@@ -1,0 +1,47 @@
+name: Dependabot auto-merge
+
+# Turns on GitHub's native auto-merge for Dependabot PRs carrying only patch or
+# minor bumps. Auto-merge does NOT merge immediately — it waits for the required
+# status checks configured in main's branch protection (Format, Typos, Clippy,
+# Cargo deny, and Test on all three OSes). If any check fails, the PR just sits
+# there. Branch protection is therefore load-bearing: without required checks,
+# auto-merge would merge as soon as the PR is mergeable, which is immediately.
+#
+# Trigger is `pull_request`, not `pull_request_target`, per GitHub's documented
+# recipe. Dependabot runs get a read-only token by default, so the permissions
+# block below is required for `gh pr merge` to work. Nothing here checks out or
+# executes the PR's code.
+
+on: pull_request
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  automerge:
+    name: Enable auto-merge
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enable auto-merge for patch and minor updates
+        if: |
+          steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+          steps.meta.outputs.update-type == 'version-update:semver-minor'
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Leave majors for review
+        if: |
+          steps.meta.outputs.update-type != 'version-update:semver-patch' &&
+          steps.meta.outputs.update-type != 'version-update:semver-minor'
+        run: |
+          echo "::notice::${{ steps.meta.outputs.dependency-names }} is a ${{ steps.meta.outputs.update-type }} update — not auto-merging. Review it by hand."
