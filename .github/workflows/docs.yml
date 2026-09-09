@@ -5,12 +5,12 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# Least privilege: contents stays read. `pages` + `id-token` are all the native
-# deploy needs — no third-party action gets repo write.
+# Least privilege, workflow-wide. `pages: write` + `id-token: write` are granted
+# per-job, on `deploy` only — the `build` job runs `cargo doc`, which executes
+# dependency build scripts, and that job has no business holding a Pages OIDC
+# token. A job-level permissions block overrides this default for that job.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 # One deployment at a time. Do NOT cancel a run in progress: cancelling a
 # half-finished Pages deploy can leave the site in a broken state.
@@ -89,7 +89,11 @@ jobs:
           </html>
           EOF
 
-      - uses: actions/configure-pages@v5
+      # No actions/configure-pages: its only job is computing base_url for static
+      # site generators, which rustdoc does not consume, and `enablement` defaults
+      # to false so it never creates the site either. Pages is already enabled with
+      # build_type=workflow, so the step is dead weight — and dropping it keeps the
+      # build job honestly at contents:read.
       - uses: actions/upload-pages-artifact@v3
         with:
           path: target/doc
@@ -98,6 +102,9 @@ jobs:
     name: Deploy to Pages
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
