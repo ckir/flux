@@ -1,0 +1,106 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege: contents stays read. `pages` + `id-token` are all the native
+# deploy needs — no third-party action gets repo write.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time. Do NOT cancel a run in progress: cancelling a
+# half-finished Pages deploy can leave the site in a broken state.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build docs
+        # -D warnings catches broken intra-doc links, which are otherwise
+        # invisible until someone clicks a dead link on the published site.
+        # --document-private-items because every crate here is publish = false:
+        # the audience is contributors, not downstream API consumers.
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --document-private-items
+
+      - name: Generate workspace index
+        # `cargo doc` on a workspace produces no root page, so without this the
+        # Pages root is a 404.
+        run: |
+          cat << 'EOF' > target/doc/index.html
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Flux Workspace Documentation</title>
+            <style>
+              :root { color-scheme: light dark; }
+              body {
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+                max-width: 820px; margin: 40px auto; padding: 0 20px;
+                line-height: 1.6;
+              }
+              h1 { border-bottom: 1px solid #8884; padding-bottom: 10px; }
+              ul { list-style: none; padding: 0; }
+              li { margin: 12px 0; }
+              a { color: #0366d6; text-decoration: none; }
+              @media (prefers-color-scheme: dark) { a { color: #58a6ff; } }
+              a:hover { text-decoration: underline; }
+              .crate {
+                font-weight: bold; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                background: #8882; padding: 2px 6px; border-radius: 4px;
+              }
+              .note { font-size: .92em; opacity: .75; }
+            </style>
+          </head>
+          <body>
+            <h1>Flux Workspace Documentation</h1>
+            <p>
+              A high-performance, safe, topology-aware filesystem transfer engine.
+              Crate responsibilities follow §3 of the engineering specification.
+            </p>
+            <ul>
+              <li><a href="flux_core/index.html"><span class="crate">flux-core</span></a> &mdash; scanner, selection, identity, topology, planner, scheduler, workers, copy, verification, resume</li>
+              <li><a href="flux_fs/index.html"><span class="crate">flux-fs</span></a> &mdash; portable filesystem abstractions</li>
+              <li><a href="flux_platform/index.html"><span class="crate">flux-platform</span></a> &mdash; Linux, macOS and Windows implementations</li>
+              <li><a href="flux_hash/index.html"><span class="crate">flux-hash</span></a> &mdash; streaming hashing (BLAKE3)</li>
+              <li><a href="flux_ui/index.html"><span class="crate">flux-ui</span></a> &mdash; progress and terminal presentation</li>
+              <li><a href="flux/index.html"><span class="crate">flux-cli</span></a> &mdash; CLI parsing and dispatch; the <code>flux</code> binary</li>
+            </ul>
+            <p class="note">
+              Private items are documented: every crate is <code>publish = false</code>,
+              so the audience is contributors rather than downstream consumers.
+            </p>
+          </body>
+          </html>
+          EOF
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/doc
+
+  deploy:
+    name: Deploy to Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
