@@ -1,0 +1,9 @@
+[package]
+name = "flux-hash"
+description = "Streaming hashing for Flux. MVP algorithm: BLAKE3."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true

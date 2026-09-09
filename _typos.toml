@@ -1,0 +1,29 @@
+# https://github.com/crate-ci/typos
+
+[files]
+extend-exclude = [
+    "target/",
+    "Cargo.lock",
+    # The engineering spec is a delivered document; do not rewrite it.
+    "FLUX_FULL_UPDATED_SPEC_V15.md",
+]
+
+[default]
+extend-ignore-re = [
+    # BLAKE3 / SHA-256 style hex digests
+    "[0-9a-fA-F]{32,}",
+    "blake3:[0-9a-f]+",
+]
+
+[default.extend-words]
+# Domain terms that look like typos
+reflink = "reflink"
+reflinks = "reflinks"
+hardlink = "hardlink"
+hardlinks = "hardlinks"
+inode = "inode"
+inodes = "inodes"
+ser = "ser"
+der = "der"
+flux = "flux"
+ckir = "ckir"

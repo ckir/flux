@@ -1,0 +1,4 @@
+# Clippy configuration
+msrv = "1.85"
+allow-dbg-in-tests = true
+allow-unwrap-in-tests = true

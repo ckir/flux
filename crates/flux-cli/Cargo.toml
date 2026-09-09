@@ -1,0 +1,13 @@
+[package]
+name = "flux-cli"
+description = "Command-line interface for Flux. Produces the `flux` binary."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "flux"
+path = "src/main.rs"

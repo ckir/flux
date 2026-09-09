@@ -1,0 +1,19 @@
+# https://lefthook.dev
+# Run `lefthook install` once per clone to activate.
+#
+# fmt and clippy run on pre-push, not pre-commit: they are workspace-wide and slow
+# enough to be annoying on every commit, and pushing is the point where the work
+# becomes other people's problem. Commits stay fast; the branch stays clean.
+#
+# Every command goes through `just` so the hook and CI cannot drift apart — the
+# recipe is the single definition of what the check is.
+
+pre-push:
+  parallel: true
+  commands:
+    fmt:
+      run: just fmt-check
+    clippy:
+      run: just clippy
+    typos:
+      run: just typos

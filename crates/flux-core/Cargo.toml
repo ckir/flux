@@ -1,0 +1,9 @@
+[package]
+name = "flux-core"
+description = "Flux engine: scanner, selection, identity, topology, planner, scheduler, workers, copy, verification, resume."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true

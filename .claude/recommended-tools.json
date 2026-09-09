@@ -1,0 +1,56 @@
+[
+  {
+    "name": "cargo-nextest",
+    "why": "Test runner used by CI (`cargo nextest run --workspace`). Runs each test in its own process, which matters here because Flux tests create real files, temp trees, hardlinks and permission states. Does NOT run doctests \u2014 pair with `cargo test --doc`.",
+    "install": "cargo binstall -y cargo-nextest",
+    "in_path": "cargo-nextest"
+  },
+  {
+    "name": "just",
+    "why": "Task runner and the single entry point for the local gate. `just check` = fmt-check + clippy + test. Configured by the root justfile.",
+    "install": "cargo binstall -y just",
+    "in_path": "just"
+  },
+  {
+    "name": "lefthook",
+    "why": "Git hooks. pre-push runs `just fmt-check`, `just clippy` and `just typos` in parallel; there is no pre-commit hook, so commits stay fast. Routing through just keeps the hook and CI from drifting apart. Configured by lefthook.yml; needs `lefthook install` once per clone.",
+    "install": "cargo binstall -y lefthook",
+    "in_path": "lefthook"
+  },
+  {
+    "name": "cargo-deny",
+    "why": "Advisory, licence, ban and source auditing across the dependency graph. Configured by deny.toml, which pins the allow-listed licences and the per-platform target triples Flux ships for.",
+    "install": "cargo binstall -y cargo-deny",
+    "in_path": "cargo-deny"
+  },
+  {
+    "name": "typos",
+    "why": "Spell-checks source and prose; runs as its own CI job. Configured by _typos.toml, which must allow Flux domain words (reflink, hardlink, dedup) and long hex/hash literals.",
+    "install": "cargo binstall -y typos-cli",
+    "in_path": "typos"
+  },
+  {
+    "name": "bacon",
+    "why": "Background check/clippy/test watcher during development. Configured by bacon.toml; default job is check-all.",
+    "install": "cargo binstall -y bacon",
+    "in_path": "bacon"
+  },
+  {
+    "name": "git-cliff",
+    "why": "Generates CHANGELOG.md from conventional commits (`just changelog`). Configured by cliff.toml.",
+    "install": "cargo binstall -y git-cliff",
+    "in_path": "git-cliff"
+  },
+  {
+    "name": "cargo-release",
+    "why": "Bumps every workspace crate in lockstep and pushes the single `v{version}` tag that .github/workflows/release.yml triggers on. Configured by [workspace.metadata.release] in the root Cargo.toml.",
+    "install": "cargo binstall -y cargo-release",
+    "in_path": "cargo-release"
+  },
+  {
+    "name": "cargo-mutants",
+    "why": "Mutation testing for the invariant-heavy core \u2014 hardlink topology, resume validation, atomic publication. Flux's .gitignore already excludes mutants.out*, so this was anticipated from the start.",
+    "install": "cargo binstall -y cargo-mutants",
+    "in_path": "cargo-mutants"
+  }
+]
