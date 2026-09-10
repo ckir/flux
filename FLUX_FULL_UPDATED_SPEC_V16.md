@@ -130,8 +130,9 @@ Revision history:
         (Sections 147.2, V14.3).
     40. `HARDLINK_UNAVAILABLE` is produced for a member whose required
         link cannot be created (Sections 15, 16.1, 55, 253.7).
+    41. Each retry category has defined behavior (Section 207).
 
-    V16 adds acceptance tests 31--79 to Section 259.14.
+    V16 adds acceptance tests 31--80 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -8202,8 +8203,18 @@ unsupported filesystem operation
 permanent path conflict
 ```
 
-The classification is implementation-defined but must be deterministic
-and observable.
+Which category a given error falls into is implementation-defined, but
+must be deterministic and observable. What each category does is not:
+
+| Category | Behavior |
+|---|---|
+| `retryable` | retried within the attempt budget (Section 206) |
+| `non_retryable` | not retried; a `path_scoped` one may fall back to the next candidate (Section 253.2) |
+| `operator_action_required` | not retried; reported, and the operation can be resumed once the cause is fixed (Section 20) |
+| `source_mutation` | retried within the attempt budget; every attempt re-validates the source (Section 33) |
+| `capacity_failure` | handled by the capacity states of Section 254, not by the attempt budget |
+| `lock_conflict` | not retried; reported as `TARGET_LOCK_BUSY` (no wait mode, Section 96) |
+| `filesystem_identity_failure` | not retried; `object_scoped` |
 
 Independently, every failure of a hardlink candidate is classified by
 scope:
@@ -12293,6 +12304,8 @@ A conforming implementation must test at least:
     that needs target exclusivity fail with REMOTE_LOCK_UNSAFE.
 79. --dry-run --resume and --dry-run --restart report the resume or the discard
     and fresh plan, take no lock, and change nothing on disk.
+80. each retry category of Section 207 behaves as its row states; in
+    particular lock_conflict and capacity_failure never spend attempt budget.
 ```
 
 ## 259.15 V15 Implementation Baseline
