@@ -352,8 +352,10 @@ Revision history:
     101. --break-lock's takeover is exclusive: it moves the lock aside by rename, which only one takeover can do,
         then creates its own lock exclusively; a lock acquired in between is put back and the takeover refuses (Sections
         240.5, 250.1, 251.1, 251.2).
+    102. Section 99 defines "still owned" as the lock file holding the operation's own record, and a failed
+        revalidation stops the operation, resumable (Section 99).
 
-    V16 adds acceptance tests 31--128 to Section 259.14.
+    V16 adds acceptance tests 31--129 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -4766,6 +4768,10 @@ operation lock still owned
 destination target lock still owned
 operation not cancelled
 ```
+
+"Still owned" means the lock file at the lock path holds
+this operation's own record (its operation_id and owner_instance_id). When revalidation fails, the worker performs
+nothing further; the operation stops, reports `TARGET_LOCK_BUSY`, and stays resumable.
 
 For atomic publication:
 
@@ -13203,6 +13209,8 @@ A conforming implementation must test at least:
 128. of two concurrent --break-lock takeovers of one uncertain lock exactly one proceeds; a
      lock acquired by another operation after the re-read is put back and the takeover refuses with TARGET_LOCK_BUSY; a
      crash after the move leaves P/<name>.flux-lock.broken.<operation-id>, which cleanup finds.
+129. an operation whose lock file no longer holds its own record performs nothing further, stops with
+     TARGET_LOCK_BUSY, and remains resumable.
 ```
 
 ## 259.15 V15 Implementation Baseline
