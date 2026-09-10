@@ -278,6 +278,11 @@ Revision history:
         subtree is not transferred, the error is reported, and the
         operation exits 1. There is no configured mutation policy or
         rescan alternative (Section 149.4).
+    84. `FsCapabilities` is determined per filesystem — for `reflink` and
+        `hardlink`, per source/destination filesystem pair — and a value
+        measured for one root is never applied to a root on another
+        filesystem, as Section 196 already required for durability
+        capabilities (Section 62).
 
     V16 adds acceptance tests 31--109 to Section 259.14.
 
@@ -2992,6 +2997,12 @@ struct FsCapabilities {
 
 This is the only definition of `FsCapabilities`. Durability capabilities
 are a separate structure (Section 196).
+
+Capabilities are determined per filesystem, like durability capabilities
+(Section 196): a single global platform boolean is insufficient. For
+`reflink` and `hardlink`, capability is per source/destination filesystem
+pair. A value measured for one root is never applied to a root on
+another filesystem.
 
 Planner decisions use capabilities rather than hard-coded assumptions.
 
