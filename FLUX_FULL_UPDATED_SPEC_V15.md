@@ -3246,48 +3246,82 @@ enum TopologyState {
     Copying {
         operation_id: OperationId,
         canonical_path: RelativePath,
+        current_attempt_id: AttemptId,
+        attempt_number: u64,
+        candidate_path: RelativePath,
     },
     Materialized {
         destination_path: RelativePath,
+        attempt_id: AttemptId,
     },
     Failed {
         error_code: ErrorCode,
+        last_attempt_id: AttemptId,
     },
 }
 ```
+
+This is the authoritative payload-bearing definition (Section V14.4).
+Field semantics:
+
+-   `canonical_path` is the immutable deterministic representative
+    (Sections 13, 204). It never changes.
+-   `candidate_path` is the member the current attempt is
+    materializing. It equals `canonical_path` until fallback
+    materialization selects another candidate (Sections 253, 259.2). A
+    candidate never becomes canonical.
+-   `current_attempt_id` identifies the authoritative current execution
+    attempt (Section 202). It is the value that Section V14.3 attempt
+    fencing compares against.
+-   `attempt_number` is the ordinal of the current attempt for
+    `candidate_path`, starting at 1 for the initial attempt. It is
+    durable and survives restart (Section 206).
+-   `Materialized.destination_path` is the `materialization_anchor`
+    (Section 259.2): the destination path of the member that actually
+    created the object. It may differ from `canonical_path`.
+-   `Failed` is terminal: every viable candidate has been exhausted or
+    proven unusable (Sections 253.5, 259.2).
 
 The valid transitions are:
 
 ``` text
 Unresolved
     │
-    │ claim canonical
+    │ claim canonical (creates attempt 1, candidate = canonical_path)
     ▼
-Copying(OperationId)
+Copying { current_attempt_id = A1 }
     │
-    ├──────── success ────────► Materialized(Path)
+    ├── attempt succeeds ──────────────────────► Materialized { anchor, attempt }
     │
-    └──────── failure ────────► Failed(Error)
+    ├── attempt fails; a retry or fallback
+    │   candidate remains ────────────────────► Copying { current_attempt_id = A2 }
+    │
+    └── attempt fails; no viable candidate
+        remains ──────────────────────────────► Failed { error, last attempt }
 ```
+
+Retries and fallback attempts never leave `Copying`. A failed attempt is
+recorded in its immutable execution history (Section 202), and a new
+attempt becomes `current_attempt_id`.
 
 There is no:
 
 ``` text
-Failed → Copying(new canonical)
+Failed → any other state
+Materialized → Copying      (during normal execution)
+Copying → Unresolved        (including crash recovery; Section 123)
 ```
 
-transition.
+transition. `Failed` is terminal.
 
-There is also no:
+Every transition out of `Copying` names the expected
+`current_attempt_id` and is applied by compare-and-swap. A transition
+whose expected attempt is not the current attempt changes nothing
+(Section 91).
 
-``` text
-Materialized → Copying
-```
-
-transition during normal execution.
-
-This makes canonical selection immutable and prevents concurrent workers
-from changing the topology decision.
+This makes canonical selection immutable and prevents concurrent workers,
+or stale work from a superseded attempt, from changing the topology
+decision.
 
 ------------------------------------------------------------------------
 
@@ -3305,7 +3339,8 @@ sequence.
 
 That sequence has a race.
 
-Instead the topology store must provide an atomic claim operation:
+Instead the topology store must provide an atomic claim operation and
+attempt-fenced transitions:
 
 ``` rust
 trait TopologyStore {
@@ -3314,6 +3349,8 @@ trait TopologyStore {
         identity: FileIdentity,
     ) -> Result<Option<TopologyRecord>>;
 
+    // Unresolved → Copying; creates attempt 1 with
+    // candidate_path = canonical_path.
     fn claim_canonical(
         &self,
         identity: FileIdentity,
@@ -3321,29 +3358,58 @@ trait TopologyStore {
         canonical_path: RelativePath,
     ) -> Result<ClaimResult>;
 
+    // Current attempt Running → Failed. The record stays Copying.
+    fn record_attempt_failure(
+        &self,
+        identity: FileIdentity,
+        attempt_id: AttemptId,
+        error_code: ErrorCode,
+    ) -> Result<TransitionResult>;
+
+    // Retry or fallback: requires the expected current attempt to be
+    // Failed and the retry/candidate budget to allow a new attempt.
+    // Creates the new attempt and makes it current.
+    fn begin_attempt(
+        &self,
+        identity: FileIdentity,
+        expected_attempt_id: AttemptId,
+        candidate_path: RelativePath,
+    ) -> Result<TransitionResult>;
+
+    // Copying → Materialized { destination_path = anchor }.
     fn mark_materialized(
         &self,
         identity: FileIdentity,
+        attempt_id: AttemptId,
         destination_path: RelativePath,
-    ) -> Result<()>;
+    ) -> Result<TransitionResult>;
 
+    // Copying → Failed (terminal). Requires the current attempt to be
+    // Failed and no viable candidate to remain.
     fn mark_failed(
         &self,
         identity: FileIdentity,
+        attempt_id: AttemptId,
         error_code: ErrorCode,
-    ) -> Result<()>;
+    ) -> Result<TransitionResult>;
 }
 ```
 
-`claim_canonical` must be implemented as a transactional
-compare-and-swap or equivalent database transaction.
+`claim_canonical` and every transition must be implemented as a
+transactional compare-and-swap or equivalent database transaction. The
+attempt record (Section 202) and the topology record are updated in the
+same transaction.
 
-Possible result:
+Possible results:
 
 ``` rust
 enum ClaimResult {
-    Claimed,
-    AlreadyCopying,
+    Claimed {
+        attempt_id: AttemptId,
+    },
+    AlreadyCopying {
+        current_attempt_id: AttemptId,
+    },
     AlreadyMaterialized {
         destination_path: RelativePath,
     },
@@ -3351,9 +3417,28 @@ enum ClaimResult {
         error_code: ErrorCode,
     },
 }
+
+enum TransitionResult {
+    Applied,
+    // The same transition was already applied by the same attempt;
+    // an idempotent no-op (duplicate delivery, Section V14.7.4).
+    AlreadyApplied,
+    // The named attempt is not the current attempt; nothing changed.
+    StaleAttempt {
+        current_attempt_id: AttemptId,
+    },
+    // The record is not in a state that permits this transition
+    // (for example Unresolved, or already terminal); nothing changed.
+    InvalidState,
+}
 ```
 
 Only one worker may successfully claim `Unresolved`.
+
+A transition carrying a superseded `attempt_id` MUST return
+`StaleAttempt` and MUST NOT change the topology record, the execution
+history, or any dependent state. This fence applies at the store, not
+only to scheduler events (Section V14.3).
 
 ------------------------------------------------------------------------
 
@@ -3374,6 +3459,11 @@ BLOCKED_BY_CANONICAL_FAILURE
 ```
 
 They must not execute `link()`.
+
+Here `FAILED` is the terminal `TopologyState::Failed` (Section 90): no
+retry or fallback candidate remains. While a retry or fallback candidate
+can still materialize the object, the record stays `Copying` and
+dependents stay held (Section 94); they are not blocked.
 
 The final operation report must distinguish:
 
@@ -4585,19 +4675,21 @@ If committed:
 → Materialized
 ```
 
-If not:
+If not committed, the record stays `Copying` with the same
+`current_attempt_id`:
 
 ``` text
-→ Unresolved
+attempt safely recoverable
+    → resume the same attempt (a crash does not create a new attempt)
+
+attempt not safely recoverable
+    → durably record the attempt as Failed, then apply the normal
+      retry / fallback / terminal rules (Sections 90, 206, 253)
 ```
 
-or:
-
-``` text
-→ Failed
-```
-
-according to the recovery result.
+Recovery MUST NOT return a record to `Unresolved`. Re-claiming would
+discard the durable attempt count and create implicit retries (Section
+206).
 
 The canonical path itself does not change.
 
@@ -5155,6 +5247,7 @@ trait Scanner {
     fn next(&mut self) -> Result<Option<DiscoveryRecord>>;
 }
 
+// Full definition, results, and fencing rules: Section 91.
 trait TopologyStore {
     fn lookup(&self, identity: FileIdentity)
         -> Result<Option<TopologyRecord>>;
@@ -5166,17 +5259,33 @@ trait TopologyStore {
         canonical_path: RelativePath,
     ) -> Result<ClaimResult>;
 
+    fn record_attempt_failure(
+        &self,
+        identity: FileIdentity,
+        attempt_id: AttemptId,
+        error_code: ErrorCode,
+    ) -> Result<TransitionResult>;
+
+    fn begin_attempt(
+        &self,
+        identity: FileIdentity,
+        expected_attempt_id: AttemptId,
+        candidate_path: RelativePath,
+    ) -> Result<TransitionResult>;
+
     fn mark_materialized(
         &self,
         identity: FileIdentity,
+        attempt_id: AttemptId,
         destination_path: RelativePath,
-    ) -> Result<()>;
+    ) -> Result<TransitionResult>;
 
     fn mark_failed(
         &self,
         identity: FileIdentity,
+        attempt_id: AttemptId,
         error_code: ErrorCode,
-    ) -> Result<()>;
+    ) -> Result<TransitionResult>;
 }
 
 trait OperationStore {
@@ -5499,14 +5608,22 @@ path.
 The scheduler consumes an internal event:
 
 ``` rust
+// Attempt fields and fencing rules: Section V14.3.
 enum SchedulerEvent {
     CanonicalMaterialized {
         identity: FileIdentity,
         destination_path: RelativePath,
+        operation_id: OperationId,
+        attempt_id: AttemptId,
+        attempt_number: u64,
     },
 
     CanonicalFailed {
         identity: FileIdentity,
+        destination_path: RelativePath,
+        operation_id: OperationId,
+        attempt_id: AttemptId,
+        attempt_number: u64,
         error_code: ErrorCode,
     },
 
@@ -7215,6 +7332,10 @@ object.
 
 It does not represent the complete history of execution attempts.
 
+This list names the logical states only. The authoritative
+payload-bearing definition, including the current attempt and the
+materialization anchor, is Section 90 (Section V14.4).
+
 ------------------------------------------------------------------------
 
 # 202. Canonical Execution Attempt
@@ -7226,6 +7347,10 @@ struct CanonicalExecution {
     attempt_id: AttemptId,
     operation_id: OperationId,
     canonical_path: RelativePath,
+    // Member this attempt materializes; equals canonical_path
+    // unless this is a fallback attempt (Section 253).
+    candidate_path: RelativePath,
+    // Ordinal for candidate_path; 1 = initial attempt (Section 206).
     attempt_number: u64,
     state: ExecutionState,
     started_at: Timestamp,
@@ -7253,23 +7378,22 @@ Every retry creates a new execution attempt.
 The legal lifecycle is:
 
 ``` text
-Topology:
+Topology:                 Current attempt:
     Unresolved
        ↓
-    Copying
+    Copying               Attempt 1  Running → Failed
+       │                     │ retry
+       │                     ▼
+    Copying               Attempt 2  Running → Succeeded
        ↓
-    Failed
-       │
-       │ retry
-       ▼
-    Copying
-       │
-       ▼
     Materialized
 ```
 
-The `Failed → Copying` operation is implemented by creating a **new
-execution attempt**, not by mutating the historical failed attempt.
+A retry never leaves `Copying`. It is implemented by recording the
+failed attempt and creating a **new execution attempt** that becomes
+`current_attempt_id` (Section 90), not by mutating the historical failed
+attempt. `TopologyState::Failed` is terminal and is reached only when no
+retry or fallback candidate remains.
 
 Example:
 
@@ -7284,8 +7408,9 @@ Attempt 2:
 The topology record can therefore represent:
 
 ``` text
-current state = Copying
-current_attempt = 2
+current state      = Copying
+current_attempt_id = A2
+attempt_number     = 2
 ```
 
 while retaining the immutable history of Attempt 1.
@@ -7324,27 +7449,17 @@ transient execution failures.
 
 # 205. Dependent Hardlink Behavior During Retry
 
-If the canonical attempt fails:
+If a canonical attempt fails and a retry or fallback candidate remains:
 
 ``` text
-canonical
+attempt N Failed
     ↓
-Failed
+record stays Copying
     ↓
-dependents
-    ↓
-BLOCKED_BY_CANONICAL_FAILURE
+attempt N+1 Running
 ```
 
-If a retry begins:
-
-``` text
-Failed
-    ↓
-new attempt Running
-```
-
-dependents remain blocked until the retry reaches:
+dependents stay held (Section 94) until an attempt reaches:
 
 ``` text
 Materialized
@@ -7354,6 +7469,19 @@ Only then may they be released.
 
 A retry must not prematurely release dependents merely because copying
 has restarted.
+
+Dependents become:
+
+``` text
+BLOCKED_BY_CANONICAL_FAILURE
+```
+
+only when the record reaches the terminal `TopologyState::Failed`.
+
+A `CanonicalFailed` scheduler event reports a failed attempt. After
+attempt fencing (Section V14.3), the scheduler either begins a retry or
+fallback attempt (`begin_attempt`) or, when no viable candidate remains,
+applies the terminal `mark_failed`. Only the latter blocks dependents.
 
 ------------------------------------------------------------------------
 
@@ -7399,15 +7527,15 @@ Retry count semantics are:
 Therefore, a default operation may contain up to four execution
 attempts: the initial attempt plus three retries.
 
-Retry exhaustion produces:
+Retry exhaustion for a candidate produces:
 
 ``` text
 CANONICAL_RETRY_EXHAUSTED
 ```
 
-The canonical topology state becomes `Failed`.
-
-Dependents remain:
+for that candidate. The topology state becomes `Failed` only when no
+viable fallback candidate remains (Sections 253, 259.2). Dependents then
+become:
 
 ``` text
 BLOCKED_BY_CANONICAL_FAILURE
@@ -9990,6 +10118,12 @@ TopologyGroup
         Unresolved / Materializing / Materialized / Failed
 ```
 
+In the authoritative schema (Section 90), "Materializing" is
+`TopologyState::Copying`, `candidate_path` names the candidate currently
+being attempted, and per-candidate outcomes are the immutable execution
+attempts of Section 202. A candidate shown as `Failed` here is a failed
+attempt history, not the terminal `TopologyState::Failed`.
+
 ## 253.4 Successful Fallback
 
 If `B/file` successfully materializes the object:
@@ -10572,7 +10706,7 @@ Additional diagnostic fields MAY be carried, but `attempt_id` MUST remain availa
 
 Upon receiving a canonical scheduler event, the scheduler MUST NOT blindly apply the state transition represented by the event.
 
-The scheduler MUST compare the event's `attempt_id` against the authoritative current canonical execution record.
+The scheduler MUST compare the event's `attempt_id` against the authoritative current canonical execution record: `TopologyState::Copying.current_attempt_id`, or the recorded attempt of a `Materialized`/`Failed` record (Section 90). The store applies the same fence to every transition (Section 91).
 
 Conceptually:
 
@@ -10974,7 +11108,7 @@ enum ExecutionState {
 
 There is no `Retrying` execution state. A retry creates a new execution attempt; the historical failed attempt remains immutable.
 
-`TopologyState::Failed` is terminal for the topology record that reached terminal failure. A retry does not mutate that historical record in place. Instead, durable operation state records a new current execution attempt. Thus the shorthand `Failed → Copying` means creation and selection of a new attempt, not resurrection of the failed attempt.
+`TopologyState::Failed` is terminal. Retries and fallback attempts happen while the record is `Copying` (Section 90): the failed attempt stays in its immutable execution history and a new attempt becomes `current_attempt_id`. Any earlier shorthand `Failed → Copying` means a failed attempt followed by a new one, never a transition out of `TopologyState::Failed`.
 
 Canonical identity remains unchanged throughout.
 
@@ -11280,6 +11414,14 @@ A conforming implementation must test at least:
 28. weak identity cannot prove rename success from path existence alone.
 29. ambiguous commit recovery becomes conservative uncertainty.
 30. symlink failure does not silently change object type.
+31. a topology store transition carrying a superseded attempt_id returns
+    StaleAttempt and changes nothing.
+32. crash recovery never returns a Copying record to Unresolved and never
+    resets attempt_number.
+33. under fallback, Materialized.destination_path is the materialization
+    anchor and canonical_path is unchanged.
+34. dependents stay held (not blocked) while a retry or fallback candidate
+    remains, and become BLOCKED_BY_CANONICAL_FAILURE only on terminal Failed.
 ```
 
 ## 259.15 V15 Implementation Baseline
