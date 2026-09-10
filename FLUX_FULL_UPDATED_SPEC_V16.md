@@ -267,7 +267,7 @@ Revision history:
     81. Any WAL write failure Section 189 lists — disk full, I/O error,
         permission failure, or filesystem corruption — enters the
         emergency persistence path, not only `ENOSPC` (Sections 189,
-        231.3, 238).
+        231.3, 236, 237, 238).
     82. Flux must establish the emergency control-space reserve before
         transfer; where the filesystem cannot guarantee that later writes
         into the reserved file succeed, the reserve counts as
@@ -10069,7 +10069,7 @@ The following are normative:
 5. Cross-filesystem source hardlink groups are never merged.
 6. Content equality never creates hardlink identity.
 7. Emergency control space is reserved before normal transfer.
-8. ENOSPC must have a pre-established minimal recovery path.
+8. Every WAL write failure, including ENOSPC, has a pre-established minimal recovery path (Sections 189, 231.3).
 9. Failure to persist the emergency state is explicitly reported.
 10. The complete hardlink hold index is persistent from discovery.
 11. RAM contains only bounded waiting/release metadata.
@@ -10099,7 +10099,7 @@ The implementation must add:
 [ ] identical content across different filesystems remains separate
 [ ] destination convergence of independent hardlink groups
 [ ] emergency control reservation
-[ ] WAL ENOSPC transition
+[ ] WAL write failure transition (ENOSPC and non-space failures)
 [ ] zero-normal-space emergency pause
 [ ] emergency-state durability failure
 [ ] million-member persistent hardlink hold group
