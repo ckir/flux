@@ -2612,7 +2612,8 @@ existing code.
 Not error codes, and not listed above: state names (for example
 `CAPACITY_WAIT`, `DIRECTORY_STAGING`), WAL record types (for example
 `PREPARE_COMMIT`), WAL corruption classes (Section 191), cleanup
-classifications (Sections 131, 251.1), and operating-system error names.
+classifications (Sections 131, 251.1), and operating-system error and
+flag names.
 
 Do not keep an unbounded in-memory error list.
 
