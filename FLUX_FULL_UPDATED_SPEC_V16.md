@@ -159,6 +159,8 @@ Revision history:
     54. `TopologyState` gains the terminal `Skipped` state for an
         all-skipped group, with `mark_skipped` and `AlreadySkipped`
         (Sections 90, 91, 142, 147.3, 201, 253.3, 253.5, V14.4).
+    55. Section 239.1 points to Section 249.2's single-file lifecycle
+        instead of restating it without the catalog steps.
 
     V16 adds acceptance tests 31--88 to Section 259.14.
 
@@ -9914,21 +9916,8 @@ directly or through a verifiable state record.
 
 ## 239.1 Normal Lifecycle
 
-``` text
-acquire target lock (also the operation lock, Section 98)
-       ↓
-create durable state
-       ↓
-create partial destination
-       ↓
-copy/checkpoint
-       ↓
-verify
-       ↓
-durably publish target
-       ↓
-remove partial/state/lock
-```
+The normal lifecycle, including standalone catalog registration and
+removal, is Section 249.2's.
 
 Failure during cleanup does not invalidate an otherwise successful
 transfer.
