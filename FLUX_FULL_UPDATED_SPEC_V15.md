@@ -999,10 +999,11 @@ The retention period should be configurable.
 Command:
 
 ``` bash
-flux cleanup
+flux cleanup DEST
 ```
 
-It lists stale operations before deletion unless forced.
+The `DEST` argument is required (Section 251.1). It lists stale
+operations before deletion unless forced.
 
 Example future interface:
 
@@ -9826,21 +9827,41 @@ entire destination filesystem.
 Flux therefore maintains a persistent **standalone operation catalog**
 inside the destination control plane.
 
-Conceptually:
+For a single-file target `T`, let `P` be its parent directory and `K` the
+stable target key of Section 259.6 (physical identity of `P` where
+reliably available, plus the canonical `FluxPathKey` of `T` relative to
+`P`). The catalog record for `T` is:
 
 ``` text
-DEST/.flux/
+P/.flux/
     standalone/
-        <sharded target records>
+        <sha256(K)>.record
 ```
 
-The catalog is an index, not the authoritative artifact state.
+The catalog therefore lives in the target's own parent directory; there
+is no user-wide or system-wide catalog (Section 18).
+
+A known target is looked up directly by computing `K`, with no directory
+listing. The record stores the complete key `K`; a stored key that
+differs from the looked-up key is a collision, handled as in Section
+259.6, and the targets must never be aliased. If the record is missing,
+for example after a crash between steps 2 and 3 of Section 250.2, Flux
+may list `P` non-recursively for that target's adjacent artifacts
+(Section 251.2) to reconstruct it.
+
+A pre-existing `P/.flux` that Flux does not own is handled as in Section
+259.3: it is never overwritten or reinterpreted.
+
+The catalog is an index, not the authoritative artifact state. Losing a
+catalog record never removes cleanup authority, which remains with the
+adjacent state record (Section 218).
 
 ## 250.1 Catalog Record
 
 A catalog record contains:
 
 ``` text
+complete_key
 target_identity
 target_path_key
 target_parent_identity
@@ -9888,10 +9909,15 @@ Successful completion follows:
 2. durably mark operation complete
 3. remove adjacent partial/state/lock artifacts
 4. remove standalone catalog record
+5. remove P/.flux/standalone/ and P/.flux/ if Flux created them and
+   they are now empty
 ```
 
 If the process dies between these steps, the catalog and/or adjacent
 state provide recovery information.
+
+Step 5 never removes a directory that still contains any entry, or one
+that Flux did not create.
 
 ------------------------------------------------------------------------
 
@@ -9910,16 +9936,20 @@ It must not perform a filesystem-wide search for:
 ## 251.1 Default Cleanup
 
 ``` text
-flux cleanup
+flux cleanup DEST
 ```
 
-performs:
+performs, without recursing into subdirectories of `DEST`:
 
 ``` text
-central operation enumeration
+DEST/.flux/operations/   directory operations whose destination root is DEST
         +
-standalone catalog enumeration
+DEST/.flux/standalone/   single-file operations whose target's parent is DEST
 ```
+
+The `DEST` argument is required (Section 60). A bare `flux cleanup` with
+no path is a usage error, because there is no global catalog to
+enumerate (Section 18).
 
 For each standalone catalog entry:
 
@@ -10424,7 +10454,7 @@ The implementation must add:
 [ ] missing adjacent state
 [ ] corrupt adjacent state
 [ ] target-scoped orphan cleanup
-[ ] catalog-driven global cleanup
+[ ] catalog-driven cleanup of DEST (non-recursive)
 [ ] missing catalog entry with explicit target cleanup
 [ ] foreign .flux-* files preserved
 [ ] no recursive filesystem-wide cleanup
@@ -10531,7 +10561,9 @@ inode/object-generation recycling
 remote filesystem locking
 ```
 
-The standalone cleanup architecture is:
+The standalone cleanup architecture is (`DEST` is a directory
+operation's destination root, or a single-file target's parent
+directory; Section 250):
 
 ``` text
                     DEST/.flux/
@@ -11503,6 +11535,14 @@ A conforming implementation must test at least:
 38. a group whose canonical failed path_scoped before any other member was
     discovered stays Copying with dependents held, and a later-discovered
     member becomes the next candidate.
+39. a single-file operation registers at P/.flux/standalone/<sha256(K)>.record
+    in the target's parent, and resume finds it without listing P.
+40. a crash between adjacent-state creation and catalog registration is
+    recovered by a non-recursive listing of P.
+41. `flux cleanup DEST` enumerates only DEST/.flux/operations and
+    DEST/.flux/standalone; a bare `flux cleanup` is a usage error.
+42. after completion, empty P/.flux/standalone/ and P/.flux/ created by Flux
+    are removed; a pre-existing foreign P/.flux is left untouched.
 ```
 
 ## 259.15 V15 Implementation Baseline
