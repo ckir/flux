@@ -333,8 +333,12 @@ Revision history:
         prior owner already started; uncertain artifacts are deleted
         only through `cleanup --target --break-lock` (Sections 21.1,
         240.5, 251.1, 251.2).
+    96. Cleanup and resume discovery look in
+        `P/.flux/atomic/<target-key>/`, find `.flux-dir.lock` per entry,
+        and handle a filesystem-root DEST or target (Sections 120,
+        234.1, 251.1, 251.2).
 
-    V16 adds acceptance tests 31--122 to Section 259.14.
+    V16 adds acceptance tests 31--123 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -5623,9 +5627,10 @@ two paths, derived from the lock's own target and `operation_id`. Any
 other value makes the record unverifiable: `ARTIFACT_OWNERSHIP_UNCERTAIN`;
 nothing at the recorded path is read, adopted, or deleted.
 
-If the lock is missing, Flux checks both locations: `DEST/.flux/operations/`
-and, non-recursively, `P/.flux/atomic/`. Both are authoritative discovery
-locations; nothing else is searched.
+If the lock is missing, Flux checks both locations, each non-recursively:
+`DEST/.flux/operations/` and `P/.flux/atomic/<target-key>/` for DEST's
+own key (Section 259.10). A filesystem-root DEST has only the first.
+Both are authoritative discovery locations; nothing else is searched.
 
 ------------------------------------------------------------------------
 
@@ -9998,8 +10003,9 @@ They are not part of the centralized `.flux/operations/` tree.
 
 ## 234.1 Target-Scoped Discovery
 
-Flux may inspect the target's parent directory when performing explicit
-cleanup for a known target.
+Flux may inspect the target's parent directory (for a filesystem-root
+target, the root itself; Section 251.2) when performing explicit cleanup
+for a known target.
 
 Example:
 
@@ -11201,6 +11207,11 @@ P/.flux/atomic/<target-key>/ whole-tree atomic staging for DEST (Section 259.10)
 Each workspace found under `P/.flux/atomic/<target-key>/` is classified
 like any other.
 
+For a filesystem-root DEST (Section 96.1), cleanup also inspects
+`DEST/.flux-root.lock`, and there is no `P/.flux/atomic/` to inspect: a
+root has no parent and never has whole-tree atomic staging (Section
+259.9).
+
 The `DEST` argument is required unless `--target PATH` is given
 (Section 251.2). A bare `flux cleanup` with neither is a usage error,
 because there is no global catalog to enumerate (Section 18).
@@ -11220,6 +11231,10 @@ validate lock/lease ownership
         ↓
 classify
 ```
+
+The expected adjacent artifacts are the target's lock (`P/<name>.flux-lock`,
+or `P/.flux-dir.lock` when the Section 96.1 fallback applies), its state,
+and its partial, derived as Section 250.1 describes.
 
 Classification (the only cleanup status names; Section 131 uses them
 too):
@@ -11265,6 +11280,10 @@ may directly inspect:
 /dest/foo.iso.flux-state.*
 /dest/foo.iso.flux-partial.*
 ```
+
+For a filesystem-root target `T`, the only adjacent artifact is its lock
+`T/.flux-root.lock` (Section 96.1); `flux cleanup --target T` inspects
+that instead of the parent-relative names above.
 
 even if the standalone catalog entry is missing.
 
@@ -13114,6 +13133,10 @@ A conforming implementation must test at least:
      record over by atomic rename, reports the holder, and proceeds; a
      crash right after the takeover leaves a lock owned by the new
      operation.
+123. flux cleanup DEST for a filesystem-root DEST inspects
+     DEST/.flux-root.lock and no P/.flux/atomic/; flux cleanup --target T
+     for a root T inspects T/.flux-root.lock; resume with the root lock
+     missing looks only in DEST/.flux/operations/.
 ```
 
 ## 259.15 V15 Implementation Baseline
