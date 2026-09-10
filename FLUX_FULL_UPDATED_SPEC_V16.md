@@ -2329,13 +2329,7 @@ Default:
 do not cross filesystem boundaries
 ```
 
-Crossing is off unless `--cross-filesystems` is given.
-
-Future:
-
-``` bash
---cross-filesystems
-```
+Crossing is off unless `--cross-filesystems` is given (Section 5).
 
 Filesystem identity must be used to evaluate boundaries.
 
@@ -2743,7 +2737,7 @@ are used only when no more specific code applies.
 | `CONTROL_PLANE_NAMESPACE_CONFLICT` | The destination control-plane path (`.flux`) holds a foreign object that Flux does not own. | 96.1, 259.3 |
 | `CONTROL_STATE_DURABILITY_FAILURE` | The emergency control reserve is unavailable, exhausted, or corrupt, so a pause or failure cannot be durably recorded. | 231.5 |
 | `COPY_FAILED` | The content copy of an independent file, or a canonical attempt, failed. | 92, 133 |
-| `DESTINATION_ERROR` | A destination-side failure not covered by a more specific code. | 55 |
+| `DESTINATION_ERROR` | A destination-side failure not covered by a more specific code, including a path the destination refuses as too long. | 55, 105, 207 |
 | `DESTINATION_NAMESPACE_COLLISION` | Two distinct source paths, or two source roots, map to the same destination object or prefix. | 18.3, 241.5 |
 | `DIRECTORY_CHANGED_DURING_SCAN` | An existing directory's identity changed while it was being entered. | 149.4 |
 | `DISK_FULL` | A destination data allocation failed for lack of space (`ENOSPC`, `ERROR_DISK_FULL`), outside the atomic capacity states of Section 254. | 29 |
