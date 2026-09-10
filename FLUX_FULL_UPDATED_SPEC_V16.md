@@ -268,6 +268,12 @@ Revision history:
         permission failure, or filesystem corruption — enters the
         emergency persistence path, not only `ENOSPC` (Sections 189,
         231.3, 238).
+    82. Flux must establish the emergency control-space reserve before
+        transfer; where the filesystem cannot guarantee that later writes
+        into the reserved file succeed, the reserve counts as
+        unavailable, Flux warns at start, and a subsequent WAL failure
+        ends in `CONTROL_STATE_DURABILITY_FAILURE` (Sections 231.1,
+        231.2, 231.5).
 
     V16 adds acceptance tests 31--108 to Section 259.14.
 
@@ -9638,8 +9644,8 @@ safe failure/pause state when the normal data volume reaches capacity.
 
 ## 231.1 Control Reservation
 
-Before substantial transfer begins, Flux should establish a small
-reserved control-space budget for:
+Before substantial transfer begins, Flux must establish a small reserved
+control-space budget for:
 
 ``` text
 pause/failure state
@@ -9652,11 +9658,12 @@ The reservation is separate from ordinary copy-capacity accounting.
 
 ## 231.2 Preallocation
 
-Where supported, Flux should preallocate the emergency journal/control
-file.
-
-The reservation must be physically established before ordinary transfer
-consumes the available space.
+Flux preallocates the emergency journal/control file before ordinary
+transfer consumes the available space. Where the filesystem cannot
+guarantee that later writes into the reserved file succeed — no
+preallocation primitive, or copy-on-write allocation — the reserve
+counts as unavailable: Flux warns at start, and a subsequent WAL failure
+ends in `CONTROL_STATE_DURABILITY_FAILURE` (Section 231.5).
 
 ## 231.3 Emergency Path
 
