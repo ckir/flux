@@ -133,6 +133,8 @@ Revision history:
     41. Each retry category has defined behavior (Section 207).
     42. The `OperationStateChanged` scheduler event is described (Section
         147.2).
+    43. Every "lexicographically smallest" statement points to the
+        component-wise order of Section 7.2 (Sections 8.1, 13, 69).
 
     V16 adds acceptance tests 31--81 to Section 259.14.
 
@@ -591,7 +593,7 @@ Guarantee:
 ``` text
 first selected member of an identity
 =
-lexicographically smallest selected member
+lexicographically smallest selected member   (component-wise, Section 7.2)
 ```
 
 This makes deterministic hardlink canonicalization possible without
@@ -762,7 +764,7 @@ Because the default scanner is deterministically ordered:
 
 ``` text
 canonical =
-lexicographically smallest selected relative path
+lexicographically smallest selected relative path   (component-wise, Section 7.2)
 ```
 
 ## 13.1 Critical consequence
@@ -2874,8 +2876,8 @@ Persistent topology state may be used.
 
 Hardlink members are spread across a massive directory tree.
 
-The canonical member remains the lexicographically smallest selected
-member.
+The canonical member remains the smallest selected member in
+`FluxPathKey` order (component-wise, Section 7.2).
 
 ## Partial selection
 
