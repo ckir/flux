@@ -49,8 +49,12 @@ Revision history:
         error-code registry.
     7.  Version labels are corrected, and options used elsewhere are
         listed in Sections 5 and 60.
+    8.  Multiple source roots share one key space: each root maps to a
+        distinct destination prefix, keys are destination-relative, and
+        the manifest records one mapping per root (Sections 7.2, 18.3,
+        19, 103, 121).
 
-    V16 adds acceptance tests 31--42 to Section 259.14.
+    V16 adds acceptance tests 31--45 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -381,7 +385,9 @@ flat '/'-joined bytes (NOT):  a-b   a/x     a/y/z a0
 A depth-first scanner that sorts each directory's entries by name alone
 emits component-wise order without buffering. `FluxPathKey` (Section
 103) encodes this order so that plain bytewise comparison of keys equals
-component-wise comparison.
+component-wise comparison. With multiple source roots, paths are ordered
+by their destination-relative path and roots are visited in prefix order
+(Section 18.3).
 
 For platforms with native Unicode strings, comparison is performed on
 the deterministic normalized representation.
@@ -820,6 +826,32 @@ DEST/.flux/operations/<operation-id>/
 
 The manifest maps each source root to its destination mapping.
 
+Each source root `R` maps to a **destination prefix**: the path, relative
+to the destination root, under which `R`'s content is placed.
+
+-   A single root that maps onto the destination root itself has an
+    empty prefix.
+-   With multiple roots, each root maps to `DEST/<name>`, where `<name>`
+    is the root's final path component. Every prefix is then exactly one
+    component, and prefixes must be pairwise distinct. Two roots with
+    the same prefix are rejected with `DESTINATION_NAMESPACE_COLLISION`
+    before any transfer begins.
+
+A path's `FluxPathKey` is its destination-relative path: its root's
+prefix components followed by its components relative to that root
+(Section 103). All roots therefore share one key space and one order.
+
+The scanner visits roots in `FluxPathKey` order of their prefixes, and
+each root depth-first as in Section 7.2. Because prefixes are distinct
+single components, this emits global key order across all roots without
+buffering. A hardlink group whose members span roots on the same source
+filesystem therefore has one canonical member: the smallest
+destination-relative key (Section 13). Members on different source
+filesystems are never grouped (Section 230).
+
+The order depends only on the prefixes, not on the order in which roots
+appear on the command line.
+
 ------------------------------------------------------------------------
 
 # 19. Operation Manifest
@@ -833,8 +865,10 @@ struct OperationManifest {
     format_version: u32,
     operation_id: OperationId,
 
-    source_root: PathBuf,
     destination_root: PathBuf,
+    // One entry per source root (Section 18.3), stored in
+    // FluxPathKey order of destination_prefix.
+    roots: Vec<RootMapping>,
 
     created_at: Timestamp,
     last_checkpoint: Timestamp,
@@ -842,6 +876,12 @@ struct OperationManifest {
     state: OperationState,
 
     configuration_fingerprint: Hash,
+}
+
+struct RootMapping {
+    source_root: PathBuf,
+    // Empty for a single root mapped onto destination_root itself.
+    destination_prefix: FluxPathKey,
 }
 ```
 
@@ -2069,7 +2109,7 @@ existing code.
 | `CONTROL_STATE_DURABILITY_FAILURE` | The emergency control reserve is unavailable, exhausted, or corrupt, so a pause or failure cannot be durably recorded. | 231.5 |
 | `COPY_FAILED` | The content copy of an independent file, or a canonical attempt, failed. | 92, 133 |
 | `DESTINATION_ERROR` | A destination-side failure not covered by a more specific code. | 55 |
-| `DESTINATION_NAMESPACE_COLLISION` | Two distinct source `FluxPathKey` values map to the same destination object. | 241.5 |
+| `DESTINATION_NAMESPACE_COLLISION` | Two distinct source paths, or two source roots, map to the same destination object or prefix. | 18.3, 241.5 |
 | `DIRECTORY_CHANGED_DURING_SCAN` | An existing directory's identity changed while it was being entered. | 149.4 |
 | `DISK_FULL` | A destination data allocation failed for lack of space (`ENOSPC`, `ERROR_DISK_FULL`). | 29, 55 |
 | `FAILED_ATOMIC_CAPACITY` | Required atomic temporary capacity provably exceeds the maximum recoverable capacity; terminal for the action. | 254.3 |
@@ -3985,9 +4025,13 @@ Normative encoding:
 FluxPathKey = c1 0x00 c2 0x00 ... 0x00 cn
 ```
 
-where `c1 .. cn` are the components of the normalized relative path, each
-in its exact platform byte form (Sections 104, 105, 241). The empty
-relative path (the source root itself) encodes as the empty key.
+where `c1 .. cn` are the components of the path relative to the
+operation's destination root: the source root's destination prefix
+(Section 18.3) followed by the path's components relative to that source
+root. Each component is in its exact platform byte form (Sections 104,
+105, 241). A source root itself encodes as its prefix, which is the empty
+key when the prefix is empty. For a single root mapped onto the
+destination root, the key is simply the source-relative path.
 
 The byte `0x00` cannot occur inside a component: POSIX filenames cannot
 contain NUL, and Windows/NTFS filenames cannot contain U+0000 (whose
@@ -4700,6 +4744,11 @@ Changes that cannot be safely migrated produce:
 ``` text
 INCOMPATIBLE_STATE
 ```
+
+Source and destination mappings are compared as the set of
+`(source_root, destination_prefix)` pairs recorded in the manifest
+(Section 19). Listing the same roots in a different command-line order
+is compatible; adding, removing, or remapping a root is not.
 
 ------------------------------------------------------------------------
 
@@ -11628,6 +11677,13 @@ A conforming implementation must test at least:
     usage error.
 42. after completion, empty P/.flux/standalone/ and P/.flux/ created by Flux
     are removed; a pre-existing foreign P/.flux is left untouched.
+43. with roots /x/b and /y/a whose files b/f and a/f are hardlinked on one
+    filesystem, the canonical is a/f for either command-line order of the
+    roots, and the scanner emits /y/a before /x/b.
+44. two source roots with the same final component are rejected with
+    DESTINATION_NAMESPACE_COLLISION before any transfer.
+45. resuming with the same roots in a different command-line order is
+    compatible; adding, removing, or remapping a root is INCOMPATIBLE_STATE.
 ```
 
 ## 259.15 V15 Implementation Baseline
