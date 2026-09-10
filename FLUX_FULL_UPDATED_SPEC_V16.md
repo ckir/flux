@@ -164,6 +164,7 @@ Revision history:
     56. Per-prefix locks apply only with multiple roots (Section 18.3).
     57. `--dry-run --restart` previews the refusal a real `--restart`
         would get (Section 5.2).
+    58. `TransferAction` has a `CreateSymlink` variant (Section 45).
 
     V16 adds acceptance tests 31--88 to Section 259.14.
 
@@ -2284,6 +2285,7 @@ enum TransferAction {
     CreateDirectory { /* ... */ },
     CopyFile { /* ... */ },
     LinkFile { /* ... */ },
+    CreateSymlink { /* payload copied verbatim; Sections 124, 125 */ },
     ReflinkFile { /* ... */ },
     SetMetadata { /* ... */ },
     VerifyFile { /* ... */ },
