@@ -301,8 +301,12 @@ Revision history:
         the existing entry, durable and resume-safe, not by a
         before-either-is-published check the streaming planner cannot
         make; this tightens item 49 (Section 241.5).
+    89. The `capacity_failure` retry category covers only atomic
+        temporary capacity (Section 254); `DISK_FULL` on any other
+        destination write is `operator_action_required` (Sections 29,
+        207).
 
-    V16 adds acceptance tests 31--111 to Section 259.14.
+    V16 adds acceptance tests 31--112 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -8680,9 +8684,13 @@ must be deterministic and observable. What each category does is not:
 | `non_retryable` | not retried; a `path_scoped` one may fall back to the next candidate (Section 253.2) |
 | `operator_action_required` | not retried; reported, and the operation can be resumed once the cause is fixed (Section 20) |
 | `source_mutation` | retried within the attempt budget; every attempt re-validates the source (Section 33) |
-| `capacity_failure` | handled by the capacity states of Section 254, not by the attempt budget |
+| `capacity_failure` | covers only atomic temporary capacity (Section 254); handled by those states, not by the attempt budget |
 | `lock_conflict` | not retried; reported as `TARGET_LOCK_BUSY` (no wait mode, Section 96) |
 | `filesystem_identity_failure` | not retried; `object_scoped` |
+
+`DISK_FULL` on any destination write outside atomic temporary capacity
+(Section 29) is `operator_action_required`: not retried, reported, and
+the operation can be resumed once space is freed.
 
 Independently, every failure of a hardlink candidate is classified by
 scope:
@@ -12959,6 +12967,10 @@ A conforming implementation must test at least:
      destination entry: the first to claim it proceeds, the second's
      claim finds it taken and is reported DESTINATION_NAMESPACE_COLLISION
      without being published; the claim survives resume.
+112. DISK_FULL on a destination write outside atomic temporary capacity
+     is not retried, is reported, and the operation can be resumed once
+     space is freed; DISK_FULL inside atomic temporary capacity is
+     handled by the Section 254 capacity states instead.
 ```
 
 ## 259.15 V15 Implementation Baseline
