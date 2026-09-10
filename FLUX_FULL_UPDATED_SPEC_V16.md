@@ -122,8 +122,10 @@ Revision history:
         (Sections 5.1, 91, 142, 253.7).
     36. Each directory publication state has a meaning and a recovery
         action (Section 30.1).
+    37. Each `LockCapability` value is mapped to whether exclusive
+        operations are allowed or refused (Section 235.1).
 
-    V16 adds acceptance tests 31--77 to Section 259.14.
+    V16 adds acceptance tests 31--78 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -9473,6 +9475,13 @@ enum LockCapability {
 }
 ```
 
+| Value | Meaning | Operations needing target exclusivity |
+|---|---|---|
+| `LocalStrong` | local filesystem whose exclusive creation and locks have the properties of Section 235.2 | allowed |
+| `RemoteStrong` | remote filesystem whose deployment is verified to have those properties | allowed |
+| `RemoteUnverified` | remote filesystem whose lock contract cannot be verified | refused: `REMOTE_LOCK_UNSAFE` |
+| `Unsupported` | no usable exclusive-creation or lock primitive | refused: `REMOTE_LOCK_UNSAFE` |
+
 ## 235.2 Required Strong-Lock Properties
 
 A lock mechanism used for safe concurrent destination mutation must
@@ -12261,6 +12270,8 @@ A conforming implementation must test at least:
 77. a crash in each directory publication state of Section 30.1 recovers with
     that state's stated action; DIRECTORY_PUBLISHING that cannot be decided
     becomes COMMIT_STATE_UNCERTAIN.
+78. an adapter reporting RemoteUnverified or Unsupported makes every operation
+    that needs target exclusivity fail with REMOTE_LOCK_UNSAFE.
 ```
 
 ## 259.15 V15 Implementation Baseline
