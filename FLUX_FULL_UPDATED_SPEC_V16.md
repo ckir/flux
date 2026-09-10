@@ -152,8 +152,10 @@ Revision history:
         (Sections 32, 39).
     51. Hardlink groups cover regular files and symlink inodes; special
         files are handled per entry (Sections 12.1, 72, 86, 259.11).
+    52. `--resume-verify` may change on resume; missing digests upgrade
+        validation to `full` (Sections 121, 211).
 
-    V16 adds acceptance tests 31--85 to Section 259.14.
+    V16 adds acceptance tests 31--86 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -5256,6 +5258,12 @@ Two options may change in one direction only:
 These may change freely on resume: `--workers`, `--json`, `--quiet`,
 `-v` / `-vv` / `-vvv`, `--heartbeat-interval`, `--lease-timeout`.
 
+`--resume-verify` may also change. If the requested level needs chunk
+digests that were compacted away under a weaker policy (Section 211),
+Flux validates the partial data with `full` instead, re-reading and
+hashing source and destination, never with anything weaker, and reports
+the upgrade.
+
 Changes that cannot be safely migrated produce:
 
 ``` text
@@ -8434,7 +8442,8 @@ the resulting representation still provides the exact guarantees
 required by that policy.
 
 The implementation must document the point at which individual chunk
-digests cease to be recoverable.
+digests cease to be recoverable. A later resume that asks for chunk
+validation after that point is validated with `full` (Section 121).
 
 ------------------------------------------------------------------------
 
@@ -12423,6 +12432,8 @@ A conforming implementation must test at least:
 85. two entries of one symlink inode are recreated as one symlink plus a
     hardlink to it with the payload unchanged; special files with several
     entries are handled per entry and reported as degraded.
+86. resuming with --resume-verify=chunks after digests were compacted under
+    --resume-verify=metadata validates with full and reports the upgrade.
 ```
 
 ## 259.15 V15 Implementation Baseline
