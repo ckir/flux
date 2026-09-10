@@ -3201,7 +3201,9 @@ The following decisions are mandatory for the implementation:
 
 1.  Canonical hardlink identity is immutable for the lifetime of an
     operation.
-2.  A failed canonical hardlink member is never dynamically promoted.
+2.  A failed canonical hardlink member is never dynamically replaced as
+    canonical. Fallback materialization (Section 253) may select a
+    different materialization anchor without changing `canonical_path`.
 3.  Dependent hardlink actions are held outside the worker execution
     queue until their canonical object is materialized.
 4.  Single-file destination targets require destination-path locking in
@@ -3273,9 +3275,11 @@ Field semantics:
 -   `current_attempt_id` identifies the authoritative current execution
     attempt (Section 202). It is the value that Section V14.3 attempt
     fencing compares against.
--   `attempt_number` is the ordinal of the current attempt for
-    `candidate_path`, starting at 1 for the initial attempt. It is
-    durable and survives restart (Section 206).
+-   `attempt_number` is the ordinal of the current attempt within the
+    whole hardlink group, counting retries and fallback candidates
+    alike, starting at 1 for the initial attempt. It is durable and
+    survives restart, and it is bounded by the per-group retry budget
+    (Section 206).
 -   `Materialized.destination_path` is the `materialization_anchor`
     (Section 259.2): the destination path of the member that actually
     created the object. It may differ from `canonical_path`.
@@ -6001,7 +6005,7 @@ The implementation must preserve all of the following:
 
 ``` text
 1. Canonical hardlink selection is deterministic and immutable.
-2. Canonical failure never promotes another member.
+2. Canonical failure never promotes another member to canonical (fallback anchors: Section 253).
 3. Dependents never consume worker slots while waiting.
 4. Canonical completion releases dependents through an event-driven path.
 5. Persistent topology remains authoritative after event loss.
@@ -7350,7 +7354,8 @@ struct CanonicalExecution {
     // Member this attempt materializes; equals canonical_path
     // unless this is a fallback attempt (Section 253).
     candidate_path: RelativePath,
-    // Ordinal for candidate_path; 1 = initial attempt (Section 206).
+    // Ordinal within the hardlink group, across retries and fallback
+    // candidates; 1 = initial attempt (Section 206).
     attempt_number: u64,
     state: ExecutionState,
     started_at: Timestamp,
@@ -7524,18 +7529,22 @@ Retry count semantics are:
 --retries=3  → at most three retries after the initial attempt
 ```
 
-Therefore, a default operation may contain up to four execution
-attempts: the initial attempt plus three retries.
+Therefore, by default a file, or a whole hardlink group, may use up to
+four execution attempts: the initial attempt plus three retries.
 
-Retry exhaustion for a candidate produces:
+For a hardlink group the budget is shared: retries of one candidate and
+attempts on fallback candidates (Section 253) all draw on the same
+`initial + N` attempts. Falling back never grants a fresh budget.
+
+Budget exhaustion produces:
 
 ``` text
 CANONICAL_RETRY_EXHAUSTED
 ```
 
-for that candidate. The topology state becomes `Failed` only when no
-viable fallback candidate remains (Sections 253, 259.2). Dependents then
-become:
+and the topology state becomes `Failed`. A group can also become
+`Failed` before the budget is spent: when the failure is file-wide, or
+when no candidate can remain (Section 253.5). Dependents then become:
 
 ``` text
 BLOCKED_BY_CANONICAL_FAILURE
@@ -7587,6 +7596,27 @@ permanent path conflict
 
 The classification is implementation-defined but must be deterministic
 and observable.
+
+Independently, every failure of a hardlink candidate is classified by
+scope:
+
+``` text
+path_scoped
+    tied to one member's path; another member of the same object
+    may succeed. Examples: invalid or colliding destination name
+    (Section 241.5), destination-side permission on the member's
+    parent directory, path too long for the destination.
+
+object_scoped
+    tied to the source object itself; every member reads the same
+    object and would fail the same way. Examples: source read I/O
+    error, source mutation, capacity failure, filesystem identity
+    failure.
+```
+
+Only `path_scoped` failures permit fallback materialization (Section
+253.2). When the scope cannot be established, the failure is treated as
+`object_scoped`.
 
 ------------------------------------------------------------------------
 
@@ -10077,19 +10107,38 @@ C/file
 ...
 ```
 
+The candidate sequence is the group's selected members in `FluxPathKey`
+order. Because the scanner emits in that order (Section 7.2), it is also
+discovery order: the next candidate is the next selected member of the
+group that the scanner has discovered and that has not been attempted.
+
 If:
 
 ``` text
-A/file → Failed
+A/file → attempt Failed
 ```
 
-after exhausting its retry policy, Flux may attempt:
+Flux may attempt:
 
 ``` text
 B/file
 ```
 
-as the next materialization candidate.
+as the next materialization candidate, subject to all of:
+
+``` text
+1. the failure is path_scoped (Section 207); an object_scoped failure
+   makes the group terminally Failed without fallback
+2. the shared per-group attempt budget is not exhausted (Section 206);
+   a path_scoped failure that is not retryable moves straight to the
+   next candidate and spends one attempt
+3. a next candidate exists
+```
+
+If the failure permits fallback but no next candidate has been
+discovered yet, the record stays `Copying` with its failed current
+attempt, dependents stay held, and the next member the scanner
+discovers for this identity becomes the candidate.
 
 This is not a change to the group's identity or canonical ordering.
 
@@ -10134,19 +10183,26 @@ B/file → MATERIALIZED OBJECT
 C/file → HARDLINK TO MATERIALIZED OBJECT
 ```
 
-The final destination topology remains:
+Every failed candidate, including the canonical `A/file`, then becomes an
+ordinary dependent link action to the materialization anchor:
 
 ``` text
-B/file == C/file
+A/file → HARDLINK TO MATERIALIZED OBJECT (reported with its earlier
+         failed attempts)
 ```
 
-and any eligible action for `A/file` follows the configured failure
-policy because its own source action failed.
+This creates nothing that was not observed: `A/file` was established as
+a member of the same source object during the scan, and fallback is only
+permitted after a `path_scoped` failure, so the object's content was not
+the problem. If the link action fails too, for example because the
+destination path of `A/file` is itself the cause, `A/file` is reported
+failed with both its attempt failures and the link failure. The final
+destination topology is then:
 
-If the source path `A/file` is required to exist independently, the
-engine may need to copy its content separately rather than silently
-turning a failed source path into a hardlink. The specification must not
-invent a source object at a path that could not be read.
+``` text
+A/file == B/file == C/file     (when the link for A/file succeeds)
+B/file == C/file               (when it fails; A/file reported failed)
+```
 
 ## 253.5 Complete Group Failure
 
@@ -10156,6 +10212,22 @@ become:
 ``` text
 HARDLINK_GROUP_UNMATERIALIZABLE
 ```
+
+That is the terminal `TopologyState::Failed` (Section 90). It is reached
+when any of these holds:
+
+``` text
+1. the latest failure is object_scoped (Section 207)
+2. the shared per-group attempt budget is exhausted (Section 206)
+3. no candidate remains and no further member can appear
+```
+
+"No further member can appear" requires that the scan of every source
+root is complete, or that the number of distinct selected members seen
+for the identity equals the object's link count. Before either holds, a
+group whose failure permits fallback stays `Copying` and its dependents
+stay held, because a later-discovered member may still materialize the
+object.
 
 At that point dependents become:
 
@@ -10299,7 +10371,7 @@ The following are normative:
 12. Hardlink canonical ordering is distinct from materialization attempt selection.
 13. A failed first canonical candidate may be followed by another deterministic candidate.
 14. Hardlink fallback never merges unrelated source identities.
-15. A hardlink group is terminally failed only after all viable materialization candidates fail.
+15. A hardlink group is terminally failed only on an object-scoped failure, an exhausted per-group budget, or no viable candidate once no further member can appear (Section 253.5).
 16. --atomic=always never silently degrades because of capacity shortage.
 17. Capacity waiting must have a progress/recoverability test.
 18. Provably impossible atomic capacity transitions to FAILED_ATOMIC_CAPACITY.
@@ -11120,11 +11192,11 @@ The normative default remains:
 --retries=3
 ```
 
-This means one initial attempt plus at most three retries, for at most four attempts per candidate. The retry count is durable and survives restart.
+This means one initial attempt plus at most three retries, for at most four attempts per file or per hardlink group. For a hardlink group the budget is shared across retries and fallback candidates (Section 206). The retry count is durable and survives restart.
 
 `canonical_path` is the immutable deterministic representative. `materialization_anchor` is the destination member that actually succeeds in creating the materialized object.
 
-After canonical retries are exhausted, eligible fallback candidates may be attempted according to the deterministic hardlink candidate ordering. A fallback candidate never becomes canonical.
+After a `path_scoped` failure (Section 207), eligible fallback candidates may be attempted according to the deterministic hardlink candidate ordering, within the same budget (Section 253.2). An `object_scoped` failure is terminal. A fallback candidate never becomes canonical.
 
 Example:
 
@@ -11135,7 +11207,7 @@ materialization_anchor = B/file
 
 is valid.
 
-The hardlink group becomes terminally unmaterializable only after all viable permitted candidates have been exhausted or proven unusable. Earlier shorthand that canonical failure immediately blocks all dependents applies only to terminal group failure. Dependents remain blocked while a retry or fallback candidate can still establish the required materialization.
+The hardlink group becomes terminally unmaterializable only under the conditions of Section 253.5: an `object_scoped` failure, an exhausted per-group budget, or no remaining candidate once no further member can appear. Earlier shorthand that canonical failure immediately blocks all dependents applies only to terminal group failure. Dependents stay held (not blocked) while a retry or fallback candidate can still establish the required materialization.
 
 ## 259.3 Source `.flux` Semantics
 
@@ -11422,6 +11494,15 @@ A conforming implementation must test at least:
     anchor and canonical_path is unchanged.
 34. dependents stay held (not blocked) while a retry or fallback candidate
     remains, and become BLOCKED_BY_CANONICAL_FAILURE only on terminal Failed.
+35. an object_scoped canonical failure makes the group terminally Failed
+    without attempting any fallback candidate.
+36. --retries=N bounds a hardlink group to N+1 attempts in total across
+    retries and fallback candidates, including after restart.
+37. after a fallback anchor materializes, the failed canonical becomes a
+    link to the anchor; if that link fails it is reported with both errors.
+38. a group whose canonical failed path_scoped before any other member was
+    discovered stays Copying with dependents held, and a later-discovered
+    member becomes the next candidate.
 ```
 
 ## 259.15 V15 Implementation Baseline
