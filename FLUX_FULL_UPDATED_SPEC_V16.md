@@ -355,8 +355,10 @@ Revision history:
     102. Section 99 defines "still owned" as the lock file holding the operation's own record, and a failed
         revalidation stops the operation, resumable (Section 99).
     103. --restart keeps the target locked from step 1 to the start of the new operation (Section 21.1).
+    104. A refusal that cannot remove a lock or probe file it created reports the path and exits 1; the probe writes
+        only inside the operation's workspace (Sections 55, 97.1, 241.5).
 
-    V16 adds acceptance tests 31--130 to Section 259.14.
+    V16 adds acceptance tests 31--131 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -2829,7 +2831,8 @@ Exit codes (normative):
 "Nothing was changed" means the destination's content and any prior
 operation's state are as they were; a lock or probe file that Flux
 created and removed again while refusing does not count (Sections
-97.1, 241.5).
+97.1, 241.5). If Flux cannot remove a lock or probe file it
+created while refusing, it reports the file's path and exits 1 instead of 3.
 
 Where a partial run hit a refusal on some paths only (for example
 Section 97.1(b), or a path rejected under Section 149.7), the result is
@@ -4694,10 +4697,10 @@ classifies each lock it finds as Section 240 does: a live owner → it
 releases its own lock and refuses with `TARGET_LOCK_BUSY`; uncertain
 ownership → it releases its own lock and refuses with
 `TARGET_LOCK_UNCERTAIN`; a demonstrably abandoned owner is not an
-obstacle. In both refusals nothing is changed, and the operator resolves
+obstacle. In both refusals the operator resolves
 the ancestor's lock itself (for example `flux cleanup --target <ancestor>
 --break-lock`, Section 240.5). If removing its own lock fails, the
-refusal reports that lock's path; the lock has no live owner and is
+refusal reports that lock's path and exits 1 (Section 55); the lock has no live owner and is
 recovered like any dead owner's lock (Section 240.3). Creating its own
 lock first, then checking, mirrors Section 96.1's acquirer protocol, so
 two racing operations can never both proceed.
@@ -10645,8 +10648,9 @@ the destination. Before a directory operation changes anything, Flux
 probes the destination for one of these primitives. If none is
 available, the operation is refused with `NOREPLACE_PUBLISH_UNAVAILABLE`
 (exit code 3); check-then-rename is never used as a substitute. The
-probe writes only inside Flux's own control state (Section 259.3) and
-removes what it wrote; anything it cannot remove is reported. Under
+probe writes only inside the operation's workspace and
+removes what it wrote. A file it cannot remove is reported as a warning and goes with the workspace when cleanup
+removes it; if the operation is being refused, it exits 1 instead of 3 (Section 55). Under
 `--dry-run` it writes nothing at all; a primitive it cannot establish
 without writing is reported as unprobed, and the preview says that a
 real run may be refused with `NOREPLACE_PUBLISH_UNAVAILABLE` (Section
@@ -13216,6 +13220,8 @@ A conforming implementation must test at least:
      TARGET_LOCK_BUSY, and remains resumable.
 130. --restart never leaves the target unlocked between taking the prior operation's lock and starting the new
      operation.
+131. a refusal that cannot remove its own lock or probe file reports the path and exits 1; a probe file left by an
+     operation that proceeds is reported as a warning and removed with the workspace.
 ```
 
 ## 259.15 V15 Implementation Baseline
