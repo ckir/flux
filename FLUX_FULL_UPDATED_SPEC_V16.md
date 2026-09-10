@@ -67,8 +67,10 @@ Revision history:
         every level is defined (Sections 5, 32, 82).
     12. `--links=skip` is defined: symlinks are not created and each is
         reported as skipped (Sections 5, 124).
+    13. `--overwrite`, `--update`, and `--skip-existing` are defined and
+        mutually exclusive; overwrite is the default (Sections 5, 5.1).
 
-    V16 adds acceptance tests 31--57 to Section 259.14.
+    V16 adds acceptance tests 31--58 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -291,9 +293,9 @@ Planned interface:
 
 --exclude <PATTERN>                  (Section 14)
 
---overwrite
---update
---skip-existing
+--overwrite                          (Section 5.1; default)
+--update                             (Section 5.1)
+--skip-existing                      (Section 5.1)
 
 --verify[=<none|source-stream|destination|full>]
                                      (Section 32; default source-stream;
@@ -340,6 +342,32 @@ Planned interface:
 
 Not every option must be exposed in Flux 0.1, but internal APIs must be
 designed so these semantics can be added without redesigning the engine.
+
+## 5.1 Existing Destination Policy
+
+When a destination file target already exists, exactly one policy
+applies:
+
+``` text
+--overwrite       replace it (default when no policy is given)
+--update          replace it only when the source mtime is newer or the
+                  sizes differ
+--skip-existing   never modify it; report it as skipped
+```
+
+Giving more than one of these options is a usage error (exit code 2).
+
+The policy applies per file target, including hardlink dependents.
+Existing directories are merged into, not replaced, except under
+`--atomic=always` (Sections 30.1, 259.9). Replacement follows the atomic
+policy (Sections 27, 116): with atomic replacement, the existing target
+stays untouched until publication.
+
+`--update` compares metadata only. A changed source whose mtime did not
+advance and whose size is unchanged is not replaced; use `--overwrite`
+when that matters.
+
+Skipped targets appear in the report and in "files skipped" (Section 51).
 
 ------------------------------------------------------------------------
 
@@ -11896,6 +11924,9 @@ A conforming implementation must test at least:
 56. each --verify level performs exactly the checks of Section 32; bare --verify
     means destination; --hash selects the algorithm independently.
 57. --links=skip creates no destination symlinks and reports every skipped one.
+58. with no policy an existing file is replaced; --update replaces only a newer
+    or differently sized source; --skip-existing reports and keeps it; two
+    policies together are a usage error.
 ```
 
 ## 259.15 V15 Implementation Baseline
