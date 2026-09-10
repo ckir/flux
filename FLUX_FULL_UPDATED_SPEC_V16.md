@@ -185,8 +185,12 @@ Revision history:
     64. Section 249.1's list now includes `cleanup_pending` and
         `cleanup_pending_artifacts` (required by Section 218), completing
         item 31 (Sections 218, 249.1).
+    65. A standalone catalog record left with no artifacts by a crash
+        between Section 250.3's steps 3 and 4 is an orphan; default
+        cleanup classifies it `STALE` and deletes it under the target
+        lock (Sections 250.3, 251.1).
 
-    V16 adds acceptance tests 31--92 to Section 259.14.
+    V16 adds acceptance tests 31--93 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -10749,7 +10753,9 @@ Successful completion follows:
 ```
 
 If the process dies between these steps, the catalog and/or adjacent
-state provide recovery information.
+state provide recovery information. A crash between steps 3 and 4 leaves
+an orphan catalog record; default cleanup classifies and removes it
+(Section 251.1).
 
 Step 5 never removes a directory that still contains any entry, or one
 that Flux did not create.
@@ -10827,6 +10833,14 @@ deletion precondition now (Sections 130, 216, 217, 222). `--force` may
 also mark `RESUMABLE` rows eligible, bypassing retention only. `LIVE`,
 `UNCERTAIN`, and `CORRUPT` rows are never eligible; `CORRUPT` workspaces
 are kept for diagnosis.
+
+A standalone catalog record whose target has no lock, state, or partial
+artifact is an orphan (a crash between Section 250.3's steps 3 and 4
+leaves exactly this). Default cleanup classifies an orphan `STALE` and
+marks it eligible. Deletion acquires the target lock without waiting,
+re-checks that no artifact has appeared, deletes the record, and
+releases the lock. Registration creates the lock before the record
+(Section 250.2), so a live registration always holds a lock.
 
 ## 251.2 Explicit Target Cleanup
 
@@ -12565,6 +12579,10 @@ A conforming implementation must test at least:
 92. flux cleanup --target PATH for a target whose lock fell back to
     P/.flux-dir.lock (Section 96.1) inspects that lock file; it is not
     left undiscoverable.
+93. a standalone catalog record with no lock, state, or partial artifact
+    is classified STALE and eligible by default cleanup, and is deleted
+    only while the target lock is held, after re-checking that no
+    artifact has appeared.
 ```
 
 ## 259.15 V15 Implementation Baseline
