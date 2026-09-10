@@ -264,8 +264,12 @@ Revision history:
         `--lease-timeout` in the freely-changeable resume list are marked
         when implemented (Section 121); a single-file operation's
         `relative_path` is the target's file name (Section 233.1).
+    81. Any WAL write failure Section 189 lists — disk full, I/O error,
+        permission failure, or filesystem corruption — enters the
+        emergency persistence path, not only `ENOSPC` (Sections 189,
+        231.3, 238).
 
-    V16 adds acceptance tests 31--107 to Section 259.14.
+    V16 adds acceptance tests 31--108 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -8013,6 +8017,10 @@ drain what can safely be persisted
 enter operation failure/paused state
 ```
 
+Any of these WAL write failures enters the emergency persistence path
+(Section 231.3), not only `ENOSPC`. If the emergency journal fails too,
+Section 231.5 applies.
+
 The final state must accurately indicate whether resume state is
 trustworthy.
 
@@ -9652,18 +9660,14 @@ consumes the available space.
 
 ## 231.3 Emergency Path
 
-If the normal WAL encounters:
-
-``` text
-ENOSPC
-```
-
-the engine enters the emergency persistence path:
+If the normal WAL becomes unwritable for any of the reasons Section 189
+lists (disk full, I/O error, permission failure, filesystem corruption),
+not only `ENOSPC`, the engine enters the emergency persistence path:
 
 ``` text
 normal WAL
     ↓
-ENOSPC
+WAL write failure (disk full, I/O error, permission failure, filesystem corruption)
     ↓
 emergency control journal
     ↓
@@ -10090,7 +10094,7 @@ normal WAL
     │
     ├── capacity available → normal operation
     │
-    └── ENOSPC
+    └── WAL write failure (disk full, I/O error, permission failure, filesystem corruption)
           ↓
     emergency reserved space
           ↓
@@ -12871,6 +12875,10 @@ A conforming implementation must test at least:
      level; a source-stream-only run reports files_verified as 0; --json
      includes files_verified, files_mismatched, files_failed,
      files_overwritten, bytes_skipped, verify_level, and hash_algorithm.
+108. any WAL write failure (disk full, I/O error, permission failure, or
+     filesystem corruption), not only ENOSPC, enters the emergency
+     persistence path; if the emergency journal fails too,
+     CONTROL_STATE_DURABILITY_FAILURE is reported.
 ```
 
 ## 259.15 V15 Implementation Baseline
