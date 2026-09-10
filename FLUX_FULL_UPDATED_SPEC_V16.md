@@ -57,8 +57,13 @@ Revision history:
         state refuses with `RESUMABLE_OPERATION_EXISTS`; `--restart`
         supersedes the prior operation and deletes its state before
         copying (Sections 5, 19, 21.1, 22, 239.2, 249.3).
+    10. Target locks are files named after the target in its own parent
+        directory and created exclusively, so the destination filesystem's
+        own case and Unicode-form rules decide which spellings contend; the
+        hashed lock directory is removed (Sections 96, 96.1, 97, 99.1,
+        119, 220, 241.5, 250, 259.6).
 
-    V16 adds acceptance tests 31--49 to Section 259.14.
+    V16 adds acceptance tests 31--55 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -2207,7 +2212,7 @@ existing code.
 | `STRICT_DURABILITY_UNAVAILABLE` | `--durability=strict` cannot be established for the filesystem. | 169 |
 | `SYMLINK_CREATION_UNAVAILABLE` | A symlink cannot be created (for example, a missing Windows privilege); action-scoped. | 127, 259.11 |
 | `TARGET_LOCK_BUSY` | A live owner holds the destination target lock. | 96, 240.2, 252.2 |
-| `TARGET_LOCK_KEY_COLLISION` | Two distinct complete lock or catalog keys share a digest; the targets are never aliased. | 250, 259.6 |
+| `TARGET_LOCK_KEY_COLLISION` | Two distinct complete keys share a catalog-record digest; the records are never merged. | 250 |
 | `TARGET_LOCK_UNCERTAIN` | Flux cannot distinguish a dead lock owner from a stalled one. | 240.4, 252.4 |
 | `VERIFY_MISMATCH` | A verification digest did not match. | 55, 135 |
 | `WAL_CORRUPT` | WAL corruption found before the trailing record. | 174, 191 |
@@ -3816,20 +3821,14 @@ For a single-file destination:
 DEST/target.flux-lock
 ```
 
-or an equivalent native locking primitive protects:
+protects:
 
 ``` text
 DEST/target
 ```
 
-The target lock identity is derived from the normalized destination
-target, including its canonical:
-
-``` text
-FluxPathKey
-```
-
-and is not derived from the operation ID.
+The target lock is named after the destination target (Section 96.1) and
+is not derived from the operation ID.
 
 Therefore:
 
@@ -3851,6 +3850,83 @@ unless an explicit future wait/retry mode is enabled.
 A target lock establishes namespace exclusivity. It does not, by itself,
 establish object identity or object continuity.
 
+## 96.1 Name-Equivalent Target Locks
+
+Destination filesystems differ in which names denote the same entry.
+Some ignore case, some ignore case only in particular directories, and
+some treat different Unicode normalization forms as the same name. No
+fixed lexical rule matches all of them, and `FluxPathKey` deliberately
+folds nothing (Section 103). A lock keyed by `FluxPathKey`, or by a digest
+of it, would give two spellings of one destination entry two separate
+locks. Measured on NTFS: `Backup` and `backup` are one entry, while the
+NFC and NFD forms of `café` are two.
+
+Flux therefore lets the destination filesystem decide. A target lock is a
+lock file created in the target's parent directory `P`, named after the
+target:
+
+``` text
+P/<name>.flux-lock
+```
+
+where `<name>` is the target's final path component exactly as the
+operation will publish it. The lock file is created with exclusive
+creation (`O_CREAT | O_EXCL`, `CREATE_NEW`, or the platform equivalent).
+Because it lives in the same directory as the target, and its name is the
+target's name plus a suffix beginning with an ASCII `.`, the filesystem
+applies the same name equivalence to the lock as to the target. Two
+spellings the filesystem treats as one entry cannot both create their
+lock; two names it treats as distinct never share one.
+
+When exclusive creation fails because the lock already exists:
+
+``` text
+record names another operation
+    → ownership rules of Sections 240 and 252 (TARGET_LOCK_BUSY,
+      TARGET_LOCK_UNCERTAIN, or recovery under Section 21.1)
+
+record names this operation, for a different target spelling
+    → the two targets alias on the destination:
+      DESTINATION_NAMESPACE_COLLISION (Section 241.5)
+
+object at the lock path is not a valid Flux lock record
+    → CONTROL_PLANE_NAMESPACE_CONFLICT; the object is never overwritten
+```
+
+The lock record (Section 259.6) stores the spelling that created it. A
+contender whose spelling differs, but whose creation fails, is contending
+for the same entry.
+
+An OS-native lock, such as a byte-range lock or `flock` on the lock file,
+may be held on the lock file to prove the owner is alive (Sections 240,
+252). It never replaces the named lock file, because a primitive keyed by
+anything other than the filesystem's own resolution of `<name>` loses the
+name equivalence.
+
+If `<name>.flux-lock` would exceed the directory's name-length limit, the
+operation takes the directory lock instead, which covers every target in
+`P`:
+
+``` text
+P/.flux-dir.lock
+```
+
+Per-name locks and the directory lock exclude each other by announcing,
+then checking:
+
+``` text
+per-name acquirer    create P/<name>.flux-lock, then check that
+                     P/.flux-dir.lock is absent
+directory acquirer   create P/.flux-dir.lock, then list P (non-recursively)
+                     for *.flux-lock held by other operations
+```
+
+On a conflict the acquirer removes what it created and reports
+`TARGET_LOCK_BUSY`. Both acquirers may back off; both can never proceed.
+
+Exclusive creation on a remote filesystem is trusted only under the lock
+capability rules of Section 235; otherwise `REMOTE_LOCK_UNSAFE`.
+
 ------------------------------------------------------------------------
 
 # 97. Directory Target Locking
@@ -3869,8 +3945,10 @@ Required invariant:
 > Two Flux operations may not concurrently publish or destructively
 > replace the same destination object.
 
-The target-lock key MUST remain stable for the normalized destination
-namespace/path even when the filesystem's object identity is weak.
+Target locks, including the lock on a directory operation's destination
+root, follow Section 96.1. They depend on the destination's name
+resolution, not on object identity, so they remain valid when the
+filesystem's object identity is weak.
 
 ------------------------------------------------------------------------
 
@@ -3940,8 +4018,8 @@ invalidate ownership.
 A weak or unavailable filesystem identity does NOT by itself invalidate
 a strong, authoritative, path-scoped target lock.
 
-Target-lock identity is based on the authoritative destination namespace
-and canonical `FluxPathKey` of the target.
+Target-lock identity is the target's name as the destination filesystem
+resolves it in the target's parent directory (Section 96.1).
 
 Therefore:
 
@@ -4742,8 +4820,8 @@ DEST/
 └── target.flux-lock
 ```
 
-The lock may be implemented using an OS-native lock primitive rather
-than a persistent visible file.
+An OS-native lock may be held on the lock file for liveness, but never
+replaces it (Section 96.1).
 
 ## Directory
 
@@ -8275,6 +8353,7 @@ The default policy must favor recoverability over aggressive cleanup.
   `.flux/WAL/*`                          Managed control plane   Yes                  Yes
   `.flux/topology/*`                     Managed control plane   Yes                  Yes
   `target.flux-lock`                     Adjacent target scope   Yes                  Yes
+  `P/.flux-dir.lock`                     Adjacent target scope   Yes                  Yes
   `target.flux-partial.<operation-id>`   Adjacent target scope   Yes                  Yes
   `target.flux-state.<operation-id>`     Adjacent target scope   Yes                  Yes
   Arbitrary `*.flux-*` elsewhere         Never by default        N/A                  N/A
@@ -9570,6 +9649,9 @@ DESTINATION_NAMESPACE_COLLISION
 
 unless an explicit, deterministic collision policy has been selected.
 
+Target locks detect this within an operation: the second target's lock
+creation fails against the operation's own lock (Section 96.1).
+
 ## 241.6 Hardlink Independence
 
 Unicode normalization never determines hardlink identity.
@@ -10052,13 +10134,17 @@ P/.flux/
 The catalog therefore lives in the target's own parent directory; there
 is no user-wide or system-wide catalog (Section 18).
 
-A known target is looked up directly by computing `K`, with no directory
-listing. The record stores the complete key `K`; a stored key that
-differs from the looked-up key is a collision, handled as in Section
-259.6, and the targets must never be aliased. If the record is missing,
-for example after a crash between steps 2 and 3 of Section 250.2, Flux
-may list `P` non-recursively for that target's adjacent artifacts
-(Section 251.2) to reconstruct it.
+A known target is looked up through its lock file, with no directory
+listing: Flux opens `P/<name>.flux-lock` by name, so the filesystem
+resolves any spelling of the target to the same lock (Section 96.1). The
+lock record names the operation and the complete key `K`, and the
+catalog record is `<sha256(K)>.record` for that recorded `K`, whatever
+spelling the invocation used. The catalog record stores `K`; a stored key
+that differs from the key it was looked up with is a digest collision,
+`TARGET_LOCK_KEY_COLLISION`, and the two records are never merged. If the
+lock or the record is missing, for example after a crash between steps 2
+and 3 of Section 250.2, Flux may list `P` non-recursively for that
+target's adjacent artifacts (Section 251.2) to reconstruct it.
 
 A pre-existing `P/.flux` that Flux does not own is handled as in Section
 259.3: it is never overwritten or reinterpreted.
@@ -10711,7 +10797,8 @@ GC-UNCERTAINTY-01
     deletion.
 
 TARGET-LOCK-01
-    target-lock identity is namespace/path scoped and stable for the target.
+    target-lock identity is the target's name as resolved by the destination
+    filesystem in its parent directory (Section 96.1), stable for the target.
 
 TARGET-LOCK-IDENTITY-01
     weak filesystem identity does not by itself invalidate a strong target lock.
@@ -11525,13 +11612,13 @@ The current filesystem-reported available-space result is authoritative for the 
 
 ## 259.6 Directory Target Lock Representation
 
-For directory target `T`, let `P` be its parent. The stable lock key `K` consists of the physical identity of `P` where reliably available plus the canonical `FluxPathKey` of `T` relative to `P`.
-
-When a visible lock representation is used, the normative layout is:
+For directory target `T`, let `P` be its parent. The lock is named after the target in `P`, as for every target (Section 96.1):
 
 ```text
-P/.flux-target-locks/<sha256(K)>.lock
+P/<T-name>.flux-lock
 ```
+
+Its complete key `K`, recorded in the lock, consists of the physical identity of `P` where reliably available plus the canonical `FluxPathKey` of `T` relative to `P`. `K` records the spelling that created the lock; it is not used to name the lock file, so the filesystem's own name equivalence decides which spellings contend.
 
 The lock record must include:
 
@@ -11546,15 +11633,9 @@ creation_time
 heartbeat
 ```
 
-The digest filename is not sufficient ownership proof. A detected collision between distinct complete keys must produce:
+The lock file's name is not ownership proof; the record inside it is validated (Section 216).
 
-```text
-TARGET_LOCK_KEY_COLLISION
-```
-
-and the targets must never be aliased.
-
-An OS-native lock primitive may replace the visible lock file only when it provides semantically equivalent exclusive ownership, authoritative acquisition, owner validation, and crash/disconnect recovery.
+An OS-native lock may be held on the lock file for liveness, with authoritative acquisition, owner validation, and crash/disconnect recovery. It never replaces the named lock file (Section 96.1).
 
 If the required target lock cannot be established, destination mutation must not proceed.
 
@@ -11715,7 +11796,7 @@ A conforming implementation must test at least:
 11. DEST/.flux control state is not scanned as source.
 12. foreign DEST/.flux state is never silently overwritten.
 13. directory target lock keys are deterministic.
-14. lock-key collisions are detected.
+14. catalog-record key digest collisions are detected.
 15. unsafe remote locking causes refusal.
 16. workers do not wait indefinitely for WAL while holding mutation locks.
 17. destination durability precedes durable checkpoint claims.
@@ -11750,7 +11831,8 @@ A conforming implementation must test at least:
     discovered stays Copying with dependents held, and a later-discovered
     member becomes the next candidate.
 39. a single-file operation registers at P/.flux/standalone/<sha256(K)>.record
-    in the target's parent, and resume finds it without listing P.
+    in the target's parent, and resume finds it through the target's lock file
+    without listing P.
 40. a crash between adjacent-state creation and catalog registration is
     recovered by a non-recursive listing of P.
 41. `flux cleanup DEST` enumerates only DEST/.flux/operations and
@@ -11774,6 +11856,18 @@ A conforming implementation must test at least:
     or corrupt prior state; --resume together with --restart is a usage error.
 49. a prior operation that completed with cleanup_pending does not block a
     new run.
+50. on a case-insensitive destination, `flux copy A /dest/Backup` and
+    `flux copy B /dest/backup` contend: the second gets TARGET_LOCK_BUSY.
+51. on a case-sensitive destination the same two commands proceed
+    independently.
+52. the NFC and NFD forms of one name lock separately on a filesystem that
+    treats them as distinct (NTFS), and contend on one that treats them as one.
+53. a target name too long for the lock suffix falls back to P/.flux-dir.lock,
+    and a per-name holder and a directory holder never both proceed.
+54. two targets of one operation that alias on the destination are reported as
+    DESTINATION_NAMESPACE_COLLISION through the operation's own lock.
+55. a resume that spells the target differently (Backup vs backup) on a
+    case-insensitive destination finds the prior operation through its lock.
 ```
 
 ## 259.15 V15 Implementation Baseline
