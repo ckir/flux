@@ -343,8 +343,11 @@ Revision history:
     98. Every publication claims the entry it creates, and claims are
         never released during the operation (Section 241.5); this
         completes item 88.
+    99. `operator_action_required` stops the operation without fallback,
+        terminal failure, or budget; walk errors other than links map
+        to generic codes (Sections 149.7, 207).
 
-    V16 adds acceptance tests 31--125 to Section 259.14.
+    V16 adds acceptance tests 31--126 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -7066,7 +7069,11 @@ If a component under `DEST` is a symlink, junction, or other reparse point
 that this operation did not create, that path is rejected: its actions
 fail with `SAFETY_REJECTED` and are reported, and the rest of the
 operation continues (exit status 1, Section 55). Symlinks this operation
-creates are leaves; the writer never walks through them.
+creates are leaves; the writer never walks through them. Any other error
+on the walk (a component that is missing or not a directory, or an I/O or
+permission error) fails that path's actions with the matching code
+(`DESTINATION_ERROR`, `IO_ERROR`, or `PERMISSION_DENIED`, Section 55),
+`path_scoped` (Section 207).
 
 ------------------------------------------------------------------------
 
@@ -8780,6 +8787,12 @@ must be deterministic and observable. What each category does is not:
 `DISK_FULL` on any destination write outside atomic temporary capacity
 (Section 29) is `operator_action_required`: not retried, reported, and
 the operation can be resumed once space is freed.
+
+An `operator_action_required` failure stops the operation, which stays
+resumable (Section 20). It is neither `path_scoped` nor `object_scoped`:
+a hardlink group whose attempt fails this way does not fall back and does
+not become terminal `Failed`. The failed attempt is recorded, no attempt
+budget is spent, and resume starts a new attempt for the same candidate.
 
 Independently, every failure of a hardlink candidate is classified by
 scope:
@@ -13163,6 +13176,11 @@ A conforming implementation must test at least:
      published is reported DESTINATION_NAMESPACE_COLLISION, before and
      after a resume; a claim whose target failed still blocks a later
      target resolving to the same entry.
+126. DISK_FULL on a hardlink group's canonical attempt stops the
+     operation with the group still Copying, spends no attempt budget,
+     and resume starts a new attempt for the same candidate; a missing
+     or non-directory component on the Section 149.7 walk fails that
+     path with the matching generic code.
 ```
 
 ## 259.15 V15 Implementation Baseline
