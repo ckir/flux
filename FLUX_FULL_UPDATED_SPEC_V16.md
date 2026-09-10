@@ -319,8 +319,13 @@ Revision history:
         this operation did not create rejects that path with
         `SAFETY_REJECTED` (Sections 55, 149.7).
     92. Tests are added for items 82, 84, 85, and 86 (Section 259.14).
+    93. Exit codes: code 1 also covers an operation that stopped with a
+        failure after changing something, such as
+        `CONTROL_STATE_DURABILITY_FAILURE`; code 3 applies to
+        `SAFETY_REJECTED` only from the Section 129 containment check;
+        "nothing was changed" is defined (Sections 55, 231.5).
 
-    V16 adds acceptance tests 31--118 to Section 259.14.
+    V16 adds acceptance tests 31--119 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -2770,19 +2775,29 @@ Exit codes (normative):
 ``` text
 0  success, including outcomes degraded under an auto policy (they are
    reported, Section 51)
-1  one or more actions failed, or verification found a mismatch
+1  one or more actions failed, verification found a mismatch, or the
+   operation stopped with a failure after it had changed something (for
+   example CONTROL_STATE_DURABILITY_FAILURE, or a WAL failure under
+   Section 189)
 2  usage or configuration error: the options are invalid, or invalid
    together for the given sources
 3  refused before changing anything: the operation was refused as a
    whole because of the state of the destination, a prior operation, or
    the platform (for example TARGET_LOCK_BUSY, OPERATION_LOCKED,
    TARGET_LOCK_UNCERTAIN, LEASE_AGE_UNCERTAIN, RESUMABLE_OPERATION_EXISTS,
-   INCOMPATIBLE_STATE, STATE_CORRUPT, REMOTE_LOCK_UNSAFE,
-   SAFETY_REJECTED), and nothing was changed
+   INCOMPATIBLE_STATE, STATE_CORRUPT, REMOTE_LOCK_UNSAFE, or
+   SAFETY_REJECTED from the containment check of Section 129), and
+   nothing was changed
 ```
 
+"Nothing was changed" means the destination's content and any prior
+operation's state are as they were; a lock or probe file that Flux
+created and removed again while refusing does not count (Sections
+97.1, 241.5).
+
 Where a partial run hit a refusal on some paths only (for example
-Section 97.1(b)), the result is exit code 1.
+Section 97.1(b), or a path rejected under Section 149.7), the result is
+exit code 1.
 
 Error code registry (normative). Every failure or result code used in
 this specification appears here. A change that introduces a new code
@@ -2803,7 +2818,7 @@ are used only when no more specific code applies.
 | `DESTINATION_ERROR` | A destination-side failure not covered by a more specific code, including a path the destination refuses as too long. | 55, 105, 207 |
 | `DESTINATION_NAMESPACE_COLLISION` | Two distinct source paths, or two source roots, map to the same destination object or prefix. | 18.3, 241.5 |
 | `DIRECTORY_CHANGED_DURING_SCAN` | An existing directory's identity changed while it was being entered. | 149.4 |
-| `DISK_FULL` | A destination data allocation failed for lack of space (`ENOSPC`, `ERROR_DISK_FULL`), outside the atomic capacity states of Section 254. | 29 |
+| `DISK_FULL` | A destination data allocation failed for lack of space (`ENOSPC`, `ERROR_DISK_FULL`), outside the atomic capacity states of Section 254. | 29, 207 |
 | `FAILED_ATOMIC_CAPACITY` | Required atomic temporary capacity provably exceeds the maximum recoverable capacity; terminal for the action. | 254.3 |
 | `HARDLINK_GROUP_UNMATERIALIZABLE` | Reported outcome of a hardlink group that reached terminal `Failed`. | 253.5 |
 | `HARDLINK_IDENTITY_UNAVAILABLE` | `--hardlinks=preserve` was requested but reliable object identity is unavailable. | 108 |
@@ -9805,6 +9820,10 @@ must be reported.
 Flux must not claim that the operation is durably paused when it cannot
 persist that fact.
 
+The operation then ends with exit code 1 (Section 55). The next start
+treats it like a crash: recovery uses the last durable WAL record
+(Section 189).
+
 ------------------------------------------------------------------------
 
 # 232. Persistent Hardlink Hold Index
@@ -13043,6 +13062,11 @@ A conforming implementation must test at least:
 118. a filesystem call that blocks (for example on a stalled mount) is
      never abandoned on a timer: no deadline-driven error is reported,
      and cancellation takes effect when the call returns.
+119. SAFETY_REJECTED from the containment check exits 3 with nothing
+     changed; a path rejected under Section 149.7 fails only that
+     path's actions and the run exits 1; CONTROL_STATE_DURABILITY_FAILURE
+     exits 1, and the next start recovers from the last durable WAL
+     record.
 ```
 
 ## 259.15 V15 Implementation Baseline
