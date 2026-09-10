@@ -362,8 +362,9 @@ Revision history:
         251.2).
     107. Default cleanup classifies a directory operation's root lock with its operation, and an orphan root lock by its
         owner (Section 251.1).
+    108. flux cleanup's exit codes are defined (Sections 55, 251).
 
-    V16 adds acceptance tests 31--134 to Section 259.14.
+    V16 adds acceptance tests 31--135 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -2842,6 +2843,8 @@ created while refusing, it reports the file's path and exits 1 instead of 3.
 Where a partial run hit a refusal on some paths only (for example
 Section 97.1(b), or a path rejected under Section 149.7), the result is
 exit code 1.
+
+flux verify and flux cleanup use the same codes (Sections 4.2, 251).
 
 Error code registry (normative). Every failure or result code used in
 this specification appears here. A change that introduces a new code
@@ -11249,6 +11252,11 @@ It must not perform a filesystem-wide search for:
 *.flux-partial.*
 ```
 
+flux cleanup exits 0 when it completed its
+classification (rows it keeps — LIVE, RESUMABLE, UNCERTAIN, CORRUPT — are reported, not failures), 1 when a deletion it
+attempted failed, 2 for a usage error, and 3 when it is refused as a whole, for example --break-lock against a live
+owner (TARGET_LOCK_BUSY). These follow Section 55.
+
 ## 251.1 Default Cleanup
 
 ``` text
@@ -13238,6 +13246,8 @@ A conforming implementation must test at least:
      together with the workspace the lock names, never the lock alone.
 134. an orphan root lock whose named workspace is gone is STALE and eligible when its owner is demonstrably gone, and
      UNCERTAIN otherwise.
+135. flux cleanup exits 0 after classifying, even when it keeps rows; 1 when a deletion failed; 2 on a usage error;
+     3 when --break-lock is refused by a live owner.
 ```
 
 ## 259.15 V15 Implementation Baseline
