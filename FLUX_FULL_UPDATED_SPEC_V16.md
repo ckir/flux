@@ -147,8 +147,11 @@ Revision history:
     49. Destination aliasing between ordinary files is caught at
         publication by no-replace renames and by recording which existing
         entry each replacement resolves to (Sections 16.1, 30, 241.5).
+    50. Reflinked files are verified by construction under the default
+        levels and by hashing both sides under destination and full
+        (Sections 32, 39).
 
-    V16 adds acceptance tests 31--83 to Section 259.14.
+    V16 adds acceptance tests 31--84 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -1805,6 +1808,7 @@ copying, compared with the source-stream digest. This also detects
 source bytes that changed or were misread during the copy.
 
 The CLI must document exactly what guarantee each level provides.
+Reflinked files are verified as Section 39 states.
 
 ------------------------------------------------------------------------
 
@@ -2021,6 +2025,21 @@ auto
 `always` fails when unavailable.
 
 `never` uses ordinary copying.
+
+A reflinked file shares the source's blocks, so its content is identical
+to the source by construction, and no bytes are streamed through Flux.
+Verification of reflinked files (Section 32):
+
+``` text
+--verify=none, source-stream    not hashed; reported as "reflinked, not
+                                hashed"
+--verify=destination, full      source and destination are both read,
+                                hashed with --hash, and compared; the
+                                reflink stays in place
+```
+
+Source mutation checks (Section 33) apply before and after the clone as
+for a streamed copy.
 
 ------------------------------------------------------------------------
 
@@ -12370,6 +12389,9 @@ A conforming implementation must test at least:
     destination publishes one and reports DESTINATION_NAMESPACE_COLLISION for
     the other; nothing is overwritten. Two targets resolving to the same
     existing entry are refused before either is published.
+84. a reflinked file under the default --verify reads no source bytes and is
+    reported as "reflinked, not hashed"; under --verify=destination both sides
+    are hashed and compared.
 ```
 
 ## 259.15 V15 Implementation Baseline
