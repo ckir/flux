@@ -62,8 +62,11 @@ Revision history:
         own case and Unicode-form rules decide which spellings contend; the
         hashed lock directory is removed (Sections 96, 96.1, 97, 99.1,
         119, 220, 241.5, 250, 259.6).
+    11. Verification level and digest algorithm are separate options,
+        `--verify=<none|source-stream|destination|full>` and `--hash`, and
+        every level is defined (Sections 5, 32, 82).
 
-    V16 adds acceptance tests 31--55 to Section 259.14.
+    V16 adds acceptance tests 31--56 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -290,7 +293,10 @@ Planned interface:
 --update
 --skip-existing
 
---verify[=<ALGORITHM>]
+--verify[=<none|source-stream|destination|full>]
+                                     (Section 32; default source-stream;
+                                      bare --verify = destination)
+--hash=<ALGORITHM>                   (Section 32; default blake3)
 
 --preserve-times
 --preserve-permissions
@@ -1513,13 +1519,14 @@ destination verification.
 
 # 32. Verification Levels
 
-Conceptual:
+The level is selected with `--verify` and the digest algorithm with
+`--hash` (default `blake3`):
 
 ``` text
-none
-source-stream
-destination
-full
+--verify=none
+--verify=source-stream     (default)
+--verify=destination       (also: bare --verify)
+--verify=full
 ```
 
 ## `none`
@@ -1532,12 +1539,15 @@ Hash source bytes while copying.
 
 ## `destination`
 
-Independently hash destination after writing.
+`source-stream`, then independently re-read and hash the destination
+after writing and compare it with the source-stream digest before
+publication (Section 135).
 
 ## `full`
 
-Perform the strongest configured verification, potentially including
-both source and destination validation.
+`destination`, plus a second, independent read of the source after
+copying, compared with the source-stream digest. This also detects
+source bytes that changed or were misread during the copy.
 
 The CLI must document exactly what guarantee each level provides.
 
@@ -3043,7 +3053,8 @@ flux copy /data /backup
 ``` bash
 flux copy \
   --workers auto \
-  --verify=blake3 \
+  --verify=destination \
+  --hash=blake3 \
   --hardlinks=auto \
   --reflink=auto \
   --sparse=auto \
@@ -11868,6 +11879,8 @@ A conforming implementation must test at least:
     DESTINATION_NAMESPACE_COLLISION through the operation's own lock.
 55. a resume that spells the target differently (Backup vs backup) on a
     case-insensitive destination finds the prior operation through its lock.
+56. each --verify level performs exactly the checks of Section 32; bare --verify
+    means destination; --hash selects the algorithm independently.
 ```
 
 ## 259.15 V15 Implementation Baseline
