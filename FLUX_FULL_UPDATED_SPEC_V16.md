@@ -79,8 +79,11 @@ Revision history:
         pausing is never persisted (Sections 20, 21, 132, 222).
     17. `flux cleanup` uses one set of status names, each defined, plus a
         separate eligibility marker (Sections 60, 131, 251.1).
+    18. `DEST/.flux/` holds only `operations/` and `standalone/`, and every
+        workspace layout shows its `wal/` (Sections 18.2, 119, 145, 213,
+        220, 259.10).
 
-    V16 adds acceptance tests 31--62 to Section 259.14.
+    V16 adds acceptance tests 31--63 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -882,6 +885,7 @@ Flux uses:
             ├── manifest
             ├── state.db
             ├── topology.db
+            ├── wal/
             ├── checkpoints/
             └── lock
 ```
@@ -4939,6 +4943,7 @@ DEST/
             ├── manifest
             ├── state.db
             ├── topology.db
+            ├── wal/
             ├── checkpoints/
             └── lock
 ```
@@ -5823,6 +5828,7 @@ DEST/.flux/operations/<operation-id>/
     ├── manifest
     ├── state.db
     ├── topology.db
+    ├── wal/
     ├── checkpoints/
     └── lock
 ```
@@ -8191,12 +8197,13 @@ may be enumerated and cleaned according to the operation lifecycle.
 This includes:
 
 ``` text
-operations/
-topology/
-WAL/
-state/
-manifests/
+operations/    one workspace per directory operation: manifest,
+               state.db, topology.db, wal/ segments, checkpoints/, lock
+               (Section 18.2)
+standalone/    the standalone operation catalog (Section 250)
 ```
+
+There are no other top-level directories under `DEST/.flux/`.
 
 ## Adjacent Single-File Artifacts
 
@@ -8471,8 +8478,7 @@ The default policy must favor recoverability over aggressive cleanup.
   Artifact                               Normal GC Scope         Ownership Required   Live Lock Check
   -------------------------------------- ----------------------- -------------------- -----------------
   `.flux/operations/*`                   Managed control plane   Yes                  Yes
-  `.flux/WAL/*`                          Managed control plane   Yes                  Yes
-  `.flux/topology/*`                     Managed control plane   Yes                  Yes
+  `.flux/standalone/*`                   Managed control plane   Yes                  Yes
   `target.flux-lock`                     Adjacent target scope   Yes                  Yes
   `P/.flux-dir.lock`                     Adjacent target scope   Yes                  Yes
   `target.flux-partial.<operation-id>`   Adjacent target scope   Yes                  Yes
@@ -11843,6 +11849,7 @@ P/.flux/atomic/<target-key>/<operation-id>/
     manifest
     state.db
     topology.db
+    wal/
     checkpoints/
     staging/
         root/
@@ -12015,6 +12022,8 @@ A conforming implementation must test at least:
 62. flux cleanup shows exactly the Section 251.1 statuses and an eligibility
     marker; LIVE, UNCERTAIN, and CORRUPT rows are never eligible, and --force
     makes RESUMABLE rows eligible only by bypassing retention.
+63. DEST/.flux/ contains only operations/ and standalone/; each operation's WAL
+    segments live in its own workspace's wal/.
 ```
 
 ## 259.15 V15 Implementation Baseline
