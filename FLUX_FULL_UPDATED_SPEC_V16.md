@@ -120,8 +120,10 @@ Revision history:
         canonical target, the next non-skipped member materializes the
         group; Flux never links to an existing object it did not write
         (Sections 5.1, 91, 142, 253.7).
+    36. Each directory publication state has a meaning and a recovery
+        action (Section 30.1).
 
-    V16 adds acceptance tests 31--76 to Section 259.14.
+    V16 adds acceptance tests 31--77 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -1644,6 +1646,19 @@ DIRECTORY_PUBLISHED
 DIRECTORY_METADATA_FINALIZED
 COMMITTED
 ```
+
+These are publication states of one directory target, following the
+order above; they are not operation states (Section 20). The operation
+is `COMMITTING` from `DIRECTORY_READY_TO_PUBLISH` until `COMMITTED`.
+
+| State | Reached when | Recovery |
+|---|---|---|
+| `DIRECTORY_STAGING` | the staged tree is being built and verified (Section 259.10) | continue staging; never delete it merely because of a crash |
+| `DIRECTORY_READY_TO_PUBLISH` | every descendant is copied and verified, final directory metadata is applied in staging, data is flushed, and `PREPARE_COMMIT` is durable (Section 182) | revalidate locks, then publish |
+| `DIRECTORY_PUBLISHING` | the root publication has been issued but its outcome is not yet durably recorded | inspect the namespace (Sections 183, 259.8); if it cannot be decided, `COMMIT_STATE_UNCERTAIN` |
+| `DIRECTORY_PUBLISHED` | the root publication is durably observed, but directory metadata the publication can disturb (Section 30.2) is not yet finalized and durable | finalize and flush that metadata |
+| `DIRECTORY_METADATA_FINALIZED` | published, with final metadata applied and durable | record `COMMIT` |
+| `COMMITTED` | `COMMIT` is durable | cleanup only (Section 218) |
 
 If durable evidence cannot establish whether the root publication
 occurred:
@@ -12243,6 +12258,9 @@ A conforming implementation must test at least:
 76. with --skip-existing and the canonical member's target already present, the
     next non-skipped member copies and the others link to it; the existing
     file is never linked; if every target exists the group is Skipped.
+77. a crash in each directory publication state of Section 30.1 recovers with
+    that state's stated action; DIRECTORY_PUBLISHING that cannot be decided
+    becomes COMMIT_STATE_UNCERTAIN.
 ```
 
 ## 259.15 V15 Implementation Baseline
