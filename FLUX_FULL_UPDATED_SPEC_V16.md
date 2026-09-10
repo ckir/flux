@@ -107,8 +107,11 @@ Revision history:
         procedure that recovery re-runs (Sections 16.1, 147.3).
     30. A single-file operation's target lock also serves as its operation
         lock (Sections 89, 98, 239.1, 249.2).
+    31. Section 249.1 is the one full list of adjacent-state fields and
+        includes `artifact_type`; timestamps are `creation_wall_time`
+        (Sections 215, 239, 249.1, 259.6).
 
-    V16 adds acceptance tests 31--73 to Section 259.14.
+    V16 adds acceptance tests 31--74 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -8394,10 +8397,12 @@ target_identity
 source_identity
 artifact_type
 format_version
-creation_time
+creation_wall_time
 ```
 
-The exact binary/sidecar representation is implementation-defined.
+This is the minimum; the adjacent state record carries the full list of
+Section 249.1. The exact binary/sidecar representation is
+implementation-defined.
 
 GC must validate the artifact before deletion.
 
@@ -9673,19 +9678,7 @@ Flux may create:
 The `.flux-state` record is the authoritative association between the
 target and the operation.
 
-It must contain sufficient metadata to establish:
-
-``` text
-operation_id
-target_identity
-source_identity
-artifact_generation
-owner_instance_id
-boot_session_id
-creation_wall_time
-last_heartbeat_wall_time
-format_version
-```
+It contains the fields listed in Section 249.1.
 
 Partial and lock artifacts must reference the same operation identity,
 directly or through a verifiable state record.
@@ -10272,6 +10265,7 @@ verifiable authenticated/structured reference:
 
 ``` text
 format_version
+artifact_type
 operation_id
 attempt_id
 target_identity
@@ -11914,7 +11908,7 @@ owner_instance_id
 boot_session_id
 target_path_key
 workspace_path     (where the owning operation's recovery state lives; Section 120)
-creation_time
+creation_wall_time
 heartbeat
 ```
 
@@ -12200,6 +12194,8 @@ A conforming implementation must test at least:
 73. a single-file operation holds exactly one lock file; a second process
     resuming the same operation or targeting the same file gets
     TARGET_LOCK_BUSY from it.
+74. every adjacent state record carries the Section 249.1 fields, including
+    artifact_type, and GC validation (Section 234.4) finds each field it checks.
 ```
 
 ## 259.15 V15 Implementation Baseline
