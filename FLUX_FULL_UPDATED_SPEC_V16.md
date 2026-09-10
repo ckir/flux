@@ -328,8 +328,13 @@ Revision history:
         classify ancestor locks by Section 240, cover a directory about
         to be created, and handle a failed release of the operation's
         own lock (Section 97.1).
+    95. `--break-lock` takes over the lock record by atomic rename and
+        satisfies `--restart`'s lock steps; it cannot stop a call the
+        prior owner already started; uncertain artifacts are deleted
+        only through `cleanup --target --break-lock` (Sections 21.1,
+        240.5, 251.1, 251.2).
 
-    V16 adds acceptance tests 31--121 to Section 259.14.
+    V16 adds acceptance tests 31--122 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -1551,7 +1556,10 @@ does not match is still `INCOMPATIBLE_STATE`.
 
 ``` text
 1. acquire the prior operation's lock without waiting; failure means
-   a live owner (OPERATION_LOCKED / TARGET_LOCK_BUSY)
+   a live owner (OPERATION_LOCKED / TARGET_LOCK_BUSY); with
+   --break-lock and uncertain ownership, Flux instead takes the lock
+   over (Section 240.5) and continues with step 2; step 3 then
+   revalidates the lock it now holds
 2. durably mark the prior operation ABANDONED, recording
    superseded_by = the new operation_id
 3. revalidate ownership and locks
@@ -10445,9 +10453,14 @@ corrupt state.
 
 Before acting, Flux reports the recorded holder's `owner_instance_id`,
 `boot_session_id`, `last_heartbeat_wall_time`, and `workspace_path`, and
-durably records the takeover, then proceeds as if the prior owner were
-dead. A prior owner that was only stalled publishes nothing more: its
-commit-time lock revalidation (Section 99) fails.
+durably records the takeover, then replaces the lock record with its own
+by an atomic rename over it, and proceeds as if the prior owner were
+dead. A prior owner that was only stalled starts nothing more: its next
+lock revalidation (Section 99) fails. A filesystem call it had already
+started can still complete, because Flux sets no deadline on filesystem
+calls (Section 189); that is why a takeover is left to the operator and
+its report names the holder. A crash after the takeover leaves a lock
+owned by the new operation, recovered like any dead owner's lock.
 
 `--break-lock` is not a resume-compatibility option (Section 121).
 
@@ -11225,9 +11238,8 @@ Eligibility for deletion is a separate marker, not a status. A `STALE` or
 deletion precondition now (Sections 130, 216, 217, 222). `--force` may
 also mark `RESUMABLE` rows eligible, bypassing retention only. `LIVE`,
 `UNCERTAIN`, and `CORRUPT` rows are never eligible; `CORRUPT` workspaces
-are kept for diagnosis. The one exception: `flux cleanup --target PATH
---break-lock` (Section 240.5) treats that target's `UNCERTAIN` row as
-`STALE`, after reporting the recorded holder.
+are kept for diagnosis. Artifacts of uncertain ownership can be deleted
+only through `flux cleanup --target PATH --break-lock` (Section 251.2).
 
 A standalone catalog record whose target has no lock, state, or partial
 artifact is an orphan (a crash between Section 250.3's steps 3 and 4
@@ -11258,6 +11270,11 @@ even if the standalone catalog entry is missing.
 
 The artifacts must still pass ownership and target-identity validation
 before deletion.
+
+With `--break-lock` (Section 240.5), artifacts whose owner is uncertain
+(`TARGET_LOCK_UNCERTAIN`, `LEASE_AGE_UNCERTAIN`) may be deleted after Flux
+reports the recorded holder; a live owner, or missing or corrupt state,
+still blocks deletion.
 
 ## 251.3 No Filesystem-Wide Artifact Hunt
 
@@ -12905,9 +12922,9 @@ A conforming implementation must test at least:
     including FAILED and COMMITTING (after commit recovery), and refuses
     COMPLETED and ABANDONED; a crash while pausing leaves TRANSFERRING.
 62. flux cleanup shows exactly the Section 251.1 statuses and an eligibility
-    marker; LIVE, UNCERTAIN, and CORRUPT rows are never eligible (except an
-    UNCERTAIN row under cleanup --target --break-lock), and --force makes
-    RESUMABLE rows eligible only by bypassing retention.
+    marker; LIVE, UNCERTAIN, and CORRUPT rows are never eligible (artifacts of
+    uncertain ownership are deleted only by cleanup --target --break-lock), and
+    --force makes RESUMABLE rows eligible only by bypassing retention.
 63. DEST/.flux/ contains only operations/ and standalone/; each operation's WAL
     segments live in its own workspace's wal/.
 64. a crash while dependents are held, with fewer dependents than the RAM limit,
@@ -13093,6 +13110,10 @@ A conforming implementation must test at least:
 121. an operation whose writer is about to create D, where a live
      operation holds D's root lock, creates and writes nothing under D;
      a later operation whose DEST is D refuses under Section 97.1(a).
+122. --restart --break-lock against an uncertain lock takes the lock
+     record over by atomic rename, reports the holder, and proceeds; a
+     crash right after the takeover leaves a lock owned by the new
+     operation.
 ```
 
 ## 259.15 V15 Implementation Baseline
