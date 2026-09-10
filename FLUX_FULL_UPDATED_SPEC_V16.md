@@ -238,6 +238,11 @@ Revision history:
     76. `flux verify` adds an `unreadable` outcome (either side could not
         be read or hashed); exit status is 1 when anything is missing,
         mismatched, or unreadable (Section 4.2).
+    77. `DISK_FULL` is named where it is produced: a destination write
+        that fails for lack of space outside Section 254's atomic
+        capacity states (Section 29). `IO_ERROR`, `PERMISSION_DENIED`,
+        and `DESTINATION_ERROR` are used only when no more specific code
+        applies (Section 55).
 
     V16 adds acceptance tests 31--105 to Section 259.14.
 
@@ -1755,7 +1760,9 @@ ENOSPC
 ERROR_DISK_FULL
 ```
 
-must always be handled as runtime conditions.
+must always be handled as runtime conditions. A destination write that
+fails for lack of space, outside the atomic capacity states of Section
+254, reports `DISK_FULL`.
 
 ------------------------------------------------------------------------
 
@@ -1972,7 +1979,9 @@ Hash source bytes while copying.
 
 `source-stream`, then independently re-read and hash the destination
 after writing and compare it with the source-stream digest before
-publication (Section 135).
+publication (Section 135). The re-read opens the written file anew and
+reads it through the filesystem; a buffer kept from writing never
+substitutes.
 
 ## `full`
 
@@ -2676,7 +2685,8 @@ Section 97.1(b)), the result is exit code 1.
 Error code registry (normative). Every failure or result code used in
 this specification appears here. A change that introduces a new code
 MUST add it to this table, and MUST NOT introduce a synonym for an
-existing code.
+existing code. `IO_ERROR`, `PERMISSION_DENIED`, and `DESTINATION_ERROR`
+are used only when no more specific code applies.
 
 | Code | Meaning | Defined in |
 |------|---------|------------|
@@ -2691,7 +2701,7 @@ existing code.
 | `DESTINATION_ERROR` | A destination-side failure not covered by a more specific code. | 55 |
 | `DESTINATION_NAMESPACE_COLLISION` | Two distinct source paths, or two source roots, map to the same destination object or prefix. | 18.3, 241.5 |
 | `DIRECTORY_CHANGED_DURING_SCAN` | An existing directory's identity changed while it was being entered. | 149.4 |
-| `DISK_FULL` | A destination data allocation failed for lack of space (`ENOSPC`, `ERROR_DISK_FULL`). | 29, 55 |
+| `DISK_FULL` | A destination data allocation failed for lack of space (`ENOSPC`, `ERROR_DISK_FULL`), outside the atomic capacity states of Section 254. | 29 |
 | `FAILED_ATOMIC_CAPACITY` | Required atomic temporary capacity provably exceeds the maximum recoverable capacity; terminal for the action. | 254.3 |
 | `HARDLINK_GROUP_UNMATERIALIZABLE` | Reported outcome of a hardlink group that reached terminal `Failed`. | 253.5 |
 | `HARDLINK_IDENTITY_UNAVAILABLE` | `--hardlinks=preserve` was requested but reliable object identity is unavailable. | 108 |
@@ -6013,6 +6023,9 @@ hash destination
        ↓
 compare expected digest
 ```
+
+The read opens the written file anew and reads it through the
+filesystem; a buffer kept from writing never substitutes.
 
 Only then may atomic publication occur.
 
