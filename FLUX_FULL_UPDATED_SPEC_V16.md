@@ -11198,7 +11198,7 @@ The record must be crash-safe.
 name from the record's `target_path_key` and `operation_id` using the
 fixed patterns (`P/<name>.flux-lock`, `P/.flux-dir.lock`,
 `P/<name>.flux-state.<operation-id>`, `P/<name>.flux-partial.<operation-id>`,
-`P/<name>.flux-lock.broken.<operation-id>` (a takeover's moved lock, Section 240.5))
+and `<lock-name>.broken.<operation-id>` beside any of those locks (a takeover's moved lock, Section 240.5))
 and never open or delete a name taken only from `artifact_names`.
 
 ## 250.2 Registration
@@ -11319,8 +11319,8 @@ classify
 
 The expected adjacent artifacts are the target's lock (`P/<name>.flux-lock`,
 or `P/.flux-dir.lock` when the Section 96.1 fallback applies), its state,
-its partial, and a takeover's moved lock (`P/<name>.flux-lock.broken.<operation-id>`,
-Section 240.5), derived as Section 250.1 describes.
+its partial, and a takeover's moved lock (`<lock-name>.broken.<operation-id>`
+beside the lock, Section 240.5), derived as Section 250.1 describes.
 
 Classification (the only cleanup status names; Section 131 uses them
 too):
@@ -11365,7 +11365,8 @@ may directly inspect:
 /dest/.flux-dir.lock       (Section 96.1 fallback, when it applies to this target)
 /dest/foo.iso.flux-state.*
 /dest/foo.iso.flux-partial.*
-/dest/foo.iso.flux-lock.broken.*   (a takeover's moved lock, Section 240.5)
+/dest/foo.iso.flux-lock.broken.*   (a takeover's moved lock, Section 240.5;
+                                   /dest/.flux-dir.lock.broken.* under the fallback)
 ```
 
 even if the standalone catalog entry is missing.
@@ -13218,7 +13219,7 @@ A conforming implementation must test at least:
      operation holds D's root lock, creates and writes nothing under D;
      a later operation whose DEST is D refuses under Section 97.1(a).
 122. --restart --break-lock against an uncertain lock takes the lock
-     record over by atomic rename, reports the holder, and proceeds; a
+     over exclusively (Section 240.5), reports the holder, and proceeds; a
      crash right after the takeover leaves a lock owned by the new
      operation.
 123. flux cleanup DEST for a filesystem-root DEST inspects
@@ -13243,7 +13244,7 @@ A conforming implementation must test at least:
      claim proceeds.
 128. of two concurrent --break-lock takeovers of one uncertain lock exactly one proceeds; a
      lock acquired by another operation after the re-read is put back and the takeover refuses with TARGET_LOCK_BUSY; a
-     crash after the move leaves P/<name>.flux-lock.broken.<operation-id>, which cleanup finds.
+     crash after the move leaves <lock-name>.broken.<operation-id> beside the lock, which cleanup finds.
 129. an operation whose lock file no longer holds its own record performs nothing further, stops with
      TARGET_LOCK_BUSY, and remains resumable.
 130. --restart never leaves the target unlocked between taking the prior operation's lock and starting the new
