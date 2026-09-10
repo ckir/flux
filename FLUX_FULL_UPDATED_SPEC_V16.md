@@ -53,8 +53,12 @@ Revision history:
         distinct destination prefix, keys are destination-relative, and
         the manifest records one mapping per root (Sections 7.2, 18.3,
         19, 103, 121).
+    9.  A run without `--resume` that finds a dead operation's resumable
+        state refuses with `RESUMABLE_OPERATION_EXISTS`; `--restart`
+        supersedes the prior operation and deletes its state before
+        copying (Sections 5, 19, 21.1, 22, 239.2, 249.3).
 
-    V16 adds acceptance tests 31--45 to Section 259.14.
+    V16 adds acceptance tests 31--49 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -296,6 +300,7 @@ Planned interface:
 --atomic=<auto|always|never>
 
 --resume
+--restart                            (Section 21.1; supersede prior state)
 --resume-verify=<metadata|chunks|full>
 --retries=<N|unlimited>              (Section 206; default 3)
 
@@ -874,6 +879,9 @@ struct OperationManifest {
     last_checkpoint: Timestamp,
 
     state: OperationState,
+    // Set when a later operation superseded this one with
+    // --restart (Section 21.1); state is then ABANDONED.
+    superseded_by: Option<OperationId>,
 
     configuration_fingerprint: Hash,
 }
@@ -978,6 +986,72 @@ format is supported
 configuration is compatible
 ```
 
+## 21.1 Existing Operation State Without `--resume`
+
+Before starting a new operation, Flux checks for existing operation
+state for the same destination:
+
+-   directory operations: every operation in `DEST/.flux/operations/`
+    whose destination root is `DEST`;
+-   single-file operations: the target's catalog record and adjacent
+    artifacts (Section 250).
+
+Each prior operation found is handled by its classification:
+
+``` text
+live owner (lock held)
+    → OPERATION_LOCKED or TARGET_LOCK_BUSY
+
+ownership uncertain, or state missing/corrupt
+    → preserve; TARGET_LOCK_UNCERTAIN, ARTIFACT_OWNERSHIP_UNCERTAIN,
+      or STATE_CORRUPT
+
+completed (including cleanup_pending)
+    → not resumable; the new operation proceeds and may complete the
+      prior cleanup under Section 218
+
+terminal ABANDONED
+    → not resumable; the new operation proceeds, and the prior state
+      is left to garbage collection (Section 222)
+
+resumable (non-terminal, owner demonstrably gone)
+    → decided by the invocation, below
+```
+
+For a resumable prior operation:
+
+``` text
+--resume            resume it (Sections 21, 22); a mapping or
+                    configuration mismatch is INCOMPATIBLE_STATE
+--restart           supersede it, then start a new operation
+neither             fail with RESUMABLE_OPERATION_EXISTS, naming the
+                    prior operation and its progress, without mutating
+                    anything
+both                usage error
+```
+
+`--restart` supersedes a prior operation in this order:
+
+``` text
+1. acquire the prior operation's lock without waiting; failure means
+   a live owner (OPERATION_LOCKED / TARGET_LOCK_BUSY)
+2. durably mark the prior operation ABANDONED, recording
+   superseded_by = the new operation_id
+3. revalidate ownership and locks
+4. delete the prior operation's derived artifacts (partials), then its
+   primary state, in the order of Sections 222 and 223
+5. release the prior operation's lock and start the new operation
+```
+
+Deleting before copying frees the prior partial allocation before the
+new operation needs it. `--restart` never overrides uncertain ownership,
+missing or corrupt state, or a live owner (Section 259.13). A crash
+during steps 3--5 leaves the prior operation durably `ABANDONED`, which
+normal garbage collection can then remove.
+
+A plain rerun therefore never runs alongside a dead operation's partial
+data, and never discards resumable progress without an explicit flag.
+
 ------------------------------------------------------------------------
 
 # 22. Single-file Resume Discovery
@@ -989,7 +1063,8 @@ flux copy source.iso /dest/source.iso --resume
 ```
 
 Flux checks the destination-side operation metadata for that exact
-target.
+target. An invocation without `--resume` that finds resumable state for
+the target follows Section 21.1.
 
 The state file must contain:
 
@@ -2123,6 +2198,7 @@ existing code.
 | `PATH_COMPONENT_INVALID` | A path component contains `0x00`; no `FluxPathKey` is constructed. | 103 |
 | `PERMISSION_DENIED` | The operating system denied access. | 55 |
 | `REMOTE_LOCK_UNSAFE` | No trustworthy exclusive lock contract can be established on a remote filesystem. | 235.4 |
+| `RESUMABLE_OPERATION_EXISTS` | A run without `--resume` or `--restart` found a resumable prior operation for its target or destination; nothing was changed. | 21.1 |
 | `RESUME_INVALID` | Resume validation failed: missing partial, state mismatch, or checkpoint mismatch. | 23, 35.3 |
 | `SAFETY_REJECTED` | The source/destination containment or self-copy check rejected the operation. | 129 |
 | `SOURCE_CHANGED` | Source identity or metadata changed during the copy; the result is not published. | 33 |
@@ -9320,6 +9396,8 @@ evaluate lock ownership
 resume / recover / report conflict
 ```
 
+Section 21.1 decides which outcome applies.
+
 It must never infer ownership solely from filenames.
 
 ## 239.3 Missing State
@@ -9860,6 +9938,7 @@ boot_session_id
 creation_wall_time
 last_heartbeat_wall_time
 operation_state
+superseded_by        (set by --restart; Section 21.1)
 ```
 
 The lock and partial artifacts must be associated with the same
@@ -9922,6 +10001,8 @@ evaluate lock ownership
         ↓
 resume / recover / report conflict
 ```
+
+Section 21.1 decides which outcome applies.
 
 ## 249.4 Missing or Corrupt State
 
@@ -11684,6 +11765,15 @@ A conforming implementation must test at least:
     DESTINATION_NAMESPACE_COLLISION before any transfer.
 45. resuming with the same roots in a different command-line order is
     compatible; adding, removing, or remapping a root is INCOMPATIBLE_STATE.
+46. a plain rerun after a crash fails with RESUMABLE_OPERATION_EXISTS and
+    changes nothing on disk.
+47. --restart marks the prior operation ABANDONED with superseded_by, deletes
+    its partial before the new copy allocates, and a crash mid-restart leaves
+    it ABANDONED and collectible.
+48. --restart never overrides a live owner, uncertain ownership, or missing
+    or corrupt prior state; --resume together with --restart is a usage error.
+49. a prior operation that completed with cleanup_pending does not block a
+    new run.
 ```
 
 ## 259.15 V15 Implementation Baseline
