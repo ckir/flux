@@ -133,8 +133,10 @@ Revision history:
     41. Each retry category has defined behavior (Section 207).
     42. The `OperationStateChanged` scheduler event is described (Section
         147.2).
-    43. Every "lexicographically smallest" statement points to the
-        component-wise order of Section 7.2 (Sections 8.1, 13, 69).
+    43. The canonical-rule statements of Sections 8.1, 13, and 69 point to
+        the component-wise order of Section 7.2.
+    44. The Section 83 architecture diagram shows the workspace's `wal/`
+        and `checkpoints/`.
 
     V16 adds acceptance tests 31--81 to Section 259.14.
 
@@ -3431,11 +3433,11 @@ flux cleanup /backup
 
        .flux/operations/<operation-id>/
                     │
-          ┌─────────┼──────────┐
-          ▼         ▼          ▼
-       manifest   state.db   topology.db
-          │         │          │
-          └─────────┴──────────┘
+          ┌─────────┬─────────┼──────────┬───────────┐
+          ▼         ▼         ▼          ▼           ▼
+       manifest  state.db  topology.db  wal/    checkpoints/
+          │         │         │          │           │
+          └─────────┴─────────┴──────────┴───────────┘
                     │
                lock + lease
                     │
