@@ -86,6 +86,8 @@ Revision history:
         is only a bounded cache (Sections 94, 232, V14.2.1).
     20. `CheckpointMessage` carries `attempt_id` (Sections 158, 225).
     21. `FsCapabilities` has one definition (Sections 62, 112).
+    22. `--durability` is a current option, not a future one (Sections 141,
+        165).
 
     V16 adds acceptance tests 31--65 to Section 259.14.
 
@@ -5639,14 +5641,14 @@ power-loss durability
 Without explicit flush guarantees, successful `write()` does not
 necessarily mean data survives sudden power loss.
 
-The implementation may provide:
+Flux provides:
 
 ``` text
 --durability=normal
 --durability=strict
 ```
 
-in a future release.
+as defined in Section 165.
 
 ------------------------------------------------------------------------
 
