@@ -82,8 +82,10 @@ Revision history:
     18. `DEST/.flux/` holds only `operations/` and `standalone/`, and every
         workspace layout shows its `wal/` (Sections 18.2, 119, 145, 213,
         220, 259.10).
+    19. Held dependents are persisted when discovered; the RAM hold index
+        is only a bounded cache (Sections 94, 232, V14.2.1).
 
-    V16 adds acceptance tests 31--63 to Section 259.14.
+    V16 adds acceptance tests 31--64 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -3881,8 +3883,8 @@ Failed
 the dependents are completed as blocked failures without consuming
 worker slots.
 
-The hold index itself must be bounded in RAM and may spill to persistent
-state.
+The hold index is persistent from the moment each dependent is
+discovered (Section 232). RAM holds only a bounded cache of it.
 
 ------------------------------------------------------------------------
 
@@ -11159,6 +11161,12 @@ Persistent hold index
     +-- spilled dependents keyed/indexed by canonical_identity
 ```
 
+Every dependent is written to the persistent hold index when it is
+discovered (Section 232); there is no threshold at which dependents first
+reach disk. The RAM hold index is a bounded cache of some of those
+records, and "spilled" dependents are the ones not currently cached.
+Losing the RAM index, for example in a crash, loses no dependent.
+
 When:
 
 ```text
@@ -12024,6 +12032,8 @@ A conforming implementation must test at least:
     makes RESUMABLE rows eligible only by bypassing retention.
 63. DEST/.flux/ contains only operations/ and standalone/; each operation's WAL
     segments live in its own workspace's wal/.
+64. a crash while dependents are held, with fewer dependents than the RAM limit,
+    loses none: every dependent was persisted when it was discovered.
 ```
 
 ## 259.15 V15 Implementation Baseline
