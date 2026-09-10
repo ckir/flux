@@ -173,8 +173,11 @@ Revision history:
         if it equals one of the two paths derivable from the lock's own
         target and `operation_id`; this tightens item 25 (Sections 120,
         259.6).
+    61. The standalone catalog record's `artifact_names` field is
+        informational; cleanup and GC derive each artifact name from the
+        record's target and operation_id instead (Section 250.1).
 
-    V16 adds acceptance tests 31--89 to Section 259.14.
+    V16 adds acceptance tests 31--90 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -10689,6 +10692,12 @@ catalog_record_generation
 
 The record must be crash-safe.
 
+`artifact_names` is informational. Cleanup and GC derive each artifact
+name from the record's `target_path_key` and `operation_id` using the
+fixed patterns (`P/<name>.flux-lock`, `P/.flux-dir.lock`,
+`P/<name>.flux-state.<operation-id>`, `P/<name>.flux-partial.<operation-id>`)
+and never open or delete a name taken only from `artifact_names`.
+
 ## 250.2 Registration
 
 After acquiring the target lock and establishing the adjacent state, the
@@ -12525,6 +12534,9 @@ A conforming implementation must test at least:
 89. a directory target lock whose recorded workspace_path is neither of the
     two derivable paths makes recovery report ARTIFACT_OWNERSHIP_UNCERTAIN
     and read, adopt, or delete nothing at that path.
+90. a catalog record's artifact_names is never used to open or delete an
+    artifact; cleanup and GC derive each artifact name from the record's
+    target and operation_id instead.
 ```
 
 ## 259.15 V15 Implementation Baseline
