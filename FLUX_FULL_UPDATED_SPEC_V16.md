@@ -324,8 +324,12 @@ Revision history:
         `CONTROL_STATE_DURABILITY_FAILURE`; code 3 applies to
         `SAFETY_REJECTED` only from the Section 129 containment check;
         "nothing was changed" is defined (Sections 55, 231.5).
+    94. Section 97.1's lock checks also find the long-name fallback lock,
+        classify ancestor locks by Section 240, cover a directory about
+        to be created, and handle a failed release of the operation's
+        own lock (Section 97.1).
 
-    V16 adds acceptance tests 31--119 to Section 259.14.
+    V16 adds acceptance tests 31--121 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -1559,7 +1563,7 @@ does not match is still `INCOMPATIBLE_STATE`.
 Deleting before copying frees the prior partial allocation before the
 new operation needs it. `--restart` never overrides a live owner or
 missing or corrupt state; without `--break-lock` (Section 240.5), it also
-never overrides uncertain ownership (Section 259.13). A crash
+never overrides uncertain ownership (Sections 240.4, 259.13). A crash
 during steps 3--5 leaves the prior operation durably `ABANDONED`, which
 normal garbage collection can then remove.
 
@@ -4650,20 +4654,35 @@ other's tree while it runs.
 (a) After a directory operation creates its own destination-root lock, it
 checks each ancestor of DEST's physical path (every directory from the
 filesystem root down to DEST's parent) for a live Flux root lock
-`<parent-of-ancestor>/<ancestor-name>.flux-lock`, or, for the filesystem
-root itself, `<root>/.flux-root.lock` (Section 96.1). If one exists, it
-releases its own lock and refuses with `TARGET_LOCK_BUSY`; nothing is
-changed. Creating its own lock first, then checking, mirrors Section
-96.1's acquirer protocol, so two racing operations can never both
-proceed.
+`<parent-of-ancestor>/<ancestor-name>.flux-lock`, or
+`<parent-of-ancestor>/.flux-dir.lock` (the Section 96.1 long-name
+fallback, which covers every target in that directory), or, for the
+filesystem root itself, `<root>/.flux-root.lock` (Section 96.1). It
+classifies each lock it finds as Section 240 does: a live owner → it
+releases its own lock and refuses with `TARGET_LOCK_BUSY`; uncertain
+ownership → it releases its own lock and refuses with
+`TARGET_LOCK_UNCERTAIN`; a demonstrably abandoned owner is not an
+obstacle. In both refusals nothing is changed, and the operator resolves
+the ancestor's lock itself (for example `flux cleanup --target <ancestor>
+--break-lock`, Section 240.5). If removing its own lock fails, the
+refusal reports that lock's path; the lock has no live owner and is
+recovered like any dead owner's lock (Section 240.3). Creating its own
+lock first, then checking, mirrors Section 96.1's acquirer protocol, so
+two racing operations can never both proceed.
 
-(b) When the writer is about to write into an existing destination
-directory `D`, it checks for `D`'s own root lock
-`<parent-of-D>/<D-name>.flux-lock`. If a live operation holds it, nothing
-under `D` is written; each affected action fails with `TARGET_LOCK_BUSY`
+(b) When the writer is about to create a destination directory `D`, or
+write into an existing one, it checks for `D`'s own root lock
+`<parent-of-D>/<D-name>.flux-lock` (or `<parent-of-D>/.flux-dir.lock`,
+Section 96.1). If a live operation holds it, nothing under `D` is
+written; each affected action fails with `TARGET_LOCK_BUSY`
 (path-scoped, retry category `lock_conflict`, Section 207) and the rest of
 the operation continues. A hardlink candidate under `D` moves to the next
 candidate without spending attempt budget (Section 253.2).
+
+Together, (a) and (b) cover both start orders: an operation whose DEST is
+D and that starts after this one refuses under (a), because this
+operation's root lock is on its ancestor; one that started before is
+found by (b) before anything under D is created or written.
 
 ------------------------------------------------------------------------
 
@@ -13067,6 +13086,13 @@ A conforming implementation must test at least:
      path's actions and the run exits 1; CONTROL_STATE_DURABILITY_FAILURE
      exits 1, and the next start recovers from the last durable WAL
      record.
+120. a nested operation finds an ancestor's long-name fallback lock
+     P/.flux-dir.lock; an ancestor lock of uncertain ownership refuses
+     with TARGET_LOCK_UNCERTAIN; a demonstrably abandoned one does not
+     block.
+121. an operation whose writer is about to create D, where a live
+     operation holds D's root lock, creates and writes nothing under D;
+     a later operation whose DEST is D refuses under Section 97.1(a).
 ```
 
 ## 259.15 V15 Implementation Baseline
