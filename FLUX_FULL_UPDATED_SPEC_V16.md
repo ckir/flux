@@ -88,8 +88,10 @@ Revision history:
     21. `FsCapabilities` has one definition (Sections 62, 112).
     22. `--durability` is a current option, not a future one (Sections 141,
         165).
+    23. WAL segments live in `wal/` and are ordered by their records'
+        sequence numbers, never by file name (Sections 178, 194).
 
-    V16 adds acceptance tests 31--65 to Section 259.14.
+    V16 adds acceptance tests 31--66 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -7117,15 +7119,21 @@ Anything after that boundary remains replayable.
 
 # 178. WAL Rotation
 
-Large WALs must be rotated into segments.
+Large WALs must be rotated into segments, stored in the operation
+workspace's `wal/` directory.
 
 Example:
 
 ``` text
-wal.000001
-wal.000002
-wal.000003
+wal/000001
+wal/000002
+wal/000003
 ```
+
+Segment order comes from the generation and sequence numbers of the
+records each segment contains (Sections 161, 162), never from file names.
+Names are informational, so a name that outgrows its zero padding cannot
+reorder segments.
 
 A segment may be deleted only after all records it contains are covered
 by a durable state snapshot and compaction marker.
@@ -7516,7 +7524,8 @@ Normative recovery order:
 3. identify current operation generation
 4. load latest durable checkpoint snapshot
 5. identify durable WAL compaction boundary
-6. open WAL segments
+6. open WAL segments, ordered by their records' generation and sequence
+   numbers (Section 178)
 7. validate records sequentially
 8. truncate only a torn trailing record
 9. reject middle corruption
@@ -12035,6 +12044,8 @@ A conforming implementation must test at least:
     loses none: every dependent was persisted when it was discovered.
 65. a checkpoint message from a superseded attempt is never applied to the
     current attempt's progress.
+66. recovery orders WAL segments by their records' generation and sequence,
+    including when segment names sort differently (wal/999999 vs wal/1000000).
 ```
 
 ## 259.15 V15 Implementation Baseline
