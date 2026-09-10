@@ -235,8 +235,11 @@ Revision history:
         the manifest; a file of N bytes has `ceil(N / chunk_size)`
         chunks. A manifest recording a different `chunk_size` is
         `INCOMPATIBLE_STATE` (Sections 121, 136).
+    76. `flux verify` adds an `unreadable` outcome (either side could not
+        be read or hashed); exit status is 1 when anything is missing,
+        mismatched, or unreadable (Section 4.2).
 
-    V16 adds acceptance tests 31--104 to Section 259.14.
+    V16 adds acceptance tests 31--105 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -492,12 +495,14 @@ missing      in the source, absent at the destination
 mismatched   content, symlink payload, or object type differs
              (VERIFY_MISMATCH)
 extra        at the destination, not in the source
+unreadable   either side could not be read or hashed (the error is
+             reported)
 ```
 
-Exit status is 0 when nothing is missing or mismatched and 1 otherwise;
-extra paths are reported but do not change the exit status, because
-copying into an existing folder can leave them legitimately. `--json`
-reports the same records.
+Exit status is 0 when nothing is missing, mismatched, or unreadable, and
+1 otherwise; extra paths are reported but do not change the exit
+status, because copying into an existing folder can leave them
+legitimately. `--json` reports the same records.
 
 `flux verify` takes no lock and creates no workspace. Run against a
 destination that another operation is changing, its report is a
@@ -12743,9 +12748,9 @@ A conforming implementation must test at least:
     entries are handled per entry and reported as degraded.
 86. resuming with --resume-verify=chunks after digests were compacted under
     --resume-verify=metadata validates with full and reports the upgrade.
-87. flux verify reports match, missing, mismatched, and extra paths correctly,
-    exits 1 only for missing or mismatched, ignores DEST/.flux and Flux
-    artifacts, and writes nothing.
+87. flux verify reports match, missing, mismatched, extra, and unreadable
+    paths correctly, exits 1 only for missing, mismatched, or unreadable,
+    ignores DEST/.flux and Flux artifacts, and writes nothing.
 88. a hardlink group whose every member's target is skipped ends in the
     terminal Skipped state (not Failed); its dependents are Skipped after
     recovery too.
@@ -12804,6 +12809,8 @@ A conforming implementation must test at least:
 104. chunk_size is 1 MiB for every file regardless of options, a file of
      N bytes has ceil(N / 1 MiB) chunks with a shorter last chunk, and a
      manifest recording a different chunk_size is INCOMPATIBLE_STATE.
+105. flux verify reports a path unreadable when either side could not be
+     read or hashed, reports the error, and exits 1.
 ```
 
 ## 259.15 V15 Implementation Baseline
