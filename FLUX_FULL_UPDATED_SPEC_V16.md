@@ -124,8 +124,10 @@ Revision history:
         action (Section 30.1).
     37. Each `LockCapability` value is mapped to whether exclusive
         operations are allowed or refused (Section 235.1).
+    38. `--dry-run` with `--resume` or `--restart` previews that
+        invocation without changing anything (Section 5.2).
 
-    V16 adds acceptance tests 31--78 to Section 259.14.
+    V16 adds acceptance tests 31--79 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -459,6 +461,17 @@ A dry run may run while a real operation is live. Its report is a
 snapshot of the destination as scanned and may be stale when printed.
 Checks that need locks, capacity reservations, or writes (Sections 96,
 259.5) are reported as checks a real run would make, not performed.
+
+Combined with `--resume` or `--restart`, a dry run previews that
+invocation (Section 21.1) without changing anything:
+
+``` text
+--dry-run --resume    reads the prior operation's saved state without
+                      taking any lock, and reports what resuming would do,
+                      or the refusal it would get (INCOMPATIBLE_STATE, a
+                      live owner)
+--dry-run --restart   reports what would be discarded, then the fresh plan
+```
 
 ------------------------------------------------------------------------
 
@@ -12272,6 +12285,8 @@ A conforming implementation must test at least:
     becomes COMMIT_STATE_UNCERTAIN.
 78. an adapter reporting RemoteUnverified or Unsupported makes every operation
     that needs target exclusivity fail with REMOTE_LOCK_UNSAFE.
+79. --dry-run --resume and --dry-run --restart report the resume or the discard
+    and fresh plan, take no lock, and change nothing on disk.
 ```
 
 ## 259.15 V15 Implementation Baseline
