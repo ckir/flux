@@ -11318,7 +11318,7 @@ The record must be crash-safe.
 name from the record's `target_path_key` and `operation_id` using the
 fixed patterns (`P/<name>.flux-lock`, `P/.flux-dir.lock`,
 `P/<name>.flux-state.<operation-id>`, `P/<name>.flux-partial.<operation-id>`,
-and any `<lock-name>.broken.*` beside one of those locks (a takeover's moved lock, Section 240.5; found by listing
+and any `<lock-name>.broken.*` beside one of those locks (a dead owner's moved lock, Section 240.3; found by listing
 that one directory, Section 234.1))
 and never open or delete a name taken only from `artifact_names`.
 
@@ -11419,7 +11419,7 @@ A directory operation's root lock (`P/<DEST-name>.flux-lock`,
 `P/.flux-dir.lock` under the fallback, or `DEST/.flux-root.lock`) is classified with the operation its record names. A
 root lock whose named workspace does not exist is an orphan, classified by its owner as Section 240 does: `LIVE` when
 the owner is alive, `STALE` and eligible when the owner is demonstrably gone, `UNCERTAIN` otherwise. Deleting it
-follows Section 240.3 (move aside and verify first). Any `<lock-name>.broken.*` beside a root lock (Section 240.5) is
+follows Section 240.3 (move aside and verify first). Any `<lock-name>.broken.*` beside a root lock (Section 240.3) is
 classified the same way, by the owner its record names.
 
 The `DEST` argument is required unless `--target PATH` is given
@@ -11444,8 +11444,8 @@ classify
 
 The expected adjacent artifacts are the target's lock (`P/<name>.flux-lock`,
 or `P/.flux-dir.lock` when the Section 96.1 fallback applies), its state,
-its partial, and any takeover's moved lock (`<lock-name>.broken.*` beside the
-lock, Section 240.5), derived as Section 250.1 describes.
+its partial, and any dead owner's moved lock (`<lock-name>.broken.*` beside the
+lock, Section 240.3), derived as Section 250.1 describes.
 
 Classification (the only cleanup status names; Section 131 uses them
 too):
@@ -11490,7 +11490,7 @@ may directly inspect:
 /dest/.flux-dir.lock       (Section 96.1 fallback, when it applies to this target)
 /dest/foo.iso.flux-state.*
 /dest/foo.iso.flux-partial.*
-/dest/foo.iso.flux-lock.broken.*   (a takeover's moved lock, Section 240.5;
+/dest/foo.iso.flux-lock.broken.*   (a dead owner's moved lock, Section 240.3;
                                    /dest/.flux-dir.lock.broken.* under the fallback)
 ```
 
@@ -11499,7 +11499,7 @@ even if the standalone catalog entry is missing.
 For a directory target `T` (a filesystem root included),
 `flux cleanup --target T` cleans that directory operation as `flux cleanup T` would (Section 251.1): its root lock
 (`P/<T-name>.flux-lock`, `P/.flux-dir.lock` under the fallback, or `T/.flux-root.lock` for a root) together with the
-workspace the lock's record names, and any `<lock-name>.broken.*` beside that lock (Section 240.5).
+workspace the lock's record names, and any `<lock-name>.broken.*` beside that lock (Section 240.3).
 
 The artifacts must still pass ownership and target-identity validation
 before deletion.
