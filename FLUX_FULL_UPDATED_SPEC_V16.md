@@ -340,8 +340,11 @@ Revision history:
     97. The no-replace probe writes only Flux control state, its
         dry-run preview is defined, and it applies to atomic staging
         (Section 241.5).
+    98. Every publication claims the entry it creates, and claims are
+        never released during the operation (Section 241.5); this
+        completes item 88.
 
-    V16 adds acceptance tests 31--124 to Section 259.14.
+    V16 adds acceptance tests 31--125 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -10583,7 +10586,14 @@ not take (Section 97). It happens at publication:
     that resolve to the same existing entry: the first target to claim
     an entry proceeds; a later target whose claim finds the entry
     already taken is reported `DESTINATION_NAMESPACE_COLLISION` and is
-    not published. The claim is durable and survives resume.
+    not published. The claim is durable and survives resume. Every
+    publication also claims the entry it creates, under that entry's new
+    identity (or its name as the filesystem reports it), whether the
+    target was planned as new or as a replacement, so a later target that
+    resolves to an entry this operation published is a collision too. A
+    claim is never released during the operation, even if its target
+    later fails; a later target that resolves to the same entry stays a
+    collision.
 -   Targets that are locked themselves (single-file targets, directory
     roots, source-root prefixes; Sections 18.3, 96.1) are also detected
     through their lock.
@@ -13149,6 +13159,10 @@ A conforming implementation must test at least:
      writes nothing and says a real run may be refused with
      NOREPLACE_PUBLISH_UNAVAILABLE; the probe runs under --atomic=always
      too.
+125. a later target that resolves to an entry this operation already
+     published is reported DESTINATION_NAMESPACE_COLLISION, before and
+     after a resume; a claim whose target failed still blocks a later
+     target resolving to the same entry.
 ```
 
 ## 259.15 V15 Implementation Baseline
