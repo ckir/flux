@@ -182,6 +182,9 @@ Revision history:
     63. `flux cleanup --target PATH` also inspects `P/.flux-dir.lock`
         when the Section 96.1 fallback applies to that target (Section
         251.2).
+    64. Section 249.1's list now includes `cleanup_pending` and
+        `cleanup_pending_artifacts` (required by Section 218), completing
+        item 31 (Sections 218, 249.1).
 
     V16 adds acceptance tests 31--92 to Section 259.14.
 
@@ -10548,6 +10551,8 @@ creation_wall_time
 last_heartbeat_wall_time
 operation_state
 superseded_by        (set by --restart; Section 21.1)
+cleanup_pending             (Section 218)
+cleanup_pending_artifacts   (Section 218)
 ```
 
 The lock and partial artifacts must be associated with the same
