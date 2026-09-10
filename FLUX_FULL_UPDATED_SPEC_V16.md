@@ -103,8 +103,10 @@ Revision history:
         recorded outcomes; only `--retries` (up) and `--durability`
         (normal to strict) may change, one way (Sections 19, 121).
     28. `--resume` with no prior operation starts a new one (Section 21.1).
+    29. Dependent links have persisted states and an idempotent link
+        procedure that recovery re-runs (Sections 16.1, 147.3).
 
-    V16 adds acceptance tests 31--71 to Section 259.14.
+    V16 adds acceptance tests 31--72 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -843,6 +845,42 @@ separately from:
 ``` text
 dependent link materialization
 ```
+
+## 16.1 Dependent Link State and Recovery
+
+Each dependent link action is persisted in `topology.db` from discovery
+(Section 232) with its existing-destination decision (Section 5.1) and
+one of these states:
+
+| State | Meaning |
+|---|---|
+| `Held` | waiting for the group to materialize (Section 94) |
+| `Released` | released for linking; the link may or may not exist yet |
+| `Linked` | the link is durably recorded as created |
+| `Skipped` | not linked because the existing-destination policy skips its target |
+| `Blocked` | not linked because the group terminally failed (`BLOCKED_BY_CANONICAL_FAILURE`) |
+| `Failed` | linking failed; reported with its error |
+
+A dependent is linked the same way every time, so re-running it is safe:
+
+``` text
+1. create the hardlink at <target>.flux-partial.<operation-id>, in the
+   target's directory, to the materialization anchor
+2. atomically rename it over <target>
+3. remove <target>.flux-partial.<operation-id> if it still exists
+4. record Linked
+```
+
+Step 3 is needed because a POSIX rename between two names that already
+link the same file does nothing and returns success, leaving the
+temporary name in place. Each step revalidates ownership as Section 99
+requires.
+
+After a crash, recovery re-runs every `Released` dependent with these
+steps. A link created before the crash is replaced by an identical link,
+so no identity check is needed and an existing correct link never causes
+a failure. `Held` dependents stay held; `Linked`, `Skipped`, `Blocked`,
+and `Failed` are final.
 
 ------------------------------------------------------------------------
 
@@ -6158,6 +6196,9 @@ load topology records
       │
       └── Copying/Unresolved → retain hold
 ```
+
+Dependents already `Released` before the crash are re-run with the
+idempotent link steps of Section 16.1.
 
 No polling loop is required during normal operation.
 
@@ -12145,6 +12186,9 @@ A conforming implementation must test at least:
     normal→strict --durability are accepted; their reverses are rejected.
 71. --resume with no prior operation starts a new one and reports it; with a
     non-matching prior operation it is INCOMPATIBLE_STATE.
+72. a crash after a dependent's link is created but before Linked is recorded
+    recovers by re-running the link steps: the result is one correct link, no
+    leftover temporary name, and no failure.
 ```
 
 ## 259.15 V15 Implementation Baseline
