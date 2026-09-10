@@ -162,6 +162,8 @@ Revision history:
     55. Section 239.1 points to Section 249.2's single-file lifecycle
         instead of restating it without the catalog steps.
     56. Per-prefix locks apply only with multiple roots (Section 18.3).
+    57. `--dry-run --restart` previews the refusal a real `--restart`
+        would get (Section 5.2).
 
     V16 adds acceptance tests 31--88 to Section 259.14.
 
@@ -544,7 +546,10 @@ invocation (Section 21.1) without changing anything:
                       taking any lock, and reports what resuming would do,
                       or the refusal it would get (INCOMPATIBLE_STATE, a
                       live owner)
---dry-run --restart   reports what would be discarded, then the fresh plan
+--dry-run --restart   reports what would be discarded, then the fresh plan,
+                      or the refusal a real --restart would get (a live
+                      owner, uncertain ownership, or missing or corrupt
+                      prior state)
 ```
 
 ------------------------------------------------------------------------
