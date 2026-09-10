@@ -96,8 +96,11 @@ Revision history:
     25. Resume finds whole-tree atomic staging state through the
         destination root's lock, which records the workspace path
         (Sections 18, 21, 120, 259.6, 259.10).
+    26. Where each source lands is defined: a single folder is copied onto
+        `DEST`, a file goes into an existing folder, several sources go to
+        `DEST/<name>` (Sections 4.1, 18.3).
 
-    V16 adds acceptance tests 31--68 to Section 259.14.
+    V16 adds acceptance tests 31--69 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -305,6 +308,25 @@ Basic copy:
 ``` bash
 flux copy SOURCE DEST
 ```
+
+## 4.1 Destination Mapping
+
+Where each source lands:
+
+| Sources | `DEST` | Result |
+|---|---|---|
+| one folder | any path (created if missing) | the folder's contents are copied onto `DEST` |
+| one file | an existing folder, or a path ending in a separator | `DEST/<name>` |
+| one file | any other path | `DEST` itself is the target file |
+| several | a folder (created if missing) | each source at `DEST/<name>` (Section 18.3) |
+
+A folder source whose `DEST` is an existing file, or several sources whose
+`DEST` is an existing file, is a usage error (exit code 2). A file whose
+target already exists follows the existing-destination policy (Section
+5.1).
+
+For folder sources the mapping never depends on whether `DEST` already
+exists, so re-running the same command lands in the same place.
 
 ------------------------------------------------------------------------
 
@@ -923,8 +945,8 @@ The manifest maps each source root to its destination mapping.
 Each source root `R` maps to a **destination prefix**: the path, relative
 to the destination root, under which `R`'s content is placed.
 
--   A single root that maps onto the destination root itself has an
-    empty prefix.
+-   A single folder source maps onto the destination root itself
+    (Section 4.1) and has an empty prefix.
 -   With multiple roots, each root maps to `DEST/<name>`, where `<name>`
     is the root's final path component. Every prefix is then exactly one
     component, and prefixes must be pairwise distinct. Two roots with
@@ -12078,6 +12100,8 @@ A conforming implementation must test at least:
 68. --resume after a crash during an --atomic=always directory replacement finds
     the staging workspace under P/.flux/atomic/ through the destination root's
     lock, and also when that lock is missing.
+69. each row of Section 4.1 maps as stated; running `flux copy /data /backup`
+    twice lands in /backup both times, never in /backup/data.
 ```
 
 ## 259.15 V15 Implementation Baseline
