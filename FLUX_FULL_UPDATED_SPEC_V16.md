@@ -84,8 +84,9 @@ Revision history:
         220, 259.10).
     19. Held dependents are persisted when discovered; the RAM hold index
         is only a bounded cache (Sections 94, 232, V14.2.1).
+    20. `CheckpointMessage` carries `attempt_id` (Sections 158, 225).
 
-    V16 adds acceptance tests 31--64 to Section 259.14.
+    V16 adds acceptance tests 31--65 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -6605,6 +6606,8 @@ Conceptually:
 struct CheckpointMessage {
     operation_id: OperationId,
     file_id: FileId,
+    // Isolates each retry's progress (Section 225).
+    attempt_id: AttemptId,
     generation: u64,
     range_start: u64,
     range_end: u64,
@@ -12034,6 +12037,8 @@ A conforming implementation must test at least:
     segments live in its own workspace's wal/.
 64. a crash while dependents are held, with fewer dependents than the RAM limit,
     loses none: every dependent was persisted when it was discovered.
+65. a checkpoint message from a superseded attempt is never applied to the
+    current attempt's progress.
 ```
 
 ## 259.15 V15 Implementation Baseline
