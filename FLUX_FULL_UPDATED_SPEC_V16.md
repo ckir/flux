@@ -351,7 +351,7 @@ Revision history:
     100. Section 241.5's claims are keyed by directory entry (parent directory identity and reported name), not object
         identity; a claim records its target, so a resumed target and a hardlink dependent never collide with their own
         claims (Section 241.5).
-    101. --break-lock's takeover is exclusive: it moves the lock aside by rename, which only one takeover can do,
+    101. (Superseded by item 115.) --break-lock's takeover is exclusive: it moves the lock aside by rename, which only one takeover can do,
         then creates its own lock exclusively; a lock acquired in between is put back and the takeover refuses (Sections
         240.5, 250.1, 251.1, 251.2).
     102. Section 99 defines "still owned" as the lock file holding the operation's own record, and a failed
@@ -369,7 +369,7 @@ Revision history:
         predict namespace collisions (Section 5.2).
     110. Wording: TARGET_LOCK_UNCERTAIN cites Section 97.1; Section 207's object_scoped default excludes
         operator_action_required (Sections 55, 207).
-    111. `--break-lock`'s takeover is one numbered procedure with a defined
+    111. (Superseded by item 115.) `--break-lock`'s takeover is one numbered procedure with a defined
         outcome for every step, an unreadable-record variant, a takeover
         record, and a cleanup variant; moved locks are found as
         `<lock-name>.broken.*` beside any lock form (Sections 240.5, 250.1,
@@ -404,8 +404,21 @@ Revision history:
         operation's worker stops without changing its state. A directory
         cleanup cannot list makes cleanup exit 1. Registry rows cite the
         new sections (Sections 55, 99, 251).
+    119. Lock replacement hardening: a dead-owner recoverer takes the
+        OS-native lock where available and re-checks the moved record, not
+        only its identity; a lost exclusive create deletes the moved file;
+        a takeover decides OS-native lock support from `LockCapability`,
+        retries when its final identity check finds the path empty, treats
+        a failed check as a different file, and records nothing when its
+        flush fails (Sections 96.1, 240.3, 240.5).
+    120. Section 120 accepts `workspace_path` = `none` for a cleanup lock;
+        the lock-record checksum is the first 16 bytes of BLAKE3; a worker
+        checks supersession before cancellation and writes `PAUSED` only
+        over `TRANSFERRING` (Sections 99, 120, 259.6).
+    121. A target's created-entry claim is written in the same durable
+        transaction as its `COMMIT` record (Sections 182, 183, 241.5).
 
-    V16 adds acceptance tests 31--143 to Section 259.14.
+    V16 adds acceptance tests 31--146 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -4663,6 +4676,10 @@ object at the lock path is not a Flux lock record at all
     → CONTROL_PLANE_NAMESPACE_CONFLICT; the object is never overwritten
 ```
 
+A Flux lock record is overwritten in place only by a `--break-lock`
+takeover (Section 240.5); the OS-native lock serializes takeovers but
+never replaces the named lock file. A foreign object is never touched.
+
 The lock record (Section 259.6) stores the spelling that created it. A
 contender whose spelling differs, but whose creation fails, is contending
 for the same entry.
@@ -4840,12 +4857,14 @@ lock and its target lock; one file for a single-file operation, Section
 98) is a lock file at its lock path holding this operation's own record
 (its `operation_id` and `owner_instance_id`). When an ownership check
 fails, the worker performs nothing further; the operation stops, reports
-`TARGET_LOCK_BUSY`, and stays resumable. When the operation has been
-cancelled, the worker performs nothing further and the operation pauses
-(`PAUSED`, Sections 20, 132). When it is no longer active because it was
-superseded (Section 21.1) or reached a terminal state (Section 20), the
-worker performs nothing further and does not change the operation's
-state.
+`TARGET_LOCK_BUSY`, and stays resumable. When the operation is no longer
+active because it was superseded (Section 21.1) or reached a terminal
+state (Section 20), the worker performs nothing further and does not
+change the operation's state; this is checked first. Otherwise, when the
+operation has been cancelled, the worker performs nothing further and
+the operation pauses (`PAUSED`, Sections 20, 132). A worker writes
+`PAUSED` only over `TRANSFERRING`, never over a state another process
+wrote.
 
 For atomic publication:
 
@@ -5718,9 +5737,11 @@ P/.flux/atomic/<target-key>/<operation-id>/             whole-tree atomic stagin
 ```
 
 The recorded `workspace_path` is trusted only if it equals one of these
-two paths, derived from the lock's own target and `operation_id`. Any
-other value makes the record unverifiable: `ARTIFACT_OWNERSHIP_UNCERTAIN`;
-nothing at the recorded path is read, adopted, or deleted.
+two paths, derived from the lock's own target and `operation_id`, or is
+`none`, which marks a cleanup lock that names no workspace (Section
+259.6). Any other value makes the record unverifiable:
+`ARTIFACT_OWNERSHIP_UNCERTAIN`; nothing at the recorded path is read,
+adopted, or deleted.
 
 If the lock is missing, Flux checks both locations, each non-recursively:
 `DEST/.flux/operations/` and `P/.flux/atomic/<target-key>/` for DEST's
@@ -10532,15 +10553,23 @@ Recovery, and cleanup, replace a dead owner's lock by moving it aside:
 1. Re-read the lock. Proceed only if it still names the same dead owner.
    A record that cannot be read, or fails its checksum (Section 259.6),
    cannot show a dead owner: that is uncertain ownership (Section 240.4).
+   Where the destination provides OS-native locks (Section 235.1), take
+   the OS-native lock on the lock file without waiting; if that fails,
+   another process is using the lock, so start the acquisition again
+   (Section 21.1 step 1).
 2. Rename the lock file to `<lock-name>.broken.<new-operation-id>` beside
    it. Only one of several concurrent recoverers can move it; the others
-   find the lock gone and start the acquisition again (Section 21.1
-   step 1).
-3. Check that the moved file is the one step 1 re-read. If it is not,
-   rename it back without replacing (Section 241.5) and start the
+   find the lock gone and start the acquisition again.
+3. Check that the moved file is the one step 1 re-read, by file identity
+   and by its record: it must still name the same dead owner. A
+   `--break-lock` takeover rewrites the record in the same file (Section
+   240.5), so identity alone is not enough. If either check fails, rename
+   the file back without replacing (Section 241.5) and start the
    acquisition again.
-4. Create its own lock exclusively (Section 96.1). If that fails, classify
-   what is at the lock path as Section 96.1 does and act on it.
+4. Create its own lock exclusively (Section 96.1). If that fails, another
+   operation created the lock in the gap and owns the target: delete the
+   moved file (its owner is dead) and classify what is at the lock path as
+   Section 96.1 does.
 5. Delete the moved file.
 
 The lock path is empty between steps 2 and 4. That is harmless because
@@ -10597,14 +10626,16 @@ checksum (Section 259.6). It then takes the lock over in place, so the
 lock path is never empty:
 
 1. The destination must provide strong file identity (Section 107) and
-   OS-native locks on the lock file (Section 96.1). Otherwise
-   `--break-lock` refuses with `TARGET_LOCK_UNCERTAIN` and changes
-   nothing; the operator checks the reported holder and removes the lock
-   by hand.
+   OS-native locks on the lock file, as its `LockCapability` reports
+   (`LocalStrong` or `RemoteStrong`, Section 235.1); Flux decides this
+   from the capability, never by a trial lock. Otherwise `--break-lock` refuses with
+   `TARGET_LOCK_UNCERTAIN` and changes nothing; the operator checks the
+   reported holder and removes the lock by hand.
 2. Open the existing lock file for writing, without creating it. If it is
    gone, start the acquisition again (Section 21.1 step 1).
-3. Take the OS-native lock on it without waiting. If that fails, the
-   owner is alive: `TARGET_LOCK_BUSY`.
+3. Take the OS-native lock on it without waiting. If that fails, another
+   process holds it (the owner, or another takeover): refuse with
+   `TARGET_LOCK_BUSY`, reporting the record as read.
 4. Check that the open file is still the one at the lock path (the same
    file identity). If not, close it and start the acquisition again.
 5. Read the record. If it names a live owner, refuse with
@@ -10613,17 +10644,21 @@ lock path is never empty:
    holder, or is unreadable, continue.
 6. Overwrite the record in place with this operation's record in one
    write (Section 259.6) and flush it. Then check the file identity
-   against the lock path again: if they differ, the file was removed and
-   replaced meanwhile, and whoever created the new lock owns the target;
-   Flux stops and refuses with `TARGET_LOCK_BUSY`. Otherwise it durably
-   records the takeover and proceeds as if the prior owner were dead.
+   against the lock path again. If the path is empty, the prior owner
+   removed its lock meanwhile: start the acquisition again. If another
+   file is there, whoever created it owns the target: refuse with
+   `TARGET_LOCK_BUSY` and exit code 3, because the write went to a file no
+   longer at the lock path and nothing at the destination changed. A
+   check that itself fails counts as a different file. Only when the identity matches does Flux durably record the
+   takeover and proceed as if the prior owner were dead.
 
-An open, read, or write that fails for another reason (an I/O or
+An open, read, write, or flush that fails for another reason (an I/O or
 permission error) refuses with that error's code (Section 55): exit code 3
-before step 6 writes, exit code 1 after. A crash before step 6's write
-leaves the old lock; a crash after it leaves a lock holding the new
-operation's record, which is that operation's own lock whether or not the
-takeover record was written.
+before step 6 writes, exit code 1 after; a takeover whose flush failed is
+never recorded. A crash before step 6's write leaves the old lock; a crash
+after it leaves a lock holding the new operation's record, which is that
+operation's own lock whether or not the takeover record was written. The
+report made before acting is then the only account of the prior holder.
 
 The takeover record, kept in the new operation's state, holds the prior
 holder's `operation_id`, `owner_instance_id`, `boot_session_id`, and
@@ -10763,9 +10798,10 @@ not take (Section 97). It happens at publication:
     operation's `state.db`, holds its key (the parent directory's `FileIdentity`, Section 11, and the entry's name
     bytes as the filesystem reports them), the claiming target's `FluxPathKey` (Section 103), and whether it claims an
     existing entry or one this operation created. Claims are looked up in `state.db`, never held wholesale in memory
-    (the bound of Section 91 applies). Recovery that finds a target published without its publication record
-    (Section 30) writes that target's created-entry claim before any other target is planned or published, so a
-    crash between a publication and its claim loses no claim. A dependent hardlink member whose name maps to a different directory
+    (the resident-memory bound of Section 10.1 applies). A target's created-entry claim is written in the same
+    durable transaction as its `COMMIT` record (Section 182), so a committed target always has its claim. Recovery
+    of a `PREPARE_COMMIT` without `COMMIT` that finds the rename happened (Section 183) writes both, before any other
+    target is planned or published. A dependent hardlink member whose name maps to a different directory
     entry from its canonical member never collides with the group's claims; one that the destination folds onto the
     same entry (the example below) is a collision like any other and is reported `DESTINATION_NAMESPACE_COLLISION`,
     not `HARDLINK_UNAVAILABLE`.
@@ -11386,8 +11422,7 @@ flux cleanup exits 0 when it completed its
 classification (rows it keeps — LIVE, RESUMABLE, UNCERTAIN, CORRUPT — are reported, not failures), 1 when a deletion it
 attempted failed, 2 for a usage error, and 3 when it is refused as a whole, for example --break-lock against a live
 owner (TARGET_LOCK_BUSY). These follow Section 55. A directory that cleanup cannot list while looking for artifacts is
-reported with its error, and cleanup exits 1, because its classification is incomplete. A directory that cleanup could not list while looking for artifacts
-is reported with its error, and cleanup then exits 1: its classification is incomplete.
+reported with its error, and cleanup exits 1, because its classification is incomplete.
 
 ## 251.1 Default Cleanup
 
@@ -12896,7 +12931,7 @@ last_heartbeat_wall_time
 
 The lock file's name is not ownership proof; the record inside it is validated (Section 216).
 
-The record is written in one write call, padded to the fixed size its `format_version` defines, and ends with a checksum of its other bytes. A record whose checksum fails counts as unreadable: uncertain ownership, never a foreign object (Section 96.1).
+The record is written in one write call, padded to the fixed size its `format_version` defines, and ends with a checksum of its other bytes: the first 16 bytes of their BLAKE3 hash (Section 3.4). A record whose checksum fails counts as unreadable: uncertain ownership, never a foreign object (Section 96.1).
 
 Every target lock uses this record, including a lock that `flux cleanup` holds (Sections 240.5, 251.1). A cleanup lock carries a fresh `operation_id` for that cleanup run and `workspace_path` = `none`; it is never resumable, and once its owner is dead it is removed as Section 240.3 describes.
 
@@ -13229,8 +13264,9 @@ A conforming implementation must test at least:
     terminal Skipped state (not Failed); its dependents are Skipped after
     recovery too.
 89. a directory target lock whose recorded workspace_path is neither of the
-    two derivable paths makes recovery report ARTIFACT_OWNERSHIP_UNCERTAIN
-    and read, adopt, or delete nothing at that path.
+    two derivable paths nor none (a cleanup lock) makes recovery report
+    ARTIFACT_OWNERSHIP_UNCERTAIN and read, adopt, or delete nothing at
+    that path.
 90. a catalog record's artifact_names is never used to open or delete an
     artifact; cleanup and GC derive each artifact name from the record's
     target and operation_id instead.
@@ -13374,8 +13410,9 @@ A conforming implementation must test at least:
      existing destination names of one hardlinked object are different entries; a resumed target that finds its own
      claim proceeds.
 128. of two concurrent --break-lock takeovers of one uncertain lock exactly one proceeds (the OS-native lock admits
-     one), and the lock path is never empty; a lock removed and re-created by another operation during a takeover is
-     caught by the identity re-check and the takeover refuses with TARGET_LOCK_BUSY; a crash during a dead-owner
+     one), and the lock path is never empty; a lock removed and re-created by another operation after the takeover's
+     write is caught by the step-6 identity re-check and the takeover refuses with TARGET_LOCK_BUSY (exit 3), while one
+     removed before step 4 makes the takeover start its acquisition again; a crash during a dead-owner
      recovery leaves <lock-name>.broken.<operation-id> beside the lock, which cleanup finds for every lock form
      (single-file, fallback, directory root, filesystem root).
 129. an operation whose lock file no longer holds its own record performs nothing further, stops with
@@ -13407,14 +13444,22 @@ A conforming implementation must test at least:
      could not remove it exits 1; flux verify exits 2 on a usage error.
 141. a plain run meeting a lock whose owner is demonstrably dead replaces it by moving it aside; a second recoverer
      restarts its acquisition; the moved file is deleted, or reported and later found by cleanup; a lock whose owner is
-     uncertain is never moved aside without --break-lock.
+     uncertain is never moved aside, and --break-lock takes it over in place (Section 240.5).
 142. flux cleanup --target PATH --break-lock takes the lock over with a cleanup lock record (fresh operation_id,
      workspace_path none), deletes the artifacts, then its lock, and reports the takeover record, including the prior
      holder's fields; a crash part way is finished by running cleanup again; the no-replace probe file is named
      noreplace-probe.
 143. a worker whose operation was superseded or became terminal stops without changing the operation's state; a
-     target published without its publication record gets its created-entry claim before any other target is
-     published; a directory cleanup cannot list is reported and cleanup exits 1.
+     target recovered from PREPARE_COMMIT without COMMIT gets its COMMIT and created-entry claim before any other
+     target is planned or published; a directory cleanup cannot list is reported and cleanup exits 1.
+144. a dead-owner recoverer that finds the moved file's record changed (a --break-lock takeover rewrote it) puts it
+     back and starts again; a recoverer whose exclusive create loses the gap deletes the moved file; a takeover whose
+     final identity check finds the lock path empty starts again instead of refusing.
+145. a cancelled operation that was also superseded is never written PAUSED over ABANDONED; a takeover whose flush
+     fails is not recorded and exits 1; a cleanup lock (workspace_path none) with a dead owner is removed, never
+     reported ARTIFACT_OWNERSHIP_UNCERTAIN.
+146. a committed target always has its created-entry claim, including after a crash right after COMMIT; a lock record
+     torn by a crash fails its checksum and counts as uncertain ownership.
 ```
 
 ## 259.15 V15 Implementation Baseline
