@@ -116,8 +116,12 @@ Revision history:
         `TopologyStore`; it points to Section 91.
     34. Source-root prefixes are checked for aliasing by the destination
         filesystem through per-prefix locks (Sections 18.3, 96.1).
+    35. When the existing-destination policy skips a hardlink group's
+        canonical target, the next non-skipped member materializes the
+        group; Flux never links to an existing object it did not write
+        (Sections 5.1, 91, 142, 253.7).
 
-    V16 adds acceptance tests 31--75 to Section 259.14.
+    V16 adds acceptance tests 31--76 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -423,7 +427,8 @@ applies:
 
 Giving more than one of these options is a usage error (exit code 2).
 
-The policy applies per file target, including hardlink dependents.
+The policy applies per file target, including every member of a
+hardlink group (Section 253.7).
 Existing directories are merged into, not replaced, except under
 `--atomic=always` (Sections 30.1, 259.9). Replacement follows the atomic
 policy (Sections 27, 116): with atomic replacement, the existing target
@@ -3782,13 +3787,15 @@ trait TopologyStore {
         identity: FileIdentity,
     ) -> Result<Option<TopologyRecord>>;
 
-    // Unresolved → Copying; creates attempt 1 with
-    // candidate_path = canonical_path.
+    // Unresolved → Copying; creates attempt 1 for candidate_path:
+    // canonical_path, or the first member whose target the
+    // existing-destination policy does not skip (Section 253.7).
     fn claim_canonical(
         &self,
         identity: FileIdentity,
         operation_id: OperationId,
         canonical_path: RelativePath,
+        candidate_path: RelativePath,
     ) -> Result<ClaimResult>;
 
     // Current attempt Running → Failed. The record stays Copying.
@@ -5812,6 +5819,7 @@ trait TopologyStore {
         identity: FileIdentity,
         operation_id: OperationId,
         canonical_path: RelativePath,
+        candidate_path: RelativePath,
     ) -> Result<ClaimResult>;
 
     fn record_attempt_failure(
@@ -10845,6 +10853,32 @@ Fallback materialization must never create a hardlink between objects
 that Flux has not established as members of the same source hardlink
 identity.
 
+## 253.7 Existing-Destination Policy and Hardlink Groups
+
+The existing-destination policy (Section 5.1) is decided for each member
+of a hardlink group from that member's own target. A member whose target
+the policy leaves untouched is `Skipped` (Section 16.1). Flux never links
+other members to that existing object: Flux did not write it and cannot
+prove its content (Section 99.1).
+
+If the canonical member is skipped, that is not a failed attempt and
+spends no retry budget. Materialization passes to the next candidate, in
+`FluxPathKey` order, whose target is not skipped (Section 253.2). That
+candidate copies the content and becomes the materialization anchor, and
+the remaining non-skipped members link to it. `canonical_path` does not
+change; the first attempt is claimed with that candidate as
+`candidate_path` (Section 91). Until such a candidate is discovered, the
+group stays `Unresolved` and later members are held.
+
+If every member's target is skipped, which is decided when no further
+member can appear (Section 253.5), the whole group is `Skipped`: nothing
+is copied or linked, and every member is reported as skipped.
+
+A skipped member stays outside the destination hardlink group. Under
+`--hardlinks=preserve` that is a failure to create a required hardlink,
+reported as `HARDLINK_UNAVAILABLE` for that member; under
+`--hardlinks=auto` it is reported as degraded (Section 15).
+
 ------------------------------------------------------------------------
 
 # 254. Atomic Capacity Exhaustion State Machine
@@ -12206,6 +12240,9 @@ A conforming implementation must test at least:
 75. on a case-insensitive destination, `flux copy /s/Data /s/data /dest` is
     rejected with DESTINATION_NAMESPACE_COLLISION before any transfer; on a
     case-sensitive destination it proceeds.
+76. with --skip-existing and the canonical member's target already present, the
+    next non-skipped member copies and the others link to it; the existing
+    file is never linked; if every target exists the group is Skipped.
 ```
 
 ## 259.15 V15 Implementation Baseline
