@@ -207,8 +207,12 @@ Revision history:
         `--atomic=always` against a root DEST is refused with
         `ATOMIC_DIRECTORY_REPLACE_UNSUPPORTED` (Sections 4.2, 96.1, 259.3,
         259.9).
+    70. A `TARGET_LOCK_BUSY`, `OPERATION_LOCKED`, or `TARGET_LOCK_UNCERTAIN`
+        refusal reports the holder's identity, boot session, workspace
+        path, and last heartbeat where the lock record is readable
+        (Section 96.2).
 
-    V16 adds acceptance tests 31--98 to Section 259.14.
+    V16 adds acceptance tests 31--99 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -2635,7 +2639,7 @@ existing code.
 | `IO_ERROR` | An I/O failure not covered by a more specific code. | 55 |
 | `LEASE_AGE_UNCERTAIN` | The wall clock moved backward, so lease staleness cannot be concluded. | 229.5 |
 | `METADATA_APPLY_FAILED` | Metadata could not be applied to a file: the file's action fails when that metadata was explicitly requested, and is a best-effort warning otherwise. | 44.1 |
-| `OPERATION_LOCKED` | Another process holds the operation lock. | 58 |
+| `OPERATION_LOCKED` | Another process holds the operation lock. | 58, 96.2 |
 | `PATH_COMPONENT_INVALID` | A path component contains `0x00`; no `FluxPathKey` is constructed. | 103 |
 | `PERMISSION_DENIED` | The operating system denied access. | 55 |
 | `REMOTE_LOCK_UNSAFE` | No trustworthy exclusive lock contract can be established on a remote filesystem. | 235.4 |
@@ -2647,9 +2651,9 @@ existing code.
 | `STATE_CORRUPT` | The manifest, `state.db`, or `topology.db` is corrupt; the workspace is preserved. | 140 |
 | `STRICT_DURABILITY_UNAVAILABLE` | `--durability=strict` cannot be established for the filesystem. | 169 |
 | `SYMLINK_CREATION_UNAVAILABLE` | A symlink cannot be created (for example, a missing Windows privilege); action-scoped. | 127, 259.11 |
-| `TARGET_LOCK_BUSY` | A live owner holds the destination target lock. | 96, 97.1, 240.2, 252.2 |
+| `TARGET_LOCK_BUSY` | A live owner holds the destination target lock. | 96, 96.2, 97.1, 240.2, 252.2 |
 | `TARGET_LOCK_KEY_COLLISION` | Two distinct complete keys share a catalog-record digest; the records are never merged. | 250 |
-| `TARGET_LOCK_UNCERTAIN` | Flux cannot distinguish a dead lock owner from a stalled one. | 240.4, 252.4 |
+| `TARGET_LOCK_UNCERTAIN` | Flux cannot distinguish a dead lock owner from a stalled one. | 96.2, 240.4, 252.4 |
 | `VERIFY_MISMATCH` | A verification digest did not match, or `flux verify` found differing content, payload, or object type. | 4.2, 55, 135 |
 | `WAL_CORRUPT` | WAL corruption found before the trailing record. | 174, 191 |
 | `WAL_FORMAT_UNSUPPORTED` | The WAL format is unknown. | 191 |
@@ -2729,7 +2733,8 @@ receive:
 OPERATION_LOCKED
 ```
 
-rather than concurrently modifying the same state.
+rather than concurrently modifying the same state. The refusal reports
+the holder (Section 96.2).
 
 ------------------------------------------------------------------------
 
@@ -4406,6 +4411,13 @@ because a root cannot be replaced (Section 259.9).
 
 Exclusive creation on a remote filesystem is trusted only under the lock
 capability rules of Section 235; otherwise `REMOTE_LOCK_UNSAFE`.
+
+## 96.2 Lock Refusal Reports the Holder
+
+A refusal with `TARGET_LOCK_BUSY`, `OPERATION_LOCKED`, or
+`TARGET_LOCK_UNCERTAIN` reports, where the lock record is readable, the
+holder's `owner_instance_id`, `boot_session_id`, `workspace_path`, and
+`last_heartbeat_wall_time`.
 
 ------------------------------------------------------------------------
 
@@ -10106,7 +10118,7 @@ demonstrates that the owner is alive:
 TARGET_LOCK_BUSY
 ```
 
-must be returned.
+must be returned, reporting the holder (Section 96.2).
 
 Flux must not steal the lock because the heartbeat happens to be old.
 
@@ -10136,7 +10148,8 @@ then:
 TARGET_LOCK_UNCERTAIN
 ```
 
-must be reported.
+must be reported, with the holder (Section 96.2) where the lock record
+is readable.
 
 The safe default is to preserve the artifacts.
 
@@ -11018,7 +11031,7 @@ owner remains alive:
 TARGET_LOCK_BUSY
 ```
 
-must be returned.
+must be returned, reporting the holder (Section 96.2).
 
 Flux must not steal the lock because the heartbeat is old.
 
@@ -11047,6 +11060,9 @@ the result is:
 ``` text
 TARGET_LOCK_UNCERTAIN
 ```
+
+reported with the holder (Section 96.2) where the lock record is
+readable.
 
 The safe default is preservation.
 
@@ -12687,6 +12703,10 @@ A conforming implementation must test at least:
 98. copying to a filesystem-root DEST takes the lock T/.flux-root.lock
     inside T, never compares or reports it, and refuses --atomic=always
     against that DEST with ATOMIC_DIRECTORY_REPLACE_UNSUPPORTED.
+99. a TARGET_LOCK_BUSY, OPERATION_LOCKED, or TARGET_LOCK_UNCERTAIN
+    refusal against a readable lock record reports the holder's
+    owner_instance_id, boot_session_id, workspace_path, and
+    last_heartbeat_wall_time.
 ```
 
 ## 259.15 V15 Implementation Baseline
