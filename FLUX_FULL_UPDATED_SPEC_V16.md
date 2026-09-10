@@ -154,8 +154,10 @@ Revision history:
         files are handled per entry (Sections 12.1, 72, 86, 259.11).
     52. `--resume-verify` may change on resume; missing digests upgrade
         validation to `full` (Sections 121, 211).
+    53. `flux verify` is defined: read-only comparison of SOURCE and DEST
+        under the copy mapping (Sections 4.2, 46, 55).
 
-    V16 adds acceptance tests 31--86 to Section 259.14.
+    V16 adds acceptance tests 31--87 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -382,6 +384,44 @@ target already exists follows the existing-destination policy (Section
 
 For folder sources the mapping never depends on whether `DEST` already
 exists, so re-running the same command lands in the same place.
+
+## 4.2 Verify Command
+
+``` bash
+flux verify SOURCE DEST
+```
+
+compares `SOURCE` with `DEST` without changing anything. It uses the
+destination mapping of Section 4.1 and the copy selection options
+(`--exclude`, `--links`, `--cross-filesystems`, `--recursive`), and
+reads with `--hash` (default `blake3`):
+
+-   Each selected source file is hashed on both sides and compared.
+    Symlinks compare payloads; directories compare presence. Metadata is
+    not compared.
+-   Both sides are walked together in `FluxPathKey` order (Section 7.2),
+    so resident memory stays bounded.
+-   Flux's own control state (`DEST/.flux/`, lock, state, and partial
+    artifacts) is never compared (Section 259.3).
+
+It reports each path as:
+
+``` text
+match
+missing      in the source, absent at the destination
+mismatched   content, symlink payload, or object type differs
+             (VERIFY_MISMATCH)
+extra        at the destination, not in the source
+```
+
+Exit status is 0 when nothing is missing or mismatched and 1 otherwise;
+extra paths are reported but do not change the exit status, because
+copying into an existing folder can leave them legitimately. `--json`
+reports the same records.
+
+`flux verify` takes no lock and creates no workspace. Run against a
+destination that another operation is changing, its report is a
+snapshot and may be stale.
 
 ------------------------------------------------------------------------
 
@@ -2251,13 +2291,13 @@ pub trait TransferOperation {
 }
 ```
 
-Future operations:
+Operations:
 
 ``` text
-CopyOperation
-SyncOperation
-VerifyOperation
-RestoreOperation
+CopyOperation      flux copy
+VerifyOperation    flux verify (Section 4.2)
+SyncOperation      future
+RestoreOperation   future
 ```
 
 The implementation must avoid an API that requires a complete in-memory
@@ -2544,7 +2584,7 @@ existing code.
 | `TARGET_LOCK_BUSY` | A live owner holds the destination target lock. | 96, 240.2, 252.2 |
 | `TARGET_LOCK_KEY_COLLISION` | Two distinct complete keys share a catalog-record digest; the records are never merged. | 250 |
 | `TARGET_LOCK_UNCERTAIN` | Flux cannot distinguish a dead lock owner from a stalled one. | 240.4, 252.4 |
-| `VERIFY_MISMATCH` | A verification digest did not match. | 55, 135 |
+| `VERIFY_MISMATCH` | A verification digest did not match, or `flux verify` found differing content, payload, or object type. | 4.2, 55, 135 |
 | `WAL_CORRUPT` | WAL corruption found before the trailing record. | 174, 191 |
 | `WAL_FORMAT_UNSUPPORTED` | The WAL format is unknown. | 191 |
 | `WAL_SEQUENCE_CONFLICT` | Conflicting payloads were found for one WAL sequence number. | 175, 191 |
@@ -12434,6 +12474,9 @@ A conforming implementation must test at least:
     entries are handled per entry and reported as degraded.
 86. resuming with --resume-verify=chunks after digests were compacted under
     --resume-verify=metadata validates with full and reports the upgrade.
+87. flux verify reports match, missing, mismatched, and extra paths correctly,
+    exits 1 only for missing or mismatched, ignores DEST/.flux and Flux
+    artifacts, and writes nothing.
 ```
 
 ## 259.15 V15 Implementation Baseline
