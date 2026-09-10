@@ -131,8 +131,8 @@ Revision history:
     40. `HARDLINK_UNAVAILABLE` is produced for a member whose required
         link cannot be created (Sections 15, 16.1, 55, 253.7).
     41. Each retry category has defined behavior (Section 207).
-    42. The `OperationStateChanged` scheduler event is described (Section
-        147.2).
+    42. The `OperationStateChanged` scheduler event is described in
+        Section 147.2.
     43. The canonical-rule statements of Sections 8.1, 13, and 69 point to
         the component-wise order of Section 7.2.
     44. The Section 83 architecture diagram shows the workspace's `wal/`
