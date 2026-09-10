@@ -216,8 +216,14 @@ Revision history:
         whole-operation refusal before anything changed; a refusal scoped
         to some paths only (for example Section 97.1(b)) exits 1
         (Section 55).
+    72. Defaults are stated for `--atomic` (auto), `--durability`
+        (normal), `--resume-verify` (chunks), and mount-boundary crossing
+        (off unless `--cross-filesystems`); Section 5's option list
+        annotates the default for `--hardlinks`, `--reflink`, `--sparse`,
+        `--atomic`, `--resume-verify`, and `--durability` (Sections 5, 27,
+        36, 42, 165).
 
-    V16 adds acceptance tests 31--100 to Section 259.14.
+    V16 adds acceptance tests 31--101 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -511,21 +517,22 @@ Planned interface:
 --preserve-permissions
 --preserve
 
---hardlinks=<auto|preserve|copy>
+--hardlinks=<auto|preserve|copy>      (Section 15; default auto)
 
---reflink=<auto|always|never>
+--reflink=<auto|always|never>        (Section 39; default auto)
 
---sparse=<auto|always|never>
+--sparse=<auto|always|never>         (Section 38; default auto)
 
---atomic=<auto|always|never>
+--atomic=<auto|always|never>         (Section 27; default auto)
 
 --resume
 --restart                            (Section 21.1; supersede prior state)
 --break-lock                         (Section 240.5; with --restart only)
 --resume-verify=<metadata|chunks|full>
+                                     (Section 36; default chunks)
 --retries=<N|unlimited>              (Section 206; default 3)
 
---durability=<normal|strict>         (Sections 141, 165)
+--durability=<normal|strict>         (Sections 141, 165; default normal)
 
 --links=<copy|follow|skip>           (Sections 26, 124; follow is future)
 
@@ -1663,6 +1670,12 @@ Flux supports:
 --atomic=never
 ```
 
+Default:
+
+``` text
+auto
+```
+
 ## `auto`
 
 Prefer atomic replacement.
@@ -2070,7 +2083,7 @@ Flux must not silently continue.
 --resume-verify=full
 ```
 
-Recommended default for large resumable files:
+Default:
 
 ``` text
 chunks
@@ -2247,11 +2260,13 @@ self-exclusion.
 
 # 42. Mount Boundaries
 
-Recommended default:
+Default:
 
 ``` text
 do not cross filesystem boundaries
 ```
+
+Crossing is off unless `--cross-filesystems` is given.
 
 Future:
 
@@ -7262,6 +7277,12 @@ Flux defines:
 ``` text
 --durability=normal
 --durability=strict
+```
+
+Default:
+
+``` text
+normal
 ```
 
 ## Normal
@@ -12731,6 +12752,9 @@ A conforming implementation must test at least:
      an action failure or verify mismatch or a refusal scoped to some
      paths only, 2 for a usage error, and 3 for a whole-operation refusal
      that changed nothing.
+101. with no options given, --atomic behaves as auto, --durability as
+     normal, --resume-verify as chunks, and filesystem boundaries are not
+     crossed.
 ```
 
 ## 259.15 V15 Implementation Baseline
