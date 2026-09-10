@@ -274,8 +274,12 @@ Revision history:
         unavailable, Flux warns at start, and a subsequent WAL failure
         ends in `CONTROL_STATE_DURABILITY_FAILURE` (Sections 231.1,
         231.2, 231.5).
+    83. `DIRECTORY_CHANGED_DURING_SCAN` has one outcome: the directory's
+        subtree is not transferred, the error is reported, and the
+        operation exits 1. There is no configured mutation policy or
+        rescan alternative (Section 149.4).
 
-    V16 adds acceptance tests 31--108 to Section 259.14.
+    V16 adds acceptance tests 31--109 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -6903,8 +6907,9 @@ If it changes unexpectedly:
 DIRECTORY_CHANGED_DURING_SCAN
 ```
 
-is raised or the directory is rescanned according to the configured
-mutation policy.
+is raised. That directory's subtree is not transferred; the error is
+reported, and the operation's exit status is 1. There is no rescan
+alternative.
 
 ## 149.5 New Destination Directories
 
@@ -12886,6 +12891,10 @@ A conforming implementation must test at least:
      filesystem corruption), not only ENOSPC, enters the emergency
      persistence path; if the emergency journal fails too,
      CONTROL_STATE_DURABILITY_FAILURE is reported.
+109. an existing directory whose identity changes unexpectedly while
+     being entered raises DIRECTORY_CHANGED_DURING_SCAN, does not
+     transfer that directory's subtree, reports the error, and the
+     operation exits 1; there is no rescan alternative.
 ```
 
 ## 259.15 V15 Implementation Baseline
