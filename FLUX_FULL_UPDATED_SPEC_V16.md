@@ -198,8 +198,12 @@ Revision history:
         with `--restart` or `flux cleanup --target`, it overrides only
         uncertain ownership, never a live owner or missing or corrupt
         state (Sections 5, 21.1, 60, 240.5, 252.4).
+    68. `flux cleanup` reports every row and every deletion regardless of
+        `--force`, with no interactive prompt; `--dry-run` classifies and
+        reports without deleting or locking; `--target`, `--dry-run`, and
+        `--force` are no longer future options (Sections 24.4, 60).
 
-    V16 adds acceptance tests 31--96 to Section 259.14.
+    V16 adds acceptance tests 31--97 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -1536,13 +1540,19 @@ flux cleanup DEST
 ```
 
 The `DEST` argument is required unless `--target PATH` is given
-(Section 251). It lists stale operations before deletion unless forced.
+(Section 251). Cleanup reports every row with its status and every
+deletion it makes; `--force` never suppresses that report. There is no
+interactive prompt.
 
-Example future interface:
+`--dry-run` classifies and reports eligibility, deletes nothing, and
+takes no lock (Section 251.1).
+
+Example interface:
 
 ``` bash
 flux cleanup /backup
-flux cleanup /backup --older-than 30d
+flux cleanup /backup --dry-run
+flux cleanup /backup --older-than 30d      (future)
 flux cleanup /backup --force
 ```
 
@@ -2755,14 +2765,19 @@ Behavior:
 5.  display candidates
 6.  remove only explicitly eligible operations
 
-Future options:
+Options:
 
 ``` bash
 --target <PATH>          # single target, no DEST needed (Sections 234.1, 251.2)
---older-than <duration>
---dry-run
---force
+--dry-run                # classify and report eligibility; delete nothing, take no lock
+--force                  # also mark RESUMABLE rows eligible, bypassing retention only
 --break-lock             (Section 240.5; with --target only)
+```
+
+Future options:
+
+``` bash
+--older-than <duration>
 ```
 
 Automatic cleanup should be conservative.
@@ -12644,6 +12659,9 @@ A conforming implementation must test at least:
     reports the recorded holder, takes over, and proceeds; the same
     invocation against a target reporting TARGET_LOCK_BUSY, or missing or
     corrupt state, still refuses.
+97. flux cleanup --force still reports every row's status and every
+    deletion it makes; flux cleanup --dry-run reports classification and
+    eligibility, deletes nothing, and takes no lock.
 ```
 
 ## 259.15 V15 Implementation Baseline
