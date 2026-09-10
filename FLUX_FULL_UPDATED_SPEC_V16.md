@@ -93,8 +93,11 @@ Revision history:
     24. Every capacity state is defined with its outcome;
         `CAPACITY_IMPOSSIBLE` ends in `FAILED_ATOMIC_CAPACITY` (Section
         254).
+    25. Resume finds whole-tree atomic staging state through the
+        destination root's lock, which records the workspace path
+        (Sections 18, 21, 120, 259.6, 259.10).
 
-    V16 adds acceptance tests 31--67 to Section 259.14.
+    V16 adds acceptance tests 31--68 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -857,6 +860,10 @@ Flux state is **destination-local and operation-scoped**.
 
 It must never depend on a global system-wide Flux database.
 
+Whole-tree atomic staging keeps its workspace in the destination's parent
+directory instead of inside the destination (Section 259.10), because
+that state must survive the replacement of the destination root.
+
 ## 18.1 Single-file transfer
 
 For:
@@ -1075,7 +1082,8 @@ It first checks:
 /backup/.flux/operations/
 ```
 
-and loads operation manifests.
+(or, for whole-tree atomic staging, the workspace named by the
+destination root's lock; Section 120) and loads operation manifests.
 
 The requested source/destination pair is matched against the manifest.
 
@@ -4980,13 +4988,19 @@ partial target
 
 must form a validated relationship.
 
-For directory operations:
+For directory operations, discovery starts from the destination root's
+lock, `P/<DEST-name>.flux-lock` (Section 96.1). Its record names the
+operation's workspace:
 
 ``` text
-destination/.flux/operations/
+DEST/.flux/operations/<operation-id>/                   normal operations
+P/.flux/atomic/<target-key>/<operation-id>/             whole-tree atomic staging
+                                                        (Section 259.10)
 ```
 
-is the authoritative discovery location.
+If the lock is missing, Flux checks both locations: `DEST/.flux/operations/`
+and, non-recursively, `P/.flux/atomic/`. Both are authoritative discovery
+locations; nothing else is searched.
 
 ------------------------------------------------------------------------
 
@@ -11790,6 +11804,7 @@ operation_id
 owner_instance_id
 boot_session_id
 target_path_key
+workspace_path     (where the owning operation's recovery state lives; Section 120)
 creation_time
 heartbeat
 ```
@@ -11868,7 +11883,7 @@ However, a successful `--atomic=always` operation must not expose an unintended 
 
 Whole-tree atomic staging control state required for recovery must live outside the root being published or replaced.
 
-A preferred structure is:
+The structure is:
 
 ```text
 P/.flux/atomic/<target-key>/<operation-id>/
@@ -11880,6 +11895,8 @@ P/.flux/atomic/<target-key>/<operation-id>/
     staging/
         root/
 ```
+
+where `<target-key>` is `sha256(K)` for the destination root's complete lock key `K` (Section 259.6). The destination root's lock record names this workspace, which is how resume finds it (Section 120).
 
 Publishing the staged root must not destroy the control state needed to recover that publication.
 
@@ -12058,6 +12075,9 @@ A conforming implementation must test at least:
     including when segment names sort differently (wal/999999 vs wal/1000000).
 67. each capacity state of Section 254.1 is reachable and has its stated
     outcome; CAPACITY_IMPOSSIBLE always ends in FAILED_ATOMIC_CAPACITY.
+68. --resume after a crash during an --atomic=always directory replacement finds
+    the staging workspace under P/.flux/atomic/ through the destination root's
+    lock, and also when that lock is missing.
 ```
 
 ## 259.15 V15 Implementation Baseline
