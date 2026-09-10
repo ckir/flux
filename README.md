@@ -8,7 +8,7 @@ deterministic traversal, resumability and filesystem-native acceleration.
 
 **Status: pre-implementation.** The workspace and toolchain are scaffolded; no
 engine code exists yet. The authoritative design is
-[`FLUX_FULL_UPDATED_SPEC_V15.md`](FLUX_FULL_UPDATED_SPEC_V15.md).
+[`FLUX_FULL_UPDATED_SPEC_V16.md`](FLUX_FULL_UPDATED_SPEC_V16.md).
 
 ## Goals
 

@@ -1,6 +1,7 @@
 # Flux --- Full Updated Engineering Specification
 
 **Project:** Flux\
+**Revision:** V16\
 **Status:** Implementation-ready architectural specification\
 **Language:** Rust\
 **Platforms:** Linux, macOS, Windows\
@@ -8,18 +9,52 @@
 
 ------------------------------------------------------------------------
 
-# V14 Normative Integration Notice
+# Revision Notice
 
-This V13 revision integrates the Architecture Review Panel
-protocol-completeness resolutions directly into the authoritative
-specification.
+This is revision **V16** of the specification.
 
-V13 resolves: 1. Section 222 --- deterministic orphaned
-operation-workspace collection predicates. 2. Section 218 --- exact
-durable location and lifecycle for `cleanup_pending` for isolated
-single-file transfers. 3. Section 206 --- normative default retry limit
-of 3 retries. 4. Section 113.1 --- precise trigger for subtracting
-reclaimed capacity from the Stage A running forecast.
+Revision history:
+
+-   **V13** integrated the Architecture Review Panel protocol-completeness
+    resolutions: Section 222 (deterministic orphaned operation-workspace
+    collection predicates), Section 218 (durable location and lifecycle
+    of `cleanup_pending` for isolated single-file transfers), Section 206
+    (normative default retry limit of 3 retries), and Section 113.1
+    (trigger for subtracting reclaimed capacity from the Stage A
+    forecast). Its invariants follow Section 256.
+-   **V14** closed scheduler, retry, and bounded-memory ambiguities in the
+    "V14 Normative Integration" section after Section 258.
+-   **V15** closed implementation-blocking ambiguities in Section 259;
+    its status is Section 260.
+-   **V16** resolves contradictions found in a full read of V15. Unlike
+    earlier revisions, V16 amends the affected sections **in place**, so
+    no section still states a superseded rule:
+    1.  Path ordering: `FluxPathKey` order is component-wise, encoded as
+        path components joined by `0x00` (Sections 2, 7, 70, 103, 241,
+        245).
+    2.  The single-file state artifact is named
+        `target.flux-state.<operation-id>` everywhere (Sections 18.1,
+        213, 214, 218, 220, 234, 239).
+    3.  `TopologyState` is payload-bearing and attempt-fenced, and
+        `Failed` is terminal (Sections 90, 91, 92, 123, 142, 147.2,
+        201--206, 253.3, 259.1, V14.3.1).
+    4.  Fallback materialization is limited to path-scoped failures and a
+        shared per-group retry budget; the failed canonical is linked to
+        the anchor; terminal failure waits until no further member can
+        appear (Sections 89, 152, 206, 207, 253, 256, 259.2).
+    5.  The standalone catalog lives in the target's parent directory,
+        and `flux cleanup` is non-recursive (Sections 24.4, 250, 251,
+        257, 258).
+    6.  Error-code names are unified, and Section 55 is the normative
+        error-code registry.
+    7.  Version labels are corrected, and options used elsewhere are
+        listed in Sections 5 and 60.
+
+    V16 adds acceptance tests 31--42 to Section 259.14.
+
+Where sections conflict, later closure layers control earlier ones, and
+payload-bearing definitions control state-name summaries (Section
+V14.4).
 
 These rules are normative. Implementation choices may vary only where
 they do not alter the stated invariants or recovery semantics.
@@ -234,7 +269,9 @@ Planned interface:
 --recursive
 --no-recursive
 
---workers <N>
+--workers <N|auto>
+
+--exclude <PATTERN>                  (Section 14)
 
 --overwrite
 --update
@@ -256,10 +293,18 @@ Planned interface:
 
 --resume
 --resume-verify=<metadata|chunks|full>
+--retries=<N|unlimited>              (Section 206; default 3)
+
+--durability=<normal|strict>         (Sections 141, 165)
 
 --links=<copy|follow|skip>
 
+--special-files=<skip|strict>        (Section 233; default skip)
+
 --cross-filesystems
+
+--heartbeat-interval <duration>      (Section 101; future)
+--lease-timeout <duration>           (Section 101; future)
 
 --dry-run
 
@@ -1002,8 +1047,8 @@ Command:
 flux cleanup DEST
 ```
 
-The `DEST` argument is required (Section 251.1). It lists stale
-operations before deletion unless forced.
+The `DEST` argument is required unless `--target PATH` is given
+(Section 251). It lists stale operations before deletion unless forced.
 
 Example future interface:
 
@@ -2170,6 +2215,7 @@ Behavior:
 Future options:
 
 ``` bash
+--target <PATH>          # single target, no DEST needed (Sections 234.1, 251.2)
 --older-than <duration>
 --dry-run
 --force
@@ -7554,8 +7600,8 @@ An explicit finite value:
 
 overrides the default for that operation.
 
-An explicit unlimited policy may be requested by the user and is the
-only case in which the retry count is unbounded.
+An explicit unlimited policy (`--retries=unlimited`) may be requested by
+the user and is the only case in which the retry count is unbounded.
 
 Retry count semantics are:
 
@@ -8370,7 +8416,7 @@ The implementation must add:
 
 ------------------------------------------------------------------------
 
-# 228. Final Flux Specification Status --- V13
+# 228. Final Flux Specification Status --- V6
 
 With Sections 200--227 incorporated, the Flux specification explicitly
 separates:
@@ -9035,7 +9081,7 @@ The implementation must add:
 
 ------------------------------------------------------------------------
 
-# 238. Final Flux Specification Status --- V13
+# 238. Final Flux Specification Status --- V7
 
 With Sections 229--237 incorporated, Flux explicitly defines:
 
@@ -9651,7 +9697,7 @@ The implementation must add:
 
 ------------------------------------------------------------------------
 
-# 248. Final Flux Specification Status --- V13
+# 248. Final Flux Specification Status --- V8
 
 Flux now explicitly separates four identities:
 
@@ -9982,9 +10028,9 @@ DEST/.flux/operations/   directory operations whose destination root is DEST
 DEST/.flux/standalone/   single-file operations whose target's parent is DEST
 ```
 
-The `DEST` argument is required (Section 60). A bare `flux cleanup` with
-no path is a usage error, because there is no global catalog to
-enumerate (Section 18).
+The `DEST` argument is required unless `--target PATH` is given
+(Section 251.2). A bare `flux cleanup` with neither is a usage error,
+because there is no global catalog to enumerate (Section 18).
 
 For each standalone catalog entry:
 
@@ -10581,7 +10627,7 @@ UNCERTAINTY-01
     reconciled before destructive recovery action.
 ```
 
-# 258. Final Flux Specification Status --- V13
+# 258. Final Flux Specification Status --- V9
 
 Flux now has explicit protocols for:
 
@@ -11578,7 +11624,8 @@ A conforming implementation must test at least:
 40. a crash between adjacent-state creation and catalog registration is
     recovered by a non-recursive listing of P.
 41. `flux cleanup DEST` enumerates only DEST/.flux/operations and
-    DEST/.flux/standalone; a bare `flux cleanup` is a usage error.
+    DEST/.flux/standalone; `flux cleanup` with neither DEST nor --target is a
+    usage error.
 42. after completion, empty P/.flux/standalone/ and P/.flux/ created by Flux
     are removed; a pre-existing foreign P/.flux is left untouched.
 ```
@@ -11667,4 +11714,7 @@ atomic publication → never silently downgraded
 ```
 
 **V15 implementation baseline: CLOSED.**
+
+**V16 implementation baseline:** V15 as amended in place by V16 (see
+the Revision Notice at the top of this document).
 
