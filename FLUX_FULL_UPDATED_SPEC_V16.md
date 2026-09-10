@@ -131,8 +131,10 @@ Revision history:
     40. `HARDLINK_UNAVAILABLE` is produced for a member whose required
         link cannot be created (Sections 15, 16.1, 55, 253.7).
     41. Each retry category has defined behavior (Section 207).
+    42. The `OperationStateChanged` scheduler event is described (Section
+        147.2).
 
-    V16 adds acceptance tests 31--80 to Section 259.14.
+    V16 adds acceptance tests 31--81 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -6234,6 +6236,13 @@ enum SchedulerEvent {
 }
 ```
 
+`OperationStateChanged` is emitted when the operation's persisted state
+(Section 20) changes, for example to `PAUSED` after cancellation. On
+receiving it the scheduler reads the persisted state and stops admitting
+new work unless that state is `TRANSFERRING`. It carries no attempt, so
+attempt fencing (Section V14.3) does not apply; a duplicate or late
+delivery is harmless because the scheduler acts on the persisted state.
+
 The event itself is not the authoritative state.
 
 The authoritative state remains in `topology.db`.
@@ -12306,6 +12315,8 @@ A conforming implementation must test at least:
     and fresh plan, take no lock, and change nothing on disk.
 80. each retry category of Section 207 behaves as its row states; in
     particular lock_conflict and capacity_failure never spend attempt budget.
+81. after OperationStateChanged to PAUSED the scheduler admits no new work; a
+    duplicate or late delivery changes nothing.
 ```
 
 ## 259.15 V15 Implementation Baseline
