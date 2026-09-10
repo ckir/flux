@@ -161,6 +161,7 @@ Revision history:
         (Sections 90, 91, 142, 147.3, 201, 253.3, 253.5, V14.4).
     55. Section 239.1 points to Section 249.2's single-file lifecycle
         instead of restating it without the catalog steps.
+    56. Per-prefix locks apply only with multiple roots (Section 18.3).
 
     V16 adds acceptance tests 31--88 to Section 259.14.
 
@@ -1131,9 +1132,11 @@ to the destination root, under which `R`'s content is placed.
     component, and prefixes must be pairwise distinct. Two roots with
     the same prefix are rejected with `DESTINATION_NAMESPACE_COLLISION`
     before any transfer begins.
--   Distinctness is decided by the destination filesystem, not by
-    bytes. Before any transfer, the operation takes a lock named after
-    each prefix, `DEST/<name>.flux-lock` (Section 96.1). If a prefix's
+-   With multiple roots, distinctness is decided by the destination
+    filesystem, not by bytes. Before any transfer, the operation takes
+    a lock named after each root's prefix, `DEST/<name>.flux-lock`
+    (Section 96.1). A single root with an empty prefix takes no prefix
+    lock; its destination root is locked as in Section 97. If a prefix's
     lock creation fails against another root's lock of the same
     operation, the two prefixes alias on the destination (for example
     `Data` and `data` on a case-insensitive filesystem) and are
