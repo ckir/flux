@@ -97,8 +97,8 @@ implementation details.
 5.  The canonical hardlink member is the first selected path encountered
     for an object identity.
 6.  Because the default scanner is deterministically ordered, the
-    canonical member is the lexicographically smallest selected
-    normalized relative path.
+    canonical member is the smallest selected normalized relative path
+    in `FluxPathKey` order (component-wise; Sections 7.2 and 103).
 7.  Flux does not buffer an entire hardlink group in RAM merely to
     determine its canonical member.
 8.  Persistent topology state may spill to disk.
@@ -303,7 +303,9 @@ ordering.
 
 The ordering representation must:
 
--   use `/` as the internal relative-path separator
+-   use `/` as the internal relative-path separator for display and
+    destination mapping (the ordering key uses its own separator;
+    Section 103)
 -   preserve the actual filename bytes/code points where possible
 -   not perform Unicode normalization implicitly
 -   not perform locale-specific case folding
@@ -316,6 +318,25 @@ Primary ordering:
 ``` text
 lexicographic comparison of normalized relative path components
 ```
+
+Components are compared as unsigned byte strings (Unix: raw filename
+bytes; Windows: canonical WTF-8, Section 241.2). A path whose component
+sequence is a prefix of another's sorts first, so a directory sorts
+before its own contents.
+
+This is **not** the same as a flat byte comparison of the `/`-joined
+path. Many legal filename bytes sort below `/` (0x2F), including space,
+`-` (0x2D), and `.` (0x2E). For the paths `a/x`, `a/y/z`, `a-b`, `a0`:
+
+``` text
+component-wise (normative):   a/x   a/y/z   a-b   a0
+flat '/'-joined bytes (NOT):  a-b   a/x     a/y/z a0
+```
+
+A depth-first scanner that sorts each directory's entries by name alone
+emits component-wise order without buffering. `FluxPathKey` (Section
+103) encodes this order so that plain bytewise comparison of keys equals
+component-wise comparison.
 
 For platforms with native Unicode strings, comparison is performed on
 the deterministic normalized representation.
@@ -2434,6 +2455,22 @@ The copy of `A/large` must be allowed to start before `M/large` and
 
 This validates the central bounded-memory hardlink architecture.
 
+Separator-ordering case: create a directory `foo/` containing `bar`,
+and a sibling file `foo.txt`, with `foo/bar` and `foo.txt` sharing one
+filesystem identity.
+
+Expected discovery and canonical:
+
+``` text
+foo/bar     canonical
+foo.txt     dependent
+```
+
+A flat byte comparison of `/`-joined paths would pick `foo.txt`
+(0x2E < 0x2F); that result is non-conforming. The test must also assert
+that the scanner's emission order equals the order of the emitted
+`FluxPathKey` values sorted bytewise.
+
 ------------------------------------------------------------------------
 
 # 71. Windows Ordering Acceptance Test
@@ -3763,6 +3800,32 @@ struct FluxPathKey(Vec<u8>);
 `FluxPathKey` is an internal ordering representation.
 
 It is not necessarily the filesystem path encoding.
+
+Normative encoding:
+
+``` text
+FluxPathKey = c1 0x00 c2 0x00 ... 0x00 cn
+```
+
+where `c1 .. cn` are the components of the normalized relative path, each
+in its exact platform byte form (Sections 104, 105, 241). The empty
+relative path (the source root itself) encodes as the empty key.
+
+The byte `0x00` cannot occur inside a component: POSIX filenames cannot
+contain NUL, and Windows/NTFS filenames cannot contain U+0000 (whose
+WTF-8 encoding is the only way to produce `0x00`). A platform adapter that
+nevertheless observes a component containing `0x00` MUST report the entry
+as an error and MUST NOT construct a key for it.
+
+Because `0x00` is smaller than every byte that can occur in a component,
+plain bytewise comparison of `FluxPathKey` values (the derived `Ord` of
+`Vec<u8>`) is exactly the component-wise order of Section 7.2. Persistent
+indexes with byte-ordered keys may therefore store keys directly, without
+a custom comparator.
+
+`FluxPathKey` is an ordering and identity key, not a display string
+(Section 245). The `/`-joined relative path remains the display and
+destination-mapping representation.
 
 Properties:
 
@@ -9063,7 +9126,8 @@ normalization as an identity operation.
 On Unix-like systems:
 
 ``` text
-FluxPathKey = exact raw pathname byte sequence
+each FluxPathKey component = exact raw filename byte sequence
+components joined by 0x00 (Section 103)
 ```
 
 No UTF-8 lossy conversion is permitted for identity.
@@ -9078,7 +9142,8 @@ encoding suitable for deterministic cross-platform serialization.
 The specification uses:
 
 ``` text
-canonical WTF-8 byte representation
+canonical WTF-8 byte representation of each component,
+components joined by 0x00 (Section 103)
 ```
 
 for `FluxPathKey` serialization and deterministic ordering.
@@ -9325,8 +9390,9 @@ The following are normative:
 
 ``` text
 1. FluxPathKey is a namespace identity, not a display string.
-2. Unix FluxPathKey preserves raw pathname bytes.
-3. Windows FluxPathKey uses lossless canonical WTF-8 serialization.
+2. Unix FluxPathKey preserves the raw filename bytes of every component.
+3. Windows FluxPathKey uses lossless canonical WTF-8 serialization of every component.
+   In both cases components are joined by 0x00, so bytewise key order is component-wise order.
 4. Unicode normalization is never used as a hardlink identity operation.
 5. Destination filesystem normalization is treated as a namespace mapping.
 6. Destination namespace collisions are detected explicitly.
