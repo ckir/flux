@@ -346,8 +346,11 @@ Revision history:
     99. `operator_action_required` stops the operation without fallback,
         terminal failure, or budget; walk errors other than links map
         to generic codes (Sections 149.7, 207).
+    100. Section 241.5's claims are keyed by directory entry (parent directory identity and reported name), not object
+        identity; a claim records its target, so a resumed target and a hardlink dependent never collide with their own
+        claims (Section 241.5).
 
-    V16 adds acceptance tests 31--126 to Section 259.14.
+    V16 adds acceptance tests 31--127 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -10591,22 +10594,23 @@ not take (Section 97). It happens at publication:
     outside process), and Flux reports `DESTINATION_NAMESPACE_COLLISION`
     without replacing it.
 -   A target planned as a replacement (Section 5.1) claims the existing
-    entry it resolves to with an insert-if-absent write, keyed by that
-    entry — its object identity where that is strong, otherwise the
-    entry's name as the filesystem reports it — in the operation's state
+    entry it resolves to with an insert-if-absent write, keyed by that directory entry — the identity of its parent directory and the
+    entry's name as the filesystem reports it, never the object's identity, which hardlinks share — in the operation's state
     store. The planner streams (Section 47), so this claim, not a
     before-either-is-published check, is what serializes two targets
     that resolve to the same existing entry: the first target to claim
     an entry proceeds; a later target whose claim finds the entry
     already taken is reported `DESTINATION_NAMESPACE_COLLISION` and is
-    not published. The claim is durable and survives resume. Every
-    publication also claims the entry it creates, under that entry's new
-    identity (or its name as the filesystem reports it), whether the
-    target was planned as new or as a replacement, so a later target that
+    not published. The claim is durable and survives resume. Every publication also claims the directory entry it
+    creates (its parent directory's identity and its name as the filesystem reports it after publication), whether
+    the target was planned as new or as a replacement, so a later target that
     resolves to an entry this operation published is a collision too. A
     claim is never released during the operation, even if its target
     later fails; a later target that resolves to the same entry stays a
-    collision.
+    collision. Every claim is durable, survives resume, and records the target that made it; that same target
+    finding its own claim proceeds, so a resumed target never collides with itself. A dependent hardlink member
+    publishes a different directory entry from its canonical member, so linking never collides with the group's own
+    claims.
 -   Targets that are locked themselves (single-file targets, directory
     roots, source-root prefixes; Sections 18.3, 96.1) are also detected
     through their lock.
@@ -13181,6 +13185,9 @@ A conforming implementation must test at least:
      and resume starts a new attempt for the same candidate; a missing
      or non-directory component on the Section 149.7 walk fails that
      path with the matching generic code.
+127. a hardlink group's dependents link beside their canonical member without DESTINATION_NAMESPACE_COLLISION; two
+     existing destination names of one hardlinked object are different entries; a resumed target that finds its own
+     claim proceeds.
 ```
 
 ## 259.15 V15 Implementation Baseline
