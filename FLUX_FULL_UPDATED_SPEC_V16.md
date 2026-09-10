@@ -90,8 +90,11 @@ Revision history:
         165).
     23. WAL segments live in `wal/` and are ordered by their records'
         sequence numbers, never by file name (Sections 178, 194).
+    24. Every capacity state is defined with its outcome;
+        `CAPACITY_IMPOSSIBLE` ends in `FAILED_ATOMIC_CAPACITY` (Section
+        254).
 
-    V16 adds acceptance tests 31--66 to Section 259.14.
+    V16 adds acceptance tests 31--67 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -10736,6 +10739,13 @@ CAPACITY_BLOCKED
 CAPACITY_IMPOSSIBLE
 ```
 
+| State | Meaning | Outcome |
+|---|---|---|
+| `CAPACITY_READY` | enough capacity now | execute |
+| `CAPACITY_WAIT` | short now; capacity that in-flight work will reclaim covers it (Section 254.2) | stay pending, reevaluated (Section 255) |
+| `CAPACITY_BLOCKED` | short now; nothing in flight will reclaim enough, but not provably impossible | reported and reevaluated (Section 255); `--atomic=auto` may take its fallback (Section 254.5) |
+| `CAPACITY_IMPOSSIBLE` | required capacity provably exceeds the maximum recoverable capacity (Section 254.3) | terminal: `FAILED_ATOMIC_CAPACITY` |
+
 ## 254.2 Temporary Shortage
 
 If an atomic action cannot currently execute but future completion of
@@ -10757,7 +10767,7 @@ required atomic temporary capacity
 maximum recoverable destination capacity
 ```
 
-then:
+then the action enters `CAPACITY_IMPOSSIBLE`, and:
 
 ``` text
 FAILED_ATOMIC_CAPACITY
@@ -12046,6 +12056,8 @@ A conforming implementation must test at least:
     current attempt's progress.
 66. recovery orders WAL segments by their records' generation and sequence,
     including when segment names sort differently (wal/999999 vs wal/1000000).
+67. each capacity state of Section 254.1 is reachable and has its stated
+    outcome; CAPACITY_IMPOSSIBLE always ends in FAILED_ATOMIC_CAPACITY.
 ```
 
 ## 259.15 V15 Implementation Baseline
