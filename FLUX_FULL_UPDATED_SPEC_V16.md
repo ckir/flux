@@ -144,8 +144,11 @@ Revision history:
     47. Records use one name per field: `complete_lock_key` and
         `last_heartbeat_wall_time` (Sections 229.2, 250.1, 259.6).
     48. `--links=follow` is marked as a future value in Section 5.
+    49. Destination aliasing between ordinary files is caught at
+        publication by no-replace renames and by recording which existing
+        entry each replacement resolves to (Sections 16.1, 30, 241.5).
 
-    V16 adds acceptance tests 31--82 to Section 259.14.
+    V16 adds acceptance tests 31--83 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -928,7 +931,8 @@ A dependent is linked the same way every time, so re-running it is safe:
    (Section 253.4)
 1. create the hardlink at <target>.flux-partial.<operation-id>, in the
    target's directory, to the materialization anchor
-2. atomically rename it over <target>
+2. atomically rename it over <target>, refusing to replace when the
+   target was planned as new (Section 241.5)
 3. remove <target>.flux-partial.<operation-id> if it still exists
 4. record Linked
 ```
@@ -1604,7 +1608,7 @@ APPLY METADATA
     ↓
 OPTIONAL FLUSH
     ↓
-ATOMIC RENAME
+ATOMIC RENAME   (no-replace when the target was planned as new; Section 241.5)
 ```
 
 A destination must not appear complete until required verification and
@@ -10009,8 +10013,31 @@ DESTINATION_NAMESPACE_COLLISION
 
 unless an explicit, deterministic collision policy has been selected.
 
-Target locks detect this within an operation: the second target's lock
-creation fails against the operation's own lock (Section 96.1).
+Detection does not rely on per-file locks, which directory operations do
+not take (Section 97). It happens at publication:
+
+-   A target planned as new (absent at planning) is published with a
+    primitive that refuses to replace an existing entry:
+    `renameat2(RENAME_NOREPLACE)`, `renamex_np(RENAME_EXCL)`,
+    `MoveFileEx` without `MOVEFILE_REPLACE_EXISTING`, or `link()` to the
+    target followed by `unlink()` of the temporary name. If the name
+    exists by then, the entry appeared after planning (an earlier target
+    of this operation that the filesystem treats as the same name, or an
+    outside process), and Flux reports `DESTINATION_NAMESPACE_COLLISION`
+    without replacing it.
+-   A target planned as a replacement (Section 5.1) records the existing
+    entry it resolves to: its object identity where that is strong,
+    otherwise the entry's name as the filesystem reports it. Two targets
+    that resolve to the same existing entry are rejected with
+    `DESTINATION_NAMESPACE_COLLISION` before either is published.
+-   Targets that are locked themselves (single-file targets, directory
+    roots, source-root prefixes; Sections 18.3, 96.1) are also detected
+    through their lock.
+
+Example: a case-sensitive source holds `File.txt` and `file.txt`, and the
+destination ignores case. Both are planned as new; the first is
+published; the second's no-replace publication finds the name taken and
+is reported as a collision instead of overwriting the first.
 
 ## 241.6 Hardlink Independence
 
@@ -12339,6 +12366,10 @@ A conforming implementation must test at least:
     duplicate or late delivery changes nothing.
 82. after fallback, linking the failed canonical succeeds even when its failed
     copy attempt left <target>.flux-partial.<operation-id> behind.
+83. copying a folder holding File.txt and file.txt to a case-insensitive
+    destination publishes one and reports DESTINATION_NAMESPACE_COLLISION for
+    the other; nothing is overwritten. Two targets resolving to the same
+    existing entry are refused before either is published.
 ```
 
 ## 259.15 V15 Implementation Baseline
