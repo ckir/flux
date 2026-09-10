@@ -85,6 +85,7 @@ Revision history:
     19. Held dependents are persisted when discovered; the RAM hold index
         is only a bounded cache (Sections 94, 232, V14.2.1).
     20. `CheckpointMessage` carries `attempt_id` (Sections 158, 225).
+    21. `FsCapabilities` has one definition (Sections 62, 112).
 
     V16 adds acceptance tests 31--65 to Section 259.14.
 
@@ -2517,6 +2518,7 @@ Expose:
 
 ``` rust
 struct FsCapabilities {
+    stable_snapshot_read: bool,   // Section 112
     reflink: bool,
     sparse: bool,
     hardlink: bool,
@@ -2525,6 +2527,9 @@ struct FsCapabilities {
     acl: bool,
 }
 ```
+
+This is the only definition of `FsCapabilities`. Durability capabilities
+are a separate structure (Section 196).
 
 Planner decisions use capabilities rather than hard-coded assumptions.
 
@@ -4660,19 +4665,8 @@ trait StableSourceReader {
 }
 ```
 
-Capability detection:
-
-``` rust
-struct FsCapabilities {
-    stable_snapshot_read: bool,
-    reflink: bool,
-    sparse: bool,
-    hardlink: bool,
-    atomic_replace: bool,
-    xattrs: bool,
-    acl: bool,
-}
-```
+Capability detection reports it as `FsCapabilities::stable_snapshot_read`
+(Section 62).
 
 If stable snapshot reading is unavailable, Flux must report the actual
 guarantee level rather than implying stronger semantics.
