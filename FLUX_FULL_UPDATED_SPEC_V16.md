@@ -194,8 +194,12 @@ Revision history:
         ancestor of its destination, and a writer refuses path-scoped
         writes under an existing directory whose own root lock a live
         operation holds (Section 97.1).
+    67. Operator-directed recovery is defined as `--break-lock`: valid
+        with `--restart` or `flux cleanup --target`, it overrides only
+        uncertain ownership, never a live owner or missing or corrupt
+        state (Sections 5, 21.1, 60, 240.5, 252.4).
 
-    V16 adds acceptance tests 31--95 to Section 259.14.
+    V16 adds acceptance tests 31--96 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -498,6 +502,7 @@ Planned interface:
 
 --resume
 --restart                            (Section 21.1; supersede prior state)
+--break-lock                         (Section 240.5; with --restart only)
 --resume-verify=<metadata|chunks|full>
 --retries=<N|unlimited>              (Section 206; default 3)
 
@@ -1411,8 +1416,9 @@ does not match is still `INCOMPATIBLE_STATE`.
 ```
 
 Deleting before copying frees the prior partial allocation before the
-new operation needs it. `--restart` never overrides uncertain ownership,
-missing or corrupt state, or a live owner (Section 259.13). A crash
+new operation needs it. `--restart` never overrides a live owner or
+missing or corrupt state; without `--break-lock` (Section 240.5), it also
+never overrides uncertain ownership (Section 259.13). A crash
 during steps 3--5 leaves the prior operation durably `ABANDONED`, which
 normal garbage collection can then remove.
 
@@ -2756,6 +2762,7 @@ Future options:
 --older-than <duration>
 --dry-run
 --force
+--break-lock             (Section 240.5; with --target only)
 ```
 
 Automatic cleanup should be conservative.
@@ -10100,8 +10107,23 @@ must be reported.
 
 The safe default is to preserve the artifacts.
 
-Explicit operator-directed recovery may override this condition after
-suitable confirmation.
+Explicit operator-directed recovery is `--break-lock` (Section 240.5).
+
+## 240.5 `--break-lock`
+
+`--break-lock` is valid with `flux copy --restart` and `flux cleanup
+--target PATH`. It applies only when ownership is uncertain
+(`TARGET_LOCK_UNCERTAIN`, `LEASE_AGE_UNCERTAIN`); it never overrides a
+proven live owner (`TARGET_LOCK_BUSY` stays), and never missing or
+corrupt state.
+
+Before acting, Flux reports the recorded holder's `owner_instance_id`,
+`boot_session_id`, `last_heartbeat_wall_time`, and `workspace_path`, and
+durably records the takeover, then proceeds as if the prior owner were
+dead. A prior owner that was only stalled publishes nothing more: its
+commit-time lock revalidation (Section 99) fails.
+
+`--break-lock` is not a resume-compatibility option (Section 121).
 
 ------------------------------------------------------------------------
 
@@ -10995,7 +11017,7 @@ TARGET_LOCK_UNCERTAIN
 
 The safe default is preservation.
 
-Explicit operator-directed recovery may override this condition.
+Explicit operator-directed recovery is `--break-lock` (Section 240.5).
 
 ------------------------------------------------------------------------
 
@@ -12495,8 +12517,9 @@ A conforming implementation must test at least:
 47. --restart marks the prior operation ABANDONED with superseded_by, deletes
     its partial before the new copy allocates, and a crash mid-restart leaves
     it ABANDONED and collectible.
-48. --restart never overrides a live owner, uncertain ownership, or missing
-    or corrupt prior state; --resume together with --restart is a usage error.
+48. --restart never overrides a live owner or missing or corrupt prior
+    state, and without --break-lock never overrides uncertain ownership;
+    --resume together with --restart is a usage error.
 49. a prior operation that completed with cleanup_pending does not block a
     new run.
 50. on a case-insensitive destination, `flux copy A /dest/Backup` and
@@ -12617,6 +12640,10 @@ A conforming implementation must test at least:
     holds the root lock on /backup/archive fails only the actions that
     write under /backup/archive with TARGET_LOCK_BUSY, and the rest of
     the operation continues.
+96. --restart --break-lock against a target reporting TARGET_LOCK_UNCERTAIN
+    reports the recorded holder, takes over, and proceeds; the same
+    invocation against a target reporting TARGET_LOCK_BUSY, or missing or
+    corrupt state, still refuses.
 ```
 
 ## 259.15 V15 Implementation Baseline
