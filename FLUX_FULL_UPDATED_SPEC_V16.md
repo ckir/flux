@@ -243,8 +243,12 @@ Revision history:
         capacity states (Section 29). `IO_ERROR`, `PERMISSION_DENIED`,
         and `DESTINATION_ERROR` are used only when no more specific code
         applies (Section 55).
+    78. Capacity waits are visible: the progress display shows the count
+        of actions waiting for capacity and the bytes short, and each
+        action is logged at `warn` when it enters `CAPACITY_WAIT` or
+        `CAPACITY_BLOCKED` (Sections 52, 254.1).
 
-    V16 adds acceptance tests 31--105 to Section 259.14.
+    V16 adds acceptance tests 31--106 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -2588,7 +2592,13 @@ Skipped       312
 Hardlinks     1,284
 Degraded          0
 Errors            0
+Capacity wait     0 actions, 0 B short
 ```
+
+When one or more actions are in `CAPACITY_WAIT` or `CAPACITY_BLOCKED`
+(Section 254.1), the progress display shows the count of actions
+waiting for capacity and the bytes short; each action is logged at
+`warn` when it enters either state.
 
 Progress must not require the entire file list in RAM.
 
@@ -11388,6 +11398,10 @@ CAPACITY_IMPOSSIBLE
 | `CAPACITY_BLOCKED` | short now; nothing in flight will reclaim enough, but not provably impossible | reported and reevaluated (Section 255); `--atomic=auto` may take its fallback (Section 254.5) |
 | `CAPACITY_IMPOSSIBLE` | required capacity provably exceeds the maximum recoverable capacity (Section 254.3) | terminal: `FAILED_ATOMIC_CAPACITY` |
 
+An action entering `CAPACITY_WAIT` or `CAPACITY_BLOCKED` is logged at
+`warn`; the count of waiting actions and the bytes short are shown in
+the progress display (Section 52).
+
 ## 254.2 Temporary Shortage
 
 If an atomic action cannot currently execute but future completion of
@@ -12824,6 +12838,9 @@ A conforming implementation must test at least:
      manifest recording a different chunk_size is INCOMPATIBLE_STATE.
 105. flux verify reports a path unreadable when either side could not be
      read or hashed, reports the error, and exits 1.
+106. an action entering CAPACITY_WAIT or CAPACITY_BLOCKED is logged at
+     warn, and the progress display shows the count of actions waiting
+     for capacity and the bytes short.
 ```
 
 ## 259.15 V15 Implementation Baseline
