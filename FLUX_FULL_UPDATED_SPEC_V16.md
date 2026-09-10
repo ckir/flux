@@ -179,8 +179,11 @@ Revision history:
     62. Default `flux cleanup DEST` also inspects, non-recursively,
         `P/.flux/atomic/<target-key>/` for whole-tree atomic staging
         workspaces (Sections 24.4, 60, 251.1, 259.10).
+    63. `flux cleanup --target PATH` also inspects `P/.flux-dir.lock`
+        when the Section 96.1 fallback applies to that target (Section
+        251.2).
 
-    V16 adds acceptance tests 31--91 to Section 259.14.
+    V16 adds acceptance tests 31--92 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -10832,6 +10835,7 @@ may directly inspect:
 
 ``` text
 /dest/foo.iso.flux-lock
+/dest/.flux-dir.lock       (Section 96.1 fallback, when it applies to this target)
 /dest/foo.iso.flux-state.*
 /dest/foo.iso.flux-partial.*
 ```
@@ -12553,6 +12557,9 @@ A conforming implementation must test at least:
 91. default flux cleanup DEST classifies a whole-tree atomic staging
     workspace found under P/.flux/atomic/<target-key>/ the same way it
     classifies an entry under DEST/.flux/operations/.
+92. flux cleanup --target PATH for a target whose lock fell back to
+    P/.flux-dir.lock (Section 96.1) inspects that lock file; it is not
+    left undiscoverable.
 ```
 
 ## 259.15 V15 Implementation Baseline
