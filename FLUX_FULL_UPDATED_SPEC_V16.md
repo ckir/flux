@@ -71,8 +71,11 @@ Revision history:
         mutually exclusive; overwrite is the default (Sections 5, 5.1).
     14. `--dry-run` is read-only: no locks, workspace, catalog entry, or
         destination change, and it is not resumable (Sections 5, 5.2).
+    15. The metadata policy is defined: explicitly requested metadata is
+        strict, default metadata is best-effort, and both report
+        `METADATA_APPLY_FAILED` (Sections 44.1, 55, 133).
 
-    V16 adds acceptance tests 31--59 to Section 259.14.
+    V16 adds acceptance tests 31--60 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -1949,6 +1952,23 @@ DOS attributes
 alternate data streams
 ```
 
+## 44.1 Metadata Policy
+
+The metadata policy is set by the `--preserve` options (Section 5):
+
+-   Metadata the user explicitly requested (`--preserve`,
+    `--preserve-times`, `--preserve-permissions`) is strict. If it cannot
+    be applied to a file, that file's action fails with
+    `METADATA_APPLY_FAILED`, and under atomic replacement the file is not
+    published.
+-   Metadata applied only by default is best-effort. The file is
+    published, each failure is reported as `METADATA_APPLY_FAILED`, and
+    the operation exits with status 1.
+
+Either way a metadata failure is reported separately from content-copy
+failure (Section 133). The metadata policy is part of the configuration
+fingerprint (Section 19).
+
 ------------------------------------------------------------------------
 
 # 45. Transfer Action IR
@@ -2257,6 +2277,7 @@ existing code.
 | `INCOMPATIBLE_STATE` | Resume state is incompatible with the requested options or format and cannot be migrated. | 121 |
 | `IO_ERROR` | An I/O failure not covered by a more specific code. | 55 |
 | `LEASE_AGE_UNCERTAIN` | The wall clock moved backward, so lease staleness cannot be concluded. | 229.5 |
+| `METADATA_APPLY_FAILED` | Metadata could not be applied to a file: the file's action fails when that metadata was explicitly requested, and is a best-effort warning otherwise. | 44.1 |
 | `OPERATION_LOCKED` | Another process holds the operation lock. | 58 |
 | `PATH_COMPONENT_INVALID` | A path component contains `0x00`; no `FluxPathKey` is constructed. | 103 |
 | `PERMISSION_DENIED` | The operating system denied access. | 55 |
@@ -5390,7 +5411,7 @@ metadata failure
 
 must not be confused with content-copy failure.
 
-Strictness is controlled by the metadata policy.
+Strictness is controlled by the metadata policy (Section 44.1).
 
 ------------------------------------------------------------------------
 
@@ -11948,6 +11969,9 @@ A conforming implementation must test at least:
 59. --dry-run leaves the destination byte-for-byte and entry-for-entry unchanged,
     creates no lock or workspace, and keeps memory bounded on a tree large
     enough to spill planning state.
+60. a failure to apply explicitly requested metadata fails that file's action;
+    a failure to apply default metadata publishes the file, reports
+    METADATA_APPLY_FAILED, and exits 1.
 ```
 
 ## 259.15 V15 Implementation Baseline
