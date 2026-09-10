@@ -105,8 +105,10 @@ Revision history:
     28. `--resume` with no prior operation starts a new one (Section 21.1).
     29. Dependent links have persisted states and an idempotent link
         procedure that recovery re-runs (Sections 16.1, 147.3).
+    30. A single-file operation's target lock also serves as its operation
+        lock (Sections 89, 98, 239.1, 249.2).
 
-    V16 adds acceptance tests 31--72 to Section 259.14.
+    V16 adds acceptance tests 31--73 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -3617,7 +3619,8 @@ The following decisions are mandatory for the implementation:
 3.  Dependent hardlink actions are held outside the worker execution
     queue until their canonical object is materialized.
 4.  Single-file destination targets require destination-path locking in
-    addition to operation locking.
+    addition to operation locking; for a single-file operation one lock
+    serves as both (Section 98).
 5.  Path ordering uses a platform-independent, byte-preserving
     `FluxPathKey`.
 6.  Weak or unavailable filesystem object identity cannot establish
@@ -4171,6 +4174,11 @@ To prevent lock-order deadlocks, the implementation must use this order:
 
 A topology operation must never acquire an operation lock after entering
 a topology transaction.
+
+A single-file operation holds one lock, its target lock
+(`target.flux-lock`, Section 96.1), which also serves as its operation
+lock. Acquiring it satisfies steps 1 and 2, and revalidation (Section 99)
+checks it once for both roles.
 
 If platform constraints require another order internally, the
 implementation must establish an equivalent globally consistent ordering
@@ -9685,7 +9693,7 @@ directly or through a verifiable state record.
 ## 239.1 Normal Lifecycle
 
 ``` text
-acquire target lock
+acquire target lock (also the operation lock, Section 98)
        ↓
 create durable state
        ↓
@@ -10286,7 +10294,7 @@ Filename patterns alone are never sufficient to establish ownership.
 ## 249.2 Normal Lifecycle
 
 ``` text
-acquire target lock
+acquire target lock (also the operation lock, Section 98)
        ↓
 create durable state
        ↓
@@ -12189,6 +12197,9 @@ A conforming implementation must test at least:
 72. a crash after a dependent's link is created but before Linked is recorded
     recovers by re-running the link steps: the result is one correct link, no
     leftover temporary name, and no failure.
+73. a single-file operation holds exactly one lock file; a second process
+    resuming the same operation or targeting the same file gets
+    TARGET_LOCK_BUSY from it.
 ```
 
 ## 259.15 V15 Implementation Baseline
