@@ -13119,3 +13119,16 @@ atomic publication → never silently downgraded
 **V16 implementation baseline:** V15 as amended in place by V16 (see
 the Revision Notice at the top of this document).
 
+
+------------------------------------------------------------------------
+
+## Stand-downs
+
+Findings from the V16 adversarial review (AGY-AFTER) that were stood
+down rather than fixed, each with the guard that makes it unreachable:
+
+-   DISCARDED-BELOW-FLOOR: a scheduler that drains a very large batch of
+    held dependents in one go cannot cause a lock takeover, because
+    heartbeat age alone never proves an owner dead (Section 252: "Heartbeat
+    age alone cannot prove that a process is dead"); the cost is
+    throughput only.
