@@ -291,8 +291,14 @@ Revision history:
     86. Flux sets no deadline on filesystem calls; a blocking call blocks
         the work waiting on it, and a killed process recovers through
         `--resume` (Section 189).
+    87. `--atomic=always` replacing an existing directory publishes
+        exactly the selected source tree: entries present only at the
+        destination are removed with the old tree. For a folder source,
+        `--update` or `--skip-existing` together with `--atomic=always`
+        is a usage error (exit 2), whether or not the destination exists
+        (Sections 5.1, 259.9).
 
-    V16 adds acceptance tests 31--109 to Section 259.14.
+    V16 adds acceptance tests 31--110 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -649,7 +655,15 @@ hardlink group (Section 253.7).
 Existing directories are merged into, not replaced, except under
 `--atomic=always` (Sections 30.1, 259.9). Replacement follows the atomic
 policy (Sections 27, 116): with atomic replacement, the existing target
-stays untouched until publication.
+stays untouched until publication. Under `--atomic=always`, the
+published tree is exactly the selected source tree: entries present only
+at the destination are removed with the old tree (Section 259.9).
+
+For a directory operation (folder source), `--update` or
+`--skip-existing` together with `--atomic=always` is a usage error (exit
+code 2), whether or not the destination exists: a newly created
+directory has nothing to keep, so per-target update/skip has nothing to
+apply to. Single-file operations are unaffected.
 
 `--update` compares metadata only. A changed source whose mtime did not
 advance and whose size is unchanged is not replaced; use `--overwrite`
@@ -12597,6 +12611,8 @@ For a previously nonexistent destination directory, there is no existing tree to
 
 However, a successful `--atomic=always` operation must not expose an unintended partially constructed hierarchy as the final successful publication. The implementation must use its recoverable staging/publication model and must honor any stronger initial-publication visibility guarantee it explicitly declares.
 
+Replacing an existing directory publishes exactly the selected source tree: entries present only at the destination are removed along with the old tree, they are not merged forward. Because there is nothing at the destination to selectively keep, `--update` and `--skip-existing` are usage errors (exit code 2) together with `--atomic=always` for a directory operation, whether or not the destination exists (Section 5.1). `--dry-run` reports the destination-only entries that would be removed, without removing them (Section 5.2).
+
 ## 259.10 Atomic Directory Staging
 
 Whole-tree atomic staging control state required for recovery must live outside the root being published or replaced.
@@ -12924,6 +12940,12 @@ A conforming implementation must test at least:
      being entered raises DIRECTORY_CHANGED_DURING_SCAN, does not
      transfer that directory's subtree, reports the error, and the
      operation exits 1; there is no rescan alternative.
+110. --atomic=always replacing an existing directory publishes exactly
+     the selected source tree, removing destination-only entries with
+     the old tree; for a folder source, --update or --skip-existing
+     together with --atomic=always is a usage error (exit 2) whether or
+     not the destination exists; --dry-run reports the entries that
+     would be removed.
 ```
 
 ## 259.15 V15 Implementation Baseline
