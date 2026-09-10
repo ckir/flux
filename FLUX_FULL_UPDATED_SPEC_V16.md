@@ -193,7 +193,9 @@ Revision history:
         refuses with `TARGET_LOCK_BUSY` if a live root lock exists on an
         ancestor of its destination, and a writer refuses path-scoped
         writes under an existing directory whose own root lock a live
-        operation holds (Section 97.1).
+        operation holds; that is a `lock_conflict`, so a hardlink
+        candidate there moves on without spending attempt budget
+        (Sections 97.1, 253.2).
     67. Operator-directed recovery is defined as `--break-lock`: valid
         with `--restart` or `flux cleanup --target`, it overrides only
         uncertain ownership, never a live owner or missing or corrupt
@@ -4643,7 +4645,9 @@ proceed.
 directory `D`, it checks for `D`'s own root lock
 `<parent-of-D>/<D-name>.flux-lock`. If a live operation holds it, nothing
 under `D` is written; each affected action fails with `TARGET_LOCK_BUSY`
-(path-scoped) and the rest of the operation continues.
+(path-scoped, retry category `lock_conflict`, Section 207) and the rest of
+the operation continues. A hardlink candidate under `D` moves to the next
+candidate without spending attempt budget (Section 253.2).
 
 ------------------------------------------------------------------------
 
@@ -11376,7 +11380,8 @@ as the next materialization candidate, subject to all of:
    makes the group terminally Failed without fallback
 2. the shared per-group attempt budget is not exhausted (Section 206);
    a path_scoped failure that is not retryable moves straight to the
-   next candidate and spends one attempt
+   next candidate and spends one attempt, except a `lock_conflict`
+   (Section 97.1(b)), which moves on without spending any
 3. a next candidate exists
 ```
 
