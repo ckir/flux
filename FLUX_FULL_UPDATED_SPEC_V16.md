@@ -354,8 +354,9 @@ Revision history:
         240.5, 250.1, 251.1, 251.2).
     102. Section 99 defines "still owned" as the lock file holding the operation's own record, and a failed
         revalidation stops the operation, resumable (Section 99).
+    103. --restart keeps the target locked from step 1 to the start of the new operation (Section 21.1).
 
-    V16 adds acceptance tests 31--129 to Section 259.14.
+    V16 adds acceptance tests 31--130 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -1586,7 +1587,9 @@ does not match is still `INCOMPATIBLE_STATE`.
 3. revalidate ownership and locks
 4. delete the prior operation's derived artifacts (partials), then its
    primary state, in the order of Sections 222 and 223
-5. release the prior operation's lock and start the new operation
+5. start the new operation under
+   the lock already held: the lock record is rewritten for the new operation; the lock is never released between steps
+   1 and 5
 ```
 
 Deleting before copying frees the prior partial allocation before the
@@ -13211,6 +13214,8 @@ A conforming implementation must test at least:
      crash after the move leaves P/<name>.flux-lock.broken.<operation-id>, which cleanup finds.
 129. an operation whose lock file no longer holds its own record performs nothing further, stops with
      TARGET_LOCK_BUSY, and remains resumable.
+130. --restart never leaves the target unlocked between taking the prior operation's lock and starting the new
+     operation.
 ```
 
 ## 259.15 V15 Implementation Baseline
