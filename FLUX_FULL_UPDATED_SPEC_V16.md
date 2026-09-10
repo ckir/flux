@@ -143,6 +143,7 @@ Revision history:
         leftover temporary name (Section 16.1).
     47. Records use one name per field: `complete_lock_key` and
         `last_heartbeat_wall_time` (Sections 229.2, 250.1, 259.6).
+    48. `--links=follow` is marked as a future value in Section 5.
 
     V16 adds acceptance tests 31--82 to Section 259.14.
 
@@ -414,7 +415,7 @@ Planned interface:
 
 --durability=<normal|strict>         (Sections 141, 165)
 
---links=<copy|follow|skip>           (Sections 26, 124)
+--links=<copy|follow|skip>           (Sections 26, 124; follow is future)
 
 --special-files=<skip|strict>        (Section 233; default skip)
 
