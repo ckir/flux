@@ -247,8 +247,14 @@ Revision history:
         of actions waiting for capacity and the bytes short, and each
         action is logged at `warn` when it enters `CAPACITY_WAIT` or
         `CAPACITY_BLOCKED` (Sections 52, 254.1).
+    79. `files verified` counts only files whose destination bytes were
+        compared with the source digest (`destination` or `full`
+        verify level); `--json`'s complete field list adds
+        `files_verified`, `files_mismatched`, `files_failed`,
+        `files_overwritten`, `bytes_skipped`, `verify_level`, and
+        `hash_algorithm` (Sections 51, 53).
 
-    V16 adds acceptance tests 31--106 to Section 259.14.
+    V16 adds acceptance tests 31--107 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -2564,6 +2570,11 @@ average throughput
 peak throughput
 ```
 
+`files verified` counts files whose destination bytes were compared
+with the source digest (`--verify=destination` or `--verify=full`,
+Section 32). `--verify=source-stream` alone never counts a file as
+verified.
+
 For hardlinks distinguish:
 
 ``` text
@@ -2617,23 +2628,33 @@ Processed:   98,412
 --json
 ```
 
-Example:
+Complete field list (not only an example):
 
 ``` json
 {
   "files_total": 12842,
   "files_copied": 8321,
   "files_skipped": 312,
+  "files_overwritten": 0,
   "files_hardlinked": 1284,
   "files_reflinked": 0,
   "files_degraded": 0,
+  "files_verified": 8321,
+  "files_mismatched": 0,
+  "files_failed": 0,
   "bytes_total": 828124124124,
   "bytes_copied": 523124124124,
+  "bytes_skipped": 0,
   "errors": 0,
   "duration_ms": 183421,
-  "average_bytes_per_second": 2841241241
+  "average_bytes_per_second": 2841241241,
+  "verify_level": "destination",
+  "hash_algorithm": "blake3"
 }
 ```
+
+`verify_level` is the `--verify` level used; `hash_algorithm` is the
+`--hash` algorithm used.
 
 JSON goes to stdout.
 
@@ -12841,6 +12862,10 @@ A conforming implementation must test at least:
 106. an action entering CAPACITY_WAIT or CAPACITY_BLOCKED is logged at
      warn, and the progress display shows the count of actions waiting
      for capacity and the bytes short.
+107. files verified counts only files verified at the destination or full
+     level; a source-stream-only run reports files_verified as 0; --json
+     includes files_verified, files_mismatched, files_failed,
+     files_overwritten, bytes_skipped, verify_level, and hash_algorithm.
 ```
 
 ## 259.15 V15 Implementation Baseline
