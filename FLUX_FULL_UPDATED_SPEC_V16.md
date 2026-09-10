@@ -375,8 +375,12 @@ Revision history:
     112. Recovery and cleanup remove a dead owner's lock only by moving it
         aside and verifying it; an orphan root lock can be `LIVE`
         (Sections 240.3, 251.1).
+    113. A claim record's fields are defined; a hardlink dependent that the
+        destination folds onto its canonical member's name is a
+        `DESTINATION_NAMESPACE_COLLISION`; test 83 follows the
+        first-claimant rule (Sections 16.1, 241.5).
 
-    V16 adds acceptance tests 31--138 to Section 259.14.
+    V16 adds acceptance tests 31--139 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -1234,7 +1238,7 @@ one of these states:
 | `Linked` | the link is durably recorded as created |
 | `Skipped` | not linked because the existing-destination policy skips its target |
 | `Blocked` | not linked because the group terminally failed (`BLOCKED_BY_CANONICAL_FAILURE`) |
-| `Failed` | linking failed; reported with its error, `HARDLINK_UNAVAILABLE` when the link itself cannot be created |
+| `Failed` | linking failed; reported with its error: `DESTINATION_NAMESPACE_COLLISION` when the name is taken (Section 241.5), otherwise `HARDLINK_UNAVAILABLE` when the link itself cannot be created |
 
 A dependent is linked the same way every time, so re-running it is safe:
 
@@ -10687,9 +10691,13 @@ not take (Section 97). It happens at publication:
     claim is never released during the operation, even if its target
     later fails; a later target that resolves to the same entry stays a
     collision. Every claim is durable, survives resume, and records the target that made it; that same target
-    finding its own claim proceeds, so a resumed target never collides with itself. A dependent hardlink member
-    publishes a different directory entry from its canonical member, so linking never collides with the group's own
-    claims.
+    finding its own claim proceeds, so a resumed target never collides with itself. A claim record, kept in the
+    operation's `state.db`, holds its key (the parent directory's `FileIdentity`, Section 11, and the entry's name
+    bytes as the filesystem reports them), the claiming target's `FluxPathKey` (Section 103), and whether it claims an
+    existing entry or one this operation created. A dependent hardlink member whose name maps to a different directory
+    entry from its canonical member never collides with the group's claims; one that the destination folds onto the
+    same entry (the example below) is a collision like any other and is reported `DESTINATION_NAMESPACE_COLLISION`,
+    not `HARDLINK_UNAVAILABLE`.
 -   Targets that are locked themselves (single-file targets, directory
     roots, source-root prefixes; Sections 18.3, 96.1) are also detected
     through their lock.
@@ -13126,8 +13134,9 @@ A conforming implementation must test at least:
     copy attempt left <target>.flux-partial.<operation-id> behind.
 83. copying a folder holding File.txt and file.txt to a case-insensitive
     destination publishes one and reports DESTINATION_NAMESPACE_COLLISION for
-    the other; nothing is overwritten. Two targets resolving to the same
-    existing entry are refused before either is published.
+    the other; nothing is overwritten. Of two targets resolving to the same
+    existing entry, the first to claim it proceeds and the second is
+    reported DESTINATION_NAMESPACE_COLLISION (Section 241.5).
 84. a reflinked file under the default --verify reads no source bytes and is
     reported as "reflinked, not hashed"; under --verify=destination both sides
     are hashed and compared.
@@ -13311,6 +13320,9 @@ A conforming implementation must test at least:
      exit code 1; a foreign object found at the lock path in step 4 is reported CONTROL_PLANE_NAMESPACE_CONFLICT.
 138. recovery and cleanup remove a dead owner's lock only by moving it aside and verifying it first; a lock that
      another operation recovered in the meantime is never removed.
+139. a hardlink group whose members Data.bin and data.bin share one directory, copied to a case-insensitive
+     destination, publishes the canonical member and reports the dependent DESTINATION_NAMESPACE_COLLISION; a claim
+     record holds the parent FileIdentity, the reported name, the claiming target's FluxPathKey, and its kind.
 ```
 
 ## 259.15 V15 Implementation Baseline
