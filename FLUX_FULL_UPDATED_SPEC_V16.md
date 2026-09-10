@@ -4674,7 +4674,7 @@ other's tree while it runs.
 
 (a) After a directory operation creates its own destination-root lock, it
 checks each ancestor of DEST's physical path (every directory from the
-filesystem root down to DEST's parent) for a live Flux root lock
+filesystem root down to DEST's parent) for a Flux root lock
 `<parent-of-ancestor>/<ancestor-name>.flux-lock`, or
 `<parent-of-ancestor>/.flux-dir.lock` (the Section 96.1 long-name
 fallback, which covers every target in that directory), or, for the
@@ -11312,11 +11312,11 @@ may directly inspect:
 /dest/foo.iso.flux-partial.*
 ```
 
+even if the standalone catalog entry is missing.
+
 For a filesystem-root target `T`, the only adjacent artifact is its lock
 `T/.flux-root.lock` (Section 96.1); `flux cleanup --target T` inspects
 that instead of the parent-relative names above.
-
-even if the standalone catalog entry is missing.
 
 The artifacts must still pass ownership and target-identity validation
 before deletion.
