@@ -222,8 +222,13 @@ Revision history:
         annotates the default for `--hardlinks`, `--reflink`, `--sparse`,
         `--atomic`, `--resume-verify`, and `--durability` (Sections 5, 27,
         36, 42, 165).
+    73. `--sparse=always` and `--reflink=always` have failure codes:
+        `SPARSE_UNAVAILABLE` when the destination cannot hold holes,
+        `REFLINK_UNAVAILABLE` when no reflink can be created; the sparse
+        verification digest is over logical bytes for all three
+        `--sparse` modes (Sections 38, 39, 55).
 
-    V16 adds acceptance tests 31--101 to Section 259.14.
+    V16 adds acceptance tests 31--102 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -2143,7 +2148,18 @@ Default:
 auto
 ```
 
-Preserve logical holes where supported.
+`auto` keeps the source's holes; where the destination cannot hold
+holes, it writes zeros instead.
+
+`always` also turns runs of zero bytes into holes, even where the
+source has none; where the destination cannot hold holes
+(`FsCapabilities::sparse` is false), the file's action fails with
+`SPARSE_UNAVAILABLE`.
+
+`never` writes every byte allocated.
+
+The verification digest is over logical bytes and is the same for all
+three modes.
 
 Tests should compare:
 
@@ -2177,7 +2193,8 @@ auto
 
 `auto` attempts CoW and safely falls back.
 
-`always` fails when unavailable.
+`always` fails when unavailable: the file's action fails with
+`REFLINK_UNAVAILABLE`.
 
 `never` uses ordinary copying.
 
@@ -2673,11 +2690,13 @@ existing code.
 | `OPERATION_LOCKED` | Another process holds the operation lock. | 58, 96.2 |
 | `PATH_COMPONENT_INVALID` | A path component contains `0x00`; no `FluxPathKey` is constructed. | 103 |
 | `PERMISSION_DENIED` | The operating system denied access. | 55 |
+| `REFLINK_UNAVAILABLE` | `--reflink=always` was requested but a reflink cannot be created. | 39 |
 | `REMOTE_LOCK_UNSAFE` | No trustworthy exclusive lock contract can be established on a remote filesystem. | 235.4 |
 | `RESUMABLE_OPERATION_EXISTS` | A run without `--resume` or `--restart` found a resumable prior operation for its target or destination; nothing was changed. | 21.1 |
 | `RESUME_INVALID` | Resume validation failed: missing partial, state mismatch, or checkpoint mismatch. | 23, 35.3 |
 | `SAFETY_REJECTED` | The source/destination containment or self-copy check rejected the operation. | 129 |
 | `SOURCE_CHANGED` | Source identity or metadata changed during the copy; the result is not published. | 33 |
+| `SPARSE_UNAVAILABLE` | `--sparse=always` was requested but the destination cannot hold holes (`FsCapabilities::sparse` is false). | 38 |
 | `SPECIAL_FILE_UNSUPPORTED` | An unsupported special file: skipped with a durable warning, or a failure under strict policy. | 233 |
 | `STATE_CORRUPT` | The manifest, `state.db`, or `topology.db` is corrupt; the workspace is preserved. | 140 |
 | `STRICT_DURABILITY_UNAVAILABLE` | `--durability=strict` cannot be established for the filesystem. | 169 |
@@ -12755,6 +12774,11 @@ A conforming implementation must test at least:
 101. with no options given, --atomic behaves as auto, --durability as
      normal, --resume-verify as chunks, and filesystem boundaries are not
      crossed.
+102. --sparse=always on a destination that cannot hold holes fails that
+     file's action with SPARSE_UNAVAILABLE; --reflink=always where no
+     reflink can be created fails with REFLINK_UNAVAILABLE; the
+     verification digest for a sparse file is the same under auto,
+     always, and never.
 ```
 
 ## 259.15 V15 Implementation Baseline
