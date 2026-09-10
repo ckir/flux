@@ -318,8 +318,9 @@ Revision history:
         parent handle without following links; a link under `DEST` that
         this operation did not create rejects that path with
         `SAFETY_REJECTED` (Sections 55, 149.7).
+    92. Tests are added for items 82, 84, 85, and 86 (Section 259.14).
 
-    V16 adds acceptance tests 31--114 to Section 259.14.
+    V16 adds acceptance tests 31--118 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -13029,6 +13030,19 @@ A conforming implementation must test at least:
      location outside DEST, between its creation and the writing of its
      descendants, makes those actions fail with SAFETY_REJECTED; nothing is
      written outside DEST, and the rest of the operation continues.
+115. where the emergency reserve cannot be guaranteed (no preallocation
+     primitive, or copy-on-write allocation), Flux warns at start, and a
+     later WAL failure ends in CONTROL_STATE_DURABILITY_FAILURE with exit
+     code 1.
+116. with two source roots on different filesystems, reflink and hardlink
+     capability is evaluated per source/destination filesystem pair; a
+     value measured for one root is never applied to the other.
+117. a new attempt never resumes from a failed attempt's chunk
+     checkpoints; discarding them once the new attempt has started
+     changes no outcome.
+118. a filesystem call that blocks (for example on a stalled mount) is
+     never abandoned on a timer: no deadline-driven error is reported,
+     and cancellation takes effect when the call returns.
 ```
 
 ## 259.15 V15 Implementation Baseline
