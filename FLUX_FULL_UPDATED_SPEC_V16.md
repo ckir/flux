@@ -150,8 +150,10 @@ Revision history:
     50. Reflinked files are verified by construction under the default
         levels and by hashing both sides under destination and full
         (Sections 32, 39).
+    51. Hardlink groups cover regular files and symlink inodes; special
+        files are handled per entry (Sections 12.1, 72, 86, 259.11).
 
-    V16 adds acceptance tests 31--84 to Section 259.14.
+    V16 adds acceptance tests 31--85 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -765,6 +767,30 @@ LINK C/file → A/file
 ```
 
 Only one physical data transfer is required.
+
+## 12.1 Hardlinked Symlinks and Special Files
+
+Hardlink groups contain regular files and symlinks.
+
+A symlink inode with several selected entries forms its own hardlink
+group. Its identity is the symlink object's own `FileIdentity` (read
+without following it), never its target's (Section 25):
+
+-   The materializing attempt creates the symlink at the candidate's
+    path, with its payload copied verbatim (Section 125); the other
+    members are linked to it (Section 16.1).
+-   There is no content to copy: attempts have no chunks, checkpoints,
+    or content digest, and verification (Section 32) compares the
+    created payload with the source payload.
+-   `SYMLINK_CREATION_UNAVAILABLE` (Section 127) affects every member the
+    same way, so it is `object_scoped` (Section 207) and the group
+    terminally fails (Section 253.5).
+-   Under `--links=skip` every member is skipped (Section 124). Under
+    `--hardlinks=copy` each entry becomes an independent symlink.
+
+Special files (Section 233) never form hardlink groups. Each entry
+follows Section 233 on its own, and a lost link relationship among them
+is reported as degraded.
 
 ------------------------------------------------------------------------
 
@@ -3022,9 +3048,10 @@ Symlink action:
     link → real/file
 ```
 
-The symlink must not appear as a hardlink group member.
+The symlink must not appear as a member of `real/file`'s hardlink group.
 
-Repeat with multiple hardlinks and symlinks.
+Repeat with multiple hardlinks and symlinks, including a symlink inode
+with two entries, which forms its own group (Section 12.1).
 
 ------------------------------------------------------------------------
 
@@ -3632,8 +3659,9 @@ not:
 symlink = alias to the target object's topology
 ```
 
-Therefore a symlink never enters the hardlink topology graph unless
-explicit link-following semantics are enabled.
+Therefore a symlink never joins its target's hardlink group unless
+explicit link-following semantics are enabled. A symlink inode that
+itself has several entries forms its own group (Section 12.1).
 
 ------------------------------------------------------------------------
 
@@ -12200,7 +12228,7 @@ Flux must not silently substitute a junction, hardlink, or regular file for a re
 
 Independent ready actions may continue according to scheduler policy. The final operation status must report failure when a required symlink action failed.
 
-A symlink action does not create or alter hardlink topology, so symlink failure must not silently become a hardlink canonical failure.
+A symlink action does not create or alter the hardlink topology of the symlink's target, so symlink failure must not silently become a hardlink canonical failure for that target. A symlink inode with several entries forms its own group, whose failure follows Section 12.1.
 
 ## 259.12 Cleanup and Orphan Safety
 
@@ -12392,6 +12420,9 @@ A conforming implementation must test at least:
 84. a reflinked file under the default --verify reads no source bytes and is
     reported as "reflinked, not hashed"; under --verify=destination both sides
     are hashed and compared.
+85. two entries of one symlink inode are recreated as one symlink plus a
+    hardlink to it with the payload unchanged; special files with several
+    entries are handled per entry and reported as degraded.
 ```
 
 ## 259.15 V15 Implementation Baseline
