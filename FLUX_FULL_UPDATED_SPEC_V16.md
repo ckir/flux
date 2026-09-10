@@ -74,8 +74,11 @@ Revision history:
     15. The metadata policy is defined: explicitly requested metadata is
         strict, default metadata is best-effort, and both report
         `METADATA_APPLY_FAILED` (Sections 44.1, 55, 133).
+    16. Every operation state is described and marked resumable or
+        terminal; only `COMPLETED` and `ABANDONED` are terminal, and
+        pausing is never persisted (Sections 20, 21, 132, 222).
 
-    V16 adds acceptance tests 31--60 to Section 259.14.
+    V16 adds acceptance tests 31--61 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -990,6 +993,27 @@ COMPLETED
 ABANDONED
 ```
 
+Meaning, and whether `--resume` may continue the operation (Section 21):
+
+| State | Meaning | Resumable |
+|---|---|---|
+| `CREATED` | workspace and manifest exist; scanning has not started | yes |
+| `SCANNING` | discovery and planning in progress, before any transfer | yes |
+| `TRANSFERRING` | copying, linking, and checkpointing | yes |
+| `PAUSED` | durably paused after cancellation (Section 132) | yes |
+| `FAILED` | stopped by an error; its durable progress is kept | yes |
+| `COMMITTING` | publishing results (Sections 182, 183) | yes, after commit recovery |
+| `COMPLETED` | finished; only cleanup may remain (Section 218) | no (terminal) |
+| `ABANDONED` | superseded or given up (Section 21.1) | no (terminal) |
+
+A `FAILED` operation can be continued with `--resume` once its cause is
+fixed, or discarded with `--restart` (Section 21.1). Only `COMPLETED` and
+`ABANDONED` are terminal.
+
+Transient in-process states, such as pausing, are never persisted: a
+crash while pausing leaves the last persisted state, normally
+`TRANSFERRING`.
+
 Normal completion:
 
 ``` text
@@ -1043,7 +1067,7 @@ Resume is allowed only when:
 ``` text
 source mapping matches
 destination mapping matches
-operation state is resumable
+operation state is resumable (Section 20)
 format is supported
 configuration is compatible
 ```
@@ -5360,9 +5384,9 @@ active-operation ownership.
 On normal cancellation:
 
 ``` text
-RUNNING
+TRANSFERRING
    ↓
-PAUSING
+pausing          (in-process only; never persisted, Section 20)
    ↓
 PAUSED
 ```
@@ -8486,8 +8510,8 @@ Orphaned operation workspaces are collectible **only when all applicable
 conditions below are satisfied**:
 
 ``` text
-1. the operation is durably marked COMPLETED, ABANDONED, or another
-   terminal state that proves no further recovery is required;
+1. the operation is durably marked COMPLETED or ABANDONED, the only
+   terminal states (Section 20);
 
 2. no live operation lock exists;
 
@@ -11972,6 +11996,9 @@ A conforming implementation must test at least:
 60. a failure to apply explicitly requested metadata fails that file's action;
     a failure to apply default metadata publishes the file, reports
     METADATA_APPLY_FAILED, and exits 1.
+61. --resume continues an operation in every resumable state of Section 20,
+    including FAILED and COMMITTING (after commit recovery), and refuses
+    COMPLETED and ABANDONED; a crash while pausing leaves TRANSFERRING.
 ```
 
 ## 259.15 V15 Implementation Baseline
