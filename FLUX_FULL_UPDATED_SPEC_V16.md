@@ -77,8 +77,10 @@ Revision history:
     16. Every operation state is described and marked resumable or
         terminal; only `COMPLETED` and `ABANDONED` are terminal, and
         pausing is never persisted (Sections 20, 21, 132, 222).
+    17. `flux cleanup` uses one set of status names, each defined, plus a
+        separate eligibility marker (Sections 60, 131, 251.1).
 
-    V16 adds acceptance tests 31--61 to Section 259.14.
+    V16 adds acceptance tests 31--62 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -2432,7 +2434,7 @@ Behavior:
 1.  enumerate operation manifests
 2.  inspect locks
 3.  inspect heartbeat/lease
-4.  classify active, resumable, stale
+4.  classify each operation (Section 251.1)
 5.  display candidates
 6.  remove only explicitly eligible operations
 
@@ -5361,16 +5363,19 @@ final lock/check succeeds
 
 # 131. Cleanup Safety
 
-`flux cleanup` must display classification:
+`flux cleanup` must display each operation's status and whether it is
+eligible for deletion, using the names of Section 251.1:
 
 ``` text
-ACTIVE
+LIVE
 RESUMABLE
 STALE
-DELETE-CANDIDATE
+COMPLETED_BUT_UNCLEAN
+UNCERTAIN
+CORRUPT
 ```
 
-No active operation may be deleted.
+No `LIVE` operation may be deleted.
 
 Manual force mode must still respect the active OS lock.
 
@@ -10380,16 +10385,24 @@ validate lock/lease ownership
 classify
 ```
 
-Classification:
+Classification (the only cleanup status names; Section 131 uses them
+too):
 
-``` text
-LIVE
-RESUMABLE
-STALE
-COMPLETED_BUT_UNCLEAN
-UNCERTAIN
-CORRUPT
-```
+| Status | Meaning |
+|---|---|
+| `LIVE` | a live owner holds the operation or target lock |
+| `RESUMABLE` | no live owner; resumable state (Section 20); within retention |
+| `STALE` | no live owner; retention exceeded, or the operation is `ABANDONED` |
+| `COMPLETED_BUT_UNCLEAN` | `COMPLETED`, with leftover artifacts (`cleanup_pending`, Section 218) |
+| `UNCERTAIN` | ownership or lease age cannot be established (Sections 229.5, 239.3, 240.4, 252.4) |
+| `CORRUPT` | state exists but is unreadable or invalid (Section 140) |
+
+Eligibility for deletion is a separate marker, not a status. A `STALE` or
+`COMPLETED_BUT_UNCLEAN` row is marked eligible when it passes every
+deletion precondition now (Sections 130, 216, 217, 222). `--force` may
+also mark `RESUMABLE` rows eligible, bypassing retention only. `LIVE`,
+`UNCERTAIN`, and `CORRUPT` rows are never eligible; `CORRUPT` workspaces
+are kept for diagnosis.
 
 ## 251.2 Explicit Target Cleanup
 
@@ -11999,6 +12012,9 @@ A conforming implementation must test at least:
 61. --resume continues an operation in every resumable state of Section 20,
     including FAILED and COMMITTING (after commit recovery), and refuses
     COMPLETED and ABANDONED; a crash while pausing leaves TRANSFERRING.
+62. flux cleanup shows exactly the Section 251.1 statuses and an eligibility
+    marker; LIVE, UNCERTAIN, and CORRUPT rows are never eligible, and --force
+    makes RESUMABLE rows eligible only by bypassing retention.
 ```
 
 ## 259.15 V15 Implementation Baseline
