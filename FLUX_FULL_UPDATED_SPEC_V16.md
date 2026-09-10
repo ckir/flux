@@ -328,7 +328,8 @@ Revision history:
         classify ancestor locks by Section 240, cover a directory about
         to be created, and handle a failed release of the operation's
         own lock (Section 97.1).
-    95. `--break-lock` takes over the lock record by atomic rename and
+    95. (Takeover mechanism superseded by items 101 and 111.)
+        `--break-lock` takes over the lock record by atomic rename and
         satisfies `--restart`'s lock steps; it cannot stop a call the
         prior owner already started; uncertain artifacts are deleted
         only through `cleanup --target --break-lock` (Sections 21.1,
@@ -337,7 +338,8 @@ Revision history:
         `P/.flux/atomic/<target-key>/`, find `.flux-dir.lock` per entry,
         and handle a filesystem-root DEST or target (Sections 120,
         234.1, 251.1, 251.2).
-    97. The no-replace probe writes only Flux control state, its
+    97. (Narrowed by item 104: the probe writes only in the operation's
+        workspace.) The no-replace probe writes only Flux control state, its
         dry-run preview is defined, and it applies to atomic staging
         (Section 241.5).
     98. Every publication claims the entry it creates, and claims are
@@ -379,8 +381,14 @@ Revision history:
         destination folds onto its canonical member's name is a
         `DESTINATION_NAMESPACE_COLLISION`; test 83 follows the
         first-claimant rule (Sections 16.1, 241.5).
+    114. Section 99 checks every lock the operation holds, and a cancelled
+        operation pauses; "nothing was changed" also exempts a workspace
+        created and removed while refusing; `flux verify` exits 2 on a
+        usage error; the probe file is named `noreplace-probe`; items 95
+        and 97 point to what superseded them (Sections 4.2, 21.1, 55, 99,
+        241.5).
 
-    V16 adds acceptance tests 31--139 to Section 259.14.
+    V16 adds acceptance tests 31--140 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -640,8 +648,8 @@ unreadable   either side could not be read or hashed (the error is
              reported)
 ```
 
-Exit status is 0 when nothing is missing, mismatched, or unreadable, and
-1 otherwise; extra paths are reported but do not change the exit
+Exit status is 0 when nothing is missing, mismatched, or unreadable, 1
+when something is, and 2 for a usage error (Section 55); extra paths are reported but do not change the exit
 status, because copying into an existing folder can leave them
 legitimately. `--json` reports the same records.
 
@@ -1613,7 +1621,7 @@ does not match is still `INCOMPATIBLE_STATE`.
    revalidates the lock it now holds
 2. durably mark the prior operation ABANDONED, recording
    superseded_by = the new operation_id
-3. revalidate ownership and locks
+3. revalidate ownership and locks (Section 99)
 4. delete the prior operation's derived artifacts (partials), then its
    primary state, in the order of Sections 222 and 223
 5. start the new operation under
@@ -2856,16 +2864,17 @@ Exit codes (normative):
 ```
 
 "Nothing was changed" means the destination's content and any prior
-operation's state are as they were; a lock or probe file that Flux
-created and removed again while refusing does not count (Sections
-97.1, 241.5). If Flux cannot remove a lock or probe file it
-created while refusing, it reports the file's path and exits 1 instead of 3.
+operation's state are as they were; a lock, probe file, or workspace that
+Flux created and removed again while refusing does not count (Sections
+97.1, 241.5). If Flux cannot remove a lock, probe file, or workspace it
+created while refusing, it reports the path and exits 1 instead of 3.
 
 Where a partial run hit a refusal on some paths only (for example
 Section 97.1(b), or a path rejected under Section 149.7), the result is
 exit code 1.
 
-flux verify and flux cleanup use the same codes (Sections 4.2, 251).
+flux verify and flux cleanup use these codes where they apply (Sections
+4.2, 251).
 
 Error code registry (normative). Every failure or result code used in
 this specification appears here. A change that introduces a new code
@@ -4804,9 +4813,14 @@ destination target lock still owned
 operation not cancelled
 ```
 
-"Still owned" means the lock file at the lock path holds
-this operation's own record (its operation_id and owner_instance_id). When revalidation fails, the worker performs
-nothing further; the operation stops, reports `TARGET_LOCK_BUSY`, and stays resumable.
+"Still owned" means that every lock the operation holds (its operation
+lock and its target lock; one file for a single-file operation, Section
+98) is a lock file at its lock path holding this operation's own record
+(its `operation_id` and `owner_instance_id`). When an ownership check
+fails, the worker performs nothing further; the operation stops, reports
+`TARGET_LOCK_BUSY`, and stays resumable. When the operation is no longer
+active or has been cancelled, the worker performs nothing further and the
+operation pauses (`PAUSED`, Sections 20, 147.2).
 
 For atomic publication:
 
@@ -10714,8 +10728,8 @@ the destination. Before a directory operation changes anything, Flux
 probes the destination for one of these primitives. If none is
 available, the operation is refused with `NOREPLACE_PUBLISH_UNAVAILABLE`
 (exit code 3); check-then-rename is never used as a substitute. The
-probe writes only inside the operation's workspace and
-removes what it wrote. A file it cannot remove is reported as a warning and goes with the workspace when cleanup
+probe writes only inside the operation's workspace, under the fixed name
+`noreplace-probe`, and removes what it wrote. A file it cannot remove is reported as a warning and goes with the workspace when cleanup
 removes it; if the operation is being refused, it exits 1 instead of 3 (Section 55). Under
 `--dry-run` it writes nothing at all; a primitive it cannot establish
 without writing is reported as unprobed, and the preview says that a
@@ -13323,6 +13337,9 @@ A conforming implementation must test at least:
 139. a hardlink group whose members Data.bin and data.bin share one directory, copied to a case-insensitive
      destination, publishes the canonical member and reports the dependent DESTINATION_NAMESPACE_COLLISION; a claim
      record holds the parent FileIdentity, the reported name, the claiming target's FluxPathKey, and its kind.
+140. a directory operation revalidates both its operation lock and its target lock; a cancelled operation pauses
+     instead of reporting TARGET_LOCK_BUSY; a refusal that created and removed its workspace exits 3, and one that
+     could not remove it exits 1; flux verify exits 2 on a usage error.
 ```
 
 ## 259.15 V15 Implementation Baseline
