@@ -176,8 +176,11 @@ Revision history:
     61. The standalone catalog record's `artifact_names` field is
         informational; cleanup and GC derive each artifact name from the
         record's target and operation_id instead (Section 250.1).
+    62. Default `flux cleanup DEST` also inspects, non-recursively,
+        `P/.flux/atomic/<target-key>/` for whole-tree atomic staging
+        workspaces (Sections 24.4, 60, 251.1, 259.10).
 
-    V16 adds acceptance tests 31--90 to Section 259.14.
+    V16 adds acceptance tests 31--91 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -2723,7 +2726,8 @@ flux cleanup DEST
 
 Behavior:
 
-1.  enumerate operation manifests
+1.  enumerate operation manifests, including whole-tree atomic staging
+    workspaces (Section 259.10)
 2.  inspect locks
 3.  inspect heartbeat/lease
 4.  classify each operation (Section 251.1)
@@ -10765,10 +10769,17 @@ flux cleanup DEST
 performs, without recursing into subdirectories of `DEST`:
 
 ``` text
-DEST/.flux/operations/   directory operations whose destination root is DEST
+DEST/.flux/operations/       directory operations whose destination root is DEST
         +
-DEST/.flux/standalone/   single-file operations whose target's parent is DEST
+DEST/.flux/standalone/       single-file operations whose target's parent is DEST
+        +
+P/.flux/atomic/<target-key>/ whole-tree atomic staging for DEST (Section 259.10),
+                              where <target-key> is sha256(K) for DEST's own
+                              root lock key K
 ```
+
+Each workspace found under `P/.flux/atomic/<target-key>/` is classified
+like any other.
 
 The `DEST` argument is required unless `--target PATH` is given
 (Section 251.2). A bare `flux cleanup` with neither is a usage error,
@@ -12303,6 +12314,8 @@ Publishing the staged root must not destroy the control state needed to recover 
 
 `DIRECTORY_STAGING` means recoverable staged state exists; it is not an instruction for immediate deletion.
 
+Default `flux cleanup DEST` inspects `P/.flux/atomic/<target-key>/` too, non-recursively (Section 251.1).
+
 Cleanup follows:
 
 ```text
@@ -12537,6 +12550,9 @@ A conforming implementation must test at least:
 90. a catalog record's artifact_names is never used to open or delete an
     artifact; cleanup and GC derive each artifact name from the record's
     target and operation_id instead.
+91. default flux cleanup DEST classifies a whole-tree atomic staging
+    workspace found under P/.flux/atomic/<target-key>/ the same way it
+    classifies an entry under DEST/.flux/operations/.
 ```
 
 ## 259.15 V15 Implementation Baseline
