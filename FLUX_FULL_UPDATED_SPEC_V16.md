@@ -65,8 +65,10 @@ Revision history:
     11. Verification level and digest algorithm are separate options,
         `--verify=<none|source-stream|destination|full>` and `--hash`, and
         every level is defined (Sections 5, 32, 82).
+    12. `--links=skip` is defined: symlinks are not created and each is
+        reported as skipped (Sections 5, 124).
 
-    V16 adds acceptance tests 31--56 to Section 259.14.
+    V16 adds acceptance tests 31--57 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -317,7 +319,7 @@ Planned interface:
 
 --durability=<normal|strict>         (Sections 141, 165)
 
---links=<copy|follow|skip>
+--links=<copy|follow|skip>           (Sections 26, 124)
 
 --special-files=<skip|strict>        (Section 233; default skip)
 
@@ -5022,6 +5024,18 @@ SYMLINK alias -> real/file
 ```
 
 Topology state tracks only the identity of `real/file`.
+
+Under:
+
+``` text
+--links=skip
+```
+
+symlinks are not created at the destination. Each skipped symlink is
+recorded in the operation report as skipped, with `relative_path`,
+`object_type=symlink`, and `action=skipped`, as for unsupported special
+files (Section 233.1). It is never silently dropped. A skipped symlink
+adds no topology and blocks no other action.
 
 ------------------------------------------------------------------------
 
@@ -11881,6 +11895,7 @@ A conforming implementation must test at least:
     case-insensitive destination finds the prior operation through its lock.
 56. each --verify level performs exactly the checks of Section 32; bare --verify
     means destination; --hash selects the algorithm independently.
+57. --links=skip creates no destination symlinks and reports every skipped one.
 ```
 
 ## 259.15 V15 Implementation Baseline
