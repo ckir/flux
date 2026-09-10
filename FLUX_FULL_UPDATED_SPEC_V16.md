@@ -165,6 +165,10 @@ Revision history:
     57. `--dry-run --restart` previews the refusal a real `--restart`
         would get (Section 5.2).
     58. `TransferAction` has a `CreateSymlink` variant (Section 45).
+    59. Wording: catalog field names are snake_case (Section 250.1);
+        Stage A never delays the first transfer (Section 113); the lock
+        key `K` uses `T`'s final name, not the destination-relative key
+        (Sections 250, 259.6).
 
     V16 adds acceptance tests 31--88 to Section 259.14.
 
@@ -4971,8 +4975,9 @@ guarantee level rather than implying stronger semantics.
 
 # 113. Stage A Capacity Forecast
 
-Stage A performs an early, conservative capacity forecast before
-execution.
+Stage A performs an early, conservative capacity forecast. It runs
+alongside scanning and copying and never delays the first transfer
+(Section 146.1).
 
 The forecast considers, where applicable:
 
@@ -10623,9 +10628,9 @@ Flux therefore maintains a persistent **standalone operation catalog**
 inside the destination control plane.
 
 For a single-file target `T`, let `P` be its parent directory and `K` the
-stable target key of Section 259.6 (physical identity of `P` where
-reliably available, plus the canonical `FluxPathKey` of `T` relative to
-`P`). The catalog record for `T` is:
+complete lock key recorded in `T`'s lock (Sections 96.1, 259.6: physical
+identity of `P` where reliably available, plus `T`'s final name in
+`FluxPathKey` encoding). The catalog record for `T` is:
 
 ``` text
 P/.flux/
@@ -10666,10 +10671,10 @@ target_path_key
 target_parent_identity
 operation_id
 attempt_id
-artifact names
-artifact generation
-last known lease
-catalog record generation
+artifact_names
+artifact_generation
+last_known_lease
+catalog_record_generation
 ```
 
 The record must be crash-safe.
@@ -12170,7 +12175,7 @@ For directory target `T`, let `P` be its parent. The lock is named after the tar
 P/<T-name>.flux-lock
 ```
 
-Its complete key `K`, recorded in the lock, consists of the physical identity of `P` where reliably available plus the canonical `FluxPathKey` of `T` relative to `P`. `K` records the spelling that created the lock; it is not used to name the lock file, so the filesystem's own name equivalence decides which spellings contend.
+Its complete key `K`, recorded in the lock, consists of the physical identity of `P` where reliably available plus `T`'s final name in `FluxPathKey` encoding (a one-component key relative to `P`, not the operation's destination-relative key of Section 103). `K` records the spelling that created the lock; it is not used to name the lock file, so the filesystem's own name equivalence decides which spellings contend.
 
 The lock record must include:
 
