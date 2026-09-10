@@ -633,7 +633,7 @@ Planned interface:
 
 --special-files=<skip|strict>        (Section 233; default skip)
 
---cross-filesystems
+--cross-filesystems                  (Section 42; future)
 
 --heartbeat-interval <duration>      (Section 101; future)
 --lease-timeout <duration>           (Section 101; future)
@@ -2385,7 +2385,8 @@ Default:
 do not cross filesystem boundaries
 ```
 
-Crossing is off unless `--cross-filesystems` is given (Section 5).
+Crossing is off unless `--cross-filesystems` is given; the flag is not
+yet implemented (Section 5, future).
 
 Filesystem identity must be used to evaluate boundaries.
 
