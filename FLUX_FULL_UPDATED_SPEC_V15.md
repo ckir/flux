@@ -736,7 +736,9 @@ Flux may use adjacent temporary/state files:
 └── source.iso.flux-state.<operation-id>
 ```
 
-The exact filename suffix is implementation-defined but must be
+The name structure `<target>.flux-partial.<operation-id>` and
+`<target>.flux-state.<operation-id>` is normative (Section 218). The
+textual form of `<operation-id>` is implementation-defined but must be
 collision-resistant and deterministic enough for discovery.
 
 ## 18.2 Directory transfer
@@ -7638,8 +7640,8 @@ Single-file transfers may use:
 
 ``` text
 target.flux-lock
-target.flux-partial.<op-id>
-target.flux-state
+target.flux-partial.<operation-id>
+target.flux-state.<operation-id>
 ```
 
 These files are intentionally outside the centralized control-plane
@@ -7657,7 +7659,7 @@ trees for names matching:
 ``` text
 *.flux-lock
 *.flux-partial.*
-*.flux-state
+*.flux-state.*
 ```
 
 Filename pattern matching alone is insufficient evidence of Flux
@@ -7805,9 +7807,9 @@ for post-commit cleanup status is the adjacent target state record:
 target.flux-state.<operation-id>
 ```
 
-or the implementation's equivalent exact operation-qualified
-`target.flux-state` representation defined by the single-file state
-format.
+This is the only on-disk name for the single-file state record. An
+unsuffixed `target.flux-state` is not a conforming representation, even
+if it stores the operation identity internally.
 
 The centralized managed `.flux` control plane MUST NOT be required
 merely to remember post-commit cleanup status for an isolated
@@ -7902,15 +7904,15 @@ The default policy must favor recoverability over aggressive cleanup.
 
 # 220. Cleanup Safety Matrix
 
-  Artifact                         Normal GC Scope         Ownership Required   Live Lock Check
-  -------------------------------- ----------------------- -------------------- -----------------
-  `.flux/operations/*`             Managed control plane   Yes                  Yes
-  `.flux/WAL/*`                    Managed control plane   Yes                  Yes
-  `.flux/topology/*`               Managed control plane   Yes                  Yes
-  `target.flux-lock`               Adjacent target scope   Yes                  Yes
-  `target.flux-partial.<op-id>`    Adjacent target scope   Yes                  Yes
-  `target.flux-state`              Adjacent target scope   Yes                  Yes
-  Arbitrary `*.flux-*` elsewhere   Never by default        N/A                  N/A
+  Artifact                               Normal GC Scope         Ownership Required   Live Lock Check
+  -------------------------------------- ----------------------- -------------------- -----------------
+  `.flux/operations/*`                   Managed control plane   Yes                  Yes
+  `.flux/WAL/*`                          Managed control plane   Yes                  Yes
+  `.flux/topology/*`                     Managed control plane   Yes                  Yes
+  `target.flux-lock`                     Adjacent target scope   Yes                  Yes
+  `target.flux-partial.<operation-id>`   Adjacent target scope   Yes                  Yes
+  `target.flux-state.<operation-id>`     Adjacent target scope   Yes                  Yes
+  Arbitrary `*.flux-*` elsewhere         Never by default        N/A                  N/A
 
 ------------------------------------------------------------------------
 
@@ -8643,8 +8645,8 @@ Single-file artifacts intentionally reside beside the target:
 ``` text
 target
 target.flux-lock
-target.flux-partial.<op-id>
-target.flux-state
+target.flux-partial.<operation-id>
+target.flux-state.<operation-id>
 ```
 
 They are not part of the centralized `.flux/operations/` tree.
@@ -8676,7 +8678,7 @@ filesystem for:
 ``` text
 *.flux-lock
 *.flux-partial.*
-*.flux-state
+*.flux-state.*
 ```
 
 Filename matching alone is never sufficient for deletion.
@@ -8958,7 +8960,7 @@ Flux may create:
 ``` text
 /dest/foo.iso.flux-lock
 /dest/foo.iso.flux-partial.<operation-id>
-/dest/foo.iso.flux-state
+/dest/foo.iso.flux-state.<operation-id>
 ```
 
 The `.flux-state` record is the authoritative association between the
