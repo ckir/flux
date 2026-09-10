@@ -112,6 +112,8 @@ Revision history:
         (Sections 215, 239, 249.1, 259.6).
     32. `FileIdentity` has one definition, including `generation`
         (Sections 11, 242).
+    33. Section 17 no longer defines the racy lookup-then-insert
+        `TopologyStore`; it points to Section 91.
 
     V16 adds acceptance tests 31--74 to Section 259.14.
 
@@ -900,14 +902,9 @@ and `Failed` are final.
 
 A pure in-memory map is not sufficient for arbitrarily large operations.
 
-Define:
-
-``` rust
-trait TopologyStore {
-    fn lookup(identity: FileIdentity) -> Result<Option<TopologyRecord>>;
-    fn insert(identity: FileIdentity, record: TopologyRecord) -> Result<()>;
-}
-```
+The `TopologyStore` interface is defined in Section 91: a lookup plus
+atomic, attempt-fenced transitions. A separate lookup-then-insert is
+forbidden, because that sequence races (Section 91).
 
 The production implementation should provide:
 
