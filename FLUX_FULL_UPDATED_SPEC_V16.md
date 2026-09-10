@@ -283,6 +283,11 @@ Revision history:
         measured for one root is never applied to a root on another
         filesystem, as Section 196 already required for durability
         capabilities (Section 62).
+    85. Attempt retention is defined: attempt records are kept for the
+        life of the operation workspace; once a newer attempt starts, the
+        superseded attempt's chunk checkpoints may be discarded, since a
+        new attempt never resumes from a failed attempt's chunks (Section
+        226).
 
     V16 adds acceptance tests 31--109 to Section 259.14.
 
@@ -9347,7 +9352,10 @@ The following are normative:
 3. Every retry creates a new execution attempt.
 4. Retry never promotes another hardlink member to canonical status.
 5. Dependents remain blocked until a canonical attempt materializes.
-6. Canonical attempt history survives restart according to retention policy.
+6. Canonical attempt history survives restart. Attempt records are kept
+   for the life of the operation workspace; once a newer attempt starts,
+   the superseded attempt's chunk checkpoints may be discarded, because a
+   new attempt never resumes from a failed attempt's chunks.
 7. Coalescing never destroys information required by the active resume policy.
 8. Strict chunk verification retains every constituent chunk digest.
 9. Adjacent artifact GC is target-scoped, not filesystem-wide.
