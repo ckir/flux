@@ -367,8 +367,16 @@ Revision history:
         predict namespace collisions (Section 5.2).
     110. Wording: TARGET_LOCK_UNCERTAIN cites Section 97.1; Section 207's object_scoped default excludes
         operator_action_required (Sections 55, 207).
+    111. `--break-lock`'s takeover is one numbered procedure with a defined
+        outcome for every step, an unreadable-record variant, a takeover
+        record, and a cleanup variant; moved locks are found as
+        `<lock-name>.broken.*` beside any lock form (Sections 240.5, 250.1,
+        251.1, 251.2).
+    112. Recovery and cleanup remove a dead owner's lock only by moving it
+        aside and verifying it; an orphan root lock can be `LIVE`
+        (Sections 240.3, 251.1).
 
-    V16 adds acceptance tests 31--136 to Section 259.14.
+    V16 adds acceptance tests 31--138 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -10476,6 +10484,10 @@ If the platform can establish that the lock owner no longer exists and
 the lock has been released/invalidated according to the platform's
 semantics, recovery may proceed.
 
+Recovery, and cleanup, remove a dead owner's lock only through steps 1--3
+of Section 240.5 (re-read, move aside, verify) before creating their own,
+so a lock that another operation has just recovered is never removed.
+
 ## 240.4 Uncertain Ownership
 
 If Flux cannot distinguish:
@@ -10512,21 +10524,50 @@ proven live owner (`TARGET_LOCK_BUSY` stays), and never missing or
 corrupt state.
 
 Before acting, Flux reports the recorded holder's `owner_instance_id`,
-`boot_session_id`, `last_heartbeat_wall_time`, and `workspace_path`, and
-then takes the lock over exclusively. It re-reads the lock record and proceeds only if it still names the recorded
-holder. It renames the lock file to `<lock-name>.broken.<new-operation-id>` in the same directory; only one of several
-concurrent takeovers can move it, and the others find the lock gone and start again from Section 240.1. It checks that
-the moved record is the recorded holder's; if not (another operation acquired the lock after the re-read), it renames
-the file back without replacing (Section 241.5) and refuses with `TARGET_LOCK_BUSY`. It then creates its own lock
-exclusively (Section 96.1); if that fails, another operation acquired the lock in between, and Flux refuses with
-`TARGET_LOCK_BUSY`, reporting the moved file. Finally it durably records the takeover in its own state, naming the
-moved file, deletes the moved file, and proceeds as if the prior owner were
-dead. A prior owner that was only stalled starts nothing more: its next
-lock revalidation (Section 99) fails. A filesystem call it had already
-started can still complete, because Flux sets no deadline on filesystem
-calls (Section 189); that is why a takeover is left to the operator and
-its report names the holder. A crash after the takeover leaves a lock
-owned by the new operation, recovered like any dead owner's lock.
+`boot_session_id`, `last_heartbeat_wall_time`, and `workspace_path`. If
+the record cannot be read (an I/O or permission error), it reports the
+lock as unreadable instead. It then takes the lock over exclusively:
+
+1. Re-read the lock. Proceed only if it is unchanged: the same record,
+   or, for an unreadable record, the same file by file identity.
+   Otherwise start the acquisition again (Section 21.1 step 1, Section
+   240.1) and classify what is there now.
+2. Rename the lock file to `<lock-name>.broken.<new-operation-id>` beside
+   it. Only one of several concurrent takeovers can move it; the others
+   find the lock gone and start the acquisition again, as in step 1.
+3. Check that the moved file is the one step 1 re-read. If it is not,
+   rename it back without replacing (Section 241.5) and refuse with
+   `TARGET_LOCK_BUSY`.
+4. Create its own lock exclusively (Section 96.1). While the lock was
+   moved aside, another operation may have created one by ordinary
+   exclusive creation; that operation then owns the target. If the create
+   fails, Flux classifies what is at the lock path as Section 96.1 does
+   (`TARGET_LOCK_BUSY` for another operation's lock,
+   `CONTROL_PLANE_NAMESPACE_CONFLICT` for a foreign object) and refuses.
+5. Durably record the takeover, delete the moved file, and proceed as if
+   the prior owner were dead.
+
+A refusal after step 2, or a put-back in step 3 that fails, leaves the
+moved file: Flux reports its path and exits 1 (Section 55). If the delete
+in step 5 fails, Flux warns and continues. Cleanup finds a moved file as
+`<lock-name>.broken.*` beside the lock and classifies it by the owner its
+record names (Sections 250.1, 251.1). A crash at any step leaves the lock,
+the moved file, or a lock owned by the new operation, each recovered as
+this section describes.
+
+The takeover record, kept in the new operation's state, holds the prior
+holder's `operation_id`, `owner_instance_id`, `boot_session_id`, and
+`last_heartbeat_wall_time` (or "unreadable"), the moved file's name, and
+the takeover's `creation_wall_time`. `flux cleanup --target PATH
+--break-lock` starts no operation: it performs steps 1--4 with a lock of
+its own, deletes the artifacts, then deletes its lock and the moved file;
+its report carries the takeover record.
+
+A prior owner that was only stalled starts nothing more: its next lock
+revalidation (Section 99) fails. A filesystem call it had already started
+can still complete, because Flux sets no deadline on filesystem calls
+(Section 189); that is why a takeover is left to the operator and its
+report names the holder.
 
 `--break-lock` is not a resume-compatibility option (Section 121).
 
@@ -11198,7 +11239,8 @@ The record must be crash-safe.
 name from the record's `target_path_key` and `operation_id` using the
 fixed patterns (`P/<name>.flux-lock`, `P/.flux-dir.lock`,
 `P/<name>.flux-state.<operation-id>`, `P/<name>.flux-partial.<operation-id>`,
-and `<lock-name>.broken.<operation-id>` beside any of those locks (a takeover's moved lock, Section 240.5))
+and any `<lock-name>.broken.*` beside one of those locks (a takeover's moved lock, Section 240.5; found by listing
+that one directory, Section 234.1))
 and never open or delete a name taken only from `artifact_names`.
 
 ## 250.2 Registration
@@ -11294,8 +11336,10 @@ root has no parent and never has whole-tree atomic staging (Section
 
 A directory operation's root lock (`P/<DEST-name>.flux-lock`,
 `P/.flux-dir.lock` under the fallback, or `DEST/.flux-root.lock`) is classified with the operation its record names. A
-root lock whose named workspace does not exist is an orphan, classified by its owner as Section 240 does: `STALE` and
-eligible when the owner is demonstrably gone, `UNCERTAIN` otherwise.
+root lock whose named workspace does not exist is an orphan, classified by its owner as Section 240 does: `LIVE` when
+the owner is alive, `STALE` and eligible when the owner is demonstrably gone, `UNCERTAIN` otherwise. Deleting it
+follows Section 240.3 (move aside and verify first). Any `<lock-name>.broken.*` beside a root lock (Section 240.5) is
+classified the same way, by the owner its record names.
 
 The `DEST` argument is required unless `--target PATH` is given
 (Section 251.2). A bare `flux cleanup` with neither is a usage error,
@@ -11319,8 +11363,8 @@ classify
 
 The expected adjacent artifacts are the target's lock (`P/<name>.flux-lock`,
 or `P/.flux-dir.lock` when the Section 96.1 fallback applies), its state,
-its partial, and a takeover's moved lock (`<lock-name>.broken.<operation-id>`
-beside the lock, Section 240.5), derived as Section 250.1 describes.
+its partial, and any takeover's moved lock (`<lock-name>.broken.*` beside the
+lock, Section 240.5), derived as Section 250.1 describes.
 
 Classification (the only cleanup status names; Section 131 uses them
 too):
@@ -11374,7 +11418,7 @@ even if the standalone catalog entry is missing.
 For a directory target `T` (a filesystem root included),
 `flux cleanup --target T` cleans that directory operation as `flux cleanup T` would (Section 251.1): its root lock
 (`P/<T-name>.flux-lock`, `P/.flux-dir.lock` under the fallback, or `T/.flux-root.lock` for a root) together with the
-workspace the lock's record names.
+workspace the lock's record names, and any `<lock-name>.broken.*` beside that lock (Section 240.5).
 
 The artifacts must still pass ownership and target-identity validation
 before deletion.
@@ -13224,7 +13268,8 @@ A conforming implementation must test at least:
      operation.
 123. flux cleanup DEST for a filesystem-root DEST inspects
      DEST/.flux-root.lock and no P/.flux/atomic/; flux cleanup --target T
-     for a root T inspects T/.flux-root.lock; resume with the root lock
+     for a root T cleans T/.flux-root.lock together with its workspace
+     (test 133); resume with the root lock
      missing looks only in DEST/.flux/operations/.
 124. --dry-run with a primitive that cannot be probed without writing
      writes nothing and says a real run may be refused with
@@ -13244,7 +13289,8 @@ A conforming implementation must test at least:
      claim proceeds.
 128. of two concurrent --break-lock takeovers of one uncertain lock exactly one proceeds; a
      lock acquired by another operation after the re-read is put back and the takeover refuses with TARGET_LOCK_BUSY; a
-     crash after the move leaves <lock-name>.broken.<operation-id> beside the lock, which cleanup finds.
+     crash after the move leaves <lock-name>.broken.<operation-id> beside the lock, which cleanup finds for every
+     lock form (single-file, fallback, directory root, filesystem root).
 129. an operation whose lock file no longer holds its own record performs nothing further, stops with
      TARGET_LOCK_BUSY, and remains resumable.
 130. --restart never leaves the target unlocked between taking the prior operation's lock and starting the new
@@ -13254,12 +13300,17 @@ A conforming implementation must test at least:
 132. an ancestor lock whose record cannot be read makes a nested operation refuse with TARGET_LOCK_UNCERTAIN.
 133. flux cleanup --target T on a directory target, including a filesystem root, classifies and removes its root lock
      together with the workspace the lock names, never the lock alone.
-134. an orphan root lock whose named workspace is gone is STALE and eligible when its owner is demonstrably gone, and
-     UNCERTAIN otherwise.
+134. an orphan root lock whose named workspace is gone is LIVE when its owner is alive, STALE and eligible when its
+     owner is demonstrably gone, and UNCERTAIN otherwise.
 135. flux cleanup exits 0 after classifying, even when it keeps rows; 1 when a deletion failed; 2 on a usage error;
      3 when --break-lock is refused by a live owner.
 136. --dry-run --resume with no prior operation previews the fresh plan; --dry-run --restart --break-lock against an
      uncertain lock previews the takeover; neither changes anything.
+137. --break-lock against an unreadable lock re-checks it by file identity and takes it over; a plain operation that
+     creates the lock while it is moved aside owns the target, and the takeover refuses, reporting the moved file, with
+     exit code 1; a foreign object found at the lock path in step 4 is reported CONTROL_PLANE_NAMESPACE_CONFLICT.
+138. recovery and cleanup remove a dead owner's lock only by moving it aside and verifying it first; a lock that
+     another operation recovered in the meantime is never removed.
 ```
 
 ## 259.15 V15 Implementation Baseline
