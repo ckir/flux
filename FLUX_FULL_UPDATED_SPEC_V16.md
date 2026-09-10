@@ -253,6 +253,17 @@ Revision history:
         `files_verified`, `files_mismatched`, `files_failed`,
         `files_overwritten`, `bytes_skipped`, `verify_level`, and
         `hash_algorithm` (Sections 51, 53).
+    80. Wording and registry fixes: the `destination`/`full` re-read opens
+        the written file anew, never a kept write buffer (Sections 32,
+        135); `--hash` accepts only `blake3` in this version, any other
+        value is a usage error (Section 5); `CONTROL_PLANE_NAMESPACE_CONFLICT`'s
+        "Defined in" lists exactly 96.1 and 259.3 (Section 55); the term
+        is "candidate stale lock" throughout (Sections 240, 252); the
+        `SYMLINK_CREATION_UNAVAILABLE` report names the required Windows
+        privilege or policy (Section 127); `--heartbeat-interval` and
+        `--lease-timeout` in the freely-changeable resume list are marked
+        when implemented (Section 121); a single-file operation's
+        `relative_path` is the target's file name (Section 233.1).
 
     V16 adds acceptance tests 31--107 to Section 259.14.
 
@@ -544,7 +555,10 @@ Planned interface:
 --verify[=<none|source-stream|destination|full>]
                                      (Section 32; default source-stream;
                                       bare --verify = destination)
---hash=<ALGORITHM>                   (Section 32; default blake3)
+--hash=<ALGORITHM>                   (Section 32; default blake3; blake3
+                                      is the only accepted value in this
+                                      version; any other value is a
+                                      usage error, exit code 2)
 
 --preserve-times
 --preserve-permissions
@@ -2726,7 +2740,7 @@ are used only when no more specific code applies.
 | `BLOCKED_BY_CANONICAL_FAILURE` | A hardlink dependent was not linked because its group reached terminal `Failed`. | 92, 205 |
 | `CANONICAL_RETRY_EXHAUSTED` | The per-group attempt budget is spent; recorded as the cause in `Failed.error_code`. | 206, 253.5 |
 | `COMMIT_STATE_UNCERTAIN` | Recovery cannot establish whether a publication or rename happened; state is preserved for reconciliation. | 30.1, 259.8 |
-| `CONTROL_PLANE_NAMESPACE_CONFLICT` | The destination control-plane path (`.flux`) holds a foreign object that Flux does not own. | 250, 259.3 |
+| `CONTROL_PLANE_NAMESPACE_CONFLICT` | The destination control-plane path (`.flux`) holds a foreign object that Flux does not own. | 96.1, 259.3 |
 | `CONTROL_STATE_DURABILITY_FAILURE` | The emergency control reserve is unavailable, exhausted, or corrupt, so a pause or failure cannot be durably recorded. | 231.5 |
 | `COPY_FAILED` | The content copy of an independent file, or a canonical attempt, failed. | 92, 133 |
 | `DESTINATION_ERROR` | A destination-side failure not covered by a more specific code. | 55 |
@@ -5546,7 +5560,8 @@ Two options may change in one direction only:
 ```
 
 These may change freely on resume: `--workers`, `--json`, `--quiet`,
-`-v` / `-vv` / `-vvv`, `--heartbeat-interval`, `--lease-timeout`.
+`-v` / `-vv` / `-vvv`, `--heartbeat-interval` (when implemented; Section
+101), `--lease-timeout` (when implemented; Section 101).
 
 `--resume-verify` may also change. If the requested level needs chunk
 digests that were compacted away under a weaker policy (Section 211),
@@ -5815,8 +5830,8 @@ must not silently change the object type.
 
 No elevation prompt is performed by the core engine.
 
-The CLI may provide a platform-specific diagnostic explaining the
-required Windows privilege/policy.
+The report for `SYMLINK_CREATION_UNAVAILABLE` names the required
+privilege or policy (Developer Mode or `SeCreateSymbolicLinkPrivilege`).
 
 ------------------------------------------------------------------------
 
@@ -9792,7 +9807,8 @@ action=skipped
 In every report record, `relative_path` is the path relative to the
 destination root, including the source root's prefix (Section 18.3),
 written with `/` separators. With several source roots, two records
-therefore never share a `relative_path`.
+therefore never share a `relative_path`. For a single-file operation,
+`relative_path` is the target's file name.
 
 ## 233.2 Strict Behavior
 
@@ -11128,12 +11144,7 @@ perform destructive global artifact discovery.
 
 Heartbeat age alone cannot prove that a process is dead.
 
-A lock with an old heartbeat is therefore a:
-
-``` text
-STALE_CANDIDATE
-```
-
+A lock with an old heartbeat is therefore a **candidate stale lock**,
 not automatically an abandoned lock.
 
 ## 252.1 Recovery Decision Order
