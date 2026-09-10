@@ -197,7 +197,7 @@ Revision history:
     67. Operator-directed recovery is defined as `--break-lock`: valid
         with `--restart` or `flux cleanup --target`, it overrides only
         uncertain ownership, never a live owner or missing or corrupt
-        state (Sections 5, 21.1, 60, 240.5, 252.4).
+        state (Sections 5, 21.1, 60, 240.5, 251.1, 252.4).
     68. `flux cleanup` reports every row and every deletion regardless of
         `--force`, with no interactive prompt; `--dry-run` classifies and
         reports without deleting or locking; `--target`, `--dry-run`, and
@@ -4452,7 +4452,8 @@ other's tree while it runs.
 (a) After a directory operation creates its own destination-root lock, it
 checks each ancestor of DEST's physical path (every directory from the
 filesystem root down to DEST's parent) for a live Flux root lock
-`<parent-of-ancestor>/<ancestor-name>.flux-lock`. If one exists, it
+`<parent-of-ancestor>/<ancestor-name>.flux-lock`, or, for the filesystem
+root itself, `<root>/.flux-root.lock` (Section 96.1). If one exists, it
 releases its own lock and refuses with `TARGET_LOCK_BUSY`; nothing is
 changed. Creating its own lock first, then checking, mirrors Section
 96.1's acquirer protocol, so two racing operations can never both
@@ -10927,7 +10928,9 @@ Eligibility for deletion is a separate marker, not a status. A `STALE` or
 deletion precondition now (Sections 130, 216, 217, 222). `--force` may
 also mark `RESUMABLE` rows eligible, bypassing retention only. `LIVE`,
 `UNCERTAIN`, and `CORRUPT` rows are never eligible; `CORRUPT` workspaces
-are kept for diagnosis.
+are kept for diagnosis. The one exception: `flux cleanup --target PATH
+--break-lock` (Section 240.5) treats that target's `UNCERTAIN` row as
+`STALE`, after reporting the recorded holder.
 
 A standalone catalog record whose target has no lock, state, or partial
 artifact is an orphan (a crash between Section 250.3's steps 3 and 4
@@ -12603,8 +12606,9 @@ A conforming implementation must test at least:
     including FAILED and COMMITTING (after commit recovery), and refuses
     COMPLETED and ABANDONED; a crash while pausing leaves TRANSFERRING.
 62. flux cleanup shows exactly the Section 251.1 statuses and an eligibility
-    marker; LIVE, UNCERTAIN, and CORRUPT rows are never eligible, and --force
-    makes RESUMABLE rows eligible only by bypassing retention.
+    marker; LIVE, UNCERTAIN, and CORRUPT rows are never eligible (except an
+    UNCERTAIN row under cleanup --target --break-lock), and --force makes
+    RESUMABLE rows eligible only by bypassing retention.
 63. DEST/.flux/ contains only operations/ and standalone/; each operation's WAL
     segments live in its own workspace's wal/.
 64. a crash while dependents are held, with fewer dependents than the RAM limit,
