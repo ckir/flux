@@ -114,8 +114,10 @@ Revision history:
         (Sections 11, 242).
     33. Section 17 no longer defines the racy lookup-then-insert
         `TopologyStore`; it points to Section 91.
+    34. Source-root prefixes are checked for aliasing by the destination
+        filesystem through per-prefix locks (Sections 18.3, 96.1).
 
-    V16 adds acceptance tests 31--74 to Section 259.14.
+    V16 adds acceptance tests 31--75 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -1003,6 +1005,13 @@ to the destination root, under which `R`'s content is placed.
     component, and prefixes must be pairwise distinct. Two roots with
     the same prefix are rejected with `DESTINATION_NAMESPACE_COLLISION`
     before any transfer begins.
+-   Distinctness is decided by the destination filesystem, not by
+    bytes. Before any transfer, the operation takes a lock named after
+    each prefix, `DEST/<name>.flux-lock` (Section 96.1). If a prefix's
+    lock creation fails against another root's lock of the same
+    operation, the two prefixes alias on the destination (for example
+    `Data` and `data` on a case-insensitive filesystem) and are
+    rejected with `DESTINATION_NAMESPACE_COLLISION`.
 
 A path's `FluxPathKey` is its destination-relative path: its root's
 prefix components followed by its components relative to that root
@@ -12194,6 +12203,9 @@ A conforming implementation must test at least:
     TARGET_LOCK_BUSY from it.
 74. every adjacent state record carries the Section 249.1 fields, including
     artifact_type, and GC validation (Section 234.4) finds each field it checks.
+75. on a case-insensitive destination, `flux copy /s/Data /s/data /dest` is
+    rejected with DESTINATION_NAMESPACE_COLLISION before any transfer; on a
+    case-sensitive destination it proceeds.
 ```
 
 ## 259.15 V15 Implementation Baseline
