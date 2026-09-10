@@ -102,8 +102,9 @@ Revision history:
     27. Resume compatibility covers every option that changes selection or
         recorded outcomes; only `--retries` (up) and `--durability`
         (normal to strict) may change, one way (Sections 19, 121).
+    28. `--resume` with no prior operation starts a new one (Section 21.1).
 
-    V16 adds acceptance tests 31--70 to Section 259.14.
+    V16 adds acceptance tests 31--71 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -1170,6 +1171,11 @@ neither             fail with RESUMABLE_OPERATION_EXISTS, naming the
                     anything
 both                usage error
 ```
+
+If no prior operation exists for the target or `DEST`, `--resume` starts
+a new operation and the report says "no prior operation; starting new",
+so scripts may always pass `--resume`. A prior operation that exists but
+does not match is still `INCOMPATIBLE_STATE`.
 
 `--restart` supersedes a prior operation in this order:
 
@@ -12137,6 +12143,8 @@ A conforming implementation must test at least:
 70. resuming with a different --exclude, --links, --cross-filesystems, or
     recursion setting is INCOMPATIBLE_STATE; a higher --retries and
     normal→strict --durability are accepted; their reverses are rejected.
+71. --resume with no prior operation starts a new one and reports it; with a
+    non-matching prior operation it is INCOMPATIBLE_STATE.
 ```
 
 ## 259.15 V15 Implementation Baseline
