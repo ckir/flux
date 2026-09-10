@@ -99,8 +99,11 @@ Revision history:
     26. Where each source lands is defined: a single folder is copied onto
         `DEST`, a file goes into an existing folder, several sources go to
         `DEST/<name>` (Sections 4.1, 18.3).
+    27. Resume compatibility covers every option that changes selection or
+        recorded outcomes; only `--retries` (up) and `--durability`
+        (normal to strict) may change, one way (Sections 19, 121).
 
-    V16 adds acceptance tests 31--69 to Section 259.14.
+    V16 adds acceptance tests 31--70 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -1011,13 +1014,18 @@ Examples of potentially incompatible changes:
 
 ``` text
 --hardlinks=preserve → --hardlinks=copy
+selection changed (--exclude, --links, --cross-filesystems, --recursive)
 chunk size changed
 verification policy changed
 atomic policy changed
 reflink policy changed
 sparse policy changed
 metadata policy changed
+special-files or existing-destination policy changed
+--retries decreased, or --durability weakened
 ```
+
+The fingerprint covers every option Section 121 lists.
 
 Flux must either support explicit migration or reject incompatible
 resume attempts.
@@ -5033,16 +5041,40 @@ Resume requires compatibility of:
 ``` text
 source mapping
 destination mapping
+selection: --exclude patterns, --links, --cross-filesystems,
+           --recursive / --no-recursive
 hardlink mode
 atomic mode
 verification policy
 sparse policy
 reflink policy
 metadata policy
+special-files policy
+existing-destination policy (Section 5.1)
+retry policy (--retries)
+durability mode (--durability)
 chunk size
 hash algorithm
 state format
 ```
+
+Selection options must match exactly, because hardlink canonical members
+are the smallest *selected* members (Section 13) and are immutable once
+recorded (Section 204); a different selection could change them.
+
+Two options may change in one direction only:
+
+``` text
+--retries      may increase; the durable attempt count is kept (Section
+               206). A decrease is INCOMPATIBLE_STATE.
+--durability   may change from normal to strict. It applies to checkpoints
+               written after the resume; earlier checkpoints keep the
+               guarantee they were written with. strict to normal is
+               INCOMPATIBLE_STATE.
+```
+
+These may change freely on resume: `--workers`, `--json`, `--quiet`,
+`-v` / `-vv` / `-vvv`, `--heartbeat-interval`, `--lease-timeout`.
 
 Changes that cannot be safely migrated produce:
 
@@ -12102,6 +12134,9 @@ A conforming implementation must test at least:
     lock, and also when that lock is missing.
 69. each row of Section 4.1 maps as stated; running `flux copy /data /backup`
     twice lands in /backup both times, never in /backup/data.
+70. resuming with a different --exclude, --links, --cross-filesystems, or
+    recursion setting is INCOMPATIBLE_STATE; a higher --retries and
+    normal→strict --durability are accepted; their reverses are rejected.
 ```
 
 ## 259.15 V15 Implementation Baseline
