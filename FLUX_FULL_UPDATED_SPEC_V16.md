@@ -357,8 +357,9 @@ Revision history:
     103. --restart keeps the target locked from step 1 to the start of the new operation (Section 21.1).
     104. A refusal that cannot remove a lock or probe file it created reports the path and exits 1; the probe writes
         only inside the operation's workspace (Sections 55, 97.1, 241.5).
+    105. An unreadable ancestor lock record counts as uncertain ownership (Section 97.1).
 
-    V16 adds acceptance tests 31--131 to Section 259.14.
+    V16 adds acceptance tests 31--132 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -4697,7 +4698,7 @@ classifies each lock it finds as Section 240 does: a live owner → it
 releases its own lock and refuses with `TARGET_LOCK_BUSY`; uncertain
 ownership → it releases its own lock and refuses with
 `TARGET_LOCK_UNCERTAIN`; a demonstrably abandoned owner is not an
-obstacle. In both refusals the operator resolves
+obstacle. An ancestor lock whose record cannot be read counts as uncertain ownership. In both refusals the operator resolves
 the ancestor's lock itself (for example `flux cleanup --target <ancestor>
 --break-lock`, Section 240.5). If removing its own lock fails, the
 refusal reports that lock's path and exits 1 (Section 55); the lock has no live owner and is
@@ -13222,6 +13223,7 @@ A conforming implementation must test at least:
      operation.
 131. a refusal that cannot remove its own lock or probe file reports the path and exits 1; a probe file left by an
      operation that proceeds is reported as a warning and removed with the workspace.
+132. an ancestor lock whose record cannot be read makes a nested operation refuse with TARGET_LOCK_UNCERTAIN.
 ```
 
 ## 259.15 V15 Implementation Baseline
