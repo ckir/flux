@@ -231,8 +231,12 @@ Revision history:
         filesystem call, so the legacy 260-character limit never applies;
         a path the destination still refuses as too long fails that
         action with `DESTINATION_ERROR` (Sections 105, 207).
+    75. `chunk_size` is fixed at 1 MiB, not configurable, and recorded in
+        the manifest; a file of N bytes has `ceil(N / chunk_size)`
+        chunks. A manifest recording a different `chunk_size` is
+        `INCOMPATIBLE_STATE` (Sections 121, 136).
 
-    V16 adds acceptance tests 31--103 to Section 259.14.
+    V16 adds acceptance tests 31--104 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -6017,8 +6021,14 @@ verification is enabled.
 A file is divided into fixed-size chunks:
 
 ``` text
-chunk_size = configurable
+chunk_size = 1 MiB (1,048,576 bytes), fixed, not configurable
 ```
+
+`chunk_size` is recorded in the manifest. A file of N bytes has
+`ceil(N / chunk_size)` chunks; the last chunk is shorter when N is not a
+multiple of `chunk_size`. Resume compatibility of chunk size (Section
+121) is unchanged: a manifest recording a different `chunk_size` is
+`INCOMPATIBLE_STATE`.
 
 Each completed chunk may store:
 
@@ -12791,6 +12801,9 @@ A conforming implementation must test at least:
 103. on Windows, a destination path longer than 260 characters succeeds
      through the extended-length call path; a path the destination still
      refuses as too long fails that action with DESTINATION_ERROR.
+104. chunk_size is 1 MiB for every file regardless of options, a file of
+     N bytes has ceil(N / 1 MiB) chunks with a shorter last chunk, and a
+     manifest recording a different chunk_size is INCOMPATIBLE_STATE.
 ```
 
 ## 259.15 V15 Implementation Baseline
