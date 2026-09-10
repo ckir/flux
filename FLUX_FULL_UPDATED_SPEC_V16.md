@@ -227,8 +227,12 @@ Revision history:
         `REFLINK_UNAVAILABLE` when no reflink can be created; the sparse
         verification digest is over logical bytes for all three
         `--sparse` modes (Sections 38, 39, 55).
+    74. On Windows, Flux uses extended-length paths (`\\?\`) for every
+        filesystem call, so the legacy 260-character limit never applies;
+        a path the destination still refuses as too long fails that
+        action with `DESTINATION_ERROR` (Sections 105, 207).
 
-    V16 adds acceptance tests 31--102 to Section 259.14.
+    V16 adds acceptance tests 31--103 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -4848,6 +4852,11 @@ for ordering.
 Where a byte-preserving WTF-8-style representation is used internally,
 it must be specified and tested as an encoding of Windows UTF-16 code
 units, not assumed to be equivalent to arbitrary Unix byte strings.
+
+Flux uses extended-length paths (`\\?\`) for every filesystem call on
+Windows, so the legacy 260-character path limit never applies. A name
+or path the destination still refuses as too long fails that action
+with `DESTINATION_ERROR` (`path_scoped`, Section 207).
 
 ------------------------------------------------------------------------
 
@@ -12779,6 +12788,9 @@ A conforming implementation must test at least:
      reflink can be created fails with REFLINK_UNAVAILABLE; the
      verification digest for a sparse file is the same under auto,
      always, and never.
+103. on Windows, a destination path longer than 260 characters succeeds
+     through the extended-length call path; a path the destination still
+     refuses as too long fails that action with DESTINATION_ERROR.
 ```
 
 ## 259.15 V15 Implementation Baseline
