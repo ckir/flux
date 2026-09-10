@@ -305,8 +305,15 @@ Revision history:
         temporary capacity (Section 254); `DISK_FULL` on any other
         destination write is `operator_action_required` (Sections 29,
         207).
+    90. Before a directory operation changes anything, Flux probes the
+        destination for a no-replace publication primitive; if none is
+        available, the operation is refused with
+        `NOREPLACE_PUBLISH_UNAVAILABLE` (exit code 3), and check-then-
+        rename is never used instead. `FsCapabilities` gains
+        `no_replace_publish`. Single-file operations are unaffected
+        (Sections 55, 62, 241.5).
 
-    V16 adds acceptance tests 31--112 to Section 259.14.
+    V16 adds acceptance tests 31--113 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -2798,6 +2805,7 @@ are used only when no more specific code applies.
 | `IO_ERROR` | An I/O failure not covered by a more specific code. | 55 |
 | `LEASE_AGE_UNCERTAIN` | The wall clock moved backward, so lease staleness cannot be concluded. | 229.5 |
 | `METADATA_APPLY_FAILED` | Metadata could not be applied to a file: the file's action fails when that metadata was explicitly requested, and is a best-effort warning otherwise. | 44.1 |
+| `NOREPLACE_PUBLISH_UNAVAILABLE` | No no-replace publication primitive is available on the destination for a directory operation; refused before anything changes. | 241.5 |
 | `OPERATION_LOCKED` | Another process holds the operation lock. | 58, 96.2 |
 | `PATH_COMPONENT_INVALID` | A path component contains `0x00`; no `FluxPathKey` is constructed. | 103 |
 | `PERMISSION_DENIED` | The operating system denied access. | 55 |
@@ -3022,6 +3030,7 @@ struct FsCapabilities {
     atomic_replace: bool,
     xattrs: bool,
     acl: bool,
+    no_replace_publish: bool,     // Section 241.5
 }
 ```
 
@@ -10497,6 +10506,16 @@ destination ignores case. Both are planned as new; the first is
 published; the second's no-replace publication finds the name taken and
 is reported as a collision instead of overwriting the first.
 
+No-replace publication depends on one of `renameat2(RENAME_NOREPLACE)`,
+`renamex_np(RENAME_EXCL)`, `MoveFileEx` without
+`MOVEFILE_REPLACE_EXISTING`, or `link()`+`unlink()` being available on
+the destination. Before a directory operation changes anything, Flux
+probes the destination for one of these primitives. If none is
+available, the operation is refused with `NOREPLACE_PUBLISH_UNAVAILABLE`
+(exit code 3); check-then-rename is never used as a substitute.
+Single-file operations are unaffected: their target lock (Section 96)
+detects collisions instead.
+
 ## 241.6 Hardlink Independence
 
 Unicode normalization never determines hardlink identity.
@@ -12971,6 +12990,11 @@ A conforming implementation must test at least:
      is not retried, is reported, and the operation can be resumed once
      space is freed; DISK_FULL inside atomic temporary capacity is
      handled by the Section 254 capacity states instead.
+113. a directory operation against a destination with no no-replace
+     publication primitive is refused with NOREPLACE_PUBLISH_UNAVAILABLE
+     (exit 3) before anything changes, without falling back to
+     check-then-rename; a single-file operation against the same
+     destination is unaffected.
 ```
 
 ## 259.15 V15 Implementation Baseline
