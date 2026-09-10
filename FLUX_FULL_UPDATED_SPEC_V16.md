@@ -169,8 +169,12 @@ Revision history:
         Stage A never delays the first transfer (Section 113); the lock
         key `K` uses `T`'s final name, not the destination-relative key
         (Sections 250, 259.6).
+    60. A directory target lock's recorded `workspace_path` is trusted only
+        if it equals one of the two paths derivable from the lock's own
+        target and `operation_id`; this tightens item 25 (Sections 120,
+        259.6).
 
-    V16 adds acceptance tests 31--88 to Section 259.14.
+    V16 adds acceptance tests 31--89 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -2568,7 +2572,7 @@ existing code.
 
 | Code | Meaning | Defined in |
 |------|---------|------------|
-| `ARTIFACT_OWNERSHIP_UNCERTAIN` | An adjacent artifact's state record is missing, malformed, or unverifiable; the artifact is preserved, never adopted or deleted. | 239.3, 249.4 |
+| `ARTIFACT_OWNERSHIP_UNCERTAIN` | An adjacent artifact's state record is missing, malformed, or unverifiable; the artifact is preserved, never adopted or deleted. | 120, 239.3, 249.4 |
 | `ATOMIC_DIRECTORY_REPLACE_UNSUPPORTED` | `--atomic=always` on an existing directory, with no safe whole-tree replacement primitive. | 30.1, 259.9 |
 | `BLOCKED_BY_CANONICAL_FAILURE` | A hardlink dependent was not linked because its group reached terminal `Failed`. | 92, 205 |
 | `CANONICAL_RETRY_EXHAUSTED` | The per-group attempt budget is spent; recorded as the cause in `Failed.error_code`. | 206, 253.5 |
@@ -5284,6 +5288,11 @@ DEST/.flux/operations/<operation-id>/                   normal operations
 P/.flux/atomic/<target-key>/<operation-id>/             whole-tree atomic staging
                                                         (Section 259.10)
 ```
+
+The recorded `workspace_path` is trusted only if it equals one of these
+two paths, derived from the lock's own target and `operation_id`. Any
+other value makes the record unverifiable: `ARTIFACT_OWNERSHIP_UNCERTAIN`;
+nothing at the recorded path is read, adopted, or deleted.
 
 If the lock is missing, Flux checks both locations: `DEST/.flux/operations/`
 and, non-recursively, `P/.flux/atomic/`. Both are authoritative discovery
@@ -12513,6 +12522,9 @@ A conforming implementation must test at least:
 88. a hardlink group whose every member's target is skipped ends in the
     terminal Skipped state (not Failed); its dependents are Skipped after
     recovery too.
+89. a directory target lock whose recorded workspace_path is neither of the
+    two derivable paths makes recovery report ARTIFACT_OWNERSHIP_UNCERTAIN
+    and read, adopt, or delete nothing at that path.
 ```
 
 ## 259.15 V15 Implementation Baseline
