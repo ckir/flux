@@ -365,6 +365,8 @@ Revision history:
     108. flux cleanup's exit codes are defined (Sections 55, 251).
     109. --dry-run previews a fresh plan when there is nothing to resume, previews a --break-lock takeover, and does not
         predict namespace collisions (Section 5.2).
+    110. Wording: TARGET_LOCK_UNCERTAIN cites Section 97.1; Section 207's object_scoped default excludes
+        operator_action_required (Sections 55, 207).
 
     V16 adds acceptance tests 31--136 to Section 259.14.
 
@@ -2898,7 +2900,7 @@ are used only when no more specific code applies.
 | `SYMLINK_CREATION_UNAVAILABLE` | A symlink cannot be created (for example, a missing Windows privilege); action-scoped. | 127, 259.11 |
 | `TARGET_LOCK_BUSY` | A live owner holds the destination target lock. | 96, 96.2, 97.1, 240.2, 252.2 |
 | `TARGET_LOCK_KEY_COLLISION` | Two distinct complete keys share a catalog-record digest; the records are never merged. | 250 |
-| `TARGET_LOCK_UNCERTAIN` | Flux cannot distinguish a dead lock owner from a stalled one. | 96.2, 240.4, 252.4 |
+| `TARGET_LOCK_UNCERTAIN` | Flux cannot distinguish a dead lock owner from a stalled one. | 96.2, 97.1, 240.4, 252.4 |
 | `VERIFY_MISMATCH` | A verification digest did not match, or `flux verify` found differing content, payload, or object type. | 4.2, 55, 135 |
 | `WAL_CORRUPT` | WAL corruption found before the trailing record. | 174, 191 |
 | `WAL_FORMAT_UNSUPPORTED` | The WAL format is unknown. | 191 |
@@ -8846,7 +8848,7 @@ object_scoped
 
 Only `path_scoped` failures permit fallback materialization (Section
 253.2). When the scope cannot be established, the failure is treated as
-`object_scoped`.
+`object_scoped` (`operator_action_required` excepted, above).
 
 ------------------------------------------------------------------------
 
