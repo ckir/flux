@@ -137,6 +137,8 @@ Revision history:
         the component-wise order of Section 7.2.
     44. The Section 83 architecture diagram shows the workspace's `wal/`
         and `checkpoints/`.
+    45. Report `relative_path` is destination-relative, including the root
+        prefix (Section 233.1).
 
     V16 adds acceptance tests 31--81 to Section 259.14.
 
@@ -9404,6 +9406,11 @@ relative_path
 object_type
 action=skipped
 ```
+
+In every report record, `relative_path` is the path relative to the
+destination root, including the source root's prefix (Section 18.3),
+written with `/` separators. With several source roots, two records
+therefore never share a `relative_path`.
 
 ## 233.2 Strict Behavior
 
