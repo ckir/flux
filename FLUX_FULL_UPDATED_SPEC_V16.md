@@ -156,8 +156,11 @@ Revision history:
         validation to `full` (Sections 121, 211).
     53. `flux verify` is defined: read-only comparison of SOURCE and DEST
         under the copy mapping (Sections 4.2, 46, 55).
+    54. `TopologyState` gains the terminal `Skipped` state for an
+        all-skipped group, with `mark_skipped` and `AlreadySkipped`
+        (Sections 90, 91, 142, 147.3, 201, 253.3, 253.5, V14.4).
 
-    V16 adds acceptance tests 31--87 to Section 259.14.
+    V16 adds acceptance tests 31--88 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -3841,6 +3844,9 @@ enum TopologyState {
         error_code: ErrorCode,
         last_attempt_id: AttemptId,
     },
+    // Every member's target is skipped by the existing-destination
+    // policy (Section 253.7).
+    Skipped,
 }
 ```
 
@@ -3893,11 +3899,14 @@ There is no:
 
 ``` text
 Failed → any other state
+Skipped → any other state
 Materialized → Copying      (during normal execution)
 Copying → Unresolved        (including crash recovery; Section 123)
 ```
 
-transition. `Failed` is terminal.
+transition. `Failed` and `Skipped` are terminal. `Unresolved → Skipped`
+happens when every member's target is skipped and no further member can
+appear (Section 253.7); nothing is copied or linked.
 
 Every transition out of `Copying` names the expected
 `current_attempt_id` and is applied by compare-and-swap. A transition
@@ -3979,6 +3988,13 @@ trait TopologyStore {
         attempt_id: AttemptId,
         error_code: ErrorCode,
     ) -> Result<TransitionResult>;
+
+    // Unresolved → Skipped (terminal). Every member's target is skipped
+    // and no further member can appear (Section 253.7).
+    fn mark_skipped(
+        &self,
+        identity: FileIdentity,
+    ) -> Result<TransitionResult>;
 }
 ```
 
@@ -4003,6 +4019,7 @@ enum ClaimResult {
     AlreadyFailed {
         error_code: ErrorCode,
     },
+    AlreadySkipped,
 }
 
 enum TransitionResult {
@@ -6002,6 +6019,11 @@ trait TopologyStore {
         attempt_id: AttemptId,
         error_code: ErrorCode,
     ) -> Result<TransitionResult>;
+
+    fn mark_skipped(
+        &self,
+        identity: FileIdentity,
+    ) -> Result<TransitionResult>;
 }
 
 trait OperationStore {
@@ -6385,6 +6407,8 @@ load topology records
       ├── Materialized → release dependents
       │
       ├── Failed → block dependents
+      │
+      ├── Skipped → dependents Skipped
       │
       └── Copying/Unresolved → retain hold
 ```
@@ -8060,6 +8084,7 @@ enum TopologyState {
     Copying,
     Materialized,
     Failed,
+    Skipped,
 }
 ```
 
@@ -10977,7 +11002,7 @@ TopologyGroup
         C/file → Pending
 
     group materialization:
-        Unresolved / Materializing / Materialized / Failed
+        Unresolved / Materializing / Materialized / Failed / Skipped
 ```
 
 In the authoritative schema (Section 90), "Materializing" is
@@ -11035,7 +11060,9 @@ failure that ended the group. It is reached when any of these holds:
 ``` text
 1. the latest failure is object_scoped (Section 207)
 2. the shared per-group attempt budget is exhausted (Section 206)
-3. no candidate remains and no further member can appear
+3. no candidate remains and no further member can appear, and at least
+   one member was attempted (a group whose every member's target was
+   skipped is Skipped instead, Section 253.7)
 ```
 
 "No further member can appear" requires that the scan of every source
@@ -11727,6 +11754,7 @@ Unresolved
 Copying
 Materialized
 Failed
+Skipped
 ```
 
 as the logical topology states, that presentation is conceptual shorthand for the logical state dimension.
@@ -12477,6 +12505,9 @@ A conforming implementation must test at least:
 87. flux verify reports match, missing, mismatched, and extra paths correctly,
     exits 1 only for missing or mismatched, ignores DEST/.flux and Flux
     artifacts, and writes nothing.
+88. a hardlink group whose every member's target is skipped ends in the
+    terminal Skipped state (not Failed); its dependents are Skipped after
+    recovery too.
 ```
 
 ## 259.15 V15 Implementation Baseline
