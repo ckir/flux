@@ -189,8 +189,13 @@ Revision history:
         between Section 250.3's steps 3 and 4 is an orphan; default
         cleanup classifies it `STALE` and deletes it under the target
         lock (Sections 250.3, 251.1).
+    66. Nested destination roots are defined: a new directory operation
+        refuses with `TARGET_LOCK_BUSY` if a live root lock exists on an
+        ancestor of its destination, and a writer refuses path-scoped
+        writes under an existing directory whose own root lock a live
+        operation holds (Section 97.1).
 
-    V16 adds acceptance tests 31--93 to Section 259.14.
+    V16 adds acceptance tests 31--95 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -2620,7 +2625,7 @@ existing code.
 | `STATE_CORRUPT` | The manifest, `state.db`, or `topology.db` is corrupt; the workspace is preserved. | 140 |
 | `STRICT_DURABILITY_UNAVAILABLE` | `--durability=strict` cannot be established for the filesystem. | 169 |
 | `SYMLINK_CREATION_UNAVAILABLE` | A symlink cannot be created (for example, a missing Windows privilege); action-scoped. | 127, 259.11 |
-| `TARGET_LOCK_BUSY` | A live owner holds the destination target lock. | 96, 240.2, 252.2 |
+| `TARGET_LOCK_BUSY` | A live owner holds the destination target lock. | 96, 97.1, 240.2, 252.2 |
 | `TARGET_LOCK_KEY_COLLISION` | Two distinct complete keys share a catalog-record digest; the records are never merged. | 250 |
 | `TARGET_LOCK_UNCERTAIN` | Flux cannot distinguish a dead lock owner from a stalled one. | 240.4, 252.4 |
 | `VERIFY_MISMATCH` | A verification digest did not match, or `flux verify` found differing content, payload, or object type. | 4.2, 55, 135 |
@@ -4384,6 +4389,28 @@ Target locks, including the lock on a directory operation's destination
 root, follow Section 96.1. They depend on the destination's name
 resolution, not on object identity, so they remain valid when the
 filesystem's object identity is weak.
+
+## 97.1 Nested Destination Roots
+
+Two operations whose destination roots nest (for example `DEST=/backup`
+and `DEST=/backup/archive`) take unrelated locks (Section 96.1); Section
+97's invariant does not by itself stop one from publishing into the
+other's tree while it runs.
+
+(a) After a directory operation creates its own destination-root lock, it
+checks each ancestor of DEST's physical path (every directory from the
+filesystem root down to DEST's parent) for a live Flux root lock
+`<parent-of-ancestor>/<ancestor-name>.flux-lock`. If one exists, it
+releases its own lock and refuses with `TARGET_LOCK_BUSY`; nothing is
+changed. Creating its own lock first, then checking, mirrors Section
+96.1's acquirer protocol, so two racing operations can never both
+proceed.
+
+(b) When the writer is about to write into an existing destination
+directory `D`, it checks for `D`'s own root lock
+`<parent-of-D>/<D-name>.flux-lock`. If a live operation holds it, nothing
+under `D` is written; each affected action fails with `TARGET_LOCK_BUSY`
+(path-scoped) and the rest of the operation continues.
 
 ------------------------------------------------------------------------
 
@@ -12583,6 +12610,13 @@ A conforming implementation must test at least:
     is classified STALE and eligible by default cleanup, and is deleted
     only while the target lock is held, after re-checking that no
     artifact has appeared.
+94. a directory operation targeting DEST=/backup/archive while a live
+    operation holds the root lock on an ancestor (/backup) releases its
+    own lock and refuses with TARGET_LOCK_BUSY, changing nothing.
+95. a directory operation targeting DEST=/backup while a live operation
+    holds the root lock on /backup/archive fails only the actions that
+    write under /backup/archive with TARGET_LOCK_BUSY, and the rest of
+    the operation continues.
 ```
 
 ## 259.15 V15 Implementation Baseline
