@@ -141,6 +141,8 @@ Revision history:
         prefix (Section 233.1).
     46. The dependent link procedure first removes the operation's own
         leftover temporary name (Section 16.1).
+    47. Records use one name per field: `complete_lock_key` and
+        `last_heartbeat_wall_time` (Sections 229.2, 250.1, 259.6).
 
     V16 adds acceptance tests 31--82 to Section 259.14.
 
@@ -9082,7 +9084,7 @@ struct LeaseRecord {
     owner_instance_id: InstanceId,
     boot_session_id: BootSessionId,
 
-    last_heartbeat_wall: Timestamp,
+    last_heartbeat_wall_time: Timestamp,
 
     // Diagnostic/current-session data only.
     last_heartbeat_monotonic: Option<Duration>,
@@ -10510,7 +10512,7 @@ adjacent state record (Section 218).
 A catalog record contains:
 
 ``` text
-complete_key
+complete_lock_key
 target_identity
 target_path_key
 target_parent_identity
@@ -12030,7 +12032,7 @@ boot_session_id
 target_path_key
 workspace_path     (where the owning operation's recovery state lives; Section 120)
 creation_wall_time
-heartbeat
+last_heartbeat_wall_time
 ```
 
 The lock file's name is not ownership proof; the record inside it is validated (Section 216).
