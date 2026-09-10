@@ -363,8 +363,10 @@ Revision history:
     107. Default cleanup classifies a directory operation's root lock with its operation, and an orphan root lock by its
         owner (Section 251.1).
     108. flux cleanup's exit codes are defined (Sections 55, 251).
+    109. --dry-run previews a fresh plan when there is nothing to resume, previews a --break-lock takeover, and does not
+        predict namespace collisions (Section 5.2).
 
-    V16 adds acceptance tests 31--135 to Section 259.14.
+    V16 adds acceptance tests 31--136 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -759,13 +761,18 @@ invocation (Section 21.1) without changing anything:
 ``` text
 --dry-run --resume    reads the prior operation's saved state without
                       taking any lock, and reports what resuming would do,
-                      or the refusal it would get (INCOMPATIBLE_STATE, a
+                      or, with no resumable prior operation, the
+                      fresh plan (Section 21.1), or the refusal it would get (INCOMPATIBLE_STATE, a
                       live owner)
 --dry-run --restart   reports what would be discarded, then the fresh plan,
                       or the refusal a real --restart would get (a live
                       owner, uncertain ownership, or missing or corrupt
-                      prior state)
+                      prior state); with
+                      --break-lock, uncertain ownership previews the takeover instead
 ```
+
+--dry-run does not predict DESTINATION_NAMESPACE_COLLISION: collisions are detected at
+publication (Section 241.5), so a preview can show two targets that a real run reports as one collision.
 
 ------------------------------------------------------------------------
 
@@ -13248,6 +13255,8 @@ A conforming implementation must test at least:
      UNCERTAIN otherwise.
 135. flux cleanup exits 0 after classifying, even when it keeps rows; 1 when a deletion failed; 2 on a usage error;
      3 when --break-lock is refused by a live owner.
+136. --dry-run --resume with no prior operation previews the fresh plan; --dry-run --restart --break-lock against an
+     uncertain lock previews the takeover; neither changes anything.
 ```
 
 ## 259.15 V15 Implementation Baseline
