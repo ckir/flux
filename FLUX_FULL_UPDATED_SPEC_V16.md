@@ -139,8 +139,10 @@ Revision history:
         and `checkpoints/`.
     45. Report `relative_path` is destination-relative, including the root
         prefix (Section 233.1).
+    46. The dependent link procedure first removes the operation's own
+        leftover temporary name (Section 16.1).
 
-    V16 adds acceptance tests 31--81 to Section 259.14.
+    V16 adds acceptance tests 31--82 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -917,6 +919,10 @@ one of these states:
 A dependent is linked the same way every time, so re-running it is safe:
 
 ``` text
+0. remove any leftover <target>.flux-partial.<operation-id>; the name
+   carries this operation's id, so it is this operation's own leftover,
+   for example a failed copy attempt's temporary file after fallback
+   (Section 253.4)
 1. create the hardlink at <target>.flux-partial.<operation-id>, in the
    target's directory, to the materialization anchor
 2. atomically rename it over <target>
@@ -12328,6 +12334,8 @@ A conforming implementation must test at least:
     particular lock_conflict and capacity_failure never spend attempt budget.
 81. after OperationStateChanged to PAUSED the scheduler admits no new work; a
     duplicate or late delivery changes nothing.
+82. after fallback, linking the failed canonical succeeds even when its failed
+    copy attempt left <target>.flux-partial.<operation-id> behind.
 ```
 
 ## 259.15 V15 Implementation Baseline
