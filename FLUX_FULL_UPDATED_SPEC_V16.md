@@ -337,8 +337,11 @@ Revision history:
         `P/.flux/atomic/<target-key>/`, find `.flux-dir.lock` per entry,
         and handle a filesystem-root DEST or target (Sections 120,
         234.1, 251.1, 251.2).
+    97. The no-replace probe writes only Flux control state, its
+        dry-run preview is defined, and it applies to atomic staging
+        (Section 241.5).
 
-    V16 adds acceptance tests 31--123 to Section 259.14.
+    V16 adds acceptance tests 31--124 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -10597,9 +10600,14 @@ the destination. Before a directory operation changes anything, Flux
 probes the destination for one of these primitives. If none is
 available, the operation is refused with `NOREPLACE_PUBLISH_UNAVAILABLE`
 (exit code 3); check-then-rename is never used as a substitute. The
-probe leaves nothing behind; under `--dry-run` it writes nothing at all,
-and a primitive it cannot establish without writing is reported as
-unprobed (Section 5.2).
+probe writes only inside Flux's own control state (Section 259.3) and
+removes what it wrote; anything it cannot remove is reported. Under
+`--dry-run` it writes nothing at all; a primitive it cannot establish
+without writing is reported as unprobed, and the preview says that a
+real run may be refused with `NOREPLACE_PUBLISH_UNAVAILABLE` (Section
+5.2). The probe applies under `--atomic=always` too: the staged tree is
+populated on the same filesystem and needs the same collision detection
+(Section 259.10).
 Single-file operations are unaffected: their target lock (Section 96)
 detects collisions instead.
 
@@ -13137,6 +13145,10 @@ A conforming implementation must test at least:
      DEST/.flux-root.lock and no P/.flux/atomic/; flux cleanup --target T
      for a root T inspects T/.flux-root.lock; resume with the root lock
      missing looks only in DEST/.flux/operations/.
+124. --dry-run with a primitive that cannot be probed without writing
+     writes nothing and says a real run may be refused with
+     NOREPLACE_PUBLISH_UNAVAILABLE; the probe runs under --atomic=always
+     too.
 ```
 
 ## 259.15 V15 Implementation Baseline
