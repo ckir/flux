@@ -288,6 +288,9 @@ Revision history:
         superseded attempt's chunk checkpoints may be discarded, since a
         new attempt never resumes from a failed attempt's chunks (Section
         226).
+    86. Flux sets no deadline on filesystem calls; a blocking call blocks
+        the work waiting on it, and a killed process recovers through
+        `--resume` (Section 189).
 
     V16 adds acceptance tests 31--109 to Section 259.14.
 
@@ -8050,6 +8053,13 @@ Section 231.5 applies.
 
 The final state must accurately indicate whether resume state is
 trustworthy.
+
+Flux sets no deadline on filesystem calls. A call that blocks (a stalled
+network mount, a removed device) blocks the work waiting on it;
+cancellation takes effect when the call returns; a killed process
+recovers through `--resume`. A call abandoned after a deadline could
+still complete later and write into the WAL or a partial file after the
+failure was recorded.
 
 ------------------------------------------------------------------------
 
