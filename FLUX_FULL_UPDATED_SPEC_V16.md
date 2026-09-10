@@ -202,8 +202,13 @@ Revision history:
         `--force`, with no interactive prompt; `--dry-run` classifies and
         reports without deleting or locking; `--target`, `--dry-run`, and
         `--force` are no longer future options (Sections 24.4, 60).
+    69. A target lock for a filesystem-root DEST is defined:
+        `T/.flux-root.lock`, created exclusively inside `T`; and
+        `--atomic=always` against a root DEST is refused with
+        `ATOMIC_DIRECTORY_REPLACE_UNSUPPORTED` (Sections 4.2, 96.1, 259.3,
+        259.9).
 
-    V16 adds acceptance tests 31--97 to Section 259.14.
+    V16 adds acceptance tests 31--98 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -448,7 +453,8 @@ reads with `--hash` (default `blake3`):
 -   Both sides are walked together in `FluxPathKey` order (Section 7.2),
     so resident memory stays bounded.
 -   Flux's own control state (`DEST/.flux/`, lock, state, and partial
-    artifacts) is never compared (Section 259.3).
+    artifacts, including a root `DEST`'s `DEST/.flux-root.lock`) is never
+    compared (Section 259.3).
 
 It reports each path as:
 
@@ -2610,7 +2616,7 @@ existing code.
 | Code | Meaning | Defined in |
 |------|---------|------------|
 | `ARTIFACT_OWNERSHIP_UNCERTAIN` | An adjacent artifact's state record is missing, malformed, or unverifiable; the artifact is preserved, never adopted or deleted. | 120, 239.3, 249.4 |
-| `ATOMIC_DIRECTORY_REPLACE_UNSUPPORTED` | `--atomic=always` on an existing directory, with no safe whole-tree replacement primitive. | 30.1, 259.9 |
+| `ATOMIC_DIRECTORY_REPLACE_UNSUPPORTED` | `--atomic=always` on an existing directory, with no safe whole-tree replacement primitive, or on a root `DEST`, which cannot be replaced. | 30.1, 96.1, 259.9 |
 | `BLOCKED_BY_CANONICAL_FAILURE` | A hardlink dependent was not linked because its group reached terminal `Failed`. | 92, 205 |
 | `CANONICAL_RETRY_EXHAUSTED` | The per-group attempt budget is spent; recorded as the cause in `Failed.error_code`. | 206, 253.5 |
 | `COMMIT_STATE_UNCERTAIN` | Recovery cannot establish whether a publication or rename happened; state is preserved for reconciliation. | 30.1, 259.8 |
@@ -4385,6 +4391,18 @@ directory acquirer   create P/.flux-dir.lock, then list P (non-recursively)
 
 On a conflict the acquirer removes what it created and reports
 `TARGET_LOCK_BUSY`. Both acquirers may back off; both can never proceed.
+
+A target `T` with no parent (a filesystem root: `/`, `C:\`, a share root)
+has no `P` to hold a lock file. Its lock is instead:
+
+``` text
+T/.flux-root.lock
+```
+
+created exclusively inside `T`. It is Flux control state: never copied,
+compared, or reported as extra (Sections 4.2, 259.3). `--atomic=always`
+with a root `DEST` is refused with `ATOMIC_DIRECTORY_REPLACE_UNSUPPORTED`,
+because a root cannot be replaced (Section 259.9).
 
 Exclusive creation on a remote filesystem is trusted only under the lock
 capability rules of Section 235; otherwise `REMOTE_LOCK_UNSAFE`.
@@ -12240,6 +12258,8 @@ A scanner must distinguish a user source `.flux` directory from Flux-owned desti
 
 If the required destination control-plane path already contains an unrecognized foreign object, Flux must not overwrite or reinterpret it merely because it is named `.flux`; the operation must fail with `CONTROL_PLANE_NAMESPACE_CONFLICT` or use a separately configured control-plane location if supported.
 
+The same exclusion applies to `DEST/.flux-root.lock` when `DEST` is a filesystem root (Section 96.1): it is Flux control state, not source content.
+
 ## 259.4 WAL Backpressure and Lock Ordering
 
 The bounded WAL/checkpoint channel is required and must not become a lock inversion mechanism.
@@ -12373,6 +12393,8 @@ ATOMIC_DIRECTORY_REPLACE_UNSUPPORTED
 must be returned.
 
 Flux must not delete the old tree first or silently fall back to per-file replacement.
+
+A root `DEST` (Section 96.1) has no replaceable parent boundary; `--atomic=always` against a root `DEST` is always refused with `ATOMIC_DIRECTORY_REPLACE_UNSUPPORTED`.
 
 For a previously nonexistent destination directory, there is no existing tree to replace. Atomic replacement of an old directory is therefore not required merely to create every intermediate directory.
 
@@ -12662,6 +12684,9 @@ A conforming implementation must test at least:
 97. flux cleanup --force still reports every row's status and every
     deletion it makes; flux cleanup --dry-run reports classification and
     eligibility, deletes nothing, and takes no lock.
+98. copying to a filesystem-root DEST takes the lock T/.flux-root.lock
+    inside T, never compares or reports it, and refuses --atomic=always
+    against that DEST with ATOMIC_DIRECTORY_REPLACE_UNSUPPORTED.
 ```
 
 ## 259.15 V15 Implementation Baseline
