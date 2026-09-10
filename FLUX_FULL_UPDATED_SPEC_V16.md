@@ -358,8 +358,10 @@ Revision history:
     104. A refusal that cannot remove a lock or probe file it created reports the path and exits 1; the probe writes
         only inside the operation's workspace (Sections 55, 97.1, 241.5).
     105. An unreadable ancestor lock record counts as uncertain ownership (Section 97.1).
+    106. flux cleanup --target on a directory target cleans its root lock together with its workspace (Sections 234.1,
+        251.2).
 
-    V16 adds acceptance tests 31--132 to Section 259.14.
+    V16 adds acceptance tests 31--133 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -11344,9 +11346,10 @@ may directly inspect:
 
 even if the standalone catalog entry is missing.
 
-For a filesystem-root target `T`, the only adjacent artifact is its lock
-`T/.flux-root.lock` (Section 96.1); `flux cleanup --target T` inspects
-that instead of the parent-relative names above.
+For a directory target `T` (a filesystem root included),
+`flux cleanup --target T` cleans that directory operation as `flux cleanup T` would (Section 251.1): its root lock
+(`P/<T-name>.flux-lock`, `P/.flux-dir.lock` under the fallback, or `T/.flux-root.lock` for a root) together with the
+workspace the lock's record names.
 
 The artifacts must still pass ownership and target-identity validation
 before deletion.
@@ -13224,6 +13227,8 @@ A conforming implementation must test at least:
 131. a refusal that cannot remove its own lock or probe file reports the path and exits 1; a probe file left by an
      operation that proceeds is reported as a warning and removed with the workspace.
 132. an ancestor lock whose record cannot be read makes a nested operation refuse with TARGET_LOCK_UNCERTAIN.
+133. flux cleanup --target T on a directory target, including a filesystem root, classifies and removes its root lock
+     together with the workspace the lock names, never the lock alone.
 ```
 
 ## 259.15 V15 Implementation Baseline
