@@ -110,6 +110,8 @@ Revision history:
     31. Section 249.1 is the one full list of adjacent-state fields and
         includes `artifact_type`; timestamps are `creation_wall_time`
         (Sections 215, 239, 249.1, 259.6).
+    32. `FileIdentity` has one definition, including `generation`
+        (Sections 11, 242).
 
     V16 adds acceptance tests 31--74 to Section 259.14.
 
@@ -664,8 +666,13 @@ Define:
 struct FileIdentity {
     filesystem_id: FilesystemId,
     object_id: ObjectId,
+    generation: Option<ObjectGeneration>,   // Section 242
 }
 ```
+
+This is the only definition of `FileIdentity`. Its reliability is
+classified in Section 107, and the persisted form of `filesystem_id` is
+defined in Section 109.1.
 
 Unix implementations should use suitable device/inode information.
 
@@ -9931,13 +9938,7 @@ The persistent identity model is extended to include an object
 generation where the platform/filesystem provides a reliable generation
 value.
 
-``` rust
-struct FileIdentity {
-    filesystem_id: FilesystemId,
-    object_id: ObjectId,
-    generation: Option<ObjectGeneration>,
-}
-```
+It is held in `FileIdentity::generation` (Section 11).
 
 ## 242.1 Generation Semantics
 
