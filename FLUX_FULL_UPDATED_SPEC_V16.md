@@ -297,8 +297,12 @@ Revision history:
         `--update` or `--skip-existing` together with `--atomic=always`
         is a usage error (exit 2), whether or not the destination exists
         (Sections 5.1, 259.9).
+    88. Replacement aliasing is resolved by an insert-if-absent claim on
+        the existing entry, durable and resume-safe, not by a
+        before-either-is-published check the streaming planner cannot
+        make; this tightens item 49 (Section 241.5).
 
-    V16 adds acceptance tests 31--110 to Section 259.14.
+    V16 adds acceptance tests 31--111 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -10466,11 +10470,16 @@ not take (Section 97). It happens at publication:
     of this operation that the filesystem treats as the same name, or an
     outside process), and Flux reports `DESTINATION_NAMESPACE_COLLISION`
     without replacing it.
--   A target planned as a replacement (Section 5.1) records the existing
-    entry it resolves to: its object identity where that is strong,
-    otherwise the entry's name as the filesystem reports it. Two targets
-    that resolve to the same existing entry are rejected with
-    `DESTINATION_NAMESPACE_COLLISION` before either is published.
+-   A target planned as a replacement (Section 5.1) claims the existing
+    entry it resolves to with an insert-if-absent write, keyed by that
+    entry — its object identity where that is strong, otherwise the
+    entry's name as the filesystem reports it — in the operation's state
+    store. The planner streams (Section 47), so this claim, not a
+    before-either-is-published check, is what serializes two targets
+    that resolve to the same existing entry: the first target to claim
+    an entry proceeds; a later target whose claim finds the entry
+    already taken is reported `DESTINATION_NAMESPACE_COLLISION` and is
+    not published. The claim is durable and survives resume.
 -   Targets that are locked themselves (single-file targets, directory
     roots, source-root prefixes; Sections 18.3, 96.1) are also detected
     through their lock.
@@ -12946,6 +12955,10 @@ A conforming implementation must test at least:
      together with --atomic=always is a usage error (exit 2) whether or
      not the destination exists; --dry-run reports the entries that
      would be removed.
+111. two replacement targets that resolve to the same existing
+     destination entry: the first to claim it proceeds, the second's
+     claim finds it taken and is reported DESTINATION_NAMESPACE_COLLISION
+     without being published; the claim survives resume.
 ```
 
 ## 259.15 V15 Implementation Baseline
