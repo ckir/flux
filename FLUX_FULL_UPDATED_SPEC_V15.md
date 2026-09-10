@@ -2008,21 +2008,56 @@ Suggested exit codes:
 2 = usage/configuration errors
 ```
 
-Useful categories:
+Error code registry (normative). Every failure or result code used in
+this specification appears here. A change that introduces a new code
+MUST add it to this table, and MUST NOT introduce a synonym for an
+existing code.
 
-``` text
-SOURCE_CHANGED
-DESTINATION_ERROR
-PERMISSION_DENIED
-IO_ERROR
-VERIFY_MISMATCH
-HARDLINK_UNAVAILABLE
-RESUME_INVALID
-SAFETY_REJECTED
-DISK_FULL
-OPERATION_LOCKED
-INCOMPATIBLE_STATE
-```
+| Code | Meaning | Defined in |
+|------|---------|------------|
+| `ARTIFACT_OWNERSHIP_UNCERTAIN` | An adjacent artifact's state record is missing, malformed, or unverifiable; the artifact is preserved, never adopted or deleted. | 239.3, 249.4 |
+| `ATOMIC_DIRECTORY_REPLACE_UNSUPPORTED` | `--atomic=always` on an existing directory, with no safe whole-tree replacement primitive. | 30.1, 259.9 |
+| `BLOCKED_BY_CANONICAL_FAILURE` | A hardlink dependent was not linked because its group reached terminal `Failed`. | 92, 205 |
+| `CANONICAL_RETRY_EXHAUSTED` | The per-group attempt budget is spent; recorded as the cause in `Failed.error_code`. | 206, 253.5 |
+| `COMMIT_STATE_UNCERTAIN` | Recovery cannot establish whether a publication or rename happened; state is preserved for reconciliation. | 30.1, 259.8 |
+| `CONTROL_PLANE_NAMESPACE_CONFLICT` | The destination control-plane path (`.flux`) holds a foreign object that Flux does not own. | 250, 259.3 |
+| `CONTROL_STATE_DURABILITY_FAILURE` | The emergency control reserve is unavailable, exhausted, or corrupt, so a pause or failure cannot be durably recorded. | 231.5 |
+| `COPY_FAILED` | The content copy of an independent file, or a canonical attempt, failed. | 92, 133 |
+| `DESTINATION_ERROR` | A destination-side failure not covered by a more specific code. | 55 |
+| `DESTINATION_NAMESPACE_COLLISION` | Two distinct source `FluxPathKey` values map to the same destination object. | 241.5 |
+| `DIRECTORY_CHANGED_DURING_SCAN` | An existing directory's identity changed while it was being entered. | 149.4 |
+| `DISK_FULL` | A destination data allocation failed for lack of space (`ENOSPC`, `ERROR_DISK_FULL`). | 29, 55 |
+| `FAILED_ATOMIC_CAPACITY` | Required atomic temporary capacity provably exceeds the maximum recoverable capacity; terminal for the action. | 254.3 |
+| `HARDLINK_GROUP_UNMATERIALIZABLE` | Reported outcome of a hardlink group that reached terminal `Failed`. | 253.5 |
+| `HARDLINK_IDENTITY_UNAVAILABLE` | `--hardlinks=preserve` was requested but reliable object identity is unavailable. | 108 |
+| `HARDLINK_UNAVAILABLE` | A required destination hardlink cannot be created. | 15, 55 |
+| `INCOMPATIBLE_STATE` | Resume state is incompatible with the requested options or format and cannot be migrated. | 121 |
+| `IO_ERROR` | An I/O failure not covered by a more specific code. | 55 |
+| `LEASE_AGE_UNCERTAIN` | The wall clock moved backward, so lease staleness cannot be concluded. | 229.5 |
+| `OPERATION_LOCKED` | Another process holds the operation lock. | 58 |
+| `PATH_COMPONENT_INVALID` | A path component contains `0x00`; no `FluxPathKey` is constructed. | 103 |
+| `PERMISSION_DENIED` | The operating system denied access. | 55 |
+| `REMOTE_LOCK_UNSAFE` | No trustworthy exclusive lock contract can be established on a remote filesystem. | 235.4 |
+| `RESUME_INVALID` | Resume validation failed: missing partial, state mismatch, or checkpoint mismatch. | 23, 35.3 |
+| `SAFETY_REJECTED` | The source/destination containment or self-copy check rejected the operation. | 129 |
+| `SOURCE_CHANGED` | Source identity or metadata changed during the copy; the result is not published. | 33 |
+| `SPECIAL_FILE_UNSUPPORTED` | An unsupported special file: skipped with a durable warning, or a failure under strict policy. | 233 |
+| `STATE_CORRUPT` | The manifest, `state.db`, or `topology.db` is corrupt; the workspace is preserved. | 140 |
+| `STRICT_DURABILITY_UNAVAILABLE` | `--durability=strict` cannot be established for the filesystem. | 169 |
+| `SYMLINK_CREATION_UNAVAILABLE` | A symlink cannot be created (for example, a missing Windows privilege); action-scoped. | 127, 259.11 |
+| `TARGET_LOCK_BUSY` | A live owner holds the destination target lock. | 96, 240.2, 252.2 |
+| `TARGET_LOCK_KEY_COLLISION` | Two distinct complete lock or catalog keys share a digest; the targets are never aliased. | 250, 259.6 |
+| `TARGET_LOCK_UNCERTAIN` | Flux cannot distinguish a dead lock owner from a stalled one. | 240.4, 252.4 |
+| `VERIFY_MISMATCH` | A verification digest did not match. | 55, 135 |
+| `WAL_CORRUPT` | WAL corruption found before the trailing record. | 174, 191 |
+| `WAL_FORMAT_UNSUPPORTED` | The WAL format is unknown. | 191 |
+| `WAL_SEQUENCE_CONFLICT` | Conflicting payloads were found for one WAL sequence number. | 175, 191 |
+| `WAL_SPACE_EXHAUSTED` | WAL growth cannot be relieved by compaction. | 190 |
+
+Not error codes, and not listed above: state names (for example
+`CAPACITY_WAIT`, `DIRECTORY_STAGING`), WAL record types (for example
+`PREPARE_COMMIT`), WAL corruption classes (Section 191), cleanup
+classifications (Sections 131, 251.1), and operating-system error names.
 
 Do not keep an unbounded in-memory error list.
 
@@ -3646,7 +3681,7 @@ must contend for the same target lock.
 The second operation must receive:
 
 ``` text
-TARGET_LOCKED
+TARGET_LOCK_BUSY
 ```
 
 unless an explicit future wait/retry mode is enabled.
@@ -3912,7 +3947,7 @@ The byte `0x00` cannot occur inside a component: POSIX filenames cannot
 contain NUL, and Windows/NTFS filenames cannot contain U+0000 (whose
 WTF-8 encoding is the only way to produce `0x00`). A platform adapter that
 nevertheless observes a component containing `0x00` MUST report the entry
-as an error and MUST NOT construct a key for it.
+as `PATH_COMPONENT_INVALID` and MUST NOT construct a key for it.
 
 Because `0x00` is smaller than every byte that can occur in a component,
 plain bytewise comparison of `FluxPathKey` values (the derived `Ord` of
@@ -4848,7 +4883,7 @@ If symlink creation fails because required Windows capability/privilege
 is unavailable:
 
 ``` text
-LINK_CREATION_UNAVAILABLE
+SYMLINK_CREATION_UNAVAILABLE
 ```
 
 for strict behavior.
@@ -8913,7 +8948,7 @@ provides the required crash/ownership semantics.
 If the platform cannot establish a trustworthy exclusive lock contract:
 
 ``` text
-FLUX_REMOTE_LOCK_UNSAFE
+REMOTE_LOCK_UNSAFE
 ```
 
 must be returned for operations requiring concurrent-safety guarantees.
@@ -10243,8 +10278,11 @@ become:
 HARDLINK_GROUP_UNMATERIALIZABLE
 ```
 
-That is the terminal `TopologyState::Failed` (Section 90). It is reached
-when any of these holds:
+That is the terminal `TopologyState::Failed` (Section 90).
+`HARDLINK_GROUP_UNMATERIALIZABLE` is the group's reported outcome;
+`Failed.error_code` records its cause, which is either
+`CANONICAL_RETRY_EXHAUSTED` (budget exhausted) or the error of the
+failure that ended the group. It is reached when any of these holds:
 
 ``` text
 1. the latest failure is object_scoped (Section 207)
@@ -11263,7 +11301,7 @@ which must not be recursively discovered as source content.
 
 A scanner must distinguish a user source `.flux` directory from Flux-owned destination control state using the operation's source/destination mapping and control-plane ownership. It must not globally exclude every path whose basename is `.flux`.
 
-If the required destination control-plane path already contains an unrecognized foreign object, Flux must not overwrite or reinterpret it merely because it is named `.flux`; the operation must fail with an explicit namespace-conflict classification or use a separately configured control-plane location if supported.
+If the required destination control-plane path already contains an unrecognized foreign object, Flux must not overwrite or reinterpret it merely because it is named `.flux`; the operation must fail with `CONTROL_PLANE_NAMESPACE_CONFLICT` or use a separately configured control-plane location if supported.
 
 ## 259.4 WAL Backpressure and Lock Ordering
 
@@ -11385,10 +11423,10 @@ If the evidence uniquely establishes the intended publication, recovery may fina
 If it cannot distinguish completed publication from non-completion, recovery must enter:
 
 ```text
-COMMIT_OUTCOME_UNCERTAIN
+COMMIT_STATE_UNCERTAIN
 ```
 
-or the equivalent conservative classification.
+(the same classification as Section 30.1).
 
 In that state Flux must not perform destructive compensating mutation that could overwrite or delete an unrelated object. Preservation and operator/resume investigation are the default.
 
@@ -11447,7 +11485,7 @@ A crash must not cause staged data to be deleted merely because it is marked `DI
 
 ## 259.11 Symlink Failure
 
-`LINK_CREATION_UNAVAILABLE` is an action-scoped failure.
+`SYMLINK_CREATION_UNAVAILABLE` is an action-scoped failure.
 
 Flux must not silently substitute a junction, hardlink, or regular file for a requested symlink.
 
