@@ -349,8 +349,11 @@ Revision history:
     100. Section 241.5's claims are keyed by directory entry (parent directory identity and reported name), not object
         identity; a claim records its target, so a resumed target and a hardlink dependent never collide with their own
         claims (Section 241.5).
+    101. --break-lock's takeover is exclusive: it moves the lock aside by rename, which only one takeover can do,
+        then creates its own lock exclusively; a lock acquired in between is put back and the takeover refuses (Sections
+        240.5, 250.1, 251.1, 251.2).
 
-    V16 adds acceptance tests 31--127 to Section 259.14.
+    V16 adds acceptance tests 31--128 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -10481,8 +10484,14 @@ corrupt state.
 
 Before acting, Flux reports the recorded holder's `owner_instance_id`,
 `boot_session_id`, `last_heartbeat_wall_time`, and `workspace_path`, and
-durably records the takeover, then replaces the lock record with its own
-by an atomic rename over it, and proceeds as if the prior owner were
+then takes the lock over exclusively. It re-reads the lock record and proceeds only if it still names the recorded
+holder. It renames the lock file to `<lock-name>.broken.<new-operation-id>` in the same directory; only one of several
+concurrent takeovers can move it, and the others find the lock gone and start again from Section 240.1. It checks that
+the moved record is the recorded holder's; if not (another operation acquired the lock after the re-read), it renames
+the file back without replacing (Section 241.5) and refuses with `TARGET_LOCK_BUSY`. It then creates its own lock
+exclusively (Section 96.1); if that fails, another operation acquired the lock in between, and Flux refuses with
+`TARGET_LOCK_BUSY`, reporting the moved file. Finally it durably records the takeover in its own state, naming the
+moved file, deletes the moved file, and proceeds as if the prior owner were
 dead. A prior owner that was only stalled starts nothing more: its next
 lock revalidation (Section 99) fails. A filesystem call it had already
 started can still complete, because Flux sets no deadline on filesystem
@@ -11158,7 +11167,8 @@ The record must be crash-safe.
 `artifact_names` is informational. Cleanup and GC derive each artifact
 name from the record's `target_path_key` and `operation_id` using the
 fixed patterns (`P/<name>.flux-lock`, `P/.flux-dir.lock`,
-`P/<name>.flux-state.<operation-id>`, `P/<name>.flux-partial.<operation-id>`)
+`P/<name>.flux-state.<operation-id>`, `P/<name>.flux-partial.<operation-id>`,
+`P/<name>.flux-lock.broken.<operation-id>` (a takeover's moved lock, Section 240.5))
 and never open or delete a name taken only from `artifact_names`.
 
 ## 250.2 Registration
@@ -11269,7 +11279,8 @@ classify
 
 The expected adjacent artifacts are the target's lock (`P/<name>.flux-lock`,
 or `P/.flux-dir.lock` when the Section 96.1 fallback applies), its state,
-and its partial, derived as Section 250.1 describes.
+its partial, and a takeover's moved lock (`P/<name>.flux-lock.broken.<operation-id>`,
+Section 240.5), derived as Section 250.1 describes.
 
 Classification (the only cleanup status names; Section 131 uses them
 too):
@@ -11314,6 +11325,7 @@ may directly inspect:
 /dest/.flux-dir.lock       (Section 96.1 fallback, when it applies to this target)
 /dest/foo.iso.flux-state.*
 /dest/foo.iso.flux-partial.*
+/dest/foo.iso.flux-lock.broken.*   (a takeover's moved lock, Section 240.5)
 ```
 
 even if the standalone catalog entry is missing.
@@ -13188,6 +13200,9 @@ A conforming implementation must test at least:
 127. a hardlink group's dependents link beside their canonical member without DESTINATION_NAMESPACE_COLLISION; two
      existing destination names of one hardlinked object are different entries; a resumed target that finds its own
      claim proceeds.
+128. of two concurrent --break-lock takeovers of one uncertain lock exactly one proceeds; a
+     lock acquired by another operation after the re-read is put back and the takeover refuses with TARGET_LOCK_BUSY; a
+     crash after the move leaves P/<name>.flux-lock.broken.<operation-id>, which cleanup finds.
 ```
 
 ## 259.15 V15 Implementation Baseline
