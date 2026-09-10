@@ -126,6 +126,8 @@ Revision history:
         operations are allowed or refused (Section 235.1).
     38. `--dry-run` with `--resume` or `--restart` previews that
         invocation without changing anything (Section 5.2).
+    39. The `CanonicalFailed` event field is `error_code` everywhere
+        (Sections 147.2, V14.3).
 
     V16 adds acceptance tests 31--79 to Section 259.14.
 
@@ -11457,7 +11459,7 @@ CanonicalFailed {
     operation_id
     attempt_id
     attempt_number
-    error
+    error_code
 }
 ```
 
