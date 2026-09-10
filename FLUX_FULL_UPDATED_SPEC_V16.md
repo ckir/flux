@@ -69,8 +69,10 @@ Revision history:
         reported as skipped (Sections 5, 124).
     13. `--overwrite`, `--update`, and `--skip-existing` are defined and
         mutually exclusive; overwrite is the default (Sections 5, 5.1).
+    14. `--dry-run` is read-only: no locks, workspace, catalog entry, or
+        destination change, and it is not resumable (Sections 5, 5.2).
 
-    V16 adds acceptance tests 31--58 to Section 259.14.
+    V16 adds acceptance tests 31--59 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -330,7 +332,7 @@ Planned interface:
 --heartbeat-interval <duration>      (Section 101; future)
 --lease-timeout <duration>           (Section 101; future)
 
---dry-run
+--dry-run                            (Section 5.2)
 
 --json
 
@@ -368,6 +370,22 @@ advance and whose size is unchanged is not replaced; use `--overwrite`
 when that matters.
 
 Skipped targets appear in the report and in "files skipped" (Section 51).
+
+## 5.2 Dry Run
+
+`--dry-run` scans, selects, and plans exactly as a real run would, and
+reports the actions it would take. It creates no operation lock, target
+lock, workspace, catalog entry, partial file, or destination change, and
+it cannot be resumed.
+
+Planning state that must spill to keep resident memory bounded (Section
+10.2) goes to a private temporary directory outside the destination,
+removed when the run ends.
+
+A dry run may run while a real operation is live. Its report is a
+snapshot of the destination as scanned and may be stale when printed.
+Checks that need locks, capacity reservations, or writes (Sections 96,
+259.5) are reported as checks a real run would make, not performed.
 
 ------------------------------------------------------------------------
 
@@ -11927,6 +11945,9 @@ A conforming implementation must test at least:
 58. with no policy an existing file is replaced; --update replaces only a newer
     or differently sized source; --skip-existing reports and keeps it; two
     policies together are a usage error.
+59. --dry-run leaves the destination byte-for-byte and entry-for-entry unchanged,
+    creates no lock or workspace, and keeps memory bounded on a tree large
+    enough to spill planning state.
 ```
 
 ## 259.15 V15 Implementation Baseline
