@@ -13563,3 +13563,19 @@ down rather than fixed, each with the guard that makes it unreachable:
     heartbeat age alone never proves an owner dead (Section 252: "Heartbeat
     age alone cannot prove that a process is dead"); the cost is
     throughput only.
+-   DISCARDED-BELOW-FLOOR: a lock left behind by a cleanup run that
+    crashed has a dead owner, so the next operation removes it (Section
+    240.3), or `--break-lock` does when ownership is uncertain (Section
+    240.5); the target is never permanently blocked.
+-   DISCARDED-BELOW-FLOOR: a `lock_conflict` that spends no attempt budget
+    cannot cycle a hardlink group forever: each candidate is tried at most
+    once (Section 253.2, "has not been attempted").
+-   DISCARDED-BELOW-FLOOR: Section 250.1's fixed-pattern list omits atomic
+    staging because Section 250 covers single-file targets only ("For a
+    single-file target T"); directory staging is Section 259.10.
+-   DISCARDED-BELOW-FLOOR: an `operator_action_required` failure cannot
+    loop by itself: every resume is an explicit operator command
+    (`--resume`, Section 21.1).
+-   DISCARDED-BELOW-FLOOR: a moved dead-owner lock whose delete keeps
+    failing is reported by every cleanup run (every row is reported,
+    Sections 24.4, 251.1); nothing depends on its removal.
