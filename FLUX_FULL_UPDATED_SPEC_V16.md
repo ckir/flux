@@ -312,8 +312,12 @@ Revision history:
         rename is never used instead. `FsCapabilities` gains
         `no_replace_publish`. Single-file operations are unaffected
         (Sections 55, 62, 241.5).
+    91. The writer resolves every destination entry relative to a held
+        parent handle without following links; a link under `DEST` that
+        this operation did not create rejects that path with
+        `SAFETY_REJECTED` (Sections 55, 149.7).
 
-    V16 adds acceptance tests 31--113 to Section 259.14.
+    V16 adds acceptance tests 31--114 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -2813,7 +2817,7 @@ are used only when no more specific code applies.
 | `REMOTE_LOCK_UNSAFE` | No trustworthy exclusive lock contract can be established on a remote filesystem. | 235.4 |
 | `RESUMABLE_OPERATION_EXISTS` | A run without `--resume` or `--restart` found a resumable prior operation for its target or destination; nothing was changed. | 21.1 |
 | `RESUME_INVALID` | Resume validation failed: missing partial, state mismatch, or checkpoint mismatch. | 23, 35.3 |
-| `SAFETY_REJECTED` | The source/destination containment or self-copy check rejected the operation. | 129 |
+| `SAFETY_REJECTED` | The source/destination containment or self-copy check rejected the operation, or a destination path component is a link this operation did not create (that path only). | 129, 149.7 |
 | `SOURCE_CHANGED` | Source identity or metadata changed during the copy; the result is not published. | 33 |
 | `SPARSE_UNAVAILABLE` | `--sparse=always` was requested but the destination cannot hold holes (`FsCapabilities::sparse` is false). | 38 |
 | `SPECIAL_FILE_UNSUPPORTED` | An unsupported special file: skipped with a durable warning, or a failure under strict policy. | 233 |
@@ -6987,6 +6991,24 @@ identity checks
 ```
 
 are all part of the safety model.
+
+## 149.7 Destination-Side Resolution
+
+Sections 149.3--149.5 bind the scanner. The writer is bound too: a
+directory Flux created or entered under `DEST` could be replaced by a
+link before its descendants are written.
+
+`DEST` itself is resolved once, at start. Below it, the writer creates and
+opens every destination entry relative to a directory handle it holds for
+the parent, reached by walking down from `DEST`'s root without following
+links (POSIX: `openat` with `O_NOFOLLOW` and `O_DIRECTORY`; Windows:
+handle-relative opens that do not follow reparse points).
+
+If a component under `DEST` is a symlink, junction, or other reparse point
+that this operation did not create, that path is rejected: its actions
+fail with `SAFETY_REJECTED` and are reported, and the rest of the
+operation continues (exit status 1, Section 55). Symlinks this operation
+creates are leaves; the writer never walks through them.
 
 ------------------------------------------------------------------------
 
@@ -12995,6 +13017,10 @@ A conforming implementation must test at least:
      (exit 3) before anything changes, without falling back to
      check-then-rename; a single-file operation against the same
      destination is unaffected.
+114. replacing a directory that Flux created under DEST with a symlink to a
+     location outside DEST, between its creation and the writing of its
+     descendants, makes those actions fail with SAFETY_REJECTED; nothing is
+     written outside DEST, and the rest of the operation continues.
 ```
 
 ## 259.15 V15 Implementation Baseline
