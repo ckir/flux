@@ -360,8 +360,10 @@ Revision history:
     105. An unreadable ancestor lock record counts as uncertain ownership (Section 97.1).
     106. flux cleanup --target on a directory target cleans its root lock together with its workspace (Sections 234.1,
         251.2).
+    107. Default cleanup classifies a directory operation's root lock with its operation, and an orphan root lock by its
+        owner (Section 251.1).
 
-    V16 adds acceptance tests 31--133 to Section 259.14.
+    V16 adds acceptance tests 31--134 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -11273,6 +11275,11 @@ For a filesystem-root DEST (Section 96.1), cleanup also inspects
 root has no parent and never has whole-tree atomic staging (Section
 259.9).
 
+A directory operation's root lock (`P/<DEST-name>.flux-lock`,
+`P/.flux-dir.lock` under the fallback, or `DEST/.flux-root.lock`) is classified with the operation its record names. A
+root lock whose named workspace does not exist is an orphan, classified by its owner as Section 240 does: `STALE` and
+eligible when the owner is demonstrably gone, `UNCERTAIN` otherwise.
+
 The `DEST` argument is required unless `--target PATH` is given
 (Section 251.2). A bare `flux cleanup` with neither is a usage error,
 because there is no global catalog to enumerate (Section 18).
@@ -13229,6 +13236,8 @@ A conforming implementation must test at least:
 132. an ancestor lock whose record cannot be read makes a nested operation refuse with TARGET_LOCK_UNCERTAIN.
 133. flux cleanup --target T on a directory target, including a filesystem root, classifies and removes its root lock
      together with the workspace the lock names, never the lock alone.
+134. an orphan root lock whose named workspace is gone is STALE and eligible when its owner is demonstrably gone, and
+     UNCERTAIN otherwise.
 ```
 
 ## 259.15 V15 Implementation Baseline
