@@ -10534,7 +10534,10 @@ No-replace publication depends on one of `renameat2(RENAME_NOREPLACE)`,
 the destination. Before a directory operation changes anything, Flux
 probes the destination for one of these primitives. If none is
 available, the operation is refused with `NOREPLACE_PUBLISH_UNAVAILABLE`
-(exit code 3); check-then-rename is never used as a substitute.
+(exit code 3); check-then-rename is never used as a substitute. The
+probe leaves nothing behind; under `--dry-run` it writes nothing at all,
+and a primitive it cannot establish without writing is reported as
+unprobed (Section 5.2).
 Single-file operations are unaffected: their target lock (Section 96)
 detects collisions instead.
 
