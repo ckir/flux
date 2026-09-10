@@ -128,6 +128,8 @@ Revision history:
         invocation without changing anything (Section 5.2).
     39. The `CanonicalFailed` event field is `error_code` everywhere
         (Sections 147.2, V14.3).
+    40. `HARDLINK_UNAVAILABLE` is produced for a member whose required
+        link cannot be created (Sections 15, 16.1, 55, 253.7).
 
     V16 adds acceptance tests 31--79 to Section 259.14.
 
@@ -843,7 +845,9 @@ must report the degradation.
 
 Topology preservation is mandatory.
 
-Failure to create a required hardlink is an operation failure.
+Failure to create a required hardlink is an operation failure, reported
+as `HARDLINK_UNAVAILABLE` for the member that could not be linked
+(Sections 16.1, 253.7).
 
 ## `copy`
 
@@ -899,7 +903,7 @@ one of these states:
 | `Linked` | the link is durably recorded as created |
 | `Skipped` | not linked because the existing-destination policy skips its target |
 | `Blocked` | not linked because the group terminally failed (`BLOCKED_BY_CANONICAL_FAILURE`) |
-| `Failed` | linking failed; reported with its error |
+| `Failed` | linking failed; reported with its error, `HARDLINK_UNAVAILABLE` when the link itself cannot be created |
 
 A dependent is linked the same way every time, so re-running it is safe:
 
@@ -2451,7 +2455,7 @@ existing code.
 | `FAILED_ATOMIC_CAPACITY` | Required atomic temporary capacity provably exceeds the maximum recoverable capacity; terminal for the action. | 254.3 |
 | `HARDLINK_GROUP_UNMATERIALIZABLE` | Reported outcome of a hardlink group that reached terminal `Failed`. | 253.5 |
 | `HARDLINK_IDENTITY_UNAVAILABLE` | `--hardlinks=preserve` was requested but reliable object identity is unavailable. | 108 |
-| `HARDLINK_UNAVAILABLE` | A required destination hardlink cannot be created. | 15, 55 |
+| `HARDLINK_UNAVAILABLE` | A required destination hardlink cannot be created for one member (link creation failed, or the member was skipped under `--hardlinks=preserve`). Distinct from `HARDLINK_GROUP_UNMATERIALIZABLE`, which concerns the group's content. | 15, 16.1, 253.7 |
 | `INCOMPATIBLE_STATE` | Resume state is incompatible with the requested options or format and cannot be migrated. | 121 |
 | `IO_ERROR` | An I/O failure not covered by a more specific code. | 55 |
 | `LEASE_AGE_UNCERTAIN` | The wall clock moved backward, so lease staleness cannot be concluded. | 229.5 |
