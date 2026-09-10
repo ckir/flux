@@ -211,8 +211,13 @@ Revision history:
         refusal reports the holder's identity, boot session, workspace
         path, and last heartbeat where the lock record is readable
         (Section 96.2).
+    71. Exit codes are normative: 0 success (including degraded `auto`
+        outcomes), 1 action failure or verify mismatch, 2 usage error, 3
+        whole-operation refusal before anything changed; a refusal scoped
+        to some paths only (for example Section 97.1(b)) exits 1
+        (Section 55).
 
-    V16 adds acceptance tests 31--99 to Section 259.14.
+    V16 adds acceptance tests 31--100 to Section 259.14.
 
 Where sections conflict, later closure layers control earlier ones, and
 payload-bearing definitions control state-name summaries (Section
@@ -2604,13 +2609,24 @@ CLI:
 
 # 55. Error Model
 
-Suggested exit codes:
+Exit codes (normative):
 
 ``` text
-0 = complete success
-1 = transfer/verification errors
-2 = usage/configuration errors
+0  success, including outcomes degraded under an auto policy (they are
+   reported, Section 51)
+1  one or more actions failed, or verification found a mismatch
+2  usage or configuration error: the options are invalid, or invalid
+   together for the given sources
+3  refused before changing anything: the operation was refused as a
+   whole because of the state of the destination, a prior operation, or
+   the platform (for example TARGET_LOCK_BUSY, OPERATION_LOCKED,
+   TARGET_LOCK_UNCERTAIN, LEASE_AGE_UNCERTAIN, RESUMABLE_OPERATION_EXISTS,
+   INCOMPATIBLE_STATE, STATE_CORRUPT, REMOTE_LOCK_UNSAFE,
+   SAFETY_REJECTED), and nothing was changed
 ```
+
+Where a partial run hit a refusal on some paths only (for example
+Section 97.1(b)), the result is exit code 1.
 
 Error code registry (normative). Every failure or result code used in
 this specification appears here. A change that introduces a new code
@@ -12711,6 +12727,10 @@ A conforming implementation must test at least:
     refusal against a readable lock record reports the holder's
     owner_instance_id, boot_session_id, workspace_path, and
     last_heartbeat_wall_time.
+100. exit code is 0 for success including a degraded auto outcome, 1 for
+     an action failure or verify mismatch or a refusal scoped to some
+     paths only, 2 for a usage error, and 3 for a whole-operation refusal
+     that changed nothing.
 ```
 
 ## 259.15 V15 Implementation Baseline
