@@ -138,7 +138,7 @@ Recipes and CI:
   these is part of `just check`, which stays Java-free.
 - `.github/workflows/model.yml` runs on every pull request to `main`, on pushes to `main`, and on manual dispatch, with
   `permissions: contents: read` and no secrets, in three jobs:
-  1. `plan` checks out the repository with full history (`fetch-depth: 0`), runs `run.py`'s unit tests, lists the
+  1. `plan` checks out the repository with full history (`fetch-depth: 0`), runs `run.py`'s unit tests under Python 3.14 and 3.11 (the oldest version `run.py` supports), lists the
      changed files with `git diff
      --name-only` from the merge base of the pull request's base and head (`base...head`), or from the push's previous
      commit, decides whether they touch
@@ -148,7 +148,7 @@ Recipes and CI:
      force push whose previous commit is gone), count as touching, so an unknown change runs every scenario;
   2. `scenario`, one matrix job per scenario name and skipped when the matrix is empty (GitHub rejects an empty
      matrix, so the job carries a condition on `plan`'s output), installs Java with `actions/setup-java` (Temurin 21) and Python
-     with `actions/setup-python` (3.11, the oldest version `run.py` supports), runs `just model <name>`, and uploads `target/tla/out/` when it
+     with `actions/setup-python` (3.14, the version the development machines use), runs `just model <name>`, and uploads `target/tla/out/` when it
      fails;
   3. `model-gate` always runs after the others and fails if `plan` failed, if any `scenario` job failed or was
      cancelled, or if `scenario` was skipped although the matrix was not empty; it passes when the matrix was empty.
