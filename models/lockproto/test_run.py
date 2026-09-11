@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import sys
 import tempfile
 import textwrap
@@ -459,6 +462,68 @@ class MainTests(unittest.TestCase):
             raise KeyboardInterrupt
         run.execute = execute
         self.assertEqual(run.main(["--expected", str(HERE / "expected.toml")]), 2)
+
+    def main_with(self, statuses: dict[tuple[str, bool], str]) -> tuple[int, list[tuple[str, bool]]]:
+        """Run main() over GOOD_EXPECTED with execute() stubbed: each (run, fixed) reports its status, default ok."""
+        d = ExpectedDir()
+        self.addCleanup(d.close)
+        run.ensure_jar = lambda: Path("unused.jar")
+        calls: list[tuple[str, bool]] = []
+
+        def execute(r: run.Run, _jar: Path, _base: Path, fixed: bool) -> run.Result:
+            calls.append((r.name, fixed))
+            status = statuses.get((r.name, fixed), "ok")
+            if status == "raise":
+                raise OSError("cannot write the TLC log")
+            return ExitCodeTests.result(status)
+        run.execute = execute
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = run.main(["--expected", str(d.path / "expected.toml")])
+        return code, calls
+
+    def test_all_runs_ok_is_exit_0(self) -> None:
+        code, calls = self.main_with({})
+        self.assertEqual(code, 0)
+        # The run with an open finding runs twice: as written, then with its fix flag set.
+        self.assertEqual(calls, [("demo-posix-check", False), ("demo-posix-check", True),
+                                 ("demo-posix-liveness", False), ("demo-posix-seeded-SEED_X", False)])
+
+    def test_a_mismatch_is_exit_1_even_beside_a_tooling_failure(self) -> None:
+        code, _ = self.main_with({("demo-posix-check", True): "tooling", ("demo-posix-liveness", False): "mismatch"})
+        self.assertEqual(code, 1)
+
+    def test_a_tooling_failure_alone_is_exit_2(self) -> None:
+        code, _ = self.main_with({("demo-posix-seeded-SEED_X", False): "tooling"})
+        self.assertEqual(code, 2)
+
+    def test_an_error_inside_one_run_is_exit_2_and_later_runs_still_run(self) -> None:
+        code, calls = self.main_with({("demo-posix-check", False): "raise"})
+        self.assertEqual(code, 2)
+        self.assertEqual(calls[-1], ("demo-posix-seeded-SEED_X", False))
+
+    def test_list_scenarios_prints_the_names_as_json_without_java(self) -> None:
+        d = ExpectedDir(GOOD_EXPECTED.replace('scenarios = ["demo"]', 'scenarios = ["demo", "other"]') + """
+[[run]]
+name = "other-posix-liveness"
+module = "M"
+config = "live.cfg"
+scenario = "other"
+kind = "liveness"
+timeout_minutes = 5
+""")
+        self.addCleanup(d.close)
+        # The CI plan job lists scenarios before any Java or TLC setup, so listing must touch neither.
+        run.shutil.which = lambda _name: None
+
+        def refuse(*_args: object) -> Path:
+            raise AssertionError("--list-scenarios must not fetch or run TLC")
+        run.ensure_jar = refuse
+        run.execute = refuse
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = run.main(["--expected", str(d.path / "expected.toml"), "--list-scenarios"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue()), ["demo", "other"])
 
 
 class CommandTests(unittest.TestCase):

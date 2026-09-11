@@ -14,7 +14,7 @@ and traceability check, the filesystem probes, and CI. Plan 2 adds `FsModel.tla`
 |---|---|---|
 | `just model` | runs every run in `expected.toml` | Java 11+, Python 3.11+ |
 | `just model <scenario>` | runs one scenario, for example `just model selftest` | Java 11+, Python 3.11+ |
-| `just model-test` | unit tests of `run.py` (recorded TLC output, no Java) | Python 3.11+ |
+| `just model-test` | unit tests of `run.py` (recorded TLC output, no Java) and of the CI workflow's change detection | Python 3.11+ |
 | `just model-stamp` | runs `just model`, then rewrites the unit hashes in `trace.toml` if every run matched | Java, Python, Rust |
 
 `run.py` downloads `tla2tools.jar` (release and SHA-256 pinned in `run.py`) into `target/tla/`, checks its hash
@@ -39,6 +39,7 @@ runs write their TLC state and logs under `target/tla/`, keyed by run name.
 | `expected.toml` | every TLC run and what it must report (design Section 4) |
 | `configs/*.cfg` | one TLC configuration per run |
 | `run.py`, `test_run.py` | the runner and its unit tests |
+| `test_workflow.py` | checks the path pattern `.github/workflows/model.yml` uses to decide whether to run the scenarios |
 | `testdata/` | recorded TLC output for the unit tests; `record_fixtures.py` re-records it after the TLC pin changes |
 | `Smoke.tla` | runner self-test model (the `selftest` scenario); not part of the protocol |
 | `spec-sections.stamp` | the spec file and the spec headings the model encodes (design Section 9) |

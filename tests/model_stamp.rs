@@ -604,6 +604,19 @@ fn child_heading_text_is_not_part_of_its_parent() {
     assert_eq!(section_units("## 1.2.1 Child"), ["Child text."]);
 }
 
+/// A Windows checkout can give the spec CRLF line endings; its headings, units, and so its hashes
+/// must be the same as in an LF checkout, or trace.toml would pass on one platform only.
+#[test]
+fn crlf_spec_splits_like_lf() {
+    let crlf = SPEC.replace('\n', "\r\n");
+    let lf: Vec<(String, Vec<String>)> =
+        sections(SPEC).into_iter().map(|s| (s.heading, units(&s.lines))).collect();
+    let got: Vec<(String, Vec<String>)> =
+        sections(&crlf).into_iter().map(|s| (s.heading, units(&s.lines))).collect();
+    assert_eq!(got, lf);
+    assert!(got.iter().flat_map(|(_, u)| u).all(|u| !u.contains('\r')));
+}
+
 #[test]
 fn labels_are_found_and_near_misses_are_not() {
     let tla = "S240_5_s6a: x := 1;\nS97_1_ancestor:\n  y := S99_check;\nS12_x := 3;\nS1_a::\nStep: z := 0;\nXS1_a: w := 1;";

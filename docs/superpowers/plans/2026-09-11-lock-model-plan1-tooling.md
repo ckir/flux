@@ -140,6 +140,7 @@ Because 2116 names no property, a configuration that checks a temporal property 
 | `crates/flux-platform/Cargo.toml` | Task 4 | probe dev-dependencies |
 | `crates/flux-platform/tests/fs_semantics.rs` | Task 4 | probes FS-1 to FS-11 (design Section 10) |
 | `.github/workflows/model.yml` | Task 5 | `plan`, `scenario`, `model-gate` (design Section 4) |
+| `models/lockproto/test_workflow.py` | Task 5 | pins the `plan` job's change-detection pattern, no Java |
 | `Cargo.lock` | Tasks 3 and 4 (generated) | new crates |
 
 ---
@@ -183,6 +184,9 @@ Create `models/lockproto/test_run.py`:
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import sys
 import tempfile
 import textwrap
@@ -640,6 +644,68 @@ class MainTests(unittest.TestCase):
             raise KeyboardInterrupt
         run.execute = execute
         self.assertEqual(run.main(["--expected", str(HERE / "expected.toml")]), 2)
+
+    def main_with(self, statuses: dict[tuple[str, bool], str]) -> tuple[int, list[tuple[str, bool]]]:
+        """Run main() over GOOD_EXPECTED with execute() stubbed: each (run, fixed) reports its status, default ok."""
+        d = ExpectedDir()
+        self.addCleanup(d.close)
+        run.ensure_jar = lambda: Path("unused.jar")
+        calls: list[tuple[str, bool]] = []
+
+        def execute(r: run.Run, _jar: Path, _base: Path, fixed: bool) -> run.Result:
+            calls.append((r.name, fixed))
+            status = statuses.get((r.name, fixed), "ok")
+            if status == "raise":
+                raise OSError("cannot write the TLC log")
+            return ExitCodeTests.result(status)
+        run.execute = execute
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = run.main(["--expected", str(d.path / "expected.toml")])
+        return code, calls
+
+    def test_all_runs_ok_is_exit_0(self) -> None:
+        code, calls = self.main_with({})
+        self.assertEqual(code, 0)
+        # The run with an open finding runs twice: as written, then with its fix flag set.
+        self.assertEqual(calls, [("demo-posix-check", False), ("demo-posix-check", True),
+                                 ("demo-posix-liveness", False), ("demo-posix-seeded-SEED_X", False)])
+
+    def test_a_mismatch_is_exit_1_even_beside_a_tooling_failure(self) -> None:
+        code, _ = self.main_with({("demo-posix-check", True): "tooling", ("demo-posix-liveness", False): "mismatch"})
+        self.assertEqual(code, 1)
+
+    def test_a_tooling_failure_alone_is_exit_2(self) -> None:
+        code, _ = self.main_with({("demo-posix-seeded-SEED_X", False): "tooling"})
+        self.assertEqual(code, 2)
+
+    def test_an_error_inside_one_run_is_exit_2_and_later_runs_still_run(self) -> None:
+        code, calls = self.main_with({("demo-posix-check", False): "raise"})
+        self.assertEqual(code, 2)
+        self.assertEqual(calls[-1], ("demo-posix-seeded-SEED_X", False))
+
+    def test_list_scenarios_prints_the_names_as_json_without_java(self) -> None:
+        d = ExpectedDir(GOOD_EXPECTED.replace('scenarios = ["demo"]', 'scenarios = ["demo", "other"]') + """
+[[run]]
+name = "other-posix-liveness"
+module = "M"
+config = "live.cfg"
+scenario = "other"
+kind = "liveness"
+timeout_minutes = 5
+""")
+        self.addCleanup(d.close)
+        # The CI plan job lists scenarios before any Java or TLC setup, so listing must touch neither.
+        run.shutil.which = lambda _name: None
+
+        def refuse(*_args: object) -> Path:
+            raise AssertionError("--list-scenarios must not fetch or run TLC")
+        run.ensure_jar = refuse
+        run.execute = refuse
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = run.main(["--expected", str(d.path / "expected.toml"), "--list-scenarios"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue()), ["demo", "other"])
 
 
 class CommandTests(unittest.TestCase):
@@ -1485,7 +1551,7 @@ differs, stop: the pinned TLC does not behave as measured, and the parser consta
 - [ ] **Step 8: Run the unit tests to see them pass**
 
 Run: `python3 -W error -m unittest discover -s models/lockproto -p "test_*.py"`
-Expected: `Ran 58 tests` and `OK`.
+Expected: `Ran 63 tests` and `OK`.
 
 - [ ] **Step 9: Run the self-test end to end**
 
@@ -1550,7 +1616,7 @@ model-test:
 - [ ] **Step 2: Run the recipes**
 
 Run: `just model selftest`, then `just model-test`, then `just model nope; echo $?`
-Expected: the four `OK` lines and `run.py: 4 runs, exit 0`; then `Ran 58 tests` and `OK`; then `run.py: unknown
+Expected: the four `OK` lines and `run.py: 4 runs, exit 0`; then `Ran 63 tests` and `OK`; then `run.py: unknown
 scenario 'nope'; known: selftest`, a `just` error line, and a non-zero status.
 
 - [ ] **Step 3: Add the recommended tools**
@@ -1609,7 +1675,7 @@ and traceability check, the filesystem probes, and CI. Plan 2 adds `FsModel.tla`
 |---|---|---|
 | `just model` | runs every run in `expected.toml` | Java 11+, Python 3.11+ |
 | `just model <scenario>` | runs one scenario, for example `just model selftest` | Java 11+, Python 3.11+ |
-| `just model-test` | unit tests of `run.py` (recorded TLC output, no Java) | Python 3.11+ |
+| `just model-test` | unit tests of `run.py` (recorded TLC output, no Java) and of the CI workflow's change detection | Python 3.11+ |
 | `just model-stamp` | runs `just model`, then rewrites the unit hashes in `trace.toml` if every run matched | Java, Python, Rust |
 
 `run.py` downloads `tla2tools.jar` (release and SHA-256 pinned in `run.py`) into `target/tla/`, checks its hash
@@ -1634,6 +1700,7 @@ runs write their TLC state and logs under `target/tla/`, keyed by run name.
 | `expected.toml` | every TLC run and what it must report (design Section 4) |
 | `configs/*.cfg` | one TLC configuration per run |
 | `run.py`, `test_run.py` | the runner and its unit tests |
+| `test_workflow.py` | checks the path pattern `.github/workflows/model.yml` uses to decide whether to run the scenarios |
 | `testdata/` | recorded TLC output for the unit tests; `record_fixtures.py` re-records it after the TLC pin changes |
 | `Smoke.tla` | runner self-test model (the `selftest` scenario); not part of the protocol |
 | `spec-sections.stamp` | the spec file and the spec headings the model encodes (design Section 9) |
@@ -2367,6 +2434,19 @@ fn child_heading_text_is_not_part_of_its_parent() {
     assert_eq!(section_units("## 1.2.1 Child"), ["Child text."]);
 }
 
+/// A Windows checkout can give the spec CRLF line endings; its headings, units, and so its hashes
+/// must be the same as in an LF checkout, or trace.toml would pass on one platform only.
+#[test]
+fn crlf_spec_splits_like_lf() {
+    let crlf = SPEC.replace('\n', "\r\n");
+    let lf: Vec<(String, Vec<String>)> =
+        sections(SPEC).into_iter().map(|s| (s.heading, units(&s.lines))).collect();
+    let got: Vec<(String, Vec<String>)> =
+        sections(&crlf).into_iter().map(|s| (s.heading, units(&s.lines))).collect();
+    assert_eq!(got, lf);
+    assert!(got.iter().flat_map(|(_, u)| u).all(|u| !u.contains('\r')));
+}
+
 #[test]
 fn labels_are_found_and_near_misses_are_not() {
     let tla = "S240_5_s6a: x := 1;\nS97_1_ancestor:\n  y := S99_check;\nS12_x := 3;\nS1_a::\nStep: z := 0;\nXS1_a: w := 1;";
@@ -2472,14 +2552,14 @@ fn rewrite_updates_only_hash_lines() {
 - [ ] **Step 4: Run it**
 
 Run: `cargo test --test model_stamp`
-Expected: `test result: ok. 19 passed; 0 failed; 1 ignored` (the ignored one is `rewrite_unit_hashes`).
+Expected: `test result: ok. 20 passed; 0 failed; 1 ignored` (the ignored one is `rewrite_unit_hashes`).
 
 - [ ] **Step 5: Prove the step rule is load-bearing**
 
 Temporarily change the last line of `is_step` from `digits > 0 && text[digits..].starts_with(". ")` to
 `false && digits > 0`, run `cargo test --test model_stamp`, and expect exactly four failures:
 `complete_map_passes`, `indented_numbered_steps_are_units`, `numbered_steps_are_units_and_keep_indented_lines`, and
-`numbered_steps_inside_a_fence_are_units`. Restore the line and rerun: 19 passed.
+`numbered_steps_inside_a_fence_are_units`. Restore the line and rerun: 20 passed.
 
 - [ ] **Step 6: Add the `model-stamp` recipe**
 
@@ -2495,7 +2575,7 @@ model-stamp:
 
 Run (`trace.toml` is not committed yet, so compare against a copy rather than with `git diff`):
 `cp models/lockproto/trace.toml "${TMPDIR:-/tmp}/trace.before" && just model-stamp && cmp "${TMPDIR:-/tmp}/trace.before" models/lockproto/trace.toml && echo UNCHANGED`
-Expected: `run.py: 4 runs, exit 0`, then `test rewrite_unit_hashes ... ok` with `19 filtered out`, then `UNCHANGED`.
+Expected: `run.py: 4 runs, exit 0`, then `test rewrite_unit_hashes ... ok` with `20 filtered out`, then `UNCHANGED`.
 
 - [ ] **Step 7: Format and lint as the gate does**
 
@@ -2973,7 +3053,7 @@ git commit -m "model: filesystem probes FS-1 to FS-11 (lock-model plan 1, task 4
 detection; the empty-matrix rule).
 
 **Files:**
-- Create: `.github/workflows/model.yml`
+- Create: `.github/workflows/model.yml`, `models/lockproto/test_workflow.py`
 
 - [ ] **Step 0: State check**
 
@@ -3172,10 +3252,69 @@ scratch="${TMPDIR:-/tmp}/rename-check"; rm -rf "$scratch"; mkdir -p "$scratch/mo
 
 Expected: `event=pull_request touching=true matrix=["selftest"]` (without `--no-renames` it reads `touching=false`).
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: Pin the change-detection pattern**
+
+If the `pattern=` line stopped matching a watched path, CI would skip every scenario and `model-gate` would still
+pass, so a unit test reads the pattern from the workflow and checks it against watched paths and near misses.
+
+Create `models/lockproto/test_workflow.py`:
+
+````python
+"""Tests of the model workflow's plan step (.github/workflows/model.yml). Standard library only."""
+
+from __future__ import annotations
+
+import re
+import unittest
+from pathlib import Path
+
+WORKFLOW = Path(__file__).resolve().parent.parent.parent / ".github" / "workflows" / "model.yml"
+
+
+class ChangePatternTests(unittest.TestCase):
+    """The workflow runs the scenarios only when a changed path matches its plan step's pattern.
+
+    A path that should match but does not makes CI skip every scenario while the model gate still
+    passes, so both directions are pinned here.
+    """
+
+    def setUp(self) -> None:
+        found = re.findall(r"^\s*pattern='([^']*)'$", WORKFLOW.read_text(encoding="utf-8"), re.M)
+        self.assertEqual(len(found), 1, "model.yml must set pattern= exactly once")
+        # grep -E and Python's re agree on everything this pattern uses: ^ $ ( | ) [^/] * and \.
+        self.pattern = re.compile(found[0])
+
+    def test_watched_paths_match(self) -> None:
+        for path in ("models/lockproto/run.py", "models/lockproto/configs/selftest-check.cfg",
+                     "FLUX_FULL_UPDATED_SPEC_V16.md", "FLUX_FULL_UPDATED_SPEC_V17.md",
+                     "crates/flux-platform/tests/fs_semantics.rs", "justfile", ".github/workflows/model.yml"):
+            with self.subTest(path=path):
+                self.assertIsNotNone(self.pattern.search(path))
+
+    def test_near_misses_do_not_match(self) -> None:
+        for path in ("docs/models/notes.md", "FLUX_FULL_UPDATED_SPEC_V16.md.bak", "docs/FLUX_FULL_UPDATED_SPEC_V16.md",
+                     "FLUX_FULL_UPDATED_SPEC_V16/notes.md", "crates/flux-platform/tests/fs_semantics.rs.orig",
+                     "crates/flux-platform/src/lib.rs", "justfile.bak", "crates/justfile",
+                     ".github/workflows/ci.yml", ".github/workflows/model.yml.disabled"):
+            with self.subTest(path=path):
+                self.assertIsNone(self.pattern.search(path))
+
+
+if __name__ == "__main__":
+    unittest.main()
+````
+
+Run: `just model-test`
+Expected: `Ran 65 tests` and `OK`.
+
+Then prove the test can fail: temporarily delete `models/|` from the `pattern=` line in `model.yml` and rerun
+`just model-test`. Expect `FAILED (failures=2)`, both in `test_watched_paths_match` (the two `models/` paths).
+Restore the line and rerun: `OK`.
+
+- [ ] **Step 5: Commit**
 
 ```bash
-git add .github/workflows/model.yml
+git add .github/workflows/model.yml models/lockproto/test_workflow.py
 git commit -m "model: CI workflow with plan, scenario, and model-gate jobs (lock-model plan 1, task 5)"
 ```
 
@@ -3188,7 +3327,7 @@ git commit -m "model: CI workflow with plan, scenario, and model-gate jobs (lock
 - [ ] **Step 1: Run the repository gate**
 
 Run: `just check`
-Expected: exit 0; nextest's summary reads `29 tests run: 29 passed, 1 skipped` (1 existing integration test, 19
+Expected: exit 0; nextest's summary reads `30 tests run: 30 passed, 1 skipped` (1 existing integration test, 20
 stamp tests, 9 probes; nextest does not count the skipped `rewrite_unit_hashes` as run).
 
 - [ ] **Step 2: Run the dependency audit**
