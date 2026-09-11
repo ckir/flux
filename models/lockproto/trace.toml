@@ -1,0 +1,13 @@
+# Traceability map of the lock-protocol model (design Section 9.1).
+#
+# One [[unit]] per unit of each heading listed in spec-sections.stamp:
+#
+#   [[unit]]
+#   heading = "## 240.5 `--break-lock`"   # the heading line exactly as in the spec
+#   ordinal = 2                            # the unit's position in that heading's own text
+#   quote = "Open the existing lock file"  # a sentence of the unit
+#   hash = "<BLAKE3 hex>"                  # written by `just model-stamp`
+#   labels = ["S240_5_s2"]                 # PlusCal labels that implement it, or
+#   # not_modelled = "<reason>"            # instead of labels
+#
+# Headings enter the stamp as the model encodes them (plan 2 onward).

@@ -73,6 +73,11 @@ model scenario="":
 model-test:
     {{python}} -W error -m unittest discover -s models/lockproto -p "test_*.py"
 
+# Rewrite trace.toml's unit hashes; runs the whole model check first and stops if it fails
+model-stamp:
+    {{python}} models/lockproto/run.py
+    cargo test --test model_stamp -- --ignored rewrite_unit_hashes --exact
+
 # Mutation testing over the engine
 mutants:
     cargo mutants --package flux-core
