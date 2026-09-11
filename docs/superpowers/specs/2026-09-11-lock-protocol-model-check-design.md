@@ -96,8 +96,8 @@ The runner, `run.py`:
 - exits 0 when every run matched, 1 when any run's result did not match, and 2 for a tooling failure (Java missing,
   download or checksum failure, TLC crash, out of memory, or timeout), naming the cause. A run that times out is
   reported as `TIMEOUT` with the states explored so far, never as a witness that was not violated, because a partial
-  state space cannot show that a path is unreachable; a timeout in any run makes the exit code 2 even if other runs
-  mismatched.
+  state space cannot show that a path is unreachable. When both happen, a mismatch outranks a tooling failure: the exit
+  code is 1 if any run completed with an unexpected result, otherwise 2 if any run hit a tooling failure.
 
 Recipes and CI:
 
@@ -308,11 +308,18 @@ re-check the model against the changed text, update the model, run `just model`,
 
 ### 9.1 Traceability check
 
-`trace.toml` is the single traceability map: one entry per spec step of the stamped headings, each with the spec
-sentence it covers (quoted) and either the labels that implement it or `not_modelled = "<reason>"`. The same test file
-checks, without Java, that every label in `LockProtocol.tla` and `Claims.tla` (matched by `S\d+(_\d+)*_\w+:`) appears
-in `trace.toml`, that every label `trace.toml` names exists in a model file, and that every stamped heading has at
-least one entry. The README renders the map for readers but is not the source of truth.
+`trace.toml` is the single traceability map. Its unit is a spec unit of a stamped heading's own text (Section 9): a
+numbered step where the heading has numbered steps, otherwise each block of that text separated by blank lines
+(fenced blocks included, split at their blank lines too). Each entry names its heading and the unit's ordinal, quotes
+a sentence from that unit, and gives either the labels that implement it or `not_modelled = "<reason>"`. The same
+test file checks, without Java:
+
+- every unit of every stamped heading has exactly one entry, and each quoted sentence occurs in its unit;
+- every label in `LockProtocol.tla` and `Claims.tla` (matched by `S\d+(_\d+)*_\w+:`) appears in `trace.toml`;
+- every label `trace.toml` names exists in a model file.
+
+Because units are counted from the spec text, an entry cannot be left out, and a spec edit that adds a unit fails the
+check until the map covers it. The README renders the map for readers but is not the source of truth.
 
 ## 10. Filesystem probes
 
