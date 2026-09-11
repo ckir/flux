@@ -1,6 +1,6 @@
 # Lock-protocol model check — design
 
-Date: 2026-09-11. Status: approved design, revised after adversarial review round 1; awaiting implementation plan.
+Date: 2026-09-11. Status: approved design, revised after adversarial review rounds 1 and 2; awaiting implementation plan.
 Branch: `model/lock-protocol`, on top of `spec/v16-resolution`.
 
 ## 1. Goal
@@ -19,7 +19,7 @@ the protocol still makes progress, and stay tied to the spec text.
 | Decision | Choice |
 |---|---|
 | What the work leaves behind | A living model in the repository, run by `just` and CI, that must stay green whenever the spec's lock sections change. Findings become spec fixes. |
-| Scope | Lock replacement core; crashes at every step and torn lock records; nested destination roots; claims with COMMIT. |
+| Scope | Lock replacement core; crashes at every step and torn lock records; nested destination roots; claims with COMMIT; and (added by the owner after review round 2) Section 96.1's directory-lock fallback and its announce-then-check exclusion. |
 | Filesystem semantics | Two configurations of one filesystem model: POSIX and Windows (plus a weak-identity variant, Section 5). |
 | Method | TLA+/PlusCal checked with TLC, plus Rust tests that confirm the filesystem assumptions on real operating systems. Chosen independently by the owner's two reviewers (Claude and agy). |
 
@@ -29,7 +29,7 @@ These sections are the model's contract. The drift stamp (Section 9) hashes exac
 
 | Section | Rule | Model |
 |---|---|---|
-| 96.1 | Target lock file created exclusively; classification when creation fails (another operation's record, this operation's record for a different spelling, unreadable, foreign); OS-native lock for liveness; in-place overwrite only by a takeover | LockProtocol (the different-spelling branch is "not modelled": LockProtocol uses one spelling per target; that branch is a deterministic comparison with no interleaving and is pinned by spec acceptance test 54) |
+| 96.1 | Target lock file created exclusively; classification when creation fails (another operation's record, this operation's record for a different spelling, unreadable, foreign); OS-native lock for liveness; in-place overwrite only by a takeover; the directory-lock fallback `P/.flux-dir.lock` and its announce-then-check exclusion with per-name locks; the root lock `T/.flux-root.lock` | LockProtocol. Two parts are "not modelled": the different-spelling branch (LockProtocol uses one spelling per target; the branch is a deterministic comparison with no interleaving, pinned by spec acceptance test 54) and the root lock (the same exclusive creation at a different path, which adds no interleaving to an abstract lock path) |
 | 96.2 | A lock refusal reports the holder | LockProtocol (report content is not checked, only that the refusal happens) |
 | 97.1 | Nested destination roots: ancestor check after creating one's own lock; descendant check before creating or writing into a directory | LockProtocol |
 | 99 | Commit-time revalidation: "still owned" for every lock held; failure outcomes; supersession checked before cancellation | LockProtocol, Claims |
@@ -51,7 +51,7 @@ models/lockproto/
     configs/*.cfg          one per run (Section 12): check runs, liveness runs, seeded runs
     expected.toml          the run list and each run's expected result (format below)
     trace.toml             the traceability map: every label and every spec step (Section 9.1)
-    run.py                 the runner (Python 3, standard library only)
+    run.py                 the runner (Python 3.11 or later, standard library only: it reads TOML with tomllib)
     spec-sections.stamp    drift stamp (Section 9)
     README.md              traceability table, probe table, bounds, unverified assumptions, how to run
 tests/model_stamp.rs     the drift-stamp test (Section 9)
@@ -66,7 +66,7 @@ crates/flux-platform/tests/fs_semantics.rs    the filesystem probes (Section 10)
 | `name` | unique run name, used in CI and in the runner's report |
 | `module` | `LockProtocol` or `Claims` |
 | `config` | path of the `.cfg` file |
-| `scenario` | the Section 12 scenario the run belongs to; CI groups runs by it |
+| `scenario` | the Section 12 scenario the run belongs to; one of the names in `expected.toml`'s top-level `scenarios` list, which is the only place scenario names are defined; CI builds its matrix from that list |
 | `kind` | `check`, `liveness`, or `seeded` |
 | `violated` | for `check`: the exact set of witness invariants that must be reported violated; for `seeded`: the one invariant or property that must be the first violation; absent for `liveness` |
 | `timeout_minutes` | the run's time limit |
@@ -86,11 +86,17 @@ checked by the witnesses and the liveness properties instead.
 
 The runner, `run.py`:
 
+- stops with exit code 2 before running anything if Python is older than 3.11, if `expected.toml` is malformed, if a
+  run's `scenario` is not in the `scenarios` list, if a listed scenario has no runs, or if `--scenario NAME` names an
+  unknown scenario; `--list-scenarios` prints the `scenarios` list as a JSON array;
 - downloads a pinned `tla2tools.jar` (exact release chosen in the plan) into `target/tla/` and verifies its SHA-256
   before every use, including a cached copy; on a mismatch it deletes the file and downloads once more, and if the
   hash still does not match it stops with exit code 2;
 - runs the selected runs (all, or one scenario with `--scenario NAME`), each under its `timeout_minutes`, killing TLC
-  on timeout;
+  on timeout; a run that fails in any way does not stop the others, so one report covers every selected run;
+- runs TLC with `-tool`, whose output marks each message with a numeric message code, and decides each run's result
+  from the invariant-violation and property-violation messages and the names they carry; the plan pins those codes
+  against the pinned TLC release and keeps a recorded TLC log as a test fixture for the parser;
 - prints one line per run (name, expected, observed, states found, duration) and, for every unexpected result, the
   first 60 states of TLC's trace, saving the full TLC output under `target/tla/out/<name>.log`;
 - exits 0 when every run matched, 1 when any run's result did not match, and 2 for a tooling failure (Java missing,
@@ -101,16 +107,30 @@ The runner, `run.py`:
 
 Recipes and CI:
 
-- `just model` runs every run; `just model scenario=<name>` runs one scenario; `just model-stamp` rewrites the stamp
-  (Section 9). None of these is part of `just check`, which stays Java-free.
-- `.github/workflows/model.yml` runs on pushes and pull requests to `main` that touch `models/**`,
-  `FLUX_FULL_UPDATED_SPEC_V16.md`, `crates/flux-platform/tests/fs_semantics.rs`, or the workflow itself, and on
-  manual dispatch. It has one matrix job per Section 12 scenario, each installing Java with `actions/setup-java`
-  (Temurin 21) and running `just model scenario=<name>`; the job uploads `target/tla/out/` when it fails.
+- `just model` runs every run; `just model scenario=<name>` runs one scenario; `just model-stamp` runs `just model`
+  first and rewrites the stamp (Section 9) only if every run matched. None of these is part of `just check`, which
+  stays Java-free.
+- `.github/workflows/model.yml` runs on every pull request to `main`, on pushes to `main`, and on manual dispatch, in
+  three jobs:
+  1. `plan` checks out the repository, decides whether the change touches `models/**`, the spec file (glob
+     `FLUX_FULL_UPDATED_SPEC_V*.md`), `crates/flux-platform/tests/fs_semantics.rs`, or the workflow itself (manual
+     dispatch always counts as touching), and outputs `run.py --list-scenarios` as the matrix, or an empty matrix
+     when nothing relevant changed;
+  2. `scenario`, one matrix job per scenario name and skipped when the matrix is empty (GitHub rejects an empty
+     matrix, so the job carries a condition on `plan`'s output), installs Java with `actions/setup-java` (Temurin 21) and Python
+     with `actions/setup-python` (3.12), runs `just model scenario=<name>`, and uploads `target/tla/out/` when it
+     fails;
+  3. `model-gate` always runs after the others and fails if `plan` failed, if any `scenario` job failed or was
+     cancelled, or if `scenario` was skipped although the matrix was not empty; it passes when the matrix was empty.
+  Because the matrix comes from `expected.toml`, a run can never belong to a scenario CI does not run.
 - The drift-stamp test and the filesystem probes are ordinary Rust tests, so `just check` and the existing
   Linux/macOS/Windows test job run them.
-- `.claude/recommended-tools.json` gains entries for Java and Python 3, the two non-Rust tools `just model` needs.
-- Whether the `model` job becomes a required status check is left to the owner and is outside this design.
+- `.claude/recommended-tools.json` gains entries for Java 21 and Python 3.11 or later, the two non-Rust tools
+  `just model` needs.
+- The stamp and traceability tests (Section 9) are mechanical: they can be made to pass by rewriting the stamp
+  without re-checking the model. Only the TLC runs check the model against the changed text, so the design
+  recommends that the owner make `model-gate` a required status check; `model-gate` always reports, so requiring it
+  never blocks a pull request that does not touch the model.
 
 ## 5. Filesystem model (`FsModel.tla`)
 
@@ -118,7 +138,7 @@ State:
 
 | Variable | Meaning |
 |---|---|
-| `entries` | per directory, entry name → file object id; two names are the same entry when `Fold` maps them to the same class |
+| `entries` | per directory, entry name → file object id; two names are the same entry when `Fold` maps them to the same class. Object ids are never reused; they index `content`, `durable`, `handles`, and `oslock` |
 | `content` | object id → `Record(op, kind)` (kind: `operation` or `cleanup`), `Torn`, or `Foreign`: what a reader sees now |
 | `durable` | object id → the content that survives a crash |
 | `handles` | set of `[proc, obj, shareDelete]` |
@@ -140,7 +160,8 @@ Each row is grounded by a filesystem probe (Section 10) where a real platform ca
 | unlink | succeeds even if the object is open and OS-locked; open handles keep writing to the now-unnamed object | succeeds only if every open handle has `shareDelete` |
 | write a lock record | two steps: `WriteBegin` sets `content` to `Torn`, `WriteEnd` sets it to the new record; a reader in between sees `Torn` | same |
 | flush | copies `content` to `durable` | same |
-| identity of a name | the object id the name maps to; under `IdentityStrength = Weak` it may instead be the id of an object that name held earlier | same |
+| identity of a name | reports an identity value: under `IdentityStrength = strong`, the id of the object the name maps to; under `weak`, either that id or the id of an object the name held earlier. Only the reported value can repeat; the objects stay distinct | same |
+| list a directory | not atomic: `ListBegin`, then one `ListNext` step per name in the directory's name set, in any order, each reading that name's entry at that moment; an entry present for the whole listing is always returned, one created or removed during it may or may not be | same |
 
 Constants: `Platform ∈ {"posix", "windows"}`; `Fold`, the name-equivalence map (identity, or case folding);
 `IdentityStrength ∈ {"strong", "weak"}`, where `weak` stands for FAT32/exFAT-like identity that CI cannot probe;
@@ -150,7 +171,11 @@ so TLC explores every combination; the spec does not yet state these values, and
 to find which combinations are unsafe (Section 11). Once the spec states them, the configurations switch to the
 record.
 
-### 5.2 In-flight calls and crashes
+### 5.2 Atomicity, in-flight calls, and crashes
+
+Each row of the operations table is one atomic step, and each PlusCal label performs at most one filesystem
+operation. A spec step that makes several filesystem calls (for example open, OS-lock attempt, then read) is
+therefore several labels, and other actors can run between them.
 
 A data write or rename that an operation issues as part of publishing is two steps: issue, then complete. Other
 actors' steps can run between them, and the call's effect lands at completion. This is how the model represents a
@@ -172,8 +197,9 @@ At most two crashes happen in one run, counted across all actors.
 
 Each PlusCal label is named `S<section>_<step>` after the spec step it implements, with dots in the section number
 written as underscores. Where the spec numbers its steps, `<step>` is `s` and the number: Section 240.5 step 6 is
-`S240_5_s6`. Where the spec states a rule without numbered steps (96.1, 97.1, 99, 120, 241.5), `<step>` is a short
-name defined in `trace.toml` next to the spec sentence it implements, for example `S97_1_ancestor`. A step that needs
+`S240_5_s6`. Where a heading has no numbered steps (for example 96.1, 97.1, 99, 120, 182, 183, 241.5), `<step>` is a
+short name defined in `trace.toml` next to the spec sentence it implements, for example `S97_1_ancestor` or
+`S182_prepare`. A step that needs
 more than one atomic action gets suffixes `a`, `b`, and so on (`S240_5_s6a`).
 
 Encodings: a lock record is a TLA+ record `[op |-> <operation id>, kind |-> "operation" | "cleanup"]`; `Torn`,
@@ -182,7 +208,8 @@ Encodings: a lock record is a TLA+ record `[op |-> <operation id>, kind |-> "ope
 | Actor | Behaviour |
 |---|---|
 | Owner | A normal operation: acquires the target lock (96.1) and holds its OS-native lock, runs its ancestor check (97.1 a), publishes with a Section 99 check before each write, releases the lock at completion; may crash |
-| StalledOwner | An owner that stops making progress at any point, may later resume (its next Section 99 check then runs), may release its lock, or may have a call in flight that completes later |
+| StalledOwner | An owner that stops making progress at any point and may later resume (its next Section 99 check then runs, and if the check fails it stops, closing its handles), may resume and complete normally, or may have a call in flight that completes later |
+| DirOwner | An owner whose target name is too long for a per-name lock: takes `P/.flux-dir.lock` and lists `P` for per-name locks (96.1 announce-then-check); may crash |
 | PlainRun | A new invocation without flags: classifies what it finds (21.1 table, 96.1, 120, 240) and acts or refuses |
 | Recoverer | A new invocation that finds a dead owner's lock and runs 240.3 steps 1-5 |
 | Breaker | `flux copy --restart --break-lock`: 240.5 steps 1-6, then 21.1 steps 2-5 |
@@ -190,12 +217,18 @@ Encodings: a lock record is a TLA+ record `[op |-> <operation id>, kind |-> "ope
 | Cleanup | `flux cleanup DEST`: classifies and removes orphan, dead, and cleanup locks via 240.3 |
 | NestedOwner | An owner whose destination is a child of another owner's destination (97.1) |
 
-Classification of a lock's owner combines an OS-native lock attempt with an oracle:
+Classification of a lock is a sequence of labelled filesystem steps followed by one judgement (Section 5.2): open the
+lock file, attempt its OS-native lock without blocking, read the record, then judge the owner:
 
-- If the owner holds the OS-native lock, a non-blocking attempt by another process fails, and the classifier sees
-  the owner as live. An owner releases its OS-native lock only by crashing or by releasing the lock at completion.
-- Otherwise the oracle decides, consistent with the truth: live only if the owner is alive, dead only if it has
-  crashed, uncertain in either case. Two classifiers may disagree at different moments, as Section 240 allows.
+- If the OS-native lock attempt failed because the owner holds it, the classifier sees the owner as live. An owner
+  gives up its OS-native lock only by crashing, by completing, or by stopping after a failed Section 99 check (it
+  closes its handles); none of these removes a lock file whose record is not its own.
+- Otherwise an oracle decides the part of Section 240.2 and 240.3 evidence that is not a filesystem fact (whether the
+  owner's process or host still exists), consistent with the truth: live only if the owner is alive, dead only if it
+  has crashed, uncertain in either case. Two classifiers may disagree at different moments, as Section 240 allows.
+
+Because the steps are separate, the lock file can be renamed, unlinked, or rewritten between the open and the read,
+and the classifier then judges what its handle reads.
 
 Ghost variables, used only by the properties: `classified[p]`, the last classification each process made of the lock
 path (live, dead, uncertain, cleanup lock, foreign, empty), and `lastRecord[path]`, the record most recently present
@@ -230,10 +263,11 @@ Safety invariants, which must hold in every reachable state:
 | `ForeignUntouched` | A `Foreign` object at a lock path is never written, renamed, or deleted. |
 | `Classifiable` | In every state, the object at each lock path classifies into exactly one case: live, dead, uncertain, cleanup lock, or foreign; a `Torn` record classifies as uncertain. |
 | `NestedExclusion` | Two operations whose destinations nest never both write objects under the inner destination. |
+| `DirLockExclusion` | A per-name lock holder and a directory-lock holder in the same directory `P` are never both past their 96.1 check. |
 | `NoSilentOverwrite` (Claims) | No target overwrites an entry this operation already published. |
 | `CommittedHasClaim` (Claims) | Every target with COMMIT has its created-entry claim. |
 | `NoSelfCollision` (Claims) | A resumed target never collides with its own claim; a hardlink dependent whose name maps to a different entry never collides with its group's claims; a dependent folded onto its canonical's entry is reported as a collision. |
-| `NoPublishAfterLockLost` (Claims) | No rename happens after `LockLost` unless the worker's revalidation ran before `LockLost`. |
+| `NoPublishAfterLockLost` (Claims) | No rename lands after `LockLost` unless it was issued (in flight, Section 5.2) before `LockLost`: the same single exception `SingleWriter` accepts, following 240.5's "a filesystem call it had already started can still complete". A revalidation that passed before `LockLost` does not by itself permit a later rename. |
 
 Reachability witnesses, which every `check` run must report violated, proving each path is reachable. Each witness
 is the negation of a ghost flag that only the named procedure's final label sets (for example, `recovered` is set
@@ -249,6 +283,8 @@ only by a Recoverer at `S240_3_s5`), so an end state reached by some other path 
 | `NeverTornRead` | a process reads a `Torn` record |
 | `NeverInFlightAfterTakeover` | a stalled owner's in-flight call completes after a takeover |
 | `NeverClassifiedCleanupLock` | a PlainRun or Recoverer classifies a cleanup lock |
+| `NeverDirLockAcquired` | a DirOwner passes its 96.1 check holding the directory lock |
+| `NeverDirLockBackoff` | a per-name or directory acquirer backs off on a 96.1 conflict |
 | `NeverCommittedWithClaim` (Claims) | a target commits with its claim |
 | `NeverLockLostMidCommit` (Claims) | `LockLost` happens between a PREPARE_COMMIT and its rename |
 
@@ -279,9 +315,10 @@ ability to see that defect and the run fails.
 | `SEED_RENAME_OVER_TAKEOVER` | takeover by renaming a new record over the lock (round 3) | `breaklock` | `SingleWriter` |
 | `SEED_NO_IDENTITY_RECHECK` | 240.5 step 6 skips its identity check after the write (round 6) | `breaklock` | `SingleWriter` |
 | `SEED_CLEANUP_LOCK_UNVERIFIABLE` | Section 120 rejects `workspace_path = none` (round 6) | `cleanup-crash` | `DeadLockEventuallyCleared` |
-| `SEED_TORN_AS_FOREIGN` | a checksum-failing record is treated as a foreign object (round 5) | `recovery` | `UncertainLockEventuallyCleared` |
+| `SEED_TORN_AS_FOREIGN` | a checksum-failing record is treated as a foreign object (round 5); `mixed` has both a record torn by the Owner's crash and a Breaker, the only actor that can clear it | `mixed` | `UncertainLockEventuallyCleared` |
 | `SEED_NO_ANCESTOR_CHECK` | 97.1 (a) skipped | `nested` | `NestedExclusion` |
 | `SEED_DESCENDANT_EXISTING_ONLY` | 97.1 (b) checks only directories that already exist (round 2) | `nested` | `NestedExclusion` |
+| `SEED_CHECK_BEFORE_ANNOUNCE` | the directory acquirer lists `P` before creating `P/.flux-dir.lock` (96.1's announce-then-check order reversed) | `dirlock` | `DirLockExclusion` |
 | `SEED_CLAIM_AFTER_COMMIT` | created-entry claim written after COMMIT (round 6, CPE-4) | `claims` | `CommittedHasClaim` |
 | `SEED_CLAIM_BY_OBJECT_ID` | claims keyed by object identity (round 3) | `claims` | `NoSelfCollision` |
 | `SEED_NO_PUBLICATION_CLAIM` | publications do not claim the entry they create (round 2) | `claims` | `NoSilentOverwrite` |
@@ -292,7 +329,10 @@ without symmetry. Every later fix that the model drives adds a row here.
 
 ## 9. Spec-drift stamp
 
-`spec-sections.stamp` has one line per spec heading the model encodes, listed individually (96.1, 96.2, 97.1, 99,
+`spec-sections.stamp` begins with one line `spec: <path>` naming the spec file relative to the repository root; this
+is the only place the model tooling names it, and the test fails if that file does not exist, so renaming the spec
+(a V17) fails `just check` until the stamp names the new file. Then it has one line per spec heading the model
+encodes, listed individually (96.1, 96.2, 97.1, 99,
 21.1, 240.1, 240.2, 240.3, 240.4, 240.5, 251.1, 251.2, 259.6, 120, 241.5, 182, 183): the BLAKE3 hash of that
 heading's own text in lowercase hex, two spaces, then the heading line exactly as it appears in the spec. A heading's
 own text runs from its heading line up to, not including, the next heading line of any level, so a subsection the
@@ -302,8 +342,9 @@ encode is listed as its own line.
 
 `tests/model_stamp.rs`, an auto-discovered test target of the root package (so `just check` runs it), recomputes the
 hashes. It fails, naming each section, if a hash differs, a listed heading is missing, or a heading appears more than
-once. `blake3` is added to the root package's `[dev-dependencies]` from the workspace. The same file holds an
-`#[ignore]`d test that rewrites the stamp; `just model-stamp` runs only that test. The workflow after a spec change:
+once. `blake3` is added to the root package's `[dev-dependencies]` from the workspace, and `toml` (added to
+`[workspace.dependencies]`, subject to `deny.toml`) for reading `trace.toml`. The same file holds an `#[ignore]`d
+test that rewrites the stamp; `just model-stamp` runs it after a green `just model` (Section 4). The workflow after a spec change:
 re-check the model against the changed text, update the model, run `just model`, then run `just model-stamp`.
 
 ### 9.1 Traceability check
@@ -343,8 +384,13 @@ held (a second handle's non-blocking attempt fails) before it renames.
 | FS-7 | renaming or deleting a file open with delete-sharing succeeds | Windows |
 | FS-8 | a name replaced by a new file reports a different file identity | all |
 | FS-9 | closing a handle releases its OS-native lock | all |
+| FS-10 | a directory listing returns every entry that exists for the whole listing, including one created just before it starts | all |
 
-A failing probe means the model's assumption for that platform is wrong: the model is fixed, not the probe.
+Each probe prints the filesystem type of its scratch directory (`statfs` on Unix, `GetVolumeInformationW` on Windows).
+A failing probe is never weakened to pass. It is triaged first as environment or platform: if the filesystem type is
+not the platform's usual local one (for example an overlay or network filesystem on a runner), the failure is
+reproduced on a native local filesystem of that platform before anything changes; if it reproduces, the model's
+assumption for that platform is wrong and the model is fixed.
 `IdentityStrength = weak` and case-folding behaviour of FAT32/exFAT cannot run on CI runners; the README lists them
 as unverified assumptions.
 
@@ -356,8 +402,19 @@ A counterexample in a `check` or `liveness` run is saved with its trace and tria
 - Spec defect: fixed in the spec on the spec branch. A design fork goes through an agy-first consult and then to the
   owner. The fix gets a new seeded configuration (Section 8), and the stamp is updated.
 
-The expected first finding is the Windows sharing mode: with `ShareMode = "any"`, some combination of open sites
-without delete-sharing should break an invariant, which forces the spec to state the mode at each open site.
+Findings the design already expects, each to be confirmed or refuted by the first runs:
+
+- Windows sharing mode: with `ShareMode = "any"`, some combination of open sites without delete-sharing should break
+  an invariant, which forces the spec to state the mode at each open site.
+- The check-to-call window: Section 99 requires revalidation and rename "without an intervening operation-state
+  transition that would invalidate ownership", while Section 240.5 accepts only a call "already started" when a
+  takeover lands. A takeover between a passing check and the issue of the call is covered by neither, and no
+  implementation can close that window, so `SingleWriter` and `NoPublishAfterLockLost` should report it; the fix
+  is a spec statement of the accepted window.
+- The directory acquirer lists `P` "for *.flux-lock held by other operations" (96.1), without saying whether a dead or
+  uncertain owner's per-name lock counts as held. The model classifies each listed lock as Section 240 does and treats
+  live and uncertain as held and dead as not, as 97.1 (a) does for ancestor locks; `trace.toml` records this reading
+  as an assumption until the spec states it.
 
 ## 12. Scenarios, bounds, and time budget
 
@@ -372,17 +429,23 @@ them apart keeps each state space small.
 | `cleanup` | StalledOwner, CleanupBreaker, Breaker | POSIX, Windows | `NeverBrokeLock`, `NeverInFlightAfterTakeover` |
 | `cleanup-crash` | CleanupBreaker (crashes), PlainRun, Recoverer, Cleanup | POSIX, Windows | `NeverClassifiedCleanupLock`, `NeverCleanedUp` |
 | `nested` | Owner on the parent destination, NestedOwner on the child, PlainRun | POSIX | `NeverAcquired` |
+| `dirlock` | two Owners with per-name locks on different targets in one directory `P` (one may crash), DirOwner (may crash), Recoverer | POSIX, Windows | `NeverAcquired`, `NeverDirLockAcquired`, `NeverDirLockBackoff` |
 | `claims` | Claims model, 2 workers, `LockLost`, one crash and resume | not platform-specific | `NeverCommittedWithClaim`, `NeverLockLostMidCommit` |
 
 Liveness runs: `DeadLockEventuallyCleared` in `recovery` and `cleanup-crash`; `UncertainLockEventuallyCleared` in
-`breaklock` and `cleanup`; POSIX variant only, without symmetry.
+`breaklock`, `cleanup`, and `mixed` (so that `SEED_TORN_AS_FOREIGN` is judged against a passing run of the same
+scenario); POSIX variant only, without symmetry.
 
-Common bounds: one target lock path (plus the parent's for `nested`); at most two crashes per run in total; symmetry
+Common bounds: one target lock path (plus the parent's for `nested`, and two per-name lock paths and the directory
+lock path for `dirlock`); at most two crashes per run in total; symmetry
 over interchangeable actors of the same kind in `check` and `seeded` runs only. Each TLC run's `timeout_minutes` is
 10; each CI matrix job (one scenario) should finish within about 20 minutes. A run that does not fit gets tighter
 bounds, and the tighter bounds are written into the README, never raised silently.
 
 ## 13. Success criteria
+
+These hold at the end of the work, after the spec fixes that the model's findings (Section 11) lead to; until then a
+`check` run that reports a safety violation is a finding, not a failure of the model.
 
 1. Every seeded run stops with its named violation.
 2. Every `check` run reports exactly its listed witnesses violated and no safety invariant violated.
@@ -390,7 +453,8 @@ bounds, and the tighter bounds are written into the README, never raised silentl
 4. Every run finishes within its time limit on CI.
 5. The traceability check (Section 9.1) passes: every label maps to a spec step, and every spec step of the stamped
    headings maps to a label or to a `not_modelled` reason.
-6. The drift-stamp test, the traceability check, and FS-1 to FS-9 pass in the existing test job.
+6. The drift-stamp test, the traceability check, and FS-1 to FS-10 pass in the existing test job.
+7. `model-gate` passes on the pull request that adds the model.
 
 ## 14. Out of scope
 
@@ -399,4 +463,4 @@ bounds, and the tighter bounds are written into the README, never raised silentl
 - Filesystems beyond the modelled variants (SMB, NFS), and clock behaviour beyond the liveness oracle: listed in the
   README as unverified assumptions.
 - The content of refusal reports (96.2) and exit codes: the model checks which outcome happens, not its wording.
-- Whether the `model` CI job is a required status check.
+- Configuring branch protection: the design recommends requiring `model-gate` (Section 4); the owner sets it.
