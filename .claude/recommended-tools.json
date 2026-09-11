@@ -64,5 +64,17 @@
     "why": "Runs models/lockproto/run.py (the model-check runner) and its unit tests (`just model`, `just model-test`). Python 3.14 is the version CI and the development machines use; run.py accepts 3.11 or later (tomllib). Not needed by `just check`.",
     "install": "winget install Python.Python.3.14",
     "in_path": "python3"
+  },
+  {
+    "name": "actionlint",
+    "why": "Lints the GitHub Actions workflows, including .github/workflows/model.yml (lock-model plan 1). Runs the shell in each `run:` step through shellcheck when shellcheck is on PATH; without it that check is silently skipped (visible only with `actionlint -verbose`).",
+    "install": "winget install rhysd.actionlint",
+    "in_path": "actionlint"
+  },
+  {
+    "name": "shellcheck",
+    "why": "Lets actionlint check the shell inside workflow `run:` steps; actionlint disables that rule when shellcheck is not on PATH.",
+    "install": "winget install koalaman.shellcheck",
+    "in_path": "shellcheck"
   }
 ]

@@ -52,12 +52,13 @@ jobs:
           # touching: true (a relevant file changed), false (none did), unknown (cannot tell: run everything)
           touching=unknown
           changed=""
+          # --no-renames lists a moved file under both names, so moving one out of a watched path counts.
           if [ "$EVENT" = "pull_request" ]; then
-            if changed=$(git diff --name-only "$PR_BASE...$PR_HEAD"); then touching=true; fi
+            if changed=$(git diff --no-renames --name-only "$PR_BASE...$PR_HEAD"); then touching=true; fi
           elif [ "$EVENT" = "push" ] && [ -n "$PUSH_BEFORE" ] \
                && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ] \
                && git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
-            if changed=$(git diff --name-only "$PUSH_BEFORE" "$GITHUB_SHA"); then touching=true; fi
+            if changed=$(git diff --no-renames --name-only "$PUSH_BEFORE" "$GITHUB_SHA"); then touching=true; fi
           fi
           if [ "$touching" = true ]; then
             pattern='^(models/|FLUX_FULL_UPDATED_SPEC_V[^/]*\.md$|crates/flux-platform/tests/fs_semantics\.rs$|justfile$|\.github/workflows/model\.yml$)'
