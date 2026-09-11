@@ -36,27 +36,56 @@ fn is_heading(line: &str) -> bool {
     (1..=6).contains(&hashes) && line.as_bytes().get(hashes) == Some(&b' ')
 }
 
-fn fence_marker(line: &str) -> Option<&'static str> {
-    ["```", "~~~"].into_iter().find(|m| line.starts_with(m))
+/// An open fenced code block, as CommonMark defines it: a run of at least three backticks or
+/// tildes opens it, and only a run of at least as many of the same character with nothing after it
+/// closes it. Indentation before a marker is ignored.
+#[derive(Clone, Copy)]
+struct Fence {
+    ch: u8,
+    len: usize,
+}
+
+impl Fence {
+    fn opened_by(line: &str) -> Option<Fence> {
+        let text = line.trim_start();
+        let ch = *text.as_bytes().first()?;
+        let len = text.bytes().take_while(|b| *b == ch).count();
+        ((ch == b'`' || ch == b'~') && len >= 3).then_some(Fence { ch, len })
+    }
+
+    fn closed_by(self, line: &str) -> bool {
+        let text = line.trim_start();
+        let run = text.bytes().take_while(|b| *b == self.ch).count();
+        run >= self.len && text[run..].trim().is_empty()
+    }
+}
+
+/// Advance the fence state over one line; true if the line is a fence marker (opens or closes a
+/// fence). A marker-like line inside a fence that does not close it is ordinary text.
+fn fence_marker_line(fence: &mut Option<Fence>, line: &str) -> bool {
+    match *fence {
+        Some(open) if open.closed_by(line) => {
+            *fence = None;
+            true
+        }
+        Some(_) => false,
+        None => {
+            *fence = Fence::opened_by(line);
+            fence.is_some()
+        }
+    }
 }
 
 /// Split the spec into sections. Heading lines inside fenced code blocks (indented or not) are text,
 /// not headings.
 fn sections(spec: &str) -> Vec<Section> {
     let mut out: Vec<Section> = Vec::new();
-    let mut fence: Option<&str> = None;
+    let mut fence: Option<Fence> = None;
     for line in spec.lines() {
-        match fence {
-            Some(marker) if line.trim_start().starts_with(marker) => fence = None,
-            Some(_) => {}
-            None => {
-                if let Some(marker) = fence_marker(line.trim_start()) {
-                    fence = Some(marker);
-                } else if is_heading(line) {
-                    out.push(Section { heading: line.to_string(), lines: Vec::new() });
-                    continue;
-                }
-            }
+        let in_fence = fence.is_some();
+        if !fence_marker_line(&mut fence, line) && !in_fence && is_heading(line) {
+            out.push(Section { heading: line.to_string(), lines: Vec::new() });
+            continue;
         }
         if let Some(section) = out.last_mut() {
             section.lines.push(line.to_string());
@@ -81,8 +110,10 @@ fn units(lines: &[String]) -> Vec<String> {
     let mut units: Vec<Vec<&str>> = Vec::new();
     let mut in_step = false;
     let mut after_blank = true;
+    // A section's lines start outside any fence: sections() splits only outside fences.
+    let mut fence: Option<Fence> = None;
     for line in lines {
-        if line.trim().is_empty() || fence_marker(line.trim_start()).is_some() {
+        if fence_marker_line(&mut fence, line) || line.trim().is_empty() {
             after_blank = true;
             continue;
         }
@@ -478,6 +509,44 @@ Text.
 ";
     let headings: Vec<String> = sections(spec).into_iter().map(|s| s.heading).collect();
     assert_eq!(headings, ["## 2.1 Parent", "## 2.2 Next"]);
+}
+
+#[test]
+fn longer_fence_is_not_closed_by_a_shorter_marker() {
+    // A four-backtick fence showing a Markdown sample: the inner ``` lines are text, so the
+    // heading-like line between them stays text and is hashed with its unit.
+    let spec = "## 3.1 Parent
+Before.
+
+````markdown
+```text
+## 3.9 Not a heading
+```
+````
+
+After.
+
+## 3.2 Next
+Text.
+";
+    let parts = sections(spec);
+    let headings: Vec<&str> = parts.iter().map(|s| s.heading.as_str()).collect();
+    assert_eq!(headings, ["## 3.1 Parent", "## 3.2 Next"]);
+    assert_eq!(units(&parts[0].lines), ["Before.", "```text\n## 3.9 Not a heading\n```", "After."]);
+}
+
+#[test]
+fn marker_with_trailing_text_does_not_close_a_fence() {
+    let spec = "## 4.1 Parent
+```
+```text
+## 4.9 Not a heading
+```
+
+## 4.2 Next
+";
+    let headings: Vec<String> = sections(spec).into_iter().map(|s| s.heading).collect();
+    assert_eq!(headings, ["## 4.1 Parent", "## 4.2 Next"]);
 }
 
 #[test]

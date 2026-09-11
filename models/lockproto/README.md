@@ -28,7 +28,8 @@ In CI, `.github/workflows/model.yml` runs the scenarios when a change touches `m
 queued rather than finished, cancel the run again from the workflow's page (reported as actions/runner#4411 for
 matrix jobs with `if: always()`; that issue is closed, and whether it is fixed is not known).
 
-To set `PYTHON` to another interpreter: `PYTHON=python just model`. Run one `just model` at a time in a checkout:
+To use another interpreter: `just python=python model` (any shell; in a POSIX shell, `PYTHON=python just model` also
+works). Run one `just model` at a time in a checkout:
 runs write their TLC state and logs under `target/tla/`, keyed by run name.
 
 ## Files
