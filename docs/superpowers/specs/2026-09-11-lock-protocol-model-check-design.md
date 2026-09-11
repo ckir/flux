@@ -1,6 +1,6 @@
 # Lock-protocol model check — design
 
-Date: 2026-09-11. Status: approved design, revised after adversarial review rounds 1 and 2; awaiting implementation plan.
+Date: 2026-09-11. Status: approved design, revised after adversarial review rounds 1 to 3; awaiting implementation plan.
 Branch: `model/lock-protocol`, on top of `spec/v16-resolution`.
 
 ## 1. Goal
@@ -33,6 +33,7 @@ These sections are the model's contract. The drift stamp (Section 9) hashes exac
 | 96.2 | A lock refusal reports the holder | LockProtocol (report content is not checked, only that the refusal happens) |
 | 97.1 | Nested destination roots: ancestor check after creating one's own lock; descendant check before creating or writing into a directory | LockProtocol |
 | 99 | Commit-time revalidation: "still owned" for every lock held; failure outcomes; supersession checked before cancellation | LockProtocol, Claims |
+| 99.1 | Weak or unavailable filesystem identity does not invalidate the name-based target lock; a lock is no proof of object continuity | LockProtocol (the `IdentityStrength = weak` variants) |
 | 21.1 | `--restart` steps 1-5; the lock never released between steps 1 and 5 | LockProtocol |
 | 240.1-240.5 | Recovery decision order; live owner; dead-owner move-aside (240.3 steps 1-5); uncertain ownership; `--break-lock` in-place takeover (240.5 steps 1-6) and its cleanup variant | LockProtocol |
 | 251.1, 251.2 | Cleanup classification of locks, orphan locks, moved locks, cleanup locks | LockProtocol |
@@ -69,34 +70,48 @@ crates/flux-platform/tests/fs_semantics.rs    the filesystem probes (Section 10)
 | `scenario` | the Section 12 scenario the run belongs to; one of the names in `expected.toml`'s top-level `scenarios` list, which is the only place scenario names are defined; CI builds its matrix from that list |
 | `kind` | `check`, `liveness`, or `seeded` |
 | `violated` | for `check`: the exact set of witness invariants that must be reported violated; for `seeded`: the one invariant or property that must be the first violation; absent for `liveness` |
+| `open_findings` | optional, for `check` and `liveness`: safety invariants or properties that currently fail because of a spec defect not yet fixed, each as `{ name, tracking }` where `tracking` names its `TODO.md` or `.clavity/local-anomalies.md` entry |
 | `timeout_minutes` | the run's time limit |
 
 How each kind of run is judged:
 
 - `check`: TLC runs with `-continue`, so it explores the whole reachable state space and reports every violated
-  invariant. The run passes only if the set reported equals `violated` exactly: every witness violated, no safety
-  invariant violated. One run per configuration therefore checks both safety and reachability.
-- `liveness`: TLC checks the configuration's temporal properties with no symmetry reduction (symmetry and liveness
-  checking together are unsound in TLC). Passes only with no violation.
+  invariant. The run passes only if the set reported equals `violated` plus the run's `open_findings` exactly: every
+  witness violated, every open finding still violated, no other safety invariant violated. One run per configuration
+  therefore checks both safety and reachability. An open finding that stops failing also fails the run, so the entry
+  is removed together with the spec fix.
+- `liveness`: TLC checks the configuration's temporal properties, and every safety invariant of the scenario, with no
+  symmetry reduction (symmetry and liveness checking together are unsound in TLC). Passes only with no violation
+  other than its `open_findings`.
 - `seeded`: TLC runs without `-continue`. Passes only if TLC stops with a violation of exactly the named invariant or
-  property; a different violation, or none, fails the run.
+  property; a different violation, or none, fails the run. A seeded run's scenario must have no open finding on the
+  same invariant, so that the seed, not the open defect, is what fails it.
 
-TLC's deadlock check is turned off (`-deadlock`) in every run, because actors legitimately terminate; progress is
-checked by the witnesses and the liveness properties instead.
+TLC's deadlock check stays on. PlusCal's translation already allows the final state in which every process is done,
+so a deadlock report means some process is stuck on a condition that can never become true, which is either a model
+defect or a real stuck state. To keep that meaning, a crashed process ends at `Done` (a ghost flag records the crash),
+and a process that waits for an event that may never happen (a resume that waits for a crash, the `LockLost`
+environment action) may also finish without it.
 
 The runner, `run.py`:
 
 - stops with exit code 2 before running anything if Python is older than 3.11, if `expected.toml` is malformed, if a
   run's `scenario` is not in the `scenarios` list, if a listed scenario has no runs, or if `--scenario NAME` names an
   unknown scenario; `--list-scenarios` prints the `scenarios` list as a JSON array;
-- downloads a pinned `tla2tools.jar` (exact release chosen in the plan) into `target/tla/` and verifies its SHA-256
-  before every use, including a cached copy; on a mismatch it deletes the file and downloads once more, and if the
-  hash still does not match it stops with exit code 2;
+- downloads `tla2tools.jar` from the TLA+ project's GitHub releases (`github.com/tlaplus/tlaplus/releases`), at a
+  release tag and SHA-256 both pinned in `run.py` (exact release chosen in the plan), into `target/tla/`, and verifies
+  the hash before every use, including a cached copy; on a mismatch it deletes the file and downloads once more, and
+  if the hash still does not match it stops with exit code 2. The pin protects against the download changing later,
+  not against a pull request that changes the tag and hash together; such a change is visible in `run.py`'s diff and
+  is reviewed as a dependency change;
 - runs the selected runs (all, or one scenario with `--scenario NAME`), each under its `timeout_minutes`, killing TLC
   on timeout; a run that fails in any way does not stop the others, so one report covers every selected run;
 - runs TLC with `-tool`, whose output marks each message with a numeric message code, and decides each run's result
   from the invariant-violation and property-violation messages and the names they carry; the plan pins those codes
-  against the pinned TLC release and keeps a recorded TLC log as a test fixture for the parser;
+  and TLC's exit statuses against the pinned TLC release and keeps recorded TLC logs as test fixtures for the parser.
+  A run is judged only when TLC's output shows that model checking finished (or stopped at a violation) and its exit
+  status agrees; a parse or semantic error in a model or configuration, any other error message, or a missing
+  completion message is a tooling failure (exit code 2), never a run with no violations;
 - prints one line per run (name, expected, observed, states found, duration) and, for every unexpected result, the
   first 60 states of TLC's trace, saving the full TLC output under `target/tla/out/<name>.log`;
 - exits 0 when every run matched, 1 when any run's result did not match, and 2 for a tooling failure (Java missing,
@@ -108,14 +123,16 @@ The runner, `run.py`:
 Recipes and CI:
 
 - `just model` runs every run; `just model scenario=<name>` runs one scenario; `just model-stamp` runs `just model`
-  first and rewrites the stamp (Section 9) only if every run matched. None of these is part of `just check`, which
-  stays Java-free.
-- `.github/workflows/model.yml` runs on every pull request to `main`, on pushes to `main`, and on manual dispatch, in
-  three jobs:
-  1. `plan` checks out the repository, decides whether the change touches `models/**`, the spec file (glob
-     `FLUX_FULL_UPDATED_SPEC_V*.md`), `crates/flux-platform/tests/fs_semantics.rs`, or the workflow itself (manual
-     dispatch always counts as touching), and outputs `run.py --list-scenarios` as the matrix, or an empty matrix
-     when nothing relevant changed;
+  first and rewrites the unit hashes (Section 9) only if every run matched, counting open findings as matched. None of
+  these is part of `just check`, which stays Java-free.
+- `.github/workflows/model.yml` runs on every pull request to `main`, on pushes to `main`, and on manual dispatch, with
+  `permissions: contents: read` and no secrets, in three jobs:
+  1. `plan` checks out the repository with full history (`fetch-depth: 0`), lists the changed files with `git diff
+     --name-only` against the pull request's base commit or the push's previous commit, decides whether they touch
+     `models/**`, the spec file (glob `FLUX_FULL_UPDATED_SPEC_V*.md`), `crates/flux-platform/tests/fs_semantics.rs`,
+     or the workflow itself, and outputs `run.py --list-scenarios` as the matrix, or an empty matrix when nothing
+     relevant changed. Manual dispatch, and any case where the changed files cannot be determined (a new branch, a
+     force push whose previous commit is gone), count as touching, so an unknown change runs every scenario;
   2. `scenario`, one matrix job per scenario name and skipped when the matrix is empty (GitHub rejects an empty
      matrix, so the job carries a condition on `plan`'s output), installs Java with `actions/setup-java` (Temurin 21) and Python
      with `actions/setup-python` (3.12), runs `just model scenario=<name>`, and uploads `target/tla/out/` when it
@@ -127,10 +144,12 @@ Recipes and CI:
   Linux/macOS/Windows test job run them.
 - `.claude/recommended-tools.json` gains entries for Java 21 and Python 3.11 or later, the two non-Rust tools
   `just model` needs.
-- The stamp and traceability tests (Section 9) are mechanical: they can be made to pass by rewriting the stamp
+- The stamp and traceability tests (Section 9) are mechanical: they can be made to pass by rewriting the hashes
   without re-checking the model. Only the TLC runs check the model against the changed text, so the design
   recommends that the owner make `model-gate` a required status check; `model-gate` always reports, so requiring it
-  never blocks a pull request that does not touch the model.
+  never blocks a pull request that does not touch the model. No mechanism can make a person model a new spec rule
+  rather than re-stamp it; what the design does is make the change visible, because the rewritten hashes appear in
+  the pull request's diff next to the `trace.toml` entries and labels they cover.
 
 ## 5. Filesystem model (`FsModel.tla`)
 
@@ -140,7 +159,7 @@ State:
 |---|---|
 | `entries` | per directory, entry name → file object id; two names are the same entry when `Fold` maps them to the same class. Object ids are never reused; they index `content`, `durable`, `handles`, and `oslock` |
 | `content` | object id → `Record(op, kind)` (kind: `operation` or `cleanup`), `Torn`, or `Foreign`: what a reader sees now |
-| `durable` | object id → the content that survives a crash |
+| `durable` | object id → the content that survives a host crash (Section 5.2) |
 | `handles` | set of `[proc, obj, shareDelete]` |
 | `oslock` | object id → the process holding its OS-native lock, or none |
 | `inflight` | set of filesystem calls issued by a process and not yet complete (Section 5.2) |
@@ -181,15 +200,29 @@ A data write or rename that an operation issues as part of publishing is two ste
 actors' steps can run between them, and the call's effect lands at completion. This is how the model represents a
 stalled owner whose call "can still complete" (Section 240.5).
 
-A crash of a process:
+There are two kinds of crash.
+
+A process crash (the process dies; the machine keeps running):
 
 - releases its handles, their sharing restrictions, and its OS-native locks;
-- for each object it wrote since its last flush, sets `durable` nondeterministically to the old durable content, the
-  new content, or `Torn`; a crash during a flush has the same outcomes;
+- leaves `content` as it is, so a record write interrupted between `WriteBegin` and `WriteEnd` stays `Torn` and every
+  completed write stays visible, flushed or not;
 - lands or drops, nondeterministically, each of its in-flight calls;
 - loses its in-memory state; a crashed invocation never continues, and later work is done by other actors.
 
-At most two crashes happen in one run, counted across all actors.
+A host crash (power loss or reboot of the machine all actors run on):
+
+- is a process crash of every process that has started;
+- then sets, for every object written since its last flush, both `content` and `durable` to one of: the old durable
+  content, the latest content, or `Torn`, chosen nondeterministically per object; a crash during a flush has the same
+  outcomes. Objects flushed since their last write keep their content. This is the only way `durable` becomes
+  visible.
+
+Processes that had not started when the host crashed run afterwards as the later invocations. At most two crashes
+happen in one run, counted across all actors and both kinds. In `liveness` runs, the actors a property relies on to
+make progress (Section 7) do not crash; every other actor crashes as in `check` runs. Without that exemption a run
+where the only actor able to clear a lock crashes would violate the property for a reason the spec does not claim to
+cover (an operator re-running the command is outside the model).
 
 ## 6. Actors
 
@@ -199,15 +232,19 @@ Each PlusCal label is named `S<section>_<step>` after the spec step it implement
 written as underscores. Where the spec numbers its steps, `<step>` is `s` and the number: Section 240.5 step 6 is
 `S240_5_s6`. Where a heading has no numbered steps (for example 96.1, 97.1, 99, 120, 182, 183, 241.5), `<step>` is a
 short name defined in `trace.toml` next to the spec sentence it implements, for example `S97_1_ancestor` or
-`S182_prepare`. A step that needs
-more than one atomic action gets suffixes `a`, `b`, and so on (`S240_5_s6a`).
+`S182_prepare`. A step that needs more than one atomic action gets suffixes `a`, `b`, and so on (`S240_5_s6a`).
 
 Encodings: a lock record is a TLA+ record `[op |-> <operation id>, kind |-> "operation" | "cleanup"]`; `Torn`,
-`Foreign`, and `Empty` are distinct model values; operation ids are model values drawn from the actors present.
+`Foreign`, and `Empty` are distinct model values. Each process is a model value, and its operation id is its own
+process value, so every value that names an actor (records, ghost variables, handles, in-flight calls) changes
+consistently when TLC permutes processes. Symmetry reduction is declared over each set of same-kind actors, and only in
+the `recovery` and `breaklock` scenarios, the two with more than one actor of a kind whose symmetry-free `liveness`
+runs also check every safety invariant (Section 4); all other runs use no symmetry. Every invariant and witness
+quantifies over processes rather than naming one.
 
 | Actor | Behaviour |
 |---|---|
-| Owner | A normal operation: acquires the target lock (96.1) and holds its OS-native lock, runs its ancestor check (97.1 a), publishes with a Section 99 check before each write, releases the lock at completion; may crash |
+| Owner | A normal operation: acquires the target lock (96.1: exclusive create of `P/<name>.flux-lock`, then the per-name acquirer's check that `P/.flux-dir.lock` is absent, backing off on a conflict) and holds its OS-native lock, runs its ancestor check (97.1 a), publishes with a Section 99 check before each write, releases the lock at completion; may crash |
 | StalledOwner | An owner that stops making progress at any point and may later resume (its next Section 99 check then runs, and if the check fails it stops, closing its handles), may resume and complete normally, or may have a call in flight that completes later |
 | DirOwner | An owner whose target name is too long for a per-name lock: takes `P/.flux-dir.lock` and lists `P` for per-name locks (96.1 announce-then-check); may crash |
 | PlainRun | A new invocation without flags: classifies what it finds (21.1 table, 96.1, 120, 240) and acts or refuses |
@@ -245,11 +282,22 @@ folding), so aliasing happens. Targets:
 | `H1`, `H2` | a hardlink group: canonical `H1`, dependent `H2` whose name maps to a different entry |
 | `D1`, `d1` | a hardlink group whose dependent's name folds onto the canonical's entry |
 
-Each target runs the Section 182 pipeline: plan with its existing-entry claim, PREPARE_COMMIT, revalidate locks
-(Section 99), rename, then COMMIT together with its created-entry claim in one durable transaction. Dependents run the
-Section 16.1 link procedure. An environment action, `LockLost`, can take the operation's lock over at any point (a
-`--break-lock` from outside), after which every worker's next revalidation fails and it stops. A crash can happen
-between any two steps; a resume then runs Section 183 recovery before continuing. Two workers interleave freely.
+Besides the filesystem model, `Claims.tla` has one variable for the operation's state database (`state.db` with its
+WAL): the set of durable records per target (PREPARE_COMMIT, COMMIT) and the set of claims. A database transaction
+is one atomic step and is durable when it completes; a crash of either kind keeps every completed transaction and
+none of an incomplete one.
+
+Each target runs the Section 182 pipeline as separate steps: plan with its existing-entry claim (a transaction),
+PREPARE_COMMIT (a transaction), revalidate locks (Section 99), rename (a filesystem call, issued then completed,
+Section 5.2), then one transaction that writes COMMIT and the target's created-entry claim together. The rename and
+that transaction are two steps, so a crash can fall between them; that is the case Section 183 recovery handles.
+Dependents run the Section 16.1 link procedure. An environment action, `LockLost`, can take the operation's lock over
+at any point (a `--break-lock` from outside), after which every worker's next revalidation fails and it stops. A crash
+can happen between any two steps; a resume then runs Section 183 recovery before continuing.
+
+The scenario runs one configuration per target group, so that each state space stays small: `A`/`a` (with and without
+an existing entry `A`), `H1`/`H2`, and `D1`/`d1`. In each, two workers take the group's targets from a shared queue
+in any order and interleave freely.
 
 ## 7. Properties
 
@@ -319,10 +367,11 @@ ability to see that defect and the run fails.
 | `SEED_NO_ANCESTOR_CHECK` | 97.1 (a) skipped | `nested` | `NestedExclusion` |
 | `SEED_DESCENDANT_EXISTING_ONLY` | 97.1 (b) checks only directories that already exist (round 2) | `nested` | `NestedExclusion` |
 | `SEED_CHECK_BEFORE_ANNOUNCE` | the directory acquirer lists `P` before creating `P/.flux-dir.lock` (96.1's announce-then-check order reversed) | `dirlock` | `DirLockExclusion` |
-| `SEED_CLAIM_AFTER_COMMIT` | created-entry claim written after COMMIT (round 6, CPE-4) | `claims` | `CommittedHasClaim` |
-| `SEED_CLAIM_BY_OBJECT_ID` | claims keyed by object identity (round 3) | `claims` | `NoSelfCollision` |
-| `SEED_NO_PUBLICATION_CLAIM` | publications do not claim the entry they create (round 2) | `claims` | `NoSilentOverwrite` |
-| `SEED_NO_REVALIDATE_BEFORE_RENAME` | Section 182 renames without revalidating locks | `claims` | `NoPublishAfterLockLost` |
+| `SEED_PERNAME_SKIPS_DIR_CHECK` | a per-name acquirer does not check that `P/.flux-dir.lock` is absent | `dirlock` | `DirLockExclusion` |
+| `SEED_CLAIM_AFTER_COMMIT` | created-entry claim written after COMMIT (round 6, CPE-4) | `claims`, group `A`/`a` | `CommittedHasClaim` |
+| `SEED_CLAIM_BY_OBJECT_ID` | claims keyed by object identity (round 3) | `claims`, group `H1`/`H2` | `NoSelfCollision` |
+| `SEED_NO_PUBLICATION_CLAIM` | publications do not claim the entry they create (round 2) | `claims`, group `A`/`a` | `NoSilentOverwrite` |
+| `SEED_NO_REVALIDATE_BEFORE_RENAME` | Section 182 renames without revalidating locks | `claims`, group `A`/`a` | `NoPublishAfterLockLost` |
 
 A seeded run whose "must fail" entry is a liveness property is a `liveness`-kind run with the seed flag set, run
 without symmetry. Every later fix that the model drives adds a row here.
@@ -331,31 +380,33 @@ without symmetry. Every later fix that the model drives adds a row here.
 
 `spec-sections.stamp` begins with one line `spec: <path>` naming the spec file relative to the repository root; this
 is the only place the model tooling names it, and the test fails if that file does not exist, so renaming the spec
-(a V17) fails `just check` until the stamp names the new file. Then it has one line per spec heading the model
-encodes, listed individually (96.1, 96.2, 97.1, 99,
-21.1, 240.1, 240.2, 240.3, 240.4, 240.5, 251.1, 251.2, 259.6, 120, 241.5, 182, 183): the BLAKE3 hash of that
-heading's own text in lowercase hex, two spaces, then the heading line exactly as it appears in the spec. A heading's
-own text runs from its heading line up to, not including, the next heading line of any level, so a subsection the
-model does not encode (for example 99.1) is not hashed with its parent. Heading lines are ATX headings (`#` to
-`######`) outside fenced code blocks; line endings are normalised to LF before hashing. A subsection the model does
-encode is listed as its own line.
+(a V17) fails `just check` until the stamp names the new file. Then it lists, one per line, each spec heading the
+model encodes, exactly as the heading line appears in the spec: 96.1, 96.2, 97.1, 99, 99.1, 21.1, 240.1, 240.2,
+240.3, 240.4, 240.5, 251.1, 251.2, 259.6, 120, 241.5, 182, 183. A heading's own text runs from its heading line up
+to, not including, the next heading line of any level, so a subsection the model does not encode is not part of its
+parent's text; a subsection the model does encode is listed as its own line. Heading lines are ATX headings (`#` to
+`######`) outside fenced code blocks; line endings are normalised to LF before hashing.
 
-`tests/model_stamp.rs`, an auto-discovered test target of the root package (so `just check` runs it), recomputes the
-hashes. It fails, naming each section, if a hash differs, a listed heading is missing, or a heading appears more than
-once. `blake3` is added to the root package's `[dev-dependencies]` from the workspace, and `toml` (added to
-`[workspace.dependencies]`, subject to `deny.toml`) for reading `trace.toml`. The same file holds an `#[ignore]`d
-test that rewrites the stamp; `just model-stamp` runs it after a green `just model` (Section 4). The workflow after a spec change:
-re-check the model against the changed text, update the model, run `just model`, then run `just model-stamp`.
+The hashes live in `trace.toml`, one per unit (Section 9.1): the BLAKE3 hash, in lowercase hex, of the unit's text.
+`tests/model_stamp.rs`, an auto-discovered test target of the root package (so `just check` runs it), recomputes
+them. It fails if a listed heading is missing or appears more than once, and, for each unit whose hash differs, names
+the heading, the unit's ordinal, and the labels that `trace.toml` says implement it, so a spec change points at the
+exact model steps to re-check. `blake3` is added to the root package's `[dev-dependencies]` from the workspace, and
+`toml` (added to `[workspace.dependencies]`, subject to `deny.toml`) for reading `trace.toml`. The same file holds an
+`#[ignore]`d test that rewrites the unit hashes; `just model-stamp` runs it after a green `just model` (Section 4).
+The workflow after a spec change: re-check each unit the test names against the model, update the model and
+`trace.toml`, run `just model`, then run `just model-stamp`.
 
 ### 9.1 Traceability check
 
 `trace.toml` is the single traceability map. Its unit is a spec unit of a stamped heading's own text (Section 9): a
 numbered step where the heading has numbered steps, otherwise each block of that text separated by blank lines
 (fenced blocks included, split at their blank lines too). Each entry names its heading and the unit's ordinal, quotes
-a sentence from that unit, and gives either the labels that implement it or `not_modelled = "<reason>"`. The same
-test file checks, without Java:
+a sentence from that unit, carries the unit's hash (Section 9), and gives either the labels that implement it or
+`not_modelled = "<reason>"`. The same test file checks, without Java:
 
-- every unit of every stamped heading has exactly one entry, and each quoted sentence occurs in its unit;
+- every unit of every stamped heading has exactly one entry, each quoted sentence occurs in its unit, and each hash
+  matches its unit;
 - every label in `LockProtocol.tla` and `Claims.tla` (matched by `S\d+(_\d+)*_\w+:`) appears in `trace.toml`;
 - every label `trace.toml` names exists in a model file.
 
@@ -386,8 +437,9 @@ held (a second handle's non-blocking attempt fails) before it renames.
 | FS-9 | closing a handle releases its OS-native lock | all |
 | FS-10 | a directory listing returns every entry that exists for the whole listing, including one created just before it starts | all |
 
-Each probe prints the filesystem type of its scratch directory (`statfs` on Unix, `GetVolumeInformationW` on Windows).
-A failing probe is never weakened to pass. It is triaged first as environment or platform: if the filesystem type is
+Each probe prints the filesystem type of its scratch directory (`statfs` on Unix, `GetVolumeInformationW` on Windows),
+or `unknown` if that call fails; the call's failure never fails the probe, and `unknown` counts as not native for
+triage. A failing probe is never weakened to pass. It is triaged first as environment or platform: if the filesystem type is
 not the platform's usual local one (for example an overlay or network filesystem on a runner), the failure is
 reproduced on a native local filesystem of that platform before anything changes; if it reproduces, the model's
 assumption for that platform is wrong and the model is fixed.
@@ -399,8 +451,11 @@ as unverified assumptions.
 A counterexample in a `check` or `liveness` run is saved with its trace and triaged:
 
 - Model defect: fixed in the model.
-- Spec defect: fixed in the spec on the spec branch. A design fork goes through an agy-first consult and then to the
-  owner. The fix gets a new seeded configuration (Section 8), and the stamp is updated.
+- Spec defect: recorded in `TODO.md` or `.clavity/local-anomalies.md` and listed in the failing runs'
+  `open_findings` (Section 4), so the gates stay green for every other change while it is open; then fixed in the
+  spec on the spec branch. A design fork goes through an agy-first consult and then to the owner. The fix removes the
+  `open_findings` entries in the same change, gets a new seeded configuration (Section 8), and the unit hashes are
+  updated.
 
 Findings the design already expects, each to be confirmed or refuted by the first runs:
 
@@ -415,6 +470,10 @@ Findings the design already expects, each to be confirmed or refuted by the firs
   uncertain owner's per-name lock counts as held. The model classifies each listed lock as Section 240 does and treats
   live and uncertain as held and dead as not, as 97.1 (a) does for ancestor locks; `trace.toml` records this reading
   as an assumption until the spec states it.
+- A `--break-lock` takeover of a per-name lock (Section 240.5) never checks `P/.flux-dir.lock`, which Section 240.5
+  does not mention. If a directory acquirer judged that per-name lock dead and proceeded, a Breaker that judges the
+  same lock uncertain and takes it over in place would hold it alongside the directory lock, so the `dirlock`
+  scenario includes a Breaker and `DirLockExclusion` should report it.
 
 ## 12. Scenarios, bounds, and time budget
 
@@ -429,23 +488,23 @@ them apart keeps each state space small.
 | `cleanup` | StalledOwner, CleanupBreaker, Breaker | POSIX, Windows | `NeverBrokeLock`, `NeverInFlightAfterTakeover` |
 | `cleanup-crash` | CleanupBreaker (crashes), PlainRun, Recoverer, Cleanup | POSIX, Windows | `NeverClassifiedCleanupLock`, `NeverCleanedUp` |
 | `nested` | Owner on the parent destination, NestedOwner on the child, PlainRun | POSIX | `NeverAcquired` |
-| `dirlock` | two Owners with per-name locks on different targets in one directory `P` (one may crash), DirOwner (may crash), Recoverer | POSIX, Windows | `NeverAcquired`, `NeverDirLockAcquired`, `NeverDirLockBackoff` |
-| `claims` | Claims model, 2 workers, `LockLost`, one crash and resume | not platform-specific | `NeverCommittedWithClaim`, `NeverLockLostMidCommit` |
+| `dirlock` | two Owners with per-name locks on different targets in one directory `P` (one may crash), DirOwner (may crash), Recoverer, Breaker | POSIX, Windows | `NeverAcquired`, `NeverDirLockAcquired`, `NeverDirLockBackoff`, `NeverBrokeLock` |
+| `claims` | Claims model, 2 workers, `LockLost`, one crash and resume; one configuration per target group (Section 6.2) | not platform-specific | `NeverCommittedWithClaim`, `NeverLockLostMidCommit` |
 
 Liveness runs: `DeadLockEventuallyCleared` in `recovery` and `cleanup-crash`; `UncertainLockEventuallyCleared` in
 `breaklock`, `cleanup`, and `mixed` (so that `SEED_TORN_AS_FOREIGN` is judged against a passing run of the same
 scenario); POSIX variant only, without symmetry.
 
 Common bounds: one target lock path (plus the parent's for `nested`, and two per-name lock paths and the directory
-lock path for `dirlock`); at most two crashes per run in total; symmetry
-over interchangeable actors of the same kind in `check` and `seeded` runs only. Each TLC run's `timeout_minutes` is
+lock path for `dirlock`); at most two crashes per run in total; symmetry only as Section 6.1 states (`recovery` and
+`breaklock`, in `check` and `seeded` runs). Each TLC run's `timeout_minutes` is
 10; each CI matrix job (one scenario) should finish within about 20 minutes. A run that does not fit gets tighter
 bounds, and the tighter bounds are written into the README, never raised silently.
 
 ## 13. Success criteria
 
-These hold at the end of the work, after the spec fixes that the model's findings (Section 11) lead to; until then a
-`check` run that reports a safety violation is a finding, not a failure of the model.
+A spec defect the model finds is carried as an `open_finding` (Sections 4 and 11) until the spec is fixed; criteria 1
+to 7 hold with open findings counted as expected results, and the work is finished when no open finding remains.
 
 1. Every seeded run stops with its named violation.
 2. Every `check` run reports exactly its listed witnesses violated and no safety invariant violated.
