@@ -20,14 +20,14 @@ test job: `tests/model_stamp.rs` (stamp and traceability) and `crates/flux-platf
 
 ## Context
 
-- **Design:** `docs/superpowers/specs/2026-09-11-lock-protocol-model-check-design.md` at commit `022a565` (approved;
+- **Design:** `docs/superpowers/specs/2026-09-11-lock-protocol-model-check-design.md` at commit `b50e998` (approved;
   aligned with the measurements below). Section numbers in this plan refer to it.
 - **Branch:** `model/lock-protocol`. Work in place on that branch; do not push.
 - **Sequence:** this is plan 1 of 3 (owner decision, 2026-09-11). Plan 2 (`FsModel.tla` + `LockProtocol.tla`) and plan 3
   (`Claims.tla`) are written after this plan lands. After this plan, `expected.toml` has only the `selftest` scenario,
   the stamp lists no spec headings, and `trace.toml` has no units; plan 2 fills them.
 - **Every file below was built and run before this plan was written**, on Windows 11 with Java 21 and Python 3.14;
-  the runner tests also ran under Python 3.12, and the probes also ran on Linux (tmpfs and ext4, through WSL). On macOS
+  the runner tests also ran under Python 3.11 and 3.12, and the probes also ran on Linux (tmpfs and ext4, through WSL). On macOS
   the probes were only compiled and linted (`cargo clippy --target aarch64-apple-darwin`); their first macOS run is
   the existing CI test job. `just check` and `cargo deny check` were green. The file contents in this plan are those
   files, copied verbatim.
@@ -73,7 +73,7 @@ is a rolling prerelease whose asset changes, so it cannot be pinned. With `-tool
 Because 2116 names no property, a configuration that checks a temporal property lists exactly one `PROPERTY`
 (design Section 4). `-workers auto` works. TLC wrote no trace files beside the model with these flags.
 
-### Deviations from the design text, all already folded into the design at `022a565`
+### Deviations from the design text, all already folded into the design at `b50e998`
 
 1. `just model <scenario>` instead of `just model scenario=<name>`: `just` accepts `name=value` only as a variable
    override before the recipe name.
@@ -513,8 +513,9 @@ class EnsureJarTests(unittest.TestCase):
         self.assertIn("connection reset", str(ctx.exception))
 
     def test_two_bad_downloads_fail(self) -> None:
-        with self.assertRaises(run.ToolingError):
+        with self.assertRaises(run.ToolingError) as ctx:
             run.ensure_jar(self.target, self.fetch_returning(b"bad"), self.good_sha)
+        self.assertIn(f"got {run.hashlib.sha256(b'bad').hexdigest()}", str(ctx.exception))
         self.assertEqual(self.calls, 2)
         self.assertFalse((self.target / "tla2tools.jar").exists())
 
@@ -559,6 +560,28 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(derived, self.target / "cfg" / "demo-posix-check-fixed.cfg")
         self.assertIn("FIX_SAFE = TRUE", derived.read_text(encoding="utf-8"))
         self.assertEqual(result.status, "tooling", "a process that prints nothing is never a clean run")
+
+    def test_interrupt_kills_tlc_and_propagates(self) -> None:
+        procs: list[FakeProc] = []
+
+        class FakeProc:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                self.killed = False
+                procs.append(self)
+
+            def wait(self, timeout: float | None = None) -> int:
+                if timeout is not None:
+                    raise KeyboardInterrupt
+                return -9
+
+            def kill(self) -> None:
+                self.killed = True
+
+        self.addCleanup(setattr, run.subprocess, "Popen", run.subprocess.Popen)
+        run.subprocess.Popen = FakeProc
+        with self.assertRaises(KeyboardInterrupt):
+            run.execute(self.check, Path("unused.jar"), self.base, fixed=False)
+        self.assertEqual([p.killed for p in procs], [True])
 
     def test_timeout_is_reported_as_a_tooling_failure(self) -> None:
         self.fake_tlc("import time; time.sleep(30)")
@@ -1034,9 +1057,10 @@ def ensure_jar(target: Path = TARGET, fetch: Callable[[str, Path], None] = downl
         except ToolingError as err:
             failure = str(err)
             continue
-        if jar.is_file() and sha256(jar) == expected_sha:
+        got = sha256(jar) if jar.is_file() else "no file"
+        if got == expected_sha:
             return jar
-        failure = mismatch
+        failure = f"{mismatch} (expected {expected_sha}, got {got})"
     jar.unlink(missing_ok=True)
     raise ToolingError(f"{failure} (after two download attempts)")
 
@@ -1427,7 +1451,7 @@ differs, stop: the pinned TLC does not behave as measured, and the parser consta
 - [ ] **Step 8: Run the unit tests to see them pass**
 
 Run: `python3 -m unittest discover -s models/lockproto -p "test_*.py"`
-Expected: `Ran 55 tests` and `OK`.
+Expected: `Ran 56 tests` and `OK`.
 
 - [ ] **Step 9: Run the self-test end to end**
 
@@ -1492,7 +1516,7 @@ model-test:
 - [ ] **Step 2: Run the recipes**
 
 Run: `just model selftest`, then `just model-test`, then `just model nope; echo $?`
-Expected: the four `OK` lines and `run.py: 4 runs, exit 0`; then `Ran 55 tests` and `OK`; then `run.py: unknown
+Expected: the four `OK` lines and `run.py: 4 runs, exit 0`; then `Ran 56 tests` and `OK`; then `run.py: unknown
 scenario 'nope'; known: selftest`, a `just` error line, and a non-zero status.
 
 - [ ] **Step 3: Add the recommended tools**
@@ -1548,6 +1572,11 @@ matched its expectation, 1 when one did not, and 2 for a tooling failure (Java m
 failure, a TLC error, or a timeout). `just check` runs the Rust side (the stamp and traceability test and the
 filesystem probes) and needs no Java or Python.
 
+In CI, `.github/workflows/model.yml` runs the scenarios when a change touches `models/`, the spec, the probes, the
+`justfile`, or the workflow, and its `model-gate` job always reports. If cancelling a run ever leaves `model-gate`
+queued rather than finished, cancel the run again from the workflow's page (reported as actions/runner#4411 for
+matrix jobs with `if: always()`; that issue is closed, and whether it is fixed is not known).
+
 To set `PYTHON` to another interpreter: `PYTHON=python just model`. Run one `just model` at a time in a checkout:
 runs write their TLC state and logs under `target/tla/`, keyed by run name.
 
@@ -1578,8 +1607,9 @@ runs write their TLC state and logs under `target/tla/`, keyed by run name.
 
 `crates/flux-platform/tests/fs_semantics.rs` holds FS-1 to FS-11 (design Section 10). Each prints the filesystem type
 of its scratch directory. The OS-native lock they probe covers the whole file: `flock` on Unix, and `LockFileEx` over
-the full byte range on Windows; an implementation that locks a different range would not be covered by them. A failing probe is never weakened: reproduce it on a native local filesystem of that
-platform, and if it still fails, the model's assumption is wrong and the model changes.
+the full byte range on Windows; an implementation that locks a different range would not be covered by them. A failing
+probe is never weakened: reproduce it on a native local filesystem of that platform, and if it still fails, the
+model's assumption is wrong and the model changes.
 
 Measured while plan 1 was written (Windows 11 NTFS, rustc 1.98): a replacing rename onto a file that is open with
 delete-sharing succeeds with `std::fs::rename` (POSIX-semantics rename) but fails with
@@ -2799,7 +2829,8 @@ name: Model
 # Lock-protocol model check: docs/superpowers/specs/2026-09-11-lock-protocol-model-check-design.md,
 # Section 4. Runs on every pull request and push to main so that `model-gate` always reports and
 # can be a required check; the scenario jobs run only when the change touches the model, the spec,
-# the filesystem probes, or this workflow.
+# the filesystem probes, the justfile (its model recipes), or this workflow. Python 3.11 is the
+# oldest version run.py supports, so CI uses it.
 
 on:
   push:
@@ -2823,7 +2854,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          python-version: "3.11"
       - name: Runner unit tests
         run: python -m unittest discover -s models/lockproto -p "test_*.py"
       - name: Decide which scenarios to run
@@ -2846,7 +2877,7 @@ jobs:
             if changed=$(git diff --name-only "$PUSH_BEFORE" "$GITHUB_SHA"); then touching=true; fi
           fi
           if [ "$touching" = true ]; then
-            pattern='^(models/|FLUX_FULL_UPDATED_SPEC_V[^/]*\.md$|crates/flux-platform/tests/fs_semantics\.rs$|\.github/workflows/model\.yml$)'
+            pattern='^(models/|FLUX_FULL_UPDATED_SPEC_V[^/]*\.md$|crates/flux-platform/tests/fs_semantics\.rs$|justfile$|\.github/workflows/model\.yml$)'
             if ! printf '%s\n' "$changed" | grep -Eq "$pattern"; then touching=false; fi
           fi
           if [ "$touching" = false ]; then
@@ -2876,7 +2907,7 @@ jobs:
           java-version: "21"
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          python-version: "3.11"
       - uses: taiki-e/install-action@just
       - name: Run the model check
         env:
