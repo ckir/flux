@@ -27,7 +27,8 @@ test job: `tests/model_stamp.rs` (stamp and traceability) and `crates/flux-platf
   (`Claims.tla`) are written after this plan lands. After this plan, `expected.toml` has only the `selftest` scenario,
   the stamp lists no spec headings, and `trace.toml` has no units; plan 2 fills them.
 - **Every file below was built and run before this plan was written**, on Windows 11 with Java 21 and Python 3.14;
-  the runner tests also ran under Python 3.11 and 3.12, and the probes also ran on Linux (tmpfs and ext4, through WSL). On macOS
+  the runner tests also ran under Python 3.11 and 3.12; on Linux (WSL Ubuntu 26.04, Java 21, `just` 1.58) `just check`,
+  `just model`, `just model-test`, and `just model-stamp` all passed, and the probes ran on tmpfs and ext4. On macOS
   the probes were only compiled and linted (`cargo clippy --target aarch64-apple-darwin`); their first macOS run is
   the existing CI test job. `just check` and `cargo deny check` were green. The file contents in this plan are those
   files, copied verbatim.
@@ -324,6 +325,13 @@ class LoadExpectedTests(unittest.TestCase):
         expected = GOOD_EXPECTED.replace('violated = ["Other"]', 'violated = ["Eventually"]')
         cfgs = dict(CFGS, **{"seed.cfg": "SPECIFICATION Spec\nPROPERTY Eventually Always\n"})
         self.assertRejected(expected, "exactly one PROPERTY", cfgs)
+
+    def test_config_must_stay_inside_the_model_directory(self) -> None:
+        for bad in ("/etc/seed.cfg", "../seed.cfg", "configs/../../seed.cfg", "C:/seed.cfg", r"configs\seed.cfg"):
+            with self.subTest(config=bad):
+                toml_string = '"' + bad.replace("\\", "\\\\") + '"'
+                self.assertRejected(GOOD_EXPECTED.replace('"seed.cfg"', toml_string),
+                                    "relative path inside the model directory")
 
     def test_missing_config_file(self) -> None:
         self.assertRejected(GOOD_EXPECTED.replace('"seed.cfg"', '"missing.cfg"'), "config missing.cfg not found")
@@ -634,7 +642,7 @@ if __name__ == "__main__":
 
 - [ ] **Step 3: Run them to see them fail**
 
-Run: `python3 -m unittest discover -s models/lockproto -p "test_*.py"`
+Run: `python3 -W error -m unittest discover -s models/lockproto -p "test_*.py"`
 Expected: an error, `ModuleNotFoundError: No module named 'run'`.
 
 - [ ] **Step 4: Write the runner**
@@ -886,8 +894,12 @@ def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
              f"{where}: name must be '<scenario>-<variant>-<kind>', plus '-<SEED_FLAG>' exactly when it is seeded")
     _require(IDENT.fullmatch(module) is not None and (base / f"{module}.tla").is_file(),
              f"{where}: module {module}.tla not found beside expected.toml")
+    _require(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_][A-Za-z0-9_.-]*)*\.cfg", config) is not None
+             and ".." not in config.split("/"),
+             f"{where}: config must be a relative path inside the model directory, with '/' separators")
     cfg_path = base / config
-    _require(config.endswith(".cfg") and cfg_path.is_file(), f"{where}: config {config} not found")
+    _require(cfg_path.resolve().is_relative_to(base.resolve()) and cfg_path.is_file(),
+             f"{where}: config {config} not found")
 
     timeout = raw.get("timeout_minutes")
     _require(isinstance(timeout, int) and not isinstance(timeout, bool) and timeout >= 1,
@@ -1450,8 +1462,8 @@ differs, stop: the pinned TLC does not behave as measured, and the parser consta
 
 - [ ] **Step 8: Run the unit tests to see them pass**
 
-Run: `python3 -m unittest discover -s models/lockproto -p "test_*.py"`
-Expected: `Ran 56 tests` and `OK`.
+Run: `python3 -W error -m unittest discover -s models/lockproto -p "test_*.py"`
+Expected: `Ran 57 tests` and `OK`.
 
 - [ ] **Step 9: Run the self-test end to end**
 
@@ -1509,14 +1521,14 @@ model scenario="":
 
 # Unit tests of the model runner (Python only, no Java)
 model-test:
-    {{python}} -m unittest discover -s models/lockproto -p "test_*.py"
+    {{python}} -W error -m unittest discover -s models/lockproto -p "test_*.py"
 
 ```
 
 - [ ] **Step 2: Run the recipes**
 
 Run: `just model selftest`, then `just model-test`, then `just model nope; echo $?`
-Expected: the four `OK` lines and `run.py: 4 runs, exit 0`; then `Ran 56 tests` and `OK`; then `run.py: unknown
+Expected: the four `OK` lines and `run.py: 4 runs, exit 0`; then `Ran 57 tests` and `OK`; then `run.py: unknown
 scenario 'nope'; known: selftest`, a `just` error line, and a non-zero status.
 
 - [ ] **Step 3: Add the recommended tools**
@@ -2856,7 +2868,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Runner unit tests
-        run: python -m unittest discover -s models/lockproto -p "test_*.py"
+        run: python -W error -m unittest discover -s models/lockproto -p "test_*.py"
       - name: Decide which scenarios to run
         id: plan
         env:
@@ -2886,7 +2898,8 @@ jobs:
             matrix=$(python models/lockproto/run.py --list-scenarios)
           fi
           echo "event=$EVENT touching=$touching matrix=$matrix"
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          # Delimited form, so a value that ever spans lines cannot add output keys.
+          { echo "matrix<<MATRIX_EOF"; echo "$matrix"; echo "MATRIX_EOF"; } >> "$GITHUB_OUTPUT"
 
   scenario:
     name: Scenario ${{ matrix.scenario }}
