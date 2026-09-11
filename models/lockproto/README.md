@@ -45,7 +45,8 @@ runs write their TLC state and logs under `target/tla/`, keyed by run name.
 
 ## How a run is judged
 
-- `check` runs use `-continue` and must report exactly their `violated` witnesses plus their `open_findings`.
+- `check` runs use `-continue` and must report exactly their `violated` witnesses plus their `open_findings`; a
+  `check` run lists at least one witness, so a model that reaches nothing cannot pass.
 - `liveness` runs check one temporal property (TLC does not name the property it reports violated, so a config
   lists exactly one) and every safety invariant in the config, with no symmetry; they pass with no violation other
   than their `open_findings`.

@@ -128,6 +128,10 @@ class LoadExpectedTests(unittest.TestCase):
         self.assertRejected(GOOD_EXPECTED.replace('kind = "liveness"', 'kind = "liveness"\nviolated = ["X"]'),
                             "a liveness run has no 'violated'")
 
+    def test_check_needs_a_witness(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace('violated = ["NeverDone"]', 'violated = []'),
+                            "at least one reachability witness")
+
     def test_seeded_needs_exactly_one(self) -> None:
         self.assertRejected(GOOD_EXPECTED.replace('violated = ["Other"]', 'violated = ["Other", "More"]'),
                             "exactly one invariant or property")

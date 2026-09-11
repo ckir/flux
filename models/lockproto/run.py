@@ -261,6 +261,9 @@ def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
         violated = _str_list(raw["violated"], f"{where}: violated")
         if kind == "seeded":
             _require(len(violated) == 1, f"{where}: a seeded run names exactly one invariant or property")
+        else:
+            # The witnesses prove the run reached its paths; without one, a model that explores nothing would pass.
+            _require(bool(violated), f"{where}: a check run lists at least one reachability witness")
 
     findings: list[OpenFinding] = []
     raw_findings = raw.get("open_findings", [])
