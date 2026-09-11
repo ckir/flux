@@ -483,7 +483,7 @@ check until the map covers it. The README renders the map for readers but is not
 Rust tests in `crates/flux-platform/tests/fs_semantics.rs`, run on Linux, macOS, and Windows by the existing test
 job. They use `rustix` on Unix (`flock` for the OS-native lock, `fstat`, `renameat2`/`renamex_np` for no-replace
 renames) and
-`windows-sys` on Windows (`CreateFileW` share flags, `LockFileEx`, `GetFileInformationByHandle`, `DeleteFileW`, and
+`windows-sys` on Windows (`CreateFileW` share flags, `LockFileEx`, `GetFileInformationByHandleEx` with `FileIdInfo`, `DeleteFileW`, and
 `MoveFileExW` with and without `MOVEFILE_REPLACE_EXISTING`) as `flux-platform` dev-dependencies, subject to `deny.toml`; no standard
 library API newer than the workspace's `rust-version` (1.85) is used, because clippy's MSRV lint would fail the gate.
 `tempfile` (already pinned in the workspace) provides each probe's scratch directory. Each probe is compiled only on
@@ -500,15 +500,21 @@ held (a second handle's non-blocking attempt fails) before it renames.
 | FS-5 | unlinking an open file succeeds and the open handle still writes to the unnamed object | Linux, macOS |
 | FS-6 | renaming or deleting a file open without delete-sharing fails, and so does a replacing rename onto a file open without delete-sharing | Windows |
 | FS-7 | renaming or deleting a file open with delete-sharing succeeds, and so does a replacing rename onto one; whether the deleted name disappears at once or stays pending until the handle closes (the probe prints which; both are allowed by the model) | Windows |
+| FS-8 | a name replaced by a new file reports a different file identity | all |
+| FS-9 | closing a handle releases its OS-native lock | all |
+| FS-10 | a directory listing returns every entry that exists for the whole listing, including one created just before it starts | all |
+| FS-11 | the OS-native lock is scoped to its handle: a process that holds it, opens a second handle to the same file, and closes that second handle still holds the lock | all |
 
 The replacing renames of FS-6 and FS-7 use `std::fs::rename`, which on current Rust performs a POSIX-semantics rename
 on Windows; that is the behaviour the model's Windows row describes. Measured on Windows 11 NTFS while plan 1 was
 written, `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` refuses any open target even with delete-sharing, so FS-7 prints
 what it does. The spec does not name the Windows API for a replacing rename; plan 2 records this as a finding.
-| FS-8 | a name replaced by a new file reports a different file identity | all |
-| FS-9 | closing a handle releases its OS-native lock | all |
-| FS-10 | a directory listing returns every entry that exists for the whole listing, including one created just before it starts | all |
-| FS-11 | the OS-native lock is scoped to its handle: a process that holds it, opens a second handle to the same file, and closes that second handle still holds the lock | all |
+
+FS-8 reads a Windows file's identity as the 64-bit volume serial number plus the 128-bit file id from
+`GetFileInformationByHandleEx(FileIdInfo)`, and a Unix file's as `(st_dev, st_ino)` widened to the same type. The
+64-bit index from `GetFileInformationByHandle` is documented as not guaranteed unique on ReFS, which Windows Dev Drives
+use. The probes pass on NTFS and ReFS (measured while plan 1 was executed). The spec does not say where a Windows
+identity comes from; plan 2 records this as a finding.
 
 Each probe prints the filesystem type of its scratch directory (`statfs` on Unix, `GetVolumeInformationW` on Windows),
 or `unknown` if that call fails; the call's failure never fails the probe, and `unknown` counts as not native for

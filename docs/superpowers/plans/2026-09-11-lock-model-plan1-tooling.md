@@ -21,7 +21,12 @@ test job: `tests/model_stamp.rs` (stamp and traceability) and `crates/flux-platf
 ## Context
 
 - **Design:** `docs/superpowers/specs/2026-09-11-lock-protocol-model-check-design.md` at commit `666fe42` (approved;
-  aligned with the measurements below). Section numbers in this plan refer to it.
+  aligned with the measurements below), plus the Section 10 note on file identity added when this plan was synced.
+  Section numbers in this plan refer to it.
+- **Executed and synced:** this plan was executed on `model/lock-protocol` (commits `4695994` to `6c11719`). Its
+  embedded files and expected outputs were then re-synced to the committed code, so they include every fix the task
+  reviews and the AGY-CAPSTONE review folded (`docs/agy-capstone-ledger.md`). Run as written, it reproduces the
+  branch's files; the fixes arrive in the tasks instead of as extra commits.
 - **Branch:** `model/lock-protocol`. Work in place on that branch; do not push.
 - **Sequence:** this is plan 1 of 3 (owner decision, 2026-09-11). Plan 2 (`FsModel.tla` + `LockProtocol.tla`) and plan 3
   (`Claims.tla`) are written after this plan lands. After this plan, `expected.toml` has only the `selftest` scenario,
@@ -86,6 +91,10 @@ Because 2116 names no property, a configuration that checks a temporal property 
    REPLACE_EXISTING)` refuses any open target even with delete-sharing, while `std::fs::rename` (a POSIX-semantics
    rename) behaves as the model's Windows row says. FS-7 prints what `MoveFileExW` does. This is recorded as a spec
    finding for plan 2 (`.clavity/local-anomalies.md`, 2026-09-11).
+6. FS-8 reads a Windows file's identity as the 64-bit volume serial plus the 128-bit id from
+   `GetFileInformationByHandleEx(FileIdInfo)`: Microsoft documents that the 64-bit index from
+   `GetFileInformationByHandle` is not guaranteed unique on ReFS, which Windows Dev Drives use. Unix `(dev, ino)` is
+   widened to the same `(u64, u128)` type. The probes pass on NTFS and ReFS.
 
 ### Rules for whoever executes a task
 
@@ -100,7 +109,12 @@ Because 2116 names no property, a configuration that checks a temporal property 
 - **Gate:** the repository's gate is `just check`. Do not add stricter flags than it uses.
 - **Shell:** run every command in a POSIX shell: bash, or Git Bash on Windows (the shell `just` itself uses there).
   The commands use `head`, `$?`, `2>&1`, and `${TMPDIR:-/tmp}`, which PowerShell and cmd do not accept.
-- **Tools:** Java 11+ (21 recommended), Python 3.11+ as `python3` (or set `PYTHON`), `just`, `cargo-nextest`, `typos`.
+- **Command-rewrite hooks:** if your shell rewrites commands before running them (an agent hook such as `rtk`), call
+  `grep` as `/usr/bin/grep`, because a rewritten `grep` can lose quoted or backslashed patterns. Run the probe command
+  in Task 4 Step 3 through the hook's passthrough (`rtk proxy cargo test ...`), because a condensed test summary hides
+  the diagnostics the probes print.
+- **Tools:** Java 11+ (21 recommended), Python 3.11+ as `python3` (or set `PYTHON`), `just`, `cargo-nextest`, `typos`,
+  and for Task 5 `actionlint` with `shellcheck`.
   Commits end with the attribution lines of the session running the plan.
 
 ## File map
@@ -117,7 +131,7 @@ Because 2116 names no property, a configuration that checks a temporal property 
 | `models/lockproto/configs/selftest-*.cfg` | Task 1 | the three self-test configurations |
 | `models/lockproto/expected.toml` | Task 1 | the run list (only `selftest` after plan 1) |
 | `justfile` | Tasks 2 and 3 | `model`, `model-test`, `model-stamp` |
-| `.claude/recommended-tools.json` | Task 2 | Java and Python entries |
+| `.claude/recommended-tools.json` | Task 2 | Java, Python, actionlint, and shellcheck entries |
 | `models/lockproto/README.md` | Task 2 | how to run, files, judging, probes, unverified assumptions |
 | `Cargo.toml` | Tasks 3 and 4 | `toml`, `rustix`, `windows-sys` in the workspace; root test dev-dependencies |
 | `models/lockproto/spec-sections.stamp` | Task 3 | spec path and stamped headings (none yet) |
@@ -294,6 +308,10 @@ class LoadExpectedTests(unittest.TestCase):
     def test_liveness_with_violated(self) -> None:
         self.assertRejected(GOOD_EXPECTED.replace('kind = "liveness"', 'kind = "liveness"\nviolated = ["X"]'),
                             "a liveness run has no 'violated'")
+
+    def test_check_needs_a_witness(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace('violated = ["NeverDone"]', 'violated = []'),
+                            "at least one reachability witness")
 
     def test_seeded_needs_exactly_one(self) -> None:
         self.assertRejected(GOOD_EXPECTED.replace('violated = ["Other"]', 'violated = ["Other", "More"]'),
@@ -914,6 +932,9 @@ def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
         violated = _str_list(raw["violated"], f"{where}: violated")
         if kind == "seeded":
             _require(len(violated) == 1, f"{where}: a seeded run names exactly one invariant or property")
+        else:
+            # The witnesses prove the run reached its paths; without one, a model that explores nothing would pass.
+            _require(bool(violated), f"{where}: a check run lists at least one reachability witness")
 
     findings: list[OpenFinding] = []
     raw_findings = raw.get("open_findings", [])
@@ -1464,7 +1485,7 @@ differs, stop: the pinned TLC does not behave as measured, and the parser consta
 - [ ] **Step 8: Run the unit tests to see them pass**
 
 Run: `python3 -W error -m unittest discover -s models/lockproto -p "test_*.py"`
-Expected: `Ran 57 tests` and `OK`.
+Expected: `Ran 58 tests` and `OK`.
 
 - [ ] **Step 9: Run the self-test end to end**
 
@@ -1498,7 +1519,7 @@ git commit -m "model: TLC runner with unit tests and the selftest scenario (lock
 
 **Files:**
 - Modify: `justfile` (insert before the `# Mutation testing over the engine` recipe)
-- Modify: `.claude/recommended-tools.json` (append two entries)
+- Modify: `.claude/recommended-tools.json` (append four entries)
 - Create: `models/lockproto/README.md`
 
 - [ ] **Step 0: State check**
@@ -1529,12 +1550,12 @@ model-test:
 - [ ] **Step 2: Run the recipes**
 
 Run: `just model selftest`, then `just model-test`, then `just model nope; echo $?`
-Expected: the four `OK` lines and `run.py: 4 runs, exit 0`; then `Ran 57 tests` and `OK`; then `run.py: unknown
+Expected: the four `OK` lines and `run.py: 4 runs, exit 0`; then `Ran 58 tests` and `OK`; then `run.py: unknown
 scenario 'nope'; known: selftest`, a `just` error line, and a non-zero status.
 
 - [ ] **Step 3: Add the recommended tools**
 
-In `.claude/recommended-tools.json`, append these two objects to the array, after the `cargo-mutants` entry (keep
+In `.claude/recommended-tools.json`, append these four objects to the array, after the `cargo-mutants` entry (keep
 the file's two-space indentation and its existing `—` escapes):
 
 ```json
@@ -1549,11 +1570,23 @@ the file's two-space indentation and its existing `—` escapes):
     "why": "Runs models/lockproto/run.py (the model-check runner) and its unit tests (`just model`, `just model-test`). Python 3.14 is the version CI and the development machines use; run.py accepts 3.11 or later (tomllib). Not needed by `just check`.",
     "install": "winget install Python.Python.3.14",
     "in_path": "python3"
+  },
+  {
+    "name": "actionlint",
+    "why": "Lints the GitHub Actions workflows, including .github/workflows/model.yml (lock-model plan 1). Runs the shell in each `run:` step through shellcheck when shellcheck is on PATH; without it that check is silently skipped (visible only with `actionlint -verbose`).",
+    "install": "winget install rhysd.actionlint",
+    "in_path": "actionlint"
+  },
+  {
+    "name": "shellcheck",
+    "why": "Lets actionlint check the shell inside workflow `run:` steps; actionlint disables that rule when shellcheck is not on PATH.",
+    "install": "winget install koalaman.shellcheck",
+    "in_path": "shellcheck"
   }
 ```
 
 Run: `python3 -c "import json; print(len(json.load(open('.claude/recommended-tools.json'))))"`
-Expected: `11`.
+Expected: `13`.
 
 - [ ] **Step 4: Write the README**
 
@@ -1590,7 +1623,8 @@ In CI, `.github/workflows/model.yml` runs the scenarios when a change touches `m
 queued rather than finished, cancel the run again from the workflow's page (reported as actions/runner#4411 for
 matrix jobs with `if: always()`; that issue is closed, and whether it is fixed is not known).
 
-To set `PYTHON` to another interpreter: `PYTHON=python just model`. Run one `just model` at a time in a checkout:
+To use another interpreter: `just python=python model` (any shell; in a POSIX shell, `PYTHON=python just model` also
+works). Run one `just model` at a time in a checkout:
 runs write their TLC state and logs under `target/tla/`, keyed by run name.
 
 ## Files
@@ -1607,7 +1641,8 @@ runs write their TLC state and logs under `target/tla/`, keyed by run name.
 
 ## How a run is judged
 
-- `check` runs use `-continue` and must report exactly their `violated` witnesses plus their `open_findings`.
+- `check` runs use `-continue` and must report exactly their `violated` witnesses plus their `open_findings`; a
+  `check` run lists at least one witness, so a model that reaches nothing cannot pass.
 - `liveness` runs check one temporal property (TLC does not name the property it reports violated, so a config
   lists exactly one) and every safety invariant in the config, with no symmetry; they pass with no violation other
   than their `open_findings`.
@@ -1725,7 +1760,7 @@ made-up-input tests at the bottom are the tests, and `model_trace_matches_spec` 
 
 Create `tests/model_stamp.rs`:
 
-````rust
+`````rust
 //! Spec-drift stamp and traceability check for the lock-protocol model.
 //!
 //! Design: docs/superpowers/specs/2026-09-11-lock-protocol-model-check-design.md, Sections 9
@@ -1764,26 +1799,56 @@ fn is_heading(line: &str) -> bool {
     (1..=6).contains(&hashes) && line.as_bytes().get(hashes) == Some(&b' ')
 }
 
-fn fence_marker(line: &str) -> Option<&'static str> {
-    ["```", "~~~"].into_iter().find(|m| line.starts_with(m))
+/// An open fenced code block, as CommonMark defines it: a run of at least three backticks or
+/// tildes opens it, and only a run of at least as many of the same character with nothing after it
+/// closes it. Indentation before a marker is ignored.
+#[derive(Clone, Copy)]
+struct Fence {
+    ch: u8,
+    len: usize,
 }
 
-/// Split the spec into sections. Heading lines inside fenced code blocks are text, not headings.
+impl Fence {
+    fn opened_by(line: &str) -> Option<Fence> {
+        let text = line.trim_start();
+        let ch = *text.as_bytes().first()?;
+        let len = text.bytes().take_while(|b| *b == ch).count();
+        ((ch == b'`' || ch == b'~') && len >= 3).then_some(Fence { ch, len })
+    }
+
+    fn closed_by(self, line: &str) -> bool {
+        let text = line.trim_start();
+        let run = text.bytes().take_while(|b| *b == self.ch).count();
+        run >= self.len && text[run..].trim().is_empty()
+    }
+}
+
+/// Advance the fence state over one line; true if the line is a fence marker (opens or closes a
+/// fence). A marker-like line inside a fence that does not close it is ordinary text.
+fn fence_marker_line(fence: &mut Option<Fence>, line: &str) -> bool {
+    match *fence {
+        Some(open) if open.closed_by(line) => {
+            *fence = None;
+            true
+        }
+        Some(_) => false,
+        None => {
+            *fence = Fence::opened_by(line);
+            fence.is_some()
+        }
+    }
+}
+
+/// Split the spec into sections. Heading lines inside fenced code blocks (indented or not) are text,
+/// not headings.
 fn sections(spec: &str) -> Vec<Section> {
     let mut out: Vec<Section> = Vec::new();
-    let mut fence: Option<&str> = None;
+    let mut fence: Option<Fence> = None;
     for line in spec.lines() {
-        match fence {
-            Some(marker) if line.starts_with(marker) => fence = None,
-            Some(_) => {}
-            None => {
-                if let Some(marker) = fence_marker(line) {
-                    fence = Some(marker);
-                } else if is_heading(line) {
-                    out.push(Section { heading: line.to_string(), lines: Vec::new() });
-                    continue;
-                }
-            }
+        let in_fence = fence.is_some();
+        if !fence_marker_line(&mut fence, line) && !in_fence && is_heading(line) {
+            out.push(Section { heading: line.to_string(), lines: Vec::new() });
+            continue;
         }
         if let Some(section) = out.last_mut() {
             section.lines.push(line.to_string());
@@ -1808,8 +1873,10 @@ fn units(lines: &[String]) -> Vec<String> {
     let mut units: Vec<Vec<&str>> = Vec::new();
     let mut in_step = false;
     let mut after_blank = true;
+    // A section's lines start outside any fence: sections() splits only outside fences.
+    let mut fence: Option<Fence> = None;
     for line in lines {
-        if line.trim().is_empty() || fence_marker(line.trim_start()).is_some() {
+        if fence_marker_line(&mut fence, line) || line.trim().is_empty() {
             after_blank = true;
             continue;
         }
@@ -1959,7 +2026,7 @@ fn check(inputs: &Inputs<'_>) -> Vec<String> {
             problems.push(format!("{at}: listed twice"));
         }
         let Some(text) = entry.ordinal.checked_sub(1).and_then(|i| units.get(i)) else {
-            problems.push(format!("{at}: the heading has only {} units", units.len()));
+            problems.push(format!("{at}: no such unit; ordinals run from 1 to {}", units.len()));
             continue;
         };
         if entry.quote.trim().is_empty() || !squash(text).contains(&squash(&entry.quote)) {
@@ -2054,8 +2121,11 @@ fn read(path: &Path) -> String {
 
 fn model_files(root: &Path) -> Vec<String> {
     let mut texts = Vec::new();
-    for entry in std::fs::read_dir(root.join(MODELS)).unwrap() {
-        let path = entry.unwrap().path();
+    let dir = root.join(MODELS);
+    let entries =
+        std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot list {}: {e}", dir.display()));
+    for entry in entries {
+        let path = entry.unwrap_or_else(|e| panic!("cannot list {}: {e}", dir.display())).path();
         if path.extension().is_some_and(|e| e == "tla") {
             texts.push(read(&path));
         }
@@ -2184,6 +2254,62 @@ fn fenced_heading_is_not_a_heading() {
             "## 1.4 Indented list"
         ]
     );
+}
+
+#[test]
+fn indented_fence_hides_a_heading_line() {
+    // The fence is indented under a list item; the line inside it starts at column 0.
+    let spec = "## 2.1 Parent
+
+1. A step with code:
+
+   ``` text
+## 2.9 Not a heading
+   ```
+
+## 2.2 Next
+Text.
+";
+    let headings: Vec<String> = sections(spec).into_iter().map(|s| s.heading).collect();
+    assert_eq!(headings, ["## 2.1 Parent", "## 2.2 Next"]);
+}
+
+#[test]
+fn longer_fence_is_not_closed_by_a_shorter_marker() {
+    // A four-backtick fence showing a Markdown sample: the inner ``` lines are text, so the
+    // heading-like line between them stays text and is hashed with its unit.
+    let spec = "## 3.1 Parent
+Before.
+
+````markdown
+```text
+## 3.9 Not a heading
+```
+````
+
+After.
+
+## 3.2 Next
+Text.
+";
+    let parts = sections(spec);
+    let headings: Vec<&str> = parts.iter().map(|s| s.heading.as_str()).collect();
+    assert_eq!(headings, ["## 3.1 Parent", "## 3.2 Next"]);
+    assert_eq!(units(&parts[0].lines), ["Before.", "```text\n## 3.9 Not a heading\n```", "After."]);
+}
+
+#[test]
+fn marker_with_trailing_text_does_not_close_a_fence() {
+    let spec = "## 4.1 Parent
+```
+```text
+## 4.9 Not a heading
+```
+
+## 4.2 Next
+";
+    let headings: Vec<String> = sections(spec).into_iter().map(|s| s.heading).collect();
+    assert_eq!(headings, ["## 4.1 Parent", "## 4.2 Next"]);
 }
 
 #[test]
@@ -2341,19 +2467,19 @@ fn rewrite_updates_only_hash_lines() {
     assert!(rewritten.contains(&format!("hash = \"{good}\"")));
     assert!(!rewritten.contains("stale"));
 }
-````
+`````
 
 - [ ] **Step 4: Run it**
 
 Run: `cargo test --test model_stamp`
-Expected: `test result: ok. 16 passed; 0 failed; 1 ignored` (the ignored one is `rewrite_unit_hashes`).
+Expected: `test result: ok. 19 passed; 0 failed; 1 ignored` (the ignored one is `rewrite_unit_hashes`).
 
 - [ ] **Step 5: Prove the step rule is load-bearing**
 
 Temporarily change the last line of `is_step` from `digits > 0 && text[digits..].starts_with(". ")` to
 `false && digits > 0`, run `cargo test --test model_stamp`, and expect exactly four failures:
 `complete_map_passes`, `indented_numbered_steps_are_units`, `numbered_steps_are_units_and_keep_indented_lines`, and
-`numbered_steps_inside_a_fence_are_units`. Restore the line and rerun: 16 passed.
+`numbered_steps_inside_a_fence_are_units`. Restore the line and rerun: 19 passed.
 
 - [ ] **Step 6: Add the `model-stamp` recipe**
 
@@ -2369,7 +2495,7 @@ model-stamp:
 
 Run (`trace.toml` is not committed yet, so compare against a copy rather than with `git diff`):
 `cp models/lockproto/trace.toml "${TMPDIR:-/tmp}/trace.before" && just model-stamp && cmp "${TMPDIR:-/tmp}/trace.before" models/lockproto/trace.toml && echo UNCHANGED`
-Expected: `run.py: 4 runs, exit 0`, then `test rewrite_unit_hashes ... ok` with `16 filtered out`, then `UNCHANGED`.
+Expected: `run.py: 4 runs, exit 0`, then `test rewrite_unit_hashes ... ok` with `19 filtered out`, then `UNCHANGED`.
 
 - [ ] **Step 7: Format and lint as the gate does**
 
@@ -2451,6 +2577,9 @@ use std::path::Path;
 
 use tempfile::TempDir;
 
+/// A fresh directory for one probe. Bind it first in each test so it drops after every handle
+/// opened inside it: `TempDir` ignores a failed removal, and Windows cannot remove a file that is
+/// still open without delete-sharing.
 fn scratch() -> TempDir {
     let dir = tempfile::tempdir().expect("create a scratch directory");
     println!("scratch filesystem: {}", platform::fs_type(dir.path()));
@@ -2487,14 +2616,15 @@ mod platform {
         rustix::fs::renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE).map_err(Into::into)
     }
 
-    pub fn identity_of_handle(file: &File) -> (u64, u64) {
+    /// Device and inode, widened to the Windows identity type.
+    pub fn identity_of_handle(file: &File) -> (u64, u128) {
         let meta = file.metadata().expect("fstat");
-        (meta.dev(), meta.ino())
+        (meta.dev(), u128::from(meta.ino()))
     }
 
-    pub fn identity_of_name(path: &Path) -> (u64, u64) {
+    pub fn identity_of_name(path: &Path) -> (u64, u128) {
         let meta = std::fs::metadata(path).expect("stat");
-        (meta.dev(), meta.ino())
+        (meta.dev(), u128::from(meta.ino()))
     }
 
     #[cfg(target_os = "linux")]
@@ -2529,8 +2659,8 @@ mod platform {
 
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, DeleteFileW, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, GetFileInformationByHandle, GetVolumeInformationW, GetVolumePathNameW,
+        DeleteFileW, FILE_ID_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FileIdInfo, GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW,
         LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, MOVEFILE_REPLACE_EXISTING,
         MoveFileExW,
     };
@@ -2591,19 +2721,27 @@ mod platform {
         check(unsafe { DeleteFileW(wide(path).as_ptr()) })
     }
 
-    pub fn identity_of_handle(file: &File) -> (u64, u64) {
-        // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is valid; the handle is open.
+    /// Volume serial and the 128-bit file id. The 64-bit `nFileIndex` from
+    /// `GetFileInformationByHandle` is not guaranteed unique on ReFS (Dev Drive), so read
+    /// `FILE_ID_INFO` instead.
+    pub fn identity_of_handle(file: &File) -> (u64, u128) {
+        // SAFETY: an all-zero FILE_ID_INFO is valid; the handle is open and the buffer size
+        // passed is the size of the struct written to.
         let info = unsafe {
-            let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
-            check(GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info))
-                .expect("GetFileInformationByHandle");
+            let mut info: FILE_ID_INFO = std::mem::zeroed();
+            check(GetFileInformationByHandleEx(
+                file.as_raw_handle() as HANDLE,
+                FileIdInfo,
+                (&raw mut info).cast(),
+                size_of::<FILE_ID_INFO>() as u32,
+            ))
+            .expect("GetFileInformationByHandleEx(FileIdInfo)");
             info
         };
-        let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
-        (u64::from(info.dwVolumeSerialNumber), index)
+        (info.VolumeSerialNumber, u128::from_le_bytes(info.FileId.Identifier))
     }
 
-    pub fn identity_of_name(path: &Path) -> (u64, u64) {
+    pub fn identity_of_name(path: &Path) -> (u64, u128) {
         identity_of_handle(&open(path))
     }
 
@@ -2650,8 +2788,14 @@ fn fs2_no_replace_rename_fails_when_target_exists() {
     let (from, to) = (dir.path().join("from"), dir.path().join("to"));
     drop(create(&from));
     drop(create(&to));
-    assert!(rename_no_replace(&from, &to).is_err(), "no-replace rename replaced an existing name");
+    let refused = rename_no_replace(&from, &to).err().map(|e| e.kind());
+    assert_eq!(refused, Some(ErrorKind::AlreadyExists), "no-replace rename onto an existing name");
     assert!(from.exists() && to.exists());
+    // Control: the same call onto a free name moves `from`, so the refusal above came from the
+    // existing target, not from an unsupported flag or swapped arguments.
+    let free = dir.path().join("free");
+    rename_no_replace(&from, &free).expect("no-replace rename onto a free name");
+    assert!(!from.exists() && free.exists());
 }
 
 #[test]
@@ -2738,13 +2882,16 @@ fn fs7_file_open_with_delete_sharing_can_be_renamed_deleted_and_replaced() {
     let source = dir.path().join("source");
     drop(create(&target));
     drop(create(&source));
+    let source_id = identity_of_name(&source);
     let _held_target = platform::open_shared(&target, true);
     let legacy = platform::rename(&source, &target, true);
     println!("MoveFileExW(MOVEFILE_REPLACE_EXISTING) onto an open, delete-shared file: {legacy:?}");
     // The model's replacing rename is the POSIX-semantics rename that std::fs::rename uses; the
-    // legacy MoveFileExW replace above refuses any open target (measured on Windows 11 NTFS).
+    // legacy MoveFileExW replace above refuses any open target (measured on Windows 11 NTFS and
+    // ReFS).
     std::fs::rename(&source, &target).expect("replacing rename onto a shared-delete file");
     assert!(!source.exists());
+    assert_eq!(identity_of_name(&target), source_id, "the name does not hold the moved file");
 }
 
 #[test]
@@ -2754,7 +2901,8 @@ fn fs8_name_replaced_by_new_file_reports_new_identity() {
     let old = create(&path);
     let old_id = identity_of_handle(&old);
     drop(create(&fresh));
-    // Keep the old object open so its identity cannot be reused while we compare.
+    // `fresh` is created while the old file is still named and open, so the two are distinct
+    // objects; the probe checks that the name reports the new one after the replace.
     std::fs::rename(&fresh, &path).expect("replace the name with a new file");
     assert_ne!(identity_of_name(&path), old_id, "a replaced name reported the old identity");
 }
@@ -2891,12 +3039,13 @@ jobs:
           # touching: true (a relevant file changed), false (none did), unknown (cannot tell: run everything)
           touching=unknown
           changed=""
+          # --no-renames lists a moved file under both names, so moving one out of a watched path counts.
           if [ "$EVENT" = "pull_request" ]; then
-            if changed=$(git diff --name-only "$PR_BASE...$PR_HEAD"); then touching=true; fi
+            if changed=$(git diff --no-renames --name-only "$PR_BASE...$PR_HEAD"); then touching=true; fi
           elif [ "$EVENT" = "push" ] && [ -n "$PUSH_BEFORE" ] \
                && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ] \
                && git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
-            if changed=$(git diff --name-only "$PUSH_BEFORE" "$GITHUB_SHA"); then touching=true; fi
+            if changed=$(git diff --no-renames --name-only "$PUSH_BEFORE" "$GITHUB_SHA"); then touching=true; fi
           fi
           if [ "$touching" = true ]; then
             pattern='^(models/|FLUX_FULL_UPDATED_SPEC_V[^/]*\.md$|crates/flux-platform/tests/fs_semantics\.rs$|justfile$|\.github/workflows/model\.yml$)'
@@ -2968,11 +3117,15 @@ jobs:
           fi
 ````
 
-- [ ] **Step 2: Lint it, if `actionlint` is available**
+- [ ] **Step 2: Lint it, with shellcheck**
 
-Run: `actionlint .github/workflows/model.yml`
-Expected: no output, exit 0. (If `actionlint` is not installed, download the release binary for your platform from
-`github.com/rhysd/actionlint/releases` into a temporary directory and run it from there; do not commit it.)
+`actionlint` checks the shell in each `run:` step only when `shellcheck` is on `PATH`; without it that rule is
+skipped silently. Both are in `.claude/recommended-tools.json` (Task 2). If either is not installed, download its
+release binary (`github.com/rhysd/actionlint/releases`, `github.com/koalaman/shellcheck/releases`) into a temporary
+directory on `PATH`; do not commit it.
+
+Run: `actionlint -verbose .github/workflows/model.yml 2>&1 | grep -i "shellcheck\|total"`
+Expected: `Found total 0 errors ...` and no line saying `Rule "shellcheck" was disabled`.
 
 - [ ] **Step 3: Exercise the `plan` job's change detection locally**
 
@@ -3004,6 +3157,21 @@ event=push touching=false matrix=[]
 event=workflow_dispatch touching=unknown matrix=["selftest"]
 ```
 
+Then check that moving a watched file out of `models/` still counts as touching the model. `git diff --name-only`
+lists only the new path of a detected rename, which is why the step passes `--no-renames`. In the same shell, build
+a throwaway repository with one such move and a stub runner, and run the step there:
+
+```bash
+scratch="${TMPDIR:-/tmp}/rename-check"; rm -rf "$scratch"; mkdir -p "$scratch/models/lockproto"
+( cd "$scratch" && git init -q && echo a > models/bar.txt && git add models/bar.txt \
+  && git -c user.name=x -c user.email=x@x commit -qm one && git mv models/bar.txt outside.txt \
+  && git -c user.name=x -c user.email=x@x commit -qm two \
+  && printf 'print(%s)\n' "'[\"selftest\"]'" > models/lockproto/run.py \
+  && EVENT=pull_request PR_BASE=HEAD~1 PR_HEAD=HEAD run_plan )
+```
+
+Expected: `event=pull_request touching=true matrix=["selftest"]` (without `--no-renames` it reads `touching=false`).
+
 - [ ] **Step 4: Commit**
 
 ```bash
@@ -3020,7 +3188,7 @@ git commit -m "model: CI workflow with plan, scenario, and model-gate jobs (lock
 - [ ] **Step 1: Run the repository gate**
 
 Run: `just check`
-Expected: exit 0; nextest's summary reads `26 tests run: 26 passed, 1 skipped` (1 existing integration test, 16
+Expected: exit 0; nextest's summary reads `29 tests run: 29 passed, 1 skipped` (1 existing integration test, 19
 stamp tests, 9 probes; nextest does not count the skipped `rewrite_unit_hashes` as run).
 
 - [ ] **Step 2: Run the dependency audit**
