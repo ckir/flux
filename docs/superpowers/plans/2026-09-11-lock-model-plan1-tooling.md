@@ -20,16 +20,17 @@ test job: `tests/model_stamp.rs` (stamp and traceability) and `crates/flux-platf
 
 ## Context
 
-- **Design:** `docs/superpowers/specs/2026-09-11-lock-protocol-model-check-design.md` at commit `1de0f65` (approved;
+- **Design:** `docs/superpowers/specs/2026-09-11-lock-protocol-model-check-design.md` at commit `022a565` (approved;
   aligned with the measurements below). Section numbers in this plan refer to it.
 - **Branch:** `model/lock-protocol`. Work in place on that branch; do not push.
 - **Sequence:** this is plan 1 of 3 (owner decision, 2026-09-11). Plan 2 (`FsModel.tla` + `LockProtocol.tla`) and plan 3
   (`Claims.tla`) are written after this plan lands. After this plan, `expected.toml` has only the `selftest` scenario,
   the stamp lists no spec headings, and `trace.toml` has no units; plan 2 fills them.
-- **Every file below was built and run before this plan was written** (Windows 11 with Java 21 and Python 3.14; the
-  runner tests also under Python 3.12; the probes also on Linux tmpfs and ext4 through WSL; clippy for Linux, macOS and
-  Windows targets; `just check` and `cargo deny check` green). The file contents in this plan are those files, copied
-  verbatim.
+- **Every file below was built and run before this plan was written**, on Windows 11 with Java 21 and Python 3.14;
+  the runner tests also ran under Python 3.12, and the probes also ran on Linux (tmpfs and ext4, through WSL). On macOS
+  the probes were only compiled and linted (`cargo clippy --target aarch64-apple-darwin`); their first macOS run is
+  the existing CI test job. `just check` and `cargo deny check` were green. The file contents in this plan are those
+  files, copied verbatim.
 
 ### What exists now (verified by reading the files)
 
@@ -72,7 +73,7 @@ is a rolling prerelease whose asset changes, so it cannot be pinned. With `-tool
 Because 2116 names no property, a configuration that checks a temporal property lists exactly one `PROPERTY`
 (design Section 4). `-workers auto` works. TLC wrote no trace files beside the model with these flags.
 
-### Deviations from the design text, all already folded into the design at `1de0f65`
+### Deviations from the design text, all already folded into the design at `022a565`
 
 1. `just model <scenario>` instead of `just model scenario=<name>`: `just` accepts `name=value` only as a variable
    override before the recipe name.
@@ -96,6 +97,8 @@ Because 2116 names no property, a configuration that checks a temporal property 
   written. Implement until they pass; never edit a test to match the code. A failing probe is never weakened (design
   Section 10).
 - **Gate:** the repository's gate is `just check`. Do not add stricter flags than it uses.
+- **Shell:** run every command in a POSIX shell: bash, or Git Bash on Windows (the shell `just` itself uses there).
+  The commands use `head`, `$?`, `2>&1`, and `${TMPDIR:-/tmp}`, which PowerShell and cmd do not accept.
 - **Tools:** Java 11+ (21 recommended), Python 3.11+ as `python3` (or set `PYTHON`), `just`, `cargo-nextest`, `typos`.
   Commits end with the attribution lines of the session running the plan.
 
@@ -275,6 +278,13 @@ class LoadExpectedTests(unittest.TestCase):
     def test_bad_name(self) -> None:
         self.assertRejected(GOOD_EXPECTED.replace('"demo-posix-liveness"', '"liveness-demo"'), "name must be")
 
+    def test_seeded_name_carries_its_seed(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace('"demo-posix-seeded-SEED_X"', '"demo-posix-seeded"'), "exactly when it is seeded")
+
+    def test_only_seeded_names_carry_a_seed(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace('"demo-posix-liveness"', '"demo-posix-liveness-SEED_X"'),
+                            "exactly when it is seeded")
+
     def test_duplicate_names(self) -> None:
         self.assertRejected(GOOD_EXPECTED.replace('"demo-posix-seeded-SEED_X"', '"demo-posix-check"')
                             .replace('kind = "seeded"', 'kind = "check"'), "duplicate run names")
@@ -335,6 +345,18 @@ class CfgTests(unittest.TestCase):
         self.assertIn("FIX_A = TRUE", fixed)
         self.assertIn("FIX_B = TRUE", fixed)
         self.assertIn("SEED_C = FALSE", fixed)
+
+    def test_keywords_inside_strings_are_values(self) -> None:
+        text = 'CONSTANT Kind = "VIEW"\nPROPERTY Real\nCONSTANT Other = "SYMMETRY"\n'
+        sections = run.cfg_sections(text)
+        self.assertEqual(run.cfg_properties(text), ["Real"])
+        self.assertNotIn("VIEW", sections)
+        self.assertNotIn("SYMMETRY", sections)
+
+    def test_fixed_cfg_leaves_comments_alone(self) -> None:
+        text = "\\* set FIX_A = FALSE to see the defect\n(* FIX_A = FALSE *)\nCONSTANT FIX_A = FALSE\n"
+        fixed = run.fixed_cfg_text(text, ["FIX_A"])
+        self.assertEqual(fixed, "\\* set FIX_A = FALSE to see the defect\n(* FIX_A = FALSE *)\nCONSTANT FIX_A = TRUE\n")
 
     def test_fixed_cfg_rejects_a_missing_flag(self) -> None:
         with self.assertRaises(run.ExpectedError):
@@ -471,6 +493,25 @@ class EnsureJarTests(unittest.TestCase):
         self.assertEqual(jar.read_bytes(), self.good)
         self.assertEqual(self.calls, 2)
 
+    def failing_then(self, payload: bytes | None):
+        def fetch(url: str, dest: Path) -> None:
+            self.calls += 1
+            if self.calls == 1 or payload is None:
+                raise run.ToolingError("connection reset")
+            dest.write_bytes(payload)
+        return fetch
+
+    def test_failed_download_is_retried_once(self) -> None:
+        jar = run.ensure_jar(self.target, self.failing_then(self.good), self.good_sha)
+        self.assertEqual(jar.read_bytes(), self.good)
+        self.assertEqual(self.calls, 2)
+
+    def test_two_failed_downloads_fail_with_the_cause(self) -> None:
+        with self.assertRaises(run.ToolingError) as ctx:
+            run.ensure_jar(self.target, self.failing_then(None), self.good_sha)
+        self.assertEqual(self.calls, 2)
+        self.assertIn("connection reset", str(ctx.exception))
+
     def test_two_bad_downloads_fail(self) -> None:
         with self.assertRaises(run.ToolingError):
             run.ensure_jar(self.target, self.fetch_returning(b"bad"), self.good_sha)
@@ -525,6 +566,30 @@ class ExecuteTests(unittest.TestCase):
         result = run.execute(slow, Path("unused.jar"), self.base, fixed=False)
         self.assertEqual(result.status, "tooling")
         self.assertEqual(result.detail, "TIMEOUT after 0 min")
+
+
+class MainTests(unittest.TestCase):
+    """main() keeps its 0/1/2 contract when the environment fails."""
+
+    def setUp(self) -> None:
+        for name in ("ensure_jar", "execute"):
+            self.addCleanup(setattr, run, name, getattr(run, name))
+        self.addCleanup(setattr, run.shutil, "which", run.shutil.which)
+        run.shutil.which = lambda _name: "java"
+
+    def test_unwritable_target_is_exit_2(self) -> None:
+        def ensure_jar() -> Path:
+            raise PermissionError("target/tla is read-only")
+        run.ensure_jar = ensure_jar
+        self.assertEqual(run.main(["--expected", str(HERE / "expected.toml")]), 2)
+
+    def test_interrupt_is_exit_2(self) -> None:
+        run.ensure_jar = lambda: Path("unused.jar")
+
+        def execute(*_args: object) -> run.Result:
+            raise KeyboardInterrupt
+        run.execute = execute
+        self.assertEqual(run.main(["--expected", str(HERE / "expected.toml")]), 2)
 
 
 class CommandTests(unittest.TestCase):
@@ -685,13 +750,26 @@ class Result:
 # TLC configuration files
 
 
+# A .cfg token: a block comment, a line comment, a string, `<-`, a word, or any other character.
+_CFG_TOKEN = re.compile(r'\(\*.*?\*\)|\\\*[^\n]*|"(?:[^"\\\n]|\\.)*"|<-|[A-Za-z0-9_]+|\S', re.S)
+
+
+def _is_comment(token: str) -> bool:
+    return token.startswith(("(*", "\\*"))
+
+
 def cfg_sections(text: str) -> dict[str, list[str]]:
-    """Map each keyword of a TLC .cfg file (singular form) to the tokens that follow it."""
-    text = re.sub(r"\(\*.*?\*\)", " ", text, flags=re.S)
-    text = re.sub(r"\\\*[^\n]*", " ", text)
+    """Map each keyword of a TLC .cfg file (singular form) to the tokens that follow it.
+
+    Comments are skipped, and a string literal is a value, never a keyword."""
     sections: dict[str, list[str]] = {}
     current: str | None = None
-    for token in re.findall(r"<-|[A-Za-z0-9_]+|\S", text):
+    for match in _CFG_TOKEN.finditer(text):
+        token = match.group(0)
+        if _is_comment(token):
+            continue
+        if token.startswith('"'):
+            token = '""'
         if token in CFG_KEYWORDS:
             current = CFG_KEYWORDS[token]
             sections.setdefault(current, [])
@@ -705,12 +783,15 @@ def cfg_properties(text: str) -> list[str]:
 
 
 def fixed_cfg_text(text: str, flags: list[str]) -> str:
-    """Return the .cfg text with each fix flag switched from FALSE to TRUE."""
+    """Return the .cfg text with each fix flag switched from FALSE to TRUE (comments are left alone)."""
     for flag in flags:
+        comments = [m.span() for m in _CFG_TOKEN.finditer(text) if _is_comment(m.group(0))]
         pattern = re.compile(rf"\b{re.escape(flag)}\s*=\s*FALSE\b")
-        if len(pattern.findall(text)) != 1:
-            raise ExpectedError(f"fix flag {flag} must appear exactly once as '{flag} = FALSE' in the config")
-        text = pattern.sub(f"{flag} = TRUE", text)
+        hits = [m for m in pattern.finditer(text) if not any(a <= m.start() < b for a, b in comments)]
+        if len(hits) != 1:
+            raise ExpectedError(f"fix flag {flag} must appear exactly once as '{flag} = FALSE' in the config "
+                                "(outside comments)")
+        text = text[: hits[0].start()] + f"{flag} = TRUE" + text[hits[0].end():]
     return text
 
 
@@ -777,8 +858,9 @@ def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
 
     _require(kind in KINDS, f"{where}: kind must be one of {KINDS}")
     _require(scenario in scenarios, f"{where}: scenario {scenario!r} is not in 'scenarios'")
-    _require(re.fullmatch(rf"{re.escape(scenario)}-[a-z0-9]+(-[a-z0-9]+)*-{kind}(-[A-Z][A-Z0-9_]*)?", name) is not None,
-             f"{where}: name must be '<scenario>-<variant>-<kind>' plus '-<SEED_FLAG>' for a seeded run")
+    seed = r"-[A-Z][A-Z0-9_]*" if kind == "seeded" else ""
+    _require(re.fullmatch(rf"{re.escape(scenario)}-[a-z0-9]+(-[a-z0-9]+)*-{kind}{seed}", name) is not None,
+             f"{where}: name must be '<scenario>-<variant>-<kind>', plus '-<SEED_FLAG>' exactly when it is seeded")
     _require(IDENT.fullmatch(module) is not None and (base / f"{module}.tla").is_file(),
              f"{where}: module {module}.tla not found beside expected.toml")
     cfg_path = base / config
@@ -929,25 +1011,34 @@ def download(url: str, dest: Path) -> None:
     try:
         with urllib.request.urlopen(url, timeout=120) as response, tmp.open("wb") as out:
             shutil.copyfileobj(response, out)
+        tmp.replace(dest)
     except OSError as err:
-        raise ToolingError(f"cannot download {url}: {err}") from err
-    tmp.replace(dest)
+        raise ToolingError(f"cannot download {url} to {dest}: {err}") from err
 
 
 def ensure_jar(target: Path = TARGET, fetch: Callable[[str, Path], None] = download,
                expected_sha: str = TLA_SHA256) -> Path:
-    """Return a tla2tools.jar whose SHA-256 matches the pin, downloading at most twice."""
+    """Return a tla2tools.jar whose SHA-256 matches the pin, downloading at most twice.
+
+    A download that fails, or that yields the wrong hash, uses up one of the two attempts."""
     target.mkdir(parents=True, exist_ok=True)
     jar = target / "tla2tools.jar"
     if jar.is_file() and sha256(jar) == expected_sha:
         return jar
+    mismatch = f"tla2tools.jar {TLA_TAG} does not match its pinned SHA-256"
+    failure = mismatch
     for _ in range(2):
         jar.unlink(missing_ok=True)
-        fetch(TLA_URL, jar)
+        try:
+            fetch(TLA_URL, jar)
+        except ToolingError as err:
+            failure = str(err)
+            continue
         if jar.is_file() and sha256(jar) == expected_sha:
             return jar
+        failure = mismatch
     jar.unlink(missing_ok=True)
-    raise ToolingError(f"tla2tools.jar {TLA_TAG} does not match its pinned SHA-256 after downloading it again")
+    raise ToolingError(f"{failure} (after two download attempts)")
 
 
 # ---------------------------------------------------------------------------------------
@@ -988,6 +1079,10 @@ def execute(run: Run, jar: Path, base: Path, fixed: bool) -> Result:
             proc.kill()
             proc.wait()
             code = None
+        except BaseException:  # KeyboardInterrupt: never leave TLC running
+            proc.kill()
+            proc.wait()
+            raise
     seconds = time.monotonic() - start
     output = log.read_text(encoding="utf-8", errors="replace")
 
@@ -1042,20 +1137,24 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         jar = ensure_jar()
-    except ToolingError as err:
+    except (ToolingError, OSError) as err:
         print(f"run.py: {err}", file=sys.stderr)
         return 2
 
     base = args.expected.resolve().parent
     results: list[Result] = []
-    for run in selected:
-        for fixed in (False, True) if run.open_findings else (False,):
-            try:
-                result = execute(run, jar, base, fixed)
-            except (OSError, ExpectedError) as err:
-                result = Result(run.name, "tooling", frozenset(), frozenset(), None, 0.0, str(err), (), None)
-            report(result)
-            results.append(result)
+    try:
+        for run in selected:
+            for fixed in (False, True) if run.open_findings else (False,):
+                try:
+                    result = execute(run, jar, base, fixed)
+                except (OSError, ExpectedError) as err:
+                    result = Result(run.name, "tooling", frozenset(), frozenset(), None, 0.0, str(err), (), None)
+                report(result)
+                results.append(result)
+    except KeyboardInterrupt:
+        print(f"run.py: interrupted after {len(results)} runs", file=sys.stderr)
+        return 2
     code = exit_code(results)
     print(f"run.py: {len(results)} runs, exit {code}")
     return code
@@ -1328,7 +1427,7 @@ differs, stop: the pinned TLC does not behave as measured, and the parser consta
 - [ ] **Step 8: Run the unit tests to see them pass**
 
 Run: `python3 -m unittest discover -s models/lockproto -p "test_*.py"`
-Expected: `Ran 47 tests` and `OK`.
+Expected: `Ran 55 tests` and `OK`.
 
 - [ ] **Step 9: Run the self-test end to end**
 
@@ -1393,7 +1492,7 @@ model-test:
 - [ ] **Step 2: Run the recipes**
 
 Run: `just model selftest`, then `just model-test`, then `just model nope; echo $?`
-Expected: the four `OK` lines and `run.py: 4 runs, exit 0`; then `Ran 47 tests` and `OK`; then `run.py: unknown
+Expected: the four `OK` lines and `run.py: 4 runs, exit 0`; then `Ran 55 tests` and `OK`; then `run.py: unknown
 scenario 'nope'; known: selftest`, a `just` error line, and a non-zero status.
 
 - [ ] **Step 3: Add the recommended tools**
@@ -1449,7 +1548,8 @@ matched its expectation, 1 when one did not, and 2 for a tooling failure (Java m
 failure, a TLC error, or a timeout). `just check` runs the Rust side (the stamp and traceability test and the
 filesystem probes) and needs no Java or Python.
 
-To set `PYTHON` to another interpreter: `PYTHON=python just model`.
+To set `PYTHON` to another interpreter: `PYTHON=python just model`. Run one `just model` at a time in a checkout:
+runs write their TLC state and logs under `target/tla/`, keyed by run name.
 
 ## Files
 
@@ -1477,7 +1577,8 @@ To set `PYTHON` to another interpreter: `PYTHON=python just model`.
 ## Filesystem probes
 
 `crates/flux-platform/tests/fs_semantics.rs` holds FS-1 to FS-11 (design Section 10). Each prints the filesystem type
-of its scratch directory. A failing probe is never weakened: reproduce it on a native local filesystem of that
+of its scratch directory. The OS-native lock they probe covers the whole file: `flock` on Unix, and `LockFileEx` over
+the full byte range on Windows; an implementation that locks a different range would not be covered by them. A failing probe is never weakened: reproduce it on a native local filesystem of that
 platform, and if it still fails, the model's assumption is wrong and the model changes.
 
 Measured while plan 1 was written (Windows 11 NTFS, rustc 1.98): a replacing rename onto a file that is open with
@@ -1648,21 +1749,24 @@ fn sections(spec: &str) -> Vec<Section> {
     out
 }
 
+/// A numbered step: optional indentation, digits, a dot, and a space (`1. Open`, `    2.  Take`).
 fn is_step(line: &str) -> bool {
-    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
-    digits > 0 && line[digits..].starts_with(". ")
+    let text = line.trim_start();
+    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0 && text[digits..].starts_with(". ")
 }
 
-/// The units of a heading's own text (design Section 9.1): blocks separated by blank lines,
-/// except that a numbered step and its indented continuation lines form one unit, even across
-/// blank lines, and each numbered step starts a new unit. A unit's text is its non-blank lines
-/// joined by '\n'.
+/// The units of a heading's own text (design Section 9.1): blocks separated by blank lines or
+/// fence-marker lines (which belong to no unit), except that each numbered step starts a new
+/// unit and keeps the indented lines that follow it, even across blank lines. A unit's text is
+/// its lines joined by '\n'. The numbered steps of Sections 21.1 and 240.1 sit inside fences, so
+/// a fence does not stop a step from being its own unit.
 fn units(lines: &[String]) -> Vec<String> {
     let mut units: Vec<Vec<&str>> = Vec::new();
     let mut in_step = false;
     let mut after_blank = true;
     for line in lines {
-        if line.trim().is_empty() {
+        if line.trim().is_empty() || fence_marker(line.trim_start()).is_some() {
             after_blank = true;
             continue;
         }
@@ -1877,6 +1981,24 @@ fn rewrite_hashes(trace_text: &str, spec: &str) -> Result<String, String> {
             out.push('\n');
         }
     }
+    // The edit is line-based, so prove it changed the hashes and nothing else (a multi-line
+    // string with a line starting `hash =` would otherwise be rewritten too).
+    let rewritten: Trace = toml::from_str(&out).map_err(|e| format!("rewritten map: {e}"))?;
+    let only_hashes = rewritten.unit.len() == trace.unit.len()
+        && rewritten.unit.iter().zip(&trace.unit).zip(&hashes).all(|((new, old), hash)| {
+            new.heading == old.heading
+                && new.ordinal == old.ordinal
+                && new.quote == old.quote
+                && new.labels == old.labels
+                && new.not_modelled == old.not_modelled
+                && Some(&new.hash) == hash.as_ref().or(Some(&old.hash))
+        });
+    if !only_hashes {
+        return Err(
+            "rewriting the hash lines would change more than the hashes; fix trace.toml by hand"
+                .into(),
+        );
+    }
     Ok(out)
 }
 
@@ -1962,6 +2084,24 @@ Not indented, so a new unit.
 
 ## 1.2.1 Child
 Child text.
+
+## 1.3 Fenced steps
+
+In this order:
+
+``` text
+1. acquire the lock
+   without waiting
+2. mark the prior operation
+```
+
+After the fence.
+
+## 1.4 Indented list
+
+    1.  First item
+        more of it
+    2.  Second item
 ";
 
 fn stamp(headings: &[&str]) -> Stamp {
@@ -1990,16 +2130,51 @@ fn entry(heading: &str, ordinal: usize, quote: &str, labels: &[&str]) -> String 
 #[test]
 fn fenced_heading_is_not_a_heading() {
     let headings: Vec<String> = sections(SPEC).into_iter().map(|s| s.heading).collect();
-    assert_eq!(headings, ["# 1. Top", "## 1.1 Alpha", "## 1.2 Steps", "## 1.2.1 Child"]);
+    assert_eq!(
+        headings,
+        [
+            "# 1. Top",
+            "## 1.1 Alpha",
+            "## 1.2 Steps",
+            "## 1.2.1 Child",
+            "## 1.3 Fenced steps",
+            "## 1.4 Indented list"
+        ]
+    );
 }
 
 #[test]
 fn units_split_at_blank_lines_and_fences() {
-    let got = section_units("## 1.1 Alpha");
-    assert_eq!(got.len(), 4, "{got:#?}");
-    assert_eq!(got[0], "First paragraph of alpha\ncontinues here.");
-    assert_eq!(got[2], "``` text\n## 9.9 Not a heading\nstill fenced");
-    assert_eq!(got[3], "after a blank line in the fence\n```");
+    assert_eq!(
+        section_units("## 1.1 Alpha"),
+        [
+            "First paragraph of alpha\ncontinues here.",
+            "Second paragraph.",
+            "## 9.9 Not a heading\nstill fenced",
+            "after a blank line in the fence",
+        ]
+    );
+}
+
+#[test]
+fn numbered_steps_inside_a_fence_are_units() {
+    assert_eq!(
+        section_units("## 1.3 Fenced steps"),
+        [
+            "In this order:",
+            "1. acquire the lock\n   without waiting",
+            "2. mark the prior operation",
+            "After the fence.",
+        ]
+    );
+}
+
+#[test]
+fn indented_numbered_steps_are_units() {
+    assert_eq!(
+        section_units("## 1.4 Indented list"),
+        ["    1.  First item\n        more of it", "    2.  Second item"]
+    );
 }
 
 #[test]
@@ -2107,6 +2282,13 @@ fn stamp_format() {
 }
 
 #[test]
+fn rewrite_refuses_to_touch_a_multi_line_string() {
+    let trace = "[[unit]]\nheading = \"## 1.2.1 Child\"\nordinal = 1\n\
+                 quote = \"\"\"Child\nhash = \"x\"\n\"\"\"\nhash = \"stale\"\nlabels = [\"S1_2_1_x\"]\n";
+    assert!(rewrite_hashes(trace, SPEC).is_err());
+}
+
+#[test]
 fn rewrite_updates_only_hash_lines() {
     let mut trace = entry("## 1.2.1 Child", 1, "Child text", &["S1_2_1_x"]);
     let good = unit_hash("Child text.");
@@ -2121,13 +2303,14 @@ fn rewrite_updates_only_hash_lines() {
 - [ ] **Step 4: Run it**
 
 Run: `cargo test --test model_stamp`
-Expected: `test result: ok. 13 passed; 0 failed; 1 ignored` (the ignored one is `rewrite_unit_hashes`).
+Expected: `test result: ok. 16 passed; 0 failed; 1 ignored` (the ignored one is `rewrite_unit_hashes`).
 
 - [ ] **Step 5: Prove the step rule is load-bearing**
 
-Temporarily change the body of `is_step` to `false`, run `cargo test --test model_stamp`, and expect exactly two
-failures: `numbered_steps_are_units_and_keep_indented_lines` and `complete_map_passes`. Restore the body
-(`let digits = ...; digits > 0 && line[digits..].starts_with(". ")`) and rerun: 13 passed.
+Temporarily change the last line of `is_step` from `digits > 0 && text[digits..].starts_with(". ")` to
+`false && digits > 0`, run `cargo test --test model_stamp`, and expect exactly four failures:
+`complete_map_passes`, `indented_numbered_steps_are_units`, `numbered_steps_are_units_and_keep_indented_lines`, and
+`numbered_steps_inside_a_fence_are_units`. Restore the line and rerun: 16 passed.
 
 - [ ] **Step 6: Add the `model-stamp` recipe**
 
@@ -2141,9 +2324,9 @@ model-stamp:
 
 ```
 
-Run: `just model-stamp`, then `git diff --exit-code models/lockproto/trace.toml`
-Expected: `run.py: 4 runs, exit 0`, then `test rewrite_unit_hashes ... ok` with `13 filtered out`; `trace.toml`
-unchanged (exit 0).
+Run (`trace.toml` is not committed yet, so compare against a copy rather than with `git diff`):
+`cp models/lockproto/trace.toml "${TMPDIR:-/tmp}/trace.before" && just model-stamp && cmp "${TMPDIR:-/tmp}/trace.before" models/lockproto/trace.toml && echo UNCHANGED`
+Expected: `run.py: 4 runs, exit 0`, then `test rewrite_unit_hashes ... ok` with `16 filtered out`, then `UNCHANGED`.
 
 - [ ] **Step 7: Format and lint as the gate does**
 
@@ -2331,7 +2514,8 @@ mod platform {
         open_shared(path, true)
     }
 
-    /// Take the OS-native lock without waiting; true if it was granted.
+    /// Take the OS-native lock without waiting; true if it was granted. Like `flock`, it covers
+    /// the whole file: the full 64-bit byte range from offset 0.
     pub fn try_lock(file: &File) -> bool {
         // SAFETY: an all-zero OVERLAPPED is valid (offset 0, no event); the handle is open.
         let ok = unsafe {
@@ -2340,8 +2524,8 @@ mod platform {
                 file.as_raw_handle() as HANDLE,
                 LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
                 0,
-                1,
-                0,
+                u32::MAX,
+                u32::MAX,
                 &mut overlapped,
             )
         };
@@ -2782,8 +2966,8 @@ git commit -m "model: CI workflow with plan, scenario, and model-gate jobs (lock
 - [ ] **Step 1: Run the repository gate**
 
 Run: `just check`
-Expected: exit 0; nextest's summary reads `23 tests run: 23 passed, 1 skipped` (1 existing integration test, 13
-stamp tests, 9 probes; the skipped one is `rewrite_unit_hashes`).
+Expected: exit 0; nextest's summary reads `26 tests run: 26 passed, 1 skipped` (1 existing integration test, 16
+stamp tests, 9 probes; nextest does not count the skipped `rewrite_unit_hashes` as run).
 
 - [ ] **Step 2: Run the dependency audit**
 
@@ -2799,7 +2983,7 @@ Expected: `run.py: 4 runs, exit 0`, then `OK`.
 - [ ] **Step 4: Confirm the tree is clean and list the commits**
 
 Run: `git status --short && git log --oneline -6`
-Expected: no changes; the five task commits on top of `1de0f65`.
+Expected: no changes; the five task commits of this plan are the newest five.
 
 - [ ] **Step 5: Report**
 
