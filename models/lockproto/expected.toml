@@ -1,0 +1,36 @@
+# Runs of the lock-protocol model check and what each must report.
+# Format: design Section 4 (docs/superpowers/specs/2026-09-11-lock-protocol-model-check-design.md).
+# `scenarios` is the only place scenario names are defined; CI builds its matrix from it.
+
+scenarios = ["selftest"]
+
+# Runner self-test (Smoke.tla): exercises every way run.py judges a run. Not a protocol scenario.
+
+[[run]]
+name = "selftest-posix-check"
+module = "Smoke"
+config = "configs/selftest-check.cfg"
+scenario = "selftest"
+kind = "check"
+violated = ["NeverReachedTwo"]
+open_findings = [
+    { name = "AtMostThree", tracking = "selftest: exercises the open-finding and fix-flag path", fix_flag = "FIX_BOUND" },
+]
+timeout_minutes = 2
+
+[[run]]
+name = "selftest-posix-liveness"
+module = "Smoke"
+config = "configs/selftest-liveness.cfg"
+scenario = "selftest"
+kind = "liveness"
+timeout_minutes = 2
+
+[[run]]
+name = "selftest-posix-seeded-SEED_OVERSHOOT"
+module = "Smoke"
+config = "configs/selftest-seeded-SEED_OVERSHOOT.cfg"
+scenario = "selftest"
+kind = "seeded"
+violated = ["WithinBound"]
+timeout_minutes = 2

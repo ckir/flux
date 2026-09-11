@@ -1,0 +1,41 @@
+exit=150
+@!@!@STARTMSG 2262:0 @!@!@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+@!@!@ENDMSG 2262 @!@!@
+@!@!@STARTMSG 2187:0 @!@!@
+Running breadth-first search Model-Checking with fp 96 and seed 1949869904328772282 with 1 worker on 4 cores with 3621MB heap and 64MB offheap memory [pid: 9596] (Windows 11 10.0 amd64, Eclipse Adoptium 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+@!@!@ENDMSG 2187 @!@!@
+@!@!@STARTMSG 2220:0 @!@!@
+Starting SANY...
+@!@!@ENDMSG 2220 @!@!@
+Parsing file E:\Rust\flux\models\lockproto\testdata\Broken.tla
+***Parse Error***
+Was expecting "==== or more Module body"
+Encountered "1" at line 9, column 20 and token "+" 
+
+Residual stack trace follows:
+Module definition starting at line 1, column 1.
+
+
+Fatal errors while parsing TLA+ spec in file Broken
+
+tla2sany.semantic.AbortException
+*** Abort messages: 1
+
+In module Broken
+
+Could not parse module Broken from file Broken.tla
+
+
+@!@!@STARTMSG 2219:0 @!@!@
+SANY finished.
+@!@!@ENDMSG 2219 @!@!@
+@!@!@STARTMSG 2185:0 @!@!@
+Starting... (2026-09-11 09:26:50)
+@!@!@ENDMSG 2185 @!@!@
+@!@!@STARTMSG 3002:1 @!@!@
+Parsing or semantic analysis failed.
+@!@!@ENDMSG 3002 @!@!@
+@!@!@STARTMSG 2186:0 @!@!@
+Finished in 1262ms at (2026-09-11 09:26:50)
+@!@!@ENDMSG 2186 @!@!@

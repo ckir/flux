@@ -23,3 +23,6 @@ target
 # Local agent/tool state (machine-specific, not project config)
 .serena/
 .clavity/
+
+# Python bytecode from models/lockproto/run.py and its tests
+__pycache__/
