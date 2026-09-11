@@ -1,6 +1,6 @@
 # Lock-protocol model check — design
 
-Date: 2026-09-11. Status: approved design, revised after adversarial review rounds 1 to 4; awaiting implementation plan.
+Date: 2026-09-11. Status: approved design, revised after adversarial review rounds 1 to 5; awaiting implementation plan.
 Branch: `model/lock-protocol`, on top of `spec/v16-resolution`.
 
 ## 1. Goal
@@ -39,6 +39,7 @@ These sections are the model's contract. The drift stamp (Section 9) hashes exac
 | 251.1, 251.2 | Cleanup classification of locks, orphan locks, moved locks, cleanup locks | LockProtocol |
 | 259.6 | Lock record: fixed size, checksum, cleanup lock record | LockProtocol |
 | 120 | Accepted `workspace_path` values, including `none` | LockProtocol |
+| 235.1 | `RemoteUnverified` and `Unsupported` lock capabilities refuse every operation needing target exclusivity (`REMOTE_LOCK_UNSAFE`) | LockProtocol (the `LockCapability = weak` variant) |
 | 241.5 | Directory-entry claims; created-entry claim with COMMIT; aliasing; hardlink dependents | Claims |
 | 182, 183 | Per-file commit pipeline, including its lock revalidation; recovery of PREPARE_COMMIT without COMMIT | Claims |
 
@@ -79,13 +80,16 @@ How each kind of run is judged:
   invariant. The run passes only if the set reported equals `violated` plus the run's `open_findings` exactly: every
   witness violated, every open finding still violated, no other safety invariant violated. One run per configuration
   therefore checks both safety and reachability. An open finding that stops failing also fails the run, so the entry
-  is removed together with the spec fix. For every run with open findings, the runner also runs the same
-  configuration with all their fix flags set, and that run must match with no open finding at all: a new defect that
-  violates the same invariant as a known one still fails there, and the proposed spec fix is checked before the spec
-  changes.
+  is removed together with the spec fix.
 - `liveness`: TLC checks the configuration's temporal properties, and every safety invariant of the scenario, with no
   symmetry reduction (symmetry and liveness checking together are unsound in TLC). Passes only with no violation
   other than its `open_findings`.
+- Fix-flag runs: for every `check` or `liveness` run with open findings, the runner also runs the same configuration
+  with all their fix flags set, as a derived run named `<name>-fixed` of the same kind and time limit (it has no
+  `expected.toml` entry of its own). It must match with no open finding at all: a new defect that violates the same
+  invariant or property as a known one still fails there, and the proposed spec fix is checked before the spec
+  changes. A scenario carrying open findings therefore runs longer; Section 12's time budget is for a scenario with
+  none.
 - `seeded`: TLC runs without `-continue`. Passes only if TLC stops with a violation of exactly the named invariant or
   property; a different violation, or none, fails the run. A seeded run's scenario must have no open finding on the
   same invariant, so that the seed, not the open defect, is what fails it.
@@ -178,7 +182,7 @@ Each row is grounded by a filesystem probe (Section 10) where a real platform ca
 | exclusive create at a name | fails if an entry of the same class exists; otherwise creates an empty object and a handle | same |
 | open existing without create | fails if absent; otherwise adds a handle (`shareDelete` is recorded as true and never chosen, because POSIX has no delete-sharing) | fails if absent; otherwise adds a handle with the chosen `shareDelete`; a new handle cannot be opened on an object with a pending delete |
 | close a handle | removes the handle; releases its OS-native lock if held | same; lifts the sharing restriction that handle imposed, and removes a pending-delete object's name when its last handle closes |
-| non-blocking OS-native lock | fails if another process holds it; unavailable (the call reports no lock support) when `LockCapability = weak` | same |
+| non-blocking OS-native lock | a lock scoped to the handle that takes it (`flock` or Linux open-file-description locks; never `fcntl` record locks, which the process loses when it closes any handle to the file); fails if another process holds it; unavailable when `LockCapability = weak` (reached only in the seeded run that removes the 235.1 gate) | a lock scoped to the handle (`LockFileEx`); fails if another process holds it; unavailable when `LockCapability = weak` |
 | release an OS-native lock | clears `oslock` | same |
 | rename, no-replace | fails if the target class exists; succeeds even if the object is open and OS-locked | fails if the target class exists; succeeds only if every open handle on the object has `shareDelete` |
 | rename, replacing | atomically points the target entry at the source object, whether or not the target existed; the replaced object keeps its open handles and loses its name | same, and succeeds only if every open handle on the source object and on the replaced object has `shareDelete` |
@@ -186,14 +190,16 @@ Each row is grounded by a filesystem probe (Section 10) where a real platform ca
 | write a lock record | two steps: `WriteBegin` sets `content` to `Torn`, `WriteEnd` sets it to the new record; a reader in between sees `Torn` | same |
 | flush a file | copies the object's `content` to `durable` | same |
 | flush a directory | copies the directory's `entries` to `durableEntries` | same |
+| look up a name | reports whether the name has an entry, without opening a handle | same |
 | identity of a name | reports an identity value: under `IdentityStrength = strong`, the id of the object the name maps to; under `weak`, either that id or the id of an object the name held earlier. Only the reported value can repeat; the objects stay distinct | same |
 | list a directory | not atomic: `ListBegin`, then one `ListNext` step per name in the directory's name set, in any order, each reading that name's entry at that moment; an entry present for the whole listing is always returned, one created or removed during it may or may not be | same |
 
 Constants: `Platform ∈ {"posix", "windows"}`; `Fold`, the name-equivalence map (identity, or case folding);
 `IdentityStrength ∈ {"strong", "weak"}`, where `weak` stands for FAT32/exFAT-like identity that CI cannot probe;
-`LockCapability ∈ {"strong", "weak"}`, where `strong` stands for the spec's `LocalStrong` or `RemoteStrong` (Section
-235.1: OS-native locks work) and `weak` for any other capability, under which no OS-native lock is available and
-Section 240.5 step 1 refuses; `ShareMode`, the `shareDelete` value Windows opens use. The spec does not yet state the
+`LockCapability ∈ {"strong", "weak"}`, where `strong` stands for the spec's `LocalStrong` or `RemoteStrong` and `weak`
+for `RemoteUnverified` or `Unsupported` (Section 235.1). Under `weak`, Section 235.1 refuses every operation that needs
+target exclusivity with `REMOTE_LOCK_UNSAFE`, so every actor refuses before it acquires anything; the variant exists
+only for the seeded run that removes that gate (Section 8); `ShareMode`, the `shareDelete` value Windows opens use. The spec does not yet state the
 value at each open site (owner lock handle, classification read, recoverer, breaker, cleanup), so this work builds
 only `ShareMode = "any"`: every Windows open chooses `shareDelete` nondeterministically and TLC explores every
 combination, and the first Windows runs are expected to find which combinations are unsafe (Section 11). The spec fix
@@ -226,15 +232,22 @@ A host crash (power loss or reboot of the machine all actors run on):
   content, the latest content, or `Torn`, chosen nondeterministically per object; a crash during a flush has the same
   outcomes. Objects flushed since their last write keep their content;
 - then, for every directory, keeps or loses each entry operation made since that directory's last flush, each as a
-  whole (a rename is never half applied) and independently of the others, and sets `durableEntries` to the result.
-  Directories flushed since their last entry operation keep their entries.
+  whole (a rename is never half applied) and independently of the others, and sets both `entries` and
+  `durableEntries` to the result. Directories flushed since their last entry operation keep their entries.
 
 These are the only ways `durable` and `durableEntries` become visible. Processes that had not started when the host
-crashed run afterwards as the later invocations. At most two crashes happen in one run, counted across both kinds; a
-host crash counts as one crash however many processes it stops. In `liveness` runs, the actors a property relies on to
-make progress (Section 7) do not crash; every other actor crashes as in `check` runs. Without that exemption a run
-where the only actor able to clear a lock crashes would violate the property for a reason the spec does not claim to
-cover (an operator re-running the command is outside the model).
+crashed run afterwards as the later invocations. At most two crashes happen in one run, counted across both kinds (one
+in `claims`, Section 12); a host crash counts as one crash however many processes it stops.
+
+In `liveness` runs, one actor of each kind a property relies on to make progress (Section 7) never has a process
+crash, and a host crash can happen only before any such actor has started, so those actors run afterwards as later
+invocations; every other actor crashes as in `check` runs. Without that rule a run where every actor able to clear a
+lock crashes would violate the property for a reason the spec does not claim to cover (an operator re-running the
+command is outside the model), and a host crash that spared a running process would be impossible.
+
+The lock protocol's actors flush only where the spec tells them to (the record write of 240.5 step 6 is flushed); the
+spec states no directory flush after creating, moving aside, or removing a lock file, so a host crash may undo any of
+those entry operations, and the model explores what the next invocation then finds (Section 11).
 
 ## 6. Actors
 
@@ -249,9 +262,10 @@ short name defined in `trace.toml` next to the spec sentence it implements, for 
 Encodings: a lock record is a TLA+ record `[op |-> <operation id>, kind |-> "operation" | "cleanup"]`; `Torn`,
 `Foreign`, and `Empty` are distinct model values. Each process is a model value, and its operation id is its own
 process value, so every value that names an actor (records, ghost variables, handles, in-flight calls) changes
-consistently when TLC permutes processes. Symmetry reduction is declared over each set of same-kind actors, and only in
-the `recovery` and `breaklock` scenarios, the two with more than one actor of a kind whose symmetry-free `liveness`
-runs also check every safety invariant (Section 4); all other runs use no symmetry. Every invariant and witness
+consistently when TLC permutes processes. Symmetry reduction is declared only over interchangeable actors (same kind
+and same target), and only in scenarios whose symmetry-free `liveness` runs also check every safety invariant (Section
+4): the two Recoverers of `recovery` and the two Breakers of `breaklock`. All other runs use no symmetry; `dirlock`'s
+two Owners lock different targets and are not interchangeable, and `claims` has no liveness run. Every invariant and witness
 quantifies over processes rather than naming one.
 
 | Actor | Behaviour |
@@ -261,7 +275,7 @@ quantifies over processes rather than naming one.
 | DirOwner | An owner whose target name is too long for a per-name lock: takes `P/.flux-dir.lock` and lists `P` for per-name locks (96.1 announce-then-check); may crash |
 | PlainRun | A new invocation without flags: classifies what it finds (21.1 table, 96.1, 120, 240) and acts or refuses; if it acquires the lock it continues as an Owner |
 | Recoverer | A new invocation that finds a dead owner's lock and runs 240.3 steps 1-5, then continues as an Owner |
-| Breaker | `flux copy --restart --break-lock`: 240.5 steps 1-6, then 21.1 steps 2-5, then continues as an Owner; refuses at 240.5 step 1 when `IdentityStrength = weak` or `LockCapability = weak` |
+| Breaker | `flux copy --restart --break-lock`: 240.5 steps 1-6, then 21.1 steps 2-5, then continues as an Owner; refuses at 240.5 step 1 when `IdentityStrength = weak` (under `LockCapability = weak` it has already refused under 235.1); may crash, including between the `WriteBegin` and `WriteEnd` of its step 6 overwrite |
 | CleanupBreaker | `flux cleanup --target PATH --break-lock`: 240.5 steps 1-6 with a cleanup lock record, deletes artifacts, deletes its lock; may crash |
 | Cleanup | `flux cleanup DEST`: classifies and removes orphan, dead, and cleanup locks via 240.3 |
 | NestedOwner | An owner whose destination is a child of another owner's destination (97.1) |
@@ -282,14 +296,13 @@ lock file, attempt its OS-native lock without blocking, read the record, then ju
 | a record of an operation, and the OS-native lock attempt failed because another process holds it | live |
 | a record of an operation, otherwise | the oracle's judgement of the record's owner, below |
 
-For the last row:
+An owner gives up its OS-native lock only by crashing, by completing, or by stopping after a failed Section 99 check
+(it closes its handles); none of these removes a lock file whose record is not its own. So while an owner runs, the
+fifth row applies to its lock.
 
-- If the OS-native lock attempt failed because the owner holds it, the classifier sees the owner as live. An owner
-  gives up its OS-native lock only by crashing, by completing, or by stopping after a failed Section 99 check (it
-  closes its handles); none of these removes a lock file whose record is not its own.
-- Otherwise an oracle decides the part of Section 240.2 and 240.3 evidence that is not a filesystem fact (whether the
-  owner's process or host still exists), consistent with the truth: live only if the owner is alive, dead only if it
-  has crashed, uncertain in either case. Two classifiers may disagree at different moments, as Section 240 allows.
+In the last row an oracle decides the part of Section 240.2 and 240.3 evidence that is not a filesystem fact (whether
+the owner's process or host still exists), consistent with the truth: live only if the owner is alive, dead only if
+it has crashed, uncertain in either case. Two classifiers may disagree at different moments, as Section 240 allows.
 
 Because the steps are separate, the lock file can be renamed, unlinked, or rewritten between the open and the read,
 and the classifier then judges what its handle reads.
@@ -318,7 +331,9 @@ Each target runs the Section 182 pipeline as separate steps: plan with its exist
 write the temporary file, flush it, PREPARE_COMMIT (a transaction), revalidate locks (Section 99), rename (a
 filesystem call, issued then completed, Section 5.2; no-replace for a target planned as new, replacing for one
 planned as a replacement, Section 241.5), flush the destination directory, then one transaction that writes COMMIT
-and the target's created-entry claim together. A transaction includes its WAL flush, so it is durable when it
+and the target's created-entry claim together. Planning uses the look-up operation (Section 5.1) to decide whether a
+target is planned as new or as a replacement; a no-replace rename that fails because the name is now taken is reported
+as `DESTINATION_NAMESPACE_COLLISION` (241.5) and ends that target. A transaction includes its WAL flush, so it is durable when it
 completes. The steps are separate, so a crash can fall between any two; a crash between the rename and COMMIT is the
 case Section 183 recovery handles, and a host crash before the directory flush can undo the rename.
 Dependents run the Section 16.1 link procedure. An environment action, `LockLost`, can take the operation's lock over
@@ -339,7 +354,7 @@ Safety invariants, which must hold in every reachable state:
 | `PlainNeverOwnsUncertain` | A process without `--break-lock` never removes, renames, or overwrites a lock it classified as uncertain (`classified`), and creates a lock only at an empty lock path. |
 | `RefusalJustified` | Every `TARGET_LOCK_BUSY` refusal happens while the lock path holds, or the refusing process's open handle refers to, a lock whose owner is alive or another takeover's. |
 | `ForeignUntouched` | A `Foreign` object at a lock path is never written, renamed, or deleted. |
-| `Classifiable` | In every state, the object at each lock path classifies into exactly one case: live, dead, uncertain, cleanup lock, or foreign; a `Torn` record classifies as uncertain. |
+| `Classifiable` | In every state, each lock path classifies into exactly one case of the Section 6.1 judgement table: empty, foreign, uncertain, cleanup lock, live, or (by the oracle) dead; a `Torn` record classifies as uncertain. |
 | `NestedExclusion` | Two operations whose destinations nest never both write objects under the inner destination. |
 | `DirLockExclusion` | A per-name lock holder and a directory-lock holder in the same directory `P` are never both past their 96.1 check. |
 | `NoSilentOverwrite` (Claims) | No target overwrites an entry this operation already published. |
@@ -393,7 +408,7 @@ ability to see that defect and the run fails.
 | `SEED_MOVE_ASIDE_FOR_UNCERTAIN` | an uncertain owner's lock is moved aside, leaving the path empty (round 5) | `breaklock` | `PlainNeverOwnsUncertain` |
 | `SEED_RENAME_OVER_TAKEOVER` | takeover by renaming a new record over the lock (round 3) | `breaklock` | `SingleWriter` |
 | `SEED_NO_IDENTITY_RECHECK` | 240.5 step 6 skips its identity check after the write (round 6) | `breaklock` | `SingleWriter` |
-| `SEED_BREAK_WITHOUT_CAPABILITY` | 240.5 step 1 does not require `LocalStrong` or `RemoteStrong`, so a takeover proceeds with no OS-native lock to prove the owner gone | `breaklock`, weak-capability variant | `SingleWriter` |
+| `SEED_NO_CAPABILITY_GATE` | neither Section 235.1's refusal nor 240.5 step 1's capability check is applied, so operations and takeovers run with no OS-native lock and two Breakers are no longer serialized by it | `breaklock`, weak-capability variant | `SingleWriter` |
 | `SEED_CLEANUP_LOCK_UNVERIFIABLE` | Section 120 rejects `workspace_path = none` (round 6) | `cleanup-crash` | `DeadLockEventuallyCleared` |
 | `SEED_TORN_AS_FOREIGN` | a checksum-failing record is treated as a foreign object (round 5); `mixed` has both a record torn by the Owner's crash and a Breaker, the only actor that can clear it | `mixed` | `UncertainLockEventuallyCleared` |
 | `SEED_NO_ANCESTOR_CHECK` | 97.1 (a) skipped | `nested` | `NestedExclusion` |
@@ -414,7 +429,7 @@ without symmetry. Every later fix that the model drives adds a row here.
 is the only place the model tooling names it, and the test fails if that file does not exist, so renaming the spec
 (a V17) fails `just check` until the stamp names the new file. Then it lists, one per line, each spec heading the
 model encodes, exactly as the heading line appears in the spec: 96.1, 96.2, 97.1, 99, 99.1, 21.1, 240.1, 240.2,
-240.3, 240.4, 240.5, 251.1, 251.2, 259.6, 120, 241.5, 182, 183. A heading's own text runs from its heading line up
+240.3, 240.4, 240.5, 251.1, 251.2, 259.6, 120, 235.1, 241.5, 182, 183. A heading's own text runs from its heading line up
 to, not including, the next heading line of any level, so a subsection the model does not encode is not part of its
 parent's text; a subsection the model does encode is listed as its own line. Heading lines are ATX headings (`#` to
 `######`) outside fenced code blocks; line endings are normalised to LF before hashing.
@@ -450,7 +465,8 @@ check until the map covers it. The README renders the map for readers but is not
 ## 10. Filesystem probes
 
 Rust tests in `crates/flux-platform/tests/fs_semantics.rs`, run on Linux, macOS, and Windows by the existing test
-job. They use `rustix` on Unix (`flock`/`fcntl`, `fstat`, `renameat2`/`renamex_np` for no-replace renames) and
+job. They use `rustix` on Unix (`flock` for the OS-native lock, `fstat`, `renameat2`/`renamex_np` for no-replace
+renames) and
 `windows-sys` on Windows (`CreateFileW` share flags, `LockFileEx`, `GetFileInformationByHandle`, `DeleteFileW`, and
 `MoveFileExW` with and without `MOVEFILE_REPLACE_EXISTING`) as `flux-platform` dev-dependencies, subject to `deny.toml`; no standard
 library API newer than the workspace's `rust-version` (1.85) is used, because clippy's MSRV lint would fail the gate.
@@ -466,11 +482,12 @@ held (a second handle's non-blocking attempt fails) before it renames.
 | FS-3 | a non-blocking OS-native lock fails while another handle holds it | all |
 | FS-4 | renaming an open, OS-locked file succeeds | Linux, macOS |
 | FS-5 | unlinking an open file succeeds and the open handle still writes to the unnamed object | Linux, macOS |
-| FS-6 | renaming or deleting a file open without delete-sharing fails | Windows |
-| FS-7 | renaming or deleting a file open with delete-sharing succeeds, and whether the deleted name disappears at once or stays pending until the handle closes (the probe prints which; both are allowed by the model) | Windows |
+| FS-6 | renaming or deleting a file open without delete-sharing fails, and so does a replacing rename onto a file open without delete-sharing | Windows |
+| FS-7 | renaming or deleting a file open with delete-sharing succeeds, and so does a replacing rename onto one; whether the deleted name disappears at once or stays pending until the handle closes (the probe prints which; both are allowed by the model) | Windows |
 | FS-8 | a name replaced by a new file reports a different file identity | all |
 | FS-9 | closing a handle releases its OS-native lock | all |
 | FS-10 | a directory listing returns every entry that exists for the whole listing, including one created just before it starts | all |
+| FS-11 | the OS-native lock is scoped to its handle: a process that holds it, opens a second handle to the same file, and closes that second handle still holds the lock | all |
 
 Each probe prints the filesystem type of its scratch directory (`statfs` on Unix, `GetVolumeInformationW` on Windows),
 or `unknown` if that call fails; the call's failure never fails the probe, and `unknown` counts as not native for
@@ -478,8 +495,11 @@ triage. A failing probe is never weakened to pass. It is triaged first as enviro
 not the platform's usual local one (for example an overlay or network filesystem on a runner), the failure is
 reproduced on a native local filesystem of that platform before anything changes; if it reproduces, the model's
 assumption for that platform is wrong and the model is fixed.
-`IdentityStrength = weak` and case-folding behaviour of FAT32/exFAT cannot run on CI runners; the README lists them
-as unverified assumptions.
+Some model rules no probe can confirm, and the README lists them as unverified assumptions: `IdentityStrength =
+weak` and the case-folding behaviour of FAT32/exFAT (no such filesystem on CI runners); both crash rules of Section
+5.2, including which unflushed writes and entry operations survive a host crash (no probe can cut power; the rules
+follow the platforms' documented guarantees, spec Sections 166 to 168); and whether an entry created or removed
+during a listing is returned (the model allows either, which covers both).
 
 ## 11. Handling findings
 
@@ -509,6 +529,13 @@ Findings the design already expects, each to be confirmed or refuted by the firs
   does not mention. If a directory acquirer judged that per-name lock dead and proceeded, a Breaker that judges the
   same lock uncertain and takes it over in place would hold it alongside the directory lock, so the `dirlock`
   scenario includes a Breaker and `DirLockExclusion` should report it.
+- The spec never flushes the directory after creating, moving aside, or removing a lock file (Section 5.2). A host
+  crash can therefore undo a lock's creation, leaving an operation recorded in `state.db` whose lock is gone, or undo
+  a move-aside, bringing a replaced lock back; the model explores what the next invocation does in each case.
+- Section 96.1 allows "a byte-range lock or `flock`" as the OS-native lock. On POSIX a byte-range lock taken with
+  `fcntl` is lost when the process closes any handle to the file, which the model does not allow (Section 5.1, FS-11);
+  the expected fix is a spec statement that the lock is scoped to its handle (`flock`, open-file-description locks,
+  or `LockFileEx`).
 
 ## 12. Scenarios, bounds, and time budget
 
@@ -518,7 +545,7 @@ them apart keeps each state space small.
 | Scenario | Actors | Variants | Witnesses its `check` run expects |
 |---|---|---|---|
 | `recovery` | Owner (crashes), 2 Recoverers, PlainRun, Cleanup | POSIX, Windows, POSIX weak-identity | `NeverAcquired`, `NeverRecovered`, `NeverRecoveredAfterCrash`, `NeverCleanedUp`, `NeverTornRead` |
-| `breaklock` | StalledOwner, 2 Breakers, PlainRun | POSIX, Windows; POSIX weak-capability (seeded run only: with `LockCapability = weak` every Breaker refuses at step 1, so the witnesses cannot be reached there) | `NeverAcquired`, `NeverBrokeLock`, `NeverInFlightAfterTakeover`, `NeverTornRead` |
+| `breaklock` | StalledOwner, 2 Breakers, PlainRun | POSIX, Windows; POSIX weak-capability (seeded run only: with `LockCapability = weak` every actor refuses under 235.1, so the witnesses cannot be reached there) | `NeverAcquired`, `NeverBrokeLock`, `NeverInFlightAfterTakeover`, `NeverTornRead` |
 | `mixed` | Owner (crashes; its lock is dead), Breaker (may see it uncertain), Recoverer (may see it dead), PlainRun | POSIX, Windows, POSIX weak-identity | `NeverRecovered`, `NeverBrokeLock`; the weak-identity variant expects only `NeverRecovered`, because the Breaker refuses at 240.5 step 1 there |
 | `cleanup` | StalledOwner, CleanupBreaker, Breaker | POSIX, Windows | `NeverBrokeLock`, `NeverInFlightAfterTakeover` |
 | `cleanup-crash` | CleanupBreaker (crashes), PlainRun, Recoverer, Cleanup | POSIX, Windows | `NeverClassifiedCleanupLock`, `NeverCleanedUp` |
@@ -534,7 +561,7 @@ Liveness runs: `DeadLockEventuallyCleared` in `recovery` and `cleanup-crash`; `U
 scenario); POSIX variant only, without symmetry.
 
 Common bounds: one target lock path (plus the parent's for `nested`, and two per-name lock paths and the directory
-lock path for `dirlock`); at most two crashes per run in total; symmetry only as Section 6.1 states (`recovery` and
+lock path for `dirlock`); at most two crashes per run in total, and one in `claims`; symmetry only as Section 6.1 states (`recovery` and
 `breaklock`, in `check` and `seeded` runs). Each TLC run's `timeout_minutes` is
 10; each CI matrix job (one scenario) should finish within about 20 minutes. A run that does not fit gets tighter
 bounds, and the tighter bounds are written into the README, never raised silently.
@@ -551,7 +578,7 @@ to 7 hold with open findings counted as expected results, and the work is finish
 4. Every run finishes within its time limit on CI.
 5. The traceability check (Section 9.1) passes: every label maps to a spec step, and every spec step of the stamped
    headings maps to a label or to a `not_modelled` reason.
-6. The drift-stamp test, the traceability check, and FS-1 to FS-10 pass in the existing test job.
+6. The drift-stamp test, the traceability check, and FS-1 to FS-11 pass in the existing test job.
 7. `model-gate` passes on the pull request that adds the model.
 
 ## 14. Out of scope
