@@ -82,9 +82,11 @@ How each kind of run is judged:
   witness violated, every open finding still violated, no other safety invariant violated. One run per configuration
   therefore checks both safety and reachability. An open finding that stops failing also fails the run, so the entry
   is removed together with the spec fix.
-- `liveness`: TLC checks the configuration's temporal properties, and every safety invariant of the scenario, with no
-  symmetry reduction (symmetry and liveness checking together are unsound in TLC). Passes only with no violation
-  other than its `open_findings`.
+- `liveness`: TLC runs with `-continue` and checks the configuration's one temporal property, and every safety
+  invariant of the scenario, with no symmetry reduction (symmetry and liveness checking together are unsound in TLC).
+  Passes only with no violation other than its `open_findings`. A configuration that checks a temporal property (a
+  liveness run, or a seeded run whose "must fail" entry is a property) lists exactly one `PROPERTY`, because TLC
+  reports a temporal violation without naming the property (measured against TLC 2.19).
 - Fix-flag runs: for every `check` or `liveness` run with open findings, the runner also runs the same configuration
   with all their fix flags set, as a derived run named `<name>-fixed` of the same kind and time limit (it has no
   `expected.toml` entry of its own). It must match with no open finding at all: a new defect that violates the same
@@ -130,12 +132,14 @@ The runner, `run.py`:
 
 Recipes and CI:
 
-- `just model` runs every run; `just model scenario=<name>` runs one scenario; `just model-stamp` runs `just model`
+- `just model` runs every run; `just model <scenario>` runs one scenario; `just model-test` runs `run.py`'s unit
+  tests (recorded TLC output, no Java); `just model-stamp` runs `just model`
   first and rewrites the unit hashes (Section 9) only if every run matched, counting open findings as matched. None of
   these is part of `just check`, which stays Java-free.
 - `.github/workflows/model.yml` runs on every pull request to `main`, on pushes to `main`, and on manual dispatch, with
   `permissions: contents: read` and no secrets, in three jobs:
-  1. `plan` checks out the repository with full history (`fetch-depth: 0`), lists the changed files with `git diff
+  1. `plan` checks out the repository with full history (`fetch-depth: 0`), runs `run.py`'s unit tests, lists the
+     changed files with `git diff
      --name-only` from the merge base of the pull request's base and head (`base...head`), or from the push's previous
      commit, decides whether they touch
      `models/**`, the spec file (glob `FLUX_FULL_UPDATED_SPEC_V*.md`), `crates/flux-platform/tests/fs_semantics.rs`,
@@ -144,7 +148,7 @@ Recipes and CI:
      force push whose previous commit is gone), count as touching, so an unknown change runs every scenario;
   2. `scenario`, one matrix job per scenario name and skipped when the matrix is empty (GitHub rejects an empty
      matrix, so the job carries a condition on `plan`'s output), installs Java with `actions/setup-java` (Temurin 21) and Python
-     with `actions/setup-python` (3.12), runs `just model scenario=<name>`, and uploads `target/tla/out/` when it
+     with `actions/setup-python` (3.12), runs `just model <name>`, and uploads `target/tla/out/` when it
      fails;
   3. `model-gate` always runs after the others and fails if `plan` failed, if any `scenario` job failed or was
      cancelled, or if `scenario` was skipped although the matrix was not empty; it passes when the matrix was empty.
@@ -439,7 +443,8 @@ without symmetry. Every later fix that the model drives adds a row here.
 is the only place the model tooling names it, and the test fails if that file does not exist, so renaming the spec
 (a V17) fails `just check` until the stamp names the new file. Then it lists, one per line, each spec heading the
 model encodes, exactly as the heading line appears in the spec: 96.1, 96.2, 97.1, 99, 99.1, 21.1, 240.1, 240.2,
-240.3, 240.4, 240.5, 251.1, 251.2, 259.6, 120, 235.1, 241.5, 182, 183. A heading's own text runs from its heading line up
+240.3, 240.4, 240.5, 251.1, 251.2, 259.6, 120, 235.1, 241.5, 182, 183 at the end of the work; a heading is added to
+the stamp, with its `trace.toml` entries, when the model starts to encode it. A heading's own text runs from its heading line up
 to, not including, the next heading line of any level, so a subsection the model does not encode is not part of its
 parent's text; a subsection the model does encode is listed as its own line. Heading lines are ATX headings (`#` to
 `######`) outside fenced code blocks; line endings are normalised to LF before hashing.
@@ -458,9 +463,10 @@ The workflow after a spec change: re-check each unit the test names against the 
 
 `trace.toml` is the single traceability map. Its unit is a piece of a stamped heading's own text (Section 9), and every
 line after the heading line belongs to exactly one unit: each block of lines separated by blank lines is a unit
-(fenced blocks included, split at their blank lines too), except that a numbered step together with its indented
-continuation lines is one unit even across blank lines. Prose before, between, or after numbered steps is therefore
-covered like any other text. Each entry names its heading and the unit's ordinal, quotes
+(fenced blocks included, split at their blank lines too), except that each numbered step starts a new unit, and a
+numbered step together with its indented continuation lines is one unit even across blank lines. Prose before,
+between, or after numbered steps is therefore covered like any other text. A unit's text, which is what is hashed, is
+its non-blank lines joined by LF. Each entry names its heading and the unit's ordinal, quotes
 a sentence from that unit, carries the unit's hash (Section 9), and gives either the labels that implement it or
 `not_modelled = "<reason>"`. The same test file checks, without Java:
 
@@ -494,6 +500,11 @@ held (a second handle's non-blocking attempt fails) before it renames.
 | FS-5 | unlinking an open file succeeds and the open handle still writes to the unnamed object | Linux, macOS |
 | FS-6 | renaming or deleting a file open without delete-sharing fails, and so does a replacing rename onto a file open without delete-sharing | Windows |
 | FS-7 | renaming or deleting a file open with delete-sharing succeeds, and so does a replacing rename onto one; whether the deleted name disappears at once or stays pending until the handle closes (the probe prints which; both are allowed by the model) | Windows |
+
+The replacing renames of FS-6 and FS-7 use `std::fs::rename`, which on current Rust performs a POSIX-semantics rename
+on Windows; that is the behaviour the model's Windows row describes. Measured on Windows 11 NTFS while plan 1 was
+written, `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` refuses any open target even with delete-sharing, so FS-7 prints
+what it does. The spec does not name the Windows API for a replacing rename; plan 2 records this as a finding.
 | FS-8 | a name replaced by a new file reports a different file identity | all |
 | FS-9 | closing a handle releases its OS-native lock | all |
 | FS-10 | a directory listing returns every entry that exists for the whole listing, including one created just before it starts | all |
@@ -551,7 +562,10 @@ Findings the design already expects, each to be confirmed or refuted by the firs
 ## 12. Scenarios, bounds, and time budget
 
 Each configuration is one scenario on one platform variant. A scenario names the actors that run together; keeping
-them apart keeps each state space small.
+them apart keeps each state space small. Besides the protocol scenarios below, `expected.toml` has a `selftest`
+scenario: a small model (`Smoke.tla`) with a check run carrying a witness and an open finding, a liveness run, and a
+seeded run, which exercises every way `run.py` judges a run in a few seconds. It lands with plan 1, before any
+protocol model exists, and stays as the runner's own regression check.
 
 | Scenario | Actors | Variants | Witnesses its `check` run expects |
 |---|---|---|---|
