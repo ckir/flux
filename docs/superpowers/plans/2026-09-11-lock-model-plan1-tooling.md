@@ -13,14 +13,14 @@ test job: `tests/model_stamp.rs` (stamp and traceability) and `crates/flux-platf
 `.github/workflows/model.yml` runs the TLC scenarios in a matrix built from `expected.toml`, behind an always-reporting
 `model-gate` job.
 
-**Tech Stack:** Python 3.11+ (`tomllib`, `unittest`), TLA+ / TLC 2.19 (`tla2tools.jar` v1.7.4, Java 21), Rust 2024
+**Tech Stack:** Python 3.14 (3.11 or later accepted; `tomllib`, `unittest`), TLA+ / TLC 2.19 (`tla2tools.jar` v1.7.4, Java 21), Rust 2024
 (MSRV 1.85; crates `blake3`, `toml` 1.1, `serde`, `tempfile`, `rustix` 1.1, `windows-sys` 0.61), `just`, GitHub Actions.
 
 ---
 
 ## Context
 
-- **Design:** `docs/superpowers/specs/2026-09-11-lock-protocol-model-check-design.md` at commit `b50e998` (approved;
+- **Design:** `docs/superpowers/specs/2026-09-11-lock-protocol-model-check-design.md` at commit `666fe42` (approved;
   aligned with the measurements below). Section numbers in this plan refer to it.
 - **Branch:** `model/lock-protocol`. Work in place on that branch; do not push.
 - **Sequence:** this is plan 1 of 3 (owner decision, 2026-09-11). Plan 2 (`FsModel.tla` + `LockProtocol.tla`) and plan 3
@@ -74,7 +74,7 @@ is a rolling prerelease whose asset changes, so it cannot be pinned. With `-tool
 Because 2116 names no property, a configuration that checks a temporal property lists exactly one `PROPERTY`
 (design Section 4). `-workers auto` works. TLC wrote no trace files beside the model with these flags.
 
-### Deviations from the design text, all already folded into the design at `b50e998`
+### Deviations from the design text, all already folded into the design at `666fe42`
 
 1. `just model <scenario>` instead of `just model scenario=<name>`: `just` accepts `name=value` only as a variable
    override before the recipe name.
@@ -1545,8 +1545,8 @@ the file's two-space indentation and its existing `—` escapes):
   },
   {
     "name": "python3",
-    "why": "Runs models/lockproto/run.py (the model-check runner) and its unit tests (`just model`, `just model-test`). Needs Python 3.11 or later, for tomllib. Not needed by `just check`.",
-    "install": "winget install Python.Python.3.12",
+    "why": "Runs models/lockproto/run.py (the model-check runner) and its unit tests (`just model`, `just model-test`). Python 3.14 is the version CI and the development machines use; run.py accepts 3.11 or later (tomllib). Not needed by `just check`.",
+    "install": "winget install Python.Python.3.14",
     "in_path": "python3"
   }
 ```
@@ -2841,8 +2841,9 @@ name: Model
 # Lock-protocol model check: docs/superpowers/specs/2026-09-11-lock-protocol-model-check-design.md,
 # Section 4. Runs on every pull request and push to main so that `model-gate` always reports and
 # can be a required check; the scenario jobs run only when the change touches the model, the spec,
-# the filesystem probes, the justfile (its model recipes), or this workflow. Python 3.11 is the
-# oldest version run.py supports, so CI uses it.
+# the filesystem probes, the justfile (its model recipes), or this workflow. CI runs Python 3.14, the
+# version the development machines use, and also runs the runner's unit tests under Python 3.11, the
+# oldest version run.py supports.
 
 on:
   push:
@@ -2866,9 +2867,14 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
-      - name: Runner unit tests
-        run: python -W error -m unittest discover -s models/lockproto -p "test_*.py"
+          # The last version listed is the default `python`; the others stay available as pythonX.Y.
+          python-version: |
+            3.11
+            3.14
+      - name: Runner unit tests (Python 3.14, then 3.11)
+        run: |
+          python -W error -m unittest discover -s models/lockproto -p "test_*.py"
+          python3.11 -W error -m unittest discover -s models/lockproto -p "test_*.py"
       - name: Decide which scenarios to run
         id: plan
         env:
@@ -2920,7 +2926,7 @@ jobs:
           java-version: "21"
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
+          python-version: "3.14"
       - uses: taiki-e/install-action@just
       - name: Run the model check
         env:
