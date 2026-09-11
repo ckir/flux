@@ -462,11 +462,11 @@ The workflow after a spec change: re-check each unit the test names against the 
 ### 9.1 Traceability check
 
 `trace.toml` is the single traceability map. Its unit is a piece of a stamped heading's own text (Section 9), and every
-line after the heading line belongs to exactly one unit: each block of lines separated by blank lines is a unit
-(fenced blocks included, split at their blank lines too), except that each numbered step starts a new unit, and a
-numbered step together with its indented continuation lines is one unit even across blank lines. Prose before,
-between, or after numbered steps is therefore covered like any other text. A unit's text, which is what is hashed, is
-its non-blank lines joined by LF. Each entry names its heading and the unit's ordinal, quotes
+text line after the heading line belongs to exactly one unit: each block of lines separated by blank lines or by
+fence-marker lines (which belong to no unit) is a unit, except that each numbered step, indented or not, starts a new
+unit, and a numbered step together with the indented lines after it is one unit even across blank lines. The numbered
+steps of 21.1 and 240.1 sit inside fences, and each is a unit. Prose before, between, or after numbered steps is
+therefore covered like any other text. A unit's text, which is what is hashed, is its lines joined by LF. Each entry names its heading and the unit's ordinal, quotes
 a sentence from that unit, carries the unit's hash (Section 9), and gives either the labels that implement it or
 `not_modelled = "<reason>"`. The same test file checks, without Java:
 
