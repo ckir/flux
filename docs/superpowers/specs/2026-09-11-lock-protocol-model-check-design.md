@@ -1,6 +1,8 @@
 # Lock-protocol model check — design
 
-Date: 2026-09-11. Status: approved design, revised after adversarial review rounds 1 to 6; awaiting implementation plan.
+Date: 2026-09-11. Status: approved design, revised after adversarial review rounds 1 to 6, and on 2026-09-12 with the
+owner's rulings for plan 2 (liveness witnesses, Sections 4 and 7; sibling headings and pending units, Section 9; build
+order, Section 12).
 Branch: `model/lock-protocol`, on top of `spec/v16-resolution`.
 
 ## 1. Goal
@@ -71,20 +73,53 @@ crates/flux-platform/tests/fs_semantics.rs    the filesystem probes (Section 10)
 | `config` | path of the `.cfg` file |
 | `scenario` | the Section 12 scenario the run belongs to; one of the names in `expected.toml`'s top-level `scenarios` list, which is the only place scenario names are defined; CI builds its matrix from that list |
 | `kind` | `check`, `liveness`, or `seeded` |
-| `violated` | for `check`: the exact set of witness invariants that must be reported violated; for `seeded`: the one invariant or property that must be the first violation; absent for `liveness` |
+| `violated` | for `check` and `liveness`: the exact set of witness invariants that must be reported violated, at least one; for `seeded`: the one invariant or property that must be the first violation |
 | `open_findings` | optional, for `check` and `liveness`: safety invariants or properties that currently fail because of a spec defect not yet fixed, each as `{ name, tracking, fix_flag }`: `tracking` names its `TODO.md` or `.clavity/local-anomalies.md` entry, and `fix_flag` names a model flag that applies the proposed spec fix |
+| `unreached` | optional, for `check` and `liveness`: labels of the run's own actors that this run cannot reach, each as `{ label, reason }` (the coverage check below) |
 | `timeout_minutes` | the run's time limit |
 
 How each kind of run is judged:
+
+Every `check` and `liveness` run also runs TLC with `-coverage 1`, whose report lists each action with the states it
+generated as `<distinct:found>`. Measured on TLC 2.19 (2026-09-12): PlusCal translates each label into one action, the
+report carries one line per label rather than per process instance, a label whose guard can never hold reports `0:0`
+even though TLC evaluates it at every state, and symmetry reduction lowers a label's counts but does not zero them
+(`A 3:4` under `SYMMETRY` against `4:6` without). A run fails if a label of an actor it instantiates has no states
+found. Without this, a label behind a condition that can never hold would still have a `trace.toml` entry mapping it to
+a spec rule, and the traceability map would claim coverage that never runs. The witnesses (Section 7) show that named
+procedures complete; this shows that every step of every running actor is reached. Four rules keep the check honest
+without making it lie:
+
+- the labels of an actor whose process set the run's configuration leaves empty are exempt; the runner derives which
+  labels belong to which actor from the model's `process` blocks and which sets are empty from the configuration's
+  constants, so no list is maintained by hand;
+- a run may list `unreached` labels with a reason: steps its variant or its configuration cannot reach although their
+  actor runs, such as 240.5 step 1's capability branch, which only the seeded run without the capability gate reaches
+  (Section 5.1). The check is symmetric, as for witnesses: a listed label that does get covered fails the run too,
+  naming the label and saying to remove it from `unreached`, so a label that becomes reachable cannot stay excused;
+- `unreached` excuses a label in one run, never in the model. A run of every run in `expected.toml` (`just model` with
+  no scenario) fails if any label of any model was covered by no run at all, so a label cannot be listed out of every
+  run and left as dead code: whatever a scenario cannot reach, another scenario or a seeded run must. A single-scenario
+  run cannot judge this and says so in its report, and the CI matrix runs one scenario per job, so `model-gate` does not
+  enforce it; the full `just model` that Section 13 requires before the work is declared finished does;
+- the derived `<name>-fixed` runs are not covered by the check. A proposed spec fix is meant to make the path it
+  closes unreachable, so a fix-flag run would otherwise fail because the fix worked;
+- a run that times out is a tooling failure (exit code 2) and its coverage is not judged at all, because a partial
+  state space says nothing about what is reachable.
 
 - `check`: TLC runs with `-continue`, so it explores the whole reachable state space and reports every violated
   invariant. The run passes only if the set reported equals `violated` plus the run's `open_findings` exactly: every
   witness violated, every open finding still violated, no other safety invariant violated. One run per configuration
   therefore checks both safety and reachability. An open finding that stops failing also fails the run, so the entry
   is removed together with the spec fix.
-- `liveness`: TLC runs with `-continue` and checks the configuration's one temporal property, and every safety
-  invariant of the scenario, with no symmetry reduction (symmetry and liveness checking together are unsound in TLC).
-  Passes only with no violation other than its `open_findings`. A configuration that checks a temporal property (a
+- `liveness`: TLC runs with `-continue` and checks the configuration's one temporal property, every safety invariant
+  of the scenario, and the run's witnesses, with no symmetry reduction (symmetry and liveness checking together are
+  unsound in TLC). Passes only if the invariants reported violated are exactly its `violated` witnesses plus its
+  `open_findings`, and the property is not violated unless it is itself an open finding. The witnesses show that the
+  run reaches the states its property is about (Section 7); without them a liveness configuration that constrains its
+  state space to almost nothing would pass without checking anything. TLC 2.19 with `-continue` still checks the
+  temporal property over the complete state space after reporting invariant violations, and reports both (measured
+  2026-09-12). A configuration that checks a temporal property (a
   liveness run, or a seeded run whose "must fail" entry is a property) lists exactly one `PROPERTY`, because TLC
   reports a temporal violation without naming the property (measured against TLC 2.19).
 - Fix-flag runs: for every `check` or `liveness` run with open findings, the runner also runs the same configuration
@@ -394,8 +429,13 @@ only by a Recoverer at `S240_3_s5`), so an end state reached by some other path 
 | `NeverDirLockBackoff` | a per-name or directory acquirer backs off on a 96.1 conflict |
 | `NeverCommittedWithClaim` (Claims) | a target commits with its claim |
 | `NeverLockLostMidCommit` (Claims) | `LockLost` happens between a PREPARE_COMMIT and its rename |
+| `NeverDeadOwnerLock` | a lock whose owner is dead is at the lock path (`DeadOwnerLockAt(t)` holds) |
+| `NeverUncertainOwnerLock` | a lock whose owner is uncertain is at the lock path (`UncertainOwnerLockAt(t)` holds) |
 
-Each scenario's `check` run lists the witnesses its actors can reach (Section 12).
+Each scenario's `check` run lists the witnesses its actors can reach (Section 12). The last two witnesses are state
+predicates, the negation of the antecedent of a liveness property below, rather than ghost flags. A `liveness`
+configuration's invariants are the scenario's safety invariants plus exactly one witness, the one for its property,
+and its `violated` lists exactly that witness, so the run shows that the states its property constrains occur.
 
 Liveness, checked in `liveness` runs under weak fairness for every process that has not crashed:
 
@@ -447,13 +487,35 @@ model encodes, exactly as the heading line appears in the spec: 96.1, 96.2, 97.1
 the stamp, with its `trace.toml` entries, when the model starts to encode it. A heading's own text runs from its heading line up
 to, not including, the next heading line of any level, so a subsection the model does not encode is not part of its
 parent's text; a subsection the model does encode is listed as its own line. Heading lines are ATX headings (`#` to
-`######`) outside fenced code blocks; line endings are normalised to LF before hashing.
+`######`) outside fenced code blocks, and, for the family rule below only, a Setext heading (a line of text underlined
+by `=` or `-`), so that a new rule cannot be introduced under a heading the check does not see; the spec has 264 such
+underline lines today and none follows a text line, so none is a Setext heading (measured 2026-09-12). Line endings are
+normalised to LF before hashing.
+
+A heading's number is the first word after its `#` marks, without a trailing `.` (`96.1` in `## 96.1 Name-Equivalent
+Target Locks`, `99` in `# 99. Commit-Time Lock Revalidation`), when that word is digits separated by dots. A heading
+without such a number (for example `## Stand-downs`) takes, for the family rule below, the number of the nearest
+numbered heading above it; if there is none (the document's title), it has no number and belongs to no family. A new
+heading next to a stamped one changes no stamped unit (a `96.3` added between 96.2 and 97 leaves 96.1's text as it
+was), so the test also checks each stamped heading's family. For a stamped heading whose number has more than one
+part, let `M` be the number without its last part (`96` for `96.1`, `259` for `259.6`); its family is every heading
+numbered `M` or beginning `M.`. For a stamped heading with a one-part number `N` (`99`, `120`), its family is every
+heading numbered `N` or beginning `N.`, so an unnumbered heading placed under `# 99.` belongs to it. Each heading in a
+family other than a stamped one must be listed in `trace.toml` as a `[[heading]]` entry: the key `heading` holding the
+heading line exactly as in the spec, the key `family` holding the number whose family it is in (`96`, `99`), and
+exactly one of `not_modelled = "<reason>"` or `pending = [<scenario>, ...]` (Section 9.1); a heading whose text the model
+encodes is stamped, never listed. Because the same heading line can appear more than once in the spec (`## Normal`
+appears twice today, in sections the model does not encode), an entry also carries `count`, the number of times that
+line occurs in that family, and the test fails when the number changes; so a new section cannot hide behind the name of
+one already listed. So a new
+sibling or child heading, numbered or not, fails the check until someone decides whether the model encodes it.
 
 The hashes live in `trace.toml`, one per unit (Section 9.1): the BLAKE3 hash, in lowercase hex, of the unit's text.
 `tests/model_stamp.rs`, an auto-discovered test target of the root package (so `just check` runs it), recomputes
 them. It fails if a listed heading is missing or appears more than once, and, for each unit whose hash differs, names
 the heading, the unit's ordinal, and the labels that `trace.toml` says implement it, so a spec change points at the
-exact model steps to re-check. `blake3` is added to the root package's `[dev-dependencies]` from the workspace, and
+exact model steps to re-check. For a family heading with no entry it names that heading line and the stamped heading
+whose family it belongs to, so the reader knows which section grew. `blake3` is added to the root package's `[dev-dependencies]` from the workspace, and
 `toml` (added to `[workspace.dependencies]`, subject to `deny.toml`) for reading `trace.toml`. The same file holds an
 `#[ignore]`d test that rewrites the unit hashes; `just model-stamp` runs it after a green `just model` (Section 4).
 The workflow after a spec change: re-check each unit the test names against the model, update the model and
@@ -467,11 +529,32 @@ fence-marker lines (which belong to no unit) is a unit, except that each numbere
 unit, and a numbered step together with the indented lines after it is one unit even across blank lines. The numbered
 steps of 21.1 and 240.1 sit inside fences, and each is a unit. Prose before, between, or after numbered steps is
 therefore covered like any other text. A unit's text, which is what is hashed, is its lines joined by LF. Each entry names its heading and the unit's ordinal, quotes
-a sentence from that unit, carries the unit's hash (Section 9), and gives either the labels that implement it or
-`not_modelled = "<reason>"`. The same test file checks, without Java:
+a sentence from that unit, carries the unit's hash (Section 9), and gives the labels that implement it,
+`not_modelled = "<reason>"`, or `pending = [<scenario>, ...]`, and at least one of the three. A `pending` entry also
+carries the labels the scenarios already built contribute to that unit, if any, so that partial work is recorded and
+every label in a model file still has an entry naming it. Labels and `not_modelled` together mean a partly modelled
+unit: the labels implement what the model encodes, and the reason says what it does not and why.
+
+`pending` marks a unit, or a family heading, that scenarios not yet built will model: the model is built one scenario
+at a time (Section 12), and a heading such as 96.1 holds rules for several scenarios. `trace.toml` lists the scenarios
+still to be built in one top-level `planned_scenarios` array. A `pending` array names every scenario still owed labels
+for that unit; each name must be in `planned_scenarios`, and a scenario in `planned_scenarios` must not be in
+`expected.toml`'s `scenarios` list. A misspelt name therefore fails at once, and moving a scenario from
+`planned_scenarios` into `expected.toml`, as the plan that builds it must, fails every entry that still names it: that
+plan adds the labels its scenario contributes and removes its name, so no scenario can leave its share of a shared unit
+to the next one. The entry keeps `pending` while other scenarios are still owed, and the key goes away with the last
+name rather than being left as an empty array. When every scenario is built, `planned_scenarios` is empty and no
+`pending` entry remains.
+
+The same test file checks, without Java:
 
 - every unit of every stamped heading has exactly one entry, each quoted sentence occurs in its unit, and each hash
   matches its unit;
+- every heading in a stamped heading's family (Section 9) is stamped or covered by a `[[heading]]` entry for its line
+  and family, and every `[[heading]]` entry names a family that some stamped heading defines, quotes a heading line
+  that occurs in that family exactly `count` times, is not stamped, and is the only entry for that line and family;
+- every name in a `pending` array is in `planned_scenarios`, and no scenario is in both `planned_scenarios` and
+  `expected.toml`'s `scenarios`;
 - every label in `LockProtocol.tla` and `Claims.tla` (matched by `S\d+(_\d+)*_\w+:`) appears in `trace.toml`;
 - every label `trace.toml` names exists in a model file.
 
@@ -587,9 +670,18 @@ protocol model exists, and stays as the runner's own regression check.
 Every variant of a scenario expects the witness set in its row, except where the row says otherwise; a variant that
 cannot reach a witness is a change to this table with its reason, never an edit to `expected.toml` alone.
 
-Liveness runs: `DeadLockEventuallyCleared` in `recovery` and `cleanup-crash`; `UncertainLockEventuallyCleared` in
-`breaklock`, `cleanup`, and `mixed` (so that `SEED_TORN_AS_FOREIGN` is judged against a passing run of the same
-scenario); POSIX variant only, without symmetry.
+Liveness runs: `DeadLockEventuallyCleared` in `recovery` and `cleanup-crash`, each with the witness
+`NeverDeadOwnerLock`; `UncertainLockEventuallyCleared` in `breaklock`, `cleanup`, and `mixed` (so that
+`SEED_TORN_AS_FOREIGN` is judged against a passing run of the same scenario), each with the witness
+`NeverUncertainOwnerLock`; POSIX variant only, without symmetry.
+
+Build order: the scenarios are built one plan at a time, not all at once, so that the first TLC runs measure real
+state-space sizes and their findings are triaged before more actors are built on the same model. Plan 2 builds
+`FsModel.tla` and the `recovery` scenario (the Owner, Recoverer, PlainRun, and Cleanup actors). The remaining
+LockProtocol scenarios follow in plans grouped once plan 2's measurements exist, and `claims` last. Until a scenario
+is built it is listed in `trace.toml`'s `planned_scenarios` (Section 9.1). A later plan changes files an earlier plan
+created (the runner, the stamp test, the self-test configuration); those changes are shown in the later plan, and the
+earlier plan document stays as it was executed.
 
 Common bounds: one target lock path (plus the parent's for `nested`, and the per-name lock path and the directory
 lock path for `dirlock`); at most two crashes per run in total, and one in `claims`; `LockLost` at most once; symmetry
@@ -606,11 +698,17 @@ to 7 hold with open findings counted as expected results, and the work is finish
 
 1. Every seeded run stops with its named violation.
 2. Every `check` run reports exactly its listed witnesses and its open findings violated, and no other safety
-   invariant; every fix-flag run reports exactly its witnesses.
+   invariant; every fix-flag run reports exactly its witnesses. In every `check` and `liveness` run, every label of
+   every actor the run instantiates is covered except the labels it lists as `unreached`, and each of those is indeed
+   uncovered; a full `just model` reports every label of every model covered by at least one run (Section 4).
 3. Every `liveness` run passes.
 4. Every run finishes within its time limit on CI.
 5. The traceability check (Section 9.1) passes: every label maps to a spec step, and every spec step of the stamped
-   headings maps to a label or to a `not_modelled` reason.
+   headings maps to a label or to a `not_modelled` reason. When the last scenario is built, `planned_scenarios` is
+   empty and no `pending` entry remains. Dropping a scenario from Section 12 removes its name from
+   `planned_scenarios` and from every `pending` array in the same change, and every entry that named it gains a
+   `not_modelled` reason saying what that scenario would have modelled, keeping whatever labels it already has; an
+   entry must never become silently complete while part of its unit has no model.
 6. The drift-stamp test, the traceability check, and FS-1 to FS-11 pass in the existing test job.
 7. `model-gate` passes on the pull request that adds the model.
 
@@ -622,3 +720,14 @@ to 7 hold with open findings counted as expected results, and the work is finish
   README as unverified assumptions.
 - The content of refusal reports (96.2) and exit codes: the model checks which outcome happens, not its wording.
 - Configuring branch protection: the design recommends requiring `model-gate` (Section 4); the owner sets it.
+
+## Stand-downs
+
+Findings the 2026-09-12 panel stood down below its severity floor, with the guard that makes each one moot:
+
+- A genuinely new rule-bearing heading can be listed as `not_modelled` with a vague reason rather than modelled.
+  Section 4 already states that no mechanism can force a person to model a new rule rather than re-stamp it; the
+  reason and the hashes appear in the pull request's diff.
+- Ordinary prose beginning with `#` inside a stamped section is read as a heading and can fail the family check.
+  That is what the markdown the spec is written in means (Section 9 counts ATX headings outside fenced blocks), so
+  the check agrees with every other reader of the file.
