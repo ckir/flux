@@ -98,10 +98,17 @@ without making it lie:
   (Section 5.1). The check is symmetric, as for witnesses: a listed label that does get covered fails the run too,
   naming the label and saying to remove it from `unreached`, so a label that becomes reachable cannot stay excused;
 - `unreached` excuses a label in one run, never in the model. A run of every run in `expected.toml` (`just model` with
-  no scenario) fails if any label of any model was covered by no run at all, so a label cannot be listed out of every
-  run and left as dead code: whatever a scenario cannot reach, another scenario or a seeded run must. A single-scenario
-  run cannot judge this and says so in its report, and the CI matrix runs one scenario per job, so `model-gate` does not
-  enforce it; the full `just model` that Section 13 requires before the work is declared finished does;
+  no scenario) unions the coverage of all its runs, which TLC reports per run and never merges itself, and fails if any
+  label of any model was covered by no run at all, so a label cannot be listed out of every run and left as dead code:
+  whatever a scenario cannot reach, another scenario or a seeded run must. A single-scenario run cannot judge this and
+  says so in its report, and the CI matrix runs one scenario per job, so `model-gate` does not enforce it; the full
+  `just model` that Section 13 requires before the work is declared finished does;
+- one top-level `never_reached` list in `expected.toml`, each entry a label and a reason, holds the labels no run can
+  cover. It is the only way out of the rule above, and it costs the label its traceability: a label in `never_reached`
+  may not appear in any `[[unit]]` entry's labels (Section 9.1), so a unit it was meant to implement falls back on
+  `not_modelled` or another label. A dead label can therefore never stand as the model of a spec rule, which is the
+  only thing listing it could otherwise buy. Adding a scenario to reach an awkward label instead is a change to Section
+  12's table with its reason, as a changed witness set is, never an edit to `expected.toml` alone;
 - the derived `<name>-fixed` runs are not covered by the check. A proposed spec fix is meant to make the path it
   closes unreachable, so a fix-flag run would otherwise fail because the fix worked;
 - a run that times out is a tooling failure (exit code 2) and its coverage is not judged at all, because a partial
@@ -687,7 +694,12 @@ Common bounds: one target lock path (plus the parent's for `nested`, and the per
 lock path for `dirlock`); at most two crashes per run in total, and one in `claims`; `LockLost` at most once; symmetry
 only as Section 6.1 states (`recovery` and `breaklock`, in `check` and `seeded` runs). These bounds come from
 order-of-magnitude estimates made during review (`dirlock` and the `claims` group `A`/`a` were the two at risk), not
-from measured runs; the first runs measure them. Each TLC run's `timeout_minutes` is
+from measured runs; the first runs measure them. The `recovery` liveness run is measured first of all, because liveness
+checking cannot use symmetry (Section 4) and has to build the whole state graph: five actors interleaving filesystem
+steps with two crashes each may not fit ten minutes. When it does not, the tightenings, in this order, are one crash
+instead of two in that run, then one Recoverer instead of two, then dropping the `PlainRun` from the liveness
+configuration; each is recorded in the README with the measurement that forced it, and the `check` runs keep the full
+actor set. Each TLC run's `timeout_minutes` is
 10; each CI matrix job (one scenario) should finish within about 20 minutes. A run that does not fit gets tighter
 bounds, and the tighter bounds are written into the README, never raised silently.
 
@@ -700,7 +712,8 @@ to 7 hold with open findings counted as expected results, and the work is finish
 2. Every `check` run reports exactly its listed witnesses and its open findings violated, and no other safety
    invariant; every fix-flag run reports exactly its witnesses. In every `check` and `liveness` run, every label of
    every actor the run instantiates is covered except the labels it lists as `unreached`, and each of those is indeed
-   uncovered; a full `just model` reports every label of every model covered by at least one run (Section 4).
+   uncovered; a full `just model` reports every label of every model covered by at least one run, apart from any in
+   `never_reached`, and no `never_reached` label is named by a `trace.toml` unit (Section 4).
 3. Every `liveness` run passes.
 4. Every run finishes within its time limit on CI.
 5. The traceability check (Section 9.1) passes: every label maps to a spec step, and every spec step of the stamped
