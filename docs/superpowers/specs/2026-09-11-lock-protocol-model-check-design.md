@@ -143,12 +143,12 @@ Recipes and CI:
      --name-only` from the merge base of the pull request's base and head (`base...head`), or from the push's previous
      commit, decides whether they touch
      `models/**`, the spec file (glob `FLUX_FULL_UPDATED_SPEC_V*.md`), `crates/flux-platform/tests/fs_semantics.rs`,
-     or the workflow itself, and outputs `run.py --list-scenarios` as the matrix, or an empty matrix when nothing
+     the `justfile` (its model recipes), or the workflow itself, and outputs `run.py --list-scenarios` as the matrix, or an empty matrix when nothing
      relevant changed. Manual dispatch, and any case where the changed files cannot be determined (a new branch, a
      force push whose previous commit is gone), count as touching, so an unknown change runs every scenario;
   2. `scenario`, one matrix job per scenario name and skipped when the matrix is empty (GitHub rejects an empty
      matrix, so the job carries a condition on `plan`'s output), installs Java with `actions/setup-java` (Temurin 21) and Python
-     with `actions/setup-python` (3.12), runs `just model <name>`, and uploads `target/tla/out/` when it
+     with `actions/setup-python` (3.11, the oldest version `run.py` supports), runs `just model <name>`, and uploads `target/tla/out/` when it
      fails;
   3. `model-gate` always runs after the others and fails if `plan` failed, if any `scenario` job failed or was
      cancelled, or if `scenario` was skipped although the matrix was not empty; it passes when the matrix was empty.
