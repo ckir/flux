@@ -147,7 +147,8 @@ exit codes) and the measured TLC facts above.
 - [ ] **Step 0: State check**
 
 Run: `git status --short && ls models 2>&1; java -version 2>&1 | head -1; python3 --version`
-Expected: a clean tree on `model/lock-protocol`; `ls: cannot access 'models'`; a Java version line; Python 3.11 or later.
+Expected: a clean tree on `model/lock-protocol`; an `ls` error saying `models` does not exist (GNU and BSD `ls` word it
+differently); a Java version line; Python 3.11 or later (3.14 recommended).
 
 - [ ] **Step 1: Ignore Python bytecode**
 
@@ -2866,15 +2867,18 @@ jobs:
         with:
           fetch-depth: 0
       - uses: actions/setup-python@v7
+        id: python311
         with:
-          # The last version listed is the default `python`; the others stay available as pythonX.Y.
-          python-version: |
-            3.11
-            3.14
+          python-version: "3.11"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
       - name: Runner unit tests (Python 3.14, then 3.11)
+        env:
+          PYTHON311: ${{ steps.python311.outputs.python-path }}
         run: |
           python -W error -m unittest discover -s models/lockproto -p "test_*.py"
-          python3.11 -W error -m unittest discover -s models/lockproto -p "test_*.py"
+          "$PYTHON311" -W error -m unittest discover -s models/lockproto -p "test_*.py"
       - name: Decide which scenarios to run
         id: plan
         env:
