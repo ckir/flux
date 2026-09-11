@@ -20,12 +20,13 @@ the protocol still makes progress, and stay tied to the spec text.
 |---|---|
 | What the work leaves behind | A living model in the repository, run by `just` and CI, that must stay green whenever the spec's lock sections change. Findings become spec fixes. |
 | Scope | Lock replacement core; crashes at every step and torn lock records; nested destination roots; claims with COMMIT; and (added by the owner after review round 2) Section 96.1's directory-lock fallback and its announce-then-check exclusion. |
-| Filesystem semantics | Two configurations of one filesystem model: POSIX and Windows (plus a weak-identity variant, Section 5). |
+| Filesystem semantics | Two configurations of one filesystem model: POSIX and Windows (plus weak-identity and weak-lock-capability variants, Section 5). |
 | Method | TLA+/PlusCal checked with TLC, plus Rust tests that confirm the filesystem assumptions on real operating systems. Chosen independently by the owner's two reviewers (Claude and agy). |
 
 ## 3. Spec sections the model encodes
 
-These sections are the model's contract. The drift stamp (Section 9) hashes exactly this list.
+These sections are the model's contract. The drift stamp and the traceability check (Section 9) cover exactly this
+list.
 
 | Section | Rule | Model |
 |---|---|---|
@@ -168,7 +169,7 @@ State:
 | `entries` | per directory, entry name → file object id; two names are the same entry when `Fold` maps them to the same class. Object ids are never reused; they index `content`, `durable`, `handles`, and `oslock` |
 | `content` | object id → `Record(op, kind)` (kind: `operation` or `cleanup`), `Torn`, or `Foreign`: what a reader sees now |
 | `durable` | object id → the content that survives a host crash (Section 5.2) |
-| `durableEntries` | per directory, the entries that survive a host crash; `entries` differs from it by the entry operations (create, rename, unlink) made since that directory's last flush |
+| `durableEntries` | per directory, the entries that survive a host crash; `entries` differs from it by the entry operations (create, hard link, rename, unlink) made since that directory's last flush |
 | `handles` | set of `[proc, obj, shareDelete]` |
 | `oslock` | object id → the process holding its OS-native lock, or none |
 | `inflight` | set of filesystem calls issued by a process and not yet complete (Section 5.2) |
@@ -269,8 +270,8 @@ Encodings: a lock record is a TLA+ record `[op |-> <operation id>, kind |-> "ope
 process value, so every value that names an actor (records, ghost variables, handles, in-flight calls) changes
 consistently when TLC permutes processes. Symmetry reduction is declared only over interchangeable actors (same kind
 and same target), and only in scenarios whose symmetry-free `liveness` runs also check every safety invariant (Section
-4): the two Recoverers of `recovery` and the two Breakers of `breaklock`. All other runs use no symmetry; `dirlock`'s
-two Owners lock different targets and are not interchangeable, and `claims` has no liveness run. Every invariant and witness
+4): the two Recoverers of `recovery` and the two Breakers of `breaklock`. All other runs use no symmetry; `dirlock` has one actor of
+each kind, and `claims` has no liveness run. Every invariant and witness
 quantifies over processes rather than naming one.
 
 | Actor | Behaviour |
@@ -404,8 +405,8 @@ time and is not claimed.
 
 ## 8. Defect-seeded configurations
 
-Each seeded configuration sets one flag that re-introduces a defect the adversarial review fixed, in the scenario that
-can reach it. `just model` requires each to stop with the listed violation; if one passes, the model has lost the
+Each seeded configuration sets one flag that re-introduces a defect the adversarial review fixed, or removes one rule
+the spec states (the rows without a review finding), in the scenario that can reach it. `just model` requires each to stop with the listed violation; if one passes, the model has lost the
 ability to see that defect and the run fails.
 
 | Flag | Defect re-introduced (review finding) | Scenario | Must fail |
