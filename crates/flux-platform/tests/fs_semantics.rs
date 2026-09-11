@@ -53,14 +53,15 @@ mod platform {
         rustix::fs::renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE).map_err(Into::into)
     }
 
-    pub fn identity_of_handle(file: &File) -> (u64, u64) {
+    /// Device and inode, widened to the Windows identity type.
+    pub fn identity_of_handle(file: &File) -> (u64, u128) {
         let meta = file.metadata().expect("fstat");
-        (meta.dev(), meta.ino())
+        (meta.dev(), u128::from(meta.ino()))
     }
 
-    pub fn identity_of_name(path: &Path) -> (u64, u64) {
+    pub fn identity_of_name(path: &Path) -> (u64, u128) {
         let meta = std::fs::metadata(path).expect("stat");
-        (meta.dev(), meta.ino())
+        (meta.dev(), u128::from(meta.ino()))
     }
 
     #[cfg(target_os = "linux")]
@@ -95,8 +96,8 @@ mod platform {
 
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, DeleteFileW, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, GetFileInformationByHandle, GetVolumeInformationW, GetVolumePathNameW,
+        DeleteFileW, FILE_ID_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FileIdInfo, GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW,
         LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, MOVEFILE_REPLACE_EXISTING,
         MoveFileExW,
     };
@@ -157,19 +158,27 @@ mod platform {
         check(unsafe { DeleteFileW(wide(path).as_ptr()) })
     }
 
-    pub fn identity_of_handle(file: &File) -> (u64, u64) {
-        // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is valid; the handle is open.
+    /// Volume serial and the 128-bit file id. The 64-bit `nFileIndex` from
+    /// `GetFileInformationByHandle` is not guaranteed unique on ReFS (Dev Drive), so read
+    /// `FILE_ID_INFO` instead.
+    pub fn identity_of_handle(file: &File) -> (u64, u128) {
+        // SAFETY: an all-zero FILE_ID_INFO is valid; the handle is open and the buffer size
+        // passed is the size of the struct written to.
         let info = unsafe {
-            let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
-            check(GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info))
-                .expect("GetFileInformationByHandle");
+            let mut info: FILE_ID_INFO = std::mem::zeroed();
+            check(GetFileInformationByHandleEx(
+                file.as_raw_handle() as HANDLE,
+                FileIdInfo,
+                (&raw mut info).cast(),
+                size_of::<FILE_ID_INFO>() as u32,
+            ))
+            .expect("GetFileInformationByHandleEx(FileIdInfo)");
             info
         };
-        let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
-        (u64::from(info.dwVolumeSerialNumber), index)
+        (info.VolumeSerialNumber, u128::from_le_bytes(info.FileId.Identifier))
     }
 
-    pub fn identity_of_name(path: &Path) -> (u64, u64) {
+    pub fn identity_of_name(path: &Path) -> (u64, u128) {
         identity_of_handle(&open(path))
     }
 
