@@ -40,16 +40,17 @@ fn fence_marker(line: &str) -> Option<&'static str> {
     ["```", "~~~"].into_iter().find(|m| line.starts_with(m))
 }
 
-/// Split the spec into sections. Heading lines inside fenced code blocks are text, not headings.
+/// Split the spec into sections. Heading lines inside fenced code blocks (indented or not) are text,
+/// not headings.
 fn sections(spec: &str) -> Vec<Section> {
     let mut out: Vec<Section> = Vec::new();
     let mut fence: Option<&str> = None;
     for line in spec.lines() {
         match fence {
-            Some(marker) if line.starts_with(marker) => fence = None,
+            Some(marker) if line.trim_start().starts_with(marker) => fence = None,
             Some(_) => {}
             None => {
-                if let Some(marker) = fence_marker(line) {
+                if let Some(marker) = fence_marker(line.trim_start()) {
                     fence = Some(marker);
                 } else if is_heading(line) {
                     out.push(Section { heading: line.to_string(), lines: Vec::new() });
@@ -231,7 +232,7 @@ fn check(inputs: &Inputs<'_>) -> Vec<String> {
             problems.push(format!("{at}: listed twice"));
         }
         let Some(text) = entry.ordinal.checked_sub(1).and_then(|i| units.get(i)) else {
-            problems.push(format!("{at}: the heading has only {} units", units.len()));
+            problems.push(format!("{at}: no such unit; ordinals run from 1 to {}", units.len()));
             continue;
         };
         if entry.quote.trim().is_empty() || !squash(text).contains(&squash(&entry.quote)) {
@@ -326,8 +327,11 @@ fn read(path: &Path) -> String {
 
 fn model_files(root: &Path) -> Vec<String> {
     let mut texts = Vec::new();
-    for entry in std::fs::read_dir(root.join(MODELS)).unwrap() {
-        let path = entry.unwrap().path();
+    let dir = root.join(MODELS);
+    let entries =
+        std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot list {}: {e}", dir.display()));
+    for entry in entries {
+        let path = entry.unwrap_or_else(|e| panic!("cannot list {}: {e}", dir.display())).path();
         if path.extension().is_some_and(|e| e == "tla") {
             texts.push(read(&path));
         }
@@ -456,6 +460,24 @@ fn fenced_heading_is_not_a_heading() {
             "## 1.4 Indented list"
         ]
     );
+}
+
+#[test]
+fn indented_fence_hides_a_heading_line() {
+    // The fence is indented under a list item; the line inside it starts at column 0.
+    let spec = "## 2.1 Parent
+
+1. A step with code:
+
+   ``` text
+## 2.9 Not a heading
+   ```
+
+## 2.2 Next
+Text.
+";
+    let headings: Vec<String> = sections(spec).into_iter().map(|s| s.heading).collect();
+    assert_eq!(headings, ["## 2.1 Parent", "## 2.2 Next"]);
 }
 
 #[test]
