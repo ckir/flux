@@ -17,6 +17,9 @@ use std::path::Path;
 
 use tempfile::TempDir;
 
+/// A fresh directory for one probe. Bind it first in each test so it drops after every handle
+/// opened inside it: `TempDir` ignores a failed removal, and Windows cannot remove a file that is
+/// still open without delete-sharing.
 fn scratch() -> TempDir {
     let dir = tempfile::tempdir().expect("create a scratch directory");
     println!("scratch filesystem: {}", platform::fs_type(dir.path()));
@@ -225,8 +228,14 @@ fn fs2_no_replace_rename_fails_when_target_exists() {
     let (from, to) = (dir.path().join("from"), dir.path().join("to"));
     drop(create(&from));
     drop(create(&to));
-    assert!(rename_no_replace(&from, &to).is_err(), "no-replace rename replaced an existing name");
+    let refused = rename_no_replace(&from, &to).err().map(|e| e.kind());
+    assert_eq!(refused, Some(ErrorKind::AlreadyExists), "no-replace rename onto an existing name");
     assert!(from.exists() && to.exists());
+    // Control: the same call onto a free name moves `from`, so the refusal above came from the
+    // existing target, not from an unsupported flag or swapped arguments.
+    let free = dir.path().join("free");
+    rename_no_replace(&from, &free).expect("no-replace rename onto a free name");
+    assert!(!from.exists() && free.exists());
 }
 
 #[test]
@@ -313,13 +322,16 @@ fn fs7_file_open_with_delete_sharing_can_be_renamed_deleted_and_replaced() {
     let source = dir.path().join("source");
     drop(create(&target));
     drop(create(&source));
+    let source_id = identity_of_name(&source);
     let _held_target = platform::open_shared(&target, true);
     let legacy = platform::rename(&source, &target, true);
     println!("MoveFileExW(MOVEFILE_REPLACE_EXISTING) onto an open, delete-shared file: {legacy:?}");
     // The model's replacing rename is the POSIX-semantics rename that std::fs::rename uses; the
-    // legacy MoveFileExW replace above refuses any open target (measured on Windows 11 NTFS).
+    // legacy MoveFileExW replace above refuses any open target (measured on Windows 11 NTFS and
+    // ReFS).
     std::fs::rename(&source, &target).expect("replacing rename onto a shared-delete file");
     assert!(!source.exists());
+    assert_eq!(identity_of_name(&target), source_id, "the name does not hold the moved file");
 }
 
 #[test]
@@ -329,7 +341,8 @@ fn fs8_name_replaced_by_new_file_reports_new_identity() {
     let old = create(&path);
     let old_id = identity_of_handle(&old);
     drop(create(&fresh));
-    // Keep the old object open so its identity cannot be reused while we compare.
+    // `fresh` is created while the old file is still named and open, so the two are distinct
+    // objects; the probe checks that the name reports the new one after the replace.
     std::fs::rename(&fresh, &path).expect("replace the name with a new file");
     assert_ne!(identity_of_name(&path), old_id, "a replaced name reported the old identity");
 }
