@@ -44,4 +44,13 @@ NeverRecoveredAfterCrash == ~recoveredAfterCrash
 \* (design Section 7).
 NeverDeadOwnerLock == ~DeadOwnerLock
 NeverTornLock == ~TornLock
+
+\* ------------------------------------------------------------------------------------------
+\* Temporal properties (design Section 7). A configuration that checks one lists exactly one
+\* PROPERTY, because TLC reports a temporal violation without naming the property it belongs to.
+
+\* A lock left behind by an owner that died does not stay there: some later invocation clears it
+\* (240.3, 251.1). This is what the `recovery` scenario's liveness run checks, and the state it is
+\* about is shown to occur by the `NeverDeadOwnerLock` witness run.
+DeadLockEventuallyCleared == [](DeadOwnerLock => <>(~DeadOwnerLock))
 ====

@@ -1,4 +1,4 @@
-(* --algorithm LockProtocol {
+(* --fair algorithm LockProtocol {
      \* Each label performs at most ONE filesystem operation (design Section 5.2). A purely local
      \* decision that follows a call - a judgement over what was just read, a branch on whether the
      \* call succeeded - belongs to the same label: no other actor can observe the state between

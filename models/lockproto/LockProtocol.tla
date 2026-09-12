@@ -39,7 +39,7 @@ INSTANCE FsModel WITH Dirs <- Dirs, Names <- Names, Procs <- Procs, NoProc <- No
 RecovererPerms == Permutations(Recoverers)
 Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "dead"}
 
-(* --algorithm LockProtocol {
+(* --fair algorithm LockProtocol {
      \* Each label performs at most ONE filesystem operation (design Section 5.2). A purely local
      \* decision that follows a call - a judgement over what was just read, a branch on whether the
      \* call succeeded - belongs to the same label: no other actor can observe the state between
@@ -532,7 +532,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "84889d62" /\ chksum(tla) = "bc31dcaf")
+\* BEGIN TRANSLATION (chksum(pcal) = "84889d62" /\ chksum(tla) = "dbbb812f")
 \* Procedure variable obj of procedure Classify at line 95 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, classified, ownerLive, sawLive, seenRec, crashed, live, holding, 
@@ -1633,7 +1633,8 @@ Next == env
            \/ (\E self \in Cleanups: clean(self))
            \/ Terminating
 
-Spec == Init /\ [][Next]_vars
+Spec == /\ Init /\ [][Next]_vars
+        /\ WF_vars(Next)
 
 Termination == <>(\A self \in ProcSet: pc[self] = "Done")
 
@@ -1684,4 +1685,13 @@ NeverRecoveredAfterCrash == ~recoveredAfterCrash
 \* (design Section 7).
 NeverDeadOwnerLock == ~DeadOwnerLock
 NeverTornLock == ~TornLock
+
+\* ------------------------------------------------------------------------------------------
+\* Temporal properties (design Section 7). A configuration that checks one lists exactly one
+\* PROPERTY, because TLC reports a temporal violation without naming the property it belongs to.
+
+\* A lock left behind by an owner that died does not stay there: some later invocation clears it
+\* (240.3, 251.1). This is what the `recovery` scenario's liveness run checks, and the state it is
+\* about is shown to occur by the `NeverDeadOwnerLock` witness run.
+DeadLockEventuallyCleared == [](DeadOwnerLock => <>(~DeadOwnerLock))
 ====
