@@ -16,6 +16,7 @@ use serde::Deserialize;
 
 const STAMP: &str = "models/lockproto/spec-sections.stamp";
 const TRACE: &str = "models/lockproto/trace.toml";
+const EXPECTED: &str = "models/lockproto/expected.toml";
 const MODELS: &str = "models/lockproto";
 
 fn repo() -> PathBuf {
@@ -50,7 +51,15 @@ impl Fence {
         let text = line.trim_start();
         let ch = *text.as_bytes().first()?;
         let len = text.bytes().take_while(|b| *b == ch).count();
-        ((ch == b'`' || ch == b'~') && len >= 3).then_some(Fence { ch, len })
+        if !(ch == b'`' || ch == b'~') || len < 3 {
+            return None;
+        }
+        // CommonMark: a backtick fence's info string may not itself contain a backtick (it would
+        // be ambiguous with inline code spans); a tilde fence's info string has no such limit.
+        if ch == b'`' && text[len..].contains('`') {
+            return None;
+        }
+        Some(Fence { ch, len })
     }
 
     fn closed_by(self, line: &str) -> bool {
@@ -92,6 +101,91 @@ fn sections(spec: &str) -> Vec<Section> {
         }
     }
     out
+}
+
+/// A heading's number (design Section 9): the first whitespace-separated word after its `#`
+/// marks, with at most one trailing `.` removed, when what remains is digits separated by single
+/// dots (`96`, `96.1`, `21.1`). A heading whose first word doesn't fit that shape has no number.
+fn heading_number(heading: &str) -> Option<String> {
+    let hashes = heading.bytes().take_while(|b| *b == b'#').count();
+    let rest = heading[hashes..].trim_start();
+    let word = rest.split_whitespace().next()?;
+    let word = word.strip_suffix('.').unwrap_or(word);
+    let is_number = !word.is_empty()
+        && word.split('.').all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()));
+    is_number.then(|| word.to_string())
+}
+
+/// A Setext underline (design Section 9, family rule only): up to 3 leading spaces, then one or
+/// more of only `=` or only `-`, trailing spaces allowed.
+fn is_setext_underline(line: &str) -> bool {
+    let text = line.trim_end_matches(' ');
+    let leading = text.bytes().take_while(|b| *b == b' ').count();
+    if leading > 3 {
+        return false;
+    }
+    let core = &text[leading..];
+    !core.is_empty() && (core.bytes().all(|b| b == b'=') || core.bytes().all(|b| b == b'-'))
+}
+
+/// A heading line for the family rule only (design Section 9): every ATX heading outside a
+/// fenced block, plus every Setext heading outside a fenced block, each carrying its own number
+/// or, lacking one, the number of the nearest heading above it that has one (design point 4). This
+/// is a separate pass from `sections()`/`units()`, which must not change.
+struct HeadingLine {
+    text: String,
+    number: Option<String>,
+}
+
+fn heading_lines(spec: &str) -> Vec<HeadingLine> {
+    let lines: Vec<&str> = spec.lines().collect();
+    let mut out = Vec::new();
+    let mut fence: Option<Fence> = None;
+    let mut current_number: Option<String> = None;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let in_fence_before = fence.is_some();
+        let marker = fence_marker_line(&mut fence, line);
+        if !marker && !in_fence_before {
+            if is_heading(line) {
+                if let Some(n) = heading_number(line) {
+                    current_number = Some(n);
+                }
+                out.push(HeadingLine { text: line.to_string(), number: current_number.clone() });
+            } else if !line.trim().is_empty() {
+                if let Some(next) = lines.get(i + 1) {
+                    if is_setext_underline(next) {
+                        out.push(HeadingLine {
+                            text: line.to_string(),
+                            number: current_number.clone(),
+                        });
+                        i += 1; // also consume the underline line
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The family root of a number (design Section 9): drop the last dotted part when there is more
+/// than one part; a one-part number is its own root.
+fn family_root(number: &str) -> String {
+    number.rsplit_once('.').map_or_else(|| number.to_string(), |(head, _)| head.to_string())
+}
+
+/// Whether `number` is in the family rooted at `root`: equal to it, or beginning `root.`.
+fn in_family(number: &str, root: &str) -> bool {
+    number == root || number.starts_with(&format!("{root}."))
+}
+
+/// How many times `text` occurs, among heading lines in `all`, within the family rooted at `root`.
+fn occurrences_in_family(all: &[HeadingLine], root: &str, text: &str) -> usize {
+    all.iter()
+        .filter(|h| h.text == text && h.number.as_deref().is_some_and(|n| in_family(n, root)))
+        .count()
 }
 
 /// A numbered step: optional indentation, digits, a dot, and a space (`1. Open`, `    2.  Take`).
@@ -168,6 +262,10 @@ fn parse_stamp(text: &str) -> Result<Stamp, String> {
 struct Trace {
     #[serde(default)]
     unit: Vec<TraceUnit>,
+    #[serde(default)]
+    heading: Vec<TraceHeadingEntry>,
+    #[serde(default)]
+    planned_scenarios: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -180,6 +278,37 @@ struct TraceUnit {
     #[serde(default)]
     labels: Vec<String>,
     not_modelled: Option<String>,
+    #[serde(default)]
+    pending: Vec<String>,
+}
+
+/// A `[[heading]]` entry (design Section 9): a heading in a stamped heading's family that the
+/// model does not encode itself. Never carries labels — a heading whose text the model encodes is
+/// stamped, never listed here.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TraceHeadingEntry {
+    heading: String,
+    family: String,
+    count: usize,
+    not_modelled: Option<String>,
+    #[serde(default)]
+    pending: Vec<String>,
+}
+
+/// The fields of `expected.toml` the check needs (design Section 9.1). `run.py` owns that file's
+/// full schema, so this does not `deny_unknown_fields`.
+#[derive(Deserialize, Default)]
+struct Expected {
+    #[serde(default)]
+    scenarios: Vec<String>,
+    #[serde(default)]
+    never_reached: Vec<NeverReached>,
+}
+
+#[derive(Deserialize)]
+struct NeverReached {
+    label: String,
 }
 
 fn is_label_name(token: &str) -> bool {
@@ -226,6 +355,7 @@ struct Inputs<'a> {
     stamp: &'a Stamp,
     trace: &'a str,
     tla: &'a [String],
+    expected: &'a str,
 }
 
 fn check(inputs: &Inputs<'_>) -> Vec<String> {
@@ -234,6 +364,13 @@ fn check(inputs: &Inputs<'_>) -> Vec<String> {
     let trace: Trace = match toml::from_str(inputs.trace) {
         Ok(t) => t,
         Err(e) => return vec![format!("{TRACE} does not parse: {e}")],
+    };
+    let expected: Expected = match toml::from_str(inputs.expected) {
+        Ok(e) => e,
+        Err(e) => {
+            problems.push(format!("expected.toml does not parse: {e}"));
+            Expected::default()
+        }
     };
 
     let mut stamped: BTreeMap<&str, Vec<String>> = BTreeMap::new();
@@ -248,6 +385,9 @@ fn check(inputs: &Inputs<'_>) -> Vec<String> {
             stamped.insert(heading, units(&matches[0].lines));
         }
     }
+
+    let never_reached: BTreeSet<&str> =
+        expected.never_reached.iter().map(|n| n.label.as_str()).collect();
 
     let mut seen: BTreeMap<&str, BTreeSet<usize>> = BTreeMap::new();
     let mut mapped_labels = BTreeSet::new();
@@ -275,11 +415,28 @@ fn check(inputs: &Inputs<'_>) -> Vec<String> {
                 entry.labels.join(", ")
             ));
         }
-        match (entry.labels.is_empty(), &entry.not_modelled) {
-            (false, None) => mapped_labels.extend(entry.labels.iter().cloned()),
-            (true, Some(reason)) if !reason.trim().is_empty() => {}
-            _ => problems
-                .push(format!("{at}: give either non-empty labels or a not_modelled reason")),
+        let not_modelled_given = entry.not_modelled.as_ref().is_some_and(|r| !r.trim().is_empty());
+        let pending_given = !entry.pending.is_empty();
+        if entry.labels.is_empty() && !not_modelled_given && !pending_given {
+            problems.push(format!(
+                "{at}: give either non-empty labels or a not_modelled reason (or a non-empty pending array)"
+            ));
+        } else if !entry.labels.is_empty() {
+            mapped_labels.extend(entry.labels.iter().cloned());
+        }
+        for label in &entry.labels {
+            if never_reached.contains(label.as_str()) {
+                problems.push(format!(
+                    "{at}: label {label} is in expected.toml's never_reached and must not be used"
+                ));
+            }
+        }
+        for scenario in &entry.pending {
+            if !trace.planned_scenarios.iter().any(|s| s == scenario) {
+                problems.push(format!(
+                    "{at}: pending scenario {scenario:?} is not in trace.toml's planned_scenarios"
+                ));
+            }
         }
     }
     for (heading, units) in &stamped {
@@ -297,6 +454,98 @@ fn check(inputs: &Inputs<'_>) -> Vec<String> {
     for label in mapped_labels.difference(&model_labels) {
         problems.push(format!("label {label} is in trace.toml but in no model file"));
     }
+
+    // Family rule (design Section 9): every heading in a stamped heading's family, other than a
+    // stamped one, must be covered by exactly one `[[heading]]` entry.
+    let all_headings = heading_lines(inputs.spec);
+    let mut families: BTreeMap<String, &str> = BTreeMap::new();
+    for heading in stamped.keys().copied() {
+        let Some(found) = all_headings.iter().find(|h| h.text == heading) else { continue };
+        let Some(number) = &found.number else { continue };
+        families.entry(family_root(number)).or_insert(heading);
+    }
+
+    let mut heading_entries: BTreeMap<(&str, &str), &TraceHeadingEntry> = BTreeMap::new();
+    for h in &trace.heading {
+        let key = (h.heading.as_str(), h.family.as_str());
+        if heading_entries.insert(key, h).is_some() {
+            problems.push(format!(
+                "[[heading]] entry for {:?} in family {} is listed more than once",
+                h.heading, h.family
+            ));
+        }
+    }
+
+    for (root, representative) in &families {
+        let mut members: BTreeSet<&str> = BTreeSet::new();
+        for h in &all_headings {
+            if h.number.as_deref().is_some_and(|n| in_family(n, root)) {
+                members.insert(h.text.as_str());
+            }
+        }
+        for text in members {
+            if stamped.contains_key(text) {
+                continue;
+            }
+            if !heading_entries.contains_key(&(text, root.as_str())) {
+                problems.push(format!(
+                    "{text:?} is in the family of {representative:?} but has no matching trace.toml [[heading]] entry"
+                ));
+            }
+        }
+    }
+
+    for h in &trace.heading {
+        if !families.contains_key(&h.family) {
+            problems.push(format!(
+                "[[heading]] entry names family {:?}, which is not the family of any stamped heading",
+                h.family
+            ));
+        }
+        if stamped.contains_key(h.heading.as_str()) {
+            problems.push(format!(
+                "[[heading]] entry names {:?}, which is itself a stamped heading",
+                h.heading
+            ));
+        }
+        let occurrences = occurrences_in_family(&all_headings, &h.family, &h.heading);
+        if occurrences == 0 {
+            problems.push(format!(
+                "[[heading]] entry for {:?} does not occur in family {}",
+                h.heading, h.family
+            ));
+        } else if occurrences != h.count {
+            problems.push(format!(
+                "[[heading]] entry for {:?} (family {}) says count = {}, but it occurs {occurrences} times",
+                h.heading, h.family, h.count
+            ));
+        }
+        let not_modelled_given = h.not_modelled.as_ref().is_some_and(|r| !r.trim().is_empty());
+        let pending_given = !h.pending.is_empty();
+        if not_modelled_given == pending_given {
+            problems.push(format!(
+                "[[heading]] entry for {:?} (family {}) must give exactly one of a not_modelled reason or a non-empty pending array",
+                h.heading, h.family
+            ));
+        }
+        for scenario in &h.pending {
+            if !trace.planned_scenarios.iter().any(|s| s == scenario) {
+                problems.push(format!(
+                    "[[heading]] entry for {:?} (family {}): pending scenario {scenario:?} is not in trace.toml's planned_scenarios",
+                    h.heading, h.family
+                ));
+            }
+        }
+    }
+
+    for scenario in &trace.planned_scenarios {
+        if expected.scenarios.iter().any(|s| s == scenario) {
+            problems.push(format!(
+                "planned_scenarios lists {scenario:?}, which is also in expected.toml's scenarios"
+            ));
+        }
+    }
+
     problems
 }
 
@@ -332,13 +581,23 @@ fn rewrite_hashes(trace_text: &str, spec: &str) -> Result<String, String> {
     // string with a line starting `hash =` would otherwise be rewritten too).
     let rewritten: Trace = toml::from_str(&out).map_err(|e| format!("rewritten map: {e}"))?;
     let only_hashes = rewritten.unit.len() == trace.unit.len()
+        && rewritten.heading.len() == trace.heading.len()
+        && rewritten.planned_scenarios == trace.planned_scenarios
         && rewritten.unit.iter().zip(&trace.unit).zip(&hashes).all(|((new, old), hash)| {
             new.heading == old.heading
                 && new.ordinal == old.ordinal
                 && new.quote == old.quote
                 && new.labels == old.labels
                 && new.not_modelled == old.not_modelled
+                && new.pending == old.pending
                 && Some(&new.hash) == hash.as_ref().or(Some(&old.hash))
+        })
+        && rewritten.heading.iter().zip(&trace.heading).all(|(new, old)| {
+            new.heading == old.heading
+                && new.family == old.family
+                && new.count == old.count
+                && new.not_modelled == old.not_modelled
+                && new.pending == old.pending
         });
     if !only_hashes {
         return Err(
@@ -385,6 +644,7 @@ fn model_trace_matches_spec() {
         stamp: &stamp,
         trace: &read(&root.join(TRACE)),
         tla: &model_files(&root),
+        expected: &read(&root.join(EXPECTED)),
     });
     assert!(problems.is_empty(), "model traceability problems:\n  {}", problems.join("\n  "));
 }
@@ -475,6 +735,43 @@ fn entry(heading: &str, ordinal: usize, quote: &str, labels: &[&str]) -> String 
         unit_hash(text),
         labels.join(", ")
     )
+}
+
+/// `[[heading]]` entries covering, with a generic `not_modelled` reason, every heading in the
+/// family of any of `headings` (SPEC's headings are deliberately numbered as a family tree, e.g.
+/// `1.2` under `1`), other than `headings` themselves. For tests that use SPEC to exercise
+/// unrelated behaviour and don't want the family rule (Section 9) to add unrelated problems.
+fn cover_families(headings: &[&str]) -> String {
+    let all = heading_lines(SPEC);
+    let stamped: BTreeSet<&str> = headings.iter().copied().collect();
+    let mut roots: BTreeSet<String> = BTreeSet::new();
+    for heading in headings {
+        if let Some(found) = all.iter().find(|h| h.text == *heading) {
+            if let Some(number) = &found.number {
+                roots.insert(family_root(number));
+            }
+        }
+    }
+    let mut counts: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    for h in &all {
+        let Some(number) = &h.number else { continue };
+        for root in &roots {
+            if in_family(number, root) {
+                *counts.entry((h.text.as_str(), root.as_str())).or_default() += 1;
+            }
+        }
+    }
+    let mut out = String::new();
+    for ((text, root), count) in counts {
+        if stamped.contains(text) {
+            continue;
+        }
+        let _ = write!(
+            out,
+            "[[heading]]\nheading = {text:?}\nfamily = {root:?}\ncount = {count}\nnot_modelled = \"test fixture\"\n\n"
+        );
+    }
+    out
 }
 
 #[test]
@@ -635,9 +932,11 @@ fn complete_map_passes() {
     trace += "[[unit]]\nheading = \"## 1.2 Steps\"\nordinal = 5\nquote = \"Not indented\"\n";
     let _ = writeln!(trace, "hash = \"{}\"", unit_hash(&section_units("## 1.2 Steps")[4]));
     trace += "not_modelled = \"prose only\"\n";
+    trace += &cover_families(&["## 1.2 Steps"]);
     let tla =
         vec!["S1_2_intro: a := 1; S1_2_s1: b := 1; S1_2_s2: c := 1; S1_2_s3: d := 1;".to_string()];
-    let problems = check(&Inputs { spec: SPEC, stamp: &stamp, trace: &trace, tla: &tla });
+    let problems =
+        check(&Inputs { spec: SPEC, stamp: &stamp, trace: &trace, tla: &tla, expected: "" });
     assert!(problems.is_empty(), "{problems:#?}");
 }
 
@@ -647,7 +946,8 @@ fn missing_unit_changed_text_and_stray_labels_are_reported() {
     let mut trace = entry("## 1.1 Alpha", 1, "First paragraph", &["S1_1_first"]);
     trace = trace.replacen("hash = \"", "hash = \"00", 1);
     let tla = vec!["S1_1_first: a := 1; S1_1_extra: b := 1;".to_string()];
-    let problems = check(&Inputs { spec: SPEC, stamp: &stamp, trace: &trace, tla: &tla });
+    let problems =
+        check(&Inputs { spec: SPEC, stamp: &stamp, trace: &trace, tla: &tla, expected: "" });
     let text = problems.join("\n");
     assert!(text.contains("units [2, 3, 4] have no trace.toml entry"), "{text}");
     assert!(text.contains("unit 1: spec text changed; re-check labels [S1_1_first]"), "{text}");
@@ -657,9 +957,11 @@ fn missing_unit_changed_text_and_stray_labels_are_reported() {
 #[test]
 fn quote_must_come_from_its_unit() {
     let stamp = stamp(&["## 1.2.1 Child"]);
-    let trace = entry("## 1.2.1 Child", 1, "Take the lock", &["S1_2_1_x"]);
+    let mut trace = entry("## 1.2.1 Child", 1, "Take the lock", &["S1_2_1_x"]);
+    trace += &cover_families(&["## 1.2.1 Child"]);
     let tla = vec!["S1_2_1_x: a := 1;".to_string()];
-    let problems = check(&Inputs { spec: SPEC, stamp: &stamp, trace: &trace, tla: &tla });
+    let problems =
+        check(&Inputs { spec: SPEC, stamp: &stamp, trace: &trace, tla: &tla, expected: "" });
     assert_eq!(problems.len(), 1, "{problems:#?}");
     assert!(problems[0].contains("is not in the unit"));
 }
@@ -671,6 +973,7 @@ fn stamp_heading_must_exist_once() {
         stamp: &stamp(&["## 9.9 Not a heading", "## 1.2.1 Child", "## 1.2.1 Child"]),
         trace: "",
         tla: &[],
+        expected: "",
     });
     let text = problems.join("\n");
     assert!(
@@ -684,7 +987,8 @@ fn stamp_heading_must_exist_once() {
 fn labels_and_not_modelled_are_exclusive() {
     let stamp = stamp(&["## 1.2.1 Child"]);
     let trace = entry("## 1.2.1 Child", 1, "Child text", &[]);
-    let problems = check(&Inputs { spec: SPEC, stamp: &stamp, trace: &trace, tla: &[] });
+    let problems =
+        check(&Inputs { spec: SPEC, stamp: &stamp, trace: &trace, tla: &[], expected: "" });
     assert!(
         problems.iter().any(|p| p.contains("either non-empty labels or a not_modelled reason")),
         "{problems:#?}"
@@ -716,4 +1020,259 @@ fn rewrite_updates_only_hash_lines() {
     assert!(rewritten.starts_with("# map\n[[unit]]\n"));
     assert!(rewritten.contains(&format!("hash = \"{good}\"")));
     assert!(!rewritten.contains("stale"));
+}
+
+// ------------------------------------------------------------------------------------------
+// Tests of the CommonMark fence fix, heading numbers, the family rule, and the new trace.toml
+// shapes (design Sections 9 and 9.1), on small made-up inputs.
+
+#[test]
+fn backtick_fence_with_a_backtick_in_its_info_string_does_not_open() {
+    // CommonMark: a backtick fence's info string may not itself contain a backtick, so this line
+    // does not open a fence; without the fix it would, hiding "## 5.2 Next" until EOF.
+    let spec = "## 5.1 Parent\n```rust` x\nStill text.\n\n## 5.2 Next\nMore.\n";
+    let headings: Vec<String> = sections(spec).into_iter().map(|s| s.heading).collect();
+    assert_eq!(headings, ["## 5.1 Parent", "## 5.2 Next"]);
+}
+
+#[test]
+fn tilde_fence_with_a_backtick_in_its_info_string_still_opens() {
+    // The restriction is backtick-specific; a tilde fence's info string may contain a backtick.
+    let spec = "## 6.1 Parent\n~~~rust` x\n## 6.9 Not a heading\n~~~\n\n## 6.2 Next\n";
+    let headings: Vec<String> = sections(spec).into_iter().map(|s| s.heading).collect();
+    assert_eq!(headings, ["## 6.1 Parent", "## 6.2 Next"]);
+}
+
+#[test]
+fn family_sibling_with_no_heading_entry_is_reported() {
+    let spec = "\
+# Title
+
+## 96.1 Alpha
+Alpha text.
+
+## 96.2 Beta
+Beta text.
+";
+    let stamp = stamp(&["## 96.1 Alpha"]);
+    let hash = unit_hash("Alpha text.");
+    let trace = format!(
+        "[[unit]]\nheading = \"## 96.1 Alpha\"\nordinal = 1\nquote = \"Alpha text\"\nhash = \"{hash}\"\nlabels = [\"S96_1_a\"]\n"
+    );
+    let tla = vec!["S96_1_a: x := 1;".to_string()];
+    let problems = check(&Inputs { spec, stamp: &stamp, trace: &trace, tla: &tla, expected: "" });
+    let text = problems.join("\n");
+    assert!(text.contains("\"## 96.2 Beta\""), "{text}");
+    assert!(text.contains("\"## 96.1 Alpha\""), "{text}");
+}
+
+#[test]
+fn unnumbered_heading_inherits_a_number_and_joins_the_family() {
+    let spec = "\
+# Title
+
+## 96.1 Alpha
+Alpha text.
+
+## Extra
+Extra text.
+";
+    let stamp = stamp(&["## 96.1 Alpha"]);
+    let hash = unit_hash("Alpha text.");
+    let trace = format!(
+        "[[unit]]\nheading = \"## 96.1 Alpha\"\nordinal = 1\nquote = \"Alpha text\"\nhash = \"{hash}\"\nlabels = [\"S96_1_a\"]\n"
+    );
+    let tla = vec!["S96_1_a: x := 1;".to_string()];
+    let problems = check(&Inputs { spec, stamp: &stamp, trace: &trace, tla: &tla, expected: "" });
+    let text = problems.join("\n");
+    assert!(text.contains("\"## Extra\""), "{text}");
+}
+
+#[test]
+fn setext_heading_falls_in_the_family() {
+    let spec = "\
+# Title
+
+## 96.1 Alpha
+Alpha text.
+
+Sibling Setext
+--------------
+Setext text.
+";
+    let stamp = stamp(&["## 96.1 Alpha"]);
+    let hash1 = unit_hash("Alpha text.");
+    let hash2 = unit_hash("Sibling Setext\n--------------\nSetext text.");
+    let trace = format!(
+        "[[unit]]\nheading = \"## 96.1 Alpha\"\nordinal = 1\nquote = \"Alpha text\"\nhash = \"{hash1}\"\nlabels = [\"S96_1_a\"]\n\n\
+         [[unit]]\nheading = \"## 96.1 Alpha\"\nordinal = 2\nquote = \"Setext text\"\nhash = \"{hash2}\"\nnot_modelled = \"prose only\"\n"
+    );
+    let tla = vec!["S96_1_a: x := 1;".to_string()];
+    let problems = check(&Inputs { spec, stamp: &stamp, trace: &trace, tla: &tla, expected: "" });
+    let text = problems.join("\n");
+    assert!(text.contains("\"Sibling Setext\""), "{text}");
+}
+
+#[test]
+fn heading_entry_with_wrong_count_is_reported() {
+    let spec = "\
+# Title
+
+## 96.1 Alpha
+Alpha text.
+
+## Normal
+First.
+
+## Normal
+Second.
+";
+    let stamp = stamp(&["## 96.1 Alpha"]);
+    let hash = unit_hash("Alpha text.");
+    let trace = format!(
+        "[[unit]]\nheading = \"## 96.1 Alpha\"\nordinal = 1\nquote = \"Alpha text\"\nhash = \"{hash}\"\nlabels = [\"S96_1_a\"]\n\n\
+         [[heading]]\nheading = \"## Normal\"\nfamily = \"96\"\ncount = 1\nnot_modelled = \"not modelled\"\n"
+    );
+    let tla = vec!["S96_1_a: x := 1;".to_string()];
+    let problems = check(&Inputs { spec, stamp: &stamp, trace: &trace, tla: &tla, expected: "" });
+    let text = problems.join("\n");
+    assert!(text.contains("count = 1") && text.contains("occurs 2 times"), "{text}");
+}
+
+#[test]
+fn duplicate_heading_entry_is_reported() {
+    let spec = "\
+# Title
+
+## 96.1 Alpha
+Alpha text.
+
+## Normal
+First.
+
+## Normal
+Second.
+";
+    let stamp = stamp(&["## 96.1 Alpha"]);
+    let hash = unit_hash("Alpha text.");
+    let trace = format!(
+        "[[unit]]\nheading = \"## 96.1 Alpha\"\nordinal = 1\nquote = \"Alpha text\"\nhash = \"{hash}\"\nlabels = [\"S96_1_a\"]\n\n\
+         [[heading]]\nheading = \"## Normal\"\nfamily = \"96\"\ncount = 2\nnot_modelled = \"not modelled\"\n\n\
+         [[heading]]\nheading = \"## Normal\"\nfamily = \"96\"\ncount = 2\nnot_modelled = \"not modelled\"\n"
+    );
+    let tla = vec!["S96_1_a: x := 1;".to_string()];
+    let problems = check(&Inputs { spec, stamp: &stamp, trace: &trace, tla: &tla, expected: "" });
+    let text = problems.join("\n");
+    assert!(text.contains("is listed more than once"), "{text}");
+}
+
+#[test]
+fn heading_entry_for_a_stamped_heading_is_rejected() {
+    let spec = "\
+# Title
+
+## 96.1 Alpha
+Alpha text.
+";
+    let stamp = stamp(&["## 96.1 Alpha"]);
+    let hash = unit_hash("Alpha text.");
+    let trace = format!(
+        "[[unit]]\nheading = \"## 96.1 Alpha\"\nordinal = 1\nquote = \"Alpha text\"\nhash = \"{hash}\"\nlabels = [\"S96_1_a\"]\n\n\
+         [[heading]]\nheading = \"## 96.1 Alpha\"\nfamily = \"96\"\ncount = 1\nnot_modelled = \"bogus\"\n"
+    );
+    let tla = vec!["S96_1_a: x := 1;".to_string()];
+    let problems = check(&Inputs { spec, stamp: &stamp, trace: &trace, tla: &tla, expected: "" });
+    assert!(problems.iter().any(|p| p.contains("is itself a stamped heading")), "{problems:#?}");
+}
+
+#[test]
+fn pending_name_missing_from_planned_scenarios_is_reported() {
+    let spec = "\
+# Title
+
+## 96.1 Alpha
+Alpha text.
+";
+    let stamp = stamp(&["## 96.1 Alpha"]);
+    let hash = unit_hash("Alpha text.");
+    let trace = format!(
+        "[[unit]]\nheading = \"## 96.1 Alpha\"\nordinal = 1\nquote = \"Alpha text\"\nhash = \"{hash}\"\npending = [\"mixed\"]\n"
+    );
+    let problems = check(&Inputs { spec, stamp: &stamp, trace: &trace, tla: &[], expected: "" });
+    assert!(
+        problems.iter().any(|p| p.contains("\"mixed\"") && p.contains("planned_scenarios")),
+        "{problems:#?}"
+    );
+}
+
+#[test]
+fn scenario_in_both_planned_and_expected_is_rejected() {
+    let trace = "planned_scenarios = [\"mixed\"]\n";
+    let expected = "scenarios = [\"mixed\"]\n";
+    let stamp = stamp(&[]);
+    let problems = check(&Inputs { spec: "# Title\n", stamp: &stamp, trace, tla: &[], expected });
+    assert!(
+        problems.iter().any(|p| p.contains("\"mixed\"") && p.contains("expected.toml")),
+        "{problems:#?}"
+    );
+}
+
+#[test]
+fn never_reached_label_used_by_a_unit_is_reported() {
+    let spec = "\
+# Title
+
+## 96.1 Alpha
+Alpha text.
+";
+    let stamp = stamp(&["## 96.1 Alpha"]);
+    let hash = unit_hash("Alpha text.");
+    let trace = format!(
+        "[[unit]]\nheading = \"## 96.1 Alpha\"\nordinal = 1\nquote = \"Alpha text\"\nhash = \"{hash}\"\nlabels = [\"S96_1_a\"]\n"
+    );
+    let tla = vec!["S96_1_a: x := 1;".to_string()];
+    let expected = "never_reached = [{ label = \"S96_1_a\", reason = \"cannot be reached\" }]\n";
+    let problems = check(&Inputs { spec, stamp: &stamp, trace: &trace, tla: &tla, expected });
+    assert!(
+        problems.iter().any(|p| p.contains("S96_1_a") && p.contains("never_reached")),
+        "{problems:#?}"
+    );
+}
+
+#[test]
+fn unit_with_labels_and_not_modelled_passes() {
+    let spec = "\
+# Title
+
+## 96.1 Alpha
+Alpha text.
+";
+    let stamp = stamp(&["## 96.1 Alpha"]);
+    let hash = unit_hash("Alpha text.");
+    let trace = format!(
+        "[[unit]]\nheading = \"## 96.1 Alpha\"\nordinal = 1\nquote = \"Alpha text\"\nhash = \"{hash}\"\nlabels = [\"S96_1_a\"]\nnot_modelled = \"partly modelled\"\n"
+    );
+    let tla = vec!["S96_1_a: x := 1;".to_string()];
+    let problems = check(&Inputs { spec, stamp: &stamp, trace: &trace, tla: &tla, expected: "" });
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+#[test]
+fn unit_with_none_of_labels_not_modelled_pending_fails() {
+    let spec = "\
+# Title
+
+## 96.1 Alpha
+Alpha text.
+";
+    let stamp = stamp(&["## 96.1 Alpha"]);
+    let hash = unit_hash("Alpha text.");
+    let trace = format!(
+        "[[unit]]\nheading = \"## 96.1 Alpha\"\nordinal = 1\nquote = \"Alpha text\"\nhash = \"{hash}\"\n"
+    );
+    let problems = check(&Inputs { spec, stamp: &stamp, trace: &trace, tla: &[], expected: "" });
+    assert!(
+        problems.iter().any(|p| p.contains("either non-empty labels or a not_modelled reason")),
+        "{problems:#?}"
+    );
 }

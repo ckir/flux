@@ -37,6 +37,7 @@ module = "M"
 config = "live.cfg"
 scenario = "demo"
 kind = "liveness"
+violated = ["LiveWitness"]
 timeout_minutes = 5
 
 [[run]]
@@ -51,7 +52,7 @@ timeout_minutes = 5
 
 CFGS = {
     "check.cfg": "SPECIFICATION Spec\nCONSTANTS\n    FIX_SAFE = FALSE\nINVARIANTS Safe NeverDone\n",
-    "live.cfg": "SPECIFICATION Spec\nCONSTANT FIX_SAFE = FALSE\nPROPERTY Eventually\n",
+    "live.cfg": "SPECIFICATION Spec\nCONSTANT FIX_SAFE = FALSE\nINVARIANT LiveWitness\nPROPERTY Eventually\n",
     "seed.cfg": "SPECIFICATION Spec\nCONSTANT FIX_SAFE = FALSE\nINVARIANT Other\n",
 }
 
@@ -96,7 +97,7 @@ class LoadExpectedTests(unittest.TestCase):
         self.assertEqual(scenarios, ["demo"])
         self.assertEqual([r.kind for r in runs], ["check", "liveness", "seeded"])
         self.assertEqual(runs[0].open_findings, (run.OpenFinding("Safe", "TODO.md: demo", "FIX_SAFE"),))
-        self.assertEqual(runs[1].violated, ())
+        self.assertEqual(runs[1].violated, ("LiveWitness",))
 
     def test_the_repository_file_loads(self) -> None:
         scenarios, runs = run.load_expected(HERE / "expected.toml")
@@ -127,9 +128,17 @@ class LoadExpectedTests(unittest.TestCase):
         self.assertRejected(GOOD_EXPECTED.replace('"demo-posix-seeded-SEED_X"', '"demo-posix-check"')
                             .replace('kind = "seeded"', 'kind = "check"'), "duplicate run names")
 
-    def test_liveness_with_violated(self) -> None:
-        self.assertRejected(GOOD_EXPECTED.replace('kind = "liveness"', 'kind = "liveness"\nviolated = ["X"]'),
-                            "a liveness run has no 'violated'")
+    def test_liveness_needs_violated(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace('kind = "liveness"\nviolated = ["LiveWitness"]', 'kind = "liveness"'),
+                            "a liveness run needs 'violated'")
+
+    def test_liveness_needs_exactly_one_witness(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace('violated = ["LiveWitness"]', 'violated = ["LiveWitness", "Other2"]'),
+                            "exactly one witness invariant")
+
+    def test_liveness_with_one_witness_is_accepted(self) -> None:
+        _, runs = self.load(GOOD_EXPECTED)
+        self.assertEqual(runs[1].violated, ("LiveWitness",))
 
     def test_check_needs_a_witness(self) -> None:
         self.assertRejected(GOOD_EXPECTED.replace('violated = ["NeverDone"]', 'violated = []'),
@@ -176,6 +185,66 @@ class LoadExpectedTests(unittest.TestCase):
 
     def test_missing_config_file(self) -> None:
         self.assertRejected(GOOD_EXPECTED.replace('"seed.cfg"', '"missing.cfg"'), "config missing.cfg not found")
+
+    def test_check_config_must_not_declare_a_property(self) -> None:
+        cfgs = dict(CFGS, **{"check.cfg": CFGS["check.cfg"] + "PROPERTY Eventually\n"})
+        self.assertRejected(GOOD_EXPECTED, "must not declare a PROPERTY", cfgs)
+
+    def test_unreached_well_formed_is_parsed(self) -> None:
+        expected = GOOD_EXPECTED.replace(
+            'open_findings = [{ name = "Safe", tracking = "TODO.md: demo", fix_flag = "FIX_SAFE" }]\n'
+            'timeout_minutes = 5',
+            'open_findings = [{ name = "Safe", tracking = "TODO.md: demo", fix_flag = "FIX_SAFE" }]\n'
+            'unreached = [{ label = "S12_3", reason = "not reached in this variant" }]\n'
+            'timeout_minutes = 5')
+        _, runs = self.load(expected)
+        self.assertEqual(runs[0].unreached, (("S12_3", "not reached in this variant"),))
+
+    def test_unreached_must_be_a_list(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace('violated = ["NeverDone"]',
+                                                  'violated = ["NeverDone"]\nunreached = "S12_3"'),
+                            "unreached must be an array of tables")
+
+    def test_unreached_entry_needs_exactly_label_and_reason(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace('violated = ["NeverDone"]',
+                                                  'violated = ["NeverDone"]\n'
+                                                  'unreached = [{ label = "S12_3" }]'),
+                            "exactly 'label' and 'reason'")
+
+    def test_unreached_label_must_look_like_a_pluscal_label(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace('violated = ["NeverDone"]',
+                                                  'violated = ["NeverDone"]\n'
+                                                  'unreached = [{ label = "NotALabel", reason = "x" }]'),
+                            "must look like a PlusCal label")
+
+    def test_unreached_reason_must_be_non_empty(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace('violated = ["NeverDone"]',
+                                                  'violated = ["NeverDone"]\n'
+                                                  'unreached = [{ label = "S12_3", reason = "" }]'),
+                            "reason must be a non-empty string")
+
+    def test_unreached_labels_must_be_unique(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace(
+            'violated = ["NeverDone"]',
+            'violated = ["NeverDone"]\n'
+            'unreached = [{ label = "S12_3", reason = "a" }, { label = "S12_3", reason = "b" }]'),
+            "has duplicate labels")
+
+    def test_unreached_is_not_allowed_on_a_seeded_run(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace(
+            'violated = ["Other"]',
+            'violated = ["Other"]\nunreached = [{ label = "S12_3", reason = "x" }]'),
+            "only allowed for check and liveness runs")
+
+    def test_never_reached_well_formed_is_parsed(self) -> None:
+        d = ExpectedDir(GOOD_EXPECTED + '\n[[never_reached]]\nlabel = "S99_1"\nreason = "no scenario reaches it"\n')
+        self.addCleanup(d.close)
+        d.load()
+        self.assertEqual(run.LAST_NEVER_REACHED, (("S99_1", "no scenario reaches it"),))
+
+    def test_never_reached_label_must_look_like_a_pluscal_label(self) -> None:
+        self.assertRejected(GOOD_EXPECTED + '\n[[never_reached]]\nlabel = "Bad"\nreason = "x"\n',
+                            "must look like a PlusCal label")
 
     def test_unknown_run_key(self) -> None:
         self.assertRejected(GOOD_EXPECTED.replace("timeout_minutes = 5\n\n[[run]]\nname = \"demo-posix-liveness\"",
@@ -286,9 +355,10 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual(run.judge(self.check, self.seen("NeverDone"), fixed=True), "ok")
         self.assertEqual(run.judge(self.check, self.seen("NeverDone", "Safe"), fixed=True), "mismatch")
 
-    def test_liveness_passes_only_clean(self) -> None:
-        self.assertEqual(run.judge(self.liveness, self.seen(), fixed=False), "ok")
-        self.assertEqual(run.judge(self.liveness, self.seen("Eventually"), fixed=False), "mismatch")
+    def test_liveness_passes_only_when_its_witness_is_seen_and_the_property_holds(self) -> None:
+        self.assertEqual(run.judge(self.liveness, self.seen("LiveWitness"), fixed=False), "ok")
+        self.assertEqual(run.judge(self.liveness, self.seen(), fixed=False), "mismatch")
+        self.assertEqual(run.judge(self.liveness, self.seen("LiveWitness", "Eventually"), fixed=False), "mismatch")
 
     def test_seeded_needs_its_violation(self) -> None:
         self.assertEqual(run.judge(self.seeded, self.seen("Other"), fixed=False), "ok")
@@ -394,7 +464,7 @@ class ExecuteTests(unittest.TestCase):
     def test_replayed_output_is_judged_and_logged(self) -> None:
         self.fake_tlc(f"import sys; text = open({str(TESTDATA / 'clean.out')!r}).read(); "
                       "sys.stdout.write(text.partition(chr(10))[2]); sys.exit(0)")
-        clean = run.Run("demo-posix-check", "M", "check.cfg", "demo", "check", (), (), 1)
+        clean = run.Run("demo-posix-check", "M", "check.cfg", "demo", "check", (), (), (), 1)
         result = run.execute(clean, Path("unused.jar"), self.base, fixed=False)
         self.assertEqual((result.status, result.observed, result.distinct_states), ("ok", frozenset(), 4))
         self.assertIsNotNone(result.log)
@@ -434,7 +504,7 @@ class ExecuteTests(unittest.TestCase):
 
     def test_timeout_is_reported_as_a_tooling_failure(self) -> None:
         self.fake_tlc("import time; time.sleep(30)")
-        slow = run.Run("demo-posix-check", "M", "check.cfg", "demo", "check", ("NeverDone",), (), 0)
+        slow = run.Run("demo-posix-check", "M", "check.cfg", "demo", "check", ("NeverDone",), (), (), 0)
         result = run.execute(slow, Path("unused.jar"), self.base, fixed=False)
         self.assertEqual(result.status, "tooling")
         self.assertEqual(result.detail, "TIMEOUT after 0 min")
@@ -509,6 +579,7 @@ module = "M"
 config = "live.cfg"
 scenario = "other"
 kind = "liveness"
+violated = ["LiveWitness"]
 timeout_minutes = 5
 """)
         self.addCleanup(d.close)

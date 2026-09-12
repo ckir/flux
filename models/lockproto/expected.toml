@@ -24,6 +24,7 @@ module = "Smoke"
 config = "configs/selftest-liveness.cfg"
 scenario = "selftest"
 kind = "liveness"
+violated = ["NeverReachedTwo"]
 timeout_minutes = 2
 
 [[run]]

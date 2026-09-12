@@ -1,0 +1,47 @@
+
+\* ------------------------------------------------------------------------------------------
+\* Properties (design Section 7).
+\*
+\* Safety invariants hold in every reachable state and are checked in the scenario's `check` run.
+\* Reachability is proved two ways: a step a label performs is proved by that label's TLC coverage
+\* count (design Section 4), and the two facts no single label states - a read that found a torn
+\* record, and a replaced lock that a crash had left - keep a ghost flag and are checked as witnesses
+\* in their own small run without `-continue`, which stops at the first violation and prints one
+\* trace. To get a trace for any other path, re-run the configuration with that witness as an
+\* invariant and no `-continue`.
+
+\* The filesystem model's own assumptions (FsModel.tla), so a simplification there cannot pass
+\* unnoticed.
+FsOk == FsInvariants(fs)
+
+\* Every object's content is one of the forms the protocol knows, so a classifier's judgement table
+\* covers every case it can meet (`Classifiable`, Section 7).
+Classifiable == \A o \in Objs : fs.content[o] = NoContent \/ fs.content[o] \in Contents
+
+\* For a target, at most one process is inside a publishing step whose last Section 99 check passed.
+\* The one exception the spec accepts - a stalled owner's in-flight call issued before an operator
+\* `--break-lock` - belongs to the `breaklock` scenario, which has the actors for it.
+SingleWriter == Cardinality({p \in Procs : checked[p]}) <= 1
+
+\* A process without `--break-lock` never removes, renames, or overwrites a lock it classified as
+\* uncertain, and creates a lock only at an empty lock path (Section 7).
+PlainNeverOwnsUncertain == ~touchedUncertain
+
+\* A `Foreign` object at a lock path is never written, renamed, or deleted (Section 7).
+ForeignUntouched == ~touchedForeign
+
+\* Every TARGET_LOCK_BUSY refusal rests on evidence that the lock path held, or the refusing
+\* process's handle referred to, a lock whose owner was alive or another takeover's (Section 7). The
+\* refusing label records that, because the refusal may be reported after the owner it saw has
+\* finished: the spec's refusal rests on what the classifier observed (240.2), not on a re-read.
+RefusalJustified == \A p \in Procs : refused[p] = "TARGET_LOCK_BUSY" => refusedOk[p]
+
+\* The two ghost witnesses, for the witness run.
+NeverTornRead == ~tornRead
+NeverRecoveredAfterCrash == ~recoveredAfterCrash
+
+\* The two state witnesses the liveness runs need: the states their properties are about do occur
+\* (design Section 7).
+NeverDeadOwnerLock == ~DeadOwnerLock
+NeverTornLock == ~TornLock
+====

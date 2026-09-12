@@ -1,0 +1,36 @@
+---- MODULE LockProtocol ----
+\* The V16 lock protocol: acquisition (96.1), classification and recovery (240.1 to 240.3), a plain
+\* rerun's decision (21.1), cleanup (251.1), and commit-time revalidation (99), on the abstract
+\* filesystem of FsModel.tla. Design: docs/superpowers/specs/2026-09-11-lock-protocol-model-check-design.md,
+\* Sections 6.1, 7 and 12. Each label is named after the spec step it implements, and each performs
+\* at most one filesystem operation, so other actors run in between (design Section 5.2).
+EXTENDS Naturals, FiniteSets, Sequences, TLC
+
+CONSTANTS
+    Owners,        \* operations that acquire the lock and publish
+    Recoverers,    \* new invocations that recover a dead owner's lock (240.3)
+    PlainRuns,     \* new invocations with no flags (21.1)
+    Cleanups,      \* flux cleanup DEST (251.1)
+    NoProc,        \* model value: nobody
+    P,             \* the target's parent directory
+    T,             \* the target's name
+    LockName,      \* P/<name>.flux-lock (96.1)
+    DirLockName,   \* P/.flux-dir.lock, the long-name fallback (96.1); never created here
+    MaxObjs,       \* how many objects this scenario's actors can create (bounds the state space)
+    Platform, IdentityStrength, LockCapability
+
+Procs == Owners \cup Recoverers \cup PlainRuns \cup Cleanups
+\* <lock-name>.broken.<operation-id> beside the lock (240.3 step 2)
+BrokenOf(p) == <<"broken", p>>
+Names == {T, LockName, DirLockName} \cup {BrokenOf(p) : p \in Procs}
+Dirs == {P}
+Fold == [n \in Names |-> n]          \* the recovery scenario needs no name folding
+
+INSTANCE FsModel WITH Dirs <- Dirs, Names <- Names, Procs <- Procs, NoProc <- NoProc,
+                      MaxObjs <- MaxObjs, Fold <- Fold, Platform <- Platform,
+                      IdentityStrength <- IdentityStrength, LockCapability <- LockCapability
+
+\* How a classifier judged the lock path (design Section 6.1).
+RecovererPerms == Permutations(Recoverers)
+Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "dead"}
+

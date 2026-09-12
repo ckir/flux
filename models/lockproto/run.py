@@ -38,7 +38,7 @@ REPO = HERE.parent.parent
 TARGET = REPO / "target" / "tla"
 
 KINDS = ("check", "liveness", "seeded")
-RUN_KEYS = {"name", "module", "config", "scenario", "kind", "violated", "open_findings", "timeout_minutes"}
+RUN_KEYS = {"name", "module", "config", "scenario", "kind", "violated", "open_findings", "unreached", "timeout_minutes"}
 FINDING_KEYS = {"name", "tracking", "fix_flag"}
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 FIX_FLAG = re.compile(r"FIX_[A-Z0-9_]+")
@@ -94,6 +94,7 @@ class Run:
     kind: str
     violated: tuple[str, ...]
     open_findings: tuple[OpenFinding, ...]
+    unreached: tuple[tuple[str, str], ...]
     timeout_minutes: int
 
 
@@ -191,6 +192,43 @@ def _str_list(value: object, where: str) -> tuple[str, ...]:
     return tuple(value)
 
 
+# A PlusCal label named after a spec step: 'S', digits, '_', then at least one more character
+# (mirrors tests/model_stamp.rs's is_label_name).
+_LABEL_NAME = re.compile(r"S[0-9]+_.+")
+
+
+def _is_label_name(token: str) -> bool:
+    return _LABEL_NAME.fullmatch(token) is not None
+
+
+def _load_label_reasons(value: object, subject: str) -> tuple[tuple[str, str], ...]:
+    """Parse a list of {label, reason} tables, as used by 'unreached' and 'never_reached'.
+
+    `subject` names the field for error messages, e.g. "run 'x-check': unreached" or "'never_reached'"."""
+    _require(isinstance(value, list), f"{subject} must be an array of tables")
+    assert isinstance(value, list)
+    entries: list[tuple[str, str]] = []
+    for item in value:
+        _require(isinstance(item, dict) and set(item) == {"label", "reason"},
+                 f"{subject}: each entry has exactly 'label' and 'reason'")
+        label, reason = item.get("label"), item.get("reason")
+        _require(isinstance(label, str) and label, f"{subject}: each label must be a non-empty string")
+        _require(_is_label_name(label),
+                 f"{subject}: label {label!r} must look like a PlusCal label (S<digits>_<rest>)")
+        _require(isinstance(reason, str) and reason, f"{subject}: each reason must be a non-empty string")
+        entries.append((label, reason))
+    labels = [label for label, _ in entries]
+    _require(len(set(labels)) == len(labels), f"{subject} has duplicate labels")
+    return tuple(entries)
+
+
+# Set by load_expected as a side effect. Not consumed here: the coverage gate that will read it is a
+# separate task (design Section 4's `-coverage 1` rules). Kept off load_expected's return value because
+# every caller (main() below, and test_run.py) unpacks it positionally as exactly two values
+# (`scenarios, runs = load_expected(...)`); adding a third element would break every one of them.
+LAST_NEVER_REACHED: tuple[tuple[str, str], ...] = ()
+
+
 def load_expected(path: Path) -> tuple[list[str], list[Run]]:
     """Load and validate expected.toml; module and config paths are resolved beside it."""
     base = path.parent
@@ -199,7 +237,10 @@ def load_expected(path: Path) -> tuple[list[str], list[Run]]:
     except (OSError, tomllib.TOMLDecodeError) as err:
         raise ExpectedError(f"cannot read {path}: {err}") from err
 
-    _require(set(data) <= {"scenarios", "run"}, f"unknown top-level keys: {sorted(set(data) - {'scenarios', 'run'})}")
+    _require(set(data) <= {"scenarios", "run", "never_reached"},
+             f"unknown top-level keys: {sorted(set(data) - {'scenarios', 'run', 'never_reached'})}")
+    global LAST_NEVER_REACHED
+    LAST_NEVER_REACHED = _load_label_reasons(data.get("never_reached", []), "'never_reached'")
     scenarios = data.get("scenarios")
     _require(isinstance(scenarios, list) and scenarios and all(isinstance(s, str) for s in scenarios),
              "'scenarios' must be a non-empty list of names")
@@ -253,17 +294,15 @@ def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
     _require(isinstance(timeout, int) and not isinstance(timeout, bool) and timeout >= 1,
              f"{where}: timeout_minutes must be a whole number of minutes, at least 1")
 
-    if kind == "liveness":
-        _require("violated" not in raw, f"{where}: a liveness run has no 'violated'")
-        violated: tuple[str, ...] = ()
+    _require("violated" in raw, f"{where}: a {kind} run needs 'violated'")
+    violated = _str_list(raw["violated"], f"{where}: violated")
+    if kind == "seeded":
+        _require(len(violated) == 1, f"{where}: a seeded run names exactly one invariant or property")
+    elif kind == "liveness":
+        _require(len(violated) == 1, f"{where}: a liveness run names exactly one witness invariant")
     else:
-        _require("violated" in raw, f"{where}: a {kind} run needs 'violated'")
-        violated = _str_list(raw["violated"], f"{where}: violated")
-        if kind == "seeded":
-            _require(len(violated) == 1, f"{where}: a seeded run names exactly one invariant or property")
-        else:
-            # The witnesses prove the run reached its paths; without one, a model that explores nothing would pass.
-            _require(bool(violated), f"{where}: a check run lists at least one reachability witness")
+        # The witnesses prove the run reached its paths; without one, a model that explores nothing would pass.
+        _require(bool(violated), f"{where}: a check run lists at least one reachability witness")
 
     findings: list[OpenFinding] = []
     raw_findings = raw.get("open_findings", [])
@@ -279,9 +318,16 @@ def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
         findings.append(OpenFinding(f["name"], f["tracking"], f["fix_flag"]))
     _require(len({f.name for f in findings}) == len(findings), f"{where}: duplicate open findings")
 
+    _require(kind in ("check", "liveness") or "unreached" not in raw,
+             f"{where}: unreached is only allowed for check and liveness runs")
+    unreached = _load_label_reasons(raw.get("unreached", []), f"{where}: unreached")
+
     text = cfg_path.read_text(encoding="utf-8")
     sections = cfg_sections(text)
     _require("CHECK_DEADLOCK" not in sections, f"{where}: the config must not set CHECK_DEADLOCK (deadlock checking stays on)")
+    _require(kind != "check" or "PROPERTY" not in sections,
+             f"{where}: a check run's config must not declare a PROPERTY (TLC reports a temporal violation "
+             "without naming it)")
     properties = cfg_properties(text)
     temporal_run = kind == "liveness" or (kind == "seeded" and violated[0] in properties)
     if temporal_run:
@@ -291,7 +337,7 @@ def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
     if findings:
         fixed_cfg_text(text, [f.fix_flag for f in findings])  # raises if a flag is missing
 
-    return Run(name, module, config, scenario, kind, violated, tuple(findings), timeout)
+    return Run(name, module, config, scenario, kind, violated, tuple(findings), unreached, timeout)
 
 
 # ---------------------------------------------------------------------------------------
