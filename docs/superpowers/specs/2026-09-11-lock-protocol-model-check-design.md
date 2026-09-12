@@ -72,8 +72,8 @@ crates/flux-platform/tests/fs_semantics.rs    the filesystem probes (Section 10)
 | `module` | `LockProtocol` or `Claims` |
 | `config` | path of the `.cfg` file |
 | `scenario` | the Section 12 scenario the run belongs to; one of the names in `expected.toml`'s top-level `scenarios` list, which is the only place scenario names are defined; CI builds its matrix from that list |
-| `kind` | `check`, `liveness`, or `seeded` |
-| `violated` | for `check` and `liveness`: the exact set of witness invariants that must be reported violated, at least one; for `seeded`: the one invariant or property that must be the first violation |
+| `kind` | `check`, `liveness`, `witness`, or `seeded` |
+| `violated` | for `seeded` and `witness`: the one invariant or property that must be the first violation; absent for `check` and `liveness` |
 | `open_findings` | optional, for `check` and `liveness`: safety invariants or properties that currently fail because of a spec defect not yet fixed, each as `{ name, tracking, fix_flag }`: `tracking` names its `TODO.md` or `.clavity/local-anomalies.md` entry, and `fix_flag` names a model flag that applies the proposed spec fix |
 | `unreached` | optional, for `check` and `liveness`: labels of the run's own actors that this run cannot reach, each as `{ label, reason }` (the coverage check below) |
 | `timeout_minutes` | the run's time limit |
@@ -86,9 +86,19 @@ report carries one line per label rather than per process instance, a label whos
 even though TLC evaluates it at every state, and symmetry reduction lowers a label's counts but does not zero them
 (`A 3:4` under `SYMMETRY` against `4:6` without). A run fails if a label of an actor it instantiates has no states
 found. Without this, a label behind a condition that can never hold would still have a `trace.toml` entry mapping it to
-a spec rule, and the traceability map would claim coverage that never runs. The witnesses (Section 7) show that named
-procedures complete; this shows that every step of every running actor is reached. Four rules keep the check honest
-without making it lie:
+a spec rule, and the traceability map would claim coverage that never runs.
+
+This coverage report is also how a run proves it reached the paths it is about, which is why no `check` or `liveness`
+run carries witness invariants. A witness invariant is violated in every state after its path is reached, and TLC has
+no flag that reports an invariant once: measured on the `recovery` scenario with four actors and no crashes, the
+witnesses produced 10,057 violation reports and a 309.6 MB log with `-difftrace` already on, and the run had not
+finished in ten minutes (2026-09-12). A label's coverage count proves the same reachability with no output at all. The
+few facts no single label states - a read that found a torn record, a replaced lock that a crash had left, a lock whose
+owner is dead or uncertain sitting at the lock path - keep a ghost flag or a state predicate and are checked as
+`witness` runs (below). To get a counterexample trace for any path, re-run that configuration with the witness as an
+invariant and without `-continue`; the gates need the fact, a person debugging needs the trace.
+
+Four rules keep the coverage check honest without making it lie:
 
 - the labels of an actor whose process set the run's configuration leaves empty are exempt; the runner derives which
   labels belong to which actor from the model's `process` blocks and which sets are empty from the configuration's
@@ -115,18 +125,22 @@ without making it lie:
   state space says nothing about what is reachable.
 
 - `check`: TLC runs with `-continue`, so it explores the whole reachable state space and reports every violated
-  invariant. The run passes only if the set reported equals `violated` plus the run's `open_findings` exactly: every
-  witness violated, every open finding still violated, no other safety invariant violated. One run per configuration
-  therefore checks both safety and reachability. An open finding that stops failing also fails the run, so the entry
-  is removed together with the spec fix.
-- `liveness`: TLC runs with `-continue` and checks the configuration's one temporal property, every safety invariant
-  of the scenario, and the run's witnesses, with no symmetry reduction (symmetry and liveness checking together are
-  unsound in TLC). Passes only if the invariants reported violated are exactly its `violated` witnesses plus its
-  `open_findings`, and the property is not violated unless it is itself an open finding. The witnesses show that the
-  run reaches the states its property is about (Section 7); without them a liveness configuration that constrains its
-  state space to almost nothing would pass without checking anything. TLC 2.19 with `-continue` still checks the
-  temporal property over the complete state space after reporting invariant violations, and reports both (measured
-  2026-09-12). A configuration that checks a temporal property (a
+  invariant. The configuration lists the scenario's safety invariants and no witness. The run passes only if the set
+  reported equals the run's `open_findings` exactly: every open finding still violated, no other safety invariant
+  violated, and every label of every actor it runs covered (above). An open finding that stops failing also fails the
+  run, so the entry is removed together with the spec fix.
+- `witness`: TLC runs without `-continue` and the configuration lists exactly one invariant, the negation of a fact the
+  scenario must reach that no label's coverage states (Section 7). Passes only if TLC stops with that invariant
+  violated, which both proves the fact and yields the one trace showing how it happens. These runs are small: TLC stops
+  at the first violating state.
+- `liveness`: TLC runs with `-continue` and checks the configuration's one temporal property and every safety invariant
+  of the scenario, with no symmetry reduction (symmetry and liveness checking together are unsound in TLC). Passes only
+  if the invariants reported violated are exactly its `open_findings`, the property is not violated unless it is itself
+  an open finding, and every label of every actor it runs is covered. Its scenario's `witness` runs are what show the
+  states the property is about do occur, so a configuration that constrained its state space to almost nothing could not
+  pass them. TLC 2.19 with `-continue` does still check the temporal property over the complete state space after
+  reporting invariant violations, and reports both (measured 2026-09-12), so a liveness run with an open finding is
+  judged on both. A configuration that checks a temporal property (a
   liveness run, or a seeded run whose "must fail" entry is a property) lists exactly one `PROPERTY`, because TLC
   reports a temporal violation without naming the property (measured against TLC 2.19).
 - Fix-flag runs: for every `check` or `liveness` run with open findings, the runner also runs the same configuration
@@ -418,31 +432,39 @@ Safety invariants, which must hold in every reachable state:
 | `NoSelfCollision` (Claims) | A resumed target never collides with its own claim; a hardlink dependent whose name maps to a different entry never collides with its group's claims; a dependent folded onto its canonical's entry is reported as a collision. |
 | `NoPublishAfterLockLost` (Claims) | No rename lands after `LockLost` unless it was issued (in flight, Section 5.2) before `LockLost`: the same single exception `SingleWriter` accepts, following 240.5's "a filesystem call it had already started can still complete". A revalidation that passed before `LockLost` does not by itself permit a later rename. |
 
-Reachability witnesses, which every `check` run must report violated, proving each path is reachable. Each witness
-is the negation of a ghost flag that only the named procedure's final label sets (for example, `recovered` is set
-only by a Recoverer at `S240_3_s5`), so an end state reached by some other path cannot satisfy it.
+Reachability: every path the model claims to explore is proved reached, and how depends on what the path is.
 
-| Witness | Reached when |
+A path a LABEL performs is proved by that label's coverage count in its scenario's `check` and `liveness` runs
+(Section 4), which is stronger than a witness invariant: the run fails unless EVERY label of every actor it runs is
+covered, not only the ones someone thought to name. The table below says which label proves each path the earlier
+design named as a witness, so the intent is kept and nothing is lost:
+
+| Path | Proved by the coverage of |
 |---|---|
-| `NeverAcquired` | an operation acquires the target lock |
-| `NeverRecovered` | a Recoverer completes 240.3 |
-| `NeverBrokeLock` | a Breaker or CleanupBreaker completes 240.5 |
-| `NeverRecoveredAfterCrash` | a lock left by a crash is later replaced |
-| `NeverCleanedUp` | Cleanup removes a lock |
-| `NeverTornRead` | a process reads a `Torn` record |
-| `NeverInFlightAfterTakeover` | a stalled owner's in-flight call completes after a takeover |
-| `NeverClassifiedCleanupLock` | a PlainRun or Recoverer classifies a cleanup lock |
-| `NeverDirLockAcquired` | a DirOwner passes its 96.1 check holding the directory lock |
-| `NeverDirLockBackoff` | a per-name or directory acquirer backs off on a 96.1 conflict |
-| `NeverCommittedWithClaim` (Claims) | a target commits with its claim |
-| `NeverLockLostMidCommit` (Claims) | `LockLost` happens between a PREPARE_COMMIT and its rename |
-| `NeverDeadOwnerLock` | a lock whose owner is dead is at the lock path (`DeadOwnerLockAt(t)` holds) |
-| `NeverUncertainOwnerLock` | a lock whose owner is uncertain is at the lock path (`UncertainOwnerLockAt(t)` holds) |
+| an operation acquires the target lock | `S96_1_record_end` |
+| a Recoverer completes 240.3 | `S240_3_s5` |
+| a Breaker or CleanupBreaker completes 240.5 | `S240_5_s6` |
+| Cleanup removes a lock | `S251_1_delete` |
+| a stalled owner's in-flight call completes after a takeover | `S240_5_inflight_lands` |
+| a DirOwner passes its 96.1 check holding the directory lock | `S96_1_dirowner_check` |
+| a per-name or directory acquirer backs off on a 96.1 conflict | `S96_1_backoff` |
+| a target commits with its claim (Claims) | `S182_commit` |
 
-Each scenario's `check` run lists the witnesses its actors can reach (Section 12). The last two witnesses are state
-predicates, the negation of the antecedent of a liveness property below, rather than ghost flags. A `liveness`
-configuration's invariants are the scenario's safety invariants plus exactly one witness, the one for its property,
-and its `violated` lists exactly that witness, so the run shows that the states its property constrains occur.
+A fact no single label states keeps a ghost flag or a state predicate, and its scenario has a `witness` run for it
+(Section 4): TLC without `-continue` stops at the first state that has it, which proves the fact and prints one trace.
+
+| Witness run's invariant | Passes when TLC stops because |
+|---|---|
+| `NeverTornRead` | a process read a `Torn` record |
+| `NeverRecoveredAfterCrash` | a lock a crash had left was replaced |
+| `NeverClassifiedCleanupLock` | a PlainRun or Recoverer classified a cleanup lock |
+| `NeverDeadOwnerLock` | a lock whose owner is dead sat at the lock path |
+| `NeverUncertainOwnerLock` | a lock whose owner is uncertain sat at the lock path |
+| `NeverLockLostMidCommit` (Claims) | `LockLost` fell between a PREPARE_COMMIT and its rename |
+
+Each scenario lists its `witness` runs in Section 12. The last two above are the states the liveness properties are
+about, so the scenario that checks such a property always has the matching `witness` run: that is what keeps a liveness
+run from passing over a state space that never reaches its antecedent.
 
 Liveness, checked in `liveness` runs under weak fairness for every process that has not crashed:
 
@@ -663,24 +685,25 @@ scenario: a small model (`Smoke.tla`) with a check run carrying a witness and an
 seeded run, which exercises every way `run.py` judges a run in a few seconds. It lands with plan 1, before any
 protocol model exists, and stays as the runner's own regression check.
 
-| Scenario | Actors | Variants | Witnesses its `check` run expects |
+| Scenario | Actors | Variants | Its `witness` runs (Section 7); every other path is proved by label coverage |
 |---|---|---|---|
-| `recovery` | Owner (crashes), 2 Recoverers, PlainRun, Cleanup | POSIX, Windows, POSIX weak-identity | `NeverAcquired`, `NeverRecovered`, `NeverRecoveredAfterCrash`, `NeverCleanedUp`, `NeverTornRead` |
-| `breaklock` | StalledOwner, 2 Breakers, PlainRun | POSIX, Windows; POSIX weak-capability (seeded run only: with `LockCapability = weak` every actor refuses under 235.1, so the witnesses cannot be reached there) | `NeverAcquired`, `NeverBrokeLock`, `NeverInFlightAfterTakeover`, `NeverTornRead` |
-| `mixed` | Owner (crashes; its lock is dead), Breaker (may see it uncertain), Recoverer (may see it dead), PlainRun | POSIX, Windows, POSIX weak-identity | `NeverRecovered`, `NeverBrokeLock`; the weak-identity variant expects only `NeverRecovered`, because the Breaker refuses at 240.5 step 1 there |
-| `cleanup` | StalledOwner, CleanupBreaker, Breaker | POSIX, Windows | `NeverBrokeLock`, `NeverInFlightAfterTakeover` |
-| `cleanup-crash` | CleanupBreaker (crashes), PlainRun, Recoverer, Cleanup | POSIX, Windows | `NeverClassifiedCleanupLock`, `NeverCleanedUp` |
-| `nested` | Owner on the parent destination, NestedOwner on the child, PlainRun | POSIX | `NeverAcquired` |
-| `dirlock` | an Owner with a per-name lock in directory `P` (may crash), DirOwner on `P` (may crash), Recoverer, Breaker; one per-name Owner suffices for every `dirlock` witness and seed, and keeps the state space within budget | POSIX, Windows | `NeverAcquired`, `NeverDirLockAcquired`, `NeverDirLockBackoff`, `NeverBrokeLock` |
-| `claims` | Claims model, 2 workers, `LockLost` at most once, one crash and resume; one configuration per target group (Section 6.2) | POSIX with case folding (as APFS by default), Windows | `NeverCommittedWithClaim`, `NeverLockLostMidCommit` |
+| `recovery` | Owner (crashes), 2 Recoverers, PlainRun, Cleanup | POSIX, Windows, POSIX weak-identity | `NeverTornRead`, `NeverRecoveredAfterCrash`, `NeverDeadOwnerLock` |
+| `breaklock` | StalledOwner, 2 Breakers, PlainRun | POSIX, Windows; POSIX weak-capability (seeded run only: with `LockCapability = weak` every actor refuses under 235.1, so no path of the scenario is reached there) | `NeverTornRead`, `NeverUncertainOwnerLock` |
+| `mixed` | Owner (crashes; its lock is dead), Breaker (may see it uncertain), Recoverer (may see it dead), PlainRun | POSIX, Windows, POSIX weak-identity | `NeverRecoveredAfterCrash`, `NeverUncertainOwnerLock`; in the weak-identity variant the Breaker refuses at 240.5 step 1, so its labels are listed `unreached` there (Section 4) |
+| `cleanup` | StalledOwner, CleanupBreaker, Breaker | POSIX, Windows | `NeverUncertainOwnerLock` |
+| `cleanup-crash` | CleanupBreaker (crashes), PlainRun, Recoverer, Cleanup | POSIX, Windows | `NeverClassifiedCleanupLock`, `NeverDeadOwnerLock` |
+| `nested` | Owner on the parent destination, NestedOwner on the child, PlainRun | POSIX | none: every path of this scenario is a label |
+| `dirlock` | an Owner with a per-name lock in directory `P` (may crash), DirOwner on `P` (may crash), Recoverer, Breaker; one per-name Owner suffices for every `dirlock` path and seed, and keeps the state space within budget | POSIX, Windows | `NeverRecoveredAfterCrash` |
+| `claims` | Claims model, 2 workers, `LockLost` at most once, one crash and resume; one configuration per target group (Section 6.2) | POSIX with case folding (as APFS by default), Windows | `NeverLockLostMidCommit` |
 
-Every variant of a scenario expects the witness set in its row, except where the row says otherwise; a variant that
-cannot reach a witness is a change to this table with its reason, never an edit to `expected.toml` alone.
+Every variant of a scenario has the `witness` runs in its row, except where the row says otherwise, and its `check`
+run covers every label of the actors it runs (Section 4). A variant that cannot reach a path is a change to this table,
+or an `unreached` entry with its reason, never a silent edit to `expected.toml`.
 
-Liveness runs: `DeadLockEventuallyCleared` in `recovery` and `cleanup-crash`, each with the witness
-`NeverDeadOwnerLock`; `UncertainLockEventuallyCleared` in `breaklock`, `cleanup`, and `mixed` (so that
-`SEED_TORN_AS_FOREIGN` is judged against a passing run of the same scenario), each with the witness
-`NeverUncertainOwnerLock`; POSIX variant only, without symmetry.
+Liveness runs: `DeadLockEventuallyCleared` in `recovery` and `cleanup-crash`, whose `NeverDeadOwnerLock` witness run
+shows the state it is about occurs; `UncertainLockEventuallyCleared` in `breaklock`, `cleanup`, and `mixed` (so that
+`SEED_TORN_AS_FOREIGN` is judged against a passing run of the same scenario), with `NeverUncertainOwnerLock`; POSIX
+variant only, without symmetry.
 
 Build order: the scenarios are built one plan at a time, not all at once, so that the first TLC runs measure real
 state-space sizes and their findings are triaged before more actors are built on the same model. Plan 2 builds
@@ -710,10 +733,11 @@ to 7 hold with open findings counted as expected results, and the work is finish
 
 1. Every seeded run stops with its named violation.
 2. Every `check` run reports exactly its listed witnesses and its open findings violated, and no other safety
-   invariant; every fix-flag run reports exactly its witnesses. In every `check` and `liveness` run, every label of
-   every actor the run instantiates is covered except the labels it lists as `unreached`, and each of those is indeed
-   uncovered; a full `just model` reports every label of every model covered by at least one run, apart from any in
-   `never_reached`, and no `never_reached` label is named by a `trace.toml` unit (Section 4).
+   invariant, and no fix-flag run reports any. Every `witness` run stops with its own invariant violated. In every
+   `check` and `liveness` run, every label of every actor the run instantiates is covered except the labels it lists as
+   `unreached`, and each of those is indeed uncovered; a full `just model` reports every label of every model covered by
+   at least one run, apart from any in `never_reached`, and no `never_reached` label is named by a `trace.toml` unit
+   (Section 4).
 3. Every `liveness` run passes.
 4. Every run finishes within its time limit on CI.
 5. The traceability check (Section 9.1) passes: every label maps to a spec step, and every spec step of the stamped
