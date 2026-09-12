@@ -130,6 +130,14 @@ checked when a label it could pin is uncovered, and the uncovered label names wh
 create-failure label points at `MaxObjs`, a crash-path label at `MaxCrashes`, and an interference label at the
 actor set - which is what the `recovery` pairing below is.
 
+An uncovered label is a trigger for that check, not the whole of it. A bound constrains INTERLEAVINGS as well as
+labels, and those it can cut while every label stays covered: a second crash removed from a run does not uncover a
+label if some other path reaches the same label once, and nothing in the coverage report will say the run stopped
+exploring the case where a crash lands inside a recovery. Coverage cannot see this, so the bounds do not rest on it.
+Each configuration's bounds are justified in the README on their own terms - what the run is for and what its bounds
+still let it explore - and that justification is what a reviewer reads, with the label check underneath it as a floor
+that catches the cruder failure.
+
 What the gate cannot see is which ARM of a label was taken. A label holds one filesystem call and the local decision
 that follows it (Section 5.2), so `S21_1_decide` carries the whole of 21.1's judgement table: its coverage count
 proves a plain rerun decided, never that it decided `RESUMABLE_OPERATION_EXISTS` against a dead owner. Coverage is a
@@ -165,7 +173,10 @@ Four rules keep the coverage check honest without making it lie:
 - `unreached` excuses a label in one run, never in the model. A run of every run in `expected.toml` (`just model` with
   no scenario) unions the coverage of all its runs, which TLC reports per run and never merges itself, and fails if any
   label of any model was covered by no run at all, so a label cannot be listed out of every run and left as dead code:
-  whatever a scenario cannot reach, another scenario or a seeded run must. A single-scenario run cannot judge this and
+  whatever a scenario cannot reach, another scenario or a seeded run must. What the union proves is exactly that and
+  no more - that the label is not dead - never that it was reached under the conditions its own scenario is about,
+  since the runs it unions include other platforms and other actor sets. The stronger property is what the per-run
+  requirement gives, which is why a label excused in one run still has to carry its reason there. A single-scenario run cannot judge this and
   says so in its report, and the CI matrix runs one scenario per job, so `model-gate` does not enforce it; the full
   `just model` that Section 13 requires before the work is declared finished does;
 - one top-level `never_reached` list in `expected.toml`, each entry a label and a reason, holds the labels no run can
@@ -173,7 +184,12 @@ Four rules keep the coverage check honest without making it lie:
   may not appear in any `[[unit]]` entry's labels (Section 9.1), so a unit it was meant to implement falls back on
   `not_modelled` or another label. A dead label can therefore never stand as the model of a spec rule, which is the
   only thing listing it could otherwise buy. Adding a scenario to reach an awkward label instead is a change to Section
-  12's table with its reason, as a changed witness set is, never an edit to `expected.toml` alone;
+  12's table with its reason, as a changed witness set is, never an edit to `expected.toml` alone - and so is adding a
+  RUN to a scenario that already exists. That second half is the one the first misses on its own: the cheap way to
+  clear an awkward label is not a new scenario at all but a degenerate new run under a scenario name already blessed,
+  bounded down to almost nothing and aimed only at the label, which the suite-wide union then accepts. Section 12's
+  table lists runs, not only scenarios, which is what makes a new run reviewable as a design change; the `recovery`
+  pairing below is that list for its scenario, and each of its rows carries what only that pairing reaches;
 - the derived `<name>-fixed` runs are not covered by the check. A proposed spec fix is meant to make the path it
   closes unreachable, so a fix-flag run would otherwise fail because the fix worked;
 - a run that times out is a tooling failure (exit code 2) and its coverage is not judged at all, because a partial
@@ -195,7 +211,12 @@ Four rules keep the coverage check honest without making it lie:
   states the property is about do occur, so a configuration that constrained its state space to almost nothing could not
   pass them. TLC 2.19 with `-continue` does still check the temporal property over the complete state space after
   reporting invariant violations, and reports both (measured 2026-09-12), so a liveness run with an open finding is
-  judged on both. A configuration that checks a temporal property (a
+  judged on both. A liveness run's configuration must also declare no `SYMMETRY`, and the runner rejects one that does
+  before running it, exactly as it rejects a `PROPERTY` in a `check` configuration. Prose alone will not hold this: symmetry and
+  liveness together are unsound in TLC but TLC does not refuse the combination, and a `SYMMETRY` line is the
+  cheapest way there is to make a run that will not fit its budget suddenly fit - it shrinks the state space and
+  changes no result the gate looks at. The rule belongs where the gate can see it. A configuration that checks a
+  temporal property (a
   liveness run, or a seeded run whose "must fail" entry is a property) lists exactly one `PROPERTY`, because TLC
   reports a temporal violation without naming the property (measured against TLC 2.19).
 - Fix-flag runs: for every `check` or `liveness` run with open findings, the runner also runs the same configuration
@@ -823,7 +844,13 @@ able to clear the lock, or it cannot hold at all; below that the run is not a we
 check of a different one. Between the floor and the top rung the run still proves the property, and proves it under
 less contention than the scenario allows, so the README records not just which rung was taken but what the tightened
 run no longer says: a liveness run with one Recoverer says a dead lock is cleared, not that it is cleared while
-another recoverer races for it. The `check` runs, which keep the contention, are where that question is answered. A fourth tightening is available to the liveness run alone and to no
+another recoverer races for it. The `check` runs, which keep the contention, are where that question is answered.
+
+A README note is not enough on its own, because the gate would go on reporting an unqualified pass for a run that
+now checks less. A tightened liveness run says so in `expected.toml`, as a `tightened` entry naming the rung taken
+and the measurement that forced it, and the runner prints that alongside the run's result. The point is not to fail
+the run - a tightened run is a legitimate one - but that nobody should be able to read the gate's output as saying
+the property holds under the scenario's full contention when it was not checked there. A fourth tightening is available to the liveness run alone and to no
 `check` run: start it from an initial state that already holds a dead owner's lock, which drops the whole prefix in
 which the owner acquires and dies. A `check` run may not do that, because those prefix states are where the
 scenario's dangerous interleavings are; a liveness run asks only whether a dead lock is eventually cleared, and that
