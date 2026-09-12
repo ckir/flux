@@ -47,12 +47,22 @@ runs write their TLC state and logs under `target/tla/`, keyed by run name.
 
 ## How a run is judged
 
-- `check` runs use `-continue` and must report exactly their `violated` witnesses plus their `open_findings`; a
-  `check` run lists at least one witness, so a model that reaches nothing cannot pass.
+- `check` runs use `-continue`, so they explore the whole reachable state space and report every violated invariant.
+  The configuration lists the scenario's safety invariants and no witness. A run passes only if the invariants
+  reported violated are exactly its `open_findings`, and only if every label of every actor it runs is covered.
+- `witness` runs use no `-continue` and list exactly one invariant, the negation of a fact the scenario must reach
+  that no label's coverage states. They pass only if TLC stops with that invariant violated, which both proves the
+  fact and yields the one trace showing how it happens.
 - `liveness` runs check one temporal property (TLC does not name the property it reports violated, so a config
   lists exactly one) and every safety invariant in the config, with no symmetry; they pass with no violation other
-  than their `open_findings`.
+  than their `open_findings`, and their labels must be covered too.
 - `seeded` runs stop at the first violation, which must be the one named.
+
+Reachability is proved by label coverage, not by witness invariants inside a check run. A witness invariant is
+violated in every state after its path is reached and TLC has no flag that reports an invariant once, so a check run
+carrying witnesses spends its budget printing the same trace: measured, 10,057 violation reports and a 309.6 MB log
+with `-difftrace` already on. A label's coverage count proves the same reachability with no output at all. To get a
+trace for any path, re-run that configuration with the witness as an invariant and without `-continue`.
 - A run with open findings is run a second time with the findings' fix flags set (`<run>-fixed`), and must then
   report no open finding.
 - TLC's deadlock check always stays on; a config may not set `CHECK_DEADLOCK`.
