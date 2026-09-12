@@ -13,7 +13,7 @@
        classified = [p \in Procs |-> "none"],     \* ghost: each process's last judgement
        ownerLive = [p \in Procs |-> "none"],      \* what it decided about the record's owner
        sawLive = [p \in Procs |-> FALSE],         \* its classification found a live owner
-       lastRecord = EmptyFile,                    \* ghost: the content most recently at the lock path
+       seenRec = [p \in Procs |-> EmptyFile],     \* ghost: what this process last read at the lock path
        crashed = [p \in Procs |-> FALSE],         \* ghost: this process died
        live = [p \in Procs |-> FALSE],            \* it has started and has neither finished nor died
        holding = [p \in Procs |-> FALSE],         \* this process owns the target lock now
@@ -59,7 +59,7 @@
            \* No entry at the lock path: the open fails and the judgement is "empty" (96.1).
            with (r = FsOpen(fs, P, LockName, self, TRUE)) {
              if (r.ok) { fs := r.fs; obj := r.val; }
-             else { classified[self] := "empty"; return; };
+             else { classified[self] := "empty"; seenRec[self] := EmptyFile; return; };
          };
          };
        S240_1_trylock:
@@ -76,6 +76,7 @@
            \* Read the record, then judge what was read (Section 6.1's table). A torn or unreadable
            \* record cannot show a dead owner: uncertain (96.1, 240.4, 259.6).
            with (seen = fs.content[obj]) {
+             seenRec[self] := seen;
              if (seen = Torn) { tornRead := TRUE; };
              if (seen = Torn \/ seen = EmptyFile) {
                classified[self] := "uncertain";
@@ -154,7 +155,7 @@
          if (crashed[self]) { goto acquire_crashed; }
          else {
            fs := FsWriteEnd(fs, obj, OwnRecord(self)).fs;
-           lastRecord := OwnRecord(self);
+           seenRec[self] := OwnRecord(self);
            holding[self] := TRUE;
            return;
          };
@@ -181,8 +182,8 @@
          if (crashed[self]) { goto recover_crashed; }
          else {
            robj := LockObj;
-           if (IsRecord(lastRecord)) { victim := lastRecord.op; };
-           if (LockObj = NoObj \/ fs.content[LockObj] # lastRecord) { goto S240_3_restart; };
+           if (IsRecord(seenRec[self])) { victim := seenRec[self].op; };
+           if (LockObj = NoObj \/ fs.content[LockObj] # seenRec[self]) { goto S240_3_restart; };
          };
        S240_3_s2:
          \* Only one of several concurrent recoverers can move it; the others find the lock gone and
@@ -201,7 +202,7 @@
          if (crashed[self]) { goto recover_crashed; }
          else {
            with (ident \in FsIdentityChoices(fs, P, BrokenOf(self))) {
-             if (ident # robj \/ fs.content[robj] # lastRecord) { goto S240_3_putback; };
+             if (ident # robj \/ fs.content[robj] # seenRec[self]) { goto S240_3_putback; };
          };
          };
        S240_3_s4:
@@ -229,7 +230,7 @@
          if (crashed[self]) { goto recover_crashed; }
          else {
            fs := FsWriteEnd(fs, LockObj, OwnRecord(self)).fs;
-           lastRecord := OwnRecord(self);
+           seenRec[self] := OwnRecord(self);
            holding[self] := TRUE;
          };
        S240_3_s5:

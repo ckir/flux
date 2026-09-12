@@ -26,3 +26,6 @@ target
 
 # Python bytecode from models/lockproto/run.py and its tests
 __pycache__/
+
+# pcal.trans writes a backup of the module it rewrites
+models/lockproto/LockProtocol.old
