@@ -13,16 +13,21 @@ CONSTANTS
     Cleanups,      \* flux cleanup DEST (251.1)
     NoProc,        \* model value: nobody
     P,             \* the target's parent directory
-    T,             \* the target's name
     LockName,      \* P/<name>.flux-lock (96.1)
     DirLockName,   \* P/.flux-dir.lock, the long-name fallback (96.1); never created here
     MaxObjs,       \* how many objects this scenario's actors can create (bounds the state space)
+    MaxCrashes,    \* how many crashes a run may have, both kinds together (design Section 5.2)
+    HostCrashes,   \* whether a host crash is one of the crashes this run explores
     Platform, IdentityStrength, LockCapability
 
 Procs == Owners \cup Recoverers \cup PlainRuns \cup Cleanups
-\* <lock-name>.broken.<operation-id> beside the lock (240.3 step 2)
+\* <lock-name>.broken.<operation-id> beside the lock (240.3 step 2). Only an actor that can move a
+\* lock aside needs such a name, and every name is an entry class in every state, so the Owners do
+\* not get one. The target's own name is not here either: publishing sets a ghost in this scenario
+\* (the `nested` scenario, which is about what gets written where, creates the object).
+Movers == Recoverers \cup PlainRuns \cup Cleanups
 BrokenOf(p) == <<"broken", p>>
-Names == {T, LockName, DirLockName} \cup {BrokenOf(p) : p \in Procs}
+Names == {LockName, DirLockName} \cup {BrokenOf(p) : p \in Movers}
 Dirs == {P}
 Fold == [n \in Names |-> n]          \* the recovery scenario needs no name folding
 

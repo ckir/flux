@@ -111,18 +111,22 @@ Allocated(fs) == {o \in Objs : fs.content[o] # NoContent}
 \* (design Section 5.1; probe FS-6). POSIX allows it (FS-4, FS-5).
 DeleteAllowed(fs, o) == Posix \/ \A h \in HandlesOf(fs, o) : h.del
 
-\* A failed call and a successful one. `val` carries what the call reports.
-Fail == [ok |-> FALSE, fs |-> NoObj, val |-> NoObj]
+\* A failed call and a successful one. `val` carries what the call reports. A failed call returns the
+\* filesystem UNCHANGED, which is both what a failed call does and what lets a caller that ignores
+\* the failure - as 240.3 step 5 does, where Flux warns and continues - write `...fs` safely.
+Fail(fs) == [ok |-> FALSE, fs |-> fs, val |-> NoObj]
 Ok(newFs, v) == [ok |-> TRUE, fs |-> newFs, val |-> v]
 Succeeded(r) == r.ok
 
 \* ------------------------------------------------------------------------------------------
-\* Operations (design Section 5.1: one row, one atomic step)
+\* Operations (design Section 5.1: one row, one atomic step). Every operator that takes an object id
+\* treats NoObj as a failed call: the protocol reads an id out of the state (`At(fs, ...)`), and a
+\* concurrent actor may have removed the name in between, so the id can be NoObj at any call site.
 
 \* Exclusive create. Fails if an entry of the same class exists; otherwise creates an empty object
 \* and a handle for the caller. `del` is the Windows delete-sharing mode of that handle.
 FsCreate(fs, d, n, p, del) ==
-    IF Exists(fs, d, n) \/ fs.next = MaxObjs THEN Fail
+    IF Exists(fs, d, n) \/ fs.next = MaxObjs THEN Fail(fs)
     ELSE LET o == fs.next + 1
              share == IF Posix THEN TRUE ELSE del IN
          Ok([ fs EXCEPT
@@ -137,14 +141,14 @@ FsCreate(fs, d, n, p, del) ==
 \* keeps one handle per object per process, and `NoDoubleOpen` below checks that.
 FsOpen(fs, d, n, p, del) ==
     LET o == At(fs, d, n) IN
-    IF o = NoObj \/ (Windows /\ o \in fs.deleted) THEN Fail
+    IF o = NoObj \/ (Windows /\ o \in fs.deleted) THEN Fail(fs)
     ELSE LET share == IF Posix THEN TRUE ELSE del IN
          Ok([fs EXCEPT !.handles = @ \cup {[proc |-> p, obj |-> o, del |-> share]}], o)
 
 \* Close one handle: drops it, releases its OS-native lock, and on Windows removes a pending-delete
 \* object's name when its last handle goes.
 FsClose(fs, p, o) ==
-    IF ~OpenBy(fs, p, o) THEN Fail ELSE
+    IF o = NoObj \/ ~OpenBy(fs, p, o) THEN Fail(fs) ELSE
     LET rest == fs.handles \ {h \in fs.handles : h.proc = p /\ h.obj = o}
         lock == IF fs.oslock[o] = p THEN NoProc ELSE fs.oslock[o]
         gone == Windows /\ o \in fs.deleted /\ {h \in rest : h.obj = o} = {}
@@ -161,18 +165,18 @@ FsClose(fs, p, o) ==
 \* The OS-native lock, scoped to the handle that takes it (probe FS-11) and unavailable when the
 \* capability is weak (Section 235.1).
 FsTryLock(fs, p, o) ==
-    IF LockCapability = "weak" \/ ~OpenBy(fs, p, o) \/ fs.oslock[o] # NoProc THEN Fail
+    IF o = NoObj \/ LockCapability = "weak" \/ ~OpenBy(fs, p, o) \/ fs.oslock[o] # NoProc THEN Fail(fs)
     ELSE Ok([fs EXCEPT !.oslock[o] = p], o)
 
 FsUnlock(fs, p, o) ==
-    IF fs.oslock[o] # p THEN Fail ELSE Ok([fs EXCEPT !.oslock[o] = NoProc], o)
+    IF o = NoObj \/ fs.oslock[o] # p THEN Fail(fs) ELSE Ok([fs EXCEPT !.oslock[o] = NoProc], o)
 
 \* Rename without replacing: fails if the target class exists. On POSIX it succeeds even while the
 \* object is open and OS-locked (FS-4); on Windows every open handle must allow delete sharing
 \* (FS-6, FS-7).
 FsRenameNoReplace(fs, d, from, to) ==
     LET o == At(fs, d, from) IN
-    IF o = NoObj \/ Exists(fs, d, to) \/ ~DeleteAllowed(fs, o) THEN Fail
+    IF o = NoObj \/ Exists(fs, d, to) \/ ~DeleteAllowed(fs, o) THEN Fail(fs)
     ELSE Ok([ fs EXCEPT
                 !.entries[d][ClassOf(from)] = NoObj,
                 !.entries[d][ClassOf(to)] = o,
@@ -185,35 +189,35 @@ FsRenameNoReplace(fs, d, from, to) ==
 FsUnlinkChoices == IF Windows THEN {TRUE, FALSE} ELSE {TRUE}
 FsUnlink(fs, d, n, atOnce) ==
     LET o == At(fs, d, n) IN
-    IF o = NoObj \/ ~DeleteAllowed(fs, o) THEN Fail
+    IF o = NoObj \/ ~DeleteAllowed(fs, o) THEN Fail(fs)
     ELSE IF atOnce \/ HandlesOf(fs, o) = {}
     THEN Ok([fs EXCEPT !.entries[d][ClassOf(n)] = NoObj], o)
     ELSE Ok([fs EXCEPT !.deleted = @ \cup {o}], o)
 
 \* Writing a lock record is two steps, so a reader in between sees Torn (Section 259.6).
 FsWriteBegin(fs, o) ==
-    IF fs.content[o] = NoContent THEN Fail ELSE Ok([fs EXCEPT !.content[o] = Torn], o)
+    IF o = NoObj \/ fs.content[o] = NoContent THEN Fail(fs) ELSE Ok([fs EXCEPT !.content[o] = Torn], o)
 
 FsWriteEnd(fs, o, c) ==
-    IF fs.content[o] = NoContent THEN Fail ELSE Ok([fs EXCEPT !.content[o] = c], o)
+    IF o = NoObj \/ fs.content[o] = NoContent THEN Fail(fs) ELSE Ok([fs EXCEPT !.content[o] = c], o)
 
 \* A data write an operation issues while publishing: it lands at completion, so a stalled owner's
 \* call can complete after a takeover (Section 5.2, Section 240.5).
 FsIssue(fs, p, o, c) ==
-    IF fs.content[o] = NoContent THEN Fail
+    IF o = NoObj \/ fs.content[o] = NoContent THEN Fail(fs)
     ELSE Ok([fs EXCEPT !.inflight = @ \cup {[proc |-> p, obj |-> o, content |-> c]}], o)
 
 FsLand(fs, call) ==
-    IF call \notin fs.inflight THEN Fail
+    IF call \notin fs.inflight THEN Fail(fs)
     ELSE Ok([ fs EXCEPT
                 !.content[call.obj] = call.content,
                 !.inflight = @ \ {call} ], call.obj)
 
 FsDrop(fs, call) ==
-    IF call \notin fs.inflight THEN Fail ELSE Ok([fs EXCEPT !.inflight = @ \ {call}], call.obj)
+    IF call \notin fs.inflight THEN Fail(fs) ELSE Ok([fs EXCEPT !.inflight = @ \ {call}], call.obj)
 
 FsFlushFile(fs, o) ==
-    IF fs.content[o] = NoContent THEN Fail ELSE Ok([fs EXCEPT !.durable[o] = fs.content[o]], o)
+    IF o = NoObj \/ fs.content[o] = NoContent THEN Fail(fs) ELSE Ok([fs EXCEPT !.durable[o] = fs.content[o]], o)
 
 FsFlushDir(fs, d) == Ok([fs EXCEPT !.dentries[d] = fs.entries[d]], d)
 

@@ -1,3 +1,44 @@
+---- MODULE LockProtocol ----
+\* The V16 lock protocol: acquisition (96.1), classification and recovery (240.1 to 240.3), a plain
+\* rerun's decision (21.1), cleanup (251.1), and commit-time revalidation (99), on the abstract
+\* filesystem of FsModel.tla. Design: docs/superpowers/specs/2026-09-11-lock-protocol-model-check-design.md,
+\* Sections 6.1, 7 and 12. Each label is named after the spec step it implements, and each performs
+\* at most one filesystem operation, so other actors run in between (design Section 5.2).
+EXTENDS Naturals, FiniteSets, Sequences, TLC
+
+CONSTANTS
+    Owners,        \* operations that acquire the lock and publish
+    Recoverers,    \* new invocations that recover a dead owner's lock (240.3)
+    PlainRuns,     \* new invocations with no flags (21.1)
+    Cleanups,      \* flux cleanup DEST (251.1)
+    NoProc,        \* model value: nobody
+    P,             \* the target's parent directory
+    LockName,      \* P/<name>.flux-lock (96.1)
+    DirLockName,   \* P/.flux-dir.lock, the long-name fallback (96.1); never created here
+    MaxObjs,       \* how many objects this scenario's actors can create (bounds the state space)
+    MaxCrashes,    \* how many crashes a run may have, both kinds together (design Section 5.2)
+    HostCrashes,   \* whether a host crash is one of the crashes this run explores
+    Platform, IdentityStrength, LockCapability
+
+Procs == Owners \cup Recoverers \cup PlainRuns \cup Cleanups
+\* <lock-name>.broken.<operation-id> beside the lock (240.3 step 2). Only an actor that can move a
+\* lock aside needs such a name, and every name is an entry class in every state, so the Owners do
+\* not get one. The target's own name is not here either: publishing sets a ghost in this scenario
+\* (the `nested` scenario, which is about what gets written where, creates the object).
+Movers == Recoverers \cup PlainRuns \cup Cleanups
+BrokenOf(p) == <<"broken", p>>
+Names == {LockName, DirLockName} \cup {BrokenOf(p) : p \in Movers}
+Dirs == {P}
+Fold == [n \in Names |-> n]          \* the recovery scenario needs no name folding
+
+INSTANCE FsModel WITH Dirs <- Dirs, Names <- Names, Procs <- Procs, NoProc <- NoProc,
+                      MaxObjs <- MaxObjs, Fold <- Fold, Platform <- Platform,
+                      IdentityStrength <- IdentityStrength, LockCapability <- LockCapability
+
+\* How a classifier judged the lock path (design Section 6.1).
+RecovererPerms == Permutations(Recoverers)
+Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "dead"}
+
 (* --algorithm LockProtocol {
      \* Each label performs at most ONE filesystem operation (design Section 5.2). A purely local
      \* decision that follows a call - a judgement over what was just read, a branch on whether the
@@ -490,3 +531,50 @@
          skip;
      }
    } *)
+
+\* ------------------------------------------------------------------------------------------
+\* Properties (design Section 7).
+\*
+\* Safety invariants hold in every reachable state and are checked in the scenario's `check` run.
+\* Reachability is proved two ways: a step a label performs is proved by that label's TLC coverage
+\* count (design Section 4), and the two facts no single label states - a read that found a torn
+\* record, and a replaced lock that a crash had left - keep a ghost flag and are checked as witnesses
+\* in their own small run without `-continue`, which stops at the first violation and prints one
+\* trace. To get a trace for any other path, re-run the configuration with that witness as an
+\* invariant and no `-continue`.
+
+\* The filesystem model's own assumptions (FsModel.tla), so a simplification there cannot pass
+\* unnoticed.
+FsOk == FsInvariants(fs)
+
+\* Every object's content is one of the forms the protocol knows, so a classifier's judgement table
+\* covers every case it can meet (`Classifiable`, Section 7).
+Classifiable == \A o \in Objs : fs.content[o] = NoContent \/ fs.content[o] \in Contents
+
+\* For a target, at most one process is inside a publishing step whose last Section 99 check passed.
+\* The one exception the spec accepts - a stalled owner's in-flight call issued before an operator
+\* `--break-lock` - belongs to the `breaklock` scenario, which has the actors for it.
+SingleWriter == Cardinality({p \in Procs : checked[p]}) <= 1
+
+\* A process without `--break-lock` never removes, renames, or overwrites a lock it classified as
+\* uncertain, and creates a lock only at an empty lock path (Section 7).
+PlainNeverOwnsUncertain == ~touchedUncertain
+
+\* A `Foreign` object at a lock path is never written, renamed, or deleted (Section 7).
+ForeignUntouched == ~touchedForeign
+
+\* Every TARGET_LOCK_BUSY refusal rests on evidence that the lock path held, or the refusing
+\* process's handle referred to, a lock whose owner was alive or another takeover's (Section 7). The
+\* refusing label records that, because the refusal may be reported after the owner it saw has
+\* finished: the spec's refusal rests on what the classifier observed (240.2), not on a re-read.
+RefusalJustified == \A p \in Procs : refused[p] = "TARGET_LOCK_BUSY" => refusedOk[p]
+
+\* The two ghost witnesses, for the witness run.
+NeverTornRead == ~tornRead
+NeverRecoveredAfterCrash == ~recoveredAfterCrash
+
+\* The two state witnesses the liveness runs need: the states their properties are about do occur
+\* (design Section 7).
+NeverDeadOwnerLock == ~DeadOwnerLock
+NeverTornLock == ~TornLock
+====
