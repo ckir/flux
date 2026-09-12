@@ -88,8 +88,11 @@ even though TLC evaluates it at every state, and symmetry reduction lowers a lab
 found. Without this, a label behind a condition that can never hold would still have a `trace.toml` entry mapping it to
 a spec rule, and the traceability map would claim coverage that never runs.
 
-Four things about reading that report are measured, and each of them silently breaks a gate that gets them wrong
-(2026-09-12; every one of them was hit while building the `recovery` scenario):
+Five things about reading that report are measured, and each of them silently breaks a gate that gets them wrong
+(2026-09-12; every one of them was hit while building the `recovery` scenario). None of them is a documented
+interface: they are the output format of the pinned TLC release, so they are pinned by the same SHA-256 that pins
+the jar, and a change to that pin re-checks them and re-records `testdata/` with `record_fixtures.py` in the same
+change. A gate reading an unpinned TLC would be reading an unspecified format.
 
 - `-coverage 1` prints a snapshot every minute **and** a final report, and only the last block covers the whole run.
   In one log `S240_3_s4_drop` reads `0:0` in the one-minute snapshot and `1168:2835` in the final block of that same
@@ -118,6 +121,15 @@ for the wrong reason - the gate passes on the bound rather than on the protocol.
 therefore raised by one once and its state count confirmed unchanged; the four `recovery` check runs are all
 verified this way.
 
+That check is per bound, and clearing one bound says nothing about the others. A configuration is a box with at
+least three walls - `MaxObjs`, `MaxCrashes`, and the actor sets themselves - and a label can be pinned against any
+of them while the other two sit slack. This scenario is its own example: at `MaxCrashes = 1`, `recover_crashed` was
+unreachable no matter what, and `MaxObjs` was already provably non-binding at the time, so the object-bound check
+passed and proved nothing about the label. Raising `MaxCrashes` to 2 is what reached it. A bound is therefore
+checked when a label it could pin is uncovered, and the uncovered label names which wall to push on: a
+create-failure label points at `MaxObjs`, a crash-path label at `MaxCrashes`, and an interference label at the
+actor set - which is what the `recovery` pairing below is.
+
 What the gate cannot see is which ARM of a label was taken. A label holds one filesystem call and the local decision
 that follows it (Section 5.2), so `S21_1_decide` carries the whole of 21.1's judgement table: its coverage count
 proves a plain rerun decided, never that it decided `RESUMABLE_OPERATION_EXISTS` against a dead owner. Coverage is a
@@ -136,9 +148,16 @@ invariant and without `-continue`; the gates need the fact, a person debugging n
 
 Four rules keep the coverage check honest without making it lie:
 
-- the labels of an actor whose process set the run's configuration leaves empty are exempt; the runner derives which
-  labels belong to which actor from the model's `process` blocks and which sets are empty from the configuration's
-  constants, so no list is maintained by hand;
+- the labels of an actor whose process set the run's configuration leaves empty are exempt. For a label inside a
+  `process` block the runner needs to derive nothing: TLC reports no action at all for an empty process set
+  (measured - the run with `Recoverers = {}` reports none of the nine `rec_` actions the others report), so such a
+  label is simply absent from the report and cannot fail the gate. The attribution that DOES have to be derived is
+  for the labels in the shared `procedure` blocks, which is where most of this model's labels live: `S240_1_*`,
+  `S96_1_*`, `S240_3_*` and `S99_*` sit in `Classify`, `Acquire`, `Recover` and `Publish`, belong to no `process`
+  block, and are reached by whichever actors call them. A procedure's label therefore belongs to the set of actors
+  that call that procedure, and is exempt only when every one of those actors has an empty process set. Deriving it
+  from the containing block instead would attribute those labels to nobody, which is both the larger half of the
+  model and the half the exemption has to get right;
 - a run may list `unreached` labels with a reason: steps its variant or its configuration cannot reach although their
   actor runs, such as 240.5 step 1's capability branch, which only the seeded run without the capability gate reaches
   (Section 5.1). The check is symmetric, as for witnesses: a listed label that does get covered fails the run too,
@@ -796,7 +815,15 @@ steps with two crashes each may not fit ten minutes. The `check` runs now say th
 five actors already take 1.2 to 2.2 million states WITH symmetry available, and all four together did not finish at
 all. When the liveness run does not fit, the tightenings, in this order, are one crash instead of two in that run,
 then one Recoverer instead of two, then dropping the `PlainRun` from the liveness configuration; each is recorded in
-the README with the measurement that forced it. A fourth tightening is available to the liveness run alone and to no
+the README with the measurement that forced it.
+
+The ladder has a floor, because each rung removes some of what the property is about. A liveness run must keep at
+least one crash, or no lock is ever dead and `DeadLockEventuallyCleared` holds vacuously, and at least one actor
+able to clear the lock, or it cannot hold at all; below that the run is not a weaker check of the property but a
+check of a different one. Between the floor and the top rung the run still proves the property, and proves it under
+less contention than the scenario allows, so the README records not just which rung was taken but what the tightened
+run no longer says: a liveness run with one Recoverer says a dead lock is cleared, not that it is cleared while
+another recoverer races for it. The `check` runs, which keep the contention, are where that question is answered. A fourth tightening is available to the liveness run alone and to no
 `check` run: start it from an initial state that already holds a dead owner's lock, which drops the whole prefix in
 which the owner acquires and dies. A `check` run may not do that, because those prefix states are where the
 scenario's dangerous interleavings are; a liveness run asks only whether a dead lock is eventually cleared, and that
@@ -865,3 +892,7 @@ Findings the 2026-09-12 panel stood down below its severity floor, with the guar
 - Ordinary prose beginning with `#` inside a stamped section is read as a heading and can fail the family check.
   That is what the markdown the spec is written in means (Section 9 counts ATX headings outside fenced blocks), so
   the check agrees with every other reader of the file.
+- The coverage parser could mistake a wrapped cost line for an action line, or break if TLC changed the report's
+  indentation. Every cost line is indented and every action line starts at column 1 (measured on the pinned release
+  across four runs), and the report's format is pinned by the same SHA-256 as the jar, with `record_fixtures.py`
+  re-recording `testdata/` when that pin moves - so a format change cannot arrive unnoticed between pins.
