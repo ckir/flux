@@ -178,7 +178,11 @@ Four rules keep the coverage check honest without making it lie:
   since the runs it unions include other platforms and other actor sets. The stronger property is what the per-run
   requirement gives, which is why a label excused in one run still has to carry its reason there. A single-scenario run cannot judge this and
   says so in its report, and the CI matrix runs one scenario per job, so `model-gate` does not enforce it; the full
-  `just model` that Section 13 requires before the work is declared finished does;
+  `just model` that Section 13 requires before the work is declared finished does. That leaves the union checked
+  only at the end and only by hand, which is the weakest point in this rule: a branch can be green in CI for as long
+  as it likes with a label no run covers. Whichever way Section 12's per-job time question is settled, the answer
+  has to leave room for one job that performs the union - it needs every run's coverage, not one scenario's, so it
+  is the one job that cannot be part of a per-scenario matrix;
 - one top-level `never_reached` list in `expected.toml`, each entry a label and a reason, holds the labels no run can
   cover. It is the only way out of the rule above, and it costs the label its traceability: a label in `never_reached`
   may not appear in any `[[unit]]` entry's labels (Section 9.1), so a unit it was meant to implement falls back on
@@ -189,7 +193,11 @@ Four rules keep the coverage check honest without making it lie:
   clear an awkward label is not a new scenario at all but a degenerate new run under a scenario name already blessed,
   bounded down to almost nothing and aimed only at the label, which the suite-wide union then accepts. Section 12's
   table lists runs, not only scenarios, which is what makes a new run reviewable as a design change; the `recovery`
-  pairing below is that list for its scenario, and each of its rows carries what only that pairing reaches;
+  pairing below is that list for its scenario, and each of its rows carries what only that pairing reaches. This one
+  is review-gated rather than mechanised, and says so: no check can tell a run added to reach a real path from one
+  added to clear a label, because the difference is intent. What it buys is that both edits - the new `[[run]]` and
+  the new table row with its reason - appear in the same diff, and a `[[run]]` arriving without one is the thing a
+  reviewer looks for. Section 9 already rests on the same footing for a re-stamped heading;
 - the derived `<name>-fixed` runs are not covered by the check. A proposed spec fix is meant to make the path it
   closes unreachable, so a fix-flag run would otherwise fail because the fix worked;
 - a run that times out is a tooling failure (exit code 2) and its coverage is not judged at all, because a partial
@@ -246,6 +254,18 @@ The runner, `run.py`:
   if the hash still does not match it stops with exit code 2. The pin protects against the download changing later,
   not against a pull request that changes the tag and hash together; such a change is visible in `run.py`'s diff and
   is reviewed as a dependency change;
+- checks each run's configuration against what its `expected.toml` entry declares before running it, and stops with
+  exit code 2 on any difference. A run declares its actor sets and its numeric bounds - the `MaxObjs`, `MaxCrashes`
+  and process-set constants - and the runner reads the same constants out of the `.cfg` and compares them. This is
+  what keeps a configuration honest, because the `.cfg` is the one file in this design that a person can edit to
+  make a failing run pass: tightening a bound, emptying a process set, or adding a `SYMMETRY` line all shrink the
+  state space, and none of them changes any result the rest of the gate looks at. A rule that lives only in prose
+  about what a configuration "should" contain is a rule the `.cfg` can quietly break, so the bounds a run is
+  entitled to are declared where the gate can read them and the `.cfg` may only agree;
+- rejects a `SYMMETRY` declaration in any run whose entry does not name the actor set it is over, whatever the run's
+  kind. Symmetry with liveness is unsound, so a liveness run may declare none at all (above); but a false symmetry
+  over actors that are not interchangeable is unsound in a `check` run too, and it is the single cheapest edit that
+  makes an over-budget run fit. The permitted sets are Section 6.1's, named per run in `expected.toml`;
 - runs the selected runs (all, or one scenario with `--scenario NAME`), each under its `timeout_minutes`, killing TLC
   on timeout; a run that fails in any way does not stop the others, so one report covers every selected run;
 - runs TLC with `-tool`, whose output marks each message with a numeric message code, and decides each run's result
