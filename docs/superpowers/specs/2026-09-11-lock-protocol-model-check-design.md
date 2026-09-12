@@ -97,11 +97,20 @@ Four things about reading that report are measured, and each of them silently br
 - the block's terminator has two forms: `End of statistics.` and, on a large model, `End of statistics (please note
   that for performance reasons large models are best checked with coverage and cost statistics disabled).` A parser
   anchored on the punctuated form fails on exactly the big runs it matters for.
+- a block holds two kinds of line, and only one of them is a label. An action's own line begins with `<` in the
+  first column and carries the `distinct:found` pair; every line beneath it is a cost line for an expression inside
+  that action, indented, carrying a SINGLE number, and prefixed with one `|` per level of nesting below the first
+  (`  line 606, col 25 ...: 5856534`, then `  |line 606, col 25 ...: 5815368`). A gate must anchor on the leading
+  `<` - not on the `|`, which the first level of cost lines does not carry - or it will read an expression's figure
+  as a label's.
 - "no states found" is the SECOND number. A label that only ever regenerates states already seen reports zero
   distinct and a large total: `publish_crashed` reports `0:32937`, and PlusCal's own `Terminating` action `0:1029`,
   in a run where an all-Done state is reachable. A gate reading the first number fails on both.
 - `-coverage 1` is not free: the same state graph (7,254,481 generated, 2,174,196 distinct, exhausted both times)
   took 5min53s with it and 3min24s without, which is why the time budget below is quoted for runs that carry it.
+  That pair is one measurement each, minutes apart on a machine whose background load was not controlled, so it
+  sizes the cost and does not pin it; the state counts either side of it are exact and repeatable, the durations
+  are not.
 
 A bound must also be shown not to bind before its run's coverage means anything. `FsCreate` fails both when an entry
 of the name exists and when `fs.next = MaxObjs`, so under a binding object bound a create-failure label is covered
@@ -732,18 +741,31 @@ about twenty-one minutes with 1,866,860 still queued and growing, against a ten-
 do finish, so each POSIX `check` run of the scenario takes one pairing, and all four are measured to exhaustion and
 clean (2026-09-12, `MaxCrashes = 2`):
 
-| Run | Actors | Distinct states | What only this pairing reaches |
-|---|---|---|---|
-| `recovery-posix-check` | Owner, 2 Recoverers (`SYMMETRY`) | 1,224,261 | two recoverers racing for the same lock, which is what 240.3 step 2 is about |
-| `recovery-posix-check-plain` | Owner, Recoverer, PlainRun | 2,174,196 | a plain rerun (21.1) meeting a dead owner's lock a recoverer is working on |
-| `recovery-posix-check-cleanup` | Owner, Recoverer, Cleanup | 1,604,109 | two movers of different kinds, both entitled to move the lock aside |
-| `recovery-posix-check-plain-cleanup` | Owner, PlainRun, Cleanup | 1,453,842 | the plain rerun's own 240.3 path, which needs a dead cleanup lock |
+| Run | Actors | `MaxObjs` | Distinct states | What only this pairing reaches |
+|---|---|---|---|---|
+| `recovery-posix-check` | Owner, 2 Recoverers (`SYMMETRY`) | 3 | 1,224,261 | two recoverers racing for the same lock, which is what 240.3 step 2 is about |
+| `recovery-posix-check-plain` | Owner, Recoverer, PlainRun | 4 | 2,174,196 | a plain rerun (21.1) meeting a dead owner's lock a recoverer is working on |
+| `recovery-posix-check-cleanup` | Owner, Recoverer, Cleanup | 5 | 1,604,109 | two movers of different kinds, both entitled to move the lock aside |
+| `recovery-posix-check-plain-cleanup` | Owner, PlainRun, Cleanup | 6 | 1,453,842 | the plain rerun's own 240.3 path, which needs a dead cleanup lock |
 
 The fourth run carries no Recoverer deliberately. `plain_recover`, `plain_recovered` and `plain_recovered_done` are
 reached only by a plain rerun that finds a dead CLEANUP lock, which only a Cleanup that created one and then crashed
 leaves behind; no other pairing covers them. Together the four cover every label of the scenario's actors except
 `S96_1_backoff`, the 96.1 directory-lock conflict that belongs to `dirlock`, and `S240_3_putback`, which needs a
-record rewritten in place by a 240.5 takeover and so belongs to `breaklock`; both are `unreached` entries here.
+record rewritten in place by a 240.5 takeover and so belongs to `breaklock`; both are `unreached` entries in all
+four.
+
+Pairing moves work onto the `unreached` lists, and those lists are per run. A label an actor of the run owns but
+this pairing cannot reach must be listed in THAT run's entry with its reason, even though another pairing covers it:
+the three plain-rerun recovery labels above are `unreached` in `recovery-posix-check-plain`, which runs a PlainRun
+and so owns them, and covered in `recovery-posix-check-plain-cleanup`. The suite-wide rule is what makes that safe -
+it is the union across runs that may leave nothing uncovered, not any single run. A label belonging to an actor a
+pairing does not instantiate needs no entry at all: TLC reports no action for an empty process set, so those labels
+never appear in that run's report.
+
+Windows pairs the same way, with the same four actor sets under `Platform = "windows"`, named
+`recovery-windows-check` and so on. The pairing is forced by the number of concurrent actors, which the platform
+does not change.
 
 The POSIX weak-identity variant is dropped from this scenario. Measured, it explores a state graph identical to the
 strong-identity one (1,531,965 generated, 473,328 distinct, an identical coverage table): the scenario's only
@@ -775,20 +797,31 @@ five actors already take 1.2 to 2.2 million states WITH symmetry available, and 
 all. When the liveness run does not fit, the tightenings, in this order, are one crash instead of two in that run,
 then one Recoverer instead of two, then dropping the `PlainRun` from the liveness configuration; each is recorded in
 the README with the measurement that forced it. A fourth tightening is available to the liveness run alone and to no
-`check` run: start it from `FsWith`, an initial state that already holds a dead owner's lock, which drops the whole
-prefix in which the owner acquires and dies. A `check` run may not do that, because those prefix states are where
-the scenario's dangerous interleavings are; a liveness run asks only whether a dead lock is eventually cleared, and
-that question begins at the state `FsWith` sets up. Each TLC run's `timeout_minutes` is
+`check` run: start it from an initial state that already holds a dead owner's lock, which drops the whole prefix in
+which the owner acquires and dies. A `check` run may not do that, because those prefix states are where the
+scenario's dangerous interleavings are; a liveness run asks only whether a dead lock is eventually cleared, and that
+question begins at the state the seed sets up.
+
+Seeding that state takes two things, not one, and `FsWith` is only the first. `FsWith` builds a filesystem holding
+the record; what makes a lock DEAD is the ghost `crashed` flag of the process the record names, because a classifier
+reads `crashed[seen.op]` and can otherwise judge the lock only live or uncertain. A seeded liveness configuration
+must therefore also start `crashed` true for that owner, which in turn makes the owner's own process take one step
+to its end label and stop - the prefix the seed exists to remove. A configuration that seeds the filesystem alone
+does not model a dead owner at all; it models a live one, and the liveness property it checks is a different
+property from the one intended. Each TLC run's `timeout_minutes` is
 10; each CI matrix job (one scenario) should finish within about 20 minutes. A run that does not fit gets tighter
 bounds, and the tighter bounds are written into the README, never raised silently.
 
 That per-job figure is the one number `recovery`'s pairing does not fit, and it is recorded here rather than quietly
 exceeded. Its four POSIX `check` runs alone measure about eighteen minutes with `-coverage 1` on, before the same
-job's Windows variants, its liveness run, its three `witness` runs and its seeded runs. The levers, none of them yet
-chosen: raise the per-job figure for a scenario whose actors are paired; run the pairings only on POSIX and keep
-Windows to the main `recovery-posix-check` pairing, on the ground that the pairings test interference between actors
-rather than platform semantics; or make the CI matrix one job per run rather than one per scenario, which costs
-runner start-up per run but removes the per-job ceiling as a constraint on how a scenario is decomposed.
+job's four Windows pairings, its liveness run, its three `witness` runs and its seeded runs - and before the fix-flag
+runs, which are the part that compounds worst: every `check` run carrying an open finding is run a second time as
+`<name>-fixed`, so one open finding in `recovery` turns four POSIX check runs into eight. The levers, none of them
+yet chosen: raise the per-job figure for a scenario whose actors are paired; run the pairings only on POSIX and keep
+Windows to the `recovery-windows-check` pairing alone, on the ground that the pairings test interference between
+actors rather than platform semantics; or make the CI matrix one job per run rather than one per scenario, which
+costs runner start-up per run but removes the per-job ceiling as a constraint on how a scenario is decomposed. The
+choice is the owner's and belongs in the plan that builds these runs, not in `expected.toml`.
 
 ## 13. Success criteria
 
