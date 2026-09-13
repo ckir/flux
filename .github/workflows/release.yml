@@ -64,6 +64,6 @@ jobs:
           Compress-Archive -Path "target/${{ matrix.target }}/release/flux.exe" -DestinationPath "flux-${{ matrix.target }}.zip"
 
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: flux-${{ matrix.target }}.*
