@@ -1019,16 +1019,18 @@ scenario's `witness` and seeded runs and, compounding worst, a `<name>-fixed` se
 an open finding.
 
 Host crashes form their own tier. With `HostCrashes = TRUE` the four POSIX pairings exhaust with no violation, but
-their state spaces are 11 to 15 times those without (measured before the fix to torn empty files in Section 5.2,
-11.3 to 24.7 million distinct states; after it, the Owner and two Recoverers pairing gives 13,331,133). The owner
+their state spaces are 10 to 14 times those without. Measured on CI after the fix to torn empty files in Section
+5.2, each with its per-run coverage gate passing on the same `unreached` lists as its process-crash counterpart:
+Owner and two Recoverers 13,331,133 distinct states; with a PlainRun 22,750,053; with a Cleanup 12,148,827; PlainRun
+and Cleanup 10,652,055. The owner
 ruled that per-pull-request CI keeps the process-crash runs and a separate tier, `expected-extended.toml` (Section 4),
 runs the host-crash pairings: nightly, on request, and on a labelled pull request. What that stops proving on an
 ordinary pull request is stated plainly: a change that relies on an unflushed write or entry operation being durable
 passes the pull request's checks, and the tier catches it afterwards. Label coverage cannot even show that a host
 crash ran, because it shares the label `env_loop` with the process crash, so `expected.toml` keeps one cheap host-crash
 run of its own, the witness `NeverHostCrashChangedLock`, which stops once a host crash has changed which object the
-lock path names. The tier is POSIX only for now; whether it gains Windows pairings is decided once CI has measured
-them.
+lock path names. The tier carries the four Windows host-crash pairings too, as a measurement: whether they stay is
+the owner's decision once CI has their counts.
 
 ## 13. Success criteria
 
