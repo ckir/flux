@@ -37,8 +37,9 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 TARGET = REPO / "target" / "tla"
 
-KINDS = ("check", "liveness", "seeded")
-RUN_KEYS = {"name", "module", "config", "scenario", "kind", "violated", "open_findings", "unreached", "timeout_minutes"}
+KINDS = ("check", "liveness", "seeded", "witness")
+RUN_KEYS = {"name", "module", "config", "scenario", "kind", "violated", "open_findings", "unreached", "timeout_minutes",
+            "constants", "symmetry", "tightened"}
 FINDING_KEYS = {"name", "tracking", "fix_flag"}
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 FIX_FLAG = re.compile(r"FIX_[A-Z0-9_]+")
@@ -96,6 +97,16 @@ class Run:
     open_findings: tuple[OpenFinding, ...]
     unreached: tuple[tuple[str, str], ...]
     timeout_minutes: int
+    constants: tuple[tuple[str, object], ...]
+    symmetry: tuple[str, str] | None
+    tightened: tuple[str, str] | None
+
+
+@dataclass(frozen=True)
+class Expected:
+    scenarios: list[str]
+    runs: list[Run]
+    never_reached: tuple[tuple[str, str], ...]
 
 
 @dataclass(frozen=True)
@@ -162,6 +173,65 @@ def cfg_properties(text: str) -> list[str]:
     return [t for t in cfg_sections(text).get("PROPERTY", []) if IDENT.fullmatch(t)]
 
 
+def cfg_constants(text: str) -> dict[str, object]:
+    """Parse the literal-valued assignments in a TLC .cfg's CONSTANT/CONSTANTS section.
+
+    An entry is returned only for a literal value: an integer literal (int), TRUE/FALSE (bool), a
+    double-quoted string (str, unquoted), or a set literal of identifiers ({a, b} or {}, frozenset[str]).
+    A model-value assignment (NAME = someIdentifier) or a substitution (NAME <- op) is omitted: neither
+    names a literal the runner can compare against 'constants'."""
+    tokens: list[str] = []
+    current: str | None = None
+    for match in _CFG_TOKEN.finditer(text):
+        token = match.group(0)
+        if _is_comment(token):
+            continue
+        if token in CFG_KEYWORDS:
+            current = CFG_KEYWORDS[token]
+            continue
+        if current == "CONSTANT":
+            tokens.append(token)
+
+    result: dict[str, object] = {}
+    i, n = 0, len(tokens)
+    while i < n:
+        name = tokens[i]
+        i += 1
+        if i >= n:
+            break
+        op = tokens[i]
+        i += 1
+        if op == "<-":
+            if i < n:
+                i += 1  # the substituted operator name; not a literal
+            continue
+        if op != "=" or i >= n:
+            continue
+        value = tokens[i]
+        if value.startswith('"'):
+            result[name] = value[1:-1]
+            i += 1
+        elif value == "{":
+            i += 1
+            elements: list[str] = []
+            while i < n and tokens[i] != "}":
+                if tokens[i] != ",":
+                    elements.append(tokens[i])
+                i += 1
+            if i < n:
+                i += 1  # consume "}"
+            result[name] = frozenset(elements)
+        elif value.isdigit():
+            result[name] = int(value)
+            i += 1
+        elif value in ("TRUE", "FALSE"):
+            result[name] = value == "TRUE"
+            i += 1
+        else:
+            i += 1  # a model value; not a literal
+    return result
+
+
 def fixed_cfg_text(text: str, flags: list[str]) -> str:
     """Return the .cfg text with each fix flag switched from FALSE to TRUE (comments are left alone)."""
     for flag in flags:
@@ -192,19 +262,13 @@ def _str_list(value: object, where: str) -> tuple[str, ...]:
     return tuple(value)
 
 
-# A PlusCal label named after a spec step: 'S', digits, '_', then at least one more character
-# (mirrors tests/model_stamp.rs's is_label_name).
-_LABEL_NAME = re.compile(r"S[0-9]+_.+")
-
-
-def _is_label_name(token: str) -> bool:
-    return _LABEL_NAME.fullmatch(token) is not None
-
-
 def _load_label_reasons(value: object, subject: str) -> tuple[tuple[str, str], ...]:
     """Parse a list of {label, reason} tables, as used by 'unreached' and 'never_reached'.
 
-    `subject` names the field for error messages, e.g. "run 'x-check': unreached" or "'never_reached'"."""
+    `subject` names the field for error messages, e.g. "run 'x-check': unreached" or "'never_reached'".
+    A label must be a non-empty TLA+ identifier: real PlusCal labels (e.g. `plain_recover`) do not all
+    start with `S<digits>_`, so that stricter shape is not checked here. Whether the label exists in the
+    model at all is a later task's concern."""
     _require(isinstance(value, list), f"{subject} must be an array of tables")
     assert isinstance(value, list)
     entries: list[tuple[str, str]] = []
@@ -212,9 +276,8 @@ def _load_label_reasons(value: object, subject: str) -> tuple[tuple[str, str], .
         _require(isinstance(item, dict) and set(item) == {"label", "reason"},
                  f"{subject}: each entry has exactly 'label' and 'reason'")
         label, reason = item.get("label"), item.get("reason")
-        _require(isinstance(label, str) and label, f"{subject}: each label must be a non-empty string")
-        _require(_is_label_name(label),
-                 f"{subject}: label {label!r} must look like a PlusCal label (S<digits>_<rest>)")
+        _require(isinstance(label, str) and IDENT.fullmatch(label) is not None,
+                 f"{subject}: each label must be a TLA+ identifier")
         _require(isinstance(reason, str) and reason, f"{subject}: each reason must be a non-empty string")
         entries.append((label, reason))
     labels = [label for label, _ in entries]
@@ -222,14 +285,7 @@ def _load_label_reasons(value: object, subject: str) -> tuple[tuple[str, str], .
     return tuple(entries)
 
 
-# Set by load_expected as a side effect. Not consumed here: the coverage gate that will read it is a
-# separate task (design Section 4's `-coverage 1` rules). Kept off load_expected's return value because
-# every caller (main() below, and test_run.py) unpacks it positionally as exactly two values
-# (`scenarios, runs = load_expected(...)`); adding a third element would break every one of them.
-LAST_NEVER_REACHED: tuple[tuple[str, str], ...] = ()
-
-
-def load_expected(path: Path) -> tuple[list[str], list[Run]]:
+def load_expected(path: Path) -> Expected:
     """Load and validate expected.toml; module and config paths are resolved beside it."""
     base = path.parent
     try:
@@ -239,8 +295,7 @@ def load_expected(path: Path) -> tuple[list[str], list[Run]]:
 
     _require(set(data) <= {"scenarios", "run", "never_reached"},
              f"unknown top-level keys: {sorted(set(data) - {'scenarios', 'run', 'never_reached'})}")
-    global LAST_NEVER_REACHED
-    LAST_NEVER_REACHED = _load_label_reasons(data.get("never_reached", []), "'never_reached'")
+    never_reached = _load_label_reasons(data.get("never_reached", []), "'never_reached'")
     scenarios = data.get("scenarios")
     _require(isinstance(scenarios, list) and scenarios and all(isinstance(s, str) for s in scenarios),
              "'scenarios' must be a non-empty list of names")
@@ -265,7 +320,45 @@ def load_expected(path: Path) -> tuple[list[str], list[Run]]:
             open_names = {f.name for r in runs if r.scenario == run.scenario for f in r.open_findings}
             _require(run.violated[0] not in open_names,
                      f"{run.name}: its scenario carries an open finding on {run.violated[0]}, so the seed cannot be judged")
-    return scenarios, runs
+    return Expected(scenarios, runs, never_reached)
+
+
+def _constants_equal(a: object, b: object) -> bool:
+    """Compare two constants values: an int never equals a bool, even though bool is an int subclass."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a == b
+    if isinstance(a, int) and isinstance(b, int):
+        return a == b
+    if isinstance(a, str) and isinstance(b, str):
+        return a == b
+    if isinstance(a, frozenset) and isinstance(b, frozenset):
+        return a == b
+    return False
+
+
+def _load_constants(raw: dict, where: str) -> dict[str, object]:
+    """Parse and shape-check the 'constants' table: int (not bool), bool, str, or a set of strings."""
+    _require("constants" in raw, f"{where}: 'constants' is required")
+    value = raw["constants"]
+    _require(isinstance(value, dict), f"{where}: constants must be a table")
+    assert isinstance(value, dict)
+    result: dict[str, object] = {}
+    for key, v in value.items():
+        _require(isinstance(key, str) and IDENT.fullmatch(key) is not None,
+                 f"{where}: constants key {key!r} must be a TLA+ identifier")
+        _require(FIX_FLAG.fullmatch(key) is None, f"{where}: constants must not contain a fix flag ({key})")
+        if isinstance(v, bool):
+            result[key] = v
+        elif isinstance(v, int):
+            result[key] = v
+        elif isinstance(v, str):
+            result[key] = v
+        elif isinstance(v, list) and all(isinstance(e, str) for e in v):
+            _require(len(set(v)) == len(v), f"{where}: constants {key!r} has duplicate elements")
+            result[key] = frozenset(v)
+        else:
+            _require(False, f"{where}: constants {key!r} must be an int, bool, string, or array of strings")
+    return result
 
 
 def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
@@ -278,9 +371,28 @@ def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
 
     _require(kind in KINDS, f"{where}: kind must be one of {KINDS}")
     _require(scenario in scenarios, f"{where}: scenario {scenario!r} is not in 'scenarios'")
-    seed = r"-[A-Z][A-Z0-9_]*" if kind == "seeded" else ""
-    _require(re.fullmatch(rf"{re.escape(scenario)}-[a-z0-9]+(-[a-z0-9]+)*-{kind}{seed}", name) is not None,
-             f"{where}: name must be '<scenario>-<variant>-<kind>', plus '-<SEED_FLAG>' exactly when it is seeded")
+
+    # violated: forbidden for check/liveness (reachability comes from coverage, a later task), required
+    # (exactly one) for seeded/witness.
+    if kind in ("check", "liveness"):
+        _require("violated" not in raw, f"{where}: a {kind} run must not declare 'violated'")
+        violated: tuple[str, ...] = ()
+    else:
+        _require("violated" in raw, f"{where}: a {kind} run needs 'violated'")
+        violated = _str_list(raw["violated"], f"{where}: violated")
+        _require(len(violated) == 1, f"{where}: a {kind} run names exactly one invariant or property")
+
+    if kind == "seeded":
+        suffix = r"-[A-Z][A-Z0-9_]*"
+        suffix_help = ", plus '-<SEED_FLAG>' exactly when it is seeded"
+    elif kind == "witness":
+        suffix = "-" + re.escape(violated[0])
+        suffix_help = ", plus '-<Invariant>' equal to violated[0] when it is a witness"
+    else:
+        suffix = ""
+        suffix_help = ", plus '-<SEED_FLAG>' exactly when it is seeded"
+    _require(re.fullmatch(rf"{re.escape(scenario)}-[a-z0-9]+(-[a-z0-9]+)*-{kind}{suffix}", name) is not None,
+             f"{where}: name must be '<scenario>-<variant>-<kind>'{suffix_help}")
     _require(IDENT.fullmatch(module) is not None and (base / f"{module}.tla").is_file(),
              f"{where}: module {module}.tla not found beside expected.toml")
     _require(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_][A-Za-z0-9_.-]*)*\.cfg", config) is not None
@@ -294,20 +406,11 @@ def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
     _require(isinstance(timeout, int) and not isinstance(timeout, bool) and timeout >= 1,
              f"{where}: timeout_minutes must be a whole number of minutes, at least 1")
 
-    _require("violated" in raw, f"{where}: a {kind} run needs 'violated'")
-    violated = _str_list(raw["violated"], f"{where}: violated")
-    if kind == "seeded":
-        _require(len(violated) == 1, f"{where}: a seeded run names exactly one invariant or property")
-    elif kind == "liveness":
-        _require(len(violated) == 1, f"{where}: a liveness run names exactly one witness invariant")
-    else:
-        # The witnesses prove the run reached its paths; without one, a model that explores nothing would pass.
-        _require(bool(violated), f"{where}: a check run lists at least one reachability witness")
-
     findings: list[OpenFinding] = []
+    _require(kind in ("check", "liveness") or "open_findings" not in raw,
+             f"{where}: open_findings is only allowed for check and liveness runs")
     raw_findings = raw.get("open_findings", [])
     _require(isinstance(raw_findings, list), f"{where}: open_findings must be an array of tables")
-    _require(kind != "seeded" or not raw_findings, f"{where}: a seeded run has no open_findings")
     for f in raw_findings:
         _require(isinstance(f, dict) and set(f) == FINDING_KEYS,
                  f"{where}: each open finding has exactly name, tracking, fix_flag")
@@ -322,22 +425,81 @@ def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
              f"{where}: unreached is only allowed for check and liveness runs")
     unreached = _load_label_reasons(raw.get("unreached", []), f"{where}: unreached")
 
+    raw_tightened = raw.get("tightened")
+    _require(kind == "liveness" or raw_tightened is None, f"{where}: tightened is only allowed for liveness runs")
+    tightened: tuple[str, str] | None = None
+    if raw_tightened is not None:
+        _require(isinstance(raw_tightened, dict) and set(raw_tightened) == {"rung", "measurement"},
+                 f"{where}: tightened must be a table with 'rung' and 'measurement'")
+        rung, measurement = raw_tightened.get("rung"), raw_tightened.get("measurement")
+        _require(isinstance(rung, str) and rung, f"{where}: tightened.rung must be a non-empty string")
+        _require(isinstance(measurement, str) and measurement, f"{where}: tightened.measurement must be a non-empty string")
+        tightened = (rung, measurement)
+
+    declared_constants = _load_constants(raw, where)
+
+    raw_symmetry = raw.get("symmetry")
+    _require(kind != "liveness" or raw_symmetry is None, f"{where}: a liveness run must not declare symmetry")
+    symmetry: tuple[str, str] | None = None
+    if raw_symmetry is not None:
+        _require(isinstance(raw_symmetry, dict) and set(raw_symmetry) == {"definition", "over"},
+                 f"{where}: symmetry must be a table with 'definition' and 'over'")
+        definition, over = raw_symmetry.get("definition"), raw_symmetry.get("over")
+        _require(isinstance(definition, str) and IDENT.fullmatch(definition) is not None,
+                 f"{where}: symmetry.definition must be a non-empty TLA+ identifier")
+        _require(isinstance(over, str) and IDENT.fullmatch(over) is not None,
+                 f"{where}: symmetry.over must be a non-empty TLA+ identifier")
+        symmetry = (definition, over)
+
     text = cfg_path.read_text(encoding="utf-8")
     sections = cfg_sections(text)
     _require("CHECK_DEADLOCK" not in sections, f"{where}: the config must not set CHECK_DEADLOCK (deadlock checking stays on)")
     _require(kind != "check" or "PROPERTY" not in sections,
              f"{where}: a check run's config must not declare a PROPERTY (TLC reports a temporal violation "
              "without naming it)")
+    if kind == "witness":
+        invariants = [t for t in sections.get("INVARIANT", []) if IDENT.fullmatch(t)]
+        _require(invariants == [violated[0]],
+                 f"{where}: a witness run's config lists exactly one invariant, {violated[0]!r}")
+        _require("PROPERTY" not in sections, f"{where}: a witness run's config must not declare a PROPERTY")
     properties = cfg_properties(text)
     temporal_run = kind == "liveness" or (kind == "seeded" and violated[0] in properties)
     if temporal_run:
         _require(len(properties) == 1, f"{where}: a run that checks a temporal property lists exactly one PROPERTY "
                                        "(TLC does not name the property it reports violated)")
         _require("SYMMETRY" not in sections, f"{where}: symmetry is unsound with liveness checking")
+
+    _require(("SYMMETRY" in sections) == (symmetry is not None),
+             f"{where}: the config has a SYMMETRY section if and only if the run declares 'symmetry'")
+    if symmetry is not None:
+        definition, over = symmetry
+        _require(sections["SYMMETRY"] == [definition],
+                 f"{where}: the config's SYMMETRY must name exactly {definition!r}")
+        module_text = (base / f"{module}.tla").read_text(encoding="utf-8")
+        def_pattern = re.compile(rf"\b{re.escape(definition)}\b\s*==\s*Permutations\s*\(\s*{re.escape(over)}\s*\)")
+        _require(def_pattern.search(module_text) is not None,
+                 f"{where}: {module}.tla must define {definition} == Permutations({over})")
+        over_value = declared_constants.get(over)
+        _require(isinstance(over_value, frozenset) and len(over_value) >= 2,
+                 f"{where}: symmetry.over ({over}) must be a 'constants' entry that is a set of at least two elements")
+
+    cfg_consts = cfg_constants(text)
+    for cname, cvalue in cfg_consts.items():
+        if FIX_FLAG.fullmatch(cname):
+            continue
+        _require(cname in declared_constants,
+                 f"{where}: the config assigns {cname}, which is not declared in 'constants'")
+        _require(_constants_equal(cvalue, declared_constants[cname]),
+                 f"{where}: constants.{cname} does not match the config's {cname} = {cvalue!r}")
+    for dname in declared_constants:
+        _require(dname in cfg_consts, f"{where}: constants has {dname!r}, which the config does not assign")
+
     if findings:
         fixed_cfg_text(text, [f.fix_flag for f in findings])  # raises if a flag is missing
 
-    return Run(name, module, config, scenario, kind, violated, tuple(findings), unreached, timeout)
+    constants = tuple(sorted(declared_constants.items()))
+    return Run(name, module, config, scenario, kind, violated, tuple(findings), unreached, timeout,
+               constants, symmetry, tightened)
 
 
 # ---------------------------------------------------------------------------------------
@@ -529,13 +691,16 @@ def execute(run: Run, jar: Path, base: Path, fixed: bool) -> Result:
                   outcome.tooling_error or "", outcome.trace, log)
 
 
-def report(result: Result) -> None:
+def report(result: Result, tightened: tuple[str, str] | None = None) -> None:
     def names(s: frozenset[str]) -> str:
         return ",".join(sorted(s)) or "-"
 
     states = "?" if result.distinct_states is None else f"{result.distinct_states:,}"
     print(f"{result.status.upper():8} {result.name}  expected={names(result.expected)}  "
           f"observed={names(result.observed)}  states={states}  {result.seconds:.0f}s")
+    if tightened is not None:
+        rung, measurement = tightened
+        print(f"         tightened: {rung} ({measurement})")
     if result.status != "ok":
         if result.detail:
             print(f"         {result.detail}")
@@ -553,17 +718,18 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        scenarios, runs = load_expected(args.expected)
+        expected = load_expected(args.expected)
     except ExpectedError as err:
         print(f"run.py: {err}", file=sys.stderr)
         return 2
+    scenarios = expected.scenarios
     if args.list_scenarios:
         print(json.dumps(scenarios))
         return 0
     if args.scenario is not None and args.scenario not in scenarios:
         print(f"run.py: unknown scenario {args.scenario!r}; known: {', '.join(scenarios)}", file=sys.stderr)
         return 2
-    selected = [r for r in runs if args.scenario is None or r.scenario == args.scenario]
+    selected = [r for r in expected.runs if args.scenario is None or r.scenario == args.scenario]
 
     if shutil.which("java") is None:
         print("run.py: java is not on PATH (TLC needs Java 11 or later; CI uses Temurin 21)", file=sys.stderr)
@@ -583,7 +749,7 @@ def main(argv: list[str] | None = None) -> int:
                     result = execute(run, jar, base, fixed)
                 except (OSError, ExpectedError) as err:
                     result = Result(run.name, "tooling", frozenset(), frozenset(), None, 0.0, str(err), (), None)
-                report(result)
+                report(result, run.tightened)
                 results.append(result)
     except KeyboardInterrupt:
         print(f"run.py: interrupted after {len(results)} runs", file=sys.stderr)

@@ -12,10 +12,10 @@ module = "Smoke"
 config = "configs/selftest-check.cfg"
 scenario = "selftest"
 kind = "check"
-violated = ["NeverReachedTwo"]
 open_findings = [
     { name = "AtMostThree", tracking = "selftest: exercises the open-finding and fix-flag path", fix_flag = "FIX_BOUND" },
 ]
+constants = { SEED_OVERSHOOT = false }
 timeout_minutes = 2
 
 [[run]]
@@ -24,7 +24,17 @@ module = "Smoke"
 config = "configs/selftest-liveness.cfg"
 scenario = "selftest"
 kind = "liveness"
+constants = { SEED_OVERSHOOT = false }
+timeout_minutes = 2
+
+[[run]]
+name = "selftest-posix-witness-NeverReachedTwo"
+module = "Smoke"
+config = "configs/selftest-witness-NeverReachedTwo.cfg"
+scenario = "selftest"
+kind = "witness"
 violated = ["NeverReachedTwo"]
+constants = { SEED_OVERSHOOT = false }
 timeout_minutes = 2
 
 [[run]]
@@ -34,4 +44,5 @@ config = "configs/selftest-seeded-SEED_OVERSHOOT.cfg"
 scenario = "selftest"
 kind = "seeded"
 violated = ["WithinBound"]
+constants = { SEED_OVERSHOOT = true }
 timeout_minutes = 2
