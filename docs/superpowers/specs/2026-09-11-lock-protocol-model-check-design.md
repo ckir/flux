@@ -119,8 +119,13 @@ A bound must also be shown not to bind before its run's coverage means anything.
 of the name exists and when `fs.next = MaxObjs`, so under a binding object bound a create-failure label is covered
 for the wrong reason - the gate passes on the bound rather than on the protocol. Every configuration's `MaxObjs` is
 therefore raised by one once and its state count confirmed unchanged. All eight `recovery` check runs were verified
-this way before the acquirer rule of spec 96.1 became part of the model; that rule was not re-measured against the
-bound, because both of its backoffs only remove a file and end the actor, so no path creates more objects than it did.
+this way before the acquirer rule of spec 96.1 became part of the model. That rule is not re-measured against the
+bound by raising it, because the bound cannot bind in any `recovery` configuration, for a reason independent of the
+rule: every actor makes at most one exclusive create - an acquisition or a recovery's replacement lock, never both,
+since each actor makes one pass - so objects allocated never exceed the number of actors, and each configuration's
+`MaxObjs` is at least that number. Measured where it is tightest, `recovery-posix-check`, whose three actors meet
+`MaxObjs = 3`: `fs.next <= Cardinality(Procs)` holds over its complete state space (2026-09-13). A later model that
+lets an actor create twice, for instance by retrying, reopens the question.
 
 That check is per bound, and clearing one bound says nothing about the others. A configuration is a box with at
 least three walls - `MaxObjs`, `MaxCrashes`, and the actor sets themselves - and a label can be pinned against any
@@ -559,9 +564,11 @@ A fact no single label states keeps a ghost flag or a state predicate, and its s
 | `NeverUncertainOwnerLock` | a lock whose owner is uncertain sat at the lock path |
 | `NeverLockLostMidCommit` (Claims) | `LockLost` fell between a PREPARE_COMMIT and its rename |
 
-Each scenario lists its `witness` runs in Section 12. `NeverDeadLockWithPendingMover` and `NeverUncertainOwnerLock` are
-the antecedents of the two liveness properties below, so a scenario that checks such a property always has the matching
-`witness` run: that is what keeps a liveness run from passing over a state space that never reaches its antecedent.
+Each scenario lists its `witness` runs in Section 12. `NeverDeadLockWithPendingMover` is the witness for the antecedent
+of `DeadLockEventuallyCleared` below; `NeverUncertainOwnerLock` stands in for `UncertainLockEventuallyCleared`'s until
+that property's scenarios are built, when it has to be narrowed to the conditioned antecedent in the same way. A
+scenario that checks such a property always has the matching `witness` run: that is what keeps a liveness run from
+passing over a state space that never reaches its antecedent.
 
 Liveness, checked in `liveness` runs under weak fairness. PlusCal's `--fair algorithm` generates `WF_vars(Next)`, which
 is fairness over the whole next-state relation rather than per process; it is enough here only because no process
@@ -578,11 +585,18 @@ run's reachable states (measured: identical counts before and after it was added
   scenarios are not built, and its witness above has to be narrowed to that antecedent when they are.
 
 The two conditions are what make the property checkable at all, not a weakening chosen for convenience. Measured on
-`recovery` (2026-09-12), the unconditioned `[](DeadOwnerLock => <>(~DeadOwnerLock))` is violated in every model of
-this shape: with a fixed, finite set of actors that all finish, the last crash can always fall after the last actor
-has acted, and no action is enabled in the state that leaves. No retry and no fairness condition changes that - even
-a recoverer that retries without bound correctly exits when it sees a live owner, and the owner can die afterwards.
-The prose of this section already said "given a Recoverer or Cleanup actor"; the formula had dropped it.
+`recovery` (2026-09-12), the unconditioned `[](DeadOwnerLock => <>(~DeadOwnerLock))` is violated. The reason is not
+particular to `recovery`, so it is argued, not measured, for every other model of the same shape: with a fixed, finite
+set of actors that all finish, the last crash can always fall after the last actor has acted, and no action is enabled
+in the state that leaves. No retry and no fairness condition changes that - even a recoverer that retries without
+bound correctly exits when it sees a live owner, and the owner can die afterwards. The prose of this section already
+said "given a Recoverer or Cleanup actor"; the formula had dropped it.
+
+The conditions also bound what a passing run shows, and the bound is worth stating. `PendingMover` requires an actor
+that has not started, so the property says nothing about a lock that dies while every Recoverer and Cleanup is already
+under way - one whose owner crashes after the last of them has begun classifying. Whether those in-flight actors still
+clear it is left to the `check` runs' invariants and to coverage, neither of which proves it. A later liveness property
+over actors already in flight would have to condition on where each one is, and is not attempted here.
 
 These are linear-time properties TLC can check. The stronger "from every state some action clears it" is branching
 time and is not claimed.
@@ -618,8 +632,10 @@ checked with the liveness settings: TLC checks the scenario's temporal propertie
 without symmetry. Every later fix that the model drives adds a row here.
 
 `SEED_CLEANUP_LOCK_UNVERIFIABLE` and `SEED_TORN_AS_FOREIGN` mean something only against the conditioned liveness
-properties of Section 7. Their unconditioned forms are violated in every model of this shape with or without a seed,
-so a seeded run against them would stop with the named violation and pass while proving nothing about the seed - and
+properties of Section 7. Their unconditioned forms are violated with or without a seed - measured for
+`DeadLockEventuallyCleared` on `recovery`, and argued for these two seeds' own scenarios, which are not built, from the
+same last-crash reason - so a seeded run against them would stop with the named violation and pass while proving
+nothing about the seed - and
 Section 4 already forbids a seeded run whose scenario carries an open finding on the same property, which an
 unconditioned property would always be. Each of these seeded runs is therefore judged against a scenario whose own
 liveness run passes the conditioned property first.
@@ -874,7 +890,9 @@ file and start again when it cannot; with that rule the liveness run holds (1,86
 refusal invariant was tightened: `TARGET_LOCK_BUSY` naming a dead owner because another recoverer held the lock. A
 bounded retry before judging "live" does not remove that in an untimed model - the scheduler can always run the retry
 before the other invocation moves - so it is left to the CLI as a heuristic, and spec 240.2 and 96.2 instead say what
-the refusal can honestly claim: that the lock is held, not that its recorded owner is alive.
+the refusal can honestly claim: that the lock is held, not that its recorded owner is alive. Under that meaning the
+refusal is correct rather than a misreport, so the model no longer flags it: the tightening that exposed it was
+removed, and `RefusalJustified` is now the regression guard Section 7 describes.
 
 Build order: the scenarios are built one plan at a time, not all at once, so that the first TLC runs measure real
 state-space sizes and their findings are triaged before more actors are built on the same model. Plan 2 builds
@@ -925,10 +943,12 @@ property from the one intended. Each TLC run's `timeout_minutes` is
 bounds, and the tighter bounds are written into the README, never raised silently.
 
 That per-job figure is the one number `recovery`'s pairing does not fit, and it is recorded here rather than quietly
-exceeded. Measured on 2026-09-13 in one batch with nothing else running (single samples; the machine's background load
-was not controlled): its four POSIX `check` runs take about twelve minutes with `-coverage 1` on and its four Windows
-runs about seventeen, so the eight together are about twenty-nine; every one of them now fits the ten-minute per-run
-limit, the slowest at five minutes forty. The liveness run does not: about fourteen minutes, so it exceeds the
+exceeded. Measured on 2026-09-13 in one batch during which no other work of this project ran, as single samples on a
+developer machine whose background load was not controlled - a Ghidra worker, the peer's editor and the operating
+system's own services were all running: its four POSIX `check` runs take about twelve minutes with `-coverage 1` on
+and its four Windows runs about seventeen, so the eight together are about twenty-nine. On that machine every one of
+them fits the ten-minute per-run limit, the slowest at five minutes forty; a CI runner is typically slower, so that
+margin is not a promise. The liveness run does not fit even there: about fourteen minutes, so it exceeds the
 per-run limit as well as adding to the job, and it is the run the tightening ladder above exists for. All of that is
 before the same job's `witness` runs and its seeded runs - and before the fix-flag
 runs, which are the part that compounds worst: every `check` run carrying an open finding is run a second time as
