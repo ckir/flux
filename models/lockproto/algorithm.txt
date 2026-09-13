@@ -69,8 +69,7 @@
              got := r.ok;
              \* Who held the lock when this try-lock ran: the evidence a forced "live" rests on.
              holder := fs.oslock[obj];
-             if (r.ok) { fs := r.fs; }
-             else if (LockCapability = "strong") { goto S240_1_trylock_retry; };
+             if (r.ok) { fs := r.fs; };
          };
          };
        S240_1_read:
@@ -115,20 +114,6 @@
          else {
            if (~keep \/ ~Replaceable(self)) { fs := FsClose(fs, self, obj).fs; };
            return;
-         };
-       S240_1_trylock_retry:
-         \* The first try-lock failed. Its holder may be the owner, or another invocation inspecting
-         \* or recovering the lock (240.1 step 3, 240.3 step 1), which holds it only briefly. Only a
-         \* lock still held on a second attempt is taken as the owner's (240.2). One retry stands for
-         \* the bounded retry, and other actors can act between the two attempts.
-         if (crashed[self]) { goto classify_crashed; }
-         else {
-           with (r = FsTryLock(fs, self, obj)) {
-             got := r.ok;
-             holder := fs.oslock[obj];
-             if (r.ok) { fs := r.fs; };
-           };
-           goto S240_1_read;
          };
        classify_crashed:
          return;
