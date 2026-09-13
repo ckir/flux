@@ -68,7 +68,7 @@ crates/flux-platform/tests/fs_semantics.rs    the filesystem probes (Section 10)
 
 | Field | Meaning |
 |---|---|
-| `name` | unique run name, used in CI and in the runner's report: `<scenario>-<variant>-<kind>`, plus `-<seed flag>` for a seeded run (for example `breaklock-windows-check`, `mixed-posix-seeded-SEED_TORN_AS_FOREIGN`) |
+| `name` | unique run name, used in CI and in the runner's report: `<scenario>-<variant>-<kind>`, plus `-<seed flag>` for a seeded run and `-<invariant>` for a witness run; a variant may have several hyphen-separated parts, as a recovery pairing's does (for example `breaklock-windows-check`, `recovery-posix-plain-check`, `mixed-posix-seeded-SEED_TORN_AS_FOREIGN`, `recovery-posix-witness-NeverTornRead`) |
 | `module` | `LockProtocol` or `Claims` |
 | `config` | path of the `.cfg` file |
 | `scenario` | the Section 12 scenario the run belongs to; one of the names in `expected.toml`'s top-level `scenarios` list, which is the only place scenario names are defined; CI builds its matrix from that list |
@@ -842,9 +842,9 @@ clean (2026-09-12, `MaxCrashes = 2`):
 | Run | Actors | `MaxObjs` | Distinct states, POSIX / Windows | What only this pairing reaches |
 |---|---|---|---|---|
 | `recovery-<platform>-check` | Owner, 2 Recoverers (`SYMMETRY`) | 3 | 937,335 / 1,380,999 | two recoverers racing for the same lock, which is what 240.3 step 2 is about |
-| `recovery-<platform>-check-plain` | Owner, Recoverer, PlainRun | 4 | 1,620,690 / 2,310,021 | a plain rerun (21.1) meeting a dead owner's lock a recoverer is working on |
-| `recovery-<platform>-check-cleanup` | Owner, Recoverer, Cleanup | 5 | 1,174,383 / 1,684,944 | two movers of different kinds, both entitled to move the lock aside |
-| `recovery-<platform>-check-plain-cleanup` | Owner, PlainRun, Cleanup | 6 | 1,043,058 / 1,446,348 | the plain rerun's own 240.3 path, which needs a dead cleanup lock |
+| `recovery-<platform>-plain-check` | Owner, Recoverer, PlainRun | 4 | 1,620,690 / 2,310,021 | a plain rerun (21.1) meeting a dead owner's lock a recoverer is working on |
+| `recovery-<platform>-cleanup-check` | Owner, Recoverer, Cleanup | 5 | 1,174,383 / 1,684,944 | two movers of different kinds, both entitled to move the lock aside |
+| `recovery-<platform>-plain-cleanup-check` | Owner, PlainRun, Cleanup | 6 | 1,043,058 / 1,446,348 | the plain rerun's own 240.3 path, which needs a dead cleanup lock |
 
 Counts are as measured on 2026-09-13, after the acquirer rule of spec 96.1 and 240.3 step 4 became unconditional in
 the model; each state space is about a fifth smaller than before it, because an actor that cannot take its OS-native
@@ -859,8 +859,8 @@ four.
 
 Pairing moves work onto the `unreached` lists, and those lists are per run. A label an actor of the run owns but
 this pairing cannot reach must be listed in THAT run's entry with its reason, even though another pairing covers it:
-the three plain-rerun recovery labels above are `unreached` in `recovery-posix-check-plain`, which runs a PlainRun
-and so owns them, and covered in `recovery-posix-check-plain-cleanup`. The suite-wide rule is what makes that safe -
+the three plain-rerun recovery labels above are `unreached` in `recovery-posix-plain-check`, which runs a PlainRun
+and so owns them, and covered in `recovery-posix-plain-cleanup-check`. The suite-wide rule is what makes that safe -
 it is the union across runs that may leave nothing uncovered, not any single run. A label belonging to an actor a
 pairing does not instantiate needs no entry at all: TLC reports no action for an empty process set, so those labels
 never appear in that run's report.
