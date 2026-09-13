@@ -4,9 +4,10 @@ A TLA+/PlusCal model of Flux's target-lock protocol, checked with TLC, plus Rust
 filesystem assumptions on real operating systems. Design:
 [`docs/superpowers/specs/2026-09-11-lock-protocol-model-check-design.md`](../../docs/superpowers/specs/2026-09-11-lock-protocol-model-check-design.md).
 
-The work lands in three plans. Plan 1 (this state) provides the tooling: the runner, its self-test, the drift stamp
-and traceability check, the filesystem probes, and CI. Plan 2 adds `FsModel.tla` and `LockProtocol.tla`; plan 3 adds
-`Claims.tla`.
+The work lands in several plans. Plan 1 provides the tooling: the runner, its self-test, the drift stamp and
+traceability check, the filesystem probes, and CI. Plan 2 (this state) adds `FsModel.tla`, `LockProtocol.tla`, and
+its first scenario, `recovery`, end to end. Later plans add the remaining scenarios of design Section 12, which
+`trace.toml` lists as `planned_scenarios`, and `Claims.tla`.
 
 ## Running it
 
@@ -42,6 +43,9 @@ runs write their TLC state and logs under `target/tla/`, keyed by run name.
 | `test_workflow.py` | checks the path pattern `.github/workflows/model.yml` uses to decide whether to run the scenarios |
 | `testdata/` | recorded TLC output for the unit tests; `record_fixtures.py` re-records it after the TLC pin changes |
 | `Smoke.tla` | runner self-test model (the `selftest` scenario); not part of the protocol |
+| `FsModel.tla` | the filesystem model: objects, entries, handles, OS-native locks, crashes (design Section 5) |
+| `LockProtocol.head`, `algorithm.txt`, `invariants.txt` | the sources of `LockProtocol.tla`: its header, the PlusCal algorithm, and the properties (design Sections 6.1 and 7) |
+| `LockProtocol.tla` | generated: `cat LockProtocol.head algorithm.txt invariants.txt`, then `pcal.trans`; committed so `run.py` needs no translator |
 | `spec-sections.stamp` | the spec file and the spec headings the model encodes (design Section 9) |
 | `trace.toml` | every unit of those headings, its hash, and the labels that implement it (design Section 9.1) |
 
@@ -66,6 +70,42 @@ trace for any path, re-run that configuration with the witness as an invariant a
 - A run with open findings is run a second time with the findings' fix flags set (`<run>-fixed`), and must then
   report no open finding.
 - TLC's deadlock check always stays on; a config may not set `CHECK_DEADLOCK`.
+- Coverage is read from the FINAL `-coverage` block only: TLC prints a snapshot every minute and ends a block with
+  either of two messages, so a run whose last block is unfinished is a tooling failure, never judged from an earlier
+  snapshot. A label a run's actors cannot reach is listed in that run's `unreached` with its reason, and fails the run
+  if it is covered after all.
+- A full `just model` also unions the coverage of every run. A label no run covers must be in `deferred`, naming
+  the planned scenario that will cover it (today `S96_1_backoff`, for `dirlock`, and `S240_3_putback`, for
+  `breaklock`), or in `never_reached`, if no run can ever cover it. Either list fails when its label is covered.
+
+## Bounds
+
+Each configuration's bounds, and what they still let it explore (design Section 4). The state counts are TLC's and
+do not depend on the machine; no wall-clock figure is recorded here until the controlled timing measurement.
+
+`recovery` runs one Owner, which may crash, against the actors entitled to find and replace its lock. All four actor
+kinds at once do not finish, so the check runs pair them, and each pairing is exhaustive:
+
+| Pairing | Actors | What only this pairing explores | Distinct states, POSIX / Windows |
+|---|---|---|---|
+| `recovery-<platform>-check` | Owner, 2 Recoverers, with `SYMMETRY` over the Recoverers | two recoverers racing to move the same dead lock aside (240.3 step 2) | 937,335 / 1,380,999 |
+| `recovery-<platform>-plain-check` | Owner, Recoverer, PlainRun | a plain rerun (21.1) meeting a lock a recoverer is working on | 1,620,690 / 2,310,021 |
+| `recovery-<platform>-cleanup-check` | Owner, Recoverer, Cleanup | two movers of different kinds, both entitled to move the lock aside | 1,174,383 / 1,684,944 |
+| `recovery-<platform>-plain-cleanup-check` | Owner, PlainRun, Cleanup | the plain rerun's own 240.3 path, which needs a dead cleanup lock | 1,043,058 / 1,446,348 |
+
+- `MaxCrashes = 2` in every run. With one crash, the path where a recovering actor itself crashes was unreachable,
+  so a second crash is what the crash-inside-recovery interleavings need.
+- `MaxObjs` (3 to 6, one per actor) cannot bind. Every actor makes at most one exclusive create, and
+  `fs.next <= Cardinality(Procs)` was checked over the whole state space of the tightest run.
+- `IdentityStrength = "strong"` only. Measured, the weak-identity variant explores an identical state graph here,
+  because no name in this scenario is reused.
+- `LockCapability = "strong"` only. The weak capability refuses every operation under 235.1, which `breaklock`'s
+  seeded run covers.
+- `HostCrashes = FALSE` in every run, so only process crashes are explored. This bound is not yet justified: design
+  Section 5.2 says the model explores what the next invocation finds after a host crash undoes unflushed lock-file
+  operations. It is an open question for plan 2.
+- The liveness run (`DeadLockEventuallyCleared`, Owner and 2 Recoverers, no symmetry) is not yet in
+  `expected.toml`. Its time limit and any tightening wait for the controlled timing measurement.
 
 ## Filesystem probes
 

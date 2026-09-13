@@ -4,6 +4,13 @@
 
 scenarios = ["selftest", "recovery"]
 
+# Labels no BUILT scenario covers but a planned one will (design Section 4). Each entry goes when its
+# scenario lands: the stamp test requires the scenario to be in trace.toml's planned_scenarios.
+deferred = [
+    { label = "S96_1_backoff", scenario = "dirlock", reason = "the 96.1 directory-lock conflict needs the directory lock only dirlock creates" },
+    { label = "S240_3_putback", scenario = "breaklock", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover, which only breaklock performs" },
+]
+
 # Runner self-test (Smoke.tla): exercises every way run.py judges a run. Not a protocol scenario.
 
 [[run]]
