@@ -209,6 +209,15 @@ class LoadExpectedTests(unittest.TestCase):
         cfgs = dict(CFGS, **{"seed.cfg": CFGS["seed.cfg"] + "CHECK_DEADLOCK FALSE\n"})
         self.assertRejected(GOOD_EXPECTED, "must not set CHECK_DEADLOCK", cfgs)
 
+    def test_state_space_shrinking_sections_are_rejected_in_every_kind(self) -> None:
+        # CONSTRAINT, ACTION_CONSTRAINT and VIEW all cut or merge states while every constant still matches
+        # expected.toml, so a .cfg could make a failing run pass (design Section 4: the .cfg may only agree).
+        for cfg in ("check.cfg", "live.cfg", "seed.cfg"):
+            for section in ("CONSTRAINT Safe", "CONSTRAINTS Safe", "ACTION_CONSTRAINT Safe", "VIEW x"):
+                with self.subTest(cfg=cfg, section=section):
+                    cfgs = dict(CFGS, **{cfg: CFGS[cfg] + section + "\n"})
+                    self.assertRejected(GOOD_EXPECTED, "must not shrink the state space", cfgs)
+
     def test_liveness_needs_one_property(self) -> None:
         cfgs = dict(CFGS, **{"live.cfg": "SPECIFICATION Spec\nPROPERTIES Eventually Always\n"})
         self.assertRejected(GOOD_EXPECTED, "exactly one PROPERTY", cfgs)

@@ -720,6 +720,11 @@ def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
     text = cfg_path.read_text(encoding="utf-8")
     sections = cfg_sections(text)
     _require("CHECK_DEADLOCK" not in sections, f"{where}: the config must not set CHECK_DEADLOCK (deadlock checking stays on)")
+    # A state or action constraint, or a VIEW, cuts or merges states while every constant still agrees with
+    # expected.toml, so a .cfg could make a failing run pass through them (design Section 4).
+    for shrinking in ("CONSTRAINT", "ACTION_CONSTRAINT", "VIEW"):
+        _require(shrinking not in sections,
+                 f"{where}: the config must not shrink the state space with {shrinking}; bound the run through its constants")
     _require(kind != "check" or "PROPERTY" not in sections,
              f"{where}: a check run's config must not declare a PROPERTY (TLC reports a temporal violation "
              "without naming it)")
