@@ -118,8 +118,9 @@ change. A gate reading an unpinned TLC would be reading an unspecified format.
 A bound must also be shown not to bind before its run's coverage means anything. `FsCreate` fails both when an entry
 of the name exists and when `fs.next = MaxObjs`, so under a binding object bound a create-failure label is covered
 for the wrong reason - the gate passes on the bound rather than on the protocol. Every configuration's `MaxObjs` is
-therefore raised by one once and its state count confirmed unchanged; the four `recovery` check runs are all
-verified this way.
+therefore raised by one once and its state count confirmed unchanged. All eight `recovery` check runs were verified
+this way before the acquirer rule of spec 96.1 became part of the model; that rule was not re-measured against the
+bound, because both of its backoffs only remove a file and end the actor, so no path creates more objects than it did.
 
 That check is per bound, and clearing one bound says nothing about the others. A configuration is a box with at
 least three walls - `MaxObjs`, `MaxCrashes`, and the actor sets themselves - and a label can be pinned against any
@@ -517,7 +518,7 @@ Safety invariants, which must hold in every reachable state:
 |---|---|
 | `SingleWriter` | For a target, at most one process is inside a publishing step whose last Section 99 check passed. The one exception the spec accepts, a stalled prior owner's in-flight call issued before an operator `--break-lock` and completing after it, is permitted only in that case. |
 | `PlainNeverOwnsUncertain` | A process without `--break-lock` never removes, renames, or overwrites a lock it classified as uncertain (`classified`), and creates a lock only at an empty lock path. |
-| `RefusalJustified` | Every `TARGET_LOCK_BUSY` refusal happens while the lock path holds, or the refusing process's open handle refers to, a lock whose owner is alive or another takeover's. |
+| `RefusalJustified` | A regression guard, not a liveness check. Every `TARGET_LOCK_BUSY` refusal rests on evidence that the lock was held, that its owner was alive, or that the lock path holds a live owner's record. Since spec 240.2 was corrected, a held OS-native lock shows only that the lock is held - it cannot tell the owner from another invocation inspecting or recovering it - so this invariant cannot establish owner liveness. What it catches is a refusal with nothing behind it: a decision table that refuses `TARGET_LOCK_BUSY` for a lock it judged dead, or a publisher refusing it at the Section 99 check when the lock path is empty or foreign. |
 | `ForeignUntouched` | A `Foreign` object at a lock path is never written, renamed, or deleted. |
 | `Classifiable` | In every state, each lock path classifies into exactly one case of the Section 6.1 judgement table: empty, foreign, uncertain, cleanup lock, live, or (by the oracle) dead; a `Torn` record classifies as uncertain. |
 | `NestedExclusion` | Two operations whose destinations nest never both write objects under the inner destination. |
@@ -554,20 +555,34 @@ A fact no single label states keeps a ghost flag or a state predicate, and its s
 | `NeverTornRead` | a process read a `Torn` record |
 | `NeverRecoveredAfterCrash` | a lock a crash had left was replaced |
 | `NeverClassifiedCleanupLock` | a PlainRun or Recoverer classified a cleanup lock |
-| `NeverDeadOwnerLock` | a lock whose owner is dead sat at the lock path |
+| `NeverDeadLockWithPendingMover` | a lock whose owner is dead sat at the lock path while no further crash could occur and a Recoverer or Cleanup had yet to run |
 | `NeverUncertainOwnerLock` | a lock whose owner is uncertain sat at the lock path |
 | `NeverLockLostMidCommit` (Claims) | `LockLost` fell between a PREPARE_COMMIT and its rename |
 
-Each scenario lists its `witness` runs in Section 12. The last two above are the states the liveness properties are
-about, so the scenario that checks such a property always has the matching `witness` run: that is what keeps a liveness
-run from passing over a state space that never reaches its antecedent.
+Each scenario lists its `witness` runs in Section 12. `NeverDeadLockWithPendingMover` and `NeverUncertainOwnerLock` are
+the antecedents of the two liveness properties below, so a scenario that checks such a property always has the matching
+`witness` run: that is what keeps a liveness run from passing over a state space that never reaches its antecedent.
 
-Liveness, checked in `liveness` runs under weak fairness for every process that has not crashed:
+Liveness, checked in `liveness` runs under weak fairness. PlusCal's `--fair algorithm` generates `WF_vars(Next)`, which
+is fairness over the whole next-state relation rather than per process; it is enough here only because no process
+loops, so none can be starved forever. Fairness constrains infinite behaviours only, and does not change any `check`
+run's reachable states (measured: identical counts before and after it was added).
 
-- `DeadLockEventuallyCleared`: `[](DeadOwnerLockAt(t) => <>(~DeadOwnerLockAt(t)))`. A lock whose owner is dead is
-  eventually removed or replaced, given a Recoverer or Cleanup actor.
-- `UncertainLockEventuallyCleared`: the same for an uncertain owner's lock, given a Breaker or CleanupBreaker actor
-  (only an operator action clears it, Section 240.4).
+- `DeadLockEventuallyCleared`:
+  `[](DeadOwnerLock /\ EnvQuiet /\ PendingMover => <>(~DeadOwnerLock \/ UncertainReported))`. A lock whose owner is
+  dead is eventually removed or replaced, or an actor reports it cannot establish that the owner is dead - which
+  Section 240.4 preserves rather than clears - provided no further crash can occur (`EnvQuiet`) and a Recoverer or
+  Cleanup has yet to run (`PendingMover`).
+- `UncertainLockEventuallyCleared`: the same for an uncertain owner's lock, conditioned the same way on a Breaker or
+  CleanupBreaker that has yet to run (only an operator action clears it, Section 240.4). Not yet measured: its
+  scenarios are not built, and its witness above has to be narrowed to that antecedent when they are.
+
+The two conditions are what make the property checkable at all, not a weakening chosen for convenience. Measured on
+`recovery` (2026-09-12), the unconditioned `[](DeadOwnerLock => <>(~DeadOwnerLock))` is violated in every model of
+this shape: with a fixed, finite set of actors that all finish, the last crash can always fall after the last actor
+has acted, and no action is enabled in the state that leaves. No retry and no fairness condition changes that - even
+a recoverer that retries without bound correctly exits when it sees a live owner, and the owner can die afterwards.
+The prose of this section already said "given a Recoverer or Cleanup actor"; the formula had dropped it.
 
 These are linear-time properties TLC can check. The stronger "from every state some action clears it" is branching
 time and is not claimed.
@@ -601,6 +616,13 @@ ability to see that defect and the run fails.
 A seeded run whose "must fail" entry is a liveness property is still a `seeded` run (its `violated` names the property),
 checked with the liveness settings: TLC checks the scenario's temporal properties, run
 without symmetry. Every later fix that the model drives adds a row here.
+
+`SEED_CLEANUP_LOCK_UNVERIFIABLE` and `SEED_TORN_AS_FOREIGN` mean something only against the conditioned liveness
+properties of Section 7. Their unconditioned forms are violated in every model of this shape with or without a seed,
+so a seeded run against them would stop with the named violation and pass while proving nothing about the seed - and
+Section 4 already forbids a seeded run whose scenario carries an open finding on the same property, which an
+unconditioned property would always be. Each of these seeded runs is therefore judged against a scenario whose own
+liveness run passes the conditioned property first.
 
 ## 9. Spec-drift stamp
 
@@ -783,11 +805,11 @@ protocol model exists, and stays as the runner's own regression check.
 
 | Scenario | Actors | Variants | Its `witness` runs (Section 7); every other path is proved by label coverage |
 |---|---|---|---|
-| `recovery` | Owner (crashes), 2 Recoverers, PlainRun, Cleanup - **paired across four `check` runs, never all at once** (below) | POSIX, Windows | `NeverTornRead`, `NeverRecoveredAfterCrash`, `NeverDeadOwnerLock` |
+| `recovery` | Owner (crashes), 2 Recoverers, PlainRun, Cleanup - **paired across four `check` runs, never all at once** (below) | POSIX, Windows | `NeverTornRead`, `NeverRecoveredAfterCrash`, `NeverDeadLockWithPendingMover` |
 | `breaklock` | StalledOwner, 2 Breakers, PlainRun | POSIX, Windows; POSIX weak-capability (seeded run only: with `LockCapability = weak` every actor refuses under 235.1, so no path of the scenario is reached there) | `NeverTornRead`, `NeverUncertainOwnerLock` |
 | `mixed` | Owner (crashes; its lock is dead), Breaker (may see it uncertain), Recoverer (may see it dead), PlainRun | POSIX, Windows, POSIX weak-identity | `NeverRecoveredAfterCrash`, `NeverUncertainOwnerLock`; in the weak-identity variant the Breaker refuses at 240.5 step 1, so its labels are listed `unreached` there (Section 4) |
 | `cleanup` | StalledOwner, CleanupBreaker, Breaker | POSIX, Windows | `NeverUncertainOwnerLock` |
-| `cleanup-crash` | CleanupBreaker (crashes), PlainRun, Recoverer, Cleanup | POSIX, Windows | `NeverClassifiedCleanupLock`, `NeverDeadOwnerLock` |
+| `cleanup-crash` | CleanupBreaker (crashes), PlainRun, Recoverer, Cleanup | POSIX, Windows | `NeverClassifiedCleanupLock`, `NeverDeadLockWithPendingMover` |
 | `nested` | Owner on the parent destination, NestedOwner on the child, PlainRun | POSIX | none: every path of this scenario is a label |
 | `dirlock` | an Owner with a per-name lock in directory `P` (may crash), DirOwner on `P` (may crash), Recoverer, Breaker; one per-name Owner suffices for every `dirlock` path and seed, and keeps the state space within budget | POSIX, Windows | `NeverRecoveredAfterCrash` |
 | `claims` | Claims model, 2 workers, `LockLost` at most once, one crash and resume; one configuration per target group (Section 6.2) | POSIX with case folding (as APFS by default), Windows | `NeverLockLostMidCommit` |
@@ -801,12 +823,16 @@ about twenty-one minutes with 1,866,860 still queued and growing, against a ten-
 do finish, so each POSIX `check` run of the scenario takes one pairing, and all four are measured to exhaustion and
 clean (2026-09-12, `MaxCrashes = 2`):
 
-| Run | Actors | `MaxObjs` | Distinct states | What only this pairing reaches |
+| Run | Actors | `MaxObjs` | Distinct states, POSIX / Windows | What only this pairing reaches |
 |---|---|---|---|---|
-| `recovery-posix-check` | Owner, 2 Recoverers (`SYMMETRY`) | 3 | 1,224,261 | two recoverers racing for the same lock, which is what 240.3 step 2 is about |
-| `recovery-posix-check-plain` | Owner, Recoverer, PlainRun | 4 | 2,174,196 | a plain rerun (21.1) meeting a dead owner's lock a recoverer is working on |
-| `recovery-posix-check-cleanup` | Owner, Recoverer, Cleanup | 5 | 1,604,109 | two movers of different kinds, both entitled to move the lock aside |
-| `recovery-posix-check-plain-cleanup` | Owner, PlainRun, Cleanup | 6 | 1,453,842 | the plain rerun's own 240.3 path, which needs a dead cleanup lock |
+| `recovery-<platform>-check` | Owner, 2 Recoverers (`SYMMETRY`) | 3 | 937,335 / 1,380,999 | two recoverers racing for the same lock, which is what 240.3 step 2 is about |
+| `recovery-<platform>-check-plain` | Owner, Recoverer, PlainRun | 4 | 1,620,690 / 2,310,021 | a plain rerun (21.1) meeting a dead owner's lock a recoverer is working on |
+| `recovery-<platform>-check-cleanup` | Owner, Recoverer, Cleanup | 5 | 1,174,383 / 1,684,944 | two movers of different kinds, both entitled to move the lock aside |
+| `recovery-<platform>-check-plain-cleanup` | Owner, PlainRun, Cleanup | 6 | 1,043,058 / 1,446,348 | the plain rerun's own 240.3 path, which needs a dead cleanup lock |
+
+Counts are as measured on 2026-09-13, after the acquirer rule of spec 96.1 and 240.3 step 4 became unconditional in
+the model; each state space is about a fifth smaller than before it, because an actor that cannot take its OS-native
+lock now removes its file and stops instead of carrying on.
 
 The fourth run carries no Recoverer deliberately. `plain_recover`, `plain_recovered` and `plain_recovered_done` are
 reached only by a plain rerun that finds a dead CLEANUP lock, which only a Cleanup that created one and then crashed
@@ -833,10 +859,22 @@ identity query is on `BrokenOf(self)`, a name each recoverer renames into exactl
 second id for it and `FsIdentityChoices` returns a singleton either way. A scenario that reuses a name is what
 exercises weak identity.
 
-Liveness runs: `DeadLockEventuallyCleared` in `recovery` and `cleanup-crash`, whose `NeverDeadOwnerLock` witness run
-shows the state it is about occurs; `UncertainLockEventuallyCleared` in `breaklock`, `cleanup`, and `mixed` (so that
-`SEED_TORN_AS_FOREIGN` is judged against a passing run of the same scenario), with `NeverUncertainOwnerLock`; POSIX
-variant only, without symmetry.
+Liveness runs: `DeadLockEventuallyCleared` in `recovery` and `cleanup-crash`, whose `NeverDeadLockWithPendingMover`
+witness run shows the state it is about occurs; `UncertainLockEventuallyCleared` in `breaklock`, `cleanup`, and `mixed`
+(so that `SEED_TORN_AS_FOREIGN` is judged against a passing run of the same scenario), with `NeverUncertainOwnerLock`;
+POSIX variant only, without symmetry.
+
+What `recovery` found, and what changed because of it. Its liveness run, once the property was conditioned, was
+violated over the complete state space: an acquirer could lose the race for its own freshly created lock file to an
+invocation inspecting it, write its record holding nothing, and a later classifier would read the other invocation's
+OS-native lock as a live owner, so two recoverers each refused a dead owner's lock and it was never cleared. Spec
+96.1 and 240.3 step 4 now require an acquirer to hold its OS-native lock before writing its record, and to remove its
+file and start again when it cannot; with that rule the liveness run holds (1,869,534 distinct states) and every
+`check` run passes on both platforms. The same root cause also produced a misreport the model then saw once its
+refusal invariant was tightened: `TARGET_LOCK_BUSY` naming a dead owner because another recoverer held the lock. A
+bounded retry before judging "live" does not remove that in an untimed model - the scheduler can always run the retry
+before the other invocation moves - so it is left to the CLI as a heuristic, and spec 240.2 and 96.2 instead say what
+the refusal can honestly claim: that the lock is held, not that its recorded owner is alive.
 
 Build order: the scenarios are built one plan at a time, not all at once, so that the first TLC runs measure real
 state-space sizes and their findings are triaged before more actors are built on the same model. Plan 2 builds
@@ -887,8 +925,12 @@ property from the one intended. Each TLC run's `timeout_minutes` is
 bounds, and the tighter bounds are written into the README, never raised silently.
 
 That per-job figure is the one number `recovery`'s pairing does not fit, and it is recorded here rather than quietly
-exceeded. Its four POSIX `check` runs alone measure about eighteen minutes with `-coverage 1` on, before the same
-job's four Windows pairings, its liveness run, its three `witness` runs and its seeded runs - and before the fix-flag
+exceeded. Measured on 2026-09-13 in one batch with nothing else running (single samples; the machine's background load
+was not controlled): its four POSIX `check` runs take about twelve minutes with `-coverage 1` on and its four Windows
+runs about seventeen, so the eight together are about twenty-nine; every one of them now fits the ten-minute per-run
+limit, the slowest at five minutes forty. The liveness run does not: about fourteen minutes, so it exceeds the
+per-run limit as well as adding to the job, and it is the run the tightening ladder above exists for. All of that is
+before the same job's `witness` runs and its seeded runs - and before the fix-flag
 runs, which are the part that compounds worst: every `check` run carrying an open finding is run a second time as
 `<name>-fixed`, so one open finding in `recovery` turns four POSIX check runs into eight. The levers, none of them
 yet chosen: raise the per-job figure for a scenario whose actors are paired; run the pairings only on POSIX and keep
