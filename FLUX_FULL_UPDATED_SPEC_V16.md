@@ -4690,6 +4690,19 @@ may be held on the lock file to prove the owner is alive (Sections 240,
 anything other than the filesystem's own resolution of `<name>` loses the
 name equivalence.
 
+Where the destination provides OS-native locks (Section 235.1), the
+acquirer holds that lock before it writes its record. It takes the lock
+as part of the exclusive creation where the platform can do both in one
+call (for example `O_EXLOCK` with `O_CREAT | O_EXCL`), and otherwise
+immediately after it. In between, another invocation can open the new
+file and take its lock, because inspecting a lock (Section 240.1 step 3)
+and recovering one (Section 240.3 step 1) both try to take it. If the
+acquirer cannot take the lock, it removes the lock file it created and
+starts the acquisition again (Section 21.1 step 1); it never writes a
+record while another process holds the lock. A record written without the
+lock proves nothing about its owner, and Section 240.2 would read
+whichever process does hold the lock as that owner.
+
 If `<name>.flux-lock` would exceed the directory's name-length limit, the
 operation takes the directory lock instead, which covers every target in
 `P`:
@@ -10566,10 +10579,12 @@ Recovery, and cleanup, replace a dead owner's lock by moving it aside:
    240.5), so identity alone is not enough. If either check fails, rename
    the file back without replacing (Section 241.5) and start the
    acquisition again.
-4. Create its own lock exclusively (Section 96.1). If that fails, another
-   operation created the lock in the gap and owns the target: delete the
-   moved file (its owner is dead) and classify what is at the lock path as
-   Section 96.1 does.
+4. Create its own lock exclusively and take its OS-native lock (Section
+   96.1). If the creation fails, another operation created the lock in the
+   gap and owns the target: delete the moved file (its owner is dead) and
+   classify what is at the lock path as Section 96.1 does. If the creation
+   succeeds but the OS-native lock cannot be taken, remove the lock file it
+   created, delete the moved file, and start the acquisition again.
 5. Delete the moved file.
 
 The lock path is empty between steps 2 and 4. That is harmless because
