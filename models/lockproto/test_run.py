@@ -1301,6 +1301,18 @@ class LabelUniverseTests(unittest.TestCase):
         self.assertFalse(universe.is_exempt("shared_step", {"SetA": frozenset(), "SetB": frozenset({"x"})}))
         self.assertFalse(universe.is_exempt("shared_step", {"SetA": frozenset({"x"}), "SetB": frozenset()}))
 
+    def test_procedure_no_process_calls_is_gated_not_exempt(self) -> None:
+        # A procedure nothing calls has no owner. "Every caller's set is empty" holds vacuously, but
+        # design Section 4 says attributing such labels to nobody is the case the exemption must get
+        # right: dead labels must fail the per-run gate, not pass it silently.
+        universe = run.module_labels(MIXED_CALLERS_MODULE.replace(
+            "  process (p1 \\in SetA)", "  procedure Orphan()\n  {\n    orphan_step:\n      return;\n  }\n\n"
+            "  process (p1 \\in SetA)"))
+        self.assertIn("orphan_step", universe.labels)
+        self.assertEqual(universe.owners.get("orphan_step", frozenset()), frozenset())
+        self.assertFalse(universe.is_exempt("orphan_step", {"SetA": frozenset(), "SetB": frozenset()}))
+        self.assertFalse(universe.is_exempt("orphan_step", {"SetA": frozenset({"x"}), "SetB": frozenset()}))
+
     def test_non_pluscal_universe_is_the_top_level_operators(self) -> None:
         universe = run.module_labels((HERE / "Smoke.tla").read_text(encoding="utf-8"))
         self.assertFalse(universe.pluscal)

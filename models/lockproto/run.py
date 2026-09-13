@@ -503,7 +503,8 @@ class LabelUniverse:
     `owners[label]` is the set of process-block ids (a process's bound name, e.g. "own", "env")
     that own `label`, directly or by calling (transitively, through `procedure`s) the block it is
     in; a label absent from `owners` (or mapped to an empty set) is inside a procedure no process
-    reaches, which is vacuously exempt. `blocks[block_id]` is that process block's `\\in` set
+    reaches, which is never exempt, so a dead procedure fails the per-run gate instead of passing it
+    vacuously (design Section 4). `blocks[block_id]` is that process block's `\\in` set
     constant name, or None if it is declared `= VALUE` (always instantiated, so any label it owns is
     never exempt). Both dicts are empty, and nothing is ever exempt, for a non-PlusCal module."""
     pluscal: bool
@@ -514,7 +515,10 @@ class LabelUniverse:
     def is_exempt(self, label: str, constants: dict[str, object]) -> bool:
         if not self.pluscal:
             return False
-        for block in self.owners.get(label, frozenset()):
+        owners = self.owners.get(label, frozenset())
+        if not owners:  # a procedure no process calls: dead code the gate must catch, never exempt
+            return False
+        for block in owners:
             setname = self.blocks.get(block)
             if setname is None:  # a `= VALUE` process: always instantiated, never exempt
                 return False
