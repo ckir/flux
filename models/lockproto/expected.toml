@@ -2,7 +2,7 @@
 # Format: design Section 4 (docs/superpowers/specs/2026-09-11-lock-protocol-model-check-design.md).
 # `scenarios` is the only place scenario names are defined; CI builds its matrix from it.
 
-scenarios = ["selftest"]
+scenarios = ["selftest", "recovery"]
 
 # Runner self-test (Smoke.tla): exercises every way run.py judges a run. Not a protocol scenario.
 
@@ -52,3 +52,185 @@ kind = "seeded"
 violated = ["WithinBound"]
 constants = { SEED_OVERSHOOT = true }
 timeout_minutes = 2
+
+# Recovery scenario (design Section 12): four actor pairings per platform, never all at once, each
+# exhaustive; then the three witnesses on each platform's main pairing. timeout_minutes is provisional
+# until the controlled timing measurement.
+
+[[run]]
+name = "recovery-posix-check"
+module = "LockProtocol"
+config = "configs/recovery-posix-check.cfg"
+scenario = "recovery"
+kind = "check"
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong" }
+symmetry = { definition = "RecovererPerms", over = "Recoverers" }
+unreached = [
+    { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
+    { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record; breaklock reaches it" },
+]
+timeout_minutes = 30
+
+[[run]]
+name = "recovery-posix-plain-check"
+module = "LockProtocol"
+config = "configs/recovery-posix-plain-check.cfg"
+scenario = "recovery"
+kind = "check"
+constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = ["p1"], Cleanups = [], MaxObjs = 4, MaxCrashes = 2, HostCrashes = false, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong" }
+unreached = [
+    { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
+    { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record; breaklock reaches it" },
+    { label = "plain_recover", reason = "reached only by a plain rerun that finds a dead CLEANUP lock, which needs a Cleanup actor; recovery-<platform>-plain-cleanup-check reaches it" },
+    { label = "plain_recovered", reason = "reached only by a plain rerun that finds a dead CLEANUP lock, which needs a Cleanup actor; recovery-<platform>-plain-cleanup-check reaches it" },
+    { label = "plain_recovered_done", reason = "reached only by a plain rerun that finds a dead CLEANUP lock, which needs a Cleanup actor; recovery-<platform>-plain-cleanup-check reaches it" },
+]
+timeout_minutes = 30
+
+[[run]]
+name = "recovery-posix-cleanup-check"
+module = "LockProtocol"
+config = "configs/recovery-posix-cleanup-check.cfg"
+scenario = "recovery"
+kind = "check"
+constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = [], Cleanups = ["c1"], MaxObjs = 5, MaxCrashes = 2, HostCrashes = false, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong" }
+unreached = [
+    { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
+    { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record; breaklock reaches it" },
+]
+timeout_minutes = 30
+
+[[run]]
+name = "recovery-posix-plain-cleanup-check"
+module = "LockProtocol"
+config = "configs/recovery-posix-plain-cleanup-check.cfg"
+scenario = "recovery"
+kind = "check"
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = ["p1"], Cleanups = ["c1"], MaxObjs = 6, MaxCrashes = 2, HostCrashes = false, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong" }
+unreached = [
+    { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
+    { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record; breaklock reaches it" },
+]
+timeout_minutes = 30
+
+[[run]]
+name = "recovery-posix-witness-NeverTornRead"
+module = "LockProtocol"
+config = "configs/recovery-posix-witness-NeverTornRead.cfg"
+scenario = "recovery"
+kind = "witness"
+violated = ["NeverTornRead"]
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong" }
+symmetry = { definition = "RecovererPerms", over = "Recoverers" }
+timeout_minutes = 30
+
+[[run]]
+name = "recovery-posix-witness-NeverRecoveredAfterCrash"
+module = "LockProtocol"
+config = "configs/recovery-posix-witness-NeverRecoveredAfterCrash.cfg"
+scenario = "recovery"
+kind = "witness"
+violated = ["NeverRecoveredAfterCrash"]
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong" }
+symmetry = { definition = "RecovererPerms", over = "Recoverers" }
+timeout_minutes = 30
+
+[[run]]
+name = "recovery-posix-witness-NeverDeadLockWithPendingMover"
+module = "LockProtocol"
+config = "configs/recovery-posix-witness-NeverDeadLockWithPendingMover.cfg"
+scenario = "recovery"
+kind = "witness"
+violated = ["NeverDeadLockWithPendingMover"]
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong" }
+symmetry = { definition = "RecovererPerms", over = "Recoverers" }
+timeout_minutes = 30
+
+[[run]]
+name = "recovery-windows-check"
+module = "LockProtocol"
+config = "configs/recovery-windows-check.cfg"
+scenario = "recovery"
+kind = "check"
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong" }
+symmetry = { definition = "RecovererPerms", over = "Recoverers" }
+unreached = [
+    { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
+    { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record; breaklock reaches it" },
+]
+timeout_minutes = 30
+
+[[run]]
+name = "recovery-windows-plain-check"
+module = "LockProtocol"
+config = "configs/recovery-windows-plain-check.cfg"
+scenario = "recovery"
+kind = "check"
+constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = ["p1"], Cleanups = [], MaxObjs = 4, MaxCrashes = 2, HostCrashes = false, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong" }
+unreached = [
+    { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
+    { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record; breaklock reaches it" },
+    { label = "plain_recover", reason = "reached only by a plain rerun that finds a dead CLEANUP lock, which needs a Cleanup actor; recovery-<platform>-plain-cleanup-check reaches it" },
+    { label = "plain_recovered", reason = "reached only by a plain rerun that finds a dead CLEANUP lock, which needs a Cleanup actor; recovery-<platform>-plain-cleanup-check reaches it" },
+    { label = "plain_recovered_done", reason = "reached only by a plain rerun that finds a dead CLEANUP lock, which needs a Cleanup actor; recovery-<platform>-plain-cleanup-check reaches it" },
+]
+timeout_minutes = 30
+
+[[run]]
+name = "recovery-windows-cleanup-check"
+module = "LockProtocol"
+config = "configs/recovery-windows-cleanup-check.cfg"
+scenario = "recovery"
+kind = "check"
+constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = [], Cleanups = ["c1"], MaxObjs = 5, MaxCrashes = 2, HostCrashes = false, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong" }
+unreached = [
+    { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
+    { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record; breaklock reaches it" },
+]
+timeout_minutes = 30
+
+[[run]]
+name = "recovery-windows-plain-cleanup-check"
+module = "LockProtocol"
+config = "configs/recovery-windows-plain-cleanup-check.cfg"
+scenario = "recovery"
+kind = "check"
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = ["p1"], Cleanups = ["c1"], MaxObjs = 6, MaxCrashes = 2, HostCrashes = false, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong" }
+unreached = [
+    { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
+    { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record; breaklock reaches it" },
+]
+timeout_minutes = 30
+
+[[run]]
+name = "recovery-windows-witness-NeverTornRead"
+module = "LockProtocol"
+config = "configs/recovery-windows-witness-NeverTornRead.cfg"
+scenario = "recovery"
+kind = "witness"
+violated = ["NeverTornRead"]
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong" }
+symmetry = { definition = "RecovererPerms", over = "Recoverers" }
+timeout_minutes = 30
+
+[[run]]
+name = "recovery-windows-witness-NeverRecoveredAfterCrash"
+module = "LockProtocol"
+config = "configs/recovery-windows-witness-NeverRecoveredAfterCrash.cfg"
+scenario = "recovery"
+kind = "witness"
+violated = ["NeverRecoveredAfterCrash"]
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong" }
+symmetry = { definition = "RecovererPerms", over = "Recoverers" }
+timeout_minutes = 30
+
+[[run]]
+name = "recovery-windows-witness-NeverDeadLockWithPendingMover"
+module = "LockProtocol"
+config = "configs/recovery-windows-witness-NeverDeadLockWithPendingMover.cfg"
+scenario = "recovery"
+kind = "witness"
+violated = ["NeverDeadLockWithPendingMover"]
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong" }
+symmetry = { definition = "RecovererPerms", over = "Recoverers" }
+timeout_minutes = 30
