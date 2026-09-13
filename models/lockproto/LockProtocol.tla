@@ -1690,8 +1690,30 @@ NeverTornLock == ~TornLock
 \* Temporal properties (design Section 7). A configuration that checks one lists exactly one
 \* PROPERTY, because TLC reports a temporal violation without naming the property it belongs to.
 
-\* A lock left behind by an owner that died does not stay there: some later invocation clears it
-\* (240.3, 251.1). This is what the `recovery` scenario's liveness run checks, and the state it is
-\* about is shown to occur by the `NeverDeadOwnerLock` witness run.
-DeadLockEventuallyCleared == [](DeadOwnerLock => <>(~DeadOwnerLock))
+\* No further crash can happen: the environment has stopped, or has spent every crash it has.
+EnvQuiet == pc["env"] \in {"env_done", "Done"} \/ crashes = MaxCrashes
+
+\* Some actor entitled to replace a dead lock (240.3, 251.1) has not started yet and has not been
+\* killed, so it will still classify what is at the lock path. A PlainRun is not one: a plain rerun
+\* refuses a dead operation's lock with RESUMABLE_OPERATION_EXISTS (21.1).
+PendingMover == \E p \in Recoverers \cup Cleanups :
+                    /\ ~crashed[p]
+                    /\ pc[p] \in {"rec_start", "clean_start"}
+
+\* An actor reported that it could not establish the owner was dead. 240.4 preserves such a lock, so
+\* leaving it in place is the protocol working, not failing.
+UncertainReported == \E p \in Recoverers \cup Cleanups : refused[p] = "TARGET_LOCK_UNCERTAIN"
+
+\* A lock left behind by an owner that died does not stay there, PROVIDED someone is left to act on it
+\* and nothing more can go wrong: while no further crash can occur and an entitled actor has yet to
+\* run, the lock is eventually replaced or removed, or an actor reports it cannot tell the owner is
+\* dead (design Section 7, lines 565-568). Without those conditions the property is false in every
+\* model whose actors all finish, because the last crash can always fall after the last actor has
+\* acted: measured, and that counterexample is why they are here.
+DeadLockEventuallyCleared ==
+    [](DeadOwnerLock /\ EnvQuiet /\ PendingMover => <>(~DeadOwnerLock \/ UncertainReported))
+
+\* The witness for that property's antecedent. Its run must stop with this violated, which is what
+\* stops the liveness run from passing over a state space that never reaches the case it is about.
+NeverDeadLockWithPendingMover == ~(DeadOwnerLock /\ EnvQuiet /\ PendingMover)
 ====
