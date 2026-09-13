@@ -69,11 +69,11 @@ crates/flux-platform/tests/fs_semantics.rs    the filesystem probes (Section 10)
 | Field | Meaning |
 |---|---|
 | `name` | unique run name, used in CI and in the runner's report: `<scenario>-<variant>-<kind>`, plus `-<seed flag>` for a seeded run and `-<invariant>` for a witness run; a variant may have several hyphen-separated parts, as a recovery pairing's does (for example `breaklock-windows-check`, `recovery-posix-plain-check`, `mixed-posix-seeded-SEED_TORN_AS_FOREIGN`, `recovery-posix-witness-NeverTornRead`) |
-| `module` | `LockProtocol` or `Claims` |
+| `module` | `LockProtocol` or `Claims`, or `Smoke` for the runner's own `selftest` scenario; a module named here must exist beside `expected.toml` |
 | `config` | path of the `.cfg` file |
 | `scenario` | the Section 12 scenario the run belongs to; one of the names in `expected.toml`'s top-level `scenarios` list, which is the only place scenario names are defined; CI builds its matrix from that list |
 | `kind` | `check`, `liveness`, `witness`, or `seeded` |
-| `violated` | for `seeded` and `witness`: the one invariant or property that must be the first violation; absent for `check` and `liveness` |
+| `violated` | for `seeded` and `witness`: a list of exactly one name, the invariant or property that must be the first violation; absent for `check` and `liveness` |
 | `open_findings` | optional, for `check` and `liveness`: safety invariants or properties that currently fail because of a spec defect not yet fixed, each as `{ name, tracking, fix_flag }`: `tracking` names its `TODO.md` or `.clavity/local-anomalies.md` entry, and `fix_flag` names a model flag that applies the proposed spec fix |
 | `unreached` | optional, for `check` and `liveness`: labels of the run's own actors that this run cannot reach, each as `{ label, reason }` (the coverage check below) |
 | `timeout_minutes` | the run's time limit |
