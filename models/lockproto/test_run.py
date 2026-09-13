@@ -302,6 +302,65 @@ class LoadExpectedTests(unittest.TestCase):
                             "unknown keys")
 
 
+class DeferredLoadTests(unittest.TestCase):
+    """Load-time validation of the top-level 'deferred' list (design Section 4)."""
+
+    MODULE_WITH_S99_1 = "---- MODULE M ----\nS99_1 == TRUE\n====\n"
+
+    def load(self, expected: str, module_text: str | None = None) -> run.Expected:
+        d = ExpectedDir(expected, module_text=module_text)
+        self.addCleanup(d.close)
+        return d.load()
+
+    def assertRejected(self, expected: str, fragment: str, module_text: str | None = None) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            self.load(expected, module_text)
+        self.assertIn(fragment, str(ctx.exception))
+
+    def test_deferred_well_formed_is_parsed(self) -> None:
+        expected = self.load(
+            GOOD_EXPECTED + '\n[[deferred]]\nlabel = "S99_1"\nscenario = "future"\nreason = "not built yet"\n',
+            module_text=self.MODULE_WITH_S99_1)
+        self.assertEqual(expected.deferred, (("S99_1", "future", "not built yet"),))
+
+    def test_duplicate_deferred_label_is_rejected(self) -> None:
+        self.assertRejected(
+            GOOD_EXPECTED + '\n[[deferred]]\nlabel = "S99_1"\nscenario = "future"\nreason = "a"\n'
+                            '\n[[deferred]]\nlabel = "S99_1"\nscenario = "later"\nreason = "b"\n',
+            "has duplicate labels", module_text=self.MODULE_WITH_S99_1)
+
+    def test_deferred_label_also_in_never_reached_is_rejected(self) -> None:
+        self.assertRejected(
+            GOOD_EXPECTED + '\n[[never_reached]]\nlabel = "S99_1"\nreason = "x"\n'
+                            '\n[[deferred]]\nlabel = "S99_1"\nscenario = "future"\nreason = "y"\n',
+            "is also in 'never_reached'", module_text=self.MODULE_WITH_S99_1)
+
+    def test_unknown_deferred_label_is_rejected(self) -> None:
+        self.assertRejected(
+            GOOD_EXPECTED + '\n[[deferred]]\nlabel = "NoSuchLabel"\nscenario = "future"\nreason = "x"\n',
+            "is not in the label universe of any run's module")
+
+    def test_deferred_scenario_already_built_is_rejected(self) -> None:
+        self.assertRejected(
+            GOOD_EXPECTED + '\n[[deferred]]\nlabel = "S99_1"\nscenario = "demo"\nreason = "x"\n',
+            "is in 'scenarios'", module_text=self.MODULE_WITH_S99_1)
+
+    def test_deferred_empty_reason_is_rejected(self) -> None:
+        self.assertRejected(
+            GOOD_EXPECTED + '\n[[deferred]]\nlabel = "S99_1"\nscenario = "future"\nreason = ""\n',
+            "reason must be a non-empty string", module_text=self.MODULE_WITH_S99_1)
+
+    def test_deferred_missing_reason_is_rejected(self) -> None:
+        self.assertRejected(
+            GOOD_EXPECTED + '\n[[deferred]]\nlabel = "S99_1"\nscenario = "future"\n',
+            "exactly 'label', 'scenario', 'reason'", module_text=self.MODULE_WITH_S99_1)
+
+    def test_deferred_unknown_key_is_rejected(self) -> None:
+        self.assertRejected(
+            GOOD_EXPECTED + '\n[[deferred]]\nlabel = "S99_1"\nscenario = "future"\nreason = "x"\nextra = "z"\n',
+            "exactly 'label', 'scenario', 'reason'", module_text=self.MODULE_WITH_S99_1)
+
+
 class ConstantsLoadTests(unittest.TestCase):
     """Load-time validation of the 'constants' table against the .cfg's CONSTANT section."""
 
@@ -965,10 +1024,15 @@ def coverage_messages(case: str) -> list[run.Message]:
 class ParseCoverageTests(unittest.TestCase):
     """parse_coverage(), against real recorded '-coverage 1' output (testdata/*.out)."""
 
-    def test_takes_the_last_complete_block(self) -> None:
+    def test_takes_the_final_block(self) -> None:
         # coverage_two_blocks.out splices the CoverageFixture recording's block in as an early
         # snapshot, ahead of the real final block from smoke_check_coverage.out (record_fixtures.py
-        # says so). Only the CoverageFixture block carries 'only_alpha_step'.
+        # says so). Only the CoverageFixture block carries 'only_alpha_step'. Renamed from
+        # test_takes_the_last_complete_block: parse_coverage() no longer searches backward for the
+        # last COMPLETE block among several - it takes ONLY the block starting at the last 2201, and
+        # fails closed (None) if that one block is not terminated. This fixture's last block is
+        # complete, so the observed result is unchanged; test_trailing_2201_without_a_terminator_
+        # returns_none below is what actually exercises the no-fallback behaviour.
         coverage = run.parse_coverage(coverage_messages("coverage_two_blocks"))
         self.assertEqual(coverage, {"Step": (4, 8), "Overshoot": (0, 0), "Finished": (0, 1)})
 
@@ -978,6 +1042,29 @@ class ParseCoverageTests(unittest.TestCase):
 
     def test_returns_none_with_no_block_at_all(self) -> None:
         self.assertIsNone(run.parse_coverage(coverage_messages("clean")))
+
+    def test_a_2777_terminated_final_block_is_returned(self) -> None:
+        # coverage_long_terminator.out (measured defect): TLC switches from 2202 to 2777 ("End of
+        # statistics (please note ...)") once a run has gone on long enough. The pre-fix parser
+        # accepted only 2202 and so returned the file's SECOND block (2201..2202), where
+        # plain_recover is 0:0; the true final block (2201..2777) has plain_recover 278:357.
+        coverage = run.parse_coverage(coverage_messages("coverage_long_terminator"))
+        assert coverage is not None
+        self.assertEqual(coverage["plain_recover"], (278, 357))
+
+    def test_trailing_2201_without_a_terminator_returns_none(self) -> None:
+        # An earlier block (2201..2202) is complete, but the last 2201 in the file has no 2202 or
+        # 2777 after it at all. The fix must fail closed here, not fall back to the earlier block.
+        text = (
+            "@!@!@STARTMSG 2201:0 @!@!@\nThe coverage statistics at now\n@!@!@ENDMSG 2201 @!@!@\n"
+            "@!@!@STARTMSG 2772:0 @!@!@\n<Step line 1, col 1 to line 1, col 4 of module M>: 2:3\n"
+            "@!@!@ENDMSG 2772 @!@!@\n"
+            "@!@!@STARTMSG 2202:0 @!@!@\nEnd of statistics.\n@!@!@ENDMSG 2202 @!@!@\n"
+            "@!@!@STARTMSG 2201:0 @!@!@\nThe coverage statistics at later\n@!@!@ENDMSG 2201 @!@!@\n"
+            "@!@!@STARTMSG 2772:0 @!@!@\n<Step line 1, col 1 to line 1, col 4 of module M>: 9:9\n"
+            "@!@!@ENDMSG 2772 @!@!@\n"
+        )
+        self.assertIsNone(run.parse_coverage(run.parse_messages(text)))
 
     def test_sums_a_repeated_name(self) -> None:
         text = (
@@ -1261,7 +1348,7 @@ class CoverageUnionTests(unittest.TestCase):
                    self.entry("x-seeded", "seeded", False, "smoke_seeded_coverage")]
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            failed = run.judge_union(executed, self.base, ())
+            failed = run.judge_union(executed, self.base, (), ())
         self.assertFalse(failed)
         self.assertIn("COVERAGE suite", out.getvalue())
 
@@ -1270,7 +1357,7 @@ class CoverageUnionTests(unittest.TestCase):
         executed = [self.entry("x-check", "check", False, "smoke_check_coverage")]
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            failed = run.judge_union(executed, self.base, ())
+            failed = run.judge_union(executed, self.base, (), ())
         self.assertTrue(failed)
         self.assertIn("Overshoot", out.getvalue())
 
@@ -1279,7 +1366,7 @@ class CoverageUnionTests(unittest.TestCase):
                    self.entry("x-seeded", "seeded", False, "smoke_seeded_coverage")]
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            failed = run.judge_union(executed, self.base, (("Overshoot", "thought unreachable"),))
+            failed = run.judge_union(executed, self.base, (("Overshoot", "thought unreachable"),), ())
         self.assertTrue(failed)
         self.assertIn("never_reached but covered", out.getvalue())
 
@@ -1288,7 +1375,7 @@ class CoverageUnionTests(unittest.TestCase):
                    self.entry("x-seeded", "seeded", False, None, status="tooling")]
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            failed = run.judge_union(executed, self.base, ())
+            failed = run.judge_union(executed, self.base, (), ())
         self.assertFalse(failed)
         self.assertIn("not judged: a run failed or timed out", out.getvalue())
 
@@ -1326,6 +1413,96 @@ timeout_minutes = 5
             code = run.main(["--expected", str(self.base / "expected.toml")])
         self.assertEqual(code, 1)
         self.assertIn("MISMATCH suite coverage", out.getvalue())
+
+
+class DeferredUnionTests(unittest.TestCase):
+    """judge_union()'s 'deferred' handling (design Section 4), against real recorded logs."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name)
+        (self.base / "Smoke.tla").write_text((HERE / "Smoke.tla").read_text(encoding="utf-8"), encoding="utf-8")
+
+    def log_for(self, case: str) -> Path:
+        log = self.base / f"{case}.log"
+        log.write_text(fixture(case)[1], encoding="utf-8")
+        return log
+
+    def entry(self, name: str, kind: str, case: str) -> tuple[run.Run, bool, run.Result]:
+        r = run.Run(name, "Smoke", "c", "x", kind, (), (), (), 2, (("SEED_OVERSHOOT", kind == "seeded"),),
+                   None, None)
+        result = run.Result(name, "ok", frozenset(), frozenset(), None, 1.0, "", (), self.log_for(case))
+        return (r, False, result)
+
+    def test_uncovered_deferred_label_passes_and_is_counted(self) -> None:
+        executed = [self.entry("x-check", "check", "smoke_check_coverage")]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            failed = run.judge_union(executed, self.base, (), (("Overshoot", "future", "not built yet"),))
+        self.assertFalse(failed)
+        self.assertIn("0 never_reached, 1 deferred", out.getvalue())
+
+    def test_covered_deferred_label_fails_the_union(self) -> None:
+        executed = [self.entry("x-check", "check", "smoke_check_coverage"),
+                   self.entry("x-seeded", "seeded", "smoke_seeded_coverage")]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            failed = run.judge_union(executed, self.base, (), (("Overshoot", "future", "not built yet"),))
+        self.assertTrue(failed)
+        self.assertIn("deferred but covered: Overshoot", out.getvalue())
+
+    def test_covered_deferred_label_exit_code_1_through_main(self) -> None:
+        toml = """
+scenarios = ["demo"]
+
+[[run]]
+name = "demo-posix-check"
+module = "Smoke"
+config = "c.cfg"
+scenario = "demo"
+kind = "check"
+constants = { SEED_OVERSHOOT = false }
+timeout_minutes = 5
+
+[[run]]
+name = "demo-posix-seeded-SEED_X"
+module = "Smoke"
+config = "seed.cfg"
+scenario = "demo"
+kind = "seeded"
+violated = ["WithinBound"]
+constants = { SEED_OVERSHOOT = true }
+timeout_minutes = 5
+
+[[deferred]]
+label = "Overshoot"
+scenario = "future"
+reason = "not built yet"
+"""
+        check_cfg_text = "SPECIFICATION Spec\nCONSTANTS\n    SEED_OVERSHOOT = FALSE\n    FIX_BOUND = FALSE\nINVARIANT WithinBound\n"
+        seed_cfg_text = "SPECIFICATION Spec\nCONSTANT SEED_OVERSHOOT = TRUE\nINVARIANT WithinBound\n"
+        (self.base / "expected.toml").write_text(toml, encoding="utf-8")
+        (self.base / "c.cfg").write_text(check_cfg_text, encoding="utf-8")
+        (self.base / "seed.cfg").write_text(seed_cfg_text, encoding="utf-8")
+        check_log = self.log_for("smoke_check_coverage")
+        seeded_log = self.log_for("smoke_seeded_coverage")
+
+        def execute(r: run.Run, _jar: Path, _base: Path, fixed: bool) -> run.Result:
+            log = check_log if r.kind == "check" else seeded_log
+            return run.Result(r.name, "ok", frozenset(), frozenset(), 10, 1.0, "", (), log)
+
+        for name in ("execute", "ensure_jar"):
+            self.addCleanup(setattr, run, name, getattr(run, name))
+        self.addCleanup(setattr, run.shutil, "which", run.shutil.which)
+        run.shutil.which = lambda _name: "java"
+        run.ensure_jar = lambda: Path("unused.jar")
+        run.execute = execute
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = run.main(["--expected", str(self.base / "expected.toml")])
+        self.assertEqual(code, 1)
+        self.assertIn("deferred but covered", out.getvalue())
 
 
 class MainUnionRoutingTests(unittest.TestCase):
