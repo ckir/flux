@@ -105,7 +105,7 @@ ordinal = 10
 quote = "neither             fail with RESUMABLE_OPERATION_EXISTS, naming the"
 hash = "155614d97e907a990cb05d7c1bcf75bdee561a4b13fc997c924b1e785d876d6c"
 labels = ["S21_1_decide", "S21_1_refused"]
-not_modelled = "the model has no --resume or --restart flag; only the plain (neither) path is modelled"
+not_modelled = "the --resume and both rows are not modelled; the neither row is the PlainRun (S21_1_decide/S21_1_refused, mapped here); the --restart row is the Recoverer, mapped at ordinals 13 to 17"
 
 [[unit]]
 heading = "## 21.1 Existing Operation State Without `--resume`"
@@ -119,14 +119,15 @@ heading = "## 21.1 Existing Operation State Without `--resume`"
 ordinal = 12
 quote = "`--restart` supersedes a prior operation in this order:"
 hash = "fcffe45a7d1f42e9ff3773b76d06110e865cb41e98831b40d9fc7a7514d95236"
-not_modelled = "describes --restart, which the model does not represent as a separate flag; step 1's lock acquisition is modelled generically under 240.3, not as this flag's own path"
+not_modelled = "explanatory text; the rule it explains is modelled in ordinals 13 to 17 (the Recoverer)"
 
 [[unit]]
 heading = "## 21.1 Existing Operation State Without `--resume`"
 ordinal = 13
 quote = "1. acquire the prior operation's lock without waiting (a dead owner's"
 hash = "10bc1c6eb532112f84694c8649abf4b01ae4c05a8e4089f21edb9b5043a3e02e"
-not_modelled = "--restart itself is not modelled; step 1's dead-owner replacement is already covered under 240.3, and its --break-lock branch is pending breaklock"
+labels = ["S240_1_open", "S240_1_trylock", "S240_1_read", "S240_1_close", "S240_3_s1", "S240_3_s2", "S240_3_s3", "S240_3_s4", "S240_3_s4_lock", "S240_3_s4_record_begin", "S240_3_s4_record_end", "S240_3_restart"]
+not_modelled = "the model refuses TARGET_LOCK_BUSY generically and does not distinguish OPERATION_LOCKED as a separate code"
 pending = ["breaklock"]
 
 [[unit]]
@@ -141,7 +142,7 @@ heading = "## 21.1 Existing Operation State Without `--resume`"
 ordinal = 15
 quote = "3. revalidate ownership and locks (Section 99)"
 hash = "2e2c0b257756369a3304969102ddaf4a3816f4706875b727f14e2f66d70e67fe"
-not_modelled = "--restart's own revalidation step; already covered generically under Section 99's own units"
+labels = ["S99_check", "S99_write", "S99_release", "S99_close"]
 
 [[unit]]
 heading = "## 21.1 Existing Operation State Without `--resume`"
@@ -155,15 +156,14 @@ heading = "## 21.1 Existing Operation State Without `--resume`"
 ordinal = 17
 quote = "5. start the new operation under"
 hash = "3095b782073bac3b3226b5cfaa0ba4e89fad2f1e775f3773927cca1d7889e0de"
-labels = ["S96_1_record_begin", "S96_1_record_end"]
-not_modelled = "--restart's rewrite-record-under-the-held-lock step; the model's record rewrite is exercised generically by acquisition, not as this flag's own path"
+labels = ["S240_3_s4_record_begin", "S240_3_s4_record_end"]
 
 [[unit]]
 heading = "## 21.1 Existing Operation State Without `--resume`"
 ordinal = 18
 quote = "Deleting before copying frees the prior partial allocation before the"
 hash = "ae0f9d86d93060f577dda47fccbe3e561d8592a813a7ce2ad8d06d4a34ad5f02"
-not_modelled = "--restart-specific rationale; the model does not represent partial allocations"
+not_modelled = "the model has no partial allocations or a durable ABANDONED marker for garbage collection to remove, and does not model Section 259.13's precedence rule; the never-overrides-live/uncertain-ownership guard is enforced by classification (240.1, 240.4) and Replaceable(), gating recovery before the Recoverer ever reaches 240.3"
 
 [[unit]]
 heading = "## 21.1 Existing Operation State Without `--resume`"
@@ -335,6 +335,21 @@ ordinal = 22
 quote = "Exclusive creation on a remote filesystem is trusted only under the lock"
 hash = "4c938d58d5793215d3ce4f490bfff768e14740f101ea2ebfd106ef40c4c7a27b"
 pending = ["breaklock"]
+
+[[unit]]
+heading = "## 96.2 Lock Refusal Reports the Holder"
+ordinal = 1
+quote = "A refusal with `TARGET_LOCK_BUSY`, `OPERATION_LOCKED`, or"
+hash = "0c5397966346bab9e3d0f7fee6be4b53f96581f412477f95d82916a4d3e08590"
+labels = ["S96_1_backoff", "S99_check", "S21_1_decide", "S251_1_classify"]
+not_modelled = "report content is not checked, only that the refusal happens (design Section 3)"
+
+[[unit]]
+heading = "## 96.2 Lock Refusal Reports the Holder"
+ordinal = 2
+quote = "------------------------------------------------------------------------"
+hash = "f985f00990171ff0b2aa0d821f0d8b318c31a218c72238c01c2306e768b8dc30"
+not_modelled = "document separator, no content"
 
 [[unit]]
 heading = "# 99. Commit-Time Lock Revalidation"
@@ -611,63 +626,63 @@ heading = "## 240.5 `--break-lock`"
 ordinal = 1
 quote = "`--break-lock` is valid with `flux copy --restart` and `flux cleanup"
 hash = "d47e0ddecc9bcc066308a74e08a6caa155397355d9cdcac06994cf067c7d46b8"
-pending = ["breaklock"]
+pending = ["breaklock", "cleanup"]
 
 [[unit]]
 heading = "## 240.5 `--break-lock`"
 ordinal = 2
 quote = "Before acting, Flux reports the recorded holder's `owner_instance_id`,"
 hash = "f22d8b340430bb74f8be8ea1ba502cac9594dab13247f5d7b2002647d3c1ed8c"
-pending = ["breaklock"]
+pending = ["breaklock", "cleanup"]
 
 [[unit]]
 heading = "## 240.5 `--break-lock`"
 ordinal = 3
 quote = "1. The destination must provide strong file identity (Section 107) and"
 hash = "c308f74a8c0205d8817f6a1f4993396f1602fd7acc22dc94ba8d2f278dcc6987"
-pending = ["breaklock"]
+pending = ["breaklock", "cleanup"]
 
 [[unit]]
 heading = "## 240.5 `--break-lock`"
 ordinal = 4
 quote = "2. Open the existing lock file for writing, without creating it."
 hash = "775b080a7d1c13db6034705bc86423c0b75895359f22c3d8ab35c6e96bac6c37"
-pending = ["breaklock"]
+pending = ["breaklock", "cleanup"]
 
 [[unit]]
 heading = "## 240.5 `--break-lock`"
 ordinal = 5
 quote = "3. Take the OS-native lock on it without waiting."
 hash = "2bd2c5a7696da8c554795161fc23488b7376cca423ec40fb7493eaf79616711e"
-pending = ["breaklock"]
+pending = ["breaklock", "cleanup"]
 
 [[unit]]
 heading = "## 240.5 `--break-lock`"
 ordinal = 6
 quote = "4. Check that the open file is still the one at the lock path"
 hash = "6ab81361b3232eb80c9a7ee1ab8101fba4fdb0a1f71b340068169f85dfb29cbb"
-pending = ["breaklock"]
+pending = ["breaklock", "cleanup"]
 
 [[unit]]
 heading = "## 240.5 `--break-lock`"
 ordinal = 7
 quote = "5. Read the record. If it names a live owner, refuse with"
 hash = "6faace063b28fb5eb49d0848d9ba04e343206ed00a267b53cb92f794918f6060"
-pending = ["breaklock"]
+pending = ["breaklock", "cleanup"]
 
 [[unit]]
 heading = "## 240.5 `--break-lock`"
 ordinal = 8
 quote = "6. Overwrite the record in place with this operation's record in one"
 hash = "f0c9e42611e7803ca44a5f1ef7476ffd9c09fbf347f8536a37592d135b039e14"
-pending = ["breaklock"]
+pending = ["breaklock", "cleanup"]
 
 [[unit]]
 heading = "## 240.5 `--break-lock`"
 ordinal = 9
 quote = "An open, read, write, or flush that fails for another reason (an I/O or"
 hash = "06d1056ee655dfb4ea0209ed822013e645d9052547e04524f380b44f324a74ae"
-pending = ["breaklock"]
+pending = ["breaklock", "cleanup"]
 
 [[unit]]
 heading = "## 240.5 `--break-lock`"
@@ -675,14 +690,14 @@ ordinal = 10
 quote = "deletes the artifacts, then deletes its lock while still holding"
 hash = "52371dded6c24af0b747547e79588aabd8a7dad6f4b49c8cb1496012b1308a54"
 labels = ["S251_1_delete", "S251_1_close"]
-pending = ["breaklock"]
+pending = ["cleanup", "cleanup-crash"]
 
 [[unit]]
 heading = "## 240.5 `--break-lock`"
 ordinal = 11
 quote = "A prior owner that was only stalled starts nothing more: its next lock"
 hash = "0d064cba024bbd4490bfe5f4009f68915a9386c3fa0add879a11aeb619ccae5d"
-pending = ["breaklock"]
+pending = ["breaklock", "cleanup"]
 
 [[unit]]
 heading = "## 240.5 `--break-lock`"
@@ -880,13 +895,7 @@ not_modelled = "container heading; its own text carries no rule beyond the 21.1 
 heading = "# 96. Destination Target Locks"
 family = "96"
 count = 1
-not_modelled = "container heading; its own text carries no rule beyond the 96.1 subsection modelled here"
-
-[[heading]]
-heading = "## 96.2 Lock Refusal Reports the Holder"
-family = "96"
-count = 1
-not_modelled = "report content is not checked, only that the refusal happens (design Section 3)"
+not_modelled = "container heading; its own text carries no rule beyond the 96.1 and 96.2 subsections modelled here"
 
 [[heading]]
 heading = "## 99.1 Weak Filesystem Identity and Target Locks"
@@ -910,7 +919,7 @@ not_modelled = "container heading; its own text carries no rule beyond the 251.1
 heading = "## 251.2 Explicit Target Cleanup"
 family = "251"
 count = 1
-pending = ["dirlock", "breaklock"]
+pending = ["cleanup", "dirlock"]
 
 [[heading]]
 heading = "## 251.3 No Filesystem-Wide Artifact Hunt"
@@ -923,6 +932,18 @@ heading = "## 251.4 Missing Catalog Entry"
 family = "251"
 count = 1
 not_modelled = "the standalone catalog record is not modelled; the model has no catalog to be missing an entry from"
+
+[[heading]]
+heading = "## 259.7 Weak Filesystem Identity"
+family = "259"
+count = 1
+pending = ["mixed"]
+
+[[heading]]
+heading = "## 259.8 Commit Recovery With Weak Identity"
+family = "259"
+count = 1
+pending = ["claims"]
 
 [[heading]]
 heading = "# 259. V15 Normative Closure Revision"
@@ -959,18 +980,6 @@ heading = "## 259.5 Concurrent Capacity Reservation"
 family = "259"
 count = 1
 not_modelled = "concurrent capacity reservation is outside the lock-protocol model's scope"
-
-[[heading]]
-heading = "## 259.7 Weak Filesystem Identity"
-family = "259"
-count = 1
-not_modelled = "general filesystem-identity-strength policy is outside the lock-protocol model's scope; the model's IdentityStrength variants are not exercised by the recovery scenario"
-
-[[heading]]
-heading = "## 259.8 Commit Recovery With Weak Identity"
-family = "259"
-count = 1
-not_modelled = "commit recovery with weak identity is COMMIT-pipeline (Sections 182, 183) territory, outside this model's scope"
 
 [[heading]]
 heading = "## 259.9 `--atomic=always`: Existing Versus New Directory"
