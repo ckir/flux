@@ -235,7 +235,7 @@ class LoadExpectedTests(unittest.TestCase):
         expected_toml = GOOD_EXPECTED.replace(
             'kind = "check"\nopen_findings',
             'kind = "check"\nunreached = [{ label = "S12_3", reason = "not reached in this variant" }]\nopen_findings')
-        expected = self.load(expected_toml)
+        expected = self.load(expected_toml, module_text="---- MODULE M ----\nS12_3 == TRUE\n====\n")
         self.assertEqual(expected.runs[0].unreached, (("S12_3", "not reached in this variant"),))
 
     def test_unreached_must_be_a_list(self) -> None:
@@ -258,7 +258,7 @@ class LoadExpectedTests(unittest.TestCase):
         expected_toml = GOOD_EXPECTED.replace(
             'kind = "check"\nopen_findings',
             'kind = "check"\nunreached = [{ label = "plain_recover", reason = "x" }]\nopen_findings')
-        expected = self.load(expected_toml)
+        expected = self.load(expected_toml, module_text="---- MODULE M ----\nplain_recover == TRUE\n====\n")
         self.assertEqual(expected.runs[0].unreached, (("plain_recover", "x"),))
 
     def test_unreached_reason_must_be_non_empty(self) -> None:
@@ -282,10 +282,15 @@ class LoadExpectedTests(unittest.TestCase):
             "only allowed for check and liveness runs")
 
     def test_never_reached_well_formed_is_parsed(self) -> None:
-        d = ExpectedDir(GOOD_EXPECTED + '\n[[never_reached]]\nlabel = "S99_1"\nreason = "no scenario reaches it"\n')
+        d = ExpectedDir(GOOD_EXPECTED + '\n[[never_reached]]\nlabel = "S99_1"\nreason = "no scenario reaches it"\n',
+                         module_text="---- MODULE M ----\nS99_1 == TRUE\n====\n")
         self.addCleanup(d.close)
         expected = d.load()
         self.assertEqual(expected.never_reached, (("S99_1", "no scenario reaches it"),))
+
+    def test_never_reached_label_must_be_in_some_module(self) -> None:
+        self.assertRejected(GOOD_EXPECTED + '\n[[never_reached]]\nlabel = "NoSuchLabel"\nreason = "x"\n',
+                            "is not in the label universe of any run's module")
 
     def test_never_reached_label_must_be_an_identifier(self) -> None:
         self.assertRejected(GOOD_EXPECTED + '\n[[never_reached]]\nlabel = "not-an-ident"\nreason = "x"\n',
@@ -370,9 +375,13 @@ timeout_minutes = 5
 
 
 class CfgConstantsTests(unittest.TestCase):
-    """Direct tests of cfg_constants(), independent of expected.toml loading."""
+    """Direct tests of cfg_constants(), independent of expected.toml loading.
 
-    def test_returns_typed_literals_and_omits_model_values_and_substitutions(self) -> None:
+    cfg_constants fails CLOSED: the .cfg is the one file a person can edit to make a failing run
+    pass, so anything it cannot read as one of the literal shapes below is an ExpectedError, not a
+    silent skip."""
+
+    def test_returns_typed_literals_and_omits_model_values(self) -> None:
         text = (
             "CONSTANTS\n"
             "    N = 3\n"
@@ -381,7 +390,6 @@ class CfgConstantsTests(unittest.TestCase):
             "    NAMES = {a, b}\n"
             "    EMPTY = {}\n"
             "    NoProc = nobody\n"
-            "    P <- dirOp\n"
         )
         self.assertEqual(run.cfg_constants(text), {
             "N": 3,
@@ -390,6 +398,53 @@ class CfgConstantsTests(unittest.TestCase):
             "NAMES": frozenset({"a", "b"}),
             "EMPTY": frozenset(),
         })
+
+    def test_negative_integer_is_parsed(self) -> None:
+        self.assertEqual(run.cfg_constants("CONSTANT N = -1\n"), {"N": -1})
+
+    def test_negative_integer_needs_no_space(self) -> None:
+        with self.assertRaises(run.ExpectedError):
+            run.cfg_constants("CONSTANT N = - 1\n")
+
+    def test_substitution_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANT P <- dirOp\n")
+        self.assertIn("substitutes an operator for 'P'", str(ctx.exception))
+
+    def test_duplicate_assignment_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANTS\n    N = 3\n    N = 4\n")
+        self.assertIn("more than once", str(ctx.exception))
+
+    def test_duplicate_assignment_is_rejected_even_as_a_model_value(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANTS\n    P = dir\n    P = other\n")
+        self.assertIn("more than once", str(ctx.exception))
+
+    def test_unparseable_value_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANT N = 3x\n")
+        self.assertIn("N", str(ctx.exception))
+
+    def test_set_with_a_string_element_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants('CONSTANT NAMES = {a, "b"}\n')
+        self.assertIn("non-identifier element", str(ctx.exception))
+
+    def test_unterminated_set_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANT NAMES = {a, b\n")
+        self.assertIn("never closed", str(ctx.exception))
+
+    def test_missing_equals_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANT N 3\n")
+        self.assertIn("not followed by '='", str(ctx.exception))
+
+    def test_set_missing_a_comma_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANT NAMES = {a b}\n")
+        self.assertIn("missing a comma", str(ctx.exception))
 
 
 SYMMETRY_MODULE = "---- MODULE M ----\nPerms == Permutations(Recoverers)\n====\n"
@@ -442,6 +497,21 @@ class SymmetryTests(unittest.TestCase):
 
     def test_module_without_permutations_definition_is_rejected(self) -> None:
         self.assertRejected(symmetry_toml(), "must define", module_text=DEFAULT_MODULE)
+
+    def test_definition_only_in_a_line_comment_is_rejected(self) -> None:
+        module = "---- MODULE M ----\n\\* Perms == Permutations(Recoverers)\n====\n"
+        self.assertRejected(symmetry_toml(), "must define", module_text=module)
+
+    def test_definition_only_in_a_block_comment_is_rejected(self) -> None:
+        module = "---- MODULE M ----\n(* Perms == Permutations(Recoverers) *)\n====\n"
+        self.assertRejected(symmetry_toml(), "must define", module_text=module)
+
+    def test_definition_inside_a_nested_block_comment_is_rejected(self) -> None:
+        # Correct nesting treats the whole span, first `(*` to last `*)`, as one comment. A
+        # stripper that is not nesting-aware closes at the first `*)` instead, which would wrongly
+        # leave the definition below visible as real code.
+        module = "---- MODULE M ----\n(* (* inner *) Perms == Permutations(Recoverers) *)\n====\n"
+        self.assertRejected(symmetry_toml(), "must define", module_text=module)
 
     def test_symmetry_over_must_be_a_set_of_at_least_two(self) -> None:
         self.assertRejected(symmetry_toml(constants_literal='{ Recoverers = ["r1"] }'),
@@ -506,6 +576,25 @@ class CfgTests(unittest.TestCase):
     def test_fixed_cfg_rejects_a_missing_flag(self) -> None:
         with self.assertRaises(run.ExpectedError):
             run.fixed_cfg_text("CONSTANT FIX_A = TRUE\n", ["FIX_A"])
+
+
+class CommentStrippingTests(unittest.TestCase):
+    """Direct tests of strip_tla_comments(), used by the symmetry check (Part A) and by the
+    PlusCal label parser (Part B)."""
+
+    def test_removes_line_and_block_comments(self) -> None:
+        text = "A\n\\* comment\nB (* block *) C\n"
+        self.assertEqual(run.strip_tla_comments(text), "A\n\nB  C\n")
+
+    def test_nested_block_comments_are_honoured(self) -> None:
+        text = "before (* outer (* inner *) still-comment *) after"
+        self.assertEqual(run.strip_tla_comments(text), "before  after")
+
+    def test_real_definition_survives_stripping(self) -> None:
+        text = "\\* not this one: Perms == Permutations(X)\nPerms == Permutations(Recoverers)\n"
+        stripped = run.strip_tla_comments(text)
+        self.assertNotIn("Permutations(X)", stripped)
+        self.assertIn("Perms == Permutations(Recoverers)", stripped)
 
 
 class InterpretTests(unittest.TestCase):
@@ -692,15 +781,17 @@ class ExecuteTests(unittest.TestCase):
         self.commands: list[list[str]] = []
 
     def fake_tlc(self, script: str) -> None:
-        def command(jar: Path, r: run.Run, cfg: Path, metadir: Path) -> list[str]:
+        def command(jar: Path, r: run.Run, cfg: Path, metadir: Path, fixed: bool) -> list[str]:
             self.commands.append([str(cfg)])
             return [sys.executable, "-c", script]
         run.tlc_command = command
 
     def test_replayed_output_is_judged_and_logged(self) -> None:
+        # kind "seeded" (not "check"/"liveness"): the coverage gate does not apply, so replaying a
+        # plain recorded run - no coverage block - still judges cleanly.
         self.fake_tlc(f"import sys; text = open({str(TESTDATA / 'clean.out')!r}).read(); "
                       "sys.stdout.write(text.partition(chr(10))[2]); sys.exit(0)")
-        clean = run.Run("demo-posix-check", "M", "check.cfg", "demo", "check", (), (), (), 1, (), None, None)
+        clean = run.Run("demo-posix-check", "M", "check.cfg", "demo", "seeded", (), (), (), 1, (), None, None)
         result = run.execute(clean, Path("unused.jar"), self.base, fixed=False)
         self.assertEqual((result.status, result.observed, result.distinct_states), ("ok", frozenset(), 4))
         self.assertIsNotNone(result.log)
@@ -770,7 +861,10 @@ class MainTests(unittest.TestCase):
         self.assertEqual(run.main(["--expected", str(HERE / "expected.toml")]), 2)
 
     def main_with(self, statuses: dict[tuple[str, bool], str]) -> tuple[int, list[tuple[str, bool]]]:
-        """Run main() over GOOD_EXPECTED with execute() stubbed: each (run, fixed) reports its status, default ok."""
+        """Run main() over GOOD_EXPECTED with execute() stubbed: each (run, fixed) reports its status,
+        default ok. Scoped to --scenario demo (GOOD_EXPECTED's only scenario) so the suite-wide
+        coverage union - which needs a real TLC log per run - is skipped; that union has its own
+        tests (CoverageUnionTests) against real recorded logs."""
         d = ExpectedDir()
         self.addCleanup(d.close)
         run.ensure_jar = lambda: Path("unused.jar")
@@ -784,7 +878,7 @@ class MainTests(unittest.TestCase):
             return ExitCodeTests.result(status)
         run.execute = execute
         with contextlib.redirect_stdout(io.StringIO()):
-            code = run.main(["--expected", str(d.path / "expected.toml")])
+            code = run.main(["--expected", str(d.path / "expected.toml"), "--scenario", "demo"])
         return code, calls
 
     def test_all_runs_ok_is_exit_0(self) -> None:
@@ -842,12 +936,412 @@ class CommandTests(unittest.TestCase):
         expected = d.load()
         check, liveness, seeded, witness = expected.runs
         jar, cfg, meta = Path("j.jar"), Path("c.cfg"), Path("m")
-        self.assertIn("-continue", run.tlc_command(jar, check, cfg, meta))
-        self.assertIn("-continue", run.tlc_command(jar, liveness, cfg, meta))
-        self.assertNotIn("-continue", run.tlc_command(jar, seeded, cfg, meta))
-        self.assertNotIn("-continue", run.tlc_command(jar, witness, cfg, meta))
-        self.assertNotIn("-deadlock", run.tlc_command(jar, check, cfg, meta))
-        self.assertEqual(run.tlc_command(jar, check, cfg, meta)[-1], "M")
+        self.assertIn("-continue", run.tlc_command(jar, check, cfg, meta, fixed=False))
+        self.assertIn("-continue", run.tlc_command(jar, liveness, cfg, meta, fixed=False))
+        self.assertNotIn("-continue", run.tlc_command(jar, seeded, cfg, meta, fixed=False))
+        self.assertNotIn("-continue", run.tlc_command(jar, witness, cfg, meta, fixed=False))
+        self.assertNotIn("-deadlock", run.tlc_command(jar, check, cfg, meta, fixed=False))
+        self.assertEqual(run.tlc_command(jar, check, cfg, meta, fixed=False)[-1], "M")
+
+    def test_coverage_added_for_every_kind_unless_fixed(self) -> None:
+        d = ExpectedDir()
+        self.addCleanup(d.close)
+        expected = d.load()
+        jar, cfg, meta = Path("j.jar"), Path("c.cfg"), Path("m")
+        for r in expected.runs:
+            with self.subTest(kind=r.kind):
+                cmd = run.tlc_command(jar, r, cfg, meta, fixed=False)
+                self.assertIn("-coverage", cmd)
+                self.assertEqual(cmd[cmd.index("-coverage") + 1], "1")
+                self.assertNotIn("-coverage", run.tlc_command(jar, r, cfg, meta, fixed=True))
+
+
+def coverage_messages(case: str) -> list[run.Message]:
+    """Parse one testdata/<case>.out recording into Messages (the 'exit=' line stripped)."""
+    _, output = fixture(case)
+    return run.parse_messages(output)
+
+
+class ParseCoverageTests(unittest.TestCase):
+    """parse_coverage(), against real recorded '-coverage 1' output (testdata/*.out)."""
+
+    def test_takes_the_last_complete_block(self) -> None:
+        # coverage_two_blocks.out splices the CoverageFixture recording's block in as an early
+        # snapshot, ahead of the real final block from smoke_check_coverage.out (record_fixtures.py
+        # says so). Only the CoverageFixture block carries 'only_alpha_step'.
+        coverage = run.parse_coverage(coverage_messages("coverage_two_blocks"))
+        self.assertEqual(coverage, {"Step": (4, 8), "Overshoot": (0, 0), "Finished": (0, 1)})
+
+    def test_returns_none_without_a_complete_block(self) -> None:
+        text = "@!@!@STARTMSG 2201:0 @!@!@\nThe coverage statistics at now\n@!@!@ENDMSG 2201 @!@!@\n"
+        self.assertIsNone(run.parse_coverage(run.parse_messages(text)))
+
+    def test_returns_none_with_no_block_at_all(self) -> None:
+        self.assertIsNone(run.parse_coverage(coverage_messages("clean")))
+
+    def test_sums_a_repeated_name(self) -> None:
+        text = (
+            "@!@!@STARTMSG 2201:0 @!@!@\nThe coverage statistics at now\n@!@!@ENDMSG 2201 @!@!@\n"
+            "@!@!@STARTMSG 2772:0 @!@!@\n<Step line 1, col 1 to line 1, col 4 of module M>: 2:3\n"
+            "@!@!@ENDMSG 2772 @!@!@\n"
+            "@!@!@STARTMSG 2772:0 @!@!@\n<Step line 5, col 1 to line 5, col 4 of module M>: 1:1\n"
+            "@!@!@ENDMSG 2772 @!@!@\n"
+            "@!@!@STARTMSG 2202:0 @!@!@\nEnd of statistics.\n@!@!@ENDMSG 2202 @!@!@\n"
+        )
+        self.assertEqual(run.parse_coverage(run.parse_messages(text)), {"Step": (3, 4)})
+
+    def test_ignores_init_definition_and_cost_lines(self) -> None:
+        coverage = run.parse_coverage(coverage_messages("smoke_check_coverage"))
+        assert coverage is not None
+        self.assertNotIn("Init", coverage)  # 2773
+        self.assertNotIn("WithinBound", coverage)  # 2774
+        self.assertNotIn("AtMostThree", coverage)  # 2774
+
+    def test_zero_distinct_nonzero_total_is_executed(self) -> None:
+        # 'Finished' reports 0:1 in the recorded check run: never a NEW state, but executed once.
+        coverage = run.parse_coverage(coverage_messages("smoke_check_coverage"))
+        assert coverage is not None
+        self.assertEqual(coverage["Finished"], (0, 1))
+
+
+MIXED_CALLERS_MODULE = """---- MODULE Mixed ----
+(* --algorithm Mixed {
+  procedure Shared()
+  {
+    shared_step:
+      skip;
+      return;
+  }
+
+  process (p1 \\in SetA)
+  {
+    p1_step:
+      call Shared();
+  }
+
+  process (p2 \\in SetB)
+  {
+    p2_step:
+      call Shared();
+  }
+}
+*)
+====
+"""
+
+
+class LabelUniverseTests(unittest.TestCase):
+    """module_labels() and LabelUniverse.is_exempt(), against the real committed fixture module
+    (CoverageFixture.tla, recorded by record_fixtures.py) and Smoke.tla."""
+
+    def setUp(self) -> None:
+        self.universe = run.module_labels((TESTDATA / "CoverageFixture.tla").read_text(encoding="utf-8"))
+
+    def test_finds_process_and_procedure_labels(self) -> None:
+        self.assertEqual(self.universe.labels, {
+            "a_step", "a_done", "only_alpha_step", "b_step", "b_guarded",
+            "calls_helper_step", "calls_helper_after", "helper_step", "env_step",
+        })
+
+    def test_ownership_follows_transitive_calls(self) -> None:
+        # helper_step is in procedure Helper, called only by CallsHelper, called only by process b.
+        self.assertEqual(self.universe.owners["helper_step"], frozenset({"b"}))
+
+    def test_process_label_is_exempt_when_its_set_is_empty(self) -> None:
+        empty = {"Alphas": frozenset(), "Betas": frozenset({"b1"})}
+        self.assertTrue(self.universe.is_exempt("a_step", empty))
+        self.assertTrue(self.universe.is_exempt("a_done", empty))
+
+    def test_process_label_is_not_exempt_when_its_set_is_non_empty(self) -> None:
+        non_empty = {"Alphas": frozenset({"a1"}), "Betas": frozenset({"b1"})}
+        self.assertFalse(self.universe.is_exempt("a_step", non_empty))
+
+    def test_procedure_label_exempt_only_when_its_only_caller_is_empty(self) -> None:
+        empty = {"Alphas": frozenset(), "Betas": frozenset({"b1"})}
+        self.assertTrue(self.universe.is_exempt("only_alpha_step", empty))  # only called via Alphas
+        self.assertFalse(self.universe.is_exempt("helper_step", empty))  # only called via Betas (non-empty)
+
+    def test_equals_value_process_is_never_exempt(self) -> None:
+        self.assertFalse(self.universe.is_exempt("env_step", {"Alphas": frozenset(), "Betas": frozenset()}))
+
+    def test_a_genuinely_unguarded_label_is_never_executed_in_the_recording(self) -> None:
+        # b_guarded (await FALSE) is real recorded TOTAL 0 (testdata/coverage.out), and is NOT
+        # exempt (Betas is non-empty in that recording) - the gate must catch it.
+        coverage = run.parse_coverage(coverage_messages("coverage"))
+        assert coverage is not None
+        self.assertEqual(coverage["b_guarded"][1], 0)
+        self.assertFalse(self.universe.is_exempt("b_guarded", {"Alphas": frozenset(), "Betas": frozenset({"b1"})}))
+
+    def test_procedure_label_exempt_only_when_every_calling_set_is_empty(self) -> None:
+        # A hand-written module (not real TLC output: this tests our own graph logic, not TLC's
+        # behaviour) where one procedure has two different process callers.
+        universe = run.module_labels(MIXED_CALLERS_MODULE)
+        self.assertEqual(universe.owners["shared_step"], frozenset({"p1", "p2"}))
+        self.assertTrue(universe.is_exempt("shared_step", {"SetA": frozenset(), "SetB": frozenset()}))
+        self.assertFalse(universe.is_exempt("shared_step", {"SetA": frozenset(), "SetB": frozenset({"x"})}))
+        self.assertFalse(universe.is_exempt("shared_step", {"SetA": frozenset({"x"}), "SetB": frozenset()}))
+
+    def test_non_pluscal_universe_is_the_top_level_operators(self) -> None:
+        universe = run.module_labels((HERE / "Smoke.tla").read_text(encoding="utf-8"))
+        self.assertFalse(universe.pluscal)
+        self.assertEqual(universe.labels, {
+            "Limit", "Init", "Step", "Overshoot", "Finished", "Next", "Spec",
+            "WithinBound", "AtMostThree", "NeverReachedTwo", "ReachesLimit", "vars",
+        })
+        self.assertFalse(universe.is_exempt("Overshoot", {}))  # nothing is exempt without PlusCal
+
+
+class UnreachedLoadTimeValidationTests(unittest.TestCase):
+    """_load_run()'s load-time checks on 'unreached' against the real module universe (Smoke.tla),
+    beyond the shape checks LoadExpectedTests already covers."""
+
+    TOML = """
+scenarios = ["selftest"]
+
+[[run]]
+name = "selftest-posix-check"
+module = "M"
+config = "check.cfg"
+scenario = "selftest"
+kind = "check"
+unreached = [{{ label = "{label}", reason = "x" }}]
+constants = {{ SEED_OVERSHOOT = false }}
+timeout_minutes = 2
+"""
+    CFG = {"check.cfg": "SPECIFICATION Spec\nCONSTANTS\n    SEED_OVERSHOOT = FALSE\n    FIX_BOUND = FALSE\n"
+                        "INVARIANT WithinBound\n"}
+
+    def load(self, label: str) -> run.Expected:
+        d = ExpectedDir(self.TOML.format(label=label), self.CFG, (HERE / "Smoke.tla").read_text(encoding="utf-8"))
+        self.addCleanup(d.close)
+        return d.load()
+
+    def test_unknown_unreached_label_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            self.load("NoSuchLabel")
+        self.assertIn("is not in", str(ctx.exception))
+
+    def test_known_never_exempt_label_is_accepted(self) -> None:
+        # Overshoot is real and, for a non-PlusCal module, never exempt.
+        expected = self.load("Overshoot")
+        self.assertEqual(expected.runs[0].unreached, (("Overshoot", "x"),))
+
+
+class CoverageGateTests(unittest.TestCase):
+    """judge_coverage(), against real recorded coverage (testdata/*.out) and Smoke.tla's real
+    (non-PlusCal) universe."""
+
+    def setUp(self) -> None:
+        self.universe = run.module_labels((HERE / "Smoke.tla").read_text(encoding="utf-8"))
+
+    @staticmethod
+    def coverage(case: str) -> dict[str, tuple[int, int]]:
+        result = run.parse_coverage(coverage_messages(case))
+        assert result is not None
+        return result
+
+    @staticmethod
+    def run_with(unreached: tuple[tuple[str, str], ...]) -> run.Run:
+        return run.Run("x-check", "Smoke", "c", "x", "check", (), (), unreached, 2,
+                       (("SEED_OVERSHOOT", False),), None, None)
+
+    def test_fails_on_an_uncovered_unlisted_label(self) -> None:
+        failures = run.judge_coverage(self.run_with(()), self.universe, self.coverage("smoke_check_coverage"))
+        self.assertEqual(failures, ["Overshoot: gated label not covered (TOTAL 0)"])
+
+    def test_fails_on_a_listed_but_covered_label(self) -> None:
+        failures = run.judge_coverage(self.run_with((("Overshoot", "wrongly excused"),)), self.universe,
+                                      self.coverage("smoke_seeded_coverage"))
+        self.assertIn("Overshoot: covered - remove it from unreached", failures)
+
+    def test_passes_when_every_gated_label_is_covered_or_listed(self) -> None:
+        failures = run.judge_coverage(self.run_with((("Overshoot", "SEED_OVERSHOOT is off"),)), self.universe,
+                                      self.coverage("smoke_check_coverage"))
+        self.assertEqual(failures, [])
+
+
+class ExecuteCoverageGateTests(unittest.TestCase):
+    """execute() wired end-to-end against Smoke.tla's real content, replaying real recorded TLC
+    output (no Java: TLC is replaced by a small script)."""
+
+    def setUp(self) -> None:
+        smoke_text = (HERE / "Smoke.tla").read_text(encoding="utf-8")
+        toml = """
+scenarios = ["demo"]
+
+[[run]]
+name = "demo-posix-check"
+module = "M"
+config = "check.cfg"
+scenario = "demo"
+kind = "check"
+open_findings = [{ name = "AtMostThree", tracking = "t", fix_flag = "FIX_BOUND" }]
+unreached = [{ label = "Overshoot", reason = "SEED_OVERSHOOT is off in this run" }]
+constants = { SEED_OVERSHOOT = false }
+timeout_minutes = 5
+"""
+        cfgs = {"check.cfg": "SPECIFICATION Spec\nCONSTANTS\n    SEED_OVERSHOOT = FALSE\n    FIX_BOUND = FALSE\n"
+                             "INVARIANTS\n    WithinBound\n    AtMostThree\n"}
+        d = ExpectedDir(toml, cfgs, smoke_text)
+        self.addCleanup(d.close)
+        self.base = d.path
+        self.check = d.load().runs[0]
+        target = tempfile.TemporaryDirectory()
+        self.addCleanup(target.cleanup)
+        self.target = Path(target.name)
+        for name in ("TARGET", "tlc_command"):
+            self.addCleanup(setattr, run, name, getattr(run, name))
+        run.TARGET = self.target
+
+    def replay(self, case: str) -> None:
+        script = (f"import sys; text = open({str(TESTDATA / f'{case}.out')!r}).read(); "
+                  "sys.stdout.write(text.partition(chr(10))[2]); sys.exit(0)")
+
+        def command(jar: Path, r: run.Run, cfg: Path, metadir: Path, fixed: bool) -> list[str]:
+            return [sys.executable, "-c", script]
+        run.tlc_command = command
+
+    def test_real_check_coverage_passes_with_the_gap_listed(self) -> None:
+        self.replay("smoke_check_coverage")
+        result = run.execute(self.check, Path("unused.jar"), self.base, fixed=False)
+        self.assertEqual(result.status, "ok")
+
+    def test_missing_coverage_report_is_a_tooling_failure(self) -> None:
+        self.replay("clean")  # a recording with no coverage block at all
+        result = run.execute(self.check, Path("unused.jar"), self.base, fixed=False)
+        self.assertEqual(result.status, "tooling")
+        self.assertEqual(result.detail, "no coverage report")
+
+    def test_no_gate_for_a_fixed_run(self) -> None:
+        # -fixed skips -coverage entirely (B1); replaying a report-less recording must not turn
+        # into "no coverage report" for a -fixed run.
+        self.replay("clean")
+        result = run.execute(self.check, Path("unused.jar"), self.base, fixed=True)
+        self.assertNotEqual(result.detail, "no coverage report")
+
+    def test_no_gate_for_a_witness_run(self) -> None:
+        witness = run.Run("demo-posix-witness", "M", "check.cfg", "demo", "witness",
+                          ("NeverReachedTwo",), (), (), 5, self.check.constants, None, None)
+        self.replay("clean")
+        result = run.execute(witness, Path("unused.jar"), self.base, fixed=False)
+        self.assertNotEqual(result.detail, "no coverage report")
+
+    def test_no_gate_for_a_seeded_run(self) -> None:
+        seeded = run.Run("demo-posix-seeded-SEED_X", "M", "check.cfg", "demo", "seeded",
+                         ("WithinBound",), (), (), 5, self.check.constants, None, None)
+        self.replay("clean")
+        result = run.execute(seeded, Path("unused.jar"), self.base, fixed=False)
+        self.assertNotEqual(result.detail, "no coverage report")
+
+
+class CoverageUnionTests(unittest.TestCase):
+    """judge_union(): the suite-wide coverage union (design Section 4), against real recorded logs."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name)
+        (self.base / "Smoke.tla").write_text((HERE / "Smoke.tla").read_text(encoding="utf-8"), encoding="utf-8")
+
+    def log_for(self, case: str) -> Path:
+        log = self.base / f"{case}.log"
+        log.write_text(fixture(case)[1], encoding="utf-8")
+        return log
+
+    def entry(self, name: str, kind: str, fixed: bool, case: str | None,
+             status: str = "ok") -> tuple[run.Run, bool, run.Result]:
+        r = run.Run(name, "Smoke", "c", "x", kind, (), (), (), 2, (("SEED_OVERSHOOT", kind == "seeded"),),
+                   None, None)
+        log = self.log_for(case) if case is not None else None
+        result = run.Result(name, status, frozenset(), frozenset(), None, 1.0, "", (), log)
+        return (r, fixed, result)
+
+    def test_union_counts_a_seeded_runs_coverage(self) -> None:
+        executed = [self.entry("x-check", "check", False, "smoke_check_coverage"),
+                   self.entry("x-seeded", "seeded", False, "smoke_seeded_coverage")]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            failed = run.judge_union(executed, self.base, ())
+        self.assertFalse(failed)
+        self.assertIn("COVERAGE suite", out.getvalue())
+
+    def test_union_fails_on_an_uncovered_label(self) -> None:
+        # No seeded run here, so Overshoot (TOTAL 0 in the check run) is covered by nothing.
+        executed = [self.entry("x-check", "check", False, "smoke_check_coverage")]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            failed = run.judge_union(executed, self.base, ())
+        self.assertTrue(failed)
+        self.assertIn("Overshoot", out.getvalue())
+
+    def test_union_fails_on_a_covered_never_reached_label(self) -> None:
+        executed = [self.entry("x-check", "check", False, "smoke_check_coverage"),
+                   self.entry("x-seeded", "seeded", False, "smoke_seeded_coverage")]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            failed = run.judge_union(executed, self.base, (("Overshoot", "thought unreachable"),))
+        self.assertTrue(failed)
+        self.assertIn("never_reached but covered", out.getvalue())
+
+    def test_union_skipped_when_a_run_had_a_tooling_failure(self) -> None:
+        executed = [self.entry("x-check", "check", False, "smoke_check_coverage"),
+                   self.entry("x-seeded", "seeded", False, None, status="tooling")]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            failed = run.judge_union(executed, self.base, ())
+        self.assertFalse(failed)
+        self.assertIn("not judged: a run failed or timed out", out.getvalue())
+
+    def test_union_failure_sets_exit_1_through_main(self) -> None:
+        toml = """
+scenarios = ["demo"]
+
+[[run]]
+name = "demo-posix-check"
+module = "Smoke"
+config = "c.cfg"
+scenario = "demo"
+kind = "check"
+unreached = [{ label = "Overshoot", reason = "not seeded in this run" }]
+constants = { SEED_OVERSHOOT = false }
+timeout_minutes = 5
+"""
+        cfg_text = "SPECIFICATION Spec\nCONSTANTS\n    SEED_OVERSHOOT = FALSE\n    FIX_BOUND = FALSE\n" \
+                   "INVARIANT WithinBound\n"
+        (self.base / "expected.toml").write_text(toml, encoding="utf-8")
+        (self.base / "c.cfg").write_text(cfg_text, encoding="utf-8")
+        log = self.log_for("smoke_check_coverage")
+
+        def execute(r: run.Run, _jar: Path, _base: Path, fixed: bool) -> run.Result:
+            return run.Result(r.name, "ok", frozenset(), frozenset(), 10, 1.0, "", (), log)
+
+        for name in ("execute", "ensure_jar"):
+            self.addCleanup(setattr, run, name, getattr(run, name))
+        self.addCleanup(setattr, run.shutil, "which", run.shutil.which)
+        run.shutil.which = lambda _name: "java"
+        run.ensure_jar = lambda: Path("unused.jar")
+        run.execute = execute
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = run.main(["--expected", str(self.base / "expected.toml")])
+        self.assertEqual(code, 1)
+        self.assertIn("MISMATCH suite coverage", out.getvalue())
+
+
+class MainUnionRoutingTests(unittest.TestCase):
+    def test_scenario_run_skips_the_union(self) -> None:
+        d = ExpectedDir()
+        self.addCleanup(d.close)
+        for name in ("execute", "ensure_jar"):
+            self.addCleanup(setattr, run, name, getattr(run, name))
+        self.addCleanup(setattr, run.shutil, "which", run.shutil.which)
+        run.shutil.which = lambda _name: "java"
+        run.ensure_jar = lambda: Path("unused.jar")
+        run.execute = lambda r, _jar, _base, fixed: ExitCodeTests.result("ok")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            run.main(["--expected", str(d.path / "expected.toml"), "--scenario", "demo"])
+        self.assertIn("not judged for a single scenario", out.getvalue())
 
 
 if __name__ == "__main__":
