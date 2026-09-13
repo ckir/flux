@@ -485,7 +485,7 @@ class CfgConstantsTests(unittest.TestCase):
             run.cfg_constants("CONSTANTS\n    P = dir\n    P = other\n")
         self.assertIn("more than once", str(ctx.exception))
 
-    def test_unparseable_value_is_rejected(self) -> None:
+    def test_unparsable_value_is_rejected(self) -> None:
         with self.assertRaises(run.ExpectedError) as ctx:
             run.cfg_constants("CONSTANT N = 3x\n")
         self.assertIn("N", str(ctx.exception))
