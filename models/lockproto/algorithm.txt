@@ -65,9 +65,7 @@
        S240_1_trylock:
          if (crashed[self]) { goto classify_crashed; }
          else {
-           \* A classifier inspects the lock with a SHARED hold, which fails only while an owner holds it
-           \* exclusively, so any number of inspectors can look at one lock at once.
-           with (r = FsTryLockShared(fs, self, obj)) {
+           with (r = FsTryLock(fs, self, obj)) {
              got := r.ok;
              if (r.ok) { fs := r.fs; };
          };

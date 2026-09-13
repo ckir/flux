@@ -106,9 +106,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
        S240_1_trylock:
          if (crashed[self]) { goto classify_crashed; }
          else {
-           \* A classifier inspects the lock with a SHARED hold, which fails only while an owner holds it
-           \* exclusively, so any number of inspectors can look at one lock at once.
-           with (r = FsTryLockShared(fs, self, obj)) {
+           with (r = FsTryLock(fs, self, obj)) {
              got := r.ok;
              if (r.ok) { fs := r.fs; };
          };
@@ -556,7 +554,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "186374bb" /\ chksum(tla) = "a9d49982")
+\* BEGIN TRANSLATION (chksum(pcal) = "541001f4" /\ chksum(tla) = "49e942af")
 \* Procedure variable obj of procedure Classify at line 95 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, classified, ownerLive, sawLive, seenRec, crashed, live, holding, 
@@ -658,7 +656,7 @@ S240_1_trylock(self) == /\ pc[self] = "S240_1_trylock"
                         /\ IF crashed[self]
                               THEN /\ pc' = [pc EXCEPT ![self] = "classify_crashed"]
                                    /\ UNCHANGED << fs, got >>
-                              ELSE /\ LET r == FsTryLockShared(fs, self, obj_[self]) IN
+                              ELSE /\ LET r == FsTryLock(fs, self, obj_[self]) IN
                                         /\ got' = [got EXCEPT ![self] = r.ok]
                                         /\ IF r.ok
                                               THEN /\ fs' = r.fs
