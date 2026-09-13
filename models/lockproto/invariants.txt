@@ -30,10 +30,13 @@ PlainNeverOwnsUncertain == ~touchedUncertain
 \* A `Foreign` object at a lock path is never written, renamed, or deleted (Section 7).
 ForeignUntouched == ~touchedForeign
 
-\* Every TARGET_LOCK_BUSY refusal rests on evidence that the lock path held, or the refusing
-\* process's handle referred to, a lock whose owner was alive or another takeover's (Section 7). The
-\* refusing label records that, because the refusal may be reported after the owner it saw has
-\* finished: the spec's refusal rests on what the classifier observed (240.2), not on a re-read.
+\* A REGRESSION GUARD, not a liveness check. TARGET_LOCK_BUSY means the target's lock is held, not that
+\* its recorded owner is alive (240.2): a held OS-native lock cannot tell the owner from another
+\* invocation inspecting or recovering it, so no refusal-time check can establish owner liveness on
+\* that path. What this catches is a refusal with nothing behind it - a decision table that refuses
+\* BUSY for a lock it judged dead, or a publisher refusing it at S99_check when the lock path is empty
+\* or foreign. The refusing label records its evidence because the refusal may be reported after what
+\* it saw has changed: the refusal rests on what the classifier observed, not on a re-read.
 RefusalJustified == \A p \in Procs : refused[p] = "TARGET_LOCK_BUSY" => refusedOk[p]
 
 \* The two ghost witnesses, for the witness run.

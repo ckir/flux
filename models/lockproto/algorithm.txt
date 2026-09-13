@@ -51,7 +51,7 @@
      \* record, then judge (design Section 6.1). `keep` says whether the caller keeps the handle and
      \* the lock it may have taken, as 240.3 does through its move-aside.
      procedure Classify(keep)
-       variables obj = 0, got = FALSE, holder = NoProc;
+       variables obj = 0, got = FALSE;
      {
        S240_1_open:
          if (crashed[self]) { goto classify_crashed; }
@@ -67,8 +67,6 @@
          else {
            with (r = FsTryLock(fs, self, obj)) {
              got := r.ok;
-             \* Who held the lock when this try-lock ran: the evidence a forced "live" rests on.
-             holder := fs.oslock[obj];
              if (r.ok) { fs := r.fs; };
          };
          };
@@ -96,8 +94,9 @@
                               ELSE IF crashed[seen.op] THEN {"dead", "uncertain"}
                               ELSE {"live", "uncertain"}) {
                  ownerLive[self] := alive;
-                 \* A "live" forced by a failed try-lock is evidence only if the owner held the lock.
-                 sawLive[self] := alive = "live" /\ (got \/ LockCapability # "strong" \/ holder = seen.op);
+                 \* A "live" forced by a failed try-lock shows the lock is held, which is what BUSY means
+                 \* (240.2); it does not show who holds it.
+                 sawLive[self] := alive = "live";
                  \* A cleanup lock is its own case (251.1); an operation's lock takes its judgement
                  \* from its owner (240.1 to 240.4).
                  if (seen.kind = "cleanup") { classified[self] := "cleanuplock"; }
