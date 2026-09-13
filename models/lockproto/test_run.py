@@ -1066,7 +1066,8 @@ timeout_minutes = 5
         with contextlib.redirect_stdout(out):
             code = run.main(["--expected", str(HERE / "expected-extended.toml"), "--list-jobs"])
         self.assertEqual(code, 0)
-        self.assertEqual(json.loads(out.getvalue()), [{"scenario": "recovery", "platform": "posix"}])
+        self.assertEqual(json.loads(out.getvalue()), [{"scenario": "recovery", "platform": "posix"},
+                                                      {"scenario": "recovery", "platform": "windows"}])
 
     def test_platform_without_scenario_exits_2(self) -> None:
         err = io.StringIO()

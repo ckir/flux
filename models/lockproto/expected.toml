@@ -121,6 +121,19 @@ unreached = [
 timeout_minutes = 30
 
 [[run]]
+name = "recovery-posix-liveness"
+module = "LockProtocol"
+config = "configs/recovery-posix-liveness.cfg"
+scenario = "recovery"
+kind = "liveness"
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong" }
+unreached = [
+    { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
+    { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record; breaklock reaches it" },
+]
+timeout_minutes = 30
+
+[[run]]
 name = "recovery-posix-witness-NeverTornRead"
 module = "LockProtocol"
 config = "configs/recovery-posix-witness-NeverTornRead.cfg"

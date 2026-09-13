@@ -105,14 +105,15 @@ kinds at once do not finish, so the check runs pair them, and each pairing is ex
   seeded run covers.
 - `HostCrashes = FALSE` in these runs, so only process crashes are explored here. Host crashes have their own
   slower tier, `expected-extended.toml`, run by `.github/workflows/model-extended.yml` nightly, on request, and on a
-  pull request labelled `model-extended`. It holds the same four POSIX pairings with `HostCrashes = TRUE`, at 11 to 25
-  million distinct states each (design Section 12). A change that relies on an unflushed write or rename being durable
+  pull request labelled `model-extended`. It holds the same four pairings with `HostCrashes = TRUE` on each platform.
+  On POSIX they give 10.7 to 22.8 million distinct states each (design Section 12). The Windows host-crash
+  pairings are there as a measurement. A change that relies on an unflushed write or rename being durable
   therefore passes a pull request's checks, and this tier catches it afterwards. Label coverage cannot show that a
   host crash ran, so the per-pull-request suite keeps the witness `NeverHostCrashChangedLock`.
 - The host crash keeps a directory's unflushed entry operations all-or-nothing, not as the prefix a journaled
   filesystem keeps. A partial prefix followed by a further crash is not explored (design Section 5.2).
-- The liveness run (`DeadLockEventuallyCleared`, Owner and 2 Recoverers, no symmetry) is not yet in
-  `expected.toml`. Its time limit and any tightening wait for the controlled timing measurement.
+- The liveness run, `recovery-posix-liveness` (`DeadLockEventuallyCleared`, Owner and 2 Recoverers, no symmetry),
+  is untightened. Its 30-minute limit is provisional until it has been timed twice on CI.
 
 ## Filesystem probes
 
