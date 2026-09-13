@@ -1,0 +1,77 @@
+# The slower "extended" tier of the lock-protocol model check: docs/superpowers/specs/
+# 2026-09-11-lock-protocol-model-check-design.md, Sections 4 and 12. These runs (host crashes) need
+# far more time than fits the per-PR budget in model.yml, so they run on a schedule, on manual
+# dispatch, and on a pull request carrying the `model-extended` label - never on every PR.
+name: Model (extended tier)
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+  pull_request:
+    types: [labeled, synchronize, opened, reopened]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: model-extended-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    name: Plan
+    # On a pull request, run only once the model-extended label is present; every other trigger
+    # (schedule, manual dispatch) always plans.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'model-extended')
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: List the extended-tier jobs
+        id: plan
+        run: |
+          set -euo pipefail
+          matrix=$(python models/lockproto/run.py --expected models/lockproto/expected-extended.toml --list-jobs)
+          echo "matrix=$matrix"
+          # Delimited form, so a value that ever spans lines cannot add output keys.
+          { echo "matrix<<MATRIX_EOF"; echo "$matrix"; echo "MATRIX_EOF"; } >> "$GITHUB_OUTPUT"
+
+  tier:
+    name: Extended ${{ matrix.job.scenario }} (${{ matrix.job.platform }})
+    needs: plan
+    # GitHub rejects an empty matrix; the plan job's outputs are empty strings when it was skipped.
+    if: needs.plan.outputs.matrix != '' && needs.plan.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        job: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Run the model check
+        env:
+          SCENARIO: ${{ matrix.job.scenario }}
+          PLATFORM: ${{ matrix.job.platform }}
+        run: >-
+          python models/lockproto/run.py --expected models/lockproto/expected-extended.toml
+          --scenario "$SCENARIO" --platform "$PLATFORM"
+      - name: Upload TLC output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tlc-output-extended-${{ matrix.job.scenario }}-${{ matrix.job.platform }}
+          path: target/tla/out/

@@ -121,6 +121,11 @@ class LoadExpectedTests(unittest.TestCase):
         self.assertTrue(expected.scenarios)
         self.assertTrue(expected.runs)
 
+    def test_the_extended_repository_file_loads(self) -> None:
+        expected = run.load_expected(HERE / "expected-extended.toml")
+        self.assertEqual(expected.scenarios, ["recovery"])
+        self.assertTrue(expected.runs)
+
     def test_unknown_kind(self) -> None:
         self.assertRejected(GOOD_EXPECTED.replace('kind = "liveness"', 'kind = "live"'), "kind must be one of")
 
@@ -986,6 +991,133 @@ timeout_minutes = 5
             code = run.main(["--expected", str(d.path / "expected.toml"), "--list-scenarios"])
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out.getvalue()), ["demo", "other"])
+
+    def test_list_jobs_orders_by_scenario_then_first_platform_appearance(self) -> None:
+        d = ExpectedDir("""
+scenarios = ["alpha", "beta"]
+
+[[run]]
+name = "alpha-windows-check"
+module = "M"
+config = "check.cfg"
+scenario = "alpha"
+kind = "check"
+constants = {}
+timeout_minutes = 5
+
+[[run]]
+name = "alpha-posix-liveness"
+module = "M"
+config = "live.cfg"
+scenario = "alpha"
+kind = "liveness"
+constants = {}
+timeout_minutes = 5
+
+[[run]]
+name = "beta-posix-check"
+module = "M"
+config = "check.cfg"
+scenario = "beta"
+kind = "check"
+constants = {}
+timeout_minutes = 5
+""")
+        self.addCleanup(d.close)
+        run.shutil.which = lambda _name: None
+
+        def refuse(*_args: object) -> Path:
+            raise AssertionError("--list-jobs must not fetch or run TLC")
+        run.ensure_jar = refuse
+        run.execute = refuse
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = run.main(["--expected", str(d.path / "expected.toml"), "--list-jobs"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue()), [
+            {"scenario": "alpha", "platform": "windows"},
+            {"scenario": "alpha", "platform": "posix"},
+            {"scenario": "beta", "platform": "posix"},
+        ])
+
+    def test_list_jobs_on_the_repository_file_includes_both_recovery_platforms(self) -> None:
+        run.shutil.which = lambda _name: None
+
+        def refuse(*_args: object) -> Path:
+            raise AssertionError("--list-jobs must not fetch or run TLC")
+        run.ensure_jar = refuse
+        run.execute = refuse
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = run.main(["--expected", str(HERE / "expected.toml"), "--list-jobs"])
+        self.assertEqual(code, 0)
+        jobs = json.loads(out.getvalue())
+        self.assertIn({"scenario": "recovery", "platform": "posix"}, jobs)
+        self.assertIn({"scenario": "recovery", "platform": "windows"}, jobs)
+
+    def test_list_jobs_on_the_extended_repository_file(self) -> None:
+        run.shutil.which = lambda _name: None
+
+        def refuse(*_args: object) -> Path:
+            raise AssertionError("--list-jobs must not fetch or run TLC")
+        run.ensure_jar = refuse
+        run.execute = refuse
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = run.main(["--expected", str(HERE / "expected-extended.toml"), "--list-jobs"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue()), [{"scenario": "recovery", "platform": "posix"}])
+
+    def test_platform_without_scenario_exits_2(self) -> None:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = run.main(["--expected", str(HERE / "expected.toml"), "--platform", "posix"])
+        self.assertEqual(code, 2)
+        self.assertIn("--platform requires --scenario", err.getvalue())
+
+    def test_unknown_platform_exits_2(self) -> None:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = run.main(["--expected", str(HERE / "expected.toml"), "--scenario", "recovery",
+                             "--platform", "solaris"])
+        self.assertEqual(code, 2)
+        self.assertIn("no runs for scenario recovery on platform solaris", err.getvalue())
+
+    def test_platform_selects_exactly_the_matching_runs(self) -> None:
+        d = ExpectedDir("""
+scenarios = ["demo"]
+
+[[run]]
+name = "demo-windows-check"
+module = "M"
+config = "check.cfg"
+scenario = "demo"
+kind = "check"
+constants = {}
+timeout_minutes = 5
+
+[[run]]
+name = "demo-posix-check"
+module = "M"
+config = "check.cfg"
+scenario = "demo"
+kind = "check"
+constants = {}
+timeout_minutes = 5
+""")
+        self.addCleanup(d.close)
+        run.ensure_jar = lambda: Path("unused.jar")
+        calls: list[str] = []
+
+        def execute(r: run.Run, _jar: Path, _base: Path, fixed: bool) -> run.Result:
+            calls.append(r.name)
+            return ExitCodeTests.result("ok")
+        run.execute = execute
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = run.main(["--expected", str(d.path / "expected.toml"), "--scenario", "demo",
+                             "--platform", "posix"])
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, ["demo-posix-check"])
 
 
 class CommandTests(unittest.TestCase):
