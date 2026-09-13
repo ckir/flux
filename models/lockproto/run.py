@@ -1114,8 +1114,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the lock-protocol model check.")
     parser.add_argument("--expected", type=Path, default=HERE / "expected.toml")
     parser.add_argument("--scenario", help="run only this scenario")
+    parser.add_argument("--platform", help="with --scenario, run only this platform")
     parser.add_argument("--list-scenarios", action="store_true", help="print the scenario names as JSON")
+    parser.add_argument("--list-jobs", action="store_true",
+                         help="print the distinct {scenario, platform} pairs as JSON")
     args = parser.parse_args(argv)
+
+    if args.platform is not None and args.scenario is None:
+        print("run.py: --platform requires --scenario", file=sys.stderr)
+        return 2
 
     try:
         expected = load_expected(args.expected)
@@ -1126,10 +1133,28 @@ def main(argv: list[str] | None = None) -> int:
     if args.list_scenarios:
         print(json.dumps(scenarios))
         return 0
+    if args.list_jobs:
+        jobs: list[dict[str, str]] = []
+        for s in scenarios:
+            platforms: list[str] = []
+            for r in expected.runs:
+                if r.scenario != s:
+                    continue
+                platform = r.name[len(s) + 1:].split("-", 1)[0]
+                if platform not in platforms:
+                    platforms.append(platform)
+            jobs.extend({"scenario": s, "platform": p} for p in platforms)
+        print(json.dumps(jobs))
+        return 0
     if args.scenario is not None and args.scenario not in scenarios:
         print(f"run.py: unknown scenario {args.scenario!r}; known: {', '.join(scenarios)}", file=sys.stderr)
         return 2
     selected = [r for r in expected.runs if args.scenario is None or r.scenario == args.scenario]
+    if args.platform is not None:
+        selected = [r for r in selected if r.name.startswith(f"{args.scenario}-{args.platform}-")]
+        if not selected:
+            print(f"run.py: no runs for scenario {args.scenario} on platform {args.platform}", file=sys.stderr)
+            return 2
 
     if shutil.which("java") is None:
         print("run.py: java is not on PATH (TLC needs Java 11 or later; CI uses Temurin 21)", file=sys.stderr)

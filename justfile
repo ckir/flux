@@ -65,9 +65,10 @@ changelog:
 
 python := env_var_or_default("PYTHON", "python3")
 
-# Run the model check: every scenario, or one (`just model selftest`)
-model scenario="":
-    {{python}} models/lockproto/run.py {{ if scenario == "" { "" } else { "--scenario " + scenario } }}
+# Run the model check: every scenario, or one (`just model selftest`), optionally one platform
+# (`just model recovery posix`)
+model scenario="" platform="":
+    {{python}} models/lockproto/run.py {{ if scenario == "" { "" } else { "--scenario " + scenario } }} {{ if platform == "" { "" } else { "--platform " + platform } }}
 
 # Unit tests of the model runner (Python only, no Java)
 model-test:

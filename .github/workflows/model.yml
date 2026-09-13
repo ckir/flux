@@ -67,23 +67,23 @@ jobs:
           if [ "$touching" = false ]; then
             matrix='[]'
           else
-            matrix=$(python models/lockproto/run.py --list-scenarios)
+            matrix=$(python models/lockproto/run.py --list-jobs)
           fi
           echo "event=$EVENT touching=$touching matrix=$matrix"
           # Delimited form, so a value that ever spans lines cannot add output keys.
           { echo "matrix<<MATRIX_EOF"; echo "$matrix"; echo "MATRIX_EOF"; } >> "$GITHUB_OUTPUT"
 
   scenario:
-    name: Scenario ${{ matrix.scenario }}
+    name: Scenario ${{ matrix.job.scenario }} (${{ matrix.job.platform }})
     needs: plan
     # GitHub rejects an empty matrix, so the job is skipped when there is nothing to run.
     if: needs.plan.outputs.matrix != '[]'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
-        scenario: ${{ fromJSON(needs.plan.outputs.matrix) }}
+        job: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-java@v6
@@ -96,13 +96,14 @@ jobs:
       - uses: taiki-e/install-action@just
       - name: Run the model check
         env:
-          SCENARIO: ${{ matrix.scenario }}
-        run: just model "$SCENARIO"
+          SCENARIO: ${{ matrix.job.scenario }}
+          PLATFORM: ${{ matrix.job.platform }}
+        run: just model "$SCENARIO" "$PLATFORM"
       - name: Upload TLC output
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: tlc-output-${{ matrix.scenario }}
+          name: tlc-output-${{ matrix.job.scenario }}-${{ matrix.job.platform }}
           path: target/tla/out/
 
   model-gate:
