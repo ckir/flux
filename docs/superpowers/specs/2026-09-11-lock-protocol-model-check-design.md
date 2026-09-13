@@ -1007,14 +1007,19 @@ does not model a dead owner at all; it models a live one, and the liveness prope
 property from the one intended. A run that does not fit its time limit gets tighter bounds, and the tighter bounds
 are written into the README, never raised silently.
 
-No wall-clock figure in this design is a measurement yet. The figures once quoted here for `recovery` (about
-twenty-nine minutes for its eight `check` runs, about fourteen for its liveness run) were single samples taken on a
-developer machine while other work shared its CPU, so the owner ruled them unverified, and the model check itself
-was loading that machine past use. The model's runs therefore move to CI, and the time budget is measured there,
-twice, with the spread quoted and the runner's hardware stated as uncontrolled. Until then `recovery`'s
-`timeout_minutes` are provisional (30 for its `check` and `witness` runs), and the liveness run and any tightening
-of it wait for that measurement. The owner chose the lever for jobs: one CI job per scenario and platform
-(Section 4), with a 180-minute job limit, since paired runs make a scenario's job long. A job still carries its
+The figures once quoted here for `recovery` (about twenty-nine minutes for its eight `check` runs, about fourteen for
+its liveness run) were single samples taken on a developer machine while other work shared its CPU, so the owner
+ruled them unverified, and the model check itself was loading that machine past use. The model's runs therefore
+moved to CI, where they were measured on 2026-09-13. The runners are GitHub-hosted `ubuntu-latest` machines whose
+hardware is not controlled, so every figure is a range from two samples:
+- POSIX `check` runs: 44-45, 63-65, 49 and 43-45 seconds.
+- Windows `check` runs: 45-65, 67-92, 50-68 and 45-59 seconds. The two runners differed by up to about 40%.
+- The liveness run, `DeadLockEventuallyCleared` over 1,869,534 distinct states: 258-261 seconds.
+- A whole `recovery` POSIX job (nine runs): 8m06s-8m10s. A Windows job: 3m49s-5m09s.
+The liveness run fits its 30-minute limit several times over, so no tightening rung is needed. The
+`timeout_minutes` of 30 therefore stand as generous ceilings, not tight budgets. The owner chose the lever for
+jobs: one CI job per scenario and platform (Section 4), with a 180-minute job limit, since paired runs make a
+scenario's job long. A job still carries its
 scenario's `witness` and seeded runs and, compounding worst, a `<name>-fixed` second run for every `check` run with
 an open finding.
 
@@ -1029,8 +1034,17 @@ ordinary pull request is stated plainly: a change that relies on an unflushed wr
 passes the pull request's checks, and the tier catches it afterwards. Label coverage cannot even show that a host
 crash ran, because it shares the label `env_loop` with the process crash, so `expected.toml` keeps one cheap host-crash
 run of its own, the witness `NeverHostCrashChangedLock`, which stops once a host crash has changed which object the
-lock path names. The tier carries the four Windows host-crash pairings too, as a measurement: whether they stay is
-the owner's decision once CI has their counts.
+lock path names.
+
+The tier also carries the four Windows host-crash pairings, measured on CI with no violation and their coverage gates
+passing: 16,959,639 / 28,314,300 / 16,046,736 / 13,700,391 distinct states. The Windows job took 49m56s against
+POSIX's 40m00s, and the two jobs run in parallel. The POSIX host-crash runs, timed twice, took 523-558, 847-907,
+462-481 and 414-448 seconds. The owner kept the Windows pairings against the peer's recommendation to drop them. The
+peer's argument: a host crash releases every handle, and objects it leaves without a name cannot be opened, so the
+directory tree after the crash is one the Windows process-crash runs already explore. The reason for keeping them:
+one host crash stops every live process and uses a single unit of `MaxCrashes`. "A host crash, then a further crash
+of a later invocation" therefore fits at `MaxCrashes = 2` only in this tier, and that further process crash releases
+handles, which is where Windows sharing rules apply. No counterexample is known either way.
 
 ## 13. Success criteria
 
