@@ -184,11 +184,11 @@ Four rules keep the coverage check honest without making it lie:
   since the runs it unions include other platforms and other actor sets. The stronger property is what the per-run
   requirement gives, which is why a label excused in one run still has to carry its reason there. A single-scenario run cannot judge this and
   says so in its report, and the CI matrix runs one scenario and platform per job, so `model-gate` does not enforce it; the full
-  `just model` that Section 13 requires before the work is declared finished does. That leaves the union checked
-  only at the end and only by hand, which is the weakest point in this rule: a branch can be green in CI for as long
-  as it likes with a label no run covers. Whichever way Section 12's per-job time question is settled, the answer
-  has to leave room for one job that performs the union - it needs every run's coverage, not one scenario's, so it
-  is the one job that cannot be part of a per-scenario matrix;
+  `just model` that Section 13 requires before the work is declared finished does. That is the weakest point in this
+  rule: a pull request can be green for as long as it likes with a label no run covers. The union job of
+  `model-extended.yml` closes most of that gap. It runs all of `expected.toml` in one invocation, every night and on
+  a labelled pull request, because it needs every run's coverage, not one scenario's, and so it cannot be part of a
+  per-scenario matrix. A label left uncovered therefore fails within a day of reaching `main`, not only at the end;
 - one top-level `never_reached` list in `expected.toml`, each entry a label and a reason, holds the labels no run can
   cover. It is the only way out of the rule above, and it costs the label its traceability: a label in `never_reached`
   may not appear in any `[[unit]]` entry's labels (Section 9.1), so a unit it was meant to implement falls back on
@@ -331,8 +331,9 @@ Recipes and CI:
 - A second workflow, `.github/workflows/model-extended.yml`, runs the slower tier in `expected-extended.toml` (same
   schema; Section 12 says what is in it): nightly, on manual dispatch, and on a pull request labelled
   `model-extended`, one job per scenario and platform, with `run.py --expected models/lockproto/expected-extended.toml
-  --scenario <s> --platform <p>`. It is not part of `model-gate` and not part of `just model`, and it judges no union,
-  because its runs cover no label the runs in `expected.toml` miss. Nothing in a normal pull request would even read
+  --scenario <s> --platform <p>`. It is not part of `model-gate` and not part of `just model`, and the tier's own runs
+  judge no union, because they cover no label the runs in `expected.toml` miss. The same workflow's `union` job runs
+  `run.py` over all of `expected.toml` and is where the suite-wide union is judged on CI. Nothing in a normal pull request would even read
   that file, so a unit test of `run.py` loads it: a broken entry or configuration fails the pull request instead of
   waiting for the nightly run.
 - The drift-stamp test and the filesystem probes are ordinary Rust tests, so `just check` and the existing
