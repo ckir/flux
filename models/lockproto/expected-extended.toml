@@ -2,7 +2,6 @@
 # as expected.toml. It runs on a schedule and on request, never as part of `just model` or the
 # per-pull-request jobs:
 #   python models/lockproto/run.py --expected models/lockproto/expected-extended.toml --scenario recovery
-# The Windows host-crash pairings are here as a measurement; whether they stay is the owner's decision.
 # The suite-wide union is not judged here: host crashes share `env_loop`, so these runs cover no label
 # the process-crash runs in expected.toml miss.
 

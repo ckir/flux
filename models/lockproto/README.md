@@ -83,7 +83,9 @@ trace for any path, re-run that configuration with the witness as an invariant a
 ## Bounds
 
 Each configuration's bounds, and what they still let it explore (design Section 4). The state counts are TLC's and
-do not depend on the machine; no wall-clock figure is recorded here until the controlled timing measurement.
+do not depend on the machine. Wall-clock figures are CI ranges from two samples each, on GitHub-hosted runners whose
+hardware is not controlled (design Section 12). A POSIX check run takes 43-65s, a Windows one 45-92s, and the
+liveness run 258-261s.
 
 `recovery` runs one Owner, which may crash, against the actors entitled to find and replace its lock. All four actor
 kinds at once do not finish, so the check runs pair them, and each pairing is exhaustive:
@@ -106,14 +108,15 @@ kinds at once do not finish, so the check runs pair them, and each pairing is ex
 - `HostCrashes = FALSE` in these runs, so only process crashes are explored here. Host crashes have their own
   slower tier, `expected-extended.toml`, run by `.github/workflows/model-extended.yml` nightly, on request, and on a
   pull request labelled `model-extended`. It holds the same four pairings with `HostCrashes = TRUE` on each platform.
-  On POSIX they give 10.7 to 22.8 million distinct states each (design Section 12). The Windows host-crash
-  pairings are there as a measurement. A change that relies on an unflushed write or rename being durable
+  They give 10.7 to 22.8 million distinct states each on POSIX and 13.7 to 28.3 million on Windows (design
+  Section 12). The two platform jobs run in parallel and took about 40 and 50 minutes. A change that relies on an unflushed write or rename being durable
   therefore passes a pull request's checks, and this tier catches it afterwards. Label coverage cannot show that a
   host crash ran, so the per-pull-request suite keeps the witness `NeverHostCrashChangedLock`.
 - The host crash keeps a directory's unflushed entry operations all-or-nothing, not as the prefix a journaled
   filesystem keeps. A partial prefix followed by a further crash is not explored (design Section 5.2).
 - The liveness run, `recovery-posix-liveness` (`DeadLockEventuallyCleared`, Owner and 2 Recoverers, no symmetry),
-  is untightened. Its 30-minute limit is provisional until it has been timed twice on CI.
+  holds over 1,869,534 distinct states and is untightened: timed twice on CI at 258-261s, it fits its 30-minute
+  limit several times over.
 
 ## Filesystem probes
 
