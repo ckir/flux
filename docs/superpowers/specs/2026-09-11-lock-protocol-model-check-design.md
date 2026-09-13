@@ -183,7 +183,7 @@ Four rules keep the coverage check honest without making it lie:
   no more - that the label is not dead - never that it was reached under the conditions its own scenario is about,
   since the runs it unions include other platforms and other actor sets. The stronger property is what the per-run
   requirement gives, which is why a label excused in one run still has to carry its reason there. A single-scenario run cannot judge this and
-  says so in its report, and the CI matrix runs one scenario per job, so `model-gate` does not enforce it; the full
+  says so in its report, and the CI matrix runs one scenario and platform per job, so `model-gate` does not enforce it; the full
   `just model` that Section 13 requires before the work is declared finished does. That leaves the union checked
   only at the end and only by hand, which is the weakest point in this rule: a branch can be green in CI for as long
   as it likes with a label no run covers. Whichever way Section 12's per-job time question is settled, the answer
@@ -317,16 +317,24 @@ Recipes and CI:
      --name-only` from the merge base of the pull request's base and head (`base...head`), or from the push's previous
      commit, decides whether they touch
      `models/**`, the spec file (glob `FLUX_FULL_UPDATED_SPEC_V*.md`), `crates/flux-platform/tests/fs_semantics.rs`,
-     the `justfile` (its model recipes), or the workflow itself, and outputs `run.py --list-scenarios` as the matrix, or an empty matrix when nothing
+     the `justfile` (its model recipes), or the workflow itself, and outputs `run.py --list-jobs` as the matrix - one entry per scenario and platform, the platform being the first part of a run name's variant - or an empty matrix when nothing
      relevant changed. Manual dispatch, and any case where the changed files cannot be determined (a new branch, a
      force push whose previous commit is gone), count as touching, so an unknown change runs every scenario;
-  2. `scenario`, one matrix job per scenario name and skipped when the matrix is empty (GitHub rejects an empty
+  2. `scenario`, one matrix job per scenario and platform, skipped when the matrix is empty (GitHub rejects an empty
      matrix, so the job carries a condition on `plan`'s output), installs Java with `actions/setup-java` (Temurin 21) and Python
-     with `actions/setup-python` (3.14, the version the development machines use), runs `just model <name>`, and uploads `target/tla/out/` when it
-     fails;
+     with `actions/setup-python` (3.14, the version the development machines use), runs `just model <scenario> <platform>`, and uploads `target/tla/out/`
+     whether it passes or fails, because the logs carry the state counts. Splitting by platform is what lets a scenario
+     whose runs are paired (Section 12) fit one job;
   3. `model-gate` always runs after the others and fails if `plan` failed, if any `scenario` job failed or was
      cancelled, or if `scenario` was skipped although the matrix was not empty; it passes when the matrix was empty.
   Because the matrix comes from `expected.toml`, a run can never belong to a scenario CI does not run.
+- A second workflow, `.github/workflows/model-extended.yml`, runs the slower tier in `expected-extended.toml` (same
+  schema; Section 12 says what is in it): nightly, on manual dispatch, and on a pull request labelled
+  `model-extended`, one job per scenario and platform, with `run.py --expected models/lockproto/expected-extended.toml
+  --scenario <s> --platform <p>`. It is not part of `model-gate` and not part of `just model`, and it judges no union,
+  because its runs cover no label the runs in `expected.toml` miss. Nothing in a normal pull request would even read
+  that file, so a unit test of `run.py` loads it: a broken entry or configuration fails the pull request instead of
+  waiting for the nightly run.
 - The drift-stamp test and the filesystem probes are ordinary Rust tests, so `just check` and the existing
   Linux/macOS/Windows test job run them.
 - `.claude/recommended-tools.json` gains entries for Java 21 and Python 3.11 or later, the two non-Rust tools
@@ -412,12 +420,21 @@ A host crash (power loss or reboot of the machine all actors run on):
 - is a process crash of every process that has started;
 - then sets, for every object written since its last flush, both `content` and `durable` to one of: the old durable
   content, the latest content, or `Torn`, chosen nondeterministically per object; a crash during a flush has the same
-  outcomes. Objects flushed since their last write keep their content;
+  outcomes. Objects flushed since their last write keep their content, and so does a file created and never
+  written, which has nothing to tear;
 - then keeps a prefix, in the order they were made, of the entry operations (create, hard link, rename, unlink) made
   since the last flush that covered them, and loses the rest; each kept operation applies whole (a rename is never
   half applied), and the prefix always includes every operation a directory flush covered. Both `entries` and
   `durableEntries` are set to the result. This is the ordering journaled filesystems give (ext4, APFS, NTFS); a
   filesystem without a journal can lose operations out of order, which the README lists as unverified.
+
+  The model approximates that prefix, and the owner accepted the gap: per directory, a host crash keeps either all
+  of the unflushed entry operations or none of them. A partial prefix is still reached on the filesystem, by a
+  process crash of the actor whose later operations are lost, followed by a host crash that keeps the rest. But
+  that costs a crash for each truncated actor on top of the host crash, where the real event costs one. So at
+  `MaxCrashes = 2` the model never explores a host crash that keeps only part of what was done and then a further
+  crash of a later invocation. Raising `MaxCrashes` narrows the gap only for a single truncated actor. A faithful
+  prefix needs a per-directory log of unflushed entry operations and a cut point, which is not built.
 
 These are the only ways `durable` and `durableEntries` become visible. Processes that had not started when the host
 crashed run afterwards as the later invocations. At most two crashes happen in one run, counted across both kinds (one
@@ -987,26 +1004,31 @@ reads `crashed[seen.op]` and can otherwise judge the lock only live or uncertain
 must therefore also start `crashed` true for that owner, which in turn makes the owner's own process take one step
 to its end label and stop - the prefix the seed exists to remove. A configuration that seeds the filesystem alone
 does not model a dead owner at all; it models a live one, and the liveness property it checks is a different
-property from the one intended. Each TLC run's `timeout_minutes` is
-10; each CI matrix job (one scenario) should finish within about 20 minutes. A run that does not fit gets tighter
-bounds, and the tighter bounds are written into the README, never raised silently.
+property from the one intended. A run that does not fit its time limit gets tighter bounds, and the tighter bounds
+are written into the README, never raised silently.
 
-That per-job figure is the one number `recovery`'s pairing does not fit, and it is recorded here rather than quietly
-exceeded. Measured on 2026-09-13 in one batch during which no other work of this project ran, as single samples on a
-developer machine whose background load was not controlled - a Ghidra worker, the peer's editor and the operating
-system's own services were all running: its four POSIX `check` runs take about twelve minutes with `-coverage 1` on
-and its four Windows runs about seventeen, so the eight together are about twenty-nine. On that machine every one of
-them fits the ten-minute per-run limit, the slowest at five minutes forty; a CI runner is typically slower, so that
-margin is not a promise. The liveness run does not fit even there: about fourteen minutes, so it exceeds the
-per-run limit as well as adding to the job, and it is the run the tightening ladder above exists for. All of that is
-before the same job's `witness` runs and its seeded runs - and before the fix-flag
-runs, which are the part that compounds worst: every `check` run carrying an open finding is run a second time as
-`<name>-fixed`, so one open finding in `recovery` turns four POSIX check runs into eight. The levers, none of them
-yet chosen: raise the per-job figure for a scenario whose actors are paired; run the pairings only on POSIX and keep
-Windows to the `recovery-windows-check` pairing alone, on the ground that the pairings test interference between
-actors rather than platform semantics; or make the CI matrix one job per run rather than one per scenario, which
-costs runner start-up per run but removes the per-job ceiling as a constraint on how a scenario is decomposed. The
-choice is the owner's and belongs in the plan that builds these runs, not in `expected.toml`.
+No wall-clock figure in this design is a measurement yet. The figures once quoted here for `recovery` (about
+twenty-nine minutes for its eight `check` runs, about fourteen for its liveness run) were single samples taken on a
+developer machine while other work shared its CPU, so the owner ruled them unverified, and the model check itself
+was loading that machine past use. The model's runs therefore move to CI, and the time budget is measured there,
+twice, with the spread quoted and the runner's hardware stated as uncontrolled. Until then `recovery`'s
+`timeout_minutes` are provisional (30 for its `check` and `witness` runs), and the liveness run and any tightening
+of it wait for that measurement. The owner chose the lever for jobs: one CI job per scenario and platform
+(Section 4), with a 180-minute job limit, since paired runs make a scenario's job long. A job still carries its
+scenario's `witness` and seeded runs and, compounding worst, a `<name>-fixed` second run for every `check` run with
+an open finding.
+
+Host crashes form their own tier. With `HostCrashes = TRUE` the four POSIX pairings exhaust with no violation, but
+their state spaces are 11 to 15 times those without (measured before the fix to torn empty files in Section 5.2,
+11.3 to 24.7 million distinct states; after it, the Owner and two Recoverers pairing gives 13,331,133). The owner
+ruled that per-pull-request CI keeps the process-crash runs and a separate tier, `expected-extended.toml` (Section 4),
+runs the host-crash pairings: nightly, on request, and on a labelled pull request. What that stops proving on an
+ordinary pull request is stated plainly: a change that relies on an unflushed write or entry operation being durable
+passes the pull request's checks, and the tier catches it afterwards. Label coverage cannot even show that a host
+crash ran, because it shares the label `env_loop` with the process crash, so `expected.toml` keeps one cheap host-crash
+run of its own, the witness `NeverHostCrashChangedLock`, which stops once a host crash has changed which object the
+lock path names. The tier is POSIX only for now; whether it gains Windows pairings is decided once CI has measured
+them.
 
 ## 13. Success criteria
 
