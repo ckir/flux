@@ -110,7 +110,8 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
              got := r.ok;
              \* Who held the lock when this try-lock ran: the evidence a forced "live" rests on.
              holder := fs.oslock[obj];
-             if (r.ok) { fs := r.fs; };
+             if (r.ok) { fs := r.fs; }
+             else if (LockCapability = "strong") { goto S240_1_trylock_retry; };
          };
          };
        S240_1_read:
@@ -155,6 +156,20 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          else {
            if (~keep \/ ~Replaceable(self)) { fs := FsClose(fs, self, obj).fs; };
            return;
+         };
+       S240_1_trylock_retry:
+         \* The first try-lock failed. Its holder may be the owner, or another invocation inspecting
+         \* or recovering the lock (240.1 step 3, 240.3 step 1), which holds it only briefly. Only a
+         \* lock still held on a second attempt is taken as the owner's (240.2). One retry stands for
+         \* the bounded retry, and other actors can act between the two attempts.
+         if (crashed[self]) { goto classify_crashed; }
+         else {
+           with (r = FsTryLock(fs, self, obj)) {
+             got := r.ok;
+             holder := fs.oslock[obj];
+             if (r.ok) { fs := r.fs; };
+           };
+           goto S240_1_read;
          };
        classify_crashed:
          return;
@@ -555,7 +570,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "7e7a4fa9" /\ chksum(tla) = "d723d3e3")
+\* BEGIN TRANSLATION (chksum(pcal) = "98afe595" /\ chksum(tla) = "6e693e59")
 \* Procedure variable obj of procedure Classify at line 95 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, classified, ownerLive, sawLive, seenRec, crashed, live, holding, 
@@ -664,9 +679,11 @@ S240_1_trylock(self) == /\ pc[self] = "S240_1_trylock"
                                         /\ holder' = [holder EXCEPT ![self] = fs.oslock[obj_[self]]]
                                         /\ IF r.ok
                                               THEN /\ fs' = r.fs
-                                              ELSE /\ TRUE
+                                                   /\ pc' = [pc EXCEPT ![self] = "S240_1_read"]
+                                              ELSE /\ IF LockCapability = "strong"
+                                                         THEN /\ pc' = [pc EXCEPT ![self] = "S240_1_trylock_retry"]
+                                                         ELSE /\ pc' = [pc EXCEPT ![self] = "S240_1_read"]
                                                    /\ fs' = fs
-                                   /\ pc' = [pc EXCEPT ![self] = "S240_1_read"]
                         /\ UNCHANGED << classified, ownerLive, sawLive, 
                                         seenRec, crashed, live, holding, 
                                         checked, recoveredAfterCrash, tornRead, 
@@ -730,6 +747,26 @@ S240_1_close(self) == /\ pc[self] = "S240_1_close"
                                       refusedOk, refused, obj, robj, victim, 
                                       crashes >>
 
+S240_1_trylock_retry(self) == /\ pc[self] = "S240_1_trylock_retry"
+                              /\ IF crashed[self]
+                                    THEN /\ pc' = [pc EXCEPT ![self] = "classify_crashed"]
+                                         /\ UNCHANGED << fs, got, holder >>
+                                    ELSE /\ LET r == FsTryLock(fs, self, obj_[self]) IN
+                                              /\ got' = [got EXCEPT ![self] = r.ok]
+                                              /\ holder' = [holder EXCEPT ![self] = fs.oslock[obj_[self]]]
+                                              /\ IF r.ok
+                                                    THEN /\ fs' = r.fs
+                                                    ELSE /\ TRUE
+                                                         /\ fs' = fs
+                                         /\ pc' = [pc EXCEPT ![self] = "S240_1_read"]
+                              /\ UNCHANGED << classified, ownerLive, sawLive, 
+                                              seenRec, crashed, live, holding, 
+                                              checked, recoveredAfterCrash, 
+                                              tornRead, touchedUncertain, 
+                                              touchedForeign, refusedOk, 
+                                              refused, stack, keep, obj_, obj, 
+                                              robj, victim, crashes >>
+
 classify_crashed(self) == /\ pc[self] = "classify_crashed"
                           /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
                           /\ obj_' = [obj_ EXCEPT ![self] = Head(stack[self]).obj_]
@@ -746,6 +783,7 @@ classify_crashed(self) == /\ pc[self] = "classify_crashed"
 
 Classify(self) == S240_1_open(self) \/ S240_1_trylock(self)
                      \/ S240_1_read(self) \/ S240_1_close(self)
+                     \/ S240_1_trylock_retry(self)
                      \/ classify_crashed(self)
 
 S96_1_create(self) == /\ pc[self] = "S96_1_create"
