@@ -67,7 +67,8 @@ FsType ==
       content: [Objs -> Contents \cup {NoContent}],
       durable: [Objs -> Contents \cup {NoContent}],
       handles: SUBSET [proc: Procs, obj: Objs, del: BOOLEAN],
-      oslock: [Objs -> Procs \cup {NoProc}],
+      oslock: [Objs -> Procs \cup {NoProc}],               \* the exclusive holder, if any
+      shlock: [Objs -> SUBSET Procs],                     \* the shared holders
       inflight: SUBSET InFlight,
       past: [Dirs -> [Classes -> SUBSET Objs]],            \* ids a class has held (weak identity)
       deleted: SUBSET Objs,                                \* Windows: name gone when last handle closes
@@ -80,6 +81,7 @@ FsInit ==
       durable |-> [o \in Objs |-> NoContent],
       handles |-> {},
       oslock |-> [o \in Objs |-> NoProc],
+      shlock |-> [o \in Objs |-> {}],
       inflight |-> {},
       past |-> [d \in Dirs |-> [c \in Classes |-> {}]],
       deleted |-> {},
@@ -156,6 +158,7 @@ FsClose(fs, p, o) ==
     IN Ok([ fs EXCEPT
               !.handles = rest,
               !.oslock[o] = lock,
+              !.shlock[o] = @ \ {p},
               !.entries = IF gone
                           THEN [d \in Dirs |-> [c \in Classes |->
                                   IF <<d, c>> \in names THEN NoObj ELSE fs.entries[d][c]]]
@@ -163,10 +166,20 @@ FsClose(fs, p, o) ==
               !.deleted = IF gone THEN @ \ {o} ELSE @ ], o)
 
 \* The OS-native lock, scoped to the handle that takes it (probe FS-11) and unavailable when the
-\* capability is weak (Section 235.1).
+\* capability is weak (Section 235.1). It has two modes, as flock's LOCK_EX and LOCK_SH and
+\* LockFileEx with and without LOCKFILE_EXCLUSIVE_LOCK do: any number of processes may hold it
+\* shared, one may hold it exclusively, and never both at once. An owner proving it is alive holds
+\* it exclusively; a process inspecting a lock holds it shared.
 FsTryLock(fs, p, o) ==
-    IF o = NoObj \/ LockCapability = "weak" \/ ~OpenBy(fs, p, o) \/ fs.oslock[o] # NoProc THEN Fail(fs)
+    IF \/ o = NoObj \/ LockCapability = "weak" \/ ~OpenBy(fs, p, o)
+       \/ fs.oslock[o] # NoProc \/ fs.shlock[o] # {}
+    THEN Fail(fs)
     ELSE Ok([fs EXCEPT !.oslock[o] = p], o)
+
+FsTryLockShared(fs, p, o) ==
+    IF o = NoObj \/ LockCapability = "weak" \/ ~OpenBy(fs, p, o) \/ fs.oslock[o] # NoProc
+    THEN Fail(fs)
+    ELSE Ok([fs EXCEPT !.shlock[o] = @ \cup {p}], o)
 
 FsUnlock(fs, p, o) ==
     IF o = NoObj \/ fs.oslock[o] # p THEN Fail(fs) ELSE Ok([fs EXCEPT !.oslock[o] = NoProc], o)
@@ -254,6 +267,7 @@ FsProcCrash(fs, p) ==
     IN [ fs EXCEPT
            !.handles = @ \ mine,
            !.oslock = [o \in Objs |-> IF fs.oslock[o] = p THEN NoProc ELSE fs.oslock[o]],
+           !.shlock = [o \in Objs |-> fs.shlock[o] \ {p}],
            !.entries = [d \in Dirs |-> [c \in Classes |->
                           IF <<d, c>> \in names THEN NoObj ELSE fs.entries[d][c]]],
            !.deleted = @ \ {o \in fs.deleted : o \in gone /\ last(o)} ]
@@ -284,6 +298,7 @@ FsHostCrash(fs, pick, dirs) ==
            !.dentries = [d \in Dirs |-> ents(d)],
            !.handles = {},
            !.oslock = [o \in Objs |-> NoProc],
+           !.shlock = [o \in Objs |-> {}],
            !.inflight = {},
            !.deleted = {} ]
 
@@ -298,7 +313,12 @@ NoDoubleOpen(fs) ==
 
 \* An OS-native lock is only ever held by a process that has the object open (probe FS-9, FS-11).
 LockImpliesHandle(fs) ==
-    \A o \in Objs : fs.oslock[o] # NoProc => OpenBy(fs, fs.oslock[o], o)
+    /\ \A o \in Objs : fs.oslock[o] # NoProc => OpenBy(fs, fs.oslock[o], o)
+    /\ \A o \in Objs : \A q \in fs.shlock[o] : OpenBy(fs, q, o)
+
+\* An exclusive hold and a shared hold never coexist on one object.
+LockModesExclusive(fs) ==
+    \A o \in Objs : fs.oslock[o] # NoProc => fs.shlock[o] = {}
 
 \* Ids are never reused: a name's past ids are allocated, and an allocated id keeps its content
 \* slot for the whole run.
@@ -306,5 +326,6 @@ IdsNotReused(fs) ==
     /\ \A d \in Dirs, c \in Classes : fs.past[d][c] \subseteq 1..fs.next
     /\ \A d \in Dirs, c \in Classes : fs.entries[d][c] \in (1..fs.next) \cup {NoObj}
 
-FsInvariants(fs) == NoDoubleOpen(fs) /\ LockImpliesHandle(fs) /\ IdsNotReused(fs)
+FsInvariants(fs) ==
+    NoDoubleOpen(fs) /\ LockImpliesHandle(fs) /\ LockModesExclusive(fs) /\ IdsNotReused(fs)
 ====
