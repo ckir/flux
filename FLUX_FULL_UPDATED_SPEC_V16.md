@@ -4690,6 +4690,19 @@ may be held on the lock file to prove the owner is alive (Sections 240,
 anything other than the filesystem's own resolution of `<name>` loses the
 name equivalence.
 
+Where the destination provides OS-native locks (Section 235.1), the
+acquirer holds that lock before it writes its record. It takes the lock
+as part of the exclusive creation where the platform can do both in one
+call (for example `O_EXLOCK` with `O_CREAT | O_EXCL`), and otherwise
+immediately after it. In between, another invocation can open the new
+file and take its lock, because inspecting a lock (Section 240.1 step 3)
+and recovering one (Section 240.3 step 1) both try to take it. If the
+acquirer cannot take the lock, it removes the lock file it created and
+starts the acquisition again (Section 21.1 step 1); it never writes a
+record while another process holds the lock. A record written without the
+lock proves nothing about its owner, and Section 240.2 would read
+whichever process does hold the lock as that owner.
+
 If `<name>.flux-lock` would exceed the directory's name-length limit, the
 operation takes the directory lock instead, which covers every target in
 `P`:
@@ -4730,8 +4743,11 @@ capability rules of Section 235; otherwise `REMOTE_LOCK_UNSAFE`.
 
 A refusal with `TARGET_LOCK_BUSY`, `OPERATION_LOCKED`, or
 `TARGET_LOCK_UNCERTAIN` reports, where the lock record is readable, the
-holder's `owner_instance_id`, `boot_session_id`, `workspace_path`, and
-`last_heartbeat_wall_time`.
+recorded holder's `owner_instance_id`, `boot_session_id`, `workspace_path`,
+and `last_heartbeat_wall_time`. These are the record's contents, and like
+all lock metadata they are descriptive (Section 99.1): they name the
+operation that wrote the lock, which need not be the process holding it
+when the refusal is made (Section 240.2).
 
 ------------------------------------------------------------------------
 
@@ -10531,14 +10547,22 @@ When a new invocation encounters an existing adjacent lock:
 
 ## 240.2 Live Owner
 
-If the native locking mechanism or platform ownership information
-demonstrates that the owner is alive:
+If platform ownership information demonstrates that the owner is alive,
+or the native locking mechanism shows that the lock is held:
 
 ``` text
 TARGET_LOCK_BUSY
 ```
 
-must be returned, reporting the holder (Section 96.2).
+must be returned, reporting the recorded holder (Section 96.2).
+
+A held native lock shows only that some process holds it. An invocation
+inspecting the lock (Section 240.1 step 3) or recovering it (Section
+240.3 step 1) takes the same lock, so the process holding it may be the
+owner or another invocation, and the lock cannot tell them apart.
+`TARGET_LOCK_BUSY` therefore means that the target's lock is held, not
+that its recorded owner is alive. It may be transient: a later attempt can
+succeed once another invocation has released the lock.
 
 Flux must not steal the lock because the heartbeat happens to be old.
 
@@ -10566,10 +10590,12 @@ Recovery, and cleanup, replace a dead owner's lock by moving it aside:
    240.5), so identity alone is not enough. If either check fails, rename
    the file back without replacing (Section 241.5) and start the
    acquisition again.
-4. Create its own lock exclusively (Section 96.1). If that fails, another
-   operation created the lock in the gap and owns the target: delete the
-   moved file (its owner is dead) and classify what is at the lock path as
-   Section 96.1 does.
+4. Create its own lock exclusively and take its OS-native lock (Section
+   96.1). If the creation fails, another operation created the lock in the
+   gap and owns the target: delete the moved file (its owner is dead) and
+   classify what is at the lock path as Section 96.1 does. If the creation
+   succeeds but the OS-native lock cannot be taken, remove the lock file it
+   created, delete the moved file, and start the acquisition again.
 5. Delete the moved file.
 
 The lock path is empty between steps 2 and 4. That is harmless because

@@ -72,8 +72,8 @@ crates/flux-platform/tests/fs_semantics.rs    the filesystem probes (Section 10)
 | `module` | `LockProtocol` or `Claims` |
 | `config` | path of the `.cfg` file |
 | `scenario` | the Section 12 scenario the run belongs to; one of the names in `expected.toml`'s top-level `scenarios` list, which is the only place scenario names are defined; CI builds its matrix from that list |
-| `kind` | `check`, `liveness`, or `seeded` |
-| `violated` | for `check` and `liveness`: the exact set of witness invariants that must be reported violated, at least one; for `seeded`: the one invariant or property that must be the first violation |
+| `kind` | `check`, `liveness`, `witness`, or `seeded` |
+| `violated` | for `seeded` and `witness`: the one invariant or property that must be the first violation; absent for `check` and `liveness` |
 | `open_findings` | optional, for `check` and `liveness`: safety invariants or properties that currently fail because of a spec defect not yet fixed, each as `{ name, tracking, fix_flag }`: `tracking` names its `TODO.md` or `.clavity/local-anomalies.md` entry, and `fix_flag` names a model flag that applies the proposed spec fix |
 | `unreached` | optional, for `check` and `liveness`: labels of the run's own actors that this run cannot reach, each as `{ label, reason }` (the coverage check below) |
 | `timeout_minutes` | the run's time limit |
@@ -86,13 +86,92 @@ report carries one line per label rather than per process instance, a label whos
 even though TLC evaluates it at every state, and symmetry reduction lowers a label's counts but does not zero them
 (`A 3:4` under `SYMMETRY` against `4:6` without). A run fails if a label of an actor it instantiates has no states
 found. Without this, a label behind a condition that can never hold would still have a `trace.toml` entry mapping it to
-a spec rule, and the traceability map would claim coverage that never runs. The witnesses (Section 7) show that named
-procedures complete; this shows that every step of every running actor is reached. Four rules keep the check honest
-without making it lie:
+a spec rule, and the traceability map would claim coverage that never runs.
 
-- the labels of an actor whose process set the run's configuration leaves empty are exempt; the runner derives which
-  labels belong to which actor from the model's `process` blocks and which sets are empty from the configuration's
-  constants, so no list is maintained by hand;
+Five things about reading that report are measured, and each of them silently breaks a gate that gets them wrong
+(2026-09-12; every one of them was hit while building the `recovery` scenario). None of them is a documented
+interface: they are the output format of the pinned TLC release, so they are pinned by the same SHA-256 that pins
+the jar, and a change to that pin re-checks them and re-records `testdata/` with `record_fixtures.py` in the same
+change. A gate reading an unpinned TLC would be reading an unspecified format.
+
+- `-coverage 1` prints a snapshot every minute **and** a final report, and only the last block covers the whole run.
+  In one log `S240_3_s4_drop` reads `0:0` in the one-minute snapshot and `1168:2835` in the final block of that same
+  log. A gate that reads the first block reports labels as uncovered that the run reaches later.
+- the block's terminator has two forms: `End of statistics.` and, on a large model, `End of statistics (please note
+  that for performance reasons large models are best checked with coverage and cost statistics disabled).` A parser
+  anchored on the punctuated form fails on exactly the big runs it matters for.
+- a block holds two kinds of line, and only one of them is a label. An action's own line begins with `<` in the
+  first column and carries the `distinct:found` pair; every line beneath it is a cost line for an expression inside
+  that action, indented, carrying a SINGLE number, and prefixed with one `|` per level of nesting below the first
+  (`  line 606, col 25 ...: 5856534`, then `  |line 606, col 25 ...: 5815368`). A gate must anchor on the leading
+  `<` - not on the `|`, which the first level of cost lines does not carry - or it will read an expression's figure
+  as a label's.
+- "no states found" is the SECOND number. A label that only ever regenerates states already seen reports zero
+  distinct and a large total: `publish_crashed` reports `0:32937`, and PlusCal's own `Terminating` action `0:1029`,
+  in a run where an all-Done state is reachable. A gate reading the first number fails on both.
+- `-coverage 1` is not free: the same state graph (7,254,481 generated, 2,174,196 distinct, exhausted both times)
+  took 5min53s with it and 3min24s without, which is why the time budget below is quoted for runs that carry it.
+  That pair is one measurement each, minutes apart on a machine whose background load was not controlled, so it
+  sizes the cost and does not pin it; the state counts either side of it are exact and repeatable, the durations
+  are not.
+
+A bound must also be shown not to bind before its run's coverage means anything. `FsCreate` fails both when an entry
+of the name exists and when `fs.next = MaxObjs`, so under a binding object bound a create-failure label is covered
+for the wrong reason - the gate passes on the bound rather than on the protocol. Every configuration's `MaxObjs` is
+therefore raised by one once and its state count confirmed unchanged. All eight `recovery` check runs were verified
+this way before the acquirer rule of spec 96.1 became part of the model. That rule is not re-measured against the
+bound by raising it, because the bound cannot bind in any `recovery` configuration, for a reason independent of the
+rule: every actor makes at most one exclusive create - an acquisition or a recovery's replacement lock, never both,
+since each actor makes one pass - so objects allocated never exceed the number of actors, and each configuration's
+`MaxObjs` is at least that number. Measured where it is tightest, `recovery-posix-check`, whose three actors meet
+`MaxObjs = 3`: `fs.next <= Cardinality(Procs)` holds over its complete state space (2026-09-13). A later model that
+lets an actor create twice, for instance by retrying, reopens the question.
+
+That check is per bound, and clearing one bound says nothing about the others. A configuration is a box with at
+least three walls - `MaxObjs`, `MaxCrashes`, and the actor sets themselves - and a label can be pinned against any
+of them while the other two sit slack. This scenario is its own example: at `MaxCrashes = 1`, `recover_crashed` was
+unreachable no matter what, and `MaxObjs` was already provably non-binding at the time, so the object-bound check
+passed and proved nothing about the label. Raising `MaxCrashes` to 2 is what reached it. A bound is therefore
+checked when a label it could pin is uncovered, and the uncovered label names which wall to push on: a
+create-failure label points at `MaxObjs`, a crash-path label at `MaxCrashes`, and an interference label at the
+actor set - which is what the `recovery` pairing below is.
+
+An uncovered label is a trigger for that check, not the whole of it. A bound constrains INTERLEAVINGS as well as
+labels, and those it can cut while every label stays covered: a second crash removed from a run does not uncover a
+label if some other path reaches the same label once, and nothing in the coverage report will say the run stopped
+exploring the case where a crash lands inside a recovery. Coverage cannot see this, so the bounds do not rest on it.
+Each configuration's bounds are justified in the README on their own terms - what the run is for and what its bounds
+still let it explore - and that justification is what a reviewer reads, with the label check underneath it as a floor
+that catches the cruder failure.
+
+What the gate cannot see is which ARM of a label was taken. A label holds one filesystem call and the local decision
+that follows it (Section 5.2), so `S21_1_decide` carries the whole of 21.1's judgement table: its coverage count
+proves a plain rerun decided, never that it decided `RESUMABLE_OPERATION_EXISTS` against a dead owner. Coverage is a
+reachability floor for a label, and the invariants, checked in every state of an exhausted graph, are what constrain
+what happens inside one.
+
+This coverage report is also how a run proves it reached the paths it is about, which is why no `check` or `liveness`
+run carries witness invariants. A witness invariant is violated in every state after its path is reached, and TLC has
+no flag that reports an invariant once: measured on the `recovery` scenario with four actors and no crashes, the
+witnesses produced 10,057 violation reports and a 309.6 MB log with `-difftrace` already on, and the run had not
+finished in ten minutes (2026-09-12). A label's coverage count proves the same reachability with no output at all. The
+few facts no single label states - a read that found a torn record, a replaced lock that a crash had left, a lock whose
+owner is dead or uncertain sitting at the lock path - keep a ghost flag or a state predicate and are checked as
+`witness` runs (below). To get a counterexample trace for any path, re-run that configuration with the witness as an
+invariant and without `-continue`; the gates need the fact, a person debugging needs the trace.
+
+Four rules keep the coverage check honest without making it lie:
+
+- the labels of an actor whose process set the run's configuration leaves empty are exempt. For a label inside a
+  `process` block the runner needs to derive nothing: TLC reports no action at all for an empty process set
+  (measured - the run with `Recoverers = {}` reports none of the nine `rec_` actions the others report), so such a
+  label is simply absent from the report and cannot fail the gate. The attribution that DOES have to be derived is
+  for the labels in the shared `procedure` blocks, which is where most of this model's labels live: `S240_1_*`,
+  `S96_1_*`, `S240_3_*` and `S99_*` sit in `Classify`, `Acquire`, `Recover` and `Publish`, belong to no `process`
+  block, and are reached by whichever actors call them. A procedure's label therefore belongs to the set of actors
+  that call that procedure, and is exempt only when every one of those actors has an empty process set. Deriving it
+  from the containing block instead would attribute those labels to nobody, which is both the larger half of the
+  model and the half the exemption has to get right;
 - a run may list `unreached` labels with a reason: steps its variant or its configuration cannot reach although their
   actor runs, such as 240.5 step 1's capability branch, which only the seeded run without the capability gate reaches
   (Section 5.1). The check is symmetric, as for witnesses: a listed label that does get covered fails the run too,
@@ -100,33 +179,58 @@ without making it lie:
 - `unreached` excuses a label in one run, never in the model. A run of every run in `expected.toml` (`just model` with
   no scenario) unions the coverage of all its runs, which TLC reports per run and never merges itself, and fails if any
   label of any model was covered by no run at all, so a label cannot be listed out of every run and left as dead code:
-  whatever a scenario cannot reach, another scenario or a seeded run must. A single-scenario run cannot judge this and
+  whatever a scenario cannot reach, another scenario or a seeded run must. What the union proves is exactly that and
+  no more - that the label is not dead - never that it was reached under the conditions its own scenario is about,
+  since the runs it unions include other platforms and other actor sets. The stronger property is what the per-run
+  requirement gives, which is why a label excused in one run still has to carry its reason there. A single-scenario run cannot judge this and
   says so in its report, and the CI matrix runs one scenario per job, so `model-gate` does not enforce it; the full
-  `just model` that Section 13 requires before the work is declared finished does;
+  `just model` that Section 13 requires before the work is declared finished does. That leaves the union checked
+  only at the end and only by hand, which is the weakest point in this rule: a branch can be green in CI for as long
+  as it likes with a label no run covers. Whichever way Section 12's per-job time question is settled, the answer
+  has to leave room for one job that performs the union - it needs every run's coverage, not one scenario's, so it
+  is the one job that cannot be part of a per-scenario matrix;
 - one top-level `never_reached` list in `expected.toml`, each entry a label and a reason, holds the labels no run can
   cover. It is the only way out of the rule above, and it costs the label its traceability: a label in `never_reached`
   may not appear in any `[[unit]]` entry's labels (Section 9.1), so a unit it was meant to implement falls back on
   `not_modelled` or another label. A dead label can therefore never stand as the model of a spec rule, which is the
   only thing listing it could otherwise buy. Adding a scenario to reach an awkward label instead is a change to Section
-  12's table with its reason, as a changed witness set is, never an edit to `expected.toml` alone;
+  12's table with its reason, as a changed witness set is, never an edit to `expected.toml` alone - and so is adding a
+  RUN to a scenario that already exists. That second half is the one the first misses on its own: the cheap way to
+  clear an awkward label is not a new scenario at all but a degenerate new run under a scenario name already blessed,
+  bounded down to almost nothing and aimed only at the label, which the suite-wide union then accepts. Section 12's
+  table lists runs, not only scenarios, which is what makes a new run reviewable as a design change; the `recovery`
+  pairing below is that list for its scenario, and each of its rows carries what only that pairing reaches. This one
+  is review-gated rather than mechanised, and says so: no check can tell a run added to reach a real path from one
+  added to clear a label, because the difference is intent. What it buys is that both edits - the new `[[run]]` and
+  the new table row with its reason - appear in the same diff, and a `[[run]]` arriving without one is the thing a
+  reviewer looks for. Section 9 already rests on the same footing for a re-stamped heading;
 - the derived `<name>-fixed` runs are not covered by the check. A proposed spec fix is meant to make the path it
   closes unreachable, so a fix-flag run would otherwise fail because the fix worked;
 - a run that times out is a tooling failure (exit code 2) and its coverage is not judged at all, because a partial
   state space says nothing about what is reachable.
 
 - `check`: TLC runs with `-continue`, so it explores the whole reachable state space and reports every violated
-  invariant. The run passes only if the set reported equals `violated` plus the run's `open_findings` exactly: every
-  witness violated, every open finding still violated, no other safety invariant violated. One run per configuration
-  therefore checks both safety and reachability. An open finding that stops failing also fails the run, so the entry
-  is removed together with the spec fix.
-- `liveness`: TLC runs with `-continue` and checks the configuration's one temporal property, every safety invariant
-  of the scenario, and the run's witnesses, with no symmetry reduction (symmetry and liveness checking together are
-  unsound in TLC). Passes only if the invariants reported violated are exactly its `violated` witnesses plus its
-  `open_findings`, and the property is not violated unless it is itself an open finding. The witnesses show that the
-  run reaches the states its property is about (Section 7); without them a liveness configuration that constrains its
-  state space to almost nothing would pass without checking anything. TLC 2.19 with `-continue` still checks the
-  temporal property over the complete state space after reporting invariant violations, and reports both (measured
-  2026-09-12). A configuration that checks a temporal property (a
+  invariant. The configuration lists the scenario's safety invariants and no witness. The run passes only if the set
+  reported equals the run's `open_findings` exactly: every open finding still violated, no other safety invariant
+  violated, and every label of every actor it runs covered (above). An open finding that stops failing also fails the
+  run, so the entry is removed together with the spec fix.
+- `witness`: TLC runs without `-continue` and the configuration lists exactly one invariant, the negation of a fact the
+  scenario must reach that no label's coverage states (Section 7). Passes only if TLC stops with that invariant
+  violated, which both proves the fact and yields the one trace showing how it happens. These runs are small: TLC stops
+  at the first violating state.
+- `liveness`: TLC runs with `-continue` and checks the configuration's one temporal property and every safety invariant
+  of the scenario, with no symmetry reduction (symmetry and liveness checking together are unsound in TLC). Passes only
+  if the invariants reported violated are exactly its `open_findings`, the property is not violated unless it is itself
+  an open finding, and every label of every actor it runs is covered. Its scenario's `witness` runs are what show the
+  states the property is about do occur, so a configuration that constrained its state space to almost nothing could not
+  pass them. TLC 2.19 with `-continue` does still check the temporal property over the complete state space after
+  reporting invariant violations, and reports both (measured 2026-09-12), so a liveness run with an open finding is
+  judged on both. A liveness run's configuration must also declare no `SYMMETRY`, and the runner rejects one that does
+  before running it, exactly as it rejects a `PROPERTY` in a `check` configuration. Prose alone will not hold this: symmetry and
+  liveness together are unsound in TLC but TLC does not refuse the combination, and a `SYMMETRY` line is the
+  cheapest way there is to make a run that will not fit its budget suddenly fit - it shrinks the state space and
+  changes no result the gate looks at. The rule belongs where the gate can see it. A configuration that checks a
+  temporal property (a
   liveness run, or a seeded run whose "must fail" entry is a property) lists exactly one `PROPERTY`, because TLC
   reports a temporal violation without naming the property (measured against TLC 2.19).
 - Fix-flag runs: for every `check` or `liveness` run with open findings, the runner also runs the same configuration
@@ -156,6 +260,18 @@ The runner, `run.py`:
   if the hash still does not match it stops with exit code 2. The pin protects against the download changing later,
   not against a pull request that changes the tag and hash together; such a change is visible in `run.py`'s diff and
   is reviewed as a dependency change;
+- checks each run's configuration against what its `expected.toml` entry declares before running it, and stops with
+  exit code 2 on any difference. A run declares its actor sets and its numeric bounds - the `MaxObjs`, `MaxCrashes`
+  and process-set constants - and the runner reads the same constants out of the `.cfg` and compares them. This is
+  what keeps a configuration honest, because the `.cfg` is the one file in this design that a person can edit to
+  make a failing run pass: tightening a bound, emptying a process set, or adding a `SYMMETRY` line all shrink the
+  state space, and none of them changes any result the rest of the gate looks at. A rule that lives only in prose
+  about what a configuration "should" contain is a rule the `.cfg` can quietly break, so the bounds a run is
+  entitled to are declared where the gate can read them and the `.cfg` may only agree;
+- rejects a `SYMMETRY` declaration in any run whose entry does not name the actor set it is over, whatever the run's
+  kind. Symmetry with liveness is unsound, so a liveness run may declare none at all (above); but a false symmetry
+  over actors that are not interchangeable is unsound in a `check` run too, and it is the single cheapest edit that
+  makes an over-budget run fit. The permitted sets are Section 6.1's, named per run in `expected.toml`;
 - runs the selected runs (all, or one scenario with `--scenario NAME`), each under its `timeout_minutes`, killing TLC
   on timeout; a run that fails in any way does not stop the others, so one report covers every selected run;
 - runs TLC with `-tool`, whose output marks each message with a numeric message code, and decides each run's result
@@ -407,7 +523,7 @@ Safety invariants, which must hold in every reachable state:
 |---|---|
 | `SingleWriter` | For a target, at most one process is inside a publishing step whose last Section 99 check passed. The one exception the spec accepts, a stalled prior owner's in-flight call issued before an operator `--break-lock` and completing after it, is permitted only in that case. |
 | `PlainNeverOwnsUncertain` | A process without `--break-lock` never removes, renames, or overwrites a lock it classified as uncertain (`classified`), and creates a lock only at an empty lock path. |
-| `RefusalJustified` | Every `TARGET_LOCK_BUSY` refusal happens while the lock path holds, or the refusing process's open handle refers to, a lock whose owner is alive or another takeover's. |
+| `RefusalJustified` | A regression guard, not a liveness check. Every `TARGET_LOCK_BUSY` refusal rests on evidence that the lock was held, that its owner was alive, or that the lock path holds a live owner's record. Since spec 240.2 was corrected, a held OS-native lock shows only that the lock is held - it cannot tell the owner from another invocation inspecting or recovering it - so this invariant cannot establish owner liveness. What it catches is a refusal with nothing behind it: a decision table that refuses `TARGET_LOCK_BUSY` for a lock it judged dead, or a publisher refusing it at the Section 99 check when the lock path is empty or foreign. |
 | `ForeignUntouched` | A `Foreign` object at a lock path is never written, renamed, or deleted. |
 | `Classifiable` | In every state, each lock path classifies into exactly one case of the Section 6.1 judgement table: empty, foreign, uncertain, cleanup lock, live, or (by the oracle) dead; a `Torn` record classifies as uncertain. |
 | `NestedExclusion` | Two operations whose destinations nest never both write objects under the inner destination. |
@@ -418,38 +534,69 @@ Safety invariants, which must hold in every reachable state:
 | `NoSelfCollision` (Claims) | A resumed target never collides with its own claim; a hardlink dependent whose name maps to a different entry never collides with its group's claims; a dependent folded onto its canonical's entry is reported as a collision. |
 | `NoPublishAfterLockLost` (Claims) | No rename lands after `LockLost` unless it was issued (in flight, Section 5.2) before `LockLost`: the same single exception `SingleWriter` accepts, following 240.5's "a filesystem call it had already started can still complete". A revalidation that passed before `LockLost` does not by itself permit a later rename. |
 
-Reachability witnesses, which every `check` run must report violated, proving each path is reachable. Each witness
-is the negation of a ghost flag that only the named procedure's final label sets (for example, `recovered` is set
-only by a Recoverer at `S240_3_s5`), so an end state reached by some other path cannot satisfy it.
+Reachability: every path the model claims to explore is proved reached, and how depends on what the path is.
 
-| Witness | Reached when |
+A path a LABEL performs is proved by that label's coverage count in its scenario's `check` and `liveness` runs
+(Section 4), which is stronger than a witness invariant: the run fails unless EVERY label of every actor it runs is
+covered, not only the ones someone thought to name. The table below says which label proves each path the earlier
+design named as a witness, so the intent is kept and nothing is lost:
+
+| Path | Proved by the coverage of |
 |---|---|
-| `NeverAcquired` | an operation acquires the target lock |
-| `NeverRecovered` | a Recoverer completes 240.3 |
-| `NeverBrokeLock` | a Breaker or CleanupBreaker completes 240.5 |
-| `NeverRecoveredAfterCrash` | a lock left by a crash is later replaced |
-| `NeverCleanedUp` | Cleanup removes a lock |
-| `NeverTornRead` | a process reads a `Torn` record |
-| `NeverInFlightAfterTakeover` | a stalled owner's in-flight call completes after a takeover |
-| `NeverClassifiedCleanupLock` | a PlainRun or Recoverer classifies a cleanup lock |
-| `NeverDirLockAcquired` | a DirOwner passes its 96.1 check holding the directory lock |
-| `NeverDirLockBackoff` | a per-name or directory acquirer backs off on a 96.1 conflict |
-| `NeverCommittedWithClaim` (Claims) | a target commits with its claim |
-| `NeverLockLostMidCommit` (Claims) | `LockLost` happens between a PREPARE_COMMIT and its rename |
-| `NeverDeadOwnerLock` | a lock whose owner is dead is at the lock path (`DeadOwnerLockAt(t)` holds) |
-| `NeverUncertainOwnerLock` | a lock whose owner is uncertain is at the lock path (`UncertainOwnerLockAt(t)` holds) |
+| an operation acquires the target lock | `S96_1_record_end` |
+| a Recoverer completes 240.3 | `S240_3_s5` |
+| a Breaker or CleanupBreaker completes 240.5 | `S240_5_s6` |
+| Cleanup removes a lock | `S251_1_delete` |
+| a stalled owner's in-flight call completes after a takeover | `S240_5_inflight_lands` |
+| a DirOwner passes its 96.1 check holding the directory lock | `S96_1_dirowner_check` |
+| a per-name or directory acquirer backs off on a 96.1 conflict | `S96_1_backoff` |
+| a target commits with its claim (Claims) | `S182_commit` |
 
-Each scenario's `check` run lists the witnesses its actors can reach (Section 12). The last two witnesses are state
-predicates, the negation of the antecedent of a liveness property below, rather than ghost flags. A `liveness`
-configuration's invariants are the scenario's safety invariants plus exactly one witness, the one for its property,
-and its `violated` lists exactly that witness, so the run shows that the states its property constrains occur.
+A fact no single label states keeps a ghost flag or a state predicate, and its scenario has a `witness` run for it
+(Section 4): TLC without `-continue` stops at the first state that has it, which proves the fact and prints one trace.
 
-Liveness, checked in `liveness` runs under weak fairness for every process that has not crashed:
+| Witness run's invariant | Passes when TLC stops because |
+|---|---|
+| `NeverTornRead` | a process read a `Torn` record |
+| `NeverRecoveredAfterCrash` | a lock a crash had left was replaced |
+| `NeverClassifiedCleanupLock` | a PlainRun or Recoverer classified a cleanup lock |
+| `NeverDeadLockWithPendingMover` | a lock whose owner is dead sat at the lock path while no further crash could occur and a Recoverer or Cleanup had yet to run |
+| `NeverUncertainOwnerLock` | a lock whose owner is uncertain sat at the lock path |
+| `NeverLockLostMidCommit` (Claims) | `LockLost` fell between a PREPARE_COMMIT and its rename |
 
-- `DeadLockEventuallyCleared`: `[](DeadOwnerLockAt(t) => <>(~DeadOwnerLockAt(t)))`. A lock whose owner is dead is
-  eventually removed or replaced, given a Recoverer or Cleanup actor.
-- `UncertainLockEventuallyCleared`: the same for an uncertain owner's lock, given a Breaker or CleanupBreaker actor
-  (only an operator action clears it, Section 240.4).
+Each scenario lists its `witness` runs in Section 12. `NeverDeadLockWithPendingMover` is the witness for the antecedent
+of `DeadLockEventuallyCleared` below; `NeverUncertainOwnerLock` stands in for `UncertainLockEventuallyCleared`'s until
+that property's scenarios are built, when it has to be narrowed to the conditioned antecedent in the same way. A
+scenario that checks such a property always has the matching `witness` run: that is what keeps a liveness run from
+passing over a state space that never reaches its antecedent.
+
+Liveness, checked in `liveness` runs under weak fairness. PlusCal's `--fair algorithm` generates `WF_vars(Next)`, which
+is fairness over the whole next-state relation rather than per process; it is enough here only because no process
+loops, so none can be starved forever. Fairness constrains infinite behaviours only, and does not change any `check`
+run's reachable states (measured: identical counts before and after it was added).
+
+- `DeadLockEventuallyCleared`:
+  `[](DeadOwnerLock /\ EnvQuiet /\ PendingMover => <>(~DeadOwnerLock \/ UncertainReported))`. A lock whose owner is
+  dead is eventually removed or replaced, or an actor reports it cannot establish that the owner is dead - which
+  Section 240.4 preserves rather than clears - provided no further crash can occur (`EnvQuiet`) and a Recoverer or
+  Cleanup has yet to run (`PendingMover`).
+- `UncertainLockEventuallyCleared`: the same for an uncertain owner's lock, conditioned the same way on a Breaker or
+  CleanupBreaker that has yet to run (only an operator action clears it, Section 240.4). Not yet measured: its
+  scenarios are not built, and its witness above has to be narrowed to that antecedent when they are.
+
+The two conditions are what make the property checkable at all, not a weakening chosen for convenience. Measured on
+`recovery` (2026-09-12), the unconditioned `[](DeadOwnerLock => <>(~DeadOwnerLock))` is violated. The reason is not
+particular to `recovery`, so it is argued, not measured, for every other model of the same shape: with a fixed, finite
+set of actors that all finish, the last crash can always fall after the last actor has acted, and no action is enabled
+in the state that leaves. No retry and no fairness condition changes that - even a recoverer that retries without
+bound correctly exits when it sees a live owner, and the owner can die afterwards. The prose of this section already
+said "given a Recoverer or Cleanup actor"; the formula had dropped it.
+
+The conditions also bound what a passing run shows, and the bound is worth stating. `PendingMover` requires an actor
+that has not started, so the property says nothing about a lock that dies while every Recoverer and Cleanup is already
+under way - one whose owner crashes after the last of them has begun classifying. Whether those in-flight actors still
+clear it is left to the `check` runs' invariants and to coverage, neither of which proves it. A later liveness property
+over actors already in flight would have to condition on where each one is, and is not attempted here.
 
 These are linear-time properties TLC can check. The stronger "from every state some action clears it" is branching
 time and is not claimed.
@@ -483,6 +630,15 @@ ability to see that defect and the run fails.
 A seeded run whose "must fail" entry is a liveness property is still a `seeded` run (its `violated` names the property),
 checked with the liveness settings: TLC checks the scenario's temporal properties, run
 without symmetry. Every later fix that the model drives adds a row here.
+
+`SEED_CLEANUP_LOCK_UNVERIFIABLE` and `SEED_TORN_AS_FOREIGN` mean something only against the conditioned liveness
+properties of Section 7. Their unconditioned forms are violated with or without a seed - measured for
+`DeadLockEventuallyCleared` on `recovery`, and argued for these two seeds' own scenarios, which are not built, from the
+same last-crash reason - so a seeded run against them would stop with the named violation and pass while proving
+nothing about the seed - and
+Section 4 already forbids a seeded run whose scenario carries an open finding on the same property, which an
+unconditioned property would always be. Each of these seeded runs is therefore judged against a scenario whose own
+liveness run passes the conditioned property first.
 
 ## 9. Spec-drift stamp
 
@@ -663,24 +819,111 @@ scenario: a small model (`Smoke.tla`) with a check run carrying a witness and an
 seeded run, which exercises every way `run.py` judges a run in a few seconds. It lands with plan 1, before any
 protocol model exists, and stays as the runner's own regression check.
 
-| Scenario | Actors | Variants | Witnesses its `check` run expects |
+| Scenario | Actors | Variants | Its `witness` runs (Section 7); every other path is proved by label coverage |
 |---|---|---|---|
-| `recovery` | Owner (crashes), 2 Recoverers, PlainRun, Cleanup | POSIX, Windows, POSIX weak-identity | `NeverAcquired`, `NeverRecovered`, `NeverRecoveredAfterCrash`, `NeverCleanedUp`, `NeverTornRead` |
-| `breaklock` | StalledOwner, 2 Breakers, PlainRun | POSIX, Windows; POSIX weak-capability (seeded run only: with `LockCapability = weak` every actor refuses under 235.1, so the witnesses cannot be reached there) | `NeverAcquired`, `NeverBrokeLock`, `NeverInFlightAfterTakeover`, `NeverTornRead` |
-| `mixed` | Owner (crashes; its lock is dead), Breaker (may see it uncertain), Recoverer (may see it dead), PlainRun | POSIX, Windows, POSIX weak-identity | `NeverRecovered`, `NeverBrokeLock`; the weak-identity variant expects only `NeverRecovered`, because the Breaker refuses at 240.5 step 1 there |
-| `cleanup` | StalledOwner, CleanupBreaker, Breaker | POSIX, Windows | `NeverBrokeLock`, `NeverInFlightAfterTakeover` |
-| `cleanup-crash` | CleanupBreaker (crashes), PlainRun, Recoverer, Cleanup | POSIX, Windows | `NeverClassifiedCleanupLock`, `NeverCleanedUp` |
-| `nested` | Owner on the parent destination, NestedOwner on the child, PlainRun | POSIX | `NeverAcquired` |
-| `dirlock` | an Owner with a per-name lock in directory `P` (may crash), DirOwner on `P` (may crash), Recoverer, Breaker; one per-name Owner suffices for every `dirlock` witness and seed, and keeps the state space within budget | POSIX, Windows | `NeverAcquired`, `NeverDirLockAcquired`, `NeverDirLockBackoff`, `NeverBrokeLock` |
-| `claims` | Claims model, 2 workers, `LockLost` at most once, one crash and resume; one configuration per target group (Section 6.2) | POSIX with case folding (as APFS by default), Windows | `NeverCommittedWithClaim`, `NeverLockLostMidCommit` |
+| `recovery` | Owner (crashes), 2 Recoverers, PlainRun, Cleanup - **paired across four `check` runs, never all at once** (below) | POSIX, Windows | `NeverTornRead`, `NeverRecoveredAfterCrash`, `NeverDeadLockWithPendingMover` |
+| `breaklock` | StalledOwner, 2 Breakers, PlainRun | POSIX, Windows; POSIX weak-capability (seeded run only: with `LockCapability = weak` every actor refuses under 235.1, so no path of the scenario is reached there) | `NeverTornRead`, `NeverUncertainOwnerLock` |
+| `mixed` | Owner (crashes; its lock is dead), Breaker (may see it uncertain), Recoverer (may see it dead), PlainRun | POSIX, Windows, POSIX weak-identity | `NeverRecoveredAfterCrash`, `NeverUncertainOwnerLock`; in the weak-identity variant the Breaker refuses at 240.5 step 1, so its labels are listed `unreached` there (Section 4) |
+| `cleanup` | StalledOwner, CleanupBreaker, Breaker | POSIX, Windows | `NeverUncertainOwnerLock` |
+| `cleanup-crash` | CleanupBreaker (crashes), PlainRun, Recoverer, Cleanup | POSIX, Windows | `NeverClassifiedCleanupLock`, `NeverDeadLockWithPendingMover` |
+| `nested` | Owner on the parent destination, NestedOwner on the child, PlainRun | POSIX | none: every path of this scenario is a label |
+| `dirlock` | an Owner with a per-name lock in directory `P` (may crash), DirOwner on `P` (may crash), Recoverer, Breaker; one per-name Owner suffices for every `dirlock` path and seed, and keeps the state space within budget | POSIX, Windows | `NeverRecoveredAfterCrash` |
+| `claims` | Claims model, 2 workers, `LockLost` at most once, one crash and resume; one configuration per target group (Section 6.2) | POSIX with case folding (as APFS by default), Windows | `NeverLockLostMidCommit` |
 
-Every variant of a scenario expects the witness set in its row, except where the row says otherwise; a variant that
-cannot reach a witness is a change to this table with its reason, never an edit to `expected.toml` alone.
+Every variant of a scenario has the `witness` runs in its row, except where the row says otherwise, and its `check`
+run covers every label of the actors it runs (Section 4). A variant that cannot reach a path is a change to this table,
+or an `unreached` entry with its reason, never a silent edit to `expected.toml`.
 
-Liveness runs: `DeadLockEventuallyCleared` in `recovery` and `cleanup-crash`, each with the witness
-`NeverDeadOwnerLock`; `UncertainLockEventuallyCleared` in `breaklock`, `cleanup`, and `mixed` (so that
-`SEED_TORN_AS_FOREIGN` is judged against a passing run of the same scenario), each with the witness
-`NeverUncertainOwnerLock`; POSIX variant only, without symmetry.
+`recovery` runs its actors in pairs because all four together do not finish: measured, 6,290,483 distinct states at
+about twenty-one minutes with 1,866,860 still queued and growing, against a ten-minute per-run budget. Three actors
+do finish, so each POSIX `check` run of the scenario takes one pairing, and all four are measured to exhaustion and
+clean (2026-09-12, `MaxCrashes = 2`):
+
+| Run | Actors | `MaxObjs` | Distinct states, POSIX / Windows | What only this pairing reaches |
+|---|---|---|---|---|
+| `recovery-<platform>-check` | Owner, 2 Recoverers (`SYMMETRY`) | 3 | 937,335 / 1,380,999 | two recoverers racing for the same lock, which is what 240.3 step 2 is about |
+| `recovery-<platform>-check-plain` | Owner, Recoverer, PlainRun | 4 | 1,620,690 / 2,310,021 | a plain rerun (21.1) meeting a dead owner's lock a recoverer is working on |
+| `recovery-<platform>-check-cleanup` | Owner, Recoverer, Cleanup | 5 | 1,174,383 / 1,684,944 | two movers of different kinds, both entitled to move the lock aside |
+| `recovery-<platform>-check-plain-cleanup` | Owner, PlainRun, Cleanup | 6 | 1,043,058 / 1,446,348 | the plain rerun's own 240.3 path, which needs a dead cleanup lock |
+
+Counts are as measured on 2026-09-13, after the acquirer rule of spec 96.1 and 240.3 step 4 became unconditional in
+the model; each state space is about a fifth smaller than before it, because an actor that cannot take its OS-native
+lock now removes its file and stops instead of carrying on.
+
+The fourth run carries no Recoverer deliberately. `plain_recover`, `plain_recovered` and `plain_recovered_done` are
+reached only by a plain rerun that finds a dead CLEANUP lock, which only a Cleanup that created one and then crashed
+leaves behind; no other pairing covers them. Together the four cover every label of the scenario's actors except
+`S96_1_backoff`, the 96.1 directory-lock conflict that belongs to `dirlock`, and `S240_3_putback`, which needs a
+record rewritten in place by a 240.5 takeover and so belongs to `breaklock`; both are `unreached` entries in all
+four.
+
+Pairing moves work onto the `unreached` lists, and those lists are per run. A label an actor of the run owns but
+this pairing cannot reach must be listed in THAT run's entry with its reason, even though another pairing covers it:
+the three plain-rerun recovery labels above are `unreached` in `recovery-posix-check-plain`, which runs a PlainRun
+and so owns them, and covered in `recovery-posix-check-plain-cleanup`. The suite-wide rule is what makes that safe -
+it is the union across runs that may leave nothing uncovered, not any single run. A label belonging to an actor a
+pairing does not instantiate needs no entry at all: TLC reports no action for an empty process set, so those labels
+never appear in that run's report.
+
+Windows pairs the same way, with the same four actor sets under `Platform = "windows"`, named
+`recovery-windows-check` and so on. The pairing is forced by the number of concurrent actors, which the platform
+does not change.
+
+The POSIX weak-identity variant is dropped from this scenario. Measured, it explores a state graph identical to the
+strong-identity one (1,531,965 generated, 473,328 distinct, an identical coverage table): the scenario's only
+identity query is on `BrokenOf(self)`, a name each recoverer renames into exactly once, so `past` can never hold a
+second id for it and `FsIdentityChoices` returns a singleton either way. A scenario that reuses a name is what
+exercises weak identity.
+
+Liveness runs: `DeadLockEventuallyCleared` in `recovery` and `cleanup-crash`, whose `NeverDeadLockWithPendingMover`
+witness run shows the state it is about occurs; `UncertainLockEventuallyCleared` in `breaklock`, `cleanup`, and `mixed`
+(so that `SEED_TORN_AS_FOREIGN` is judged against a passing run of the same scenario), with `NeverUncertainOwnerLock`;
+POSIX variant only, without symmetry.
+
+What `recovery` found, and what changed because of it. Its liveness run, once the property was conditioned, was
+violated over the complete state space: an acquirer could lose the race for its own freshly created lock file to an
+invocation inspecting it, write its record holding nothing, and a later classifier would read the other invocation's
+OS-native lock as a live owner, so two recoverers each refused a dead owner's lock and it was never cleared. Spec
+96.1 and 240.3 step 4 now require an acquirer to hold its OS-native lock before writing its record, and to remove its
+file and start again when it cannot; with that rule the liveness run holds (1,869,534 distinct states) and every
+`check` run passes on both platforms. The same root cause also produced a misreport the model then saw once its
+refusal invariant was tightened: `TARGET_LOCK_BUSY` naming a dead owner because another recoverer held the lock. A
+bounded retry before judging "live" does not remove that in an untimed model - the scheduler can always run the retry
+before the other invocation moves - so it is left to the CLI as a heuristic, and spec 240.2 and 96.2 instead say what
+the refusal can honestly claim: that the lock is held, not that its recorded owner is alive. Under that meaning the
+refusal is correct rather than a misreport, so the model no longer flags it: the tightening that exposed it was
+removed, and `RefusalJustified` is now the regression guard Section 7 describes.
+
+That liveness run covers an Owner and two Recoverers only - `PlainRuns` and `Cleanups` are empty in its configuration -
+and the gap is not academic. With an Owner, one Recoverer and one PlainRun (one crash, no symmetry), the conditioned
+property is violated over the complete state space (583,626 distinct states, 2026-09-13): a plain rerun takes the lock
+to inspect it and judges the owner dead, the waiting Recoverer's try-lock fails meanwhile so it refuses
+`TARGET_LOCK_BUSY`, and the plain rerun then correctly refuses `RESUMABLE_OPERATION_EXISTS` (Section 21.1) and lets go.
+Both finish and the dead lock stays. The two-Recoverer run never shows this because there a tester that does not
+recover is a Recoverer reporting the owner uncertain, an outcome the property admits; a plain rerun is the one tester
+that refuses for another reason. Admitting "some invocation was refused `TARGET_LOCK_BUSY`" as an outcome would not
+fix this: the counterexample that produced the acquirer rule ended with both recoverers refused exactly that way, and
+would have passed.
+
+This is accepted, not fixed: the stranded lock is swept up by the next attempt, which spec 240.2 already says can
+succeed. The alternative was modelled and measured first (2026-09-13). With classifiers inspecting under a SHARED
+OS-native lock and owners holding it exclusively, the plain-rerun case holds - 582,756 distinct states - but a new race
+appears: two recoverers can now both classify a dead lock, one passes 240.3 step 1 and stalls while the other completes
+the whole recovery, and the stalled one then renames the fresh lock aside by path, so the new owner's publish check
+refuses. Safety held throughout (the five safety invariants over the complete state space), yet `RefusalJustified`
+failed on an ordinary `check` run; exclusive inspection had been serializing recoverers. Inspecting shared and recovering
+exclusive does not rescue it: neither `flock` nor `LockFileEx` upgrades a hold atomically, so the race returns in the
+upgrade window, and a recoverer blocked by an inspector must restart in a loop that either livelocks under a steady
+stream of inspectors or strands the lock. What decided it is where each design fails. Exclusive inspection fails a
+colliding invocation at the door, before it has changed anything; shared inspection fails a rightful owner after it
+has recovered and reached publish, and leaves the lock it puts back orphaned.
+
+Two smaller items were found along the way and are deferred, not fixed. The model's refusal at the Section 99 check
+returns without closing its own handle, so a refusing owner finishes still holding its OS-native lock, which a real
+process gives up on exit; the path is unreachable under exclusive inspection, so it is latent. And spec 240.3 step 1's
+"re-read the lock" does not say whether it reads the lock path or the handle already open. The model reads the path,
+and with that reading safety is measured to hold; that step 3's post-move identity check would equally keep a handle
+re-read safe is argued, not measured.
 
 Build order: the scenarios are built one plan at a time, not all at once, so that the first TLC runs measure real
 state-space sizes and their findings are triaged before more actors are built on the same model. Plan 2 builds
@@ -696,12 +939,56 @@ only as Section 6.1 states (`recovery` and `breaklock`, in `check` and `seeded` 
 order-of-magnitude estimates made during review (`dirlock` and the `claims` group `A`/`a` were the two at risk), not
 from measured runs; the first runs measure them. The `recovery` liveness run is measured first of all, because liveness
 checking cannot use symmetry (Section 4) and has to build the whole state graph: five actors interleaving filesystem
-steps with two crashes each may not fit ten minutes. When it does not, the tightenings, in this order, are one crash
-instead of two in that run, then one Recoverer instead of two, then dropping the `PlainRun` from the liveness
-configuration; each is recorded in the README with the measurement that forced it, and the `check` runs keep the full
-actor set. Each TLC run's `timeout_minutes` is
+steps with two crashes each may not fit ten minutes. The `check` runs now say this is near certain: three of those
+five actors already take 1.2 to 2.2 million states WITH symmetry available, and all four together did not finish at
+all. When the liveness run does not fit, the tightenings, in this order, are one crash instead of two in that run,
+then one Recoverer instead of two, then dropping the `PlainRun` from the liveness configuration; each is recorded in
+the README with the measurement that forced it.
+
+The ladder has a floor, because each rung removes some of what the property is about. A liveness run must keep at
+least one crash, or no lock is ever dead and `DeadLockEventuallyCleared` holds vacuously, and at least one actor
+able to clear the lock, or it cannot hold at all; below that the run is not a weaker check of the property but a
+check of a different one. Between the floor and the top rung the run still proves the property, and proves it under
+less contention than the scenario allows, so the README records not just which rung was taken but what the tightened
+run no longer says: a liveness run with one Recoverer says a dead lock is cleared, not that it is cleared while
+another recoverer races for it. The `check` runs, which keep the contention, are where that question is answered.
+
+A README note is not enough on its own, because the gate would go on reporting an unqualified pass for a run that
+now checks less. A tightened liveness run says so in `expected.toml`, as a `tightened` entry naming the rung taken
+and the measurement that forced it, and the runner prints that alongside the run's result. The point is not to fail
+the run - a tightened run is a legitimate one - but that nobody should be able to read the gate's output as saying
+the property holds under the scenario's full contention when it was not checked there. A fourth tightening is available to the liveness run alone and to no
+`check` run: start it from an initial state that already holds a dead owner's lock, which drops the whole prefix in
+which the owner acquires and dies. A `check` run may not do that, because those prefix states are where the
+scenario's dangerous interleavings are; a liveness run asks only whether a dead lock is eventually cleared, and that
+question begins at the state the seed sets up.
+
+Seeding that state takes two things, not one, and `FsWith` is only the first. `FsWith` builds a filesystem holding
+the record; what makes a lock DEAD is the ghost `crashed` flag of the process the record names, because a classifier
+reads `crashed[seen.op]` and can otherwise judge the lock only live or uncertain. A seeded liveness configuration
+must therefore also start `crashed` true for that owner, which in turn makes the owner's own process take one step
+to its end label and stop - the prefix the seed exists to remove. A configuration that seeds the filesystem alone
+does not model a dead owner at all; it models a live one, and the liveness property it checks is a different
+property from the one intended. Each TLC run's `timeout_minutes` is
 10; each CI matrix job (one scenario) should finish within about 20 minutes. A run that does not fit gets tighter
 bounds, and the tighter bounds are written into the README, never raised silently.
+
+That per-job figure is the one number `recovery`'s pairing does not fit, and it is recorded here rather than quietly
+exceeded. Measured on 2026-09-13 in one batch during which no other work of this project ran, as single samples on a
+developer machine whose background load was not controlled - a Ghidra worker, the peer's editor and the operating
+system's own services were all running: its four POSIX `check` runs take about twelve minutes with `-coverage 1` on
+and its four Windows runs about seventeen, so the eight together are about twenty-nine. On that machine every one of
+them fits the ten-minute per-run limit, the slowest at five minutes forty; a CI runner is typically slower, so that
+margin is not a promise. The liveness run does not fit even there: about fourteen minutes, so it exceeds the
+per-run limit as well as adding to the job, and it is the run the tightening ladder above exists for. All of that is
+before the same job's `witness` runs and its seeded runs - and before the fix-flag
+runs, which are the part that compounds worst: every `check` run carrying an open finding is run a second time as
+`<name>-fixed`, so one open finding in `recovery` turns four POSIX check runs into eight. The levers, none of them
+yet chosen: raise the per-job figure for a scenario whose actors are paired; run the pairings only on POSIX and keep
+Windows to the `recovery-windows-check` pairing alone, on the ground that the pairings test interference between
+actors rather than platform semantics; or make the CI matrix one job per run rather than one per scenario, which
+costs runner start-up per run but removes the per-job ceiling as a constraint on how a scenario is decomposed. The
+choice is the owner's and belongs in the plan that builds these runs, not in `expected.toml`.
 
 ## 13. Success criteria
 
@@ -710,10 +997,11 @@ to 7 hold with open findings counted as expected results, and the work is finish
 
 1. Every seeded run stops with its named violation.
 2. Every `check` run reports exactly its listed witnesses and its open findings violated, and no other safety
-   invariant; every fix-flag run reports exactly its witnesses. In every `check` and `liveness` run, every label of
-   every actor the run instantiates is covered except the labels it lists as `unreached`, and each of those is indeed
-   uncovered; a full `just model` reports every label of every model covered by at least one run, apart from any in
-   `never_reached`, and no `never_reached` label is named by a `trace.toml` unit (Section 4).
+   invariant, and no fix-flag run reports any. Every `witness` run stops with its own invariant violated. In every
+   `check` and `liveness` run, every label of every actor the run instantiates is covered except the labels it lists as
+   `unreached`, and each of those is indeed uncovered; a full `just model` reports every label of every model covered by
+   at least one run, apart from any in `never_reached`, and no `never_reached` label is named by a `trace.toml` unit
+   (Section 4).
 3. Every `liveness` run passes.
 4. Every run finishes within its time limit on CI.
 5. The traceability check (Section 9.1) passes: every label maps to a spec step, and every spec step of the stamped
@@ -744,3 +1032,11 @@ Findings the 2026-09-12 panel stood down below its severity floor, with the guar
 - Ordinary prose beginning with `#` inside a stamped section is read as a heading and can fail the family check.
   That is what the markdown the spec is written in means (Section 9 counts ATX headings outside fenced blocks), so
   the check agrees with every other reader of the file.
+- The coverage parser could mistake a wrapped cost line for an action line, or break if TLC changed the report's
+  indentation. Every cost line is indented and every action line starts at column 1 (measured on the pinned release
+  across four runs), and the report's format is pinned by the same SHA-256 as the jar, with `record_fixtures.py`
+  re-recording `testdata/` when that pin moves - so a format change cannot arrive unnoticed between pins.
+- Three `recovery` pairings set `MaxObjs` to 4, 5 and 6 although each runs three actors, so the bound looks inflated.
+  Section 4 claims only that `MaxObjs` is at least the actor count, never that it equals it, and a bound that does not
+  bind leaves the state space unchanged: raising each of these by one gave identical state counts, so tightening them
+  would cost a re-measurement for no difference in what is checked.
