@@ -213,7 +213,8 @@ class LoadExpectedTests(unittest.TestCase):
         # CONSTRAINT, ACTION_CONSTRAINT and VIEW all cut or merge states while every constant still matches
         # expected.toml, so a .cfg could make a failing run pass (design Section 4: the .cfg may only agree).
         for cfg in ("check.cfg", "live.cfg", "seed.cfg"):
-            for section in ("CONSTRAINT Safe", "CONSTRAINTS Safe", "ACTION_CONSTRAINT Safe", "VIEW x"):
+            for section in ("CONSTRAINT Safe", "CONSTRAINTS Safe", "ACTION_CONSTRAINT Safe", "VIEW x",
+                            "TYPE Safe", "TYPE_CONSTRAINT Safe"):
                 with self.subTest(cfg=cfg, section=section):
                     cfgs = dict(CFGS, **{cfg: CFGS[cfg] + section + "\n"})
                     self.assertRejected(GOOD_EXPECTED, "must not shrink the state space", cfgs)

@@ -78,7 +78,7 @@ CFG_KEYWORDS = {
     "PROPERTY": "PROPERTY", "PROPERTIES": "PROPERTY", "SYMMETRY": "SYMMETRY",
     "CONSTRAINT": "CONSTRAINT", "CONSTRAINTS": "CONSTRAINT", "ACTION_CONSTRAINT": "ACTION_CONSTRAINT",
     "ACTION_CONSTRAINTS": "ACTION_CONSTRAINT", "VIEW": "VIEW", "CHECK_DEADLOCK": "CHECK_DEADLOCK",
-    "POSTCONDITION": "POSTCONDITION", "ALIAS": "ALIAS",
+    "POSTCONDITION": "POSTCONDITION", "ALIAS": "ALIAS", "TYPE": "TYPE", "TYPE_CONSTRAINT": "TYPE_CONSTRAINT",
 }
 
 
@@ -721,8 +721,10 @@ def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
     sections = cfg_sections(text)
     _require("CHECK_DEADLOCK" not in sections, f"{where}: the config must not set CHECK_DEADLOCK (deadlock checking stays on)")
     # A state or action constraint, or a VIEW, cuts or merges states while every constant still agrees with
-    # expected.toml, so a .cfg could make a failing run pass through them (design Section 4).
-    for shrinking in ("CONSTRAINT", "ACTION_CONSTRAINT", "VIEW"):
+    # expected.toml, so a .cfg could make a failing run pass through them (design Section 4). TYPE and
+    # TYPE_CONSTRAINT are TLC 2.19 keywords too (its ModelConfig lists them) whose effect on the explored states
+    # the runner cannot vouch for, so they are refused with the rest.
+    for shrinking in ("CONSTRAINT", "ACTION_CONSTRAINT", "VIEW", "TYPE", "TYPE_CONSTRAINT"):
         _require(shrinking not in sections,
                  f"{where}: the config must not shrink the state space with {shrinking}; bound the run through its constants")
     _require(kind != "check" or "PROPERTY" not in sections,
