@@ -4743,8 +4743,11 @@ capability rules of Section 235; otherwise `REMOTE_LOCK_UNSAFE`.
 
 A refusal with `TARGET_LOCK_BUSY`, `OPERATION_LOCKED`, or
 `TARGET_LOCK_UNCERTAIN` reports, where the lock record is readable, the
-holder's `owner_instance_id`, `boot_session_id`, `workspace_path`, and
-`last_heartbeat_wall_time`.
+recorded holder's `owner_instance_id`, `boot_session_id`, `workspace_path`,
+and `last_heartbeat_wall_time`. These are the record's contents, and like
+all lock metadata they are descriptive (Section 99.1): they name the
+operation that wrote the lock, which need not be the process holding it
+when the refusal is made (Section 240.2).
 
 ------------------------------------------------------------------------
 
@@ -10544,14 +10547,22 @@ When a new invocation encounters an existing adjacent lock:
 
 ## 240.2 Live Owner
 
-If the native locking mechanism or platform ownership information
-demonstrates that the owner is alive:
+If platform ownership information demonstrates that the owner is alive,
+or the native locking mechanism shows that the lock is held:
 
 ``` text
 TARGET_LOCK_BUSY
 ```
 
-must be returned, reporting the holder (Section 96.2).
+must be returned, reporting the recorded holder (Section 96.2).
+
+A held native lock shows only that some process holds it. An invocation
+inspecting the lock (Section 240.1 step 3) or recovering it (Section
+240.3 step 1) takes the same lock, so the process holding it may be the
+owner or another invocation, and the lock cannot tell them apart.
+`TARGET_LOCK_BUSY` therefore means that the target's lock is held, not
+that its recorded owner is alive. It may be transient: a later attempt can
+succeed once another invocation has released the lock.
 
 Flux must not steal the lock because the heartbeat happens to be old.
 
