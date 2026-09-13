@@ -156,6 +156,9 @@ fn heading_lines(spec: &str) -> Vec<HeadingLine> {
             } else if !line.trim().is_empty() {
                 if let Some(next) = lines.get(i + 1) {
                     if is_setext_underline(next) {
+                        if let Some(n) = heading_number(line) {
+                            current_number = Some(n);
+                        }
                         out.push(HeadingLine {
                             text: line.to_string(),
                             number: current_number.clone(),
@@ -1111,6 +1114,61 @@ Setext text.
     let problems = check(&Inputs { spec, stamp: &stamp, trace: &trace, tla: &tla, expected: "" });
     let text = problems.join("\n");
     assert!(text.contains("\"Sibling Setext\""), "{text}");
+}
+
+#[test]
+fn numbered_setext_heading_takes_its_own_number_not_the_one_above() {
+    // "97 Gamma" is a Setext heading whose own first word is a number; it must take that number
+    // and so is not in family 96, and must not be reported as an unlisted 96 sibling.
+    let spec = "\
+# Title
+
+## 96.1 Alpha
+Alpha text.
+
+97 Gamma
+========
+Gamma text.
+";
+    let stamp = stamp(&["## 96.1 Alpha"]);
+    let hash = unit_hash("Alpha text.");
+    let trace = format!(
+        "[[unit]]\nheading = \"## 96.1 Alpha\"\nordinal = 1\nquote = \"Alpha text\"\nhash = \"{hash}\"\nlabels = [\"S96_1_a\"]\n"
+    );
+    let tla = vec!["S96_1_a: x := 1;".to_string()];
+    let problems = check(&Inputs { spec, stamp: &stamp, trace: &trace, tla: &tla, expected: "" });
+    let text = problems.join("\n");
+    assert!(!text.contains("\"97 Gamma\""), "{text}");
+}
+
+#[test]
+fn heading_after_a_numbered_setext_heading_inherits_its_number() {
+    // The Setext heading "97 Gamma" carries its own number 97; the unnumbered heading that
+    // follows it inherits 97, landing in family 97, not family 96.
+    let spec = "\
+# Title
+
+## 96.1 Alpha
+Alpha text.
+
+97 Gamma
+========
+Gamma text.
+
+## Delta
+Delta text.
+";
+    let stamp = stamp(&["## 96.1 Alpha"]);
+    let hash = unit_hash("Alpha text.");
+    let trace = format!(
+        "[[unit]]\nheading = \"## 96.1 Alpha\"\nordinal = 1\nquote = \"Alpha text\"\nhash = \"{hash}\"\nlabels = [\"S96_1_a\"]\n"
+    );
+    let tla = vec!["S96_1_a: x := 1;".to_string()];
+    let problems = check(&Inputs { spec, stamp: &stamp, trace: &trace, tla: &tla, expected: "" });
+    let text = problems.join("\n");
+    // "## Delta" is not in family 96 (it inherited 97 from the Setext heading above it), so it
+    // must not be reported against 96.1 Alpha's family.
+    assert!(!text.contains("\"## Delta\""), "{text}");
 }
 
 #[test]
