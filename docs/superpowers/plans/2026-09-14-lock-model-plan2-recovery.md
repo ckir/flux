@@ -10305,3 +10305,27 @@ run.py: 21 runs, exit 0
 
 Then remove the label with `gh pr edit --remove-label model-extended`. While the label is on, every push restarts
 the tier's jobs, which take about 40 and 50 minutes.
+
+## Stand-downs
+
+Adversarial panel over this plan and the design delta, four rounds (solo and agy, 2026-09-14).
+- **Discarded below the severity floor, or accepted unverified:** none.
+- **Folded:**
+  - runner fix `584fe0b`: a procedure no process calls is gated, not exempt;
+  - the plan's shellcheck, label and `gh` instructions;
+  - the design's run-field table: `module`, `violated`, `constants`, `symmetry`, `tightened`, and the `name`
+    character set.
+- **Deferred to `.clavity/local-anomalies.md` (2026-09-14):** `open_findings[].tracking` is not validated against an
+  inbox entry.
+- **Rejected, with the measurement that settled each:**
+  - a host crash acting as a directory flush: design Section 5.2 and `FsModel.tla`, where post-crash disk state is
+    durable;
+  - the union job loading `expected-extended.toml`: design Section 4, where host-crash runs cover no new label;
+  - a union failure needing a counterexample trace: the runner names the label, and the README describes the witness
+    re-run;
+  - listing a dead label in `unreached` as a bypass: the union still fails;
+  - an `OSError` skipping the union silently: `run.py` exits 2 with a message;
+  - TLC resuming from a stale state directory: `tlc_command` never passes `-recover`;
+  - an out-of-memory failure without `-Xmx`: the 28,314,300-state run passed on CI.
+- **The panel stopped at the severity floor after round 4.** Its last findings were precision fixes to one table,
+  whose failure mode is an explicit load-time rejection.
