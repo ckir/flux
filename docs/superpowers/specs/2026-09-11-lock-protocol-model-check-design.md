@@ -289,7 +289,8 @@ The runner, `run.py`:
   about what a configuration "should" contain is a rule the `.cfg` can quietly break, so the bounds a run is
   entitled to are declared where the gate can read them and the `.cfg` may only agree. For the same reason a `.cfg`
   may not contain a `CONSTRAINT`, `ACTION_CONSTRAINT` or `VIEW` section: each cuts or merges states while every
-  constant still agrees, so the runner rejects all three in every kind of run;
+  constant still agrees, so the runner rejects all three in every kind of run. It rejects TLC's `TYPE` and
+  `TYPE_CONSTRAINT` sections too, whose effect on the explored states it cannot vouch for;
 - rejects a `SYMMETRY` declaration in any run whose entry does not name the actor set it is over, whatever the run's
   kind. Symmetry with liveness is unsound, so a liveness run may declare none at all (above); but a false symmetry
   over actors that are not interchangeable is unsound in a `check` run too, and it is the single cheapest edit that
