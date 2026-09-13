@@ -15,6 +15,9 @@ kind = "check"
 open_findings = [
     { name = "AtMostThree", tracking = "selftest: exercises the open-finding and fix-flag path", fix_flag = "FIX_BOUND" },
 ]
+unreached = [
+    { label = "Overshoot", reason = "SEED_OVERSHOOT is off in this run; the seeded run reaches it" },
+]
 constants = { SEED_OVERSHOOT = false }
 timeout_minutes = 2
 
@@ -24,6 +27,9 @@ module = "Smoke"
 config = "configs/selftest-liveness.cfg"
 scenario = "selftest"
 kind = "liveness"
+unreached = [
+    { label = "Overshoot", reason = "SEED_OVERSHOOT is off in this run; the seeded run reaches it" },
+]
 constants = { SEED_OVERSHOOT = false }
 timeout_minutes = 2
 

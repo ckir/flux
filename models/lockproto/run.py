@@ -57,6 +57,14 @@ C_COUNTEREXAMPLE = 2264  # "The following behavior constitutes a counter-example
 ALLOWED_ERROR_CODES = {C_INVARIANT_INITIAL, C_INVARIANT, C_DEADLOCK, C_TEMPORAL, C_BEHAVIOR, C_COUNTEREXAMPLE}
 SEVERITY_ERROR = 1
 
+# '-coverage 1' message codes (design Section 4, "Five things about reading that report").
+C_COVERAGE_START = 2201  # "The coverage statistics at ..."
+C_COVERAGE_ACTION = 2772  # one action's line: <Name ...>: DISTINCT:TOTAL - a label
+C_COVERAGE_INIT = 2773  # the Init action's line, same shape - not a label
+C_COVERAGE_DEF = 2774  # an invariant or definition being evaluated, no counts - not a label
+C_COVERAGE_COST = 2221  # an indented cost sub-line for an expression - not a label
+C_COVERAGE_END = 2202  # "End of statistics[...]"
+
 DEADLOCK = "DEADLOCK"
 TRACE_STATES_SHOWN = 60
 
@@ -351,6 +359,14 @@ def load_expected(path: Path) -> Expected:
             open_names = {f.name for r in runs if r.scenario == run.scenario for f in r.open_findings}
             _require(run.violated[0] not in open_names,
                      f"{run.name}: its scenario carries an open finding on {run.violated[0]}, so the seed cannot be judged")
+
+    # 'never_reached' excuses a label from every run's coverage; it must exist in some run's module.
+    module_universes = {r.module: module_labels((base / f"{r.module}.tla").read_text(encoding="utf-8"))
+                         for r in runs}
+    every_label = frozenset(label for u in module_universes.values() for label in u.labels)
+    for label, _reason in never_reached:
+        _require(label in every_label,
+                 f"'never_reached': label {label!r} is not in the label universe of any run's module")
     return Expected(scenarios, runs, never_reached)
 
 
@@ -425,6 +441,139 @@ def strip_tla_comments(text: str) -> str:
         out.append(text[i])
         i += 1
     return "".join(out)
+
+
+# ---------------------------------------------------------------------------------------
+# The model's labels and who owns them (design Section 4: the coverage gate's "four rules")
+
+
+_ALGORITHM_START = re.compile(r"\(\*\s*--(?:fair\s+algorithm|algorithm)\b")
+_PROCESS_HEADER = re.compile(r"\bprocess\s*\(\s*([A-Za-z_]\w*)\s*(\\in|=)\s*")
+_PROCEDURE_HEADER = re.compile(r"\bprocedure\s+([A-Za-z_]\w*)\s*\(")
+_CALL = re.compile(r"\bcall\s+([A-Za-z_]\w*)\s*\(")
+_LABEL_LINE = re.compile(r"^[ \t]*([A-Za-z_]\w*):(?!=)")
+_TOPLEVEL_DEF = re.compile(r"^([A-Za-z_]\w*)\s*==", re.M)
+
+
+@dataclass(frozen=True)
+class LabelUniverse:
+    """A module's label universe (design Section 4) and, for a PlusCal module, how to tell whether
+    a run's constants make a label exempt from the coverage gate.
+
+    `owners[label]` is the set of process-block ids (a process's bound name, e.g. "own", "env")
+    that own `label`, directly or by calling (transitively, through `procedure`s) the block it is
+    in; a label absent from `owners` (or mapped to an empty set) is inside a procedure no process
+    reaches, which is vacuously exempt. `blocks[block_id]` is that process block's `\\in` set
+    constant name, or None if it is declared `= VALUE` (always instantiated, so any label it owns is
+    never exempt). Both dicts are empty, and nothing is ever exempt, for a non-PlusCal module."""
+    pluscal: bool
+    labels: frozenset[str]
+    owners: dict[str, frozenset[str]]
+    blocks: dict[str, str | None]
+
+    def is_exempt(self, label: str, constants: dict[str, object]) -> bool:
+        if not self.pluscal:
+            return False
+        for block in self.owners.get(label, frozenset()):
+            setname = self.blocks.get(block)
+            if setname is None:  # a `= VALUE` process: always instantiated, never exempt
+                return False
+            value = constants.get(setname)
+            if not (isinstance(value, frozenset) and len(value) == 0):
+                return False
+        return True
+
+
+def _strip_line_comments(text: str) -> str:
+    """Truncate each line of `text` at its first '\\*' (a TLA+ line comment); code is left intact."""
+    return "\n".join(line.split("\\*", 1)[0] for line in text.split("\n"))
+
+
+def _find_matching_close(text: str, open_pos: int) -> int:
+    """Return the index just past the '*)' that matches the '(*' at open_pos (nesting-aware)."""
+    depth, i, n = 0, open_pos, len(text)
+    while i < n:
+        if text.startswith("(*", i):
+            depth += 1
+            i += 2
+        elif text.startswith("*)", i):
+            depth -= 1
+            i += 2
+            if depth == 0:
+                return i
+        else:
+            i += 1
+    raise ExpectedError("the module's PlusCal algorithm comment is never closed with '*)'")
+
+
+def _pcal_block(module_text: str) -> str | None:
+    """Return the source of the module's PlusCal algorithm (the whole '(* --algorithm ... *)' or
+    '(* --fair algorithm ... *)' comment, nesting-aware), or None if it has none."""
+    match = _ALGORITHM_START.search(module_text)
+    if match is None:
+        return None
+    return module_text[match.start(): _find_matching_close(module_text, match.start())]
+
+
+def module_labels(module_text: str) -> LabelUniverse:
+    """The label universe of a .tla module, and (for a PlusCal module) each label's owners."""
+    block = _pcal_block(module_text)
+    if block is None:
+        labels = frozenset(m.group(1) for m in _TOPLEVEL_DEF.finditer(strip_tla_comments(module_text)))
+        return LabelUniverse(False, labels, {}, {})
+
+    text = _strip_line_comments(block)
+
+    # (position, block id, kind, `\in` set name or None) for every process/procedure header, in
+    # the order they appear; a block runs from its header to the next header or the block's end.
+    headers: list[tuple[int, str, str, str | None]] = []
+    for m in _PROCESS_HEADER.finditer(text):
+        proc_name, op = m.group(1), m.group(2)
+        if op == "\\in":
+            setname_match = re.match(r"([A-Za-z_]\w*)\s*\)", text[m.end():])
+            if setname_match is None:
+                raise ExpectedError(f"process ({proc_name} \\in ...) must name a single identifier "
+                                     "as its process set")
+            headers.append((m.start(), proc_name, "process", setname_match.group(1)))
+        else:
+            headers.append((m.start(), proc_name, "process", None))
+    for m in _PROCEDURE_HEADER.finditer(text):
+        headers.append((m.start(), m.group(1), "procedure", None))
+    headers.sort(key=lambda h: h[0])
+
+    process_sets: dict[str, str | None] = {}
+    block_kind: dict[str, str] = {}
+    block_labels: dict[str, set[str]] = {}
+    block_calls: dict[str, set[str]] = {}
+    for idx, (pos, block_id, kind, setname) in enumerate(headers):
+        end = headers[idx + 1][0] if idx + 1 < len(headers) else len(text)
+        span = text[pos:end]
+        block_kind[block_id] = kind
+        if kind == "process":
+            process_sets[block_id] = setname
+        block_labels[block_id] = {match.group(1) for line in span.split("\n")
+                                   for match in [_LABEL_LINE.match(line)] if match}
+        block_calls[block_id] = {m.group(1) for m in _CALL.finditer(span)}
+
+    # Forward reachability from each process block, over call edges through procedures: a label is
+    # owned by every process block whose call graph reaches the block the label is defined in.
+    owners: dict[str, set[str]] = {}
+    for root, kind in block_kind.items():
+        if kind != "process":
+            continue
+        seen: set[str] = set()
+        stack = [root]
+        while stack:
+            current = stack.pop()
+            if current in seen or current not in block_labels:
+                continue
+            seen.add(current)
+            for label in block_labels[current]:
+                owners.setdefault(label, set()).add(root)
+            stack.extend(block_calls.get(current, ()))
+
+    all_labels = frozenset(label for labels in block_labels.values() for label in labels)
+    return LabelUniverse(True, all_labels, {k: frozenset(v) for k, v in owners.items()}, process_sets)
 
 
 def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
@@ -504,6 +653,13 @@ def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
 
     declared_constants = _load_constants(raw, where)
 
+    module_text = (base / f"{module}.tla").read_text(encoding="utf-8")
+    universe = module_labels(module_text)
+    for label, _reason in unreached:
+        _require(label in universe.labels, f"{where}: unreached label {label!r} is not in {module}.tla's labels")
+        _require(not universe.is_exempt(label, declared_constants),
+                 f"{where}: unreached label {label!r} needs no entry: its actor does not run here")
+
     raw_symmetry = raw.get("symmetry")
     _require(kind != "liveness" or raw_symmetry is None, f"{where}: a liveness run must not declare symmetry")
     symmetry: tuple[str, str] | None = None
@@ -541,7 +697,6 @@ def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
         definition, over = symmetry
         _require(sections["SYMMETRY"] == [definition],
                  f"{where}: the config's SYMMETRY must name exactly {definition!r}")
-        module_text = (base / f"{module}.tla").read_text(encoding="utf-8")
         def_pattern = re.compile(rf"\b{re.escape(definition)}\b\s*==\s*Permutations\s*\(\s*{re.escape(over)}\s*\)")
         _require(def_pattern.search(strip_tla_comments(module_text)) is not None,
                  f"{where}: {module}.tla must define {definition} == Permutations({over})")
@@ -631,6 +786,64 @@ def interpret(exit_code: int, output: str, properties: list[str]) -> Outcome:
     return Outcome(None, frozenset(observed), states, trace)
 
 
+_COVERAGE_ACTION_NAME = re.compile(r"^<([A-Za-z_]\w*)\b")
+_COVERAGE_COUNTS = re.compile(r"(\d+):(\d+)\s*$")
+
+
+def parse_coverage(messages: list[Message]) -> dict[str, tuple[int, int]] | None:
+    """Parse the LAST complete '-coverage 1' block (a 2201 start followed later by a 2202 end) in
+    `messages` into {action name: (distinct, total)}, summing the counts of a name that appears
+    twice in that block. '-coverage 1' prints a snapshot every minute and a final block; only the
+    last COMPLETE one covers the whole run (design Section 4), so an incomplete trailing block (the
+    run was killed mid-write) is ignored, not returned. Returns None when there is no complete
+    block at all."""
+    last_block: list[Message] | None = None
+    start: int | None = None
+    for i, m in enumerate(messages):
+        if m.code == C_COVERAGE_START:
+            start = i
+        elif m.code == C_COVERAGE_END and start is not None:
+            last_block = messages[start: i + 1]
+            start = None
+    if last_block is None:
+        return None
+
+    result: dict[str, tuple[int, int]] = {}
+    for m in last_block:
+        if m.code != C_COVERAGE_ACTION:
+            continue  # 2773 (Init), 2774 (a definition, no counts), 2221 (a cost sub-line): not labels
+        name_match = _COVERAGE_ACTION_NAME.match(m.text)
+        counts_match = _COVERAGE_COUNTS.search(m.text)
+        if not name_match or not counts_match:
+            continue
+        name = name_match.group(1)
+        distinct, total = int(counts_match.group(1)), int(counts_match.group(2))
+        prev = result.get(name, (0, 0))
+        result[name] = (prev[0] + distinct, prev[1] + total)
+    return result
+
+
+def judge_coverage(run: Run, universe: LabelUniverse, coverage: dict[str, tuple[int, int]]) -> list[str]:
+    """The per-run coverage gate (design Section 4, "four rules"): failures for one check/liveness
+    run that is not -fixed and finished without a tooling error or timeout (the caller decides
+    whether the gate applies at all; this only judges `coverage` against `universe`). Empty means
+    the gate passed."""
+    unreached_labels = {label for label, _ in run.unreached}
+    if universe.pluscal:
+        gated = {label for label in universe.labels if not universe.is_exempt(label, dict(run.constants))}
+    else:
+        gated = {name for name in coverage if name in universe.labels}
+
+    failures: list[str] = []
+    for label in sorted(gated):
+        if coverage.get(label, (0, 0))[1] == 0 and label not in unreached_labels:
+            failures.append(f"{label}: gated label not covered (TOTAL 0)")
+    for label in sorted(unreached_labels):
+        if coverage.get(label, (0, 0))[1] > 0:
+            failures.append(f"{label}: covered - remove it from unreached")
+    return failures
+
+
 def expected_set(run: Run, fixed: bool) -> frozenset[str]:
     names = set(run.violated)
     if not fixed:
@@ -706,11 +919,15 @@ def ensure_jar(target: Path = TARGET, fetch: Callable[[str, Path], None] = downl
 # Running TLC
 
 
-def tlc_command(jar: Path, run: Run, cfg: Path, metadir: Path) -> list[str]:
+def tlc_command(jar: Path, run: Run, cfg: Path, metadir: Path, fixed: bool) -> list[str]:
     cmd = ["java", "-XX:+UseParallelGC", "-cp", str(jar), "tlc2.TLC", "-tool", "-workers", "auto",
            "-metadir", str(metadir), "-config", str(cfg)]
     if run.kind in ("check", "liveness"):
         cmd.append("-continue")
+    if not fixed:
+        # Every non-fixed run carries coverage: the per-run gate needs it for check/liveness, and
+        # the suite-wide union needs it for every kind (design Section 4).
+        cmd.extend(["-coverage", "1"])
     cmd.append(run.module)
     return cmd
 
@@ -732,7 +949,7 @@ def execute(run: Run, jar: Path, base: Path, fixed: bool) -> Result:
 
     start = time.monotonic()
     with log.open("w", encoding="utf-8") as out:
-        proc = subprocess.Popen(tlc_command(jar, run, cfg, metadir), cwd=base, stdout=out,
+        proc = subprocess.Popen(tlc_command(jar, run, cfg, metadir, fixed), cwd=base, stdout=out,
                                 stderr=subprocess.STDOUT)
         try:
             code = proc.wait(timeout=run.timeout_minutes * 60)
@@ -753,8 +970,24 @@ def execute(run: Run, jar: Path, base: Path, fixed: bool) -> Result:
                       f"TIMEOUT after {run.timeout_minutes} min", (), log)
     outcome = interpret(code, output, cfg_properties(text))
     status = judge(run, outcome, fixed)
+    detail = outcome.tooling_error or ""
+
+    # The per-run coverage gate (design Section 4): check/liveness only, not -fixed, and only when
+    # the run finished without a tooling error (a timed-out run never reaches this point at all).
+    if run.kind in ("check", "liveness") and not fixed and outcome.tooling_error is None:
+        coverage = parse_coverage(parse_messages(output))
+        if coverage is None:
+            status = "tooling"
+            detail = "no coverage report"
+        else:
+            universe = module_labels((base / f"{run.module}.tla").read_text(encoding="utf-8"))
+            failures = judge_coverage(run, universe, coverage)
+            if failures:
+                status = "mismatch"
+                detail = "; ".join(f for f in [detail, "; ".join(failures)] if f)
+
     return Result(name, status, expected, outcome.observed, outcome.distinct_states, seconds,
-                  outcome.tooling_error or "", outcome.trace, log)
+                  detail, outcome.trace, log)
 
 
 def report(result: Result, tightened: tuple[str, str] | None = None) -> None:
@@ -774,6 +1007,51 @@ def report(result: Result, tightened: tuple[str, str] | None = None) -> None:
             print("         " + state.replace("\n", "\n         "))
         if result.log is not None:
             print(f"         full TLC output: {result.log}")
+
+
+def judge_union(executed: list[tuple[Run, bool, Result]], base: Path,
+                 never_reached: tuple[tuple[str, str], ...]) -> bool:
+    """The suite-wide coverage union (design Section 4), judged only when every run in
+    expected.toml was selected (no --scenario). `executed` is every (run, fixed, result) this
+    invocation ran. A label of any run's module is covered if ANY run of that module - any
+    scenario, any kind, not -fixed - reports it with TOTAL > 0 in its last coverage block; whatever
+    is not covered that way must be listed in `never_reached`, and a listed label that IS covered
+    that way fails too. Prints the one-line report and returns whether the union failed (which
+    counts like a run mismatch in the exit code)."""
+    if any(result.status == "tooling" for _run, _fixed, result in executed):
+        print("run.py: suite-wide coverage not judged: a run failed or timed out")
+        return False
+
+    never_reached_labels = {label for label, _ in never_reached}
+    universes: dict[str, LabelUniverse] = {}
+    covered: dict[str, set[str]] = {}
+    reported: dict[str, set[str]] = {}
+    for run, fixed, result in executed:
+        if fixed:
+            continue
+        if run.module not in universes:
+            universes[run.module] = module_labels((base / f"{run.module}.tla").read_text(encoding="utf-8"))
+        assert result.log is not None, "a non-tooling result always has a log"
+        coverage = parse_coverage(parse_messages(result.log.read_text(encoding="utf-8", errors="replace"))) or {}
+        reported.setdefault(run.module, set()).update(coverage)
+        covered.setdefault(run.module, set()).update(name for name, (_d, total) in coverage.items() if total > 0)
+
+    all_covered: set[str] = set().union(*covered.values()) if covered else set()
+    uncovered: set[str] = set()
+    covered_in_universe: set[str] = set()
+    for module, universe in universes.items():
+        gated = universe.labels if universe.pluscal else (universe.labels & reported.get(module, set()))
+        module_covered = covered.get(module, set())
+        covered_in_universe |= gated & module_covered
+        uncovered |= {label for label in gated if label not in module_covered} - never_reached_labels
+    wrongly_covered = never_reached_labels & all_covered
+
+    if uncovered or wrongly_covered:
+        print(f"MISMATCH suite coverage  uncovered: {','.join(sorted(uncovered)) or '-'}; "
+              f"never_reached but covered: {','.join(sorted(wrongly_covered)) or '-'}")
+        return True
+    print(f"COVERAGE suite  {len(covered_in_universe)} labels covered, {len(never_reached_labels)} never_reached")
+    return False
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -808,6 +1086,7 @@ def main(argv: list[str] | None = None) -> int:
 
     base = args.expected.resolve().parent
     results: list[Result] = []
+    executed: list[tuple[Run, bool, Result]] = []
     try:
         for run in selected:
             for fixed in (False, True) if run.open_findings else (False,):
@@ -817,10 +1096,17 @@ def main(argv: list[str] | None = None) -> int:
                     result = Result(run.name, "tooling", frozenset(), frozenset(), None, 0.0, str(err), (), None)
                 report(result, run.tightened)
                 results.append(result)
+                executed.append((run, fixed, result))
     except KeyboardInterrupt:
         print(f"run.py: interrupted after {len(results)} runs", file=sys.stderr)
         return 2
     code = exit_code(results)
+
+    if args.scenario is not None:
+        print("run.py: suite-wide coverage not judged for a single scenario")
+    elif judge_union(executed, base, expected.never_reached):
+        code = 1  # a union failure counts like a run mismatch: it outranks a tooling failure too
+
     print(f"run.py: {len(results)} runs, exit {code}")
     return code
 
