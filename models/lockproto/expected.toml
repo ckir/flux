@@ -154,6 +154,17 @@ symmetry = { definition = "RecovererPerms", over = "Recoverers" }
 timeout_minutes = 30
 
 [[run]]
+name = "recovery-posix-hostcrash-witness-NeverHostCrashChangedLock"
+module = "LockProtocol"
+config = "configs/recovery-posix-hostcrash-witness-NeverHostCrashChangedLock.cfg"
+scenario = "recovery"
+kind = "witness"
+violated = ["NeverHostCrashChangedLock"]
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = true, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong" }
+symmetry = { definition = "RecovererPerms", over = "Recoverers" }
+timeout_minutes = 30
+
+[[run]]
 name = "recovery-windows-check"
 module = "LockProtocol"
 config = "configs/recovery-windows-check.cfg"

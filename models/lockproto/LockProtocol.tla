@@ -61,6 +61,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
        checked = [p \in Procs |-> FALSE],         \* its last Section 99 check passed
        recoveredAfterCrash = FALSE,               \* witness: a lock left by a crash was replaced
        tornRead = FALSE,                          \* witness: a process read a torn record
+       hostCrashChangedLock = FALSE,              \* witness: a host crash changed what is at the lock path
        touchedUncertain = FALSE,                  \* a lock judged uncertain was mutated
        touchedForeign = FALSE,                    \* a Foreign object was mutated
        refusedOk = [p \in Procs |-> FALSE],       \* the refusal below was justified
@@ -538,6 +539,8 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
              \* The whole host goes down.
              await HostCrashes;
              with (pick \in HostCrashPicks(fs), dirs \in HostCrashDirs) {
+               \* An unflushed create, move-aside or removal at the lock path undone (Section 11).
+               hostCrashChangedLock := hostCrashChangedLock \/ At(FsHostCrash(fs, pick, dirs), P, LockName) # LockObj;
                fs := FsHostCrash(fs, pick, dirs);
              };
              crashed := [q \in Procs |-> IF live[q] THEN TRUE ELSE crashed[q]];
@@ -554,12 +557,12 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "541001f4" /\ chksum(tla) = "49e942af")
-\* Procedure variable obj of procedure Classify at line 95 col 18 changed to obj_
+\* BEGIN TRANSLATION (chksum(pcal) = "4a269874" /\ chksum(tla) = "512dcb94")
+\* Procedure variable obj of procedure Classify at line 96 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, classified, ownerLive, sawLive, seenRec, crashed, live, holding, 
-          checked, recoveredAfterCrash, tornRead, touchedUncertain, 
-          touchedForeign, refusedOk, refused, pc, stack
+          checked, recoveredAfterCrash, tornRead, hostCrashChangedLock, 
+          touchedUncertain, touchedForeign, refusedOk, refused, pc, stack
 
 (* define statement *)
 LockObj == At(fs, P, LockName)
@@ -585,9 +588,9 @@ TornLock == LockObj # NoObj /\ fs.content[LockObj] = Torn
 VARIABLES keep, obj_, got, obj, robj, victim, crashes
 
 vars == << fs, classified, ownerLive, sawLive, seenRec, crashed, live, 
-           holding, checked, recoveredAfterCrash, tornRead, touchedUncertain, 
-           touchedForeign, refusedOk, refused, pc, stack, keep, obj_, got, 
-           obj, robj, victim, crashes >>
+           holding, checked, recoveredAfterCrash, tornRead, 
+           hostCrashChangedLock, touchedUncertain, touchedForeign, refusedOk, 
+           refused, pc, stack, keep, obj_, got, obj, robj, victim, crashes >>
 
 ProcSet == (Owners) \cup (PlainRuns) \cup (Recoverers) \cup (Cleanups) \cup {"env"}
 
@@ -603,6 +606,7 @@ Init == (* Global variables *)
         /\ checked = [p \in Procs |-> FALSE]
         /\ recoveredAfterCrash = FALSE
         /\ tornRead = FALSE
+        /\ hostCrashChangedLock = FALSE
         /\ touchedUncertain = FALSE
         /\ touchedForeign = FALSE
         /\ refusedOk = [p \in Procs |-> FALSE]
@@ -648,9 +652,10 @@ S240_1_open(self) == /\ pc[self] = "S240_1_open"
                                              /\ fs' = fs
                      /\ UNCHANGED << ownerLive, sawLive, crashed, live, 
                                      holding, checked, recoveredAfterCrash, 
-                                     tornRead, touchedUncertain, 
-                                     touchedForeign, refusedOk, refused, obj, 
-                                     robj, victim, crashes >>
+                                     tornRead, hostCrashChangedLock, 
+                                     touchedUncertain, touchedForeign, 
+                                     refusedOk, refused, obj, robj, victim, 
+                                     crashes >>
 
 S240_1_trylock(self) == /\ pc[self] = "S240_1_trylock"
                         /\ IF crashed[self]
@@ -666,9 +671,10 @@ S240_1_trylock(self) == /\ pc[self] = "S240_1_trylock"
                         /\ UNCHANGED << classified, ownerLive, sawLive, 
                                         seenRec, crashed, live, holding, 
                                         checked, recoveredAfterCrash, tornRead, 
-                                        touchedUncertain, touchedForeign, 
-                                        refusedOk, refused, stack, keep, obj_, 
-                                        obj, robj, victim, crashes >>
+                                        hostCrashChangedLock, touchedUncertain, 
+                                        touchedForeign, refusedOk, refused, 
+                                        stack, keep, obj_, obj, robj, victim, 
+                                        crashes >>
 
 S240_1_read(self) == /\ pc[self] = "S240_1_read"
                      /\ IF crashed[self]
@@ -699,10 +705,10 @@ S240_1_read(self) == /\ pc[self] = "S240_1_read"
                                                                       ELSE /\ classified' = [classified EXCEPT ![self] = alive]
                                 /\ pc' = [pc EXCEPT ![self] = "S240_1_close"]
                      /\ UNCHANGED << fs, crashed, live, holding, checked, 
-                                     recoveredAfterCrash, touchedUncertain, 
-                                     touchedForeign, refusedOk, refused, stack, 
-                                     keep, obj_, got, obj, robj, victim, 
-                                     crashes >>
+                                     recoveredAfterCrash, hostCrashChangedLock, 
+                                     touchedUncertain, touchedForeign, 
+                                     refusedOk, refused, stack, keep, obj_, 
+                                     got, obj, robj, victim, crashes >>
 
 S240_1_close(self) == /\ pc[self] = "S240_1_close"
                       /\ IF crashed[self]
@@ -720,9 +726,9 @@ S240_1_close(self) == /\ pc[self] = "S240_1_close"
                       /\ UNCHANGED << classified, ownerLive, sawLive, seenRec, 
                                       crashed, live, holding, checked, 
                                       recoveredAfterCrash, tornRead, 
-                                      touchedUncertain, touchedForeign, 
-                                      refusedOk, refused, obj, robj, victim, 
-                                      crashes >>
+                                      hostCrashChangedLock, touchedUncertain, 
+                                      touchedForeign, refusedOk, refused, obj, 
+                                      robj, victim, crashes >>
 
 classify_crashed(self) == /\ pc[self] = "classify_crashed"
                           /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
@@ -733,9 +739,10 @@ classify_crashed(self) == /\ pc[self] = "classify_crashed"
                           /\ UNCHANGED << fs, classified, ownerLive, sawLive, 
                                           seenRec, crashed, live, holding, 
                                           checked, recoveredAfterCrash, 
-                                          tornRead, touchedUncertain, 
-                                          touchedForeign, refusedOk, refused, 
-                                          obj, robj, victim, crashes >>
+                                          tornRead, hostCrashChangedLock, 
+                                          touchedUncertain, touchedForeign, 
+                                          refusedOk, refused, obj, robj, 
+                                          victim, crashes >>
 
 Classify(self) == S240_1_open(self) \/ S240_1_trylock(self)
                      \/ S240_1_read(self) \/ S240_1_close(self)
@@ -759,9 +766,9 @@ S96_1_create(self) == /\ pc[self] = "S96_1_create"
                       /\ UNCHANGED << classified, ownerLive, sawLive, seenRec, 
                                       crashed, live, holding, checked, 
                                       recoveredAfterCrash, tornRead, 
-                                      touchedUncertain, touchedForeign, 
-                                      refusedOk, keep, obj_, got, robj, victim, 
-                                      crashes >>
+                                      hostCrashChangedLock, touchedUncertain, 
+                                      touchedForeign, refusedOk, keep, obj_, 
+                                      got, robj, victim, crashes >>
 
 S96_1_dircheck(self) == /\ pc[self] = "S96_1_dircheck"
                         /\ IF crashed[self]
@@ -772,9 +779,10 @@ S96_1_dircheck(self) == /\ pc[self] = "S96_1_dircheck"
                         /\ UNCHANGED << fs, classified, ownerLive, sawLive, 
                                         seenRec, crashed, live, holding, 
                                         checked, recoveredAfterCrash, tornRead, 
-                                        touchedUncertain, touchedForeign, 
-                                        refusedOk, refused, stack, keep, obj_, 
-                                        got, obj, robj, victim, crashes >>
+                                        hostCrashChangedLock, touchedUncertain, 
+                                        touchedForeign, refusedOk, refused, 
+                                        stack, keep, obj_, got, obj, robj, 
+                                        victim, crashes >>
 
 S96_1_ownlock(self) == /\ pc[self] = "S96_1_ownlock"
                        /\ IF crashed[self]
@@ -789,9 +797,10 @@ S96_1_ownlock(self) == /\ pc[self] = "S96_1_ownlock"
                        /\ UNCHANGED << classified, ownerLive, sawLive, seenRec, 
                                        crashed, live, holding, checked, 
                                        recoveredAfterCrash, tornRead, 
-                                       touchedUncertain, touchedForeign, 
-                                       refusedOk, refused, stack, keep, obj_, 
-                                       got, obj, robj, victim, crashes >>
+                                       hostCrashChangedLock, touchedUncertain, 
+                                       touchedForeign, refusedOk, refused, 
+                                       stack, keep, obj_, got, obj, robj, 
+                                       victim, crashes >>
 
 S96_1_record_begin(self) == /\ pc[self] = "S96_1_record_begin"
                             /\ IF crashed[self]
@@ -802,10 +811,11 @@ S96_1_record_begin(self) == /\ pc[self] = "S96_1_record_begin"
                             /\ UNCHANGED << classified, ownerLive, sawLive, 
                                             seenRec, crashed, live, holding, 
                                             checked, recoveredAfterCrash, 
-                                            tornRead, touchedUncertain, 
-                                            touchedForeign, refusedOk, refused, 
-                                            stack, keep, obj_, got, obj, robj, 
-                                            victim, crashes >>
+                                            tornRead, hostCrashChangedLock, 
+                                            touchedUncertain, touchedForeign, 
+                                            refusedOk, refused, stack, keep, 
+                                            obj_, got, obj, robj, victim, 
+                                            crashes >>
 
 S96_1_record_end(self) == /\ pc[self] = "S96_1_record_end"
                           /\ IF crashed[self]
@@ -821,6 +831,7 @@ S96_1_record_end(self) == /\ pc[self] = "S96_1_record_end"
                           /\ UNCHANGED << classified, ownerLive, sawLive, 
                                           crashed, live, checked, 
                                           recoveredAfterCrash, tornRead, 
+                                          hostCrashChangedLock, 
                                           touchedUncertain, touchedForeign, 
                                           refusedOk, refused, keep, obj_, got, 
                                           robj, victim, crashes >>
@@ -840,8 +851,9 @@ S96_1_backoff(self) == /\ pc[self] = "S96_1_backoff"
                        /\ UNCHANGED << classified, ownerLive, sawLive, seenRec, 
                                        crashed, live, holding, checked, 
                                        recoveredAfterCrash, tornRead, 
-                                       touchedUncertain, touchedForeign, keep, 
-                                       obj_, got, robj, victim, crashes >>
+                                       hostCrashChangedLock, touchedUncertain, 
+                                       touchedForeign, keep, obj_, got, robj, 
+                                       victim, crashes >>
 
 S96_1_ownlock_backoff(self) == /\ pc[self] = "S96_1_ownlock_backoff"
                                /\ IF crashed[self]
@@ -857,7 +869,8 @@ S96_1_ownlock_backoff(self) == /\ pc[self] = "S96_1_ownlock_backoff"
                                /\ UNCHANGED << classified, ownerLive, sawLive, 
                                                seenRec, crashed, live, holding, 
                                                checked, recoveredAfterCrash, 
-                                               tornRead, touchedUncertain, 
+                                               tornRead, hostCrashChangedLock, 
+                                               touchedUncertain, 
                                                touchedForeign, refusedOk, keep, 
                                                obj_, got, robj, victim, 
                                                crashes >>
@@ -869,10 +882,10 @@ acquire_crashed(self) == /\ pc[self] = "acquire_crashed"
                          /\ UNCHANGED << fs, classified, ownerLive, sawLive, 
                                          seenRec, crashed, live, holding, 
                                          checked, recoveredAfterCrash, 
-                                         tornRead, touchedUncertain, 
-                                         touchedForeign, refusedOk, refused, 
-                                         keep, obj_, got, robj, victim, 
-                                         crashes >>
+                                         tornRead, hostCrashChangedLock, 
+                                         touchedUncertain, touchedForeign, 
+                                         refusedOk, refused, keep, obj_, got, 
+                                         robj, victim, crashes >>
 
 Acquire(self) == S96_1_create(self) \/ S96_1_dircheck(self)
                     \/ S96_1_ownlock(self) \/ S96_1_record_begin(self)
@@ -894,9 +907,9 @@ S240_3_s1(self) == /\ pc[self] = "S240_3_s1"
                    /\ UNCHANGED << fs, classified, ownerLive, sawLive, seenRec, 
                                    crashed, live, holding, checked, 
                                    recoveredAfterCrash, tornRead, 
-                                   touchedUncertain, touchedForeign, refusedOk, 
-                                   refused, stack, keep, obj_, got, obj, 
-                                   crashes >>
+                                   hostCrashChangedLock, touchedUncertain, 
+                                   touchedForeign, refusedOk, refused, stack, 
+                                   keep, obj_, got, obj, crashes >>
 
 S240_3_s2(self) == /\ pc[self] = "S240_3_s2"
                    /\ IF crashed[self]
@@ -919,9 +932,10 @@ S240_3_s2(self) == /\ pc[self] = "S240_3_s2"
                                            /\ fs' = fs
                    /\ UNCHANGED << classified, ownerLive, sawLive, seenRec, 
                                    crashed, live, holding, checked, 
-                                   recoveredAfterCrash, tornRead, refusedOk, 
-                                   refused, stack, keep, obj_, got, obj, robj, 
-                                   victim, crashes >>
+                                   recoveredAfterCrash, tornRead, 
+                                   hostCrashChangedLock, refusedOk, refused, 
+                                   stack, keep, obj_, got, obj, robj, victim, 
+                                   crashes >>
 
 S240_3_s3(self) == /\ pc[self] = "S240_3_s3"
                    /\ IF crashed[self]
@@ -933,9 +947,9 @@ S240_3_s3(self) == /\ pc[self] = "S240_3_s3"
                    /\ UNCHANGED << fs, classified, ownerLive, sawLive, seenRec, 
                                    crashed, live, holding, checked, 
                                    recoveredAfterCrash, tornRead, 
-                                   touchedUncertain, touchedForeign, refusedOk, 
-                                   refused, stack, keep, obj_, got, obj, robj, 
-                                   victim, crashes >>
+                                   hostCrashChangedLock, touchedUncertain, 
+                                   touchedForeign, refusedOk, refused, stack, 
+                                   keep, obj_, got, obj, robj, victim, crashes >>
 
 S240_3_s4(self) == /\ pc[self] = "S240_3_s4"
                    /\ IF crashed[self]
@@ -950,9 +964,9 @@ S240_3_s4(self) == /\ pc[self] = "S240_3_s4"
                    /\ UNCHANGED << classified, ownerLive, sawLive, seenRec, 
                                    crashed, live, holding, checked, 
                                    recoveredAfterCrash, tornRead, 
-                                   touchedUncertain, touchedForeign, refusedOk, 
-                                   refused, stack, keep, obj_, got, obj, robj, 
-                                   victim, crashes >>
+                                   hostCrashChangedLock, touchedUncertain, 
+                                   touchedForeign, refusedOk, refused, stack, 
+                                   keep, obj_, got, obj, robj, victim, crashes >>
 
 S240_3_s4_lock(self) == /\ pc[self] = "S240_3_s4_lock"
                         /\ IF crashed[self]
@@ -967,9 +981,10 @@ S240_3_s4_lock(self) == /\ pc[self] = "S240_3_s4_lock"
                         /\ UNCHANGED << classified, ownerLive, sawLive, 
                                         seenRec, crashed, live, holding, 
                                         checked, recoveredAfterCrash, tornRead, 
-                                        touchedUncertain, touchedForeign, 
-                                        refusedOk, refused, stack, keep, obj_, 
-                                        got, obj, robj, victim, crashes >>
+                                        hostCrashChangedLock, touchedUncertain, 
+                                        touchedForeign, refusedOk, refused, 
+                                        stack, keep, obj_, got, obj, robj, 
+                                        victim, crashes >>
 
 S240_3_s4_record_begin(self) == /\ pc[self] = "S240_3_s4_record_begin"
                                 /\ IF crashed[self]
@@ -981,6 +996,7 @@ S240_3_s4_record_begin(self) == /\ pc[self] = "S240_3_s4_record_begin"
                                                 seenRec, crashed, live, 
                                                 holding, checked, 
                                                 recoveredAfterCrash, tornRead, 
+                                                hostCrashChangedLock, 
                                                 touchedUncertain, 
                                                 touchedForeign, refusedOk, 
                                                 refused, stack, keep, obj_, 
@@ -998,6 +1014,7 @@ S240_3_s4_record_end(self) == /\ pc[self] = "S240_3_s4_record_end"
                               /\ UNCHANGED << classified, ownerLive, sawLive, 
                                               crashed, live, checked, 
                                               recoveredAfterCrash, tornRead, 
+                                              hostCrashChangedLock, 
                                               touchedUncertain, touchedForeign, 
                                               refusedOk, refused, stack, keep, 
                                               obj_, got, obj, robj, victim, 
@@ -1019,9 +1036,9 @@ S240_3_s5(self) == /\ pc[self] = "S240_3_s5"
                               /\ pc' = [pc EXCEPT ![self] = "S240_3_release"]
                    /\ UNCHANGED << classified, ownerLive, sawLive, seenRec, 
                                    crashed, live, holding, checked, tornRead, 
-                                   touchedUncertain, touchedForeign, refusedOk, 
-                                   refused, stack, keep, obj_, got, obj, robj, 
-                                   victim, crashes >>
+                                   hostCrashChangedLock, touchedUncertain, 
+                                   touchedForeign, refusedOk, refused, stack, 
+                                   keep, obj_, got, obj, robj, victim, crashes >>
 
 S240_3_s4_drop(self) == /\ pc[self] = "S240_3_s4_drop"
                         /\ IF crashed[self]
@@ -1034,9 +1051,9 @@ S240_3_s4_drop(self) == /\ pc[self] = "S240_3_s4_drop"
                         /\ UNCHANGED << classified, ownerLive, sawLive, 
                                         seenRec, crashed, live, holding, 
                                         checked, recoveredAfterCrash, tornRead, 
-                                        touchedUncertain, touchedForeign, 
-                                        refusedOk, stack, keep, obj_, got, obj, 
-                                        robj, victim, crashes >>
+                                        hostCrashChangedLock, touchedUncertain, 
+                                        touchedForeign, refusedOk, stack, keep, 
+                                        obj_, got, obj, robj, victim, crashes >>
 
 S240_3_s4_lock_backoff(self) == /\ pc[self] = "S240_3_s4_lock_backoff"
                                 /\ IF crashed[self]
@@ -1049,6 +1066,7 @@ S240_3_s4_lock_backoff(self) == /\ pc[self] = "S240_3_s4_lock_backoff"
                                                 seenRec, crashed, live, 
                                                 holding, checked, 
                                                 recoveredAfterCrash, tornRead, 
+                                                hostCrashChangedLock, 
                                                 touchedUncertain, 
                                                 touchedForeign, refusedOk, 
                                                 refused, stack, keep, obj_, 
@@ -1069,9 +1087,9 @@ S240_3_putback(self) == /\ pc[self] = "S240_3_putback"
                         /\ UNCHANGED << classified, ownerLive, sawLive, 
                                         seenRec, crashed, live, holding, 
                                         checked, recoveredAfterCrash, tornRead, 
-                                        touchedUncertain, touchedForeign, 
-                                        refusedOk, stack, keep, obj_, got, obj, 
-                                        robj, victim, crashes >>
+                                        hostCrashChangedLock, touchedUncertain, 
+                                        touchedForeign, refusedOk, stack, keep, 
+                                        obj_, got, obj, robj, victim, crashes >>
 
 S240_3_restart(self) == /\ pc[self] = "S240_3_restart"
                         /\ refused' = [refused EXCEPT ![self] = "RESTART"]
@@ -1079,9 +1097,9 @@ S240_3_restart(self) == /\ pc[self] = "S240_3_restart"
                         /\ UNCHANGED << fs, classified, ownerLive, sawLive, 
                                         seenRec, crashed, live, holding, 
                                         checked, recoveredAfterCrash, tornRead, 
-                                        touchedUncertain, touchedForeign, 
-                                        refusedOk, stack, keep, obj_, got, obj, 
-                                        robj, victim, crashes >>
+                                        hostCrashChangedLock, touchedUncertain, 
+                                        touchedForeign, refusedOk, stack, keep, 
+                                        obj_, got, obj, robj, victim, crashes >>
 
 S240_3_release(self) == /\ pc[self] = "S240_3_release"
                         /\ IF crashed[self]
@@ -1098,9 +1116,9 @@ S240_3_release(self) == /\ pc[self] = "S240_3_release"
                         /\ UNCHANGED << classified, ownerLive, sawLive, 
                                         seenRec, crashed, live, holding, 
                                         checked, recoveredAfterCrash, tornRead, 
-                                        touchedUncertain, touchedForeign, 
-                                        refusedOk, refused, keep, obj_, got, 
-                                        obj, crashes >>
+                                        hostCrashChangedLock, touchedUncertain, 
+                                        touchedForeign, refusedOk, refused, 
+                                        keep, obj_, got, obj, crashes >>
 
 recover_crashed(self) == /\ pc[self] = "recover_crashed"
                          /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
@@ -1110,9 +1128,10 @@ recover_crashed(self) == /\ pc[self] = "recover_crashed"
                          /\ UNCHANGED << fs, classified, ownerLive, sawLive, 
                                          seenRec, crashed, live, holding, 
                                          checked, recoveredAfterCrash, 
-                                         tornRead, touchedUncertain, 
-                                         touchedForeign, refusedOk, refused, 
-                                         keep, obj_, got, obj, crashes >>
+                                         tornRead, hostCrashChangedLock, 
+                                         touchedUncertain, touchedForeign, 
+                                         refusedOk, refused, keep, obj_, got, 
+                                         obj, crashes >>
 
 Recover(self) == S240_3_s1(self) \/ S240_3_s2(self) \/ S240_3_s3(self)
                     \/ S240_3_s4(self) \/ S240_3_s4_lock(self)
@@ -1140,8 +1159,9 @@ S99_check(self) == /\ pc[self] = "S99_check"
                                          /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
                    /\ UNCHANGED << fs, classified, ownerLive, sawLive, seenRec, 
                                    crashed, live, recoveredAfterCrash, 
-                                   tornRead, touchedUncertain, touchedForeign, 
-                                   keep, obj_, got, obj, robj, victim, crashes >>
+                                   tornRead, hostCrashChangedLock, 
+                                   touchedUncertain, touchedForeign, keep, 
+                                   obj_, got, obj, robj, victim, crashes >>
 
 S99_write(self) == /\ pc[self] = "S99_write"
                    /\ IF crashed[self]
@@ -1151,9 +1171,9 @@ S99_write(self) == /\ pc[self] = "S99_write"
                    /\ UNCHANGED << fs, classified, ownerLive, sawLive, seenRec, 
                                    crashed, live, holding, checked, 
                                    recoveredAfterCrash, tornRead, 
-                                   touchedUncertain, touchedForeign, refusedOk, 
-                                   refused, stack, keep, obj_, got, obj, robj, 
-                                   victim, crashes >>
+                                   hostCrashChangedLock, touchedUncertain, 
+                                   touchedForeign, refusedOk, refused, stack, 
+                                   keep, obj_, got, obj, robj, victim, crashes >>
 
 S99_release(self) == /\ pc[self] = "S99_release"
                      /\ IF crashed[self]
@@ -1166,10 +1186,10 @@ S99_release(self) == /\ pc[self] = "S99_release"
                                 /\ pc' = [pc EXCEPT ![self] = "S99_close"]
                      /\ UNCHANGED << classified, ownerLive, sawLive, seenRec, 
                                      crashed, live, recoveredAfterCrash, 
-                                     tornRead, touchedUncertain, 
-                                     touchedForeign, refusedOk, refused, stack, 
-                                     keep, obj_, got, obj, robj, victim, 
-                                     crashes >>
+                                     tornRead, hostCrashChangedLock, 
+                                     touchedUncertain, touchedForeign, 
+                                     refusedOk, refused, stack, keep, obj_, 
+                                     got, obj, robj, victim, crashes >>
 
 S99_close(self) == /\ pc[self] = "S99_close"
                    /\ IF crashed[self]
@@ -1184,9 +1204,9 @@ S99_close(self) == /\ pc[self] = "S99_close"
                    /\ UNCHANGED << classified, ownerLive, sawLive, seenRec, 
                                    crashed, live, holding, checked, 
                                    recoveredAfterCrash, tornRead, 
-                                   touchedUncertain, touchedForeign, refusedOk, 
-                                   refused, keep, obj_, got, obj, robj, victim, 
-                                   crashes >>
+                                   hostCrashChangedLock, touchedUncertain, 
+                                   touchedForeign, refusedOk, refused, keep, 
+                                   obj_, got, obj, robj, victim, crashes >>
 
 publish_crashed(self) == /\ pc[self] = "publish_crashed"
                          /\ checked' = [checked EXCEPT ![self] = FALSE]
@@ -1195,6 +1215,7 @@ publish_crashed(self) == /\ pc[self] = "publish_crashed"
                          /\ UNCHANGED << fs, classified, ownerLive, sawLive, 
                                          seenRec, crashed, live, holding, 
                                          recoveredAfterCrash, tornRead, 
+                                         hostCrashChangedLock, 
                                          touchedUncertain, touchedForeign, 
                                          refusedOk, refused, keep, obj_, got, 
                                          obj, robj, victim, crashes >>
@@ -1213,9 +1234,9 @@ own_start(self) == /\ pc[self] = "own_start"
                    /\ UNCHANGED << fs, classified, ownerLive, sawLive, seenRec, 
                                    crashed, holding, checked, 
                                    recoveredAfterCrash, tornRead, 
-                                   touchedUncertain, touchedForeign, refusedOk, 
-                                   refused, keep, obj_, got, robj, victim, 
-                                   crashes >>
+                                   hostCrashChangedLock, touchedUncertain, 
+                                   touchedForeign, refusedOk, refused, keep, 
+                                   obj_, got, robj, victim, crashes >>
 
 own_publish(self) == /\ pc[self] = "own_publish"
                      /\ IF ~crashed[self] /\ holding[self]
@@ -1228,9 +1249,9 @@ own_publish(self) == /\ pc[self] = "own_publish"
                      /\ UNCHANGED << fs, classified, ownerLive, sawLive, 
                                      seenRec, crashed, live, holding, checked, 
                                      recoveredAfterCrash, tornRead, 
-                                     touchedUncertain, touchedForeign, 
-                                     refusedOk, refused, keep, obj_, got, obj, 
-                                     robj, victim, crashes >>
+                                     hostCrashChangedLock, touchedUncertain, 
+                                     touchedForeign, refusedOk, refused, keep, 
+                                     obj_, got, obj, robj, victim, crashes >>
 
 own_end(self) == /\ pc[self] = "own_end"
                  /\ live' = [live EXCEPT ![self] = FALSE]
@@ -1238,9 +1259,9 @@ own_end(self) == /\ pc[self] = "own_end"
                  /\ UNCHANGED << fs, classified, ownerLive, sawLive, seenRec, 
                                  crashed, holding, checked, 
                                  recoveredAfterCrash, tornRead, 
-                                 touchedUncertain, touchedForeign, refusedOk, 
-                                 refused, stack, keep, obj_, got, obj, robj, 
-                                 victim, crashes >>
+                                 hostCrashChangedLock, touchedUncertain, 
+                                 touchedForeign, refusedOk, refused, stack, 
+                                 keep, obj_, got, obj, robj, victim, crashes >>
 
 own(self) == own_start(self) \/ own_publish(self) \/ own_end(self)
 
@@ -1259,9 +1280,9 @@ plain_start(self) == /\ pc[self] = "plain_start"
                      /\ UNCHANGED << fs, classified, ownerLive, sawLive, 
                                      seenRec, crashed, holding, checked, 
                                      recoveredAfterCrash, tornRead, 
-                                     touchedUncertain, touchedForeign, 
-                                     refusedOk, refused, obj, robj, victim, 
-                                     crashes >>
+                                     hostCrashChangedLock, touchedUncertain, 
+                                     touchedForeign, refusedOk, refused, obj, 
+                                     robj, victim, crashes >>
 
 S21_1_decide(self) == /\ pc[self] = "S21_1_decide"
                       /\ IF crashed[self]
@@ -1287,18 +1308,19 @@ S21_1_decide(self) == /\ pc[self] = "S21_1_decide"
                       /\ UNCHANGED << fs, classified, ownerLive, sawLive, 
                                       seenRec, crashed, live, holding, checked, 
                                       recoveredAfterCrash, tornRead, 
-                                      touchedUncertain, touchedForeign, stack, 
-                                      keep, obj_, got, obj, robj, victim, 
-                                      crashes >>
+                                      hostCrashChangedLock, touchedUncertain, 
+                                      touchedForeign, stack, keep, obj_, got, 
+                                      obj, robj, victim, crashes >>
 
 S21_1_refused(self) == /\ pc[self] = "S21_1_refused"
                        /\ pc' = [pc EXCEPT ![self] = "plain_end"]
                        /\ UNCHANGED << fs, classified, ownerLive, sawLive, 
                                        seenRec, crashed, live, holding, 
                                        checked, recoveredAfterCrash, tornRead, 
-                                       touchedUncertain, touchedForeign, 
-                                       refusedOk, refused, stack, keep, obj_, 
-                                       got, obj, robj, victim, crashes >>
+                                       hostCrashChangedLock, touchedUncertain, 
+                                       touchedForeign, refusedOk, refused, 
+                                       stack, keep, obj_, got, obj, robj, 
+                                       victim, crashes >>
 
 plain_recover(self) == /\ pc[self] = "plain_recover"
                        /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "Recover",
@@ -1312,9 +1334,9 @@ plain_recover(self) == /\ pc[self] = "plain_recover"
                        /\ UNCHANGED << fs, classified, ownerLive, sawLive, 
                                        seenRec, crashed, live, holding, 
                                        checked, recoveredAfterCrash, tornRead, 
-                                       touchedUncertain, touchedForeign, 
-                                       refusedOk, refused, keep, obj_, got, 
-                                       obj, crashes >>
+                                       hostCrashChangedLock, touchedUncertain, 
+                                       touchedForeign, refusedOk, refused, 
+                                       keep, obj_, got, obj, crashes >>
 
 plain_recovered(self) == /\ pc[self] = "plain_recovered"
                          /\ IF ~crashed[self] /\ holding[self]
@@ -1327,10 +1349,10 @@ plain_recovered(self) == /\ pc[self] = "plain_recovered"
                          /\ UNCHANGED << fs, classified, ownerLive, sawLive, 
                                          seenRec, crashed, live, holding, 
                                          checked, recoveredAfterCrash, 
-                                         tornRead, touchedUncertain, 
-                                         touchedForeign, refusedOk, refused, 
-                                         keep, obj_, got, obj, robj, victim, 
-                                         crashes >>
+                                         tornRead, hostCrashChangedLock, 
+                                         touchedUncertain, touchedForeign, 
+                                         refusedOk, refused, keep, obj_, got, 
+                                         obj, robj, victim, crashes >>
 
 plain_recovered_done(self) == /\ pc[self] = "plain_recovered_done"
                               /\ pc' = [pc EXCEPT ![self] = "plain_end"]
@@ -1338,6 +1360,7 @@ plain_recovered_done(self) == /\ pc[self] = "plain_recovered_done"
                                               sawLive, seenRec, crashed, live, 
                                               holding, checked, 
                                               recoveredAfterCrash, tornRead, 
+                                              hostCrashChangedLock, 
                                               touchedUncertain, touchedForeign, 
                                               refusedOk, refused, stack, keep, 
                                               obj_, got, obj, robj, victim, 
@@ -1353,9 +1376,9 @@ plain_acquire(self) == /\ pc[self] = "plain_acquire"
                        /\ UNCHANGED << fs, classified, ownerLive, sawLive, 
                                        seenRec, crashed, live, holding, 
                                        checked, recoveredAfterCrash, tornRead, 
-                                       touchedUncertain, touchedForeign, 
-                                       refusedOk, refused, keep, obj_, got, 
-                                       robj, victim, crashes >>
+                                       hostCrashChangedLock, touchedUncertain, 
+                                       touchedForeign, refusedOk, refused, 
+                                       keep, obj_, got, robj, victim, crashes >>
 
 plain_publish(self) == /\ pc[self] = "plain_publish"
                        /\ IF ~crashed[self] /\ holding[self]
@@ -1368,9 +1391,10 @@ plain_publish(self) == /\ pc[self] = "plain_publish"
                        /\ UNCHANGED << fs, classified, ownerLive, sawLive, 
                                        seenRec, crashed, live, holding, 
                                        checked, recoveredAfterCrash, tornRead, 
-                                       touchedUncertain, touchedForeign, 
-                                       refusedOk, refused, keep, obj_, got, 
-                                       obj, robj, victim, crashes >>
+                                       hostCrashChangedLock, touchedUncertain, 
+                                       touchedForeign, refusedOk, refused, 
+                                       keep, obj_, got, obj, robj, victim, 
+                                       crashes >>
 
 plain_end(self) == /\ pc[self] = "plain_end"
                    /\ live' = [live EXCEPT ![self] = FALSE]
@@ -1378,9 +1402,9 @@ plain_end(self) == /\ pc[self] = "plain_end"
                    /\ UNCHANGED << fs, classified, ownerLive, sawLive, seenRec, 
                                    crashed, holding, checked, 
                                    recoveredAfterCrash, tornRead, 
-                                   touchedUncertain, touchedForeign, refusedOk, 
-                                   refused, stack, keep, obj_, got, obj, robj, 
-                                   victim, crashes >>
+                                   hostCrashChangedLock, touchedUncertain, 
+                                   touchedForeign, refusedOk, refused, stack, 
+                                   keep, obj_, got, obj, robj, victim, crashes >>
 
 plain(self) == plain_start(self) \/ S21_1_decide(self)
                   \/ S21_1_refused(self) \/ plain_recover(self)
@@ -1403,8 +1427,9 @@ rec_start(self) == /\ pc[self] = "rec_start"
                    /\ UNCHANGED << fs, classified, ownerLive, sawLive, seenRec, 
                                    crashed, holding, checked, 
                                    recoveredAfterCrash, tornRead, 
-                                   touchedUncertain, touchedForeign, refusedOk, 
-                                   refused, obj, robj, victim, crashes >>
+                                   hostCrashChangedLock, touchedUncertain, 
+                                   touchedForeign, refusedOk, refused, obj, 
+                                   robj, victim, crashes >>
 
 rec_decide(self) == /\ pc[self] = "rec_decide"
                     /\ IF crashed[self]
@@ -1426,18 +1451,19 @@ rec_decide(self) == /\ pc[self] = "rec_decide"
                     /\ UNCHANGED << fs, classified, ownerLive, sawLive, 
                                     seenRec, crashed, live, holding, checked, 
                                     recoveredAfterCrash, tornRead, 
-                                    touchedUncertain, touchedForeign, stack, 
-                                    keep, obj_, got, obj, robj, victim, 
-                                    crashes >>
+                                    hostCrashChangedLock, touchedUncertain, 
+                                    touchedForeign, stack, keep, obj_, got, 
+                                    obj, robj, victim, crashes >>
 
 rec_refused(self) == /\ pc[self] = "rec_refused"
                      /\ pc' = [pc EXCEPT ![self] = "rec_end"]
                      /\ UNCHANGED << fs, classified, ownerLive, sawLive, 
                                      seenRec, crashed, live, holding, checked, 
                                      recoveredAfterCrash, tornRead, 
-                                     touchedUncertain, touchedForeign, 
-                                     refusedOk, refused, stack, keep, obj_, 
-                                     got, obj, robj, victim, crashes >>
+                                     hostCrashChangedLock, touchedUncertain, 
+                                     touchedForeign, refusedOk, refused, stack, 
+                                     keep, obj_, got, obj, robj, victim, 
+                                     crashes >>
 
 rec_recover(self) == /\ pc[self] = "rec_recover"
                      /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "Recover",
@@ -1451,9 +1477,9 @@ rec_recover(self) == /\ pc[self] = "rec_recover"
                      /\ UNCHANGED << fs, classified, ownerLive, sawLive, 
                                      seenRec, crashed, live, holding, checked, 
                                      recoveredAfterCrash, tornRead, 
-                                     touchedUncertain, touchedForeign, 
-                                     refusedOk, refused, keep, obj_, got, obj, 
-                                     crashes >>
+                                     hostCrashChangedLock, touchedUncertain, 
+                                     touchedForeign, refusedOk, refused, keep, 
+                                     obj_, got, obj, crashes >>
 
 rec_publish(self) == /\ pc[self] = "rec_publish"
                      /\ IF ~crashed[self] /\ holding[self]
@@ -1466,19 +1492,20 @@ rec_publish(self) == /\ pc[self] = "rec_publish"
                      /\ UNCHANGED << fs, classified, ownerLive, sawLive, 
                                      seenRec, crashed, live, holding, checked, 
                                      recoveredAfterCrash, tornRead, 
-                                     touchedUncertain, touchedForeign, 
-                                     refusedOk, refused, keep, obj_, got, obj, 
-                                     robj, victim, crashes >>
+                                     hostCrashChangedLock, touchedUncertain, 
+                                     touchedForeign, refusedOk, refused, keep, 
+                                     obj_, got, obj, robj, victim, crashes >>
 
 rec_publish_done(self) == /\ pc[self] = "rec_publish_done"
                           /\ pc' = [pc EXCEPT ![self] = "rec_end"]
                           /\ UNCHANGED << fs, classified, ownerLive, sawLive, 
                                           seenRec, crashed, live, holding, 
                                           checked, recoveredAfterCrash, 
-                                          tornRead, touchedUncertain, 
-                                          touchedForeign, refusedOk, refused, 
-                                          stack, keep, obj_, got, obj, robj, 
-                                          victim, crashes >>
+                                          tornRead, hostCrashChangedLock, 
+                                          touchedUncertain, touchedForeign, 
+                                          refusedOk, refused, stack, keep, 
+                                          obj_, got, obj, robj, victim, 
+                                          crashes >>
 
 rec_acquire(self) == /\ pc[self] = "rec_acquire"
                      /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "Acquire",
@@ -1490,9 +1517,9 @@ rec_acquire(self) == /\ pc[self] = "rec_acquire"
                      /\ UNCHANGED << fs, classified, ownerLive, sawLive, 
                                      seenRec, crashed, live, holding, checked, 
                                      recoveredAfterCrash, tornRead, 
-                                     touchedUncertain, touchedForeign, 
-                                     refusedOk, refused, keep, obj_, got, robj, 
-                                     victim, crashes >>
+                                     hostCrashChangedLock, touchedUncertain, 
+                                     touchedForeign, refusedOk, refused, keep, 
+                                     obj_, got, robj, victim, crashes >>
 
 rec_acquired(self) == /\ pc[self] = "rec_acquired"
                       /\ IF ~crashed[self] /\ holding[self]
@@ -1505,9 +1532,9 @@ rec_acquired(self) == /\ pc[self] = "rec_acquired"
                       /\ UNCHANGED << fs, classified, ownerLive, sawLive, 
                                       seenRec, crashed, live, holding, checked, 
                                       recoveredAfterCrash, tornRead, 
-                                      touchedUncertain, touchedForeign, 
-                                      refusedOk, refused, keep, obj_, got, obj, 
-                                      robj, victim, crashes >>
+                                      hostCrashChangedLock, touchedUncertain, 
+                                      touchedForeign, refusedOk, refused, keep, 
+                                      obj_, got, obj, robj, victim, crashes >>
 
 rec_end(self) == /\ pc[self] = "rec_end"
                  /\ live' = [live EXCEPT ![self] = FALSE]
@@ -1515,9 +1542,9 @@ rec_end(self) == /\ pc[self] = "rec_end"
                  /\ UNCHANGED << fs, classified, ownerLive, sawLive, seenRec, 
                                  crashed, holding, checked, 
                                  recoveredAfterCrash, tornRead, 
-                                 touchedUncertain, touchedForeign, refusedOk, 
-                                 refused, stack, keep, obj_, got, obj, robj, 
-                                 victim, crashes >>
+                                 hostCrashChangedLock, touchedUncertain, 
+                                 touchedForeign, refusedOk, refused, stack, 
+                                 keep, obj_, got, obj, robj, victim, crashes >>
 
 rec(self) == rec_start(self) \/ rec_decide(self) \/ rec_refused(self)
                 \/ rec_recover(self) \/ rec_publish(self)
@@ -1539,9 +1566,9 @@ clean_start(self) == /\ pc[self] = "clean_start"
                      /\ UNCHANGED << fs, classified, ownerLive, sawLive, 
                                      seenRec, crashed, holding, checked, 
                                      recoveredAfterCrash, tornRead, 
-                                     touchedUncertain, touchedForeign, 
-                                     refusedOk, refused, obj, robj, victim, 
-                                     crashes >>
+                                     hostCrashChangedLock, touchedUncertain, 
+                                     touchedForeign, refusedOk, refused, obj, 
+                                     robj, victim, crashes >>
 
 S251_1_classify(self) == /\ pc[self] = "S251_1_classify"
                          /\ IF crashed[self]
@@ -1562,18 +1589,20 @@ S251_1_classify(self) == /\ pc[self] = "S251_1_classify"
                          /\ UNCHANGED << fs, classified, ownerLive, sawLive, 
                                          seenRec, crashed, live, holding, 
                                          checked, recoveredAfterCrash, 
-                                         tornRead, touchedUncertain, 
-                                         touchedForeign, stack, keep, obj_, 
-                                         got, obj, robj, victim, crashes >>
+                                         tornRead, hostCrashChangedLock, 
+                                         touchedUncertain, touchedForeign, 
+                                         stack, keep, obj_, got, obj, robj, 
+                                         victim, crashes >>
 
 clean_refused(self) == /\ pc[self] = "clean_refused"
                        /\ pc' = [pc EXCEPT ![self] = "clean_end"]
                        /\ UNCHANGED << fs, classified, ownerLive, sawLive, 
                                        seenRec, crashed, live, holding, 
                                        checked, recoveredAfterCrash, tornRead, 
-                                       touchedUncertain, touchedForeign, 
-                                       refusedOk, refused, stack, keep, obj_, 
-                                       got, obj, robj, victim, crashes >>
+                                       hostCrashChangedLock, touchedUncertain, 
+                                       touchedForeign, refusedOk, refused, 
+                                       stack, keep, obj_, got, obj, robj, 
+                                       victim, crashes >>
 
 clean_recover(self) == /\ pc[self] = "clean_recover"
                        /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "Recover",
@@ -1587,9 +1616,9 @@ clean_recover(self) == /\ pc[self] = "clean_recover"
                        /\ UNCHANGED << fs, classified, ownerLive, sawLive, 
                                        seenRec, crashed, live, holding, 
                                        checked, recoveredAfterCrash, tornRead, 
-                                       touchedUncertain, touchedForeign, 
-                                       refusedOk, refused, keep, obj_, got, 
-                                       obj, crashes >>
+                                       hostCrashChangedLock, touchedUncertain, 
+                                       touchedForeign, refusedOk, refused, 
+                                       keep, obj_, got, obj, crashes >>
 
 S251_1_delete(self) == /\ pc[self] = "S251_1_delete"
                        /\ IF crashed[self]
@@ -1605,9 +1634,10 @@ S251_1_delete(self) == /\ pc[self] = "S251_1_delete"
                        /\ UNCHANGED << classified, ownerLive, sawLive, seenRec, 
                                        crashed, live, checked, 
                                        recoveredAfterCrash, tornRead, 
-                                       touchedUncertain, touchedForeign, 
-                                       refusedOk, refused, stack, keep, obj_, 
-                                       got, obj, robj, victim, crashes >>
+                                       hostCrashChangedLock, touchedUncertain, 
+                                       touchedForeign, refusedOk, refused, 
+                                       stack, keep, obj_, got, obj, robj, 
+                                       victim, crashes >>
 
 S251_1_close(self) == /\ pc[self] = "S251_1_close"
                       /\ IF crashed[self]
@@ -1621,9 +1651,10 @@ S251_1_close(self) == /\ pc[self] = "S251_1_close"
                       /\ UNCHANGED << classified, ownerLive, sawLive, seenRec, 
                                       crashed, live, holding, checked, 
                                       recoveredAfterCrash, tornRead, 
-                                      touchedUncertain, touchedForeign, 
-                                      refusedOk, refused, stack, keep, obj_, 
-                                      got, obj, robj, victim, crashes >>
+                                      hostCrashChangedLock, touchedUncertain, 
+                                      touchedForeign, refusedOk, refused, 
+                                      stack, keep, obj_, got, obj, robj, 
+                                      victim, crashes >>
 
 clean_end(self) == /\ pc[self] = "clean_end"
                    /\ live' = [live EXCEPT ![self] = FALSE]
@@ -1631,9 +1662,9 @@ clean_end(self) == /\ pc[self] = "clean_end"
                    /\ UNCHANGED << fs, classified, ownerLive, sawLive, seenRec, 
                                    crashed, holding, checked, 
                                    recoveredAfterCrash, tornRead, 
-                                   touchedUncertain, touchedForeign, refusedOk, 
-                                   refused, stack, keep, obj_, got, obj, robj, 
-                                   victim, crashes >>
+                                   hostCrashChangedLock, touchedUncertain, 
+                                   touchedForeign, refusedOk, refused, stack, 
+                                   keep, obj_, got, obj, robj, victim, crashes >>
 
 clean(self) == clean_start(self) \/ S251_1_classify(self)
                   \/ clean_refused(self) \/ clean_recover(self)
@@ -1649,19 +1680,22 @@ env_loop == /\ pc["env"] = "env_loop"
                                   /\ holding' = [holding EXCEPT ![p] = FALSE]
                                   /\ crashes' = crashes + 1
                              /\ pc' = [pc EXCEPT !["env"] = "env_loop"]
+                             /\ UNCHANGED hostCrashChangedLock
                           \/ /\ HostCrashes
                              /\ \E pick \in HostCrashPicks(fs):
                                   \E dirs \in HostCrashDirs:
-                                    fs' = FsHostCrash(fs, pick, dirs)
+                                    /\ hostCrashChangedLock' = (hostCrashChangedLock \/ At(FsHostCrash(fs, pick, dirs), P, LockName) # LockObj)
+                                    /\ fs' = FsHostCrash(fs, pick, dirs)
                              /\ crashed' = [q \in Procs |-> IF live[q] THEN TRUE ELSE crashed[q]]
                              /\ checked' = [q \in Procs |-> IF live[q] THEN FALSE ELSE checked[q]]
                              /\ holding' = [q \in Procs |-> IF live[q] THEN FALSE ELSE holding[q]]
                              /\ crashes' = crashes + 1
                              /\ pc' = [pc EXCEPT !["env"] = "env_loop"]
                           \/ /\ pc' = [pc EXCEPT !["env"] = "env_done"]
-                             /\ UNCHANGED <<fs, crashed, holding, checked, crashes>>
+                             /\ UNCHANGED <<fs, crashed, holding, checked, hostCrashChangedLock, crashes>>
                   ELSE /\ pc' = [pc EXCEPT !["env"] = "env_done"]
-                       /\ UNCHANGED << fs, crashed, holding, checked, crashes >>
+                       /\ UNCHANGED << fs, crashed, holding, checked, 
+                                       hostCrashChangedLock, crashes >>
             /\ UNCHANGED << classified, ownerLive, sawLive, seenRec, live, 
                             recoveredAfterCrash, tornRead, touchedUncertain, 
                             touchedForeign, refusedOk, refused, stack, keep, 
@@ -1672,7 +1706,8 @@ env_done == /\ pc["env"] = "env_done"
             /\ pc' = [pc EXCEPT !["env"] = "Done"]
             /\ UNCHANGED << fs, classified, ownerLive, sawLive, seenRec, 
                             crashed, live, holding, checked, 
-                            recoveredAfterCrash, tornRead, touchedUncertain, 
+                            recoveredAfterCrash, tornRead, 
+                            hostCrashChangedLock, touchedUncertain, 
                             touchedForeign, refusedOk, refused, stack, keep, 
                             obj_, got, obj, robj, victim, crashes >>
 
@@ -1741,6 +1776,10 @@ RefusalJustified == \A p \in Procs : refused[p] = "TARGET_LOCK_BUSY" => refusedO
 \* The two ghost witnesses, for the witness run.
 NeverTornRead == ~tornRead
 NeverRecoveredAfterCrash == ~recoveredAfterCrash
+\* A host crash changed which object the lock path names: an unflushed create, move-aside or removal
+\* was undone. Label coverage cannot show this, because the host crash shares `env_loop` with the
+\* process crash (design Section 11).
+NeverHostCrashChangedLock == ~hostCrashChangedLock
 
 \* The two state witnesses the liveness runs need: the states their properties are about do occur
 \* (design Section 7).

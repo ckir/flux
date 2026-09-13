@@ -265,7 +265,9 @@ FsProcCrash(fs, p) ==
 \* directory, either the current entries or the durable ones, which is the one-operation case, or
 \* an intermediate state the protocol reached. `HostCrashPicks` and `HostCrashDirs` are the choice
 \* sets a caller iterates.
-Unflushed(fs) == {o \in Objs : fs.content[o] # NoContent /\ fs.durable[o] # fs.content[o]}
+\* Only an object WRITTEN since its last flush (design Section 5.2). A file created and never written
+\* still holds EmptyFile, which only creation sets, and a host crash cannot tear what was never written.
+Unflushed(fs) == {o \in Objs : fs.content[o] \notin {NoContent, EmptyFile} /\ fs.durable[o] # fs.content[o]}
 HostCrashPicks(fs) == [Unflushed(fs) -> {"old", "new", "torn"}]
 HostCrashDirs == [Dirs -> {"kept", "lost"}]
 

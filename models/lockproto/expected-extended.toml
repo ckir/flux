@@ -1,0 +1,64 @@
+# The slower host-crash tier of the lock-protocol model check (design Sections 4 and 12). Same schema
+# as expected.toml. It runs on a schedule and on request, never as part of `just model` or the
+# per-pull-request jobs:
+#   python models/lockproto/run.py --expected models/lockproto/expected-extended.toml --scenario recovery
+# The suite-wide union is not judged here: host crashes share `env_loop`, so these runs cover no label
+# the process-crash runs in expected.toml miss.
+
+scenarios = ["recovery"]
+
+[[run]]
+name = "recovery-posix-hostcrash-check"
+module = "LockProtocol"
+config = "configs/recovery-posix-hostcrash-check.cfg"
+scenario = "recovery"
+kind = "check"
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = true, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong" }
+symmetry = { definition = "RecovererPerms", over = "Recoverers" }
+unreached = [
+    { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
+    { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record; breaklock reaches it" },
+]
+timeout_minutes = 150
+
+[[run]]
+name = "recovery-posix-hostcrash-plain-check"
+module = "LockProtocol"
+config = "configs/recovery-posix-hostcrash-plain-check.cfg"
+scenario = "recovery"
+kind = "check"
+constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = ["p1"], Cleanups = [], MaxObjs = 4, MaxCrashes = 2, HostCrashes = true, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong" }
+unreached = [
+    { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
+    { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record; breaklock reaches it" },
+    { label = "plain_recover", reason = "reached only by a plain rerun that finds a dead CLEANUP lock, which needs a Cleanup actor; recovery-posix-hostcrash-plain-cleanup-check reaches it" },
+    { label = "plain_recovered", reason = "reached only by a plain rerun that finds a dead CLEANUP lock, which needs a Cleanup actor; recovery-posix-hostcrash-plain-cleanup-check reaches it" },
+    { label = "plain_recovered_done", reason = "reached only by a plain rerun that finds a dead CLEANUP lock, which needs a Cleanup actor; recovery-posix-hostcrash-plain-cleanup-check reaches it" },
+]
+timeout_minutes = 150
+
+[[run]]
+name = "recovery-posix-hostcrash-cleanup-check"
+module = "LockProtocol"
+config = "configs/recovery-posix-hostcrash-cleanup-check.cfg"
+scenario = "recovery"
+kind = "check"
+constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = [], Cleanups = ["c1"], MaxObjs = 5, MaxCrashes = 2, HostCrashes = true, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong" }
+unreached = [
+    { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
+    { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record; breaklock reaches it" },
+]
+timeout_minutes = 150
+
+[[run]]
+name = "recovery-posix-hostcrash-plain-cleanup-check"
+module = "LockProtocol"
+config = "configs/recovery-posix-hostcrash-plain-cleanup-check.cfg"
+scenario = "recovery"
+kind = "check"
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = ["p1"], Cleanups = ["c1"], MaxObjs = 6, MaxCrashes = 2, HostCrashes = true, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong" }
+unreached = [
+    { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
+    { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record; breaklock reaches it" },
+]
+timeout_minutes = 150

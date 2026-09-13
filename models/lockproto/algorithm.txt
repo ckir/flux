@@ -20,6 +20,7 @@
        checked = [p \in Procs |-> FALSE],         \* its last Section 99 check passed
        recoveredAfterCrash = FALSE,               \* witness: a lock left by a crash was replaced
        tornRead = FALSE,                          \* witness: a process read a torn record
+       hostCrashChangedLock = FALSE,              \* witness: a host crash changed what is at the lock path
        touchedUncertain = FALSE,                  \* a lock judged uncertain was mutated
        touchedForeign = FALSE,                    \* a Foreign object was mutated
        refusedOk = [p \in Procs |-> FALSE],       \* the refusal below was justified
@@ -497,6 +498,8 @@
              \* The whole host goes down.
              await HostCrashes;
              with (pick \in HostCrashPicks(fs), dirs \in HostCrashDirs) {
+               \* An unflushed create, move-aside or removal at the lock path undone (Section 11).
+               hostCrashChangedLock := hostCrashChangedLock \/ At(FsHostCrash(fs, pick, dirs), P, LockName) # LockObj;
                fs := FsHostCrash(fs, pick, dirs);
              };
              crashed := [q \in Procs |-> IF live[q] THEN TRUE ELSE crashed[q]];

@@ -42,6 +42,10 @@ RefusalJustified == \A p \in Procs : refused[p] = "TARGET_LOCK_BUSY" => refusedO
 \* The two ghost witnesses, for the witness run.
 NeverTornRead == ~tornRead
 NeverRecoveredAfterCrash == ~recoveredAfterCrash
+\* A host crash changed which object the lock path names: an unflushed create, move-aside or removal
+\* was undone. Label coverage cannot show this, because the host crash shares `env_loop` with the
+\* process crash (design Section 11).
+NeverHostCrashChangedLock == ~hostCrashChangedLock
 
 \* The two state witnesses the liveness runs need: the states their properties are about do occur
 \* (design Section 7).
