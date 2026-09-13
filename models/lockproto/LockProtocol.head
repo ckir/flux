@@ -18,7 +18,8 @@ CONSTANTS
     MaxObjs,       \* how many objects this scenario's actors can create (bounds the state space)
     MaxCrashes,    \* how many crashes a run may have, both kinds together (design Section 5.2)
     HostCrashes,   \* whether a host crash is one of the crashes this run explores
-    Platform, IdentityStrength, LockCapability
+    Platform, IdentityStrength, LockCapability,
+    FIX_OWNER_HOLDS_OSLOCK \* open finding OWNER_LOCK_UNHELD: an acquirer must hold its OS-native lock
 
 Procs == Owners \cup Recoverers \cup PlainRuns \cup Cleanups
 \* <lock-name>.broken.<operation-id> beside the lock (240.3 step 2). Only an actor that can move a
