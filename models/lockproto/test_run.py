@@ -370,9 +370,13 @@ timeout_minutes = 5
 
 
 class CfgConstantsTests(unittest.TestCase):
-    """Direct tests of cfg_constants(), independent of expected.toml loading."""
+    """Direct tests of cfg_constants(), independent of expected.toml loading.
 
-    def test_returns_typed_literals_and_omits_model_values_and_substitutions(self) -> None:
+    cfg_constants fails CLOSED: the .cfg is the one file a person can edit to make a failing run
+    pass, so anything it cannot read as one of the literal shapes below is an ExpectedError, not a
+    silent skip."""
+
+    def test_returns_typed_literals_and_omits_model_values(self) -> None:
         text = (
             "CONSTANTS\n"
             "    N = 3\n"
@@ -381,7 +385,6 @@ class CfgConstantsTests(unittest.TestCase):
             "    NAMES = {a, b}\n"
             "    EMPTY = {}\n"
             "    NoProc = nobody\n"
-            "    P <- dirOp\n"
         )
         self.assertEqual(run.cfg_constants(text), {
             "N": 3,
@@ -390,6 +393,53 @@ class CfgConstantsTests(unittest.TestCase):
             "NAMES": frozenset({"a", "b"}),
             "EMPTY": frozenset(),
         })
+
+    def test_negative_integer_is_parsed(self) -> None:
+        self.assertEqual(run.cfg_constants("CONSTANT N = -1\n"), {"N": -1})
+
+    def test_negative_integer_needs_no_space(self) -> None:
+        with self.assertRaises(run.ExpectedError):
+            run.cfg_constants("CONSTANT N = - 1\n")
+
+    def test_substitution_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANT P <- dirOp\n")
+        self.assertIn("substitutes an operator for 'P'", str(ctx.exception))
+
+    def test_duplicate_assignment_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANTS\n    N = 3\n    N = 4\n")
+        self.assertIn("more than once", str(ctx.exception))
+
+    def test_duplicate_assignment_is_rejected_even_as_a_model_value(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANTS\n    P = dir\n    P = other\n")
+        self.assertIn("more than once", str(ctx.exception))
+
+    def test_unparseable_value_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANT N = 3x\n")
+        self.assertIn("N", str(ctx.exception))
+
+    def test_set_with_a_string_element_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants('CONSTANT NAMES = {a, "b"}\n')
+        self.assertIn("non-identifier element", str(ctx.exception))
+
+    def test_unterminated_set_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANT NAMES = {a, b\n")
+        self.assertIn("never closed", str(ctx.exception))
+
+    def test_missing_equals_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANT N 3\n")
+        self.assertIn("not followed by '='", str(ctx.exception))
+
+    def test_set_missing_a_comma_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANT NAMES = {a b}\n")
+        self.assertIn("missing a comma", str(ctx.exception))
 
 
 SYMMETRY_MODULE = "---- MODULE M ----\nPerms == Permutations(Recoverers)\n====\n"
@@ -442,6 +492,21 @@ class SymmetryTests(unittest.TestCase):
 
     def test_module_without_permutations_definition_is_rejected(self) -> None:
         self.assertRejected(symmetry_toml(), "must define", module_text=DEFAULT_MODULE)
+
+    def test_definition_only_in_a_line_comment_is_rejected(self) -> None:
+        module = "---- MODULE M ----\n\\* Perms == Permutations(Recoverers)\n====\n"
+        self.assertRejected(symmetry_toml(), "must define", module_text=module)
+
+    def test_definition_only_in_a_block_comment_is_rejected(self) -> None:
+        module = "---- MODULE M ----\n(* Perms == Permutations(Recoverers) *)\n====\n"
+        self.assertRejected(symmetry_toml(), "must define", module_text=module)
+
+    def test_definition_inside_a_nested_block_comment_is_rejected(self) -> None:
+        # Correct nesting treats the whole span, first `(*` to last `*)`, as one comment. A
+        # stripper that is not nesting-aware closes at the first `*)` instead, which would wrongly
+        # leave the definition below visible as real code.
+        module = "---- MODULE M ----\n(* (* inner *) Perms == Permutations(Recoverers) *)\n====\n"
+        self.assertRejected(symmetry_toml(), "must define", module_text=module)
 
     def test_symmetry_over_must_be_a_set_of_at_least_two(self) -> None:
         self.assertRejected(symmetry_toml(constants_literal='{ Recoverers = ["r1"] }'),
@@ -506,6 +571,25 @@ class CfgTests(unittest.TestCase):
     def test_fixed_cfg_rejects_a_missing_flag(self) -> None:
         with self.assertRaises(run.ExpectedError):
             run.fixed_cfg_text("CONSTANT FIX_A = TRUE\n", ["FIX_A"])
+
+
+class CommentStrippingTests(unittest.TestCase):
+    """Direct tests of strip_tla_comments(), used by the symmetry check (Part A) and by the
+    PlusCal label parser (Part B)."""
+
+    def test_removes_line_and_block_comments(self) -> None:
+        text = "A\n\\* comment\nB (* block *) C\n"
+        self.assertEqual(run.strip_tla_comments(text), "A\n\nB  C\n")
+
+    def test_nested_block_comments_are_honoured(self) -> None:
+        text = "before (* outer (* inner *) still-comment *) after"
+        self.assertEqual(run.strip_tla_comments(text), "before  after")
+
+    def test_real_definition_survives_stripping(self) -> None:
+        text = "\\* not this one: Perms == Permutations(X)\nPerms == Permutations(Recoverers)\n"
+        stripped = run.strip_tla_comments(text)
+        self.assertNotIn("Permutations(X)", stripped)
+        self.assertIn("Perms == Permutations(Recoverers)", stripped)
 
 
 class InterpretTests(unittest.TestCase):

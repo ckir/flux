@@ -176,11 +176,15 @@ def cfg_properties(text: str) -> list[str]:
 def cfg_constants(text: str) -> dict[str, object]:
     """Parse the literal-valued assignments in a TLC .cfg's CONSTANT/CONSTANTS section.
 
-    An entry is returned only for a literal value: an integer literal (int), TRUE/FALSE (bool), a
-    double-quoted string (str, unquoted), or a set literal of identifiers ({a, b} or {}, frozenset[str]).
-    A model-value assignment (NAME = someIdentifier) or a substitution (NAME <- op) is omitted: neither
-    names a literal the runner can compare against 'constants'."""
-    tokens: list[str] = []
+    An entry is returned only for a literal value: an integer literal (int, optionally negative), TRUE/FALSE
+    (bool), a double-quoted string (str, unquoted), or a set literal of identifiers ({a, b} or {}, frozenset[str]).
+    A model-value assignment (NAME = someIdentifier) is omitted: it names no literal the runner can compare
+    against 'constants'. The .cfg is the one file a person can edit to make a failing run pass, so this parser
+    fails CLOSED (raises ExpectedError) rather than silently skipping anything else it cannot read: a `<-`
+    substitution, the same constant assigned twice, a value that is none of the literal shapes above and is not
+    a single identifier, or any token sequence that is not `NAME = VALUE` (a missing '=', a stray token, an
+    unterminated set, or a set element that is not an identifier)."""
+    tokens: list[tuple[str, int, int]] = []
     current: str | None = None
     for match in _CFG_TOKEN.finditer(text):
         token = match.group(0)
@@ -190,45 +194,72 @@ def cfg_constants(text: str) -> dict[str, object]:
             current = CFG_KEYWORDS[token]
             continue
         if current == "CONSTANT":
-            tokens.append(token)
+            tokens.append((token, match.start(), match.end()))
 
     result: dict[str, object] = {}
+    seen: set[str] = set()
     i, n = 0, len(tokens)
     while i < n:
-        name = tokens[i]
+        name, _, _ = tokens[i]
+        if IDENT.fullmatch(name) is None:
+            raise ExpectedError(f"the config's CONSTANT section has an unexpected token where a constant name "
+                                 f"was expected: {name!r}")
         i += 1
         if i >= n:
-            break
-        op = tokens[i]
+            raise ExpectedError(f"the config's CONSTANT section ends after {name!r} with no '=' and value")
+        op, _, _ = tokens[i]
         i += 1
         if op == "<-":
-            if i < n:
-                i += 1  # the substituted operator name; not a literal
-            continue
-        if op != "=" or i >= n:
-            continue
-        value = tokens[i]
+            raise ExpectedError(f"the config substitutes an operator for {name!r} ('{name} <- ...'), which this "
+                                 "runner cannot read as a literal constant")
+        if op != "=":
+            raise ExpectedError(f"the config's CONSTANT section has {name!r} not followed by '=' (found {op!r})")
+        if name in seen:
+            raise ExpectedError(f"the config assigns {name!r} more than once in its CONSTANT section")
+        seen.add(name)
+        if i >= n:
+            raise ExpectedError(f"the config's CONSTANT section assigns {name!r} no value")
+        value, vstart, vend = tokens[i]
+        i += 1
         if value.startswith('"'):
             result[name] = value[1:-1]
-            i += 1
         elif value == "{":
-            i += 1
             elements: list[str] = []
-            while i < n and tokens[i] != "}":
-                if tokens[i] != ",":
-                    elements.append(tokens[i])
+            expect_element = True
+            closed = False
+            while i < n:
+                tok, _, _ = tokens[i]
+                if tok == "}":
+                    if expect_element and elements:
+                        raise ExpectedError(f"the config's set for {name!r} has a trailing comma before '}}'")
+                    i += 1
+                    closed = True
+                    break
+                if expect_element:
+                    if IDENT.fullmatch(tok) is None:
+                        raise ExpectedError(f"the config's set for {name!r} has a non-identifier element {tok!r}")
+                    elements.append(tok)
+                    expect_element = False
+                else:
+                    if tok != ",":
+                        raise ExpectedError(f"the config's set for {name!r} is missing a comma before {tok!r}")
+                    expect_element = True
                 i += 1
-            if i < n:
-                i += 1  # consume "}"
+            if not closed:
+                raise ExpectedError(f"the config's set for {name!r} is never closed with '}}'")
             result[name] = frozenset(elements)
         elif value.isdigit():
             result[name] = int(value)
+        elif value == "-" and i < n and tokens[i][0].isdigit() and tokens[i][1] == vend:
+            digits, _, _ = tokens[i]
             i += 1
+            result[name] = -int(digits)
         elif value in ("TRUE", "FALSE"):
             result[name] = value == "TRUE"
-            i += 1
+        elif IDENT.fullmatch(value) is not None:
+            pass  # a model value; not a literal, and not an error
         else:
-            i += 1  # a model value; not a literal
+            raise ExpectedError(f"the config assigns {name!r} a value this runner cannot read: {value!r}")
     return result
 
 
@@ -361,6 +392,41 @@ def _load_constants(raw: dict, where: str) -> dict[str, object]:
     return result
 
 
+def strip_tla_comments(text: str) -> str:
+    """Remove TLA+ comments from `text`: block comments `(* ... *)`, which nest (a depth counter),
+    and line comments from `\\*` to end of line. Used before a textual search for a definition, so a
+    definition that exists only inside a comment cannot satisfy the search."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    depth = 0
+    while i < n:
+        if depth > 0:
+            if text.startswith("(*", i):
+                depth += 1
+                i += 2
+            elif text.startswith("*)", i):
+                depth -= 1
+                i += 2
+            else:
+                i += 1
+            continue
+        if text.startswith("(*", i):
+            depth = 1
+            i += 2
+            continue
+        if text.startswith("\\*", i):
+            nl = text.find("\n", i)
+            if nl == -1:
+                i = n
+            else:
+                out.append("\n")
+                i = nl + 1
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
 def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
     where = f"run #{i + 1}"
     _require(set(raw) <= RUN_KEYS, f"{where}: unknown keys {sorted(set(raw) - RUN_KEYS)}")
@@ -477,7 +543,7 @@ def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
                  f"{where}: the config's SYMMETRY must name exactly {definition!r}")
         module_text = (base / f"{module}.tla").read_text(encoding="utf-8")
         def_pattern = re.compile(rf"\b{re.escape(definition)}\b\s*==\s*Permutations\s*\(\s*{re.escape(over)}\s*\)")
-        _require(def_pattern.search(module_text) is not None,
+        _require(def_pattern.search(strip_tla_comments(module_text)) is not None,
                  f"{where}: {module}.tla must define {definition} == Permutations({over})")
         over_value = declared_constants.get(over)
         _require(isinstance(over_value, frozenset) and len(over_value) >= 2,
