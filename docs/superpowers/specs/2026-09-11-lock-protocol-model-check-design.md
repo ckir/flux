@@ -886,7 +886,19 @@ invocation inspecting it, write its record holding nothing, and a later classifi
 OS-native lock as a live owner, so two recoverers each refused a dead owner's lock and it was never cleared. Spec
 96.1 and 240.3 step 4 now require an acquirer to hold its OS-native lock before writing its record, and to remove its
 file and start again when it cannot; with that rule the liveness run holds (1,869,534 distinct states) and every
-`check` run passes on both platforms. The same root cause also produced a misreport the model then saw once its
+`check` run passes on both platforms.
+
+That liveness run covers an Owner and two Recoverers only - `PlainRuns` and `Cleanups` are empty in its configuration -
+and the gap is not academic. With an Owner, one Recoverer and one PlainRun (one crash, no symmetry), the conditioned
+property is violated over the complete state space (583,626 distinct states, 2026-09-13): a plain rerun takes the lock
+to inspect it and judges the owner dead, the waiting Recoverer's try-lock fails meanwhile so it refuses
+`TARGET_LOCK_BUSY`, and the plain rerun then correctly refuses `RESUMABLE_OPERATION_EXISTS` (Section 21.1) and lets go.
+Both finish and the dead lock stays. The two-Recoverer run never shows this because there a tester that does not
+recover is a Recoverer reporting the owner uncertain, an outcome the property admits; a plain rerun is the one tester
+that refuses for another reason. Under spec 240.2 the Recoverer's refusal is transient and a later attempt succeeds, but
+that later attempt is the CLI's retry, which is outside the model. How the liveness run should account for it is open.
+Admitting "some invocation was refused `TARGET_LOCK_BUSY`" as an outcome is not an answer: the counterexample that
+produced the acquirer rule ended with both recoverers refused exactly that way, and would have passed. The same root cause also produced a misreport the model then saw once its
 refusal invariant was tightened: `TARGET_LOCK_BUSY` naming a dead owner because another recoverer held the lock. A
 bounded retry before judging "live" does not remove that in an untimed model - the scheduler can always run the retry
 before the other invocation moves - so it is left to the CLI as a heuristic, and spec 240.2 and 96.2 instead say what
@@ -1005,3 +1017,7 @@ Findings the 2026-09-12 panel stood down below its severity floor, with the guar
   indentation. Every cost line is indented and every action line starts at column 1 (measured on the pinned release
   across four runs), and the report's format is pinned by the same SHA-256 as the jar, with `record_fixtures.py`
   re-recording `testdata/` when that pin moves - so a format change cannot arrive unnoticed between pins.
+- Three `recovery` pairings set `MaxObjs` to 4, 5 and 6 although each runs three actors, so the bound looks inflated.
+  Section 4 claims only that `MaxObjs` is at least the actor count, never that it equals it, and a bound that does not
+  bind leaves the state space unchanged: raising each of these by one gave identical state counts, so tightening them
+  would cost a re-measurement for no difference in what is checked.
