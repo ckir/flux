@@ -64,6 +64,9 @@ C_COVERAGE_INIT = 2773  # the Init action's line, same shape - not a label
 C_COVERAGE_DEF = 2774  # an invariant or definition being evaluated, no counts - not a label
 C_COVERAGE_COST = 2221  # an indented cost sub-line for an expression - not a label
 C_COVERAGE_END = 2202  # "End of statistics[...]"
+C_COVERAGE_END_LONG = 2777  # "End of statistics (please note that for performance reasons ...)";
+# TLC prints this form, instead of 2202, once a run has gone on long enough to warn about the cost
+# of leaving coverage/cost statistics on.
 
 DEADLOCK = "DEADLOCK"
 TRACE_STATES_SHOWN = 60
@@ -115,6 +118,7 @@ class Expected:
     scenarios: list[str]
     runs: list[Run]
     never_reached: tuple[tuple[str, str], ...]
+    deferred: tuple[tuple[str, str, str], ...]
 
 
 @dataclass(frozen=True)
@@ -324,6 +328,29 @@ def _load_label_reasons(value: object, subject: str) -> tuple[tuple[str, str], .
     return tuple(entries)
 
 
+def _load_deferred(value: object, subject: str) -> tuple[tuple[str, str, str], ...]:
+    """Parse the top-level 'deferred' list (design Section 4): {label, scenario, reason} tables
+    holding a label that no BUILT scenario covers but a planned one will. Unlike 'never_reached', a
+    deferred label is reachable and keeps its trace.toml entries. Whether the label exists in some
+    run's module, whether it collides with 'never_reached', and whether its scenario is already
+    built are checked by the caller, which has the label universe and 'scenarios' list to hand."""
+    _require(isinstance(value, list), f"{subject} must be an array of tables")
+    assert isinstance(value, list)
+    entries: list[tuple[str, str, str]] = []
+    for item in value:
+        _require(isinstance(item, dict) and set(item) == {"label", "scenario", "reason"},
+                 f"{subject}: each entry has exactly 'label', 'scenario', 'reason'")
+        label, scenario, reason = item.get("label"), item.get("scenario"), item.get("reason")
+        _require(isinstance(label, str) and IDENT.fullmatch(label) is not None,
+                 f"{subject}: each label must be a TLA+ identifier")
+        _require(isinstance(scenario, str) and scenario, f"{subject}: each scenario must be a non-empty string")
+        _require(isinstance(reason, str) and reason, f"{subject}: each reason must be a non-empty string")
+        entries.append((label, scenario, reason))
+    labels = [label for label, _, _ in entries]
+    _require(len(set(labels)) == len(labels), f"{subject} has duplicate labels")
+    return tuple(entries)
+
+
 def load_expected(path: Path) -> Expected:
     """Load and validate expected.toml; module and config paths are resolved beside it."""
     base = path.parent
@@ -332,9 +359,10 @@ def load_expected(path: Path) -> Expected:
     except (OSError, tomllib.TOMLDecodeError) as err:
         raise ExpectedError(f"cannot read {path}: {err}") from err
 
-    _require(set(data) <= {"scenarios", "run", "never_reached"},
-             f"unknown top-level keys: {sorted(set(data) - {'scenarios', 'run', 'never_reached'})}")
+    _require(set(data) <= {"scenarios", "run", "never_reached", "deferred"},
+             f"unknown top-level keys: {sorted(set(data) - {'scenarios', 'run', 'never_reached', 'deferred'})}")
     never_reached = _load_label_reasons(data.get("never_reached", []), "'never_reached'")
+    deferred = _load_deferred(data.get("deferred", []), "'deferred'")
     scenarios = data.get("scenarios")
     _require(isinstance(scenarios, list) and scenarios and all(isinstance(s, str) for s in scenarios),
              "'scenarios' must be a non-empty list of names")
@@ -367,7 +395,19 @@ def load_expected(path: Path) -> Expected:
     for label, _reason in never_reached:
         _require(label in every_label,
                  f"'never_reached': label {label!r} is not in the label universe of any run's module")
-    return Expected(scenarios, runs, never_reached)
+
+    # 'deferred' names a reachable label a scenario not yet built will cover (design Section 4): it
+    # must not collide with 'never_reached', must exist in some run's module, and its scenario must
+    # not already be one of 'scenarios' (the runner does not read trace.toml's planned_scenarios).
+    never_reached_labels = {label for label, _reason in never_reached}
+    for label, scenario, _reason in deferred:
+        _require(label not in never_reached_labels,
+                 f"'deferred': label {label!r} is also in 'never_reached'")
+        _require(label in every_label,
+                 f"'deferred': label {label!r} is not in the label universe of any run's module")
+        _require(scenario not in scenarios,
+                 f"'deferred': scenario {scenario!r} is in 'scenarios' (the scenario is already built)")
+    return Expected(scenarios, runs, never_reached, deferred)
 
 
 def _constants_equal(a: object, b: object) -> bool:
@@ -791,20 +831,30 @@ _COVERAGE_COUNTS = re.compile(r"(\d+):(\d+)\s*$")
 
 
 def parse_coverage(messages: list[Message]) -> dict[str, tuple[int, int]] | None:
-    """Parse the LAST complete '-coverage 1' block (a 2201 start followed later by a 2202 end) in
-    `messages` into {action name: (distinct, total)}, summing the counts of a name that appears
-    twice in that block. '-coverage 1' prints a snapshot every minute and a final block; only the
-    last COMPLETE one covers the whole run (design Section 4), so an incomplete trailing block (the
-    run was killed mid-write) is ignored, not returned. Returns None when there is no complete
-    block at all."""
-    last_block: list[Message] | None = None
-    start: int | None = None
+    """Parse the FINAL '-coverage 1' block (the one starting at the LAST 2201) in `messages` into
+    {action name: (distinct, total)}, summing the counts of a name that appears twice in that
+    block. '-coverage 1' prints a snapshot every minute and a final block; TLC ends a block with
+    2202 ("End of statistics.") normally, but switches to 2777 (the same message, plus a note
+    about the cost of leaving coverage/cost statistics on) once a run has gone on long enough - both
+    end a block equally. Only the block starting at the LAST 2201 can be the whole run's final
+    report, so this fails CLOSED: if that last 2201 is not followed by a 2202 or 2777 (the run was
+    killed mid-write, or -coverage output was cut short), this returns None rather than falling
+    back to an earlier complete block, because an earlier block is only a partial snapshot and
+    judging coverage from it can pass a run wrongly (or fail one wrongly, for a label that finishes
+    covered only late). Returns None when there is no 2201 at all, too."""
+    last_start: int | None = None
     for i, m in enumerate(messages):
         if m.code == C_COVERAGE_START:
-            start = i
-        elif m.code == C_COVERAGE_END and start is not None:
-            last_block = messages[start: i + 1]
-            start = None
+            last_start = i
+    if last_start is None:
+        return None
+    # last_start is the LAST 2201 in `messages`, so nothing after it can be another 2201; scan
+    # forward for its terminator only.
+    last_block: list[Message] | None = None
+    for i in range(last_start + 1, len(messages)):
+        if messages[i].code in (C_COVERAGE_END, C_COVERAGE_END_LONG):
+            last_block = messages[last_start: i + 1]
+            break
     if last_block is None:
         return None
 
@@ -1010,19 +1060,21 @@ def report(result: Result, tightened: tuple[str, str] | None = None) -> None:
 
 
 def judge_union(executed: list[tuple[Run, bool, Result]], base: Path,
-                 never_reached: tuple[tuple[str, str], ...]) -> bool:
+                 never_reached: tuple[tuple[str, str], ...],
+                 deferred: tuple[tuple[str, str, str], ...]) -> bool:
     """The suite-wide coverage union (design Section 4), judged only when every run in
     expected.toml was selected (no --scenario). `executed` is every (run, fixed, result) this
     invocation ran. A label of any run's module is covered if ANY run of that module - any
     scenario, any kind, not -fixed - reports it with TOTAL > 0 in its last coverage block; whatever
-    is not covered that way must be listed in `never_reached`, and a listed label that IS covered
-    that way fails too. Prints the one-line report and returns whether the union failed (which
-    counts like a run mismatch in the exit code)."""
+    is not covered that way must be listed in `never_reached` or `deferred`, and a listed label
+    that IS covered that way fails too. Prints the one-line report and returns whether the union
+    failed (which counts like a run mismatch in the exit code)."""
     if any(result.status == "tooling" for _run, _fixed, result in executed):
         print("run.py: suite-wide coverage not judged: a run failed or timed out")
         return False
 
     never_reached_labels = {label for label, _ in never_reached}
+    deferred_labels = {label for label, _scenario, _reason in deferred}
     universes: dict[str, LabelUniverse] = {}
     covered: dict[str, set[str]] = {}
     reported: dict[str, set[str]] = {}
@@ -1043,14 +1095,18 @@ def judge_union(executed: list[tuple[Run, bool, Result]], base: Path,
         gated = universe.labels if universe.pluscal else (universe.labels & reported.get(module, set()))
         module_covered = covered.get(module, set())
         covered_in_universe |= gated & module_covered
-        uncovered |= {label for label in gated if label not in module_covered} - never_reached_labels
+        uncovered |= ({label for label in gated if label not in module_covered}
+                      - never_reached_labels - deferred_labels)
     wrongly_covered = never_reached_labels & all_covered
+    wrongly_covered_deferred = deferred_labels & all_covered
 
-    if uncovered or wrongly_covered:
+    if uncovered or wrongly_covered or wrongly_covered_deferred:
         print(f"MISMATCH suite coverage  uncovered: {','.join(sorted(uncovered)) or '-'}; "
-              f"never_reached but covered: {','.join(sorted(wrongly_covered)) or '-'}")
+              f"never_reached but covered: {','.join(sorted(wrongly_covered)) or '-'}; "
+              f"deferred but covered: {','.join(sorted(wrongly_covered_deferred)) or '-'}")
         return True
-    print(f"COVERAGE suite  {len(covered_in_universe)} labels covered, {len(never_reached_labels)} never_reached")
+    print(f"COVERAGE suite  {len(covered_in_universe)} labels covered, {len(never_reached_labels)} never_reached, "
+          f"{len(deferred_labels)} deferred")
     return False
 
 
@@ -1104,7 +1160,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.scenario is not None:
         print("run.py: suite-wide coverage not judged for a single scenario")
-    elif judge_union(executed, base, expected.never_reached):
+    elif judge_union(executed, base, expected.never_reached, expected.deferred):
         code = 1  # a union failure counts like a run mismatch: it outranks a tooling failure too
 
     print(f"run.py: {len(results)} runs, exit {code}")

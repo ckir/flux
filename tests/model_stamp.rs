@@ -307,11 +307,21 @@ struct Expected {
     scenarios: Vec<String>,
     #[serde(default)]
     never_reached: Vec<NeverReached>,
+    #[serde(default)]
+    deferred: Vec<Deferred>,
 }
 
 #[derive(Deserialize)]
 struct NeverReached {
     label: String,
+}
+
+/// A `[[deferred]]` entry (design Section 4): a reachable label that no BUILT scenario covers yet.
+/// Unlike `never_reached`, a deferred label MAY appear in `trace.toml` units - it keeps its trace.
+#[derive(Deserialize)]
+struct Deferred {
+    label: String,
+    scenario: String,
 }
 
 fn is_label_name(token: &str) -> bool {
@@ -546,6 +556,21 @@ fn check(inputs: &Inputs<'_>) -> Vec<String> {
             problems.push(format!(
                 "planned_scenarios lists {scenario:?}, which is also in expected.toml's scenarios"
             ));
+        }
+    }
+
+    // expected.toml's `deferred` list (Section 4, Section 9.1): each entry's scenario must still
+    // be planned (not yet built), and its label must exist in some model file. A deferred label
+    // MAY appear in trace.toml units - unlike never_reached, it stays reachable and keeps its trace.
+    for d in &expected.deferred {
+        if !trace.planned_scenarios.iter().any(|s| s == &d.scenario) {
+            problems.push(format!(
+                "deferred label {} names scenario {:?}, which is not in trace.toml's planned_scenarios",
+                d.label, d.scenario
+            ));
+        }
+        if !model_labels.contains(&d.label) {
+            problems.push(format!("deferred label {} is not a label in any model file", d.label));
         }
     }
 
@@ -1312,6 +1337,77 @@ Alpha text.
     );
     let tla = vec!["S96_1_a: x := 1;".to_string()];
     let problems = check(&Inputs { spec, stamp: &stamp, trace: &trace, tla: &tla, expected: "" });
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+#[test]
+fn deferred_scenario_missing_from_planned_scenarios_is_reported() {
+    let spec = "\
+# Title
+
+## 96.1 Alpha
+Alpha text.
+";
+    let stamp = stamp(&["## 96.1 Alpha"]);
+    let hash = unit_hash("Alpha text.");
+    let trace = format!(
+        "[[unit]]\nheading = \"## 96.1 Alpha\"\nordinal = 1\nquote = \"Alpha text\"\nhash = \"{hash}\"\nlabels = [\"S96_1_a\"]\n"
+    );
+    let tla = vec!["S96_1_a: x := 1;".to_string()];
+    let expected =
+        "[[deferred]]\nlabel = \"S96_1_a\"\nscenario = \"mixed\"\nreason = \"not built yet\"\n";
+    let problems = check(&Inputs { spec, stamp: &stamp, trace: &trace, tla: &tla, expected });
+    assert!(
+        problems.iter().any(|p| p.contains("S96_1_a")
+            && p.contains("\"mixed\"")
+            && p.contains("planned_scenarios")),
+        "{problems:#?}"
+    );
+}
+
+#[test]
+fn deferred_label_absent_from_model_files_is_reported() {
+    let spec = "\
+# Title
+
+## 96.1 Alpha
+Alpha text.
+";
+    let stamp = stamp(&["## 96.1 Alpha"]);
+    let hash = unit_hash("Alpha text.");
+    let trace = format!(
+        "planned_scenarios = [\"mixed\"]\n\n\
+         [[unit]]\nheading = \"## 96.1 Alpha\"\nordinal = 1\nquote = \"Alpha text\"\nhash = \"{hash}\"\nlabels = [\"S96_1_a\"]\n"
+    );
+    let tla = vec!["S96_1_a: x := 1;".to_string()];
+    let expected = "[[deferred]]\nlabel = \"S96_1_missing\"\nscenario = \"mixed\"\nreason = \"not built yet\"\n";
+    let problems = check(&Inputs { spec, stamp: &stamp, trace: &trace, tla: &tla, expected });
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains("S96_1_missing") && p.contains("not a label in any model file")),
+        "{problems:#?}"
+    );
+}
+
+#[test]
+fn deferred_label_may_also_appear_in_a_unit() {
+    let spec = "\
+# Title
+
+## 96.1 Alpha
+Alpha text.
+";
+    let stamp = stamp(&["## 96.1 Alpha"]);
+    let hash = unit_hash("Alpha text.");
+    let trace = format!(
+        "planned_scenarios = [\"mixed\"]\n\n\
+         [[unit]]\nheading = \"## 96.1 Alpha\"\nordinal = 1\nquote = \"Alpha text\"\nhash = \"{hash}\"\nlabels = [\"S96_1_a\"]\n"
+    );
+    let tla = vec!["S96_1_a: x := 1;".to_string()];
+    let expected =
+        "[[deferred]]\nlabel = \"S96_1_a\"\nscenario = \"mixed\"\nreason = \"not built yet\"\n";
+    let problems = check(&Inputs { spec, stamp: &stamp, trace: &trace, tla: &tla, expected });
     assert!(problems.is_empty(), "{problems:#?}");
 }
 

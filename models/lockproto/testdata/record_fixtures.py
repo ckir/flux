@@ -104,6 +104,29 @@ def build_two_block_fixture(coverage_output: str, smoke_output: str) -> None:
     print("coverage_two_blocks: built from coverage.out + smoke_check_coverage.out")
 
 
+# coverage_long_terminator.out (design Section 4, parse_coverage's 2777 terminator fix) is NOT
+# built by this script: TLC prints the block terminator as 2202 ("End of statistics.") on a short
+# run, but switches to 2777 ("End of statistics (please note that for performance reasons large
+# models are best checked with coverage and cost statistics disabled).") once a run has gone on for
+# a few minutes, which the CASES/COVERAGE_CASES above do not run long enough to reach. This fixture
+# was instead extracted from a real long run's recorded '-tool -coverage 1' log (a recovery scenario
+# check, captured outside this repo while diagnosing the 2777 defect): its three coverage blocks -
+# the second block (2201..2202, the one the pre-fix parser wrongly returned) and the last two blocks
+# (2201..2777 each, the second of which is the true final block) - were kept as their real, unedited
+# '@!@!@STARTMSG ...@!@!@ENDMSG...@!@!@' message frames (codes 2201, 2202, 2777, 2772, 2773, 2774);
+# every 2221 cost sub-line was dropped to keep the file small, since parse_coverage() never reads
+# 2221. No message text was invented. The extraction (for reference, should the source log ever need
+# re-deriving):
+#
+#   MESSAGE = re.compile(r"@!@!@STARTMSG (\d+):(\d+) @!@!@\n(.*?)@!@!@ENDMSG \1 @!@!@", re.S)
+#   KEEP = {"2201", "2202", "2777", "2772", "2773", "2774"}
+#   def trimmed(block_text):
+#       return "\n".join(m.group(0) for m in MESSAGE.finditer(block_text) if m.group(1) in KEEP) + "\n"
+#   # block2/block3/block4 are the three '@!@!@STARTMSG 2201...' through terminator line spans of
+#   # the source log, in order; block3 and block4 are the two 2777-terminated blocks.
+#   text = "exit=0\n" + trimmed(block2) + trimmed(block3) + trimmed(block4)
+
+
 def main() -> int:
     jar = run.ensure_jar()
     for case, (module, cfg_text, cont) in CASES.items():
