@@ -2359,6 +2359,16 @@ class LoadExpectedTests(unittest.TestCase):
         cfgs = dict(CFGS, **{"seed.cfg": CFGS["seed.cfg"] + "CHECK_DEADLOCK FALSE\n"})
         self.assertRejected(GOOD_EXPECTED, "must not set CHECK_DEADLOCK", cfgs)
 
+    def test_state_space_shrinking_sections_are_rejected_in_every_kind(self) -> None:
+        # CONSTRAINT, ACTION_CONSTRAINT and VIEW all cut or merge states while every constant still matches
+        # expected.toml, so a .cfg could make a failing run pass (design Section 4: the .cfg may only agree).
+        for cfg in ("check.cfg", "live.cfg", "seed.cfg"):
+            for section in ("CONSTRAINT Safe", "CONSTRAINTS Safe", "ACTION_CONSTRAINT Safe", "VIEW x",
+                            "TYPE Safe", "TYPE_CONSTRAINT Safe"):
+                with self.subTest(cfg=cfg, section=section):
+                    cfgs = dict(CFGS, **{cfg: CFGS[cfg] + section + "\n"})
+                    self.assertRejected(GOOD_EXPECTED, "must not shrink the state space", cfgs)
+
     def test_liveness_needs_one_property(self) -> None:
         cfgs = dict(CFGS, **{"live.cfg": "SPECIFICATION Spec\nPROPERTIES Eventually Always\n"})
         self.assertRejected(GOOD_EXPECTED, "exactly one PROPERTY", cfgs)
@@ -3823,7 +3833,7 @@ if __name__ == "__main__":
 - [ ] **Step 2: Run them to see them fail**
 
 Run: `python3 -W error -m unittest discover -s models/lockproto -p "test_*.py"`
-Expected: `Ran 176 tests`, then `FAILED (failures=67, errors=83)`. The new tests call runner functions and flags
+Expected: `Ran 177 tests`, then `FAILED (failures=85, errors=83)`. The new tests call runner functions and flags
 that do not exist yet.
 
 - [ ] **Step 3: Write the runner**
@@ -3911,7 +3921,7 @@ CFG_KEYWORDS = {
     "PROPERTY": "PROPERTY", "PROPERTIES": "PROPERTY", "SYMMETRY": "SYMMETRY",
     "CONSTRAINT": "CONSTRAINT", "CONSTRAINTS": "CONSTRAINT", "ACTION_CONSTRAINT": "ACTION_CONSTRAINT",
     "ACTION_CONSTRAINTS": "ACTION_CONSTRAINT", "VIEW": "VIEW", "CHECK_DEADLOCK": "CHECK_DEADLOCK",
-    "POSTCONDITION": "POSTCONDITION", "ALIAS": "ALIAS",
+    "POSTCONDITION": "POSTCONDITION", "ALIAS": "ALIAS", "TYPE": "TYPE", "TYPE_CONSTRAINT": "TYPE_CONSTRAINT",
 }
 
 
@@ -4553,6 +4563,13 @@ def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
     text = cfg_path.read_text(encoding="utf-8")
     sections = cfg_sections(text)
     _require("CHECK_DEADLOCK" not in sections, f"{where}: the config must not set CHECK_DEADLOCK (deadlock checking stays on)")
+    # A state or action constraint, or a VIEW, cuts or merges states while every constant still agrees with
+    # expected.toml, so a .cfg could make a failing run pass through them (design Section 4). TYPE and
+    # TYPE_CONSTRAINT are TLC 2.19 keywords too (its ModelConfig lists them) whose effect on the explored states
+    # the runner cannot vouch for, so they are refused with the rest.
+    for shrinking in ("CONSTRAINT", "ACTION_CONSTRAINT", "VIEW", "TYPE", "TYPE_CONSTRAINT"):
+        _require(shrinking not in sections,
+                 f"{where}: the config must not shrink the state space with {shrinking}; bound the run through its constants")
     _require(kind != "check" or "PROPERTY" not in sections,
              f"{where}: a check run's config must not declare a PROPERTY (TLC reports a temporal violation "
              "without naming it)")
@@ -7202,7 +7219,7 @@ timeout_minutes = 150
 - [ ] **Step 6: Run the unit tests to see them pass**
 
 Run: `python3 -W error -m unittest discover -s models/lockproto -p "test_*.py"`
-Expected: `Ran 176 tests` and `OK`.
+Expected: `Ran 177 tests` and `OK`.
 
 - [ ] **Step 7: Check the job lists**
 
@@ -10239,7 +10256,7 @@ git commit -m "model: README for plan 2 - bounds, judging, the host-crash tier (
 
 Run: `just model-test`, then `cargo test --test model_stamp`, then `just check`.
 Expected:
-- `just model-test`: `Ran 176 tests`, then `OK`;
+- `just model-test`: `Ran 177 tests`, then `OK`;
 - `cargo test --test model_stamp`: `38 passed; 0 failed; 1 ignored`;
 - `just check`: exits 0 (fmt, clippy, typos, and the workspace tests).
 
