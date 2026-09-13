@@ -169,7 +169,8 @@ Four rules keep the coverage check honest without making it lie:
   for the labels in the shared `procedure` blocks, which is where most of this model's labels live: `S240_1_*`,
   `S96_1_*`, `S240_3_*` and `S99_*` sit in `Classify`, `Acquire`, `Recover` and `Publish`, belong to no `process`
   block, and are reached by whichever actors call them. A procedure's label therefore belongs to the set of actors
-  that call that procedure, and is exempt only when every one of those actors has an empty process set. Deriving it
+  that call that procedure, and is exempt only when every one of those actors has an empty process set; a procedure
+  no actor calls is never exempt, so a dead procedure fails its run rather than passing vacuously. Deriving it
   from the containing block instead would attribute those labels to nobody, which is both the larger half of the
   model and the half the exemption has to get right;
 - a run may list `unreached` labels with a reason: steps its variant or its configuration cannot reach although their

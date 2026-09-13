@@ -27,7 +27,7 @@ standard library only), Rust 2024 (`toml`, `blake3`), `just`, GitHub Actions (`u
 
 ## Context
 
-- **Design:** `docs/superpowers/specs/2026-09-11-lock-protocol-model-check-design.md` at commit `39d059c`. Section
+- **Design:** `docs/superpowers/specs/2026-09-11-lock-protocol-model-check-design.md` at the commit that adds this plan. Section
   numbers in this plan refer to it. Every owner ruling this plan implements is already written into that design.
 - **Built and verified before this plan was written.** This plan was written after the work, from the committed files
   on branch `model/lock-protocol-wip` (PR #3), and every code block below is a copy of a committed file. Run as
@@ -76,7 +76,7 @@ frames:
 | `-coverage 1` prints a block framed by 2201 ... terminator, a snapshot every minute, and a final block | `run.py` judges only the block that starts at the LAST 2201; a last block with no terminator is a tooling failure |
 | the terminator is 2202 on a short run and 2777 ("End of statistics (please note ...)") once a run has lasted a few minutes | both codes end a block; the first coverage gate accepted only 2202 and judged early snapshots on long runs |
 | 2772 is an action line `<Name line ...>: distinct:total`; 2773 is `Init`; 2774 is an invariant being evaluated; 2221 is an indented cost line | only 2772 lines are labels; "executed" means `total > 0` (a label can report `0:32937`) |
-| TLC reports no action for a `process` whose set is empty, but reports every label of a `procedure` | a procedure label belongs to every process that calls it, transitively, and is exempt only when all of them are empty |
+| TLC reports no action for a `process` whose set is empty, but reports every label of a `procedure` | a procedure label belongs to every process that calls it, transitively, and is exempt only when all of them are empty; a procedure no process calls is never exempt |
 | `SYMMETRY` with a temporal property is unsound, and TLC does not refuse it | a liveness config must not declare `SYMMETRY` |
 | `pcal.trans` writes `LockProtocol.old` and a default `LockProtocol.cfg` beside the module | both are ignored by git |
 
@@ -91,8 +91,9 @@ GitHub-hosted `ubuntu-latest` runners whose hardware is not controlled.
 | `recovery-posix-hostcrash-check` / `-plain-` / `-cleanup-` / `-plain-cleanup-check` | 13,331,133 / 22,750,053 / 12,148,827 / 10,652,055 | 523-558 / 847-907 / 462-481 / 414-448 |
 | `recovery-windows-hostcrash-check` / `-plain-` / `-cleanup-` / `-plain-cleanup-check` | 16,959,639 / 28,314,300 / 16,046,736 / 13,700,391 | 709 / 1102 / 623 / 556 (one sample) |
 
-A witness run's state count varies between runs, because TLC stops at the first violation it meets and the number of
-workers changes the exploration order. Only its verdict is fixed.
+A witness run's state count was observed to differ between CI runs of the same commit, for example 1,061 to 2,885 for
+`recovery-posix-witness-NeverTornRead`. A witness stops at the first violation, and the multi-worker search order is
+not fixed. Only its verdict is compared.
 
 ### What the model found, and the owner rulings already in the design
 
@@ -3450,6 +3451,18 @@ class LabelUniverseTests(unittest.TestCase):
         self.assertFalse(universe.is_exempt("shared_step", {"SetA": frozenset(), "SetB": frozenset({"x"})}))
         self.assertFalse(universe.is_exempt("shared_step", {"SetA": frozenset({"x"}), "SetB": frozenset()}))
 
+    def test_procedure_no_process_calls_is_gated_not_exempt(self) -> None:
+        # A procedure nothing calls has no owner. "Every caller's set is empty" holds vacuously, but
+        # design Section 4 says attributing such labels to nobody is the case the exemption must get
+        # right: dead labels must fail the per-run gate, not pass it silently.
+        universe = run.module_labels(MIXED_CALLERS_MODULE.replace(
+            "  process (p1 \\in SetA)", "  procedure Orphan()\n  {\n    orphan_step:\n      return;\n  }\n\n"
+            "  process (p1 \\in SetA)"))
+        self.assertIn("orphan_step", universe.labels)
+        self.assertEqual(universe.owners.get("orphan_step", frozenset()), frozenset())
+        self.assertFalse(universe.is_exempt("orphan_step", {"SetA": frozenset(), "SetB": frozenset()}))
+        self.assertFalse(universe.is_exempt("orphan_step", {"SetA": frozenset({"x"}), "SetB": frozenset()}))
+
     def test_non_pluscal_universe_is_the_top_level_operators(self) -> None:
         universe = run.module_labels((HERE / "Smoke.tla").read_text(encoding="utf-8"))
         self.assertFalse(universe.pluscal)
@@ -3810,7 +3823,7 @@ if __name__ == "__main__":
 - [ ] **Step 2: Run them to see them fail**
 
 Run: `python3 -W error -m unittest discover -s models/lockproto -p "test_*.py"`
-Expected: `Ran 175 tests`, then `FAILED (failures=67, errors=82)`. The new tests call runner functions and flags
+Expected: `Ran 176 tests`, then `FAILED (failures=67, errors=83)`. The new tests call runner functions and flags
 that do not exist yet.
 
 - [ ] **Step 3: Write the runner**
@@ -4323,7 +4336,8 @@ class LabelUniverse:
     `owners[label]` is the set of process-block ids (a process's bound name, e.g. "own", "env")
     that own `label`, directly or by calling (transitively, through `procedure`s) the block it is
     in; a label absent from `owners` (or mapped to an empty set) is inside a procedure no process
-    reaches, which is vacuously exempt. `blocks[block_id]` is that process block's `\\in` set
+    reaches, which is never exempt, so a dead procedure fails the per-run gate instead of passing it
+    vacuously (design Section 4). `blocks[block_id]` is that process block's `\\in` set
     constant name, or None if it is declared `= VALUE` (always instantiated, so any label it owns is
     never exempt). Both dicts are empty, and nothing is ever exempt, for a non-PlusCal module."""
     pluscal: bool
@@ -4334,7 +4348,10 @@ class LabelUniverse:
     def is_exempt(self, label: str, constants: dict[str, object]) -> bool:
         if not self.pluscal:
             return False
-        for block in self.owners.get(label, frozenset()):
+        owners = self.owners.get(label, frozenset())
+        if not owners:  # a procedure no process calls: dead code the gate must catch, never exempt
+            return False
+        for block in owners:
             setname = self.blocks.get(block)
             if setname is None:  # a `= VALUE` process: always instantiated, never exempt
                 return False
@@ -7185,7 +7202,7 @@ timeout_minutes = 150
 - [ ] **Step 6: Run the unit tests to see them pass**
 
 Run: `python3 -W error -m unittest discover -s models/lockproto -p "test_*.py"`
-Expected: `Ran 175 tests` and `OK`.
+Expected: `Ran 176 tests` and `OK`.
 
 - [ ] **Step 7: Check the job lists**
 
@@ -10028,8 +10045,10 @@ jobs:
 Run: `actionlint .github/workflows/model.yml .github/workflows/model-extended.yml; echo "exit=$?"`, then
 `just --dry-run model recovery posix`.
 Expected: no findings and `exit=0`, then the line
-`python3 models/lockproto/run.py --scenario recovery --platform posix`. First confirm that shellcheck is active: a
-workflow with an unquoted `rm $files` in a `run:` step must be reported with SC2086.
+`python3 models/lockproto/run.py --scenario recovery --platform posix`. First confirm that shellcheck is active: run
+`actionlint -verbose .github/workflows/model.yml 2>&1 | grep 'was disabled'`. The output must not include a line
+naming the rule `shellcheck`. A line for `pyflakes` is harmless. If `shellcheck` is disabled, install it: without it
+actionlint silently skips every `run:` script.
 
 - [ ] **Step 5: Run the workflow's own test**
 
@@ -10220,14 +10239,15 @@ git commit -m "model: README for plan 2 - bounds, judging, the host-crash tier (
 
 Run: `just model-test`, then `cargo test --test model_stamp`, then `just check`.
 Expected:
-- `just model-test`: `Ran 175 tests`, then `OK`;
+- `just model-test`: `Ran 176 tests`, then `OK`;
 - `cargo test --test model_stamp`: `38 passed; 0 failed; 1 ignored`;
 - `just check`: exits 0 (fmt, clippy, typos, and the workspace tests).
 
 - [ ] **Step 2: Push, open a draft pull request to `main`, and read the `Model` run**
 
-Run: `git push -u origin HEAD`, then `gh pr create --draft --base main --fill`, then, when the `Model` run for the
-head commit has finished, `gh run view <run-id>`.
+Run: `git push -u origin HEAD`, then `gh pr create --draft --base main --fill`. Then find the run and wait for it:
+`gh run list --branch "$(git branch --show-current)" --workflow Model --limit 1 --json databaseId --jq '.[0].databaseId'`
+prints the run id, `gh run watch <that id> --exit-status` waits for it, and `gh run view <that id>` shows its jobs.
 Expected: jobs `Plan`, `Scenario selftest (posix)`, `Scenario recovery (posix)`, `Scenario recovery (windows)` and
 `Model gate`, all successful. Each job's log ends with the lines below. Durations and witness state counts vary; the
 check and liveness counts do not.
@@ -10270,7 +10290,9 @@ run.py: 7 runs, exit 0
 
 - [ ] **Step 3: Run the host-crash tier and the union**
 
-Create the label once with `gh label create model-extended`, add it with `gh pr edit <pr> --add-label model-extended`,
+Create the label if the repository does not have it yet (`gh label list --search model-extended`, then
+`gh label create model-extended`; `gh label create` fails when the label exists), add it with
+`gh pr edit --add-label model-extended`, which acts on the current branch's pull request,
 and read the `Model (extended tier)` run when it has finished.
 Expected: `Extended recovery (posix)` and `Extended recovery (windows)` both succeed, each ending with four `OK` lines
 carrying the host-crash counts in the table above and `run.py: 4 runs, exit 0`. `Suite-wide coverage union` runs
@@ -10281,5 +10303,5 @@ COVERAGE suite  63 labels covered, 0 never_reached, 2 deferred
 run.py: 21 runs, exit 0
 ```
 
-Then remove the label with `gh pr edit <pr> --remove-label model-extended`. While the label is on, every push restarts
+Then remove the label with `gh pr edit --remove-label model-extended`. While the label is on, every push restarts
 the tier's jobs, which take about 40 and 50 minutes.
