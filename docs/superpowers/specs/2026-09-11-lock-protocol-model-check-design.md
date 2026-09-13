@@ -886,7 +886,13 @@ invocation inspecting it, write its record holding nothing, and a later classifi
 OS-native lock as a live owner, so two recoverers each refused a dead owner's lock and it was never cleared. Spec
 96.1 and 240.3 step 4 now require an acquirer to hold its OS-native lock before writing its record, and to remove its
 file and start again when it cannot; with that rule the liveness run holds (1,869,534 distinct states) and every
-`check` run passes on both platforms.
+`check` run passes on both platforms. The same root cause also produced a misreport the model then saw once its
+refusal invariant was tightened: `TARGET_LOCK_BUSY` naming a dead owner because another recoverer held the lock. A
+bounded retry before judging "live" does not remove that in an untimed model - the scheduler can always run the retry
+before the other invocation moves - so it is left to the CLI as a heuristic, and spec 240.2 and 96.2 instead say what
+the refusal can honestly claim: that the lock is held, not that its recorded owner is alive. Under that meaning the
+refusal is correct rather than a misreport, so the model no longer flags it: the tightening that exposed it was
+removed, and `RefusalJustified` is now the regression guard Section 7 describes.
 
 That liveness run covers an Owner and two Recoverers only - `PlainRuns` and `Cleanups` are empty in its configuration -
 and the gap is not academic. With an Owner, one Recoverer and one PlainRun (one crash, no symmetry), the conditioned
@@ -895,16 +901,29 @@ to inspect it and judges the owner dead, the waiting Recoverer's try-lock fails 
 `TARGET_LOCK_BUSY`, and the plain rerun then correctly refuses `RESUMABLE_OPERATION_EXISTS` (Section 21.1) and lets go.
 Both finish and the dead lock stays. The two-Recoverer run never shows this because there a tester that does not
 recover is a Recoverer reporting the owner uncertain, an outcome the property admits; a plain rerun is the one tester
-that refuses for another reason. Under spec 240.2 the Recoverer's refusal is transient and a later attempt succeeds, but
-that later attempt is the CLI's retry, which is outside the model. How the liveness run should account for it is open.
-Admitting "some invocation was refused `TARGET_LOCK_BUSY`" as an outcome is not an answer: the counterexample that
-produced the acquirer rule ended with both recoverers refused exactly that way, and would have passed. The same root cause also produced a misreport the model then saw once its
-refusal invariant was tightened: `TARGET_LOCK_BUSY` naming a dead owner because another recoverer held the lock. A
-bounded retry before judging "live" does not remove that in an untimed model - the scheduler can always run the retry
-before the other invocation moves - so it is left to the CLI as a heuristic, and spec 240.2 and 96.2 instead say what
-the refusal can honestly claim: that the lock is held, not that its recorded owner is alive. Under that meaning the
-refusal is correct rather than a misreport, so the model no longer flags it: the tightening that exposed it was
-removed, and `RefusalJustified` is now the regression guard Section 7 describes.
+that refuses for another reason. Admitting "some invocation was refused `TARGET_LOCK_BUSY`" as an outcome would not
+fix this: the counterexample that produced the acquirer rule ended with both recoverers refused exactly that way, and
+would have passed.
+
+This is accepted, not fixed: the stranded lock is swept up by the next attempt, which spec 240.2 already says can
+succeed. The alternative was modelled and measured first (2026-09-13). With classifiers inspecting under a SHARED
+OS-native lock and owners holding it exclusively, the plain-rerun case holds - 582,756 distinct states - but a new race
+appears: two recoverers can now both classify a dead lock, one passes 240.3 step 1 and stalls while the other completes
+the whole recovery, and the stalled one then renames the fresh lock aside by path, so the new owner's publish check
+refuses. Safety held throughout (the five safety invariants over the complete state space), yet `RefusalJustified`
+failed on an ordinary `check` run; exclusive inspection had been serializing recoverers. Inspecting shared and recovering
+exclusive does not rescue it: neither `flock` nor `LockFileEx` upgrades a hold atomically, so the race returns in the
+upgrade window, and a recoverer blocked by an inspector must restart in a loop that either livelocks under a steady
+stream of inspectors or strands the lock. What decided it is where each design fails. Exclusive inspection fails a
+colliding invocation at the door, before it has changed anything; shared inspection fails a rightful owner after it
+has recovered and reached publish, and leaves the lock it puts back orphaned.
+
+Two smaller items were found along the way and are deferred, not fixed. The model's refusal at the Section 99 check
+returns without closing its own handle, so a refusing owner finishes still holding its OS-native lock, which a real
+process gives up on exit; the path is unreachable under exclusive inspection, so it is latent. And spec 240.3 step 1's
+"re-read the lock" does not say whether it reads the lock path or the handle already open. The model reads the path,
+and with that reading safety is measured to hold; that step 3's post-move identity check would equally keep a handle
+re-read safe is argued, not measured.
 
 Build order: the scenarios are built one plan at a time, not all at once, so that the first TLC runs measure real
 state-space sizes and their findings are triaged before more actors are built on the same model. Plan 2 builds
