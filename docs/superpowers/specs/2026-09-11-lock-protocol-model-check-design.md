@@ -287,7 +287,9 @@ The runner, `run.py`:
   make a failing run pass: tightening a bound, emptying a process set, or adding a `SYMMETRY` line all shrink the
   state space, and none of them changes any result the rest of the gate looks at. A rule that lives only in prose
   about what a configuration "should" contain is a rule the `.cfg` can quietly break, so the bounds a run is
-  entitled to are declared where the gate can read them and the `.cfg` may only agree;
+  entitled to are declared where the gate can read them and the `.cfg` may only agree. For the same reason a `.cfg`
+  may not contain a `CONSTRAINT`, `ACTION_CONSTRAINT` or `VIEW` section: each cuts or merges states while every
+  constant still agrees, so the runner rejects all three in every kind of run;
 - rejects a `SYMMETRY` declaration in any run whose entry does not name the actor set it is over, whatever the run's
   kind. Symmetry with liveness is unsound, so a liveness run may declare none at all (above); but a false symmetry
   over actors that are not interchangeable is unsound in a `check` run too, and it is the single cheapest edit that
