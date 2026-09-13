@@ -15,6 +15,8 @@ its first scenario, `recovery`, end to end. Later plans add the remaining scenar
 |---|---|---|
 | `just model` | runs every run in `expected.toml` | Java 11+, Python 3.11+ |
 | `just model <scenario>` | runs one scenario, for example `just model selftest` | Java 11+, Python 3.11+ |
+| `just model <scenario> <platform>` | runs one scenario's runs for one platform, as a CI job does: `just model recovery posix` | Java 11+, Python 3.11+ |
+| `python models/lockproto/run.py --expected models/lockproto/expected-extended.toml --scenario recovery` | the host-crash tier; hours of CPU, meant for CI | Java 11+, Python 3.11+ |
 | `just model-test` | unit tests of `run.py` (recorded TLC output, no Java) and of the CI workflow's change detection | Python 3.11+ |
 | `just model-stamp` | runs `just model`, then rewrites the unit hashes in `trace.toml` if every run matched | Java, Python, Rust |
 
@@ -101,9 +103,14 @@ kinds at once do not finish, so the check runs pair them, and each pairing is ex
   because no name in this scenario is reused.
 - `LockCapability = "strong"` only. The weak capability refuses every operation under 235.1, which `breaklock`'s
   seeded run covers.
-- `HostCrashes = FALSE` in every run, so only process crashes are explored. This bound is not yet justified: design
-  Section 5.2 says the model explores what the next invocation finds after a host crash undoes unflushed lock-file
-  operations. It is an open question for plan 2.
+- `HostCrashes = FALSE` in these runs, so only process crashes are explored here. Host crashes have their own
+  slower tier, `expected-extended.toml`, run by `.github/workflows/model-extended.yml` nightly, on request, and on a
+  pull request labelled `model-extended`. It holds the same four POSIX pairings with `HostCrashes = TRUE`, at 11 to 25
+  million distinct states each (design Section 12). A change that relies on an unflushed write or rename being durable
+  therefore passes a pull request's checks, and this tier catches it afterwards. Label coverage cannot show that a
+  host crash ran, so the per-pull-request suite keeps the witness `NeverHostCrashChangedLock`.
+- The host crash keeps a directory's unflushed entry operations all-or-nothing, not as the prefix a journaled
+  filesystem keeps. A partial prefix followed by a further crash is not explored (design Section 5.2).
 - The liveness run (`DeadLockEventuallyCleared`, Owner and 2 Recoverers, no symmetry) is not yet in
   `expected.toml`. Its time limit and any tightening wait for the controlled timing measurement.
 
