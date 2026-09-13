@@ -204,6 +204,22 @@ Four rules keep the coverage check honest without making it lie:
   added to clear a label, because the difference is intent. What it buys is that both edits - the new `[[run]]` and
   the new table row with its reason - appear in the same diff, and a `[[run]]` arriving without one is the thing a
   reviewer looks for. Section 9 already rests on the same footing for a re-stamped heading;
+- one top-level `deferred` list in `expected.toml`, each entry `{ label, scenario, reason }`, holds the labels that no
+  BUILT scenario covers but a planned one will. The model is built one scenario at a time (Section 12), and a
+  procedure shared across scenarios carries branches whose state only a later scenario creates: `S96_1_backoff` needs
+  the directory lock that only `dirlock` makes, and `S240_3_putback` needs the in-place record rewrite that only
+  `breaklock` performs. `never_reached` is the wrong home for such a label, because it is reachable and keeps its
+  traceability, so its `trace.toml` entries stay. `pending` (Section 9.1) is the wrong source too: it is a fact about
+  a spec UNIT, which scenario still owes that unit labels, while the union needs a fact about a LABEL, and the two
+  differ. 240.3 step 3 is fully modelled with no `pending`, yet its put-back branch waits for `breaklock`. The union
+  accepts a `deferred` label as uncovered, and fails when a `deferred` label IS covered, as it does for `never_reached`,
+  so the entry must go the moment a run reaches it. The drift-stamp test (Section 9.1), which already reads both
+  files, requires each entry's `scenario` to be in `trace.toml`'s `planned_scenarios`, so an entry cannot outlive
+  its scenario: the plan that builds the scenario moves its name out of `planned_scenarios` and must remove the entry
+  or cover the label. The runner rejects a label listed in both `deferred` and `never_reached`, or twice in
+  `deferred`, and a `deferred` label that is in no model named by a run. One way round this stays review-gated, and this rule says so: re-pointing an entry to a
+  different scenario that is still planned. Like a new run, that change shows in the diff next to its reason;
+
 - the derived `<name>-fixed` runs are not covered by the check. A proposed spec fix is meant to make the path it
   closes unreachable, so a fix-flag run would otherwise fail because the fix worked;
 - a run that times out is a tooling failure (exit code 2) and its coverage is not judged at all, because a partial
@@ -718,6 +734,8 @@ The same test file checks, without Java:
   that occurs in that family exactly `count` times, is not stamped, and is the only entry for that line and family;
 - every name in a `pending` array is in `planned_scenarios`, and no scenario is in both `planned_scenarios` and
   `expected.toml`'s `scenarios`;
+- every `scenario` in `expected.toml`'s `deferred` list (Section 4) is in `planned_scenarios`, and each `deferred`
+  label exists in a model file and appears in no more than one `deferred` entry;
 - every label in `LockProtocol.tla` and `Claims.tla` (matched by `S\d+(_\d+)*_\w+:`) appears in `trace.toml`;
 - every label `trace.toml` names exists in a model file.
 
@@ -1001,7 +1019,7 @@ to 7 hold with open findings counted as expected results, and the work is finish
    `check` and `liveness` run, every label of every actor the run instantiates is covered except the labels it lists as
    `unreached`, and each of those is indeed uncovered; a full `just model` reports every label of every model covered by
    at least one run, apart from any in `never_reached`, and no `never_reached` label is named by a `trace.toml` unit
-   (Section 4).
+   (Section 4). When the work is finished `deferred` is empty, because every scenario it could name has been built.
 3. Every `liveness` run passes.
 4. Every run finishes within its time limit on CI.
 5. The traceability check (Section 9.1) passes: every label maps to a spec step, and every spec step of the stamped
