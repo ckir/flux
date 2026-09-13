@@ -27,8 +27,8 @@ module = "M"
 config = "check.cfg"
 scenario = "demo"
 kind = "check"
-violated = ["NeverDone"]
 open_findings = [{ name = "Safe", tracking = "TODO.md: demo", fix_flag = "FIX_SAFE" }]
+constants = {}
 timeout_minutes = 5
 
 [[run]]
@@ -37,7 +37,8 @@ module = "M"
 config = "live.cfg"
 scenario = "demo"
 kind = "liveness"
-violated = ["LiveWitness"]
+open_findings = [{ name = "LiveWitness", tracking = "TODO.md: demo-live", fix_flag = "FIX_LIVE" }]
+constants = {}
 timeout_minutes = 5
 
 [[run]]
@@ -47,14 +48,28 @@ config = "seed.cfg"
 scenario = "demo"
 kind = "seeded"
 violated = ["Other"]
+constants = {}
+timeout_minutes = 5
+
+[[run]]
+name = "demo-posix-witness-Other2"
+module = "M"
+config = "witness.cfg"
+scenario = "demo"
+kind = "witness"
+violated = ["Other2"]
+constants = {}
 timeout_minutes = 5
 """
 
 CFGS = {
     "check.cfg": "SPECIFICATION Spec\nCONSTANTS\n    FIX_SAFE = FALSE\nINVARIANTS Safe NeverDone\n",
-    "live.cfg": "SPECIFICATION Spec\nCONSTANT FIX_SAFE = FALSE\nINVARIANT LiveWitness\nPROPERTY Eventually\n",
+    "live.cfg": "SPECIFICATION Spec\nCONSTANTS\n    FIX_LIVE = FALSE\nINVARIANT LiveWitness\nPROPERTY Eventually\n",
     "seed.cfg": "SPECIFICATION Spec\nCONSTANT FIX_SAFE = FALSE\nINVARIANT Other\n",
+    "witness.cfg": "SPECIFICATION Spec\nCONSTANT FIX_SAFE = FALSE\nINVARIANT Other2\n",
 }
+
+DEFAULT_MODULE = "---- MODULE M ----\n====\n"
 
 
 def fixture(case: str) -> tuple[int, str]:
@@ -66,15 +81,16 @@ def fixture(case: str) -> tuple[int, str]:
 class ExpectedDir:
     """A temporary directory holding expected.toml, M.tla and the configs."""
 
-    def __init__(self, expected: str = GOOD_EXPECTED, cfgs: dict[str, str] | None = None) -> None:
+    def __init__(self, expected: str = GOOD_EXPECTED, cfgs: dict[str, str] | None = None,
+                 module_text: str | None = None) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.path = Path(self._tmp.name)
-        (self.path / "M.tla").write_text("---- MODULE M ----\n====\n", encoding="utf-8")
+        (self.path / "M.tla").write_text(module_text or DEFAULT_MODULE, encoding="utf-8")
         for name, text in (CFGS if cfgs is None else cfgs).items():
             (self.path / name).write_text(text, encoding="utf-8")
         (self.path / "expected.toml").write_text(textwrap.dedent(expected), encoding="utf-8")
 
-    def load(self) -> tuple[list[str], list[run.Run]]:
+    def load(self) -> run.Expected:
         return run.load_expected(self.path / "expected.toml")
 
     def close(self) -> None:
@@ -82,27 +98,28 @@ class ExpectedDir:
 
 
 class LoadExpectedTests(unittest.TestCase):
-    def load(self, expected: str, cfgs: dict[str, str] | None = None) -> tuple[list[str], list[run.Run]]:
-        d = ExpectedDir(expected, cfgs)
+    def load(self, expected: str, cfgs: dict[str, str] | None = None, module_text: str | None = None) -> run.Expected:
+        d = ExpectedDir(expected, cfgs, module_text)
         self.addCleanup(d.close)
         return d.load()
 
-    def assertRejected(self, expected: str, fragment: str, cfgs: dict[str, str] | None = None) -> None:
+    def assertRejected(self, expected: str, fragment: str, cfgs: dict[str, str] | None = None,
+                        module_text: str | None = None) -> None:
         with self.assertRaises(run.ExpectedError) as ctx:
-            self.load(expected, cfgs)
+            self.load(expected, cfgs, module_text)
         self.assertIn(fragment, str(ctx.exception))
 
     def test_good_file_loads(self) -> None:
-        scenarios, runs = self.load(GOOD_EXPECTED)
-        self.assertEqual(scenarios, ["demo"])
-        self.assertEqual([r.kind for r in runs], ["check", "liveness", "seeded"])
-        self.assertEqual(runs[0].open_findings, (run.OpenFinding("Safe", "TODO.md: demo", "FIX_SAFE"),))
-        self.assertEqual(runs[1].violated, ("LiveWitness",))
+        expected = self.load(GOOD_EXPECTED)
+        self.assertEqual(expected.scenarios, ["demo"])
+        self.assertEqual([r.kind for r in expected.runs], ["check", "liveness", "seeded", "witness"])
+        self.assertEqual(expected.runs[0].open_findings, (run.OpenFinding("Safe", "TODO.md: demo", "FIX_SAFE"),))
+        self.assertEqual(expected.runs[2].violated, ("Other",))
 
     def test_the_repository_file_loads(self) -> None:
-        scenarios, runs = run.load_expected(HERE / "expected.toml")
-        self.assertTrue(scenarios)
-        self.assertTrue(runs)
+        expected = run.load_expected(HERE / "expected.toml")
+        self.assertTrue(expected.scenarios)
+        self.assertTrue(expected.runs)
 
     def test_unknown_kind(self) -> None:
         self.assertRejected(GOOD_EXPECTED.replace('kind = "liveness"', 'kind = "live"'), "kind must be one of")
@@ -126,23 +143,47 @@ class LoadExpectedTests(unittest.TestCase):
 
     def test_duplicate_names(self) -> None:
         self.assertRejected(GOOD_EXPECTED.replace('"demo-posix-seeded-SEED_X"', '"demo-posix-check"')
-                            .replace('kind = "seeded"', 'kind = "check"'), "duplicate run names")
+                            .replace('kind = "seeded"\nviolated = ["Other"]', 'kind = "check"'), "duplicate run names")
 
-    def test_liveness_needs_violated(self) -> None:
-        self.assertRejected(GOOD_EXPECTED.replace('kind = "liveness"\nviolated = ["LiveWitness"]', 'kind = "liveness"'),
-                            "a liveness run needs 'violated'")
+    def test_witness_is_accepted(self) -> None:
+        expected = self.load(GOOD_EXPECTED)
+        witness = expected.runs[3]
+        self.assertEqual(witness.kind, "witness")
+        self.assertEqual(witness.violated, ("Other2",))
+        self.assertEqual(witness.name, "demo-posix-witness-Other2")
 
-    def test_liveness_needs_exactly_one_witness(self) -> None:
-        self.assertRejected(GOOD_EXPECTED.replace('violated = ["LiveWitness"]', 'violated = ["LiveWitness", "Other2"]'),
-                            "exactly one witness invariant")
+    def test_witness_name_suffix_must_equal_violated(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace('"demo-posix-witness-Other2"', '"demo-posix-witness-WrongName"'),
+                            "name must be")
 
-    def test_liveness_with_one_witness_is_accepted(self) -> None:
-        _, runs = self.load(GOOD_EXPECTED)
-        self.assertEqual(runs[1].violated, ("LiveWitness",))
+    def test_witness_cfg_must_list_exactly_its_invariant(self) -> None:
+        cfgs = dict(CFGS, **{"witness.cfg": "SPECIFICATION Spec\nCONSTANT FIX_SAFE = FALSE\nINVARIANT Other2 Extra\n"})
+        self.assertRejected(GOOD_EXPECTED, "lists exactly one invariant", cfgs)
 
-    def test_check_needs_a_witness(self) -> None:
-        self.assertRejected(GOOD_EXPECTED.replace('violated = ["NeverDone"]', 'violated = []'),
-                            "at least one reachability witness")
+    def test_witness_cfg_must_not_declare_a_property(self) -> None:
+        cfgs = dict(CFGS, **{"witness.cfg": CFGS["witness.cfg"] + "PROPERTY Eventually\n"})
+        self.assertRejected(GOOD_EXPECTED, "must not declare a PROPERTY", cfgs)
+
+    def test_check_with_violated_is_rejected(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace('kind = "check"\nopen_findings',
+                                                  'kind = "check"\nviolated = ["Anything"]\nopen_findings'),
+                            "must not declare 'violated'")
+
+    def test_liveness_with_violated_is_rejected(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace('kind = "liveness"\nopen_findings',
+                                                  'kind = "liveness"\nviolated = ["Anything"]\nopen_findings'),
+                            "must not declare 'violated'")
+
+    def test_open_findings_on_a_witness_is_rejected(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace(
+            'kind = "witness"\nviolated = ["Other2"]',
+            'kind = "witness"\nviolated = ["Other2"]\n'
+            'open_findings = [{ name = "X", tracking = "y", fix_flag = "FIX_X" }]'),
+            "only allowed for check and liveness runs")
+
+    def test_seeded_needs_violated(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace('kind = "seeded"\nviolated = ["Other"]', 'kind = "seeded"'),
+                            "a seeded run needs 'violated'")
 
     def test_seeded_needs_exactly_one(self) -> None:
         self.assertRejected(GOOD_EXPECTED.replace('violated = ["Other"]', 'violated = ["Other", "More"]'),
@@ -191,43 +232,47 @@ class LoadExpectedTests(unittest.TestCase):
         self.assertRejected(GOOD_EXPECTED, "must not declare a PROPERTY", cfgs)
 
     def test_unreached_well_formed_is_parsed(self) -> None:
-        expected = GOOD_EXPECTED.replace(
-            'open_findings = [{ name = "Safe", tracking = "TODO.md: demo", fix_flag = "FIX_SAFE" }]\n'
-            'timeout_minutes = 5',
-            'open_findings = [{ name = "Safe", tracking = "TODO.md: demo", fix_flag = "FIX_SAFE" }]\n'
-            'unreached = [{ label = "S12_3", reason = "not reached in this variant" }]\n'
-            'timeout_minutes = 5')
-        _, runs = self.load(expected)
-        self.assertEqual(runs[0].unreached, (("S12_3", "not reached in this variant"),))
+        expected_toml = GOOD_EXPECTED.replace(
+            'kind = "check"\nopen_findings',
+            'kind = "check"\nunreached = [{ label = "S12_3", reason = "not reached in this variant" }]\nopen_findings')
+        expected = self.load(expected_toml)
+        self.assertEqual(expected.runs[0].unreached, (("S12_3", "not reached in this variant"),))
 
     def test_unreached_must_be_a_list(self) -> None:
-        self.assertRejected(GOOD_EXPECTED.replace('violated = ["NeverDone"]',
-                                                  'violated = ["NeverDone"]\nunreached = "S12_3"'),
+        self.assertRejected(GOOD_EXPECTED.replace('kind = "check"\nopen_findings',
+                                                  'kind = "check"\nunreached = "S12_3"\nopen_findings'),
                             "unreached must be an array of tables")
 
     def test_unreached_entry_needs_exactly_label_and_reason(self) -> None:
-        self.assertRejected(GOOD_EXPECTED.replace('violated = ["NeverDone"]',
-                                                  'violated = ["NeverDone"]\n'
-                                                  'unreached = [{ label = "S12_3" }]'),
+        self.assertRejected(GOOD_EXPECTED.replace('kind = "check"\nopen_findings',
+                                                  'kind = "check"\nunreached = [{ label = "S12_3" }]\nopen_findings'),
                             "exactly 'label' and 'reason'")
 
-    def test_unreached_label_must_look_like_a_pluscal_label(self) -> None:
-        self.assertRejected(GOOD_EXPECTED.replace('violated = ["NeverDone"]',
-                                                  'violated = ["NeverDone"]\n'
-                                                  'unreached = [{ label = "NotALabel", reason = "x" }]'),
-                            "must look like a PlusCal label")
+    def test_unreached_label_must_be_an_identifier(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace(
+            'kind = "check"\nopen_findings',
+            'kind = "check"\nunreached = [{ label = "not-a-label", reason = "x" }]\nopen_findings'),
+            "must be a TLA+ identifier")
+
+    def test_unreached_label_like_plain_recover_is_accepted(self) -> None:
+        expected_toml = GOOD_EXPECTED.replace(
+            'kind = "check"\nopen_findings',
+            'kind = "check"\nunreached = [{ label = "plain_recover", reason = "x" }]\nopen_findings')
+        expected = self.load(expected_toml)
+        self.assertEqual(expected.runs[0].unreached, (("plain_recover", "x"),))
 
     def test_unreached_reason_must_be_non_empty(self) -> None:
-        self.assertRejected(GOOD_EXPECTED.replace('violated = ["NeverDone"]',
-                                                  'violated = ["NeverDone"]\n'
-                                                  'unreached = [{ label = "S12_3", reason = "" }]'),
-                            "reason must be a non-empty string")
+        self.assertRejected(GOOD_EXPECTED.replace(
+            'kind = "check"\nopen_findings',
+            'kind = "check"\nunreached = [{ label = "S12_3", reason = "" }]\nopen_findings'),
+            "reason must be a non-empty string")
 
     def test_unreached_labels_must_be_unique(self) -> None:
         self.assertRejected(GOOD_EXPECTED.replace(
-            'violated = ["NeverDone"]',
-            'violated = ["NeverDone"]\n'
-            'unreached = [{ label = "S12_3", reason = "a" }, { label = "S12_3", reason = "b" }]'),
+            'kind = "check"\nopen_findings',
+            'kind = "check"\n'
+            'unreached = [{ label = "S12_3", reason = "a" }, { label = "S12_3", reason = "b" }]\n'
+            'open_findings'),
             "has duplicate labels")
 
     def test_unreached_is_not_allowed_on_a_seeded_run(self) -> None:
@@ -239,17 +284,199 @@ class LoadExpectedTests(unittest.TestCase):
     def test_never_reached_well_formed_is_parsed(self) -> None:
         d = ExpectedDir(GOOD_EXPECTED + '\n[[never_reached]]\nlabel = "S99_1"\nreason = "no scenario reaches it"\n')
         self.addCleanup(d.close)
-        d.load()
-        self.assertEqual(run.LAST_NEVER_REACHED, (("S99_1", "no scenario reaches it"),))
+        expected = d.load()
+        self.assertEqual(expected.never_reached, (("S99_1", "no scenario reaches it"),))
 
-    def test_never_reached_label_must_look_like_a_pluscal_label(self) -> None:
-        self.assertRejected(GOOD_EXPECTED + '\n[[never_reached]]\nlabel = "Bad"\nreason = "x"\n',
-                            "must look like a PlusCal label")
+    def test_never_reached_label_must_be_an_identifier(self) -> None:
+        self.assertRejected(GOOD_EXPECTED + '\n[[never_reached]]\nlabel = "not-an-ident"\nreason = "x"\n',
+                            "must be a TLA+ identifier")
 
     def test_unknown_run_key(self) -> None:
         self.assertRejected(GOOD_EXPECTED.replace("timeout_minutes = 5\n\n[[run]]\nname = \"demo-posix-liveness\"",
                                                   "timeout_minutes = 5\nnotes = \"x\"\n\n[[run]]\nname = \"demo-posix-liveness\""),
                             "unknown keys")
+
+
+class ConstantsLoadTests(unittest.TestCase):
+    """Load-time validation of the 'constants' table against the .cfg's CONSTANT section."""
+
+    CFGS = {
+        "constants.cfg": ('SPECIFICATION Spec\nCONSTANTS\n    N = 3\n    FLAG = TRUE\n    LABEL = "x"\n'
+                          '    NAMES = {a, b}\n    FIX_X = FALSE\nINVARIANT Safe\n'),
+    }
+
+    @staticmethod
+    def toml(literal: str) -> str:
+        return f"""
+scenarios = ["demo"]
+
+[[run]]
+name = "demo-posix-check"
+module = "M"
+config = "constants.cfg"
+scenario = "demo"
+kind = "check"
+constants = {literal}
+timeout_minutes = 5
+"""
+
+    def load(self, literal: str) -> run.Expected:
+        d = ExpectedDir(self.toml(literal), self.CFGS)
+        self.addCleanup(d.close)
+        return d.load()
+
+    def assertRejected(self, literal: str, fragment: str) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            self.load(literal)
+        self.assertIn(fragment, str(ctx.exception))
+
+    def test_matching_constants_are_accepted(self) -> None:
+        expected = self.load('{ N = 3, FLAG = true, LABEL = "x", NAMES = ["a", "b"] }')
+        self.assertEqual(dict(expected.runs[0].constants),
+                         {"N": 3, "FLAG": True, "LABEL": "x", "NAMES": frozenset({"a", "b"})})
+
+    def test_fix_flag_cfg_constant_is_not_required_in_constants(self) -> None:
+        expected = self.load('{ N = 3, FLAG = true, LABEL = "x", NAMES = ["a", "b"] }')
+        self.assertNotIn("FIX_X", dict(expected.runs[0].constants))
+
+    def test_set_comparison_is_order_insensitive(self) -> None:
+        self.load('{ N = 3, FLAG = true, LABEL = "x", NAMES = ["b", "a"] }')
+
+    def test_wrong_int_is_rejected(self) -> None:
+        self.assertRejected('{ N = 4, FLAG = true, LABEL = "x", NAMES = ["a", "b"] }', "does not match")
+
+    def test_wrong_bool_is_rejected(self) -> None:
+        self.assertRejected('{ N = 3, FLAG = false, LABEL = "x", NAMES = ["a", "b"] }', "does not match")
+
+    def test_wrong_string_is_rejected(self) -> None:
+        self.assertRejected('{ N = 3, FLAG = true, LABEL = "y", NAMES = ["a", "b"] }', "does not match")
+
+    def test_wrong_set_is_rejected(self) -> None:
+        self.assertRejected('{ N = 3, FLAG = true, LABEL = "x", NAMES = ["a", "c"] }', "does not match")
+
+    def test_int_does_not_satisfy_a_boolean(self) -> None:
+        self.assertRejected('{ N = 3, FLAG = 1, LABEL = "x", NAMES = ["a", "b"] }', "does not match")
+
+    def test_cfg_constant_missing_from_constants_is_rejected(self) -> None:
+        self.assertRejected('{ FLAG = true, LABEL = "x", NAMES = ["a", "b"] }', "not declared in 'constants'")
+
+    def test_extra_constants_key_is_rejected(self) -> None:
+        self.assertRejected('{ N = 3, FLAG = true, LABEL = "x", NAMES = ["a", "b"], EXTRA = 1 }',
+                            "which the config does not assign")
+
+    def test_fix_key_in_constants_is_rejected(self) -> None:
+        self.assertRejected('{ N = 3, FLAG = true, LABEL = "x", NAMES = ["a", "b"], FIX_X = false }',
+                            "must not contain a fix flag")
+
+
+class CfgConstantsTests(unittest.TestCase):
+    """Direct tests of cfg_constants(), independent of expected.toml loading."""
+
+    def test_returns_typed_literals_and_omits_model_values_and_substitutions(self) -> None:
+        text = (
+            "CONSTANTS\n"
+            "    N = 3\n"
+            "    FLAG = TRUE\n"
+            '    LABEL = "x"\n'
+            "    NAMES = {a, b}\n"
+            "    EMPTY = {}\n"
+            "    NoProc = nobody\n"
+            "    P <- dirOp\n"
+        )
+        self.assertEqual(run.cfg_constants(text), {
+            "N": 3,
+            "FLAG": True,
+            "LABEL": "x",
+            "NAMES": frozenset({"a", "b"}),
+            "EMPTY": frozenset(),
+        })
+
+
+SYMMETRY_MODULE = "---- MODULE M ----\nPerms == Permutations(Recoverers)\n====\n"
+SYMMETRY_CFG = {"symmetry.cfg": "SPECIFICATION Spec\nCONSTANTS\n    Recoverers = {r1, r2}\nSYMMETRY Perms\nINVARIANT Safe\n"}
+NO_SYMMETRY_CFG = {"symmetry.cfg": "SPECIFICATION Spec\nCONSTANTS\n    Recoverers = {r1, r2}\nINVARIANT Safe\n"}
+
+
+def symmetry_toml(kind: str = "check", symmetry_literal: str | None = '{ definition = "Perms", over = "Recoverers" }',
+                   constants_literal: str = '{ Recoverers = ["r1", "r2"] }') -> str:
+    sym_line = f"symmetry = {symmetry_literal}\n" if symmetry_literal is not None else ""
+    return f"""
+scenarios = ["demo"]
+
+[[run]]
+name = "demo-posix-{kind}"
+module = "M"
+config = "symmetry.cfg"
+scenario = "demo"
+kind = "{kind}"
+{sym_line}constants = {constants_literal}
+timeout_minutes = 5
+"""
+
+
+class SymmetryTests(unittest.TestCase):
+    def load(self, toml_text: str, cfgs: dict[str, str], module_text: str = SYMMETRY_MODULE) -> run.Expected:
+        d = ExpectedDir(toml_text, cfgs, module_text)
+        self.addCleanup(d.close)
+        return d.load()
+
+    def assertRejected(self, toml_text: str, fragment: str, cfgs: dict[str, str] = SYMMETRY_CFG,
+                        module_text: str = SYMMETRY_MODULE) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            self.load(toml_text, cfgs, module_text)
+        self.assertIn(fragment, str(ctx.exception))
+
+    def test_valid_symmetry_is_accepted(self) -> None:
+        expected = self.load(symmetry_toml(), SYMMETRY_CFG)
+        self.assertEqual(expected.runs[0].symmetry, ("Perms", "Recoverers"))
+
+    def test_symmetry_declared_but_absent_from_cfg_is_rejected(self) -> None:
+        self.assertRejected(symmetry_toml(), "if and only if", cfgs=NO_SYMMETRY_CFG)
+
+    def test_symmetry_in_cfg_but_undeclared_is_rejected(self) -> None:
+        self.assertRejected(symmetry_toml(symmetry_literal=None), "if and only if")
+
+    def test_wrong_symmetry_definition_is_rejected(self) -> None:
+        cfgs = {"symmetry.cfg": "SPECIFICATION Spec\nCONSTANTS\n    Recoverers = {r1, r2}\nSYMMETRY OtherPerms\nINVARIANT Safe\n"}
+        self.assertRejected(symmetry_toml(), "must name exactly", cfgs=cfgs)
+
+    def test_module_without_permutations_definition_is_rejected(self) -> None:
+        self.assertRejected(symmetry_toml(), "must define", module_text=DEFAULT_MODULE)
+
+    def test_symmetry_over_must_be_a_set_of_at_least_two(self) -> None:
+        self.assertRejected(symmetry_toml(constants_literal='{ Recoverers = ["r1"] }'),
+                            "set of at least two elements")
+
+    def test_symmetry_on_a_liveness_run_is_rejected(self) -> None:
+        self.assertRejected(symmetry_toml(kind="liveness"), "must not declare symmetry")
+
+
+class TightenedTests(unittest.TestCase):
+    def test_tightened_on_a_non_liveness_run_is_rejected(self) -> None:
+        expected = GOOD_EXPECTED.replace(
+            'kind = "check"\nopen_findings',
+            'kind = "check"\ntightened = { rung = "one crash", measurement = "did not fit" }\nopen_findings')
+        d = ExpectedDir(expected)
+        self.addCleanup(d.close)
+        with self.assertRaises(run.ExpectedError) as ctx:
+            d.load()
+        self.assertIn("tightened is only allowed for liveness runs", str(ctx.exception))
+
+    def test_tightened_on_a_liveness_run_is_accepted_and_stored(self) -> None:
+        expected = GOOD_EXPECTED.replace(
+            'kind = "liveness"\nopen_findings',
+            'kind = "liveness"\ntightened = { rung = "one crash", measurement = "did not fit" }\nopen_findings')
+        d = ExpectedDir(expected)
+        self.addCleanup(d.close)
+        loaded = d.load()
+        self.assertEqual(loaded.runs[1].tightened, ("one crash", "did not fit"))
+
+    def test_report_prints_tightened_line(self) -> None:
+        result = run.Result("demo-posix-liveness", "ok", frozenset(), frozenset(), 10, 1.0, "", (), None)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            run.report(result, ("one crash", "did not fit"))
+        self.assertIn("tightened: one crash (did not fit)", out.getvalue())
 
 
 class CfgTests(unittest.TestCase):
@@ -339,31 +566,39 @@ class JudgeTests(unittest.TestCase):
     def setUp(self) -> None:
         d = ExpectedDir()
         self.addCleanup(d.close)
-        _, runs = d.load()
-        self.check, self.liveness, self.seeded = runs
+        expected = d.load()
+        self.check, self.liveness, self.seeded, self.witness = expected.runs
 
     @staticmethod
     def seen(*names: str) -> run.Outcome:
         return run.Outcome(None, frozenset(names), 10, ())
 
-    def test_check_needs_witnesses_and_open_findings(self) -> None:
-        self.assertEqual(run.judge(self.check, self.seen("NeverDone", "Safe"), fixed=False), "ok")
-        self.assertEqual(run.judge(self.check, self.seen("NeverDone"), fixed=False), "mismatch")
-        self.assertEqual(run.judge(self.check, self.seen("NeverDone", "Safe", "Extra"), fixed=False), "mismatch")
+    def test_check_passes_only_on_its_open_findings(self) -> None:
+        self.assertEqual(run.judge(self.check, self.seen("Safe"), fixed=False), "ok")
+        self.assertEqual(run.judge(self.check, self.seen(), fixed=False), "mismatch")
+        self.assertEqual(run.judge(self.check, self.seen("Safe", "Extra"), fixed=False), "mismatch")
 
     def test_fixed_run_drops_open_findings(self) -> None:
-        self.assertEqual(run.judge(self.check, self.seen("NeverDone"), fixed=True), "ok")
-        self.assertEqual(run.judge(self.check, self.seen("NeverDone", "Safe"), fixed=True), "mismatch")
+        self.assertEqual(run.judge(self.check, self.seen(), fixed=True), "ok")
+        self.assertEqual(run.judge(self.check, self.seen("Safe"), fixed=True), "mismatch")
 
-    def test_liveness_passes_only_when_its_witness_is_seen_and_the_property_holds(self) -> None:
+    def test_liveness_passes_only_on_its_open_findings(self) -> None:
         self.assertEqual(run.judge(self.liveness, self.seen("LiveWitness"), fixed=False), "ok")
         self.assertEqual(run.judge(self.liveness, self.seen(), fixed=False), "mismatch")
         self.assertEqual(run.judge(self.liveness, self.seen("LiveWitness", "Eventually"), fixed=False), "mismatch")
+
+    def test_liveness_fixed_run_drops_open_findings(self) -> None:
+        self.assertEqual(run.judge(self.liveness, self.seen(), fixed=True), "ok")
+        self.assertEqual(run.judge(self.liveness, self.seen("LiveWitness"), fixed=True), "mismatch")
 
     def test_seeded_needs_its_violation(self) -> None:
         self.assertEqual(run.judge(self.seeded, self.seen("Other"), fixed=False), "ok")
         self.assertEqual(run.judge(self.seeded, self.seen(), fixed=False), "mismatch")
         self.assertEqual(run.judge(self.seeded, self.seen(run.DEADLOCK), fixed=False), "mismatch")
+
+    def test_witness_needs_its_violation(self) -> None:
+        self.assertEqual(run.judge(self.witness, self.seen("Other2"), fixed=False), "ok")
+        self.assertEqual(run.judge(self.witness, self.seen(), fixed=False), "mismatch")
 
     def test_tooling_error_is_never_a_match(self) -> None:
         self.assertEqual(run.judge(self.liveness, run.Outcome("boom", frozenset(), None, ()), fixed=False), "tooling")
@@ -446,7 +681,8 @@ class ExecuteTests(unittest.TestCase):
         d = ExpectedDir()
         self.addCleanup(d.close)
         self.base = d.path
-        _, (self.check, _, _) = d.load()
+        expected = d.load()
+        self.check = expected.runs[0]
         target = tempfile.TemporaryDirectory()
         self.addCleanup(target.cleanup)
         self.target = Path(target.name)
@@ -464,7 +700,7 @@ class ExecuteTests(unittest.TestCase):
     def test_replayed_output_is_judged_and_logged(self) -> None:
         self.fake_tlc(f"import sys; text = open({str(TESTDATA / 'clean.out')!r}).read(); "
                       "sys.stdout.write(text.partition(chr(10))[2]); sys.exit(0)")
-        clean = run.Run("demo-posix-check", "M", "check.cfg", "demo", "check", (), (), (), 1)
+        clean = run.Run("demo-posix-check", "M", "check.cfg", "demo", "check", (), (), (), 1, (), None, None)
         result = run.execute(clean, Path("unused.jar"), self.base, fixed=False)
         self.assertEqual((result.status, result.observed, result.distinct_states), ("ok", frozenset(), 4))
         self.assertIsNotNone(result.log)
@@ -504,7 +740,7 @@ class ExecuteTests(unittest.TestCase):
 
     def test_timeout_is_reported_as_a_tooling_failure(self) -> None:
         self.fake_tlc("import time; time.sleep(30)")
-        slow = run.Run("demo-posix-check", "M", "check.cfg", "demo", "check", ("NeverDone",), (), (), 0)
+        slow = run.Run("demo-posix-check", "M", "check.cfg", "demo", "check", ("NeverDone",), (), (), 0, (), None, None)
         result = run.execute(slow, Path("unused.jar"), self.base, fixed=False)
         self.assertEqual(result.status, "tooling")
         self.assertEqual(result.detail, "TIMEOUT after 0 min")
@@ -554,9 +790,11 @@ class MainTests(unittest.TestCase):
     def test_all_runs_ok_is_exit_0(self) -> None:
         code, calls = self.main_with({})
         self.assertEqual(code, 0)
-        # The run with an open finding runs twice: as written, then with its fix flag set.
+        # Runs with an open finding run twice: as written, then with their fix flags set.
         self.assertEqual(calls, [("demo-posix-check", False), ("demo-posix-check", True),
-                                 ("demo-posix-liveness", False), ("demo-posix-seeded-SEED_X", False)])
+                                 ("demo-posix-liveness", False), ("demo-posix-liveness", True),
+                                 ("demo-posix-seeded-SEED_X", False),
+                                 ("demo-posix-witness-Other2", False)])
 
     def test_a_mismatch_is_exit_1_even_beside_a_tooling_failure(self) -> None:
         code, _ = self.main_with({("demo-posix-check", True): "tooling", ("demo-posix-liveness", False): "mismatch"})
@@ -569,7 +807,7 @@ class MainTests(unittest.TestCase):
     def test_an_error_inside_one_run_is_exit_2_and_later_runs_still_run(self) -> None:
         code, calls = self.main_with({("demo-posix-check", False): "raise"})
         self.assertEqual(code, 2)
-        self.assertEqual(calls[-1], ("demo-posix-seeded-SEED_X", False))
+        self.assertEqual(calls[-1], ("demo-posix-witness-Other2", False))
 
     def test_list_scenarios_prints_the_names_as_json_without_java(self) -> None:
         d = ExpectedDir(GOOD_EXPECTED.replace('scenarios = ["demo"]', 'scenarios = ["demo", "other"]') + """
@@ -579,7 +817,7 @@ module = "M"
 config = "live.cfg"
 scenario = "other"
 kind = "liveness"
-violated = ["LiveWitness"]
+constants = {}
 timeout_minutes = 5
 """)
         self.addCleanup(d.close)
@@ -598,14 +836,16 @@ timeout_minutes = 5
 
 
 class CommandTests(unittest.TestCase):
-    def test_check_and_liveness_continue_seeded_halts(self) -> None:
+    def test_check_and_liveness_continue_seeded_and_witness_halt(self) -> None:
         d = ExpectedDir()
         self.addCleanup(d.close)
-        _, (check, liveness, seeded) = d.load()
+        expected = d.load()
+        check, liveness, seeded, witness = expected.runs
         jar, cfg, meta = Path("j.jar"), Path("c.cfg"), Path("m")
         self.assertIn("-continue", run.tlc_command(jar, check, cfg, meta))
         self.assertIn("-continue", run.tlc_command(jar, liveness, cfg, meta))
         self.assertNotIn("-continue", run.tlc_command(jar, seeded, cfg, meta))
+        self.assertNotIn("-continue", run.tlc_command(jar, witness, cfg, meta))
         self.assertNotIn("-deadlock", run.tlc_command(jar, check, cfg, meta))
         self.assertEqual(run.tlc_command(jar, check, cfg, meta)[-1], "M")
 
