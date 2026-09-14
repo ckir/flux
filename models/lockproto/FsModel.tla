@@ -168,6 +168,11 @@ FsTryLock(fs, p, o) ==
     IF o = NoObj \/ LockCapability = "weak" \/ ~OpenBy(fs, p, o) \/ fs.oslock[o] # NoProc THEN Fail(fs)
     ELSE Ok([fs EXCEPT !.oslock[o] = p], o)
 
+\* A remote lock's lease lapses (design Section 5.1): the lock is gone, the holder keeps its handle and
+\* is not told.
+FsLeaseExpiry(fs, o) ==
+    IF o = NoObj \/ fs.oslock[o] = NoProc THEN Fail(fs) ELSE Ok([fs EXCEPT !.oslock[o] = NoProc], o)
+
 FsUnlock(fs, p, o) ==
     IF o = NoObj \/ fs.oslock[o] # p THEN Fail(fs) ELSE Ok([fs EXCEPT !.oslock[o] = NoProc], o)
 
@@ -241,10 +246,10 @@ FsListStep(fs, d, n) == Exists(fs, d, n)
 \* ------------------------------------------------------------------------------------------
 \* Crashes (design Section 5.2)
 
-\* A process crash: its handles, their sharing restrictions and its OS-native locks go; content
-\* stays as it is, so an interrupted record write stays Torn. Its in-flight calls are not resolved
-\* here: each lands or is dropped later, which is what `FsLand`/`FsDrop` are for.
-FsProcCrash(fs, p) ==
+\* Closing every handle a process holds: the handles, their sharing restrictions and its OS-native
+\* locks go, and on Windows a pending-delete object whose last handle this was loses its name. A
+\* process that stops after a failed Section 99 check does this, and so does a process crash.
+FsCloseAll(fs, p) ==
     LET mine == {h \in fs.handles : h.proc = p}
         gone == {h.obj : h \in mine}
         last(o) == {h \in fs.handles \ mine : h.obj = o} = {}
@@ -257,6 +262,11 @@ FsProcCrash(fs, p) ==
            !.entries = [d \in Dirs |-> [c \in Classes |->
                           IF <<d, c>> \in names THEN NoObj ELSE fs.entries[d][c]]],
            !.deleted = @ \ {o \in fs.deleted : o \in gone /\ last(o)} ]
+
+\* A process crash closes everything the process holds; content stays as it is, so an interrupted
+\* record write stays Torn. The protocol resolves its in-flight calls in the same step (design
+\* Section 5.2), with `FsLand` and `FsDrop`.
+FsProcCrash(fs, p) == FsCloseAll(fs, p)
 
 \* A host crash. Every object written since its last flush takes one of: its old durable content,
 \* its latest content, or Torn, chosen per object (`pick`). Entry operations since the last

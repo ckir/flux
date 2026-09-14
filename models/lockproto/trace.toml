@@ -34,7 +34,7 @@
 #
 # Headings enter the stamp as the model encodes them (plan 2 onward).
 
-planned_scenarios = ["breaklock", "mixed", "cleanup", "cleanup-crash", "nested", "dirlock", "claims"]
+planned_scenarios = ["breaklock", "mixed", "breaklock-remote", "mixed-remote", "cleanup", "cleanup-crash", "nested", "dirlock", "claims"]
 
 [[unit]]
 heading = "## 21.1 Existing Operation State Without `--resume`"

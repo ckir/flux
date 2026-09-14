@@ -51,17 +51,13 @@ NeverRecoveredAfterCrash == ~recoveredAfterCrash
 \* process crash (design Section 11).
 NeverHostCrashChangedLock == ~hostCrashChangedLock
 
-\* The two state witnesses the liveness runs need: the states their properties are about do occur
-\* (design Section 7).
-NeverDeadOwnerLock == ~DeadOwnerLock
-NeverTornLock == ~TornLock
-
 \* ------------------------------------------------------------------------------------------
 \* Temporal properties (design Section 7). A configuration that checks one lists exactly one
 \* PROPERTY, because TLC reports a temporal violation without naming the property it belongs to.
 
-\* No further crash can happen: the environment has stopped, or has spent every crash it has.
-EnvQuiet == pc["env"] \in {"env_done", "Done"} \/ crashes = MaxCrashes
+\* Nothing more can go wrong: the environment has stopped, or has spent every crash and every lease
+\* expiry it has.
+EnvQuiet == pc["env"] \in {"env_done", "Done"} \/ (crashes = MaxCrashes /\ leases = MaxLeaseExpiries)
 
 \* Some actor entitled to replace a dead lock (240.3, 251.1) has not started yet and has not been
 \* killed, so it will still classify what is at the lock path. A PlainRun is not one: a plain rerun
