@@ -762,7 +762,11 @@ class InterpretTests(unittest.TestCase):
 
     def test_exit_status_must_agree_with_messages(self) -> None:
         _, output = fixture("clean")
-        self.assertIn("does not match", run.interpret(12, output, []).tooling_error or "")
+        for exit_code in (11, 12, 13):
+            with self.subTest(exit_code=exit_code):
+                # A clean run's messages carry no deadlock, invariant or temporal report, so none of the
+                # violation exit codes agrees with them.
+                self.assertIn("does not match", run.interpret(exit_code, output, ["P"]).tooling_error or "")
 
     def test_crlf_output_parses(self) -> None:
         code, output = fixture("continue_two_invariants")

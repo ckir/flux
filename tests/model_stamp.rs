@@ -1441,7 +1441,7 @@ fn invalid_trace_toml_is_reported() {
     let problems =
         check(&Inputs { spec: "# Title\n", stamp: &stamp, trace, tla: &[], expected: "" });
     assert_eq!(problems.len(), 1, "{problems:#?}");
-    assert!(problems[0].contains("does not parse"), "{problems:#?}");
+    assert!(problems[0].contains("trace.toml does not parse"), "{problems:#?}");
 }
 
 #[test]
