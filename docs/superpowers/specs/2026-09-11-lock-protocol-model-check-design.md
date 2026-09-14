@@ -904,7 +904,7 @@ clean (2026-09-12, `MaxCrashes = 2`):
 | `recovery-<platform>-plain-cleanup-check` | Owner, PlainRun, Cleanup | 6 | 1,067,868 / 1,471,158 | the plain rerun's own 240.3 path, which needs a dead cleanup lock |
 
 Counts are as measured on CI on 2026-09-14, with the `Foreign` start state of Section 7, which adds 24,810 states to each
-run (12,669 under `SYMMETRY`), 1.1% to 2.4%. Before that, on 2026-09-13, the acquirer rule of spec 96.1 and 240.3 step 4 became unconditional in the model,
+run (12,669 under `SYMMETRY`), 0.9% to 2.4%. Before that, on 2026-09-13, the acquirer rule of spec 96.1 and 240.3 step 4 became unconditional in the model,
 and each state space shrank by about a fifth, because an actor that cannot take its OS-native
 lock now removes its file and stops instead of carrying on.
 
