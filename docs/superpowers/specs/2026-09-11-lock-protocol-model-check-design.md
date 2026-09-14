@@ -898,12 +898,13 @@ clean (2026-09-12, `MaxCrashes = 2`):
 
 | Run | Actors | `MaxObjs` | Distinct states, POSIX / Windows | What only this pairing reaches |
 |---|---|---|---|---|
-| `recovery-<platform>-check` | Owner, 2 Recoverers (`SYMMETRY`) | 3 | 937,335 / 1,380,999 | two recoverers racing for the same lock, which is what 240.3 step 2 is about |
-| `recovery-<platform>-plain-check` | Owner, Recoverer, PlainRun | 4 | 1,620,690 / 2,310,021 | a plain rerun (21.1) meeting a dead owner's lock a recoverer is working on |
-| `recovery-<platform>-cleanup-check` | Owner, Recoverer, Cleanup | 5 | 1,174,383 / 1,684,944 | two movers of different kinds, both entitled to move the lock aside |
-| `recovery-<platform>-plain-cleanup-check` | Owner, PlainRun, Cleanup | 6 | 1,043,058 / 1,446,348 | the plain rerun's own 240.3 path, which needs a dead cleanup lock |
+| `recovery-<platform>-check` | Owner, 2 Recoverers (`SYMMETRY`) | 3 | 950,004 / 1,393,668 | two recoverers racing for the same lock, which is what 240.3 step 2 is about |
+| `recovery-<platform>-plain-check` | Owner, Recoverer, PlainRun | 4 | 1,645,500 / 2,334,831 | a plain rerun (21.1) meeting a dead owner's lock a recoverer is working on |
+| `recovery-<platform>-cleanup-check` | Owner, Recoverer, Cleanup | 5 | 1,199,193 / 1,709,754 | two movers of different kinds, both entitled to move the lock aside |
+| `recovery-<platform>-plain-cleanup-check` | Owner, PlainRun, Cleanup | 6 | 1,067,868 / 1,471,158 | the plain rerun's own 240.3 path, which needs a dead cleanup lock |
 
-Counts are as measured on 2026-09-13, after the acquirer rule of spec 96.1 and 240.3 step 4 became unconditional in
+Counts are as measured on CI on 2026-09-14, after the `Foreign` start state of Section 7 was added (it adds under 2% to
+each run); the note that follows is from 2026-09-13, after the acquirer rule of spec 96.1 and 240.3 step 4 became unconditional in
 the model; each state space is about a fifth smaller than before it, because an actor that cannot take its OS-native
 lock now removes its file and stops instead of carrying on.
 
