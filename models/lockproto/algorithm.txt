@@ -161,7 +161,16 @@
          else {
            with (r = FsTryLock(fs, self, obj)) {
              if (r.ok) { fs := r.fs; }
-             else { goto S96_1_ownlock_backoff; };
+             else { goto S96_1_ownlock_wait; };
+         };
+         };
+       S96_1_ownlock_verify:
+         \* Holding the lock, check that the lock path still names the file and that nobody has written it
+         \* (a takeover that finished and released while this acquirer waited): otherwise start again.
+         if (crashed[self]) { goto acquire_crashed; }
+         else {
+           with (ident \in FsIdentityChoices(fs, P, LockName)) {
+             if (ident # obj \/ fs.content[obj] # EmptyFile) { goto S96_1_ownlock_close; };
          };
          };
        S96_1_record_begin:
@@ -188,27 +197,30 @@
            refused[self] := "TARGET_LOCK_BUSY";
            return;
          };
-       S96_1_ownlock_backoff:
+       S96_1_ownlock_wait:
          \* Without the OS-native lock the record would prove nothing, and 240.2 would read whoever does
-         \* hold the lock as the owner: close and start again (96.1), removing the file first only if the
-         \* lock path still names it. Another invocation may have taken the file over in place (240.5), and
-         \* removing it by name would delete that lock (plan 3's measured finding; SEED_ACQUIRER_UNLINKS_BY_NAME
-         \* puts the old by-name removal back).
+         \* hold the lock as the owner (96.1). The holder may be an inspector, which lets go, or a takeover of
+         \* this very file (240.5). While the lock path still names the file and it is still empty, try the
+         \* lock again or give up; once it has changed, give up. Giving up closes the handle and never removes
+         \* the file by name, which could delete a takeover's lock (plan 3's measured finding): the empty lock
+         \* it leaves is uncertain, and --break-lock clears it.
          if (crashed[self]) { goto acquire_crashed; }
          else {
            with (ident \in FsIdentityChoices(fs, P, LockName)) {
-             if (ident # obj /\ ~SEED_ACQUIRER_UNLINKS_BY_NAME) { goto S96_1_ownlock_close; };
+             if (ident # obj \/ fs.content[obj] # EmptyFile) { goto S96_1_ownlock_close; }
+             else {
+               either { goto S96_1_ownlock; }
+               or { goto S96_1_ownlock_close; };
+             };
          };
-         };
-       S96_1_ownlock_unlink:
-         if (crashed[self]) { goto acquire_crashed; }
-         else {
-           with (c \in FsUnlinkChoices) { fs := FsUnlink(fs, P, LockName, c).fs; };
          };
        S96_1_ownlock_close:
+         \* SEED_ACQUIRER_UNLINKS_BY_NAME puts back the old wording, which removed the file by name first.
          if (crashed[self]) { goto acquire_crashed; }
          else {
-           if (OpenBy(fs, self, obj)) { fs := FsClose(fs, self, obj).fs; };
+           with (c \in FsUnlinkChoices) {
+             fs := FsClose(IF SEED_ACQUIRER_UNLINKS_BY_NAME THEN FsUnlink(fs, P, LockName, c).fs ELSE fs, self, obj).fs;
+           };
            refused[self] := "RESTART";
            return;
          };
@@ -264,7 +276,16 @@
          else {
            with (r = FsTryLock(fs, self, nobj)) {
              if (r.ok) { fs := r.fs; }
-             else { goto S240_3_s4_lock_backoff; };
+             else { goto S240_3_s4_lock_wait; };
+         };
+         };
+       S240_3_s4_lock_verify:
+         \* As 96.1's acquirer: holding the lock, the path must still name the new file and it must still
+         \* be empty, or the recoverer closes it and drops the moved file.
+         if (crashed[self]) { goto recover_crashed; }
+         else {
+           with (ident \in FsIdentityChoices(fs, P, LockName)) {
+             if (ident # nobj \/ fs.content[nobj] # EmptyFile) { goto S240_3_s4_lock_close; };
          };
          };
        S240_3_s4_record_begin:
@@ -294,24 +315,27 @@
            refused[self] := "RESTART";
            goto S240_3_release;
          };
-       S240_3_s4_lock_backoff:
-         \* The same rule at 240.3 step 4: remove the lock this recoverer just created if the lock path
-         \* still names it, close it, then drop the moved file as a failed create does, and start again.
+       S240_3_s4_lock_wait:
+         \* The same rule at 240.3 step 4 (96.1): while the path still names the new file and it is still
+         \* empty, try the lock again or give up; giving up closes without removing the file by name, then
+         \* drops the moved file as a failed create does, and starts again.
          if (crashed[self]) { goto recover_crashed; }
          else {
            with (ident \in FsIdentityChoices(fs, P, LockName)) {
-             if (ident # nobj /\ ~SEED_ACQUIRER_UNLINKS_BY_NAME) { goto S240_3_s4_lock_close; };
+             if (ident # nobj \/ fs.content[nobj] # EmptyFile) { goto S240_3_s4_lock_close; }
+             else {
+               either { goto S240_3_s4_lock; }
+               or { goto S240_3_s4_lock_close; };
+             };
          };
-         };
-       S240_3_s4_lock_unlink:
-         if (crashed[self]) { goto recover_crashed; }
-         else {
-           with (c \in FsUnlinkChoices) { fs := FsUnlink(fs, P, LockName, c).fs; };
          };
        S240_3_s4_lock_close:
+         \* SEED_ACQUIRER_UNLINKS_BY_NAME puts back the old wording, which removed the file by name first.
          if (crashed[self]) { goto recover_crashed; }
          else {
-           if (OpenBy(fs, self, nobj)) { fs := FsClose(fs, self, nobj).fs; };
+           with (c \in FsUnlinkChoices) {
+             fs := FsClose(IF SEED_ACQUIRER_UNLINKS_BY_NAME THEN FsUnlink(fs, P, LockName, c).fs ELSE fs, self, nobj).fs;
+           };
            goto S240_3_s4_drop;
          };
        S240_3_putback:

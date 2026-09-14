@@ -679,7 +679,7 @@ ability to see that defect and the run fails.
 
 | Flag | Defect re-introduced (review finding) | Scenario | Must fail |
 |---|---|---|---|
-| `SEED_ACQUIRER_UNLINKS_BY_NAME` | an acquirer that cannot take the lock on its new file removes the lock path by name, as 96.1 said before plan 3 (the acquirer window, Section 11) | `breaklock` | `RefusalJustified` (the shallowest of the two invariants it breaks) |
+| `SEED_ACQUIRER_UNLINKS_BY_NAME` | an acquirer that gives up on the lock of its new file removes the lock path by name, as 96.1 said before plan 3 (the acquirer window, Section 11) | `breaklock` | `RefusalJustified` (the shallowest of the two invariants it breaks) |
 | `SEED_RECOVER_FOREIGN` | a `Foreign` object at the lock path is judged replaceable and moved aside through 240.3, where the spec refuses it with `CONTROL_PLANE_NAMESPACE_CONFLICT` | `recovery`, POSIX, Owner and 2 Recoverers | `ForeignUntouched` |
 | `SEED_RECOVER_UNCERTAIN` | a lock whose record is torn or empty, judged uncertain, is moved aside through 240.3, where 240.4 preserves it; only the `classified` half of `PlainNeverOwnsUncertain`'s judgement reports it | `recovery`, POSIX, Owner and 2 Recoverers | `PlainNeverOwnsUncertain` |
 | `SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK` | a cleanup lock whose owner the oracle could not judge dead is moved aside through 240.3 (251.1 and 259.6 replace only a dead one); only the `ownerLive` half of `PlainNeverOwnsUncertain`'s judgement reports it | `recovery`, POSIX, Owner, Recoverer and Cleanup | `PlainNeverOwnsUncertain` |
@@ -912,10 +912,16 @@ Findings the design already expects, each to be confirmed or refuted by the firs
   removes that lock by name, and a third operation acquires a fresh one and passes its check. A first `SingleWriter`
   counterexample ran through a model reading instead (21.1 step 5's rewrite looked the lock path up again and wrote
   into the fresh lock); the owner ruled that lock-record writes go through the writer's handle, for 21.1 step 5 and
-  240.3 step 4 alike, and the violation remained. Fixed in the spec (owner ruling): 96.1 and 240.3 step 4 remove the
-  file only while the lock path still names it (the same file identity as the acquirer's handle), then close and
-  start again; `SEED_ACQUIRER_UNLINKS_BY_NAME` keeps the old wording. The window between that identity check and the
-  unlink is measured by the restored `breaklock-posix-check`.
+  240.3 step 4 alike, and the violation remained. A first fix, removing the file only while the lock path still names
+  it, was measured and failed (3,157,035 states): the Breaker completed its takeover between the identity check and
+  the unlink, which POSIX cannot make atomic. After a subagent analysis of five options the owner ruled (2026-09-14)
+  that an acquirer never removes by name a file whose lock it does not hold: it retries the lock while the path names
+  its still-empty file, re-checks both after taking it, and otherwise closes, leaving an empty lock that is uncertain
+  and cleared by `--break-lock`. The spec accepts that such a `--break-lock` can take the lock from a live acquirer
+  that has not yet locked it, which then finds the target busy; no second writer results. The model gives the retry a
+  nondeterministic give-up, since an untimed model cannot bound it (above). `SEED_ACQUIRER_UNLINKS_BY_NAME` keeps the
+  old by-name removal, on giving up. The same by-name removal remains in the directory-lock conflict of 96.1
+  (`S96_1_backoff`), which only `dirlock` reaches.
 - The directory acquirer lists `P` "for *.flux-lock held by other operations" (96.1), without saying whether a dead or
   uncertain owner's per-name lock counts as held. The model classifies each listed lock as Section 240 does and treats
   live and uncertain as held and dead as not, as 97.1 (a) does for ancestor locks; `trace.toml` records this reading
