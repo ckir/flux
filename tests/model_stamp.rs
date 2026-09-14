@@ -1430,3 +1430,145 @@ Alpha text.
         "{problems:#?}"
     );
 }
+
+// ------------------------------------------------------------------------------------------
+// Coverage gaps closed against the mutation harness (R1-R5b).
+
+#[test]
+fn invalid_trace_toml_is_reported() {
+    let stamp = stamp(&[]);
+    let trace = "heading = \"unterminated";
+    let problems =
+        check(&Inputs { spec: "# Title\n", stamp: &stamp, trace, tla: &[], expected: "" });
+    assert_eq!(problems.len(), 1, "{problems:#?}");
+    assert!(problems[0].contains("does not parse"), "{problems:#?}");
+}
+
+#[test]
+fn invalid_expected_toml_is_reported() {
+    let stamp = stamp(&[]);
+    let expected = "scenarios = [";
+    let problems =
+        check(&Inputs { spec: "# Title\n", stamp: &stamp, trace: "", tla: &[], expected });
+    assert_eq!(problems.len(), 1, "{problems:#?}");
+    assert!(problems[0].contains("expected.toml does not parse"), "{problems:#?}");
+}
+
+#[test]
+fn trace_label_absent_from_model_files_is_reported() {
+    let spec = "\
+# Title
+
+## 96.1 Alpha
+Alpha text.
+";
+    let stamp = stamp(&["## 96.1 Alpha"]);
+    let hash = unit_hash("Alpha text.");
+    let trace = format!(
+        "[[unit]]\nheading = \"## 96.1 Alpha\"\nordinal = 1\nquote = \"Alpha text\"\nhash = \"{hash}\"\nlabels = [\"S96_1_a\"]\n"
+    );
+    let problems = check(&Inputs { spec, stamp: &stamp, trace: &trace, tla: &[], expected: "" });
+    assert!(
+        problems.iter().any(|p| p == "label S96_1_a is in trace.toml but in no model file"),
+        "{problems:#?}"
+    );
+}
+
+#[test]
+fn heading_entry_with_neither_reason_is_reported() {
+    let spec = "\
+# Title
+
+## 96.1 Alpha
+Alpha text.
+
+## Normal
+First.
+";
+    let stamp = stamp(&["## 96.1 Alpha"]);
+    let hash = unit_hash("Alpha text.");
+    let trace = format!(
+        "[[unit]]\nheading = \"## 96.1 Alpha\"\nordinal = 1\nquote = \"Alpha text\"\nhash = \"{hash}\"\nlabels = [\"S96_1_a\"]\n\n\
+         [[heading]]\nheading = \"## Normal\"\nfamily = \"96\"\ncount = 1\n"
+    );
+    let tla = vec!["S96_1_a: x := 1;".to_string()];
+    let problems = check(&Inputs { spec, stamp: &stamp, trace: &trace, tla: &tla, expected: "" });
+    assert!(
+        problems.iter().any(|p| p.contains(
+            "must give exactly one of a not_modelled reason or a non-empty pending array"
+        )),
+        "{problems:#?}"
+    );
+}
+
+#[test]
+fn heading_entry_with_both_reasons_is_reported() {
+    let spec = "\
+# Title
+
+## 96.1 Alpha
+Alpha text.
+
+## Normal
+First.
+";
+    let stamp = stamp(&["## 96.1 Alpha"]);
+    let hash = unit_hash("Alpha text.");
+    let trace = format!(
+        "planned_scenarios = [\"extra\"]\n\n\
+         [[unit]]\nheading = \"## 96.1 Alpha\"\nordinal = 1\nquote = \"Alpha text\"\nhash = \"{hash}\"\nlabels = [\"S96_1_a\"]\n\n\
+         [[heading]]\nheading = \"## Normal\"\nfamily = \"96\"\ncount = 1\nnot_modelled = \"reason\"\npending = [\"extra\"]\n"
+    );
+    let tla = vec!["S96_1_a: x := 1;".to_string()];
+    let problems = check(&Inputs { spec, stamp: &stamp, trace: &trace, tla: &tla, expected: "" });
+    assert!(
+        problems.iter().any(|p| p.contains(
+            "must give exactly one of a not_modelled reason or a non-empty pending array"
+        )),
+        "{problems:#?}"
+    );
+}
+
+#[test]
+fn heading_entry_for_an_unknown_family_is_reported() {
+    let spec = "\
+# Title
+
+## 96.1 Alpha
+Alpha text.
+
+## 50.1 Other
+Other text.
+";
+    let stamp = stamp(&["## 96.1 Alpha"]);
+    let hash = unit_hash("Alpha text.");
+    let trace = format!(
+        "[[unit]]\nheading = \"## 96.1 Alpha\"\nordinal = 1\nquote = \"Alpha text\"\nhash = \"{hash}\"\nlabels = [\"S96_1_a\"]\n\n\
+         [[heading]]\nheading = \"## 50.1 Other\"\nfamily = \"50\"\ncount = 1\nnot_modelled = \"reason\"\n"
+    );
+    let tla = vec!["S96_1_a: x := 1;".to_string()];
+    let problems = check(&Inputs { spec, stamp: &stamp, trace: &trace, tla: &tla, expected: "" });
+    assert!(
+        problems.iter().any(|p| p.contains("which is not the family of any stamped heading")),
+        "{problems:#?}"
+    );
+}
+
+#[test]
+fn heading_entry_for_a_heading_absent_from_its_family_is_reported() {
+    let spec = "\
+# Title
+
+## 96.1 Alpha
+Alpha text.
+";
+    let stamp = stamp(&["## 96.1 Alpha"]);
+    let hash = unit_hash("Alpha text.");
+    let trace = format!(
+        "[[unit]]\nheading = \"## 96.1 Alpha\"\nordinal = 1\nquote = \"Alpha text\"\nhash = \"{hash}\"\nlabels = [\"S96_1_a\"]\n\n\
+         [[heading]]\nheading = \"## Nonexistent\"\nfamily = \"96\"\ncount = 1\nnot_modelled = \"reason\"\n"
+    );
+    let tla = vec!["S96_1_a: x := 1;".to_string()];
+    let problems = check(&Inputs { spec, stamp: &stamp, trace: &trace, tla: &tla, expected: "" });
+    assert!(problems.iter().any(|p| p.contains("does not occur in family")), "{problems:#?}");
+}

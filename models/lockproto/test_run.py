@@ -213,8 +213,8 @@ class LoadExpectedTests(unittest.TestCase):
         # CONSTRAINT, ACTION_CONSTRAINT and VIEW all cut or merge states while every constant still matches
         # expected.toml, so a .cfg could make a failing run pass (design Section 4: the .cfg may only agree).
         for cfg in ("check.cfg", "live.cfg", "seed.cfg"):
-            for section in ("CONSTRAINT Safe", "CONSTRAINTS Safe", "ACTION_CONSTRAINT Safe", "VIEW x",
-                            "TYPE Safe", "TYPE_CONSTRAINT Safe"):
+            for section in ("CONSTRAINT Safe", "CONSTRAINTS Safe", "ACTION_CONSTRAINT Safe", "ACTION_CONSTRAINTS Safe",
+                            "VIEW x", "TYPE Safe", "TYPE_CONSTRAINT Safe"):
                 with self.subTest(cfg=cfg, section=section):
                     cfgs = dict(CFGS, **{cfg: CFGS[cfg] + section + "\n"})
                     self.assertRejected(GOOD_EXPECTED, "must not shrink the state space", cfgs)
@@ -315,6 +315,30 @@ class LoadExpectedTests(unittest.TestCase):
         self.assertRejected(GOOD_EXPECTED.replace("timeout_minutes = 5\n\n[[run]]\nname = \"demo-posix-liveness\"",
                                                   "timeout_minutes = 5\nnotes = \"x\"\n\n[[run]]\nname = \"demo-posix-liveness\""),
                             "unknown keys")
+
+    def test_unknown_top_level_key_is_rejected(self) -> None:
+        self.assertRejected('bogus = "x"\n' + GOOD_EXPECTED, "unknown top-level keys")
+
+    def test_duplicate_scenarios_are_rejected(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace('scenarios = ["demo"]', 'scenarios = ["demo", "demo"]'),
+                            "has duplicates")
+
+    def test_timeout_must_be_a_positive_whole_number(self) -> None:
+        for literal in ("0", "-1", "true", '"5"'):
+            with self.subTest(literal=literal):
+                self.assertRejected(GOOD_EXPECTED.replace("timeout_minutes = 5", f"timeout_minutes = {literal}"),
+                                    "timeout_minutes must be a whole number")
+
+    def test_duplicate_open_finding_names_are_rejected(self) -> None:
+        expected = GOOD_EXPECTED.replace(
+            'open_findings = [{ name = "Safe", tracking = "TODO.md: demo", fix_flag = "FIX_SAFE" }]',
+            'open_findings = [{ name = "Safe", tracking = "TODO.md: demo", fix_flag = "FIX_SAFE" }, '
+            '{ name = "Safe", tracking = "TODO.md: demo2", fix_flag = "FIX_SAFE" }]')
+        self.assertRejected(expected, "duplicate open findings")
+
+    def test_unknown_module_is_rejected(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace('module = "M"', 'module = "NoSuchModule"'),
+                            "not found beside expected.toml")
 
 
 class DeferredLoadTests(unittest.TestCase):
@@ -520,6 +544,26 @@ class CfgConstantsTests(unittest.TestCase):
             run.cfg_constants("CONSTANT NAMES = {a b}\n")
         self.assertIn("missing a comma", str(ctx.exception))
 
+    def test_stray_token_after_assignment_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANT N = 3 4\n")
+        self.assertIn("unexpected token where a constant name", str(ctx.exception))
+
+    def test_bare_name_with_no_value_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANT N\n")
+        self.assertIn("with no '=' and value", str(ctx.exception))
+
+    def test_name_equals_nothing_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANT N =\n")
+        self.assertIn("no value", str(ctx.exception))
+
+    def test_trailing_comma_in_set_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANT S = {a, b,}\n")
+        self.assertIn("trailing comma", str(ctx.exception))
+
 
 SYMMETRY_MODULE = "---- MODULE M ----\nPerms == Permutations(Recoverers)\n====\n"
 SYMMETRY_CFG = {"symmetry.cfg": "SPECIFICATION Spec\nCONSTANTS\n    Recoverers = {r1, r2}\nSYMMETRY Perms\nINVARIANT Safe\n"}
@@ -723,6 +767,32 @@ class InterpretTests(unittest.TestCase):
     def test_crlf_output_parses(self) -> None:
         code, output = fixture("continue_two_invariants")
         self.assertEqual(run.interpret(code, output.replace("\n", "\r\n"), []).observed, {"NeverTwo", "NeverThree"})
+
+    def test_success_exit_with_a_deadlock_message_is_a_tooling_failure(self) -> None:
+        # "clean" carries Finished + Success (exit 0's messages); splicing in a message TLC would
+        # never emit alongside a clean success (a deadlock, or a temporal violation) must still be
+        # caught as a tooling failure - the exit code no longer agrees with the messages.
+        _, output = fixture("clean")
+        variants = {
+            "deadlock": ("@!@!@STARTMSG 2114:1 @!@!@\nDeadlock reached.\n@!@!@ENDMSG 2114 @!@!@\n", []),
+            "temporal": ("@!@!@STARTMSG 2116:1 @!@!@\nTemporal properties were violated.\n@!@!@ENDMSG 2116 @!@!@\n",
+                        ["EventuallyFive"]),
+        }
+        for case, (extra, properties) in variants.items():
+            with self.subTest(case=case):
+                result = run.interpret(0, output + extra, properties)
+                self.assertIn("does not match", result.tooling_error or "")
+
+    def test_unreadable_invariant_name_is_a_tooling_failure(self) -> None:
+        _, output = fixture("clean")
+        extra = "@!@!@STARTMSG 2110:1 @!@!@\nSomething is wrong here.\n@!@!@ENDMSG 2110 @!@!@\n"
+        result = run.interpret(12, output + extra, [])
+        self.assertIn("cannot read the invariant name", result.tooling_error or "")
+
+    def test_distinct_states_takes_the_last_report(self) -> None:
+        messages = [run.Message(run.C_COVERAGE_START, 0, "5 distinct states found"),
+                   run.Message(run.C_COVERAGE_START, 0, "9 distinct states found")]
+        self.assertEqual(run.distinct_states(messages), 9)
 
 
 class JudgeTests(unittest.TestCase):
@@ -1130,6 +1200,39 @@ timeout_minutes = 5
         self.assertEqual(code, 0)
         self.assertEqual(calls, ["demo-posix-check"])
 
+    def test_bad_expected_file_exits_2_with_the_error(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        bad = Path(tmp.name) / "expected.toml"
+        bad.write_text("this is not valid toml [[[\n", encoding="utf-8")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = run.main(["--expected", str(bad)])
+        self.assertEqual(code, 2)
+        self.assertIn("run.py:", err.getvalue())
+
+    def test_missing_java_exits_2_before_any_run(self) -> None:
+        d = ExpectedDir()
+        self.addCleanup(d.close)
+        run.shutil.which = lambda _name: None
+        called: list[str] = []
+
+        def ensure_jar() -> Path:
+            called.append("ensure_jar")
+            return Path("unused.jar")
+
+        def execute(*_args: object) -> run.Result:
+            called.append("execute")
+            return ExitCodeTests.result("ok")
+        run.ensure_jar = ensure_jar
+        run.execute = execute
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = run.main(["--expected", str(d.path / "expected.toml")])
+        self.assertEqual(code, 2)
+        self.assertIn("java is not on PATH", err.getvalue())
+        self.assertEqual(called, [])
+
 
 class CommandTests(unittest.TestCase):
     def test_check_and_liveness_continue_seeded_and_witness_halt(self) -> None:
@@ -1368,6 +1471,45 @@ timeout_minutes = 2
         expected = self.load("Overshoot")
         self.assertEqual(expected.runs[0].unreached, (("Overshoot", "x"),))
 
+    COVERAGE_FIXTURE_TOML = """
+scenarios = ["cov"]
+
+[[run]]
+name = "cov-posix-check"
+module = "M"
+config = "check.cfg"
+scenario = "cov"
+kind = "check"
+unreached = [{{ label = "a_step", reason = "x" }}]
+constants = {{ Alphas = {alphas}, Betas = ["b1"] }}
+timeout_minutes = 2
+"""
+
+    @staticmethod
+    def coverage_fixture_cfg(alphas_cfg_set: str) -> dict[str, str]:
+        return {"check.cfg": f"SPECIFICATION Spec\nCONSTANTS\n    Alphas = {alphas_cfg_set}\n"
+                             "    Betas = {b1}\nINVARIANT Safe\n"}
+
+    def load_coverage_fixture(self, alphas_toml: str, alphas_cfg_set: str) -> run.Expected:
+        d = ExpectedDir(self.COVERAGE_FIXTURE_TOML.format(alphas=alphas_toml),
+                        self.coverage_fixture_cfg(alphas_cfg_set),
+                        (TESTDATA / "CoverageFixture.tla").read_text(encoding="utf-8"))
+        self.addCleanup(d.close)
+        return d.load()
+
+    def test_exempt_pluscal_unreached_label_is_rejected(self) -> None:
+        # a_step is owned only by process (a \\in Alphas); with Alphas emptied by the run's
+        # constants, its actor never runs here, so listing it in 'unreached' needs no entry.
+        with self.assertRaises(run.ExpectedError) as ctx:
+            self.load_coverage_fixture("[]", "{}")
+        self.assertIn("needs no entry", str(ctx.exception))
+
+    def test_exempt_pluscal_unreached_label_with_non_empty_set_is_accepted(self) -> None:
+        # Same label, but Alphas is non-empty: process a does run here, so a_step is not exempt
+        # and 'unreached' may list it.
+        expected = self.load_coverage_fixture('["a1"]', "{a1}")
+        self.assertEqual(expected.runs[0].unreached, (("a_step", "x"),))
+
 
 class CoverageGateTests(unittest.TestCase):
     """judge_coverage(), against real recorded coverage (testdata/*.out) and Smoke.tla's real
@@ -1400,6 +1542,29 @@ class CoverageGateTests(unittest.TestCase):
         failures = run.judge_coverage(self.run_with((("Overshoot", "SEED_OVERSHOOT is off"),)), self.universe,
                                       self.coverage("smoke_check_coverage"))
         self.assertEqual(failures, [])
+
+    def test_pluscal_gate_skips_an_exempt_label_and_gates_the_rest(self) -> None:
+        pluscal_universe = run.module_labels((TESTDATA / "CoverageFixture.tla").read_text(encoding="utf-8"))
+
+        def run_with_constants(constants: tuple[tuple[str, object], ...]) -> run.Run:
+            return run.Run("x-check", "CoverageFixture", "c", "x", "check", (), (), (), 2, constants, None, None)
+
+        empty_alphas = (("Alphas", frozenset()), ("Betas", frozenset({"b1"})))
+        non_empty_alphas = (("Alphas", frozenset({"a1"})), ("Betas", frozenset({"b1"})))
+
+        # a_step is exempt when Alphas is empty: no failure is reported for it.
+        failures = run.judge_coverage(run_with_constants(empty_alphas), pluscal_universe, {})
+        self.assertNotIn("a_step: gated label not covered (TOTAL 0)", failures)
+
+        # Same label, Alphas non-empty: not exempt, and zero coverage, so it DOES fail.
+        failures = run.judge_coverage(run_with_constants(non_empty_alphas), pluscal_universe, {})
+        self.assertIn("a_step: gated label not covered (TOTAL 0)", failures)
+
+        # env_step is never exempt (its process is declared '= "env"'); even when it is absent
+        # from the coverage dict entirely (not merely TOTAL 0), it must still be gated.
+        coverage_missing_env = {label: (1, 1) for label in pluscal_universe.labels if label != "env_step"}
+        failures = run.judge_coverage(run_with_constants(non_empty_alphas), pluscal_universe, coverage_missing_env)
+        self.assertIn("env_step: gated label not covered (TOTAL 0)", failures)
 
 
 class ExecuteCoverageGateTests(unittest.TestCase):
@@ -1568,6 +1733,39 @@ timeout_minutes = 5
             code = run.main(["--expected", str(self.base / "expected.toml")])
         self.assertEqual(code, 1)
         self.assertIn("MISMATCH suite coverage", out.getvalue())
+
+    def test_union_gates_a_pluscal_label_no_run_reported(self) -> None:
+        # A PlusCal module's label is gated even if it appears in NO run's coverage report at all
+        # (unlike a non-PlusCal module, which only gates names that were reported at least once).
+        (self.base / "CoverageFixture.tla").write_text(
+            (TESTDATA / "CoverageFixture.tla").read_text(encoding="utf-8"), encoding="utf-8")
+        log_text = (
+            "@!@!@STARTMSG 2201:0 @!@!@\nThe coverage statistics at now\n@!@!@ENDMSG 2201 @!@!@\n"
+            "@!@!@STARTMSG 2772:0 @!@!@\n<a_step line 1, col 1 to line 1, col 4 of module CoverageFixture>: 1:1\n"
+            "@!@!@ENDMSG 2772 @!@!@\n"
+            "@!@!@STARTMSG 2202:0 @!@!@\nEnd of statistics.\n@!@!@ENDMSG 2202 @!@!@\n"
+        )
+        log = self.base / "cf.log"
+        log.write_text(log_text, encoding="utf-8")
+        r = run.Run("x-check", "CoverageFixture", "c", "x", "check", (), (), (), 2,
+                   (("Alphas", frozenset({"a1"})), ("Betas", frozenset({"b1"}))), None, None)
+        result = run.Result("x-check", "ok", frozenset(), frozenset(), None, 1.0, "", (), log)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            failed = run.judge_union([(r, False, result)], self.base, (), ())
+        self.assertTrue(failed)
+        self.assertIn("env_step", out.getvalue())
+
+    def test_union_ignores_a_fixed_runs_coverage(self) -> None:
+        # The only run that covers Overshoot here is -fixed; a -fixed run's coverage must not
+        # count toward the union, so Overshoot stays uncovered.
+        executed = [self.entry("x-check", "check", False, "smoke_check_coverage"),
+                   self.entry("x-seeded", "seeded", True, "smoke_seeded_coverage")]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            failed = run.judge_union(executed, self.base, (), ())
+        self.assertTrue(failed)
+        self.assertIn("Overshoot", out.getvalue())
 
 
 class DeferredUnionTests(unittest.TestCase):
