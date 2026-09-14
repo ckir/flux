@@ -894,7 +894,7 @@ or an `unreached` entry with its reason, never a silent edit to `expected.toml`.
 `recovery` runs its actors in pairs because all four together do not finish: measured, 6,290,483 distinct states at
 about twenty-one minutes with 1,866,860 still queued and growing, against a ten-minute per-run budget. Three actors
 do finish, so each POSIX `check` run of the scenario takes one pairing, and all four are measured to exhaustion and
-clean (2026-09-12, `MaxCrashes = 2`):
+clean (`MaxCrashes = 2`; first on 2026-09-12, and again with the counts below):
 
 | Run | Actors | `MaxObjs` | Distinct states, POSIX / Windows | What only this pairing reaches |
 |---|---|---|---|---|
