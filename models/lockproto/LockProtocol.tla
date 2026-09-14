@@ -24,7 +24,8 @@ CONSTANTS
     SEED_RECOVER_FOREIGN,    \* seeded defects (design Section 8); FALSE outside their seeded runs
     SEED_RECOVER_UNCERTAIN,
     SEED_DEAD_AS_BUSY,
-    SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK
+    SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK,
+    SEED_ACQUIRER_UNLINKS_BY_NAME
 
 Procs == Owners \cup Recoverers \cup PlainRuns \cup Cleanups \cup Breakers
 \* <lock-name>.broken.<operation-id> beside the lock (240.3 step 2). Only an actor that can move a
@@ -238,10 +239,25 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          };
        S96_1_ownlock_backoff:
          \* Without the OS-native lock the record would prove nothing, and 240.2 would read whoever does
-         \* hold the lock as the owner: remove the file and start again (96.1).
+         \* hold the lock as the owner: close and start again (96.1), removing the file first only if the
+         \* lock path still names it. Another invocation may have taken the file over in place (240.5), and
+         \* removing it by name would delete that lock (plan 3's measured finding; SEED_ACQUIRER_UNLINKS_BY_NAME
+         \* puts the old by-name removal back).
+         if (crashed[self]) { goto acquire_crashed; }
+         else {
+           with (ident \in FsIdentityChoices(fs, P, LockName)) {
+             if (ident # obj /\ ~SEED_ACQUIRER_UNLINKS_BY_NAME) { goto S96_1_ownlock_close; };
+         };
+         };
+       S96_1_ownlock_unlink:
          if (crashed[self]) { goto acquire_crashed; }
          else {
            with (c \in FsUnlinkChoices) { fs := FsUnlink(fs, P, LockName, c).fs; };
+         };
+       S96_1_ownlock_close:
+         if (crashed[self]) { goto acquire_crashed; }
+         else {
+           if (OpenBy(fs, self, obj)) { fs := FsClose(fs, self, obj).fs; };
            refused[self] := "RESTART";
            return;
          };
@@ -328,11 +344,23 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
            goto S240_3_release;
          };
        S240_3_s4_lock_backoff:
-         \* The same rule at 240.3 step 4: remove the lock this recoverer just created, then drop the
-         \* moved file as a failed create does, and start again.
+         \* The same rule at 240.3 step 4: remove the lock this recoverer just created if the lock path
+         \* still names it, close it, then drop the moved file as a failed create does, and start again.
+         if (crashed[self]) { goto recover_crashed; }
+         else {
+           with (ident \in FsIdentityChoices(fs, P, LockName)) {
+             if (ident # nobj /\ ~SEED_ACQUIRER_UNLINKS_BY_NAME) { goto S240_3_s4_lock_close; };
+         };
+         };
+       S240_3_s4_lock_unlink:
          if (crashed[self]) { goto recover_crashed; }
          else {
            with (c \in FsUnlinkChoices) { fs := FsUnlink(fs, P, LockName, c).fs; };
+         };
+       S240_3_s4_lock_close:
+         if (crashed[self]) { goto recover_crashed; }
+         else {
+           if (OpenBy(fs, self, nobj)) { fs := FsClose(fs, self, nobj).fs; };
            goto S240_3_s4_drop;
          };
        S240_3_putback:
@@ -798,8 +826,8 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "d4845a94" /\ chksum(tla) = "d35b1da0")
-\* Procedure variable obj of procedure Classify at line 118 col 18 changed to obj_
+\* BEGIN TRANSLATION (chksum(pcal) = "1fdfd6dc" /\ chksum(tla) = "a3bc364b")
+\* Procedure variable obj of procedure Classify at line 119 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
           live, holding, checked, recoveredAfterCrash, tornRead, 
@@ -1122,22 +1150,58 @@ S96_1_backoff(self) == /\ pc[self] = "S96_1_backoff"
 S96_1_ownlock_backoff(self) == /\ pc[self] = "S96_1_ownlock_backoff"
                                /\ IF crashed[self]
                                      THEN /\ pc' = [pc EXCEPT ![self] = "acquire_crashed"]
-                                          /\ UNCHANGED << fs, refused, stack, 
-                                                          obj >>
-                                     ELSE /\ \E c \in FsUnlinkChoices:
-                                               fs' = FsUnlink(fs, P, LockName, c).fs
-                                          /\ refused' = [refused EXCEPT ![self] = "RESTART"]
-                                          /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
-                                          /\ obj' = [obj EXCEPT ![self] = Head(stack[self]).obj]
-                                          /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
-                               /\ UNCHANGED << foreignObj, classified, 
+                                     ELSE /\ \E ident \in FsIdentityChoices(fs, P, LockName):
+                                               IF ident # obj[self] /\ ~SEED_ACQUIRER_UNLINKS_BY_NAME
+                                                  THEN /\ pc' = [pc EXCEPT ![self] = "S96_1_ownlock_close"]
+                                                  ELSE /\ pc' = [pc EXCEPT ![self] = "S96_1_ownlock_unlink"]
+                               /\ UNCHANGED << fs, foreignObj, classified, 
                                                ownerLive, sawLive, seenRec, 
                                                crashed, live, holding, checked, 
                                                recoveredAfterCrash, tornRead, 
                                                hostCrashChangedLock, 
                                                touchedUncertain, refusedOk, 
-                                               keep, obj_, got, robj, victim, 
-                                               nobj, tobj, crashes, leases >>
+                                               refused, stack, keep, obj_, got, 
+                                               obj, robj, victim, nobj, tobj, 
+                                               crashes, leases >>
+
+S96_1_ownlock_unlink(self) == /\ pc[self] = "S96_1_ownlock_unlink"
+                              /\ IF crashed[self]
+                                    THEN /\ pc' = [pc EXCEPT ![self] = "acquire_crashed"]
+                                         /\ fs' = fs
+                                    ELSE /\ \E c \in FsUnlinkChoices:
+                                              fs' = FsUnlink(fs, P, LockName, c).fs
+                                         /\ pc' = [pc EXCEPT ![self] = "S96_1_ownlock_close"]
+                              /\ UNCHANGED << foreignObj, classified, 
+                                              ownerLive, sawLive, seenRec, 
+                                              crashed, live, holding, checked, 
+                                              recoveredAfterCrash, tornRead, 
+                                              hostCrashChangedLock, 
+                                              touchedUncertain, refusedOk, 
+                                              refused, stack, keep, obj_, got, 
+                                              obj, robj, victim, nobj, tobj, 
+                                              crashes, leases >>
+
+S96_1_ownlock_close(self) == /\ pc[self] = "S96_1_ownlock_close"
+                             /\ IF crashed[self]
+                                   THEN /\ pc' = [pc EXCEPT ![self] = "acquire_crashed"]
+                                        /\ UNCHANGED << fs, refused, stack, 
+                                                        obj >>
+                                   ELSE /\ IF OpenBy(fs, self, obj[self])
+                                              THEN /\ fs' = FsClose(fs, self, obj[self]).fs
+                                              ELSE /\ TRUE
+                                                   /\ fs' = fs
+                                        /\ refused' = [refused EXCEPT ![self] = "RESTART"]
+                                        /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
+                                        /\ obj' = [obj EXCEPT ![self] = Head(stack[self]).obj]
+                                        /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
+                             /\ UNCHANGED << foreignObj, classified, ownerLive, 
+                                             sawLive, seenRec, crashed, live, 
+                                             holding, checked, 
+                                             recoveredAfterCrash, tornRead, 
+                                             hostCrashChangedLock, 
+                                             touchedUncertain, refusedOk, keep, 
+                                             obj_, got, robj, victim, nobj, 
+                                             tobj, crashes, leases >>
 
 acquire_crashed(self) == /\ pc[self] = "acquire_crashed"
                          /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
@@ -1154,7 +1218,9 @@ acquire_crashed(self) == /\ pc[self] = "acquire_crashed"
 Acquire(self) == S96_1_create(self) \/ S96_1_dircheck(self)
                     \/ S96_1_ownlock(self) \/ S96_1_record_begin(self)
                     \/ S96_1_record_end(self) \/ S96_1_backoff(self)
-                    \/ S96_1_ownlock_backoff(self) \/ acquire_crashed(self)
+                    \/ S96_1_ownlock_backoff(self)
+                    \/ S96_1_ownlock_unlink(self)
+                    \/ S96_1_ownlock_close(self) \/ acquire_crashed(self)
 
 S240_3_s1(self) == /\ pc[self] = "S240_3_s1"
                    /\ IF crashed[self]
@@ -1321,11 +1387,11 @@ S240_3_s4_drop(self) == /\ pc[self] = "S240_3_s4_drop"
 S240_3_s4_lock_backoff(self) == /\ pc[self] = "S240_3_s4_lock_backoff"
                                 /\ IF crashed[self]
                                       THEN /\ pc' = [pc EXCEPT ![self] = "recover_crashed"]
-                                           /\ fs' = fs
-                                      ELSE /\ \E c \in FsUnlinkChoices:
-                                                fs' = FsUnlink(fs, P, LockName, c).fs
-                                           /\ pc' = [pc EXCEPT ![self] = "S240_3_s4_drop"]
-                                /\ UNCHANGED << foreignObj, classified, 
+                                      ELSE /\ \E ident \in FsIdentityChoices(fs, P, LockName):
+                                                IF ident # nobj[self] /\ ~SEED_ACQUIRER_UNLINKS_BY_NAME
+                                                   THEN /\ pc' = [pc EXCEPT ![self] = "S240_3_s4_lock_close"]
+                                                   ELSE /\ pc' = [pc EXCEPT ![self] = "S240_3_s4_lock_unlink"]
+                                /\ UNCHANGED << fs, foreignObj, classified, 
                                                 ownerLive, sawLive, seenRec, 
                                                 crashed, live, holding, 
                                                 checked, recoveredAfterCrash, 
@@ -1334,6 +1400,42 @@ S240_3_s4_lock_backoff(self) == /\ pc[self] = "S240_3_s4_lock_backoff"
                                                 refused, stack, keep, obj_, 
                                                 got, obj, robj, victim, nobj, 
                                                 tobj, crashes, leases >>
+
+S240_3_s4_lock_unlink(self) == /\ pc[self] = "S240_3_s4_lock_unlink"
+                               /\ IF crashed[self]
+                                     THEN /\ pc' = [pc EXCEPT ![self] = "recover_crashed"]
+                                          /\ fs' = fs
+                                     ELSE /\ \E c \in FsUnlinkChoices:
+                                               fs' = FsUnlink(fs, P, LockName, c).fs
+                                          /\ pc' = [pc EXCEPT ![self] = "S240_3_s4_lock_close"]
+                               /\ UNCHANGED << foreignObj, classified, 
+                                               ownerLive, sawLive, seenRec, 
+                                               crashed, live, holding, checked, 
+                                               recoveredAfterCrash, tornRead, 
+                                               hostCrashChangedLock, 
+                                               touchedUncertain, refusedOk, 
+                                               refused, stack, keep, obj_, got, 
+                                               obj, robj, victim, nobj, tobj, 
+                                               crashes, leases >>
+
+S240_3_s4_lock_close(self) == /\ pc[self] = "S240_3_s4_lock_close"
+                              /\ IF crashed[self]
+                                    THEN /\ pc' = [pc EXCEPT ![self] = "recover_crashed"]
+                                         /\ fs' = fs
+                                    ELSE /\ IF OpenBy(fs, self, nobj[self])
+                                               THEN /\ fs' = FsClose(fs, self, nobj[self]).fs
+                                               ELSE /\ TRUE
+                                                    /\ fs' = fs
+                                         /\ pc' = [pc EXCEPT ![self] = "S240_3_s4_drop"]
+                              /\ UNCHANGED << foreignObj, classified, 
+                                              ownerLive, sawLive, seenRec, 
+                                              crashed, live, holding, checked, 
+                                              recoveredAfterCrash, tornRead, 
+                                              hostCrashChangedLock, 
+                                              touchedUncertain, refusedOk, 
+                                              refused, stack, keep, obj_, got, 
+                                              obj, robj, victim, nobj, tobj, 
+                                              crashes, leases >>
 
 S240_3_putback(self) == /\ pc[self] = "S240_3_putback"
                         /\ IF crashed[self]
@@ -1406,8 +1508,10 @@ Recover(self) == S240_3_s1(self) \/ S240_3_s2(self) \/ S240_3_s3(self)
                     \/ S240_3_s4_record_begin(self)
                     \/ S240_3_s4_record_end(self) \/ S240_3_s5(self)
                     \/ S240_3_s4_drop(self) \/ S240_3_s4_lock_backoff(self)
-                    \/ S240_3_putback(self) \/ S240_3_restart(self)
-                    \/ S240_3_release(self) \/ recover_crashed(self)
+                    \/ S240_3_s4_lock_unlink(self)
+                    \/ S240_3_s4_lock_close(self) \/ S240_3_putback(self)
+                    \/ S240_3_restart(self) \/ S240_3_release(self)
+                    \/ recover_crashed(self)
 
 S240_5_s1(self) == /\ pc[self] = "S240_5_s1"
                    /\ IF crashed[self]

@@ -70,7 +70,7 @@ module = "LockProtocol"
 config = "configs/recovery-posix-check.cfg"
 scenario = "recovery"
 kind = "check"
-constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false }
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
 symmetry = { definition = "RecovererPerms", over = "Recoverers" }
 unreached = [
     { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
@@ -85,7 +85,7 @@ module = "LockProtocol"
 config = "configs/recovery-posix-plain-check.cfg"
 scenario = "recovery"
 kind = "check"
-constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = ["p1"], Cleanups = [], Breakers = [], MaxObjs = 4, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false }
+constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = ["p1"], Cleanups = [], Breakers = [], MaxObjs = 4, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
 unreached = [
     { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
     { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record under a running Recoverer, which needs a lapsed lease; mixed-remote reaches it" },
@@ -102,7 +102,7 @@ module = "LockProtocol"
 config = "configs/recovery-posix-cleanup-check.cfg"
 scenario = "recovery"
 kind = "check"
-constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = [], Cleanups = ["c1"], Breakers = [], MaxObjs = 5, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false }
+constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = [], Cleanups = ["c1"], Breakers = [], MaxObjs = 5, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
 unreached = [
     { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
     { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record under a running Recoverer, which needs a lapsed lease; mixed-remote reaches it" },
@@ -116,7 +116,7 @@ module = "LockProtocol"
 config = "configs/recovery-posix-plain-cleanup-check.cfg"
 scenario = "recovery"
 kind = "check"
-constants = { Owners = ["o1"], Recoverers = [], PlainRuns = ["p1"], Cleanups = ["c1"], Breakers = [], MaxObjs = 6, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false }
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = ["p1"], Cleanups = ["c1"], Breakers = [], MaxObjs = 6, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
 unreached = [
     { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
     { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record under a running Recoverer, which needs a lapsed lease; mixed-remote reaches it" },
@@ -130,7 +130,7 @@ module = "LockProtocol"
 config = "configs/recovery-posix-liveness.cfg"
 scenario = "recovery"
 kind = "liveness"
-constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false }
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
 unreached = [
     { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
     { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record under a running Recoverer, which needs a lapsed lease; mixed-remote reaches it" },
@@ -145,7 +145,7 @@ config = "configs/recovery-posix-witness-NeverTornRead.cfg"
 scenario = "recovery"
 kind = "witness"
 violated = ["NeverTornRead"]
-constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false }
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
 symmetry = { definition = "RecovererPerms", over = "Recoverers" }
 timeout_minutes = 30
 
@@ -156,7 +156,7 @@ config = "configs/recovery-posix-witness-NeverRecoveredAfterCrash.cfg"
 scenario = "recovery"
 kind = "witness"
 violated = ["NeverRecoveredAfterCrash"]
-constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false }
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
 symmetry = { definition = "RecovererPerms", over = "Recoverers" }
 timeout_minutes = 30
 
@@ -167,7 +167,7 @@ config = "configs/recovery-posix-witness-NeverDeadLockWithPendingMover.cfg"
 scenario = "recovery"
 kind = "witness"
 violated = ["NeverDeadLockWithPendingMover"]
-constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false }
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
 symmetry = { definition = "RecovererPerms", over = "Recoverers" }
 timeout_minutes = 30
 
@@ -178,7 +178,7 @@ config = "configs/recovery-posix-hostcrash-witness-NeverHostCrashChangedLock.cfg
 scenario = "recovery"
 kind = "witness"
 violated = ["NeverHostCrashChangedLock"]
-constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = true, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false }
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = true, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
 symmetry = { definition = "RecovererPerms", over = "Recoverers" }
 timeout_minutes = 30
 
@@ -189,7 +189,7 @@ config = "configs/recovery-posix-witness-NeverChecked.cfg"
 scenario = "recovery"
 kind = "witness"
 violated = ["NeverChecked"]
-constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false }
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
 symmetry = { definition = "RecovererPerms", over = "Recoverers" }
 timeout_minutes = 30
 
@@ -200,7 +200,7 @@ config = "configs/recovery-posix-seeded-SEED_RECOVER_FOREIGN.cfg"
 scenario = "recovery"
 kind = "seeded"
 violated = ["ForeignUntouched"]
-constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = true, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false }
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = true, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
 symmetry = { definition = "RecovererPerms", over = "Recoverers" }
 timeout_minutes = 30
 
@@ -211,7 +211,7 @@ config = "configs/recovery-posix-seeded-SEED_RECOVER_UNCERTAIN.cfg"
 scenario = "recovery"
 kind = "seeded"
 violated = ["PlainNeverOwnsUncertain"]
-constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = true, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false }
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = true, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
 symmetry = { definition = "RecovererPerms", over = "Recoverers" }
 timeout_minutes = 30
 
@@ -222,7 +222,7 @@ config = "configs/recovery-posix-plain-seeded-SEED_DEAD_AS_BUSY.cfg"
 scenario = "recovery"
 kind = "seeded"
 violated = ["RefusalJustified"]
-constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = ["p1"], Cleanups = [], Breakers = [], MaxObjs = 4, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = true, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false }
+constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = ["p1"], Cleanups = [], Breakers = [], MaxObjs = 4, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = true, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
 timeout_minutes = 30
 
 [[run]]
@@ -232,7 +232,7 @@ config = "configs/recovery-posix-cleanup-seeded-SEED_RECOVER_UNCERTAIN_CLEANUP_L
 scenario = "recovery"
 kind = "seeded"
 violated = ["PlainNeverOwnsUncertain"]
-constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = [], Cleanups = ["c1"], Breakers = [], MaxObjs = 5, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = true }
+constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = [], Cleanups = ["c1"], Breakers = [], MaxObjs = 5, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = true, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
 timeout_minutes = 30
 
 [[run]]
@@ -241,7 +241,7 @@ module = "LockProtocol"
 config = "configs/recovery-windows-check.cfg"
 scenario = "recovery"
 kind = "check"
-constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false }
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
 symmetry = { definition = "RecovererPerms", over = "Recoverers" }
 unreached = [
     { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
@@ -256,7 +256,7 @@ module = "LockProtocol"
 config = "configs/recovery-windows-plain-check.cfg"
 scenario = "recovery"
 kind = "check"
-constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = ["p1"], Cleanups = [], Breakers = [], MaxObjs = 4, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false }
+constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = ["p1"], Cleanups = [], Breakers = [], MaxObjs = 4, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
 unreached = [
     { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
     { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record under a running Recoverer, which needs a lapsed lease; mixed-remote reaches it" },
@@ -273,7 +273,7 @@ module = "LockProtocol"
 config = "configs/recovery-windows-cleanup-check.cfg"
 scenario = "recovery"
 kind = "check"
-constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = [], Cleanups = ["c1"], Breakers = [], MaxObjs = 5, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false }
+constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = [], Cleanups = ["c1"], Breakers = [], MaxObjs = 5, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
 unreached = [
     { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
     { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record under a running Recoverer, which needs a lapsed lease; mixed-remote reaches it" },
@@ -287,7 +287,7 @@ module = "LockProtocol"
 config = "configs/recovery-windows-plain-cleanup-check.cfg"
 scenario = "recovery"
 kind = "check"
-constants = { Owners = ["o1"], Recoverers = [], PlainRuns = ["p1"], Cleanups = ["c1"], Breakers = [], MaxObjs = 6, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false }
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = ["p1"], Cleanups = ["c1"], Breakers = [], MaxObjs = 6, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
 unreached = [
     { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
     { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record under a running Recoverer, which needs a lapsed lease; mixed-remote reaches it" },
@@ -302,7 +302,7 @@ config = "configs/recovery-windows-witness-NeverTornRead.cfg"
 scenario = "recovery"
 kind = "witness"
 violated = ["NeverTornRead"]
-constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false }
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
 symmetry = { definition = "RecovererPerms", over = "Recoverers" }
 timeout_minutes = 30
 
@@ -313,7 +313,7 @@ config = "configs/recovery-windows-witness-NeverRecoveredAfterCrash.cfg"
 scenario = "recovery"
 kind = "witness"
 violated = ["NeverRecoveredAfterCrash"]
-constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false }
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
 symmetry = { definition = "RecovererPerms", over = "Recoverers" }
 timeout_minutes = 30
 
@@ -324,7 +324,7 @@ config = "configs/recovery-windows-witness-NeverDeadLockWithPendingMover.cfg"
 scenario = "recovery"
 kind = "witness"
 violated = ["NeverDeadLockWithPendingMover"]
-constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false }
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
 symmetry = { definition = "RecovererPerms", over = "Recoverers" }
 timeout_minutes = 30
 
@@ -335,22 +335,37 @@ config = "configs/recovery-windows-witness-NeverChecked.cfg"
 scenario = "recovery"
 kind = "witness"
 violated = ["NeverChecked"]
-constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false }
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
 symmetry = { definition = "RecovererPerms", over = "Recoverers" }
 timeout_minutes = 30
 
 # Breaklock scenario (design Section 12, plan 3): a StalledOwner (under strong capability, an Owner that may crash)
 # and two Breakers racing to take over the same uncertain lock. Built first, with spec 96.1 as written, to measure
-# the acquirer window of design Section 11. MEASUREMENT (owner ruling 2026-09-14): the check run showed the window on
-# RefusalJustified but TLC aborted printing traces; this halting run asks whether it also breaks SingleWriter, without
-# symmetry. It passes if SingleWriter is violated; a clean exhaustion is the other answer.
+# the acquirer window of design Section 11. Measured (2026-09-14): with 96.1 as written, an acquirer's backoff removed
+# a Breaker's taken-over lock by name, violating RefusalJustified and SingleWriter; spec 96.1 and 240.3 step 4 now
+# remove the file only while the lock path still names it, and SEED_ACQUIRER_UNLINKS_BY_NAME keeps the old wording.
 
 [[run]]
-name = "breaklock-posix-nosym-witness-SingleWriter"
+name = "breaklock-posix-check"
 module = "LockProtocol"
-config = "configs/breaklock-posix-nosym-witness-SingleWriter.cfg"
+config = "configs/breaklock-posix-check.cfg"
 scenario = "breaklock"
-kind = "witness"
-violated = ["SingleWriter"]
-constants = { Owners = ["o1"], Recoverers = [], PlainRuns = [], Cleanups = [], Breakers = ["b1", "b2"], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false }
-timeout_minutes = 90
+kind = "check"
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = [], Cleanups = [], Breakers = ["b1", "b2"], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
+symmetry = { definition = "BreakerPerms", over = "Breakers" }
+unreached = [
+    { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
+    { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record under a running Recoverer, which needs a lapsed lease; mixed-remote reaches it" },
+]
+timeout_minutes = 60
+
+[[run]]
+name = "breaklock-posix-seeded-SEED_ACQUIRER_UNLINKS_BY_NAME"
+module = "LockProtocol"
+config = "configs/breaklock-posix-seeded-SEED_ACQUIRER_UNLINKS_BY_NAME.cfg"
+scenario = "breaklock"
+kind = "seeded"
+violated = ["RefusalJustified"]
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = [], Cleanups = [], Breakers = ["b1", "b2"], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = true }
+symmetry = { definition = "BreakerPerms", over = "Breakers" }
+timeout_minutes = 30

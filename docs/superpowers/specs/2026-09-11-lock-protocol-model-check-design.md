@@ -679,6 +679,7 @@ ability to see that defect and the run fails.
 
 | Flag | Defect re-introduced (review finding) | Scenario | Must fail |
 |---|---|---|---|
+| `SEED_ACQUIRER_UNLINKS_BY_NAME` | an acquirer that cannot take the lock on its new file removes the lock path by name, as 96.1 said before plan 3 (the acquirer window, Section 11) | `breaklock` | `RefusalJustified` (the shallowest of the two invariants it breaks) |
 | `SEED_RECOVER_FOREIGN` | a `Foreign` object at the lock path is judged replaceable and moved aside through 240.3, where the spec refuses it with `CONTROL_PLANE_NAMESPACE_CONFLICT` | `recovery`, POSIX, Owner and 2 Recoverers | `ForeignUntouched` |
 | `SEED_RECOVER_UNCERTAIN` | a lock whose record is torn or empty, judged uncertain, is moved aside through 240.3, where 240.4 preserves it; only the `classified` half of `PlainNeverOwnsUncertain`'s judgement reports it | `recovery`, POSIX, Owner and 2 Recoverers | `PlainNeverOwnsUncertain` |
 | `SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK` | a cleanup lock whose owner the oracle could not judge dead is moved aside through 240.3 (251.1 and 259.6 replace only a dead one); only the `ownerLive` half of `PlainNeverOwnsUncertain`'s judgement reports it | `recovery`, POSIX, Owner, Recoverer and Cleanup | `PlainNeverOwnsUncertain` |
@@ -904,10 +905,17 @@ Findings the design already expects, each to be confirmed or refuted by the firs
   its own lock, then removes "the lock it created" by name (96.1), which is now the Breaker's. No crash or
   `LeaseExpiry` is needed, so `breaklock` should show it, on `SingleWriter` (a second writer creates and checks a lock
   after the backoff removes the Breaker's) or `RefusalJustified` (the Breaker's next check refuses at an empty path).
-  The owner ruled (2026-09-14) that plan 3 measures it first: `breaklock` is built with 96.1 as written, and the spec
-  fix (the acquirer checks the identity or record before removing its file) and where the `breaklock` seeds live are
-  decided from the counterexample. Until then its seeds are not added, because an open finding on their invariant
-  would block them (Section 4).
+  Measured on 2026-09-14 with 96.1 as written (owner ruling: measure first): `breaklock-posix-check` found
+  `RefusalJustified` violated in 12,846 states, a Breaker refusing at the path the backoff emptied, and TLC then aborted
+  building traces under `-continue`; a halting run without symmetry found `SingleWriter` violated too (6,094,198
+  states explored): a Breaker takes over an acquirer's file and passes its Section 99 check, the acquirer's backoff
+  removes that lock by name, and a third operation acquires a fresh one and passes its check. A first `SingleWriter`
+  counterexample ran through a model reading instead (21.1 step 5's rewrite looked the lock path up again and wrote
+  into the fresh lock); the owner ruled that lock-record writes go through the writer's handle, for 21.1 step 5 and
+  240.3 step 4 alike, and the violation remained. Fixed in the spec (owner ruling): 96.1 and 240.3 step 4 remove the
+  file only while the lock path still names it (the same file identity as the acquirer's handle), then close and
+  start again; `SEED_ACQUIRER_UNLINKS_BY_NAME` keeps the old wording. The window between that identity check and the
+  unlink is measured by the restored `breaklock-posix-check`.
 - The directory acquirer lists `P` "for *.flux-lock held by other operations" (96.1), without saying whether a dead or
   uncertain owner's per-name lock counts as held. The model classifies each listed lock as Section 240 does and treats
   live and uncertain as held and dead as not, as 97.1 (a) does for ancestor locks; `trace.toml` records this reading

@@ -24,7 +24,8 @@ CONSTANTS
     SEED_RECOVER_FOREIGN,    \* seeded defects (design Section 8); FALSE outside their seeded runs
     SEED_RECOVER_UNCERTAIN,
     SEED_DEAD_AS_BUSY,
-    SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK
+    SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK,
+    SEED_ACQUIRER_UNLINKS_BY_NAME
 
 Procs == Owners \cup Recoverers \cup PlainRuns \cup Cleanups \cup Breakers
 \* <lock-name>.broken.<operation-id> beside the lock (240.3 step 2). Only an actor that can move a

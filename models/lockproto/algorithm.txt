@@ -190,10 +190,25 @@
          };
        S96_1_ownlock_backoff:
          \* Without the OS-native lock the record would prove nothing, and 240.2 would read whoever does
-         \* hold the lock as the owner: remove the file and start again (96.1).
+         \* hold the lock as the owner: close and start again (96.1), removing the file first only if the
+         \* lock path still names it. Another invocation may have taken the file over in place (240.5), and
+         \* removing it by name would delete that lock (plan 3's measured finding; SEED_ACQUIRER_UNLINKS_BY_NAME
+         \* puts the old by-name removal back).
+         if (crashed[self]) { goto acquire_crashed; }
+         else {
+           with (ident \in FsIdentityChoices(fs, P, LockName)) {
+             if (ident # obj /\ ~SEED_ACQUIRER_UNLINKS_BY_NAME) { goto S96_1_ownlock_close; };
+         };
+         };
+       S96_1_ownlock_unlink:
          if (crashed[self]) { goto acquire_crashed; }
          else {
            with (c \in FsUnlinkChoices) { fs := FsUnlink(fs, P, LockName, c).fs; };
+         };
+       S96_1_ownlock_close:
+         if (crashed[self]) { goto acquire_crashed; }
+         else {
+           if (OpenBy(fs, self, obj)) { fs := FsClose(fs, self, obj).fs; };
            refused[self] := "RESTART";
            return;
          };
@@ -280,11 +295,23 @@
            goto S240_3_release;
          };
        S240_3_s4_lock_backoff:
-         \* The same rule at 240.3 step 4: remove the lock this recoverer just created, then drop the
-         \* moved file as a failed create does, and start again.
+         \* The same rule at 240.3 step 4: remove the lock this recoverer just created if the lock path
+         \* still names it, close it, then drop the moved file as a failed create does, and start again.
+         if (crashed[self]) { goto recover_crashed; }
+         else {
+           with (ident \in FsIdentityChoices(fs, P, LockName)) {
+             if (ident # nobj /\ ~SEED_ACQUIRER_UNLINKS_BY_NAME) { goto S240_3_s4_lock_close; };
+         };
+         };
+       S240_3_s4_lock_unlink:
          if (crashed[self]) { goto recover_crashed; }
          else {
            with (c \in FsUnlinkChoices) { fs := FsUnlink(fs, P, LockName, c).fs; };
+         };
+       S240_3_s4_lock_close:
+         if (crashed[self]) { goto recover_crashed; }
+         else {
+           if (OpenBy(fs, self, nobj)) { fs := FsClose(fs, self, nobj).fs; };
            goto S240_3_s4_drop;
          };
        S240_3_putback:

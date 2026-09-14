@@ -4697,9 +4697,13 @@ call (for example `O_EXLOCK` with `O_CREAT | O_EXCL`), and otherwise
 immediately after it. In between, another invocation can open the new
 file and take its lock, because inspecting a lock (Section 240.1 step 3)
 and recovering one (Section 240.3 step 1) both try to take it. If the
-acquirer cannot take the lock, it removes the lock file it created and
-starts the acquisition again (Section 21.1 step 1); it never writes a
-record while another process holds the lock. A record written without the
+acquirer cannot take the lock, it closes its handle and starts the
+acquisition again (Section 21.1 step 1), first removing the lock file it
+created only if the lock path still names that file (the same file
+identity as its handle). Another invocation may already have taken the
+file over in place (Section 240.5), and removing it by name would delete
+that invocation's lock. It never writes a record while another process
+holds the lock. A record written without the
 lock proves nothing about its owner, and Section 240.2 would read
 whichever process does hold the lock as that owner.
 
@@ -10595,7 +10599,8 @@ Recovery, and cleanup, replace a dead owner's lock by moving it aside:
    gap and owns the target: delete the moved file (its owner is dead) and
    classify what is at the lock path as Section 96.1 does. If the creation
    succeeds but the OS-native lock cannot be taken, remove the lock file it
-   created, delete the moved file, and start the acquisition again.
+   created if the lock path still names it (Section 96.1), delete the moved
+   file, and start the acquisition again.
 5. Delete the moved file.
 
 The lock path is empty between steps 2 and 4. That is harmless because
@@ -13486,6 +13491,8 @@ A conforming implementation must test at least:
      reported ARTIFACT_OWNERSHIP_UNCERTAIN.
 146. a committed target always has its created-entry claim, including after a crash right after COMMIT; a lock record
      torn by a crash fails its checksum and counts as uncertain ownership.
+147. an acquirer that cannot take the OS-native lock on the file it created removes the file only while the lock path
+     still names it, so a --break-lock takeover of that file in the meantime keeps its lock.
 ```
 
 ## 259.15 V15 Implementation Baseline
