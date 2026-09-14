@@ -2,7 +2,8 @@
 
 Date: 2026-09-11. Status: approved design, revised after adversarial review rounds 1 to 6, and on 2026-09-12 with the
 owner's rulings for plan 2 (liveness witnesses, Sections 4 and 7; sibling headings and pending units, Section 9; build
-order, Section 12).
+order, Section 12), and on 2026-09-14 with the owner's rulings for plan 3 (`breaklock` and `mixed`: Sections 5, 6.1, 7,
+8 and 12).
 Branch: `model/lock-protocol`, on top of `spec/v16-resolution`.
 
 ## 1. Goal
@@ -393,8 +394,12 @@ Each row is grounded by a filesystem probe (Section 10) where a real platform ca
 
 Constants: `Platform ∈ {"posix", "windows"}`; `Fold`, the name-equivalence map (identity, or case folding);
 `IdentityStrength ∈ {"strong", "weak"}`, where `weak` stands for FAT32/exFAT-like identity that CI cannot probe;
-`LockCapability ∈ {"strong", "weak"}`, where `strong` stands for the spec's `LocalStrong` or `RemoteStrong` and `weak`
-for `RemoteUnverified` or `Unsupported` (Section 235.1). Under `weak`, Section 235.1 refuses every operation that needs
+`LockCapability ∈ {"strong", "remote", "weak"}`, where `strong` stands for the spec's `LocalStrong`, `remote` for
+`RemoteStrong`, and `weak` for `RemoteUnverified` or `Unsupported` (Section 235.1). `strong` and `remote` behave the
+same except that under `remote` an environment step, `LeaseExpiry`, may clear the OS-native lock a live process holds,
+at most once per run, as a remote lock whose lease lapsed while its holder stalled does; the holder is not told and
+keeps its handles. That is the stalled owner of Section 240.5 whose lock a takeover can win (owner ruling for plan 3,
+2026-09-14). A process crash still releases the lock under every capability. Under `weak`, Section 235.1 refuses every operation that needs
 target exclusivity with `REMOTE_LOCK_UNSAFE`, so every actor refuses before it acquires anything, and the unavailable
 OS-native lock and 240.5 step 1's capability branch are reached only in the seeded run that removes that gate
 (Section 8), on POSIX only; `ShareMode`, the `shareDelete` value Windows opens use. The spec does not yet state the
@@ -409,9 +414,13 @@ Each row of the operations table is one atomic step, and each PlusCal label perf
 operation. A spec step that makes several filesystem calls (for example open, OS-lock attempt, then read) is
 therefore several labels, and other actors can run between them.
 
-A data write or rename that an operation issues as part of publishing is two steps: issue, then complete. Other
-actors' steps can run between them, and the call's effect lands at completion. This is how the model represents a
-stalled owner whose call "can still complete" (Section 240.5).
+A data write, rename, or unlink that an operation issues as part of publishing or releasing its lock is two steps:
+issue, then complete. Other actors' steps can run between them, and the call's effect lands at completion. This is how
+the model represents a stalled owner whose call "can still complete" (Section 240.5). Plan 2 built only the data
+write; plan 3 adds the in-flight rename and unlink, which is what lets the lock path empty during a takeover
+(`SEED_EMPTY_PATH_BUSY`, `SEED_NO_IDENTITY_RECHECK`). A lock-record write stays a single labelled `WriteBegin` and
+`WriteEnd` pair, not an in-flight call, unless plan 3's measurements show `S240_3_putback` and
+`SEED_RECOVERER_IDENTITY_ONLY` need one (owner ruling, 2026-09-14; Section 12).
 
 There are two kinds of crash.
 
@@ -425,7 +434,8 @@ A process crash (the process dies; the machine keeps running):
 
 A host crash (power loss or reboot of the machine all actors run on):
 
-- is a process crash of every process that has started;
+- is a process crash of every process that has started, so each in-flight call lands or is dropped (plan 2's
+  `FsHostCrash` drops them all, which was equivalent while no scenario issued one; plan 3 makes it match this rule);
 - then sets, for every object written since its last flush, both `content` and `durable` to one of: the old durable
   content, the latest content, or `Torn`, chosen nondeterministically per object; a crash during a flush has the same
   outcomes. Objects flushed since their last write keep their content, and so does a file created and never
@@ -448,11 +458,12 @@ These are the only ways `durable` and `durableEntries` become visible. Processes
 crashed run afterwards as the later invocations. At most two crashes happen in one run, counted across both kinds (one
 in `claims`, Section 12); a host crash counts as one crash however many processes it stops.
 
-In `liveness` runs, one actor of each kind a property relies on to make progress (Section 7) never has a process
-crash, and a host crash, if one happens, happens before any such actor has started, so those actors run after it as
-later invocations; every other actor crashes as in `check` runs. Without that rule a run where every actor able to clear a
-lock crashes would violate the property for a reason the spec does not claim to cover (an operator re-running the
-command is outside the model), and a host crash that spared a running process would be impossible.
+In `liveness` runs, the actors crash exactly as in `check` runs. The earlier rule, which spared one actor of each
+kind a property relies on, is superseded by conditioning the property instead (Section 7): a liveness property
+promises progress only while no further crash can occur and an entitled actor has yet to run, which excludes the runs
+where every actor able to clear a lock crashes, for the same reason the spared-actor rule did (an operator re-running
+the command is outside the model). `recovery` measured why the rule alone was not enough: the last crash can always
+fall after the last actor has acted.
 
 The lock protocol's actors flush only where the spec tells them to (the record write of 240.5 step 6 is flushed); the
 spec states no directory flush after creating, moving aside, or removing a lock file, so a host crash may undo any of
@@ -480,11 +491,11 @@ quantifies over processes rather than naming one.
 | Actor | Behaviour |
 |---|---|
 | Owner | A normal operation: acquires the target lock (96.1: exclusive create of `P/<name>.flux-lock`, then the per-name acquirer's check that `P/.flux-dir.lock` is absent; on a conflict it removes the lock it created, refuses with `TARGET_LOCK_BUSY`, and ends, as 96.1 states, with no retry) and holds its OS-native lock, runs its ancestor check (97.1 a), publishes with a Section 99 check before each write, releases the lock at completion; may crash |
-| StalledOwner | An owner that stops making progress at any point and may later resume (its next Section 99 check then runs, and if the check fails it stops, closing its handles), may resume and complete normally, or may have a call in flight that completes later |
+| StalledOwner | An Owner whose calls can be in flight when a takeover lands. Under `LockCapability = strong` a live owner keeps its OS-native lock, so 240.5 step 3 refuses every takeover of it, and a stalled owner is one that crashes with calls in flight, which then land or are dropped after the crash. Under `remote`, `LeaseExpiry` (Section 5.1) clears a live owner's lock: a takeover can then win while the owner still runs, the owner's next Section 99 check fails and it stops, closing its handles, and a call it had issued before the takeover can still complete (owner ruling for plan 3, 2026-09-14) |
 | DirOwner | An owner whose target name is too long for a per-name lock: takes `P/.flux-dir.lock` and lists `P` for per-name locks (96.1 announce-then-check); may crash |
 | PlainRun | A new invocation without flags: classifies what it finds (21.1 table, 96.1, 120, 240) and acts or refuses; if it acquires the lock it continues as an Owner |
 | Recoverer | A new invocation that finds a dead owner's lock and runs 240.3 steps 1-5, then continues as an Owner |
-| Breaker | `flux copy --restart --break-lock`: 240.5 steps 1-6, then 21.1 steps 2-5, then continues as an Owner; refuses at 240.5 step 1 when `IdentityStrength = weak` or `LockCapability = weak` (the step requires both, spec lines 10628-10631; under `LockCapability = weak` 235.1 refuses first, so that branch is reached only in the seeded run); may crash, including between the `WriteBegin` and `WriteEnd` of its step 6 overwrite |
+| Breaker | `flux copy --restart --break-lock`: classifies the lock as 240.1 does and closes its handle (the "reported holder" 240.5 reads before acting); on uncertain, runs 240.5 steps 1-6, then 21.1 steps 2-5, then continues as an Owner; on dead, replaces the lock through 240.3 as 21.1 step 1 says, because 240.5 "applies only when ownership is uncertain"; on live, empty, cleanup lock or foreign, acts as a PlainRun would. Refuses at 240.5 step 1 when `IdentityStrength = weak` or `LockCapability = weak` (the step requires both, spec lines 10654-10659; under `LockCapability = weak` 235.1 refuses first, so that branch is reached only in the seeded run); may crash, including between the `WriteBegin` and `WriteEnd` of its step 6 overwrite (owner ruling for plan 3, 2026-09-14) |
 | CleanupBreaker | `flux cleanup --target PATH --break-lock`: 240.5 steps 1-6 with a cleanup lock record, deletes artifacts, deletes its lock; may crash |
 | Cleanup | `flux cleanup DEST`: classifies and removes orphan, dead, and cleanup locks via 240.3 |
 | NestedOwner | An owner whose destination is a child of another owner's destination (97.1) |
@@ -507,7 +518,8 @@ lock file, attempt its OS-native lock without blocking, read the record, then ju
 
 An owner gives up its OS-native lock only by crashing, by completing, or by stopping after a failed Section 99 check
 (it closes its handles); none of these removes a lock file whose record is not its own. So while an owner runs, the
-fifth row applies to its lock.
+fifth row applies to its lock, except under `LockCapability = remote` after `LeaseExpiry` has cleared it (Section
+5.1), when the oracle decides as for any unlocked record.
 
 In the last row an oracle decides the part of Section 240.2 and 240.3 evidence that is not a filesystem fact (whether
 the owner's process or host still exists), consistent with the truth: live only if the owner is alive, dead only if
@@ -562,8 +574,8 @@ Safety invariants, which must hold in every reachable state:
 
 | Name | Statement |
 |---|---|
-| `SingleWriter` | For a target, at most one process is inside a publishing step whose last Section 99 check passed. The one exception the spec accepts, a stalled prior owner's in-flight call issued before an operator `--break-lock` and completing after it, is permitted only in that case. |
-| `PlainNeverOwnsUncertain` | A process without `--break-lock` never removes, renames, or overwrites a lock it classified as uncertain, and creates a lock only at an empty lock path. "Classified as uncertain" means either judgement: `classified` is uncertain (a torn or empty record), or `ownerLive` is (the oracle could not tell a cleanup lock's owner is dead), because the decision tables refuse `TARGET_LOCK_UNCERTAIN` for both. |
+| `SingleWriter` | For a target, at most one process is inside a publishing step whose last Section 99 check passed. The one exception the spec accepts, a stalled prior owner's in-flight call issued before an operator `--break-lock` and completing after it, is permitted only in that case. The model counts a process as a writer while its last Section 99 check passed or while it has a data write, rename or unlink in flight, and excepts an in-flight call only when a ghost records that it was issued before the takeover that ended its owner's tenure (owner ruling for plan 3, 2026-09-14). |
+| `PlainNeverOwnsUncertain` | A process without `--break-lock` never removes, renames, or overwrites a lock it classified as uncertain, and creates a lock only at an empty lock path. A process with `--break-lock` may overwrite such a lock in place (240.5 step 6) but never renames or removes it, which is what `SEED_MOVE_ASIDE_FOR_UNCERTAIN` breaks (owner ruling for plan 3). "Classified as uncertain" means either judgement: `classified` is uncertain (a torn or empty record), or `ownerLive` is (the oracle could not tell a cleanup lock's owner is dead), because the decision tables refuse `TARGET_LOCK_UNCERTAIN` for both. |
 | `RefusalJustified` | A regression guard, not a liveness check. Every `TARGET_LOCK_BUSY` refusal rests on evidence that the lock was held, that its owner was alive, or that the lock path holds a live owner's record. Since spec 240.2 was corrected, a held OS-native lock shows only that the lock is held - it cannot tell the owner from another invocation inspecting or recovering it - so this invariant cannot establish owner liveness. What it catches is a refusal with nothing behind it: a decision table that refuses `TARGET_LOCK_BUSY` for a lock it judged dead, or a publisher refusing it at the Section 99 check when the lock path is empty or foreign. Every refusing label records its evidence through one definition, `RefusalEvidence`, so the seeded run of Section 8 guards all of them at once; a change that bypasses the definition at a single label is not caught (accepted, test audit 2026-09-14). |
 | `ForeignUntouched` | A `Foreign` object at a lock path is never written, renamed, or deleted. It is a state predicate, not a ghost flag: the `Foreign` object an initial state holds, if any, is still the object at the lock path and still holds `Foreign`. No actor ever writes `Foreign`, so an invariant about it means something only where an initial state holds one: every `recovery` configuration starts from either an empty lock path or one holding a `Foreign` object (`FsWith`), and the empty start keeps the whole acquisition prefix a `check` run needs (Section 12). `SEED_RECOVER_FOREIGN` exercises the identity half; nothing exercises the content half, because a `Foreign` object exists only in the initial state, every record write in the model follows its writer's own successful exclusive create at the lock path (96.1's record write, 240.3 step 4's), and no such create succeeds while the `Foreign` object holds the lock path. The write operation itself checks no handle, so this rests on that ordering, not on a guard. A `Foreign` object that appears mid-run, after an actor's check and before its remove by name, is not modelled (test audit 2026-09-14). |
 | `Classifiable` | In every state, each lock path classifies into exactly one case of the Section 6.1 judgement table: empty, foreign, uncertain, cleanup lock, live, or (by the oracle) dead; a `Torn` record classifies as uncertain. |
@@ -603,7 +615,8 @@ A fact no single label states keeps a ghost flag or a state predicate, and its s
 | `NeverRecoveredAfterCrash` | a lock a crash had left was replaced |
 | `NeverClassifiedCleanupLock` | a PlainRun or Recoverer classified a cleanup lock |
 | `NeverDeadLockWithPendingMover` | a lock whose owner is dead sat at the lock path while no further crash could occur and a Recoverer or Cleanup had yet to run |
-| `NeverUncertainOwnerLock` | a lock whose owner is uncertain sat at the lock path |
+| `NeverUncertainOwnerLock` | a lock whose owner is uncertain sat at the lock path (`cleanup`, until that scenario narrows it) |
+| `NeverUncertainLockWithPendingBreaker` | a lock whose owner is uncertain sat at the lock path while no further crash could occur and a Breaker or CleanupBreaker had yet to run (`breaklock`, `mixed`) |
 | `NeverLockLostMidCommit` (Claims) | `LockLost` fell between a PREPARE_COMMIT and its rename |
 
 Each scenario lists its `witness` runs in Section 12. `NeverDeadLockWithPendingMover` is the witness for the antecedent
@@ -623,8 +636,10 @@ run's reachable states (measured: identical counts before and after it was added
   Section 240.4 preserves rather than clears - provided no further crash can occur (`EnvQuiet`) and a Recoverer or
   Cleanup has yet to run (`PendingMover`).
 - `UncertainLockEventuallyCleared`: the same for an uncertain owner's lock, conditioned the same way on a Breaker or
-  CleanupBreaker that has yet to run (only an operator action clears it, Section 240.4). Not yet measured: its
-  scenarios are not built, and its witness above has to be narrowed to that antecedent when they are.
+  CleanupBreaker that has yet to run (only an operator action clears it, Section 240.4). Plan 3 measures it in `mixed`,
+  and in `breaklock` if a three-actor configuration without symmetry fits its limit, and narrows its witness to that
+  antecedent (`NeverUncertainLockWithPendingBreaker`). The state witnesses `NeverDeadOwnerLock` and `NeverTornLock`
+  that plan 2 defined are used by no run and are removed in plan 3.
 
 The two conditions are what make the property checkable at all, not a weakening chosen for convenience. Measured on
 `recovery` (2026-09-12), the unconditioned `[](DeadOwnerLock => <>(~DeadOwnerLock))` is violated. The reason is not
@@ -681,6 +696,14 @@ judgement table of Section 6.1), not a rule of the spec, so no protocol defect i
 `mixed` and `breaklock`; in `recovery` the witness `NeverChecked` (Section 7) shows at least that its ghost is set. A
 seeded configuration lists the scenario's safety invariants, not only the one it must fail, so a seed that breaks a
 different invariant first fails its run.
+
+Two of this table's rows need model changes plan 2 did not make. `SEED_NO_CAPABILITY_GATE` needs every OS-native lock
+attempt to be conditional on the capability, as spec 96.1 and 240.3 step 4 put it ("where the destination provides
+OS-native locks"): plan 2's `Acquire` and 240.3 step 4 try the lock unconditionally, and under `LockCapability = weak`
+that attempt always fails, so with the gate removed nobody could acquire and `SingleWriter` could never fail. And
+`SEED_RECOVERER_IDENTITY_ONLY` needs a record rewritten in place under a Recoverer that holds the OS-native lock from
+classification to release; plan 3 measures whether in-flight rename and unlink reach that, and adds an in-flight
+lock-record write only if they do not (Section 5.2). If neither reaches it, the seed is dropped with a note here.
 
 A seeded run whose "must fail" entry is a liveness property is still a `seeded` run (its `violated` names the property),
 checked with the liveness settings: TLC checks the scenario's temporal properties, run
@@ -879,8 +902,8 @@ protocol model exists, and stays as the runner's own regression check.
 | Scenario | Actors | Variants | Its `witness` runs (Section 7); every other path is proved by label coverage |
 |---|---|---|---|
 | `recovery` | Owner (crashes), 2 Recoverers, PlainRun, Cleanup - **paired across four `check` runs, never all at once** (below) | POSIX, Windows | `NeverTornRead`, `NeverChecked`, `NeverRecoveredAfterCrash`, `NeverDeadLockWithPendingMover`; POSIX also `NeverHostCrashChangedLock` (Section 12, host crashes) |
-| `breaklock` | StalledOwner, 2 Breakers, PlainRun | POSIX, Windows; POSIX weak-capability (seeded run only: with `LockCapability = weak` every actor refuses under 235.1, so no path of the scenario is reached there) | `NeverTornRead`, `NeverUncertainOwnerLock` |
-| `mixed` | Owner (crashes; its lock is dead), Breaker (may see it uncertain), Recoverer (may see it dead), PlainRun | POSIX, Windows, POSIX weak-identity | `NeverRecoveredAfterCrash`, `NeverUncertainOwnerLock`; in the weak-identity variant the Breaker refuses at 240.5 step 1, so its labels are listed `unreached` there (Section 4) |
+| `breaklock` | StalledOwner, 2 Breakers, PlainRun - **paired across two `check` runs** (below) | POSIX, Windows; POSIX `LockCapability = remote` (`LeaseExpiry`, Section 5.1); POSIX weak-capability (seeded run only: with `LockCapability = weak` every actor refuses under 235.1, so no path of the scenario is reached there) | `NeverTornRead`, `NeverUncertainLockWithPendingBreaker`; POSIX also a host-crash witness |
+| `mixed` | Owner (crashes; its lock is dead), Breaker (may see it uncertain), Recoverer (may see it dead), PlainRun - **paired across two `check` runs** (below) | POSIX, Windows; POSIX weak-identity only if measurement shows it explores more than the strong one, and then possibly only as a seeded or witness run (below) | `NeverRecoveredAfterCrash`, `NeverUncertainLockWithPendingBreaker`; POSIX also a host-crash witness |
 | `cleanup` | StalledOwner, CleanupBreaker, Breaker | POSIX, Windows | `NeverUncertainOwnerLock` |
 | `cleanup-crash` | CleanupBreaker (crashes), PlainRun, Recoverer, Cleanup | POSIX, Windows | `NeverClassifiedCleanupLock`, `NeverDeadLockWithPendingMover` |
 | `nested` | Owner on the parent destination, NestedOwner on the child, PlainRun | POSIX | none: every path of this scenario is a label |
@@ -912,8 +935,9 @@ The fourth run carries no Recoverer deliberately. `plain_recover`, `plain_recove
 reached only by a plain rerun that finds a dead CLEANUP lock, which only a Cleanup that created one and then crashed
 leaves behind; no other pairing covers them. Together the four cover every label of the scenario's actors except
 `S96_1_backoff`, the 96.1 directory-lock conflict that belongs to `dirlock`, and `S240_3_putback`, which needs a
-record rewritten in place by a 240.5 takeover and so belongs to `breaklock`; both are `unreached` entries in all
-four.
+record rewritten in place by a 240.5 takeover under a running Recoverer; both are `unreached` entries in all
+four. `breaklock` runs no Recoverer, so the takeover that reaches `S240_3_putback` can only come from `mixed`, and
+its `deferred` entry names `mixed` (owner ruling for plan 3, 2026-09-14).
 
 Pairing moves work onto the `unreached` lists, and those lists are per run. A label an actor of the run owns but
 this pairing cannot reach must be listed in THAT run's entry with its reason, even though another pairing covers it:
@@ -935,7 +959,8 @@ exercises weak identity.
 
 Liveness runs: `DeadLockEventuallyCleared` in `recovery` and `cleanup-crash`, whose `NeverDeadLockWithPendingMover`
 witness run shows the state it is about occurs; `UncertainLockEventuallyCleared` in `breaklock`, `cleanup`, and `mixed`
-(so that `SEED_TORN_AS_FOREIGN` is judged against a passing run of the same scenario), with `NeverUncertainOwnerLock`;
+(so that `SEED_TORN_AS_FOREIGN` is judged against a passing run of the same scenario), with
+`NeverUncertainLockWithPendingBreaker` in `breaklock` and `mixed` and `NeverUncertainOwnerLock` in `cleanup`;
 POSIX variant only, without symmetry.
 
 What `recovery` found, and what changed because of it. Its liveness run, once the property was conditioned, was
@@ -982,14 +1007,43 @@ process gives up on exit; the path is unreachable under exclusive inspection, so
 "re-read the lock" does not say whether it reads the lock path or the handle already open. The model reads the path,
 and with that reading safety is measured to hold; that step 3's post-move identity check would equally keep a handle
 re-read safe is argued, not measured.
+Plan 3 settles the first, because its StalledOwner stops after a failed check and must close its handles (Section
+6.1); the second only if plan 3 adds an in-flight lock-record write, the one thing that can rewrite a lock under a
+Recoverer's OS-native lock, and then both readings are measured.
 
 Build order: the scenarios are built one plan at a time, not all at once, so that the first TLC runs measure real
 state-space sizes and their findings are triaged before more actors are built on the same model. Plan 2 builds
-`FsModel.tla` and the `recovery` scenario (the Owner, Recoverer, PlainRun, and Cleanup actors). The remaining
-LockProtocol scenarios follow in plans grouped once plan 2's measurements exist, and `claims` last. Until a scenario
+`FsModel.tla` and the `recovery` scenario (the Owner, Recoverer, PlainRun, and Cleanup actors). Plan 3 builds
+`breaklock` and `mixed` (below). The remaining LockProtocol scenarios follow in later plans, and `claims` last. Until a scenario
 is built it is listed in `trace.toml`'s `planned_scenarios` (Section 9.1). A later plan changes files an earlier plan
 created (the runner, the stamp test, the self-test configuration); those changes are shown in the later plan, and the
 earlier plan document stays as it was executed.
+
+Plan 3 builds `breaklock` and `mixed` together (owner ruling, 2026-09-14), because both add the Breaker and both
+carry `SingleWriter`'s seeds. The owner's rulings for it, made after a gap analysis of the plan-2 model:
+
+- Four concurrent actors did not finish for `recovery`, so both scenarios pair their actors:
+
+  | Run | Actors | What only this pairing reaches |
+  |---|---|---|
+  | `breaklock-<platform>-check` | StalledOwner, 2 Breakers (`SYMMETRY` over the Breakers) | two takeovers racing for the same uncertain lock (240.5 steps 3-6) |
+  | `breaklock-<platform>-plain-check` | StalledOwner, Breaker, PlainRun | a plain rerun meeting a lock mid-takeover |
+  | `mixed-<platform>-check` | Owner, Breaker, Recoverer | a Breaker and a Recoverer judging the same dead owner differently |
+  | `mixed-<platform>-plain-check` | Owner, Breaker, PlainRun | a plain rerun meeting a Breaker's takeover of a dead owner's lock |
+
+  Each row's counts and time are measured before the plan is written, as `recovery`'s were.
+- A stalled owner is reached two ways (Section 6.1): under `strong`, an owner that crashes with calls in flight; under
+  the POSIX `remote` variant, a live owner whose lock lease `LeaseExpiry` clears. Only the second exercises
+  `SingleWriter`'s stalled-owner exception with the owner still running.
+- In-flight rename and unlink are added now; an in-flight lock-record write only if measured necessary (Section 5.2).
+- The Breaker classifies and closes before 240.5, and recovers a dead owner's lock through 240.3 (Section 6.1).
+- Liveness is in scope, POSIX only, without symmetry: `UncertainLockEventuallyCleared` in `mixed`, and in `breaklock`
+  if a three-actor configuration fits its limit. Host crashes get one witness run per scenario; neither scenario adds
+  pairings to the host-crash tier.
+- The weak-identity variant of `mixed` is measured first; `recovery`'s identical-graph finding (above) may repeat,
+  since the Breaker refuses at 240.5 step 1 under weak identity.
+- Every `recovery` configuration and run gains the new constants (the Breaker and StalledOwner sets, empty there, and
+  every new seed flag, false), and its state counts are re-measured to confirm they do not change.
 
 Common bounds: one target lock path (plus the parent's for `nested`, and the per-name lock path and the directory
 lock path for `dirlock`); at most two crashes per run in total, and one in `claims`; `LockLost` at most once; symmetry
