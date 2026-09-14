@@ -52,5 +52,29 @@
     "why": "Mutation testing for the invariant-heavy core \u2014 hardlink topology, resume validation, atomic publication. Flux's .gitignore already excludes mutants.out*, so this was anticipated from the start.",
     "install": "cargo binstall -y cargo-mutants",
     "in_path": "cargo-mutants"
+  },
+  {
+    "name": "java",
+    "why": "Runs TLC (the TLA+ model checker) for the lock-protocol model check: `just model` downloads a pinned tla2tools.jar and needs Java 11 or later on PATH. CI uses Temurin 21. Not needed by `just check`.",
+    "install": "winget install EclipseAdoptium.Temurin.21.JDK",
+    "in_path": "java"
+  },
+  {
+    "name": "python3",
+    "why": "Runs models/lockproto/run.py (the model-check runner) and its unit tests (`just model`, `just model-test`). Python 3.14 is the version CI and the development machines use; run.py accepts 3.11 or later (tomllib). Not needed by `just check`.",
+    "install": "winget install Python.Python.3.14",
+    "in_path": "python3"
+  },
+  {
+    "name": "actionlint",
+    "why": "Lints the GitHub Actions workflows, including .github/workflows/model.yml (lock-model plan 1). Runs the shell in each `run:` step through shellcheck when shellcheck is on PATH; without it that check is silently skipped (visible only with `actionlint -verbose`).",
+    "install": "winget install rhysd.actionlint",
+    "in_path": "actionlint"
+  },
+  {
+    "name": "shellcheck",
+    "why": "Lets actionlint check the shell inside workflow `run:` steps; actionlint disables that rule when shellcheck is not on PATH.",
+    "install": "winget install koalaman.shellcheck",
+    "in_path": "shellcheck"
   }
 ]

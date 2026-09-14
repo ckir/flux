@@ -3,7 +3,7 @@
 Thanks for your interest. This document covers the basics.
 
 Flux is built against an authoritative engineering specification,
-[`FLUX_FULL_UPDATED_SPEC_V15.md`](FLUX_FULL_UPDATED_SPEC_V15.md). **The spec is the
+[`FLUX_FULL_UPDATED_SPEC_V16.md`](FLUX_FULL_UPDATED_SPEC_V16.md). **The spec is the
 oracle.** If the code and the spec disagree, that is a bug in the code — or a
 change that needs to be made to the spec first, deliberately. Please cite the
 relevant section (e.g. "spec §13.1") in issues and pull requests.
