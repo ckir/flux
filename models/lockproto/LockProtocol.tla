@@ -92,7 +92,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
        \* lock whose owner is dead (251.1, 259.6). The seeds re-introduce the defects of design Section 8.
        Replaceable(p) == \/ classified[p] = "dead"
                          \/ (classified[p] = "cleanuplock" /\ ownerLive[p] = "dead")
-                         \/ (SEED_RECOVER_UNCERTAIN /\ JudgedUncertain(p))
+                         \/ (SEED_RECOVER_UNCERTAIN /\ classified[p] = "uncertain" /\ ownerLive[p] = "none")
                          \/ (SEED_RECOVER_FOREIGN /\ classified[p] = "foreign")
                          \/ (SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK /\ classified[p] = "cleanuplock"
                                                                 /\ ownerLive[p] = "uncertain")
@@ -572,7 +572,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "5e34eb3b" /\ chksum(tla) = "4ddc5dd6")
+\* BEGIN TRANSLATION (chksum(pcal) = "1af3bdbf" /\ chksum(tla) = "ff960454")
 \* Procedure variable obj of procedure Classify at line 110 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
@@ -599,7 +599,7 @@ JudgedUncertain(p) == classified[p] = "uncertain" \/ ownerLive[p] = "uncertain"
 
 Replaceable(p) == \/ classified[p] = "dead"
                   \/ (classified[p] = "cleanuplock" /\ ownerLive[p] = "dead")
-                  \/ (SEED_RECOVER_UNCERTAIN /\ JudgedUncertain(p))
+                  \/ (SEED_RECOVER_UNCERTAIN /\ classified[p] = "uncertain" /\ ownerLive[p] = "none")
                   \/ (SEED_RECOVER_FOREIGN /\ classified[p] = "foreign")
                   \/ (SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK /\ classified[p] = "cleanuplock"
                                                          /\ ownerLive[p] = "uncertain")
