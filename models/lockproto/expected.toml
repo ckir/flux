@@ -8,7 +8,9 @@ scenarios = ["selftest", "recovery", "breaklock"]
 # scenario lands: the stamp test requires the scenario to be in trace.toml's planned_scenarios.
 deferred = [
     { label = "S96_1_backoff", scenario = "dirlock", reason = "the 96.1 directory-lock conflict needs the directory lock only dirlock creates" },
-    { label = "S240_3_putback", scenario = "mixed-remote", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover, which only breaklock performs" },
+    { label = "S240_3_putback", scenario = "mixed-remote", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover under a running Recoverer, which needs a lapsed lease" },
+    { label = "S99_refuse_close", scenario = "breaklock-remote", reason = "a failed Section 99 check needs a lock lost while its holder ran, which only LockCapability = remote gives" },
+    { label = "brk_refuse_close", scenario = "breaklock-remote", reason = "a failed 21.1 step 3 check needs a lock lost while its holder ran, which only LockCapability = remote gives" },
 ]
 
 # Runner self-test (Smoke.tla): exercises every way run.py judges a run. Not a protocol scenario.
@@ -356,6 +358,8 @@ symmetry = { definition = "BreakerPerms", over = "Breakers" }
 unreached = [
     { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
     { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record under a running Recoverer, which needs a lapsed lease; mixed-remote reaches it" },
+    { label = "S99_refuse_close", reason = "a Section 99 or 21.1 step 3 check fails only for a holder whose lock was taken while it ran; under a strong capability a running holder keeps its OS-native lock, so no takeover wins against it; breaklock-remote reaches it" },
+    { label = "brk_refuse_close", reason = "a Section 99 or 21.1 step 3 check fails only for a holder whose lock was taken while it ran; under a strong capability a running holder keeps its OS-native lock, so no takeover wins against it; breaklock-remote reaches it" },
 ]
 timeout_minutes = 60
 
