@@ -38,6 +38,11 @@
        BusyJustified == /\ LockObj # NoObj
                         /\ IsRecord(fs.content[LockObj])
                         /\ ~crashed[fs.content[LockObj].op]
+       \* The object of the one lock-file handle a process holds, or NoObj. A holder of the target lock
+       \* has exactly one open handle at the points that use this (after a takeover or a recovery).
+       HandleObj(p) == IF \E h \in fs.handles : h.proc = p
+                       THEN (CHOOSE h \in fs.handles : h.proc = p).obj
+                       ELSE NoObj
        \* The evidence a TARGET_LOCK_BUSY refusal rests on, recorded by every refusing label through this
        \* one definition, so SEED_DEAD_AS_BUSY guards all of them (design Section 7, RefusalJustified).
        RefusalEvidence(p) == BusyJustified \/ sawLive[p]
@@ -199,7 +204,7 @@
      \* Replace a dead owner's lock by moving it aside (240.3 steps 1 to 5). The caller has
      \* classified the lock as replaceable and still holds its handle and its OS-native lock.
      procedure Recover()
-       variables robj = 0, victim = NoProc;
+       variables robj = 0, victim = NoProc, nobj = 0;
      {
        S240_3_s1:
          \* Re-read the lock: proceed only if it still names the same dead owner.
@@ -234,13 +239,15 @@
          if (crashed[self]) { goto recover_crashed; }
          else {
            with (r = FsCreate(fs, P, LockName, self, TRUE)) {
-             if (r.ok) { fs := r.fs; } else { goto S240_3_s4_drop; };
+             if (r.ok) { fs := r.fs; nobj := r.val; } else { goto S240_3_s4_drop; };
          };
          };
        S240_3_s4_lock:
+         \* The lock, and the record write below, go through the handle the create returned, as the
+         \* acquirer's do (a reading, recorded in trace.toml): never through a second lookup of the path.
          if (crashed[self]) { goto recover_crashed; }
          else {
-           with (r = FsTryLock(fs, self, LockObj)) {
+           with (r = FsTryLock(fs, self, nobj)) {
              if (r.ok) { fs := r.fs; }
              else { goto S240_3_s4_lock_backoff; };
          };
@@ -248,12 +255,12 @@
        S240_3_s4_record_begin:
          if (crashed[self]) { goto recover_crashed; }
          else {
-           fs := FsWriteBegin(fs, LockObj).fs;
+           fs := FsWriteBegin(fs, nobj).fs;
          };
        S240_3_s4_record_end:
          if (crashed[self]) { goto recover_crashed; }
          else {
-           fs := FsWriteEnd(fs, LockObj, OwnRecord(self)).fs;
+           fs := FsWriteEnd(fs, nobj, OwnRecord(self)).fs;
            seenRec[self] := OwnRecord(self);
            holding[self] := TRUE;
          };
@@ -657,15 +664,16 @@
            };
          };
        S21_1_s5_write_begin:
-         \* The lock record is rewritten for the new operation, under the lock already held.
+         \* The lock record is rewritten for the new operation, under the lock already held: through the
+         \* handle that holds it, not through a second lookup of the path (a reading, recorded in trace.toml).
          if (crashed[self]) { goto brk_end; }
          else {
-           fs := FsWriteBegin(fs, LockObj).fs;
+           fs := FsWriteBegin(fs, HandleObj(self)).fs;
          };
        S21_1_s5_write_end:
          if (crashed[self]) { goto brk_end; }
          else {
-           fs := FsWriteEnd(fs, LockObj, OwnRecord(self)).fs;
+           fs := FsWriteEnd(fs, HandleObj(self), OwnRecord(self)).fs;
          };
        brk_publish:
          if (~crashed[self] /\ holding[self]) { call Publish(); };
