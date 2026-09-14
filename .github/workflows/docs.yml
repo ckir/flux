@@ -94,7 +94,7 @@ jobs:
       # to false so it never creates the site either. Pages is already enabled with
       # build_type=workflow, so the step is dead weight — and dropping it keeps the
       # build job honestly at contents:read.
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: target/doc
 
