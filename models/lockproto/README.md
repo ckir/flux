@@ -92,10 +92,10 @@ kinds at once do not finish, so the check runs pair them, and each pairing is ex
 
 | Pairing | Actors | What only this pairing explores | Distinct states, POSIX / Windows |
 |---|---|---|---|
-| `recovery-<platform>-check` | Owner, 2 Recoverers, with `SYMMETRY` over the Recoverers | two recoverers racing to move the same dead lock aside (240.3 step 2) | 937,335 / 1,380,999 |
-| `recovery-<platform>-plain-check` | Owner, Recoverer, PlainRun | a plain rerun (21.1) meeting a lock a recoverer is working on | 1,620,690 / 2,310,021 |
-| `recovery-<platform>-cleanup-check` | Owner, Recoverer, Cleanup | two movers of different kinds, both entitled to move the lock aside | 1,174,383 / 1,684,944 |
-| `recovery-<platform>-plain-cleanup-check` | Owner, PlainRun, Cleanup | the plain rerun's own 240.3 path, which needs a dead cleanup lock | 1,043,058 / 1,446,348 |
+| `recovery-<platform>-check` | Owner, 2 Recoverers, with `SYMMETRY` over the Recoverers | two recoverers racing to move the same dead lock aside (240.3 step 2) | 950,004 / 1,393,668 |
+| `recovery-<platform>-plain-check` | Owner, Recoverer, PlainRun | a plain rerun (21.1) meeting a lock a recoverer is working on | 1,645,500 / 2,334,831 |
+| `recovery-<platform>-cleanup-check` | Owner, Recoverer, Cleanup | two movers of different kinds, both entitled to move the lock aside | 1,199,193 / 1,709,754 |
+| `recovery-<platform>-plain-cleanup-check` | Owner, PlainRun, Cleanup | the plain rerun's own 240.3 path, which needs a dead cleanup lock | 1,067,868 / 1,471,158 |
 
 - Every run starts from an empty lock path or from one holding a `Foreign` object, which no actor writes, so
   `ForeignUntouched` has something to hold over. The empty start keeps the whole acquisition prefix.
@@ -123,7 +123,8 @@ kinds at once do not finish, so the check runs pair them, and each pairing is ex
 - The host crash keeps a directory's unflushed entry operations all-or-nothing, not as the prefix a journaled
   filesystem keeps. A partial prefix followed by a further crash is not explored (design Section 5.2).
 - The liveness run, `recovery-posix-liveness` (`DeadLockEventuallyCleared`, Owner and 2 Recoverers, no symmetry),
-  holds over 1,869,534 distinct states and is untightened: timed twice on CI at 258-261s, it fits its 30-minute
+  holds over 1,894,344 distinct states and is untightened: timed twice on CI at 258-261s before the `Foreign`
+  start state added 24,810 states, it fits its 30-minute
   limit several times over.
 
 ## Filesystem probes
