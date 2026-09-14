@@ -1,0 +1,1024 @@
+# Traceability map of the lock-protocol model (design Section 9.1).
+#
+# One [[unit]] per unit of each heading listed in spec-sections.stamp:
+#
+#   [[unit]]
+#   heading = "## 240.5 `--break-lock`"   # the heading line exactly as in the spec
+#   ordinal = 2                            # the unit's position in that heading's own text
+#   quote = "Open the existing lock file"  # a sentence of the unit
+#   hash = "<BLAKE3 hex>"                  # written by `just model-stamp`
+#   labels = ["S240_5_s2"]                 # PlusCal labels that implement it, and/or
+#   # not_modelled = "<reason>"            # instead of, or alongside, labels (together they mean
+#                                           # a partly modelled unit), and/or
+#   # pending = ["<scenario>", ...]        # scenarios not yet built that still owe this unit
+#                                           # labels; may accompany labels. At least one of
+#                                           # labels, not_modelled, or pending is required.
+#
+# `[[heading]]` entries cover every heading in a stamped heading's family (Section 9) other than
+# a stamped one itself:
+#
+#   [[heading]]
+#   heading = "## 96.3 A New Sibling"  # the heading line exactly as in the spec
+#   family = "96"                      # the number whose family it is in (M for a stamped M.N)
+#   count = 1                          # how many times that line occurs in that family
+#   not_modelled = "<reason>"          # exactly one of this or `pending` below
+#   # pending = ["<scenario>", ...]    # scenarios that will cover it; never both with not_modelled
+#
+# A `[[heading]]` entry never carries labels: a heading whose text the model encodes is stamped,
+# never listed here.
+#
+# `planned_scenarios` lists, at the top level, every scenario not yet built that some `pending`
+# array still owes labels to. Each name in a `pending` array must be in `planned_scenarios`, and a
+# scenario must not be in both `planned_scenarios` and expected.toml's `scenarios` list: building a
+# scenario moves its name out of `planned_scenarios` (Section 9.1).
+#
+# Headings enter the stamp as the model encodes them (plan 2 onward).
+
+planned_scenarios = ["breaklock", "mixed", "cleanup", "cleanup-crash", "nested", "dirlock", "claims"]
+
+[[unit]]
+heading = "## 21.1 Existing Operation State Without `--resume`"
+ordinal = 1
+quote = "Before starting a new operation, Flux checks for existing operation"
+hash = "86d982bb3a12cd177d826e36f6bebb842a2bda9d8dd8a4f21e7ec4a1d6ec50d4"
+not_modelled = "explanatory text; the rule it explains is modelled in ordinals 2 to 9"
+
+[[unit]]
+heading = "## 21.1 Existing Operation State Without `--resume`"
+ordinal = 2
+quote = "directory operations: every operation in `DEST/.flux/operations/`"
+hash = "c343002be5ba8f052edd7bc2d932610ee071002b13ef921d095395da41f47ba7"
+not_modelled = "the model represents one abstract target lock, not a scan of DEST/.flux/operations or standalone catalog records"
+
+[[unit]]
+heading = "## 21.1 Existing Operation State Without `--resume`"
+ordinal = 3
+quote = "Each prior operation found is handled by its classification:"
+hash = "9f1c32185397ef1e0fe7cb542b112e10ff8517f07c1ba4a8a0942f9f59eaade0"
+not_modelled = "explanatory text; the rule it explains is modelled in ordinals 4 to 8"
+
+[[unit]]
+heading = "## 21.1 Existing Operation State Without `--resume`"
+ordinal = 4
+quote = "live owner (lock held)"
+hash = "e40f84e927bd385e101093024f255660808289fdc3a20f76a6df9c0b867c2cee"
+labels = ["S21_1_decide"]
+
+[[unit]]
+heading = "## 21.1 Existing Operation State Without `--resume`"
+ordinal = 5
+quote = "ownership uncertain, or state missing/corrupt"
+hash = "9a5d38bb0ec9ce5bde527d270cf21f48dd97c33521cfa84890031a599ccb90fd"
+labels = ["S21_1_decide"]
+
+[[unit]]
+heading = "## 21.1 Existing Operation State Without `--resume`"
+ordinal = 6
+quote = "completed (including cleanup_pending)"
+hash = "4bac160702f9cd37216eec608b48d9228b600a8c0b7931b95ea8f3de741c61ab"
+not_modelled = "the model has no completed/cleanup_pending operation state; only lock classification is modelled"
+
+[[unit]]
+heading = "## 21.1 Existing Operation State Without `--resume`"
+ordinal = 7
+quote = "terminal ABANDONED"
+hash = "bdf1ca8fab66d68b2b7cf51793d7546948c7417f3aa1bb7077c4a1dacb4e937e"
+not_modelled = "the model has no terminal ABANDONED operation state; only lock classification is modelled"
+
+[[unit]]
+heading = "## 21.1 Existing Operation State Without `--resume`"
+ordinal = 8
+quote = "resumable (non-terminal, owner demonstrably gone)"
+hash = "7f541a24708a576b60f08027c69cdbd80c6717c1bea9f946df65abd25588770a"
+labels = ["S21_1_decide"]
+
+[[unit]]
+heading = "## 21.1 Existing Operation State Without `--resume`"
+ordinal = 9
+quote = "For a resumable prior operation:"
+hash = "43f1c30ea89b0c8e4d8d8c854076378720cb2404ce920243fccb50c311308e7c"
+not_modelled = "explanatory text; the rule it explains is modelled in ordinal 10"
+
+[[unit]]
+heading = "## 21.1 Existing Operation State Without `--resume`"
+ordinal = 10
+quote = "neither             fail with RESUMABLE_OPERATION_EXISTS, naming the"
+hash = "155614d97e907a990cb05d7c1bcf75bdee561a4b13fc997c924b1e785d876d6c"
+labels = ["S21_1_decide", "S21_1_refused"]
+not_modelled = "the --resume and both rows are not modelled; the neither row is the PlainRun (S21_1_decide/S21_1_refused, mapped here); the --restart row is the Recoverer, mapped at ordinals 13 to 17"
+
+[[unit]]
+heading = "## 21.1 Existing Operation State Without `--resume`"
+ordinal = 11
+quote = "If no prior operation exists for the target or `DEST`, `--resume` starts"
+hash = "d6a0b906feb52123e1179715bd9586b2fe6515db550e9b1d2f44523d6d6a800a"
+not_modelled = "describes --resume, which the model does not represent (S96_1_create's fresh-creation path already covers the no-prior-operation case)"
+
+[[unit]]
+heading = "## 21.1 Existing Operation State Without `--resume`"
+ordinal = 12
+quote = "`--restart` supersedes a prior operation in this order:"
+hash = "fcffe45a7d1f42e9ff3773b76d06110e865cb41e98831b40d9fc7a7514d95236"
+not_modelled = "explanatory text; the rule it explains is modelled in ordinals 13 to 17 (the Recoverer)"
+
+[[unit]]
+heading = "## 21.1 Existing Operation State Without `--resume`"
+ordinal = 13
+quote = "1. acquire the prior operation's lock without waiting (a dead owner's"
+hash = "10bc1c6eb532112f84694c8649abf4b01ae4c05a8e4089f21edb9b5043a3e02e"
+labels = ["S240_1_open", "S240_1_trylock", "S240_1_read", "S240_1_close", "S240_3_s1", "S240_3_s2", "S240_3_s3", "S240_3_s4", "S240_3_s4_lock", "S240_3_s4_record_begin", "S240_3_s4_record_end", "S240_3_restart"]
+not_modelled = "the model refuses TARGET_LOCK_BUSY generically and does not distinguish OPERATION_LOCKED as a separate code"
+pending = ["breaklock"]
+
+[[unit]]
+heading = "## 21.1 Existing Operation State Without `--resume`"
+ordinal = 14
+quote = "2. durably mark the prior operation ABANDONED, recording"
+hash = "bfa96d762706592f3027a400f75cffcfb20d74dc8dfcf2ffcd7553975c9d7298"
+not_modelled = "the model has no durable ABANDONED operation-state marker"
+
+[[unit]]
+heading = "## 21.1 Existing Operation State Without `--resume`"
+ordinal = 15
+quote = "3. revalidate ownership and locks (Section 99)"
+hash = "2e2c0b257756369a3304969102ddaf4a3816f4706875b727f14e2f66d70e67fe"
+labels = ["S99_check", "S99_write", "S99_release", "S99_close"]
+
+[[unit]]
+heading = "## 21.1 Existing Operation State Without `--resume`"
+ordinal = 16
+quote = "4. delete the prior operation's derived artifacts (partials), then its"
+hash = "9e338ca3642848b2048f8318f5b356908f282201cd938e8284972b0637189e91"
+not_modelled = "the model has no partial or primary-state artifacts to delete"
+
+[[unit]]
+heading = "## 21.1 Existing Operation State Without `--resume`"
+ordinal = 17
+quote = "5. start the new operation under"
+hash = "3095b782073bac3b3226b5cfaa0ba4e89fad2f1e775f3773927cca1d7889e0de"
+labels = ["S240_3_s4_record_begin", "S240_3_s4_record_end"]
+
+[[unit]]
+heading = "## 21.1 Existing Operation State Without `--resume`"
+ordinal = 18
+quote = "Deleting before copying frees the prior partial allocation before the"
+hash = "ae0f9d86d93060f577dda47fccbe3e561d8592a813a7ce2ad8d06d4a34ad5f02"
+not_modelled = "the model has no partial allocations or a durable ABANDONED marker for garbage collection to remove, and does not model Section 259.13's precedence rule; the never-overrides-live/uncertain-ownership guard is enforced by classification (240.1, 240.4) and Replaceable(), gating recovery before the Recoverer ever reaches 240.3"
+
+[[unit]]
+heading = "## 21.1 Existing Operation State Without `--resume`"
+ordinal = 19
+quote = "A plain rerun therefore never runs alongside a dead operation's partial"
+hash = "482abf13a95c151036fe15672546c0ad20f6384692485edd1f89c1f6b47d6749"
+not_modelled = "the model has no partial data objects for a plain rerun to run alongside"
+
+[[unit]]
+heading = "## 21.1 Existing Operation State Without `--resume`"
+ordinal = 20
+quote = "------------------------------------------------------------------------"
+hash = "f985f00990171ff0b2aa0d821f0d8b318c31a218c72238c01c2306e768b8dc30"
+not_modelled = "document separator, no content"
+
+[[unit]]
+heading = "## 96.1 Name-Equivalent Target Locks"
+ordinal = 1
+quote = "Destination filesystems differ in which names denote the same entry."
+hash = "18e8b5d4ea2c9ca97cbf928cdc46b50058bf5bb71f983390a09e43ee9b0bc0d5"
+not_modelled = "the different-spelling branch is not modelled (LockProtocol uses one spelling per target; the branch is a deterministic comparison with no interleaving, pinned by spec acceptance test 54)"
+
+[[unit]]
+heading = "## 96.1 Name-Equivalent Target Locks"
+ordinal = 2
+quote = "Flux therefore lets the destination filesystem decide. A target lock is a"
+hash = "8ffaf50f7135ceabe0f2681721f67df68e71cccdb697772cea0f0e12341ad263"
+labels = ["S96_1_create"]
+
+[[unit]]
+heading = "## 96.1 Name-Equivalent Target Locks"
+ordinal = 3
+quote = "P/<name>.flux-lock"
+hash = "738aec55d3d6c32e3aeb29e4b21cee244e18f01d662e2867ffa98e8ff059d46f"
+labels = ["S96_1_create"]
+
+[[unit]]
+heading = "## 96.1 Name-Equivalent Target Locks"
+ordinal = 4
+quote = "The lock file is created with exclusive"
+hash = "1f76022b697fca869ebfe23f102c013f78d9dfa004301d3f44b937f9e2bf5169"
+labels = ["S96_1_create"]
+
+[[unit]]
+heading = "## 96.1 Name-Equivalent Target Locks"
+ordinal = 5
+quote = "When exclusive creation fails because the lock already exists:"
+hash = "973fa304c2352420441678c9c9bdd7e828ee62bd41f8cf362eb6bad3974c3b22"
+not_modelled = "explanatory text; the rule it explains is modelled in ordinals 6 to 9"
+
+[[unit]]
+heading = "## 96.1 Name-Equivalent Target Locks"
+ordinal = 6
+quote = "record names another operation"
+hash = "b3646ee328ffc72d7dce00fba6f26d72636e86ac61cd7ec86d31b86c708d7076"
+labels = ["S96_1_create"]
+
+[[unit]]
+heading = "## 96.1 Name-Equivalent Target Locks"
+ordinal = 7
+quote = "record names this operation, for a different target spelling"
+hash = "d02c4fba0ec8d0610f95d412b4dd8b4c12c49141e96711f26253c326b438b051"
+not_modelled = "the different-spelling branch is not modelled (LockProtocol uses one spelling per target; the branch is a deterministic comparison with no interleaving, pinned by spec acceptance test 54)"
+
+[[unit]]
+heading = "## 96.1 Name-Equivalent Target Locks"
+ordinal = 8
+quote = "record cannot be read (an I/O or permission error), or fails its"
+hash = "173d2792cd7f103aa3455f36ad2aa96278a13a648e676b778eec90dee30affe1"
+labels = ["S240_1_read"]
+
+[[unit]]
+heading = "## 96.1 Name-Equivalent Target Locks"
+ordinal = 9
+quote = "object at the lock path is not a Flux lock record at all"
+hash = "da69b55a14743748422a19ffdfabdd7c482717a86dff374d90d764da278260a5"
+labels = ["S240_1_read", "S21_1_decide", "S251_1_classify"]
+
+[[unit]]
+heading = "## 96.1 Name-Equivalent Target Locks"
+ordinal = 10
+quote = "A Flux lock record is overwritten in place only by a `--break-lock`"
+hash = "978df397b3a0bebbc934718290b9ca34a7d5293441b0b4a72bd4ca4ab1265ade"
+labels = ["S240_3_s2"]
+pending = ["breaklock"]
+
+[[unit]]
+heading = "## 96.1 Name-Equivalent Target Locks"
+ordinal = 11
+quote = "The lock record (Section 259.6) stores the spelling that created it."
+hash = "ac1995cfa1ce0f9296f35a0ace75d265637aa2e5cf9b7299ef97f45bb1e731ba"
+not_modelled = "the different-spelling branch is not modelled (LockProtocol uses one spelling per target; the branch is a deterministic comparison with no interleaving, pinned by spec acceptance test 54)"
+
+[[unit]]
+heading = "## 96.1 Name-Equivalent Target Locks"
+ordinal = 12
+quote = "An OS-native lock, such as a byte-range lock or `flock` on the lock file,"
+hash = "3193a86a81a62853c50f363cdfddadb4f8961e75724871aa26f90e5b8e0808ab"
+labels = ["S96_1_ownlock"]
+
+[[unit]]
+heading = "## 96.1 Name-Equivalent Target Locks"
+ordinal = 13
+quote = "Where the destination provides OS-native locks (Section 235.1), the"
+hash = "2e31dee7fefda0d3b01610d9040de9fddf5cdb2dd60836ba1e0c8706b07268b6"
+labels = ["S96_1_ownlock", "S96_1_ownlock_backoff", "S96_1_record_begin", "S96_1_record_end"]
+
+[[unit]]
+heading = "## 96.1 Name-Equivalent Target Locks"
+ordinal = 14
+quote = "If `<name>.flux-lock` would exceed the directory's name-length limit, the"
+hash = "d51e5a249d4c549dde296c0271c38c0839c189a20df2b27d18e49f521d3194a9"
+pending = ["dirlock"]
+
+[[unit]]
+heading = "## 96.1 Name-Equivalent Target Locks"
+ordinal = 15
+quote = "P/.flux-dir.lock"
+hash = "1ae6f4d2ff791906c3002c617897cee8562df4b374ead8ad87fdc465476151d9"
+pending = ["dirlock"]
+
+[[unit]]
+heading = "## 96.1 Name-Equivalent Target Locks"
+ordinal = 16
+quote = "Per-name locks and the directory lock exclude each other by announcing,"
+hash = "acafc83fab771e7a4413a262bfbb22f1c81237c3ab7ac5de8cc51b3ed9a0d08e"
+not_modelled = "explanatory text; the rule it explains is modelled in ordinal 17"
+
+[[unit]]
+heading = "## 96.1 Name-Equivalent Target Locks"
+ordinal = 17
+quote = "per-name acquirer    create P/<name>.flux-lock, then check that"
+hash = "a9c9fea66afe7dd9521f09b7d8079a896367c15dd23c4527f8495ac53e6bb87f"
+labels = ["S96_1_dircheck"]
+pending = ["dirlock"]
+
+[[unit]]
+heading = "## 96.1 Name-Equivalent Target Locks"
+ordinal = 18
+quote = "On a conflict the acquirer removes what it created and reports"
+hash = "ab656c638dfaab957c7fca22dfcf09be0ae2ae8e08c01616ed3591d5b69519aa"
+labels = ["S96_1_backoff"]
+pending = ["dirlock"]
+
+[[unit]]
+heading = "## 96.1 Name-Equivalent Target Locks"
+ordinal = 19
+quote = "A target `T` with no parent (a filesystem root: `/`, `C:\\`, a share root)"
+hash = "2f4d1e4a9b60bdbd4d1e15503286ce8234d52d3dee14afb93906f255043979cb"
+not_modelled = "the root lock is not modelled (the same exclusive creation at a different path, which adds no interleaving to an abstract lock path)"
+
+[[unit]]
+heading = "## 96.1 Name-Equivalent Target Locks"
+ordinal = 20
+quote = "T/.flux-root.lock"
+hash = "d2434f6a716baec862ae7f227a2eaaccab87b5c4223e649a02d25c04d99d3d99"
+not_modelled = "the root lock is not modelled (the same exclusive creation at a different path, which adds no interleaving to an abstract lock path)"
+
+[[unit]]
+heading = "## 96.1 Name-Equivalent Target Locks"
+ordinal = 21
+quote = "created exclusively inside `T`. It is Flux control state: never copied,"
+hash = "8c476e9a79ec677b403a2dc0d39ab6f96f0c5809cab07cbc566c39a111e89873"
+not_modelled = "the root lock is not modelled (the same exclusive creation at a different path, which adds no interleaving to an abstract lock path)"
+
+[[unit]]
+heading = "## 96.1 Name-Equivalent Target Locks"
+ordinal = 22
+quote = "Exclusive creation on a remote filesystem is trusted only under the lock"
+hash = "4c938d58d5793215d3ce4f490bfff768e14740f101ea2ebfd106ef40c4c7a27b"
+pending = ["breaklock"]
+
+[[unit]]
+heading = "## 96.2 Lock Refusal Reports the Holder"
+ordinal = 1
+quote = "A refusal with `TARGET_LOCK_BUSY`, `OPERATION_LOCKED`, or"
+hash = "0c5397966346bab9e3d0f7fee6be4b53f96581f412477f95d82916a4d3e08590"
+labels = ["S96_1_backoff", "S99_check", "S21_1_decide", "S251_1_classify"]
+not_modelled = "report content is not checked, only that the refusal happens (design Section 3)"
+
+[[unit]]
+heading = "## 96.2 Lock Refusal Reports the Holder"
+ordinal = 2
+quote = "------------------------------------------------------------------------"
+hash = "f985f00990171ff0b2aa0d821f0d8b318c31a218c72238c01c2306e768b8dc30"
+not_modelled = "document separator, no content"
+
+[[unit]]
+heading = "# 99. Commit-Time Lock Revalidation"
+ordinal = 1
+quote = "Immediately before:"
+hash = "a222f07240fd5d6f2f1126c0ed3f46b5cbe901724c4bc93fa6864a881e5229b1"
+not_modelled = "explanatory text; the rule it explains is modelled in ordinal 3"
+
+[[unit]]
+heading = "# 99. Commit-Time Lock Revalidation"
+ordinal = 2
+quote = "write"
+hash = "e876672828dfec4bbff3d90eb3513be86e46292c275ddf994a0716d903d33818"
+not_modelled = "the model abstracts every mutating operation into one generic S99_write step; it does not distinguish write/truncate/rename/unlink/hardlink-creation/metadata-replacement individually"
+
+[[unit]]
+heading = "# 99. Commit-Time Lock Revalidation"
+ordinal = 3
+quote = "the worker must verify that its required ownership remains valid."
+hash = "23d3b2ad1c79c117338acf208bd044e4be57e57d741d89c12f77545720b5c7a9"
+labels = ["S99_check", "S99_release", "S99_close"]
+
+[[unit]]
+heading = "# 99. Commit-Time Lock Revalidation"
+ordinal = 4
+quote = "At minimum:"
+hash = "e5edf559e78d93abafaf60e0b3aa7d3a53c21aad097d861c2a7271a593c1a3d1"
+not_modelled = "explanatory text; the rule it explains is modelled in ordinal 5"
+
+[[unit]]
+heading = "# 99. Commit-Time Lock Revalidation"
+ordinal = 5
+quote = "operation still active"
+hash = "943c4f7712455cc7e43f2320289b8460f7d3cee1445a1d388a49cd453a860e9c"
+labels = ["S99_check"]
+not_modelled = "the model has no operation lock separate from the target lock, and no active/cancelled state machine; only the target-lock-still-owned check is modelled"
+
+[[unit]]
+heading = "# 99. Commit-Time Lock Revalidation"
+ordinal = 6
+quote = "\"Still owned\" means that every lock the operation holds (its operation"
+hash = "31df83790f4abb23d6ba5129ac3c61daa03598d1ce4f15169990baf4e29a55f0"
+labels = ["S99_check"]
+not_modelled = "the superseded/terminal-state/cancelled/PAUSED handling is not modelled; the model has no operation-state machine beyond crashed/holding"
+
+[[unit]]
+heading = "# 99. Commit-Time Lock Revalidation"
+ordinal = 7
+quote = "For atomic publication:"
+hash = "c3df57187f36f5698590bff7f48af764c34b549f6a16f591f473596c6c5b5250"
+not_modelled = "explanatory text; the rule it explains is modelled in ordinal 9"
+
+[[unit]]
+heading = "# 99. Commit-Time Lock Revalidation"
+ordinal = 8
+quote = "source validation"
+hash = "0ea229ac8a79977fe4f4f06e4f85f7115967c6caf0a765ef12c6aa201c008f3f"
+labels = ["S99_check", "S99_write"]
+not_modelled = "source validation and verification are not modelled; only lock revalidation and the mutating write itself are"
+
+[[unit]]
+heading = "# 99. Commit-Time Lock Revalidation"
+ordinal = 9
+quote = "must occur without an intervening operation-state transition that would"
+hash = "66adba884c02d049e499ed98b82220e4471ad6041e007c4c92df60a198053032"
+labels = ["S99_check", "S99_write"]
+
+[[unit]]
+heading = "## 240.1 Recovery Decision Order"
+ordinal = 1
+quote = "When a new invocation encounters an existing adjacent lock:"
+hash = "23816b198f6fd3e76bc8d1a74361218bd16bb4720ffc134de2802c15084a5495"
+not_modelled = "explanatory text; the rule it explains is modelled in ordinals 2 to 7"
+
+[[unit]]
+heading = "## 240.1 Recovery Decision Order"
+ordinal = 2
+quote = "1. inspect lock metadata"
+hash = "b93ff122c47c778d5e50631c71028d114087939cd500606e2fc6ba21d1dfddb1"
+labels = ["S240_1_open", "S240_1_read"]
+
+[[unit]]
+heading = "## 240.1 Recovery Decision Order"
+ordinal = 3
+quote = "2. identify owner instance"
+hash = "58bce9e92f71a0eb93f130a426866265ca639b5f93e7607697ea5681ca8d2c52"
+labels = ["S240_1_read"]
+
+[[unit]]
+heading = "## 240.1 Recovery Decision Order"
+ordinal = 4
+quote = "3. consult native lock/ownership mechanism"
+hash = "0702dcde5b8fee057d8e78c8894da5a4c6f877de46d01e002df0fbe413223d16"
+labels = ["S240_1_trylock", "S240_1_close"]
+
+[[unit]]
+heading = "## 240.1 Recovery Decision Order"
+ordinal = 5
+quote = "4. determine whether owner is demonstrably alive"
+hash = "690c8e69155f36bb139342655658dc0c9394c72f179896e64894e421df90112c"
+labels = ["S240_1_read"]
+
+[[unit]]
+heading = "## 240.1 Recovery Decision Order"
+ordinal = 6
+quote = "5. use lease age as a secondary recovery signal"
+hash = "24b3b7134a3ed14d37b4b1da3276a596d110fda658967340eef0313e9bd116ff"
+not_modelled = "the model does not represent lease age or heartbeat wall-clock time"
+
+[[unit]]
+heading = "## 240.1 Recovery Decision Order"
+ordinal = 7
+quote = "6. recover only when abandonment is sufficiently established"
+hash = "7fd46486d354a686b9b66e9d02758065ee59422c31f725fef6706c033e1472e4"
+labels = ["S21_1_decide", "S251_1_classify"]
+
+[[unit]]
+heading = "## 240.2 Live Owner"
+ordinal = 1
+quote = "If platform ownership information demonstrates that the owner is alive,"
+hash = "b9b3ec82d03302b08dd9224e25398dc02ee9f0465abe5b2590f2c7d916423d7d"
+not_modelled = "explanatory text; the rule it explains is modelled in ordinal 2"
+
+[[unit]]
+heading = "## 240.2 Live Owner"
+ordinal = 2
+quote = "TARGET_LOCK_BUSY"
+hash = "e6cd1eb36ed844ddcc1ba33b1a333886fdab8c16faa1c7d1769c82d151897b54"
+labels = ["S96_1_backoff", "S21_1_decide", "S251_1_classify", "S99_check"]
+
+[[unit]]
+heading = "## 240.2 Live Owner"
+ordinal = 3
+quote = "must be returned, reporting the recorded holder (Section 96.2)."
+hash = "5fe29fd6050ab53d3650eda3125d4d41e71fde47e7a03465d62d7d91b4e2c644"
+not_modelled = "report content is not checked, only that the refusal happens (design Section 3)"
+
+[[unit]]
+heading = "## 240.2 Live Owner"
+ordinal = 4
+quote = "A held native lock shows only that some process holds it."
+hash = "034b812a3976310c5edebdd729ad4b913787b56854d841c675bd32c8e4536b6a"
+labels = ["S240_1_read", "S96_1_ownlock_backoff"]
+
+[[unit]]
+heading = "## 240.2 Live Owner"
+ordinal = 5
+quote = "Flux must not steal the lock because the heartbeat happens to be old."
+hash = "31ff5a1ecafb043d7786484e3692891cc270f5aa982f48748ef6051c61ba9c83"
+not_modelled = "the model does not represent heartbeat wall-clock time; no heartbeat exists for the oracle to steal a lock on the basis of"
+
+[[unit]]
+heading = "## 240.3 Demonstrably Abandoned Owner"
+ordinal = 1
+quote = "If the platform can establish that the lock owner no longer exists and"
+hash = "7434336c24fb6a699e9d13c5c3a7228000b1c30b616fa3baf7ad38af2895a1a1"
+not_modelled = "explanatory text; the rule it explains is modelled in ordinals 3 to 8"
+
+[[unit]]
+heading = "## 240.3 Demonstrably Abandoned Owner"
+ordinal = 2
+quote = "Recovery, and cleanup, replace a dead owner's lock by moving it aside:"
+hash = "be7c7e1a36ce49848242bbe16353860f703963c05e3a6cdfa3037e26c1861937"
+not_modelled = "explanatory text; the rule it explains is modelled in ordinals 3 to 8"
+
+[[unit]]
+heading = "## 240.3 Demonstrably Abandoned Owner"
+ordinal = 3
+quote = "1. Re-read the lock. Proceed only if it still names the same dead owner."
+hash = "61bb2d7ef55be3e4463d8cbbaa3a4b1d013b3914cdbde21b553a2228004c81a9"
+labels = ["S240_3_s1", "S240_1_trylock"]
+
+[[unit]]
+heading = "## 240.3 Demonstrably Abandoned Owner"
+ordinal = 4
+quote = "2. Rename the lock file to `<lock-name>.broken.<new-operation-id>` beside"
+hash = "e8d13629a8dc33fe71827d42669a38edb023d7fb2ec8ce12b8e18acb9f66d342"
+labels = ["S240_3_s2"]
+
+[[unit]]
+heading = "## 240.3 Demonstrably Abandoned Owner"
+ordinal = 5
+quote = "3. Check that the moved file is the one step 1 re-read, by file identity"
+hash = "c6cbf42fd4595558098f61e290871a814adb47abcaf435b52e44c2fe6f17e7f9"
+labels = ["S240_3_s3", "S240_3_putback"]
+
+[[unit]]
+heading = "## 240.3 Demonstrably Abandoned Owner"
+ordinal = 6
+quote = "4. Create its own lock exclusively and take its OS-native lock (Section"
+hash = "09188902f8126011c3941f4cb6da6102774e7bd8d8a69a81f2f299b792117c6d"
+labels = ["S240_3_s4", "S240_3_s4_lock", "S240_3_s4_record_begin", "S240_3_s4_record_end", "S240_3_s4_drop", "S240_3_s4_lock_backoff"]
+
+[[unit]]
+heading = "## 240.3 Demonstrably Abandoned Owner"
+ordinal = 7
+quote = "5. Delete the moved file."
+hash = "fc709e99b5a5552bc7a1b7934e7ecdd1836e0da04c5535bbdd712688efa35e61"
+labels = ["S240_3_s5", "S240_3_release"]
+
+[[unit]]
+heading = "## 240.3 Demonstrably Abandoned Owner"
+ordinal = 8
+quote = "The lock path is empty between steps 2 and 4. That is harmless because"
+hash = "e1bff23c02855c1e99446a3ccbfc3d7372e7c984b849597a88e65803680a6edd"
+labels = ["S240_3_s2", "S240_3_restart"]
+not_modelled = "the empty-lock-path race window is not checked as its own property (TLC's exhaustive interleaving already explores it); a moved file's later discovery by an independent cleanup run scanning for `<lock-name>.broken.*` is not modelled, since Cleanups here classifies only the lock path itself"
+
+[[unit]]
+heading = "## 240.4 Uncertain Ownership"
+ordinal = 1
+quote = "If Flux cannot distinguish:"
+hash = "959fc200cb81c78aef4b8f83af62e15a20d60a0766586c4ef26541257879a166"
+not_modelled = "explanatory text; the rule it explains is modelled in ordinal 6"
+
+[[unit]]
+heading = "## 240.4 Uncertain Ownership"
+ordinal = 2
+quote = "dead owner"
+hash = "f832a9f58eb3dcb62a4579dfc4d53bd63d92c69734a196e44f28f178240ffd8a"
+not_modelled = "explanatory text; the rule it explains is modelled in ordinal 6"
+
+[[unit]]
+heading = "## 240.4 Uncertain Ownership"
+ordinal = 3
+quote = "from:"
+hash = "061b2401cd835a21c538f175bbcd22cea3c1d627d7e3c26ee7809d6e214cc519"
+not_modelled = "explanatory text; the rule it explains is modelled in ordinal 6"
+
+[[unit]]
+heading = "## 240.4 Uncertain Ownership"
+ordinal = 4
+quote = "alive but stalled owner"
+hash = "542d9a303ac7c8cd9ffdcee2d38ec36ff9ef649a5028b4dfa2a775f345e3063f"
+not_modelled = "explanatory text; the rule it explains is modelled in ordinal 6"
+
+[[unit]]
+heading = "## 240.4 Uncertain Ownership"
+ordinal = 5
+quote = "then:"
+hash = "c8f18e1ae902a4da80bf08f0dc1291f0fce36910dcaac8cea698d63b77e690f0"
+not_modelled = "explanatory text; the rule it explains is modelled in ordinal 6"
+
+[[unit]]
+heading = "## 240.4 Uncertain Ownership"
+ordinal = 6
+quote = "TARGET_LOCK_UNCERTAIN"
+hash = "a243bd62abc761d1d6df7c2a0d58b355f42532722474ac6a8c57311e5665e7f2"
+labels = ["S21_1_decide", "S251_1_classify"]
+
+[[unit]]
+heading = "## 240.4 Uncertain Ownership"
+ordinal = 7
+quote = "must be reported, with the holder (Section 96.2) where the lock record"
+hash = "687af2e2bd87cd16b814fe18fe671aeb7f4510810e3aa473542f500279c75af0"
+not_modelled = "report content is not checked, only that the refusal happens (design Section 3)"
+
+[[unit]]
+heading = "## 240.4 Uncertain Ownership"
+ordinal = 8
+quote = "The safe default is to preserve the artifacts."
+hash = "6d1cbef3b17ba3e5888ccbfa72673cfa0dd77e34275ae5d5e9a5caedfa6234db"
+labels = ["S240_3_s2"]
+
+[[unit]]
+heading = "## 240.4 Uncertain Ownership"
+ordinal = 9
+quote = "Explicit operator-directed recovery is `--break-lock` (Section 240.5)."
+hash = "970013469d41bdcd7cf20f101f4b1bdea5dfbd9b90806eee6b2a849e87405e24"
+pending = ["breaklock"]
+
+[[unit]]
+heading = "## 240.5 `--break-lock`"
+ordinal = 1
+quote = "`--break-lock` is valid with `flux copy --restart` and `flux cleanup"
+hash = "d47e0ddecc9bcc066308a74e08a6caa155397355d9cdcac06994cf067c7d46b8"
+pending = ["breaklock", "cleanup"]
+
+[[unit]]
+heading = "## 240.5 `--break-lock`"
+ordinal = 2
+quote = "Before acting, Flux reports the recorded holder's `owner_instance_id`,"
+hash = "f22d8b340430bb74f8be8ea1ba502cac9594dab13247f5d7b2002647d3c1ed8c"
+pending = ["breaklock", "cleanup"]
+
+[[unit]]
+heading = "## 240.5 `--break-lock`"
+ordinal = 3
+quote = "1. The destination must provide strong file identity (Section 107) and"
+hash = "c308f74a8c0205d8817f6a1f4993396f1602fd7acc22dc94ba8d2f278dcc6987"
+pending = ["breaklock", "cleanup"]
+
+[[unit]]
+heading = "## 240.5 `--break-lock`"
+ordinal = 4
+quote = "2. Open the existing lock file for writing, without creating it."
+hash = "775b080a7d1c13db6034705bc86423c0b75895359f22c3d8ab35c6e96bac6c37"
+pending = ["breaklock", "cleanup"]
+
+[[unit]]
+heading = "## 240.5 `--break-lock`"
+ordinal = 5
+quote = "3. Take the OS-native lock on it without waiting."
+hash = "2bd2c5a7696da8c554795161fc23488b7376cca423ec40fb7493eaf79616711e"
+pending = ["breaklock", "cleanup"]
+
+[[unit]]
+heading = "## 240.5 `--break-lock`"
+ordinal = 6
+quote = "4. Check that the open file is still the one at the lock path"
+hash = "6ab81361b3232eb80c9a7ee1ab8101fba4fdb0a1f71b340068169f85dfb29cbb"
+pending = ["breaklock", "cleanup"]
+
+[[unit]]
+heading = "## 240.5 `--break-lock`"
+ordinal = 7
+quote = "5. Read the record. If it names a live owner, refuse with"
+hash = "6faace063b28fb5eb49d0848d9ba04e343206ed00a267b53cb92f794918f6060"
+pending = ["breaklock", "cleanup"]
+
+[[unit]]
+heading = "## 240.5 `--break-lock`"
+ordinal = 8
+quote = "6. Overwrite the record in place with this operation's record in one"
+hash = "f0c9e42611e7803ca44a5f1ef7476ffd9c09fbf347f8536a37592d135b039e14"
+pending = ["breaklock", "cleanup"]
+
+[[unit]]
+heading = "## 240.5 `--break-lock`"
+ordinal = 9
+quote = "An open, read, write, or flush that fails for another reason (an I/O or"
+hash = "06d1056ee655dfb4ea0209ed822013e645d9052547e04524f380b44f324a74ae"
+pending = ["breaklock", "cleanup"]
+
+[[unit]]
+heading = "## 240.5 `--break-lock`"
+ordinal = 10
+quote = "deletes the artifacts, then deletes its lock while still holding"
+hash = "52371dded6c24af0b747547e79588aabd8a7dad6f4b49c8cb1496012b1308a54"
+labels = ["S251_1_delete", "S251_1_close"]
+pending = ["cleanup", "cleanup-crash"]
+
+[[unit]]
+heading = "## 240.5 `--break-lock`"
+ordinal = 11
+quote = "A prior owner that was only stalled starts nothing more: its next lock"
+hash = "0d064cba024bbd4490bfe5f4009f68915a9386c3fa0add879a11aeb619ccae5d"
+pending = ["breaklock", "cleanup"]
+
+[[unit]]
+heading = "## 240.5 `--break-lock`"
+ordinal = 12
+quote = "`--break-lock` is not a resume-compatibility option (Section 121)."
+hash = "dd895089ef2caf845bb1f65d69e70a501c8be0e03f595cbc4cbcca6e3c83dabf"
+not_modelled = "usage/CLI compatibility-flag interaction, not lock-acquisition behavior; Section 121 is outside the model's scope"
+
+[[unit]]
+heading = "## 240.5 `--break-lock`"
+ordinal = 13
+quote = "------------------------------------------------------------------------"
+hash = "f985f00990171ff0b2aa0d821f0d8b318c31a218c72238c01c2306e768b8dc30"
+not_modelled = "document separator, no content"
+
+[[unit]]
+heading = "## 251.1 Default Cleanup"
+ordinal = 1
+quote = "flux cleanup DEST"
+hash = "416365222687a2205aad9af2badf91618d4d65fe113a87201d434bb3dcdc1a73"
+not_modelled = "invocation syntax; the rule it introduces is modelled in ordinal 6"
+
+[[unit]]
+heading = "## 251.1 Default Cleanup"
+ordinal = 2
+quote = "performs, without recursing into subdirectories of `DEST`:"
+hash = "d1fc09be43679b3b7916dd75a8d328be80f2b57526e8e2a3b82ae8032eef8551"
+not_modelled = "the model does not represent DEST-wide scanning of multiple operations/standalone/atomic directories; it models classification and recovery of one target's lock"
+
+[[unit]]
+heading = "## 251.1 Default Cleanup"
+ordinal = 3
+quote = "DEST/.flux/operations/       directory operations whose destination root is DEST"
+hash = "0e7c2c21481cc7667685142576a8e2dd182d74e18b9c8d77c4edd5070ffe248d"
+not_modelled = "the model does not represent DEST-wide scanning of multiple operations/standalone/atomic directories; it models classification and recovery of one target's lock"
+
+[[unit]]
+heading = "## 251.1 Default Cleanup"
+ordinal = 4
+quote = "Each workspace found under `P/.flux/atomic/<target-key>/` is classified"
+hash = "f9f50d6e1a3814ff1e3dbdd5cb59b031f76860aebc5c3bfece3ee0471b82a211"
+not_modelled = "the model does not represent DEST-wide scanning of atomic-staging workspaces"
+
+[[unit]]
+heading = "## 251.1 Default Cleanup"
+ordinal = 5
+quote = "For a filesystem-root DEST (Section 96.1), cleanup also inspects"
+hash = "9ebdb6f69c09ae23fd89cde2619b78a4dcb04fce8b5fdd02e4e0f816931dec2a"
+not_modelled = "the root lock is not modelled (the same exclusive creation at a different path, which adds no interleaving to an abstract lock path)"
+
+[[unit]]
+heading = "## 251.1 Default Cleanup"
+ordinal = 6
+quote = "A directory operation's root lock (`P/<DEST-name>.flux-lock`,"
+hash = "244b12f2be36a1fa34db6c3436f7db46ff1463dff303cbe41b07b390c893b2fd"
+labels = ["S251_1_classify"]
+
+[[unit]]
+heading = "## 251.1 Default Cleanup"
+ordinal = 7
+quote = "The `DEST` argument is required unless `--target PATH` is given"
+hash = "3115a27859fdedff57ddd5fcbc67433bdd5ce069c2f86fa1d0c985917d043ee5"
+not_modelled = "CLI argument validation, not lock-acquisition behavior"
+
+[[unit]]
+heading = "## 251.1 Default Cleanup"
+ordinal = 8
+quote = "For each standalone catalog entry:"
+hash = "49b74809bb4b1fed6b965465ce6a54d93a927e4e8e0f8a877b21bfbf0ddd2c6c"
+not_modelled = "explanatory text; the rule it explains is modelled in ordinal 9"
+
+[[unit]]
+heading = "## 251.1 Default Cleanup"
+ordinal = 9
+quote = "locate target parent"
+hash = "a6b54855ab7f9d013c5a094e7f54882164409993c01bf200174f42f478faeb9f"
+labels = ["S251_1_classify"]
+not_modelled = "locating the target parent, inspecting adjacent artifacts, and validating artifact/target identity are not modelled; only lock/lease ownership validation and classification are"
+
+[[unit]]
+heading = "## 251.1 Default Cleanup"
+ordinal = 10
+quote = "The expected adjacent artifacts are the target's lock (`P/<name>.flux-lock`,"
+hash = "0ef18bbaf5d90ec074591b35344a0d2b6492d229df07f31835dca6b2f94db84c"
+not_modelled = "artifact inventory (state, partial files); the model represents only the lock object, not separate state or partial files"
+
+[[unit]]
+heading = "## 251.1 Default Cleanup"
+ordinal = 11
+quote = "Classification (the only cleanup status names; Section 131 uses them"
+hash = "1b8edcc170488d90f0c27dd74a71e87d758c50b16f5256f982554d7563911697"
+not_modelled = "explanatory text; the rule it explains is modelled in ordinal 12"
+
+[[unit]]
+heading = "## 251.1 Default Cleanup"
+ordinal = 12
+quote = "| `LIVE` | a live owner holds the operation or target lock |"
+hash = "c47af13bc14ebb029cdebb95d249aef77355a55c917b12e751dedeee9e7ab237"
+labels = ["S251_1_classify"]
+not_modelled = "RESUMABLE, COMPLETED_BUT_UNCLEAN, and CORRUPT are not modelled; the model has no operation-state machine and does not distinguish a corrupt record from an uncertain one"
+
+[[unit]]
+heading = "## 251.1 Default Cleanup"
+ordinal = 13
+quote = "Eligibility for deletion is a separate marker, not a status."
+hash = "ccb4b7bbd5611e9ce98e9c87894d2d6a70a9cd0ee43b74ec251bad3ea7ab1d70"
+labels = ["S251_1_classify"]
+not_modelled = "the eligibility marker, --force/RESUMABLE bypass, and deletion of eligible artifacts beyond the lock itself are not modelled"
+
+[[unit]]
+heading = "## 251.1 Default Cleanup"
+ordinal = 14
+quote = "A standalone catalog record whose target has no lock, state, or partial"
+hash = "27b155ef2ad4527b5ed918f5148d0511661c2549eefc5b59dec2489640b57ef7"
+not_modelled = "the model has no separate standalone catalog record and does not represent the acquire-recheck-delete-release orphan-record deletion flow; Cleanups here classifies and clears only the lock object it already finds"
+
+[[unit]]
+heading = "## 259.6 Directory Target Lock Representation"
+ordinal = 1
+quote = "For directory target `T`, let `P` be its parent."
+hash = "5e97c37a3264f76ff16bea0737de7c4a57bc9459196598b9a29da27ce5bf8cb1"
+not_modelled = "duplicates 96.1's own naming rule, which is modelled there"
+
+[[unit]]
+heading = "## 259.6 Directory Target Lock Representation"
+ordinal = 2
+quote = "P/<T-name>.flux-lock"
+hash = "9af149181710f368a9a01f9d79b88e29eff2694e0452e4df8620bb1c33e81efc"
+not_modelled = "duplicates 96.1's own naming rule, which is modelled there"
+
+[[unit]]
+heading = "## 259.6 Directory Target Lock Representation"
+ordinal = 3
+quote = "Its complete key `K`, recorded in the lock, consists of the physical identity"
+hash = "bf99812eb349c071bc6fd51d2b1dbc1231aa538899dba6334e5f5c06babf68f6"
+not_modelled = "the model's lock record is an abstract (process, kind) pair; it does not represent the complete key K or FluxPathKey encoding"
+
+[[unit]]
+heading = "## 259.6 Directory Target Lock Representation"
+ordinal = 4
+quote = "The lock record must include:"
+hash = "5c15880f164dae9f330f80fda2f4135e1bcdab186ef54e43ae1e0e8095708563"
+not_modelled = "the model's lock record does not represent these individual fields; see ordinal 5"
+
+[[unit]]
+heading = "## 259.6 Directory Target Lock Representation"
+ordinal = 5
+quote = "format_version"
+hash = "a171f1aedb60595b630ab528324cc7f95052a05f3070ecf7532498b4fe98ca54"
+not_modelled = "the model's lock record is an abstract (process, kind) pair; it does not carry these individual fields"
+
+[[unit]]
+heading = "## 259.6 Directory Target Lock Representation"
+ordinal = 6
+quote = "The lock file's name is not ownership proof; the record inside it is validated"
+hash = "bb6a1a1e5940b86ec78dd72f9b04a22de1b701cda846f3ae93fd4ba87e6f9d70"
+labels = ["S240_1_read", "S99_check"]
+
+[[unit]]
+heading = "## 259.6 Directory Target Lock Representation"
+ordinal = 7
+quote = "The record is written in one write call, padded to the fixed size its"
+hash = "40a98e75c154e19fce3f1b9f9ea3bb6dfb88ee6c8b4e0c28276c50b33bc5ff2b"
+labels = ["S240_1_read"]
+not_modelled = "the one-write-call/padding/checksum computation is not modelled; the model instead represents tearing directly via a two-phase write with a Torn ghost content value"
+
+[[unit]]
+heading = "## 259.6 Directory Target Lock Representation"
+ordinal = 8
+quote = "Every target lock uses this record, including a lock that `flux cleanup`"
+hash = "ced0c6cbef847a6fdc71739c903fd844c4f0a1dec2b10dc2ccef54937675aadf"
+labels = ["S96_1_record_begin", "S96_1_record_end", "S21_1_decide"]
+
+[[unit]]
+heading = "## 259.6 Directory Target Lock Representation"
+ordinal = 9
+quote = "An OS-native lock may be held on the lock file for liveness, with"
+hash = "fa964beebe944a0a590f45d6c1f65f0ae8b8f2435dc3ac740153867b4dd58e2d"
+labels = ["S96_1_ownlock", "S240_1_trylock"]
+
+[[unit]]
+heading = "## 259.6 Directory Target Lock Representation"
+ordinal = 10
+quote = "If the required target lock cannot be established, destination mutation must not proceed."
+hash = "9cd5145d31ffda58fba3933509c649796b522d33f972cbe01bdd389adedf260f"
+labels = ["S96_1_backoff", "S96_1_ownlock_backoff", "S99_check"]
+
+[[heading]]
+heading = "# 21. Resume Discovery"
+family = "21"
+count = 1
+not_modelled = "container heading; its own text carries no rule beyond the 21.1 subsection modelled here"
+
+[[heading]]
+heading = "# 96. Destination Target Locks"
+family = "96"
+count = 1
+not_modelled = "container heading; its own text carries no rule beyond the 96.1 and 96.2 subsections modelled here"
+
+[[heading]]
+heading = "## 99.1 Weak Filesystem Identity and Target Locks"
+family = "99"
+count = 1
+pending = ["mixed"]
+
+[[heading]]
+heading = "# 240. Adjacent Lock Staleness and Liveness"
+family = "240"
+count = 1
+not_modelled = "container heading; its own text carries no rule beyond its 240.1-240.5 subsections"
+
+[[heading]]
+heading = "# 251. `flux cleanup` Discovery Rules"
+family = "251"
+count = 1
+not_modelled = "container heading; its own text carries no rule beyond the 251.1 subsection modelled here"
+
+[[heading]]
+heading = "## 251.2 Explicit Target Cleanup"
+family = "251"
+count = 1
+pending = ["cleanup", "dirlock"]
+
+[[heading]]
+heading = "## 251.3 No Filesystem-Wide Artifact Hunt"
+family = "251"
+count = 1
+not_modelled = "a prohibition on unbounded filesystem traversal; the model has no such traversal to prohibit, only a fixed abstract lock path"
+
+[[heading]]
+heading = "## 251.4 Missing Catalog Entry"
+family = "251"
+count = 1
+not_modelled = "the standalone catalog record is not modelled; the model has no catalog to be missing an entry from"
+
+[[heading]]
+heading = "## 259.7 Weak Filesystem Identity"
+family = "259"
+count = 1
+pending = ["mixed"]
+
+[[heading]]
+heading = "## 259.8 Commit Recovery With Weak Identity"
+family = "259"
+count = 1
+pending = ["claims"]
+
+[[heading]]
+heading = "# 259. V15 Normative Closure Revision"
+family = "259"
+count = 1
+not_modelled = "container heading; a V15 closure-revision umbrella outside the lock-protocol model's scope"
+
+[[heading]]
+heading = "## 259.1 ExecutionState Versus TopologyState"
+family = "259"
+count = 1
+not_modelled = "the ExecutionState/TopologyState distinction is outside the lock-protocol model's scope"
+
+[[heading]]
+heading = "## 259.2 Retry Budget and Canonical Materialization"
+family = "259"
+count = 1
+not_modelled = "retry budget and canonical materialization are outside the lock-protocol model's scope"
+
+[[heading]]
+heading = "## 259.3 Source `.flux` Semantics"
+family = "259"
+count = 1
+not_modelled = "source .flux semantics are outside the lock-protocol model's scope"
+
+[[heading]]
+heading = "## 259.4 WAL Backpressure and Lock Ordering"
+family = "259"
+count = 1
+not_modelled = "WAL backpressure and cross-WAL lock ordering are outside the lock-protocol model's scope"
+
+[[heading]]
+heading = "## 259.5 Concurrent Capacity Reservation"
+family = "259"
+count = 1
+not_modelled = "concurrent capacity reservation is outside the lock-protocol model's scope"
+
+[[heading]]
+heading = "## 259.9 `--atomic=always`: Existing Versus New Directory"
+family = "259"
+count = 1
+not_modelled = "--atomic=always directory-replacement behavior is outside the lock-protocol model's scope"
+
+[[heading]]
+heading = "## 259.10 Atomic Directory Staging"
+family = "259"
+count = 1
+not_modelled = "atomic directory staging is outside the lock-protocol model's scope"
+
+[[heading]]
+heading = "## 259.11 Symlink Failure"
+family = "259"
+count = 1
+not_modelled = "symlink failure handling is outside the lock-protocol model's scope"
+
+[[heading]]
+heading = "## 259.12 Cleanup and Orphan Safety"
+family = "259"
+count = 1
+not_modelled = "cleanup_pending and orphan-workspace collection criteria (Section 222) are outside the lock-protocol model's scope; the model clears only the lock object itself"
+
+[[heading]]
+heading = "## 259.13 Normative Precedence"
+family = "259"
+count = 1
+not_modelled = "normative precedence between spec sections is outside the lock-protocol model's scope"
+
+[[heading]]
+heading = "## 259.14 V15 Acceptance Tests"
+family = "259"
+count = 1
+not_modelled = "V15 acceptance-test enumeration is outside the lock-protocol model's scope"
+
+[[heading]]
+heading = "## 259.15 V15 Implementation Baseline"
+family = "259"
+count = 1
+not_modelled = "the V15 implementation baseline is outside the lock-protocol model's scope"

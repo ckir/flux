@@ -60,6 +60,25 @@ hooks:
 changelog:
     git-cliff --output CHANGELOG.md
 
+# --- Lock-protocol model check (docs/superpowers/specs/2026-09-11-lock-protocol-model-check-design.md)
+# Needs Java 11+ and Python 3.11+; not part of `just check`. See models/lockproto/README.md.
+
+python := env_var_or_default("PYTHON", "python3")
+
+# Run the model check: every scenario, or one (`just model selftest`), optionally one platform
+# (`just model recovery posix`)
+model scenario="" platform="":
+    {{python}} models/lockproto/run.py {{ if scenario == "" { "" } else { "--scenario " + scenario } }} {{ if platform == "" { "" } else { "--platform " + platform } }}
+
+# Unit tests of the model runner (Python only, no Java)
+model-test:
+    {{python}} -W error -m unittest discover -s models/lockproto -p "test_*.py"
+
+# Rewrite trace.toml's unit hashes; runs the whole model check first and stops if it fails
+model-stamp:
+    {{python}} models/lockproto/run.py
+    cargo test --test model_stamp -- --ignored rewrite_unit_hashes --exact
+
 # Mutation testing over the engine
 mutants:
     cargo mutants --package flux-core
