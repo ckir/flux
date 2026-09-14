@@ -27,8 +27,10 @@ SingleWriter == Cardinality({p \in Procs : checked[p]}) <= 1
 \* uncertain, and creates a lock only at an empty lock path (Section 7).
 PlainNeverOwnsUncertain == ~touchedUncertain
 
-\* A `Foreign` object at a lock path is never written, renamed, or deleted (Section 7).
-ForeignUntouched == ~touchedForeign
+\* A `Foreign` object at a lock path is never written, renamed, or deleted (Section 7): the one an initial
+\* state holds is still the object at the lock path and still holds Foreign. A state predicate, so no
+\* misplaced ghost can make it vacuous.
+ForeignUntouched == foreignObj # NoObj => LockObj = foreignObj /\ fs.content[foreignObj] = Foreign
 
 \* A REGRESSION GUARD, not a liveness check. TARGET_LOCK_BUSY means the target's lock is held, not that
 \* its recorded owner is alive (240.2): a held OS-native lock cannot tell the owner from another
@@ -39,8 +41,10 @@ ForeignUntouched == ~touchedForeign
 \* it saw has changed: the refusal rests on what the classifier observed, not on a re-read.
 RefusalJustified == \A p \in Procs : refused[p] = "TARGET_LOCK_BUSY" => refusedOk[p]
 
-\* The two ghost witnesses, for the witness run.
+\* The ghost witnesses, for the witness runs.
 NeverTornRead == ~tornRead
+\* A process passed its Section 99 check, so SingleWriter's ghost is set (design Section 7).
+NeverChecked == \A p \in Procs : ~checked[p]
 NeverRecoveredAfterCrash == ~recoveredAfterCrash
 \* A host crash changed which object the lock path names: an unflushed create, move-aside or removal
 \* was undone. Label coverage cannot show this, because the host crash shares `env_loop` with the

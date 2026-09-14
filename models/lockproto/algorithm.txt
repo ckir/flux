@@ -9,7 +9,10 @@
      \* process it kills (Section 5.2); the process itself then performs nothing further and ends at
      \* Done, which is what keeps TLC's deadlock check meaningful.
      variables
-       fs = FsInit,                              \* the filesystem (FsModel.tla)
+       \* The filesystem (FsModel.tla). A run starts from an empty lock path, or from one holding an object
+       \* that is not a Flux lock record, which no actor ever writes (design Section 7, ForeignUntouched).
+       fs \in {FsInit, FsWith(P, LockName, Foreign)},
+       foreignObj = At(fs, P, LockName),         \* ghost: that Foreign object, or NoObj
        classified = [p \in Procs |-> "none"],     \* ghost: each process's last judgement
        ownerLive = [p \in Procs |-> "none"],      \* what it decided about the record's owner
        sawLive = [p \in Procs |-> FALSE],         \* its classification found a live owner
@@ -22,7 +25,6 @@
        tornRead = FALSE,                          \* witness: a process read a torn record
        hostCrashChangedLock = FALSE,              \* witness: a host crash changed what is at the lock path
        touchedUncertain = FALSE,                  \* a lock judged uncertain was mutated
-       touchedForeign = FALSE,                    \* a Foreign object was mutated
        refusedOk = [p \in Procs |-> FALSE],       \* the refusal below was justified
        refused = [p \in Procs |-> "none"];        \* what a refusing actor reported
 
@@ -36,11 +38,17 @@
        BusyJustified == /\ LockObj # NoObj
                         /\ IsRecord(fs.content[LockObj])
                         /\ ~crashed[fs.content[LockObj].op]
-       ForeignAtLock == LockObj # NoObj /\ fs.content[LockObj] = Foreign
+       \* The evidence a TARGET_LOCK_BUSY refusal rests on, recorded by every refusing label through this
+       \* one definition, so SEED_DEAD_AS_BUSY guards all of them (design Section 7, RefusalJustified).
+       RefusalEvidence(p) == BusyJustified \/ sawLive[p]
+       \* The actor's judgement was uncertain: a torn or empty record, or an owner the oracle cannot judge.
+       JudgedUncertain(p) == classified[p] = "uncertain" \/ ownerLive[p] = "uncertain"
        \* A lock this actor may replace through 240.3: a dead owner's operation lock, or a cleanup
-       \* lock whose owner is dead (251.1, 259.6).
+       \* lock whose owner is dead (251.1, 259.6). The two seeds re-introduce the defects of design Section 8.
        Replaceable(p) == \/ classified[p] = "dead"
                          \/ (classified[p] = "cleanuplock" /\ ownerLive[p] = "dead")
+                         \/ (SEED_RECOVER_UNCERTAIN /\ JudgedUncertain(p))
+                         \/ (SEED_RECOVER_FOREIGN /\ classified[p] = "foreign")
        \* The states the liveness properties are about, and the two state witnesses (Section 7).
        DeadOwnerLock == /\ LockObj # NoObj
                         /\ IsRecord(fs.content[LockObj])
@@ -168,7 +176,7 @@
          \* On a conflict the acquirer removes what it created and reports TARGET_LOCK_BUSY (96.1).
          if (crashed[self]) { goto acquire_crashed; }
          else {
-           refusedOk[self] := BusyJustified \/ sawLive[self];
+           refusedOk[self] := RefusalEvidence(self);
            with (c \in FsUnlinkChoices) { fs := FsUnlink(fs, P, LockName, c).fs; };
            refused[self] := "TARGET_LOCK_BUSY";
            return;
@@ -204,8 +212,7 @@
          \* start the acquisition again (240.3 step 2).
          if (crashed[self]) { goto recover_crashed; }
          else {
-           if (classified[self] = "uncertain") { touchedUncertain := TRUE; };
-           if (ForeignAtLock) { touchedForeign := TRUE; };
+           if (JudgedUncertain(self)) { touchedUncertain := TRUE; };
            with (r = FsRenameNoReplace(fs, P, LockName, BrokenOf(self))) {
              if (r.ok) { fs := r.fs; } else { goto S240_3_restart; };
          };
@@ -305,7 +312,7 @@
            if (StillOwned(self)) { checked[self] := TRUE; }
            else {
              checked[self] := FALSE;
-             refusedOk[self] := BusyJustified \/ sawLive[self];
+             refusedOk[self] := RefusalEvidence(self);
              refused[self] := "TARGET_LOCK_BUSY";
              holding[self] := FALSE;
              return;
@@ -359,14 +366,16 @@
        S21_1_decide:
          if (crashed[self]) { goto plain_end; }
          else {
-           refusedOk[self] := BusyJustified \/ sawLive[self];
+           refusedOk[self] := RefusalEvidence(self);
            if (classified[self] = "empty") { goto plain_acquire; }
            else if (Replaceable(self) /\ classified[self] = "cleanuplock") {
              \* A cleanup lock names no resumable operation (259.6), so a dead one is removed as 240.3
              \* describes and this invocation proceeds (21.1).
              goto plain_recover;
            }
-           else if (classified[self] = "live") { refused[self] := "TARGET_LOCK_BUSY"; }
+           else if (classified[self] = "live" \/ (SEED_DEAD_AS_BUSY /\ classified[self] = "dead")) {
+             refused[self] := "TARGET_LOCK_BUSY";
+           }
          else if (classified[self] = "uncertain" \/ ownerLive[self] = "uncertain") {
            refused[self] := "TARGET_LOCK_UNCERTAIN";
          }
@@ -404,7 +413,7 @@
        rec_decide:
          if (crashed[self]) { goto rec_end; }
          else {
-           refusedOk[self] := BusyJustified \/ sawLive[self];
+           refusedOk[self] := RefusalEvidence(self);
            if (Replaceable(self)) { goto rec_recover; }
            else if (classified[self] = "empty") { goto rec_acquire; }
            else if (classified[self] = "uncertain" \/ ownerLive[self] = "uncertain") {
@@ -439,7 +448,7 @@
        S251_1_classify:
          if (crashed[self]) { goto clean_end; }
          else {
-           refusedOk[self] := BusyJustified \/ sawLive[self];
+           refusedOk[self] := RefusalEvidence(self);
            if (Replaceable(self)) { goto clean_recover; }
            else if (classified[self] = "empty") { refused[self] := "NOTHING_TO_CLEAN"; }
            else if (classified[self] = "foreign") { refused[self] := "CONTROL_PLANE_NAMESPACE_CONFLICT"; }
