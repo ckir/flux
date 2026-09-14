@@ -13,7 +13,7 @@ module = "LockProtocol"
 config = "configs/recovery-posix-hostcrash-check.cfg"
 scenario = "recovery"
 kind = "check"
-constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = true, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = true, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false }
 symmetry = { definition = "RecovererPerms", over = "Recoverers" }
 unreached = [
     { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
@@ -28,7 +28,7 @@ module = "LockProtocol"
 config = "configs/recovery-posix-hostcrash-plain-check.cfg"
 scenario = "recovery"
 kind = "check"
-constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = ["p1"], Cleanups = [], Breakers = [], MaxObjs = 4, MaxCrashes = 2, HostCrashes = true, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
+constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = ["p1"], Cleanups = [], Breakers = [], MaxObjs = 4, MaxCrashes = 2, HostCrashes = true, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false }
 unreached = [
     { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
     { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record under a running Recoverer, which needs a lapsed lease; mixed-remote reaches it" },
@@ -45,7 +45,7 @@ module = "LockProtocol"
 config = "configs/recovery-posix-hostcrash-cleanup-check.cfg"
 scenario = "recovery"
 kind = "check"
-constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = [], Cleanups = ["c1"], Breakers = [], MaxObjs = 5, MaxCrashes = 2, HostCrashes = true, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
+constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = [], Cleanups = ["c1"], Breakers = [], MaxObjs = 5, MaxCrashes = 2, HostCrashes = true, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false }
 unreached = [
     { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
     { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record under a running Recoverer, which needs a lapsed lease; mixed-remote reaches it" },
@@ -59,7 +59,7 @@ module = "LockProtocol"
 config = "configs/recovery-posix-hostcrash-plain-cleanup-check.cfg"
 scenario = "recovery"
 kind = "check"
-constants = { Owners = ["o1"], Recoverers = [], PlainRuns = ["p1"], Cleanups = ["c1"], Breakers = [], MaxObjs = 6, MaxCrashes = 2, HostCrashes = true, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = ["p1"], Cleanups = ["c1"], Breakers = [], MaxObjs = 6, MaxCrashes = 2, HostCrashes = true, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false }
 unreached = [
     { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
     { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record under a running Recoverer, which needs a lapsed lease; mixed-remote reaches it" },
@@ -72,7 +72,7 @@ module = "LockProtocol"
 config = "configs/recovery-windows-hostcrash-check.cfg"
 scenario = "recovery"
 kind = "check"
-constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = true, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = true, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false }
 symmetry = { definition = "RecovererPerms", over = "Recoverers" }
 unreached = [
     { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
@@ -87,7 +87,7 @@ module = "LockProtocol"
 config = "configs/recovery-windows-hostcrash-plain-check.cfg"
 scenario = "recovery"
 kind = "check"
-constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = ["p1"], Cleanups = [], Breakers = [], MaxObjs = 4, MaxCrashes = 2, HostCrashes = true, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
+constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = ["p1"], Cleanups = [], Breakers = [], MaxObjs = 4, MaxCrashes = 2, HostCrashes = true, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false }
 unreached = [
     { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
     { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record under a running Recoverer, which needs a lapsed lease; mixed-remote reaches it" },
@@ -104,7 +104,7 @@ module = "LockProtocol"
 config = "configs/recovery-windows-hostcrash-cleanup-check.cfg"
 scenario = "recovery"
 kind = "check"
-constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = [], Cleanups = ["c1"], Breakers = [], MaxObjs = 5, MaxCrashes = 2, HostCrashes = true, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
+constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = [], Cleanups = ["c1"], Breakers = [], MaxObjs = 5, MaxCrashes = 2, HostCrashes = true, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false }
 unreached = [
     { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
     { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record under a running Recoverer, which needs a lapsed lease; mixed-remote reaches it" },
@@ -118,7 +118,7 @@ module = "LockProtocol"
 config = "configs/recovery-windows-hostcrash-plain-cleanup-check.cfg"
 scenario = "recovery"
 kind = "check"
-constants = { Owners = ["o1"], Recoverers = [], PlainRuns = ["p1"], Cleanups = ["c1"], Breakers = [], MaxObjs = 6, MaxCrashes = 2, HostCrashes = true, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false }
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = ["p1"], Cleanups = ["c1"], Breakers = [], MaxObjs = 6, MaxCrashes = 2, HostCrashes = true, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false }
 unreached = [
     { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
     { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record under a running Recoverer, which needs a lapsed lease; mixed-remote reaches it" },

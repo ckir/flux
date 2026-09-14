@@ -38,6 +38,10 @@
        BusyJustified == /\ LockObj # NoObj
                         /\ IsRecord(fs.content[LockObj])
                         /\ ~crashed[fs.content[LockObj].op]
+       \* The destination provides OS-native locks (235.1): every lock attempt is conditional on it, as
+       \* 96.1 and 240.3 step 4 put it. Under `weak` 235.1 refuses first, so only SEED_NO_CAPABILITY_GATE
+       \* ever runs a protocol step without them.
+       LocksAvailable == LockCapability # "weak"
        \* The object of the one lock-file handle a process holds, or NoObj. A holder of the target lock
        \* has exactly one open handle at the points that use this (after a takeover or a recovery).
        HandleObj(p) == IF \E h \in fs.handles : h.proc = p
@@ -159,9 +163,11 @@
          \* A classifier can open the file just created and take its lock before this step does.
          if (crashed[self]) { goto acquire_crashed; }
          else {
-           with (r = FsTryLock(fs, self, obj)) {
-             if (r.ok) { fs := r.fs; }
-             else { goto S96_1_ownlock_wait; };
+           if (LocksAvailable) {
+             with (r = FsTryLock(fs, self, obj)) {
+               if (r.ok) { fs := r.fs; }
+               else { goto S96_1_ownlock_wait; };
+             };
          };
          };
        S96_1_ownlock_verify:
@@ -274,9 +280,11 @@
          \* acquirer's do (a reading, recorded in trace.toml): never through a second lookup of the path.
          if (crashed[self]) { goto recover_crashed; }
          else {
-           with (r = FsTryLock(fs, self, nobj)) {
-             if (r.ok) { fs := r.fs; }
-             else { goto S240_3_s4_lock_wait; };
+           if (LocksAvailable) {
+             with (r = FsTryLock(fs, self, nobj)) {
+               if (r.ok) { fs := r.fs; }
+               else { goto S240_3_s4_lock_wait; };
+             };
          };
          };
        S240_3_s4_lock_verify:
@@ -373,7 +381,7 @@
          \* Strong file identity and OS-native locks, decided from the capability, never by a trial lock.
          if (crashed[self]) { goto takeover_crashed; }
          else {
-           if (IdentityStrength # "strong" \/ LockCapability \notin {"strong", "remote"}) {
+           if (IdentityStrength # "strong" \/ (LockCapability \notin {"strong", "remote"} /\ ~SEED_NO_CAPABILITY_GATE)) {
              refused[self] := "TARGET_LOCK_UNCERTAIN";
              return;
            };
@@ -392,12 +400,14 @@
          \* another takeover), and that failure is the refusal's evidence (240.2).
          if (crashed[self]) { goto takeover_crashed; }
          else {
-           with (r = FsTryLock(fs, self, tobj)) {
-             if (r.ok) { fs := r.fs; }
-             else {
-               refusedOk[self] := fs.oslock[tobj] # NoProc \/ RefusalEvidence(self);
-               refused[self] := "TARGET_LOCK_BUSY";
-               goto S240_5_close;
+           if (LocksAvailable) {
+             with (r = FsTryLock(fs, self, tobj)) {
+               if (r.ok) { fs := r.fs; }
+               else {
+                 refusedOk[self] := fs.oslock[tobj] # NoProc \/ RefusalEvidence(self);
+                 refused[self] := "TARGET_LOCK_BUSY";
+                 goto S240_5_close;
+               };
              };
          };
          };
@@ -428,6 +438,18 @@
              };
              };
          };
+         };
+       S240_5_s6_seed:
+         \* SEED_RENAME_OVER_TAKEOVER (design Section 8): instead of overwriting in place, build this
+         \* operation's record under a private name and rename it over the lock.
+         if (crashed[self]) { goto takeover_crashed; }
+         else {
+           if (SEED_RENAME_OVER_TAKEOVER) {
+             with (r = FsCreate(fs, P, TakeoverName(self), self, TRUE)) {
+               if (r.ok) { fs := r.fs; goto S240_5_seed_write_begin; }
+               else { refused[self] := "RESTART"; goto S240_5_close; };
+             };
+           };
          };
        S240_5_s6_write_begin:
          \* Overwrite the record in place with this operation's record, in one write (259.6).
@@ -464,6 +486,26 @@
                return;
              };
          };
+         };
+       S240_5_seed_write_begin:
+         if (crashed[self]) { goto takeover_crashed; }
+         else {
+           fs := FsWriteBegin(fs, At(fs, P, TakeoverName(self))).fs;
+         };
+       S240_5_seed_write_end:
+         if (crashed[self]) { goto takeover_crashed; }
+         else {
+           fs := FsWriteEnd(fs, At(fs, P, TakeoverName(self)), OwnRecord(self)).fs;
+           seenRec[self] := OwnRecord(self);
+         };
+       S240_5_seed_rename:
+         \* The rename replaces the lock; the old file keeps its handles and its OS-native lock.
+         if (crashed[self]) { goto takeover_crashed; }
+         else {
+           with (r = FsRenameReplace(fs, P, TakeoverName(self), LockName)) {
+             if (r.ok) { fs := FsClose(r.fs, self, tobj).fs; holding[self] := TRUE; return; }
+             else { refused[self] := "RESTART"; goto S240_5_close; };
+           };
          };
        S240_5_close:
          if (crashed[self]) { goto takeover_crashed; }
@@ -542,8 +584,15 @@
      process (own \in Owners)
      {
        own_start:
-         live[self] := TRUE;
-         call Acquire();
+         if (LockCapability = "weak" /\ ~SEED_NO_CAPABILITY_GATE) {
+           \* 235.1: without verified OS-native locks, an operation needing target exclusivity refuses.
+           refused[self] := "REMOTE_LOCK_UNSAFE";
+           goto own_end;
+         }
+         else {
+           live[self] := TRUE;
+           call Acquire();
+         };
        own_publish:
          if (~crashed[self] /\ holding[self]) { call Publish(); };
        own_end:
@@ -554,8 +603,15 @@
      process (plain \in PlainRuns)
      {
        plain_start:
-         live[self] := TRUE;
-         call Classify(FALSE);
+         if (LockCapability = "weak" /\ ~SEED_NO_CAPABILITY_GATE) {
+           \* 235.1: without verified OS-native locks, an operation needing target exclusivity refuses.
+           refused[self] := "REMOTE_LOCK_UNSAFE";
+           goto plain_end;
+         }
+         else {
+           live[self] := TRUE;
+           call Classify(FALSE);
+         };
        S21_1_decide:
          if (crashed[self]) { goto plain_end; }
          else {
@@ -601,8 +657,15 @@
      process (rec \in Recoverers)
      {
        rec_start:
-         live[self] := TRUE;
-         call Classify(TRUE);
+         if (LockCapability = "weak" /\ ~SEED_NO_CAPABILITY_GATE) {
+           \* 235.1: without verified OS-native locks, an operation needing target exclusivity refuses.
+           refused[self] := "REMOTE_LOCK_UNSAFE";
+           goto rec_end;
+         }
+         else {
+           live[self] := TRUE;
+           call Classify(TRUE);
+         };
        rec_decide:
          if (crashed[self]) { goto rec_end; }
          else {
@@ -636,8 +699,15 @@
      process (clean \in Cleanups)
      {
        clean_start:
-         live[self] := TRUE;
-         call Classify(TRUE);
+         if (LockCapability = "weak" /\ ~SEED_NO_CAPABILITY_GATE) {
+           \* 235.1: without verified OS-native locks, an operation needing target exclusivity refuses.
+           refused[self] := "REMOTE_LOCK_UNSAFE";
+           goto clean_end;
+         }
+         else {
+           live[self] := TRUE;
+           call Classify(TRUE);
+         };
        S251_1_classify:
          if (crashed[self]) { goto clean_end; }
          else {
@@ -682,15 +752,25 @@
      process (brk \in Breakers)
      {
        brk_start:
-         live[self] := TRUE;
-         call Classify(TRUE);
+         if (LockCapability = "weak" /\ ~SEED_NO_CAPABILITY_GATE) {
+           \* 235.1: without verified OS-native locks, an operation needing target exclusivity refuses.
+           refused[self] := "REMOTE_LOCK_UNSAFE";
+           goto brk_end;
+         }
+         else {
+           live[self] := TRUE;
+           call Classify(TRUE);
+         };
        S21_1_restart_decide:
          if (crashed[self]) { goto brk_end; }
          else {
            refusedOk[self] := RefusalEvidence(self);
            if (Replaceable(self)) { goto brk_recover; }
            else if (classified[self] = "empty") { goto brk_acquire; }
-           else if (classified[self] = "uncertain") { goto brk_takeover; }
+           else if (classified[self] = "uncertain") {
+             \* SEED_MOVE_ASIDE_FOR_UNCERTAIN (design Section 8) moves the uncertain lock aside instead.
+             if (SEED_MOVE_ASIDE_FOR_UNCERTAIN) { goto brk_recover; } else { goto brk_takeover; };
+           }
            else if (ownerLive[self] = "uncertain") { refused[self] := "TARGET_LOCK_UNCERTAIN"; }
            else if (classified[self] = "foreign") { refused[self] := "CONTROL_PLANE_NAMESPACE_CONFLICT"; }
            else { refused[self] := "TARGET_LOCK_BUSY"; };
@@ -719,7 +799,9 @@
          \* handle that holds it, not through a second lookup of the path (a reading, recorded in trace.toml).
          if (crashed[self]) { goto brk_end; }
          else {
-           fs := FsWriteBegin(fs, HandleObj(self)).fs;
+           \* SEED_RESTART_RELEASES (design Section 8) releases the OS-native lock here first.
+           fs := FsWriteBegin(IF SEED_RESTART_RELEASES THEN FsUnlock(fs, self, HandleObj(self)).fs ELSE fs,
+                              HandleObj(self)).fs;
          };
        S21_1_s5_write_end:
          if (crashed[self]) { goto brk_end; }

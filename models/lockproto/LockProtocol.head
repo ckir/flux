@@ -25,7 +25,11 @@ CONSTANTS
     SEED_RECOVER_UNCERTAIN,
     SEED_DEAD_AS_BUSY,
     SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK,
-    SEED_ACQUIRER_UNLINKS_BY_NAME
+    SEED_ACQUIRER_UNLINKS_BY_NAME,
+    SEED_RESTART_RELEASES,
+    SEED_MOVE_ASIDE_FOR_UNCERTAIN,
+    SEED_RENAME_OVER_TAKEOVER,
+    SEED_NO_CAPABILITY_GATE
 
 Procs == Owners \cup Recoverers \cup PlainRuns \cup Cleanups \cup Breakers
 \* <lock-name>.broken.<operation-id> beside the lock (240.3 step 2). Only an actor that can move a
@@ -34,7 +38,10 @@ Procs == Owners \cup Recoverers \cup PlainRuns \cup Cleanups \cup Breakers
 \* (the `nested` scenario, which is about what gets written where, creates the object).
 Movers == Recoverers \cup PlainRuns \cup Cleanups \cup Breakers
 BrokenOf(p) == <<"broken", p>>
-Names == {LockName, DirLockName} \cup {BrokenOf(p) : p \in Movers}
+\* The private name SEED_RENAME_OVER_TAKEOVER's takeover builds its record under, before renaming it
+\* over the lock (design Section 8); only Breakers have one.
+TakeoverName(p) == <<"takeover", p>>
+Names == {LockName, DirLockName} \cup {BrokenOf(p) : p \in Movers} \cup {TakeoverName(p) : p \in Breakers}
 Dirs == {P}
 Fold == [n \in Names |-> n]          \* the recovery scenario needs no name folding
 

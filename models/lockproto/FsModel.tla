@@ -188,6 +188,19 @@ FsRenameNoReplace(fs, d, from, to) ==
                 !.past[d][ClassOf(to)] =
                     IF IdentityStrength = "weak" THEN @ \cup {o} ELSE @ ], o)
 
+\* Rename, replacing (design Section 5.1): atomically points the target at the source object whether or
+\* not the target existed; the replaced object keeps its open handles and loses its name. Windows needs
+\* delete sharing on every handle of both objects.
+FsRenameReplace(fs, d, from, to) ==
+    LET o == At(fs, d, from)
+        old == At(fs, d, to) IN
+    IF o = NoObj \/ ~DeleteAllowed(fs, o) \/ (old # NoObj /\ ~DeleteAllowed(fs, old)) THEN Fail(fs)
+    ELSE Ok([ fs EXCEPT
+                !.entries[d][ClassOf(from)] = NoObj,
+                !.entries[d][ClassOf(to)] = o,
+                !.past[d][ClassOf(to)] =
+                    IF IdentityStrength = "weak" THEN @ \cup {o} ELSE @ ], o)
+
 \* Unlink. POSIX always succeeds and the open handles keep the now-unnamed object (FS-5). Windows
 \* needs delete sharing on every handle, and then either removes the name at once or leaves it as a
 \* pending delete until the last handle closes: `atOnce` is that choice (FS-7).
