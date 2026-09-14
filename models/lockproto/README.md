@@ -99,9 +99,10 @@ kinds at once do not finish, so the check runs pair them, and each pairing is ex
 
 - Every run starts from an empty lock path or from one holding a `Foreign` object, which no actor writes, so
   `ForeignUntouched` has something to hold over. The empty start keeps the whole acquisition prefix.
-- Three seeded runs show the scenario's invariants can fail at all: `SEED_RECOVER_FOREIGN` must break
-  `ForeignUntouched`, `SEED_RECOVER_UNCERTAIN` `PlainNeverOwnsUncertain`, and `SEED_DEAD_AS_BUSY` (plain pairing)
-  `RefusalJustified` (design Section 8). `SingleWriter`'s seeds need actors of `mixed` and `breaklock`; here the
+- Four seeded runs show the scenario's invariants can fail at all: `SEED_RECOVER_FOREIGN` must break
+  `ForeignUntouched`, `SEED_RECOVER_UNCERTAIN` `PlainNeverOwnsUncertain`, `SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK`
+  (clean-up pairing) the same invariant through a cleanup lock whose owner is uncertain, and `SEED_DEAD_AS_BUSY`
+  (plain pairing) `RefusalJustified` (design Section 8). `SingleWriter`'s seeds need actors of `mixed` and `breaklock`; here the
   witness `NeverChecked` shows its ghost is set. Before the test audit of 2026-09-14 found this, deleting any of those
   ghosts left every run green.
 - `MaxCrashes = 2` in every run. With one crash, the path where a recovering actor itself crashes was unreachable,

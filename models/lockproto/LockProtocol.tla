@@ -21,7 +21,8 @@ CONSTANTS
     Platform, IdentityStrength, LockCapability,
     SEED_RECOVER_FOREIGN,    \* seeded defects (design Section 8); FALSE outside their seeded runs
     SEED_RECOVER_UNCERTAIN,
-    SEED_DEAD_AS_BUSY
+    SEED_DEAD_AS_BUSY,
+    SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK
 
 Procs == Owners \cup Recoverers \cup PlainRuns \cup Cleanups
 \* <lock-name>.broken.<operation-id> beside the lock (240.3 step 2). Only an actor that can move a
@@ -88,11 +89,13 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
        \* The actor's judgement was uncertain: a torn or empty record, or an owner the oracle cannot judge.
        JudgedUncertain(p) == classified[p] = "uncertain" \/ ownerLive[p] = "uncertain"
        \* A lock this actor may replace through 240.3: a dead owner's operation lock, or a cleanup
-       \* lock whose owner is dead (251.1, 259.6). The two seeds re-introduce the defects of design Section 8.
+       \* lock whose owner is dead (251.1, 259.6). The seeds re-introduce the defects of design Section 8.
        Replaceable(p) == \/ classified[p] = "dead"
                          \/ (classified[p] = "cleanuplock" /\ ownerLive[p] = "dead")
                          \/ (SEED_RECOVER_UNCERTAIN /\ JudgedUncertain(p))
                          \/ (SEED_RECOVER_FOREIGN /\ classified[p] = "foreign")
+                         \/ (SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK /\ classified[p] = "cleanuplock"
+                                                                /\ ownerLive[p] = "uncertain")
        \* The states the liveness properties are about, and the two state witnesses (Section 7).
        DeadOwnerLock == /\ LockObj # NoObj
                         /\ IsRecord(fs.content[LockObj])
@@ -569,8 +572,8 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "a75dc3f5" /\ chksum(tla) = "df90ed91")
-\* Procedure variable obj of procedure Classify at line 107 col 18 changed to obj_
+\* BEGIN TRANSLATION (chksum(pcal) = "5e34eb3b" /\ chksum(tla) = "4ddc5dd6")
+\* Procedure variable obj of procedure Classify at line 110 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
           live, holding, checked, recoveredAfterCrash, tornRead, 
@@ -598,6 +601,8 @@ Replaceable(p) == \/ classified[p] = "dead"
                   \/ (classified[p] = "cleanuplock" /\ ownerLive[p] = "dead")
                   \/ (SEED_RECOVER_UNCERTAIN /\ JudgedUncertain(p))
                   \/ (SEED_RECOVER_FOREIGN /\ classified[p] = "foreign")
+                  \/ (SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK /\ classified[p] = "cleanuplock"
+                                                         /\ ownerLive[p] = "uncertain")
 
 DeadOwnerLock == /\ LockObj # NoObj
                  /\ IsRecord(fs.content[LockObj])
