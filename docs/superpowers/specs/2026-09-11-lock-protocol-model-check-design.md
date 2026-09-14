@@ -213,7 +213,7 @@ Four rules keep the coverage check honest without making it lie:
   BUILT scenario covers but a planned one will. The model is built one scenario at a time (Section 12), and a
   procedure shared across scenarios carries branches whose state only a later scenario creates: `S96_1_backoff` needs
   the directory lock that only `dirlock` makes, and `S240_3_putback` needs an in-place record rewrite under a running
-  Recoverer, which only the Breaker's takeover in `mixed` or `mixed-remote` performs. `never_reached` is the wrong home for such a label, because it is reachable and keeps its
+  Recoverer, which only the Breaker's takeover in `mixed-remote` performs. `never_reached` is the wrong home for such a label, because it is reachable and keeps its
   traceability, so its `trace.toml` entries stay. `pending` (Section 9.1) is the wrong source too: it is a fact about
   a spec UNIT, which scenario still owes that unit labels, while the union needs a fact about a LABEL, and the two
   differ. 240.3 step 3 is fully modelled with no `pending`, yet its put-back branch waits for `breaklock`. The union
@@ -397,9 +397,10 @@ Constants: `Platform ∈ {"posix", "windows"}`; `Fold`, the name-equivalence map
 `LockCapability ∈ {"strong", "remote", "weak"}`, where `strong` stands for the spec's `LocalStrong`, `remote` for
 `RemoteStrong`, and `weak` for `RemoteUnverified` or `Unsupported` (Section 235.1). `strong` and `remote` behave the
 same except that under `remote` an environment step, `LeaseExpiry`, may clear the OS-native lock any live process holds (an owner, an acquirer inside 96.1, a classifier inside
-240.1, a Breaker inside its takeover), at most `MaxLeaseExpiries` times per run (1 in every plan-3 configuration),
-counted apart from crashes: the environment loop runs while either budget remains, and `EnvQuiet` holds only
-when both are spent or the environment has stopped, as a remote lock whose lease lapsed while its holder stalled does; the holder is not told and
+240.1, a Breaker inside its takeover), as a remote lock whose lease lapsed while its holder stalled does. It happens at most
+`MaxLeaseExpiries` times per run, 1 under `remote` and 0 under every other capability (so `recovery` and the strong
+scenarios keep plan 2's environment exactly), counted apart from crashes: the environment loop runs while either
+budget remains, and `EnvQuiet` holds only when both are spent or the environment has stopped; the holder is not told and
 keeps its handles. That is the stalled owner of Section 240.5 whose lock a takeover can win (owner ruling for plan 3,
 2026-09-14). A process crash still releases the lock under every capability. The spec states no lease: it implies
 a lock can be lost while its holder lives (240.3's "released or invalidated according to the platform's
@@ -683,12 +684,12 @@ ability to see that defect and the run fails.
 | `SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK` | a cleanup lock whose owner the oracle could not judge dead is moved aside through 240.3 (251.1 and 259.6 replace only a dead one); only the `ownerLive` half of `PlainNeverOwnsUncertain`'s judgement reports it | `recovery`, POSIX, Owner, Recoverer and Cleanup | `PlainNeverOwnsUncertain` |
 | `SEED_DEAD_AS_BUSY` | a plain rerun refuses a dead owner's lock with `TARGET_LOCK_BUSY` instead of `RESUMABLE_OPERATION_EXISTS` (21.1) | `recovery`, POSIX, Owner, Recoverer and PlainRun | `RefusalJustified` |
 | `SEED_RECOVERER_IDENTITY_ONLY` | 240.3 step 3 checks identity only, not the record (round 6, IMC-4) | `mixed-remote` | `SingleWriter` |
-| `SEED_EMPTY_PATH_BUSY` | 240.5 step 6 refuses when the lock path is empty instead of retrying (round 6, IMC-3) | `breaklock` | `RefusalJustified` |
-| `SEED_RESTART_RELEASES` | 21.1 step 5 releases the lock before the new operation starts (round 3) | `breaklock` | `SingleWriter` |
-| `SEED_MOVE_ASIDE_FOR_UNCERTAIN` | an uncertain owner's lock is moved aside, leaving the path empty (round 5) | `breaklock` | `PlainNeverOwnsUncertain` |
-| `SEED_RENAME_OVER_TAKEOVER` | takeover by renaming a new record over the lock (round 3) | `breaklock` | `SingleWriter` |
-| `SEED_NO_IDENTITY_RECHECK` | 240.5 step 6 skips its identity check after the write (round 6) | `breaklock` | `SingleWriter` |
-| `SEED_NO_CAPABILITY_GATE` | neither Section 235.1's refusal nor 240.5 step 1's capability check is applied, so operations and takeovers run with no OS-native lock and two Breakers are no longer serialized by it | `breaklock`, weak-capability variant | `SingleWriter` |
+| `SEED_EMPTY_PATH_BUSY` | 240.5 step 6 refuses when the lock path is empty instead of retrying (round 6, IMC-3) | `breaklock`, placed after the acquirer-window measurement (Sections 8, 11) | `RefusalJustified` |
+| `SEED_RESTART_RELEASES` | 21.1 step 5 releases the lock before the new operation starts (round 3) | `breaklock`, placed after the acquirer-window measurement (Sections 8, 11) | `SingleWriter` |
+| `SEED_MOVE_ASIDE_FOR_UNCERTAIN` | an uncertain owner's lock is moved aside, leaving the path empty (round 5) | `breaklock`, placed after the acquirer-window measurement (Sections 8, 11) | `PlainNeverOwnsUncertain` |
+| `SEED_RENAME_OVER_TAKEOVER` | takeover by renaming a new record over the lock (round 3) | `breaklock`, placed after the acquirer-window measurement (Sections 8, 11) | `SingleWriter` |
+| `SEED_NO_IDENTITY_RECHECK` | 240.5 step 6 skips its identity check after the write (round 6) | `breaklock`, placed after the acquirer-window measurement (Sections 8, 11) | `SingleWriter` |
+| `SEED_NO_CAPABILITY_GATE` | neither Section 235.1's refusal nor 240.5 step 1's capability check is applied, so operations and takeovers run with no OS-native lock and two Breakers are no longer serialized by it | `breaklock`, weak-capability variant, placed after the acquirer-window measurement (Sections 8, 11) | `SingleWriter` |
 | `SEED_CLEANUP_LOCK_UNVERIFIABLE` | Section 120 rejects `workspace_path = none` (round 6) | `cleanup-crash` | `DeadLockEventuallyCleared` |
 | `SEED_TORN_AS_FOREIGN` | a checksum-failing record is treated as a foreign object (round 5); `mixed` has both a record torn by the Owner's crash and a Breaker, the only actor that can clear it | `mixed` | `UncertainLockEventuallyCleared` |
 | `SEED_NO_ANCESTOR_CHECK` | 97.1 (a) skipped | `nested` | `NestedExclusion` |
@@ -722,7 +723,10 @@ rename, which plan 2's `FsModel.tla` lacks and plan 3 adds, and `SEED_RESTART_RE
 plan 3 models as its own record rewrite (Section 6.1). The other `breaklock` seeds are placed once the acquirer window of Section 11 is measured: if `breaklock` then
 carries an open finding on `SingleWriter` or `RefusalJustified`, the seeds on that invariant cannot run there.
 `SEED_EMPTY_PATH_BUSY` and `SEED_NO_IDENTITY_RECHECK` need the path emptied during a takeover, which under `strong`
-only that acquirer window does, so after its spec fix they belong to `breaklock-remote`.
+only that acquirer window does; under `remote` a lease-expired owner's release unlink does too, but
+`breaklock-remote` is expected to carry the check-to-call window on `SingleWriter` and possibly an empty-path
+refusal on `RefusalJustified`, either of which would block them there as well. Their home is therefore the owner's
+decision once both findings are measured (as for `SEED_RECOVERER_IDENTITY_ONLY` in `mixed-remote`).
 
 A seeded run whose "must fail" entry is a liveness property is still a `seeded` run (its `violated` names the property),
 checked with the liveness settings: TLC checks the scenario's temporal properties, run
@@ -967,8 +971,8 @@ reached only by a plain rerun that finds a dead CLEANUP lock, which only a Clean
 leaves behind; no other pairing covers them. Together the four cover every label of the scenario's actors except
 `S96_1_backoff`, the 96.1 directory-lock conflict that belongs to `dirlock`, and `S240_3_putback`, which needs a
 record rewritten in place by a 240.5 takeover under a running Recoverer; both are `unreached` entries in all
-four. `breaklock` runs no Recoverer, so the takeover that reaches `S240_3_putback` can only come from `mixed`, and
-its `deferred` entry names `mixed` (owner ruling for plan 3, 2026-09-14).
+four. `breaklock` runs no Recoverer, so the takeover that reaches `S240_3_putback` can only come from `mixed-remote`, and
+its `deferred` entry names `mixed-remote` (owner ruling for plan 3, 2026-09-14).
 
 Pairing moves work onto the `unreached` lists, and those lists are per run. A label an actor of the run owns but
 this pairing cannot reach must be listed in THAT run's entry with its reason, even though another pairing covers it:
@@ -1081,8 +1085,15 @@ carry `SingleWriter`'s seeds. The owner's rulings for it, made after a gap analy
 - The Breaker classifies before 240.5, closing on uncertain and keeping the lock on dead, and recovers a dead owner's
   lock through 240.3 (Section 6.1).
 - Seeds by scenario: `SEED_TORN_AS_FOREIGN` in `mixed`; `SEED_RECOVERER_IDENTITY_ONLY` in `mixed-remote`; the six
-  `breaklock` seeds after the acquirer window is measured (Sections 8 and 11). `S240_3_putback` is owed to `mixed`,
-  where two crashes (the Owner, then a Breaker after its step-6 write) may reach it, and to `mixed-remote` otherwise.
+  `breaklock` seeds after the acquirer window is measured (Sections 8 and 11). `S240_3_putback` is owed to `mixed-remote`:
+  under `strong` a Recoverer holds its OS-native lock from classification to put-back, so only a lease expiring on it
+  lets a Breaker rewrite the record underneath.
+- Decided during building and recorded in `trace.toml`, as plan 2 did: the takeover that ends a prior owner's tenure
+  for `SingleWriter`'s exception is the Breaker's step-6 write, when the prior owner's record-based check first fails;
+  after `LeaseExpiry` the holder's `holding` stays true (it is not told) and no refusal evidence reads the OS-native
+  lock; the remote scenarios run without symmetry, since they have no liveness run, and pair if four actors do not fit.
+- The first run built and measured is `breaklock-posix-check` under 96.1 as written: its counterexample for the
+  acquirer window decides the spec fix, the open findings `breaklock` carries, and the seeds' homes.
 - `breaklock-remote` and `mixed-remote` carry the witnesses of their strong scenarios but no liveness run: a lease
   budget is a second source of lost progress that the conditioned properties do not model.
 - Liveness is in scope, POSIX only, without symmetry: `UncertainLockEventuallyCleared` in `mixed`, and in `breaklock`
