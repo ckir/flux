@@ -1049,8 +1049,8 @@ an open finding.
 Host crashes form their own tier. With `HostCrashes = TRUE` the four POSIX pairings exhaust with no violation, but
 their state spaces are 10 to 14 times those without. Measured on CI after the fix to torn empty files in Section
 5.2, each with its per-run coverage gate passing on the same `unreached` lists as its process-crash counterpart:
-Owner and two Recoverers 13,331,133 distinct states; with a PlainRun 22,750,053; with a Cleanup 12,148,827; PlainRun
-and Cleanup 10,652,055. The owner
+Owner and two Recoverers 13,365,123 distinct states; with a PlainRun 22,816,212; with a Cleanup 12,214,986; PlainRun
+and Cleanup 10,718,214 (re-measured 2026-09-14 with the `Foreign` start state of Section 7). The owner
 ruled that per-pull-request CI keeps the process-crash runs and a separate tier, `expected-extended.toml` (Section 4),
 runs the host-crash pairings: nightly, on request, and on a labelled pull request. What that stops proving on an
 ordinary pull request is stated plainly: a change that relies on an unflushed write or entry operation being durable
@@ -1060,7 +1060,7 @@ run of its own, the witness `NeverHostCrashChangedLock`, which stops once a host
 lock path names.
 
 The tier also carries the four Windows host-crash pairings, measured on CI with no violation and their coverage gates
-passing: 16,959,639 / 28,314,300 / 16,046,736 / 13,700,391 distinct states. The Windows job took 49m56s against
+passing: 16,993,629 / 28,380,459 / 16,112,895 / 13,766,550 distinct states (re-measured 2026-09-14). The Windows job took 49m56s against
 POSIX's 40m00s, and the two jobs run in parallel. The POSIX host-crash runs, timed twice, took 523-558, 847-907,
 462-481 and 414-448 seconds. The owner kept the Windows pairings against the peer's recommendation to drop them. The
 peer's argument: a host crash releases every handle, and objects it leaves without a name cannot be opened, so the
