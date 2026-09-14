@@ -903,9 +903,9 @@ clean (2026-09-12, `MaxCrashes = 2`):
 | `recovery-<platform>-cleanup-check` | Owner, Recoverer, Cleanup | 5 | 1,199,193 / 1,709,754 | two movers of different kinds, both entitled to move the lock aside |
 | `recovery-<platform>-plain-cleanup-check` | Owner, PlainRun, Cleanup | 6 | 1,067,868 / 1,471,158 | the plain rerun's own 240.3 path, which needs a dead cleanup lock |
 
-Counts are as measured on CI on 2026-09-14, after the `Foreign` start state of Section 7 was added (it adds under 2% to
-each run); the note that follows is from 2026-09-13, after the acquirer rule of spec 96.1 and 240.3 step 4 became unconditional in
-the model; each state space is about a fifth smaller than before it, because an actor that cannot take its OS-native
+Counts are as measured on CI on 2026-09-14, with the `Foreign` start state of Section 7, which adds under 2% to each
+run. Before that, on 2026-09-13, the acquirer rule of spec 96.1 and 240.3 step 4 became unconditional in the model,
+and each state space shrank by about a fifth, because an actor that cannot take its OS-native
 lock now removes its file and stops instead of carrying on.
 
 The fourth run carries no Recoverer deliberately. `plain_recover`, `plain_recovered` and `plain_recovered_done` are
