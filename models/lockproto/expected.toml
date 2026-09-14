@@ -341,18 +341,16 @@ timeout_minutes = 30
 
 # Breaklock scenario (design Section 12, plan 3): a StalledOwner (under strong capability, an Owner that may crash)
 # and two Breakers racing to take over the same uncertain lock. Built first, with spec 96.1 as written, to measure
-# the acquirer window of design Section 11; timeout_minutes is provisional until measured on CI.
+# the acquirer window of design Section 11. MEASUREMENT (owner ruling 2026-09-14): the check run showed the window on
+# RefusalJustified but TLC aborted printing traces; this halting run asks whether it also breaks SingleWriter, without
+# symmetry. It passes if SingleWriter is violated; a clean exhaustion is the other answer.
 
 [[run]]
-name = "breaklock-posix-check"
+name = "breaklock-posix-nosym-witness-SingleWriter"
 module = "LockProtocol"
-config = "configs/breaklock-posix-check.cfg"
+config = "configs/breaklock-posix-nosym-witness-SingleWriter.cfg"
 scenario = "breaklock"
-kind = "check"
+kind = "witness"
+violated = ["SingleWriter"]
 constants = { Owners = ["o1"], Recoverers = [], PlainRuns = [], Cleanups = [], Breakers = ["b1", "b2"], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false }
-symmetry = { definition = "BreakerPerms", over = "Breakers" }
-unreached = [
-    { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
-    { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record under a running Recoverer, which needs a lapsed lease; mixed-remote reaches it" },
-]
-timeout_minutes = 60
+timeout_minutes = 90
