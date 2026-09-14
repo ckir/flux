@@ -97,6 +97,13 @@ kinds at once do not finish, so the check runs pair them, and each pairing is ex
 | `recovery-<platform>-cleanup-check` | Owner, Recoverer, Cleanup | two movers of different kinds, both entitled to move the lock aside | 1,174,383 / 1,684,944 |
 | `recovery-<platform>-plain-cleanup-check` | Owner, PlainRun, Cleanup | the plain rerun's own 240.3 path, which needs a dead cleanup lock | 1,043,058 / 1,446,348 |
 
+- Every run starts from an empty lock path or from one holding a `Foreign` object, which no actor writes, so
+  `ForeignUntouched` has something to hold over. The empty start keeps the whole acquisition prefix.
+- Three seeded runs show the scenario's invariants can fail at all: `SEED_RECOVER_FOREIGN` must break
+  `ForeignUntouched`, `SEED_RECOVER_UNCERTAIN` `PlainNeverOwnsUncertain`, and `SEED_DEAD_AS_BUSY` (plain pairing)
+  `RefusalJustified` (design Section 8). `SingleWriter`'s seeds need actors of `mixed` and `breaklock`; here the
+  witness `NeverChecked` shows its ghost is set. Before the test audit of 2026-09-14 found this, deleting any of those
+  ghosts left every run green.
 - `MaxCrashes = 2` in every run. With one crash, the path where a recovering actor itself crashes was unreachable,
   so a second crash is what the crash-inside-recovery interleavings need.
 - `MaxObjs` (3 to 6, one per actor) cannot bind. Every actor makes at most one exclusive create, and
