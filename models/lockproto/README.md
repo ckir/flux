@@ -116,7 +116,7 @@ kinds at once do not finish, so the check runs pair them, and each pairing is ex
 - `HostCrashes = FALSE` in these runs, so only process crashes are explored here. Host crashes have their own
   slower tier, `expected-extended.toml`, run by `.github/workflows/model-extended.yml` nightly, on request, and on a
   pull request labelled `model-extended`. It holds the same four pairings with `HostCrashes = TRUE` on each platform.
-  They give 10.7 to 22.8 million distinct states each on POSIX and 13.7 to 28.3 million on Windows (design
+  They give 10.7 to 22.8 million distinct states each on POSIX and 13.8 to 28.4 million on Windows (design
   Section 12). The two platform jobs run in parallel and took about 40 and 50 minutes. A change that relies on an unflushed write or rename being durable
   therefore passes a pull request's checks, and this tier catches it afterwards. Label coverage cannot show that a
   host crash ran, so the per-pull-request suite keeps the witness `NeverHostCrashChangedLock`.
