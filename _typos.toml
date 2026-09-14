@@ -5,7 +5,7 @@ extend-exclude = [
     "target/",
     "Cargo.lock",
     # The engineering spec is a delivered document; do not rewrite it.
-    "FLUX_FULL_UPDATED_SPEC_V15.md",
+    "FLUX_FULL_UPDATED_SPEC_V16.md",
 ]
 
 [default]
