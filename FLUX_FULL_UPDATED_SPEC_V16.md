@@ -1,6 +1,7 @@
 # Flux --- Full Updated Engineering Specification
 
 **Project:** Flux\
+**Revision:** V16\
 **Status:** Implementation-ready architectural specification\
 **Language:** Rust\
 **Platforms:** Linux, macOS, Windows\
@@ -8,18 +9,420 @@
 
 ------------------------------------------------------------------------
 
-# V14 Normative Integration Notice
+# Revision Notice
 
-This V13 revision integrates the Architecture Review Panel
-protocol-completeness resolutions directly into the authoritative
-specification.
+This is revision **V16** of the specification.
 
-V13 resolves: 1. Section 222 --- deterministic orphaned
-operation-workspace collection predicates. 2. Section 218 --- exact
-durable location and lifecycle for `cleanup_pending` for isolated
-single-file transfers. 3. Section 206 --- normative default retry limit
-of 3 retries. 4. Section 113.1 --- precise trigger for subtracting
-reclaimed capacity from the Stage A running forecast.
+Revision history:
+
+-   **V13** integrated the Architecture Review Panel protocol-completeness
+    resolutions: Section 222 (deterministic orphaned operation-workspace
+    collection predicates), Section 218 (durable location and lifecycle
+    of `cleanup_pending` for isolated single-file transfers), Section 206
+    (normative default retry limit of 3 retries), and Section 113.1
+    (trigger for subtracting reclaimed capacity from the Stage A
+    forecast). Its invariants follow Section 256.
+-   **V14** closed scheduler, retry, and bounded-memory ambiguities in the
+    "V14 Normative Integration" section after Section 258.
+-   **V15** closed implementation-blocking ambiguities in Section 259;
+    its status is Section 260.
+-   **V16** resolves contradictions found in a full read of V15. Unlike
+    earlier revisions, V16 amends the affected sections **in place**, so
+    no section still states a superseded rule:
+    1.  Path ordering: `FluxPathKey` order is component-wise, encoded as
+        path components joined by `0x00` (Sections 2, 7, 70, 103, 241,
+        245).
+    2.  The single-file state artifact is named
+        `target.flux-state.<operation-id>` everywhere (Sections 18.1,
+        213, 214, 218, 220, 234, 239).
+    3.  `TopologyState` is payload-bearing and attempt-fenced, and
+        `Failed` is terminal (Sections 90, 91, 92, 123, 142, 147.2,
+        201--206, 253.3, 259.1, V14.3.1).
+    4.  Fallback materialization is limited to path-scoped failures and a
+        shared per-group retry budget; the failed canonical is linked to
+        the anchor; terminal failure waits until no further member can
+        appear (Sections 89, 152, 206, 207, 253, 256, 259.2).
+    5.  The standalone catalog lives in the target's parent directory,
+        and `flux cleanup` is non-recursive (Sections 24.4, 250, 251,
+        257, 258).
+    6.  Error-code names are unified, and Section 55 is the normative
+        error-code registry.
+    7.  Version labels are corrected, and options used elsewhere are
+        listed in Sections 5 and 60.
+    8.  Multiple source roots share one key space: each root maps to a
+        distinct destination prefix, keys are destination-relative, and
+        the manifest records one mapping per root (Sections 7.2, 18.3,
+        19, 103, 121).
+    9.  A run without `--resume` that finds a dead operation's resumable
+        state refuses with `RESUMABLE_OPERATION_EXISTS`; `--restart`
+        supersedes the prior operation and deletes its state before
+        copying (Sections 5, 19, 21.1, 22, 239.2, 249.3).
+    10. Target locks are files named after the target in its own parent
+        directory and created exclusively, so the destination filesystem's
+        own case and Unicode-form rules decide which spellings contend; the
+        hashed lock directory is removed (Sections 96, 96.1, 97, 99.1,
+        119, 220, 241.5, 250, 259.6).
+    11. Verification level and digest algorithm are separate options,
+        `--verify=<none|source-stream|destination|full>` and `--hash`, and
+        every level is defined (Sections 5, 32, 82).
+    12. `--links=skip` is defined: symlinks are not created and each is
+        reported as skipped (Sections 5, 124).
+    13. `--overwrite`, `--update`, and `--skip-existing` are defined and
+        mutually exclusive; overwrite is the default (Sections 5, 5.1).
+    14. `--dry-run` is read-only: no locks, workspace, catalog entry, or
+        destination change, and it is not resumable (Sections 5, 5.2).
+    15. The metadata policy is defined: explicitly requested metadata is
+        strict, default metadata is best-effort, and both report
+        `METADATA_APPLY_FAILED` (Sections 44.1, 55, 133).
+    16. Every operation state is described and marked resumable or
+        terminal; only `COMPLETED` and `ABANDONED` are terminal, and
+        pausing is never persisted (Sections 20, 21, 132, 222).
+    17. `flux cleanup` uses one set of status names, each defined, plus a
+        separate eligibility marker (Sections 60, 131, 251.1).
+    18. `DEST/.flux/` holds only `operations/` and `standalone/`, and every
+        workspace layout shows its `wal/` (Sections 18.2, 119, 145, 213,
+        220, 259.10).
+    19. Held dependents are persisted when discovered; the RAM hold index
+        is only a bounded cache (Sections 94, 232, V14.2.1).
+    20. `CheckpointMessage` carries `attempt_id` (Sections 158, 225).
+    21. `FsCapabilities` has one definition (Sections 62, 112).
+    22. `--durability` is a current option, not a future one (Sections 141,
+        165).
+    23. WAL segments live in `wal/` and are ordered by their records'
+        sequence numbers, never by file name (Sections 178, 194).
+    24. Every capacity state is defined with its outcome;
+        `CAPACITY_IMPOSSIBLE` ends in `FAILED_ATOMIC_CAPACITY` (Section
+        254).
+    25. Resume finds whole-tree atomic staging state through the
+        destination root's lock, which records the workspace path
+        (Sections 18, 21, 120, 259.6, 259.10).
+    26. Where each source lands is defined: a single folder is copied onto
+        `DEST`, a file goes into an existing folder, several sources go to
+        `DEST/<name>` (Sections 4.1, 18.3).
+    27. Resume compatibility covers every option that changes selection or
+        recorded outcomes; only `--retries` (up) and `--durability`
+        (normal to strict) may change, one way (Sections 19, 121).
+    28. `--resume` with no prior operation starts a new one (Section 21.1).
+    29. Dependent links have persisted states and an idempotent link
+        procedure that recovery re-runs (Sections 16.1, 147.3).
+    30. A single-file operation's target lock also serves as its operation
+        lock (Sections 89, 98, 239.1, 249.2).
+    31. Section 249.1 is the one full list of adjacent-state fields and
+        includes `artifact_type`; timestamps are `creation_wall_time`
+        (Sections 215, 239, 249.1, 259.6).
+    32. `FileIdentity` has one definition, including `generation`
+        (Sections 11, 242).
+    33. Section 17 no longer defines the racy lookup-then-insert
+        `TopologyStore`; it points to Section 91.
+    34. Source-root prefixes are checked for aliasing by the destination
+        filesystem through per-prefix locks (Sections 18.3, 96.1).
+    35. When the existing-destination policy skips a hardlink group's
+        canonical target, the next non-skipped member materializes the
+        group; Flux never links to an existing object it did not write
+        (Sections 5.1, 91, 142, 253.7).
+    36. Each directory publication state has a meaning and a recovery
+        action (Section 30.1).
+    37. Each `LockCapability` value is mapped to whether exclusive
+        operations are allowed or refused (Section 235.1).
+    38. `--dry-run` with `--resume` or `--restart` previews that
+        invocation without changing anything (Section 5.2).
+    39. The `CanonicalFailed` event field is `error_code` everywhere
+        (Sections 147.2, V14.3).
+    40. `HARDLINK_UNAVAILABLE` is produced for a member whose required
+        link cannot be created (Sections 15, 16.1, 55, 253.7).
+    41. Each retry category has defined behavior (Section 207).
+    42. The `OperationStateChanged` scheduler event is described in
+        Section 147.2.
+    43. The canonical-rule statements of Sections 8.1, 13, and 69 point to
+        the component-wise order of Section 7.2.
+    44. The Section 83 architecture diagram shows the workspace's `wal/`
+        and `checkpoints/`.
+    45. Report `relative_path` is destination-relative, including the root
+        prefix (Section 233.1).
+    46. The dependent link procedure first removes the operation's own
+        leftover temporary name (Section 16.1).
+    47. Records use one name per field: `complete_lock_key` and
+        `last_heartbeat_wall_time` (Sections 229.2, 250.1, 259.6).
+    48. `--links=follow` is marked as a future value in Section 5.
+    49. Destination aliasing between ordinary files is caught at
+        publication by no-replace renames and by recording which existing
+        entry each replacement resolves to (Sections 16.1, 30, 241.5).
+    50. Reflinked files are verified by construction under the default
+        levels and by hashing both sides under destination and full
+        (Sections 32, 39).
+    51. Hardlink groups cover regular files and symlink inodes; special
+        files are handled per entry (Sections 12.1, 72, 86, 259.11).
+    52. `--resume-verify` may change on resume; missing digests upgrade
+        validation to `full` (Sections 121, 211).
+    53. `flux verify` is defined: read-only comparison of SOURCE and DEST
+        under the copy mapping (Sections 4.2, 46, 55).
+    54. `TopologyState` gains the terminal `Skipped` state for an
+        all-skipped group, with `mark_skipped` and `AlreadySkipped`
+        (Sections 90, 91, 142, 147.3, 201, 253.3, 253.5, V14.4).
+    55. Section 239.1 points to Section 249.2's single-file lifecycle
+        instead of restating it without the catalog steps.
+    56. Per-prefix locks apply only with multiple roots (Section 18.3).
+    57. `--dry-run --restart` previews the refusal a real `--restart`
+        would get (Section 5.2).
+    58. `TransferAction` has a `CreateSymlink` variant (Section 45).
+    59. Wording: catalog field names are snake_case (Section 250.1);
+        Stage A never delays the first transfer (Section 113); the lock
+        key `K` uses `T`'s final name, not the destination-relative key
+        (Sections 250, 259.6).
+    60. A directory target lock's recorded `workspace_path` is trusted only
+        if it equals one of the two paths derivable from the lock's own
+        target and `operation_id`; this tightens item 25 (Sections 120,
+        259.6).
+    61. The standalone catalog record's `artifact_names` field is
+        informational; cleanup and GC derive each artifact name from the
+        record's target and operation_id instead (Section 250.1).
+    62. Default `flux cleanup DEST` also inspects, non-recursively,
+        `P/.flux/atomic/<target-key>/` for whole-tree atomic staging
+        workspaces (Sections 24.4, 60, 251.1, 259.10).
+    63. `flux cleanup --target PATH` also inspects `P/.flux-dir.lock`
+        when the Section 96.1 fallback applies to that target (Section
+        251.2).
+    64. Section 249.1's list now includes `cleanup_pending` and
+        `cleanup_pending_artifacts` (required by Section 218), completing
+        item 31 (Sections 218, 249.1).
+    65. A standalone catalog record left with no artifacts by a crash
+        between Section 250.3's steps 3 and 4 is an orphan; default
+        cleanup classifies it `STALE` and deletes it under the target
+        lock (Sections 250.3, 251.1).
+    66. Nested destination roots are defined: a new directory operation
+        refuses with `TARGET_LOCK_BUSY` if a live root lock exists on an
+        ancestor of its destination, and a writer refuses path-scoped
+        writes under an existing directory whose own root lock a live
+        operation holds; that is a `lock_conflict`, so a hardlink
+        candidate there moves on without spending attempt budget
+        (Sections 97.1, 253.2).
+    67. Operator-directed recovery is defined as `--break-lock`: valid
+        with `--restart` or `flux cleanup --target`, it overrides only
+        uncertain ownership, never a live owner or missing or corrupt
+        state (Sections 5, 21.1, 60, 240.5, 251.1, 252.4).
+    68. `flux cleanup` reports every row and every deletion regardless of
+        `--force`, with no interactive prompt; `--dry-run` classifies and
+        reports without deleting or locking; `--target`, `--dry-run`, and
+        `--force` are no longer future options (Sections 24.4, 60).
+    69. A target lock for a filesystem-root DEST is defined:
+        `T/.flux-root.lock`, created exclusively inside `T`; and
+        `--atomic=always` against a root DEST is refused with
+        `ATOMIC_DIRECTORY_REPLACE_UNSUPPORTED` (Sections 4.2, 96.1, 259.3,
+        259.9).
+    70. A `TARGET_LOCK_BUSY`, `OPERATION_LOCKED`, or `TARGET_LOCK_UNCERTAIN`
+        refusal reports the holder's identity, boot session, workspace
+        path, and last heartbeat where the lock record is readable
+        (Section 96.2).
+    71. Exit codes are normative: 0 success (including degraded `auto`
+        outcomes), 1 action failure or verify mismatch, 2 usage error, 3
+        whole-operation refusal before anything changed; a refusal scoped
+        to some paths only (for example Section 97.1(b)) exits 1
+        (Section 55).
+    72. Defaults are stated for `--atomic` (auto), `--durability`
+        (normal), `--resume-verify` (chunks), and mount-boundary crossing
+        (off unless `--cross-filesystems`); Section 5's option list
+        annotates the default for `--hardlinks`, `--reflink`, `--sparse`,
+        `--atomic`, `--resume-verify`, and `--durability` (Sections 5, 27,
+        36, 42, 165).
+    73. `--sparse=always` and `--reflink=always` have failure codes:
+        `SPARSE_UNAVAILABLE` when the destination cannot hold holes,
+        `REFLINK_UNAVAILABLE` when no reflink can be created; the sparse
+        verification digest is over logical bytes for all three
+        `--sparse` modes (Sections 38, 39, 55).
+    74. On Windows, Flux uses extended-length paths (`\\?\`) for every
+        filesystem call, so the legacy 260-character limit never applies;
+        a path the destination still refuses as too long fails that
+        action with `DESTINATION_ERROR` (Sections 105, 207).
+    75. `chunk_size` is fixed at 1 MiB, not configurable, and recorded in
+        the manifest; a file of N bytes has `ceil(N / chunk_size)`
+        chunks. A manifest recording a different `chunk_size` is
+        `INCOMPATIBLE_STATE` (Sections 121, 136).
+    76. `flux verify` adds an `unreadable` outcome (either side could not
+        be read or hashed); exit status is 1 when anything is missing,
+        mismatched, or unreadable (Section 4.2).
+    77. `DISK_FULL` is named where it is produced: a destination write
+        that fails for lack of space outside Section 254's atomic
+        capacity states (Section 29). `IO_ERROR`, `PERMISSION_DENIED`,
+        and `DESTINATION_ERROR` are used only when no more specific code
+        applies (Section 55).
+    78. Capacity waits are visible: the progress display shows the count
+        of actions waiting for capacity and the bytes short, and each
+        action is logged at `warn` when it enters `CAPACITY_WAIT` or
+        `CAPACITY_BLOCKED` (Sections 52, 254.1).
+    79. `files verified` counts only files whose destination bytes were
+        compared with the source digest (`destination` or `full`
+        verify level); `--json`'s complete field list adds
+        `files_verified`, `files_mismatched`, `files_failed`,
+        `files_overwritten`, `bytes_skipped`, `verify_level`, and
+        `hash_algorithm` (Sections 51, 53).
+    80. Wording and registry fixes: the `destination`/`full` re-read opens
+        the written file anew, never a kept write buffer (Sections 32,
+        135); `--hash` accepts only `blake3` in this version, any other
+        value is a usage error (Section 5); `CONTROL_PLANE_NAMESPACE_CONFLICT`'s
+        "Defined in" lists exactly 96.1 and 259.3 (Section 55); the term
+        is "candidate stale lock" throughout (Sections 240, 252); the
+        `SYMLINK_CREATION_UNAVAILABLE` report names the required Windows
+        privilege or policy (Section 127); `--heartbeat-interval` and
+        `--lease-timeout` in the freely-changeable resume list are marked
+        when implemented (Section 121); a single-file operation's
+        `relative_path` is the target's file name (Section 233.1).
+    81. Any WAL write failure Section 189 lists — disk full, I/O error,
+        permission failure, or filesystem corruption — enters the
+        emergency persistence path, not only `ENOSPC` (Sections 189,
+        231.3, 236, 237, 238).
+    82. Flux must establish the emergency control-space reserve before
+        transfer; where the filesystem cannot guarantee that later writes
+        into the reserved file succeed, the reserve counts as
+        unavailable, Flux warns at start, and a subsequent WAL failure
+        ends in `CONTROL_STATE_DURABILITY_FAILURE` (Sections 231.1,
+        231.2, 231.5).
+    83. `DIRECTORY_CHANGED_DURING_SCAN` has one outcome: the directory's
+        subtree is not transferred, the error is reported, and the
+        operation exits 1. There is no configured mutation policy or
+        rescan alternative (Section 149.4).
+    84. `FsCapabilities` is determined per filesystem — for `reflink` and
+        `hardlink`, per source/destination filesystem pair — and a value
+        measured for one root is never applied to a root on another
+        filesystem, as Section 196 already required for durability
+        capabilities (Section 62).
+    85. Attempt retention is defined: attempt records are kept for the
+        life of the operation workspace; once a newer attempt starts, the
+        superseded attempt's chunk checkpoints may be discarded, since a
+        new attempt never resumes from a failed attempt's chunks (Section
+        226).
+    86. Flux sets no deadline on filesystem calls; a blocking call blocks
+        the work waiting on it, and a killed process recovers through
+        `--resume` (Section 189).
+    87. `--atomic=always` replacing an existing directory publishes
+        exactly the selected source tree: entries present only at the
+        destination are removed with the old tree. For a folder source,
+        `--update` or `--skip-existing` together with `--atomic=always`
+        is a usage error (exit 2), whether or not the destination exists
+        (Sections 5.1, 259.9).
+    88. Replacement aliasing is resolved by an insert-if-absent claim on
+        the existing entry, durable and resume-safe, not by a
+        before-either-is-published check the streaming planner cannot
+        make; this tightens item 49 (Section 241.5).
+    89. The `capacity_failure` retry category covers only atomic
+        temporary capacity (Section 254); `DISK_FULL` on any other
+        destination write is `operator_action_required` (Sections 29,
+        207).
+    90. Before a directory operation changes anything, Flux probes the
+        destination for a no-replace publication primitive; if none is
+        available, the operation is refused with
+        `NOREPLACE_PUBLISH_UNAVAILABLE` (exit code 3), and check-then-
+        rename is never used instead. `FsCapabilities` gains
+        `no_replace_publish`. Single-file operations are unaffected
+        (Sections 55, 62, 241.5).
+    91. The writer resolves every destination entry relative to a held
+        parent handle without following links; a link under `DEST` that
+        this operation did not create rejects that path with
+        `SAFETY_REJECTED` (Sections 55, 149.7).
+    92. Tests are added for items 82, 84, 85, and 86 (Section 259.14).
+    93. Exit codes: code 1 also covers an operation that stopped with a
+        failure after changing something, such as
+        `CONTROL_STATE_DURABILITY_FAILURE`; code 3 applies to
+        `SAFETY_REJECTED` only from the Section 129 containment check;
+        "nothing was changed" is defined (Sections 55, 231.5).
+    94. Section 97.1's lock checks also find the long-name fallback lock,
+        classify ancestor locks by Section 240, cover a directory about
+        to be created, and handle a failed release of the operation's
+        own lock (Section 97.1).
+    95. (Takeover mechanism superseded by items 101 and 111.)
+        `--break-lock` takes over the lock record by atomic rename and
+        satisfies `--restart`'s lock steps; it cannot stop a call the
+        prior owner already started; uncertain artifacts are deleted
+        only through `cleanup --target --break-lock` (Sections 21.1,
+        240.5, 251.1, 251.2).
+    96. Cleanup and resume discovery look in
+        `P/.flux/atomic/<target-key>/`, find `.flux-dir.lock` per entry,
+        and handle a filesystem-root DEST or target (Sections 120,
+        234.1, 251.1, 251.2).
+    97. (Narrowed by item 104: the probe writes only in the operation's
+        workspace.) The no-replace probe writes only Flux control state, its
+        dry-run preview is defined, and it applies to atomic staging
+        (Section 241.5).
+    98. Every publication claims the entry it creates, and claims are
+        never released during the operation (Section 241.5); this
+        completes item 88.
+    99. `operator_action_required` stops the operation without fallback,
+        terminal failure, or budget; walk errors other than links map
+        to generic codes (Sections 149.7, 207).
+    100. Section 241.5's claims are keyed by directory entry (parent directory identity and reported name), not object
+        identity; a claim records its target, so a resumed target and a hardlink dependent never collide with their own
+        claims (Section 241.5).
+    101. (Superseded by item 115.) --break-lock's takeover is exclusive: it moves the lock aside by rename, which only one takeover can do,
+        then creates its own lock exclusively; a lock acquired in between is put back and the takeover refuses (Sections
+        240.5, 250.1, 251.1, 251.2).
+    102. Section 99 defines "still owned" as the lock file holding the operation's own record, and a failed
+        revalidation stops the operation, resumable (Section 99). (Cancellation pauses instead: items 114, 118.)
+    103. --restart keeps the target locked from step 1 to the start of the new operation (Section 21.1).
+    104. A refusal that cannot remove a lock or probe file it created reports the path and exits 1; the probe writes
+        only inside the operation's workspace (Sections 55, 97.1, 241.5).
+    105. An unreadable ancestor lock record counts as uncertain ownership (Section 97.1).
+    106. flux cleanup --target on a directory target cleans its root lock together with its workspace (Sections 234.1,
+        251.2).
+    107. Default cleanup classifies a directory operation's root lock with its operation, and an orphan root lock by its
+        owner (Section 251.1).
+    108. flux cleanup's exit codes are defined (Sections 55, 251).
+    109. --dry-run previews a fresh plan when there is nothing to resume, previews a --break-lock takeover, and does not
+        predict namespace collisions (Section 5.2).
+    110. Wording: TARGET_LOCK_UNCERTAIN cites Section 97.1; Section 207's object_scoped default excludes
+        operator_action_required (Sections 55, 207).
+    111. (Superseded by item 115.) `--break-lock`'s takeover is one numbered procedure with a defined
+        outcome for every step, an unreadable-record variant, a takeover
+        record, and a cleanup variant; moved locks are found as
+        `<lock-name>.broken.*` beside any lock form (Sections 240.5, 250.1,
+        251.1, 251.2).
+    112. Recovery and cleanup remove a dead owner's lock only by moving it
+        aside and verifying it; an orphan root lock can be `LIVE`
+        (Sections 240.3, 251.1).
+    113. A claim record's fields are defined; a hardlink dependent that the
+        destination folds onto its canonical member's name is a
+        `DESTINATION_NAMESPACE_COLLISION`; test 83 follows the
+        first-claimant rule (Sections 16.1, 241.5).
+    114. Section 99 checks every lock the operation holds, and a cancelled
+        operation pauses; "nothing was changed" also exempts a workspace
+        created and removed while refusing; `flux verify` exits 2 on a
+        usage error; the probe file is named `noreplace-probe`; items 95
+        and 97 point to what superseded them (Sections 4.2, 21.1, 55, 99,
+        241.5).
+    115. Lock replacement is split by owner state: a dead owner's lock is
+        moved aside (Section 240.3); an uncertain owner's lock is taken
+        over in place by `--break-lock`, which needs strong file identity
+        and OS-native locks and never leaves the lock path empty (Section
+        240.5). This supersedes the takeover mechanism of items 101 and
+        111 (Sections 21.1, 240.3, 240.5).
+    116. The lock record is fixed-size and checksummed; an unreadable or
+        checksum-failing record is uncertain ownership, never a foreign
+        object; a cleanup lock carries a fresh `operation_id` and no
+        workspace (Sections 96.1, 259.6).
+    117. Claims are looked up in `state.db`, never held wholesale in
+        memory, and recovery writes a published target's missing claim
+        first (Section 241.5).
+    118. Section 99: cancellation pauses; a superseded or terminal
+        operation's worker stops without changing its state. A directory
+        cleanup cannot list makes cleanup exit 1. Registry rows cite the
+        new sections (Sections 55, 99, 251).
+    119. Lock replacement hardening: a dead-owner recoverer takes the
+        OS-native lock where available and re-checks the moved record, not
+        only its identity; a lost exclusive create deletes the moved file;
+        a takeover decides OS-native lock support from `LockCapability`,
+        retries when its final identity check finds the path empty, treats
+        a failed check as a different file, and records nothing when its
+        flush fails (Sections 96.1, 240.3, 240.5).
+    120. Section 120 accepts `workspace_path` = `none` for a cleanup lock;
+        the lock-record checksum is the first 16 bytes of BLAKE3; a worker
+        checks supersession before cancellation and writes `PAUSED` only
+        over `TRANSFERRING` (Sections 99, 120, 259.6).
+    121. A target's created-entry claim is written in the same durable
+        transaction as its `COMMIT` record (Sections 182, 183, 241.5).
+
+    V16 adds acceptance tests 31--146 to Section 259.14.
+
+Where sections conflict, later closure layers control earlier ones, and
+payload-bearing definitions control state-name summaries (Section
+V14.4).
 
 These rules are normative. Implementation choices may vary only where
 they do not alter the stated invariants or recovery semantics.
@@ -97,8 +500,8 @@ implementation details.
 5.  The canonical hardlink member is the first selected path encountered
     for an object identity.
 6.  Because the default scanner is deterministically ordered, the
-    canonical member is the lexicographically smallest selected
-    normalized relative path.
+    canonical member is the smallest selected normalized relative path
+    in `FluxPathKey` order (component-wise; Sections 7.2 and 103).
 7.  Flux does not buffer an entire hardlink group in RAM merely to
     determine its canonical member.
 8.  Persistent topology state may spill to disk.
@@ -224,6 +627,66 @@ Basic copy:
 flux copy SOURCE DEST
 ```
 
+## 4.1 Destination Mapping
+
+Where each source lands:
+
+| Sources | `DEST` | Result |
+|---|---|---|
+| one folder | any path (created if missing) | the folder's contents are copied onto `DEST` |
+| one file | an existing folder, or a path ending in a separator | `DEST/<name>` |
+| one file | any other path | `DEST` itself is the target file |
+| several | a folder (created if missing) | each source at `DEST/<name>` (Section 18.3) |
+
+A folder source whose `DEST` is an existing file, or several sources whose
+`DEST` is an existing file, is a usage error (exit code 2). A file whose
+target already exists follows the existing-destination policy (Section
+5.1).
+
+For folder sources the mapping never depends on whether `DEST` already
+exists, so re-running the same command lands in the same place.
+
+## 4.2 Verify Command
+
+``` bash
+flux verify SOURCE DEST
+```
+
+compares `SOURCE` with `DEST` without changing anything. It uses the
+destination mapping of Section 4.1 and the copy selection options
+(`--exclude`, `--links`, `--cross-filesystems`, `--recursive`), and
+reads with `--hash` (default `blake3`):
+
+-   Each selected source file is hashed on both sides and compared.
+    Symlinks compare payloads; directories compare presence. Metadata is
+    not compared.
+-   Both sides are walked together in `FluxPathKey` order (Section 7.2),
+    so resident memory stays bounded.
+-   Flux's own control state (`DEST/.flux/`, lock, state, and partial
+    artifacts, including a root `DEST`'s `DEST/.flux-root.lock`) is never
+    compared (Section 259.3).
+
+It reports each path as:
+
+``` text
+match
+missing      in the source, absent at the destination
+mismatched   content, symlink payload, or object type differs
+             (VERIFY_MISMATCH)
+extra        at the destination, not in the source
+unreadable   either side could not be read or hashed (the error is
+             reported)
+```
+
+Exit status is 0 when nothing is missing, mismatched, or unreadable, 1
+when something is, and 2 for a usage error (Section 55); extra paths are reported but do not change the exit
+status, because copying into an existing folder can leave them
+legitimately. `--json` reports the same records.
+
+`flux verify` takes no lock and creates no workspace. Run against a
+destination that another operation is changing, its report is a
+snapshot and may be stale.
+
 ------------------------------------------------------------------------
 
 # 5. Copy Options
@@ -234,34 +697,53 @@ Planned interface:
 --recursive
 --no-recursive
 
---workers <N>
+--workers <N|auto>
 
---overwrite
---update
---skip-existing
+--exclude <PATTERN>                  (Section 14)
 
---verify[=<ALGORITHM>]
+--overwrite                          (Section 5.1; default)
+--update                             (Section 5.1)
+--skip-existing                      (Section 5.1)
+
+--verify[=<none|source-stream|destination|full>]
+                                     (Section 32; default source-stream;
+                                      bare --verify = destination)
+--hash=<ALGORITHM>                   (Section 32; default blake3; blake3
+                                      is the only accepted value in this
+                                      version; any other value is a
+                                      usage error, exit code 2)
 
 --preserve-times
 --preserve-permissions
 --preserve
 
---hardlinks=<auto|preserve|copy>
+--hardlinks=<auto|preserve|copy>      (Section 15; default auto)
 
---reflink=<auto|always|never>
+--reflink=<auto|always|never>        (Section 39; default auto)
 
---sparse=<auto|always|never>
+--sparse=<auto|always|never>         (Section 38; default auto)
 
---atomic=<auto|always|never>
+--atomic=<auto|always|never>         (Section 27; default auto)
 
 --resume
+--restart                            (Section 21.1; supersede prior state)
+--break-lock                         (Section 240.5; with --restart only)
 --resume-verify=<metadata|chunks|full>
+                                     (Section 36; default chunks)
+--retries=<N|unlimited>              (Section 206; default 3)
 
---links=<copy|follow|skip>
+--durability=<normal|strict>         (Sections 141, 165; default normal)
+
+--links=<copy|follow|skip>           (Sections 26, 124; follow is future)
+
+--special-files=<skip|strict>        (Section 233; default skip)
 
 --cross-filesystems
 
---dry-run
+--heartbeat-interval <duration>      (Section 101; future)
+--lease-timeout <duration>           (Section 101; future)
+
+--dry-run                            (Section 5.2)
 
 --json
 
@@ -273,6 +755,76 @@ Planned interface:
 
 Not every option must be exposed in Flux 0.1, but internal APIs must be
 designed so these semantics can be added without redesigning the engine.
+
+## 5.1 Existing Destination Policy
+
+When a destination file target already exists, exactly one policy
+applies:
+
+``` text
+--overwrite       replace it (default when no policy is given)
+--update          replace it only when the source mtime is newer or the
+                  sizes differ
+--skip-existing   never modify it; report it as skipped
+```
+
+Giving more than one of these options is a usage error (exit code 2).
+
+The policy applies per file target, including every member of a
+hardlink group (Section 253.7).
+Existing directories are merged into, not replaced, except under
+`--atomic=always` (Sections 30.1, 259.9). Replacement follows the atomic
+policy (Sections 27, 116): with atomic replacement, the existing target
+stays untouched until publication. Under `--atomic=always`, the
+published tree is exactly the selected source tree: entries present only
+at the destination are removed with the old tree (Section 259.9).
+
+For a directory operation (folder source), `--update` or
+`--skip-existing` together with `--atomic=always` is a usage error (exit
+code 2), whether or not the destination exists: a newly created
+directory has nothing to keep, so per-target update/skip has nothing to
+apply to. Single-file operations are unaffected.
+
+`--update` compares metadata only. A changed source whose mtime did not
+advance and whose size is unchanged is not replaced; use `--overwrite`
+when that matters.
+
+Skipped targets appear in the report and in "files skipped" (Section 51).
+
+## 5.2 Dry Run
+
+`--dry-run` scans, selects, and plans exactly as a real run would, and
+reports the actions it would take. It creates no operation lock, target
+lock, workspace, catalog entry, partial file, or destination change, and
+it cannot be resumed.
+
+Planning state that must spill to keep resident memory bounded (Section
+10.2) goes to a private temporary directory outside the destination,
+removed when the run ends.
+
+A dry run may run while a real operation is live. Its report is a
+snapshot of the destination as scanned and may be stale when printed.
+Checks that need locks, capacity reservations, or writes (Sections 96,
+259.5) are reported as checks a real run would make, not performed.
+
+Combined with `--resume` or `--restart`, a dry run previews that
+invocation (Section 21.1) without changing anything:
+
+``` text
+--dry-run --resume    reads the prior operation's saved state without
+                      taking any lock, and reports what resuming would do,
+                      or, with no resumable prior operation, the
+                      fresh plan (Section 21.1), or the refusal it would get (INCOMPATIBLE_STATE, a
+                      live owner)
+--dry-run --restart   reports what would be discarded, then the fresh plan,
+                      or the refusal a real --restart would get (a live
+                      owner, uncertain ownership, or missing or corrupt
+                      prior state); with
+                      --break-lock, uncertain ownership previews the takeover instead
+```
+
+--dry-run does not predict DESTINATION_NAMESPACE_COLLISION: collisions are detected at
+publication (Section 241.5), so a preview can show two targets that a real run reports as one collision.
 
 ------------------------------------------------------------------------
 
@@ -303,7 +855,9 @@ ordering.
 
 The ordering representation must:
 
--   use `/` as the internal relative-path separator
+-   use `/` as the internal relative-path separator for display and
+    destination mapping (the ordering key uses its own separator;
+    Section 103)
 -   preserve the actual filename bytes/code points where possible
 -   not perform Unicode normalization implicitly
 -   not perform locale-specific case folding
@@ -316,6 +870,27 @@ Primary ordering:
 ``` text
 lexicographic comparison of normalized relative path components
 ```
+
+Components are compared as unsigned byte strings (Unix: raw filename
+bytes; Windows: canonical WTF-8, Section 241.2). A path whose component
+sequence is a prefix of another's sorts first, so a directory sorts
+before its own contents.
+
+This is **not** the same as a flat byte comparison of the `/`-joined
+path. Many legal filename bytes sort below `/` (0x2F), including space,
+`-` (0x2D), and `.` (0x2E). For the paths `a/x`, `a/y/z`, `a-b`, `a0`:
+
+``` text
+component-wise (normative):   a/x   a/y/z   a-b   a0
+flat '/'-joined bytes (NOT):  a-b   a/x     a/y/z a0
+```
+
+A depth-first scanner that sorts each directory's entries by name alone
+emits component-wise order without buffering. `FluxPathKey` (Section
+103) encodes this order so that plain bytewise comparison of keys equals
+component-wise comparison. With multiple source roots, paths are ordered
+by their destination-relative path and roots are visited in prefix order
+(Section 18.3).
 
 For platforms with native Unicode strings, comparison is performed on
 the deterministic normalized representation.
@@ -362,7 +937,7 @@ Guarantee:
 ``` text
 first selected member of an identity
 =
-lexicographically smallest selected member
+lexicographically smallest selected member   (component-wise, Section 7.2)
 ```
 
 This makes deterministic hardlink canonicalization possible without
@@ -470,8 +1045,13 @@ Define:
 struct FileIdentity {
     filesystem_id: FilesystemId,
     object_id: ObjectId,
+    generation: Option<ObjectGeneration>,   // Section 242
 }
 ```
+
+This is the only definition of `FileIdentity`. Its reliability is
+classified in Section 107, and the persisted form of `filesystem_id` is
+defined in Section 109.1.
 
 Unix implementations should use suitable device/inode information.
 
@@ -515,6 +1095,30 @@ LINK C/file → A/file
 
 Only one physical data transfer is required.
 
+## 12.1 Hardlinked Symlinks and Special Files
+
+Hardlink groups contain regular files and symlinks.
+
+A symlink inode with several selected entries forms its own hardlink
+group. Its identity is the symlink object's own `FileIdentity` (read
+without following it), never its target's (Section 25):
+
+-   The materializing attempt creates the symlink at the candidate's
+    path, with its payload copied verbatim (Section 125); the other
+    members are linked to it (Section 16.1).
+-   There is no content to copy: attempts have no chunks, checkpoints,
+    or content digest, and verification (Section 32) compares the
+    created payload with the source payload.
+-   `SYMLINK_CREATION_UNAVAILABLE` (Section 127) affects every member the
+    same way, so it is `object_scoped` (Section 207) and the group
+    terminally fails (Section 253.5).
+-   Under `--links=skip` every member is skipped (Section 124). Under
+    `--hardlinks=copy` each entry becomes an independent symlink.
+
+Special files (Section 233) never form hardlink groups. Each entry
+follows Section 233 on its own, and a lost link relationship among them
+is reported as degraded.
+
 ------------------------------------------------------------------------
 
 # 13. Canonical Hardlink Rule
@@ -528,7 +1132,7 @@ Because the default scanner is deterministically ordered:
 
 ``` text
 canonical =
-lexicographically smallest selected relative path
+lexicographically smallest selected relative path   (component-wise, Section 7.2)
 ```
 
 ## 13.1 Critical consequence
@@ -614,7 +1218,9 @@ must report the degradation.
 
 Topology preservation is mandatory.
 
-Failure to create a required hardlink is an operation failure.
+Failure to create a required hardlink is an operation failure, reported
+as `HARDLINK_UNAVAILABLE` for the member that could not be linked
+(Sections 16.1, 253.7).
 
 ## `copy`
 
@@ -657,20 +1263,56 @@ separately from:
 dependent link materialization
 ```
 
+## 16.1 Dependent Link State and Recovery
+
+Each dependent link action is persisted in `topology.db` from discovery
+(Section 232) with its existing-destination decision (Section 5.1) and
+one of these states:
+
+| State | Meaning |
+|---|---|
+| `Held` | waiting for the group to materialize (Section 94) |
+| `Released` | released for linking; the link may or may not exist yet |
+| `Linked` | the link is durably recorded as created |
+| `Skipped` | not linked because the existing-destination policy skips its target |
+| `Blocked` | not linked because the group terminally failed (`BLOCKED_BY_CANONICAL_FAILURE`) |
+| `Failed` | linking failed; reported with its error: `DESTINATION_NAMESPACE_COLLISION` when the name is taken (Section 241.5), otherwise `HARDLINK_UNAVAILABLE` when the link itself cannot be created |
+
+A dependent is linked the same way every time, so re-running it is safe:
+
+``` text
+0. remove any leftover <target>.flux-partial.<operation-id>; the name
+   carries this operation's id, so it is this operation's own leftover,
+   for example a failed copy attempt's temporary file after fallback
+   (Section 253.4)
+1. create the hardlink at <target>.flux-partial.<operation-id>, in the
+   target's directory, to the materialization anchor
+2. atomically rename it over <target>, refusing to replace when the
+   target was planned as new (Section 241.5)
+3. remove <target>.flux-partial.<operation-id> if it still exists
+4. record Linked
+```
+
+Step 3 is needed because a POSIX rename between two names that already
+link the same file does nothing and returns success, leaving the
+temporary name in place. Each step revalidates ownership as Section 99
+requires.
+
+After a crash, recovery re-runs every `Released` dependent with these
+steps. A link created before the crash is replaced by an identical link,
+so no identity check is needed and an existing correct link never causes
+a failure. `Held` dependents stay held; `Linked`, `Skipped`, `Blocked`,
+and `Failed` are final.
+
 ------------------------------------------------------------------------
 
 # 17. Topology Store
 
 A pure in-memory map is not sufficient for arbitrarily large operations.
 
-Define:
-
-``` rust
-trait TopologyStore {
-    fn lookup(identity: FileIdentity) -> Result<Option<TopologyRecord>>;
-    fn insert(identity: FileIdentity, record: TopologyRecord) -> Result<()>;
-}
-```
+The `TopologyStore` interface is defined in Section 91: a lookup plus
+atomic, attempt-fenced transitions. A separate lookup-then-insert is
+forbidden, because that sequence races (Section 91).
 
 The production implementation should provide:
 
@@ -699,6 +1341,10 @@ Flux state is **destination-local and operation-scoped**.
 
 It must never depend on a global system-wide Flux database.
 
+Whole-tree atomic staging keeps its workspace in the destination's parent
+directory instead of inside the destination (Section 259.10), because
+that state must survive the replacement of the destination root.
+
 ## 18.1 Single-file transfer
 
 For:
@@ -715,7 +1361,9 @@ Flux may use adjacent temporary/state files:
 └── source.iso.flux-state.<operation-id>
 ```
 
-The exact filename suffix is implementation-defined but must be
+The name structure `<target>.flux-partial.<operation-id>` and
+`<target>.flux-state.<operation-id>` is normative (Section 218). The
+textual form of `<operation-id>` is implementation-defined but must be
 collision-resistant and deterministic enough for discovery.
 
 ## 18.2 Directory transfer
@@ -736,6 +1384,7 @@ Flux uses:
             ├── manifest
             ├── state.db
             ├── topology.db
+            ├── wal/
             ├── checkpoints/
             └── lock
 ```
@@ -752,6 +1401,41 @@ DEST/.flux/operations/<operation-id>/
 
 The manifest maps each source root to its destination mapping.
 
+Each source root `R` maps to a **destination prefix**: the path, relative
+to the destination root, under which `R`'s content is placed.
+
+-   A single folder source maps onto the destination root itself
+    (Section 4.1) and has an empty prefix.
+-   With multiple roots, each root maps to `DEST/<name>`, where `<name>`
+    is the root's final path component. Every prefix is then exactly one
+    component, and prefixes must be pairwise distinct. Two roots with
+    the same prefix are rejected with `DESTINATION_NAMESPACE_COLLISION`
+    before any transfer begins.
+-   With multiple roots, distinctness is decided by the destination
+    filesystem, not by bytes. Before any transfer, the operation takes
+    a lock named after each root's prefix, `DEST/<name>.flux-lock`
+    (Section 96.1). A single root with an empty prefix takes no prefix
+    lock; its destination root is locked as in Section 97. If a prefix's
+    lock creation fails against another root's lock of the same
+    operation, the two prefixes alias on the destination (for example
+    `Data` and `data` on a case-insensitive filesystem) and are
+    rejected with `DESTINATION_NAMESPACE_COLLISION`.
+
+A path's `FluxPathKey` is its destination-relative path: its root's
+prefix components followed by its components relative to that root
+(Section 103). All roots therefore share one key space and one order.
+
+The scanner visits roots in `FluxPathKey` order of their prefixes, and
+each root depth-first as in Section 7.2. Because prefixes are distinct
+single components, this emits global key order across all roots without
+buffering. A hardlink group whose members span roots on the same source
+filesystem therefore has one canonical member: the smallest
+destination-relative key (Section 13). Members on different source
+filesystems are never grouped (Section 230).
+
+The order depends only on the prefixes, not on the order in which roots
+appear on the command line.
+
 ------------------------------------------------------------------------
 
 # 19. Operation Manifest
@@ -765,15 +1449,26 @@ struct OperationManifest {
     format_version: u32,
     operation_id: OperationId,
 
-    source_root: PathBuf,
     destination_root: PathBuf,
+    // One entry per source root (Section 18.3), stored in
+    // FluxPathKey order of destination_prefix.
+    roots: Vec<RootMapping>,
 
     created_at: Timestamp,
     last_checkpoint: Timestamp,
 
     state: OperationState,
+    // Set when a later operation superseded this one with
+    // --restart (Section 21.1); state is then ABANDONED.
+    superseded_by: Option<OperationId>,
 
     configuration_fingerprint: Hash,
+}
+
+struct RootMapping {
+    source_root: PathBuf,
+    // Empty for a single root mapped onto destination_root itself.
+    destination_prefix: FluxPathKey,
 }
 ```
 
@@ -784,13 +1479,18 @@ Examples of potentially incompatible changes:
 
 ``` text
 --hardlinks=preserve → --hardlinks=copy
+selection changed (--exclude, --links, --cross-filesystems, --recursive)
 chunk size changed
 verification policy changed
 atomic policy changed
 reflink policy changed
 sparse policy changed
 metadata policy changed
+special-files or existing-destination policy changed
+--retries decreased, or --durability weakened
 ```
+
+The fingerprint covers every option Section 121 lists.
 
 Flux must either support explicit migration or reject incompatible
 resume attempts.
@@ -811,6 +1511,27 @@ COMMITTING
 COMPLETED
 ABANDONED
 ```
+
+Meaning, and whether `--resume` may continue the operation (Section 21):
+
+| State | Meaning | Resumable |
+|---|---|---|
+| `CREATED` | workspace and manifest exist; scanning has not started | yes |
+| `SCANNING` | discovery and planning in progress, before any transfer | yes |
+| `TRANSFERRING` | copying, linking, and checkpointing | yes |
+| `PAUSED` | durably paused after cancellation (Section 132) | yes |
+| `FAILED` | stopped by an error; its durable progress is kept | yes |
+| `COMMITTING` | publishing results (Sections 182, 183) | yes, after commit recovery |
+| `COMPLETED` | finished; only cleanup may remain (Section 218) | no (terminal) |
+| `ABANDONED` | superseded or given up (Section 21.1) | no (terminal) |
+
+A `FAILED` operation can be continued with `--resume` once its cause is
+fixed, or discarded with `--restart` (Section 21.1). Only `COMPLETED` and
+`ABANDONED` are terminal.
+
+Transient in-process states, such as pausing, are never persisted: a
+crash while pausing leaves the last persisted state, normally
+`TRANSFERRING`.
 
 Normal completion:
 
@@ -856,7 +1577,8 @@ It first checks:
 /backup/.flux/operations/
 ```
 
-and loads operation manifests.
+(or, for whole-tree atomic staging, the workspace named by the
+destination root's lock; Section 120) and loads operation manifests.
 
 The requested source/destination pair is matched against the manifest.
 
@@ -865,10 +1587,88 @@ Resume is allowed only when:
 ``` text
 source mapping matches
 destination mapping matches
-operation state is resumable
+operation state is resumable (Section 20)
 format is supported
 configuration is compatible
 ```
+
+## 21.1 Existing Operation State Without `--resume`
+
+Before starting a new operation, Flux checks for existing operation
+state for the same destination:
+
+-   directory operations: every operation in `DEST/.flux/operations/`
+    whose destination root is `DEST`;
+-   single-file operations: the target's catalog record and adjacent
+    artifacts (Section 250).
+
+Each prior operation found is handled by its classification:
+
+``` text
+live owner (lock held)
+    → OPERATION_LOCKED or TARGET_LOCK_BUSY
+
+ownership uncertain, or state missing/corrupt
+    → preserve; TARGET_LOCK_UNCERTAIN, ARTIFACT_OWNERSHIP_UNCERTAIN,
+      or STATE_CORRUPT
+
+completed (including cleanup_pending)
+    → not resumable; the new operation proceeds and may complete the
+      prior cleanup under Section 218
+
+terminal ABANDONED
+    → not resumable; the new operation proceeds, and the prior state
+      is left to garbage collection (Section 222)
+
+resumable (non-terminal, owner demonstrably gone)
+    → decided by the invocation, below
+```
+
+For a resumable prior operation:
+
+``` text
+--resume            resume it (Sections 21, 22); a mapping or
+                    configuration mismatch is INCOMPATIBLE_STATE
+--restart           supersede it, then start a new operation
+neither             fail with RESUMABLE_OPERATION_EXISTS, naming the
+                    prior operation and its progress, without mutating
+                    anything
+both                usage error
+```
+
+If no prior operation exists for the target or `DEST`, `--resume` starts
+a new operation and the report says "no prior operation; starting new",
+so scripts may always pass `--resume`. A prior operation that exists but
+does not match is still `INCOMPATIBLE_STATE`.
+
+`--restart` supersedes a prior operation in this order:
+
+``` text
+1. acquire the prior operation's lock without waiting (a dead owner's
+   lock is replaced as Section 240.3 describes); failure means
+   a live owner (OPERATION_LOCKED / TARGET_LOCK_BUSY); with
+   --break-lock and uncertain ownership, Flux instead takes the lock
+   over (Section 240.5) and continues with step 2; step 3 then
+   revalidates the lock it now holds
+2. durably mark the prior operation ABANDONED, recording
+   superseded_by = the new operation_id
+3. revalidate ownership and locks (Section 99)
+4. delete the prior operation's derived artifacts (partials), then its
+   primary state, in the order of Sections 222 and 223
+5. start the new operation under
+   the lock already held: the lock record is rewritten for the new operation; the lock is never released between steps
+   1 and 5
+```
+
+Deleting before copying frees the prior partial allocation before the
+new operation needs it. `--restart` never overrides a live owner or
+missing or corrupt state; without `--break-lock` (Section 240.5), it also
+never overrides uncertain ownership (Sections 240.4, 259.13). A crash
+during steps 3--5 leaves the prior operation durably `ABANDONED`, which
+normal garbage collection can then remove.
+
+A plain rerun therefore never runs alongside a dead operation's partial
+data, and never discards resumable progress without an explicit flag.
 
 ------------------------------------------------------------------------
 
@@ -881,7 +1681,8 @@ flux copy source.iso /dest/source.iso --resume
 ```
 
 Flux checks the destination-side operation metadata for that exact
-target.
+target. An invocation without `--resume` that finds resumable state for
+the target follows Section 21.1.
 
 The state file must contain:
 
@@ -976,16 +1777,23 @@ The retention period should be configurable.
 Command:
 
 ``` bash
-flux cleanup
+flux cleanup DEST
 ```
 
-It lists stale operations before deletion unless forced.
+The `DEST` argument is required unless `--target PATH` is given
+(Section 251). Cleanup reports every row with its status and every
+deletion it makes; `--force` never suppresses that report. There is no
+interactive prompt.
 
-Example future interface:
+`--dry-run` classifies and reports eligibility, deletes nothing, and
+takes no lock (Section 251.1).
+
+Example interface:
 
 ``` bash
 flux cleanup /backup
-flux cleanup /backup --older-than 30d
+flux cleanup /backup --dry-run
+flux cleanup /backup --older-than 30d      (future)
 flux cleanup /backup --force
 ```
 
@@ -1081,6 +1889,12 @@ Flux supports:
 --atomic=never
 ```
 
+Default:
+
+``` text
+auto
+```
+
 ## `auto`
 
 Prefer atomic replacement.
@@ -1142,7 +1956,9 @@ ENOSPC
 ERROR_DISK_FULL
 ```
 
-must always be handled as runtime conditions.
+must always be handled as runtime conditions. A destination write that
+fails for lack of space, outside the atomic capacity states of Section
+254, reports `DISK_FULL`.
 
 ------------------------------------------------------------------------
 
@@ -1171,7 +1987,7 @@ APPLY METADATA
     ↓
 OPTIONAL FLUSH
     ↓
-ATOMIC RENAME
+ATOMIC RENAME   (no-replace when the target was planned as new; Section 241.5)
 ```
 
 A destination must not appear complete until required verification and
@@ -1253,6 +2069,19 @@ DIRECTORY_METADATA_FINALIZED
 COMMITTED
 ```
 
+These are publication states of one directory target, following the
+order above; they are not operation states (Section 20). The operation
+is `COMMITTING` from `DIRECTORY_READY_TO_PUBLISH` until `COMMITTED`.
+
+| State | Reached when | Recovery |
+|---|---|---|
+| `DIRECTORY_STAGING` | the staged tree is being built and verified (Section 259.10) | continue staging; never delete it merely because of a crash |
+| `DIRECTORY_READY_TO_PUBLISH` | every descendant is copied and verified, final directory metadata is applied in staging, data is flushed, and `PREPARE_COMMIT` is durable (Section 182) | revalidate locks, then publish |
+| `DIRECTORY_PUBLISHING` | the root publication has been issued but its outcome is not yet durably recorded | inspect the namespace (Sections 183, 259.8); if it cannot be decided, `COMMIT_STATE_UNCERTAIN` |
+| `DIRECTORY_PUBLISHED` | the root publication is durably observed, but directory metadata the publication can disturb (Section 30.2) is not yet finalized and durable | finalize and flush that metadata |
+| `DIRECTORY_METADATA_FINALIZED` | published, with final metadata applied and durable | record `COMMIT` |
+| `COMMITTED` | `COMMIT` is durable | cleanup only (Section 218) |
+
 If durable evidence cannot establish whether the root publication
 occurred:
 
@@ -1324,13 +2153,14 @@ destination verification.
 
 # 32. Verification Levels
 
-Conceptual:
+The level is selected with `--verify` and the digest algorithm with
+`--hash` (default `blake3`):
 
 ``` text
-none
-source-stream
-destination
-full
+--verify=none
+--verify=source-stream     (default)
+--verify=destination       (also: bare --verify)
+--verify=full
 ```
 
 ## `none`
@@ -1343,14 +2173,20 @@ Hash source bytes while copying.
 
 ## `destination`
 
-Independently hash destination after writing.
+`source-stream`, then independently re-read and hash the destination
+after writing and compare it with the source-stream digest before
+publication (Section 135). The re-read opens the written file anew and
+reads it through the filesystem; a buffer kept from writing never
+substitutes.
 
 ## `full`
 
-Perform the strongest configured verification, potentially including
-both source and destination validation.
+`destination`, plus a second, independent read of the source after
+copying, compared with the source-stream digest. This also detects
+source bytes that changed or were misread during the copy.
 
 The CLI must document exactly what guarantee each level provides.
+Reflinked files are verified as Section 39 states.
 
 ------------------------------------------------------------------------
 
@@ -1470,7 +2306,7 @@ Flux must not silently continue.
 --resume-verify=full
 ```
 
-Recommended default for large resumable files:
+Default:
 
 ``` text
 chunks
@@ -1530,7 +2366,18 @@ Default:
 auto
 ```
 
-Preserve logical holes where supported.
+`auto` keeps the source's holes; where the destination cannot hold
+holes, it writes zeros instead.
+
+`always` also turns runs of zero bytes into holes, even where the
+source has none; where the destination cannot hold holes
+(`FsCapabilities::sparse` is false), the file's action fails with
+`SPARSE_UNAVAILABLE`.
+
+`never` writes every byte allocated.
+
+The verification digest is over logical bytes and is the same for all
+three modes.
 
 Tests should compare:
 
@@ -1564,9 +2411,25 @@ auto
 
 `auto` attempts CoW and safely falls back.
 
-`always` fails when unavailable.
+`always` fails when unavailable: the file's action fails with
+`REFLINK_UNAVAILABLE`.
 
 `never` uses ordinary copying.
+
+A reflinked file shares the source's blocks, so its content is identical
+to the source by construction, and no bytes are streamed through Flux.
+Verification of reflinked files (Section 32):
+
+``` text
+--verify=none, source-stream    not hashed; reported as "reflinked, not
+                                hashed"
+--verify=destination, full      source and destination are both read,
+                                hashed with --hash, and compared; the
+                                reflink stays in place
+```
+
+Source mutation checks (Section 33) apply before and after the clone as
+for a streamed copy.
 
 ------------------------------------------------------------------------
 
@@ -1632,17 +2495,13 @@ self-exclusion.
 
 # 42. Mount Boundaries
 
-Recommended default:
+Default:
 
 ``` text
 do not cross filesystem boundaries
 ```
 
-Future:
-
-``` bash
---cross-filesystems
-```
+Crossing is off unless `--cross-filesystems` is given (Section 5).
 
 Filesystem identity must be used to evaluate boundaries.
 
@@ -1702,6 +2561,23 @@ DOS attributes
 alternate data streams
 ```
 
+## 44.1 Metadata Policy
+
+The metadata policy is set by the `--preserve` options (Section 5):
+
+-   Metadata the user explicitly requested (`--preserve`,
+    `--preserve-times`, `--preserve-permissions`) is strict. If it cannot
+    be applied to a file, that file's action fails with
+    `METADATA_APPLY_FAILED`, and under atomic replacement the file is not
+    published.
+-   Metadata applied only by default is best-effort. The file is
+    published, each failure is reported as `METADATA_APPLY_FAILED`, and
+    the operation exits with status 1.
+
+Either way a metadata failure is reported separately from content-copy
+failure (Section 133). The metadata policy is part of the configuration
+fingerprint (Section 19).
+
 ------------------------------------------------------------------------
 
 # 45. Transfer Action IR
@@ -1713,6 +2589,7 @@ enum TransferAction {
     CreateDirectory { /* ... */ },
     CopyFile { /* ... */ },
     LinkFile { /* ... */ },
+    CreateSymlink { /* payload copied verbatim; Sections 124, 125 */ },
     ReflinkFile { /* ... */ },
     SetMetadata { /* ... */ },
     VerifyFile { /* ... */ },
@@ -1733,13 +2610,13 @@ pub trait TransferOperation {
 }
 ```
 
-Future operations:
+Operations:
 
 ``` text
-CopyOperation
-SyncOperation
-VerifyOperation
-RestoreOperation
+CopyOperation      flux copy
+VerifyOperation    flux verify (Section 4.2)
+SyncOperation      future
+RestoreOperation   future
 ```
 
 The implementation must avoid an API that requires a complete in-memory
@@ -1873,6 +2750,11 @@ average throughput
 peak throughput
 ```
 
+`files verified` counts files whose destination bytes were compared
+with the source digest (`--verify=destination` or `--verify=full`,
+Section 32). `--verify=source-stream` alone never counts a file as
+verified.
+
 For hardlinks distinguish:
 
 ``` text
@@ -1901,7 +2783,13 @@ Skipped       312
 Hardlinks     1,284
 Degraded          0
 Errors            0
+Capacity wait     0 actions, 0 B short
 ```
+
+When one or more actions are in `CAPACITY_WAIT` or `CAPACITY_BLOCKED`
+(Section 254.1), the progress display shows the count of actions
+waiting for capacity and the bytes short; each action is logged at
+`warn` when it enters either state.
 
 Progress must not require the entire file list in RAM.
 
@@ -1920,23 +2808,33 @@ Processed:   98,412
 --json
 ```
 
-Example:
+Complete field list (not only an example):
 
 ``` json
 {
   "files_total": 12842,
   "files_copied": 8321,
   "files_skipped": 312,
+  "files_overwritten": 0,
   "files_hardlinked": 1284,
   "files_reflinked": 0,
   "files_degraded": 0,
+  "files_verified": 8321,
+  "files_mismatched": 0,
+  "files_failed": 0,
   "bytes_total": 828124124124,
   "bytes_copied": 523124124124,
+  "bytes_skipped": 0,
   "errors": 0,
   "duration_ms": 183421,
-  "average_bytes_per_second": 2841241241
+  "average_bytes_per_second": 2841241241,
+  "verify_level": "destination",
+  "hash_algorithm": "blake3"
 }
 ```
+
+`verify_level` is the `--verify` level used; `hash_algorithm` is the
+`--hash` algorithm used.
 
 JSON goes to stdout.
 
@@ -1976,29 +2874,96 @@ CLI:
 
 # 55. Error Model
 
-Suggested exit codes:
+Exit codes (normative):
 
 ``` text
-0 = complete success
-1 = transfer/verification errors
-2 = usage/configuration errors
+0  success, including outcomes degraded under an auto policy (they are
+   reported, Section 51)
+1  one or more actions failed, verification found a mismatch, or the
+   operation stopped with a failure after it had changed something (for
+   example CONTROL_STATE_DURABILITY_FAILURE, or a WAL failure under
+   Section 189)
+2  usage or configuration error: the options are invalid, or invalid
+   together for the given sources
+3  refused before changing anything: the operation was refused as a
+   whole because of the state of the destination, a prior operation, or
+   the platform (for example TARGET_LOCK_BUSY, OPERATION_LOCKED,
+   TARGET_LOCK_UNCERTAIN, LEASE_AGE_UNCERTAIN, RESUMABLE_OPERATION_EXISTS,
+   INCOMPATIBLE_STATE, STATE_CORRUPT, REMOTE_LOCK_UNSAFE, or
+   SAFETY_REJECTED from the containment check of Section 129), and
+   nothing was changed
 ```
 
-Useful categories:
+"Nothing was changed" means the destination's content and any prior
+operation's state are as they were; a lock, probe file, or workspace that
+Flux created and removed again while refusing does not count (Sections
+97.1, 241.5). If Flux cannot remove a lock, probe file, or workspace it
+created while refusing, it reports the path and exits 1 instead of 3.
 
-``` text
-SOURCE_CHANGED
-DESTINATION_ERROR
-PERMISSION_DENIED
-IO_ERROR
-VERIFY_MISMATCH
-HARDLINK_UNAVAILABLE
-RESUME_INVALID
-SAFETY_REJECTED
-DISK_FULL
-OPERATION_LOCKED
-INCOMPATIBLE_STATE
-```
+Where a partial run hit a refusal on some paths only (for example
+Section 97.1(b), or a path rejected under Section 149.7), the result is
+exit code 1.
+
+flux verify and flux cleanup use these codes where they apply (Sections
+4.2, 251).
+
+Error code registry (normative). Every failure or result code used in
+this specification appears here. A change that introduces a new code
+MUST add it to this table, and MUST NOT introduce a synonym for an
+existing code. `IO_ERROR`, `PERMISSION_DENIED`, and `DESTINATION_ERROR`
+are used only when no more specific code applies.
+
+| Code | Meaning | Defined in |
+|------|---------|------------|
+| `ARTIFACT_OWNERSHIP_UNCERTAIN` | An adjacent artifact's state record is missing, malformed, or unverifiable; the artifact is preserved, never adopted or deleted. | 120, 239.3, 249.4 |
+| `ATOMIC_DIRECTORY_REPLACE_UNSUPPORTED` | `--atomic=always` on an existing directory, with no safe whole-tree replacement primitive, or on a root `DEST`, which cannot be replaced. | 30.1, 96.1, 259.9 |
+| `BLOCKED_BY_CANONICAL_FAILURE` | A hardlink dependent was not linked because its group reached terminal `Failed`. | 92, 205 |
+| `CANONICAL_RETRY_EXHAUSTED` | The per-group attempt budget is spent; recorded as the cause in `Failed.error_code`. | 206, 253.5 |
+| `COMMIT_STATE_UNCERTAIN` | Recovery cannot establish whether a publication or rename happened; state is preserved for reconciliation. | 30.1, 259.8 |
+| `CONTROL_PLANE_NAMESPACE_CONFLICT` | The destination control-plane path (`.flux`) holds a foreign object that Flux does not own. | 96.1, 259.3 |
+| `CONTROL_STATE_DURABILITY_FAILURE` | The emergency control reserve is unavailable, exhausted, or corrupt, so a pause or failure cannot be durably recorded. | 231.5 |
+| `COPY_FAILED` | The content copy of an independent file, or a canonical attempt, failed. | 92, 133 |
+| `DESTINATION_ERROR` | A destination-side failure not covered by a more specific code, including a path the destination refuses as too long. | 55, 105, 207 |
+| `DESTINATION_NAMESPACE_COLLISION` | Two distinct source paths, or two source roots, map to the same destination object or prefix. | 16.1, 18.3, 241.5 |
+| `DIRECTORY_CHANGED_DURING_SCAN` | An existing directory's identity changed while it was being entered. | 149.4 |
+| `DISK_FULL` | A destination data allocation failed for lack of space (`ENOSPC`, `ERROR_DISK_FULL`), outside the atomic capacity states of Section 254. | 29, 207 |
+| `FAILED_ATOMIC_CAPACITY` | Required atomic temporary capacity provably exceeds the maximum recoverable capacity; terminal for the action. | 254.3 |
+| `HARDLINK_GROUP_UNMATERIALIZABLE` | Reported outcome of a hardlink group that reached terminal `Failed`. | 253.5 |
+| `HARDLINK_IDENTITY_UNAVAILABLE` | `--hardlinks=preserve` was requested but reliable object identity is unavailable. | 108 |
+| `HARDLINK_UNAVAILABLE` | A required destination hardlink cannot be created for one member (link creation failed, or the member was skipped under `--hardlinks=preserve`). Distinct from `HARDLINK_GROUP_UNMATERIALIZABLE`, which concerns the group's content. | 15, 16.1, 253.7 |
+| `INCOMPATIBLE_STATE` | Resume state is incompatible with the requested options or format and cannot be migrated. | 121 |
+| `IO_ERROR` | An I/O failure not covered by a more specific code. | 55 |
+| `LEASE_AGE_UNCERTAIN` | The wall clock moved backward, so lease staleness cannot be concluded. | 229.5 |
+| `METADATA_APPLY_FAILED` | Metadata could not be applied to a file: the file's action fails when that metadata was explicitly requested, and is a best-effort warning otherwise. | 44.1 |
+| `NOREPLACE_PUBLISH_UNAVAILABLE` | No no-replace publication primitive is available on the destination for a directory operation; refused before anything changes. | 241.5 |
+| `OPERATION_LOCKED` | Another process holds the operation lock. | 58, 96.2 |
+| `PATH_COMPONENT_INVALID` | A path component contains `0x00`; no `FluxPathKey` is constructed. | 103 |
+| `PERMISSION_DENIED` | The operating system denied access. | 55 |
+| `REFLINK_UNAVAILABLE` | `--reflink=always` was requested but a reflink cannot be created. | 39 |
+| `REMOTE_LOCK_UNSAFE` | No trustworthy exclusive lock contract can be established on a remote filesystem. | 235.4 |
+| `RESUMABLE_OPERATION_EXISTS` | A run without `--resume` or `--restart` found a resumable prior operation for its target or destination; nothing was changed. | 21.1 |
+| `RESUME_INVALID` | Resume validation failed: missing partial, state mismatch, or checkpoint mismatch. | 23, 35.3 |
+| `SAFETY_REJECTED` | The source/destination containment or self-copy check rejected the operation, or a destination path component is a link this operation did not create (that path only). | 129, 149.7 |
+| `SOURCE_CHANGED` | Source identity or metadata changed during the copy; the result is not published. | 33 |
+| `SPARSE_UNAVAILABLE` | `--sparse=always` was requested but the destination cannot hold holes (`FsCapabilities::sparse` is false). | 38 |
+| `SPECIAL_FILE_UNSUPPORTED` | An unsupported special file: skipped with a durable warning, or a failure under strict policy. | 233 |
+| `STATE_CORRUPT` | The manifest, `state.db`, or `topology.db` is corrupt; the workspace is preserved. | 140 |
+| `STRICT_DURABILITY_UNAVAILABLE` | `--durability=strict` cannot be established for the filesystem. | 169 |
+| `SYMLINK_CREATION_UNAVAILABLE` | A symlink cannot be created (for example, a missing Windows privilege); action-scoped. | 127, 259.11 |
+| `TARGET_LOCK_BUSY` | A live owner holds the destination target lock. | 96, 96.2, 97.1, 99, 240.2, 240.5, 252.2 |
+| `TARGET_LOCK_KEY_COLLISION` | Two distinct complete keys share a catalog-record digest; the records are never merged. | 250 |
+| `TARGET_LOCK_UNCERTAIN` | Flux cannot distinguish a dead lock owner from a stalled one, or `--break-lock` cannot take the lock over safely on this filesystem. | 96.1, 96.2, 97.1, 240.4, 240.5, 252.4 |
+| `VERIFY_MISMATCH` | A verification digest did not match, or `flux verify` found differing content, payload, or object type. | 4.2, 55, 135 |
+| `WAL_CORRUPT` | WAL corruption found before the trailing record. | 174, 191 |
+| `WAL_FORMAT_UNSUPPORTED` | The WAL format is unknown. | 191 |
+| `WAL_SEQUENCE_CONFLICT` | Conflicting payloads were found for one WAL sequence number. | 175, 191 |
+| `WAL_SPACE_EXHAUSTED` | WAL growth cannot be relieved by compaction. | 190 |
+
+Not error codes, and not listed above: state names (for example
+`CAPACITY_WAIT`, `DIRECTORY_STAGING`), WAL record types (for example
+`PREPARE_COMMIT`), WAL corruption classes (Section 191), cleanup
+classifications (Sections 131, 251.1), and operating-system error and
+flag names.
 
 Do not keep an unbounded in-memory error list.
 
@@ -2067,7 +3032,8 @@ receive:
 OPERATION_LOCKED
 ```
 
-rather than concurrently modifying the same state.
+rather than concurrently modifying the same state. The refusal reports
+the holder (Section 96.2).
 
 ------------------------------------------------------------------------
 
@@ -2101,19 +3067,27 @@ flux cleanup DEST
 
 Behavior:
 
-1.  enumerate operation manifests
+1.  enumerate operation manifests, including whole-tree atomic staging
+    workspaces (Section 259.10)
 2.  inspect locks
 3.  inspect heartbeat/lease
-4.  classify active, resumable, stale
+4.  classify each operation (Section 251.1)
 5.  display candidates
 6.  remove only explicitly eligible operations
+
+Options:
+
+``` bash
+--target <PATH>          # single target, no DEST needed (Sections 234.1, 251.2)
+--dry-run                # classify and report eligibility; delete nothing, take no lock
+--force                  # also mark RESUMABLE rows eligible, bypassing retention only
+--break-lock             (Section 240.5; with --target only)
+```
 
 Future options:
 
 ``` bash
 --older-than <duration>
---dry-run
---force
 ```
 
 Automatic cleanup should be conservative.
@@ -2179,14 +3153,25 @@ Expose:
 
 ``` rust
 struct FsCapabilities {
+    stable_snapshot_read: bool,   // Section 112
     reflink: bool,
     sparse: bool,
     hardlink: bool,
     atomic_replace: bool,
     xattrs: bool,
     acl: bool,
+    no_replace_publish: bool,     // Section 241.5
 }
 ```
+
+This is the only definition of `FsCapabilities`. Durability capabilities
+are a separate structure (Section 196).
+
+Capabilities are determined per filesystem, like durability capabilities
+(Section 196): a single global platform boolean is insufficient. For
+`reflink` and `hardlink`, capability is per source/destination filesystem
+pair. A value measured for one root is never applied to a root on
+another filesystem.
 
 Planner decisions use capabilities rather than hard-coded assumptions.
 
@@ -2380,8 +3365,8 @@ Persistent topology state may be used.
 
 Hardlink members are spread across a massive directory tree.
 
-The canonical member remains the lexicographically smallest selected
-member.
+The canonical member remains the smallest selected member in
+`FluxPathKey` order (component-wise, Section 7.2).
 
 ## Partial selection
 
@@ -2434,6 +3419,22 @@ The copy of `A/large` must be allowed to start before `M/large` and
 
 This validates the central bounded-memory hardlink architecture.
 
+Separator-ordering case: create a directory `foo/` containing `bar`,
+and a sibling file `foo.txt`, with `foo/bar` and `foo.txt` sharing one
+filesystem identity.
+
+Expected discovery and canonical:
+
+``` text
+foo/bar     canonical
+foo.txt     dependent
+```
+
+A flat byte comparison of `/`-joined paths would pick `foo.txt`
+(0x2E < 0x2F); that result is non-conforming. The test must also assert
+that the scanner's emission order equals the order of the emitted
+`FluxPathKey` values sorted bytewise.
+
 ------------------------------------------------------------------------
 
 # 71. Windows Ordering Acceptance Test
@@ -2474,9 +3475,10 @@ Symlink action:
     link → real/file
 ```
 
-The symlink must not appear as a hardlink group member.
+The symlink must not appear as a member of `real/file`'s hardlink group.
 
-Repeat with multiple hardlinks and symlinks.
+Repeat with multiple hardlinks and symlinks, including a symlink inode
+with two entries, which forms its own group (Section 12.1).
 
 ------------------------------------------------------------------------
 
@@ -2801,7 +3803,8 @@ flux copy /data /backup
 ``` bash
 flux copy \
   --workers auto \
-  --verify=blake3 \
+  --verify=destination \
+  --hash=blake3 \
   --hardlinks=auto \
   --reflink=auto \
   --sparse=auto \
@@ -2918,11 +3921,11 @@ flux cleanup /backup
 
        .flux/operations/<operation-id>/
                     │
-          ┌─────────┼──────────┐
-          ▼         ▼          ▼
-       manifest   state.db   topology.db
-          │         │          │
-          └─────────┴──────────┘
+          ┌─────────┬─────────┼──────────┬───────────┐
+          ▼         ▼         ▼          ▼           ▼
+       manifest  state.db  topology.db  wal/    checkpoints/
+          │         │         │          │           │
+          └─────────┴─────────┴──────────┴───────────┘
                     │
                lock + lease
                     │
@@ -3083,8 +4086,9 @@ not:
 symlink = alias to the target object's topology
 ```
 
-Therefore a symlink never enters the hardlink topology graph unless
-explicit link-following semantics are enabled.
+Therefore a symlink never joins its target's hardlink group unless
+explicit link-following semantics are enabled. A symlink inode that
+itself has several entries forms its own group (Section 12.1).
 
 ------------------------------------------------------------------------
 
@@ -3162,11 +4166,14 @@ The following decisions are mandatory for the implementation:
 
 1.  Canonical hardlink identity is immutable for the lifetime of an
     operation.
-2.  A failed canonical hardlink member is never dynamically promoted.
+2.  A failed canonical hardlink member is never dynamically replaced as
+    canonical. Fallback materialization (Section 253) may select a
+    different materialization anchor without changing `canonical_path`.
 3.  Dependent hardlink actions are held outside the worker execution
     queue until their canonical object is materialized.
 4.  Single-file destination targets require destination-path locking in
-    addition to operation locking.
+    addition to operation locking; for a single-file operation one lock
+    serves as both (Section 98).
 5.  Path ordering uses a platform-independent, byte-preserving
     `FluxPathKey`.
 6.  Weak or unavailable filesystem object identity cannot establish
@@ -3207,48 +4214,90 @@ enum TopologyState {
     Copying {
         operation_id: OperationId,
         canonical_path: RelativePath,
+        current_attempt_id: AttemptId,
+        attempt_number: u64,
+        candidate_path: RelativePath,
     },
     Materialized {
         destination_path: RelativePath,
+        attempt_id: AttemptId,
     },
     Failed {
         error_code: ErrorCode,
+        last_attempt_id: AttemptId,
     },
+    // Every member's target is skipped by the existing-destination
+    // policy (Section 253.7).
+    Skipped,
 }
 ```
+
+This is the authoritative payload-bearing definition (Section V14.4).
+Field semantics:
+
+-   `canonical_path` is the immutable deterministic representative
+    (Sections 13, 204). It never changes.
+-   `candidate_path` is the member the current attempt is
+    materializing. It equals `canonical_path` until fallback
+    materialization selects another candidate (Sections 253, 259.2). A
+    candidate never becomes canonical.
+-   `current_attempt_id` identifies the authoritative current execution
+    attempt (Section 202). It is the value that Section V14.3 attempt
+    fencing compares against.
+-   `attempt_number` is the ordinal of the current attempt within the
+    whole hardlink group, counting retries and fallback candidates
+    alike, starting at 1 for the initial attempt. It is durable and
+    survives restart, and it is bounded by the per-group retry budget
+    (Section 206).
+-   `Materialized.destination_path` is the `materialization_anchor`
+    (Section 259.2): the destination path of the member that actually
+    created the object. It may differ from `canonical_path`.
+-   `Failed` is terminal: every viable candidate has been exhausted or
+    proven unusable (Sections 253.5, 259.2).
 
 The valid transitions are:
 
 ``` text
 Unresolved
     │
-    │ claim canonical
+    │ claim canonical (creates attempt 1, candidate = canonical_path)
     ▼
-Copying(OperationId)
+Copying { current_attempt_id = A1 }
     │
-    ├──────── success ────────► Materialized(Path)
+    ├── attempt succeeds ──────────────────────► Materialized { anchor, attempt }
     │
-    └──────── failure ────────► Failed(Error)
+    ├── attempt fails; a retry or fallback
+    │   candidate remains ────────────────────► Copying { current_attempt_id = A2 }
+    │
+    └── attempt fails; no viable candidate
+        remains ──────────────────────────────► Failed { error, last attempt }
 ```
+
+Retries and fallback attempts never leave `Copying`. A failed attempt is
+recorded in its immutable execution history (Section 202), and a new
+attempt becomes `current_attempt_id`.
 
 There is no:
 
 ``` text
-Failed → Copying(new canonical)
+Failed → any other state
+Skipped → any other state
+Materialized → Copying      (during normal execution)
+Copying → Unresolved        (including crash recovery; Section 123)
 ```
 
-transition.
+transition. `Failed` and `Skipped` are terminal. `Unresolved → Skipped`
+happens when every member's target is skipped and no further member can
+appear (Section 253.7); nothing is copied or linked.
 
-There is also no:
+Every transition out of `Copying` names the expected
+`current_attempt_id` and is applied by compare-and-swap. A transition
+whose expected attempt is not the current attempt changes nothing
+(Section 91).
 
-``` text
-Materialized → Copying
-```
-
-transition during normal execution.
-
-This makes canonical selection immutable and prevents concurrent workers
-from changing the topology decision.
+This makes canonical selection immutable and prevents concurrent workers,
+or stale work from a superseded attempt, from changing the topology
+decision.
 
 ------------------------------------------------------------------------
 
@@ -3266,7 +4315,8 @@ sequence.
 
 That sequence has a race.
 
-Instead the topology store must provide an atomic claim operation:
+Instead the topology store must provide an atomic claim operation and
+attempt-fenced transitions:
 
 ``` rust
 trait TopologyStore {
@@ -3275,46 +4325,106 @@ trait TopologyStore {
         identity: FileIdentity,
     ) -> Result<Option<TopologyRecord>>;
 
+    // Unresolved → Copying; creates attempt 1 for candidate_path:
+    // canonical_path, or the first member whose target the
+    // existing-destination policy does not skip (Section 253.7).
     fn claim_canonical(
         &self,
         identity: FileIdentity,
         operation_id: OperationId,
         canonical_path: RelativePath,
+        candidate_path: RelativePath,
     ) -> Result<ClaimResult>;
 
+    // Current attempt Running → Failed. The record stays Copying.
+    fn record_attempt_failure(
+        &self,
+        identity: FileIdentity,
+        attempt_id: AttemptId,
+        error_code: ErrorCode,
+    ) -> Result<TransitionResult>;
+
+    // Retry or fallback: requires the expected current attempt to be
+    // Failed and the retry/candidate budget to allow a new attempt.
+    // Creates the new attempt and makes it current.
+    fn begin_attempt(
+        &self,
+        identity: FileIdentity,
+        expected_attempt_id: AttemptId,
+        candidate_path: RelativePath,
+    ) -> Result<TransitionResult>;
+
+    // Copying → Materialized { destination_path = anchor }.
     fn mark_materialized(
         &self,
         identity: FileIdentity,
+        attempt_id: AttemptId,
         destination_path: RelativePath,
-    ) -> Result<()>;
+    ) -> Result<TransitionResult>;
 
+    // Copying → Failed (terminal). Requires the current attempt to be
+    // Failed and no viable candidate to remain.
     fn mark_failed(
         &self,
         identity: FileIdentity,
+        attempt_id: AttemptId,
         error_code: ErrorCode,
-    ) -> Result<()>;
+    ) -> Result<TransitionResult>;
+
+    // Unresolved → Skipped (terminal). Every member's target is skipped
+    // and no further member can appear (Section 253.7).
+    fn mark_skipped(
+        &self,
+        identity: FileIdentity,
+    ) -> Result<TransitionResult>;
 }
 ```
 
-`claim_canonical` must be implemented as a transactional
-compare-and-swap or equivalent database transaction.
+`claim_canonical` and every transition must be implemented as a
+transactional compare-and-swap or equivalent database transaction. The
+attempt record (Section 202) and the topology record are updated in the
+same transaction.
 
-Possible result:
+Possible results:
 
 ``` rust
 enum ClaimResult {
-    Claimed,
-    AlreadyCopying,
+    Claimed {
+        attempt_id: AttemptId,
+    },
+    AlreadyCopying {
+        current_attempt_id: AttemptId,
+    },
     AlreadyMaterialized {
         destination_path: RelativePath,
     },
     AlreadyFailed {
         error_code: ErrorCode,
     },
+    AlreadySkipped,
+}
+
+enum TransitionResult {
+    Applied,
+    // The same transition was already applied by the same attempt;
+    // an idempotent no-op (duplicate delivery, Section V14.7.4).
+    AlreadyApplied,
+    // The named attempt is not the current attempt; nothing changed.
+    StaleAttempt {
+        current_attempt_id: AttemptId,
+    },
+    // The record is not in a state that permits this transition
+    // (for example Unresolved, or already terminal); nothing changed.
+    InvalidState,
 }
 ```
 
 Only one worker may successfully claim `Unresolved`.
+
+A transition carrying a superseded `attempt_id` MUST return
+`StaleAttempt` and MUST NOT change the topology record, the execution
+history, or any dependent state. This fence applies at the store, not
+only to scheduler events (Section V14.3).
 
 ------------------------------------------------------------------------
 
@@ -3335,6 +4445,11 @@ BLOCKED_BY_CANONICAL_FAILURE
 ```
 
 They must not execute `link()`.
+
+Here `FAILED` is the terminal `TopologyState::Failed` (Section 90): no
+retry or fallback candidate remains. While a retry or fallback candidate
+can still materialize the object, the record stays `Copying` and
+dependents stay held (Section 94); they are not blocked.
 
 The final operation report must distinguish:
 
@@ -3435,8 +4550,8 @@ Failed
 the dependents are completed as blocked failures without consuming
 worker slots.
 
-The hold index itself must be bounded in RAM and may spill to persistent
-state.
+The hold index is persistent from the moment each dependent is
+discovered (Section 232). RAM holds only a bounded cache of it.
 
 ------------------------------------------------------------------------
 
@@ -3485,20 +4600,14 @@ For a single-file destination:
 DEST/target.flux-lock
 ```
 
-or an equivalent native locking primitive protects:
+protects:
 
 ``` text
 DEST/target
 ```
 
-The target lock identity is derived from the normalized destination
-target, including its canonical:
-
-``` text
-FluxPathKey
-```
-
-and is not derived from the operation ID.
+The target lock is named after the destination target (Section 96.1) and
+is not derived from the operation ID.
 
 Therefore:
 
@@ -3512,13 +4621,133 @@ must contend for the same target lock.
 The second operation must receive:
 
 ``` text
-TARGET_LOCKED
+TARGET_LOCK_BUSY
 ```
 
 unless an explicit future wait/retry mode is enabled.
 
 A target lock establishes namespace exclusivity. It does not, by itself,
 establish object identity or object continuity.
+
+## 96.1 Name-Equivalent Target Locks
+
+Destination filesystems differ in which names denote the same entry.
+Some ignore case, some ignore case only in particular directories, and
+some treat different Unicode normalization forms as the same name. No
+fixed lexical rule matches all of them, and `FluxPathKey` deliberately
+folds nothing (Section 103). A lock keyed by `FluxPathKey`, or by a digest
+of it, would give two spellings of one destination entry two separate
+locks. Measured on NTFS: `Backup` and `backup` are one entry, while the
+NFC and NFD forms of `café` are two.
+
+Flux therefore lets the destination filesystem decide. A target lock is a
+lock file created in the target's parent directory `P`, named after the
+target:
+
+``` text
+P/<name>.flux-lock
+```
+
+where `<name>` is the target's final path component exactly as the
+operation will publish it. The lock file is created with exclusive
+creation (`O_CREAT | O_EXCL`, `CREATE_NEW`, or the platform equivalent).
+Because it lives in the same directory as the target, and its name is the
+target's name plus a suffix beginning with an ASCII `.`, the filesystem
+applies the same name equivalence to the lock as to the target. Two
+spellings the filesystem treats as one entry cannot both create their
+lock; two names it treats as distinct never share one.
+
+When exclusive creation fails because the lock already exists:
+
+``` text
+record names another operation
+    → ownership rules of Sections 240 and 252 (TARGET_LOCK_BUSY,
+      TARGET_LOCK_UNCERTAIN, or recovery under Section 21.1)
+
+record names this operation, for a different target spelling
+    → the two targets alias on the destination:
+      DESTINATION_NAMESPACE_COLLISION (Section 241.5)
+
+record cannot be read (an I/O or permission error), or fails its
+checksum (Section 259.6)
+    → uncertain ownership (Section 240.4)
+
+object at the lock path is not a Flux lock record at all
+    → CONTROL_PLANE_NAMESPACE_CONFLICT; the object is never overwritten
+```
+
+A Flux lock record is overwritten in place only by a `--break-lock`
+takeover (Section 240.5); the OS-native lock serializes takeovers but
+never replaces the named lock file. A foreign object is never touched.
+
+The lock record (Section 259.6) stores the spelling that created it. A
+contender whose spelling differs, but whose creation fails, is contending
+for the same entry.
+
+An OS-native lock, such as a byte-range lock or `flock` on the lock file,
+may be held on the lock file to prove the owner is alive (Sections 240,
+252). It never replaces the named lock file, because a primitive keyed by
+anything other than the filesystem's own resolution of `<name>` loses the
+name equivalence.
+
+Where the destination provides OS-native locks (Section 235.1), the
+acquirer holds that lock before it writes its record. It takes the lock
+as part of the exclusive creation where the platform can do both in one
+call (for example `O_EXLOCK` with `O_CREAT | O_EXCL`), and otherwise
+immediately after it. In between, another invocation can open the new
+file and take its lock, because inspecting a lock (Section 240.1 step 3)
+and recovering one (Section 240.3 step 1) both try to take it. If the
+acquirer cannot take the lock, it removes the lock file it created and
+starts the acquisition again (Section 21.1 step 1); it never writes a
+record while another process holds the lock. A record written without the
+lock proves nothing about its owner, and Section 240.2 would read
+whichever process does hold the lock as that owner.
+
+If `<name>.flux-lock` would exceed the directory's name-length limit, the
+operation takes the directory lock instead, which covers every target in
+`P`:
+
+``` text
+P/.flux-dir.lock
+```
+
+Per-name locks and the directory lock exclude each other by announcing,
+then checking:
+
+``` text
+per-name acquirer    create P/<name>.flux-lock, then check that
+                     P/.flux-dir.lock is absent
+directory acquirer   create P/.flux-dir.lock, then list P (non-recursively)
+                     for *.flux-lock held by other operations
+```
+
+On a conflict the acquirer removes what it created and reports
+`TARGET_LOCK_BUSY`. Both acquirers may back off; both can never proceed.
+
+A target `T` with no parent (a filesystem root: `/`, `C:\`, a share root)
+has no `P` to hold a lock file. Its lock is instead:
+
+``` text
+T/.flux-root.lock
+```
+
+created exclusively inside `T`. It is Flux control state: never copied,
+compared, or reported as extra (Sections 4.2, 259.3). `--atomic=always`
+with a root `DEST` is refused with `ATOMIC_DIRECTORY_REPLACE_UNSUPPORTED`,
+because a root cannot be replaced (Section 259.9).
+
+Exclusive creation on a remote filesystem is trusted only under the lock
+capability rules of Section 235; otherwise `REMOTE_LOCK_UNSAFE`.
+
+## 96.2 Lock Refusal Reports the Holder
+
+A refusal with `TARGET_LOCK_BUSY`, `OPERATION_LOCKED`, or
+`TARGET_LOCK_UNCERTAIN` reports, where the lock record is readable, the
+recorded holder's `owner_instance_id`, `boot_session_id`, `workspace_path`,
+and `last_heartbeat_wall_time`. These are the record's contents, and like
+all lock metadata they are descriptive (Section 99.1): they name the
+operation that wrote the lock, which need not be the process holding it
+when the refusal is made (Section 240.2).
 
 ------------------------------------------------------------------------
 
@@ -3538,8 +4767,50 @@ Required invariant:
 > Two Flux operations may not concurrently publish or destructively
 > replace the same destination object.
 
-The target-lock key MUST remain stable for the normalized destination
-namespace/path even when the filesystem's object identity is weak.
+Target locks, including the lock on a directory operation's destination
+root, follow Section 96.1. They depend on the destination's name
+resolution, not on object identity, so they remain valid when the
+filesystem's object identity is weak.
+
+## 97.1 Nested Destination Roots
+
+Two operations whose destination roots nest (for example `DEST=/backup`
+and `DEST=/backup/archive`) take unrelated locks (Section 96.1); Section
+97's invariant does not by itself stop one from publishing into the
+other's tree while it runs.
+
+(a) After a directory operation creates its own destination-root lock, it
+checks each ancestor of DEST's physical path (every directory from the
+filesystem root down to DEST's parent) for a Flux root lock
+`<parent-of-ancestor>/<ancestor-name>.flux-lock`, or
+`<parent-of-ancestor>/.flux-dir.lock` (the Section 96.1 long-name
+fallback, which covers every target in that directory), or, for the
+filesystem root itself, `<root>/.flux-root.lock` (Section 96.1). It
+classifies each lock it finds as Section 240 does: a live owner → it
+releases its own lock and refuses with `TARGET_LOCK_BUSY`; uncertain
+ownership → it releases its own lock and refuses with
+`TARGET_LOCK_UNCERTAIN`; a demonstrably abandoned owner is not an
+obstacle. An ancestor lock whose record cannot be read counts as uncertain ownership. In both refusals the operator resolves
+the ancestor's lock itself (for example `flux cleanup --target <ancestor>
+--break-lock`, Section 240.5). If removing its own lock fails, the
+refusal reports that lock's path and exits 1 (Section 55); the lock has no live owner and is
+recovered like any dead owner's lock (Section 240.3). Creating its own
+lock first, then checking, mirrors Section 96.1's acquirer protocol, so
+two racing operations can never both proceed.
+
+(b) When the writer is about to create a destination directory `D`, or
+write into an existing one, it checks for `D`'s own root lock
+`<parent-of-D>/<D-name>.flux-lock` (or `<parent-of-D>/.flux-dir.lock`,
+Section 96.1). If a live operation holds it, nothing under `D` is
+written; each affected action fails with `TARGET_LOCK_BUSY`
+(path-scoped, retry category `lock_conflict`, Section 207) and the rest of
+the operation continues. A hardlink candidate under `D` moves to the next
+candidate without spending attempt budget (Section 253.2).
+
+Together, (a) and (b) cover both start orders: an operation whose DEST is
+D and that starts after this one refuses under (a), because this
+operation's root lock is on its ancestor; one that started before is
+found by (b) before anything under D is created or written.
 
 ------------------------------------------------------------------------
 
@@ -3555,6 +4826,11 @@ To prevent lock-order deadlocks, the implementation must use this order:
 
 A topology operation must never acquire an operation lock after entering
 a topology transaction.
+
+A single-file operation holds one lock, its target lock
+(`target.flux-lock`, Section 96.1), which also serves as its operation
+lock. Acquiring it satisfies steps 1 and 2, and revalidation (Section 99)
+checks it once for both roles.
 
 If platform constraints require another order internally, the
 implementation must establish an equivalent globally consistent ordering
@@ -3592,6 +4868,20 @@ destination target lock still owned
 operation not cancelled
 ```
 
+"Still owned" means that every lock the operation holds (its operation
+lock and its target lock; one file for a single-file operation, Section
+98) is a lock file at its lock path holding this operation's own record
+(its `operation_id` and `owner_instance_id`). When an ownership check
+fails, the worker performs nothing further; the operation stops, reports
+`TARGET_LOCK_BUSY`, and stays resumable. When the operation is no longer
+active because it was superseded (Section 21.1) or reached a terminal
+state (Section 20), the worker performs nothing further and does not
+change the operation's state; this is checked first. Otherwise, when the
+operation has been cancelled, the worker performs nothing further and
+the operation pauses (`PAUSED`, Sections 20, 132). A worker writes
+`PAUSED` only over `TRANSFERRING`, never over a state another process
+wrote.
+
 For atomic publication:
 
 ``` text
@@ -3609,8 +4899,8 @@ invalidate ownership.
 A weak or unavailable filesystem identity does NOT by itself invalidate
 a strong, authoritative, path-scoped target lock.
 
-Target-lock identity is based on the authoritative destination namespace
-and canonical `FluxPathKey` of the target.
+Target-lock identity is the target's name as the destination filesystem
+resolves it in the target's parent directory (Section 96.1).
 
 Therefore:
 
@@ -3764,6 +5054,36 @@ struct FluxPathKey(Vec<u8>);
 
 It is not necessarily the filesystem path encoding.
 
+Normative encoding:
+
+``` text
+FluxPathKey = c1 0x00 c2 0x00 ... 0x00 cn
+```
+
+where `c1 .. cn` are the components of the path relative to the
+operation's destination root: the source root's destination prefix
+(Section 18.3) followed by the path's components relative to that source
+root. Each component is in its exact platform byte form (Sections 104,
+105, 241). A source root itself encodes as its prefix, which is the empty
+key when the prefix is empty. For a single root mapped onto the
+destination root, the key is simply the source-relative path.
+
+The byte `0x00` cannot occur inside a component: POSIX filenames cannot
+contain NUL, and Windows/NTFS filenames cannot contain U+0000 (whose
+WTF-8 encoding is the only way to produce `0x00`). A platform adapter that
+nevertheless observes a component containing `0x00` MUST report the entry
+as `PATH_COMPONENT_INVALID` and MUST NOT construct a key for it.
+
+Because `0x00` is smaller than every byte that can occur in a component,
+plain bytewise comparison of `FluxPathKey` values (the derived `Ord` of
+`Vec<u8>`) is exactly the component-wise order of Section 7.2. Persistent
+indexes with byte-ordered keys may therefore store keys directly, without
+a custom comparator.
+
+`FluxPathKey` is an ordering and identity key, not a display string
+(Section 245). The `/`-joined relative path remains the display and
+destination-mapping representation.
+
 Properties:
 
 ``` text
@@ -3839,6 +5159,11 @@ for ordering.
 Where a byte-preserving WTF-8-style representation is used internally,
 it must be specified and tested as an encoding of Windows UTF-16 code
 units, not assumed to be equivalent to arbitrary Unix byte strings.
+
+Flux uses extended-length paths (`\\?\`) for every filesystem call on
+Windows, so the legacy 260-character path limit never applies. A name
+or path the destination still refuses as too long fails that action
+with `DESTINATION_ERROR` (`path_scoped`, Section 207).
 
 ------------------------------------------------------------------------
 
@@ -4108,19 +5433,8 @@ trait StableSourceReader {
 }
 ```
 
-Capability detection:
-
-``` rust
-struct FsCapabilities {
-    stable_snapshot_read: bool,
-    reflink: bool,
-    sparse: bool,
-    hardlink: bool,
-    atomic_replace: bool,
-    xattrs: bool,
-    acl: bool,
-}
-```
+Capability detection reports it as `FsCapabilities::stable_snapshot_read`
+(Section 62).
 
 If stable snapshot reading is unavailable, Flux must report the actual
 guarantee level rather than implying stronger semantics.
@@ -4129,8 +5443,9 @@ guarantee level rather than implying stronger semantics.
 
 # 113. Stage A Capacity Forecast
 
-Stage A performs an early, conservative capacity forecast before
-execution.
+Stage A performs an early, conservative capacity forecast. It runs
+alongside scanning and copying and never delays the first transfer
+(Section 146.1).
 
 The forecast considers, where applicable:
 
@@ -4381,8 +5696,8 @@ DEST/
 └── target.flux-lock
 ```
 
-The lock may be implemented using an OS-native lock primitive rather
-than a persistent visible file.
+An OS-native lock may be held on the lock file for liveness, but never
+replaces it (Section 96.1).
 
 ## Directory
 
@@ -4394,6 +5709,7 @@ DEST/
             ├── manifest
             ├── state.db
             ├── topology.db
+            ├── wal/
             ├── checkpoints/
             └── lock
 ```
@@ -4426,13 +5742,27 @@ partial target
 
 must form a validated relationship.
 
-For directory operations:
+For directory operations, discovery starts from the destination root's
+lock, `P/<DEST-name>.flux-lock` (Section 96.1). Its record names the
+operation's workspace:
 
 ``` text
-destination/.flux/operations/
+DEST/.flux/operations/<operation-id>/                   normal operations
+P/.flux/atomic/<target-key>/<operation-id>/             whole-tree atomic staging
+                                                        (Section 259.10)
 ```
 
-is the authoritative discovery location.
+The recorded `workspace_path` is trusted only if it equals one of these
+two paths, derived from the lock's own target and `operation_id`, or is
+`none`, which marks a cleanup lock that names no workspace (Section
+259.6). Any other value makes the record unverifiable:
+`ARTIFACT_OWNERSHIP_UNCERTAIN`; nothing at the recorded path is read,
+adopted, or deleted.
+
+If the lock is missing, Flux checks both locations, each non-recursively:
+`DEST/.flux/operations/` and `P/.flux/atomic/<target-key>/` for DEST's
+own key (Section 259.10). A filesystem-root DEST has only the first.
+Both are authoritative discovery locations; nothing else is searched.
 
 ------------------------------------------------------------------------
 
@@ -4443,22 +5773,58 @@ Resume requires compatibility of:
 ``` text
 source mapping
 destination mapping
+selection: --exclude patterns, --links, --cross-filesystems,
+           --recursive / --no-recursive
 hardlink mode
 atomic mode
 verification policy
 sparse policy
 reflink policy
 metadata policy
+special-files policy
+existing-destination policy (Section 5.1)
+retry policy (--retries)
+durability mode (--durability)
 chunk size
 hash algorithm
 state format
 ```
+
+Selection options must match exactly, because hardlink canonical members
+are the smallest *selected* members (Section 13) and are immutable once
+recorded (Section 204); a different selection could change them.
+
+Two options may change in one direction only:
+
+``` text
+--retries      may increase; the durable attempt count is kept (Section
+               206). A decrease is INCOMPATIBLE_STATE.
+--durability   may change from normal to strict. It applies to checkpoints
+               written after the resume; earlier checkpoints keep the
+               guarantee they were written with. strict to normal is
+               INCOMPATIBLE_STATE.
+```
+
+These may change freely on resume: `--workers`, `--json`, `--quiet`,
+`-v` / `-vv` / `-vvv`, `--heartbeat-interval` (when implemented; Section
+101), `--lease-timeout` (when implemented; Section 101).
+
+`--resume-verify` may also change. If the requested level needs chunk
+digests that were compacted away under a weaker policy (Section 211),
+Flux validates the partial data with `full` instead, re-reading and
+hashing source and destination, never with anything weaker, and reports
+the upgrade.
 
 Changes that cannot be safely migrated produce:
 
 ``` text
 INCOMPATIBLE_STATE
 ```
+
+Source and destination mappings are compared as the set of
+`(source_root, destination_prefix)` pairs recorded in the manifest
+(Section 19). Listing the same roots in a different command-line order
+is compatible; adding, removing, or remapping a root is not.
 
 ------------------------------------------------------------------------
 
@@ -4520,19 +5886,21 @@ If committed:
 → Materialized
 ```
 
-If not:
+If not committed, the record stays `Copying` with the same
+`current_attempt_id`:
 
 ``` text
-→ Unresolved
+attempt safely recoverable
+    → resume the same attempt (a crash does not create a new attempt)
+
+attempt not safely recoverable
+    → durably record the attempt as Failed, then apply the normal
+      retry / fallback / terminal rules (Sections 90, 206, 253)
 ```
 
-or:
-
-``` text
-→ Failed
-```
-
-according to the recovery result.
+Recovery MUST NOT return a record to `Unresolved`. Re-claiming would
+discard the durable attempt count and create implicit retries (Section
+206).
 
 The canonical path itself does not change.
 
@@ -4565,6 +5933,18 @@ SYMLINK alias -> real/file
 ```
 
 Topology state tracks only the identity of `real/file`.
+
+Under:
+
+``` text
+--links=skip
+```
+
+symlinks are not created at the destination. Each skipped symlink is
+recorded in the operation report as skipped, with `relative_path`,
+`object_type=symlink`, and `action=skipped`, as for unsupported special
+files (Section 233.1). It is never silently dropped. A skipped symlink
+adds no topology and blocks no other action.
 
 ------------------------------------------------------------------------
 
@@ -4686,7 +6066,7 @@ If symlink creation fails because required Windows capability/privilege
 is unavailable:
 
 ``` text
-LINK_CREATION_UNAVAILABLE
+SYMLINK_CREATION_UNAVAILABLE
 ```
 
 for strict behavior.
@@ -4696,8 +6076,8 @@ must not silently change the object type.
 
 No elevation prompt is performed by the core engine.
 
-The CLI may provide a platform-specific diagnostic explaining the
-required Windows privilege/policy.
+The report for `SYMLINK_CREATION_UNAVAILABLE` names the required
+privilege or policy (Developer Mode or `SeCreateSymbolicLinkPrivilege`).
 
 ------------------------------------------------------------------------
 
@@ -4799,16 +6179,19 @@ final lock/check succeeds
 
 # 131. Cleanup Safety
 
-`flux cleanup` must display classification:
+`flux cleanup` must display each operation's status and whether it is
+eligible for deletion, using the names of Section 251.1:
 
 ``` text
-ACTIVE
+LIVE
 RESUMABLE
 STALE
-DELETE-CANDIDATE
+COMPLETED_BUT_UNCLEAN
+UNCERTAIN
+CORRUPT
 ```
 
-No active operation may be deleted.
+No `LIVE` operation may be deleted.
 
 Manual force mode must still respect the active OS lock.
 
@@ -4822,9 +6205,9 @@ active-operation ownership.
 On normal cancellation:
 
 ``` text
-RUNNING
+TRANSFERRING
    ↓
-PAUSING
+pausing          (in-process only; never persisted, Section 20)
    ↓
 PAUSED
 ```
@@ -4873,7 +6256,7 @@ metadata failure
 
 must not be confused with content-copy failure.
 
-Strictness is controlled by the metadata policy.
+Strictness is controlled by the metadata policy (Section 44.1).
 
 ------------------------------------------------------------------------
 
@@ -4933,6 +6316,9 @@ hash destination
 compare expected digest
 ```
 
+The read opens the written file anew and reads it through the
+filesystem; a buffer kept from writing never substitutes.
+
 Only then may atomic publication occur.
 
 The source-stream digest remains useful even when destination
@@ -4945,8 +6331,14 @@ verification is enabled.
 A file is divided into fixed-size chunks:
 
 ``` text
-chunk_size = configurable
+chunk_size = 1 MiB (1,048,576 bytes), fixed, not configurable
 ```
+
+`chunk_size` is recorded in the manifest. A file of N bytes has
+`ceil(N / chunk_size)` chunks; the last chunk is shorter when N is not a
+multiple of `chunk_size`. Resume compatibility of chunk size (Section
+121) is unchanged: a manifest recording a different `chunk_size` is
+`INCOMPATIBLE_STATE`.
 
 Each completed chunk may store:
 
@@ -5070,14 +6462,14 @@ power-loss durability
 Without explicit flush guarantees, successful `write()` does not
 necessarily mean data survives sudden power loss.
 
-The implementation may provide:
+Flux provides:
 
 ``` text
 --durability=normal
 --durability=strict
 ```
 
-in a future release.
+as defined in Section 165.
 
 ------------------------------------------------------------------------
 
@@ -5090,6 +6482,7 @@ trait Scanner {
     fn next(&mut self) -> Result<Option<DiscoveryRecord>>;
 }
 
+// Full definition, results, and fencing rules: Section 91.
 trait TopologyStore {
     fn lookup(&self, identity: FileIdentity)
         -> Result<Option<TopologyRecord>>;
@@ -5099,19 +6492,41 @@ trait TopologyStore {
         identity: FileIdentity,
         operation_id: OperationId,
         canonical_path: RelativePath,
+        candidate_path: RelativePath,
     ) -> Result<ClaimResult>;
+
+    fn record_attempt_failure(
+        &self,
+        identity: FileIdentity,
+        attempt_id: AttemptId,
+        error_code: ErrorCode,
+    ) -> Result<TransitionResult>;
+
+    fn begin_attempt(
+        &self,
+        identity: FileIdentity,
+        expected_attempt_id: AttemptId,
+        candidate_path: RelativePath,
+    ) -> Result<TransitionResult>;
 
     fn mark_materialized(
         &self,
         identity: FileIdentity,
+        attempt_id: AttemptId,
         destination_path: RelativePath,
-    ) -> Result<()>;
+    ) -> Result<TransitionResult>;
 
     fn mark_failed(
         &self,
         identity: FileIdentity,
+        attempt_id: AttemptId,
         error_code: ErrorCode,
-    ) -> Result<()>;
+    ) -> Result<TransitionResult>;
+
+    fn mark_skipped(
+        &self,
+        identity: FileIdentity,
+    ) -> Result<TransitionResult>;
 }
 
 trait OperationStore {
@@ -5239,6 +6654,7 @@ DEST/.flux/operations/<operation-id>/
     ├── manifest
     ├── state.db
     ├── topology.db
+    ├── wal/
     ├── checkpoints/
     └── lock
 ```
@@ -5434,14 +6850,22 @@ path.
 The scheduler consumes an internal event:
 
 ``` rust
+// Attempt fields and fencing rules: Section V14.3.
 enum SchedulerEvent {
     CanonicalMaterialized {
         identity: FileIdentity,
         destination_path: RelativePath,
+        operation_id: OperationId,
+        attempt_id: AttemptId,
+        attempt_number: u64,
     },
 
     CanonicalFailed {
         identity: FileIdentity,
+        destination_path: RelativePath,
+        operation_id: OperationId,
+        attempt_id: AttemptId,
+        attempt_number: u64,
         error_code: ErrorCode,
     },
 
@@ -5450,6 +6874,13 @@ enum SchedulerEvent {
     },
 }
 ```
+
+`OperationStateChanged` is emitted when the operation's persisted state
+(Section 20) changes, for example to `PAUSED` after cancellation. On
+receiving it the scheduler reads the persisted state and stops admitting
+new work unless that state is `TRANSFERRING`. It carries no attempt, so
+attempt fencing (Section V14.3) does not apply; a duplicate or late
+delivery is harmless because the scheduler acts on the persisted state.
 
 The event itself is not the authoritative state.
 
@@ -5480,8 +6911,13 @@ load topology records
       │
       ├── Failed → block dependents
       │
+      ├── Skipped → dependents Skipped
+      │
       └── Copying/Unresolved → retain hold
 ```
+
+Dependents already `Released` before the crash are re-run with the
+idempotent link steps of Section 16.1.
 
 No polling loop is required during normal operation.
 
@@ -5709,8 +7145,9 @@ If it changes unexpectedly:
 DIRECTORY_CHANGED_DURING_SCAN
 ```
 
-is raised or the directory is rescanned according to the configured
-mutation policy.
+is raised. That directory's subtree is not transferred; the error is
+reported, and the operation's exit status is 1. There is no rescan
+alternative.
 
 ## 149.5 New Destination Directories
 
@@ -5738,6 +7175,28 @@ identity checks
 ```
 
 are all part of the safety model.
+
+## 149.7 Destination-Side Resolution
+
+Sections 149.3--149.5 bind the scanner. The writer is bound too: a
+directory Flux created or entered under `DEST` could be replaced by a
+link before its descendants are written.
+
+`DEST` itself is resolved once, at start. Below it, the writer creates and
+opens every destination entry relative to a directory handle it holds for
+the parent, reached by walking down from `DEST`'s root without following
+links (POSIX: `openat` with `O_NOFOLLOW` and `O_DIRECTORY`; Windows:
+handle-relative opens that do not follow reparse points).
+
+If a component under `DEST` is a symlink, junction, or other reparse point
+that this operation did not create, that path is rejected: its actions
+fail with `SAFETY_REJECTED` and are reported, and the rest of the
+operation continues (exit status 1, Section 55). Symlinks this operation
+creates are leaves; the writer never walks through them. Any other error
+on the walk (a component that is missing or not a directory, or an I/O or
+permission error) fails that path's actions with the matching code
+(`DESTINATION_ERROR`, `IO_ERROR`, or `PERMISSION_DENIED`, Section 55),
+`path_scoped` (Section 207).
 
 ------------------------------------------------------------------------
 
@@ -5819,7 +7278,7 @@ The implementation must preserve all of the following:
 
 ``` text
 1. Canonical hardlink selection is deterministic and immutable.
-2. Canonical failure never promotes another member.
+2. Canonical failure never promotes another member to canonical (fallback anchors: Section 253).
 3. Dependents never consume worker slots while waiting.
 4. Canonical completion releases dependents through an event-driven path.
 5. Persistent topology remains authoritative after event loss.
@@ -6005,6 +7464,8 @@ Conceptually:
 struct CheckpointMessage {
     operation_id: OperationId,
     file_id: FileId,
+    // Isolates each retry's progress (Section 225).
+    attempt_id: AttemptId,
     generation: u64,
     range_start: u64,
     range_end: u64,
@@ -6187,6 +7648,12 @@ Flux defines:
 ``` text
 --durability=normal
 --durability=strict
+```
+
+Default:
+
+``` text
+normal
 ```
 
 ## Normal
@@ -6518,15 +7985,21 @@ Anything after that boundary remains replayable.
 
 # 178. WAL Rotation
 
-Large WALs must be rotated into segments.
+Large WALs must be rotated into segments, stored in the operation
+workspace's `wal/` directory.
 
 Example:
 
 ``` text
-wal.000001
-wal.000002
-wal.000003
+wal/000001
+wal/000002
+wal/000003
 ```
+
+Segment order comes from the generation and sequence numbers of the
+records each segment contains (Sections 161, 162), never from file names.
+Names are informational, so a name that outgrows its zero padding cannot
+reorder segments.
 
 A segment may be deleted only after all records it contains are covered
 by a durable state snapshot and compaction marker.
@@ -6815,8 +8288,19 @@ drain what can safely be persisted
 enter operation failure/paused state
 ```
 
+Any of these WAL write failures enters the emergency persistence path
+(Section 231.3), not only `ENOSPC`. If the emergency journal fails too,
+Section 231.5 applies.
+
 The final state must accurately indicate whether resume state is
 trustworthy.
+
+Flux sets no deadline on filesystem calls. A call that blocks (a stalled
+network mount, a removed device) blocks the work waiting on it;
+cancellation takes effect when the call returns; a killed process
+recovers through `--resume`. A call abandoned after a deadline could
+still complete later and write into the WAL or a partial file after the
+failure was recorded.
 
 ------------------------------------------------------------------------
 
@@ -6917,7 +8401,8 @@ Normative recovery order:
 3. identify current operation generation
 4. load latest durable checkpoint snapshot
 5. identify durable WAL compaction boundary
-6. open WAL segments
+6. open WAL segments, ordered by their records' generation and sequence
+   numbers (Section 178)
 7. validate records sequentially
 8. truncate only a torn trailing record
 9. reject middle corruption
@@ -7142,6 +8627,7 @@ enum TopologyState {
     Copying,
     Materialized,
     Failed,
+    Skipped,
 }
 ```
 
@@ -7149,6 +8635,10 @@ This state describes the current logical disposition of the canonical
 object.
 
 It does not represent the complete history of execution attempts.
+
+This list names the logical states only. The authoritative
+payload-bearing definition, including the current attempt and the
+materialization anchor, is Section 90 (Section V14.4).
 
 ------------------------------------------------------------------------
 
@@ -7161,6 +8651,11 @@ struct CanonicalExecution {
     attempt_id: AttemptId,
     operation_id: OperationId,
     canonical_path: RelativePath,
+    // Member this attempt materializes; equals canonical_path
+    // unless this is a fallback attempt (Section 253).
+    candidate_path: RelativePath,
+    // Ordinal within the hardlink group, across retries and fallback
+    // candidates; 1 = initial attempt (Section 206).
     attempt_number: u64,
     state: ExecutionState,
     started_at: Timestamp,
@@ -7188,23 +8683,22 @@ Every retry creates a new execution attempt.
 The legal lifecycle is:
 
 ``` text
-Topology:
+Topology:                 Current attempt:
     Unresolved
        ↓
-    Copying
+    Copying               Attempt 1  Running → Failed
+       │                     │ retry
+       │                     ▼
+    Copying               Attempt 2  Running → Succeeded
        ↓
-    Failed
-       │
-       │ retry
-       ▼
-    Copying
-       │
-       ▼
     Materialized
 ```
 
-The `Failed → Copying` operation is implemented by creating a **new
-execution attempt**, not by mutating the historical failed attempt.
+A retry never leaves `Copying`. It is implemented by recording the
+failed attempt and creating a **new execution attempt** that becomes
+`current_attempt_id` (Section 90), not by mutating the historical failed
+attempt. `TopologyState::Failed` is terminal and is reached only when no
+retry or fallback candidate remains.
 
 Example:
 
@@ -7219,8 +8713,9 @@ Attempt 2:
 The topology record can therefore represent:
 
 ``` text
-current state = Copying
-current_attempt = 2
+current state      = Copying
+current_attempt_id = A2
+attempt_number     = 2
 ```
 
 while retaining the immutable history of Attempt 1.
@@ -7259,27 +8754,17 @@ transient execution failures.
 
 # 205. Dependent Hardlink Behavior During Retry
 
-If the canonical attempt fails:
+If a canonical attempt fails and a retry or fallback candidate remains:
 
 ``` text
-canonical
+attempt N Failed
     ↓
-Failed
+record stays Copying
     ↓
-dependents
-    ↓
-BLOCKED_BY_CANONICAL_FAILURE
+attempt N+1 Running
 ```
 
-If a retry begins:
-
-``` text
-Failed
-    ↓
-new attempt Running
-```
-
-dependents remain blocked until the retry reaches:
+dependents stay held (Section 94) until an attempt reaches:
 
 ``` text
 Materialized
@@ -7289,6 +8774,19 @@ Only then may they be released.
 
 A retry must not prematurely release dependents merely because copying
 has restarted.
+
+Dependents become:
+
+``` text
+BLOCKED_BY_CANONICAL_FAILURE
+```
+
+only when the record reaches the terminal `TopologyState::Failed`.
+
+A `CanonicalFailed` scheduler event reports a failed attempt. After
+attempt fencing (Section V14.3), the scheduler either begins a retry or
+fallback attempt (`begin_attempt`) or, when no viable candidate remains,
+applies the terminal `mark_failed`. Only the latter blocks dependents.
 
 ------------------------------------------------------------------------
 
@@ -7320,8 +8818,8 @@ An explicit finite value:
 
 overrides the default for that operation.
 
-An explicit unlimited policy may be requested by the user and is the
-only case in which the retry count is unbounded.
+An explicit unlimited policy (`--retries=unlimited`) may be requested by
+the user and is the only case in which the retry count is unbounded.
 
 Retry count semantics are:
 
@@ -7331,18 +8829,22 @@ Retry count semantics are:
 --retries=3  → at most three retries after the initial attempt
 ```
 
-Therefore, a default operation may contain up to four execution
-attempts: the initial attempt plus three retries.
+Therefore, by default a file, or a whole hardlink group, may use up to
+four execution attempts: the initial attempt plus three retries.
 
-Retry exhaustion produces:
+For a hardlink group the budget is shared: retries of one candidate and
+attempts on fallback candidates (Section 253) all draw on the same
+`initial + N` attempts. Falling back never grants a fresh budget.
+
+Budget exhaustion produces:
 
 ``` text
 CANONICAL_RETRY_EXHAUSTED
 ```
 
-The canonical topology state becomes `Failed`.
-
-Dependents remain:
+and the topology state becomes `Failed`. A group can also become
+`Failed` before the budget is spent: when the failure is file-wide, or
+when no candidate can remain (Section 253.5). Dependents then become:
 
 ``` text
 BLOCKED_BY_CANONICAL_FAILURE
@@ -7392,8 +8894,49 @@ unsupported filesystem operation
 permanent path conflict
 ```
 
-The classification is implementation-defined but must be deterministic
-and observable.
+Which category a given error falls into is implementation-defined, but
+must be deterministic and observable. What each category does is not:
+
+| Category | Behavior |
+|---|---|
+| `retryable` | retried within the attempt budget (Section 206) |
+| `non_retryable` | not retried; a `path_scoped` one may fall back to the next candidate (Section 253.2) |
+| `operator_action_required` | not retried; reported, and the operation can be resumed once the cause is fixed (Section 20) |
+| `source_mutation` | retried within the attempt budget; every attempt re-validates the source (Section 33) |
+| `capacity_failure` | covers only atomic temporary capacity (Section 254); handled by those states, not by the attempt budget |
+| `lock_conflict` | not retried; reported as `TARGET_LOCK_BUSY` (no wait mode, Section 96) |
+| `filesystem_identity_failure` | not retried; `object_scoped` |
+
+`DISK_FULL` on any destination write outside atomic temporary capacity
+(Section 29) is `operator_action_required`: not retried, reported, and
+the operation can be resumed once space is freed.
+
+An `operator_action_required` failure stops the operation, which stays
+resumable (Section 20). It is neither `path_scoped` nor `object_scoped`:
+a hardlink group whose attempt fails this way does not fall back and does
+not become terminal `Failed`. The failed attempt is recorded, no attempt
+budget is spent, and resume starts a new attempt for the same candidate.
+
+Independently, every failure of a hardlink candidate is classified by
+scope:
+
+``` text
+path_scoped
+    tied to one member's path; another member of the same object
+    may succeed. Examples: invalid or colliding destination name
+    (Section 241.5), destination-side permission on the member's
+    parent directory, path too long for the destination.
+
+object_scoped
+    tied to the source object itself; every member reads the same
+    object and would fail the same way. Examples: source read I/O
+    error, source mutation, capacity failure, filesystem identity
+    failure.
+```
+
+Only `path_scoped` failures permit fallback materialization (Section
+253.2). When the scope cannot be established, the failure is treated as
+`object_scoped` (`operator_action_required` excepted, above).
 
 ------------------------------------------------------------------------
 
@@ -7517,7 +9060,8 @@ the resulting representation still provides the exact guarantees
 required by that policy.
 
 The implementation must document the point at which individual chunk
-digests cease to be recoverable.
+digests cease to be recoverable. A later resume that asks for chunk
+validation after that point is validated with `full` (Section 121).
 
 ------------------------------------------------------------------------
 
@@ -7562,12 +9106,13 @@ may be enumerated and cleaned according to the operation lifecycle.
 This includes:
 
 ``` text
-operations/
-topology/
-WAL/
-state/
-manifests/
+operations/    one workspace per directory operation: manifest,
+               state.db, topology.db, wal/ segments, checkpoints/, lock
+               (Section 18.2)
+standalone/    the standalone operation catalog (Section 250)
 ```
+
+There are no other top-level directories under `DEST/.flux/`.
 
 ## Adjacent Single-File Artifacts
 
@@ -7575,8 +9120,8 @@ Single-file transfers may use:
 
 ``` text
 target.flux-lock
-target.flux-partial.<op-id>
-target.flux-state
+target.flux-partial.<operation-id>
+target.flux-state.<operation-id>
 ```
 
 These files are intentionally outside the centralized control-plane
@@ -7594,7 +9139,7 @@ trees for names matching:
 ``` text
 *.flux-lock
 *.flux-partial.*
-*.flux-state
+*.flux-state.*
 ```
 
 Filename pattern matching alone is insufficient evidence of Flux
@@ -7622,10 +9167,12 @@ target_identity
 source_identity
 artifact_type
 format_version
-creation_time
+creation_wall_time
 ```
 
-The exact binary/sidecar representation is implementation-defined.
+This is the minimum; the adjacent state record carries the full list of
+Section 249.1. The exact binary/sidecar representation is
+implementation-defined.
 
 GC must validate the artifact before deletion.
 
@@ -7742,9 +9289,9 @@ for post-commit cleanup status is the adjacent target state record:
 target.flux-state.<operation-id>
 ```
 
-or the implementation's equivalent exact operation-qualified
-`target.flux-state` representation defined by the single-file state
-format.
+This is the only on-disk name for the single-file state record. An
+unsuffixed `target.flux-state` is not a conforming representation, even
+if it stores the operation identity internally.
 
 The centralized managed `.flux` control plane MUST NOT be required
 merely to remember post-commit cleanup status for an isolated
@@ -7839,15 +9386,15 @@ The default policy must favor recoverability over aggressive cleanup.
 
 # 220. Cleanup Safety Matrix
 
-  Artifact                         Normal GC Scope         Ownership Required   Live Lock Check
-  -------------------------------- ----------------------- -------------------- -----------------
-  `.flux/operations/*`             Managed control plane   Yes                  Yes
-  `.flux/WAL/*`                    Managed control plane   Yes                  Yes
-  `.flux/topology/*`               Managed control plane   Yes                  Yes
-  `target.flux-lock`               Adjacent target scope   Yes                  Yes
-  `target.flux-partial.<op-id>`    Adjacent target scope   Yes                  Yes
-  `target.flux-state`              Adjacent target scope   Yes                  Yes
-  Arbitrary `*.flux-*` elsewhere   Never by default        N/A                  N/A
+  Artifact                               Normal GC Scope         Ownership Required   Live Lock Check
+  -------------------------------------- ----------------------- -------------------- -----------------
+  `.flux/operations/*`                   Managed control plane   Yes                  Yes
+  `.flux/standalone/*`                   Managed control plane   Yes                  Yes
+  `target.flux-lock`                     Adjacent target scope   Yes                  Yes
+  `P/.flux-dir.lock`                     Adjacent target scope   Yes                  Yes
+  `target.flux-partial.<operation-id>`   Adjacent target scope   Yes                  Yes
+  `target.flux-state.<operation-id>`     Adjacent target scope   Yes                  Yes
+  Arbitrary `*.flux-*` elsewhere         Never by default        N/A                  N/A
 
 ------------------------------------------------------------------------
 
@@ -7885,8 +9432,8 @@ Orphaned operation workspaces are collectible **only when all applicable
 conditions below are satisfied**:
 
 ``` text
-1. the operation is durably marked COMPLETED, ABANDONED, or another
-   terminal state that proves no further recovery is required;
+1. the operation is durably marked COMPLETED or ABANDONED, the only
+   terminal states (Section 20);
 
 2. no live operation lock exists;
 
@@ -8066,7 +9613,10 @@ The following are normative:
 3. Every retry creates a new execution attempt.
 4. Retry never promotes another hardlink member to canonical status.
 5. Dependents remain blocked until a canonical attempt materializes.
-6. Canonical attempt history survives restart according to retention policy.
+6. Canonical attempt history survives restart. Attempt records are kept
+   for the life of the operation workspace; once a newer attempt starts,
+   the superseded attempt's chunk checkpoints may be discarded, because a
+   new attempt never resumes from a failed attempt's chunks.
 7. Coalescing never destroys information required by the active resume policy.
 8. Strict chunk verification retains every constituent chunk digest.
 9. Adjacent artifact GC is target-scoped, not filesystem-wide.
@@ -8111,7 +9661,7 @@ The implementation must add:
 
 ------------------------------------------------------------------------
 
-# 228. Final Flux Specification Status --- V13
+# 228. Final Flux Specification Status --- V6
 
 With Sections 200--227 incorporated, the Flux specification explicitly
 separates:
@@ -8216,7 +9766,7 @@ struct LeaseRecord {
     owner_instance_id: InstanceId,
     boot_session_id: BootSessionId,
 
-    last_heartbeat_wall: Timestamp,
+    last_heartbeat_wall_time: Timestamp,
 
     // Diagnostic/current-session data only.
     last_heartbeat_monotonic: Option<Duration>,
@@ -8379,8 +9929,8 @@ safe failure/pause state when the normal data volume reaches capacity.
 
 ## 231.1 Control Reservation
 
-Before substantial transfer begins, Flux should establish a small
-reserved control-space budget for:
+Before substantial transfer begins, Flux must establish a small reserved
+control-space budget for:
 
 ``` text
 pause/failure state
@@ -8393,26 +9943,23 @@ The reservation is separate from ordinary copy-capacity accounting.
 
 ## 231.2 Preallocation
 
-Where supported, Flux should preallocate the emergency journal/control
-file.
-
-The reservation must be physically established before ordinary transfer
-consumes the available space.
+Flux preallocates the emergency journal/control file before ordinary
+transfer consumes the available space. Where the filesystem cannot
+guarantee that later writes into the reserved file succeed — no
+preallocation primitive, or copy-on-write allocation — the reserve
+counts as unavailable: Flux warns at start, and a subsequent WAL failure
+ends in `CONTROL_STATE_DURABILITY_FAILURE` (Section 231.5).
 
 ## 231.3 Emergency Path
 
-If the normal WAL encounters:
-
-``` text
-ENOSPC
-```
-
-the engine enters the emergency persistence path:
+If the normal WAL becomes unwritable for any of the reasons Section 189
+lists (disk full, I/O error, permission failure, filesystem corruption),
+not only `ENOSPC`, the engine enters the emergency persistence path:
 
 ``` text
 normal WAL
     ↓
-ENOSPC
+WAL write failure (disk full, I/O error, permission failure, filesystem corruption)
     ↓
 emergency control journal
     ↓
@@ -8446,6 +9993,10 @@ must be reported.
 
 Flux must not claim that the operation is durably paused when it cannot
 persist that fact.
+
+The operation then ends with exit code 1 (Section 55). The next start
+treats it like a crash: recovery uses the last durable WAL record
+(Section 189).
 
 ------------------------------------------------------------------------
 
@@ -8547,6 +10098,12 @@ object_type
 action=skipped
 ```
 
+In every report record, `relative_path` is the path relative to the
+destination root, including the source root's prefix (Section 18.3),
+written with `/` separators. With several source roots, two records
+therefore never share a `relative_path`. For a single-file operation,
+`relative_path` is the target's file name.
+
 ## 233.2 Strict Behavior
 
 A strict option may convert unsupported special files into a hard
@@ -8580,16 +10137,17 @@ Single-file artifacts intentionally reside beside the target:
 ``` text
 target
 target.flux-lock
-target.flux-partial.<op-id>
-target.flux-state
+target.flux-partial.<operation-id>
+target.flux-state.<operation-id>
 ```
 
 They are not part of the centralized `.flux/operations/` tree.
 
 ## 234.1 Target-Scoped Discovery
 
-Flux may inspect the target's parent directory when performing explicit
-cleanup for a known target.
+Flux may inspect the target's parent directory (for a filesystem-root
+target, the root itself; Section 251.2) when performing explicit cleanup
+for a known target.
 
 Example:
 
@@ -8613,7 +10171,7 @@ filesystem for:
 ``` text
 *.flux-lock
 *.flux-partial.*
-*.flux-state
+*.flux-state.*
 ```
 
 Filename matching alone is never sufficient for deletion.
@@ -8660,6 +10218,13 @@ enum LockCapability {
 }
 ```
 
+| Value | Meaning | Operations needing target exclusivity |
+|---|---|---|
+| `LocalStrong` | local filesystem whose exclusive creation and locks have the properties of Section 235.2 | allowed |
+| `RemoteStrong` | remote filesystem whose deployment is verified to have those properties | allowed |
+| `RemoteUnverified` | remote filesystem whose lock contract cannot be verified | refused: `REMOTE_LOCK_UNSAFE` |
+| `Unsupported` | no usable exclusive-creation or lock primitive | refused: `REMOTE_LOCK_UNSAFE` |
+
 ## 235.2 Required Strong-Lock Properties
 
 A lock mechanism used for safe concurrent destination mutation must
@@ -8689,7 +10254,7 @@ provides the required crash/ownership semantics.
 If the platform cannot establish a trustworthy exclusive lock contract:
 
 ``` text
-FLUX_REMOTE_LOCK_UNSAFE
+REMOTE_LOCK_UNSAFE
 ```
 
 must be returned for operations requiring concurrent-safety guarantees.
@@ -8725,7 +10290,7 @@ The following are normative:
 5. Cross-filesystem source hardlink groups are never merged.
 6. Content equality never creates hardlink identity.
 7. Emergency control space is reserved before normal transfer.
-8. ENOSPC must have a pre-established minimal recovery path.
+8. Every WAL write failure, including ENOSPC, has a pre-established minimal recovery path (Sections 189, 231.3).
 9. Failure to persist the emergency state is explicitly reported.
 10. The complete hardlink hold index is persistent from discovery.
 11. RAM contains only bounded waiting/release metadata.
@@ -8755,7 +10320,7 @@ The implementation must add:
 [ ] identical content across different filesystems remains separate
 [ ] destination convergence of independent hardlink groups
 [ ] emergency control reservation
-[ ] WAL ENOSPC transition
+[ ] WAL write failure transition (ENOSPC and non-space failures)
 [ ] zero-normal-space emergency pause
 [ ] emergency-state durability failure
 [ ] million-member persistent hardlink hold group
@@ -8776,7 +10341,7 @@ The implementation must add:
 
 ------------------------------------------------------------------------
 
-# 238. Final Flux Specification Status --- V13
+# 238. Final Flux Specification Status --- V7
 
 With Sections 229--237 incorporated, Flux explicitly defines:
 
@@ -8826,7 +10391,7 @@ normal WAL
     │
     ├── capacity available → normal operation
     │
-    └── ENOSPC
+    └── WAL write failure (disk full, I/O error, permission failure, filesystem corruption)
           ↓
     emergency reserved space
           ↓
@@ -8895,46 +10460,21 @@ Flux may create:
 ``` text
 /dest/foo.iso.flux-lock
 /dest/foo.iso.flux-partial.<operation-id>
-/dest/foo.iso.flux-state
+/dest/foo.iso.flux-state.<operation-id>
 ```
 
 The `.flux-state` record is the authoritative association between the
 target and the operation.
 
-It must contain sufficient metadata to establish:
-
-``` text
-operation_id
-target_identity
-source_identity
-artifact_generation
-owner_instance_id
-boot_session_id
-creation_wall_time
-last_heartbeat_wall_time
-format_version
-```
+It contains the fields listed in Section 249.1.
 
 Partial and lock artifacts must reference the same operation identity,
 directly or through a verifiable state record.
 
 ## 239.1 Normal Lifecycle
 
-``` text
-acquire target lock
-       ↓
-create durable state
-       ↓
-create partial destination
-       ↓
-copy/checkpoint
-       ↓
-verify
-       ↓
-durably publish target
-       ↓
-remove partial/state/lock
-```
+The normal lifecycle, including standalone catalog registration and
+removal, is Section 249.2's.
 
 Failure during cleanup does not invalidate an otherwise successful
 transfer.
@@ -8965,6 +10505,8 @@ evaluate lock ownership
         ↓
 resume / recover / report conflict
 ```
+
+Section 21.1 decides which outcome applies.
 
 It must never infer ownership solely from filenames.
 
@@ -9005,14 +10547,22 @@ When a new invocation encounters an existing adjacent lock:
 
 ## 240.2 Live Owner
 
-If the native locking mechanism or platform ownership information
-demonstrates that the owner is alive:
+If platform ownership information demonstrates that the owner is alive,
+or the native locking mechanism shows that the lock is held:
 
 ``` text
 TARGET_LOCK_BUSY
 ```
 
-must be returned.
+must be returned, reporting the recorded holder (Section 96.2).
+
+A held native lock shows only that some process holds it. An invocation
+inspecting the lock (Section 240.1 step 3) or recovering it (Section
+240.3 step 1) takes the same lock, so the process holding it may be the
+owner or another invocation, and the lock cannot tell them apart.
+`TARGET_LOCK_BUSY` therefore means that the target's lock is held, not
+that its recorded owner is alive. It may be transient: a later attempt can
+succeed once another invocation has released the lock.
 
 Flux must not steal the lock because the heartbeat happens to be old.
 
@@ -9021,6 +10571,44 @@ Flux must not steal the lock because the heartbeat happens to be old.
 If the platform can establish that the lock owner no longer exists and
 the lock has been released/invalidated according to the platform's
 semantics, recovery may proceed.
+
+Recovery, and cleanup, replace a dead owner's lock by moving it aside:
+
+1. Re-read the lock. Proceed only if it still names the same dead owner.
+   A record that cannot be read, or fails its checksum (Section 259.6),
+   cannot show a dead owner: that is uncertain ownership (Section 240.4).
+   Where the destination provides OS-native locks (Section 235.1), take
+   the OS-native lock on the lock file without waiting; if that fails,
+   another process is using the lock, so start the acquisition again
+   (Section 21.1 step 1).
+2. Rename the lock file to `<lock-name>.broken.<new-operation-id>` beside
+   it. Only one of several concurrent recoverers can move it; the others
+   find the lock gone and start the acquisition again.
+3. Check that the moved file is the one step 1 re-read, by file identity
+   and by its record: it must still name the same dead owner. A
+   `--break-lock` takeover rewrites the record in the same file (Section
+   240.5), so identity alone is not enough. If either check fails, rename
+   the file back without replacing (Section 241.5) and start the
+   acquisition again.
+4. Create its own lock exclusively and take its OS-native lock (Section
+   96.1). If the creation fails, another operation created the lock in the
+   gap and owns the target: delete the moved file (its owner is dead) and
+   classify what is at the lock path as Section 96.1 does. If the creation
+   succeeds but the OS-native lock cannot be taken, remove the lock file it
+   created, delete the moved file, and start the acquisition again.
+5. Delete the moved file.
+
+The lock path is empty between steps 2 and 4. That is harmless because
+the owner is dead: whoever creates the lock in that gap owns the target by
+the same right. A read, rename, or create that fails for another reason
+(an I/O or permission error) stops with that error's code (Section 55); if
+it leaves the moved file, including a put-back that fails in step 3, Flux
+reports the file's path and exits 1. A moved file left by a crash, or by a
+delete in step 5 that fails (Flux warns and continues), is found as
+`<lock-name>.broken.*` beside the lock and classified by the owner its
+record names (Sections 250.1, 251.1). A lock whose owner is uncertain is
+never moved aside; it is taken over only by `--break-lock` (Section
+240.5).
 
 ## 240.4 Uncertain Ownership
 
@@ -9042,12 +10630,79 @@ then:
 TARGET_LOCK_UNCERTAIN
 ```
 
-must be reported.
+must be reported, with the holder (Section 96.2) where the lock record
+is readable.
 
 The safe default is to preserve the artifacts.
 
-Explicit operator-directed recovery may override this condition after
-suitable confirmation.
+Explicit operator-directed recovery is `--break-lock` (Section 240.5).
+
+## 240.5 `--break-lock`
+
+`--break-lock` is valid with `flux copy --restart` and `flux cleanup
+--target PATH`. It applies only when ownership is uncertain
+(`TARGET_LOCK_UNCERTAIN`, `LEASE_AGE_UNCERTAIN`); it never overrides a
+proven live owner (`TARGET_LOCK_BUSY` stays), and never missing or
+corrupt state.
+
+Before acting, Flux reports the recorded holder's `owner_instance_id`,
+`boot_session_id`, `last_heartbeat_wall_time`, and `workspace_path`, or
+reports the lock as unreadable when its record cannot be read or fails its
+checksum (Section 259.6). It then takes the lock over in place, so the
+lock path is never empty:
+
+1. The destination must provide strong file identity (Section 107) and
+   OS-native locks on the lock file, as its `LockCapability` reports
+   (`LocalStrong` or `RemoteStrong`, Section 235.1); Flux decides this
+   from the capability, never by a trial lock. Otherwise `--break-lock` refuses with
+   `TARGET_LOCK_UNCERTAIN` and changes nothing; the operator checks the
+   reported holder and removes the lock by hand.
+2. Open the existing lock file for writing, without creating it. If it is
+   gone, start the acquisition again (Section 21.1 step 1).
+3. Take the OS-native lock on it without waiting. If that fails, another
+   process holds it (the owner, or another takeover): refuse with
+   `TARGET_LOCK_BUSY`, reporting the record as read.
+4. Check that the open file is still the one at the lock path (the same
+   file identity). If not, close it and start the acquisition again.
+5. Read the record. If it names a live owner, refuse with
+   `TARGET_LOCK_BUSY`. If it names another operation than the reported
+   holder, start the acquisition again. If it still names the reported
+   holder, or is unreadable, continue.
+6. Overwrite the record in place with this operation's record in one
+   write (Section 259.6) and flush it. Then check the file identity
+   against the lock path again. If the path is empty, the prior owner
+   removed its lock meanwhile: start the acquisition again. If another
+   file is there, whoever created it owns the target: refuse with
+   `TARGET_LOCK_BUSY` and exit code 3, because the write went to a file no
+   longer at the lock path and nothing at the destination changed. A
+   check that itself fails counts as a different file. Only when the identity matches does Flux durably record the
+   takeover and proceed as if the prior owner were dead.
+
+An open, read, write, or flush that fails for another reason (an I/O or
+permission error) refuses with that error's code (Section 55): exit code 3
+before step 6 writes, exit code 1 after; a takeover whose flush failed is
+never recorded. A crash before step 6's write leaves the old lock; a crash
+after it leaves a lock holding the new operation's record, which is that
+operation's own lock whether or not the takeover record was written. The
+report made before acting is then the only account of the prior holder.
+
+The takeover record, kept in the new operation's state, holds the prior
+holder's `operation_id`, `owner_instance_id`, `boot_session_id`, and
+`last_heartbeat_wall_time` (or "unreadable"), and the takeover's
+`creation_wall_time`. `flux cleanup --target PATH --break-lock` starts no
+operation: it performs steps 1--6 with a cleanup lock record (Section
+259.6), deletes the artifacts, then deletes its lock while still holding
+the OS-native lock; its report carries the takeover record. A crash part
+way leaves the cleanup's lock, whose owner is then dead; running cleanup
+again removes it (Section 240.3) and finishes the deletion.
+
+A prior owner that was only stalled starts nothing more: its next lock
+revalidation (Section 99) fails. A filesystem call it had already started
+can still complete, because Flux sets no deadline on filesystem calls
+(Section 189); that is why a takeover is left to the operator and its
+report names the holder.
+
+`--break-lock` is not a resume-compatibility option (Section 121).
 
 ------------------------------------------------------------------------
 
@@ -9063,7 +10718,8 @@ normalization as an identity operation.
 On Unix-like systems:
 
 ``` text
-FluxPathKey = exact raw pathname byte sequence
+each FluxPathKey component = exact raw filename byte sequence
+components joined by 0x00 (Section 103)
 ```
 
 No UTF-8 lossy conversion is permitted for identity.
@@ -9078,7 +10734,8 @@ encoding suitable for deterministic cross-platform serialization.
 The specification uses:
 
 ``` text
-canonical WTF-8 byte representation
+canonical WTF-8 byte representation of each component,
+components joined by 0x00 (Section 103)
 ```
 
 for `FluxPathKey` serialization and deterministic ordering.
@@ -9136,6 +10793,72 @@ DESTINATION_NAMESPACE_COLLISION
 
 unless an explicit, deterministic collision policy has been selected.
 
+Detection does not rely on per-file locks, which directory operations do
+not take (Section 97). It happens at publication:
+
+-   A target planned as new (absent at planning) is published with a
+    primitive that refuses to replace an existing entry:
+    `renameat2(RENAME_NOREPLACE)`, `renamex_np(RENAME_EXCL)`,
+    `MoveFileEx` without `MOVEFILE_REPLACE_EXISTING`, or `link()` to the
+    target followed by `unlink()` of the temporary name. If the name
+    exists by then, the entry appeared after planning (an earlier target
+    of this operation that the filesystem treats as the same name, or an
+    outside process), and Flux reports `DESTINATION_NAMESPACE_COLLISION`
+    without replacing it.
+-   A target planned as a replacement (Section 5.1) claims the existing
+    entry it resolves to with an insert-if-absent write, keyed by that directory entry — the identity of its parent directory and the
+    entry's name as the filesystem reports it, never the object's identity, which hardlinks share — in the operation's state
+    store. The planner streams (Section 47), so this claim, not a
+    before-either-is-published check, is what serializes two targets
+    that resolve to the same existing entry: the first target to claim
+    an entry proceeds; a later target whose claim finds the entry
+    already taken is reported `DESTINATION_NAMESPACE_COLLISION` and is
+    not published. The claim is durable and survives resume. Every publication also claims the directory entry it
+    creates (its parent directory's identity and its name as the filesystem reports it after publication), whether
+    the target was planned as new or as a replacement, so a later target that
+    resolves to an entry this operation published is a collision too. A
+    claim is never released during the operation, even if its target
+    later fails; a later target that resolves to the same entry stays a
+    collision. Every claim is durable, survives resume, and records the target that made it; that same target
+    finding its own claim proceeds, so a resumed target never collides with itself. A claim record, kept in the
+    operation's `state.db`, holds its key (the parent directory's `FileIdentity`, Section 11, and the entry's name
+    bytes as the filesystem reports them), the claiming target's `FluxPathKey` (Section 103), and whether it claims an
+    existing entry or one this operation created. Claims are looked up in `state.db`, never held wholesale in memory
+    (the resident-memory bound of Section 10.1 applies). A target's created-entry claim is written in the same
+    durable transaction as its `COMMIT` record (Section 182), so a committed target always has its claim. Recovery
+    of a `PREPARE_COMMIT` without `COMMIT` that finds the rename happened (Section 183) writes both, before any other
+    target is planned or published. A dependent hardlink member whose name maps to a different directory
+    entry from its canonical member never collides with the group's claims; one that the destination folds onto the
+    same entry (the example below) is a collision like any other and is reported `DESTINATION_NAMESPACE_COLLISION`,
+    not `HARDLINK_UNAVAILABLE`.
+-   Targets that are locked themselves (single-file targets, directory
+    roots, source-root prefixes; Sections 18.3, 96.1) are also detected
+    through their lock.
+
+Example: a case-sensitive source holds `File.txt` and `file.txt`, and the
+destination ignores case. Both are planned as new; the first is
+published; the second's no-replace publication finds the name taken and
+is reported as a collision instead of overwriting the first.
+
+No-replace publication depends on one of `renameat2(RENAME_NOREPLACE)`,
+`renamex_np(RENAME_EXCL)`, `MoveFileEx` without
+`MOVEFILE_REPLACE_EXISTING`, or `link()`+`unlink()` being available on
+the destination. Before a directory operation changes anything, Flux
+probes the destination for one of these primitives. If none is
+available, the operation is refused with `NOREPLACE_PUBLISH_UNAVAILABLE`
+(exit code 3); check-then-rename is never used as a substitute. The
+probe writes only inside the operation's workspace, under the fixed name
+`noreplace-probe`, and removes what it wrote. A file it cannot remove is reported as a warning and goes with the workspace when cleanup
+removes it; if the operation is being refused, it exits 1 instead of 3 (Section 55). Under
+`--dry-run` it writes nothing at all; a primitive it cannot establish
+without writing is reported as unprobed, and the preview says that a
+real run may be refused with `NOREPLACE_PUBLISH_UNAVAILABLE` (Section
+5.2). The probe applies under `--atomic=always` too: the staged tree is
+populated on the same filesystem and needs the same collision detection
+(Section 259.10).
+Single-file operations are unaffected: their target lock (Section 96)
+detects collisions instead.
+
 ## 241.6 Hardlink Independence
 
 Unicode normalization never determines hardlink identity.
@@ -9159,13 +10882,7 @@ The persistent identity model is extended to include an object
 generation where the platform/filesystem provides a reliable generation
 value.
 
-``` rust
-struct FileIdentity {
-    filesystem_id: FilesystemId,
-    object_id: ObjectId,
-    generation: Option<ObjectGeneration>,
-}
-```
+It is held in `FileIdentity::generation` (Section 11).
 
 ## 242.1 Generation Semantics
 
@@ -9325,8 +11042,9 @@ The following are normative:
 
 ``` text
 1. FluxPathKey is a namespace identity, not a display string.
-2. Unix FluxPathKey preserves raw pathname bytes.
-3. Windows FluxPathKey uses lossless canonical WTF-8 serialization.
+2. Unix FluxPathKey preserves the raw filename bytes of every component.
+3. Windows FluxPathKey uses lossless canonical WTF-8 serialization of every component.
+   In both cases components are joined by 0x00, so bytewise key order is component-wise order.
 4. Unicode normalization is never used as a hardlink identity operation.
 5. Destination filesystem normalization is treated as a namespace mapping.
 6. Destination namespace collisions are detected explicitly.
@@ -9389,7 +11107,7 @@ The implementation must add:
 
 ------------------------------------------------------------------------
 
-# 248. Final Flux Specification Status --- V13
+# 248. Final Flux Specification Status --- V8
 
 Flux now explicitly separates four identities:
 
@@ -9492,6 +11210,7 @@ verifiable authenticated/structured reference:
 
 ``` text
 format_version
+artifact_type
 operation_id
 attempt_id
 target_identity
@@ -9503,6 +11222,9 @@ boot_session_id
 creation_wall_time
 last_heartbeat_wall_time
 operation_state
+superseded_by        (set by --restart; Section 21.1)
+cleanup_pending             (Section 218)
+cleanup_pending_artifacts   (Section 218)
 ```
 
 The lock and partial artifacts must be associated with the same
@@ -9513,7 +11235,7 @@ Filename patterns alone are never sufficient to establish ownership.
 ## 249.2 Normal Lifecycle
 
 ``` text
-acquire target lock
+acquire target lock (also the operation lock, Section 98)
        ↓
 create durable state
        ↓
@@ -9566,6 +11288,8 @@ evaluate lock ownership
 resume / recover / report conflict
 ```
 
+Section 21.1 decides which outcome applies.
+
 ## 249.4 Missing or Corrupt State
 
 If an adjacent artifact exists but its associated state is:
@@ -9600,33 +11324,65 @@ entire destination filesystem.
 Flux therefore maintains a persistent **standalone operation catalog**
 inside the destination control plane.
 
-Conceptually:
+For a single-file target `T`, let `P` be its parent directory and `K` the
+complete lock key recorded in `T`'s lock (Sections 96.1, 259.6: physical
+identity of `P` where reliably available, plus `T`'s final name in
+`FluxPathKey` encoding). The catalog record for `T` is:
 
 ``` text
-DEST/.flux/
+P/.flux/
     standalone/
-        <sharded target records>
+        <sha256(K)>.record
 ```
 
-The catalog is an index, not the authoritative artifact state.
+The catalog therefore lives in the target's own parent directory; there
+is no user-wide or system-wide catalog (Section 18).
+
+A known target is looked up through its lock file, with no directory
+listing: Flux opens `P/<name>.flux-lock` by name, so the filesystem
+resolves any spelling of the target to the same lock (Section 96.1). The
+lock record names the operation and the complete key `K`, and the
+catalog record is `<sha256(K)>.record` for that recorded `K`, whatever
+spelling the invocation used. The catalog record stores `K`; a stored key
+that differs from the key it was looked up with is a digest collision,
+`TARGET_LOCK_KEY_COLLISION`, and the two records are never merged. If the
+lock or the record is missing, for example after a crash between steps 2
+and 3 of Section 250.2, Flux may list `P` non-recursively for that
+target's adjacent artifacts (Section 251.2) to reconstruct it.
+
+A pre-existing `P/.flux` that Flux does not own is handled as in Section
+259.3: it is never overwritten or reinterpreted.
+
+The catalog is an index, not the authoritative artifact state. Losing a
+catalog record never removes cleanup authority, which remains with the
+adjacent state record (Section 218).
 
 ## 250.1 Catalog Record
 
 A catalog record contains:
 
 ``` text
+complete_lock_key
 target_identity
 target_path_key
 target_parent_identity
 operation_id
 attempt_id
-artifact names
-artifact generation
-last known lease
-catalog record generation
+artifact_names
+artifact_generation
+last_known_lease
+catalog_record_generation
 ```
 
 The record must be crash-safe.
+
+`artifact_names` is informational. Cleanup and GC derive each artifact
+name from the record's `target_path_key` and `operation_id` using the
+fixed patterns (`P/<name>.flux-lock`, `P/.flux-dir.lock`,
+`P/<name>.flux-state.<operation-id>`, `P/<name>.flux-partial.<operation-id>`,
+and any `<lock-name>.broken.*` beside one of those locks (a dead owner's moved lock, Section 240.3; found by listing
+that one directory, Section 234.1))
+and never open or delete a name taken only from `artifact_names`.
 
 ## 250.2 Registration
 
@@ -9662,10 +11418,17 @@ Successful completion follows:
 2. durably mark operation complete
 3. remove adjacent partial/state/lock artifacts
 4. remove standalone catalog record
+5. remove P/.flux/standalone/ and P/.flux/ if Flux created them and
+   they are now empty
 ```
 
 If the process dies between these steps, the catalog and/or adjacent
-state provide recovery information.
+state provide recovery information. A crash between steps 3 and 4 leaves
+an orphan catalog record; default cleanup classifies and removes it
+(Section 251.1).
+
+Step 5 never removes a directory that still contains any entry, or one
+that Flux did not create.
 
 ------------------------------------------------------------------------
 
@@ -9681,19 +11444,48 @@ It must not perform a filesystem-wide search for:
 *.flux-partial.*
 ```
 
+flux cleanup exits 0 when it completed its
+classification (rows it keeps — LIVE, RESUMABLE, UNCERTAIN, CORRUPT — are reported, not failures), 1 when a deletion it
+attempted failed, 2 for a usage error, and 3 when it is refused as a whole, for example --break-lock against a live
+owner (TARGET_LOCK_BUSY). These follow Section 55. A directory that cleanup cannot list while looking for artifacts is
+reported with its error, and cleanup exits 1, because its classification is incomplete.
+
 ## 251.1 Default Cleanup
 
 ``` text
-flux cleanup
+flux cleanup DEST
 ```
 
-performs:
+performs, without recursing into subdirectories of `DEST`:
 
 ``` text
-central operation enumeration
+DEST/.flux/operations/       directory operations whose destination root is DEST
         +
-standalone catalog enumeration
+DEST/.flux/standalone/       single-file operations whose target's parent is DEST
+        +
+P/.flux/atomic/<target-key>/ whole-tree atomic staging for DEST (Section 259.10),
+                              where <target-key> is sha256(K) for DEST's own
+                              root lock key K
 ```
+
+Each workspace found under `P/.flux/atomic/<target-key>/` is classified
+like any other.
+
+For a filesystem-root DEST (Section 96.1), cleanup also inspects
+`DEST/.flux-root.lock`, and there is no `P/.flux/atomic/` to inspect: a
+root has no parent and never has whole-tree atomic staging (Section
+259.9).
+
+A directory operation's root lock (`P/<DEST-name>.flux-lock`,
+`P/.flux-dir.lock` under the fallback, or `DEST/.flux-root.lock`) is classified with the operation its record names. A
+root lock whose named workspace does not exist is an orphan, classified by its owner as Section 240 does: `LIVE` when
+the owner is alive, `STALE` and eligible when the owner is demonstrably gone, `UNCERTAIN` otherwise. Deleting it
+follows Section 240.3 (move aside and verify first). Any `<lock-name>.broken.*` beside a root lock (Section 240.3) is
+classified the same way, by the owner its record names.
+
+The `DEST` argument is required unless `--target PATH` is given
+(Section 251.2). A bare `flux cleanup` with neither is a usage error,
+because there is no global catalog to enumerate (Section 18).
 
 For each standalone catalog entry:
 
@@ -9711,16 +11503,38 @@ validate lock/lease ownership
 classify
 ```
 
-Classification:
+The expected adjacent artifacts are the target's lock (`P/<name>.flux-lock`,
+or `P/.flux-dir.lock` when the Section 96.1 fallback applies), its state,
+its partial, and any dead owner's moved lock (`<lock-name>.broken.*` beside the
+lock, Section 240.3), derived as Section 250.1 describes.
 
-``` text
-LIVE
-RESUMABLE
-STALE
-COMPLETED_BUT_UNCLEAN
-UNCERTAIN
-CORRUPT
-```
+Classification (the only cleanup status names; Section 131 uses them
+too):
+
+| Status | Meaning |
+|---|---|
+| `LIVE` | a live owner holds the operation or target lock |
+| `RESUMABLE` | no live owner; resumable state (Section 20); within retention |
+| `STALE` | no live owner; retention exceeded, or the operation is `ABANDONED` |
+| `COMPLETED_BUT_UNCLEAN` | `COMPLETED`, with leftover artifacts (`cleanup_pending`, Section 218) |
+| `UNCERTAIN` | ownership or lease age cannot be established (Sections 229.5, 239.3, 240.4, 252.4) |
+| `CORRUPT` | state exists but is unreadable or invalid (Section 140) |
+
+Eligibility for deletion is a separate marker, not a status. A `STALE` or
+`COMPLETED_BUT_UNCLEAN` row is marked eligible when it passes every
+deletion precondition now (Sections 130, 216, 217, 222). `--force` may
+also mark `RESUMABLE` rows eligible, bypassing retention only. `LIVE`,
+`UNCERTAIN`, and `CORRUPT` rows are never eligible; `CORRUPT` workspaces
+are kept for diagnosis. Artifacts of uncertain ownership can be deleted
+only through `flux cleanup --target PATH --break-lock` (Section 251.2).
+
+A standalone catalog record whose target has no lock, state, or partial
+artifact is an orphan (a crash between Section 250.3's steps 3 and 4
+leaves exactly this). Default cleanup classifies an orphan `STALE` and
+marks it eligible. Deletion acquires the target lock without waiting,
+re-checks that no artifact has appeared, deletes the record, and
+releases the lock. Registration creates the lock before the record
+(Section 250.2), so a live registration always holds a lock.
 
 ## 251.2 Explicit Target Cleanup
 
@@ -9734,14 +11548,27 @@ may directly inspect:
 
 ``` text
 /dest/foo.iso.flux-lock
+/dest/.flux-dir.lock       (Section 96.1 fallback, when it applies to this target)
 /dest/foo.iso.flux-state.*
 /dest/foo.iso.flux-partial.*
+/dest/foo.iso.flux-lock.broken.*   (a dead owner's moved lock, Section 240.3;
+                                   /dest/.flux-dir.lock.broken.* under the fallback)
 ```
 
 even if the standalone catalog entry is missing.
 
+For a directory target `T` (a filesystem root included),
+`flux cleanup --target T` cleans that directory operation as `flux cleanup T` would (Section 251.1): its root lock
+(`P/<T-name>.flux-lock`, `P/.flux-dir.lock` under the fallback, or `T/.flux-root.lock` for a root) together with the
+workspace the lock's record names, and any `<lock-name>.broken.*` beside that lock (Section 240.3).
+
 The artifacts must still pass ownership and target-identity validation
 before deletion.
+
+With `--break-lock` (Section 240.5), artifacts whose owner is uncertain
+(`TARGET_LOCK_UNCERTAIN`, `LEASE_AGE_UNCERTAIN`) may be deleted after Flux
+reports the recorded holder; a live owner, or missing or corrupt state,
+still blocks deletion.
 
 ## 251.3 No Filesystem-Wide Artifact Hunt
 
@@ -9785,12 +11612,7 @@ perform destructive global artifact discovery.
 
 Heartbeat age alone cannot prove that a process is dead.
 
-A lock with an old heartbeat is therefore a:
-
-``` text
-STALE_CANDIDATE
-```
-
+A lock with an old heartbeat is therefore a **candidate stale lock**,
 not automatically an abandoned lock.
 
 ## 252.1 Recovery Decision Order
@@ -9815,7 +11637,7 @@ owner remains alive:
 TARGET_LOCK_BUSY
 ```
 
-must be returned.
+must be returned, reporting the holder (Section 96.2).
 
 Flux must not steal the lock because the heartbeat is old.
 
@@ -9845,9 +11667,12 @@ the result is:
 TARGET_LOCK_UNCERTAIN
 ```
 
+reported with the holder (Section 96.2) where the lock record is
+readable.
+
 The safe default is preservation.
 
-Explicit operator-directed recovery may override this condition.
+Explicit operator-directed recovery is `--break-lock` (Section 240.5).
 
 ------------------------------------------------------------------------
 
@@ -9881,19 +11706,39 @@ C/file
 ...
 ```
 
+The candidate sequence is the group's selected members in `FluxPathKey`
+order. Because the scanner emits in that order (Section 7.2), it is also
+discovery order: the next candidate is the next selected member of the
+group that the scanner has discovered and that has not been attempted.
+
 If:
 
 ``` text
-A/file → Failed
+A/file → attempt Failed
 ```
 
-after exhausting its retry policy, Flux may attempt:
+Flux may attempt:
 
 ``` text
 B/file
 ```
 
-as the next materialization candidate.
+as the next materialization candidate, subject to all of:
+
+``` text
+1. the failure is path_scoped (Section 207); an object_scoped failure
+   makes the group terminally Failed without fallback
+2. the shared per-group attempt budget is not exhausted (Section 206);
+   a path_scoped failure that is not retryable moves straight to the
+   next candidate and spends one attempt, except a `lock_conflict`
+   (Section 97.1(b)), which moves on without spending any
+3. a next candidate exists
+```
+
+If the failure permits fallback but no next candidate has been
+discovered yet, the record stays `Copying` with its failed current
+attempt, dependents stay held, and the next member the scanner
+discovers for this identity becomes the candidate.
 
 This is not a change to the group's identity or canonical ordering.
 
@@ -9919,8 +11764,14 @@ TopologyGroup
         C/file → Pending
 
     group materialization:
-        Unresolved / Materializing / Materialized / Failed
+        Unresolved / Materializing / Materialized / Failed / Skipped
 ```
+
+In the authoritative schema (Section 90), "Materializing" is
+`TopologyState::Copying`, `candidate_path` names the candidate currently
+being attempted, and per-candidate outcomes are the immutable execution
+attempts of Section 202. A candidate shown as `Failed` here is a failed
+attempt history, not the terminal `TopologyState::Failed`.
 
 ## 253.4 Successful Fallback
 
@@ -9932,19 +11783,26 @@ B/file → MATERIALIZED OBJECT
 C/file → HARDLINK TO MATERIALIZED OBJECT
 ```
 
-The final destination topology remains:
+Every failed candidate, including the canonical `A/file`, then becomes an
+ordinary dependent link action to the materialization anchor:
 
 ``` text
-B/file == C/file
+A/file → HARDLINK TO MATERIALIZED OBJECT (reported with its earlier
+         failed attempts)
 ```
 
-and any eligible action for `A/file` follows the configured failure
-policy because its own source action failed.
+This creates nothing that was not observed: `A/file` was established as
+a member of the same source object during the scan, and fallback is only
+permitted after a `path_scoped` failure, so the object's content was not
+the problem. If the link action fails too, for example because the
+destination path of `A/file` is itself the cause, `A/file` is reported
+failed with both its attempt failures and the link failure. The final
+destination topology is then:
 
-If the source path `A/file` is required to exist independently, the
-engine may need to copy its content separately rather than silently
-turning a failed source path into a hardlink. The specification must not
-invent a source object at a path that could not be read.
+``` text
+A/file == B/file == C/file     (when the link for A/file succeeds)
+B/file == C/file               (when it fails; A/file reported failed)
+```
 
 ## 253.5 Complete Group Failure
 
@@ -9954,6 +11812,27 @@ become:
 ``` text
 HARDLINK_GROUP_UNMATERIALIZABLE
 ```
+
+That is the terminal `TopologyState::Failed` (Section 90).
+`HARDLINK_GROUP_UNMATERIALIZABLE` is the group's reported outcome;
+`Failed.error_code` records its cause, which is either
+`CANONICAL_RETRY_EXHAUSTED` (budget exhausted) or the error of the
+failure that ended the group. It is reached when any of these holds:
+
+``` text
+1. the latest failure is object_scoped (Section 207)
+2. the shared per-group attempt budget is exhausted (Section 206)
+3. no candidate remains and no further member can appear, and at least
+   one member was attempted (a group whose every member's target was
+   skipped is Skipped instead, Section 253.7)
+```
+
+"No further member can appear" requires that the scan of every source
+root is complete, or that the number of distinct selected members seen
+for the identity equals the object's link count. Before either holds, a
+group whose failure permits fallback stays `Copying` and its dependents
+stay held, because a later-discovered member may still materialize the
+object.
 
 At that point dependents become:
 
@@ -9968,6 +11847,32 @@ or the equivalent terminal group-failure state.
 Fallback materialization must never create a hardlink between objects
 that Flux has not established as members of the same source hardlink
 identity.
+
+## 253.7 Existing-Destination Policy and Hardlink Groups
+
+The existing-destination policy (Section 5.1) is decided for each member
+of a hardlink group from that member's own target. A member whose target
+the policy leaves untouched is `Skipped` (Section 16.1). Flux never links
+other members to that existing object: Flux did not write it and cannot
+prove its content (Section 99.1).
+
+If the canonical member is skipped, that is not a failed attempt and
+spends no retry budget. Materialization passes to the next candidate, in
+`FluxPathKey` order, whose target is not skipped (Section 253.2). That
+candidate copies the content and becomes the materialization anchor, and
+the remaining non-skipped members link to it. `canonical_path` does not
+change; the first attempt is claimed with that candidate as
+`candidate_path` (Section 91). Until such a candidate is discovered, the
+group stays `Unresolved` and later members are held.
+
+If every member's target is skipped, which is decided when no further
+member can appear (Section 253.5), the whole group is `Skipped`: nothing
+is copied or linked, and every member is reported as skipped.
+
+A skipped member stays outside the destination hardlink group. Under
+`--hardlinks=preserve` that is a failure to create a required hardlink,
+reported as `HARDLINK_UNAVAILABLE` for that member; under
+`--hardlinks=auto` it is reported as degraded (Section 15).
 
 ------------------------------------------------------------------------
 
@@ -9986,6 +11891,17 @@ CAPACITY_WAIT
 CAPACITY_BLOCKED
 CAPACITY_IMPOSSIBLE
 ```
+
+| State | Meaning | Outcome |
+|---|---|---|
+| `CAPACITY_READY` | enough capacity now | execute |
+| `CAPACITY_WAIT` | short now; capacity that in-flight work will reclaim covers it (Section 254.2) | stay pending, reevaluated (Section 255) |
+| `CAPACITY_BLOCKED` | short now; nothing in flight will reclaim enough, but not provably impossible | reported and reevaluated (Section 255); `--atomic=auto` may take its fallback (Section 254.5) |
+| `CAPACITY_IMPOSSIBLE` | required capacity provably exceeds the maximum recoverable capacity (Section 254.3) | terminal: `FAILED_ATOMIC_CAPACITY` |
+
+An action entering `CAPACITY_WAIT` or `CAPACITY_BLOCKED` is logged at
+`warn`; the count of waiting actions and the bytes short are shown in
+the progress display (Section 52).
 
 ## 254.2 Temporary Shortage
 
@@ -10008,7 +11924,7 @@ required atomic temporary capacity
 maximum recoverable destination capacity
 ```
 
-then:
+then the action enters `CAPACITY_IMPOSSIBLE`, and:
 
 ``` text
 FAILED_ATOMIC_CAPACITY
@@ -10097,7 +12013,7 @@ The following are normative:
 12. Hardlink canonical ordering is distinct from materialization attempt selection.
 13. A failed first canonical candidate may be followed by another deterministic candidate.
 14. Hardlink fallback never merges unrelated source identities.
-15. A hardlink group is terminally failed only after all viable materialization candidates fail.
+15. A hardlink group is terminally failed only on an object-scoped failure, an exhausted per-group budget, or no viable candidate once no further member can appear (Section 253.5).
 16. --atomic=always never silently degrades because of capacity shortage.
 17. Capacity waiting must have a progress/recoverability test.
 18. Provably impossible atomic capacity transitions to FAILED_ATOMIC_CAPACITY.
@@ -10150,7 +12066,7 @@ The implementation must add:
 [ ] missing adjacent state
 [ ] corrupt adjacent state
 [ ] target-scoped orphan cleanup
-[ ] catalog-driven global cleanup
+[ ] catalog-driven cleanup of DEST (non-recursive)
 [ ] missing catalog entry with explicit target cleanup
 [ ] foreign .flux-* files preserved
 [ ] no recursive filesystem-wide cleanup
@@ -10193,7 +12109,8 @@ GC-UNCERTAINTY-01
     deletion.
 
 TARGET-LOCK-01
-    target-lock identity is namespace/path scoped and stable for the target.
+    target-lock identity is the target's name as resolved by the destination
+    filesystem in its parent directory (Section 96.1), stable for the target.
 
 TARGET-LOCK-IDENTITY-01
     weak filesystem identity does not by itself invalidate a strong target lock.
@@ -10239,7 +12156,7 @@ UNCERTAINTY-01
     reconciled before destructive recovery action.
 ```
 
-# 258. Final Flux Specification Status --- V13
+# 258. Final Flux Specification Status --- V9
 
 Flux now has explicit protocols for:
 
@@ -10257,7 +12174,9 @@ inode/object-generation recycling
 remote filesystem locking
 ```
 
-The standalone cleanup architecture is:
+The standalone cleanup architecture is (`DEST` is a directory
+operation's destination root, or a single-file target's parent
+directory; Section 250):
 
 ``` text
                     DEST/.flux/
@@ -10417,6 +12336,12 @@ Persistent hold index
     +-- spilled dependents keyed/indexed by canonical_identity
 ```
 
+Every dependent is written to the persistent hold index when it is
+discovered (Section 232); there is no threshold at which dependents first
+reach disk. The RAM hold index is a bounded cache of some of those
+records, and "spilled" dependents are the ones not currently cached.
+Losing the RAM index, for example in a crash, loses no dependent.
+
 When:
 
 ```text
@@ -10494,7 +12419,7 @@ CanonicalFailed {
     operation_id
     attempt_id
     attempt_number
-    error
+    error_code
 }
 ```
 
@@ -10504,7 +12429,7 @@ Additional diagnostic fields MAY be carried, but `attempt_id` MUST remain availa
 
 Upon receiving a canonical scheduler event, the scheduler MUST NOT blindly apply the state transition represented by the event.
 
-The scheduler MUST compare the event's `attempt_id` against the authoritative current canonical execution record.
+The scheduler MUST compare the event's `attempt_id` against the authoritative current canonical execution record: `TopologyState::Copying.current_attempt_id`, or the recorded attempt of a `Materialized`/`Failed` record (Section 90). The store applies the same fence to every transition (Section 91).
 
 Conceptually:
 
@@ -10595,6 +12520,7 @@ Unresolved
 Copying
 Materialized
 Failed
+Skipped
 ```
 
 as the logical topology states, that presentation is conceptual shorthand for the logical state dimension.
@@ -10906,7 +12832,7 @@ enum ExecutionState {
 
 There is no `Retrying` execution state. A retry creates a new execution attempt; the historical failed attempt remains immutable.
 
-`TopologyState::Failed` is terminal for the topology record that reached terminal failure. A retry does not mutate that historical record in place. Instead, durable operation state records a new current execution attempt. Thus the shorthand `Failed → Copying` means creation and selection of a new attempt, not resurrection of the failed attempt.
+`TopologyState::Failed` is terminal. Retries and fallback attempts happen while the record is `Copying` (Section 90): the failed attempt stays in its immutable execution history and a new attempt becomes `current_attempt_id`. Any earlier shorthand `Failed → Copying` means a failed attempt followed by a new one, never a transition out of `TopologyState::Failed`.
 
 Canonical identity remains unchanged throughout.
 
@@ -10918,11 +12844,11 @@ The normative default remains:
 --retries=3
 ```
 
-This means one initial attempt plus at most three retries, for at most four attempts per candidate. The retry count is durable and survives restart.
+This means one initial attempt plus at most three retries, for at most four attempts per file or per hardlink group. For a hardlink group the budget is shared across retries and fallback candidates (Section 206). The retry count is durable and survives restart.
 
 `canonical_path` is the immutable deterministic representative. `materialization_anchor` is the destination member that actually succeeds in creating the materialized object.
 
-After canonical retries are exhausted, eligible fallback candidates may be attempted according to the deterministic hardlink candidate ordering. A fallback candidate never becomes canonical.
+After a `path_scoped` failure (Section 207), eligible fallback candidates may be attempted according to the deterministic hardlink candidate ordering, within the same budget (Section 253.2). An `object_scoped` failure is terminal. A fallback candidate never becomes canonical.
 
 Example:
 
@@ -10933,7 +12859,7 @@ materialization_anchor = B/file
 
 is valid.
 
-The hardlink group becomes terminally unmaterializable only after all viable permitted candidates have been exhausted or proven unusable. Earlier shorthand that canonical failure immediately blocks all dependents applies only to terminal group failure. Dependents remain blocked while a retry or fallback candidate can still establish the required materialization.
+The hardlink group becomes terminally unmaterializable only under the conditions of Section 253.5: an `object_scoped` failure, an exhausted per-group budget, or no remaining candidate once no further member can appear. Earlier shorthand that canonical failure immediately blocks all dependents applies only to terminal group failure. Dependents stay held (not blocked) while a retry or fallback candidate can still establish the required materialization.
 
 ## 259.3 Source `.flux` Semantics
 
@@ -10957,7 +12883,9 @@ which must not be recursively discovered as source content.
 
 A scanner must distinguish a user source `.flux` directory from Flux-owned destination control state using the operation's source/destination mapping and control-plane ownership. It must not globally exclude every path whose basename is `.flux`.
 
-If the required destination control-plane path already contains an unrecognized foreign object, Flux must not overwrite or reinterpret it merely because it is named `.flux`; the operation must fail with an explicit namespace-conflict classification or use a separately configured control-plane location if supported.
+If the required destination control-plane path already contains an unrecognized foreign object, Flux must not overwrite or reinterpret it merely because it is named `.flux`; the operation must fail with `CONTROL_PLANE_NAMESPACE_CONFLICT` or use a separately configured control-plane location if supported.
+
+The same exclusion applies to `DEST/.flux-root.lock` when `DEST` is a filesystem root (Section 96.1): it is Flux control state, not source content.
 
 ## 259.4 WAL Backpressure and Lock Ordering
 
@@ -11005,13 +12933,13 @@ The current filesystem-reported available-space result is authoritative for the 
 
 ## 259.6 Directory Target Lock Representation
 
-For directory target `T`, let `P` be its parent. The stable lock key `K` consists of the physical identity of `P` where reliably available plus the canonical `FluxPathKey` of `T` relative to `P`.
-
-When a visible lock representation is used, the normative layout is:
+For directory target `T`, let `P` be its parent. The lock is named after the target in `P`, as for every target (Section 96.1):
 
 ```text
-P/.flux-target-locks/<sha256(K)>.lock
+P/<T-name>.flux-lock
 ```
+
+Its complete key `K`, recorded in the lock, consists of the physical identity of `P` where reliably available plus `T`'s final name in `FluxPathKey` encoding (a one-component key relative to `P`, not the operation's destination-relative key of Section 103). `K` records the spelling that created the lock; it is not used to name the lock file, so the filesystem's own name equivalence decides which spellings contend.
 
 The lock record must include:
 
@@ -11022,19 +12950,18 @@ operation_id
 owner_instance_id
 boot_session_id
 target_path_key
-creation_time
-heartbeat
+workspace_path     (where the owning operation's recovery state lives; Section 120)
+creation_wall_time
+last_heartbeat_wall_time
 ```
 
-The digest filename is not sufficient ownership proof. A detected collision between distinct complete keys must produce:
+The lock file's name is not ownership proof; the record inside it is validated (Section 216).
 
-```text
-TARGET_LOCK_KEY_COLLISION
-```
+The record is written in one write call, padded to the fixed size its `format_version` defines, and ends with a checksum of its other bytes: the first 16 bytes of their BLAKE3 hash (Section 3.4). A record whose checksum fails counts as unreadable: uncertain ownership, never a foreign object (Section 96.1).
 
-and the targets must never be aliased.
+Every target lock uses this record, including a lock that `flux cleanup` holds (Sections 240.5, 251.1). A cleanup lock carries a fresh `operation_id` for that cleanup run and `workspace_path` = `none`; it is never resumable, and once its owner is dead it is removed as Section 240.3 describes.
 
-An OS-native lock primitive may replace the visible lock file only when it provides semantically equivalent exclusive ownership, authoritative acquisition, owner validation, and crash/disconnect recovery.
+An OS-native lock may be held on the lock file for liveness, with authoritative acquisition, owner validation, and crash/disconnect recovery. It never replaces the named lock file (Section 96.1).
 
 If the required target lock cannot be established, destination mutation must not proceed.
 
@@ -11079,10 +13006,10 @@ If the evidence uniquely establishes the intended publication, recovery may fina
 If it cannot distinguish completed publication from non-completion, recovery must enter:
 
 ```text
-COMMIT_OUTCOME_UNCERTAIN
+COMMIT_STATE_UNCERTAIN
 ```
 
-or the equivalent conservative classification.
+(the same classification as Section 30.1).
 
 In that state Flux must not perform destructive compensating mutation that could overwrite or delete an unrelated object. Preservation and operator/resume investigation are the default.
 
@@ -11098,29 +13025,38 @@ must be returned.
 
 Flux must not delete the old tree first or silently fall back to per-file replacement.
 
+A root `DEST` (Section 96.1) has no replaceable parent boundary; `--atomic=always` against a root `DEST` is always refused with `ATOMIC_DIRECTORY_REPLACE_UNSUPPORTED`.
+
 For a previously nonexistent destination directory, there is no existing tree to replace. Atomic replacement of an old directory is therefore not required merely to create every intermediate directory.
 
 However, a successful `--atomic=always` operation must not expose an unintended partially constructed hierarchy as the final successful publication. The implementation must use its recoverable staging/publication model and must honor any stronger initial-publication visibility guarantee it explicitly declares.
+
+Replacing an existing directory publishes exactly the selected source tree: entries present only at the destination are removed along with the old tree, they are not merged forward. Because there is nothing at the destination to selectively keep, `--update` and `--skip-existing` are usage errors (exit code 2) together with `--atomic=always` for a directory operation, whether or not the destination exists (Section 5.1). `--dry-run` reports the destination-only entries that would be removed, without removing them (Section 5.2).
 
 ## 259.10 Atomic Directory Staging
 
 Whole-tree atomic staging control state required for recovery must live outside the root being published or replaced.
 
-A preferred structure is:
+The structure is:
 
 ```text
 P/.flux/atomic/<target-key>/<operation-id>/
     manifest
     state.db
     topology.db
+    wal/
     checkpoints/
     staging/
         root/
 ```
 
+where `<target-key>` is `sha256(K)` for the destination root's complete lock key `K` (Section 259.6). The destination root's lock record names this workspace, which is how resume finds it (Section 120).
+
 Publishing the staged root must not destroy the control state needed to recover that publication.
 
 `DIRECTORY_STAGING` means recoverable staged state exists; it is not an instruction for immediate deletion.
+
+Default `flux cleanup DEST` inspects `P/.flux/atomic/<target-key>/` too, non-recursively (Section 251.1).
 
 Cleanup follows:
 
@@ -11141,13 +13077,13 @@ A crash must not cause staged data to be deleted merely because it is marked `DI
 
 ## 259.11 Symlink Failure
 
-`LINK_CREATION_UNAVAILABLE` is an action-scoped failure.
+`SYMLINK_CREATION_UNAVAILABLE` is an action-scoped failure.
 
 Flux must not silently substitute a junction, hardlink, or regular file for a requested symlink.
 
 Independent ready actions may continue according to scheduler policy. The final operation status must report failure when a required symlink action failed.
 
-A symlink action does not create or alter hardlink topology, so symlink failure must not silently become a hardlink canonical failure.
+A symlink action does not create or alter the hardlink topology of the symlink's target, so symlink failure must not silently become a hardlink canonical failure for that target. A symlink inode with several entries forms its own group, whose failure follows Section 12.1.
 
 ## 259.12 Cleanup and Orphan Safety
 
@@ -11195,7 +13131,7 @@ A conforming implementation must test at least:
 11. DEST/.flux control state is not scanned as source.
 12. foreign DEST/.flux state is never silently overwritten.
 13. directory target lock keys are deterministic.
-14. lock-key collisions are detected.
+14. catalog-record key digest collisions are detected.
 15. unsafe remote locking causes refusal.
 16. workers do not wait indefinitely for WAL while holding mutation locks.
 17. destination durability precedes durable checkpoint claims.
@@ -11212,6 +13148,344 @@ A conforming implementation must test at least:
 28. weak identity cannot prove rename success from path existence alone.
 29. ambiguous commit recovery becomes conservative uncertainty.
 30. symlink failure does not silently change object type.
+31. a topology store transition carrying a superseded attempt_id returns
+    StaleAttempt and changes nothing.
+32. crash recovery never returns a Copying record to Unresolved and never
+    resets attempt_number.
+33. under fallback, Materialized.destination_path is the materialization
+    anchor and canonical_path is unchanged.
+34. dependents stay held (not blocked) while a retry or fallback candidate
+    remains, and become BLOCKED_BY_CANONICAL_FAILURE only on terminal Failed.
+35. an object_scoped canonical failure makes the group terminally Failed
+    without attempting any fallback candidate.
+36. --retries=N bounds a hardlink group to N+1 attempts in total across
+    retries and fallback candidates, including after restart.
+37. after a fallback anchor materializes, the failed canonical becomes a
+    link to the anchor; if that link fails it is reported with both errors.
+38. a group whose canonical failed path_scoped before any other member was
+    discovered stays Copying with dependents held, and a later-discovered
+    member becomes the next candidate.
+39. a single-file operation registers at P/.flux/standalone/<sha256(K)>.record
+    in the target's parent, and resume finds it through the target's lock file
+    without listing P.
+40. a crash between adjacent-state creation and catalog registration is
+    recovered by a non-recursive listing of P.
+41. `flux cleanup DEST` enumerates only DEST/.flux/operations and
+    DEST/.flux/standalone; `flux cleanup` with neither DEST nor --target is a
+    usage error.
+42. after completion, empty P/.flux/standalone/ and P/.flux/ created by Flux
+    are removed; a pre-existing foreign P/.flux is left untouched.
+43. with roots /x/b and /y/a whose files b/f and a/f are hardlinked on one
+    filesystem, the canonical is a/f for either command-line order of the
+    roots, and the scanner emits /y/a before /x/b.
+44. two source roots with the same final component are rejected with
+    DESTINATION_NAMESPACE_COLLISION before any transfer.
+45. resuming with the same roots in a different command-line order is
+    compatible; adding, removing, or remapping a root is INCOMPATIBLE_STATE.
+46. a plain rerun after a crash fails with RESUMABLE_OPERATION_EXISTS and
+    changes nothing on disk.
+47. --restart marks the prior operation ABANDONED with superseded_by, deletes
+    its partial before the new copy allocates, and a crash mid-restart leaves
+    it ABANDONED and collectible.
+48. --restart never overrides a live owner or missing or corrupt prior
+    state, and without --break-lock never overrides uncertain ownership;
+    --resume together with --restart is a usage error.
+49. a prior operation that completed with cleanup_pending does not block a
+    new run.
+50. on a case-insensitive destination, `flux copy A /dest/Backup` and
+    `flux copy B /dest/backup` contend: the second gets TARGET_LOCK_BUSY.
+51. on a case-sensitive destination the same two commands proceed
+    independently.
+52. the NFC and NFD forms of one name lock separately on a filesystem that
+    treats them as distinct (NTFS), and contend on one that treats them as one.
+53. a target name too long for the lock suffix falls back to P/.flux-dir.lock,
+    and a per-name holder and a directory holder never both proceed.
+54. two targets of one operation that alias on the destination are reported as
+    DESTINATION_NAMESPACE_COLLISION through the operation's own lock.
+55. a resume that spells the target differently (Backup vs backup) on a
+    case-insensitive destination finds the prior operation through its lock.
+56. each --verify level performs exactly the checks of Section 32; bare --verify
+    means destination; --hash selects the algorithm independently.
+57. --links=skip creates no destination symlinks and reports every skipped one.
+58. with no policy an existing file is replaced; --update replaces only a newer
+    or differently sized source; --skip-existing reports and keeps it; two
+    policies together are a usage error.
+59. --dry-run leaves the destination byte-for-byte and entry-for-entry unchanged,
+    creates no lock or workspace, and keeps memory bounded on a tree large
+    enough to spill planning state.
+60. a failure to apply explicitly requested metadata fails that file's action;
+    a failure to apply default metadata publishes the file, reports
+    METADATA_APPLY_FAILED, and exits 1.
+61. --resume continues an operation in every resumable state of Section 20,
+    including FAILED and COMMITTING (after commit recovery), and refuses
+    COMPLETED and ABANDONED; a crash while pausing leaves TRANSFERRING.
+62. flux cleanup shows exactly the Section 251.1 statuses and an eligibility
+    marker; LIVE, UNCERTAIN, and CORRUPT rows are never eligible (artifacts of
+    uncertain ownership are deleted only by cleanup --target --break-lock), and
+    --force makes RESUMABLE rows eligible only by bypassing retention.
+63. DEST/.flux/ contains only operations/ and standalone/; each operation's WAL
+    segments live in its own workspace's wal/.
+64. a crash while dependents are held, with fewer dependents than the RAM limit,
+    loses none: every dependent was persisted when it was discovered.
+65. a checkpoint message from a superseded attempt is never applied to the
+    current attempt's progress.
+66. recovery orders WAL segments by their records' generation and sequence,
+    including when segment names sort differently (wal/999999 vs wal/1000000).
+67. each capacity state of Section 254.1 is reachable and has its stated
+    outcome; CAPACITY_IMPOSSIBLE always ends in FAILED_ATOMIC_CAPACITY.
+68. --resume after a crash during an --atomic=always directory replacement finds
+    the staging workspace under P/.flux/atomic/ through the destination root's
+    lock, and also when that lock is missing.
+69. each row of Section 4.1 maps as stated; running `flux copy /data /backup`
+    twice lands in /backup both times, never in /backup/data.
+70. resuming with a different --exclude, --links, --cross-filesystems, or
+    recursion setting is INCOMPATIBLE_STATE; a higher --retries and
+    normal→strict --durability are accepted; their reverses are rejected.
+71. --resume with no prior operation starts a new one and reports it; with a
+    non-matching prior operation it is INCOMPATIBLE_STATE.
+72. a crash after a dependent's link is created but before Linked is recorded
+    recovers by re-running the link steps: the result is one correct link, no
+    leftover temporary name, and no failure.
+73. a single-file operation holds exactly one lock file; a second process
+    resuming the same operation or targeting the same file gets
+    TARGET_LOCK_BUSY from it.
+74. every adjacent state record carries the Section 249.1 fields, including
+    artifact_type, and GC validation (Section 234.4) finds each field it checks.
+75. on a case-insensitive destination, `flux copy /s/Data /s/data /dest` is
+    rejected with DESTINATION_NAMESPACE_COLLISION before any transfer; on a
+    case-sensitive destination it proceeds.
+76. with --skip-existing and the canonical member's target already present, the
+    next non-skipped member copies and the others link to it; the existing
+    file is never linked; if every target exists the group is Skipped.
+77. a crash in each directory publication state of Section 30.1 recovers with
+    that state's stated action; DIRECTORY_PUBLISHING that cannot be decided
+    becomes COMMIT_STATE_UNCERTAIN.
+78. an adapter reporting RemoteUnverified or Unsupported makes every operation
+    that needs target exclusivity fail with REMOTE_LOCK_UNSAFE.
+79. --dry-run --resume and --dry-run --restart report the resume or the discard
+    and fresh plan, take no lock, and change nothing on disk.
+80. each retry category of Section 207 behaves as its row states; in
+    particular lock_conflict and capacity_failure never spend attempt budget.
+81. after OperationStateChanged to PAUSED the scheduler admits no new work; a
+    duplicate or late delivery changes nothing.
+82. after fallback, linking the failed canonical succeeds even when its failed
+    copy attempt left <target>.flux-partial.<operation-id> behind.
+83. copying a folder holding File.txt and file.txt to a case-insensitive
+    destination publishes one and reports DESTINATION_NAMESPACE_COLLISION for
+    the other; nothing is overwritten. Of two targets resolving to the same
+    existing entry, the first to claim it proceeds and the second is
+    reported DESTINATION_NAMESPACE_COLLISION (Section 241.5).
+84. a reflinked file under the default --verify reads no source bytes and is
+    reported as "reflinked, not hashed"; under --verify=destination both sides
+    are hashed and compared.
+85. two entries of one symlink inode are recreated as one symlink plus a
+    hardlink to it with the payload unchanged; special files with several
+    entries are handled per entry and reported as degraded.
+86. resuming with --resume-verify=chunks after digests were compacted under
+    --resume-verify=metadata validates with full and reports the upgrade.
+87. flux verify reports match, missing, mismatched, extra, and unreadable
+    paths correctly, exits 1 only for missing, mismatched, or unreadable,
+    ignores DEST/.flux and Flux artifacts, and writes nothing.
+88. a hardlink group whose every member's target is skipped ends in the
+    terminal Skipped state (not Failed); its dependents are Skipped after
+    recovery too.
+89. a directory target lock whose recorded workspace_path is neither of the
+    two derivable paths nor none (a cleanup lock) makes recovery report
+    ARTIFACT_OWNERSHIP_UNCERTAIN and read, adopt, or delete nothing at
+    that path.
+90. a catalog record's artifact_names is never used to open or delete an
+    artifact; cleanup and GC derive each artifact name from the record's
+    target and operation_id instead.
+91. default flux cleanup DEST classifies a whole-tree atomic staging
+    workspace found under P/.flux/atomic/<target-key>/ the same way it
+    classifies an entry under DEST/.flux/operations/.
+92. flux cleanup --target PATH for a target whose lock fell back to
+    P/.flux-dir.lock (Section 96.1) inspects that lock file; it is not
+    left undiscoverable.
+93. a standalone catalog record with no lock, state, or partial artifact
+    is classified STALE and eligible by default cleanup, and is deleted
+    only while the target lock is held, after re-checking that no
+    artifact has appeared.
+94. a directory operation targeting DEST=/backup/archive while a live
+    operation holds the root lock on an ancestor (/backup) releases its
+    own lock and refuses with TARGET_LOCK_BUSY, changing nothing.
+95. a directory operation targeting DEST=/backup while a live operation
+    holds the root lock on /backup/archive fails only the actions that
+    write under /backup/archive with TARGET_LOCK_BUSY, and the rest of
+    the operation continues.
+96. --restart --break-lock against a target reporting TARGET_LOCK_UNCERTAIN
+    reports the recorded holder, takes over, and proceeds; the same
+    invocation against a target reporting TARGET_LOCK_BUSY, or missing or
+    corrupt state, still refuses.
+97. flux cleanup --force still reports every row's status and every
+    deletion it makes; flux cleanup --dry-run reports classification and
+    eligibility, deletes nothing, and takes no lock.
+98. copying to a filesystem-root DEST takes the lock T/.flux-root.lock
+    inside T, never compares or reports it, and refuses --atomic=always
+    against that DEST with ATOMIC_DIRECTORY_REPLACE_UNSUPPORTED.
+99. a TARGET_LOCK_BUSY, OPERATION_LOCKED, or TARGET_LOCK_UNCERTAIN
+    refusal against a readable lock record reports the holder's
+    owner_instance_id, boot_session_id, workspace_path, and
+    last_heartbeat_wall_time.
+100. exit code is 0 for success including a degraded auto outcome, 1 for
+     an action failure or verify mismatch or a refusal scoped to some
+     paths only, 2 for a usage error, and 3 for a whole-operation refusal
+     that changed nothing.
+101. with no options given, --atomic behaves as auto, --durability as
+     normal, --resume-verify as chunks, and filesystem boundaries are not
+     crossed.
+102. --sparse=always on a destination that cannot hold holes fails that
+     file's action with SPARSE_UNAVAILABLE; --reflink=always where no
+     reflink can be created fails with REFLINK_UNAVAILABLE; the
+     verification digest for a sparse file is the same under auto,
+     always, and never.
+103. on Windows, a destination path longer than 260 characters succeeds
+     through the extended-length call path; a path the destination still
+     refuses as too long fails that action with DESTINATION_ERROR.
+104. chunk_size is 1 MiB for every file regardless of options, a file of
+     N bytes has ceil(N / 1 MiB) chunks with a shorter last chunk, and a
+     manifest recording a different chunk_size is INCOMPATIBLE_STATE.
+105. flux verify reports a path unreadable when either side could not be
+     read or hashed, reports the error, and exits 1.
+106. an action entering CAPACITY_WAIT or CAPACITY_BLOCKED is logged at
+     warn, and the progress display shows the count of actions waiting
+     for capacity and the bytes short.
+107. files verified counts only files verified at the destination or full
+     level; a source-stream-only run reports files_verified as 0; --json
+     includes files_verified, files_mismatched, files_failed,
+     files_overwritten, bytes_skipped, verify_level, and hash_algorithm.
+108. any WAL write failure (disk full, I/O error, permission failure, or
+     filesystem corruption), not only ENOSPC, enters the emergency
+     persistence path; if the emergency journal fails too,
+     CONTROL_STATE_DURABILITY_FAILURE is reported.
+109. an existing directory whose identity changes unexpectedly while
+     being entered raises DIRECTORY_CHANGED_DURING_SCAN, does not
+     transfer that directory's subtree, reports the error, and the
+     operation exits 1; there is no rescan alternative.
+110. --atomic=always replacing an existing directory publishes exactly
+     the selected source tree, removing destination-only entries with
+     the old tree; for a folder source, --update or --skip-existing
+     together with --atomic=always is a usage error (exit 2) whether or
+     not the destination exists; --dry-run reports the entries that
+     would be removed.
+111. two replacement targets that resolve to the same existing
+     destination entry: the first to claim it proceeds, the second's
+     claim finds it taken and is reported DESTINATION_NAMESPACE_COLLISION
+     without being published; the claim survives resume.
+112. DISK_FULL on a destination write outside atomic temporary capacity
+     is not retried, is reported, and the operation can be resumed once
+     space is freed; DISK_FULL inside atomic temporary capacity is
+     handled by the Section 254 capacity states instead.
+113. a directory operation against a destination with no no-replace
+     publication primitive is refused with NOREPLACE_PUBLISH_UNAVAILABLE
+     (exit 3) before anything changes, without falling back to
+     check-then-rename; a single-file operation against the same
+     destination is unaffected.
+114. replacing a directory that Flux created under DEST with a symlink to a
+     location outside DEST, between its creation and the writing of its
+     descendants, makes those actions fail with SAFETY_REJECTED; nothing is
+     written outside DEST, and the rest of the operation continues.
+115. where the emergency reserve cannot be guaranteed (no preallocation
+     primitive, or copy-on-write allocation), Flux warns at start, and a
+     later WAL failure ends in CONTROL_STATE_DURABILITY_FAILURE with exit
+     code 1.
+116. with two source roots on different filesystems, reflink and hardlink
+     capability is evaluated per source/destination filesystem pair; a
+     value measured for one root is never applied to the other.
+117. a new attempt never resumes from a failed attempt's chunk
+     checkpoints; discarding them once the new attempt has started
+     changes no outcome.
+118. a filesystem call that blocks (for example on a stalled mount) is
+     never abandoned on a timer: no deadline-driven error is reported,
+     and cancellation takes effect when the call returns.
+119. SAFETY_REJECTED from the containment check exits 3 with nothing
+     changed; a path rejected under Section 149.7 fails only that
+     path's actions and the run exits 1; CONTROL_STATE_DURABILITY_FAILURE
+     exits 1, and the next start recovers from the last durable WAL
+     record.
+120. a nested operation finds an ancestor's long-name fallback lock
+     P/.flux-dir.lock; an ancestor lock of uncertain ownership refuses
+     with TARGET_LOCK_UNCERTAIN; a demonstrably abandoned one does not
+     block.
+121. an operation whose writer is about to create D, where a live
+     operation holds D's root lock, creates and writes nothing under D;
+     a later operation whose DEST is D refuses under Section 97.1(a).
+122. --restart --break-lock against an uncertain lock takes the lock
+     over exclusively (Section 240.5), reports the holder, and proceeds; a
+     crash right after the takeover leaves a lock owned by the new
+     operation.
+123. flux cleanup DEST for a filesystem-root DEST inspects
+     DEST/.flux-root.lock and no P/.flux/atomic/; flux cleanup --target T
+     for a root T cleans T/.flux-root.lock together with its workspace
+     (test 133); resume with the root lock
+     missing looks only in DEST/.flux/operations/.
+124. --dry-run with a primitive that cannot be probed without writing
+     writes nothing and says a real run may be refused with
+     NOREPLACE_PUBLISH_UNAVAILABLE; the probe runs under --atomic=always
+     too.
+125. a later target that resolves to an entry this operation already
+     published is reported DESTINATION_NAMESPACE_COLLISION, before and
+     after a resume; a claim whose target failed still blocks a later
+     target resolving to the same entry.
+126. DISK_FULL on a hardlink group's canonical attempt stops the
+     operation with the group still Copying, spends no attempt budget,
+     and resume starts a new attempt for the same candidate; a missing
+     or non-directory component on the Section 149.7 walk fails that
+     path with the matching generic code.
+127. a hardlink group's dependents link beside their canonical member without DESTINATION_NAMESPACE_COLLISION; two
+     existing destination names of one hardlinked object are different entries; a resumed target that finds its own
+     claim proceeds.
+128. of two concurrent --break-lock takeovers of one uncertain lock exactly one proceeds (the OS-native lock admits
+     one), and the lock path is never empty; a lock removed and re-created by another operation after the takeover's
+     write is caught by the step-6 identity re-check and the takeover refuses with TARGET_LOCK_BUSY (exit 3), while one
+     removed before step 4 makes the takeover start its acquisition again; a crash during a dead-owner
+     recovery leaves <lock-name>.broken.<operation-id> beside the lock, which cleanup finds for every lock form
+     (single-file, fallback, directory root, filesystem root).
+129. an operation whose lock file no longer holds its own record performs nothing further, stops with
+     TARGET_LOCK_BUSY, and remains resumable.
+130. --restart never leaves the target unlocked between taking the prior operation's lock and starting the new
+     operation.
+131. a refusal that cannot remove its own lock or probe file reports the path and exits 1; a probe file left by an
+     operation that proceeds is reported as a warning and removed with the workspace.
+132. an ancestor lock whose record cannot be read makes a nested operation refuse with TARGET_LOCK_UNCERTAIN.
+133. flux cleanup --target T on a directory target, including a filesystem root, classifies and removes its root lock
+     together with the workspace the lock names, never the lock alone.
+134. an orphan root lock whose named workspace is gone is LIVE when its owner is alive, STALE and eligible when its
+     owner is demonstrably gone, and UNCERTAIN otherwise.
+135. flux cleanup exits 0 after classifying, even when it keeps rows; 1 when a deletion failed; 2 on a usage error;
+     3 when --break-lock is refused by a live owner.
+136. --dry-run --resume with no prior operation previews the fresh plan; --dry-run --restart --break-lock against an
+     uncertain lock previews the takeover; neither changes anything.
+137. --break-lock on a destination without strong file identity or OS-native locks refuses with
+     TARGET_LOCK_UNCERTAIN and changes nothing; elsewhere it takes an unreadable or checksum-failing lock over in place;
+     a plain run never owns a target whose prior owner is uncertain; a lock record with a failed checksum counts as
+     uncertain ownership, never as a foreign object.
+138. recovery and cleanup remove a dead owner's lock only by moving it aside and verifying it first; a lock that
+     another operation recovered in the meantime is never removed.
+139. a hardlink group whose members Data.bin and data.bin share one directory, copied to a case-insensitive
+     destination, publishes the canonical member and reports the dependent DESTINATION_NAMESPACE_COLLISION; a claim
+     record holds the parent FileIdentity, the reported name, the claiming target's FluxPathKey, and its kind.
+140. a directory operation revalidates both its operation lock and its target lock; a cancelled operation pauses
+     instead of reporting TARGET_LOCK_BUSY; a refusal that created and removed its workspace exits 3, and one that
+     could not remove it exits 1; flux verify exits 2 on a usage error.
+141. a plain run meeting a lock whose owner is demonstrably dead replaces it by moving it aside; a second recoverer
+     restarts its acquisition; the moved file is deleted, or reported and later found by cleanup; a lock whose owner is
+     uncertain is never moved aside, and --break-lock takes it over in place (Section 240.5).
+142. flux cleanup --target PATH --break-lock takes the lock over with a cleanup lock record (fresh operation_id,
+     workspace_path none), deletes the artifacts, then its lock, and reports the takeover record, including the prior
+     holder's fields; a crash part way is finished by running cleanup again; the no-replace probe file is named
+     noreplace-probe.
+143. a worker whose operation was superseded or became terminal stops without changing the operation's state; a
+     target recovered from PREPARE_COMMIT without COMMIT gets its COMMIT and created-entry claim before any other
+     target is planned or published; a directory cleanup cannot list is reported and cleanup exits 1.
+144. a dead-owner recoverer that finds the moved file's record changed (a --break-lock takeover rewrote it) puts it
+     back and starts again; a recoverer whose exclusive create loses the gap deletes the moved file; a takeover whose
+     final identity check finds the lock path empty starts again instead of refusing.
+145. a cancelled operation that was also superseded is never written PAUSED over ABANDONED; a takeover whose flush
+     fails is not recorded and exits 1; a cleanup lock (workspace_path none) with a dead owner is removed, never
+     reported ARTIFACT_OWNERSHIP_UNCERTAIN.
+146. a committed target always has its created-entry claim, including after a crash right after COMMIT; a lock record
+     torn by a crash fails its checksum and counts as uncertain ownership.
 ```
 
 ## 259.15 V15 Implementation Baseline
@@ -11299,3 +13573,35 @@ atomic publication → never silently downgraded
 
 **V15 implementation baseline: CLOSED.**
 
+**V16 implementation baseline:** V15 as amended in place by V16 (see
+the Revision Notice at the top of this document).
+
+
+------------------------------------------------------------------------
+
+## Stand-downs
+
+Findings from the V16 adversarial review (AGY-AFTER) that were stood
+down rather than fixed, each with the guard that makes it unreachable:
+
+-   DISCARDED-BELOW-FLOOR: a scheduler that drains a very large batch of
+    held dependents in one go cannot cause a lock takeover, because
+    heartbeat age alone never proves an owner dead (Section 252: "Heartbeat
+    age alone cannot prove that a process is dead"); the cost is
+    throughput only.
+-   DISCARDED-BELOW-FLOOR: a lock left behind by a cleanup run that
+    crashed has a dead owner, so the next operation removes it (Section
+    240.3), or `--break-lock` does when ownership is uncertain (Section
+    240.5); the target is never permanently blocked.
+-   DISCARDED-BELOW-FLOOR: a `lock_conflict` that spends no attempt budget
+    cannot cycle a hardlink group forever: each candidate is tried at most
+    once (Section 253.2, "has not been attempted").
+-   DISCARDED-BELOW-FLOOR: Section 250.1's fixed-pattern list omits atomic
+    staging because Section 250 covers single-file targets only ("For a
+    single-file target T"); directory staging is Section 259.10.
+-   DISCARDED-BELOW-FLOOR: an `operator_action_required` failure cannot
+    loop by itself: every resume is an explicit operator command
+    (`--resume`, Section 21.1).
+-   DISCARDED-BELOW-FLOOR: a moved dead-owner lock whose delete keeps
+    failing is reported by every cleanup run (every row is reported,
+    Sections 24.4, 251.1); nothing depends on its removal.

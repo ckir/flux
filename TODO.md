@@ -14,6 +14,13 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
       deterministic-ordering requirement (spec §7) may force a custom one anyway.
 - [ ] **Persistent state format** for the topology store and operation manifest
       (spec §17, §19). Must scale past RAM and survive a crash mid-write.
+- [ ] **Model-check the lock protocol before implementing it** (spec §96.1, §99,
+      §240.3, §240.5, §259.6, and the claim/`COMMIT` ordering of §241.5 and
+      §182). The V16 adversarial review stopped at its six-round cap still finding
+      defects there each round, and round 6's fixes went unreviewed. Model two
+      recoverers, two `--break-lock` takeovers, a stalled prior owner, and a plain
+      run (for example with TLA+, or `loom`/`shuttle` against the Rust
+      implementation) and check that at most one operation ever owns a target.
 - [ ] Repository housekeeping: enable GitHub private vulnerability reporting (see
       [SECURITY.md](SECURITY.md)), and decide whether `main` gets branch protection.
 

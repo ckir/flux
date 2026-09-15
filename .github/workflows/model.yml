@@ -1,0 +1,131 @@
+name: Model
+
+# Lock-protocol model check: docs/superpowers/specs/2026-09-11-lock-protocol-model-check-design.md,
+# Section 4. Runs on every pull request and push to main so that `model-gate` always reports and
+# can be a required check; the scenario jobs run only when the change touches the model, the spec,
+# the filesystem probes, the justfile (its model recipes), or this workflow. CI runs Python 3.14, the
+# version the development machines use, and also runs the runner's unit tests under Python 3.11, the
+# oldest version run.py supports.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        id: python311
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Runner unit tests (Python 3.14, then 3.11)
+        env:
+          PYTHON311: ${{ steps.python311.outputs.python-path }}
+        run: |
+          python -W error -m unittest discover -s models/lockproto -p "test_*.py"
+          "$PYTHON311" -W error -m unittest discover -s models/lockproto -p "test_*.py"
+      - name: Decide which scenarios to run
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          # touching: true (a relevant file changed), false (none did), unknown (cannot tell: run everything)
+          touching=unknown
+          changed=""
+          # --no-renames lists a moved file under both names, so moving one out of a watched path counts.
+          if [ "$EVENT" = "pull_request" ]; then
+            if changed=$(git diff --no-renames --name-only "$PR_BASE...$PR_HEAD"); then touching=true; fi
+          elif [ "$EVENT" = "push" ] && [ -n "$PUSH_BEFORE" ] \
+               && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ] \
+               && git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
+            if changed=$(git diff --no-renames --name-only "$PUSH_BEFORE" "$GITHUB_SHA"); then touching=true; fi
+          fi
+          if [ "$touching" = true ]; then
+            pattern='^(models/|FLUX_FULL_UPDATED_SPEC_V[^/]*\.md$|crates/flux-platform/tests/fs_semantics\.rs$|justfile$|\.github/workflows/model\.yml$)'
+            if ! printf '%s\n' "$changed" | grep -Eq "$pattern"; then touching=false; fi
+          fi
+          if [ "$touching" = false ]; then
+            matrix='[]'
+          else
+            matrix=$(python models/lockproto/run.py --list-jobs)
+          fi
+          echo "event=$EVENT touching=$touching matrix=$matrix"
+          # Delimited form, so a value that ever spans lines cannot add output keys.
+          { echo "matrix<<MATRIX_EOF"; echo "$matrix"; echo "MATRIX_EOF"; } >> "$GITHUB_OUTPUT"
+
+  scenario:
+    name: Scenario ${{ matrix.job.scenario }} (${{ matrix.job.platform }})
+    needs: plan
+    # GitHub rejects an empty matrix, so the job is skipped when there is nothing to run.
+    if: needs.plan.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        job: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - uses: taiki-e/install-action@just
+      - name: Run the model check
+        env:
+          SCENARIO: ${{ matrix.job.scenario }}
+          PLATFORM: ${{ matrix.job.platform }}
+        run: just model "$SCENARIO" "$PLATFORM"
+      - name: Upload TLC output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tlc-output-${{ matrix.job.scenario }}-${{ matrix.job.platform }}
+          path: target/tla/out/
+
+  model-gate:
+    name: Model gate
+    needs: [plan, scenario]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the model jobs
+        env:
+          PLAN: ${{ needs.plan.result }}
+          SCENARIO: ${{ needs.scenario.result }}
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+        run: |
+          echo "plan=$PLAN scenario=$SCENARIO matrix=$MATRIX"
+          if [ "$PLAN" != "success" ]; then
+            echo "::error::the plan job did not succeed"; exit 1
+          fi
+          if [ "$MATRIX" = "[]" ]; then
+            if [ "$SCENARIO" = "skipped" ]; then exit 0; fi
+            echo "::error::nothing needed to run, yet the scenario job ended as $SCENARIO"; exit 1
+          fi
+          if [ "$SCENARIO" != "success" ]; then
+            echo "::error::a scenario job did not succeed ($SCENARIO)"; exit 1
+          fi

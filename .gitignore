@@ -23,3 +23,10 @@ target
 # Local agent/tool state (machine-specific, not project config)
 .serena/
 .clavity/
+
+# Python bytecode from models/lockproto/run.py and its tests
+__pycache__/
+
+# pcal.trans writes a backup of the module it rewrites, and a default configuration nothing uses
+models/lockproto/LockProtocol.old
+models/lockproto/LockProtocol.cfg

@@ -1,0 +1,51 @@
+exit=75
+@!@!@STARTMSG 2262:0 @!@!@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+@!@!@ENDMSG 2262 @!@!@
+@!@!@STARTMSG 2187:0 @!@!@
+Running breadth-first search Model-Checking with fp 34 and seed 4987116560992870213 with 1 worker on 4 cores with 3621MB heap and 64MB offheap memory [pid: 23628] (Windows 11 10.0 amd64, Eclipse Adoptium 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+@!@!@ENDMSG 2187 @!@!@
+@!@!@STARTMSG 2220:0 @!@!@
+Starting SANY...
+@!@!@ENDMSG 2220 @!@!@
+Parsing file E:\Rust\flux\models\lockproto\testdata\Fixture.tla
+Parsing file C:\Users\user\AppData\Local\Temp\Naturals.tla
+Semantic processing of module Naturals
+Semantic processing of module Fixture
+@!@!@STARTMSG 2219:0 @!@!@
+SANY finished.
+@!@!@ENDMSG 2219 @!@!@
+@!@!@STARTMSG 2185:0 @!@!@
+Starting... (2026-09-11 09:26:45)
+@!@!@ENDMSG 2185 @!@!@
+@!@!@STARTMSG 2189:0 @!@!@
+Computing initial states...
+@!@!@ENDMSG 2189 @!@!@
+@!@!@STARTMSG 2102:1 @!@!@
+Attempted to apply tuple
+<<1, 2>>
+to integer 5 which is out of domain.
+While working on the initial state:
+x = 0
+
+@!@!@ENDMSG 2102 @!@!@
+@!@!@STARTMSG 2147:1 @!@!@
+TLC was unable to fingerprint.
+
+Fingerprint Stack Trace:
+0) line 26, col 14 to line 26, col 21 of module Fixture
+
+Reason:
+Attempted to apply tuple
+<<1, 2>>
+to integer 5 which is out of domain.
+@!@!@ENDMSG 2147 @!@!@
+@!@!@STARTMSG 2200:0 @!@!@
+Progress(1) at 2026-09-11 09:26:46: 1 states generated (23 s/min), 1 distinct states found (23 ds/min), 1 states left on queue.
+@!@!@ENDMSG 2200 @!@!@
+@!@!@STARTMSG 2199:0 @!@!@
+1 states generated, 1 distinct states found, 1 states left on queue.
+@!@!@ENDMSG 2199 @!@!@
+@!@!@STARTMSG 2186:0 @!@!@
+Finished in 2550ms at (2026-09-11 09:26:46)
+@!@!@ENDMSG 2186 @!@!@
