@@ -18,14 +18,13 @@ Status column says otherwise (verified 2026-09-09).
 | `cargo-nextest` | — | Test runner used by CI (`cargo nextest run --workspace`). Per-test process isolation, which matters for Flux: tests touch real files, temp dirs, and permissions. Does **not** run doctests — pair with `cargo test --doc`. | 0.9.x |
 | `cargo-deny` | `deny.toml` | Advisory/licence/ban/source auditing. aishelter allow-lists MIT/Apache/BSD/ISC/Unicode/MPL/Zlib/CC0, denies `openssl-sys` in favour of rustls, denies unknown git sources. Targets list is per-platform — Flux must add macOS + aarch64 targets. | 0.16.x |
 | `typos` (typos-cli) | `_typos.toml` | Prose + source spell-check, run as its own CI job. Needs a Flux-specific `extend-words` (e.g. `reflink`, `dedup`, `hardlink`, `ckir`). | 1.48.0 |
-| `just` | `justfile` | Task runner; the single entry point for `build` / `test` / `clippy` / `fmt` / `check` / `clean` / `changelog` / `release`. aishelter's `default` recipe is `just check` = fmt-check + clippy + test. | 1.46.0 |
+| `just` | `justfile` | Task runner; the single entry point for `build` / `test` / `clippy` / `fmt` / `check` / `clean`. aishelter's `default` recipe is `just check` = fmt-check + clippy + test. | 1.46.0 |
 | `bacon` | `bacon.toml` | Background watcher during development (`check`, `check-all`, `clippy`, `clippy-all`, `test`, `doc` jobs; default `check-all`). | 3.25.0 |
 | `lefthook` | `lefthook.yml` | Git hooks. aishelter ran fmt + clippy on **both** pre-commit and pre-push. Flux runs them on **pre-push only**, and invokes them as `just fmt-check` / `just clippy` / `just typos` so the hook and CI share one definition. Commits stay fast. | 2.1.12 |
-| `git-cliff` | `cliff.toml` | Conventional-commit changelog generation (`just changelog`). Parsers for feat/fix/docs/perf/refactor/test/ci/chore. | 2.13.1 |
-| `cargo-release` | `[workspace.metadata.release]` in root `Cargo.toml` | Lockstep version bump + `v{{version}}` tag across all workspace crates; `publish = false` in aishelter. | 0.25.x |
+| `release-plz` | `release-plz.toml`, `.github/workflows/release-plz.yml` | Release automation, replacing aishelter's `git-cliff` + `cargo-release`. In CI it keeps one release PR open (shared version bump, `Cargo.lock`, `CHANGELOG.md` from commit messages, grouped by the `[changelog]` parsers); merging it creates the `v{version}` tag and GitHub release, and the tag starts `release.yml`. Git-only mode: versions come from tags, nothing goes to crates.io. Uses `PR_UPDATER_TOKEN` so CI runs on the PR and the tag triggers workflows. Local `release-plz update` previews the result. | 0.3.167 |
 | `cargo-binstall` | — | How every one of the above gets installed without a source build. | 1.x |
 | GitHub Actions | `.github/workflows/ci.yml` | aishelter runs four jobs: `fmt`, `typos`, `clippy`, `test`. Uses `dtolnay/rust-toolchain@stable`, `Swatinem/rust-cache@v2`, `taiki-e/install-action@nextest`. | — |
-| GitHub Actions release | `.github/workflows/release.yml` | Tag-triggered (`v*`) cross-platform binary matrix. Directly reusable for shipping the `flux` binary. | — |
+| GitHub Actions release | `.github/workflows/release.yml` | Tag-triggered (`v*`) cross-platform binary matrix. Flux's tags come from release-plz; the builds attach to the release it creates. | — |
 
 ## Installed here, not used by aishelter — candidates for Flux
 
