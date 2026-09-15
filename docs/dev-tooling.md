@@ -37,6 +37,17 @@ Status column says otherwise (verified 2026-09-09).
 | `cargo-zigbuild` | Cross-compiling to Linux/macOS targets from this Windows box. | installed |
 | `criterion` (crate, not a binary) | Spec §3 asks for `benches/` and the CLI has a `flux benchmark` command. | add as dev-dep |
 
+## Added for Flux
+
+| Tool | Config file | What it does for us | Status |
+|---|---|---|---|
+| `actionlint` | — | Lints every GitHub Actions workflow: YAML syntax, `${{ }}` expressions against the context types, job and step references, action inputs. The workflows change often (the model check's per-scenario matrix, the extended tier's label and schedule triggers, Dependabot action bumps), and those mistakes otherwise surface only when CI runs. `just lint-workflows` locally; the `Workflow lint` job in `ci.yml` runs the pinned `rhysd/actionlint:1.7.12` image on every CI run. | 1.7.12 (`winget install rhysd.actionlint`) |
+| `shellcheck` | — | actionlint runs every workflow `run:` step through it when it is on PATH, and silently skips that check when it is not (visible only with `actionlint -verbose`). The CI image bundles it. | 0.11.0 (`winget install koalaman.shellcheck`) |
+
+Both are winget installs, which Git Bash on this machine does not see until its PATH is reloaded, so there is no
+pre-push hook for them; CI is the gate. A clean result is meaningful: a control workflow with an unquoted variable
+(SC2086) and an undefined context property is reported (verified 2026-09-15).
+
 ## Deliberately not carried over
 
 - `sqlx` / `cargo-sqlx` / `migrations/` — aishelter is Postgres-backed; Flux persists its
@@ -57,4 +68,5 @@ cargo nextest run --workspace
 cargo test --doc    # nextest does not run doctests
 cargo deny check
 typos
+just lint-workflows # actionlint (+ shellcheck over run: steps); CI job "Workflow lint"
 ```
