@@ -400,7 +400,7 @@
      \* reported as the holder. A takeover that succeeds returns holding the lock file's handle and its
      \* OS-native lock; every other outcome returns holding nothing.
      procedure TakeOver()
-       variables tobj = 0, tvictim = NoProc;
+       variables tobj = 0;
      {
        S240_5_s1:
          \* Strong file identity and OS-native locks, decided from the capability, never by a trial lock.
@@ -451,7 +451,6 @@
          if (crashed[self]) { goto takeover_crashed; }
          else {
            with (seen = fs.content[tobj]) {
-             tvictim := IF IsRecord(seen) THEN seen.op ELSE NoProc;
              if (IsRecord(seen) /\ seen # seenRec[self]) { refused[self] := "RESTART"; goto S240_5_close; }
              else if (IsRecord(seen)) {
                with (alive \in IF crashed[seen.op] THEN {"dead", "uncertain"} ELSE {"live", "uncertain"}) {
@@ -496,9 +495,11 @@
            \* still complete, which SingleWriter excepts; one it issues later is the check-to-call window.
            \* FIX_ACCEPT_CHECK_TO_CALL_WINDOW models the spec statement the open finding calls for: a prior owner whose
            \* Section 99 check passed before this takeover may still issue that call (design Section 11).
-           if (tvictim \in Procs) {
-             exempt[tvictim] := writing[tvictim] \/ (FIX_ACCEPT_CHECK_TO_CALL_WINDOW /\ checked[tvictim]);
-           };
+           \* The prior owner is whoever still holds a handle on the file this write replaces, not the record step 5
+           \* read: that record can be torn while the owner is still writing it (measured, mixed-remote -fixed run).
+           exempt := [p \in Procs |-> IF p # self /\ HandleObj(p) = tobj
+                                      THEN exempt[p] \/ writing[p] \/ (FIX_ACCEPT_CHECK_TO_CALL_WINDOW /\ checked[p])
+                                      ELSE exempt[p]];
          };
        S240_5_s6_flush:
          if (crashed[self]) { goto takeover_crashed; }
