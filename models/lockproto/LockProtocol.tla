@@ -29,7 +29,8 @@ CONSTANTS
     SEED_RESTART_RELEASES,
     SEED_MOVE_ASIDE_FOR_UNCERTAIN,
     SEED_RENAME_OVER_TAKEOVER,
-    SEED_NO_CAPABILITY_GATE
+    SEED_NO_CAPABILITY_GATE,
+    SEED_TORN_AS_FOREIGN
 
 Procs == Owners \cup Recoverers \cup PlainRuns \cup Cleanups \cup Breakers
 \* <lock-name>.broken.<operation-id> beside the lock (240.3 step 2). Only an actor that can move a
@@ -162,11 +163,12 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
            with (seen = fs.content[obj]) {
              seenRec[self] := seen;
              if (seen = Torn) { tornRead := TRUE; };
-             if (seen = Torn \/ seen = EmptyFile) {
+             if ((seen = Torn /\ ~SEED_TORN_AS_FOREIGN) \/ seen = EmptyFile) {
                classified[self] := "uncertain";
                ownerLive[self] := "none";
                sawLive[self] := FALSE;
-             } else if (seen = Foreign) {
+             } else if (seen = Foreign \/ (SEED_TORN_AS_FOREIGN /\ seen = Torn)) {
+               \* SEED_TORN_AS_FOREIGN (design Section 8) treats a checksum-failing record as a foreign object.
                classified[self] := "foreign";
                ownerLive[self] := "none";
                sawLive[self] := FALSE;
@@ -947,8 +949,8 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "fefca194" /\ chksum(tla) = "a1523e63")
-\* Procedure variable obj of procedure Classify at line 138 col 18 changed to obj_
+\* BEGIN TRANSLATION (chksum(pcal) = "e9ea7267" /\ chksum(tla) = "1914ab9")
+\* Procedure variable obj of procedure Classify at line 139 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
           live, holding, checked, recoveredAfterCrash, tornRead, 
@@ -1105,11 +1107,11 @@ S240_1_read(self) == /\ pc[self] = "S240_1_read"
                                            THEN /\ tornRead' = TRUE
                                            ELSE /\ TRUE
                                                 /\ UNCHANGED tornRead
-                                     /\ IF seen = Torn \/ seen = EmptyFile
+                                     /\ IF (seen = Torn /\ ~SEED_TORN_AS_FOREIGN) \/ seen = EmptyFile
                                            THEN /\ classified' = [classified EXCEPT ![self] = "uncertain"]
                                                 /\ ownerLive' = [ownerLive EXCEPT ![self] = "none"]
                                                 /\ sawLive' = [sawLive EXCEPT ![self] = FALSE]
-                                           ELSE /\ IF seen = Foreign
+                                           ELSE /\ IF seen = Foreign \/ (SEED_TORN_AS_FOREIGN /\ seen = Torn)
                                                       THEN /\ classified' = [classified EXCEPT ![self] = "foreign"]
                                                            /\ ownerLive' = [ownerLive EXCEPT ![self] = "none"]
                                                            /\ sawLive' = [sawLive EXCEPT ![self] = FALSE]

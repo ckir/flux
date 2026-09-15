@@ -106,11 +106,12 @@
            with (seen = fs.content[obj]) {
              seenRec[self] := seen;
              if (seen = Torn) { tornRead := TRUE; };
-             if (seen = Torn \/ seen = EmptyFile) {
+             if ((seen = Torn /\ ~SEED_TORN_AS_FOREIGN) \/ seen = EmptyFile) {
                classified[self] := "uncertain";
                ownerLive[self] := "none";
                sawLive[self] := FALSE;
-             } else if (seen = Foreign) {
+             } else if (seen = Foreign \/ (SEED_TORN_AS_FOREIGN /\ seen = Torn)) {
+               \* SEED_TORN_AS_FOREIGN (design Section 8) treats a checksum-failing record as a foreign object.
                classified[self] := "foreign";
                ownerLive[self] := "none";
                sawLive[self] := FALSE;
