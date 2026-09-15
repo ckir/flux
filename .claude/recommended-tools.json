@@ -67,13 +67,13 @@
   },
   {
     "name": "actionlint",
-    "why": "Lints the GitHub Actions workflows, including .github/workflows/model.yml (lock-model plan 1). Runs the shell in each `run:` step through shellcheck when shellcheck is on PATH; without it that check is silently skipped (visible only with `actionlint -verbose`).",
+    "why": "Lints the GitHub Actions workflows (syntax, expressions, job references, action inputs): `just lint-workflows` locally, and the `Workflow lint` job in ci.yml runs the pinned rhysd/actionlint:1.7.12 image on every CI run. Runs the shell in each `run:` step through shellcheck when shellcheck is on PATH; without it that check is silently skipped (visible only with `actionlint -verbose`). Winget installs are not on Git Bash's PATH on this machine until it is reloaded, so there is no pre-push hook; see docs/dev-tooling.md.",
     "install": "winget install rhysd.actionlint",
     "in_path": "actionlint"
   },
   {
     "name": "shellcheck",
-    "why": "Lets actionlint check the shell inside workflow `run:` steps; actionlint disables that rule when shellcheck is not on PATH.",
+    "why": "Lets actionlint check the shell inside workflow `run:` steps (`just lint-workflows`); actionlint disables that rule when shellcheck is not on PATH. CI's Workflow lint image bundles it.",
     "install": "winget install koalaman.shellcheck",
     "in_path": "shellcheck"
   }
