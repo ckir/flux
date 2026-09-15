@@ -55,9 +55,21 @@
   },
   {
     "name": "java",
-    "why": "Runs TLC (the TLA+ model checker) for the lock-protocol model check: `just model` downloads a pinned tla2tools.jar and needs Java 11 or later on PATH. CI uses Temurin 21. Not needed by `just check`.",
+    "why": "Runs the TLA+ tools in the pinned tla2tools.jar (Java 11 or later; CI uses Temurin 21). Locally it runs only the PlusCal translator and the SANY parser when models/lockproto/algorithm.txt changes: `java -cp target/tla/tla2tools.jar pcal.trans LockProtocol.tla` after concatenating LockProtocol.head, algorithm.txt and invariants.txt, then `tla2sany.SANY LockProtocol.tla`. The TLC model checks themselves are too heavy for the development machine and run only on CI (owner ruling, 2026-09-13); do not run `just model` locally. Not needed by `just check`.",
     "install": "winget install EclipseAdoptium.Temurin.21.JDK",
     "in_path": "java"
+  },
+  {
+    "name": "tla2tools.jar",
+    "why": "The pinned TLA+ tools jar (TLC 2.19, SHA-256 checked by models/lockproto/run.py) that the local PlusCal translation and SANY parse need; see the java entry. run.py downloads it into target/tla/ on first use; the install command fetches it without running any model check.",
+    "install": "python -c \"import sys; sys.path.insert(0, 'models/lockproto'); import run; print(run.ensure_jar())\"",
+    "file_exists": "target/tla/tla2tools.jar"
+  },
+  {
+    "name": "gh",
+    "why": "GitHub CLI. The model checks run only on CI, so their results come from `gh run watch`, `gh run view --log` and `gh run download -n tlc-output-<scenario>-<platform>` (the full TLC log artifact); pull requests, labels such as `model-extended`, and Dependabot auto-merge are driven through it too.",
+    "install": "winget install GitHub.cli",
+    "in_path": "gh"
   },
   {
     "name": "python3",
