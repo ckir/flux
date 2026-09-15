@@ -229,6 +229,8 @@
          if (crashed[self]) { goto acquire_crashed; }
          else {
            fs := FsWriteEnd(fs, obj, OwnRecord(self)).fs;
+           \* Either half of a write can hit a file another process took meanwhile, so both mark it.
+           lostLock := MarkLost(self, obj);
            seenRec[self] := OwnRecord(self);
            holding[self] := TRUE;
            gen := gen + 1;
@@ -347,6 +349,7 @@
          if (crashed[self]) { goto recover_crashed; }
          else {
            fs := FsWriteEnd(fs, nobj, OwnRecord(self)).fs;
+           lostLock := MarkLost(self, nobj);
            seenRec[self] := OwnRecord(self);
            holding[self] := TRUE;
            gen := gen + 1;
@@ -510,6 +513,7 @@
          if (crashed[self]) { goto takeover_crashed; }
          else {
            fs := FsWriteEnd(fs, tobj, OwnRecord(self)).fs;
+           lostLock := MarkLost(self, tobj);
            seenRec[self] := OwnRecord(self);
          };
        S240_5_s6_flush:
@@ -890,6 +894,7 @@
          if (crashed[self]) { goto brk_end; }
          else {
            fs := FsWriteEnd(fs, HandleObj(self), OwnRecord(self)).fs;
+           lostLock := MarkLost(self, HandleObj(self));
          };
        brk_publish:
          if (~crashed[self] /\ holding[self]) { call Publish(); };

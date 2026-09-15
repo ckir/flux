@@ -287,6 +287,8 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          if (crashed[self]) { goto acquire_crashed; }
          else {
            fs := FsWriteEnd(fs, obj, OwnRecord(self)).fs;
+           \* Either half of a write can hit a file another process took meanwhile, so both mark it.
+           lostLock := MarkLost(self, obj);
            seenRec[self] := OwnRecord(self);
            holding[self] := TRUE;
            gen := gen + 1;
@@ -405,6 +407,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          if (crashed[self]) { goto recover_crashed; }
          else {
            fs := FsWriteEnd(fs, nobj, OwnRecord(self)).fs;
+           lostLock := MarkLost(self, nobj);
            seenRec[self] := OwnRecord(self);
            holding[self] := TRUE;
            gen := gen + 1;
@@ -568,6 +571,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          if (crashed[self]) { goto takeover_crashed; }
          else {
            fs := FsWriteEnd(fs, tobj, OwnRecord(self)).fs;
+           lostLock := MarkLost(self, tobj);
            seenRec[self] := OwnRecord(self);
          };
        S240_5_s6_flush:
@@ -948,6 +952,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          if (crashed[self]) { goto brk_end; }
          else {
            fs := FsWriteEnd(fs, HandleObj(self), OwnRecord(self)).fs;
+           lostLock := MarkLost(self, HandleObj(self));
          };
        brk_publish:
          if (~crashed[self] /\ holding[self]) { call Publish(); };
@@ -1040,7 +1045,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "4b30fee2" /\ chksum(tla) = "56e429ae")
+\* BEGIN TRANSLATION (chksum(pcal) = "57bc1d1a" /\ chksum(tla) = "170fd088")
 \* Procedure variable obj of procedure Classify at line 169 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
@@ -1415,8 +1420,9 @@ S96_1_record_end(self) == /\ pc[self] = "S96_1_record_end"
                           /\ IF crashed[self]
                                 THEN /\ pc' = [pc EXCEPT ![self] = "acquire_crashed"]
                                      /\ UNCHANGED << fs, seenRec, holding, gen, 
-                                                     stack, obj >>
+                                                     lostLock, stack, obj >>
                                 ELSE /\ fs' = FsWriteEnd(fs, obj[self], OwnRecord(self)).fs
+                                     /\ lostLock' = MarkLost(self, obj[self])
                                      /\ seenRec' = [seenRec EXCEPT ![self] = OwnRecord(self)]
                                      /\ holding' = [holding EXCEPT ![self] = TRUE]
                                      /\ gen' = gen + 1
@@ -1426,8 +1432,7 @@ S96_1_record_end(self) == /\ pc[self] = "S96_1_record_end"
                           /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                           sawLive, crashed, live, checked, 
                                           writing, pendingUnlink, checkGen, 
-                                          writeGen, lostLock, 
-                                          landedAfterTakeover, 
+                                          writeGen, landedAfterTakeover, 
                                           recoveredAfterCrash, tornRead, 
                                           hostCrashChangedLock, 
                                           touchedUncertain, refusedOk, refused, 
@@ -1675,8 +1680,9 @@ S240_3_s4_record_end(self) == /\ pc[self] = "S240_3_s4_record_end"
                               /\ IF crashed[self]
                                     THEN /\ pc' = [pc EXCEPT ![self] = "recover_crashed"]
                                          /\ UNCHANGED << fs, seenRec, holding, 
-                                                         gen >>
+                                                         gen, lostLock >>
                                     ELSE /\ fs' = FsWriteEnd(fs, nobj[self], OwnRecord(self)).fs
+                                         /\ lostLock' = MarkLost(self, nobj[self])
                                          /\ seenRec' = [seenRec EXCEPT ![self] = OwnRecord(self)]
                                          /\ holding' = [holding EXCEPT ![self] = TRUE]
                                          /\ gen' = gen + 1
@@ -1685,8 +1691,7 @@ S240_3_s4_record_end(self) == /\ pc[self] = "S240_3_s4_record_end"
                                               ownerLive, sawLive, crashed, 
                                               live, checked, writing, 
                                               pendingUnlink, checkGen, 
-                                              writeGen, lostLock, 
-                                              landedAfterTakeover, 
+                                              writeGen, landedAfterTakeover, 
                                               recoveredAfterCrash, tornRead, 
                                               hostCrashChangedLock, 
                                               touchedUncertain, refusedOk, 
@@ -2042,14 +2047,15 @@ S240_5_s6_write_begin(self) == /\ pc[self] = "S240_5_s6_write_begin"
 S240_5_s6_write_end(self) == /\ pc[self] = "S240_5_s6_write_end"
                              /\ IF crashed[self]
                                    THEN /\ pc' = [pc EXCEPT ![self] = "takeover_crashed"]
-                                        /\ UNCHANGED << fs, seenRec >>
+                                        /\ UNCHANGED << fs, seenRec, lostLock >>
                                    ELSE /\ fs' = FsWriteEnd(fs, tobj[self], OwnRecord(self)).fs
+                                        /\ lostLock' = MarkLost(self, tobj[self])
                                         /\ seenRec' = [seenRec EXCEPT ![self] = OwnRecord(self)]
                                         /\ pc' = [pc EXCEPT ![self] = "S240_5_s6_flush"]
                              /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                              sawLive, crashed, live, holding, 
                                              checked, writing, pendingUnlink, 
-                                             gen, checkGen, writeGen, lostLock, 
+                                             gen, checkGen, writeGen, 
                                              landedAfterTakeover, 
                                              recoveredAfterCrash, tornRead, 
                                              hostCrashChangedLock, 
@@ -3147,15 +3153,15 @@ S21_1_s5_write_begin(self) == /\ pc[self] = "S21_1_s5_write_begin"
 S21_1_s5_write_end(self) == /\ pc[self] = "S21_1_s5_write_end"
                             /\ IF crashed[self]
                                   THEN /\ pc' = [pc EXCEPT ![self] = "brk_end"]
-                                       /\ fs' = fs
+                                       /\ UNCHANGED << fs, lostLock >>
                                   ELSE /\ fs' = FsWriteEnd(fs, HandleObj(self), OwnRecord(self)).fs
+                                       /\ lostLock' = MarkLost(self, HandleObj(self))
                                        /\ pc' = [pc EXCEPT ![self] = "brk_publish"]
                             /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                             sawLive, seenRec, crashed, live, 
                                             holding, checked, writing, 
                                             pendingUnlink, gen, checkGen, 
-                                            writeGen, lostLock, 
-                                            landedAfterTakeover, 
+                                            writeGen, landedAfterTakeover, 
                                             recoveredAfterCrash, tornRead, 
                                             hostCrashChangedLock, 
                                             touchedUncertain, refusedOk, 
