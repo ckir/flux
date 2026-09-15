@@ -1,4 +1,8 @@
-(* --fair algorithm LockProtocol {
+(* --algorithm LockProtocol {
+     \* Fairness (design Section 7): every actor is a weakly fair process, so an actor that can keep taking a
+     \* step eventually takes it, however busy the others are; the environment is not fair, so whether and
+     \* when it crashes something stays a free choice. Weak fairness of the whole system alone let one actor
+     \* spin in a retry loop while another that could step never did (plan 3, breaklock liveness).
      \* Each label performs at most ONE filesystem operation (design Section 5.2). A purely local
      \* decision that follows a call - a judgement over what was just read, a branch on whether the
      \* call succeeded - belongs to the same label: no other actor can observe the state between
@@ -585,7 +589,7 @@
      }
 
      \* A normal operation: acquire the lock, publish, release.
-     process (own \in Owners)
+     fair process (own \in Owners)
      {
        own_start:
          if (LockCapability = "weak" /\ ~SEED_NO_CAPABILITY_GATE) {
@@ -604,7 +608,7 @@
      }
 
      \* A new invocation with no flags (21.1): classify what it finds, then act or refuse.
-     process (plain \in PlainRuns)
+     fair process (plain \in PlainRuns)
      {
        plain_start:
          if (LockCapability = "weak" /\ ~SEED_NO_CAPABILITY_GATE) {
@@ -658,7 +662,7 @@
 
      \* A new invocation that finds a dead owner's lock, recovers it (240.3), then continues as an
      \* owner: the recovery path of 21.1 step 1.
-     process (rec \in Recoverers)
+     fair process (rec \in Recoverers)
      {
        rec_start:
          if (LockCapability = "weak" /\ ~SEED_NO_CAPABILITY_GATE) {
@@ -700,7 +704,7 @@
 
      \* flux cleanup DEST: classify the lock, remove a dead owner's or a dead cleanup lock through
      \* 240.3 under its own cleanup lock, then delete that lock last (251.1, 259.6).
-     process (clean \in Cleanups)
+     fair process (clean \in Cleanups)
      {
        clean_start:
          if (LockCapability = "weak" /\ ~SEED_NO_CAPABILITY_GATE) {
@@ -753,7 +757,7 @@
      \* the lock, it then revalidates (21.1 step 3) and rewrites the record for the new operation (step 5),
      \* and continues as an Owner. 21.1 steps 2 and 4 change only the prior operation's state, which is
      \* not modelled.
-     process (brk \in Breakers)
+     fair process (brk \in Breakers)
      {
        brk_start:
          if (LockCapability = "weak" /\ ~SEED_NO_CAPABILITY_GATE) {

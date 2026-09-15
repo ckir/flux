@@ -654,6 +654,12 @@ run's reachable states (measured: identical counts before and after it was added
   antecedent (`NeverUncertainLockWithPendingBreaker`). The state witnesses `NeverDeadOwnerLock` and `NeverTornLock`
   that plan 2 defined are used by no run and are removed in plan 3.
 
+Fairness: every actor is a weakly fair process, and the environment is not fair (owner ruling for plan 3,
+2026-09-15). Plan 2 declared weak fairness of the whole system only, which was enough while no actor looped; plan 3's
+acquirer retries its lock, and `breaklock-posix-liveness` then found a lasso in which the acquirer spun while a
+Breaker that could step never did. Per-process fairness only removes behaviours, so a property that held before still
+holds; `recovery`'s liveness run is re-measured with it.
+
 The two conditions are what make the property checkable at all, not a weakening chosen for convenience. Measured on
 `recovery` (2026-09-12), the unconditioned `[](DeadOwnerLock => <>(~DeadOwnerLock))` is violated. The reason is not
 particular to `recovery`, so it is argued, not measured, for every other model of the same shape: with a fixed, finite

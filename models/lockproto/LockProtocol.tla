@@ -54,7 +54,11 @@ RecovererPerms == Permutations(Recoverers)
 BreakerPerms == Permutations(Breakers)
 Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "dead"}
 
-(* --fair algorithm LockProtocol {
+(* --algorithm LockProtocol {
+     \* Fairness (design Section 7): every actor is a weakly fair process, so an actor that can keep taking a
+     \* step eventually takes it, however busy the others are; the environment is not fair, so whether and
+     \* when it crashes something stays a free choice. Weak fairness of the whole system alone let one actor
+     \* spin in a retry loop while another that could step never did (plan 3, breaklock liveness).
      \* Each label performs at most ONE filesystem operation (design Section 5.2). A purely local
      \* decision that follows a call - a judgement over what was just read, a branch on whether the
      \* call succeeded - belongs to the same label: no other actor can observe the state between
@@ -641,7 +645,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
      }
 
      \* A normal operation: acquire the lock, publish, release.
-     process (own \in Owners)
+     fair process (own \in Owners)
      {
        own_start:
          if (LockCapability = "weak" /\ ~SEED_NO_CAPABILITY_GATE) {
@@ -660,7 +664,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
      }
 
      \* A new invocation with no flags (21.1): classify what it finds, then act or refuse.
-     process (plain \in PlainRuns)
+     fair process (plain \in PlainRuns)
      {
        plain_start:
          if (LockCapability = "weak" /\ ~SEED_NO_CAPABILITY_GATE) {
@@ -714,7 +718,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
 
      \* A new invocation that finds a dead owner's lock, recovers it (240.3), then continues as an
      \* owner: the recovery path of 21.1 step 1.
-     process (rec \in Recoverers)
+     fair process (rec \in Recoverers)
      {
        rec_start:
          if (LockCapability = "weak" /\ ~SEED_NO_CAPABILITY_GATE) {
@@ -756,7 +760,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
 
      \* flux cleanup DEST: classify the lock, remove a dead owner's or a dead cleanup lock through
      \* 240.3 under its own cleanup lock, then delete that lock last (251.1, 259.6).
-     process (clean \in Cleanups)
+     fair process (clean \in Cleanups)
      {
        clean_start:
          if (LockCapability = "weak" /\ ~SEED_NO_CAPABILITY_GATE) {
@@ -809,7 +813,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
      \* the lock, it then revalidates (21.1 step 3) and rewrites the record for the new operation (step 5),
      \* and continues as an Owner. 21.1 steps 2 and 4 change only the prior operation's state, which is
      \* not modelled.
-     process (brk \in Breakers)
+     fair process (brk \in Breakers)
      {
        brk_start:
          if (LockCapability = "weak" /\ ~SEED_NO_CAPABILITY_GATE) {
@@ -943,8 +947,8 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "9c9e337" /\ chksum(tla) = "43fd1335")
-\* Procedure variable obj of procedure Classify at line 134 col 18 changed to obj_
+\* BEGIN TRANSLATION (chksum(pcal) = "8988890f" /\ chksum(tla) = "61488d6e")
+\* Procedure variable obj of procedure Classify at line 138 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
           live, holding, checked, recoveredAfterCrash, tornRead, 
@@ -2889,7 +2893,24 @@ Next == env
            \/ Terminating
 
 Spec == /\ Init /\ [][Next]_vars
-        /\ WF_vars(Next)
+        /\ \A self \in Owners : WF_vars(own(self)) /\ WF_vars(Acquire(self)) /\ WF_vars(Publish(self))
+        /\ \A self \in PlainRuns : /\ WF_vars(plain(self))
+                                   /\ WF_vars(Classify(self))
+                                   /\ WF_vars(Recover(self))
+                                   /\ WF_vars(Publish(self))
+                                   /\ WF_vars(Acquire(self))
+        /\ \A self \in Recoverers : /\ WF_vars(rec(self))
+                                    /\ WF_vars(Classify(self))
+                                    /\ WF_vars(Recover(self))
+                                    /\ WF_vars(Publish(self))
+                                    /\ WF_vars(Acquire(self))
+        /\ \A self \in Cleanups : WF_vars(clean(self)) /\ WF_vars(Classify(self)) /\ WF_vars(Recover(self))
+        /\ \A self \in Breakers : /\ WF_vars(brk(self))
+                                  /\ WF_vars(Classify(self))
+                                  /\ WF_vars(TakeOver(self))
+                                  /\ WF_vars(Recover(self))
+                                  /\ WF_vars(Publish(self))
+                                  /\ WF_vars(Acquire(self))
 
 Termination == <>(\A self \in ProcSet: pc[self] = "Done")
 
