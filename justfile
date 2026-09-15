@@ -33,6 +33,11 @@ fmt:
 typos:
     typos
 
+# Lint the GitHub Actions workflows (actionlint, with shellcheck over `run:` steps when it is on PATH;
+# without shellcheck that check is silently skipped). CI runs the same in the Workflow lint job.
+lint-workflows:
+    actionlint
+
 # Dependency advisories, licences, bans and sources
 deny:
     cargo deny check
