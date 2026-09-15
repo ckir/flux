@@ -43,13 +43,23 @@
        LandUnlink(f, q, c) == IF q # NoProc /\ pendingUnlink[q] # NoObj /\ At(f, P, LockName) = pendingUnlink[q]
                               THEN FsUnlink(f, P, LockName, c).fs ELSE f
        OwnRecord(p) == Rec(p, IF p \in Cleanups THEN "cleanup" ELSE "operation")
+       \* The object of the one lock-file handle a process holds, or NoObj. A holder of the target lock
+       \* has exactly one open handle at the points that use this (after a takeover or a recovery).
+       HandleObj(p) == IF \E h \in fs.handles : h.proc = p
+                       THEN (CHOOSE h \in fs.handles : h.proc = p).obj
+                       ELSE NoObj
        \* "Still owned" (Section 99): a lock file at the lock path holding this operation's record. FIX_REMOTE_LEASE_SPEC
-       \* adds the amendment the open finding calls for: this process still holds that file's OS-native lock (for
-       \* RemoteStrong, an unexpired lease), so a lease-lapsed owner whose stale record write undid a takeover no
-       \* longer passes (owner ruling for plan 3, 2026-09-15).
+       \* adds the amendment the open finding calls for, as a test an implementation can make (owner ruling for plan 3,
+       \* 2026-09-15): the check also tries to take the OS-native lock again on the handle it holds, without waiting.
+       \* Held by another process: the check fails, so a lease-lapsed owner whose stale record write undid a takeover
+       \* no longer passes. Held by nobody (the lease lapsed and no one took it): the attempt takes it back and the
+       \* check goes on (Relock). Held by this process: nothing changes. The attempt and the read are one step here.
        StillOwned(p) == /\ LockObj # NoObj
                         /\ fs.content[LockObj] = OwnRecord(p)
-                        /\ (FIX_REMOTE_LEASE_SPEC => fs.oslock[LockObj] = p)
+                        /\ (FIX_REMOTE_LEASE_SPEC => HandleObj(p) = LockObj /\ fs.oslock[LockObj] \in {p, NoProc})
+       \* The filesystem after that relock attempt: it takes a lapsed lock back, and changes nothing otherwise.
+       Relock(p) == IF FIX_REMOTE_LEASE_SPEC /\ HandleObj(p) # NoObj /\ fs.oslock[HandleObj(p)] = NoProc
+                    THEN FsTryLock(fs, p, HandleObj(p)).fs ELSE fs
        \* The lock path holds a record whose owner is alive: what justifies TARGET_LOCK_BUSY
        \* (Section 7, 240.2). A takeover's record is the `breaklock` scenario's business.
        BusyJustified == /\ LockObj # NoObj
@@ -59,11 +69,6 @@
        \* 96.1 and 240.3 step 4 put it. Under `weak` 235.1 refuses first, so only SEED_NO_CAPABILITY_GATE
        \* ever runs a protocol step without them.
        LocksAvailable == LockCapability # "weak"
-       \* The object of the one lock-file handle a process holds, or NoObj. A holder of the target lock
-       \* has exactly one open handle at the points that use this (after a takeover or a recovery).
-       HandleObj(p) == IF \E h \in fs.handles : h.proc = p
-                       THEN (CHOOSE h \in fs.handles : h.proc = p).obj
-                       ELSE NoObj
        \* The evidence a TARGET_LOCK_BUSY refusal rests on, recorded by every refusing label through this
        \* one definition, so SEED_DEAD_AS_BUSY guards all of them (design Section 7, RefusalJustified).
        \* 240.2 defines TARGET_LOCK_BUSY as "the lock is held", so another process holding the OS-native lock
@@ -79,7 +84,7 @@
        \* lock path by a process holding no lock file there still has none.
        LostLock(p) == \/ LockObj # NoObj /\ fs.content[LockObj] # Foreign /\ fs.content[LockObj] # OwnRecord(p)
                       \/ HandleObj(p) # NoObj /\ HandleObj(p) # LockObj
-                      \/ FIX_REMOTE_LEASE_SPEC /\ LockObj # NoObj /\ fs.oslock[LockObj] # p
+                      \/ FIX_REMOTE_LEASE_SPEC /\ LockObj # NoObj /\ fs.oslock[LockObj] \notin {p, NoProc}
        \* The actor's judgement was uncertain: a torn or empty record, or an owner the oracle cannot judge.
        JudgedUncertain(p) == classified[p] = "uncertain" \/ ownerLive[p] = "uncertain"
        \* A lock this actor may replace through 240.3: a dead owner's operation lock, or a cleanup
@@ -568,6 +573,7 @@
          \* "Still owned" is a read of the lock path; the decision that follows is local.
          if (crashed[self]) { goto publish_crashed; }
          else {
+           fs := Relock(self);
            if (StillOwned(self)) { checked[self] := TRUE; }
            else {
              checked[self] := FALSE;
@@ -600,6 +606,7 @@
          if (crashed[self]) { goto publish_crashed; }
          else {
            checked[self] := FALSE;
+           fs := Relock(self);
            if (~StillOwned(self)) {
              refusedOk[self] := RefusalEvidence(self) \/ LostLock(self);
              refused[self] := "TARGET_LOCK_BUSY";
@@ -849,6 +856,7 @@
          \* Revalidate the lock it now holds (Section 99).
          if (crashed[self] \/ ~holding[self]) { goto brk_end; }
          else {
+           fs := Relock(self);
            if (~StillOwned(self)) {
              refusedOk[self] := RefusalEvidence(self) \/ LostLock(self);
              refused[self] := "TARGET_LOCK_BUSY";

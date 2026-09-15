@@ -101,13 +101,23 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
        LandUnlink(f, q, c) == IF q # NoProc /\ pendingUnlink[q] # NoObj /\ At(f, P, LockName) = pendingUnlink[q]
                               THEN FsUnlink(f, P, LockName, c).fs ELSE f
        OwnRecord(p) == Rec(p, IF p \in Cleanups THEN "cleanup" ELSE "operation")
+       \* The object of the one lock-file handle a process holds, or NoObj. A holder of the target lock
+       \* has exactly one open handle at the points that use this (after a takeover or a recovery).
+       HandleObj(p) == IF \E h \in fs.handles : h.proc = p
+                       THEN (CHOOSE h \in fs.handles : h.proc = p).obj
+                       ELSE NoObj
        \* "Still owned" (Section 99): a lock file at the lock path holding this operation's record. FIX_REMOTE_LEASE_SPEC
-       \* adds the amendment the open finding calls for: this process still holds that file's OS-native lock (for
-       \* RemoteStrong, an unexpired lease), so a lease-lapsed owner whose stale record write undid a takeover no
-       \* longer passes (owner ruling for plan 3, 2026-09-15).
+       \* adds the amendment the open finding calls for, as a test an implementation can make (owner ruling for plan 3,
+       \* 2026-09-15): the check also tries to take the OS-native lock again on the handle it holds, without waiting.
+       \* Held by another process: the check fails, so a lease-lapsed owner whose stale record write undid a takeover
+       \* no longer passes. Held by nobody (the lease lapsed and no one took it): the attempt takes it back and the
+       \* check goes on (Relock). Held by this process: nothing changes. The attempt and the read are one step here.
        StillOwned(p) == /\ LockObj # NoObj
                         /\ fs.content[LockObj] = OwnRecord(p)
-                        /\ (FIX_REMOTE_LEASE_SPEC => fs.oslock[LockObj] = p)
+                        /\ (FIX_REMOTE_LEASE_SPEC => HandleObj(p) = LockObj /\ fs.oslock[LockObj] \in {p, NoProc})
+       \* The filesystem after that relock attempt: it takes a lapsed lock back, and changes nothing otherwise.
+       Relock(p) == IF FIX_REMOTE_LEASE_SPEC /\ HandleObj(p) # NoObj /\ fs.oslock[HandleObj(p)] = NoProc
+                    THEN FsTryLock(fs, p, HandleObj(p)).fs ELSE fs
        \* The lock path holds a record whose owner is alive: what justifies TARGET_LOCK_BUSY
        \* (Section 7, 240.2). A takeover's record is the `breaklock` scenario's business.
        BusyJustified == /\ LockObj # NoObj
@@ -117,11 +127,6 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
        \* 96.1 and 240.3 step 4 put it. Under `weak` 235.1 refuses first, so only SEED_NO_CAPABILITY_GATE
        \* ever runs a protocol step without them.
        LocksAvailable == LockCapability # "weak"
-       \* The object of the one lock-file handle a process holds, or NoObj. A holder of the target lock
-       \* has exactly one open handle at the points that use this (after a takeover or a recovery).
-       HandleObj(p) == IF \E h \in fs.handles : h.proc = p
-                       THEN (CHOOSE h \in fs.handles : h.proc = p).obj
-                       ELSE NoObj
        \* The evidence a TARGET_LOCK_BUSY refusal rests on, recorded by every refusing label through this
        \* one definition, so SEED_DEAD_AS_BUSY guards all of them (design Section 7, RefusalJustified).
        \* 240.2 defines TARGET_LOCK_BUSY as "the lock is held", so another process holding the OS-native lock
@@ -137,7 +142,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
        \* lock path by a process holding no lock file there still has none.
        LostLock(p) == \/ LockObj # NoObj /\ fs.content[LockObj] # Foreign /\ fs.content[LockObj] # OwnRecord(p)
                       \/ HandleObj(p) # NoObj /\ HandleObj(p) # LockObj
-                      \/ FIX_REMOTE_LEASE_SPEC /\ LockObj # NoObj /\ fs.oslock[LockObj] # p
+                      \/ FIX_REMOTE_LEASE_SPEC /\ LockObj # NoObj /\ fs.oslock[LockObj] \notin {p, NoProc}
        \* The actor's judgement was uncertain: a torn or empty record, or an owner the oracle cannot judge.
        JudgedUncertain(p) == classified[p] = "uncertain" \/ ownerLive[p] = "uncertain"
        \* A lock this actor may replace through 240.3: a dead owner's operation lock, or a cleanup
@@ -626,6 +631,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          \* "Still owned" is a read of the lock path; the decision that follows is local.
          if (crashed[self]) { goto publish_crashed; }
          else {
+           fs := Relock(self);
            if (StillOwned(self)) { checked[self] := TRUE; }
            else {
              checked[self] := FALSE;
@@ -658,6 +664,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          if (crashed[self]) { goto publish_crashed; }
          else {
            checked[self] := FALSE;
+           fs := Relock(self);
            if (~StillOwned(self)) {
              refusedOk[self] := RefusalEvidence(self) \/ LostLock(self);
              refused[self] := "TARGET_LOCK_BUSY";
@@ -907,6 +914,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          \* Revalidate the lock it now holds (Section 99).
          if (crashed[self] \/ ~holding[self]) { goto brk_end; }
          else {
+           fs := Relock(self);
            if (~StillOwned(self)) {
              refusedOk[self] := RefusalEvidence(self) \/ LostLock(self);
              refused[self] := "TARGET_LOCK_BUSY";
@@ -1016,8 +1024,8 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "24e311d0" /\ chksum(tla) = "8eb5da5a")
-\* Procedure variable obj of procedure Classify at line 162 col 18 changed to obj_
+\* BEGIN TRANSLATION (chksum(pcal) = "e06378f0" /\ chksum(tla) = "76f3043e")
+\* Procedure variable obj of procedure Classify at line 167 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
           live, holding, checked, writing, pendingUnlink, exempt, 
@@ -1034,11 +1042,21 @@ LandUnlink(f, q, c) == IF q # NoProc /\ pendingUnlink[q] # NoObj /\ At(f, P, Loc
 OwnRecord(p) == Rec(p, IF p \in Cleanups THEN "cleanup" ELSE "operation")
 
 
+HandleObj(p) == IF \E h \in fs.handles : h.proc = p
+                THEN (CHOOSE h \in fs.handles : h.proc = p).obj
+                ELSE NoObj
+
+
+
+
 
 
 StillOwned(p) == /\ LockObj # NoObj
                  /\ fs.content[LockObj] = OwnRecord(p)
-                 /\ (FIX_REMOTE_LEASE_SPEC => fs.oslock[LockObj] = p)
+                 /\ (FIX_REMOTE_LEASE_SPEC => HandleObj(p) = LockObj /\ fs.oslock[LockObj] \in {p, NoProc})
+
+Relock(p) == IF FIX_REMOTE_LEASE_SPEC /\ HandleObj(p) # NoObj /\ fs.oslock[HandleObj(p)] = NoProc
+             THEN FsTryLock(fs, p, HandleObj(p)).fs ELSE fs
 
 
 BusyJustified == /\ LockObj # NoObj
@@ -1048,11 +1066,6 @@ BusyJustified == /\ LockObj # NoObj
 
 
 LocksAvailable == LockCapability # "weak"
-
-
-HandleObj(p) == IF \E h \in fs.handles : h.proc = p
-                THEN (CHOOSE h \in fs.handles : h.proc = p).obj
-                ELSE NoObj
 
 
 
@@ -1068,7 +1081,7 @@ RefusalEvidence(p) == BusyJustified \/ sawLive[p] \/ HeldByOther(p)
 
 LostLock(p) == \/ LockObj # NoObj /\ fs.content[LockObj] # Foreign /\ fs.content[LockObj] # OwnRecord(p)
                \/ HandleObj(p) # NoObj /\ HandleObj(p) # LockObj
-               \/ FIX_REMOTE_LEASE_SPEC /\ LockObj # NoObj /\ fs.oslock[LockObj] # p
+               \/ FIX_REMOTE_LEASE_SPEC /\ LockObj # NoObj /\ fs.oslock[LockObj] \notin {p, NoProc}
 
 JudgedUncertain(p) == classified[p] = "uncertain" \/ ownerLive[p] = "uncertain"
 
@@ -2158,9 +2171,10 @@ TakeOver(self) == S240_5_s1(self) \/ S240_5_s2(self) \/ S240_5_s3(self)
 S99_check(self) == /\ pc[self] = "S99_check"
                    /\ IF crashed[self]
                          THEN /\ pc' = [pc EXCEPT ![self] = "publish_crashed"]
-                              /\ UNCHANGED << holding, checked, refusedOk, 
+                              /\ UNCHANGED << fs, holding, checked, refusedOk, 
                                               refused >>
-                         ELSE /\ IF StillOwned(self)
+                         ELSE /\ fs' = Relock(self)
+                              /\ IF StillOwned(self)
                                     THEN /\ checked' = [checked EXCEPT ![self] = TRUE]
                                          /\ pc' = [pc EXCEPT ![self] = "S99_write"]
                                          /\ UNCHANGED << holding, refusedOk, 
@@ -2170,8 +2184,8 @@ S99_check(self) == /\ pc[self] = "S99_check"
                                          /\ refused' = [refused EXCEPT ![self] = "TARGET_LOCK_BUSY"]
                                          /\ holding' = [holding EXCEPT ![self] = FALSE]
                                          /\ pc' = [pc EXCEPT ![self] = "S99_refuse_close"]
-                   /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
-                                   sawLive, seenRec, crashed, live, writing, 
+                   /\ UNCHANGED << foreignObj, classified, ownerLive, sawLive, 
+                                   seenRec, crashed, live, writing, 
                                    pendingUnlink, exempt, landedAfterTakeover, 
                                    recoveredAfterCrash, tornRead, 
                                    hostCrashChangedLock, touchedUncertain, 
@@ -2218,9 +2232,10 @@ S240_5_inflight_lands(self) == /\ pc[self] = "S240_5_inflight_lands"
 S99_release_check(self) == /\ pc[self] = "S99_release_check"
                            /\ IF crashed[self]
                                  THEN /\ pc' = [pc EXCEPT ![self] = "publish_crashed"]
-                                      /\ UNCHANGED << holding, checked, 
+                                      /\ UNCHANGED << fs, holding, checked, 
                                                       refusedOk, refused >>
                                  ELSE /\ checked' = [checked EXCEPT ![self] = FALSE]
+                                      /\ fs' = Relock(self)
                                       /\ IF ~StillOwned(self)
                                             THEN /\ refusedOk' = [refusedOk EXCEPT ![self] = RefusalEvidence(self) \/ LostLock(self)]
                                                  /\ refused' = [refused EXCEPT ![self] = "TARGET_LOCK_BUSY"]
@@ -2230,10 +2245,9 @@ S99_release_check(self) == /\ pc[self] = "S99_release_check"
                                                  /\ UNCHANGED << holding, 
                                                                  refusedOk, 
                                                                  refused >>
-                           /\ UNCHANGED << fs, foreignObj, classified, 
-                                           ownerLive, sawLive, seenRec, 
-                                           crashed, live, writing, 
-                                           pendingUnlink, exempt, 
+                           /\ UNCHANGED << foreignObj, classified, ownerLive, 
+                                           sawLive, seenRec, crashed, live, 
+                                           writing, pendingUnlink, exempt, 
                                            landedAfterTakeover, 
                                            recoveredAfterCrash, tornRead, 
                                            hostCrashChangedLock, 
@@ -2988,8 +3002,9 @@ brk_recover(self) == /\ pc[self] = "brk_recover"
 S21_1_s3(self) == /\ pc[self] = "S21_1_s3"
                   /\ IF crashed[self] \/ ~holding[self]
                         THEN /\ pc' = [pc EXCEPT ![self] = "brk_end"]
-                             /\ UNCHANGED << holding, refusedOk, refused >>
-                        ELSE /\ IF ~StillOwned(self)
+                             /\ UNCHANGED << fs, holding, refusedOk, refused >>
+                        ELSE /\ fs' = Relock(self)
+                             /\ IF ~StillOwned(self)
                                    THEN /\ refusedOk' = [refusedOk EXCEPT ![self] = RefusalEvidence(self) \/ LostLock(self)]
                                         /\ refused' = [refused EXCEPT ![self] = "TARGET_LOCK_BUSY"]
                                         /\ holding' = [holding EXCEPT ![self] = FALSE]
@@ -2997,14 +3012,13 @@ S21_1_s3(self) == /\ pc[self] = "S21_1_s3"
                                    ELSE /\ pc' = [pc EXCEPT ![self] = "S21_1_s5_write_begin"]
                                         /\ UNCHANGED << holding, refusedOk, 
                                                         refused >>
-                  /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
-                                  sawLive, seenRec, crashed, live, checked, 
-                                  writing, pendingUnlink, exempt, 
-                                  landedAfterTakeover, recoveredAfterCrash, 
-                                  tornRead, hostCrashChangedLock, 
-                                  touchedUncertain, stack, keep, obj_, got, 
-                                  obj, robj, victim, nobj, tobj, crashes, 
-                                  leases >>
+                  /\ UNCHANGED << foreignObj, classified, ownerLive, sawLive, 
+                                  seenRec, crashed, live, checked, writing, 
+                                  pendingUnlink, exempt, landedAfterTakeover, 
+                                  recoveredAfterCrash, tornRead, 
+                                  hostCrashChangedLock, touchedUncertain, 
+                                  stack, keep, obj_, got, obj, robj, victim, 
+                                  nobj, tobj, crashes, leases >>
 
 S21_1_s5_write_begin(self) == /\ pc[self] = "S21_1_s5_write_begin"
                               /\ IF crashed[self]
