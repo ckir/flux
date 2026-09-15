@@ -1,0 +1,61 @@
+name: Update auto-merge PRs
+
+# main requires branches to be up to date, so after every merge the other open pull requests fall behind
+# and GitHub's auto-merge waits until someone clicks "Update branch". When main moves, this workflow brings
+# up to date every open, non-draft pull request that has auto-merge enabled and is behind main; the
+# required checks then run on the updated branch and auto-merge finishes on its own. Pull requests without
+# auto-merge, and drafts, are left alone.
+#
+# Token: an update made with the workflow's own GITHUB_TOKEN does not trigger new workflow runs, so the
+# required checks would never run on the updated branch and auto-merge would stay stuck. Therefore:
+# - a Dependabot pull request is asked to rebase (a comment is enough, and Dependabot's own push runs CI);
+# - any other pull request is updated with PR_UPDATER_TOKEN, a fine-grained personal access token scoped
+#   to this repository only, with Contents and Pull requests set to read and write. Without that secret
+#   the workflow names the pull request in a warning instead.
+#
+# Nothing here checks out or runs pull request code.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: update-auto-merge-prs
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Update behind PRs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update every behind pull request that has auto-merge enabled
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPDATER_TOKEN: ${{ secrets.PR_UPDATER_TOKEN }}
+        run: |
+          set -euo pipefail
+          # mergeStateStatus is computed lazily and often reads UNKNOWN right after a push, so "behind" is
+          # measured directly: how many commits of main the pull request's head does not contain.
+          gh pr list --state open --base main --limit 100 \
+            --json number,isDraft,autoMergeRequest,headRefOid,author \
+            --jq '.[] | select(.autoMergeRequest != null and (.isDraft | not)) | "\(.number) \(.headRefOid) \(.author.login)"' |
+          while read -r number head author; do
+            behind=$(gh api "repos/$GH_REPO/compare/$head...main" --jq '.ahead_by')
+            if [ "$behind" = "0" ]; then
+              echo "#$number is up to date with main"
+            elif [ "$author" = "app/dependabot" ]; then
+              gh pr comment "$number" --body "@dependabot rebase"
+              echo "::notice::#$number is $behind commit(s) behind main: asked Dependabot to rebase"
+            elif [ -n "$UPDATER_TOKEN" ]; then
+              GH_TOKEN="$UPDATER_TOKEN" gh pr update-branch "$number"
+              echo "::notice::#$number was $behind commit(s) behind main: updated"
+            else
+              echo "::warning::#$number is $behind commit(s) behind main, but PR_UPDATER_TOKEN is not set; update it by hand"
+            fi
+          done
