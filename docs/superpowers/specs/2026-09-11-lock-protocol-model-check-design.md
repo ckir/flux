@@ -425,8 +425,11 @@ therefore several labels, and other actors can run between them.
 A data write, rename, or unlink that an operation issues as part of publishing or releasing its lock is two steps:
 issue, then complete. Other actors' steps can run between them, and the call's effect lands at completion. This is how
 the model represents a stalled owner whose call "can still complete" (Section 240.5). Plan 2 defined these operations in
-`FsModel.tla` but no label issues one (its publishing write is a `skip`); plan 3 builds the in-flight data write,
-rename and unlink, which under `remote` is what lets the lock path empty during a takeover: a lease-expired owner's
+`FsModel.tla` but no label issues one (its publishing write is a `skip`); plan 3 builds the in-flight publishing write
+(`S99_write`, landing at `S240_5_inflight_lands`) and release unlink (`S99_release`, landing at `S99_release_lands`,
+which removes the name only while the lock path still names the file the call resolved when issued). The publishing
+write has no filesystem effect in the model; it is what `SingleWriter` counts. The in-flight unlink under `remote` is
+what lets the lock path empty during a takeover: a lease-expired owner's
 release unlink lands after a Breaker's step 3. Under `strong` the only thing that empties the path mid-takeover is
 the acquirer window of Section 11. A lock-record write stays a labelled `WriteBegin` and `WriteEnd`
 pair, not an in-flight call (owner ruling, 2026-09-14): what rewrites a record under a Recoverer that holds its
@@ -448,7 +451,9 @@ A process crash (the process dies; the machine keeps running):
 A host crash (power loss or reboot of the machine all actors run on):
 
 - is a process crash of every process that has started, so each in-flight call lands or is dropped at the crash (plan 2's
-  `FsHostCrash` drops them all, which was equivalent while no scenario issued one; plan 3 makes it match this rule);
+  `FsHostCrash` drops them all, which was equivalent while no scenario issued one; plan 3 makes it match this rule: the
+  env step lands at most one pending release unlink, since at most one can still name the lock file, before the host
+  crash resolves unflushed state, so a landed unlink can itself be undone);
 - then sets, for every object written since its last flush, both `content` and `durable` to one of: the old durable
   content, the latest content, or `Torn`, chosen nondeterministically per object; a crash during a flush has the same
   outcomes. Objects flushed since their last write keep their content, and so does a file created and never
@@ -587,7 +592,7 @@ Safety invariants, which must hold in every reachable state:
 
 | Name | Statement |
 |---|---|
-| `SingleWriter` | For a target, at most one process is inside a publishing step whose last Section 99 check passed. The one exception the spec accepts, a stalled prior owner's in-flight call issued before an operator `--break-lock` and completing after it, is permitted only in that case. The model counts a process as a writer while its last Section 99 check passed or while it has a data write, rename or unlink in flight, and excepts an in-flight call only when a ghost records that it was issued before the takeover that ended its owner's tenure (owner ruling for plan 3, 2026-09-14). |
+| `SingleWriter` | For a target, at most one process is inside a publishing step whose last Section 99 check passed. The one exception the spec accepts, a stalled prior owner's in-flight call issued before an operator `--break-lock` and completing after it, is permitted only in that case. The model counts a process as a writer while its last Section 99 check passed or while it has a publishing write in flight, and excepts an in-flight call only when a ghost records that it was issued before the takeover that ended its owner's tenure (owner ruling for plan 3, 2026-09-14). |
 | `PlainNeverOwnsUncertain` | A process without `--break-lock` never removes, renames, or overwrites a lock it classified as uncertain, and creates a lock only at an empty lock path. A process with `--break-lock` may overwrite such a lock in place (240.5 step 6) but never renames or removes a lock whose record is not its own; its own lock, after a takeover, it releases as any owner does. That is what `SEED_MOVE_ASIDE_FOR_UNCERTAIN` breaks (owner ruling for plan 3). "Classified as uncertain" means either judgement: `classified` is uncertain (a torn or empty record), or `ownerLive` is (the oracle could not tell a cleanup lock's owner is dead), because the decision tables refuse `TARGET_LOCK_UNCERTAIN` for both. |
 | `RefusalJustified` | A regression guard, not a liveness check. Every `TARGET_LOCK_BUSY` refusal rests on evidence that the lock was held, that its owner was alive, or that the lock path holds a live owner's record. Since spec 240.2 was corrected, a held OS-native lock shows only that the lock is held - it cannot tell the owner from another invocation inspecting or recovering it - so this invariant cannot establish owner liveness. What it catches is a refusal with nothing behind it: a decision table that refuses `TARGET_LOCK_BUSY` for a lock it judged dead, or a publisher refusing it at the Section 99 check when the lock path is empty or foreign. Every refusing label records its evidence through one definition, `RefusalEvidence`, so the seeded run of Section 8 guards all of them at once; a change that bypasses the definition at a single label is not caught (accepted, test audit 2026-09-14). |
 | `ForeignUntouched` | A `Foreign` object at a lock path is never written, renamed, or deleted. It is a state predicate, not a ghost flag: the `Foreign` object an initial state holds, if any, is still the object at the lock path and still holds `Foreign`. No actor ever writes `Foreign`, so an invariant about it means something only where an initial state holds one: every `recovery` configuration starts from either an empty lock path or one holding a `Foreign` object (`FsWith`), and the empty start keeps the whole acquisition prefix a `check` run needs (Section 12). `SEED_RECOVER_FOREIGN` exercises the identity half; nothing exercises the content half, because a `Foreign` object exists only in the initial state, every record write in the model follows its writer's own successful exclusive create at the lock path (96.1's record write, 240.3 step 4's), and no such create succeeds while the `Foreign` object holds the lock path. The write operation itself checks no handle, so this rests on that ordering, not on a guard. A `Foreign` object that appears mid-run, after an actor's check and before its remove by name, is not modelled (test audit 2026-09-14). |
@@ -613,7 +618,7 @@ design named as a witness, so the intent is kept and nothing is lost:
 | a Recoverer completes 240.3 | `S240_3_s5` |
 | a Breaker or CleanupBreaker completes 240.5 | `S240_5_s6` |
 | Cleanup removes a lock | `S251_1_delete` |
-| a stalled owner's in-flight call completes after a takeover | `S240_5_inflight_lands`, reached only under `remote` (`breaklock-remote`, `mixed-remote`); every strong-capability run that runs a publishing actor lists it `unreached` |
+| a stalled owner's in-flight call completes after a takeover | not a label: `S240_5_inflight_lands` is where every issued publishing write completes, so every run with a publishing actor covers it. That the write was issued before a takeover ended its owner's tenure is the ghost `landedAfterTakeover`, whose witness `NeverInflightLandedAfterTakeover` runs in `breaklock-remote` |
 | a DirOwner passes its 96.1 check holding the directory lock | `S96_1_dirowner_check` |
 | a per-name or directory acquirer backs off on a 96.1 conflict | `S96_1_backoff` |
 | a target commits with its claim (Claims) | `S182_commit` |

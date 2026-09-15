@@ -34,7 +34,7 @@
 #
 # Headings enter the stamp as the model encodes them (plan 2 onward).
 
-planned_scenarios = ["breaklock-remote", "mixed-remote", "cleanup", "cleanup-crash", "nested", "dirlock", "claims"]
+planned_scenarios = ["cleanup", "cleanup-crash", "nested", "dirlock", "claims"]
 
 [[unit]]
 heading = "## 21.1 Existing Operation State Without `--resume`"
@@ -332,7 +332,8 @@ heading = "## 96.1 Name-Equivalent Target Locks"
 ordinal = 22
 quote = "Exclusive creation on a remote filesystem is trusted only under the lock"
 hash = "4c938d58d5793215d3ce4f490bfff768e14740f101ea2ebfd106ef40c4c7a27b"
-pending = ["breaklock-remote"]
+labels = ["S96_1_ownlock"]
+not_modelled = "the REMOTE_LOCK_UNSAFE refusal sits in each actor's start step, which has no spec-named label; S96_1_ownlock is the exclusive creation, attempted only under LockCapability strong or remote (RemoteStrong), where a lease can lapse"
 
 [[unit]]
 heading = "## 96.2 Lock Refusal Reports the Holder"
@@ -368,7 +369,7 @@ heading = "# 99. Commit-Time Lock Revalidation"
 ordinal = 3
 quote = "the worker must verify that its required ownership remains valid."
 hash = "23d3b2ad1c79c117338acf208bd044e4be57e57d741d89c12f77545720b5c7a9"
-labels = ["S99_check", "S99_release_check", "S99_release", "S99_close", "S99_refuse_close"]
+labels = ["S99_check", "S99_release_check", "S99_release", "S99_release_lands", "S99_close", "S99_refuse_close"]
 not_modelled = "the check before the release unlink is a reading: Section 99 lists unlink among the calls it guards but is about commit-time writes and never names releasing the lock (design Section 12, plan 3)"
 
 [[unit]]
@@ -707,8 +708,8 @@ heading = "## 240.5 `--break-lock`"
 ordinal = 11
 quote = "A prior owner that was only stalled starts nothing more: its next lock"
 hash = "0d064cba024bbd4490bfe5f4009f68915a9386c3fa0add879a11aeb619ccae5d"
-pending = ["breaklock-remote", "cleanup"]
-labels = ["S99_check", "S99_refuse_close"]
+pending = ["cleanup"]
+labels = ["S99_check", "S99_refuse_close", "S240_5_inflight_lands", "S240_5_s6_write_end"]
 
 [[unit]]
 heading = "## 240.5 `--break-lock`"

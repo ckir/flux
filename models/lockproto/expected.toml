@@ -2,15 +2,12 @@
 # Format: design Section 4 (docs/superpowers/specs/2026-09-11-lock-protocol-model-check-design.md).
 # `scenarios` is the only place scenario names are defined; CI builds its matrix from it.
 
-scenarios = ["selftest", "recovery", "breaklock", "mixed"]
+scenarios = ["selftest", "recovery", "breaklock", "mixed", "breaklock-remote", "mixed-remote"]
 
 # Labels no BUILT scenario covers but a planned one will (design Section 4). Each entry goes when its
 # scenario lands: the stamp test requires the scenario to be in trace.toml's planned_scenarios.
 deferred = [
     { label = "S96_1_backoff", scenario = "dirlock", reason = "the 96.1 directory-lock conflict needs the directory lock only dirlock creates" },
-    { label = "S240_3_putback", scenario = "mixed-remote", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover under a running Recoverer, which needs a lapsed lease" },
-    { label = "S99_refuse_close", scenario = "breaklock-remote", reason = "a failed Section 99 check needs a lock lost while its holder ran, which only LockCapability = remote gives" },
-    { label = "S21_1_s3_refuse_close", scenario = "breaklock-remote", reason = "a failed 21.1 step 3 check needs a lock lost while its holder ran, which only LockCapability = remote gives" },
 ]
 
 # Runner self-test (Smoke.tla): exercises every way run.py judges a run. Not a protocol scenario.
@@ -671,3 +668,113 @@ kind = "seeded"
 violated = ["UncertainLockEventuallyCleared"]
 constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = [], Cleanups = [], Breakers = ["b1"], MaxObjs = 4, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = true }
 timeout_minutes = 90
+
+# Remote scenarios (design Section 12, plan 3): LockCapability = remote, where a lock lease can lapse under a
+# running holder, so a takeover can win against it and its in-flight write can land afterwards.
+
+[[run]]
+name = "breaklock-remote-posix-check"
+module = "LockProtocol"
+config = "configs/breaklock-remote-posix-check.cfg"
+scenario = "breaklock-remote"
+kind = "check"
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = ["p1"], Cleanups = [], Breakers = ["b1", "b2"], MaxObjs = 5, MaxCrashes = 1, HostCrashes = false, MaxLeaseExpiries = 1, Platform = "posix", IdentityStrength = "strong", LockCapability = "remote", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false }
+unreached = [
+    { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
+    { label = "S240_5_seed_write_begin", reason = "reached only with SEED_RENAME_OVER_TAKEOVER; its seeded run in breaklock reaches it" },
+    { label = "S240_5_seed_write_end", reason = "reached only with SEED_RENAME_OVER_TAKEOVER; its seeded run in breaklock reaches it" },
+    { label = "S240_5_seed_rename", reason = "reached only with SEED_RENAME_OVER_TAKEOVER; its seeded run in breaklock reaches it" },
+    { label = "plain_recover", reason = "reached only by a plain rerun that finds a dead CLEANUP lock, which needs a Cleanup actor; recovery-<platform>-plain-cleanup-check reaches it" },
+    { label = "plain_recovered", reason = "reached only by a plain rerun that finds a dead CLEANUP lock, which needs a Cleanup actor; recovery-<platform>-plain-cleanup-check reaches it" },
+    { label = "plain_recovered_done", reason = "reached only by a plain rerun that finds a dead CLEANUP lock, which needs a Cleanup actor; recovery-<platform>-plain-cleanup-check reaches it" },
+    { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a takeover under a running Recoverer; mixed-remote reaches it" },
+]
+timeout_minutes = 120
+
+[[run]]
+name = "breaklock-remote-posix-witness-NeverTornRead"
+module = "LockProtocol"
+config = "configs/breaklock-remote-posix-witness-NeverTornRead.cfg"
+scenario = "breaklock-remote"
+kind = "witness"
+violated = ["NeverTornRead"]
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = ["p1"], Cleanups = [], Breakers = ["b1", "b2"], MaxObjs = 5, MaxCrashes = 1, HostCrashes = false, MaxLeaseExpiries = 1, Platform = "posix", IdentityStrength = "strong", LockCapability = "remote", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false }
+timeout_minutes = 60
+
+[[run]]
+name = "breaklock-remote-posix-witness-NeverUncertainLockWithPendingBreaker"
+module = "LockProtocol"
+config = "configs/breaklock-remote-posix-witness-NeverUncertainLockWithPendingBreaker.cfg"
+scenario = "breaklock-remote"
+kind = "witness"
+violated = ["NeverUncertainLockWithPendingBreaker"]
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = ["p1"], Cleanups = [], Breakers = ["b1", "b2"], MaxObjs = 5, MaxCrashes = 1, HostCrashes = false, MaxLeaseExpiries = 1, Platform = "posix", IdentityStrength = "strong", LockCapability = "remote", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false }
+timeout_minutes = 60
+
+[[run]]
+name = "breaklock-remote-posix-witness-NeverInflightLandedAfterTakeover"
+module = "LockProtocol"
+config = "configs/breaklock-remote-posix-witness-NeverInflightLandedAfterTakeover.cfg"
+scenario = "breaklock-remote"
+kind = "witness"
+violated = ["NeverInflightLandedAfterTakeover"]
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = ["p1"], Cleanups = [], Breakers = ["b1", "b2"], MaxObjs = 5, MaxCrashes = 1, HostCrashes = false, MaxLeaseExpiries = 1, Platform = "posix", IdentityStrength = "strong", LockCapability = "remote", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false }
+timeout_minutes = 60
+
+[[run]]
+name = "mixed-remote-posix-check"
+module = "LockProtocol"
+config = "configs/mixed-remote-posix-check.cfg"
+scenario = "mixed-remote"
+kind = "check"
+constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = ["p1"], Cleanups = [], Breakers = ["b1"], MaxObjs = 5, MaxCrashes = 1, HostCrashes = false, MaxLeaseExpiries = 1, Platform = "posix", IdentityStrength = "strong", LockCapability = "remote", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false }
+unreached = [
+    { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
+    { label = "S240_5_seed_write_begin", reason = "reached only with SEED_RENAME_OVER_TAKEOVER; its seeded run in breaklock reaches it" },
+    { label = "S240_5_seed_write_end", reason = "reached only with SEED_RENAME_OVER_TAKEOVER; its seeded run in breaklock reaches it" },
+    { label = "S240_5_seed_rename", reason = "reached only with SEED_RENAME_OVER_TAKEOVER; its seeded run in breaklock reaches it" },
+    { label = "plain_recover", reason = "reached only by a plain rerun that finds a dead CLEANUP lock, which needs a Cleanup actor; recovery-<platform>-plain-cleanup-check reaches it" },
+    { label = "plain_recovered", reason = "reached only by a plain rerun that finds a dead CLEANUP lock, which needs a Cleanup actor; recovery-<platform>-plain-cleanup-check reaches it" },
+    { label = "plain_recovered_done", reason = "reached only by a plain rerun that finds a dead CLEANUP lock, which needs a Cleanup actor; recovery-<platform>-plain-cleanup-check reaches it" },
+]
+timeout_minutes = 120
+
+[[run]]
+name = "mixed-remote-posix-witness-NeverRecoveredAfterCrash"
+module = "LockProtocol"
+config = "configs/mixed-remote-posix-witness-NeverRecoveredAfterCrash.cfg"
+scenario = "mixed-remote"
+kind = "witness"
+violated = ["NeverRecoveredAfterCrash"]
+constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = ["p1"], Cleanups = [], Breakers = ["b1"], MaxObjs = 5, MaxCrashes = 1, HostCrashes = false, MaxLeaseExpiries = 1, Platform = "posix", IdentityStrength = "strong", LockCapability = "remote", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false }
+timeout_minutes = 60
+
+[[run]]
+name = "mixed-remote-posix-witness-NeverUncertainLockWithPendingBreaker"
+module = "LockProtocol"
+config = "configs/mixed-remote-posix-witness-NeverUncertainLockWithPendingBreaker.cfg"
+scenario = "mixed-remote"
+kind = "witness"
+violated = ["NeverUncertainLockWithPendingBreaker"]
+constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = ["p1"], Cleanups = [], Breakers = ["b1"], MaxObjs = 5, MaxCrashes = 1, HostCrashes = false, MaxLeaseExpiries = 1, Platform = "posix", IdentityStrength = "strong", LockCapability = "remote", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false }
+timeout_minutes = 60
+
+[[run]]
+name = "breaklock-remote-posix-hostcrash-witness-NeverHostCrashChangedLock"
+module = "LockProtocol"
+config = "configs/breaklock-remote-posix-hostcrash-witness-NeverHostCrashChangedLock.cfg"
+scenario = "breaklock-remote"
+kind = "witness"
+violated = ["NeverHostCrashChangedLock"]
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = ["p1"], Cleanups = [], Breakers = ["b1", "b2"], MaxObjs = 5, MaxCrashes = 1, HostCrashes = true, MaxLeaseExpiries = 1, Platform = "posix", IdentityStrength = "strong", LockCapability = "remote", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false }
+timeout_minutes = 60
+
+[[run]]
+name = "mixed-remote-posix-hostcrash-witness-NeverHostCrashChangedLock"
+module = "LockProtocol"
+config = "configs/mixed-remote-posix-hostcrash-witness-NeverHostCrashChangedLock.cfg"
+scenario = "mixed-remote"
+kind = "witness"
+violated = ["NeverHostCrashChangedLock"]
+constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = ["p1"], Cleanups = [], Breakers = ["b1"], MaxObjs = 5, MaxCrashes = 1, HostCrashes = true, MaxLeaseExpiries = 1, Platform = "posix", IdentityStrength = "strong", LockCapability = "remote", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false }
+timeout_minutes = 60

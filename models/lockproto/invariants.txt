@@ -18,10 +18,11 @@ FsOk == FsInvariants(fs)
 \* covers every case it can meet (`Classifiable`, Section 7).
 Classifiable == \A o \in Objs : fs.content[o] = NoContent \/ fs.content[o] \in Contents
 
-\* For a target, at most one process is inside a publishing step whose last Section 99 check passed.
-\* The one exception the spec accepts - a stalled owner's in-flight call issued before an operator
-\* `--break-lock` - belongs to the `breaklock` scenario, which has the actors for it.
-SingleWriter == Cardinality({p \in Procs : checked[p]}) <= 1
+\* For a target, at most one process is inside a publishing step whose last Section 99 check passed, or has
+\* a publishing write in flight. The one exception the spec accepts is a prior owner's call issued before a
+\* --break-lock takeover ended its tenure (240.5: "a filesystem call it had already started can still
+\* complete"); only a lapsed lease under LockCapability = remote lets that happen (design Section 7).
+SingleWriter == Cardinality({p \in Procs : (checked[p] \/ writing[p]) /\ ~exempt[p]}) <= 1
 
 \* A process without `--break-lock` never removes, renames, or overwrites a lock it classified as
 \* uncertain, and creates a lock only at an empty lock path (Section 7).
@@ -43,6 +44,8 @@ RefusalJustified == \A p \in Procs : refused[p] = "TARGET_LOCK_BUSY" => refusedO
 
 \* The ghost witnesses, for the witness runs.
 NeverTornRead == ~tornRead
+\* A prior owner's write issued before a takeover landed after it (240.5; remote scenarios).
+NeverInflightLandedAfterTakeover == ~landedAfterTakeover
 \* A process passed its Section 99 check, so SingleWriter's ghost is set (design Section 7).
 NeverChecked == \A p \in Procs : ~checked[p]
 NeverRecoveredAfterCrash == ~recoveredAfterCrash
