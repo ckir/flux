@@ -855,7 +855,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
              refusedOk[self] := RefusalEvidence(self);
              refused[self] := "TARGET_LOCK_BUSY";
              holding[self] := FALSE;
-             goto brk_refuse_close;
+             goto S21_1_s3_refuse_close;
            };
          };
        S21_1_s5_write_begin:
@@ -882,7 +882,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          if (~crashed[self] /\ holding[self]) { call Publish(); };
        brk_acquired_done:
          goto brk_end;
-       brk_refuse_close:
+       S21_1_s3_refuse_close:
          if (crashed[self]) { goto brk_end; }
          else {
            fs := FsCloseAll(fs, self);
@@ -947,7 +947,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "8988890f" /\ chksum(tla) = "61488d6e")
+\* BEGIN TRANSLATION (chksum(pcal) = "fefca194" /\ chksum(tla) = "a1523e63")
 \* Procedure variable obj of procedure Classify at line 138 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
@@ -2680,7 +2680,7 @@ S21_1_s3(self) == /\ pc[self] = "S21_1_s3"
                                    THEN /\ refusedOk' = [refusedOk EXCEPT ![self] = RefusalEvidence(self)]
                                         /\ refused' = [refused EXCEPT ![self] = "TARGET_LOCK_BUSY"]
                                         /\ holding' = [holding EXCEPT ![self] = FALSE]
-                                        /\ pc' = [pc EXCEPT ![self] = "brk_refuse_close"]
+                                        /\ pc' = [pc EXCEPT ![self] = "S21_1_s3_refuse_close"]
                                    ELSE /\ pc' = [pc EXCEPT ![self] = "S21_1_s5_write_begin"]
                                         /\ UNCHANGED << holding, refusedOk, 
                                                         refused >>
@@ -2792,20 +2792,21 @@ brk_acquired_done(self) == /\ pc[self] = "brk_acquired_done"
                                            obj, robj, victim, nobj, tobj, 
                                            crashes, leases >>
 
-brk_refuse_close(self) == /\ pc[self] = "brk_refuse_close"
-                          /\ IF crashed[self]
-                                THEN /\ pc' = [pc EXCEPT ![self] = "brk_end"]
-                                     /\ fs' = fs
-                                ELSE /\ fs' = FsCloseAll(fs, self)
-                                     /\ pc' = [pc EXCEPT ![self] = "brk_end"]
-                          /\ UNCHANGED << foreignObj, classified, ownerLive, 
-                                          sawLive, seenRec, crashed, live, 
-                                          holding, checked, 
-                                          recoveredAfterCrash, tornRead, 
-                                          hostCrashChangedLock, 
-                                          touchedUncertain, refusedOk, refused, 
-                                          stack, keep, obj_, got, obj, robj, 
-                                          victim, nobj, tobj, crashes, leases >>
+S21_1_s3_refuse_close(self) == /\ pc[self] = "S21_1_s3_refuse_close"
+                               /\ IF crashed[self]
+                                     THEN /\ pc' = [pc EXCEPT ![self] = "brk_end"]
+                                          /\ fs' = fs
+                                     ELSE /\ fs' = FsCloseAll(fs, self)
+                                          /\ pc' = [pc EXCEPT ![self] = "brk_end"]
+                               /\ UNCHANGED << foreignObj, classified, 
+                                               ownerLive, sawLive, seenRec, 
+                                               crashed, live, holding, checked, 
+                                               recoveredAfterCrash, tornRead, 
+                                               hostCrashChangedLock, 
+                                               touchedUncertain, refusedOk, 
+                                               refused, stack, keep, obj_, got, 
+                                               obj, robj, victim, nobj, tobj, 
+                                               crashes, leases >>
 
 brk_end(self) == /\ pc[self] = "brk_end"
                  /\ live' = [live EXCEPT ![self] = FALSE]
@@ -2825,7 +2826,7 @@ brk(self) == brk_start(self) \/ S21_1_restart_decide(self)
                 \/ S21_1_s5_write_end(self) \/ brk_publish(self)
                 \/ brk_publish_done(self) \/ brk_acquire(self)
                 \/ brk_acquired(self) \/ brk_acquired_done(self)
-                \/ brk_refuse_close(self) \/ brk_end(self)
+                \/ S21_1_s3_refuse_close(self) \/ brk_end(self)
 
 env_loop == /\ pc["env"] = "env_loop"
             /\ IF crashes < MaxCrashes \/ leases < MaxLeaseExpiries

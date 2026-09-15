@@ -799,7 +799,7 @@
              refusedOk[self] := RefusalEvidence(self);
              refused[self] := "TARGET_LOCK_BUSY";
              holding[self] := FALSE;
-             goto brk_refuse_close;
+             goto S21_1_s3_refuse_close;
            };
          };
        S21_1_s5_write_begin:
@@ -826,7 +826,7 @@
          if (~crashed[self] /\ holding[self]) { call Publish(); };
        brk_acquired_done:
          goto brk_end;
-       brk_refuse_close:
+       S21_1_s3_refuse_close:
          if (crashed[self]) { goto brk_end; }
          else {
            fs := FsCloseAll(fs, self);
