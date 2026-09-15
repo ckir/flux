@@ -2969,7 +2969,7 @@ UncertainReported == \E p \in Recoverers \cup Cleanups : refused[p] = "TARGET_LO
 \* A lock left behind by an owner that died does not stay there, PROVIDED someone is left to act on it
 \* and nothing more can go wrong: while no further crash can occur and an entitled actor has yet to
 \* run, the lock is eventually replaced or removed, or an actor reports it cannot tell the owner is
-\* dead (design Section 7, lines 565-568). Without those conditions the property is false in every
+\* dead (design Section 7). Without those conditions the property is false in every
 \* model whose actors all finish, because the last crash can always fall after the last actor has
 \* acted: measured, and that counterexample is why they are here.
 DeadLockEventuallyCleared ==
@@ -2978,4 +2978,19 @@ DeadLockEventuallyCleared ==
 \* The witness for that property's antecedent. Its run must stop with this violated, which is what
 \* stops the liveness run from passing over a state space that never reaches the case it is about.
 NeverDeadLockWithPendingMover == ~(DeadOwnerLock /\ EnvQuiet /\ PendingMover)
+
+\* A lock whose owner no reader can establish: the file at the lock path holds no readable record (torn,
+\* or created and not yet written). Only a --break-lock takeover clears one (240.4, 240.5).
+UncertainLock == LockObj # NoObj /\ fs.content[LockObj] \in {Torn, EmptyFile}
+
+\* A Breaker has not started yet and has not been killed, so it will still classify the lock.
+PendingBreaker == \E p \in Breakers : ~crashed[p] /\ pc[p] = "brk_start"
+
+\* The same promise for an uncertain lock (design Section 7): while nothing more can go wrong and a
+\* Breaker has yet to run, an uncertain lock does not stay.
+UncertainLockEventuallyCleared ==
+    [](UncertainLock /\ EnvQuiet /\ PendingBreaker => <>~UncertainLock)
+
+\* Its antecedent's witness, which keeps the liveness run from passing vacuously.
+NeverUncertainLockWithPendingBreaker == ~(UncertainLock /\ EnvQuiet /\ PendingBreaker)
 ====

@@ -420,3 +420,131 @@ violated = ["RefusalJustified"]
 constants = { Owners = ["o1"], Recoverers = [], PlainRuns = [], Cleanups = [], Breakers = ["b1", "b2"], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "weak", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = true }
 symmetry = { definition = "BreakerPerms", over = "Breakers" }
 timeout_minutes = 30
+
+[[run]]
+name = "breaklock-posix-plain-check"
+module = "LockProtocol"
+config = "configs/breaklock-posix-plain-check.cfg"
+scenario = "breaklock"
+kind = "check"
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = ["p1"], Cleanups = [], Breakers = ["b1"], MaxObjs = 4, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false }
+unreached = [
+    { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
+    { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record under a running Recoverer, which needs a lapsed lease; mixed-remote reaches it" },
+    { label = "S99_refuse_close", reason = "a Section 99 or 21.1 step 3 check fails only for a holder whose lock was taken while it ran; under a strong capability a running holder keeps its OS-native lock, so no takeover wins against it; breaklock-remote reaches it" },
+    { label = "brk_refuse_close", reason = "a Section 99 or 21.1 step 3 check fails only for a holder whose lock was taken while it ran; under a strong capability a running holder keeps its OS-native lock, so no takeover wins against it; breaklock-remote reaches it" },
+    { label = "S240_5_seed_write_begin", reason = "reached only with SEED_RENAME_OVER_TAKEOVER; its seeded run reaches it" },
+    { label = "S240_5_seed_write_end", reason = "reached only with SEED_RENAME_OVER_TAKEOVER; its seeded run reaches it" },
+    { label = "S240_5_seed_rename", reason = "reached only with SEED_RENAME_OVER_TAKEOVER; its seeded run reaches it" },
+]
+timeout_minutes = 60
+
+[[run]]
+name = "breaklock-windows-check"
+module = "LockProtocol"
+config = "configs/breaklock-windows-check.cfg"
+scenario = "breaklock"
+kind = "check"
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = [], Cleanups = [], Breakers = ["b1", "b2"], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false }
+symmetry = { definition = "BreakerPerms", over = "Breakers" }
+unreached = [
+    { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
+    { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record under a running Recoverer, which needs a lapsed lease; mixed-remote reaches it" },
+    { label = "S99_refuse_close", reason = "a Section 99 or 21.1 step 3 check fails only for a holder whose lock was taken while it ran; under a strong capability a running holder keeps its OS-native lock, so no takeover wins against it; breaklock-remote reaches it" },
+    { label = "brk_refuse_close", reason = "a Section 99 or 21.1 step 3 check fails only for a holder whose lock was taken while it ran; under a strong capability a running holder keeps its OS-native lock, so no takeover wins against it; breaklock-remote reaches it" },
+    { label = "S240_5_seed_write_begin", reason = "reached only with SEED_RENAME_OVER_TAKEOVER; its seeded run reaches it" },
+    { label = "S240_5_seed_write_end", reason = "reached only with SEED_RENAME_OVER_TAKEOVER; its seeded run reaches it" },
+    { label = "S240_5_seed_rename", reason = "reached only with SEED_RENAME_OVER_TAKEOVER; its seeded run reaches it" },
+]
+timeout_minutes = 60
+
+[[run]]
+name = "breaklock-windows-plain-check"
+module = "LockProtocol"
+config = "configs/breaklock-windows-plain-check.cfg"
+scenario = "breaklock"
+kind = "check"
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = ["p1"], Cleanups = [], Breakers = ["b1"], MaxObjs = 4, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false }
+unreached = [
+    { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
+    { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record under a running Recoverer, which needs a lapsed lease; mixed-remote reaches it" },
+    { label = "S99_refuse_close", reason = "a Section 99 or 21.1 step 3 check fails only for a holder whose lock was taken while it ran; under a strong capability a running holder keeps its OS-native lock, so no takeover wins against it; breaklock-remote reaches it" },
+    { label = "brk_refuse_close", reason = "a Section 99 or 21.1 step 3 check fails only for a holder whose lock was taken while it ran; under a strong capability a running holder keeps its OS-native lock, so no takeover wins against it; breaklock-remote reaches it" },
+    { label = "S240_5_seed_write_begin", reason = "reached only with SEED_RENAME_OVER_TAKEOVER; its seeded run reaches it" },
+    { label = "S240_5_seed_write_end", reason = "reached only with SEED_RENAME_OVER_TAKEOVER; its seeded run reaches it" },
+    { label = "S240_5_seed_rename", reason = "reached only with SEED_RENAME_OVER_TAKEOVER; its seeded run reaches it" },
+]
+timeout_minutes = 60
+
+[[run]]
+name = "breaklock-posix-witness-NeverTornRead"
+module = "LockProtocol"
+config = "configs/breaklock-posix-witness-NeverTornRead.cfg"
+scenario = "breaklock"
+kind = "witness"
+violated = ["NeverTornRead"]
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = [], Cleanups = [], Breakers = ["b1", "b2"], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false }
+symmetry = { definition = "BreakerPerms", over = "Breakers" }
+timeout_minutes = 30
+
+[[run]]
+name = "breaklock-posix-witness-NeverUncertainLockWithPendingBreaker"
+module = "LockProtocol"
+config = "configs/breaklock-posix-witness-NeverUncertainLockWithPendingBreaker.cfg"
+scenario = "breaklock"
+kind = "witness"
+violated = ["NeverUncertainLockWithPendingBreaker"]
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = [], Cleanups = [], Breakers = ["b1", "b2"], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false }
+symmetry = { definition = "BreakerPerms", over = "Breakers" }
+timeout_minutes = 30
+
+[[run]]
+name = "breaklock-windows-witness-NeverTornRead"
+module = "LockProtocol"
+config = "configs/breaklock-windows-witness-NeverTornRead.cfg"
+scenario = "breaklock"
+kind = "witness"
+violated = ["NeverTornRead"]
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = [], Cleanups = [], Breakers = ["b1", "b2"], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false }
+symmetry = { definition = "BreakerPerms", over = "Breakers" }
+timeout_minutes = 30
+
+[[run]]
+name = "breaklock-windows-witness-NeverUncertainLockWithPendingBreaker"
+module = "LockProtocol"
+config = "configs/breaklock-windows-witness-NeverUncertainLockWithPendingBreaker.cfg"
+scenario = "breaklock"
+kind = "witness"
+violated = ["NeverUncertainLockWithPendingBreaker"]
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = [], Cleanups = [], Breakers = ["b1", "b2"], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false }
+symmetry = { definition = "BreakerPerms", over = "Breakers" }
+timeout_minutes = 30
+
+[[run]]
+name = "breaklock-posix-hostcrash-witness-NeverHostCrashChangedLock"
+module = "LockProtocol"
+config = "configs/breaklock-posix-hostcrash-witness-NeverHostCrashChangedLock.cfg"
+scenario = "breaklock"
+kind = "witness"
+violated = ["NeverHostCrashChangedLock"]
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = [], Cleanups = [], Breakers = ["b1", "b2"], MaxObjs = 3, MaxCrashes = 2, HostCrashes = true, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false }
+symmetry = { definition = "BreakerPerms", over = "Breakers" }
+timeout_minutes = 30
+
+[[run]]
+name = "breaklock-posix-liveness"
+module = "LockProtocol"
+config = "configs/breaklock-posix-liveness.cfg"
+scenario = "breaklock"
+kind = "liveness"
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = [], Cleanups = [], Breakers = ["b1", "b2"], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false }
+unreached = [
+    { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
+    { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record under a running Recoverer, which needs a lapsed lease; mixed-remote reaches it" },
+    { label = "S99_refuse_close", reason = "a Section 99 or 21.1 step 3 check fails only for a holder whose lock was taken while it ran; under a strong capability a running holder keeps its OS-native lock, so no takeover wins against it; breaklock-remote reaches it" },
+    { label = "brk_refuse_close", reason = "a Section 99 or 21.1 step 3 check fails only for a holder whose lock was taken while it ran; under a strong capability a running holder keeps its OS-native lock, so no takeover wins against it; breaklock-remote reaches it" },
+    { label = "S240_5_seed_write_begin", reason = "reached only with SEED_RENAME_OVER_TAKEOVER; its seeded run reaches it" },
+    { label = "S240_5_seed_write_end", reason = "reached only with SEED_RENAME_OVER_TAKEOVER; its seeded run reaches it" },
+    { label = "S240_5_seed_rename", reason = "reached only with SEED_RENAME_OVER_TAKEOVER; its seeded run reaches it" },
+]
+timeout_minutes = 90
