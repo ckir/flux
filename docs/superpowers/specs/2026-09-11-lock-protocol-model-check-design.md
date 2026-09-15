@@ -753,6 +753,8 @@ defect let another takeover tear or replace. That first run also exposed a gap, 
 240.5 step 5 recorded its evidence through `RefusalEvidence`, a define-block operator that read `sawLive` as it was
 before the step that set it. Fixed (2026-09-15), the three stop on `SingleWriter` alone, the invariant they were
 meant for, and that is their recorded must-fail.
+`SEED_ACQUIRER_UNLINKS_BY_NAME` followed once a deleted held lock counted as a lost lock: its Breaker's refusal at
+the path the backoff emptied is justified, and the seed stops on `SingleWriter` alone (measured twice, 2026-09-15).
 
 A seeded run whose "must fail" entry is a liveness property is still a `seeded` run (its `violated` names the property),
 checked with the liveness settings: TLC checks the scenario's temporal properties, run
@@ -927,9 +929,17 @@ Findings the design already expects, each to be confirmed or refuted by the firs
   lock from a running owner, and possibly in `breaklock` through the acquirer window below.
   Measured (2026-09-15): all three remote checks break `SingleWriter` this way (an Owner passes its check, its lease
   lapses, a Breaker takes over and passes its own). Owner ruling: an open finding on `SingleWriter` in each remote
-  check run, with fix flag `FIX_ACCEPT_CHECK_TO_CALL_WINDOW`, which exempts a prior owner whose check passed before
+  check run, with fix flag `FIX_REMOTE_LEASE_SPEC`, which exempts a prior owner whose check passed before
   the takeover, as the spec statement would; its `-fixed` run shows this is the only `SingleWriter` case. The spec
   amendment to 240.5 follows; while the finding is open no seed runs in `breaklock-remote` or `mixed-remote`.
+  The first `-fixed` runs still broke `SingleWriter` by a second remote path: an Owner's lease lapses while it writes
+  its record, a Breaker completes a takeover of that file, the Owner's record write then lands and puts its record
+  back, and its Section 99 check passes because "still owned" reads only the record; the Breaker's 21.1 step 5
+  rewrite then passes too. Owner ruling (2026-09-15): a spec gap in Section 99 - "still owned" should also require
+  that the process still holds the lock file's OS-native lock (for RemoteStrong, an unexpired lease). The finding's
+  one fix flag, renamed `FIX_REMOTE_LEASE_SPEC`, now models both amendments, and a refusal for a lapsed lease counts
+  as a lost lock. Measured on the way: 240.5 step 5 can read the Owner's record torn while the Owner still writes it,
+  so the exemption names the process holding a handle on the file step 6 overwrites, not the record step 5 read.
 - An acquirer between 96.1's exclusive create and taking its OS-native lock holds an unlocked, empty lock file, which
   a classifier judges uncertain. A Breaker can take it over (240.5 steps 3-6), and the acquirer, failing to take
   its own lock, then removes "the lock it created" by name (96.1), which is now the Breaker's. No crash or

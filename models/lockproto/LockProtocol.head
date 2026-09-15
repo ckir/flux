@@ -31,7 +31,7 @@ CONSTANTS
     SEED_RENAME_OVER_TAKEOVER,
     SEED_NO_CAPABILITY_GATE,
     SEED_TORN_AS_FOREIGN,
-    FIX_ACCEPT_CHECK_TO_CALL_WINDOW  \* fix flag of the open finding on SingleWriter (design Section 11)
+    FIX_REMOTE_LEASE_SPEC  \* fix flag of the open finding on SingleWriter: the remote-lease spec amendments (design Section 11)
 
 Procs == Owners \cup Recoverers \cup PlainRuns \cup Cleanups \cup Breakers
 \* <lock-name>.broken.<operation-id> beside the lock (240.3 step 2). Only an actor that can move a

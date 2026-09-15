@@ -31,7 +31,7 @@ CONSTANTS
     SEED_RENAME_OVER_TAKEOVER,
     SEED_NO_CAPABILITY_GATE,
     SEED_TORN_AS_FOREIGN,
-    FIX_ACCEPT_CHECK_TO_CALL_WINDOW  \* fix flag of the open finding on SingleWriter (design Section 11)
+    FIX_REMOTE_LEASE_SPEC  \* fix flag of the open finding on SingleWriter: the remote-lease spec amendments (design Section 11)
 
 Procs == Owners \cup Recoverers \cup PlainRuns \cup Cleanups \cup Breakers
 \* <lock-name>.broken.<operation-id> beside the lock (240.3 step 2). Only an actor that can move a
@@ -101,8 +101,13 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
        LandUnlink(f, q, c) == IF q # NoProc /\ pendingUnlink[q] # NoObj /\ At(f, P, LockName) = pendingUnlink[q]
                               THEN FsUnlink(f, P, LockName, c).fs ELSE f
        OwnRecord(p) == Rec(p, IF p \in Cleanups THEN "cleanup" ELSE "operation")
-       \* "Still owned" (Section 99): a lock file at the lock path holding this operation's record.
-       StillOwned(p) == LockObj # NoObj /\ fs.content[LockObj] = OwnRecord(p)
+       \* "Still owned" (Section 99): a lock file at the lock path holding this operation's record. FIX_REMOTE_LEASE_SPEC
+       \* adds the amendment the open finding calls for: this process still holds that file's OS-native lock (for
+       \* RemoteStrong, an unexpired lease), so a lease-lapsed owner whose stale record write undid a takeover no
+       \* longer passes (owner ruling for plan 3, 2026-09-15).
+       StillOwned(p) == /\ LockObj # NoObj
+                        /\ fs.content[LockObj] = OwnRecord(p)
+                        /\ (FIX_REMOTE_LEASE_SPEC => fs.oslock[LockObj] = p)
        \* The lock path holds a record whose owner is alive: what justifies TARGET_LOCK_BUSY
        \* (Section 7, 240.2). A takeover's record is the `breaklock` scenario's business.
        BusyJustified == /\ LockObj # NoObj
@@ -132,6 +137,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
        \* lock path by a process holding no lock file there still has none.
        LostLock(p) == \/ LockObj # NoObj /\ fs.content[LockObj] # Foreign /\ fs.content[LockObj] # OwnRecord(p)
                       \/ HandleObj(p) # NoObj /\ HandleObj(p) # LockObj
+                      \/ FIX_REMOTE_LEASE_SPEC /\ LockObj # NoObj /\ fs.oslock[LockObj] # p
        \* The actor's judgement was uncertain: a torn or empty record, or an owner the oracle cannot judge.
        JudgedUncertain(p) == classified[p] = "uncertain" \/ ownerLive[p] = "uncertain"
        \* A lock this actor may replace through 240.3: a dead owner's operation lock, or a cleanup
@@ -551,12 +557,12 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
            seenRec[self] := OwnRecord(self);
            \* The prior owner's tenure ends with this write (design Section 7): a call it had already issued may
            \* still complete, which SingleWriter excepts; one it issues later is the check-to-call window.
-           \* FIX_ACCEPT_CHECK_TO_CALL_WINDOW models the spec statement the open finding calls for: a prior owner whose
+           \* FIX_REMOTE_LEASE_SPEC models the 240.5 statement the open finding calls for: a prior owner whose
            \* Section 99 check passed before this takeover may still issue that call (design Section 11).
            \* The prior owner is whoever still holds a handle on the file this write replaces, not the record step 5
            \* read: that record can be torn while the owner is still writing it (measured, mixed-remote -fixed run).
            exempt := [p \in Procs |-> IF p # self /\ HandleObj(p) = tobj
-                                      THEN exempt[p] \/ writing[p] \/ (FIX_ACCEPT_CHECK_TO_CALL_WINDOW /\ checked[p])
+                                      THEN exempt[p] \/ writing[p] \/ (FIX_REMOTE_LEASE_SPEC /\ checked[p])
                                       ELSE exempt[p]];
          };
        S240_5_s6_flush:
@@ -1010,8 +1016,8 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "6b18f946" /\ chksum(tla) = "7e0920a6")
-\* Procedure variable obj of procedure Classify at line 156 col 18 changed to obj_
+\* BEGIN TRANSLATION (chksum(pcal) = "24e311d0" /\ chksum(tla) = "8eb5da5a")
+\* Procedure variable obj of procedure Classify at line 162 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
           live, holding, checked, writing, pendingUnlink, exempt, 
@@ -1027,7 +1033,12 @@ LandUnlink(f, q, c) == IF q # NoProc /\ pendingUnlink[q] # NoObj /\ At(f, P, Loc
                        THEN FsUnlink(f, P, LockName, c).fs ELSE f
 OwnRecord(p) == Rec(p, IF p \in Cleanups THEN "cleanup" ELSE "operation")
 
-StillOwned(p) == LockObj # NoObj /\ fs.content[LockObj] = OwnRecord(p)
+
+
+
+StillOwned(p) == /\ LockObj # NoObj
+                 /\ fs.content[LockObj] = OwnRecord(p)
+                 /\ (FIX_REMOTE_LEASE_SPEC => fs.oslock[LockObj] = p)
 
 
 BusyJustified == /\ LockObj # NoObj
@@ -1057,6 +1068,7 @@ RefusalEvidence(p) == BusyJustified \/ sawLive[p] \/ HeldByOther(p)
 
 LostLock(p) == \/ LockObj # NoObj /\ fs.content[LockObj] # Foreign /\ fs.content[LockObj] # OwnRecord(p)
                \/ HandleObj(p) # NoObj /\ HandleObj(p) # LockObj
+               \/ FIX_REMOTE_LEASE_SPEC /\ LockObj # NoObj /\ fs.oslock[LockObj] # p
 
 JudgedUncertain(p) == classified[p] = "uncertain" \/ ownerLive[p] = "uncertain"
 
@@ -1969,7 +1981,7 @@ S240_5_s6_write_end(self) == /\ pc[self] = "S240_5_s6_write_end"
                                    ELSE /\ fs' = FsWriteEnd(fs, tobj[self], OwnRecord(self)).fs
                                         /\ seenRec' = [seenRec EXCEPT ![self] = OwnRecord(self)]
                                         /\ exempt' = [p \in Procs |-> IF p # self /\ HandleObj(p) = tobj[self]
-                                                                      THEN exempt[p] \/ writing[p] \/ (FIX_ACCEPT_CHECK_TO_CALL_WINDOW /\ checked[p])
+                                                                      THEN exempt[p] \/ writing[p] \/ (FIX_REMOTE_LEASE_SPEC /\ checked[p])
                                                                       ELSE exempt[p]]
                                         /\ pc' = [pc EXCEPT ![self] = "S240_5_s6_flush"]
                              /\ UNCHANGED << foreignObj, classified, ownerLive, 
