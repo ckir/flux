@@ -344,6 +344,7 @@
          if (crashed[self]) { goto recover_crashed; }
          else {
            fs := FsWriteBegin(fs, nobj).fs;
+           lostLock := MarkLost(self, nobj);
          };
        S240_3_s4_record_end:
          if (crashed[self]) { goto recover_crashed; }
@@ -546,11 +547,13 @@
          if (crashed[self]) { goto takeover_crashed; }
          else {
            fs := FsWriteBegin(fs, At(fs, P, TakeoverName(self))).fs;
+           lostLock := MarkLost(self, At(fs, P, TakeoverName(self)));
          };
        S240_5_seed_write_end:
          if (crashed[self]) { goto takeover_crashed; }
          else {
            fs := FsWriteEnd(fs, At(fs, P, TakeoverName(self)), OwnRecord(self)).fs;
+           lostLock := MarkLost(self, At(fs, P, TakeoverName(self)));
            seenRec[self] := OwnRecord(self);
          };
        S240_5_seed_rename:

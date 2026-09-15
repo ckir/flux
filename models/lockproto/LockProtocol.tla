@@ -402,6 +402,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          if (crashed[self]) { goto recover_crashed; }
          else {
            fs := FsWriteBegin(fs, nobj).fs;
+           lostLock := MarkLost(self, nobj);
          };
        S240_3_s4_record_end:
          if (crashed[self]) { goto recover_crashed; }
@@ -604,11 +605,13 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          if (crashed[self]) { goto takeover_crashed; }
          else {
            fs := FsWriteBegin(fs, At(fs, P, TakeoverName(self))).fs;
+           lostLock := MarkLost(self, At(fs, P, TakeoverName(self)));
          };
        S240_5_seed_write_end:
          if (crashed[self]) { goto takeover_crashed; }
          else {
            fs := FsWriteEnd(fs, At(fs, P, TakeoverName(self)), OwnRecord(self)).fs;
+           lostLock := MarkLost(self, At(fs, P, TakeoverName(self)));
            seenRec[self] := OwnRecord(self);
          };
        S240_5_seed_rename:
@@ -1045,7 +1048,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "57bc1d1a" /\ chksum(tla) = "170fd088")
+\* BEGIN TRANSLATION (chksum(pcal) = "649cec86" /\ chksum(tla) = "208087c4")
 \* Procedure variable obj of procedure Classify at line 169 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
@@ -1659,16 +1662,16 @@ S240_3_s4_lock_verify(self) == /\ pc[self] = "S240_3_s4_lock_verify"
 S240_3_s4_record_begin(self) == /\ pc[self] = "S240_3_s4_record_begin"
                                 /\ IF crashed[self]
                                       THEN /\ pc' = [pc EXCEPT ![self] = "recover_crashed"]
-                                           /\ fs' = fs
+                                           /\ UNCHANGED << fs, lostLock >>
                                       ELSE /\ fs' = FsWriteBegin(fs, nobj[self]).fs
+                                           /\ lostLock' = MarkLost(self, nobj[self])
                                            /\ pc' = [pc EXCEPT ![self] = "S240_3_s4_record_end"]
                                 /\ UNCHANGED << foreignObj, classified, 
                                                 ownerLive, sawLive, seenRec, 
                                                 crashed, live, holding, 
                                                 checked, writing, 
                                                 pendingUnlink, gen, checkGen, 
-                                                writeGen, lostLock, 
-                                                landedAfterTakeover, 
+                                                writeGen, landedAfterTakeover, 
                                                 recoveredAfterCrash, tornRead, 
                                                 hostCrashChangedLock, 
                                                 touchedUncertain, refusedOk, 
@@ -2121,16 +2124,16 @@ S240_5_s6(self) == /\ pc[self] = "S240_5_s6"
 S240_5_seed_write_begin(self) == /\ pc[self] = "S240_5_seed_write_begin"
                                  /\ IF crashed[self]
                                        THEN /\ pc' = [pc EXCEPT ![self] = "takeover_crashed"]
-                                            /\ fs' = fs
+                                            /\ UNCHANGED << fs, lostLock >>
                                        ELSE /\ fs' = FsWriteBegin(fs, At(fs, P, TakeoverName(self))).fs
+                                            /\ lostLock' = MarkLost(self, At(fs', P, TakeoverName(self)))
                                             /\ pc' = [pc EXCEPT ![self] = "S240_5_seed_write_end"]
                                  /\ UNCHANGED << foreignObj, classified, 
                                                  ownerLive, sawLive, seenRec, 
                                                  crashed, live, holding, 
                                                  checked, writing, 
                                                  pendingUnlink, gen, checkGen, 
-                                                 writeGen, lostLock, 
-                                                 landedAfterTakeover, 
+                                                 writeGen, landedAfterTakeover, 
                                                  recoveredAfterCrash, tornRead, 
                                                  hostCrashChangedLock, 
                                                  touchedUncertain, refusedOk, 
@@ -2141,16 +2144,17 @@ S240_5_seed_write_begin(self) == /\ pc[self] = "S240_5_seed_write_begin"
 S240_5_seed_write_end(self) == /\ pc[self] = "S240_5_seed_write_end"
                                /\ IF crashed[self]
                                      THEN /\ pc' = [pc EXCEPT ![self] = "takeover_crashed"]
-                                          /\ UNCHANGED << fs, seenRec >>
+                                          /\ UNCHANGED << fs, seenRec, 
+                                                          lostLock >>
                                      ELSE /\ fs' = FsWriteEnd(fs, At(fs, P, TakeoverName(self)), OwnRecord(self)).fs
+                                          /\ lostLock' = MarkLost(self, At(fs', P, TakeoverName(self)))
                                           /\ seenRec' = [seenRec EXCEPT ![self] = OwnRecord(self)]
                                           /\ pc' = [pc EXCEPT ![self] = "S240_5_seed_rename"]
                                /\ UNCHANGED << foreignObj, classified, 
                                                ownerLive, sawLive, crashed, 
                                                live, holding, checked, writing, 
                                                pendingUnlink, gen, checkGen, 
-                                               writeGen, lostLock, 
-                                               landedAfterTakeover, 
+                                               writeGen, landedAfterTakeover, 
                                                recoveredAfterCrash, tornRead, 
                                                hostCrashChangedLock, 
                                                touchedUncertain, refusedOk, 
