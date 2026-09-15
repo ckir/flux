@@ -686,11 +686,11 @@ ability to see that defect and the run fails.
 | `SEED_DEAD_AS_BUSY` | a plain rerun refuses a dead owner's lock with `TARGET_LOCK_BUSY` instead of `RESUMABLE_OPERATION_EXISTS` (21.1) | `recovery`, POSIX, Owner, Recoverer and PlainRun | `RefusalJustified` |
 | `SEED_RECOVERER_IDENTITY_ONLY` | 240.3 step 3 checks identity only, not the record (round 6, IMC-4) | `mixed-remote` | `SingleWriter` |
 | `SEED_EMPTY_PATH_BUSY` | 240.5 step 6 refuses when the lock path is empty instead of retrying (round 6, IMC-3) | `breaklock`, placed after the acquirer-window measurement (Sections 8, 11) | `RefusalJustified` |
-| `SEED_RESTART_RELEASES` | 21.1 step 5 releases the lock before the new operation starts (round 3) | `breaklock`, placed after the acquirer-window measurement (Sections 8, 11) | `SingleWriter` |
+| `SEED_RESTART_RELEASES` | 21.1 step 5 releases the lock before the new operation starts (round 3) | `breaklock`, placed after the acquirer-window measurement (Sections 8, 11) | `RefusalJustified`, which it breaks at a shallower depth; `SingleWriter` too, measured once by a halting run on it alone (4,872,715 states explored) |
 | `SEED_MOVE_ASIDE_FOR_UNCERTAIN` | an uncertain owner's lock is moved aside, leaving the path empty (round 5) | `breaklock`, placed after the acquirer-window measurement (Sections 8, 11) | `PlainNeverOwnsUncertain` |
-| `SEED_RENAME_OVER_TAKEOVER` | takeover by renaming a new record over the lock (round 3) | `breaklock`, placed after the acquirer-window measurement (Sections 8, 11) | `SingleWriter` |
+| `SEED_RENAME_OVER_TAKEOVER` | takeover by renaming a new record over the lock (round 3) | `breaklock`, placed after the acquirer-window measurement (Sections 8, 11) | `RefusalJustified`, which it breaks at a shallower depth; `SingleWriter` too, measured once by a halting run on it alone (5,431,996 states explored) |
 | `SEED_NO_IDENTITY_RECHECK` | 240.5 step 6 skips its identity check after the write (round 6) | `breaklock`, placed after the acquirer-window measurement (Sections 8, 11) | `SingleWriter` |
-| `SEED_NO_CAPABILITY_GATE` | neither Section 235.1's refusal nor 240.5 step 1's capability check is applied, so operations and takeovers run with no OS-native lock and two Breakers are no longer serialized by it | `breaklock`, weak-capability variant, placed after the acquirer-window measurement (Sections 8, 11) | `SingleWriter` |
+| `SEED_NO_CAPABILITY_GATE` | neither Section 235.1's refusal nor 240.5 step 1's capability check is applied, so operations and takeovers run with no OS-native lock and two Breakers are no longer serialized by it | `breaklock`, weak-capability variant, placed after the acquirer-window measurement (Sections 8, 11) | `RefusalJustified`, which it breaks at a shallower depth; `SingleWriter` too, measured once by a halting run on it alone (1,690,014 states explored) |
 | `SEED_CLEANUP_LOCK_UNVERIFIABLE` | Section 120 rejects `workspace_path = none` (round 6) | `cleanup-crash` | `DeadLockEventuallyCleared` |
 | `SEED_TORN_AS_FOREIGN` | a checksum-failing record is treated as a foreign object (round 5); `mixed` has both a record torn by the Owner's crash and a Breaker, the only actor that can clear it | `mixed` | `UncertainLockEventuallyCleared` |
 | `SEED_NO_ANCESTOR_CHECK` | 97.1 (a) skipped | `nested` | `NestedExclusion` |
@@ -728,6 +728,13 @@ only that acquirer window does; under `remote` a lease-expired owner's release u
 `breaklock-remote` is expected to carry the check-to-call window on `SingleWriter` and possibly an empty-path
 refusal on `RefusalJustified`, either of which would block them there as well. Their home is therefore the owner's
 decision once both findings are measured (as for `SEED_RECOVERER_IDENTITY_ONLY` in `mixed-remote`).
+
+Three `breaklock` seeds meant for `SingleWriter` (`SEED_RESTART_RELEASES`, `SEED_RENAME_OVER_TAKEOVER`,
+`SEED_NO_CAPABILITY_GATE`) break `RefusalJustified` first: a process refuses at a lock path whose record the seeded
+defect let another takeover tear or replace. That first run also exposed a gap, fixed by owner ruling (2026-09-15):
+`RefusalEvidence` now counts another process holding the OS-native lock at the lock path, which is what 240.2 says
+`TARGET_LOCK_BUSY` means. With that evidence the three still stop on `RefusalJustified`, so their recorded must-fail
+is that invariant, and a halting run on `SingleWriter` alone showed once, per seed, that each breaks it too.
 
 A seeded run whose "must fail" entry is a liveness property is still a `seeded` run (its `violated` names the property),
 checked with the liveness settings: TLC checks the scenario's temporal properties, run
