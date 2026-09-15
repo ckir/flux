@@ -967,7 +967,7 @@ protocol model exists, and stays as the runner's own regression check.
 |---|---|---|---|
 | `recovery` | Owner (crashes), 2 Recoverers, PlainRun, Cleanup - **paired across four `check` runs, never all at once** (below) | POSIX, Windows | `NeverTornRead`, `NeverChecked`, `NeverRecoveredAfterCrash`, `NeverDeadLockWithPendingMover`; POSIX also `NeverHostCrashChangedLock` (Section 12, host crashes) |
 | `breaklock` | StalledOwner, 2 Breakers, PlainRun - **paired across two `check` runs** (below) | POSIX, Windows; POSIX weak-capability (seeded run only: with `LockCapability = weak` every actor refuses under 235.1, so no path of the scenario is reached there) | `NeverTornRead`, `NeverUncertainLockWithPendingBreaker`; POSIX also a host-crash witness |
-| `mixed` | Owner (crashes; its lock is dead), Breaker (may see it uncertain), Recoverer (may see it dead), PlainRun - **paired across two `check` runs** (below) | POSIX, Windows; POSIX weak-identity only if measurement shows it explores more than the strong one, and then possibly only as a seeded or witness run (below) | `NeverRecoveredAfterCrash`, `NeverUncertainLockWithPendingBreaker`; POSIX also a host-crash witness |
+| `mixed` | Owner (crashes; its lock is dead), Breaker (may see it uncertain), Recoverer (may see it dead); its pairing with a PlainRun is `breaklock`'s (below) | POSIX, Windows; the weak-identity variant was measured and dropped (below) | `NeverRecoveredAfterCrash`, `NeverUncertainLockWithPendingBreaker`; POSIX also a host-crash witness |
 | `breaklock-remote` | as `breaklock`, under `LockCapability = remote` | POSIX | as `breaklock`; the check-to-call window expected as an open finding (Section 11) |
 | `mixed-remote` | as `mixed`, under `LockCapability = remote` | POSIX | as `mixed`; carries `SEED_RECOVERER_IDENTITY_ONLY` (Section 8) |
 | `cleanup` | StalledOwner, CleanupBreaker, Breaker | POSIX, Windows | `NeverUncertainOwnerLock` |
@@ -1095,7 +1095,6 @@ carry `SingleWriter`'s seeds. The owner's rulings for it, made after a gap analy
   | `breaklock-<platform>-check` | StalledOwner, 2 Breakers (`SYMMETRY` over the Breakers) | two takeovers racing for the same uncertain lock (240.5 steps 3-6) |
   | `breaklock-<platform>-plain-check` | StalledOwner, Breaker, PlainRun | a plain rerun meeting a lock mid-takeover |
   | `mixed-<platform>-check` | Owner, Breaker, Recoverer | a Breaker and a Recoverer judging the same dead owner differently |
-  | `mixed-<platform>-plain-check` | Owner, Breaker, PlainRun | a plain rerun meeting a Breaker's takeover of a dead owner's lock |
 
   Each row's counts and time are measured before the plan is written, as `recovery`'s were.
 - A takeover of a running owner, and a call that lands after it, happen only under `remote`, in the scenarios
@@ -1132,8 +1131,13 @@ carry `SingleWriter`'s seeds. The owner's rulings for it, made after a gap analy
   an uncertain lock for a dead one. Host crashes get one witness run per scenario, named
   `<scenario>-posix-hostcrash-witness-<Invariant>` after the host-crash witness it checks; no scenario adds pairings
   to the host-crash tier.
-- The weak-identity variant of `mixed` is measured first; `recovery`'s identical-graph finding (above) may repeat,
-  since the Breaker refuses at 240.5 step 1 under weak identity.
+- Measured on CI (2026-09-15) and dropped by owner ruling: `mixed`'s weak-identity variant explored 3,197,550 states
+  against 4,839,093 under strong identity, because the Breaker refuses at 240.5 step 1 and every later takeover
+  step goes unreached, while the Recoverer's one identity query returns a single id as in `recovery`. The headings
+  99.1 and 259.7 that owed labels to it now wait for `dirlock`, the planned scenario whose per-name locks reuse a
+  name. `mixed`'s plain pairing {Owner, Breaker, PlainRun} was also dropped: under a strong capability `breaklock`'s
+  StalledOwner is an Owner, so the two pairings are the same actors, measured at identical state counts on both
+  platforms (4,135,698 and 5,591,892).
 - Every `recovery` configuration and run gains the new constants (the Breaker and StalledOwner sets, empty there, and
   every new seed flag, false), and its state counts are re-measured: they change, because the shared publishing steps
   gain an in-flight write and release and a check before the release unlink.

@@ -34,7 +34,7 @@
 #
 # Headings enter the stamp as the model encodes them (plan 2 onward).
 
-planned_scenarios = ["mixed", "breaklock-remote", "mixed-remote", "cleanup", "cleanup-crash", "nested", "dirlock", "claims"]
+planned_scenarios = ["breaklock-remote", "mixed-remote", "cleanup", "cleanup-crash", "nested", "dirlock", "claims"]
 
 [[unit]]
 heading = "## 21.1 Existing Operation State Without `--resume`"
@@ -912,7 +912,7 @@ not_modelled = "container heading; its own text carries no rule beyond the 96.1 
 heading = "## 99.1 Weak Filesystem Identity and Target Locks"
 family = "99"
 count = 1
-pending = ["mixed"]
+pending = ["dirlock"]
 
 [[heading]]
 heading = "# 240. Adjacent Lock Staleness and Liveness"
@@ -948,7 +948,7 @@ not_modelled = "the standalone catalog record is not modelled; the model has no 
 heading = "## 259.7 Weak Filesystem Identity"
 family = "259"
 count = 1
-pending = ["mixed"]
+pending = ["dirlock"]
 
 [[heading]]
 heading = "## 259.8 Commit Recovery With Weak Identity"
