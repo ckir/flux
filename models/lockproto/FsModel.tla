@@ -26,7 +26,7 @@ CONSTANTS
 
 ASSUME Platform \in {"posix", "windows"}
 ASSUME IdentityStrength \in {"strong", "weak"}
-ASSUME LockCapability \in {"strong", "weak"}
+ASSUME LockCapability \in {"strong", "remote", "weak"}
 ASSUME MaxObjs \in Nat \ {0}
 ASSUME NoProc \notin Procs
 ASSUME DOMAIN Fold = Names

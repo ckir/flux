@@ -27,8 +27,11 @@
        checked = [p \in Procs |-> FALSE],         \* its last Section 99 check passed
        writing = [p \in Procs |-> FALSE],         \* its publishing write is issued and has not landed (Section 5.2)
        pendingUnlink = [p \in Procs |-> NoObj],   \* the lock file its issued release unlink resolved, not yet landed
-       exempt = [p \in Procs |-> FALSE],          \* a takeover ended its tenure while its write was in flight (240.5)
-       landedAfterTakeover = FALSE,               \* witness: such a write landed after the takeover
+       gen = 0,                                   \* tenure generation: a new lock tenure (create, recovery, takeover) starts one
+       checkGen = [p \in Procs |-> 0],            \* the generation its last passing Section 99 check saw
+       writeGen = [p \in Procs |-> 0],            \* the generation its in-flight publishing write was issued in
+       lostLock = [p \in Procs |-> FALSE],        \* ghost: another process's write, unlink, rename or a lease lapse hit its lock file
+       landedAfterTakeover = FALSE,               \* witness: a write issued in an earlier generation landed
        recoveredAfterCrash = FALSE,               \* witness: a lock left by a crash was replaced
        tornRead = FALSE,                          \* witness: a process read a torn record
        hostCrashChangedLock = FALSE,              \* witness: a host crash changed what is at the lock path
@@ -53,12 +56,14 @@
        \* 2026-09-15): the check also tries to take the OS-native lock again on the handle it holds, without waiting.
        \* Held by another process: the check fails, so a lease-lapsed owner whose stale record write undid a takeover
        \* no longer passes. Held by nobody (the lease lapsed and no one took it): the attempt takes it back and the
-       \* check goes on (Relock). Held by this process: nothing changes. The attempt and the read are one step here.
+       \* check goes on (Relock). Held by this process: nothing changes. The attempt and the read are one step here,
+       \* and the record is read first: a process that already lost its file to another never takes its lock back.
        StillOwned(p) == /\ LockObj # NoObj
                         /\ fs.content[LockObj] = OwnRecord(p)
                         /\ (FIX_REMOTE_LEASE_SPEC => HandleObj(p) = LockObj /\ fs.oslock[LockObj] \in {p, NoProc})
        \* The filesystem after that relock attempt: it takes a lapsed lock back, and changes nothing otherwise.
        Relock(p) == IF FIX_REMOTE_LEASE_SPEC /\ HandleObj(p) # NoObj /\ fs.oslock[HandleObj(p)] = NoProc
+                       /\ fs.content[HandleObj(p)] = OwnRecord(p)
                     THEN FsTryLock(fs, p, HandleObj(p)).fs ELSE fs
        \* The lock path holds a record whose owner is alive: what justifies TARGET_LOCK_BUSY
        \* (Section 7, 240.2). A takeover's record is the `breaklock` scenario's business.
@@ -76,15 +81,12 @@
        \* holds it while the record it replaces is torn).
        HeldByOther(p) == LockObj # NoObj /\ fs.oslock[LockObj] \notin {NoProc, p}
        RefusalEvidence(p) == BusyJustified \/ sawLive[p] \/ HeldByOther(p)
-       \* A failed Section 99 ownership check has a lost lock behind it: the lock path names a file that is not
-       \* Foreign and no longer holds this operation's record, because another invocation took it over
-       \* (owner ruling for plan 3, 2026-09-15); or the lock file this process still holds a handle on is no longer
-       \* the one the lock path names, because another invocation's unlink removed it (owner ruling, 2026-09-15:
-       \* a stalled owner's in-flight release unlink landing after a takeover). A refusal at an empty or Foreign
-       \* lock path by a process holding no lock file there still has none.
-       LostLock(p) == \/ LockObj # NoObj /\ fs.content[LockObj] # Foreign /\ fs.content[LockObj] # OwnRecord(p)
-                      \/ HandleObj(p) # NoObj /\ HandleObj(p) # LockObj
-                      \/ FIX_REMOTE_LEASE_SPEC /\ LockObj # NoObj /\ fs.oslock[LockObj] \notin {p, NoProc}
+       \* Process q holds an open handle on object o.
+       Holds(q, o) == o # NoObj /\ \E h \in fs.handles : h.proc = q /\ h.obj = o
+       \* The cause ghost after process `me` writes, unlinks, renames or replaces object o: every other process with
+       \* a handle on it has had its lock hit. A failed Section 99 check is justified only by that cause (owner ruling
+       \* for plan 3, 2026-09-15): a restatement of the check's own predicate could not catch a wrong refusal.
+       MarkLost(me, o) == [q \in Procs |-> IF q # me /\ Holds(q, o) THEN TRUE ELSE lostLock[q]]
        \* The actor's judgement was uncertain: a torn or empty record, or an owner the oracle cannot judge.
        JudgedUncertain(p) == classified[p] = "uncertain" \/ ownerLive[p] = "uncertain"
        \* A lock this actor may replace through 240.3: a dead owner's operation lock, or a cleanup
@@ -184,7 +186,7 @@
          else {
            \* Another operation created the lock first: start the acquisition again (21.1 step 1).
            with (r = FsCreate(fs, P, LockName, self, TRUE)) {
-             if (r.ok) { fs := r.fs; obj := r.val; }
+             if (r.ok) { fs := r.fs; obj := r.val; lostLock[self] := FALSE; }
              else { refused[self] := "RESTART"; return; };
          };
          };
@@ -219,6 +221,7 @@
          if (crashed[self]) { goto acquire_crashed; }
          else {
            fs := FsWriteBegin(fs, obj).fs;
+           lostLock := MarkLost(self, obj);
          };
        S96_1_record_end:
          \* A crash between the two halves of the write leaves the record torn (Section 5.2), which
@@ -228,6 +231,7 @@
            fs := FsWriteEnd(fs, obj, OwnRecord(self)).fs;
            seenRec[self] := OwnRecord(self);
            holding[self] := TRUE;
+           gen := gen + 1;
            return;
          };
        S96_1_backoff:
@@ -236,6 +240,7 @@
          else {
            refusedOk[self] := RefusalEvidence(self);
            with (c \in FsUnlinkChoices) { fs := FsUnlink(fs, P, LockName, c).fs; };
+           lostLock := MarkLost(self, LockObj);
            refused[self] := "TARGET_LOCK_BUSY";
            return;
          };
@@ -263,6 +268,7 @@
            with (c \in FsUnlinkChoices) {
              fs := FsClose(IF SEED_ACQUIRER_UNLINKS_BY_NAME THEN FsUnlink(fs, P, LockName, c).fs ELSE fs, self, obj).fs;
            };
+           lostLock := IF SEED_ACQUIRER_UNLINKS_BY_NAME THEN MarkLost(self, LockObj) ELSE lostLock;
            refused[self] := "RESTART";
            return;
          };
@@ -290,7 +296,7 @@
          else {
            if (JudgedUncertain(self)) { touchedUncertain := TRUE; };
            with (r = FsRenameNoReplace(fs, P, LockName, BrokenOf(self))) {
-             if (r.ok) { fs := r.fs; } else { goto S240_3_restart; };
+             if (r.ok) { fs := r.fs; lostLock := MarkLost(self, LockObj); } else { goto S240_3_restart; };
          };
          };
        S240_3_s3:
@@ -308,7 +314,7 @@
          if (crashed[self]) { goto recover_crashed; }
          else {
            with (r = FsCreate(fs, P, LockName, self, TRUE)) {
-             if (r.ok) { fs := r.fs; nobj := r.val; } else { goto S240_3_s4_drop; };
+             if (r.ok) { fs := r.fs; nobj := r.val; lostLock[self] := FALSE; } else { goto S240_3_s4_drop; };
          };
          };
        S240_3_s4_lock:
@@ -343,6 +349,7 @@
            fs := FsWriteEnd(fs, nobj, OwnRecord(self)).fs;
            seenRec[self] := OwnRecord(self);
            holding[self] := TRUE;
+           gen := gen + 1;
          };
        S240_3_s5:
          \* Delete the moved file (step 5).
@@ -380,6 +387,7 @@
            with (c \in FsUnlinkChoices) {
              fs := FsClose(IF SEED_ACQUIRER_UNLINKS_BY_NAME THEN FsUnlink(fs, P, LockName, c).fs ELSE fs, self, nobj).fs;
            };
+           lostLock := IF SEED_ACQUIRER_UNLINKS_BY_NAME THEN MarkLost(self, LockObj) ELSE lostLock;
            goto S240_3_s4_drop;
          };
        S240_3_putback:
@@ -427,7 +435,7 @@
          if (crashed[self]) { goto takeover_crashed; }
          else {
            with (r = FsOpen(fs, P, LockName, self, TRUE)) {
-             if (r.ok) { fs := r.fs; tobj := r.val; }
+             if (r.ok) { fs := r.fs; tobj := r.val; lostLock[self] := FALSE; }
              else { refused[self] := "RESTART"; return; };
          };
          };
@@ -496,21 +504,13 @@
          if (crashed[self]) { goto takeover_crashed; }
          else {
            fs := FsWriteBegin(fs, tobj).fs;
+           lostLock := MarkLost(self, tobj);
          };
        S240_5_s6_write_end:
          if (crashed[self]) { goto takeover_crashed; }
          else {
            fs := FsWriteEnd(fs, tobj, OwnRecord(self)).fs;
            seenRec[self] := OwnRecord(self);
-           \* The prior owner's tenure ends with this write (design Section 7): a call it had already issued may
-           \* still complete, which SingleWriter excepts; one it issues later is the check-to-call window.
-           \* FIX_REMOTE_LEASE_SPEC models the 240.5 statement the open finding calls for: a prior owner whose
-           \* Section 99 check passed before this takeover may still issue that call (design Section 11).
-           \* The prior owner is whoever still holds a handle on the file this write replaces, not the record step 5
-           \* read: that record can be torn while the owner is still writing it (measured, mixed-remote -fixed run).
-           exempt := [p \in Procs |-> IF p # self /\ HandleObj(p) = tobj
-                                      THEN exempt[p] \/ writing[p] \/ (FIX_REMOTE_LEASE_SPEC /\ checked[p])
-                                      ELSE exempt[p]];
          };
        S240_5_s6_flush:
          if (crashed[self]) { goto takeover_crashed; }
@@ -531,7 +531,9 @@
                goto S240_5_close;
              }
              else {
+               \* The takeover stands: a new tenure generation starts, which ends the prior owner's (design Section 7).
                holding[self] := TRUE;
+               gen := gen + 1;
                return;
              };
          };
@@ -552,7 +554,13 @@
          if (crashed[self]) { goto takeover_crashed; }
          else {
            with (r = FsRenameReplace(fs, P, TakeoverName(self), LockName)) {
-             if (r.ok) { fs := FsClose(r.fs, self, tobj).fs; holding[self] := TRUE; return; }
+             if (r.ok) {
+               fs := FsClose(r.fs, self, tobj).fs;
+               lostLock := MarkLost(self, LockObj);
+               holding[self] := TRUE;
+               gen := gen + 1;
+               return;
+             }
              else { refused[self] := "RESTART"; goto S240_5_close; };
            };
          };
@@ -574,10 +582,10 @@
          if (crashed[self]) { goto publish_crashed; }
          else {
            fs := Relock(self);
-           if (StillOwned(self)) { checked[self] := TRUE; }
+           if (StillOwned(self)) { checked[self] := TRUE; checkGen[self] := gen; }
            else {
              checked[self] := FALSE;
-             refusedOk[self] := RefusalEvidence(self) \/ LostLock(self);
+             refusedOk[self] := lostLock[self];
              refused[self] := "TARGET_LOCK_BUSY";
              holding[self] := FALSE;
              goto S99_refuse_close;
@@ -591,13 +599,14 @@
          if (crashed[self]) { goto publish_crashed; }
          else {
            writing[self] := TRUE;
+           writeGen[self] := gen;
          };
        S240_5_inflight_lands:
          \* The issued write completes (Section 5.2). A takeover can land in between, and "a filesystem call it had
          \* already started can still complete" (240.5).
          if (crashed[self]) { goto publish_crashed; }
          else {
-           if (exempt[self]) { landedAfterTakeover := TRUE; };
+           if (writeGen[self] # gen) { landedAfterTakeover := TRUE; };
            writing[self] := FALSE;
          };
        S99_release_check:
@@ -608,7 +617,7 @@
            checked[self] := FALSE;
            fs := Relock(self);
            if (~StillOwned(self)) {
-             refusedOk[self] := RefusalEvidence(self) \/ LostLock(self);
+             refusedOk[self] := lostLock[self];
              refused[self] := "TARGET_LOCK_BUSY";
              holding[self] := FALSE;
              goto S99_refuse_close;
@@ -628,12 +637,14 @@
            with (c \in FsUnlinkChoices) {
              fs := LandUnlink(fs, self, c);
            };
+           lostLock := IF pendingUnlink[self] # NoObj /\ LockObj = pendingUnlink[self] THEN MarkLost(self, LockObj) ELSE lostLock;
            pendingUnlink[self] := NoObj;
          };
        S99_close:
          if (crashed[self]) { goto publish_crashed; }
          else {
-           if (LockObj # NoObj /\ OpenBy(fs, self, LockObj)) { fs := FsClose(fs, self, LockObj).fs; };
+           \* Close the lock file's handle, which may no longer be at the lock path once the release unlink landed.
+           fs := FsCloseAll(fs, self);
            return;
          };
        S99_refuse_close:
@@ -801,6 +812,7 @@
            if (holding[self]) {
              holding[self] := FALSE;
              with (c \in FsUnlinkChoices) { fs := FsUnlink(fs, P, LockName, c).fs; };
+             lostLock := MarkLost(self, LockObj);
          };
          };
        S251_1_close:
@@ -858,7 +870,7 @@
          else {
            fs := Relock(self);
            if (~StillOwned(self)) {
-             refusedOk[self] := RefusalEvidence(self) \/ LostLock(self);
+             refusedOk[self] := lostLock[self];
              refused[self] := "TARGET_LOCK_BUSY";
              holding[self] := FALSE;
              goto S21_1_s3_refuse_close;
@@ -872,6 +884,7 @@
            \* SEED_RESTART_RELEASES (design Section 8) releases the OS-native lock here first.
            fs := FsWriteBegin(IF SEED_RESTART_RELEASES THEN FsUnlock(fs, self, HandleObj(self)).fs ELSE fs,
                               HandleObj(self)).fs;
+           lostLock := MarkLost(self, HandleObj(self));
          };
        S21_1_s5_write_end:
          if (crashed[self]) { goto brk_end; }
@@ -916,7 +929,8 @@
              with (p \in {q \in Procs : live[q] /\ ~crashed[q]}, land \in BOOLEAN, c \in FsUnlinkChoices) {
                \* Its in-flight calls land or are dropped at the crash itself (design Section 5.2).
                fs := FsProcCrash(LandUnlink(fs, IF land THEN p ELSE NoProc, c), p);
-               landedAfterTakeover := landedAfterTakeover \/ (land /\ writing[p] /\ exempt[p]);
+               lostLock := IF land /\ pendingUnlink[p] # NoObj /\ LockObj = pendingUnlink[p] THEN MarkLost(p, LockObj) ELSE lostLock;
+               landedAfterTakeover := landedAfterTakeover \/ (land /\ writing[p] /\ writeGen[p] # gen);
                writing[p] := FALSE;
                pendingUnlink[p] := NoObj;
                crashed[p] := TRUE;
@@ -953,6 +967,8 @@
              \* A remote lock's lease lapses under a live holder, which is not told.
              await LockCapability = "remote" /\ leases < MaxLeaseExpiries;
              with (o \in {x \in Objs : fs.oslock[x] # NoProc /\ live[fs.oslock[x]] /\ ~crashed[fs.oslock[x]]}) {
+               \* Before fs: PlusCal reads fs as already assigned once it has been, so the holder must be read first.
+               lostLock[fs.oslock[o]] := TRUE;
                fs := FsLeaseExpiry(fs, o).fs;
                leases := leases + 1;
              };

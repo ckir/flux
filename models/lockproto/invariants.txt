@@ -19,10 +19,14 @@ FsOk == FsInvariants(fs)
 Classifiable == \A o \in Objs : fs.content[o] = NoContent \/ fs.content[o] \in Contents
 
 \* For a target, at most one process is inside a publishing step whose last Section 99 check passed, or has
-\* a publishing write in flight. The one exception the spec accepts is a prior owner's call issued before a
-\* --break-lock takeover ended its tenure (240.5: "a filesystem call it had already started can still
-\* complete"); only a lapsed lease under LockCapability = remote lets that happen (design Section 7).
-SingleWriter == Cardinality({p \in Procs : (checked[p] \/ writing[p]) /\ ~exempt[p]}) <= 1
+\* a publishing write in flight. Tenure generations (owner ruling for plan 3, 2026-09-15): a new lock tenure -
+\* a create, a recovery or a takeover that stands - starts a generation. As the spec stands, the one exception
+\* is a call already started before a later tenure began (240.5: "a filesystem call it had already started can
+\* still complete"). FIX_REMOTE_LEASE_SPEC models the amendments the open finding calls for: a process whose
+\* check passed in an earlier generation is no longer counted (the check-to-call window, however the lock was
+\* lost), and Section 99's check also tries the lock (Relock).
+Superseded(p) == IF FIX_REMOTE_LEASE_SPEC THEN checkGen[p] # gen ELSE writing[p] /\ writeGen[p] # gen
+SingleWriter == Cardinality({p \in Procs : (checked[p] \/ writing[p]) /\ ~Superseded(p)}) <= 1
 
 \* A process without `--break-lock` never removes, renames, or overwrites a lock it classified as
 \* uncertain, and creates a lock only at an empty lock path (Section 7).
@@ -37,17 +41,17 @@ ForeignUntouched == foreignObj # NoObj => LockObj = foreignObj /\ fs.content[for
 \* its recorded owner is alive (240.2): a held OS-native lock cannot tell the owner from another
 \* invocation inspecting or recovering it, so no refusal-time check can establish owner liveness on
 \* that path. What this catches is a refusal with nothing behind it - a decision table that refuses
-\* BUSY for a lock it judged dead, or a Section 99 check (S99_check, S99_release_check, S21_1_s3) refusing
-\* when the lock path is empty or foreign. A failed check at a path that names another invocation's file
-\* is justified: that lock was lost to a takeover, and Section 99 reports TARGET_LOCK_BUSY for it (LostLock,
-\* owner ruling for plan 3); so is one by a process whose held lock file was unlinked from the lock path. The
+\* BUSY for a lock it judged dead, or a Section 99 check (S99_check, S99_release_check, S21_1_s3) refusing with
+\* no cause: such a refusal is justified only by the ghost lostLock, set when another process's write, unlink,
+\* rename or replacement hit the lock file this process holds, or its lease lapsed (owner ruling for plan 3,
+\* 2026-09-15). The other refusing labels record the evidence of RefusalEvidence. The
 \* refusing label records its evidence because the refusal may be reported after what it saw has changed: the
 \* refusal rests on what the classifier observed, not on a re-read.
 RefusalJustified == \A p \in Procs : refused[p] = "TARGET_LOCK_BUSY" => refusedOk[p]
 
 \* The ghost witnesses, for the witness runs.
 NeverTornRead == ~tornRead
-\* A prior owner's write issued before a takeover landed after it (240.5; remote scenarios).
+\* A write issued in an earlier tenure generation landed after a later tenure began (240.5; remote scenarios).
 NeverInflightLandedAfterTakeover == ~landedAfterTakeover
 \* A process passed its Section 99 check, so SingleWriter's ghost is set (design Section 7).
 NeverChecked == \A p \in Procs : ~checked[p]

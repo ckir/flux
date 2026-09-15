@@ -85,8 +85,11 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
        checked = [p \in Procs |-> FALSE],         \* its last Section 99 check passed
        writing = [p \in Procs |-> FALSE],         \* its publishing write is issued and has not landed (Section 5.2)
        pendingUnlink = [p \in Procs |-> NoObj],   \* the lock file its issued release unlink resolved, not yet landed
-       exempt = [p \in Procs |-> FALSE],          \* a takeover ended its tenure while its write was in flight (240.5)
-       landedAfterTakeover = FALSE,               \* witness: such a write landed after the takeover
+       gen = 0,                                   \* tenure generation: a new lock tenure (create, recovery, takeover) starts one
+       checkGen = [p \in Procs |-> 0],            \* the generation its last passing Section 99 check saw
+       writeGen = [p \in Procs |-> 0],            \* the generation its in-flight publishing write was issued in
+       lostLock = [p \in Procs |-> FALSE],        \* ghost: another process's write, unlink, rename or a lease lapse hit its lock file
+       landedAfterTakeover = FALSE,               \* witness: a write issued in an earlier generation landed
        recoveredAfterCrash = FALSE,               \* witness: a lock left by a crash was replaced
        tornRead = FALSE,                          \* witness: a process read a torn record
        hostCrashChangedLock = FALSE,              \* witness: a host crash changed what is at the lock path
@@ -111,12 +114,14 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
        \* 2026-09-15): the check also tries to take the OS-native lock again on the handle it holds, without waiting.
        \* Held by another process: the check fails, so a lease-lapsed owner whose stale record write undid a takeover
        \* no longer passes. Held by nobody (the lease lapsed and no one took it): the attempt takes it back and the
-       \* check goes on (Relock). Held by this process: nothing changes. The attempt and the read are one step here.
+       \* check goes on (Relock). Held by this process: nothing changes. The attempt and the read are one step here,
+       \* and the record is read first: a process that already lost its file to another never takes its lock back.
        StillOwned(p) == /\ LockObj # NoObj
                         /\ fs.content[LockObj] = OwnRecord(p)
                         /\ (FIX_REMOTE_LEASE_SPEC => HandleObj(p) = LockObj /\ fs.oslock[LockObj] \in {p, NoProc})
        \* The filesystem after that relock attempt: it takes a lapsed lock back, and changes nothing otherwise.
        Relock(p) == IF FIX_REMOTE_LEASE_SPEC /\ HandleObj(p) # NoObj /\ fs.oslock[HandleObj(p)] = NoProc
+                       /\ fs.content[HandleObj(p)] = OwnRecord(p)
                     THEN FsTryLock(fs, p, HandleObj(p)).fs ELSE fs
        \* The lock path holds a record whose owner is alive: what justifies TARGET_LOCK_BUSY
        \* (Section 7, 240.2). A takeover's record is the `breaklock` scenario's business.
@@ -134,15 +139,12 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
        \* holds it while the record it replaces is torn).
        HeldByOther(p) == LockObj # NoObj /\ fs.oslock[LockObj] \notin {NoProc, p}
        RefusalEvidence(p) == BusyJustified \/ sawLive[p] \/ HeldByOther(p)
-       \* A failed Section 99 ownership check has a lost lock behind it: the lock path names a file that is not
-       \* Foreign and no longer holds this operation's record, because another invocation took it over
-       \* (owner ruling for plan 3, 2026-09-15); or the lock file this process still holds a handle on is no longer
-       \* the one the lock path names, because another invocation's unlink removed it (owner ruling, 2026-09-15:
-       \* a stalled owner's in-flight release unlink landing after a takeover). A refusal at an empty or Foreign
-       \* lock path by a process holding no lock file there still has none.
-       LostLock(p) == \/ LockObj # NoObj /\ fs.content[LockObj] # Foreign /\ fs.content[LockObj] # OwnRecord(p)
-                      \/ HandleObj(p) # NoObj /\ HandleObj(p) # LockObj
-                      \/ FIX_REMOTE_LEASE_SPEC /\ LockObj # NoObj /\ fs.oslock[LockObj] \notin {p, NoProc}
+       \* Process q holds an open handle on object o.
+       Holds(q, o) == o # NoObj /\ \E h \in fs.handles : h.proc = q /\ h.obj = o
+       \* The cause ghost after process `me` writes, unlinks, renames or replaces object o: every other process with
+       \* a handle on it has had its lock hit. A failed Section 99 check is justified only by that cause (owner ruling
+       \* for plan 3, 2026-09-15): a restatement of the check's own predicate could not catch a wrong refusal.
+       MarkLost(me, o) == [q \in Procs |-> IF q # me /\ Holds(q, o) THEN TRUE ELSE lostLock[q]]
        \* The actor's judgement was uncertain: a torn or empty record, or an owner the oracle cannot judge.
        JudgedUncertain(p) == classified[p] = "uncertain" \/ ownerLive[p] = "uncertain"
        \* A lock this actor may replace through 240.3: a dead owner's operation lock, or a cleanup
@@ -242,7 +244,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          else {
            \* Another operation created the lock first: start the acquisition again (21.1 step 1).
            with (r = FsCreate(fs, P, LockName, self, TRUE)) {
-             if (r.ok) { fs := r.fs; obj := r.val; }
+             if (r.ok) { fs := r.fs; obj := r.val; lostLock[self] := FALSE; }
              else { refused[self] := "RESTART"; return; };
          };
          };
@@ -277,6 +279,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          if (crashed[self]) { goto acquire_crashed; }
          else {
            fs := FsWriteBegin(fs, obj).fs;
+           lostLock := MarkLost(self, obj);
          };
        S96_1_record_end:
          \* A crash between the two halves of the write leaves the record torn (Section 5.2), which
@@ -286,6 +289,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
            fs := FsWriteEnd(fs, obj, OwnRecord(self)).fs;
            seenRec[self] := OwnRecord(self);
            holding[self] := TRUE;
+           gen := gen + 1;
            return;
          };
        S96_1_backoff:
@@ -294,6 +298,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          else {
            refusedOk[self] := RefusalEvidence(self);
            with (c \in FsUnlinkChoices) { fs := FsUnlink(fs, P, LockName, c).fs; };
+           lostLock := MarkLost(self, LockObj);
            refused[self] := "TARGET_LOCK_BUSY";
            return;
          };
@@ -321,6 +326,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
            with (c \in FsUnlinkChoices) {
              fs := FsClose(IF SEED_ACQUIRER_UNLINKS_BY_NAME THEN FsUnlink(fs, P, LockName, c).fs ELSE fs, self, obj).fs;
            };
+           lostLock := IF SEED_ACQUIRER_UNLINKS_BY_NAME THEN MarkLost(self, LockObj) ELSE lostLock;
            refused[self] := "RESTART";
            return;
          };
@@ -348,7 +354,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          else {
            if (JudgedUncertain(self)) { touchedUncertain := TRUE; };
            with (r = FsRenameNoReplace(fs, P, LockName, BrokenOf(self))) {
-             if (r.ok) { fs := r.fs; } else { goto S240_3_restart; };
+             if (r.ok) { fs := r.fs; lostLock := MarkLost(self, LockObj); } else { goto S240_3_restart; };
          };
          };
        S240_3_s3:
@@ -366,7 +372,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          if (crashed[self]) { goto recover_crashed; }
          else {
            with (r = FsCreate(fs, P, LockName, self, TRUE)) {
-             if (r.ok) { fs := r.fs; nobj := r.val; } else { goto S240_3_s4_drop; };
+             if (r.ok) { fs := r.fs; nobj := r.val; lostLock[self] := FALSE; } else { goto S240_3_s4_drop; };
          };
          };
        S240_3_s4_lock:
@@ -401,6 +407,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
            fs := FsWriteEnd(fs, nobj, OwnRecord(self)).fs;
            seenRec[self] := OwnRecord(self);
            holding[self] := TRUE;
+           gen := gen + 1;
          };
        S240_3_s5:
          \* Delete the moved file (step 5).
@@ -438,6 +445,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
            with (c \in FsUnlinkChoices) {
              fs := FsClose(IF SEED_ACQUIRER_UNLINKS_BY_NAME THEN FsUnlink(fs, P, LockName, c).fs ELSE fs, self, nobj).fs;
            };
+           lostLock := IF SEED_ACQUIRER_UNLINKS_BY_NAME THEN MarkLost(self, LockObj) ELSE lostLock;
            goto S240_3_s4_drop;
          };
        S240_3_putback:
@@ -485,7 +493,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          if (crashed[self]) { goto takeover_crashed; }
          else {
            with (r = FsOpen(fs, P, LockName, self, TRUE)) {
-             if (r.ok) { fs := r.fs; tobj := r.val; }
+             if (r.ok) { fs := r.fs; tobj := r.val; lostLock[self] := FALSE; }
              else { refused[self] := "RESTART"; return; };
          };
          };
@@ -554,21 +562,13 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          if (crashed[self]) { goto takeover_crashed; }
          else {
            fs := FsWriteBegin(fs, tobj).fs;
+           lostLock := MarkLost(self, tobj);
          };
        S240_5_s6_write_end:
          if (crashed[self]) { goto takeover_crashed; }
          else {
            fs := FsWriteEnd(fs, tobj, OwnRecord(self)).fs;
            seenRec[self] := OwnRecord(self);
-           \* The prior owner's tenure ends with this write (design Section 7): a call it had already issued may
-           \* still complete, which SingleWriter excepts; one it issues later is the check-to-call window.
-           \* FIX_REMOTE_LEASE_SPEC models the 240.5 statement the open finding calls for: a prior owner whose
-           \* Section 99 check passed before this takeover may still issue that call (design Section 11).
-           \* The prior owner is whoever still holds a handle on the file this write replaces, not the record step 5
-           \* read: that record can be torn while the owner is still writing it (measured, mixed-remote -fixed run).
-           exempt := [p \in Procs |-> IF p # self /\ HandleObj(p) = tobj
-                                      THEN exempt[p] \/ writing[p] \/ (FIX_REMOTE_LEASE_SPEC /\ checked[p])
-                                      ELSE exempt[p]];
          };
        S240_5_s6_flush:
          if (crashed[self]) { goto takeover_crashed; }
@@ -589,7 +589,9 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
                goto S240_5_close;
              }
              else {
+               \* The takeover stands: a new tenure generation starts, which ends the prior owner's (design Section 7).
                holding[self] := TRUE;
+               gen := gen + 1;
                return;
              };
          };
@@ -610,7 +612,13 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          if (crashed[self]) { goto takeover_crashed; }
          else {
            with (r = FsRenameReplace(fs, P, TakeoverName(self), LockName)) {
-             if (r.ok) { fs := FsClose(r.fs, self, tobj).fs; holding[self] := TRUE; return; }
+             if (r.ok) {
+               fs := FsClose(r.fs, self, tobj).fs;
+               lostLock := MarkLost(self, LockObj);
+               holding[self] := TRUE;
+               gen := gen + 1;
+               return;
+             }
              else { refused[self] := "RESTART"; goto S240_5_close; };
            };
          };
@@ -632,10 +640,10 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          if (crashed[self]) { goto publish_crashed; }
          else {
            fs := Relock(self);
-           if (StillOwned(self)) { checked[self] := TRUE; }
+           if (StillOwned(self)) { checked[self] := TRUE; checkGen[self] := gen; }
            else {
              checked[self] := FALSE;
-             refusedOk[self] := RefusalEvidence(self) \/ LostLock(self);
+             refusedOk[self] := lostLock[self];
              refused[self] := "TARGET_LOCK_BUSY";
              holding[self] := FALSE;
              goto S99_refuse_close;
@@ -649,13 +657,14 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          if (crashed[self]) { goto publish_crashed; }
          else {
            writing[self] := TRUE;
+           writeGen[self] := gen;
          };
        S240_5_inflight_lands:
          \* The issued write completes (Section 5.2). A takeover can land in between, and "a filesystem call it had
          \* already started can still complete" (240.5).
          if (crashed[self]) { goto publish_crashed; }
          else {
-           if (exempt[self]) { landedAfterTakeover := TRUE; };
+           if (writeGen[self] # gen) { landedAfterTakeover := TRUE; };
            writing[self] := FALSE;
          };
        S99_release_check:
@@ -666,7 +675,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
            checked[self] := FALSE;
            fs := Relock(self);
            if (~StillOwned(self)) {
-             refusedOk[self] := RefusalEvidence(self) \/ LostLock(self);
+             refusedOk[self] := lostLock[self];
              refused[self] := "TARGET_LOCK_BUSY";
              holding[self] := FALSE;
              goto S99_refuse_close;
@@ -686,12 +695,14 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
            with (c \in FsUnlinkChoices) {
              fs := LandUnlink(fs, self, c);
            };
+           lostLock := IF pendingUnlink[self] # NoObj /\ LockObj = pendingUnlink[self] THEN MarkLost(self, LockObj) ELSE lostLock;
            pendingUnlink[self] := NoObj;
          };
        S99_close:
          if (crashed[self]) { goto publish_crashed; }
          else {
-           if (LockObj # NoObj /\ OpenBy(fs, self, LockObj)) { fs := FsClose(fs, self, LockObj).fs; };
+           \* Close the lock file's handle, which may no longer be at the lock path once the release unlink landed.
+           fs := FsCloseAll(fs, self);
            return;
          };
        S99_refuse_close:
@@ -859,6 +870,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
            if (holding[self]) {
              holding[self] := FALSE;
              with (c \in FsUnlinkChoices) { fs := FsUnlink(fs, P, LockName, c).fs; };
+             lostLock := MarkLost(self, LockObj);
          };
          };
        S251_1_close:
@@ -916,7 +928,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          else {
            fs := Relock(self);
            if (~StillOwned(self)) {
-             refusedOk[self] := RefusalEvidence(self) \/ LostLock(self);
+             refusedOk[self] := lostLock[self];
              refused[self] := "TARGET_LOCK_BUSY";
              holding[self] := FALSE;
              goto S21_1_s3_refuse_close;
@@ -930,6 +942,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
            \* SEED_RESTART_RELEASES (design Section 8) releases the OS-native lock here first.
            fs := FsWriteBegin(IF SEED_RESTART_RELEASES THEN FsUnlock(fs, self, HandleObj(self)).fs ELSE fs,
                               HandleObj(self)).fs;
+           lostLock := MarkLost(self, HandleObj(self));
          };
        S21_1_s5_write_end:
          if (crashed[self]) { goto brk_end; }
@@ -974,7 +987,8 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
              with (p \in {q \in Procs : live[q] /\ ~crashed[q]}, land \in BOOLEAN, c \in FsUnlinkChoices) {
                \* Its in-flight calls land or are dropped at the crash itself (design Section 5.2).
                fs := FsProcCrash(LandUnlink(fs, IF land THEN p ELSE NoProc, c), p);
-               landedAfterTakeover := landedAfterTakeover \/ (land /\ writing[p] /\ exempt[p]);
+               lostLock := IF land /\ pendingUnlink[p] # NoObj /\ LockObj = pendingUnlink[p] THEN MarkLost(p, LockObj) ELSE lostLock;
+               landedAfterTakeover := landedAfterTakeover \/ (land /\ writing[p] /\ writeGen[p] # gen);
                writing[p] := FALSE;
                pendingUnlink[p] := NoObj;
                crashed[p] := TRUE;
@@ -1011,6 +1025,8 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
              \* A remote lock's lease lapses under a live holder, which is not told.
              await LockCapability = "remote" /\ leases < MaxLeaseExpiries;
              with (o \in {x \in Objs : fs.oslock[x] # NoProc /\ live[fs.oslock[x]] /\ ~crashed[fs.oslock[x]]}) {
+               \* Before fs: PlusCal reads fs as already assigned once it has been, so the holder must be read first.
+               lostLock[fs.oslock[o]] := TRUE;
                fs := FsLeaseExpiry(fs, o).fs;
                leases := leases + 1;
              };
@@ -1024,14 +1040,14 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "e06378f0" /\ chksum(tla) = "76f3043e")
-\* Procedure variable obj of procedure Classify at line 167 col 18 changed to obj_
+\* BEGIN TRANSLATION (chksum(pcal) = "4b30fee2" /\ chksum(tla) = "56e429ae")
+\* Procedure variable obj of procedure Classify at line 169 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
-          live, holding, checked, writing, pendingUnlink, exempt, 
-          landedAfterTakeover, recoveredAfterCrash, tornRead, 
-          hostCrashChangedLock, touchedUncertain, refusedOk, refused, pc, 
-          stack
+          live, holding, checked, writing, pendingUnlink, gen, checkGen, 
+          writeGen, lostLock, landedAfterTakeover, recoveredAfterCrash, 
+          tornRead, hostCrashChangedLock, touchedUncertain, refusedOk, 
+          refused, pc, stack
 
 (* define statement *)
 LockObj == At(fs, P, LockName)
@@ -1051,11 +1067,13 @@ HandleObj(p) == IF \E h \in fs.handles : h.proc = p
 
 
 
+
 StillOwned(p) == /\ LockObj # NoObj
                  /\ fs.content[LockObj] = OwnRecord(p)
                  /\ (FIX_REMOTE_LEASE_SPEC => HandleObj(p) = LockObj /\ fs.oslock[LockObj] \in {p, NoProc})
 
 Relock(p) == IF FIX_REMOTE_LEASE_SPEC /\ HandleObj(p) # NoObj /\ fs.oslock[HandleObj(p)] = NoProc
+                /\ fs.content[HandleObj(p)] = OwnRecord(p)
              THEN FsTryLock(fs, p, HandleObj(p)).fs ELSE fs
 
 
@@ -1074,14 +1092,11 @@ LocksAvailable == LockCapability # "weak"
 HeldByOther(p) == LockObj # NoObj /\ fs.oslock[LockObj] \notin {NoProc, p}
 RefusalEvidence(p) == BusyJustified \/ sawLive[p] \/ HeldByOther(p)
 
+Holds(q, o) == o # NoObj /\ \E h \in fs.handles : h.proc = q /\ h.obj = o
 
 
 
-
-
-LostLock(p) == \/ LockObj # NoObj /\ fs.content[LockObj] # Foreign /\ fs.content[LockObj] # OwnRecord(p)
-               \/ HandleObj(p) # NoObj /\ HandleObj(p) # LockObj
-               \/ FIX_REMOTE_LEASE_SPEC /\ LockObj # NoObj /\ fs.oslock[LockObj] \notin {p, NoProc}
+MarkLost(me, o) == [q \in Procs |-> IF q # me /\ Holds(q, o) THEN TRUE ELSE lostLock[q]]
 
 JudgedUncertain(p) == classified[p] = "uncertain" \/ ownerLive[p] = "uncertain"
 
@@ -1101,11 +1116,11 @@ TornLock == LockObj # NoObj /\ fs.content[LockObj] = Torn
 VARIABLES keep, obj_, got, obj, robj, victim, nobj, tobj, crashes, leases
 
 vars == << fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
-           live, holding, checked, writing, pendingUnlink, exempt, 
-           landedAfterTakeover, recoveredAfterCrash, tornRead, 
-           hostCrashChangedLock, touchedUncertain, refusedOk, refused, pc, 
-           stack, keep, obj_, got, obj, robj, victim, nobj, tobj, crashes, 
-           leases >>
+           live, holding, checked, writing, pendingUnlink, gen, checkGen, 
+           writeGen, lostLock, landedAfterTakeover, recoveredAfterCrash, 
+           tornRead, hostCrashChangedLock, touchedUncertain, refusedOk, 
+           refused, pc, stack, keep, obj_, got, obj, robj, victim, nobj, tobj, 
+           crashes, leases >>
 
 ProcSet == (Owners) \cup (PlainRuns) \cup (Recoverers) \cup (Cleanups) \cup (Breakers) \cup {"env"}
 
@@ -1122,7 +1137,10 @@ Init == (* Global variables *)
         /\ checked = [p \in Procs |-> FALSE]
         /\ writing = [p \in Procs |-> FALSE]
         /\ pendingUnlink = [p \in Procs |-> NoObj]
-        /\ exempt = [p \in Procs |-> FALSE]
+        /\ gen = 0
+        /\ checkGen = [p \in Procs |-> 0]
+        /\ writeGen = [p \in Procs |-> 0]
+        /\ lostLock = [p \in Procs |-> FALSE]
         /\ landedAfterTakeover = FALSE
         /\ recoveredAfterCrash = FALSE
         /\ tornRead = FALSE
@@ -1176,11 +1194,12 @@ S240_1_open(self) == /\ pc[self] = "S240_1_open"
                                              /\ fs' = fs
                      /\ UNCHANGED << foreignObj, ownerLive, sawLive, crashed, 
                                      live, holding, checked, writing, 
-                                     pendingUnlink, exempt, 
-                                     landedAfterTakeover, recoveredAfterCrash, 
-                                     tornRead, hostCrashChangedLock, 
-                                     touchedUncertain, refusedOk, refused, obj, 
-                                     robj, victim, nobj, tobj, crashes, leases >>
+                                     pendingUnlink, gen, checkGen, writeGen, 
+                                     lostLock, landedAfterTakeover, 
+                                     recoveredAfterCrash, tornRead, 
+                                     hostCrashChangedLock, touchedUncertain, 
+                                     refusedOk, refused, obj, robj, victim, 
+                                     nobj, tobj, crashes, leases >>
 
 S240_1_trylock(self) == /\ pc[self] = "S240_1_trylock"
                         /\ IF crashed[self]
@@ -1196,8 +1215,8 @@ S240_1_trylock(self) == /\ pc[self] = "S240_1_trylock"
                         /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                         sawLive, seenRec, crashed, live, 
                                         holding, checked, writing, 
-                                        pendingUnlink, exempt, 
-                                        landedAfterTakeover, 
+                                        pendingUnlink, gen, checkGen, writeGen, 
+                                        lostLock, landedAfterTakeover, 
                                         recoveredAfterCrash, tornRead, 
                                         hostCrashChangedLock, touchedUncertain, 
                                         refusedOk, refused, stack, keep, obj_, 
@@ -1233,7 +1252,8 @@ S240_1_read(self) == /\ pc[self] = "S240_1_read"
                                                                       ELSE /\ classified' = [classified EXCEPT ![self] = alive]
                                 /\ pc' = [pc EXCEPT ![self] = "S240_1_close"]
                      /\ UNCHANGED << fs, foreignObj, crashed, live, holding, 
-                                     checked, writing, pendingUnlink, exempt, 
+                                     checked, writing, pendingUnlink, gen, 
+                                     checkGen, writeGen, lostLock, 
                                      landedAfterTakeover, recoveredAfterCrash, 
                                      hostCrashChangedLock, touchedUncertain, 
                                      refusedOk, refused, stack, keep, obj_, 
@@ -1255,7 +1275,8 @@ S240_1_close(self) == /\ pc[self] = "S240_1_close"
                                  /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
                       /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                       sawLive, seenRec, crashed, live, holding, 
-                                      checked, writing, pendingUnlink, exempt, 
+                                      checked, writing, pendingUnlink, gen, 
+                                      checkGen, writeGen, lostLock, 
                                       landedAfterTakeover, recoveredAfterCrash, 
                                       tornRead, hostCrashChangedLock, 
                                       touchedUncertain, refusedOk, refused, 
@@ -1271,7 +1292,8 @@ classify_crashed(self) == /\ pc[self] = "classify_crashed"
                           /\ UNCHANGED << fs, foreignObj, classified, 
                                           ownerLive, sawLive, seenRec, crashed, 
                                           live, holding, checked, writing, 
-                                          pendingUnlink, exempt, 
+                                          pendingUnlink, gen, checkGen, 
+                                          writeGen, lostLock, 
                                           landedAfterTakeover, 
                                           recoveredAfterCrash, tornRead, 
                                           hostCrashChangedLock, 
@@ -1286,26 +1308,28 @@ Classify(self) == S240_1_open(self) \/ S240_1_trylock(self)
 S96_1_create(self) == /\ pc[self] = "S96_1_create"
                       /\ IF crashed[self]
                             THEN /\ pc' = [pc EXCEPT ![self] = "acquire_crashed"]
-                                 /\ UNCHANGED << fs, refused, stack, obj >>
+                                 /\ UNCHANGED << fs, lostLock, refused, stack, 
+                                                 obj >>
                             ELSE /\ LET r == FsCreate(fs, P, LockName, self, TRUE) IN
                                       IF r.ok
                                          THEN /\ fs' = r.fs
                                               /\ obj' = [obj EXCEPT ![self] = r.val]
+                                              /\ lostLock' = [lostLock EXCEPT ![self] = FALSE]
                                               /\ pc' = [pc EXCEPT ![self] = "S96_1_dircheck"]
                                               /\ UNCHANGED << refused, stack >>
                                          ELSE /\ refused' = [refused EXCEPT ![self] = "RESTART"]
                                               /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
                                               /\ obj' = [obj EXCEPT ![self] = Head(stack[self]).obj]
                                               /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
-                                              /\ fs' = fs
+                                              /\ UNCHANGED << fs, lostLock >>
                       /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                       sawLive, seenRec, crashed, live, holding, 
-                                      checked, writing, pendingUnlink, exempt, 
-                                      landedAfterTakeover, recoveredAfterCrash, 
-                                      tornRead, hostCrashChangedLock, 
-                                      touchedUncertain, refusedOk, keep, obj_, 
-                                      got, robj, victim, nobj, tobj, crashes, 
-                                      leases >>
+                                      checked, writing, pendingUnlink, gen, 
+                                      checkGen, writeGen, landedAfterTakeover, 
+                                      recoveredAfterCrash, tornRead, 
+                                      hostCrashChangedLock, touchedUncertain, 
+                                      refusedOk, keep, obj_, got, robj, victim, 
+                                      nobj, tobj, crashes, leases >>
 
 S96_1_dircheck(self) == /\ pc[self] = "S96_1_dircheck"
                         /\ IF crashed[self]
@@ -1316,8 +1340,8 @@ S96_1_dircheck(self) == /\ pc[self] = "S96_1_dircheck"
                         /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                         sawLive, seenRec, crashed, live, 
                                         holding, checked, writing, 
-                                        pendingUnlink, exempt, 
-                                        landedAfterTakeover, 
+                                        pendingUnlink, gen, checkGen, writeGen, 
+                                        lostLock, landedAfterTakeover, 
                                         recoveredAfterCrash, tornRead, 
                                         hostCrashChangedLock, touchedUncertain, 
                                         refusedOk, refused, stack, keep, obj_, 
@@ -1340,8 +1364,8 @@ S96_1_ownlock(self) == /\ pc[self] = "S96_1_ownlock"
                        /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                        sawLive, seenRec, crashed, live, 
                                        holding, checked, writing, 
-                                       pendingUnlink, exempt, 
-                                       landedAfterTakeover, 
+                                       pendingUnlink, gen, checkGen, writeGen, 
+                                       lostLock, landedAfterTakeover, 
                                        recoveredAfterCrash, tornRead, 
                                        hostCrashChangedLock, touchedUncertain, 
                                        refusedOk, refused, stack, keep, obj_, 
@@ -1358,7 +1382,8 @@ S96_1_ownlock_verify(self) == /\ pc[self] = "S96_1_ownlock_verify"
                               /\ UNCHANGED << fs, foreignObj, classified, 
                                               ownerLive, sawLive, seenRec, 
                                               crashed, live, holding, checked, 
-                                              writing, pendingUnlink, exempt, 
+                                              writing, pendingUnlink, gen, 
+                                              checkGen, writeGen, lostLock, 
                                               landedAfterTakeover, 
                                               recoveredAfterCrash, tornRead, 
                                               hostCrashChangedLock, 
@@ -1370,14 +1395,15 @@ S96_1_ownlock_verify(self) == /\ pc[self] = "S96_1_ownlock_verify"
 S96_1_record_begin(self) == /\ pc[self] = "S96_1_record_begin"
                             /\ IF crashed[self]
                                   THEN /\ pc' = [pc EXCEPT ![self] = "acquire_crashed"]
-                                       /\ fs' = fs
+                                       /\ UNCHANGED << fs, lostLock >>
                                   ELSE /\ fs' = FsWriteBegin(fs, obj[self]).fs
+                                       /\ lostLock' = MarkLost(self, obj[self])
                                        /\ pc' = [pc EXCEPT ![self] = "S96_1_record_end"]
                             /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                             sawLive, seenRec, crashed, live, 
                                             holding, checked, writing, 
-                                            pendingUnlink, exempt, 
-                                            landedAfterTakeover, 
+                                            pendingUnlink, gen, checkGen, 
+                                            writeGen, landedAfterTakeover, 
                                             recoveredAfterCrash, tornRead, 
                                             hostCrashChangedLock, 
                                             touchedUncertain, refusedOk, 
@@ -1388,17 +1414,19 @@ S96_1_record_begin(self) == /\ pc[self] = "S96_1_record_begin"
 S96_1_record_end(self) == /\ pc[self] = "S96_1_record_end"
                           /\ IF crashed[self]
                                 THEN /\ pc' = [pc EXCEPT ![self] = "acquire_crashed"]
-                                     /\ UNCHANGED << fs, seenRec, holding, 
+                                     /\ UNCHANGED << fs, seenRec, holding, gen, 
                                                      stack, obj >>
                                 ELSE /\ fs' = FsWriteEnd(fs, obj[self], OwnRecord(self)).fs
                                      /\ seenRec' = [seenRec EXCEPT ![self] = OwnRecord(self)]
                                      /\ holding' = [holding EXCEPT ![self] = TRUE]
+                                     /\ gen' = gen + 1
                                      /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
                                      /\ obj' = [obj EXCEPT ![self] = Head(stack[self]).obj]
                                      /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
                           /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                           sawLive, crashed, live, checked, 
-                                          writing, pendingUnlink, exempt, 
+                                          writing, pendingUnlink, checkGen, 
+                                          writeGen, lostLock, 
                                           landedAfterTakeover, 
                                           recoveredAfterCrash, tornRead, 
                                           hostCrashChangedLock, 
@@ -1409,11 +1437,12 @@ S96_1_record_end(self) == /\ pc[self] = "S96_1_record_end"
 S96_1_backoff(self) == /\ pc[self] = "S96_1_backoff"
                        /\ IF crashed[self]
                              THEN /\ pc' = [pc EXCEPT ![self] = "acquire_crashed"]
-                                  /\ UNCHANGED << fs, refusedOk, refused, 
-                                                  stack, obj >>
+                                  /\ UNCHANGED << fs, lostLock, refusedOk, 
+                                                  refused, stack, obj >>
                              ELSE /\ refusedOk' = [refusedOk EXCEPT ![self] = RefusalEvidence(self)]
                                   /\ \E c \in FsUnlinkChoices:
                                        fs' = FsUnlink(fs, P, LockName, c).fs
+                                  /\ lostLock' = MarkLost(self, LockObj)
                                   /\ refused' = [refused EXCEPT ![self] = "TARGET_LOCK_BUSY"]
                                   /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
                                   /\ obj' = [obj EXCEPT ![self] = Head(stack[self]).obj]
@@ -1421,7 +1450,7 @@ S96_1_backoff(self) == /\ pc[self] = "S96_1_backoff"
                        /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                        sawLive, seenRec, crashed, live, 
                                        holding, checked, writing, 
-                                       pendingUnlink, exempt, 
+                                       pendingUnlink, gen, checkGen, writeGen, 
                                        landedAfterTakeover, 
                                        recoveredAfterCrash, tornRead, 
                                        hostCrashChangedLock, touchedUncertain, 
@@ -1439,7 +1468,8 @@ S96_1_ownlock_wait(self) == /\ pc[self] = "S96_1_ownlock_wait"
                             /\ UNCHANGED << fs, foreignObj, classified, 
                                             ownerLive, sawLive, seenRec, 
                                             crashed, live, holding, checked, 
-                                            writing, pendingUnlink, exempt, 
+                                            writing, pendingUnlink, gen, 
+                                            checkGen, writeGen, lostLock, 
                                             landedAfterTakeover, 
                                             recoveredAfterCrash, tornRead, 
                                             hostCrashChangedLock, 
@@ -1451,10 +1481,11 @@ S96_1_ownlock_wait(self) == /\ pc[self] = "S96_1_ownlock_wait"
 S96_1_ownlock_close(self) == /\ pc[self] = "S96_1_ownlock_close"
                              /\ IF crashed[self]
                                    THEN /\ pc' = [pc EXCEPT ![self] = "acquire_crashed"]
-                                        /\ UNCHANGED << fs, refused, stack, 
-                                                        obj >>
+                                        /\ UNCHANGED << fs, lostLock, refused, 
+                                                        stack, obj >>
                                    ELSE /\ \E c \in FsUnlinkChoices:
                                              fs' = FsClose(IF SEED_ACQUIRER_UNLINKS_BY_NAME THEN FsUnlink(fs, P, LockName, c).fs ELSE fs, self, obj[self]).fs
+                                        /\ lostLock' = IF SEED_ACQUIRER_UNLINKS_BY_NAME THEN MarkLost(self, LockObj) ELSE lostLock
                                         /\ refused' = [refused EXCEPT ![self] = "RESTART"]
                                         /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
                                         /\ obj' = [obj EXCEPT ![self] = Head(stack[self]).obj]
@@ -1462,8 +1493,8 @@ S96_1_ownlock_close(self) == /\ pc[self] = "S96_1_ownlock_close"
                              /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                              sawLive, seenRec, crashed, live, 
                                              holding, checked, writing, 
-                                             pendingUnlink, exempt, 
-                                             landedAfterTakeover, 
+                                             pendingUnlink, gen, checkGen, 
+                                             writeGen, landedAfterTakeover, 
                                              recoveredAfterCrash, tornRead, 
                                              hostCrashChangedLock, 
                                              touchedUncertain, refusedOk, keep, 
@@ -1477,7 +1508,8 @@ acquire_crashed(self) == /\ pc[self] = "acquire_crashed"
                          /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                          sawLive, seenRec, crashed, live, 
                                          holding, checked, writing, 
-                                         pendingUnlink, exempt, 
+                                         pendingUnlink, gen, checkGen, 
+                                         writeGen, lostLock, 
                                          landedAfterTakeover, 
                                          recoveredAfterCrash, tornRead, 
                                          hostCrashChangedLock, 
@@ -1505,7 +1537,8 @@ S240_3_s1(self) == /\ pc[self] = "S240_3_s1"
                                     ELSE /\ pc' = [pc EXCEPT ![self] = "S240_3_s2"]
                    /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                    sawLive, seenRec, crashed, live, holding, 
-                                   checked, writing, pendingUnlink, exempt, 
+                                   checked, writing, pendingUnlink, gen, 
+                                   checkGen, writeGen, lostLock, 
                                    landedAfterTakeover, recoveredAfterCrash, 
                                    tornRead, hostCrashChangedLock, 
                                    touchedUncertain, refusedOk, refused, stack, 
@@ -1515,7 +1548,7 @@ S240_3_s1(self) == /\ pc[self] = "S240_3_s1"
 S240_3_s2(self) == /\ pc[self] = "S240_3_s2"
                    /\ IF crashed[self]
                          THEN /\ pc' = [pc EXCEPT ![self] = "recover_crashed"]
-                              /\ UNCHANGED << fs, touchedUncertain >>
+                              /\ UNCHANGED << fs, lostLock, touchedUncertain >>
                          ELSE /\ IF JudgedUncertain(self)
                                     THEN /\ touchedUncertain' = TRUE
                                     ELSE /\ TRUE
@@ -1523,16 +1556,18 @@ S240_3_s2(self) == /\ pc[self] = "S240_3_s2"
                               /\ LET r == FsRenameNoReplace(fs, P, LockName, BrokenOf(self)) IN
                                    IF r.ok
                                       THEN /\ fs' = r.fs
+                                           /\ lostLock' = MarkLost(self, LockObj)
                                            /\ pc' = [pc EXCEPT ![self] = "S240_3_s3"]
                                       ELSE /\ pc' = [pc EXCEPT ![self] = "S240_3_restart"]
-                                           /\ fs' = fs
+                                           /\ UNCHANGED << fs, lostLock >>
                    /\ UNCHANGED << foreignObj, classified, ownerLive, sawLive, 
                                    seenRec, crashed, live, holding, checked, 
-                                   writing, pendingUnlink, exempt, 
-                                   landedAfterTakeover, recoveredAfterCrash, 
-                                   tornRead, hostCrashChangedLock, refusedOk, 
-                                   refused, stack, keep, obj_, got, obj, robj, 
-                                   victim, nobj, tobj, crashes, leases >>
+                                   writing, pendingUnlink, gen, checkGen, 
+                                   writeGen, landedAfterTakeover, 
+                                   recoveredAfterCrash, tornRead, 
+                                   hostCrashChangedLock, refusedOk, refused, 
+                                   stack, keep, obj_, got, obj, robj, victim, 
+                                   nobj, tobj, crashes, leases >>
 
 S240_3_s3(self) == /\ pc[self] = "S240_3_s3"
                    /\ IF crashed[self]
@@ -1543,7 +1578,8 @@ S240_3_s3(self) == /\ pc[self] = "S240_3_s3"
                                       ELSE /\ pc' = [pc EXCEPT ![self] = "S240_3_s4"]
                    /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                    sawLive, seenRec, crashed, live, holding, 
-                                   checked, writing, pendingUnlink, exempt, 
+                                   checked, writing, pendingUnlink, gen, 
+                                   checkGen, writeGen, lostLock, 
                                    landedAfterTakeover, recoveredAfterCrash, 
                                    tornRead, hostCrashChangedLock, 
                                    touchedUncertain, refusedOk, refused, stack, 
@@ -1553,22 +1589,23 @@ S240_3_s3(self) == /\ pc[self] = "S240_3_s3"
 S240_3_s4(self) == /\ pc[self] = "S240_3_s4"
                    /\ IF crashed[self]
                          THEN /\ pc' = [pc EXCEPT ![self] = "recover_crashed"]
-                              /\ UNCHANGED << fs, nobj >>
+                              /\ UNCHANGED << fs, lostLock, nobj >>
                          ELSE /\ LET r == FsCreate(fs, P, LockName, self, TRUE) IN
                                    IF r.ok
                                       THEN /\ fs' = r.fs
                                            /\ nobj' = [nobj EXCEPT ![self] = r.val]
+                                           /\ lostLock' = [lostLock EXCEPT ![self] = FALSE]
                                            /\ pc' = [pc EXCEPT ![self] = "S240_3_s4_lock"]
                                       ELSE /\ pc' = [pc EXCEPT ![self] = "S240_3_s4_drop"]
-                                           /\ UNCHANGED << fs, nobj >>
+                                           /\ UNCHANGED << fs, lostLock, nobj >>
                    /\ UNCHANGED << foreignObj, classified, ownerLive, sawLive, 
                                    seenRec, crashed, live, holding, checked, 
-                                   writing, pendingUnlink, exempt, 
-                                   landedAfterTakeover, recoveredAfterCrash, 
-                                   tornRead, hostCrashChangedLock, 
-                                   touchedUncertain, refusedOk, refused, stack, 
-                                   keep, obj_, got, obj, robj, victim, tobj, 
-                                   crashes, leases >>
+                                   writing, pendingUnlink, gen, checkGen, 
+                                   writeGen, landedAfterTakeover, 
+                                   recoveredAfterCrash, tornRead, 
+                                   hostCrashChangedLock, touchedUncertain, 
+                                   refusedOk, refused, stack, keep, obj_, got, 
+                                   obj, robj, victim, tobj, crashes, leases >>
 
 S240_3_s4_lock(self) == /\ pc[self] = "S240_3_s4_lock"
                         /\ IF crashed[self]
@@ -1586,8 +1623,8 @@ S240_3_s4_lock(self) == /\ pc[self] = "S240_3_s4_lock"
                         /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                         sawLive, seenRec, crashed, live, 
                                         holding, checked, writing, 
-                                        pendingUnlink, exempt, 
-                                        landedAfterTakeover, 
+                                        pendingUnlink, gen, checkGen, writeGen, 
+                                        lostLock, landedAfterTakeover, 
                                         recoveredAfterCrash, tornRead, 
                                         hostCrashChangedLock, touchedUncertain, 
                                         refusedOk, refused, stack, keep, obj_, 
@@ -1604,7 +1641,8 @@ S240_3_s4_lock_verify(self) == /\ pc[self] = "S240_3_s4_lock_verify"
                                /\ UNCHANGED << fs, foreignObj, classified, 
                                                ownerLive, sawLive, seenRec, 
                                                crashed, live, holding, checked, 
-                                               writing, pendingUnlink, exempt, 
+                                               writing, pendingUnlink, gen, 
+                                               checkGen, writeGen, lostLock, 
                                                landedAfterTakeover, 
                                                recoveredAfterCrash, tornRead, 
                                                hostCrashChangedLock, 
@@ -1623,7 +1661,8 @@ S240_3_s4_record_begin(self) == /\ pc[self] = "S240_3_s4_record_begin"
                                                 ownerLive, sawLive, seenRec, 
                                                 crashed, live, holding, 
                                                 checked, writing, 
-                                                pendingUnlink, exempt, 
+                                                pendingUnlink, gen, checkGen, 
+                                                writeGen, lostLock, 
                                                 landedAfterTakeover, 
                                                 recoveredAfterCrash, tornRead, 
                                                 hostCrashChangedLock, 
@@ -1635,15 +1674,18 @@ S240_3_s4_record_begin(self) == /\ pc[self] = "S240_3_s4_record_begin"
 S240_3_s4_record_end(self) == /\ pc[self] = "S240_3_s4_record_end"
                               /\ IF crashed[self]
                                     THEN /\ pc' = [pc EXCEPT ![self] = "recover_crashed"]
-                                         /\ UNCHANGED << fs, seenRec, holding >>
+                                         /\ UNCHANGED << fs, seenRec, holding, 
+                                                         gen >>
                                     ELSE /\ fs' = FsWriteEnd(fs, nobj[self], OwnRecord(self)).fs
                                          /\ seenRec' = [seenRec EXCEPT ![self] = OwnRecord(self)]
                                          /\ holding' = [holding EXCEPT ![self] = TRUE]
+                                         /\ gen' = gen + 1
                                          /\ pc' = [pc EXCEPT ![self] = "S240_3_s5"]
                               /\ UNCHANGED << foreignObj, classified, 
                                               ownerLive, sawLive, crashed, 
                                               live, checked, writing, 
-                                              pendingUnlink, exempt, 
+                                              pendingUnlink, checkGen, 
+                                              writeGen, lostLock, 
                                               landedAfterTakeover, 
                                               recoveredAfterCrash, tornRead, 
                                               hostCrashChangedLock, 
@@ -1668,12 +1710,12 @@ S240_3_s5(self) == /\ pc[self] = "S240_3_s5"
                               /\ pc' = [pc EXCEPT ![self] = "S240_3_release"]
                    /\ UNCHANGED << foreignObj, classified, ownerLive, sawLive, 
                                    seenRec, crashed, live, holding, checked, 
-                                   writing, pendingUnlink, exempt, 
-                                   landedAfterTakeover, tornRead, 
-                                   hostCrashChangedLock, touchedUncertain, 
-                                   refusedOk, refused, stack, keep, obj_, got, 
-                                   obj, robj, victim, nobj, tobj, crashes, 
-                                   leases >>
+                                   writing, pendingUnlink, gen, checkGen, 
+                                   writeGen, lostLock, landedAfterTakeover, 
+                                   tornRead, hostCrashChangedLock, 
+                                   touchedUncertain, refusedOk, refused, stack, 
+                                   keep, obj_, got, obj, robj, victim, nobj, 
+                                   tobj, crashes, leases >>
 
 S240_3_s4_drop(self) == /\ pc[self] = "S240_3_s4_drop"
                         /\ IF crashed[self]
@@ -1686,8 +1728,8 @@ S240_3_s4_drop(self) == /\ pc[self] = "S240_3_s4_drop"
                         /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                         sawLive, seenRec, crashed, live, 
                                         holding, checked, writing, 
-                                        pendingUnlink, exempt, 
-                                        landedAfterTakeover, 
+                                        pendingUnlink, gen, checkGen, writeGen, 
+                                        lostLock, landedAfterTakeover, 
                                         recoveredAfterCrash, tornRead, 
                                         hostCrashChangedLock, touchedUncertain, 
                                         refusedOk, stack, keep, obj_, got, obj, 
@@ -1705,7 +1747,8 @@ S240_3_s4_lock_wait(self) == /\ pc[self] = "S240_3_s4_lock_wait"
                              /\ UNCHANGED << fs, foreignObj, classified, 
                                              ownerLive, sawLive, seenRec, 
                                              crashed, live, holding, checked, 
-                                             writing, pendingUnlink, exempt, 
+                                             writing, pendingUnlink, gen, 
+                                             checkGen, writeGen, lostLock, 
                                              landedAfterTakeover, 
                                              recoveredAfterCrash, tornRead, 
                                              hostCrashChangedLock, 
@@ -1717,14 +1760,16 @@ S240_3_s4_lock_wait(self) == /\ pc[self] = "S240_3_s4_lock_wait"
 S240_3_s4_lock_close(self) == /\ pc[self] = "S240_3_s4_lock_close"
                               /\ IF crashed[self]
                                     THEN /\ pc' = [pc EXCEPT ![self] = "recover_crashed"]
-                                         /\ fs' = fs
+                                         /\ UNCHANGED << fs, lostLock >>
                                     ELSE /\ \E c \in FsUnlinkChoices:
                                               fs' = FsClose(IF SEED_ACQUIRER_UNLINKS_BY_NAME THEN FsUnlink(fs, P, LockName, c).fs ELSE fs, self, nobj[self]).fs
+                                         /\ lostLock' = IF SEED_ACQUIRER_UNLINKS_BY_NAME THEN MarkLost(self, LockObj) ELSE lostLock
                                          /\ pc' = [pc EXCEPT ![self] = "S240_3_s4_drop"]
                               /\ UNCHANGED << foreignObj, classified, 
                                               ownerLive, sawLive, seenRec, 
                                               crashed, live, holding, checked, 
-                                              writing, pendingUnlink, exempt, 
+                                              writing, pendingUnlink, gen, 
+                                              checkGen, writeGen, 
                                               landedAfterTakeover, 
                                               recoveredAfterCrash, tornRead, 
                                               hostCrashChangedLock, 
@@ -1747,8 +1792,8 @@ S240_3_putback(self) == /\ pc[self] = "S240_3_putback"
                         /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                         sawLive, seenRec, crashed, live, 
                                         holding, checked, writing, 
-                                        pendingUnlink, exempt, 
-                                        landedAfterTakeover, 
+                                        pendingUnlink, gen, checkGen, writeGen, 
+                                        lostLock, landedAfterTakeover, 
                                         recoveredAfterCrash, tornRead, 
                                         hostCrashChangedLock, touchedUncertain, 
                                         refusedOk, stack, keep, obj_, got, obj, 
@@ -1761,8 +1806,8 @@ S240_3_restart(self) == /\ pc[self] = "S240_3_restart"
                         /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                         sawLive, seenRec, crashed, live, 
                                         holding, checked, writing, 
-                                        pendingUnlink, exempt, 
-                                        landedAfterTakeover, 
+                                        pendingUnlink, gen, checkGen, writeGen, 
+                                        lostLock, landedAfterTakeover, 
                                         recoveredAfterCrash, tornRead, 
                                         hostCrashChangedLock, touchedUncertain, 
                                         refusedOk, stack, keep, obj_, got, obj, 
@@ -1786,8 +1831,8 @@ S240_3_release(self) == /\ pc[self] = "S240_3_release"
                         /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                         sawLive, seenRec, crashed, live, 
                                         holding, checked, writing, 
-                                        pendingUnlink, exempt, 
-                                        landedAfterTakeover, 
+                                        pendingUnlink, gen, checkGen, writeGen, 
+                                        lostLock, landedAfterTakeover, 
                                         recoveredAfterCrash, tornRead, 
                                         hostCrashChangedLock, touchedUncertain, 
                                         refusedOk, refused, keep, obj_, got, 
@@ -1802,7 +1847,8 @@ recover_crashed(self) == /\ pc[self] = "recover_crashed"
                          /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                          sawLive, seenRec, crashed, live, 
                                          holding, checked, writing, 
-                                         pendingUnlink, exempt, 
+                                         pendingUnlink, gen, checkGen, 
+                                         writeGen, lostLock, 
                                          landedAfterTakeover, 
                                          recoveredAfterCrash, tornRead, 
                                          hostCrashChangedLock, 
@@ -1833,7 +1879,8 @@ S240_5_s1(self) == /\ pc[self] = "S240_5_s1"
                                          /\ UNCHANGED << refused, stack, tobj >>
                    /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                    sawLive, seenRec, crashed, live, holding, 
-                                   checked, writing, pendingUnlink, exempt, 
+                                   checked, writing, pendingUnlink, gen, 
+                                   checkGen, writeGen, lostLock, 
                                    landedAfterTakeover, recoveredAfterCrash, 
                                    tornRead, hostCrashChangedLock, 
                                    touchedUncertain, refusedOk, keep, obj_, 
@@ -1843,26 +1890,28 @@ S240_5_s1(self) == /\ pc[self] = "S240_5_s1"
 S240_5_s2(self) == /\ pc[self] = "S240_5_s2"
                    /\ IF crashed[self]
                          THEN /\ pc' = [pc EXCEPT ![self] = "takeover_crashed"]
-                              /\ UNCHANGED << fs, refused, stack, tobj >>
+                              /\ UNCHANGED << fs, lostLock, refused, stack, 
+                                              tobj >>
                          ELSE /\ LET r == FsOpen(fs, P, LockName, self, TRUE) IN
                                    IF r.ok
                                       THEN /\ fs' = r.fs
                                            /\ tobj' = [tobj EXCEPT ![self] = r.val]
+                                           /\ lostLock' = [lostLock EXCEPT ![self] = FALSE]
                                            /\ pc' = [pc EXCEPT ![self] = "S240_5_s3"]
                                            /\ UNCHANGED << refused, stack >>
                                       ELSE /\ refused' = [refused EXCEPT ![self] = "RESTART"]
                                            /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
                                            /\ tobj' = [tobj EXCEPT ![self] = Head(stack[self]).tobj]
                                            /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
-                                           /\ fs' = fs
+                                           /\ UNCHANGED << fs, lostLock >>
                    /\ UNCHANGED << foreignObj, classified, ownerLive, sawLive, 
                                    seenRec, crashed, live, holding, checked, 
-                                   writing, pendingUnlink, exempt, 
-                                   landedAfterTakeover, recoveredAfterCrash, 
-                                   tornRead, hostCrashChangedLock, 
-                                   touchedUncertain, refusedOk, keep, obj_, 
-                                   got, obj, robj, victim, nobj, crashes, 
-                                   leases >>
+                                   writing, pendingUnlink, gen, checkGen, 
+                                   writeGen, landedAfterTakeover, 
+                                   recoveredAfterCrash, tornRead, 
+                                   hostCrashChangedLock, touchedUncertain, 
+                                   refusedOk, keep, obj_, got, obj, robj, 
+                                   victim, nobj, crashes, leases >>
 
 S240_5_s3(self) == /\ pc[self] = "S240_5_s3"
                    /\ IF crashed[self]
@@ -1884,12 +1933,12 @@ S240_5_s3(self) == /\ pc[self] = "S240_5_s3"
                                                          refused >>
                    /\ UNCHANGED << foreignObj, classified, ownerLive, sawLive, 
                                    seenRec, crashed, live, holding, checked, 
-                                   writing, pendingUnlink, exempt, 
-                                   landedAfterTakeover, recoveredAfterCrash, 
-                                   tornRead, hostCrashChangedLock, 
-                                   touchedUncertain, stack, keep, obj_, got, 
-                                   obj, robj, victim, nobj, tobj, crashes, 
-                                   leases >>
+                                   writing, pendingUnlink, gen, checkGen, 
+                                   writeGen, lostLock, landedAfterTakeover, 
+                                   recoveredAfterCrash, tornRead, 
+                                   hostCrashChangedLock, touchedUncertain, 
+                                   stack, keep, obj_, got, obj, robj, victim, 
+                                   nobj, tobj, crashes, leases >>
 
 S240_5_s4(self) == /\ pc[self] = "S240_5_s4"
                    /\ IF crashed[self]
@@ -1903,7 +1952,8 @@ S240_5_s4(self) == /\ pc[self] = "S240_5_s4"
                                            /\ UNCHANGED refused
                    /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                    sawLive, seenRec, crashed, live, holding, 
-                                   checked, writing, pendingUnlink, exempt, 
+                                   checked, writing, pendingUnlink, gen, 
+                                   checkGen, writeGen, lostLock, 
                                    landedAfterTakeover, recoveredAfterCrash, 
                                    tornRead, hostCrashChangedLock, 
                                    touchedUncertain, refusedOk, stack, keep, 
@@ -1936,12 +1986,12 @@ S240_5_s5(self) == /\ pc[self] = "S240_5_s5"
                                                                       refused >>
                    /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                    seenRec, crashed, live, holding, checked, 
-                                   writing, pendingUnlink, exempt, 
-                                   landedAfterTakeover, recoveredAfterCrash, 
-                                   tornRead, hostCrashChangedLock, 
-                                   touchedUncertain, stack, keep, obj_, got, 
-                                   obj, robj, victim, nobj, tobj, crashes, 
-                                   leases >>
+                                   writing, pendingUnlink, gen, checkGen, 
+                                   writeGen, lostLock, landedAfterTakeover, 
+                                   recoveredAfterCrash, tornRead, 
+                                   hostCrashChangedLock, touchedUncertain, 
+                                   stack, keep, obj_, got, obj, robj, victim, 
+                                   nobj, tobj, crashes, leases >>
 
 S240_5_s6_seed(self) == /\ pc[self] = "S240_5_s6_seed"
                         /\ IF crashed[self]
@@ -1961,8 +2011,8 @@ S240_5_s6_seed(self) == /\ pc[self] = "S240_5_s6_seed"
                         /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                         sawLive, seenRec, crashed, live, 
                                         holding, checked, writing, 
-                                        pendingUnlink, exempt, 
-                                        landedAfterTakeover, 
+                                        pendingUnlink, gen, checkGen, writeGen, 
+                                        lostLock, landedAfterTakeover, 
                                         recoveredAfterCrash, tornRead, 
                                         hostCrashChangedLock, touchedUncertain, 
                                         refusedOk, stack, keep, obj_, got, obj, 
@@ -1972,13 +2022,15 @@ S240_5_s6_seed(self) == /\ pc[self] = "S240_5_s6_seed"
 S240_5_s6_write_begin(self) == /\ pc[self] = "S240_5_s6_write_begin"
                                /\ IF crashed[self]
                                      THEN /\ pc' = [pc EXCEPT ![self] = "takeover_crashed"]
-                                          /\ fs' = fs
+                                          /\ UNCHANGED << fs, lostLock >>
                                      ELSE /\ fs' = FsWriteBegin(fs, tobj[self]).fs
+                                          /\ lostLock' = MarkLost(self, tobj[self])
                                           /\ pc' = [pc EXCEPT ![self] = "S240_5_s6_write_end"]
                                /\ UNCHANGED << foreignObj, classified, 
                                                ownerLive, sawLive, seenRec, 
                                                crashed, live, holding, checked, 
-                                               writing, pendingUnlink, exempt, 
+                                               writing, pendingUnlink, gen, 
+                                               checkGen, writeGen, 
                                                landedAfterTakeover, 
                                                recoveredAfterCrash, tornRead, 
                                                hostCrashChangedLock, 
@@ -1990,16 +2042,14 @@ S240_5_s6_write_begin(self) == /\ pc[self] = "S240_5_s6_write_begin"
 S240_5_s6_write_end(self) == /\ pc[self] = "S240_5_s6_write_end"
                              /\ IF crashed[self]
                                    THEN /\ pc' = [pc EXCEPT ![self] = "takeover_crashed"]
-                                        /\ UNCHANGED << fs, seenRec, exempt >>
+                                        /\ UNCHANGED << fs, seenRec >>
                                    ELSE /\ fs' = FsWriteEnd(fs, tobj[self], OwnRecord(self)).fs
                                         /\ seenRec' = [seenRec EXCEPT ![self] = OwnRecord(self)]
-                                        /\ exempt' = [p \in Procs |-> IF p # self /\ HandleObj(p) = tobj[self]
-                                                                      THEN exempt[p] \/ writing[p] \/ (FIX_REMOTE_LEASE_SPEC /\ checked[p])
-                                                                      ELSE exempt[p]]
                                         /\ pc' = [pc EXCEPT ![self] = "S240_5_s6_flush"]
                              /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                              sawLive, crashed, live, holding, 
                                              checked, writing, pendingUnlink, 
+                                             gen, checkGen, writeGen, lostLock, 
                                              landedAfterTakeover, 
                                              recoveredAfterCrash, tornRead, 
                                              hostCrashChangedLock, 
@@ -2017,7 +2067,8 @@ S240_5_s6_flush(self) == /\ pc[self] = "S240_5_s6_flush"
                          /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                          sawLive, seenRec, crashed, live, 
                                          holding, checked, writing, 
-                                         pendingUnlink, exempt, 
+                                         pendingUnlink, gen, checkGen, 
+                                         writeGen, lostLock, 
                                          landedAfterTakeover, 
                                          recoveredAfterCrash, tornRead, 
                                          hostCrashChangedLock, 
@@ -2028,22 +2079,25 @@ S240_5_s6_flush(self) == /\ pc[self] = "S240_5_s6_flush"
 S240_5_s6(self) == /\ pc[self] = "S240_5_s6"
                    /\ IF crashed[self]
                          THEN /\ pc' = [pc EXCEPT ![self] = "takeover_crashed"]
-                              /\ UNCHANGED << holding, refusedOk, refused, 
+                              /\ UNCHANGED << holding, gen, refusedOk, refused, 
                                               stack, tobj >>
                          ELSE /\ \E ident \in FsIdentityChoices(fs, P, LockName):
                                    IF ident = NoObj
                                       THEN /\ refused' = [refused EXCEPT ![self] = "RESTART"]
                                            /\ pc' = [pc EXCEPT ![self] = "S240_5_close"]
-                                           /\ UNCHANGED << holding, refusedOk, 
-                                                           stack, tobj >>
+                                           /\ UNCHANGED << holding, gen, 
+                                                           refusedOk, stack, 
+                                                           tobj >>
                                       ELSE /\ IF ident # tobj[self]
                                                  THEN /\ refusedOk' = [refusedOk EXCEPT ![self] = LockObj # NoObj /\ LockObj # tobj[self]]
                                                       /\ refused' = [refused EXCEPT ![self] = "TARGET_LOCK_BUSY"]
                                                       /\ pc' = [pc EXCEPT ![self] = "S240_5_close"]
                                                       /\ UNCHANGED << holding, 
+                                                                      gen, 
                                                                       stack, 
                                                                       tobj >>
                                                  ELSE /\ holding' = [holding EXCEPT ![self] = TRUE]
+                                                      /\ gen' = gen + 1
                                                       /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
                                                       /\ tobj' = [tobj EXCEPT ![self] = Head(stack[self]).tobj]
                                                       /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
@@ -2051,11 +2105,12 @@ S240_5_s6(self) == /\ pc[self] = "S240_5_s6"
                                                                       refused >>
                    /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                    sawLive, seenRec, crashed, live, checked, 
-                                   writing, pendingUnlink, exempt, 
-                                   landedAfterTakeover, recoveredAfterCrash, 
-                                   tornRead, hostCrashChangedLock, 
-                                   touchedUncertain, keep, obj_, got, obj, 
-                                   robj, victim, nobj, crashes, leases >>
+                                   writing, pendingUnlink, checkGen, writeGen, 
+                                   lostLock, landedAfterTakeover, 
+                                   recoveredAfterCrash, tornRead, 
+                                   hostCrashChangedLock, touchedUncertain, 
+                                   keep, obj_, got, obj, robj, victim, nobj, 
+                                   crashes, leases >>
 
 S240_5_seed_write_begin(self) == /\ pc[self] = "S240_5_seed_write_begin"
                                  /\ IF crashed[self]
@@ -2067,7 +2122,8 @@ S240_5_seed_write_begin(self) == /\ pc[self] = "S240_5_seed_write_begin"
                                                  ownerLive, sawLive, seenRec, 
                                                  crashed, live, holding, 
                                                  checked, writing, 
-                                                 pendingUnlink, exempt, 
+                                                 pendingUnlink, gen, checkGen, 
+                                                 writeGen, lostLock, 
                                                  landedAfterTakeover, 
                                                  recoveredAfterCrash, tornRead, 
                                                  hostCrashChangedLock, 
@@ -2086,7 +2142,8 @@ S240_5_seed_write_end(self) == /\ pc[self] = "S240_5_seed_write_end"
                                /\ UNCHANGED << foreignObj, classified, 
                                                ownerLive, sawLive, crashed, 
                                                live, holding, checked, writing, 
-                                               pendingUnlink, exempt, 
+                                               pendingUnlink, gen, checkGen, 
+                                               writeGen, lostLock, 
                                                landedAfterTakeover, 
                                                recoveredAfterCrash, tornRead, 
                                                hostCrashChangedLock, 
@@ -2098,12 +2155,15 @@ S240_5_seed_write_end(self) == /\ pc[self] = "S240_5_seed_write_end"
 S240_5_seed_rename(self) == /\ pc[self] = "S240_5_seed_rename"
                             /\ IF crashed[self]
                                   THEN /\ pc' = [pc EXCEPT ![self] = "takeover_crashed"]
-                                       /\ UNCHANGED << fs, holding, refused, 
+                                       /\ UNCHANGED << fs, holding, gen, 
+                                                       lostLock, refused, 
                                                        stack, tobj >>
                                   ELSE /\ LET r == FsRenameReplace(fs, P, TakeoverName(self), LockName) IN
                                             IF r.ok
                                                THEN /\ fs' = FsClose(r.fs, self, tobj[self]).fs
+                                                    /\ lostLock' = MarkLost(self, LockObj)
                                                     /\ holding' = [holding EXCEPT ![self] = TRUE]
+                                                    /\ gen' = gen + 1
                                                     /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
                                                     /\ tobj' = [tobj EXCEPT ![self] = Head(stack[self]).tobj]
                                                     /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
@@ -2112,12 +2172,15 @@ S240_5_seed_rename(self) == /\ pc[self] = "S240_5_seed_rename"
                                                     /\ pc' = [pc EXCEPT ![self] = "S240_5_close"]
                                                     /\ UNCHANGED << fs, 
                                                                     holding, 
+                                                                    gen, 
+                                                                    lostLock, 
                                                                     stack, 
                                                                     tobj >>
                             /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                             sawLive, seenRec, crashed, live, 
                                             checked, writing, pendingUnlink, 
-                                            exempt, landedAfterTakeover, 
+                                            checkGen, writeGen, 
+                                            landedAfterTakeover, 
                                             recoveredAfterCrash, tornRead, 
                                             hostCrashChangedLock, 
                                             touchedUncertain, refusedOk, keep, 
@@ -2137,7 +2200,8 @@ S240_5_close(self) == /\ pc[self] = "S240_5_close"
                                  /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
                       /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                       sawLive, seenRec, crashed, live, holding, 
-                                      checked, writing, pendingUnlink, exempt, 
+                                      checked, writing, pendingUnlink, gen, 
+                                      checkGen, writeGen, lostLock, 
                                       landedAfterTakeover, recoveredAfterCrash, 
                                       tornRead, hostCrashChangedLock, 
                                       touchedUncertain, refusedOk, refused, 
@@ -2151,7 +2215,8 @@ takeover_crashed(self) == /\ pc[self] = "takeover_crashed"
                           /\ UNCHANGED << fs, foreignObj, classified, 
                                           ownerLive, sawLive, seenRec, crashed, 
                                           live, holding, checked, writing, 
-                                          pendingUnlink, exempt, 
+                                          pendingUnlink, gen, checkGen, 
+                                          writeGen, lostLock, 
                                           landedAfterTakeover, 
                                           recoveredAfterCrash, tornRead, 
                                           hostCrashChangedLock, 
@@ -2171,48 +2236,53 @@ TakeOver(self) == S240_5_s1(self) \/ S240_5_s2(self) \/ S240_5_s3(self)
 S99_check(self) == /\ pc[self] = "S99_check"
                    /\ IF crashed[self]
                          THEN /\ pc' = [pc EXCEPT ![self] = "publish_crashed"]
-                              /\ UNCHANGED << fs, holding, checked, refusedOk, 
-                                              refused >>
+                              /\ UNCHANGED << fs, holding, checked, checkGen, 
+                                              refusedOk, refused >>
                          ELSE /\ fs' = Relock(self)
                               /\ IF StillOwned(self)
                                     THEN /\ checked' = [checked EXCEPT ![self] = TRUE]
+                                         /\ checkGen' = [checkGen EXCEPT ![self] = gen]
                                          /\ pc' = [pc EXCEPT ![self] = "S99_write"]
                                          /\ UNCHANGED << holding, refusedOk, 
                                                          refused >>
                                     ELSE /\ checked' = [checked EXCEPT ![self] = FALSE]
-                                         /\ refusedOk' = [refusedOk EXCEPT ![self] = RefusalEvidence(self) \/ LostLock(self)]
+                                         /\ refusedOk' = [refusedOk EXCEPT ![self] = lostLock[self]]
                                          /\ refused' = [refused EXCEPT ![self] = "TARGET_LOCK_BUSY"]
                                          /\ holding' = [holding EXCEPT ![self] = FALSE]
                                          /\ pc' = [pc EXCEPT ![self] = "S99_refuse_close"]
+                                         /\ UNCHANGED checkGen
                    /\ UNCHANGED << foreignObj, classified, ownerLive, sawLive, 
                                    seenRec, crashed, live, writing, 
-                                   pendingUnlink, exempt, landedAfterTakeover, 
-                                   recoveredAfterCrash, tornRead, 
-                                   hostCrashChangedLock, touchedUncertain, 
-                                   stack, keep, obj_, got, obj, robj, victim, 
-                                   nobj, tobj, crashes, leases >>
+                                   pendingUnlink, gen, writeGen, lostLock, 
+                                   landedAfterTakeover, recoveredAfterCrash, 
+                                   tornRead, hostCrashChangedLock, 
+                                   touchedUncertain, stack, keep, obj_, got, 
+                                   obj, robj, victim, nobj, tobj, crashes, 
+                                   leases >>
 
 S99_write(self) == /\ pc[self] = "S99_write"
                    /\ IF crashed[self]
                          THEN /\ pc' = [pc EXCEPT ![self] = "publish_crashed"]
-                              /\ UNCHANGED writing
+                              /\ UNCHANGED << writing, writeGen >>
                          ELSE /\ writing' = [writing EXCEPT ![self] = TRUE]
+                              /\ writeGen' = [writeGen EXCEPT ![self] = gen]
                               /\ pc' = [pc EXCEPT ![self] = "S240_5_inflight_lands"]
                    /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                    sawLive, seenRec, crashed, live, holding, 
-                                   checked, pendingUnlink, exempt, 
-                                   landedAfterTakeover, recoveredAfterCrash, 
-                                   tornRead, hostCrashChangedLock, 
-                                   touchedUncertain, refusedOk, refused, stack, 
-                                   keep, obj_, got, obj, robj, victim, nobj, 
-                                   tobj, crashes, leases >>
+                                   checked, pendingUnlink, gen, checkGen, 
+                                   lostLock, landedAfterTakeover, 
+                                   recoveredAfterCrash, tornRead, 
+                                   hostCrashChangedLock, touchedUncertain, 
+                                   refusedOk, refused, stack, keep, obj_, got, 
+                                   obj, robj, victim, nobj, tobj, crashes, 
+                                   leases >>
 
 S240_5_inflight_lands(self) == /\ pc[self] = "S240_5_inflight_lands"
                                /\ IF crashed[self]
                                      THEN /\ pc' = [pc EXCEPT ![self] = "publish_crashed"]
                                           /\ UNCHANGED << writing, 
                                                           landedAfterTakeover >>
-                                     ELSE /\ IF exempt[self]
+                                     ELSE /\ IF writeGen[self] # gen
                                                 THEN /\ landedAfterTakeover' = TRUE
                                                 ELSE /\ TRUE
                                                      /\ UNCHANGED landedAfterTakeover
@@ -2221,7 +2291,8 @@ S240_5_inflight_lands(self) == /\ pc[self] = "S240_5_inflight_lands"
                                /\ UNCHANGED << fs, foreignObj, classified, 
                                                ownerLive, sawLive, seenRec, 
                                                crashed, live, holding, checked, 
-                                               pendingUnlink, exempt, 
+                                               pendingUnlink, gen, checkGen, 
+                                               writeGen, lostLock, 
                                                recoveredAfterCrash, tornRead, 
                                                hostCrashChangedLock, 
                                                touchedUncertain, refusedOk, 
@@ -2237,7 +2308,7 @@ S99_release_check(self) == /\ pc[self] = "S99_release_check"
                                  ELSE /\ checked' = [checked EXCEPT ![self] = FALSE]
                                       /\ fs' = Relock(self)
                                       /\ IF ~StillOwned(self)
-                                            THEN /\ refusedOk' = [refusedOk EXCEPT ![self] = RefusalEvidence(self) \/ LostLock(self)]
+                                            THEN /\ refusedOk' = [refusedOk EXCEPT ![self] = lostLock[self]]
                                                  /\ refused' = [refused EXCEPT ![self] = "TARGET_LOCK_BUSY"]
                                                  /\ holding' = [holding EXCEPT ![self] = FALSE]
                                                  /\ pc' = [pc EXCEPT ![self] = "S99_refuse_close"]
@@ -2247,7 +2318,8 @@ S99_release_check(self) == /\ pc[self] = "S99_release_check"
                                                                  refused >>
                            /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                            sawLive, seenRec, crashed, live, 
-                                           writing, pendingUnlink, exempt, 
+                                           writing, pendingUnlink, gen, 
+                                           checkGen, writeGen, lostLock, 
                                            landedAfterTakeover, 
                                            recoveredAfterCrash, tornRead, 
                                            hostCrashChangedLock, 
@@ -2264,7 +2336,8 @@ S99_release(self) == /\ pc[self] = "S99_release"
                                 /\ pc' = [pc EXCEPT ![self] = "S99_release_lands"]
                      /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                      sawLive, seenRec, crashed, live, checked, 
-                                     writing, exempt, landedAfterTakeover, 
+                                     writing, gen, checkGen, writeGen, 
+                                     lostLock, landedAfterTakeover, 
                                      recoveredAfterCrash, tornRead, 
                                      hostCrashChangedLock, touchedUncertain, 
                                      refusedOk, refused, stack, keep, obj_, 
@@ -2274,14 +2347,17 @@ S99_release(self) == /\ pc[self] = "S99_release"
 S99_release_lands(self) == /\ pc[self] = "S99_release_lands"
                            /\ IF crashed[self]
                                  THEN /\ pc' = [pc EXCEPT ![self] = "publish_crashed"]
-                                      /\ UNCHANGED << fs, pendingUnlink >>
+                                      /\ UNCHANGED << fs, pendingUnlink, 
+                                                      lostLock >>
                                  ELSE /\ \E c \in FsUnlinkChoices:
                                            fs' = LandUnlink(fs, self, c)
+                                      /\ lostLock' = (IF pendingUnlink[self] # NoObj /\ LockObj = pendingUnlink[self] THEN MarkLost(self, LockObj) ELSE lostLock)
                                       /\ pendingUnlink' = [pendingUnlink EXCEPT ![self] = NoObj]
                                       /\ pc' = [pc EXCEPT ![self] = "S99_close"]
                            /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                            sawLive, seenRec, crashed, live, 
-                                           holding, checked, writing, exempt, 
+                                           holding, checked, writing, gen, 
+                                           checkGen, writeGen, 
                                            landedAfterTakeover, 
                                            recoveredAfterCrash, tornRead, 
                                            hostCrashChangedLock, 
@@ -2294,20 +2370,17 @@ S99_close(self) == /\ pc[self] = "S99_close"
                    /\ IF crashed[self]
                          THEN /\ pc' = [pc EXCEPT ![self] = "publish_crashed"]
                               /\ UNCHANGED << fs, stack >>
-                         ELSE /\ IF LockObj # NoObj /\ OpenBy(fs, self, LockObj)
-                                    THEN /\ fs' = FsClose(fs, self, LockObj).fs
-                                    ELSE /\ TRUE
-                                         /\ fs' = fs
+                         ELSE /\ fs' = FsCloseAll(fs, self)
                               /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
                               /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
                    /\ UNCHANGED << foreignObj, classified, ownerLive, sawLive, 
                                    seenRec, crashed, live, holding, checked, 
-                                   writing, pendingUnlink, exempt, 
-                                   landedAfterTakeover, recoveredAfterCrash, 
-                                   tornRead, hostCrashChangedLock, 
-                                   touchedUncertain, refusedOk, refused, keep, 
-                                   obj_, got, obj, robj, victim, nobj, tobj, 
-                                   crashes, leases >>
+                                   writing, pendingUnlink, gen, checkGen, 
+                                   writeGen, lostLock, landedAfterTakeover, 
+                                   recoveredAfterCrash, tornRead, 
+                                   hostCrashChangedLock, touchedUncertain, 
+                                   refusedOk, refused, keep, obj_, got, obj, 
+                                   robj, victim, nobj, tobj, crashes, leases >>
 
 S99_refuse_close(self) == /\ pc[self] = "S99_refuse_close"
                           /\ IF crashed[self]
@@ -2319,7 +2392,8 @@ S99_refuse_close(self) == /\ pc[self] = "S99_refuse_close"
                           /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                           sawLive, seenRec, crashed, live, 
                                           holding, checked, writing, 
-                                          pendingUnlink, exempt, 
+                                          pendingUnlink, gen, checkGen, 
+                                          writeGen, lostLock, 
                                           landedAfterTakeover, 
                                           recoveredAfterCrash, tornRead, 
                                           hostCrashChangedLock, 
@@ -2333,8 +2407,9 @@ publish_crashed(self) == /\ pc[self] = "publish_crashed"
                          /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
                          /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                          sawLive, seenRec, crashed, live, 
-                                         holding, writing, pendingUnlink, 
-                                         exempt, landedAfterTakeover, 
+                                         holding, writing, pendingUnlink, gen, 
+                                         checkGen, writeGen, lostLock, 
+                                         landedAfterTakeover, 
                                          recoveredAfterCrash, tornRead, 
                                          hostCrashChangedLock, 
                                          touchedUncertain, refusedOk, refused, 
@@ -2362,12 +2437,12 @@ own_start(self) == /\ pc[self] = "own_start"
                               /\ UNCHANGED refused
                    /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                    sawLive, seenRec, crashed, holding, checked, 
-                                   writing, pendingUnlink, exempt, 
-                                   landedAfterTakeover, recoveredAfterCrash, 
-                                   tornRead, hostCrashChangedLock, 
-                                   touchedUncertain, refusedOk, keep, obj_, 
-                                   got, robj, victim, nobj, tobj, crashes, 
-                                   leases >>
+                                   writing, pendingUnlink, gen, checkGen, 
+                                   writeGen, lostLock, landedAfterTakeover, 
+                                   recoveredAfterCrash, tornRead, 
+                                   hostCrashChangedLock, touchedUncertain, 
+                                   refusedOk, keep, obj_, got, robj, victim, 
+                                   nobj, tobj, crashes, leases >>
 
 own_publish(self) == /\ pc[self] = "own_publish"
                      /\ IF ~crashed[self] /\ holding[self]
@@ -2379,7 +2454,8 @@ own_publish(self) == /\ pc[self] = "own_publish"
                                 /\ stack' = stack
                      /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                      sawLive, seenRec, crashed, live, holding, 
-                                     checked, writing, pendingUnlink, exempt, 
+                                     checked, writing, pendingUnlink, gen, 
+                                     checkGen, writeGen, lostLock, 
                                      landedAfterTakeover, recoveredAfterCrash, 
                                      tornRead, hostCrashChangedLock, 
                                      touchedUncertain, refusedOk, refused, 
@@ -2391,12 +2467,13 @@ own_end(self) == /\ pc[self] = "own_end"
                  /\ pc' = [pc EXCEPT ![self] = "Done"]
                  /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                  sawLive, seenRec, crashed, holding, checked, 
-                                 writing, pendingUnlink, exempt, 
-                                 landedAfterTakeover, recoveredAfterCrash, 
-                                 tornRead, hostCrashChangedLock, 
-                                 touchedUncertain, refusedOk, refused, stack, 
-                                 keep, obj_, got, obj, robj, victim, nobj, 
-                                 tobj, crashes, leases >>
+                                 writing, pendingUnlink, gen, checkGen, 
+                                 writeGen, lostLock, landedAfterTakeover, 
+                                 recoveredAfterCrash, tornRead, 
+                                 hostCrashChangedLock, touchedUncertain, 
+                                 refusedOk, refused, stack, keep, obj_, got, 
+                                 obj, robj, victim, nobj, tobj, crashes, 
+                                 leases >>
 
 own(self) == own_start(self) \/ own_publish(self) \/ own_end(self)
 
@@ -2419,7 +2496,8 @@ plain_start(self) == /\ pc[self] = "plain_start"
                                 /\ UNCHANGED refused
                      /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                      sawLive, seenRec, crashed, holding, 
-                                     checked, writing, pendingUnlink, exempt, 
+                                     checked, writing, pendingUnlink, gen, 
+                                     checkGen, writeGen, lostLock, 
                                      landedAfterTakeover, recoveredAfterCrash, 
                                      tornRead, hostCrashChangedLock, 
                                      touchedUncertain, refusedOk, obj, robj, 
@@ -2448,7 +2526,8 @@ S21_1_decide(self) == /\ pc[self] = "S21_1_decide"
                                                        /\ pc' = [pc EXCEPT ![self] = "S21_1_refused"]
                       /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                       sawLive, seenRec, crashed, live, holding, 
-                                      checked, writing, pendingUnlink, exempt, 
+                                      checked, writing, pendingUnlink, gen, 
+                                      checkGen, writeGen, lostLock, 
                                       landedAfterTakeover, recoveredAfterCrash, 
                                       tornRead, hostCrashChangedLock, 
                                       touchedUncertain, stack, keep, obj_, got, 
@@ -2460,8 +2539,8 @@ S21_1_refused(self) == /\ pc[self] = "S21_1_refused"
                        /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                        sawLive, seenRec, crashed, live, 
                                        holding, checked, writing, 
-                                       pendingUnlink, exempt, 
-                                       landedAfterTakeover, 
+                                       pendingUnlink, gen, checkGen, writeGen, 
+                                       lostLock, landedAfterTakeover, 
                                        recoveredAfterCrash, tornRead, 
                                        hostCrashChangedLock, touchedUncertain, 
                                        refusedOk, refused, stack, keep, obj_, 
@@ -2482,8 +2561,8 @@ plain_recover(self) == /\ pc[self] = "plain_recover"
                        /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                        sawLive, seenRec, crashed, live, 
                                        holding, checked, writing, 
-                                       pendingUnlink, exempt, 
-                                       landedAfterTakeover, 
+                                       pendingUnlink, gen, checkGen, writeGen, 
+                                       lostLock, landedAfterTakeover, 
                                        recoveredAfterCrash, tornRead, 
                                        hostCrashChangedLock, touchedUncertain, 
                                        refusedOk, refused, keep, obj_, got, 
@@ -2500,7 +2579,8 @@ plain_recovered(self) == /\ pc[self] = "plain_recovered"
                          /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                          sawLive, seenRec, crashed, live, 
                                          holding, checked, writing, 
-                                         pendingUnlink, exempt, 
+                                         pendingUnlink, gen, checkGen, 
+                                         writeGen, lostLock, 
                                          landedAfterTakeover, 
                                          recoveredAfterCrash, tornRead, 
                                          hostCrashChangedLock, 
@@ -2513,7 +2593,8 @@ plain_recovered_done(self) == /\ pc[self] = "plain_recovered_done"
                               /\ UNCHANGED << fs, foreignObj, classified, 
                                               ownerLive, sawLive, seenRec, 
                                               crashed, live, holding, checked, 
-                                              writing, pendingUnlink, exempt, 
+                                              writing, pendingUnlink, gen, 
+                                              checkGen, writeGen, lostLock, 
                                               landedAfterTakeover, 
                                               recoveredAfterCrash, tornRead, 
                                               hostCrashChangedLock, 
@@ -2532,8 +2613,8 @@ plain_acquire(self) == /\ pc[self] = "plain_acquire"
                        /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                        sawLive, seenRec, crashed, live, 
                                        holding, checked, writing, 
-                                       pendingUnlink, exempt, 
-                                       landedAfterTakeover, 
+                                       pendingUnlink, gen, checkGen, writeGen, 
+                                       lostLock, landedAfterTakeover, 
                                        recoveredAfterCrash, tornRead, 
                                        hostCrashChangedLock, touchedUncertain, 
                                        refusedOk, refused, keep, obj_, got, 
@@ -2551,8 +2632,8 @@ plain_publish(self) == /\ pc[self] = "plain_publish"
                        /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                        sawLive, seenRec, crashed, live, 
                                        holding, checked, writing, 
-                                       pendingUnlink, exempt, 
-                                       landedAfterTakeover, 
+                                       pendingUnlink, gen, checkGen, writeGen, 
+                                       lostLock, landedAfterTakeover, 
                                        recoveredAfterCrash, tornRead, 
                                        hostCrashChangedLock, touchedUncertain, 
                                        refusedOk, refused, keep, obj_, got, 
@@ -2564,12 +2645,13 @@ plain_end(self) == /\ pc[self] = "plain_end"
                    /\ pc' = [pc EXCEPT ![self] = "Done"]
                    /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                    sawLive, seenRec, crashed, holding, checked, 
-                                   writing, pendingUnlink, exempt, 
-                                   landedAfterTakeover, recoveredAfterCrash, 
-                                   tornRead, hostCrashChangedLock, 
-                                   touchedUncertain, refusedOk, refused, stack, 
-                                   keep, obj_, got, obj, robj, victim, nobj, 
-                                   tobj, crashes, leases >>
+                                   writing, pendingUnlink, gen, checkGen, 
+                                   writeGen, lostLock, landedAfterTakeover, 
+                                   recoveredAfterCrash, tornRead, 
+                                   hostCrashChangedLock, touchedUncertain, 
+                                   refusedOk, refused, stack, keep, obj_, got, 
+                                   obj, robj, victim, nobj, tobj, crashes, 
+                                   leases >>
 
 plain(self) == plain_start(self) \/ S21_1_decide(self)
                   \/ S21_1_refused(self) \/ plain_recover(self)
@@ -2596,11 +2678,12 @@ rec_start(self) == /\ pc[self] = "rec_start"
                               /\ UNCHANGED refused
                    /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                    sawLive, seenRec, crashed, holding, checked, 
-                                   writing, pendingUnlink, exempt, 
-                                   landedAfterTakeover, recoveredAfterCrash, 
-                                   tornRead, hostCrashChangedLock, 
-                                   touchedUncertain, refusedOk, obj, robj, 
-                                   victim, nobj, tobj, crashes, leases >>
+                                   writing, pendingUnlink, gen, checkGen, 
+                                   writeGen, lostLock, landedAfterTakeover, 
+                                   recoveredAfterCrash, tornRead, 
+                                   hostCrashChangedLock, touchedUncertain, 
+                                   refusedOk, obj, robj, victim, nobj, tobj, 
+                                   crashes, leases >>
 
 rec_decide(self) == /\ pc[self] = "rec_decide"
                     /\ IF crashed[self]
@@ -2621,7 +2704,8 @@ rec_decide(self) == /\ pc[self] = "rec_decide"
                                                      /\ pc' = [pc EXCEPT ![self] = "rec_refused"]
                     /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                     sawLive, seenRec, crashed, live, holding, 
-                                    checked, writing, pendingUnlink, exempt, 
+                                    checked, writing, pendingUnlink, gen, 
+                                    checkGen, writeGen, lostLock, 
                                     landedAfterTakeover, recoveredAfterCrash, 
                                     tornRead, hostCrashChangedLock, 
                                     touchedUncertain, stack, keep, obj_, got, 
@@ -2632,7 +2716,8 @@ rec_refused(self) == /\ pc[self] = "rec_refused"
                      /\ pc' = [pc EXCEPT ![self] = "rec_end"]
                      /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                      sawLive, seenRec, crashed, live, holding, 
-                                     checked, writing, pendingUnlink, exempt, 
+                                     checked, writing, pendingUnlink, gen, 
+                                     checkGen, writeGen, lostLock, 
                                      landedAfterTakeover, recoveredAfterCrash, 
                                      tornRead, hostCrashChangedLock, 
                                      touchedUncertain, refusedOk, refused, 
@@ -2652,7 +2737,8 @@ rec_recover(self) == /\ pc[self] = "rec_recover"
                      /\ pc' = [pc EXCEPT ![self] = "S240_3_s1"]
                      /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                      sawLive, seenRec, crashed, live, holding, 
-                                     checked, writing, pendingUnlink, exempt, 
+                                     checked, writing, pendingUnlink, gen, 
+                                     checkGen, writeGen, lostLock, 
                                      landedAfterTakeover, recoveredAfterCrash, 
                                      tornRead, hostCrashChangedLock, 
                                      touchedUncertain, refusedOk, refused, 
@@ -2669,7 +2755,8 @@ rec_publish(self) == /\ pc[self] = "rec_publish"
                                 /\ stack' = stack
                      /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                      sawLive, seenRec, crashed, live, holding, 
-                                     checked, writing, pendingUnlink, exempt, 
+                                     checked, writing, pendingUnlink, gen, 
+                                     checkGen, writeGen, lostLock, 
                                      landedAfterTakeover, recoveredAfterCrash, 
                                      tornRead, hostCrashChangedLock, 
                                      touchedUncertain, refusedOk, refused, 
@@ -2681,7 +2768,8 @@ rec_publish_done(self) == /\ pc[self] = "rec_publish_done"
                           /\ UNCHANGED << fs, foreignObj, classified, 
                                           ownerLive, sawLive, seenRec, crashed, 
                                           live, holding, checked, writing, 
-                                          pendingUnlink, exempt, 
+                                          pendingUnlink, gen, checkGen, 
+                                          writeGen, lostLock, 
                                           landedAfterTakeover, 
                                           recoveredAfterCrash, tornRead, 
                                           hostCrashChangedLock, 
@@ -2698,7 +2786,8 @@ rec_acquire(self) == /\ pc[self] = "rec_acquire"
                      /\ pc' = [pc EXCEPT ![self] = "S96_1_create"]
                      /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                      sawLive, seenRec, crashed, live, holding, 
-                                     checked, writing, pendingUnlink, exempt, 
+                                     checked, writing, pendingUnlink, gen, 
+                                     checkGen, writeGen, lostLock, 
                                      landedAfterTakeover, recoveredAfterCrash, 
                                      tornRead, hostCrashChangedLock, 
                                      touchedUncertain, refusedOk, refused, 
@@ -2715,7 +2804,8 @@ rec_acquired(self) == /\ pc[self] = "rec_acquired"
                                  /\ stack' = stack
                       /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                       sawLive, seenRec, crashed, live, holding, 
-                                      checked, writing, pendingUnlink, exempt, 
+                                      checked, writing, pendingUnlink, gen, 
+                                      checkGen, writeGen, lostLock, 
                                       landedAfterTakeover, recoveredAfterCrash, 
                                       tornRead, hostCrashChangedLock, 
                                       touchedUncertain, refusedOk, refused, 
@@ -2727,12 +2817,13 @@ rec_end(self) == /\ pc[self] = "rec_end"
                  /\ pc' = [pc EXCEPT ![self] = "Done"]
                  /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                  sawLive, seenRec, crashed, holding, checked, 
-                                 writing, pendingUnlink, exempt, 
-                                 landedAfterTakeover, recoveredAfterCrash, 
-                                 tornRead, hostCrashChangedLock, 
-                                 touchedUncertain, refusedOk, refused, stack, 
-                                 keep, obj_, got, obj, robj, victim, nobj, 
-                                 tobj, crashes, leases >>
+                                 writing, pendingUnlink, gen, checkGen, 
+                                 writeGen, lostLock, landedAfterTakeover, 
+                                 recoveredAfterCrash, tornRead, 
+                                 hostCrashChangedLock, touchedUncertain, 
+                                 refusedOk, refused, stack, keep, obj_, got, 
+                                 obj, robj, victim, nobj, tobj, crashes, 
+                                 leases >>
 
 rec(self) == rec_start(self) \/ rec_decide(self) \/ rec_refused(self)
                 \/ rec_recover(self) \/ rec_publish(self)
@@ -2758,7 +2849,8 @@ clean_start(self) == /\ pc[self] = "clean_start"
                                 /\ UNCHANGED refused
                      /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                      sawLive, seenRec, crashed, holding, 
-                                     checked, writing, pendingUnlink, exempt, 
+                                     checked, writing, pendingUnlink, gen, 
+                                     checkGen, writeGen, lostLock, 
                                      landedAfterTakeover, recoveredAfterCrash, 
                                      tornRead, hostCrashChangedLock, 
                                      touchedUncertain, refusedOk, obj, robj, 
@@ -2783,7 +2875,8 @@ S251_1_classify(self) == /\ pc[self] = "S251_1_classify"
                          /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                          sawLive, seenRec, crashed, live, 
                                          holding, checked, writing, 
-                                         pendingUnlink, exempt, 
+                                         pendingUnlink, gen, checkGen, 
+                                         writeGen, lostLock, 
                                          landedAfterTakeover, 
                                          recoveredAfterCrash, tornRead, 
                                          hostCrashChangedLock, 
@@ -2796,8 +2889,8 @@ clean_refused(self) == /\ pc[self] = "clean_refused"
                        /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                        sawLive, seenRec, crashed, live, 
                                        holding, checked, writing, 
-                                       pendingUnlink, exempt, 
-                                       landedAfterTakeover, 
+                                       pendingUnlink, gen, checkGen, writeGen, 
+                                       lostLock, landedAfterTakeover, 
                                        recoveredAfterCrash, tornRead, 
                                        hostCrashChangedLock, touchedUncertain, 
                                        refusedOk, refused, stack, keep, obj_, 
@@ -2818,8 +2911,8 @@ clean_recover(self) == /\ pc[self] = "clean_recover"
                        /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                        sawLive, seenRec, crashed, live, 
                                        holding, checked, writing, 
-                                       pendingUnlink, exempt, 
-                                       landedAfterTakeover, 
+                                       pendingUnlink, gen, checkGen, writeGen, 
+                                       lostLock, landedAfterTakeover, 
                                        recoveredAfterCrash, tornRead, 
                                        hostCrashChangedLock, touchedUncertain, 
                                        refusedOk, refused, keep, obj_, got, 
@@ -2828,18 +2921,20 @@ clean_recover(self) == /\ pc[self] = "clean_recover"
 S251_1_delete(self) == /\ pc[self] = "S251_1_delete"
                        /\ IF crashed[self]
                              THEN /\ pc' = [pc EXCEPT ![self] = "clean_end"]
-                                  /\ UNCHANGED << fs, holding >>
+                                  /\ UNCHANGED << fs, holding, lostLock >>
                              ELSE /\ IF holding[self]
                                         THEN /\ holding' = [holding EXCEPT ![self] = FALSE]
                                              /\ \E c \in FsUnlinkChoices:
                                                   fs' = FsUnlink(fs, P, LockName, c).fs
+                                             /\ lostLock' = MarkLost(self, LockObj)
                                         ELSE /\ TRUE
-                                             /\ UNCHANGED << fs, holding >>
+                                             /\ UNCHANGED << fs, holding, 
+                                                             lostLock >>
                                   /\ pc' = [pc EXCEPT ![self] = "S251_1_close"]
                        /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                        sawLive, seenRec, crashed, live, 
-                                       checked, writing, pendingUnlink, exempt, 
-                                       landedAfterTakeover, 
+                                       checked, writing, pendingUnlink, gen, 
+                                       checkGen, writeGen, landedAfterTakeover, 
                                        recoveredAfterCrash, tornRead, 
                                        hostCrashChangedLock, touchedUncertain, 
                                        refusedOk, refused, stack, keep, obj_, 
@@ -2857,7 +2952,8 @@ S251_1_close(self) == /\ pc[self] = "S251_1_close"
                                  /\ pc' = [pc EXCEPT ![self] = "clean_end"]
                       /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                       sawLive, seenRec, crashed, live, holding, 
-                                      checked, writing, pendingUnlink, exempt, 
+                                      checked, writing, pendingUnlink, gen, 
+                                      checkGen, writeGen, lostLock, 
                                       landedAfterTakeover, recoveredAfterCrash, 
                                       tornRead, hostCrashChangedLock, 
                                       touchedUncertain, refusedOk, refused, 
@@ -2869,12 +2965,13 @@ clean_end(self) == /\ pc[self] = "clean_end"
                    /\ pc' = [pc EXCEPT ![self] = "Done"]
                    /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                    sawLive, seenRec, crashed, holding, checked, 
-                                   writing, pendingUnlink, exempt, 
-                                   landedAfterTakeover, recoveredAfterCrash, 
-                                   tornRead, hostCrashChangedLock, 
-                                   touchedUncertain, refusedOk, refused, stack, 
-                                   keep, obj_, got, obj, robj, victim, nobj, 
-                                   tobj, crashes, leases >>
+                                   writing, pendingUnlink, gen, checkGen, 
+                                   writeGen, lostLock, landedAfterTakeover, 
+                                   recoveredAfterCrash, tornRead, 
+                                   hostCrashChangedLock, touchedUncertain, 
+                                   refusedOk, refused, stack, keep, obj_, got, 
+                                   obj, robj, victim, nobj, tobj, crashes, 
+                                   leases >>
 
 clean(self) == clean_start(self) \/ S251_1_classify(self)
                   \/ clean_refused(self) \/ clean_recover(self)
@@ -2900,11 +2997,12 @@ brk_start(self) == /\ pc[self] = "brk_start"
                               /\ UNCHANGED refused
                    /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                    sawLive, seenRec, crashed, holding, checked, 
-                                   writing, pendingUnlink, exempt, 
-                                   landedAfterTakeover, recoveredAfterCrash, 
-                                   tornRead, hostCrashChangedLock, 
-                                   touchedUncertain, refusedOk, obj, robj, 
-                                   victim, nobj, tobj, crashes, leases >>
+                                   writing, pendingUnlink, gen, checkGen, 
+                                   writeGen, lostLock, landedAfterTakeover, 
+                                   recoveredAfterCrash, tornRead, 
+                                   hostCrashChangedLock, touchedUncertain, 
+                                   refusedOk, obj, robj, victim, nobj, tobj, 
+                                   crashes, leases >>
 
 S21_1_restart_decide(self) == /\ pc[self] = "S21_1_restart_decide"
                               /\ IF crashed[self]
@@ -2931,7 +3029,8 @@ S21_1_restart_decide(self) == /\ pc[self] = "S21_1_restart_decide"
                               /\ UNCHANGED << fs, foreignObj, classified, 
                                               ownerLive, sawLive, seenRec, 
                                               crashed, live, holding, checked, 
-                                              writing, pendingUnlink, exempt, 
+                                              writing, pendingUnlink, gen, 
+                                              checkGen, writeGen, lostLock, 
                                               landedAfterTakeover, 
                                               recoveredAfterCrash, tornRead, 
                                               hostCrashChangedLock, 
@@ -2943,7 +3042,8 @@ brk_refused(self) == /\ pc[self] = "brk_refused"
                      /\ pc' = [pc EXCEPT ![self] = "brk_end"]
                      /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                      sawLive, seenRec, crashed, live, holding, 
-                                     checked, writing, pendingUnlink, exempt, 
+                                     checked, writing, pendingUnlink, gen, 
+                                     checkGen, writeGen, lostLock, 
                                      landedAfterTakeover, recoveredAfterCrash, 
                                      tornRead, hostCrashChangedLock, 
                                      touchedUncertain, refusedOk, refused, 
@@ -2959,7 +3059,8 @@ brk_takeover(self) == /\ pc[self] = "brk_takeover"
                       /\ pc' = [pc EXCEPT ![self] = "S240_5_s1"]
                       /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                       sawLive, seenRec, crashed, live, holding, 
-                                      checked, writing, pendingUnlink, exempt, 
+                                      checked, writing, pendingUnlink, gen, 
+                                      checkGen, writeGen, lostLock, 
                                       landedAfterTakeover, recoveredAfterCrash, 
                                       tornRead, hostCrashChangedLock, 
                                       touchedUncertain, refusedOk, refused, 
@@ -2971,8 +3072,8 @@ brk_took_over(self) == /\ pc[self] = "brk_took_over"
                        /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                        sawLive, seenRec, crashed, live, 
                                        holding, checked, writing, 
-                                       pendingUnlink, exempt, 
-                                       landedAfterTakeover, 
+                                       pendingUnlink, gen, checkGen, writeGen, 
+                                       lostLock, landedAfterTakeover, 
                                        recoveredAfterCrash, tornRead, 
                                        hostCrashChangedLock, touchedUncertain, 
                                        refusedOk, refused, stack, keep, obj_, 
@@ -2992,7 +3093,8 @@ brk_recover(self) == /\ pc[self] = "brk_recover"
                      /\ pc' = [pc EXCEPT ![self] = "S240_3_s1"]
                      /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                      sawLive, seenRec, crashed, live, holding, 
-                                     checked, writing, pendingUnlink, exempt, 
+                                     checked, writing, pendingUnlink, gen, 
+                                     checkGen, writeGen, lostLock, 
                                      landedAfterTakeover, recoveredAfterCrash, 
                                      tornRead, hostCrashChangedLock, 
                                      touchedUncertain, refusedOk, refused, 
@@ -3005,7 +3107,7 @@ S21_1_s3(self) == /\ pc[self] = "S21_1_s3"
                              /\ UNCHANGED << fs, holding, refusedOk, refused >>
                         ELSE /\ fs' = Relock(self)
                              /\ IF ~StillOwned(self)
-                                   THEN /\ refusedOk' = [refusedOk EXCEPT ![self] = RefusalEvidence(self) \/ LostLock(self)]
+                                   THEN /\ refusedOk' = [refusedOk EXCEPT ![self] = lostLock[self]]
                                         /\ refused' = [refused EXCEPT ![self] = "TARGET_LOCK_BUSY"]
                                         /\ holding' = [holding EXCEPT ![self] = FALSE]
                                         /\ pc' = [pc EXCEPT ![self] = "S21_1_s3_refuse_close"]
@@ -3014,7 +3116,8 @@ S21_1_s3(self) == /\ pc[self] = "S21_1_s3"
                                                         refused >>
                   /\ UNCHANGED << foreignObj, classified, ownerLive, sawLive, 
                                   seenRec, crashed, live, checked, writing, 
-                                  pendingUnlink, exempt, landedAfterTakeover, 
+                                  pendingUnlink, gen, checkGen, writeGen, 
+                                  lostLock, landedAfterTakeover, 
                                   recoveredAfterCrash, tornRead, 
                                   hostCrashChangedLock, touchedUncertain, 
                                   stack, keep, obj_, got, obj, robj, victim, 
@@ -3023,14 +3126,16 @@ S21_1_s3(self) == /\ pc[self] = "S21_1_s3"
 S21_1_s5_write_begin(self) == /\ pc[self] = "S21_1_s5_write_begin"
                               /\ IF crashed[self]
                                     THEN /\ pc' = [pc EXCEPT ![self] = "brk_end"]
-                                         /\ fs' = fs
+                                         /\ UNCHANGED << fs, lostLock >>
                                     ELSE /\ fs' = FsWriteBegin(IF SEED_RESTART_RELEASES THEN FsUnlock(fs, self, HandleObj(self)).fs ELSE fs,
                                                                HandleObj(self)).fs
+                                         /\ lostLock' = MarkLost(self, HandleObj(self))
                                          /\ pc' = [pc EXCEPT ![self] = "S21_1_s5_write_end"]
                               /\ UNCHANGED << foreignObj, classified, 
                                               ownerLive, sawLive, seenRec, 
                                               crashed, live, holding, checked, 
-                                              writing, pendingUnlink, exempt, 
+                                              writing, pendingUnlink, gen, 
+                                              checkGen, writeGen, 
                                               landedAfterTakeover, 
                                               recoveredAfterCrash, tornRead, 
                                               hostCrashChangedLock, 
@@ -3048,7 +3153,8 @@ S21_1_s5_write_end(self) == /\ pc[self] = "S21_1_s5_write_end"
                             /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                             sawLive, seenRec, crashed, live, 
                                             holding, checked, writing, 
-                                            pendingUnlink, exempt, 
+                                            pendingUnlink, gen, checkGen, 
+                                            writeGen, lostLock, 
                                             landedAfterTakeover, 
                                             recoveredAfterCrash, tornRead, 
                                             hostCrashChangedLock, 
@@ -3067,7 +3173,8 @@ brk_publish(self) == /\ pc[self] = "brk_publish"
                                 /\ stack' = stack
                      /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                      sawLive, seenRec, crashed, live, holding, 
-                                     checked, writing, pendingUnlink, exempt, 
+                                     checked, writing, pendingUnlink, gen, 
+                                     checkGen, writeGen, lostLock, 
                                      landedAfterTakeover, recoveredAfterCrash, 
                                      tornRead, hostCrashChangedLock, 
                                      touchedUncertain, refusedOk, refused, 
@@ -3079,7 +3186,8 @@ brk_publish_done(self) == /\ pc[self] = "brk_publish_done"
                           /\ UNCHANGED << fs, foreignObj, classified, 
                                           ownerLive, sawLive, seenRec, crashed, 
                                           live, holding, checked, writing, 
-                                          pendingUnlink, exempt, 
+                                          pendingUnlink, gen, checkGen, 
+                                          writeGen, lostLock, 
                                           landedAfterTakeover, 
                                           recoveredAfterCrash, tornRead, 
                                           hostCrashChangedLock, 
@@ -3096,7 +3204,8 @@ brk_acquire(self) == /\ pc[self] = "brk_acquire"
                      /\ pc' = [pc EXCEPT ![self] = "S96_1_create"]
                      /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                      sawLive, seenRec, crashed, live, holding, 
-                                     checked, writing, pendingUnlink, exempt, 
+                                     checked, writing, pendingUnlink, gen, 
+                                     checkGen, writeGen, lostLock, 
                                      landedAfterTakeover, recoveredAfterCrash, 
                                      tornRead, hostCrashChangedLock, 
                                      touchedUncertain, refusedOk, refused, 
@@ -3113,7 +3222,8 @@ brk_acquired(self) == /\ pc[self] = "brk_acquired"
                                  /\ stack' = stack
                       /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                       sawLive, seenRec, crashed, live, holding, 
-                                      checked, writing, pendingUnlink, exempt, 
+                                      checked, writing, pendingUnlink, gen, 
+                                      checkGen, writeGen, lostLock, 
                                       landedAfterTakeover, recoveredAfterCrash, 
                                       tornRead, hostCrashChangedLock, 
                                       touchedUncertain, refusedOk, refused, 
@@ -3125,7 +3235,8 @@ brk_acquired_done(self) == /\ pc[self] = "brk_acquired_done"
                            /\ UNCHANGED << fs, foreignObj, classified, 
                                            ownerLive, sawLive, seenRec, 
                                            crashed, live, holding, checked, 
-                                           writing, pendingUnlink, exempt, 
+                                           writing, pendingUnlink, gen, 
+                                           checkGen, writeGen, lostLock, 
                                            landedAfterTakeover, 
                                            recoveredAfterCrash, tornRead, 
                                            hostCrashChangedLock, 
@@ -3143,7 +3254,8 @@ S21_1_s3_refuse_close(self) == /\ pc[self] = "S21_1_s3_refuse_close"
                                /\ UNCHANGED << foreignObj, classified, 
                                                ownerLive, sawLive, seenRec, 
                                                crashed, live, holding, checked, 
-                                               writing, pendingUnlink, exempt, 
+                                               writing, pendingUnlink, gen, 
+                                               checkGen, writeGen, lostLock, 
                                                landedAfterTakeover, 
                                                recoveredAfterCrash, tornRead, 
                                                hostCrashChangedLock, 
@@ -3157,12 +3269,13 @@ brk_end(self) == /\ pc[self] = "brk_end"
                  /\ pc' = [pc EXCEPT ![self] = "Done"]
                  /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                  sawLive, seenRec, crashed, holding, checked, 
-                                 writing, pendingUnlink, exempt, 
-                                 landedAfterTakeover, recoveredAfterCrash, 
-                                 tornRead, hostCrashChangedLock, 
-                                 touchedUncertain, refusedOk, refused, stack, 
-                                 keep, obj_, got, obj, robj, victim, nobj, 
-                                 tobj, crashes, leases >>
+                                 writing, pendingUnlink, gen, checkGen, 
+                                 writeGen, lostLock, landedAfterTakeover, 
+                                 recoveredAfterCrash, tornRead, 
+                                 hostCrashChangedLock, touchedUncertain, 
+                                 refusedOk, refused, stack, keep, obj_, got, 
+                                 obj, robj, victim, nobj, tobj, crashes, 
+                                 leases >>
 
 brk(self) == brk_start(self) \/ S21_1_restart_decide(self)
                 \/ brk_refused(self) \/ brk_takeover(self)
@@ -3180,7 +3293,8 @@ env_loop == /\ pc["env"] = "env_loop"
                                   \E land \in BOOLEAN:
                                     \E c \in FsUnlinkChoices:
                                       /\ fs' = FsProcCrash(LandUnlink(fs, IF land THEN p ELSE NoProc, c), p)
-                                      /\ landedAfterTakeover' = (landedAfterTakeover \/ (land /\ writing[p] /\ exempt[p]))
+                                      /\ lostLock' = (IF land /\ pendingUnlink[p] # NoObj /\ LockObj = pendingUnlink[p] THEN MarkLost(p, LockObj) ELSE lostLock)
+                                      /\ landedAfterTakeover' = (landedAfterTakeover \/ (land /\ writing[p] /\ writeGen[p] # gen))
                                       /\ writing' = [writing EXCEPT ![p] = FALSE]
                                       /\ pendingUnlink' = [pendingUnlink EXCEPT ![p] = NoObj]
                                       /\ crashed' = [crashed EXCEPT ![p] = TRUE]
@@ -3203,32 +3317,34 @@ env_loop == /\ pc["env"] = "env_loop"
                              /\ holding' = [q \in Procs |-> IF live[q] THEN FALSE ELSE holding[q]]
                              /\ crashes' = crashes + 1
                              /\ pc' = [pc EXCEPT !["env"] = "env_loop"]
-                             /\ UNCHANGED <<landedAfterTakeover, leases>>
+                             /\ UNCHANGED <<lostLock, landedAfterTakeover, leases>>
                           \/ /\ LockCapability = "remote" /\ leases < MaxLeaseExpiries
                              /\ \E o \in {x \in Objs : fs.oslock[x] # NoProc /\ live[fs.oslock[x]] /\ ~crashed[fs.oslock[x]]}:
+                                  /\ lostLock' = [lostLock EXCEPT ![fs.oslock[o]] = TRUE]
                                   /\ fs' = FsLeaseExpiry(fs, o).fs
                                   /\ leases' = leases + 1
                              /\ pc' = [pc EXCEPT !["env"] = "env_loop"]
                              /\ UNCHANGED <<crashed, holding, checked, writing, pendingUnlink, landedAfterTakeover, hostCrashChangedLock, crashes>>
                           \/ /\ pc' = [pc EXCEPT !["env"] = "env_done"]
-                             /\ UNCHANGED <<fs, crashed, holding, checked, writing, pendingUnlink, landedAfterTakeover, hostCrashChangedLock, crashes, leases>>
+                             /\ UNCHANGED <<fs, crashed, holding, checked, writing, pendingUnlink, lostLock, landedAfterTakeover, hostCrashChangedLock, crashes, leases>>
                   ELSE /\ pc' = [pc EXCEPT !["env"] = "env_done"]
                        /\ UNCHANGED << fs, crashed, holding, checked, writing, 
-                                       pendingUnlink, landedAfterTakeover, 
+                                       pendingUnlink, lostLock, 
+                                       landedAfterTakeover, 
                                        hostCrashChangedLock, crashes, leases >>
             /\ UNCHANGED << foreignObj, classified, ownerLive, sawLive, 
-                            seenRec, live, exempt, recoveredAfterCrash, 
-                            tornRead, touchedUncertain, refusedOk, refused, 
-                            stack, keep, obj_, got, obj, robj, victim, nobj, 
-                            tobj >>
+                            seenRec, live, gen, checkGen, writeGen, 
+                            recoveredAfterCrash, tornRead, touchedUncertain, 
+                            refusedOk, refused, stack, keep, obj_, got, obj, 
+                            robj, victim, nobj, tobj >>
 
 env_done == /\ pc["env"] = "env_done"
             /\ TRUE
             /\ pc' = [pc EXCEPT !["env"] = "Done"]
             /\ UNCHANGED << fs, foreignObj, classified, ownerLive, sawLive, 
                             seenRec, crashed, live, holding, checked, writing, 
-                            pendingUnlink, exempt, landedAfterTakeover, 
-                            recoveredAfterCrash, tornRead, 
+                            pendingUnlink, gen, checkGen, writeGen, lostLock, 
+                            landedAfterTakeover, recoveredAfterCrash, tornRead, 
                             hostCrashChangedLock, touchedUncertain, refusedOk, 
                             refused, stack, keep, obj_, got, obj, robj, victim, 
                             nobj, tobj, crashes, leases >>
@@ -3294,10 +3410,14 @@ FsOk == FsInvariants(fs)
 Classifiable == \A o \in Objs : fs.content[o] = NoContent \/ fs.content[o] \in Contents
 
 \* For a target, at most one process is inside a publishing step whose last Section 99 check passed, or has
-\* a publishing write in flight. The one exception the spec accepts is a prior owner's call issued before a
-\* --break-lock takeover ended its tenure (240.5: "a filesystem call it had already started can still
-\* complete"); only a lapsed lease under LockCapability = remote lets that happen (design Section 7).
-SingleWriter == Cardinality({p \in Procs : (checked[p] \/ writing[p]) /\ ~exempt[p]}) <= 1
+\* a publishing write in flight. Tenure generations (owner ruling for plan 3, 2026-09-15): a new lock tenure -
+\* a create, a recovery or a takeover that stands - starts a generation. As the spec stands, the one exception
+\* is a call already started before a later tenure began (240.5: "a filesystem call it had already started can
+\* still complete"). FIX_REMOTE_LEASE_SPEC models the amendments the open finding calls for: a process whose
+\* check passed in an earlier generation is no longer counted (the check-to-call window, however the lock was
+\* lost), and Section 99's check also tries the lock (Relock).
+Superseded(p) == IF FIX_REMOTE_LEASE_SPEC THEN checkGen[p] # gen ELSE writing[p] /\ writeGen[p] # gen
+SingleWriter == Cardinality({p \in Procs : (checked[p] \/ writing[p]) /\ ~Superseded(p)}) <= 1
 
 \* A process without `--break-lock` never removes, renames, or overwrites a lock it classified as
 \* uncertain, and creates a lock only at an empty lock path (Section 7).
@@ -3312,17 +3432,17 @@ ForeignUntouched == foreignObj # NoObj => LockObj = foreignObj /\ fs.content[for
 \* its recorded owner is alive (240.2): a held OS-native lock cannot tell the owner from another
 \* invocation inspecting or recovering it, so no refusal-time check can establish owner liveness on
 \* that path. What this catches is a refusal with nothing behind it - a decision table that refuses
-\* BUSY for a lock it judged dead, or a Section 99 check (S99_check, S99_release_check, S21_1_s3) refusing
-\* when the lock path is empty or foreign. A failed check at a path that names another invocation's file
-\* is justified: that lock was lost to a takeover, and Section 99 reports TARGET_LOCK_BUSY for it (LostLock,
-\* owner ruling for plan 3); so is one by a process whose held lock file was unlinked from the lock path. The
+\* BUSY for a lock it judged dead, or a Section 99 check (S99_check, S99_release_check, S21_1_s3) refusing with
+\* no cause: such a refusal is justified only by the ghost lostLock, set when another process's write, unlink,
+\* rename or replacement hit the lock file this process holds, or its lease lapsed (owner ruling for plan 3,
+\* 2026-09-15). The other refusing labels record the evidence of RefusalEvidence. The
 \* refusing label records its evidence because the refusal may be reported after what it saw has changed: the
 \* refusal rests on what the classifier observed, not on a re-read.
 RefusalJustified == \A p \in Procs : refused[p] = "TARGET_LOCK_BUSY" => refusedOk[p]
 
 \* The ghost witnesses, for the witness runs.
 NeverTornRead == ~tornRead
-\* A prior owner's write issued before a takeover landed after it (240.5; remote scenarios).
+\* A write issued in an earlier tenure generation landed after a later tenure began (240.5; remote scenarios).
 NeverInflightLandedAfterTakeover == ~landedAfterTakeover
 \* A process passed its Section 99 check, so SingleWriter's ghost is set (design Section 7).
 NeverChecked == \A p \in Procs : ~checked[p]

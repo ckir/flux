@@ -940,6 +940,20 @@ Findings the design already expects, each to be confirmed or refuted by the firs
   one fix flag, renamed `FIX_REMOTE_LEASE_SPEC`, now models both amendments, and a refusal for a lapsed lease counts
   as a lost lock. Measured on the way: 240.5 step 5 can read the Owner's record torn while the Owner still writes it,
   so the exemption names the process holding a handle on the file step 6 overwrites, not the record step 5 read.
+  A Fable review (2026-09-15, checked against the model and CI) then found, and the `-fixed` run of `mixed-remote`
+  on `fbc10af` measured, a third path: a stalled Owner's release unlink lands after a lease-lapse takeover of the
+  same file and deletes the Breaker's lock by name, and a fresh acquirer then checks alongside the Breaker. Owner
+  ruling: accepted as the remote window, through tenure generations, which replace the `exempt` ghost. A create,
+  a recovery or a takeover that stands starts a generation; as the spec stands only a call already issued in an
+  earlier generation is uncounted, and under the fix flag so is every process whose check passed in an earlier
+  generation. The Section 99 lock test is modelled as an implementation can make it (owner ruling, challenge
+  accepted): a relock attempt without waiting on the held handle, made only when the record read is this
+  operation's, so a process that already lost its file never takes its lock back. Unverified: whether a
+  lease-lost NFSv4 lock can be re-taken on the same descriptor, and Windows, where `LockFileEx` on an already
+  held range fails, so held-by-self and held-by-another look alike (the remote runs are POSIX only). The same
+  review showed `RefusalJustified` had become a restatement of the check at the three Section 99 sites; owner
+  ruling: a cause ghost, `lostLock`, set when another process's write, unlink, rename or replacement hits a
+  process's lock file or its lease lapses, is now the only justification a failed Section 99 check has.
 - An acquirer between 96.1's exclusive create and taking its OS-native lock holds an unlocked, empty lock file, which
   a classifier judges uncertain. A Breaker can take it over (240.5 steps 3-6), and the acquirer, failing to take
   its own lock, then removes "the lock it created" by name (96.1), which is now the Breaker's. No crash or
