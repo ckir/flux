@@ -943,10 +943,11 @@ Findings the design already expects, each to be confirmed or refuted by the firs
   A Fable review (2026-09-15, checked against the model and CI) then found, and the `-fixed` run of `mixed-remote`
   on `fbc10af` measured, a third path: a stalled Owner's release unlink lands after a lease-lapse takeover of the
   same file and deletes the Breaker's lock by name, and a fresh acquirer then checks alongside the Breaker. Owner
-  ruling: accepted as the remote window, through tenure generations, which replace the `exempt` ghost. A create,
-  a recovery or a takeover that stands starts a generation; as the spec stands only a call already issued in an
-  earlier generation is uncounted, and under the fix flag so is every process whose check passed in an earlier
-  generation. The Section 99 lock test is modelled as an implementation can make it (owner ruling, challenge
+  ruling: accepted as the remote window, through tenure staleness, which replaces the `exempt` ghost. A create,
+  a recovery or a takeover that stands makes every other process's last check and issued write stale; as the spec stands only a call already issued in an
+  earlier tenure is uncounted, and under the fix flag so is every process whose check a later tenure has made
+  stale. Two booleans, not a counter: a counter's absolute value splits otherwise equal states, and it cost
+  `breaklock-posix-liveness` 4595s against its 90 minute limit (measured 2026-09-16, CI 35028045352). The Section 99 lock test is modelled as an implementation can make it (owner ruling, challenge
   accepted): a relock attempt without waiting on the held handle, made only when the record read is this
   operation's, so a process that already lost its file never takes its lock back. Unverified: whether a
   lease-lost NFSv4 lock can be re-taken on the same descriptor, and Windows, where `LockFileEx` on an already

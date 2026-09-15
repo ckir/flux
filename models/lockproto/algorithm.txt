@@ -27,9 +27,8 @@
        checked = [p \in Procs |-> FALSE],         \* its last Section 99 check passed
        writing = [p \in Procs |-> FALSE],         \* its publishing write is issued and has not landed (Section 5.2)
        pendingUnlink = [p \in Procs |-> NoObj],   \* the lock file its issued release unlink resolved, not yet landed
-       gen = 0,                                   \* tenure generation: a new lock tenure (create, recovery, takeover) starts one
-       checkGen = [p \in Procs |-> 0],            \* the generation its last passing Section 99 check saw
-       writeGen = [p \in Procs |-> 0],            \* the generation its in-flight publishing write was issued in
+       checkStale = [p \in Procs |-> TRUE],       \* a lock tenure began after its last passing Section 99 check
+       writeStale = [p \in Procs |-> TRUE],       \* a lock tenure began after it issued its publishing write
        lostLock = [p \in Procs |-> FALSE],        \* ghost: another process's write, unlink, rename or a lease lapse hit its lock file
        landedAfterTakeover = FALSE,               \* witness: a write issued in an earlier generation landed
        recoveredAfterCrash = FALSE,               \* witness: a lock left by a crash was replaced
@@ -233,7 +232,9 @@
            lostLock := MarkLost(self, obj);
            seenRec[self] := OwnRecord(self);
            holding[self] := TRUE;
-           gen := gen + 1;
+           \* A new tenure: every other process's last check and issued write are stale from here (design Section 7).
+           checkStale := [q \in Procs |-> IF q = self THEN checkStale[q] ELSE TRUE];
+           writeStale := [q \in Procs |-> IF q = self THEN writeStale[q] ELSE TRUE];
            return;
          };
        S96_1_backoff:
@@ -353,7 +354,9 @@
            lostLock := MarkLost(self, nobj);
            seenRec[self] := OwnRecord(self);
            holding[self] := TRUE;
-           gen := gen + 1;
+           \* A new tenure: every other process's last check and issued write are stale from here (design Section 7).
+           checkStale := [q \in Procs |-> IF q = self THEN checkStale[q] ELSE TRUE];
+           writeStale := [q \in Procs |-> IF q = self THEN writeStale[q] ELSE TRUE];
          };
        S240_3_s5:
          \* Delete the moved file (step 5).
@@ -536,9 +539,10 @@
                goto S240_5_close;
              }
              else {
-               \* The takeover stands: a new tenure generation starts, which ends the prior owner's (design Section 7).
+               \* The takeover stands: it ends the prior owner's tenure (design Section 7).
                holding[self] := TRUE;
-               gen := gen + 1;
+               checkStale := [q \in Procs |-> IF q = self THEN checkStale[q] ELSE TRUE];
+               writeStale := [q \in Procs |-> IF q = self THEN writeStale[q] ELSE TRUE];
                return;
              };
          };
@@ -565,7 +569,8 @@
                fs := FsClose(r.fs, self, tobj).fs;
                lostLock := MarkLost(self, LockObj);
                holding[self] := TRUE;
-               gen := gen + 1;
+               checkStale := [q \in Procs |-> IF q = self THEN checkStale[q] ELSE TRUE];
+               writeStale := [q \in Procs |-> IF q = self THEN writeStale[q] ELSE TRUE];
                return;
              }
              else { refused[self] := "RESTART"; goto S240_5_close; };
@@ -589,7 +594,7 @@
          if (crashed[self]) { goto publish_crashed; }
          else {
            fs := Relock(self);
-           if (StillOwned(self)) { checked[self] := TRUE; checkGen[self] := gen; }
+           if (StillOwned(self)) { checked[self] := TRUE; checkStale[self] := FALSE; }
            else {
              checked[self] := FALSE;
              refusedOk[self] := lostLock[self];
@@ -606,15 +611,18 @@
          if (crashed[self]) { goto publish_crashed; }
          else {
            writing[self] := TRUE;
-           writeGen[self] := gen;
+           writeStale[self] := FALSE;
          };
        S240_5_inflight_lands:
          \* The issued write completes (Section 5.2). A takeover can land in between, and "a filesystem call it had
          \* already started can still complete" (240.5).
          if (crashed[self]) { goto publish_crashed; }
          else {
-           if (writeGen[self] # gen) { landedAfterTakeover := TRUE; };
+           if (writeStale[self]) { landedAfterTakeover := TRUE; };
            writing[self] := FALSE;
+           \* Neither flag is read again until the next check or write sets it, so both go back to their initial
+           \* value: a state that differs only in them is the same state.
+           writeStale[self] := TRUE;
          };
        S99_release_check:
          \* Section 99 lists unlink among the calls it guards, so the release is revalidated too (a reading
@@ -622,6 +630,7 @@
          if (crashed[self]) { goto publish_crashed; }
          else {
            checked[self] := FALSE;
+           checkStale[self] := TRUE;
            fs := Relock(self);
            if (~StillOwned(self)) {
              refusedOk[self] := lostLock[self];
@@ -664,6 +673,7 @@
          };
        publish_crashed:
          checked[self] := FALSE;
+         checkStale[self] := TRUE;
          return;
      }
 
@@ -938,13 +948,15 @@
                \* Its in-flight calls land or are dropped at the crash itself (design Section 5.2).
                fs := FsProcCrash(LandUnlink(fs, IF land THEN p ELSE NoProc, c), p);
                lostLock := IF land /\ pendingUnlink[p] # NoObj /\ LockObj = pendingUnlink[p] THEN MarkLost(p, LockObj) ELSE lostLock;
-               landedAfterTakeover := landedAfterTakeover \/ (land /\ writing[p] /\ writeGen[p] # gen);
+               landedAfterTakeover := landedAfterTakeover \/ (land /\ writing[p] /\ writeStale[p]);
                writing[p] := FALSE;
                pendingUnlink[p] := NoObj;
                crashed[p] := TRUE;
                \* It loses its in-memory state (Section 5.2): it is no longer inside a publishing
                \* step and no longer owns anything, whatever its lock file still says.
                checked[p] := FALSE;
+               checkStale[p] := TRUE;
+               writeStale[p] := TRUE;
                holding[p] := FALSE;
                crashes := crashes + 1;
              };
@@ -968,6 +980,8 @@
              writing := [q \in Procs |-> IF live[q] THEN FALSE ELSE writing[q]];
              pendingUnlink := [q \in Procs |-> IF live[q] THEN NoObj ELSE pendingUnlink[q]];
              checked := [q \in Procs |-> IF live[q] THEN FALSE ELSE checked[q]];
+             checkStale := [q \in Procs |-> IF live[q] THEN TRUE ELSE checkStale[q]];
+             writeStale := [q \in Procs |-> IF live[q] THEN TRUE ELSE writeStale[q]];
              holding := [q \in Procs |-> IF live[q] THEN FALSE ELSE holding[q]];
              crashes := crashes + 1;
            }
