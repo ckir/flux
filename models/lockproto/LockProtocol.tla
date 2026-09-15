@@ -105,7 +105,11 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
                        ELSE NoObj
        \* The evidence a TARGET_LOCK_BUSY refusal rests on, recorded by every refusing label through this
        \* one definition, so SEED_DEAD_AS_BUSY guards all of them (design Section 7, RefusalJustified).
-       RefusalEvidence(p) == BusyJustified \/ sawLive[p]
+       \* 240.2 defines TARGET_LOCK_BUSY as "the lock is held", so another process holding the OS-native lock
+       \* on the file at the lock path is evidence too (owner ruling for plan 3: a takeover writing in place
+       \* holds it while the record it replaces is torn).
+       HeldByOther(p) == LockObj # NoObj /\ fs.oslock[LockObj] \notin {NoProc, p}
+       RefusalEvidence(p) == BusyJustified \/ sawLive[p] \/ HeldByOther(p)
        \* The actor's judgement was uncertain: a torn or empty record, or an owner the oracle cannot judge.
        JudgedUncertain(p) == classified[p] = "uncertain" \/ ownerLive[p] = "uncertain"
        \* A lock this actor may replace through 240.3: a dead owner's operation lock, or a cleanup
@@ -939,8 +943,8 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "c477966b" /\ chksum(tla) = "9dbe5e21")
-\* Procedure variable obj of procedure Classify at line 130 col 18 changed to obj_
+\* BEGIN TRANSLATION (chksum(pcal) = "9c9e337" /\ chksum(tla) = "43fd1335")
+\* Procedure variable obj of procedure Classify at line 134 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
           live, holding, checked, recoveredAfterCrash, tornRead, 
@@ -968,7 +972,11 @@ HandleObj(p) == IF \E h \in fs.handles : h.proc = p
                 ELSE NoObj
 
 
-RefusalEvidence(p) == BusyJustified \/ sawLive[p]
+
+
+
+HeldByOther(p) == LockObj # NoObj /\ fs.oslock[LockObj] \notin {NoProc, p}
+RefusalEvidence(p) == BusyJustified \/ sawLive[p] \/ HeldByOther(p)
 
 JudgedUncertain(p) == classified[p] = "uncertain" \/ ownerLive[p] = "uncertain"
 

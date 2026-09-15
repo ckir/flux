@@ -49,7 +49,11 @@
                        ELSE NoObj
        \* The evidence a TARGET_LOCK_BUSY refusal rests on, recorded by every refusing label through this
        \* one definition, so SEED_DEAD_AS_BUSY guards all of them (design Section 7, RefusalJustified).
-       RefusalEvidence(p) == BusyJustified \/ sawLive[p]
+       \* 240.2 defines TARGET_LOCK_BUSY as "the lock is held", so another process holding the OS-native lock
+       \* on the file at the lock path is evidence too (owner ruling for plan 3: a takeover writing in place
+       \* holds it while the record it replaces is torn).
+       HeldByOther(p) == LockObj # NoObj /\ fs.oslock[LockObj] \notin {NoProc, p}
+       RefusalEvidence(p) == BusyJustified \/ sawLive[p] \/ HeldByOther(p)
        \* The actor's judgement was uncertain: a torn or empty record, or an owner the oracle cannot judge.
        JudgedUncertain(p) == classified[p] = "uncertain" \/ ownerLive[p] = "uncertain"
        \* A lock this actor may replace through 240.3: a dead owner's operation lock, or a cleanup
