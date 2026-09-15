@@ -90,10 +90,16 @@ UncertainLock == LockObj # NoObj /\ fs.content[LockObj] \in {Torn, EmptyFile}
 \* A Breaker has not started yet and has not been killed, so it will still classify the lock.
 PendingBreaker == \E p \in Breakers : ~crashed[p] /\ pc[p] = "brk_start"
 
+\* A Breaker was refused because the lock was held (240.5 step 3 or later). RefusalJustified guards that
+\* the refusal had its evidence, so this outcome cannot hide a refusal with nothing behind it.
+BreakerReportedBusy == \E p \in Breakers : refused[p] = "TARGET_LOCK_BUSY"
+
 \* The same promise for an uncertain lock (design Section 7): while nothing more can go wrong and a
-\* Breaker has yet to run, an uncertain lock does not stay.
+\* Breaker has yet to run, an uncertain lock does not stay, or a Breaker was refused because something
+\* held it. Measured (plan 3): the last Breaker can meet a backing-off acquirer holding the torn lock for
+\* a few steps; the lock then stays until the next --break-lock, which the owner accepted.
 UncertainLockEventuallyCleared ==
-    [](UncertainLock /\ EnvQuiet /\ PendingBreaker => <>~UncertainLock)
+    [](UncertainLock /\ EnvQuiet /\ PendingBreaker => <>(~UncertainLock \/ BreakerReportedBusy))
 
 \* Its antecedent's witness, which keeps the liveness run from passing vacuously.
 NeverUncertainLockWithPendingBreaker == ~(UncertainLock /\ EnvQuiet /\ PendingBreaker)

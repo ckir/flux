@@ -649,7 +649,11 @@ run's reachable states (measured: identical counts before and after it was added
   Section 240.4 preserves rather than clears - provided no further crash can occur (`EnvQuiet`) and a Recoverer or
   Cleanup has yet to run (`PendingMover`).
 - `UncertainLockEventuallyCleared`: the same for an uncertain owner's lock, conditioned the same way on a Breaker or
-  CleanupBreaker that has yet to run (only an operator action clears it, Section 240.4). Plan 3 measures it in `mixed`,
+  CleanupBreaker that has yet to run (only an operator action clears it, Section 240.4); its outcome is that the lock
+  is cleared or a Breaker was refused `TARGET_LOCK_BUSY`. Measured in `breaklock` (8,684,871 states, 2026-09-15): the
+  last Breaker can arrive while a backing-off acquirer holds the torn lock for a few steps, refuse honestly, and leave
+  the lock to the next `--break-lock`. The owner accepted it, as plan 2 accepted the stranded dead lock above, and the
+  refusal counts as an outcome because `RefusalJustified` guards that it had its evidence. Plan 3 measures it in `mixed`,
   and in `breaklock` if a three-actor configuration without symmetry fits its limit, and narrows its witness to that
   antecedent (`NeverUncertainLockWithPendingBreaker`). The state witnesses `NeverDeadOwnerLock` and `NeverTornLock`
   that plan 2 defined are used by no run and are removed in plan 3.
