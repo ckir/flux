@@ -40,8 +40,9 @@ ForeignUntouched == foreignObj # NoObj => LockObj = foreignObj /\ fs.content[for
 \* BUSY for a lock it judged dead, or a Section 99 check (S99_check, S99_release_check, S21_1_s3) refusing
 \* when the lock path is empty or foreign. A failed check at a path that names another invocation's file
 \* is justified: that lock was lost to a takeover, and Section 99 reports TARGET_LOCK_BUSY for it (LostLock,
-\* owner ruling for plan 3). The refusing label records its evidence because the refusal may be reported after
-\* what it saw has changed: the refusal rests on what the classifier observed, not on a re-read.
+\* owner ruling for plan 3); so is one by a process whose held lock file was unlinked from the lock path. The
+\* refusing label records its evidence because the refusal may be reported after what it saw has changed: the
+\* refusal rests on what the classifier observed, not on a re-read.
 RefusalJustified == \A p \in Procs : refused[p] = "TARGET_LOCK_BUSY" => refusedOk[p]
 
 \* The ghost witnesses, for the witness runs.

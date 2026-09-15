@@ -68,8 +68,12 @@
        RefusalEvidence(p) == BusyJustified \/ sawLive[p] \/ HeldByOther(p)
        \* A failed Section 99 ownership check has a lost lock behind it: the lock path names a file that is not
        \* Foreign and no longer holds this operation's record, because another invocation took it over
-       \* (owner ruling for plan 3, 2026-09-15). A refusal at an empty or Foreign lock path still has none.
-       LostLock(p) == LockObj # NoObj /\ fs.content[LockObj] # Foreign /\ fs.content[LockObj] # OwnRecord(p)
+       \* (owner ruling for plan 3, 2026-09-15); or the lock file this process still holds a handle on is no longer
+       \* the one the lock path names, because another invocation's unlink removed it (owner ruling, 2026-09-15:
+       \* a stalled owner's in-flight release unlink landing after a takeover). A refusal at an empty or Foreign
+       \* lock path by a process holding no lock file there still has none.
+       LostLock(p) == \/ LockObj # NoObj /\ fs.content[LockObj] # Foreign /\ fs.content[LockObj] # OwnRecord(p)
+                      \/ HandleObj(p) # NoObj /\ HandleObj(p) # LockObj
        \* The actor's judgement was uncertain: a torn or empty record, or an owner the oracle cannot judge.
        JudgedUncertain(p) == classified[p] = "uncertain" \/ ownerLive[p] = "uncertain"
        \* A lock this actor may replace through 240.3: a dead owner's operation lock, or a cleanup
@@ -490,7 +494,11 @@
            seenRec[self] := OwnRecord(self);
            \* The prior owner's tenure ends with this write (design Section 7): a call it had already issued may
            \* still complete, which SingleWriter excepts; one it issues later is the check-to-call window.
-           if (tvictim \in Procs) { exempt[tvictim] := writing[tvictim]; };
+           \* FIX_ACCEPT_CHECK_TO_CALL_WINDOW models the spec statement the open finding calls for: a prior owner whose
+           \* Section 99 check passed before this takeover may still issue that call (design Section 11).
+           if (tvictim \in Procs) {
+             exempt[tvictim] := writing[tvictim] \/ (FIX_ACCEPT_CHECK_TO_CALL_WINDOW /\ checked[tvictim]);
+           };
          };
        S240_5_s6_flush:
          if (crashed[self]) { goto takeover_crashed; }

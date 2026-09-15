@@ -30,7 +30,8 @@ CONSTANTS
     SEED_MOVE_ASIDE_FOR_UNCERTAIN,
     SEED_RENAME_OVER_TAKEOVER,
     SEED_NO_CAPABILITY_GATE,
-    SEED_TORN_AS_FOREIGN
+    SEED_TORN_AS_FOREIGN,
+    FIX_ACCEPT_CHECK_TO_CALL_WINDOW  \* fix flag of the open finding on SingleWriter (design Section 11)
 
 Procs == Owners \cup Recoverers \cup PlainRuns \cup Cleanups \cup Breakers
 \* <lock-name>.broken.<operation-id> beside the lock (240.3 step 2). Only an actor that can move a
@@ -125,8 +126,12 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
        RefusalEvidence(p) == BusyJustified \/ sawLive[p] \/ HeldByOther(p)
        \* A failed Section 99 ownership check has a lost lock behind it: the lock path names a file that is not
        \* Foreign and no longer holds this operation's record, because another invocation took it over
-       \* (owner ruling for plan 3, 2026-09-15). A refusal at an empty or Foreign lock path still has none.
-       LostLock(p) == LockObj # NoObj /\ fs.content[LockObj] # Foreign /\ fs.content[LockObj] # OwnRecord(p)
+       \* (owner ruling for plan 3, 2026-09-15); or the lock file this process still holds a handle on is no longer
+       \* the one the lock path names, because another invocation's unlink removed it (owner ruling, 2026-09-15:
+       \* a stalled owner's in-flight release unlink landing after a takeover). A refusal at an empty or Foreign
+       \* lock path by a process holding no lock file there still has none.
+       LostLock(p) == \/ LockObj # NoObj /\ fs.content[LockObj] # Foreign /\ fs.content[LockObj] # OwnRecord(p)
+                      \/ HandleObj(p) # NoObj /\ HandleObj(p) # LockObj
        \* The actor's judgement was uncertain: a torn or empty record, or an owner the oracle cannot judge.
        JudgedUncertain(p) == classified[p] = "uncertain" \/ ownerLive[p] = "uncertain"
        \* A lock this actor may replace through 240.3: a dead owner's operation lock, or a cleanup
@@ -547,7 +552,11 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
            seenRec[self] := OwnRecord(self);
            \* The prior owner's tenure ends with this write (design Section 7): a call it had already issued may
            \* still complete, which SingleWriter excepts; one it issues later is the check-to-call window.
-           if (tvictim \in Procs) { exempt[tvictim] := writing[tvictim]; };
+           \* FIX_ACCEPT_CHECK_TO_CALL_WINDOW models the spec statement the open finding calls for: a prior owner whose
+           \* Section 99 check passed before this takeover may still issue that call (design Section 11).
+           if (tvictim \in Procs) {
+             exempt[tvictim] := writing[tvictim] \/ (FIX_ACCEPT_CHECK_TO_CALL_WINDOW /\ checked[tvictim]);
+           };
          };
        S240_5_s6_flush:
          if (crashed[self]) { goto takeover_crashed; }
@@ -1000,8 +1009,8 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "74466d32" /\ chksum(tla) = "9e8a6c6")
-\* Procedure variable obj of procedure Classify at line 151 col 18 changed to obj_
+\* BEGIN TRANSLATION (chksum(pcal) = "da675d1e" /\ chksum(tla) = "a9b20a3b")
+\* Procedure variable obj of procedure Classify at line 156 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
           live, holding, checked, writing, pendingUnlink, exempt, 
@@ -1042,7 +1051,11 @@ RefusalEvidence(p) == BusyJustified \/ sawLive[p] \/ HeldByOther(p)
 
 
 
-LostLock(p) == LockObj # NoObj /\ fs.content[LockObj] # Foreign /\ fs.content[LockObj] # OwnRecord(p)
+
+
+
+LostLock(p) == \/ LockObj # NoObj /\ fs.content[LockObj] # Foreign /\ fs.content[LockObj] # OwnRecord(p)
+               \/ HandleObj(p) # NoObj /\ HandleObj(p) # LockObj
 
 JudgedUncertain(p) == classified[p] = "uncertain" \/ ownerLive[p] = "uncertain"
 
@@ -1967,7 +1980,7 @@ S240_5_s6_write_end(self) == /\ pc[self] = "S240_5_s6_write_end"
                                    ELSE /\ fs' = FsWriteEnd(fs, tobj[self], OwnRecord(self)).fs
                                         /\ seenRec' = [seenRec EXCEPT ![self] = OwnRecord(self)]
                                         /\ IF tvictim[self] \in Procs
-                                              THEN /\ exempt' = [exempt EXCEPT ![tvictim[self]] = writing[tvictim[self]]]
+                                              THEN /\ exempt' = [exempt EXCEPT ![tvictim[self]] = writing[tvictim[self]] \/ (FIX_ACCEPT_CHECK_TO_CALL_WINDOW /\ checked[tvictim[self]])]
                                               ELSE /\ TRUE
                                                    /\ UNCHANGED exempt
                                         /\ pc' = [pc EXCEPT ![self] = "S240_5_s6_flush"]
@@ -3307,8 +3320,9 @@ ForeignUntouched == foreignObj # NoObj => LockObj = foreignObj /\ fs.content[for
 \* BUSY for a lock it judged dead, or a Section 99 check (S99_check, S99_release_check, S21_1_s3) refusing
 \* when the lock path is empty or foreign. A failed check at a path that names another invocation's file
 \* is justified: that lock was lost to a takeover, and Section 99 reports TARGET_LOCK_BUSY for it (LostLock,
-\* owner ruling for plan 3). The refusing label records its evidence because the refusal may be reported after
-\* what it saw has changed: the refusal rests on what the classifier observed, not on a re-read.
+\* owner ruling for plan 3); so is one by a process whose held lock file was unlinked from the lock path. The
+\* refusing label records its evidence because the refusal may be reported after what it saw has changed: the
+\* refusal rests on what the classifier observed, not on a re-read.
 RefusalJustified == \A p \in Procs : refused[p] = "TARGET_LOCK_BUSY" => refusedOk[p]
 
 \* The ghost witnesses, for the witness runs.
