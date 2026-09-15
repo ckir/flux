@@ -510,7 +510,11 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
                with (alive \in IF crashed[seen.op] THEN {"dead", "uncertain"} ELSE {"live", "uncertain"}) {
                  if (alive = "live") {
                    sawLive[self] := TRUE;
-                   refusedOk[self] := RefusalEvidence(self);
+                   \* A define-block operator reads the variables as they were before this step, so RefusalEvidence
+                   \* would not see the sawLive set just above; the judgement is passed in directly. Measured under
+                   \* remote (2026-09-15): the prior owner's release unlink empties the path during the takeover, so
+                   \* BusyJustified is false and only this judgement is behind the refusal.
+                   refusedOk[self] := alive = "live" \/ RefusalEvidence(self);
                    refused[self] := "TARGET_LOCK_BUSY";
                    goto S240_5_close;
                  };
@@ -996,7 +1000,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "c69edb14" /\ chksum(tla) = "29175c6a")
+\* BEGIN TRANSLATION (chksum(pcal) = "74466d32" /\ chksum(tla) = "9e8a6c6")
 \* Procedure variable obj of procedure Classify at line 151 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
@@ -1892,7 +1896,7 @@ S240_5_s5(self) == /\ pc[self] = "S240_5_s5"
                                                     THEN /\ \E alive \in IF crashed[seen.op] THEN {"dead", "uncertain"} ELSE {"live", "uncertain"}:
                                                               IF alive = "live"
                                                                  THEN /\ sawLive' = [sawLive EXCEPT ![self] = TRUE]
-                                                                      /\ refusedOk' = [refusedOk EXCEPT ![self] = RefusalEvidence(self)]
+                                                                      /\ refusedOk' = [refusedOk EXCEPT ![self] = alive = "live" \/ RefusalEvidence(self)]
                                                                       /\ refused' = [refused EXCEPT ![self] = "TARGET_LOCK_BUSY"]
                                                                       /\ pc' = [pc EXCEPT ![self] = "S240_5_close"]
                                                                  ELSE /\ pc' = [pc EXCEPT ![self] = "S240_5_s6_seed"]

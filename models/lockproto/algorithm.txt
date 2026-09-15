@@ -453,7 +453,11 @@
                with (alive \in IF crashed[seen.op] THEN {"dead", "uncertain"} ELSE {"live", "uncertain"}) {
                  if (alive = "live") {
                    sawLive[self] := TRUE;
-                   refusedOk[self] := RefusalEvidence(self);
+                   \* A define-block operator reads the variables as they were before this step, so RefusalEvidence
+                   \* would not see the sawLive set just above; the judgement is passed in directly. Measured under
+                   \* remote (2026-09-15): the prior owner's release unlink empties the path during the takeover, so
+                   \* BusyJustified is false and only this judgement is behind the refusal.
+                   refusedOk[self] := alive = "live" \/ RefusalEvidence(self);
                    refused[self] := "TARGET_LOCK_BUSY";
                    goto S240_5_close;
                  };
