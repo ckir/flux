@@ -50,10 +50,6 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
 
 Promoted from the local anomalies inbox (triage of 2026-09-14); each was re-measured on `origin/main` that day.
 
-- [ ] **`build:` commits vanish from the changelog.** `cliff.toml` sets `filter_unconventional = true` and has
-      parsers for `feat fix docs perf refactor test ci chore` only, while `CONTRIBUTING.md` lists `build` as an
-      allowed type, so `build: ...` is silently omitted from `CHANGELOG.md`. Add a `^build` parser or drop the type.
-      Check: commit `build: x`, run `git-cliff --unreleased`, confirm the entry.
 - [ ] **No MSRV job.** Every `ci.yml` job uses the stable toolchain and Dependabot auto-merges cargo minor and
       patch bumps, so a dependency raising its MSRV past the workspace's `rust-version` (1.85) is not caught.
       Add a job running `cargo +1.85 check --workspace --all-targets`.

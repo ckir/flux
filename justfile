@@ -61,10 +61,6 @@ doc:
 hooks:
     lefthook install
 
-# Generate the changelog
-changelog:
-    git-cliff --output CHANGELOG.md
-
 # --- Lock-protocol model check (docs/superpowers/specs/2026-09-11-lock-protocol-model-check-design.md)
 # Needs Java 11+ and Python 3.11+; not part of `just check`. See models/lockproto/README.md.
 
@@ -91,8 +87,3 @@ mutants:
 # Clean build artifacts
 clean:
     cargo clean
-
-# Release: bump every crate in lockstep, tag, commit
-# Usage: just release <patch|minor|major>
-release VERSION_BUMP:
-    cargo release {{VERSION_BUMP}} --workspace --execute
