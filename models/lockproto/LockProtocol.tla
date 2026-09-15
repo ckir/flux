@@ -123,6 +123,10 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
        \* holds it while the record it replaces is torn).
        HeldByOther(p) == LockObj # NoObj /\ fs.oslock[LockObj] \notin {NoProc, p}
        RefusalEvidence(p) == BusyJustified \/ sawLive[p] \/ HeldByOther(p)
+       \* A failed Section 99 ownership check has a lost lock behind it: the lock path names a file that is not
+       \* Foreign and no longer holds this operation's record, because another invocation took it over
+       \* (owner ruling for plan 3, 2026-09-15). A refusal at an empty or Foreign lock path still has none.
+       LostLock(p) == LockObj # NoObj /\ fs.content[LockObj] # Foreign /\ fs.content[LockObj] # OwnRecord(p)
        \* The actor's judgement was uncertain: a torn or empty record, or an owner the oracle cannot judge.
        JudgedUncertain(p) == classified[p] = "uncertain" \/ ownerLive[p] = "uncertain"
        \* A lock this actor may replace through 240.3: a dead owner's operation lock, or a cleanup
@@ -605,7 +609,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
            if (StillOwned(self)) { checked[self] := TRUE; }
            else {
              checked[self] := FALSE;
-             refusedOk[self] := RefusalEvidence(self);
+             refusedOk[self] := RefusalEvidence(self) \/ LostLock(self);
              refused[self] := "TARGET_LOCK_BUSY";
              holding[self] := FALSE;
              goto S99_refuse_close;
@@ -635,7 +639,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          else {
            checked[self] := FALSE;
            if (~StillOwned(self)) {
-             refusedOk[self] := RefusalEvidence(self);
+             refusedOk[self] := RefusalEvidence(self) \/ LostLock(self);
              refused[self] := "TARGET_LOCK_BUSY";
              holding[self] := FALSE;
              goto S99_refuse_close;
@@ -884,7 +888,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          if (crashed[self] \/ ~holding[self]) { goto brk_end; }
          else {
            if (~StillOwned(self)) {
-             refusedOk[self] := RefusalEvidence(self);
+             refusedOk[self] := RefusalEvidence(self) \/ LostLock(self);
              refused[self] := "TARGET_LOCK_BUSY";
              holding[self] := FALSE;
              goto S21_1_s3_refuse_close;
@@ -992,8 +996,8 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "50cbc321" /\ chksum(tla) = "3c9a854")
-\* Procedure variable obj of procedure Classify at line 147 col 18 changed to obj_
+\* BEGIN TRANSLATION (chksum(pcal) = "c69edb14" /\ chksum(tla) = "29175c6a")
+\* Procedure variable obj of procedure Classify at line 151 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
           live, holding, checked, writing, pendingUnlink, exempt, 
@@ -1031,6 +1035,10 @@ HandleObj(p) == IF \E h \in fs.handles : h.proc = p
 
 HeldByOther(p) == LockObj # NoObj /\ fs.oslock[LockObj] \notin {NoProc, p}
 RefusalEvidence(p) == BusyJustified \/ sawLive[p] \/ HeldByOther(p)
+
+
+
+LostLock(p) == LockObj # NoObj /\ fs.content[LockObj] # Foreign /\ fs.content[LockObj] # OwnRecord(p)
 
 JudgedUncertain(p) == classified[p] = "uncertain" \/ ownerLive[p] = "uncertain"
 
@@ -2150,7 +2158,7 @@ S99_check(self) == /\ pc[self] = "S99_check"
                                          /\ UNCHANGED << holding, refusedOk, 
                                                          refused >>
                                     ELSE /\ checked' = [checked EXCEPT ![self] = FALSE]
-                                         /\ refusedOk' = [refusedOk EXCEPT ![self] = RefusalEvidence(self)]
+                                         /\ refusedOk' = [refusedOk EXCEPT ![self] = RefusalEvidence(self) \/ LostLock(self)]
                                          /\ refused' = [refused EXCEPT ![self] = "TARGET_LOCK_BUSY"]
                                          /\ holding' = [holding EXCEPT ![self] = FALSE]
                                          /\ pc' = [pc EXCEPT ![self] = "S99_refuse_close"]
@@ -2206,7 +2214,7 @@ S99_release_check(self) == /\ pc[self] = "S99_release_check"
                                                       refusedOk, refused >>
                                  ELSE /\ checked' = [checked EXCEPT ![self] = FALSE]
                                       /\ IF ~StillOwned(self)
-                                            THEN /\ refusedOk' = [refusedOk EXCEPT ![self] = RefusalEvidence(self)]
+                                            THEN /\ refusedOk' = [refusedOk EXCEPT ![self] = RefusalEvidence(self) \/ LostLock(self)]
                                                  /\ refused' = [refused EXCEPT ![self] = "TARGET_LOCK_BUSY"]
                                                  /\ holding' = [holding EXCEPT ![self] = FALSE]
                                                  /\ pc' = [pc EXCEPT ![self] = "S99_refuse_close"]
@@ -2983,7 +2991,7 @@ S21_1_s3(self) == /\ pc[self] = "S21_1_s3"
                         THEN /\ pc' = [pc EXCEPT ![self] = "brk_end"]
                              /\ UNCHANGED << holding, refusedOk, refused >>
                         ELSE /\ IF ~StillOwned(self)
-                                   THEN /\ refusedOk' = [refusedOk EXCEPT ![self] = RefusalEvidence(self)]
+                                   THEN /\ refusedOk' = [refusedOk EXCEPT ![self] = RefusalEvidence(self) \/ LostLock(self)]
                                         /\ refused' = [refused EXCEPT ![self] = "TARGET_LOCK_BUSY"]
                                         /\ holding' = [holding EXCEPT ![self] = FALSE]
                                         /\ pc' = [pc EXCEPT ![self] = "S21_1_s3_refuse_close"]
@@ -3292,9 +3300,11 @@ ForeignUntouched == foreignObj # NoObj => LockObj = foreignObj /\ fs.content[for
 \* its recorded owner is alive (240.2): a held OS-native lock cannot tell the owner from another
 \* invocation inspecting or recovering it, so no refusal-time check can establish owner liveness on
 \* that path. What this catches is a refusal with nothing behind it - a decision table that refuses
-\* BUSY for a lock it judged dead, or a publisher refusing it at S99_check when the lock path is empty
-\* or foreign. The refusing label records its evidence because the refusal may be reported after what
-\* it saw has changed: the refusal rests on what the classifier observed, not on a re-read.
+\* BUSY for a lock it judged dead, or a Section 99 check (S99_check, S99_release_check, S21_1_s3) refusing
+\* when the lock path is empty or foreign. A failed check at a path that names another invocation's file
+\* is justified: that lock was lost to a takeover, and Section 99 reports TARGET_LOCK_BUSY for it (LostLock,
+\* owner ruling for plan 3). The refusing label records its evidence because the refusal may be reported after
+\* what it saw has changed: the refusal rests on what the classifier observed, not on a re-read.
 RefusalJustified == \A p \in Procs : refused[p] = "TARGET_LOCK_BUSY" => refusedOk[p]
 
 \* The ghost witnesses, for the witness runs.

@@ -66,6 +66,10 @@
        \* holds it while the record it replaces is torn).
        HeldByOther(p) == LockObj # NoObj /\ fs.oslock[LockObj] \notin {NoProc, p}
        RefusalEvidence(p) == BusyJustified \/ sawLive[p] \/ HeldByOther(p)
+       \* A failed Section 99 ownership check has a lost lock behind it: the lock path names a file that is not
+       \* Foreign and no longer holds this operation's record, because another invocation took it over
+       \* (owner ruling for plan 3, 2026-09-15). A refusal at an empty or Foreign lock path still has none.
+       LostLock(p) == LockObj # NoObj /\ fs.content[LockObj] # Foreign /\ fs.content[LockObj] # OwnRecord(p)
        \* The actor's judgement was uncertain: a torn or empty record, or an owner the oracle cannot judge.
        JudgedUncertain(p) == classified[p] = "uncertain" \/ ownerLive[p] = "uncertain"
        \* A lock this actor may replace through 240.3: a dead owner's operation lock, or a cleanup
@@ -548,7 +552,7 @@
            if (StillOwned(self)) { checked[self] := TRUE; }
            else {
              checked[self] := FALSE;
-             refusedOk[self] := RefusalEvidence(self);
+             refusedOk[self] := RefusalEvidence(self) \/ LostLock(self);
              refused[self] := "TARGET_LOCK_BUSY";
              holding[self] := FALSE;
              goto S99_refuse_close;
@@ -578,7 +582,7 @@
          else {
            checked[self] := FALSE;
            if (~StillOwned(self)) {
-             refusedOk[self] := RefusalEvidence(self);
+             refusedOk[self] := RefusalEvidence(self) \/ LostLock(self);
              refused[self] := "TARGET_LOCK_BUSY";
              holding[self] := FALSE;
              goto S99_refuse_close;
@@ -827,7 +831,7 @@
          if (crashed[self] \/ ~holding[self]) { goto brk_end; }
          else {
            if (~StillOwned(self)) {
-             refusedOk[self] := RefusalEvidence(self);
+             refusedOk[self] := RefusalEvidence(self) \/ LostLock(self);
              refused[self] := "TARGET_LOCK_BUSY";
              holding[self] := FALSE;
              goto S21_1_s3_refuse_close;
