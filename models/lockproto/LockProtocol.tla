@@ -962,8 +962,8 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
              with (lander \in {NoProc} \cup {q \in Procs : live[q]}, c \in FsUnlinkChoices) {
                with (pick \in HostCrashPicks(LandUnlink(fs, lander, c)), dirs \in HostCrashDirs) {
                  \* An unflushed create, move-aside or removal at the lock path undone (Section 11).
-                 hostCrashChangedLock := hostCrashChangedLock
-                     \/ At(FsHostCrash(LandUnlink(fs, lander, c), pick, dirs), P, LockName) # At(LandUnlink(fs, lander, c), P, LockName);
+                 \* One line: a disjunct continued on the next line would split the translated action (TLC error 2109).
+                 hostCrashChangedLock := (hostCrashChangedLock \/ At(FsHostCrash(LandUnlink(fs, lander, c), pick, dirs), P, LockName) # At(LandUnlink(fs, lander, c), P, LockName));
                  fs := FsHostCrash(LandUnlink(fs, lander, c), pick, dirs);
                };
              };
@@ -992,7 +992,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "3df17c98" /\ chksum(tla) = "54f673c")
+\* BEGIN TRANSLATION (chksum(pcal) = "50cbc321" /\ chksum(tla) = "3c9a854")
 \* Procedure variable obj of procedure Classify at line 147 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
@@ -3174,8 +3174,7 @@ env_loop == /\ pc["env"] = "env_loop"
                                   \E c \in FsUnlinkChoices:
                                     \E pick \in HostCrashPicks(LandUnlink(fs, lander, c)):
                                       \E dirs \in HostCrashDirs:
-                                        /\ hostCrashChangedLock' =                     hostCrashChangedLock
-                                                                   \/ At(FsHostCrash(LandUnlink(fs, lander, c), pick, dirs), P, LockName) # At(LandUnlink(fs, lander, c), P, LockName)
+                                        /\ hostCrashChangedLock' = (hostCrashChangedLock \/ At(FsHostCrash(LandUnlink(fs, lander, c), pick, dirs), P, LockName) # At(LandUnlink(fs, lander, c), P, LockName))
                                         /\ fs' = FsHostCrash(LandUnlink(fs, lander, c), pick, dirs)
                              /\ crashed' = [q \in Procs |-> IF live[q] THEN TRUE ELSE crashed[q]]
                              /\ writing' = [q \in Procs |-> IF live[q] THEN FALSE ELSE writing[q]]
