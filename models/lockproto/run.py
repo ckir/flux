@@ -382,6 +382,11 @@ def load_expected(path: Path) -> Expected:
     _require(len(set(names)) == len(names), f"duplicate run names: {sorted({n for n in names if names.count(n) > 1})}")
     for s in scenarios:
         _require(any(r.scenario == s for r in runs), f"scenario {s!r} has no runs")
+    # NOTE this guard reads DECLARED open_findings, and the two scenarios that actually carry an open
+    # finding - breaklock-remote and mixed-remote, on SingleWriter - do not declare one: their check runs
+    # cannot, because TLC dies building the traces, so the finding is carried by a witness/-fixed pair of
+    # hand-written configs instead. The guard is therefore inert for exactly the scenarios it is for. That
+    # bites nothing today (neither has a seeded run) and would, the moment one is added.
     for run in runs:
         if run.kind == "seeded":
             open_names = {f.name for r in runs if r.scenario == run.scenario for f in r.open_findings}
