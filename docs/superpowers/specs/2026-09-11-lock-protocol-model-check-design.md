@@ -487,6 +487,44 @@ The lock protocol's actors flush only where the spec tells them to (the record w
 spec states no directory flush after creating, moving aside, or removing a lock file, so a host crash may undo any of
 those entry operations, and the model explores what the next invocation then finds (Section 11).
 
+### 5.3 What the model borrows from the platform
+
+Every row of Section 5.1 and every rule of Section 5.2 is a claim about somebody else's software. TLC checks the
+protocol against the filesystem described here, not against the one the code will run on, so a wrong claim buys a
+green run and nothing else. Three were found in plan 3, all after the rulings that rested on them, and **all three
+were optimistic - each made the protocol look safer than it is.** That direction is not a coincidence: an assumption
+is invented at the moment it is needed, and the convenient reading is the one that comes to mind. So the table is
+kept, and a claim that favours the protocol is the one to check first.
+
+Each borrowed behaviour is one row: what the model assumes, where that comes from, and whether it is verified. A
+row with no citation is not a small debt - it is a result waiting to be withdrawn.
+
+| Behaviour the model assumes | Source | State |
+|---|---|---|
+| `rename` replacing an existing target is atomic to a reader: never a mixture, never a gap | [RFC 7530](https://datatracker.ietf.org/doc/html/rfc7530) | verified |
+| An in-flight `unlink` removes whatever holds the name when the server runs it, not the file the path named when the call was issued | [RFC 7530](https://datatracker.ietf.org/doc/html/rfc7530) (`REMOVE` carries the directory handle and the name) | verified; **the model is still optimistic here** - `LandUnlink` resolves at issue time (Section 11) |
+| A lock lost to an expired lease is not reclaimed; I/O through that descriptor fails with `EIO` until it is closed, and re-locking the same descriptor does not clear it | [fcntl_locking(2)](https://man7.org/linux/man-pages/man2/fcntl_locking.2.html); kernel `NFS_LOCK_LOST` | verified; **`FIX_REMOTE_LEASE_SPEC`'s relock test contradicts it** (Section 11) |
+| `recover_lost_locks=1` restores the pre-3.12 reclaim and risks corruption, so it is not the deployment the model describes | [kernel parameters](https://www.kernel.org/doc/Documentation/admin-guide/kernel-parameters.txt) | verified |
+| A process cannot ask whether it still holds its own lock | [LockFileEx](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex) (Windows); `F_GETLK` reports only other processes' locks | verified |
+| On SMB3 a durable handle whose oplock or lease break cannot be delivered is closed by the server, and the reconnect fails | [MS-SMB2](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/2a09fc40-1615-42df-bda6-2865b8d6da95) | verified; the Linux `EIO` rule must not be reused for SMB3 |
+| No primitive makes a publication conditional on still holding a lock, and there is no directory-entry compare-and-swap | POSIX `rename`, `renameat2` (`RENAME_NOREPLACE` tests existence only), NFSv4 `RENAME`, SMB3 | verified |
+| A failed `rename` on NFS proves the rename did not happen | - | **unverified**; a retransmission answered from the server's duplicate-request cache may contradict it. Probe before any publication rule depends on it |
+
+Three rules keep the table honest:
+
+1. **A source is primary.** A specification, a manual page, kernel source, or a probe of Section 10. Another
+   model's answer, however fluent, is a lead to check, never a source; the round of 2026-09-16 was useful
+   precisely because every claim it produced was then read in the documentation it named.
+2. **An unverified row names its probe**, or it is not an assumption but a guess.
+3. **A row that favours the protocol is checked first.** Of the three errors found in plan 3, every one made
+   the protocol look safer, and each had already been built on by the time it surfaced.
+
+And a rule about what the table cannot save: **when a third exception is accepted to the same invariant, the
+invariant is the problem.** Two accepted windows is a protocol with caveats; three is a sign the property being
+defended is a proxy for the one that matters. Section 11 records where that happened here, and the note of
+2026-09-16 records what modelling the destination instead produced.
+
+
 ## 6. Actors
 
 ### 6.1 `LockProtocol.tla`
