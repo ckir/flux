@@ -82,6 +82,13 @@ trace for any path, re-run that configuration with the witness as an invariant a
 
 ## Bounds
 
+**These bounds are the `recovery` scenario's, not the suite's.** Every pairing in the table below is a
+`recovery-*` run, and the statements under it - `MaxCrashes`, `IdentityStrength`, `LockCapability` - hold
+for those runs only. The `breaklock`, `mixed`, `breaklock-remote` and `mixed-remote` scenarios added by
+plans 2 and 3 use different bounds (`MaxCrashes = 1` and `LockCapability = "remote"` among them); their
+pairings, state counts and the reasoning behind each bound live in the plan documents under
+`docs/superpowers/plans/`.
+
 Each configuration's bounds, and what they still let it explore (design Section 4). The state counts are TLC's and
 do not depend on the machine. Wall-clock figures are CI ranges from two samples each, on GitHub-hosted runners whose
 hardware is not controlled (design Section 12). A POSIX check run takes 43-65s, a Windows one 45-92s, and the

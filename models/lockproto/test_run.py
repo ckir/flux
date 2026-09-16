@@ -1878,5 +1878,41 @@ class MainUnionRoutingTests(unittest.TestCase):
         self.assertIn("not judged for a single scenario", out.getvalue())
 
 
+class GeneratedModuleTests(unittest.TestCase):
+    """LockProtocol.tla is generated (README.md): `cat LockProtocol.head algorithm.txt invariants.txt`,
+    then `pcal.trans`, which INSERTS a translation block after the algorithm's closing `*)`. Nothing in
+    the justfile, the workflows or these tests re-derived it, so a source edited without re-running the
+    translator left CI checking a model the sources no longer described, silently (capstone, plan 3).
+
+    This catches that case with no Java: everything OUTSIDE the inserted block must still be exactly the
+    three sources concatenated. It does NOT catch a hand-edited translation block - only a real
+    `pcal.trans` run can, and that needs the jar, so it belongs in CI rather than here.
+    """
+
+    BEGIN = "\\* BEGIN TRANSLATION"
+    END = "\\* END TRANSLATION"
+
+    def test_generated_module_matches_its_sources(self) -> None:
+        d = Path(__file__).resolve().parent
+        sources = "".join((d / name).read_text(encoding="utf-8")
+                          for name in ("LockProtocol.head", "algorithm.txt", "invariants.txt"))
+        generated = (d / "LockProtocol.tla").read_text(encoding="utf-8")
+
+        lines = generated.splitlines(keepends=True)
+        starts = [i for i, ln in enumerate(lines) if ln.startswith(self.BEGIN)]
+        ends = [i for i, ln in enumerate(lines) if ln.startswith(self.END)]
+        self.assertEqual(len(starts), 1, "expected exactly one BEGIN TRANSLATION marker")
+        self.assertEqual(len(ends), 1, "expected exactly one END TRANSLATION marker")
+        self.assertLess(starts[0], ends[0], "END TRANSLATION precedes BEGIN TRANSLATION")
+
+        without_translation = "".join(lines[:starts[0]] + lines[ends[0] + 1:])
+        self.assertEqual(
+            without_translation, sources,
+            "LockProtocol.tla no longer matches LockProtocol.head + algorithm.txt + invariants.txt. "
+            "Re-run the translator: cat the three sources into LockProtocol.tla, then "
+            "`java -cp target/tla/tla2tools.jar pcal.trans LockProtocol.tla` (and delete the "
+            "LockProtocol.cfg it writes beside it).")
+
+
 if __name__ == "__main__":
     unittest.main()

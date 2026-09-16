@@ -661,8 +661,10 @@
              fs := LandUnlink(fs, self, c);
            };
            \* After the fs assignment ON PURPOSE: `LockObj` is a define-block operator, so it denotes the
-           \* PRE-step `fs` wherever it is written - unlike a direct `fs.` read, which sees the assignment
-           \* above (the lease-expiry branch below depends on that opposite rule). This names the lock as it
+           \* PRE-step `fs` wherever it is written - unlike a direct textual `fs` read, which sees the
+           \* assignment above: `S240_5_seed_write_begin` is the witness, the one site the translator emits
+           \* as `At(fs', ...)`. (The lease-expiry branch AVOIDS the rule by ordering, it does not show it.)
+           \* This names the lock as it
            \* stood before the unlink landed, which is the holder to mark lost.
            lostLock := IF pendingUnlink[self] # NoObj /\ LockObj # NoObj THEN MarkLost(self, LockObj) ELSE lostLock;
            pendingUnlink[self] := NoObj;
@@ -965,8 +967,9 @@
                \* Its own ghost goes back to FALSE: a crashed process never refuses again, so any other value is
                \* dead state that splits states which are otherwise the same.
                \* `LockObj` is a define-block operator: it denotes the PRE-step `fs`, not the one assigned two
-               \* lines up, so this is the lock as it stood before the crash's unlink landed. A direct `fs.`
-               \* read would see the assignment instead (the lease-expiry branch below relies on that).
+               \* lines up, so this is the lock as it stood before the crash's unlink landed. A direct textual
+               \* `fs` read would see the assignment instead - `S240_5_seed_write_begin` is the witness for
+               \* that half, the one site the translator emits as `At(fs', ...)`.
                lostLock := [ (IF land /\ pendingUnlink[p] # NoObj /\ LockObj # NoObj
                               THEN MarkLost(p, LockObj) ELSE lostLock) EXCEPT ![p] = FALSE ];
                landedAfterTakeover := landedAfterTakeover \/ (land /\ writing[p] /\ writeStale[p]);
