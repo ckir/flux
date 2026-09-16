@@ -116,9 +116,11 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
 
      define {
        LockObj == At(fs, P, LockName)
-       \* `f` after process q's issued release unlink lands (Section 5.2): it removes the name only while the lock
-       \* path still names the file the call resolved. q = NoProc lands nothing.
-       LandUnlink(f, q, c) == IF q # NoProc /\ pendingUnlink[q] # NoObj /\ At(f, P, LockName) = pendingUnlink[q]
+       \* `f` after process q's issued release unlink lands. NFS REMOVE carries the directory handle and the NAME
+       \* (RFC 7530), and the server resolves that name when it executes the call, so a stale unlink removes
+       \* whatever holds the name THEN - including a lock another operation created meanwhile. The optimistic
+       \* reading, where the call resolves the path when it is issued, is what LockProtocol.tla assumes.
+       LandUnlink(f, q, c) == IF q # NoProc /\ pendingUnlink[q] # NoObj /\ At(f, P, LockName) # NoObj
                               THEN FsUnlink(f, P, LockName, c).fs ELSE f
        OwnRecord(p) == Rec(p, IF p \in Cleanups THEN "cleanup" ELSE "operation")
        \* The object of the one lock-file handle a process holds, or NoObj. A holder of the target lock
@@ -130,6 +132,12 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
        \* comparison (a record is descriptive, 99.1) and no OS-native lock (a lease can lapse unheard), so nothing
        \* here depends on a value another process can forge or on a lock this process cannot query.
        StillOwned(p) == LockObj # NoObj /\ HandleObj(p) = LockObj
+       \* Linux NFSv4 (since 3.12) does not reclaim a lock lost to an expired lease, and read/write through that
+       \* descriptor then fail with EIO until it is closed (fcntl_locking(2); the module parameter
+       \* recover_lost_locks, which re-enables reclaim, is documented as risking corruption). So a write through
+       \* a descriptor whose lock this process no longer holds FAILS here, rather than silently landing. It says
+       \* nothing about a rename, which is a directory operation and is not fenced this way.
+       WriteFenced(p, o) == LockCapability = "remote" /\ o # NoObj /\ fs.oslock[o] # p
        \* The destination, and what it holds.
        TargetObj == At(fs, P, TargetName)
        TargetContent == IF TargetObj = NoObj THEN NoContent ELSE fs.content[TargetObj]
@@ -288,23 +296,41 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
        S96_1_record_begin:
          if (crashed[self]) { goto acquire_crashed; }
          else {
-           fs := FsWriteBegin(fs, obj).fs;
-           lostLock := MarkLost(self, obj);
+           \* The lease lapsed under this write: the descriptor is poisoned and the write fails (EIO).
+           if (WriteFenced(self, obj)) {
+             refused[self] := "TARGET_LOCK_BUSY";
+             refusedOk[self] := lostLock[self];
+             holding[self] := FALSE;
+             goto S96_1_ownlock_close;
+           }
+           else {
+             fs := FsWriteBegin(fs, obj).fs;
+             lostLock := MarkLost(self, obj);
+           };
          };
        S96_1_record_end:
          \* A crash between the two halves of the write leaves the record torn (Section 5.2), which
          \* is what the `NeverTornRead` witness run is about.
          if (crashed[self]) { goto acquire_crashed; }
          else {
-           fs := FsWriteEnd(fs, obj, OwnRecord(self)).fs;
-           \* Either half of a write can hit a file another process took meanwhile, so both mark it.
-           lostLock := MarkLost(self, obj);
-           seenRec[self] := OwnRecord(self);
-           holding[self] := TRUE;
-           \* A new tenure: every other process's last check and issued write are stale from here (design Section 7).
-           checkStale := [q \in Procs |-> IF q = self THEN checkStale[q] ELSE TRUE];
-           writeStale := [q \in Procs |-> IF q = self THEN writeStale[q] ELSE TRUE];
-           return;
+           \* The lease lapsed under this write: the descriptor is poisoned and the write fails (EIO).
+           if (WriteFenced(self, obj)) {
+             refused[self] := "TARGET_LOCK_BUSY";
+             refusedOk[self] := lostLock[self];
+             holding[self] := FALSE;
+             goto S96_1_ownlock_close;
+           }
+           else {
+             fs := FsWriteEnd(fs, obj, OwnRecord(self)).fs;
+             \* Either half of a write can hit a file another process took meanwhile, so both mark it.
+             lostLock := MarkLost(self, obj);
+             seenRec[self] := OwnRecord(self);
+             holding[self] := TRUE;
+             \* A new tenure: every other process's last check and issued write are stale from here (design Section 7).
+             checkStale := [q \in Procs |-> IF q = self THEN checkStale[q] ELSE TRUE];
+             writeStale := [q \in Procs |-> IF q = self THEN writeStale[q] ELSE TRUE];
+             return;
+           };
          };
        S96_1_backoff:
          \* On a conflict the acquirer removes what it created and reports TARGET_LOCK_BUSY (96.1).
@@ -758,7 +784,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
            with (c \in FsUnlinkChoices) {
              fs := LandUnlink(fs, self, c);
            };
-           lostLock := IF pendingUnlink[self] # NoObj /\ LockObj = pendingUnlink[self] THEN MarkLost(self, LockObj) ELSE lostLock;
+           lostLock := IF pendingUnlink[self] # NoObj /\ LockObj # NoObj THEN MarkLost(self, LockObj) ELSE lostLock;
            pendingUnlink[self] := NoObj;
          };
        S99_close:
@@ -1002,10 +1028,19 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          \* handle that holds it, not through a second lookup of the path (a reading, recorded in trace.toml).
          if (crashed[self]) { goto brk_end; }
          else {
-           \* SEED_RESTART_RELEASES (design Section 8) releases the OS-native lock here first.
-           fs := FsWriteBegin(IF SEED_RESTART_RELEASES THEN FsUnlock(fs, self, HandleObj(self)).fs ELSE fs,
-                              HandleObj(self)).fs;
-           lostLock := MarkLost(self, HandleObj(self));
+           \* The lease lapsed under this write: the descriptor is poisoned and the write fails (EIO).
+           if (WriteFenced(self, HandleObj(self))) {
+             refused[self] := "TARGET_LOCK_BUSY";
+             refusedOk[self] := lostLock[self];
+             holding[self] := FALSE;
+             goto S21_1_s3_refuse_close;
+           }
+           else {
+             \* SEED_RESTART_RELEASES (design Section 8) releases the OS-native lock here first.
+             fs := FsWriteBegin(IF SEED_RESTART_RELEASES THEN FsUnlock(fs, self, HandleObj(self)).fs ELSE fs,
+                                HandleObj(self)).fs;
+             lostLock := MarkLost(self, HandleObj(self));
+           };
          };
        S21_1_s5_write_end:
          if (crashed[self]) { goto brk_end; }
@@ -1051,7 +1086,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
              with (p \in {q \in Procs : live[q] /\ ~crashed[q]}, land \in BOOLEAN, c \in FsUnlinkChoices) {
                \* Its in-flight calls land or are dropped at the crash itself (design Section 5.2).
                fs := FsProcCrash(LandUnlink(fs, IF land THEN p ELSE NoProc, c), p);
-               lostLock := IF land /\ pendingUnlink[p] # NoObj /\ LockObj = pendingUnlink[p] THEN MarkLost(p, LockObj) ELSE lostLock;
+               lostLock := IF land /\ pendingUnlink[p] # NoObj /\ LockObj # NoObj THEN MarkLost(p, LockObj) ELSE lostLock;
                landedAfterTakeover := landedAfterTakeover \/ (land /\ writing[p] /\ writeStale[p]);
                writing[p] := FALSE;
                pendingUnlink[p] := NoObj;
@@ -1108,8 +1143,8 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "6a09a06b" /\ chksum(tla) = "f271ee6f")
-\* Procedure variable obj of procedure Classify at line 179 col 18 changed to obj_
+\* BEGIN TRANSLATION (chksum(pcal) = "b889abad" /\ chksum(tla) = "6dd14a3e")
+\* Procedure variable obj of procedure Classify at line 187 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
           live, holding, checked, writing, pendingUnlink, checkStale, 
@@ -1121,7 +1156,9 @@ VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed,
 LockObj == At(fs, P, LockName)
 
 
-LandUnlink(f, q, c) == IF q # NoProc /\ pendingUnlink[q] # NoObj /\ At(f, P, LockName) = pendingUnlink[q]
+
+
+LandUnlink(f, q, c) == IF q # NoProc /\ pendingUnlink[q] # NoObj /\ At(f, P, LockName) # NoObj
                        THEN FsUnlink(f, P, LockName, c).fs ELSE f
 OwnRecord(p) == Rec(p, IF p \in Cleanups THEN "cleanup" ELSE "operation")
 
@@ -1133,6 +1170,12 @@ HandleObj(p) == IF \E h \in fs.handles : h.proc = p
 
 
 StillOwned(p) == LockObj # NoObj /\ HandleObj(p) = LockObj
+
+
+
+
+
+WriteFenced(p, o) == LockCapability = "remote" /\ o # NoObj /\ fs.oslock[o] # p
 
 TargetObj == At(fs, P, TargetName)
 TargetContent == IF TargetObj = NoObj THEN NoContent ELSE fs.content[TargetObj]
@@ -1461,47 +1504,68 @@ S96_1_ownlock_verify(self) == /\ pc[self] = "S96_1_ownlock_verify"
 S96_1_record_begin(self) == /\ pc[self] = "S96_1_record_begin"
                             /\ IF crashed[self]
                                   THEN /\ pc' = [pc EXCEPT ![self] = "acquire_crashed"]
-                                       /\ UNCHANGED << fs, lostLock >>
-                                  ELSE /\ fs' = FsWriteBegin(fs, obj[self]).fs
-                                       /\ lostLock' = MarkLost(self, obj[self])
-                                       /\ pc' = [pc EXCEPT ![self] = "S96_1_record_end"]
+                                       /\ UNCHANGED << fs, holding, lostLock, 
+                                                       refusedOk, refused >>
+                                  ELSE /\ IF WriteFenced(self, obj[self])
+                                             THEN /\ refused' = [refused EXCEPT ![self] = "TARGET_LOCK_BUSY"]
+                                                  /\ refusedOk' = [refusedOk EXCEPT ![self] = lostLock[self]]
+                                                  /\ holding' = [holding EXCEPT ![self] = FALSE]
+                                                  /\ pc' = [pc EXCEPT ![self] = "S96_1_ownlock_close"]
+                                                  /\ UNCHANGED << fs, lostLock >>
+                                             ELSE /\ fs' = FsWriteBegin(fs, obj[self]).fs
+                                                  /\ lostLock' = MarkLost(self, obj[self])
+                                                  /\ pc' = [pc EXCEPT ![self] = "S96_1_record_end"]
+                                                  /\ UNCHANGED << holding, 
+                                                                  refusedOk, 
+                                                                  refused >>
                             /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                             sawLive, seenRec, crashed, live, 
-                                            holding, checked, writing, 
-                                            pendingUnlink, checkStale, 
-                                            writeStale, landedAfterTakeover, 
-                                            published, verified, 
-                                            recoveredAfterCrash, tornRead, 
-                                            hostCrashChangedLock, 
-                                            touchedUncertain, refusedOk, 
-                                            refused, stack, keep, obj_, got, 
-                                            obj, robj, victim, nobj, tobj, 
-                                            crashes, leases >>
+                                            checked, writing, pendingUnlink, 
+                                            checkStale, writeStale, 
+                                            landedAfterTakeover, published, 
+                                            verified, recoveredAfterCrash, 
+                                            tornRead, hostCrashChangedLock, 
+                                            touchedUncertain, stack, keep, 
+                                            obj_, got, obj, robj, victim, nobj, 
+                                            tobj, crashes, leases >>
 
 S96_1_record_end(self) == /\ pc[self] = "S96_1_record_end"
                           /\ IF crashed[self]
                                 THEN /\ pc' = [pc EXCEPT ![self] = "acquire_crashed"]
                                      /\ UNCHANGED << fs, seenRec, holding, 
                                                      checkStale, writeStale, 
-                                                     lostLock, stack, obj >>
-                                ELSE /\ fs' = FsWriteEnd(fs, obj[self], OwnRecord(self)).fs
-                                     /\ lostLock' = MarkLost(self, obj[self])
-                                     /\ seenRec' = [seenRec EXCEPT ![self] = OwnRecord(self)]
-                                     /\ holding' = [holding EXCEPT ![self] = TRUE]
-                                     /\ checkStale' = [q \in Procs |-> IF q = self THEN checkStale[q] ELSE TRUE]
-                                     /\ writeStale' = [q \in Procs |-> IF q = self THEN writeStale[q] ELSE TRUE]
-                                     /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
-                                     /\ obj' = [obj EXCEPT ![self] = Head(stack[self]).obj]
-                                     /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
+                                                     lostLock, refusedOk, 
+                                                     refused, stack, obj >>
+                                ELSE /\ IF WriteFenced(self, obj[self])
+                                           THEN /\ refused' = [refused EXCEPT ![self] = "TARGET_LOCK_BUSY"]
+                                                /\ refusedOk' = [refusedOk EXCEPT ![self] = lostLock[self]]
+                                                /\ holding' = [holding EXCEPT ![self] = FALSE]
+                                                /\ pc' = [pc EXCEPT ![self] = "S96_1_ownlock_close"]
+                                                /\ UNCHANGED << fs, seenRec, 
+                                                                checkStale, 
+                                                                writeStale, 
+                                                                lostLock, 
+                                                                stack, obj >>
+                                           ELSE /\ fs' = FsWriteEnd(fs, obj[self], OwnRecord(self)).fs
+                                                /\ lostLock' = MarkLost(self, obj[self])
+                                                /\ seenRec' = [seenRec EXCEPT ![self] = OwnRecord(self)]
+                                                /\ holding' = [holding EXCEPT ![self] = TRUE]
+                                                /\ checkStale' = [q \in Procs |-> IF q = self THEN checkStale[q] ELSE TRUE]
+                                                /\ writeStale' = [q \in Procs |-> IF q = self THEN writeStale[q] ELSE TRUE]
+                                                /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
+                                                /\ obj' = [obj EXCEPT ![self] = Head(stack[self]).obj]
+                                                /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
+                                                /\ UNCHANGED << refusedOk, 
+                                                                refused >>
                           /\ UNCHANGED << foreignObj, classified, ownerLive, 
                                           sawLive, crashed, live, checked, 
                                           writing, pendingUnlink, 
                                           landedAfterTakeover, published, 
                                           verified, recoveredAfterCrash, 
                                           tornRead, hostCrashChangedLock, 
-                                          touchedUncertain, refusedOk, refused, 
-                                          keep, obj_, got, robj, victim, nobj, 
-                                          tobj, crashes, leases >>
+                                          touchedUncertain, keep, obj_, got, 
+                                          robj, victim, nobj, tobj, crashes, 
+                                          leases >>
 
 S96_1_backoff(self) == /\ pc[self] = "S96_1_backoff"
                        /\ IF crashed[self]
@@ -2551,7 +2615,7 @@ S99_release_lands(self) == /\ pc[self] = "S99_release_lands"
                                                       lostLock >>
                                  ELSE /\ \E c \in FsUnlinkChoices:
                                            fs' = LandUnlink(fs, self, c)
-                                      /\ lostLock' = (IF pendingUnlink[self] # NoObj /\ LockObj = pendingUnlink[self] THEN MarkLost(self, LockObj) ELSE lostLock)
+                                      /\ lostLock' = (IF pendingUnlink[self] # NoObj /\ LockObj # NoObj THEN MarkLost(self, LockObj) ELSE lostLock)
                                       /\ pendingUnlink' = [pendingUnlink EXCEPT ![self] = NoObj]
                                       /\ pc' = [pc EXCEPT ![self] = "S99_close"]
                            /\ UNCHANGED << foreignObj, classified, ownerLive, 
@@ -3345,23 +3409,33 @@ S21_1_s3(self) == /\ pc[self] = "S21_1_s3"
 S21_1_s5_write_begin(self) == /\ pc[self] = "S21_1_s5_write_begin"
                               /\ IF crashed[self]
                                     THEN /\ pc' = [pc EXCEPT ![self] = "brk_end"]
-                                         /\ UNCHANGED << fs, lostLock >>
-                                    ELSE /\ fs' = FsWriteBegin(IF SEED_RESTART_RELEASES THEN FsUnlock(fs, self, HandleObj(self)).fs ELSE fs,
-                                                               HandleObj(self)).fs
-                                         /\ lostLock' = MarkLost(self, HandleObj(self))
-                                         /\ pc' = [pc EXCEPT ![self] = "S21_1_s5_write_end"]
+                                         /\ UNCHANGED << fs, holding, lostLock, 
+                                                         refusedOk, refused >>
+                                    ELSE /\ IF WriteFenced(self, HandleObj(self))
+                                               THEN /\ refused' = [refused EXCEPT ![self] = "TARGET_LOCK_BUSY"]
+                                                    /\ refusedOk' = [refusedOk EXCEPT ![self] = lostLock[self]]
+                                                    /\ holding' = [holding EXCEPT ![self] = FALSE]
+                                                    /\ pc' = [pc EXCEPT ![self] = "S21_1_s3_refuse_close"]
+                                                    /\ UNCHANGED << fs, 
+                                                                    lostLock >>
+                                               ELSE /\ fs' = FsWriteBegin(IF SEED_RESTART_RELEASES THEN FsUnlock(fs, self, HandleObj(self)).fs ELSE fs,
+                                                                          HandleObj(self)).fs
+                                                    /\ lostLock' = MarkLost(self, HandleObj(self))
+                                                    /\ pc' = [pc EXCEPT ![self] = "S21_1_s5_write_end"]
+                                                    /\ UNCHANGED << holding, 
+                                                                    refusedOk, 
+                                                                    refused >>
                               /\ UNCHANGED << foreignObj, classified, 
                                               ownerLive, sawLive, seenRec, 
-                                              crashed, live, holding, checked, 
-                                              writing, pendingUnlink, 
-                                              checkStale, writeStale, 
-                                              landedAfterTakeover, published, 
-                                              verified, recoveredAfterCrash, 
-                                              tornRead, hostCrashChangedLock, 
-                                              touchedUncertain, refusedOk, 
-                                              refused, stack, keep, obj_, got, 
-                                              obj, robj, victim, nobj, tobj, 
-                                              crashes, leases >>
+                                              crashed, live, checked, writing, 
+                                              pendingUnlink, checkStale, 
+                                              writeStale, landedAfterTakeover, 
+                                              published, verified, 
+                                              recoveredAfterCrash, tornRead, 
+                                              hostCrashChangedLock, 
+                                              touchedUncertain, stack, keep, 
+                                              obj_, got, obj, robj, victim, 
+                                              nobj, tobj, crashes, leases >>
 
 S21_1_s5_write_end(self) == /\ pc[self] = "S21_1_s5_write_end"
                             /\ IF crashed[self]
@@ -3515,7 +3589,7 @@ env_loop == /\ pc["env"] = "env_loop"
                                   \E land \in BOOLEAN:
                                     \E c \in FsUnlinkChoices:
                                       /\ fs' = FsProcCrash(LandUnlink(fs, IF land THEN p ELSE NoProc, c), p)
-                                      /\ lostLock' = (IF land /\ pendingUnlink[p] # NoObj /\ LockObj = pendingUnlink[p] THEN MarkLost(p, LockObj) ELSE lostLock)
+                                      /\ lostLock' = (IF land /\ pendingUnlink[p] # NoObj /\ LockObj # NoObj THEN MarkLost(p, LockObj) ELSE lostLock)
                                       /\ landedAfterTakeover' = (landedAfterTakeover \/ (land /\ writing[p] /\ writeStale[p]))
                                       /\ writing' = [writing EXCEPT ![p] = FALSE]
                                       /\ pendingUnlink' = [pendingUnlink EXCEPT ![p] = NoObj]

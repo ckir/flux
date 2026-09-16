@@ -42,9 +42,11 @@
 
      define {
        LockObj == At(fs, P, LockName)
-       \* `f` after process q's issued release unlink lands (Section 5.2): it removes the name only while the lock
-       \* path still names the file the call resolved. q = NoProc lands nothing.
-       LandUnlink(f, q, c) == IF q # NoProc /\ pendingUnlink[q] # NoObj /\ At(f, P, LockName) = pendingUnlink[q]
+       \* `f` after process q's issued release unlink lands. NFS REMOVE carries the directory handle and the NAME
+       \* (RFC 7530), and the server resolves that name when it executes the call, so a stale unlink removes
+       \* whatever holds the name THEN - including a lock another operation created meanwhile. The optimistic
+       \* reading, where the call resolves the path when it is issued, is what LockProtocol.tla assumes.
+       LandUnlink(f, q, c) == IF q # NoProc /\ pendingUnlink[q] # NoObj /\ At(f, P, LockName) # NoObj
                               THEN FsUnlink(f, P, LockName, c).fs ELSE f
        OwnRecord(p) == Rec(p, IF p \in Cleanups THEN "cleanup" ELSE "operation")
        \* The object of the one lock-file handle a process holds, or NoObj. A holder of the target lock
@@ -56,6 +58,12 @@
        \* comparison (a record is descriptive, 99.1) and no OS-native lock (a lease can lapse unheard), so nothing
        \* here depends on a value another process can forge or on a lock this process cannot query.
        StillOwned(p) == LockObj # NoObj /\ HandleObj(p) = LockObj
+       \* Linux NFSv4 (since 3.12) does not reclaim a lock lost to an expired lease, and read/write through that
+       \* descriptor then fail with EIO until it is closed (fcntl_locking(2); the module parameter
+       \* recover_lost_locks, which re-enables reclaim, is documented as risking corruption). So a write through
+       \* a descriptor whose lock this process no longer holds FAILS here, rather than silently landing. It says
+       \* nothing about a rename, which is a directory operation and is not fenced this way.
+       WriteFenced(p, o) == LockCapability = "remote" /\ o # NoObj /\ fs.oslock[o] # p
        \* The destination, and what it holds.
        TargetObj == At(fs, P, TargetName)
        TargetContent == IF TargetObj = NoObj THEN NoContent ELSE fs.content[TargetObj]
@@ -214,23 +222,41 @@
        S96_1_record_begin:
          if (crashed[self]) { goto acquire_crashed; }
          else {
-           fs := FsWriteBegin(fs, obj).fs;
-           lostLock := MarkLost(self, obj);
+           \* The lease lapsed under this write: the descriptor is poisoned and the write fails (EIO).
+           if (WriteFenced(self, obj)) {
+             refused[self] := "TARGET_LOCK_BUSY";
+             refusedOk[self] := lostLock[self];
+             holding[self] := FALSE;
+             goto S96_1_ownlock_close;
+           }
+           else {
+             fs := FsWriteBegin(fs, obj).fs;
+             lostLock := MarkLost(self, obj);
+           };
          };
        S96_1_record_end:
          \* A crash between the two halves of the write leaves the record torn (Section 5.2), which
          \* is what the `NeverTornRead` witness run is about.
          if (crashed[self]) { goto acquire_crashed; }
          else {
-           fs := FsWriteEnd(fs, obj, OwnRecord(self)).fs;
-           \* Either half of a write can hit a file another process took meanwhile, so both mark it.
-           lostLock := MarkLost(self, obj);
-           seenRec[self] := OwnRecord(self);
-           holding[self] := TRUE;
-           \* A new tenure: every other process's last check and issued write are stale from here (design Section 7).
-           checkStale := [q \in Procs |-> IF q = self THEN checkStale[q] ELSE TRUE];
-           writeStale := [q \in Procs |-> IF q = self THEN writeStale[q] ELSE TRUE];
-           return;
+           \* The lease lapsed under this write: the descriptor is poisoned and the write fails (EIO).
+           if (WriteFenced(self, obj)) {
+             refused[self] := "TARGET_LOCK_BUSY";
+             refusedOk[self] := lostLock[self];
+             holding[self] := FALSE;
+             goto S96_1_ownlock_close;
+           }
+           else {
+             fs := FsWriteEnd(fs, obj, OwnRecord(self)).fs;
+             \* Either half of a write can hit a file another process took meanwhile, so both mark it.
+             lostLock := MarkLost(self, obj);
+             seenRec[self] := OwnRecord(self);
+             holding[self] := TRUE;
+             \* A new tenure: every other process's last check and issued write are stale from here (design Section 7).
+             checkStale := [q \in Procs |-> IF q = self THEN checkStale[q] ELSE TRUE];
+             writeStale := [q \in Procs |-> IF q = self THEN writeStale[q] ELSE TRUE];
+             return;
+           };
          };
        S96_1_backoff:
          \* On a conflict the acquirer removes what it created and reports TARGET_LOCK_BUSY (96.1).
@@ -684,7 +710,7 @@
            with (c \in FsUnlinkChoices) {
              fs := LandUnlink(fs, self, c);
            };
-           lostLock := IF pendingUnlink[self] # NoObj /\ LockObj = pendingUnlink[self] THEN MarkLost(self, LockObj) ELSE lostLock;
+           lostLock := IF pendingUnlink[self] # NoObj /\ LockObj # NoObj THEN MarkLost(self, LockObj) ELSE lostLock;
            pendingUnlink[self] := NoObj;
          };
        S99_close:
@@ -928,10 +954,19 @@
          \* handle that holds it, not through a second lookup of the path (a reading, recorded in trace.toml).
          if (crashed[self]) { goto brk_end; }
          else {
-           \* SEED_RESTART_RELEASES (design Section 8) releases the OS-native lock here first.
-           fs := FsWriteBegin(IF SEED_RESTART_RELEASES THEN FsUnlock(fs, self, HandleObj(self)).fs ELSE fs,
-                              HandleObj(self)).fs;
-           lostLock := MarkLost(self, HandleObj(self));
+           \* The lease lapsed under this write: the descriptor is poisoned and the write fails (EIO).
+           if (WriteFenced(self, HandleObj(self))) {
+             refused[self] := "TARGET_LOCK_BUSY";
+             refusedOk[self] := lostLock[self];
+             holding[self] := FALSE;
+             goto S21_1_s3_refuse_close;
+           }
+           else {
+             \* SEED_RESTART_RELEASES (design Section 8) releases the OS-native lock here first.
+             fs := FsWriteBegin(IF SEED_RESTART_RELEASES THEN FsUnlock(fs, self, HandleObj(self)).fs ELSE fs,
+                                HandleObj(self)).fs;
+             lostLock := MarkLost(self, HandleObj(self));
+           };
          };
        S21_1_s5_write_end:
          if (crashed[self]) { goto brk_end; }
@@ -977,7 +1012,7 @@
              with (p \in {q \in Procs : live[q] /\ ~crashed[q]}, land \in BOOLEAN, c \in FsUnlinkChoices) {
                \* Its in-flight calls land or are dropped at the crash itself (design Section 5.2).
                fs := FsProcCrash(LandUnlink(fs, IF land THEN p ELSE NoProc, c), p);
-               lostLock := IF land /\ pendingUnlink[p] # NoObj /\ LockObj = pendingUnlink[p] THEN MarkLost(p, LockObj) ELSE lostLock;
+               lostLock := IF land /\ pendingUnlink[p] # NoObj /\ LockObj # NoObj THEN MarkLost(p, LockObj) ELSE lostLock;
                landedAfterTakeover := landedAfterTakeover \/ (land /\ writing[p] /\ writeStale[p]);
                writing[p] := FALSE;
                pendingUnlink[p] := NoObj;
