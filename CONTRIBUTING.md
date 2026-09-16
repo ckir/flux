@@ -26,7 +26,7 @@ Requires Rust 1.85+ (edition 2024). The toolchain is pinned by
 
 ```bash
 # One-time: install the dev tools
-cargo binstall -y cargo-nextest just lefthook cargo-deny typos-cli bacon git-cliff cargo-release cargo-mutants
+cargo binstall -y cargo-nextest just lefthook cargo-deny typos-cli bacon cargo-mutants
 lefthook install
 
 # Everyday
@@ -79,7 +79,7 @@ concerns.
 ## Commit messages
 
 We follow [Conventional Commits](https://www.conventionalcommits.org/), because
-`git-cliff` generates the changelog from them:
+release-plz generates the changelog from them:
 
 ```
 type(scope): description
@@ -119,16 +119,19 @@ For security issues, do **not** open a public issue; see [SECURITY.md](SECURITY.
 
 ## Releasing
 
-Releases use `cargo release` and follow [Semantic Versioning](https://semver.org/).
-All crates are versioned in lockstep.
+Releases are automated with [release-plz](https://release-plz.dev) and follow
+[Semantic Versioning](https://semver.org/). All crates share one version.
 
-```bash
-just release patch    # bug fixes
-just release minor    # new features
-just release major    # breaking changes
-```
+- After every push to `main`, the `Release-plz` workflow opens or refreshes a
+  release pull request that bumps the version and adds the next `CHANGELOG.md`
+  section from the commit messages.
+- Merging that pull request is the release: release-plz creates the `v*` tag and
+  its GitHub release, and the tag starts the cross-platform build that attaches
+  the binaries.
 
-Pushing the resulting `v*` tag triggers the cross-platform release build.
+To pick a different version, edit it in the release pull request before merging.
+To preview locally, run `release-plz update` on a clean checkout (it edits files;
+discard them afterwards). Configuration is in `release-plz.toml`.
 
 ## Licence
 

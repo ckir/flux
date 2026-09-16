@@ -1,0 +1,77 @@
+# release-plz (https://release-plz.dev), run by .github/workflows/release-plz.yml.
+#
+# Every push to main refreshes one release pull request: it bumps the shared workspace version, updates
+# Cargo.lock and adds the next section of CHANGELOG.md. Merging that pull request is the release: release-plz
+# then creates the `v{version}` tag and its GitHub release, and the tag starts .github/workflows/release.yml,
+# which builds the binaries and attaches them.
+
+[workspace]
+# Nothing is published to crates.io (every crate has `publish = false`): the last released version is read
+# from the `v{version}` git tags instead of the registry.
+git_only = true
+publish = false
+# A binary with no published library API has nothing for cargo-semver-checks to compare against.
+semver_check = false
+# Release only when the release pull request is merged, not on every push to main.
+release_always = false
+# One tag and one GitHub release for the whole workspace, made by flux-cli below.
+git_tag_enable = false
+git_release_enable = false
+changelog_update = false
+pr_labels = ["release"]
+
+# flux-cli ships the `flux` binary, so it carries the tag, the release and the one changelog, which also
+# lists the commits of every other package (the root package owns everything outside crates/).
+[[package]]
+name = "flux-cli"
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+git_release_enable = true
+git_release_name = "v{{ version }}"
+changelog_update = true
+changelog_path = "CHANGELOG.md"
+changelog_include = ["flux", "flux-core", "flux-fs", "flux-platform", "flux-hash", "flux-ui"]
+version_group = "flux"
+
+[[package]]
+name = "flux"
+version_group = "flux"
+
+[[package]]
+name = "flux-core"
+version_group = "flux"
+
+[[package]]
+name = "flux-fs"
+version_group = "flux"
+
+[[package]]
+name = "flux-platform"
+version_group = "flux"
+
+[[package]]
+name = "flux-hash"
+version_group = "flux"
+
+[[package]]
+name = "flux-ui"
+version_group = "flux"
+
+[changelog]
+# Groups for the commit types this repository uses (CONTRIBUTING.md). A commit matching no parser lands in
+# "Other" rather than vanishing.
+commit_parsers = [
+    { message = "^release", skip = true },
+    { message = "^wip", skip = true },
+    { message = "^feat", group = "Features" },
+    { message = "^fix", group = "Bug fixes" },
+    { message = "^perf", group = "Performance" },
+    { message = "^refactor", group = "Refactoring" },
+    { message = "^(spec|design|plan)", group = "Specification and design" },
+    { message = "^(model|runner|trace|recovery)", group = "Lock-protocol model" },
+    { message = "^docs", group = "Documentation" },
+    { message = "^tests?", group = "Tests" },
+    { message = "^(ci|build)", group = "Build and CI" },
+    { message = "^(chore|style|revert)", group = "Miscellaneous" },
+    { message = ".*", group = "Other" },
+]

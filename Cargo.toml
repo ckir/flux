@@ -6,7 +6,7 @@
 
 [package]
 name = "flux"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 rust-version = "1.85"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -85,13 +85,6 @@ flux-ui = { path = "crates/flux-ui" }
 criterion = "0.8"
 proptest = "1.11"
 tempfile = "3"
-
-[workspace.metadata.release]
-shared-version = true
-tag-name = "v{{version}}"
-tag-prefix = ""
-pre-release-commit-message = "release: v{{version}}"
-publish = false
 
 [profile.ci]
 inherits = "dev"

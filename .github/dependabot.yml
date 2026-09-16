@@ -6,9 +6,8 @@
 # own PR and waits for a human — majors are where MSRV bumps, breaking API
 # changes and licence changes live, and deny.toml's allow-list is not advisory.
 #
-# `commit-message.prefix: chore` is not cosmetic: cliff.toml sets
-# filter_unconventional = true and has no `build` parser, so Dependabot's default
-# `build(deps)` prefix would drop these commits from the generated changelog.
+# `commit-message.prefix: chore` files these commits under Miscellaneous in the
+# changelog release-plz generates (release-plz.toml's [changelog] parsers).
 
 version: 2
 updates:

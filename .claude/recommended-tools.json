@@ -36,16 +36,10 @@
     "in_path": "bacon"
   },
   {
-    "name": "git-cliff",
-    "why": "Generates CHANGELOG.md from conventional commits (`just changelog`). Configured by cliff.toml.",
-    "install": "cargo binstall -y git-cliff",
-    "in_path": "git-cliff"
-  },
-  {
-    "name": "cargo-release",
-    "why": "Bumps every workspace crate in lockstep and pushes the single `v{version}` tag that .github/workflows/release.yml triggers on. Configured by [workspace.metadata.release] in the root Cargo.toml.",
-    "install": "cargo binstall -y cargo-release",
-    "in_path": "cargo-release"
+    "name": "release-plz",
+    "why": "Releases run in CI (.github/workflows/release-plz.yml, configured by release-plz.toml): a release pull request bumps the shared version and writes CHANGELOG.md, and merging it tags `v{version}`, which starts release.yml. Locally, `release-plz update` previews the next version and changelog without touching GitHub.",
+    "install": "cargo binstall -y release-plz",
+    "in_path": "release-plz"
   },
   {
     "name": "cargo-mutants",
