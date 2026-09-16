@@ -475,6 +475,10 @@
          \* alive is the oracle's judgement, as in classification (design Section 6.1).
          if (crashed[self]) { goto takeover_crashed; }
          else {
+           \* A torn record read HERE is deliberately not recorded in `tornRead`, unlike the classify read.
+           \* That ghost is a witness only (`NeverTornRead`), it already fires from the classify path, so
+           \* setting it here buys no coverage - and it would add reachable states to a scenario whose CI
+           \* job already runs 2h36m against a 3h cap. Revisit with the job split (capstone, plan 3).
            with (seen = fs.content[tobj]) {
              if (IsRecord(seen) /\ seen # seenRec[self]) { refused[self] := "RESTART"; goto S240_5_close; }
              else if (IsRecord(seen)) {
