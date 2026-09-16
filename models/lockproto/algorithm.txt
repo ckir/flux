@@ -694,6 +694,7 @@
          if (~crashed[self] /\ holding[self]) { call Publish(); };
        own_end:
          live[self] := FALSE;
+         lostLock[self] := FALSE;
      }
 
      \* A new invocation with no flags (21.1): classify what it finds, then act or refuse.
@@ -747,6 +748,7 @@
          if (~crashed[self] /\ holding[self]) { call Publish(); };
        plain_end:
          live[self] := FALSE;
+         lostLock[self] := FALSE;
      }
 
      \* A new invocation that finds a dead owner's lock, recovers it (240.3), then continues as an
@@ -789,6 +791,7 @@
          if (~crashed[self] /\ holding[self]) { call Publish(); };
        rec_end:
          live[self] := FALSE;
+         lostLock[self] := FALSE;
      }
 
      \* flux cleanup DEST: classify the lock, remove a dead owner's or a dead cleanup lock through
@@ -839,6 +842,7 @@
          };
        clean_end:
          live[self] := FALSE;
+         lostLock[self] := FALSE;
      }
 
      \* flux copy --restart --break-lock (21.1, 240.5). It classifies the lock first (the reported holder
@@ -926,6 +930,7 @@
          };
        brk_end:
          live[self] := FALSE;
+         lostLock[self] := FALSE;
      }
 
      \* The environment: the crashes of Section 5.2. A process crash releases the handles, their
@@ -947,7 +952,10 @@
              with (p \in {q \in Procs : live[q] /\ ~crashed[q]}, land \in BOOLEAN, c \in FsUnlinkChoices) {
                \* Its in-flight calls land or are dropped at the crash itself (design Section 5.2).
                fs := FsProcCrash(LandUnlink(fs, IF land THEN p ELSE NoProc, c), p);
-               lostLock := IF land /\ pendingUnlink[p] # NoObj /\ LockObj = pendingUnlink[p] THEN MarkLost(p, LockObj) ELSE lostLock;
+               \* Its own ghost goes back to FALSE: a crashed process never refuses again, so any other value is
+               \* dead state that splits states which are otherwise the same.
+               lostLock := [ (IF land /\ pendingUnlink[p] # NoObj /\ LockObj = pendingUnlink[p]
+                              THEN MarkLost(p, LockObj) ELSE lostLock) EXCEPT ![p] = FALSE ];
                landedAfterTakeover := landedAfterTakeover \/ (land /\ writing[p] /\ writeStale[p]);
                writing[p] := FALSE;
                pendingUnlink[p] := NoObj;
@@ -981,6 +989,7 @@
              pendingUnlink := [q \in Procs |-> IF live[q] THEN NoObj ELSE pendingUnlink[q]];
              checked := [q \in Procs |-> IF live[q] THEN FALSE ELSE checked[q]];
              checkStale := [q \in Procs |-> IF live[q] THEN TRUE ELSE checkStale[q]];
+             lostLock := [q \in Procs |-> IF live[q] THEN FALSE ELSE lostLock[q]];
              writeStale := [q \in Procs |-> IF live[q] THEN TRUE ELSE writeStale[q]];
              holding := [q \in Procs |-> IF live[q] THEN FALSE ELSE holding[q]];
              crashes := crashes + 1;

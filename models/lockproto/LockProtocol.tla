@@ -752,6 +752,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          if (~crashed[self] /\ holding[self]) { call Publish(); };
        own_end:
          live[self] := FALSE;
+         lostLock[self] := FALSE;
      }
 
      \* A new invocation with no flags (21.1): classify what it finds, then act or refuse.
@@ -805,6 +806,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          if (~crashed[self] /\ holding[self]) { call Publish(); };
        plain_end:
          live[self] := FALSE;
+         lostLock[self] := FALSE;
      }
 
      \* A new invocation that finds a dead owner's lock, recovers it (240.3), then continues as an
@@ -847,6 +849,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          if (~crashed[self] /\ holding[self]) { call Publish(); };
        rec_end:
          live[self] := FALSE;
+         lostLock[self] := FALSE;
      }
 
      \* flux cleanup DEST: classify the lock, remove a dead owner's or a dead cleanup lock through
@@ -897,6 +900,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          };
        clean_end:
          live[self] := FALSE;
+         lostLock[self] := FALSE;
      }
 
      \* flux copy --restart --break-lock (21.1, 240.5). It classifies the lock first (the reported holder
@@ -984,6 +988,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          };
        brk_end:
          live[self] := FALSE;
+         lostLock[self] := FALSE;
      }
 
      \* The environment: the crashes of Section 5.2. A process crash releases the handles, their
@@ -1005,7 +1010,10 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
              with (p \in {q \in Procs : live[q] /\ ~crashed[q]}, land \in BOOLEAN, c \in FsUnlinkChoices) {
                \* Its in-flight calls land or are dropped at the crash itself (design Section 5.2).
                fs := FsProcCrash(LandUnlink(fs, IF land THEN p ELSE NoProc, c), p);
-               lostLock := IF land /\ pendingUnlink[p] # NoObj /\ LockObj = pendingUnlink[p] THEN MarkLost(p, LockObj) ELSE lostLock;
+               \* Its own ghost goes back to FALSE: a crashed process never refuses again, so any other value is
+               \* dead state that splits states which are otherwise the same.
+               lostLock := [ (IF land /\ pendingUnlink[p] # NoObj /\ LockObj = pendingUnlink[p]
+                              THEN MarkLost(p, LockObj) ELSE lostLock) EXCEPT ![p] = FALSE ];
                landedAfterTakeover := landedAfterTakeover \/ (land /\ writing[p] /\ writeStale[p]);
                writing[p] := FALSE;
                pendingUnlink[p] := NoObj;
@@ -1039,6 +1047,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
              pendingUnlink := [q \in Procs |-> IF live[q] THEN NoObj ELSE pendingUnlink[q]];
              checked := [q \in Procs |-> IF live[q] THEN FALSE ELSE checked[q]];
              checkStale := [q \in Procs |-> IF live[q] THEN TRUE ELSE checkStale[q]];
+             lostLock := [q \in Procs |-> IF live[q] THEN FALSE ELSE lostLock[q]];
              writeStale := [q \in Procs |-> IF live[q] THEN TRUE ELSE writeStale[q]];
              holding := [q \in Procs |-> IF live[q] THEN FALSE ELSE holding[q]];
              crashes := crashes + 1;
@@ -1062,7 +1071,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "dd211874" /\ chksum(tla) = "bdc88b32")
+\* BEGIN TRANSLATION (chksum(pcal) = "9674e4ba" /\ chksum(tla) = "624065f")
 \* Procedure variable obj of procedure Classify at line 168 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
@@ -2492,11 +2501,12 @@ own_publish(self) == /\ pc[self] = "own_publish"
 
 own_end(self) == /\ pc[self] = "own_end"
                  /\ live' = [live EXCEPT ![self] = FALSE]
+                 /\ lostLock' = [lostLock EXCEPT ![self] = FALSE]
                  /\ pc' = [pc EXCEPT ![self] = "Done"]
                  /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                  sawLive, seenRec, crashed, holding, checked, 
                                  writing, pendingUnlink, checkStale, 
-                                 writeStale, lostLock, landedAfterTakeover, 
+                                 writeStale, landedAfterTakeover, 
                                  recoveredAfterCrash, tornRead, 
                                  hostCrashChangedLock, touchedUncertain, 
                                  refusedOk, refused, stack, keep, obj_, got, 
@@ -2669,11 +2679,12 @@ plain_publish(self) == /\ pc[self] = "plain_publish"
 
 plain_end(self) == /\ pc[self] = "plain_end"
                    /\ live' = [live EXCEPT ![self] = FALSE]
+                   /\ lostLock' = [lostLock EXCEPT ![self] = FALSE]
                    /\ pc' = [pc EXCEPT ![self] = "Done"]
                    /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                    sawLive, seenRec, crashed, holding, checked, 
                                    writing, pendingUnlink, checkStale, 
-                                   writeStale, lostLock, landedAfterTakeover, 
+                                   writeStale, landedAfterTakeover, 
                                    recoveredAfterCrash, tornRead, 
                                    hostCrashChangedLock, touchedUncertain, 
                                    refusedOk, refused, stack, keep, obj_, got, 
@@ -2841,11 +2852,12 @@ rec_acquired(self) == /\ pc[self] = "rec_acquired"
 
 rec_end(self) == /\ pc[self] = "rec_end"
                  /\ live' = [live EXCEPT ![self] = FALSE]
+                 /\ lostLock' = [lostLock EXCEPT ![self] = FALSE]
                  /\ pc' = [pc EXCEPT ![self] = "Done"]
                  /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                  sawLive, seenRec, crashed, holding, checked, 
                                  writing, pendingUnlink, checkStale, 
-                                 writeStale, lostLock, landedAfterTakeover, 
+                                 writeStale, landedAfterTakeover, 
                                  recoveredAfterCrash, tornRead, 
                                  hostCrashChangedLock, touchedUncertain, 
                                  refusedOk, refused, stack, keep, obj_, got, 
@@ -2989,11 +3001,12 @@ S251_1_close(self) == /\ pc[self] = "S251_1_close"
 
 clean_end(self) == /\ pc[self] = "clean_end"
                    /\ live' = [live EXCEPT ![self] = FALSE]
+                   /\ lostLock' = [lostLock EXCEPT ![self] = FALSE]
                    /\ pc' = [pc EXCEPT ![self] = "Done"]
                    /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                    sawLive, seenRec, crashed, holding, checked, 
                                    writing, pendingUnlink, checkStale, 
-                                   writeStale, lostLock, landedAfterTakeover, 
+                                   writeStale, landedAfterTakeover, 
                                    recoveredAfterCrash, tornRead, 
                                    hostCrashChangedLock, touchedUncertain, 
                                    refusedOk, refused, stack, keep, obj_, got, 
@@ -3293,11 +3306,12 @@ S21_1_s3_refuse_close(self) == /\ pc[self] = "S21_1_s3_refuse_close"
 
 brk_end(self) == /\ pc[self] = "brk_end"
                  /\ live' = [live EXCEPT ![self] = FALSE]
+                 /\ lostLock' = [lostLock EXCEPT ![self] = FALSE]
                  /\ pc' = [pc EXCEPT ![self] = "Done"]
                  /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                  sawLive, seenRec, crashed, holding, checked, 
                                  writing, pendingUnlink, checkStale, 
-                                 writeStale, lostLock, landedAfterTakeover, 
+                                 writeStale, landedAfterTakeover, 
                                  recoveredAfterCrash, tornRead, 
                                  hostCrashChangedLock, touchedUncertain, 
                                  refusedOk, refused, stack, keep, obj_, got, 
@@ -3320,7 +3334,8 @@ env_loop == /\ pc["env"] = "env_loop"
                                   \E land \in BOOLEAN:
                                     \E c \in FsUnlinkChoices:
                                       /\ fs' = FsProcCrash(LandUnlink(fs, IF land THEN p ELSE NoProc, c), p)
-                                      /\ lostLock' = (IF land /\ pendingUnlink[p] # NoObj /\ LockObj = pendingUnlink[p] THEN MarkLost(p, LockObj) ELSE lostLock)
+                                      /\ lostLock' = [ (IF land /\ pendingUnlink[p] # NoObj /\ LockObj = pendingUnlink[p]
+                                                        THEN MarkLost(p, LockObj) ELSE lostLock) EXCEPT ![p] = FALSE ]
                                       /\ landedAfterTakeover' = (landedAfterTakeover \/ (land /\ writing[p] /\ writeStale[p]))
                                       /\ writing' = [writing EXCEPT ![p] = FALSE]
                                       /\ pendingUnlink' = [pendingUnlink EXCEPT ![p] = NoObj]
@@ -3344,11 +3359,12 @@ env_loop == /\ pc["env"] = "env_loop"
                              /\ pendingUnlink' = [q \in Procs |-> IF live[q] THEN NoObj ELSE pendingUnlink[q]]
                              /\ checked' = [q \in Procs |-> IF live[q] THEN FALSE ELSE checked[q]]
                              /\ checkStale' = [q \in Procs |-> IF live[q] THEN TRUE ELSE checkStale[q]]
+                             /\ lostLock' = [q \in Procs |-> IF live[q] THEN FALSE ELSE lostLock[q]]
                              /\ writeStale' = [q \in Procs |-> IF live[q] THEN TRUE ELSE writeStale[q]]
                              /\ holding' = [q \in Procs |-> IF live[q] THEN FALSE ELSE holding[q]]
                              /\ crashes' = crashes + 1
                              /\ pc' = [pc EXCEPT !["env"] = "env_loop"]
-                             /\ UNCHANGED <<lostLock, landedAfterTakeover, leases>>
+                             /\ UNCHANGED <<landedAfterTakeover, leases>>
                           \/ /\ LockCapability = "remote" /\ leases < MaxLeaseExpiries
                              /\ \E o \in {x \in Objs : fs.oslock[x] # NoProc /\ live[fs.oslock[x]] /\ ~crashed[fs.oslock[x]]}:
                                   /\ lostLock' = [lostLock EXCEPT ![fs.oslock[o]] = TRUE]

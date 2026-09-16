@@ -970,6 +970,14 @@ Findings the design already expects, each to be confirmed or refuted by the firs
   check run, with fix flag `FIX_REMOTE_LEASE_SPEC`, which exempts a prior owner whose check passed before
   the takeover, as the spec statement would; its `-fixed` run shows this is the only `SingleWriter` case. The spec
   amendment to 240.5 follows; while the finding is open no seed runs in `breaklock-remote` or `mixed-remote`.
+  **How an open finding is expressed when its invariant fails often (measured 2026-09-16).** The `open_findings`
+  mechanism of Section 4 assumes the invariant fails rarely: the check run carries it, TLC runs with `-continue`,
+  and the runner reads the violated set. With the check-to-call window that assumption breaks - `SingleWriter`
+  fails in thousands of states, TLC dies building traces, and the run reports no verdict at all. So each remote
+  check run drops `SingleWriter` and keeps every other invariant and its coverage; a halting `-window-witness`
+  run proves the window with one trace, which is what records that the finding is open; and a `-fixed` run with
+  `FIX_REMOTE_LEASE_SPEC` on checks every invariant and must violate nothing, which is what shows the window is
+  the only way `SingleWriter` breaks. The seed ban still applies to those scenarios.
   The first `-fixed` runs still broke `SingleWriter` by a second remote path: an Owner's lease lapses while it writes
   its record, a Breaker completes a takeover of that file, the Owner's record write then lands and puts its record
   back, and its Section 99 check passes because "still owned" reads only the record; the Breaker's 21.1 step 5
