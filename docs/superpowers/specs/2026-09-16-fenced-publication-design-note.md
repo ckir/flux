@@ -88,7 +88,7 @@ What can be done is refuse to lie about it, which is what the prototype does:
 Verified from the platform documentation, not assumed:
 
 - **A lock lost to an expired lease is not reclaimed** on Linux NFSv4, and `read`/`write` through that
-  descriptor then fail with `EIO` until it is closed. The module parameter `recover_lost_locks` re-enables
+  descriptor then fail with `EIO` until it is closed (kernel: `NFS_LOCK_LOST`, `nfs4_select_rw_stateid`). The module parameter `recover_lost_locks` re-enables
   reclaim and is documented as risking corruption.
   ([fcntl_locking(2)](https://man7.org/linux/man-pages/man2/fcntl_locking.2.html),
   [Red Hat](https://access.redhat.com/solutions/1179643))
@@ -100,9 +100,31 @@ Verified from the platform documentation, not assumed:
   and a second handle cannot touch it, so "do I still hold my lock?" is not answerable.
   ([LockFileEx](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex))
 
-**Unverified, and load-bearing if this is adopted:** whether a lease-lost lock can be re-taken on the same
-descriptor in practice (the prototype's relock branch), and whether SMB durable handles behave the same way
-across a lease break.
+Two of these were open questions in the first draft. Both were put to Gemini, ChatGPT and Grok on
+2026-09-16, and the answers that survived my own verification are folded in here (Grok declined to answer
+without an account):
+
+- **A lease-lost lock cannot be re-taken on the same descriptor.** The descriptor is poisoned: the kernel
+  keeps an `NFS_LOCK_LOST` state and returns `-EIO` for I/O through it, and re-acquiring with `F_SETLK` or
+  `flock` on that same descriptor does not clear it. The documented recovery is to **close the file and open
+  it again**. This refutes the optimistic branch in the prototype, where a lapsed lock is quietly taken back
+  on the same handle, and it refutes the same assumption in `FIX_REMOTE_LEASE_SPEC`'s relock test in
+  `LockProtocol.tla` (Section 8, decision 6).
+- **SMB3 is not Linux here, and the difference favours SMB3.** When a durable handle's oplock or lease must
+  be broken and the client is disconnected, `[MS-SMB2]` requires the server to **close the Open**, and the
+  later durable-handle reconnect fails (`STATUS_OBJECT_NAME_NOT_FOUND`). A stale handle's buffered writes
+  therefore cannot land. A handle that is still valid and connected, by contrast, keeps writing normally: a
+  lease break is a caching mechanism, not a write fence. So the Linux `EIO` behaviour must **not** be used as
+  a generic abstraction for SMB3.
+  ([MS-SMB2 oplock break](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/2a09fc40-1615-42df-bda6-2865b8d6da95),
+  [durable reconnect](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/3309c3d1-3daf-4448-9faa-81d2d6aa3315))
+
+**Reported but not verified here:** that on NFS a failed `rename()` does not prove the rename did not happen,
+because a retransmitted request can be answered from the server's duplicate-request cache. If true it matters
+for publication, and it is worth a probe of its own.
+
+**Still unverified:** nothing load-bearing, but the prototype's own behaviour under a Windows pairing has not
+been measured at all - every fenced run is POSIX.
 
 ## 6. A soundness gap in the CURRENT model, independent of this note
 
@@ -131,7 +153,12 @@ This is a finding against plan 3 whatever happens to the rest of this note.
    the three accepted windows against it.
 4. **`SingleWriter`'s future:** keep it as a gate property with its accepted windows, or demote it to a
    witness and gate on destination properties once the destination is modelled (the `nested` scenario).
-5. **Probes** for the two unverified facts in Section 5, before any of this reaches the spec.
+5. **A probe** for the NFS duplicate-request-cache question in Section 5, and a Windows pairing for the
+   prototype, before any of this reaches the spec.
+6. **`FIX_REMOTE_LEASE_SPEC`'s relock test is now known to be wrong** (Section 5): a poisoned descriptor
+   cannot take its lock back, so the fix flag's Section 99 test should fail the check outright rather than
+   model a retake. This changes what the accepted windows were measured against, whatever is decided about
+   the rest of this note.
 
 ## 9. How to reproduce
 
