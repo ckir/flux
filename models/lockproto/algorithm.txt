@@ -40,9 +40,12 @@
 
      define {
        LockObj == At(fs, P, LockName)
-       \* `f` after process q's issued release unlink lands (Section 5.2): it removes the name only while the lock
-       \* path still names the file the call resolved. q = NoProc lands nothing.
-       LandUnlink(f, q, c) == IF q # NoProc /\ pendingUnlink[q] # NoObj /\ At(f, P, LockName) = pendingUnlink[q]
+       \* `f` after process q's issued release unlink lands (Section 5.2). NFS REMOVE carries the directory handle
+       \* and the NAME, and the server resolves that name when it EXECUTES the call (RFC 7530, design Section 5.3),
+       \* so a stale unlink removes whatever holds the lock name then - including a lock another operation created
+       \* meanwhile. The model read this the optimistic way until 2026-09-16, and the three accepted remote windows
+       \* were measured under that reading. q = NoProc lands nothing.
+       LandUnlink(f, q, c) == IF q # NoProc /\ pendingUnlink[q] # NoObj /\ At(f, P, LockName) # NoObj
                               THEN FsUnlink(f, P, LockName, c).fs ELSE f
        OwnRecord(p) == Rec(p, IF p \in Cleanups THEN "cleanup" ELSE "operation")
        \* The object of the one lock-file handle a process holds, or NoObj. A holder of the target lock
@@ -50,20 +53,15 @@
        HandleObj(p) == IF \E h \in fs.handles : h.proc = p
                        THEN (CHOOSE h \in fs.handles : h.proc = p).obj
                        ELSE NoObj
-       \* "Still owned" (Section 99): a lock file at the lock path holding this operation's record. FIX_REMOTE_LEASE_SPEC
-       \* adds the amendment the open finding calls for, as a test an implementation can make (owner ruling for plan 3,
-       \* 2026-09-15): the check also tries to take the OS-native lock again on the handle it holds, without waiting.
-       \* Held by another process: the check fails, so a lease-lapsed owner whose stale record write undid a takeover
-       \* no longer passes. Held by nobody (the lease lapsed and no one took it): the attempt takes it back and the
-       \* check goes on (Relock). Held by this process: nothing changes. The attempt and the read are one step here,
-       \* and the record is read first: a process that already lost its file to another never takes its lock back.
+       \* "Still owned" (Section 99): a lock file at the lock path holding this operation's record.
+       \* FIX_REMOTE_LEASE_SPEC adds the amendment the open finding calls for: this process must still hold that
+       \* file's OS-native lock. It cannot get it back once a lease has lapsed - the descriptor keeps the kernel's
+       \* NFS_LOCK_LOST state, I/O through it fails with EIO, re-locking the same descriptor does not clear it, and
+       \* the documented recovery is to close the file and open it again (fcntl_locking(2), design Section 5.3).
+       \* The model tried a relock that took a lapsed lock back until 2026-09-16; no platform offers that.
        StillOwned(p) == /\ LockObj # NoObj
                         /\ fs.content[LockObj] = OwnRecord(p)
-                        /\ (FIX_REMOTE_LEASE_SPEC => HandleObj(p) = LockObj /\ fs.oslock[LockObj] \in {p, NoProc})
-       \* The filesystem after that relock attempt: it takes a lapsed lock back, and changes nothing otherwise.
-       Relock(p) == IF FIX_REMOTE_LEASE_SPEC /\ HandleObj(p) # NoObj /\ fs.oslock[HandleObj(p)] = NoProc
-                       /\ fs.content[HandleObj(p)] = OwnRecord(p)
-                    THEN FsTryLock(fs, p, HandleObj(p)).fs ELSE fs
+                        /\ (FIX_REMOTE_LEASE_SPEC => HandleObj(p) = LockObj /\ fs.oslock[LockObj] = p)
        \* The lock path holds a record whose owner is alive: what justifies TARGET_LOCK_BUSY
        \* (Section 7, 240.2). A takeover's record is the `breaklock` scenario's business.
        BusyJustified == /\ LockObj # NoObj
@@ -593,7 +591,6 @@
          \* "Still owned" is a read of the lock path; the decision that follows is local.
          if (crashed[self]) { goto publish_crashed; }
          else {
-           fs := Relock(self);
            if (StillOwned(self)) { checked[self] := TRUE; checkStale[self] := FALSE; }
            else {
              checked[self] := FALSE;
@@ -631,7 +628,6 @@
          else {
            checked[self] := FALSE;
            checkStale[self] := TRUE;
-           fs := Relock(self);
            if (~StillOwned(self)) {
              refusedOk[self] := lostLock[self];
              refused[self] := "TARGET_LOCK_BUSY";
@@ -653,7 +649,7 @@
            with (c \in FsUnlinkChoices) {
              fs := LandUnlink(fs, self, c);
            };
-           lostLock := IF pendingUnlink[self] # NoObj /\ LockObj = pendingUnlink[self] THEN MarkLost(self, LockObj) ELSE lostLock;
+           lostLock := IF pendingUnlink[self] # NoObj /\ LockObj # NoObj THEN MarkLost(self, LockObj) ELSE lostLock;
            pendingUnlink[self] := NoObj;
          };
        S99_close:
@@ -889,7 +885,6 @@
          \* Revalidate the lock it now holds (Section 99).
          if (crashed[self] \/ ~holding[self]) { goto brk_end; }
          else {
-           fs := Relock(self);
            if (~StillOwned(self)) {
              refusedOk[self] := lostLock[self];
              refused[self] := "TARGET_LOCK_BUSY";
@@ -954,7 +949,7 @@
                fs := FsProcCrash(LandUnlink(fs, IF land THEN p ELSE NoProc, c), p);
                \* Its own ghost goes back to FALSE: a crashed process never refuses again, so any other value is
                \* dead state that splits states which are otherwise the same.
-               lostLock := [ (IF land /\ pendingUnlink[p] # NoObj /\ LockObj = pendingUnlink[p]
+               lostLock := [ (IF land /\ pendingUnlink[p] # NoObj /\ LockObj # NoObj
                               THEN MarkLost(p, LockObj) ELSE lostLock) EXCEPT ![p] = FALSE ];
                landedAfterTakeover := landedAfterTakeover \/ (land /\ writing[p] /\ writeStale[p]);
                writing[p] := FALSE;

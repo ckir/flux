@@ -502,8 +502,8 @@ row with no citation is not a small debt - it is a result waiting to be withdraw
 | Behaviour the model assumes | Source | State |
 |---|---|---|
 | `rename` replacing an existing target is atomic to a reader: never a mixture, never a gap | [RFC 7530](https://datatracker.ietf.org/doc/html/rfc7530) | verified |
-| An in-flight `unlink` removes whatever holds the name when the server runs it, not the file the path named when the call was issued | [RFC 7530](https://datatracker.ietf.org/doc/html/rfc7530) (`REMOVE` carries the directory handle and the name) | verified; **the model is still optimistic here** - `LandUnlink` resolves at issue time (Section 11) |
-| A lock lost to an expired lease is not reclaimed; I/O through that descriptor fails with `EIO` until it is closed, and re-locking the same descriptor does not clear it | [fcntl_locking(2)](https://man7.org/linux/man-pages/man2/fcntl_locking.2.html); kernel `NFS_LOCK_LOST` | verified; **`FIX_REMOTE_LEASE_SPEC`'s relock test contradicts it** (Section 11) |
+| An in-flight `unlink` removes whatever holds the name when the server runs it, not the file the path named when the call was issued | [RFC 7530](https://datatracker.ietf.org/doc/html/rfc7530) (`REMOVE` carries the directory handle and the name) | verified, and modelled: `LandUnlink` resolves the name when the call lands (2026-09-16) |
+| A lock lost to an expired lease is not reclaimed; I/O through that descriptor fails with `EIO` until it is closed, and re-locking the same descriptor does not clear it | [fcntl_locking(2)](https://man7.org/linux/man-pages/man2/fcntl_locking.2.html); kernel `NFS_LOCK_LOST` | verified, and modelled: the fix flag's Section 99 test now requires the lock to be held, with no retake (2026-09-16) |
 | `recover_lost_locks=1` restores the pre-3.12 reclaim and risks corruption, so it is not the deployment the model describes | [kernel parameters](https://www.kernel.org/doc/Documentation/admin-guide/kernel-parameters.txt) | verified |
 | A process cannot ask whether it still holds its own lock | [LockFileEx](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex) (Windows); `F_GETLK` reports only other processes' locks | verified |
 | On SMB3 a durable handle whose oplock or lease break cannot be delivered is closed by the server, and the reconnect fails | [MS-SMB2](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/2a09fc40-1615-42df-bda6-2865b8d6da95) | verified; the Linux `EIO` rule must not be reused for SMB3 |
@@ -970,6 +970,11 @@ Findings the design already expects, each to be confirmed or refuted by the firs
   check run, with fix flag `FIX_REMOTE_LEASE_SPEC`, which exempts a prior owner whose check passed before
   the takeover, as the spec statement would; its `-fixed` run shows this is the only `SingleWriter` case. The spec
   amendment to 240.5 follows; while the finding is open no seed runs in `breaklock-remote` or `mixed-remote`.
+  **Re-measured on the real semantics (2026-09-16).** Two of the assumptions those windows were first measured
+  against were wrong, both in the direction that flattered the protocol (Section 5.3): an in-flight unlink now
+  removes whatever holds the lock name when it lands, and the fix flag's Section 99 test now requires the lock to
+  be held rather than modelling a retake no platform offers. The windows stand or fall on that run, not on the
+  earlier one.
   **How an open finding is expressed when its invariant fails often (measured 2026-09-16).** The `open_findings`
   mechanism of Section 4 assumes the invariant fails rarely: the check run carries it, TLC runs with `-continue`,
   and the runner reads the violated set. With the check-to-call window that assumption breaks - `SingleWriter`
