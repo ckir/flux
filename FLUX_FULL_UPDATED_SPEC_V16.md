@@ -4697,9 +4697,20 @@ call (for example `O_EXLOCK` with `O_CREAT | O_EXCL`), and otherwise
 immediately after it. In between, another invocation can open the new
 file and take its lock, because inspecting a lock (Section 240.1 step 3)
 and recovering one (Section 240.3 step 1) both try to take it. If the
-acquirer cannot take the lock, it removes the lock file it created and
-starts the acquisition again (Section 21.1 step 1); it never writes a
-record while another process holds the lock. A record written without the
+acquirer cannot take the lock, it tries again while the lock path still
+names the file it created (the same file identity as its handle) and the
+file is still empty; once either has changed, or it stops trying, it
+closes its handle and starts the acquisition again (Section 21.1 step 1).
+It never removes that file by name: another invocation may have taken it
+over in place (Section 240.5), and a name-based removal would delete that
+invocation's lock however the acquirer checked first. When it does take
+the lock, it checks the same two things again before writing, and starts
+again if either has changed. It never writes a record while another
+process holds the lock. An empty lock file left this way, or by an
+acquirer that crashed before writing its record, is uncertain ownership
+(Section 240.4), cleared by `--break-lock` (Section 240.5); a
+`--break-lock` on it can take it from a live acquirer that has not yet
+locked it, which then starts again and finds the target busy. A record written without the
 lock proves nothing about its owner, and Section 240.2 would read
 whichever process does hold the lock as that owner.
 
@@ -10594,8 +10605,10 @@ Recovery, and cleanup, replace a dead owner's lock by moving it aside:
    96.1). If the creation fails, another operation created the lock in the
    gap and owns the target: delete the moved file (its owner is dead) and
    classify what is at the lock path as Section 96.1 does. If the creation
-   succeeds but the OS-native lock cannot be taken, remove the lock file it
-   created, delete the moved file, and start the acquisition again.
+   succeeds but the OS-native lock cannot be taken, retry and give up as
+   Section 96.1's acquirer does, never removing the new lock file by name;
+   on giving up, close it, delete the moved file, and start the acquisition
+   again.
 5. Delete the moved file.
 
 The lock path is empty between steps 2 and 4. That is harmless because
@@ -13486,6 +13499,8 @@ A conforming implementation must test at least:
      reported ARTIFACT_OWNERSHIP_UNCERTAIN.
 146. a committed target always has its created-entry claim, including after a crash right after COMMIT; a lock record
      torn by a crash fails its checksum and counts as uncertain ownership.
+147. an acquirer that cannot take the OS-native lock on the file it created never removes that file by name: it retries
+     while the path names its still-empty file and otherwise closes, so a --break-lock takeover of the file keeps its lock.
 ```
 
 ## 259.15 V15 Implementation Baseline
