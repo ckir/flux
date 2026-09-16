@@ -634,6 +634,11 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
            };
          };
        S240_5_close:
+         \* Only `tobj`. The seeded rename path (SEED_RENAME_OVER_TAKEOVER) also holds a handle on its own
+         \* takeover file, and reaches here only when `FsRenameReplace` failed - which needs a handle
+         \* without delete sharing, so `DeleteAllowed` (FsModel.tla) makes it impossible on POSIX, and the
+         \* one run that sets that seed is POSIX. On a Windows pairing the branch would be live and would
+         \* leave that handle open (capstone finding, plan 3: unreachable, so not fixed).
          if (crashed[self]) { goto takeover_crashed; }
          else {
            if (tobj # NoObj /\ OpenBy(fs, self, tobj)) { fs := FsClose(fs, self, tobj).fs; };
