@@ -84,7 +84,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
        holding = [p \in Procs |-> FALSE],         \* this process owns the target lock now
        checked = [p \in Procs |-> FALSE],         \* its last Section 99 check passed
        writing = [p \in Procs |-> FALSE],         \* its publishing write is issued and has not landed (Section 5.2)
-       pendingUnlink = [p \in Procs |-> NoObj],   \* the lock file its issued release unlink resolved, not yet landed
+       pendingUnlink = [p \in Procs |-> NoObj],   \* NoObj unless a release unlink of its is in flight; only ever tested # NoObj (the name resolves at landing)
        checkStale = [p \in Procs |-> TRUE],       \* a lock tenure began after its last passing Section 99 check
        writeStale = [p \in Procs |-> TRUE],       \* a lock tenure began after it issued its publishing write
        lostLock = [p \in Procs |-> FALSE],        \* ghost: another process's write, unlink, rename or a lease lapse hit its lock file
@@ -101,8 +101,9 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
        \* `f` after process q's issued release unlink lands (Section 5.2). NFS REMOVE carries the directory handle
        \* and the NAME, and the server resolves that name when it EXECUTES the call (RFC 7530, design Section 5.3),
        \* so a stale unlink removes whatever holds the lock name then - including a lock another operation created
-       \* meanwhile. The model read this the optimistic way until 2026-09-16, and the three accepted remote windows
-       \* were measured under that reading. q = NoProc lands nothing.
+       \* meanwhile. The model read this the optimistic way until 2026-09-16; the three accepted remote windows
+       \* were RE-measured under this reading, and the plan 3 document carries the state counts. q = NoProc
+       \* lands nothing.
        LandUnlink(f, q, c) == IF q # NoProc /\ pendingUnlink[q] # NoObj /\ At(f, P, LockName) # NoObj
                               THEN FsUnlink(f, P, LockName, c).fs ELSE f
        OwnRecord(p) == Rec(p, IF p \in Cleanups THEN "cleanup" ELSE "operation")
@@ -694,8 +695,9 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
            };
          };
        S99_release:
-         \* The release unlink is issued: it resolves the lock path to a file now and removes that file's name when
-         \* it lands, as a system call resolves its path when it starts.
+         \* The release unlink is issued. Which file it removes is NOT decided here: REMOVE carries the NAME, and
+         \* the server resolves it when the call LANDS (RFC 7530, design Section 5.3) - `LandUnlink` does that.
+         \* So the object stored below is never read back; `pendingUnlink` only records that an unlink is in flight.
          if (crashed[self]) { goto publish_crashed; }
          else {
            holding[self] := FALSE;
@@ -707,6 +709,10 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
            with (c \in FsUnlinkChoices) {
              fs := LandUnlink(fs, self, c);
            };
+           \* After the fs assignment ON PURPOSE: `LockObj` is a define-block operator, so it denotes the
+           \* PRE-step `fs` wherever it is written - unlike a direct `fs.` read, which sees the assignment
+           \* above (the lease-expiry branch below depends on that opposite rule). This names the lock as it
+           \* stood before the unlink landed, which is the holder to mark lost.
            lostLock := IF pendingUnlink[self] # NoObj /\ LockObj # NoObj THEN MarkLost(self, LockObj) ELSE lostLock;
            pendingUnlink[self] := NoObj;
          };
@@ -1007,6 +1013,9 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
                fs := FsProcCrash(LandUnlink(fs, IF land THEN p ELSE NoProc, c), p);
                \* Its own ghost goes back to FALSE: a crashed process never refuses again, so any other value is
                \* dead state that splits states which are otherwise the same.
+               \* `LockObj` is a define-block operator: it denotes the PRE-step `fs`, not the one assigned two
+               \* lines up, so this is the lock as it stood before the crash's unlink landed. A direct `fs.`
+               \* read would see the assignment instead (the lease-expiry branch below relies on that).
                lostLock := [ (IF land /\ pendingUnlink[p] # NoObj /\ LockObj # NoObj
                               THEN MarkLost(p, LockObj) ELSE lostLock) EXCEPT ![p] = FALSE ];
                landedAfterTakeover := landedAfterTakeover \/ (land /\ writing[p] /\ writeStale[p]);
@@ -1066,8 +1075,8 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "e9414163" /\ chksum(tla) = "e186ecdf")
-\* Procedure variable obj of procedure Classify at line 166 col 18 changed to obj_
+\* BEGIN TRANSLATION (chksum(pcal) = "2bc9678b" /\ chksum(tla) = "9eb4fa40")
+\* Procedure variable obj of procedure Classify at line 167 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
           live, holding, checked, writing, pendingUnlink, checkStale, 
@@ -1077,6 +1086,7 @@ VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed,
 
 (* define statement *)
 LockObj == At(fs, P, LockName)
+
 
 
 
@@ -3452,9 +3462,17 @@ Classifiable == \A o \in Objs : fs.content[o] = NoContent \/ fs.content[o] \in C
 \* is a call already started before a later tenure began (240.5: "a filesystem call it had already started can
 \* still complete"). FIX_REMOTE_LEASE_SPEC models the amendments the open finding calls for: a process whose
 \* check passed in an earlier generation is no longer counted (the check-to-call window, however the lock was
-\* lost), and Section 99's check also tries the lock (Relock).
+\* lost), and Section 99's check also tests that the process still holds the lock file it opened - it does not
+\* model retaking a lost lock, which a poisoned descriptor cannot do (design Section 5.3).
 Superseded(p) == IF FIX_REMOTE_LEASE_SPEC THEN checkStale[p] ELSE writing[p] /\ writeStale[p]
 SingleWriter == Cardinality({p \in Procs : (checked[p] \/ writing[p]) /\ ~Superseded(p)}) <= 1
+
+\* A NON-VACUITY WITNESS for the runs that turn FIX_REMOTE_LEASE_SPEC on. The flag REPLACES `Superseded`'s
+\* formula rather than narrowing it, so a clean -fixed-check run is open to two readings: the window closed,
+\* or every process is superseded and the count SingleWriter bounds is always zero. Witnessed violated, this
+\* says the second reading is false - some state has a process inside a publishing step that the flag does
+\* NOT supersede, so SingleWriter is bounding a real count there (capstone finding, plan 3).
+NoLiveWriter == Cardinality({p \in Procs : (checked[p] \/ writing[p]) /\ ~Superseded(p)}) = 0
 
 \* A process without `--break-lock` never removes, renames, or overwrites a lock it classified as
 \* uncertain, and creates a lock only at an empty lock path (Section 7).
@@ -3472,8 +3490,10 @@ ForeignUntouched == foreignObj # NoObj => LockObj = foreignObj /\ fs.content[for
 \* BUSY for a lock it judged dead, or a Section 99 check (S99_check, S99_release_check, S21_1_s3) refusing with
 \* no cause: such a refusal is justified only by the ghost lostLock, set when another process's write, unlink,
 \* rename or replacement hit the lock file this process holds, or its lease lapsed (owner ruling for plan 3,
-\* 2026-09-15). The other refusing labels record the evidence of RefusalEvidence. The
-\* refusing label records its evidence because the refusal may be reported after what it saw has changed: the
+\* 2026-09-15). Every other refusing label but one records the evidence of RefusalEvidence; S240_5_s6 records
+\* its own, narrower predicate (the lock exists and is not the file this takeover opened), which is exactly
+\* 240.2's "the lock is held" and is sound where RefusalEvidence would not be - a new occupant has no record
+\* yet. The refusing label records its evidence because the refusal may be reported after what it saw has changed: the
 \* refusal rests on what the classifier observed, not on a re-read.
 RefusalJustified == \A p \in Procs : refused[p] = "TARGET_LOCK_BUSY" => refusedOk[p]
 

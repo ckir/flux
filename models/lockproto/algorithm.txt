@@ -26,7 +26,7 @@
        holding = [p \in Procs |-> FALSE],         \* this process owns the target lock now
        checked = [p \in Procs |-> FALSE],         \* its last Section 99 check passed
        writing = [p \in Procs |-> FALSE],         \* its publishing write is issued and has not landed (Section 5.2)
-       pendingUnlink = [p \in Procs |-> NoObj],   \* the lock file its issued release unlink resolved, not yet landed
+       pendingUnlink = [p \in Procs |-> NoObj],   \* NoObj unless a release unlink of its is in flight; only ever tested # NoObj (the name resolves at landing)
        checkStale = [p \in Procs |-> TRUE],       \* a lock tenure began after its last passing Section 99 check
        writeStale = [p \in Procs |-> TRUE],       \* a lock tenure began after it issued its publishing write
        lostLock = [p \in Procs |-> FALSE],        \* ghost: another process's write, unlink, rename or a lease lapse hit its lock file
@@ -43,8 +43,9 @@
        \* `f` after process q's issued release unlink lands (Section 5.2). NFS REMOVE carries the directory handle
        \* and the NAME, and the server resolves that name when it EXECUTES the call (RFC 7530, design Section 5.3),
        \* so a stale unlink removes whatever holds the lock name then - including a lock another operation created
-       \* meanwhile. The model read this the optimistic way until 2026-09-16, and the three accepted remote windows
-       \* were measured under that reading. q = NoProc lands nothing.
+       \* meanwhile. The model read this the optimistic way until 2026-09-16; the three accepted remote windows
+       \* were RE-measured under this reading, and the plan 3 document carries the state counts. q = NoProc
+       \* lands nothing.
        LandUnlink(f, q, c) == IF q # NoProc /\ pendingUnlink[q] # NoObj /\ At(f, P, LockName) # NoObj
                               THEN FsUnlink(f, P, LockName, c).fs ELSE f
        OwnRecord(p) == Rec(p, IF p \in Cleanups THEN "cleanup" ELSE "operation")
@@ -636,8 +637,9 @@
            };
          };
        S99_release:
-         \* The release unlink is issued: it resolves the lock path to a file now and removes that file's name when
-         \* it lands, as a system call resolves its path when it starts.
+         \* The release unlink is issued. Which file it removes is NOT decided here: REMOVE carries the NAME, and
+         \* the server resolves it when the call LANDS (RFC 7530, design Section 5.3) - `LandUnlink` does that.
+         \* So the object stored below is never read back; `pendingUnlink` only records that an unlink is in flight.
          if (crashed[self]) { goto publish_crashed; }
          else {
            holding[self] := FALSE;
@@ -649,6 +651,10 @@
            with (c \in FsUnlinkChoices) {
              fs := LandUnlink(fs, self, c);
            };
+           \* After the fs assignment ON PURPOSE: `LockObj` is a define-block operator, so it denotes the
+           \* PRE-step `fs` wherever it is written - unlike a direct `fs.` read, which sees the assignment
+           \* above (the lease-expiry branch below depends on that opposite rule). This names the lock as it
+           \* stood before the unlink landed, which is the holder to mark lost.
            lostLock := IF pendingUnlink[self] # NoObj /\ LockObj # NoObj THEN MarkLost(self, LockObj) ELSE lostLock;
            pendingUnlink[self] := NoObj;
          };
@@ -949,6 +955,9 @@
                fs := FsProcCrash(LandUnlink(fs, IF land THEN p ELSE NoProc, c), p);
                \* Its own ghost goes back to FALSE: a crashed process never refuses again, so any other value is
                \* dead state that splits states which are otherwise the same.
+               \* `LockObj` is a define-block operator: it denotes the PRE-step `fs`, not the one assigned two
+               \* lines up, so this is the lock as it stood before the crash's unlink landed. A direct `fs.`
+               \* read would see the assignment instead (the lease-expiry branch below relies on that).
                lostLock := [ (IF land /\ pendingUnlink[p] # NoObj /\ LockObj # NoObj
                               THEN MarkLost(p, LockObj) ELSE lostLock) EXCEPT ![p] = FALSE ];
                landedAfterTakeover := landedAfterTakeover \/ (land /\ writing[p] /\ writeStale[p]);
