@@ -4,8 +4,11 @@
 #   python models/lockproto/run.py --expected models/lockproto/expected-extended.toml --scenario recovery
 # The suite-wide union is not judged here: host crashes share `env_loop`, so these runs cover no label
 # the process-crash runs in expected.toml miss.
+#
+# It is also where an OPEN EXPERIMENT lives - a run whose outcome is not known yet, which therefore
+# must not be able to redden the per-pull-request gate. See the takeover-refusal witness at the end.
 
-scenarios = ["recovery"]
+scenarios = ["recovery", "breaklock"]
 
 [[run]]
 name = "recovery-posix-hostcrash-check"
@@ -125,3 +128,13 @@ unreached = [
     { label = "S99_refuse_close", reason = "a Section 99 check fails only for an owner whose lock was taken while it ran; no recovery actor loses its lock while running (a takeover needs a Breaker, a lapsed lease needs LockCapability = remote)" },
 ]
 timeout_minutes = 150
+
+[[run]]
+name = "breaklock-posix-takeover-refusal-witness-RefusalJustified"
+module = "LockProtocol"
+config = "configs/breaklock-posix-takeover-refusal-witness-RefusalJustified.cfg"
+scenario = "breaklock"
+kind = "witness"
+violated = ["RefusalJustified"]
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = [], Cleanups = [], Breakers = ["b1", "b2"], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false }
+timeout_minutes = 30

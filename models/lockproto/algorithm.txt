@@ -537,7 +537,19 @@
            with (ident \in FsIdentityChoices(fs, P, LockName)) {
              if (ident = NoObj) { refused[self] := "RESTART"; goto S240_5_close; }
              else if (ident # tobj) {
-               refusedOk[self] := LockObj # NoObj /\ LockObj # tobj;
+               \* OPEN FINDING (capstone, plan 3). The evidence below is a RESTATEMENT of this branch's
+               \* own guard: TakeOver runs only under strong identity (S240_5_s1), where
+               \* FsIdentityChoices is the singleton {At(fs, P, LockName)} = {LockObj}, so `ident` IS
+               \* `LockObj` and the assignment is TRUE whenever this branch is taken. RefusalJustified
+               \* therefore cannot fail here - exactly what the ruling at the MarkLost comment above
+               \* forbids. What SHOULD justify TARGET_LOCK_BUSY at a label whose whole meaning is
+               \* "someone else won the race" is an OPEN SPEC QUESTION (owner, 2026-09-17): the flag
+               \* below asks RefusalEvidence instead, so a witness run can PRINT the occupant the
+               \* restatement was blessing, and the spec can be decided from that trace rather than
+               \* from an argument. No fs is assigned earlier in this label, so the define-block
+               \* operators read the state this branch actually sees.
+               refusedOk[self] := IF FIX_TAKEOVER_REFUSAL THEN RefusalEvidence(self)
+                                  ELSE LockObj # NoObj /\ LockObj # tobj;
                refused[self] := "TARGET_LOCK_BUSY";
                goto S240_5_close;
              }
