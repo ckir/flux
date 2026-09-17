@@ -52,10 +52,10 @@ ForeignUntouched == foreignObj # NoObj => LockObj = foreignObj /\ fs.content[for
 \* BUSY for a lock it judged dead, or a Section 99 check (S99_check, S99_release_check, S21_1_s3) refusing with
 \* no cause: such a refusal is justified only by the ghost lostLock, set when another process's write, unlink,
 \* rename or replacement hit the lock file this process holds, or its lease lapsed (owner ruling for plan 3,
-\* 2026-09-15). Every other refusing label but one records the evidence of RefusalEvidence; S240_5_s6 records
-\* its own, narrower predicate (the lock exists and is not the file this takeover opened), which is exactly
-\* 240.2's "the lock is held" and is sound where RefusalEvidence would not be - a new occupant has no record
-\* yet. The refusing label records its evidence because the refusal may be reported after what it saw has changed: the
+\* 2026-09-15). EVERY refusing label now records the evidence of RefusalEvidence - there is no exception.
+\* S240_5_s6 used to be one, on a predicate that restated its own branch guard and so could never fail; that
+\* label no longer refuses at all (240.5 step 6, amended 2026-09-17), which is why the exception is gone
+\* rather than fixed. The refusing label records its evidence because the refusal may be reported after what it saw has changed: the
 \* refusal rests on what the classifier observed, not on a re-read.
 RefusalJustified == \A p \in Procs : refused[p] = "TARGET_LOCK_BUSY" => refusedOk[p]
 

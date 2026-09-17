@@ -2014,6 +2014,28 @@ class UnionFromLogsTests(unittest.TestCase):
             self.assertIn("cannot judge the union", out.getvalue())
             self.assertIn(expected.runs[1].name, out.getvalue())
 
+    def test_a_log_with_no_complete_coverage_block_fails(self) -> None:
+        """A log that is PRESENT but silent must fail, not count as "covered nothing".
+
+        parse_coverage returns None rather than judging from a partial block. `or {}` used to turn
+        that refusal into an empty coverage set, which inflates `uncovered` (loud) but SHRINKS
+        all_covered - and all_covered is the only detector for a never_reached or deferred label
+        that IS covered, so those two checks failed OPEN. Reachable because the per-run coverage
+        gate covers check/liveness only, while witness and seeded runs also carry -coverage 1.
+        """
+        d = ExpectedDir()
+        self.addCleanup(d.close)
+        expected = d.load()
+        for r in expected.runs:
+            self.write_log(r.name)
+        # one run's log is present and parses to no complete coverage block
+        (self.logs / "tlc-output-x-posix" / f"{expected.runs[0].name}.log").write_text("", encoding="utf-8")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = run.judge_union_from(expected, d.path, self.logs)
+        self.assertEqual(code, 1, "a silent log must fail the union, never be read as covering nothing")
+        self.assertIn("no complete coverage block", out.getvalue())
+
     def test_no_logs_at_all_fails(self) -> None:
         d = ExpectedDir()
         self.addCleanup(d.close)

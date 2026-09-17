@@ -535,8 +535,9 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          else {
            \* A torn record read HERE is deliberately not recorded in `tornRead`, unlike the classify read.
            \* That ghost is a witness only (`NeverTornRead`), it already fires from the classify path, so
-           \* setting it here buys no coverage - and it would add reachable states to a scenario whose CI
-           \* job already runs 2h36m against a 3h cap. Revisit with the job split (capstone, plan 3).
+           \* setting it here buys no coverage and changes no verdict, which is the whole reason. (It also
+           \* used to cite the breaklock-remote job's budget; that job has since been split and the reason
+           \* no longer needs it - capstone, plan 3.)
            with (seen = fs.content[tobj]) {
              if (IsRecord(seen) /\ seen # seenRec[self]) { refused[self] := "RESTART"; goto S240_5_close; }
              else if (IsRecord(seen)) {
@@ -588,8 +589,9 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          };
        S240_5_s6:
          \* Check the file identity against the lock path again. Empty: the prior owner removed its lock
-         \* meanwhile, so start again. Another file: whoever created it owns the target. The same file: the
-         \* takeover stands, and this operation proceeds as if the prior owner were dead.
+         \* meanwhile, so start again. Another file: another operation claimed the path, so start again too
+         \* (240.5 step 6, amended 2026-09-17). The same file: the takeover stands, and this operation
+         \* proceeds as if the prior owner were dead.
          if (crashed[self]) { goto takeover_crashed; }
          else {
            with (ident \in FsIdentityChoices(fs, P, LockName)) {
@@ -3514,10 +3516,10 @@ ForeignUntouched == foreignObj # NoObj => LockObj = foreignObj /\ fs.content[for
 \* BUSY for a lock it judged dead, or a Section 99 check (S99_check, S99_release_check, S21_1_s3) refusing with
 \* no cause: such a refusal is justified only by the ghost lostLock, set when another process's write, unlink,
 \* rename or replacement hit the lock file this process holds, or its lease lapsed (owner ruling for plan 3,
-\* 2026-09-15). Every other refusing label but one records the evidence of RefusalEvidence; S240_5_s6 records
-\* its own, narrower predicate (the lock exists and is not the file this takeover opened), which is exactly
-\* 240.2's "the lock is held" and is sound where RefusalEvidence would not be - a new occupant has no record
-\* yet. The refusing label records its evidence because the refusal may be reported after what it saw has changed: the
+\* 2026-09-15). EVERY refusing label now records the evidence of RefusalEvidence - there is no exception.
+\* S240_5_s6 used to be one, on a predicate that restated its own branch guard and so could never fail; that
+\* label no longer refuses at all (240.5 step 6, amended 2026-09-17), which is why the exception is gone
+\* rather than fixed. The refusing label records its evidence because the refusal may be reported after what it saw has changed: the
 \* refusal rests on what the classifier observed, not on a re-read.
 RefusalJustified == \A p \in Procs : refused[p] = "TARGET_LOCK_BUSY" => refusedOk[p]
 

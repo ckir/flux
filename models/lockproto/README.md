@@ -125,6 +125,11 @@ kinds at once do not finish, so the check runs pair them, and each pairing is ex
   ghosts left every run green.
 - `MaxCrashes = 2` in every run. With one crash, the path where a recovering actor itself crashes was unreachable,
   so a second crash is what the crash-inside-recovery interleavings need.
+- **One pass, never a loop.** Where the spec says an actor starts its acquisition again - 240.3 step 2 and
+  step 4, 240.5 step 6's two restarting branches, and `S240_3_restart` itself - the model records
+  `refused = "RESTART"` and stops instead of looping. One pass reaches every state a further one would,
+  because a second pass starts from a state the first already explored. Nothing in the model takes a next
+  pass, so a spec sentence whose justification rests on one ("the next pass classifies it") is not modelled.
 - `MaxObjs` (3 to 6, one per actor) cannot bind. Every actor makes at most one exclusive create, and
   `fs.next <= Cardinality(Procs)` was checked over the whole state space of the tightest run.
 - `IdentityStrength = "strong"` only. Measured, the weak-identity variant explores an identical state graph here,

@@ -1192,13 +1192,27 @@ def union_from_logs(entries: list[tuple[str, str]], base: Path,
     universes: dict[str, LabelUniverse] = {}
     covered: dict[str, set[str]] = {}
     reported: dict[str, set[str]] = {}
+    silent: list[str] = []
     for module, log_text in entries:
         if module not in universes:
             universes[module] = module_labels((base / f"{module}.tla").read_text(encoding="utf-8"))
-        coverage = parse_coverage(parse_messages(log_text)) or {}
+        coverage = parse_coverage(parse_messages(log_text))
+        if coverage is None:
+            # parse_coverage fails CLOSED on purpose - it returns None rather than judging from a
+            # partial block. `or {}` used to turn that refusal into "this run covered nothing", which
+            # is not fail-closed in both directions: it inflates `uncovered` (loud) but SHRINKS
+            # `all_covered`, and `all_covered` is the only detector for a never_reached or deferred
+            # label that IS covered - so those two checks failed OPEN. execute() has always treated
+            # this condition as a tooling failure; the union now does too (capstone, plan 3).
+            silent.append(module)
+            continue
         reported.setdefault(module, set()).update(coverage)
         covered.setdefault(module, set()).update(name for name, (_d, total) in coverage.items() if total > 0)
 
+    if silent:
+        print(f"run.py: cannot judge the union: {len(silent)} log(s) carry no complete coverage block "
+              f"(truncated, empty, or -coverage output cut short)")
+        return True
     all_covered: set[str] = set().union(*covered.values()) if covered else set()
     uncovered: set[str] = set()
     covered_in_universe: set[str] = set()

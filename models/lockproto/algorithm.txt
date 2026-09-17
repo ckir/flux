@@ -477,8 +477,9 @@
          else {
            \* A torn record read HERE is deliberately not recorded in `tornRead`, unlike the classify read.
            \* That ghost is a witness only (`NeverTornRead`), it already fires from the classify path, so
-           \* setting it here buys no coverage - and it would add reachable states to a scenario whose CI
-           \* job already runs 2h36m against a 3h cap. Revisit with the job split (capstone, plan 3).
+           \* setting it here buys no coverage and changes no verdict, which is the whole reason. (It also
+           \* used to cite the breaklock-remote job's budget; that job has since been split and the reason
+           \* no longer needs it - capstone, plan 3.)
            with (seen = fs.content[tobj]) {
              if (IsRecord(seen) /\ seen # seenRec[self]) { refused[self] := "RESTART"; goto S240_5_close; }
              else if (IsRecord(seen)) {
@@ -530,8 +531,9 @@
          };
        S240_5_s6:
          \* Check the file identity against the lock path again. Empty: the prior owner removed its lock
-         \* meanwhile, so start again. Another file: whoever created it owns the target. The same file: the
-         \* takeover stands, and this operation proceeds as if the prior owner were dead.
+         \* meanwhile, so start again. Another file: another operation claimed the path, so start again too
+         \* (240.5 step 6, amended 2026-09-17). The same file: the takeover stands, and this operation
+         \* proceeds as if the prior owner were dead.
          if (crashed[self]) { goto takeover_crashed; }
          else {
            with (ident \in FsIdentityChoices(fs, P, LockName)) {
