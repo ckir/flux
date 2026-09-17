@@ -1171,21 +1171,33 @@ def judge_union(executed: list[tuple[Run, bool, Result]], base: Path,
     if any(result.status == "tooling" for _run, _fixed, result in executed):
         print("run.py: suite-wide coverage not judged: a run failed or timed out")
         return False
+    entries = []
+    for run, fixed, result in executed:
+        if fixed:
+            continue
+        assert result.log is not None, "a non-tooling result always has a log"
+        entries.append((run.module, result.log.read_text(encoding="utf-8", errors="replace")))
+    return union_from_logs(entries, base, never_reached, deferred)
 
+
+def union_from_logs(entries: list[tuple[str, str]], base: Path,
+                    never_reached: tuple[tuple[str, str], ...],
+                    deferred: tuple[tuple[str, str, str], ...]) -> bool:
+    """The union arithmetic itself, over (module, TLC log text) pairs.
+
+    Split out so the union can be judged from logs SAVED BY EARLIER JOBS rather than only from runs
+    this invocation made - see --union-from. Returns whether the union failed."""
     never_reached_labels = {label for label, _ in never_reached}
     deferred_labels = {label for label, _scenario, _reason in deferred}
     universes: dict[str, LabelUniverse] = {}
     covered: dict[str, set[str]] = {}
     reported: dict[str, set[str]] = {}
-    for run, fixed, result in executed:
-        if fixed:
-            continue
-        if run.module not in universes:
-            universes[run.module] = module_labels((base / f"{run.module}.tla").read_text(encoding="utf-8"))
-        assert result.log is not None, "a non-tooling result always has a log"
-        coverage = parse_coverage(parse_messages(result.log.read_text(encoding="utf-8", errors="replace"))) or {}
-        reported.setdefault(run.module, set()).update(coverage)
-        covered.setdefault(run.module, set()).update(name for name, (_d, total) in coverage.items() if total > 0)
+    for module, log_text in entries:
+        if module not in universes:
+            universes[module] = module_labels((base / f"{module}.tla").read_text(encoding="utf-8"))
+        coverage = parse_coverage(parse_messages(log_text)) or {}
+        reported.setdefault(module, set()).update(coverage)
+        covered.setdefault(module, set()).update(name for name, (_d, total) in coverage.items() if total > 0)
 
     all_covered: set[str] = set().union(*covered.values()) if covered else set()
     uncovered: set[str] = set()
@@ -1209,6 +1221,30 @@ def judge_union(executed: list[tuple[Run, bool, Result]], base: Path,
     return False
 
 
+def judge_union_from(expected: Expected, base: Path, logs_dir: Path) -> int:
+    """Judge the suite-wide coverage union from TLC logs the scenario jobs already wrote.
+
+    The union used to be judged by RE-RUNNING every run of expected.toml in one job. Measured
+    (CI 35188279927), that job cannot fit: it ran exactly its 180-minute cap and was killed, and
+    `breaklock-remote` alone is ~2.5h - so the one place the union is judged was never judging it.
+    The scenario jobs already upload `target/tla/out/`, and the union needs nothing from a run but
+    its last coverage block, so it is arithmetic over those logs and costs no TLC time at all.
+
+    A log that is MISSING is a hard failure, not a gap to skip: a union computed from some of the
+    runs would under-report coverage and fail honest labels, or over-report and excuse real ones."""
+    logs = {path.stem: path for path in sorted(logs_dir.rglob("*.log"))}
+    wanted = [r for r in expected.runs]
+    missing = [r.name for r in wanted if r.name not in logs]
+    if missing:
+        print(f"run.py: cannot judge the union: no TLC log for {len(missing)} run(s) under {logs_dir}: "
+              f"{', '.join(sorted(missing))}", file=sys.stderr)
+        return 2
+    entries = [(r.module, logs[r.name].read_text(encoding="utf-8", errors="replace")) for r in wanted]
+    print(f"run.py: judging the union from {len(entries)} saved logs under {logs_dir}")
+    failed = union_from_logs(entries, base, expected.never_reached, expected.deferred)
+    return 1 if failed else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the lock-protocol model check.")
     parser.add_argument("--expected", type=Path, default=HERE / "expected.toml")
@@ -1217,6 +1253,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--job", help="run only the runs in this CI job (see --list-jobs)")
     parser.add_argument("--check-translation", action="store_true",
                         help="re-run the PlusCal translator and fail if LockProtocol.tla is stale")
+    parser.add_argument("--union-from", type=Path, metavar="DIR",
+                        help="judge the suite-wide coverage union from TLC logs already written under DIR, "
+                             "instead of re-running every run")
     parser.add_argument("--list-scenarios", action="store_true", help="print the scenario names as JSON")
     parser.add_argument("--list-jobs", action="store_true",
                          help="print the distinct {scenario, platform} pairs as JSON")
@@ -1248,6 +1287,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.check_translation:
         return check_translation(args.expected.resolve().parent)
+    if args.union_from is not None:
+        return judge_union_from(expected, args.expected.resolve().parent, args.union_from)
     if args.scenario is not None and args.scenario not in scenarios:
         print(f"run.py: unknown scenario {args.scenario!r}; known: {', '.join(scenarios)}", file=sys.stderr)
         return 2

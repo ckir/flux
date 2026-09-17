@@ -1983,5 +1983,47 @@ class ConfigConsistencyTests(unittest.TestCase):
                 f"of the fixed run is to check it with the flag on")
 
 
+class UnionFromLogsTests(unittest.TestCase):
+    """--union-from: judge the union from logs earlier CI jobs already wrote.
+
+    The union used to be judged by re-running every run in one job; measured, that job could not fit
+    its 180-minute cap, so the only place the union was judged never judged it (capstone, plan 3)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.logs = Path(self._tmp.name) / "artifacts"
+        # nested, as `gh run download` lays artifacts out: one directory per uploading job
+        (self.logs / "tlc-output-x-posix").mkdir(parents=True)
+
+    def write_log(self, name: str, case: str = "smoke_check_coverage") -> None:
+        (self.logs / "tlc-output-x-posix" / f"{name}.log").write_text(fixture(case)[1], encoding="utf-8")
+
+    def test_a_missing_log_fails_rather_than_under_reporting(self) -> None:
+        d = ExpectedDir()
+        self.addCleanup(d.close)
+        expected = d.load()
+        self.write_log(expected.runs[0].name)
+        for extra in expected.runs[1:]:
+            pass  # deliberately not written
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            code = run.judge_union_from(expected, d.path, self.logs)
+        if len(expected.runs) > 1:
+            self.assertEqual(code, 2)
+            self.assertIn("cannot judge the union", out.getvalue())
+            self.assertIn(expected.runs[1].name, out.getvalue())
+
+    def test_no_logs_at_all_fails(self) -> None:
+        d = ExpectedDir()
+        self.addCleanup(d.close)
+        expected = d.load()
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            code = run.judge_union_from(expected, d.path, self.logs)
+        self.assertEqual(code, 2, "an empty artifact directory must fail, never pass vacuously")
+        self.assertIn("cannot judge the union", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

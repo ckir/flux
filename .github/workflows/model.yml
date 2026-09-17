@@ -128,9 +128,34 @@ jobs:
       - name: Re-run pcal.trans and diff
         run: python models/lockproto/run.py --check-translation
 
+  union:
+    # The suite-wide coverage union (design Section 4). It used to live in the extended tier, which
+    # RE-RAN every run of expected.toml in one job to compute it - and measured (CI 35188279927) that
+    # job ran exactly its 180-minute cap and was killed, so the one place the union was judged never
+    # judged it. The union needs nothing from a run but its last coverage block, which the scenario
+    # jobs above already upload, so here it is arithmetic over those logs and costs no TLC time.
+    # It needs EVERY run's log and fails if one is missing, so it only runs when the full matrix did.
+    name: Suite-wide coverage union
+    needs: [plan, scenario]
+    if: needs.plan.outputs.matrix != '[]' && needs.scenario.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Download every scenario's TLC output
+        uses: actions/download-artifact@v7
+        with:
+          pattern: tlc-output-*
+          path: tlc-output
+      - name: Judge the union
+        run: python models/lockproto/run.py --union-from tlc-output
+
   model-gate:
     name: Model gate
-    needs: [plan, scenario, translation]
+    needs: [plan, scenario, translation, union]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -139,15 +164,16 @@ jobs:
           PLAN: ${{ needs.plan.result }}
           SCENARIO: ${{ needs.scenario.result }}
           TRANSLATION: ${{ needs.translation.result }}
+          UNION: ${{ needs.union.result }}
           MATRIX: ${{ needs.plan.outputs.matrix }}
         run: |
-          echo "plan=$PLAN scenario=$SCENARIO translation=$TRANSLATION matrix=$MATRIX"
+          echo "plan=$PLAN scenario=$SCENARIO translation=$TRANSLATION union=$UNION matrix=$MATRIX"
           if [ "$PLAN" != "success" ]; then
             echo "::error::the plan job did not succeed"; exit 1
           fi
           if [ "$MATRIX" = "[]" ]; then
-            if [ "$SCENARIO" = "skipped" ] && [ "$TRANSLATION" = "skipped" ]; then exit 0; fi
-            echo "::error::nothing needed to run, yet scenario=$SCENARIO translation=$TRANSLATION"; exit 1
+            if [ "$SCENARIO" = "skipped" ] && [ "$TRANSLATION" = "skipped" ] && [ "$UNION" = "skipped" ]; then exit 0; fi
+            echo "::error::nothing needed to run, yet scenario=$SCENARIO translation=$TRANSLATION union=$UNION"; exit 1
           fi
           if [ "$TRANSLATION" != "success" ]; then
             echo "::error::LockProtocol.tla is not what pcal.trans emits for its sources ($TRANSLATION)"
@@ -155,4 +181,7 @@ jobs:
           fi
           if [ "$SCENARIO" != "success" ]; then
             echo "::error::a scenario job did not succeed ($SCENARIO)"; exit 1
+          fi
+          if [ "$UNION" != "success" ]; then
+            echo "::error::the suite-wide coverage union did not succeed ($UNION)"; exit 1
           fi

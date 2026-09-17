@@ -18,6 +18,7 @@ its first scenario, `recovery`, end to end. Later plans add the remaining scenar
 | `just model <scenario> <platform>` | runs one scenario's runs for one platform: `just model recovery posix` | Java 11+, Python 3.11+ |
 | `just model <scenario> <platform> <job>` | runs exactly one CI job's runs: `just model breaklock-remote posix posix-plain` | Java 11+, Python 3.11+ |
 | `python models/lockproto/run.py --check-translation` | re-runs the PlusCal translator and fails if the committed `LockProtocol.tla` is not what it emits | Java 11+, Python 3.11+ |
+| `python models/lockproto/run.py --union-from <dir>` | judges the suite-wide coverage union from TLC logs already written under `<dir>`, instead of re-running everything | Python 3.11+ |
 | `python models/lockproto/run.py --expected models/lockproto/expected-extended.toml --scenario recovery` | the host-crash tier; hours of CPU, meant for CI | Java 11+, Python 3.11+ |
 | `just model-test` | unit tests of `run.py` (recorded TLC output, no Java) and of the CI workflow's change detection | Python 3.11+ |
 | `just model-stamp` | runs `just model`, then rewrites the unit hashes in `trace.toml` if every run matched | Java, Python, Rust |
@@ -33,7 +34,11 @@ In CI, `.github/workflows/model.yml` runs the scenarios when a change touches `m
 `run.py --list-jobs`, which is one per `(scenario, job)`: `job` defaults to the run's platform, and a run may
 name a longer id to split a scenario too big for one job's budget. `breaklock-remote` is split that way -
 whole, it measured 2h27m-2h36m against a 180-minute cap. A separate `translation` job re-derives
-`LockProtocol.tla` and fails if the committed file is stale, which nothing checked before. If cancelling a run ever leaves `model-gate`
+`LockProtocol.tla` and fails if the committed file is stale, which nothing checked before. A `union` job then judges the
+suite-wide coverage union from those jobs' own uploaded logs - it needs nothing from a run but its last coverage
+block, so it costs no TLC time and fails if any run's log is missing. The extended tier used to judge the union by
+re-running `expected.toml` whole; measured, that job hit its 180-minute cap and was killed, so the one place the
+union was judged never judged it. If cancelling a run ever leaves `model-gate`
 queued rather than finished, cancel the run again from the workflow's page (reported as actions/runner#4411 for
 matrix jobs with `if: always()`; that issue is closed, and whether it is fixed is not known).
 
