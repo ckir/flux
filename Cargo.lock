@@ -265,6 +265,7 @@ dependencies = [
  "blake3",
  "criterion",
  "serde",
+ "serde_json",
  "toml",
 ]
 
