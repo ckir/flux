@@ -10685,10 +10685,14 @@ lock path is never empty:
    write (Section 259.6) and flush it. Then check the file identity
    against the lock path again. If the path is empty, the prior owner
    removed its lock meanwhile: start the acquisition again. If another
-   file is there, whoever created it owns the target: refuse with
-   `TARGET_LOCK_BUSY` and exit code 3, because the write went to a file no
-   longer at the lock path and nothing at the destination changed. A
-   check that itself fails counts as a different file. Only when the identity matches does Flux durably record the
+   file is there, another operation claimed the lock path while this
+   takeover was in flight: start the acquisition again as well, because the
+   write went to a file no longer at the lock path and nothing at the
+   destination changed. Do NOT refuse with `TARGET_LOCK_BUSY` here: this
+   operation has not classified the new occupant, so it cannot report the
+   lock as held, and the occupant may be a dead owner's lock -- the next
+   pass classifies it and reports whatever is then true. A check that
+   itself fails counts as a different file. Only when the identity matches does Flux durably record the
    takeover and proceed as if the prior owner were dead.
 
 An open, read, write, or flush that fails for another reason (an I/O or

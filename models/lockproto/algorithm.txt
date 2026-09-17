@@ -537,19 +537,22 @@
            with (ident \in FsIdentityChoices(fs, P, LockName)) {
              if (ident = NoObj) { refused[self] := "RESTART"; goto S240_5_close; }
              else if (ident # tobj) {
-               \* This used to assign `LockObj # NoObj /\ LockObj # tobj`, which is a RESTATEMENT of the
-               \* branch guard above it: TakeOver runs only under strong identity (S240_5_s1), where
-               \* FsIdentityChoices is the singleton {At(fs, P, LockName)} = {LockObj}, so `ident` IS
-               \* `LockObj` and the assignment was TRUE whenever the branch was taken. RefusalJustified
-               \* could not fail here - what the ruling at the MarkLost comment above forbids.
-               \* MEASURED before changing it (CI 35188279927, 17,377,074 states, exhaustive): asking
-               \* RefusalEvidence instead violates NOTHING in the breaklock POSIX pairing, so the
-               \* restatement was blessing no unjustified refusal - it was merely unable to catch one.
-               \* So the evidence is now the real predicate, at no change in behaviour. No fs is
-               \* assigned earlier in this label, so the define-block operators read the state this
-               \* branch actually sees.
-               refusedOk[self] := RefusalEvidence(self);
-               refused[self] := "TARGET_LOCK_BUSY";
+               \* Another operation claimed the lock path while this takeover was in flight, so the
+               \* acquisition starts again - the same answer as the empty path above, and the same one
+               \* S240_3_restart gives when another actor wins an acquisition (240.5 step 6, amended by
+               \* owner ruling 2026-09-17).
+               \*
+               \* It used to report TARGET_LOCK_BUSY on evidence that RESTATED this branch's own guard,
+               \* so RefusalJustified could never fail here. Asking RefusalEvidence instead MEASURED the
+               \* real thing: nothing in the breaklock POSIX pairing (CI 35188279927, 17,377,074 states,
+               \* exhaustive), but 3,569 violating states once a lease can lapse (CI 35211125866). Its
+               \* first trace has a Breaker reporting "the lock is held" while the only Owner is CRASHED,
+               \* it holds that lock itself, and it never saw a live owner - which is what
+               \* SEED_DEAD_AS_BUSY seeds as a DEFECT elsewhere. This label classifies the new occupant
+               \* not at all, so it cannot report one; the classifier that does measure liveness makes
+               \* that call on the next pass. No refusal here means RefusalJustified has nothing to
+               \* quantify at this label, which is why no evidence predicate is left.
+               refused[self] := "RESTART";
                goto S240_5_close;
              }
              else {

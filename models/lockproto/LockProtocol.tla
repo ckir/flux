@@ -595,19 +595,22 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
            with (ident \in FsIdentityChoices(fs, P, LockName)) {
              if (ident = NoObj) { refused[self] := "RESTART"; goto S240_5_close; }
              else if (ident # tobj) {
-               \* This used to assign `LockObj # NoObj /\ LockObj # tobj`, which is a RESTATEMENT of the
-               \* branch guard above it: TakeOver runs only under strong identity (S240_5_s1), where
-               \* FsIdentityChoices is the singleton {At(fs, P, LockName)} = {LockObj}, so `ident` IS
-               \* `LockObj` and the assignment was TRUE whenever the branch was taken. RefusalJustified
-               \* could not fail here - what the ruling at the MarkLost comment above forbids.
-               \* MEASURED before changing it (CI 35188279927, 17,377,074 states, exhaustive): asking
-               \* RefusalEvidence instead violates NOTHING in the breaklock POSIX pairing, so the
-               \* restatement was blessing no unjustified refusal - it was merely unable to catch one.
-               \* So the evidence is now the real predicate, at no change in behaviour. No fs is
-               \* assigned earlier in this label, so the define-block operators read the state this
-               \* branch actually sees.
-               refusedOk[self] := RefusalEvidence(self);
-               refused[self] := "TARGET_LOCK_BUSY";
+               \* Another operation claimed the lock path while this takeover was in flight, so the
+               \* acquisition starts again - the same answer as the empty path above, and the same one
+               \* S240_3_restart gives when another actor wins an acquisition (240.5 step 6, amended by
+               \* owner ruling 2026-09-17).
+               \*
+               \* It used to report TARGET_LOCK_BUSY on evidence that RESTATED this branch's own guard,
+               \* so RefusalJustified could never fail here. Asking RefusalEvidence instead MEASURED the
+               \* real thing: nothing in the breaklock POSIX pairing (CI 35188279927, 17,377,074 states,
+               \* exhaustive), but 3,569 violating states once a lease can lapse (CI 35211125866). Its
+               \* first trace has a Breaker reporting "the lock is held" while the only Owner is CRASHED,
+               \* it holds that lock itself, and it never saw a live owner - which is what
+               \* SEED_DEAD_AS_BUSY seeds as a DEFECT elsewhere. This label classifies the new occupant
+               \* not at all, so it cannot report one; the classifier that does measure liveness makes
+               \* that call on the next pass. No refusal here means RefusalJustified has nothing to
+               \* quantify at this label, which is why no evidence predicate is left.
+               refused[self] := "RESTART";
                goto S240_5_close;
              }
              else {
@@ -1098,7 +1101,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "4d1a1597" /\ chksum(tla) = "534b9bce")
+\* BEGIN TRANSLATION (chksum(pcal) = "7fff9d41" /\ chksum(tla) = "215ce458")
 \* Procedure variable obj of procedure Classify at line 167 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
@@ -2137,18 +2140,16 @@ S240_5_s6(self) == /\ pc[self] = "S240_5_s6"
                    /\ IF crashed[self]
                          THEN /\ pc' = [pc EXCEPT ![self] = "takeover_crashed"]
                               /\ UNCHANGED << holding, checkStale, writeStale, 
-                                              refusedOk, refused, stack, tobj >>
+                                              refused, stack, tobj >>
                          ELSE /\ \E ident \in FsIdentityChoices(fs, P, LockName):
                                    IF ident = NoObj
                                       THEN /\ refused' = [refused EXCEPT ![self] = "RESTART"]
                                            /\ pc' = [pc EXCEPT ![self] = "S240_5_close"]
                                            /\ UNCHANGED << holding, checkStale, 
-                                                           writeStale, 
-                                                           refusedOk, stack, 
+                                                           writeStale, stack, 
                                                            tobj >>
                                       ELSE /\ IF ident # tobj[self]
-                                                 THEN /\ refusedOk' = [refusedOk EXCEPT ![self] = RefusalEvidence(self)]
-                                                      /\ refused' = [refused EXCEPT ![self] = "TARGET_LOCK_BUSY"]
+                                                 THEN /\ refused' = [refused EXCEPT ![self] = "RESTART"]
                                                       /\ pc' = [pc EXCEPT ![self] = "S240_5_close"]
                                                       /\ UNCHANGED << holding, 
                                                                       checkStale, 
@@ -2161,15 +2162,15 @@ S240_5_s6(self) == /\ pc[self] = "S240_5_s6"
                                                       /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
                                                       /\ tobj' = [tobj EXCEPT ![self] = Head(stack[self]).tobj]
                                                       /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
-                                                      /\ UNCHANGED << refusedOk, 
-                                                                      refused >>
+                                                      /\ UNCHANGED refused
                    /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                    sawLive, seenRec, crashed, live, checked, 
                                    writing, pendingUnlink, lostLock, 
                                    landedAfterTakeover, recoveredAfterCrash, 
                                    tornRead, hostCrashChangedLock, 
-                                   touchedUncertain, keep, obj_, got, obj, 
-                                   robj, victim, nobj, crashes, leases >>
+                                   touchedUncertain, refusedOk, keep, obj_, 
+                                   got, obj, robj, victim, nobj, crashes, 
+                                   leases >>
 
 S240_5_seed_write_begin(self) == /\ pc[self] = "S240_5_seed_write_begin"
                                  /\ IF crashed[self]
