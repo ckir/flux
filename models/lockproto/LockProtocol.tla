@@ -31,8 +31,7 @@ CONSTANTS
     SEED_RENAME_OVER_TAKEOVER,
     SEED_NO_CAPABILITY_GATE,
     SEED_TORN_AS_FOREIGN,
-    FIX_REMOTE_LEASE_SPEC, \* fix flag of the open finding on SingleWriter: the remote-lease spec amendments (design Section 11)
-    FIX_TAKEOVER_REFUSAL   \* fix flag of the open finding on RefusalJustified at S240_5_s6 (capstone, plan 3)
+    FIX_REMOTE_LEASE_SPEC  \* fix flag of the open finding on SingleWriter: the remote-lease spec amendments (design Section 11)
 
 Procs == Owners \cup Recoverers \cup PlainRuns \cup Cleanups \cup Breakers
 \* <lock-name>.broken.<operation-id> beside the lock (240.3 step 2). Only an actor that can move a
@@ -596,19 +595,18 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
            with (ident \in FsIdentityChoices(fs, P, LockName)) {
              if (ident = NoObj) { refused[self] := "RESTART"; goto S240_5_close; }
              else if (ident # tobj) {
-               \* OPEN FINDING (capstone, plan 3). The evidence below is a RESTATEMENT of this branch's
-               \* own guard: TakeOver runs only under strong identity (S240_5_s1), where
+               \* This used to assign `LockObj # NoObj /\ LockObj # tobj`, which is a RESTATEMENT of the
+               \* branch guard above it: TakeOver runs only under strong identity (S240_5_s1), where
                \* FsIdentityChoices is the singleton {At(fs, P, LockName)} = {LockObj}, so `ident` IS
-               \* `LockObj` and the assignment is TRUE whenever this branch is taken. RefusalJustified
-               \* therefore cannot fail here - exactly what the ruling at the MarkLost comment above
-               \* forbids. What SHOULD justify TARGET_LOCK_BUSY at a label whose whole meaning is
-               \* "someone else won the race" is an OPEN SPEC QUESTION (owner, 2026-09-17): the flag
-               \* below asks RefusalEvidence instead, so a witness run can PRINT the occupant the
-               \* restatement was blessing, and the spec can be decided from that trace rather than
-               \* from an argument. No fs is assigned earlier in this label, so the define-block
-               \* operators read the state this branch actually sees.
-               refusedOk[self] := IF FIX_TAKEOVER_REFUSAL THEN RefusalEvidence(self)
-                                  ELSE LockObj # NoObj /\ LockObj # tobj;
+               \* `LockObj` and the assignment was TRUE whenever the branch was taken. RefusalJustified
+               \* could not fail here - what the ruling at the MarkLost comment above forbids.
+               \* MEASURED before changing it (CI 35188279927, 17,377,074 states, exhaustive): asking
+               \* RefusalEvidence instead violates NOTHING in the breaklock POSIX pairing, so the
+               \* restatement was blessing no unjustified refusal - it was merely unable to catch one.
+               \* So the evidence is now the real predicate, at no change in behaviour. No fs is
+               \* assigned earlier in this label, so the define-block operators read the state this
+               \* branch actually sees.
+               refusedOk[self] := RefusalEvidence(self);
                refused[self] := "TARGET_LOCK_BUSY";
                goto S240_5_close;
              }
@@ -1100,8 +1098,8 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "b9dc3b63" /\ chksum(tla) = "5098fe48")
-\* Procedure variable obj of procedure Classify at line 168 col 18 changed to obj_
+\* BEGIN TRANSLATION (chksum(pcal) = "4d1a1597" /\ chksum(tla) = "534b9bce")
+\* Procedure variable obj of procedure Classify at line 167 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
           live, holding, checked, writing, pendingUnlink, checkStale, 
@@ -2149,8 +2147,7 @@ S240_5_s6(self) == /\ pc[self] = "S240_5_s6"
                                                            refusedOk, stack, 
                                                            tobj >>
                                       ELSE /\ IF ident # tobj[self]
-                                                 THEN /\ refusedOk' = [refusedOk EXCEPT ![self] = IF FIX_TAKEOVER_REFUSAL THEN RefusalEvidence(self)
-                                                                                                  ELSE LockObj # NoObj /\ LockObj # tobj[self]]
+                                                 THEN /\ refusedOk' = [refusedOk EXCEPT ![self] = RefusalEvidence(self)]
                                                       /\ refused' = [refused EXCEPT ![self] = "TARGET_LOCK_BUSY"]
                                                       /\ pc' = [pc EXCEPT ![self] = "S240_5_close"]
                                                       /\ UNCHANGED << holding, 

@@ -124,7 +124,7 @@ class LoadExpectedTests(unittest.TestCase):
 
     def test_the_extended_repository_file_loads(self) -> None:
         expected = run.load_expected(HERE / "expected-extended.toml")
-        self.assertEqual(expected.scenarios, ["recovery", "breaklock"])
+        self.assertEqual(expected.scenarios, ["recovery"])
         self.assertTrue(expected.runs)
 
     def test_unknown_kind(self) -> None:
@@ -1152,8 +1152,7 @@ timeout_minutes = 5
             code = run.main(["--expected", str(HERE / "expected-extended.toml"), "--list-jobs"])
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out.getvalue()), [{"scenario": "recovery", "platform": "posix", "job": "posix"},
-                                                      {"scenario": "recovery", "platform": "windows", "job": "windows"},
-                                                      {"scenario": "breaklock", "platform": "posix", "job": "posix"}])
+                                                      {"scenario": "recovery", "platform": "windows", "job": "windows"}])
 
     def test_platform_without_scenario_exits_2(self) -> None:
         err = io.StringIO()
