@@ -134,8 +134,11 @@ kinds at once do not finish, so the check runs pair them, and each pairing is ex
   `fs.next <= Cardinality(Procs)` was checked over the whole state space of the tightest run.
 - `IdentityStrength = "strong"` only. Measured, the weak-identity variant explores an identical state graph here,
   because no name in this scenario is reused.
-- `LockCapability = "strong"` only. The weak capability refuses every operation under 235.1, which `breaklock`'s
-  seeded run covers.
+- `LockCapability = "strong"` only. The weak capability refuses every operation under 235.1. TWO runs cover
+  that between them, and it is worth knowing which does what: `breaklock`'s seeded run sets
+  `SEED_NO_CAPABILITY_GATE` to BYPASS the refusal and show `SingleWriter` catches the bypass, so it does
+  NOT exercise the refusal - `breaklock-posix-weakcap-witness-NeverRefusedUnsafe` is the run that does.
+  Until that witness was added this line claimed the seeded run covered the refusal, and nothing did.
 - `HostCrashes = FALSE` in these runs, so only process crashes are explored here. Host crashes have their own
   slower tier, `expected-extended.toml`, run by `.github/workflows/model-extended.yml` nightly, on request, and on a
   pull request labelled `model-extended`. It holds the same four pairings with `HostCrashes = TRUE` on each platform.

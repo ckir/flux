@@ -3530,6 +3530,12 @@ NeverInflightLandedAfterTakeover == ~landedAfterTakeover
 \* A process passed its Section 99 check, so SingleWriter's ghost is set (design Section 7).
 NeverChecked == \A p \in Procs : ~checked[p]
 NeverRecoveredAfterCrash == ~recoveredAfterCrash
+\* The 235.1 capability refusal itself. Without verified OS-native locks, an operation that needs target
+\* exclusivity refuses outright - six sites do it, all guarded by `~SEED_NO_CAPABILITY_GATE`. The suite's
+\* only LockCapability = "weak" run sets that seed, to prove SingleWriter catches the BYPASS, so until
+\* this witness existed nothing exercised the refusal - while the README said the seeded run covered it
+\* (capstone finding, plan 3).
+NeverRefusedUnsafe == \A p \in Procs : refused[p] # "REMOTE_LOCK_UNSAFE"
 \* A host crash changed which object the lock path names: an unflushed create, move-aside or removal
 \* was undone. Label coverage cannot show this, because the host crash shares `env_loop` with the
 \* process crash (design Section 11).
