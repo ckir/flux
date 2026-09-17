@@ -21,6 +21,8 @@ import json  # noqa: E402
 import re  # noqa: E402
 import shutil  # noqa: E402
 import subprocess  # noqa: E402
+import tempfile  # noqa: E402
+import difflib  # noqa: E402
 import time  # noqa: E402
 import tomllib  # noqa: E402
 import urllib.request  # noqa: E402
@@ -39,7 +41,7 @@ TARGET = REPO / "target" / "tla"
 
 KINDS = ("check", "liveness", "seeded", "witness")
 RUN_KEYS = {"name", "module", "config", "scenario", "kind", "violated", "open_findings", "unreached", "timeout_minutes",
-            "constants", "symmetry", "tightened"}
+            "constants", "symmetry", "tightened", "job"}
 FINDING_KEYS = {"name", "tracking", "fix_flag"}
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 FIX_FLAG = re.compile(r"FIX_[A-Z0-9_]+")
@@ -111,6 +113,11 @@ class Run:
     constants: tuple[tuple[str, object], ...]
     symmetry: tuple[str, str] | None
     tightened: tuple[str, str] | None
+    # The CI job this run belongs to. Defaults to the run's platform, so one job per
+    # (scenario, platform); a run may name a longer id to split a scenario that does not fit one
+    # job's budget. It always starts with the platform, so the job's display name stays true.
+    # The empty default is for test helpers that build a Run directly; _load_run always sets it.
+    job: str = ""
 
 
 @dataclass(frozen=True)
@@ -625,6 +632,73 @@ def module_labels(module_text: str) -> LabelUniverse:
     return LabelUniverse(True, all_labels, {k: frozenset(v) for k, v in owners.items()}, process_sets)
 
 
+SOURCES = ("LockProtocol.head", "algorithm.txt", "invariants.txt")
+
+
+def check_translation(base: Path) -> int:
+    """Re-derive LockProtocol.tla from its sources and fail if the committed file differs.
+
+    LockProtocol.tla is generated - `cat LockProtocol.head algorithm.txt invariants.txt`, then
+    `pcal.trans` - and committed so that run.py needs no translator. Nothing re-derived it, so a
+    source edited without re-running the translator left TLC checking a model the sources no longer
+    described (capstone finding, plan 3). test_run.py catches the cheap half with no Java: everything
+    OUTSIDE the inserted translation block must equal the sources. Only this can catch the other
+    half, a translation block that does not match the algorithm it claims to translate.
+
+    Works in a temporary directory, because pcal.trans rewrites its input in place.
+    """
+    committed = base / "LockProtocol.tla"
+    if not committed.is_file():
+        print(f"run.py: {committed} not found", file=sys.stderr)
+        return 2
+    if shutil.which("java") is None:
+        print("run.py: java is not on PATH (the translator needs Java 11 or later)", file=sys.stderr)
+        return 2
+    try:
+        jar = ensure_jar()
+    except (ToolingError, OSError) as err:
+        print(f"run.py: {err}", file=sys.stderr)
+        return 2
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        # FsModel.tla goes along so the translator sees the same directory the module EXTENDS.
+        for name in (*SOURCES, "FsModel.tla"):
+            shutil.copyfile(base / name, work / name)
+        target = work / "LockProtocol.tla"
+        target.write_text("".join((work / name).read_text(encoding="utf-8") for name in SOURCES),
+                          encoding="utf-8")
+        proc = subprocess.run(["java", "-cp", str(jar), "pcal.trans", str(target)],
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            print(f"run.py: pcal.trans failed:\n{proc.stdout}{proc.stderr}", file=sys.stderr)
+            return 2
+        # Compare by lines, so a checkout that normalised line endings is not reported as a mismatch.
+        fresh = target.read_text(encoding="utf-8").splitlines()
+        have = committed.read_text(encoding="utf-8").splitlines()
+
+    if fresh == have:
+        print("run.py: LockProtocol.tla matches its sources")
+        return 0
+    diff = list(difflib.unified_diff(have, fresh, "committed LockProtocol.tla", "pcal.trans output",
+                                     lineterm="", n=2))
+    print("run.py: LockProtocol.tla is STALE - it is not what pcal.trans emits for its sources.",
+          file=sys.stderr)
+    print("        Regenerate: cat " + " ".join(SOURCES) + " > LockProtocol.tla && \\", file=sys.stderr)
+    print("        java -cp target/tla/tla2tools.jar pcal.trans LockProtocol.tla  (then delete "
+          "LockProtocol.cfg)", file=sys.stderr)
+    for line in diff[:60]:
+        print(f"        {line}", file=sys.stderr)
+    if len(diff) > 60:
+        print(f"        ... {len(diff) - 60} more diff lines", file=sys.stderr)
+    return 1
+
+
+def platform_of(name: str, scenario: str) -> str:
+    """The platform segment of a run name: the first word after the scenario."""
+    return name[len(scenario) + 1:].split("-", 1)[0]
+
+
 def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
     where = f"run #{i + 1}"
     _require(set(raw) <= RUN_KEYS, f"{where}: unknown keys {sorted(set(raw) - RUN_KEYS)}")
@@ -657,6 +731,15 @@ def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
         suffix_help = ", plus '-<SEED_FLAG>' exactly when it is seeded"
     _require(re.fullmatch(rf"{re.escape(scenario)}-[a-z0-9]+(-[a-z0-9]+)*-{kind}{suffix}", name) is not None,
              f"{where}: name must be '<scenario>-<variant>-<kind>'{suffix_help}")
+    platform = platform_of(name, scenario)
+    job = raw.get("job", platform)
+    _require(isinstance(job, str) and re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", job) is not None,
+             f"{where}: job must be a lower-case dash-separated word")
+    _require(job == platform or job.startswith(f"{platform}-"),
+             f"{where}: job {job!r} must be the run's platform {platform!r} or start with it, so the CI "
+             f"job's displayed platform is true")
+    _require(name.startswith(f"{scenario}-{job}-") or job == platform,
+             f"{where}: job {job!r} must be a prefix of the run's variant")
     _require(IDENT.fullmatch(module) is not None and (base / f"{module}.tla").is_file(),
              f"{where}: module {module}.tla not found beside expected.toml")
     _require(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_][A-Za-z0-9_.-]*)*\.cfg", config) is not None
@@ -776,7 +859,7 @@ def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
 
     constants = tuple(sorted(declared_constants.items()))
     return Run(name, module, config, scenario, kind, violated, tuple(findings), unreached, timeout,
-               constants, symmetry, tightened)
+               constants, symmetry, tightened, job)
 
 
 # ---------------------------------------------------------------------------------------
@@ -1131,6 +1214,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--expected", type=Path, default=HERE / "expected.toml")
     parser.add_argument("--scenario", help="run only this scenario")
     parser.add_argument("--platform", help="with --scenario, run only this platform")
+    parser.add_argument("--job", help="run only the runs in this CI job (see --list-jobs)")
+    parser.add_argument("--check-translation", action="store_true",
+                        help="re-run the PlusCal translator and fail if LockProtocol.tla is stale")
     parser.add_argument("--list-scenarios", action="store_true", help="print the scenario names as JSON")
     parser.add_argument("--list-jobs", action="store_true",
                          help="print the distinct {scenario, platform} pairs as JSON")
@@ -1152,16 +1238,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.list_jobs:
         jobs: list[dict[str, str]] = []
         for s in scenarios:
-            platforms: list[str] = []
             for r in expected.runs:
                 if r.scenario != s:
                     continue
-                platform = r.name[len(s) + 1:].split("-", 1)[0]
-                if platform not in platforms:
-                    platforms.append(platform)
-            jobs.extend({"scenario": s, "platform": p} for p in platforms)
+                entry = {"scenario": s, "platform": platform_of(r.name, s), "job": r.job}
+                if entry not in jobs:
+                    jobs.append(entry)
         print(json.dumps(jobs))
         return 0
+    if args.check_translation:
+        return check_translation(args.expected.resolve().parent)
     if args.scenario is not None and args.scenario not in scenarios:
         print(f"run.py: unknown scenario {args.scenario!r}; known: {', '.join(scenarios)}", file=sys.stderr)
         return 2
@@ -1170,6 +1256,11 @@ def main(argv: list[str] | None = None) -> int:
         selected = [r for r in selected if r.name.startswith(f"{args.scenario}-{args.platform}-")]
         if not selected:
             print(f"run.py: no runs for scenario {args.scenario} on platform {args.platform}", file=sys.stderr)
+            return 2
+    if args.job is not None:
+        selected = [r for r in selected if r.job == args.job]
+        if not selected:
+            print(f"run.py: no runs in job {args.job!r}", file=sys.stderr)
             return 2
 
     if shutil.which("java") is None:

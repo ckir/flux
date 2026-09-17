@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import re
 import sys
 import tempfile
 import textwrap
@@ -1119,9 +1120,9 @@ timeout_minutes = 5
             code = run.main(["--expected", str(d.path / "expected.toml"), "--list-jobs"])
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out.getvalue()), [
-            {"scenario": "alpha", "platform": "windows"},
-            {"scenario": "alpha", "platform": "posix"},
-            {"scenario": "beta", "platform": "posix"},
+            {"scenario": "alpha", "platform": "windows", "job": "windows"},
+            {"scenario": "alpha", "platform": "posix", "job": "posix"},
+            {"scenario": "beta", "platform": "posix", "job": "posix"},
         ])
 
     def test_list_jobs_on_the_repository_file_includes_both_recovery_platforms(self) -> None:
@@ -1136,8 +1137,8 @@ timeout_minutes = 5
             code = run.main(["--expected", str(HERE / "expected.toml"), "--list-jobs"])
         self.assertEqual(code, 0)
         jobs = json.loads(out.getvalue())
-        self.assertIn({"scenario": "recovery", "platform": "posix"}, jobs)
-        self.assertIn({"scenario": "recovery", "platform": "windows"}, jobs)
+        self.assertIn({"scenario": "recovery", "platform": "posix", "job": "posix"}, jobs)
+        self.assertIn({"scenario": "recovery", "platform": "windows", "job": "windows"}, jobs)
 
     def test_list_jobs_on_the_extended_repository_file(self) -> None:
         run.shutil.which = lambda _name: None
@@ -1150,9 +1151,9 @@ timeout_minutes = 5
         with contextlib.redirect_stdout(out):
             code = run.main(["--expected", str(HERE / "expected-extended.toml"), "--list-jobs"])
         self.assertEqual(code, 0)
-        self.assertEqual(json.loads(out.getvalue()), [{"scenario": "recovery", "platform": "posix"},
-                                                      {"scenario": "recovery", "platform": "windows"},
-                                                      {"scenario": "breaklock", "platform": "posix"}])
+        self.assertEqual(json.loads(out.getvalue()), [{"scenario": "recovery", "platform": "posix", "job": "posix"},
+                                                      {"scenario": "recovery", "platform": "windows", "job": "windows"},
+                                                      {"scenario": "breaklock", "platform": "posix", "job": "posix"}])
 
     def test_platform_without_scenario_exits_2(self) -> None:
         err = io.StringIO()
@@ -1913,6 +1914,74 @@ class GeneratedModuleTests(unittest.TestCase):
             "Re-run the translator: cat the three sources into LockProtocol.tla, then "
             "`java -cp target/tla/tla2tools.jar pcal.trans LockProtocol.tla` (and delete the "
             "LockProtocol.cfg it writes beside it).")
+
+
+class ConfigConsistencyTests(unittest.TestCase):
+    """The .cfg files are hand-written copies of each other - TLC's format has no include - so nothing
+    stops one drifting from the rest. Adding a CONSTANT means editing 70-odd files by hand, and the
+    `-fixed-check` configs exist only to be their `-check` sibling with the fix flag flipped. These
+    two guards make that duplication safe to keep (capstone, plan 3)."""
+
+    def configs(self) -> dict[str, str]:
+        d = Path(__file__).resolve().parent / "configs"
+        # The selftest configs belong to Smoke.tla, a different module with its own constants.
+        return {c.name: c.read_text(encoding="utf-8") for c in sorted(d.glob("*.cfg"))
+                if not c.name.startswith("selftest-")}
+
+    @staticmethod
+    def constant_names(text: str) -> frozenset[str]:
+        """The names assigned in the CONSTANT/CONSTANTS section.
+
+        Parsed per line rather than from cfg_sections' token stream: a set-literal value such as
+        `Owners = {o1}` is several tokens, so the stream has no fixed stride to step over."""
+        body = text[text.index("CONSTANT"):]
+        for keyword in ("INVARIANT", "PROPERTY", "SYMMETRY", "SPECIFICATION"):
+            if keyword in body:
+                body = body[:body.index(keyword)]
+        return frozenset(m.group(1) for m in re.finditer(r"^\s+([A-Za-z_][A-Za-z0-9_]*)\s*=", body, re.M))
+
+    def test_every_config_declares_the_same_constants(self) -> None:
+        names = {name: self.constant_names(text) for name, text in self.configs().items()}
+        self.assertTrue(names, "expected LockProtocol configs beside the tests")
+        every = frozenset().union(*names.values())
+        # Reported per CONSTANT rather than against one chosen file: whichever config is the odd one
+        # out, the message must name IT, not the other seventy.
+        gaps = {constant: sorted(f for f, declared in names.items() if constant not in declared)
+                for constant in sorted(every)}
+        gaps = {c: files for c, files in gaps.items() if files}
+        self.assertEqual(
+            gaps, {},
+            "every LockProtocol config must assign every constant the module declares, because adding "
+            "one means editing them all by hand and TLC's format has no include. Not declared by: "
+            + "; ".join(f"{c} <- {', '.join(files)}" for c, files in gaps.items()))
+
+    def test_fixed_check_configs_match_their_sibling(self) -> None:
+        configs = self.configs()
+        pairs = [(n, n.replace("-fixed-check.cfg", "-check.cfg")) for n in configs
+                 if n.endswith("-fixed-check.cfg")]
+        self.assertTrue(pairs, "expected at least one -fixed-check config")
+        for fixed_name, check_name in pairs:
+            self.assertIn(check_name, configs, f"{fixed_name} has no -check sibling")
+            fixed, check = run.cfg_constants(configs[fixed_name]), run.cfg_constants(configs[check_name])
+            self.assertEqual(
+                fixed.get("FIX_REMOTE_LEASE_SPEC"), True, f"{fixed_name} must set FIX_REMOTE_LEASE_SPEC")
+            self.assertEqual(
+                check.get("FIX_REMOTE_LEASE_SPEC"), False, f"{check_name} must clear FIX_REMOTE_LEASE_SPEC")
+            differing = {k for k in set(fixed) | set(check) if fixed.get(k) != check.get(k)}
+            self.assertEqual(
+                differing, {"FIX_REMOTE_LEASE_SPEC"},
+                f"{fixed_name} and {check_name} must differ in FIX_REMOTE_LEASE_SPEC alone, "
+                f"but also differ in {sorted(differing - {'FIX_REMOTE_LEASE_SPEC'})}")
+
+            def invariants(text: str) -> set[str]:
+                sections = run.cfg_sections(text)
+                return set(sections.get("INVARIANT", []))
+
+            self.assertEqual(
+                invariants(configs[fixed_name]), invariants(configs[check_name]) | {"SingleWriter"},
+                f"{fixed_name} must check exactly its sibling's invariants plus SingleWriter: the "
+                f"sibling drops SingleWriter because it carries the open finding, and the whole point "
+                f"of the fixed run is to check it with the flag on")
 
 
 if __name__ == "__main__":

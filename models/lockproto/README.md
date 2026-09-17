@@ -15,7 +15,9 @@ its first scenario, `recovery`, end to end. Later plans add the remaining scenar
 |---|---|---|
 | `just model` | runs every run in `expected.toml` | Java 11+, Python 3.11+ |
 | `just model <scenario>` | runs one scenario, for example `just model selftest` | Java 11+, Python 3.11+ |
-| `just model <scenario> <platform>` | runs one scenario's runs for one platform, as a CI job does: `just model recovery posix` | Java 11+, Python 3.11+ |
+| `just model <scenario> <platform>` | runs one scenario's runs for one platform: `just model recovery posix` | Java 11+, Python 3.11+ |
+| `just model <scenario> <platform> <job>` | runs exactly one CI job's runs: `just model breaklock-remote posix posix-plain` | Java 11+, Python 3.11+ |
+| `python models/lockproto/run.py --check-translation` | re-runs the PlusCal translator and fails if the committed `LockProtocol.tla` is not what it emits | Java 11+, Python 3.11+ |
 | `python models/lockproto/run.py --expected models/lockproto/expected-extended.toml --scenario recovery` | the host-crash tier; hours of CPU, meant for CI | Java 11+, Python 3.11+ |
 | `just model-test` | unit tests of `run.py` (recorded TLC output, no Java) and of the CI workflow's change detection | Python 3.11+ |
 | `just model-stamp` | runs `just model`, then rewrites the unit hashes in `trace.toml` if every run matched | Java, Python, Rust |
@@ -27,7 +29,11 @@ failure, a TLC error, or a timeout). `just check` runs the Rust side (the stamp 
 filesystem probes) and needs no Java or Python.
 
 In CI, `.github/workflows/model.yml` runs the scenarios when a change touches `models/`, the spec, the probes, the
-`justfile`, or the workflow, and its `model-gate` job always reports. If cancelling a run ever leaves `model-gate`
+`justfile`, or the workflow, and its `model-gate` job always reports. One CI job per entry of
+`run.py --list-jobs`, which is one per `(scenario, job)`: `job` defaults to the run's platform, and a run may
+name a longer id to split a scenario too big for one job's budget. `breaklock-remote` is split that way -
+whole, it measured 2h27m-2h36m against a 180-minute cap. A separate `translation` job re-derives
+`LockProtocol.tla` and fails if the committed file is stale, which nothing checked before. If cancelling a run ever leaves `model-gate`
 queued rather than finished, cancel the run again from the workflow's page (reported as actions/runner#4411 for
 matrix jobs with `if: always()`; that issue is closed, and whether it is fixed is not known).
 
@@ -47,7 +53,7 @@ runs write their TLC state and logs under `target/tla/`, keyed by run name.
 | `Smoke.tla` | runner self-test model (the `selftest` scenario); not part of the protocol |
 | `FsModel.tla` | the filesystem model: objects, entries, handles, OS-native locks, crashes (design Section 5) |
 | `LockProtocol.head`, `algorithm.txt`, `invariants.txt` | the sources of `LockProtocol.tla`: its header, the PlusCal algorithm, and the properties (design Sections 6.1 and 7) |
-| `LockProtocol.tla` | generated: `cat LockProtocol.head algorithm.txt invariants.txt`, then `pcal.trans`; committed so `run.py` needs no translator |
+| `LockProtocol.tla` | generated: `cat LockProtocol.head algorithm.txt invariants.txt`, then `pcal.trans`; committed so `run.py` needs no translator. Two guards keep it honest: `test_run.py` checks everything outside the translation block still equals the sources (no Java), and `--check-translation` re-runs the translator (CI) |
 | `spec-sections.stamp` | the spec file and the spec headings the model encodes (design Section 9) |
 | `trace.toml` | every unit of those headings, its hash, and the labels that implement it (design Section 9.1) |
 

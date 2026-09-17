@@ -672,6 +672,10 @@ timeout_minutes = 90
 # Remote scenarios (design Section 12, plan 3): LockCapability = remote, where a lock lease can lapse under a
 # running holder, so a takeover can win against it and its in-flight write can land afterwards. Paired into
 # three-actor runs (owner ruling 2026-09-15): the four-actor checks passed ~65M states in 72 min unfinished.
+#
+# breaklock-remote is SPLIT ACROSS TWO CI JOBS by `job`. Whole, it measured 2h27m-2h36m against a 180-minute
+# cap - under 45 minutes of margin, so every run added to it was a gamble. The two pairings are independent
+# (two Breakers vs one Breaker and a PlainRun), so they parallelise with nothing shared but the module.
 
 [[run]]
 name = "breaklock-remote-posix-check"
@@ -730,6 +734,7 @@ name = "breaklock-remote-posix-plain-check"
 module = "LockProtocol"
 config = "configs/breaklock-remote-posix-plain-check.cfg"
 scenario = "breaklock-remote"
+job = "posix-plain"
 kind = "check"
 constants = { Owners = ["o1"], Recoverers = [], PlainRuns = ["p1"], Cleanups = [], Breakers = ["b1"], MaxObjs = 5, MaxCrashes = 1, HostCrashes = false, MaxLeaseExpiries = 1, Platform = "posix", IdentityStrength = "strong", LockCapability = "remote", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false }
 unreached = [
@@ -750,6 +755,7 @@ name = "breaklock-remote-posix-plain-window-witness-SingleWriter"
 module = "LockProtocol"
 config = "configs/breaklock-remote-posix-plain-window-witness-SingleWriter.cfg"
 scenario = "breaklock-remote"
+job = "posix-plain"
 kind = "witness"
 violated = ["SingleWriter"]
 constants = { Owners = ["o1"], Recoverers = [], PlainRuns = ["p1"], Cleanups = [], Breakers = ["b1"], MaxObjs = 5, MaxCrashes = 1, HostCrashes = false, MaxLeaseExpiries = 1, Platform = "posix", IdentityStrength = "strong", LockCapability = "remote", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false }
@@ -760,6 +766,7 @@ name = "breaklock-remote-posix-plain-fixed-check"
 module = "LockProtocol"
 config = "configs/breaklock-remote-posix-plain-fixed-check.cfg"
 scenario = "breaklock-remote"
+job = "posix-plain"
 kind = "check"
 constants = { Owners = ["o1"], Recoverers = [], PlainRuns = ["p1"], Cleanups = [], Breakers = ["b1"], MaxObjs = 5, MaxCrashes = 1, HostCrashes = false, MaxLeaseExpiries = 1, Platform = "posix", IdentityStrength = "strong", LockCapability = "remote", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false }
 unreached = [
@@ -780,6 +787,7 @@ name = "breaklock-remote-posix-plain-fixed-witness-NoLiveWriter"
 module = "LockProtocol"
 config = "configs/breaklock-remote-posix-plain-fixed-witness-NoLiveWriter.cfg"
 scenario = "breaklock-remote"
+job = "posix-plain"
 kind = "witness"
 violated = ["NoLiveWriter"]
 constants = { Owners = ["o1"], Recoverers = [], PlainRuns = ["p1"], Cleanups = [], Breakers = ["b1"], MaxObjs = 5, MaxCrashes = 1, HostCrashes = false, MaxLeaseExpiries = 1, Platform = "posix", IdentityStrength = "strong", LockCapability = "remote", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false }
