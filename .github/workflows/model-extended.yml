@@ -47,7 +47,7 @@ jobs:
           { echo "matrix<<MATRIX_EOF"; echo "$matrix"; echo "MATRIX_EOF"; } >> "$GITHUB_OUTPUT"
 
   tier:
-    name: Extended ${{ matrix.job.scenario }} (${{ matrix.job.platform }})
+    name: Extended ${{ matrix.job.scenario }} (${{ matrix.job.job }})
     needs: plan
     # GitHub rejects an empty matrix; the plan job's outputs are empty strings when it was skipped.
     if: needs.plan.outputs.matrix != '' && needs.plan.outputs.matrix != '[]'
@@ -70,12 +70,13 @@ jobs:
         env:
           SCENARIO: ${{ matrix.job.scenario }}
           PLATFORM: ${{ matrix.job.platform }}
+          JOB: ${{ matrix.job.job }}
         run: >-
           python models/lockproto/run.py --expected models/lockproto/expected-extended.toml
-          --scenario "$SCENARIO" --platform "$PLATFORM"
+          --scenario "$SCENARIO" --platform "$PLATFORM" --job "$JOB"
       - name: Upload TLC output
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: tlc-output-extended-${{ matrix.job.scenario }}-${{ matrix.job.platform }}
+          name: tlc-output-extended-${{ matrix.job.scenario }}-${{ matrix.job.job }}
           path: target/tla/out/

@@ -137,7 +137,12 @@ jobs:
     # It needs EVERY run's log and fails if one is missing, so it only runs when the full matrix did.
     name: Suite-wide coverage union
     needs: [plan, scenario]
-    if: needs.plan.outputs.matrix != '[]' && needs.scenario.result == 'success'
+    # Deliberately NOT gated on the scenario jobs SUCCEEDING. A run that MISMATCHES still completes
+    # and still uploads its log, so the union can be judged - and a pull request carrying both a bug
+    # and a coverage gap would otherwise hide the gap until the bug was fixed. Safe because
+    # --union-from fails closed: a job that died before uploading leaves a missing log, which is
+    # exit 2 naming the run, not a partial verdict.
+    if: needs.plan.outputs.matrix != '[]' && needs.scenario.result != 'skipped'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
