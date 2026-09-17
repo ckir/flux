@@ -42,8 +42,12 @@ Status column says otherwise (verified 2026-09-09).
 |---|---|---|---|
 | `actionlint` | — | Lints every GitHub Actions workflow: YAML syntax, `${{ }}` expressions against the context types, job and step references, action inputs. The workflows change often (the model check's per-scenario matrix, the extended tier's label and schedule triggers, Dependabot action bumps), and those mistakes otherwise surface only when CI runs. `just lint-workflows` locally; the `Workflow lint` job in `ci.yml` runs the pinned `rhysd/actionlint:1.7.12` image on every CI run. | 1.7.12 (`winget install rhysd.actionlint`) |
 | `shellcheck` | — | actionlint runs every workflow `run:` step through it when it is on PATH, and silently skips that check when it is not (visible only with `actionlint -verbose`). The CI image bundles it. | 0.11.0 (`winget install koalaman.shellcheck`) |
+| `gh` | — | GitHub CLI. The model checks run only on CI, so their results come back through `gh run watch`, `gh run view --log` and `gh run download` (the TLC log artifacts). Pull requests, labels such as `model-extended`, and Dependabot auto-merge are driven through it too. | (`winget install GitHub.cli`) |
+| `java` | — | Runs the TLA+ tools in the pinned `tla2tools.jar` (Java 11 or later; CI uses Temurin 21). Locally it runs only the PlusCal translator and the SANY parser when `models/lockproto/algorithm.txt` changes. The TLC model checks themselves are too heavy for a development machine and run only on CI (owner ruling, 2026-09-13) — do not run `just model` locally. Not needed by `just check`. | Temurin 21 (`winget install EclipseAdoptium.Temurin.21.JDK`) |
+| `tla2tools.jar` | — | The pinned TLA+ tools jar (TLC 2.19, SHA-256 checked by `models/lockproto/run.py`) that the local translation and SANY parse need; see `java`. `run.py` downloads it into `target/tla/` on first use. | fetched on demand |
+| `python3` | — | Runs `models/lockproto/run.py` (the model-check runner) and its unit tests (`just model`, `just model-test`). Python 3.14 is what CI and the development machines use; `run.py` accepts 3.11 or later (`tomllib`). Not needed by `just check`. | 3.14 (`winget install Python.Python.3.14`) |
 
-Both are winget installs, which Git Bash on this machine does not see until its PATH is reloaded, so there is no
+`actionlint` and `shellcheck` are winget installs, which Git Bash on this machine does not see until its PATH is reloaded, so there is no
 pre-push hook for them; CI is the gate. A clean result is meaningful: a control workflow with an unquoted variable
 (SC2086) and an undefined context property is reported (verified 2026-09-15).
 
@@ -69,3 +73,13 @@ cargo deny check
 typos
 just lint-workflows # actionlint (+ shellcheck over run: steps); CI job "Workflow lint"
 ```
+
+## Keeping this file honest
+
+Every tool named here that an agent or a fresh checkout has to *install* is also declared in
+`.claude/recommended-tools.json`, which the SessionStart hook reads to report what is missing. The two are
+machine-checked by `tests/dev_tooling.rs`: each tool in that JSON must appear in a table row above, and the
+prose in `README.md` and `CONTRIBUTING.md` must still point at both files. The check runs one way only —
+this file may document more than the JSON declares, because components that ship with the toolchain
+(`rustfmt`, `clippy`), the installer that fetches the rest (`cargo-binstall`), and merely-installed
+candidates all belong here but not in the file the hook acts on.
