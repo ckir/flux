@@ -2047,5 +2047,55 @@ class UnionFromLogsTests(unittest.TestCase):
         self.assertIn("cannot judge the union", out.getvalue())
 
 
+class CostNodeTests(unittest.TestCase):
+    """parse_cost_nodes(): the expression-granular data TLC emits and run.py used to discard.
+
+    The suite's coverage gate is LABEL-granular, so a guarded branch inside a label that the
+    non-taking path also reaches is invisible to it. That blind spot produced two capstone findings.
+    TLC's `-coverage 1` has carried per-expression counts (message 2221) all along, including zeros.
+    """
+
+    def test_extracts_the_zero_count_nodes_of_a_constant_guarded_body(self) -> None:
+        nodes = run.parse_cost_nodes(run.parse_messages(fixture("smoke_check_coverage")[1]))
+        self.assertIsNotNone(nodes)
+        zeros = [(module, line) for module, line, _col, count in nodes if count == 0]
+        # Smoke.tla's Overshoot body is guarded by the constant SEED_OVERSHOOT, and in the
+        # non-seeded run it reports zero - the exact shape of the capstone's R4-1 finding.
+        self.assertEqual(zeros, [("Smoke", 26), ("Smoke", 27)])
+
+    def test_fails_closed_like_parse_coverage(self) -> None:
+        # No coverage block at all, and a block whose terminator never arrived.
+        self.assertIsNone(run.parse_cost_nodes(run.parse_messages("no coverage here")))
+        started = fixture("smoke_check_coverage")[1]
+        cut = started[: started.rindex("@!@!@STARTMSG 2201")] + "@!@!@STARTMSG 2201:0 @!@!@" + chr(10)
+        self.assertIsNone(
+            run.parse_cost_nodes(run.parse_messages(cut)),
+            "an unterminated final block must be None, never a partial answer")
+
+
+class PartialCoverageTests(unittest.TestCase):
+    """A seeded or witness run halts at its first counterexample, so its coverage block describes a
+    PREFIX of the state space. Its positive coverage is sound; its SILENCE is not evidence."""
+
+    def test_the_union_reports_which_runs_contributed_a_prefix(self) -> None:
+        d = ExpectedDir()
+        self.addCleanup(d.close)
+        expected = d.load()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        logs = Path(tmp.name)
+        for r in expected.runs:
+            (logs / f"{r.name}.log").write_text(fixture("smoke_check_coverage")[1], encoding="utf-8")
+        halting = frozenset(r.name for r in expected.runs if r.kind in ("seeded", "witness"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            run.judge_union_from(expected, d.path, logs)
+        if halting:
+            self.assertIn("PREFIX", out.getvalue(),
+                          "a union built partly from halting runs must say so")
+            for name in halting:
+                self.assertIn(name, out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

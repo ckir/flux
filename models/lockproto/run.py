@@ -972,6 +972,50 @@ def parse_coverage(messages: list[Message]) -> dict[str, tuple[int, int]] | None
     return result
 
 
+_COVERAGE_COST_NODE = re.compile(
+    r"^\s*line (\d+), col (\d+) to line (\d+), col (\d+) of module (\w+): (\d+)\s*$")
+
+
+def parse_cost_nodes(messages: list[Message]) -> list[tuple[str, int, int, int]] | None:
+    """Every EXPRESSION node of the last coverage block: (module, line, col, count).
+
+    TLC's `-coverage 1` is expression-granular, not action-granular: alongside each action (2772) it
+    emits indented cost sub-lines (2221) carrying a source span and a count, and a count of ZERO for
+    an expression that never evaluated. `parse_coverage` deliberately keeps only the actions, which
+    is what makes this suite's coverage gate LABEL-granular - and a guarded branch inside a label the
+    non-taking path also reaches is therefore invisible to it. That blind spot produced two findings
+    (capstone, plan 3, rounds 3 and 4), and the data to close it was in every log all along.
+
+    Same last-block rule and the same fail-closed contract as `parse_coverage`: None when there is no
+    complete final block, rather than a partial one.
+
+    NOTE the spans are line/col of the GENERATED LockProtocol.tla, so a caller mapping them back to
+    `algorithm.txt` must go through that file - which `--check-translation` pins.
+    """
+    last_start = None
+    for i, m in enumerate(messages):
+        if m.code == C_COVERAGE_START:
+            last_start = i
+    if last_start is None:
+        return None
+    last_block = None
+    for i in range(last_start + 1, len(messages)):
+        if messages[i].code in (C_COVERAGE_END, C_COVERAGE_END_LONG):
+            last_block = messages[last_start: i + 1]
+            break
+    if last_block is None:
+        return None
+
+    nodes: list[tuple[str, int, int, int]] = []
+    for m in last_block:
+        if m.code != C_COVERAGE_COST:
+            continue
+        match = _COVERAGE_COST_NODE.match(m.text)
+        if match:
+            nodes.append((match.group(5), int(match.group(1)), int(match.group(2)), int(match.group(6))))
+    return nodes
+
+
 def judge_coverage(run: Run, universe: LabelUniverse, coverage: dict[str, tuple[int, int]]) -> list[str]:
     """The per-run coverage gate (design Section 4, "four rules"): failures for one check/liveness
     run that is not -fixed and finished without a tooling error or timeout (the caller decides
@@ -1182,11 +1226,21 @@ def judge_union(executed: list[tuple[Run, bool, Result]], base: Path,
 
 def union_from_logs(entries: list[tuple[str, str]], base: Path,
                     never_reached: tuple[tuple[str, str], ...],
-                    deferred: tuple[tuple[str, str, str], ...]) -> bool:
+                    deferred: tuple[tuple[str, str, str], ...],
+                    partial: frozenset[str] = frozenset()) -> bool:
     """The union arithmetic itself, over (module, TLC log text) pairs.
 
     Split out so the union can be judged from logs SAVED BY EARLIER JOBS rather than only from runs
-    this invocation made - see --union-from. Returns whether the union failed."""
+    this invocation made - see --union-from. Returns whether the union failed.
+
+    `partial` names the runs whose coverage block describes only a PREFIX of the state space: a
+    seeded or witness run halts at its first counterexample, so a label it does not report may
+    simply lie beyond the halt. Their POSITIVE coverage is sound - a label they did reach is
+    genuinely reachable - so it still counts, and `uncovered` still fails closed. What a prefix
+    CANNOT support is the opposite inference, and one check rests on exactly that: a `never_reached`
+    or `deferred` label is caught only by appearing in `all_covered`, so a label that a halting run
+    would have covered had it continued escapes. That is unfixable from a halting run by
+    construction - it is reported here rather than left implied (capstone, plan 3, round 5)."""
     never_reached_labels = {label for label, _ in never_reached}
     deferred_labels = {label for label, _scenario, _reason in deferred}
     universes: dict[str, LabelUniverse] = {}
@@ -1213,6 +1267,11 @@ def union_from_logs(entries: list[tuple[str, str]], base: Path,
         print(f"run.py: cannot judge the union: {len(silent)} log(s) carry no complete coverage block "
               f"(truncated, empty, or -coverage output cut short)")
         return True
+    if partial:
+        print(f"run.py: note: {len(partial)} of {len(entries)} runs halt at a counterexample, so their "
+              f"coverage is a PREFIX. Their positive coverage counts and 'uncovered' still fails "
+              f"closed; a never_reached or deferred label they would have covered later cannot be "
+              f"detected: {', '.join(sorted(partial))}")
     all_covered: set[str] = set().union(*covered.values()) if covered else set()
     uncovered: set[str] = set()
     covered_in_universe: set[str] = set()
@@ -1254,9 +1313,39 @@ def judge_union_from(expected: Expected, base: Path, logs_dir: Path) -> int:
               f"{', '.join(sorted(missing))}", file=sys.stderr)
         return 2
     entries = [(r.module, logs[r.name].read_text(encoding="utf-8", errors="replace")) for r in wanted]
+    # A seeded or witness run halts at its first counterexample; check and liveness runs explore the
+    # whole reachable space under -continue.
+    partial = frozenset(r.name for r in wanted if r.kind in ("seeded", "witness"))
     print(f"run.py: judging the union from {len(entries)} saved logs under {logs_dir}")
-    failed = union_from_logs(entries, base, expected.never_reached, expected.deferred)
+    failed = union_from_logs(entries, base, expected.never_reached, expected.deferred, partial)
     return 1 if failed else 0
+
+
+def report_zero_branches(expected: Expected, logs_dir: Path) -> int:
+    """List every expression TLC evaluated ZERO times, per run, from saved logs.
+
+    A REPORT, not a gate. Making it a gate needs an expectations surface - which zeros are intended -
+    and nobody has measured how many there are yet; this is how that gets measured. It is also not
+    yet known what node shape TLC emits for a PlusCal `if`/`else if` INSIDE a label: the recorded
+    fixtures cover a raw TLA+ module and a three-action PlusCal one, and this suite is neither."""
+    logs = {path.stem: path for path in sorted(logs_dir.rglob("*.log"))}
+    total_zero = 0
+    for run in expected.runs:
+        path = logs.get(run.name)
+        if path is None:
+            print(f"  {run.name}: no log")
+            continue
+        nodes = parse_cost_nodes(parse_messages(path.read_text(encoding="utf-8", errors="replace")))
+        if nodes is None:
+            print(f"  {run.name}: no complete coverage block")
+            continue
+        zeros = [n for n in nodes if n[3] == 0]
+        total_zero += len(zeros)
+        print(f"  {run.name}: {len(zeros)} zero of {len(nodes)} expression nodes")
+        for module, line, col, _count in zeros:
+            print(f"      {module} line {line}, col {col}")
+    print(f"run.py: {total_zero} zero-count expression nodes across {len(expected.runs)} runs")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1270,6 +1359,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--union-from", type=Path, metavar="DIR",
                         help="judge the suite-wide coverage union from TLC logs already written under DIR, "
                              "instead of re-running every run")
+    parser.add_argument("--zero-branches", type=Path, metavar="DIR",
+                        help="report every expression TLC evaluated zero times, from logs under DIR "
+                             "(a report, not a gate)")
     parser.add_argument("--list-scenarios", action="store_true", help="print the scenario names as JSON")
     parser.add_argument("--list-jobs", action="store_true",
                          help="print the distinct {scenario, platform} pairs as JSON")
@@ -1303,6 +1395,8 @@ def main(argv: list[str] | None = None) -> int:
         return check_translation(args.expected.resolve().parent)
     if args.union_from is not None:
         return judge_union_from(expected, args.expected.resolve().parent, args.union_from)
+    if args.zero_branches is not None:
+        return report_zero_branches(expected, args.zero_branches)
     if args.scenario is not None and args.scenario not in scenarios:
         print(f"run.py: unknown scenario {args.scenario!r}; known: {', '.join(scenarios)}", file=sys.stderr)
         return 2
