@@ -57,6 +57,16 @@ Promoted from the local anomalies inbox (triage of 2026-09-14); each was re-meas
       concurrency group.
 - [ ] **`_typos.toml` excludes the spec by its literal file name**, so renaming the spec (a new version) makes the
       typos job scan it for the first time. Match the spec by a pattern instead.
+- [ ] **An empty release pull request is indistinguishable from a real one.** `release-plz` opens one on
+      every push to `main`, and `release-plz.toml` deliberately skips `spec`, `design`, `plan`, `model`,
+      `docs`, `skills` and `test` — which is most work in this repository — so a typical push produces a
+      version bump with **zero** changelog entries. Four have been closed for that reason so far (#22 was a
+      duplicate of `v0.1.1`'s own content; #24, #26 and #29 were empty), and the next one will look exactly
+      as actionable as a real release. The distinguishing check is one command,
+      `gh pr diff <n> | grep -c '^+- '`, returning zero — so make it a gate rather than a habit: a job on
+      release pull requests that fails when the changelog diff adds no entries, or a `release-plz` setting
+      that declines to open one. A habit is not a control; the person who merges it will not be the person
+      who learned the habit.
 
 ## Spec gaps from the filesystem probes
 
