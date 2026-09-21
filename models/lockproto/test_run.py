@@ -2078,8 +2078,12 @@ class CostNodeTests(unittest.TestCase):
         nodes = run.parse_cost_nodes(run.parse_messages(fixture("smoke_check_coverage")[1]))
         self.assertIsNotNone(nodes)
         zeros = [(module, line) for module, line, _col, count, _depth in nodes if count == 0]
-        # Smoke.tla's Overshoot body is guarded by the constant SEED_OVERSHOOT, and in the
-        # non-seeded run it reports zero - the exact shape of the capstone's R4-1 finding.
+        # Smoke.tla's Overshoot body is guarded by the constant SEED_OVERSHOOT and reports zero
+        # in the non-seeded run. NOTE it is NOT the R4-1 shape, though this comment used to say
+        # so: Overshoot is a top-level action whose own action line reads `0:0`, so the
+        # LABEL-granular gate already catches it. R4-1's shape is a zero branch inside an action
+        # that IS covered, and no recorded fixture contains one - so what this pins is that the
+        # parser reads zero-count nodes at all, not that the blind spot is instrumented.
         self.assertEqual(zeros, [("Smoke", 26), ("Smoke", 27)])
 
     def test_fails_closed_like_parse_coverage(self) -> None:

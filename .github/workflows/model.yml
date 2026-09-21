@@ -142,7 +142,14 @@ jobs:
     # and a coverage gap would otherwise hide the gap until the bug was fixed. Safe because
     # --union-from fails closed: a job that died before uploading leaves a missing log, which is
     # exit 2 naming the run, not a partial verdict.
-    if: needs.plan.outputs.matrix != '[]' && needs.scenario.result != 'skipped'
+    #
+    # `!cancelled()` is LOAD-BEARING, not decoration. GitHub wraps a job-level `if` in an implicit
+    # success() over `needs` unless the expression itself contains a status-check function, so the
+    # first version of this - the same condition without it - still skipped on a red scenario and
+    # delivered none of the above. Remove it and this job silently reverts (capstone, plan 3, round 6).
+    if: >-
+      !cancelled() && needs.plan.outputs.matrix != '[]'
+      && needs.scenario.result != 'skipped'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
