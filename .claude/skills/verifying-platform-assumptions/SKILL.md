@@ -104,15 +104,16 @@ are **not** verified, because writing this table is what showed that nobody here
 |---|---|---|
 | A lost lease poisons the descriptor; re-locking it does not help | `fcntl_locking(2)`, "Lost locks", retrieved 2026-09-21: *"future read(2) or write(2) requests may fail with the error EIO. This error will persist until the lock is removed or the file descriptor is closed."* | verified; ends if the page is revised for a kernel past 3.12 |
 | *(assumed)* Re-locking a descriptor whose lease lapsed recovers the lock | same sentence - it says the error persists until the descriptor is closed, which is the opposite | **refuted** - the design resting on it was rebuilt |
-| `rename` over an existing target is atomic to a reader | RFC 7530 §16.27 (RENAME). **Quote owed** - the section is located, the sentence is not transcribed | unverified; probe: read §16.27 and paste the sentence, or say it is not there |
-| A stale `unlink` removes whatever holds the name when the server runs it | RFC 7530 §16.26 (REMOVE). **Quote owed**, same reason | unverified; probe: read §16.26 and paste the sentence |
+| `rename` over an existing target is atomic to **the client** | RFC 7530 §16.27 (RENAME), retrieved 2026-09-21: *"The operation is required to be atomic to the client."* - and for the over-an-existing-target case, *"the existing target is removed before the rename occurs"* | verified; ends if a later NFS revision weakens RENAME's atomicity |
+| `REMOVE` identifies its target by NAME in a directory, never by filehandle | RFC 7530 §16.26 (REMOVE), retrieved 2026-09-21. Argument is `(cfh), filename`; *"The REMOVE operation removes (deletes) a directory entry named by filename from the directory corresponding to the current filehandle."* | verified |
+| …therefore a stale `unlink` removes whatever holds that name when the server RUNS it | **Inference from the row above, not a sentence in the RFC.** §16.26 says what REMOVE does, not what a retransmitted one does at a later moment. Nothing found on that timing | unverified; probe: retransmit a REMOVE after the name has been recreated, against a server with a duplicate-request cache |
 | A failed `rename` proves the rename did not happen | - | unverified; probe: retransmit against a server with a duplicate-request cache |
 | A non-blocking lock attempt on an open handle succeeds exactly when no other process holds that lock | **Quote owed** - this is one of the two behaviours the agents above got wrong, and it had no row here at all until the count was checked | unverified; probe: `fcntl(F_SETLK)` from two processes on one file, local and on NFS |
 
-**6 rows, and here is why that is all of them:** they are every behaviour this protocol borrows from the
+**7 rows, and here is why that is all of them:** they are every behaviour this protocol borrows from the
 filesystem - the four calls it makes at the lock path (`rename`, `unlink`, the lock acquisition, the
 re-lock after a lapse), the lease that underlies them, and the one failure mode (`rename` that reports
-failure). Walked by re-reading each filesystem call in the model and asking what it assumes.
+failure). `unlink` takes two rows because asking for its quote split a claim that had been one. Walked by re-reading each filesystem call in the model and asking what it assumes.
 
 **Write this paragraph and it audits itself.** Until this review it read "5 rows" and named the lock
 acquisition among them - and there was no lock-acquisition row. Five rows, five things listed, one of them
@@ -167,9 +168,10 @@ produces no other durable record (round 1, 2026-09-21).
 - `UNVERIFIED-ACCEPTED` (round 5, owner-capped): **no round of this review ever landed clean.** Five
   rounds, 21 findings folded, one rejected; every round found a defect inside the previous round's
   fixes, and round 5's three folds are themselves unreviewed. The owner capped the review here rather
-  than at a green round, so this page ships reviewed but not settled. Two rows of the Quick reference
-  carry **quote owed**: the RFC 7530 sections are located and the sentences are not transcribed. Do not
-  close those by writing a plausible sentence - fetch §16.26 and §16.27, or leave them owed.
+  than at a green round, so this page ships reviewed but not settled. The two RFC rows that carried
+  **quote owed** are now CLOSED the only admissible way - by fetching RFC 7530 and transcribing
+  §16.26 and §16.27, not by writing a plausible sentence. One row still owes a quote: the
+  `fcntl(F_SETLK)` claim, whose probe needs two processes and an NFS mount rather than a document.
 - `REJECTED` (round 3): that the core rule grants a rule-violating row "provisional" status. Measured -
   the reviewer quoted the round-1 wording, while the file it was sent says a row in no state is "weaker
   than provisional", which is the opposite. Superseded text, and the point was already in the
