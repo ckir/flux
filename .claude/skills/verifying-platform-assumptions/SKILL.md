@@ -65,40 +65,53 @@ not hold, stated with confidence, with no source, and the agent then argued *aga
 3. **Cite, refute, or mark.** A primary source is a specification, a manual page, the implementation's own
    source, or **a probe you actually ran** - not one you named. Another model's answer, a blog post, or your
    own recollection is a lead to check, never a source.
-4. **Cite it so someone else can re-check it.** A row says `verified` long after everyone has forgotten how.
-   A page that can change needs the date you read it; a long document needs the section, not just its
-   number; and **a probe needs its command and what the command printed**, in the row or in something the
-   row links to. A probe you ran and did not record is indistinguishable later from a probe you imagined -
-   without this, the rule for unverified rows is stricter than the rule for verified ones, which is
-   backwards.
-5. **A refuted row is a result, not a failure.** If the source or the probe says the platform does NOT behave
+4. **Quote the words, not just the reference.** This is the one guard that works without a second reader.
+   A reference is a promise that a source says something; the sentence itself is checkable on sight, and a
+   claim that has drifted from its quote is visible to anyone reading the row. It would have caught this
+   page's own failure below with no fetch at all. Typing a reference because a blog post mentioned it is
+   how a lead crosses into the Source column, and a quote is what that cannot survive.
+5. **Record what makes it re-checkable, and what would end it.** A page that can change needs the date you
+   read it; a long document needs the section, not just its number; a probe needs its command and what it
+   printed. A probe you ran and did not record is indistinguishable later from one you imagined - without
+   this the rule for unverified rows is stricter than the rule for verified ones, which is backwards.
+   **And say what would put the row back to `unverified`**: the platform version it was true of, the
+   paragraph that could be revised. A date nothing ever reads is filing, not verification - the row it
+   dates goes stale in place and still reads `verified`.
+6. **A refuted row is a result, not a failure.** If the source or the probe says the platform does NOT behave
    as assumed, say so in the row and follow what it costs: the design resting on it is now unsupported, and
    that is the whole return on doing this.
-6. **Check the self-serving ones first.** Of three such errors found in one project, every one was the
+7. **Check the self-serving ones first.** Of three such errors found in one project, every one was the
    reading that made the protocol look safer, and every one had already been built on by the time it surfaced.
-7. **An unverified row names the probe that would settle it** - concrete enough that someone else could
+8. **An unverified row names the probe that would settle it** - concrete enough that someone else could
    attempt it without asking you what you meant. "Write a test for it" is not a probe; a command, a named
    tool, or a setup someone could build is. Naming a probe does not verify anything; it records what is
    owed, and a vague one records nothing.
-8. **Say how many rows there are, and how you know that is all of them.** A list of zero borrowed behaviours
+9. **Say how many rows there are, and how you know that is all of them.** A list of zero borrowed behaviours
    satisfies every rule above and proves nothing - the commonest way this comes out green is by naming
    nothing. If the count is low, say which calls you went looking through to get it.
 
 ## Quick reference
 
-| Claim | Source | State |
+The Source column carries the words, not just the reference (step 4). Note what that costs: two rows below
+are **not** verified, because writing this table is what showed that nobody here had ever read the sentence.
+
+| Claim | Source, and the words that say so | State |
 |---|---|---|
-| `rename` over an existing target is atomic to a reader | RFC 7530 | verified |
-| A stale `unlink` removes whatever holds the name when the server runs it | RFC 7530 (`REMOVE` carries the name) | verified |
-| A lost lease poisons the descriptor; re-locking it does not help | `fcntl_locking(2)`, "Lost locks" | verified |
+| A lost lease poisons the descriptor; re-locking it does not help | `fcntl_locking(2)`, "Lost locks", retrieved 2026-09-21: *"future read(2) or write(2) requests may fail with the error EIO. This error will persist until the lock is removed or the file descriptor is closed."* | verified; ends if the page is revised for a kernel past 3.12 |
+| *(assumed)* Re-locking a descriptor whose lease lapsed recovers the lock | same sentence - it says the error persists until the descriptor is closed, which is the opposite | **refuted** - the design resting on it was rebuilt |
+| `rename` over an existing target is atomic to a reader | RFC 7530 §16.27 (RENAME). **Quote owed** - the section is located, the sentence is not transcribed | unverified; probe: read §16.27 and paste the sentence, or say it is not there |
+| A stale `unlink` removes whatever holds the name when the server runs it | RFC 7530 §16.26 (REMOVE). **Quote owed**, same reason | unverified; probe: read §16.26 and paste the sentence |
 | A failed `rename` proves the rename did not happen | - | unverified; probe: retransmit against a server with a duplicate-request cache |
-| *(assumed)* Re-locking a descriptor whose lease lapsed recovers the lock | `fcntl_locking(2)`, same section | **refuted** - the design resting on it was rebuilt |
 
 **5 rows, and here is why that is all of them:** they are every behaviour this protocol borrows from the
 filesystem - the four calls it makes at the lock path (`rename`, `unlink`, the lock acquisition, the
 re-lock after a lapse) and the lease that underlies them. Walked by re-reading each filesystem call in the
-model and asking what it assumes. Step 7 without this line is the part everyone skips, which is why the
+model and asking what it assumes. Step 9 without this line is the part everyone skips, which is why the
 example carries it.
+
+Two rows moved from `verified` to `unverified` the moment the quote was asked for. They had said "RFC 7530"
+for months and nobody could have told from the table whether anyone had opened it. That is the rule earning
+its place, and it is also the honest state of this list: the sections are right, the sentences are owed.
 
 ## Red flags
 
