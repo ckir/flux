@@ -14,15 +14,11 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
       deterministic-ordering requirement (spec §7) may force a custom one anyway.
 - [ ] **Persistent state format** for the topology store and operation manifest
       (spec §17, §19). Must scale past RAM and survive a crash mid-write.
-- [ ] **Model-check the lock protocol before implementing it** (spec §96.1, §99,
-      §240.3, §240.5, §259.6, and the claim/`COMMIT` ordering of §241.5 and
-      §182). The V16 adversarial review stopped at its six-round cap still finding
-      defects there each round, and round 6's fixes went unreviewed. Model two
-      recoverers, two `--break-lock` takeovers, a stalled prior owner, and a plain
-      run (for example with TLA+, or `loom`/`shuttle` against the Rust
-      implementation) and check that at most one operation ever owns a target.
 - [ ] Repository housekeeping: enable GitHub private vulnerability reporting (see
       [SECURITY.md](SECURITY.md)), and decide whether `main` gets branch protection.
+      `UNVERIFIABLE` 2026-09-22: both halves are GitHub settings, which nothing in the tree
+      records, so no closure here could be re-checked from the repository alone. Observed at the
+      time: `required_status_checks.strict` is `true`, so branch protection is on.
 
 ## Phase 2 — portable copy (next)
 
@@ -41,6 +37,9 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
 
 - [ ] Install `cargo-mutants` (`cargo binstall -y cargo-mutants`) — it is the one
       tool in `.claude/recommended-tools.json` not yet present on the dev box
+      `UNVERIFIABLE` 2026-09-22: completion is the state of one machine, which the repository
+      cannot record. Observed at the time: `command -v cargo-mutants` says INSTALLED, and the tool
+      is declared in `.claude/recommended-tools.json`.
 - [ ] Run `lefthook install` in each clone (or add it to a bootstrap recipe)
 - [ ] Replace the placeholder `benches/copy.rs` once there is a pipeline to measure
 - [ ] Replace the placeholder test in `tests/integration/mod.rs` with the first
@@ -195,5 +194,20 @@ stated so the next audit starts from a prediction rather than a hunt.
       `SEED_[A-Z0-9_]+` from `LockProtocol.tla`, collect `SEED_... = TRUE` across `configs/*.cfg`, subtract —
       which is how "the complement is empty" came to be measured rather than asserted. It belongs in
       `test_run.py`.
-- [ ] **`.antigravityignore` is untracked in the primary working tree.** Neither committed nor ignored, and the
-      only thing between that tree and a clean `git status`.
+
+## Closed
+
+Triaged 2026-09-22. Kept here rather than deleted: the evidence for a closure belongs where the
+item was, not only in a commit message.
+
+- `DONE` **Model-check the lock protocol before implementing it.** Done by lock-model plans 1 to 3.
+  The item asked for two recoverers, two `--break-lock` takeovers, a stalled prior owner and a plain
+  run, checking that at most one operation ever owns a target: `recovery` runs `Recoverers = {r1, r2}`,
+  `breaklock` runs `Breakers = {b1, b2}`, crashes model the stalled owner, `PlainRuns` covers the plain
+  run, and `SingleWriter` is the at-most-one-owner invariant — 5 occurrences in
+  `models/lockproto/invariants.txt`, checked across the scenarios `run.py --list-jobs` reports. The item
+  offered TLA+ *or* `loom`/`shuttle` as alternatives; TLA+ satisfies it.
+- `OVERTAKEN` **`.antigravityignore` is untracked in the primary working tree.** It is tracked on `main`:
+  `git ls-files .antigravityignore` returns it. It reads as untracked only in `E:/Rust/flux`, which sits
+  on the stale `model/lock-protocol` branch — the remedy is to move that tree, and there is nothing to
+  change in the repository.
