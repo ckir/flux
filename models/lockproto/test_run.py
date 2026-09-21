@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import re
 import sys
 import tempfile
 import textwrap
@@ -65,7 +66,7 @@ timeout_minutes = 5
 CFGS = {
     "check.cfg": "SPECIFICATION Spec\nCONSTANTS\n    FIX_SAFE = FALSE\nINVARIANTS Safe NeverDone\n",
     "live.cfg": "SPECIFICATION Spec\nCONSTANTS\n    FIX_LIVE = FALSE\nINVARIANT LiveWitness\nPROPERTY Eventually\n",
-    "seed.cfg": "SPECIFICATION Spec\nCONSTANT FIX_SAFE = FALSE\nINVARIANT Other\n",
+    "seed.cfg": "SPECIFICATION Spec\nCONSTANT FIX_SAFE = FALSE\nINVARIANT Other Safe\n",
     "witness.cfg": "SPECIFICATION Spec\nCONSTANT FIX_SAFE = FALSE\nINVARIANT Other2\n",
 }
 
@@ -768,6 +769,17 @@ class InterpretTests(unittest.TestCase):
                 # violation exit codes agrees with them.
                 self.assertIn("does not match", run.interpret(exit_code, output, ["P"]).tooling_error or "")
 
+    def test_an_unknown_exit_status_is_a_tooling_failure(self) -> None:
+        """The catch-all in `agrees.get(exit_code, False)` had no test, so its default could be
+        flipped to accept any unrecognised code and the suite stayed green (test audit, plan 3,
+        TA-3). An exit status TLC is not documented to produce must never be read as a verdict."""
+        _, output = fixture("clean")
+        for exit_code in (77, 1, 255):
+            with self.subTest(exit_code=exit_code):
+                detail = run.interpret(exit_code, output, []).tooling_error or ""
+                self.assertIn("does not match", detail)
+                self.assertIn(str(exit_code), detail)
+
     def test_crlf_output_parses(self) -> None:
         code, output = fixture("continue_two_invariants")
         self.assertEqual(run.interpret(code, output.replace("\n", "\r\n"), []).observed, {"NeverTwo", "NeverThree"})
@@ -1119,9 +1131,9 @@ timeout_minutes = 5
             code = run.main(["--expected", str(d.path / "expected.toml"), "--list-jobs"])
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out.getvalue()), [
-            {"scenario": "alpha", "platform": "windows"},
-            {"scenario": "alpha", "platform": "posix"},
-            {"scenario": "beta", "platform": "posix"},
+            {"scenario": "alpha", "platform": "windows", "job": "windows"},
+            {"scenario": "alpha", "platform": "posix", "job": "posix"},
+            {"scenario": "beta", "platform": "posix", "job": "posix"},
         ])
 
     def test_list_jobs_on_the_repository_file_includes_both_recovery_platforms(self) -> None:
@@ -1136,8 +1148,8 @@ timeout_minutes = 5
             code = run.main(["--expected", str(HERE / "expected.toml"), "--list-jobs"])
         self.assertEqual(code, 0)
         jobs = json.loads(out.getvalue())
-        self.assertIn({"scenario": "recovery", "platform": "posix"}, jobs)
-        self.assertIn({"scenario": "recovery", "platform": "windows"}, jobs)
+        self.assertIn({"scenario": "recovery", "platform": "posix", "job": "posix"}, jobs)
+        self.assertIn({"scenario": "recovery", "platform": "windows", "job": "windows"}, jobs)
 
     def test_list_jobs_on_the_extended_repository_file(self) -> None:
         run.shutil.which = lambda _name: None
@@ -1150,8 +1162,8 @@ timeout_minutes = 5
         with contextlib.redirect_stdout(out):
             code = run.main(["--expected", str(HERE / "expected-extended.toml"), "--list-jobs"])
         self.assertEqual(code, 0)
-        self.assertEqual(json.loads(out.getvalue()), [{"scenario": "recovery", "platform": "posix"},
-                                                      {"scenario": "recovery", "platform": "windows"}])
+        self.assertEqual(json.loads(out.getvalue()), [{"scenario": "recovery", "platform": "posix", "job": "posix"},
+                                                      {"scenario": "recovery", "platform": "windows", "job": "windows"}])
 
     def test_platform_without_scenario_exits_2(self) -> None:
         err = io.StringIO()
@@ -1876,6 +1888,253 @@ class MainUnionRoutingTests(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             run.main(["--expected", str(d.path / "expected.toml"), "--scenario", "demo"])
         self.assertIn("not judged for a single scenario", out.getvalue())
+
+
+class GeneratedModuleTests(unittest.TestCase):
+    """LockProtocol.tla is generated (README.md): `cat LockProtocol.head algorithm.txt invariants.txt`,
+    then `pcal.trans`, which INSERTS a translation block after the algorithm's closing `*)`. Nothing in
+    the justfile, the workflows or these tests re-derived it, so a source edited without re-running the
+    translator left CI checking a model the sources no longer described, silently (capstone, plan 3).
+
+    This catches that case with no Java: everything OUTSIDE the inserted block must still be exactly the
+    three sources concatenated. It does NOT catch a hand-edited translation block - only a real
+    `pcal.trans` run can, and that needs the jar, so it belongs in CI rather than here.
+    """
+
+    BEGIN = "\\* BEGIN TRANSLATION"
+    END = "\\* END TRANSLATION"
+
+    def test_generated_module_matches_its_sources(self) -> None:
+        d = Path(__file__).resolve().parent
+        sources = "".join((d / name).read_text(encoding="utf-8")
+                          for name in ("LockProtocol.head", "algorithm.txt", "invariants.txt"))
+        generated = (d / "LockProtocol.tla").read_text(encoding="utf-8")
+
+        lines = generated.splitlines(keepends=True)
+        starts = [i for i, ln in enumerate(lines) if ln.startswith(self.BEGIN)]
+        ends = [i for i, ln in enumerate(lines) if ln.startswith(self.END)]
+        self.assertEqual(len(starts), 1, "expected exactly one BEGIN TRANSLATION marker")
+        self.assertEqual(len(ends), 1, "expected exactly one END TRANSLATION marker")
+        self.assertLess(starts[0], ends[0], "END TRANSLATION precedes BEGIN TRANSLATION")
+
+        without_translation = "".join(lines[:starts[0]] + lines[ends[0] + 1:])
+        self.assertEqual(
+            without_translation, sources,
+            "LockProtocol.tla no longer matches LockProtocol.head + algorithm.txt + invariants.txt. "
+            "Re-run the translator: cat the three sources into LockProtocol.tla, then "
+            "`java -cp target/tla/tla2tools.jar pcal.trans LockProtocol.tla` (and delete the "
+            "LockProtocol.cfg it writes beside it).")
+
+
+class ConfigConsistencyTests(unittest.TestCase):
+    """The .cfg files are hand-written copies of each other - TLC's format has no include - so nothing
+    stops one drifting from the rest. Adding a CONSTANT means editing 70-odd files by hand, and the
+    `-fixed-check` configs exist only to be their `-check` sibling with the fix flag flipped. These
+    two guards make that duplication safe to keep (capstone, plan 3)."""
+
+    def configs(self) -> dict[str, str]:
+        d = Path(__file__).resolve().parent / "configs"
+        # The selftest configs belong to Smoke.tla, a different module with its own constants.
+        return {c.name: c.read_text(encoding="utf-8") for c in sorted(d.glob("*.cfg"))
+                if not c.name.startswith("selftest-")}
+
+    @staticmethod
+    def constant_names(text: str) -> frozenset[str]:
+        """The names assigned in the CONSTANT/CONSTANTS section.
+
+        Parsed per line rather than from cfg_sections' token stream: a set-literal value such as
+        `Owners = {o1}` is several tokens, so the stream has no fixed stride to step over."""
+        body = text[text.index("CONSTANT"):]
+        for keyword in ("INVARIANT", "PROPERTY", "SYMMETRY", "SPECIFICATION"):
+            if keyword in body:
+                body = body[:body.index(keyword)]
+        return frozenset(m.group(1) for m in re.finditer(r"^\s+([A-Za-z_][A-Za-z0-9_]*)\s*=", body, re.M))
+
+    def test_every_config_declares_the_same_constants(self) -> None:
+        names = {name: self.constant_names(text) for name, text in self.configs().items()}
+        self.assertTrue(names, "expected LockProtocol configs beside the tests")
+        every = frozenset().union(*names.values())
+        # Assert something was PARSED, not only that the gaps between files are empty. Without
+        # this a parser that extracts nothing gives every file an empty set, so `gaps` is empty
+        # and the guard passes while guarding nothing (test audit, plan 3, TA-2 - the same shape
+        # as the parse_cost_nodes defect: assert on the filtered result, never on the count).
+        self.assertIn("LockCapability", every,
+                      "the constant parser returned nothing recognisable; this guard is vacuous")
+        self.assertGreater(len(every), 10, f"only {len(every)} constants parsed across {len(names)} configs")
+        # Reported per CONSTANT rather than against one chosen file: whichever config is the odd one
+        # out, the message must name IT, not the other seventy.
+        gaps = {constant: sorted(f for f, declared in names.items() if constant not in declared)
+                for constant in sorted(every)}
+        gaps = {c: files for c, files in gaps.items() if files}
+        self.assertEqual(
+            gaps, {},
+            "every LockProtocol config must assign every constant the module declares, because adding "
+            "one means editing them all by hand and TLC's format has no include. Not declared by: "
+            + "; ".join(f"{c} <- {', '.join(files)}" for c, files in gaps.items()))
+
+    def test_fixed_check_configs_match_their_sibling(self) -> None:
+        configs = self.configs()
+        pairs = [(n, n.replace("-fixed-check.cfg", "-check.cfg")) for n in configs
+                 if n.endswith("-fixed-check.cfg")]
+        self.assertTrue(pairs, "expected at least one -fixed-check config")
+        for fixed_name, check_name in pairs:
+            self.assertIn(check_name, configs, f"{fixed_name} has no -check sibling")
+            fixed, check = run.cfg_constants(configs[fixed_name]), run.cfg_constants(configs[check_name])
+            self.assertEqual(
+                fixed.get("FIX_REMOTE_LEASE_SPEC"), True, f"{fixed_name} must set FIX_REMOTE_LEASE_SPEC")
+            self.assertEqual(
+                check.get("FIX_REMOTE_LEASE_SPEC"), False, f"{check_name} must clear FIX_REMOTE_LEASE_SPEC")
+            differing = {k for k in set(fixed) | set(check) if fixed.get(k) != check.get(k)}
+            self.assertEqual(
+                differing, {"FIX_REMOTE_LEASE_SPEC"},
+                f"{fixed_name} and {check_name} must differ in FIX_REMOTE_LEASE_SPEC alone, "
+                f"but also differ in {sorted(differing - {'FIX_REMOTE_LEASE_SPEC'})}")
+
+            def invariants(text: str) -> set[str]:
+                sections = run.cfg_sections(text)
+                return set(sections.get("INVARIANT", []))
+
+            self.assertEqual(
+                invariants(configs[fixed_name]), invariants(configs[check_name]) | {"SingleWriter"},
+                f"{fixed_name} must check exactly its sibling's invariants plus SingleWriter: the "
+                f"sibling drops SingleWriter because it carries the open finding, and the whole point "
+                f"of the fixed run is to check it with the flag on")
+
+
+class UnionFromLogsTests(unittest.TestCase):
+    """--union-from: judge the union from logs earlier CI jobs already wrote.
+
+    The union used to be judged by re-running every run in one job; measured, that job could not fit
+    its 180-minute cap, so the only place the union was judged never judged it (capstone, plan 3)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.logs = Path(self._tmp.name) / "artifacts"
+        # nested, as `gh run download` lays artifacts out: one directory per uploading job
+        (self.logs / "tlc-output-x-posix").mkdir(parents=True)
+
+    def write_log(self, name: str, case: str = "smoke_check_coverage") -> None:
+        (self.logs / "tlc-output-x-posix" / f"{name}.log").write_text(fixture(case)[1], encoding="utf-8")
+
+    def test_a_missing_log_fails_rather_than_under_reporting(self) -> None:
+        d = ExpectedDir()
+        self.addCleanup(d.close)
+        expected = d.load()
+        self.write_log(expected.runs[0].name)
+        for extra in expected.runs[1:]:
+            pass  # deliberately not written
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            code = run.judge_union_from(expected, d.path, self.logs)
+        if len(expected.runs) > 1:
+            self.assertEqual(code, 2)
+            self.assertIn("cannot judge the union", out.getvalue())
+            self.assertIn(expected.runs[1].name, out.getvalue())
+
+    def test_a_log_with_no_complete_coverage_block_fails(self) -> None:
+        """A log that is PRESENT but silent must fail, not count as "covered nothing".
+
+        parse_coverage returns None rather than judging from a partial block. `or {}` used to turn
+        that refusal into an empty coverage set, which inflates `uncovered` (loud) but SHRINKS
+        all_covered - and all_covered is the only detector for a never_reached or deferred label
+        that IS covered, so those two checks failed OPEN. Reachable because the per-run coverage
+        gate covers check/liveness only, while witness and seeded runs also carry -coverage 1.
+        """
+        d = ExpectedDir()
+        self.addCleanup(d.close)
+        expected = d.load()
+        for r in expected.runs:
+            self.write_log(r.name)
+        # one run's log is present and parses to no complete coverage block
+        (self.logs / "tlc-output-x-posix" / f"{expected.runs[0].name}.log").write_text("", encoding="utf-8")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = run.judge_union_from(expected, d.path, self.logs)
+        self.assertEqual(code, 1, "a silent log must fail the union, never be read as covering nothing")
+        self.assertIn("no complete coverage block", out.getvalue())
+
+    def test_no_logs_at_all_fails(self) -> None:
+        d = ExpectedDir()
+        self.addCleanup(d.close)
+        expected = d.load()
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            code = run.judge_union_from(expected, d.path, self.logs)
+        self.assertEqual(code, 2, "an empty artifact directory must fail, never pass vacuously")
+        self.assertIn("cannot judge the union", out.getvalue())
+
+
+class CostNodeTests(unittest.TestCase):
+    """parse_cost_nodes(): the expression-granular data TLC emits and run.py used to discard.
+
+    The suite's coverage gate is LABEL-granular, so a guarded branch inside a label that the
+    non-taking path also reaches is invisible to it. That blind spot produced two capstone findings.
+    TLC's `-coverage 1` has carried per-expression counts (message 2221) all along, including zeros.
+    """
+
+    def test_reads_every_cost_node_including_the_nested_ones(self) -> None:
+        """The NESTED nodes are the branch-level ones, and the first version of this parser dropped
+        them: TLC prefixes a node's depth with `|`, and the pattern matched leading whitespace
+        only. It returned 10 of 17 while looking like it had read them all. Assert the COUNT,
+        absence of this assertion is exactly what let that through."""
+        text = fixture("smoke_check_coverage")[1]
+        nodes = run.parse_cost_nodes(run.parse_messages(text))
+        self.assertIsNotNone(nodes)
+        self.assertEqual(len(nodes), text.count("@!@!@STARTMSG 2221"),
+                         "every message-2221 line must be parsed, nested ones included")
+        self.assertTrue(any(depth > 0 for *_rest, depth in nodes),
+                        "the fixture carries nested nodes; if none parse, the depth support is dead")
+
+    def test_an_unreadable_cost_line_fails_closed(self) -> None:
+        text = fixture("smoke_check_coverage")[1]
+        broken = text.replace("line 26, col 8", "LINE 26, col 8", 1)
+        self.assertIsNone(run.parse_cost_nodes(run.parse_messages(broken)),
+                          "a 2221 line the parser cannot read must be None, never a silent drop")
+
+    def test_extracts_the_zero_count_nodes_of_a_constant_guarded_body(self) -> None:
+        nodes = run.parse_cost_nodes(run.parse_messages(fixture("smoke_check_coverage")[1]))
+        self.assertIsNotNone(nodes)
+        zeros = [(module, line) for module, line, _col, count, _depth in nodes if count == 0]
+        # Smoke.tla's Overshoot body is guarded by the constant SEED_OVERSHOOT and reports zero
+        # in the non-seeded run. NOTE it is NOT the R4-1 shape, though this comment used to say
+        # so: Overshoot is a top-level action whose own action line reads `0:0`, so the
+        # LABEL-granular gate already catches it. R4-1's shape is a zero branch inside an action
+        # that IS covered, and no recorded fixture contains one - so what this pins is that the
+        # parser reads zero-count nodes at all, not that the blind spot is instrumented.
+        self.assertEqual(zeros, [("Smoke", 26), ("Smoke", 27)])
+
+    def test_fails_closed_like_parse_coverage(self) -> None:
+        # No coverage block at all, and a block whose terminator never arrived.
+        self.assertIsNone(run.parse_cost_nodes(run.parse_messages("no coverage here")))
+        started = fixture("smoke_check_coverage")[1]
+        cut = started[: started.rindex("@!@!@STARTMSG 2201")] + "@!@!@STARTMSG 2201:0 @!@!@" + chr(10)
+        self.assertIsNone(
+            run.parse_cost_nodes(run.parse_messages(cut)),
+            "an unterminated final block must be None, never a partial answer")
+
+
+class PartialCoverageTests(unittest.TestCase):
+    """A seeded or witness run halts at its first counterexample, so its coverage block describes a
+    PREFIX of the state space. Its positive coverage is sound; its SILENCE is not evidence."""
+
+    def test_the_union_reports_which_runs_contributed_a_prefix(self) -> None:
+        d = ExpectedDir()
+        self.addCleanup(d.close)
+        expected = d.load()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        logs = Path(tmp.name)
+        for r in expected.runs:
+            (logs / f"{r.name}.log").write_text(fixture("smoke_check_coverage")[1], encoding="utf-8")
+        halting = frozenset(r.name for r in expected.runs if r.kind in run.HALTING_KINDS)
+        self.assertTrue(halting, "the fixture must contain a halting run or this test asserts nothing")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            run.judge_union_from(expected, d.path, logs)
+        self.assertIn("PREFIX", out.getvalue(), "a union built partly from halting runs must say so")
+        for name in halting:
+            self.assertIn(name, out.getvalue())
 
 
 if __name__ == "__main__":

@@ -91,3 +91,14 @@ tempfile = "3"
 inherits = "dev"
 debug = 0
 strip = "debuginfo"
+
+# The shipped binary. `panic = "abort"` means a panic is a hard crash with no unwinding, so no Drop
+# runs and a held lock file is left behind rather than released - which is the dead-owner case the
+# lock protocol already models and recovers (240.2, 240.3), not a new failure mode. `strip = true`
+# removes the symbols, so a field panic gives no backtrace; the debug build keeps them.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

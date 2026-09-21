@@ -74,7 +74,7 @@ jobs:
           { echo "matrix<<MATRIX_EOF"; echo "$matrix"; echo "MATRIX_EOF"; } >> "$GITHUB_OUTPUT"
 
   scenario:
-    name: Scenario ${{ matrix.job.scenario }} (${{ matrix.job.platform }})
+    name: Scenario ${{ matrix.job.scenario }} (${{ matrix.job.job }})
     needs: plan
     # GitHub rejects an empty matrix, so the job is skipped when there is nothing to run.
     if: needs.plan.outputs.matrix != '[]'
@@ -98,17 +98,76 @@ jobs:
         env:
           SCENARIO: ${{ matrix.job.scenario }}
           PLATFORM: ${{ matrix.job.platform }}
-        run: just model "$SCENARIO" "$PLATFORM"
+          JOB: ${{ matrix.job.job }}
+        run: just model "$SCENARIO" "$PLATFORM" "$JOB"
       - name: Upload TLC output
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: tlc-output-${{ matrix.job.scenario }}-${{ matrix.job.platform }}
+          name: tlc-output-${{ matrix.job.scenario }}-${{ matrix.job.job }}
           path: target/tla/out/
+
+  translation:
+    # LockProtocol.tla is generated and committed. Until this job existed nothing re-derived it, so a
+    # source edited without re-running the translator left every TLC run checking a model the sources
+    # no longer described, silently (capstone finding, plan 3). Cheap: the translator, not TLC.
+    name: Translation is fresh
+    needs: plan
+    if: needs.plan.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Re-run pcal.trans and diff
+        run: python models/lockproto/run.py --check-translation
+
+  union:
+    # The suite-wide coverage union (design Section 4). It used to live in the extended tier, which
+    # RE-RAN every run of expected.toml in one job to compute it - and measured (CI 35188279927) that
+    # job ran exactly its 180-minute cap and was killed, so the one place the union was judged never
+    # judged it. The union needs nothing from a run but its last coverage block, which the scenario
+    # jobs above already upload, so here it is arithmetic over those logs and costs no TLC time.
+    # It needs EVERY run's log and fails if one is missing, so it only runs when the full matrix did.
+    name: Suite-wide coverage union
+    needs: [plan, scenario]
+    # Deliberately NOT gated on the scenario jobs SUCCEEDING. A run that MISMATCHES still completes
+    # and still uploads its log, so the union can be judged - and a pull request carrying both a bug
+    # and a coverage gap would otherwise hide the gap until the bug was fixed. Safe because
+    # --union-from fails closed: a job that died before uploading leaves a missing log, which is
+    # exit 2 naming the run, not a partial verdict.
+    #
+    # `!cancelled()` is LOAD-BEARING, not decoration. GitHub wraps a job-level `if` in an implicit
+    # success() over `needs` unless the expression itself contains a status-check function, so the
+    # first version of this - the same condition without it - still skipped on a red scenario and
+    # delivered none of the above. Remove it and this job silently reverts (capstone, plan 3, round 6).
+    if: >-
+      !cancelled() && needs.plan.outputs.matrix != '[]'
+      && needs.scenario.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Download every scenario's TLC output
+        uses: actions/download-artifact@v7
+        with:
+          pattern: tlc-output-*
+          path: tlc-output
+      - name: Judge the union
+        run: python models/lockproto/run.py --union-from tlc-output
 
   model-gate:
     name: Model gate
-    needs: [plan, scenario]
+    needs: [plan, scenario, translation, union]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -116,16 +175,25 @@ jobs:
         env:
           PLAN: ${{ needs.plan.result }}
           SCENARIO: ${{ needs.scenario.result }}
+          TRANSLATION: ${{ needs.translation.result }}
+          UNION: ${{ needs.union.result }}
           MATRIX: ${{ needs.plan.outputs.matrix }}
         run: |
-          echo "plan=$PLAN scenario=$SCENARIO matrix=$MATRIX"
+          echo "plan=$PLAN scenario=$SCENARIO translation=$TRANSLATION union=$UNION matrix=$MATRIX"
           if [ "$PLAN" != "success" ]; then
             echo "::error::the plan job did not succeed"; exit 1
           fi
           if [ "$MATRIX" = "[]" ]; then
-            if [ "$SCENARIO" = "skipped" ]; then exit 0; fi
-            echo "::error::nothing needed to run, yet the scenario job ended as $SCENARIO"; exit 1
+            if [ "$SCENARIO" = "skipped" ] && [ "$TRANSLATION" = "skipped" ] && [ "$UNION" = "skipped" ]; then exit 0; fi
+            echo "::error::nothing needed to run, yet scenario=$SCENARIO translation=$TRANSLATION union=$UNION"; exit 1
+          fi
+          if [ "$TRANSLATION" != "success" ]; then
+            echo "::error::LockProtocol.tla is not what pcal.trans emits for its sources ($TRANSLATION)"
+            exit 1
           fi
           if [ "$SCENARIO" != "success" ]; then
             echo "::error::a scenario job did not succeed ($SCENARIO)"; exit 1
+          fi
+          if [ "$UNION" != "success" ]; then
+            echo "::error::the suite-wide coverage union did not succeed ($UNION)"; exit 1
           fi
