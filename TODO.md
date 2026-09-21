@@ -78,7 +78,7 @@ against spec V16.
 
 ## Lock-model follow-ups
 
-On branch `model/lock-protocol-wip` (PR #3). Each was verified by measurement; M5 to M8 come from the plan-2 test
+From plan 2, now merged (was PR #3). Each was verified by measurement; M5 to M8 come from the plan-2 test
 audit (`docs/agy-test-audit-ledger.md`), where the owner deferred them as minor.
 
 - [ ] **Cache the TLC jar in CI.** Each `model.yml` scenario job downloads and checksums `tla2tools.jar` on its own;
@@ -101,3 +101,99 @@ audit (`docs/agy-test-audit-ledger.md`), where the owner deferred them as minor.
 - [ ] **M8, the liveness consequent can be weakened undetectably.** Widening `UncertainReported` or making
       `DeadLockEventuallyCleared` trivially true keeps its witness violated and the liveness run green. Add a recovery
       seed (a Recoverer that gives up) that must violate the property.
+
+## Lock-model follow-ups (plan 3)
+
+Triage of the local anomalies inbox, 2026-09-21: six capstone rounds, two test-audit rounds, and the
+v0.1.0/v0.1.1 release. Each was verified by measurement; the inbox entry carried the evidence and was deleted
+by the commit that added this section.
+
+**One re-measurement covers the first three.** Each is a model change needing a fresh full run, and
+`breaklock-remote` alone was ~2.5h before its split, so batch them rather than paying three times.
+
+- [ ] **`pendingUnlink` could be a boolean.** Every use tests it only against `NoObj`; its captured identity
+      became dead when `LandUnlink` moved to resolving the lock NAME at the landing. As a per-process object id
+      it carries `MaxObjs + 1` values per process against two for a boolean, and the remote checks run at 60M+
+      states — a real state-space reduction, not tidiness.
+- [ ] **`tornRead` is set at one of the two labels that read a record.** The classify read sets it; `S240_5_s5`
+      does not, so a torn read during a takeover goes unrecorded and the ghost under-reports its own declared
+      meaning. It feeds only `NeverTornRead`, which already fires from the classify path, so it buys no coverage
+      today — do it while the states are being re-measured anyway.
+- [ ] **`IdentityStrength = "weak"` is dead across every run.** All 74 runs pin `"strong"` while `FsModel.tla`
+      implements the weak value at four sites. The README justifies the pin only for `recovery`, and the one
+      protocol decision that discriminates on it (`algorithm.txt:434`) is in the Breaker/TakeOver path, which
+      `recovery` has no actor for. Give it a `breaklock`-scoped justification, or drop the value.
+
+**Coverage, where the gate is weaker than it reads.**
+
+- [ ] **Build the BRANCH-granular coverage union — it is debt, not a limit.** TLC's `-coverage 1` is
+      expression-granular (message 2221, nested, zeros included) and the repo's own fixture proves the shape at
+      `models/lockproto/testdata/smoke_check_coverage.out:109`. `run.py` already parses that message and
+      deliberately discards it, so a branch union is buildable from logs on disk at no TLC cost. Settle two things
+      first: the nodes key off `line,col` of the GENERATED module (which `--check-translation` pins), and the
+      shape TLC emits for a PlusCal `if`/`else if` INSIDE a label was never measured. This blind spot has already
+      produced two findings.
+- [ ] **Say which `never_reached` claims an exhaustive run supports.** 52 of 77 runs halt at a counterexample, so
+      their coverage is a PREFIX. Positive coverage from a prefix is sound and `uncovered` fails closed, but the
+      one check that fails OPEN — a label a halting run would have covered later — is blind across two-thirds of
+      the suite. The exhaustive check and liveness runs alone carry those claims; the union could mark each claim
+      supported or not, turning a suite-wide caveat into a per-claim one.
+- [ ] **Commit the union verdict as an artifact.** "103 labels covered, 0 never_reached, 1 deferred" exists only
+      in prose nobody can confirm or refute. A `union.txt` beside `expected.toml`, or the verdict pinned as a
+      fixture, makes the most-cited number in this work re-readable. Cheapest item here, and it answers the
+      review's structural finding: of ~84 factual claims in this branch's commit messages, ~45 are permanently
+      unverifiable — every state count, every timing, all sixteen CI run ids — because GitHub log retention is 90
+      days and commit messages are forever.
+
+**Seeds that pin their own seed rather than the property.** Each needs TLC, so each is CI-only; the mutant is
+stated so the next audit starts from a prediction rather than a hunt.
+
+- [ ] **`FsOk`'s other two conjuncts are still indistinguishable from `TRUE`.** `FsOk` is
+      `NoDoubleOpen /\ LockImpliesHandle /\ IdsNotReused`, and `SEED_FS_LOCK_WITHOUT_HANDLE` breaks only the
+      middle one. Mutant `FsInvariants(fs) == LockImpliesHandle(fs)` is predicted GREEN.
+- [ ] **`Classifiable`'s seed pins the seed.** `SEED_FS_ALIEN_CONTENT` writes `NoProc` specifically, so the
+      mutant `Classifiable == \A o \in Objs : fs.content[o] # NoProc` is predicted GREEN — the invariant gutted
+      to a NoProc-check and still satisfied by its own seed.
+- [ ] **Two of `RefusalJustified`'s three `lostLock` sites remain unseeded.** `SEED_CHECK_REFUSES_UNTOUCHED`
+      (added 2026-09-21) pins `S99_check`, because a seeded run halts at the first violating state. A mutant
+      hardwiring `refusedOk` at `S99_release_check` or `S21_1_s3` still survives; closing it needs one run per
+      site — the same shape that needed five `NeverRefusedUnsafe` witnesses.
+- [ ] **`PlainNeverOwnsUncertain`'s ghost is wired to one label.** `touchedUncertain` is assigned at
+      `algorithm.txt:299` and nowhere else, so only the move-aside is instrumented against an invariant that also
+      covers removing, renaming and creating.
+- [ ] **`ForeignUntouched`'s content half is accepted as unreachable by reasoning.** The plan-2 audit
+      dispositioned it so and re-validation at HEAD agrees, but the argument is reasoned, not measured. Run its
+      mutant alongside the others rather than on its own.
+
+**Smaller, each independently shippable.**
+
+- [ ] **The stamp cannot see an acceptance test.** `spec-sections.stamp` lists twelve headings, and §259.14 —
+      which opens "A conforming implementation must test at least:" and is therefore normative — is not among
+      them. So a rule can be amended under a stamped heading while the acceptance item testing it keeps demanding
+      the old outcome, and `model_stamp` passes. That is exactly what `788267a` did. Stamping 259.14 is cheap and
+      would have caught it.
+- [ ] **The model cites RFC 7530 for a sentence it does not contain.** `models/lockproto/algorithm.txt:44` says
+      "the server resolves that name when it EXECUTES the call (RFC 7530, design Section 5.3)". §16.26 supports
+      only the name-based half — *"removes (deletes) a directory entry named by filename"* — and says nothing
+      about timing. Measured with a positive control: `REMOVE` 14 hits, `filename` 3, `directory` 15, against
+      `retransmit` / `resolve` / `executes` / `stale` all 0. The claim is sound as an INFERENCE; the citation
+      overstates it. Prose, not behaviour, but load-bearing — this reading forced three remote windows to be
+      re-measured. The fix edits a PlusCal comment, so it needs `pcal.trans` + SANY + `--check-translation`.
+- [ ] **A halting run's state count is not reproducible.** `run.py:1138` runs TLC with `-workers auto`, so a run
+      stopping at the first violating state stops wherever the workers had got to: the same model on two commits
+      differing by one docs line reported 6,105 against 6,976 states. 52 of 77 runs halt. Either use `-workers 1`
+      for halting runs, or stop quoting exact counts for them — they evidence "the seed fires, roughly this
+      deep", never a number.
+- [ ] **`S240_5_s6`'s two refusing branches are indistinguishable to every gate.** Both set
+      `refused := "RESTART"` with identical successor state, `RefusalJustified` no longer reaches that label, and
+      coverage is label-granular — so nothing can witness that the "another file is there" case is reached.
+      Closed by the branch-granular union above, if that lands.
+- [ ] **`trace.toml`'s exemption for family 259 states the wrong reason.** It reads "normative precedence between
+      spec sections is outside the lock-protocol model's scope", but §259.13 ranks RUNTIME SIGNALS, not spec
+      sections. The exemption may well be right; its stated reason describes something the section does not say.
+- [ ] **Make the SEED-flag complement a test.** A review seat computed it with a scratch script — collect
+      `SEED_[A-Z0-9_]+` from `LockProtocol.tla`, collect `SEED_... = TRUE` across `configs/*.cfg`, subtract —
+      which is how "the complement is empty" came to be measured rather than asserted. It belongs in
+      `test_run.py`.
+- [ ] **`.antigravityignore` is untracked in the primary working tree.** Neither committed nor ignored, and the
+      only thing between that tree and a clean `git status`.
