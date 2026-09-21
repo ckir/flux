@@ -829,6 +829,15 @@ def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
         _require("PROPERTY" not in sections, f"{where}: a witness run's config must not declare a PROPERTY")
     properties = cfg_properties(text)
     temporal_run = kind == "liveness" or (kind == "seeded" and violated[0] in properties)
+    if kind == "seeded" and not temporal_run:
+        # A seeded run names the invariant its seed is meant to break. Its config lists the
+        # scenario's whole invariant set, so this is membership, not the equality a witness gets -
+        # but it must be there at all. Witness runs were checked and seeded runs were not, so a
+        # seed could name an invariant its config never declares; TLC would then report nothing
+        # and the run would fail confusingly, hours in, instead of here (test audit, plan 3, TA-4).
+        _require(violated[0] in [tok for tok in sections.get("INVARIANT", []) if IDENT.fullmatch(tok)],
+                 f"{where}: a seeded run's config must check {violated[0]!r}, the invariant its seed "
+                 f"is meant to break")
     if temporal_run:
         _require(len(properties) == 1, f"{where}: a run that checks a temporal property lists exactly one PROPERTY "
                                        "(TLC does not name the property it reports violated)")

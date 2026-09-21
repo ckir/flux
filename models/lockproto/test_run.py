@@ -66,7 +66,7 @@ timeout_minutes = 5
 CFGS = {
     "check.cfg": "SPECIFICATION Spec\nCONSTANTS\n    FIX_SAFE = FALSE\nINVARIANTS Safe NeverDone\n",
     "live.cfg": "SPECIFICATION Spec\nCONSTANTS\n    FIX_LIVE = FALSE\nINVARIANT LiveWitness\nPROPERTY Eventually\n",
-    "seed.cfg": "SPECIFICATION Spec\nCONSTANT FIX_SAFE = FALSE\nINVARIANT Other\n",
+    "seed.cfg": "SPECIFICATION Spec\nCONSTANT FIX_SAFE = FALSE\nINVARIANT Other Safe\n",
     "witness.cfg": "SPECIFICATION Spec\nCONSTANT FIX_SAFE = FALSE\nINVARIANT Other2\n",
 }
 
@@ -768,6 +768,17 @@ class InterpretTests(unittest.TestCase):
                 # A clean run's messages carry no deadlock, invariant or temporal report, so none of the
                 # violation exit codes agrees with them.
                 self.assertIn("does not match", run.interpret(exit_code, output, ["P"]).tooling_error or "")
+
+    def test_an_unknown_exit_status_is_a_tooling_failure(self) -> None:
+        """The catch-all in `agrees.get(exit_code, False)` had no test, so its default could be
+        flipped to accept any unrecognised code and the suite stayed green (test audit, plan 3,
+        TA-3). An exit status TLC is not documented to produce must never be read as a verdict."""
+        _, output = fixture("clean")
+        for exit_code in (77, 1, 255):
+            with self.subTest(exit_code=exit_code):
+                detail = run.interpret(exit_code, output, []).tooling_error or ""
+                self.assertIn("does not match", detail)
+                self.assertIn(str(exit_code), detail)
 
     def test_crlf_output_parses(self) -> None:
         code, output = fixture("continue_two_invariants")
@@ -1943,6 +1954,13 @@ class ConfigConsistencyTests(unittest.TestCase):
         names = {name: self.constant_names(text) for name, text in self.configs().items()}
         self.assertTrue(names, "expected LockProtocol configs beside the tests")
         every = frozenset().union(*names.values())
+        # Assert something was PARSED, not only that the gaps between files are empty. Without
+        # this a parser that extracts nothing gives every file an empty set, so `gaps` is empty
+        # and the guard passes while guarding nothing (test audit, plan 3, TA-2 - the same shape
+        # as the parse_cost_nodes defect: assert on the filtered result, never on the count).
+        self.assertIn("LockCapability", every,
+                      "the constant parser returned nothing recognisable; this guard is vacuous")
+        self.assertGreater(len(every), 10, f"only {len(every)} constants parsed across {len(names)} configs")
         # Reported per CONSTANT rather than against one chosen file: whichever config is the odd one
         # out, the message must name IT, not the other seventy.
         gaps = {constant: sorted(f for f, declared in names.items() if constant not in declared)
