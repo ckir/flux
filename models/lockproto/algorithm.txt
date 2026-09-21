@@ -1037,6 +1037,24 @@
              };
            }
            or {
+             \* SEEDED ONLY: give an object's OS-native lock to a process that has no handle on it,
+             \* which is what LockImpliesHandle forbids and therefore what FsOk must catch. The
+             \* protocol cannot do this - FsTryLock requires the handle - so without the seed the
+             \* invariant is true by construction and indistinguishable from TRUE (test audit, TA-1).
+             await SEED_FS_LOCK_WITHOUT_HANDLE;
+             with (o \in {x \in Objs : fs.oslock[x] = NoProc}, q \in {r \in Procs : ~OpenBy(fs, r, o)}) {
+               fs := [fs EXCEPT !.oslock[o] = q];
+             };
+           }
+           or {
+             \* SEEDED ONLY: write a content value that is not in Contents, which is what Classifiable
+             \* forbids. NoProc is a model value and is not a record, Torn, Foreign or EmptyFile.
+             await SEED_FS_ALIEN_CONTENT;
+             with (o \in {x \in Objs : fs.content[x] # NoContent}) {
+               fs := [fs EXCEPT !.content[o] = NoProc];
+             };
+           }
+           or {
              \* Nothing crashes after all: the environment may simply stop.
              goto env_done;
            };

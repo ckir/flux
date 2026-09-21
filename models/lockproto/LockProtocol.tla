@@ -31,6 +31,13 @@ CONSTANTS
     SEED_RENAME_OVER_TAKEOVER,
     SEED_NO_CAPABILITY_GATE,
     SEED_TORN_AS_FOREIGN,
+    \* The two seeds of the FILESYSTEM MODEL's own invariants. FsOk and Classifiable assert that the
+    \* abstraction is internally consistent, and no run could tell either from TRUE, so neither was
+    \* guarding anything the harness could prove (test audit, plan 3, TA-1). These corrupt `fs`
+    \* directly from the environment - the protocol cannot break them, only a bad FsModel edit could,
+    \* and that is exactly the regression they exist to catch.
+    SEED_FS_LOCK_WITHOUT_HANDLE, \* an OS-native lock held by a process with no open handle
+    SEED_FS_ALIEN_CONTENT,       \* a content value outside Contents
     FIX_REMOTE_LEASE_SPEC  \* fix flag of the open finding on SingleWriter: the remote-lease spec amendments (design Section 11)
 
 Procs == Owners \cup Recoverers \cup PlainRuns \cup Cleanups \cup Breakers
@@ -1095,6 +1102,24 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
              };
            }
            or {
+             \* SEEDED ONLY: give an object's OS-native lock to a process that has no handle on it,
+             \* which is what LockImpliesHandle forbids and therefore what FsOk must catch. The
+             \* protocol cannot do this - FsTryLock requires the handle - so without the seed the
+             \* invariant is true by construction and indistinguishable from TRUE (test audit, TA-1).
+             await SEED_FS_LOCK_WITHOUT_HANDLE;
+             with (o \in {x \in Objs : fs.oslock[x] = NoProc}, q \in {r \in Procs : ~OpenBy(fs, r, o)}) {
+               fs := [fs EXCEPT !.oslock[o] = q];
+             };
+           }
+           or {
+             \* SEEDED ONLY: write a content value that is not in Contents, which is what Classifiable
+             \* forbids. NoProc is a model value and is not a record, Torn, Foreign or EmptyFile.
+             await SEED_FS_ALIEN_CONTENT;
+             with (o \in {x \in Objs : fs.content[x] # NoContent}) {
+               fs := [fs EXCEPT !.content[o] = NoProc];
+             };
+           }
+           or {
              \* Nothing crashes after all: the environment may simply stop.
              goto env_done;
            };
@@ -1103,8 +1128,8 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "7fff9d41" /\ chksum(tla) = "215ce458")
-\* Procedure variable obj of procedure Classify at line 167 col 18 changed to obj_
+\* BEGIN TRANSLATION (chksum(pcal) = "a979b2f6" /\ chksum(tla) = "ae4df95")
+\* Procedure variable obj of procedure Classify at line 174 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
           live, holding, checked, writing, pendingUnlink, checkStale, 
@@ -3399,6 +3424,17 @@ env_loop == /\ pc["env"] = "env_loop"
                                   /\ leases' = leases + 1
                              /\ pc' = [pc EXCEPT !["env"] = "env_loop"]
                              /\ UNCHANGED <<crashed, holding, checked, writing, pendingUnlink, checkStale, writeStale, landedAfterTakeover, hostCrashChangedLock, crashes>>
+                          \/ /\ SEED_FS_LOCK_WITHOUT_HANDLE
+                             /\ \E o \in {x \in Objs : fs.oslock[x] = NoProc}:
+                                  \E q \in {r \in Procs : ~OpenBy(fs, r, o)}:
+                                    fs' = [fs EXCEPT !.oslock[o] = q]
+                             /\ pc' = [pc EXCEPT !["env"] = "env_loop"]
+                             /\ UNCHANGED <<crashed, holding, checked, writing, pendingUnlink, checkStale, writeStale, lostLock, landedAfterTakeover, hostCrashChangedLock, crashes, leases>>
+                          \/ /\ SEED_FS_ALIEN_CONTENT
+                             /\ \E o \in {x \in Objs : fs.content[x] # NoContent}:
+                                  fs' = [fs EXCEPT !.content[o] = NoProc]
+                             /\ pc' = [pc EXCEPT !["env"] = "env_loop"]
+                             /\ UNCHANGED <<crashed, holding, checked, writing, pendingUnlink, checkStale, writeStale, lostLock, landedAfterTakeover, hostCrashChangedLock, crashes, leases>>
                           \/ /\ pc' = [pc EXCEPT !["env"] = "env_done"]
                              /\ UNCHANGED <<fs, crashed, holding, checked, writing, pendingUnlink, checkStale, writeStale, lostLock, landedAfterTakeover, hostCrashChangedLock, crashes, leases>>
                   ELSE /\ pc' = [pc EXCEPT !["env"] = "env_done"]
