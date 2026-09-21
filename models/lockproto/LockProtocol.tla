@@ -31,6 +31,18 @@ CONSTANTS
     SEED_RENAME_OVER_TAKEOVER,
     SEED_NO_CAPABILITY_GATE,
     SEED_TORN_AS_FOREIGN,
+    \* The two seeds of the FILESYSTEM MODEL's own invariants. FsOk and Classifiable assert that the
+    \* abstraction is internally consistent, and no run could tell either from TRUE, so neither was
+    \* guarding anything the harness could prove (test audit, plan 3, TA-1). These corrupt `fs`
+    \* directly from the environment - the protocol cannot break them, only a bad FsModel edit could,
+    \* and that is exactly the regression they exist to catch.
+    SEED_FS_LOCK_WITHOUT_HANDLE, \* an OS-native lock held by a process with no open handle
+    SEED_FS_ALIEN_CONTENT,       \* a content value outside Contents
+    \* The seed of RefusalJustified's `lostLock` half. Its three sites are the only readers of
+    \* StillOwned, and no run reached one of them with that ghost FALSE, so the half was true by
+    \* construction: a mutant hardwiring `refusedOk` TRUE at S99_check left the suite green (test
+    \* audit, plan 3, TB-1). This seed is the wrong refusal itself.
+    SEED_CHECK_REFUSES_UNTOUCHED, \* a Section 99 check that refuses a holder nobody dispossessed
     FIX_REMOTE_LEASE_SPEC  \* fix flag of the open finding on SingleWriter: the remote-lease spec amendments (design Section 11)
 
 Procs == Owners \cup Recoverers \cup PlainRuns \cup Cleanups \cup Breakers
@@ -84,7 +96,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
        holding = [p \in Procs |-> FALSE],         \* this process owns the target lock now
        checked = [p \in Procs |-> FALSE],         \* its last Section 99 check passed
        writing = [p \in Procs |-> FALSE],         \* its publishing write is issued and has not landed (Section 5.2)
-       pendingUnlink = [p \in Procs |-> NoObj],   \* the lock file its issued release unlink resolved, not yet landed
+       pendingUnlink = [p \in Procs |-> NoObj],   \* NoObj unless a release unlink of its is in flight; only ever tested # NoObj (the name resolves at landing)
        checkStale = [p \in Procs |-> TRUE],       \* a lock tenure began after its last passing Section 99 check
        writeStale = [p \in Procs |-> TRUE],       \* a lock tenure began after it issued its publishing write
        lostLock = [p \in Procs |-> FALSE],        \* ghost: another process's write, unlink, rename or a lease lapse hit its lock file
@@ -101,8 +113,9 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
        \* `f` after process q's issued release unlink lands (Section 5.2). NFS REMOVE carries the directory handle
        \* and the NAME, and the server resolves that name when it EXECUTES the call (RFC 7530, design Section 5.3),
        \* so a stale unlink removes whatever holds the lock name then - including a lock another operation created
-       \* meanwhile. The model read this the optimistic way until 2026-09-16, and the three accepted remote windows
-       \* were measured under that reading. q = NoProc lands nothing.
+       \* meanwhile. The model read this the optimistic way until 2026-09-16; the three accepted remote windows
+       \* were RE-measured under this reading, and the plan 3 document carries the state counts. q = NoProc
+       \* lands nothing.
        LandUnlink(f, q, c) == IF q # NoProc /\ pendingUnlink[q] # NoObj /\ At(f, P, LockName) # NoObj
                               THEN FsUnlink(f, P, LockName, c).fs ELSE f
        OwnRecord(p) == Rec(p, IF p \in Cleanups THEN "cleanup" ELSE "operation")
@@ -117,7 +130,16 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
        \* NFS_LOCK_LOST state, I/O through it fails with EIO, re-locking the same descriptor does not clear it, and
        \* the documented recovery is to close the file and open it again (fcntl_locking(2), design Section 5.3).
        \* The model tried a relock that took a lapsed lock back until 2026-09-16; no platform offers that.
-       StillOwned(p) == /\ LockObj # NoObj
+       \* SEEDED ONLY: the check fails although nothing has touched this operation's lock. Its three
+       \* readers - S99_check, S99_release_check and S21_1_s3, which are the only uses of this operator -
+       \* each record `refusedOk[self] := lostLock[self]`, and no run reached one of them with that ghost
+       \* FALSE: a check fails only after another actor wrote, unlinked or renamed the lock file, or a
+       \* lease lapsed, and every one of those marks the holder. So that half of RefusalJustified was true
+       \* by construction and no run could tell it from TRUE - a mutant hardwiring `refusedOk` TRUE at
+       \* S99_check left the whole suite green (test audit, plan 3, TB-1). The seed is the wrong refusal
+       \* itself: a Section 99 check that refuses a holder nobody dispossessed.
+       StillOwned(p) == /\ ~SEED_CHECK_REFUSES_UNTOUCHED
+                        /\ LockObj # NoObj
                         /\ fs.content[LockObj] = OwnRecord(p)
                         /\ (FIX_REMOTE_LEASE_SPEC => HandleObj(p) = LockObj /\ fs.oslock[LockObj] = p)
        \* The lock path holds a record whose owner is alive: what justifies TARGET_LOCK_BUSY
@@ -532,6 +554,11 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          \* alive is the oracle's judgement, as in classification (design Section 6.1).
          if (crashed[self]) { goto takeover_crashed; }
          else {
+           \* A torn record read HERE is deliberately not recorded in `tornRead`, unlike the classify read.
+           \* That ghost is a witness only (`NeverTornRead`), it already fires from the classify path, so
+           \* setting it here buys no coverage and changes no verdict, which is the whole reason. (It also
+           \* used to cite the breaklock-remote job's budget; that job has since been split and the reason
+           \* no longer needs it - capstone, plan 3.)
            with (seen = fs.content[tobj]) {
              if (IsRecord(seen) /\ seen # seenRec[self]) { refused[self] := "RESTART"; goto S240_5_close; }
              else if (IsRecord(seen)) {
@@ -583,15 +610,30 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          };
        S240_5_s6:
          \* Check the file identity against the lock path again. Empty: the prior owner removed its lock
-         \* meanwhile, so start again. Another file: whoever created it owns the target. The same file: the
-         \* takeover stands, and this operation proceeds as if the prior owner were dead.
+         \* meanwhile, so start again. Another file: another operation claimed the path, so start again too
+         \* (240.5 step 6, amended 2026-09-17). The same file: the takeover stands, and this operation
+         \* proceeds as if the prior owner were dead.
          if (crashed[self]) { goto takeover_crashed; }
          else {
            with (ident \in FsIdentityChoices(fs, P, LockName)) {
              if (ident = NoObj) { refused[self] := "RESTART"; goto S240_5_close; }
              else if (ident # tobj) {
-               refusedOk[self] := LockObj # NoObj /\ LockObj # tobj;
-               refused[self] := "TARGET_LOCK_BUSY";
+               \* Another operation claimed the lock path while this takeover was in flight, so the
+               \* acquisition starts again - the same answer as the empty path above, and the same one
+               \* S240_3_restart gives when another actor wins an acquisition (240.5 step 6, amended by
+               \* owner ruling 2026-09-17).
+               \*
+               \* It used to report TARGET_LOCK_BUSY on evidence that RESTATED this branch's own guard,
+               \* so RefusalJustified could never fail here. Asking RefusalEvidence instead MEASURED the
+               \* real thing: nothing in the breaklock POSIX pairing (CI 35188279927, 17,377,074 states,
+               \* exhaustive), but 3,569 violating states once a lease can lapse (CI 35211125866). Its
+               \* first trace has a Breaker reporting "the lock is held" while the only Owner is CRASHED,
+               \* it holds that lock itself, and it never saw a live owner - which is what
+               \* SEED_DEAD_AS_BUSY seeds as a DEFECT elsewhere. This label classifies the new occupant
+               \* not at all, so it cannot report one; the classifier that does measure liveness makes
+               \* that call on the next pass. No refusal here means RefusalJustified has nothing to
+               \* quantify at this label, which is why no evidence predicate is left.
+               refused[self] := "RESTART";
                goto S240_5_close;
              }
              else {
@@ -633,6 +675,11 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
            };
          };
        S240_5_close:
+         \* Only `tobj`. The seeded rename path (SEED_RENAME_OVER_TAKEOVER) also holds a handle on its own
+         \* takeover file, and reaches here only when `FsRenameReplace` failed - which needs a handle
+         \* without delete sharing, so `DeleteAllowed` (FsModel.tla) makes it impossible on POSIX, and the
+         \* one run that sets that seed is POSIX. On a Windows pairing the branch would be live and would
+         \* leave that handle open (capstone finding, plan 3: unreachable, so not fixed).
          if (crashed[self]) { goto takeover_crashed; }
          else {
            if (tobj # NoObj /\ OpenBy(fs, self, tobj)) { fs := FsClose(fs, self, tobj).fs; };
@@ -694,8 +741,9 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
            };
          };
        S99_release:
-         \* The release unlink is issued: it resolves the lock path to a file now and removes that file's name when
-         \* it lands, as a system call resolves its path when it starts.
+         \* The release unlink is issued. Which file it removes is NOT decided here: REMOVE carries the NAME, and
+         \* the server resolves it when the call LANDS (RFC 7530, design Section 5.3) - `LandUnlink` does that.
+         \* So the object stored below is never read back; `pendingUnlink` only records that an unlink is in flight.
          if (crashed[self]) { goto publish_crashed; }
          else {
            holding[self] := FALSE;
@@ -707,6 +755,12 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
            with (c \in FsUnlinkChoices) {
              fs := LandUnlink(fs, self, c);
            };
+           \* After the fs assignment ON PURPOSE: `LockObj` is a define-block operator, so it denotes the
+           \* PRE-step `fs` wherever it is written - unlike a direct textual `fs` read, which sees the
+           \* assignment above: `S240_5_seed_write_begin` is the witness, the one site the translator emits
+           \* as `At(fs', ...)`. (The lease-expiry branch AVOIDS the rule by ordering, it does not show it.)
+           \* This names the lock as it
+           \* stood before the unlink landed, which is the holder to mark lost.
            lostLock := IF pendingUnlink[self] # NoObj /\ LockObj # NoObj THEN MarkLost(self, LockObj) ELSE lostLock;
            pendingUnlink[self] := NoObj;
          };
@@ -1007,6 +1061,10 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
                fs := FsProcCrash(LandUnlink(fs, IF land THEN p ELSE NoProc, c), p);
                \* Its own ghost goes back to FALSE: a crashed process never refuses again, so any other value is
                \* dead state that splits states which are otherwise the same.
+               \* `LockObj` is a define-block operator: it denotes the PRE-step `fs`, not the one assigned two
+               \* lines up, so this is the lock as it stood before the crash's unlink landed. A direct textual
+               \* `fs` read would see the assignment instead - `S240_5_seed_write_begin` is the witness for
+               \* that half, the one site the translator emits as `At(fs', ...)`.
                lostLock := [ (IF land /\ pendingUnlink[p] # NoObj /\ LockObj # NoObj
                               THEN MarkLost(p, LockObj) ELSE lostLock) EXCEPT ![p] = FALSE ];
                landedAfterTakeover := landedAfterTakeover \/ (land /\ writing[p] /\ writeStale[p]);
@@ -1058,6 +1116,24 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
              };
            }
            or {
+             \* SEEDED ONLY: give an object's OS-native lock to a process that has no handle on it,
+             \* which is what LockImpliesHandle forbids and therefore what FsOk must catch. The
+             \* protocol cannot do this - FsTryLock requires the handle - so without the seed the
+             \* invariant is true by construction and indistinguishable from TRUE (test audit, TA-1).
+             await SEED_FS_LOCK_WITHOUT_HANDLE;
+             with (o \in {x \in Objs : fs.oslock[x] = NoProc}, q \in {r \in Procs : ~OpenBy(fs, r, o)}) {
+               fs := [fs EXCEPT !.oslock[o] = q];
+             };
+           }
+           or {
+             \* SEEDED ONLY: write a content value that is not in Contents, which is what Classifiable
+             \* forbids. NoProc is a model value and is not a record, Torn, Foreign or EmptyFile.
+             await SEED_FS_ALIEN_CONTENT;
+             with (o \in {x \in Objs : fs.content[x] # NoContent}) {
+               fs := [fs EXCEPT !.content[o] = NoProc];
+             };
+           }
+           or {
              \* Nothing crashes after all: the environment may simply stop.
              goto env_done;
            };
@@ -1066,8 +1142,8 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "e9414163" /\ chksum(tla) = "e186ecdf")
-\* Procedure variable obj of procedure Classify at line 166 col 18 changed to obj_
+\* BEGIN TRANSLATION (chksum(pcal) = "7732d14c" /\ chksum(tla) = "f2271f94")
+\* Procedure variable obj of procedure Classify at line 188 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
           live, holding, checked, writing, pendingUnlink, checkStale, 
@@ -1077,6 +1153,7 @@ VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed,
 
 (* define statement *)
 LockObj == At(fs, P, LockName)
+
 
 
 
@@ -1096,7 +1173,16 @@ HandleObj(p) == IF \E h \in fs.handles : h.proc = p
 
 
 
-StillOwned(p) == /\ LockObj # NoObj
+
+
+
+
+
+
+
+
+StillOwned(p) == /\ ~SEED_CHECK_REFUSES_UNTOUCHED
+                 /\ LockObj # NoObj
                  /\ fs.content[LockObj] = OwnRecord(p)
                  /\ (FIX_REMOTE_LEASE_SPEC => HandleObj(p) = LockObj /\ fs.oslock[LockObj] = p)
 
@@ -2104,18 +2190,16 @@ S240_5_s6(self) == /\ pc[self] = "S240_5_s6"
                    /\ IF crashed[self]
                          THEN /\ pc' = [pc EXCEPT ![self] = "takeover_crashed"]
                               /\ UNCHANGED << holding, checkStale, writeStale, 
-                                              refusedOk, refused, stack, tobj >>
+                                              refused, stack, tobj >>
                          ELSE /\ \E ident \in FsIdentityChoices(fs, P, LockName):
                                    IF ident = NoObj
                                       THEN /\ refused' = [refused EXCEPT ![self] = "RESTART"]
                                            /\ pc' = [pc EXCEPT ![self] = "S240_5_close"]
                                            /\ UNCHANGED << holding, checkStale, 
-                                                           writeStale, 
-                                                           refusedOk, stack, 
+                                                           writeStale, stack, 
                                                            tobj >>
                                       ELSE /\ IF ident # tobj[self]
-                                                 THEN /\ refusedOk' = [refusedOk EXCEPT ![self] = LockObj # NoObj /\ LockObj # tobj[self]]
-                                                      /\ refused' = [refused EXCEPT ![self] = "TARGET_LOCK_BUSY"]
+                                                 THEN /\ refused' = [refused EXCEPT ![self] = "RESTART"]
                                                       /\ pc' = [pc EXCEPT ![self] = "S240_5_close"]
                                                       /\ UNCHANGED << holding, 
                                                                       checkStale, 
@@ -2128,15 +2212,15 @@ S240_5_s6(self) == /\ pc[self] = "S240_5_s6"
                                                       /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
                                                       /\ tobj' = [tobj EXCEPT ![self] = Head(stack[self]).tobj]
                                                       /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
-                                                      /\ UNCHANGED << refusedOk, 
-                                                                      refused >>
+                                                      /\ UNCHANGED refused
                    /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                    sawLive, seenRec, crashed, live, checked, 
                                    writing, pendingUnlink, lostLock, 
                                    landedAfterTakeover, recoveredAfterCrash, 
                                    tornRead, hostCrashChangedLock, 
-                                   touchedUncertain, keep, obj_, got, obj, 
-                                   robj, victim, nobj, crashes, leases >>
+                                   touchedUncertain, refusedOk, keep, obj_, 
+                                   got, obj, robj, victim, nobj, crashes, 
+                                   leases >>
 
 S240_5_seed_write_begin(self) == /\ pc[self] = "S240_5_seed_write_begin"
                                  /\ IF crashed[self]
@@ -3363,6 +3447,17 @@ env_loop == /\ pc["env"] = "env_loop"
                                   /\ leases' = leases + 1
                              /\ pc' = [pc EXCEPT !["env"] = "env_loop"]
                              /\ UNCHANGED <<crashed, holding, checked, writing, pendingUnlink, checkStale, writeStale, landedAfterTakeover, hostCrashChangedLock, crashes>>
+                          \/ /\ SEED_FS_LOCK_WITHOUT_HANDLE
+                             /\ \E o \in {x \in Objs : fs.oslock[x] = NoProc}:
+                                  \E q \in {r \in Procs : ~OpenBy(fs, r, o)}:
+                                    fs' = [fs EXCEPT !.oslock[o] = q]
+                             /\ pc' = [pc EXCEPT !["env"] = "env_loop"]
+                             /\ UNCHANGED <<crashed, holding, checked, writing, pendingUnlink, checkStale, writeStale, lostLock, landedAfterTakeover, hostCrashChangedLock, crashes, leases>>
+                          \/ /\ SEED_FS_ALIEN_CONTENT
+                             /\ \E o \in {x \in Objs : fs.content[x] # NoContent}:
+                                  fs' = [fs EXCEPT !.content[o] = NoProc]
+                             /\ pc' = [pc EXCEPT !["env"] = "env_loop"]
+                             /\ UNCHANGED <<crashed, holding, checked, writing, pendingUnlink, checkStale, writeStale, lostLock, landedAfterTakeover, hostCrashChangedLock, crashes, leases>>
                           \/ /\ pc' = [pc EXCEPT !["env"] = "env_done"]
                              /\ UNCHANGED <<fs, crashed, holding, checked, writing, pendingUnlink, checkStale, writeStale, lostLock, landedAfterTakeover, hostCrashChangedLock, crashes, leases>>
                   ELSE /\ pc' = [pc EXCEPT !["env"] = "env_done"]
@@ -3452,9 +3547,17 @@ Classifiable == \A o \in Objs : fs.content[o] = NoContent \/ fs.content[o] \in C
 \* is a call already started before a later tenure began (240.5: "a filesystem call it had already started can
 \* still complete"). FIX_REMOTE_LEASE_SPEC models the amendments the open finding calls for: a process whose
 \* check passed in an earlier generation is no longer counted (the check-to-call window, however the lock was
-\* lost), and Section 99's check also tries the lock (Relock).
+\* lost), and Section 99's check also tests that the process still holds the lock file it opened - it does not
+\* model retaking a lost lock, which a poisoned descriptor cannot do (design Section 5.3).
 Superseded(p) == IF FIX_REMOTE_LEASE_SPEC THEN checkStale[p] ELSE writing[p] /\ writeStale[p]
 SingleWriter == Cardinality({p \in Procs : (checked[p] \/ writing[p]) /\ ~Superseded(p)}) <= 1
+
+\* A NON-VACUITY WITNESS for the runs that turn FIX_REMOTE_LEASE_SPEC on. The flag REPLACES `Superseded`'s
+\* formula rather than narrowing it, so a clean -fixed-check run is open to two readings: the window closed,
+\* or every process is superseded and the count SingleWriter bounds is always zero. Witnessed violated, this
+\* says the second reading is false - some state has a process inside a publishing step that the flag does
+\* NOT supersede, so SingleWriter is bounding a real count there (capstone finding, plan 3).
+NoLiveWriter == Cardinality({p \in Procs : (checked[p] \/ writing[p]) /\ ~Superseded(p)}) = 0
 
 \* A process without `--break-lock` never removes, renames, or overwrites a lock it classified as
 \* uncertain, and creates a lock only at an empty lock path (Section 7).
@@ -3472,8 +3575,12 @@ ForeignUntouched == foreignObj # NoObj => LockObj = foreignObj /\ fs.content[for
 \* BUSY for a lock it judged dead, or a Section 99 check (S99_check, S99_release_check, S21_1_s3) refusing with
 \* no cause: such a refusal is justified only by the ghost lostLock, set when another process's write, unlink,
 \* rename or replacement hit the lock file this process holds, or its lease lapsed (owner ruling for plan 3,
-\* 2026-09-15). The other refusing labels record the evidence of RefusalEvidence. The
-\* refusing label records its evidence because the refusal may be reported after what it saw has changed: the
+\* 2026-09-15). So the evidence comes in THREE families, and the Section 99 checks named just above are one
+\* of them: `lostLock[self]` at S99_check, S99_release_check and S21_1_s3; `RefusalEvidence(self)` at
+\* S96_1_backoff, S21_1_decide, rec_decide, S251_1_classify and S21_1_restart_decide; and a disjunction of
+\* RefusalEvidence with a local observation at S240_5_s3 and S240_5_s5. What is gone is the EXCEPTION:
+\* S240_5_s6 used to restate its own branch guard and so could never fail, and that label no longer refuses
+\* at all (240.5 step 6, amended 2026-09-17). The refusing label records its evidence because the refusal may be reported after what it saw has changed: the
 \* refusal rests on what the classifier observed, not on a re-read.
 RefusalJustified == \A p \in Procs : refused[p] = "TARGET_LOCK_BUSY" => refusedOk[p]
 
@@ -3484,6 +3591,18 @@ NeverInflightLandedAfterTakeover == ~landedAfterTakeover
 \* A process passed its Section 99 check, so SingleWriter's ghost is set (design Section 7).
 NeverChecked == \A p \in Procs : ~checked[p]
 NeverRecoveredAfterCrash == ~recoveredAfterCrash
+\* The 235.1 capability refusal itself. Without verified OS-native locks, an operation that needs target
+\* exclusivity refuses outright. FIVE sites assign REMOTE_LOCK_UNSAFE, one per process kind (own_start,
+\* plain_start, rec_start, clean_start, brk_start), each guarded by `~SEED_NO_CAPABILITY_GATE`. A sixth
+\* site, S240_5_s1, is 240.5 step 1's CAPABILITY CHECK, not 235.1's refusal: it reports
+\* TARGET_LOCK_UNCERTAIN, this invariant cannot see it, and its capability disjunct is DEAD in every
+\* expressible configuration - TakeOver has one caller, behind brk_start's else arm, which already
+\* requires the gate not to fire. Earlier weak runs SET the seed, to prove SingleWriter catches the
+\* bypass, so the refusal itself went unexercised while the README said otherwise. A witness halts at the
+\* first violating state, so one run per process kind is what actually reaches all five - FIVE runs for five
+\* sites, each declaring exactly one actor (capstone, plan 3, rounds 4 to 6: round 4's single witness reached
+\* one site, and round 5's fix still left two kinds sharing a run, so one of those was reached by nothing).
+NeverRefusedUnsafe == \A p \in Procs : refused[p] # "REMOTE_LOCK_UNSAFE"
 \* A host crash changed which object the lock path names: an unflushed create, move-aside or removal
 \* was undone. Label coverage cannot show this, because the host crash shares `env_loop` with the
 \* process crash (design Section 11).

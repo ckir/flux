@@ -408,9 +408,9 @@ Revision history:
         OS-native lock where available and re-checks the moved record, not
         only its identity; a lost exclusive create deletes the moved file;
         a takeover decides OS-native lock support from `LockCapability`,
-        retries when its final identity check finds the path empty, treats
-        a failed check as a different file, and records nothing when its
-        flush fails (Sections 96.1, 240.3, 240.5).
+        retries when its final identity check finds the path empty or
+        names another file, treats a failed check as a different file, and
+        records nothing when its flush fails (Sections 96.1, 240.3, 240.5).
     120. Section 120 accepts `workspace_path` = `none` for a cleanup lock;
         the lock-record checksum is the first 16 bytes of BLAKE3; a worker
         checks supersession before cancellation and writes `PAUSED` only
@@ -10685,10 +10685,14 @@ lock path is never empty:
    write (Section 259.6) and flush it. Then check the file identity
    against the lock path again. If the path is empty, the prior owner
    removed its lock meanwhile: start the acquisition again. If another
-   file is there, whoever created it owns the target: refuse with
-   `TARGET_LOCK_BUSY` and exit code 3, because the write went to a file no
-   longer at the lock path and nothing at the destination changed. A
-   check that itself fails counts as a different file. Only when the identity matches does Flux durably record the
+   file is there, another operation claimed the lock path while this
+   takeover was in flight: start the acquisition again as well, because the
+   write went to a file no longer at the lock path and nothing at the
+   destination changed. Do NOT refuse with `TARGET_LOCK_BUSY` here: this
+   operation has not classified the new occupant, so it cannot report the
+   lock as held, and the occupant may be a dead owner's lock -- the next
+   pass classifies it and reports whatever is then true. A check that
+   itself fails counts as a different file. Only when the identity matches does Flux durably record the
    takeover and proceed as if the prior owner were dead.
 
 An open, read, write, or flush that fails for another reason (an I/O or
@@ -13450,8 +13454,8 @@ A conforming implementation must test at least:
      claim proceeds.
 128. of two concurrent --break-lock takeovers of one uncertain lock exactly one proceeds (the OS-native lock admits
      one), and the lock path is never empty; a lock removed and re-created by another operation after the takeover's
-     write is caught by the step-6 identity re-check and the takeover refuses with TARGET_LOCK_BUSY (exit 3), while one
-     removed before step 4 makes the takeover start its acquisition again; a crash during a dead-owner
+     write is caught by the step-6 identity re-check, which makes the takeover start its acquisition again rather
+     than report the lock held -- it has classified the new occupant not at all -- as does one removed before step 4; a crash during a dead-owner
      recovery leaves <lock-name>.broken.<operation-id> beside the lock, which cleanup finds for every lock form
      (single-file, fallback, directory root, filesystem root).
 129. an operation whose lock file no longer holds its own record performs nothing further, stops with
@@ -13493,7 +13497,7 @@ A conforming implementation must test at least:
      target is planned or published; a directory cleanup cannot list is reported and cleanup exits 1.
 144. a dead-owner recoverer that finds the moved file's record changed (a --break-lock takeover rewrote it) puts it
      back and starts again; a recoverer whose exclusive create loses the gap deletes the moved file; a takeover whose
-     final identity check finds the lock path empty starts again instead of refusing.
+     final identity check finds the lock path empty, or names another file, starts again instead of refusing.
 145. a cancelled operation that was also superseded is never written PAUSED over ABANDONED; a takeover whose flush
      fails is not recorded and exits 1; a cleanup lock (workspace_path none) with a dead owner is removed, never
      reported ARTIFACT_OWNERSHIP_UNCERTAIN.

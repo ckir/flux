@@ -15,7 +15,10 @@ its first scenario, `recovery`, end to end. Later plans add the remaining scenar
 |---|---|---|
 | `just model` | runs every run in `expected.toml` | Java 11+, Python 3.11+ |
 | `just model <scenario>` | runs one scenario, for example `just model selftest` | Java 11+, Python 3.11+ |
-| `just model <scenario> <platform>` | runs one scenario's runs for one platform, as a CI job does: `just model recovery posix` | Java 11+, Python 3.11+ |
+| `just model <scenario> <platform>` | runs one scenario's runs for one platform: `just model recovery posix` | Java 11+, Python 3.11+ |
+| `just model <scenario> <platform> <job>` | runs exactly one CI job's runs: `just model breaklock-remote posix posix-plain` | Java 11+, Python 3.11+ |
+| `python models/lockproto/run.py --check-translation` | re-runs the PlusCal translator and fails if the committed `LockProtocol.tla` is not what it emits | Java 11+, Python 3.11+ |
+| `python models/lockproto/run.py --union-from <dir>` | judges the suite-wide coverage union from TLC logs already written under `<dir>`, instead of re-running everything | Python 3.11+ |
 | `python models/lockproto/run.py --expected models/lockproto/expected-extended.toml --scenario recovery` | the host-crash tier; hours of CPU, meant for CI | Java 11+, Python 3.11+ |
 | `just model-test` | unit tests of `run.py` (recorded TLC output, no Java) and of the CI workflow's change detection | Python 3.11+ |
 | `just model-stamp` | runs `just model`, then rewrites the unit hashes in `trace.toml` if every run matched | Java, Python, Rust |
@@ -27,7 +30,15 @@ failure, a TLC error, or a timeout). `just check` runs the Rust side (the stamp 
 filesystem probes) and needs no Java or Python.
 
 In CI, `.github/workflows/model.yml` runs the scenarios when a change touches `models/`, the spec, the probes, the
-`justfile`, or the workflow, and its `model-gate` job always reports. If cancelling a run ever leaves `model-gate`
+`justfile`, or the workflow, and its `model-gate` job always reports. One CI job per entry of
+`run.py --list-jobs`, which is one per `(scenario, job)`: `job` defaults to the run's platform, and a run may
+name a longer id to split a scenario too big for one job's budget. `breaklock-remote` is split that way -
+whole, it measured 2h27m-2h36m against a 180-minute cap. A separate `translation` job re-derives
+`LockProtocol.tla` and fails if the committed file is stale, which nothing checked before. A `union` job then judges the
+suite-wide coverage union from those jobs' own uploaded logs - it needs nothing from a run but its last coverage
+block, so it costs no TLC time and fails if any run's log is missing. The extended tier used to judge the union by
+re-running `expected.toml` whole; measured, that job hit its 180-minute cap and was killed, so the one place the
+union was judged never judged it. If cancelling a run ever leaves `model-gate`
 queued rather than finished, cancel the run again from the workflow's page (reported as actions/runner#4411 for
 matrix jobs with `if: always()`; that issue is closed, and whether it is fixed is not known).
 
@@ -47,7 +58,7 @@ runs write their TLC state and logs under `target/tla/`, keyed by run name.
 | `Smoke.tla` | runner self-test model (the `selftest` scenario); not part of the protocol |
 | `FsModel.tla` | the filesystem model: objects, entries, handles, OS-native locks, crashes (design Section 5) |
 | `LockProtocol.head`, `algorithm.txt`, `invariants.txt` | the sources of `LockProtocol.tla`: its header, the PlusCal algorithm, and the properties (design Sections 6.1 and 7) |
-| `LockProtocol.tla` | generated: `cat LockProtocol.head algorithm.txt invariants.txt`, then `pcal.trans`; committed so `run.py` needs no translator |
+| `LockProtocol.tla` | generated: `cat LockProtocol.head algorithm.txt invariants.txt`, then `pcal.trans`; committed so `run.py` needs no translator. Two guards keep it honest: `test_run.py` checks everything outside the translation block still equals the sources (no Java), and `--check-translation` re-runs the translator (CI) |
 | `spec-sections.stamp` | the spec file and the spec headings the model encodes (design Section 9) |
 | `trace.toml` | every unit of those headings, its hash, and the labels that implement it (design Section 9.1) |
 
@@ -82,6 +93,13 @@ trace for any path, re-run that configuration with the witness as an invariant a
 
 ## Bounds
 
+**These bounds are the `recovery` scenario's, not the suite's.** Every pairing in the table below is a
+`recovery-*` run, and the statements under it - `MaxCrashes`, `IdentityStrength`, `LockCapability` - hold
+for those runs only. The `breaklock`, `mixed`, `breaklock-remote` and `mixed-remote` scenarios added by
+plans 2 and 3 use different bounds (`MaxCrashes = 1` and `LockCapability = "remote"` among them); their
+pairings, state counts and the reasoning behind each bound live in the plan documents under
+`docs/superpowers/plans/`.
+
 Each configuration's bounds, and what they still let it explore (design Section 4). The state counts are TLC's and
 do not depend on the machine. Wall-clock figures are CI ranges from two samples each, on GitHub-hosted runners whose
 hardware is not controlled (design Section 12). A POSIX check run takes 43-65s, a Windows one 45-92s, and the
@@ -99,20 +117,35 @@ kinds at once do not finish, so the check runs pair them, and each pairing is ex
 
 - Every run starts from an empty lock path or from one holding a `Foreign` object, which no actor writes, so
   `ForeignUntouched` has something to hold over. The empty start keeps the whole acquisition prefix.
-- Four seeded runs show the scenario's invariants can fail at all: `SEED_RECOVER_FOREIGN` must break
-  `ForeignUntouched`, `SEED_RECOVER_UNCERTAIN` `PlainNeverOwnsUncertain` through a torn or empty record, `SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK`
+- Seven seeded runs show the scenario's invariants can fail at all. Four re-introduce a protocol defect
+  (design Section 8): `SEED_RECOVER_FOREIGN` must break `ForeignUntouched`, `SEED_RECOVER_UNCERTAIN`
+  `PlainNeverOwnsUncertain` through a torn or empty record, `SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK`
   (clean-up pairing) the same invariant through a cleanup lock whose owner is uncertain, and `SEED_DEAD_AS_BUSY`
-  (plain pairing) `RefusalJustified` (design Section 8). `SingleWriter`'s seeds need actors of `mixed` and `breaklock`; here the
-  witness `NeverChecked` shows its ghost is set. Before the test audit of 2026-09-14 found this, deleting any of those
-  ghosts left every run green.
+  (plain pairing) `RefusalJustified` through the evidence a refusal rests on. `SEED_CHECK_REFUSES_UNTOUCHED`
+  breaks that invariant's OTHER half - the `lostLock` ghost its three Section 99 sites record - by failing
+  every check, so a holder nobody dispossessed refuses. The last two corrupt `fs` from the environment,
+  because the protocol cannot reach either state: `SEED_FS_LOCK_WITHOUT_HANDLE` breaks `FsOk` and
+  `SEED_FS_ALIEN_CONTENT` `Classifiable`, the two invariants of the filesystem model itself. Those three
+  are the test audit of 2026-09-21; `SingleWriter`'s seeds need actors of `mixed` and `breaklock`, and here
+  the witness `NeverChecked` shows its ghost is set. Before the test audit of 2026-09-14 found this,
+  deleting any of those ghosts left every run green.
 - `MaxCrashes = 2` in every run. With one crash, the path where a recovering actor itself crashes was unreachable,
   so a second crash is what the crash-inside-recovery interleavings need.
+- **One pass, never a loop.** Where the spec says an actor starts its acquisition again - 240.3 step 2 and
+  step 4, 240.5 step 6's two restarting branches, and `S240_3_restart` itself - the model records
+  `refused = "RESTART"` and stops instead of looping. One pass reaches every state a further one would,
+  because a second pass starts from a state the first already explored. Nothing in the model takes a next
+  pass, so a spec sentence whose justification rests on one ("the next pass classifies it") is not modelled.
 - `MaxObjs` (3 to 6, one per actor) cannot bind. Every actor makes at most one exclusive create, and
-  `fs.next <= Cardinality(Procs)` was checked over the whole state space of the tightest run.
+  `fs.next <= Cardinality(Procs)` was checked over the whole state space of the tightest run - ONCE, as a
+  measurement. Nothing enforces it now: no invariant asserts that bound, so an edit giving an actor a
+  second create would make `MaxObjs` start binding and `FsCreate` start failing, silently, rather than
+  erroring (capstone, plan 3). Making it an invariant is the obvious fix and is not done yet.
 - `IdentityStrength = "strong"` only. Measured, the weak-identity variant explores an identical state graph here,
   because no name in this scenario is reused.
-- `LockCapability = "strong"` only. The weak capability refuses every operation under 235.1, which `breaklock`'s
-  seeded run covers.
+- `LockCapability = "strong"` only in these runs. The weak capability refuses every operation under 235.1;
+  what covers that refusal belongs to `breaklock`, not here, and is described under "The 235.1 refusal"
+  below.
 - `HostCrashes = FALSE` in these runs, so only process crashes are explored here. Host crashes have their own
   slower tier, `expected-extended.toml`, run by `.github/workflows/model-extended.yml` nightly, on request, and on a
   pull request labelled `model-extended`. It holds the same four pairings with `HostCrashes = TRUE` on each platform.
@@ -126,6 +159,35 @@ kinds at once do not finish, so the check runs pair them, and each pairing is ex
   holds over 1,894,344 distinct states and is untightened: timed twice on CI at 258-261s before the `Foreign`
   start state added 24,810 states, it fits its 30-minute
   limit several times over.
+
+## The 235.1 refusal, and what covers it
+
+Without verified OS-native locks an operation that needs target exclusivity refuses outright. FIVE sites
+assign `REMOTE_LOCK_UNSAFE`, one per process kind - `own_start`, `plain_start`, `rec_start`,
+`clean_start`, `brk_start` - each guarded by `~SEED_NO_CAPABILITY_GATE`.
+
+`breaklock`'s seeded run SETS that seed, to bypass the refusal and show `SingleWriter` catches the
+bypass. It therefore does NOT exercise the refusal, though the Bounds section used to say it did.
+
+FIVE witness runs do, one per process kind - the `-own-`, `-plain-`, `-rec-`, `-clean-` and `-brk-`
+variants of `breaklock-posix-weakcap-*-witness-NeverRefusedUnsafe` - each declaring exactly ONE actor.
+One run per kind is not tidiness: a witness has no `-continue`, so TLC halts at the FIRST violating state,
+and a run carrying several kinds proves only that one of them refused. That rule cost two rounds to
+apply: round 4 added a single witness and reached one site of five, and round 5 added three more while
+leaving an Owner and a Breaker sharing the original - so one of those two was still reached by nothing.
+
+A sixth site, `S240_5_s1`, is 240.5 step 1's capability check rather than 235.1's refusal: it reports
+`TARGET_LOCK_UNCERTAIN`, and its capability disjunct is dead in every configuration this suite can
+express, because `TakeOver`'s only caller sits behind `brk_start`'s else arm, which already requires the
+gate not to fire.
+
+## A rule nothing enforces
+
+`algorithm.txt` states that each label performs at most ONE filesystem operation, so that no interleaving
+is hidden inside a label. **Nothing checks this.** Neither `pcal.trans`, nor `run.py`, nor any test counts
+the filesystem calls in a label, so an edit putting two in one label translates and runs, and quietly
+removes the interleavings the model exists to explore. Counting `Fs*(` calls per label is mechanical and
+is the obvious guard; it is not written yet (capstone, plan 3).
 
 ## Filesystem probes
 

@@ -26,7 +26,7 @@
        holding = [p \in Procs |-> FALSE],         \* this process owns the target lock now
        checked = [p \in Procs |-> FALSE],         \* its last Section 99 check passed
        writing = [p \in Procs |-> FALSE],         \* its publishing write is issued and has not landed (Section 5.2)
-       pendingUnlink = [p \in Procs |-> NoObj],   \* the lock file its issued release unlink resolved, not yet landed
+       pendingUnlink = [p \in Procs |-> NoObj],   \* NoObj unless a release unlink of its is in flight; only ever tested # NoObj (the name resolves at landing)
        checkStale = [p \in Procs |-> TRUE],       \* a lock tenure began after its last passing Section 99 check
        writeStale = [p \in Procs |-> TRUE],       \* a lock tenure began after it issued its publishing write
        lostLock = [p \in Procs |-> FALSE],        \* ghost: another process's write, unlink, rename or a lease lapse hit its lock file
@@ -43,8 +43,9 @@
        \* `f` after process q's issued release unlink lands (Section 5.2). NFS REMOVE carries the directory handle
        \* and the NAME, and the server resolves that name when it EXECUTES the call (RFC 7530, design Section 5.3),
        \* so a stale unlink removes whatever holds the lock name then - including a lock another operation created
-       \* meanwhile. The model read this the optimistic way until 2026-09-16, and the three accepted remote windows
-       \* were measured under that reading. q = NoProc lands nothing.
+       \* meanwhile. The model read this the optimistic way until 2026-09-16; the three accepted remote windows
+       \* were RE-measured under this reading, and the plan 3 document carries the state counts. q = NoProc
+       \* lands nothing.
        LandUnlink(f, q, c) == IF q # NoProc /\ pendingUnlink[q] # NoObj /\ At(f, P, LockName) # NoObj
                               THEN FsUnlink(f, P, LockName, c).fs ELSE f
        OwnRecord(p) == Rec(p, IF p \in Cleanups THEN "cleanup" ELSE "operation")
@@ -59,7 +60,16 @@
        \* NFS_LOCK_LOST state, I/O through it fails with EIO, re-locking the same descriptor does not clear it, and
        \* the documented recovery is to close the file and open it again (fcntl_locking(2), design Section 5.3).
        \* The model tried a relock that took a lapsed lock back until 2026-09-16; no platform offers that.
-       StillOwned(p) == /\ LockObj # NoObj
+       \* SEEDED ONLY: the check fails although nothing has touched this operation's lock. Its three
+       \* readers - S99_check, S99_release_check and S21_1_s3, which are the only uses of this operator -
+       \* each record `refusedOk[self] := lostLock[self]`, and no run reached one of them with that ghost
+       \* FALSE: a check fails only after another actor wrote, unlinked or renamed the lock file, or a
+       \* lease lapsed, and every one of those marks the holder. So that half of RefusalJustified was true
+       \* by construction and no run could tell it from TRUE - a mutant hardwiring `refusedOk` TRUE at
+       \* S99_check left the whole suite green (test audit, plan 3, TB-1). The seed is the wrong refusal
+       \* itself: a Section 99 check that refuses a holder nobody dispossessed.
+       StillOwned(p) == /\ ~SEED_CHECK_REFUSES_UNTOUCHED
+                        /\ LockObj # NoObj
                         /\ fs.content[LockObj] = OwnRecord(p)
                         /\ (FIX_REMOTE_LEASE_SPEC => HandleObj(p) = LockObj /\ fs.oslock[LockObj] = p)
        \* The lock path holds a record whose owner is alive: what justifies TARGET_LOCK_BUSY
@@ -474,6 +484,11 @@
          \* alive is the oracle's judgement, as in classification (design Section 6.1).
          if (crashed[self]) { goto takeover_crashed; }
          else {
+           \* A torn record read HERE is deliberately not recorded in `tornRead`, unlike the classify read.
+           \* That ghost is a witness only (`NeverTornRead`), it already fires from the classify path, so
+           \* setting it here buys no coverage and changes no verdict, which is the whole reason. (It also
+           \* used to cite the breaklock-remote job's budget; that job has since been split and the reason
+           \* no longer needs it - capstone, plan 3.)
            with (seen = fs.content[tobj]) {
              if (IsRecord(seen) /\ seen # seenRec[self]) { refused[self] := "RESTART"; goto S240_5_close; }
              else if (IsRecord(seen)) {
@@ -525,15 +540,30 @@
          };
        S240_5_s6:
          \* Check the file identity against the lock path again. Empty: the prior owner removed its lock
-         \* meanwhile, so start again. Another file: whoever created it owns the target. The same file: the
-         \* takeover stands, and this operation proceeds as if the prior owner were dead.
+         \* meanwhile, so start again. Another file: another operation claimed the path, so start again too
+         \* (240.5 step 6, amended 2026-09-17). The same file: the takeover stands, and this operation
+         \* proceeds as if the prior owner were dead.
          if (crashed[self]) { goto takeover_crashed; }
          else {
            with (ident \in FsIdentityChoices(fs, P, LockName)) {
              if (ident = NoObj) { refused[self] := "RESTART"; goto S240_5_close; }
              else if (ident # tobj) {
-               refusedOk[self] := LockObj # NoObj /\ LockObj # tobj;
-               refused[self] := "TARGET_LOCK_BUSY";
+               \* Another operation claimed the lock path while this takeover was in flight, so the
+               \* acquisition starts again - the same answer as the empty path above, and the same one
+               \* S240_3_restart gives when another actor wins an acquisition (240.5 step 6, amended by
+               \* owner ruling 2026-09-17).
+               \*
+               \* It used to report TARGET_LOCK_BUSY on evidence that RESTATED this branch's own guard,
+               \* so RefusalJustified could never fail here. Asking RefusalEvidence instead MEASURED the
+               \* real thing: nothing in the breaklock POSIX pairing (CI 35188279927, 17,377,074 states,
+               \* exhaustive), but 3,569 violating states once a lease can lapse (CI 35211125866). Its
+               \* first trace has a Breaker reporting "the lock is held" while the only Owner is CRASHED,
+               \* it holds that lock itself, and it never saw a live owner - which is what
+               \* SEED_DEAD_AS_BUSY seeds as a DEFECT elsewhere. This label classifies the new occupant
+               \* not at all, so it cannot report one; the classifier that does measure liveness makes
+               \* that call on the next pass. No refusal here means RefusalJustified has nothing to
+               \* quantify at this label, which is why no evidence predicate is left.
+               refused[self] := "RESTART";
                goto S240_5_close;
              }
              else {
@@ -575,6 +605,11 @@
            };
          };
        S240_5_close:
+         \* Only `tobj`. The seeded rename path (SEED_RENAME_OVER_TAKEOVER) also holds a handle on its own
+         \* takeover file, and reaches here only when `FsRenameReplace` failed - which needs a handle
+         \* without delete sharing, so `DeleteAllowed` (FsModel.tla) makes it impossible on POSIX, and the
+         \* one run that sets that seed is POSIX. On a Windows pairing the branch would be live and would
+         \* leave that handle open (capstone finding, plan 3: unreachable, so not fixed).
          if (crashed[self]) { goto takeover_crashed; }
          else {
            if (tobj # NoObj /\ OpenBy(fs, self, tobj)) { fs := FsClose(fs, self, tobj).fs; };
@@ -636,8 +671,9 @@
            };
          };
        S99_release:
-         \* The release unlink is issued: it resolves the lock path to a file now and removes that file's name when
-         \* it lands, as a system call resolves its path when it starts.
+         \* The release unlink is issued. Which file it removes is NOT decided here: REMOVE carries the NAME, and
+         \* the server resolves it when the call LANDS (RFC 7530, design Section 5.3) - `LandUnlink` does that.
+         \* So the object stored below is never read back; `pendingUnlink` only records that an unlink is in flight.
          if (crashed[self]) { goto publish_crashed; }
          else {
            holding[self] := FALSE;
@@ -649,6 +685,12 @@
            with (c \in FsUnlinkChoices) {
              fs := LandUnlink(fs, self, c);
            };
+           \* After the fs assignment ON PURPOSE: `LockObj` is a define-block operator, so it denotes the
+           \* PRE-step `fs` wherever it is written - unlike a direct textual `fs` read, which sees the
+           \* assignment above: `S240_5_seed_write_begin` is the witness, the one site the translator emits
+           \* as `At(fs', ...)`. (The lease-expiry branch AVOIDS the rule by ordering, it does not show it.)
+           \* This names the lock as it
+           \* stood before the unlink landed, which is the holder to mark lost.
            lostLock := IF pendingUnlink[self] # NoObj /\ LockObj # NoObj THEN MarkLost(self, LockObj) ELSE lostLock;
            pendingUnlink[self] := NoObj;
          };
@@ -949,6 +991,10 @@
                fs := FsProcCrash(LandUnlink(fs, IF land THEN p ELSE NoProc, c), p);
                \* Its own ghost goes back to FALSE: a crashed process never refuses again, so any other value is
                \* dead state that splits states which are otherwise the same.
+               \* `LockObj` is a define-block operator: it denotes the PRE-step `fs`, not the one assigned two
+               \* lines up, so this is the lock as it stood before the crash's unlink landed. A direct textual
+               \* `fs` read would see the assignment instead - `S240_5_seed_write_begin` is the witness for
+               \* that half, the one site the translator emits as `At(fs', ...)`.
                lostLock := [ (IF land /\ pendingUnlink[p] # NoObj /\ LockObj # NoObj
                               THEN MarkLost(p, LockObj) ELSE lostLock) EXCEPT ![p] = FALSE ];
                landedAfterTakeover := landedAfterTakeover \/ (land /\ writing[p] /\ writeStale[p]);
@@ -997,6 +1043,24 @@
                lostLock[fs.oslock[o]] := TRUE;
                fs := FsLeaseExpiry(fs, o).fs;
                leases := leases + 1;
+             };
+           }
+           or {
+             \* SEEDED ONLY: give an object's OS-native lock to a process that has no handle on it,
+             \* which is what LockImpliesHandle forbids and therefore what FsOk must catch. The
+             \* protocol cannot do this - FsTryLock requires the handle - so without the seed the
+             \* invariant is true by construction and indistinguishable from TRUE (test audit, TA-1).
+             await SEED_FS_LOCK_WITHOUT_HANDLE;
+             with (o \in {x \in Objs : fs.oslock[x] = NoProc}, q \in {r \in Procs : ~OpenBy(fs, r, o)}) {
+               fs := [fs EXCEPT !.oslock[o] = q];
+             };
+           }
+           or {
+             \* SEEDED ONLY: write a content value that is not in Contents, which is what Classifiable
+             \* forbids. NoProc is a model value and is not a record, Torn, Foreign or EmptyFile.
+             await SEED_FS_ALIEN_CONTENT;
+             with (o \in {x \in Objs : fs.content[x] # NoContent}) {
+               fs := [fs EXCEPT !.content[o] = NoProc];
              };
            }
            or {
