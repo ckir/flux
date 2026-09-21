@@ -38,6 +38,11 @@ CONSTANTS
     \* and that is exactly the regression they exist to catch.
     SEED_FS_LOCK_WITHOUT_HANDLE, \* an OS-native lock held by a process with no open handle
     SEED_FS_ALIEN_CONTENT,       \* a content value outside Contents
+    \* The seed of RefusalJustified's `lostLock` half. Its three sites are the only readers of
+    \* StillOwned, and no run reached one of them with that ghost FALSE, so the half was true by
+    \* construction: a mutant hardwiring `refusedOk` TRUE at S99_check left the suite green (test
+    \* audit, plan 3, TB-1). This seed is the wrong refusal itself.
+    SEED_CHECK_REFUSES_UNTOUCHED, \* a Section 99 check that refuses a holder nobody dispossessed
     FIX_REMOTE_LEASE_SPEC  \* fix flag of the open finding on SingleWriter: the remote-lease spec amendments (design Section 11)
 
 Procs == Owners \cup Recoverers \cup PlainRuns \cup Cleanups \cup Breakers
@@ -125,7 +130,16 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
        \* NFS_LOCK_LOST state, I/O through it fails with EIO, re-locking the same descriptor does not clear it, and
        \* the documented recovery is to close the file and open it again (fcntl_locking(2), design Section 5.3).
        \* The model tried a relock that took a lapsed lock back until 2026-09-16; no platform offers that.
-       StillOwned(p) == /\ LockObj # NoObj
+       \* SEEDED ONLY: the check fails although nothing has touched this operation's lock. Its three
+       \* readers - S99_check, S99_release_check and S21_1_s3, which are the only uses of this operator -
+       \* each record `refusedOk[self] := lostLock[self]`, and no run reached one of them with that ghost
+       \* FALSE: a check fails only after another actor wrote, unlinked or renamed the lock file, or a
+       \* lease lapsed, and every one of those marks the holder. So that half of RefusalJustified was true
+       \* by construction and no run could tell it from TRUE - a mutant hardwiring `refusedOk` TRUE at
+       \* S99_check left the whole suite green (test audit, plan 3, TB-1). The seed is the wrong refusal
+       \* itself: a Section 99 check that refuses a holder nobody dispossessed.
+       StillOwned(p) == /\ ~SEED_CHECK_REFUSES_UNTOUCHED
+                        /\ LockObj # NoObj
                         /\ fs.content[LockObj] = OwnRecord(p)
                         /\ (FIX_REMOTE_LEASE_SPEC => HandleObj(p) = LockObj /\ fs.oslock[LockObj] = p)
        \* The lock path holds a record whose owner is alive: what justifies TARGET_LOCK_BUSY
@@ -1128,8 +1142,8 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "a979b2f6" /\ chksum(tla) = "ae4df95")
-\* Procedure variable obj of procedure Classify at line 174 col 18 changed to obj_
+\* BEGIN TRANSLATION (chksum(pcal) = "7732d14c" /\ chksum(tla) = "f2271f94")
+\* Procedure variable obj of procedure Classify at line 188 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
           live, holding, checked, writing, pendingUnlink, checkStale, 
@@ -1159,7 +1173,16 @@ HandleObj(p) == IF \E h \in fs.handles : h.proc = p
 
 
 
-StillOwned(p) == /\ LockObj # NoObj
+
+
+
+
+
+
+
+
+StillOwned(p) == /\ ~SEED_CHECK_REFUSES_UNTOUCHED
+                 /\ LockObj # NoObj
                  /\ fs.content[LockObj] = OwnRecord(p)
                  /\ (FIX_REMOTE_LEASE_SPEC => HandleObj(p) = LockObj /\ fs.oslock[LockObj] = p)
 

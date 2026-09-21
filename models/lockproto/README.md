@@ -117,12 +117,18 @@ kinds at once do not finish, so the check runs pair them, and each pairing is ex
 
 - Every run starts from an empty lock path or from one holding a `Foreign` object, which no actor writes, so
   `ForeignUntouched` has something to hold over. The empty start keeps the whole acquisition prefix.
-- Four seeded runs show the scenario's invariants can fail at all: `SEED_RECOVER_FOREIGN` must break
-  `ForeignUntouched`, `SEED_RECOVER_UNCERTAIN` `PlainNeverOwnsUncertain` through a torn or empty record, `SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK`
+- Seven seeded runs show the scenario's invariants can fail at all. Four re-introduce a protocol defect
+  (design Section 8): `SEED_RECOVER_FOREIGN` must break `ForeignUntouched`, `SEED_RECOVER_UNCERTAIN`
+  `PlainNeverOwnsUncertain` through a torn or empty record, `SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK`
   (clean-up pairing) the same invariant through a cleanup lock whose owner is uncertain, and `SEED_DEAD_AS_BUSY`
-  (plain pairing) `RefusalJustified` (design Section 8). `SingleWriter`'s seeds need actors of `mixed` and `breaklock`; here the
-  witness `NeverChecked` shows its ghost is set. Before the test audit of 2026-09-14 found this, deleting any of those
-  ghosts left every run green.
+  (plain pairing) `RefusalJustified` through the evidence a refusal rests on. `SEED_CHECK_REFUSES_UNTOUCHED`
+  breaks that invariant's OTHER half - the `lostLock` ghost its three Section 99 sites record - by failing
+  every check, so a holder nobody dispossessed refuses. The last two corrupt `fs` from the environment,
+  because the protocol cannot reach either state: `SEED_FS_LOCK_WITHOUT_HANDLE` breaks `FsOk` and
+  `SEED_FS_ALIEN_CONTENT` `Classifiable`, the two invariants of the filesystem model itself. Those three
+  are the test audit of 2026-09-21; `SingleWriter`'s seeds need actors of `mixed` and `breaklock`, and here
+  the witness `NeverChecked` shows its ghost is set. Before the test audit of 2026-09-14 found this,
+  deleting any of those ghosts left every run green.
 - `MaxCrashes = 2` in every run. With one crash, the path where a recovering actor itself crashes was unreachable,
   so a second crash is what the crash-inside-recovery interleavings need.
 - **One pass, never a loop.** Where the spec says an actor starts its acquisition again - 240.3 step 2 and

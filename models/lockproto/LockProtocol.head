@@ -38,6 +38,11 @@ CONSTANTS
     \* and that is exactly the regression they exist to catch.
     SEED_FS_LOCK_WITHOUT_HANDLE, \* an OS-native lock held by a process with no open handle
     SEED_FS_ALIEN_CONTENT,       \* a content value outside Contents
+    \* The seed of RefusalJustified's `lostLock` half. Its three sites are the only readers of
+    \* StillOwned, and no run reached one of them with that ghost FALSE, so the half was true by
+    \* construction: a mutant hardwiring `refusedOk` TRUE at S99_check left the suite green (test
+    \* audit, plan 3, TB-1). This seed is the wrong refusal itself.
+    SEED_CHECK_REFUSES_UNTOUCHED, \* a Section 99 check that refuses a holder nobody dispossessed
     FIX_REMOTE_LEASE_SPEC  \* fix flag of the open finding on SingleWriter: the remote-lease spec amendments (design Section 11)
 
 Procs == Owners \cup Recoverers \cup PlainRuns \cup Cleanups \cup Breakers
