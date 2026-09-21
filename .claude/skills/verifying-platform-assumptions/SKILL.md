@@ -11,9 +11,13 @@ A model checks your protocol against the platform **you described**, not the one
 wrong description buys a green run and nothing else. The same is true of a spec: it is only as sound as its
 claims about the things it does not control.
 
-**Core rule: every borrowed behaviour is named, and each one is in exactly one of three states — cited to a
-primary source, refuted by one, or unverified with a named probe. A row in no state is not a fourth state: it
-is the rule unmet, and every result resting on it is provisional.**
+**Core rule: every borrowed behaviour is named, and each one is in exactly one of three states — `verified`,
+`refuted`, or `unverified`. A row in no state is not a fourth state: it is the rule unmet, and every result
+resting on it is provisional.**
+
+`verified` is the one with a trap in it. A row is verified only when the cited source covers **this** claim -
+not a neighbouring one on the same page. A citation is not a verification, and the worked example below is
+this page failing exactly that way.
 
 ## The failure this prevents
 
@@ -67,9 +71,9 @@ not hold, stated with confidence, with no source, and the agent then argued *aga
 |---|---|---|
 | `rename` over an existing target is atomic to a reader | RFC 7530 | verified |
 | A stale `unlink` removes whatever holds the name when the server runs it | RFC 7530 (`REMOVE` carries the name) | verified |
-| A lost lease poisons the descriptor; re-locking it does not help | `fcntl_locking(2)`, kernel `NFS_LOCK_LOST` | verified |
+| A lost lease poisons the descriptor; re-locking it does not help | `fcntl_locking(2)`, "Lost locks" | verified |
 | A failed `rename` proves the rename did not happen | - | unverified; probe: retransmit against a server with a duplicate-request cache |
-| Re-locking a descriptor whose lease lapsed recovers the lock | `fcntl_locking(2)` | **refuted** - the design that assumed it was rebuilt |
+| *(assumed)* Re-locking a descriptor whose lease lapsed recovers the lock | `fcntl_locking(2)`, same section | **refuted** - the design resting on it was rebuilt |
 
 ## Red flags
 
