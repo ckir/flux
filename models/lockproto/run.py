@@ -40,6 +40,10 @@ REPO = HERE.parent.parent
 TARGET = REPO / "target" / "tla"
 
 KINDS = ("check", "liveness", "seeded", "witness")
+# The kinds that halt at their first counterexample, so their coverage block is a PREFIX. Derived
+# rather than restated: it is the exact complement of the kinds that get `-continue`, and two
+# copies in opposite polarity would let a sixth kind fall between them (capstone, plan 3, round 6).
+HALTING_KINDS = tuple(k for k in KINDS if k not in ("check", "liveness"))
 RUN_KEYS = {"name", "module", "config", "scenario", "kind", "violated", "open_findings", "unreached", "timeout_minutes",
             "constants", "symmetry", "tightened", "job"}
 FINDING_KEYS = {"name", "tracking", "fix_flag"}
@@ -972,12 +976,16 @@ def parse_coverage(messages: list[Message]) -> dict[str, tuple[int, int]] | None
     return result
 
 
+# TLC marks a cost node's NESTING DEPTH with leading `|` characters, and the nested ones are the
+# intra-action sub-expressions - exactly the branch-level data this is for. The first version of
+# this pattern began `^\s*line`, and `\s` does not match `|`, so it dropped 7 of the 17 nodes in
+# the repo's own fixture while looking like it had read them all (capstone, plan 3, round 6).
 _COVERAGE_COST_NODE = re.compile(
-    r"^\s*line (\d+), col (\d+) to line (\d+), col (\d+) of module (\w+): (\d+)\s*$")
+    r"^\s*(\|*)\s*line (\d+), col (\d+) to line (\d+), col (\d+) of module (\w+): (\d+)\s*$")
 
 
-def parse_cost_nodes(messages: list[Message]) -> list[tuple[str, int, int, int]] | None:
-    """Every EXPRESSION node of the last coverage block: (module, line, col, count).
+def parse_cost_nodes(messages: list[Message]) -> list[tuple[str, int, int, int, int]] | None:
+    """Every EXPRESSION node of the last coverage block: (module, line, col, count, depth).
 
     TLC's `-coverage 1` is expression-granular, not action-granular: alongside each action (2772) it
     emits indented cost sub-lines (2221) carrying a source span and a count, and a count of ZERO for
@@ -1006,13 +1014,18 @@ def parse_cost_nodes(messages: list[Message]) -> list[tuple[str, int, int, int]]
     if last_block is None:
         return None
 
-    nodes: list[tuple[str, int, int, int]] = []
+    nodes: list[tuple[str, int, int, int, int]] = []
     for m in last_block:
         if m.code != C_COVERAGE_COST:
             continue
         match = _COVERAGE_COST_NODE.match(m.text)
-        if match:
-            nodes.append((match.group(5), int(match.group(1)), int(match.group(2)), int(match.group(6))))
+        if match is None:
+            # A 2221 line this does not understand. Fail CLOSED rather than drop it: an
+            # unparsable node and an absent node are indistinguishable downstream, and a silent
+            # drop is how "no zero branches found" would come to mean "I could not read them".
+            return None
+        nodes.append((match.group(6), int(match.group(2)), int(match.group(3)),
+                      int(match.group(7)), len(match.group(1))))
     return nodes
 
 
@@ -1221,7 +1234,9 @@ def judge_union(executed: list[tuple[Run, bool, Result]], base: Path,
             continue
         assert result.log is not None, "a non-tooling result always has a log"
         entries.append((run.module, result.log.read_text(encoding="utf-8", errors="replace")))
-    return union_from_logs(entries, base, never_reached, deferred)
+    partial = frozenset(run.name for run, fixed, _result in executed
+                        if not fixed and run.kind in HALTING_KINDS)
+    return union_from_logs(entries, base, never_reached, deferred, partial)
 
 
 def union_from_logs(entries: list[tuple[str, str]], base: Path,
@@ -1313,9 +1328,7 @@ def judge_union_from(expected: Expected, base: Path, logs_dir: Path) -> int:
               f"{', '.join(sorted(missing))}", file=sys.stderr)
         return 2
     entries = [(r.module, logs[r.name].read_text(encoding="utf-8", errors="replace")) for r in wanted]
-    # A seeded or witness run halts at its first counterexample; check and liveness runs explore the
-    # whole reachable space under -continue.
-    partial = frozenset(r.name for r in wanted if r.kind in ("seeded", "witness"))
+    partial = frozenset(r.name for r in wanted if r.kind in HALTING_KINDS)
     print(f"run.py: judging the union from {len(entries)} saved logs under {logs_dir}")
     failed = union_from_logs(entries, base, expected.never_reached, expected.deferred, partial)
     return 1 if failed else 0
@@ -1341,9 +1354,11 @@ def report_zero_branches(expected: Expected, logs_dir: Path) -> int:
             continue
         zeros = [n for n in nodes if n[3] == 0]
         total_zero += len(zeros)
-        print(f"  {run.name}: {len(zeros)} zero of {len(nodes)} expression nodes")
-        for module, line, col, _count in zeros:
-            print(f"      {module} line {line}, col {col}")
+        nested = sum(1 for n in nodes if n[4] > 0)
+        print(f"  {run.name}: {len(zeros)} zero of {len(nodes)} expression nodes "
+              f"({nested} nested)")
+        for module, line, col, _count, depth in zeros:
+            print(f"      {module} line {line}, col {col}{'  (depth ' + str(depth) + ')' if depth else ''}")
     print(f"run.py: {total_zero} zero-count expression nodes across {len(expected.runs)} runs")
     return 0
 

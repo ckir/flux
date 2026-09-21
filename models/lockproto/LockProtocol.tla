@@ -3540,8 +3540,9 @@ NeverRecoveredAfterCrash == ~recoveredAfterCrash
 \* expressible configuration - TakeOver has one caller, behind brk_start's else arm, which already
 \* requires the gate not to fire. Earlier weak runs SET the seed, to prove SingleWriter catches the
 \* bypass, so the refusal itself went unexercised while the README said otherwise. A witness halts at the
-\* first violating state, so one run per process kind is what actually reaches all five (capstone, plan 3,
-\* rounds 4 and 5 - round 4's single witness reached one).
+\* first violating state, so one run per process kind is what actually reaches all five - FIVE runs for five
+\* sites, each declaring exactly one actor (capstone, plan 3, rounds 4 to 6: round 4's single witness reached
+\* one site, and round 5's fix still left two kinds sharing a run, so one of those was reached by nothing).
 NeverRefusedUnsafe == \A p \in Procs : refused[p] # "REMOTE_LOCK_UNSAFE"
 \* A host crash changed which object the lock path names: an unflushed create, move-aside or removal
 \* was undone. Label coverage cannot show this, because the host crash shares `env_loop` with the

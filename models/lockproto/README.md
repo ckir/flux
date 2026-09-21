@@ -163,11 +163,12 @@ assign `REMOTE_LOCK_UNSAFE`, one per process kind - `own_start`, `plain_start`, 
 `breaklock`'s seeded run SETS that seed, to bypass the refusal and show `SingleWriter` catches the
 bypass. It therefore does NOT exercise the refusal, though the Bounds section used to say it did.
 
-Four witness runs do, one per process kind: `breaklock-posix-weakcap-witness-NeverRefusedUnsafe` (an
-Owner and two Breakers) plus the `-plain-`, `-rec-` and `-clean-` variants, each declaring exactly one
-actor. One run per kind is not tidiness: a witness has no `-continue`, so TLC halts at the FIRST
-violating state, and a run carrying several kinds proves only that one of them refused. Round 4 added a
-single witness and reached one site of five; round 5 added the rest.
+FIVE witness runs do, one per process kind - the `-own-`, `-plain-`, `-rec-`, `-clean-` and `-brk-`
+variants of `breaklock-posix-weakcap-*-witness-NeverRefusedUnsafe` - each declaring exactly ONE actor.
+One run per kind is not tidiness: a witness has no `-continue`, so TLC halts at the FIRST violating state,
+and a run carrying several kinds proves only that one of them refused. That rule cost two rounds to
+apply: round 4 added a single witness and reached one site of five, and round 5 added three more while
+leaving an Owner and a Breaker sharing the original - so one of those two was still reached by nothing.
 
 A sixth site, `S240_5_s1`, is 240.5 step 1's capability check rather than 235.1's refusal: it reports
 `TARGET_LOCK_UNCERTAIN`, and its capability disjunct is dead in every configuration this suite can

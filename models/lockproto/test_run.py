@@ -2055,10 +2055,29 @@ class CostNodeTests(unittest.TestCase):
     TLC's `-coverage 1` has carried per-expression counts (message 2221) all along, including zeros.
     """
 
+    def test_reads_every_cost_node_including_the_nested_ones(self) -> None:
+        """The NESTED nodes are the branch-level ones, and the first version of this parser dropped
+        them: TLC prefixes a node's depth with `|`, and the pattern matched leading whitespace
+        only. It returned 10 of 17 while looking like it had read them all. Assert the COUNT,
+        absence of this assertion is exactly what let that through."""
+        text = fixture("smoke_check_coverage")[1]
+        nodes = run.parse_cost_nodes(run.parse_messages(text))
+        self.assertIsNotNone(nodes)
+        self.assertEqual(len(nodes), text.count("@!@!@STARTMSG 2221"),
+                         "every message-2221 line must be parsed, nested ones included")
+        self.assertTrue(any(depth > 0 for *_rest, depth in nodes),
+                        "the fixture carries nested nodes; if none parse, the depth support is dead")
+
+    def test_an_unreadable_cost_line_fails_closed(self) -> None:
+        text = fixture("smoke_check_coverage")[1]
+        broken = text.replace("line 26, col 8", "LINE 26, col 8", 1)
+        self.assertIsNone(run.parse_cost_nodes(run.parse_messages(broken)),
+                          "a 2221 line the parser cannot read must be None, never a silent drop")
+
     def test_extracts_the_zero_count_nodes_of_a_constant_guarded_body(self) -> None:
         nodes = run.parse_cost_nodes(run.parse_messages(fixture("smoke_check_coverage")[1]))
         self.assertIsNotNone(nodes)
-        zeros = [(module, line) for module, line, _col, count in nodes if count == 0]
+        zeros = [(module, line) for module, line, _col, count, _depth in nodes if count == 0]
         # Smoke.tla's Overshoot body is guarded by the constant SEED_OVERSHOOT, and in the
         # non-seeded run it reports zero - the exact shape of the capstone's R4-1 finding.
         self.assertEqual(zeros, [("Smoke", 26), ("Smoke", 27)])
@@ -2086,15 +2105,14 @@ class PartialCoverageTests(unittest.TestCase):
         logs = Path(tmp.name)
         for r in expected.runs:
             (logs / f"{r.name}.log").write_text(fixture("smoke_check_coverage")[1], encoding="utf-8")
-        halting = frozenset(r.name for r in expected.runs if r.kind in ("seeded", "witness"))
+        halting = frozenset(r.name for r in expected.runs if r.kind in run.HALTING_KINDS)
+        self.assertTrue(halting, "the fixture must contain a halting run or this test asserts nothing")
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             run.judge_union_from(expected, d.path, logs)
-        if halting:
-            self.assertIn("PREFIX", out.getvalue(),
-                          "a union built partly from halting runs must say so")
-            for name in halting:
-                self.assertIn(name, out.getvalue())
+        self.assertIn("PREFIX", out.getvalue(), "a union built partly from halting runs must say so")
+        for name in halting:
+            self.assertIn(name, out.getvalue())
 
 
 if __name__ == "__main__":
