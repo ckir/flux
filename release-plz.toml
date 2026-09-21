@@ -28,14 +28,20 @@ git_tag_enable = true
 git_tag_name = "v{{ version }}"
 git_release_enable = true
 git_release_name = "v{{ version }}"
-changelog_update = true
-changelog_path = "CHANGELOG.md"
-changelog_include = ["flux", "flux-core", "flux-fs", "flux-platform", "flux-hash", "flux-ui"]
+changelog_update = false
 version_group = "flux"
 
+# The root package owns the changelog, because it is the only one release-plz attributes the whole
+# repository to. MEASURED: with the changelog on flux-cli it carried ONE entry - `changelog_include`
+# merges other packages' GENERATED changelogs, and `[workspace] changelog_update = false` meant the
+# six included packages generated nothing. It keeps `v{{ version }}` so its links point at the tag
+# flux-cli actually creates.
 [[package]]
 name = "flux"
 version_group = "flux"
+changelog_update = true
+changelog_path = "CHANGELOG.md"
+git_tag_name = "v{{ version }}"
 
 [[package]]
 name = "flux-core"
@@ -67,10 +73,13 @@ commit_parsers = [
     { message = "^fix", group = "Bug fixes" },
     { message = "^perf", group = "Performance" },
     { message = "^refactor", group = "Refactoring" },
-    { message = "^(spec|design|plan)", group = "Specification and design" },
-    { message = "^(model|runner|trace|recovery)", group = "Lock-protocol model" },
-    { message = "^docs", group = "Documentation" },
-    { message = "^tests?", group = "Tests" },
+    # Skipped: this changelog describes the SHIPPED BINARY, and these types do not change it. They are
+    # the bulk of the repository - 130 spec, 43 design, 31 model, 11 docs, 8 skills, 8 plan, 5 test at
+    # v0.1.0 - so without these skips the notes run to 240 entries and bury the few that ship.
+    { message = "^(spec|design|plan)", skip = true },
+    { message = "^(model|runner|trace|recovery)", skip = true },
+    { message = "^(docs|skills)", skip = true },
+    { message = "^tests?", skip = true },
     { message = "^(ci|build)", group = "Build and CI" },
     { message = "^(chore|style|revert)", group = "Miscellaneous" },
     { message = ".*", group = "Other" },
