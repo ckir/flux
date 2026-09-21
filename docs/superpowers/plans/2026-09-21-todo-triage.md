@@ -69,18 +69,31 @@ Expected: the commit `main` is on. If it is not `76e0ff1`, re-run the fact table
 - [ ] **Step 2: Emit the item inventory**
 
 ```bash
-python -c "
-import sys
-lines=open('TODO.md',encoding='utf-8').read().splitlines()
-sec=None
-for i,l in enumerate(lines,1):
-    if l.startswith('## '): sec=l[3:].strip()
-    elif l.startswith('- [ ]'): print(f'{i}\t{sec}\t{l[6:]}')
-" > <scratch>/items.tsv
+python - <<'EOF' > <scratch>/items.tsv
+lines = open("TODO.md", encoding="utf-8").read().splitlines()
+sec, cur, out = None, None, []
+for i, l in enumerate(lines, 1):
+    if l.startswith("## "):
+        sec, cur = l[3:].strip(), None
+    elif l.startswith("- [ ]"):
+        cur = [i, sec, [l[6:].strip()]]; out.append(cur)
+    elif cur is not None and l.startswith("      "):
+        cur[2].append(l.strip())
+    elif not l.strip():
+        cur = None
+for i, s, parts in out:
+    print(f"{i}\t{s}\t" + " ".join(parts).replace("\t", " "))
+EOF
 wc -l < <scratch>/items.tsv
+awk -F'\t' '{print length($3)}' <scratch>/items.tsv | sort -n | tail -1
 ```
 
-Expected: `49`. If not 49, `main` has moved and the candidate list below must be re-derived.
+Expected: `49`, and a longest-item length well over 80 — most items run to several lines, and all
+101 continuation lines in the file are indented exactly six spaces (measured), which is what the
+`startswith("      ")` branch matches. **The text is captured whole.** Once an item is deleted the
+commit message is the working record of what it said; an inventory that keeps only first lines
+produces a record of fragments. The full text remains recoverable from `git show <parent>:TODO.md`,
+because `TODO.md` is tracked — but that is a fallback, not a reason to write a poor message.
 
 ---
 
@@ -252,8 +265,8 @@ by having evidence written against it — the default is the safe one.
 
 - [ ] **Step 2: Fill in the verdicts that the evidence changes**
 
-One row per item: `line`, `section`, `verdict`, `evidence`. Every `DONE`, `OVERTAKEN` and `SPLIT` row
-must quote a measurement from `evidence.txt`. `LIVE` rows carry a one-line reason. `UNVERIFIABLE`
+One row per item, **five tab-separated fields**: `line`, `section`, `text`, `verdict`, `evidence`. Leave `text` exactly as seeded — the seed, this instruction and Task 7's
+generator must agree on five fields or the generator raises `ValueError` on unpacking. Every `DONE`,
 rows carry the reason they cannot be settled.
 
 - [ ] **Step 3: Check the acceptance bar mechanically**
@@ -330,8 +343,9 @@ live half only, rewritten as a standalone item that does not reference the close
 Directly under the `# TODO` heading's intro line, add:
 
 ```markdown
-Last triaged 2026-09-22 (commit `PENDING`): <N> items closed, <M> remain. The verdicts and the
-measurement behind each closure are in that commit's message — this file keeps only surviving work.
+Last triaged 2026-09-22: <N> items closed, <M> remain. The verdicts and the measurement behind
+each closure are in the commit titled `docs(todo): triage the 49 open items`, which
+`git log --grep='triage the 49'` finds — this file keeps only surviving work.
 ```
 
 `<N>` and `<M>` come from `wc -l` over `verdicts.tsv`, **not** from memory. The commit `7c085bf`
@@ -380,6 +394,7 @@ for line, sec, text, verdict, ev in rows:
     by[verdict].append((line, sec, text, ev))
 print("docs(todo): triage the 49 open items")
 print()
+closed = sum(len(by[v]) for v in ("DONE", "OVERTAKEN", "SPLIT"))
 print(f"{closed} closed, {len(rows)-closed} remain. Every closure carries the measurement that")
 print("settled it; this message is the only durable record, because TODO.md keeps only live work.")
 for v in ("DONE", "OVERTAKEN", "SPLIT", "UNVERIFIABLE", "LIVE"):
@@ -390,6 +405,7 @@ for v in ("DONE", "OVERTAKEN", "SPLIT", "UNVERIFIABLE", "LIVE"):
     for line, sec, text, ev in by[v]:
         print(f"  TODO.md:{line}  [{sec}]  {text}")
         print(f"        evidence: {ev}")
+EOF
 head -12 <scratch>/triage-message.txt
 ```
 
@@ -400,23 +416,17 @@ Task 6's pointer line — if they disagree, one of them was written from memory.
 
 ```bash
 git commit -F <scratch>/triage-message.txt
-sha=$(git rev-parse --short HEAD)
-python - "$sha" <<'EOF'
-import sys, io
-t = io.open("TODO.md", encoding="utf-8").read()
-assert "commit `PENDING`" in t, "pointer line missing or already amended"
-io.open("TODO.md", "w", encoding="utf-8").write(t.replace("commit `PENDING`", "commit `%s`" % sys.argv[1], 1))
-EOF
-git add TODO.md && git commit --amend --no-edit
+git log -1 --format='%h %s' 
 grep -n 'Last triaged' TODO.md
-git rev-parse --short HEAD
 ```
 
-Expected: the pointer line names the commit that contains it. **Amending changes the hash**, so the
-last two commands must agree — if they do not, repeat the replacement with the new hash and amend
-again. This is the only self-reference in the plan and it cannot be written in one pass: an earlier
-draft had Task 6 write the hash of a commit Task 7 had not yet created.
+Expected: the commit exists, and the pointer line names it **by subject, not by hash**.
 
+**A tracked file cannot contain the hash of the commit that modifies it.** An earlier draft had
+Task 6 write `PENDING` and Task 7 amend the real hash in — but amending changes the content, which
+changes the hash, so the file would name the previous commit and 'amend again with the new hash'
+is an infinite regress. The pointer therefore names the subject line, which `git log --grep` finds
+and which survives a rebase or a squash that a hash would not.
 
 ---
 
