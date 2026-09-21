@@ -164,6 +164,20 @@ FsClose(fs, p, o) ==
 
 \* The OS-native lock, scoped to the handle that takes it (probe FS-11) and unavailable when the
 \* capability is weak (Section 235.1).
+\*
+\* This does NOT model a poisoned descriptor. A lock lost to a lapsed lease leaves the kernel's
+\* NFS_LOCK_LOST state on the descriptor, so the holder cannot take that lock back through it - it must
+\* close the file and open it again (design Section 5.3). `FsLeaseExpiry` only clears `oslock`, so this
+\* operator would happily hand the lapsed holder its lock back on the same handle. What makes that sound
+\* is the PROTOCOL, not this primitive, and in two parts - NOT, as this comment first claimed, because
+\* every caller locks an object it has just opened. Two of the four sites are re-entered from a wait
+\* loop (`S96_1_ownlock_wait`, `S240_3_s4_lock_wait`), with any number of environment steps - lease
+\* expiries included - in between. What holds instead: (a) a wait label is reachable ONLY from a FAILED
+\* try-lock, so the caller has never held that object's lock and nothing of its can have lapsed; and
+\* (b) once a try-lock succeeds the control flow is strictly forward, with no edge back to the lock
+\* label. The one label that did retake a lapsed lock was deleted on 2026-09-16. A new caller that
+\* re-locks a descriptor whose lease lapsed would be admitted here and would be wrong - add the
+\* poisoned state before writing one (capstone finding, plan 3).
 FsTryLock(fs, p, o) ==
     IF o = NoObj \/ LockCapability = "weak" \/ ~OpenBy(fs, p, o) \/ fs.oslock[o] # NoProc THEN Fail(fs)
     ELSE Ok([fs EXCEPT !.oslock[o] = p], o)

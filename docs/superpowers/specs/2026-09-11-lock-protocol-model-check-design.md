@@ -508,6 +508,7 @@ row with no citation is not a small debt - it is a result waiting to be withdraw
 | A process cannot ask whether it still holds its own lock | [LockFileEx](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex) (Windows); `F_GETLK` reports only other processes' locks | verified |
 | On SMB3 a durable handle whose oplock or lease break cannot be delivered is closed by the server, and the reconnect fails | [MS-SMB2](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/2a09fc40-1615-42df-bda6-2865b8d6da95) | verified; the Linux `EIO` rule must not be reused for SMB3 |
 | No primitive makes a publication conditional on still holding a lock, and there is no directory-entry compare-and-swap | POSIX `rename`, `renameat2` (`RENAME_NOREPLACE` tests existence only), NFSv4 `RENAME`, SMB3 | verified |
+| A lost lease fences writes through that descriptor: the write fails rather than landing unseen (Linux NFSv4) | [fcntl_locking(2)](https://man7.org/linux/man-pages/man2/fcntl_locking.2.html) | verified, and deliberately NOT modelled - see below |
 | A failed `rename` on NFS proves the rename did not happen | - | **unverified**; a retransmission answered from the server's duplicate-request cache may contradict it. Probe before any publication rule depends on it |
 
 Three rules keep the table honest:
@@ -518,6 +519,19 @@ Three rules keep the table honest:
 2. **An unverified row names its probe**, or it is not an assumption but a guess.
 3. **A row that favours the protocol is checked first.** Of the three errors found in plan 3, every one made
    the protocol look safer, and each had already been built on by the time it surfaced.
+
+A row may be verified and still not modelled, provided the divergence is measured rather than assumed. The
+write-fencing row is the one case here. Linux NFSv4 fails a write through a descriptor whose lease lapsed, so
+the model - which lets that write land - explores stale writes the client would refuse. That is the
+conservative direction, but conservative is not free: it can force a spec concession the platform never
+needed. Measured (2026-09-16, the scratch repository: the same protocol with a `LEASE_FENCES_WRITES`
+constant, `mixed-remote`, `SingleWriter` as a halting witness): fencing removes **no** accepted window. Both
+settings produce the same 34-step trace, ending in the check-to-call window, and differ only in state count
+(5,217,818 fenced against 4,876,949 unfenced). The window is about two checks passing, not two writes
+landing, so write fencing cannot touch it, and the second window had already been closed by Section 99's
+lock test. The amendment of Section 11 is therefore needed on every platform, not only where the client
+leaves a lapsed holder free to write. Modelling the fence would cost every configuration a new constant and
+change no verdict, so it stays a documented divergence rather than a model change.
 
 And a rule about what the table cannot save: **when a third exception is accepted to the same invariant, the
 invariant is the problem.** Two accepted windows is a protocol with caveats; three is a sign the property being

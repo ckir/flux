@@ -67,9 +67,10 @@ hooks:
 python := env_var_or_default("PYTHON", "python3")
 
 # Run the model check: every scenario, or one (`just model selftest`), optionally one platform
-# (`just model recovery posix`)
-model scenario="" platform="":
-    {{python}} models/lockproto/run.py {{ if scenario == "" { "" } else { "--scenario " + scenario } }} {{ if platform == "" { "" } else { "--platform " + platform } }}
+# (`just model recovery posix`), optionally one CI job (`just model breaklock-remote posix posix-plain`;
+# see `run.py --list-jobs`, which is what the workflow's matrix is built from)
+model scenario="" platform="" job="":
+    {{python}} models/lockproto/run.py {{ if scenario == "" { "" } else { "--scenario " + scenario } }} {{ if platform == "" { "" } else { "--platform " + platform } }} {{ if job == "" { "" } else { "--job " + job } }}
 
 # Unit tests of the model runner (Python only, no Java)
 model-test:
