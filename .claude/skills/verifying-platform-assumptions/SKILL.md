@@ -12,8 +12,16 @@ wrong description buys a green run and nothing else. The same is true of a spec:
 claims about the things it does not control.
 
 **Core rule: every borrowed behaviour is named, and each one is in exactly one of three states — `verified`,
-`refuted`, or `unverified`. A row in no state is not a fourth state: it is the rule unmet, and every result
-resting on it is provisional.**
+`refuted`, or `unverified`.**
+
+Each state costs something different, and saying which is the point of having them:
+
+- `verified` — settled. Build on it.
+- `refuted` — the design resting on it is unsupported. Stop and say so.
+- `unverified` — **every result resting on this row is provisional**, including a model run that passes.
+  Provisional is a real state you may proceed from, as long as it is written where the result is read.
+- *no state at all* — not a fourth state. The rule is unmet, which is weaker than provisional: you do not
+  yet know what you are resting on, so you cannot say what it costs.
 
 `verified` is the one with a trap in it. A row is verified only when the cited source covers **this** claim -
 not a neighbouring one on the same page. A citation is not a verification, and the worked example below is
@@ -47,6 +55,9 @@ not hold, stated with confidence, with no source, and the agent then argued *aga
 
 ## The procedure
 
+0. **Check which door you came in by.** If you are here because a third exception is being accepted to the
+   same invariant, there is no external system to name: go straight to **The companion rule** at the end.
+   The procedure below is for a borrowed behaviour.
 1. **Name the external system** and the exact call or state involved.
 2. **List each borrowed behaviour as one row, in the artifact that depends on it** - the design document,
    the model's own comments, the commit message. One row per claim, not one row per subsystem. A list that
@@ -59,8 +70,10 @@ not hold, stated with confidence, with no source, and the agent then argued *aga
    that is the whole return on doing this.
 5. **Check the self-serving ones first.** Of three such errors found in one project, every one was the
    reading that made the protocol look safer, and every one had already been built on by the time it surfaced.
-6. **An unverified row names the probe that would settle it** - a command or test someone could run. Naming a
-   probe does not verify anything; it records what is owed.
+6. **An unverified row names the probe that would settle it** - concrete enough that someone else could
+   attempt it without asking you what you meant. "Write a test for it" is not a probe; a command, a named
+   tool, or a setup someone could build is. Naming a probe does not verify anything; it records what is
+   owed, and a vague one records nothing.
 7. **Say how many rows there are, and how you know that is all of them.** A list of zero borrowed behaviours
    satisfies every rule above and proves nothing - the commonest way this comes out green is by naming
    nothing. If the count is low, say which calls you went looking through to get it.
@@ -74,6 +87,12 @@ not hold, stated with confidence, with no source, and the agent then argued *aga
 | A lost lease poisons the descriptor; re-locking it does not help | `fcntl_locking(2)`, "Lost locks" | verified |
 | A failed `rename` proves the rename did not happen | - | unverified; probe: retransmit against a server with a duplicate-request cache |
 | *(assumed)* Re-locking a descriptor whose lease lapsed recovers the lock | `fcntl_locking(2)`, same section | **refuted** - the design resting on it was rebuilt |
+
+**5 rows, and here is why that is all of them:** they are every behaviour this protocol borrows from the
+filesystem - the four calls it makes at the lock path (`rename`, `unlink`, the lock acquisition, the
+re-lock after a lapse) and the lease that underlies them. Walked by re-reading each filesystem call in the
+model and asking what it assumes. Step 7 without this line is the part everyone skips, which is why the
+example carries it.
 
 ## Red flags
 
