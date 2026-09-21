@@ -92,17 +92,54 @@ from whether the modelling happened.
 
 ## Outputs
 
-Three, deliberately separated.
+**Amended 2026-09-22, after three adversarial panel rounds. The original design is recorded below it,
+because the reason for the change matters more than the change.**
 
-1. **`TODO.md`** — closed items removed, `SPLIT` items rewritten down to their live half, everything
-   else untouched. It carries only surviving work.
-2. **The triage commit message** — the full verdict table: every item, its verdict, its evidence. This
-   is the only durable record of a deletion, following `docs(todo)` PRs #6 and #25.
-3. **A pointer line in `TODO.md`** — "Last triaged 2026-09-21 (`<sha>`); verdicts and evidence in that
-   commit." Without it the reasons exist and nobody reading the file knows where.
+Everything happens **in `TODO.md` itself**.
 
-"Already true" fixes go in a **separate commit** in the same pull request, so the triage commit stays
-pure analysis and can be read as evidence rather than as a change set.
+1. **A closed item moves to a `## Closed` section** at the bottom of the file, rewritten as one line
+   carrying its verdict and the measurement that settled it:
+
+   ```markdown
+   ## Closed
+
+   Triaged 2026-09-22. Kept here rather than deleted: the evidence for a closure belongs where the
+   item was, not only in a commit message.
+
+   - `DONE` **Model-check the lock protocol before implementing it.** `recovery` runs two Recoverers
+     and `breaklock` two Breakers; `SingleWriter` is checked by 43 configs — `models/lockproto/expected.toml`.
+   ```
+
+2. **Nothing else.** No intermediate file, no generated commit message, no pointer line.
+
+The **git diff is the durable record**: it shows exactly which item moved, what evidence came with it,
+and nothing else. The commit message summarises; it does not carry the only copy.
+
+### Why this replaced the original design
+
+The original said closed items were **deleted** and their reasons lived **only in the commit message**,
+with a pointer line in `TODO.md` naming that commit. Implementing it required keying items by line
+number, a five-field TSV, a deletion script, a message generator, and a pointer line naming its own
+commit.
+
+Three panel rounds found 17 defects in that plan. **Every blocking one came from that machinery** — a
+line-shifting cascade that would have destroyed un-evaluated items, a schema that disagreed with its
+own instructions, a name used but never bound, a heredoc with no terminator, duplicate line numbers
+driving an irreversible delete, and a pointer line that could never converge because a commit cannot
+contain its own hash.
+
+None of those defects are about triage. They are about moving 49 lines of Markdown across a data
+pipeline in order to throw the lines away. The reviewer's verdict on the plan was that it "spends
+hundreds of lines of fragile bash, awk, and Python ... purely to prevent a human from making a mistake
+while checking boxes", and that is correct.
+
+**Keeping the items in the file removes the pipeline and satisfies this spec's own acceptance bar
+better than the original did.** The bar is that a closure be re-checkable from the repository alone;
+evidence on the line, in a tracked file, meets that more directly than evidence in a commit message
+that a reader must first know to look for.
+
+The cost is that `TODO.md` stops being "surviving work only". That was a preference, not a
+requirement, and it is worth less than the defects it generated.
 
 ## Edge cases
 
@@ -133,3 +170,20 @@ The surviving list decides the next plan. On current reading the natural candida
 follow-ups (24 items, of which three share one re-measurement and five are CI-only seed mutants) or
 the repository and CI hygiene group (7 items, small and independent). That choice is the owner's, and
 it is made **after** the triage, not before — which is the whole point of doing this first.
+
+## Stand-downs
+
+From the adversarial panel, rounds 1 to 3 (2026-09-22). This discipline has no ledger file, so the
+artifact carries its own record.
+
+- `DISCARDED-BELOW-FLOOR`: `<scratch>` used as a literal path in the plan's shell blocks — an executor
+  substitutes it, and the plan now defines it in its Conventions section.
+- `DISCARDED-BELOW-FLOOR`: `gh api` assuming an authenticated executor. Guarded: the only items it
+  touches are `UNVERIFIABLE` by construction anyway, so the assumption changes no verdict.
+- `UNVERIFIED-ACCEPTED`: the check script's positive controls (for example `grep -c "MoveFileEx"`)
+  were not confirmed by the reviewer against the real spec file, which it could not see. They are
+  verified in the plan instead, against `origin/main`.
+- **Process, recorded because it was mine:** round 2's do-not-re-raise ledger told the reviewer a
+  clobber guard had been folded. It had not — the fix lived in a script that aborted before writing.
+  The reviewer caught it in round 3. A ledger entry is a claim like any other and deserves the same
+  measurement as a finding.
