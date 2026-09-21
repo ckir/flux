@@ -70,13 +70,18 @@ not hold, stated with confidence, with no source, and the agent then argued *aga
    claim that has drifted from its quote is visible to anyone reading the row. It would have caught this
    page's own failure below with no fetch at all. Typing a reference because a blog post mentioned it is
    how a lead crosses into the Source column, and a quote is what that cannot survive.
+   **An absence claim has no sentence to quote**, and those are the load-bearing ones. Quote the place
+   that would have said it and give the bounds you searched - "§16 enumerates every operation, and none
+   of them is X" - so a reader can check the same place rather than take your word for the silence.
 5. **Record what makes it re-checkable, and what would end it.** A page that can change needs the date you
    read it; a long document needs the section, not just its number; a probe needs its command and what it
    printed. A probe you ran and did not record is indistinguishable later from one you imagined - without
    this the rule for unverified rows is stricter than the rule for verified ones, which is backwards.
    **And say what would put the row back to `unverified`**: the platform version it was true of, the
    paragraph that could be revised. A date nothing ever reads is filing, not verification - the row it
-   dates goes stale in place and still reads `verified`.
+   dates goes stale in place and still reads `verified`. The end condition has a reader and a moment:
+   **whoever next leans on the row, at the moment they lean on it.** That is the one time it is certain
+   to be read, so write it for that person rather than for an audit nobody schedules.
 6. **A refuted row is a result, not a failure.** If the source or the probe says the platform does NOT behave
    as assumed, say so in the row and follow what it costs: the design resting on it is now unsupported, and
    that is the whole return on doing this.
@@ -102,12 +107,18 @@ are **not** verified, because writing this table is what showed that nobody here
 | `rename` over an existing target is atomic to a reader | RFC 7530 §16.27 (RENAME). **Quote owed** - the section is located, the sentence is not transcribed | unverified; probe: read §16.27 and paste the sentence, or say it is not there |
 | A stale `unlink` removes whatever holds the name when the server runs it | RFC 7530 §16.26 (REMOVE). **Quote owed**, same reason | unverified; probe: read §16.26 and paste the sentence |
 | A failed `rename` proves the rename did not happen | - | unverified; probe: retransmit against a server with a duplicate-request cache |
+| A non-blocking lock attempt on an open handle succeeds exactly when no other process holds that lock | **Quote owed** - this is one of the two behaviours the agents above got wrong, and it had no row here at all until the count was checked | unverified; probe: `fcntl(F_SETLK)` from two processes on one file, local and on NFS |
 
-**5 rows, and here is why that is all of them:** they are every behaviour this protocol borrows from the
+**6 rows, and here is why that is all of them:** they are every behaviour this protocol borrows from the
 filesystem - the four calls it makes at the lock path (`rename`, `unlink`, the lock acquisition, the
-re-lock after a lapse) and the lease that underlies them. Walked by re-reading each filesystem call in the
-model and asking what it assumes. Step 9 without this line is the part everyone skips, which is why the
-example carries it.
+re-lock after a lapse), the lease that underlies them, and the one failure mode (`rename` that reports
+failure). Walked by re-reading each filesystem call in the model and asking what it assumes.
+
+**Write this paragraph and it audits itself.** Until this review it read "5 rows" and named the lock
+acquisition among them - and there was no lock-acquisition row. Five rows, five things listed, one of them
+not there and `rename` quietly counted twice. It looked right at a glance for as long as nobody set the
+list beside the table, which is the entire failure this page is about, committed in the paragraph whose
+job is to prevent it.
 
 Two rows moved from `verified` to `unverified` the moment the quote was asked for. They had said "RFC 7530"
 for months and nobody could have told from the table whether anyone had opened it. That is the rule earning
@@ -153,6 +164,12 @@ produces no other durable record (round 1, 2026-09-21).
   man-pages project itself. Guarded by the retrieval date beside it, which is what makes a mirror
   checkable - and step 4 now asks that of every row, so the guard is a rule rather than an accident of
   this one example.
+- `UNVERIFIED-ACCEPTED` (round 5, owner-capped): **no round of this review ever landed clean.** Five
+  rounds, 21 findings folded, one rejected; every round found a defect inside the previous round's
+  fixes, and round 5's three folds are themselves unreviewed. The owner capped the review here rather
+  than at a green round, so this page ships reviewed but not settled. Two rows of the Quick reference
+  carry **quote owed**: the RFC 7530 sections are located and the sentences are not transcribed. Do not
+  close those by writing a plausible sentence - fetch §16.26 and §16.27, or leave them owed.
 - `REJECTED` (round 3): that the core rule grants a rule-violating row "provisional" status. Measured -
   the reviewer quoted the round-1 wording, while the file it was sent says a row in no state is "weaker
   than provisional", which is the opposite. Superseded text, and the point was already in the
