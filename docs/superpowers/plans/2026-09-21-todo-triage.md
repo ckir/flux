@@ -75,7 +75,7 @@ lines=open('TODO.md',encoding='utf-8').read().splitlines()
 sec=None
 for i,l in enumerate(lines,1):
     if l.startswith('## '): sec=l[3:].strip()
-    elif l.startswith('- [ ]'): print(f'{i}\t{sec}\t{l[6:80]}')
+    elif l.startswith('- [ ]'): print(f'{i}\t{sec}\t{l[6:]}')
 " > <scratch>/items.tsv
 wc -l < <scratch>/items.tsv
 ```
@@ -87,6 +87,12 @@ Expected: `49`. If not 49, `main` has moved and the candidate list below must be
 ## Task 2: Pass one — the candidate list
 
 Pass one is reasoned, not measured, and is **already done**. Record it; do not re-derive it.
+**This deviates from the spec, deliberately.** `SPEC.md` describes pass one as part of the execution;
+doing it at authoring time is what makes this plan executable by someone with no context. Candidacy is
+not a verdict — it decides only what gets measured, and the bias is toward over-inclusion, so an error
+costs one extra measurement rather than a wrong closure. To have the executor do it blind instead,
+delete the list below and have them derive it from `items.tsv`; nothing downstream depends on who
+produced it.
 
 21 of 49 items are closure candidates. The other 28 are `LIVE` by default: all 8 of Phase 2 (no product
 code has been written), 3 of the 5 open decisions (a decision nobody has taken cannot be `DONE`), 2
@@ -132,8 +138,8 @@ Create `<scratch>/checks.sh`:
 
 ```bash
 set -u
-cd "$(dirname "$0")/todotriage"
-echo "=== L53 MSRV job ==="
+cd "$(dirname "$0")/todotriage" || { echo "FATAL: worktree missing - every check below would report NO MATCH from the wrong directory"; exit 1; }
+test -f TODO.md || { echo "FATAL: not at the worktree root"; exit 1; }
 grep -n "1\.85\|msrv\|MSRV\|toolchain" .github/workflows/ci.yml || echo "NO MATCH"
 echo "--- positive control (must print jobs:) ---"; grep -c "^jobs:" .github/workflows/ci.yml
 
@@ -170,6 +176,13 @@ grep -n "pendingUnlink" models/lockproto/algorithm.txt | head -5
 
 echo "=== L42 cargo-mutants ==="
 command -v cargo-mutants >/dev/null && echo INSTALLED || echo ABSENT
+grep -n "cargo-mutants" .claude/recommended-tools.json || echo "NOT DECLARED"
+
+# WARNING: the two checks above and the two below measure THE EXECUTOR'S MACHINE, not the
+# repository. The spec's bar is re-checkable from the repository alone, so L42 and L44 are
+# UNVERIFIABLE by construction, exactly like L24. What CAN be closed from the repository is the
+# adjacent half - whether cargo-mutants is declared in recommended-tools.json, and whether the
+# justfile carries a lefthook bootstrap recipe - which makes each a SPLIT, not a closure.
 
 echo "=== L44 lefthook ==="
 test -f .git/hooks/pre-push && echo "HOOK PRESENT" || echo "HOOK ABSENT"
@@ -230,8 +243,8 @@ Do not assign a verdict while running commands. Read `evidence.txt` end to end f
 - [ ] **Step 1: Seed the verdict file from the inventory**
 
 ```bash
-awk -F'	' '{print $1"	"$2"	LIVE	"}' <scratch>/items.tsv > <scratch>/verdicts.tsv
-wc -l < <scratch>/verdicts.tsv
+awk -F'\t' '{print $1"\t"$2"\t"$3"\tLIVE\t"}' <scratch>/items.tsv > <scratch>/verdicts.tsv
+awk -F'\t' 'NF!=5 {print "MALFORMED ROW:", NR}' <scratch>/verdicts.tsv
 ```
 
 Expected: `49`. Every item starts as `LIVE` with empty evidence, so an item can only leave that state
@@ -246,12 +259,19 @@ rows carry the reason they cannot be settled.
 - [ ] **Step 3: Check the acceptance bar mechanically**
 
 ```bash
-awk -F'\t' '$3=="DONE"||$3=="OVERTAKEN"||$3=="SPLIT"' <scratch>/verdicts.tsv | grep -c "" 
-awk -F'\t' '($3=="DONE"||$3=="OVERTAKEN"||$3=="SPLIT") && length($4)<20' <scratch>/verdicts.tsv
+awk -F'\t' '$4=="DONE"||$4=="OVERTAKEN"||$4=="SPLIT"' <scratch>/verdicts.tsv | grep -c "" 
+awk -F'\t' '($4=="DONE"||$4=="OVERTAKEN"||$4=="SPLIT") && $5 !~ /[A-Za-z0-9_.\/-]+:[0-9]+|[0-9a-f]{7,40}|`[^`]+`/' <scratch>/verdicts.tsv
 ```
 
-Expected: the second command prints **nothing**. Any row it prints is a closure whose evidence is too
-thin to be re-checked by someone else, which the spec says makes it `UNVERIFIABLE`, not closed.
+Expected: the second command prints **nothing**.
+
+**This is a structural test, not a length test.** An earlier draft asked only that the evidence field
+be 20 characters or more, which "the grep showed nothing" satisfies at 22 while being no evidence at
+all — a gate measuring effort instead of substance is the compliance theatre this plan exists to
+avoid. The regex demands one of three shapes a reader can follow: a `file:line` reference, a commit
+sha of 7 to 40 hex characters, or a backtick-quoted command or output. **Do not widen it to make a
+row pass**; widen it only if a legitimate evidence shape is genuinely missing, and say so in the
+commit message.
 
 - [ ] **Step 4: Confirm the count**
 
@@ -270,7 +290,39 @@ Expected: `49`.
 
 - [ ] **Step 1: Remove closed items and rewrite `SPLIT` items to their live half**
 
-Delete the lines of every `DONE` and `OVERTAKEN` item. For each `SPLIT`, replace the item with its
+**First, print what is about to be destroyed and read it.**
+
+```bash
+awk -F'\t' '$4=="DONE"||$4=="OVERTAKEN"' <scratch>/verdicts.tsv | cut -c1-160
+```
+
+This is the last point at which a wrong verdict is cheap.
+
+**Then delete BOTTOM-UP.** `verdicts.tsv` is keyed by line number, and removing a line shifts every
+line beneath it — so a top-down pass would, from the second deletion onward, hit whatever slid into
+the recorded position and silently destroy items nobody evaluated.
+
+```bash
+awk -F'\t' '$4=="DONE"||$4=="OVERTAKEN" {print $1}' <scratch>/verdicts.tsv | sort -rn > <scratch>/kill.txt
+wc -l < <scratch>/kill.txt
+python - <<'EOF'
+kill = [int(x) for x in open(r"<scratch>/kill.txt")]
+lines = open("TODO.md", encoding="utf-8").read().splitlines(keepends=True)
+for n in kill:                       # descending already
+    assert lines[n-1].startswith("- [ ]"), f"line {n} is not an item: {lines[n-1]!r}"
+    end = n
+    while end < len(lines) and lines[end].startswith("      "):
+        end += 1
+    del lines[n-1:end]
+open("TODO.md", "w", encoding="utf-8").writelines(lines)
+EOF
+```
+
+The `assert` is the guard: if a recorded line no longer points at an item, the mapping has already
+drifted and the script stops rather than deleting something arbitrary.
+
+- [ ] **Step 2: Rewrite each `SPLIT` item to its live half**
+
 live half only, rewritten as a standalone item that does not reference the closed half.
 
 - [ ] **Step 2: Add the pointer line**
@@ -278,7 +330,7 @@ live half only, rewritten as a standalone item that does not reference the close
 Directly under the `# TODO` heading's intro line, add:
 
 ```markdown
-Last triaged 2026-09-21 (commit `<sha>`): <N> items closed, <M> remain. The verdicts and the
+Last triaged 2026-09-22 (commit `PENDING`): <N> items closed, <M> remain. The verdicts and the
 measurement behind each closure are in that commit's message — this file keeps only surviving work.
 ```
 
@@ -289,7 +341,7 @@ claimed a promoted count that was wrong by two; do not repeat that.
 
 ```bash
 grep -c "^- \[ \]" TODO.md
-awk -F'\t' '$3=="LIVE"||$3=="UNVERIFIABLE"' <scratch>/verdicts.tsv | wc -l
+awk -F'\t' '$4=="LIVE"||$4=="UNVERIFIABLE"' <scratch>/verdicts.tsv | wc -l
 ```
 
 Expected: the two numbers are **equal**, and equal to `<M>`. If they differ, an item was dropped or
@@ -322,12 +374,10 @@ the analysis commit; unstage it for Task 8.
 ```bash
 python - <<'EOF' > <scratch>/triage-message.txt
 import collections
-rows = [l.rstrip("
-").split("	") for l in open(r"<scratch>/verdicts.tsv", encoding="utf-8")]
+rows = [l.rstrip("\n").split("\t") for l in open(r"<scratch>/verdicts.tsv", encoding="utf-8") if l.strip()]
 by = collections.defaultdict(list)
-for line, sec, verdict, ev in rows:
-    by[verdict].append((line, sec, ev))
-closed = sum(len(by[v]) for v in ("DONE", "OVERTAKEN", "SPLIT"))
+for line, sec, text, verdict, ev in rows:
+    by[verdict].append((line, sec, text, ev))
 print("docs(todo): triage the 49 open items")
 print()
 print(f"{closed} closed, {len(rows)-closed} remain. Every closure carries the measurement that")
@@ -337,9 +387,9 @@ for v in ("DONE", "OVERTAKEN", "SPLIT", "UNVERIFIABLE", "LIVE"):
         continue
     print()
     print(f"{v} ({len(by[v])})")
-    for line, sec, ev in by[v]:
-        print(f"  TODO.md:{line}  [{sec}]  {ev}")
-EOF
+    for line, sec, text, ev in by[v]:
+        print(f"  TODO.md:{line}  [{sec}]  {text}")
+        print(f"        evidence: {ev}")
 head -12 <scratch>/triage-message.txt
 ```
 
@@ -350,8 +400,23 @@ Task 6's pointer line — if they disagree, one of them was written from memory.
 
 ```bash
 git commit -F <scratch>/triage-message.txt
-git log -1 --format=%B | head -20
+sha=$(git rev-parse --short HEAD)
+python - "$sha" <<'EOF'
+import sys, io
+t = io.open("TODO.md", encoding="utf-8").read()
+assert "commit `PENDING`" in t, "pointer line missing or already amended"
+io.open("TODO.md", "w", encoding="utf-8").write(t.replace("commit `PENDING`", "commit `%s`" % sys.argv[1], 1))
+EOF
+git add TODO.md && git commit --amend --no-edit
+grep -n 'Last triaged' TODO.md
+git rev-parse --short HEAD
 ```
+
+Expected: the pointer line names the commit that contains it. **Amending changes the hash**, so the
+last two commands must agree — if they do not, repeat the replacement with the new hash and amend
+again. This is the only self-reference in the plan and it cannot be written in one pass: an earlier
+draft had Task 6 write the hash of a commit Task 7 had not yet created.
+
 
 ---
 
