@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/ckir/flux/compare/v0.1.0...v0.1.1) - 2026-09-21
+
+### Build and CI
+
+- build the release binary from the package that defines it
+
 ## [0.1.0](https://github.com/ckir/flux/releases/tag/v0.1.0) - 2026-09-21
 
 ### Build and CI
