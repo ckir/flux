@@ -52,10 +52,12 @@ ForeignUntouched == foreignObj # NoObj => LockObj = foreignObj /\ fs.content[for
 \* BUSY for a lock it judged dead, or a Section 99 check (S99_check, S99_release_check, S21_1_s3) refusing with
 \* no cause: such a refusal is justified only by the ghost lostLock, set when another process's write, unlink,
 \* rename or replacement hit the lock file this process holds, or its lease lapsed (owner ruling for plan 3,
-\* 2026-09-15). EVERY refusing label now records the evidence of RefusalEvidence - there is no exception.
-\* S240_5_s6 used to be one, on a predicate that restated its own branch guard and so could never fail; that
-\* label no longer refuses at all (240.5 step 6, amended 2026-09-17), which is why the exception is gone
-\* rather than fixed. The refusing label records its evidence because the refusal may be reported after what it saw has changed: the
+\* 2026-09-15). So the evidence comes in THREE families, and the Section 99 checks named just above are one
+\* of them: `lostLock[self]` at S99_check, S99_release_check and S21_1_s3; `RefusalEvidence(self)` at
+\* S96_1_backoff, S21_1_decide, rec_decide, S251_1_classify and S21_1_restart_decide; and a disjunction of
+\* RefusalEvidence with a local observation at S240_5_s3 and S240_5_s5. What is gone is the EXCEPTION:
+\* S240_5_s6 used to restate its own branch guard and so could never fail, and that label no longer refuses
+\* at all (240.5 step 6, amended 2026-09-17). The refusing label records its evidence because the refusal may be reported after what it saw has changed: the
 \* refusal rests on what the classifier observed, not on a re-read.
 RefusalJustified == \A p \in Procs : refused[p] = "TARGET_LOCK_BUSY" => refusedOk[p]
 
@@ -67,10 +69,15 @@ NeverInflightLandedAfterTakeover == ~landedAfterTakeover
 NeverChecked == \A p \in Procs : ~checked[p]
 NeverRecoveredAfterCrash == ~recoveredAfterCrash
 \* The 235.1 capability refusal itself. Without verified OS-native locks, an operation that needs target
-\* exclusivity refuses outright - six sites do it, all guarded by `~SEED_NO_CAPABILITY_GATE`. The suite's
-\* only LockCapability = "weak" run sets that seed, to prove SingleWriter catches the BYPASS, so until
-\* this witness existed nothing exercised the refusal - while the README said the seeded run covered it
-\* (capstone finding, plan 3).
+\* exclusivity refuses outright. FIVE sites assign REMOTE_LOCK_UNSAFE, one per process kind (own_start,
+\* plain_start, rec_start, clean_start, brk_start), each guarded by `~SEED_NO_CAPABILITY_GATE`. A sixth
+\* site, S240_5_s1, is 240.5 step 1's CAPABILITY CHECK, not 235.1's refusal: it reports
+\* TARGET_LOCK_UNCERTAIN, this invariant cannot see it, and its capability disjunct is DEAD in every
+\* expressible configuration - TakeOver has one caller, behind brk_start's else arm, which already
+\* requires the gate not to fire. Earlier weak runs SET the seed, to prove SingleWriter catches the
+\* bypass, so the refusal itself went unexercised while the README said otherwise. A witness halts at the
+\* first violating state, so one run per process kind is what actually reaches all five (capstone, plan 3,
+\* rounds 4 and 5 - round 4's single witness reached one).
 NeverRefusedUnsafe == \A p \in Procs : refused[p] # "REMOTE_LOCK_UNSAFE"
 \* A host crash changed which object the lock path names: an unflushed create, move-aside or removal
 \* was undone. Label coverage cannot show this, because the host crash shares `env_loop` with the

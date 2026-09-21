@@ -131,14 +131,15 @@ kinds at once do not finish, so the check runs pair them, and each pairing is ex
   because a second pass starts from a state the first already explored. Nothing in the model takes a next
   pass, so a spec sentence whose justification rests on one ("the next pass classifies it") is not modelled.
 - `MaxObjs` (3 to 6, one per actor) cannot bind. Every actor makes at most one exclusive create, and
-  `fs.next <= Cardinality(Procs)` was checked over the whole state space of the tightest run.
+  `fs.next <= Cardinality(Procs)` was checked over the whole state space of the tightest run - ONCE, as a
+  measurement. Nothing enforces it now: no invariant asserts that bound, so an edit giving an actor a
+  second create would make `MaxObjs` start binding and `FsCreate` start failing, silently, rather than
+  erroring (capstone, plan 3). Making it an invariant is the obvious fix and is not done yet.
 - `IdentityStrength = "strong"` only. Measured, the weak-identity variant explores an identical state graph here,
   because no name in this scenario is reused.
-- `LockCapability = "strong"` only. The weak capability refuses every operation under 235.1. TWO runs cover
-  that between them, and it is worth knowing which does what: `breaklock`'s seeded run sets
-  `SEED_NO_CAPABILITY_GATE` to BYPASS the refusal and show `SingleWriter` catches the bypass, so it does
-  NOT exercise the refusal - `breaklock-posix-weakcap-witness-NeverRefusedUnsafe` is the run that does.
-  Until that witness was added this line claimed the seeded run covered the refusal, and nothing did.
+- `LockCapability = "strong"` only in these runs. The weak capability refuses every operation under 235.1;
+  what covers that refusal belongs to `breaklock`, not here, and is described under "The 235.1 refusal"
+  below.
 - `HostCrashes = FALSE` in these runs, so only process crashes are explored here. Host crashes have their own
   slower tier, `expected-extended.toml`, run by `.github/workflows/model-extended.yml` nightly, on request, and on a
   pull request labelled `model-extended`. It holds the same four pairings with `HostCrashes = TRUE` on each platform.
@@ -152,6 +153,34 @@ kinds at once do not finish, so the check runs pair them, and each pairing is ex
   holds over 1,894,344 distinct states and is untightened: timed twice on CI at 258-261s before the `Foreign`
   start state added 24,810 states, it fits its 30-minute
   limit several times over.
+
+## The 235.1 refusal, and what covers it
+
+Without verified OS-native locks an operation that needs target exclusivity refuses outright. FIVE sites
+assign `REMOTE_LOCK_UNSAFE`, one per process kind - `own_start`, `plain_start`, `rec_start`,
+`clean_start`, `brk_start` - each guarded by `~SEED_NO_CAPABILITY_GATE`.
+
+`breaklock`'s seeded run SETS that seed, to bypass the refusal and show `SingleWriter` catches the
+bypass. It therefore does NOT exercise the refusal, though the Bounds section used to say it did.
+
+Four witness runs do, one per process kind: `breaklock-posix-weakcap-witness-NeverRefusedUnsafe` (an
+Owner and two Breakers) plus the `-plain-`, `-rec-` and `-clean-` variants, each declaring exactly one
+actor. One run per kind is not tidiness: a witness has no `-continue`, so TLC halts at the FIRST
+violating state, and a run carrying several kinds proves only that one of them refused. Round 4 added a
+single witness and reached one site of five; round 5 added the rest.
+
+A sixth site, `S240_5_s1`, is 240.5 step 1's capability check rather than 235.1's refusal: it reports
+`TARGET_LOCK_UNCERTAIN`, and its capability disjunct is dead in every configuration this suite can
+express, because `TakeOver`'s only caller sits behind `brk_start`'s else arm, which already requires the
+gate not to fire.
+
+## A rule nothing enforces
+
+`algorithm.txt` states that each label performs at most ONE filesystem operation, so that no interleaving
+is hidden inside a label. **Nothing checks this.** Neither `pcal.trans`, nor `run.py`, nor any test counts
+the filesystem calls in a label, so an edit putting two in one label translates and runs, and quietly
+removes the interleavings the model exists to explore. Counting `Fs*(` calls per label is mechanical and
+is the obvious guard; it is not written yet (capstone, plan 3).
 
 ## Filesystem probes
 

@@ -429,6 +429,36 @@ constants = { Owners = ["o1"], Recoverers = [], PlainRuns = [], Cleanups = [], B
 timeout_minutes = 15
 
 [[run]]
+name = "breaklock-posix-weakcap-plain-witness-NeverRefusedUnsafe"
+module = "LockProtocol"
+config = "configs/breaklock-posix-weakcap-plain-witness-NeverRefusedUnsafe.cfg"
+scenario = "breaklock"
+kind = "witness"
+violated = ["NeverRefusedUnsafe"]
+constants = { Owners = [], Recoverers = [], PlainRuns = ["p1"], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "weak", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false }
+timeout_minutes = 10
+
+[[run]]
+name = "breaklock-posix-weakcap-rec-witness-NeverRefusedUnsafe"
+module = "LockProtocol"
+config = "configs/breaklock-posix-weakcap-rec-witness-NeverRefusedUnsafe.cfg"
+scenario = "breaklock"
+kind = "witness"
+violated = ["NeverRefusedUnsafe"]
+constants = { Owners = [], Recoverers = ["r1"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "weak", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false }
+timeout_minutes = 10
+
+[[run]]
+name = "breaklock-posix-weakcap-clean-witness-NeverRefusedUnsafe"
+module = "LockProtocol"
+config = "configs/breaklock-posix-weakcap-clean-witness-NeverRefusedUnsafe.cfg"
+scenario = "breaklock"
+kind = "witness"
+violated = ["NeverRefusedUnsafe"]
+constants = { Owners = [], Recoverers = [], PlainRuns = [], Cleanups = ["c1"], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "weak", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false }
+timeout_minutes = 10
+
+[[run]]
 name = "breaklock-posix-plain-check"
 module = "LockProtocol"
 config = "configs/breaklock-posix-plain-check.cfg"
