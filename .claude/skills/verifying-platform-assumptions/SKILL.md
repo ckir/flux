@@ -1,6 +1,6 @@
 ---
 name: verifying-platform-assumptions
-description: Use when a model, spec, design or implementation depends on how an external system behaves - a filesystem, kernel, network protocol, database or service - and especially when two readings of that behaviour are both plausible and one of them makes your design look safer.
+description: Use when a spec, design, model or protocol WRITES DOWN how an external system behaves - a filesystem, kernel, network protocol, database or service - so that later work rests on that claim. Especially when you feel no doubt about the claim, or when two readings are both plausible and one of them makes your design look safer. Also use it when a third exception is being accepted to the same invariant.
 ---
 
 # Verifying platform assumptions
@@ -90,6 +90,10 @@ not hold, stated with confidence, with no source, and the agent then argued *aga
 | "It's a detail, the protocol is what matters" | Every measured error of this kind had already changed a decision before it surfaced. |
 
 ## The companion rule
+
+This one is here rather than in its own page because it comes from the same place: an invariant is a claim
+about a system, and the exceptions are what you pay when the claim is not quite the one you meant. The
+frontmatter routes here for it, so it is reachable on its own.
 
 **When a third exception is accepted to the same invariant, the invariant is the problem.** Two accepted
 windows is a protocol with caveats; three means you are defending a proxy for the property you actually care
