@@ -26,7 +26,7 @@ CONSTANTS
 
 ASSUME Platform \in {"posix", "windows"}
 ASSUME IdentityStrength \in {"strong", "weak"}
-ASSUME LockCapability \in {"strong", "weak"}
+ASSUME LockCapability \in {"strong", "remote", "weak"}
 ASSUME MaxObjs \in Nat \ {0}
 ASSUME NoProc \notin Procs
 ASSUME DOMAIN Fold = Names
@@ -164,9 +164,28 @@ FsClose(fs, p, o) ==
 
 \* The OS-native lock, scoped to the handle that takes it (probe FS-11) and unavailable when the
 \* capability is weak (Section 235.1).
+\*
+\* This does NOT model a poisoned descriptor. A lock lost to a lapsed lease leaves the kernel's
+\* NFS_LOCK_LOST state on the descriptor, so the holder cannot take that lock back through it - it must
+\* close the file and open it again (design Section 5.3). `FsLeaseExpiry` only clears `oslock`, so this
+\* operator would happily hand the lapsed holder its lock back on the same handle. What makes that sound
+\* is the PROTOCOL, not this primitive, and in two parts - NOT, as this comment first claimed, because
+\* every caller locks an object it has just opened. Two of the four sites are re-entered from a wait
+\* loop (`S96_1_ownlock_wait`, `S240_3_s4_lock_wait`), with any number of environment steps - lease
+\* expiries included - in between. What holds instead: (a) a wait label is reachable ONLY from a FAILED
+\* try-lock, so the caller has never held that object's lock and nothing of its can have lapsed; and
+\* (b) once a try-lock succeeds the control flow is strictly forward, with no edge back to the lock
+\* label. The one label that did retake a lapsed lock was deleted on 2026-09-16. A new caller that
+\* re-locks a descriptor whose lease lapsed would be admitted here and would be wrong - add the
+\* poisoned state before writing one (capstone finding, plan 3).
 FsTryLock(fs, p, o) ==
     IF o = NoObj \/ LockCapability = "weak" \/ ~OpenBy(fs, p, o) \/ fs.oslock[o] # NoProc THEN Fail(fs)
     ELSE Ok([fs EXCEPT !.oslock[o] = p], o)
+
+\* A remote lock's lease lapses (design Section 5.1): the lock is gone, the holder keeps its handle and
+\* is not told.
+FsLeaseExpiry(fs, o) ==
+    IF o = NoObj \/ fs.oslock[o] = NoProc THEN Fail(fs) ELSE Ok([fs EXCEPT !.oslock[o] = NoProc], o)
 
 FsUnlock(fs, p, o) ==
     IF o = NoObj \/ fs.oslock[o] # p THEN Fail(fs) ELSE Ok([fs EXCEPT !.oslock[o] = NoProc], o)
@@ -177,6 +196,19 @@ FsUnlock(fs, p, o) ==
 FsRenameNoReplace(fs, d, from, to) ==
     LET o == At(fs, d, from) IN
     IF o = NoObj \/ Exists(fs, d, to) \/ ~DeleteAllowed(fs, o) THEN Fail(fs)
+    ELSE Ok([ fs EXCEPT
+                !.entries[d][ClassOf(from)] = NoObj,
+                !.entries[d][ClassOf(to)] = o,
+                !.past[d][ClassOf(to)] =
+                    IF IdentityStrength = "weak" THEN @ \cup {o} ELSE @ ], o)
+
+\* Rename, replacing (design Section 5.1): atomically points the target at the source object whether or
+\* not the target existed; the replaced object keeps its open handles and loses its name. Windows needs
+\* delete sharing on every handle of both objects.
+FsRenameReplace(fs, d, from, to) ==
+    LET o == At(fs, d, from)
+        old == At(fs, d, to) IN
+    IF o = NoObj \/ ~DeleteAllowed(fs, o) \/ (old # NoObj /\ ~DeleteAllowed(fs, old)) THEN Fail(fs)
     ELSE Ok([ fs EXCEPT
                 !.entries[d][ClassOf(from)] = NoObj,
                 !.entries[d][ClassOf(to)] = o,
@@ -241,10 +273,10 @@ FsListStep(fs, d, n) == Exists(fs, d, n)
 \* ------------------------------------------------------------------------------------------
 \* Crashes (design Section 5.2)
 
-\* A process crash: its handles, their sharing restrictions and its OS-native locks go; content
-\* stays as it is, so an interrupted record write stays Torn. Its in-flight calls are not resolved
-\* here: each lands or is dropped later, which is what `FsLand`/`FsDrop` are for.
-FsProcCrash(fs, p) ==
+\* Closing every handle a process holds: the handles, their sharing restrictions and its OS-native
+\* locks go, and on Windows a pending-delete object whose last handle this was loses its name. A
+\* process that stops after a failed Section 99 check does this, and so does a process crash.
+FsCloseAll(fs, p) ==
     LET mine == {h \in fs.handles : h.proc = p}
         gone == {h.obj : h \in mine}
         last(o) == {h \in fs.handles \ mine : h.obj = o} = {}
@@ -257,6 +289,11 @@ FsProcCrash(fs, p) ==
            !.entries = [d \in Dirs |-> [c \in Classes |->
                           IF <<d, c>> \in names THEN NoObj ELSE fs.entries[d][c]]],
            !.deleted = @ \ {o \in fs.deleted : o \in gone /\ last(o)} ]
+
+\* A process crash closes everything the process holds; content stays as it is, so an interrupted
+\* record write stays Torn. The protocol resolves its in-flight calls in the same step (design
+\* Section 5.2), with `FsLand` and `FsDrop`.
+FsProcCrash(fs, p) == FsCloseAll(fs, p)
 
 \* A host crash. Every object written since its last flush takes one of: its old durable content,
 \* its latest content, or Torn, chosen per object (`pick`). Entry operations since the last

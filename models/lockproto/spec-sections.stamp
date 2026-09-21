@@ -3,6 +3,7 @@ spec: FLUX_FULL_UPDATED_SPEC_V16.md
 ## 96.1 Name-Equivalent Target Locks
 ## 96.2 Lock Refusal Reports the Holder
 # 99. Commit-Time Lock Revalidation
+## 235.1 Capability Classes
 ## 240.1 Recovery Decision Order
 ## 240.2 Live Owner
 ## 240.3 Demonstrably Abandoned Owner

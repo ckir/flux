@@ -34,7 +34,7 @@
 #
 # Headings enter the stamp as the model encodes them (plan 2 onward).
 
-planned_scenarios = ["breaklock", "mixed", "cleanup", "cleanup-crash", "nested", "dirlock", "claims"]
+planned_scenarios = ["cleanup", "cleanup-crash", "nested", "dirlock", "claims"]
 
 [[unit]]
 heading = "## 21.1 Existing Operation State Without `--resume`"
@@ -126,9 +126,8 @@ heading = "## 21.1 Existing Operation State Without `--resume`"
 ordinal = 13
 quote = "1. acquire the prior operation's lock without waiting (a dead owner's"
 hash = "10bc1c6eb532112f84694c8649abf4b01ae4c05a8e4089f21edb9b5043a3e02e"
-labels = ["S240_1_open", "S240_1_trylock", "S240_1_read", "S240_1_close", "S240_3_s1", "S240_3_s2", "S240_3_s3", "S240_3_s4", "S240_3_s4_lock", "S240_3_s4_record_begin", "S240_3_s4_record_end", "S240_3_restart"]
+labels = ["S240_1_open", "S240_1_trylock", "S240_1_read", "S240_1_close", "S240_3_s1", "S240_3_s2", "S240_3_s3", "S240_3_s4", "S240_3_s4_lock", "S240_3_s4_record_begin", "S240_3_s4_record_end", "S240_3_restart", "S21_1_restart_decide", "S240_5_s1", "S240_5_s2", "S240_5_s3", "S240_5_s4", "S240_5_s5", "S240_5_s6"]
 not_modelled = "the model refuses TARGET_LOCK_BUSY generically and does not distinguish OPERATION_LOCKED as a separate code"
-pending = ["breaklock"]
 
 [[unit]]
 heading = "## 21.1 Existing Operation State Without `--resume`"
@@ -142,7 +141,7 @@ heading = "## 21.1 Existing Operation State Without `--resume`"
 ordinal = 15
 quote = "3. revalidate ownership and locks (Section 99)"
 hash = "2e2c0b257756369a3304969102ddaf4a3816f4706875b727f14e2f66d70e67fe"
-labels = ["S99_check", "S99_write", "S99_release", "S99_close"]
+labels = ["S99_check", "S99_write", "S99_release", "S99_close", "S21_1_s3", "S21_1_s3_refuse_close"]
 
 [[unit]]
 heading = "## 21.1 Existing Operation State Without `--resume`"
@@ -156,7 +155,7 @@ heading = "## 21.1 Existing Operation State Without `--resume`"
 ordinal = 17
 quote = "5. start the new operation under"
 hash = "3095b782073bac3b3226b5cfaa0ba4e89fad2f1e775f3773927cca1d7889e0de"
-labels = ["S240_3_s4_record_begin", "S240_3_s4_record_end"]
+labels = ["S240_3_s4_record_begin", "S240_3_s4_record_end", "S21_1_s5_write_begin", "S21_1_s5_write_end"]
 
 [[unit]]
 heading = "## 21.1 Existing Operation State Without `--resume`"
@@ -247,8 +246,7 @@ heading = "## 96.1 Name-Equivalent Target Locks"
 ordinal = 10
 quote = "A Flux lock record is overwritten in place only by a `--break-lock`"
 hash = "978df397b3a0bebbc934718290b9ca34a7d5293441b0b4a72bd4ca4ab1265ade"
-labels = ["S240_3_s2"]
-pending = ["breaklock"]
+labels = ["S240_3_s2", "S240_5_s6_write_begin", "S240_5_s6_write_end"]
 
 [[unit]]
 heading = "## 96.1 Name-Equivalent Target Locks"
@@ -268,8 +266,8 @@ labels = ["S96_1_ownlock"]
 heading = "## 96.1 Name-Equivalent Target Locks"
 ordinal = 13
 quote = "Where the destination provides OS-native locks (Section 235.1), the"
-hash = "2e31dee7fefda0d3b01610d9040de9fddf5cdb2dd60836ba1e0c8706b07268b6"
-labels = ["S96_1_ownlock", "S96_1_ownlock_backoff", "S96_1_record_begin", "S96_1_record_end"]
+hash = "f89f79b57e4b9c3f383e51daa4776fe0b8b01d60b24b9e7f51ed1d8fcb6e9577"
+labels = ["S96_1_ownlock", "S96_1_ownlock_wait", "S96_1_ownlock_verify", "S96_1_ownlock_close", "S96_1_record_begin", "S96_1_record_end"]
 
 [[unit]]
 heading = "## 96.1 Name-Equivalent Target Locks"
@@ -334,7 +332,8 @@ heading = "## 96.1 Name-Equivalent Target Locks"
 ordinal = 22
 quote = "Exclusive creation on a remote filesystem is trusted only under the lock"
 hash = "4c938d58d5793215d3ce4f490bfff768e14740f101ea2ebfd106ef40c4c7a27b"
-pending = ["breaklock"]
+labels = ["S96_1_ownlock"]
+not_modelled = "the REMOTE_LOCK_UNSAFE refusal sits in each actor's start step, which has no spec-named label; S96_1_ownlock is the exclusive creation, attempted only under LockCapability strong or remote (RemoteStrong), where a lease can lapse"
 
 [[unit]]
 heading = "## 96.2 Lock Refusal Reports the Holder"
@@ -370,7 +369,8 @@ heading = "# 99. Commit-Time Lock Revalidation"
 ordinal = 3
 quote = "the worker must verify that its required ownership remains valid."
 hash = "23d3b2ad1c79c117338acf208bd044e4be57e57d741d89c12f77545720b5c7a9"
-labels = ["S99_check", "S99_release", "S99_close"]
+labels = ["S99_check", "S99_release_check", "S99_release", "S99_release_lands", "S99_close", "S99_refuse_close"]
+not_modelled = "the check before the release unlink is a reading: Section 99 lists unlink among the calls it guards but is about commit-time writes and never names releasing the lock (design Section 12, plan 3)"
 
 [[unit]]
 heading = "# 99. Commit-Time Lock Revalidation"
@@ -492,7 +492,7 @@ heading = "## 240.2 Live Owner"
 ordinal = 4
 quote = "A held native lock shows only that some process holds it."
 hash = "034b812a3976310c5edebdd729ad4b913787b56854d841c675bd32c8e4536b6a"
-labels = ["S240_1_read", "S96_1_ownlock_backoff"]
+labels = ["S240_1_read", "S96_1_ownlock_wait", "S96_1_ownlock_close", "S240_5_s3"]
 
 [[unit]]
 heading = "## 240.2 Live Owner"
@@ -540,8 +540,8 @@ labels = ["S240_3_s3", "S240_3_putback"]
 heading = "## 240.3 Demonstrably Abandoned Owner"
 ordinal = 6
 quote = "4. Create its own lock exclusively and take its OS-native lock (Section"
-hash = "09188902f8126011c3941f4cb6da6102774e7bd8d8a69a81f2f299b792117c6d"
-labels = ["S240_3_s4", "S240_3_s4_lock", "S240_3_s4_record_begin", "S240_3_s4_record_end", "S240_3_s4_drop", "S240_3_s4_lock_backoff"]
+hash = "c68707b84eb376031da041493a542c77231ede80140a3b4cfd32fb3cf2ecf59e"
+labels = ["S240_3_s4", "S240_3_s4_lock", "S240_3_s4_record_begin", "S240_3_s4_record_end", "S240_3_s4_drop", "S240_3_s4_lock_wait", "S240_3_s4_lock_verify", "S240_3_s4_lock_close"]
 
 [[unit]]
 heading = "## 240.3 Demonstrably Abandoned Owner"
@@ -619,70 +619,81 @@ heading = "## 240.4 Uncertain Ownership"
 ordinal = 9
 quote = "Explicit operator-directed recovery is `--break-lock` (Section 240.5)."
 hash = "970013469d41bdcd7cf20f101f4b1bdea5dfbd9b90806eee6b2a849e87405e24"
-pending = ["breaklock"]
+labels = ["S21_1_restart_decide", "S240_5_s1"]
 
 [[unit]]
 heading = "## 240.5 `--break-lock`"
 ordinal = 1
 quote = "`--break-lock` is valid with `flux copy --restart` and `flux cleanup"
 hash = "d47e0ddecc9bcc066308a74e08a6caa155397355d9cdcac06994cf067c7d46b8"
-pending = ["breaklock", "cleanup"]
+pending = ["cleanup"]
+labels = ["S21_1_restart_decide"]
 
 [[unit]]
 heading = "## 240.5 `--break-lock`"
 ordinal = 2
 quote = "Before acting, Flux reports the recorded holder's `owner_instance_id`,"
 hash = "f22d8b340430bb74f8be8ea1ba502cac9594dab13247f5d7b2002647d3c1ed8c"
-pending = ["breaklock", "cleanup"]
+pending = ["cleanup"]
+labels = ["S240_1_open", "S240_1_trylock", "S240_1_read", "S240_1_close", "S21_1_restart_decide"]
+not_modelled = "the report of the holder's fields is not modelled; the model keeps what the classification read (seenRec)"
 
 [[unit]]
 heading = "## 240.5 `--break-lock`"
 ordinal = 3
 quote = "1. The destination must provide strong file identity (Section 107) and"
 hash = "c308f74a8c0205d8817f6a1f4993396f1602fd7acc22dc94ba8d2f278dcc6987"
-pending = ["breaklock", "cleanup"]
+pending = ["cleanup"]
+labels = ["S240_5_s1"]
 
 [[unit]]
 heading = "## 240.5 `--break-lock`"
 ordinal = 4
 quote = "2. Open the existing lock file for writing, without creating it."
 hash = "775b080a7d1c13db6034705bc86423c0b75895359f22c3d8ab35c6e96bac6c37"
-pending = ["breaklock", "cleanup"]
+pending = ["cleanup"]
+labels = ["S240_5_s2"]
 
 [[unit]]
 heading = "## 240.5 `--break-lock`"
 ordinal = 5
 quote = "3. Take the OS-native lock on it without waiting."
 hash = "2bd2c5a7696da8c554795161fc23488b7376cca423ec40fb7493eaf79616711e"
-pending = ["breaklock", "cleanup"]
+pending = ["cleanup"]
+labels = ["S240_5_s3", "S240_5_close"]
 
 [[unit]]
 heading = "## 240.5 `--break-lock`"
 ordinal = 6
 quote = "4. Check that the open file is still the one at the lock path"
 hash = "6ab81361b3232eb80c9a7ee1ab8101fba4fdb0a1f71b340068169f85dfb29cbb"
-pending = ["breaklock", "cleanup"]
+pending = ["cleanup"]
+labels = ["S240_5_s4"]
 
 [[unit]]
 heading = "## 240.5 `--break-lock`"
 ordinal = 7
 quote = "5. Read the record. If it names a live owner, refuse with"
 hash = "6faace063b28fb5eb49d0848d9ba04e343206ed00a267b53cb92f794918f6060"
-pending = ["breaklock", "cleanup"]
+pending = ["cleanup"]
+labels = ["S240_5_s5"]
 
 [[unit]]
 heading = "## 240.5 `--break-lock`"
 ordinal = 8
 quote = "6. Overwrite the record in place with this operation's record in one"
-hash = "f0c9e42611e7803ca44a5f1ef7476ffd9c09fbf347f8536a37592d135b039e14"
-pending = ["breaklock", "cleanup"]
+hash = "e5bfeaf176d21663b37c45d727e22ad394d9743c42d68af845cfc227ad7e15c6"
+pending = ["cleanup"]
+labels = ["S240_5_s6_seed", "S240_5_s6_write_begin", "S240_5_s6_write_end", "S240_5_s6_flush", "S240_5_s6", "S240_5_seed_write_begin", "S240_5_seed_write_end", "S240_5_seed_rename"]
+not_modelled = "S240_5_s6_seed and the S240_5_seed_* labels run only with SEED_RENAME_OVER_TAKEOVER, the defect a rename over the lock re-introduces (design Section 8)"
 
 [[unit]]
 heading = "## 240.5 `--break-lock`"
 ordinal = 9
 quote = "An open, read, write, or flush that fails for another reason (an I/O or"
 hash = "06d1056ee655dfb4ea0209ed822013e645d9052547e04524f380b44f324a74ae"
-pending = ["breaklock", "cleanup"]
+pending = ["cleanup"]
+not_modelled = "I/O and permission errors of the takeover's calls are not modelled"
 
 [[unit]]
 heading = "## 240.5 `--break-lock`"
@@ -697,7 +708,8 @@ heading = "## 240.5 `--break-lock`"
 ordinal = 11
 quote = "A prior owner that was only stalled starts nothing more: its next lock"
 hash = "0d064cba024bbd4490bfe5f4009f68915a9386c3fa0add879a11aeb619ccae5d"
-pending = ["breaklock", "cleanup"]
+pending = ["cleanup"]
+labels = ["S99_check", "S99_refuse_close", "S240_5_inflight_lands", "S240_5_s6_write_end"]
 
 [[unit]]
 heading = "## 240.5 `--break-lock`"
@@ -883,7 +895,7 @@ heading = "## 259.6 Directory Target Lock Representation"
 ordinal = 10
 quote = "If the required target lock cannot be established, destination mutation must not proceed."
 hash = "9cd5145d31ffda58fba3933509c649796b522d33f972cbe01bdd389adedf260f"
-labels = ["S96_1_backoff", "S96_1_ownlock_backoff", "S99_check"]
+labels = ["S96_1_backoff", "S96_1_ownlock_wait", "S96_1_ownlock_close", "S99_check"]
 
 [[heading]]
 heading = "# 21. Resume Discovery"
@@ -901,7 +913,7 @@ not_modelled = "container heading; its own text carries no rule beyond the 96.1 
 heading = "## 99.1 Weak Filesystem Identity and Target Locks"
 family = "99"
 count = 1
-pending = ["mixed"]
+pending = ["dirlock"]
 
 [[heading]]
 heading = "# 240. Adjacent Lock Staleness and Liveness"
@@ -937,7 +949,7 @@ not_modelled = "the standalone catalog record is not modelled; the model has no 
 heading = "## 259.7 Weak Filesystem Identity"
 family = "259"
 count = 1
-pending = ["mixed"]
+pending = ["dirlock"]
 
 [[heading]]
 heading = "## 259.8 Commit Recovery With Weak Identity"
@@ -1022,3 +1034,55 @@ heading = "## 259.15 V15 Implementation Baseline"
 family = "259"
 count = 1
 not_modelled = "the V15 implementation baseline is outside the lock-protocol model's scope"
+
+[[unit]]
+heading = "## 235.1 Capability Classes"
+ordinal = 1
+quote = "The filesystem adapter exposes:"
+hash = "f312c6cc19e4767280e0c2be432697f625af158931a2626a2bf7b334d513f22d"
+not_modelled = "explanatory text; the classes it introduces are modelled in ordinals 2 and 3"
+
+[[unit]]
+heading = "## 235.1 Capability Classes"
+ordinal = 2
+quote = "enum LockCapability {"
+hash = "b2b456dda857f39ebd4c71395453d4eb9d97239e6d90ee2ca71cef46c4447f35"
+not_modelled = "the enum is abstracted into the model constant LockCapability: strong for LocalStrong, remote for RemoteStrong, weak for RemoteUnverified and Unsupported (design Section 5.1)"
+
+[[unit]]
+heading = "## 235.1 Capability Classes"
+ordinal = 3
+quote = "remote filesystem whose lock contract cannot be verified"
+hash = "5d38fb617798a292d85f4dc9fa0d534d6827fe3381e4da3b8b774b1b0b6f8931"
+labels = ["S240_5_s1", "S96_1_ownlock", "S240_3_s4_lock"]
+not_modelled = "the REMOTE_LOCK_UNSAFE refusal sits in each actor's start step, which has no spec-named label; the labels listed are the lock attempts made conditional on the capability, and 240.5 step 1's capability check"
+
+[[heading]]
+heading = "# 235. Remote Filesystem Lock Capability"
+family = "235"
+count = 1
+not_modelled = "container heading; its one sentence is the premise the 235.1 capability classes encode"
+
+[[heading]]
+heading = "## 235.2 Required Strong-Lock Properties"
+family = "235"
+count = 1
+not_modelled = "the properties are assumed by FsModel's operations table for LockCapability strong and remote (design Section 5.1); they are what the classes certify, not a protocol step"
+
+[[heading]]
+heading = "## 235.3 O_EXCL"
+family = "235"
+count = 1
+not_modelled = "exclusive creation is one atomic step in FsModel; whether a deployment provides it is what the capability class records"
+
+[[heading]]
+heading = "## 235.4 Remote Uncertainty"
+family = "235"
+count = 1
+not_modelled = "the same REMOTE_LOCK_UNSAFE refusal as the 235.1 table, modelled in each actor's start step"
+
+[[heading]]
+heading = "## 235.5 Lock Revalidation"
+family = "235"
+count = 1
+not_modelled = "restates the revalidation of Section 99, which is stamped and modelled (S99_check, S99_release_check)"
