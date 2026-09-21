@@ -65,16 +65,22 @@ not hold, stated with confidence, with no source, and the agent then argued *aga
 3. **Cite, refute, or mark.** A primary source is a specification, a manual page, the implementation's own
    source, or **a probe you actually ran** - not one you named. Another model's answer, a blog post, or your
    own recollection is a lead to check, never a source.
-4. **A refuted row is a result, not a failure.** If the source or the probe says the platform does NOT behave
+4. **Cite it so someone else can re-check it.** A row says `verified` long after everyone has forgotten how.
+   A page that can change needs the date you read it; a long document needs the section, not just its
+   number; and **a probe needs its command and what the command printed**, in the row or in something the
+   row links to. A probe you ran and did not record is indistinguishable later from a probe you imagined -
+   without this, the rule for unverified rows is stricter than the rule for verified ones, which is
+   backwards.
+5. **A refuted row is a result, not a failure.** If the source or the probe says the platform does NOT behave
    as assumed, say so in the row and follow what it costs: the design resting on it is now unsupported, and
    that is the whole return on doing this.
-5. **Check the self-serving ones first.** Of three such errors found in one project, every one was the
+6. **Check the self-serving ones first.** Of three such errors found in one project, every one was the
    reading that made the protocol look safer, and every one had already been built on by the time it surfaced.
-6. **An unverified row names the probe that would settle it** - concrete enough that someone else could
+7. **An unverified row names the probe that would settle it** - concrete enough that someone else could
    attempt it without asking you what you meant. "Write a test for it" is not a probe; a command, a named
    tool, or a setup someone could build is. Naming a probe does not verify anything; it records what is
    owed, and a vague one records nothing.
-7. **Say how many rows there are, and how you know that is all of them.** A list of zero borrowed behaviours
+8. **Say how many rows there are, and how you know that is all of them.** A list of zero borrowed behaviours
    satisfies every rule above and proves nothing - the commonest way this comes out green is by naming
    nothing. If the count is low, say which calls you went looking through to get it.
 
@@ -130,6 +136,11 @@ produces no other durable record (round 1, 2026-09-21).
 - `DISCARDED-BELOW-FLOOR`: "Absence claims are the easiest to check" (Rationalizations) overstates -
   proving a negative can be hard. Unreachable as a defect: the row is a rhetorical answer to an excuse,
   not a step any reader executes, and nothing in **The procedure** branches on it.
-- `DISCARDED-BELOW-FLOOR`: the one citation points at man7.org, a mirror, rather than at the Linux
-  man-pages project itself. Guarded by the retrieval date now beside it, which is what makes a mirror
-  checkable.
+- `DISCARDED-BELOW-FLOOR`: the man-page citation points at man7.org, a mirror, rather than at the Linux
+  man-pages project itself. Guarded by the retrieval date beside it, which is what makes a mirror
+  checkable - and step 4 now asks that of every row, so the guard is a rule rather than an accident of
+  this one example.
+- `REJECTED` (round 3): that the core rule grants a rule-violating row "provisional" status. Measured -
+  the reviewer quoted the round-1 wording, while the file it was sent says a row in no state is "weaker
+  than provisional", which is the opposite. Superseded text, and the point was already in the
+  do-not-re-raise ledger it had been given.
