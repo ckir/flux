@@ -225,4 +225,305 @@ mod tests {
         copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap();
         assert!(fs.called("create_new(/dst.flux-partial.op1)"), "{:?}", fs.calls());
     }
+
+    #[test]
+    fn a_strict_metadata_failure_prevents_publication() {
+        // §44.1, the rule this whole design exists to honour.
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.fail("set_times", flux_fs::Code::PermissionDenied);
+
+        let mut o = opts();
+        o.preserve_times = Preserve::Strict;
+        let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &o).unwrap_err();
+
+        assert_eq!(err.code, flux_fs::Code::MetadataApplyFailed);
+        assert!(!fs.called("rename_replace"), "must not publish; got {:?}", fs.calls());
+        assert!(!fs.exists("/dst"));
+        assert!(!fs.exists("/dst.flux-partial.op1"), "temporary must be removed");
+    }
+
+    #[test]
+    fn a_default_metadata_failure_still_publishes_and_reports() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.fail("set_times", flux_fs::Code::PermissionDenied);
+
+        let out = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap();
+
+        assert_eq!(out.metadata_failures.len(), 1);
+        assert_eq!(out.metadata_failures[0].item, flux_fs::MetadataItem::Times);
+        assert!(fs.called("rename_replace"), "best-effort still publishes");
+        assert!(fs.exists("/dst"));
+    }
+
+    #[test]
+    fn a_full_disk_does_not_publish_and_leaves_no_temporary() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.fail("create_new", flux_fs::Code::DiskFull);
+
+        let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap_err();
+
+        assert_eq!(err.code, flux_fs::Code::DiskFull);
+        assert!(!fs.called("rename_replace"));
+        assert!(!fs.exists("/dst.flux-partial.op1"));
+    }
+
+    #[test]
+    fn a_denied_publish_keeps_the_denial_code_and_removes_the_temporary() {
+        // The taxonomy says PERMISSION_DENIED is "the operating system denied access"
+        // and COPY_FAILED is "the content copy failed". At the publish step the content
+        // copy has already succeeded, so a denial here is a denial, not a copy failure.
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.fail("rename_replace", flux_fs::Code::PermissionDenied);
+
+        let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap_err();
+
+        assert_eq!(err.code, flux_fs::Code::PermissionDenied);
+        assert!(!fs.exists("/dst.flux-partial.op1"));
+    }
+
+    #[test]
+    fn an_unclassified_publish_failure_stays_io_error() {
+        // The publish step is not the content copy, so an unclassified failure here is
+        // the IO_ERROR catch-all rather than COPY_FAILED.
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.fail("rename_replace", flux_fs::Code::IoError);
+
+        let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap_err();
+
+        assert_eq!(err.code, flux_fs::Code::IoError);
+        assert!(!fs.exists("/dst.flux-partial.op1"));
+    }
+
+    #[test]
+    fn an_unclassified_write_failure_is_copy_failed() {
+        // COPY_FAILED's reachable producer, and the spec's own definition of it.
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.fail_write(std::io::Error::other("the device hiccupped"));
+
+        let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap_err();
+
+        assert_eq!(err.code, flux_fs::Code::CopyFailed);
+        assert!(!fs.called("rename_replace"), "must not publish");
+        assert!(!fs.exists("/dst.flux-partial.op1"));
+    }
+
+    #[test]
+    fn a_temporary_that_cannot_be_removed_is_named_in_the_error() {
+        // `discard` must not swallow a failed cleanup: a leftover nobody is told
+        // about is one the user cannot even find.
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.fail("rename_replace", flux_fs::Code::PermissionDenied);
+        fs.fail_always("remove_file", flux_fs::Code::PermissionDenied);
+
+        let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap_err();
+
+        let msg = err.source.to_string();
+        assert!(msg.contains("/dst.flux-partial.op1"), "must name the leftover; got {msg}");
+        assert!(msg.contains("injected"), "must carry why it could not be removed; got {msg}");
+    }
+
+    #[test]
+    fn a_missing_source_creates_nothing() {
+        let fs = FaultFs::new();
+        let err = copy_file(&fs, Path::new("/nope"), Path::new("/dst"), &opts()).unwrap_err();
+        assert!(!fs.called("create_new"), "nothing is created before the source is checked");
+        assert_eq!(err.code, flux_fs::Code::IoError);
+    }
+
+    #[test]
+    fn a_self_copy_is_refused_before_anything_is_touched() {
+        let fs = FaultFs::new();
+        fs.write_file("/a", b"hello");
+        let err = copy_file(&fs, Path::new("/a"), Path::new("/a"), &opts()).unwrap_err();
+        assert_eq!(err.code, flux_fs::Code::SafetyRejected);
+        assert!(fs.calls().is_empty(), "refuse before any call; got {:?}", fs.calls());
+    }
+
+    #[test]
+    fn a_source_that_changes_mid_copy_is_not_published() {
+        // Section 33: the result is not published.
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        // The fake re-reads metadata at step 6; growing the file between the two
+        // reads is what a real concurrent writer does.
+        fs.grow_on_second_metadata("/src", b" world");
+
+        let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap_err();
+
+        assert_eq!(err.code, flux_fs::Code::SourceChanged);
+        assert!(!fs.called("rename_replace"), "must not publish a stale copy");
+        assert!(!fs.exists("/dst.flux-partial.op1"));
+    }
+
+    #[test]
+    fn a_source_deleted_mid_copy_reports_source_changed() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.vanish_on_second_metadata("/src");
+
+        let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap_err();
+
+        assert_eq!(err.code, flux_fs::Code::SourceChanged);
+        assert!(!fs.called("rename_replace"), "must not publish");
+        assert!(!fs.exists("/dst.flux-partial.op1"));
+    }
+
+    #[test]
+    fn the_sources_metadata_survives_publication() {
+        // §44.1's whole point: metadata is applied to the temporary and must still be
+        // on the file after the rename. Asserting the CALLS happened does not show
+        // that, because a rename that dropped the metadata would call them just the
+        // same.
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.set_file_perms("/src", flux_fs::Perms::UnixMode(0o640));
+
+        copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap();
+
+        assert_eq!(fs.permissions("/dst"), Some(flux_fs::Perms::UnixMode(0o640)));
+    }
+
+    #[test]
+    fn preserve_off_does_not_touch_metadata_at_all() {
+        // The third state earns its keep here. `Off` is not a lenient `Default`, it is
+        // "do not attempt", and nothing else in the suite tells those apart: an
+        // implementation that treated `Off` as `Default` would pass every other test.
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        let mut o = opts();
+        o.preserve_times = Preserve::Off;
+        o.preserve_permissions = Preserve::Off;
+
+        copy_file(&fs, Path::new("/src"), Path::new("/dst"), &o).unwrap();
+
+        assert!(!fs.called("set_times"), "Off must not attempt it; got {:?}", fs.calls());
+        assert!(!fs.called("set_permissions"), "Off must not attempt it; got {:?}", fs.calls());
+        assert!(fs.called("rename_replace"), "the copy itself still publishes");
+    }
+
+    #[test]
+    fn a_special_file_source_is_refused_before_anything_is_created() {
+        // SPECIAL_FILE_UNSUPPORTED's producer. The spec's acceptance criteria require
+        // every variant to have a test that produces it.
+        let fs = FaultFs::new();
+        fs.add_special("/dev/null");
+
+        let err = copy_file(&fs, Path::new("/dev/null"), Path::new("/dst"), &opts()).unwrap_err();
+
+        assert_eq!(err.code, flux_fs::Code::SpecialFileUnsupported);
+        assert!(!fs.called("open_read"), "must refuse before opening it");
+        assert!(!fs.called("create_new"), "and before creating anything");
+    }
+
+    #[test]
+    fn a_leftover_from_this_invocation_is_swept_first() {
+        // Step 1 exists to remove this run's own leftover. Delete that line and this
+        // is the only test that notices.
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.write_file("/dst.flux-partial.op1", b"junk from a previous attempt");
+
+        copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap();
+
+        let calls = fs.calls();
+        assert_eq!(
+            calls.first().map(String::as_str),
+            Some("remove_file(/dst.flux-partial.op1)"),
+            "the sweep must come first; got {calls:?}"
+        );
+        assert_eq!(fs.read_file("/dst").as_deref(), Some(&b"hello"[..]));
+    }
+
+    #[test]
+    fn normal_durability_does_not_sync_and_strict_does() {
+        // Two runs, because the difference between them IS the option's meaning.
+        let lax = FaultFs::new();
+        lax.write_file("/src", b"hello");
+        copy_file(&lax, Path::new("/src"), Path::new("/dst"), &opts()).unwrap();
+        assert!(!lax.called("sync_all"), "Normal must not sync; got {:?}", lax.calls());
+
+        let strict = FaultFs::new();
+        strict.write_file("/src", b"hello");
+        let mut o = opts();
+        o.durability = Durability::Strict;
+        copy_file(&strict, Path::new("/src"), Path::new("/dst"), &o).unwrap();
+        assert!(strict.called("sync_all"), "Strict must sync; got {:?}", strict.calls());
+    }
+
+    #[test]
+    fn a_source_larger_than_the_buffer_copies_every_byte() {
+        // Every other test uses five bytes, so the read loop has only ever run once.
+        // The buffer is 64 KiB; this forces several iterations and a short final read.
+        let fs = FaultFs::new();
+        let big: Vec<u8> = (0..(64 * 1024 * 2 + 7)).map(|i| (i % 251) as u8).collect();
+        fs.write_file("/src", &big);
+
+        let out = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap();
+
+        assert_eq!(out.bytes_copied, big.len() as u64);
+        assert_eq!(fs.read_file("/dst").as_deref(), Some(&big[..]));
+    }
+
+    #[test]
+    fn a_zero_byte_source_copies_and_still_gets_metadata() {
+        // Named in TODO.md's integration-test item, so it gets a test of its own.
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"");
+        let out = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap();
+
+        assert_eq!(out.bytes_copied, 0);
+        assert!(fs.called("set_times"), "metadata still applies to an empty file");
+        assert!(fs.called("rename_replace"));
+    }
+
+    #[test]
+    fn no_replace_refuses_an_existing_target_and_cleans_up() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.write_file("/dst", b"existing");
+
+        let mut o = opts();
+        o.publish = Publish::NoReplace;
+        let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &o).unwrap_err();
+
+        // A target that already exists is a destination-side refusal, not a
+        // content-copy failure: the IO_ERROR catch-all until a later cut adds
+        // DESTINATION_ERROR.
+        assert_eq!(err.code, flux_fs::Code::IoError);
+        assert!(!fs.exists("/dst.flux-partial.op1"), "temporary must be removed");
+    }
+
+    #[test]
+    fn two_default_failures_produce_two_entries_and_still_publish() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.fail("set_times", flux_fs::Code::PermissionDenied);
+        fs.fail("set_permissions", flux_fs::Code::PermissionDenied);
+
+        let out = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap();
+
+        assert_eq!(out.metadata_failures.len(), 2);
+        assert!(fs.called("rename_replace"));
+    }
+
+    #[test]
+    fn strict_durability_failure_is_its_own_code() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.fail("sync_all", flux_fs::Code::IoError);
+
+        let mut o = opts();
+        o.durability = Durability::Strict;
+        let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &o).unwrap_err();
+
+        assert_eq!(err.code, flux_fs::Code::StrictDurabilityUnavailable);
+        assert!(!fs.called("rename_replace"));
+    }
 }
