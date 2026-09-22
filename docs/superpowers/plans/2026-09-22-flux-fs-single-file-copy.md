@@ -354,8 +354,8 @@ Add to `crates/flux-fs/src/lib.rs`:
 pub mod options;
 
 pub use options::{
-    CopyOptions, Durability, MetadataFailure, MetadataItem, OperationId, Outcome, Preserve, Publish,
-    temp_path,
+    CopyOptions, Durability, MetadataFailure, MetadataItem, OperationId, Outcome, Preserve,
+    Publish, temp_path,
 };
 ```
 
@@ -657,17 +657,22 @@ struct Inner {
     metadata_reads: HashMap<String, u32>,
     /// call name -> code, not consumed on use
     always: HashMap<String, Code>,
+    /// paths removed on the second `metadata` call
+    vanish: std::collections::HashSet<String>,
 }
 
 #[derive(Default)]
 pub struct FaultFs {
-    inner: Mutex<Inner>,
+    inner: std::sync::Arc<Mutex<Inner>>,
 }
 
 pub struct FakeHandle {
     path: String,
     buf: Vec<u8>,
     read_pos: usize,
+    /// Where writes land. `None` for a handle opened to read, so a reader cannot
+    /// mutate the fake's state even though both roles share this struct.
+    sink: Option<std::sync::Arc<Mutex<Inner>>>,
     sync_fault: std::sync::Arc<Mutex<Option<Code>>>,
 }
 
@@ -683,6 +688,13 @@ impl Read for FakeHandle {
 impl Write for FakeHandle {
     fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
         self.buf.extend_from_slice(b);
+        // Straight through to the fake's state. Without this the bytes died in the
+        // handle, `rename_*` published an empty file, and every test still passed
+        // because none of them looked at the content.
+        if let Some(sink) = &self.sink {
+            let mut g = sink.lock().unwrap();
+            g.files.entry(self.path.clone()).or_default().extend_from_slice(b);
+        }
         Ok(b.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -735,6 +747,18 @@ impl FaultFs {
         self.calls().iter().any(|c| c.starts_with(prefix))
     }
 
+    /// The bytes the fake currently holds for `path`.
+    pub fn read_file(&self, path: &str) -> Option<Vec<u8>> {
+        self.inner.lock().unwrap().files.get(path).cloned()
+    }
+
+    /// Delete a file the *second* time its metadata is read -- a source removed
+    /// while the copy was streaming.
+    pub fn vanish_on_second_metadata(&self, path: &str) {
+        let mut g = self.inner.lock().unwrap();
+        g.vanish.insert(path.to_string());
+    }
+
     /// Append to a file the *second* time its metadata is read — what a concurrent
     /// writer looks like from inside step 6.
     pub fn grow_on_second_metadata(&self, path: &str, extra: &[u8]) {
@@ -770,11 +794,13 @@ impl FileSystem for FaultFs {
         let buf = g.files.get(&p).cloned().ok_or_else(|| {
             FsError::new(Code::IoError, std::io::Error::from(std::io::ErrorKind::NotFound))
         })?;
-        // The reader never syncs; only the writer may consume the injected sync fault.
+        // The reader never syncs, and never writes: only the writer may consume the
+        // injected sync fault, and only the writer gets a sink.
         Ok(FakeHandle {
             path: p,
             buf,
             read_pos: 0,
+            sink: None,
             sync_fault: std::sync::Arc::new(Mutex::new(None)),
         })
     }
@@ -794,20 +820,35 @@ impl FileSystem for FaultFs {
         // `inner` again would DEADLOCK here -- `std::sync::Mutex` is not reentrant --
         // and every test that creates a temporary would hang forever.
         let sync_fault = std::sync::Arc::new(Mutex::new(g.faults.remove("sync_all")));
-        Ok(FakeHandle { path: p, buf: Vec::new(), read_pos: 0, sync_fault })
+        drop(g);
+        Ok(FakeHandle {
+            path: p,
+            buf: Vec::new(),
+            read_pos: 0,
+            sink: Some(std::sync::Arc::clone(&self.inner)),
+            sync_fault,
+        })
     }
 
     fn metadata(&self, path: &Path) -> Result<Metadata> {
         let p = path.display().to_string();
         self.record(format!("metadata({p})"), "metadata")?;
         let mut g = self.inner.lock().unwrap();
-        let n = g.metadata_reads.entry(p.clone()).or_insert(0);
-        *n += 1;
-        if *n == 2
+        // Copy the count out: holding the entry's `&mut` across the blocks below
+        // borrows `g` for too long, and they each need it again.
+        let reads = {
+            let c = g.metadata_reads.entry(p.clone()).or_insert(0);
+            *c += 1;
+            *c
+        };
+        if reads == 2
             && let Some(extra) = g.grow.get(&p).cloned()
             && let Some(b) = g.files.get_mut(&p)
         {
             b.extend_from_slice(&extra);
+        }
+        if reads == 2 && g.vanish.contains(&p) {
+            g.files.remove(&p);
         }
         let g = &*g;
         let len = g.files.get(&p).map(|b| b.len() as u64).ok_or_else(|| {
@@ -872,10 +913,14 @@ impl FileSystem for FaultFs {
 }
 ```
 
-Important: `FakeHandle` writes into its own buffer, so `copy_file` must flush it back. Rather than
-model that, the fake's `rename_*` moves whatever key exists — and Task 5's happy-path test asserts on
-the **call order**, not on byte contents. Byte fidelity is asserted end to end in **Task 8**, which
-runs the real binary against a real filesystem and compares the destination's bytes.
+Important: a writing `FakeHandle` commits straight through to the fake's state, so what
+`rename_replace` publishes is what was actually written. That is what lets Task 5's happy-path test
+assert the destination's CONTENT rather than only the call order — without it, a `copy_file` that
+wrote nothing at all would pass every test in this crate, because a rename of an empty file is still
+a rename. Byte fidelity is additionally asserted end to end in **Task 8**, against a real filesystem.
+
+A handle opened for reading carries no sink, so it cannot write to the fake's state even though both
+roles share the `FakeHandle` struct.
 
 Replace `crates/flux-core/src/lib.rs`:
 
@@ -939,7 +984,10 @@ mod tests {
         assert_eq!(out.bytes_copied, 5);
         assert!(out.metadata_failures.is_empty());
         assert!(fs.called("rename_replace"));
-        assert!(fs.exists("/dst"));
+        // The CONTENT, not just the call. Asserting only that a rename happened
+        // passes just as well against a copy that published nothing.
+        assert_eq!(fs.read_file("/dst").as_deref(), Some(&b"hello"[..]));
+        assert!(!fs.exists("/dst.flux-partial.op1"));
     }
 
     #[test]
@@ -1111,6 +1159,13 @@ pub fn copy_file<F: FileSystem>(
     //    still on disk, which is the one leak the `discard` helper exists to prevent.
     let now = match fs.metadata(src) {
         Ok(m) => m,
+        // Gone is the most complete form of "changed under us", and the taxonomy has
+        // a code for that. Reporting IO_ERROR here would hide it among unrelated
+        // failures.
+        Err(e) if e.source.kind() == std::io::ErrorKind::NotFound => {
+            let gone = std::io::Error::other("source disappeared during the copy");
+            return Err(discard(fs, &temp, Code::SourceChanged, gone));
+        }
         Err(e) => return Err(discard(fs, &temp, e.code, e.source)),
     };
     if now.len != src_meta.len || now.modified != src_meta.modified {
@@ -1303,6 +1358,19 @@ Inside the existing `mod tests` in `crates/flux-core/src/copy.rs`:
     }
 
     #[test]
+    fn a_source_deleted_mid_copy_reports_source_changed() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.vanish_on_second_metadata("/src");
+
+        let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap_err();
+
+        assert_eq!(err.code, flux_fs::Code::SourceChanged);
+        assert!(!fs.called("rename_replace"), "must not publish");
+        assert!(!fs.exists("/dst.flux-partial.op1"));
+    }
+
+    #[test]
     fn a_zero_byte_source_copies_and_still_gets_metadata() {
         // Named in TODO.md's integration-test item, so it gets a test of its own.
         let fs = FaultFs::new();
@@ -1359,7 +1427,7 @@ Inside the existing `mod tests` in `crates/flux-core/src/copy.rs`:
 - [ ] **Step 2: Run the tests**
 
 Run: `cargo nextest run -p flux-core --no-tests=pass`
-Expected: PASS, 18 tests. If `a_strict_metadata_failure_prevents_publication` fails, the ordering in
+Expected: PASS, 19 tests. If `a_strict_metadata_failure_prevents_publication` fails, the ordering in
 `copy_file` is wrong — fix the implementation, not the test.
 
 - [ ] **Step 3: Commit**
