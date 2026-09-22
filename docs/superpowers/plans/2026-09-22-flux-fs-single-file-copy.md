@@ -2166,7 +2166,7 @@ git commit -m "spec: name the replacing-rename API for publication (§241.5)"
 there stages nothing, and Task 11's pull request promises these limitations to a reader who would
 never see them. They are tracked work, and `TODO.md` is where this repository tracks work.
 
-- [ ] **Step 1: Append the three limitations to `TODO.md`, under `## Phase 2 — portable copy (next)`**
+- [ ] **Step 1: Append the four limitations to `TODO.md`, under `## Phase 2 — portable copy (next)`**
 
 ```markdown
 ### Known limits of the first single-file copy (2026-09-22)
@@ -2213,7 +2213,7 @@ never see them. They are tracked work, and `TODO.md` is where this repository tr
 
 ```bash
 git add TODO.md
-git commit -m "docs(todo): the three known limits of the first copy implementation"
+git commit -m "docs(todo): the four known limits of the first copy implementation"
 ```
 
 Expected: one file changed. If `git status` shows nothing staged, the append did not land — stop and
@@ -2243,7 +2243,7 @@ gh pr create --base main --title "feat: flux-fs trait surface and single-file co
 ```
 
 Body: what now works (`flux copy` copies a file), the §44.1 ordering and the test that proves it, the
-spec amendment, and the three limitations Task 10 added to `TODO.md`.
+spec amendment, and the four limitations Task 10 added to `TODO.md`.
 
 ---
 
