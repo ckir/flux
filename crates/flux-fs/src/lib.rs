@@ -3,3 +3,10 @@
 pub mod error;
 
 pub use error::{Code, FsError, Result};
+
+pub mod options;
+
+pub use options::{
+    CopyOptions, Durability, MetadataFailure, MetadataItem, OperationId, Outcome, Preserve,
+    Publish, temp_path,
+};
