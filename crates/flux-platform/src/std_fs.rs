@@ -48,6 +48,13 @@ pub struct StdFileSystem;
 /// user, `cp` refuses it with "Permission denied", and `rename(2)` replaces it anyway,
 /// because rename consults the DIRECTORY's permission and never the file's. So ask the
 /// question `cp` asks -- can WE write this name?
+///
+/// KNOWN AND UNCLOSEABLE: this is check-then-act, so a permission change landing between
+/// the probe and the `rename` is not seen, and the OS is no backstop -- `rename` is
+/// exactly what does NOT consult the file. The race cannot be closed through `std`,
+/// whose `rename` takes paths rather than the handle we probed with, and neither
+/// platform offers a "rename only if I may replace the target" primitive. `cp` carries
+/// the same window. Recorded rather than papered over.
 #[cfg(unix)]
 fn destination_is_write_protected(to: &Path) -> bool {
     use rustix::fs::{Access, AtFlags, CWD, accessat};
@@ -83,15 +90,23 @@ fn destination_is_write_protected(to: &Path) -> bool {
 /// attribute check would also have left this platform refusing where Unix allows and
 /// allowing where Unix refuses -- the very divergence the guard exists to remove.
 ///
-/// Opening for write asks the real security question, and it SUBSUMES the attribute:
-/// measured `raw_os_error() == Some(5)` (`ERROR_ACCESS_DENIED`) for an ACL-denied file
-/// AND for a read-only one, and `None` for a plain writable one.
+/// So it asks the OS instead, with a `DELETE`-access probe, AND keeps the attribute
+/// check -- measured across four cases, neither alone is sufficient:
+///
+/// ```text
+///                  .write(true)   .access_mode(DELETE)   attribute
+/// ACL denies W,D    Some(5)        Some(5)               false
+/// read-only attr    Some(5)        None                  true
+/// plain writable    None           None                  false
+/// held FileShare    Some(32)       Some(32)              false
+/// ```
+///
+/// The TOCTOU note on the Unix twin applies here too.
 #[cfg(windows)]
 fn destination_is_write_protected(to: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
     /// `ERROR_ACCESS_DENIED`.
     const ACCESS_DENIED: i32 = 5;
-
-    use std::os::windows::fs::OpenOptionsExt;
     /// The Win32 `DELETE` right, which is what `rename` actually needs on the target.
     const DELETE: u32 = 0x0001_0000;
 
@@ -110,9 +125,12 @@ fn destination_is_write_protected(to: &Path) -> bool {
         // HYDRATE an offline file -- a blocking download -- merely to answer a
         // permission question.
         //
-        // Only `ERROR_ACCESS_DENIED` counts. `ERROR_SHARING_VIOLATION` means somebody
-        // else holds the file open, which is not a protection; refusing there would fail
-        // a legitimate copy. Same allow-list discipline as the Unix arm's errnos.
+        // Only `ERROR_ACCESS_DENIED` counts. MEASURED, with a control that signalled only
+        // once the handle was actually open: a file held with `FileShare::None` gives
+        // code 32, `ERROR_SHARING_VIOLATION`, from BOTH probes. That is somebody else
+        // holding the file, not a protection, so it must not refuse -- let `rename`
+        // report the sharing violation itself. Same allow-list discipline as the Unix
+        // arm's errnos. See the TOCTOU note on the Unix twin, which applies here too.
         Ok(m) => {
             m.permissions().readonly()
                 || std::fs::OpenOptions::new()
