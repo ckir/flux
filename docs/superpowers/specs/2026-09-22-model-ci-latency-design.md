@@ -199,6 +199,10 @@ So verification is run-level, not job-level:
    collapses every posix scenario into one bucket and tells you nothing. This grouping reproduces
    the ten entries `--list-jobs` emits, which is how you know it models the right thing:
 
+   Needs **Python 3.11 or newer** locally, for `tomllib`. The repository targets 3.14 and the
+   workflows pin `python-version: "3.14"`, so this matches CI; it is stated because the command is
+   run on a developer machine, where the default interpreter may be older.
+
    ```bash
    python - <<'EOF'
    import tomllib, pathlib, collections
@@ -235,8 +239,13 @@ So verification is run-level, not job-level:
 3. **`run.py --list-jobs` and the extended-tier equivalent** still run, but only to confirm the
    matrix parses and gains the `posix-fixed` entry. They are a syntax check, not the oracle.
 3. **`models/lockproto/test_run.py` and `test_workflow.py`**, plus the repository gate `just check`.
-4. **CI is the only oracle for the timings.** The first `Model` run on the branch demonstrates the
-   new critical path, and the first nightly run demonstrates the moved run still passes there.
+4. **CI is the only oracle for the timings**, and the moved run is verified BEFORE the merge, not
+   after. `model-extended.yml:31` gates on
+   `github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'model-extended')`,
+   so applying the **`model-extended`** label to the implementation PR runs the extended tier on
+   that PR. Do that: it proves `breaklock-posix-liveness` passes in its new home while the change is
+   still revertible. Waiting for the cron would verify it only after it had already merged, and an
+   earlier draft of this spec said exactly that — it was wrong.
 
 The coverage union is the risk to watch: if the union fails on the first run after A, the measured
 "zero unique labels" result was wrong and the change must be reverted rather than papered over by
@@ -276,6 +285,33 @@ They are recorded so the implementer does not have to rediscover them.
   the strongest reason to land the deferred follow-up sooner rather than later. The decision about
   whether to gate `release-plz` is deliberately not taken here.
 - **The 45.4-minute floor**, as above.
+
+## The gap this change widens: nobody is told when the nightly tier fails
+
+A pull-request check is synchronous and addressed to the person who caused it — it blocks their
+merge and they see it immediately. A cron job is neither. Moving `breaklock-posix-liveness` into the
+nightly tier therefore changes WHO finds out when it breaks, and that is a property of the change,
+not a pre-existing condition to wave at.
+
+**Measured: `model-extended.yml` contains no notification of any kind.** Grepping it for
+`notify`, `slack`, `webhook`, `issue`, `mail` and `alert` returns nothing. A failing nightly run
+raises GitHub's default notification and nothing else, which does not reach the author of the commit
+that broke it — they may not even be watching the repository.
+
+Compounding it: `release-plz` opens a release pull request on every push to `main`, and no release
+workflow consults the model tier. So the sequence "deadlock merges, nightly goes red at 03:17,
+nobody is told, a release ships" is available today.
+
+This spec does NOT fix that, because inventing a notification mechanism here would widen it well
+past CI latency and the choice of mechanism belongs to the owner. What it does is state the gap in
+the terms the decision needs:
+
+- The consequence of a red nightly tier is currently borne by whoever happens to look.
+- After this change, one more class of defect — `breaklock` liveness — lands in that tier.
+- Until either a routing mechanism exists or the deferred shallow per-PR run lands, the window
+  between "a deadlock merges" and "a human notices" is unbounded.
+
+Owner decision, recorded as a follow-up rather than taken here.
 
 ## Deferred to its own spec
 
