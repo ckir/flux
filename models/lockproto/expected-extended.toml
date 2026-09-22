@@ -2,14 +2,22 @@
 # as expected.toml. It runs on a schedule and on request, never as part of `just model` or the
 # per-pull-request jobs:
 #   python models/lockproto/run.py --expected models/lockproto/expected-extended.toml --scenario recovery
-# The suite-wide union is not judged here: host crashes share `env_loop`, so these runs cover no label
-# the process-crash runs in expected.toml miss.
+# The suite-wide union is not judged here. That held originally because host crashes share `env_loop`
+# and so cover no label the process-crash runs in expected.toml miss; it also holds for the
+# breaklock liveness run moved here on 2026-09-22, which was measured to cover 70 labels and zero of
+# them uniquely.
 #
 # It is also where an OPEN EXPERIMENT goes - a run whose outcome is not known yet, which therefore must
 # not be able to redden the per-pull-request gate. The takeover-refusal witness lived here on 2026-09-17
 # and answered its question in one run (CI 35188279927): exhaustive at 17,377,074 states, no violation.
 
-scenarios = ["recovery"]
+scenarios = ["breaklock", "recovery"]
+
+# A TRAP for whoever adds the next `breaklock` run here. `run.py` assigns a run to a CI job with
+# `job = raw.get("job", platform)`, so a new breaklock/posix run with no explicit `job` key lands in
+# the SAME matrix entry as breaklock-posix-liveness below and runs after it, serially - adding its
+# own runtime to a run that already takes about an hour. Give such a run its own `job` key unless
+# you mean them to share a runner.
 
 [[run]]
 name = "recovery-posix-hostcrash-check"
@@ -129,3 +137,21 @@ unreached = [
     { label = "S99_refuse_close", reason = "a Section 99 check fails only for an owner whose lock was taken while it ran; no recovery actor loses its lock while running (a takeover needs a Breaker, a lapsed lease needs LockCapability = remote)" },
 ]
 timeout_minutes = 150
+
+[[run]]
+name = "breaklock-posix-liveness"
+module = "LockProtocol"
+config = "configs/breaklock-posix-liveness.cfg"
+scenario = "breaklock"
+kind = "liveness"
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = [], Cleanups = [], Breakers = ["b1", "b2"], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false, SEED_FS_LOCK_WITHOUT_HANDLE = false, SEED_FS_ALIEN_CONTENT = false, SEED_CHECK_REFUSES_UNTOUCHED = false }
+unreached = [
+    { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock; dirlock reaches it" },
+    { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record while another actor was inside the recovery path, which needs a lapsed lease; the remote scenarios reach it" },
+    { label = "S99_refuse_close", reason = "a Section 99 or 21.1 step 3 check fails only for a holder whose lock was taken while it ran; under a strong capability a running holder keeps its OS-native lock, so no takeover wins against it; breaklock-remote reaches it" },
+    { label = "S21_1_s3_refuse_close", reason = "a Section 99 or 21.1 step 3 check fails only for a holder whose lock was taken while it ran; under a strong capability a running holder keeps its OS-native lock, so no takeover wins against it; breaklock-remote reaches it" },
+    { label = "S240_5_seed_write_begin", reason = "reached only with SEED_RENAME_OVER_TAKEOVER; its seeded run reaches it" },
+    { label = "S240_5_seed_write_end", reason = "reached only with SEED_RENAME_OVER_TAKEOVER; its seeded run reaches it" },
+    { label = "S240_5_seed_rename", reason = "reached only with SEED_RENAME_OVER_TAKEOVER; its seeded run reaches it" },
+]
+timeout_minutes = 120
