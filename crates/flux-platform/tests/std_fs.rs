@@ -136,3 +136,24 @@ fn metadata_reports_a_directory_as_not_a_file() {
     let fs = StdFileSystem;
     assert!(!fs.metadata(d.path()).unwrap().is_file);
 }
+
+#[test]
+#[cfg(unix)]
+fn rename_no_replace_refuses_a_dangling_symlink() {
+    let d = TempDir::new().unwrap();
+    let (from, to) = (d.path().join("from"), d.path().join("to"));
+    let fs = StdFileSystem;
+    fs.create_new(&from).unwrap();
+    // `Path::exists` FOLLOWS the link, so a dangling symlink reports false while the
+    // NAME `to` is occupied. Replacing it destroys a link the user created, which is
+    // exactly what this method promises not to do. Same root cause as the
+    // `symlink_metadata` fix in `rename_replace`; this is the sibling site.
+    std::os::unix::fs::symlink(d.path().join("nowhere"), &to).unwrap();
+
+    assert!(
+        fs.rename_no_replace(&from, &to).is_err(),
+        "FS-2: a dangling symlink occupies the name"
+    );
+    let m = std::fs::symlink_metadata(&to).expect("the link itself must survive");
+    assert!(m.file_type().is_symlink(), "the link must not have been replaced");
+}

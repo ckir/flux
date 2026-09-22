@@ -132,7 +132,11 @@ impl FileSystem for StdFileSystem {
     }
 
     fn rename_no_replace(&self, from: &Path, to: &Path) -> Result<()> {
-        if to.exists() {
+        // `symlink_metadata`, NOT `exists()`: `exists()` FOLLOWS the link, so a dangling
+        // symlink reports false and this method would replace the very name it promises
+        // to leave alone. Identical root cause to the guard in `rename_replace` above --
+        // that one was fixed first and this sibling site was missed.
+        if std::fs::symlink_metadata(to).is_ok() {
             return Err(FsError::new(
                 flux_fs::Code::IoError,
                 std::io::Error::from(std::io::ErrorKind::AlreadyExists),
