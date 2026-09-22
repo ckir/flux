@@ -909,6 +909,10 @@ use std::path::Path;
 fn discard<F: FileSystem>(fs: &F, temp: &Path, code: Code, source: std::io::Error) -> FsError {
     match fs.remove_file(temp) {
         Ok(()) => FsError::new(code, source),
+        // NotFound means it is already gone -- something else removed it, or it was
+        // never created. Reporting a leftover here would send someone hunting a file
+        // that does not exist.
+        Err(e) if e.source.kind() == std::io::ErrorKind::NotFound => FsError::new(code, source),
         Err(_) => FsError::new(
             code,
             std::io::Error::other(format!("{source}; temporary left at {}", temp.display())),
@@ -969,13 +973,17 @@ pub fn copy_file<F: FileSystem>(
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => {
-                let code = FsError::from_io(std::io::Error::from(e.kind())).code;
-                return Err(discard(fs, &temp, code, e));
+                // Map the ORIGINAL error. `std::io::Error::from(e.kind())` would
+                // discard `raw_os_error()`, and ENOSPC would stop reaching DISK_FULL
+                // on the one path where a full disk actually shows up. Measured:
+                // `Error::from(e.kind()).raw_os_error()` is `None`.
+                let mapped = FsError::from_io(e);
+                return Err(discard(fs, &temp, mapped.code, mapped.source));
             }
         };
         if let Err(e) = writer.write_all(&buf[..n]) {
-            let code = FsError::from_io(std::io::Error::from(e.kind())).code;
-            return Err(discard(fs, &temp, code, e));
+            let mapped = FsError::from_io(e);
+            return Err(discard(fs, &temp, mapped.code, mapped.source));
         }
         bytes_copied += n as u64;
     }
@@ -1304,6 +1312,21 @@ fn set_times_on_a_handle_moves_the_mtime() {
     assert_eq!(got, t);
 }
 
+#[cfg(unix)]
+#[test]
+fn metadata_reports_a_symlink_as_not_a_file() {
+    // Unix-only: creating a symlink on Windows needs Developer Mode or admin, which a
+    // CI runner may not have. The code path under test is not platform-specific.
+    let d = TempDir::new().unwrap();
+    let target = d.path().join("target");
+    std::fs::write(&target, b"hello").unwrap();
+    let link = d.path().join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let m = StdFileSystem.metadata(&link).unwrap();
+    assert!(!m.is_file, "a symlink must not read as a regular file, or the refusal is bypassed");
+}
+
 #[test]
 fn metadata_reports_a_directory_as_not_a_file() {
     let d = TempDir::new().unwrap();
@@ -1378,7 +1401,14 @@ impl FileSystem for StdFileSystem {
     }
 
     fn metadata(&self, path: &Path) -> Result<Metadata> {
-        let m = std::fs::metadata(path).map_err(FsError::from_io)?;
+        // `symlink_metadata`, NOT `metadata`: `std::fs::metadata` dereferences a
+        // symlink and would report the TARGET as a regular file, so a symlink would
+        // sail past the SPECIAL_FILE_UNSUPPORTED refusal and be copied as its target.
+        // Measured: for a symlink to a regular file, `metadata().is_file()` is true
+        // and only `symlink_metadata()` sees the link. §2 Foundational Invariants
+        // item 21 also says symlink targets never contribute unless link-following is
+        // explicitly enabled, which it is not in this cut.
+        let m = std::fs::symlink_metadata(path).map_err(FsError::from_io)?;
         Ok(Metadata {
             len: m.len(),
             is_file: m.is_file(),
@@ -1458,7 +1488,9 @@ protocol, which is the consumer that needs them to be atomic.
 - [ ] **Step 5: Run the tests**
 
 Run: `cargo nextest run -p flux-platform --no-tests=pass`
-Expected: PASS — 5 new tests plus the 11 existing `fs_semantics` probes.
+Expected: PASS. Six new tests on Unix, five on Windows — `metadata_reports_a_symlink_as_not_a_file`
+is `#[cfg(unix)]`. The existing `fs_semantics` file holds eleven probes but runs **nine** on either
+platform: `fs4`/`fs5` are `#[cfg(unix)]` and `fs6`/`fs7` are `#[cfg(windows)]`.
 
 - [ ] **Step 6: Commit**
 
@@ -1773,3 +1805,29 @@ gh pr create --base main --title "feat: flux-fs trait surface and single-file co
 
 Body: what now works (`flux copy` copies a file), the §44.1 ordering and the test that proves it, the
 spec amendment, and the three limitations Task 10 added to `TODO.md`.
+
+---
+
+## Stand-downs
+
+Findings the panel raised and did not fold, each with the reason it was not folded. Recorded here
+because this artifact is the only durable record a pre-implementation review produces.
+
+- `DISCARDED-BELOW-FLOOR`: the 64 KiB stream buffer is heap-allocated per call
+  (`let mut buf = vec![0u8; 64 * 1024];`). Raised against a hypothetical recursive copy of 100,000
+  files. Unreachable in this cut: recursive copy is explicitly out of scope, and `flux-cli`'s `main`
+  calls `copy_file` exactly once per process, so the allocation happens once per invocation. Revisit
+  with the directory walker, which is the change that would make it reachable.
+- `REJECTED`: "delete Task 4 (`FaultFs`) and test only against a real filesystem." The same peer had
+  already answered, in the previous round, that the fake "is the *only* practical way to test the
+  strict vs best-effort fallback logic, because creating deterministic OS failures ... is flaky or
+  impossible in CI." No real-filesystem test can make `set_times` fail on demand, and
+  `a_strict_metadata_failure_prevents_publication` is the assertion §44.1 exists for.
+- `REJECTED`: "on Windows, renaming or removing a file with open handles fails, so every copy fails
+  at publication and leaks its temporary." Measured on the target machine over this plan's exact
+  sequence: the replacing rename returned `Ok`, `remove_file` with a live handle returned `Ok`, and
+  `create_new` on the just-removed name returned `Ok`. Rust's `std::fs` opens with
+  `FILE_SHARE_DELETE`.
+- `REJECTED`: "`remove_file` on a read-only file fails on Windows, so a temporary made read-only by
+  `set_permissions` leaks." Raised by the driver, not the peer. Measured on the target machine:
+  `remove_file` on a read-only file returned `Ok(())`.
