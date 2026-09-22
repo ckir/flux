@@ -1,3 +1,5 @@
 //! Portable filesystem abstractions (spec §3.2).
-//!
-//! Scaffold only — no implementation yet.
+
+pub mod error;
+
+pub use error::{Code, FsError, Result};
