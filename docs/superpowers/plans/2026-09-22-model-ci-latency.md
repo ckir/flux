@@ -248,10 +248,44 @@ move together), then JSON containing an entry
 
 If `--list-jobs` raises `scenario 'breaklock' is not in 'scenarios'`, Step 3 was skipped.
 
+- [ ] **Step 6b: Update the two tests that pin the extended tier's contents**
+
+`models/lockproto/test_run.py` has two tests that assert this file's DATA rather than `run.py`'s
+behaviour, and both fail after the move. This step was missing from the first version of this plan;
+it was found by running the suite.
+
+In `test_the_extended_repository_file_loads`, change:
+
+```python
+        self.assertEqual(expected.scenarios, ["recovery"])
+```
+
+to:
+
+```python
+        # breaklock joined recovery here on 2026-09-22, when the deep liveness run moved off the
+        # per-pull-request tier. This list is the file's contents, not a property of the loader.
+        self.assertEqual(expected.scenarios, ["breaklock", "recovery"])
+```
+
+In `test_list_jobs_on_the_extended_repository_file`, add the breaklock entry FIRST, matching the
+order `run.py` emits:
+
+```python
+        self.assertEqual(json.loads(out.getvalue()), [{"scenario": "breaklock", "platform": "posix", "job": "posix"},
+                                                      {"scenario": "recovery", "platform": "posix", "job": "posix"},
+                                                      {"scenario": "recovery", "platform": "windows", "job": "windows"}])
+```
+
+**Neither test's subject changes.** The first tests that the file LOADS and has runs; the second
+tests that `--list-jobs` works without fetching or running TLC, which it enforces with a stub that
+raises if either happens. Only the data snapshots move. If you find yourself changing anything else
+in either test, stop — that would be editing a test to match code rather than data.
+
 - [ ] **Step 7: Commit**
 
 ```bash
-git add models/lockproto/expected.toml models/lockproto/expected-extended.toml
+git add models/lockproto/expected.toml models/lockproto/expected-extended.toml models/lockproto/test_run.py
 git commit -m "ci(model): move the deep breaklock liveness run to the nightly tier
 
 It is 59.4 minutes of a 98.4-minute job and covers 70 labels, zero of them
@@ -382,9 +416,12 @@ changed, so the interesting part is `typos` over the edited TOML and the `model_
 python -m pytest models/lockproto/test_run.py -q
 ```
 
-Expected: `206 passed, 45 subtests passed`, in about a minute. That was the count before these
-changes; the tests exercise `run.py`'s config loading, which is exactly what Tasks 2 and 3 touched,
-so the count should not move. A LOWER count means a test errored out rather than failed visibly.
+Expected: `206 passed, 45 subtests passed`, in about a minute — the same count as before the
+branch, because Task 2 Step 6b updated the two tests that pin the extended tier's contents.
+
+If you see `2 failed, 204 passed` naming `test_the_extended_repository_file_loads` and
+`test_list_jobs_on_the_extended_repository_file`, Step 6b was skipped. Any OTHER failure is a real
+problem — stop and read it rather than adjusting the test.
 
 If a test fails naming `scenarios` or a missing run, re-read Task 2 Step 3.
 
