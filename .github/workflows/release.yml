@@ -3,6 +3,18 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Manual re-run, for when a tag's assets are missing or a runner died after the
+  # release was already created. v0.1.0 shipped with zero binaries and had to be
+  # recovered as a fresh tag; with this, the same failure is a re-run instead.
+  #
+  # The tag is REQUIRED and is not defaulted: a manual run from a branch has no
+  # release to upload to, so the input is what gives the job a target at all.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build and upload assets for, e.g. v0.1.1"
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -34,7 +46,11 @@ jobs:
             target: x86_64-pc-windows-msvc
             archive: zip
     steps:
+      # On a manual run, build the TAG that was asked for, not the branch the
+      # workflow was dispatched from.
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -66,4 +82,6 @@ jobs:
       - name: Upload to release
         uses: softprops/action-gh-release@v3
         with:
+          # `inputs.tag` is empty on a tag push, so this falls back to the pushed tag.
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: flux-${{ matrix.target }}.*
