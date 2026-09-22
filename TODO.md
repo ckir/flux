@@ -72,6 +72,28 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
   Blocked on the same primitive the lock protocol needs: `dev`+`ino` on Unix is one call, Windows needs
   `FILE_ID_INFO`, which is already an open item above. Do both at once.
 
+## Known gaps in the single-file copy (from the PR #32 capstone)
+
+Each was measured, and each is deliberately NOT fixed in that PR.
+
+- [ ] **`rename_no_replace` is check-then-act.** It calls `symlink_metadata` and then
+      `rename`, so two processes can both see an empty name and one silently wins,
+      which is exactly what the method's contract forbids. Unlike the race in
+      `rename_replace`, this one HAS an atomic primitive: `rustix::fs::renameat_with`
+      with `RenameFlags::NOREPLACE`, verified present in rustix 1.1.5 source
+      (`src/fs/at.rs:302`, `types.rs:314`). Windows has the equivalent via
+      `FileRenameInfoEx` without `REPLACE_IF_EXISTS`, which `std` does not expose.
+- [ ] **A blocking pre-existing temporary is not reported.** If the step-1 leftover
+      sweep fails and `create_new` then fails with `AlreadyExists`, `copy_file` returns
+      `leftover: None` even though a temporary genuinely sits at the path and is
+      blocking the copy. The caller is told nothing was left behind.
+- [ ] **The read-only guard cannot be atomic.** `rename_replace` checks whether this
+      process may replace the destination and then renames; a permission change landing
+      in between is not seen, and `rename` is precisely what does not consult the file.
+      `std::fs::rename` takes paths rather than the handle probed with, and neither
+      platform offers "rename only if I may replace the target". `cp` has the same
+      window. Documented in the code; recorded here so it is not rediscovered.
+
 ## Scaffolding follow-ups
 
 - [ ] Install `cargo-mutants` (`cargo binstall -y cargo-mutants`) — it is the one
