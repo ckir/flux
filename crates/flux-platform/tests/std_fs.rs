@@ -48,6 +48,12 @@ fn rename_replace_refuses_a_read_only_target() {
     let err = fs.rename_replace(&from, &to).unwrap_err();
 
     assert_eq!(err.code, flux_fs::Code::PermissionDenied);
+    // The refusal must come from OUR guard, not from whatever the OS happened to do.
+    // Windows' own `rename` ALSO refuses a read-only target, so without this the test
+    // passes even with the guard deleted -- measured by mutation: removing the
+    // attribute check left all seven tests green. Our error carries no raw OS code;
+    // an OS refusal would carry ERROR_ACCESS_DENIED.
+    assert!(err.source.raw_os_error().is_none(), "the guard must refuse, not the OS");
     assert_eq!(std::fs::read(&to).unwrap(), b"protected", "the protected file must survive");
 
     // Remove it here rather than clearing the read-only bit: `set_readonly(false)`
@@ -214,4 +220,44 @@ fn rename_replace_refuses_a_target_this_user_cannot_write() {
     let _ = std::process::Command::new("sudo")
         .args(["-n", "rm", "-f", &to.display().to_string()])
         .status();
+}
+
+#[test]
+#[cfg(windows)]
+fn rename_replace_refuses_a_target_denied_by_acl() {
+    // The Windows case the read-only ATTRIBUTE cannot see, and the mirror of the
+    // Unix root-owned-0644 case. Measured before the fix: the attribute was unset,
+    // the guard passed, `rename` returned Ok, and the protected contents were gone.
+    let d = TempDir::new().unwrap();
+    let (from, to) = (d.path().join("from"), d.path().join("to"));
+    let fs = StdFileSystem;
+    let mut f = fs.create_new(&from).unwrap();
+    f.write_all(b"new").unwrap();
+    drop(f);
+    std::fs::write(&to, b"protected").unwrap();
+
+    let user = std::env::var("USERNAME").expect("USERNAME");
+    let denied = std::process::Command::new("icacls")
+        .args([&to.display().to_string(), "/deny", &format!("{user}:(W,D,DC)")])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !denied {
+        eprintln!("skipped: could not apply a deny ACE");
+        return;
+    }
+
+    // The attribute alone is blind here: that is the whole point of the case.
+    assert!(!std::fs::metadata(&to).unwrap().permissions().readonly(), "attribute is unset");
+
+    let refused = fs.rename_replace(&from, &to).is_err();
+
+    // Drop the deny ACE BEFORE reading back: it denies (W,D,DC), and reading through
+    // it is not something this test should depend on.
+    let _ = std::process::Command::new("icacls")
+        .args([&to.display().to_string(), "/remove:d", &user])
+        .output();
+    let content = std::fs::read(&to).expect("the destination must still be readable");
+
+    assert!(refused, "a destination we may not write must be refused");
+    assert_eq!(content, b"protected", "the protected contents must survive");
 }

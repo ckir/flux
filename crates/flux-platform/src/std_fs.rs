@@ -75,12 +75,54 @@ fn destination_is_write_protected(to: &Path) -> bool {
     }
 }
 
-/// The Windows half. Its `rename` already consults the read-only attribute, so the
-/// attribute is the protection that exists here. Real ACL evaluation would need
-/// `AccessCheck` against the thread token and is deliberately out of scope.
+/// The Windows half, asking the SAME question as the Unix half.
+///
+/// The read-only ATTRIBUTE is not the protection here. Measured on Windows 11 with an
+/// ACL denying `(W,D,DC)` to the current user: the attribute is unset, so an attribute
+/// check passes, and `rename` then replaced the file and destroyed its contents. An
+/// attribute check would also have left this platform refusing where Unix allows and
+/// allowing where Unix refuses -- the very divergence the guard exists to remove.
+///
+/// Opening for write asks the real security question, and it SUBSUMES the attribute:
+/// measured `raw_os_error() == Some(5)` (`ERROR_ACCESS_DENIED`) for an ACL-denied file
+/// AND for a read-only one, and `None` for a plain writable one.
 #[cfg(windows)]
 fn destination_is_write_protected(to: &Path) -> bool {
-    std::fs::symlink_metadata(to).is_ok_and(|m| m.permissions().readonly())
+    /// `ERROR_ACCESS_DENIED`.
+    const ACCESS_DENIED: i32 = 5;
+
+    use std::os::windows::fs::OpenOptionsExt;
+    /// The Win32 `DELETE` right, which is what `rename` actually needs on the target.
+    const DELETE: u32 = 0x0001_0000;
+
+    match std::fs::symlink_metadata(to) {
+        Err(_) => false,
+        // As on Unix: `rename` replaces the LINK, so the target's ACL is irrelevant.
+        Ok(m) if m.file_type().is_symlink() => false,
+        // BOTH questions, because MEASURED, neither alone is enough:
+        //
+        //   read-only ATTRIBUTE set  -> attribute true,  DELETE probe None
+        //   ACL denies (W,D,DC)      -> attribute false, DELETE probe 5
+        //
+        // Probing for DELETE rather than WRITE is deliberate twice over. `rename` needs
+        // DELETE on the target, not write, so asking about write can refuse a rename the
+        // OS would allow; and a write-intent open asks a cloud-sync filter driver to
+        // HYDRATE an offline file -- a blocking download -- merely to answer a
+        // permission question.
+        //
+        // Only `ERROR_ACCESS_DENIED` counts. `ERROR_SHARING_VIOLATION` means somebody
+        // else holds the file open, which is not a protection; refusing there would fail
+        // a legitimate copy. Same allow-list discipline as the Unix arm's errnos.
+        Ok(m) => {
+            m.permissions().readonly()
+                || std::fs::OpenOptions::new()
+                    .access_mode(DELETE)
+                    .open(to)
+                    .err()
+                    .and_then(|e| e.raw_os_error())
+                    == Some(ACCESS_DENIED)
+        }
+    }
 }
 
 impl FileSystem for StdFileSystem {
