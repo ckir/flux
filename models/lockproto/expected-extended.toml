@@ -148,4 +148,4 @@ unreached = [
     { label = "S240_5_seed_write_end", reason = "reached only with SEED_RENAME_OVER_TAKEOVER; its seeded run reaches it" },
     { label = "S240_5_seed_rename", reason = "reached only with SEED_RENAME_OVER_TAKEOVER; its seeded run reaches it" },
 ]
-timeout_minutes = 120
+timeout_minutes = 1
