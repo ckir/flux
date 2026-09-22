@@ -73,10 +73,6 @@ Promoted from the local anomalies inbox (triage of 2026-09-14); each was re-meas
 Measured by the lock-model probes (`crates/flux-platform/tests/fs_semantics.rs`, branch `model/lock-protocol`)
 against spec V16.
 
-- [ ] **Windows replacing rename is unnamed.** `std::fs::rename` (POSIX-semantics rename) replaces a target that
-      is open with delete-sharing, but `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` fails with "Access is denied" whenever
-      the target is open. §241.5 names `MoveFileEx` for the no-replace publish only; the spec should name the API
-      of the replacing rename, which is what the model's Windows row assumes.
 - [ ] **Windows file identity source.** §107 and §109.1 give only strength classes. The 64-bit file index is not
       guaranteed unique on ReFS (Dev Drives are ReFS); a strong identity needs `FILE_ID_INFO` (volume serial plus
       128-bit file id) from `GetFileInformationByHandleEx`.
@@ -221,3 +217,6 @@ item was, not only in a commit message.
   `git ls-files .antigravityignore` returns it. It reads as untracked only in `E:/Rust/flux`, which sits
   on the stale `model/lock-protocol` branch — the remedy is to move that tree, and there is nothing to
   change in the repository.
+- `DONE` **Windows replacing rename is unnamed.** §241.5 now names the POSIX-semantics rename for
+  replacing publication and states why `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` cannot serve, citing
+  the FS-6 and FS-7 probes. Implemented as `StdFileSystem::rename_replace`.

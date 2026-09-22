@@ -10860,7 +10860,17 @@ is reported as a collision instead of overwriting the first.
 No-replace publication depends on one of `renameat2(RENAME_NOREPLACE)`,
 `renamex_np(RENAME_EXCL)`, `MoveFileEx` without
 `MOVEFILE_REPLACE_EXISTING`, or `link()`+`unlink()` being available on
-the destination. Before a directory operation changes anything, Flux
+the destination.
+
+The replacing publication uses the platform's POSIX-semantics rename —
+`renameat2` without `RENAME_NOREPLACE` on Linux, `renamex_np` on macOS, and on
+Windows `SetFileInformationByHandle` with `FileRenameInfoEx` and
+`FILE_RENAME_FLAG_POSIX_SEMANTICS`, which is what `std::fs::rename` issues.
+`MoveFileExW(MOVEFILE_REPLACE_EXISTING)` is **not** usable for it: it fails with
+`ERROR_ACCESS_DENIED` whenever the target is open, which a concurrent reader makes
+routine. Measured: `crates/flux-platform/tests/fs_semantics.rs`,
+`fs6_file_open_without_delete_sharing_cannot_be_renamed_deleted_or_replaced` and
+`fs7_file_open_with_delete_sharing_can_be_renamed_deleted_and_replaced`. Before a directory operation changes anything, Flux
 probes the destination for one of these primitives. If none is
 available, the operation is refused with `NOREPLACE_PUBLISH_UNAVAILABLE`
 (exit code 3); check-then-rename is never used as a substitute. The
