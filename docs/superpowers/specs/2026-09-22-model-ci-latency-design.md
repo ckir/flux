@@ -281,6 +281,20 @@ path needs revisiting.
 Step 2 is the one that matters: it is the check that distinguishes a correct separate-job
 implementation from a failure step placed inside the matrix job.
 
+> **This procedure no longer works, and the reason is the point.** It was executed as written, by
+> dispatching the workflow on the branch, and it did open exactly one issue (#33) — which is how the
+> capstone later found that `notify` had **no branch constraint at all**. Run `35743039548`, on
+> branch `spec/model-ci-latency`, opened a repository issue announcing that the *nightly* tier had
+> failed, when what had failed was a deliberately broken feature branch. `workflow_dispatch` accepts
+> any ref, so the verification procedure and the defect were the same action.
+>
+> Both `notify` and `resolve` now require `github.ref == 'refs/heads/main'`. The consequence is that
+> **this procedure cannot be run from a branch any more** — verifying either job means dispatching
+> on `main` with a deliberate failure, which is a far heavier thing to do and should be weighed
+> against simply trusting the two jobs' conditions. The verification that was performed remains
+> valid evidence for the *one issue, not one per matrix entry* property, which is what step 2 exists
+> to establish and which the branch guard does not affect.
+
 ## What this achieves, and the limit
 
 **This section was rewritten after the change shipped, and the original prediction was wrong.** It

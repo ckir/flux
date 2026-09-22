@@ -91,9 +91,15 @@ jobs:
     #
     # Pull requests are excluded. The extended tier runs on a PR carrying the `model-extended` label,
     # and a failure there is already visible on the PR itself; an issue would be noise.
+    #
+    # `github.ref == 'refs/heads/main'` is NOT redundant with the pull-request exclusion, and it is
+    # not hypothetical: `workflow_dispatch` accepts ANY ref, and issue #33 was opened by run
+    # 35743039548 dispatched on branch `spec/model-ci-latency` - a repository issue announcing that
+    # the NIGHTLY tier failed, when what had failed was a deliberately broken feature branch. The
+    # cron and a dispatch on main both carry `refs/heads/main`, so nothing legitimate is excluded.
     name: Report a failure
     needs: [plan, tier]
-    if: failure() && github.event_name != 'pull_request'
+    if: failure() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     # Job-level rather than workflow-level: every other job here needs only `contents: read`, and
     # docs.yml already establishes this pattern for a single privileged job.
@@ -140,9 +146,22 @@ jobs:
     # `needs.tier.result == 'success'` rather than `success()` alone, because `success()` is also
     # true when `tier` was SKIPPED on an empty matrix - and closing the issue having verified
     # nothing is exactly the false all-clear this job must not give.
+    #
+    # `github.ref == 'refs/heads/main'` matters MORE here than in `notify`. A dispatch on any green
+    # feature branch would otherwise close a genuine open alarm about a broken `main` - a false
+    # all-clear raised from a branch that never verified `main` at all. The overlap with the
+    # pull-request exclusion is deliberate: on a PR the ref is `refs/pull/N/merge`, so the branch
+    # guard alone would suffice, but both are kept because each documents a distinct intent and
+    # this workflow has already lost a job once to a condition that looked redundant
+    # (see the `!cancelled()` note on model.yml's union job).
+    #
+    # KNOWN LIMIT: re-running an OLD green run on main, or a nightly whose verdict is about a
+    # commit `main` has since moved past, closes the issue on a stale verdict. Guarding that needs
+    # the run's sha compared against the tip of main, which introduces its own "never clears"
+    # failure mode - the exact defect this job was added to fix. Recorded, not guarded.
     name: Close the failure issue
     needs: [plan, tier]
-    if: success() && github.event_name != 'pull_request' && needs.tier.result == 'success'
+    if: success() && github.event_name != 'pull_request' && needs.tier.result == 'success' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       issues: write
