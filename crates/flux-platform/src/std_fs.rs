@@ -1,0 +1,258 @@
+//! The one real `FileSystem`, over `std::fs`.
+//!
+//! `rename_replace` uses `std::fs::rename`, which has POSIX replace semantics on
+//! every platform Rust supports. On Windows this succeeds where
+//! `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` fails — FS-6 and FS-7 measured exactly
+//! that, and Section 241.5 is amended in Task 9 to name it.
+
+use flux_fs::{FileHandle, FileSystem, FsError, Metadata, Perms, Result};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::Path;
+use std::time::SystemTime;
+
+/// The source handle. Read only -- it does not implement `Write` at all, so even a
+/// direct (non-generic) caller of `open_read` cannot write to the file it opened.
+pub struct StdReader(File);
+
+impl Read for StdReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+/// The temporary's handle.
+pub struct StdFile(File);
+
+impl Write for StdFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl FileHandle for StdFile {
+    fn sync_all(&self) -> Result<()> {
+        self.0.sync_all().map_err(FsError::from_io)
+    }
+}
+
+pub struct StdFileSystem;
+
+/// Can this process actually replace the destination NAME?
+///
+/// `Permissions::readonly()` asks only whether ANY write bit is set, which is the wrong
+/// question. Measured on Linux: a root-owned `0644` file reports writable to a normal
+/// user, `cp` refuses it with "Permission denied", and `rename(2)` replaces it anyway,
+/// because rename consults the DIRECTORY's permission and never the file's. So ask the
+/// question `cp` asks -- can WE write this name?
+///
+/// KNOWN AND UNCLOSEABLE: this is check-then-act, so a permission change landing between
+/// the probe and the `rename` is not seen, and the OS is no backstop -- `rename` is
+/// exactly what does NOT consult the file. The race cannot be closed through `std`,
+/// whose `rename` takes paths rather than the handle we probed with, and neither
+/// platform offers a "rename only if I may replace the target" primitive. `cp` carries
+/// the same window. Recorded rather than papered over.
+#[cfg(unix)]
+fn destination_is_write_protected(to: &Path) -> bool {
+    use rustix::fs::{Access, AtFlags, CWD, accessat};
+
+    match std::fs::symlink_metadata(to) {
+        // Nothing occupies the name, so there is nothing to protect.
+        Err(_) => false,
+        // `rename` replaces the LINK and never follows it, so the target's permissions
+        // are irrelevant. `accessat` WOULD follow it, and without this arm it refuses a
+        // rename that is perfectly safe -- the case
+        // `rename_replace_allows_a_symlink_whose_target_is_read_only` pins.
+        Ok(m) if m.file_type().is_symlink() => false,
+        // `EACCESS` asks about the EFFECTIVE uid, which is the credential `rename`
+        // itself enforces; plain `access(2)` would ask about the real one.
+        //
+        // Only these three errnos mean "you may not write this". Anything else -- EIO,
+        // ENOMEM, ETXTBSY -- is NOT a protection, and converting it into "destination is
+        // read-only" would both lie and hide a real failure. Measured: for a RUNNING
+        // binary, `access(W_OK)` returns OK while `open(O_WRONLY)` returns ETXTBSY, and
+        // `rename` over it succeeds, so atomic binary replacement keeps working.
+        Ok(_) => matches!(
+            accessat(CWD, to, Access::WRITE_OK, AtFlags::EACCESS),
+            Err(rustix::io::Errno::ACCESS | rustix::io::Errno::PERM | rustix::io::Errno::ROFS)
+        ),
+    }
+}
+
+/// The Windows half, asking the SAME question as the Unix half.
+///
+/// The read-only ATTRIBUTE is not the protection here. Measured on Windows 11 with an
+/// ACL denying `(W,D,DC)` to the current user: the attribute is unset, so an attribute
+/// check passes, and `rename` then replaced the file and destroyed its contents. An
+/// attribute check would also have left this platform refusing where Unix allows and
+/// allowing where Unix refuses -- the very divergence the guard exists to remove.
+///
+/// So it asks the OS instead, with a `DELETE`-access probe, AND keeps the attribute
+/// check -- measured across four cases, neither alone is sufficient:
+///
+/// ```text
+///                  .write(true)   .access_mode(DELETE)   attribute
+/// ACL denies W,D    Some(5)        Some(5)               false
+/// read-only attr    Some(5)        None                  true
+/// plain writable    None           None                  false
+/// held FileShare    Some(32)       Some(32)              false
+/// ```
+///
+/// The TOCTOU note on the Unix twin applies here too.
+#[cfg(windows)]
+fn destination_is_write_protected(to: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    /// `ERROR_ACCESS_DENIED`.
+    const ACCESS_DENIED: i32 = 5;
+    /// The Win32 `DELETE` right, which is what `rename` actually needs on the target.
+    const DELETE: u32 = 0x0001_0000;
+
+    match std::fs::symlink_metadata(to) {
+        Err(_) => false,
+        // As on Unix: `rename` replaces the LINK, so the target's ACL is irrelevant.
+        Ok(m) if m.file_type().is_symlink() => false,
+        // BOTH questions, because MEASURED, neither alone is enough:
+        //
+        //   read-only ATTRIBUTE set  -> attribute true,  DELETE probe None
+        //   ACL denies (W,D,DC)      -> attribute false, DELETE probe 5
+        //
+        // Probing for DELETE rather than WRITE is deliberate twice over. `rename` needs
+        // DELETE on the target, not write, so asking about write can refuse a rename the
+        // OS would allow; and a write-intent open asks a cloud-sync filter driver to
+        // HYDRATE an offline file -- a blocking download -- merely to answer a
+        // permission question.
+        //
+        // Only `ERROR_ACCESS_DENIED` counts. MEASURED, with a control that signalled only
+        // once the handle was actually open: a file held with `FileShare::None` gives
+        // code 32, `ERROR_SHARING_VIOLATION`, from BOTH probes. That is somebody else
+        // holding the file, not a protection, so it must not refuse -- let `rename`
+        // report the sharing violation itself. Same allow-list discipline as the Unix
+        // arm's errnos. See the TOCTOU note on the Unix twin, which applies here too.
+        Ok(m) => {
+            m.permissions().readonly()
+                || std::fs::OpenOptions::new()
+                    .access_mode(DELETE)
+                    .open(to)
+                    .err()
+                    .and_then(|e| e.raw_os_error())
+                    == Some(ACCESS_DENIED)
+        }
+    }
+}
+
+impl FileSystem for StdFileSystem {
+    type Reader = StdReader;
+    type Writer = StdFile;
+
+    fn open_read(&self, path: &Path) -> Result<Self::Reader> {
+        File::open(path).map(StdReader).map_err(FsError::from_io)
+    }
+
+    fn create_new(&self, path: &Path) -> Result<Self::Writer> {
+        OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create_new(true)
+            .open(path)
+            .map(StdFile)
+            .map_err(FsError::from_io)
+    }
+
+    fn metadata(&self, path: &Path) -> Result<Metadata> {
+        // `symlink_metadata`, NOT `metadata`: `std::fs::metadata` dereferences a
+        // symlink and would report the TARGET as a regular file, so a symlink would
+        // sail past the SPECIAL_FILE_UNSUPPORTED refusal and be copied as its target.
+        // Measured: for a symlink to a regular file, `metadata().is_file()` is true
+        // and only `symlink_metadata()` sees the link. §2 Foundational Invariants
+        // item 21 also says symlink targets never contribute unless link-following is
+        // explicitly enabled, which it is not in this cut.
+        let m = std::fs::symlink_metadata(path).map_err(FsError::from_io)?;
+        Ok(Metadata {
+            len: m.len(),
+            is_file: m.is_file(),
+            permissions: Some(perms_of(&m)),
+            modified: m.modified().ok(),
+        })
+    }
+
+    fn set_times(&self, file: &Self::Writer, modified: Option<SystemTime>) -> Result<()> {
+        let Some(t) = modified else { return Ok(()) };
+        let times = std::fs::FileTimes::new().set_modified(t);
+        file.0.set_times(times).map_err(FsError::from_io)
+    }
+
+    fn set_permissions(&self, file: &Self::Writer, perms: Option<Perms>) -> Result<()> {
+        let Some(p) = perms else { return Ok(()) };
+        let native = match p {
+            #[cfg(unix)]
+            Perms::UnixMode(mode) => std::os::unix::fs::PermissionsExt::from_mode(mode),
+            #[cfg(not(unix))]
+            Perms::UnixMode(_) => return Ok(()),
+            Perms::ReadOnly(ro) => {
+                let mut q = file.0.metadata().map_err(FsError::from_io)?.permissions();
+                q.set_readonly(ro);
+                q
+            }
+        };
+        file.0.set_permissions(native).map_err(FsError::from_io)
+    }
+
+    fn rename_replace(&self, from: &Path, to: &Path) -> Result<()> {
+        // Refuse a read-only destination, on every platform.
+        //
+        // `std::fs::rename` checks the DIRECTORY's write permission, not the target
+        // file's, so on Unix it happily replaces a file the user marked read-only --
+        // `cp -f` semantics where plain `cp` refuses with "Permission denied".
+        // Windows refuses already, because its rename does consult the file's
+        // read-only attribute. Without this guard the same command silently destroyed
+        // a protection on one platform and failed on the other; both were measured.
+        //
+        // Clearing the attribute and retrying was considered and rejected: it weakens
+        // a protection the user deliberately set, and if the retry then fails for any
+        // other reason it stays weakened. Deleting the target first is worse still --
+        // on Windows a target held open with FILE_SHARE_DELETE enters pending-delete,
+        // the rename fails, and the destination is lost when the reader closes it.
+        if destination_is_write_protected(to) {
+            return Err(FsError::new(
+                flux_fs::Code::PermissionDenied,
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "destination is read-only",
+                ),
+            ));
+        }
+        std::fs::rename(from, to).map_err(FsError::from_io)
+    }
+
+    fn rename_no_replace(&self, from: &Path, to: &Path) -> Result<()> {
+        // `symlink_metadata`, NOT `exists()`: `exists()` FOLLOWS the link, so a dangling
+        // symlink reports false and this method would replace the very name it promises
+        // to leave alone. Identical root cause to the guard in `rename_replace` above --
+        // that one was fixed first and this sibling site was missed.
+        if std::fs::symlink_metadata(to).is_ok() {
+            return Err(FsError::new(
+                flux_fs::Code::IoError,
+                std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+            ));
+        }
+        std::fs::rename(from, to).map_err(FsError::from_io)
+    }
+
+    fn remove_file(&self, path: &Path) -> Result<()> {
+        std::fs::remove_file(path).map_err(FsError::from_io)
+    }
+}
+
+#[cfg(unix)]
+fn perms_of(m: &std::fs::Metadata) -> Perms {
+    use std::os::unix::fs::PermissionsExt;
+    Perms::UnixMode(m.permissions().mode())
+}
+
+#[cfg(not(unix))]
+fn perms_of(m: &std::fs::Metadata) -> Perms {
+    Perms::ReadOnly(m.permissions().readonly())
+}

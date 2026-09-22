@@ -11,3 +11,12 @@ publish.workspace = true
 [[bin]]
 name = "flux"
 path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+flux-core = { path = "../flux-core" }
+flux-fs = { path = "../flux-fs" }
+flux-platform = { path = "../flux-platform" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

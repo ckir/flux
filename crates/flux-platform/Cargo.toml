@@ -8,6 +8,15 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[dependencies]
+flux-fs = { path = "../flux-fs" }
+
+# `accessat` for the write-protection guard in `std_fs.rs`. Unix only: Windows has no
+# equivalent that is worth the cost, and its own `rename` already refuses a read-only
+# destination, so the attribute check suffices there.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 # The filesystem probes of the lock-protocol model (tests/fs_semantics.rs,
 # lock-model design Section 10).
 [dev-dependencies]

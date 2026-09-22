@@ -33,6 +33,67 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
 - [ ] Integration tests: single file, directory, nested directory, multiple
       sources, zero-byte files, Unicode, spaces, newlines (spec §68.2)
 
+### Known limits of the first single-file copy (2026-09-22)
+
+- [ ] **`rename_no_replace` is a check-then-rename race**
+
+  `StdFileSystem::rename_no_replace` tests `to.exists()` and then renames. Between the two, another
+  process can create the target, and the rename replaces it — exactly what the method promises not to
+  do. The portable primitives are `renameat2(RENAME_NOREPLACE)` on Linux, `renamex_np(RENAME_EXCL)` on
+  macOS and `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` on Windows.
+
+  Not fixed now because single-file copy publishes with `Publish::Replace`; the consumer that needs an
+  atomic no-replace is the lock protocol, which is where the primitive belongs.
+
+- [ ] **A leftover temporary from a PREVIOUS run is never removed**
+
+  `<target>.flux-partial.<operation-id>` is named with a per-invocation id (the pid), so the leftover
+  sweep only ever removes this invocation's own temporary — which, with an id that is never persisted,
+  means it removes nothing at all. §18.1 wants an id "deterministic enough for discovery"; that needs
+  operation state to record it, which this cut does not have. A crashed run therefore leaves a
+  temporary that nothing collects.
+
+- [ ] **`flux copy` cannot ask for `Preserve::Off`**
+
+  `CopyOptions` has three preservation states and `copy_file` honours all three, but the CLI only
+  ever builds `Strict` (when `--preserve-times` is given) or `Default`. The spec's flags mean
+  "strict when present" and define no `--no-preserve-*`, so there is no way from the command line to
+  say "do not attempt metadata at all". `Off` is reachable only by a library caller in this cut, and
+  is tested as one.
+
+- [ ] **The self-copy refusal compares paths, not filesystem identity**
+
+  §2 Foundational Invariants item 22: *"Safety checks use filesystem identity and object identity where
+  available, not only lexical path comparisons."* `copy_file` refuses only when `src == dst` as paths,
+  so `flux copy a ./a`, or a copy through a hardlink or a junction, is not refused. It is not
+  destructive — the copy is staged in a distinct temporary and the published bytes are the source's
+  own — but the invariant asks for identity and this cut does not supply it.
+
+  Blocked on the same primitive the lock protocol needs: `dev`+`ino` on Unix is one call, Windows needs
+  `FILE_ID_INFO`, which is already an open item above. Do both at once.
+
+## Known gaps in the single-file copy (from the PR #32 capstone)
+
+Each was measured, and each is deliberately NOT fixed in that PR.
+
+- [ ] **`rename_no_replace` is check-then-act.** It calls `symlink_metadata` and then
+      `rename`, so two processes can both see an empty name and one silently wins,
+      which is exactly what the method's contract forbids. Unlike the race in
+      `rename_replace`, this one HAS an atomic primitive: `rustix::fs::renameat_with`
+      with `RenameFlags::NOREPLACE`, verified present in rustix 1.1.5 source
+      (`src/fs/at.rs:302`, `types.rs:314`). Windows has the equivalent via
+      `FileRenameInfoEx` without `REPLACE_IF_EXISTS`, which `std` does not expose.
+- [ ] **A blocking pre-existing temporary is not reported.** If the step-1 leftover
+      sweep fails and `create_new` then fails with `AlreadyExists`, `copy_file` returns
+      `leftover: None` even though a temporary genuinely sits at the path and is
+      blocking the copy. The caller is told nothing was left behind.
+- [ ] **The read-only guard cannot be atomic.** `rename_replace` checks whether this
+      process may replace the destination and then renames; a permission change landing
+      in between is not seen, and `rename` is precisely what does not consult the file.
+      `std::fs::rename` takes paths rather than the handle probed with, and neither
+      platform offers "rename only if I may replace the target". `cp` has the same
+      window. Documented in the code; recorded here so it is not rediscovered.
+
 ## Scaffolding follow-ups
 
 - [ ] Install `cargo-mutants` (`cargo binstall -y cargo-mutants`) — it is the one
@@ -73,10 +134,6 @@ Promoted from the local anomalies inbox (triage of 2026-09-14); each was re-meas
 Measured by the lock-model probes (`crates/flux-platform/tests/fs_semantics.rs`, branch `model/lock-protocol`)
 against spec V16.
 
-- [ ] **Windows replacing rename is unnamed.** `std::fs::rename` (POSIX-semantics rename) replaces a target that
-      is open with delete-sharing, but `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` fails with "Access is denied" whenever
-      the target is open. §241.5 names `MoveFileEx` for the no-replace publish only; the spec should name the API
-      of the replacing rename, which is what the model's Windows row assumes.
 - [ ] **Windows file identity source.** §107 and §109.1 give only strength classes. The 64-bit file index is not
       guaranteed unique on ReFS (Dev Drives are ReFS); a strong identity needs `FILE_ID_INFO` (volume serial plus
       128-bit file id) from `GetFileInformationByHandleEx`.
@@ -221,3 +278,6 @@ item was, not only in a commit message.
   `git ls-files .antigravityignore` returns it. It reads as untracked only in `E:/Rust/flux`, which sits
   on the stale `model/lock-protocol` branch — the remedy is to move that tree, and there is nothing to
   change in the repository.
+- `DONE` **Windows replacing rename is unnamed.** §241.5 now names the POSIX-semantics rename for
+  replacing publication and states why `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` cannot serve, citing
+  the FS-6 and FS-7 probes. Implemented as `StdFileSystem::rename_replace`.
