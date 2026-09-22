@@ -77,11 +77,17 @@ impl CopyError {
     }
 }
 
-impl From<FsError> for CopyError {
-    fn from(cause: FsError) -> Self {
-        CopyError::new(cause)
-    }
-}
+// DELIBERATELY NO `impl From<FsError> for CopyError`.
+//
+// `?` on an `FsError` AFTER the staging temporary exists would return without removing
+// it -- the one leak `discard` exists to prevent, which step 7 below has always had to
+// guard with a comment asking a human to remember. Withholding the conversion makes that
+// mistake fail to COMPILE instead.
+//
+// This is the guard the error-type split bought: while `copy_file` returned
+// `Result<Outcome, FsError>`, `?` compiled by identity and no amount of care could stop
+// it. The three sites that legitimately use `?` all run BEFORE the temporary exists, and
+// say so explicitly.
 
 /// Remove the temporary after a failure and build the error to return.
 ///
@@ -146,17 +152,20 @@ pub fn copy_file<F: FileSystem>(
     let _ = fs.remove_file(&temp);
 
     // 2. source, captured for the step-7 re-check
-    let src_meta = fs.metadata(src)?;
+    // Safe to `?`: nothing has been created yet, so there is nothing to leak.
+    let src_meta = fs.metadata(src).map_err(CopyError::new)?;
     if !src_meta.is_file {
         return Err(CopyError::new(FsError::new(
             Code::SpecialFileUnsupported,
             std::io::Error::other("not a regular file"),
         )));
     }
-    let mut reader = fs.open_read(src)?;
+    let mut reader = fs.open_read(src).map_err(CopyError::new)?;
 
     // 3. exclusive create (FS-1)
-    let mut writer = fs.create_new(&temp)?;
+    // Still safe: if this FAILS, this call is precisely what did not create the
+    // temporary, so there is nothing of ours on disk.
+    let mut writer = fs.create_new(&temp).map_err(CopyError::new)?;
 
     // 4. stream
     let mut bytes_copied = 0u64;
@@ -678,8 +687,7 @@ mod tests {
         // introduced an untested line of its own.
         use std::error::Error as _;
 
-        let err: CopyError =
-            FsError::new(Code::IoError, std::io::Error::from_raw_os_error(5)).into();
+        let err = CopyError::new(FsError::new(Code::IoError, std::io::Error::from_raw_os_error(5)));
 
         let cause = err.source().expect("CopyError must expose its cause");
         let fs_err = cause.downcast_ref::<FsError>().expect("the cause is an FsError");
