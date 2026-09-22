@@ -10,3 +10,7 @@ pub use options::{
     CopyOptions, Durability, MetadataFailure, MetadataItem, OperationId, Outcome, Preserve,
     Publish, temp_path,
 };
+
+pub mod fs;
+
+pub use fs::{FileHandle, FileSystem, Metadata, Perms};
