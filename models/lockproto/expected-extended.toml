@@ -13,6 +13,12 @@
 
 scenarios = ["breaklock", "recovery"]
 
+# A TRAP for whoever adds the next `breaklock` run here. `run.py` assigns a run to a CI job with
+# `job = raw.get("job", platform)`, so a new breaklock/posix run with no explicit `job` key lands in
+# the SAME matrix entry as breaklock-posix-liveness below and runs after it, serially - adding its
+# own runtime to a run that already takes about an hour. Give such a run its own `job` key unless
+# you mean them to share a runner.
+
 [[run]]
 name = "recovery-posix-hostcrash-check"
 module = "LockProtocol"
