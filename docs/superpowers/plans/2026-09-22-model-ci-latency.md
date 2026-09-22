@@ -551,10 +551,35 @@ observes the notification, and reverts.
 
 - [ ] **Step 1: Break one extended-tier run**
 
-In `models/lockproto/expected-extended.toml`, find the run named
-`recovery-posix-hostcrash-check` and change its `timeout_minutes` from **`150`** to **`1`**. One
-minute is far below what it needs, so it fails on timeout rather than on anything ambiguous. Note
-the original value here — Step 5 reverts to it, and `150` is what you are checking for.
+Set **EVERY** run's `timeout_minutes` in `models/lockproto/expected-extended.toml` to `1`:
+
+```bash
+python - <<'EOF'
+import pathlib
+p = pathlib.Path("models/lockproto/expected-extended.toml")
+lines = p.read_text(encoding="utf-8").split("
+")
+n = 0
+for i, l in enumerate(lines):
+    if l.startswith("timeout_minutes = "):
+        lines[i] = "timeout_minutes = 1"; n += 1
+p.write_text("
+".join(lines), encoding="utf-8")
+print(f"set {n} timeouts to 1")
+EOF
+```
+
+**Every run, not one — this was learned the hard way.** The `notify` job declares
+`needs: [plan, tier]`, and `tier` is a matrix with `fail-fast: false`, so it waits for EVERY entry
+however fast one of them fails. Breaking a single run leaves `recovery/posix` running to 451 minutes
+and `recovery/windows` to 600, and `notify` fires after neither.
+
+Breaking all of them also makes this a STRONGER test: three matrix entries fail instead of one, and
+a `notify` wrongly written as a step inside `tier` would open three issues where a correct separate
+job opens one. One failing entry cannot tell those two designs apart at all.
+
+The originals are 150 for the eight recovery runs and 120 for the moved liveness run. You do not
+need to note them by hand — Step 5 reverts the commit.
 
 Commit it on the branch with a message that says it is temporary:
 
@@ -634,12 +659,18 @@ git push origin spec/model-ci-latency
 
 ## Task 7: Confirm the latency win in CI
 
+**Run this AFTER Task 8.** It needs the pull request to exist, for the reason given in Step 1.
+
 **Files:** none.
 
 - [ ] **Step 1: Trigger a full Model run on the branch**
 
-The branch changes `models/`, which is in `model.yml`'s watched-path pattern, so pushing already
-triggered it. Find the run:
+**Pushing the branch does NOT trigger it.** `model.yml` fires on push-to-`main` and on pull
+requests targeting `main`; a branch push matches neither, so there is nothing to find until the pull
+request in Task 8 exists. Do Task 8 first, then come back here — the PR's own `Model` run is what
+this task measures.
+
+Find it:
 
 ```bash
 gh run list --workflow Model --branch spec/model-ci-latency --limit 1
