@@ -949,9 +949,15 @@ fn discard<F: FileSystem>(fs: &F, temp: &Path, code: Code, source: std::io::Erro
         // never created. Reporting a leftover here would send someone hunting a file
         // that does not exist.
         Err(e) if e.source.kind() == std::io::ErrorKind::NotFound => FsError::new(code, source),
-        Err(_) => FsError::new(
+        // Carry the removal's own error too: "a temporary was left" without "because
+        // the volume went away" tells an operator where to look but not what happened.
+        Err(why) => FsError::new(
             code,
-            std::io::Error::other(format!("{source}; temporary left at {}", temp.display())),
+            std::io::Error::other(format!(
+                "{source}; temporary left at {} ({})",
+                temp.display(),
+                why.source
+            )),
         ),
     }
 }
@@ -1160,10 +1166,28 @@ Inside the existing `mod tests` in `crates/flux-core/src/copy.rs`:
     }
 
     #[test]
-    fn a_failed_publish_reports_copy_failed_and_removes_the_temporary() {
+    fn a_denied_publish_keeps_the_denial_code_and_removes_the_temporary() {
+        // The taxonomy says PERMISSION_DENIED is "the operating system denied access"
+        // and COPY_FAILED is "the content copy failed". At the publish step the content
+        // copy has already succeeded, so a denial here is a denial, not a copy failure.
         let fs = FaultFs::new();
         fs.write_file("/src", b"hello");
         fs.fail("rename_replace", flux_fs::Code::PermissionDenied);
+
+        let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap_err();
+
+        assert_eq!(err.code, flux_fs::Code::PermissionDenied);
+        assert!(!fs.exists("/dst.flux-partial.op1"));
+    }
+
+    #[test]
+    fn an_unclassified_publish_failure_becomes_copy_failed() {
+        // COPY_FAILED must keep a reachable producer -- the spec forbids a variant
+        // without one -- and this is it: a publish failure the platform layer could
+        // not classify, which arrives as the IO_ERROR catch-all.
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.fail("rename_replace", flux_fs::Code::IoError);
 
         let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap_err();
 
@@ -1261,7 +1285,7 @@ Inside the existing `mod tests` in `crates/flux-core/src/copy.rs`:
 - [ ] **Step 2: Run the tests**
 
 Run: `cargo nextest run -p flux-core --no-tests=pass`
-Expected: PASS, 16 tests. If `a_strict_metadata_failure_prevents_publication` fails, the ordering in
+Expected: PASS, 17 tests. If `a_strict_metadata_failure_prevents_publication` fails, the ordering in
 `copy_file` is wrong — fix the implementation, not the test.
 
 - [ ] **Step 3: Commit**
