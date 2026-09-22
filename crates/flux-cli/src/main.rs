@@ -50,7 +50,12 @@ fn main() -> ExitCode {
                     }
                 }
                 Err(e) => {
-                    eprintln!("{}: {}", e.code.as_str(), e.source);
+                    // `CopyError`'s Display is already "CODE: source", and it appends a
+                    // staging temporary that could not be removed. Re-assembling the
+                    // first half by hand here would silently drop that second half, so
+                    // the one thing the user needs in order to clean up would never be
+                    // printed.
+                    eprintln!("{e}");
                     ExitCode::from(1)
                 }
             }

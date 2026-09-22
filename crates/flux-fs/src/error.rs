@@ -40,6 +40,12 @@ impl Code {
 #[error("{}: {source}", code.as_str())]
 pub struct FsError {
     pub code: Code,
+    /// The failure itself, kept INTACT. Never wrap this to bolt on context: rebuilding
+    /// it as `Error::other(format!(..))` destroys `raw_os_error()`, and MEASURED on
+    /// Linux that turns `classify` from `DiskFull` into `IoError`. Context that belongs
+    /// to a caller's workflow -- a staging temporary left behind, say -- belongs in that
+    /// caller's own error type, not here: this is the portable filesystem contract and
+    /// every operation shares it.
     #[source]
     pub source: std::io::Error,
 }

@@ -29,6 +29,15 @@ struct Inner {
     perms: HashMap<String, Option<Perms>>,
     /// consumed by the next `write` on a handle from `create_new`
     write_fault: Option<std::io::Error>,
+    /// call name -> the `ErrorKind` an injected fault should carry. Without this the
+    /// fake could only ever produce `ErrorKind::Other`, so code branching on the kind
+    /// was unreachable from a test -- `cargo mutants` measured exactly that, and two
+    /// `NotFound` guards survived mutation because of it.
+    fault_kinds: HashMap<String, std::io::ErrorKind>,
+    /// call name -> (which call, code, kind), for a step that calls the same method
+    /// more than once and needs the LATER one to fail.
+    nth_faults: HashMap<String, (u32, Code, std::io::ErrorKind)>,
+    call_counts: HashMap<String, u32>,
 }
 
 /// Move a name's content AND its metadata. Moving only the bytes meant the times and
@@ -121,6 +130,26 @@ impl FaultFs {
 
     /// Make the next call to `name` fail with `code`.
     /// Fail the next call to `name`, once.
+    /// Inject a fault whose source carries a CHOSEN `ErrorKind`.
+    ///
+    /// `fail` alone always produced `ErrorKind::Other`, so any code branching on the
+    /// kind -- `discard`'s `NotFound` arm, `copy_file`'s step-7 `NotFound` arm -- could
+    /// not be reached through injection at all. Measured with `cargo mutants`: both
+    /// guards survived mutation because no test could express the input that
+    /// distinguishes them.
+    pub fn fail_kind(&self, name: &str, code: Code, kind: std::io::ErrorKind) {
+        let mut g = self.inner.lock().unwrap();
+        g.faults.insert(name.to_string(), code);
+        g.fault_kinds.insert(name.to_string(), kind);
+    }
+
+    /// Inject a fault on the Nth call of `name` rather than the first, so a step that
+    /// calls the same method twice can have its LATER call fail.
+    pub fn fail_nth(&self, name: &str, nth: u32, code: Code, kind: std::io::ErrorKind) {
+        let mut g = self.inner.lock().unwrap();
+        g.nth_faults.insert(name.to_string(), (nth, code, kind));
+    }
+
     pub fn fail(&self, name: &str, code: Code) {
         self.inner.lock().unwrap().faults.insert(name.to_string(), code);
     }
@@ -191,13 +220,31 @@ impl FaultFs {
     fn record(&self, call: String, key: &str) -> Result<()> {
         let mut g = self.inner.lock().unwrap();
         g.calls.push(call);
+        let n = {
+            let c = g.call_counts.entry(key.to_string()).or_insert(0);
+            *c += 1;
+            *c
+        };
+        if let Some(&(nth, code, kind)) = g.nth_faults.get(key)
+            && n == nth
+        {
+            return Err(FsError::new(code, std::io::Error::new(kind, "injected")));
+        }
         if let Some(code) = g.always.get(key).copied() {
-            return Err(FsError::new(code, std::io::Error::other("injected")));
+            return Err(Self::injected(code, g.fault_kinds.get(key).copied()));
         }
         if let Some(code) = g.faults.remove(key) {
-            return Err(FsError::new(code, std::io::Error::other("injected")));
+            return Err(Self::injected(code, g.fault_kinds.remove(key)));
         }
         Ok(())
+    }
+
+    /// `ErrorKind::Other` unless a test asked for a specific kind.
+    fn injected(code: Code, kind: Option<std::io::ErrorKind>) -> FsError {
+        match kind {
+            Some(k) => FsError::new(code, std::io::Error::new(k, "injected")),
+            None => FsError::new(code, std::io::Error::other("injected")),
+        }
     }
 }
 

@@ -2,7 +2,7 @@
 
 use flux_fs::{
     Code, CopyOptions, Durability, FileHandle, FileSystem, FsError, MetadataFailure, MetadataItem,
-    Outcome, Preserve, Publish, Result, temp_path,
+    Outcome, Preserve, Publish, temp_path,
 };
 use std::io::Write;
 use std::path::Path;
@@ -25,28 +25,91 @@ fn copy_code(e: &std::io::Error) -> Code {
     }
 }
 
+/// The engine's error: a filesystem failure, plus anything the ENGINE knows that the
+/// filesystem layer cannot.
+///
+/// `flux-fs` defines the portable filesystem contract, and a staging temporary is not
+/// part of it -- `metadata` and `open_read` have no notion of one. So the leftover is
+/// recorded here, at the boundary that owns the concept, rather than as a field every
+/// `FsError` in the workspace would carry and never set.
+///
+/// `cause` is kept INTACT for the same reason it always was: this used to be reported by
+/// replacing the source with `Error::other(format!(..))`, and MEASURED on Linux that
+/// turned `classify` from `DiskFull` into `IoError`, because `Error::other` carries no
+/// `raw_os_error()`.
+#[derive(Debug)]
+pub struct CopyError {
+    /// The failure that stopped the copy.
+    pub cause: FsError,
+    /// A staging temporary that outlived the failure because it could not be removed,
+    /// with the reason removal failed. STRUCTURED, not pre-rendered: a caller that wants
+    /// to sweep it needs the path itself, not a path inside a sentence.
+    pub leftover: Option<(std::path::PathBuf, std::io::Error)>,
+}
+
+impl std::fmt::Display for CopyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.cause)?;
+        if let Some((path, why)) = &self.leftover {
+            write!(f, "; temporary left at {} ({why})", path.display())?;
+        }
+        Ok(())
+    }
+}
+
+/// Hand-written rather than derived: `Display` is already hand-written, and this keeps
+/// the `source()` chain pointing at the REAL `FsError` so `anyhow`-style walkers and
+/// `{:#}` formatting still reach the underlying `io::Error` and its `raw_os_error()`.
+impl std::error::Error for CopyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
+impl CopyError {
+    fn new(cause: FsError) -> Self {
+        CopyError { cause, leftover: None }
+    }
+
+    /// The spec code of the failure, which is what nearly every caller wants.
+    pub fn code(&self) -> Code {
+        self.cause.code
+    }
+}
+
+impl From<FsError> for CopyError {
+    fn from(cause: FsError) -> Self {
+        CopyError::new(cause)
+    }
+}
+
 /// Remove the temporary after a failure and build the error to return.
 ///
 /// The removal is never discarded: if the temporary survives, its path goes into the
 /// error, because a leftover the caller is never told about is a leak the user cannot
 /// even find. Only called where the temporary is known to exist.
-fn discard<F: FileSystem>(fs: &F, temp: &Path, code: Code, source: std::io::Error) -> FsError {
+fn discard<F: FileSystem>(fs: &F, temp: &Path, code: Code, source: std::io::Error) -> CopyError {
     match fs.remove_file(temp) {
-        Ok(()) => FsError::new(code, source),
+        Ok(()) => CopyError::new(FsError::new(code, source)),
         // NotFound means it is already gone -- something else removed it, or it was
         // never created. Reporting a leftover here would send someone hunting a file
         // that does not exist.
-        Err(e) if e.source.kind() == std::io::ErrorKind::NotFound => FsError::new(code, source),
+        Err(e) if e.source.kind() == std::io::ErrorKind::NotFound => {
+            CopyError::new(FsError::new(code, source))
+        }
         // Carry the removal's own error too: "a temporary was left" without "because
         // the volume went away" tells an operator where to look but not what happened.
-        Err(why) => FsError::new(
-            code,
-            std::io::Error::other(format!(
-                "{source}; temporary left at {} ({})",
-                temp.display(),
-                why.source
-            )),
-        ),
+        //
+        // It goes in `temp_left`, NOT over the top of `source`. Wrapping the primary
+        // failure in `Error::other(format!(..))` is what this used to do, and MEASURED
+        // on Linux that turned `classify` from `DiskFull` into `IoError`, because
+        // `Error::other` carries no `raw_os_error()` and that is exactly what the
+        // disk-full arm keys on. The same mistake -- destroying an OS code to build a
+        // message -- was already folded once in this crate at a different site.
+        Err(why) => CopyError {
+            cause: FsError::new(code, source),
+            leftover: Some((temp.to_path_buf(), why.source)),
+        },
     }
 }
 
@@ -55,7 +118,7 @@ pub fn copy_file<F: FileSystem>(
     src: &Path,
     dst: &Path,
     opts: &CopyOptions,
-) -> Result<Outcome> {
+) -> std::result::Result<Outcome, CopyError> {
     // 0. refuse a self-copy BEFORE touching the filesystem. This must precede every
     //    call below, including the leftover sweep, because
     //    `a_self_copy_is_refused_before_anything_is_touched` asserts the recorded
@@ -68,10 +131,10 @@ pub fn copy_file<F: FileSystem>(
     //    goes through a distinct temporary -- but it is not the refusal the invariant
     //    asks for either. Task 10 records the gap.
     if src == dst {
-        return Err(FsError::new(
+        return Err(CopyError::new(FsError::new(
             Code::SafetyRejected,
             std::io::Error::other("source and destination are the same path"),
-        ));
+        )));
     }
 
     let temp = temp_path(dst, &opts.operation_id);
@@ -85,10 +148,10 @@ pub fn copy_file<F: FileSystem>(
     // 2. source, captured for the step-7 re-check
     let src_meta = fs.metadata(src)?;
     if !src_meta.is_file {
-        return Err(FsError::new(
+        return Err(CopyError::new(FsError::new(
             Code::SpecialFileUnsupported,
             std::io::Error::other("not a regular file"),
-        ));
+        )));
     }
     let mut reader = fs.open_read(src)?;
 
@@ -237,7 +300,7 @@ mod tests {
         o.preserve_times = Preserve::Strict;
         let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &o).unwrap_err();
 
-        assert_eq!(err.code, flux_fs::Code::MetadataApplyFailed);
+        assert_eq!(err.code(), flux_fs::Code::MetadataApplyFailed);
         assert!(!fs.called("rename_replace"), "must not publish; got {:?}", fs.calls());
         assert!(!fs.exists("/dst"));
         assert!(!fs.exists("/dst.flux-partial.op1"), "temporary must be removed");
@@ -265,7 +328,7 @@ mod tests {
 
         let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap_err();
 
-        assert_eq!(err.code, flux_fs::Code::DiskFull);
+        assert_eq!(err.code(), flux_fs::Code::DiskFull);
         assert!(!fs.called("rename_replace"));
         assert!(!fs.exists("/dst.flux-partial.op1"));
     }
@@ -281,7 +344,7 @@ mod tests {
 
         let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap_err();
 
-        assert_eq!(err.code, flux_fs::Code::PermissionDenied);
+        assert_eq!(err.code(), flux_fs::Code::PermissionDenied);
         assert!(!fs.exists("/dst.flux-partial.op1"));
     }
 
@@ -295,7 +358,7 @@ mod tests {
 
         let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap_err();
 
-        assert_eq!(err.code, flux_fs::Code::IoError);
+        assert_eq!(err.code(), flux_fs::Code::IoError);
         assert!(!fs.exists("/dst.flux-partial.op1"));
     }
 
@@ -308,7 +371,7 @@ mod tests {
 
         let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap_err();
 
-        assert_eq!(err.code, flux_fs::Code::CopyFailed);
+        assert_eq!(err.code(), flux_fs::Code::CopyFailed);
         assert!(!fs.called("rename_replace"), "must not publish");
         assert!(!fs.exists("/dst.flux-partial.op1"));
     }
@@ -324,9 +387,16 @@ mod tests {
 
         let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap_err();
 
-        let msg = err.source.to_string();
-        assert!(msg.contains("/dst.flux-partial.op1"), "must name the leftover; got {msg}");
-        assert!(msg.contains("injected"), "must carry why it could not be removed; got {msg}");
+        // The REQUIREMENT is unchanged -- a leftover the caller is never told about is
+        // one the user cannot find -- but it is no longer met by overwriting `source`.
+        // That shape destroyed `raw_os_error()` and with it the DiskFull verdict
+        // (measured on Linux: classify went DiskFull -> IoError), so the leftover moved
+        // to `temp_left` and `source` now stays intact. The assertion follows the
+        // requirement, not the old mechanism.
+        let (path, why) = err.leftover.as_ref().expect("the leftover must be reported");
+        assert_eq!(path, Path::new("/dst.flux-partial.op1"), "the PATH, not a sentence");
+        assert!(why.to_string().contains("injected"), "must carry why removal failed; got {why}");
+        assert!(err.to_string().contains("/dst.flux-partial.op1"), "and it must be visible: {err}");
     }
 
     #[test]
@@ -334,7 +404,7 @@ mod tests {
         let fs = FaultFs::new();
         let err = copy_file(&fs, Path::new("/nope"), Path::new("/dst"), &opts()).unwrap_err();
         assert!(!fs.called("create_new"), "nothing is created before the source is checked");
-        assert_eq!(err.code, flux_fs::Code::IoError);
+        assert_eq!(err.code(), flux_fs::Code::IoError);
     }
 
     #[test]
@@ -342,7 +412,7 @@ mod tests {
         let fs = FaultFs::new();
         fs.write_file("/a", b"hello");
         let err = copy_file(&fs, Path::new("/a"), Path::new("/a"), &opts()).unwrap_err();
-        assert_eq!(err.code, flux_fs::Code::SafetyRejected);
+        assert_eq!(err.code(), flux_fs::Code::SafetyRejected);
         assert!(fs.calls().is_empty(), "refuse before any call; got {:?}", fs.calls());
     }
 
@@ -357,7 +427,7 @@ mod tests {
 
         let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap_err();
 
-        assert_eq!(err.code, flux_fs::Code::SourceChanged);
+        assert_eq!(err.code(), flux_fs::Code::SourceChanged);
         assert!(!fs.called("rename_replace"), "must not publish a stale copy");
         assert!(!fs.exists("/dst.flux-partial.op1"));
     }
@@ -370,7 +440,7 @@ mod tests {
 
         let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap_err();
 
-        assert_eq!(err.code, flux_fs::Code::SourceChanged);
+        assert_eq!(err.code(), flux_fs::Code::SourceChanged);
         assert!(!fs.called("rename_replace"), "must not publish");
         assert!(!fs.exists("/dst.flux-partial.op1"));
     }
@@ -417,7 +487,7 @@ mod tests {
 
         let err = copy_file(&fs, Path::new("/dev/null"), Path::new("/dst"), &opts()).unwrap_err();
 
-        assert_eq!(err.code, flux_fs::Code::SpecialFileUnsupported);
+        assert_eq!(err.code(), flux_fs::Code::SpecialFileUnsupported);
         assert!(!fs.called("open_read"), "must refuse before opening it");
         assert!(!fs.called("create_new"), "and before creating anything");
     }
@@ -496,7 +566,7 @@ mod tests {
         // A target that already exists is a destination-side refusal, not a
         // content-copy failure: the IO_ERROR catch-all until a later cut adds
         // DESTINATION_ERROR.
-        assert_eq!(err.code, flux_fs::Code::IoError);
+        assert_eq!(err.code(), flux_fs::Code::IoError);
         assert!(!fs.exists("/dst.flux-partial.op1"), "temporary must be removed");
     }
 
@@ -523,7 +593,96 @@ mod tests {
         o.durability = Durability::Strict;
         let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &o).unwrap_err();
 
-        assert_eq!(err.code, flux_fs::Code::StrictDurabilityUnavailable);
+        assert_eq!(err.code(), flux_fs::Code::StrictDurabilityUnavailable);
         assert!(!fs.called("rename_replace"));
+    }
+
+    #[test]
+    fn a_temporary_already_gone_is_not_reported_as_left_behind() {
+        // `discard`'s NotFound arm. If the temporary is already gone, saying "temporary
+        // left at /tmp" sends an operator hunting a file that does not exist.
+        //
+        // MEASURED by `cargo mutants` before this test existed: replacing that guard
+        // with `false` was NOT caught, because `fail` could only inject
+        // `ErrorKind::Other` and no test could express a NotFound removal.
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.fail("rename_replace", flux_fs::Code::PermissionDenied);
+        // The SECOND remove_file: the first is step 1's leftover sweep, and a one-shot
+        // fault aimed at "remove_file" is eaten there, leaving this test passing
+        // vacuously. Found by watching the sibling test below fail for that reason.
+        fs.fail_nth("remove_file", 2, flux_fs::Code::IoError, std::io::ErrorKind::NotFound);
+
+        let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap_err();
+
+        assert_eq!(
+            err.code(),
+            flux_fs::Code::PermissionDenied,
+            "the publish failure is the verdict"
+        );
+        assert!(err.leftover.is_none(), "already gone is not left behind: {:?}", err.leftover);
+    }
+
+    #[test]
+    fn a_left_behind_temporary_does_not_destroy_the_primary_error() {
+        // The other arm: removal genuinely failed, so the leftover IS reported -- but in
+        // `temp_left`, never by wrapping `source`. MEASURED on Linux: wrapping turned
+        // `classify` from DiskFull into IoError, because `Error::other` carries no
+        // `raw_os_error()`.
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.fail("rename_replace", flux_fs::Code::DiskFull);
+        fs.fail_nth("remove_file", 2, flux_fs::Code::IoError, std::io::ErrorKind::Other);
+
+        let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap_err();
+
+        assert_eq!(err.code(), flux_fs::Code::DiskFull);
+        assert!(err.leftover.is_some(), "a genuine removal failure must be reported");
+        assert!(err.to_string().contains("temporary left at"), "{err}");
+    }
+
+    #[test]
+    fn a_step_seven_failure_that_is_not_notfound_keeps_its_own_code() {
+        // `copy_file`'s step-7 guard. Only a VANISHED source is SOURCE_CHANGED; any other
+        // failure of the re-check must keep the code the platform layer gave it, or it is
+        // hidden among unrelated failures.
+        //
+        // MEASURED by `cargo mutants` before this test existed: replacing that guard with
+        // `true` was NOT caught. `metadata` is called exactly twice -- step 1 and step 7 --
+        // so the fault targets the second.
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.fail_nth(
+            "metadata",
+            2,
+            flux_fs::Code::PermissionDenied,
+            std::io::ErrorKind::PermissionDenied,
+        );
+
+        let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap_err();
+
+        assert_eq!(err.code(), flux_fs::Code::PermissionDenied, "not SOURCE_CHANGED");
+        assert!(!fs.called("rename_replace"), "must not publish");
+    }
+
+    #[test]
+    fn the_source_chain_still_reaches_the_os_error() {
+        // The design consult flagged this as the property that must not break: if
+        // `source()` returned `None`, `{:#}` walkers and anyhow-style tools would stop
+        // at `CopyError` and never reach `raw_os_error()` -- which is exactly what the
+        // DiskFull arm of `classify` keys on, and exactly the loss that made `discard`
+        // a defect in the first place.
+        //
+        // MEASURED by `cargo mutants`: replacing that impl's body with `None` was NOT
+        // caught until this test existed. The fix for the original defect had quietly
+        // introduced an untested line of its own.
+        use std::error::Error as _;
+
+        let err: CopyError =
+            FsError::new(Code::IoError, std::io::Error::from_raw_os_error(5)).into();
+
+        let cause = err.source().expect("CopyError must expose its cause");
+        let fs_err = cause.downcast_ref::<FsError>().expect("the cause is an FsError");
+        assert_eq!(fs_err.source.raw_os_error(), Some(5), "the OS code must survive the chain");
     }
 }
