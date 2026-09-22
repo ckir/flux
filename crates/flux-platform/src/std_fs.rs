@@ -41,6 +41,48 @@ impl FileHandle for StdFile {
 
 pub struct StdFileSystem;
 
+/// Can this process actually replace the destination NAME?
+///
+/// `Permissions::readonly()` asks only whether ANY write bit is set, which is the wrong
+/// question. Measured on Linux: a root-owned `0644` file reports writable to a normal
+/// user, `cp` refuses it with "Permission denied", and `rename(2)` replaces it anyway,
+/// because rename consults the DIRECTORY's permission and never the file's. So ask the
+/// question `cp` asks -- can WE write this name?
+#[cfg(unix)]
+fn destination_is_write_protected(to: &Path) -> bool {
+    use rustix::fs::{Access, AtFlags, CWD, accessat};
+
+    match std::fs::symlink_metadata(to) {
+        // Nothing occupies the name, so there is nothing to protect.
+        Err(_) => false,
+        // `rename` replaces the LINK and never follows it, so the target's permissions
+        // are irrelevant. `accessat` WOULD follow it, and without this arm it refuses a
+        // rename that is perfectly safe -- the case
+        // `rename_replace_allows_a_symlink_whose_target_is_read_only` pins.
+        Ok(m) if m.file_type().is_symlink() => false,
+        // `EACCESS` asks about the EFFECTIVE uid, which is the credential `rename`
+        // itself enforces; plain `access(2)` would ask about the real one.
+        //
+        // Only these three errnos mean "you may not write this". Anything else -- EIO,
+        // ENOMEM, ETXTBSY -- is NOT a protection, and converting it into "destination is
+        // read-only" would both lie and hide a real failure. Measured: for a RUNNING
+        // binary, `access(W_OK)` returns OK while `open(O_WRONLY)` returns ETXTBSY, and
+        // `rename` over it succeeds, so atomic binary replacement keeps working.
+        Ok(_) => matches!(
+            accessat(CWD, to, Access::WRITE_OK, AtFlags::EACCESS),
+            Err(rustix::io::Errno::ACCESS | rustix::io::Errno::PERM | rustix::io::Errno::ROFS)
+        ),
+    }
+}
+
+/// The Windows half. Its `rename` already consults the read-only attribute, so the
+/// attribute is the protection that exists here. Real ACL evaluation would need
+/// `AccessCheck` against the thread token and is deliberately out of scope.
+#[cfg(windows)]
+fn destination_is_write_protected(to: &Path) -> bool {
+    std::fs::symlink_metadata(to).is_ok_and(|m| m.permissions().readonly())
+}
+
 impl FileSystem for StdFileSystem {
     type Reader = StdReader;
     type Writer = StdFile;
@@ -113,13 +155,7 @@ impl FileSystem for StdFileSystem {
         // other reason it stays weakened. Deleting the target first is worse still --
         // on Windows a target held open with FILE_SHARE_DELETE enters pending-delete,
         // the rename fails, and the destination is lost when the reader closes it.
-        // `symlink_metadata`, NOT `metadata`: the guard must judge the NAME being
-        // replaced, not whatever it points at. `rename` replaces a symlink itself and
-        // never touches its target, so consulting the target would refuse a rename
-        // that is perfectly safe. Measured: for a symlink to a read-only file,
-        // `metadata(link).readonly()` is true while `symlink_metadata(link)` is false,
-        // and the rename leaves the target's bytes untouched.
-        if std::fs::symlink_metadata(to).is_ok_and(|m| m.permissions().readonly()) {
+        if destination_is_write_protected(to) {
             return Err(FsError::new(
                 flux_fs::Code::PermissionDenied,
                 std::io::Error::new(

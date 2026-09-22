@@ -157,3 +157,61 @@ fn rename_no_replace_refuses_a_dangling_symlink() {
     let m = std::fs::symlink_metadata(&to).expect("the link itself must survive");
     assert!(m.file_type().is_symlink(), "the link must not have been replaced");
 }
+
+#[test]
+#[cfg(unix)]
+fn rename_replace_refuses_a_target_this_user_cannot_write() {
+    // The case `Permissions::readonly()` cannot see. A root-owned 0644 file has the
+    // owner write bit SET, so `readonly()` reports false and the old guard passed --
+    // yet this user cannot write it, and `cp` refuses with "Permission denied".
+    // `rename(2)` would replace it anyway, because rename consults the DIRECTORY's
+    // permission and never the file's. Measured before the fix: the file was
+    // destroyed by a normal user.
+    //
+    // Needs a file owned by somebody else, so it needs root to build the fixture.
+    // Skips rather than fails where that is not available, so it never goes red
+    // spuriously; GitHub's ubuntu and macos runners both grant passwordless sudo.
+    if !std::process::Command::new("sudo").args(["-n", "true"]).status().is_ok_and(|s| s.success())
+    {
+        eprintln!("skipped: no passwordless sudo, cannot build a root-owned fixture");
+        return;
+    }
+
+    let d = TempDir::new().unwrap();
+    let (from, to) = (d.path().join("from"), d.path().join("to"));
+    let fs = StdFileSystem;
+    let mut f = fs.create_new(&from).unwrap();
+    f.write_all(b"new").unwrap();
+    drop(f);
+
+    let sh = format!("echo protected > {t} && chmod 0644 {t} && chown 0:0 {t}", t = to.display());
+    assert!(
+        std::process::Command::new("sudo")
+            .args(["-n", "sh", "-c", &sh])
+            .status()
+            .unwrap()
+            .success(),
+        "fixture"
+    );
+
+    // The owner write bit is set, so the attribute check alone would let this through.
+    let mode =
+        std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&to).unwrap().permissions());
+    assert_eq!(mode & 0o777, 0o644, "the fixture must look writable to a bit check");
+    assert!(!std::fs::metadata(&to).unwrap().permissions().readonly(), "readonly() is blind here");
+
+    assert!(fs.rename_replace(&from, &to).is_err(), "a file we cannot write must be refused");
+    assert_eq!(
+        std::process::Command::new("sudo")
+            .args(["-n", "cat", &to.display().to_string()])
+            .output()
+            .unwrap()
+            .stdout,
+        b"protected\n",
+        "the protected file must survive"
+    );
+
+    let _ = std::process::Command::new("sudo")
+        .args(["-n", "rm", "-f", &to.display().to_string()])
+        .status();
+}
