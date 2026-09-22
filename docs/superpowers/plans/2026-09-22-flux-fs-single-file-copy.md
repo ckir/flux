@@ -29,7 +29,8 @@ Checked against the repository at `6472a57` while writing. Re-check if `main` ha
 | `flux-platform` has `tempfile` as a dev-dependency only | its `Cargo.toml` |
 | `thiserror = "2"`, `clap = { version = "4.6", features = ["derive"] }`, `tempfile = "3"` are in `[workspace.dependencies]` | root `Cargo.toml` |
 | tests run with `cargo nextest run --workspace --no-tests=pass` | `justfile:12-13` |
-| `just check` = `fmt-check clippy typos test` | `justfile:46` |
+| `just check` = `fmt-check clippy typos test` | `justfile:41` |
+| clippy runs `--workspace --all-targets -- -D warnings`, so a warning fails the gate | `justfile:22` |
 | `rustfmt.toml` sets `max_width = 100`, `use_small_heuristics = "Max"`, edition 2024 | `rustfmt.toml` |
 | `flux-cli` has `[[bin]] name = "flux"`, `path = "src/main.rs"` | `crates/flux-cli/Cargo.toml` |
 | the probes are `fs1_..` to `fs11_..` in `crates/flux-platform/tests/fs_semantics.rs` | `grep -n "^fn fs"` |
@@ -379,7 +380,10 @@ git commit -m "feat(flux-fs): copy options, outcome, and the normative temp name
 - Modify: `crates/flux-fs/src/lib.rs`
 
 A trait alone has no behaviour to test, so the test here is that a **trivial implementation
-compiles** — which is the real risk with a trait (an un-implementable signature).
+compiles** — which is the real risk with a trait (an un-implementable signature). The trivial
+implementation uses two separate handle structs, because the trait deliberately separates the
+reader from the writer; an implementation that reuses one struct for both would still compile and
+would not exercise that separation.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -391,14 +395,17 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
 
-    struct NullHandle;
+    struct NullReader;
 
-    impl Read for NullHandle {
+    impl Read for NullReader {
         fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
             Ok(0)
         }
     }
-    impl Write for NullHandle {
+
+    struct NullWriter;
+
+    impl Write for NullWriter {
         fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
             Ok(b.len())
         }
@@ -406,7 +413,7 @@ mod tests {
             Ok(())
         }
     }
-    impl FileHandle for NullHandle {
+    impl FileHandle for NullWriter {
         fn sync_all(&self) -> crate::Result<()> {
             Ok(())
         }
@@ -415,25 +422,30 @@ mod tests {
     struct NullFs;
 
     impl FileSystem for NullFs {
-        type File = NullHandle;
+        type Reader = NullReader;
+        type Writer = NullWriter;
 
-        fn open_read(&self, _: &Path) -> crate::Result<Self::File> {
-            Ok(NullHandle)
+        fn open_read(&self, _: &Path) -> crate::Result<Self::Reader> {
+            Ok(NullReader)
         }
 
-        fn create_new(&self, _: &Path) -> crate::Result<Self::File> {
-            Ok(NullHandle)
+        fn create_new(&self, _: &Path) -> crate::Result<Self::Writer> {
+            Ok(NullWriter)
         }
 
         fn metadata(&self, _: &Path) -> crate::Result<Metadata> {
             Ok(Metadata { len: 0, is_file: true, permissions: None, modified: None })
         }
 
-        fn set_times(&self, _: &Self::File, _: Option<std::time::SystemTime>) -> crate::Result<()> {
+        fn set_times(
+            &self,
+            _: &Self::Writer,
+            _: Option<std::time::SystemTime>,
+        ) -> crate::Result<()> {
             Ok(())
         }
 
-        fn set_permissions(&self, _: &Self::File, _: Option<Perms>) -> crate::Result<()> {
+        fn set_permissions(&self, _: &Self::Writer, _: Option<Perms>) -> crate::Result<()> {
             Ok(())
         }
 
@@ -455,7 +467,6 @@ mod tests {
         let fs = NullFs;
         assert!(fs.metadata(Path::new("x")).unwrap().is_file);
     }
-
 }
 ```
 
@@ -495,27 +506,43 @@ pub struct Metadata {
     pub modified: Option<SystemTime>,
 }
 
-pub trait FileHandle: Read + Write {
+/// A handle open for writing. Deliberately NOT `Read`: see `FileSystem::Reader`.
+pub trait FileHandle: Write {
     fn sync_all(&self) -> Result<()>;
 }
 
 pub trait FileSystem: Send + Sync {
-    type File: FileHandle;
+    /// A handle open for reading, and only reading.
+    ///
+    /// Two associated types rather than one, because with a single
+    /// `type File: Read + Write` the handle returned by `open_read` accepts
+    /// `write_all` -- it compiles and fails at run time on a read-only descriptor.
+    /// `copy_file` is generic over this trait, so within it `Self::Reader` is known
+    /// only to be `Read`, and writing to the source is a compile error even where
+    /// the concrete reader type happens to implement `Write` as well.
+    ///
+    /// The cost is that `set_times` and `set_permissions` take `&Self::Writer`. If a
+    /// later requirement needs to modify the SOURCE's metadata, it needs its own
+    /// methods rather than reusing these.
+    type Reader: Read;
 
-    fn open_read(&self, path: &Path) -> Result<Self::File>;
+    /// A handle open for writing, used for the temporary.
+    type Writer: FileHandle;
+
+    fn open_read(&self, path: &Path) -> Result<Self::Reader>;
 
     /// Exclusive create: fails if the path exists. FS-1 measured that a second
     /// exclusive create fails, which is what makes the temporary safe.
-    fn create_new(&self, path: &Path) -> Result<Self::File>;
+    fn create_new(&self, path: &Path) -> Result<Self::Writer>;
 
     fn metadata(&self, path: &Path) -> Result<Metadata>;
 
     /// On the HANDLE, not the path: the temporary must be fully prepared before
     /// publication, and addressing it by path in between is a race. FS-4 and FS-5
     /// measured that a handle survives both rename and unlink.
-    fn set_times(&self, file: &Self::File, modified: Option<SystemTime>) -> Result<()>;
+    fn set_times(&self, file: &Self::Writer, modified: Option<SystemTime>) -> Result<()>;
 
-    fn set_permissions(&self, file: &Self::File, perms: Option<Perms>) -> Result<()>;
+    fn set_permissions(&self, file: &Self::Writer, perms: Option<Perms>) -> Result<()>;
 
     /// Publishes over an existing target.
     fn rename_replace(&self, from: &Path, to: &Path) -> Result<()>;
@@ -690,14 +717,6 @@ impl FaultFs {
         self.inner.lock().unwrap().faults.insert(name.to_string(), code);
     }
 
-    /// Hands each new handle the shared `sync_all` fault slot, so `fail("sync_all", ..)`
-    /// reaches a handle created afterwards.
-    fn sync_slot(&self) -> std::sync::Arc<Mutex<Option<Code>>> {
-        let mut g = self.inner.lock().unwrap();
-        let code = g.faults.remove("sync_all");
-        std::sync::Arc::new(Mutex::new(code))
-    }
-
     pub fn calls(&self) -> Vec<String> {
         self.inner.lock().unwrap().calls.clone()
     }
@@ -724,9 +743,14 @@ impl FaultFs {
 }
 
 impl FileSystem for FaultFs {
-    type File = FakeHandle;
+    // One concrete type serves both roles here, and that is fine: `copy_file` is
+    // generic over `FileSystem`, so inside it `F::Reader` is known only to be `Read`
+    // no matter what the concrete type also implements. The fake does not need two
+    // structs to give the algorithm the compile-time separation.
+    type Reader = FakeHandle;
+    type Writer = FakeHandle;
 
-    fn open_read(&self, path: &Path) -> Result<Self::File> {
+    fn open_read(&self, path: &Path) -> Result<Self::Reader> {
         let p = path.display().to_string();
         self.record(format!("open_read({p})"), "open_read")?;
         let g = self.inner.lock().unwrap();
@@ -742,7 +766,7 @@ impl FileSystem for FaultFs {
         })
     }
 
-    fn create_new(&self, path: &Path) -> Result<Self::File> {
+    fn create_new(&self, path: &Path) -> Result<Self::Writer> {
         let p = path.display().to_string();
         self.record(format!("create_new({p})"), "create_new")?;
         let mut g = self.inner.lock().unwrap();
@@ -753,7 +777,11 @@ impl FileSystem for FaultFs {
             ));
         }
         g.files.insert(p.clone(), Vec::new());
-        Ok(FakeHandle { path: p, buf: Vec::new(), read_pos: 0, sync_fault: self.sync_slot() })
+        // Take the injected fault from the guard already held. A helper that locks
+        // `inner` again would DEADLOCK here -- `std::sync::Mutex` is not reentrant --
+        // and every test that creates a temporary would hang forever.
+        let sync_fault = std::sync::Arc::new(Mutex::new(g.faults.remove("sync_all")));
+        Ok(FakeHandle { path: p, buf: Vec::new(), read_pos: 0, sync_fault })
     }
 
     fn metadata(&self, path: &Path) -> Result<Metadata> {
@@ -762,12 +790,11 @@ impl FileSystem for FaultFs {
         let mut g = self.inner.lock().unwrap();
         let n = g.metadata_reads.entry(p.clone()).or_insert(0);
         *n += 1;
-        if *n == 2 {
-            if let Some(extra) = g.grow.get(&p).cloned() {
-                if let Some(b) = g.files.get_mut(&p) {
-                    b.extend_from_slice(&extra);
-                }
-            }
+        if *n == 2
+            && let Some(extra) = g.grow.get(&p).cloned()
+            && let Some(b) = g.files.get_mut(&p)
+        {
+            b.extend_from_slice(&extra);
         }
         let g = &*g;
         let len = g.files.get(&p).map(|b| b.len() as u64).ok_or_else(|| {
@@ -781,13 +808,13 @@ impl FileSystem for FaultFs {
         })
     }
 
-    fn set_times(&self, file: &Self::File, modified: Option<SystemTime>) -> Result<()> {
+    fn set_times(&self, file: &Self::Writer, modified: Option<SystemTime>) -> Result<()> {
         self.record(format!("set_times({})", file.path), "set_times")?;
         self.inner.lock().unwrap().times.insert(file.path.clone(), modified);
         Ok(())
     }
 
-    fn set_permissions(&self, file: &Self::File, _perms: Option<Perms>) -> Result<()> {
+    fn set_permissions(&self, file: &Self::Writer, _perms: Option<Perms>) -> Result<()> {
         self.record(format!("set_permissions({})", file.path), "set_permissions")
     }
 
@@ -931,8 +958,8 @@ Above the tests in `crates/flux-core/src/copy.rs`:
 //! Single-file copy. The algorithm lives here once; platforms supply primitives.
 
 use flux_fs::{
-    Code, CopyOptions, Durability, FileSystem, FsError, MetadataFailure, MetadataItem, Outcome,
-    Preserve, Publish, Result, temp_path,
+    Code, CopyOptions, Durability, FileHandle, FileSystem, FsError, MetadataFailure, MetadataItem,
+    Outcome, Preserve, Publish, Result, temp_path,
 };
 use std::io::Write;
 use std::path::Path;
@@ -1031,31 +1058,31 @@ pub fn copy_file<F: FileSystem>(
     }
 
     // 5. durability
-    if opts.durability == Durability::Strict {
-        if let Err(e) = writer.sync_all() {
-            return Err(discard(fs, &temp, Code::StrictDurabilityUnavailable, e.source));
-        }
+    if opts.durability == Durability::Strict
+        && let Err(e) = writer.sync_all()
+    {
+        return Err(discard(fs, &temp, Code::StrictDurabilityUnavailable, e.source));
     }
 
     // 6. metadata, on the temporary, BEFORE publication (§44.1)
     let mut metadata_failures = Vec::new();
 
-    if opts.preserve_times != Preserve::Off {
-        if let Err(e) = fs.set_times(&writer, src_meta.modified) {
-            if opts.preserve_times == Preserve::Strict {
-                return Err(discard(fs, &temp, Code::MetadataApplyFailed, e.source));
-            }
-            metadata_failures.push(MetadataFailure { item: MetadataItem::Times, error: e });
+    if opts.preserve_times != Preserve::Off
+        && let Err(e) = fs.set_times(&writer, src_meta.modified)
+    {
+        if opts.preserve_times == Preserve::Strict {
+            return Err(discard(fs, &temp, Code::MetadataApplyFailed, e.source));
         }
+        metadata_failures.push(MetadataFailure { item: MetadataItem::Times, error: e });
     }
 
-    if opts.preserve_permissions != Preserve::Off {
-        if let Err(e) = fs.set_permissions(&writer, src_meta.permissions) {
-            if opts.preserve_permissions == Preserve::Strict {
-                return Err(discard(fs, &temp, Code::MetadataApplyFailed, e.source));
-            }
-            metadata_failures.push(MetadataFailure { item: MetadataItem::Permissions, error: e });
+    if opts.preserve_permissions != Preserve::Off
+        && let Err(e) = fs.set_permissions(&writer, src_meta.permissions)
+    {
+        if opts.preserve_permissions == Preserve::Strict {
+            return Err(discard(fs, &temp, Code::MetadataApplyFailed, e.source));
         }
+        metadata_failures.push(MetadataFailure { item: MetadataItem::Permissions, error: e });
     }
 
     // 7. the source must not have changed under us (Section 33), then publish.
@@ -1087,10 +1114,20 @@ pub fn copy_file<F: FileSystem>(
 }
 ```
 
-Add to `crates/flux-core/src/lib.rs`:
+Replace `crates/flux-core/src/lib.rs` entirely. The whole file, not an append: rustfmt's
+`reorder_modules` sorts module declarations, so `copy` must precede `fault_fs` or `fmt-check`
+rewrites it.
 
 ```rust
+//! Flux engine (spec §3.1).
+
 pub mod copy;
+
+// Test-only. Nothing outside this crate uses the fake, so it is gated on `test`
+// rather than on a `testing` feature that nothing would ever turn on -- and an
+// undeclared feature in a `cfg` is a warning the repo's clippy gate would surface.
+#[cfg(test)]
+pub mod fault_fs;
 
 pub use copy::copy_file;
 ```
@@ -1317,7 +1354,7 @@ flux-fs = { path = "../flux-fs" }
 Create `crates/flux-platform/tests/std_fs.rs`:
 
 ```rust
-use flux_fs::{FileSystem, Perms};
+use flux_fs::FileSystem;
 use flux_platform::StdFileSystem;
 use std::io::Write;
 use tempfile::TempDir;
@@ -1418,13 +1455,18 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::time::SystemTime;
 
-pub struct StdFile(File);
+/// The source handle. Read only -- it does not implement `Write` at all, so even a
+/// direct (non-generic) caller of `open_read` cannot write to the file it opened.
+pub struct StdReader(File);
 
-impl Read for StdFile {
+impl Read for StdReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.0.read(buf)
     }
 }
+
+/// The temporary's handle.
+pub struct StdFile(File);
 
 impl Write for StdFile {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -1444,13 +1486,14 @@ impl FileHandle for StdFile {
 pub struct StdFileSystem;
 
 impl FileSystem for StdFileSystem {
-    type File = StdFile;
+    type Reader = StdReader;
+    type Writer = StdFile;
 
-    fn open_read(&self, path: &Path) -> Result<Self::File> {
-        File::open(path).map(StdFile).map_err(FsError::from_io)
+    fn open_read(&self, path: &Path) -> Result<Self::Reader> {
+        File::open(path).map(StdReader).map_err(FsError::from_io)
     }
 
-    fn create_new(&self, path: &Path) -> Result<Self::File> {
+    fn create_new(&self, path: &Path) -> Result<Self::Writer> {
         OpenOptions::new()
             .write(true)
             .read(true)
@@ -1477,13 +1520,13 @@ impl FileSystem for StdFileSystem {
         })
     }
 
-    fn set_times(&self, file: &Self::File, modified: Option<SystemTime>) -> Result<()> {
+    fn set_times(&self, file: &Self::Writer, modified: Option<SystemTime>) -> Result<()> {
         let Some(t) = modified else { return Ok(()) };
         let times = std::fs::FileTimes::new().set_modified(t);
         file.0.set_times(times).map_err(FsError::from_io)
     }
 
-    fn set_permissions(&self, file: &Self::File, perms: Option<Perms>) -> Result<()> {
+    fn set_permissions(&self, file: &Self::Writer, perms: Option<Perms>) -> Result<()> {
         let Some(p) = perms else { return Ok(()) };
         let native = match p {
             #[cfg(unix)]
@@ -1537,7 +1580,7 @@ Replace `crates/flux-platform/src/lib.rs`:
 
 pub mod std_fs;
 
-pub use std_fs::{StdFile, StdFileSystem};
+pub use std_fs::{StdFile, StdFileSystem, StdReader};
 ```
 
 `rename_no_replace`'s `to.exists()` check is a **race**, not a primitive — it is the portable
