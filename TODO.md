@@ -33,6 +33,45 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
 - [ ] Integration tests: single file, directory, nested directory, multiple
       sources, zero-byte files, Unicode, spaces, newlines (spec §68.2)
 
+### Known limits of the first single-file copy (2026-09-22)
+
+- [ ] **`rename_no_replace` is a check-then-rename race**
+
+  `StdFileSystem::rename_no_replace` tests `to.exists()` and then renames. Between the two, another
+  process can create the target, and the rename replaces it — exactly what the method promises not to
+  do. The portable primitives are `renameat2(RENAME_NOREPLACE)` on Linux, `renamex_np(RENAME_EXCL)` on
+  macOS and `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` on Windows.
+
+  Not fixed now because single-file copy publishes with `Publish::Replace`; the consumer that needs an
+  atomic no-replace is the lock protocol, which is where the primitive belongs.
+
+- [ ] **A leftover temporary from a PREVIOUS run is never removed**
+
+  `<target>.flux-partial.<operation-id>` is named with a per-invocation id (the pid), so the leftover
+  sweep only ever removes this invocation's own temporary — which, with an id that is never persisted,
+  means it removes nothing at all. §18.1 wants an id "deterministic enough for discovery"; that needs
+  operation state to record it, which this cut does not have. A crashed run therefore leaves a
+  temporary that nothing collects.
+
+- [ ] **`flux copy` cannot ask for `Preserve::Off`**
+
+  `CopyOptions` has three preservation states and `copy_file` honours all three, but the CLI only
+  ever builds `Strict` (when `--preserve-times` is given) or `Default`. The spec's flags mean
+  "strict when present" and define no `--no-preserve-*`, so there is no way from the command line to
+  say "do not attempt metadata at all". `Off` is reachable only by a library caller in this cut, and
+  is tested as one.
+
+- [ ] **The self-copy refusal compares paths, not filesystem identity**
+
+  §2 Foundational Invariants item 22: *"Safety checks use filesystem identity and object identity where
+  available, not only lexical path comparisons."* `copy_file` refuses only when `src == dst` as paths,
+  so `flux copy a ./a`, or a copy through a hardlink or a junction, is not refused. It is not
+  destructive — the copy is staged in a distinct temporary and the published bytes are the source's
+  own — but the invariant asks for identity and this cut does not supply it.
+
+  Blocked on the same primitive the lock protocol needs: `dev`+`ino` on Unix is one call, Windows needs
+  `FILE_ID_INFO`, which is already an open item above. Do both at once.
+
 ## Scaffolding follow-ups
 
 - [ ] Install `cargo-mutants` (`cargo binstall -y cargo-mutants`) — it is the one
