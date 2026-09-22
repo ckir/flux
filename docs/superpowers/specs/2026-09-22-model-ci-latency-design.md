@@ -204,6 +204,19 @@ ordinary growth.
 
 ## Change E — the nightly tier says when it fails
 
+> **The alarm must also clear.** As first written, change E only opened or commented on an issue; it
+> had no recovery path, so the issue stayed open after the tier went green. The capstone on the
+> shipped code caught this, and it is a defect in the salience argument below rather than a missing
+> nicety: an issue that never auto-closes stops meaning "`main` is broken now" and starts meaning
+> "`main` broke at some point", which trains the reader to ignore the only signal this tier has.
+>
+> A symmetric `resolve` job closes it on recovery. Two of its guards are load-bearing and were not
+> obvious: `github.event_name != 'pull_request'` (without it, a passing PR carrying the
+> `model-extended` label would CLOSE a genuine open issue about a broken `main` — a false all-clear
+> from an unrelated branch), and `needs.tier.result == 'success'` rather than `success()` alone
+> (`success()` is also true when `tier` was SKIPPED on an empty matrix, which would close the issue
+> having verified nothing).
+
 Moving a check from a pull request to a cron changes who finds out when it breaks. A PR check is
 synchronous and addressed to the person who caused it; a cron job is neither. Since this spec is
 what puts `breaklock` liveness into that tier, the mechanism that makes the tier's verdict visible

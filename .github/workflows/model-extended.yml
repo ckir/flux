@@ -125,3 +125,43 @@ jobs:
             gh issue create --title "$TITLE" --body "$body"
             echo "opened a new issue"
           fi
+
+  resolve:
+    # The other half of `notify`, and the reason it exists: an alarm that never clears stops meaning
+    # "main is broken now" and starts meaning "main broke at some point", which trains the reader to
+    # ignore the one signal this tier has. `notify` shipped without any recovery path; the capstone
+    # on this change caught it.
+    #
+    # `github.event_name != 'pull_request'` is symmetric with `notify`, but load-bearing for a
+    # DIFFERENT reason. In `notify` it suppresses noise. Here it prevents a false all-clear: without
+    # it, a pull request carrying the `model-extended` label that passes would CLOSE a genuine open
+    # issue about a broken `main`, silencing the alarm from an unrelated branch.
+    #
+    # `needs.tier.result == 'success'` rather than `success()` alone, because `success()` is also
+    # true when `tier` was SKIPPED on an empty matrix - and closing the issue having verified
+    # nothing is exactly the false all-clear this job must not give.
+    name: Close the failure issue
+    needs: [plan, tier]
+    if: success() && github.event_name != 'pull_request' && needs.tier.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Close the open failure issue, if any
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TITLE: Nightly model tier failed
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # The same exact-title match `notify` uses, for the same reason: `--search ... in:title`
+          # is fuzzy, so the comparison is done here rather than trusted to the search.
+          number=$(gh issue list --state open --limit 50 --json number,title \
+            --jq "map(select(.title == \"$TITLE\")) | .[0].number // empty")
+          if [ -n "$number" ]; then
+            gh issue close "$number" --comment "The extended-tier model check passed. Run: $RUN_URL"
+            echo "closed issue #$number"
+          else
+            echo "no open failure issue"
+          fi
