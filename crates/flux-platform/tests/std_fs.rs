@@ -1,0 +1,76 @@
+use flux_fs::FileSystem;
+use flux_platform::StdFileSystem;
+use std::io::Write;
+use tempfile::TempDir;
+
+#[test]
+fn create_new_is_exclusive() {
+    let d = TempDir::new().unwrap();
+    let p = d.path().join("a");
+    let fs = StdFileSystem;
+    fs.create_new(&p).unwrap();
+    assert!(fs.create_new(&p).is_err(), "FS-1: a second exclusive create must fail");
+}
+
+#[test]
+fn rename_replace_replaces_an_existing_target() {
+    let d = TempDir::new().unwrap();
+    let (from, to) = (d.path().join("from"), d.path().join("to"));
+    let fs = StdFileSystem;
+    let mut f = fs.create_new(&from).unwrap();
+    f.write_all(b"new").unwrap();
+    drop(f);
+    std::fs::write(&to, b"old").unwrap();
+
+    fs.rename_replace(&from, &to).unwrap();
+    assert_eq!(std::fs::read(&to).unwrap(), b"new");
+}
+
+#[test]
+fn rename_no_replace_refuses_an_existing_target() {
+    let d = TempDir::new().unwrap();
+    let (from, to) = (d.path().join("from"), d.path().join("to"));
+    let fs = StdFileSystem;
+    fs.create_new(&from).unwrap();
+    std::fs::write(&to, b"old").unwrap();
+
+    assert!(fs.rename_no_replace(&from, &to).is_err(), "FS-2");
+    assert_eq!(std::fs::read(&to).unwrap(), b"old");
+}
+
+#[test]
+fn set_times_on_a_handle_moves_the_mtime() {
+    let d = TempDir::new().unwrap();
+    let p = d.path().join("a");
+    let fs = StdFileSystem;
+    let h = fs.create_new(&p).unwrap();
+
+    let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    fs.set_times(&h, Some(t)).unwrap();
+    drop(h);
+
+    let got = std::fs::metadata(&p).unwrap().modified().unwrap();
+    assert_eq!(got, t);
+}
+
+#[cfg(unix)]
+#[test]
+fn metadata_reports_a_symlink_as_not_a_file() {
+    // Unix-only: creating a symlink on Windows needs Developer Mode or admin, which a
+    // CI runner may not have. The code path under test is not platform-specific.
+    let d = TempDir::new().unwrap();
+    let target = d.path().join("target");
+    std::fs::write(&target, b"hello").unwrap();
+    let link = d.path().join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let m = StdFileSystem.metadata(&link).unwrap();
+    assert!(!m.is_file, "a symlink must not read as a regular file, or the refusal is bypassed");
+}
+
+#[test]
+fn metadata_reports_a_directory_as_not_a_file() {
+    let d = TempDir::new().unwrap();
+    let fs = StdFileSystem;
+    assert!(!fs.metadata(d.path()).unwrap().is_file);
+}

@@ -295,6 +295,7 @@ version = "0.1.1"
 name = "flux-platform"
 version = "0.1.1"
 dependencies = [
+ "flux-fs",
  "rustix",
  "tempfile",
  "windows-sys",

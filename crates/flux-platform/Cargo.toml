@@ -8,6 +8,9 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[dependencies]
+flux-fs = { path = "../flux-fs" }
+
 # The filesystem probes of the lock-protocol model (tests/fs_semantics.rs,
 # lock-model design Section 10).
 [dev-dependencies]
