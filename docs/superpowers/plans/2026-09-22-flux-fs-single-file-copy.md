@@ -30,6 +30,7 @@ Checked against the repository at `6472a57` while writing. Re-check if `main` ha
 | `thiserror = "2"`, `clap = { version = "4.6", features = ["derive"] }`, `tempfile = "3"` are in `[workspace.dependencies]` | root `Cargo.toml` |
 | tests run with `cargo nextest run --workspace --no-tests=pass` | `justfile:12-13` |
 | `just check` = `fmt-check clippy typos test` | `justfile:41` |
+| `Cargo.lock` is tracked, and the release workflow builds `--locked` | `git ls-files Cargo.lock`, `.github/workflows/release.yml:53` |
 | clippy runs `--workspace --all-targets -- -D warnings`, so a warning fails the gate | `justfile:22` |
 | `rustfmt.toml` sets `max_width = 100`, `use_small_heuristics = "Max"`, edition 2024 | `rustfmt.toml` |
 | `flux-cli` has `[[bin]] name = "flux"`, `path = "src/main.rs"` | `crates/flux-cli/Cargo.toml` |
@@ -39,6 +40,12 @@ Checked against the repository at `6472a57` while writing. Re-check if `main` ha
 own edge-case table produces two more — `SPECIAL_FILE_UNSUPPORTED` (a symlink, device or directory
 source) and `SAFETY_REJECTED` (self-copy). This plan implements **nine** codes. Task 1 adds a test per
 code, which is what the spec's "no variant without a reachable producer" rule actually demands.
+
+**Stage `Cargo.lock` with every task that adds a dependency.** Tasks 1, 4, 7 and 8 each add one,
+and that rewrites the root `Cargo.lock` — `flux-fs` and `flux-core` have no `dependencies` key in it
+at all today, so one appears. The `git add` lines in those tasks name the lockfile for that reason.
+Leaving it unstaged leaves the tree dirty for the rest of the plan and, if it is never committed,
+breaks the release workflow's `--locked` build against a lockfile that does not list `thiserror`.
 
 ## File structure
 
@@ -107,6 +114,14 @@ mod tests {
     }
 
     #[test]
+    fn classify_does_not_consume_the_error() {
+        let io = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(FsError::classify(&io), Code::PermissionDenied);
+        // still usable: this is what lets a caller pick its own fallback code
+        assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
     fn anything_else_maps_to_io_error() {
         let io = std::io::Error::from(std::io::ErrorKind::NotFound);
         assert_eq!(FsError::from_io(io).code, Code::IoError);
@@ -171,17 +186,23 @@ pub struct FsError {
 }
 
 impl FsError {
-    /// Map an OS error to a spec code. The mapping lives here, once, because the raw
-    /// numbers differ per OS: both the platform layer and `flux-core` call it rather
-    /// than branching on an `errno` themselves.
-    pub fn from_io(source: std::io::Error) -> Self {
-        let code = if source.raw_os_error() == Some(ENOSPC_RAW) {
+    /// Classify an OS error WITHOUT consuming it. The mapping lives here, once,
+    /// because the raw numbers differ per OS: callers use this rather than branching
+    /// on an `errno` themselves. `IoError` means "this layer could not classify it",
+    /// which lets a caller substitute a code that fits where the failure happened.
+    pub fn classify(source: &std::io::Error) -> Code {
+        if source.raw_os_error() == Some(ENOSPC_RAW) {
             Code::DiskFull
         } else if source.kind() == std::io::ErrorKind::PermissionDenied {
             Code::PermissionDenied
         } else {
             Code::IoError
-        };
+        }
+    }
+
+    /// Map an OS error to a spec code and keep it as the source.
+    pub fn from_io(source: std::io::Error) -> Self {
+        let code = Self::classify(&source);
         FsError { code, source }
     }
 
@@ -206,12 +227,12 @@ pub use error::{Code, FsError, Result};
 - [ ] **Step 5: Run the tests**
 
 Run: `cargo nextest run -p flux-fs --no-tests=pass`
-Expected: PASS, 4 tests.
+Expected: PASS, 5 tests.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/flux-fs
+git add crates/flux-fs Cargo.lock
 git commit -m "feat(flux-fs): the spec's error codes and the io::Error mapping"
 ```
 
@@ -362,7 +383,7 @@ pub use options::{
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo nextest run -p flux-fs --no-tests=pass`
-Expected: PASS, 7 tests.
+Expected: PASS, 8 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -566,7 +587,7 @@ pub use fs::{FileHandle, FileSystem, Metadata, Perms};
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo nextest run -p flux-fs --no-tests=pass`
-Expected: PASS, 8 tests.
+Expected: PASS, 9 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -588,7 +609,7 @@ the ordering is the requirement.
 
 - [ ] **Step 1: Add the dependency**
 
-In `crates/flux-core/Cargo.toml`:
+In `crates/flux-core/Cargo.toml`, after the `[package]` block:
 
 ```toml
 [dependencies]
@@ -659,6 +680,23 @@ struct Inner {
     always: HashMap<String, Code>,
     /// paths removed on the second `metadata` call
     vanish: std::collections::HashSet<String>,
+    perms: HashMap<String, Option<Perms>>,
+    /// consumed by the next `write` on a handle from `create_new`
+    write_fault: Option<std::io::Error>,
+}
+
+/// Move a name's content AND its metadata. Moving only the bytes meant the times and
+/// permissions applied to the temporary vanished at publication, so no test could
+/// assert that the §44.1 ordering achieved anything.
+fn move_object(g: &mut Inner, from: &str, to: &str) {
+    let bytes = g.files.remove(from).unwrap_or_default();
+    g.files.insert(to.to_string(), bytes);
+    if let Some(v) = g.times.remove(from) {
+        g.times.insert(to.to_string(), v);
+    }
+    if let Some(v) = g.perms.remove(from) {
+        g.perms.insert(to.to_string(), v);
+    }
 }
 
 #[derive(Default)]
@@ -674,6 +712,7 @@ pub struct FakeHandle {
     /// mutate the fake's state even though both roles share this struct.
     sink: Option<std::sync::Arc<Mutex<Inner>>>,
     sync_fault: std::sync::Arc<Mutex<Option<Code>>>,
+    write_fault: std::sync::Arc<Mutex<Option<std::io::Error>>>,
 }
 
 impl Read for FakeHandle {
@@ -687,6 +726,9 @@ impl Read for FakeHandle {
 
 impl Write for FakeHandle {
     fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        if let Some(e) = self.write_fault.lock().unwrap().take() {
+            return Err(e);
+        }
         self.buf.extend_from_slice(b);
         // Straight through to the fake's state. Without this the bytes died in the
         // handle, `rename_*` published an empty file, and every test still passed
@@ -759,6 +801,26 @@ impl FaultFs {
         g.vanish.insert(path.to_string());
     }
 
+    /// The permissions last applied to `path`.
+    pub fn permissions(&self, path: &str) -> Option<Perms> {
+        self.inner.lock().unwrap().perms.get(path).copied().flatten()
+    }
+
+    /// The modified time last applied to `path`.
+    pub fn modified(&self, path: &str) -> Option<SystemTime> {
+        self.inner.lock().unwrap().times.get(path).copied().flatten()
+    }
+
+    /// Give a file permissions, so a copy has something to carry across.
+    pub fn set_file_perms(&self, path: &str, perms: Perms) {
+        self.inner.lock().unwrap().perms.insert(path.to_string(), Some(perms));
+    }
+
+    /// Fail the next `write` on a handle from `create_new`, with this error.
+    pub fn fail_write(&self, e: std::io::Error) {
+        self.inner.lock().unwrap().write_fault = Some(e);
+    }
+
     /// Append to a file the *second* time its metadata is read — what a concurrent
     /// writer looks like from inside step 6.
     pub fn grow_on_second_metadata(&self, path: &str, extra: &[u8]) {
@@ -802,6 +864,7 @@ impl FileSystem for FaultFs {
             read_pos: 0,
             sink: None,
             sync_fault: std::sync::Arc::new(Mutex::new(None)),
+            write_fault: std::sync::Arc::new(Mutex::new(None)),
         })
     }
 
@@ -820,6 +883,7 @@ impl FileSystem for FaultFs {
         // `inner` again would DEADLOCK here -- `std::sync::Mutex` is not reentrant --
         // and every test that creates a temporary would hang forever.
         let sync_fault = std::sync::Arc::new(Mutex::new(g.faults.remove("sync_all")));
+        let write_fault = std::sync::Arc::new(Mutex::new(g.write_fault.take()));
         drop(g);
         Ok(FakeHandle {
             path: p,
@@ -827,6 +891,7 @@ impl FileSystem for FaultFs {
             read_pos: 0,
             sink: Some(std::sync::Arc::clone(&self.inner)),
             sync_fault,
+            write_fault,
         })
     }
 
@@ -857,7 +922,7 @@ impl FileSystem for FaultFs {
         Ok(Metadata {
             len,
             is_file: true,
-            permissions: None,
+            permissions: g.perms.get(&p).copied().flatten(),
             modified: g.times.get(&p).copied().flatten(),
         })
     }
@@ -868,16 +933,18 @@ impl FileSystem for FaultFs {
         Ok(())
     }
 
-    fn set_permissions(&self, file: &Self::Writer, _perms: Option<Perms>) -> Result<()> {
-        self.record(format!("set_permissions({})", file.path), "set_permissions")
+    fn set_permissions(&self, file: &Self::Writer, perms: Option<Perms>) -> Result<()> {
+        self.record(format!("set_permissions({})", file.path), "set_permissions")?;
+        // Record it. Dropping the argument made the whole suite blind to permissions:
+        // a `copy_file` that passed `None` every time passed every test.
+        self.inner.lock().unwrap().perms.insert(file.path.clone(), perms);
+        Ok(())
     }
 
     fn rename_replace(&self, from: &Path, to: &Path) -> Result<()> {
         let (f, t) = (from.display().to_string(), to.display().to_string());
         self.record(format!("rename_replace({f} -> {t})"), "rename_replace")?;
-        let mut g = self.inner.lock().unwrap();
-        let bytes = g.files.remove(&f).unwrap_or_default();
-        g.files.insert(t, bytes);
+        move_object(&mut self.inner.lock().unwrap(), &f, &t);
         Ok(())
     }
 
@@ -891,8 +958,7 @@ impl FileSystem for FaultFs {
                 std::io::Error::from(std::io::ErrorKind::AlreadyExists),
             ));
         }
-        let bytes = g.files.remove(&f).unwrap_or_default();
-        g.files.insert(t, bytes);
+        move_object(&mut g, &f, &t);
         Ok(())
     }
 
@@ -942,7 +1008,7 @@ Expected: PASS, 2 tests.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/flux-core
+git add crates/flux-core Cargo.lock
 git commit -m "test(flux-core): a filesystem fake that records order and injects faults"
 ```
 
@@ -1033,6 +1099,24 @@ use flux_fs::{
 use std::io::Write;
 use std::path::Path;
 
+/// The code for a failure inside the streaming loop.
+///
+/// The loop IS the content copy, and the spec defines `COPY_FAILED` as "the content
+/// copy of an independent file, or a canonical attempt, failed", so an unclassified
+/// failure here is `COPY_FAILED` rather than the `IO_ERROR` catch-all. A failure the
+/// platform layer could classify -- a full disk, a denial -- keeps that code, which is
+/// more specific than either.
+///
+/// `classify` borrows the error rather than consuming it: rebuilding one from
+/// `e.kind()` would discard `raw_os_error()`, and ENOSPC would stop reaching
+/// `DISK_FULL` on the one path where a full disk actually appears.
+fn copy_code(e: &std::io::Error) -> Code {
+    match FsError::classify(e) {
+        Code::IoError => Code::CopyFailed,
+        classified => classified,
+    }
+}
+
 /// Remove the temporary after a failure and build the error to return.
 ///
 /// The removal is never discarded: if the temporary survives, its path goes into the
@@ -1110,18 +1194,10 @@ pub fn copy_file<F: FileSystem>(
         let n = match std::io::Read::read(&mut reader, &mut buf) {
             Ok(0) => break,
             Ok(n) => n,
-            Err(e) => {
-                // Map the ORIGINAL error. `std::io::Error::from(e.kind())` would
-                // discard `raw_os_error()`, and ENOSPC would stop reaching DISK_FULL
-                // on the one path where a full disk actually shows up. Measured:
-                // `Error::from(e.kind()).raw_os_error()` is `None`.
-                let mapped = FsError::from_io(e);
-                return Err(discard(fs, &temp, mapped.code, mapped.source));
-            }
+            Err(e) => return Err(discard(fs, &temp, copy_code(&e), e)),
         };
         if let Err(e) = writer.write_all(&buf[..n]) {
-            let mapped = FsError::from_io(e);
-            return Err(discard(fs, &temp, mapped.code, mapped.source));
+            return Err(discard(fs, &temp, copy_code(&e), e));
         }
         bytes_copied += n as u64;
     }
@@ -1178,10 +1254,10 @@ pub fn copy_file<F: FileSystem>(
         Publish::NoReplace => fs.rename_no_replace(&temp, dst),
     };
     if let Err(e) = published {
-        // Keep the code the platform layer mapped. Collapsing a PERMISSION_DENIED at
-        // the rename into COPY_FAILED discards a code the spec's taxonomy defines.
-        let code = if e.code == Code::IoError { Code::CopyFailed } else { e.code };
-        return Err(discard(fs, &temp, code, e.source));
+        // Keep whatever the platform layer mapped. A publish failure is NOT the content
+        // copy -- that already succeeded -- so it must not be relabelled COPY_FAILED,
+        // and an unclassified one stays IO_ERROR, the declared catch-all.
+        return Err(discard(fs, &temp, e.code, e.source));
     }
 
     // A successful rename consumed the temporary; there is nothing left to remove.
@@ -1231,7 +1307,10 @@ No implementation changes. If a test here fails, Task 5's code is wrong.
 
 - [ ] **Step 1: Add the tests**
 
-Inside the existing `mod tests` in `crates/flux-core/src/copy.rs`:
+Inside the existing `mod tests` in `crates/flux-core/src/copy.rs` — **immediately before that
+module's closing brace**, which is the last line of the file. Appending to the end of the file
+instead puts these tests in the outer scope, where `FaultFs` is not in scope and the crate stops
+compiling:
 
 ```rust
     #[test]
@@ -1294,17 +1373,30 @@ Inside the existing `mod tests` in `crates/flux-core/src/copy.rs`:
     }
 
     #[test]
-    fn an_unclassified_publish_failure_becomes_copy_failed() {
-        // COPY_FAILED must keep a reachable producer -- the spec forbids a variant
-        // without one -- and this is it: a publish failure the platform layer could
-        // not classify, which arrives as the IO_ERROR catch-all.
+    fn an_unclassified_publish_failure_stays_io_error() {
+        // The publish step is not the content copy, so an unclassified failure here is
+        // the IO_ERROR catch-all rather than COPY_FAILED.
         let fs = FaultFs::new();
         fs.write_file("/src", b"hello");
         fs.fail("rename_replace", flux_fs::Code::IoError);
 
         let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap_err();
 
+        assert_eq!(err.code, flux_fs::Code::IoError);
+        assert!(!fs.exists("/dst.flux-partial.op1"));
+    }
+
+    #[test]
+    fn an_unclassified_write_failure_is_copy_failed() {
+        // COPY_FAILED's reachable producer, and the spec's own definition of it.
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.fail_write(std::io::Error::other("the device hiccupped"));
+
+        let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap_err();
+
         assert_eq!(err.code, flux_fs::Code::CopyFailed);
+        assert!(!fs.called("rename_replace"), "must not publish");
         assert!(!fs.exists("/dst.flux-partial.op1"));
     }
 
@@ -1371,6 +1463,21 @@ Inside the existing `mod tests` in `crates/flux-core/src/copy.rs`:
     }
 
     #[test]
+    fn the_sources_metadata_survives_publication() {
+        // §44.1's whole point: metadata is applied to the temporary and must still be
+        // on the file after the rename. Asserting the CALLS happened does not show
+        // that, because a rename that dropped the metadata would call them just the
+        // same.
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.set_file_perms("/src", flux_fs::Perms::UnixMode(0o640));
+
+        copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap();
+
+        assert_eq!(fs.permissions("/dst"), Some(flux_fs::Perms::UnixMode(0o640)));
+    }
+
+    #[test]
     fn a_zero_byte_source_copies_and_still_gets_metadata() {
         // Named in TODO.md's integration-test item, so it gets a test of its own.
         let fs = FaultFs::new();
@@ -1392,7 +1499,10 @@ Inside the existing `mod tests` in `crates/flux-core/src/copy.rs`:
         o.publish = Publish::NoReplace;
         let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &o).unwrap_err();
 
-        assert_eq!(err.code, flux_fs::Code::CopyFailed);
+        // A target that already exists is a destination-side refusal, not a
+        // content-copy failure: the IO_ERROR catch-all until a later cut adds
+        // DESTINATION_ERROR.
+        assert_eq!(err.code, flux_fs::Code::IoError);
         assert!(!fs.exists("/dst.flux-partial.op1"), "temporary must be removed");
     }
 
@@ -1427,7 +1537,7 @@ Inside the existing `mod tests` in `crates/flux-core/src/copy.rs`:
 - [ ] **Step 2: Run the tests**
 
 Run: `cargo nextest run -p flux-core --no-tests=pass`
-Expected: PASS, 19 tests. If `a_strict_metadata_failure_prevents_publication` fails, the ordering in
+Expected: PASS, 21 tests. If `a_strict_metadata_failure_prevents_publication` fails, the ordering in
 `copy_file` is wrong — fix the implementation, not the test.
 
 - [ ] **Step 3: Commit**
@@ -1447,7 +1557,8 @@ git commit -m "test(flux-core): the strict/best-effort rules, proven by injectio
 
 - [ ] **Step 1: Add the dependency**
 
-In `crates/flux-platform/Cargo.toml`, before `[dev-dependencies]`:
+In `crates/flux-platform/Cargo.toml`, after the `[package]` block — not immediately before
+`[dev-dependencies]`, which would insert this between that section and the comment explaining it:
 
 ```toml
 [dependencies]
@@ -1703,7 +1814,7 @@ platform: `fs4`/`fs5` are `#[cfg(unix)]` and `fs6`/`fs7` are `#[cfg(windows)]`.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/flux-platform
+git add crates/flux-platform Cargo.lock
 git commit -m "feat(flux-platform): StdFileSystem over std::fs"
 ```
 
@@ -1867,7 +1978,7 @@ Expected: fmt, clippy, typos and the full test suite all pass.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/flux-cli
+git add crates/flux-cli Cargo.lock
 git commit -m "feat(flux-cli): wire flux copy to the engine"
 ```
 
