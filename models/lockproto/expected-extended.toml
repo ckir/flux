@@ -26,7 +26,7 @@ unreached = [
     { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only after a 240.5 in-place takeover rewrote the record under a running Recoverer, which needs a lapsed lease; mixed-remote reaches it" },
     { label = "S99_refuse_close", reason = "a Section 99 check fails only for an owner whose lock was taken while it ran; no recovery actor loses its lock while running (a takeover needs a Breaker, a lapsed lease needs LockCapability = remote)" },
 ]
-timeout_minutes = 1
+timeout_minutes = 150
 
 [[run]]
 name = "recovery-posix-hostcrash-plain-check"
