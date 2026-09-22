@@ -680,6 +680,8 @@ struct Inner {
     always: HashMap<String, Code>,
     /// paths removed on the second `metadata` call
     vanish: std::collections::HashSet<String>,
+    /// paths `metadata` reports as not a regular file
+    not_files: std::collections::HashSet<String>,
     perms: HashMap<String, Option<Perms>>,
     /// consumed by the next `write` on a handle from `create_new`
     write_fault: Option<std::io::Error>,
@@ -746,7 +748,12 @@ impl Write for FakeHandle {
 
 impl FileHandle for FakeHandle {
     fn sync_all(&self) -> Result<()> {
-        // The durability test injects here, so the handle carries a shared fault slot.
+        // Record it. Without this the call log never mentioned `sync_all`, so no test
+        // could tell a run that synced from one that did not -- only one that FAILED
+        // to, via the injected fault below.
+        if let Some(sink) = &self.sink {
+            sink.lock().unwrap().calls.push(format!("sync_all({})", self.path));
+        }
         if let Some(code) = self.sync_fault.lock().unwrap().take() {
             return Err(FsError::new(code, std::io::Error::other("injected")));
         }
@@ -809,6 +816,15 @@ impl FaultFs {
     /// The modified time last applied to `path`.
     pub fn modified(&self, path: &str) -> Option<SystemTime> {
         self.inner.lock().unwrap().times.get(path).copied().flatten()
+    }
+
+    /// Make `metadata` report `path` as something other than a regular file -- a
+    /// directory, a symlink, a device. Without this the fake reported `is_file: true`
+    /// for everything and SPECIAL_FILE_UNSUPPORTED had no test that produced it.
+    pub fn add_special(&self, path: &str) {
+        let mut g = self.inner.lock().unwrap();
+        g.files.insert(path.to_string(), Vec::new());
+        g.not_files.insert(path.to_string());
     }
 
     /// Give a file permissions, so a copy has something to carry across.
@@ -921,7 +937,7 @@ impl FileSystem for FaultFs {
         })?;
         Ok(Metadata {
             len,
-            is_file: true,
+            is_file: !g.not_files.contains(&p),
             permissions: g.perms.get(&p).copied().flatten(),
             modified: g.times.get(&p).copied().flatten(),
         })
@@ -1478,6 +1494,87 @@ compiling:
     }
 
     #[test]
+    fn preserve_off_does_not_touch_metadata_at_all() {
+        // The third state earns its keep here. `Off` is not a lenient `Default`, it is
+        // "do not attempt", and nothing else in the suite tells those apart: an
+        // implementation that treated `Off` as `Default` would pass every other test.
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        let mut o = opts();
+        o.preserve_times = Preserve::Off;
+        o.preserve_permissions = Preserve::Off;
+
+        copy_file(&fs, Path::new("/src"), Path::new("/dst"), &o).unwrap();
+
+        assert!(!fs.called("set_times"), "Off must not attempt it; got {:?}", fs.calls());
+        assert!(!fs.called("set_permissions"), "Off must not attempt it; got {:?}", fs.calls());
+        assert!(fs.called("rename_replace"), "the copy itself still publishes");
+    }
+
+    #[test]
+    fn a_special_file_source_is_refused_before_anything_is_created() {
+        // SPECIAL_FILE_UNSUPPORTED's producer. The spec's acceptance criteria require
+        // every variant to have a test that produces it.
+        let fs = FaultFs::new();
+        fs.add_special("/dev/null");
+
+        let err = copy_file(&fs, Path::new("/dev/null"), Path::new("/dst"), &opts()).unwrap_err();
+
+        assert_eq!(err.code, flux_fs::Code::SpecialFileUnsupported);
+        assert!(!fs.called("open_read"), "must refuse before opening it");
+        assert!(!fs.called("create_new"), "and before creating anything");
+    }
+
+    #[test]
+    fn a_leftover_from_this_invocation_is_swept_first() {
+        // Step 1 exists to remove this run's own leftover. Delete that line and this
+        // is the only test that notices.
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.write_file("/dst.flux-partial.op1", b"junk from a previous attempt");
+
+        copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap();
+
+        let calls = fs.calls();
+        assert_eq!(
+            calls.first().map(String::as_str),
+            Some("remove_file(/dst.flux-partial.op1)"),
+            "the sweep must come first; got {calls:?}"
+        );
+        assert_eq!(fs.read_file("/dst").as_deref(), Some(&b"hello"[..]));
+    }
+
+    #[test]
+    fn normal_durability_does_not_sync_and_strict_does() {
+        // Two runs, because the difference between them IS the option's meaning.
+        let lax = FaultFs::new();
+        lax.write_file("/src", b"hello");
+        copy_file(&lax, Path::new("/src"), Path::new("/dst"), &opts()).unwrap();
+        assert!(!lax.called("sync_all"), "Normal must not sync; got {:?}", lax.calls());
+
+        let strict = FaultFs::new();
+        strict.write_file("/src", b"hello");
+        let mut o = opts();
+        o.durability = Durability::Strict;
+        copy_file(&strict, Path::new("/src"), Path::new("/dst"), &o).unwrap();
+        assert!(strict.called("sync_all"), "Strict must sync; got {:?}", strict.calls());
+    }
+
+    #[test]
+    fn a_source_larger_than_the_buffer_copies_every_byte() {
+        // Every other test uses five bytes, so the read loop has only ever run once.
+        // The buffer is 64 KiB; this forces several iterations and a short final read.
+        let fs = FaultFs::new();
+        let big: Vec<u8> = (0..(64 * 1024 * 2 + 7)).map(|i| (i % 251) as u8).collect();
+        fs.write_file("/src", &big);
+
+        let out = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap();
+
+        assert_eq!(out.bytes_copied, big.len() as u64);
+        assert_eq!(fs.read_file("/dst").as_deref(), Some(&big[..]));
+    }
+
+    #[test]
     fn a_zero_byte_source_copies_and_still_gets_metadata() {
         // Named in TODO.md's integration-test item, so it gets a test of its own.
         let fs = FaultFs::new();
@@ -1537,7 +1634,7 @@ compiling:
 - [ ] **Step 2: Run the tests**
 
 Run: `cargo nextest run -p flux-core --no-tests=pass`
-Expected: PASS, 21 tests. If `a_strict_metadata_failure_prevents_publication` fails, the ordering in
+Expected: PASS, 26 tests. If `a_strict_metadata_failure_prevents_publication` fails, the ordering in
 `copy_file` is wrong — fix the implementation, not the test.
 
 - [ ] **Step 3: Commit**
@@ -1867,12 +1964,20 @@ fn it_copies_a_single_file() {
 }
 
 #[test]
-fn it_leaves_no_temporary_behind() {
+fn a_successful_copy_consumes_its_temporary() {
+    // Named for what it proves. On the happy path the publishing rename consumes the
+    // temporary, so this does NOT exercise the failure-path cleanup -- that is
+    // `a_temporary_that_cannot_be_removed_is_named_in_the_error` and the several
+    // `!fs.exists("/dst.flux-partial.op1")` assertions in `flux-core`, which can
+    // inject the failures a real filesystem will not produce on demand.
     let d = TempDir::new().unwrap();
     let (src, dst) = (d.path().join("a"), d.path().join("b"));
     std::fs::write(&src, b"hello").unwrap();
 
-    flux().arg("copy").arg(&src).arg(&dst).output().unwrap();
+    let out = flux().arg("copy").arg(&src).arg(&dst).output().unwrap();
+    // Without this the test passes even when the binary fails outright, since a run
+    // that never starts leaves no temporary either.
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
 
     let leftovers: Vec<_> = std::fs::read_dir(d.path())
         .unwrap()
@@ -2084,6 +2189,14 @@ never see them. They are tracked work, and `TODO.md` is where this repository tr
   operation state to record it, which this cut does not have. A crashed run therefore leaves a
   temporary that nothing collects.
 
+- [ ] **`flux copy` cannot ask for `Preserve::Off`**
+
+  `CopyOptions` has three preservation states and `copy_file` honours all three, but the CLI only
+  ever builds `Strict` (when `--preserve-times` is given) or `Default`. The spec's flags mean
+  "strict when present" and define no `--no-preserve-*`, so there is no way from the command line to
+  say "do not attempt metadata at all". `Off` is reachable only by a library caller in this cut, and
+  is tested as one.
+
 - [ ] **The self-copy refusal compares paths, not filesystem identity**
 
   §2 Foundational Invariants item 22: *"Safety checks use filesystem identity and object identity where
@@ -2154,6 +2267,11 @@ because this artifact is the only durable record a pre-implementation review pro
   sequence: the replacing rename returned `Ok`, `remove_file` with a live handle returned `Ok`, and
   `create_new` on the just-removed name returned `Ok`. Rust's `std::fs` opens with
   `FILE_SHARE_DELETE`.
+- `DISCARDED-BELOW-FLOOR`: `temp_path` on an unusual target (`/`, `..`, a trailing slash) puts the
+  temporary somewhere surprising -- `dir/` yields `dir.flux-partial.<id>` as a SIBLING of `dir`.
+  Measured on all seven shapes. Unreachable as a defect: the only one that is not benign is a
+  destination that is a directory, and that lands on the documented path in the edge-case table --
+  `rename_replace` fails, the temporary is removed, and the error is returned. No data is at risk.
 - `REJECTED`: "`remove_file` on a read-only file fails on Windows, so a temporary made read-only by
   `set_permissions` leaks." Raised by the driver, not the peer. Measured on the target machine:
   `remove_file` on a read-only file returned `Ok(())`.
