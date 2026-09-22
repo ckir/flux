@@ -99,6 +99,26 @@ impl FileSystem for StdFileSystem {
     }
 
     fn rename_replace(&self, from: &Path, to: &Path) -> Result<()> {
+        // Refuse a read-only destination, on every platform.
+        //
+        // `std::fs::rename` checks the DIRECTORY's write permission, not the target
+        // file's, so on Unix it happily replaces a file the user marked read-only --
+        // `cp -f` semantics where plain `cp` refuses with "Permission denied".
+        // Windows refuses already, because its rename does consult the file's
+        // read-only attribute. Without this guard the same command silently destroyed
+        // a protection on one platform and failed on the other; both were measured.
+        //
+        // Clearing the attribute and retrying was considered and rejected: it weakens
+        // a protection the user deliberately set, and if the retry then fails for any
+        // other reason it stays weakened. Deleting the target first is worse still --
+        // on Windows a target held open with FILE_SHARE_DELETE enters pending-delete,
+        // the rename fails, and the destination is lost when the reader closes it.
+        if std::fs::metadata(to).is_ok_and(|m| m.permissions().readonly()) {
+            return Err(FsError::new(
+                flux_fs::Code::PermissionDenied,
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            ));
+        }
         std::fs::rename(from, to).map_err(FsError::from_io)
     }
 

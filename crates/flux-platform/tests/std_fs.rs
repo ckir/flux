@@ -27,6 +27,37 @@ fn rename_replace_replaces_an_existing_target() {
 }
 
 #[test]
+fn rename_replace_refuses_a_read_only_target() {
+    // Plain `cp` refuses to overwrite a read-only file; only `cp -f` replaces it.
+    // `std::fs::rename` checks the DIRECTORY's write permission, not the file's, so
+    // without this guard a copy silently destroys a protection the user set. Measured:
+    // on Linux `cp a b` with `b` read-only fails "Permission denied" while
+    // `std::fs::rename` onto it succeeds; on Windows the rename itself fails. This
+    // pins the refusal on BOTH platforms, so the behaviour no longer depends on which
+    // one you are standing on.
+    let d = TempDir::new().unwrap();
+    let (from, to) = (d.path().join("from"), d.path().join("to"));
+    let fs = StdFileSystem;
+    fs.create_new(&from).unwrap();
+    std::fs::write(&to, b"protected").unwrap();
+
+    let mut perms = std::fs::metadata(&to).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&to, perms).unwrap();
+
+    let err = fs.rename_replace(&from, &to).unwrap_err();
+
+    assert_eq!(err.code, flux_fs::Code::PermissionDenied);
+    assert_eq!(std::fs::read(&to).unwrap(), b"protected", "the protected file must survive");
+
+    // Remove it here rather than clearing the read-only bit: `set_readonly(false)`
+    // grants world-write on Unix, which clippy rightly refuses. `remove_file` handles
+    // a read-only file on both platforms, so this both cleans up after TempDir and
+    // pins that property.
+    std::fs::remove_file(&to).expect("a read-only file must still be removable");
+}
+
+#[test]
 fn rename_no_replace_refuses_an_existing_target() {
     let d = TempDir::new().unwrap();
     let (from, to) = (d.path().join("from"), d.path().join("to"));
