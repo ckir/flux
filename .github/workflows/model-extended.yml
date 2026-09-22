@@ -80,3 +80,107 @@ jobs:
         with:
           name: tlc-output-extended-${{ matrix.job.scenario }}-${{ matrix.job.job }}
           path: target/tla/out/
+
+  notify:
+    # Moving a check off the pull request and onto a cron changes who finds out when it breaks: a PR
+    # check is synchronous and addressed to whoever caused it, a cron job is neither. This is the
+    # only notification in the repository, added when the deep breaklock liveness run moved here.
+    #
+    # A SEPARATE job, not a step inside `tier`: `tier` is a matrix, so a failure step within it fires
+    # once per failing entry and would open several issues for one bad night.
+    #
+    # Pull requests are excluded. The extended tier runs on a PR carrying the `model-extended` label,
+    # and a failure there is already visible on the PR itself; an issue would be noise.
+    #
+    # `github.ref == 'refs/heads/main'` is NOT redundant with the pull-request exclusion, and it is
+    # not hypothetical: `workflow_dispatch` accepts ANY ref, and issue #33 was opened by run
+    # 35743039548 dispatched on branch `spec/model-ci-latency` - a repository issue announcing that
+    # the NIGHTLY tier failed, when what had failed was a deliberately broken feature branch. The
+    # cron and a dispatch on main both carry `refs/heads/main`, so nothing legitimate is excluded.
+    name: Report a failure
+    needs: [plan, tier]
+    if: failure() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Job-level rather than workflow-level: every other job here needs only `contents: read`, and
+    # docs.yml already establishes this pattern for a single privileged job.
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TITLE: Nightly model tier failed
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Deduplicate on the title: an ongoing breakage should be ONE issue that grows, not one
+          # issue per night. `--search ... in:title` is a fuzzy match, so the exact comparison is
+          # done here rather than trusted to the search.
+          number=$(gh issue list --state open --limit 50 --json number,title \
+            --jq "map(select(.title == \"$TITLE\")) | .[0].number // empty")
+          body=$(printf '%s\n\n%s\n%s\n' \
+            "The extended-tier model check failed." \
+            "Commit: $SHA" \
+            "Run: $RUN_URL")
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body "$body"
+            echo "commented on existing issue #$number"
+          else
+            gh issue create --title "$TITLE" --body "$body"
+            echo "opened a new issue"
+          fi
+
+  resolve:
+    # The other half of `notify`, and the reason it exists: an alarm that never clears stops meaning
+    # "main is broken now" and starts meaning "main broke at some point", which trains the reader to
+    # ignore the one signal this tier has. `notify` shipped without any recovery path; the capstone
+    # on this change caught it.
+    #
+    # `github.event_name != 'pull_request'` is symmetric with `notify`, but load-bearing for a
+    # DIFFERENT reason. In `notify` it suppresses noise. Here it prevents a false all-clear: without
+    # it, a pull request carrying the `model-extended` label that passes would CLOSE a genuine open
+    # issue about a broken `main`, silencing the alarm from an unrelated branch.
+    #
+    # `needs.tier.result == 'success'` rather than `success()` alone, because `success()` is also
+    # true when `tier` was SKIPPED on an empty matrix - and closing the issue having verified
+    # nothing is exactly the false all-clear this job must not give.
+    #
+    # `github.ref == 'refs/heads/main'` matters MORE here than in `notify`. A dispatch on any green
+    # feature branch would otherwise close a genuine open alarm about a broken `main` - a false
+    # all-clear raised from a branch that never verified `main` at all. The overlap with the
+    # pull-request exclusion is deliberate: on a PR the ref is `refs/pull/N/merge`, so the branch
+    # guard alone would suffice, but both are kept because each documents a distinct intent and
+    # this workflow has already lost a job once to a condition that looked redundant
+    # (see the `!cancelled()` note on model.yml's union job).
+    #
+    # KNOWN LIMIT: re-running an OLD green run on main, or a nightly whose verdict is about a
+    # commit `main` has since moved past, closes the issue on a stale verdict. Guarding that needs
+    # the run's sha compared against the tip of main, which introduces its own "never clears"
+    # failure mode - the exact defect this job was added to fix. Recorded, not guarded.
+    name: Close the failure issue
+    needs: [plan, tier]
+    if: success() && github.event_name != 'pull_request' && needs.tier.result == 'success' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Close the open failure issue, if any
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TITLE: Nightly model tier failed
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # The same exact-title match `notify` uses, for the same reason: `--search ... in:title`
+          # is fuzzy, so the comparison is done here rather than trusted to the search.
+          number=$(gh issue list --state open --limit 50 --json number,title \
+            --jq "map(select(.title == \"$TITLE\")) | .[0].number // empty")
+          if [ -n "$number" ]; then
+            gh issue close "$number" --comment "The extended-tier model check passed. Run: $RUN_URL"
+            echo "closed issue #$number"
+          else
+            echo "no open failure issue"
+          fi
