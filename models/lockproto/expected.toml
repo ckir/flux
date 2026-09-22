@@ -770,6 +770,7 @@ name = "breaklock-remote-posix-fixed-check"
 module = "LockProtocol"
 config = "configs/breaklock-remote-posix-fixed-check.cfg"
 scenario = "breaklock-remote"
+job = "posix-fixed"
 kind = "check"
 constants = { Owners = ["o1"], Recoverers = [], PlainRuns = [], Cleanups = [], Breakers = ["b1", "b2"], MaxObjs = 5, MaxCrashes = 1, HostCrashes = false, MaxLeaseExpiries = 1, Platform = "posix", IdentityStrength = "strong", LockCapability = "remote", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false, SEED_FS_LOCK_WITHOUT_HANDLE = false, SEED_FS_ALIEN_CONTENT = false, SEED_CHECK_REFUSES_UNTOUCHED = false }
 unreached = [
@@ -786,6 +787,7 @@ name = "breaklock-remote-posix-fixed-witness-NoLiveWriter"
 module = "LockProtocol"
 config = "configs/breaklock-remote-posix-fixed-witness-NoLiveWriter.cfg"
 scenario = "breaklock-remote"
+job = "posix-fixed"
 kind = "witness"
 violated = ["NoLiveWriter"]
 constants = { Owners = ["o1"], Recoverers = [], PlainRuns = [], Cleanups = [], Breakers = ["b1", "b2"], MaxObjs = 5, MaxCrashes = 1, HostCrashes = false, MaxLeaseExpiries = 1, Platform = "posix", IdentityStrength = "strong", LockCapability = "remote", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false, SEED_FS_LOCK_WITHOUT_HANDLE = false, SEED_FS_ALIEN_CONTENT = false, SEED_CHECK_REFUSES_UNTOUCHED = false }
