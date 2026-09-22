@@ -44,7 +44,10 @@ So the wait is set by **one liveness run and one safety check**, not by the matr
 ## Goal and non-goals
 
 **Goal:** cut the critical path of the `Model` workflow from ~98 minutes to ~52, without weakening
-any safety invariant checked on a pull request.
+any safety invariant checked on a pull request — and make the nightly tier's verdict visible, since
+this change is what moves a class of defect into it. Changes A, B and D serve the first half;
+change E serves the second, and the two are one piece of work because the first creates the need for
+the second.
 
 **Non-goals, stated so they are not smuggled in later:**
 
@@ -157,6 +160,72 @@ leaving.
 State-space growth is not linear in the constants, so a run at 66% is closer to its cliff than the
 number suggests. The point of the rule is that a timeout should fail on a genuine hang, not on
 ordinary growth.
+
+## Change E — the nightly tier says when it fails
+
+Moving a check from a pull request to a cron changes who finds out when it breaks. A PR check is
+synchronous and addressed to the person who caused it; a cron job is neither. Since this spec is
+what puts `breaklock` liveness into that tier, the mechanism that makes the tier's verdict visible
+belongs to the same change rather than to a someday list.
+
+**Measured: `model-extended.yml` contains no notification of any kind** — grepping every workflow in
+`.github/workflows/` for `slack`, `discord`, `webhook`, `notify`, `actions/github-script`,
+`create-issue` and `peter-evans` returns nothing, and no workflow holds `issues: write`.
+
+Add a final job to `model-extended.yml` that opens a GitHub issue when the tier fails:
+
+- **A separate job**, with `needs: [plan, tier]` and `if: failure()`. NOT a step inside `tier`:
+  `tier` is a matrix job, so a failure step within it fires once per failing entry and would open
+  several issues for one bad night.
+- **`issues: write`** added to the workflow's `permissions`, which is currently `contents: read`.
+- **`gh issue create`**, following the pattern already used in `dependabot-automerge.yml` and
+  `update-auto-merge-prs.yml`; the CLI is present on GitHub-hosted runners and this repository
+  already relies on that.
+- **Deduplicated.** A persistent failure would otherwise open a fresh issue every night until it is
+  fixed. Search for an open issue with the agreed title first and comment on it instead of creating
+  another. The dedup key is the title, not the run id, because the point is one issue per ongoing
+  breakage rather than one per occurrence.
+- The issue body carries the run URL, the failing job, and the commit, so it is actionable without
+  going to find them.
+
+### Why this, and why nothing for the release path
+
+The other half of the same problem is that a release can ship without the model tier ever having
+run: `release-plz.yml` opens a release pull request on every push to `main`, `release.yml` builds on
+a tag push, and `grep -c model` in both returns `0`.
+
+**That is deliberately NOT gated, and change E is the reason it does not need to be.**
+
+Hard-gating a synchronous release pipeline on an asynchronous cron is a tarpit: either `release.yml`
+runs the suite itself, which inflicts a multi-hour wait on someone who only wants to ship, or a
+script polls the API for the last cron's verdict and becomes a new thing that can be wrong. Neither
+is justified here.
+
+What closes the risk instead is salience. Merging a release pull request means visiting the
+repository, and an open "nightly model tier failed" issue sits beside the Pull requests tab while it
+is unresolved. The human at the merge button becomes the gate, holding the context at the moment the
+decision is made. That is enough **because this is a one-person repository** — `git log` lists a
+single human author and `dependabot[bot]`, so the repository owner, the workflow's editor and the
+author of any commit that introduces a deadlock are the same person. The risk was never that the
+signal reaches the wrong human; it was that an automated email is easy to skim past. An issue is not.
+
+If this repository ever gains a second regular contributor, that reasoning expires and the release
+path needs revisiting.
+
+### Verifying E
+
+`if: failure()` cannot be demonstrated by a passing run. Verify it on a branch, before merge:
+
+1. Push a branch with a deliberately failing extended-tier run — for example a `timeout_minutes` of
+   `1` on one extended-tier run — and apply the `model-extended` label to its pull request, which is
+   what `model-extended.yml:31` gates on.
+2. Confirm exactly ONE issue is opened, not one per matrix entry.
+3. Re-run the same workflow and confirm the second failure comments on the existing issue rather
+   than opening a second one.
+4. Revert the deliberate failure before merging.
+
+Step 2 is the one that matters: it is the check that distinguishes a correct separate-job
+implementation from a failure step placed inside the matrix job.
 
 ## What this achieves, and the limit
 
@@ -278,19 +347,20 @@ They are recorded so the implementer does not have to rediscover them.
 
 ## Risks and things this spec deliberately leaves open
 
-- **Per-PR liveness coverage for `breaklock` is lost until the follow-up lands.** Accepted, with the
-  qualification below.
-- **A liveness regression can reach a release before the nightly catches it.** Measured:
+- **Per-PR liveness coverage for `breaklock` is lost until the deferred shallow run lands.**
+  Accepted. Change E is what makes it tolerable: the deep run still executes nightly, and now says
+  so when it fails.
+- **A liveness regression can reach a release without the model tier having run.** Measured:
   `release-plz.yml` fires on every push to `main`, and neither it nor `release.yml` references the
-  model tier at all — zero matches for "model" in both files. So the common argument for deferring
-  per-PR liveness ("the nightly catches it within 24 hours, and releases are gated on the nightly")
-  does **not** hold in this repository today. This gap pre-dates this spec and is not made worse by
-  it, but it is recorded here because it was found while checking that argument, and because it is
-  the strongest reason to land the deferred follow-up sooner rather than later. The decision about
-  whether to gate `release-plz` is deliberately not taken here.
+  model tier at all — zero matches for "model" in both files. The decision HAS been taken, and it is
+  to leave that path ungated: see change E, which closes the risk through salience rather than
+  through a gate, and gives the reasoning. The residual risk is that a person merges a release pull
+  request while an open nightly-failure issue is sitting beside it. That is a human judgement the
+  spec deliberately leaves to a human, and it expires as a defensible position if this repository
+  ever gains a second regular contributor.
 - **The 45.4-minute floor**, as above.
 
-## The gap this change widens: nobody is told when the nightly tier fails
+## Background: the gap change E closes
 
 A pull-request check is synchronous and addressed to the person who caused it — it blocks their
 merge and they see it immediately. A cron job is neither. Moving `breaklock-posix-liveness` into the
@@ -306,16 +376,9 @@ Compounding it: `release-plz` opens a release pull request on every push to `mai
 workflow consults the model tier. So the sequence "deadlock merges, nightly goes red at 03:17,
 nobody is told, a release ships" is available today.
 
-This spec does NOT fix that, because inventing a notification mechanism here would widen it well
-past CI latency and the choice of mechanism belongs to the owner. What it does is state the gap in
-the terms the decision needs:
-
-- The consequence of a red nightly tier is currently borne by whoever happens to look.
-- After this change, one more class of defect — `breaklock` liveness — lands in that tier.
-- Until either a routing mechanism exists or the deferred shallow per-PR run lands, the window
-  between "a deadlock merges" and "a human notices" is unbounded.
-
-Owner decision, recorded as a follow-up rather than taken here.
+**Change E closes this**, and the release path is deliberately left ungated for the reasons given
+there. An earlier draft of this spec left both open as owner decisions; they were negotiated and
+settled, and the resolution is change E rather than a follow-up.
 
 ## Stand-downs
 
