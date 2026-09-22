@@ -655,6 +655,8 @@ struct Inner {
     /// path -> bytes appended on the second `metadata` call
     grow: HashMap<String, Vec<u8>>,
     metadata_reads: HashMap<String, u32>,
+    /// call name -> code, not consumed on use
+    always: HashMap<String, Code>,
 }
 
 #[derive(Default)]
@@ -713,8 +715,16 @@ impl FaultFs {
     }
 
     /// Make the next call to `name` fail with `code`.
+    /// Fail the next call to `name`, once.
     pub fn fail(&self, name: &str, code: Code) {
         self.inner.lock().unwrap().faults.insert(name.to_string(), code);
+    }
+
+    /// Fail EVERY call to `name`. Needed for `remove_file`: the leftover sweep calls
+    /// it before anything else, so a one-shot fault is consumed there and can never
+    /// reach the cleanup that `discard` performs.
+    pub fn fail_always(&self, name: &str, code: Code) {
+        self.inner.lock().unwrap().always.insert(name.to_string(), code);
     }
 
     pub fn calls(&self) -> Vec<String> {
@@ -735,6 +745,9 @@ impl FaultFs {
     fn record(&self, call: String, key: &str) -> Result<()> {
         let mut g = self.inner.lock().unwrap();
         g.calls.push(call);
+        if let Some(code) = g.always.get(key).copied() {
+            return Err(FsError::new(code, std::io::Error::other("injected")));
+        }
         if let Some(code) = g.faults.remove(key) {
             return Err(FsError::new(code, std::io::Error::other("injected")));
         }
@@ -845,7 +858,15 @@ impl FileSystem for FaultFs {
     fn remove_file(&self, path: &Path) -> Result<()> {
         let p = path.display().to_string();
         self.record(format!("remove_file({p})"), "remove_file")?;
-        self.inner.lock().unwrap().files.remove(&p);
+        // NotFound when it is not there, because `std::fs::remove_file` does that and
+        // `discard` branches on it. A fake that returned Ok here would make that
+        // branch untestable and hide the difference.
+        if self.inner.lock().unwrap().files.remove(&p).is_none() {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            ));
+        }
         Ok(())
     }
 }
@@ -1233,6 +1254,22 @@ Inside the existing `mod tests` in `crates/flux-core/src/copy.rs`:
     }
 
     #[test]
+    fn a_temporary_that_cannot_be_removed_is_named_in_the_error() {
+        // `discard` must not swallow a failed cleanup: a leftover nobody is told
+        // about is one the user cannot even find.
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.fail("rename_replace", flux_fs::Code::PermissionDenied);
+        fs.fail_always("remove_file", flux_fs::Code::PermissionDenied);
+
+        let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap_err();
+
+        let msg = err.source.to_string();
+        assert!(msg.contains("/dst.flux-partial.op1"), "must name the leftover; got {msg}");
+        assert!(msg.contains("injected"), "must carry why it could not be removed; got {msg}");
+    }
+
+    #[test]
     fn a_missing_source_creates_nothing() {
         let fs = FaultFs::new();
         let err = copy_file(&fs, Path::new("/nope"), Path::new("/dst"), &opts()).unwrap_err();
@@ -1322,7 +1359,7 @@ Inside the existing `mod tests` in `crates/flux-core/src/copy.rs`:
 - [ ] **Step 2: Run the tests**
 
 Run: `cargo nextest run -p flux-core --no-tests=pass`
-Expected: PASS, 17 tests. If `a_strict_metadata_failure_prevents_publication` fails, the ordering in
+Expected: PASS, 18 tests. If `a_strict_metadata_failure_prevents_publication` fails, the ordering in
 `copy_file` is wrong — fix the implementation, not the test.
 
 - [ ] **Step 3: Commit**
