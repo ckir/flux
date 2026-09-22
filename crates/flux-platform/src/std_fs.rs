@@ -113,10 +113,19 @@ impl FileSystem for StdFileSystem {
         // other reason it stays weakened. Deleting the target first is worse still --
         // on Windows a target held open with FILE_SHARE_DELETE enters pending-delete,
         // the rename fails, and the destination is lost when the reader closes it.
-        if std::fs::metadata(to).is_ok_and(|m| m.permissions().readonly()) {
+        // `symlink_metadata`, NOT `metadata`: the guard must judge the NAME being
+        // replaced, not whatever it points at. `rename` replaces a symlink itself and
+        // never touches its target, so consulting the target would refuse a rename
+        // that is perfectly safe. Measured: for a symlink to a read-only file,
+        // `metadata(link).readonly()` is true while `symlink_metadata(link)` is false,
+        // and the rename leaves the target's bytes untouched.
+        if std::fs::symlink_metadata(to).is_ok_and(|m| m.permissions().readonly()) {
             return Err(FsError::new(
                 flux_fs::Code::PermissionDenied,
-                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "destination is read-only",
+                ),
             ));
         }
         std::fs::rename(from, to).map_err(FsError::from_io)

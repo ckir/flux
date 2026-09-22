@@ -57,6 +57,37 @@ fn rename_replace_refuses_a_read_only_target() {
     std::fs::remove_file(&to).expect("a read-only file must still be removable");
 }
 
+#[cfg(unix)]
+#[test]
+fn rename_replace_allows_a_symlink_whose_target_is_read_only() {
+    // The read-only guard must judge the NAME being replaced, not what it points at.
+    // `rename` replaces the symlink itself and never touches the target, so refusing
+    // here is a false positive: a copy that should succeed and does not. Unix-only
+    // because creating a symlink on Windows needs Developer Mode.
+    let d = TempDir::new().unwrap();
+    let target = d.path().join("target");
+    let link = d.path().join("link");
+    let from = d.path().join("from");
+
+    std::fs::write(&target, b"protected").unwrap();
+    let mut perms = std::fs::metadata(&target).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&target, perms).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let fs = StdFileSystem;
+    let mut f = fs.create_new(&from).unwrap();
+    f.write_all(b"new").unwrap();
+    drop(f);
+
+    fs.rename_replace(&from, &link).expect("replacing a symlink must not consult its target");
+
+    assert_eq!(std::fs::read(&target).unwrap(), b"protected", "the target must be untouched");
+    assert_eq!(std::fs::read(&link).unwrap(), b"new", "the name must now hold the copy");
+
+    std::fs::remove_file(&target).expect("a read-only file must still be removable");
+}
+
 #[test]
 fn rename_no_replace_refuses_an_existing_target() {
     let d = TempDir::new().unwrap();
