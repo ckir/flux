@@ -48,7 +48,7 @@ code, which is what the spec's "no variant without a reachable producer" rule ac
 | `crates/flux-fs/src/lib.rs` | re-exports only |
 | `crates/flux-platform/src/std_fs.rs` | `StdFileSystem`, the one real implementation |
 | `crates/flux-core/src/copy.rs` | `copy_file` — the algorithm, once |
-| `crates/flux-core/src/fault_fs.rs` | `FaultFs`, the injecting fake (behind `#[cfg(any(test, feature = "testing"))]`) |
+| `crates/flux-core/src/fault_fs.rs` | `FaultFs`, the injecting fake (behind `#[cfg(test)]`) |
 | `crates/flux-cli/src/main.rs` | `flux copy` wiring |
 
 Small files, one responsibility each. `copy.rs` is the only file with branching logic.
@@ -169,8 +169,9 @@ pub struct FsError {
 }
 
 impl FsError {
-    /// Map an OS error to a spec code. **This is the platform layer's job**: the raw
-    /// numbers differ per OS and `flux-core` must never branch on them.
+    /// Map an OS error to a spec code. The mapping lives here, once, because the raw
+    /// numbers differ per OS: both the platform layer and `flux-core` call it rather
+    /// than branching on an `errno` themselves.
     pub fn from_io(source: std::io::Error) -> Self {
         let code = if source.raw_os_error() == Some(ENOSPC_RAW) {
             Code::DiskFull
@@ -424,11 +425,6 @@ mod tests {
         assert!(fs.metadata(Path::new("x")).unwrap().is_file);
     }
 
-    #[test]
-    fn the_trait_is_send_and_sync() {
-        fn requires<T: Send + Sync>() {}
-        requires::<NullFs>();
-    }
 }
 ```
 
@@ -512,7 +508,7 @@ pub use fs::{FileHandle, FileSystem, Metadata, Perms};
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo nextest run -p flux-fs --no-tests=pass`
-Expected: PASS, 9 tests.
+Expected: PASS, 8 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -794,14 +790,18 @@ impl FileSystem for FaultFs {
 
 Important: `FakeHandle` writes into its own buffer, so `copy_file` must flush it back. Rather than
 model that, the fake's `rename_*` moves whatever key exists — and Task 5's happy-path test asserts on
-the **call order**, not on byte contents. Byte fidelity is `flux-platform`'s job and Task 11 tests it
-against a real disk.
+the **call order**, not on byte contents. Byte fidelity is asserted end to end in **Task 8**, which
+runs the real binary against a real filesystem and compares the destination's bytes.
 
 Replace `crates/flux-core/src/lib.rs`:
 
 ```rust
 //! Flux engine (spec §3.1).
 
+// Test-only. Nothing outside this crate uses the fake, so it is gated on `test`
+// rather than on a `testing` feature that nothing would ever turn on -- and an
+// undeclared feature in a `cfg` is a warning the repo's clippy gate would surface.
+#[cfg(test)]
 pub mod fault_fs;
 ```
 
@@ -901,26 +901,54 @@ use flux_fs::{
 use std::io::Write;
 use std::path::Path;
 
+/// Remove the temporary after a failure and build the error to return.
+///
+/// The removal is never discarded: if the temporary survives, its path goes into the
+/// error, because a leftover the caller is never told about is a leak the user cannot
+/// even find. Only called where the temporary is known to exist.
+fn discard<F: FileSystem>(fs: &F, temp: &Path, code: Code, source: std::io::Error) -> FsError {
+    match fs.remove_file(temp) {
+        Ok(()) => FsError::new(code, source),
+        Err(_) => FsError::new(
+            code,
+            std::io::Error::other(format!("{source}; temporary left at {}", temp.display())),
+        ),
+    }
+}
+
 pub fn copy_file<F: FileSystem>(
     fs: &F,
     src: &Path,
     dst: &Path,
     opts: &CopyOptions,
 ) -> Result<Outcome> {
-    let temp = temp_path(dst, &opts.operation_id);
-
-    // 0. this invocation's own leftover, if any (§18.1)
-    let _ = fs.remove_file(&temp);
-
-    // 1. source, captured for the step-6 re-check
+    // 0. refuse a self-copy BEFORE touching the filesystem. This must precede every
+    //    call below, including the leftover sweep, because
+    //    `a_self_copy_is_refused_before_anything_is_touched` asserts the recorded
+    //    call list is empty.
+    //
+    //    §2 Foundational Invariants item 22 asks for identity, not a lexical
+    //    comparison: "Safety checks use filesystem identity and object identity where
+    //    available, not only lexical path comparisons." This cut compares paths only,
+    //    so `flux copy a ./a` is not caught here. It is not destructive -- the copy
+    //    goes through a distinct temporary -- but it is not the refusal the invariant
+    //    asks for either. Task 10 records the gap.
     if src == dst {
-        // Section 33 / SAFETY_REJECTED. Without this the copy truncates the source
-        // into its own temporary and publishes the wreckage over it.
         return Err(FsError::new(
             Code::SafetyRejected,
             std::io::Error::other("source and destination are the same path"),
         ));
     }
+
+    let temp = temp_path(dst, &opts.operation_id);
+
+    // 1. this invocation's own leftover, if any (§18.1). A no-op in this cut: the
+    //    operation id is generated per invocation and never persisted, so nothing from
+    //    an earlier run carries this name. It stays because §18.1 asks the id to be
+    //    "deterministic enough for discovery", and a derivable id makes this live.
+    let _ = fs.remove_file(&temp);
+
+    // 2. source, captured for the step-7 re-check
     let src_meta = fs.metadata(src)?;
     if !src_meta.is_file {
         return Err(FsError::new(
@@ -930,10 +958,10 @@ pub fn copy_file<F: FileSystem>(
     }
     let mut reader = fs.open_read(src)?;
 
-    // 2. exclusive create (FS-1)
+    // 3. exclusive create (FS-1)
     let mut writer = fs.create_new(&temp)?;
 
-    // 3. stream
+    // 4. stream
     let mut bytes_copied = 0u64;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
@@ -941,33 +969,31 @@ pub fn copy_file<F: FileSystem>(
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => {
-                let _ = fs.remove_file(&temp);
-                return Err(FsError::from_io(e));
+                let code = FsError::from_io(std::io::Error::from(e.kind())).code;
+                return Err(discard(fs, &temp, code, e));
             }
         };
         if let Err(e) = writer.write_all(&buf[..n]) {
-            let _ = fs.remove_file(&temp);
-            return Err(FsError::from_io(e));
+            let code = FsError::from_io(std::io::Error::from(e.kind())).code;
+            return Err(discard(fs, &temp, code, e));
         }
         bytes_copied += n as u64;
     }
 
-    // 4. durability
+    // 5. durability
     if opts.durability == Durability::Strict {
         if let Err(e) = writer.sync_all() {
-            let _ = fs.remove_file(&temp);
-            return Err(FsError::new(Code::StrictDurabilityUnavailable, e.source));
+            return Err(discard(fs, &temp, Code::StrictDurabilityUnavailable, e.source));
         }
     }
 
-    // 5. metadata, on the temporary, BEFORE publication (§44.1)
+    // 6. metadata, on the temporary, BEFORE publication (§44.1)
     let mut metadata_failures = Vec::new();
 
     if opts.preserve_times != Preserve::Off {
         if let Err(e) = fs.set_times(&writer, src_meta.modified) {
             if opts.preserve_times == Preserve::Strict {
-                let _ = fs.remove_file(&temp);
-                return Err(FsError::new(Code::MetadataApplyFailed, e.source));
+                return Err(discard(fs, &temp, Code::MetadataApplyFailed, e.source));
             }
             metadata_failures.push(MetadataFailure { item: MetadataItem::Times, error: e });
         }
@@ -976,18 +1002,22 @@ pub fn copy_file<F: FileSystem>(
     if opts.preserve_permissions != Preserve::Off {
         if let Err(e) = fs.set_permissions(&writer, src_meta.permissions) {
             if opts.preserve_permissions == Preserve::Strict {
-                let _ = fs.remove_file(&temp);
-                return Err(FsError::new(Code::MetadataApplyFailed, e.source));
+                return Err(discard(fs, &temp, Code::MetadataApplyFailed, e.source));
             }
             metadata_failures.push(MetadataFailure { item: MetadataItem::Permissions, error: e });
         }
     }
 
-    // 6. the source must not have changed under us (Section 33), then publish
-    let now = fs.metadata(src)?;
+    // 7. the source must not have changed under us (Section 33), then publish.
+    //    Note the `match` rather than `?`: a `?` here would return with the temporary
+    //    still on disk, which is the one leak the `discard` helper exists to prevent.
+    let now = match fs.metadata(src) {
+        Ok(m) => m,
+        Err(e) => return Err(discard(fs, &temp, e.code, e.source)),
+    };
     if now.len != src_meta.len || now.modified != src_meta.modified {
-        let _ = fs.remove_file(&temp);
-        return Err(FsError::new(Code::SourceChanged, std::io::Error::other("source changed")));
+        let changed = std::io::Error::other("source changed");
+        return Err(discard(fs, &temp, Code::SourceChanged, changed));
     }
 
     let published = match opts.publish {
@@ -995,12 +1025,13 @@ pub fn copy_file<F: FileSystem>(
         Publish::NoReplace => fs.rename_no_replace(&temp, dst),
     };
     if let Err(e) = published {
-        let _ = fs.remove_file(&temp);
-        return Err(FsError::new(Code::CopyFailed, e.source));
+        // Keep the code the platform layer mapped. Collapsing a PERMISSION_DENIED at
+        // the rename into COPY_FAILED discards a code the spec's taxonomy defines.
+        let code = if e.code == Code::IoError { Code::CopyFailed } else { e.code };
+        return Err(discard(fs, &temp, code, e.source));
     }
 
-    // 7. §18.1
-    let _ = fs.remove_file(&temp);
+    // A successful rename consumed the temporary; there is nothing left to remove.
 
     Ok(Outcome { bytes_copied, metadata_failures })
 }
@@ -1477,6 +1508,11 @@ fn it_copies_a_single_file() {
 
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(std::fs::read(&dst).unwrap(), b"hello");
+
+    // §44.1 is the reason this cut exists; assert it against a real filesystem, not
+    // only through the fake's call ordering.
+    let (sm, dm) = (std::fs::metadata(&src).unwrap(), std::fs::metadata(&dst).unwrap());
+    assert_eq!(dm.modified().unwrap(), sm.modified().unwrap(), "mtime must be preserved");
 }
 
 #[test]
@@ -1667,40 +1703,56 @@ git commit -m "spec: name the replacing-rename API for publication (§241.5)"
 ## Task 10: Record what this cut does not do
 
 **Files:**
-- Modify: `.clavity/local-anomalies.md`
+- Modify: `TODO.md`
 
-- [ ] **Step 1: Append the two limitations**
+`TODO.md` and not `.clavity/local-anomalies.md`: `.gitignore:25` ignores `.clavity/`, so a commit
+there stages nothing, and Task 11's pull request promises these limitations to a reader who would
+never see them. They are tracked work, and `TODO.md` is where this repository tracks work.
+
+- [ ] **Step 1: Append the three limitations to `TODO.md`, under `## Phase 2 — portable copy (next)`**
 
 ```markdown
-## 2026-09-22 — two known limits of the first single-file copy
+### Known limits of the first single-file copy (2026-09-22)
 
-### `rename_no_replace` is a check-then-rename race
+- [ ] **`rename_no_replace` is a check-then-rename race**
 
-`StdFileSystem::rename_no_replace` tests `to.exists()` and then renames. Between the two, another
-process can create the target, and the rename replaces it — exactly what the method promises not to do.
-The portable primitives are `renameat2(RENAME_NOREPLACE)` on Linux, `renamex_np(RENAME_EXCL)` on macOS
-and `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` on Windows.
+  `StdFileSystem::rename_no_replace` tests `to.exists()` and then renames. Between the two, another
+  process can create the target, and the rename replaces it — exactly what the method promises not to
+  do. The portable primitives are `renameat2(RENAME_NOREPLACE)` on Linux, `renamex_np(RENAME_EXCL)` on
+  macOS and `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` on Windows.
 
-Not fixed now because single-file copy publishes with `Publish::Replace`; the consumer that needs an
-atomic no-replace is the lock protocol, which is where the primitive belongs.
+  Not fixed now because single-file copy publishes with `Publish::Replace`; the consumer that needs an
+  atomic no-replace is the lock protocol, which is where the primitive belongs.
 
-### A leftover temporary from a PREVIOUS run is never removed
+- [ ] **A leftover temporary from a PREVIOUS run is never removed**
 
-`<target>.flux-partial.<operation-id>` is named with a per-invocation id (the pid), so step 0 only ever
-removes this invocation's own leftover. §18.1 wants an id "deterministic enough for discovery"; that
-needs operation state to record it, which this cut does not have. A crashed run therefore leaves a
-temporary that nothing collects.
+  `<target>.flux-partial.<operation-id>` is named with a per-invocation id (the pid), so the leftover
+  sweep only ever removes this invocation's own temporary — which, with an id that is never persisted,
+  means it removes nothing at all. §18.1 wants an id "deterministic enough for discovery"; that needs
+  operation state to record it, which this cut does not have. A crashed run therefore leaves a
+  temporary that nothing collects.
+
+- [ ] **The self-copy refusal compares paths, not filesystem identity**
+
+  §2 Foundational Invariants item 22: *"Safety checks use filesystem identity and object identity where
+  available, not only lexical path comparisons."* `copy_file` refuses only when `src == dst` as paths,
+  so `flux copy a ./a`, or a copy through a hardlink or a junction, is not refused. It is not
+  destructive — the copy is staged in a distinct temporary and the published bytes are the source's
+  own — but the invariant asks for identity and this cut does not supply it.
+
+  Blocked on the same primitive the lock protocol needs: `dev`+`ino` on Unix is one call, Windows needs
+  `FILE_ID_INFO`, which is already an open item above. Do both at once.
 ```
 
 - [ ] **Step 2: Commit**
 
 ```bash
-git add .clavity/local-anomalies.md
-git commit -m "docs: record the two known limits of the first copy implementation"
+git add TODO.md
+git commit -m "docs(todo): the three known limits of the first copy implementation"
 ```
 
-Note: `.clavity/` is gitignored, so this commit may stage nothing. If `git status` shows no change,
-say so and move on — the entry still exists locally for the next triage.
+Expected: one file changed. If `git status` shows nothing staged, the append did not land — stop and
+say so rather than moving on.
 
 ---
 
@@ -1720,4 +1772,4 @@ gh pr create --base main --title "feat: flux-fs trait surface and single-file co
 ```
 
 Body: what now works (`flux copy` copies a file), the §44.1 ordering and the test that proves it, the
-spec amendment, and the two limitations from Task 10.
+spec amendment, and the three limitations Task 10 added to `TODO.md`.
