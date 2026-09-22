@@ -1,7 +1,7 @@
-//! Flux engine.
-//!
-//! Spec §3.1 assigns this crate: scanner, selection, filesystem identity,
-//! topology, persistent operation state, planner, scheduler, workers, copy,
-//! hardlinks, reflinks, sparse files, verification, resume, statistics, errors.
-//!
-//! Scaffold only — no implementation yet.
+//! Flux engine (spec §3.1).
+
+// Test-only. Nothing outside this crate uses the fake, so it is gated on `test`
+// rather than on a `testing` feature that nothing would ever turn on -- and an
+// undeclared feature in a `cfg` is a warning the repo's clippy gate would surface.
+#[cfg(test)]
+pub mod fault_fs;
