@@ -1,13 +1,28 @@
 name: CI
 
 on:
+  # Every branch, not just main: a branch pushed BEFORE its pull request exists matched neither
+  # trigger and got zero checks, so work could sit on the remote untested for as long as the PR
+  # was unopened. `'**'` matches branch names containing a slash; it deliberately does NOT match
+  # tags, which would otherwise run the whole suite again on every release tag.
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
     branches: [main]
   # Manual runs (`gh workflow run ci.yml --ref <branch>`), for when GitHub drops a push event and a pull request
   # gets no checks.
   workflow_dispatch:
+
+# A push and a pull_request event both fire for the SAME commit on a PR branch, which without this
+# would run all eight jobs twice per push: duplicate runner slots, duplicate notifications, and two
+# identical check sets on the PR. `github.head_ref` is set only on pull_request and is empty on
+# push, so the fallback puts both events in one branch-named bucket and GitHub cancels the older.
+#
+# Cancelling is scoped to feature branches. A run on main is the record of what that commit did, so
+# a rapid second push must not erase the first one's verdict.
+concurrency:
+  group: ci-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: ${{ github.ref_name != 'main' }}
 
 env:
   CARGO_TERM_COLOR: always
