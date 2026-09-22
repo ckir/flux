@@ -30,6 +30,7 @@ Checked against the repository at `6472a57` while writing. Re-check if `main` ha
 | `thiserror = "2"`, `clap = { version = "4.6", features = ["derive"] }`, `tempfile = "3"` are in `[workspace.dependencies]` | root `Cargo.toml` |
 | tests run with `cargo nextest run --workspace --no-tests=pass` | `justfile:12-13` |
 | `just check` = `fmt-check clippy typos test` | `justfile:46` |
+| `rustfmt.toml` sets `max_width = 100`, `use_small_heuristics = "Max"`, edition 2024 | `rustfmt.toml` |
 | `flux-cli` has `[[bin]] name = "flux"`, `path = "src/main.rs"` | `crates/flux-cli/Cargo.toml` |
 | the probes are `fs1_..` to `fs11_..` in `crates/flux-platform/tests/fs_semantics.rs` | `grep -n "^fn fs"` |
 
@@ -393,30 +394,60 @@ mod tests {
     struct NullHandle;
 
     impl Read for NullHandle {
-        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> { Ok(0) }
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
     }
     impl Write for NullHandle {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> { Ok(b.len()) }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
     impl FileHandle for NullHandle {
-        fn sync_all(&self) -> crate::Result<()> { Ok(()) }
+        fn sync_all(&self) -> crate::Result<()> {
+            Ok(())
+        }
     }
 
     struct NullFs;
 
     impl FileSystem for NullFs {
         type File = NullHandle;
-        fn open_read(&self, _: &Path) -> crate::Result<Self::File> { Ok(NullHandle) }
-        fn create_new(&self, _: &Path) -> crate::Result<Self::File> { Ok(NullHandle) }
+
+        fn open_read(&self, _: &Path) -> crate::Result<Self::File> {
+            Ok(NullHandle)
+        }
+
+        fn create_new(&self, _: &Path) -> crate::Result<Self::File> {
+            Ok(NullHandle)
+        }
+
         fn metadata(&self, _: &Path) -> crate::Result<Metadata> {
             Ok(Metadata { len: 0, is_file: true, permissions: None, modified: None })
         }
-        fn set_times(&self, _: &Self::File, _: Option<std::time::SystemTime>) -> crate::Result<()> { Ok(()) }
-        fn set_permissions(&self, _: &Self::File, _: Option<Perms>) -> crate::Result<()> { Ok(()) }
-        fn rename_replace(&self, _: &Path, _: &Path) -> crate::Result<()> { Ok(()) }
-        fn rename_no_replace(&self, _: &Path, _: &Path) -> crate::Result<()> { Ok(()) }
-        fn remove_file(&self, _: &Path) -> crate::Result<()> { Ok(()) }
+
+        fn set_times(&self, _: &Self::File, _: Option<std::time::SystemTime>) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn set_permissions(&self, _: &Self::File, _: Option<Perms>) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn rename_replace(&self, _: &Path, _: &Path) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn rename_no_replace(&self, _: &Path, _: &Path) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn remove_file(&self, _: &Path) -> crate::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -703,7 +734,12 @@ impl FileSystem for FaultFs {
             FsError::new(Code::IoError, std::io::Error::from(std::io::ErrorKind::NotFound))
         })?;
         // The reader never syncs; only the writer may consume the injected sync fault.
-        Ok(FakeHandle { path: p, buf, read_pos: 0, sync_fault: std::sync::Arc::new(Mutex::new(None)) })
+        Ok(FakeHandle {
+            path: p,
+            buf,
+            read_pos: 0,
+            sync_fault: std::sync::Arc::new(Mutex::new(None)),
+        })
     }
 
     fn create_new(&self, path: &Path) -> Result<Self::File> {
@@ -1619,7 +1655,8 @@ fn main() -> ExitCode {
                 publish: Publish::Replace,
                 operation_id: OperationId::new(format!("{}", std::process::id())),
             };
-            match flux_core::copy_file(&flux_platform::StdFileSystem, &source, &destination, &opts) {
+            let fs = flux_platform::StdFileSystem;
+            match flux_core::copy_file(&fs, &source, &destination, &opts) {
                 Ok(outcome) => {
                     for f in &outcome.metadata_failures {
                         eprintln!("METADATA_APPLY_FAILED: {:?}: {}", f.item, f.error);
@@ -1795,6 +1832,12 @@ say so rather than moving on.
 ```bash
 just check
 ```
+
+`just check` is `fmt-check clippy typos test`, and it is the first step in this plan that runs
+`fmt-check` — the per-task commands only run `nextest`. Every code block above is written as
+rustfmt would emit it under the repository's `rustfmt.toml`, so this should be clean. If
+`fmt-check` does report a diff, take rustfmt's output: the formatting is not load-bearing and
+nothing in this plan depends on how a line is wrapped.
 
 - [ ] **Step 2: Push and open**
 
