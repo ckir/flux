@@ -24,6 +24,16 @@ workflow. Measured on run `35712320171`, a completed success:
 Total compute is 324.6 minutes; wall clock is 98.4 because the jobs run in parallel. **The suite is
 not slow because it is big.** Two jobs dominate and the other eleven finish inside half an hour.
 
+> **Correction, added after implementation (2026-09-22).** Every figure in this section is a
+> **single sample from one run**, and that turned out to matter. Measured afterwards, the same
+> `breaklock-remote-posix-check` invocation — identical code, identical config — took 2722s here and
+> 3806s / 3829s on two later runs, a **40% spread with nothing changed**. The untouched
+> `Scenario mixed (posix)` job ranged 26.9 → 31.1 → 49.0 min across the three. GitHub's hosted
+> runners are shared and their speed is not controlled by this repository, so a single sample cannot
+> support a target. The shape of the problem below is correct and still holds — two jobs dominate,
+> and inside them single runs dominate. The absolute minute figures, and every prediction derived
+> from them, are not reliable. See **What this achieves** for the corrected, within-run result.
+
 Inside those two jobs, single runs dominate again:
 
 ```
@@ -43,7 +53,7 @@ So the wait is set by **one liveness run and one safety check**, not by the matr
 
 ## Goal and non-goals
 
-**Goal:** cut the critical path of the `Model` workflow from ~98 minutes to ~52, without weakening
+**Goal:** cut the critical path of the `Model` workflow roughly in half, without weakening
 any safety invariant checked on a pull request — and make the nightly tier's verdict visible, since
 this change is what moves a class of defect into it. Changes A, B and D serve the first half;
 change E serves the second, and the two are one piece of work because the first creates the need for
@@ -117,6 +127,10 @@ Give the `fixed-*` runs an explicit `job = "posix-fixed"` key, leaving the rest 
 | `posix` | `check`, `window-witness-SingleWriter`, `witness-NeverTornRead`, `witness-NeverUncertainLockWithPendingBreaker`, `witness-NeverInflightLandedAfterTakeover`, `hostcrash-witness-NeverHostCrashChangedLock` | 52 min |
 | `posix-fixed` | `fixed-check`, `fixed-witness-NoLiveWriter` | 31 min |
 
+The two "about" figures were projected from the baseline run and **both came in higher** — 73.0 /
+73.3 and 40.9 / 44.2 measured. The split itself is unaffected: what the `job` key controls is which
+runs share a job, and that landed exactly as described.
+
 The split is by the same axis the `posix-plain` precedent uses — a scenario variant, keeping a check
 together with the witnesses that establish its reachability.
 
@@ -134,6 +148,12 @@ The real trade is 7 minutes against debuggability: splitting the witnesses away 
 means a failing check and the witnesses proving its reachability land in two different CI logs, and
 that cost is paid exactly when developer friction is highest. Both 45 and 52 minutes fall in the
 same "go and do something else" bucket. **The 7 minutes is a priced decision, not an oversight.**
+
+The *price* was computed from the baseline run and is therefore wrong in magnitude — on the runners
+actually measured, the third shard would have saved closer to 10 minutes than 7. The *decision* is
+unchanged, and arguably strengthened: the runner variance alone (18 minutes on an untouched job) is
+larger than the gap being traded away, so buying it back at the cost of splitting a check from its
+witnesses would be paying a permanent debuggability cost for a difference the runner noise swamps.
 
 ## Change D — timeout headroom
 
@@ -156,6 +176,27 @@ already satisfies it. Raise `breaklock-posix-liveness` to `timeout_minutes = 120
 50%. The tier it is moving to has ample room for that: `model-extended.yml` sets
 `timeout-minutes: 360` on its job, where `model.yml` sets 180 on the scenario job the run is
 leaving.
+
+> **Correction: the rule is right, the table was one sample, and a second run now breaks the rule.**
+> Re-measured on the two post-change runs, with declared timeouts unchanged:
+>
+> | used | actual | declared | run |
+> |---|---|---|---|
+> | **53%** | 63.4m / 63.8m | 120m | `breaklock-remote-posix-check` — **was listed at 38%** |
+> | 37% | 43.9m | 120m | `breaklock-remote-posix-fixed-check` — was listed at 26% |
+>
+> `breaklock-remote-posix-check` did not change; the runner did. It is now the run sitting closest
+> to its timeout, in the same position `breaklock-posix-liveness` occupied when this rule was
+> written — and it is the critical path, so a timeout there fails the whole PR verdict.
+>
+> **This is a headroom gap the spec has not closed.** Applying this spec's own rule, that run needs
+> `timeout_minutes` of at least 128, and by the precedent set above (90 → 120 for a run at 49.5%)
+> something like 150 would be the consistent choice. That is a change beyond the approved A/B/D/E
+> scope and is **recorded here, not made**, for the owner to scope.
+>
+> The deeper lesson the rule should carry: a percentage-of-timeout figure is only as stable as the
+> runner it was measured on. A 40% runner swing moved a run from 38% to 53% with no code change, so
+> the 50% rule needs headroom for runner variance built in, not just for state-space growth.
 
 State-space growth is not linear in the constants, so a run at 66% is closer to its cliff than the
 number suggests. The point of the rule is that a timeout should fail on a genuine hang, not on
@@ -229,16 +270,50 @@ implementation from a failure step placed inside the matrix job.
 
 ## What this achieves, and the limit
 
-| | before | after |
-|---|---|---|
-| `Scenario breaklock (posix)` | 98.4 min | ~39 min |
-| `Scenario breaklock-remote (posix)` | 83.6 min | ~52 min |
-| new `Scenario breaklock-remote (posix-fixed)` | — | ~31 min |
-| **critical path** | **98.4 min** | **~52 min** |
+**This section was rewritten after the change shipped, and the original prediction was wrong.** It
+claimed a ~52-minute critical path. The measured figure is **73.0 and 73.3 minutes** across two
+runs. The shortfall is not a failed split — it is the single-sample baseline described in the
+correction above. Both numbers below are measured, not predicted.
 
-**The floor is 45.4 minutes and no further sharding reaches past it.**
-`breaklock-remote-posix-check` is a single indivisible TLC invocation; a `job` key subdivides a list
-of runs, never one run's state-space search.
+### Measured, after (two samples)
+
+| CI job | run `35744606862` | run `35744782885` |
+|---|---|---|
+| `Scenario breaklock-remote (posix)` — **the critical path** | **73.0 min** | **73.3 min** |
+| `Scenario breaklock-remote (posix-fixed)` (new) | 40.9 min | 44.2 min |
+| `Scenario breaklock (posix)` | 40.1 min | 37.6 min |
+
+Both runs completed green, **including `Suite-wide coverage union`** — the job that would catch
+change A silently dropping label coverage, and therefore the result that matters most.
+
+### The win, measured within a single run
+
+A before-and-after across runs cannot be trusted here, because the runners differ between them. So
+the effect is stated **within each run**, where the runner is held constant by construction:
+
+| | sample 1 | sample 2 |
+|---|---|---|
+| `breaklock-remote`, had it stayed one job (`posix` + `posix-fixed`, sequential) | ~113.9 min | ~117.5 min |
+| `breaklock (posix)`, had the liveness run stayed in it | **≥ 99.5 min** | **≥ 97.0 min** |
+| critical path without changes A and B | **≥ ~114 min** | **≥ ~118 min** |
+| critical path as shipped | **73.0 min** | **73.3 min** |
+
+That is a reduction of **at least 36%**, established without comparing across runners.
+
+The `breaklock (posix)` row is a **lower bound**, and deliberately so: `breaklock-posix-liveness`
+now runs in the nightly tier, so its duration on *these* runners was never measured. The bound uses
+its 59.4-minute figure from the faster baseline runner. The true value is very likely higher — the
+one run measured on both runner populations got 40% slower — so the bound holds with room to spare.
+It is quoted as a bound rather than a scaled estimate because a scaled estimate would be exactly the
+kind of derived-from-one-sample number this spec already got wrong once.
+
+### The limit
+
+**No amount of further sharding gets past the cost of one TLC invocation.**
+`breaklock-remote-posix-check` is a single indivisible search; a `job` key subdivides a list of
+runs, never one run's state space. That run measured 45.4 min on the baseline runner and 63.4 /
+63.8 min on these two — so the floor is **a property of the runner, not a fixed number of minutes**,
+and quoting it as one (as this spec originally did) is the same mistake in miniature.
 
 Getting below that floor needs **vertical** scaling rather than horizontal: TLC's search is
 concurrent and scales roughly with cores, so larger runners would cut the floor itself. That is out
@@ -358,7 +433,9 @@ They are recorded so the implementer does not have to rediscover them.
   request while an open nightly-failure issue is sitting beside it. That is a human judgement the
   spec deliberately leaves to a human, and it expires as a defensible position if this repository
   ever gains a second regular contributor.
-- **The 45.4-minute floor**, as above.
+- **The single-TLC-invocation floor**, as above. Originally written here as a fixed 45.4 minutes;
+  corrected, because that run measured 63.4 / 63.8 min on later runners. The floor is real, but it
+  is set by the runner, not by a number this spec can quote.
 
 ## Background: the gap change E closes
 

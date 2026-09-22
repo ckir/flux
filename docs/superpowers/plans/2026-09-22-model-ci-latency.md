@@ -2,7 +2,10 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Cut the `Model` workflow's critical path from ~98 minutes to ~52, and make the nightly tier say when it fails.
+**Goal:** Cut the `Model` workflow's critical path roughly in half, and make the nightly tier say when it fails.
+
+> The original goal line read "from ~98 minutes to ~52". Both figures came from a single baseline
+> run and did not survive measurement; see the outcome note in Task 7.
 
 **Architecture:** Four changes, all configuration. One TLA+ run moves from the per-PR tier to the nightly tier; one CI job splits in two on an existing `job` key; one timeout gains headroom; and the nightly workflow gains a job that opens a deduplicated GitHub issue on failure. No Rust, no Python, no TLA+ is modified.
 
@@ -695,6 +698,26 @@ The critical path should be about **52 minutes**, down from 98.4. These are wall
 on shared runners, so treat anything within a few minutes as agreement; what must hold is that
 `breaklock (posix)` no longer dominates and a `posix-fixed` job exists.
 
+> **Outcome (recorded after execution).** The two structural conditions HELD:
+> `breaklock (posix)` fell to 40.1 / 37.6 min and is no longer the critical path, and a
+> `posix-fixed` job exists holding exactly the two named runs. The **magnitude prediction did
+> not**: two runs measured **73.0** and **73.3** min, not ~52.
+>
+> The cause is the prediction's inputs, not the change. Every "before" number above is a single
+> sample from run `35712320171`, and the runner pool is not stable: `breaklock-remote-posix-check`,
+> whose code this change never touched, took 2722s there and 3806s / 3829s on these two runs — a
+> **40% swing**. The untouched `Scenario mixed (posix)` job ranged 26.9 → 31.1 → 49.0 min.
+>
+> The win is real, but it can only be stated **within a run**, where the runner is constant:
+> unsplit, `breaklock-remote` would have been ~113.9 / ~117.5 min, so the critical path went from
+> **≥ ~114 min to 73.0 min** — at least a 36% cut. The corrected numbers and the lower-bound
+> reasoning live in the spec's **What this achieves** section.
+>
+> **"A few minutes of agreement" was the wrong tolerance to write.** It assumed run-to-run noise is
+> small. It is not — on this runner pool it is tens of minutes, larger than the effect being
+> measured. A plan that predicts a wall-clock figure from one sample cannot be verified by
+> comparing one later sample to it, whatever the tolerance.
+
 - [ ] **Step 3: Confirm the coverage union still passes**
 
 In the same run, the `Suite-wide coverage union` job must conclude `success`.
@@ -719,9 +742,12 @@ just check
 - [ ] **Step 2: Open the PR**
 
 ```bash
-gh pr create --base main --title "ci(model): cut the model suite's time-to-verdict to about 52 minutes"
+gh pr create --base main --title "ci(model): cut the model suite's time-to-verdict roughly in half"
 ```
 
 Body: the measured before-and-after critical path, that the moved run covers no label uniquely, that
-the release path is deliberately ungated and why, and the two deferred items — the shallow per-PR
-liveness run, and the 45.4-minute floor that only larger runners get past.
+the release path is deliberately ungated and why, and and the deferred items — the shallow per-PR
+liveness run, the single-TLC-invocation floor that only larger runners get past, and the timeout
+headroom gap change D did not close. State the critical path as MEASURED (two samples), not as
+predicted, and say plainly that the before-number is a single sample on a differently-performing
+runner.
