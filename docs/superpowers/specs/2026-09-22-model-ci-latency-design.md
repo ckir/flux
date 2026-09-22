@@ -218,8 +218,12 @@ So verification is run-level, not job-level:
    EOF
    ```
 
-   **Before** the change it prints 10 CI jobs, with `breaklock posix` at 16 runs and
-   `breaklock-remote posix` at 8. **After** A and B it must print **11 CI jobs**, with:
+   Run it **before** the change and keep the output; judge the change as a DELTA against that,
+   not against the absolute numbers below. At the time of writing it printed 10 CI jobs with
+   `breaklock posix` at 16 runs and `breaklock-remote posix` at 8, but `main` moves and another
+   merged change can shift those totals, which would make a correct implementation look wrong.
+
+   The delta that must hold: **exactly one more CI job than before**, and:
 
    | scenario | job | runs |
    |---|---|---|
@@ -312,6 +316,17 @@ the terms the decision needs:
   between "a deadlock merges" and "a human notices" is unbounded.
 
 Owner decision, recorded as a follow-up rather than taken here.
+
+## Stand-downs
+
+Findings the panel raised and did not fold, with the reason.
+
+- `REJECTED`: "the moved run will default to `job = 'posix'` and bundle with existing breaklock
+  runs in the extended tier, serialising a 59-minute run behind them." Measured — the extended tier
+  contains exactly two CI jobs today, `recovery/posix` (4 runs) and `recovery/windows` (4 runs).
+  There is no `breaklock/posix` job there, so the moved run forms its own job and has nothing to
+  queue behind. No explicit `job` key is needed. If a future change adds breaklock runs to that
+  tier, this becomes live again.
 
 ## Deferred to its own spec
 
