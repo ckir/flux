@@ -180,18 +180,69 @@ so the limit does not get rediscovered.
 
 TLC cannot run on the developer machine, so the change is verified in three layers:
 
-1. **`python models/lockproto/run.py --list-jobs`** — locally, no TLC. Confirms the matrix contains
-   the new `posix-fixed` entry and no longer contains `breaklock-posix-liveness`'s job, and that
-   nothing else moved. This is the fast oracle for both A and B.
-2. **`run.py --expected models/lockproto/expected-extended.toml --list-jobs`** — confirms the moved
-   run is now in the nightly tier exactly once.
+**`--list-jobs` is NOT sufficient on its own, and a panel round caught the draft assuming it was.**
+It emits one entry per CI job as `{scenario, platform, job}` — ten entries, and **no run names**.
+Two consequences the implementer must know:
+
+- The `breaklock (posix)` job does NOT disappear when `breaklock-posix-liveness` moves out of it;
+  other breaklock runs remain. "The job is gone" is an unsatisfiable check, and a correct
+  implementation would appear to fail it.
+- A run left in the wrong job is INVISIBLE to it. Add `job = "posix-fixed"` to the witnesses but
+  forget `fixed-check`, and the matrix still shows a `posix-fixed` entry while the 31-minute run
+  stays in `posix` — the check passes and the critical path silently stays near 76 minutes.
+
+So verification is run-level, not job-level:
+
+1. **Run-to-job assignment, the real oracle for B.** Locally, no TLC:
+
+   A CI job is identified by **(scenario, job)**, not by `job` alone — grouping on `job` alone
+   collapses every posix scenario into one bucket and tells you nothing. This grouping reproduces
+   the ten entries `--list-jobs` emits, which is how you know it models the right thing:
+
+   ```bash
+   python - <<'EOF'
+   import tomllib, pathlib, collections
+   d = tomllib.loads(pathlib.Path("models/lockproto/expected.toml").read_text(encoding="utf-8"))
+   by = collections.defaultdict(list)
+   for r in d["run"]:
+       plat = "windows" if "-windows" in r["name"] else "posix"
+       by[(r["scenario"], r.get("job", plat))].append(r["name"])
+   for k in sorted(by):
+       print(f"  {k[0]:<18} {k[1]:<12} {len(by[k]):>3} runs")
+   print(f"
+{len(by)} CI jobs")
+   EOF
+   ```
+
+   **Before** the change it prints 10 CI jobs, with `breaklock posix` at 16 runs and
+   `breaklock-remote posix` at 8. **After** A and B it must print **11 CI jobs**, with:
+
+   | scenario | job | runs |
+   |---|---|---|
+   | `breaklock` | `posix` | **15** (16 minus the moved liveness run) |
+   | `breaklock-remote` | `posix` | **6** (8 minus the two `fixed-*` runs) |
+   | `breaklock-remote` | `posix-fixed` | **2**, exactly `breaklock-remote-posix-fixed-check` and `breaklock-remote-posix-fixed-witness-NoLiveWriter` |
+
+   Every other row unchanged. This is the check that catches a run left in the wrong job.
+
+2. **The move, for A.** `grep -c breaklock-posix-liveness models/lockproto/expected.toml` must be
+   `0`, and the same grep against `models/lockproto/expected-extended.toml` must be `2`. Two, not
+   one: the name appears on the run's own `name` line and again in its `config` path
+   (`configs/breaklock-posix-liveness.cfg`). Both lines live inside the same `[[run]]` block and
+   move together, so the pair is the signature of a complete move. The `.cfg` file itself stays
+   where it is in `models/lockproto/configs/` — only the tier that references it changes.
+
+3. **`run.py --list-jobs` and the extended-tier equivalent** still run, but only to confirm the
+   matrix parses and gains the `posix-fixed` entry. They are a syntax check, not the oracle.
 3. **`models/lockproto/test_run.py` and `test_workflow.py`**, plus the repository gate `just check`.
 4. **CI is the only oracle for the timings.** The first `Model` run on the branch demonstrates the
    new critical path, and the first nightly run demonstrates the moved run still passes there.
 
 The coverage union is the risk to watch: if the union fails on the first run after A, the measured
 "zero unique labels" result was wrong and the change must be reverted rather than papered over by
-adding entries to `never_reached`.
+widening a coverage exemption. The per-run key for such an exemption is `unreached` (with a
+separate `deferred`); `never_reached` is the parameter name inside `run.py`'s `judge_union` and
+appears nowhere in `expected.toml`, so do not go looking for it there.
 
 ## Interactions checked, because a new CI job touches more than its own runs
 
