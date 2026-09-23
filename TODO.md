@@ -45,10 +45,24 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
 
       Two risks this decision does NOT solve, and no crate would have:
 
-- [ ] **Symlink-loop detection for the walker.** Needs `dev`/`ino` tracking,
-      which is OS-specific and subtle. Required before recursive copy can follow
-      links; spec §2 item 21 says symlink targets never contribute unless
-      link-following is explicitly enabled.
+- [x] **Symlink-loop detection for the walker — RESOLVED by the design of
+      2026-09-23, and it was the wrong shape of worry.** The default walk never
+      follows a symlink (§25, §26), and descending only on `is_dir()` gives that
+      for free on both platforms, so no symlink loop is reachable at all. What IS
+      reachable without any symlink is a bind mount: MEASURED on WSL, after
+      `mount --bind a a/b` the path `a/b` is not a symlink (`-L` no), is a
+      directory (`-d` yes), and `stat` reports `dev=120 ino=13` for both `a` and
+      `a/b`. The design handles it with an ancestor set of object identities
+      rather than `dev`/`ino` tracking of everything visited, which would grow
+      with the tree and breach spec line 997.
+- [ ] **Cycle detection is unavailable on weak-identity filesystems.** §107 names
+      FAT32, exFAT and some SMB and NFS configurations as producing weak or
+      unavailable identity, and the walker acts only on `FileIdentity::Strong`.
+      On those filesystems a bind-mounted subtree is copied twice and §149.6's
+      "even if filesystem namespace relationships change after startup" is unmet —
+      the §129 containment check degrades to a lexical test. The operation reports
+      that the guarantee was unavailable rather than implying it held, but the gap
+      is real and this is where a fix belongs.
 - [ ] **Walker TOCTOU.** If `read_dir` yields bare paths, the walk inherits the
       same races `walkdir` has: an entry can change type between the listing and
       the visit. Mitigated by returning the file type WITH the entry so no

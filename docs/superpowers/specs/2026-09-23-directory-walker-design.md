@@ -56,17 +56,35 @@ pub struct DirEntry {
     pub file_type: FileType,
 }
 
-/// Portable filesystem object identity (§107, §109.1, §149.4).
+/// Portable filesystem object identity (§109).
 ///
-/// `index` is `u128` because Windows needs it: §107's 64-bit file index is NOT
-/// unique on ReFS, so a strong identity requires `FILE_ID_INFO`'s 128-bit file id
-/// from `GetFileInformationByHandleEx`. Unix widens `st_ino` into the same field.
+/// BOTH fields, never one: §109 says "Never compare only inode" or "only file ID",
+/// and requires `filesystem_id + object_id`, so that unrelated objects on different
+/// filesystems are not merged.
+///
+/// `index` is `u128` because Windows needs it: the 64-bit file index is not unique
+/// on ReFS, so a strong identity requires `FILE_ID_INFO`'s 128-bit file id. Unix's
+/// `st_ino` is a `u64` and is zero-extended into the same field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ObjectId {
     /// Unix `st_dev`; Windows `VolumeSerialNumber`.
     pub volume: u64,
-    /// Unix `st_ino`; Windows the 128-bit `FileId`.
+    /// Unix `st_ino`, zero-extended; Windows the 128-bit `FileId`.
     pub index: u128,
+}
+
+/// §107: "A `FileIdentity` must therefore be accompanied by its reliability
+/// classification." Three states, not two.
+///
+/// This is deliberately NOT `Option<ObjectId>`. An `Option` collapses *weak* into
+/// *strong*, which is the exact failure §107 exists to prevent: FAT32, exFAT, and
+/// some SMB and NFS configurations produce an identity that EXISTS and cannot be
+/// trusted. Everything that acts on identity below acts only on `Strong`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileIdentity {
+    Strong(ObjectId),
+    Weak(ObjectId),
+    Unavailable,
 }
 
 pub struct Metadata {
@@ -74,10 +92,10 @@ pub struct Metadata {
     pub is_file: bool,
     pub permissions: Option<Perms>,
     pub modified: Option<SystemTime>,
-    /// `None` where the platform does not strongly support identity. §149.4 asks for
-    /// it "where strongly supported", so the type admits its absence rather than
-    /// inventing a value. See "When identity is unavailable" below.
-    pub object_id: Option<ObjectId>,
+    /// §149.4 asks for identity "where strongly supported", and §107 requires the
+    /// strength to travel with it. One field, three states, no second way to say
+    /// "absent".
+    pub identity: FileIdentity,
 }
 
 pub trait FileSystem: Send + Sync {
@@ -171,7 +189,7 @@ source today.
 ```rust
 pub enum WalkEvent {
     /// Pre-order: the directory exists and is about to be descended into.
-    Dir { path: PathBuf, object_id: Option<ObjectId> },
+    Dir { path: PathBuf, identity: FileIdentity },
     File { path: PathBuf },
     Symlink { path: PathBuf },
     Other { path: PathBuf },
@@ -296,9 +314,11 @@ initialisation, alongside its "is this a directory" check.
 
 Before descending into a directory `D`:
 
-- if `D.object_id` is already in the ancestor set → a cycle. Report, skip the subtree, continue.
-- if `D.object_id` equals the **destination anchor's** `ObjectId` → `SAFETY_REJECTED`, abort the whole
-  operation. This is the dynamic half of §149.6.
+- if `D`'s identity is not `Strong`, skip both checks below and see "When identity is weak or
+  unavailable".
+- if its `ObjectId` is already in the ancestor set → a cycle. Report, skip the subtree, continue.
+- if its `ObjectId` equals the **destination anchor's** → `SAFETY_REJECTED`, abort the whole operation.
+  This is the dynamic half of §149.6.
 - otherwise push it and descend, popping at `DirEnd`.
 
 The **destination anchor** resolves the case §129 has to handle before anything is created. A tree copy
@@ -314,16 +334,28 @@ can run *"before transfer begins"* as §129 demands, rather than after the desti
 A pre-flight comparison of `src_root` against the anchor runs before the walk starts; the per-directory
 comparison above is what catches a namespace change *after* startup.
 
-### When identity is unavailable
+### When identity is weak or unavailable
 
-`object_id` is `Option` because §149.4 asks for identity *"where strongly supported"*. On both target
-platforms it is supported — Unix always, Windows via `FILE_ID_INFO` — so `None` is a fallback, not the
-common case.
+Every check above acts on `FileIdentity::Strong` alone. On both target platforms that is the normal
+case — Unix always, Windows via `FILE_ID_INFO` on NTFS and ReFS — so the degraded paths are fallbacks,
+not the common route.
 
-Where it is `None`, the cycle check and the §149.6 dynamic check cannot be performed for that entry.
-The walk proceeds and the operation reports that the guarantee was unavailable for that path, rather
-than silently behaving as though it had checked. It is recorded as a known limitation, not papered
-over.
+`Weak` and `Unavailable` are treated identically here, because a value that cannot be trusted is worth
+no more than a value that is absent. §108 exists precisely because weak identity needs its own policy
+for hardlinks; the scanner's policy is this:
+
+- **Cycle detection is not performed.** A walk over a weak-identity filesystem can therefore duplicate a
+  bind-mounted subtree. This is a real, documented limitation with a `TODO.md` entry, not a silent
+  degradation — the operation records that the guarantee was unavailable for that path.
+- **The §129 containment check degrades to a lexical test.** That still catches the case §129 names,
+  `flux copy /data /data/backup`, because it is lexical. What it cannot catch is containment
+  established through a mount or a rename, which is exactly what §149.6's "even if filesystem namespace
+  relationships change after startup" asks for. So on weak identity that clause is unmet, and the
+  operation says so rather than implying a guarantee it did not provide.
+
+One adapter rule, from §107: *"The platform adapter must never treat `object_id == 0` as a valid
+universal object identity."* An adapter that reads an index of zero reports `Unavailable`, never
+`Strong(ObjectId { index: 0, .. })`.
 
 ## Composition with `copy_file`
 
@@ -361,7 +393,9 @@ pub enum TreeFailureCause {
     /// temporary is still reported per file.
     Copy(CopyError),
     /// A symlink or other non-regular entry, which this cut does not recreate.
-    Unsupported,
+    /// Carries WHAT it was, so the report can say so; the rendered code is always
+    /// `SPECIAL_FILE_UNSUPPORTED`.
+    Unsupported(FileType),
 }
 
 pub fn copy_tree<F: FileSystem>(
@@ -379,13 +413,30 @@ else lands in `failures` and the walk continues.
 `opts.operation_id` is shared across every file, so each file's staging temporary is named from the same
 id. That is what makes §18.1's leftover sweep work per file without the tree needing its own scheme.
 
+**One failure, one representation.** Each `TreeFailureCause` variant is defined by WHERE the failure
+happened, and no failure may be expressible two ways:
+
+- `Walk` — the traversal could not read or enter something. Only the walk produces it.
+- `CreateDir` — `create_dir` failed, or the path was occupied by a non-directory.
+- `Copy` — `copy_file` returned an error. Only `copy_file` produces it.
+- `Unsupported` — the walk typed the entry as something this cut does not recreate. `copy_file` is
+  never called for it, so it can never arrive as `Copy(SpecialFileUnsupported)`.
+
+That last rule is the one worth stating, because `copy_file` *would* return `SPECIAL_FILE_UNSUPPORTED`
+for a symlink source if it were called — the walk already knows the type, so it is not called, and the
+failure has exactly one home.
+
+Two `Code` variants also sit close enough to confuse: `SourceChanged` is a FILE whose length or mtime
+moved under `copy_file` (§33), while `DirectoryChangedDuringScan` is a DIRECTORY whose identity changed
+under the walk (§149.4). Different objects, different producers, no overlap.
+
 ```
 create dst_root if absent            // the walk emits no event for the root
 for event in walk(fs, src_root) {
     Dir      -> fs.create_dir(dst_root.join(rel))        // pre-order
     File     -> copy_file(fs, src_root.join(rel), dst_root.join(rel), opts)
-    Symlink  -> report SPECIAL_FILE_UNSUPPORTED
-    Other    -> report SPECIAL_FILE_UNSUPPORTED
+    Symlink  -> record Unsupported(Symlink)
+    Other    -> record Unsupported(Other)
     DirEnd   -> nothing in this cut
     Err(e)   -> report, continue
 }
@@ -396,9 +447,23 @@ event for its own root. Missing that would leave `flux copy /data /backup` writi
 `/backup` that was never created. It is created **after** the §129 pre-flight check and before the walk
 begins, so nothing is written to a destination that the safety check would have rejected.
 
-A directory that already exists at the destination is not an error; `create_dir`'s `AlreadyExists` is
-treated as success, because a tree copy onto an existing tree is ordinary. Any other `create_dir`
-failure skips that subtree and is reported.
+A directory that already exists at the destination is not an error, because a tree copy onto an existing
+tree is ordinary — but `AlreadyExists` **must not be treated as success on its own**. MEASURED:
+
+```
+mkdir on an existing FILE      -> "File exists"   exit 1
+mkdir on an existing DIRECTORY -> "File exists"   exit 1
+```
+
+`EEXIST`, and so `ErrorKind::AlreadyExists`, is identical in both cases: the error alone cannot tell
+you whether a directory or a *file* occupies the path. Treating it as success where a file sits there
+would copy the whole subtree's children into a path that is not a directory, failing once per child,
+far from the real cause.
+
+So on `AlreadyExists`, `copy_tree` calls `metadata` on the destination path and continues only if it is
+a directory. If it is not, that is one failure for that subtree, reported at the directory where it
+actually went wrong, and the subtree is skipped. Any other `create_dir` failure skips the subtree and is
+reported the same way.
 
 `copy_tree` returns a summary — files copied, bytes copied, and every per-entry failure — rather than
 stopping at the first failure. The CLI exits 1 if any failure was recorded, matching item 83 and the
@@ -432,7 +497,8 @@ So `FaultFs` gains:
 - an explicit `directories: HashSet<PathBuf>` recording which paths are directories,
 - `read_dir` yielding the immediate children found in `files` and `directories`, empty when a directory
   has none,
-- `object_id` support, so cycle detection and the §129 check are testable without a real bind mount,
+- `set_identity(path, FileIdentity)`, so cycle detection and the §129 check are testable without a real
+  bind mount or any privilege — two paths are simply given the same `ObjectId`,
 - fault injection for `read_dir` and `create_dir`, reusing the existing `fail` / `fail_kind` /
   `fail_nth` machinery.
 
@@ -461,15 +527,43 @@ fake that agrees with the implementation about encoding proves nothing about the
 Three pull requests, in order. Each plan is written only once its predecessor has merged, because a plan
 citing line numbers is a set of claims about code that must already exist.
 
-1. **Object identity.** `ObjectId`, `Metadata.object_id`, and implementations in `StdFileSystem`,
-   `FaultFs` and the `NullFs` test stub at `fs.rs:104`. No walker code. This is first because it carries
-   the only genuine platform risk in the design — Windows `FILE_ID_INFO`, on a repository that lives on
-   a ReFS Dev Drive where §107's 64-bit index is not unique — and both §149.4 and §129 depend on it.
+1. **Object identity.** `ObjectId`, `FileIdentity`, `Metadata.identity`, and implementations in
+   `StdFileSystem`, `FaultFs` and the `NullFs` test stub at `fs.rs:104`. No walker code. This is first
+   because it carries the only genuine platform risk in the design — Windows `FILE_ID_INFO`, on a
+   repository that lives on a ReFS Dev Drive where the 64-bit index is not unique — and both §149.4 and
+   §129 depend on it.
 
    Adding a field to `Metadata` is a **breaking change to a public struct**: every construction site
-   must name the new field. All three in-tree implementors are updated in this PR, and
-   `crates/flux-core/src/copy.rs` constructs no `Metadata`, so `copy_file` is untouched. The crate is
-   pre-1.0 and unpublished, so no external consumer exists.
+   must name the new field. There are exactly three, all updated in this PR — `fs.rs:119`,
+   `std_fs.rs:173` and `fault_fs.rs:329` — and `crates/flux-core/src/copy.rs` constructs none, so
+   `copy_file` is untouched. The crate is pre-1.0 and unpublished, so no external consumer exists.
+
+   **Windows.** `GetFileInformationByHandleEx(FileIdInfo)` needs a HANDLE, while `metadata` takes a
+   `&Path`, so the adapter opens one itself. The flags are not a free choice, and std's own source
+   (`sys/fs/windows.rs:1398-1404, 1501-1504`) settles all three:
+
+   - `FILE_FLAG_BACKUP_SEMANTICS` — std's comment is "allows opening directories". Without it a
+     directory cannot be opened at all, and directories are the entries the ancestor check exists for.
+   - `FILE_FLAG_OPEN_REPARSE_POINT` — "opens a link instead of its target". Without it the adapter
+     would read a symlink's TARGET identity, silently corrupting cycle detection with an identity that
+     belongs to a different object.
+   - `access_mode(0)` — std notes "No read or write permissions are necessary", which avoids both a
+     sharing violation and a denial on a file this process may not read.
+
+   `FILE_ID_INFO` yields `VolumeSerialNumber: u64` and `FileId: [u8; 16]`; the latter becomes `index`
+   via `u128::from_le_bytes`. A volume that cannot supply it reports `Unavailable`, not a zero id.
+
+   **Unix.** `st_dev` is `volume`; `st_ino` is a `u64` zero-extended into the `u128` `index`. Identity
+   is `Strong` on ordinary local filesystems. It is reported `Weak` where §107 names the filesystem as
+   unreliable and that is detectable, and `Unavailable` where `st_ino` is 0.
+
+   **`NullFs`** returns `FileIdentity::Unavailable` — the stub exists to prove the trait compiles, and
+   inventing an identity there would let a test pass against a fake that never had one.
+
+   **`FaultFs`** gets `set_identity(path, FileIdentity)` so a test can give two paths the SAME
+   `ObjectId` and reproduce the bind-mount cycle with no mount and no privileges. Paths with nothing set
+   default to a distinct `Strong` id generated per path, so ordinary tests need no setup and no two
+   unrelated paths collide by accident.
 2. **The walk.** `FileType`, `DirEntry`, `read_dir`, `create_dir`, `Code::DirectoryChangedDuringScan`,
    the `FaultFs` widening, and the ordered walk with its event type, ancestor-set cycle detection and
    non-terminal errors.
