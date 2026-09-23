@@ -8,10 +8,52 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
       versions for the candidate crates but no member crate depends on any of them
       yet. Each must be judged on performance, correctness, portability,
       maintenance, licensing and API stability before adoption.
-- [ ] **Directory walker.** Spec §67 lists `jwalk`, but crates.io currently ships
-      it described as "Use `dua-core` instead" and it has not moved since 0.9.0.
-      Decide between `walkdir`, a maintained parallel walker, or our own — the
-      deterministic-ordering requirement (spec §7) may force a custom one anyway.
+- [x] **Directory walker — DECIDED 2026-09-23: no third-party walker.** Add a
+      single-level `read_dir` primitive to `flux_fs::FileSystem`, returning one
+      level of entries WITH their file type, and implement the ordered
+      depth-first walk in `flux-core` over an explicit stack. Negotiated with
+      the agy peer; both positions converged, and the decisive argument was the
+      peer's. Reasoning, all of it measured rather than recalled:
+
+      - **§7.2's ordering needs no crate and no global sort.** The spec says "a
+        depth-first scanner that sorts each directory's entries by name alone
+        emits component-wise order without buffering". Verified against the
+        spec's own normative example: DFS with per-directory byte sorting gives
+        `a/x  a/y/z  a-b  a0`, the component-wise order, while flat `/`-joined
+        byte sorting gives `a-b  a/x  a/y/z  a0`, exactly the order §7.2 warns
+        is wrong. Per-directory sorting is sufficient.
+      - **`walkdir` is out because it cannot see our trait.** Measured in
+        walkdir 2.5.0 source: `pub struct WalkDir` carries no filesystem
+        generic, `new<P: AsRef<Path>>` is generic only over the path type, and
+        `src/lib.rs:114` and `:909` bind it to `std::fs::read_dir`. Using it in
+        the engine would bypass `FaultFs` and leave recursive copy untestable by
+        the fault-injection harness the rest of the suite depends on.
+      - **`jwalk` is out twice over.** Its own crates.io description reads "Use
+        `dua-core` instead" and it has not moved since 0.9.0, failing §67's
+        maintenance criterion. Worse, it is a PARALLEL walker: parallel
+        traversal yields entries in completion order, restoring §7 order then
+        needs a reorder buffer, and spec line 511 says "the scanner never
+        creates an unbounded global list of discovered" entries. It fights the
+        spec rather than merely failing to help.
+      - **Parallelism belongs on the copy, not the walk.** Traversal is
+        metadata-bound and must be ordered anyway. Sequential ordered discovery
+        feeding a parallel worker pool over a bounded queue is the shape spec
+        lines 508-511 describe.
+      - **FD exhaustion is a non-issue**, contrary to my initial worry: sorting a
+        directory forces collecting its entries into a `Vec`, so the directory
+        handle drops before recursing and only one is ever open.
+
+      Two risks this decision does NOT solve, and no crate would have:
+
+- [ ] **Symlink-loop detection for the walker.** Needs `dev`/`ino` tracking,
+      which is OS-specific and subtle. Required before recursive copy can follow
+      links; spec §2 item 21 says symlink targets never contribute unless
+      link-following is explicitly enabled.
+- [ ] **Walker TOCTOU.** If `read_dir` yields bare paths, the walk inherits the
+      same races `walkdir` has: an entry can change type between the listing and
+      the visit. Mitigated by returning the file type WITH the entry so no
+      re-stat is needed; a full fix wants `openat`-style directory-relative
+      operations, which `std` does not expose.
 - [ ] **Persistent state format** for the topology store and operation manifest
       (spec §17, §19). Must scale past RAM and survive a crash mid-write.
 - [ ] Repository housekeeping: enable GitHub private vulnerability reporting (see
