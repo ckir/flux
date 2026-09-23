@@ -46,7 +46,7 @@ pub enum FileIdentity {
     Unavailable,
 }
 
-/// Only what single-file copy reads. Widened when a consumer needs more.
+/// Only what single-file copy and the walk read. Widened when a consumer needs more.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Metadata {
     pub len: u64,
@@ -54,6 +54,10 @@ pub struct Metadata {
     pub is_file: bool,
     pub permissions: Option<Perms>,
     pub modified: Option<SystemTime>,
+    /// §149.4 asks the scanner to obtain identity "where strongly supported", and
+    /// §107 requires the strength to travel with it. One field, three states, and no
+    /// second way to say "absent".
+    pub identity: FileIdentity,
 }
 
 /// A handle open for writing. Deliberately NOT `Read`: see `FileSystem::Reader`.
@@ -148,7 +152,15 @@ mod tests {
         }
 
         fn metadata(&self, _: &Path) -> crate::Result<Metadata> {
-            Ok(Metadata { len: 0, is_file: true, permissions: None, modified: None })
+            Ok(Metadata {
+                len: 0,
+                is_file: true,
+                permissions: None,
+                modified: None,
+                // The stub exists to prove the trait compiles. Inventing an identity
+                // here would let a test pass against a fake that never had one.
+                identity: FileIdentity::Unavailable,
+            })
         }
 
         fn set_times(

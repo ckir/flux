@@ -5,7 +5,7 @@
 //! `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` fails — FS-6 and FS-7 measured exactly
 //! that, and Section 241.5 is amended in Task 9 to name it.
 
-use flux_fs::{FileHandle, FileSystem, FsError, Metadata, Perms, Result};
+use flux_fs::{FileHandle, FileIdentity, FileSystem, FsError, Metadata, Perms, Result};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -175,6 +175,7 @@ impl FileSystem for StdFileSystem {
             is_file: m.is_file(),
             permissions: Some(perms_of(&m)),
             modified: m.modified().ok(),
+            identity: FileIdentity::Unavailable,
         })
     }
 

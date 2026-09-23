@@ -331,6 +331,7 @@ impl FileSystem for FaultFs {
             is_file: !g.not_files.contains(&p),
             permissions: g.perms.get(&p).copied().flatten(),
             modified: g.times.get(&p).copied().flatten(),
+            identity: flux_fs::FileIdentity::Unavailable,
         })
     }
 
