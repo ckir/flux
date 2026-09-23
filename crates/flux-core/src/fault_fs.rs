@@ -63,6 +63,19 @@ struct Inner {
 /// for a path that skipped it, because the plausible alternative - reporting
 /// `Unavailable` - is a state the walker handles GRACEFULLY, so an unhooked path
 /// would silently degrade while its test stayed green.
+/// `NotFound` when the rename's source does not exist, as `std::fs::rename` gives.
+///
+/// Without it `move_object`'s `unwrap_or_default()` CONJURED the destination: renaming
+/// a missing path returned `Ok`, left an empty file at `to`, and minted no identity for
+/// it, so the next `metadata` on that path hit the unreachable-by-construction panic.
+/// MEASURED before this guard: `Ok`, `/dest` existed, `metadata` panicked.
+fn missing_source(g: &Inner, from: &str) -> Result<()> {
+    if g.files.contains_key(from) {
+        return Ok(());
+    }
+    Err(FsError::new(Code::IoError, std::io::Error::from(std::io::ErrorKind::NotFound)))
+}
+
 fn mint_identity(g: &mut Inner, path: &str) {
     if g.identities.contains_key(path) {
         return;
@@ -422,7 +435,9 @@ impl FileSystem for FaultFs {
     fn rename_replace(&self, from: &Path, to: &Path) -> Result<()> {
         let (f, t) = (from.display().to_string(), to.display().to_string());
         self.record(format!("rename_replace({f} -> {t})"), "rename_replace")?;
-        move_object(&mut self.inner.lock().unwrap(), &f, &t);
+        let mut g = self.inner.lock().unwrap();
+        missing_source(&g, &f)?;
+        move_object(&mut g, &f, &t);
         Ok(())
     }
 
@@ -430,6 +445,7 @@ impl FileSystem for FaultFs {
         let (f, t) = (from.display().to_string(), to.display().to_string());
         self.record(format!("rename_no_replace({f} -> {t})"), "rename_no_replace")?;
         let mut g = self.inner.lock().unwrap();
+        missing_source(&g, &f)?;
         if g.files.contains_key(&t) {
             return Err(FsError::new(
                 Code::IoError,
@@ -513,6 +529,21 @@ mod tests {
             fs.metadata(std::path::Path::new("/a")).unwrap().identity,
             FileIdentity::Unavailable
         );
+    }
+
+    #[test]
+    fn renaming_a_missing_source_fails_instead_of_conjuring_the_destination() {
+        // `move_object`'s `unwrap_or_default()` created the destination out of nothing,
+        // so a rename of a missing path reported success, left an empty file behind, and
+        // minted no identity for it - which then turned the next `metadata` into a panic.
+        // MEASURED before the guard: Ok, /dest existed, metadata panicked.
+        let fs = FaultFs::new();
+        let e = fs
+            .rename_replace(std::path::Path::new("/missing"), std::path::Path::new("/dest"))
+            .unwrap_err();
+
+        assert_eq!(e.source.kind(), std::io::ErrorKind::NotFound, "as std::fs::rename gives");
+        assert!(!fs.exists("/dest"), "a failed rename creates nothing");
     }
 
     #[test]
