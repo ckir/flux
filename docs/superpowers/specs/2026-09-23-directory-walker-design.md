@@ -109,6 +109,11 @@ pub trait FileSystem: Send + Sync {
     /// directory to be sorted, sorting requires the whole directory in hand, so a lazy
     /// return shape would promise a laziness the caller cannot use. Materialising also
     /// drops the directory handle before the walk recurses, so only one is ever open.
+    ///
+    /// A plain `Vec<DirEntry>` with an `OsString` per name, deliberately: a packed
+    /// layout was measured at 1.91x smaller and rejected, because it would put a
+    /// custom representation in this trait's public return type to win a constant
+    /// factor that no realistic directory notices. See "What stays unresolved".
     fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>>;
 
     /// Creates one directory. Fails if the parent is missing; the walk creates
@@ -553,15 +558,48 @@ fake that agrees with the implementation about encoding proves nothing about the
 
 ## What stays unresolved
 
-- **A single enormous directory.** §7.2 requires each directory to be sorted, which requires holding it
-  in memory, while §9 and §10.1 require bounded resident RAM. The spec bounds the scanner against the
-  *total* file count, not against one directory, so a directory with tens of millions of entries is
-  within the letter of the invariants and still a real memory cost. No resolution is proposed here; it
-  is recorded so the phase that adds spill-to-disk knows where to look.
-- **Whether `--rbind` or shared mount propagation can make a bind-mount cycle unbounded.** Measured only
-  for the plain `--bind` case, which is finite. The peer was asked and said plainly it was not certain.
-  The design does not depend on the answer, because the ancestor-set check catches duplication and a
-  hang alike.
+- **A single enormous directory — SETTLED: do the simplest thing.** `read_dir` returns an ordinary
+  `Vec<DirEntry>` holding an `OsString` per entry. No packed representation, no spill to disk.
+
+  MEASURED on 200,000 real files in one ext4 directory: `readdir` 448 ms, 3,699,984 total name bytes
+  (18.5 per entry), bytewise sort 81 ms. A packed layout — all names in one buffer plus 8 bytes per
+  entry — would cost 5.3 MB against 10.1 MB for the `OsString` form, a factor of **1.91**, plus it
+  avoids 200,000 separate allocations.
+
+  That factor was rejected as a reason to build it. At any realistic directory size the absolute
+  numbers are irrelevant (10,000 entries is half a megabyte either way), and it only starts to matter at
+  sizes where a constant factor no longer decides anything. Against that, packing would push a custom
+  representation into the *trait's public return type*, which three implementors must satisfy and every
+  future one after them. The simplest thing that works for every real directory is the right thing, and
+  the measurement is recorded here so that a future change is an informed one rather than a rediscovery.
+
+  **The justification for holding a directory at all is invariant 11 — and NOT §7.2.** Invariant 11
+  forbids "an unbounded global list of discovered files"; one directory is not the total, so holding it
+  is within the letter. It is tempting to read §7.2's "emits component-wise order without buffering" as
+  blessing this, and that reading is wrong: that sentence is about ORDERING — it says no global reorder
+  buffer is needed to achieve component-wise order — not about memory bounds. The distinction matters
+  because §7.2 would equally appear to bless something genuinely unbounded.
+
+  What stays genuinely unknown is where the cost stops being linear. The straight-line extrapolation to
+  ten million entries (~505 MB, ~22 s) assumes linear scaling in both memory and `readdir`, and that
+  assumption is untested; it is recorded as an extrapolation, not a measurement. The peer argued that
+  kernel dentry-cache pressure and ext4's htree limits would break before Rust's allocator does, which
+  is plausible and is NOT measured here either. Neither claim changes the decision, because the decision
+  is to build nothing.
+- **Mount-based cycles are FINITE — SETTLED, and the open question is closed.** MEASURED on kernel
+  `6.6.87.2-microsoft-standard-WSL2`, with `mount --bind`, `mount --rbind`, and `--make-shared`
+  followed by `--rbind`: all three reach depth 2 against a probe cap of 60, with source and mounted
+  directory sharing a `dev:ino`, and no leftover mounts.
+
+  A first probe could not distinguish "the mount is not re-applied" from "the inner directory happened
+  to be empty", which the peer caught. Re-run with a real five-deep chain and a marker file inside the
+  mount point: `a/b` lists `b`, while `a/b/b` lists the marker and the real chain, and `a/b/b/b` does
+  not exist. So the underlying directory is reached with its own content, the mount is demonstrably not
+  re-applied inside itself, and the recursion stops for that reason rather than for want of tree.
+
+  This does NOT cover a server-side construction such as an SMB wide link, where a remote server
+  resolves each request and can present an unbounded tree of ordinary directories. No local command can
+  reach that case. It is precisely the weak-identity situation, where the depth cap is the guard.
 - **`PATH_COMPONENT_INVALID`** (§103) arrives with the phase that constructs `FluxPathKey`s.
 
 ## Delivery
