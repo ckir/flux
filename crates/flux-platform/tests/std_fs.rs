@@ -338,7 +338,24 @@ fn a_symlink_reports_its_own_identity_not_its_targets() {
     #[cfg(unix)]
     let made = std::os::unix::fs::symlink(&target, &link).is_ok();
     #[cfg(windows)]
-    let made = std::os::windows::fs::symlink_dir(&target, &link).is_ok();
+    let made = {
+        // A symlink needs Developer Mode or SeCreateSymbolicLinkPrivilege, and a stock
+        // machine has neither - so this used to SKIP, leaving the only Windows coverage
+        // of FILE_FLAG_OPEN_REPARSE_POINT at zero. MEASURED: removing that flag left the
+        // whole Windows suite green.
+        //
+        // A JUNCTION needs no privilege (MEASURED: `New-Item -ItemType Junction`
+        // succeeds unelevated) and is also a name-surrogate reparse point, so it
+        // exercises the same flag. Try the symlink first, fall back to the junction.
+        std::os::windows::fs::symlink_dir(&target, &link).is_ok()
+            || std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&link)
+                .arg(&target)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+    };
 
     if !made {
         // Windows needs Developer Mode or SeCreateSymbolicLinkPrivilege. Say so loudly:
