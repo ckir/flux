@@ -38,6 +38,9 @@ struct Inner {
     /// more than once and needs the LATER one to fail.
     nth_faults: HashMap<String, (u32, Code, std::io::ErrorKind)>,
     call_counts: HashMap<String, u32>,
+    /// path -> the identity `metadata` reports. A path with no entry gets a distinct
+    /// `Strong` id derived from its name, so ordinary tests need no setup.
+    identities: HashMap<String, flux_fs::FileIdentity>,
 }
 
 /// Move a name's content AND its metadata. Moving only the bytes meant the times and
@@ -194,6 +197,12 @@ impl FaultFs {
     /// Make `metadata` report `path` as something other than a regular file -- a
     /// directory, a symlink, a device. Without this the fake reported `is_file: true`
     /// for everything and SPECIAL_FILE_UNSUPPORTED had no test that produced it.
+    /// Give a path an identity. Two paths given the SAME `ObjectId` is how a test
+    /// reproduces a directory cycle with no mount and no privilege.
+    pub fn set_identity(&self, path: &str, identity: flux_fs::FileIdentity) {
+        self.inner.lock().unwrap().identities.insert(path.to_string(), identity);
+    }
+
     pub fn add_special(&self, path: &str) {
         let mut g = self.inner.lock().unwrap();
         g.files.insert(path.to_string(), Vec::new());
@@ -331,7 +340,25 @@ impl FileSystem for FaultFs {
             is_file: !g.not_files.contains(&p),
             permissions: g.perms.get(&p).copied().flatten(),
             modified: g.times.get(&p).copied().flatten(),
-            identity: flux_fs::FileIdentity::Unavailable,
+            identity: g.identities.get(&p).copied().unwrap_or_else(|| {
+                // FNV-1a. The offset basis is non-zero so the empty path is not 0, and
+                // mixing each byte keeps ADJACENT paths apart.
+                //
+                // MEASURED: an earlier draft used `hash * 31` then `| 1` to avoid zero.
+                // That clears the low bit, so "/a" (1554) and "/b" (1555) both became
+                // 1555 and the fake's one promise -- two paths are two objects -- failed.
+                let mut index: u128 = 0xcbf2_9ce4_8422_2325;
+                for b in p.as_bytes() {
+                    index ^= u128::from(*b);
+                    index = index.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+                // §107 forbids a zero id. Unreachable given a non-zero basis; here so it
+                // cannot become reachable.
+                if index == 0 {
+                    index = 1;
+                }
+                flux_fs::FileIdentity::Strong(flux_fs::ObjectId { volume: 1, index })
+            }),
         })
     }
 
@@ -405,5 +432,36 @@ mod tests {
         fs.fail("remove_file", flux_fs::Code::PermissionDenied);
         let e = fs.remove_file(std::path::Path::new("/a")).unwrap_err();
         assert_eq!(e.code, flux_fs::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn identities_default_to_distinct_and_can_be_forced_equal() {
+        use flux_fs::{FileIdentity, ObjectId};
+        let fs = FaultFs::new();
+        fs.write_file("/a", b"x");
+        fs.write_file("/b", b"x");
+
+        // Default: every path is its own object, so an ordinary test needs no setup
+        // and two unrelated paths never collide by accident.
+        let ia = fs.metadata(std::path::Path::new("/a")).unwrap().identity;
+        let ib = fs.metadata(std::path::Path::new("/b")).unwrap().identity;
+        assert!(matches!(ia, FileIdentity::Strong(_)));
+        assert_ne!(ia, ib);
+
+        // Forced: this is what makes a cycle testable without a mount or a privilege.
+        let shared = ObjectId { volume: 7, index: 7 };
+        fs.set_identity("/a", FileIdentity::Strong(shared));
+        fs.set_identity("/b", FileIdentity::Strong(shared));
+        assert_eq!(
+            fs.metadata(std::path::Path::new("/a")).unwrap().identity,
+            fs.metadata(std::path::Path::new("/b")).unwrap().identity
+        );
+
+        // And the degraded path is reachable, which the walker's fallback needs.
+        fs.set_identity("/a", FileIdentity::Unavailable);
+        assert_eq!(
+            fs.metadata(std::path::Path::new("/a")).unwrap().identity,
+            FileIdentity::Unavailable
+        );
     }
 }
