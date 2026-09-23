@@ -171,6 +171,17 @@ Promoted from the local anomalies inbox (triage of 2026-09-14); each was re-meas
       that declines to open one. A habit is not a control; the person who merges it will not be the person
       who learned the habit.
 
+Triage of 2026-09-23 adds one more, re-measured that day.
+
+- [ ] **`cargo-mutants` reports false `MISSED` for a package whose tests live in `tests/`.** On `flux-platform` it
+      called 12 of 26 mutants missed, including `destination_is_write_protected -> false`; applying that mutant by
+      hand fails two tests, `rename_replace_refuses_a_read_only_target` and `..._denied_by_acl`. The package has
+      **zero** `#[test]` functions in `src/` and 22 across `tests/std_fs.rs` and `tests/fs_semantics.rs`, and the
+      mutants harness is not running them. `flux-core`'s results are trustworthy for the opposite reason — its tests
+      are lib tests. Until this is pinned down, read a `flux-platform` mutants report as unverified: confirm each
+      claimed survivor by applying it by hand. Fix by giving the package a `.cargo/mutants.toml` with the right
+      test scope, or by proving which invocation the harness actually uses.
+
 ## Spec gaps from the filesystem probes
 
 Measured by the lock-model probes (`crates/flux-platform/tests/fs_semantics.rs`, branch `model/lock-protocol`)
