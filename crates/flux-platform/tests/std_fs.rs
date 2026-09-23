@@ -1,4 +1,4 @@
-use flux_fs::FileSystem;
+use flux_fs::{FileIdentity, FileSystem};
 use flux_platform::StdFileSystem;
 use std::io::Write;
 use tempfile::TempDir;
@@ -260,4 +260,173 @@ fn rename_replace_refuses_a_target_denied_by_acl() {
 
     assert!(refused, "a destination we may not write must be refused");
     assert_eq!(content, b"protected", "the protected contents must survive");
+}
+
+#[test]
+fn two_hardlinks_to_one_file_share_an_identity() {
+    // The property that makes identity worth having: the SAME object reached by two
+    // different paths reports the SAME id, which no path comparison can tell you.
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    std::fs::write(&a, b"x").unwrap();
+    std::fs::hard_link(&a, &b).unwrap();
+
+    let fs = StdFileSystem;
+    let ia = fs.metadata(&a).unwrap().identity;
+    let ib = fs.metadata(&b).unwrap().identity;
+
+    assert!(matches!(ia, FileIdentity::Strong(_)), "local fs must be strong, got {ia:?}");
+    assert_eq!(ia, ib, "two links to one object are one object");
+}
+
+#[test]
+fn two_distinct_files_have_distinct_identities() {
+    // The control. Without it, an implementation returning one constant id for
+    // everything would pass the test above.
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    std::fs::write(&a, b"x").unwrap();
+    std::fs::write(&b, b"x").unwrap();
+
+    let fs = StdFileSystem;
+    assert_ne!(fs.metadata(&a).unwrap().identity, fs.metadata(&b).unwrap().identity);
+}
+
+#[test]
+fn a_directory_has_an_identity() {
+    // On Windows this is what FILE_FLAG_BACKUP_SEMANTICS buys: without it the open
+    // fails on a directory and identity degrades to Unavailable for exactly the
+    // entries the walk needs it for.
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+
+    let id = StdFileSystem.metadata(&sub).unwrap().identity;
+    assert!(matches!(id, FileIdentity::Strong(_)), "directories need identity too, got {id:?}");
+}
+
+#[test]
+fn one_directory_reached_two_ways_is_one_object() {
+    // `.` inside a directory is that same directory. If identity did not survive the
+    // spelling of the path, a later walk's ancestor check would never fire.
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let same = sub.join(".");
+
+    let fs = StdFileSystem;
+    let a = fs.metadata(&sub).unwrap().identity;
+    let b = fs.metadata(&same).unwrap().identity;
+
+    assert!(matches!(a, FileIdentity::Strong(_)), "got {a:?}");
+    assert_eq!(a, b, "one directory, two spellings, one identity");
+}
+
+#[test]
+fn a_symlink_reports_its_own_identity_not_its_targets() {
+    // The mutation this catches: dropping FILE_FLAG_OPEN_REPARSE_POINT on Windows, or
+    // using `metadata` instead of `symlink_metadata` on Unix. Either makes a link
+    // report its TARGET's identity, and a later walk would compare a link against the
+    // target's id - taking an ordinary directory for a cycle, or missing a real one.
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    let link = dir.path().join("link");
+
+    // `Result<(), String>` rather than a bool: a bare bool forced the assert to GUESS
+    // why, and it guessed a Windows cause even on Unix. The reason travels with the
+    // failure instead.
+    #[cfg(unix)]
+    let made: Result<(), String> =
+        std::os::unix::fs::symlink(&target, &link).map_err(|e| format!("symlink failed: {e}"));
+
+    #[cfg(windows)]
+    let made: Result<(), String> = make_dir_reparse_point(&target, &link);
+
+    // NOT a skip. On Windows a junction needs no privilege and on Unix a symlink needs
+    // none either, so failing to create one is a broken environment rather than an
+    // absent capability - and a silent skip reports `ok` while testing nothing, which is
+    // how this property came to have no coverage on Windows in the first place.
+    if let Err(why) = made {
+        panic!(
+            "could not create a reparse point at {}: {why}. This is the only test covering \
+             the no-follow behaviour on this platform, so it fails rather than skipping.",
+            link.display()
+        );
+    }
+
+    let fs = StdFileSystem;
+    let target_id = fs.metadata(&target).unwrap().identity;
+    let link_id = fs.metadata(&link).unwrap().identity;
+
+    assert!(matches!(target_id, FileIdentity::Strong(_)), "target: {target_id:?}");
+    assert!(matches!(link_id, FileIdentity::Strong(_)), "link: {link_id:?}");
+    assert_ne!(target_id, link_id, "a symlink is its own object, not its target");
+}
+
+/// Create a directory reparse point at `link` pointing at `target`, returning whether
+/// it worked. Prefers a symlink; falls back to a JUNCTION, which needs no privilege
+/// where a symlink needs Developer Mode or SeCreateSymbolicLinkPrivilege.
+///
+/// MEASURED: `New-Item -ItemType Junction` succeeds unelevated, and a junction is a
+/// name-surrogate reparse point, so it exercises FILE_FLAG_OPEN_REPARSE_POINT exactly
+/// as a symlink does.
+#[cfg(windows)]
+fn make_dir_reparse_point(target: &std::path::Path, link: &std::path::Path) -> Result<(), String> {
+    if std::os::windows::fs::symlink_dir(target, link).is_ok() {
+        return Ok(());
+    }
+    // Separate args, NOT one quoted string: MEASURED, `cmd /C` strips outer quotes and
+    // then misreads nested ones, creating nothing even for an ordinary path. Separate
+    // args work for ordinary paths and paths with spaces; they do not survive a `&`.
+    let out = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output();
+    // The POSTCONDITION, never the exit status: MEASURED, `mklink /J` returns 0 even
+    // when its target does not exist. The stat error is REPORTED, not swallowed.
+    match std::fs::symlink_metadata(link) {
+        Ok(m) if m.file_type().is_symlink() => Ok(()),
+        Ok(m) => Err(format!("path exists but is not a reparse point: {:?}", m.file_type())),
+        Err(e) => Err(format!(
+            "nothing at the link path after `mklink /J` ({e}); a `&` in the temp path is the likeliest cause, since cmd.exe treats it as a command separator. cmd said: {}",
+            out.map(|o| {
+                // BOTH streams: cmd writes its failure to stderr, so reporting stdout
+                // alone printed an empty string on the one path that matters.
+                let mut said = String::from_utf8_lossy(&o.stdout).trim().to_owned();
+                let err = String::from_utf8_lossy(&o.stderr).trim().to_owned();
+                if !err.is_empty() {
+                    said.push_str(&err);
+                }
+                said
+            })
+            .unwrap_or_else(|e| format!("<could not run cmd: {e}>"))
+        )),
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn metadata_reports_a_reparse_point_as_not_a_file() {
+    // The Windows half of `metadata_reports_a_symlink_as_not_a_file`, which is
+    // `#[cfg(unix)]` because symlinks used to need Developer Mode. A junction does not,
+    // so that justification is obsolete and the property is testable here after all.
+    //
+    // It matters most on THIS platform: Windows is where `metadata` and
+    // `symlink_metadata` diverge on reparse points, and a walk that gates descent on
+    // `is_file` would follow a link it should have reported.
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    let link = dir.path().join("link");
+
+    if let Err(why) = make_dir_reparse_point(&target, &link) {
+        panic!("could not create a reparse point at {}: {why}", link.display());
+    }
+
+    let m = StdFileSystem.metadata(&link).unwrap();
+    assert!(!m.is_file, "a reparse point is not a regular file");
 }

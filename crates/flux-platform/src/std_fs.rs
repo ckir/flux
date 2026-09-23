@@ -5,7 +5,7 @@
 //! `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` fails — FS-6 and FS-7 measured exactly
 //! that, and Section 241.5 is amended in Task 9 to name it.
 
-use flux_fs::{FileHandle, FileSystem, FsError, Metadata, Perms, Result};
+use flux_fs::{FileHandle, FileIdentity, FileSystem, FsError, Metadata, ObjectId, Perms, Result};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -170,11 +170,16 @@ impl FileSystem for StdFileSystem {
         // item 21 also says symlink targets never contribute unless link-following is
         // explicitly enabled, which it is not in this cut.
         let m = std::fs::symlink_metadata(path).map_err(FsError::from_io)?;
+        #[cfg(unix)]
+        let identity = identity_of(&m);
+        #[cfg(windows)]
+        let identity = identity_of(path);
         Ok(Metadata {
             len: m.len(),
             is_file: m.is_file(),
             permissions: Some(perms_of(&m)),
             modified: m.modified().ok(),
+            identity,
         })
     }
 
@@ -255,4 +260,71 @@ fn perms_of(m: &std::fs::Metadata) -> Perms {
 #[cfg(not(unix))]
 fn perms_of(m: &std::fs::Metadata) -> Perms {
     Perms::ReadOnly(m.permissions().readonly())
+}
+
+/// Unix identity costs NOTHING extra: `metadata` already calls `symlink_metadata`,
+/// and `st_dev` / `st_ino` come off that same struct. No second syscall.
+#[cfg(unix)]
+fn identity_of(m: &std::fs::Metadata) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt;
+    let index = u128::from(m.ino());
+    // §107: "The platform adapter must never treat `object_id == 0` as a valid
+    // universal object identity."
+    if index == 0 {
+        return FileIdentity::Unavailable;
+    }
+    FileIdentity::Strong(ObjectId { volume: m.dev(), index })
+}
+
+/// Windows identity needs a HANDLE, because `GetFileInformationByHandleEx` takes one
+/// and the path-based metadata std already read cannot supply the 128-bit id.
+///
+/// Every flag is load-bearing, and std's own source says why
+/// (`library/std/src/sys/fs/windows.rs`):
+/// - `BACKUP_SEMANTICS`: std says "allows opening directories". Without it a directory
+///   cannot be opened at all, and directories are exactly what the walk needs it for.
+/// - `OPEN_REPARSE_POINT`: std says "opens a link instead of its target". Without it a
+///   symlink reports its TARGET's identity, silently corrupting a walk's cycle
+///   detection with an id belonging to a different object.
+/// - `access_mode(0)`: std says "No read or write permissions are necessary". It avoids
+///   both a sharing violation and a denial on a file this process cannot read.
+#[cfg(windows)]
+fn identity_of(path: &Path) -> FileIdentity {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FileIdInfo,
+        GetFileInformationByHandleEx,
+    };
+
+    let Ok(file) = OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+    else {
+        return FileIdentity::Unavailable;
+    };
+
+    let mut info = FILE_ID_INFO { VolumeSerialNumber: 0, FileId: Default::default() };
+    // SAFETY: `info` is a live, correctly sized `FILE_ID_INFO`, and the handle stays
+    // open for the duration of the call because `file` outlives it.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as _,
+            FileIdInfo,
+            (&raw mut info).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        // Not every filesystem implements this info class.
+        return FileIdentity::Unavailable;
+    }
+
+    let index = u128::from_le_bytes(info.FileId.Identifier);
+    // §107: an id of zero is never a valid universal identity.
+    if index == 0 {
+        return FileIdentity::Unavailable;
+    }
+    FileIdentity::Strong(ObjectId { volume: info.VolumeSerialNumber, index })
 }

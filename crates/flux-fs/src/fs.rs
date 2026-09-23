@@ -14,7 +14,39 @@ pub enum Perms {
     ReadOnly(bool),
 }
 
-/// Only what single-file copy reads. Widened when a consumer needs more.
+/// Portable filesystem object identity (§109).
+///
+/// BOTH fields, always. §109 says "Never compare only inode" and "only file ID",
+/// and requires `filesystem_id + object_id`, so that two unrelated objects on
+/// different filesystems are never merged into one identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ObjectId {
+    /// Unix `st_dev`; Windows `VolumeSerialNumber`.
+    pub volume: u64,
+    /// Unix `st_ino`, zero-extended; Windows the 128-bit `FileId`.
+    ///
+    /// `u128` because Windows needs it: the 64-bit file index std exposes is not
+    /// unique on ReFS, and this repository's own working tree is a ReFS Dev Drive.
+    pub index: u128,
+}
+
+/// An `ObjectId` together with how far it can be trusted (§107).
+///
+/// §107: "A `FileIdentity` must therefore be accompanied by its reliability
+/// classification." Three states, and deliberately NOT `Option<ObjectId>`: an
+/// `Option` collapses *weak* into *strong*, which is precisely the failure §107
+/// exists to prevent. FAT32, exFAT and some SMB and NFS configurations produce an
+/// identity that exists and cannot be trusted.
+///
+/// Callers that act on identity for SAFETY must act on `Strong` alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileIdentity {
+    Strong(ObjectId),
+    Weak(ObjectId),
+    Unavailable,
+}
+
+/// Only what single-file copy and the walk read. Widened when a consumer needs more.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Metadata {
     pub len: u64,
@@ -22,6 +54,10 @@ pub struct Metadata {
     pub is_file: bool,
     pub permissions: Option<Perms>,
     pub modified: Option<SystemTime>,
+    /// §149.4 asks the scanner to obtain identity "where strongly supported", and
+    /// §107 requires the strength to travel with it. One field, three states, and no
+    /// second way to say "absent".
+    pub identity: FileIdentity,
 }
 
 /// A handle open for writing. Deliberately NOT `Read`: see `FileSystem::Reader`.
@@ -116,7 +152,15 @@ mod tests {
         }
 
         fn metadata(&self, _: &Path) -> crate::Result<Metadata> {
-            Ok(Metadata { len: 0, is_file: true, permissions: None, modified: None })
+            Ok(Metadata {
+                len: 0,
+                is_file: true,
+                permissions: None,
+                modified: None,
+                // The stub exists to prove the trait compiles. Inventing an identity
+                // here would let a test pass against a fake that never had one.
+                identity: FileIdentity::Unavailable,
+            })
         }
 
         fn set_times(
@@ -142,6 +186,24 @@ mod tests {
         fn remove_file(&self, _: &Path) -> crate::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn identity_distinguishes_strength_and_object() {
+        let a = ObjectId { volume: 1, index: 2 };
+        let b = ObjectId { volume: 1, index: 3 };
+
+        // Same object, different reliability, is NOT the same identity. This is the
+        // whole reason §107 makes strength part of the value rather than a sidecar.
+        assert_ne!(FileIdentity::Strong(a), FileIdentity::Weak(a));
+        // Different objects never compare equal.
+        assert_ne!(FileIdentity::Strong(a), FileIdentity::Strong(b));
+        assert_eq!(FileIdentity::Strong(a), FileIdentity::Strong(a));
+        assert_eq!(FileIdentity::Unavailable, FileIdentity::Unavailable);
+
+        // §109: both halves participate. An equal index on another volume is a
+        // different object, and nothing may compare on the index alone.
+        assert_ne!(ObjectId { volume: 1, index: 2 }, ObjectId { volume: 9, index: 2 });
     }
 
     #[test]

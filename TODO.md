@@ -8,10 +8,78 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
       versions for the candidate crates but no member crate depends on any of them
       yet. Each must be judged on performance, correctness, portability,
       maintenance, licensing and API stability before adoption.
-- [ ] **Directory walker.** Spec §67 lists `jwalk`, but crates.io currently ships
-      it described as "Use `dua-core` instead" and it has not moved since 0.9.0.
-      Decide between `walkdir`, a maintained parallel walker, or our own — the
-      deterministic-ordering requirement (spec §7) may force a custom one anyway.
+- [x] **Directory walker — DECIDED 2026-09-23: no third-party walker.** Add a
+      single-level `read_dir` primitive to `flux_fs::FileSystem`, returning one
+      level of entries WITH their file type, and implement the ordered
+      depth-first walk in `flux-core` over an explicit stack. Negotiated with
+      the agy peer; both positions converged, and the decisive argument was the
+      peer's. Reasoning, all of it measured rather than recalled:
+
+      - **§7.2's ordering needs no crate and no global sort.** The spec says "a
+        depth-first scanner that sorts each directory's entries by name alone
+        emits component-wise order without buffering". Verified against the
+        spec's own normative example: DFS with per-directory byte sorting gives
+        `a/x  a/y/z  a-b  a0`, the component-wise order, while flat `/`-joined
+        byte sorting gives `a-b  a/x  a/y/z  a0`, exactly the order §7.2 warns
+        is wrong. Per-directory sorting is sufficient.
+      - **`walkdir` is out because it cannot see our trait.** Measured in
+        walkdir 2.5.0 source: `pub struct WalkDir` carries no filesystem
+        generic, `new<P: AsRef<Path>>` is generic only over the path type, and
+        `src/lib.rs:114` and `:909` bind it to `std::fs::read_dir`. Using it in
+        the engine would bypass `FaultFs` and leave recursive copy untestable by
+        the fault-injection harness the rest of the suite depends on.
+      - **`jwalk` is out twice over.** Its own crates.io description reads "Use
+        `dua-core` instead" and it has not moved since 0.9.0, failing §67's
+        maintenance criterion. Worse, it is a PARALLEL walker: parallel
+        traversal yields entries in completion order, restoring §7 order then
+        needs a reorder buffer, and spec line 511 says "the scanner never
+        creates an unbounded global list of discovered" entries. It fights the
+        spec rather than merely failing to help.
+      - **Parallelism belongs on the copy, not the walk.** Traversal is
+        metadata-bound and must be ordered anyway. Sequential ordered discovery
+        feeding a parallel worker pool over a bounded queue is the shape spec
+        lines 508-511 describe.
+      - **FD exhaustion is a non-issue**, contrary to my initial worry: sorting a
+        directory forces collecting its entries into a `Vec`, so the directory
+        handle drops before recursing and only one is ever open.
+
+      Two risks this decision does NOT solve, and no crate would have:
+
+- [x] **Symlink-loop detection for the walker — RESOLVED by the design of
+      2026-09-23, and it was the wrong shape of worry.** The default walk never
+      follows a symlink (§25, §26), and descending only on `is_dir()` gives that
+      for free on both platforms, so no symlink loop is reachable at all. What IS
+      reachable without any symlink is a bind mount: MEASURED on WSL, after
+      `mount --bind a a/b` the path `a/b` is not a symlink (`-L` no), is a
+      directory (`-d` yes), and `stat` reports `dev=120 ino=13` for both `a` and
+      `a/b`. The design handles it with an ancestor set of object identities
+      rather than `dev`/`ino` tracking of everything visited, which would grow
+      with the tree and breach spec line 997.
+- [ ] **A transient failure and an unsupported filesystem both report `Unavailable`.**
+      `identity_of` on Windows returns `FileIdentity::Unavailable` when the open fails
+      - a sharing violation, a denial, a path that just vanished - and also when the
+      volume does not implement the `FileIdInfo` class at all. A caller cannot tell "this
+      filesystem never has identity" from "I could not read this one right now", so a
+      transient error silently downgrades cycle detection for that entry instead of being
+      reported. Bounded by the depth cap and the lexical containment test, so not unsafe,
+      but misleading: the operation would warn about filesystem capability when it
+      actually hit a locked file. Fixing it means deciding what the walker should DO with
+      the difference, so it belongs with the walker rather than here.
+- [ ] **Identity-based cycle detection is unavailable on weak-identity filesystems**
+      (§107 names FAT32, exFAT and some SMB and NFS configurations). Negotiated to
+      a bounded degradation rather than a refusal: the lexical containment test and
+      the depth cap both still run, so the residual harm is a cycle copied up to
+      256 times — bounded, warned about once per filesystem, and cleanable — instead
+      of an unbounded silent loop. `--safety=strict` refuses outright. What stays
+      unmet on weak identity is §149.6's "even if filesystem namespace relationships
+      change after startup", since only identity can catch containment established
+      through a mount or a rename. A real fix needs a trustworthy identity on those
+      filesystems, which is where this item lives.
+- [ ] **Walker TOCTOU.** If `read_dir` yields bare paths, the walk inherits the
+      same races `walkdir` has: an entry can change type between the listing and
+      the visit. Mitigated by returning the file type WITH the entry so no
+      re-stat is needed; a full fix wants `openat`-style directory-relative
+      operations, which `std` does not expose.
 - [ ] **Persistent state format** for the topology store and operation manifest
       (spec §17, §19). Must scale past RAM and survive a crash mid-write.
 - [ ] Repository housekeeping: enable GitHub private vulnerability reporting (see
@@ -34,6 +102,18 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
       sources, zero-byte files, Unicode, spaces, newlines (spec §68.2)
 
 ### Known limits of the first single-file copy (2026-09-22)
+
+- [ ] **`destination_is_write_protected` swallows every `symlink_metadata` error**
+
+  Both arms read `Err(_) => false`, and the comment justifies only the NotFound case — "Nothing
+  occupies the name, so there is nothing to protect", which is correct and is the dominant case. A
+  sharing violation or a denial also lands there, and the guard then reports "not protected" for a
+  destination it could not inspect. The operation still fails safely, because the rename itself fails;
+  what is lost is the precise refusal, so the user gets the rename's error instead of "the destination
+  is write-protected".
+
+  Found by the PR 1 capstone widening its lens beyond that PR's range. Not fixed there because the
+  function is PR #32's code and untouched by PR 1.
 
 - [ ] **`rename_no_replace` is a check-then-rename race**
 
@@ -128,6 +208,17 @@ Promoted from the local anomalies inbox (triage of 2026-09-14); each was re-meas
       release pull requests that fails when the changelog diff adds no entries, or a `release-plz` setting
       that declines to open one. A habit is not a control; the person who merges it will not be the person
       who learned the habit.
+
+Triage of 2026-09-23 adds one more, re-measured that day.
+
+- [ ] **`cargo-mutants` reports false `MISSED` for a package whose tests live in `tests/`.** On `flux-platform` it
+      called 12 of 26 mutants missed, including `destination_is_write_protected -> false`; applying that mutant by
+      hand fails two tests, `rename_replace_refuses_a_read_only_target` and `..._denied_by_acl`. The package has
+      **zero** `#[test]` functions in `src/` and 22 across `tests/std_fs.rs` and `tests/fs_semantics.rs`, and the
+      mutants harness is not running them. `flux-core`'s results are trustworthy for the opposite reason — its tests
+      are lib tests. Until this is pinned down, read a `flux-platform` mutants report as unverified: confirm each
+      claimed survivor by applying it by hand. Fix by giving the package a `.cargo/mutants.toml` with the right
+      test scope, or by proving which invocation the harness actually uses.
 
 ## Spec gaps from the filesystem probes
 
