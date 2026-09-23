@@ -38,49 +38,74 @@ struct Inner {
     /// more than once and needs the LATER one to fail.
     nth_faults: HashMap<String, (u32, Code, std::io::ErrorKind)>,
     call_counts: HashMap<String, u32>,
-    /// path -> the identity `metadata` reports. A path with no entry gets a distinct
-    /// `Strong` id derived from its name, so ordinary tests need no setup.
+    /// path -> the identity of the object currently at that path.
+    ///
+    /// MINTED at creation and thereafter only MOVED, never derived from the path. An
+    /// earlier draft derived it by hashing the path, which cannot be made correct:
+    /// identity must be invariant for an object AND distinct across objects, and a
+    /// path hash gives you one or the other. Carrying it on rename freed the old
+    /// hash, so a file recreated at the source path collided with the renamed one -
+    /// MEASURED, two distinct objects reported the same id.
     identities: HashMap<String, flux_fs::FileIdentity>,
+    /// Pre-incremented, so the first object is 1 and nothing ever gets 0 - §107
+    /// forbids treating a zero id as a valid identity.
+    next_object: u128,
 }
 
 /// Move a name's content AND its metadata. Moving only the bytes meant the times and
 /// permissions applied to the temporary vanished at publication, so no test could
 /// assert that the §44.1 ordering achieved anything.
-/// The identity a path gets when nothing was configured for it.
+/// Give the object now at `path` a fresh identity, unless that path already holds
+/// one - writing over an existing path is a truncate, not a new object.
 ///
-/// FNV-1a. The offset basis is non-zero so the empty path is not 0, and mixing each
-/// byte keeps ADJACENT paths apart. MEASURED: an earlier draft used `hash * 31` then
-/// `| 1` to avoid zero, which clears the low bit, so "/a" (1554) and "/b" (1555) both
-/// became 1555 and the fake's one promise - two paths are two objects - failed.
-fn default_identity(path: &str) -> flux_fs::FileIdentity {
-    let mut index: u128 = 0xcbf2_9ce4_8422_2325;
-    for b in path.as_bytes() {
-        index ^= u128::from(*b);
-        index = index.wrapping_mul(0x0000_0100_0000_01b3);
+/// EVERY creation path must call this: `write_file`, `create_new` and `add_special`,
+/// which all insert into `files`. `metadata` panics rather than inventing an identity
+/// for a path that skipped it, because the plausible alternative - reporting
+/// `Unavailable` - is a state the walker handles GRACEFULLY, so an unhooked path
+/// would silently degrade while its test stayed green.
+fn mint_identity(g: &mut Inner, path: &str) {
+    if g.identities.contains_key(path) {
+        return;
     }
-    // §107 forbids a zero id. Unreachable given a non-zero basis; here so it cannot
-    // become reachable.
-    if index == 0 {
-        index = 1;
-    }
-    flux_fs::FileIdentity::Strong(flux_fs::ObjectId { volume: 1, index })
+    g.next_object += 1;
+    let id = flux_fs::ObjectId { volume: 1, index: g.next_object };
+    g.identities.insert(path.to_string(), flux_fs::FileIdentity::Strong(id));
 }
 
 fn move_object(g: &mut Inner, from: &str, to: &str) {
     let bytes = g.files.remove(from).unwrap_or_default();
     g.files.insert(to.to_string(), bytes);
-    if let Some(v) = g.times.remove(from) {
-        g.times.insert(to.to_string(), v);
+    // REPLACE, never merge. A rename destroys the object at `to`, so where the source
+    // carries nothing the destination's old value is REMOVED rather than left standing.
+    // MEASURED before this: renaming onto a path left the destination's own permissions
+    // in place, so the two objects merged instead of one replacing the other.
+    match g.times.remove(from) {
+        Some(v) => {
+            g.times.insert(to.to_string(), v);
+        }
+        None => {
+            g.times.remove(to);
+        }
     }
-    if let Some(v) = g.perms.remove(from) {
-        g.perms.insert(to.to_string(), v);
+    match g.perms.remove(from) {
+        Some(v) => {
+            g.perms.insert(to.to_string(), v);
+        }
+        None => {
+            g.perms.remove(to);
+        }
     }
     // Identity follows the OBJECT, not the name: a real filesystem preserves the inode
     // across a rename, and §149.4's whole point is detecting when the object under a
-    // path CHANGED. Materialise an implicit identity before moving it, so the rename
-    // carries it whether or not a test configured one.
-    let id = g.identities.remove(from).unwrap_or_else(|| default_identity(from));
-    g.identities.insert(to.to_string(), id);
+    // path CHANGED.
+    match g.identities.remove(from) {
+        Some(v) => {
+            g.identities.insert(to.to_string(), v);
+        }
+        None => {
+            g.identities.remove(to);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -150,7 +175,9 @@ impl FaultFs {
 
     /// Seed a source file.
     pub fn write_file(&self, path: &str, bytes: &[u8]) {
-        self.inner.lock().unwrap().files.insert(path.to_string(), bytes.to_vec());
+        let mut g = self.inner.lock().unwrap();
+        g.files.insert(path.to_string(), bytes.to_vec());
+        mint_identity(&mut g, path);
     }
 
     pub fn exists(&self, path: &str) -> bool {
@@ -233,6 +260,7 @@ impl FaultFs {
         let mut g = self.inner.lock().unwrap();
         g.files.insert(path.to_string(), Vec::new());
         g.not_files.insert(path.to_string());
+        mint_identity(&mut g, path);
     }
 
     /// Give a file permissions, so a copy has something to carry across.
@@ -321,6 +349,7 @@ impl FileSystem for FaultFs {
             ));
         }
         g.files.insert(p.clone(), Vec::new());
+        mint_identity(&mut g, &p);
         // Take the injected fault from the guard already held. A helper that locks
         // `inner` again would DEADLOCK here -- `std::sync::Mutex` is not reentrant --
         // and every test that creates a temporary would hang forever.
@@ -366,7 +395,13 @@ impl FileSystem for FaultFs {
             is_file: !g.not_files.contains(&p),
             permissions: g.perms.get(&p).copied().flatten(),
             modified: g.times.get(&p).copied().flatten(),
-            identity: g.identities.get(&p).copied().unwrap_or_else(|| default_identity(&p)),
+            // Panic, not `Unavailable`: `Unavailable` is a state the walker handles
+            // gracefully, so an unhooked creation path would degrade silently and keep
+            // its test green. Every path that inserts into `files` calls
+            // `mint_identity`, which makes this unreachable - loudly, if it ever is not.
+            identity: *g.identities.get(&p).unwrap_or_else(|| {
+                panic!("no identity minted for {p}: a creation path skipped mint_identity")
+            }),
         })
     }
 
@@ -411,12 +446,19 @@ impl FileSystem for FaultFs {
         // NotFound when it is not there, because `std::fs::remove_file` does that and
         // `discard` branches on it. A fake that returned Ok here would make that
         // branch untestable and hide the difference.
-        if self.inner.lock().unwrap().files.remove(&p).is_none() {
+        let mut g = self.inner.lock().unwrap();
+        if g.files.remove(&p).is_none() {
             return Err(FsError::new(
                 Code::IoError,
                 std::io::Error::from(std::io::ErrorKind::NotFound),
             ));
         }
+        // The object is gone, so its state goes with it. Leaving these behind let a
+        // later file created at the SAME path inherit a dead object's identity and
+        // permissions - MEASURED, a recreated path reported the removed file's perms.
+        g.identities.remove(&p);
+        g.times.remove(&p);
+        g.perms.remove(&p);
         Ok(())
     }
 }
@@ -470,6 +512,56 @@ mod tests {
         assert_eq!(
             fs.metadata(std::path::Path::new("/a")).unwrap().identity,
             FileIdentity::Unavailable
+        );
+    }
+
+    #[test]
+    fn a_path_recreated_after_a_rename_is_a_different_object() {
+        // The defect the path-hash model could not avoid: carrying the identity to the
+        // new name FREED the old path's hash, so a file created at the old path minted
+        // the same id as the renamed one. MEASURED at the time: collide=true, two
+        // distinct objects reporting one identity.
+        let fs = FaultFs::new();
+        fs.write_file("/a", b"x");
+        fs.rename_replace(std::path::Path::new("/a"), std::path::Path::new("/b")).unwrap();
+        fs.write_file("/a", b"y");
+
+        let a = fs.metadata(std::path::Path::new("/a")).unwrap().identity;
+        let b = fs.metadata(std::path::Path::new("/b")).unwrap().identity;
+        assert_ne!(a, b, "a new file at a freed name is not the object that moved away");
+    }
+
+    #[test]
+    fn a_rename_replaces_the_destination_rather_than_merging_with_it() {
+        // A rename destroys the object at the destination. Metadata the source does not
+        // carry must not survive on it - MEASURED before the fix, the destination's own
+        // permissions were still there afterwards, so the two objects had merged.
+        let fs = FaultFs::new();
+        fs.write_file("/a", b"a");
+        fs.write_file("/b", b"b");
+        fs.set_file_perms("/b", Perms::UnixMode(0o600));
+
+        fs.rename_replace(std::path::Path::new("/a"), std::path::Path::new("/b")).unwrap();
+
+        assert_eq!(fs.permissions("/b"), None, "the destination's own permissions died with it");
+    }
+
+    #[test]
+    fn removing_a_path_does_not_leak_its_state_to_a_later_file() {
+        // `remove_file` used to drop only the CONTENT, so a later file at the same path
+        // inherited a dead object's permissions and identity.
+        let fs = FaultFs::new();
+        fs.write_file("/a", b"x");
+        fs.set_file_perms("/a", Perms::UnixMode(0o600));
+        let first = fs.metadata(std::path::Path::new("/a")).unwrap().identity;
+        fs.remove_file(std::path::Path::new("/a")).unwrap();
+
+        fs.write_file("/a", b"new");
+        assert_eq!(fs.permissions("/a"), None, "a dead object's permissions are not inherited");
+        assert_ne!(
+            fs.metadata(std::path::Path::new("/a")).unwrap().identity,
+            first,
+            "the same name twice is two objects, not one"
         );
     }
 
