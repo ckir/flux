@@ -80,6 +80,7 @@ fn mint_identity(g: &mut Inner, path: &str) {
     if g.identities.contains_key(path) {
         return;
     }
+
     g.next_object += 1;
     let id = flux_fs::ObjectId { volume: 1, index: g.next_object };
     g.identities.insert(path.to_string(), flux_fs::FileIdentity::Strong(id));
@@ -529,6 +530,25 @@ mod tests {
             fs.metadata(std::path::Path::new("/a")).unwrap().identity,
             FileIdentity::Unavailable
         );
+    }
+
+    #[test]
+    fn writing_over_an_existing_path_preserves_its_identity() {
+        // A truncating write is the SAME object with new content, so its identity must
+        // not move - that is what `mint_identity`'s early return is for, and nothing
+        // exercised it. MEASURED: deleting that early return left the whole suite green
+        // at 36 passed, so a write could have silently re-minted and no test would have
+        // noticed. Object continuity across a write is what a walk comparing a
+        // directory against its ancestors depends on.
+        let fs = FaultFs::new();
+        fs.write_file("/a", b"first");
+        let before = fs.metadata(std::path::Path::new("/a")).unwrap().identity;
+
+        fs.write_file("/a", b"second and longer");
+        let after = fs.metadata(std::path::Path::new("/a")).unwrap().identity;
+
+        assert_eq!(before, after, "a write replaces content, not the object");
+        assert_eq!(fs.read_file("/a").as_deref(), Some(&b"second and longer"[..]));
     }
 
     #[test]
