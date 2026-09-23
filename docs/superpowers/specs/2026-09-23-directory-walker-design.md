@@ -1,0 +1,484 @@
+# Directory walker and recursive copy — design
+
+**Date:** 2026-09-23
+**Status:** approved, not yet planned
+**Scope:** the ordered directory walk, the filesystem primitives it needs, portable object identity,
+and `copy_tree` driving the existing `copy_file`. Delivered as three pull requests; this document is
+the design for all three.
+
+## Why now
+
+`copy_file` landed in PR #32 and the walker decision closed in PR #35, so the Phase 2 blocker is the
+traversal itself. The `FileSystem` trait has **no traversal method at all** — that absence is why the
+walker blocks Phase 2 rather than Phase 3, and it is why the decision had to precede the code.
+
+The decision itself is settled and is not reopened here: no third-party walker crate, a single-level
+`read_dir` on the trait, and the ordered depth-first walk in `flux-core` over an explicit stack.
+`TODO.md` at `10bf2a0` carries the measured grounds.
+
+## What this design had to settle, and how
+
+Every item below was consulted with the agy peer under AGY-FIRST across three rounds, and every factual
+claim was verified by measurement before folding. The full record, including three claims of the peer's
+that measurement refuted, is at `.clavity/scratch/walker-design/converged-design.md`.
+
+Two things are worth stating plainly because they shaped the result:
+
+- **Three apparent design forks turned out to be settled by the spec**, not open. Symlink policy
+  (§25, §26), the ordering representation (§7.2, §241), and the API shape (§9) all have normative
+  answers. Reading the spec closed them faster than designing would have.
+- **One agreed answer was wrong, and only re-checking it caught that.** Both parties concluded that
+  object identity could be deferred to the hardlink phase, on the premise that hardlinks are its only
+  consumer. That premise is false — see "Object identity" below.
+
+## The trait surface after this work
+
+```rust
+/// What a directory listing reports per entry.
+///
+/// Deliberately NOT `Metadata`: the entry type is what the OS supplies during
+/// enumeration, and a `Metadata` per entry would re-stat every child, which is the
+/// cost this primitive exists to avoid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileType {
+    File,
+    Dir,
+    Symlink,
+    Other,
+}
+
+/// One entry of one directory. The NAME, not a path: the walk already holds the
+/// parent on its stack, and a `PathBuf` per entry would allocate a full path for
+/// every child of every directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    pub name: std::ffi::OsString,
+    pub file_type: FileType,
+}
+
+/// Portable filesystem object identity (§107, §109.1, §149.4).
+///
+/// `index` is `u128` because Windows needs it: §107's 64-bit file index is NOT
+/// unique on ReFS, so a strong identity requires `FILE_ID_INFO`'s 128-bit file id
+/// from `GetFileInformationByHandleEx`. Unix widens `st_ino` into the same field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ObjectId {
+    /// Unix `st_dev`; Windows `VolumeSerialNumber`.
+    pub volume: u64,
+    /// Unix `st_ino`; Windows the 128-bit `FileId`.
+    pub index: u128,
+}
+
+pub struct Metadata {
+    pub len: u64,
+    pub is_file: bool,
+    pub permissions: Option<Perms>,
+    pub modified: Option<SystemTime>,
+    /// `None` where the platform does not strongly support identity. §149.4 asks for
+    /// it "where strongly supported", so the type admits its absence rather than
+    /// inventing a value. See "When identity is unavailable" below.
+    pub object_id: Option<ObjectId>,
+}
+
+pub trait FileSystem: Send + Sync {
+    // ... the eight existing methods, unchanged ...
+
+    /// ONE level. Returns every entry with its file type, in whatever order the OS
+    /// gave them — ordering is the caller's job (§7.2), because only the caller knows
+    /// the comparison rule.
+    ///
+    /// Returns a `Vec`, not an iterator, and that is deliberate: §7.2 requires each
+    /// directory to be sorted, sorting requires the whole directory in hand, so a lazy
+    /// return shape would promise a laziness the caller cannot use. Materialising also
+    /// drops the directory handle before the walk recurses, so only one is ever open.
+    fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>>;
+
+    /// Creates one directory. Fails if the parent is missing; the walk creates
+    /// ancestors in order, so it never needs the recursive form.
+    fn create_dir(&self, path: &Path) -> Result<()>;
+}
+```
+
+`FileType` has **no `Unknown` variant.** Linux `readdir` can return `DT_UNKNOWN`, but Rust's std
+resolves it transparently — `library/std/src/sys/fs/unix.rs:1149` is
+`_ => self.metadata().map(|m| m.file_type())` — so `DirEntry::file_type` never surfaces "unknown" to a
+caller. The variant would be unconstructible.
+
+The cost this hides must be stated rather than asserted away: on a filesystem that supplies no
+`d_type`, that fallback is a real `lstat` per entry. This repository measurably uses such a mount —
+`/mnt/c` under WSL is v9fs. So `read_dir` is "one syscall per directory **plus** a stat per entry the OS
+could not type", not "no stats". On Windows there is no such cost: the reparse tag arrives in
+`wfd.dwReserved0` as part of the enumeration itself (`sys/fs/windows.rs:1143`).
+
+There is a second cost, and it is the honest limit of "the file type avoids a re-stat": the ancestor-set
+check below needs each directory's `ObjectId`, which `DirEntry` does not carry, so the walk calls
+`metadata` **once per directory** before descending. Files cost nothing extra, which is the case that
+dominates a real tree, and it remains true that no stat is spent merely to learn whether an entry is a
+file. But the claim is "no stat per FILE", not "no stats at all", and the difference is worth stating
+where a reader would otherwise be surprised by the syscall count.
+
+## The walk
+
+### Ordering
+
+Sort each directory's entries by `name.as_encoded_bytes()`, ascending. Nothing else.
+
+§7.2 is explicit that this suffices: *"A depth-first scanner that sorts each directory's entries by name
+alone emits component-wise order without buffering."* Verified against the spec's own normative example
+— depth-first plus a per-directory byte sort gives `a/x  a/y/z  a-b  a0`, the component-wise order,
+where a flat `/`-joined sort gives `a-b  a/x  a/y/z  a0`, the order §7.2 calls wrong.
+
+`as_encoded_bytes()` is exactly the §241 representation on both platforms, with no conversion and no
+allocation: `library/std/src/sys/os_str/mod.rs` selects `mod wtf8` for `target_os = "windows"` and
+`mod bytes` elsewhere, and `wtf8.rs:21-22` is `Slice { inner: Wtf8 }`.
+
+**`OsStrExt::encode_wide()` must never be used for ordering.** UTF-16 code-unit order and WTF-8 byte
+order disagree above the BMP, because surrogates (`0xD800`–`0xDBFF`) sort below the private-use area in
+UTF-16 while their UTF-8 encodings sort above it. Measured:
+
+| character | WTF-8 bytes | UTF-16BE code units |
+|---|---|---|
+| `U+E000` | `EE 80 80` | `E0 00` |
+| `U+10000` | `F0 90 80 80` | `D8 00 DC 00` |
+
+so WTF-8 puts `U+E000` first and UTF-16 puts `U+10000` first. A test pins this pair.
+
+No `FluxPathKey` (§103) is materialised. It is an ordering and identity key for persistent indexes and
+for multi-root operations (§18.3), and this work has a single root and no index. Its `0x00` separator
+and the `PATH_COMPONENT_INVALID` code it requires arrive with the phase that builds keys.
+
+### Symlinks
+
+Never followed. The walk descends only where `file_type == Dir`.
+
+§25: the default is `copy the symlink itself`, and *"Following symlinks is opt-in"*. §26 puts
+`--links=follow` in **Future**, requiring cycle detection, containment checks, mount awareness and
+identity checks before it can exist.
+
+This costs nothing on either platform. On Unix a symlink is not a directory. On Windows, junctions and
+directory symlinks carry the name-surrogate reparse bit, and `sys/fs/windows.rs:1200-1211` computes
+`is_symlink` from `reparse_tag & 0x20000000`, with `is_dir()` defined as `!self.is_symlink &&
+self.is_directory` — so an `is_dir()`-gated descent already skips them. Reparse points that are *not*
+name surrogates, such as deduplication and cloud placeholders, correctly remain ordinary files and
+directories.
+
+Symlinks are still **reported** as `Symlink` events. This work does not recreate them; `copy_tree`
+reports `SPECIAL_FILE_UNSUPPORTED` for each, which is what `copy_file` already does for a symlink
+source today.
+
+### The item type
+
+```rust
+pub enum WalkEvent {
+    /// Pre-order: the directory exists and is about to be descended into.
+    Dir { path: PathBuf, object_id: Option<ObjectId> },
+    File { path: PathBuf },
+    Symlink { path: PathBuf },
+    Other { path: PathBuf },
+    /// Post-order: every descendant of this directory has been yielded.
+    DirEnd { path: PathBuf },
+}
+
+pub struct WalkError {
+    pub path: PathBuf,
+    pub cause: FsError,
+}
+```
+
+`path` is **relative to the walk root**, so a consumer joins it onto the source root to read and onto
+the destination root to write. That is the §7/§103 framing and it keeps destination mapping trivial.
+
+`DirEnd` is not speculative generality. §30.2 requires that *"Directory metadata that is sensitive to
+child mutations MUST NOT be finalized before all required child creations, removals, renames, and
+hardlink creations are complete"* — a directory is therefore created pre-order but has its metadata
+finalized **post-order**, because writing children mutates the parent's mtime. A plain pre-order entry
+stream cannot express "leaving this directory", so a consumer would have to re-derive it by comparing
+path prefixes, which is fragile exactly where §7.2's component-wise ordering is subtle. The walker
+already knows when it pops its stack, so emitting the event costs nothing.
+
+**PR 3 emits `DirEnd` but does not consume it** — see "Directory metadata" below.
+
+### Iteration and errors
+
+```rust
+/// Borrows the filesystem for the life of the walk; holds the explicit stack, the
+/// ancestor set, and the root it makes paths relative to.
+pub struct Walk<'a, F: FileSystem> { /* private */ }
+
+/// `root` must name a directory. The walk yields no event for the root itself —
+/// its first event is the root's first child — because the root is not part of
+/// the tree being copied INTO the destination, it IS the destination mapping.
+pub fn walk<'a, F: FileSystem>(fs: &'a F, root: &Path) -> Result<Walk<'a, F>>;
+
+impl<'a, F: FileSystem> Iterator for Walk<'a, F> {
+    type Item = std::result::Result<WalkEvent, WalkError>;
+}
+```
+
+`walk` is fallible before it yields anything: it reads the root's metadata, and returns
+`Err(FsError)` if the root does not exist, or `Code::SpecialFileUnsupported` if the root exists but is
+not a directory. Those are failures of the whole operation, not per-entry errors, so they are reported
+through `Result` rather than as a first `Err` item.
+
+A pull iterator, because §9 requires that when downstream capacity is exhausted the
+*"scanner blocks/awaits"* rather than accumulating paths. A consumer that stops pulling **is** the
+backpressure, so the bounded queue Phase 3 adds sits between this iterator and the workers without the
+walker changing.
+
+**An `Err` item is not terminal.** The iterator yields the error, skips that subtree, and continues with
+the next sibling. This is the single easiest contract here to get wrong, because most fallible Rust
+iterators stop. It is required by spec item 83, quoted verbatim:
+
+> `DIRECTORY_CHANGED_DURING_SCAN` has one outcome: the directory's subtree is not transferred, the
+> error is reported, and the operation exits 1. There is no configured mutation policy or rescan
+> alternative.
+
+A directory that vanishes, changes identity, or cannot be read between listing and entry therefore
+produces one `Err`, no descent, and a continued walk. The operation's exit status is 1 even though the
+walk completed. A test asserts that a walk over a tree with one unreadable directory still yields every
+entry of its siblings.
+
+`Code` gains one variant, `DirectoryChangedDuringScan`, rendering as
+`"DIRECTORY_CHANGED_DURING_SCAN"` (§2 item 83, §149.4, taxonomy line 2928).
+
+An unreadable directory that is *not* an identity change — a permission denial, say — is reported the
+same way: the error carries its own classified code, the subtree is skipped, the walk continues. The
+spec mandates this shape only for identity changes; applying it to every per-directory failure is a
+design decision, taken because the alternative is aborting a whole tree copy over one denied
+subdirectory.
+
+## Object identity
+
+Both parties initially agreed to defer `dev`/`ino` to the hardlink phase. That was wrong, and the
+premise behind it — that hardlinks are the only consumer — is false. There are **three consumers inside
+this work**:
+
+1. **§149.4 binds the scanner directly.** *"The scanner must verify that the object being entered
+   remains consistent with the planned directory identity."* A walker that never obtains identity has no
+   baseline to compare against and cannot raise `DIRECTORY_CHANGED_DURING_SCAN` at all.
+2. **§129 and §149.6 need it for safety.** `flux copy /data /data/backup` must be `SAFETY_REJECTED`
+   *before transfer begins*, Flux *"must not rely on `exclude destination` as the primary safety
+   mechanism"*, and must never scan the destination as part of the source *"even if filesystem namespace
+   relationships change after startup"*. That final clause cannot be satisfied by a lexical prefix test.
+   `copy_file`'s existing self-copy check is lexical only (`copy.rs:139`) and `TODO.md` already records
+   that as a gap against foundational invariant 22.
+3. **Directory cycles are reachable without symlinks.** Measured on WSL Ubuntu-26.04:
+
+   ```
+   mkdir -p a/b && mount --bind a a/b
+   control, before the mount:  a/b/b exists? NO
+   after:                      a/b/b exists? YES
+   is symlink (-L): NO         is dir (-d): YES
+   stat a   : dev=120 ino=13
+   stat a/b : dev=120 ino=13     identical=YES
+   ```
+
+   A bind mount is neither a symlink nor a reparse point, so an `is_dir()`-gated walk descends into it.
+   The self-reference measured is **finite** — two levels, because the mount attaches to the path dentry
+   rather than the inode, so `a/b/b` resolves to the underlying empty mount point — so the reachable harm
+   is **duplication**, the subtree being copied twice, not a hang. Identical `dev`+`ino` means identity
+   detects it either way.
+
+### How the checks are structured
+
+The walk maintains an **ancestor set** of the `ObjectId`s of directories on the current path — not a
+global visited set. This matters: a global set would grow with the total number of directories, which
+spec line 997 forbids (*"The scanner must never construct an in-memory list proportional to the total
+number of files"*). An ancestor set is bounded by depth, and it is sufficient, because a cycle by
+definition re-enters an ancestor.
+
+**The walk root is in the ancestor set from the start**, even though no event is emitted for it. This is
+load-bearing rather than tidy: the measured bind-mount case is `mount --bind a a/b`, where the
+re-entered directory *is the root itself*. A walk that only added directories it emitted events for
+would descend into `a/b`, compare it against an empty set, and copy the whole tree twice — the exact
+defect the check exists to prevent. Obtaining the root's `ObjectId` is part of `walk`'s fallible
+initialisation, alongside its "is this a directory" check.
+
+Before descending into a directory `D`:
+
+- if `D.object_id` is already in the ancestor set → a cycle. Report, skip the subtree, continue.
+- if `D.object_id` equals the **destination anchor's** `ObjectId` → `SAFETY_REJECTED`, abort the whole
+  operation. This is the dynamic half of §149.6.
+- otherwise push it and descend, popping at `DirEnd`.
+
+The **destination anchor** resolves the case §129 has to handle before anything is created. A tree copy
+is usually given a destination that does not exist yet, so it has no identity to compare against:
+
+- if `dst_root` **exists**, the anchor is `dst_root` itself;
+- if it **does not**, the anchor is its nearest existing ancestor — in practice its parent, which must
+  exist for `create_dir` to succeed.
+
+That is sufficient, because a destination nested inside the source implies its nearest existing ancestor
+is also inside the source, or is the source root. Anchoring on the parent is therefore the check that
+can run *"before transfer begins"* as §129 demands, rather than after the destination has been created.
+A pre-flight comparison of `src_root` against the anchor runs before the walk starts; the per-directory
+comparison above is what catches a namespace change *after* startup.
+
+### When identity is unavailable
+
+`object_id` is `Option` because §149.4 asks for identity *"where strongly supported"*. On both target
+platforms it is supported — Unix always, Windows via `FILE_ID_INFO` — so `None` is a fallback, not the
+common case.
+
+Where it is `None`, the cycle check and the §149.6 dynamic check cannot be performed for that entry.
+The walk proceeds and the operation reports that the guarantee was unavailable for that path, rather
+than silently behaving as though it had checked. It is recorded as a known limitation, not papered
+over.
+
+## Composition with `copy_file`
+
+`copy_tree` lives in `flux-core` beside `copy_file` and drives it. `copy_file` is **not modified** — it
+passed a capstone in PR #32 and its contract is right as it stands.
+
+```rust
+/// What a tree copy did, and everything that went wrong while doing it.
+///
+/// A tree copy does not stop at the first failure, so unlike `copy_file` it reports
+/// a SUMMARY rather than returning at the first error. `failures` being non-empty is
+/// what makes the CLI exit 1.
+#[derive(Debug)]
+pub struct TreeOutcome {
+    pub files_copied: u64,
+    pub bytes_copied: u64,
+    pub directories_created: u64,
+    pub failures: Vec<TreeFailure>,
+}
+
+#[derive(Debug)]
+pub struct TreeFailure {
+    /// Relative to the source root, as the walk reports it.
+    pub path: std::path::PathBuf,
+    pub cause: TreeFailureCause,
+}
+
+#[derive(Debug)]
+pub enum TreeFailureCause {
+    /// The walk itself could not read or enter something.
+    Walk(FsError),
+    /// A directory could not be created at the destination.
+    CreateDir(FsError),
+    /// One file's copy failed. Carries `CopyError` intact, so a leftover staging
+    /// temporary is still reported per file.
+    Copy(CopyError),
+    /// A symlink or other non-regular entry, which this cut does not recreate.
+    Unsupported,
+}
+
+pub fn copy_tree<F: FileSystem>(
+    fs: &F,
+    src_root: &Path,
+    dst_root: &Path,
+    opts: &CopyOptions,
+) -> std::result::Result<TreeOutcome, CopyError>;
+```
+
+The outer `Err` is reserved for failures of the operation as a whole — the source root missing or not a
+directory, and the §129 safety rejection — because those mean no transfer happened at all. Everything
+else lands in `failures` and the walk continues.
+
+`opts.operation_id` is shared across every file, so each file's staging temporary is named from the same
+id. That is what makes §18.1's leftover sweep work per file without the tree needing its own scheme.
+
+```
+create dst_root if absent            // the walk emits no event for the root
+for event in walk(fs, src_root) {
+    Dir      -> fs.create_dir(dst_root.join(rel))        // pre-order
+    File     -> copy_file(fs, src_root.join(rel), dst_root.join(rel), opts)
+    Symlink  -> report SPECIAL_FILE_UNSUPPORTED
+    Other    -> report SPECIAL_FILE_UNSUPPORTED
+    DirEnd   -> nothing in this cut
+    Err(e)   -> report, continue
+}
+```
+
+The destination root is created by `copy_tree`, not by the walk, precisely because the walk emits no
+event for its own root. Missing that would leave `flux copy /data /backup` writing every child into a
+`/backup` that was never created. It is created **after** the §129 pre-flight check and before the walk
+begins, so nothing is written to a destination that the safety check would have rejected.
+
+A directory that already exists at the destination is not an error; `create_dir`'s `AlreadyExists` is
+treated as success, because a tree copy onto an existing tree is ordinary. Any other `create_dir`
+failure skips that subtree and is reported.
+
+`copy_tree` returns a summary — files copied, bytes copied, and every per-entry failure — rather than
+stopping at the first failure. The CLI exits 1 if any failure was recorded, matching item 83 and the
+existing `metadata_failures` behaviour.
+
+### Directory metadata
+
+**Not preserved in this cut.** Directories are created and keep their own fresh timestamps.
+
+§30.2 constrains only *when* directory metadata may be finalized, so not applying it is vacuous rather
+than violated. Applying it would need a path- or directory-handle-based `set_times`, and today
+`set_times` and `set_permissions` take `&Self::Writer` — a file handle — by a deliberate design in PR
+#32 that makes writing to a source a compile error. Widening that surface is a separate decision from
+the walk, and it is the reason `DirEnd` is emitted now: when directory metadata arrives, the walker does
+not change.
+
+## The test fake
+
+`FaultFs` cannot express this feature's tests as it stands. `fault_fs.rs:16` is
+`files: HashMap<String, Vec<u8>>`:
+
+- **`String` keys cannot hold a non-UTF-8 name**, which is precisely the §241 ordering case the whole
+  ordering contract is about.
+- **There is no directory concept at all.** Line 28's `not_files` set lumps every non-file together and
+  line 331 reads `is_file: !g.not_files.contains(&p)`, so an empty directory is indistinguishable from a
+  device node — and an empty directory is exactly what a tree copy must handle.
+
+So `FaultFs` gains:
+
+- keys widened from `String` to `PathBuf` across its inner maps,
+- an explicit `directories: HashSet<PathBuf>` recording which paths are directories,
+- `read_dir` yielding the immediate children found in `files` and `directories`, empty when a directory
+  has none,
+- `object_id` support, so cycle detection and the §129 check are testable without a real bind mount,
+- fault injection for `read_dir` and `create_dir`, reusing the existing `fail` / `fail_kind` /
+  `fail_nth` machinery.
+
+The existing `fail_nth` exists because a one-shot fault aimed at a method the algorithm calls more than
+once is eaten by the first call — that made a test pass vacuously once, and `read_dir` is called once
+per directory, so the same trap is live here.
+
+Ordering over non-UTF-8 names is also covered by a real-filesystem integration test on Unix, because a
+fake that agrees with the implementation about encoding proves nothing about the OS.
+
+## What stays unresolved
+
+- **A single enormous directory.** §7.2 requires each directory to be sorted, which requires holding it
+  in memory, while §9 and §10.1 require bounded resident RAM. The spec bounds the scanner against the
+  *total* file count, not against one directory, so a directory with tens of millions of entries is
+  within the letter of the invariants and still a real memory cost. No resolution is proposed here; it
+  is recorded so the phase that adds spill-to-disk knows where to look.
+- **Whether `--rbind` or shared mount propagation can make a bind-mount cycle unbounded.** Measured only
+  for the plain `--bind` case, which is finite. The peer was asked and said plainly it was not certain.
+  The design does not depend on the answer, because the ancestor-set check catches duplication and a
+  hang alike.
+- **`PATH_COMPONENT_INVALID`** (§103) arrives with the phase that constructs `FluxPathKey`s.
+
+## Delivery
+
+Three pull requests, in order. Each plan is written only once its predecessor has merged, because a plan
+citing line numbers is a set of claims about code that must already exist.
+
+1. **Object identity.** `ObjectId`, `Metadata.object_id`, and implementations in `StdFileSystem`,
+   `FaultFs` and the `NullFs` test stub at `fs.rs:104`. No walker code. This is first because it carries
+   the only genuine platform risk in the design — Windows `FILE_ID_INFO`, on a repository that lives on
+   a ReFS Dev Drive where §107's 64-bit index is not unique — and both §149.4 and §129 depend on it.
+
+   Adding a field to `Metadata` is a **breaking change to a public struct**: every construction site
+   must name the new field. All three in-tree implementors are updated in this PR, and
+   `crates/flux-core/src/copy.rs` constructs no `Metadata`, so `copy_file` is untouched. The crate is
+   pre-1.0 and unpublished, so no external consumer exists.
+2. **The walk.** `FileType`, `DirEntry`, `read_dir`, `create_dir`, `Code::DirectoryChangedDuringScan`,
+   the `FaultFs` widening, and the ordered walk with its event type, ancestor-set cycle detection and
+   non-terminal errors.
+3. **`copy_tree`.** The driver, the §129 pre-flight and dynamic safety checks, and the CLI dispatching
+   a directory source to it.
+
+## Out of scope
+
+Following symlinks (§26, Future), recreating symlinks at the destination, hardlink topology (§12, §13),
+directory metadata preservation, multiple source roots (§18.3), `FluxPathKey` materialisation (§103),
+parallel workers and the bounded transfer queue (Phase 3), resume, and the `.flux` control directory
+(§18.2).
