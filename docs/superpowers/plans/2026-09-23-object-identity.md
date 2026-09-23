@@ -763,6 +763,18 @@ two: on Unix `is_file` and `dev`/`ino` come from a SINGLE `stat` today, and §14
 about detecting that an object changed underneath you. Two calls reintroduce exactly that window. So
 the API stays as it is, and the cost is an implementation detail of the Windows adapter.
 
+**That atomicity argument holds on Unix ONLY, and the capstone caught me claiming it generally.** The
+Windows adapter calls `symlink_metadata(path)` and then opens the path AGAIN inside `identity_of` —
+two separate path-based operations. So on Windows the race is already present: a directory replaced by
+a link between the two calls yields `is_file: false` from the directory paired with the link's
+identity, and a walk would descend on the first fact while checking its ancestor set against the
+second.
+
+The decision stands, because splitting the API would keep that race and add one on Unix. What changes
+is PRIORITY: merging the two Windows opens into one handle is a CORRECTNESS fix, not the optimisation
+this section originally called it, and it must land in PR 2 before any walk consumes identity. Nothing
+in PR 1 consumes it, so nothing is exposed today.
+
 Deferred to PR 2 because merging the opens means reimplementing the Windows metadata path over raw
 FFI — more `unsafe` for an unmeasured gain, which is the wrong trade in the PR that establishes
 correctness. **The measurement that decides it:** time `copy_file` over a few thousand small files on

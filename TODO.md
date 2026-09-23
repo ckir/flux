@@ -55,6 +55,16 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
       `a/b`. The design handles it with an ancestor set of object identities
       rather than `dev`/`ino` tracking of everything visited, which would grow
       with the tree and breach spec line 997.
+- [ ] **A transient failure and an unsupported filesystem both report `Unavailable`.**
+      `identity_of` on Windows returns `FileIdentity::Unavailable` when the open fails
+      - a sharing violation, a denial, a path that just vanished - and also when the
+      volume does not implement the `FileIdInfo` class at all. A caller cannot tell "this
+      filesystem never has identity" from "I could not read this one right now", so a
+      transient error silently downgrades cycle detection for that entry instead of being
+      reported. Bounded by the depth cap and the lexical containment test, so not unsafe,
+      but misleading: the operation would warn about filesystem capability when it
+      actually hit a locked file. Fixing it means deciding what the walker should DO with
+      the difference, so it belongs with the walker rather than here.
 - [ ] **Identity-based cycle detection is unavailable on weak-identity filesystems**
       (§107 names FAT32, exFAT and some SMB and NFS configurations). Negotiated to
       a bounded degradation rather than a refusal: the lexical containment test and
