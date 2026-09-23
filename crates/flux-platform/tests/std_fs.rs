@@ -1,4 +1,4 @@
-use flux_fs::FileSystem;
+use flux_fs::{FileIdentity, FileSystem};
 use flux_platform::StdFileSystem;
 use std::io::Write;
 use tempfile::TempDir;
@@ -260,4 +260,98 @@ fn rename_replace_refuses_a_target_denied_by_acl() {
 
     assert!(refused, "a destination we may not write must be refused");
     assert_eq!(content, b"protected", "the protected contents must survive");
+}
+
+#[test]
+fn two_hardlinks_to_one_file_share_an_identity() {
+    // The property that makes identity worth having: the SAME object reached by two
+    // different paths reports the SAME id, which no path comparison can tell you.
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    std::fs::write(&a, b"x").unwrap();
+    std::fs::hard_link(&a, &b).unwrap();
+
+    let fs = StdFileSystem;
+    let ia = fs.metadata(&a).unwrap().identity;
+    let ib = fs.metadata(&b).unwrap().identity;
+
+    assert!(matches!(ia, FileIdentity::Strong(_)), "local fs must be strong, got {ia:?}");
+    assert_eq!(ia, ib, "two links to one object are one object");
+}
+
+#[test]
+fn two_distinct_files_have_distinct_identities() {
+    // The control. Without it, an implementation returning one constant id for
+    // everything would pass the test above.
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    std::fs::write(&a, b"x").unwrap();
+    std::fs::write(&b, b"x").unwrap();
+
+    let fs = StdFileSystem;
+    assert_ne!(fs.metadata(&a).unwrap().identity, fs.metadata(&b).unwrap().identity);
+}
+
+#[test]
+fn a_directory_has_an_identity() {
+    // On Windows this is what FILE_FLAG_BACKUP_SEMANTICS buys: without it the open
+    // fails on a directory and identity degrades to Unavailable for exactly the
+    // entries the walk needs it for.
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+
+    let id = StdFileSystem.metadata(&sub).unwrap().identity;
+    assert!(matches!(id, FileIdentity::Strong(_)), "directories need identity too, got {id:?}");
+}
+
+#[test]
+fn one_directory_reached_two_ways_is_one_object() {
+    // `.` inside a directory is that same directory. If identity did not survive the
+    // spelling of the path, a later walk's ancestor check would never fire.
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let same = sub.join(".");
+
+    let fs = StdFileSystem;
+    let a = fs.metadata(&sub).unwrap().identity;
+    let b = fs.metadata(&same).unwrap().identity;
+
+    assert!(matches!(a, FileIdentity::Strong(_)), "got {a:?}");
+    assert_eq!(a, b, "one directory, two spellings, one identity");
+}
+
+#[test]
+fn a_symlink_reports_its_own_identity_not_its_targets() {
+    // The mutation this catches: dropping FILE_FLAG_OPEN_REPARSE_POINT on Windows, or
+    // using `metadata` instead of `symlink_metadata` on Unix. Either makes a link
+    // report its TARGET's identity, and a later walk would compare a link against the
+    // target's id - taking an ordinary directory for a cycle, or missing a real one.
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    let link = dir.path().join("link");
+
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(&target, &link).is_ok();
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_dir(&target, &link).is_ok();
+
+    if !made {
+        // Windows needs Developer Mode or SeCreateSymbolicLinkPrivilege. Say so loudly:
+        // a silent skip is how a test stops protecting the platform it was written for.
+        eprintln!("SKIPPED a_symlink_reports_its_own_identity: could not create a symlink here");
+        return;
+    }
+
+    let fs = StdFileSystem;
+    let target_id = fs.metadata(&target).unwrap().identity;
+    let link_id = fs.metadata(&link).unwrap().identity;
+
+    assert!(matches!(target_id, FileIdentity::Strong(_)), "target: {target_id:?}");
+    assert!(matches!(link_id, FileIdentity::Strong(_)), "link: {link_id:?}");
+    assert_ne!(target_id, link_id, "a symlink is its own object, not its target");
 }

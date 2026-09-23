@@ -17,6 +17,12 @@ flux-fs = { path = "../flux-fs" }
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
 
+# `FILE_ID_INFO` for object identity in `std_fs.rs`. The 64-bit file index std exposes
+# is not unique on ReFS (§107, §109.1), so identity needs the 128-bit id, which is only
+# reachable through a handle.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
 # The filesystem probes of the lock-protocol model (tests/fs_semantics.rs,
 # lock-model design Section 10).
 [dev-dependencies]
