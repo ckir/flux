@@ -192,7 +192,9 @@ there are exactly three construction sites was verified with
 
 - [ ] **Step 3: Fix all three with the honest placeholder**
 
-In `crates/flux-fs/src/fs.rs:119`, the `NullFs` stub:
+In `crates/flux-fs/src/fs.rs:119`, the `NullFs` stub. Note that in the file this initializer is a
+SINGLE line — `Ok(Metadata { len: 0, is_file: true, permissions: None, modified: None })` — so this is
+a rewrite of that one line into the form below, not a patch of a multi-line block:
 
 ```rust
         fn metadata(&self, _: &Path) -> crate::Result<Metadata> {
@@ -234,9 +236,18 @@ git commit -m "feat(flux-fs): Metadata carries a file identity"
 - Modify: `crates/flux-platform/src/std_fs.rs`
 - Test: `crates/flux-platform/tests/std_fs.rs`
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Add the import, then write the failing test**
 
-Append to `crates/flux-platform/tests/std_fs.rs`:
+`crates/flux-platform/tests/std_fs.rs` currently imports only `flux_fs::FileSystem`,
+`flux_platform::StdFileSystem`, `std::io::Write` and `tempfile::TempDir` (lines 1-4). Without this the
+tests below fail to COMPILE rather than failing their assertion, which is a different and much less
+useful signal. Change line 1 to:
+
+```rust
+use flux_fs::{FileIdentity, FileSystem};
+```
+
+Then append to the same file:
 
 ```rust
 #[cfg(unix)]
@@ -491,11 +502,19 @@ git commit -m "feat(flux-platform): Windows object identity from FILE_ID_INFO"
 **Files:**
 - Modify: `crates/flux-core/src/fault_fs.rs`
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Create the test module, then write the failing test**
 
-Append inside `mod tests` in `crates/flux-core/src/fault_fs.rs`:
+`crates/flux-core/src/fault_fs.rs` has **no `#[cfg(test)]` module at all** — the fake is currently
+exercised only through `copy.rs`'s tests. Append one to the end of the file. `Path` is already imported
+at line 10, but a test module needs its own `use`:
 
 ```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flux_fs::{FileIdentity, FileSystem, ObjectId};
+    use std::path::Path;
+
     #[test]
     fn identities_default_to_distinct_and_can_be_forced_equal() {
         let fs = FaultFs::new();
@@ -519,10 +538,14 @@ Append inside `mod tests` in `crates/flux-core/src/fault_fs.rs`:
         );
 
         // And the degraded path is reachable, which is what the walker's fallback needs.
-        fs.set_identity("/a", flux_fs::FileIdentity::Unavailable);
-        assert_eq!(fs.metadata(Path::new("/a")).unwrap().identity, flux_fs::FileIdentity::Unavailable);
+        fs.set_identity("/a", FileIdentity::Unavailable);
+        assert_eq!(fs.metadata(Path::new("/a")).unwrap().identity, FileIdentity::Unavailable);
     }
+}
 ```
+
+Inside this module the `flux_fs::` prefixes in the test body are unnecessary — `FileIdentity` and
+`ObjectId` are imported above, so write them bare as shown. The trailing `}` closes `mod tests`.
 
 - [ ] **Step 2: Run it and watch it fail**
 
@@ -621,38 +644,93 @@ Run: `cargo test -p flux-platform --test std_fs one_directory_reached_two_ways`
 Expected: PASS — both platforms already satisfy this; the test pins it so a later change to
 `identity_of` cannot break the walker silently.
 
-If it FAILS on Windows, STOP and report: it would mean `OPEN_REPARSE_POINT` or path canonicalisation
-is interfering, and the walker design depends on this property.
+**What this test does NOT pin.** An earlier draft claimed a failure here would implicate
+`OPEN_REPARSE_POINT`. That was wrong: `.` is not a reparse point, so removing that flag would leave
+this test passing. It pins one property only — that identity survives the spelling of the path — and
+the flag needs its own test, below.
 
-- [ ] **Step 3: Full gate**
+- [ ] **Step 3: Pin `OPEN_REPARSE_POINT` with an actual link**
+
+```rust
+#[test]
+fn a_symlink_reports_its_own_identity_not_its_targets() {
+    // The mutation this catches: dropping FILE_FLAG_OPEN_REPARSE_POINT on Windows, or
+    // using `metadata` instead of `symlink_metadata` on Unix. Either makes a link
+    // report its TARGET's identity, and the walk would then compare a link against the
+    // target's id - taking an ordinary directory for a cycle, or missing a real one.
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    let link = dir.path().join("link");
+
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(&target, &link).is_ok();
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_dir(&target, &link).is_ok();
+
+    if !made {
+        // Windows needs Developer Mode or SeCreateSymbolicLinkPrivilege. Say so loudly:
+        // a silent skip is how a test stops protecting the platform it was written for.
+        eprintln!("SKIPPED a_symlink_reports_its_own_identity: could not create a symlink here");
+        return;
+    }
+
+    let fs = StdFileSystem;
+    let target_id = fs.metadata(&target).unwrap().identity;
+    let link_id = fs.metadata(&link).unwrap().identity;
+
+    assert!(matches!(target_id, FileIdentity::Strong(_)), "target: {target_id:?}");
+    assert!(matches!(link_id, FileIdentity::Strong(_)), "link: {link_id:?}");
+    assert_ne!(target_id, link_id, "a symlink is its own object, not its target");
+}
+```
+
+Run: `cargo test -p flux-platform --test std_fs a_symlink_reports_its_own`
+Expected: PASS, or the explicit `SKIPPED` line on a Windows machine without symlink privilege. If it
+prints SKIPPED, say so in the task report rather than recording a pass — on Windows this is the ONLY
+test covering that flag.
+
+- [ ] **Step 4: Full gate**
 
 Run: `just check`
 Expected: fmt, clippy, typos and the whole suite green. Final counts: `flux-fs` 10, `flux-core` 31,
-`flux-platform` `tests/std_fs.rs` 11 on Windows (7 + 3 + 1) or 10 on Unix (7 + 2 + 1),
+`flux-platform` `tests/std_fs.rs` 12 on Windows (7 + 3 + 2) or 11 on Unix (7 + 2 + 2),
 `tests/fs_semantics.rs` 9, everything else at baseline.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add crates/flux-platform/tests/std_fs.rs
-git commit -m "test(flux-platform): one directory reached two ways is one object"
+git commit -m "test(flux-platform): identity survives the path spelling, and a link is its own object"
 ```
 
 ---
 
 ## Recorded for PR 2, not resolved here
 
-**Windows pays a syscall per `metadata` call that Unix does not.** Unix identity falls out of the
-`symlink_metadata` already being made; Windows needs an open, a query and a close. `copy_file` calls
-`metadata` twice per file (`copy.rs:156` and `:216`), so a tree copy of N files gains 2N handle opens
-on Windows for a value only the walk uses.
+**Windows opens a handle twice per `metadata` call where once would do.** Unix identity falls out of
+the `symlink_metadata` already being made, at no extra cost. Windows needs a handle, and `copy_file`
+calls `metadata` twice per file (`copy.rs:156` and `:216`), so a tree copy of N files gains 2N opens
+for a value only the walk uses.
 
-This is recorded rather than fixed because the shape of the fix — a separate `identity()` trait method,
-or a lazy field — is a change to the trait surface that belongs with the walker that consumes it, and
-because the cost has not been measured. **The measurement to run before PR 2 decides:** time
-`copy_file` over a few thousand small files on Windows with `identity_of` returning early versus
-returning the real value, at the top level with no other tool calls in flight, two runs, quoting the
-range.
+**The fix is to MERGE the two opens, not to split the API.** MEASURED in std's own source: on Windows
+`symlink_metadata` is `lstat` → `metadata(path, ReparsePoint::Open)`
+(`library/std/src/sys/fs/windows.rs:1484-1485`), which already opens a handle with `access_mode(0)`,
+`FILE_FLAG_BACKUP_SEMANTICS` and `FILE_FLAG_OPEN_REPARSE_POINT` (`:1501-1504`) — the very flags
+`identity_of` uses. So the adapter opens the same path twice with identical flags, and the real fix is
+one open answering both questions via two `GetFileInformationByHandleEx` classes.
+
+That was worth establishing, because the obvious alternative is worse. Moving identity out to its own
+trait method would spare `copy_file` the cost, but it would also split one atomic observation into
+two: on Unix `is_file` and `dev`/`ino` come from a SINGLE `stat` today, and §149.4 is specifically
+about detecting that an object changed underneath you. Two calls reintroduce exactly that window. So
+the API stays as it is, and the cost is an implementation detail of the Windows adapter.
+
+Deferred to PR 2 because merging the opens means reimplementing the Windows metadata path over raw
+FFI — more `unsafe` for an unmeasured gain, which is the wrong trade in the PR that establishes
+correctness. **The measurement that decides it:** time `copy_file` over a few thousand small files on
+Windows with `identity_of` returning `Unavailable` early versus returning the real value — top level,
+no other tool calls in flight, two runs, quote the range not a point.
 
 ## Out of scope
 
