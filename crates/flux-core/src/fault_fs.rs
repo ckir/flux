@@ -46,6 +46,26 @@ struct Inner {
 /// Move a name's content AND its metadata. Moving only the bytes meant the times and
 /// permissions applied to the temporary vanished at publication, so no test could
 /// assert that the §44.1 ordering achieved anything.
+/// The identity a path gets when nothing was configured for it.
+///
+/// FNV-1a. The offset basis is non-zero so the empty path is not 0, and mixing each
+/// byte keeps ADJACENT paths apart. MEASURED: an earlier draft used `hash * 31` then
+/// `| 1` to avoid zero, which clears the low bit, so "/a" (1554) and "/b" (1555) both
+/// became 1555 and the fake's one promise - two paths are two objects - failed.
+fn default_identity(path: &str) -> flux_fs::FileIdentity {
+    let mut index: u128 = 0xcbf2_9ce4_8422_2325;
+    for b in path.as_bytes() {
+        index ^= u128::from(*b);
+        index = index.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // §107 forbids a zero id. Unreachable given a non-zero basis; here so it cannot
+    // become reachable.
+    if index == 0 {
+        index = 1;
+    }
+    flux_fs::FileIdentity::Strong(flux_fs::ObjectId { volume: 1, index })
+}
+
 fn move_object(g: &mut Inner, from: &str, to: &str) {
     let bytes = g.files.remove(from).unwrap_or_default();
     g.files.insert(to.to_string(), bytes);
@@ -55,6 +75,12 @@ fn move_object(g: &mut Inner, from: &str, to: &str) {
     if let Some(v) = g.perms.remove(from) {
         g.perms.insert(to.to_string(), v);
     }
+    // Identity follows the OBJECT, not the name: a real filesystem preserves the inode
+    // across a rename, and §149.4's whole point is detecting when the object under a
+    // path CHANGED. Materialise an implicit identity before moving it, so the rename
+    // carries it whether or not a test configured one.
+    let id = g.identities.remove(from).unwrap_or_else(|| default_identity(from));
+    g.identities.insert(to.to_string(), id);
 }
 
 #[derive(Default)]
@@ -340,25 +366,7 @@ impl FileSystem for FaultFs {
             is_file: !g.not_files.contains(&p),
             permissions: g.perms.get(&p).copied().flatten(),
             modified: g.times.get(&p).copied().flatten(),
-            identity: g.identities.get(&p).copied().unwrap_or_else(|| {
-                // FNV-1a. The offset basis is non-zero so the empty path is not 0, and
-                // mixing each byte keeps ADJACENT paths apart.
-                //
-                // MEASURED: an earlier draft used `hash * 31` then `| 1` to avoid zero.
-                // That clears the low bit, so "/a" (1554) and "/b" (1555) both became
-                // 1555 and the fake's one promise -- two paths are two objects -- failed.
-                let mut index: u128 = 0xcbf2_9ce4_8422_2325;
-                for b in p.as_bytes() {
-                    index ^= u128::from(*b);
-                    index = index.wrapping_mul(0x0000_0100_0000_01b3);
-                }
-                // §107 forbids a zero id. Unreachable given a non-zero basis; here so it
-                // cannot become reachable.
-                if index == 0 {
-                    index = 1;
-                }
-                flux_fs::FileIdentity::Strong(flux_fs::ObjectId { volume: 1, index })
-            }),
+            identity: g.identities.get(&p).copied().unwrap_or_else(|| default_identity(&p)),
         })
     }
 
@@ -463,5 +471,21 @@ mod tests {
             fs.metadata(std::path::Path::new("/a")).unwrap().identity,
             FileIdentity::Unavailable
         );
+    }
+
+    #[test]
+    fn an_identity_follows_the_object_through_a_rename() {
+        // A real filesystem preserves the inode across a rename; the name moves, the
+        // object does not change. The fake derived identity from the PATH, so a rename
+        // silently minted a new object - which would make §149.4's "did the object under
+        // this path change?" unanswerable through this fake.
+        let fs = FaultFs::new();
+        fs.write_file("/a", b"x");
+        let before = fs.metadata(std::path::Path::new("/a")).unwrap().identity;
+
+        fs.rename_replace(std::path::Path::new("/a"), std::path::Path::new("/b")).unwrap();
+        let after = fs.metadata(std::path::Path::new("/b")).unwrap().identity;
+
+        assert_eq!(before, after, "a rename moves the name, not the object");
     }
 }

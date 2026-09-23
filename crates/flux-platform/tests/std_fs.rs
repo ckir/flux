@@ -343,60 +343,7 @@ fn a_symlink_reports_its_own_identity_not_its_targets() {
         std::os::unix::fs::symlink(&target, &link).map_err(|e| format!("symlink failed: {e}"));
 
     #[cfg(windows)]
-    let made: Result<(), String> = {
-        // A symlink needs Developer Mode or SeCreateSymbolicLinkPrivilege and a stock
-        // machine has neither, so this used to SKIP - leaving the only Windows coverage
-        // of FILE_FLAG_OPEN_REPARSE_POINT at zero. MEASURED: removing that flag left the
-        // whole Windows suite green.
-        //
-        // A JUNCTION needs no privilege (MEASURED: `New-Item -ItemType Junction`
-        // succeeds unelevated) and is also a name-surrogate reparse point, so it
-        // exercises the same flag.
-        if std::os::windows::fs::symlink_dir(&target, &link).is_ok() {
-            Ok(())
-        } else {
-            // Separate args, NOT one quoted string: MEASURED both ways. `cmd /C` strips
-            // outer quotes, so folding the whole command into one argument makes it
-            // misread the nested quotes and create nothing even for an ordinary path.
-            // Separate args work for ordinary paths and for paths with spaces; they do
-            // NOT survive a `&` in the path, which cmd treats as a command separator.
-            let out = std::process::Command::new("cmd")
-                .args(["/C", "mklink", "/J"])
-                .arg(&link)
-                .arg(&target)
-                .output();
-            // Trust the POSTCONDITION, never the exit status: MEASURED, `mklink /J`
-            // returns 0 even when its target does not exist. `is_symlink` is true for a
-            // junction because Rust keys it on the name-surrogate reparse bit, which is
-            // exactly the property under test.
-            //
-            // The stat error is REPORTED, not swallowed: a transient failure here is a
-            // different problem from "cmd made nothing", and a bool cannot tell them
-            // apart.
-            match std::fs::symlink_metadata(&link) {
-                Ok(m) if m.file_type().is_symlink() => Ok(()),
-                Ok(m) => {
-                    Err(format!("path exists but is not a reparse point: {:?}", m.file_type()))
-                }
-                Err(e) => Err(format!(
-                    "nothing at the link path after `mklink /J` ({e}); a `&` in the temp \
-                     path is the likeliest cause, since cmd.exe treats it as a command \
-                     separator. cmd said: {}",
-                    // BOTH streams: cmd writes its failure to stderr, so reporting
-                    // stdout alone printed an empty string on the one path that matters.
-                    out.map(|o| {
-                        let mut said = String::from_utf8_lossy(&o.stdout).trim().to_owned();
-                        let err = String::from_utf8_lossy(&o.stderr).trim().to_owned();
-                        if !err.is_empty() {
-                            said.push_str(&err);
-                        }
-                        said
-                    })
-                    .unwrap_or_else(|e| format!("<could not run cmd: {e}>"))
-                )),
-            }
-        }
-    };
+    let made: Result<(), String> = make_dir_reparse_point(&target, &link);
 
     // NOT a skip. On Windows a junction needs no privilege and on Unix a symlink needs
     // none either, so failing to create one is a broken environment rather than an
@@ -417,4 +364,69 @@ fn a_symlink_reports_its_own_identity_not_its_targets() {
     assert!(matches!(target_id, FileIdentity::Strong(_)), "target: {target_id:?}");
     assert!(matches!(link_id, FileIdentity::Strong(_)), "link: {link_id:?}");
     assert_ne!(target_id, link_id, "a symlink is its own object, not its target");
+}
+
+/// Create a directory reparse point at `link` pointing at `target`, returning whether
+/// it worked. Prefers a symlink; falls back to a JUNCTION, which needs no privilege
+/// where a symlink needs Developer Mode or SeCreateSymbolicLinkPrivilege.
+///
+/// MEASURED: `New-Item -ItemType Junction` succeeds unelevated, and a junction is a
+/// name-surrogate reparse point, so it exercises FILE_FLAG_OPEN_REPARSE_POINT exactly
+/// as a symlink does.
+#[cfg(windows)]
+fn make_dir_reparse_point(target: &std::path::Path, link: &std::path::Path) -> Result<(), String> {
+    if std::os::windows::fs::symlink_dir(target, link).is_ok() {
+        return Ok(());
+    }
+    // Separate args, NOT one quoted string: MEASURED, `cmd /C` strips outer quotes and
+    // then misreads nested ones, creating nothing even for an ordinary path. Separate
+    // args work for ordinary paths and paths with spaces; they do not survive a `&`.
+    let out = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output();
+    // The POSTCONDITION, never the exit status: MEASURED, `mklink /J` returns 0 even
+    // when its target does not exist. The stat error is REPORTED, not swallowed.
+    match std::fs::symlink_metadata(link) {
+        Ok(m) if m.file_type().is_symlink() => Ok(()),
+        Ok(m) => Err(format!("path exists but is not a reparse point: {:?}", m.file_type())),
+        Err(e) => Err(format!(
+            "nothing at the link path after `mklink /J` ({e}); a `&` in the temp path is the likeliest cause, since cmd.exe treats it as a command separator. cmd said: {}",
+            out.map(|o| {
+                // BOTH streams: cmd writes its failure to stderr, so reporting stdout
+                // alone printed an empty string on the one path that matters.
+                let mut said = String::from_utf8_lossy(&o.stdout).trim().to_owned();
+                let err = String::from_utf8_lossy(&o.stderr).trim().to_owned();
+                if !err.is_empty() {
+                    said.push_str(&err);
+                }
+                said
+            })
+            .unwrap_or_else(|e| format!("<could not run cmd: {e}>"))
+        )),
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn metadata_reports_a_reparse_point_as_not_a_file() {
+    // The Windows half of `metadata_reports_a_symlink_as_not_a_file`, which is
+    // `#[cfg(unix)]` because symlinks used to need Developer Mode. A junction does not,
+    // so that justification is obsolete and the property is testable here after all.
+    //
+    // It matters most on THIS platform: Windows is where `metadata` and
+    // `symlink_metadata` diverge on reparse points, and a walk that gates descent on
+    // `is_file` would follow a link it should have reported.
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    let link = dir.path().join("link");
+
+    if let Err(why) = make_dir_reparse_point(&target, &link) {
+        panic!("could not create a reparse point at {}: {why}", link.display());
+    }
+
+    let m = StdFileSystem.metadata(&link).unwrap();
+    assert!(!m.is_file, "a reparse point is not a regular file");
 }
