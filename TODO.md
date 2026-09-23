@@ -55,14 +55,16 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
       `a/b`. The design handles it with an ancestor set of object identities
       rather than `dev`/`ino` tracking of everything visited, which would grow
       with the tree and breach spec line 997.
-- [ ] **Cycle detection is unavailable on weak-identity filesystems.** §107 names
-      FAT32, exFAT and some SMB and NFS configurations as producing weak or
-      unavailable identity, and the walker acts only on `FileIdentity::Strong`.
-      On those filesystems a bind-mounted subtree is copied twice and §149.6's
-      "even if filesystem namespace relationships change after startup" is unmet —
-      the §129 containment check degrades to a lexical test. The operation reports
-      that the guarantee was unavailable rather than implying it held, but the gap
-      is real and this is where a fix belongs.
+- [ ] **Identity-based cycle detection is unavailable on weak-identity filesystems**
+      (§107 names FAT32, exFAT and some SMB and NFS configurations). Negotiated to
+      a bounded degradation rather than a refusal: the lexical containment test and
+      the depth cap both still run, so the residual harm is a cycle copied up to
+      256 times — bounded, warned about once per filesystem, and cleanable — instead
+      of an unbounded silent loop. `--safety=strict` refuses outright. What stays
+      unmet on weak identity is §149.6's "even if filesystem namespace relationships
+      change after startup", since only identity can catch containment established
+      through a mount or a rename. A real fix needs a trustworthy identity on those
+      filesystems, which is where this item lives.
 - [ ] **Walker TOCTOU.** If `read_dir` yields bare paths, the walk inherits the
       same races `walkdir` has: an entry can change type between the listing and
       the visit. Mitigated by returning the file type WITH the entry so no

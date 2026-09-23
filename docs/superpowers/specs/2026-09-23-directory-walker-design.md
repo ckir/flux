@@ -314,11 +314,16 @@ initialisation, alongside its "is this a directory" check.
 
 Before descending into a directory `D`:
 
-- if `D`'s identity is not `Strong`, skip both checks below and see "When identity is weak or
-  unavailable".
-- if its `ObjectId` is already in the ancestor set → a cycle. Report, skip the subtree, continue.
-- if its `ObjectId` equals the **destination anchor's** → `SAFETY_REJECTED`, abort the whole operation.
-  This is the dynamic half of §149.6.
+- if the depth would exceed the cap → report, skip the subtree, continue. This runs at every identity
+  strength and is the only guard that does.
+- the lexical containment test runs at every identity strength too — see item 1 of "When identity is
+  weak or unavailable".
+- if `D`'s identity and the destination anchor's are BOTH `Strong`, then:
+  - if its `ObjectId` is already in the ancestor set → a cycle. Report, skip the subtree, continue.
+  - if its `ObjectId` equals the **destination anchor's** → `SAFETY_REJECTED`, abort the whole
+    operation. This is the dynamic half of §149.6.
+- otherwise the identity checks are skipped for this entry and the operation warns once per affected
+  filesystem, unless `--safety=strict` was given, in which case it refuses.
 - otherwise push it and descend, popping at `DirEnd`.
 
 The **destination anchor** resolves the case §129 has to handle before anything is created. A tree copy
@@ -336,22 +341,59 @@ comparison above is what catches a namespace change *after* startup.
 
 ### When identity is weak or unavailable
 
-Every check above acts on `FileIdentity::Strong` alone. On both target platforms that is the normal
-case — Unix always, Windows via `FILE_ID_INFO` on NTFS and ReFS — so the degraded paths are fallbacks,
-not the common route.
+`Weak` and `Unavailable` behave identically, because a value that cannot be trusted is worth no more
+than a value that is absent. On both target platforms `Strong` is the normal case — Unix always,
+Windows via `FILE_ID_INFO` on NTFS and ReFS — but the degraded path is not exotic: §107 names FAT32 and
+exFAT, which is most removable media, and some SMB and NFS configurations, which is most network
+storage. Backups go to exactly those places.
 
-`Weak` and `Unavailable` are treated identically here, because a value that cannot be trusted is worth
-no more than a value that is absent. §108 exists precisely because weak identity needs its own policy
-for hardlinks; the scanner's policy is this:
+The design does not turn the checks off. It gives each one a fallback that is always available, and
+bounds what remains. The general rule is foundational invariant 23, *"Platform optimizations have safe
+fallbacks or explicit strict failure"*, and the concrete precedent is §108, where `--hardlinks=auto`
+degrades with an aggregated warning while `--hardlinks=preserve` fails outright and is told "Do not
+guess".
 
-- **Cycle detection is not performed.** A walk over a weak-identity filesystem can therefore duplicate a
-  bind-mounted subtree. This is a real, documented limitation with a `TODO.md` entry, not a silent
-  degradation — the operation records that the guarantee was unavailable for that path.
-- **The §129 containment check degrades to a lexical test.** That still catches the case §129 names,
-  `flux copy /data /data/backup`, because it is lexical. What it cannot catch is containment
-  established through a mount or a rename, which is exactly what §149.6's "even if filesystem namespace
-  relationships change after startup" asks for. So on weak identity that clause is unmet, and the
-  operation says so rather than implying a guarantee it did not provide.
+**1. The lexical containment test always runs, at every identity strength.** Invariant 22 asks that
+safety checks use identity *"not **only** lexical path comparisons"* — lexical is a floor that identity
+is added to, not a substitute it degrades into. §129's own example, `flux copy /data /data/backup`, is
+lexically detectable, so containment is never unchecked.
+
+**2. Identity checks run in addition, and only where BOTH sides are `Strong`.** A comparison is no
+stronger than its weaker operand, so a `Strong` source directory compared against a `Weak` destination
+anchor yields no guarantee. Asymmetry is the normal case in practice — a local ext4 source copied to an
+SMB destination — so this is the common path, not a corner.
+
+**3. A depth cap bounds any runaway descent, at every identity strength.** MEASURED on WSL
+Ubuntu-26.04: creating nested directories with relative paths and `chdir` reached **5000 levels** (the
+probe's own cap, not the OS's) at a path length of **55,020 bytes**, over thirteen times the
+`getconf PATH_MAX` of 4096. The kernel enforces no cumulative depth limit.
+
+The walk is therefore bounded today only because it addresses entries as `src_root.join(rel)` —
+absolute paths, where each single argument hits `PATH_MAX` at roughly 370 levels of ten-character
+names. That is an accident of path construction, not a guard, and `TODO.md` already contemplates moving
+to `openat`-style relative traversal to close walker TOCTOU, which would silently remove it.
+
+**The cap is 256, configurable.** Chosen to sit *below* the `PATH_MAX`-implied bound rather than above
+it, so the guard is the operative one both now and after any move to relative traversal — the behaviour
+does not change out from under a user when the traversal does. Real trees are an order of magnitude
+shallower. Exceeding it reports a failure for that subtree and skips it; it does not abort the
+operation.
+
+**4. The default degrades with one aggregated warning; `--safety=strict` fails instead.** One warning
+per affected filesystem per operation, following §108's shape and its example wording rather than one
+line per path, which would bury it. `--safety=strict` refuses when identity is not `Strong` on both
+sides, which is invariant 23's "explicit strict failure" and §108's `preserve` arm.
+
+**What remains, stated rather than implied.** Under the default, a cycle on a weak-identity filesystem
+is copied up to 256 times before the cap stops it. That is a bounded, reported, cleanable mess — time,
+bandwidth and destination space — where without the cap it would be unbounded and silent. `--safety=strict`
+is what prevents the transfer entirely, and the warning names it.
+
+**Rejected: varying the default by mount topology.** Degrade for network mounts, refuse for local ones,
+on the reasoning that local weak identity implies a deeper fault. §107's own list refutes the premise —
+FAT32 and exFAT head it, and both are ordinary local removable media — so this would refuse the most
+common consumer backup there is. Detecting "is this a network mount" portably is also the same class of
+unreliable platform introspection that produced the problem.
 
 One adapter rule, from §107: *"The platform adapter must never treat `object_id == 0` as a valid
 universal object identity."* An adapter that reads an index of zero reports `Unavailable`, never
@@ -565,10 +607,15 @@ citing line numbers is a set of claims about code that must already exist.
    default to a distinct `Strong` id generated per path, so ordinary tests need no setup and no two
    unrelated paths collide by accident.
 2. **The walk.** `FileType`, `DirEntry`, `read_dir`, `create_dir`, `Code::DirectoryChangedDuringScan`,
-   the `FaultFs` widening, and the ordered walk with its event type, ancestor-set cycle detection and
-   non-terminal errors.
-3. **`copy_tree`.** The driver, the §129 pre-flight and dynamic safety checks, and the CLI dispatching
-   a directory source to it.
+   the `FaultFs` widening, and the ordered walk with its event type, non-terminal errors, the depth cap,
+   and ancestor-set cycle detection gated on both-sides-`Strong`.
+
+   `FaultFs::set_identity` is what makes the degraded paths testable: giving two paths the same
+   `ObjectId` reproduces a cycle, and giving one a `Weak` identity exercises the fallback — neither
+   needs a mount, a privilege, or a particular filesystem under the test runner.
+3. **`copy_tree`.** The driver, the lexical containment floor, the §129 pre-flight and dynamic identity
+   checks, the aggregated weak-identity warning, `--safety=strict`, and the CLI dispatching a directory
+   source to it.
 
 ## Out of scope
 
