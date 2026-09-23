@@ -103,6 +103,18 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
 
 ### Known limits of the first single-file copy (2026-09-22)
 
+- [ ] **`destination_is_write_protected` swallows every `symlink_metadata` error**
+
+  Both arms read `Err(_) => false`, and the comment justifies only the NotFound case — "Nothing
+  occupies the name, so there is nothing to protect", which is correct and is the dominant case. A
+  sharing violation or a denial also lands there, and the guard then reports "not protected" for a
+  destination it could not inspect. The operation still fails safely, because the rename itself fails;
+  what is lost is the precise refusal, so the user gets the rename's error instead of "the destination
+  is write-protected".
+
+  Found by the PR 1 capstone widening its lens beyond that PR's range. Not fixed there because the
+  function is PR #32's code and untouched by PR 1.
+
 - [ ] **`rename_no_replace` is a check-then-rename race**
 
   `StdFileSystem::rename_no_replace` tests `to.exists()` and then renames. Between the two, another
