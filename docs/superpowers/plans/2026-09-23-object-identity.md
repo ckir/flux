@@ -40,13 +40,33 @@ is never blocked on Windows identity debugging.
 | `crates/flux-core/src/fault_fs.rs` | Store identities, add `set_identity`, populate `identity` |
 | `crates/flux-platform/tests/std_fs.rs` | Behavioural tests against the real filesystem |
 
-## Baseline, measured before starting
+## Baseline and final counts, both MEASURED
 
-`cargo test --workspace` is green at `e299b5b` on Windows: `flux-core` lib **30**, `flux-fs` lib **9**,
-`flux-platform` `tests/std_fs.rs` **7** and `tests/fs_semantics.rs` **9**, root `tests/copy.rs` **2**,
-`tests/dev_tooling.rs` **2**, `tests/integration` **1**, `tests/model_stamp.rs` **45** (1 ignored).
+This plan was applied end to end, built and tested on BOTH platforms, then reverted. The counts below
+are observations, not arithmetic, and four defects in the plan were found that way — each is now folded
+into the task that contained it.
 
-Every expected count below is that baseline plus the tests the task adds.
+| target | baseline | after |
+|---|---|---|
+| `flux-fs` lib | 9 | **10** |
+| `flux-core` lib | 30 | **31** |
+| `flux-platform` `tests/std_fs.rs` (Windows) | 7 | **12** |
+| `flux-platform` `tests/std_fs.rs` (Linux) | 10 | **15** |
+| `flux-platform` `tests/fs_semantics.rs` | 9 | 9 |
+| root `copy.rs` / `dev_tooling.rs` / `integration` / `model_stamp.rs` | 2 / 2 / 1 / 45 | unchanged |
+
+`cargo fmt --check` clean and `cargo clippy --workspace --all-targets -- -D warnings` exit 0 after the
+doc-comment fix in Task 4.
+
+**Build the Unix arm too.** `#[cfg(unix)] fn identity_of` is not even type-checked by a Windows host, so
+a Windows-only run proves nothing about it. It was validated by running the suite under WSL against the
+same worktree with a Linux-side `CARGO_TARGET_DIR`. Do the same before calling this done.
+
+**One test is vacuous on a stock Windows machine.** `a_symlink_reports_its_own_identity_not_its_targets`
+prints `SKIPPED` and reports `ok` where symlink creation is denied, which is the default without
+Developer Mode or `SeCreateSymbolicLinkPrivilege`. MEASURED: it skipped here and ran on Linux. On
+Windows it is the ONLY coverage of `FILE_FLAG_OPEN_REPARSE_POINT`, so either enable Developer Mode on
+the machine that runs it or treat that flag as covered on Linux alone — and say which in the report.
 
 ## Repo gate
 
@@ -292,7 +312,15 @@ Expected: FAIL — the assertion `local fs must be strong` fails with `Unavailab
 
 - [ ] **Step 3: Implement**
 
-Add to `crates/flux-platform/src/std_fs.rs`, near the other `cfg`-gated helpers:
+First widen the crate's own import. `crates/flux-platform/src/std_fs.rs` currently reads
+`use flux_fs::{FileHandle, FileSystem, FsError, Metadata, Perms, Result};` — MEASURED: without the two
+new names the helper below does not compile. It becomes:
+
+```rust
+use flux_fs::{FileHandle, FileIdentity, FileSystem, FsError, Metadata, ObjectId, Perms, Result};
+```
+
+Then add, near the other `cfg`-gated helpers:
 
 ```rust
 /// Unix identity costs NOTHING extra: `metadata` already calls `symlink_metadata`,
@@ -414,13 +442,17 @@ Add to `crates/flux-platform/src/std_fs.rs`:
 ///
 /// Every flag here is load-bearing, and std's own source says why
 /// (`library/std/src/sys/fs/windows.rs:1398-1404, 1501-1504`):
-///   - BACKUP_SEMANTICS   "allows opening directories" — without it a directory cannot
-///                        be opened at all, and directories are what the walk needs.
-///   - OPEN_REPARSE_POINT "opens a link instead of its target" — without it a symlink
-///                        would report its TARGET's identity, silently corrupting the
-///                        walk's cycle detection with an id belonging to another object.
-///   - access_mode(0)     std: "No read or write permissions are necessary" — it avoids
-///                        both a sharing violation and a denial on an unreadable file.
+/// - `BACKUP_SEMANTICS`: std says "allows opening directories". Without it a directory
+///   cannot be opened at all, and directories are exactly what the walk needs it for.
+/// - `OPEN_REPARSE_POINT`: std says "opens a link instead of its target". Without it a
+///   symlink reports its TARGET's identity, silently corrupting the walk's cycle
+///   detection with an id belonging to a different object.
+/// - `access_mode(0)`: std says "No read or write permissions are necessary". It avoids
+///   both a sharing violation and a denial on a file this process cannot read.
+///
+/// Keep the continuation lines at TWO spaces after the `-`. MEASURED: a deeper indent
+/// trips `clippy::doc_overindented_list_items`, and the repo gate is
+/// `cargo clippy --workspace --all-targets -- -D warnings`, so it FAILS the build.
 #[cfg(windows)]
 fn identity_of(path: &Path) -> FileIdentity {
     use std::os::windows::fs::OpenOptionsExt;
@@ -502,21 +534,16 @@ git commit -m "feat(flux-platform): Windows object identity from FILE_ID_INFO"
 **Files:**
 - Modify: `crates/flux-core/src/fault_fs.rs`
 
-- [ ] **Step 1: Create the test module, then write the failing test**
+- [ ] **Step 1: Write the failing test**
 
-`crates/flux-core/src/fault_fs.rs` has **no `#[cfg(test)]` module at all** — the fake is currently
-exercised only through `copy.rs`'s tests. Append one to the end of the file. `Path` is already imported
-at line 10, but a test module needs its own `use`:
+`crates/flux-core/src/fault_fs.rs` already HAS a `#[cfg(test)] mod tests` at lines 408-409, holding
+`it_records_the_order_of_calls` and `it_fails_the_named_call`. Append inside it, after the second. It
+opens with `use super::*;` only, so the test brings in what it needs itself:
 
 ```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use flux_fs::{FileIdentity, FileSystem, ObjectId};
-    use std::path::Path;
-
     #[test]
     fn identities_default_to_distinct_and_can_be_forced_equal() {
+        use flux_fs::{FileIdentity, ObjectId};
         let fs = FaultFs::new();
         fs.write_file("/a", b"x");
         fs.write_file("/b", b"x");
@@ -541,11 +568,10 @@ mod tests {
         fs.set_identity("/a", FileIdentity::Unavailable);
         assert_eq!(fs.metadata(Path::new("/a")).unwrap().identity, FileIdentity::Unavailable);
     }
-}
 ```
 
-Inside this module the `flux_fs::` prefixes in the test body are unnecessary — `FileIdentity` and
-`ObjectId` are imported above, so write them bare as shown. The trailing `}` closes `mod tests`.
+The surrounding module uses fully-qualified `std::path::Path::new(..)` in its existing tests; either
+form works, since `Path` is imported at file scope (line 10).
 
 - [ ] **Step 2: Run it and watch it fail**
 
@@ -584,13 +610,24 @@ In `metadata`, replace the `identity: FileIdentity::Unavailable,` placeholder fr
                 // Distinct per path, and deterministic, so a test that does not care
                 // about identity still gets sane behaviour and two different paths are
                 // never accidentally the same object. Volume 1 is "the fake's volume".
-                let mut index: u128 = 0;
+                // FNV-1a. The offset basis is non-zero so the empty path is not 0, and
+                // mixing each byte keeps ADJACENT paths apart.
+                //
+                // MEASURED: an earlier draft used `hash * 31` then `| 1` to avoid zero.
+                // That clears the low bit, so "/a" (1554) and "/b" (1555) both became
+                // 1555 and the fake's one promise — two paths are two objects — failed.
+                // Windows never showed it because only the platform tests had been run.
+                let mut index: u128 = 0xcbf2_9ce4_8422_2325;
                 for b in p.as_bytes() {
-                    index = index.wrapping_mul(31).wrapping_add(u128::from(*b));
+                    index ^= u128::from(*b);
+                    index = index.wrapping_mul(0x0000_0100_0000_01b3);
                 }
-                // Never 0: §107 forbids treating a zero id as valid, and an empty path
-                // would otherwise hash to it.
-                flux_fs::FileIdentity::Strong(flux_fs::ObjectId { volume: 1, index: index | 1 })
+                // §107 forbids a zero id. Unreachable given a non-zero basis; here so it
+                // cannot become reachable.
+                if index == 0 {
+                    index = 1;
+                }
+                flux_fs::FileIdentity::Strong(flux_fs::ObjectId { volume: 1, index })
             }),
 ```
 
