@@ -335,10 +335,15 @@ fn a_symlink_reports_its_own_identity_not_its_targets() {
     std::fs::create_dir(&target).unwrap();
     let link = dir.path().join("link");
 
+    // `Result<(), String>` rather than a bool: a bare bool forced the assert to GUESS
+    // why, and it guessed a Windows cause even on Unix. The reason travels with the
+    // failure instead.
     #[cfg(unix)]
-    let made = std::os::unix::fs::symlink(&target, &link).is_ok();
+    let made: Result<(), String> =
+        std::os::unix::fs::symlink(&target, &link).map_err(|e| format!("symlink failed: {e}"));
+
     #[cfg(windows)]
-    let made = {
+    let made: Result<(), String> = {
         // A symlink needs Developer Mode or SeCreateSymbolicLinkPrivilege and a stock
         // machine has neither, so this used to SKIP - leaving the only Windows coverage
         // of FILE_FLAG_OPEN_REPARSE_POINT at zero. MEASURED: removing that flag left the
@@ -348,20 +353,14 @@ fn a_symlink_reports_its_own_identity_not_its_targets() {
         // succeeds unelevated) and is also a name-surrogate reparse point, so it
         // exercises the same flag.
         if std::os::windows::fs::symlink_dir(&target, &link).is_ok() {
-            true
+            Ok(())
         } else {
-            // ONE argument with the paths quoted INSIDE it. Passing them as separate
-            // args lets cmd.exe re-parse metacharacters: MEASURED, a temp path
-            // containing `&` and no spaces made cmd split the command in two, the
-            // junction was never created, and the test skipped silently reporting ok.
-            // Separate args, NOT one quoted string: MEASURED both ways. `cmd /C`
-            // strips outer quotes, so folding the whole command into one argument
-            // makes it misread the nested quotes and create nothing even for an
-            // ordinary path. Separate args work for ordinary paths and for paths with
-            // spaces; they do NOT survive a `&` in the path, which cmd treats as a
-            // command separator - that case now FAILS the assert below instead of
-            // skipping, and the message says so.
-            let _ = std::process::Command::new("cmd")
+            // Separate args, NOT one quoted string: MEASURED both ways. `cmd /C` strips
+            // outer quotes, so folding the whole command into one argument makes it
+            // misread the nested quotes and create nothing even for an ordinary path.
+            // Separate args work for ordinary paths and for paths with spaces; they do
+            // NOT survive a `&` in the path, which cmd treats as a command separator.
+            let out = std::process::Command::new("cmd")
                 .args(["/C", "mklink", "/J"])
                 .arg(&link)
                 .arg(&target)
@@ -370,19 +369,46 @@ fn a_symlink_reports_its_own_identity_not_its_targets() {
             // returns 0 even when its target does not exist. `is_symlink` is true for a
             // junction because Rust keys it on the name-surrogate reparse bit, which is
             // exactly the property under test.
-            std::fs::symlink_metadata(&link).map(|m| m.file_type().is_symlink()).unwrap_or(false)
+            //
+            // The stat error is REPORTED, not swallowed: a transient failure here is a
+            // different problem from "cmd made nothing", and a bool cannot tell them
+            // apart.
+            match std::fs::symlink_metadata(&link) {
+                Ok(m) if m.file_type().is_symlink() => Ok(()),
+                Ok(m) => {
+                    Err(format!("path exists but is not a reparse point: {:?}", m.file_type()))
+                }
+                Err(e) => Err(format!(
+                    "nothing at the link path after `mklink /J` ({e}); a `&` in the temp \
+                     path is the likeliest cause, since cmd.exe treats it as a command \
+                     separator. cmd said: {}",
+                    // BOTH streams: cmd writes its failure to stderr, so reporting
+                    // stdout alone printed an empty string on the one path that matters.
+                    out.map(|o| {
+                        let mut said = String::from_utf8_lossy(&o.stdout).trim().to_owned();
+                        let err = String::from_utf8_lossy(&o.stderr).trim().to_owned();
+                        if !err.is_empty() {
+                            said.push_str(&err);
+                        }
+                        said
+                    })
+                    .unwrap_or_else(|e| format!("<could not run cmd: {e}>"))
+                )),
+            }
         }
     };
 
-    // NOT a skip. A junction needs no privilege, so failing to create either kind of
-    // reparse point is a broken environment, not an absent capability - and a silent
-    // skip here reports `ok` while testing nothing, which is how this flag came to have
-    // no coverage in the first place.
-    assert!(
-        made,
-        "could not create a reparse point at {}: neither symlink_dir nor `mklink /J` produced one. A junction needs no privilege, so the likeliest cause is a `&` in the temp path, which cmd.exe treats as a command separator. This is the only Windows coverage of FILE_FLAG_OPEN_REPARSE_POINT, so it fails rather than skipping.",
-        link.display()
-    );
+    // NOT a skip. On Windows a junction needs no privilege and on Unix a symlink needs
+    // none either, so failing to create one is a broken environment rather than an
+    // absent capability - and a silent skip reports `ok` while testing nothing, which is
+    // how this property came to have no coverage on Windows in the first place.
+    if let Err(why) = made {
+        panic!(
+            "could not create a reparse point at {}: {why}. This is the only test covering \
+             the no-follow behaviour on this platform, so it fails rather than skipping.",
+            link.display()
+        );
+    }
 
     let fs = StdFileSystem;
     let target_id = fs.metadata(&target).unwrap().identity;
