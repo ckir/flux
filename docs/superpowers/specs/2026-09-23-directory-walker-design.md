@@ -1069,6 +1069,41 @@ no trait change, no new test surface in three implementors, and no second way fo
 failure to the sink rather than stopping at the first. The CLI exits 1 if any failure was reported,
 matching §2 item 83 and the existing `metadata_failures` behaviour.
 
+### The destination may rename what you asked it to create
+
+**§241.4 "Destination Normalization" (`FLUX_FULL_UPDATED_SPEC_V16.md:10778-10797`) binds this design and
+was never cited:**
+
+> A destination filesystem may itself normalize names. ... source `FluxPathKey` → destination native
+> path → destination filesystem namespace is a mapping, not a promise that source pathname bytes
+> survive physically unchanged.
+>
+> After creation, Flux must validate the destination object using destination filesystem identity and
+> namespace lookup rather than assuming byte-for-byte pathname preservation.
+
+A tree copy assumes throughout that `dst_root.join(rel)` names the thing it just created. On a
+destination that normalizes — macOS decomposing to NFD, a case-insensitive volume folding `File.txt`
+and `file.txt` — that assumption is false, and §241.4 says so in as many words.
+
+**For DIRECTORIES this is already satisfied, by accident rather than design.** The item-114 mitigation
+captures each created directory's identity immediately after creating it and re-verifies before writing
+inside. That capture IS §241.4's post-creation validation by identity, and it is worth noticing that
+two requirements arrived at the same mechanism from different directions — one about attackers, one
+about normalizing filesystems.
+
+**For FILES it is not satisfied**, and the case is item 83's: copying a directory holding `File.txt` and
+`file.txt` to a case-insensitive destination publishes one and must report
+`DESTINATION_NAMESPACE_COLLISION` for the other, with nothing overwritten. Publishing with a no-replace
+primitive is what detects it — the second rename finds the name taken and fails rather than replacing —
+so the mechanism is already in the design, arriving with the atomic-publication cut. What was missing is
+the statement that this is WHY the no-replace primitive is load-bearing for correctness and not only for
+concurrency: without it, two source names that the destination folds into one would silently become one
+file, the second overwriting the first.
+
+That also answers a question the deferral leaves open. Until the atomic primitive lands, a
+case-insensitive destination is a correctness hazard, not merely a concurrency one — which is a second
+reason the primitive precedes the engine rather than shipping alongside it.
+
 ### Long destination paths on Windows
 
 Acceptance item 103 (`FLUX_FULL_UPDATED_SPEC_V16.md:13369-13371`): *"on Windows, a destination path
@@ -1093,6 +1128,20 @@ Two halves, and only one of them is already handled:
   property true for all five cuts and every caller rather than for one entry point. The CLI's
   canonicalization still produces such paths, and that is now a harmless overlap rather than the
   mechanism.
+
+  **The adapter must do this LEXICALLY, and must not reach for `canonicalize`.** That is the obvious
+  implementation and it would break this design at its foundation: `std::fs::canonicalize` RESOLVES
+  symlinks, so a `metadata` call routed through it would report a link's target instead of the link,
+  destroying the `symlink_metadata` semantics that the Step 2a gate, the symlinked-anchor refusal and
+  the item-114 capture all depend on. It would also make `rename_no_replace` act on a target rather
+  than the name it promises to leave alone.
+
+  What is needed is a lexical absolute-path conversion that touches no disk: make the path absolute
+  against the current directory, resolve `.` and `..` textually, and prefix — `\\?\` for a drive path,
+  `\\?\UNC\` for a UNC path — leaving every link in place. A path already carrying the prefix is left
+  alone. This is fiddly rather than deep, and naming it here is the point: an implementer who reaches
+  for `canonicalize` because it produces the right-looking string will silently disable three safety
+  checks.
 
   This also removes the caveat the previous text was honest about but should not have needed: there is
   no longer a class of caller that silently gets the 260-character limit.
@@ -1525,23 +1574,14 @@ publication, engine, CLI), since a sixth insertion would shift them again.
 
    The three primitives §241.5 names — `renameat2(RENAME_NOREPLACE)` on Linux,
    `renamex_np(RENAME_EXCL)` on macOS, `MoveFileEx` without `MOVEFILE_REPLACE_EXISTING` on Windows —
-   replacing `rename_no_replace`'s present check-then-act body. Plus a **capability query** on the
-   trait.
+   replacing `rename_no_replace`'s present check-then-act body. **No new trait method** — see the
+   capability-query bullet below, which explains why the one this cut originally proposed was removed.
+
+   Also in this cut, because §105 makes it an adapter property rather than a caller's: **extended-length
+   `\\?\` paths on the Windows arm, for every call.**
 
    **Specified concretely, because this is the cut that gets planned next and intent is not a plan:**
 
-   ```rust
-   /// Can publication into this directory refuse to replace an existing entry,
-   /// atomically? `dir` must be an existing DIRECTORY — the destination anchor,
-   /// never the not-yet-created destination root — because the answer is a
-   /// property of the filesystem the directory lives on, not of the target name.
-   fn supports_no_replace_publish(&self, dir: &Path) -> Result<bool>;
-   ```
-
-   - **Why a directory and not the target path.** The target usually does not exist, and the capability
-     belongs to the filesystem. Taking the anchor means the query is always asked about something that
-     is there, which removes the "what does it answer for a missing path" question entirely rather
-     than answering it.
    - **`rename_no_replace`'s contract does not change**, and that is the point: it already promises to
      fail rather than replace. What changes is that it now keeps that promise atomically. The
      observable difference is confined to the concurrent case that previously lost silently.
@@ -1550,12 +1590,11 @@ publication, engine, CLI), since a sixth insertion would shift them again.
      `DESTINATION_NAMESPACE_COLLISION` is the ENGINE's job in the next cut, where a tree copy knows
      that the target was planned as new; a single-file caller that asked for `NoReplace` is not in a
      collision, it simply lost a name it did not reserve.
-   - **`NullFs` returns `Ok(false)`** — the stub exists to prove the trait compiles, and claiming a
-     capability it cannot have would let a test pass against a fake that never had one. This mirrors
-     its `FileIdentity::Unavailable`.
    - **`FaultFs` gets `set_no_replace_support(bool)`**, defaulting to `true` so existing tests need no
-     change. Setting it `false` is what makes the engine's `NOREPLACE_PUBLISH_UNAVAILABLE` refusal
-     testable in the next cut without a filesystem that genuinely lacks the primitive.
+     change. Setting it `false` makes `rename_no_replace` report the platform's unsupported error, which
+     is what lets the engine's behaviour on such a destination be tested in the next cut without a
+     filesystem that genuinely lacks the primitive. `NullFs` needs no change, since no trait method is
+     added.
    - **The code taxonomy is added HERE**, both `NoReplacePublishUnavailable` and
      `DestinationNamespaceCollision`, even though the engine is what returns them. A `Code` variant is
      a `flux-fs` concern and adding it with the capability keeps the vocabulary in one cut; the
@@ -1598,11 +1637,21 @@ publication, engine, CLI), since a sixth insertion would shift them again.
      113 exists to prevent. **This is tracked debt, not an oversight**, recorded on the anomalies
      conveyor for triage rather than left in prose here.
 
-     `supports_no_replace_publish` is still added to the trait in cut 3, because the adapter can answer
-     from the primitive's own error surface without writing anything — `renameat2` returning `ENOSYS`
-     or `EINVAL` is an answer. What that cannot do is satisfy the spec's WRITTEN probe, which is what
-     item 113's refusal is defined in terms of, so the method is a capability hint that the engine may
-     use opportunistically and not the compliant probe.
+     **`supports_no_replace_publish` is DROPPED from cut 3, and the reason is that it cannot be
+     implemented.** An earlier revision kept it as a "capability hint" the adapter could answer "from
+     the primitive's own error surface without writing anything — `renameat2` returning `ENOSYS` or
+     `EINVAL` is an answer". That is not true on Linux. To learn whether a filesystem supports
+     `RENAME_NOREPLACE` you must reach that filesystem's rename implementation, and to reach it you
+     must get past path resolution — so with a source that does not exist the kernel returns `ENOENT`
+     first, and `ENOENT` does not distinguish "unsupported" from "not there". **There is no
+     side-effect-free probe.** That is precisely why the spec's probe WRITES.
+
+     So the trait gains nothing here, and the honest consequence of the deferral stands on its own:
+     **the engine learns at the first publish.** At that moment a staging temporary exists, so
+     `renameat2` reaches the filesystem and returns `EINVAL` or `ENOSYS` truthfully — no extra write,
+     no invented API, and no method whose contract could not be honoured. An unimplementable trait
+     method would have been worse than the gap it was papering over, because three implementors would
+     have had to fake an answer.
 
      When the workspace lands, the probe is implemented as specified — `noreplace-probe`, written
      inside the workspace, removed, an uncleanable file reported as a warning, exit 1 rather than 3 on
@@ -1612,7 +1661,7 @@ publication, engine, CLI), since a sixth insertion would shift them again.
      leg; locally only the Windows arm runs, which is the standing constraint recorded in `TODO.md`
      rather than something this cut can fix. What is asserted everywhere, against `FaultFs`, is the
      TRAIT-level contract: that `rename_no_replace` fails on an occupied target and succeeds on a free
-     one, and that `supports_no_replace_publish` is reported faithfully. What is asserted per platform,
+     one, and that a fake lacking the primitive reports it. What is asserted per platform,
      in `crates/flux-platform/tests/`, is that the real adapter refuses a real occupied target.
 
    **The query, not the refusal.** An earlier revision of this item claimed the cut also delivers "the
@@ -1812,3 +1861,11 @@ re-derive them and a reader can see what was consciously not fixed.
   IO_ERROR is used "only when no more specific code applies", and the registry has no cycle code, while
   SAFETY_REJECTED's definition covers containment, self-copy and unexpected link components, none of
   which is a cycle. Recorded so the weaker argument is not re-cited.
+- `REJECTED: "149.1 is contradicted -- the design does not resolve the nearest existing ancestor or
+  record the unresolved suffix."` It does both. The canonicalization section resolves the nearest
+  existing ancestor and appends "the non-existent remainder lexically afterwards", which is 149.1's
+  unresolved suffix under another name. 149.1 is uncited rather than unmet, and is now cited.
+- `RESOLVED: the subsection sweep.` 30 subsections across the families whose parents this design
+  touches. Fourteen bind and were uncited; twelve are satisfied and now cited -- 7.1, 7.3, 30.1, 149.1,
+  149.2, 149.3, 149.5, 233.1, 233.2, 233.3, 241.1, 241.2, 241.3. Two were NOT satisfied: 241.4, folded
+  above, and 5.2's dry-run rule, which belongs to the deferred probe and is covered by that debt entry.
