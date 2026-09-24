@@ -1492,16 +1492,32 @@ publication, engine, CLI), since a sixth insertion would shift them again.
      directory of §18.2, which this design lists as OUT OF SCOPE for every one of these cuts. There is
      no workspace to write into.
 
-     The options are genuinely different and this document does not pick one, because it is the owner's
-     call: **(i)** cut 3 ships only the primitive and the trait method, and the PROBE lands with the
-     workspace in Phase 3, which means the engine cut cannot yet refuse with
-     `NOREPLACE_PUBLISH_UNAVAILABLE` and item 113 is unmet until then; **(ii)** these cuts define a
-     minimal probe location that is not the full workspace, accepting a divergence from "only inside
-     the operation's workspace" that must be recorded; **(iii)** the workspace's minimum viable form is
-     pulled forward into cut 3, which is a much larger cut than the one just scoped.
+     **The owner's decision: cut 3 ships the PRIMITIVE and the trait method only. The probe defers,
+     with the workspace.** Two alternatives were weighed and declined — defining a minimal probe
+     location outside the workspace, which buys item 113 on time at the price of a deliberate
+     divergence from a normative constraint and of writing a control file into the user's destination
+     tree that invariant 26 is sensitive about; and pulling a minimum viable workspace forward, which
+     turns a focused platform cut into one carrying operation-scoped, destination-local control state
+     that §18.2 and invariant 25 specify in detail.
 
-     Whichever is chosen, `--dry-run` reporting **unprobed** is the behaviour that makes the absence
-     honest rather than silent, and it is available under all three.
+     **What that costs, stated rather than buried.** Item 113 is UNMET until the workspace exists. The
+     engine cut publishes atomically and correctly, but it cannot pre-refuse a destination that lacks
+     the primitive with `NOREPLACE_PUBLISH_UNAVAILABLE` before changing anything — it discovers the
+     lack at the first publish and fails that action instead. The difference is a whole operation
+     refused up front versus every file failing one at a time, which is real and is exactly what item
+     113 exists to prevent. **This is tracked debt, not an oversight**, recorded on the anomalies
+     conveyor for triage rather than left in prose here.
+
+     `supports_no_replace_publish` is still added to the trait in cut 3, because the adapter can answer
+     from the primitive's own error surface without writing anything — `renameat2` returning `ENOSYS`
+     or `EINVAL` is an answer. What that cannot do is satisfy the spec's WRITTEN probe, which is what
+     item 113's refusal is defined in terms of, so the method is a capability hint that the engine may
+     use opportunistically and not the compliant probe.
+
+     When the workspace lands, the probe is implemented as specified — `noreplace-probe`, written
+     inside the workspace, removed, an uncleanable file reported as a warning, exit 1 rather than 3 on
+     a refusal that had to probe, and `--dry-run` writing nothing and reporting **unprobed** so the
+     absence is honest rather than silent.
    - **Testing, given the gate runs on Windows only.** Each platform arm is exercised on its own CI
      leg; locally only the Windows arm runs, which is the standing constraint recorded in `TODO.md`
      rather than something this cut can fix. What is asserted everywhere, against `FaultFs`, is the
@@ -1675,3 +1691,8 @@ re-derive them and a reader can see what was consciously not fixed.
   least 147 (spec :13505-13517). The uninspected tail is where item 142 names the no-replace probe file
   `noreplace-probe` -- which overturned this document's own account of how the probe works. An
   exhaustiveness claim that stops short of the end is worth checking before it is relied on.
+- `DEFERRED-TO-ANOMALIES: spec item 113's NOREPLACE_PUBLISH_UNAVAILABLE pre-refusal is unmet until the
+  operation workspace exists, because the normative probe must write inside it. * spec:13406 *
+  2026-09-24` Owner-ruled: cut 3 ships the primitive only and the probe defers with the workspace.
+  Until then the engine discovers a missing primitive at the first publish rather than refusing the
+  operation before anything changes.
