@@ -330,11 +330,15 @@ crates/flux-platform/tests/std_fs.rs:136:    assert!(!m.is_file, "a symlink must
 crates/flux-platform/tests/std_fs.rs:143:    assert!(!fs.metadata(d.path()).unwrap().is_file);
 crates/flux-platform/tests/std_fs.rs:431:    assert!(!m.is_file, "a reparse point is not a regular file");
 crates/flux-platform/src/std_fs.rs:179:            is_file: m.is_file(),
-crates/flux-core/src/fault_fs.rs:409:            is_file: !g.not_files.contains(&p),
+crates/flux-core/src/fault_fs.rs:408:            is_file: !g.not_files.contains(&p),
 crates/flux-core/src/copy.rs:157:    if !src_meta.is_file {
 ```
 
-(`std_fs.rs:168` and `fault_fs.rs:265` also match but are prose inside comments, not code.)
+(`std_fs.rs:168`, `std_fs.rs:420` and `fault_fs.rs:270` also match but are prose inside comments, not
+code.)
+
+**These are post-Task-1 line numbers.** Task 1 moved doc comments in `fault_fs.rs` and shortened it by
+one line, so its construction site is at **408**, not the 409 this plan carried before Task 1 ran.
 
 If the set differs, STOP and report `STATE_MISMATCH: <what differs>`.
 
@@ -373,7 +377,10 @@ pub struct Metadata {
 `file_type: FileType::File,`.
 
 `crates/flux-platform/src/std_fs.rs:179` — change `is_file: m.is_file(),` to `file_type: type_of(&m),`
-and add this free function next to `perms_of` (which is at `:255`):
+and add this free function. **Placement matters:** `perms_of` is cfg-gated into TWO definitions,
+`#[cfg(unix)]` at `:254-258` and `#[cfg(not(unix))]` at `:260-263`. `type_of` is NOT platform-specific
+and must be a SINGLE ungated function — put it after both, at line 264, before the `identity_of` doc
+comment that begins at `:265`:
 
 ```rust
 /// Map std's `FileType` to ours. Symlink FIRST: on Windows std defines `is_dir()` as
@@ -394,7 +401,7 @@ fn type_of(m: &std::fs::Metadata) -> flux_fs::FileType {
 }
 ```
 
-`crates/flux-core/src/fault_fs.rs:409` — change `is_file: !g.not_files.contains(&p),` to
+`crates/flux-core/src/fault_fs.rs:408` — change `is_file: !g.not_files.contains(&p),` to
 `file_type: if g.not_files.contains(&p) { FileType::Other } else { FileType::File },`. Task 4 replaces
 this line again; this interim form only has to compile and keep the existing tests green.
 
