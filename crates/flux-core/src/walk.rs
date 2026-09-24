@@ -170,6 +170,15 @@ pub fn walk_with_depth<'a, F: FileSystem>(
 /// subtree, and continues with the next sibling. Most fallible Rust iterators stop,
 /// which is exactly why this is stated here.
 ///
+/// Spec item 83, verbatim: "`DIRECTORY_CHANGED_DURING_SCAN` has one outcome: the
+/// directory's subtree is not transferred, the error is reported, and the operation
+/// exits 1. There is no configured mutation policy or rescan alternative." The
+/// operation's exit status is 1 even though the walk COMPLETED.
+///
+/// The spec mandates this shape only for identity changes; applying it to every
+/// per-directory failure is a design decision, taken because the alternative is
+/// aborting a whole tree copy over one denied subdirectory.
+///
 /// A pull iterator, because §9 requires that when downstream capacity is exhausted
 /// the "scanner blocks/awaits" rather than accumulating paths. A consumer that stops
 /// pulling IS the backpressure, so Phase 3's bounded queue sits between this
@@ -384,5 +393,40 @@ mod tests {
         // the assertion; an exhaustive equality carries it without a second
         // redundant assert, which would be true whenever this one is.
         assert_eq!(paths(&fs), vec!["L link", "D real", "F real/f", "E real"]);
+    }
+
+    #[test]
+    fn an_unreadable_directory_does_not_end_the_walk() {
+        // Spec item 83: the directory's subtree is not transferred, the error is
+        // reported, and the operation exits 1 -- but the WALK completes. Every
+        // sibling of the failing directory must still be yielded.
+        let fs = FaultFs::new();
+        for d in ["/r", "/r/aaa", "/r/bbb", "/r/ccc"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        fs.write_file("/r/aaa/f", b"");
+        fs.write_file("/r/bbb/f", b"");
+        fs.write_file("/r/ccc/f", b"");
+
+        // `read_dir` is called once per directory, so a one-shot fault aimed at it
+        // would be eaten by the FIRST call -- the root's. `fail_nth` targets the
+        // second call, which is /r/aaa. This trap made a test pass vacuously once.
+        fs.fail_nth("read_dir", 2, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+
+        let mut errors = Vec::new();
+        let mut files = Vec::new();
+        for item in walk(&fs, Path::new("/r")).unwrap() {
+            match item {
+                Ok(WalkEvent::File { path }) => files.push(rel(&path)),
+                Err(e) => errors.push((rel(&e.path), e.cause.code)),
+                Ok(_) => {}
+            }
+        }
+
+        assert_eq!(errors.len(), 1, "exactly one error; got {errors:?}");
+        assert_eq!(errors[0].0, "aaa");
+        assert_eq!(errors[0].1, Code::PermissionDenied);
+        // The siblings AFTER the failure are the whole point.
+        assert_eq!(files, vec!["bbb/f".to_string(), "ccc/f".to_string()]);
     }
 }
