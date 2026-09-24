@@ -406,6 +406,14 @@ impl FileSystem for StdFileSystem {
         // name as it always did. That is a documented limit of the degraded path, not
         // a reason to drop the guard: removing it would restore the `from == to` hole
         // on every identity-less filesystem, which is strictly worse.
+        // `access_mode(0)` is load-bearing HERE for a second reason beyond the one
+        // `metadata` gives, and `rename_no_replace_vetoes_a_same_object_target_held_
+        // _open_exclusively` goes red if it is widened. Asking for no access means an
+        // exclusively-held target still PROBES, so the veto below fires rather than
+        // being skipped. The other way a probe can fail on an existing name is a deny
+        // ACE -- and there `MoveFileExW` fails too, PermissionDenied, raw 5, MEASURED,
+        // because a rename needs DELETE on the source. Those two failures being
+        // correlated is what makes the nesting below safe.
         let probe = |p: &Path| {
             OpenOptions::new()
                 .access_mode(0)

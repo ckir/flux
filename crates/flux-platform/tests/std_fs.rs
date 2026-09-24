@@ -760,3 +760,38 @@ fn rename_no_replace_reports_a_missing_source_even_when_it_is_its_own_target() {
     );
     assert!(!absent.exists(), "nothing may be created");
 }
+
+#[cfg(windows)]
+#[test]
+fn rename_no_replace_vetoes_a_same_object_target_held_open_exclusively() {
+    // `access_mode(0)` in the veto's probe is LOAD-BEARING, and this test is what says
+    // so. A reviewer argued the veto is bypassed whenever the probe fails for a reason
+    // other than absence, leaving MoveFileExW to answer Ok for `from == to`. MEASURED,
+    // that is not what happens on either reachable path:
+    //
+    //   exclusive lock (here)  probe SUCCEEDS -- requesting no access conflicts with
+    //                          nothing -- so the veto fires and answers AlreadyExists.
+    //   deny ACE               probe fails PermissionDenied, and MoveFileExW fails
+    //                          PermissionDenied too (raw 5), because a rename needs
+    //                          DELETE on the source. No false success.
+    //
+    // The two failure conditions are correlated, which is why the nesting is safe. That
+    // correlation depends on the probe asking for NO access: widen `access_mode` and
+    // this test goes red, which is the point of it.
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let d = TempDir::new().unwrap();
+    let p = d.path().join("exclusive");
+    let fs = StdFileSystem;
+    fs.create_new(&p).unwrap();
+
+    let _hold = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&p)
+        .expect("an exclusive open of a file we just created must succeed");
+
+    let err = fs.rename_no_replace(&p, &p).expect_err("same object, occupied name");
+    assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(p.exists(), "the object must survive");
+}
