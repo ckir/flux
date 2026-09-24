@@ -351,19 +351,144 @@ two different paths, so the lexical check does not fire either. The file is copi
 
 A junction or a bind mount reaches the same place by a different route. This is exactly what invariant
 22 forbids — *"not **only** lexical path comparisons"* — and what §129 means by not relying on
-`exclude destination` as the primary mechanism. It is unreachable before a recursive copy exists,
-because a single-file copy's source and destination are named by the user; a TREE copy is what generates
-pairs the user never typed.
+`exclude destination` as the primary mechanism.
 
-**So the per-file check belongs to `copy_tree`'s cut, not to a later cleanup.** Before publishing a
-file, compare the source's `ObjectId` against the destination's where BOTH are `Strong`, by the same
-rule the directory checks use — a comparison is no stronger than its weaker operand, so a `Weak` or
-`Unavailable` side degrades to the lexical floor and the aggregated warning, exactly as it does for a
-directory.
+**The hole is reachable in the shipped single-file copy today, and a tree copy is what makes it
+routine.** An earlier draft of this section claimed it was "unreachable before a recursive copy exists,
+because a single-file copy's source and destination are named by the user". That is false, and
+`TODO.md` records the counter-example against this very item: `flux copy a ./a` names two paths that are
+lexically different and the same object, so the Step 0 check passes and the file is copied onto itself.
+A hardlink or a junction given directly to `flux copy` reaches the same place. What a TREE copy changes
+is not reachability but SCALE and CONSENT — it generates destination pairs the user never typed, one per
+file, so a single mistyped root can hit the case a thousand times over.
+
+That distinction matters for scoping. The check is not speculative work for a feature that does not
+exist yet; it is a live defect in shipped behaviour whose recorded blocker — a portable identity
+primitive — PR 1 removed.
 
 `TODO.md` has carried this as "the self-copy refusal compares paths, not filesystem identity" since the
-single-file cut, recorded as blocked on an identity primitive. PR 1 delivered that primitive, so the
-blocker is gone.
+single-file cut. PR 1 delivered the primitive, so the blocker is gone.
+
+#### Where the per-file check lives, exactly
+
+`copy_file` **owns** the check, and `copy_tree` does not pre-screen. Putting it in `copy_tree` would
+leave `flux copy a ./a` — the single-file case that is reachable now — still unguarded, and would make
+the guarantee a property of one caller rather than of the operation. Every caller of `copy_file` gets it.
+
+It is a NEW gate, and **Step 0 is left exactly as it is**. The existing lexical refusal at
+`crates/flux-core/src/copy.rs:139` promises to refuse before touching the filesystem, and that promise
+is pinned by `a_self_copy_is_refused_before_anything_is_touched`, which asserts the recorded call list
+is EMPTY. An identity comparison cannot keep that promise, because it must stat the destination. So the
+two coexist rather than one replacing the other, and the pinning test needs no edit — which is the
+outcome to prefer, since rewriting a pinning test to accommodate new code is the move that needs the
+most justification.
+
+The new gate sits **after Step 2 and before Step 3** — after the source metadata is read, before the
+exclusive `create_new` of the staging temporary. That position is what makes the refusal cost nothing
+that has to be cleaned up: no temporary exists yet, so a refusal leaves the filesystem exactly as it
+found it, and the source metadata the gate needs is already in hand from Step 2. The only new syscall is
+one `metadata` on the destination.
+
+The revised step order:
+
+| Step | What happens |
+|-----:|--------------|
+| 0 | lexical self-copy refusal, before touching the filesystem — **unchanged** |
+| 1 | leftover staging sweep |
+| 2 | source `metadata` (also captured for the Step 7 re-check) |
+| **2a** | **identity gate on the destination — NEW** |
+| 3 | exclusive `create_new` of the temporary |
+| 4 | stream |
+| 5 | durability |
+| 6 | metadata on the temporary |
+| 7 | source-unchanged re-check, then publish |
+
+#### What the gate does, case by case
+
+The destination stat goes through `FileSystem::metadata` on the trait, never `std::fs` directly, so
+`FaultFs` can fake every branch below and the behaviour is testable without a real hardlink.
+
+That trait method is `symlink_metadata`-based on both arms — `std_fs.rs` uses `symlink_metadata` on Unix
+and opens with `FILE_FLAG_OPEN_REPARSE_POINT` on Windows — and that is the semantic this gate needs:
+
+- a **hardlink** destination shares the source's inode, so the gate sees the same `ObjectId` and refuses.
+  This is the case the gate exists for.
+- a **symlink or junction** destination is judged as the NAME being replaced, not as what it points at,
+  so it is not refused. Replacing it is intended behaviour, pinned by
+  `rename_replace_allows_a_symlink_whose_target_is_read_only`
+  (`crates/flux-platform/tests/std_fs.rs:68`), whose own reasoning is that judging the target instead of
+  the name is "a false positive: a copy that should succeed and does not". Following the link here would
+  reintroduce exactly that.
+
+  That test is `#[cfg(unix)]`, so it pins the INTENT rather than the Windows behaviour — a plan must not
+  cite it as a Windows oracle. The Windows arm reaches the same place by a different route:
+  `metadata` opens with `FILE_FLAG_OPEN_REPARSE_POINT`, so a junction is likewise typed as the link and
+  not as its target.
+
+| Destination state | What the gate does |
+|---|---|
+| `NotFound` | **Proceed.** No object exists, so no alias is possible. This is the dominant case for a tree copy into a fresh destination, and it must cost nothing: no refusal, no warning, not even a diagnostic. |
+| exists, both identities `Strong`, `ObjectId` equal | **Refuse** with `Code::SafetyRejected` — the same code Step 0 already returns for the lexical case, because it is the same class of refusal reached by a stronger test. |
+| exists, both `Strong`, `ObjectId` differs | Proceed. |
+| exists, is a **directory** | **Refuse** with `Code::SafetyRejected`. The stat is already taken, so the `FileType` is free, and refusing here names the real reason. Without it the copy proceeds to Step 7 and fails at the rename with a platform error that does not say "the destination is a directory". |
+| exists, either side not `Strong` | See below — degrade by default, refuse under `--safety=strict`. |
+| the stat itself fails for another reason | Proceed. The gate is a guard, not the operation; a destination that cannot be inspected still meets the ordinary failure paths at Step 3 and Step 7. |
+
+#### The degraded case for files, which fails OPEN
+
+For directories, degrading to the lexical floor is bounded: the depth cap stops a runaway descent at
+256. **A file has no such bound.** If identity degrades, the aliased overwrite simply happens — the
+check fails open, and nothing downstream catches it.
+
+The design accepts that by default and gives it an off switch, rather than refusing outright:
+
+- **Default: degrade to the lexical floor, and warn.** What is actually lost is the HARDLINK
+  relationship, not the data — `copy_file` stages through a distinct temporary, so the bytes published
+  are the source's own, read before the destination was touched. `TODO.md` records this same reading.
+- **`--safety=strict`: refuse** whenever identity is not `Strong` on both sides.
+
+Refusing by default was considered and rejected. §107 names FAT32 and exFAT first among weak-identity
+filesystems, and those are most removable media — so a refuse-by-default rule would block the most
+ordinary consumer backup there is, in exchange for preventing link-breakage rather than data loss. That
+is §108's precedent applied unchanged: `--hardlinks=auto` degrades with an aggregated warning while
+`preserve` refuses and is told "do not guess".
+
+#### Where `--safety=strict` lives
+
+`CopyOptions` has no safety field today — it carries `preserve_times`, `preserve_permissions`,
+`durability`, `publish` and `operation_id`. PR 3 adds one, because `copy_tree(fs, src, dst, opts)` takes
+a single options parameter and that is the only channel a caller has.
+
+```rust
+/// Whether a safety check that cannot be made with full confidence refuses or degrades.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Safety {
+    /// Degrade to the lexical floor when identity is not `Strong`, and warn.
+    Default,
+    /// Refuse whenever identity is not `Strong` on both sides.
+    Strict,
+}
+```
+
+Added to `CopyOptions` as `safety: Safety`. A two-variant enum rather than a `strict_safety: bool`,
+because that file already prefers named states over booleans — `Preserve`, `Durability` and `Publish`
+are all enums, and `Preserve` exists as three states precisely because a bool could not express the
+distinction it needed. A third safety mode is easy to imagine; a second bool is not.
+
+A separate `TreeOptions` parameter was considered and rejected: it would split one concept across two
+types, and **the field has to reach `copy_file` anyway**, since Q1's answer makes strict mode change
+single-file behaviour at the Step 2a gate. `CopyOptions` is already the type `copy_file` receives.
+
+`CopyOptions` has no `Default` impl and does not gain one here — every construction site names all its
+fields, which is what makes adding a field a compile error at each of them rather than a silent
+inheritance of a default nobody chose. There are exactly two sites today,
+`crates/flux-cli/src/main.rs:31` and the `opts()` test helper at `crates/flux-core/src/copy.rs:254`, and
+both are updated in PR 3.
+
+**The FLAG is PR 4; the enum and its behaviour are PR 3.** Wherever this document says
+`--safety=strict`, it names the behaviour `Safety::Strict` selects, not a command-line surface PR 3
+builds — PR 3 has no CLI. The flag that sets it is part of the CLI cut, and until then `Safety::Strict`
+is reachable only by a library caller, which is exactly what makes it testable before it is exposed.
 
 The **destination anchor** resolves the case §129 has to handle before anything is created. A tree copy
 is usually given a destination that does not exist yet, so it has no identity to compare against:
@@ -377,6 +502,22 @@ is also inside the source, or is the source root. Anchoring on the parent is the
 can run *"before transfer begins"* as §129 demands, rather than after the destination has been created.
 A pre-flight comparison of `src_root` against the anchor runs before the walk starts; the per-directory
 comparison above is what catches a namespace change *after* startup.
+
+**When the ANCHOR's identity is weak, the pre-flight degrades by the same rule** — no special case, and
+no stricter treatment for being the earliest check. The reasoning is worth spelling out, because "the
+one check §129 requires before transfer begins" invites making it the exception:
+
+The pre-flight guards **overlap** — copying `/data` into `/data/backup` — which is a different hazard
+from the cycles the walk guards, and the depth cap does not bound it. A cap of 256 limits how DEEP a
+runaway descent goes; it does nothing about the duplication of copying a tree into itself, which at 256
+levels could be enormous. So the cap is not what makes degrading here safe.
+
+What makes it safe is that **the lexical containment floor always runs, at every identity strength**.
+§129's own named example is lexically detectable, so the case the specification puts its name to is
+still caught when identity degrades. What degrading loses is only the ALIASED overlap — a destination
+reached through a junction, a bind mount or a hardlinked ancestor — which is precisely the case
+`--safety=strict` exists to cover. That keeps the pre-flight consistent with the per-file rule instead
+of resting on a guard aimed at a different hazard.
 
 ### When identity is weak or unavailable
 
@@ -423,6 +564,44 @@ per affected filesystem per operation, following §108's shape and its example w
 line per path, which would bury it. `--safety=strict` refuses when identity is not `Strong` on both
 sides, which is invariant 23's "explicit strict failure" and §108's `preserve` arm.
 
+**The engine CAPTURES the warning; the CLI renders it.** Splitting the last cut at the engine boundary
+means PR 3 has no printer, so "warn once per filesystem" has to survive as data until PR 4 can display
+it. `TreeOutcome` therefore carries the aggregation, not a formatted string.
+
+Aggregating is not uniform, because the two degraded states carry different amounts of information:
+
+- **`Weak(ObjectId)` carries a volume, and that volume is trustworthy even when the index is not.** On
+  FAT32 and exFAT it is the object INDEX that is unstable; the mount identifier is not. So `Weak` groups
+  by `volume`, and two different removable drives produce two warnings rather than collapsing into one.
+- **`Unavailable` carries nothing**, so there is no key to group by. It gets a single catch-all bucket.
+
+```rust
+/// Why identity comparison was skipped, aggregated for one warning apiece.
+#[derive(Debug)]
+pub struct WeakIdentityWarnings {
+    /// One entry per affected volume, keyed by `ObjectId::volume` — a bare `u64`
+    /// (Unix `st_dev`, Windows `VolumeSerialNumber`), since there is no newtype for it.
+    /// `BTreeMap` rather than `HashMap` so the warnings render in a stable order.
+    pub weak: BTreeMap<u64, DegradedGroup>,
+    /// Everything whose identity was `Unavailable`, which names no volume to group by.
+    pub unavailable: Option<DegradedGroup>,
+}
+
+#[derive(Debug)]
+pub struct DegradedGroup {
+    pub count: u64,
+    /// One path, so the warning can point at something concrete without listing all of them.
+    pub example: std::path::PathBuf,
+}
+```
+
+An earlier draft aggregated purely by REASON — two variants, `Weak` and `Unavailable`, each with a count
+and one example — on the grounds that it never asserts a filesystem it cannot name. That is a real
+property, but it bought it by discarding information that `Weak` actually has: two distinct weak volumes
+became one warning with one example path, which is the bury-it failure §108's "per filesystem" wording
+exists to prevent. The hybrid keeps the property exactly where it is needed, on the variant that has no
+volume to name.
+
 **What remains, stated rather than implied.** Under the default, a cycle on a weak-identity filesystem
 is copied up to 256 times before the cap stops it. That is a bounded, reported, cleanable mess — time,
 bandwidth and destination space — where without the cap it would be unbounded and silent. `--safety=strict`
@@ -440,8 +619,15 @@ universal object identity."* An adapter that reads an index of zero reports `Una
 
 ## Composition with `copy_file`
 
-`copy_tree` lives in `flux-core` beside `copy_file` and drives it. `copy_file` is **not modified** — it
-passed a capstone in PR #32 and its contract is right as it stands.
+`copy_tree` lives in `flux-core` beside `copy_file` and drives it.
+
+**`copy_file` IS modified in this cut**, by the one change described under "Where the per-file check
+lives, exactly": the new identity gate at Step 2a, and the `safety` field it reads. An earlier draft of
+this section said `copy_file` was "not modified — it passed a capstone in PR #32 and its contract is
+right as it stands". The capstone half is true and the conclusion does not follow: a capstone certifies
+that the code behaves as designed, not that the design covered every case. This gap is one it did not
+cover, and `TODO.md` had it recorded as open debt throughout. Nothing else about `copy_file` changes —
+the step order above the gate, the staging contract, and the Step 7 re-check are all untouched.
 
 ```rust
 /// What a tree copy did, and everything that went wrong while doing it.
@@ -455,6 +641,10 @@ pub struct TreeOutcome {
     pub bytes_copied: u64,
     pub directories_created: u64,
     pub failures: Vec<TreeFailure>,
+    /// Identity comparisons that were SKIPPED because a side was not `Strong`,
+    /// aggregated for one warning apiece. Not failures: the copies succeeded.
+    /// The engine captures; PR 4's CLI renders. Empty on the normal path.
+    pub warnings: WeakIdentityWarnings,
 }
 
 #[derive(Debug)]
@@ -493,6 +683,34 @@ else lands in `failures` and the walk continues.
 
 `opts.operation_id` is shared across every file, so each file's staging temporary is named from the same
 id. That is what makes §18.1's leftover sweep work per file without the tree needing its own scheme.
+
+**`opts.publish` passes through unchanged, and `copy_tree` does not force a mode.** The design
+previously left this unstated, which is a gap rather than a detail, because the two modes differ in
+whether a known race is reachable:
+
+- `Publish::Replace` publishes through `rename_replace`. This is what both existing construction sites
+  set, so it is the shipped behaviour.
+- `Publish::NoReplace` publishes through `rename_no_replace`, which is **check-then-act**:
+  `StdFileSystem` tests `std::fs::symlink_metadata(to).is_ok()` and then calls `std::fs::rename`
+  (`crates/flux-platform/src/std_fs.rs:264-276`), so two processes can both see a free name and one
+  silently wins — the very thing that method's contract forbids.
+
+  The test is deliberately `symlink_metadata` rather than `exists()`, because `exists()` follows the
+  link and a dangling symlink would report false, letting the method replace the very name it promises
+  to leave alone. That fix is already in; it addresses a different defect and does not close the race,
+  because any check followed by a separate rename has a window between them.
+
+There is an argument for `NoReplace` being the more natural tree default, since §18.1 says a target
+"planned as new" publishes that way, and every file of a copy into a fresh destination is planned as
+new. It is not adopted here, and the reason is sequencing rather than taste: forcing `NoReplace` would
+make that race **reachable for the first time**, and PR 3 would be the change that exposed it. Closing
+it properly needs an atomic primitive — `rustix::fs::renameat_with` with `RenameFlags::NOREPLACE` on
+Unix, `FileRenameInfoEx` without `REPLACE_IF_EXISTS` on Windows, which `std` does not expose — and that
+is its own piece of work, recorded in `TODO.md` and deliberately out of this cut.
+
+Passing through therefore keeps the race dormant exactly as it is today: no caller in this cut selects
+`NoReplace`, so PR 3 neither fixes nor exposes it. When that primitive lands, a tree copy can adopt
+`NoReplace` without a second decision.
 
 **One failure, one representation.** Each `TreeFailureCause` variant is defined by WHERE the failure
 happened, and no failure may be expressible two ways:
@@ -686,8 +904,10 @@ citing line numbers is a set of claims about code that must already exist.
    `ObjectId` reproduces a cycle, and giving one a `Weak` identity exercises the fallback — neither
    needs a mount, a privilege, or a particular filesystem under the test runner.
 3. **`copy_tree`, the safe engine.** The driver, the lexical containment floor, the §129 pre-flight and
-   dynamic identity checks, the aggregated weak-identity warning, `--safety=strict`, and the per-file
-   identity check described under "The hole the directory checks do not cover" above. **No CLI.**
+   dynamic identity checks, the `Safety` enum on `CopyOptions`, the CAPTURE of the aggregated
+   weak-identity warning into `TreeOutcome::warnings`, and the per-file identity check described under
+   "The hole the directory checks do not cover" above. **No CLI**, so nothing here is rendered — the
+   warning is captured as data and displayed in PR 4.
 
    Split from the CLI after PR 2, with the owner's agreement. The first split proposed was traversal
    first and safety second, and it was rejected on its own consequence: a cut carrying the CLI without
@@ -696,8 +916,19 @@ citing line numbers is a set of claims about code that must already exist.
    is. Splitting at the ENGINE boundary instead means every merged state is both safe and coherent: this
    one ends at a library that cannot be driven into an unsafe copy, and the next one exposes it.
 
-4. **The CLI.** `flux copy` dispatching a directory source to `copy_tree`, and the reporting of
-   `TreeOutcome` — the counts and the per-entry failures. A thin surface over an engine whose safety is
+   **Rejected: extracting the per-file identity check into its own PR before this one.** The argument
+   for it is real — the check changes shipped SINGLE-FILE behaviour, and isolating a behaviour change is
+   ordinarily right. It does not survive the coupling, because the check's degraded case is *defined* by
+   `--safety=strict` and `Safety` lives on `CopyOptions` as part of this cut. An extracted PR would
+   therefore have to either ship the check with no strict mode to control it, or ship a safety enum
+   whose only meaningful consumer — the tree engine — does not exist yet. Both leave a merged state that
+   is incoherent on its own terms, which is the exact property the engine-boundary split was chosen to
+   guarantee.
+
+4. **The CLI.** `flux copy` dispatching a directory source to `copy_tree`, the reporting of
+   `TreeOutcome` — the counts and the per-entry failures — the rendering of
+   `TreeOutcome::warnings` as one line per affected volume plus one for the `Unavailable` bucket, and
+   the `--safety=strict` flag that sets `Safety::Strict`. A thin surface over an engine whose safety is
    already settled and reviewed.
 
 ## Out of scope
