@@ -1169,83 +1169,45 @@ reason the primitive precedes the engine rather than shipping alongside it.
 
 Acceptance item 103 (`FLUX_FULL_UPDATED_SPEC_V16.md:13369-13371`): *"on Windows, a destination path
 longer than 260 characters succeeds through the extended-length call path; a path the destination still
-refuses as too long fails that action with `DESTINATION_ERROR`."*
+refuses as too long fails that action with `DESTINATION_ERROR`."* §105 (`:5174-5177`) states the same
+requirement as a property: *"Flux uses extended-length paths (`\?\`) for every filesystem call on
+Windows, so the legacy 260-character path limit never applies."*
 
 This binds a tree copy specifically, because a tree copy is what GENERATES long destination paths — the
-user types two roots and the walk produces every path beneath them. The design discussed `PATH_MAX` at
-length for the depth cap, but that measurement was made on Linux and answers a different question. It
-said nothing about Windows `MAX_PATH`, which is 260.
+user types two roots and the walk produces every path beneath them. The `PATH_MAX` discussion elsewhere
+in this document was measured on Linux and answers a different question; Windows `MAX_PATH` is 260.
 
-Two halves, and only one of them is already handled:
+**The first half is already satisfied, by the standard library, and this design previously specified an
+adapter that would have reimplemented it.** `std::fs` on Windows routes every path argument through
+`maybe_verbatim`, whose doc comment reads *"Returns a UTF-16 encoded path capable of bypassing the
+legacy `MAX_PATH` limits"* — in the toolchain source at
+`library/std/src/sys/path/windows.rs:78-84`, reached from `with_native_path` at `:43-48`, the generic
+entry every Windows filesystem operation uses for its path arguments, and directly from `File::open`,
+`mkdir`, `readdir` and `symlink` in `sys/fs/windows.rs`. `get_long_path` at `:94` prepends the verbatim
+prefix for anything at or above 248 UTF-16 code units.
 
-- **The extended-length call path, and it belongs in the ADAPTER, not the CLI.** An earlier revision
-  said the CLI's canonicalization satisfies this because `std::fs::canonicalize` returns a
-  `\\?\`-prefixed path, and accepted that a library caller passing a raw path "does not get it". **§105
-  forbids that.** `FLUX_FULL_UPDATED_SPEC_V16.md:5172-5174`: *"Flux uses extended-length paths (`\\?\`)
-  for **every** filesystem call on Windows, so the legacy 260-character path limit never applies."*
+So no adapter work is required and none is specified. **Three revisions of this section asked for one**
+— first in the CLI, then lexically in the adapter, then by canonicalizing each path's parent — and each
+revision was reviewed without anyone asking whether `std` already did the job. Recorded here rather than
+deleted, because the same reading of §105 would otherwise produce the same machinery again:
 
-  Every call, not every CLI call. So `StdFileSystem` is what ensures the prefix, on the Windows arm,
-  for every path it touches — which is the right home regardless of the spec, because it makes the
-  property true for all five cuts and every caller rather than for one entry point. The CLI's
-  canonicalization still produces such paths, and that is now a harmless overlap rather than the
-  mechanism.
+- `std::fs::canonicalize`, which the last revision used on each parent, calls
+  `GetFinalPathNameByHandleW` — an open-and-close handle cycle per call, paid once per file in a
+  walker. `std`'s own conversion is `GetFullPathNameW`, a lexical string operation that touches no disk.
+- Forcing `\?\` unconditionally would also change behaviour on SHORT paths, where `std` deliberately
+  omits it so that Windows normalizes them — stripping trailing spaces and dots. §106 permits that
+  latitude, but it is a behaviour change nothing asked for.
+- What does NOT follow, and an earlier revision claimed: that such a helper would break the
+  symlink-dependent checks. It would not. Both approaches leave the FINAL component unresolved, so
+  `metadata` still reports a link as a link; and beneath a symlinked component, lexical and physical
+  resolution reach the same object because the kernel follows the link anyway.
 
-  **The adapter must do this LEXICALLY, and must not reach for `canonicalize`.** That is the obvious
-  implementation and it would break this design at its foundation: `std::fs::canonicalize` RESOLVES
-  symlinks, so a `metadata` call routed through it would report a link's target instead of the link,
-  destroying the `symlink_metadata` semantics that the Step 2a gate, the symlinked-anchor refusal and
-  the item-114 capture all depend on. It would also make `rename_no_replace` act on a target rather
-  than the name it promises to leave alone.
+**The second half is NOT satisfied and is a taxonomy obligation.** A name the destination still refuses
+as too long must fail THAT ACTION with `DESTINATION_ERROR`, path-scoped per §207 — one entry's failure,
+not the operation's. `Code` has no such variant, so the atomic-publication cut adds one alongside the
+other two it introduces. It maps as `TreeFailureCause::Copy` or `CreateDir` carrying it, so the walk
+continues, which is what "fails that action" requires.
 
-  **But a purely LEXICAL conversion is also wrong, and the previous revision of this paragraph asked
-  for one.** It said to "resolve `.` and `..` textually". Textual `..` is not semantics-preserving:
-  if `link` points at `/tmp`, then `link/../b` physically names `/b`, while popping `link` lexically
-  yields `./b`. And a `\\?\` path *disables* the kernel's own parsing, so the wrong answer is then
-  taken literally instead of being corrected. Asking for a lexical resolve would have produced silent
-  reads and writes of the wrong file whenever `..` followed a link.
-
-  **The correct conversion resolves the PARENT and appends the final component verbatim.**
-  `canonicalize` the parent directory — physically correct, so `..` and intermediate links resolve the
-  way the kernel would resolve them, and the result already carries `\\?\` — then push the final
-  component unchanged. That preserves exactly what this design needs: the final component is never
-  resolved, so `metadata` still reports a link as a link, `rename_no_replace` still judges the name
-  rather than its target, and the Step 2a gate, the symlinked-anchor refusal and the item-114 capture
-  all keep their meaning. A path already prefixed is left alone.
-
-  **Three preconditions make that rule total rather than mostly-right, and the first two were missing
-  from an earlier revision:**
-
-  1. **Make the path ABSOLUTE first.** `Path::new("foo").parent()` is `Some("")`, and canonicalizing
-     the empty string fails — so a single-component relative path would have failed unconditionally.
-     Joining the current directory first is a pure textual step that resolves no links.
-  2. **A path with no parent, or whose final component is `.` or `..`, is canonicalized WHOLE.** A root
-     has no final component to protect. And a trailing `..` must not be appended verbatim: a `\\?\`
-     path suppresses the kernel's parsing, so the filesystem would be asked for a literal entry named
-     `..` and answer `InvalidName`. Neither `.` nor `..` names an object whose link-ness matters, so
-     resolving them costs nothing this rule exists to protect.
-  3. **A path already carrying `\\?\` or `\\.\` is returned unchanged**, which makes the conversion
-     idempotent and safe to apply at every call site without tracking whether it has run.
-
-  The parent must exist, which it does at every call site: the engine creates parents before children
-  and the roots are resolved at startup. Where it does not, the call was going to fail with `NotFound`
-  and it still does — the error names the parent rather than the target, which is more accurate rather
-  than less.
-
-  `rename_no_replace` converts both endpoints independently. They share a parent in every use this
-  design makes of it, so an implementation may convert once and reuse; that is an optimisation, not a
-  requirement, and correctness does not depend on noticing it.
-
-  So the rule is narrow enough to state in one line: **resolve the parent physically, never the final
-  component.** An implementer who canonicalizes the WHOLE path silently disables three safety checks;
-  one who resolves it purely lexically silently retargets paths containing `..`. Both produce the
-  right-looking string.
-
-  This also removes the caveat the previous text was honest about but should not have needed: there is
-  no longer a class of caller that silently gets the 260-character limit.
-- **The refusal.** A path the destination still rejects as too long must fail THAT ACTION with
-  `DESTINATION_ERROR` — one entry's failure, not the operation's. The design had never named that code.
-  It maps as `TreeFailureCause::Copy` or `CreateDir` carrying it, so the walk continues, which is what
-  "fails that action" requires.
 
 ### Mount boundaries are not crossed by default
 
@@ -1987,8 +1949,9 @@ re-derive them and a reader can see what was consciously not fixed.
 - `RESOLVED: the section sweep's boundary.` 260 top-level `# N.` sections, 416 headings including
   subsections. Uncited sections that bind and are SATISFIED: §6 deterministic ordering, §40 special
   files, §41 filesystem safety, §43 paths, §110 source-mutation levels, §111 torn-read window -- all
-  now cited. §55 and §105 were NOT satisfied and are folded above. §149.7 was missed entirely by the
-  sweep and is the subject of its own open decision.
+  now cited. §55 was NOT satisfied and is folded above. §105 was folded as an adapter requirement and
+  has since been WITHDRAWN -- `std` already applies the prefix, so only its `DESTINATION_ERROR` half
+  needs anything. §149.7 was missed entirely by the sweep and is the subject of its own open decision.
 - `DEFERRED-TO-ANOMALIES: spec 149.7's handle-relative destination writes are unmet; the design
   substitutes identity capture plus re-verification, which narrows the window rather than closing it.
   * FLUX_FULL_UPDATED_SPEC_V16.md:7190 * 2026-09-24` Owner-ruled divergence. The OUTCOME 149.7

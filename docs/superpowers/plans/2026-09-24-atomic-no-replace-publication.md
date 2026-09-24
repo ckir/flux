@@ -57,6 +57,38 @@ only to confirm you found the right one.** This project has already paid for thi
 plan's Task 3 citations had to be corrected mid-execution after Task 1 shortened the file by a single
 line.
 
+**Windows long paths are already handled, and an earlier draft of this plan spent two tasks on them.**
+
+`std::fs` on Windows routes every path argument through `maybe_verbatim`, whose own doc comment reads
+*"Returns a UTF-16 encoded path capable of bypassing the legacy `MAX_PATH` limits"* — verified in the
+toolchain source at
+`E:\.rustup	oolchains\stable-x86_64-pc-windows-msvc\lib
+ustlib\src
+ust\library\std\src\sys\path\windows.rs:78-84`.
+It is reached from `with_native_path` at `:43-48`, the generic entry every Windows filesystem operation
+uses for its path arguments, and directly from `File::open`, `mkdir`, `readdir` and `symlink` in
+`sys/fs/windows.rs`. `get_long_path` at `:94` prepends the verbatim prefix for anything at or above 248
+UTF-16 code units.
+
+**So acceptance item 103's first half is satisfied by the standard library**, and the two tasks that
+built an `extended_length` helper, an `os_path` shim and converted nine call sites have been deleted.
+They were not merely redundant:
+
+- `std::fs::canonicalize`, which the helper used on each path's parent, calls
+  `GetFinalPathNameByHandleW` — an open-and-close handle cycle per call, paid per file in a walker.
+  std's own conversion is `GetFullPathNameW`, a lexical string operation that touches no disk.
+- Forcing `\?\` unconditionally would have changed behaviour on SHORT paths too. std omits the prefix
+  below 248 characters, so Windows normalizes those — stripping trailing spaces and dots. With the
+  prefix always applied, a name like `file.txt ` becomes creatable. §106 permits that latitude, but it
+  is a behaviour change nobody asked for.
+
+What does NOT follow, and was claimed in an earlier draft: that the helper would have broken the
+symlink-dependent safety checks. It would not have. Both approaches leave the FINAL component
+unresolved, so `symlink_metadata` still reports a link as a link, and for a path beneath a symlinked
+component lexical and physical resolution reach the same object because the kernel follows the link
+anyway. The case against the helper is redundancy, I/O cost and short-path normalization — not a safety
+break.
+
 **3. `rename_no_replace` is NOT `#[cfg]`-gated today** — it is one plain method in a non-gated `impl` block, at `crates/flux-platform/src/std_fs.rs:264-276`. Task 5 splits it. The file already mixes cfg styles (whole gated free functions, gated methods inside a non-gated `impl`, gated match arms), so a gated pair of methods matches the established pattern — `fn metadata` is already exactly that, at `:167-182` (unix) and `:184-213` (windows).
 
 ### What this cut does NOT do
@@ -127,19 +159,26 @@ Some tests are `#[cfg]`-gated, so the number `cargo nextest` reports on Windows 
 |---|---|---|
 | `crates/flux-fs/src/error.rs` | The spec error-code vocabulary | Modify: 2 new `Code` variants, 2 new `as_str` arms, 2 new assertions |
 | `crates/flux-core/src/fault_fs.rs` | The in-memory fake | Modify: 1 field, 1 configuration method, 1 branch in `rename_no_replace` |
-| `crates/flux-platform/src/std_fs.rs` | The real adapter | Modify: split `rename_no_replace` into two cfg arms; add the Windows path helper; route Windows calls through it |
+| `crates/flux-platform/src/std_fs.rs` | The real adapter | Modify: split `rename_no_replace` into two cfg arms |
 | `crates/flux-platform/tests/std_fs.rs` | Adapter behaviour against a real filesystem | Modify: new tests for atomicity, the path helper, and long paths |
 
 No files are created, no manifest changes (verified: `MoveFileExW` needs no feature this workspace does not already enable), and no file is split — `std_fs.rs` is 388 lines and stays coherent.
 
 ---
 
-### Task 1: The two new `Code` variants
+### Task 1: The three new `Code` variants
 
 **Files:**
 - Modify: `crates/flux-fs/src/error.rs:9-25` (the enum), `:27-42` (`as_str`), `:90-102` (the taxonomy test)
 
-The two codes belong to the engine and CLI cuts, but the vocabulary is a `flux-fs` concern and adding it here keeps one feature's taxonomy in one cut. Nothing in this cut returns them.
+All three codes belong to the engine and CLI cuts, but the vocabulary is a `flux-fs` concern and adding
+it here keeps one feature's taxonomy in one cut. Nothing in this cut returns them.
+
+**`DestinationError` is the third, and it comes from the half of §105 that survives.** §105's second
+sentence — `FLUX_FULL_UPDATED_SPEC_V16.md:5174-5177` — says *"A name or path the destination still
+refuses as too long fails that action with `DESTINATION_ERROR` (`path_scoped`, Section 207)."* The
+first sentence's requirement is met by the standard library (see the ground-truth section); this one is
+a taxonomy obligation and is not met by anything, because the `Code` enum has no such variant.
 
 The spec's registry is normative about the strings. Verified at `FLUX_FULL_UPDATED_SPEC_V16.md:2927` and `:2938`:
 
@@ -202,6 +241,7 @@ In `crates/flux-fs/src/error.rs`, in the test `every_code_has_the_spec_string` (
 ```rust
         assert_eq!(Code::NoReplacePublishUnavailable.as_str(), "NOREPLACE_PUBLISH_UNAVAILABLE");
         assert_eq!(Code::DestinationNamespaceCollision.as_str(), "DESTINATION_NAMESPACE_COLLISION");
+        assert_eq!(Code::DestinationError.as_str(), "DESTINATION_ERROR");
 ```
 
 - [ ] **Step 3: Run it to verify it fails**
@@ -227,6 +267,10 @@ In `crates/flux-fs/src/error.rs`, insert into the `Code` enum immediately after 
     /// or two source roots colliding. Published one, refused the other, overwrote
     /// neither. Raised by the engine, not here.
     DestinationNamespaceCollision,
+    /// §105, §207. A destination-side failure with no more specific code -- including
+    /// a name or path the destination refuses as too long even through the
+    /// extended-length call path. Path-scoped: it fails that ACTION, not the operation.
+    DestinationError,
 ```
 
 - [ ] **Step 5: Add the `as_str` arms**
@@ -236,6 +280,7 @@ In the `match self` of `Code::as_str` (`:29-40`), insert immediately after the `
 ```rust
             Code::NoReplacePublishUnavailable => "NOREPLACE_PUBLISH_UNAVAILABLE",
             Code::DestinationNamespaceCollision => "DESTINATION_NAMESPACE_COLLISION",
+            Code::DestinationError => "DESTINATION_ERROR",
 ```
 
 This `match` has no wildcard arm, which is what forces every future variant to be given a string. `crates/flux-core/src/copy.rs:22-25` also matches on `Code` but has a binding catch-all (`classified => classified`), so it compiles unchanged — do not touch it.
@@ -476,642 +521,16 @@ EOF
 
 ---
 
-### Task 3: The Windows extended-length path helper
-
-**Files:**
-- Modify: `crates/flux-platform/src/std_fs.rs` — add a `#[cfg(windows)]` free function and its unit tests
-
-§105 is normative: *"Flux uses extended-length paths (`\\?\`) for every filesystem call on Windows, so the legacy 260-character path limit never applies"* (`FLUX_FULL_UPDATED_SPEC_V16.md:5172-5174`).
-
-**This helper is where the cut is most easily got wrong, so read this before writing it.** Two obvious implementations are both wrong:
-
-- **`canonicalize` the whole path** resolves symlinks, so `metadata` would report a link's TARGET instead of the link. That silently disables the Step 2a identity gate, the symlinked-anchor refusal and the item-114 capture, all of which depend on `symlink_metadata` semantics. It produces the right-looking string.
-- **Resolve `.` and `..` lexically** is not semantics-preserving: if `link` points at `C:\tmp`, then `link\..\b` physically names `C:\b`, while popping `link` textually yields `.\b`. A `\\?\` path *disables* the kernel's own parsing, so the wrong answer is then taken literally rather than corrected.
-
-The rule is: **canonicalize the PARENT, append the final component verbatim** — with three preconditions that make it total.
-
-**This task ships the helper, the shim, AND one real call site — and the reason is a gate failure, not
-tidiness.** `extended_length` is a PRIVATE function. A private function with no caller is `dead_code`,
-which the gate's `-D warnings` turns into an error.
-
-**Unit tests do not fix that, and an earlier draft of this plan wrongly claimed they did.**
-`cargo clippy --workspace --all-targets` builds the library target WITHOUT `cfg(test)` before it builds
-the test targets. In that build the `#[cfg(test)] mod tests` does not exist, so a function called only
-from there still has zero callers and still trips `dead_code`. Tests in `tests/` cannot call it at all,
-being a separate crate. **The only thing that clears the lint is a caller in the library itself**, which
-is why this task also adds `os_path` and converts one call site rather than leaving the wiring to
-Task 4.
-
-That the repository contains no `#[allow(dead_code)]` anywhere is consistent: it has never had such a
-function.
-
-`crates/flux-platform/src/std_fs.rs` has no test module today — verified, there is no `#[test]` anywhere
-under `crates/flux-platform/src/`. This task adds the first one.
-
-- [ ] **Step 1: Write the failing unit tests**
-
-Append to `crates/flux-platform/src/std_fs.rs`:
-
-```rust
-#[cfg(all(test, windows))]
-mod tests {
-    use super::extended_length;
-    use std::path::Path;
-
-    #[test]
-    fn an_already_prefixed_path_is_returned_unchanged() {
-        // Idempotence. Applied at every call site, so it must be safe to apply twice.
-        let p = Path::new(r"\\?\C:\Windows\notepad.exe");
-        assert_eq!(extended_length(p), p);
-        assert_eq!(extended_length(&extended_length(p)), p, "twice must equal once");
-    }
-
-    #[test]
-    fn a_relative_path_becomes_absolute_and_prefixed() {
-        // `Path::new("foo").parent()` is Some(""), and canonicalizing "" fails, so a
-        // single-component relative path is the case a parent-first rule breaks on.
-        let converted = extended_length(Path::new("Cargo.toml"));
-        let s = converted.to_string_lossy();
-        assert!(s.starts_with(r"\\?\"), "must be extended-length, got {s}");
-        assert!(s.ends_with("Cargo.toml"), "the final component must survive verbatim, got {s}");
-    }
-
-    #[test]
-    fn the_final_component_is_never_resolved() {
-        // The whole point. A name that does NOT exist must still come through intact --
-        // which is also what proves the parent was resolved and the name was not.
-        let dir = std::env::current_dir().unwrap();
-        let converted = extended_length(&dir.join("definitely-absent-9f3a"));
-        assert!(
-            converted.to_string_lossy().ends_with("definitely-absent-9f3a"),
-            "an absent final component must survive, got {}",
-            converted.display()
-        );
-    }
-
-    #[test]
-    fn a_trailing_dot_dot_is_resolved_rather_than_appended() {
-        // A \\?\ path SUPPRESSES the kernel's parsing, so a literal `..` component would
-        // be asked of the filesystem as a name and answered InvalidName. Neither `.` nor
-        // `..` names an object whose link-ness matters, so resolving them costs nothing.
-        let dir = std::env::current_dir().unwrap();
-        let converted = extended_length(&dir.join(".."));
-        let s = converted.to_string_lossy();
-        assert!(!s.contains(".."), "no `..` may survive into a \\\\?\\ path, got {s}");
-        assert!(s.starts_with(r"\\?\"), "must still be extended-length, got {s}");
-    }
-
-    #[test]
-    fn a_root_has_no_parent_and_is_still_converted() {
-        let converted = extended_length(Path::new(r"C:\"));
-        assert!(
-            converted.to_string_lossy().starts_with(r"\\?\"),
-            "a root must convert rather than panic, got {}",
-            converted.display()
-        );
-    }
-}
-```
-
-Five tests, one per precondition plus the central property. These are the cases the design got wrong
-twice before settling; none of them is exercised by any integration test.
-
-- [ ] **Step 2: Write the failing integration test**
-
-This is the red-then-green test for this task: it exercises the conversion through a real call site.
-Add to `crates/flux-platform/tests/std_fs.rs`:
-
-```rust
-#[cfg(windows)]
-#[test]
-fn create_dir_works_past_the_260_character_limit() {
-    // Item 103, through the one call site this task converts. A tree copy is what
-    // GENERATES long destination paths, so this is the property the whole \?    // conversion exists for.
-    let d = tempfile::tempdir().unwrap();
-    let mut deep = d.path().to_path_buf();
-    // 12 components of 30 characters each clears 260 comfortably. Built with the
-    // TRAIT's create_dir, not std::fs, because the trait method is what converts.
-    let fs = StdFileSystem;
-    for _ in 0..12 {
-        deep.push("a".repeat(30));
-        fs.create_dir(&deep).expect("each level must be creatable past MAX_PATH");
-    }
-    assert!(
-        deep.as_os_str().len() > 260,
-        "the probe must actually exceed MAX_PATH, got {}",
-        deep.as_os_str().len()
-    );
-    assert!(std::fs::metadata(&deep).unwrap().is_dir());
-}
-```
-
-**If this test PASSES before the helper is wired in**, this machine has Windows long-path support
-enabled system-wide (`LongPathsEnabled` in the registry) and the test cannot distinguish the converted
-from the unconverted state. Say so, rely on Step 1's five unit tests as this task's pin instead, and do
-NOT delete the test — it still runs meaningfully in CI and on a machine without that setting.
-
-- [ ] **Step 3: Write the regression test for the unresolved final component**
-
-Add to `crates/flux-platform/tests/std_fs.rs`:
-
-```rust
-#[cfg(windows)]
-#[test]
-fn extended_length_conversion_leaves_the_final_component_unresolved() {
-    // The whole point. `canonicalize` on the full path would resolve the link and
-    // the adapter would then stat its TARGET, silently disabling every check that
-    // depends on a link being reported as a link.
-    let d = tempfile::tempdir().unwrap();
-    let target = d.path().join("target");
-    std::fs::write(&target, b"x").unwrap();
-    let link = d.path().join("link");
-    if std::os::windows::fs::symlink_file(&target, &link).is_err() {
-        eprintln!("SKIPPED: creating a symlink needs Developer Mode or elevation");
-        return;
-    }
-
-    let fs = StdFileSystem;
-    let m = fs.metadata(&link).expect("the link must be stattable");
-    assert_eq!(m.file_type, FileType::Symlink, "the link must be reported as a link");
-}
-
-
-**These tests need `FileType`, which the file does not currently import.** Line 1 of
-`crates/flux-platform/tests/std_fs.rs` is exactly:
-
-```rust
-use flux_fs::{FileIdentity, FileSystem};
-```
-
-Change it to:
-
-```rust
-use flux_fs::{FileIdentity, FileSystem, FileType};
-```
-
-`rustfmt.toml` sets `reorder_imports = true`, so keep the list alphabetical or `cargo fmt --check` will fail.
-
-- [ ] **Step 4: Run them to verify they fail**
-
-Run: `cargo nextest run -p flux-platform extended_length`
-
-Expected: FAIL TO COMPILE, `error[E0425]: cannot find function `extended_length` in this scope`. The five
-unit tests name a function that does not exist yet; that is the correct failure.
-
-Then run: `cargo nextest run -p flux-platform create_dir_works_past`
-
-Expected: FAIL with an OS error about the path being too long — unless this machine has
-`LongPathsEnabled`, in which case see the note under Step 2.
-
-- [ ] **Step 5: Write the helper**
-
-Add to `crates/flux-platform/src/std_fs.rs`, immediately after the `#[cfg(windows)] fn destination_is_write_protected` block (which ends at `:147`):
-
-```rust
-/// Convert a path to its Windows extended-length (`\\?\`) form.
-///
-/// §105 is normative: "Flux uses extended-length paths (`\\?\`) for every filesystem
-/// call on Windows, so the legacy 260-character path limit never applies." Every call
-/// means every call, not every CLI call, so this belongs to the adapter rather than to
-/// any one caller.
-///
-/// **Canonicalize the PARENT, never the whole path.** `canonicalize` resolves symlinks,
-/// so routing `metadata` through it would report a link's TARGET as a regular file and
-/// silently disable every check in this project that depends on a link being reported
-/// as a link. Appending the final component verbatim keeps `symlink_metadata`
-/// semantics exactly as they were.
-///
-/// **And never resolve `.` or `..` textually.** If `link` points at `C:\tmp`, then
-/// `link\..\b` physically names `C:\b` while popping `link` lexically yields `.\b` --
-/// and a `\\?\` path SUPPRESSES the kernel's parsing, so the wrong answer would be
-/// taken literally instead of corrected.
-///
-/// Three preconditions make the rule total:
-///
-/// 1. absolute first, because `Path::new("foo").parent()` is `Some("")` and
-///    canonicalizing the empty string fails;
-/// 2. a path with no parent, or whose final component is `.` or `..`, is canonicalized
-///    WHOLE -- neither names an object whose link-ness matters, and a trailing `..`
-///    appended verbatim would be asked of the filesystem literally;
-/// 3. an already-prefixed path is returned unchanged, so this is idempotent and safe
-///    to apply at every call site without tracking whether it has run.
-///
-/// Falls back to the path as given when the parent cannot be resolved. The call was
-/// going to fail anyway, and failing in the caller with its own error is better than
-/// failing here with a different one.
-#[cfg(windows)]
-fn extended_length(path: &Path) -> std::path::PathBuf {
-    use std::path::Component;
-
-    // (3) Idempotent. `Prefix` covers both `\\?\` (Verbatim*) and the plain forms; only
-    // the verbatim ones are already extended-length.
-    if matches!(
-        path.components().next(),
-        Some(Component::Prefix(p))
-            if matches!(
-                p.kind(),
-                std::path::Prefix::VerbatimDisk(_)
-                    | std::path::Prefix::VerbatimUNC(_, _)
-                    | std::path::Prefix::Verbatim(_)
-            )
-    ) {
-        return path.to_path_buf();
-    }
-
-    // (1) Absolute first, textually -- no link is resolved by joining.
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        match std::env::current_dir() {
-            Ok(cwd) => cwd.join(path),
-            Err(_) => return path.to_path_buf(),
-        }
-    };
-
-    // (2) Nothing to protect: canonicalize whole.
-    let final_is_name = matches!(absolute.components().next_back(), Some(Component::Normal(_)));
-    if !final_is_name {
-        return std::fs::canonicalize(&absolute).unwrap_or(absolute);
-    }
-
-    let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) else {
-        return std::fs::canonicalize(&absolute).unwrap_or(absolute);
-    };
-
-    match std::fs::canonicalize(parent) {
-        Ok(p) => p.join(name),
-        Err(_) => absolute,
-    }
-}
-```
-
-`std::fs::canonicalize` on Windows returns a `\\?\`-prefixed path, which is why no manual prefixing is needed — the prefix comes from the canonicalization of the parent and the verbatim final component inherits it.
-
-- [ ] **Step 6: Add the shim and convert ONE call site**
-
-The helper still has no caller in the LIBRARY build, which is what `dead_code` measures. Add the shim,
-then convert `create_dir` — the call site the Step 2 test exercises.
-
-```rust
-/// The path as the OS should see it. A no-op on every platform but Windows, so call
-/// sites stay single-form instead of sprouting a `#[cfg]` each.
-#[cfg(windows)]
-fn os_path(path: &Path) -> std::borrow::Cow<'_, Path> {
-    std::borrow::Cow::Owned(extended_length(path))
-}
-
-/// The path as the OS should see it. See the Windows twin: only Windows needs the
-/// extended-length form, so everywhere else this borrows and costs nothing.
-#[cfg(not(windows))]
-fn os_path(path: &Path) -> std::borrow::Cow<'_, Path> {
-    std::borrow::Cow::Borrowed(path)
-}
-```
-
-A `Cow` rather than two cfg-gated call sites per method: the Unix arm borrows and allocates nothing, the
-Windows arm owns, and each method body stays one line longer instead of doubling.
-
-Then convert `create_dir` — locate it by NAME, it was at `:306-308` in the base commit:
-
-```rust
-    fn create_dir(&self, path: &Path) -> Result<()> {
-        std::fs::create_dir(os_path(path).as_ref()).map_err(FsError::from_io)
-    }
-```
-
-**Convert nothing else in this task.** The remaining seven call sites are Task 4, which is a mechanical
-sweep; this one exists to give the helper a library caller and to turn the Step 2 test green.
-
-- [ ] **Step 7: Run the tests**
-
-Run: `cargo nextest run -p flux-platform extended_length`
-
-Expected: all five unit tests PASS, plus the integration symlink test (or it prints `SKIPPED` without
-Developer Mode).
-
-**The symlink test passes before this task as well as after**, because `metadata` already opens with
-`FILE_FLAG_OPEN_REPARSE_POINT`. That is deliberate: it is a REGRESSION pin on a property the helper must
-not break, not a test of the helper. The five unit tests are what actually exercise the helper, which is
-why they exist.
-
-Then run: `cargo nextest run -p flux-platform create_dir_works_past`
-
-Expected: PASS. It failed at Step 4.
-
-- [ ] **Step 8: Confirm the helper compiles away on non-Windows**
-
-Run: `wsl -e bash -lc 'cd /mnt/e/Rust/flux-walk2 && cargo clippy -p flux-platform --all-targets -- -D warnings'`
-
-Expected: clean. The helper is `#[cfg(windows)]` and so is every test above it, so Linux sees none of it. A `dead_code` warning here would mean the cfg is wrong.
-
-- [ ] **Step 9: Run the FULL gate**
-
-Run: `just check`
-
-Expected: all four stages pass. **This step is not optional and an earlier draft of this plan omitted
-it.** It is what proves the `dead_code` chain is actually closed: `extended_length` is called by
-`os_path`, which is called by `create_dir`, which is in the library build. Had this task shipped the
-helper with only unit-test callers — as an earlier draft did — the clippy stage would fail here, because
-`--all-targets` builds the lib without `cfg(test)` first.
-
-- [ ] **Step 10: Commit**
-
-```bash
-git add crates/flux-platform/src/std_fs.rs crates/flux-platform/tests/std_fs.rs
-git commit -m "$(cat <<'EOF'
-feat(flux-platform): add the Windows extended-length path conversion
-
-Section 105 is normative -- Flux uses \\?\ paths for EVERY filesystem call on
-Windows, so the legacy 260-character limit never applies. Every call means
-every call rather than every CLI call, which is why this is an adapter property
-and not a caller's.
-
-The conversion canonicalizes the PARENT and appends the final component
-verbatim. Canonicalizing the whole path is the obvious implementation and would
-break this project at its foundation: it resolves symlinks, so metadata routed
-through it reports a link's target instead of the link, silently disabling the
-identity gate, the symlinked-anchor refusal and the directory-swap capture at
-once. Resolving . and .. textually is the other obvious implementation and is
-equally wrong, because a \\?\ path suppresses the kernel's own parsing and the
-wrong answer is then taken literally rather than corrected.
-
-Three preconditions make the rule total: absolute first, since a
-single-component relative path has parent "" and canonicalizing that fails;
-whole-path canonicalization when there is no parent or the final component is
-. or .., neither of which names an object whose link-ness matters; and
-idempotence on an already-prefixed path, so it is safe to apply at every call
-site without tracking whether it has run.
-
-It ships with the os_path shim and ONE converted call site, create_dir, which is what the long-path test
-exercises. That is not an arbitrary boundary: a private function with no LIBRARY caller is dead_code
-under the gate's -D warnings, and unit tests do not clear it, because --all-targets builds the lib
-without cfg(test) before it builds the test targets. An earlier draft of this plan claimed unit tests
-were enough and would have failed the gate here. The remaining seven call sites are the next commit.
-
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-EOF
-)"
-```
-
----
-
-### Task 4: Route every Windows call through the helper
-
-**Files:**
-- Modify: `crates/flux-platform/src/std_fs.rs` — the `impl FileSystem for StdFileSystem` block at `:149-309` and the two `#[cfg(windows)]` free functions
-
-Mechanical but wide. Every method that takes a `&Path` and reaches the filesystem must convert first, on Windows only.
-
-- [ ] **Step 1: Write the failing test**
-
-Add to `crates/flux-platform/tests/std_fs.rs`:
-
-```rust
-#[cfg(windows)]
-#[test]
-fn a_destination_path_longer_than_260_characters_works() {
-    // Item 103. A tree copy is what GENERATES long destination paths, so this is
-    // the property the whole \\?\ conversion exists for.
-    let d = tempfile::tempdir().unwrap();
-    let mut deep = d.path().to_path_buf();
-    // 12 components of 30 characters each clears 260 comfortably.
-    for _ in 0..12 {
-        deep.push("a".repeat(30));
-        std::fs::create_dir(&deep).expect("each level must be creatable");
-    }
-    assert!(
-        deep.as_os_str().len() > 260,
-        "the probe must actually exceed MAX_PATH, got {}",
-        deep.as_os_str().len()
-    );
-
-    let target = deep.join("file.txt");
-    let fs = StdFileSystem;
-    let mut f = fs.create_new(&target).expect("create_new must work past MAX_PATH");
-    f.write_all(b"deep").unwrap();
-    drop(f);
-
-    let m = fs.metadata(&target).expect("metadata must work past MAX_PATH");
-    assert_eq!(m.len, 4);
-    assert_eq!(m.file_type, FileType::File);
-}
-```
-```
-
-- [ ] **Step 2: Run it to verify it fails**
-
-Run: `cargo nextest run -p flux-platform a_destination_path_longer_than_260`
-
-Expected: FAIL. `create_new` or `metadata` errors with an OS error about the path being too long,
-because the helper exists but no call site uses it yet.
-
-**If it unexpectedly PASSES**, this machine has Windows long-path support enabled system-wide
-(`LongPathsEnabled` in the registry), and the test cannot distinguish the converted from the unconverted
-state. Say so, and rely on Task 3's five unit tests as the pin for this task instead -- do not delete the
-test, since it still runs meaningfully on a machine without that setting and in CI.
-
-- [ ] **Step 3: Enumerate the call sites**
-
-The complete list of `StdFileSystem` methods taking a path, verified at `:149-309`. There are no others:
-
-| Method | Lines | Paths to convert |
-|---|---|---|
-| `open_read` | 153-155 | `path` |
-| `create_new` | 157-165 | `path` |
-| `metadata` (windows arm) | 184-213 | `path` |
-| `rename_replace` | 237-262 | `from`, `to` |
-| `rename_no_replace` | 264-276 | `from`, `to` |
-| `remove_file` | 278-280 | `path` |
-| `read_dir` | 282-304 | `path` |
-| `create_dir` | 306-308 | `path` |
-
-Plus the `#[cfg(windows)]` free function `destination_is_write_protected` at `:108-147`, which opens `to` directly.
-
-The `#[cfg(unix)]` `metadata` at `:167-182` is NOT converted — `\\?\` is a Windows concept.
-
-- [ ] **Step 4: (the shim already exists)**
-
-`os_path` was added in Task 3 along with the first converted call site, `create_dir`. Nothing to add
-here — this step is kept as a marker so the step numbering below matches what an earlier draft had, and
-so an implementer who reads Task 4 alone does not go looking for where the shim comes from.
-
-Add immediately after the `extended_length` function from Task 3:
-
-```rust
-/// The path as the OS should see it. A no-op on every platform but Windows, so call
-/// sites stay single-form instead of sprouting a `#[cfg]` each.
-#[cfg(windows)]
-fn os_path(path: &Path) -> std::borrow::Cow<'_, Path> {
-    std::borrow::Cow::Owned(extended_length(path))
-}
-
-/// The path as the OS should see it. See the Windows twin: only Windows needs the
-/// extended-length form, so everywhere else this borrows and costs nothing.
-#[cfg(not(windows))]
-fn os_path(path: &Path) -> std::borrow::Cow<'_, Path> {
-    std::borrow::Cow::Borrowed(path)
-}
-```
-
-A `Cow` rather than two cfg-gated call sites per method: the Unix arm borrows and allocates nothing, the Windows arm owns, and each method body stays one line longer instead of doubling.
-
-- [ ] **Step 5: Convert each call site**
-
-**Every method is given in full below — do not extrapolate a shape from a sample.** An earlier draft
-showed two and said "apply the same shape to every row", which is the elided enumeration this project's
-dispatch rules forbid: the two sites that need care do not have the same shape as the simple ones, and a
-reader extrapolating would get them wrong.
-
-`open_read` (`:153-155`):
-
-```rust
-    fn open_read(&self, path: &Path) -> Result<Self::Reader> {
-        File::open(os_path(path).as_ref()).map(StdReader).map_err(FsError::from_io)
-    }
-```
-
-`create_new` (`:157-165`):
-
-```rust
-    fn create_new(&self, path: &Path) -> Result<Self::Writer> {
-        OpenOptions::new()
-            .write(true)
-            .read(true)
-            .create_new(true)
-            .open(os_path(path).as_ref())
-            .map(StdFile)
-            .map_err(FsError::from_io)
-    }
-```
-
-`metadata`, the `#[cfg(windows)]` arm ONLY (`:184-213`) — change just the `.open(path)` line near the
-end of the builder chain to:
-
-```rust
-            .open(os_path(path).as_ref())
-```
-
-Leave the `#[cfg(unix)]` arm at `:167-182` alone: `\\?\` is a Windows concept and `os_path` there is a
-borrow, so converting would be noise that implies a portability the line does not have.
-
-`rename_replace` (`:237-262`) — the guard AND both endpoints:
-
-```rust
-    fn rename_replace(&self, from: &Path, to: &Path) -> Result<()> {
-        // ... the existing comment block is unchanged ...
-        let (from, to) = (os_path(from), os_path(to));
-        if destination_is_write_protected(to.as_ref()) {
-            return Err(FsError::new(
-                flux_fs::Code::PermissionDenied,
-                std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "destination is read-only",
-                ),
-            ));
-        }
-        std::fs::rename(from.as_ref(), to.as_ref()).map_err(FsError::from_io)
-    }
-```
-
-**`rename_no_replace` is DELIBERATELY SKIPPED in this task.** Task 5 replaces that method entirely and
-its Windows arm does its own conversion, so converting it here is work Task 5 deletes — and worse, it
-lengthens the method and invalidates the line range Task 5 cites to find it. An earlier draft did
-convert it here, on the reasoning that leaving one method unconverted looks like a deliberate exception;
-that reasoning loses to the concrete cost, and the one-commit window in an unmerged branch is not a
-readership worth paying for. Task 5's commit closes the gap.
-
-`remove_file` (`:278-280`):
-
-```rust
-    fn remove_file(&self, path: &Path) -> Result<()> {
-        std::fs::remove_file(os_path(path).as_ref()).map_err(FsError::from_io)
-    }
-```
-
-`read_dir` (`:282-304`) — convert ONLY the argument to `std::fs::read_dir`, on the first line of the
-body. Every other line of this method is unchanged:
-
-```rust
-        for entry in std::fs::read_dir(os_path(path).as_ref()).map_err(FsError::from_io)? {
-```
-
-`create_dir` (`:306-308`):
-
-```rust
-    fn create_dir(&self, path: &Path) -> Result<()> {
-        std::fs::create_dir(os_path(path).as_ref()).map_err(FsError::from_io)
-    }
-```
-
-**Two rules:**
-
-- **`read_dir` converts the directory it lists, and must NOT convert the entry names it returns.** The names are bare components, and the walk panics on a name that is not one bare component (`crates/flux-core/src/walk.rs:222`). Returning a prefixed absolute path as an entry name would trip that panic.
-- **`rename_replace` converts both `from` and `to`, and must also convert the path it hands `destination_is_write_protected`** — otherwise the guard consults an unprefixed path while the rename uses a prefixed one, and a long destination would be checked and renamed inconsistently.
-
-- [ ] **Step 6: Run the long-path test**
-
-Run: `cargo nextest run -p flux-platform a_destination_path_longer_than_260`
-
-Expected: PASS. It failed at Step 2 of this task, before the call sites were converted.
-
-- [ ] **Step 7: Run the whole platform suite**
-
-Run: `cargo nextest run -p flux-platform`
-
-Expected: every previously-passing test still passes. This is the step that catches an over-eager conversion — if `read_dir` entry names or the `metadata` symlink typing broke, it shows here.
-
-- [ ] **Step 8: Cross-check under WSL**
-
-Run: `wsl -e bash -lc 'cd /mnt/e/Rust/flux-walk2 && cargo nextest run --workspace --no-tests=pass'`
-
-Expected: PASS. `os_path` borrows on Linux, so behaviour is unchanged there; this proves the `cfg(not(windows))` arm compiles and that no call site accidentally assumes an owned value.
-
-- [ ] **Step 7: Run the gate**
-
-Run: `just check`
-
-Expected: all four stages pass.
-
-- [ ] **Step 8: Commit**
-
-```bash
-git add crates/flux-platform/src/std_fs.rs
-git commit -m "$(cat <<'EOF'
-feat(flux-platform): route every Windows filesystem call through \\?\
-
-Section 105 says every call, so every method of StdFileSystem that takes a path
-now converts it first: open_read, create_new, the Windows metadata arm,
-rename_replace, rename_no_replace, remove_file, read_dir and create_dir, plus
-the write-protection guard that opens the destination directly.
-
-The conversion goes through a Cow-returning shim that is a borrow on every
-platform but Windows, so call sites stay one line instead of sprouting a cfg
-each and the Unix arm allocates nothing.
-
-Two call sites needed care. read_dir converts the directory it lists but NOT
-the entry names it returns, which are bare components -- the walk panics on a
-name that is not one bare component, so returning a prefixed absolute path
-there would trip it. And rename_replace converts the path it hands the
-write-protection guard as well as both rename endpoints, so the guard cannot
-consult an unprefixed path while the rename uses a prefixed one.
-
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-EOF
-)"
-```
-
----
-
-### Task 5: The atomic primitive
+### Task 3: The atomic primitive
 
 **Files:**
 - Modify: `crates/flux-platform/src/std_fs.rs:264-276` (split into two cfg arms)
 
 This is the cut's reason to exist. `FLUX_FULL_UPDATED_SPEC_V16.md:10873-10876` forbids the current body by name: *"check-then-rename is never used as a substitute."*
 
-**Depends on Task 3.** The Windows arm below calls `os_path`, which Task 3 adds. If Task 3 has not run,
-this task fails to compile with `cannot find function os_path in this scope` — which is a clear enough
-error, but know the cause rather than debugging it.
+**No dependency on a path-conversion helper, and an earlier draft of this plan had one.** The Windows
+arm below passes its paths to `MoveFileExW` directly. See "Windows long paths are already handled" in
+the ground-truth section for why no `\?\` conversion is needed here or anywhere else.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1217,12 +636,11 @@ than editing around it.
         // No MOVEFILE_REPLACE_EXISTING is the whole point: without that flag
         // MoveFileExW fails rather than replacing, which is the guarantee this method
         // has always promised and until now only approximated.
-        let (from, to) = (os_path(from), os_path(to));
         let wide = |p: &Path| {
             use std::os::windows::ffi::OsStrExt;
             p.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>()
         };
-        let (wfrom, wto) = (wide(from.as_ref()), wide(to.as_ref()));
+        let (wfrom, wto) = (wide(from), wide(to));
 
         // SAFETY: both buffers are NUL-terminated UTF-16 built immediately above and
         // live for the duration of the call.
@@ -1234,7 +652,8 @@ than editing around it.
     }
 ```
 
-**Do not convert the paths in the Unix arm** — `os_path` is a borrow there and `\\?\` is meaningless on Unix, but passing it would still be harmless noise; leaving it out keeps the arm honest about what it does.
+Both arms pass their paths straight through, with no conversion of any kind. `\\?\` is meaningless on
+Unix, and on Windows `std` already applies it — see "Windows long paths are already handled" above.
 
 - [ ] **Step 5: Add the unsupported-platform guard**
 
@@ -1334,7 +753,7 @@ EOF
 
 ---
 
-### Task 6: Close the `rename_no_replace` coverage gap
+### Task 4: Close the `rename_no_replace` coverage gap
 
 **Files:**
 - Modify: `crates/flux-platform/tests/std_fs.rs`
@@ -1383,7 +802,7 @@ Expected: PASS, 5 tests total for `rename_no_replace` (2 pre-existing, 1 from Ta
 
 - [ ] **Step 3: Confirm the new tests behave correctly under the Task 5 mutant**
 
-Re-apply the same `MOVEFILE_REPLACE_EXISTING` mutant from Task 5 Step 8.
+Re-apply the same `MOVEFILE_REPLACE_EXISTING` mutant from Task 3 Step 8.
 
 Run: `cargo nextest run -p flux-platform rename_no_replace`
 
@@ -1426,7 +845,7 @@ EOF
 
 ---
 
-### Task 7: Final verification
+### Task 5: Final verification
 
 **Files:** none modified.
 
@@ -1469,10 +888,12 @@ Anything else is out of scope and should be reported, not committed.
 - [ ] **Step 4: Confirm the forbidden shapes are absent**
 
 ```bash
-rg -n "supports_no_replace_publish|noreplace-probe" crates/
+rg -n "supports_no_replace_publish|noreplace-probe|extended_length|os_path" crates/
 ```
 
-Expected: no matches. Both were deliberately excluded; a match means the plan was over-implemented.
+Expected: no matches. All four were deliberately excluded — the first two because the probe defers with
+the workspace, the last two because `std` already applies extended-length paths. A match means the plan
+was over-implemented.
 
 - [ ] **Step 5: Delete the base tag**
 
@@ -1494,7 +915,9 @@ Pushing and opening a pull request are outward actions. **Do not push. Do not op
 
 **Placeholder scan.** No TBDs and no conditionals. Two steps were conditional in an earlier draft and both have since been resolved by verification rather than left to the implementer: `FsError` exposes PUBLIC FIELDS (`err.code`, `err.source.kind()`) and not accessor methods, verified at `crates/flux-fs/src/error.rs:44-56` and against the idiom at `crates/flux-platform/tests/std_fs.rs:50`; and `MoveFileExW` needs no new feature, verified in the vendored `windows-sys-0.61.2` source. Each still tells the implementer how to re-check, because a plan that says "verified" without saying against what is asking to be believed rather than read.
 
-**Type consistency.** `os_path` is introduced in Task 4 Step 2 and used in Task 4 Step 3 and Task 5 Step 4 under that name. `extended_length` is introduced in Task 3 and called only by `os_path`. `set_no_replace_support` has the same signature in Task 2's test, method and commit message. `no_replace_support` is `Option<bool>` throughout.
+**Type consistency.** `set_no_replace_support` has the same signature in Task 2's test, method and
+commit message. `no_replace_support` is `Option<bool>` throughout. No path-conversion helper is
+referenced anywhere, the two tasks that defined one having been deleted.
 
 **Known gaps, stated rather than hidden.**
 
