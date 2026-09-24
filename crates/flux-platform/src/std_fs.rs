@@ -406,6 +406,7 @@ impl FileSystem for StdFileSystem {
         // name as it always did. That is a documented limit of the degraded path, not
         // a reason to drop the guard: removing it would restore the `from == to` hole
         // on every identity-less filesystem, which is strictly worse.
+        //
         // `access_mode(0)` is load-bearing HERE for a second reason beyond the one
         // `metadata` gives, and `rename_no_replace_vetoes_a_same_object_target_held_
         // _open_exclusively` goes red if it is widened. Asking for no access means an
@@ -422,9 +423,12 @@ impl FileSystem for StdFileSystem {
         };
 
         // BOTH halves live under this probe of `to`, and the nesting is load-bearing
-        // rather than tidiness. If `to` does not open, the name is free -- and when
-        // `from == to` that also means `from` does not exist, so the KERNEL must be the
-        // one to answer, with NotFound. An earlier draft ran the lexical comparison
+        // rather than tidiness. A `to` that does not open is either ABSENT or
+        // UNREACHABLE -- NOT necessarily free, as the deny-ACE case above shows -- and
+        // in both cases the KERNEL is the right one to answer rather than this method:
+        // absent gives NotFound, unreachable gives the access error, and when
+        // `from == to` an absent `to` means `from` is absent too, so NotFound is the
+        // honest reply. An earlier draft ran the lexical comparison
         // first and unconditionally, which made `rename_no_replace(absent, absent)`
         // answer AlreadyExists on Windows while Linux answered NotFound: MEASURED, and
         // an inversion of exactly the error priority that
