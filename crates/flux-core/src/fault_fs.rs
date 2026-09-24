@@ -52,17 +52,6 @@ struct Inner {
     next_object: u128,
 }
 
-/// Move a name's content AND its metadata. Moving only the bytes meant the times and
-/// permissions applied to the temporary vanished at publication, so no test could
-/// assert that the §44.1 ordering achieved anything.
-/// Give the object now at `path` a fresh identity, unless that path already holds
-/// one - writing over an existing path is a truncate, not a new object.
-///
-/// EVERY creation path must call this: `write_file`, `create_new` and `add_special`,
-/// which all insert into `files`. `metadata` panics rather than inventing an identity
-/// for a path that skipped it, because the plausible alternative - reporting
-/// `Unavailable` - is a state the walker handles GRACEFULLY, so an unhooked path
-/// would silently degrade while its test stayed green.
 /// `NotFound` when the rename's source does not exist, as `std::fs::rename` gives.
 ///
 /// Without it `move_object`'s `unwrap_or_default()` CONJURED the destination: renaming
@@ -76,6 +65,14 @@ fn missing_source(g: &Inner, from: &str) -> Result<()> {
     Err(FsError::new(Code::IoError, std::io::Error::from(std::io::ErrorKind::NotFound)))
 }
 
+/// Give the object now at `path` a fresh identity, unless that path already holds
+/// one - writing over an existing path is a truncate, not a new object.
+///
+/// EVERY creation path must call this: `write_file`, `create_new` and `add_special`,
+/// which all insert into `files`. `metadata` panics rather than inventing an identity
+/// for a path that skipped it, because the plausible alternative - reporting
+/// `Unavailable` - is a state the walker handles GRACEFULLY, so an unhooked path
+/// would silently degrade while its test stayed green.
 fn mint_identity(g: &mut Inner, path: &str) {
     if g.identities.contains_key(path) {
         return;
@@ -86,6 +83,9 @@ fn mint_identity(g: &mut Inner, path: &str) {
     g.identities.insert(path.to_string(), flux_fs::FileIdentity::Strong(id));
 }
 
+/// Move a name's content AND its metadata. Moving only the bytes meant the times and
+/// permissions applied to the temporary vanished at publication, so no test could
+/// assert that the §44.1 ordering achieved anything.
 fn move_object(g: &mut Inner, from: &str, to: &str) {
     let bytes = g.files.remove(from).unwrap_or_default();
     g.files.insert(to.to_string(), bytes);
@@ -198,8 +198,6 @@ impl FaultFs {
         self.inner.lock().unwrap().files.contains_key(path)
     }
 
-    /// Make the next call to `name` fail with `code`.
-    /// Fail the next call to `name`, once.
     /// Inject a fault whose source carries a CHOSEN `ErrorKind`.
     ///
     /// `fail` alone always produced `ErrorKind::Other`, so any code branching on the
@@ -220,6 +218,7 @@ impl FaultFs {
         g.nth_faults.insert(name.to_string(), (nth, code, kind));
     }
 
+    /// Make the next call to `name` fail with `code`, once.
     pub fn fail(&self, name: &str, code: Code) {
         self.inner.lock().unwrap().faults.insert(name.to_string(), code);
     }
@@ -261,15 +260,15 @@ impl FaultFs {
         self.inner.lock().unwrap().times.get(path).copied().flatten()
     }
 
-    /// Make `metadata` report `path` as something other than a regular file -- a
-    /// directory, a symlink, a device. Without this the fake reported `is_file: true`
-    /// for everything and SPECIAL_FILE_UNSUPPORTED had no test that produced it.
     /// Give a path an identity. Two paths given the SAME `ObjectId` is how a test
     /// reproduces a directory cycle with no mount and no privilege.
     pub fn set_identity(&self, path: &str, identity: flux_fs::FileIdentity) {
         self.inner.lock().unwrap().identities.insert(path.to_string(), identity);
     }
 
+    /// Make `metadata` report `path` as something other than a regular file -- a
+    /// directory, a symlink, a device. Without this the fake reported `is_file: true`
+    /// for everything and SPECIAL_FILE_UNSUPPORTED had no test that produced it.
     pub fn add_special(&self, path: &str) {
         let mut g = self.inner.lock().unwrap();
         g.files.insert(path.to_string(), Vec::new());
