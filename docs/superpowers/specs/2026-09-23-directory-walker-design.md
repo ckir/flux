@@ -559,12 +559,34 @@ have been refused once into thousands of individual refusals. Nothing is lost, b
 holds; what is lost is the clean early abort §129 asks for, and that gate is the only thing standing
 between this case and writing into the source.
 
-The rule: **if the destination anchor's `file_type` is `Symlink`, the pre-flight's identity comparison
-did not happen.** It is not a pass. It routes into the same channel a weak identity does — degrade with
-a warning by default, refuse under `Safety::Strict` — because the honest description of both is "the
-comparison could not be made". That needs no new trait method and no path canonicalisation, and it puts
-the symlinked-anchor case behind the flag that exists for exactly the aliases the lexical floor cannot
-see.
+**§128 settles this, and it rules out the answer this section first gave.** §128 "Destination Safety"
+(`FLUX_FULL_UPDATED_SPEC_V16.md:6095`) sits immediately before the §129 this design already cites, and
+requires containment be decided:
+
+> using both `canonical/normalized path analysis` and filesystem identity checks where available.
+>
+> Mount points, bind mounts, junctions, and symlink traversal must not invalidate the containment
+> decision.
+>
+> The scanner must not be allowed to recursively discover Flux's own destination tree through an alias.
+
+Three consequences, and the design had missed all three:
+
+1. **Canonicalization is mandatory and this design does not do it at all.** The "lexical containment
+   floor" is not canonical path analysis — it compares the strings as given. §128 asks for BOTH
+   mechanisms, and identity is only the second of them.
+2. **Degrading on a symlinked anchor is not compliant.** "Symlink traversal must not invalidate the
+   containment decision" is the exact case, named. Warning and continuing invalidates it.
+3. Canonicalization actually SOLVES the case that identity could not: resolving `/backup` to `/data`
+   makes the containment test succeed lexically, with no identity comparison needed.
+
+**So the rule is: canonicalize both roots before the containment test.** A symlinked anchor then
+resolves to the source root and is refused by the floor itself, which is where §129's
+`SAFETY_REJECTED`-before-transfer belongs. The degrade-and-warn treatment is withdrawn; it was an
+answer to a question §128 had already settled the other way.
+
+The `FileSystem` trait has no `canonicalize` today, so PR 3 adds one. That is a trait widening this
+design did not previously account for, and it is not optional.
 
 **When the ANCHOR's identity is weak, the pre-flight degrades by the same rule** — no special case, and
 no stricter treatment for being the earliest check. The reasoning is worth spelling out, because "the
@@ -810,12 +832,38 @@ whether a known race is reachable:
   to leave alone. That fix is already in; it addresses a different defect and does not close the race,
   because any check followed by a separate rename has a window between them.
 
-There is an argument for `NoReplace` being the more natural tree default, since §18.1 says a target
-"planned as new" publishes that way, and every file of a copy into a fresh destination is planned as
-new. It is not adopted here, and the reason is sequencing rather than taste: forcing `NoReplace` would
-make that race **reachable for the first time**, and PR 3 would be the change that exposed it. Closing
-it properly needs an atomic primitive, and there are **three** of them, not two — which is part of why
-it is its own piece of work, recorded in `TODO.md` and deliberately out of this cut:
+**CORRECTION — the paragraph that stood here was wrong, and wrong in the way that matters most.** It
+argued `NoReplace` was merely "the more natural tree default", cited **§18.1** for "planned as new", and
+concluded that passing through was safe because nothing in this cut would select `NoReplace`.
+
+§18.1 says no such thing. It is `FLUX_FULL_UPDATED_SPEC_V16.md:1348-1367` and is *exclusively* about
+naming — `<target>.flux-partial.<operation-id>` and `<target>.flux-state.<operation-id>` — with no
+publication semantics in it at all. The authority is **§241.5 Collision Detection** at `:10799`, and it
+does not offer a preference. It requires:
+
+> A target planned as new (absent at planning) is published with a primitive that refuses to replace an
+> existing entry: `renameat2(RENAME_NOREPLACE)`, `renamex_np(RENAME_EXCL)`, `MoveFileEx` without
+> `MOVEFILE_REPLACE_EXISTING`, or `link()` to the target followed by `unlink()` of the temporary name.
+> If the name exists by then, the entry appeared after planning ... and Flux reports
+> `DESTINATION_NAMESPACE_COLLISION` without replacing it.
+
+The single-file pipeline carries the same requirement inline at `:1990` — *"ATOMIC RENAME (no-replace
+when the target was planned as new; Section 241.5)"*.
+
+**So `NoReplace` is not a taste call for a tree copy — it is mandatory.** Every file of a copy into a
+fresh destination is absent at planning. Three things follow that the previous text got backwards:
+
+1. `copy_tree` must publish new targets with a refusing primitive. Pass-through to whatever the caller
+   set, which in practice is `Replace`, is not compliant.
+2. A name that exists at publish time is **not** an ordinary overwrite. It is
+   `DESTINATION_NAMESPACE_COLLISION`, a code this design did not previously mention anywhere.
+3. §241.5 names the platform primitives itself, and its list independently confirms the platform
+   correction made elsewhere in this document: `renameat2(RENAME_NOREPLACE)` and
+   `renamex_np(RENAME_EXCL)` are listed as *different* primitives, so treating the Linux flag as
+   covering "Unix" was wrong against the normative text as well as against macOS.
+
+What remains genuinely open is the IMPLEMENTATION, not the semantics — see the fork recorded below.
+Closing the RACE properly needs an atomic primitive, and §241.5 names **three** of them, not two:
 
 - **Linux:** `renameat2` with `RENAME_NOREPLACE`, reachable as `rustix::fs::renameat_with` with
   `RenameFlags::NOREPLACE`.
@@ -827,9 +875,22 @@ it is its own piece of work, recorded in `TODO.md` and deliberately out of this 
   so whoever implements it confirms the primitive before relying on this line.
 - **Windows:** `FileRenameInfoEx` without `REPLACE_IF_EXISTS`, which `std` does not expose.
 
-Passing through therefore keeps the race dormant exactly as it is today: no caller in this cut selects
-`NoReplace`, so PR 3 neither fixes nor exposes it. When that primitive lands, a tree copy can adopt
-`NoReplace` without a second decision.
+**The open fork, for the owner.** The SEMANTICS are settled by §241.5 and not in question. What is open
+is how PR 3 supplies them, because the trait method that expresses them today is not atomic:
+`rename_no_replace` tests `symlink_metadata(to).is_ok()` and then renames
+(`crates/flux-platform/src/std_fs.rs:264-276`), so two processes can both see a free name.
+
+- **(a) Use `Publish::NoReplace` now, on the existing check-then-act implementation.** Compliant
+  semantics immediately, plus `DESTINATION_NAMESPACE_COLLISION` reporting, with a known and documented
+  race window. Keeps PR 3 at the size it was scoped. The window is narrow and its outcome is a wrongly
+  replaced entry rather than a corrupted one.
+- **(b) Use `NoReplace` and implement the atomic primitive in this cut.** Fully compliant with no
+  window, but it pulls three platform implementations into a PR whose subject is tree safety, and
+  `FileRenameInfoEx` in particular is not exposed by `std`.
+
+Passing `Replace` through is no longer among the options. The previous text reasoned that "no caller in
+this cut selects `NoReplace`, so PR 3 neither fixes nor exposes it" — true as a statement about the
+code, and irrelevant, because §241.5 makes selecting it mandatory rather than optional.
 
 **One failure, one representation.** Each `TreeFailureCause` variant is defined by WHERE the failure
 happened, and no failure may be expressible two ways:
@@ -1139,3 +1200,14 @@ re-derive them and a reader can see what was consciously not fixed.
 - `REJECTED: "the walk signature must be broken to pass the destination anchor."` The walk never needed
   it. `copy_tree` holds the anchor and compares on each `Dir` event; the walk owns only ancestor-set
   cycle detection, which needs the source tree alone.
+- `REJECTED: "FaultFs cannot represent a symlink, so the anchor rule is too loosely specified to unit
+  test."` Refuted by measurement: `FileType::Symlink` is a merged variant (crates/flux-fs/src/fs.rs:33),
+  `FaultFs::add_symlink` exists (crates/flux-core/src/fault_fs.rs:313), `set_type` at :222, and a test
+  already uses it at :784. The claim rested on the stale `Metadata.is_file` block that the same review
+  had just found and that is now corrected — a premise carried forward instead of re-read.
+- `DISCARDED-BELOW-FLOOR: the §109 quote is reflowed from the spec's multi-line code block.`
+  Semantically identical, stylistically altered; not a factual error.
+- `DEFERRED-TO-ANOMALIES: §241.5's second bullet requires a target planned as a REPLACEMENT to claim the
+  existing directory entry with an insert-if-absent write in the operation's state store. * n/a *
+  2026-09-24` Reachable only once persistent operation state exists, which is Phase 3 and explicitly out
+  of scope here; recorded so the omission is tracked rather than forgotten. Named by the round 4 peer.
