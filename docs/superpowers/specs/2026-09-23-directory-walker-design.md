@@ -1069,6 +1069,69 @@ no trait change, no new test surface in three implementors, and no second way fo
 failure to the sink rather than stopping at the first. The CLI exits 1 if any failure was reported,
 matching §2 item 83 and the existing `metadata_failures` behaviour.
 
+### Long destination paths on Windows
+
+Acceptance item 103 (`FLUX_FULL_UPDATED_SPEC_V16.md:13369-13371`): *"on Windows, a destination path
+longer than 260 characters succeeds through the extended-length call path; a path the destination still
+refuses as too long fails that action with `DESTINATION_ERROR`."*
+
+This binds a tree copy specifically, because a tree copy is what GENERATES long destination paths — the
+user types two roots and the walk produces every path beneath them. The design discussed `PATH_MAX` at
+length for the depth cap, but that measurement was made on Linux and answers a different question. It
+said nothing about Windows `MAX_PATH`, which is 260.
+
+Two halves, and only one of them is already handled:
+
+- **The extended-length call path.** `std::fs::canonicalize` on Windows returns a `\\?\`-prefixed path,
+  which IS that call path — so a CLI invocation, which canonicalizes both roots before calling the
+  engine, already satisfies this. That is a second reason canonicalization belongs where it was put,
+  and it was not the reason it was put there. A library caller passing a raw path does not get it, and
+  that is stated rather than papered over: the engine does not rewrite the paths it is given.
+- **The refusal.** A path the destination still rejects as too long must fail THAT ACTION with
+  `DESTINATION_ERROR` — one entry's failure, not the operation's. The design had never named that code.
+  It maps as `TreeFailureCause::Copy` or `CreateDir` carrying it, so the walk continues, which is what
+  "fails that action" requires.
+
+### Mount boundaries are not crossed by default
+
+**§42 "Mount Boundaries" (`FLUX_FULL_UPDATED_SPEC_V16.md:2495-2505`) is normative and this design had
+never cited it:**
+
+> Default: `do not cross filesystem boundaries`
+>
+> Crossing is off unless `--cross-filesystems` is given (Section 5).
+>
+> Filesystem identity must be used to evaluate boundaries.
+
+Acceptance item 101 (`:13361-13363`) repeats it as a default: *"with no options given, `--atomic`
+behaves as auto, `--durability` as normal, `--resume-verify` as chunks, and filesystem boundaries are
+not crossed."*
+
+**As written, the walk violates this.** It descends into anything whose `file_type` is `Dir`, and a
+mount point inside the source is a directory. A copy of `/` would descend into `/proc`, `/sys`, every
+removable device and every network mount — which is not a corner case, it is what happens the first
+time someone copies a home directory containing a mounted volume.
+
+**The check is one comparison and the primitive is already there.** `ObjectId` carries `volume` —
+`st_dev` on Unix, `VolumeSerialNumber` on Windows — so the walk records the ROOT's volume at startup
+and, before descending into a directory, compares. A different volume means a mount boundary. §42's
+closing line asks for exactly this: *"Filesystem identity must be used to evaluate boundaries"*, which
+is the primitive cut 1 delivered and that this design had not connected to the rule requiring it.
+
+- **Default: do not descend.** The directory itself is still created at the destination — it exists in
+  the source and the namespace should match — but its contents are not traversed. This is a reported
+  outcome, not a silent skip: it goes to `on_failure` so the user learns which subtrees were left out,
+  which is the same reasoning that makes an unsupported entry a reported failure rather than an
+  omission.
+- **`--cross-filesystems` turns it off**, per §42 and §5.
+- **Where identity is not `Strong` on both sides**, the volume cannot be compared and the boundary
+  cannot be evaluated. It degrades by the rule already established — descend, warn once per
+  filesystem — because refusing to traverse anything on a FAT32 source would be worse than crossing a
+  boundary. `Safety::Strict` refuses, as everywhere else.
+
+This is a per-directory check on a value the walk already holds, so it costs nothing beyond the
+comparison.
+
 ### A destination directory swapped after Flux created it
 
 **This is a reachable way to make Flux write OUTSIDE the destination root, and the spec names it.**
@@ -1099,6 +1162,19 @@ directory on the same stack. Before publishing into a directory, it stats that d
 On a mismatch the write fails with `Code::SafetyRejected` and nothing is created; by the positional
 rule this is a per-entry failure, so it goes to `on_failure` and **the walk continues**, which is what
 item 114's closing clause requires.
+
+**The capture asserts the TYPE as well as recording the id, and that is load-bearing.** A review round
+argued this fix defeats itself: swap the directory for a symlink in the instant between `create_dir`
+and the capturing stat, and Flux would record the symlink TARGET's identity as the expected one, then
+match it forever after. That does not happen, and the reason is a property already measured in this
+design — `FileSystem::metadata` does not follow links. It is `symlink_metadata` on Unix
+(`crates/flux-platform/src/std_fs.rs:172`, whose comment says the following variant "would report the
+TARGET as a regular file") and opens with `FILE_FLAG_OPEN_REPARSE_POINT` on Windows. So a symlink
+swapped in before the capture is typed `Symlink`, carrying the LINK's identity, not the target's.
+
+The capture therefore requires `file_type == Dir`. Anything else at that moment IS the item-114 attack,
+caught one step earlier than the re-verification would have caught it, and refused the same way. Recording
+an id without checking the type is what would have made the objection correct.
 
 Identity is what makes this checkable at all — a path comparison cannot see the swap, because the path
 did not change. Where identity is not `Strong` on both sides the check degrades by the rule already
@@ -1550,3 +1626,21 @@ re-derive them and a reader can see what was consciously not fixed.
   for. Named because it is the source-side mirror of item 114 and a reader will look for it.
 - `DISCARDED-BELOW-FLOOR: the attacker deletes the staging temporary mid-stream.` Fails closed — Step 6
   or Step 7 gets `NotFound` and the copy fails without publishing, which is the desired outcome.
+- `REJECTED: "the identity capture defeats itself — swap the directory for a symlink between create_dir
+  and the capturing stat, and Flux records the TARGET's identity and matches it forever."` Refuted by
+  measurement on both arms: `FileSystem::metadata` does not follow links — `symlink_metadata` at
+  crates/flux-platform/src/std_fs.rs:172, `FILE_FLAG_OPEN_REPARSE_POINT` at :188. A symlink swapped in
+  before the capture is typed `Symlink` carrying the LINK's id. The finding did expose a real
+  underspecification, now folded: the capture ASSERTS `file_type == Dir` rather than merely recording
+  an id.
+- `REJECTED: "the design attributes the DIRECTORY_CHANGED_DURING_SCAN rule to the wrong item 83; the real item 83
+  is about case-insensitive namespace collisions."` The specification has TWO item 83s. `§2 item 83` at
+  :279-282 is the exit-1 rule this design cites and quotes verbatim, correctly. The acceptance-list
+  item 83 at :13300 is the namespace-collision one. Both exist; the citation names the section.
+- `DISCARDED-BELOW-FLOOR: a path component ABOVE the destination anchor replaced after canonicalization
+  but before a write.` Real, and already covered by the residual window stated under item 114 — the
+  check and the write remain two operations against a path the kernel re-resolves, and only
+  handle-relative traversal closes it.
+- `DISCARDED-BELOW-FLOOR: the staging temporary's name is predictable from the process id.`
+  Pre-creating it makes Step 3's `create_new` fail with `AlreadyExists` and the copy aborts without
+  publishing, which is the safe outcome; the sweep at Step 1 removes the name, following no link.
