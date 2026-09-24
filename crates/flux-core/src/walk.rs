@@ -639,4 +639,47 @@ mod tests {
             .collect();
         assert_eq!(errors, vec![("swap".to_string(), Code::DirectoryChangedDuringScan)]);
     }
+
+    /// Build an `OsString` from raw bytes, as far as the platform allows.
+    ///
+    /// The two arms are NOT equivalent, and that is stated rather than hidden. On
+    /// Unix a name IS bytes, so this is exact and the test below really does cover
+    /// non-UTF-8 ordering. On Windows a name is WTF-16 at the OS level and cannot
+    /// hold an arbitrary byte at all, so the bytes go through a lossy conversion and
+    /// the test covers NON-ASCII ordering instead. The ORDERING property is what is
+    /// under test on both; the invalidity is not.
+    #[cfg(unix)]
+    fn os_from_bytes(b: &[u8]) -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(b.to_vec())
+    }
+
+    #[cfg(windows)]
+    fn os_from_bytes(b: &[u8]) -> std::ffi::OsString {
+        std::ffi::OsString::from(String::from_utf8_lossy(b).into_owned())
+    }
+
+    #[test]
+    fn non_utf8_names_sort_by_their_encoded_bytes() {
+        // The whole reason FaultFs was rekeyed from String to PathBuf: under
+        // `display()` these two names collapsed to one key.
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/r")).unwrap();
+
+        // 0xFF is not valid UTF-8 in either direction.
+        let hi = os_from_bytes(&[b'z', 0xFF]);
+        let lo = os_from_bytes(&[b'a', 0xFF]);
+        fs.write_file(Path::new("/r").join(&lo), b"");
+        fs.write_file(Path::new("/r").join(&hi), b"");
+
+        let got: Vec<std::ffi::OsString> = walk(&fs, Path::new("/r"))
+            .unwrap()
+            .filter_map(|i| i.ok())
+            .filter_map(|e| match e {
+                WalkEvent::File { path } => path.file_name().map(|n| n.to_os_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(got, vec![lo, hi], "ascending by encoded bytes");
+    }
 }

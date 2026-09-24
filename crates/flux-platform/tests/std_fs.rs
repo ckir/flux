@@ -537,3 +537,19 @@ fn read_dir_follows_a_symlink_to_a_directory_which_is_why_file_type_is_checked()
     // And the refusal that makes it safe: the link reports as a Symlink, not a Dir.
     assert_eq!(fs.metadata(&link).unwrap().file_type, flux_fs::FileType::Symlink);
 }
+
+#[cfg(unix)]
+#[test]
+fn read_dir_reports_non_utf8_names_intact() {
+    // A fake that agrees with the implementation about encoding proves nothing
+    // about the OS. §241: the on-disk name is bytes, and it must survive read_dir
+    // without a lossy conversion.
+    use std::os::unix::ffi::OsStrExt;
+    let d = tempfile::tempdir().unwrap();
+    let raw = std::ffi::OsStr::from_bytes(&[b'x', 0xFF, b'y']);
+    std::fs::write(d.path().join(raw), b"").unwrap();
+
+    let got = StdFileSystem.read_dir(d.path()).unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].name.as_bytes(), &[b'x', 0xFF, b'y'], "name survived intact");
+}
