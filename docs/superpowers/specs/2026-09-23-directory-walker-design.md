@@ -1132,6 +1132,41 @@ is the primitive cut 1 delivered and that this design had not connected to the r
 This is a per-directory check on a value the walk already holds, so it costs nothing beyond the
 comparison.
 
+**And it inherits a window that lets it be bypassed, which has to be said here because this section is
+where a reader will assume the boundary is enforced.** The walk stats a directory and then calls
+`read_dir` on it, and those are two operations. PR 2's own code says so at
+`crates/flux-core/src/walk.rs:314-321`: *"This NARROWS the race, it does not close it: the window moves
+from read_dir-to-metadata down to metadata-to-read_dir."*
+
+What that comment does not say is the CONSEQUENCE, and the consequence is worse than a wrongly typed entry:
+
+1. the walk stats `a`, finds a `Dir` on the root's volume — the boundary check passes;
+2. the attacker replaces `a` with a symlink to `/etc`, needing no privilege beyond write access to the
+   source;
+3. the walk calls `read_dir` on it, which FOLLOWS the link and enumerates `/etc`;
+4. the walk yields `File("a/passwd")`, and `copy_file` stats `src_root.join("a/passwd")`. **`lstat`
+   spares only the FINAL component** — the intermediate `a` is resolved — so it stats `/etc/passwd`,
+   sees an ordinary file, and copies it into the destination.
+
+Flux reads outside the source root and publishes what it finds, having checked the boundary against an
+object that no longer exists by the time it traverses it.
+
+**Mitigation, and it is the same shape as the destination-side fix.** §149.4 requires that *"the
+scanner must verify that the object being entered remains consistent with the planned directory
+identity"* — *remains*, which is a before-and-after claim, not a single stat. So the walk re-verifies
+the directory's identity AFTER `read_dir` and before yielding any of its entries; on a mismatch it
+discards the listing entirely and raises `DirectoryChangedDuringScan`, which is exactly the outcome
+§149.4 and §2 item 83 already prescribe for that code. Because `ObjectId` carries `volume`, the same
+re-check covers the mount boundary at no extra cost.
+
+**What this does and does not buy, stated as plainly as the code comment states it.** It narrows the
+window from "stat, then trust indefinitely" to "stat, list, re-stat" — an attacker must now win a race
+twice, against a check that discards its own work on suspicion. It does not close it. Closing it needs
+handle-relative traversal — `openat` with `O_NOFOLLOW`, listing through a directory file descriptor
+that cannot be re-pointed — which `TODO.md` already records as the fix for walker TOCTOU and which is
+not in these cuts. The destination side has the identical residual for the identical reason, and both
+are closed by the same change.
+
 ### A destination directory swapped after Flux created it
 
 **This is a reachable way to make Flux write OUTSIDE the destination root, and the spec names it.**
@@ -1696,3 +1731,7 @@ re-derive them and a reader can see what was consciously not fixed.
   2026-09-24` Owner-ruled: cut 3 ships the primitive only and the probe defers with the workspace.
   Until then the engine discovers a missing primitive at the first publish rather than refusing the
   operation before anything changes.
+- `RESOLVED: the acceptance list's boundary.` It ends at item **147** (spec :13516-13517), verified
+  independently by both the driver and the round-11 peer. Items 143-147 are Phase 3 locking, worker
+  state and dead-owner recovery, and bind nothing here. Items 124 and 131 corroborate the probe's file
+  and its cleanup, already folded as tracked debt. The list is now swept end to end.
