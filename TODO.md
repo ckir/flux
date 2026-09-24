@@ -188,7 +188,17 @@ Each was measured, and each is deliberately NOT fixed in that PR.
 
 ## Repository and CI hygiene
 
-Promoted from the local anomalies inbox (triage of 2026-09-14); each was re-measured on `origin/main` that day.
+Promoted from the local anomalies inbox (triage of 2026-09-14, and of 2026-09-24 for the first item);
+each was re-measured on `origin/main` that day.
+
+- [ ] **The local gate is Windows-only, and two non-Windows compile breaks reached CI in PR #37.**
+      `just check` runs on the dev machine alone, so a `#[cfg]` mistake cannot fail locally. MEASURED
+      twice in one PR: an ungated `#[test]` calling a `#[cfg(windows)]` helper (`error[E0425]` on Linux,
+      caught only because a WSL cross-check was run by hand), and a test assuming `cfg(unix)` permits
+      non-UTF-8 filenames (macOS APFS/HFS+ enforce UTF-8 and returned `Os { code: 92, "Illegal byte
+      sequence" }` — caught only by CI). Add a `just check-linux` recipe wrapping the WSL leg so the
+      cross-check is a command rather than a habit, and note in the justfile that **macOS has no local
+      equivalent on this machine**, so the macOS leg is CI-only by construction.
 
 - [ ] **No MSRV job.** Every `ci.yml` job uses the stable toolchain and Dependabot auto-merges cargo minor and
       patch bumps, so a dependency raising its MSRV past the workspace's `rust-version` (1.85) is not caught.
