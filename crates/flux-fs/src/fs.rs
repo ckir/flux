@@ -14,6 +14,35 @@ pub enum Perms {
     ReadOnly(bool),
 }
 
+/// What a directory listing reports per entry.
+///
+/// Deliberately NOT `Metadata`: the entry type is what the OS supplies during
+/// enumeration, and a `Metadata` per entry would re-stat every child, which is the
+/// cost this primitive exists to avoid.
+///
+/// There is no `Unknown` variant. Linux `readdir` can return `DT_UNKNOWN`, but std
+/// resolves it transparently -- `library/std/src/sys/fs/unix.rs:1149` is
+/// `_ => self.metadata().map(|m| m.file_type())` -- so the variant would be
+/// unconstructible. The cost is real and worth naming: on a filesystem with no
+/// `d_type` (this repository measurably uses one, `/mnt/c` under WSL is v9fs) that
+/// fallback is an `lstat` per entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileType {
+    File,
+    Dir,
+    Symlink,
+    Other,
+}
+
+/// One entry of one directory. The NAME, not a path: the walk already holds the
+/// parent on its stack, and a `PathBuf` per entry would allocate a full path for
+/// every child of every directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    pub name: std::ffi::OsString,
+    pub file_type: FileType,
+}
+
 /// Portable filesystem object identity (§109).
 ///
 /// BOTH fields, always. §109 says "Never compare only inode" and "only file ID",
@@ -210,5 +239,38 @@ mod tests {
     fn a_trivial_implementation_compiles_and_is_object_safe_enough_to_use() {
         let fs = NullFs;
         assert!(fs.metadata(Path::new("x")).unwrap().is_file);
+    }
+
+    #[test]
+    fn encoded_bytes_order_is_the_ordering_contract_not_utf16() {
+        // §7.2 sorts by `as_encoded_bytes()`. WTF-8 and UTF-16 DISAGREE above the
+        // BMP: surrogates (0xD800-0xDBFF) sort below the private-use area in UTF-16
+        // while their UTF-8 encodings sort above it. If anyone ever "fixes" the sort
+        // to use `encode_wide()` on Windows, this test is what catches it.
+        //
+        //   U+E000  WTF-8 EE 80 80     UTF-16BE E0 00
+        //   U+10000 WTF-8 F0 90 80 80  UTF-16BE D8 00 DC 00
+        let pua = std::ffi::OsString::from("\u{E000}");
+        let astral = std::ffi::OsString::from("\u{10000}");
+
+        assert!(
+            pua.as_encoded_bytes() < astral.as_encoded_bytes(),
+            "WTF-8 puts U+E000 first; got {:?} vs {:?}",
+            pua.as_encoded_bytes(),
+            astral.as_encoded_bytes()
+        );
+
+        // And the other direction, so the test cannot pass by both being equal.
+        let utf16_pua: Vec<u16> = "\u{E000}".encode_utf16().collect();
+        let utf16_astral: Vec<u16> = "\u{10000}".encode_utf16().collect();
+        assert!(utf16_astral < utf16_pua, "UTF-16 puts U+10000 first: this is the disagreement");
+    }
+
+    #[test]
+    fn a_dir_entry_carries_a_name_and_a_type() {
+        let e = DirEntry { name: std::ffi::OsString::from("a"), file_type: FileType::Dir };
+        assert_eq!(e.file_type, FileType::Dir);
+        assert_ne!(FileType::Dir, FileType::Symlink);
+        assert_ne!(FileType::File, FileType::Other);
     }
 }
