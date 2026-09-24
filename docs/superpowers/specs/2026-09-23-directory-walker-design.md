@@ -585,8 +585,35 @@ resolves to the source root and is refused by the floor itself, which is where �
 `SAFETY_REJECTED`-before-transfer belongs. The degrade-and-warn treatment is withdrawn; it was an
 answer to a question §128 had already settled the other way.
 
-The `FileSystem` trait has no `canonicalize` today, so PR 3 adds one. That is a trait widening this
-design did not previously account for, and it is not optional.
+**Canonicalizing correctly is not one line, and three things about it bite.**
+
+1. **It cannot be applied to the destination root, because that root usually does not exist.**
+   Canonicalization resolves symlinks, which requires the path to be there; a tree copy's destination is
+   normally absent. So what is canonicalized is the **nearest existing ancestor** — the same anchor the
+   §129 pre-flight already uses — with the non-existent remainder appended lexically afterwards. That
+   still satisfies §128, because components that do not exist cannot be symlinks.
+2. **On Windows the canonical form carries a prefix the input did not** — `std::fs::canonicalize`
+   returns a `\\?\` DOS-namespace path. A containment test between one canonicalized path and one
+   raw path would therefore fail unconditionally, and would fail in the SAFE-LOOKING direction, since a
+   failed containment test reads as "not contained". **Both sides are canonicalized, or neither is.**
+3. **`FaultFs` cannot implement this honestly without modelling symlink resolution.** It is an
+   in-memory fake with no real filesystem beneath it, and a `canonicalize` that returns its input
+   unchanged would make every test built on it pass while proving nothing about the property under
+   test. Modelling resolution properly means traversing the fake tree and detecting link cycles, which
+   is real complexity added to a test double.
+
+**Which is why the canonicalization is better placed in the CLI than in the trait.** `flux-cli` already
+runs against the real filesystem; it can canonicalize the source and the destination anchor before
+calling `copy_tree`, and pass resolved absolute paths in. The engine then receives paths for which
+lexical containment is already meaningful, `FileSystem` does not grow a method three implementors must
+fake, and `FaultFs` is not asked to become a path resolver.
+
+The cost is honest and worth stating: it puts one safety-relevant step outside the engine, which is the
+shape this design objected to when it rejected pushing the identity gate into the adapter. The
+difference is that canonicalization is a property of PATHS rather than of the filesystem abstraction,
+and a library caller that passes unresolved paths gets the lexical floor plus the Step 2a gate, which is
+what it would have had anyway. **This is a change from the previous paragraph, which said PR 3 adds
+`canonicalize` to the trait; it does not.**
 
 **When the ANCHOR's identity is weak, the pre-flight degrades by the same rule** — no special case, and
 no stricter treatment for being the earliest check. The reasoning is worth spelling out, because "the
@@ -757,6 +784,8 @@ pub struct TreeOutcome {
     pub files_copied: u64,
     pub bytes_copied: u64,
     pub directories_created: u64,
+    /// BOUNDED — see "Failures must not grow without limit" below. Not an
+    /// unbounded accumulator, despite the type.
     pub failures: Vec<TreeFailure>,
     /// Identity comparisons that were SKIPPED because a side was not `Strong`,
     /// aggregated for one warning apiece. Not failures: the copies succeeded.
@@ -880,17 +909,33 @@ is how PR 3 supplies them, because the trait method that expresses them today is
 `rename_no_replace` tests `symlink_metadata(to).is_ok()` and then renames
 (`crates/flux-platform/src/std_fs.rs:264-276`), so two processes can both see a free name.
 
-- **(a) Use `Publish::NoReplace` now, on the existing check-then-act implementation.** Compliant
-  semantics immediately, plus `DESTINATION_NAMESPACE_COLLISION` reporting, with a known and documented
-  race window. Keeps PR 3 at the size it was scoped. The window is narrow and its outcome is a wrongly
-  replaced entry rather than a corrupted one.
-- **(b) Use `NoReplace` and implement the atomic primitive in this cut.** Fully compliant with no
-  window, but it pulls three platform implementations into a PR whose subject is tree safety, and
-  `FileRenameInfoEx` in particular is not exposed by `std`.
+- **(a) is STRUCK — the spec forbids it by name.** It was: use `NoReplace` now on the existing
+  check-then-act implementation and document the window. `FLUX_FULL_UPDATED_SPEC_V16.md:10873-10876`
+  closes it: *"Before a directory operation changes anything, Flux probes the destination for one of
+  these primitives. If none is available, the operation is refused with `NOREPLACE_PUBLISH_UNAVAILABLE`
+  (exit code 3); check-then-rename is never used as a substitute."*
+- **(b) Implement the atomic primitive in this cut.** Fully compliant, but it pulls three platform
+  implementations into a PR whose subject is tree safety, and `std` exposes none of them.
+- **(c) A prerequisite PR before this one**, scoped exclusively to atomic no-replace publication in
+  `flux-platform` — the three primitives, their platform tests, and the probe. PR 3 then rebases onto it
+  and simply calls `rename_no_replace`, knowing it is atomic.
 
-Passing `Replace` through is no longer among the options. The previous text reasoned that "no caller in
-this cut selects `NoReplace`, so PR 3 neither fixes nor exposes it" — true as a statement about the
-code, and irrelevant, because §241.5 makes selecting it mandatory rather than optional.
+Passing `Replace` through is no longer among the options either. The previous text reasoned that "no
+caller in this cut selects `NoReplace`, so PR 3 neither fixes nor exposes it" — true about the code, and
+irrelevant, because §241.5 makes selecting it mandatory rather than optional.
+
+**Two obligations fall out of that spec text regardless of which option is chosen, and this design
+carried neither of them.**
+
+1. **A PROBE, before anything changes.** `copy_tree` must establish that the destination supports a
+   no-replace primitive before it creates so much as the destination root, and refuse with
+   `NOREPLACE_PUBLISH_UNAVAILABLE` and **exit 3** when it does not. That is a third outer-`Err` cause
+   alongside the missing source root and the §129 rejection, and exit 3 is a code this design had never
+   mentioned — the CLI contract so far was 0 and 1.
+2. **The blast radius is DIRECTORY operations only.** Item 113 ends *"a single-file operation against
+   the same destination is unaffected"*, so `copy_file` called on its own keeps exactly today's
+   behaviour and needs no probe. The obligation attaches to `copy_tree`, which is what makes it PR 3's
+   problem rather than a change rippling through the merged single-file path.
 
 **One failure, one representation.** Each `TreeFailureCause` variant is defined by WHERE the failure
 happened, and no failure may be expressible two ways:
@@ -965,9 +1010,34 @@ Adding a pruning method to `Walk` is the alternative. It is not taken here: `Wal
 and reviewed in PR 2, this is the only consumer that would use pruning, and a consumer-side skip needs
 no trait change, no new test surface in three implementors, and no second way for a walk to end.
 
-`copy_tree` returns a summary — files copied, bytes copied, and every per-entry failure — rather than
+`copy_tree` returns a summary — files copied, bytes copied, and per-entry failures — rather than
 stopping at the first failure. The CLI exits 1 if any failure was recorded, matching item 83 and the
 existing `metadata_failures` behaviour.
+
+### Failures must not grow without limit
+
+Four review rounds passed over `failures: Vec<TreeFailure>` without noticing that it is an unbounded
+in-memory accumulator, and the spec forbids one. **Foundational invariant 9** (`:508-509`): *"Resident
+RAM remains bounded by configured queues, workers, buffers, and bounded caches."* **Invariant 11**
+(`:511-512`) adds that the scanner *"never creates an unbounded global list of discovered files"*.
+
+A tree copy is exactly where this bites. A destination mounted read-only, or a source the user cannot
+read, produces one failure PER ENTRY — a five-million-file tree yields five million `TreeFailure`
+records, each carrying a `PathBuf` and an `FsError`, and the process grows until it dies. The failure
+mode is worst precisely when the operation is going worst, which is when the report matters most.
+
+**So the collection is capped.** `TreeOutcome` keeps the first N failures in full — N configurable, a
+few thousand by default, enough that a real report is never truncated in practice — plus a total count
+of failures beyond the cap. The count is what item 83 and the exit code need; the retained records are
+what a human needs to diagnose. Once the cap is hit, later failures increment the counter and are
+dropped rather than stored.
+
+The same reasoning is why `WeakIdentityWarnings` was already the right shape: it is bounded by the
+number of volumes plus one, never by the number of files, which is why it stores a count and one
+example rather than a list.
+
+This is a cap on what is REPORTED, not on what is attempted — the walk still continues, and every
+failure still counts toward the exit code. Nothing is silently skipped.
 
 ### Directory metadata
 
