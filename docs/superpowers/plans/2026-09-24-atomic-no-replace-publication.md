@@ -715,7 +715,19 @@ Unix, and on Windows `std` already applies it — see "Windows long paths are al
 // Fail at BUILD time naming the reason, rather than at link time naming a missing
 // function -- and do NOT add a check-then-act fallback, which
 // FLUX_FULL_UPDATED_SPEC_V16.md:10876 forbids as a substitute by name.
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))))]
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        // rustix's own gate includes redox, and redox sets target_family = "unix",
+        // so omitting it here would refuse to compile on a platform the dependency
+        // fully supports. An earlier draft did exactly that, contradicting the
+        // comment directly above.
+        target_os = "redox"
+    ))
+))]
 compile_error!(
     "no atomic no-replace rename primitive on this target; see FLUX_FULL_UPDATED_SPEC_V16.md \
      §241.5 -- check-then-rename is not an acceptable substitute"
@@ -756,6 +768,20 @@ red, not merely that the suite returned non-zero. Revert the mutant and confirm 
 **On Unix**, the equivalent mutant is `RenameFlags::NOREPLACE` → `RenameFlags::empty()`, checked with
 the WSL command from Step 7. `rename_no_replace_refuses_a_dangling_symlink` is the test that must go red
 there.
+
+**REVERT THE UNIX MUTANT, and then re-run the WSL command to prove you did.** This is the one mutant in
+this plan that the local gate cannot protect you from. `just check` runs on Windows only, so a
+`RenameFlags::empty()` left in the `#[cfg(unix)]` arm passes Step 9 cleanly and gets committed — and it
+would then surface in Task 4's WSL cross-check, one commit later, as a pre-existing Unix test failing
+inside a task that only added happy-path tests. That is a long way to debug back from.
+
+```
+wsl -e bash -lc 'cd /mnt/e/Rust/flux-walk2 && cargo nextest run --workspace --no-tests=pass'
+```
+
+Expected: PASS. Every Windows mutant in this plan is caught by the very next `just check`, because the
+tests it kills run on Windows. This one is not, which is why it gets its own revert-and-verify step
+rather than a trailing sentence.
 
 - [ ] **Step 9: Run the gate**
 
@@ -848,7 +874,15 @@ fn rename_no_replace_reports_a_missing_source() {
 
 Run: `cargo nextest run -p flux-platform rename_no_replace`
 
-Expected: PASS, and `Starting 5 tests` for `rename_no_replace` — 2 pre-existing, 1 from Task 3, 2 here.
+Expected: PASS, and **`Starting 4 tests` on Windows, `Starting 5 tests` under WSL.**
+
+**The count is platform-dependent and an earlier draft of this step said 5 flatly.** Of the two
+pre-existing `rename_no_replace` tests, `rename_no_replace_refuses_a_dangling_symlink`
+(`crates/flux-platform/tests/std_fs.rs:151-152`) is `#[cfg(unix)]`, so Windows never sees it. The four
+on Windows are: the pre-existing occupied-target test, the directory test from Task 3, and the two
+added here. A literal implementer following the old line would have seen 4, concluded they had failed
+to write a test, and halted — the count discipline causing the exact false stop it was added to
+prevent.
 
 - [ ] **Step 3: Confirm the new tests behave correctly under the Task 3 mutant**
 
