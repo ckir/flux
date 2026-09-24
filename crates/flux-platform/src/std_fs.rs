@@ -380,6 +380,32 @@ impl FileSystem for StdFileSystem {
         // The flags are the ones `metadata` documents above: `access_mode(0)` avoids
         // both a sharing violation and a denial on a file this process may not read,
         // and OPEN_REPARSE_POINT opens a link rather than its target.
+        //
+        // THE LEXICAL CHECK IS NOT REDUNDANT WITH THE IDENTITY ONE, and an earlier
+        // draft of this method had only the identity half. On a filesystem with no
+        // `FILE_ID_INFO` -- FAT32, exFAT -- `identity_of_handle` answers `Unavailable`,
+        // the comparison below falls through by design, and `MoveFileExW` then returns
+        // Ok for `from == to`, restoring the exact bug the veto exists to stop. A
+        // string comparison costs nothing, opens no handle, and works everywhere.
+        //
+        // The two halves together are complete in practice: those same filesystems
+        // support no hard links at all, so where identity is unavailable the ONLY
+        // same-object case is the literal one this catches, and where hard links do
+        // exist so does `FILE_ID_INFO`.
+        //
+        // It is deliberately EXACT rather than case-insensitive. A case-only change on
+        // Windows resolves to the same object and is refused by the identity half
+        // below, which matches both the check-then-act body this replaced (its
+        // `symlink_metadata` saw the target and refused -- MEASURED) and macOS, where
+        // `RENAME_EXCL` on case-insensitive APFS refuses it too. Renaming a name onto
+        // itself in a different case is `rename_replace`'s job, not this method's.
+        if from == to {
+            return Err(FsError::new(
+                flux_fs::Code::IoError,
+                std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+            ));
+        }
+
         let probe = |p: &Path| {
             OpenOptions::new()
                 .access_mode(0)

@@ -712,3 +712,27 @@ fn rename_no_replace_refuses_a_second_link_to_the_source() {
     assert!(a.exists(), "the source link must survive");
     assert!(b.exists(), "the target link must survive");
 }
+
+#[cfg(windows)]
+#[test]
+fn rename_no_replace_refuses_a_case_only_change() {
+    // Pinned because it READS like a defect and is not one, so the next person to
+    // notice it finds this test instead of "fixing" it. Windows resolves both names to
+    // one object, making this a same-object publish, which the identity half of the
+    // veto refuses.
+    //
+    // It is not a regression: the check-then-act body this method replaced refused it
+    // too -- MEASURED, `symlink_metadata("FILE.TXT")` succeeds on a case-insensitive
+    // volume -- and macOS refuses it as well, since `RENAME_EXCL` on case-insensitive
+    // APFS sees an occupied name. Changing a name's case is `rename_replace`'s job;
+    // this method publishes a NEW name without replacing, and the name is not new.
+    let d = TempDir::new().unwrap();
+    let lower = d.path().join("file.txt");
+    let upper = d.path().join("FILE.TXT");
+    let fs = StdFileSystem;
+    fs.create_new(&lower).unwrap();
+
+    let err = fs.rename_no_replace(&lower, &upper).expect_err("same object, occupied name");
+    assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(lower.exists(), "the object must survive");
+}
