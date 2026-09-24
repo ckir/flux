@@ -550,7 +550,11 @@ can run *"before transfer begins"* as §129 demands, rather than after the desti
 A pre-flight comparison of `src_root` against the anchor runs before the walk starts; the per-directory
 comparison above is what catches a namespace change *after* startup.
 
-**A SYMLINKED destination anchor defeats the identity comparison, and must be treated as degraded.**
+**A SYMLINKED destination anchor defeats the identity comparison.** (An earlier revision of this
+paragraph ended "and must be treated as degraded". That answer was withdrawn two sections below, and
+leaving it in the lead sentence meant the document asserted both the defect and its rejected fix — the
+resolution is canonicalization, stated at the end of this section.)
+
 `FileSystem::metadata` is `symlink_metadata`-based — that is the whole surface, there is no following
 variant on the trait — so for `flux copy /data /backup` where `/backup` is a symlink to `/data`, the
 comparison is between `/data`'s identity and the identity of the *link object* `/backup`. Those never
@@ -612,12 +616,35 @@ calling `copy_tree`, and pass resolved absolute paths in. The engine then receiv
 lexical containment is already meaningful, `FileSystem` does not grow a method three implementors must
 fake, and `FaultFs` is not asked to become a path resolver.
 
-The cost is honest and worth stating: it puts one safety-relevant step outside the engine, which is the
-shape this design objected to when it rejected pushing the identity gate into the adapter. The
-difference is that canonicalization is a property of PATHS rather than of the filesystem abstraction,
-and a library caller that passes unresolved paths gets the lexical floor plus the Step 2a gate, which is
-what it would have had anyway. **This is a change from the previous paragraph, which said PR 4 adds
-`canonicalize` to the trait; it does not.**
+**But the CLI cannot be the ONLY place it happens, and the first draft of this paragraph was wrong to
+say so.** It claimed a library caller passing unresolved paths "gets the lexical floor plus the Step 2a
+gate, which is what it would have had anyway". That is false. What it gets is precisely the hole this
+section opened with: the floor passes because `/backup` is not lexically inside `/data`, the identity
+comparison passes because it compares against the link object, and the operation proceeds to hit the
+Step 2a gate once per file — the exact O(N) failure §129 requires be a single refusal *before transfer
+begins*. Moving canonicalization to the CLI repaired the CLI path and silently un-repaired the library
+path, which is worse than the state before the fix, because the degrade-and-warn treatment that used to
+catch it had been withdrawn by the same change.
+
+**So the engine keeps a guard of its own, and it needs no `canonicalize` to do it.** `copy_tree`
+already stats the destination anchor for the identity comparison, and that stat carries the
+`FileType`. If the anchor is a `Symlink`, the engine **refuses** — `Code::SafetyRejected`, before
+anything is created.
+
+That threads both objections rather than choosing between them:
+
+- **A library caller cannot silently get the hole.** It gets a refusal naming the reason, which is
+  §129's "before transfer begins" behaviour and satisfies §128, since refusing does not invalidate the
+  containment decision — it declines to make one it cannot make.
+- **A CLI user never sees the refusal**, because the CLI canonicalized first and the engine is handed a
+  resolved path that is not a symlink.
+- **The trait does not grow `canonicalize`**, so `FaultFs` is not asked to become a path resolver and
+  `NullFs` is untouched. `FaultFs` can already produce a `Symlink` anchor with `add_symlink`, so the
+  refusal is unit-testable against the fake with no real filesystem.
+
+The division is then honest: **canonicalization RESOLVES, and is a property of paths, so it lives in the
+CLI. Refusal GUARDS, and is a property of the operation, so it lives in the engine.** Neither is asked
+to do the other's job, and the engine's safety does not depend on a caller having been careful.
 
 **When the ANCHOR's identity is weak, the pre-flight degrades by the same rule** — no special case, and
 no stricter treatment for being the earliest check. The reasoning is worth spelling out, because "the
@@ -778,19 +805,26 @@ cover, and `TODO.md` had it recorded as open debt throughout. Nothing else about
 the step order above the gate, the staging contract, and the Step 7 re-check are all untouched.
 
 ```rust
-/// What a tree copy did, and everything that went wrong while doing it.
+/// What a tree copy did, counted. Individual failures are STREAMED to the sink as
+/// they happen, not accumulated here — see "Failures must not grow without limit".
 ///
 /// A tree copy does not stop at the first failure, so unlike `copy_file` it reports
-/// a SUMMARY rather than returning at the first error. `failures` being non-empty is
-/// what makes the CLI exit 1.
+/// a SUMMARY rather than returning at the first error. A non-zero `failures` count
+/// is what makes the CLI exit 1.
 #[derive(Debug)]
 pub struct TreeOutcome {
     pub files_copied: u64,
     pub bytes_copied: u64,
     pub directories_created: u64,
-    /// BOUNDED — see "Failures must not grow without limit" below. Not an
-    /// unbounded accumulator, despite the type.
-    pub failures: Vec<TreeFailure>,
+    /// Total failures reported to the sink. Bounded by construction: a counter,
+    /// never a list, so a tree with millions of failures costs one `u64`.
+    pub failures: u64,
+    /// The same total broken down by cause — four numbers, one per
+    /// `TreeFailureCause` variant. This is what lets a caller decide the exit
+    /// code without keeping the records: §2 item 83 makes
+    /// `DirectoryChangedDuringScan` an exit-1 condition specifically, so the
+    /// TYPE has to survive even though the records do not.
+    pub failures_by_cause: FailureTally,
     /// Identity comparisons that were SKIPPED because a side was not `Strong`,
     /// aggregated for one warning apiece. Not failures: the copies succeeded.
     /// The engine captures; PR 5's CLI renders. Empty on the normal path.
@@ -819,17 +853,29 @@ pub enum TreeFailureCause {
     Unsupported(FileType),
 }
 
+/// One counter per `TreeFailureCause` variant. Fixed size, so it costs the same
+/// on a clean tree and on one where every entry failed.
+#[derive(Debug, Default)]
+pub struct FailureTally {
+    pub walk: u64,
+    pub create_dir: u64,
+    pub copy: u64,
+    pub unsupported: u64,
+}
+
 pub fn copy_tree<F: FileSystem>(
     fs: &F,
     src_root: &Path,
     dst_root: &Path,
     opts: &CopyOptions,
+    on_failure: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<TreeOutcome, CopyError>;
 ```
 
 The outer `Err` is reserved for failures of the operation as a whole — the source root missing or not a
-directory, and the §129 safety rejection — because those mean no transfer happened at all. Everything
-else lands in `failures` and the walk continues.
+directory, the §129 safety rejection, and `NOREPLACE_PUBLISH_UNAVAILABLE` from the pre-flight probe —
+because those mean no transfer happened at all. Everything else goes to `on_failure` and the walk
+continues.
 
 **`Code::SafetyRejected` now arrives from two levels, and they resolve differently.** The per-file gate
 returns the same code as the pre-flight, so the code alone no longer says whether the operation should
@@ -838,8 +884,9 @@ stop:
 - the **pre-flight and the per-directory** rejection abort the whole operation as the outer `Err`. They
   mean the roots themselves overlap, so every remaining file is suspect and continuing would compound
   the damage.
-- a **per-file** rejection is ONE file's failure. It lands in `failures` as
-  `TreeFailureCause::Copy(CopyError)` and the walk continues, like any other per-file error.
+- a **per-file** rejection is ONE file's failure. It goes to `on_failure` as
+  `TreeFailureCause::Copy(CopyError)`, increments the tally, and the walk continues, like any other
+  per-file error.
 
 That asymmetry is deliberate. A single aliased file inside an otherwise sound tree is a reason to skip
 that file and report it, not to abandon a copy that may be most of the way through ten thousand others —
@@ -1023,14 +1070,14 @@ Adding a pruning method to `Walk` is the alternative. It is not taken here: `Wal
 and reviewed in PR 2, this is the only consumer that would use pruning, and a consumer-side skip needs
 no trait change, no new test surface in three implementors, and no second way for a walk to end.
 
-`copy_tree` returns a summary — files copied, bytes copied, and per-entry failures — rather than
-stopping at the first failure. The CLI exits 1 if any failure was recorded, matching item 83 and the
-existing `metadata_failures` behaviour.
+`copy_tree` returns a summary — files copied, bytes copied, and failure counts — and streams each
+failure to the sink rather than stopping at the first. The CLI exits 1 if any failure was reported,
+matching §2 item 83 and the existing `metadata_failures` behaviour.
 
 ### Failures must not grow without limit
 
-Four review rounds passed over `failures: Vec<TreeFailure>` without noticing that it is an unbounded
-in-memory accumulator, and the spec forbids one. **Foundational invariant 9** (`:508-509`): *"Resident
+Five review rounds passed over `failures: Vec<TreeFailure>`, as it then was, without noticing that it
+is an unbounded in-memory accumulator, and the spec forbids one. **Foundational invariant 9** (`:508-509`): *"Resident
 RAM remains bounded by configured queues, workers, buffers, and bounded caches."* **Invariant 11**
 (`:511-512`) adds that the scanner *"never creates an unbounded global list of discovered files"*.
 
@@ -1039,11 +1086,43 @@ read, produces one failure PER ENTRY — a five-million-file tree yields five mi
 records, each carrying a `PathBuf` and an `FsError`, and the process grows until it dies. The failure
 mode is worst precisely when the operation is going worst, which is when the report matters most.
 
-**So the collection is capped.** `TreeOutcome` keeps the first N failures in full — N configurable, a
-few thousand by default, enough that a real report is never truncated in practice — plus a total count
-of failures beyond the cap. The count is what item 83 and the exit code need; the retained records are
-what a human needs to diagnose. Once the cap is hit, later failures increment the counter and are
-dropped rather than stored.
+**Capping by DROPPING was the first answer here, and it is withdrawn — it breaks §2 item 83.** That
+item (`FLUX_FULL_UPDATED_SPEC_V16.md:279-282`) says `DIRECTORY_CHANGED_DURING_SCAN` has one outcome:
+*"the directory's subtree is not transferred, the error **is reported**, and the operation exits 1"*. A
+failure dropped once a cap is reached is not reported. Worse, an aggregate count of dropped failures
+erases their TYPE, so a caller could no longer tell whether what it discarded was an exit-1 condition
+or an ordinary per-file error — the cap would have quietly taken the exit-code contract with it.
+
+**The failures are STREAMED instead, which is bounded by construction rather than by a limit.**
+`copy_tree` takes a sink and reports each failure as it happens:
+
+```rust
+pub fn copy_tree<F: FileSystem>(
+    fs: &F,
+    src_root: &Path,
+    dst_root: &Path,
+    opts: &CopyOptions,
+    on_failure: &mut dyn FnMut(TreeFailure),
+) -> std::result::Result<TreeOutcome, CopyError>;
+```
+
+`TreeOutcome` then carries **counts, not records** — total failures plus a per-cause tally, which is
+four numbers because `TreeFailureCause` has four variants. Nothing is dropped, nothing is truncated,
+resident memory does not grow with the number of failures, and the exit code is derivable from the
+tally without consulting a list that may have been capped.
+
+This is a change to a signature this document had called settled, and it is made deliberately: the
+signature was fixed before invariant 9 and item 83 were brought to bear on it, and no cap can satisfy
+both "bounded memory" and "the error is reported". Streaming satisfies both, and it is the shape §1's
+pipeline uses anyway, so it moves the engine toward Phase 3 rather than away from it.
+
+The CLI passes a sink that prints or accumulates as it chooses, which is the same engine-captures /
+CLI-renders division the weak-identity warning already uses, and it means a long-running copy reports
+its failures as they occur rather than only at the end.
+
+`WeakIdentityWarnings` stays as it is, and the contrast is the point: it is bounded by the number of
+VOLUMES rather than the number of files, so aggregating it loses nothing. Failures are per-entry, so
+they cannot be aggregated the same way without losing exactly what a reader needs.
 
 The same reasoning is why `WeakIdentityWarnings` was already the right shape: it is bounded by the
 number of volumes plus one, never by the number of files, which is why it stores a count and one
@@ -1224,12 +1303,30 @@ publication, engine, CLI), since a sixth insertion would shift them again.
    `FaultFs::set_identity` is what makes the degraded paths testable: giving two paths the same
    `ObjectId` reproduces a cycle, and giving one a `Weak` identity exercises the fallback — neither
    needs a mount, a privilege, or a particular filesystem under the test runner.
-3. **Atomic no-replace publication.** `flux-platform` only, no engine and no CLI. The three primitives
-   §241.5 names — `renameat2(RENAME_NOREPLACE)` on Linux, `renamex_np(RENAME_EXCL)` on macOS,
-   `MoveFileEx` without `MOVEFILE_REPLACE_EXISTING` on Windows — replacing `rename_no_replace`'s
-   present check-then-act body, plus the destination PROBE that `:10873` requires before a directory
-   operation changes anything, and `NOREPLACE_PUBLISH_UNAVAILABLE` with exit 3 when no primitive is
-   available.
+3. **Atomic no-replace publication.** `flux-platform` only, no engine and no CLI.
+
+   The three primitives §241.5 names — `renameat2(RENAME_NOREPLACE)` on Linux,
+   `renamex_np(RENAME_EXCL)` on macOS, `MoveFileEx` without `MOVEFILE_REPLACE_EXISTING` on Windows —
+   replacing `rename_no_replace`'s present check-then-act body. Plus a **capability query** on the
+   trait: "can this destination publish without replacing?", answered by the adapter.
+
+   **The query, not the refusal.** An earlier revision of this item claimed the cut also delivers "the
+   destination PROBE and `NOREPLACE_PUBLISH_UNAVAILABLE` with exit 3", which contradicted its own
+   first line. A crate with no concept of a directory operation cannot decide to refuse one, and a
+   crate with no CLI cannot return an exit code. The three pieces separate cleanly along the cut
+   boundaries and each is testable where it lands:
+
+   - **this cut** answers whether the capability exists, and is tested by asking it on a real
+     filesystem;
+   - **the engine cut** calls it before creating anything and refuses with
+     `NOREPLACE_PUBLISH_UNAVAILABLE`, tested against `FaultFs` with the capability forced either way;
+   - **the CLI cut** maps that refusal to **exit 3**, tested end to end.
+
+   This is the same division the weak-identity warning already uses — the engine decides, the CLI
+   renders — and it is what invariant 24 asks for: *"The core transfer engine is independent of CLI
+   presentation."* The capability query is not stranded by landing first: it is a `flux-platform`
+   function with its own tests, exactly as `identity_of` was in cut 1, which also had no consumer until
+   the cut after it.
 
    **This PR was added during the design review of the cut that follows it, and it is a prerequisite
    rather than a nice-to-have.** The spec forbids check-then-rename as a substitute by name, so the
@@ -1319,3 +1416,8 @@ re-derive them and a reader can see what was consciously not fixed.
   existing directory entry with an insert-if-absent write in the operation's state store. * n/a *
   2026-09-24` Reachable only once persistent operation state exists, which is Phase 3 and explicitly out
   of scope here; recorded so the omission is tracked rather than forgotten. Named by the round 4 peer.
+- `REJECTED: "stale PR 3 / PR 4 prose references are a blockable contradiction."` Stood down by the
+  round-6 peer itself, and correctly: the Delivery list is declared authoritative and the ordinals were
+  renumbered mechanically. Recorded because the ordinals have now shifted twice.
+- `DISCARDED-BELOW-FLOOR: how the CLI renders streamed failures against the summary tally.` Presentation,
+  settled in the CLI cut, no correctness consequence.
