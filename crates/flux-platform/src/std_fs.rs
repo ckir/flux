@@ -324,11 +324,31 @@ impl FileSystem for StdFileSystem {
         // No MOVEFILE_REPLACE_EXISTING is the whole point: without that flag
         // MoveFileExW fails rather than replacing, which is the guarantee this method
         // has always promised and until now only approximated.
-        let wide = |p: &Path| {
+        //
+        // The interior-NUL rejection is not decoration, and leaving it out was a
+        // REGRESSION this method introduced. `encode_wide` emits an interior NUL
+        // happily, and `MoveFileExW` stops reading at the first one -- so a `to` of
+        // "pub\0lish" was MEASURED to publish at "pub" and return Ok, writing to a
+        // path the caller never asked for. `std::fs` never had that hole: its own
+        // `to_u16s` rejects the same input with InvalidInput ("strings passed to
+        // WinAPI cannot contain NULs"), and the check-then-act body this replaced got
+        // that for free by going through `std`. Going direct to the FFI means
+        // re-establishing it here. The Unix arm needs no equivalent: rustix rejects
+        // the same path with EINVAL, MEASURED.
+        let wide = |p: &Path| -> std::result::Result<Vec<u16>, std::io::Error> {
             use std::os::windows::ffi::OsStrExt;
-            p.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>()
+            let mut w: Vec<u16> = p.as_os_str().encode_wide().collect();
+            if w.contains(&0) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "paths passed to the Windows API cannot contain interior NULs",
+                ));
+            }
+            w.push(0);
+            Ok(w)
         };
-        let (wfrom, wto) = (wide(from), wide(to));
+        let wfrom = wide(from).map_err(FsError::from_io)?;
+        let wto = wide(to).map_err(FsError::from_io)?;
 
         // SAFETY: both buffers are NUL-terminated UTF-16 built immediately above and
         // live for the duration of the call.

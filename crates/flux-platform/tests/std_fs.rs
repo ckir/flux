@@ -616,3 +616,58 @@ fn read_dir_reports_non_utf8_names_intact() {
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].name.as_bytes(), &[b'x', 0xFF, b'y'], "name survived intact");
 }
+
+#[test]
+fn rename_no_replace_refuses_a_path_with_an_interior_nul() {
+    // A REGRESSION pin, not a hypothetical. Going direct to MoveFileExW lost the
+    // interior-NUL rejection `std::fs` performs, and MoveFileExW stops reading at the
+    // first NUL -- so this published at "to" while the caller asked for "to\0bar", and
+    // returned Ok. A method whose whole contract is "publish exactly here or refuse"
+    // must never write to a path it was not given.
+    //
+    // Cross-platform on purpose: rustix rejects the same path with EINVAL, so both arms
+    // owe the same answer and this test is what holds them to it.
+    let d = TempDir::new().unwrap();
+    let from = d.path().join("from");
+    let fs = StdFileSystem;
+    fs.create_new(&from).unwrap();
+
+    let mut s = d.path().join("to").into_os_string();
+    s.push("\u{0}bar");
+    let to = std::path::PathBuf::from(s);
+
+    let err = fs.rename_no_replace(&from, &to).expect_err("an interior NUL is not a path");
+    assert_eq!(err.source.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(from.exists(), "the source must be untouched");
+    assert!(!d.path().join("to").exists(), "nothing may appear at the truncated path");
+}
+
+#[test]
+fn rename_no_replace_reports_a_missing_source_before_an_occupied_target() {
+    // THE ONE TEST THAT DISTINGUISHES THIS BODY FROM THE FORBIDDEN ONE, and the reason
+    // it is worth its own test rather than folding into the missing-source case above.
+    //
+    // check-then-act evaluates `symlink_metadata(to)` first, finds the target occupied
+    // and answers AlreadyExists -- without ever looking at the source. The atomic
+    // primitives hand both paths to the kernel, which resolves the source first and
+    // answers NotFound. MEASURED as ENOENT(2) under Linux and ERROR_FILE_NOT_FOUND(2)
+    // on Windows.
+    //
+    // So this asserts an ORDERING that only a real atomic primitive produces, and it is
+    // what stops a future commit quietly restoring the symlink_metadata pre-check that
+    // FLUX_FULL_UPDATED_SPEC_V16.md:10876 forbids by name. Every other test in this file
+    // passes against that body.
+    let d = TempDir::new().unwrap();
+    let from = d.path().join("absent");
+    let to = d.path().join("occupied");
+    let fs = StdFileSystem;
+    fs.create_new(&to).unwrap();
+
+    let err = fs.rename_no_replace(&from, &to).expect_err("there is nothing to rename");
+    assert_eq!(
+        err.source.kind(),
+        std::io::ErrorKind::NotFound,
+        "the kernel resolves the source first; a destination pre-check would say AlreadyExists"
+    );
+    assert!(to.exists(), "the occupying target must survive");
+}
