@@ -5,28 +5,38 @@
 //! named call. None of that is reachable against a real disk.
 
 use flux_fs::{Code, FileHandle, FileSystem, FileType, FsError, Metadata, Perms, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
 #[derive(Default)]
 struct Inner {
-    files: HashMap<String, Vec<u8>>,
+    files: HashMap<PathBuf, Vec<u8>>,
+    /// The ORDER of calls, which is what every assertion on it checks. Formatted with
+    /// the lossy `display()` deliberately: this is an order oracle, not a path oracle,
+    /// and no test distinguishes two paths by this string. The MAPS above are keyed by
+    /// `PathBuf` because a lossy key there would merge two distinct objects, which is
+    /// a correctness bug; a lossy LOG is only ever a less precise assertion message.
+    /// If a test ever needs to tell two non-UTF-8 names apart HERE, add a lossless
+    /// accessor then -- it is not needed now.
     calls: Vec<String>,
     faults: HashMap<String, Code>,
-    times: HashMap<String, Option<SystemTime>>,
+    times: HashMap<PathBuf, Option<SystemTime>>,
     /// path -> bytes appended on the second `metadata` call
-    grow: HashMap<String, Vec<u8>>,
-    metadata_reads: HashMap<String, u32>,
+    grow: HashMap<PathBuf, Vec<u8>>,
+    metadata_reads: HashMap<PathBuf, u32>,
     /// call name -> code, not consumed on use
     always: HashMap<String, Code>,
     /// paths removed on the second `metadata` call
-    vanish: std::collections::HashSet<String>,
-    /// paths `metadata` reports as not a regular file
-    not_files: std::collections::HashSet<String>,
-    perms: HashMap<String, Option<Perms>>,
+    vanish: HashSet<PathBuf>,
+    /// path -> what `metadata` reports it as. One map, not three overlapping sets:
+    /// `directories`, `symlinks` and `not_files` as separate sets could put one path
+    /// in two of them at once and express a state no filesystem has. A path absent
+    /// from this map but present in `files` is a regular file.
+    types: HashMap<PathBuf, FileType>,
+    perms: HashMap<PathBuf, Option<Perms>>,
     /// consumed by the next `write` on a handle from `create_new`
     write_fault: Option<std::io::Error>,
     /// call name -> the `ErrorKind` an injected fault should carry. Without this the
@@ -46,7 +56,7 @@ struct Inner {
     /// path hash gives you one or the other. Carrying it on rename freed the old
     /// hash, so a file recreated at the source path collided with the renamed one -
     /// MEASURED, two distinct objects reported the same id.
-    identities: HashMap<String, flux_fs::FileIdentity>,
+    identities: HashMap<PathBuf, flux_fs::FileIdentity>,
     /// Pre-incremented, so the first object is 1 and nothing ever gets 0 - §107
     /// forbids treating a zero id as a valid identity.
     next_object: u128,
@@ -58,7 +68,7 @@ struct Inner {
 /// a missing path returned `Ok`, left an empty file at `to`, and minted no identity for
 /// it, so the next `metadata` on that path hit the unreachable-by-construction panic.
 /// MEASURED before this guard: `Ok`, `/dest` existed, `metadata` panicked.
-fn missing_source(g: &Inner, from: &str) -> Result<()> {
+fn missing_source(g: &Inner, from: &Path) -> Result<()> {
     if g.files.contains_key(from) {
         return Ok(());
     }
@@ -73,29 +83,29 @@ fn missing_source(g: &Inner, from: &str) -> Result<()> {
 /// for a path that skipped it, because the plausible alternative - reporting
 /// `Unavailable` - is a state the walker handles GRACEFULLY, so an unhooked path
 /// would silently degrade while its test stayed green.
-fn mint_identity(g: &mut Inner, path: &str) {
+fn mint_identity(g: &mut Inner, path: &Path) {
     if g.identities.contains_key(path) {
         return;
     }
 
     g.next_object += 1;
     let id = flux_fs::ObjectId { volume: 1, index: g.next_object };
-    g.identities.insert(path.to_string(), flux_fs::FileIdentity::Strong(id));
+    g.identities.insert(path.to_path_buf(), flux_fs::FileIdentity::Strong(id));
 }
 
 /// Move a name's content AND its metadata. Moving only the bytes meant the times and
 /// permissions applied to the temporary vanished at publication, so no test could
 /// assert that the §44.1 ordering achieved anything.
-fn move_object(g: &mut Inner, from: &str, to: &str) {
+fn move_object(g: &mut Inner, from: &Path, to: &Path) {
     let bytes = g.files.remove(from).unwrap_or_default();
-    g.files.insert(to.to_string(), bytes);
+    g.files.insert(to.to_path_buf(), bytes);
     // REPLACE, never merge. A rename destroys the object at `to`, so where the source
     // carries nothing the destination's old value is REMOVED rather than left standing.
     // MEASURED before this: renaming onto a path left the destination's own permissions
     // in place, so the two objects merged instead of one replacing the other.
     match g.times.remove(from) {
         Some(v) => {
-            g.times.insert(to.to_string(), v);
+            g.times.insert(to.to_path_buf(), v);
         }
         None => {
             g.times.remove(to);
@@ -103,7 +113,7 @@ fn move_object(g: &mut Inner, from: &str, to: &str) {
     }
     match g.perms.remove(from) {
         Some(v) => {
-            g.perms.insert(to.to_string(), v);
+            g.perms.insert(to.to_path_buf(), v);
         }
         None => {
             g.perms.remove(to);
@@ -114,7 +124,7 @@ fn move_object(g: &mut Inner, from: &str, to: &str) {
     // path CHANGED.
     match g.identities.remove(from) {
         Some(v) => {
-            g.identities.insert(to.to_string(), v);
+            g.identities.insert(to.to_path_buf(), v);
         }
         None => {
             g.identities.remove(to);
@@ -128,7 +138,7 @@ pub struct FaultFs {
 }
 
 pub struct FakeHandle {
-    path: String,
+    path: PathBuf,
     buf: Vec<u8>,
     read_pos: usize,
     /// Where writes land. `None` for a handle opened to read, so a reader cannot
@@ -173,7 +183,7 @@ impl FileHandle for FakeHandle {
         // could tell a run that synced from one that did not -- only one that FAILED
         // to, via the injected fault below.
         if let Some(sink) = &self.sink {
-            sink.lock().unwrap().calls.push(format!("sync_all({})", self.path));
+            sink.lock().unwrap().calls.push(format!("sync_all({})", self.path.display()));
         }
         if let Some(code) = self.sync_fault.lock().unwrap().take() {
             return Err(FsError::new(code, std::io::Error::other("injected")));
@@ -188,13 +198,15 @@ impl FaultFs {
     }
 
     /// Seed a source file.
-    pub fn write_file(&self, path: &str, bytes: &[u8]) {
+    pub fn write_file(&self, path: impl AsRef<Path>, bytes: &[u8]) {
+        let path = path.as_ref();
         let mut g = self.inner.lock().unwrap();
-        g.files.insert(path.to_string(), bytes.to_vec());
+        g.files.insert(path.to_path_buf(), bytes.to_vec());
         mint_identity(&mut g, path);
     }
 
-    pub fn exists(&self, path: &str) -> bool {
+    pub fn exists(&self, path: impl AsRef<Path>) -> bool {
+        let path = path.as_ref();
         self.inner.lock().unwrap().files.contains_key(path)
     }
 
@@ -239,46 +251,63 @@ impl FaultFs {
     }
 
     /// The bytes the fake currently holds for `path`.
-    pub fn read_file(&self, path: &str) -> Option<Vec<u8>> {
+    pub fn read_file(&self, path: impl AsRef<Path>) -> Option<Vec<u8>> {
+        let path = path.as_ref();
         self.inner.lock().unwrap().files.get(path).cloned()
     }
 
     /// Delete a file the *second* time its metadata is read -- a source removed
     /// while the copy was streaming.
-    pub fn vanish_on_second_metadata(&self, path: &str) {
+    pub fn vanish_on_second_metadata(&self, path: impl AsRef<Path>) {
+        let path = path.as_ref();
         let mut g = self.inner.lock().unwrap();
-        g.vanish.insert(path.to_string());
+        g.vanish.insert(path.to_path_buf());
     }
 
     /// The permissions last applied to `path`.
-    pub fn permissions(&self, path: &str) -> Option<Perms> {
+    pub fn permissions(&self, path: impl AsRef<Path>) -> Option<Perms> {
+        let path = path.as_ref();
         self.inner.lock().unwrap().perms.get(path).copied().flatten()
     }
 
     /// The modified time last applied to `path`.
-    pub fn modified(&self, path: &str) -> Option<SystemTime> {
+    pub fn modified(&self, path: impl AsRef<Path>) -> Option<SystemTime> {
+        let path = path.as_ref();
         self.inner.lock().unwrap().times.get(path).copied().flatten()
     }
 
     /// Give a path an identity. Two paths given the SAME `ObjectId` is how a test
     /// reproduces a directory cycle with no mount and no privilege.
-    pub fn set_identity(&self, path: &str, identity: flux_fs::FileIdentity) {
-        self.inner.lock().unwrap().identities.insert(path.to_string(), identity);
+    pub fn set_identity(&self, path: impl AsRef<Path>, identity: flux_fs::FileIdentity) {
+        let path = path.as_ref();
+        self.inner.lock().unwrap().identities.insert(path.to_path_buf(), identity);
     }
 
     /// Make `metadata` report `path` as something other than a regular file -- a
     /// directory, a symlink, a device. Without this the fake reported `is_file: true`
     /// for everything and SPECIAL_FILE_UNSUPPORTED had no test that produced it.
-    pub fn add_special(&self, path: &str) {
+    pub fn add_special(&self, path: impl AsRef<Path>) {
+        let path = path.as_ref();
         let mut g = self.inner.lock().unwrap();
-        g.files.insert(path.to_string(), Vec::new());
-        g.not_files.insert(path.to_string());
+        g.files.insert(path.to_path_buf(), Vec::new());
+        g.types.insert(path.to_path_buf(), FileType::Other);
+        mint_identity(&mut g, path);
+    }
+
+    /// Seed a symlink. The fake never follows it -- the walk must REPORT symlinks
+    /// and never descend into them, so a target would be unused state.
+    pub fn add_symlink(&self, path: impl AsRef<Path>) {
+        let path = path.as_ref();
+        let mut g = self.inner.lock().unwrap();
+        g.files.insert(path.to_path_buf(), Vec::new());
+        g.types.insert(path.to_path_buf(), FileType::Symlink);
         mint_identity(&mut g, path);
     }
 
     /// Give a file permissions, so a copy has something to carry across.
-    pub fn set_file_perms(&self, path: &str, perms: Perms) {
-        self.inner.lock().unwrap().perms.insert(path.to_string(), Some(perms));
+    pub fn set_file_perms(&self, path: impl AsRef<Path>, perms: Perms) {
+        let path = path.as_ref();
+        self.inner.lock().unwrap().perms.insert(path.to_path_buf(), Some(perms));
     }
 
     /// Fail the next `write` on a handle from `create_new`, with this error.
@@ -288,9 +317,10 @@ impl FaultFs {
 
     /// Append to a file the *second* time its metadata is read — what a concurrent
     /// writer looks like from inside step 6.
-    pub fn grow_on_second_metadata(&self, path: &str, extra: &[u8]) {
+    pub fn grow_on_second_metadata(&self, path: impl AsRef<Path>, extra: &[u8]) {
+        let path = path.as_ref();
         let mut g = self.inner.lock().unwrap();
-        g.grow.insert(path.to_string(), extra.to_vec());
+        g.grow.insert(path.to_path_buf(), extra.to_vec());
     }
 
     fn record(&self, call: String, key: &str) -> Result<()> {
@@ -333,8 +363,8 @@ impl FileSystem for FaultFs {
     type Writer = FakeHandle;
 
     fn open_read(&self, path: &Path) -> Result<Self::Reader> {
-        let p = path.display().to_string();
-        self.record(format!("open_read({p})"), "open_read")?;
+        let p = path.to_path_buf();
+        self.record(format!("open_read({})", p.display()), "open_read")?;
         let g = self.inner.lock().unwrap();
         let buf = g.files.get(&p).cloned().ok_or_else(|| {
             FsError::new(Code::IoError, std::io::Error::from(std::io::ErrorKind::NotFound))
@@ -352,8 +382,8 @@ impl FileSystem for FaultFs {
     }
 
     fn create_new(&self, path: &Path) -> Result<Self::Writer> {
-        let p = path.display().to_string();
-        self.record(format!("create_new({p})"), "create_new")?;
+        let p = path.to_path_buf();
+        self.record(format!("create_new({})", p.display()), "create_new")?;
         let mut g = self.inner.lock().unwrap();
         if g.files.contains_key(&p) {
             return Err(FsError::new(
@@ -380,8 +410,8 @@ impl FileSystem for FaultFs {
     }
 
     fn metadata(&self, path: &Path) -> Result<Metadata> {
-        let p = path.display().to_string();
-        self.record(format!("metadata({p})"), "metadata")?;
+        let p = path.to_path_buf();
+        self.record(format!("metadata({})", p.display()), "metadata")?;
         let mut g = self.inner.lock().unwrap();
         // Copy the count out: holding the entry's `&mut` across the blocks below
         // borrows `g` for too long, and they each need it again.
@@ -405,7 +435,7 @@ impl FileSystem for FaultFs {
         })?;
         Ok(Metadata {
             len,
-            file_type: if g.not_files.contains(&p) { FileType::Other } else { FileType::File },
+            file_type: g.types.get(&p).copied().unwrap_or(FileType::File),
             permissions: g.perms.get(&p).copied().flatten(),
             modified: g.times.get(&p).copied().flatten(),
             // Panic, not `Unavailable`: `Unavailable` is a state the walker handles
@@ -413,19 +443,22 @@ impl FileSystem for FaultFs {
             // its test green. Every path that inserts into `files` calls
             // `mint_identity`, which makes this unreachable - loudly, if it ever is not.
             identity: *g.identities.get(&p).unwrap_or_else(|| {
-                panic!("no identity minted for {p}: a creation path skipped mint_identity")
+                panic!(
+                    "no identity minted for {}: a creation path skipped mint_identity",
+                    p.display()
+                )
             }),
         })
     }
 
     fn set_times(&self, file: &Self::Writer, modified: Option<SystemTime>) -> Result<()> {
-        self.record(format!("set_times({})", file.path), "set_times")?;
+        self.record(format!("set_times({})", file.path.display()), "set_times")?;
         self.inner.lock().unwrap().times.insert(file.path.clone(), modified);
         Ok(())
     }
 
     fn set_permissions(&self, file: &Self::Writer, perms: Option<Perms>) -> Result<()> {
-        self.record(format!("set_permissions({})", file.path), "set_permissions")?;
+        self.record(format!("set_permissions({})", file.path.display()), "set_permissions")?;
         // Record it. Dropping the argument made the whole suite blind to permissions:
         // a `copy_file` that passed `None` every time passed every test.
         self.inner.lock().unwrap().perms.insert(file.path.clone(), perms);
@@ -433,8 +466,11 @@ impl FileSystem for FaultFs {
     }
 
     fn rename_replace(&self, from: &Path, to: &Path) -> Result<()> {
-        let (f, t) = (from.display().to_string(), to.display().to_string());
-        self.record(format!("rename_replace({f} -> {t})"), "rename_replace")?;
+        let (f, t) = (from.to_path_buf(), to.to_path_buf());
+        self.record(
+            format!("rename_replace({} -> {})", f.display(), t.display()),
+            "rename_replace",
+        )?;
         let mut g = self.inner.lock().unwrap();
         missing_source(&g, &f)?;
         move_object(&mut g, &f, &t);
@@ -442,8 +478,11 @@ impl FileSystem for FaultFs {
     }
 
     fn rename_no_replace(&self, from: &Path, to: &Path) -> Result<()> {
-        let (f, t) = (from.display().to_string(), to.display().to_string());
-        self.record(format!("rename_no_replace({f} -> {t})"), "rename_no_replace")?;
+        let (f, t) = (from.to_path_buf(), to.to_path_buf());
+        self.record(
+            format!("rename_no_replace({} -> {})", f.display(), t.display()),
+            "rename_no_replace",
+        )?;
         let mut g = self.inner.lock().unwrap();
         missing_source(&g, &f)?;
         if g.files.contains_key(&t) {
@@ -457,8 +496,8 @@ impl FileSystem for FaultFs {
     }
 
     fn remove_file(&self, path: &Path) -> Result<()> {
-        let p = path.display().to_string();
-        self.record(format!("remove_file({p})"), "remove_file")?;
+        let p = path.to_path_buf();
+        self.record(format!("remove_file({})", p.display()), "remove_file")?;
         // NotFound when it is not there, because `std::fs::remove_file` does that and
         // `discard` branches on it. A fake that returned Ok here would make that
         // branch untestable and hide the difference.
