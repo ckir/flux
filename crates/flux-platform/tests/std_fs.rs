@@ -107,6 +107,24 @@ fn rename_no_replace_refuses_an_existing_target() {
 }
 
 #[test]
+fn rename_no_replace_refuses_a_directory_occupying_the_name() {
+    // A directory at the target is a case the old check-then-act body got right only
+    // by accident -- `symlink_metadata` says "something is there" without saying what.
+    // The atomic primitives refuse it as the OS's own answer, and on every platform.
+    let d = TempDir::new().unwrap();
+    let (from, to) = (d.path().join("from"), d.path().join("to"));
+    let fs = StdFileSystem;
+    fs.create_new(&from).unwrap();
+    std::fs::create_dir(&to).unwrap();
+
+    let err = fs.rename_no_replace(&from, &to).expect_err("a directory occupies the name");
+    assert_eq!(err.code, flux_fs::Code::IoError);
+
+    assert!(std::fs::metadata(&to).unwrap().is_dir(), "the directory must survive");
+    assert!(from.exists(), "the source must be untouched");
+}
+
+#[test]
 fn set_times_on_a_handle_moves_the_mtime() {
     let d = TempDir::new().unwrap();
     let p = d.path().join("a");

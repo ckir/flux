@@ -146,6 +146,29 @@ fn destination_is_write_protected(to: &Path) -> bool {
     }
 }
 
+// `rustix::fs::renameat_with` is gated `any(apple, linux_kernel, target_os = "redox")`,
+// so a Unix outside that set has no atomic no-replace primitive reachable from here.
+// Fail at BUILD time naming the reason, rather than at link time naming a missing
+// function -- and do NOT add a check-then-act fallback, which
+// FLUX_FULL_UPDATED_SPEC_V16.md:10876 forbids as a substitute by name.
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        // rustix's own gate includes redox, and redox sets target_family = "unix",
+        // so omitting it here would refuse to compile on a platform the dependency
+        // fully supports. An earlier draft did exactly that, contradicting the
+        // comment directly above.
+        target_os = "redox"
+    ))
+))]
+compile_error!(
+    "no atomic no-replace rename primitive on this target; see FLUX_FULL_UPDATED_SPEC_V16.md \
+     §241.5 -- check-then-rename is not an acceptable substitute"
+);
+
 impl FileSystem for StdFileSystem {
     type Reader = StdReader;
     type Writer = StdFile;
@@ -261,18 +284,59 @@ impl FileSystem for StdFileSystem {
         std::fs::rename(from, to).map_err(FsError::from_io)
     }
 
+    /// Publish without replacing, atomically.
+    ///
+    /// §241.5 requires a target planned as new be published "with a primitive that
+    /// refuses to replace an existing entry", and `:10876` forbids the alternative by
+    /// name: "check-then-rename is never used as a substitute." The previous body was
+    /// exactly that substitute -- `symlink_metadata` then `rename` -- so two processes
+    /// could both see a free name and one silently won.
+    ///
+    /// The contract and the error are UNCHANGED: an occupied target is still
+    /// `Code::IoError` carrying `ErrorKind::AlreadyExists`. Only the atomicity is new,
+    /// and the observable difference is confined to the concurrent case that used to
+    /// lose silently.
+    #[cfg(unix)]
     fn rename_no_replace(&self, from: &Path, to: &Path) -> Result<()> {
-        // `symlink_metadata`, NOT `exists()`: `exists()` FOLLOWS the link, so a dangling
-        // symlink reports false and this method would replace the very name it promises
-        // to leave alone. Identical root cause to the guard in `rename_replace` above --
-        // that one was fixed first and this sibling site was missed.
-        if std::fs::symlink_metadata(to).is_ok() {
-            return Err(FsError::new(
-                flux_fs::Code::IoError,
-                std::io::Error::from(std::io::ErrorKind::AlreadyExists),
-            ));
+        // ONE arm for Linux and macOS, because rustix already abstracts the two
+        // primitives §241.5 names separately: `RenameFlags::NOREPLACE` is
+        // `RENAME_NOREPLACE` on Linux and `RENAME_EXCL` on Apple (rustix
+        // src/backend/libc/fs/types.rs, the `#[cfg(apple)]` bitflags block), and
+        // `renameat_with` is gated `any(apple, linux_kernel, redox)`.
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+
+        // `std::io::Error::from(Errno)` is `from_raw_os_error`, so `raw_os_error()`
+        // SURVIVES the conversion and `FsError::from_io` can still classify -- verified
+        // at rustix-1.1.4/src/io/errno.rs:58-63. That matters here specifically: the
+        // comment on `FsError::source` records that rebuilding an error as
+        // `Error::other(..)` destroys `raw_os_error()`, and that doing so was MEASURED
+        // to turn `DiskFull` into `IoError`. Do not "improve" this line by adding
+        // context to the error.
+        renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE)
+            .map_err(|e| FsError::from_io(std::io::Error::from(e)))
+    }
+
+    /// See the Unix twin for why this is atomic rather than check-then-act.
+    #[cfg(windows)]
+    fn rename_no_replace(&self, from: &Path, to: &Path) -> Result<()> {
+        use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+        // No MOVEFILE_REPLACE_EXISTING is the whole point: without that flag
+        // MoveFileExW fails rather than replacing, which is the guarantee this method
+        // has always promised and until now only approximated.
+        let wide = |p: &Path| {
+            use std::os::windows::ffi::OsStrExt;
+            p.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>()
+        };
+        let (wfrom, wto) = (wide(from), wide(to));
+
+        // SAFETY: both buffers are NUL-terminated UTF-16 built immediately above and
+        // live for the duration of the call.
+        let ok = unsafe { MoveFileExW(wfrom.as_ptr(), wto.as_ptr(), 0) };
+        if ok == 0 {
+            return Err(FsError::from_io(std::io::Error::last_os_error()));
         }
-        std::fs::rename(from, to).map_err(FsError::from_io)
+        Ok(())
     }
 
     fn remove_file(&self, path: &Path) -> Result<()> {
