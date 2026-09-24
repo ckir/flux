@@ -388,43 +388,60 @@ impl FileSystem for StdFileSystem {
         // Ok for `from == to`, restoring the exact bug the veto exists to stop. A
         // string comparison costs nothing, opens no handle, and works everywhere.
         //
-        // The two halves together are complete in practice: those same filesystems
-        // support no hard links at all, so where identity is unavailable the ONLY
-        // same-object case is the literal one this catches, and where hard links do
-        // exist so does `FILE_ID_INFO`.
-        //
         // It is deliberately EXACT rather than case-insensitive. A case-only change on
         // Windows resolves to the same object and is refused by the identity half
         // below, which matches both the check-then-act body this replaced (its
         // `symlink_metadata` saw the target and refused -- MEASURED) and macOS, where
         // `RENAME_EXCL` on case-insensitive APFS refuses it too. Renaming a name onto
         // itself in a different case is `rename_replace`'s job, not this method's.
-        if from == to {
-            return Err(FsError::new(
-                flux_fs::Code::IoError,
-                std::io::Error::from(std::io::ErrorKind::AlreadyExists),
-            ));
-        }
-
+        //
+        // WHAT THE TWO HALVES DO NOT COVER, stated because an earlier draft of this
+        // comment claimed they were "complete in practice" and that was an overclaim.
+        // They are complete only where a filesystem without `FILE_ID_INFO` also has no
+        // second name for one object. That holds for FAT32 and exFAT, which have no
+        // hard links -- but NOT for an SMB share whose server supports links while the
+        // protocol negotiation drops the id, and NOT for two lexically different paths
+        // to one object (a `subst` drive, a junction) on such a mount. There the names
+        // differ, the identity is unavailable, and `MoveFileExW` consumes the source
+        // name as it always did. That is a documented limit of the degraded path, not
+        // a reason to drop the guard: removing it would restore the `from == to` hole
+        // on every identity-less filesystem, which is strictly worse.
         let probe = |p: &Path| {
             OpenOptions::new()
                 .access_mode(0)
                 .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(p)
         };
-        if let (Ok(dst), Ok(src)) = (probe(to), probe(from))
-            && let (FileIdentity::Strong(a), FileIdentity::Strong(b)) =
-                (identity_of_handle(&src), identity_of_handle(&dst))
-            && a == b
-        {
+
+        // BOTH halves live under this probe of `to`, and the nesting is load-bearing
+        // rather than tidiness. If `to` does not open, the name is free -- and when
+        // `from == to` that also means `from` does not exist, so the KERNEL must be the
+        // one to answer, with NotFound. An earlier draft ran the lexical comparison
+        // first and unconditionally, which made `rename_no_replace(absent, absent)`
+        // answer AlreadyExists on Windows while Linux answered NotFound: MEASURED, and
+        // an inversion of exactly the error priority that
+        // `rename_no_replace_reports_a_missing_source_before_an_occupied_target` exists
+        // to pin. A guard that front-runs the filesystem inherits the obligation to be
+        // right about it.
+        if let Ok(dst) = probe(to) {
             // An Unavailable identity -- a filesystem with no FILE_ID_INFO, or an id of
-            // zero, which §107 forbids treating as valid -- falls through on purpose.
-            // Refusing on an identity the filesystem cannot supply would fail CLOSED on
-            // every ordinary publish there.
-            return Err(FsError::new(
-                flux_fs::Code::IoError,
-                std::io::Error::from(std::io::ErrorKind::AlreadyExists),
-            ));
+            // zero, which §107 forbids treating as valid -- leaves `same` false on
+            // purpose. Refusing on an identity the filesystem cannot supply would fail
+            // CLOSED on every ordinary publish there.
+            let mut same = from == to;
+            if !same
+                && let Ok(src) = probe(from)
+                && let (FileIdentity::Strong(a), FileIdentity::Strong(b)) =
+                    (identity_of_handle(&src), identity_of_handle(&dst))
+            {
+                same = a == b;
+            }
+            if same {
+                return Err(FsError::new(
+                    flux_fs::Code::IoError,
+                    std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+                ));
+            }
         }
 
         // SAFETY: both buffers are NUL-terminated UTF-16 built immediately above and

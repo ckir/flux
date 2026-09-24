@@ -736,3 +736,27 @@ fn rename_no_replace_refuses_a_case_only_change() {
     assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
     assert!(lower.exists(), "the object must survive");
 }
+
+#[test]
+fn rename_no_replace_reports_a_missing_source_even_when_it_is_its_own_target() {
+    // The same-object veto must not front-run the filesystem. `from == to` is a
+    // same-object publish ONLY when the object exists; when it does not, the honest
+    // answer is NotFound, which is what the kernel gives on both platforms.
+    //
+    // A REGRESSION PIN: an earlier draft ran the lexical comparison unconditionally
+    // and answered AlreadyExists here on Windows while Linux answered NotFound --
+    // MEASURED -- inverting the same error priority that
+    // `rename_no_replace_reports_a_missing_source_before_an_occupied_target` pins for
+    // the occupied case. Both belong to one rule: the source is resolved first.
+    let d = TempDir::new().unwrap();
+    let absent = d.path().join("absent");
+    let fs = StdFileSystem;
+
+    let err = fs.rename_no_replace(&absent, &absent).expect_err("there is nothing to rename");
+    assert_eq!(
+        err.source.kind(),
+        std::io::ErrorKind::NotFound,
+        "a missing source outranks a same-object collision that cannot exist"
+    );
+    assert!(!absent.exists(), "nothing may be created");
+}
