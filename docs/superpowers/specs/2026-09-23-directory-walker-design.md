@@ -1117,6 +1117,22 @@ keeps exactly that, one identity per created directory — so the check costs a 
 exists for another reason. A directory present before the operation started is not in that set and is
 treated as before.
 
+**The discriminator is `Strong`-only, like every other identity comparison here.** A `Weak` id is by
+definition one that may not distinguish two objects, so a set keyed on weak ids can report a
+pre-existing directory as one this operation created — turning an ordinary copy onto an existing tree
+into a spurious collision and abandoning a subtree that was fine. `Unavailable` carries no id at all
+and cannot be in the set. So a directory whose identity is not `Strong` on both sides is not entered
+into the created set and is not tested against it: `AlreadyExists` keeps its old meaning and the copy
+merges, with the degradation recorded on the warning channel.
+
+**What that costs is worth naming, because it is the least comfortable trade in this design.** Weak
+identity and case-insensitivity correlate — FAT32 and exFAT are both, and they head §107's list — so
+precisely where folding is most likely, the guard is least able to fire. Two source directories
+differing only in case then merge silently on a FAT32 destination. `Safety::Strict` refuses instead,
+which is the honest lever, and it is the same lever every other degraded check here offers. Pretending
+a weak id could carry this check would be worse: it would fail in the opposite direction, aborting
+subtrees at random on the filesystems people actually back up to.
+
 **For FILES it is not satisfied**, and the case is item 83's: copying a directory holding `File.txt` and
 `file.txt` to a case-insensitive destination publishes one and must report
 `DESTINATION_NAMESPACE_COLLISION` for the other, with nothing overwritten. Publishing with a no-replace
@@ -1177,10 +1193,28 @@ Two halves, and only one of them is already handled:
   rather than its target, and the Step 2a gate, the symlinked-anchor refusal and the item-114 capture
   all keep their meaning. A path already prefixed is left alone.
 
-  The parent must exist for this, which it does at every call site: the engine creates parents before
-  children, and the roots are resolved at startup. Where it does not — a caller naming a path under a
-  directory that is not there — the call was going to fail anyway, and it fails with the same error it
-  would have failed with.
+  **Three preconditions make that rule total rather than mostly-right, and the first two were missing
+  from an earlier revision:**
+
+  1. **Make the path ABSOLUTE first.** `Path::new("foo").parent()` is `Some("")`, and canonicalizing
+     the empty string fails — so a single-component relative path would have failed unconditionally.
+     Joining the current directory first is a pure textual step that resolves no links.
+  2. **A path with no parent, or whose final component is `.` or `..`, is canonicalized WHOLE.** A root
+     has no final component to protect. And a trailing `..` must not be appended verbatim: a `\\?\`
+     path suppresses the kernel's parsing, so the filesystem would be asked for a literal entry named
+     `..` and answer `InvalidName`. Neither `.` nor `..` names an object whose link-ness matters, so
+     resolving them costs nothing this rule exists to protect.
+  3. **A path already carrying `\\?\` or `\\.\` is returned unchanged**, which makes the conversion
+     idempotent and safe to apply at every call site without tracking whether it has run.
+
+  The parent must exist, which it does at every call site: the engine creates parents before children
+  and the roots are resolved at startup. Where it does not, the call was going to fail with `NotFound`
+  and it still does — the error names the parent rather than the target, which is more accurate rather
+  than less.
+
+  `rename_no_replace` converts both endpoints independently. They share a parent in every use this
+  design makes of it, so an implementation may convert once and reuse; that is an optimisation, not a
+  requirement, and correctness does not depend on noticing it.
 
   So the rule is narrow enough to state in one line: **resolve the parent physically, never the final
   component.** An implementer who canonicalizes the WHOLE path silently disables three safety checks;
@@ -1372,7 +1406,37 @@ improvement and is not compliance. **§149.7 is recorded as unmet tracked debt**
 when the handle-relative surface lands, this mitigation is deleted rather than kept — two mechanisms
 for one guarantee would leave a reader unsure which is authoritative.
 
-### Failures must not grow without limit
+### What all of this costs
+
+Fifteen rounds of adding guards earns an accounting, because a reader who cannot tell which check is
+load-bearing will delete the wrong one.
+
+**Per DIRECTORY:** one source stat before entering, one source re-verify after `read_dir`, one
+`create_dir`, and one destination stat capturing the created directory's identity. Plus a volume
+comparison, which is arithmetic on a value already in hand.
+
+**Per FILE:** one source stat (Step 2), one destination stat (Step 2a), one destination-parent stat
+before publishing, the `create_new`, the stream, and the publish-path stat the adapter already
+performed before any of this design existed. On Windows, one parent resolution per adapter call.
+
+**The walk does NOT stat files, and a proposed "redundant pair" rested on believing it does.** It types
+non-directory entries from `read_dir`'s `DirEntry` and yields them unstatted —
+`crates/flux-core/src/walk.rs:259` — so `copy_file`'s Step 2 is the first and only source stat. Even if
+the walk did stat, the re-stat would be load-bearing rather than redundant: the whole type-consistency
+argument in this design is that a type from a listing is a claim about the past.
+
+**Two real costs, stated rather than optimised away:**
+
+- **The destination-parent stat is per FILE, not per directory.** A directory holding ten thousand
+  files is stat'd ten thousand times. Hoisting it to once per directory is the obvious saving and is
+  wrong: the check exists because the parent can be swapped at any moment, so a per-directory check
+  would leave every file after the first one unguarded, which is the hole item 114 describes. The cost
+  is the price of the guarantee and is paid deliberately.
+- **The Windows parent resolution is per adapter CALL**, so a single file pays it several times over
+  for the same parent. This one IS safely cacheable, because the conversion is a pure function of the
+  path and the parent's resolution cannot change the answer for a directory the operation is actively
+  writing into — and if it did, the item-114 check is what notices. An implementation may memoise it
+  per directory. Correctness does not depend on doing so.
 
 Five review rounds passed over `failures: Vec<TreeFailure>`, as it then was, without noticing that it
 is an unbounded in-memory accumulator, and the spec forbids one. **Foundational invariant 9** (`:508-509`): *"Resident
@@ -1917,3 +1981,9 @@ re-derive them and a reader can see what was consciously not fixed.
   under --safety=strict.` It cannot: strict affects identity comparisons that cannot be made, while a
   boundary skip is a comparison that succeeded and said "different volume". A boundary whose volume
   could not be read is the degraded case and lands on the warning channel only, as stated.
+- `REJECTED: "the Walk source stat and copy_file's pre-copy source stat ask the same question twice."`
+  The walk does not stat files. It types non-directory entries from read_dir's DirEntry and yields them
+  unstatted (crates/flux-core/src/walk.rs:259); only FileType::Dir goes through enter(), which stats.
+  So copy_file's Step 2 is the first source stat, not the second. And were it the second it would still
+  be load-bearing, since this design's whole type-consistency argument is that a type taken from a
+  listing is a claim about the past.
