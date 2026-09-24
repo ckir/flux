@@ -200,9 +200,14 @@ each was re-measured on `origin/main` that day.
       cross-check is a command rather than a habit, and note in the justfile that **macOS has no local
       equivalent on this machine**, so the macOS leg is CI-only by construction.
 
-- [ ] **No MSRV job.** Every `ci.yml` job uses the stable toolchain and Dependabot auto-merges cargo minor and
-      patch bumps, so a dependency raising its MSRV past the workspace's `rust-version` (1.88) is not caught.
-      Add a job running `cargo +1.88 check --workspace --all-targets`.
+- [ ] **No MSRV job, and the policy change makes the original one moot.** `rust-version` now tracks the
+      current stable release (1.98.1) rather than the oldest toolchain that compiles, so the job this item
+      originally asked for — build at the floor, catch a dependency that outgrew it — cannot fail by
+      construction: nothing can require a rustc newer than the latest. What the policy needs instead is the
+      OPPOSITE check, that `rust-version` has not fallen behind stable, because a floor pinned to a specific
+      patch release goes stale the moment the next one ships and nothing in the repo notices. That is how the
+      previous value drifted: it read 1.85 while the code had needed 1.88 for some time, and `criterion`
+      already required 1.86. Decide which of the two this repo actually wants before writing either job.
 - [ ] **`ci.yml` has no `permissions:` or `concurrency:` block**, so its jobs get the repository's default token
       scope and superseded pull-request runs are not cancelled. Add `permissions: contents: read` and a
       concurrency group.

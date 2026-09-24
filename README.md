@@ -60,7 +60,7 @@ flux cleanup
 
 ## Building
 
-Requires Rust 1.88+ (edition 2024).
+Requires Rust 1.98.1+ (edition 2024).
 
 ```
 cargo build --workspace
