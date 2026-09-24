@@ -425,10 +425,14 @@ impl FileSystem for StdFileSystem {
         // BOTH halves live under this probe of `to`, and the nesting is load-bearing
         // rather than tidiness. A `to` that does not open is either ABSENT or
         // UNREACHABLE -- NOT necessarily free, as the deny-ACE case above shows -- and
-        // in both cases the KERNEL is the right one to answer rather than this method:
-        // absent gives NotFound, unreachable gives the access error, and when
-        // `from == to` an absent `to` means `from` is absent too, so NotFound is the
-        // honest reply. An earlier draft ran the lexical comparison
+        // in both cases the KERNEL is the right one to answer rather than this method.
+        //
+        // WHAT it answers depends on `from`, and that dependence is the whole argument
+        // for not pre-empting it. With a valid `from`, an absent `to` is a SUCCESS --
+        // `rename_no_replace_succeeds_when_the_name_is_free` pins exactly that. With
+        // `from == to`, an absent `to` means `from` is absent too and NotFound is the
+        // honest reply. One condition, two opposite right answers, and only the kernel
+        // knows which applies. An earlier draft ran the lexical comparison
         // first and unconditionally, which made `rename_no_replace(absent, absent)`
         // answer AlreadyExists on Windows while Linux answered NotFound: MEASURED, and
         // an inversion of exactly the error priority that
