@@ -3,7 +3,8 @@
 **Date:** 2026-09-23
 **Status:** approved, not yet planned
 **Scope:** the ordered directory walk, the filesystem primitives it needs, portable object identity,
-and `copy_tree` driving the existing `copy_file`. Delivered as three pull requests; this document is
+and `copy_tree` driving the existing `copy_file`. Delivered as four pull requests — three at first, with the last split at the engine boundary after
+PR 2 merged; this document is
 the design for all three.
 
 ## Why now
@@ -219,7 +220,7 @@ stream cannot express "leaving this directory", so a consumer would have to re-d
 path prefixes, which is fragile exactly where §7.2's component-wise ordering is subtle. The walker
 already knows when it pops its stack, so emitting the event costs nothing.
 
-**PR 3 emits `DirEnd` but does not consume it** — see "Directory metadata" below.
+**Neither PR 3 nor PR 4 consumes `DirEnd`; the walk emits it** — see "Directory metadata" below.
 
 ### Iteration and errors
 
@@ -330,6 +331,39 @@ Before descending into a directory `D`:
 - otherwise the identity checks are skipped for this entry and the operation warns once per affected
   filesystem, unless `--safety=strict` was given, in which case it refuses.
 - otherwise push it and descend, popping at `DirEnd`.
+
+### The hole the directory checks do not cover
+
+Everything above compares DIRECTORIES — an entry against the ancestor set, and an entry against the
+destination anchor. **Nothing compares a FILE against its destination**, and that is a gap in this
+design rather than an omission from the implementation. It was found while scoping PR 3, after PR 1 and
+PR 2 had merged.
+
+`copy_tree` delegates every file to `copy_file`, which is what `TreeFailureCause::Copy` records. And
+`copy_file`'s own self-copy refusal is `if src == dst` — a LEXICAL comparison. So:
+
+```
+flux copy /a /b        where /b/x is a hardlink to /a/x
+```
+
+The roots differ, lexically and by identity, so no tree-level check fires. `copy_file(/a/x, /b/x)` sees
+two different paths, so the lexical check does not fire either. The file is copied onto its own object.
+
+A junction or a bind mount reaches the same place by a different route. This is exactly what invariant
+22 forbids — *"not **only** lexical path comparisons"* — and what §129 means by not relying on
+`exclude destination` as the primary mechanism. It is unreachable before a recursive copy exists,
+because a single-file copy's source and destination are named by the user; a TREE copy is what generates
+pairs the user never typed.
+
+**So the per-file check belongs to `copy_tree`'s cut, not to a later cleanup.** Before publishing a
+file, compare the source's `ObjectId` against the destination's where BOTH are `Strong`, by the same
+rule the directory checks use — a comparison is no stronger than its weaker operand, so a `Weak` or
+`Unavailable` side degrades to the lexical floor and the aggregated warning, exactly as it does for a
+directory.
+
+`TODO.md` has carried this as "the self-copy refusal compares paths, not filesystem identity" since the
+single-file cut, recorded as blocked on an identity primitive. PR 1 delivered that primitive, so the
+blocker is gone.
 
 The **destination anchor** resolves the case §129 has to handle before anything is created. A tree copy
 is usually given a destination that does not exist yet, so it has no identity to compare against:
@@ -604,7 +638,7 @@ fake that agrees with the implementation about encoding proves nothing about the
 
 ## Delivery
 
-Three pull requests, in order. Each plan is written only once its predecessor has merged, because a plan
+Four pull requests, in order. Each plan is written only once its predecessor has merged, because a plan
 citing line numbers is a set of claims about code that must already exist.
 
 1. **Object identity.** `ObjectId`, `FileIdentity`, `Metadata.identity`, and implementations in
@@ -651,9 +685,20 @@ citing line numbers is a set of claims about code that must already exist.
    `FaultFs::set_identity` is what makes the degraded paths testable: giving two paths the same
    `ObjectId` reproduces a cycle, and giving one a `Weak` identity exercises the fallback — neither
    needs a mount, a privilege, or a particular filesystem under the test runner.
-3. **`copy_tree`.** The driver, the lexical containment floor, the §129 pre-flight and dynamic identity
-   checks, the aggregated weak-identity warning, `--safety=strict`, and the CLI dispatching a directory
-   source to it.
+3. **`copy_tree`, the safe engine.** The driver, the lexical containment floor, the §129 pre-flight and
+   dynamic identity checks, the aggregated weak-identity warning, `--safety=strict`, and the per-file
+   identity check described under "The hole the directory checks do not cover" above. **No CLI.**
+
+   Split from the CLI after PR 2, with the owner's agreement. The first split proposed was traversal
+   first and safety second, and it was rejected on its own consequence: a cut carrying the CLI without
+   the §129 pre-flight would ship a user-reachable recursive copy that will happily copy `/data` into
+   `/data/backup`, while a cut without the CLI ships nothing a user can run — which is what PR 2 already
+   is. Splitting at the ENGINE boundary instead means every merged state is both safe and coherent: this
+   one ends at a library that cannot be driven into an unsafe copy, and the next one exposes it.
+
+4. **The CLI.** `flux copy` dispatching a directory source to `copy_tree`, and the reporting of
+   `TreeOutcome` — the counts and the per-entry failures. A thin surface over an engine whose safety is
+   already settled and reviewed.
 
 ## Out of scope
 
