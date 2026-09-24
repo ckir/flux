@@ -863,4 +863,116 @@ mod tests {
             "a resumed walk must be exhausted, not handed the next sibling; got {second:?}"
         );
     }
+
+    /// Gap 1 (audit): NO test injected a `metadata` fault anywhere. The only
+    /// metadata failures tested were on the ROOT, which fails before `enter` is
+    /// ever reached, so `enter`'s own metadata error arm was unguarded.
+    #[test]
+    fn a_metadata_failure_mid_walk_is_reported_and_the_walk_continues() {
+        let fs = FaultFs::new();
+        for d in ["/r", "/r/aaa", "/r/bbb", "/r/ccc"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        fs.write_file("/r/bbb/f", b"");
+        fs.write_file("/r/ccc/f", b"");
+
+        // metadata calls: 1 = the root in `walk_with_depth`, 2 = `aaa` in `enter`.
+        fs.fail_nth("metadata", 2, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+
+        let mut errors = Vec::new();
+        let mut files = Vec::new();
+        for item in walk(&fs, Path::new("/r")).unwrap() {
+            match item {
+                Ok(WalkEvent::File { path }) => files.push(rel(&path)),
+                Err(e) => errors.push((rel(&e.path), e.cause.code)),
+                Ok(_) => {}
+            }
+        }
+
+        assert_eq!(errors, vec![("aaa".to_string(), Code::PermissionDenied)]);
+        // The siblings after the failure are the point: the error is not terminal.
+        assert_eq!(files, vec!["bbb/f".to_string(), "ccc/f".to_string()]);
+    }
+
+    /// Gap 2 (audit): the type-change guard was only ever exercised by a swap to a
+    /// SYMLINK, so weakening it from `!= Dir` to `== Symlink` survived the suite. A
+    /// directory replaced by a regular FILE is the same defect and had no test.
+    #[test]
+    fn an_entry_listed_as_a_dir_that_became_a_file_is_refused() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/r")).unwrap();
+        fs.create_dir(Path::new("/r/swap")).unwrap();
+        // The listing still says Dir, because `directories` still holds it; only
+        // what `metadata` reports changes, which is what a swap looks like.
+        fs.set_type("/r/swap", FileType::File);
+
+        let errors: Vec<(String, Code)> = walk(&fs, Path::new("/r"))
+            .unwrap()
+            .filter_map(|i| i.err())
+            .map(|e| (rel(&e.path), e.cause.code))
+            .collect();
+        assert_eq!(errors, vec![("swap".to_string(), Code::DirectoryChangedDuringScan)]);
+    }
+
+    /// Gap 3 (audit): the existing balance test only proved an error does not cause a
+    /// FALSE POSITIVE later. Nothing proved it does not cause a false NEGATIVE, so
+    /// replacing the unwind's `pop()` with `clear()` survived - and `clear()` throws
+    /// away the ROOT's id, silently disabling cycle detection for the rest of the walk.
+    #[test]
+    fn an_error_does_not_disable_cycle_detection_for_a_later_sibling() {
+        let fs = FaultFs::new();
+        for d in ["/r", "/r/aaa", "/r/loop"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        // `loop` IS the root, the measured `mount --bind a a/b` shape.
+        let shared = ObjectId { volume: 1, index: 77 };
+        fs.set_identity("/r", FileIdentity::Strong(shared));
+        fs.set_identity("/r/loop", FileIdentity::Strong(shared));
+        // read_dir calls: 1 = the root, 2 = `aaa`. Sorted, `aaa` precedes `loop`.
+        fs.fail_nth("read_dir", 2, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+
+        let errors: Vec<String> = walk(&fs, Path::new("/r"))
+            .unwrap()
+            .filter_map(|i| i.err())
+            .map(|e| rel(&e.path))
+            .collect();
+        assert_eq!(
+            errors,
+            vec!["aaa".to_string(), "loop".to_string()],
+            "the cycle must still be caught AFTER an unrelated error"
+        );
+    }
+
+    /// Gap 4 (audit): both root refusals tested failed at `metadata`, so the root's
+    /// `read_dir` failure path was never reached and swallowing it survived.
+    #[test]
+    fn walk_refuses_a_root_whose_read_dir_fails() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/r")).unwrap();
+        // read_dir call 1 IS the root's, inside `walk_with_depth`.
+        fs.fail_nth("read_dir", 1, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+
+        let e = walk(&fs, Path::new("/r")).unwrap_err();
+        assert_eq!(
+            e.code,
+            Code::PermissionDenied,
+            "a root that cannot be listed fails the whole operation, not one entry"
+        );
+    }
+
+    /// Gap 5 (audit, found by the driver and MISSED by the peer): no test ever
+    /// yielded a `WalkEvent::Other`, so rewriting that arm to produce `File`
+    /// survived the whole suite. An entire event variant had zero coverage.
+    #[test]
+    fn a_special_file_is_reported_as_other_and_never_descended_into() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/r")).unwrap();
+        fs.add_special("/r/dev");
+        fs.create_dir(Path::new("/r/real")).unwrap();
+        fs.write_file("/r/real/f", b"");
+
+        // `dev` yields exactly one Other event - not a File, and not a Dir it
+        // descends into - while `real` still produces its full triple.
+        assert_eq!(paths(&fs), vec!["O dev", "D real", "F real/f", "E real"]);
+    }
 }
