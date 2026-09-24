@@ -3,9 +3,13 @@
 **Date:** 2026-09-23
 **Status:** approved, not yet planned
 **Scope:** the ordered directory walk, the filesystem primitives it needs, portable object identity,
-and `copy_tree` driving the existing `copy_file`. Delivered as four pull requests — three at first, with the last split at the engine boundary after
-PR 2 merged; this document is
-the design for all three.
+and `copy_tree` driving the existing `copy_file`.
+
+Delivered as **five pull requests**, and this document is the design for all five. It began as three;
+the last was split at the engine boundary once PR 2 merged, and an atomic-publication prerequisite was
+inserted ahead of the engine during the engine's own design review, when §241.5 and the
+check-then-rename prohibition at `FLUX_FULL_UPDATED_SPEC_V16.md:10873` turned out to make it mandatory
+rather than optional.
 
 ## Why now
 
@@ -225,7 +229,7 @@ stream cannot express "leaving this directory", so a consumer would have to re-d
 path prefixes, which is fragile exactly where §7.2's component-wise ordering is subtle. The walker
 already knows when it pops its stack, so emitting the event costs nothing.
 
-**Neither PR 3 nor PR 4 consumes `DirEnd`; the walk emits it** — see "Directory metadata" below.
+**Neither PR 4 nor PR 5 consumes `DirEnd`; the walk emits it** — see "Directory metadata" below.
 
 ### Iteration and errors
 
@@ -341,7 +345,7 @@ Before descending into a directory `D`:
 
 Everything above compares DIRECTORIES — an entry against the ancestor set, and an entry against the
 destination anchor. **Nothing compares a FILE against its destination**, and that is a gap in this
-design rather than an omission from the implementation. It was found while scoping PR 3, after PR 1 and
+design rather than an omission from the implementation. It was found while scoping PR 4, after PR 1 and
 PR 2 had merged.
 
 `copy_tree` delegates every file to `copy_file`, which is what `TreeFailureCause::Copy` records. And
@@ -491,15 +495,15 @@ ordinary consumer backup there is, in exchange for preventing link-breakage rath
 is §108's precedent applied unchanged: `--hardlinks=auto` degrades with an aggregated warning while
 `preserve` refuses and is told "do not guess".
 
-One consequence of the split is worth naming so PR 3 does not write a promise it cannot keep: the
-warning's wording points the user at `--safety=strict`, and that flag does not exist until PR 4. PR 3
+One consequence of the split is worth naming so PR 4 does not write a promise it cannot keep: the
+warning's wording points the user at `--safety=strict`, and that flag does not exist until PR 5. PR 4
 captures the FACT of the degradation and its counts; it composes no sentence. The sentence, and the
 flag it names, land together.
 
 #### Where `--safety=strict` lives
 
 `CopyOptions` has no safety field today — it carries `preserve_times`, `preserve_permissions`,
-`durability`, `publish` and `operation_id`. PR 3 adds one, because `copy_tree(fs, src, dst, opts)` takes
+`durability`, `publish` and `operation_id`. PR 4 adds one, because `copy_tree(fs, src, dst, opts)` takes
 a single options parameter and that is the only channel a caller has.
 
 ```rust
@@ -526,11 +530,11 @@ single-file behaviour at the Step 2a gate. `CopyOptions` is already the type `co
 fields, which is what makes adding a field a compile error at each of them rather than a silent
 inheritance of a default nobody chose. There are exactly two sites today,
 `crates/flux-cli/src/main.rs:31` and the `opts()` test helper at `crates/flux-core/src/copy.rs:254`, and
-both are updated in PR 3.
+both are updated in PR 4.
 
-**The FLAG is PR 4; the enum and its behaviour are PR 3.** Wherever this document says
-`--safety=strict`, it names the behaviour `Safety::Strict` selects, not a command-line surface PR 3
-builds — PR 3 has no CLI. The flag that sets it is part of the CLI cut, and until then `Safety::Strict`
+**The FLAG is PR 5; the enum and its behaviour are PR 4.** Wherever this document says
+`--safety=strict`, it names the behaviour `Safety::Strict` selects, not a command-line surface PR 4
+builds — PR 4 has no CLI. The flag that sets it is part of the CLI cut, and until then `Safety::Strict`
 is reachable only by a library caller, which is exactly what makes it testable before it is exposed.
 
 The **destination anchor** resolves the case §129 has to handle before anything is created. A tree copy
@@ -612,7 +616,7 @@ The cost is honest and worth stating: it puts one safety-relevant step outside t
 shape this design objected to when it rejected pushing the identity gate into the adapter. The
 difference is that canonicalization is a property of PATHS rather than of the filesystem abstraction,
 and a library caller that passes unresolved paths gets the lexical floor plus the Step 2a gate, which is
-what it would have had anyway. **This is a change from the previous paragraph, which said PR 3 adds
+what it would have had anyway. **This is a change from the previous paragraph, which said PR 4 adds
 `canonicalize` to the trait; it does not.**
 
 **When the ANCHOR's identity is weak, the pre-flight degrades by the same rule** — no special case, and
@@ -677,7 +681,7 @@ line per path, which would bury it. `--safety=strict` refuses when identity is n
 sides, which is invariant 23's "explicit strict failure" and §108's `preserve` arm.
 
 **The engine CAPTURES the warning; the CLI renders it.** Splitting the last cut at the engine boundary
-means PR 3 has no printer, so "warn once per filesystem" has to survive as data until PR 4 can display
+means PR 4 has no printer, so "warn once per filesystem" has to survive as data until PR 5 can display
 it. `TreeOutcome` therefore carries the aggregation, not a formatted string.
 
 Aggregating is not uniform, because the two degraded states carry different amounts of information:
@@ -729,7 +733,7 @@ pub struct Outcome {
 
 `copy_tree` folds each file's `identity_degraded` into `TreeOutcome::warnings`, so the aggregation lives
 where the counting can happen and the detection stays where the stat is. This also gives the SINGLE-file
-path a warning it can render in PR 4 — `flux copy a b` onto removable media degrades too, and there is
+path a warning it can render in PR 5 — `flux copy a b` onto removable media degrades too, and there is
 no `TreeOutcome` in that call.
 
 This widens a public struct, so every construction site must name the new field. There are exactly two:
@@ -737,7 +741,7 @@ This widens a public struct, so every construction site must name the new field.
 
 **`DegradedGroup::example` is relative to the source root**, the same frame `TreeFailure::path` uses, so
 a renderer never has to ask which of two conventions a path came from. For the single-file path there is
-no root to be relative to, so PR 4 renders the path the user supplied.
+no root to be relative to, so PR 5 renders the path the user supplied.
 
 An earlier draft aggregated purely by REASON — two variants, `Weak` and `Unavailable`, each with a count
 and one example — on the grounds that it never asserts a filesystem it cannot name. That is a real
@@ -789,7 +793,7 @@ pub struct TreeOutcome {
     pub failures: Vec<TreeFailure>,
     /// Identity comparisons that were SKIPPED because a side was not `Strong`,
     /// aggregated for one warning apiece. Not failures: the copies succeeded.
-    /// The engine captures; PR 4's CLI renders. Empty on the normal path.
+    /// The engine captures; PR 5's CLI renders. Empty on the normal path.
     pub warnings: WeakIdentityWarnings,
 }
 
@@ -905,7 +909,7 @@ Closing the RACE properly needs an atomic primitive, and §241.5 names **three**
 - **Windows:** `FileRenameInfoEx` without `REPLACE_IF_EXISTS`, which `std` does not expose.
 
 **The open fork, for the owner.** The SEMANTICS are settled by §241.5 and not in question. What is open
-is how PR 3 supplies them, because the trait method that expresses them today is not atomic:
+is how PR 4 supplies them, because the trait method that expresses them today is not atomic:
 `rename_no_replace` tests `symlink_metadata(to).is_ok()` and then renames
 (`crates/flux-platform/src/std_fs.rs:264-276`), so two processes can both see a free name.
 
@@ -916,12 +920,21 @@ is how PR 3 supplies them, because the trait method that expresses them today is
   (exit code 3); check-then-rename is never used as a substitute."*
 - **(b) Implement the atomic primitive in this cut.** Fully compliant, but it pulls three platform
   implementations into a PR whose subject is tree safety, and `std` exposes none of them.
-- **(c) A prerequisite PR before this one**, scoped exclusively to atomic no-replace publication in
-  `flux-platform` — the three primitives, their platform tests, and the probe. PR 3 then rebases onto it
-  and simply calls `rename_no_replace`, knowing it is atomic.
+- **(c) CHOSEN by the owner — a prerequisite PR before this one**, scoped exclusively to atomic
+  no-replace publication in `flux-platform`: the three primitives, their platform tests, and the probe.
+  The tree engine then rebases onto it and simply calls `rename_no_replace`, knowing it is atomic.
+
+  Three reasons it wins over (b). It repeats a shape this project has already executed successfully —
+  PR 1 landed the object-identity primitive before the consumer that needed it, and that sequencing is
+  why PR 2 and this design could be written against something real rather than something planned. It
+  fixes a defect that exists **today**: `rename_no_replace` is racy right now, and the fix benefits the
+  single-file path whether or not a tree copy is ever built on it. And the engine cut has grown
+  materially during review — it now carries the Step 2a gate, the `Safety` enum, the warning
+  aggregation, the probe, exit 3 and the capped report — so adding three FFI implementations with no
+  `std` exposure is what would make it unreviewable.
 
 Passing `Replace` through is no longer among the options either. The previous text reasoned that "no
-caller in this cut selects `NoReplace`, so PR 3 neither fixes nor exposes it" — true about the code, and
+caller in this cut selects `NoReplace`, so PR 4 neither fixes nor exposes it" — true about the code, and
 irrelevant, because §241.5 makes selecting it mandatory rather than optional.
 
 **Two obligations fall out of that spec text regardless of which option is chosen, and this design
@@ -934,7 +947,7 @@ carried neither of them.**
    mentioned — the CLI contract so far was 0 and 1.
 2. **The blast radius is DIRECTORY operations only.** Item 113 ends *"a single-file operation against
    the same destination is unaffected"*, so `copy_file` called on its own keeps exactly today's
-   behaviour and needs no probe. The obligation attaches to `copy_tree`, which is what makes it PR 3's
+   behaviour and needs no probe. The obligation attaches to `copy_tree`, which is what makes it PR 4's
    problem rather than a change rippling through the merged single-file path.
 
 **One failure, one representation.** Each `TreeFailureCause` variant is defined by WHERE the failure
@@ -1135,7 +1148,7 @@ this document was not reconciled as they landed. A plan author who reads a block
 cite a shape that no longer exists — which is the fabricated-precision failure this project has already
 paid for once.
 
-So: **author PR 3's plan against `main`, and grep-verify every type, field, signature and line number
+So: **author PR 4's plan against `main`, and grep-verify every type, field, signature and line number
 before writing it down.** Use this document for intent and rationale, which are still current, not for
 shapes.
 
@@ -1154,12 +1167,18 @@ The drifts found so far, recorded because each one was reached for and found wro
   signature is `walk(fs, root)` and carries no destination. The walk owns ANCESTOR-SET cycle detection,
   which needs only the source tree. `copy_tree` owns the anchor comparison and performs it on each `Dir`
   event, where it already has both the anchor and the entry. Nothing about `Walk`'s surface changes for
-  PR 3.
+  PR 4.
 
 ## Delivery
 
-Four pull requests, in order. Each plan is written only once its predecessor has merged, because a plan
+Five pull requests, in order. Each plan is written only once its predecessor has merged, because a plan
 citing line numbers is a set of claims about code that must already exist.
+
+**This numbered list is the authority for the ordinals used elsewhere in this document, and the
+ordinals have already shifted once.** The engine cut was PR 3 and is now PR 4; the CLI cut was PR 4 and
+is now PR 5, because the atomic-publication prerequisite was inserted ahead of both. If prose anywhere
+disagrees with this list, the list wins — and prefer reading the cuts by NAME (identity, walk, atomic
+publication, engine, CLI), since a sixth insertion would shift them again.
 
 1. **Object identity.** `ObjectId`, `FileIdentity`, `Metadata.identity`, and implementations in
    `StdFileSystem`, `FaultFs` and the `NullFs` test stub at `fs.rs:104`. No walker code. This is first
@@ -1205,11 +1224,30 @@ citing line numbers is a set of claims about code that must already exist.
    `FaultFs::set_identity` is what makes the degraded paths testable: giving two paths the same
    `ObjectId` reproduces a cycle, and giving one a `Weak` identity exercises the fallback — neither
    needs a mount, a privilege, or a particular filesystem under the test runner.
-3. **`copy_tree`, the safe engine.** The driver, the lexical containment floor, the §129 pre-flight and
+3. **Atomic no-replace publication.** `flux-platform` only, no engine and no CLI. The three primitives
+   §241.5 names — `renameat2(RENAME_NOREPLACE)` on Linux, `renamex_np(RENAME_EXCL)` on macOS,
+   `MoveFileEx` without `MOVEFILE_REPLACE_EXISTING` on Windows — replacing `rename_no_replace`'s
+   present check-then-act body, plus the destination PROBE that `:10873` requires before a directory
+   operation changes anything, and `NOREPLACE_PUBLISH_UNAVAILABLE` with exit 3 when no primitive is
+   available.
+
+   **This PR was added during the design review of the cut that follows it, and it is a prerequisite
+   rather than a nice-to-have.** The spec forbids check-then-rename as a substitute by name, so the
+   tree engine cannot publish compliantly until this exists. It is placed here rather than inside the
+   engine cut for the reason PR 1 was placed before PR 2: a platform primitive with three
+   implementations and its own test surface is reviewable on its own terms, and unreviewable buried
+   inside a PR about tree safety.
+
+   It also fixes a defect reachable **today**, independently of any tree copy: `rename_no_replace` is
+   check-then-act in the shipped single-file path. Item 113 says a single-file operation against a
+   destination lacking the primitive is *unaffected*, so the probe and its refusal attach to directory
+   operations only — but the atomicity itself benefits both.
+
+4. **`copy_tree`, the safe engine.** The driver, the lexical containment floor, the §129 pre-flight and
    dynamic identity checks, the `Safety` enum on `CopyOptions`, the CAPTURE of the aggregated
    weak-identity warning into `TreeOutcome::warnings`, and the per-file identity check described under
    "The hole the directory checks do not cover" above. **No CLI**, so nothing here is rendered — the
-   warning is captured as data and displayed in PR 4.
+   warning is captured as data and displayed in PR 5.
 
    Split from the CLI after PR 2, with the owner's agreement. The first split proposed was traversal
    first and safety second, and it was rejected on its own consequence: a cut carrying the CLI without
@@ -1227,7 +1265,7 @@ citing line numbers is a set of claims about code that must already exist.
    is incoherent on its own terms, which is the exact property the engine-boundary split was chosen to
    guarantee.
 
-4. **The CLI.** `flux copy` dispatching a directory source to `copy_tree`, the reporting of
+5. **The CLI.** `flux copy` dispatching a directory source to `copy_tree`, the reporting of
    `TreeOutcome` — the counts and the per-entry failures — the rendering of
    `TreeOutcome::warnings` as one line per affected volume plus one for the `Unavailable` bucket, and
    the `--safety=strict` flag that sets `Safety::Strict`. A thin surface over an engine whose safety is
