@@ -1082,11 +1082,20 @@ said nothing about Windows `MAX_PATH`, which is 260.
 
 Two halves, and only one of them is already handled:
 
-- **The extended-length call path.** `std::fs::canonicalize` on Windows returns a `\\?\`-prefixed path,
-  which IS that call path — so a CLI invocation, which canonicalizes both roots before calling the
-  engine, already satisfies this. That is a second reason canonicalization belongs where it was put,
-  and it was not the reason it was put there. A library caller passing a raw path does not get it, and
-  that is stated rather than papered over: the engine does not rewrite the paths it is given.
+- **The extended-length call path, and it belongs in the ADAPTER, not the CLI.** An earlier revision
+  said the CLI's canonicalization satisfies this because `std::fs::canonicalize` returns a
+  `\\?\`-prefixed path, and accepted that a library caller passing a raw path "does not get it". **§105
+  forbids that.** `FLUX_FULL_UPDATED_SPEC_V16.md:5172-5174`: *"Flux uses extended-length paths (`\\?\`)
+  for **every** filesystem call on Windows, so the legacy 260-character path limit never applies."*
+
+  Every call, not every CLI call. So `StdFileSystem` is what ensures the prefix, on the Windows arm,
+  for every path it touches — which is the right home regardless of the spec, because it makes the
+  property true for all five cuts and every caller rather than for one entry point. The CLI's
+  canonicalization still produces such paths, and that is now a harmless overlap rather than the
+  mechanism.
+
+  This also removes the caveat the previous text was honest about but should not have needed: there is
+  no longer a class of caller that silently gets the 260-character limit.
 - **The refusal.** A path the destination still rejects as too long must fail THAT ACTION with
   `DESTINATION_ERROR` — one entry's failure, not the operation's. The design had never named that code.
   It maps as `TreeFailureCause::Copy` or `CreateDir` carrying it, so the walk continues, which is what
@@ -1119,10 +1128,18 @@ closing line asks for exactly this: *"Filesystem identity must be used to evalua
 is the primitive cut 1 delivered and that this design had not connected to the rule requiring it.
 
 - **Default: do not descend.** The directory itself is still created at the destination — it exists in
-  the source and the namespace should match — but its contents are not traversed. This is a reported
-  outcome, not a silent skip: it goes to `on_failure` so the user learns which subtrees were left out,
-  which is the same reasoning that makes an unsupported entry a reported failure rather than an
-  omission.
+  the source and the namespace should match — but its contents are not traversed.
+
+  **It is REPORTED but it is NOT a failure, and an earlier revision got this wrong** by routing it to
+  `on_failure`. That would make every backup of a home directory containing a mounted volume exit 1,
+  which is the operation correctly obeying its own default policy being reported as having gone wrong.
+  §55 settles it: exit 0 is *"success, including outcomes degraded under an auto policy (they are
+  reported, Section 51)"* — reported, and still success.
+
+  So it travels on the same channel as the weak-identity warning rather than the failure sink:
+  `TreeOutcome` carries a bounded `boundaries_skipped` — a count plus one example path, the
+  `DegradedGroup` shape, bounded by construction — and the exit code is untouched. `--cross-filesystems`
+  makes the count zero by descending.
 - **`--cross-filesystems` turns it off**, per §42 and §5.
 - **Where identity is not `Strong` on both sides**, the volume cannot be compared and the boundary
   cannot be evaluated. It degrades by the rule already established — descend, warn once per
@@ -1158,6 +1175,20 @@ the directory's identity AFTER `read_dir` and before yielding any of its entries
 discards the listing entirely and raises `DirectoryChangedDuringScan`, which is exactly the outcome
 §149.4 and §2 item 83 already prescribe for that code. Because `ObjectId` carries `volume`, the same
 re-check covers the mount boundary at no extra cost.
+
+**Where the re-check sits is load-bearing, so it is stated rather than left to the implementer.** It
+goes inside `Walk::enter`, after `read_dir` and **before the frame is pushed and before the `Dir` event
+is returned** — `crates/flux-core/src/walk.rs:372-374` pushes the frame with `emit_end: true` and then
+returns `WalkEvent::Dir`, in that order.
+
+That ordering is what makes the discard safe. A review round objected that discarding a listing would
+desynchronise the consumer's path stack, because `copy_tree` pushes on `Dir` and pops on `DirEnd`, so a
+`Dir` with no matching `DirEnd` would send every later file into the wrong directory. The objection is
+correct about the hazard and wrong about this design: failing inside `enter` means no frame is pushed
+and no `Dir` is ever emitted, so there is nothing to pop and no `DirEnd` is owed. The consumer never
+learns the directory existed.
+
+Putting the re-check anywhere later — after the `Dir` event, say — would make the objection right.
 
 **What this does and does not buy, stated as plainly as the code comment states it.** It narrows the
 window from "stat, then trust indefinitely" to "stat, list, re-stat" — an attacker must now win a race
@@ -1735,3 +1766,14 @@ re-derive them and a reader can see what was consciously not fixed.
   independently by both the driver and the round-11 peer. Items 143-147 are Phase 3 locking, worker
   state and dead-owner recovery, and bind nothing here. Items 124 and 131 corroborate the probe's file
   and its cleanup, already folded as tracked debt. The list is now swept end to end.
+- `REJECTED: "discarding a listing after read_dir desynchronises the consumer's path stack, because a
+  Dir with no matching DirEnd sends every later file into the wrong directory."` Correct about the
+  hazard, wrong about this design. `Walk::enter` pushes the frame and THEN returns the `Dir` event
+  (crates/flux-core/src/walk.rs:372-374), so a failure inside `enter` emits no `Dir` at all and owes no
+  `DirEnd`. The objection did earn a precision now folded: the re-check's position inside `enter` is
+  stated explicitly, because putting it after the `Dir` event would make the objection right.
+- `RESOLVED: the section sweep's boundary.` 260 top-level `# N.` sections, 416 headings including
+  subsections. Uncited sections that bind and are SATISFIED: §6 deterministic ordering, §40 special
+  files, §41 filesystem safety, §43 paths, §110 source-mutation levels, §111 torn-read window -- all
+  now cited. §55 and §105 were NOT satisfied and are folded above. §149.7 was missed entirely by the
+  sweep and is the subject of its own open decision.
