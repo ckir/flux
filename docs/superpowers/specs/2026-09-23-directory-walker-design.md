@@ -1069,6 +1069,50 @@ no trait change, no new test surface in three implementors, and no second way fo
 failure to the sink rather than stopping at the first. The CLI exits 1 if any failure was reported,
 matching §2 item 83 and the existing `metadata_failures` behaviour.
 
+### A destination directory swapped after Flux created it
+
+**This is a reachable way to make Flux write OUTSIDE the destination root, and the spec names it.**
+`FLUX_FULL_UPDATED_SPEC_V16.md:13411-13414`, item 114:
+
+> replacing a directory that Flux created under DEST with a symlink to a location outside DEST, between
+> its creation and the writing of its descendants, makes those actions fail with `SAFETY_REJECTED`;
+> nothing is written outside DEST, and the rest of the operation continues.
+
+The attack needs no privileges beyond write access to the destination tree:
+
+1. the walk emits `Dir("a")`, and `copy_tree` creates `dst_root/a`;
+2. the attacker removes `dst_root/a` and puts a symlink to `/etc` in its place;
+3. the walk emits `File("a/payload")`, and `copy_tree` computes `dst_root.join("a/payload")`;
+4. every check passes. Step 2a stats the destination, finds `NotFound` — correctly, nothing is there —
+   and proceeds. Step 3 creates the staging temporary in `/etc`, and Step 7 publishes `/etc/payload`.
+
+Nothing in the design as written stops it. The §129 pre-flight ran before the walk and compared roots
+that were correct at the time. The lexical floor compares the path Flux *intended*, and that path is
+inside `dst_root`; the kernel resolves the symlink afterwards. The Step 2a gate compares the source
+against whatever is at the destination, and at the destination there is nothing. **Every guard this
+design has is asking a question the attack does not answer falsely.**
+
+**The mechanism: a destination directory's identity is captured when Flux creates or accepts it, and
+re-verified before anything is written inside it.** `copy_tree` already tracks the current directory —
+it pops on `DirEnd` and keeps failed prefixes — so it holds the `ObjectId` of each destination
+directory on the same stack. Before publishing into a directory, it stats that directory and compares.
+On a mismatch the write fails with `Code::SafetyRejected` and nothing is created; by the positional
+rule this is a per-entry failure, so it goes to `on_failure` and **the walk continues**, which is what
+item 114's closing clause requires.
+
+Identity is what makes this checkable at all — a path comparison cannot see the swap, because the path
+did not change. Where identity is not `Strong` on both sides the check degrades by the rule already
+established, and `Safety::Strict` refuses; that is the same trade §107 forces everywhere else, and it
+is stated rather than hidden.
+
+**The honest limitation.** This narrows the window to the interval between the parent's verification and
+the child's publication; it does not eliminate it, because the check and the write remain two
+operations against a path the kernel re-resolves each time. Closing it structurally requires
+handle-relative traversal — `openat` and friends, writing through a directory file descriptor that
+cannot be re-pointed — which `TODO.md` already contemplates for walker TOCTOU and which is not in this
+cut. What this buys is that the attack must now win a race against a check rather than simply not being
+looked for, and item 114's requirement is met for the case item 114 describes.
+
 ### Failures must not grow without limit
 
 Five review rounds passed over `failures: Vec<TreeFailure>`, as it then was, without noticing that it
@@ -1316,7 +1360,51 @@ publication, engine, CLI), since a sixth insertion would shift them again.
    The three primitives §241.5 names — `renameat2(RENAME_NOREPLACE)` on Linux,
    `renamex_np(RENAME_EXCL)` on macOS, `MoveFileEx` without `MOVEFILE_REPLACE_EXISTING` on Windows —
    replacing `rename_no_replace`'s present check-then-act body. Plus a **capability query** on the
-   trait: "can this destination publish without replacing?", answered by the adapter.
+   trait.
+
+   **Specified concretely, because this is the cut that gets planned next and intent is not a plan:**
+
+   ```rust
+   /// Can publication into this directory refuse to replace an existing entry,
+   /// atomically? `dir` must be an existing DIRECTORY — the destination anchor,
+   /// never the not-yet-created destination root — because the answer is a
+   /// property of the filesystem the directory lives on, not of the target name.
+   fn supports_no_replace_publish(&self, dir: &Path) -> Result<bool>;
+   ```
+
+   - **Why a directory and not the target path.** The target usually does not exist, and the capability
+     belongs to the filesystem. Taking the anchor means the query is always asked about something that
+     is there, which removes the "what does it answer for a missing path" question entirely rather
+     than answering it.
+   - **`rename_no_replace`'s contract does not change**, and that is the point: it already promises to
+     fail rather than replace. What changes is that it now keeps that promise atomically. The
+     observable difference is confined to the concurrent case that previously lost silently.
+   - **Its error on an occupied target stays what it is today** — `Code::IoError` carrying
+     `ErrorKind::AlreadyExists` — so existing callers and tests are unaffected. Mapping that to
+     `DESTINATION_NAMESPACE_COLLISION` is the ENGINE's job in the next cut, where a tree copy knows
+     that the target was planned as new; a single-file caller that asked for `NoReplace` is not in a
+     collision, it simply lost a name it did not reserve.
+   - **`NullFs` returns `Ok(false)`** — the stub exists to prove the trait compiles, and claiming a
+     capability it cannot have would let a test pass against a fake that never had one. This mirrors
+     its `FileIdentity::Unavailable`.
+   - **`FaultFs` gets `set_no_replace_support(bool)`**, defaulting to `true` so existing tests need no
+     change. Setting it `false` is what makes the engine's `NOREPLACE_PUBLISH_UNAVAILABLE` refusal
+     testable in the next cut without a filesystem that genuinely lacks the primitive.
+   - **The code taxonomy is added HERE**, both `NoReplacePublishUnavailable` and
+     `DestinationNamespaceCollision`, even though the engine is what returns them. A `Code` variant is
+     a `flux-fs` concern and adding it with the capability keeps the vocabulary in one cut; the
+     alternative scatters one feature's taxonomy across two.
+   - **How the adapter answers.** Attempt-based, not a filesystem whitelist: the adapter tries the
+     primitive and reports whether it is supported, because a `statfs` magic-number table is a list of
+     guesses that ages badly and cannot see a filesystem it has not heard of. On Linux
+     `renameat2` returns `ENOSYS` or `EINVAL` where the flag is unsupported, which is the answer
+     itself; the probe needs no temporary file and therefore has no cleanup to get wrong.
+   - **Testing, given the gate runs on Windows only.** Each platform arm is exercised on its own CI
+     leg; locally only the Windows arm runs, which is the standing constraint recorded in `TODO.md`
+     rather than something this cut can fix. What is asserted everywhere, against `FaultFs`, is the
+     TRAIT-level contract: that `rename_no_replace` fails on an occupied target and succeeds on a free
+     one, and that `supports_no_replace_publish` is reported faithfully. What is asserted per platform,
+     in `crates/flux-platform/tests/`, is that the real adapter refuses a real occupied target.
 
    **The query, not the refusal.** An earlier revision of this item claimed the cut also delivers "the
    destination PROBE and `NOREPLACE_PUBLISH_UNAVAILABLE` with exit 3", which contradicted its own
@@ -1456,3 +1544,9 @@ re-derive them and a reader can see what was consciously not fixed.
   filesystems into one warning discards a volume that is trustworthy even where its index is not. The
   claimed per-file `BTreeMap` cost is also wrong: the map is touched only on a DEGRADED entry, and
   holds at most one row per volume.
+- `DISCARDED-BELOW-FLOOR: a source directory replaced by a symlink between listing and descent.`
+  Already guarded: the walk stats before entering and a type change from `Dir` yields
+  `DirectoryChangedDuringScan` rather than a descent, which is what PR 2's type-consistency check exists
+  for. Named because it is the source-side mirror of item 114 and a reader will look for it.
+- `DISCARDED-BELOW-FLOOR: the attacker deletes the staging temporary mid-stream.` Fails closed — Step 6
+  or Step 7 gets `NotFound` and the copy fails without publishing, which is the desired outcome.
