@@ -1758,8 +1758,9 @@ publication, engine, CLI), since a sixth insertion would shift them again.
      directory of §18.2, which this design lists as OUT OF SCOPE for every one of these cuts. There is
      no workspace to write into.
 
-     **The owner's decision: cut 3 ships the PRIMITIVE and the trait method only. The probe defers,
-     with the workspace.** Two alternatives were weighed and declined — defining a minimal probe
+     **The owner's decision: cut 3 ships the PRIMITIVE only. The probe defers, with the workspace.**
+     (An earlier revision of this sentence said "the primitive and the trait method", which was written
+     before the trait method was dropped two bullets below and contradicted it.) Two alternatives were weighed and declined — defining a minimal probe
      location outside the workspace, which buys item 113 on time at the price of a deliberate
      divergence from a normative constraint and of writing a control file into the user's destination
      tree that invariant 26 is sensitive about; and pulling a minimum viable workspace forward, which
@@ -1801,23 +1802,24 @@ publication, engine, CLI), since a sixth insertion would shift them again.
      one, and that a fake lacking the primitive reports it. What is asserted per platform,
      in `crates/flux-platform/tests/`, is that the real adapter refuses a real occupied target.
 
-   **The query, not the refusal.** An earlier revision of this item claimed the cut also delivers "the
-   destination PROBE and `NOREPLACE_PUBLISH_UNAVAILABLE` with exit 3", which contradicted its own
-   first line. A crate with no concept of a directory operation cannot decide to refuse one, and a
-   crate with no CLI cannot return an exit code. The three pieces separate cleanly along the cut
-   boundaries and each is testable where it lands:
+   **Where the three pieces land.** An earlier revision of this item claimed the cut delivers "the
+   destination PROBE and `NOREPLACE_PUBLISH_UNAVAILABLE` with exit 3", which contradicted its own first
+   line; a later one described a capability query that has since been dropped as unimplementable. Both
+   are gone. What remains true is the division, and it does not depend on either:
 
-   - **this cut** answers whether the capability exists, and is tested by asking it on a real
-     filesystem;
-   - **the engine cut** calls it before creating anything and refuses with
-     `NOREPLACE_PUBLISH_UNAVAILABLE`, tested against `FaultFs` with the capability forced either way;
-   - **the CLI cut** maps that refusal to **exit 3**, tested end to end.
+   - **this cut** makes publication atomic — the primitive, nothing else. It is tested on a real
+     filesystem per platform arm, and through `FaultFs` at the trait level;
+   - **the engine cut** discovers a missing primitive at the first publish and fails that action,
+     tested against `FaultFs` with `set_no_replace_support(false)`. It cannot pre-refuse, because the
+     compliant probe needs the workspace — that is the deferred debt, stated above;
+   - **the CLI cut** maps a refusal to its **exit code**, tested end to end, and will map
+     `NOREPLACE_PUBLISH_UNAVAILABLE` to exit 3 once the engine can raise it.
 
    This is the same division the weak-identity warning already uses — the engine decides, the CLI
    renders — and it is what invariant 24 asks for: *"The core transfer engine is independent of CLI
-   presentation."* The capability query is not stranded by landing first: it is a `flux-platform`
-   function with its own tests, exactly as `identity_of` was in cut 1, which also had no consumer until
-   the cut after it.
+   presentation."* The primitive is not stranded by landing first: it is a `flux-platform` change with
+   its own tests, exactly as `identity_of` was in cut 1, which also had no consumer until the cut after
+   it.
 
    **This PR was added during the design review of the cut that follows it, and it is a prerequisite
    rather than a nice-to-have.** The spec forbids check-then-rename as a substitute by name, so the
