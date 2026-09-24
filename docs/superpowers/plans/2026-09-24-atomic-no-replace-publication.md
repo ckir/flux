@@ -65,6 +65,26 @@ line.
 - **No probe.** The spec's `noreplace-probe` writes inside the operation workspace, and the workspace is out of scope for every cut in this design. Deferred by owner ruling; booked as tracked debt.
 - **No change to `rename_no_replace`'s contract or its error.** It already promises to fail rather than replace. What changes is that it keeps that promise atomically. On an occupied target it must still return `Code::IoError` carrying `ErrorKind::AlreadyExists`, because `crates/flux-platform/tests/std_fs.rs:97-107` and `:150-169` pin that and the engine cut maps it, not this one.
 
+### The shell these commands assume
+
+**Every command block in this plan is POSIX shell, not PowerShell.** The `git commit -m "$(cat <<'EOF'
+... EOF)"` form used for every commit is a heredoc, and `<<` is a parser error in PowerShell. On
+Windows, run these through the Bash tool rather than the PowerShell one. If you only have PowerShell,
+write the commit message to a file and use `git commit -F <file>` — do not try to translate the heredoc
+inline, because the message bodies contain characters PowerShell will interpret.
+
+### The tools these commands assume
+
+`just`, `cargo nextest`, `typos` and WSL. This repository declares its prerequisites in
+`.claude/recommended-tools.json`, which names each tool, why it is needed and its install command — read
+that file rather than guessing if a command is not found. A `command not found` from `just`, `typos` or
+`cargo nextest` is an ENVIRONMENT problem, not a defect in the code you just wrote, and the distinction
+matters because the gate failing for that reason looks identical to the gate failing for a real one.
+
+If WSL is absent, the cross-check steps cannot run. **Say so and stop rather than skipping them
+silently** — they are the only thing in this plan that exercises the `#[cfg(unix)]` arm, which is where
+the atomic primitive actually lives on two of the three supported platforms.
+
 ### The gate
 
 `just check` = `fmt-check` → `clippy` → `typos` → `test`, verified at `justfile:46`. Expanded:
@@ -131,11 +151,17 @@ The spec's registry is normative about the strings. Verified at `FLUX_FULL_UPDAT
 - [ ] **Step 0: Record the base commit**
 
 ```bash
-export CUT3_BASE=$(git rev-parse HEAD)
-echo "$CUT3_BASE"
+git tag -f cut3-base HEAD
+git rev-parse --short cut3-base
 ```
 
-Write that sha down. Task 7 diffs against it to confirm the cut touched only the files it should.
+**A git tag, not a shell variable.** An earlier draft used `export CUT3_BASE=...`, which does not
+survive: under subagent-driven execution each task runs in its own shell, so by Task 7 the variable is
+empty and `git diff --stat ..HEAD` silently compares nothing against nothing and prints an empty diff —
+which reads exactly like "no unexpected files" and is the most misleading possible failure. A tag lives
+in the repository and every later task sees it.
+
+Task 7 diffs against this tag and then deletes it.
 
 **Do NOT use `main` as that base.** In this worktree the local `main` ref is stale — it points at
 `bcbd4ac` while `origin/main` is at `489b947`, a gap of well over a hundred commits — so
@@ -464,13 +490,20 @@ EOF
 
 The rule is: **canonicalize the PARENT, append the final component verbatim** — with three preconditions that make it total.
 
-**A note on where these tests live, because it is load-bearing rather than taste.** `extended_length`
-is a PRIVATE function in `src/std_fs.rs`. An integration test in `tests/` cannot call it, so if its only
-tests lived there the function would have no caller until Task 4 wires it in — and an uncalled private
-function is `dead_code`, which `cargo clippy --workspace --all-targets -- -D warnings` turns into an
-error. This task would then commit a tree that fails its own gate. So the precondition tests are UNIT
-tests, in a `#[cfg(test)] mod tests` inside `src/std_fs.rs`, which both pins the behaviour and gives the
-function a caller from the moment it exists.
+**This task ships the helper, the shim, AND one real call site — and the reason is a gate failure, not
+tidiness.** `extended_length` is a PRIVATE function. A private function with no caller is `dead_code`,
+which the gate's `-D warnings` turns into an error.
+
+**Unit tests do not fix that, and an earlier draft of this plan wrongly claimed they did.**
+`cargo clippy --workspace --all-targets` builds the library target WITHOUT `cfg(test)` before it builds
+the test targets. In that build the `#[cfg(test)] mod tests` does not exist, so a function called only
+from there still has zero callers and still trips `dead_code`. Tests in `tests/` cannot call it at all,
+being a separate crate. **The only thing that clears the lint is a caller in the library itself**, which
+is why this task also adds `os_path` and converts one call site rather than leaving the wiring to
+Task 4.
+
+That the repository contains no `#[allow(dead_code)]` anywhere is consistent: it has never had such a
+function.
 
 `crates/flux-platform/src/std_fs.rs` has no test module today — verified, there is no `#[test]` anywhere
 under `crates/flux-platform/src/`. This task adds the first one.
@@ -543,7 +576,41 @@ mod tests {
 Five tests, one per precondition plus the central property. These are the cases the design got wrong
 twice before settling; none of them is exercised by any integration test.
 
-- [ ] **Step 2: Write the integration test for the unresolved final component**
+- [ ] **Step 2: Write the failing integration test**
+
+This is the red-then-green test for this task: it exercises the conversion through a real call site.
+Add to `crates/flux-platform/tests/std_fs.rs`:
+
+```rust
+#[cfg(windows)]
+#[test]
+fn create_dir_works_past_the_260_character_limit() {
+    // Item 103, through the one call site this task converts. A tree copy is what
+    // GENERATES long destination paths, so this is the property the whole \?    // conversion exists for.
+    let d = tempfile::tempdir().unwrap();
+    let mut deep = d.path().to_path_buf();
+    // 12 components of 30 characters each clears 260 comfortably. Built with the
+    // TRAIT's create_dir, not std::fs, because the trait method is what converts.
+    let fs = StdFileSystem;
+    for _ in 0..12 {
+        deep.push("a".repeat(30));
+        fs.create_dir(&deep).expect("each level must be creatable past MAX_PATH");
+    }
+    assert!(
+        deep.as_os_str().len() > 260,
+        "the probe must actually exceed MAX_PATH, got {}",
+        deep.as_os_str().len()
+    );
+    assert!(std::fs::metadata(&deep).unwrap().is_dir());
+}
+```
+
+**If this test PASSES before the helper is wired in**, this machine has Windows long-path support
+enabled system-wide (`LongPathsEnabled` in the registry) and the test cannot distinguish the converted
+from the unconverted state. Say so, rely on Step 1's five unit tests as this task's pin instead, and do
+NOT delete the test — it still runs meaningfully in CI and on a machine without that setting.
+
+- [ ] **Step 3: Write the regression test for the unresolved final component**
 
 Add to `crates/flux-platform/tests/std_fs.rs`:
 
@@ -584,14 +651,19 @@ use flux_fs::{FileIdentity, FileSystem, FileType};
 
 `rustfmt.toml` sets `reorder_imports = true`, so keep the list alphabetical or `cargo fmt --check` will fail.
 
-- [ ] **Step 3: Run them to verify they fail**
+- [ ] **Step 4: Run them to verify they fail**
 
 Run: `cargo nextest run -p flux-platform extended_length`
 
 Expected: FAIL TO COMPILE, `error[E0425]: cannot find function `extended_length` in this scope`. The five
 unit tests name a function that does not exist yet; that is the correct failure.
 
-- [ ] **Step 4: Write the helper**
+Then run: `cargo nextest run -p flux-platform create_dir_works_past`
+
+Expected: FAIL with an OS error about the path being too long — unless this machine has
+`LongPathsEnabled`, in which case see the note under Step 2.
+
+- [ ] **Step 5: Write the helper**
 
 Add to `crates/flux-platform/src/std_fs.rs`, immediately after the `#[cfg(windows)] fn destination_is_write_protected` block (which ends at `:147`):
 
@@ -675,7 +747,42 @@ fn extended_length(path: &Path) -> std::path::PathBuf {
 
 `std::fs::canonicalize` on Windows returns a `\\?\`-prefixed path, which is why no manual prefixing is needed — the prefix comes from the canonicalization of the parent and the verbatim final component inherits it.
 
-- [ ] **Step 5: Run the tests**
+- [ ] **Step 6: Add the shim and convert ONE call site**
+
+The helper still has no caller in the LIBRARY build, which is what `dead_code` measures. Add the shim,
+then convert `create_dir` — the call site the Step 2 test exercises.
+
+```rust
+/// The path as the OS should see it. A no-op on every platform but Windows, so call
+/// sites stay single-form instead of sprouting a `#[cfg]` each.
+#[cfg(windows)]
+fn os_path(path: &Path) -> std::borrow::Cow<'_, Path> {
+    std::borrow::Cow::Owned(extended_length(path))
+}
+
+/// The path as the OS should see it. See the Windows twin: only Windows needs the
+/// extended-length form, so everywhere else this borrows and costs nothing.
+#[cfg(not(windows))]
+fn os_path(path: &Path) -> std::borrow::Cow<'_, Path> {
+    std::borrow::Cow::Borrowed(path)
+}
+```
+
+A `Cow` rather than two cfg-gated call sites per method: the Unix arm borrows and allocates nothing, the
+Windows arm owns, and each method body stays one line longer instead of doubling.
+
+Then convert `create_dir` — locate it by NAME, it was at `:306-308` in the base commit:
+
+```rust
+    fn create_dir(&self, path: &Path) -> Result<()> {
+        std::fs::create_dir(os_path(path).as_ref()).map_err(FsError::from_io)
+    }
+```
+
+**Convert nothing else in this task.** The remaining seven call sites are Task 4, which is a mechanical
+sweep; this one exists to give the helper a library caller and to turn the Step 2 test green.
+
+- [ ] **Step 7: Run the tests**
 
 Run: `cargo nextest run -p flux-platform extended_length`
 
@@ -687,22 +794,27 @@ Developer Mode).
 not break, not a test of the helper. The five unit tests are what actually exercise the helper, which is
 why they exist.
 
-- [ ] **Step 6: Confirm the helper compiles away on non-Windows**
+Then run: `cargo nextest run -p flux-platform create_dir_works_past`
+
+Expected: PASS. It failed at Step 4.
+
+- [ ] **Step 8: Confirm the helper compiles away on non-Windows**
 
 Run: `wsl -e bash -lc 'cd /mnt/e/Rust/flux-walk2 && cargo clippy -p flux-platform --all-targets -- -D warnings'`
 
 Expected: clean. The helper is `#[cfg(windows)]` and so is every test above it, so Linux sees none of it. A `dead_code` warning here would mean the cfg is wrong.
 
-- [ ] **Step 7: Run the FULL gate**
+- [ ] **Step 9: Run the FULL gate**
 
 Run: `just check`
 
-Expected: all four stages pass. **This step is not optional and was missing from an earlier draft of this
-plan.** Without it this task can commit a tree whose clippy stage fails, because an uncalled private
-function is `dead_code` and the gate runs `-D warnings`. The unit tests added in Step 1 are what give the
-helper a caller; this step is what proves it.
+Expected: all four stages pass. **This step is not optional and an earlier draft of this plan omitted
+it.** It is what proves the `dead_code` chain is actually closed: `extended_length` is called by
+`os_path`, which is called by `create_dir`, which is in the library build. Had this task shipped the
+helper with only unit-test callers — as an earlier draft did — the clippy stage would fail here, because
+`--all-targets` builds the lib without `cfg(test)` first.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 git add crates/flux-platform/src/std_fs.rs crates/flux-platform/tests/std_fs.rs
@@ -730,9 +842,11 @@ whole-path canonicalization when there is no parent or the final component is
 idempotence on an already-prefixed path, so it is safe to apply at every call
 site without tracking whether it has run.
 
-Its five unit tests are what call it for now, which is both how the preconditions are pinned and why
-the tree still passes clippy -- an uncalled private function is dead_code, and the gate runs -D warnings.
-The next commit wires it into the adapter.
+It ships with the os_path shim and ONE converted call site, create_dir, which is what the long-path test
+exercises. That is not an arbitrary boundary: a private function with no LIBRARY caller is dead_code
+under the gate's -D warnings, and unit tests do not clear it, because --all-targets builds the lib
+without cfg(test) before it builds the test targets. An earlier draft of this plan claimed unit tests
+were enough and would have failed the gate here. The remaining seven call sites are the next commit.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 EOF
@@ -815,7 +929,11 @@ Plus the `#[cfg(windows)]` free function `destination_is_write_protected` at `:1
 
 The `#[cfg(unix)]` `metadata` at `:167-182` is NOT converted — `\\?\` is a Windows concept.
 
-- [ ] **Step 4: Add the conversion shim**
+- [ ] **Step 4: (the shim already exists)**
+
+`os_path` was added in Task 3 along with the first converted call site, `create_dir`. Nothing to add
+here — this step is kept as a marker so the step numbering below matches what an earlier draft had, and
+so an implementer who reads Task 4 alone does not go looking for where the shim comes from.
 
 Add immediately after the `extended_length` function from Task 3:
 
@@ -990,6 +1108,10 @@ EOF
 - Modify: `crates/flux-platform/src/std_fs.rs:264-276` (split into two cfg arms)
 
 This is the cut's reason to exist. `FLUX_FULL_UPDATED_SPEC_V16.md:10873-10876` forbids the current body by name: *"check-then-rename is never used as a substitute."*
+
+**Depends on Task 3.** The Windows arm below calls `os_path`, which Task 3 adds. If Task 3 has not run,
+this task fails to compile with `cannot find function os_path in this scope` — which is a clear enough
+error, but know the cause rather than debugging it.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1323,8 +1445,8 @@ Expected: pass, with a higher test count than Windows because `#[cfg(unix)]` tes
 - [ ] **Step 3: Confirm nothing outside the named files changed**
 
 ```bash
-# Use the sha you recorded before Task 1, NOT `main`.
-git diff --stat "$CUT3_BASE"..HEAD
+# The tag created in Task 1 Step 0, NOT `main`.
+git diff --stat cut3-base..HEAD
 ```
 
 Expected: **exactly four files.**
@@ -1352,7 +1474,15 @@ rg -n "supports_no_replace_publish|noreplace-probe" crates/
 
 Expected: no matches. Both were deliberately excluded; a match means the plan was over-implemented.
 
-- [ ] **Step 5: STOP**
+- [ ] **Step 5: Delete the base tag**
+
+```bash
+git tag -d cut3-base
+```
+
+It was scaffolding for Step 3's diff and should not outlive the cut.
+
+- [ ] **Step 6: STOP**
 
 Pushing and opening a pull request are outward actions. **Do not push. Do not open a PR.** Report completion and wait for explicit approval.
 
