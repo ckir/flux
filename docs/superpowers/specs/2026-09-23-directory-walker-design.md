@@ -1470,11 +1470,38 @@ publication, engine, CLI), since a sixth insertion would shift them again.
      `DestinationNamespaceCollision`, even though the engine is what returns them. A `Code` variant is
      a `flux-fs` concern and adding it with the capability keeps the vocabulary in one cut; the
      alternative scatters one feature's taxonomy across two.
-   - **How the adapter answers.** Attempt-based, not a filesystem whitelist: the adapter tries the
-     primitive and reports whether it is supported, because a `statfs` magic-number table is a list of
-     guesses that ages badly and cannot see a filesystem it has not heard of. On Linux
-     `renameat2` returns `ENOSYS` or `EINVAL` where the flag is unsupported, which is the answer
-     itself; the probe needs no temporary file and therefore has no cleanup to get wrong.
+   - **How the adapter answers — and this is normatively fixed, not a design choice.** An earlier
+     revision of this bullet said the probe is attempt-based and "needs no temporary file and therefore
+     has no cleanup to get wrong". That is wrong. `FLUX_FULL_UPDATED_SPEC_V16.md:10877-10884` specifies
+     the probe in detail:
+
+     > The probe writes only inside the operation's workspace, under the fixed name `noreplace-probe`,
+     > and removes what it wrote. A file it cannot remove is reported as a warning and goes with the
+     > workspace when cleanup removes it; if the operation is being refused, it exits 1 instead of 3.
+     > Under `--dry-run` it writes nothing at all; a primitive it cannot establish without writing is
+     > reported as unprobed, and the preview says that a real run may be refused with
+     > `NOREPLACE_PUBLISH_UNAVAILABLE`.
+
+     So: it WRITES, under a fixed name, in a fixed place; it cleans up; an uncleanable probe file is a
+     warning rather than a failure; a refusal that had to probe exits **1, not 3**; and `--dry-run`
+     writes nothing and reports **unprobed** rather than guessing. Acceptance items 97 and 142 repeat
+     the name and the workspace constraint.
+
+   - **This collides with a scope boundary, and the collision is real rather than editorial.** The
+     probe must write "inside the operation's workspace" — and the workspace is the `.flux` control
+     directory of §18.2, which this design lists as OUT OF SCOPE for every one of these cuts. There is
+     no workspace to write into.
+
+     The options are genuinely different and this document does not pick one, because it is the owner's
+     call: **(i)** cut 3 ships only the primitive and the trait method, and the PROBE lands with the
+     workspace in Phase 3, which means the engine cut cannot yet refuse with
+     `NOREPLACE_PUBLISH_UNAVAILABLE` and item 113 is unmet until then; **(ii)** these cuts define a
+     minimal probe location that is not the full workspace, accepting a divergence from "only inside
+     the operation's workspace" that must be recorded; **(iii)** the workspace's minimum viable form is
+     pulled forward into cut 3, which is a much larger cut than the one just scoped.
+
+     Whichever is chosen, `--dry-run` reporting **unprobed** is the behaviour that makes the absence
+     honest rather than silent, and it is available under all three.
    - **Testing, given the gate runs on Windows only.** Each platform arm is exercised on its own CI
      leg; locally only the Windows arm runs, which is the standing constraint recorded in `TODO.md`
      rather than something this cut can fix. What is asserted everywhere, against `FaultFs`, is the
@@ -1644,3 +1671,7 @@ re-derive them and a reader can see what was consciously not fixed.
 - `DISCARDED-BELOW-FLOOR: the staging temporary's name is predictable from the process id.`
   Pre-creating it makes Step 3's `create_new` fail with `AlreadyExists` and the copy aborts without
   publishing, which is the safe outcome; the sweep at Step 1 removes the name, following no link.
+- `REJECTED: "the acceptance list was swept exhaustively, items 1 through 141."` The list runs to at
+  least 147 (spec :13505-13517). The uninspected tail is where item 142 names the no-replace probe file
+  `noreplace-probe` -- which overturned this document's own account of how the probe works. An
+  exhaustiveness claim that stops short of the end is worth checking before it is relied on.
