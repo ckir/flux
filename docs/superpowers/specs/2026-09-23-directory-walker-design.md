@@ -528,6 +528,26 @@ can run *"before transfer begins"* as §129 demands, rather than after the desti
 A pre-flight comparison of `src_root` against the anchor runs before the walk starts; the per-directory
 comparison above is what catches a namespace change *after* startup.
 
+**A SYMLINKED destination anchor defeats the identity comparison, and must be treated as degraded.**
+`FileSystem::metadata` is `symlink_metadata`-based — that is the whole surface, there is no following
+variant on the trait — so for `flux copy /data /backup` where `/backup` is a symlink to `/data`, the
+comparison is between `/data`'s identity and the identity of the *link object* `/backup`. Those never
+match. The pre-flight passes.
+
+The lexical floor does not save it either: `/backup` is not lexically inside `/data`. So without a rule
+here the operation begins, `create_dir` writes THROUGH the link back into the source tree, and every
+file is copied onto itself — caught one at a time by the Step 2a gate, which turns a copy that should
+have been refused once into thousands of individual refusals. Nothing is lost, because the per-file gate
+holds; what is lost is the clean early abort §129 asks for, and that gate is the only thing standing
+between this case and writing into the source.
+
+The rule: **if the destination anchor's `file_type` is `Symlink`, the pre-flight's identity comparison
+did not happen.** It is not a pass. It routes into the same channel a weak identity does — degrade with
+a warning by default, refuse under `Safety::Strict` — because the honest description of both is "the
+comparison could not be made". That needs no new trait method and no path canonicalisation, and it puts
+the symlinked-anchor case behind the flag that exists for exactly the aliases the lexical floor cannot
+see.
+
 **When the ANCHOR's identity is weak, the pre-flight degrades by the same rule** — no special case, and
 no stricter treatment for being the earliest check. The reasoning is worth spelling out, because "the
 one check §129 requires before transfer begins" invites making it the exception:
@@ -836,6 +856,27 @@ a directory. If it is not, that is one failure for that subtree, reported at the
 actually went wrong, and the subtree is skipped. Any other `create_dir` failure skips the subtree and is
 reported the same way.
 
+**How the subtree is skipped, since `Walk` has no pruning API.** This needs saying, because "skip the
+subtree" reads like a call to a method that does not exist: `crates/flux-core/src/walk.rs` exposes
+exactly two public functions, `walk` and `walk_with_depth`, both constructors. There is no
+`skip_current_dir`, and the loop above is a `for` loop, which moves the iterator into a hidden local the
+body cannot name — so even adding one would not help without also rewriting the loop as `while let`.
+
+`copy_tree` therefore skips **consumer-side**: it keeps a set of relative prefixes whose directory
+failed, and drops any later event whose path starts with one of them, popping a prefix when its `DirEnd`
+arrives. The walker still descends and still reads those source directories; what is prevented is the
+copy attempt.
+
+That is the point. Without it, a `create_dir` that failed because a FILE occupies the destination path
+would let every descendant reach `copy_file`, and each one would fail against a non-directory parent —
+one failure per descendant, all of them far from the real cause, for a fault the design says is reported
+once. The wasted `read_dir` calls are the price of not widening a just-merged public API, and they are
+bounded by the failed subtree rather than the tree.
+
+Adding a pruning method to `Walk` is the alternative. It is not taken here: `Walk`'s surface was settled
+and reviewed in PR 2, this is the only consumer that would use pruning, and a consumer-side skip needs
+no trait change, no new test surface in three implementors, and no second way for a walk to end.
+
 `copy_tree` returns a summary — files copied, bytes copied, and every per-entry failure — rather than
 stopping at the first failure. The CLI exits 1 if any failure was recorded, matching item 83 and the
 existing `metadata_failures` behaviour.
@@ -1024,3 +1065,9 @@ re-derive them and a reader can see what was consciously not fixed.
 - `DISCARDED-BELOW-FLOOR: WeakIdentityWarnings needs an empty/default constructor because TreeOutcome
   always carries one.` A construction detail with no behavioural consequence; the implementer derives
   `Default` or writes `new()` as the surrounding code prefers.
+- `DISCARDED-BELOW-FLOOR: when BOTH sides are Weak, which volume keys the aggregation is unspecified.`
+  Affects only which of two warning buckets a degradation lands in, never whether it is reported. The
+  rule is the destination's, since that is the side the user did not name.
+- `DISCARDED-BELOW-FLOOR: TreeFailureCause::Unsupported carries a FileType while the rendered code is
+  always SPECIAL_FILE_UNSUPPORTED.` Intended, and stated as such where the variant is defined: the
+  variant carries what the entry WAS so the report can say so, while the code stays single-valued.
