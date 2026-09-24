@@ -125,6 +125,34 @@ fn rename_no_replace_refuses_a_directory_occupying_the_name() {
 }
 
 #[test]
+fn rename_no_replace_succeeds_when_the_name_is_free() {
+    // The happy path had no test at all: both existing tests assert refusal, so an
+    // implementation that refused EVERYTHING would have passed them both.
+    let d = TempDir::new().unwrap();
+    let (from, to) = (d.path().join("from"), d.path().join("to"));
+    let fs = StdFileSystem;
+    let mut f = fs.create_new(&from).unwrap();
+    f.write_all(b"payload").unwrap();
+    drop(f);
+
+    fs.rename_no_replace(&from, &to).expect("a free name must be claimable");
+
+    assert_eq!(std::fs::read(&to).unwrap(), b"payload");
+    assert!(!from.exists(), "the source name must be gone after a rename");
+}
+
+#[test]
+fn rename_no_replace_reports_a_missing_source() {
+    let d = TempDir::new().unwrap();
+    let (from, to) = (d.path().join("absent"), d.path().join("to"));
+    let fs = StdFileSystem;
+
+    let err = fs.rename_no_replace(&from, &to).expect_err("there is nothing to rename");
+    assert_eq!(err.code, flux_fs::Code::IoError);
+    assert!(!to.exists(), "nothing may appear at the target");
+}
+
+#[test]
 fn set_times_on_a_handle_moves_the_mtime() {
     let d = TempDir::new().unwrap();
     let p = d.path().join("a");
