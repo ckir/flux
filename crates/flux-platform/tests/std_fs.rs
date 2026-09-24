@@ -133,14 +133,18 @@ fn metadata_reports_a_symlink_as_not_a_file() {
     std::os::unix::fs::symlink(&target, &link).unwrap();
 
     let m = StdFileSystem.metadata(&link).unwrap();
-    assert!(!m.is_file, "a symlink must not read as a regular file, or the refusal is bypassed");
+    assert_eq!(
+        m.file_type,
+        flux_fs::FileType::Symlink,
+        "a symlink must report as a symlink, or the refusal is bypassed"
+    );
 }
 
 #[test]
 fn metadata_reports_a_directory_as_not_a_file() {
     let d = TempDir::new().unwrap();
     let fs = StdFileSystem;
-    assert!(!fs.metadata(d.path()).unwrap().is_file);
+    assert_eq!(fs.metadata(d.path()).unwrap().file_type, flux_fs::FileType::Dir);
 }
 
 #[test]
@@ -428,5 +432,9 @@ fn metadata_reports_a_reparse_point_as_not_a_file() {
     }
 
     let m = StdFileSystem.metadata(&link).unwrap();
-    assert!(!m.is_file, "a reparse point is not a regular file");
+    assert_eq!(
+        m.file_type,
+        flux_fs::FileType::Symlink,
+        "a name-surrogate reparse point reports as a symlink"
+    );
 }

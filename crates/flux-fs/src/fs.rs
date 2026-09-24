@@ -79,8 +79,17 @@ pub enum FileIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Metadata {
     pub len: u64,
-    /// False for directories, symlinks, devices, FIFOs and sockets.
-    pub is_file: bool,
+    /// The object's own type, NOT its target's -- adapters stat with
+    /// `symlink_metadata`.
+    ///
+    /// A `bool` here was not enough, and the reason is a measured tree escape rather
+    /// than tidiness. `is_file == false` is equally true of a directory and of a
+    /// symlink, while `std::fs::read_dir` FOLLOWS a symlink to a directory --
+    /// MEASURED identically on Windows (junction) and Linux (symlink). So a walk
+    /// that checked only `!is_file` before descending would, on an object swapped
+    /// from directory to symlink between the listing and the stat, enumerate the
+    /// link's TARGET and copy files from outside the tree.
+    pub file_type: FileType,
     pub permissions: Option<Perms>,
     pub modified: Option<SystemTime>,
     /// §149.4 asks the scanner to obtain identity "where strongly supported", and
@@ -183,7 +192,7 @@ mod tests {
         fn metadata(&self, _: &Path) -> crate::Result<Metadata> {
             Ok(Metadata {
                 len: 0,
-                is_file: true,
+                file_type: FileType::File,
                 permissions: None,
                 modified: None,
                 // The stub exists to prove the trait compiles. Inventing an identity
@@ -238,7 +247,7 @@ mod tests {
     #[test]
     fn a_trivial_implementation_compiles_and_is_object_safe_enough_to_use() {
         let fs = NullFs;
-        assert!(fs.metadata(Path::new("x")).unwrap().is_file);
+        assert_eq!(fs.metadata(Path::new("x")).unwrap().file_type, FileType::File);
     }
 
     #[test]

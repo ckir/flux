@@ -176,7 +176,7 @@ impl FileSystem for StdFileSystem {
         let identity = identity_of(path);
         Ok(Metadata {
             len: m.len(),
-            is_file: m.is_file(),
+            file_type: type_of(&m),
             permissions: Some(perms_of(&m)),
             modified: m.modified().ok(),
             identity,
@@ -260,6 +260,23 @@ fn perms_of(m: &std::fs::Metadata) -> Perms {
 #[cfg(not(unix))]
 fn perms_of(m: &std::fs::Metadata) -> Perms {
     Perms::ReadOnly(m.permissions().readonly())
+}
+
+/// Map std's `FileType` to ours. Symlink FIRST: on Windows std defines `is_dir()` as
+/// `!is_symlink && is_directory`, so a junction or directory symlink is already
+/// excluded there -- but testing symlink first makes that independent of std's
+/// definition rather than reliant on it.
+fn type_of(m: &std::fs::Metadata) -> flux_fs::FileType {
+    let t = m.file_type();
+    if t.is_symlink() {
+        flux_fs::FileType::Symlink
+    } else if t.is_dir() {
+        flux_fs::FileType::Dir
+    } else if t.is_file() {
+        flux_fs::FileType::File
+    } else {
+        flux_fs::FileType::Other
+    }
 }
 
 /// Unix identity costs NOTHING extra: `metadata` already calls `symlink_metadata`,

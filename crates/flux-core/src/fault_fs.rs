@@ -4,7 +4,7 @@
 //! after a strict failure — so this records the call sequence and can fail any
 //! named call. None of that is reachable against a real disk.
 
-use flux_fs::{Code, FileHandle, FileSystem, FsError, Metadata, Perms, Result};
+use flux_fs::{Code, FileHandle, FileSystem, FileType, FsError, Metadata, Perms, Result};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -405,7 +405,7 @@ impl FileSystem for FaultFs {
         })?;
         Ok(Metadata {
             len,
-            is_file: !g.not_files.contains(&p),
+            file_type: if g.not_files.contains(&p) { FileType::Other } else { FileType::File },
             permissions: g.perms.get(&p).copied().flatten(),
             modified: g.times.get(&p).copied().flatten(),
             // Panic, not `Unavailable`: `Unavailable` is a state the walker handles
