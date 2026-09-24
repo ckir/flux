@@ -432,7 +432,27 @@ and opens with `FILE_FLAG_OPEN_REPARSE_POINT` on Windows — and that is the sem
 | exists, both `Strong`, `ObjectId` differs | Proceed. |
 | exists, is a **directory** | **Refuse** with `Code::SafetyRejected`. The stat is already taken, so the `FileType` is free, and refusing here names the real reason. Without it the copy proceeds to Step 7 and fails at the rename with a platform error that does not say "the destination is a directory". |
 | exists, either side not `Strong` | See below — degrade by default, refuse under `--safety=strict`. |
-| the stat itself fails for another reason | Proceed. The gate is a guard, not the operation; a destination that cannot be inspected still meets the ordinary failure paths at Step 3 and Step 7. |
+| the stat fails for any **other** reason | Treat as a DEGRADED comparison, not as a clean pass: proceed by default and count it in the `Unavailable` bucket, refuse under strict. A destination that could not be inspected is a comparison that did not happen, which is the same thing a weak identity means. |
+
+**The rows are evaluated IN ORDER, and `NotFound` short-circuits first.** This is not a presentational
+detail. "Strict refuses whenever identity is not `Strong` on both sides" is true only of destinations
+that EXIST: a `NotFound` destination has no identity at all, so read without the ordering the rule would
+make `--safety=strict` refuse every copy into a fresh destination — and on FAT32 the source is not
+`Strong` either, so it would refuse the ordinary removable-media backup twice over, turning the flag
+into something nobody can leave on. `NotFound` is not a degraded comparison; it is a comparison that is
+not needed, because there is no object to alias.
+
+So the gate reads: **absent → proceed silently, under every `Safety` setting.** Everything below that
+row concerns destinations that exist.
+
+**One thing the gate cannot close, stated rather than implied.** The gate stats at Step 2a and the
+rename happens at Step 7, so a destination that becomes an alias of the source *in between* is not
+caught — the same check-then-act shape this document faults `rename_no_replace` for, and it would be
+dishonest to name it there and pass over it here. The window is narrow and the damage is bounded to the
+Q1 harm: a broken hardlink, not lost data, because the bytes published were read from the source before
+the destination was touched. Closing it needs an identity comparison against the open destination handle
+at publish time, which the current `rename_replace` surface does not expose. Not closed in this cut, and
+not hidden either.
 
 #### The degraded case for files, which fails OPEN
 
@@ -452,6 +472,11 @@ filesystems, and those are most removable media — so a refuse-by-default rule 
 ordinary consumer backup there is, in exchange for preventing link-breakage rather than data loss. That
 is §108's precedent applied unchanged: `--hardlinks=auto` degrades with an aggregated warning while
 `preserve` refuses and is told "do not guess".
+
+One consequence of the split is worth naming so PR 3 does not write a promise it cannot keep: the
+warning's wording points the user at `--safety=strict`, and that flag does not exist until PR 4. PR 3
+captures the FACT of the degradation and its counts; it composes no sentence. The sentence, and the
+flag it names, land together.
 
 #### Where `--safety=strict` lives
 
@@ -595,6 +620,38 @@ pub struct DegradedGroup {
 }
 ```
 
+**`copy_file` needs a channel to report its own degradation, and today it has none.** The gate that
+detects a weak identity lives in `copy_file`, but `copy_file` returns
+`Outcome { bytes_copied, metadata_failures }` — nothing there can carry "the comparison was skipped".
+Without a channel, Q1's "degrade and warn" would degrade silently, which is the fail-open behaviour the
+warning exists to prevent. So `Outcome` is widened:
+
+```rust
+pub struct Outcome {
+    pub bytes_copied: u64,
+    /// Empty on a clean copy. Non-empty means published-with-complaints.
+    pub metadata_failures: Vec<MetadataFailure>,
+    /// `Some` when the Step 2a gate could not compare and fell back to the lexical
+    /// floor. Carries the WEAKER of the two sides, which is exactly what the
+    /// aggregation keys on: `Weak(id)` contributes `id.volume`, `Unavailable`
+    /// contributes to the catch-all. `None` on the normal path AND when the
+    /// destination was `NotFound`, which is not a degradation.
+    pub identity_degraded: Option<FileIdentity>,
+}
+```
+
+`copy_tree` folds each file's `identity_degraded` into `TreeOutcome::warnings`, so the aggregation lives
+where the counting can happen and the detection stays where the stat is. This also gives the SINGLE-file
+path a warning it can render in PR 4 — `flux copy a b` onto removable media degrades too, and there is
+no `TreeOutcome` in that call.
+
+This widens a public struct, so every construction site must name the new field. There are exactly two:
+`crates/flux-core/src/copy.rs:245` and the test at `crates/flux-fs/src/options.rs:95`.
+
+**`DegradedGroup::example` is relative to the source root**, the same frame `TreeFailure::path` uses, so
+a renderer never has to ask which of two conventions a path came from. For the single-file path there is
+no root to be relative to, so PR 4 renders the path the user supplied.
+
 An earlier draft aggregated purely by REASON — two variants, `Weak` and `Unavailable`, each with a count
 and one example — on the grounds that it never asserts a filesystem it cannot name. That is a real
 property, but it bought it by discarding information that `Weak` actually has: two distinct weak volumes
@@ -680,6 +737,21 @@ pub fn copy_tree<F: FileSystem>(
 The outer `Err` is reserved for failures of the operation as a whole — the source root missing or not a
 directory, and the §129 safety rejection — because those mean no transfer happened at all. Everything
 else lands in `failures` and the walk continues.
+
+**`Code::SafetyRejected` now arrives from two levels, and they resolve differently.** The per-file gate
+returns the same code as the pre-flight, so the code alone no longer says whether the operation should
+stop:
+
+- the **pre-flight and the per-directory** rejection abort the whole operation as the outer `Err`. They
+  mean the roots themselves overlap, so every remaining file is suspect and continuing would compound
+  the damage.
+- a **per-file** rejection is ONE file's failure. It lands in `failures` as
+  `TreeFailureCause::Copy(CopyError)` and the walk continues, like any other per-file error.
+
+That asymmetry is deliberate. A single aliased file inside an otherwise sound tree is a reason to skip
+that file and report it, not to abandon a copy that may be most of the way through ten thousand others —
+and the file is left untouched either way, so continuing destroys nothing. The rule to implement is
+therefore positional, not code-based: **what aborts is WHERE the rejection came from, never its `Code`.**
 
 `opts.operation_id` is shared across every file, so each file's staging temporary is named from the same
 id. That is what makes §18.1's leftover sweep work per file without the tree needing its own scheme.
@@ -937,3 +1009,18 @@ Following symlinks (§26, Future), recreating symlinks at the destination, hardl
 directory metadata preservation, multiple source roots (§18.3), `FluxPathKey` materialisation (§103),
 parallel workers and the bounded transfer queue (Phase 3), resume, and the `.flux` control directory
 (§18.2).
+
+## Stand-downs
+
+Findings a panel round raised and stood down rather than folded, recorded so a later round does not
+re-derive them and a reader can see what was consciously not fixed.
+
+- `DISCARDED-BELOW-FLOOR: the per-file gate's extra destination stat is paid N times for a tree of N
+  files, and in the dominant fresh-destination case every one of them returns NotFound.` Unavoidable at
+  this layer: "absent" and "aliased" are not distinguishable without stat'ing, and the alternative —
+  reusing the stat `destination_is_write_protected` takes at `crates/flux-platform/src/std_fs.rs:62`
+  (Unix) / `:109` (Windows) — happens inside the adapter at publish time, which is Step 7, far too late
+  to refuse before the staging temporary exists.
+- `DISCARDED-BELOW-FLOOR: WeakIdentityWarnings needs an empty/default constructor because TreeOutcome
+  always carries one.` A construction detail with no behavioural consequence; the implementer derives
+  `Default` or writes `new()` as the surrounding code prefers.
