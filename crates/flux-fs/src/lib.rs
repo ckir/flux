@@ -13,4 +13,4 @@ pub use options::{
 
 pub mod fs;
 
-pub use fs::{FileHandle, FileIdentity, FileSystem, Metadata, ObjectId, Perms};
+pub use fs::{DirEntry, FileHandle, FileIdentity, FileSystem, FileType, Metadata, ObjectId, Perms};

@@ -1,8 +1,8 @@
 //! Single-file copy. The algorithm lives here once; platforms supply primitives.
 
 use flux_fs::{
-    Code, CopyOptions, Durability, FileHandle, FileSystem, FsError, MetadataFailure, MetadataItem,
-    Outcome, Preserve, Publish, temp_path,
+    Code, CopyOptions, Durability, FileHandle, FileSystem, FileType, FsError, MetadataFailure,
+    MetadataItem, Outcome, Preserve, Publish, temp_path,
 };
 use std::io::Write;
 use std::path::Path;
@@ -154,7 +154,7 @@ pub fn copy_file<F: FileSystem>(
     // 2. source, captured for the step-7 re-check
     // Safe to `?`: nothing has been created yet, so there is nothing to leak.
     let src_meta = fs.metadata(src).map_err(CopyError::new)?;
-    if !src_meta.is_file {
+    if src_meta.file_type != FileType::File {
         return Err(CopyError::new(FsError::new(
             Code::SpecialFileUnsupported,
             std::io::Error::other("not a regular file"),

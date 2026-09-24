@@ -5,7 +5,10 @@
 //! `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` fails — FS-6 and FS-7 measured exactly
 //! that, and Section 241.5 is amended in Task 9 to name it.
 
-use flux_fs::{FileHandle, FileIdentity, FileSystem, FsError, Metadata, ObjectId, Perms, Result};
+use flux_fs::{
+    DirEntry, FileHandle, FileIdentity, FileSystem, FileType, FsError, Metadata, ObjectId, Perms,
+    Result,
+};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -161,25 +164,51 @@ impl FileSystem for StdFileSystem {
             .map_err(FsError::from_io)
     }
 
+    #[cfg(unix)]
     fn metadata(&self, path: &Path) -> Result<Metadata> {
-        // `symlink_metadata`, NOT `metadata`: `std::fs::metadata` dereferences a
-        // symlink and would report the TARGET as a regular file, so a symlink would
-        // sail past the SPECIAL_FILE_UNSUPPORTED refusal and be copied as its target.
-        // Measured: for a symlink to a regular file, `metadata().is_file()` is true
-        // and only `symlink_metadata()` sees the link. §2 Foundational Invariants
-        // item 21 also says symlink targets never contribute unless link-following is
-        // explicitly enabled, which it is not in this cut.
+        // `symlink_metadata`, NOT `metadata`: the latter dereferences a symlink and
+        // would report the TARGET as a regular file, so a symlink would sail past
+        // the SPECIAL_FILE_UNSUPPORTED refusal and be copied as its target.
         let m = std::fs::symlink_metadata(path).map_err(FsError::from_io)?;
-        #[cfg(unix)]
-        let identity = identity_of(&m);
-        #[cfg(windows)]
-        let identity = identity_of(path);
         Ok(Metadata {
             len: m.len(),
-            is_file: m.is_file(),
+            file_type: type_of(&m),
             permissions: Some(perms_of(&m)),
             modified: m.modified().ok(),
-            identity,
+            // Free on Unix: `st_dev` and `st_ino` are already in the stat buffer, so
+            // there is no second open to eliminate here and nothing to change.
+            identity: identity_of(&m),
+        })
+    }
+
+    #[cfg(windows)]
+    fn metadata(&self, path: &Path) -> Result<Metadata> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+        // ONE open, so len, type and identity all describe the SAME object. Two
+        // opens left a window in which the path could be replaced between them.
+        //
+        // The flags are not a free choice; std's own source settles all three.
+        // BACKUP_SEMANTICS "allows opening directories" - without it a directory
+        // cannot be opened at all. OPEN_REPARSE_POINT "opens a link instead of its
+        // target" - without it this would read a symlink's TARGET identity,
+        // silently corrupting cycle detection. access_mode(0): "No read or write
+        // permissions are necessary", which avoids both a sharing violation and a
+        // denial on a file this process may not read.
+        let f = OpenOptions::new()
+            .access_mode(0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(FsError::from_io)?;
+        let m = f.metadata().map_err(FsError::from_io)?;
+        Ok(Metadata {
+            len: m.len(),
+            file_type: type_of(&m),
+            permissions: Some(perms_of(&m)),
+            modified: m.modified().ok(),
+            identity: identity_of_handle(&f),
         })
     }
 
@@ -249,6 +278,34 @@ impl FileSystem for StdFileSystem {
     fn remove_file(&self, path: &Path) -> Result<()> {
         std::fs::remove_file(path).map_err(FsError::from_io)
     }
+
+    fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(path).map_err(FsError::from_io)? {
+            let entry = entry.map_err(FsError::from_io)?;
+            // `DirEntry::file_type` does NOT follow a symlink, and on Windows the
+            // reparse tag arrives in `wfd.dwReserved0` as part of the enumeration
+            // itself, so this costs no extra syscall there.
+            let t = entry.file_type().map_err(FsError::from_io)?;
+            out.push(DirEntry {
+                name: entry.file_name(),
+                file_type: if t.is_symlink() {
+                    FileType::Symlink
+                } else if t.is_dir() {
+                    FileType::Dir
+                } else if t.is_file() {
+                    FileType::File
+                } else {
+                    FileType::Other
+                },
+            });
+        }
+        Ok(out)
+    }
+
+    fn create_dir(&self, path: &Path) -> Result<()> {
+        std::fs::create_dir(path).map_err(FsError::from_io)
+    }
 }
 
 #[cfg(unix)]
@@ -260,6 +317,23 @@ fn perms_of(m: &std::fs::Metadata) -> Perms {
 #[cfg(not(unix))]
 fn perms_of(m: &std::fs::Metadata) -> Perms {
     Perms::ReadOnly(m.permissions().readonly())
+}
+
+/// Map std's `FileType` to ours. Symlink FIRST: on Windows std defines `is_dir()` as
+/// `!is_symlink && is_directory`, so a junction or directory symlink is already
+/// excluded there -- but testing symlink first makes that independent of std's
+/// definition rather than reliant on it.
+fn type_of(m: &std::fs::Metadata) -> flux_fs::FileType {
+    let t = m.file_type();
+    if t.is_symlink() {
+        flux_fs::FileType::Symlink
+    } else if t.is_dir() {
+        flux_fs::FileType::Dir
+    } else if t.is_file() {
+        flux_fs::FileType::File
+    } else {
+        flux_fs::FileType::Other
+    }
 }
 
 /// Unix identity costs NOTHING extra: `metadata` already calls `symlink_metadata`,
@@ -276,33 +350,17 @@ fn identity_of(m: &std::fs::Metadata) -> FileIdentity {
     FileIdentity::Strong(ObjectId { volume: m.dev(), index })
 }
 
-/// Windows identity needs a HANDLE, because `GetFileInformationByHandleEx` takes one
-/// and the path-based metadata std already read cannot supply the 128-bit id.
+/// The identity half of `metadata`, reading an ALREADY-OPEN handle.
 ///
-/// Every flag is load-bearing, and std's own source says why
-/// (`library/std/src/sys/fs/windows.rs`):
-/// - `BACKUP_SEMANTICS`: std says "allows opening directories". Without it a directory
-///   cannot be opened at all, and directories are exactly what the walk needs it for.
-/// - `OPEN_REPARSE_POINT`: std says "opens a link instead of its target". Without it a
-///   symlink reports its TARGET's identity, silently corrupting a walk's cycle
-///   detection with an id belonging to a different object.
-/// - `access_mode(0)`: std says "No read or write permissions are necessary". It avoids
-///   both a sharing violation and a denial on a file this process cannot read.
+/// Split out from `identity_of(path)` so `metadata` opens once. The flags that
+/// handle must carry are documented at its one call site above; this function
+/// cannot enforce them, which is why it is private and takes a `&File` rather than
+/// a path.
 #[cfg(windows)]
-fn identity_of(path: &Path) -> FileIdentity {
-    use std::os::windows::fs::OpenOptionsExt;
+fn identity_of_handle(file: &File) -> FileIdentity {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FileIdInfo,
-        GetFileInformationByHandleEx,
-    };
-
-    let Ok(file) = OpenOptions::new()
-        .access_mode(0)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-    else {
-        return FileIdentity::Unavailable;
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
     };
 
     let mut info = FILE_ID_INFO { VolumeSerialNumber: 0, FileId: Default::default() };

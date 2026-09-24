@@ -133,14 +133,18 @@ fn metadata_reports_a_symlink_as_not_a_file() {
     std::os::unix::fs::symlink(&target, &link).unwrap();
 
     let m = StdFileSystem.metadata(&link).unwrap();
-    assert!(!m.is_file, "a symlink must not read as a regular file, or the refusal is bypassed");
+    assert_eq!(
+        m.file_type,
+        flux_fs::FileType::Symlink,
+        "a symlink must report as a symlink, or the refusal is bypassed"
+    );
 }
 
 #[test]
 fn metadata_reports_a_directory_as_not_a_file() {
     let d = TempDir::new().unwrap();
     let fs = StdFileSystem;
-    assert!(!fs.metadata(d.path()).unwrap().is_file);
+    assert_eq!(fs.metadata(d.path()).unwrap().file_type, flux_fs::FileType::Dir);
 }
 
 #[test]
@@ -428,5 +432,141 @@ fn metadata_reports_a_reparse_point_as_not_a_file() {
     }
 
     let m = StdFileSystem.metadata(&link).unwrap();
-    assert!(!m.is_file, "a reparse point is not a regular file");
+    assert_eq!(
+        m.file_type,
+        flux_fs::FileType::Symlink,
+        "a name-surrogate reparse point reports as a symlink"
+    );
+}
+
+#[test]
+fn read_dir_lists_children_with_their_types() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::create_dir(d.path().join("sub")).unwrap();
+    std::fs::write(d.path().join("f.txt"), b"x").unwrap();
+
+    let fs = StdFileSystem;
+    let mut got: Vec<(String, flux_fs::FileType)> = fs
+        .read_dir(d.path())
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.name.to_string_lossy().into_owned(), e.file_type))
+        .collect();
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+
+    assert_eq!(
+        got,
+        vec![
+            ("f.txt".to_string(), flux_fs::FileType::File),
+            ("sub".to_string(), flux_fs::FileType::Dir),
+        ]
+    );
+}
+
+#[test]
+fn read_dir_on_an_empty_directory_is_empty_not_an_error() {
+    // An empty directory is exactly what a tree copy must handle, and the old fake
+    // could not even express one.
+    let d = tempfile::tempdir().unwrap();
+    assert!(StdFileSystem.read_dir(d.path()).unwrap().is_empty());
+}
+
+#[test]
+fn read_dir_on_a_missing_path_fails() {
+    let d = tempfile::tempdir().unwrap();
+    assert!(StdFileSystem.read_dir(&d.path().join("nope")).is_err());
+}
+
+#[test]
+fn create_dir_makes_one_level_and_refuses_a_missing_parent() {
+    let d = tempfile::tempdir().unwrap();
+    let fs = StdFileSystem;
+
+    fs.create_dir(&d.path().join("a")).unwrap();
+    assert_eq!(fs.metadata(&d.path().join("a")).unwrap().file_type, flux_fs::FileType::Dir);
+
+    // Fails if the parent is missing: the walk creates ancestors in order, so it
+    // never needs the recursive form, and silently creating them would hide a bug.
+    assert!(fs.create_dir(&d.path().join("missing/b")).is_err());
+    // And refuses to replace something that is already there.
+    assert!(fs.create_dir(&d.path().join("a")).is_err());
+}
+
+/// Create a directory link at `link` pointing at `target`, by whatever mechanism the
+/// platform allows WITHOUT privilege.
+///
+/// Two arms because the test below asserts a CROSS-PLATFORM property and was measured
+/// on both, so gating it to one platform would leave the other half of the claim
+/// untested. `cfg(unix)` covers macOS, so between them the two arms cover every target
+/// the CI matrix builds.
+#[cfg(windows)]
+fn make_dir_link(target: &std::path::Path, link: &std::path::Path) -> Result<(), String> {
+    make_dir_reparse_point(target, link)
+}
+
+#[cfg(unix)]
+fn make_dir_link(target: &std::path::Path, link: &std::path::Path) -> Result<(), String> {
+    std::os::unix::fs::symlink(target, link).map_err(|e| e.to_string())
+}
+
+#[test]
+fn read_dir_follows_a_symlink_to_a_directory_which_is_why_file_type_is_checked() {
+    // This is the reachable tree escape. MEASURED on Windows via a junction and on
+    // Linux via a symlink, identically: read_dir on the link enumerates the TARGET.
+    // So a walk that descended on `!is_file` alone would copy files from outside the
+    // tree. `Metadata.file_type` is what lets the walk refuse.
+    let d = tempfile::tempdir().unwrap();
+    let real = d.path().join("real");
+    let link = d.path().join("link");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::write(real.join("marker.txt"), b"x").unwrap();
+    if make_dir_link(&real, &link).is_err() {
+        eprintln!("skipped: cannot create a directory link here");
+        return;
+    }
+
+    let fs = StdFileSystem;
+    let names: Vec<String> = fs
+        .read_dir(&link)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name.to_string_lossy().into_owned())
+        .collect();
+    assert!(names.contains(&"marker.txt".to_string()), "read_dir FOLLOWS the link");
+
+    // And the refusal that makes it safe: the link reports as a Symlink, not a Dir.
+    assert_eq!(fs.metadata(&link).unwrap().file_type, flux_fs::FileType::Symlink);
+}
+
+#[cfg(unix)]
+#[test]
+fn read_dir_reports_non_utf8_names_intact() {
+    // A fake that agrees with the implementation about encoding proves nothing
+    // about the OS. §241: the on-disk name is bytes, and it must survive read_dir
+    // without a lossy conversion.
+    //
+    // `cfg(unix)` is NOT the same as "permits arbitrary bytes in a name", and this
+    // test asserted that it was. POSIX allows any byte but `/` and NUL, and Linux
+    // follows it -- but macOS's APFS and HFS+ ENFORCE UTF-8 and refuse this name
+    // outright. MEASURED on a macos-latest runner, which is where it was caught:
+    // `Os { code: 92, kind: Uncategorized, message: "Illegal byte sequence" }`.
+    // There are three naming regimes here, not two: arbitrary bytes on Linux,
+    // WTF-16 on Windows, and enforced UTF-8 on macOS.
+    //
+    // So the CONTRACT is stated as what it actually is -- on a filesystem that
+    // permits such a name, `read_dir` must return it intact -- and the test skips,
+    // loudly, where the OS will not create one. Gating to `target_os = "linux"`
+    // would have worked too and was rejected: it would silently drop the check on
+    // every other unix that does allow these names.
+    use std::os::unix::ffi::OsStrExt;
+    let d = tempfile::tempdir().unwrap();
+    let raw = std::ffi::OsStr::from_bytes(&[b'x', 0xFF, b'y']);
+    if std::fs::write(d.path().join(raw), b"").is_err() {
+        eprintln!("skipped: this filesystem refuses a non-UTF-8 name");
+        return;
+    }
+
+    let got = StdFileSystem.read_dir(d.path()).unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].name.as_bytes(), &[b'x', 0xFF, b'y'], "name survived intact");
 }

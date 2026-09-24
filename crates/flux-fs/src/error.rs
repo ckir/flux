@@ -17,6 +17,10 @@ pub enum Code {
     StrictDurabilityUnavailable,
     SpecialFileUnsupported,
     SafetyRejected,
+    /// §2 item 83, §149.4. A DIRECTORY whose object changed under the walk -- not to
+    /// be confused with `SourceChanged`, which is a FILE whose length or mtime moved
+    /// under `copy_file` (§33). Different objects, different producers, no overlap.
+    DirectoryChangedDuringScan,
     IoError,
 }
 
@@ -31,6 +35,7 @@ impl Code {
             Code::StrictDurabilityUnavailable => "STRICT_DURABILITY_UNAVAILABLE",
             Code::SpecialFileUnsupported => "SPECIAL_FILE_UNSUPPORTED",
             Code::SafetyRejected => "SAFETY_REJECTED",
+            Code::DirectoryChangedDuringScan => "DIRECTORY_CHANGED_DURING_SCAN",
             Code::IoError => "IO_ERROR",
         }
     }
@@ -93,6 +98,7 @@ mod tests {
         assert_eq!(Code::SpecialFileUnsupported.as_str(), "SPECIAL_FILE_UNSUPPORTED");
         assert_eq!(Code::SafetyRejected.as_str(), "SAFETY_REJECTED");
         assert_eq!(Code::IoError.as_str(), "IO_ERROR");
+        assert_eq!(Code::DirectoryChangedDuringScan.as_str(), "DIRECTORY_CHANGED_DURING_SCAN");
     }
 
     #[test]
