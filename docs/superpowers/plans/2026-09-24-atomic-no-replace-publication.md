@@ -439,7 +439,7 @@ Add to the `#[cfg(test)] mod tests` block at the end of `crates/flux-core/src/fa
 
 - [ ] **Step 3: Run them to verify they fail**
 
-Run: `cargo nextest run -p flux-core no_replace_support`
+Run: `cargo nextest run -p flux-core -E 'test(no_replace_support_is_on_by_default) + test(a_destination_without_the_primitive_reports_it)'`
 
 Expected: FAIL to COMPILE with `error[E0599]: no method named `set_no_replace_support` found`. A
 compile failure, not a test failure — nothing runs, which is the correct outcome here and the one case
@@ -496,10 +496,20 @@ In `crates/flux-core/src/fault_fs.rs:502-518`, insert immediately after the `mis
 
 - [ ] **Step 7: Run the tests**
 
-Run: `cargo nextest run -p flux-core no_replace_support`
+Run: `cargo nextest run -p flux-core -E 'test(no_replace_support_is_on_by_default) + test(a_destination_without_the_primitive_reports_it)'`
 
 Expected: PASS, and `Starting 2 tests` — if it says 1, one of the two test names does not match the
 filter and you are only running half of what you think you are.
+
+**Why a filterset expression and not the bare word `no_replace_support`.** MEASURED during execution:
+a positional argument to `nextest` is a SUBSTRING match on the test name, and
+`a_destination_without_the_primitive_reports_it` shares no substring with `no_replace_support`, so
+`cargo nextest run -p flux-core no_replace_support` reports `Starting 1 test across 1 binary (70 tests
+skipped)` and silently exercises only half of what Step 8 depends on. That is not merely a wrong count:
+each mutant below predicts its victim goes red **and the other test stays green**, and the second half
+of that prediction cannot be observed if the second test was never selected. Six panel rounds read the
+bare filter without catching it — including a seat that claimed to have simulated this step and reported
+the count as matching. Naming both tests explicitly is what makes the count check mean something.
 
 - [ ] **Step 8: Prove the new tests are not vacuous**
 
@@ -512,7 +522,7 @@ advance is proving nothing.
 **Mutant A — kills `a_destination_without_the_primitive_reports_it`.** Change the guard from
 `== Some(false)` to `== Some(true)`.
 
-Run: `cargo nextest run -p flux-core no_replace_support`
+Run: `cargo nextest run -p flux-core -E 'test(no_replace_support_is_on_by_default) + test(a_destination_without_the_primitive_reports_it)'`
 
 Expected: `a_destination_without_the_primitive_reports_it` FAILS. With the field set to `Some(false)`,
 `Some(false) == Some(true)` is false, so the guard is skipped, the rename succeeds and the test's
@@ -524,7 +534,7 @@ Revert, and confirm both pass.
 **Mutant B — kills `no_replace_support_is_on_by_default`.** Change the guard from `== Some(false)` to
 `!= Some(true)`.
 
-Run: `cargo nextest run -p flux-core no_replace_support`
+Run: `cargo nextest run -p flux-core -E 'test(no_replace_support_is_on_by_default) + test(a_destination_without_the_primitive_reports_it)'`
 
 Expected: `no_replace_support_is_on_by_default` FAILS. With the field `None`, `None != Some(true)` is
 true, so the guard now fires on the default path and the rename errors where the test expects success.
