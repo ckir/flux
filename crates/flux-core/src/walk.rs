@@ -254,6 +254,24 @@ impl<'a, F: FileSystem> Walk<'a, F> {
             Err(cause) => return Err(WalkError { path: rel, cause }),
         };
 
+        // §149.4. `read_dir` typed this entry `Dir`; if `metadata` disagrees, the
+        // object under the name changed between the listing and the stat.
+        //
+        // This NARROWS the race, it does not close it: the window moves from
+        // read_dir-to-metadata down to metadata-to-read_dir, and something could
+        // still be swapped inside it. Closing it needs `openat`-style relative
+        // traversal with `O_NOFOLLOW`, which `TODO.md` already records as the fix
+        // for walker TOCTOU. Do not let this comment claim more than that.
+        if m.file_type != FileType::Dir {
+            return Err(WalkError {
+                path: rel,
+                cause: FsError::new(
+                    Code::DirectoryChangedDuringScan,
+                    std::io::Error::other("entry listed as a directory is no longer one"),
+                ),
+            });
+        }
+
         // Only `Strong` is ever pushed OR compared, so "both sides Strong" holds by
         // construction. §107: a Weak identity exists and cannot be trusted, and a
         // comparison is no stronger than its weaker operand. Asymmetry is the normal
@@ -600,5 +618,25 @@ mod tests {
             .collect();
         // `a` fails on read_dir. `b` must NOT then be refused as a cycle.
         assert_eq!(errors, vec!["a".to_string()], "b must not be a false cycle; got {errors:?}");
+    }
+
+    #[test]
+    fn an_entry_listed_as_a_directory_that_is_no_longer_one_is_refused() {
+        // §149.4: "the scanner must verify that the object being entered remains
+        // consistent with the planned directory identity." read_dir typed this as a
+        // Dir; metadata disagrees; therefore the object changed under the scan.
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/r")).unwrap();
+        fs.create_dir(Path::new("/r/swap")).unwrap();
+        // The listing still says Dir, because `directories` still holds it, while
+        // `types` now reports a symlink -- exactly the split the swap produces.
+        fs.set_type("/r/swap", FileType::Symlink);
+
+        let errors: Vec<(String, Code)> = walk(&fs, Path::new("/r"))
+            .unwrap()
+            .filter_map(|i| i.err())
+            .map(|e| (rel(&e.path), e.cause.code))
+            .collect();
+        assert_eq!(errors, vec![("swap".to_string(), Code::DirectoryChangedDuringScan)]);
     }
 }

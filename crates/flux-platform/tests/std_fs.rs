@@ -491,3 +491,32 @@ fn create_dir_makes_one_level_and_refuses_a_missing_parent() {
     // And refuses to replace something that is already there.
     assert!(fs.create_dir(&d.path().join("a")).is_err());
 }
+
+#[test]
+fn read_dir_follows_a_symlink_to_a_directory_which_is_why_file_type_is_checked() {
+    // This is the reachable tree escape. MEASURED on Windows via a junction and on
+    // Linux via a symlink, identically: read_dir on the link enumerates the TARGET.
+    // So a walk that descended on `!is_file` alone would copy files from outside the
+    // tree. `Metadata.file_type` is what lets the walk refuse.
+    let d = tempfile::tempdir().unwrap();
+    let real = d.path().join("real");
+    let link = d.path().join("link");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::write(real.join("marker.txt"), b"x").unwrap();
+    if make_dir_reparse_point(&real, &link).is_err() {
+        eprintln!("skipped: cannot create a directory reparse point here");
+        return;
+    }
+
+    let fs = StdFileSystem;
+    let names: Vec<String> = fs
+        .read_dir(&link)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name.to_string_lossy().into_owned())
+        .collect();
+    assert!(names.contains(&"marker.txt".to_string()), "read_dir FOLLOWS the link");
+
+    // And the refusal that makes it safe: the link reports as a Symlink, not a Dir.
+    assert_eq!(fs.metadata(&link).unwrap().file_type, flux_fs::FileType::Symlink);
+}

@@ -216,6 +216,14 @@ impl FaultFs {
         g.files.contains_key(path) || g.directories.contains(path)
     }
 
+    /// Override what `metadata` reports a path as, WITHOUT changing what `read_dir`
+    /// lists it as. That split is the whole point: it is what an object swapped
+    /// between the listing and the stat looks like from inside the walk.
+    pub fn set_type(&self, path: impl AsRef<Path>, file_type: FileType) {
+        let path = path.as_ref();
+        self.inner.lock().unwrap().types.insert(path.to_path_buf(), file_type);
+    }
+
     /// Inject a fault whose source carries a CHOSEN `ErrorKind`.
     ///
     /// `fail` alone always produced `ErrorKind::Other`, so any code branching on the
