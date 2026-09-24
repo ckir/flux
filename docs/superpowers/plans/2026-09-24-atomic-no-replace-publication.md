@@ -117,6 +117,33 @@ If WSL is absent, the cross-check steps cannot run. **Say so and stop rather tha
 silently** — they are the only thing in this plan that exercises the `#[cfg(unix)]` arm, which is where
 the atomic primitive actually lives on two of the three supported platforms.
 
+### Use `cargo nextest run` for every filtered test command, never `cargo test`
+
+**A `cargo test` filter that matches nothing exits 0.** MEASURED in this worktree:
+
+```
+cargo test        -p flux-fs definitely_no_such_test_9f3a
+  -> cargo test: 0 passed, 12 filtered out (1 suite, 0.00s)      EXIT 0
+
+cargo nextest run -p flux-fs definitely_no_such_test_9f3a
+  -> error: no tests to run  (hint: use `--no-tests` to customize)   EXIT 4
+```
+
+Every verification step below selects tests by name, so a renamed test, a typo, or a test that was
+never written would, under `cargo test`, produce a green step that ran no assertion at all. Under
+`nextest` it fails loudly. **This matters most at the MUTANT steps**, where the expected outcome is a
+FAILURE: a zero-match filter there reports success, which reads as "the mutant did not kill the test",
+and the implementer would then correctly follow the plan's instruction to stop and report the test as
+vacuous — a false alarm caused entirely by the runner.
+
+An earlier draft used `cargo test` in Tasks 1 and 2 and `nextest` elsewhere. It is `nextest`
+throughout now, which also matches what `just check` runs. `cargo test --doc` is a separate thing and
+stays as it is.
+
+**Read the count, not just the colour.** `nextest` prints `Starting N tests` — check `N` is the number
+you expect. A step that says "Expected: PASS, 2 tests" means two, and one is a failure even though
+nothing was red.
+
 ### The gate
 
 `just check` = `fmt-check` → `clippy` → `typos` → `test`, verified at `justfile:46`. Expanded:
@@ -246,7 +273,7 @@ In `crates/flux-fs/src/error.rs`, in the test `every_code_has_the_spec_string` (
 
 - [ ] **Step 3: Run it to verify it fails**
 
-Run: `cargo test -p flux-fs every_code_has_the_spec_string`
+Run: `cargo nextest run -p flux-fs every_code_has_the_spec_string`
 
 Expected: FAIL to COMPILE, with `error[E0599]: no variant or associated item named `NoReplacePublishUnavailable` found for enum `Code``.
 
@@ -389,9 +416,11 @@ Add to the `#[cfg(test)] mod tests` block at the end of `crates/flux-core/src/fa
 
 - [ ] **Step 3: Run them to verify they fail**
 
-Run: `cargo test -p flux-core no_replace_support`
+Run: `cargo nextest run -p flux-core no_replace_support`
 
-Expected: FAIL to COMPILE with `error[E0599]: no method named `set_no_replace_support` found`.
+Expected: FAIL to COMPILE with `error[E0599]: no method named `set_no_replace_support` found`. A
+compile failure, not a test failure — nothing runs, which is the correct outcome here and the one case
+in this plan where a zero-test run is expected.
 
 - [ ] **Step 4: Add the field**
 
@@ -444,9 +473,10 @@ In `crates/flux-core/src/fault_fs.rs:502-518`, insert immediately after the `mis
 
 - [ ] **Step 7: Run the tests**
 
-Run: `cargo test -p flux-core no_replace_support`
+Run: `cargo nextest run -p flux-core no_replace_support`
 
-Expected: PASS, 2 tests.
+Expected: PASS, and `Starting 2 tests` — if it says 1, one of the two test names does not match the
+filter and you are only running half of what you think you are.
 
 - [ ] **Step 8: Prove the new tests are not vacuous**
 
@@ -459,7 +489,7 @@ advance is proving nothing.
 **Mutant A — kills `a_destination_without_the_primitive_reports_it`.** Change the guard from
 `== Some(false)` to `== Some(true)`.
 
-Run: `cargo test -p flux-core no_replace_support`
+Run: `cargo nextest run -p flux-core no_replace_support`
 
 Expected: `a_destination_without_the_primitive_reports_it` FAILS. With the field set to `Some(false)`,
 `Some(false) == Some(true)` is false, so the guard is skipped, the rename succeeds and the test's
@@ -471,7 +501,7 @@ Revert, and confirm both pass.
 **Mutant B — kills `no_replace_support_is_on_by_default`.** Change the guard from `== Some(false)` to
 `!= Some(true)`.
 
-Run: `cargo test -p flux-core no_replace_support`
+Run: `cargo nextest run -p flux-core no_replace_support`
 
 Expected: `no_replace_support_is_on_by_default` FAILS. With the field `None`, `None != Some(true)` is
 true, so the guard now fires on the default path and the rename errors where the test expects success.
