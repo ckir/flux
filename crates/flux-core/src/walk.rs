@@ -254,15 +254,46 @@ impl<'a, F: FileSystem> Walk<'a, F> {
             Err(cause) => return Err(WalkError { path: rel, cause }),
         };
 
+        // Only `Strong` is ever pushed OR compared, so "both sides Strong" holds by
+        // construction. §107: a Weak identity exists and cannot be trusted, and a
+        // comparison is no stronger than its weaker operand. Asymmetry is the normal
+        // case -- a local ext4 source against an SMB destination -- so this is the
+        // common path, not a corner.
+        let mut pushed_ancestor = false;
+        if let FileIdentity::Strong(id) = m.identity {
+            if self.ancestors.contains(&id) {
+                return Err(WalkError {
+                    path: rel,
+                    cause: FsError::new(
+                        Code::IoError,
+                        // Not `SafetyRejected`: that aborts the whole operation
+                        // under §129 and a cycle explicitly does not, so the same
+                        // code would carry two different severities.
+                        // `ErrorKind::FilesystemLoop` would be the precise kind but
+                        // is unstable on the pinned toolchain (E0658, issue #86442).
+                        std::io::Error::other("directory cycle: already an ancestor"),
+                    ),
+                });
+            }
+            self.ancestors.push(id);
+            pushed_ancestor = true;
+        }
+
         let entries = match self.fs.read_dir(&abs) {
             Ok(v) => sorted(v),
-            Err(cause) => return Err(WalkError { path: rel, cause }),
+            Err(cause) => {
+                // Balance the set: this frame is never pushed, so nothing will pop.
+                if pushed_ancestor {
+                    self.ancestors.pop();
+                }
+                return Err(WalkError { path: rel, cause });
+            }
         };
 
         self.stack.push(Frame {
             rel: rel.clone(),
             entries: entries.into_iter(),
-            pushed_ancestor: false,
+            pushed_ancestor,
             emit_end: true,
         });
         Ok(WalkEvent::Dir { path: rel, identity: m.identity })
@@ -459,5 +490,115 @@ mod tests {
     #[test]
     fn the_default_cap_is_256() {
         assert_eq!(DEFAULT_MAX_DEPTH, 256);
+    }
+
+    #[test]
+    fn a_directory_that_re_enters_an_ancestor_is_refused() {
+        // The measured case is `mount --bind a a/b`, where `a` and `a/b` share a
+        // dev+ino. `set_identity` reproduces it with no mount and no privilege.
+        let fs = FaultFs::new();
+        for d in ["/r", "/r/a", "/r/a/b"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        fs.write_file("/r/a/marker", b"");
+        let shared = ObjectId { volume: 1, index: 9999 };
+        fs.set_identity("/r/a", FileIdentity::Strong(shared));
+        fs.set_identity("/r/a/b", FileIdentity::Strong(shared));
+
+        let mut errors = Vec::new();
+        let mut dirs = Vec::new();
+        for item in walk(&fs, Path::new("/r")).unwrap() {
+            match item {
+                Ok(WalkEvent::Dir { path, .. }) => dirs.push(rel(&path)),
+                Err(e) => errors.push(rel(&e.path)),
+                _ => {}
+            }
+        }
+
+        assert_eq!(dirs, vec!["a".to_string()], "b is never entered; got {dirs:?}");
+        assert_eq!(errors, vec!["a/b".to_string()]);
+    }
+
+    #[test]
+    fn the_root_is_in_the_ancestor_set_from_the_start() {
+        // `mount --bind a a/b` where the re-entered directory IS the root. A walk
+        // that only tracked directories it emitted events for would copy the whole
+        // tree twice -- the exact defect the check exists to prevent.
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/r")).unwrap();
+        fs.create_dir(Path::new("/r/loop")).unwrap();
+        let shared = ObjectId { volume: 1, index: 7 };
+        fs.set_identity("/r", FileIdentity::Strong(shared));
+        fs.set_identity("/r/loop", FileIdentity::Strong(shared));
+
+        let errors: Vec<String> = walk(&fs, Path::new("/r"))
+            .unwrap()
+            .filter_map(|i| i.err())
+            .map(|e| rel(&e.path))
+            .collect();
+        assert_eq!(errors, vec!["loop".to_string()]);
+    }
+
+    #[test]
+    fn a_weak_identity_is_not_compared_at_all() {
+        // A comparison is no stronger than its weaker operand. Weak and Unavailable
+        // behave identically: a value that cannot be trusted is worth no more than
+        // one that is absent. PR 3 owns the warning; PR 2 yields the identity on the
+        // Dir event and lets the consumer decide.
+        let fs = FaultFs::new();
+        for d in ["/r", "/r/a", "/r/a/b"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        let shared = ObjectId { volume: 1, index: 5 };
+        fs.set_identity("/r/a", FileIdentity::Weak(shared));
+        fs.set_identity("/r/a/b", FileIdentity::Weak(shared));
+
+        let errors: Vec<String> = walk(&fs, Path::new("/r"))
+            .unwrap()
+            .filter_map(|i| i.err())
+            .map(|e| rel(&e.path))
+            .collect();
+        assert!(errors.is_empty(), "weak identity is not compared; got {errors:?}");
+    }
+
+    #[test]
+    fn the_dir_event_carries_the_identity_for_pr_3_to_act_on() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/r")).unwrap();
+        fs.create_dir(Path::new("/r/w")).unwrap();
+        fs.set_identity("/r/w", FileIdentity::Unavailable);
+
+        let got: Vec<FileIdentity> = walk(&fs, Path::new("/r"))
+            .unwrap()
+            .filter_map(|i| i.ok())
+            .filter_map(|e| match e {
+                WalkEvent::Dir { identity, .. } => Some(identity),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(got, vec![FileIdentity::Unavailable]);
+    }
+
+    #[test]
+    fn a_read_dir_failure_after_pushing_an_ancestor_leaves_the_set_balanced() {
+        // Without the unwind, `a`'s id stays in the ancestor set forever and a later
+        // directory that legitimately reuses the id is refused as a FALSE cycle.
+        let fs = FaultFs::new();
+        for d in ["/r", "/r/a", "/r/b"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        let id = ObjectId { volume: 1, index: 42 };
+        fs.set_identity("/r/a", FileIdentity::Strong(id));
+        fs.set_identity("/r/b", FileIdentity::Strong(id));
+        // Fail read_dir on its SECOND call, which is /r/a.
+        fs.fail_nth("read_dir", 2, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+
+        let errors: Vec<String> = walk(&fs, Path::new("/r"))
+            .unwrap()
+            .filter_map(|i| i.err())
+            .map(|e| rel(&e.path))
+            .collect();
+        // `a` fails on read_dir. `b` must NOT then be refused as a cycle.
+        assert_eq!(errors, vec!["a".to_string()], "b must not be a false cycle; got {errors:?}");
     }
 }
