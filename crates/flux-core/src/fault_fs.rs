@@ -41,6 +41,12 @@ struct Inner {
     /// directory must be distinguishable from a device node (`types` alone
     /// could not tell them apart, since neither is in `files`).
     directories: HashSet<PathBuf>,
+    /// Does this fake's `rename_no_replace` have an atomic no-replace primitive?
+    ///
+    /// `true` by default, because every test written before this switch existed
+    /// assumes it. Setting it `false` is how the engine cut exercises a destination
+    /// whose filesystem cannot make the promise, without owning such a filesystem.
+    no_replace_support: Option<bool>,
     perms: HashMap<PathBuf, Option<Perms>>,
     /// consumed by the next `write` on a handle from `create_new`
     write_fault: Option<std::io::Error>,
@@ -297,6 +303,14 @@ impl FaultFs {
         self.inner.lock().unwrap().identities.insert(path.to_path_buf(), identity);
     }
 
+    /// Whether this fake's `rename_no_replace` has an atomic no-replace primitive.
+    /// Defaults to `true`; set `false` to make it report the platform's unsupported
+    /// error, which is how a caller's behaviour on such a destination is tested
+    /// without a filesystem that genuinely lacks one.
+    pub fn set_no_replace_support(&self, supported: bool) {
+        self.inner.lock().unwrap().no_replace_support = Some(supported);
+    }
+
     /// Make `metadata` report `path` as something other than a regular file -- a
     /// directory, a symlink, a device. Without this the fake reported `is_file: true`
     /// for everything and SPECIAL_FILE_UNSUPPORTED had no test that produced it.
@@ -507,6 +521,19 @@ impl FileSystem for FaultFs {
         )?;
         let mut g = self.inner.lock().unwrap();
         missing_source(&g, &f)?;
+        // Checked BEFORE the occupancy test, deliberately: a filesystem that cannot
+        // refuse-on-replace cannot answer the occupancy question atomically either,
+        // so reporting AlreadyExists here would claim a guarantee this fake is
+        // modelling the absence of.
+        if g.no_replace_support == Some(false) {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "no atomic no-replace publication primitive",
+                ),
+            ));
+        }
         if g.files.contains_key(&t) {
             return Err(FsError::new(
                 Code::IoError,
@@ -866,5 +893,30 @@ mod tests {
         let fs = FaultFs::new();
         fs.create_dir(Path::new("/r")).unwrap();
         fs.create_dir(Path::new("/r/a")).unwrap();
+    }
+
+    #[test]
+    fn no_replace_support_is_on_by_default() {
+        // Every existing test was written before this switch existed and must keep
+        // passing untouched, which is only true if the default is the old behaviour.
+        let fs = FaultFs::new();
+        fs.write_file("/from", b"new");
+        assert!(fs.rename_no_replace(Path::new("/from"), Path::new("/to")).is_ok());
+    }
+
+    #[test]
+    fn a_destination_without_the_primitive_reports_it() {
+        let fs = FaultFs::new();
+        fs.write_file("/from", b"new");
+        fs.set_no_replace_support(false);
+
+        let err = fs.rename_no_replace(Path::new("/from"), Path::new("/to")).unwrap_err();
+
+        // NOT AlreadyExists: the name is free. The filesystem cannot make the promise
+        // at all, which is a different fact and the one the engine cut branches on.
+        assert_eq!(err.code, Code::IoError);
+        assert_eq!(err.source.kind(), std::io::ErrorKind::Unsupported);
+        assert!(!fs.exists("/to"), "an unsupported primitive must not fall back to a plain rename");
+        assert!(fs.exists("/from"), "the source must be untouched");
     }
 }
