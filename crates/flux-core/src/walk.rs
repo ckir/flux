@@ -429,4 +429,35 @@ mod tests {
         // The siblings AFTER the failure are the whole point.
         assert_eq!(files, vec!["bbb/f".to_string(), "ccc/f".to_string()]);
     }
+
+    #[test]
+    fn the_depth_cap_skips_the_subtree_and_continues() {
+        let fs = FaultFs::new();
+        for d in ["/r", "/r/a", "/r/a/b", "/r/a/b/c"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        fs.write_file("/r/a/b/c/deep", b"");
+        fs.write_file("/r/sibling", b"");
+
+        // Cap of 2: `a` (1) and `a/b` (2) are entered; `a/b/c` is refused.
+        let mut errors = Vec::new();
+        let mut files = Vec::new();
+        for item in walk_with_depth(&fs, Path::new("/r"), 2).unwrap() {
+            match item {
+                Ok(WalkEvent::File { path }) => files.push(rel(&path)),
+                Err(e) => errors.push(rel(&e.path)),
+                Ok(_) => {}
+            }
+        }
+
+        assert_eq!(errors, vec!["a/b/c".to_string()]);
+        assert!(!files.iter().any(|f| f.contains("deep")), "subtree skipped; got {files:?}");
+        // Not an abort: the sibling after the refusal still arrives.
+        assert_eq!(files, vec!["sibling".to_string()]);
+    }
+
+    #[test]
+    fn the_default_cap_is_256() {
+        assert_eq!(DEFAULT_MAX_DEPTH, 256);
+    }
 }
