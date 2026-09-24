@@ -114,6 +114,21 @@ fn sorted(mut v: Vec<DirEntry>) -> Vec<DirEntry> {
     v
 }
 
+/// A `DirEntry` name must be exactly ONE ordinary component.
+///
+/// `PathBuf::join` DISCARDS the base when the appended component is absolute --
+/// MEASURED: `Path::new("sub").join("/etc/shadow")` is `"/etc/shadow"`, and with
+/// `C:\Windows` it is `C:\Windows`. So an entry name that is not a bare component
+/// would walk the iterator straight out of its own root, which is the same class of
+/// escape `Metadata::file_type` exists to prevent.
+///
+/// `..` and `.` stay relative under `join` and so cannot escape by that route, but
+/// they are refused too: neither is an entry a directory listing may contain.
+fn is_one_component(name: &std::ffi::OsStr) -> bool {
+    let mut c = Path::new(name).components();
+    matches!(c.next(), Some(std::path::Component::Normal(_))) && c.next().is_none()
+}
+
 /// `root` must name a directory. The walk yields NO event for the root itself --
 /// its first event is the root's first child -- because the root is not part of the
 /// tree being copied INTO the destination, it IS the destination mapping.
@@ -195,7 +210,33 @@ impl<'a, F: FileSystem> Iterator for Walk<'a, F> {
             // `&mut self`. `join` allocates the path we were going to need anyway.
             let step = {
                 let frame = self.stack.last_mut().expect("stack checked non-empty");
-                frame.entries.next().map(|e| (frame.rel.join(&e.name), e.file_type))
+                frame.entries.next().map(|e| {
+                    // PANIC, not an `Err` item. A real filesystem CANNOT produce this:
+                    // neither Linux nor Windows permits a separator inside a file name,
+                    // so the only way here is a `FileSystem` implementor breaking the
+                    // contract `read_dir` documents -- a programmer bug, which is what
+                    // `panic!` is for, against `Result` for an environment fault.
+                    //
+                    // An `Err` item was the obvious choice and it is wrong: every other
+                    // error here is non-terminal, so a broken adapter would silently
+                    // OMIT entries from a copy while every test stayed green. That is
+                    // the same trap `FaultFs::metadata` already refuses, panicking
+                    // rather than reporting `Unavailable` because `Unavailable` is a
+                    // state the walk handles gracefully.
+                    //
+                    // Unreachable by construction rather than merely unlikely: both
+                    // in-tree implementors build the name from `file_name()`.
+                    assert!(
+                        is_one_component(&e.name),
+                        "FileSystem::read_dir returned an entry name that is not a \
+                         single component: {:?} in {:?}. A name must be one bare \
+                         component; `join` discards the base on an absolute one and \
+                         the walk would leave its root.",
+                        e.name,
+                        frame.rel
+                    );
+                    (frame.rel.join(&e.name), e.file_type)
+                })
             };
 
             match step {
@@ -681,5 +722,98 @@ mod tests {
             })
             .collect();
         assert_eq!(got, vec![lo, hi], "ascending by encoded bytes");
+    }
+
+    /// A deliberately BROKEN adapter whose `read_dir` returns an absolute name,
+    /// violating the contract `FileSystem::read_dir` documents. It exists so the
+    /// refusal can be exercised at all: neither in-tree implementor can produce such
+    /// a name, because both build it from `file_name()`.
+    struct NeverHandle;
+
+    impl std::io::Write for NeverHandle {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl flux_fs::FileHandle for NeverHandle {
+        fn sync_all(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct EscapingFs;
+
+    impl FileSystem for EscapingFs {
+        type Reader = std::io::Empty;
+        type Writer = NeverHandle;
+
+        fn read_dir(&self, _: &Path) -> Result<Vec<DirEntry>> {
+            Ok(vec![DirEntry {
+                name: std::ffi::OsString::from("/etc/shadow"),
+                file_type: FileType::File,
+            }])
+        }
+
+        fn metadata(&self, _: &Path) -> Result<flux_fs::Metadata> {
+            Ok(flux_fs::Metadata {
+                len: 0,
+                file_type: FileType::Dir,
+                permissions: None,
+                modified: None,
+                identity: FileIdentity::Unavailable,
+            })
+        }
+
+        fn open_read(&self, _: &Path) -> Result<Self::Reader> {
+            unimplemented!("EscapingFs exists only to break read_dir")
+        }
+        fn create_new(&self, _: &Path) -> Result<Self::Writer> {
+            unimplemented!("EscapingFs exists only to break read_dir")
+        }
+        fn set_times(&self, _: &Self::Writer, _: Option<std::time::SystemTime>) -> Result<()> {
+            unimplemented!("EscapingFs exists only to break read_dir")
+        }
+        fn set_permissions(&self, _: &Self::Writer, _: Option<flux_fs::Perms>) -> Result<()> {
+            unimplemented!("EscapingFs exists only to break read_dir")
+        }
+        fn rename_replace(&self, _: &Path, _: &Path) -> Result<()> {
+            unimplemented!("EscapingFs exists only to break read_dir")
+        }
+        fn rename_no_replace(&self, _: &Path, _: &Path) -> Result<()> {
+            unimplemented!("EscapingFs exists only to break read_dir")
+        }
+        fn remove_file(&self, _: &Path) -> Result<()> {
+            unimplemented!("EscapingFs exists only to break read_dir")
+        }
+        fn create_dir(&self, _: &Path) -> Result<()> {
+            unimplemented!("EscapingFs exists only to break read_dir")
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "not a single component")]
+    fn an_adapter_returning_a_non_component_name_panics_rather_than_escaping() {
+        // Without the guard this walk would yield `/etc/shadow` - `join` discards the
+        // base on an absolute component, so the iterator leaves its own root. It
+        // panics rather than yielding an Err item because every Err here is
+        // NON-terminal, so a broken adapter would otherwise silently omit entries
+        // while the suite stayed green.
+        let fs = EscapingFs;
+        let _: Vec<_> = walk(&fs, Path::new("/r")).unwrap().collect();
+    }
+
+    #[test]
+    fn a_plain_name_is_one_component_and_the_escaping_shapes_are_not() {
+        use std::ffi::OsStr;
+        assert!(is_one_component(OsStr::new("ok.txt")));
+        assert!(!is_one_component(OsStr::new("/etc/shadow")));
+        assert!(!is_one_component(OsStr::new("a/b")));
+        assert!(!is_one_component(OsStr::new("..")));
+        assert!(!is_one_component(OsStr::new(".")));
+        assert!(!is_one_component(OsStr::new("")));
     }
 }

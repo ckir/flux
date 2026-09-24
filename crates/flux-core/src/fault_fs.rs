@@ -581,9 +581,15 @@ impl FileSystem for FaultFs {
         // Fails if the parent is missing, as the trait says and `std::fs::create_dir`
         // does. The walk root itself has no parent in the fake, so a root-level
         // create is allowed.
+        // A parent that has NO parent of its own IS a root, so a create directly
+        // under it needs no existing entry. `parent != Path::new("/")` was the naive
+        // form and it is wrong on Windows, where a drive is a root too -- MEASURED:
+        // `Path::new(r"C:\dir").parent()` is `Some(r"C:\")`, which is not `/`, so the
+        // old guard fired and rejected a valid root-level create. Asking whether the
+        // parent is its own root covers `/`, a drive, a UNC share and the empty
+        // relative parent without naming a separator at all.
         if let Some(parent) = p.parent()
-            && !parent.as_os_str().is_empty()
-            && parent != Path::new("/")
+            && parent.parent().is_some()
             && !g.directories.contains(parent)
         {
             return Err(FsError::new(
@@ -800,5 +806,27 @@ mod tests {
         assert!(fs.create_dir(Path::new("/a")).is_err(), "already a directory");
         fs.write_file("/f", b"x");
         assert!(fs.create_dir(Path::new("/f")).is_err(), "occupied by a file");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn create_dir_allows_a_create_directly_under_a_windows_drive_root() {
+        // The guard used to compare the parent against `/` alone, so a drive root was
+        // not recognised as a root and this was rejected with NotFound. MEASURED:
+        // `Path::new(r"C:\dir").parent()` is `Some(r"C:\\")`, which is not `/`.
+        // Nothing touches a real disk here - this is the fake's own namespace.
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new(r"C:\flux_fake_root")).unwrap();
+        assert_eq!(fs.metadata(Path::new(r"C:\flux_fake_root")).unwrap().file_type, FileType::Dir);
+    }
+
+    #[test]
+    fn create_dir_still_requires_a_real_parent_below_the_root() {
+        // The other half of the root fix: relaxing the root case must not relax the
+        // ordinary case, or the walk could create a directory whose parent is absent.
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/a")).unwrap();
+        fs.create_dir(Path::new("/a/b")).unwrap();
+        assert!(fs.create_dir(Path::new("/a/missing/c")).is_err());
     }
 }

@@ -166,6 +166,12 @@ pub trait FileSystem: Send + Sync {
     /// live bound is one directory per level, capped by `DEFAULT_MAX_DEPTH`. That is
     /// still bounded by DEPTH rather than by the total number of files, which is
     /// what invariant 11 actually forbids -- but it is not "one".
+    /// **Contract: each `DirEntry::name` is exactly ONE bare component.** Not a
+    /// path, not absolute, never `.` or `..`. A real filesystem cannot break this --
+    /// neither Linux nor Windows permits a separator inside a file name -- but this
+    /// trait is public, so the rule is written down here and ENFORCED by the walk
+    /// rather than assumed: `PathBuf::join` discards its base on an absolute
+    /// component, so one bad name would take a traversal out of its own root.
     fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>>;
 
     /// Creates ONE directory. Fails if the parent is missing; the walk creates
