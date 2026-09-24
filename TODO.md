@@ -201,8 +201,8 @@ each was re-measured on `origin/main` that day.
       equivalent on this machine**, so the macOS leg is CI-only by construction.
 
 - [ ] **No MSRV job.** Every `ci.yml` job uses the stable toolchain and Dependabot auto-merges cargo minor and
-      patch bumps, so a dependency raising its MSRV past the workspace's `rust-version` (1.85) is not caught.
-      Add a job running `cargo +1.85 check --workspace --all-targets`.
+      patch bumps, so a dependency raising its MSRV past the workspace's `rust-version` (1.88) is not caught.
+      Add a job running `cargo +1.88 check --workspace --all-targets`.
 - [ ] **`ci.yml` has no `permissions:` or `concurrency:` block**, so its jobs get the repository's default token
       scope and superseded pull-request runs are not cancelled. Add `permissions: contents: read` and a
       concurrency group.

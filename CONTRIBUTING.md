@@ -21,7 +21,7 @@ relevant section (e.g. "spec §13.1") in issues and pull requests.
 
 ## Development setup
 
-Requires Rust 1.85+ (edition 2024). The toolchain is pinned by
+Requires Rust 1.88+ (edition 2024). The toolchain is pinned by
 `rust-toolchain.toml`.
 
 ```bash

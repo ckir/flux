@@ -153,19 +153,15 @@ fn heading_lines(spec: &str) -> Vec<HeadingLine> {
                     current_number = Some(n);
                 }
                 out.push(HeadingLine { text: line.to_string(), number: current_number.clone() });
-            } else if !line.trim().is_empty() {
-                if let Some(next) = lines.get(i + 1) {
-                    if is_setext_underline(next) {
-                        if let Some(n) = heading_number(line) {
-                            current_number = Some(n);
-                        }
-                        out.push(HeadingLine {
-                            text: line.to_string(),
-                            number: current_number.clone(),
-                        });
-                        i += 1; // also consume the underline line
-                    }
+            } else if !line.trim().is_empty()
+                && let Some(next) = lines.get(i + 1)
+                && is_setext_underline(next)
+            {
+                if let Some(n) = heading_number(line) {
+                    current_number = Some(n);
                 }
+                out.push(HeadingLine { text: line.to_string(), number: current_number.clone() });
+                i += 1; // also consume the underline line
             }
         }
         i += 1;
@@ -774,10 +770,10 @@ fn cover_families(headings: &[&str]) -> String {
     let stamped: BTreeSet<&str> = headings.iter().copied().collect();
     let mut roots: BTreeSet<String> = BTreeSet::new();
     for heading in headings {
-        if let Some(found) = all.iter().find(|h| h.text == *heading) {
-            if let Some(number) = &found.number {
-                roots.insert(family_root(number));
-            }
+        if let Some(found) = all.iter().find(|h| h.text == *heading)
+            && let Some(number) = &found.number
+        {
+            roots.insert(family_root(number));
         }
     }
     let mut counts: BTreeMap<(&str, &str), usize> = BTreeMap::new();
