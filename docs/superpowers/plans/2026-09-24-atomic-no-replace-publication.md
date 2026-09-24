@@ -2,11 +2,18 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make `rename_no_replace` refuse an occupied destination atomically instead of by check-then-act, and route every Windows filesystem call through an extended-length `\\?\` path.
+**Goal:** Make `rename_no_replace` refuse an occupied destination atomically instead of by
+check-then-act.
 
-**Architecture:** `flux-platform` only — no engine, no CLI, no new trait method. `StdFileSystem::rename_no_replace` loses its `symlink_metadata`-then-`rename` body and gains two platform arms: `rustix::fs::renameat_with` with `RenameFlags::NOREPLACE` on Unix, `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` on Windows. A private path-conversion helper prefixes `\\?\` on the Windows arm by canonicalizing the PARENT and appending the final component verbatim, so the final component is never resolved and symlink semantics survive. `flux-fs` gains two `Code` variants; `FaultFs` gains one configuration method.
+**Architecture:** `flux-platform` only — no engine, no CLI, no new trait method, and no path-conversion
+layer. `StdFileSystem::rename_no_replace` loses its `symlink_metadata`-then-`rename` body and gains two
+platform arms: `rustix::fs::renameat_with` with `RenameFlags::NOREPLACE` on Unix, `MoveFileExW` without
+`MOVEFILE_REPLACE_EXISTING` on Windows. `flux-fs` gains three `Code` variants; `FaultFs` gains one
+configuration method.
 
-**Tech Stack:** Rust 2024, MSRV 1.85. `rustix` 1.1 (`features = ["fs"]`, already a `cfg(unix)` dependency of this crate). `windows-sys` 0.61 (already a `cfg(windows)` dependency; this plan adds one feature). `tempfile` for tests.
+**Tech Stack:** Rust 2024, MSRV 1.85. `rustix` 1.1 (`features = ["fs"]`, already a `cfg(unix)`
+dependency of this crate). `windows-sys` 0.61 (already a `cfg(windows)` dependency, with every symbol
+this plan needs already enabled — no manifest change). `tempfile` for tests.
 
 ---
 
@@ -47,7 +54,7 @@ before relying on it, and say so if anything has moved:
 rg -n "cfg\(apple\)" -A 14 "$CARGO_HOME/registry/src/index.crates.io-*/rustix-1.1.*/src/backend/libc/fs/types.rs"
 ```
 
-**2. `renameat_with` does not exist on every Unix.** Its cfg excludes FreeBSD, NetBSD, Solaris and others. This repository's CI matrix is `[ubuntu-latest, macos-latest, windows-latest]`, so every supported target is covered — but a bare `#[cfg(unix)]` arm would fail to compile on an unsupported Unix with a confusing error about a missing function. Task 5 adds an explicit `compile_error!` so that failure names its own cause. **Do not add a check-then-act fallback for such a platform** — `FLUX_FULL_UPDATED_SPEC_V16.md:10876` forbids check-then-rename as a substitute by name.
+**2. `renameat_with` does not exist on every Unix.** Its cfg excludes FreeBSD, NetBSD, Solaris and others. This repository's CI matrix is `[ubuntu-latest, macos-latest, windows-latest]`, so every supported target is covered — but a bare `#[cfg(unix)]` arm would fail to compile on an unsupported Unix with a confusing error about a missing function. Task 3 adds an explicit `compile_error!` so that failure names its own cause. **Do not add a check-then-act fallback for such a platform** — `FLUX_FULL_UPDATED_SPEC_V16.md:10876` forbids check-then-rename as a substitute by name.
 
 **LINE NUMBERS DRIFT AS TASKS LAND, AND EVERY CITATION BELOW IS AS-OF THE BASE COMMIT.** Task 1 adds
 lines to `error.rs`; Tasks 2 through 6 add lines to three more files. A citation like `:264-276` is a
@@ -89,13 +96,26 @@ component lexical and physical resolution reach the same object because the kern
 anyway. The case against the helper is redundancy, I/O cost and short-path normalization — not a safety
 break.
 
-**3. `rename_no_replace` is NOT `#[cfg]`-gated today** — it is one plain method in a non-gated `impl` block, at `crates/flux-platform/src/std_fs.rs:264-276`. Task 5 splits it. The file already mixes cfg styles (whole gated free functions, gated methods inside a non-gated `impl`, gated match arms), so a gated pair of methods matches the established pattern — `fn metadata` is already exactly that, at `:167-182` (unix) and `:184-213` (windows).
+**3. `rename_no_replace` is NOT `#[cfg]`-gated today** — it is one plain method in a non-gated `impl` block, at `crates/flux-platform/src/std_fs.rs:264-276`. Task 3 splits it. The file already mixes cfg styles (whole gated free functions, gated methods inside a non-gated `impl`, gated match arms), so a gated pair of methods matches the established pattern — `fn metadata` is already exactly that, at `:167-182` (unix) and `:184-213` (windows).
 
 ### What this cut does NOT do
 
 - **No new trait method.** `supports_no_replace_publish` was proposed and dropped: there is no side-effect-free way to ask a filesystem whether it supports the flag, because reaching the filesystem's rename implementation requires passing path resolution, and a non-existent source returns `ENOENT` first. If you find yourself adding a capability query, **STOP and report `SHAPE_DIVERGENCE`**.
 - **No probe.** The spec's `noreplace-probe` writes inside the operation workspace, and the workspace is out of scope for every cut in this design. Deferred by owner ruling; booked as tracked debt.
 - **No change to `rename_no_replace`'s contract or its error.** It already promises to fail rather than replace. What changes is that it keeps that promise atomically. On an occupied target it must still return `Code::IoError` carrying `ErrorKind::AlreadyExists`, because `crates/flux-platform/tests/std_fs.rs:97-107` and `:150-169` pin that and the engine cut maps it, not this one.
+
+- **A filesystem that lacks the flag at RUNTIME is a third outcome, and it is not `AlreadyExists`.** The
+  `compile_error!` in Task 3 covers targets where `renameat_with` does not EXIST. It does not cover a
+  Linux kernel whose particular filesystem — some NFS configurations, some FUSE mounts — rejects
+  `RENAME_NOREPLACE` at call time with `EINVAL` or `ENOSYS`. That arrives through `FsError::from_io` as
+  whatever `classify` makes of it, and it arrives whether or not the target was occupied, because the
+  kernel rejects the flag before evaluating occupancy.
+
+  **That is the designed path, not a gap.** The engine "learns at the first publish" precisely by
+  receiving such an error — it is what the deferred probe would otherwise have discovered up front.
+  **Do not add a fallback that retries without the flag:** that is the check-then-rename substitute
+  `FLUX_FULL_UPDATED_SPEC_V16.md:10876` forbids by name. It is stated here so an implementer who meets
+  it on a network mount recognises it rather than "fixing" it.
 
 ### The shell these commands assume
 
@@ -222,12 +242,12 @@ git rev-parse --short cut3-base
 ```
 
 **A git tag, not a shell variable.** An earlier draft used `export CUT3_BASE=...`, which does not
-survive: under subagent-driven execution each task runs in its own shell, so by Task 7 the variable is
+survive: under subagent-driven execution each task runs in its own shell, so by Task 5 the variable is
 empty and `git diff --stat ..HEAD` silently compares nothing against nothing and prints an empty diff —
 which reads exactly like "no unexpected files" and is the most misleading possible failure. A tag lives
 in the repository and every later task sees it.
 
-Task 7 diffs against this tag and then deletes it.
+Task 5 diffs against this tag and then deletes it.
 
 **Do NOT use `main` as that base.** In this worktree the local `main` ref is stale — it points at
 `bcbd4ac` while `origin/main` is at `489b947`, a gap of well over a hundred commits — so
@@ -603,7 +623,7 @@ This test is a REGRESSION pin, not a red-then-green cycle: it exists so that rep
 
 - `MoveFileExW` is declared at `src/Windows/Win32/Storage/FileSystem/mod.rs:273` with **no `#[cfg(feature = ...)]` attribute above it**, so it needs only the `Win32_Storage_FileSystem` feature — already enabled by the workspace pin.
 - Its flags parameter is typed `MOVE_FILE_FLAGS`, which is `pub type MOVE_FILE_FLAGS = u32;` at `:2165`. A bare `0` therefore compiles without a cast.
-- `MOVEFILE_REPLACE_EXISTING` is `1u32` at `:2163`, which Step 3 of Task 6 uses as its mutant.
+- `MOVEFILE_REPLACE_EXISTING` is `1u32` at `:2163`, which Step 3 of Task 4 uses as its mutant.
 
 The workspace pin, verified at the root `Cargo.toml`, is:
 
@@ -828,9 +848,9 @@ fn rename_no_replace_reports_a_missing_source() {
 
 Run: `cargo nextest run -p flux-platform rename_no_replace`
 
-Expected: PASS, 5 tests total for `rename_no_replace` (2 pre-existing, 1 from Task 5, 2 here).
+Expected: PASS, and `Starting 5 tests` for `rename_no_replace` — 2 pre-existing, 1 from Task 3, 2 here.
 
-- [ ] **Step 3: Confirm the new tests behave correctly under the Task 5 mutant**
+- [ ] **Step 3: Confirm the new tests behave correctly under the Task 3 mutant**
 
 Re-apply the same `MOVEFILE_REPLACE_EXISTING` mutant from Task 3 Step 8.
 
@@ -846,7 +866,7 @@ every mutant would be pinning nothing in particular. Revert the mutant afterward
 Run: `just check`
 Then: `wsl -e bash -lc 'cd /mnt/e/Rust/flux-walk2 && cargo nextest run --workspace --no-tests=pass'`
 
-Expected: both pass. `flux-platform` rises from 34 to 39 static `#[test]`s (Task 3 added 2, Task 5 added 1, Task 6 adds 2).
+Expected: both pass. `flux-platform` rises from 34 to 37 static `#[test]`s — Task 3 added 1, Task 4 adds 2.
 
 - [ ] **Step 5: Commit**
 
@@ -941,7 +961,12 @@ Pushing and opening a pull request are outward actions. **Do not push. Do not op
 
 ## Self-review
 
-**Spec coverage.** Delivery item 3 names five deliverables. Each maps to a task: the three primitives → Task 5 (as two arms, with the reason recorded); extended-length paths for every Windows call → Tasks 3 and 4; the two `Code` variants → Task 1; `FaultFs::set_no_replace_support` → Task 2; "no new trait method, no probe" → enforced by Task 7 Step 4. The contract-unchanged requirement is pinned by the pre-existing tests that Task 5 Step 6 requires to keep passing.
+**Spec coverage.** Delivery item 3's deliverables each map to a task: the three primitives → Task 3 (as
+two arms, with the reason recorded); the `Code` variants → Task 1, now three of them since §105's second
+sentence needed `DestinationError`; `FaultFs::set_no_replace_support` → Task 2; "no new trait method, no
+probe" → enforced by Task 5 Step 4. Extended-length Windows paths need no task at all: `std` applies them,
+which is recorded in the ground-truth section. The contract-unchanged requirement is pinned by the
+pre-existing tests that Task 3 Step 6 requires to keep passing.
 
 **Placeholder scan.** No TBDs and no conditionals. Two steps were conditional in an earlier draft and both have since been resolved by verification rather than left to the implementer: `FsError` exposes PUBLIC FIELDS (`err.code`, `err.source.kind()`) and not accessor methods, verified at `crates/flux-fs/src/error.rs:44-56` and against the idiom at `crates/flux-platform/tests/std_fs.rs:50`; and `MoveFileExW` needs no new feature, verified in the vendored `windows-sys-0.61.2` source. Each still tells the implementer how to re-check, because a plan that says "verified" without saying against what is asking to be believed rather than read.
 
@@ -952,7 +977,11 @@ referenced anywhere, the two tasks that defined one having been deleted.
 **Known gaps, stated rather than hidden.**
 
 1. **Atomicity itself is not directly tested.** No test schedules two processes into the window. The tests pin the observable contract — refusal, on the cases the old body handled — and the mutants prove they discriminate. This is a real limit: a future body that reintroduced check-then-act would pass this suite. The compile-time structure is the guard, not the tests.
-2. **The long-path test is environment-sensitive.** On a machine with `LongPathsEnabled` set system-wide it may pass before Task 4 wires the helper in. Task 3 Step 2 says what to do if that happens.
+2. **Long-path behaviour is not tested at all.** The tasks that tested it were deleted once `std` was
+   shown to provide it, and nothing replaced them. That is a deliberate gap rather than an oversight:
+   a test here would assert the standard library's behaviour, not Flux's. The risk it leaves is that a
+   future change introducing a hand-rolled path layer would not be caught, which is why the design
+   records why the machinery is absent.
 3. **The symlink test skips without Developer Mode.** It prints `SKIPPED` rather than failing, following the precedent set by the non-UTF-8 filename test, which skips where the filesystem refuses the name rather than gating to one OS and silently dropping the check elsewhere.
 4. **Item 113 remains unmet** and is tracked debt, not a gap in this plan. The compliant probe needs the operation workspace, which is out of scope for every cut in this design.
 
@@ -984,4 +1013,4 @@ re-derive them.
   `windows-sys-0.61.2/.../FileSystem/mod.rs:273` takes `windows_sys::core::PCWSTR`, and this crate
   already passes raw pointers to `windows-sys` functions in the `#[cfg(windows)]` `identity_of_handle`
   at `crates/flux-platform/src/std_fs.rs:359-388`. If it does not compile, the compiler says so
-  immediately and the fix is one `as` -- it cannot reach a commit, because Task 5 runs the gate first.
+  immediately and the fix is one `as` -- it cannot reach a commit, because Task 3 runs the gate first.
