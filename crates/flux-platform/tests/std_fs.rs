@@ -544,10 +544,27 @@ fn read_dir_reports_non_utf8_names_intact() {
     // A fake that agrees with the implementation about encoding proves nothing
     // about the OS. §241: the on-disk name is bytes, and it must survive read_dir
     // without a lossy conversion.
+    //
+    // `cfg(unix)` is NOT the same as "permits arbitrary bytes in a name", and this
+    // test asserted that it was. POSIX allows any byte but `/` and NUL, and Linux
+    // follows it -- but macOS's APFS and HFS+ ENFORCE UTF-8 and refuse this name
+    // outright. MEASURED on a macos-latest runner, which is where it was caught:
+    // `Os { code: 92, kind: Uncategorized, message: "Illegal byte sequence" }`.
+    // There are three naming regimes here, not two: arbitrary bytes on Linux,
+    // WTF-16 on Windows, and enforced UTF-8 on macOS.
+    //
+    // So the CONTRACT is stated as what it actually is -- on a filesystem that
+    // permits such a name, `read_dir` must return it intact -- and the test skips,
+    // loudly, where the OS will not create one. Gating to `target_os = "linux"`
+    // would have worked too and was rejected: it would silently drop the check on
+    // every other unix that does allow these names.
     use std::os::unix::ffi::OsStrExt;
     let d = tempfile::tempdir().unwrap();
     let raw = std::ffi::OsStr::from_bytes(&[b'x', 0xFF, b'y']);
-    std::fs::write(d.path().join(raw), b"").unwrap();
+    if std::fs::write(d.path().join(raw), b"").is_err() {
+        eprintln!("skipped: this filesystem refuses a non-UTF-8 name");
+        return;
+    }
 
     let got = StdFileSystem.read_dir(d.path()).unwrap();
     assert_eq!(got.len(), 1);
