@@ -1120,10 +1120,29 @@ treated as before.
 **The discriminator is `Strong`-only, like every other identity comparison here.** A `Weak` id is by
 definition one that may not distinguish two objects, so a set keyed on weak ids can report a
 pre-existing directory as one this operation created — turning an ordinary copy onto an existing tree
-into a spurious collision and abandoning a subtree that was fine. `Unavailable` carries no id at all
-and cannot be in the set. So a directory whose identity is not `Strong` on both sides is not entered
-into the created set and is not tested against it: `AlreadyExists` keeps its old meaning and the copy
-merges, with the degradation recorded on the warning channel.
+into a spurious collision and abandoning a subtree that was fine. `Unavailable` carries no id at all.
+
+**But "not tested against the set" must not be read as "not tracked", because these are TWO structures
+and an earlier revision described them as one.** Saying the capture "keeps exactly that" was a
+conflation, and taken literally it breaks the item-114 check:
+
+- **The item-114 record is a STACK, one entry per directory the walk is inside, pushed on `Dir` and
+  popped on `DirEnd`.** Its job is positional: before writing into the current directory, compare
+  against what was recorded for THAT directory. Omitting an entry because its identity is weak would
+  desynchronise the stack from the traversal, and every later file would be compared against its
+  grandparent — failing unconditionally, in a subtree that was fine.
+- **The fold-collision record is a SET of identities**, unordered, asked only "did this operation
+  create this object?".
+
+So the rule splits along those lines. **Every directory gets a stack entry, always**, carrying
+`Option<ObjectId>` — `None` where identity is not `Strong`, which makes the item-114 re-verification
+skip for that directory and degrade like every other identity check, while the stack stays aligned with
+the walk. **Only `Strong` identities enter the collision set**, so a fold is detected where it can be
+and `AlreadyExists` keeps its old merging meaning where it cannot, with the degradation on the warning
+channel.
+
+One structure is indexed by POSITION and must be complete; the other is indexed by IDENTITY and must be
+trustworthy. Neither requirement implies the other.
 
 **What that costs is worth naming, because it is the least comfortable trade in this design.** Weak
 identity and case-insensitivity correlate — FAT32 and exFAT are both, and they head §107's list — so
@@ -1415,9 +1434,19 @@ load-bearing will delete the wrong one.
 `create_dir`, and one destination stat capturing the created directory's identity. Plus a volume
 comparison, which is arithmetic on a value already in hand.
 
-**Per FILE:** one source stat (Step 2), one destination stat (Step 2a), one destination-parent stat
-before publishing, the `create_new`, the stream, and the publish-path stat the adapter already
-performed before any of this design existed. On Windows, one parent resolution per adapter call.
+**Per FILE:** **two** source stats — Step 2 before the copy and the Step 7 re-check after it, which are
+§110's "before and after" and not an accident — one destination stat at the Step 2a gate, one
+destination-parent stat before publishing, the `create_new`, and the stream. On Windows, one parent
+resolution per adapter call.
+
+An earlier revision of this count made two mistakes worth naming, because both point at the same
+misreading. It listed ONE source stat, forgetting that Step 7's source re-check is a source stat and is
+required. And it counted "the publish-path stat the adapter already performed" — which belongs to
+`rename_replace`'s read-only guard at `crates/flux-platform/src/std_fs.rs:252`, inside a method a tree
+copy does not call, since §241.5 makes it publish with `NoReplace`. `rename_no_replace`'s own stat is
+the check-then-act body that cut 3 deletes. **So the adapter contributes no destination stat on the
+tree path at all**, and the count was simultaneously one too low on the source side and one too high on
+the destination side.
 
 **The walk does NOT stat files, and a proposed "redundant pair" rested on believing it does.** It types
 non-directory entries from `read_dir`'s `DirEntry` and yields them unstatted —
