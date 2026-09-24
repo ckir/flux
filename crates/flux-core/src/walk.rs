@@ -208,35 +208,51 @@ impl<'a, F: FileSystem> Iterator for Walk<'a, F> {
             }
             // Take the next entry and release the borrow before `enter` needs
             // `&mut self`. `join` allocates the path we were going to need anyway.
-            let step = {
+            // Take the entry out of the frame BEFORE validating it. The validation
+            // can panic, and the poisoning it does first needs `self.stack`
+            // unborrowed, so the borrow has to end here.
+            let taken = {
                 let frame = self.stack.last_mut().expect("stack checked non-empty");
-                frame.entries.next().map(|e| {
-                    // PANIC, not an `Err` item. A real filesystem CANNOT produce this:
-                    // neither Linux nor Windows permits a separator inside a file name,
-                    // so the only way here is a `FileSystem` implementor breaking the
-                    // contract `read_dir` documents -- a programmer bug, which is what
-                    // `panic!` is for, against `Result` for an environment fault.
-                    //
-                    // An `Err` item was the obvious choice and it is wrong: every other
-                    // error here is non-terminal, so a broken adapter would silently
-                    // OMIT entries from a copy while every test stayed green. That is
-                    // the same trap `FaultFs::metadata` already refuses, panicking
-                    // rather than reporting `Unavailable` because `Unavailable` is a
-                    // state the walk handles gracefully.
-                    //
-                    // Unreachable by construction rather than merely unlikely: both
-                    // in-tree implementors build the name from `file_name()`.
-                    assert!(
-                        is_one_component(&e.name),
-                        "FileSystem::read_dir returned an entry name that is not a \
-                         single component: {:?} in {:?}. A name must be one bare \
-                         component; `join` discards the base on an absolute one and \
-                         the walk would leave its root.",
-                        e.name,
-                        frame.rel
-                    );
-                    (frame.rel.join(&e.name), e.file_type)
-                })
+                frame.entries.next()
+            };
+
+            let step = match taken {
+                None => None,
+                Some(e) => {
+                    if !is_one_component(&e.name) {
+                        // PANIC, not an `Err` item. A real filesystem CANNOT produce
+                        // this: neither Linux nor Windows permits a separator inside a
+                        // file name, so the only way here is a `FileSystem`
+                        // implementor breaking the contract `read_dir` documents -- a
+                        // programmer bug, which is what `panic!` is for, against
+                        // `Result` for an environment fault. An `Err` would be worse
+                        // than useless: every other error here is NON-terminal, so a
+                        // broken adapter would silently omit entries while the suite
+                        // stayed green.
+                        //
+                        // POISON FIRST. `entries.next()` has ALREADY consumed this
+                        // entry, so a consumer that catches the unwind and calls
+                        // `next()` again would be handed the next sibling and the bad
+                        // entry would simply vanish -- MEASURED before this line
+                        // existed: the second `next()` yielded `good.txt` and the
+                        // offending entry was skipped, which is precisely the silent
+                        // omission the panic was chosen to prevent. Clearing the stack
+                        // makes every later `next()` return `None` instead. Only
+                        // `[profile.release]` sets `panic = "abort"`, so a library
+                        // consumer unwinds by default and this path is live for them.
+                        let rel = self.stack.last().map(|f| f.rel.clone()).unwrap_or_default();
+                        self.stack.clear();
+                        panic!(
+                            "FileSystem::read_dir returned an entry name that is not a \
+                             single component: {:?} in {:?}. A name must be one bare \
+                             component; `join` discards the base on an absolute one and \
+                             the walk would leave its root.",
+                            e.name, rel
+                        );
+                    }
+                    let frame = self.stack.last().expect("stack checked non-empty");
+                    Some((frame.rel.join(&e.name), e.file_type))
+                }
             };
 
             match step {
@@ -752,10 +768,14 @@ mod tests {
         type Writer = NeverHandle;
 
         fn read_dir(&self, _: &Path) -> Result<Vec<DirEntry>> {
-            Ok(vec![DirEntry {
-                name: std::ffi::OsString::from("/etc/shadow"),
-                file_type: FileType::File,
-            }])
+            // TWO entries, bad then good. The second one is what makes the poisoning
+            // test meaningful: without it there would be nothing for a resumed walk
+            // to skip TO, and the test could not tell a poisoned iterator from an
+            // exhausted one.
+            vec![("/etc/shadow", FileType::File), ("good.txt", FileType::File)]
+                .into_iter()
+                .map(|(n, file_type)| Ok(DirEntry { name: std::ffi::OsString::from(n), file_type }))
+                .collect()
         }
 
         fn metadata(&self, _: &Path) -> Result<flux_fs::Metadata> {
@@ -815,5 +835,32 @@ mod tests {
         assert!(!is_one_component(OsStr::new("..")));
         assert!(!is_one_component(OsStr::new(".")));
         assert!(!is_one_component(OsStr::new("")));
+    }
+
+    #[test]
+    fn the_walk_is_poisoned_by_a_bad_name_rather_than_resuming_past_it() {
+        // The panic alone is NOT enough, and this is the test that says why.
+        // `entries.next()` has already consumed the offending entry by the time the
+        // check runs, so a consumer that catches the unwind and pulls again would be
+        // handed the NEXT sibling -- MEASURED before the fix: the second `next()`
+        // yielded `good.txt` and the bad entry vanished silently, which is exactly
+        // the omission the panic exists to prevent.
+        //
+        // Only `[profile.release]` sets `panic = "abort"`, so a library consumer
+        // unwinds by default and can reach this.
+        let fs = EscapingFs;
+        let mut w = walk(&fs, Path::new("/r")).unwrap();
+
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.next()));
+        let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.next()));
+        std::panic::set_hook(hook);
+
+        assert!(first.is_err(), "the bad name must panic");
+        assert!(
+            matches!(second, Ok(None)),
+            "a resumed walk must be exhausted, not handed the next sibling; got {second:?}"
+        );
     }
 }

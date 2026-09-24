@@ -569,6 +569,23 @@ impl FileSystem for FaultFs {
     }
 
     fn create_dir(&self, path: &Path) -> Result<()> {
+        // The fake models a ROOTED filesystem and has no working directory, so a
+        // relative path has no meaning in it. Refusing loudly beats the old silent
+        // behaviour - MEASURED: `create_dir("a")` SUCCEEDED while `read_dir("")`
+        // failed, leaving a directory detached from any tree, because `"a"`'s parent
+        // is `""` and `Path::new("").parent()` is `None`, so the parent-must-exist
+        // check was skipped.
+        //
+        // `has_root()`, NOT `is_absolute()`. MEASURED on Windows:
+        // `Path::new("/r").is_absolute()` is FALSE, because an absolute path there
+        // needs a drive or UNC prefix - so `is_absolute` would reject every path the
+        // tests use. `has_root()` is true for `/r`, `/r/a` and `C:\dir`, false for
+        // `a`, `a/b` and `""`, which is exactly the distinction wanted.
+        assert!(
+            path.has_root(),
+            "FaultFs models a rooted filesystem and has no working directory, so a \
+             relative path cannot be created in it: {path:?}"
+        );
         let p = path.to_path_buf();
         self.record(format!("create_dir({})", p.display()), "create_dir")?;
         let mut g = self.inner.lock().unwrap();
@@ -828,5 +845,26 @@ mod tests {
         fs.create_dir(Path::new("/a")).unwrap();
         fs.create_dir(Path::new("/a/b")).unwrap();
         assert!(fs.create_dir(Path::new("/a/missing/c")).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "relative path cannot be created")]
+    fn create_dir_refuses_a_relative_path_rather_than_detaching_it() {
+        // Before this guard, `create_dir("a")` SUCCEEDED while `read_dir("")` failed:
+        // "a"'s parent is "", and `Path::new("").parent()` is `None`, so the
+        // parent-must-exist check was skipped and the directory ended up attached to
+        // a root that can never exist.
+        let fs = FaultFs::new();
+        let _ = fs.create_dir(Path::new("a"));
+    }
+
+    #[test]
+    fn create_dir_still_accepts_every_rooted_form() {
+        // The guard is `has_root()`, not `is_absolute()`. MEASURED on Windows:
+        // `Path::new("/r").is_absolute()` is FALSE, so `is_absolute` would have
+        // rejected every path these tests use.
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/r")).unwrap();
+        fs.create_dir(Path::new("/r/a")).unwrap();
     }
 }

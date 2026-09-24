@@ -176,6 +176,14 @@ pub trait FileSystem: Send + Sync {
 
     /// Creates ONE directory. Fails if the parent is missing; the walk creates
     /// ancestors in order, so it never needs the recursive form.
+    ///
+    /// **It must also FAIL if the path already exists**, rather than succeeding
+    /// silently, and that half is spelled out because it is the half an implementor
+    /// forgets: a silent success would tell the walk it had created a fresh
+    /// directory when it had adopted somebody else's. Both in-tree implementors do
+    /// this -- `std::fs::create_dir` fails on an existing path, and the test fake
+    /// returns `AlreadyExists` -- but the trait is public and the requirement was
+    /// unstated.
     fn create_dir(&self, path: &Path) -> Result<()>;
 }
 
