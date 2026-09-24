@@ -49,6 +49,14 @@ rg -n "cfg\(apple\)" -A 14 "$CARGO_HOME/registry/src/index.crates.io-*/rustix-1.
 
 **2. `renameat_with` does not exist on every Unix.** Its cfg excludes FreeBSD, NetBSD, Solaris and others. This repository's CI matrix is `[ubuntu-latest, macos-latest, windows-latest]`, so every supported target is covered — but a bare `#[cfg(unix)]` arm would fail to compile on an unsupported Unix with a confusing error about a missing function. Task 5 adds an explicit `compile_error!` so that failure names its own cause. **Do not add a check-then-act fallback for such a platform** — `FLUX_FULL_UPDATED_SPEC_V16.md:10876` forbids check-then-rename as a substitute by name.
 
+**LINE NUMBERS DRIFT AS TASKS LAND, AND EVERY CITATION BELOW IS AS-OF THE BASE COMMIT.** Task 1 adds
+lines to `error.rs`; Tasks 2 through 6 add lines to three more files. A citation like `:264-276` is a
+description of where something was when this plan was written, not an instruction to edit those line
+numbers. **Locate every target by NAME — the function, the struct, the test — and use the line range
+only to confirm you found the right one.** This project has already paid for this once: a previous
+plan's Task 3 citations had to be corrected mid-execution after Task 1 shortened the file by a single
+line.
+
 **3. `rename_no_replace` is NOT `#[cfg]`-gated today** — it is one plain method in a non-gated `impl` block, at `crates/flux-platform/src/std_fs.rs:264-276`. Task 5 splits it. The file already mixes cfg styles (whole gated free functions, gated methods inside a non-gated `impl`, gated match arms), so a gated pair of methods matches the established pattern — `fn metadata` is already exactly that, at `:167-182` (unix) and `:184-213` (windows).
 
 ### What this cut does NOT do
@@ -119,6 +127,21 @@ The spec's registry is normative about the strings. Verified at `FLUX_FULL_UPDAT
 | `DESTINATION_NAMESPACE_COLLISION` | Two distinct source paths, or two source roots, map to the same destination object or prefix. | 16.1, 18.3, 241.5 |
 | `NOREPLACE_PUBLISH_UNAVAILABLE` | No no-replace publication primitive is available on the destination for a directory operation; refused before anything changes. | 241.5 |
 ```
+
+- [ ] **Step 0: Record the base commit**
+
+```bash
+export CUT3_BASE=$(git rev-parse HEAD)
+echo "$CUT3_BASE"
+```
+
+Write that sha down. Task 7 diffs against it to confirm the cut touched only the files it should.
+
+**Do NOT use `main` as that base.** In this worktree the local `main` ref is stale — it points at
+`bcbd4ac` while `origin/main` is at `489b947`, a gap of well over a hundred commits — so
+`git diff main..HEAD` prints a wall of unrelated files and tells you nothing. `origin/main` is no good
+either: this branch already carries the design commits and a `TODO.md` promote that are not part of
+cut 3. The commit you are starting from is the only honest base.
 
 - [ ] **Step 1: Verify the state matches this plan**
 
@@ -356,13 +379,39 @@ Expected: PASS, 2 tests.
 
 - [ ] **Step 8: Prove the new tests are not vacuous**
 
-Temporarily change the guard you just added from `== Some(false)` to `== Some(true)` — a LOGIC mutant, not a structural one.
+**Two mutants, because one cannot kill both tests and an earlier draft of this step named the wrong
+one.** The field is `Option<bool>` and `FaultFs::new()` leaves it `None`, so a mutant must be chosen
+against that three-valued state rather than against a boolean. Work through each before running it — the
+point of a mutant is that you can predict which test dies, and a mutant whose victim you cannot name in
+advance is proving nothing.
+
+**Mutant A — kills `a_destination_without_the_primitive_reports_it`.** Change the guard from
+`== Some(false)` to `== Some(true)`.
 
 Run: `cargo test -p flux-core no_replace_support`
 
-Expected: `no_replace_support_is_on_by_default` FAILS (it now errors where it should succeed). Confirm **that specific test** went red, not merely that the suite is non-zero. Then revert the mutant and confirm both pass again.
+Expected: `a_destination_without_the_primitive_reports_it` FAILS. With the field set to `Some(false)`,
+`Some(false) == Some(true)` is false, so the guard is skipped, the rename succeeds and the test's
+`unwrap_err()` panics. `no_replace_support_is_on_by_default` stays GREEN, because `None == Some(true)`
+is also false and the default path was always meant to succeed.
 
-If the mutant does not turn that test red, the test is not pinning what it claims and you should say so rather than proceeding.
+Revert, and confirm both pass.
+
+**Mutant B — kills `no_replace_support_is_on_by_default`.** Change the guard from `== Some(false)` to
+`!= Some(true)`.
+
+Run: `cargo test -p flux-core no_replace_support`
+
+Expected: `no_replace_support_is_on_by_default` FAILS. With the field `None`, `None != Some(true)` is
+true, so the guard now fires on the default path and the rename errors where the test expects success.
+`a_destination_without_the_primitive_reports_it` stays GREEN, since `Some(false) != Some(true)` is also
+true and that test wanted an error anyway.
+
+Revert, and confirm both pass.
+
+Confirm the SPECIFIC named test went red each time, not merely that the suite returned non-zero. If
+either mutant fails to kill its named test, the test is not pinning what it claims — say so rather than
+proceeding.
 
 - [ ] **Step 9: Run the gate**
 
@@ -846,10 +895,12 @@ borrow, so converting would be noise that implies a portability the line does no
     }
 ```
 
-`rename_no_replace` (`:264-276`) — convert both endpoints the same way. **Task 5 replaces this method
-entirely**, so the conversion you add here survives only in the Windows arm Task 5 writes. Add it anyway
-rather than reordering the tasks: leaving one method unconverted while every sibling is converted is the
-state a reader most easily mistakes for a deliberate exception.
+**`rename_no_replace` is DELIBERATELY SKIPPED in this task.** Task 5 replaces that method entirely and
+its Windows arm does its own conversion, so converting it here is work Task 5 deletes — and worse, it
+lengthens the method and invalidates the line range Task 5 cites to find it. An earlier draft did
+convert it here, on the reasoning that leaving one method unconverted looks like a deliberate exception;
+that reasoning loses to the concrete cost, and the one-commit window in an unmerged branch is not a
+readership worth paying for. Task 5's commit closes the gap.
 
 `remove_file` (`:278-280`):
 
@@ -997,7 +1048,11 @@ rg -n "fn MoveFileExW" "$CARGO_HOME/registry/src/index.crates.io-1949cf8c6b5b557
 
 - [ ] **Step 4: Replace the body with two cfg arms**
 
-In `crates/flux-platform/src/std_fs.rs`, replace the whole of `fn rename_no_replace` (`:264-276`) with:
+In `crates/flux-platform/src/std_fs.rs`, replace the whole of `fn rename_no_replace` with the two arms
+below. **Find it by NAME, not by the line range** — see the standing note on line drift at the top of
+this plan. It is unmodified by Tasks 1-4, so it should still read exactly as quoted in "Before you
+start", and if it does not, something earlier went wrong and you should report `STATE_MISMATCH` rather
+than editing around it.
 
 ```rust
     /// Publish without replacing, atomically.
@@ -1090,13 +1145,34 @@ Expected: PASS, including `rename_no_replace_refuses_a_dangling_symlink` (`:150-
 
 That test is the one most likely to break: `RENAME_NOREPLACE` must refuse a dangling symlink occupying the name, and if the kernel resolved the link instead it would see a free name and succeed. If it fails, **STOP** — that is a real behavioural regression and not a test to adjust.
 
-- [ ] **Step 8: Run the gate**
+- [ ] **Step 8: Prove the new body is what refuses**
+
+Every test in this task passes both before and after the change, which is honest but means nothing here
+yet demonstrates that the replacement does the work. Prove it with a LOGIC mutant now rather than
+leaving the only proof in a later task: a run that stopped after this task would otherwise have
+committed the cut's central change with no evidence at all.
+
+**On Windows**, change the Windows arm's `MoveFileExW(..., 0)` third argument to
+`MOVEFILE_REPLACE_EXISTING` — import it from the same module; it is `1u32`, verified at
+`windows-sys-0.61.2/.../FileSystem/mod.rs:2163`.
+
+Run: `cargo nextest run -p flux-platform rename_no_replace`
+
+Expected: `rename_no_replace_refuses_an_existing_target` and
+`rename_no_replace_refuses_a_directory_occupying_the_name` go RED. Confirm THOSE SPECIFIC tests went
+red, not merely that the suite returned non-zero. Revert the mutant and confirm they pass again.
+
+**On Unix**, the equivalent mutant is `RenameFlags::NOREPLACE` → `RenameFlags::empty()`, checked with
+the WSL command from Step 7. `rename_no_replace_refuses_a_dangling_symlink` is the test that must go red
+there.
+
+- [ ] **Step 9: Run the gate**
 
 Run: `just check`
 
 Expected: all four stages pass.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 git add crates/flux-platform/src/std_fs.rs crates/flux-platform/tests/std_fs.rs
@@ -1247,10 +1323,24 @@ Expected: pass, with a higher test count than Windows because `#[cfg(unix)]` tes
 - [ ] **Step 3: Confirm nothing outside the named files changed**
 
 ```bash
-git diff --stat main..HEAD -- . ':(exclude)docs'
+# Use the sha you recorded before Task 1, NOT `main`.
+git diff --stat "$CUT3_BASE"..HEAD
 ```
 
-Expected: exactly five files — `crates/flux-fs/src/error.rs`, `crates/flux-core/src/fault_fs.rs`, `crates/flux-platform/src/std_fs.rs`, `crates/flux-platform/tests/std_fs.rs`, and `crates/flux-platform/Cargo.toml` — and that last one only if your `windows-sys` patch version moved `MoveFileExW` behind a feature, which the pinned 0.61.2 does not. Four files is the expected outcome.
+Expected: **exactly four files.**
+
+```
+crates/flux-fs/src/error.rs
+crates/flux-core/src/fault_fs.rs
+crates/flux-platform/src/std_fs.rs
+crates/flux-platform/tests/std_fs.rs
+```
+
+A fifth, `crates/flux-platform/Cargo.toml`, appears only if your `windows-sys` patch version moved
+`MoveFileExW` behind a feature the workspace does not already enable — which the pinned 0.61.2 does not,
+so four is the outcome to expect and five is a signal to say why.
+
+Anything else is out of scope and should be reported, not committed.
 
 Anything else is out of scope and should be reported, not committed.
 
@@ -1292,3 +1382,23 @@ Plan complete and saved to `docs/superpowers/plans/2026-09-24-atomic-no-replace-
 **1. Subagent-Driven (recommended)** — a fresh subagent per task, review between tasks, fast iteration.
 
 **2. Inline Execution** — execute tasks in this session using executing-plans, batch execution with checkpoints.
+
+---
+
+## Stand-downs
+
+Findings raised during review and stood down rather than folded, recorded so a later round does not
+re-derive them.
+
+- `REJECTED: "the Errno-to-io::Error conversion in the Unix arm loses classification."` Refuted by
+  measurement: `impl From<Errno> for std::io::Error` is `Self::from_raw_os_error(err.raw_os_error())` at
+  `rustix-1.1.4/src/io/errno.rs:58-63`, so `raw_os_error()` survives and `FsError::from_io` classifies
+  normally. The concern was worth having -- `error.rs` records that rebuilding an error as
+  `Error::other(..)` destroys it, MEASURED to turn `DiskFull` into `IoError` -- which is why the code
+  comment now names the citation.
+- `DISCARDED-BELOW-FLOOR: whether windows-sys 0.61 defines PCWSTR as a raw pointer or a newtype, which
+  would decide if .as_ptr() needs a cast.` Unreachable as a plan defect: `MoveFileExW`'s declaration at
+  `windows-sys-0.61.2/.../FileSystem/mod.rs:273` takes `windows_sys::core::PCWSTR`, and this crate
+  already passes raw pointers to `windows-sys` functions in the `#[cfg(windows)]` `identity_of_handle`
+  at `crates/flux-platform/src/std_fs.rs:359-388`. If it does not compile, the compiler says so
+  immediately and the fix is one `as` -- it cannot reach a commit, because Task 5 runs the gate first.
