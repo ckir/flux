@@ -389,6 +389,19 @@ that has to be cleaned up: no temporary exists yet, so a refusal leaves the file
 found it, and the source metadata the gate needs is already in hand from Step 2. The only new syscall is
 one `metadata` on the destination.
 
+**The position is load-bearing, not merely tidy, and the symlinked-anchor case shows why.** The staging
+temporary is created in the DESTINATION's own directory — `temp_path` ends in
+`target.with_file_name(name)` at `crates/flux-fs/src/options.rs:74-79`, and `copy_file` builds it from
+`dst` at `crates/flux-core/src/copy.rs:146`. So when a destination path resolves back into the source
+tree, as it does through a symlinked anchor, the temporary is created INSIDE THE TREE BEING READ. Any
+temporary that lands in a directory the walk has not yet snapshotted is then enumerated and copied as if
+it were source content.
+
+A gate placed after Step 3 would refuse only after that had already happened. Refusing at Step 2a is
+what makes the whole class of "the destination is really the source" reach zero filesystem mutations,
+which is a stronger property than avoiding a broken hardlink and is the actual reason this gate earns
+its cost.
+
 The revised step order:
 
 | Step | What happens |
