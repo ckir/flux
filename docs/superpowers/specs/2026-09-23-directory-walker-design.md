@@ -1247,13 +1247,37 @@ did not change. Where identity is not `Strong` on both sides the check degrades 
 established, and `Safety::Strict` refuses; that is the same trade §107 forces everywhere else, and it
 is stated rather than hidden.
 
-**The honest limitation.** This narrows the window to the interval between the parent's verification and
-the child's publication; it does not eliminate it, because the check and the write remain two
-operations against a path the kernel re-resolves each time. Closing it structurally requires
-handle-relative traversal — `openat` and friends, writing through a directory file descriptor that
-cannot be re-pointed — which `TODO.md` already contemplates for walker TOCTOU and which is not in this
-cut. What this buys is that the attack must now win a race against a check rather than simply not being
-looked for, and item 114's requirement is met for the case item 114 describes.
+**This mitigation is a DIVERGENCE from the specified mechanism, not a complete implementation of it.**
+Earlier revisions of this section called handle-relative traversal "the complete fix" and placed it
+outside the cut, as though it were optional hardening that `TODO.md` might get to. It is not optional.
+**§149.7 "Destination-Side Resolution" (`FLUX_FULL_UPDATED_SPEC_V16.md:7190-7210`) specifies it
+outright:**
+
+> `DEST` itself is resolved once, at start. Below it, the writer creates and opens every destination
+> entry relative to a directory handle it holds for the parent, reached by walking down from `DEST`'s
+> root without following links (POSIX: `openat` with `O_NOFOLLOW` and `O_DIRECTORY`; Windows:
+> handle-relative opens that do not follow reparse points).
+>
+> If a component under `DEST` is a symlink, junction, or other reparse point that this operation did
+> not create, that path is rejected: its actions fail with `SAFETY_REJECTED` and are reported, and the
+> rest of the operation continues (exit status 1, Section 55).
+
+The second paragraph is what this design already does — per-path rejection with `SAFETY_REJECTED`, the
+walk continuing, exit 1 — so the OUTCOME is right. The first paragraph is the MECHANISM, and this
+design substitutes a different one: stat the parent, remember its identity, re-verify before writing.
+
+**The owner has ruled to accept that divergence**, on the same grounds as the probe deferral: a
+handle-relative surface means `openat`-style APIs across all three `FileSystem` implementors plus
+Windows handle-relative opens, reshaping a trait every existing consumer depends on, and that is a
+larger and riskier body of work than the engine cut it would sit beneath.
+
+**What it costs, stated rather than buried.** Identity re-verification is strictly weaker than a
+directory handle. A handle cannot be re-pointed, so the window closes; a re-check narrows the window
+and no more, because the check and the write remain two operations against a path the kernel re-resolves
+each time. An attacker must now win a race rather than simply not be looked for, which is a real
+improvement and is not compliance. **§149.7 is recorded as unmet tracked debt** alongside item 113, and
+when the handle-relative surface lands, this mitigation is deleted rather than kept — two mechanisms
+for one guarantee would leave a reader unsure which is authoritative.
 
 ### Failures must not grow without limit
 
@@ -1777,3 +1801,14 @@ re-derive them and a reader can see what was consciously not fixed.
   files, §41 filesystem safety, §43 paths, §110 source-mutation levels, §111 torn-read window -- all
   now cited. §55 and §105 were NOT satisfied and are folded above. §149.7 was missed entirely by the
   sweep and is the subject of its own open decision.
+- `DEFERRED-TO-ANOMALIES: spec 149.7's handle-relative destination writes are unmet; the design
+  substitutes identity capture plus re-verification, which narrows the window rather than closing it.
+  * FLUX_FULL_UPDATED_SPEC_V16.md:7190 * 2026-09-24` Owner-ruled divergence. The OUTCOME 149.7
+  prescribes -- per-path SAFETY_REJECTED, the walk continuing, exit 1 -- is met; the MECHANISM is not.
+- `REJECTED: "Code::IoError for a directory cycle is wrong because SAFETY_REJECTED aborts the whole
+  operation."` That was PR 2's stated reason and 149.7 undercuts it: SAFETY_REJECTED's registry entry
+  (spec:2946) cites both 129 and 149.7 and says "(that path only)", so the code already carries both an
+  operation-wide and a per-path severity. The CHOICE still stands on a better footing -- 55 says
+  IO_ERROR is used "only when no more specific code applies", and the registry has no cycle code, while
+  SAFETY_REJECTED's definition covers containment, self-copy and unexpected link components, none of
+  which is a cycle. Recorded so the weaker argument is not re-cited.
