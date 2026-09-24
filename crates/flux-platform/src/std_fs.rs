@@ -5,7 +5,10 @@
 //! `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` fails — FS-6 and FS-7 measured exactly
 //! that, and Section 241.5 is amended in Task 9 to name it.
 
-use flux_fs::{FileHandle, FileIdentity, FileSystem, FsError, Metadata, ObjectId, Perms, Result};
+use flux_fs::{
+    DirEntry, FileHandle, FileIdentity, FileSystem, FileType, FsError, Metadata, ObjectId, Perms,
+    Result,
+};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -248,6 +251,34 @@ impl FileSystem for StdFileSystem {
 
     fn remove_file(&self, path: &Path) -> Result<()> {
         std::fs::remove_file(path).map_err(FsError::from_io)
+    }
+
+    fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(path).map_err(FsError::from_io)? {
+            let entry = entry.map_err(FsError::from_io)?;
+            // `DirEntry::file_type` does NOT follow a symlink, and on Windows the
+            // reparse tag arrives in `wfd.dwReserved0` as part of the enumeration
+            // itself, so this costs no extra syscall there.
+            let t = entry.file_type().map_err(FsError::from_io)?;
+            out.push(DirEntry {
+                name: entry.file_name(),
+                file_type: if t.is_symlink() {
+                    FileType::Symlink
+                } else if t.is_dir() {
+                    FileType::Dir
+                } else if t.is_file() {
+                    FileType::File
+                } else {
+                    FileType::Other
+                },
+            });
+        }
+        Ok(out)
+    }
+
+    fn create_dir(&self, path: &Path) -> Result<()> {
+        std::fs::create_dir(path).map_err(FsError::from_io)
     }
 }
 

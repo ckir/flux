@@ -438,3 +438,56 @@ fn metadata_reports_a_reparse_point_as_not_a_file() {
         "a name-surrogate reparse point reports as a symlink"
     );
 }
+
+#[test]
+fn read_dir_lists_children_with_their_types() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::create_dir(d.path().join("sub")).unwrap();
+    std::fs::write(d.path().join("f.txt"), b"x").unwrap();
+
+    let fs = StdFileSystem;
+    let mut got: Vec<(String, flux_fs::FileType)> = fs
+        .read_dir(d.path())
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.name.to_string_lossy().into_owned(), e.file_type))
+        .collect();
+    got.sort();
+
+    assert_eq!(
+        got,
+        vec![
+            ("f.txt".to_string(), flux_fs::FileType::File),
+            ("sub".to_string(), flux_fs::FileType::Dir),
+        ]
+    );
+}
+
+#[test]
+fn read_dir_on_an_empty_directory_is_empty_not_an_error() {
+    // An empty directory is exactly what a tree copy must handle, and the old fake
+    // could not even express one.
+    let d = tempfile::tempdir().unwrap();
+    assert!(StdFileSystem.read_dir(d.path()).unwrap().is_empty());
+}
+
+#[test]
+fn read_dir_on_a_missing_path_fails() {
+    let d = tempfile::tempdir().unwrap();
+    assert!(StdFileSystem.read_dir(&d.path().join("nope")).is_err());
+}
+
+#[test]
+fn create_dir_makes_one_level_and_refuses_a_missing_parent() {
+    let d = tempfile::tempdir().unwrap();
+    let fs = StdFileSystem;
+
+    fs.create_dir(&d.path().join("a")).unwrap();
+    assert_eq!(fs.metadata(&d.path().join("a")).unwrap().file_type, flux_fs::FileType::Dir);
+
+    // Fails if the parent is missing: the walk creates ancestors in order, so it
+    // never needs the recursive form, and silently creating them would hide a bug.
+    assert!(fs.create_dir(&d.path().join("missing/b")).is_err());
+    // And refuses to replace something that is already there.
+    assert!(fs.create_dir(&d.path().join("a")).is_err());
+}

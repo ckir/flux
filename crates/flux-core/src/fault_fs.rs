@@ -4,7 +4,7 @@
 //! after a strict failure — so this records the call sequence and can fail any
 //! named call. None of that is reachable against a real disk.
 
-use flux_fs::{Code, FileHandle, FileSystem, FileType, FsError, Metadata, Perms, Result};
+use flux_fs::{Code, DirEntry, FileHandle, FileSystem, FileType, FsError, Metadata, Perms, Result};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -36,6 +36,11 @@ struct Inner {
     /// in two of them at once and express a state no filesystem has. A path absent
     /// from this map but present in `files` is a regular file.
     types: HashMap<PathBuf, FileType>,
+    /// Directories created via `create_dir`. Separate from `types`/`files`: a
+    /// directory has no bytes (so it cannot live in `files`) and an empty
+    /// directory must be distinguishable from a device node (`types` alone
+    /// could not tell them apart, since neither is in `files`).
+    directories: HashSet<PathBuf>,
     perms: HashMap<PathBuf, Option<Perms>>,
     /// consumed by the next `write` on a handle from `create_new`
     write_fault: Option<std::io::Error>,
@@ -207,7 +212,8 @@ impl FaultFs {
 
     pub fn exists(&self, path: impl AsRef<Path>) -> bool {
         let path = path.as_ref();
-        self.inner.lock().unwrap().files.contains_key(path)
+        let g = self.inner.lock().unwrap();
+        g.files.contains_key(path) || g.directories.contains(path)
     }
 
     /// Inject a fault whose source carries a CHOSEN `ErrorKind`.
@@ -430,9 +436,17 @@ impl FileSystem for FaultFs {
             g.files.remove(&p);
         }
         let g = &*g;
-        let len = g.files.get(&p).map(|b| b.len() as u64).ok_or_else(|| {
-            FsError::new(Code::IoError, std::io::Error::from(std::io::ErrorKind::NotFound))
-        })?;
+        let len = match g.files.get(&p) {
+            Some(b) => b.len() as u64,
+            // A directory has no bytes, and is not in `files`.
+            None if g.directories.contains(&p) => 0,
+            None => {
+                return Err(FsError::new(
+                    Code::IoError,
+                    std::io::Error::from(std::io::ErrorKind::NotFound),
+                ));
+            }
+        };
         Ok(Metadata {
             len,
             file_type: g.types.get(&p).copied().unwrap_or(FileType::File),
@@ -514,6 +528,64 @@ impl FileSystem for FaultFs {
         g.identities.remove(&p);
         g.times.remove(&p);
         g.perms.remove(&p);
+        Ok(())
+    }
+
+    fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>> {
+        let p = path.to_path_buf();
+        self.record(format!("read_dir({})", p.display()), "read_dir")?;
+        let g = self.inner.lock().unwrap();
+        if !g.directories.contains(&p) {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            ));
+        }
+        // Immediate children only, from both maps. Unsorted deliberately: the trait
+        // says ordering is the caller's job, and a fake that pre-sorted would let a
+        // walk with NO sort pass its ordering test.
+        let mut out = Vec::new();
+        for key in g.files.keys().chain(g.directories.iter()) {
+            if key.parent() != Some(p.as_path()) {
+                continue;
+            }
+            let Some(name) = key.file_name() else { continue };
+            let file_type = if g.directories.contains(key) {
+                FileType::Dir
+            } else {
+                g.types.get(key).copied().unwrap_or(FileType::File)
+            };
+            out.push(DirEntry { name: name.to_os_string(), file_type });
+        }
+        Ok(out)
+    }
+
+    fn create_dir(&self, path: &Path) -> Result<()> {
+        let p = path.to_path_buf();
+        self.record(format!("create_dir({})", p.display()), "create_dir")?;
+        let mut g = self.inner.lock().unwrap();
+        if g.directories.contains(&p) || g.files.contains_key(&p) {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+            ));
+        }
+        // Fails if the parent is missing, as the trait says and `std::fs::create_dir`
+        // does. The walk root itself has no parent in the fake, so a root-level
+        // create is allowed.
+        if let Some(parent) = p.parent()
+            && !parent.as_os_str().is_empty()
+            && parent != Path::new("/")
+            && !g.directories.contains(parent)
+        {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            ));
+        }
+        g.directories.insert(p.clone());
+        g.types.insert(p.clone(), FileType::Dir);
+        mint_identity(&mut g, &p);
         Ok(())
     }
 }
@@ -668,5 +740,57 @@ mod tests {
         let after = fs.metadata(std::path::Path::new("/b")).unwrap().identity;
 
         assert_eq!(before, after, "a rename moves the name, not the object");
+    }
+
+    #[test]
+    fn create_dir_then_read_dir_round_trips_through_the_trait() {
+        // C1: the walk's fixtures are built with create_dir, so it has a consumer in
+        // this PR rather than waiting for copy_tree.
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/a")).unwrap();
+        fs.create_dir(Path::new("/a/sub")).unwrap();
+        fs.write_file("/a/f", b"x");
+        fs.add_symlink("/a/link");
+
+        let mut got: Vec<(String, FileType)> = fs
+            .read_dir(Path::new("/a"))
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.name.to_string_lossy().into_owned(), e.file_type))
+            .collect();
+        got.sort();
+
+        assert_eq!(
+            got,
+            vec![
+                ("f".to_string(), FileType::File),
+                ("link".to_string(), FileType::Symlink),
+                ("sub".to_string(), FileType::Dir),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_directory_is_distinguishable_from_a_special_file() {
+        // The design document names this as the reason the fake had to change: the
+        // old `not_files` set made an empty directory and a device node identical.
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.add_special("/dev");
+
+        assert!(fs.read_dir(Path::new("/d")).unwrap().is_empty());
+        assert_eq!(fs.metadata(Path::new("/d")).unwrap().file_type, FileType::Dir);
+        assert_eq!(fs.metadata(Path::new("/dev")).unwrap().file_type, FileType::Other);
+        assert!(fs.read_dir(Path::new("/dev")).is_err());
+    }
+
+    #[test]
+    fn create_dir_refuses_a_missing_parent_and_an_occupied_name() {
+        let fs = FaultFs::new();
+        assert!(fs.create_dir(Path::new("/a/b")).is_err(), "parent /a does not exist");
+        fs.create_dir(Path::new("/a")).unwrap();
+        assert!(fs.create_dir(Path::new("/a")).is_err(), "already a directory");
+        fs.write_file("/f", b"x");
+        assert!(fs.create_dir(Path::new("/f")).is_err(), "occupied by a file");
     }
 }

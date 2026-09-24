@@ -26,7 +26,7 @@ pub enum Perms {
 /// unconstructible. The cost is real and worth naming: on a filesystem with no
 /// `d_type` (this repository measurably uses one, `/mnt/c` under WSL is v9fs) that
 /// fallback is an `lstat` per entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FileType {
     File,
     Dir,
@@ -144,6 +144,33 @@ pub trait FileSystem: Send + Sync {
     fn rename_no_replace(&self, from: &Path, to: &Path) -> Result<()>;
 
     fn remove_file(&self, path: &Path) -> Result<()>;
+
+    /// ONE level. Returns every entry with its file type, in whatever order the OS
+    /// gave them -- ordering is the caller's job (§7.2), because only the caller
+    /// knows the comparison rule.
+    ///
+    /// Returns a `Vec`, not an iterator, and that is deliberate: §7.2 requires each
+    /// directory to be sorted, sorting requires the whole directory in hand, so a
+    /// lazy return shape would promise a laziness the caller cannot use.
+    /// Materialising also drops the directory handle before the walk recurses, so
+    /// only one is ever open.
+    ///
+    /// This is within invariant 11, which forbids an unbounded GLOBAL list -- not
+    /// §7.2, which is about ordering and would equally appear to bless something
+    /// genuinely unbounded. Measured at 200,000 entries in one ext4 directory:
+    /// readdir 448 ms, 10.1 MB, bytewise sort 81 ms.
+    ///
+    /// State the bound precisely, because "one directory" is the easy thing to say
+    /// and it is wrong: only one directory HANDLE is ever open, but the walk's stack
+    /// retains the un-yielded entries of every directory on the CURRENT PATH, so the
+    /// live bound is one directory per level, capped by `DEFAULT_MAX_DEPTH`. That is
+    /// still bounded by DEPTH rather than by the total number of files, which is
+    /// what invariant 11 actually forbids -- but it is not "one".
+    fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>>;
+
+    /// Creates ONE directory. Fails if the parent is missing; the walk creates
+    /// ancestors in order, so it never needs the recursive form.
+    fn create_dir(&self, path: &Path) -> Result<()>;
 }
 
 #[cfg(test)]
@@ -222,6 +249,14 @@ mod tests {
         }
 
         fn remove_file(&self, _: &Path) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn read_dir(&self, _: &Path) -> crate::Result<Vec<DirEntry>> {
+            Ok(Vec::new())
+        }
+
+        fn create_dir(&self, _: &Path) -> crate::Result<()> {
             Ok(())
         }
     }
