@@ -809,22 +809,26 @@ the step order above the gate, the staging contract, and the Step 7 re-check are
 /// they happen, not accumulated here — see "Failures must not grow without limit".
 ///
 /// A tree copy does not stop at the first failure, so unlike `copy_file` it reports
-/// a SUMMARY rather than returning at the first error. A non-zero `failures` count
-/// is what makes the CLI exit 1.
+/// a SUMMARY rather than returning at the first error. A non-empty `failures`
+/// tally is what makes the CLI exit 1.
 #[derive(Debug)]
 pub struct TreeOutcome {
     pub files_copied: u64,
     pub bytes_copied: u64,
     pub directories_created: u64,
-    /// Total failures reported to the sink. Bounded by construction: a counter,
-    /// never a list, so a tree with millions of failures costs one `u64`.
-    pub failures: u64,
-    /// The same total broken down by cause — four numbers, one per
-    /// `TreeFailureCause` variant. This is what lets a caller decide the exit
-    /// code without keeping the records: §2 item 83 makes
-    /// `DirectoryChangedDuringScan` an exit-1 condition specifically, so the
-    /// TYPE has to survive even though the records do not.
-    pub failures_by_cause: FailureTally,
+    /// Failures broken down by cause — one counter per `TreeFailureCause`
+    /// variant. Bounded by construction: counters, never a list, so a tree with
+    /// millions of failures costs the same as a clean one.
+    ///
+    /// The TYPE has to survive even though the records do not, because §2 item 83
+    /// makes `DirectoryChangedDuringScan` an exit-1 condition specifically — a
+    /// single undifferentiated total could not answer that.
+    ///
+    /// There is deliberately NO separate `failures: u64` field beside this. An
+    /// earlier revision had both, which is denormalized state that two code paths
+    /// can disagree about; the total is `tally.total()`, derived, with one source
+    /// of truth.
+    pub failures: FailureTally,
     /// Identity comparisons that were SKIPPED because a side was not `Strong`,
     /// aggregated for one warning apiece. Not failures: the copies succeeded.
     /// The engine captures; PR 5's CLI renders. Empty on the normal path.
@@ -855,12 +859,29 @@ pub enum TreeFailureCause {
 
 /// One counter per `TreeFailureCause` variant. Fixed size, so it costs the same
 /// on a clean tree and on one where every entry failed.
+///
+/// It is incremented by an EXHAUSTIVE `match` on `TreeFailureCause` with no
+/// wildcard arm. That is load-bearing rather than stylistic: with a `_ =>` arm,
+/// adding a fifth cause later would compile and silently count nothing, and the
+/// miscount would show up as a wrong exit code rather than as an error. Without
+/// one, the compiler names every site that must be updated.
 #[derive(Debug, Default)]
 pub struct FailureTally {
     pub walk: u64,
     pub create_dir: u64,
     pub copy: u64,
     pub unsupported: u64,
+}
+
+impl FailureTally {
+    /// The only total. Derived, never stored alongside the parts.
+    pub fn total(&self) -> u64 {
+        self.walk + self.create_dir + self.copy + self.unsupported
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
 }
 
 pub fn copy_tree<F: FileSystem>(
@@ -1106,8 +1127,8 @@ pub fn copy_tree<F: FileSystem>(
 ) -> std::result::Result<TreeOutcome, CopyError>;
 ```
 
-`TreeOutcome` then carries **counts, not records** — total failures plus a per-cause tally, which is
-four numbers because `TreeFailureCause` has four variants. Nothing is dropped, nothing is truncated,
+`TreeOutcome` then carries **counts, not records** — a per-cause tally, four numbers because
+`TreeFailureCause` has four variants, with the total derived from them rather than stored beside them. Nothing is dropped, nothing is truncated,
 resident memory does not grow with the number of failures, and the exit code is derivable from the
 tally without consulting a list that may have been capped.
 
@@ -1119,6 +1140,19 @@ pipeline uses anyway, so it moves the engine toward Phase 3 rather than away fro
 The CLI passes a sink that prints or accumulates as it chooses, which is the same engine-captures /
 CLI-renders division the weak-identity warning already uses, and it means a long-running copy reports
 its failures as they occur rather than only at the end.
+
+**Rejected: a `Sender<TreeFailure>` channel instead of a closure**, on the reasoning that a channel is
+`Send` and so ready for Phase 3's parallel workers. It fails on the very invariant that produced this
+section. `copy_tree` is synchronous and nothing drains the receiver while it runs, so an UNBOUNDED
+channel is an unbounded in-memory list of failures — invariant 9 and 11 again, reintroduced by the fix
+for them — while a BOUNDED channel with no concurrent receiver blocks forever once it fills. Either
+the memory problem returns or the engine deadlocks. A closure has neither property because it runs the
+caller's code inline, at which point the failure is handled and gone.
+
+The `Send` concern is real but belongs to Phase 3, where the workers and the queue arrive together and
+the sink can be whatever that architecture needs. Choosing a channel now would pay a cost today for an
+engine this document says will be rewritten, and would pay it by breaking a requirement that is in
+force today.
 
 `WeakIdentityWarnings` stays as it is, and the contrast is the point: it is bounded by the number of
 VOLUMES rather than the number of files, so aggregating it loses nothing. Failures are per-entry, so
@@ -1421,3 +1455,15 @@ re-derive them and a reader can see what was consciously not fixed.
   renumbered mechanically. Recorded because the ordinals have now shifted twice.
 - `DISCARDED-BELOW-FLOOR: how the CLI renders streamed failures against the summary tally.` Presentation,
   settled in the CLI cut, no correctness consequence.
+- `REJECTED: "a failed copy leaves its .flux-partial temporary on disk, violating invariant 26."`
+  Refuted by measurement. `copy_file` routes EVERY post-temporary failure through `discard()`
+  (crates/flux-core/src/copy.rs:177, 180, 189, 199, 208, 223, 225, 229, 240), and a comment at :82
+  warns against `?` after the temporary exists for exactly this reason. Three tests pin it, including
+  `a_full_disk_does_not_publish_and_leaves_no_temporary` at :333. The single case where REMOVAL itself
+  fails reports the surviving path in `CopyError.leftover`, which `TreeFailureCause::Copy` carries
+  intact.
+- `REJECTED: "canonicalizing the destination anchor makes symlink targets contribute to topology,
+  against invariant 21."` Invariant 2 defines topology as HARDLINK topology among selected entries;
+  destination containment is not topology, and the peer hedged the claim itself.
+- `DISCARDED-BELOW-FLOOR: the failure sink returns () so a caller cannot abort the walk early.`
+  Aborting early on a per-entry failure is forbidden anyway — §2 item 83 requires the walk continue.
