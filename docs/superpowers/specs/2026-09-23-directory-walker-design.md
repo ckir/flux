@@ -90,7 +90,12 @@ pub enum FileIdentity {
 
 pub struct Metadata {
     pub len: u64,
-    pub is_file: bool,
+    /// AS MERGED IN PR 2, this replaced the `is_file: bool` this section originally
+    /// proposed. `is_file == false` is equally true of a directory and of a symlink,
+    /// while `read_dir` FOLLOWS a symlink to a directory — so `!is_file` cannot answer
+    /// "is this a directory", which the anchor check and the `AlreadyExists` recovery
+    /// both need it to answer.
+    pub file_type: FileType,
     pub permissions: Option<Perms>,
     pub modified: Option<SystemTime>,
     /// §149.4 asks for identity "where strongly supported", and §107 requires the
@@ -809,9 +814,18 @@ There is an argument for `NoReplace` being the more natural tree default, since 
 "planned as new" publishes that way, and every file of a copy into a fresh destination is planned as
 new. It is not adopted here, and the reason is sequencing rather than taste: forcing `NoReplace` would
 make that race **reachable for the first time**, and PR 3 would be the change that exposed it. Closing
-it properly needs an atomic primitive — `rustix::fs::renameat_with` with `RenameFlags::NOREPLACE` on
-Unix, `FileRenameInfoEx` without `REPLACE_IF_EXISTS` on Windows, which `std` does not expose — and that
-is its own piece of work, recorded in `TODO.md` and deliberately out of this cut.
+it properly needs an atomic primitive, and there are **three** of them, not two — which is part of why
+it is its own piece of work, recorded in `TODO.md` and deliberately out of this cut:
+
+- **Linux:** `renameat2` with `RENAME_NOREPLACE`, reachable as `rustix::fs::renameat_with` with
+  `RenameFlags::NOREPLACE`.
+- **macOS:** NOT that. macOS is a Unix platform without `renameat2`; the equivalent is `renamex_np` with
+  `RENAME_EXCL`. An earlier draft of this paragraph said the `rustix` call covers "Unix", which is the
+  same `cfg(unix)`-means-Linux mistake that already cost this project a macOS CI failure once — see the
+  non-UTF-8 filename case, where `cfg(unix)` was wrongly read as "permits arbitrary bytes" and macOS
+  refused the name outright. NOT independently verified here: this machine has no macOS to measure on,
+  so whoever implements it confirms the primitive before relying on this line.
+- **Windows:** `FileRenameInfoEx` without `REPLACE_IF_EXISTS`, which `std` does not expose.
 
 Passing through therefore keeps the race dormant exactly as it is today: no caller in this cut selects
 `NoReplace`, so PR 3 neither fixes nor exposes it. When that primitive lands, a tree copy can adopt
@@ -980,6 +994,37 @@ fake that agrees with the implementation about encoding proves nothing about the
   reach that case. It is precisely the weak-identity situation, where the depth cap is the guard.
 - **`PATH_COMPONENT_INVALID`** (§103) arrives with the phase that constructs `FluxPathKey`s.
 
+## Reading this document against merged code
+
+**PR 1 and PR 2 are merged. Where a code block in this document disagrees with the code, THE CODE WINS.**
+
+This document was written before any of it was implemented, and implementing it settled details it had
+left open or had guessed differently. Those settlements live in the code and in PR review, not here, and
+this document was not reconciled as they landed. A plan author who reads a block here as current will
+cite a shape that no longer exists — which is the fabricated-precision failure this project has already
+paid for once.
+
+So: **author PR 3's plan against `main`, and grep-verify every type, field, signature and line number
+before writing it down.** Use this document for intent and rationale, which are still current, not for
+shapes.
+
+The drifts found so far, recorded because each one was reached for and found wrong:
+
+- `Metadata.is_file: bool` became `Metadata.file_type: FileType` in PR 2. The block above is corrected
+  in place. `!is_file` cannot distinguish a directory from a symlink, and two checks in this design need
+  exactly that distinction.
+- **A directory cycle is reported as `Code::IoError`, not `Code::SafetyRejected`.** This document names
+  a code for overlap and for a changed directory but never for a cycle. PR 2 decided it, and
+  `crates/flux-core/src/walk.rs:340-351` records why: `SafetyRejected` aborts the whole operation under
+  §129 while a cycle explicitly does not, so reusing it would make one code carry two severities.
+  (`ErrorKind::FilesystemLoop` would be more precise but is unstable on the pinned toolchain, E0658.)
+- **The destination-anchor comparison belongs to `copy_tree`, NOT to the walk.** The rules for it appear
+  above inside the walk's description, which reads as though the walker performs it — but the merged
+  signature is `walk(fs, root)` and carries no destination. The walk owns ANCESTOR-SET cycle detection,
+  which needs only the source tree. `copy_tree` owns the anchor comparison and performs it on each `Dir`
+  event, where it already has both the anchor and the entry. Nothing about `Walk`'s surface changes for
+  PR 3.
+
 ## Delivery
 
 Four pull requests, in order. Each plan is written only once its predecessor has merged, because a plan
@@ -1084,3 +1129,13 @@ re-derive them and a reader can see what was consciously not fixed.
 - `DISCARDED-BELOW-FLOOR: TreeFailureCause::Unsupported carries a FileType while the rendered code is
   always SPECIAL_FILE_UNSUPPORTED.` Intended, and stated as such where the variant is defined: the
   variant carries what the entry WAS so the report can say so, while the code stays single-valued.
+- `DISCARDED-BELOW-FLOOR: the pre-flight's own weak-identity warning does not say whether its example
+  path is the source root or the destination root.` It is the destination anchor, by the same rule that
+  settles the both-sides-Weak tie-break above: the side the user did not name is the informative one.
+  Named here rather than fixed in place because it follows from a rule already stated.
+- `REJECTED: "an implementer must invent a Metadata field to check for a directory."` The field exists
+  and is merged — `pub file_type: FileType` at crates/flux-fs/src/fs.rs:87. The document's own block was
+  stale, which is the finding that was folded; the implementer invents nothing.
+- `REJECTED: "the walk signature must be broken to pass the destination anchor."` The walk never needed
+  it. `copy_tree` holds the anchor and compares on each `Dir` event; the walk owns only ancestor-set
+  cycle detection, which needs the source tree alone.
