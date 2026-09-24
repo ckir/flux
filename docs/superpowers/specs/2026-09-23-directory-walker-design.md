@@ -1085,11 +1085,37 @@ A tree copy assumes throughout that `dst_root.join(rel)` names the thing it just
 destination that normalizes — macOS decomposing to NFD, a case-insensitive volume folding `File.txt`
 and `file.txt` — that assumption is false, and §241.4 says so in as many words.
 
-**For DIRECTORIES this is already satisfied, by accident rather than design.** The item-114 mitigation
-captures each created directory's identity immediately after creating it and re-verifies before writing
-inside. That capture IS §241.4's post-creation validation by identity, and it is worth noticing that
-two requirements arrived at the same mechanism from different directions — one about attackers, one
-about normalizing filesystems.
+**An earlier revision claimed directories already satisfied this via the item-114 capture. They do
+not.** The capture stats `dst_root.join(rel)` — the INTENDED path — so it is still asking the
+destination about bytes it assumed survived. §241.4 forbids exactly that assumption. The two
+requirements look alike and are not the same: item 114 asks "is this still the object I created?", and
+§241.4 asks "is the object I created reachable by the name I used?". The capture answers the first and
+presupposes the second.
+
+**What actually satisfies it is that the presupposition is CHECKED rather than trusted**, and the two
+ways it can fail need different treatment:
+
+- **The name was normalized and no longer resolves** — the post-creation stat returns `NotFound`. That
+  is the discrepancy detected, not an assumption vindicated: it fails that entry with
+  `DESTINATION_ERROR` rather than proceeding on a path that names nothing.
+- **The name was FOLDED onto an existing entry** — the destination is case-insensitive, `file.txt` is
+  already there, and creating `File.txt` resolves to it. The stat succeeds and returns the OTHER
+  object's identity. Nothing is `NotFound` and nothing looks wrong.
+
+The second is the dangerous one, and it is item 83's case seen from the directory side. For FILES the
+no-replace primitive catches it: the second rename finds the name taken and fails rather than replacing,
+which is what makes that primitive load-bearing for correctness rather than only for concurrency.
+**For DIRECTORIES there was no such guard**, because `create_dir` returning `AlreadyExists` is treated
+as ordinary — a tree copy onto an existing tree is normal, and the design continues if the occupant is
+a directory. That rule is right for a genuine pre-existing directory and wrong for two source
+directories the destination folds into one, which would silently merge their contents.
+
+So the `AlreadyExists` path gains a discriminator: **if the occupying directory was created by THIS
+operation, the names collided**, and that entry fails with `DESTINATION_NAMESPACE_COLLISION` rather
+than merging. The set of directories this operation created is already held — the item-114 capture
+keeps exactly that, one identity per created directory — so the check costs a lookup in a set that
+exists for another reason. A directory present before the operation started is not in that set and is
+treated as before.
 
 **For FILES it is not satisfied**, and the case is item 83's: copying a directory holding `File.txt` and
 `file.txt` to a case-insensitive destination publishes one and must report
@@ -1136,12 +1162,30 @@ Two halves, and only one of them is already handled:
   the item-114 capture all depend on. It would also make `rename_no_replace` act on a target rather
   than the name it promises to leave alone.
 
-  What is needed is a lexical absolute-path conversion that touches no disk: make the path absolute
-  against the current directory, resolve `.` and `..` textually, and prefix — `\\?\` for a drive path,
-  `\\?\UNC\` for a UNC path — leaving every link in place. A path already carrying the prefix is left
-  alone. This is fiddly rather than deep, and naming it here is the point: an implementer who reaches
-  for `canonicalize` because it produces the right-looking string will silently disable three safety
-  checks.
+  **But a purely LEXICAL conversion is also wrong, and the previous revision of this paragraph asked
+  for one.** It said to "resolve `.` and `..` textually". Textual `..` is not semantics-preserving:
+  if `link` points at `/tmp`, then `link/../b` physically names `/b`, while popping `link` lexically
+  yields `./b`. And a `\\?\` path *disables* the kernel's own parsing, so the wrong answer is then
+  taken literally instead of being corrected. Asking for a lexical resolve would have produced silent
+  reads and writes of the wrong file whenever `..` followed a link.
+
+  **The correct conversion resolves the PARENT and appends the final component verbatim.**
+  `canonicalize` the parent directory — physically correct, so `..` and intermediate links resolve the
+  way the kernel would resolve them, and the result already carries `\\?\` — then push the final
+  component unchanged. That preserves exactly what this design needs: the final component is never
+  resolved, so `metadata` still reports a link as a link, `rename_no_replace` still judges the name
+  rather than its target, and the Step 2a gate, the symlinked-anchor refusal and the item-114 capture
+  all keep their meaning. A path already prefixed is left alone.
+
+  The parent must exist for this, which it does at every call site: the engine creates parents before
+  children, and the roots are resolved at startup. Where it does not — a caller naming a path under a
+  directory that is not there — the call was going to fail anyway, and it fails with the same error it
+  would have failed with.
+
+  So the rule is narrow enough to state in one line: **resolve the parent physically, never the final
+  component.** An implementer who canonicalizes the WHOLE path silently disables three safety checks;
+  one who resolves it purely lexically silently retargets paths containing `..`. Both produce the
+  right-looking string.
 
   This also removes the caveat the previous text was honest about but should not have needed: there is
   no longer a class of caller that silently gets the 260-character limit.
@@ -1869,3 +1913,7 @@ re-derive them and a reader can see what was consciously not fixed.
   touches. Fourteen bind and were uncited; twelve are satisfied and now cited -- 7.1, 7.3, 30.1, 149.1,
   149.2, 149.3, 149.5, 233.1, 233.2, 233.3, 241.1, 241.2, 241.3. Two were NOT satisfied: 241.4, folded
   above, and 5.2's dry-run rule, which belongs to the deferred probe and is covered by that debt entry.
+- `DISCARDED-BELOW-FLOOR: a mount-boundary skip could increment both boundaries_skipped and failures
+  under --safety=strict.` It cannot: strict affects identity comparisons that cannot be made, while a
+  boundary skip is a comparison that succeeded and said "different volume". A boundary whose volume
+  could not be read is the degraded case and lands on the warning channel only, as stated.
