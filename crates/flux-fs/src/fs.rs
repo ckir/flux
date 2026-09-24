@@ -26,7 +26,7 @@ pub enum Perms {
 /// unconstructible. The cost is real and worth naming: on a filesystem with no
 /// `d_type` (this repository measurably uses one, `/mnt/c` under WSL is v9fs) that
 /// fallback is an `lstat` per entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
     File,
     Dir,

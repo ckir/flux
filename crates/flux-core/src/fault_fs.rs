@@ -758,7 +758,7 @@ mod tests {
             .into_iter()
             .map(|e| (e.name.to_string_lossy().into_owned(), e.file_type))
             .collect();
-        got.sort();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
 
         assert_eq!(
             got,
