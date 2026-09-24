@@ -21,6 +21,20 @@ pub enum Code {
     /// be confused with `SourceChanged`, which is a FILE whose length or mtime moved
     /// under `copy_file` (§33). Different objects, different producers, no overlap.
     DirectoryChangedDuringScan,
+    /// §241.5. No no-replace publication primitive is available on the destination
+    /// for a DIRECTORY operation, which is refused before anything changes. Nothing
+    /// in this crate returns it: the engine raises it and the CLI maps it to exit 3.
+    /// The vocabulary lands here because a `Code` variant is a `flux-fs` concern.
+    NoReplacePublishUnavailable,
+    /// §241.5, §2 item 83. Two distinct source paths map to the same destination
+    /// object or prefix -- two names a case-insensitive destination folds into one,
+    /// or two source roots colliding. Published one, refused the other, overwrote
+    /// neither. Raised by the engine, not here.
+    DestinationNamespaceCollision,
+    /// §105, §207. A destination-side failure with no more specific code -- including
+    /// a name or path the destination refuses as too long even through the
+    /// extended-length call path. Path-scoped: it fails that ACTION, not the operation.
+    DestinationError,
     IoError,
 }
 
@@ -36,6 +50,9 @@ impl Code {
             Code::SpecialFileUnsupported => "SPECIAL_FILE_UNSUPPORTED",
             Code::SafetyRejected => "SAFETY_REJECTED",
             Code::DirectoryChangedDuringScan => "DIRECTORY_CHANGED_DURING_SCAN",
+            Code::NoReplacePublishUnavailable => "NOREPLACE_PUBLISH_UNAVAILABLE",
+            Code::DestinationNamespaceCollision => "DESTINATION_NAMESPACE_COLLISION",
+            Code::DestinationError => "DESTINATION_ERROR",
             Code::IoError => "IO_ERROR",
         }
     }
@@ -99,6 +116,9 @@ mod tests {
         assert_eq!(Code::SafetyRejected.as_str(), "SAFETY_REJECTED");
         assert_eq!(Code::IoError.as_str(), "IO_ERROR");
         assert_eq!(Code::DirectoryChangedDuringScan.as_str(), "DIRECTORY_CHANGED_DURING_SCAN");
+        assert_eq!(Code::NoReplacePublishUnavailable.as_str(), "NOREPLACE_PUBLISH_UNAVAILABLE");
+        assert_eq!(Code::DestinationNamespaceCollision.as_str(), "DESTINATION_NAMESPACE_COLLISION");
+        assert_eq!(Code::DestinationError.as_str(), "DESTINATION_ERROR");
     }
 
     #[test]
