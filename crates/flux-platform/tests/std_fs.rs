@@ -492,6 +492,23 @@ fn create_dir_makes_one_level_and_refuses_a_missing_parent() {
     assert!(fs.create_dir(&d.path().join("a")).is_err());
 }
 
+/// Create a directory link at `link` pointing at `target`, by whatever mechanism the
+/// platform allows WITHOUT privilege.
+///
+/// Two arms because the test below asserts a CROSS-PLATFORM property and was measured
+/// on both, so gating it to one platform would leave the other half of the claim
+/// untested. `cfg(unix)` covers macOS, so between them the two arms cover every target
+/// the CI matrix builds.
+#[cfg(windows)]
+fn make_dir_link(target: &std::path::Path, link: &std::path::Path) -> Result<(), String> {
+    make_dir_reparse_point(target, link)
+}
+
+#[cfg(unix)]
+fn make_dir_link(target: &std::path::Path, link: &std::path::Path) -> Result<(), String> {
+    std::os::unix::fs::symlink(target, link).map_err(|e| e.to_string())
+}
+
 #[test]
 fn read_dir_follows_a_symlink_to_a_directory_which_is_why_file_type_is_checked() {
     // This is the reachable tree escape. MEASURED on Windows via a junction and on
@@ -503,8 +520,8 @@ fn read_dir_follows_a_symlink_to_a_directory_which_is_why_file_type_is_checked()
     let link = d.path().join("link");
     std::fs::create_dir(&real).unwrap();
     std::fs::write(real.join("marker.txt"), b"x").unwrap();
-    if make_dir_reparse_point(&real, &link).is_err() {
-        eprintln!("skipped: cannot create a directory reparse point here");
+    if make_dir_link(&real, &link).is_err() {
+        eprintln!("skipped: cannot create a directory link here");
         return;
     }
 
