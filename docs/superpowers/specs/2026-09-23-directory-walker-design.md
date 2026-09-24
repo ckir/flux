@@ -503,8 +503,13 @@ flag it names, land together.
 #### Where `--safety=strict` lives
 
 `CopyOptions` has no safety field today — it carries `preserve_times`, `preserve_permissions`,
-`durability`, `publish` and `operation_id`. PR 4 adds one, because `copy_tree(fs, src, dst, opts)` takes
-a single options parameter and that is the only channel a caller has.
+`durability`, `publish` and `operation_id`. The engine cut adds one.
+
+An earlier revision justified that by saying `copy_tree` "takes a single options parameter and that is
+the only channel a caller has". That premise expired when the signature grew a failure sink, and it was
+never the real reason anyway. **The real reason is that the field has to reach `copy_file`**, because
+Q1's answer makes strict mode change single-file behaviour at the Step 2a gate, and `CopyOptions` is
+the only thing `copy_file` receives. A parameter on `copy_tree` could not reach it.
 
 ```rust
 /// Whether a safety check that cannot be made with full confidence refuses or degrades.
@@ -550,26 +555,25 @@ can run *"before transfer begins"* as §129 demands, rather than after the desti
 A pre-flight comparison of `src_root` against the anchor runs before the walk starts; the per-directory
 comparison above is what catches a namespace change *after* startup.
 
-**A SYMLINKED destination anchor defeats the identity comparison.** (An earlier revision of this
-paragraph ended "and must be treated as degraded". That answer was withdrawn two sections below, and
-leaving it in the lead sentence meant the document asserted both the defect and its rejected fix — the
-resolution is canonicalization, stated at the end of this section.)
+### A symlinked destination anchor
 
-`FileSystem::metadata` is `symlink_metadata`-based — that is the whole surface, there is no following
-variant on the trait — so for `flux copy /data /backup` where `/backup` is a symlink to `/data`, the
-comparison is between `/data`'s identity and the identity of the *link object* `/backup`. Those never
-match. The pre-flight passes.
+**The rule, first.** The CLI canonicalizes the source root and the destination anchor before calling
+`copy_tree`. The engine then refuses outright, with `Code::SafetyRejected` and before anything is
+created, if the destination anchor's `file_type` is `Symlink`. Canonicalization RESOLVES and is a
+property of paths, so it lives in the CLI; refusal GUARDS and is a property of the operation, so it
+lives in the engine. Neither does the other's job, and the engine's safety never depends on the caller
+having been careful.
 
-The lexical floor does not save it either: `/backup` is not lexically inside `/data`. So without a rule
-here the operation begins, `create_dir` writes THROUGH the link back into the source tree, and every
-file is copied onto itself — caught one at a time by the Step 2a gate, which turns a copy that should
-have been refused once into thousands of individual refusals. Nothing is lost, because the per-file gate
-holds; what is lost is the clean early abort §129 asks for, and that gate is the only thing standing
-between this case and writing into the source.
+**Why a guard is needed at all.** `FileSystem::metadata` is `symlink_metadata`-based — that is the whole
+surface, there is no following variant — so for `flux copy /data /backup` where `/backup` is a symlink
+to `/data`, the pre-flight compares `/data`'s identity against the identity of the *link object*
+`/backup`. Those never match, so it passes. The lexical floor does not save it either, because
+`/backup` is not lexically inside `/data`. Without a rule here the operation begins, `create_dir` writes
+THROUGH the link back into the source tree, and every file is copied onto itself — caught one at a time
+by the Step 2a gate, which turns a copy that should have been refused once into one refusal per file.
 
-**§128 settles this, and it rules out the answer this section first gave.** §128 "Destination Safety"
-(`FLUX_FULL_UPDATED_SPEC_V16.md:6095`) sits immediately before the §129 this design already cites, and
-requires containment be decided:
+**Why canonicalization is required, and is not optional.** §128 "Destination Safety"
+(`FLUX_FULL_UPDATED_SPEC_V16.md:6095`) sits immediately before the §129 this design already cites:
 
 > using both `canonical/normalized path analysis` and filesystem identity checks where available.
 >
@@ -578,73 +582,43 @@ requires containment be decided:
 >
 > The scanner must not be allowed to recursively discover Flux's own destination tree through an alias.
 
-Three consequences, and the design had missed all three:
+So identity is only the second of two required mechanisms, and "symlink traversal must not invalidate
+the containment decision" names this exact case. Resolving `/backup` to `/data` makes the containment
+test succeed lexically, with no identity comparison needed.
 
-1. **Canonicalization is mandatory and this design does not do it at all.** The "lexical containment
-   floor" is not canonical path analysis — it compares the strings as given. §128 asks for BOTH
-   mechanisms, and identity is only the second of them.
-2. **Degrading on a symlinked anchor is not compliant.** "Symlink traversal must not invalidate the
-   containment decision" is the exact case, named. Warning and continuing invalidates it.
-3. Canonicalization actually SOLVES the case that identity could not: resolving `/backup` to `/data`
-   makes the containment test succeed lexically, with no identity comparison needed.
+**Why canonicalization is in the CLI and not on the trait.** Three reasons, each of which independently
+rules the trait out:
 
-**So the rule is: canonicalize both roots before the containment test.** A symlinked anchor then
-resolves to the source root and is refused by the floor itself, which is where §129's
-`SAFETY_REJECTED`-before-transfer belongs. The degrade-and-warn treatment is withdrawn; it was an
-answer to a question §128 had already settled the other way.
+1. **It cannot be applied to the destination root, which usually does not exist.** Canonicalization
+   resolves symlinks, which requires the path to be there. What is canonicalized is the **nearest
+   existing ancestor** — the anchor the §129 pre-flight already uses — with the absent remainder
+   appended lexically. That still satisfies §128, because components that do not exist cannot be
+   symlinks.
+2. **On Windows the canonical form gains a `\\?\` prefix the input did not have.** A containment test
+   between one canonicalized path and one raw path would fail unconditionally, and would fail in the
+   SAFE-LOOKING direction, since a failed containment test reads as "not contained". Both sides are
+   canonicalized, or neither is.
+3. **`FaultFs` could not implement it honestly.** It is an in-memory fake with no filesystem beneath it,
+   and a `canonicalize` returning its input unchanged would make every test built on it pass while
+   proving nothing. Implementing it properly means making the test double a path resolver with cycle
+   detection.
 
-**Canonicalizing correctly is not one line, and three things about it bite.**
+**Why the engine still guards.** Putting canonicalization in the CLI repairs the CLI path and would
+otherwise leave the LIBRARY path worse than before: `copy_tree` called directly with an unresolved
+symlinked anchor passes the floor, passes the identity comparison, and proceeds — the exact O(N)
+failure §129 requires be one refusal *before transfer begins*. The `Symlink` refusal closes that,
+costs nothing because the anchor is already stat'd for the identity comparison, needs no
+`canonicalize` on the trait, and is unit-testable against `FaultFs`, which can already produce a
+`Symlink` anchor via `add_symlink`. A CLI user never sees the refusal, because the path was resolved
+before the engine saw it.
 
-1. **It cannot be applied to the destination root, because that root usually does not exist.**
-   Canonicalization resolves symlinks, which requires the path to be there; a tree copy's destination is
-   normally absent. So what is canonicalized is the **nearest existing ancestor** — the same anchor the
-   §129 pre-flight already uses — with the non-existent remainder appended lexically afterwards. That
-   still satisfies §128, because components that do not exist cannot be symlinks.
-2. **On Windows the canonical form carries a prefix the input did not** — `std::fs::canonicalize`
-   returns a `\\?\` DOS-namespace path. A containment test between one canonicalized path and one
-   raw path would therefore fail unconditionally, and would fail in the SAFE-LOOKING direction, since a
-   failed containment test reads as "not contained". **Both sides are canonicalized, or neither is.**
-3. **`FaultFs` cannot implement this honestly without modelling symlink resolution.** It is an
-   in-memory fake with no real filesystem beneath it, and a `canonicalize` that returns its input
-   unchanged would make every test built on it pass while proving nothing about the property under
-   test. Modelling resolution properly means traversing the fake tree and detecting link cycles, which
-   is real complexity added to a test double.
+Refusing satisfies §128 rather than evading it: declining to make a containment decision it cannot make
+is not the same as making the wrong one.
 
-**Which is why the canonicalization is better placed in the CLI than in the trait.** `flux-cli` already
-runs against the real filesystem; it can canonicalize the source and the destination anchor before
-calling `copy_tree`, and pass resolved absolute paths in. The engine then receives paths for which
-lexical containment is already meaningful, `FileSystem` does not grow a method three implementors must
-fake, and `FaultFs` is not asked to become a path resolver.
+**Rejected: treating a symlinked anchor as DEGRADED** — warning and continuing under the default,
+refusing only under `Safety::Strict`. §128 rules it out directly, because warning and continuing is
+precisely letting symlink traversal invalidate the containment decision.
 
-**But the CLI cannot be the ONLY place it happens, and the first draft of this paragraph was wrong to
-say so.** It claimed a library caller passing unresolved paths "gets the lexical floor plus the Step 2a
-gate, which is what it would have had anyway". That is false. What it gets is precisely the hole this
-section opened with: the floor passes because `/backup` is not lexically inside `/data`, the identity
-comparison passes because it compares against the link object, and the operation proceeds to hit the
-Step 2a gate once per file — the exact O(N) failure §129 requires be a single refusal *before transfer
-begins*. Moving canonicalization to the CLI repaired the CLI path and silently un-repaired the library
-path, which is worse than the state before the fix, because the degrade-and-warn treatment that used to
-catch it had been withdrawn by the same change.
-
-**So the engine keeps a guard of its own, and it needs no `canonicalize` to do it.** `copy_tree`
-already stats the destination anchor for the identity comparison, and that stat carries the
-`FileType`. If the anchor is a `Symlink`, the engine **refuses** — `Code::SafetyRejected`, before
-anything is created.
-
-That threads both objections rather than choosing between them:
-
-- **A library caller cannot silently get the hole.** It gets a refusal naming the reason, which is
-  §129's "before transfer begins" behaviour and satisfies §128, since refusing does not invalidate the
-  containment decision — it declines to make one it cannot make.
-- **A CLI user never sees the refusal**, because the CLI canonicalized first and the engine is handed a
-  resolved path that is not a symlink.
-- **The trait does not grow `canonicalize`**, so `FaultFs` is not asked to become a path resolver and
-  `NullFs` is untouched. `FaultFs` can already produce a `Symlink` anchor with `add_symlink`, so the
-  refusal is unit-testable against the fake with no real filesystem.
-
-The division is then honest: **canonicalization RESOLVES, and is a property of paths, so it lives in the
-CLI. Refusal GUARDS, and is a property of the operation, so it lives in the engine.** Neither is asked
-to do the other's job, and the engine's safety does not depend on a caller having been careful.
 
 **When the ANCHOR's identity is weak, the pre-flight degrades by the same rule** — no special case, and
 no stricter treatment for being the earliest check. The reasoning is worth spelling out, because "the
@@ -1467,3 +1441,18 @@ re-derive them and a reader can see what was consciously not fixed.
   destination containment is not topology, and the peer hedged the claim itself.
 - `DISCARDED-BELOW-FLOOR: the failure sink returns () so a caller cannot abort the walk early.`
   Aborting early on a per-entry failure is forbidden anyway — §2 item 83 requires the walk continue.
+- `REJECTED: "remove FailureTally, since failures are streamed and the caller can count them."` Three
+  reasons. It breaks the symmetry of `TreeOutcome`, which counts successes (`files_copied`,
+  `bytes_copied`, `directories_created`) — a summary that counts what went right but not what went
+  wrong is a strange object. It forces every caller, including each test, to reimplement counting in
+  order to learn whether anything failed at all. And it is four `u64`s. The harmful duplication here
+  was a total stored beside its parts, and that was already removed. Note also that the same peer
+  argued the opposite one round earlier, requiring that `TreeOutcome` keep TYPED counts so the exit
+  code could distinguish an item-83 condition.
+- `REJECTED: "remove the volume bucketing in WeakIdentityWarnings; one bucket for everything is
+  simpler."` §108's wording is "one aggregated warning per affected filesystem/operation where
+  practical", so grouping by volume is the specified shape and a single bucket is not. The same peer
+  argued FOR this grouping during the design negotiation, on the grounds that collapsing multiple weak
+  filesystems into one warning discards a volume that is trustworthy even where its index is not. The
+  claimed per-file `BTreeMap` cost is also wrong: the map is touched only on a DEGRADED entry, and
+  holds at most one row per volume.
