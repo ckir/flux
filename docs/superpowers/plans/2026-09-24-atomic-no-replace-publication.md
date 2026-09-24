@@ -295,7 +295,10 @@ In `crates/flux-fs/src/error.rs`, in the test `every_code_has_the_spec_string` (
 
 Run: `cargo nextest run -p flux-fs every_code_has_the_spec_string`
 
-Expected: FAIL to COMPILE, with `error[E0599]: no variant or associated item named `NoReplacePublishUnavailable` found for enum `Code``.
+Expected: FAIL to COMPILE, with **`error[E0599]`** naming `NoReplacePublishUnavailable` as not found
+on `Code`. Match on the error CODE, not the sentence: rustc's wording for E0599 has shifted across
+releases ("no variant or associated item named" in older toolchains, "no variant, associated function,
+or constant named" in newer ones) and this plan pins `channel = "stable"`, which moves.
 
 A compile failure is the correct failure here. This test cannot fail at runtime for a missing variant, which is exactly why Step 5 adds the variants to an exhaustive `match` rather than relying on this test alone.
 
@@ -1048,3 +1051,7 @@ re-derive them.
   already passes raw pointers to `windows-sys` functions in the `#[cfg(windows)]` `identity_of_handle`
   at `crates/flux-platform/src/std_fs.rs:359-388`. If it does not compile, the compiler says so
   immediately and the fix is one `as` -- it cannot reach a commit, because Task 3 runs the gate first.
+- `DISCARDED-BELOW-FLOOR: rustc's E0599 wording has shifted across releases, so a step quoting the old
+  sentence could confuse a literal string comparison.` Folded anyway rather than stood down, because it
+  cost one line: the step now says to match on the error CODE. The plan pins channel = "stable", which
+  moves, so any diagnostic sentence quoted here is a snapshot.
