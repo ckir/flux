@@ -319,7 +319,10 @@ impl FileSystem for StdFileSystem {
     /// See the Unix twin for why this is atomic rather than check-then-act.
     #[cfg(windows)]
     fn rename_no_replace(&self, from: &Path, to: &Path) -> Result<()> {
-        use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, MoveFileExW,
+        };
 
         // No MOVEFILE_REPLACE_EXISTING is the whole point: without that flag
         // MoveFileExW fails rather than replacing, which is the guarantee this method
@@ -349,6 +352,54 @@ impl FileSystem for StdFileSystem {
         };
         let wfrom = wide(from).map_err(FsError::from_io)?;
         let wto = wide(to).map_err(FsError::from_io)?;
+
+        // A SAME-OBJECT VETO, and deliberately NOT a destination pre-check.
+        //
+        // MoveFileExW without MOVEFILE_REPLACE_EXISTING does not refuse a target that
+        // IS the source. MEASURED: `from == to` returned Ok where Linux answers EEXIST,
+        // and -- worse -- two hardlinks to one file returned Ok having CONSUMED the
+        // source name. In that second case `to` is a genuinely distinct, existing
+        // directory entry, so §241.5's "refuses to replace an existing entry" was
+        // simply not kept. It is not a philosophical question about whether one object
+        // under two names counts as a collision.
+        //
+        // WHY THIS IS NOT THE SUBSTITUTE :10876 FORBIDS. That ban is on using a probe
+        // to AUTHORIZE a rename, which is what opens the TOCTOU window: check the name
+        // is free, then rename, and a concurrent publisher slips between the two. This
+        // probe only ever VETOES. Every path out of this block that is not an outright
+        // refusal falls through to MoveFileExW, which still decides atomically -- a
+        // publisher that creates `to` after the open below fails is caught there
+        // exactly as before. Nothing here can permit a rename the primitive would have
+        // refused, which is the property the ban exists to protect.
+        //
+        // Opening `to` FIRST is what bounds the cost. The common case -- publishing to
+        // a free name -- pays one FAILED open and stops, rather than the two successful
+        // opens plus two info queries an unconditional comparison would cost on every
+        // published file.
+        //
+        // The flags are the ones `metadata` documents above: `access_mode(0)` avoids
+        // both a sharing violation and a denial on a file this process may not read,
+        // and OPEN_REPARSE_POINT opens a link rather than its target.
+        let probe = |p: &Path| {
+            OpenOptions::new()
+                .access_mode(0)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(p)
+        };
+        if let (Ok(dst), Ok(src)) = (probe(to), probe(from))
+            && let (FileIdentity::Strong(a), FileIdentity::Strong(b)) =
+                (identity_of_handle(&src), identity_of_handle(&dst))
+            && a == b
+        {
+            // An Unavailable identity -- a filesystem with no FILE_ID_INFO, or an id of
+            // zero, which §107 forbids treating as valid -- falls through on purpose.
+            // Refusing on an identity the filesystem cannot supply would fail CLOSED on
+            // every ordinary publish there.
+            return Err(FsError::new(
+                flux_fs::Code::IoError,
+                std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+            ));
+        }
 
         // SAFETY: both buffers are NUL-terminated UTF-16 built immediately above and
         // live for the duration of the call.

@@ -671,3 +671,44 @@ fn rename_no_replace_reports_a_missing_source_before_an_occupied_target() {
     );
     assert!(to.exists(), "the occupying target must survive");
 }
+
+#[test]
+fn rename_no_replace_refuses_the_source_itself() {
+    // Publishing a name onto itself is a collision, not a no-op: the name is occupied,
+    // and by definition the occupant is not being replaced by something new. Linux and
+    // macOS answer EEXIST for free. Windows answers Ok, so the Windows arm has to veto
+    // it explicitly -- this is the test that holds it to the same contract.
+    let d = TempDir::new().unwrap();
+    let p = d.path().join("x");
+    let fs = StdFileSystem;
+    fs.create_new(&p).unwrap();
+
+    let err = fs.rename_no_replace(&p, &p).expect_err("a name cannot be published onto itself");
+    assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(p.exists(), "the object must survive");
+}
+
+#[test]
+fn rename_no_replace_refuses_a_second_link_to_the_source() {
+    // The sharper half, and the one that is unambiguously a contract breach rather than
+    // a question of taste: `to` is a DISTINCT directory entry that EXISTS. MEASURED
+    // before the veto existed -- Windows returned Ok and CONSUMED the source name,
+    // leaving one link where there had been two, while Linux refused with EEXIST.
+    let d = TempDir::new().unwrap();
+    let (a, b) = (d.path().join("a"), d.path().join("b"));
+    let fs = StdFileSystem;
+    fs.create_new(&a).unwrap();
+
+    // Hard links need filesystem support and, on some Windows configurations, a
+    // privilege this process may lack. Skip rather than fail, following the precedent
+    // the symlink and non-UTF-8 tests in this file set.
+    if std::fs::hard_link(&a, &b).is_err() {
+        eprintln!("SKIPPED: this filesystem will not create a hard link");
+        return;
+    }
+
+    let err = fs.rename_no_replace(&a, &b).expect_err("the target name is occupied");
+    assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(a.exists(), "the source link must survive");
+    assert!(b.exists(), "the target link must survive");
+}
