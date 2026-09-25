@@ -1207,7 +1207,10 @@ impl flux_fs::DestinationRoot for StdFileSystem {
 
 Run: `cargo nextest run -p flux-platform --no-fail-fast -E 'test(/windows_arm/)'`
 
-Expected: PASS, and **`Starting 5 tests`**.
+Expected: PASS, and **`Starting 4 tests ... (1 test ... skipped)`** if you took the `#[ignore]`
+route for `a_created_file_lands_in_the_handles_directory`. **nextest EXCLUDES an ignored test from the
+`Starting N` count** and reports it separately as skipped, so "five tests, one ignored" reads as 4 + 1,
+never as `Starting 5`. Do not halt on that.
 
 - [ ] **Step 7: Prove the tag check is not vacuous, and that it is not over-broad**
 
@@ -1292,13 +1295,20 @@ these go through a **different NT call**, and one builds a **variable-length str
 | `FILE_RENAME_INFORMATION` | `:2496` — `{ Anonymous, RootDirectory: HANDLE, FileNameLength: u32, FileName: [u16; 1] }` |
 | `FILE_DISPOSITION_INFORMATION` | `:1699` — `{ DeleteFile: bool }` |
 
-- [ ] **Step 1: Verify the state**
+- [ ] **Step 1: Verify the state, and un-ignore the deferred test**
 
 ```bash
 rg -c 'unimplemented!' crates/flux-platform/src/dir_windows.rs
+rg -n '#\[ignore' crates/flux-platform/tests/dir_handle.rs
 ```
 
-Expected: **5**. If fewer, Task 3 did not land as written — STOP and report `STATE_MISMATCH`.
+Expected: **5** stubs, and **one `#[ignore]`** on `a_created_file_lands_in_the_handles_directory` in the
+`windows_arm` module. If the stub count differs, STOP and report `STATE_MISMATCH`.
+
+**Remove that `#[ignore]` attribute now**, before writing anything else. Task 3 added it because
+`create_new` routes through `create_new_at`, which was a stub; this task implements it. Leaving the
+attribute would let the suite pass while the helper it guards is still `unimplemented!()`, which is the
+one failure mode a green run must not hide.
 
 - [ ] **Step 2: Write the failing tests**
 
