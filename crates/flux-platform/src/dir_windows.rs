@@ -35,6 +35,7 @@ const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_OBJECT_PATH_NOT_FOUND: i32 = 0xC000_003Au32 as i32;
 const STATUS_ACCESS_DENIED: i32 = 0xC000_0022u32 as i32;
 const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035u32 as i32;
+const STATUS_FILE_IS_A_DIRECTORY: i32 = 0xC000_00BAu32 as i32;
 
 /// An `NTSTATUS` as a `std::io::Error` that KEEPS its kind.
 ///
@@ -46,7 +47,21 @@ const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035u32 as i32;
 /// arrive as `AlreadyExists` on every arm or the engine cannot branch on it.
 fn nt_io_error(what: &str, status: i32) -> std::io::Error {
     let kind = match status {
-        STATUS_OBJECT_NAME_COLLISION => std::io::ErrorKind::AlreadyExists,
+        // Both mean THE NAME IS TAKEN. The kernel distinguishes them -- COLLISION
+        // when a file occupies the name, FILE_IS_A_DIRECTORY when a directory does --
+        // and to a caller of `create_new` that is one situation. MEASURED: POSIX
+        // answers AlreadyExists for both, while this arm reported the directory case
+        // as ErrorKind::Other, because only the first status was mapped. Round 1
+        // fixed the collision and missed its twin.
+        //
+        // Mapping FILE_IS_A_DIRECTORY globally is safe HERE rather than merely
+        // convenient: it can only be returned to a call that asked for a
+        // non-directory, and `create_new_at` is the one call in this file that passes
+        // FILE_NON_DIRECTORY_FILE. If another call ever does, this mapping needs
+        // revisiting with it.
+        STATUS_OBJECT_NAME_COLLISION | STATUS_FILE_IS_A_DIRECTORY => {
+            std::io::ErrorKind::AlreadyExists
+        }
         STATUS_ACCESS_DENIED => std::io::ErrorKind::PermissionDenied,
         STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => std::io::ErrorKind::NotFound,
         _ => std::io::ErrorKind::Other,
@@ -289,7 +304,21 @@ fn create_new_at(p: &OwnedHandle, n: &OsStr) -> Result<crate::StdFile> {
             0,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             FILE_CREATE,
-            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+            // FILE_OPEN_REPARSE_POINT even though this CREATES. Without it the
+            // existence check follows a surrogate sitting on the name, and a dangling
+            // one would have the kernel create the file at the LINK'S TARGET instead
+            // of refusing -- a write outside the destination tree, which is the whole
+            // thing this cut prevents. With it, the link itself is what occupies the
+            // name, so FILE_CREATE reports a collision, matching POSIX, where
+            // openat(O_CREAT | O_EXCL) refuses a symlinked final component with
+            // EEXIST.
+            //
+            // Measured with a junction, dangling and not, since a file symlink needs
+            // a privilege this account lacks: both already answered AlreadyExists, so
+            // this closes the case that could NOT be measured rather than one that was
+            // observed failing. Every other NtCreateFile in this file already passes
+            // the flag; this was the one that did not.
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
             std::ptr::null(),
             0,
         )

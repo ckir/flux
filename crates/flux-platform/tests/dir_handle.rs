@@ -221,6 +221,25 @@ mod posix {
         // And it still refuses to create the same name twice.
         assert!(root.create_dir(OsStr::new("fresh")).is_err());
     }
+
+    #[test]
+    fn create_new_reports_already_exists_when_a_directory_holds_the_name() {
+        // The twin of an_occupied_name_reports_already_exists_through_the_handle, and
+        // the case that round's fix missed. The kernel distinguishes a name held by a
+        // file from a name held by a directory -- STATUS_OBJECT_NAME_COLLISION versus
+        // STATUS_FILE_IS_A_DIRECTORY -- and to create_new they are one situation: the
+        // name is taken. MEASURED before the fix: POSIX answered AlreadyExists for
+        // both while Windows answered ErrorKind::Other for the directory.
+        let d = TempDir::new().unwrap();
+        std::fs::create_dir(d.path().join("taken")).unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+
+        let err = match root.create_new(OsStr::new("taken")) {
+            Err(e) => e,
+            Ok(_) => panic!("create_new must refuse a name a directory holds"),
+        };
+        assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
+    }
 }
 
 #[cfg(windows)]
@@ -618,5 +637,70 @@ mod windows_arm {
         assert_eq!(err.source.kind(), std::io::ErrorKind::IsADirectory);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_new_reports_already_exists_when_a_directory_holds_the_name() {
+        // The twin of an_occupied_name_reports_already_exists_through_the_handle, and
+        // the case that round's fix missed. The kernel distinguishes a name held by a
+        // file from a name held by a directory -- STATUS_OBJECT_NAME_COLLISION versus
+        // STATUS_FILE_IS_A_DIRECTORY -- and to create_new they are one situation: the
+        // name is taken. MEASURED before the fix: POSIX answered AlreadyExists for
+        // both while Windows answered ErrorKind::Other for the directory.
+        let d = TempDir::new().unwrap();
+        std::fs::create_dir(d.path().join("taken")).unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+
+        let err = match root.create_new(OsStr::new("taken")) {
+            Err(e) => e,
+            Ok(_) => panic!("create_new must refuse a name a directory holds"),
+        };
+        assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn a_stream_separator_is_refused_before_the_filesystem_is_touched() {
+        // MEASURED before this check: create_new("host:stream") returned Ok and wrote
+        // an alternate data STREAM inside the existing file `host` -- the directory
+        // still held one entry and no `host:stream` was in it. The caller asked for
+        // one name and a different object was written, reported as success.
+        //
+        // A colon is legal in a POSIX filename, so only the Windows arm refuses it;
+        // the length bound in the same function applies to both, because that one
+        // refuses nothing any filesystem accepts.
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        drop(root.create_new(OsStr::new("host")).unwrap());
+
+        let err = match root.create_new(OsStr::new("host:stream")) {
+            Err(e) => e,
+            Ok(_) => panic!("a name carrying a stream separator is not one component"),
+        };
+        assert_eq!(err.code, flux_fs::Code::SafetyRejected);
+        assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn create_new_refuses_a_name_a_surrogate_already_holds() {
+        // create_new_at passes FILE_OPEN_REPARSE_POINT, so the LINK is what occupies
+        // the name rather than whatever it points at. Without the flag a dangling
+        // surrogate would have the kernel create the file at the link's TARGET,
+        // outside the destination tree. A junction is the surrogate makeable without
+        // privilege; the file-symlink case needs SeCreateSymbolicLinkPrivilege and is
+        // the one this flag closes without being measurable here.
+        let d = TempDir::new().unwrap();
+        let target = d.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        if !junction(&target, &d.path().join("link")) {
+            eprintln!("SKIPPED: could not create a junction");
+            return;
+        }
+
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let err = match root.create_new(OsStr::new("link")) {
+            Err(e) => e,
+            Ok(_) => panic!("a name a surrogate holds is taken"),
+        };
+        assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
     }
 }

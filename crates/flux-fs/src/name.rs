@@ -73,6 +73,41 @@ pub fn check_component(name: &OsStr) -> Result<()> {
     if s.contains('/') || s.contains('\\') {
         return refuse("a path component may not contain a separator");
     }
+    check_no_stream_separator(s)
+}
+
+/// A colon does not belong in a Windows component, and this check IS platform-specific
+/// where the length bound above deliberately is not.
+///
+/// The length bound refuses nothing any filesystem accepts, so both arms apply it and
+/// agree. A colon is the opposite: it is an ordinary, legal character in a POSIX
+/// filename, and refusing it there would reject names people really have. On Windows
+/// it separates a file from one of its alternate data STREAMS, so a name carrying one
+/// is not one component -- it addresses something inside another object.
+///
+/// MEASURED: `create_new("host:stream")` returned Ok and wrote a stream inside the
+/// existing file `host`, leaving the directory with one entry and no `host:stream` in
+/// it. The caller asked for one name and a different object was written, reported as
+/// success -- the same shape as the u16 length wrap, and the same reason to refuse it
+/// at the choke point rather than deeper down.
+#[cfg(windows)]
+fn check_no_stream_separator(s: &str) -> Result<()> {
+    if s.contains(':') {
+        return Err(FsError::new(
+            Code::SafetyRejected,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a path component may not contain a stream separator".to_string(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn check_no_stream_separator(s: &str) -> Result<()> {
+    // A colon is a legal character in a POSIX filename; see the note above.
+    let _ = s;
     Ok(())
 }
 
