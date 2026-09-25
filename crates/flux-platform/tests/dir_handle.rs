@@ -14,6 +14,28 @@ mod posix {
     }
 
     #[test]
+    fn the_handle_and_the_path_describe_one_object_identically() {
+        // The engine will compare identities from both sides: one taken through a
+        // directory handle (`metadata_from_stat`), one by path (`identity_of`, via
+        // std). They convert the raw `stat` fields separately, and the widths differ
+        // by platform (macOS: `st_mode: u16`, `st_dev: i32`), so a conversion that
+        // drifts from std's would make one object look like two. MEASURED before this
+        // test: forcing the handle side's `dev` to 0 left the whole suite green.
+        use flux_fs::FileSystem;
+        let d = TempDir::new().unwrap();
+        std::fs::write(d.path().join("f"), b"1234").unwrap();
+        std::fs::create_dir(d.path().join("sub")).unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+
+        for name in ["f", "sub"] {
+            let by_handle = root.metadata(OsStr::new(name)).unwrap();
+            let by_path = StdFileSystem.metadata(&d.path().join(name)).unwrap();
+            assert!(matches!(by_path.identity, flux_fs::FileIdentity::Strong(_)));
+            assert_eq!(by_handle, by_path, "{name}: handle and path disagree");
+        }
+    }
+
+    #[test]
     fn a_symlinked_component_is_refused_as_a_safety_rejection() {
         // THE test this whole cut exists for. An attacker replaces a directory Flux
         // created with a symlink pointing outside DEST; the open must refuse rather
