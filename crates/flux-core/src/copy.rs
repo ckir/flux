@@ -242,7 +242,7 @@ pub fn copy_file<F: FileSystem>(
 
     // A successful rename consumed the temporary; there is nothing left to remove.
 
-    Ok(Outcome { bytes_copied, metadata_failures })
+    Ok(Outcome { bytes_copied, metadata_failures, identity_degraded: None })
 }
 
 #[cfg(test)]
@@ -257,6 +257,7 @@ mod tests {
             preserve_permissions: Preserve::Default,
             durability: Durability::Normal,
             publish: Publish::Replace,
+            safety: flux_fs::Safety::Default,
             operation_id: OperationId::new("op1"),
         }
     }

@@ -8,7 +8,7 @@ pub mod options;
 
 pub use options::{
     CopyOptions, Durability, MetadataFailure, MetadataItem, OperationId, Outcome, Preserve,
-    Publish, temp_path,
+    Publish, Safety, temp_path,
 };
 
 pub mod fs;
