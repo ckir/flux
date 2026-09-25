@@ -173,7 +173,6 @@ mod windows_arm {
     }
 
     #[test]
-    #[ignore = "create_new_at is Task 4's work; this exercises it via DirHandle::create_new"]
     fn a_created_file_lands_in_the_handles_directory() {
         use std::io::Write;
         let d = TempDir::new().unwrap();
@@ -182,5 +181,61 @@ mod windows_arm {
         w.write_all(b"payload").unwrap();
         drop(w);
         assert_eq!(std::fs::read(d.path().join("made")).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn a_directory_is_created_and_reopened_through_the_handle() {
+        use std::io::Write;
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let child = root.create_dir(OsStr::new("made")).unwrap();
+        assert!(d.path().join("made").is_dir());
+        let mut w = child.create_new(OsStr::new("inside")).unwrap();
+        w.write_all(b"x").unwrap();
+        drop(w);
+        assert!(
+            d.path().join("made/inside").exists(),
+            "the returned handle must address the new directory"
+        );
+    }
+
+    #[test]
+    fn a_file_is_removed_through_the_handle() {
+        let d = TempDir::new().unwrap();
+        std::fs::write(d.path().join("doomed"), b"x").unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        root.remove_file(OsStr::new("doomed")).unwrap();
+        assert!(!d.path().join("doomed").exists());
+    }
+
+    #[test]
+    fn a_publish_across_two_handles_refuses_an_occupied_name() {
+        // The two-handle rename is what staging-then-publishing needs, and the
+        // no-replace form must still refuse an occupied target.
+        let d = TempDir::new().unwrap();
+        std::fs::create_dir(d.path().join("stage")).unwrap();
+        std::fs::write(d.path().join("stage/tmp"), b"payload").unwrap();
+        std::fs::write(d.path().join("taken"), b"old").unwrap();
+
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let stage = root.open_dir(OsStr::new("stage")).unwrap();
+
+        stage.rename_no_replace(OsStr::new("tmp"), &root, OsStr::new("taken")).unwrap_err();
+        assert_eq!(
+            std::fs::read(d.path().join("taken")).unwrap(),
+            b"old",
+            "the occupied name must survive"
+        );
+
+        stage.rename_no_replace(OsStr::new("tmp"), &root, OsStr::new("fresh")).unwrap();
+        assert_eq!(std::fs::read(d.path().join("fresh")).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn metadata_through_the_handle_reads_the_child() {
+        let d = TempDir::new().unwrap();
+        std::fs::write(d.path().join("f"), b"1234").unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        assert_eq!(root.metadata(OsStr::new("f")).unwrap().len, 4);
     }
 }

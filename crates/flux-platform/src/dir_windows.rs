@@ -11,15 +11,18 @@
 
 use flux_fs::{Code, DirHandle, FsError, Metadata, Result, check_component};
 use std::ffi::OsStr;
+use std::fs::File;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT, NtCreateFile,
+    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_INFORMATION, FILE_NON_DIRECTORY_FILE,
+    FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FileDispositionInformation,
+    FileRenameInformation, NtCreateFile, NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{HANDLE, UNICODE_STRING};
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
+    DELETE, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -164,20 +167,323 @@ impl DirHandle for StdDir {
     }
 }
 
-fn create_dir_at(_p: &OwnedHandle, _n: &OsStr) -> Result<()> {
-    unimplemented!("Task 4")
+fn create_dir_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {
+    let mut wide: Vec<u16> = n.encode_wide().collect();
+    let bytes = (wide.len() * 2) as u16;
+    let us = UNICODE_STRING { Length: bytes, MaximumLength: bytes, Buffer: wide.as_mut_ptr() };
+    let mut oa: OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    oa.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
+    oa.RootDirectory = p.as_raw_handle() as HANDLE;
+    oa.ObjectName = &raw const us;
+
+    let mut h: HANDLE = std::ptr::null_mut();
+    let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+
+    // SAFETY: every pointer is to a live local that outlives the call, and `wide`
+    // outlives `us` which borrows it. ShareAccess is not a free choice, for the
+    // reason `open_dir` records: 0 would lock the object against every other
+    // process.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut h,
+            FILE_LIST_DIRECTORY | SYNCHRONIZE,
+            &raw const oa,
+            &raw mut iosb,
+            std::ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_CREATE,
+            FILE_DIRECTORY_FILE,
+            std::ptr::null(),
+            0,
+        )
+    };
+
+    if status != 0 {
+        let code = match status {
+            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => Code::DestinationError,
+            STATUS_ACCESS_DENIED => Code::PermissionDenied,
+            _ => Code::IoError,
+        };
+        return Err(FsError::new(
+            code,
+            std::io::Error::other(format!("NtCreateFile: 0x{:08X}", status as u32)),
+        ));
+    }
+
+    // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `h` is a valid handle we own.
+    // `DirHandle::create_dir` calls `self.open_dir(name)` right after this returns,
+    // which is what runs the reparse-tag check on the thing just created -- so this
+    // handle is closed immediately rather than returned.
+    drop(unsafe { OwnedHandle::from_raw_handle(h as _) });
+    Ok(())
 }
-fn create_new_at(_p: &OwnedHandle, _n: &OsStr) -> Result<crate::StdFile> {
-    unimplemented!("Task 4")
+
+fn create_new_at(p: &OwnedHandle, n: &OsStr) -> Result<crate::StdFile> {
+    let mut wide: Vec<u16> = n.encode_wide().collect();
+    let bytes = (wide.len() * 2) as u16;
+    let us = UNICODE_STRING { Length: bytes, MaximumLength: bytes, Buffer: wide.as_mut_ptr() };
+    let mut oa: OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    oa.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
+    oa.RootDirectory = p.as_raw_handle() as HANDLE;
+    oa.ObjectName = &raw const us;
+
+    let mut h: HANDLE = std::ptr::null_mut();
+    let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+
+    // SAFETY: every pointer is to a live local that outlives the call, and `wide`
+    // outlives `us` which borrows it. ShareAccess matches `open_dir`'s reasoning.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut h,
+            FILE_GENERIC_WRITE | SYNCHRONIZE,
+            &raw const oa,
+            &raw mut iosb,
+            std::ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_CREATE,
+            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null(),
+            0,
+        )
+    };
+
+    if status != 0 {
+        let code = match status {
+            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => Code::DestinationError,
+            STATUS_ACCESS_DENIED => Code::PermissionDenied,
+            _ => Code::IoError,
+        };
+        return Err(FsError::new(
+            code,
+            std::io::Error::other(format!("NtCreateFile: 0x{:08X}", status as u32)),
+        ));
+    }
+
+    // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `h` is a valid handle we own.
+    let opened = unsafe { OwnedHandle::from_raw_handle(h as _) };
+    Ok(crate::std_fs::std_file_from(std::fs::File::from(opened)))
 }
-fn metadata_at(_p: &OwnedHandle, _n: &OsStr) -> Result<Metadata> {
-    unimplemented!("Task 4")
+
+fn metadata_at(p: &OwnedHandle, n: &OsStr) -> Result<Metadata> {
+    let mut wide: Vec<u16> = n.encode_wide().collect();
+    let bytes = (wide.len() * 2) as u16;
+    let us = UNICODE_STRING { Length: bytes, MaximumLength: bytes, Buffer: wide.as_mut_ptr() };
+    let mut oa: OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    oa.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
+    oa.RootDirectory = p.as_raw_handle() as HANDLE;
+    oa.ObjectName = &raw const us;
+
+    let mut h: HANDLE = std::ptr::null_mut();
+    let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+
+    // SAFETY: every pointer is to a live local that outlives the call, and `wide`
+    // outlives `us` which borrows it. ShareAccess matches `open_dir`'s reasoning.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut h,
+            FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            &raw const oa,
+            &raw mut iosb,
+            std::ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null(),
+            0,
+        )
+    };
+
+    if status != 0 {
+        let code = match status {
+            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => Code::DestinationError,
+            STATUS_ACCESS_DENIED => Code::PermissionDenied,
+            _ => Code::IoError,
+        };
+        return Err(FsError::new(
+            code,
+            std::io::Error::other(format!("NtCreateFile: 0x{:08X}", status as u32)),
+        ));
+    }
+
+    // Once the handle is open the object is already pinned -- the open is the only
+    // part of this that had to be handle-relative. Build the `Metadata` exactly as
+    // the path-based Windows `metadata` does at `std_fs.rs:221`, reusing its three
+    // helpers rather than re-deriving the mapping, which is what makes the two
+    // Windows arms agree by construction instead of by inspection.
+    //
+    // SAFETY: NtCreateFile returned this handle and nothing else owns it.
+    let f = File::from(unsafe { OwnedHandle::from_raw_handle(h as _) });
+    let m = f.metadata().map_err(FsError::from_io)?;
+    Ok(Metadata {
+        len: m.len(),
+        file_type: crate::std_fs::type_of(&m),
+        permissions: Some(crate::std_fs::perms_of(&m)),
+        modified: m.modified().ok(),
+        identity: crate::std_fs::identity_of_handle(&f),
+    })
 }
-fn remove_file_at(_p: &OwnedHandle, _n: &OsStr) -> Result<()> {
-    unimplemented!("Task 4")
+
+fn remove_file_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {
+    // Open the name with DELETE | SYNCHRONIZE and FILE_OPEN_REPARSE_POINT, so a
+    // link is removed rather than followed -- the same reasoning `open_dir`
+    // records for opening the object itself rather than what it points to.
+    let mut wide: Vec<u16> = n.encode_wide().collect();
+    let bytes = (wide.len() * 2) as u16;
+    let us = UNICODE_STRING { Length: bytes, MaximumLength: bytes, Buffer: wide.as_mut_ptr() };
+    let mut oa: OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    oa.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
+    oa.RootDirectory = p.as_raw_handle() as HANDLE;
+    oa.ObjectName = &raw const us;
+
+    let mut raw: HANDLE = std::ptr::null_mut();
+    let mut open_iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+
+    // SAFETY: every pointer is to a live local that outlives the call, and `wide`
+    // outlives `us` which borrows it. ShareAccess matches `open_dir`'s reasoning.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut raw,
+            DELETE | SYNCHRONIZE,
+            &raw const oa,
+            &raw mut open_iosb,
+            std::ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status != 0 {
+        let code = match status {
+            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => Code::DestinationError,
+            STATUS_ACCESS_DENIED => Code::PermissionDenied,
+            _ => Code::IoError,
+        };
+        return Err(FsError::new(
+            code,
+            std::io::Error::other(format!("NtCreateFile: 0x{:08X}", status as u32)),
+        ));
+    }
+    // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `raw` is a valid handle we own.
+    let h = unsafe { OwnedHandle::from_raw_handle(raw as _) };
+
+    let mut info = FILE_DISPOSITION_INFORMATION { DeleteFile: true };
+    let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a live FILE_DISPOSITION_INFORMATION of the size given, and
+    // the handle outlives the call.
+    let status = unsafe {
+        NtSetInformationFile(
+            h.as_raw_handle() as _,
+            &raw mut iosb,
+            (&raw mut info).cast(),
+            size_of::<FILE_DISPOSITION_INFORMATION>() as u32,
+            FileDispositionInformation,
+        )
+    };
+    if status != 0 {
+        return Err(FsError::new(
+            Code::IoError,
+            std::io::Error::other(format!("NtSetInformationFile: 0x{:08X}", status as u32)),
+        ));
+    }
+    drop(h);
+    Ok(())
 }
-fn rename_at(_fd: &OwnedHandle, _f: &OsStr, _td: &OwnedHandle, _t: &OsStr, _r: bool) -> Result<()> {
-    unimplemented!("Task 4")
+
+fn rename_at(fd: &OwnedHandle, f: &OsStr, td: &OwnedHandle, t: &OsStr, r: bool) -> Result<()> {
+    // Open `from` in `from_dir` with DELETE | SYNCHRONIZE and
+    // FILE_OPEN_REPARSE_POINT, so a link is renamed rather than followed.
+    let mut wide_from: Vec<u16> = f.encode_wide().collect();
+    let bytes = (wide_from.len() * 2) as u16;
+    let us = UNICODE_STRING { Length: bytes, MaximumLength: bytes, Buffer: wide_from.as_mut_ptr() };
+    let mut oa: OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    oa.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
+    oa.RootDirectory = fd.as_raw_handle() as HANDLE;
+    oa.ObjectName = &raw const us;
+
+    let mut raw: HANDLE = std::ptr::null_mut();
+    let mut open_iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+
+    // SAFETY: every pointer is to a live local that outlives the call, and
+    // `wide_from` outlives `us` which borrows it. ShareAccess matches `open_dir`'s
+    // reasoning.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut raw,
+            DELETE | SYNCHRONIZE,
+            &raw const oa,
+            &raw mut open_iosb,
+            std::ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status != 0 {
+        let code = match status {
+            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => Code::DestinationError,
+            STATUS_ACCESS_DENIED => Code::PermissionDenied,
+            _ => Code::IoError,
+        };
+        return Err(FsError::new(
+            code,
+            std::io::Error::other(format!("NtCreateFile: 0x{:08X}", status as u32)),
+        ));
+    }
+    // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `raw` is a valid handle we own.
+    let h = unsafe { OwnedHandle::from_raw_handle(raw as _) };
+
+    let wide: Vec<u16> = t.encode_wide().collect();
+    let name_bytes = wide.len() * 2;
+    let total = size_of::<FILE_RENAME_INFORMATION>() + name_bytes;
+    let mut buf = vec![0u8; total];
+
+    // SAFETY: `buf` is at least size_of::<FILE_RENAME_INFORMATION>() bytes, and a
+    // Vec<u8> allocation is at least pointer-aligned, which is this struct's
+    // alignment (that of HANDLE). The name is written into the trailing space the
+    // [u16; 1] placeholder stands for.
+    unsafe {
+        let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+        (&raw mut (*info).Anonymous.ReplaceIfExists).write(r);
+        (&raw mut (*info).RootDirectory).write(td.as_raw_handle() as HANDLE);
+        (&raw mut (*info).FileNameLength).write(name_bytes as u32);
+        std::ptr::copy_nonoverlapping(
+            wide.as_ptr(),
+            (&raw mut (*info).FileName).cast::<u16>(),
+            wide.len(),
+        );
+    }
+
+    let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    // SAFETY: `buf` holds a fully-initialized FILE_RENAME_INFORMATION plus its
+    // trailing name, and `buf.len()` -- passed below, not
+    // size_of::<FILE_RENAME_INFORMATION>() alone -- is exactly its total size. `h`
+    // outlives the call.
+    let status = unsafe {
+        NtSetInformationFile(
+            h.as_raw_handle() as _,
+            &raw mut iosb,
+            buf.as_mut_ptr().cast(),
+            buf.len() as u32,
+            FileRenameInformation,
+        )
+    };
+    if status != 0 {
+        return Err(FsError::new(
+            Code::IoError,
+            std::io::Error::other(format!("NtSetInformationFile: 0x{:08X}", status as u32)),
+        ));
+    }
+    drop(h);
+    Ok(())
 }
 
 /// Read a handle's reparse tag, or `None` when it is not a reparse point.
