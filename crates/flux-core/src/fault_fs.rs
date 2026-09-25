@@ -1131,6 +1131,35 @@ mod tests {
         // into its tree rather than a name, so repointing the NAME leaves the
         // handle addressing the ORIGINAL node -- which is exactly what a real
         // directory handle does, and exactly what a path does not.
+        //
+        // WHAT THIS PROVES, AND WHAT IT DOES NOT. Stated because an earlier reading
+        // of it claimed more, and the gap is the kind that looks like coverage.
+        //
+        // PROVES: the handle does not RE-RESOLVE its name at use time. MEASURED by
+        // mutation -- making `my_path` re-resolve this node's own last component
+        // through the parent's (repointable) `children` binding on every call reds
+        // this test, with this message, while its sibling stays green.
+        //
+        // DOES NOT PROVE: that a path-holding handle is refused. A `FakeDirHandle`
+        // storing a `PathBuf` snapshot taken at open time would also pass, because
+        // `Inner`'s maps are keyed flat by `PathBuf` and `repoint_for_test` rewrites
+        // only the `children` bindings -- so nothing re-aliases the stored path and
+        // the write lands where it always would. In the REAL arms that distinction
+        // does not exist: the kernel re-resolves a stored path on every syscall, so
+        // holding one IS the defect. The fake cannot express that yet.
+        //
+        // Closing it means re-keying this fake's storage by node id so its
+        // path-based methods traverse, and that is deliberately NOT done here. It is
+        // not a data-structure swap: `write_file` currently creates a file at any
+        // depth with no parent, `move_object` re-keys only the exact string (a
+        // renamed directory strands its children), and a symlink carries no target
+        // at all -- so a faithful double needs hierarchical strictness, descendant
+        // re-keying and a resolution engine with cycle limits. The consumer that
+        // fixes those requirements is cut 4's `copy_tree`, which does not exist yet;
+        // building them now would be designing against an imagined caller. The peer
+        // reviewing this first argued for re-keying immediately and reversed after
+        // measuring all three points above; the agreed disposition is to document
+        // the limit here and land the re-key in cut 4, where its caller defines it.
         use flux_fs::{DestinationRoot, DirHandle};
         use std::ffi::OsStr;
 
