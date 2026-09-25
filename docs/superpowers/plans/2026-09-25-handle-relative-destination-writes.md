@@ -504,7 +504,14 @@ fn the_handle_still_addresses_the_original_directory_after_a_swap() {
     let root = StdFileSystem.destination_root(d.path()).unwrap();
     let held = root.open_dir(OsStr::new("target")).unwrap();
 
-    std::fs::remove_dir(d.path().join("target")).unwrap();
+    // RENAME aside rather than remove, and the difference is not stylistic.
+    // MEASURED: rmdir marks the inode IS_DEADDIR, after which the kernel refuses
+    // EVERY new entry under it -- ENOENT -- even through a file descriptor that is
+    // still open. A remove-based swap therefore tests nothing this code does; it
+    // tests that Linux forbids the whole operation. Renaming keeps the directory
+    // alive, and the assertion is sharper for it: the write must follow the INODE
+    // the handle holds, not the NAME that was swapped.
+    std::fs::rename(d.path().join("target"), d.path().join("target.bak")).unwrap();
     std::os::unix::fs::symlink(d.path().join("elsewhere"), d.path().join("target")).unwrap();
 
     let mut w = held.create_new(OsStr::new("payload")).unwrap();
@@ -513,14 +520,18 @@ fn the_handle_still_addresses_the_original_directory_after_a_swap() {
 
     assert!(
         !d.path().join("elsewhere/payload").exists(),
-        "the write followed the swapped name -- the handle was not load-bearing"
+        "the write followed the swapped name; the handle was not load-bearing"
+    );
+    assert!(
+        d.path().join("target.bak/payload").exists(),
+        "the write must land in the directory the handle holds, under its new name"
     );
 }
 ```
 
 - [ ] **Step 3: Run them to verify they fail**
 
-Run: `wsl -e bash -lc 'cd /mnt/e/Rust/flux-handles && cargo nextest run -p flux-platform --no-fail-fast -E "test(/dir_handle/)"'`
+Run: `wsl -e bash -lc 'cd /mnt/e/Rust/flux-handles && cargo nextest run -p flux-platform --no-fail-fast -E "binary(dir_handle)"'`
 
 Expected: FAIL to COMPILE with **`error[E0277]`** — `StdFileSystem` does not implement `DestinationRoot`. A compile failure is the correct failure here.
 
@@ -536,6 +547,9 @@ use rustix::fs::{AtFlags, Mode, OFlags, openat, statat};
 use std::ffi::OsStr;
 use std::os::fd::OwnedFd;
 
+/// `Debug` is required, not decorative: the tests call `.unwrap_err()` on a
+/// `Result<StdDir, _>`, which needs `StdDir: Debug` to compile.
+#[derive(Debug)]
 pub struct StdDir(OwnedFd);
 
 impl StdDir {
@@ -670,6 +684,11 @@ this plan named a type that does not exist, which is why this step greps rather 
 /// Construct a writer from an already-open file. `DirHandle::create_new` opens
 /// relative to a directory handle, so it cannot go through the path-based
 /// `create_new` and needs this.
+///
+/// `#[cfg(unix)]` for now because its only caller is `dir_unix.rs`. Without the
+/// gate, Windows `just check` fails on `-D dead_code` until Task 3 lands a second
+/// caller. Task 3 widens the gate; do not delete it here.
+#[cfg(unix)]
 pub(crate) fn std_file_from(f: File) -> StdFile {
     StdFile(f)
 }
@@ -723,7 +742,7 @@ Note the absence of `NOFOLLOW` here, and that it is deliberate.
 
 - [ ] **Step 7: Run the tests**
 
-Run: `wsl -e bash -lc 'cd /mnt/e/Rust/flux-handles && cargo nextest run -p flux-platform --no-fail-fast -E "test(/dir_handle/)"'`
+Run: `wsl -e bash -lc 'cd /mnt/e/Rust/flux-handles && cargo nextest run -p flux-platform --no-fail-fast -E "binary(dir_handle)"'`
 
 Expected: PASS, and **`Starting 7 tests`**.
 
@@ -731,7 +750,7 @@ Expected: PASS, and **`Starting 7 tests`**.
 
 Remove `OFlags::NOFOLLOW` from `open_dir`'s flag set — the single most plausible "simplification" of this file.
 
-Run: `wsl -e bash -lc 'cd /mnt/e/Rust/flux-handles && cargo nextest run -p flux-platform --no-fail-fast -E "test(/dir_handle/)"'`
+Run: `wsl -e bash -lc 'cd /mnt/e/Rust/flux-handles && cargo nextest run -p flux-platform --no-fail-fast -E "binary(dir_handle)"'`
 
 Expected: `a_symlinked_component_is_refused_as_a_safety_rejection` FAILS — without `NOFOLLOW` the symlink is traversed and the open succeeds. Confirm THAT test went red. **Revert, verify by READING the file, and re-run to confirm all 7 pass.**
 
