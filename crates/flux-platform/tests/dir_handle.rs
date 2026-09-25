@@ -755,13 +755,21 @@ mod windows_arm {
     }
 
     #[test]
-    fn create_new_refuses_a_name_a_surrogate_already_holds() {
-        // create_new_at passes FILE_OPEN_REPARSE_POINT, so the LINK is what occupies
-        // the name rather than whatever it points at. Without the flag a dangling
-        // surrogate would have the kernel create the file at the link's TARGET,
-        // outside the destination tree. A junction is the surrogate makeable without
-        // privilege; the file-symlink case needs SeCreateSymbolicLinkPrivilege and is
-        // the one this flag closes without being measurable here.
+    fn create_new_refuses_a_name_a_junction_already_holds() {
+        // WHAT THIS PROVES: a name a junction holds is taken, so create_new refuses
+        // it rather than writing through.
+        //
+        // WHAT IT DOES NOT PROVE, stated because its previous name claimed otherwise.
+        // It does NOT guard FILE_OPEN_REPARSE_POINT. MEASURED BY MUTATION: removing
+        // that flag from create_new_at leaves this test, and the whole suite, green.
+        // A junction makes FILE_CREATE fail whether or not the open would have
+        // followed it, because the name is occupied either way -- so this test
+        // cannot fail for the reason its old name advertised.
+        //
+        // The test that DOES guard the flag is
+        // create_new_refuses_a_name_a_dangling_symlink_holds below, which needs
+        // SeCreateSymbolicLinkPrivilege and skips without it. Two tests, honestly
+        // labelled, beat one whose name implies coverage the mutation denies.
         let d = TempDir::new().unwrap();
         let target = d.path().join("target");
         std::fs::create_dir(&target).unwrap();
@@ -854,5 +862,38 @@ mod windows_arm {
         assert!(dir.join("child/inside").is_file(), "the write must land through the handle");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_new_refuses_a_name_a_dangling_symlink_holds() {
+        // THIS is the test that guards FILE_OPEN_REPARSE_POINT, and the reason the
+        // flag is there. Without it the kernel follows the link during the existence
+        // check, and a DANGLING link has no existing object to collide with -- so
+        // FILE_CREATE succeeds and writes the file at the link's TARGET, outside the
+        // destination tree.
+        //
+        // Its junction sibling above cannot catch that, because a junction occupies
+        // the name either way. Measured by mutation: removing the flag leaves that
+        // test green.
+        //
+        // Creating a file symlink needs SeCreateSymbolicLinkPrivilege, which an
+        // ordinary account does not hold, so this SKIPS rather than fails and does
+        // not run on the machine this was written on. The POSIX arm covers the same
+        // property unconditionally in create_new_refuses_a_name_a_symlink_already_holds.
+        let d = TempDir::new().unwrap();
+        let outside = d.path().join("outside");
+        if std::os::windows::fs::symlink_file(&outside, d.path().join("bait")).is_err() {
+            eprintln!("SKIPPED: no SeCreateSymbolicLinkPrivilege; cannot create a file symlink");
+            return;
+        }
+        assert!(!outside.exists(), "the link must dangle for this to mean anything");
+
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let err = match root.create_new(OsStr::new("bait")) {
+            Err(e) => e,
+            Ok(_) => panic!("a name a symlink holds is taken"),
+        };
+        assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(!outside.exists(), "nothing may have been created at the link's TARGET");
     }
 }
