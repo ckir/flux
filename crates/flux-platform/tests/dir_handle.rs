@@ -509,4 +509,51 @@ mod windows_arm {
         // And it still refuses to create the same name twice.
         assert!(root.create_dir(OsStr::new("fresh")).is_err());
     }
+
+    #[test]
+    fn a_junction_is_accepted_as_the_destination_ROOT() {
+        // The DEST EXEMPTION, which nothing else pins. Every component BELOW the root
+        // is refused if it is a name surrogate -- a_junction_is_refused_as_a_safety_
+        // _rejection covers that -- but §149.7 exempts DEST ITSELF, which is resolved
+        // by path and DOES follow links. So a junction handed in as the root must be
+        // followed, and writes must land in its target.
+        //
+        // Without this test, "reject junctions" looks like a strictly safer change to
+        // make to destination_root, and it would silently break copying into a
+        // junctioned destination.
+        let d = TempDir::new().unwrap();
+        let real = d.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = d.path().join("rootlink");
+        if !junction(&real, &link) {
+            eprintln!("SKIPPED: could not create a junction");
+            return;
+        }
+
+        let root = StdFileSystem.destination_root(&link).unwrap();
+        drop(root.create_new(OsStr::new("through")).unwrap());
+        assert!(real.join("through").is_file(), "the write must land in the junction's TARGET");
+    }
+
+    #[test]
+    fn the_handle_create_dir_returns_serves_every_child_operation() {
+        // create_dir now returns the handle NtCreateFile gave it rather than
+        // re-opening the name, so its access mask is no longer open_dir's by
+        // construction -- it is open_dir's because it was widened to match. This
+        // exercises the whole DirHandle surface through that handle, including a
+        // rename ACROSS two handles, which is the one that needs DELETE on the source
+        // and a second directory handle as the target.
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let made = root.create_dir(OsStr::new("fresh")).unwrap();
+
+        drop(made.create_new(OsStr::new("a")).unwrap());
+        assert_eq!(made.metadata(OsStr::new("a")).unwrap().len, 0);
+        made.create_dir(OsStr::new("sub")).unwrap();
+        made.open_dir(OsStr::new("sub")).unwrap();
+        made.rename_no_replace(OsStr::new("a"), &made, OsStr::new("b")).unwrap();
+        made.remove_file(OsStr::new("b")).unwrap();
+        made.rename_no_replace(OsStr::new("sub"), &root, OsStr::new("moved")).unwrap();
+        assert!(d.path().join("moved").is_dir());
+    }
 }
