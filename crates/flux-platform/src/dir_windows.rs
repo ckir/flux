@@ -677,6 +677,95 @@ fn surrogate_tag_at(parent: &OwnedHandle, name: &OsStr) -> Option<u32> {
     }
 }
 
+/// WHAT THE TWO ATTRIBUTE QUERIES ANSWERED, as data rather than as control flow.
+///
+/// This type and the two functions below exist so the DECISIONS can be tested
+/// without a filesystem that has the property being decided about. A test audit
+/// measured the problem: the fail-closed branches below -- the ones that refuse when
+/// a reparse point is present but its tag cannot be read -- are unreachable on every
+/// filesystem available here, because NTFS always answers the tag query and FAT32 has
+/// no reparse points to make the fallback matter. Flipping either of them to
+/// fail-open left the entire suite green. They were correct, load-bearing, and
+/// guarded by nothing.
+///
+/// Separating the judgement from the syscalls that feed it makes every branch
+/// reachable from a unit test, including the ones no volume here can produce.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AttrQuery {
+    /// `FileAttributeTagInformation` answered: attributes AND a tag.
+    Tagged { attributes: u32, tag: u32 },
+    /// Only `FileBasicInformation` answered: attributes, no tag. A volume that
+    /// cannot report tags at all reaches this.
+    Untagged { attributes: u32 },
+    /// Neither answered.
+    Unanswered,
+}
+
+/// May this object be TRAVERSED, and with what tag? `Ok(None)` means it is not a
+/// reparse point at all.
+///
+/// The asymmetry is the point and it is not arbitrary: a CLEAR reparse attribute
+/// proves there is nothing to judge, so `None` is the true answer; a SET one whose
+/// tag cannot be read cannot be told apart from a junction, so it is refused.
+/// Answering `None` there would traverse a surrogate, which is the single thing
+/// §149.7 exists to prevent.
+#[cfg(windows)]
+pub(crate) fn judge_reparse(q: AttrQuery) -> flux_fs::Result<Option<u32>> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    let refuse = || {
+        Err(flux_fs::FsError::new(
+            flux_fs::Code::SafetyRejected,
+            std::io::Error::other("cannot read a reparse tag to judge this name"),
+        ))
+    };
+    match q {
+        AttrQuery::Tagged { attributes, tag } => {
+            if attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+                Ok(None)
+            } else {
+                Ok(Some(tag))
+            }
+        }
+        AttrQuery::Untagged { attributes } => {
+            if attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+                Ok(None)
+            } else {
+                refuse()
+            }
+        }
+        AttrQuery::Unanswered => refuse(),
+    }
+}
+
+/// May `remove_file` remove this object?
+///
+/// POSIX is the specification: `unlinkat` refuses a DIRECTORY and unlinks a SYMLINK
+/// whatever it points at. So a name surrogate is removable and a real directory is
+/// not -- including one carrying a NON-surrogate reparse point, such as a cloud
+/// placeholder, which is a directory with extra metadata rather than a link.
+///
+/// Without a tag a junction cannot be told from a plain directory, so the untagged
+/// case refuses every directory; nothing is lost, because a volume that cannot answer
+/// the tag query has no reparse points to distinguish. Unanswered refuses outright:
+/// this guard protects against destroying a tree, so being unable to tell is a reason
+/// to stop, not a reason to proceed.
+#[cfg(windows)]
+pub(crate) fn judge_removable(q: AttrQuery) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+    match q {
+        AttrQuery::Tagged { attributes, tag } => {
+            if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+                is_name_surrogate(tag)
+            } else {
+                true
+            }
+        }
+        AttrQuery::Untagged { attributes } => attributes & FILE_ATTRIBUTE_DIRECTORY == 0,
+        AttrQuery::Unanswered => false,
+    }
+}
+
 /// Read a handle's reparse tag, or `None` when it is not a reparse point.
 #[cfg(windows)]
 pub(crate) fn reparse_tag_of(
@@ -687,7 +776,6 @@ pub(crate) fn reparse_tag_of(
         FILE_BASIC_INFORMATION, FileAttributeTagInformation, FileBasicInformation,
         NtQueryInformationFile,
     };
-    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     #[repr(C)]
@@ -710,34 +798,22 @@ pub(crate) fn reparse_tag_of(
         )
     };
     if status == 0 {
-        if info.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
-            return Ok(None);
-        }
-        return Ok(Some(info.reparse_tag));
+        return judge_reparse(AttrQuery::Tagged {
+            attributes: info.file_attributes,
+            tag: info.reparse_tag,
+        });
     }
 
     // THE TAG QUERY DOES NOT ANSWER EVERYWHERE, and failing the call outright broke
     // an entire class of volume. MEASURED on a real FAT32 volume: this returned
     // NtQueryInformationFile 0xC000000D, and because `open_dir` asks for the tag on
     // EVERY directory it opens, directory traversal on that volume failed completely.
+    // `FileBasicInformation` is the most basic class there is and answers where the
+    // tag query does not.
     //
-    // `may_remove` had already learned this and falls back to `FileBasicInformation`.
-    // Its sibling did not, which is exactly the shape -- a rule enforced on one side
-    // of a fork and not the other -- that this review has now produced three defects
-    // from.
-    //
-    // The fallback reports the reparse ATTRIBUTE without a tag, and the two cases it
-    // leaves are not symmetric:
-    //
-    //   bit CLEAR -> definitely not a reparse point, so `None` is the true answer and
-    //                FAT32 traversal works again. This is the case that was broken.
-    //   bit SET   -> there IS a reparse point and we cannot read its tag, so we
-    //                cannot tell a junction from a OneDrive placeholder. Refuse.
-    //                Answering `None` here would traverse a surrogate, which is the
-    //                one thing this cut exists to prevent -- the fail-open that round
-    //                three found in the removal guard, in a worse place.
-    //
-    // Both queries failing also refuses, for the same reason.
+    // What to DO with each outcome is `judge_reparse`'s job, not this function's, so
+    // that every branch of it is reachable from a unit test rather than only from a
+    // filesystem nobody here has.
     let mut basic: FILE_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     let mut iosb2: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
     // SAFETY: `basic` is a live, correctly sized FILE_BASIC_INFORMATION and the
@@ -751,16 +827,11 @@ pub(crate) fn reparse_tag_of(
             FileBasicInformation,
         )
     };
-    if fallback == 0 && basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
-        return Ok(None);
-    }
-    Err(flux_fs::FsError::new(
-        flux_fs::Code::SafetyRejected,
-        std::io::Error::other(format!(
-            "cannot read a reparse tag to judge this name: NtQueryInformationFile: 0x{:08X}",
-            status as u32
-        )),
-    ))
+    judge_reparse(if fallback == 0 {
+        AttrQuery::Untagged { attributes: basic.FileAttributes }
+    } else {
+        AttrQuery::Unanswered
+    })
 }
 
 /// May `remove_file` remove what this handle addresses?
@@ -795,7 +866,6 @@ fn may_remove(h: &std::os::windows::io::OwnedHandle) -> bool {
         FILE_BASIC_INFORMATION, FileAttributeTagInformation, FileBasicInformation,
         NtQueryInformationFile,
     };
-    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     #[repr(C)]
@@ -818,17 +888,10 @@ fn may_remove(h: &std::os::windows::io::OwnedHandle) -> bool {
         )
     };
     if status == 0 {
-        // A directory is removable ONLY as a name surrogate. Reading the TAG rather
-        // than the reparse BIT is the whole point, and the bit alone was a defect:
-        // a directory carrying a NON-surrogate reparse point -- a OneDrive
-        // placeholder, tag 0x9000701A, measured on this machine -- is a real
-        // directory with cloud metadata, not a link, and deleting it is exactly the
-        // structural damage this guard exists to stop. It is the same rule `open_dir`
-        // applies when it decides what to traverse.
-        if tag_info.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
-            return is_name_surrogate(tag_info.reparse_tag);
-        }
-        return true;
+        return judge_removable(AttrQuery::Tagged {
+            attributes: tag_info.file_attributes,
+            tag: tag_info.reparse_tag,
+        });
     }
 
     let mut basic: FILE_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -844,9 +907,93 @@ fn may_remove(h: &std::os::windows::io::OwnedHandle) -> bool {
             FileBasicInformation,
         )
     };
-    if status != 0 {
-        // Neither query answered. Refuse: see the fail-closed reasoning above.
-        return false;
+    judge_removable(if status == 0 {
+        AttrQuery::Untagged { attributes: basic.FileAttributes }
+    } else {
+        AttrQuery::Unanswered
+    })
+}
+
+#[cfg(all(test, windows))]
+mod judge_tests {
+    use super::*;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+
+    // Measured on this machine during the design of this cut.
+    const JUNCTION: u32 = 0xA000_0003;
+    const ONEDRIVE: u32 = 0x9000_701A;
+
+    // THE TWO CASES NO FILESYSTEM HERE CAN PRODUCE, and the reason this layer exists.
+    // A test audit measured that flipping either of them to fail-open left the entire
+    // suite green: NTFS always answers the tag query, so the untagged path never runs,
+    // and FAT32 has no reparse points, so the one branch it does reach is the other
+    // one. They are the most safety-critical branches in the cut and nothing guarded
+    // them until these tests.
+
+    #[test]
+    fn an_unreadable_tag_on_a_reparse_point_is_refused_rather_than_traversed() {
+        let q = AttrQuery::Untagged { attributes: FILE_ATTRIBUTE_REPARSE_POINT };
+        let err = judge_reparse(q).unwrap_err();
+        assert_eq!(err.code, flux_fs::Code::SafetyRejected);
     }
-    basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+
+    #[test]
+    fn no_answer_at_all_is_refused_rather_than_traversed() {
+        let err = judge_reparse(AttrQuery::Unanswered).unwrap_err();
+        assert_eq!(err.code, flux_fs::Code::SafetyRejected);
+    }
+
+    #[test]
+    fn an_unreadable_tag_on_a_reparse_point_is_not_removable() {
+        // Cannot tell a junction from a cloud placeholder, so it must not be deleted.
+        let q = AttrQuery::Untagged {
+            attributes: FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT,
+        };
+        assert!(!judge_removable(q));
+    }
+
+    #[test]
+    fn no_answer_at_all_is_not_removable() {
+        assert!(!judge_removable(AttrQuery::Unanswered));
+    }
+
+    // The reachable branches, pinned here too so the table is exhaustive and a reader
+    // can see the whole decision in one place.
+
+    #[test]
+    fn a_clear_reparse_attribute_is_not_a_reparse_point() {
+        assert_eq!(judge_reparse(AttrQuery::Tagged { attributes: 0, tag: 0 }).unwrap(), None);
+        assert_eq!(
+            judge_reparse(AttrQuery::Untagged { attributes: FILE_ATTRIBUTE_NORMAL }).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_readable_tag_is_returned_whatever_it_is() {
+        let q = AttrQuery::Tagged { attributes: FILE_ATTRIBUTE_REPARSE_POINT, tag: JUNCTION };
+        assert_eq!(judge_reparse(q).unwrap(), Some(JUNCTION));
+        let q = AttrQuery::Tagged { attributes: FILE_ATTRIBUTE_REPARSE_POINT, tag: ONEDRIVE };
+        assert_eq!(judge_reparse(q).unwrap(), Some(ONEDRIVE));
+    }
+
+    #[test]
+    fn only_a_surrogate_directory_is_removable() {
+        let dir_attrs = FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT;
+        // A junction IS a link, so it goes -- matching POSIX, where unlinkat unlinks
+        // a symlink whatever it points at.
+        assert!(judge_removable(AttrQuery::Tagged { attributes: dir_attrs, tag: JUNCTION }));
+        // A OneDrive placeholder is a real directory carrying cloud metadata.
+        assert!(!judge_removable(AttrQuery::Tagged { attributes: dir_attrs, tag: ONEDRIVE }));
+        // A plain directory has tag 0, which is not a surrogate.
+        assert!(!judge_removable(AttrQuery::Tagged {
+            attributes: FILE_ATTRIBUTE_DIRECTORY,
+            tag: 0
+        }));
+        // Anything that is not a directory is removable.
+        assert!(judge_removable(AttrQuery::Tagged { attributes: FILE_ATTRIBUTE_NORMAL, tag: 0 }));
+        assert!(judge_removable(AttrQuery::Untagged { attributes: FILE_ATTRIBUTE_NORMAL }));
+    }
 }
