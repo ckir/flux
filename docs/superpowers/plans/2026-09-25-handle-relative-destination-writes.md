@@ -583,7 +583,7 @@ const fn libc_s_iflnk() -> u32 {
 }
 
 impl DirHandle for StdDir {
-    type Writer = crate::StdWriter;
+    type Writer = crate::StdFile;
 
     fn open_dir(&self, name: &OsStr) -> Result<Self> {
         check_component(name)?;
@@ -614,7 +614,7 @@ impl DirHandle for StdDir {
             Mode::from_raw_mode(0o666),
         )
         .map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
-        Ok(crate::StdWriter(std::fs::File::from(fd)))
+        Ok(crate::std_fs::std_file_from(std::fs::File::from(fd)))
     }
 
     fn metadata(&self, name: &OsStr) -> Result<Metadata> {
@@ -652,13 +652,35 @@ impl DirHandle for StdDir {
 }
 ```
 
-**`metadata_from_stat` and `StdWriter` are referenced above and must already exist or be extracted.** Check first:
+**Two helpers referenced above do NOT exist yet and must be added to `std_fs.rs` first. Both were
+grep-checked; do not assume either is there.**
 
 ```bash
-rg -n 'pub struct StdWriter|fn metadata_from_stat' crates/flux-platform/src/std_fs.rs
+rg -n '^pub struct StdFile|type Writer = |fn metadata_from_stat' crates/flux-platform/src/std_fs.rs
 ```
 
-If `metadata_from_stat` does not exist, extract one from the `#[cfg(unix)] fn metadata` body in `std_fs.rs` — it already builds a `Metadata` from a stat result — and make it `pub(crate)`. If `StdWriter` has a private field, add `pub(crate)` to it. **If either cannot be reached without changing a public signature, STOP and report `SHAPE_DIVERGENCE`** rather than duplicating the conversion.
+Expected: `pub struct StdFile(File);` at `:28` and `type Writer = StdFile;` at `:174`, and **no match
+for `metadata_from_stat`**. Note the writer type is **`StdFile`**, not `StdWriter` — an earlier draft of
+this plan named a type that does not exist, which is why this step greps rather than asserts.
+
+1. **`StdFile`'s field is private** (`pub struct StdFile(File);` — a tuple struct whose field is not
+   `pub`), so another module cannot construct one. Add beside it:
+
+```rust
+/// Construct a writer from an already-open file. `DirHandle::create_new` opens
+/// relative to a directory handle, so it cannot go through the path-based
+/// `create_new` and needs this.
+pub(crate) fn std_file_from(f: File) -> StdFile {
+    StdFile(f)
+}
+```
+
+2. **`metadata_from_stat` does not exist.** Extract it from the `#[cfg(unix)] fn metadata` body in
+   `std_fs.rs`, which already builds a `Metadata` from a stat result, and make it `pub(crate)` taking
+   `&rustix::fs::Stat`. Do NOT duplicate the conversion: `identity_of` and the `§107` zero-inode rule
+   live inside it, and a second copy will drift.
+
+**If either cannot be done without changing a PUBLIC signature, STOP and report `SHAPE_DIVERGENCE`.**
 
 - [ ] **Step 5: Declare the module**
 
@@ -923,7 +945,7 @@ impl StdDir {
 }
 
 impl DirHandle for StdDir {
-    type Writer = crate::StdWriter;
+    type Writer = crate::StdFile;
 
     fn open_dir(&self, name: &OsStr) -> Result<Self> {
         check_component(name)?;
@@ -1387,7 +1409,9 @@ Pushing and opening a pull request are outward actions. `just pr "title" body.md
 
 **Placeholder scan.** One task step is deliberately not literal code: **Task 4 Step 4** describes the `FaultFs` field layout as the implementer's choice. That is not a placeholder dodge — `Inner`'s shape is not fixed by this plan and pasting a struct that does not match the tree would be worse than useless. The step pins the two things that ARE contractual (the handle holds an id, not a path; `check_component` runs first) and gives a `SHAPE_DIVERGENCE` trigger for the one way to get it wrong.
 
-**Type consistency.** `StdDir` is the handle type in both platform files, so `impl DestinationRoot for StdFileSystem` names `crate::StdDir` under either cfg. `type Writer = crate::StdWriter` matches the `DestinationRoot: FileSystem` bound because `StdFileSystem::Writer` is `StdWriter`. `check_component` is exported from `flux_fs` at the crate root in Task 1 Step 8 and imported unqualified everywhere after.
+**Type consistency.** `StdDir` is the handle type in both platform files, so `impl DestinationRoot for StdFileSystem` names `crate::StdDir` under either cfg. `type Writer = crate::StdFile` matches the `DestinationRoot: FileSystem` bound because `StdFileSystem::Writer` is `StdFile`, verified at `crates/flux-platform/src/std_fs.rs:174`. `check_component` is exported from `flux_fs` at the crate root in Task 1 Step 8 and imported unqualified everywhere after.
+
+**An earlier draft of this plan failed exactly this check, and the check as first written did not catch it.** It named the writer type `StdWriter` in three code blocks. No such type exists — it is `StdFile` at `std_fs.rs:28`. The type-consistency paragraph had asserted the two matched, *using the fabricated name on both sides of the comparison*, which is self-consistent and false. A consistency check that compares a plan against itself proves nothing; this one now cites the line in the tree. The same pass found that `StdFile`'s field is private, so the constructor Task 2 needs does not exist either.
 
 **Known gaps, stated rather than hidden.**
 
