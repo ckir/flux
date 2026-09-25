@@ -1279,6 +1279,11 @@ EOF
 
 **Files:**
 - Modify: `crates/flux-platform/src/dir_windows.rs`, `crates/flux-platform/tests/dir_handle.rs`
+- Already done for you: `crates/flux-platform/src/std_fs.rs` -- `std_file_from` is now ungated and
+  `type_of`, `perms_of` and `identity_of_handle` are now `pub(crate)`. **Do not edit that file.** An
+  earlier draft left `std_file_from` behind `#[cfg(unix)]` with a comment saying the previous task
+  would widen the gate; it did not, because it had no Windows caller to widen it for, and this task hit
+  it as a compile error.
 
 Split out of Task 3 after a panel round found "extend the pattern from `open_dir`" unexecutable. Two of
 these go through a **different NT call**, and one builds a **variable-length struct**.
@@ -1387,9 +1392,40 @@ stubs exist with the right signatures, which is what Task 3 left behind.
 `ShareAccess` is `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` for all three, for the reason
 `open_dir` records: a `ShareAccess` of 0 locks the object against every other process.
 
-`metadata_at` then reads the handle with the same `NtQueryInformationFile` shape `reparse_tag_of` uses,
-passing `FileBasicInformation` (`= 4i32`), and builds a `Metadata`. `create_new_at` converts its raw
-handle with `OwnedHandle::from_raw_handle` and returns `crate::std_fs::std_file_from(File::from(h))`.
+`create_new_at` converts its raw handle with `OwnedHandle::from_raw_handle` and returns
+`crate::std_fs::std_file_from(File::from(h))`.
+
+**`metadata_at` does NOT hand-roll an `NtQueryInformationFile` call**, and an earlier draft of this
+plan said it should -- passing `FileBasicInformation` (`= 4i32`). That was wrong twice over, and both
+were caught by executing it. `FILE_BASIC_INFORMATION` (`:1598`) carries four timestamps and
+`FileAttributes` and **no size field**, so it cannot answer the `len == 4` that this task's own oracle
+test asserts; and nothing in that class carries IDENTITY, so the `Metadata` it built would report
+`FileIdentity::Unavailable` on every filesystem. The POSIX arm fills identity from
+`identity_of_raw(st_dev, st_ino)`, so that would be a silent cross-arm divergence in a field §107
+makes load-bearing: every identity comparison reached through a Windows handle would degrade to the
+lexical floor, which fails OPEN.
+
+Once the handle is open, the object is already pinned, so build the `Metadata` **exactly as the
+path-based Windows `metadata` does at `crates/flux-platform/src/std_fs.rs:221`** -- the only thing that
+had to be handle-relative was the open:
+
+```rust
+    // SAFETY: NtCreateFile returned this handle and nothing else owns it.
+    let f = File::from(unsafe { OwnedHandle::from_raw_handle(h as _) });
+    let m = f.metadata().map_err(FsError::from_io)?;
+    Ok(Metadata {
+        len: m.len(),
+        file_type: crate::std_fs::type_of(&m),
+        permissions: Some(crate::std_fs::perms_of(&m)),
+        modified: m.modified().ok(),
+        identity: crate::std_fs::identity_of_handle(&f),
+    })
+```
+
+`FILE_READ_ATTRIBUTES` is enough access for all of it: the path-based arm asks for `access_mode(0)`,
+which is less, and gets the same answers. Reusing those three helpers rather than re-deriving the
+mapping is the point -- it is what makes the two Windows arms agree by construction instead of by
+inspection.
 
 **`create_dir_at` returns `Result<()>`; the caller re-opens.** `DirHandle::create_dir` already calls
 `self.open_dir(name)` afterwards, which is what runs the reparse-tag check on the thing just created.

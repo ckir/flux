@@ -48,10 +48,12 @@ impl FileHandle for StdFile {
 /// relative to a directory handle, so it cannot go through the path-based
 /// `create_new` and needs this.
 ///
-/// `#[cfg(unix)]` for now because its only caller is `dir_unix.rs`. Without the
-/// gate, Windows `just check` fails on `-D dead_code` until Task 3 lands a second
-/// caller. Task 3 widens the gate; do not delete it here.
-#[cfg(unix)]
+/// Ungated: `dir_unix.rs` and `dir_windows.rs` both call it. It was briefly
+/// `#[cfg(unix)]`, because for one task the POSIX arm was its only caller and
+/// Windows `just check` fails on `-D dead_code`; the comment then said the NEXT
+/// task would widen it, and named the wrong task. Nobody widened it, and the
+/// Windows arm hit it as a compile error instead. A gate whose removal is somebody
+/// else's homework is a gate that stays.
 pub(crate) fn std_file_from(f: File) -> StdFile {
     StdFile(f)
 }
@@ -616,13 +618,13 @@ impl flux_fs::DestinationRoot for StdFileSystem {
 }
 
 #[cfg(unix)]
-fn perms_of(m: &std::fs::Metadata) -> Perms {
+pub(crate) fn perms_of(m: &std::fs::Metadata) -> Perms {
     use std::os::unix::fs::PermissionsExt;
     Perms::UnixMode(m.permissions().mode())
 }
 
 #[cfg(not(unix))]
-fn perms_of(m: &std::fs::Metadata) -> Perms {
+pub(crate) fn perms_of(m: &std::fs::Metadata) -> Perms {
     Perms::ReadOnly(m.permissions().readonly())
 }
 
@@ -630,7 +632,7 @@ fn perms_of(m: &std::fs::Metadata) -> Perms {
 /// `!is_symlink && is_directory`, so a junction or directory symlink is already
 /// excluded there -- but testing symlink first makes that independent of std's
 /// definition rather than reliant on it.
-fn type_of(m: &std::fs::Metadata) -> flux_fs::FileType {
+pub(crate) fn type_of(m: &std::fs::Metadata) -> flux_fs::FileType {
     let t = m.file_type();
     if t.is_symlink() {
         flux_fs::FileType::Symlink
@@ -716,7 +718,7 @@ fn mtime_from_stat(st: &rustix::fs::Stat) -> Option<SystemTime> {
 /// cannot enforce them, which is why it is private and takes a `&File` rather than
 /// a path.
 #[cfg(windows)]
-fn identity_of_handle(file: &File) -> FileIdentity {
+pub(crate) fn identity_of_handle(file: &File) -> FileIdentity {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
