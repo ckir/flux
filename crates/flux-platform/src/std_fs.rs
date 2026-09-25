@@ -12,6 +12,8 @@ use flux_fs::{
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
+#[cfg(unix)]
+use std::time::Duration;
 use std::time::SystemTime;
 
 /// The source handle. Read only -- it does not implement `Write` at all, so even a
@@ -40,6 +42,18 @@ impl FileHandle for StdFile {
     fn sync_all(&self) -> Result<()> {
         self.0.sync_all().map_err(FsError::from_io)
     }
+}
+
+/// Construct a writer from an already-open file. `DirHandle::create_new` opens
+/// relative to a directory handle, so it cannot go through the path-based
+/// `create_new` and needs this.
+///
+/// `#[cfg(unix)]` for now because its only caller is `dir_unix.rs`. Without the
+/// gate, Windows `just check` fails on `-D dead_code` until Task 3 lands a second
+/// caller. Task 3 widens the gate; do not delete it here.
+#[cfg(unix)]
+pub(crate) fn std_file_from(f: File) -> StdFile {
+    StdFile(f)
 }
 
 pub struct StdFileSystem;
@@ -566,6 +580,22 @@ impl FileSystem for StdFileSystem {
     }
 }
 
+/// Resolving `DEST` is the one path-based call in the writer, and it DOES follow
+/// links -- §149.7 exempts it, because a user who points DEST at a symlink has
+/// chosen that destination. Everything BELOW it goes through a handle.
+#[cfg(unix)]
+impl flux_fs::DestinationRoot for StdFileSystem {
+    type Dir = crate::StdDir;
+
+    fn destination_root(&self, path: &Path) -> Result<Self::Dir> {
+        use rustix::fs::{CWD, Mode, OFlags, openat};
+        let fd =
+            openat(CWD, path, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())
+                .map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
+        Ok(crate::StdDir::from_fd(fd))
+    }
+}
+
 #[cfg(unix)]
 fn perms_of(m: &std::fs::Metadata) -> Perms {
     use std::os::unix::fs::PermissionsExt;
@@ -599,13 +629,65 @@ fn type_of(m: &std::fs::Metadata) -> flux_fs::FileType {
 #[cfg(unix)]
 fn identity_of(m: &std::fs::Metadata) -> FileIdentity {
     use std::os::unix::fs::MetadataExt;
-    let index = u128::from(m.ino());
-    // §107: "The platform adapter must never treat `object_id == 0` as a valid
-    // universal object identity."
+    identity_of_raw(m.dev(), m.ino())
+}
+
+/// The §107 zero-inode rule, factored out so the path-based `identity_of` above
+/// and the handle-based `metadata_from_stat` below share ONE copy of it rather
+/// than risking two that drift.
+///
+/// §107: "The platform adapter must never treat `object_id == 0` as a valid
+/// universal object identity."
+#[cfg(unix)]
+fn identity_of_raw(dev: u64, ino: u64) -> FileIdentity {
+    let index = u128::from(ino);
     if index == 0 {
         return FileIdentity::Unavailable;
     }
-    FileIdentity::Strong(ObjectId { volume: m.dev(), index })
+    FileIdentity::Strong(ObjectId { volume: dev, index })
+}
+
+/// The handle-based twin of `FileSystem::metadata` above, for
+/// `DirHandle::metadata` (§149.7): the caller already has a `statat` result --
+/// taken relative to an open directory handle rather than by path -- and this
+/// builds the same `Metadata` from it without a second, path-based stat.
+///
+/// Shares `identity_of_raw` for the §107 rule; the file-type mapping goes through
+/// rustix's own `FileType::from_raw_mode` rather than reimplementing the
+/// `S_IFMT` bit test a second time.
+#[cfg(unix)]
+pub(crate) fn metadata_from_stat(st: &rustix::fs::Stat) -> Metadata {
+    use rustix::fs::FileType as RawFileType;
+    Metadata {
+        len: st.st_size as u64,
+        file_type: match RawFileType::from_raw_mode(st.st_mode) {
+            RawFileType::Directory => FileType::Dir,
+            RawFileType::Symlink => FileType::Symlink,
+            RawFileType::RegularFile => FileType::File,
+            _ => FileType::Other,
+        },
+        permissions: Some(Perms::UnixMode(st.st_mode)),
+        modified: mtime_from_stat(st),
+        identity: identity_of_raw(st.st_dev, st.st_ino),
+    }
+}
+
+/// `st_mtime`/`st_mtime_nsec` to `SystemTime`. POSIX keeps `st_*_nsec` a
+/// non-negative FORWARD offset even when the seconds field is negative (a
+/// timestamp before the epoch), so the two fields are combined as one signed
+/// total before splitting back into a `Duration` either side of `UNIX_EPOCH`,
+/// rather than risking a plain `Duration::new(negative_as_u64, nsec)` on the
+/// pre-epoch side.
+#[cfg(unix)]
+fn mtime_from_stat(st: &rustix::fs::Stat) -> Option<SystemTime> {
+    let total_nanos = i128::from(st.st_mtime) * 1_000_000_000 + i128::from(st.st_mtime_nsec);
+    let abs = total_nanos.unsigned_abs();
+    let d = Duration::new((abs / 1_000_000_000) as u64, (abs % 1_000_000_000) as u32);
+    if total_nanos >= 0 {
+        SystemTime::UNIX_EPOCH.checked_add(d)
+    } else {
+        SystemTime::UNIX_EPOCH.checked_sub(d)
+    }
 }
 
 /// The identity half of `metadata`, reading an ALREADY-OPEN handle.
