@@ -34,6 +34,25 @@ const STATUS_NOT_A_DIRECTORY: i32 = 0xC000_0103u32 as i32;
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_OBJECT_PATH_NOT_FOUND: i32 = 0xC000_003Au32 as i32;
 const STATUS_ACCESS_DENIED: i32 = 0xC000_0022u32 as i32;
+const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035u32 as i32;
+
+/// An `NTSTATUS` as a `std::io::Error` that KEEPS its kind.
+///
+/// `std::io::Error::other` hardcodes `ErrorKind::Other`, which silently destroyed
+/// the one distinction a caller needs most: MEASURED, a `create_new` collision came
+/// back `kind=Other` through this arm while the path-based arm reported
+/// `kind=AlreadyExists` for the very same event. `create_new` and
+/// `rename_no_replace` both exist to report occupancy, so an occupied name must
+/// arrive as `AlreadyExists` on every arm or the engine cannot branch on it.
+fn nt_io_error(what: &str, status: i32) -> std::io::Error {
+    let kind = match status {
+        STATUS_OBJECT_NAME_COLLISION => std::io::ErrorKind::AlreadyExists,
+        STATUS_ACCESS_DENIED => std::io::ErrorKind::PermissionDenied,
+        STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => std::io::ErrorKind::NotFound,
+        _ => std::io::ErrorKind::Other,
+    };
+    std::io::Error::new(kind, format!("{what}: 0x{:08X}", status as u32))
+}
 
 /// `IsReparseTagNameSurrogate`. A surrogate stands in for another NAME -- a symlink
 /// or a junction -- and is what §149.7 refuses. Everything else that merely carries
@@ -100,6 +119,24 @@ impl DirHandle for StdDir {
         };
 
         if status != 0 {
+            // STATUS_NOT_A_DIRECTORY CONFLATES two things, exactly as POSIX's
+            // ENOTDIR does: a plain file, and a symlink whose target is a file.
+            // FILE_DIRECTORY_FILE rejects the second before the reparse-tag check
+            // further down can ever see it, so without this the arms disagree on
+            // the same object -- POSIX answers SafetyRejected (its ENOTDIR path
+            // runs statat to separate them) while this one answered
+            // DestinationError. Inspecting here is the same second look POSIX
+            // already takes, and it is equally racy for the same reason: the name
+            // may be gone by now, in which case there is nothing to refuse and the
+            // original status stands.
+            if status == STATUS_NOT_A_DIRECTORY
+                && let Some(tag) = surrogate_tag_at(&self.0, name)
+            {
+                return Err(FsError::new(
+                    Code::SafetyRejected,
+                    std::io::Error::other(format!("name-surrogate reparse point, tag 0x{tag:08X}")),
+                ));
+            }
             let code = match status {
                 STATUS_NOT_A_DIRECTORY
                 | STATUS_OBJECT_NAME_NOT_FOUND
@@ -107,10 +144,7 @@ impl DirHandle for StdDir {
                 STATUS_ACCESS_DENIED => Code::PermissionDenied,
                 _ => Code::IoError,
             };
-            return Err(FsError::new(
-                code,
-                std::io::Error::other(format!("NtCreateFile: 0x{:08X}", status as u32)),
-            ));
+            return Err(FsError::new(code, nt_io_error("NtCreateFile", status)));
         }
 
         // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `h` is a valid handle we own.
@@ -205,10 +239,7 @@ fn create_dir_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {
             STATUS_ACCESS_DENIED => Code::PermissionDenied,
             _ => Code::IoError,
         };
-        return Err(FsError::new(
-            code,
-            std::io::Error::other(format!("NtCreateFile: 0x{:08X}", status as u32)),
-        ));
+        return Err(FsError::new(code, nt_io_error("NtCreateFile", status)));
     }
 
     // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `h` is a valid handle we own.
@@ -255,10 +286,7 @@ fn create_new_at(p: &OwnedHandle, n: &OsStr) -> Result<crate::StdFile> {
             STATUS_ACCESS_DENIED => Code::PermissionDenied,
             _ => Code::IoError,
         };
-        return Err(FsError::new(
-            code,
-            std::io::Error::other(format!("NtCreateFile: 0x{:08X}", status as u32)),
-        ));
+        return Err(FsError::new(code, nt_io_error("NtCreateFile", status)));
     }
 
     // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `h` is a valid handle we own.
@@ -302,10 +330,7 @@ fn metadata_at(p: &OwnedHandle, n: &OsStr) -> Result<Metadata> {
             STATUS_ACCESS_DENIED => Code::PermissionDenied,
             _ => Code::IoError,
         };
-        return Err(FsError::new(
-            code,
-            std::io::Error::other(format!("NtCreateFile: 0x{:08X}", status as u32)),
-        ));
+        return Err(FsError::new(code, nt_io_error("NtCreateFile", status)));
     }
 
     // Once the handle is open the object is already pinned -- the open is the only
@@ -364,10 +389,7 @@ fn remove_file_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {
             STATUS_ACCESS_DENIED => Code::PermissionDenied,
             _ => Code::IoError,
         };
-        return Err(FsError::new(
-            code,
-            std::io::Error::other(format!("NtCreateFile: 0x{:08X}", status as u32)),
-        ));
+        return Err(FsError::new(code, nt_io_error("NtCreateFile", status)));
     }
     // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `raw` is a valid handle we own.
     let h = unsafe { OwnedHandle::from_raw_handle(raw as _) };
@@ -386,10 +408,7 @@ fn remove_file_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {
         )
     };
     if status != 0 {
-        return Err(FsError::new(
-            Code::IoError,
-            std::io::Error::other(format!("NtSetInformationFile: 0x{:08X}", status as u32)),
-        ));
+        return Err(FsError::new(Code::IoError, nt_io_error("NtSetInformationFile", status)));
     }
     drop(h);
     Ok(())
@@ -433,10 +452,7 @@ fn rename_at(fd: &OwnedHandle, f: &OsStr, td: &OwnedHandle, t: &OsStr, r: bool) 
             STATUS_ACCESS_DENIED => Code::PermissionDenied,
             _ => Code::IoError,
         };
-        return Err(FsError::new(
-            code,
-            std::io::Error::other(format!("NtCreateFile: 0x{:08X}", status as u32)),
-        ));
+        return Err(FsError::new(code, nt_io_error("NtCreateFile", status)));
     }
     // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `raw` is a valid handle we own.
     let h = unsafe { OwnedHandle::from_raw_handle(raw as _) };
@@ -444,14 +460,28 @@ fn rename_at(fd: &OwnedHandle, f: &OsStr, td: &OwnedHandle, t: &OsStr, r: bool) 
     let wide: Vec<u16> = t.encode_wide().collect();
     let name_bytes = wide.len() * 2;
     let total = size_of::<FILE_RENAME_INFORMATION>() + name_bytes;
-    let mut buf = vec![0u8; total];
 
-    // SAFETY: `buf` is at least size_of::<FILE_RENAME_INFORMATION>() bytes, and a
-    // Vec<u8> allocation is at least pointer-aligned, which is this struct's
-    // alignment (that of HANDLE). The name is written into the trailing space the
-    // [u16; 1] placeholder stands for.
+    // A `u64` buffer, NOT a `Vec<u8>`, and the difference is soundness rather than
+    // taste. An earlier version allocated `vec![0u8; total]` under a SAFETY comment
+    // asserting "a Vec<u8> allocation is at least pointer-aligned". Rust guarantees
+    // no such thing: `Vec<u8>` carries `align_of::<u8>()`, which is 1. MEASURED, the
+    // system allocator happens to return 16-byte-aligned blocks, so the write worked
+    // -- but a SAFETY comment that rests on what an allocator HAPPENS to do is not a
+    // proof, and both the field writes and the `copy_nonoverlapping` of a `[u16]`
+    // below carry their own alignment requirements. Allocating `u64` satisfies all of
+    // them by construction. The const assertion below is what keeps that true if the
+    // struct ever changes.
+    const {
+        assert!(align_of::<FILE_RENAME_INFORMATION>() <= align_of::<u64>());
+    }
+    let mut buf: Vec<u64> = vec![0u64; total.div_ceil(size_of::<u64>())];
+    let base: *mut u8 = buf.as_mut_ptr().cast();
+
+    // SAFETY: `base` addresses at least `total` zeroed bytes, aligned to 8, which the
+    // assertion above pins as no weaker than this struct needs. The name is written
+    // into the trailing space the `[u16; 1]` placeholder stands for.
     unsafe {
-        let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+        let info = base.cast::<FILE_RENAME_INFORMATION>();
         (&raw mut (*info).Anonymous.ReplaceIfExists).write(r);
         (&raw mut (*info).RootDirectory).write(td.as_raw_handle() as HANDLE);
         (&raw mut (*info).FileNameLength).write(name_bytes as u32);
@@ -463,27 +493,73 @@ fn rename_at(fd: &OwnedHandle, f: &OsStr, td: &OwnedHandle, t: &OsStr, r: bool) 
     }
 
     let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
-    // SAFETY: `buf` holds a fully-initialized FILE_RENAME_INFORMATION plus its
-    // trailing name, and `buf.len()` -- passed below, not
-    // size_of::<FILE_RENAME_INFORMATION>() alone -- is exactly its total size. `h`
-    // outlives the call.
+    // SAFETY: `base` holds a fully-initialized FILE_RENAME_INFORMATION plus its
+    // trailing name, and `total` -- passed below, not
+    // size_of::<FILE_RENAME_INFORMATION>() alone -- is exactly its size. It is NOT
+    // `buf.len()`: `buf` counts u64 WORDS and is rounded up, so its length is both
+    // the wrong unit and, for a name whose bytes do not fill the last word, too long.
+    // `buf` outlives `base`, and `h` outlives the call.
     let status = unsafe {
         NtSetInformationFile(
             h.as_raw_handle() as _,
             &raw mut iosb,
-            buf.as_mut_ptr().cast(),
-            buf.len() as u32,
+            base.cast(),
+            total as u32,
             FileRenameInformation,
         )
     };
     if status != 0 {
-        return Err(FsError::new(
-            Code::IoError,
-            std::io::Error::other(format!("NtSetInformationFile: 0x{:08X}", status as u32)),
-        ));
+        return Err(FsError::new(Code::IoError, nt_io_error("NtSetInformationFile", status)));
     }
     drop(h);
     Ok(())
+}
+
+/// The name-surrogate tag of a child that is NOT a directory, or `None`.
+///
+/// Opens with no `FILE_DIRECTORY_FILE` and no `FILE_NON_DIRECTORY_FILE`, so it
+/// accepts whatever the name is, plus `FILE_OPEN_REPARSE_POINT` so it sees the LINK
+/// and never its target. Every failure answers `None`: this runs only on a path that
+/// is already returning an error, and its single job is to decide whether that error
+/// should be reclassified as a refusal. It must never invent a new failure of its own.
+fn surrogate_tag_at(parent: &OwnedHandle, name: &OsStr) -> Option<u32> {
+    let mut wide: Vec<u16> = name.encode_wide().collect();
+    let bytes = (wide.len() * 2) as u16;
+    let us = UNICODE_STRING { Length: bytes, MaximumLength: bytes, Buffer: wide.as_mut_ptr() };
+    let mut oa: OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    oa.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
+    oa.RootDirectory = parent.as_raw_handle() as HANDLE;
+    oa.ObjectName = &raw const us;
+
+    let mut h: HANDLE = std::ptr::null_mut();
+    let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+
+    // SAFETY: every pointer is to a live local that outlives the call, and `wide`
+    // outlives `us` which borrows it. ShareAccess matches `open_dir`'s reasoning.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut h,
+            FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            &raw const oa,
+            &raw mut iosb,
+            std::ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `h` is a valid handle we own.
+    let opened = unsafe { OwnedHandle::from_raw_handle(h as _) };
+    match reparse_tag_of(&opened) {
+        Ok(Some(tag)) if is_name_surrogate(tag) => Some(tag),
+        _ => None,
+    }
 }
 
 /// Read a handle's reparse tag, or `None` when it is not a reparse point.

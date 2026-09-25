@@ -107,6 +107,42 @@ mod posix {
             "the write must land in the directory the handle holds, under its new name"
         );
     }
+
+    #[test]
+    fn an_occupied_name_reports_already_exists_through_the_handle() {
+        // The engine branches on AlreadyExists to tell an occupied destination from
+        // a broken one, so the kind has to survive the handle arm. MEASURED on the
+        // Windows arm before this test existed: `create_new` on an occupied name came
+        // back ErrorKind::Other there while the PATH-based arm reported AlreadyExists
+        // for the identical event, because the NTSTATUS was wrapped with
+        // `io::Error::other`, which hardcodes the kind. POSIX gets this for free from
+        // errno; the test is here so both arms are pinned to the same answer.
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+
+        drop(root.create_new(OsStr::new("dup")).unwrap());
+        let err = match root.create_new(OsStr::new("dup")) {
+            Err(e) => e,
+            Ok(_) => panic!("create_new must refuse an occupied name"),
+        };
+        assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn a_symlink_to_a_file_is_also_a_safety_rejection() {
+        // The sibling of the /etc test above, which links to a DIRECTORY. O_NOFOLLOW
+        // refuses the link itself whatever it points at, so POSIX answers the same
+        // either way -- but the Windows arm reaches this case down a DIFFERENT code
+        // path (STATUS_NOT_A_DIRECTORY, not the reparse-tag check) and had to be
+        // fixed, so both arms carry the test.
+        let d = TempDir::new().unwrap();
+        std::fs::write(d.path().join("victim"), b"x").unwrap();
+        std::os::unix::fs::symlink(d.path().join("victim"), d.path().join("flink")).unwrap();
+
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let err = root.open_dir(OsStr::new("flink")).unwrap_err();
+        assert_eq!(err.code, flux_fs::Code::SafetyRejected);
+    }
 }
 
 #[cfg(windows)]
@@ -237,5 +273,61 @@ mod windows_arm {
         std::fs::write(d.path().join("f"), b"1234").unwrap();
         let root = StdFileSystem.destination_root(d.path()).unwrap();
         assert_eq!(root.metadata(OsStr::new("f")).unwrap().len, 4);
+    }
+
+    #[test]
+    fn an_occupied_name_reports_already_exists_through_the_handle() {
+        // MEASURED before the fix: this arm answered ErrorKind::Other where the
+        // path-based arm answered AlreadyExists for the same collision, because every
+        // NTSTATUS went through `io::Error::other`, which hardcodes the kind. The
+        // engine branches on AlreadyExists to tell an occupied destination from a
+        // broken one, so the two arms must agree.
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+
+        drop(root.create_new(OsStr::new("dup")).unwrap());
+        let err = match root.create_new(OsStr::new("dup")) {
+            Err(e) => e,
+            Ok(_) => panic!("create_new must refuse an occupied name"),
+        };
+        assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn a_publish_onto_an_occupied_name_reports_already_exists() {
+        let d = TempDir::new().unwrap();
+        std::fs::write(d.path().join("src"), b"x").unwrap();
+        std::fs::write(d.path().join("taken"), b"old").unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+
+        let err =
+            root.rename_no_replace(OsStr::new("src"), &root, OsStr::new("taken")).unwrap_err();
+        assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn a_symlink_to_a_file_is_refused_as_a_safety_rejection() {
+        // The case FILE_DIRECTORY_FILE hides. A junction OPENS and is caught by the
+        // reparse-tag check, but a symlink whose target is a FILE fails the open
+        // outright with STATUS_NOT_A_DIRECTORY -- the same status a plain file gives
+        // -- so without a second look this arm called it DESTINATION_ERROR while
+        // POSIX called it SAFETY_REJECTED for the identical object.
+        //
+        // Creating a symlink needs SeCreateSymbolicLinkPrivilege, which an ordinary
+        // account does not hold, so this SKIPS rather than fails when it is absent.
+        // `a_plain_file_component_is_a_destination_error` is the other half and runs
+        // everywhere: if the second look ever over-reaches, THAT one goes red.
+        let d = TempDir::new().unwrap();
+        std::fs::write(d.path().join("victim"), b"x").unwrap();
+        if std::os::windows::fs::symlink_file(d.path().join("victim"), d.path().join("flink"))
+            .is_err()
+        {
+            eprintln!("SKIPPED: no SeCreateSymbolicLinkPrivilege; cannot create a file symlink");
+            return;
+        }
+
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let err = root.open_dir(OsStr::new("flink")).unwrap_err();
+        assert_eq!(err.code, flux_fs::Code::SafetyRejected);
     }
 }
