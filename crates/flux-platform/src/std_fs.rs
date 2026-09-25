@@ -312,8 +312,34 @@ impl FileSystem for StdFileSystem {
         // `Error::other(..)` destroys `raw_os_error()`, and that doing so was MEASURED
         // to turn `DiskFull` into `IoError`. Do not "improve" this line by adding
         // context to the error.
-        renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE)
-            .map_err(|e| FsError::from_io(std::io::Error::from(e)))
+        let published = renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE)
+            .map_err(|e| FsError::from_io(std::io::Error::from(e)));
+
+        // THE TWO UNIXES DISAGREE ABOUT A NAME PUBLISHED ONTO ITSELF, and only CI could
+        // find it: `rename_no_replace_refuses_the_source_itself` was the ONE test of 171
+        // that failed on macos-latest while Linux and Windows were green. Linux's
+        // `RENAME_NOREPLACE` answers EEXIST. Apple's `RENAME_EXCL` does not -- it keeps
+        // POSIX `rename`'s rule that old and new naming the SAME existing file is a
+        // success that does nothing. Hard links are unaffected: macOS refuses those, and
+        // that test passed there.
+        //
+        // The name is occupied, so `AlreadyExists` is the answer on every platform, and
+        // this is the same veto the Windows arm carries for the same reason.
+        //
+        // CHECKED AFTER THE CALL, deliberately, and this is the half worth keeping. It
+        // costs no extra syscall, and it CANNOT invert the error priority the way a
+        // pre-check would -- a mistake already made and fixed once on the Windows arm.
+        // A missing source still answers ENOENT from the kernel rather than from us,
+        // because the kernel ran first. Letting it run is free precisely because the
+        // operation it performs in this case is nothing: renaming a name onto itself
+        // destroys nothing, so there is no damage to undo by the time we look.
+        if published.is_ok() && from == to {
+            return Err(FsError::new(
+                flux_fs::Code::IoError,
+                std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+            ));
+        }
+        published
     }
 
     /// See the Unix twin for why this is atomic rather than check-then-act.
