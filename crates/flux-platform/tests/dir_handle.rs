@@ -334,6 +334,99 @@ mod posix {
         drop(root.create_new(OsStr::new("through")).unwrap());
         assert!(real.join("through").is_file(), "the write must land in the link's TARGET");
     }
+
+    #[test]
+    fn rename_replace_refuses_a_read_only_target() {
+        // The path version's rule, now for the handle (std_fs.rs,
+        // rename_replace_refuses_a_read_only_target). `renameat` checks the
+        // DIRECTORY's permission, not the file's, so without the guard a read-only
+        // destination is silently replaced.
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        drop(root.create_new(OsStr::new("from")).unwrap());
+        let to = d.path().join("to");
+        std::fs::write(&to, b"protected").unwrap();
+        let mut perms = std::fs::metadata(&to).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&to, perms).unwrap();
+
+        let err = root.rename_replace(OsStr::new("from"), &root, OsStr::new("to")).unwrap_err();
+
+        assert_eq!(err.code, flux_fs::Code::PermissionDenied);
+        assert!(err.source.raw_os_error().is_none(), "the guard must refuse, not the OS");
+        assert_eq!(std::fs::read(&to).unwrap(), b"protected", "the protected file must survive");
+        std::fs::remove_file(&to).expect("a read-only file must still be removable");
+    }
+
+    #[test]
+    fn rename_replace_allows_a_symlink_whose_target_is_read_only() {
+        // The guard judges the NAME being replaced; renameat replaces the link and
+        // never touches its target (std_fs.rs, the same-named test).
+        let d = TempDir::new().unwrap();
+        let target = d.path().join("target");
+        std::fs::write(&target, b"protected").unwrap();
+        let mut perms = std::fs::metadata(&target).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&target, perms).unwrap();
+        std::os::unix::fs::symlink(&target, d.path().join("link")).unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let mut w = root.create_new(OsStr::new("from")).unwrap();
+        std::io::Write::write_all(&mut w, b"new").unwrap();
+        drop(w);
+
+        root.rename_replace(OsStr::new("from"), &root, OsStr::new("link"))
+            .expect("replacing a symlink must not consult its target");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"protected", "the target must be untouched");
+        assert_eq!(std::fs::read(d.path().join("link")).unwrap(), b"new");
+        std::fs::remove_file(&target).expect("a read-only file must still be removable");
+    }
+
+    #[test]
+    fn rename_replace_refuses_a_target_this_user_cannot_write() {
+        // A root-owned 0644 file: the owner write bit is set, so a mode-bit check
+        // passes, yet this user cannot write it (std_fs.rs, the same-named test).
+        // Skips without passwordless sudo, exactly as that test does.
+        if !std::process::Command::new("sudo")
+            .args(["-n", "true"])
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            eprintln!("skipped: no passwordless sudo, cannot build a root-owned fixture");
+            return;
+        }
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        drop(root.create_new(OsStr::new("from")).unwrap());
+        let to = d.path().join("to");
+        let sh =
+            format!("echo protected > {t} && chmod 0644 {t} && chown 0:0 {t}", t = to.display());
+        assert!(
+            std::process::Command::new("sudo")
+                .args(["-n", "sh", "-c", &sh])
+                .status()
+                .unwrap()
+                .success(),
+            "fixture"
+        );
+
+        assert!(
+            root.rename_replace(OsStr::new("from"), &root, OsStr::new("to")).is_err(),
+            "a file we cannot write must be refused"
+        );
+        assert_eq!(
+            std::process::Command::new("sudo")
+                .args(["-n", "cat", &to.display().to_string()])
+                .output()
+                .unwrap()
+                .stdout,
+            b"protected\n",
+            "the protected file must survive"
+        );
+        let _ = std::process::Command::new("sudo")
+            .args(["-n", "rm", "-f", &to.display().to_string()])
+            .status();
+    }
 }
 
 #[cfg(windows)]

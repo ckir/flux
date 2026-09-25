@@ -1,7 +1,7 @@
 //! The POSIX `DirHandle`: `openat` with `O_NOFOLLOW | O_DIRECTORY` (§149.7).
 
 use flux_fs::{Code, DirHandle, FsError, Metadata, Result, check_component};
-use rustix::fs::{AtFlags, Mode, OFlags, openat, statat};
+use rustix::fs::{Access, AtFlags, Mode, OFlags, accessat, openat, statat};
 use std::ffi::OsStr;
 use std::os::fd::OwnedFd;
 
@@ -171,7 +171,40 @@ impl DirHandle for StdDir {
     fn rename_replace(&self, from: &OsStr, other: &Self, to: &OsStr) -> Result<()> {
         check_component(from)?;
         check_component(to)?;
+        // The TARGET lives in `other`. See `is_write_protected_at`.
+        if is_write_protected_at(&other.0, to) {
+            return Err(FsError::new(
+                Code::PermissionDenied,
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "destination is read-only",
+                ),
+            ));
+        }
         rustix::fs::renameat(&self.0, from, &other.0, to)
             .map_err(|e| FsError::from_io(std::io::Error::from(e)))
+    }
+}
+
+/// The handle-relative twin of `destination_is_write_protected` in `std_fs.rs`,
+/// asking the same question the same way, of a NAME inside `dir`.
+///
+/// `renameat` checks the DIRECTORY's write permission and never the target's, so
+/// without this it replaces a file the user marked read-only -- `cp -f` semantics
+/// where plain `cp` refuses. Same three rules as the path version, for the same
+/// measured reasons recorded there: a missing name protects nothing; a symlink is
+/// replaced and never followed, so its target's mode is irrelevant; and only
+/// EACCES / EPERM / EROFS from an EFFECTIVE-uid `accessat` mean "you may not write
+/// this" -- anything else (ETXTBSY for a running binary) is not a protection.
+fn is_write_protected_at(dir: &OwnedFd, name: &OsStr) -> bool {
+    use rustix::fs::FileType;
+    use rustix::io::Errno;
+    match statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Err(_) => false,
+        Ok(st) if FileType::from_raw_mode(st.st_mode) == FileType::Symlink => false,
+        Ok(_) => matches!(
+            accessat(dir, name, Access::WRITE_OK, AtFlags::EACCESS),
+            Err(Errno::ACCESS | Errno::PERM | Errno::ROFS)
+        ),
     }
 }
