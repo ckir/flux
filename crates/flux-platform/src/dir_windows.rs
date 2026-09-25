@@ -252,7 +252,14 @@ fn create_dir_at(p: &OwnedHandle, n: &OsStr) -> Result<OwnedHandle> {
 
     if status != 0 {
         let code = match status {
-            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => Code::DestinationError,
+            // Aligned with metadata_at, remove_file_at and rename_at, and with POSIX,
+            // which answers IoError/NotFound. Only open_dir keeps DestinationError, for
+            // the reason recorded there. This one is CONSISTENCY rather than an observed
+            // failure: the parent here is a HANDLE, not a path, so there is no
+            // intermediate element left to be missing and the arm is close to
+            // unreachable. It is aligned anyway, because the next reader should not have
+            // to work out which of five near-identical match arms was left behind.
+            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => Code::IoError,
             STATUS_ACCESS_DENIED => Code::PermissionDenied,
             _ => Code::IoError,
         };
@@ -326,7 +333,14 @@ fn create_new_at(p: &OwnedHandle, n: &OsStr) -> Result<crate::StdFile> {
 
     if status != 0 {
         let code = match status {
-            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => Code::DestinationError,
+            // Aligned with metadata_at, remove_file_at and rename_at, and with POSIX,
+            // which answers IoError/NotFound. Only open_dir keeps DestinationError, for
+            // the reason recorded there. This one is CONSISTENCY rather than an observed
+            // failure: the parent here is a HANDLE, not a path, so there is no
+            // intermediate element left to be missing and the arm is close to
+            // unreachable. It is aligned anyway, because the next reader should not have
+            // to work out which of five near-identical match arms was left behind.
+            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => Code::IoError,
             STATUS_ACCESS_DENIED => Code::PermissionDenied,
             _ => Code::IoError,
         };
@@ -658,7 +672,8 @@ pub(crate) fn reparse_tag_of(
 ) -> flux_fs::Result<Option<u32>> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Wdk::Storage::FileSystem::{
-        FileAttributeTagInformation, NtQueryInformationFile,
+        FILE_BASIC_INFORMATION, FileAttributeTagInformation, FileBasicInformation,
+        NtQueryInformationFile,
     };
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
@@ -682,16 +697,58 @@ pub(crate) fn reparse_tag_of(
             FileAttributeTagInformation,
         )
     };
-    if status != 0 {
-        return Err(flux_fs::FsError::new(
-            flux_fs::Code::IoError,
-            std::io::Error::other(format!("NtQueryInformationFile: 0x{:08X}", status as u32)),
-        ));
+    if status == 0 {
+        if info.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+            return Ok(None);
+        }
+        return Ok(Some(info.reparse_tag));
     }
-    if info.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+
+    // THE TAG QUERY DOES NOT ANSWER EVERYWHERE, and failing the call outright broke
+    // an entire class of volume. MEASURED on a real FAT32 volume: this returned
+    // NtQueryInformationFile 0xC000000D, and because `open_dir` asks for the tag on
+    // EVERY directory it opens, directory traversal on that volume failed completely.
+    //
+    // `may_remove` had already learned this and falls back to `FileBasicInformation`.
+    // Its sibling did not, which is exactly the shape -- a rule enforced on one side
+    // of a fork and not the other -- that this review has now produced three defects
+    // from.
+    //
+    // The fallback reports the reparse ATTRIBUTE without a tag, and the two cases it
+    // leaves are not symmetric:
+    //
+    //   bit CLEAR -> definitely not a reparse point, so `None` is the true answer and
+    //                FAT32 traversal works again. This is the case that was broken.
+    //   bit SET   -> there IS a reparse point and we cannot read its tag, so we
+    //                cannot tell a junction from a OneDrive placeholder. Refuse.
+    //                Answering `None` here would traverse a surrogate, which is the
+    //                one thing this cut exists to prevent -- the fail-open that round
+    //                three found in the removal guard, in a worse place.
+    //
+    // Both queries failing also refuses, for the same reason.
+    let mut basic: FILE_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let mut iosb2: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    // SAFETY: `basic` is a live, correctly sized FILE_BASIC_INFORMATION and the
+    // handle outlives the call.
+    let fallback = unsafe {
+        NtQueryInformationFile(
+            h.as_raw_handle() as _,
+            &raw mut iosb2,
+            (&raw mut basic).cast(),
+            size_of::<FILE_BASIC_INFORMATION>() as u32,
+            FileBasicInformation,
+        )
+    };
+    if fallback == 0 && basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
         return Ok(None);
     }
-    Ok(Some(info.reparse_tag))
+    Err(flux_fs::FsError::new(
+        flux_fs::Code::SafetyRejected,
+        std::io::Error::other(format!(
+            "cannot read a reparse tag to judge this name: NtQueryInformationFile: 0x{:08X}",
+            status as u32
+        )),
+    ))
 }
 
 /// May `remove_file` remove what this handle addresses?

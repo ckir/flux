@@ -767,4 +767,35 @@ mod windows_arm {
             "nothing beyond `host` may have been created"
         );
     }
+
+    #[test]
+    fn open_dir_works_on_a_volume_that_cannot_answer_a_tag_query() {
+        // MEASURED on a real FAT32 volume, where the tag query answers 0xC000000D:
+        // open_dir asks for a reparse tag on EVERY directory it opens, and failing
+        // that call outright meant directory traversal on the whole volume failed.
+        // The sibling guard may_remove had already learned to fall back to
+        // FileBasicInformation; this one had not.
+        //
+        // The fallback is deliberately asymmetric. A CLEAR reparse attribute proves
+        // there is no reparse point, so None is the true answer -- that is this test.
+        // A SET attribute with no readable tag cannot be judged and is REFUSED, since
+        // answering None there would traverse a surrogate. FAT32 has no reparse
+        // points at all, so only the first case arises on it.
+        //
+        // Set FLUX_FAT32_ROOT to a directory on such a volume to run this.
+        let Ok(base) = std::env::var("FLUX_FAT32_ROOT") else {
+            eprintln!("SKIPPED: set FLUX_FAT32_ROOT to a directory on a FAT32 volume");
+            return;
+        };
+        let dir = std::path::Path::new(&base).join("fluxtraverse");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("child")).unwrap();
+
+        let root = StdFileSystem.destination_root(&dir).unwrap();
+        let child = root.open_dir(OsStr::new("child")).unwrap();
+        drop(child.create_new(OsStr::new("inside")).unwrap());
+        assert!(dir.join("child/inside").is_file(), "the write must land through the handle");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
