@@ -1056,8 +1056,17 @@ impl DirHandle for StdDir {
 }
 ```
 
-**Six helpers are referenced and do not exist yet. All six live in `dir_windows.rs` itself**, as
-private module functions — NOT at the crate root, which `crate::` alone would mean and which
+**`reparse_tag_of` is given in full below and is the ONLY helper this task implements.** The other
+five -- `create_dir_at`, `create_new_at`, `metadata_at`, `remove_file_at`, `rename_at` -- are **Task
+4**, and leaving them as `unimplemented!()` stubs is the CORRECT state at the end of this task.
+
+**They were split out after a panel round, and the reason is worth carrying.** An earlier draft told
+the implementer to "extend the pattern" from `open_dir`. That does not work: `remove_file_at` and
+`rename_at` go through `NtSetInformationFile`, not `NtCreateFile`, and `FILE_RENAME_INFORMATION` is a
+VARIABLE-LENGTH struct with a trailing `FileName: [u16; 1]` that must be built in an oversized buffer.
+A different technique, not a variation on one.
+
+All six live in `dir_windows.rs` itself, as private module functions — NOT at the crate root, which `crate::` alone would mean and which
 `crates/flux-platform/src/lib.rs` re-exports only three names into. Their signatures are pinned here so
 the implementer is extending a pattern rather than inventing an interface:
 
@@ -1080,9 +1089,19 @@ the safety tests depend on — the other five can be stubbed with `unimplemented
 Step 6's five tests green, then filled in before Step 8's gate, which will not pass while a stub
 remains reachable from a compiled path.
 
-**This is the one place in this plan that asks you to extend a pattern rather than paste one.** If the
-pattern does not carry — if any of the five needs something `open_dir` does not show you — STOP and
-report `SCOPE: <which helper> needs <what>` rather than guessing at NT semantics.
+Stub the five for now, with these exact signatures:
+
+```rust
+fn create_dir_at(_p: &OwnedHandle, _n: &OsStr) -> Result<()> { unimplemented!("Task 4") }
+fn create_new_at(_p: &OwnedHandle, _n: &OsStr) -> Result<crate::StdFile> { unimplemented!("Task 4") }
+fn metadata_at(_p: &OwnedHandle, _n: &OsStr) -> Result<Metadata> { unimplemented!("Task 4") }
+fn remove_file_at(_p: &OwnedHandle, _n: &OsStr) -> Result<()> { unimplemented!("Task 4") }
+fn rename_at(_fd: &OwnedHandle, _f: &OsStr, _td: &OwnedHandle, _t: &OsStr, _r: bool) -> Result<()> { unimplemented!("Task 4") }
+```
+
+**`create_new` is exercised by Step 2's `a_created_file_lands_in_the_handles_directory`**, so either
+implement `create_new_at` here (it is the simplest of the five -- see Task 4 Step 4's table) or mark
+that one test `#[ignore]` and remove the attribute in Task 4. Either is fine; say which you did.
 
 ```rust
 /// Read a handle's reparse tag, or `None` when it is not a reparse point.
@@ -1234,7 +1253,248 @@ EOF
 
 ---
 
-### Task 4: The fake
+### Task 4: The Windows handle-relative helpers
+
+**Files:**
+- Modify: `crates/flux-platform/src/dir_windows.rs`, `crates/flux-platform/tests/dir_handle.rs`
+
+Split out of Task 3 after a panel round found "extend the pattern from `open_dir`" unexecutable. Two of
+these go through a **different NT call**, and one builds a **variable-length struct**.
+
+**Every symbol below was grep-verified in `windows-sys` 0.61.2**, in
+`src/Windows/Wdk/Storage/FileSystem/mod.rs`:
+
+| symbol | where |
+|---|---|
+| `NtSetInformationFile` | `:688`, links `ntdll.dll` |
+| `FileRenameInformation` | `:3216`, `FILE_INFORMATION_CLASS = 10i32` |
+| `FileDispositionInformation` | `:3157`, `= 13i32` |
+| `FileBasicInformation` | `:3149`, `= 4i32` |
+| `FILE_RENAME_INFORMATION` | `:2496` — `{ Anonymous, RootDirectory: HANDLE, FileNameLength: u32, FileName: [u16; 1] }` |
+| `FILE_DISPOSITION_INFORMATION` | `:1699` — `{ DeleteFile: bool }` |
+
+- [ ] **Step 1: Verify the state**
+
+```bash
+rg -c 'unimplemented!' crates/flux-platform/src/dir_windows.rs
+```
+
+Expected: **5**. If fewer, Task 3 did not land as written — STOP and report `STATE_MISMATCH`.
+
+- [ ] **Step 2: Write the failing tests**
+
+Add inside the existing `#[cfg(windows)] mod windows_arm` block in `crates/flux-platform/tests/dir_handle.rs`:
+
+```rust
+    #[test]
+    fn a_directory_is_created_and_reopened_through_the_handle() {
+        use std::io::Write;
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let child = root.create_dir(OsStr::new("made")).unwrap();
+        assert!(d.path().join("made").is_dir());
+        let mut w = child.create_new(OsStr::new("inside")).unwrap();
+        w.write_all(b"x").unwrap();
+        drop(w);
+        assert!(d.path().join("made/inside").exists(), "the returned handle must address the new directory");
+    }
+
+    #[test]
+    fn a_file_is_removed_through_the_handle() {
+        let d = TempDir::new().unwrap();
+        std::fs::write(d.path().join("doomed"), b"x").unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        root.remove_file(OsStr::new("doomed")).unwrap();
+        assert!(!d.path().join("doomed").exists());
+    }
+
+    #[test]
+    fn a_publish_across_two_handles_refuses_an_occupied_name() {
+        // The two-handle rename is what staging-then-publishing needs, and the
+        // no-replace form must still refuse an occupied target.
+        let d = TempDir::new().unwrap();
+        std::fs::create_dir(d.path().join("stage")).unwrap();
+        std::fs::write(d.path().join("stage/tmp"), b"payload").unwrap();
+        std::fs::write(d.path().join("taken"), b"old").unwrap();
+
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let stage = root.open_dir(OsStr::new("stage")).unwrap();
+
+        stage.rename_no_replace(OsStr::new("tmp"), &root, OsStr::new("taken")).unwrap_err();
+        assert_eq!(std::fs::read(d.path().join("taken")).unwrap(), b"old", "the occupied name must survive");
+
+        stage.rename_no_replace(OsStr::new("tmp"), &root, OsStr::new("fresh")).unwrap();
+        assert_eq!(std::fs::read(d.path().join("fresh")).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn metadata_through_the_handle_reads_the_child() {
+        let d = TempDir::new().unwrap();
+        std::fs::write(d.path().join("f"), b"1234").unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        assert_eq!(root.metadata(OsStr::new("f")).unwrap().len, 4);
+    }
+```
+
+- [ ] **Step 3: Run them to verify they fail**
+
+Run: `cargo nextest run -p flux-platform --no-fail-fast -E 'test(/windows_arm/)'`
+
+Expected: the four new tests PANIC with `not implemented: Task 4`. A panic, not a compile error — the
+stubs exist with the right signatures, which is what Task 3 left behind.
+
+- [ ] **Step 4: Implement the three `NtCreateFile`-shaped helpers**
+
+`create_dir_at`, `create_new_at` and `metadata_at` follow `open_dir`'s structure exactly — build the
+`UNICODE_STRING`, zero an `OBJECT_ATTRIBUTES`, set `RootDirectory` to the parent handle, call
+`NtCreateFile`. They differ only in disposition and options:
+
+| helper | CreateDisposition | CreateOptions | DesiredAccess |
+|---|---|---|---|
+| `create_dir_at` | `FILE_CREATE` | `FILE_DIRECTORY_FILE` | `FILE_LIST_DIRECTORY \| SYNCHRONIZE` |
+| `create_new_at` | `FILE_CREATE` | `FILE_NON_DIRECTORY_FILE \| FILE_SYNCHRONOUS_IO_NONALERT` | `FILE_GENERIC_WRITE \| SYNCHRONIZE` |
+| `metadata_at` | `FILE_OPEN` | `FILE_OPEN_REPARSE_POINT \| FILE_SYNCHRONOUS_IO_NONALERT` | `FILE_READ_ATTRIBUTES \| SYNCHRONIZE` |
+
+`ShareAccess` is `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` for all three, for the reason
+`open_dir` records: a `ShareAccess` of 0 locks the object against every other process.
+
+`metadata_at` then reads the handle with the same `NtQueryInformationFile` shape `reparse_tag_of` uses,
+passing `FileBasicInformation` (`= 4i32`), and builds a `Metadata`. `create_new_at` converts its raw
+handle with `OwnedHandle::from_raw_handle` and returns `crate::std_fs::std_file_from(File::from(h))`.
+
+**`create_dir_at` returns `Result<()>`; the caller re-opens.** `DirHandle::create_dir` already calls
+`self.open_dir(name)` afterwards, which is what runs the reparse-tag check on the thing just created.
+
+- [ ] **Step 5: Implement `remove_file_at` — a DIFFERENT NT call**
+
+Open the name with `DELETE | SYNCHRONIZE` and `FILE_OPEN_REPARSE_POINT`, so a link is removed rather
+than followed, then:
+
+```rust
+    let mut info = FILE_DISPOSITION_INFORMATION { DeleteFile: true };
+    let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a live FILE_DISPOSITION_INFORMATION of the size given, and
+    // the handle outlives the call.
+    let status = unsafe {
+        NtSetInformationFile(
+            h.as_raw_handle() as _,
+            &raw mut iosb,
+            (&raw mut info).cast(),
+            size_of::<FILE_DISPOSITION_INFORMATION>() as u32,
+            FileDispositionInformation,
+        )
+    };
+    if status != 0 {
+        return Err(FsError::new(
+            Code::IoError,
+            std::io::Error::other(format!("NtSetInformationFile: 0x{:08X}", status as u32)),
+        ));
+    }
+    drop(h);
+    Ok(())
+```
+
+The delete takes effect when the last handle closes, which is why `h` is dropped immediately after.
+
+- [ ] **Step 6: Implement `rename_at` — a VARIABLE-LENGTH struct**
+
+This is the one that cannot be extrapolated from anything above. `FILE_RENAME_INFORMATION` ends in
+`FileName: [u16; 1]` — a placeholder for a name of any length — so the struct is built inside a byte
+buffer larger than itself:
+
+```rust
+    let wide: Vec<u16> = to.encode_wide().collect();
+    let name_bytes = wide.len() * 2;
+    let total = size_of::<FILE_RENAME_INFORMATION>() + name_bytes;
+    let mut buf = vec![0u8; total];
+
+    // SAFETY: `buf` is at least size_of::<FILE_RENAME_INFORMATION>() bytes, and a
+    // Vec<u8> allocation is at least pointer-aligned, which is this struct's
+    // alignment (that of HANDLE). The name is written into the trailing space the
+    // [u16; 1] placeholder stands for.
+    unsafe {
+        let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+        (&raw mut (*info).Anonymous.ReplaceIfExists).write(replace);
+        (&raw mut (*info).RootDirectory).write(to_dir.as_raw_handle() as HANDLE);
+        (&raw mut (*info).FileNameLength).write(name_bytes as u32);
+        std::ptr::copy_nonoverlapping(
+            wide.as_ptr(),
+            (&raw mut (*info).FileName).cast::<u16>(),
+            wide.len(),
+        );
+    }
+```
+
+Then open `from` in `from_dir` with `DELETE | SYNCHRONIZE` and `FILE_OPEN_REPARSE_POINT`, and call
+`NtSetInformationFile` with `FileRenameInformation` (`= 10i32`) and `buf.len() as u32` as the length.
+
+**`RootDirectory` on the information struct is what makes this handle-relative on the DESTINATION
+side.** Without it the rename resolves `FileName` as a path, which is the resolution this whole cut
+removes — and it is the reason `rename_at` takes two handles rather than one.
+
+**The `Anonymous` union** carries `ReplaceIfExists` as a `bool` in one arm and `Flags` as a `u32` in the
+other. Use the `ReplaceIfExists` arm: the `Flags` arm belongs to `FileRenameInformationEx`, a different
+information class, and writing it here sets a bit pattern the kernel reads as a flag set.
+
+- [ ] **Step 7: Run the tests**
+
+Run: `cargo nextest run -p flux-platform --no-fail-fast -E 'test(/windows_arm/)'`
+
+Expected: PASS, and **`Starting 9 tests`** — five from Task 3, four here.
+
+- [ ] **Step 8: Prove the rename is really handle-relative**
+
+Change `rename_at` to write `std::ptr::null_mut()` into `RootDirectory` instead of `to_dir`'s handle.
+
+Run the same command.
+
+Expected: `a_publish_across_two_handles_refuses_an_occupied_name` FAILS. With a null `RootDirectory` the
+name is resolved as a path rather than relative to the destination handle, so the publish does not land
+where the test looks for it. Confirm THAT test went red, not merely that the suite returned non-zero.
+**Revert, and verify the revert by READING the file.**
+
+- [ ] **Step 9: Run the gate and cross-check**
+
+Run: `just check`
+Then: `wsl -e bash -lc 'cd /mnt/e/Rust/flux-handles && cargo nextest run --workspace --no-tests=pass'`
+
+Expected: both pass; Windows up 4. **No stub may remain:**
+
+```bash
+rg -n 'unimplemented!' crates/flux-platform/src/dir_windows.rs
+```
+
+Expected: **no matches**.
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add crates/flux-platform/src/dir_windows.rs crates/flux-platform/tests/dir_handle.rs
+git commit -m "$(cat <<'XEOF'
+feat(flux-platform): the Windows handle-relative helpers
+
+Split out of the handle task after a panel round found "extend the pattern from
+open_dir" unexecutable, and it was right. remove_file_at and rename_at go
+through NtSetInformationFile rather than NtCreateFile, and
+FILE_RENAME_INFORMATION is a VARIABLE-LENGTH struct whose trailing
+FileName: [u16; 1] is a placeholder, so it has to be built inside an oversized
+byte buffer. That is a different technique, not a variation on one, and an
+implementer told to extrapolate would have had to invent it.
+
+RootDirectory on the rename information struct is what makes the publish
+handle-relative on the DESTINATION side. Without it the name resolves as a path,
+which is the resolution this cut exists to remove -- and that is what the mutant
+proves: nulling it reds the two-handle publish test while everything else stays
+green.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+XEOF
+)"
+```
+
+---
+
+### Task 5: The fake
 
 **Files:**
 - Modify: `crates/flux-core/src/fault_fs.rs`
@@ -1359,7 +1619,7 @@ EOF
 
 ---
 
-### Task 5: Final verification
+### Task 6: Final verification
 
 **Files:** none modified.
 
@@ -1433,7 +1693,7 @@ Pushing and opening a pull request are outward actions. `just pr "title" body.md
 
 **Spec coverage.** §149.7's clauses each map to a task: handle-relative creation and opening → Tasks 2 and 3; `DEST` resolved once and following links → `destination_root` in both arms, with the omission of `NOFOLLOW` called out in code and commit; reparse point rejected as `SAFETY_REJECTED` → the symlink test (Task 2) and the junction test (Task 3); other errors to `DESTINATION_ERROR`/`PERMISSION_DENIED`/`IO_ERROR` → `classify` and the NTSTATUS match; single components → Task 1's `check_component`, asserted in all three implementors. The spec's fourth clause — *"symlinks this operation creates are leaves"* — has **no task, correctly**: nothing in this cut creates a symlink, so it is vacuous here and is recorded in the spec as an obligation on whichever cut adds them.
 
-**Placeholder scan.** One task step is deliberately not literal code: **Task 4 Step 4** describes the `FaultFs` field layout as the implementer's choice. That is not a placeholder dodge — `Inner`'s shape is not fixed by this plan and pasting a struct that does not match the tree would be worse than useless. The step pins the two things that ARE contractual (the handle holds an id, not a path; `check_component` runs first) and gives a `SHAPE_DIVERGENCE` trigger for the one way to get it wrong.
+**Placeholder scan.** One task step is deliberately not literal code: **Task 5 Step 4** describes the `FaultFs` field layout as the implementer's choice. That is not a placeholder dodge — `Inner`'s shape is not fixed by this plan and pasting a struct that does not match the tree would be worse than useless. The step pins the two things that ARE contractual (the handle holds an id, not a path; `check_component` runs first) and gives a `SHAPE_DIVERGENCE` trigger for the one way to get it wrong.
 
 **Type consistency.** `StdDir` is the handle type in both platform files, so `impl DestinationRoot for StdFileSystem` names `crate::StdDir` under either cfg. `type Writer = crate::StdFile` matches the `DestinationRoot: FileSystem` bound because `StdFileSystem::Writer` is `StdFile`, verified at `crates/flux-platform/src/std_fs.rs:174`. `check_component` is exported from `flux_fs` at the crate root in Task 1 Step 8 and imported unqualified everywhere after.
 
@@ -1441,7 +1701,7 @@ Pushing and opening a pull request are outward actions. `just pr "title" body.md
 
 **Known gaps, stated rather than hidden.**
 
-1. **Task 3 leaves five helpers unimplemented in its code block** — `create_dir_at`, `create_new_at`, `metadata_at`, `remove_file_at`, `rename_at`. Each is the same `RootDirectory` pattern as `open_dir`, and the plan implements `reparse_tag_of` in full because the safety tests depend only on it. This is the one place the plan asks the implementer to extend a pattern rather than paste one. If that proves too thin in execution, it should become its own task rather than being guessed at.
+1. ~~**Task 3 leaves five helpers unimplemented**, each the same `RootDirectory` pattern as `open_dir`; if that proves too thin it should become its own task.~~ **It was too thin, and it is now Task 4.** A panel round established that the premise was false rather than optimistic: `remove_file_at` and `rename_at` do not use `NtCreateFile` at all, and `FILE_RENAME_INFORMATION`'s trailing `FileName: [u16; 1]` requires building the struct inside an oversized buffer — a technique nothing in Task 3 demonstrates. The gap is closed rather than carried: Task 4 gives every NT symbol with its verified line, a disposition/options/access table for the three `NtCreateFile`-shaped helpers, the full body for both `NtSetInformationFile` ones, and a mutant that nulls `RootDirectory` to prove the rename is genuinely handle-relative. **The lesson worth keeping is that "extend the pattern" is a placeholder wearing a technique's clothes** — it passes a placeholder scan because it names no TBD, and it is exactly as unexecutable.
 2. **The over-rejection case has no test on this machine.** Mutant A in Task 3 demonstrates why: widening the surrogate check leaves every test green, because no OneDrive-style placeholder exists in a `TempDir`. The measured tags live in a source comment instead. A machine with a cloud-sync root could add the test; this one cannot.
 3. **Nested junction traversal is unmeasured.** Only a single junction directly under the parent was probed. Each component is opened one at a time so the design does not depend on it, but it is untested ground.
 4. **No engine consumes any of this yet**, by construction. Cut 4 is where the first caller appears, and it is where `copy_file`'s signature question gets answered.
