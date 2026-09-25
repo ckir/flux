@@ -88,3 +88,65 @@ mutants:
 # Clean build artifacts
 clean:
     cargo clean
+
+# --- Outward actions -------------------------------------------------------
+# These PUSH and OPEN PULL REQUESTS. Each gates itself first, so the checks a
+# maintainer would otherwise have to remember are the ones they cannot skip.
+
+# Push the current branch, refusing everything that should not be pushed
+push:
+    #!/usr/bin/env sh
+    set -eu
+    branch=$(git rev-parse --abbrev-ref HEAD)
+    if [ "$branch" = "main" ] || [ "$branch" = "HEAD" ]; then
+        echo "refusing: on '$branch'. Make a branch first." >&2
+        exit 1
+    fi
+    if [ -n "$(git status --porcelain)" ]; then
+        echo "refusing: the working tree is dirty. Commit or stash first." >&2
+        git status --short >&2
+        exit 1
+    fi
+    if [ -z "$(git log origin/main..HEAD --oneline)" ]; then
+        echo "refusing: '$branch' has no commits origin/main does not have." >&2
+        exit 1
+    fi
+    # NOT hypothetical: `git worktree add -b <branch> <path> origin/main` leaves
+    # the NEW branch tracking origin/main, so a bare `git push` from a fresh
+    # worktree pushes to MAIN. That has happened twice. This recipe always
+    # pushes with `-u origin <branch>`, which cannot hit that case and repoints
+    # the branch on the way past -- but it still says so, because a branch that
+    # tracks origin/main will bite any OTHER bare push too.
+    if [ "$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)" = "origin/main" ]; then
+        echo "note: '$branch' tracks origin/main, which 'git worktree add -b' does by"
+        echo "      default. Pushing with -u repoints it. A BARE 'git push' here would"
+        echo "      have pushed to MAIN."
+    fi
+    just check
+    git push -u origin "$branch"
+
+# Push as above, then open the PR: just pr "title" [body.md]
+pr title body="":
+    #!/usr/bin/env sh
+    set -eu
+    # The body is a FILE on purpose. A PR body is the argument for the change and
+    # is worth writing; one generated from commit subjects produces something
+    # nobody reads. Omitting it opens the browser on the compose page, which is
+    # the right default for a human and the wrong one for a script.
+    #
+    # VALIDATED BEFORE THE PUSH, and it was not at first: checking after meant a
+    # mistyped path left the branch pushed with no PR, which is the worst state
+    # this recipe can end in. On Windows, pass a relative or a C:/-style path --
+    # MSYS rewrites a leading-slash path, so '/tmp/b.md' arrives as
+    # 'C:/Program Files/Git/tmp/b.md'.
+    if [ -n "{{body}}" ] && [ ! -f "{{body}}" ]; then
+        echo "refusing: body file '{{body}}' does not exist." >&2
+        exit 1
+    fi
+    just push
+    branch=$(git rev-parse --abbrev-ref HEAD)
+    if [ -n "{{body}}" ]; then
+        gh pr create --base main --head "$branch" --title "{{title}}" --body-file "{{body}}"
+    else
+        gh pr create --base main --head "$branch" --title "{{title}}" --web
+    fi
