@@ -129,9 +129,45 @@ fn check_component_bytes(name: &OsStr) -> Result<()> {
 
 #[cfg(not(unix))]
 fn check_component_bytes(name: &OsStr) -> Result<()> {
-    // Windows `OsStr` is WTF-16; an unpaired surrogate is the only way to reach
-    // here, and such a name carries no separator by construction.
-    let _ = name;
+    // THIS USED TO RETURN Ok UNCONDITIONALLY, under a comment asserting that an
+    // unpaired surrogate is the only way to reach here and that "such a name carries
+    // no separator by construction". The first half is true and the second does not
+    // follow: an unpaired surrogate can sit in a name beside any other character.
+    //
+    // MEASURED: a name of "host", one lone high surrogate, and ":stream" has
+    // `to_str() == None`, so it never enters the UTF-8 path above where the separator
+    // and stream-separator checks live -- and `create_new` ACCEPTED it and wrote an
+    // object the caller had not named. Every rule this function exists to enforce was
+    // one unpaired surrogate away from being skipped.
+    //
+    // The same rules are therefore applied to the code units directly. Scanning UTF-16
+    // units rather than `char`s is exactly right here: every character being rejected
+    // is ASCII, so it is its own single unit, and no surrogate can be mistaken for one.
+    use std::os::windows::ffi::OsStrExt;
+
+    let refuse = |why: &str| {
+        Err(FsError::new(
+            Code::SafetyRejected,
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, why.to_string()),
+        ))
+    };
+
+    let mut empty = true;
+    for unit in name.encode_wide() {
+        empty = false;
+        match unit {
+            // '/' and '\\'
+            0x2F | 0x5C => return refuse("a path component may not contain a separator"),
+            // ':' -- see `check_no_stream_separator` for why this is Windows-only.
+            0x3A => return refuse("a path component may not contain a stream separator"),
+            _ => {}
+        }
+    }
+    if empty {
+        return refuse("an empty name is not a path component");
+    }
+    // `.` and `..` need no check here: both are valid UTF-8, so a name equal to
+    // either one took the branch above rather than this one.
     Ok(())
 }
 

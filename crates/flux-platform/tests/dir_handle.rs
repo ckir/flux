@@ -703,4 +703,46 @@ mod windows_arm {
         };
         assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
     }
+
+    #[test]
+    fn an_unpaired_surrogate_does_not_smuggle_a_separator_past_validation() {
+        // Every rule check_component enforces was one unpaired surrogate away from
+        // being skipped. A Windows OsStr is WTF-16, so a name carrying a lone
+        // surrogate has to_str() == None and took a branch that returned Ok
+        // unconditionally -- under a comment asserting such a name "carries no
+        // separator by construction", which does not follow, because a surrogate can
+        // sit beside any other character.
+        //
+        // MEASURED before the fix: "host" + U+D800 + ":stream" was ACCEPTED and
+        // create_new wrote an object the caller had not named. The backslash form was
+        // refused only by the kernel, and only by accident.
+        use std::os::windows::ffi::OsStringExt;
+
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        drop(root.create_new(OsStr::new("host")).unwrap());
+
+        let build = |tail: &str| {
+            let mut w: Vec<u16> = "host".encode_utf16().collect();
+            w.push(0xD800);
+            w.extend(tail.encode_utf16());
+            std::ffi::OsString::from_wide(&w)
+        };
+
+        for tail in [":stream", r"\..\escape", "/escape"] {
+            let name = build(tail);
+            assert!(name.to_str().is_none(), "the name must take the non-UTF-8 branch");
+            let err = match root.create_new(&name) {
+                Err(e) => e,
+                Ok(_) => panic!("a surrogate must not smuggle {tail:?} past validation"),
+            };
+            assert_eq!(err.code, flux_fs::Code::SafetyRejected);
+        }
+
+        assert_eq!(
+            std::fs::read_dir(d.path()).unwrap().count(),
+            1,
+            "nothing beyond `host` may have been created"
+        );
+    }
 }
