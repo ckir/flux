@@ -724,10 +724,19 @@ impl DestinationRoot for FaultFs {
     fn destination_root(&self, path: &Path) -> Result<Self::Dir> {
         let mut g = self.inner.lock().unwrap();
         if !g.directories.contains(path) {
-            return Err(FsError::new(
-                Code::DestinationError,
-                std::io::Error::from(std::io::ErrorKind::NotFound),
-            ));
+            // A path that EXISTS but is not a directory is refused as
+            // NotADirectory, not NotFound. MEASURED before this: the fake said
+            // NotFound for both, while both real arms distinguish them -- and the
+            // distinction is the whole point of the trait's requirement, since a
+            // caller that passed a file needs to be told that rather than being
+            // told its destination is missing.
+            let exists = g.files.contains_key(path);
+            let kind = if exists {
+                std::io::ErrorKind::NotADirectory
+            } else {
+                std::io::ErrorKind::NotFound
+            };
+            return Err(FsError::new(Code::IoError, std::io::Error::from(kind)));
         }
         let id = dir_node_for_path(&mut g, path);
         drop(g);
@@ -833,6 +842,26 @@ impl DirHandle for FakeDirHandle {
     fn remove_file(&self, name: &OsStr) -> Result<()> {
         check_component(name)?;
         let child_path = self.my_path().join(name);
+        // REFUSE A DIRECTORY, with the kind both real arms use. MEASURED before
+        // this: the fake answered NotFound here -- it refused, but only because it
+        // found no FILE at the name, never because the object was a directory.
+        // Both real arms answer IsADirectory. A fake that refuses for a different
+        // reason than reality teaches the engine the wrong branch, which is the
+        // same trap as the no-replace kind recorded a few tests below.
+        {
+            let g = self.inner.lock().unwrap();
+            let is_dir = g.directories.contains(&child_path)
+                && g.types.get(&child_path) != Some(&FileType::Symlink);
+            if is_dir {
+                return Err(FsError::new(
+                    Code::IoError,
+                    std::io::Error::new(
+                        std::io::ErrorKind::IsADirectory,
+                        "remove_file refuses a directory",
+                    ),
+                ));
+            }
+        }
         self.fs().remove_file(&child_path)
     }
 
@@ -1206,5 +1235,48 @@ mod tests {
         let root = fs.destination_root(Path::new("/dst")).unwrap();
         let err = root.open_dir(OsStr::new("a/b")).unwrap_err();
         assert_eq!(err.code, Code::SafetyRejected);
+    }
+
+    #[test]
+    fn the_fake_refuses_what_the_real_arms_refuse_and_says_the_same_thing() {
+        // A fake is only useful if it is wrong in the same places reality is. These
+        // three were MEASURED to diverge: the fake refused all of them, but for
+        // different reasons and with different kinds than the POSIX and Windows
+        // arms, so an engine written against it would learn the wrong branch and
+        // meet the real kind in production. The trait now states each of these as a
+        // requirement; this is what holds the fake to it.
+        use flux_fs::{DestinationRoot, DirHandle};
+        use std::ffi::OsStr;
+
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.create_dir(Path::new("/dst/adir")).unwrap();
+        fs.write_file("/dst/afile", b"x");
+        let root = fs.destination_root(Path::new("/dst")).unwrap();
+
+        // remove_file must refuse a DIRECTORY as IsADirectory, not NotFound.
+        let err = root.remove_file(OsStr::new("adir")).unwrap_err();
+        assert_eq!(err.source.kind(), std::io::ErrorKind::IsADirectory);
+        assert!(fs.exists("/dst/adir"), "the directory must survive the refusal");
+
+        // create_dir must refuse an occupied name as AlreadyExists.
+        let err = match root.create_dir(OsStr::new("adir")) {
+            Err(e) => e,
+            Ok(_) => panic!("create_dir must refuse an occupied name"),
+        };
+        assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
+
+        // A FILE as the destination root is NotADirectory; a MISSING one is
+        // NotFound. The fake used to answer NotFound to both.
+        let err = match fs.destination_root(Path::new("/dst/afile")) {
+            Err(e) => e,
+            Ok(_) => panic!("a file must not be accepted as a destination root"),
+        };
+        assert_eq!(err.source.kind(), std::io::ErrorKind::NotADirectory);
+        let err = match fs.destination_root(Path::new("/dst/nosuch")) {
+            Err(e) => e,
+            Ok(_) => panic!("a missing root must be refused"),
+        };
+        assert_eq!(err.source.kind(), std::io::ErrorKind::NotFound);
     }
 }
