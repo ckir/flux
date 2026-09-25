@@ -596,6 +596,25 @@ impl flux_fs::DestinationRoot for StdFileSystem {
     }
 }
 
+/// See the Unix twin: DEST itself is resolved by path and DOES follow links,
+/// because §149.7 exempts it. Everything below goes through a handle.
+#[cfg(windows)]
+impl flux_fs::DestinationRoot for StdFileSystem {
+    type Dir = crate::StdDir;
+
+    fn destination_root(&self, path: &Path) -> Result<Self::Dir> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+        let f = OpenOptions::new()
+            .access_mode(0x80 | 0x1 | 0x0010_0000)
+            .share_mode(7)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .map_err(FsError::from_io)?;
+        Ok(crate::StdDir::from_handle(f.into()))
+    }
+}
+
 #[cfg(unix)]
 fn perms_of(m: &std::fs::Metadata) -> Perms {
     use std::os::unix::fs::PermissionsExt;
