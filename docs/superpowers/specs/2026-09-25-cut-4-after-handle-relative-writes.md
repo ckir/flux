@@ -37,7 +37,8 @@ with `destination_root` (the one path-based call on the write side, which §149.
 is refused as `DESTINATION_ERROR` before any call; a bare file name's empty parent becomes `.`.
 `copy_file` now requires `F: DestinationRoot`; its only callers are the `FaultFs` tests and the CLI's
 `StdFileSystem`, both of which implement it. A leftover temporary is reported relative to the parent by
-`copy_file_at` and joined onto the parent path by `copy_file`, so the reported path is unchanged.
+`copy_file_at` and rebuilt from the user's `dst` by `copy_file` (`dst.with_file_name(temp)`), so the
+reported path is unchanged.
 
 **Consequence found while planning, and it is not optional:** the handle `rename_replace` on POSIX is a
 bare `renameat` (`crates/flux-platform/src/dir_unix.rs`), without the read-only guard the path version

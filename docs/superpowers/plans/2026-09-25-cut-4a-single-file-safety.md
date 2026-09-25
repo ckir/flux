@@ -655,8 +655,11 @@ pub fn copy_file<F: DestinationRoot>(
     // destination itself: it may follow links, because the user named it.
     let parent = fs.destination_root(parent_path).map_err(CopyError::new)?;
     copy_file_at(fs, src, &parent, name, opts).map_err(|mut e| {
+        // Rebuilt from `dst`, NOT joined onto `parent_path`: for a bare name the
+        // opened parent is a synthesized `.`, and joining would report
+        // `./b.flux-partial.x` where the user's own spelling gives `b.flux-partial.x`.
         if let Some((path, _)) = e.leftover.as_mut() {
-            *path = parent_path.join(&*path);
+            *path = dst.with_file_name(&*path);
         }
         e
     })
