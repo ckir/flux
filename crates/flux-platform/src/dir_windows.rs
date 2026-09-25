@@ -693,7 +693,14 @@ fn surrogate_tag_at(parent: &OwnedHandle, name: &OsStr) -> Option<u32> {
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AttrQuery {
-    /// `FileAttributeTagInformation` answered: attributes AND a tag.
+    /// `FileAttributeTagInformation` answered AND the reparse attribute is SET, so
+    /// `tag` is meaningful.
+    ///
+    /// Build this ONLY with the bit set. The NT ABI says the tag member is to be
+    /// ignored when the attribute is clear, so a `Tagged` carrying a tag nobody may
+    /// read would be a lie the judges below have no way to detect. Constructing
+    /// `Untagged` in that case keeps the type honest and means neither judge has to
+    /// re-check the bit before trusting the tag.
     Tagged { attributes: u32, tag: u32 },
     /// Only `FileBasicInformation` answered: attributes, no tag. A volume that
     /// cannot report tags at all reaches this.
@@ -776,6 +783,7 @@ pub(crate) fn reparse_tag_of(
         FILE_BASIC_INFORMATION, FileAttributeTagInformation, FileBasicInformation,
         NtQueryInformationFile,
     };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     #[repr(C)]
@@ -798,9 +806,11 @@ pub(crate) fn reparse_tag_of(
         )
     };
     if status == 0 {
-        return judge_reparse(AttrQuery::Tagged {
-            attributes: info.file_attributes,
-            tag: info.reparse_tag,
+        // The bit decides which variant this is: see `AttrQuery::Tagged`.
+        return judge_reparse(if info.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            AttrQuery::Tagged { attributes: info.file_attributes, tag: info.reparse_tag }
+        } else {
+            AttrQuery::Untagged { attributes: info.file_attributes }
         });
     }
 
@@ -831,6 +841,21 @@ pub(crate) fn reparse_tag_of(
         AttrQuery::Untagged { attributes: basic.FileAttributes }
     } else {
         AttrQuery::Unanswered
+    })
+    .map_err(|e| {
+        // Put the STATUS back on the message. `judge_reparse` is pure and knows
+        // nothing about NTSTATUS, which is what makes its branches testable -- but
+        // the hex is how this failure gets diagnosed at all. 0xC000000D on a FAT32
+        // volume is what identified the traversal break this fallback exists for, and
+        // an extraction that quietly dropped it would have made the next one harder
+        // to find than the last.
+        flux_fs::FsError::new(
+            e.code,
+            std::io::Error::other(format!(
+                "cannot read a reparse tag to judge this name: NtQueryInformationFile:                  tag query 0x{:08X}, attribute query 0x{:08X}",
+                status as u32, fallback as u32
+            )),
+        )
     })
 }
 
@@ -866,6 +891,7 @@ fn may_remove(h: &std::os::windows::io::OwnedHandle) -> bool {
         FILE_BASIC_INFORMATION, FileAttributeTagInformation, FileBasicInformation,
         NtQueryInformationFile,
     };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     #[repr(C)]
@@ -888,9 +914,11 @@ fn may_remove(h: &std::os::windows::io::OwnedHandle) -> bool {
         )
     };
     if status == 0 {
-        return judge_removable(AttrQuery::Tagged {
-            attributes: tag_info.file_attributes,
-            tag: tag_info.reparse_tag,
+        // The bit decides which variant this is: see `AttrQuery::Tagged`.
+        return judge_removable(if tag_info.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            AttrQuery::Tagged { attributes: tag_info.file_attributes, tag: tag_info.reparse_tag }
+        } else {
+            AttrQuery::Untagged { attributes: tag_info.file_attributes }
         });
     }
 
@@ -995,5 +1023,37 @@ mod judge_tests {
         // Anything that is not a directory is removable.
         assert!(judge_removable(AttrQuery::Tagged { attributes: FILE_ATTRIBUTE_NORMAL, tag: 0 }));
         assert!(judge_removable(AttrQuery::Untagged { attributes: FILE_ATTRIBUTE_NORMAL }));
+
+        // THE FAT32 CASE THAT MOTIVATED THE FALLBACK, and it was the one row of
+        // this table with no unit test: a plain directory on a volume that cannot
+        // report tags. The integration test covers it against a real volume, but
+        // only when FLUX_FAT32_ROOT is set, so without this the row is unguarded
+        // on every machine that lacks one.
+        assert!(!judge_removable(AttrQuery::Untagged { attributes: FILE_ATTRIBUTE_DIRECTORY }));
+    }
+
+    #[test]
+    fn a_tag_is_never_consulted_when_the_reparse_attribute_is_clear() {
+        // The NT ABI says the tag member is to be IGNORED when the attribute is
+        // clear, and the wrappers keep that promise by building `Untagged` in that
+        // case rather than a `Tagged` carrying a value nobody may read.
+        //
+        // A review argued this could delete a plain directory, on the theory that
+        // the kernel might copy uninitialised pool memory into the tag and that the
+        // garbage might match the surrogate mask. That mechanism does not hold
+        // here: both wrappers zero-initialise the struct before the call, so an
+        // unwritten tag reads 0 and `is_name_surrogate(0)` is false, which refuses.
+        // The STRUCTURAL point stands on its own though -- consulting a field the
+        // ABI says to ignore is relying on unspecified behaviour, whatever today's
+        // kernel happens to write -- so the variant now encodes the bit and this
+        // pins it with a tag that WOULD be a surrogate if it were ever read.
+        let hostile = AttrQuery::Untagged { attributes: FILE_ATTRIBUTE_DIRECTORY };
+        assert!(!judge_removable(hostile), "a directory with no readable tag is not removable");
+        assert_eq!(judge_reparse(hostile).unwrap(), None, "no reparse bit means nothing to judge");
+
+        // And the surrogate mask really is what would have been consulted.
+        assert!(is_name_surrogate(JUNCTION));
+        assert!(!is_name_surrogate(0));
+        assert!(!is_name_surrogate(ONEDRIVE));
     }
 }
