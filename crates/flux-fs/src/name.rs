@@ -60,7 +60,15 @@ pub fn check_component(name: &OsStr) -> Result<()> {
 
     let Some(s) = name.to_str() else {
         // A non-UTF-8 name is fine as a NAME; it just cannot be scanned as `str`.
-        // Fall back to the byte view, which is enough to find separators.
+        //
+        // THE OTHER SIDE OF THIS FORK MUST ENFORCE THE SAME RULES, and for a while it
+        // enforced none: it returned Ok unconditionally under a comment claiming a
+        // name reaching it could not carry a separator. It could, and a lone
+        // surrogate was enough to skip every check below. This comment used to say the
+        // fallback was "enough to find separators", which understated what it owes --
+        // the sort of understatement that let that hole survive review. It owes
+        // everything below except `.` and `..`, which are valid UTF-8 and so can only
+        // arrive on the other branch.
         return check_component_bytes(name);
     };
 
@@ -72,6 +80,20 @@ pub fn check_component(name: &OsStr) -> Result<()> {
     }
     if s.contains('/') || s.contains('\\') {
         return refuse("a path component may not contain a separator");
+    }
+    // An interior NUL is not part of a name on either platform, and refusing it here
+    // is defence in depth rather than a fix for an observed hole. MEASURED: both arms
+    // already refuse it -- POSIX with InvalidInput from rustix, Windows with a kernel
+    // error -- because a UNICODE_STRING is length-counted and so does not truncate at
+    // a NUL the way the NUL-TERMINATED path API does. The path-based arm was not so
+    // lucky: a `to` of "pub\0lish" was measured to publish at "pub" and return Ok.
+    //
+    // Two kernels happening to agree is a weaker guarantee than this function
+    // stating the rule, and it left the two arms answering different ErrorKinds for
+    // the same rejected name. Refusing at the choke point makes the answer one
+    // answer, and makes it before any syscall.
+    if s.contains('\0') {
+        return refuse("a path component may not contain an interior NUL");
     }
     check_no_stream_separator(s)
 }
@@ -160,6 +182,9 @@ fn check_component_bytes(name: &OsStr) -> Result<()> {
             0x2F | 0x5C => return refuse("a path component may not contain a separator"),
             // ':' -- see `check_no_stream_separator` for why this is Windows-only.
             0x3A => return refuse("a path component may not contain a stream separator"),
+            // NUL -- see the UTF-8 path for why this is stated rather than left to
+            // the kernel.
+            0x00 => return refuse("a path component may not contain an interior NUL"),
             _ => {}
         }
     }
@@ -175,6 +200,20 @@ fn check_component_bytes(name: &OsStr) -> Result<()> {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    #[test]
+    fn an_interior_nul_is_refused_on_every_platform() {
+        // Defence in depth, stated rather than delegated. MEASURED before this: both
+        // arms already refused such a name, POSIX with InvalidInput from rustix and
+        // Windows with a kernel error, because a UNICODE_STRING is length-counted and
+        // does not truncate at a NUL the way the NUL-terminated path API does -- the
+        // path-based arm WAS truncated by one, publishing "pub\0lish" at "pub" and
+        // returning Ok. Two kernels agreeing is weaker than this function saying so,
+        // and it left the arms answering different kinds for the same rejected name.
+        let err = check_component(OsStr::new("pub\0lish")).unwrap_err();
+        assert_eq!(err.code, Code::SafetyRejected);
+        assert!(check_component(OsStr::new("publish")).is_ok());
+    }
 
     #[test]
     fn a_component_too_long_for_a_unicode_string_is_refused() {

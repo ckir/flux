@@ -240,6 +240,28 @@ mod posix {
         };
         assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
     }
+
+    #[test]
+    fn create_new_refuses_a_name_a_symlink_already_holds() {
+        // The POSIX twin of the Windows FILE_OPEN_REPARSE_POINT case. This arm passes
+        // O_CREAT | O_EXCL and NOT O_NOFOLLOW, relying on POSIX's rule that O_EXCL
+        // makes open() fail with EEXIST when the final component is a symlink,
+        // whatever it points at. That is a spec guarantee this cut leans on, so it is
+        // measured rather than assumed -- with a DANGLING link, which is the case
+        // where following would actually create something outside the tree.
+        let d = TempDir::new().unwrap();
+        let outside = d.path().join("outside");
+        std::os::unix::fs::symlink(&outside, d.path().join("bait")).unwrap();
+        assert!(!outside.exists(), "the link must dangle for this to mean anything");
+
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let err = match root.create_new(OsStr::new("bait")) {
+            Err(e) => e,
+            Ok(_) => panic!("a name a symlink holds is taken"),
+        };
+        assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(!outside.exists(), "nothing may have been created at the link's TARGET");
+    }
 }
 
 #[cfg(windows)]
