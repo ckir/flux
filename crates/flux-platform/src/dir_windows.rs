@@ -314,7 +314,11 @@ fn create_new_at(p: &OwnedHandle, n: &OsStr) -> Result<crate::StdFile> {
     let status = unsafe {
         NtCreateFile(
             &raw mut h,
-            FILE_GENERIC_WRITE | SYNCHRONIZE,
+            // FILE_READ_ATTRIBUTES because set_permissions reads the handle's
+            // attributes before changing the read-only bit; FILE_GENERIC_WRITE alone
+            // made that fail with ACCESS_DENIED (MEASURED, cut 4a Task 5). Not
+            // FILE_GENERIC_READ: nothing reads the data back.
+            FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
             &raw const oa,
             &raw mut iosb,
             std::ptr::null(),

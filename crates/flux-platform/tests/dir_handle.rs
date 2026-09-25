@@ -1120,4 +1120,27 @@ mod windows_arm {
         assert!(refused, "a destination we may not write must be refused");
         assert_eq!(content, b"protected", "the protected contents must survive");
     }
+
+    #[test]
+    fn a_created_file_accepts_the_metadata_a_copy_applies() {
+        // copy_file_at applies times and the read-only bit through the writer that
+        // create_new returned. MEASURED: a FILE_GENERIC_WRITE-only handle could not
+        // read its own attributes, so set_permissions failed with ACCESS_DENIED.
+        use flux_fs::{FileSystem, Perms};
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let w = root.create_new(OsStr::new("f")).unwrap();
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+
+        StdFileSystem.set_times(&w, Some(when)).expect("times through the handle");
+        StdFileSystem
+            .set_permissions(&w, Some(Perms::ReadOnly(true)))
+            .expect("the read-only bit through the handle");
+        drop(w);
+
+        let m = std::fs::metadata(d.path().join("f")).unwrap();
+        assert!(m.permissions().readonly());
+        assert_eq!(m.modified().unwrap(), when);
+        std::fs::remove_file(d.path().join("f")).expect("a read-only file must still be removable");
+    }
 }
