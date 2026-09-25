@@ -4,8 +4,12 @@
 //! after a strict failure — so this records the call sequence and can fail any
 //! named call. None of that is reachable against a real disk.
 
-use flux_fs::{Code, DirEntry, FileHandle, FileSystem, FileType, FsError, Metadata, Perms, Result};
+use flux_fs::{
+    Code, DestinationRoot, DirEntry, DirHandle, FileHandle, FileSystem, FileType, FsError,
+    Metadata, Perms, Result, check_component,
+};
 use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -71,6 +75,49 @@ struct Inner {
     /// Pre-incremented, so the first object is 1 and nothing ever gets 0 - §107
     /// forbids treating a zero id as a valid identity.
     next_object: u128,
+    /// The `DirHandle` node graph: id -> node, kept SEPARATE from the path-keyed
+    /// maps above. A `DirHandle` reaches a child through the id it already holds --
+    /// never by re-walking a path -- which is what lets `repoint_for_test` stage
+    /// item 114's attack: rebinding a NAME in some node's `children` does not move
+    /// the id a handle minted from that name earlier.
+    dir_nodes: HashMap<u64, DirNode>,
+    /// path -> node id, consulted ONLY when a path is resolved by name from
+    /// scratch: `destination_root`'s argument, and `repoint_for_test`'s two path
+    /// arguments. No `DirHandle` method consults this map.
+    dir_node_by_path: HashMap<PathBuf, u64>,
+    next_dir_node: u64,
+}
+
+/// One node in the `DirHandle` graph, addressed by an opaque id rather than by
+/// path. `path` is a snapshot taken ONCE, when the node is minted, and used only to
+/// reach the legacy path-keyed maps above (`files`/`directories`/`types`) -- every
+/// `DirHandle` method reaches a node through its id and this snapshot, never by
+/// re-walking a name. `children` is the one place a name binding lives, and the one
+/// place `repoint_for_test` is allowed to write: rewriting an entry there changes
+/// what OPENING that name gets from now on, without moving the snapshot any handle
+/// that already resolved it is holding.
+struct DirNode {
+    path: PathBuf,
+    children: HashMap<OsString, u64>,
+}
+
+/// Get or mint the node for `path`, memoized by path so the same path always yields
+/// the same id. This is the only place a path is turned into a node id from
+/// scratch -- used by `destination_root` (which resolves its argument by name once,
+/// per the trait's own contract) and by `repoint_for_test` (which needs the id of
+/// both the name it is rewriting and the id it is rewriting that name onto). No
+/// `DirHandle` method calls this: a handle already has its id, and reaches a child
+/// through its own node's `children` map, never by feeding a path back through this
+/// cache.
+fn dir_node_for_path(g: &mut Inner, path: &Path) -> u64 {
+    if let Some(&id) = g.dir_node_by_path.get(path) {
+        return id;
+    }
+    g.next_dir_node += 1;
+    let id = g.next_dir_node;
+    g.dir_nodes.insert(id, DirNode { path: path.to_path_buf(), children: HashMap::new() });
+    g.dir_node_by_path.insert(path.to_path_buf(), id);
+    id
 }
 
 /// `NotFound` when the rename's source does not exist, as `std::fs::rename` gives.
@@ -349,6 +396,29 @@ impl FaultFs {
         let path = path.as_ref();
         let mut g = self.inner.lock().unwrap();
         g.grow.insert(path.to_path_buf(), extra.to_vec());
+    }
+
+    /// Rebind the NAME at `name` (e.g. `/dst/target`) to whatever `new_target` (e.g.
+    /// `/elsewhere`) currently denotes, WITHOUT touching the node any handle already
+    /// holds for the old binding. This is item 114's attacker, staged without a
+    /// kernel: it can only change what a NAME means for the NEXT lookup, never reach
+    /// into a handle that already resolved that name to an id -- exactly the
+    /// property a real directory handle has and a path does not. Exists only for
+    /// `a_handle_still_addresses_its_directory_after_the_name_is_repointed`.
+    pub fn repoint_for_test(&self, name: impl AsRef<Path>, new_target: impl AsRef<Path>) {
+        let name = name.as_ref();
+        let new_target = new_target.as_ref();
+        let (Some(parent_path), Some(child_name)) = (name.parent(), name.file_name()) else {
+            return;
+        };
+        let mut g = self.inner.lock().unwrap();
+        let parent_id = dir_node_for_path(&mut g, parent_path);
+        let target_id = dir_node_for_path(&mut g, new_target);
+        g.dir_nodes
+            .get_mut(&parent_id)
+            .unwrap()
+            .children
+            .insert(child_name.to_os_string(), target_id);
     }
 
     fn record(&self, call: String, key: &str) -> Result<()> {
@@ -648,6 +718,141 @@ impl FileSystem for FaultFs {
     }
 }
 
+impl DestinationRoot for FaultFs {
+    type Dir = FakeDirHandle;
+
+    fn destination_root(&self, path: &Path) -> Result<Self::Dir> {
+        let mut g = self.inner.lock().unwrap();
+        if !g.directories.contains(path) {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            ));
+        }
+        let id = dir_node_for_path(&mut g, path);
+        drop(g);
+        Ok(FakeDirHandle { id, inner: std::sync::Arc::clone(&self.inner) })
+    }
+}
+
+/// A handle onto one of the fake's directories, addressed by an id into
+/// `Inner::dir_nodes` -- never by the path it was opened through. See `DirNode`.
+pub struct FakeDirHandle {
+    id: u64,
+    inner: std::sync::Arc<Mutex<Inner>>,
+}
+
+// Manual, not derived: `Inner` holds a `Mutex` and is not `Debug`, and the id alone
+// is all `unwrap_err()` (used on `Result<FakeDirHandle, _>` in the tests) needs.
+impl std::fmt::Debug for FakeDirHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FakeDirHandle").field("id", &self.id).finish()
+    }
+}
+
+impl FakeDirHandle {
+    /// A fresh `FaultFs` sharing this handle's state, so a `DirHandle` operation can
+    /// be implemented by delegating to the matching `FileSystem` method on a full
+    /// path -- reusing its fault injection, call log and identity bookkeeping rather
+    /// than duplicating it.
+    fn fs(&self) -> FaultFs {
+        FaultFs { inner: std::sync::Arc::clone(&self.inner) }
+    }
+
+    /// This node's own snapshot path. Fixed at the moment this id was minted; never
+    /// re-derived by walking a name.
+    fn my_path(&self) -> PathBuf {
+        let g = self.inner.lock().unwrap();
+        g.dir_nodes
+            .get(&self.id)
+            .expect("a live FakeDirHandle always names a node still in the graph")
+            .path
+            .clone()
+    }
+}
+
+impl DirHandle for FakeDirHandle {
+    type Writer = FakeHandle;
+
+    fn open_dir(&self, name: &OsStr) -> Result<Self> {
+        check_component(name)?;
+        // Reuse the binding this handle's OWN node already has for `name`, if any.
+        // This is the map `repoint_for_test` rewrites, and reading it here -- rather
+        // than recomputing a path -- is what makes a repoint AFTER this call have no
+        // effect on the handle this call already returned.
+        {
+            let g = self.inner.lock().unwrap();
+            if let Some(&child_id) = g.dir_nodes.get(&self.id).and_then(|n| n.children.get(name)) {
+                return Ok(Self { id: child_id, inner: std::sync::Arc::clone(&self.inner) });
+            }
+        }
+        let child_path = self.my_path().join(name);
+        let meta = self.fs().metadata(&child_path)?;
+        if meta.file_type == FileType::Symlink {
+            return Err(FsError::new(
+                Code::SafetyRejected,
+                std::io::Error::other("refuses to traverse a symlink or other name-surrogate"),
+            ));
+        }
+        if meta.file_type != FileType::Dir {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::other("not a directory"),
+            ));
+        }
+        let mut g = self.inner.lock().unwrap();
+        let child_id = dir_node_for_path(&mut g, &child_path);
+        g.dir_nodes.get_mut(&self.id).unwrap().children.insert(name.to_os_string(), child_id);
+        drop(g);
+        Ok(Self { id: child_id, inner: std::sync::Arc::clone(&self.inner) })
+    }
+
+    fn create_dir(&self, name: &OsStr) -> Result<Self> {
+        check_component(name)?;
+        let child_path = self.my_path().join(name);
+        self.fs().create_dir(&child_path)?;
+        let mut g = self.inner.lock().unwrap();
+        let child_id = dir_node_for_path(&mut g, &child_path);
+        g.dir_nodes.get_mut(&self.id).unwrap().children.insert(name.to_os_string(), child_id);
+        drop(g);
+        Ok(Self { id: child_id, inner: std::sync::Arc::clone(&self.inner) })
+    }
+
+    fn create_new(&self, name: &OsStr) -> Result<Self::Writer> {
+        check_component(name)?;
+        let child_path = self.my_path().join(name);
+        self.fs().create_new(&child_path)
+    }
+
+    fn metadata(&self, name: &OsStr) -> Result<Metadata> {
+        check_component(name)?;
+        let child_path = self.my_path().join(name);
+        self.fs().metadata(&child_path)
+    }
+
+    fn remove_file(&self, name: &OsStr) -> Result<()> {
+        check_component(name)?;
+        let child_path = self.my_path().join(name);
+        self.fs().remove_file(&child_path)
+    }
+
+    fn rename_no_replace(&self, from: &OsStr, other: &Self, to: &OsStr) -> Result<()> {
+        check_component(from)?;
+        check_component(to)?;
+        let from_path = self.my_path().join(from);
+        let to_path = other.my_path().join(to);
+        self.fs().rename_no_replace(&from_path, &to_path)
+    }
+
+    fn rename_replace(&self, from: &OsStr, other: &Self, to: &OsStr) -> Result<()> {
+        check_component(from)?;
+        check_component(to)?;
+        let from_path = self.my_path().join(from);
+        let to_path = other.my_path().join(to);
+        self.fs().rename_replace(&from_path, &to_path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -918,5 +1123,45 @@ mod tests {
         assert_eq!(err.source.kind(), std::io::ErrorKind::Unsupported);
         assert!(!fs.exists("/to"), "an unsupported primitive must not fall back to a plain rename");
         assert!(fs.exists("/from"), "the source must be untouched");
+    }
+
+    #[test]
+    fn a_handle_still_addresses_its_directory_after_the_name_is_repointed() {
+        // Item 114's attack, staged without a kernel. The fake's handle is an id
+        // into its tree rather than a name, so repointing the NAME leaves the
+        // handle addressing the ORIGINAL node -- which is exactly what a real
+        // directory handle does, and exactly what a path does not.
+        use flux_fs::{DestinationRoot, DirHandle};
+        use std::ffi::OsStr;
+
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.create_dir(Path::new("/dst/target")).unwrap();
+        fs.create_dir(Path::new("/elsewhere")).unwrap();
+
+        let root = fs.destination_root(Path::new("/dst")).unwrap();
+        let held = root.open_dir(OsStr::new("target")).unwrap();
+
+        // The attacker swaps what the NAME means.
+        fs.repoint_for_test(Path::new("/dst/target"), Path::new("/elsewhere"));
+
+        held.create_new(OsStr::new("payload")).unwrap();
+
+        assert!(
+            !fs.exists("/elsewhere/payload"),
+            "the write followed the swapped name; the handle was not load-bearing"
+        );
+    }
+
+    #[test]
+    fn the_fake_refuses_a_name_with_a_separator() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        use std::ffi::OsStr;
+
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/dst")).unwrap();
+        let root = fs.destination_root(Path::new("/dst")).unwrap();
+        let err = root.open_dir(OsStr::new("a/b")).unwrap_err();
+        assert_eq!(err.code, Code::SafetyRejected);
     }
 }
