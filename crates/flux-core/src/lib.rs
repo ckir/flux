@@ -9,5 +9,5 @@ pub mod walk;
 #[cfg(test)]
 pub mod fault_fs;
 
-pub use copy::copy_file;
+pub use copy::{copy_file, copy_file_at};
 pub use walk::{DEFAULT_MAX_DEPTH, Walk, WalkError, WalkEvent, walk, walk_with_depth};

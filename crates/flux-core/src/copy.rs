@@ -1,9 +1,10 @@
 //! Single-file copy. The algorithm lives here once; platforms supply primitives.
 
 use flux_fs::{
-    Code, CopyOptions, Durability, FileHandle, FileSystem, FileType, FsError, MetadataFailure,
-    MetadataItem, Outcome, Preserve, Publish, temp_path,
+    Code, CopyOptions, DestinationRoot, DirHandle, Durability, FileHandle, FileType, FsError,
+    MetadataFailure, MetadataItem, OperationId, Outcome, Preserve, Publish, temp_path,
 };
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::Path;
 
@@ -94,8 +95,17 @@ impl CopyError {
 /// The removal is never discarded: if the temporary survives, its path goes into the
 /// error, because a leftover the caller is never told about is a leak the user cannot
 /// even find. Only called where the temporary is known to exist.
-fn discard<F: FileSystem>(fs: &F, temp: &Path, code: Code, source: std::io::Error) -> CopyError {
-    match fs.remove_file(temp) {
+///
+/// The leftover is recorded RELATIVE to `parent` -- the only frame `copy_file_at`
+/// has. `copy_file` joins it onto the parent path it resolved, so its callers see
+/// the same full path as before.
+fn discard<D: DirHandle>(
+    parent: &D,
+    temp: &OsStr,
+    code: Code,
+    source: std::io::Error,
+) -> CopyError {
+    match parent.remove_file(temp) {
         Ok(()) => CopyError::new(FsError::new(code, source)),
         // NotFound means it is already gone -- something else removed it, or it was
         // never created. Reporting a leftover here would send someone hunting a file
@@ -103,53 +113,98 @@ fn discard<F: FileSystem>(fs: &F, temp: &Path, code: Code, source: std::io::Erro
         Err(e) if e.source.kind() == std::io::ErrorKind::NotFound => {
             CopyError::new(FsError::new(code, source))
         }
-        // Carry the removal's own error too: "a temporary was left" without "because
-        // the volume went away" tells an operator where to look but not what happened.
-        //
-        // It goes in `temp_left`, NOT over the top of `source`. Wrapping the primary
-        // failure in `Error::other(format!(..))` is what this used to do, and MEASURED
-        // on Linux that turned `classify` from `DiskFull` into `IoError`, because
-        // `Error::other` carries no `raw_os_error()` and that is exactly what the
-        // disk-full arm keys on. The same mistake -- destroying an OS code to build a
-        // message -- was already folded once in this crate at a different site.
+        // Carry the removal's own error too, in `leftover` and NOT over `source`:
+        // wrapping the primary failure in `Error::other(format!(..))` destroyed
+        // `raw_os_error()` and, MEASURED on Linux, turned `classify` from `DiskFull`
+        // into `IoError`.
         Err(why) => CopyError {
             cause: FsError::new(code, source),
-            leftover: Some((temp.to_path_buf(), why.source)),
+            leftover: Some((std::path::PathBuf::from(temp), why.source)),
         },
     }
 }
 
-pub fn copy_file<F: FileSystem>(
+/// `<name>.flux-partial.<operation-id>` (§18.1), as a single component for a handle.
+/// Built by `temp_path` so the normative name has exactly one definition.
+fn temp_name(name: &OsStr, id: &OperationId) -> OsString {
+    temp_path(Path::new(name), id).into_os_string()
+}
+
+/// Split `dst` into the directory to open and the one component to write there.
+///
+/// A path with no file name -- a root, or one ending in `..` -- names nothing to
+/// write, so it is a destination error. A bare name's parent is the EMPTY path,
+/// which names the working directory but which `destination_root` cannot open, so
+/// it becomes `.`.
+fn split_destination(dst: &Path) -> std::result::Result<(&Path, &OsStr), CopyError> {
+    let Some(name) = dst.file_name() else {
+        return Err(CopyError::new(FsError::new(
+            Code::DestinationError,
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "the destination names no file"),
+        )));
+    };
+    let parent = match dst.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    Ok((parent, name))
+}
+
+/// Copy one file by path. A wrapper: it resolves the destination's PARENT once, as a
+/// directory handle, and hands the algorithm to `copy_file_at`, so a single-file copy
+/// writes through a handle exactly as a tree copy does (§149.7).
+pub fn copy_file<F: DestinationRoot>(
     fs: &F,
     src: &Path,
     dst: &Path,
     opts: &CopyOptions,
 ) -> std::result::Result<Outcome, CopyError> {
-    // 0. refuse a self-copy BEFORE touching the filesystem. This must precede every
-    //    call below, including the leftover sweep, because
-    //    `a_self_copy_is_refused_before_anything_is_touched` asserts the recorded
-    //    call list is empty.
-    //
-    //    §2 Foundational Invariants item 22 asks for identity, not a lexical
-    //    comparison: "Safety checks use filesystem identity and object identity where
-    //    available, not only lexical path comparisons." This cut compares paths only,
-    //    so `flux copy a ./a` is not caught here. It is not destructive -- the copy
-    //    goes through a distinct temporary -- but it is not the refusal the invariant
-    //    asks for either. Task 10 records the gap.
+    // 0. refuse a LEXICAL self-copy BEFORE touching the filesystem. This must precede
+    //    every call below, because `a_self_copy_is_refused_before_anything_is_touched`
+    //    asserts the recorded call list is empty. The IDENTITY half of the same
+    //    refusal -- `flux copy a b` where `b` is `a` by another name -- is Step 2a in
+    //    `copy_file_at`, which has to stat the destination and so cannot keep this
+    //    step's promise; the two coexist rather than one replacing the other.
     if src == dst {
         return Err(CopyError::new(FsError::new(
             Code::SafetyRejected,
             std::io::Error::other("source and destination are the same path"),
         )));
     }
+    let (parent_path, name) = split_destination(dst)?;
+    // The one path-based call on the write side. §149.7 exempts resolving the
+    // destination itself: it may follow links, because the user named it.
+    let parent = fs.destination_root(parent_path).map_err(CopyError::new)?;
+    copy_file_at(fs, src, &parent, name, opts).map_err(|mut e| {
+        // Rebuilt from `dst`, NOT joined onto `parent_path`: for a bare name the
+        // opened parent is a synthesized `.`, and joining would report
+        // `./b.flux-partial.x` where the user's own spelling gives `b.flux-partial.x`.
+        if let Some((path, _)) = e.leftover.as_mut() {
+            *path = dst.with_file_name(&*path);
+        }
+        e
+    })
+}
 
-    let temp = temp_path(dst, &opts.operation_id);
+/// Copy `src` to `name` inside `parent`, writing ONLY through `parent`.
+///
+/// Nothing below re-resolves a destination path: the staging temporary, the
+/// metadata, the publish and the cleanup all go through the handle, so a parent
+/// swapped for a link after it was opened cannot redirect the write (item 114).
+pub fn copy_file_at<F: DestinationRoot>(
+    fs: &F,
+    src: &Path,
+    parent: &F::Dir,
+    name: &OsStr,
+    opts: &CopyOptions,
+) -> std::result::Result<Outcome, CopyError> {
+    let temp = temp_name(name, &opts.operation_id);
 
-    // 1. this invocation's own leftover, if any (§18.1). A no-op in this cut: the
+    // 1. this invocation's own leftover, if any (§18.1). A no-op in practice: the
     //    operation id is generated per invocation and never persisted, so nothing from
     //    an earlier run carries this name. It stays because §18.1 asks the id to be
     //    "deterministic enough for discovery", and a derivable id makes this live.
-    let _ = fs.remove_file(&temp);
+    let _ = parent.remove_file(&temp);
 
     // 2. source, captured for the step-7 re-check
     // Safe to `?`: nothing has been created yet, so there is nothing to leak.
@@ -165,7 +220,7 @@ pub fn copy_file<F: FileSystem>(
     // 3. exclusive create (FS-1)
     // Still safe: if this FAILS, this call is precisely what did not create the
     // temporary, so there is nothing of ours on disk.
-    let mut writer = fs.create_new(&temp).map_err(CopyError::new)?;
+    let mut writer = parent.create_new(&temp).map_err(CopyError::new)?;
 
     // 4. stream
     let mut bytes_copied = 0u64;
@@ -174,10 +229,10 @@ pub fn copy_file<F: FileSystem>(
         let n = match std::io::Read::read(&mut reader, &mut buf) {
             Ok(0) => break,
             Ok(n) => n,
-            Err(e) => return Err(discard(fs, &temp, copy_code(&e), e)),
+            Err(e) => return Err(discard(parent, &temp, copy_code(&e), e)),
         };
         if let Err(e) = writer.write_all(&buf[..n]) {
-            return Err(discard(fs, &temp, copy_code(&e), e));
+            return Err(discard(parent, &temp, copy_code(&e), e));
         }
         bytes_copied += n as u64;
     }
@@ -186,7 +241,7 @@ pub fn copy_file<F: FileSystem>(
     if opts.durability == Durability::Strict
         && let Err(e) = writer.sync_all()
     {
-        return Err(discard(fs, &temp, Code::StrictDurabilityUnavailable, e.source));
+        return Err(discard(parent, &temp, Code::StrictDurabilityUnavailable, e.source));
     }
 
     // 6. metadata, on the temporary, BEFORE publication (§44.1)
@@ -196,7 +251,7 @@ pub fn copy_file<F: FileSystem>(
         && let Err(e) = fs.set_times(&writer, src_meta.modified)
     {
         if opts.preserve_times == Preserve::Strict {
-            return Err(discard(fs, &temp, Code::MetadataApplyFailed, e.source));
+            return Err(discard(parent, &temp, Code::MetadataApplyFailed, e.source));
         }
         metadata_failures.push(MetadataFailure { item: MetadataItem::Times, error: e });
     }
@@ -205,7 +260,7 @@ pub fn copy_file<F: FileSystem>(
         && let Err(e) = fs.set_permissions(&writer, src_meta.permissions)
     {
         if opts.preserve_permissions == Preserve::Strict {
-            return Err(discard(fs, &temp, Code::MetadataApplyFailed, e.source));
+            return Err(discard(parent, &temp, Code::MetadataApplyFailed, e.source));
         }
         metadata_failures.push(MetadataFailure { item: MetadataItem::Permissions, error: e });
     }
@@ -220,24 +275,24 @@ pub fn copy_file<F: FileSystem>(
         // failures.
         Err(e) if e.source.kind() == std::io::ErrorKind::NotFound => {
             let gone = std::io::Error::other("source disappeared during the copy");
-            return Err(discard(fs, &temp, Code::SourceChanged, gone));
+            return Err(discard(parent, &temp, Code::SourceChanged, gone));
         }
-        Err(e) => return Err(discard(fs, &temp, e.code, e.source)),
+        Err(e) => return Err(discard(parent, &temp, e.code, e.source)),
     };
     if now.len != src_meta.len || now.modified != src_meta.modified {
         let changed = std::io::Error::other("source changed");
-        return Err(discard(fs, &temp, Code::SourceChanged, changed));
+        return Err(discard(parent, &temp, Code::SourceChanged, changed));
     }
 
     let published = match opts.publish {
-        Publish::Replace => fs.rename_replace(&temp, dst),
-        Publish::NoReplace => fs.rename_no_replace(&temp, dst),
+        Publish::Replace => parent.rename_replace(&temp, parent, name),
+        Publish::NoReplace => parent.rename_no_replace(&temp, parent, name),
     };
     if let Err(e) = published {
         // Keep whatever the platform layer mapped. A publish failure is NOT the content
         // copy -- that already succeeded -- so it must not be relabelled COPY_FAILED,
         // and an unclassified one stays IO_ERROR, the declared catch-all.
-        return Err(discard(fs, &temp, e.code, e.source));
+        return Err(discard(parent, &temp, e.code, e.source));
     }
 
     // A successful rename consumed the temporary; there is nothing left to remove.
@@ -249,7 +304,7 @@ pub fn copy_file<F: FileSystem>(
 mod tests {
     use super::*;
     use crate::fault_fs::FaultFs;
-    use flux_fs::{Durability, OperationId, Preserve, Publish};
+    use flux_fs::{Durability, FileSystem, OperationId, Preserve, Publish};
 
     fn opts() -> CopyOptions {
         CopyOptions {
@@ -693,5 +748,61 @@ mod tests {
         let cause = err.source().expect("CopyError must expose its cause");
         let fs_err = cause.downcast_ref::<FsError>().expect("the cause is an FsError");
         assert_eq!(fs_err.source.raw_os_error(), Some(5), "the OS code must survive the chain");
+    }
+
+    #[test]
+    fn split_destination_separates_parent_and_name() {
+        let ok = |d: &str| {
+            let (p, n) = split_destination(Path::new(d)).unwrap();
+            (p.to_path_buf(), n.to_os_string())
+        };
+        assert_eq!(ok("/d/b"), (Path::new("/d").into(), "b".into()));
+        // A bare name's parent is the EMPTY path; `destination_root("")` would fail.
+        assert_eq!(ok("b"), (Path::new(".").into(), "b".into()));
+        assert_eq!(ok("/b"), (Path::new("/").into(), "b".into()));
+    }
+
+    #[test]
+    fn a_destination_naming_no_file_is_refused_before_any_call() {
+        for dst in ["/", "/d/.."] {
+            let fs = FaultFs::new();
+            fs.write_file("/src", b"hello");
+            let err = copy_file(&fs, Path::new("/src"), Path::new(dst), &opts()).unwrap_err();
+            assert_eq!(err.code(), flux_fs::Code::DestinationError, "{dst}");
+            assert!(fs.calls().is_empty(), "{dst}: refuse before any call; got {:?}", fs.calls());
+        }
+    }
+
+    #[test]
+    fn copy_file_at_writes_into_the_directory_it_is_given() {
+        use flux_fs::DestinationRoot;
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+
+        let out =
+            copy_file_at(&fs, Path::new("/src"), &d, std::ffi::OsStr::new("f"), &opts()).unwrap();
+
+        assert_eq!(out.bytes_copied, 5);
+        assert_eq!(fs.read_file("/d/f").as_deref(), Some(&b"hello"[..]));
+        assert!(!fs.exists("/d/f.flux-partial.op1"));
+    }
+
+    #[test]
+    fn copy_file_at_reports_a_leftover_relative_to_its_directory() {
+        use flux_fs::DestinationRoot;
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        fs.fail("rename_replace", flux_fs::Code::PermissionDenied);
+        fs.fail_always("remove_file", flux_fs::Code::PermissionDenied);
+
+        let err = copy_file_at(&fs, Path::new("/src"), &d, std::ffi::OsStr::new("f"), &opts())
+            .unwrap_err();
+
+        let (path, _) = err.leftover.as_ref().expect("the leftover must be reported");
+        assert_eq!(path, Path::new("f.flux-partial.op1"), "relative to the directory handle");
     }
 }
