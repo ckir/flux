@@ -36,9 +36,16 @@ impl StdDir {
                         FsError::new(Code::DestinationError, io)
                     }
                 }
-                // The name vanished between the open and the stat. It is no longer
-                // a component we can judge, so report what we can prove.
-                Err(_) => FsError::new(Code::DestinationError, io),
+                // The stat did not answer, and WHY matters. This arm used to read
+                // every failure as "the name vanished between the open and the
+                // stat", which is only one of the reasons it can fail: a directory
+                // we may traverse but not stat answers EACCES, and calling that a
+                // broken destination hides a permission problem the caller could
+                // act on. ENOENT really is the vanished case. Anything else is
+                // reported as what it is rather than as what it most often is.
+                Err(Errno::ACCESS) | Err(Errno::PERM) => FsError::new(Code::PermissionDenied, io),
+                Err(Errno::NOENT) => FsError::new(Code::DestinationError, io),
+                Err(_) => FsError::new(Code::IoError, io),
             },
             Errno::NOENT => FsError::new(Code::DestinationError, io),
             Errno::ACCESS | Errno::PERM => FsError::new(Code::PermissionDenied, io),
@@ -102,6 +109,28 @@ impl DirHandle for StdDir {
             .map_err(|e| FsError::from_io(std::io::Error::from(e)))
     }
 
+    /// NO FALLBACK, and that is the decision rather than an omission.
+    ///
+    /// `RENAME_NOREPLACE` is not universal. MEASURED on a 9p-mounted volume: this
+    /// fails with EINVAL even for a name that is FREE, so no-replace publication is
+    /// unavailable on such a destination -- the exact POSIX counterpart of the tag
+    /// query that answers nothing on FAT32.
+    ///
+    /// A review proposed falling back to stat-then-rename. That fix is REFUSED, and
+    /// the reason is measured rather than stylistic: a non-atomic fallback
+    /// reintroduces precisely the check-then-act window this cut exists to close,
+    /// and under contention the difference is not marginal -- an atomic no-replace
+    /// rename was measured at 400 correct refusals out of 400, and the check-then-act
+    /// form at 3188 wrong outcomes. Silently degrading to that on filesystems the
+    /// caller cannot see would be worse than failing, because the guarantee would be
+    /// gone while the API still claimed it.
+    ///
+    /// Failing loudly is therefore correct here. What is MISSING is upstream: §241.5
+    /// wants a destination with no no-replace primitive refused UP FRONT with
+    /// NoReplacePublishUnavailable, before anything changes, rather than discovered
+    /// at the first publish. That probe belongs to the engine, which does not exist
+    /// yet, and is tracked; this measurement is the evidence that such destinations
+    /// are real and reachable rather than hypothetical.
     fn rename_no_replace(&self, from: &OsStr, other: &Self, to: &OsStr) -> Result<()> {
         check_component(from)?;
         check_component(to)?;

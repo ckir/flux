@@ -661,6 +661,18 @@ fn surrogate_tag_at(parent: &OwnedHandle, name: &OsStr) -> Option<u32> {
     let opened = unsafe { OwnedHandle::from_raw_handle(h as _) };
     match reparse_tag_of(&opened) {
         Ok(Some(tag)) if is_name_surrogate(tag) => Some(tag),
+        // An Err here is `reparse_tag_of` saying THERE IS a reparse point and its tag
+        // cannot be read. Folding that into `None` would quietly downgrade a refusal
+        // that function had already decided it could not justify allowing -- the same
+        // fork shape as the three defects this review found, one level up. Judge it
+        // the way it judged itself: unreadable means refuse.
+        //
+        // This cannot over-refuse an ordinary file. `reparse_tag_of` answers Err only
+        // when the reparse ATTRIBUTE is set, or when neither query answers at all; a
+        // plain file has the attribute clear and comes back Ok(None), which is still
+        // `None` here and still DESTINATION_ERROR at the call site.
+        // `a_plain_file_component_is_a_destination_error` is what holds that.
+        Err(_) => Some(0),
         _ => None,
     }
 }

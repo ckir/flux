@@ -262,6 +262,26 @@ mod posix {
         assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
         assert!(!outside.exists(), "nothing may have been created at the link's TARGET");
     }
+
+    #[test]
+    fn a_symlink_is_accepted_as_the_destination_root() {
+        // The POSIX twin of a_junction_is_accepted_as_the_destination_root. Every
+        // component BELOW the root is refused if it is a link -- that is what
+        // a_symlinked_component_is_refused_as_a_safety_rejection pins -- but 149.7
+        // exempts DEST ITSELF, which is resolved by path and DOES follow links. This
+        // arm expresses that by NOT passing O_NOFOLLOW on the root open, which is a
+        // deliberate omission and therefore worth a test: adding NOFOLLOW there would
+        // look like tightening a safety flag while silently breaking every copy into
+        // a symlinked destination.
+        let d = TempDir::new().unwrap();
+        let real = d.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, d.path().join("rootlink")).unwrap();
+
+        let root = StdFileSystem.destination_root(&d.path().join("rootlink")).unwrap();
+        drop(root.create_new(OsStr::new("through")).unwrap());
+        assert!(real.join("through").is_file(), "the write must land in the link's TARGET");
+    }
 }
 
 #[cfg(windows)]
