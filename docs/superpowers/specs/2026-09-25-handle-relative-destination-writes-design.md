@@ -212,9 +212,30 @@ the single component, and `CreateOptions` of
 open, query the handle's attributes and reject if `FILE_ATTRIBUTE_REPARSE_POINT` is set. The sequence is
 open-then-inspect, and the inspection is not optional:
 
-1. `NtCreateFile` handle-relative with the flags above.
-2. `STATUS_SUCCESS` → query attributes. Reparse point set → **close the handle** and return
-   `SafetyRejected`. Otherwise the handle is the child directory.
+1. `NtCreateFile` handle-relative with the flags above. **`DesiredAccess` is
+   `FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | SYNCHRONIZE`** and **`ShareAccess` is
+   `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`**. Neither is a free choice: a
+   `ShareAccess` of 0 takes the directory EXCLUSIVELY, so every directory the writer walks would
+   lock out any other process merely reading it, and the walker would fail on an ordinary machine.
+2. `STATUS_SUCCESS` → **read the reparse TAG**, not the attribute bit, and reject only a **name
+   surrogate** — `IsReparseTagNameSurrogate(tag)`, i.e. `tag & 0x20000000`. Reject → **close the
+   handle** and return `SafetyRejected`. Otherwise the handle is the child directory.
+
+   **Testing `FILE_ATTRIBUTE_REPARSE_POINT` alone is WRONG and would break ordinary machines.**
+   MEASURED on the development machine: 14 reparse points exist under `C:\` and the user profile, and
+   three of them — `OneDrive`, `Dropbox`, `MagentaCLOUD` — are cloud-sync placeholder roots that are
+   NEITHER junctions NOR symlinks. Rejecting on the bit would refuse to write into the user's OneDrive
+   folder. The tags settle it:
+
+   | object | tag | name surrogate? |
+   |---|---|---|
+   | `OneDrive` (cloud placeholder) | `0x9000701A` | **no** — traverse it |
+   | `Recent` (junction) | `0xA0000003` = `IO_REPARSE_TAG_MOUNT_POINT` | **yes** — reject |
+
+   The surrogate bit is the documented predicate and is preferred over enumerating
+   `IO_REPARSE_TAG_SYMLINK` and `IO_REPARSE_TAG_MOUNT_POINT` by name, because it also covers surrogate
+   tags that do not exist yet. Deduplication, WOF and AppX stubs are likewise non-surrogates and must
+   traverse.
 3. `STATUS_NOT_A_DIRECTORY` (`0xC0000103`) → `DestinationError`.
 4. `STATUS_OBJECT_NAME_NOT_FOUND` (`0xC0000034`) → `DestinationError`.
 5. `STATUS_ACCESS_DENIED` → `PermissionDenied`. Anything else → `IoError`.
@@ -227,10 +248,19 @@ Removing it does not relax a check — it makes `NtCreateFile` follow the juncti
 §149.7 exists to forbid. That is the one edit to this function that looks like a simplification and is a
 safety regression.
 
-**Open question, deliberately unresolved here:** whether `FileAttributeTagInformation` or a
-`GetFileInformationByHandle` attribute read is the better query in step 2. Both reach the answer; the
-former also yields the reparse TAG, which a future cut may want for reporting *which kind* of reparse
-point was refused. Resolve it when the code is written; it does not change this design.
+**This was an open question and is now closed, because it turned out to be a correctness requirement
+rather than a reporting nicety.** An earlier draft left the choice between `FileAttributeTagInformation`
+and a plain attribute read to the implementer, on the reasoning that both reach the answer. They do not:
+only the former yields the TAG, and without the tag the check rejects every cloud-sync placeholder on
+the machine. `FileAttributeTagInformation` is required.
+
+**Volume mount points, and a platform asymmetry worth stating rather than discovering.** A volume mount
+point carries `IO_REPARSE_TAG_MOUNT_POINT` — the same tag as a junction — so the surrogate test rejects
+it. On POSIX a mount point is not a link at all, so `openat(O_NOFOLLOW)` traverses it silently. The two
+arms therefore differ on mounts, and that is the intended outcome on each: §149.7 says a reparse point
+this operation did not create is rejected, which a Windows volume mount point is; while on POSIX
+crossing a filesystem boundary is §42's job, not §149.7's, and §42 already handles it. Same guarantee,
+reached by different mechanisms, and neither arm lets a write escape `DEST`.
 
 ---
 
