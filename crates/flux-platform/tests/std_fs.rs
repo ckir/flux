@@ -855,3 +855,80 @@ fn rename_no_replace_lets_exactly_one_concurrent_publisher_win() {
 
     assert_eq!(winners_total, ROUNDS, "one winner per round, and no round skipped");
 }
+
+/// A DIAGNOSTIC, not a gate. Point it at a volume and it reports what this adapter
+/// actually observes there, which is the one thing the degraded-identity reasoning in
+/// `rename_no_replace` rests on and cannot verify on NTFS.
+///
+/// ```text
+/// set FLUX_PROBE_VOLUME=Y:\
+/// cargo nextest run -p flux-platform --no-capture --run-ignored all -E 'test(zz_identity_probe)'
+/// ```
+///
+/// Ignored by default and skipped when the variable is unset, so it costs a normal run
+/// nothing. It asserts only what it can prove on ANY volume; everything else it PRINTS,
+/// because the point is to learn what a filesystem does, not to pin it.
+#[test]
+#[ignore = "needs FLUX_PROBE_VOLUME pointing at a mounted volume"]
+fn zz_identity_probe() {
+    let Ok(root) = std::env::var("FLUX_PROBE_VOLUME") else {
+        eprintln!("PROBE skipped: set FLUX_PROBE_VOLUME to a path on the volume to inspect");
+        return;
+    };
+    let dir = std::path::PathBuf::from(&root).join("flux-probe");
+    let fs = StdFileSystem;
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create the probe directory");
+
+    let a = dir.join("a");
+    let mut f = fs.create_new(&a).expect("create a file on the probe volume");
+    f.write_all(b"probe").unwrap();
+    drop(f);
+
+    // 1. What identity does this volume report? THE question the reasoning rests on.
+    let id = fs.metadata(&a).expect("stat the probe file").identity;
+    eprintln!("PROBE volume={root}");
+    eprintln!("PROBE identity={id:?}");
+
+    // 2. Does it support a second name for one object? FAT32/exFAT do not; SMB may.
+    let b = dir.join("b");
+    let linked = std::fs::hard_link(&a, &b).is_ok();
+    eprintln!("PROBE hard_links={linked}");
+
+    // 3. The behaviours the veto exists for. Each is only meaningful where the
+    //    precondition above holds, so each says which case it is reporting.
+    let same_path = fs.rename_no_replace(&a, &a);
+    eprintln!(
+        "PROBE same_path_refused={} err={:?}",
+        same_path.is_err(),
+        same_path.as_ref().err().map(|e| e.source.kind())
+    );
+    assert!(same_path.is_err(), "a name published onto itself must be refused anywhere");
+
+    if linked {
+        let second_link = fs.rename_no_replace(&a, &b);
+        eprintln!(
+            "PROBE second_link_refused={} err={:?}",
+            second_link.is_err(),
+            second_link.as_ref().err().map(|e| e.source.kind())
+        );
+        assert!(second_link.is_err(), "a second name for one object must be refused");
+        assert!(a.exists() && b.exists(), "neither link may be consumed");
+    } else {
+        eprintln!("PROBE second_link: N/A, this volume has no hard links");
+    }
+
+    let upper = dir.join("A");
+    let case_only = fs.rename_no_replace(&a, &upper);
+    eprintln!(
+        "PROBE case_only_refused={} err={:?}",
+        case_only.is_err(),
+        case_only.as_ref().err().map(|e| e.source.kind())
+    );
+
+    let free = fs.rename_no_replace(&a, &dir.join("fresh"));
+    eprintln!("PROBE free_name_succeeds={}", free.is_ok());
+    assert!(free.is_ok(), "a free name must still be claimable on this volume");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
