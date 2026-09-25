@@ -152,7 +152,8 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
   Blocked on the same primitive the lock protocol needs: `dev`+`ino` on Unix is one call, Windows needs
   `FILE_ID_INFO`, which is already an open item above. Do both at once.
 
-  DONE in cut 4a: `copy_file_at`'s Step 2a gate refuses a destination that is the source by identity; the lexical Step 0 refusal stays in front of it.
+  DONE in cut 4a: `copy_file_at`'s Step 2a gate refuses a destination that is the source by identity;
+  the lexical Step 0 refusal stays in front of it.
 
 ## Known gaps in the single-file copy (from the PR #32 capstone)
 
@@ -178,7 +179,8 @@ Each was measured, and each is deliberately NOT fixed in that PR.
 
 ## Engine (walker cut 4) prerequisites
 
-Cut 4 is split (see `docs/superpowers/specs/2026-09-25-cut-4-after-handle-relative-writes.md`); both entries below are cut 4b's.
+Cut 4 is split (see `docs/superpowers/specs/2026-09-25-cut-4-after-handle-relative-writes.md`); both
+entries below are cut 4b's.
 
 - [ ] **Item 113's up-front no-replace probe is not built.** A directory operation against a destination
       with no no-replace publication primitive must be refused with `NOREPLACE_PUBLISH_UNAVAILABLE`
@@ -191,16 +193,15 @@ Cut 4 is split (see `docs/superpowers/specs/2026-09-25-cut-4-after-handle-relati
       "unavailable", never match an error kind:** `FaultFs` models the missing primitive as
       `ErrorKind::Unsupported` (`fault_fs.rs`, the `no_replace_support == Some(false)` arm), but the real
       9p volume answers `InvalidInput`, so a probe written against the fake passes its tests and misses
-      the real case.
-
-  DECIDED 2026-09-25 (owner, agy aligned): the probe stays deferred with the workspace; cut 4b aborts the whole operation on the FIRST publish that fails with "primitive unavailable" (Unsupported, or EINVAL/ENOSYS on unix after the temporary was created), exit 1.
+      the real case. DECIDED 2026-09-25 (owner, agy aligned): the probe stays deferred with the
+      workspace; cut 4b aborts the whole operation on the FIRST publish that fails with "primitive
+      unavailable" (Unsupported, or EINVAL/ENOSYS on unix after the temporary was created), exit 1.
 - [ ] **`FaultFs::move_object` strands a renamed directory's children.** It re-keys only the exact
       `from` and `to` paths; nothing walks the `from/` prefix, so every child keeps its old path. That is
       the stage-then-publish shape `copy_tree` will use, so an engine test that stages a tree and
       publishes it by rename would observe a wrong tree. Fix with the fake's move to node-id keys, which
-      §149.7's handle-relative writes (PR #44) also need.
-
-  DECIDED 2026-09-25: not needed in cut 4 -- the engine renames only files. Stays debt for the first cut that renames a directory.
+      §149.7's handle-relative writes (PR #44) also need. DECIDED 2026-09-25: not needed in cut 4 --
+      the engine renames only files. Stays debt for the first cut that renames a directory.
 - [ ] **§42 mount boundaries are not enforced.** The walk descends into a directory on another volume
       (a mount), and would read `/proc` inside a copied tree. Needs a walk-level rule (the walk must not
       even read the mounted subtree), a `--cross-filesystems` option, and a report channel. Its own cut,
