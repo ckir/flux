@@ -187,6 +187,61 @@ pub trait FileSystem: Send + Sync {
     fn create_dir(&self, path: &Path) -> Result<()>;
 }
 
+/// An open directory under `DEST` (§149.7).
+///
+/// Every destination entry is created or opened relative to one of these, never
+/// by a path the kernel re-resolves. That is the entire point: a path is checked
+/// and used as two operations, and the object beneath it can change in between.
+///
+/// Names are single components and are refused otherwise — see
+/// `crate::name::check_component`.
+pub trait DirHandle: Sized {
+    type Writer: FileHandle;
+
+    /// Open a child DIRECTORY, refusing to traverse a symlink, junction or other
+    /// name-surrogate reparse point. This is the operation §149.7 is about.
+    fn open_dir(&self, name: &std::ffi::OsStr) -> Result<Self>;
+
+    /// Create a child directory and return a handle to it.
+    fn create_dir(&self, name: &std::ffi::OsStr) -> Result<Self>;
+
+    /// Create a child file exclusively, as `FileSystem::create_new` does by path.
+    fn create_new(&self, name: &std::ffi::OsStr) -> Result<Self::Writer>;
+
+    /// Metadata for a child, judging the NAME and never its target.
+    fn metadata(&self, name: &std::ffi::OsStr) -> Result<Metadata>;
+
+    fn remove_file(&self, name: &std::ffi::OsStr) -> Result<()>;
+
+    /// Publish `from` in this directory onto `to` in `other`, atomically and
+    /// without replacing. The two-handle form is what makes staging in one
+    /// directory and publishing into another expressible at all.
+    fn rename_no_replace(
+        &self,
+        from: &std::ffi::OsStr,
+        other: &Self,
+        to: &std::ffi::OsStr,
+    ) -> Result<()>;
+
+    fn rename_replace(
+        &self,
+        from: &std::ffi::OsStr,
+        other: &Self,
+        to: &std::ffi::OsStr,
+    ) -> Result<()>;
+}
+
+/// Resolving `DEST` once, at start, is the only path-based call in the writer.
+///
+/// This one DOES follow links: resolving `DEST` is exactly the operation §149.7
+/// exempts, because a user who points `DEST` at a symlink has chosen that
+/// destination. The clause protects what is BELOW it.
+pub trait DestinationRoot: FileSystem {
+    type Dir: DirHandle<Writer = Self::Writer>;
+
+    fn destination_root(&self, path: &Path) -> Result<Self::Dir>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
