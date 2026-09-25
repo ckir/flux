@@ -699,6 +699,14 @@ fn identity_of_raw(dev: u64, ino: u64) -> FileIdentity {
 #[cfg(unix)]
 pub(crate) fn metadata_from_stat(st: &rustix::fs::Stat) -> Metadata {
     use rustix::fs::FileType as RawFileType;
+    // Field widths differ by platform: macOS has `st_mode: u16` and `st_dev: i32`,
+    // Linux `u32` and `u64`, so each cast is a no-op on one and required on the
+    // other. They are std's own casts (`MetadataExt::mode`/`dev`), and `dev` must
+    // stay so: this identity is compared with the path-based one from
+    // `identity_of`, and a different `st_dev` conversion would make one object
+    // look like two.
+    #[allow(clippy::unnecessary_cast)]
+    let (mode, dev) = (st.st_mode as u32, st.st_dev as u64);
     Metadata {
         len: st.st_size as u64,
         file_type: match RawFileType::from_raw_mode(st.st_mode) {
@@ -707,9 +715,9 @@ pub(crate) fn metadata_from_stat(st: &rustix::fs::Stat) -> Metadata {
             RawFileType::RegularFile => FileType::File,
             _ => FileType::Other,
         },
-        permissions: Some(Perms::UnixMode(st.st_mode)),
+        permissions: Some(Perms::UnixMode(mode)),
         modified: mtime_from_stat(st),
-        identity: identity_of_raw(st.st_dev, st.st_ino),
+        identity: identity_of_raw(dev, st.st_ino),
     }
 }
 

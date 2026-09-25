@@ -29,7 +29,11 @@ impl StdDir {
         match e {
             Errno::NOTDIR => match statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(st) => {
-                    let is_link = (st.st_mode as u32 & libc_s_ifmt()) == libc_s_iflnk();
+                    // `st_mode` is `u32` on Linux but `u16` on macOS: the cast is a
+                    // no-op on one platform and required on the other.
+                    #[allow(clippy::unnecessary_cast)]
+                    let mode = st.st_mode as u32;
+                    let is_link = (mode & libc_s_ifmt()) == libc_s_iflnk();
                     if is_link {
                         FsError::new(Code::SafetyRejected, io)
                     } else {
