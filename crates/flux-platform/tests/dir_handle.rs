@@ -556,4 +556,67 @@ mod windows_arm {
         made.rename_no_replace(OsStr::new("sub"), &root, OsStr::new("moved")).unwrap();
         assert!(d.path().join("moved").is_dir());
     }
+
+    #[test]
+    fn remove_file_still_removes_a_junction_but_not_its_target() {
+        // The OTHER half of the directory guard, and the half its fix puts at risk.
+        // POSIX is the specification: unlinkat refuses a DIRECTORY but unlinks a
+        // SYMLINK whatever it points at. So a name surrogate must stay removable --
+        // and removing it must not touch what it points at.
+        //
+        // The guard decides on the reparse TAG, not the reparse BIT. A plain
+        // directory has tag 0, which is not a surrogate, so it is refused by
+        // remove_file_refuses_an_ordinary_directory above; a junction's tag
+        // 0xA0000003 IS a surrogate, so it is removed here. The bit alone could not
+        // tell these apart from a OneDrive directory placeholder (tag 0x9000701A,
+        // measured on this machine), which is a real directory carrying cloud
+        // metadata and must be refused like any other.
+        let d = TempDir::new().unwrap();
+        let target = d.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("precious"), b"x").unwrap();
+        if !junction(&target, &d.path().join("link")) {
+            eprintln!("SKIPPED: could not create a junction");
+            return;
+        }
+
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        root.remove_file(OsStr::new("link")).unwrap();
+
+        assert!(!d.path().join("link").exists(), "the junction itself must be removed");
+        assert!(target.join("precious").is_file(), "its TARGET must be untouched");
+    }
+
+    #[test]
+    fn remove_file_works_on_a_volume_that_cannot_answer_a_tag_query() {
+        // MEASURED on a real FAT32 volume: FileAttributeTagInformation does not
+        // answer there. An earlier version of the guard refused whenever the answer
+        // was unknown, and the result was that remove_file returned IsADirectory for
+        // an ORDINARY FILE -- no file on that volume could be deleted at all. The
+        // guard now falls back to FileBasicInformation, which reports the directory
+        // attribute without a tag, so a file deletes and a directory is still
+        // refused.
+        //
+        // Set FLUX_FAT32_ROOT to an existing directory on such a volume to run it.
+        // There is no way to synthesise one, so it skips by default rather than
+        // pinning a drive letter no other machine has.
+        let Ok(base) = std::env::var("FLUX_FAT32_ROOT") else {
+            eprintln!("SKIPPED: set FLUX_FAT32_ROOT to a directory on a FAT32 volume");
+            return;
+        };
+        let dir = std::path::Path::new(&base).join("fluxguard");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let root = StdFileSystem.destination_root(&dir).unwrap();
+        drop(root.create_new(OsStr::new("afile")).unwrap());
+        root.remove_file(OsStr::new("afile")).unwrap();
+        assert!(!dir.join("afile").exists());
+
+        std::fs::create_dir(dir.join("adir")).unwrap();
+        let err = root.remove_file(OsStr::new("adir")).unwrap_err();
+        assert_eq!(err.source.kind(), std::io::ErrorKind::IsADirectory);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -437,8 +437,7 @@ fn remove_file_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {
     // A reparse-point directory (a junction, a directory symlink) is still removed,
     // which MATCHES POSIX: `unlinkat` unlinks a symlink whatever it points at. Only
     // a PLAIN directory is refused.
-    // NOT `== Some(true)`: an UNKNOWN kind refuses too. See `plain_directory`.
-    if plain_directory(&h) != Some(false) {
+    if !may_remove(&h) {
         return Err(FsError::new(
             Code::IoError,
             std::io::Error::new(
@@ -666,29 +665,39 @@ pub(crate) fn reparse_tag_of(
     Ok(Some(info.reparse_tag))
 }
 
-/// Is this handle an ORDINARY directory -- a directory that is not a reparse point?
+/// May `remove_file` remove what this handle addresses?
 ///
-/// `remove_file_at` needs the distinction and `reparse_tag_of` cannot give it: that
-/// function answers `None` both for a plain file and for a real directory, because
-/// all it reports is the tag. This reads the same information class and asks the
-/// other question.
+/// POSIX is the specification: `unlinkat(AtFlags::empty())` refuses a DIRECTORY with
+/// EISDIR, and unlinks a SYMLINK whatever it points at. So a name surrogate -- a
+/// junction or a directory symlink -- is removable, and a real directory is not.
 ///
-/// `None` means UNKNOWN, and the caller must treat it as "do not delete". An earlier
-/// version of this returned a bare `bool` and answered `false` on a failed query,
-/// which made the guard FAIL OPEN: a query that did not answer became "not a
-/// directory", and an empty directory would then have been deleted -- reinstating the
-/// very defect the guard was added for. A guard on a destructive operation has to
-/// fail closed. The cost of refusing when the kind cannot be read is an error the
-/// caller sees; the cost of deleting is a directory the caller does not get back.
+/// Two earlier versions of this were both wrong, in opposite directions, and both
+/// were caught by review of the fix rather than of the original code.
+///
+/// It first returned a bare `bool` that answered "not a directory" when the query
+/// FAILED, so the guard FAILED OPEN: an unanswered query let the delete proceed,
+/// which is the defect the guard exists to stop.
+///
+/// Fixing that by refusing whenever the answer was unknown broke the ordinary case
+/// instead. MEASURED on a real FAT32 volume: `FileAttributeTagInformation` does not
+/// answer there, so `remove_file` on an ordinary FILE came back `IsADirectory` and
+/// no file on that volume could be deleted at all.
+///
+/// So the question is asked twice, narrowing what each answer has to carry.
+/// `FileBasicInformation` is the most basic class there is and reports
+/// `FILE_ATTRIBUTE_DIRECTORY` without any tag; without a tag a junction cannot be
+/// told from a plain directory, so that fallback refuses every directory. Nothing is
+/// lost by that: a volume that cannot answer the tag query has no reparse points to
+/// distinguish. Only if BOTH queries fail does this refuse outright, which keeps the
+/// fail-closed property for the case that actually motivated it.
 #[cfg(windows)]
-fn plain_directory(h: &std::os::windows::io::OwnedHandle) -> Option<bool> {
+fn may_remove(h: &std::os::windows::io::OwnedHandle) -> bool {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Wdk::Storage::FileSystem::{
-        FileAttributeTagInformation, NtQueryInformationFile,
+        FILE_BASIC_INFORMATION, FileAttributeTagInformation, FileBasicInformation,
+        NtQueryInformationFile,
     };
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     #[repr(C)]
@@ -697,24 +706,49 @@ fn plain_directory(h: &std::os::windows::io::OwnedHandle) -> Option<bool> {
         reparse_tag: u32,
     }
 
-    let mut info = FileAttributeTagInfo { file_attributes: 0, reparse_tag: 0 };
+    let mut tag_info = FileAttributeTagInfo { file_attributes: 0, reparse_tag: 0 };
     let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
-    // SAFETY: `info` is a live, correctly sized FILE_ATTRIBUTE_TAG_INFORMATION and
-    // the handle outlives the call.
+    // SAFETY: `tag_info` is a live, correctly sized FILE_ATTRIBUTE_TAG_INFORMATION
+    // and the handle outlives the call.
     let status = unsafe {
         NtQueryInformationFile(
             h.as_raw_handle() as _,
             &raw mut iosb,
-            (&raw mut info).cast(),
+            (&raw mut tag_info).cast(),
             size_of::<FileAttributeTagInfo>() as u32,
             FileAttributeTagInformation,
         )
     };
-    if status != 0 {
-        return None;
+    if status == 0 {
+        // A directory is removable ONLY as a name surrogate. Reading the TAG rather
+        // than the reparse BIT is the whole point, and the bit alone was a defect:
+        // a directory carrying a NON-surrogate reparse point -- a OneDrive
+        // placeholder, tag 0x9000701A, measured on this machine -- is a real
+        // directory with cloud metadata, not a link, and deleting it is exactly the
+        // structural damage this guard exists to stop. It is the same rule `open_dir`
+        // applies when it decides what to traverse.
+        if tag_info.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            return is_name_surrogate(tag_info.reparse_tag);
+        }
+        return true;
     }
-    Some(
-        info.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0
-            && info.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0,
-    )
+
+    let mut basic: FILE_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let mut iosb2: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    // SAFETY: `basic` is a live, correctly sized FILE_BASIC_INFORMATION and the
+    // handle outlives the call.
+    let status = unsafe {
+        NtQueryInformationFile(
+            h.as_raw_handle() as _,
+            &raw mut iosb2,
+            (&raw mut basic).cast(),
+            size_of::<FILE_BASIC_INFORMATION>() as u32,
+            FileBasicInformation,
+        )
+    };
+    if status != 0 {
+        // Neither query answered. Refuse: see the fail-closed reasoning above.
+        return false;
+    }
+    basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
 }
