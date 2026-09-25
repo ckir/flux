@@ -1585,6 +1585,8 @@ fake that agrees with the implementation about encoding proves nothing about the
 
 ## Reading this document against merged code
 
+**Cut 4 was re-planned after §149.7 merged.** `2026-09-25-cut-4-after-handle-relative-writes.md` supersedes this document's item-114 mitigation, its symlinked-anchor refusal, and its single engine cut; read it first.
+
 **PR 1 and PR 2 are merged. Where a code block in this document disagrees with the code, THE CODE WINS.**
 
 This document was written before any of it was implemented, and implementing it settled details it had
