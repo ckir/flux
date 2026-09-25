@@ -174,6 +174,28 @@ Each was measured, and each is deliberately NOT fixed in that PR.
       platform offers "rename only if I may replace the target". `cp` has the same
       window. Documented in the code; recorded here so it is not rediscovered.
 
+## Engine (walker cut 4) prerequisites
+
+Promoted from the anomalies inbox, 2026-09-25. Cut 4's plan (`copy_tree`) opens with both.
+
+- [ ] **Item 113's up-front no-replace probe is not built.** A directory operation against a destination
+      with no no-replace publication primitive must be refused with `NOREPLACE_PUBLISH_UNAVAILABLE`
+      (exit 3) before anything changes (spec item 113, probe at §241.5). The normative probe writes
+      `noreplace-probe` inside the operation workspace (§18.2), which no walker cut builds, so the owner
+      deferred it with the workspace. Until then the engine discovers the missing primitive at the first
+      publish and fails that action instead of refusing the operation. Such destinations are real: on a
+      WSL 9p mount `rename_no_replace` fails with `EINVAL` even for a free target name (measured during
+      the §149.7 review). **The probe must treat ANY failure of an attempted no-replace publish as
+      "unavailable", never match an error kind:** `FaultFs` models the missing primitive as
+      `ErrorKind::Unsupported` (`fault_fs.rs`, the `no_replace_support == Some(false)` arm), but the real
+      9p volume answers `InvalidInput`, so a probe written against the fake passes its tests and misses
+      the real case.
+- [ ] **`FaultFs::move_object` strands a renamed directory's children.** It re-keys only the exact
+      `from` and `to` paths; nothing walks the `from/` prefix, so every child keeps its old path. That is
+      the stage-then-publish shape `copy_tree` will use, so an engine test that stages a tree and
+      publishes it by rename would observe a wrong tree. Fix with the fake's move to node-id keys, which
+      §149.7's handle-relative writes (PR #44) also need.
+
 ## Scaffolding follow-ups
 
 - [ ] Install `cargo-mutants` (`cargo binstall -y cargo-mutants`) — it is the one
