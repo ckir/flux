@@ -396,7 +396,7 @@ Whether the NT rename (`rename_at`, `crates/flux-platform/src/dir_windows.rs:513
     }
 ```
 
-- [ ] **Step 2: MEASURE on Windows before implementing.** `cargo nextest run -p flux-platform --no-fail-fast -E 'test(rename_replace_refuses)'` and record, per test, PASS or FAIL and the failing assertion. Expected possibilities: the NT rename refuses natively (then the read-only test fails only on the `raw_os_error().is_none()` or `code` assertion) or replaces the file (then the content assertion fails). Paste the output into the commit message of Step 4.
+- [ ] **Step 2: MEASURE on Windows before implementing. RED IS THE EXPECTED RESULT OF THIS STEP** — a failure here is the measurement, not a mistake. Do NOT edit either test, and do not stop: record the output and continue to Step 3. `cargo nextest run -p flux-platform --no-fail-fast -E 'test(rename_replace_refuses)'` and record, per test, PASS or FAIL and the failing assertion. Expected possibilities: the NT rename refuses natively (then the read-only test fails only on the `raw_os_error().is_none()` or `code` assertion) or replaces the file (then the content assertion fails). Paste the output into the commit message of Step 4.
 - [ ] **Step 3: Implement the guard** (required whenever Step 2 shows any FAIL — which the `raw_os_error().is_none()` assertion makes certain unless an unexpected guard already exists). Add, in `dir_windows.rs` directly above `fn rename_at`:
 
 ```rust
