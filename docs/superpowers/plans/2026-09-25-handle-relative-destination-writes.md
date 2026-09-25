@@ -1680,11 +1680,18 @@ Anything else is out of scope and should be reported, not committed.
 - [ ] **Step 4: Confirm the forbidden shapes are absent**
 
 ```bash
-rg -n 'ELOOP' crates/flux-platform/src/
+rg -n 'Errno::LOOP' crates/flux-platform/src/
 rg -n 'FILE_ATTRIBUTE_REPARSE_POINT' crates/flux-platform/src/dir_windows.rs
 ```
 
-The first must have **no matches**: `ELOOP` is the error POSIX associates with `O_NOFOLLOW` and is NOT what this code sees, so any appearance means someone wrote the expected behaviour rather than the measured one.
+The first must have **no matches**. `ELOOP` — `Errno::LOOP` in rustix — is the error POSIX associates
+with `O_NOFOLLOW`, and is NOT what this code sees (measured: `ENOTDIR`). A match means someone matched
+on the expected behaviour rather than the measured one, and the symlink refusal would fall through to
+`IoError`.
+
+**Grep for `Errno::LOOP`, not for the bare word `ELOOP`.** An earlier draft did the latter and would
+have failed on `dir_unix.rs`'s own comments, which mention `ELOOP` precisely to say it is not what
+happens — the documentation that stops the mistake would have tripped the check that guards against it.
 
 The second must match **only inside `reparse_tag_of`**, where it distinguishes "not a reparse point" from a tag. A match inside `open_dir`'s decision means the surrogate test was replaced with the attribute bit, which refuses OneDrive.
 
