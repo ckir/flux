@@ -413,7 +413,14 @@ Whether the NT rename (`rename_at`, `crates/flux-platform/src/dir_windows.rs:513
 /// replaced as a name, never followed, so its target is never consulted.
 fn is_write_protected_at(p: &OwnedHandle, n: &OsStr) -> bool {
     match metadata_at(p, n) {
-        Err(_) => false,
+        // Nothing occupies the name, so there is nothing to protect.
+        Err(e) if e.source.kind() == std::io::ErrorKind::NotFound => false,
+        // The attributes could not be read. Unlike POSIX -- where the stat and the
+        // rename need the SAME search permission on the same directory, so a denied
+        // stat means a denied rename -- Windows opens for attributes and for DELETE
+        // separately. So still ask whether DELETE is denied, rather than treating an
+        // uninspectable file as writable. (Panel round 2.)
+        Err(_) => delete_access_denied_at(p, n),
         Ok(m) if m.file_type == flux_fs::FileType::Symlink => false,
         Ok(m) => {
             m.permissions == Some(flux_fs::Perms::ReadOnly(true)) || delete_access_denied_at(p, n)
@@ -1127,6 +1134,27 @@ fn a_copy_between_bare_names_writes_into_the_working_directory() {
 - [ ] **Step 5: STOP.** Report completion. The AGY-CAPSTONE runs next, then (owner-approved) `just pr`, which arms auto-merge — so nothing is pushed before the capstone is GREEN.
 
 ---
+
+## Stand-downs
+
+Findings the adversarial panel raised and stood down, recorded so a later round or reviewer does not
+re-derive them.
+
+- `REJECTED: "under Safety::Default an uninspectable destination that is a hardlink of the source lets the
+  source be overwritten."` No source byte changes: Step 4 streams FROM `src` into a distinct temporary and
+  Step 7 renames it over the destination NAME, so only the hardlink breaks. The row itself ("stat fails
+  for any other reason" → degrade by default, refuse under strict) is the approved design, walker design
+  ~450-457 and ~479-497. The peer conceded on reading both. (Panel round 2.)
+- `DISCARDED-BELOW-FLOOR: POSIX is_write_protected_at treats a failed statat as writable.` Unreachable:
+  `statat(other.0, name)` and `renameat(.., other.0, name)` both need search permission on the SAME
+  directory handle (Task 3's `rename_replace`), so a denied stat implies a denied rename. (Panel round 2.)
+- `DISCARDED-BELOW-FLOOR: Windows, a READ_ONLY-attributed file under an ACL that denies
+  FILE_READ_ATTRIBUTES but grants DELETE is not seen as protected.` Needs a self-contradictory ACL, and
+  Task 4 Step 2 separately MEASURES whether the NT rename refuses a read-only target by itself. (Panel
+  round 2.)
+- `REJECTED: "Windows handle metadata of a missing name does not report NotFound, so every fresh copy
+  degrades."` `nt_io_error` maps `STATUS_OBJECT_NAME_NOT_FOUND` to `ErrorKind::NotFound`
+  (`crates/flux-platform/src/dir_windows.rs`). (Panel round 1, driver.)
 
 ## Self-review (done by the plan author)
 
