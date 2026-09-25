@@ -511,7 +511,7 @@ mod windows_arm {
     }
 
     #[test]
-    fn a_junction_is_accepted_as_the_destination_ROOT() {
+    fn a_junction_is_accepted_as_the_destination_root() {
         // The DEST EXEMPTION, which nothing else pins. Every component BELOW the root
         // is refused if it is a name surrogate -- a_junction_is_refused_as_a_safety_
         // _rejection covers that -- but §149.7 exempts DEST ITSELF, which is resolved
