@@ -1118,7 +1118,21 @@ mod tests {
         let err = fs.rename_no_replace(Path::new("/from"), Path::new("/to")).unwrap_err();
 
         // NOT AlreadyExists: the name is free. The filesystem cannot make the promise
-        // at all, which is a different fact and the one the engine cut branches on.
+        // at all, which is a different fact.
+        //
+        // THE KIND BELOW IS THIS FAKE'S CHOICE, NOT A CONTRACT, and an earlier version
+        // of this comment said it was "the one the engine cut branches on" -- which
+        // would be a trap if the engine took it literally. MEASURED on a real
+        // 9p-mounted volume: `rename_no_replace` there fails with EINVAL, so the kind
+        // is `InvalidInput`, NOT `Unsupported`. A third filesystem may well answer a
+        // third way.
+        //
+        // So the engine's §241.5 probe must treat ANY failure of an attempted
+        // no-replace publish as "the primitive is unavailable", and must not match on
+        // a particular `ErrorKind`. An engine written to pass against this fake by
+        // checking for `Unsupported` alone would pass its tests and miss the real
+        // case on Linux -- the exact inversion of what a fake is for. Tracked with
+        // the rest of the item-113 debt.
         assert_eq!(err.code, Code::IoError);
         assert_eq!(err.source.kind(), std::io::ErrorKind::Unsupported);
         assert!(!fs.exists("/to"), "an unsupported primitive must not fall back to a plain rename");
