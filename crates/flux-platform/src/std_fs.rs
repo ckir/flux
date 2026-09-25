@@ -146,6 +146,29 @@ fn destination_is_write_protected(to: &Path) -> bool {
     }
 }
 
+// `rustix::fs::renameat_with` is gated `any(apple, linux_kernel, target_os = "redox")`,
+// so a Unix outside that set has no atomic no-replace primitive reachable from here.
+// Fail at BUILD time naming the reason, rather than at link time naming a missing
+// function -- and do NOT add a check-then-act fallback, which
+// FLUX_FULL_UPDATED_SPEC_V16.md:10876 forbids as a substitute by name.
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        // rustix's own gate includes redox, and redox sets target_family = "unix",
+        // so omitting it here would refuse to compile on a platform the dependency
+        // fully supports. An earlier draft did exactly that, contradicting the
+        // comment directly above.
+        target_os = "redox"
+    ))
+))]
+compile_error!(
+    "no atomic no-replace rename primitive on this target; see FLUX_FULL_UPDATED_SPEC_V16.md \
+     §241.5 -- check-then-rename is not an acceptable substitute"
+);
+
 impl FileSystem for StdFileSystem {
     type Reader = StdReader;
     type Writer = StdFile;
@@ -261,18 +284,215 @@ impl FileSystem for StdFileSystem {
         std::fs::rename(from, to).map_err(FsError::from_io)
     }
 
+    /// Publish without replacing, atomically.
+    ///
+    /// §241.5 requires a target planned as new be published "with a primitive that
+    /// refuses to replace an existing entry", and `:10876` forbids the alternative by
+    /// name: "check-then-rename is never used as a substitute." The previous body was
+    /// exactly that substitute -- `symlink_metadata` then `rename` -- so two processes
+    /// could both see a free name and one silently won.
+    ///
+    /// The contract and the error are UNCHANGED: an occupied target is still
+    /// `Code::IoError` carrying `ErrorKind::AlreadyExists`. Only the atomicity is new,
+    /// and the observable difference is confined to the concurrent case that used to
+    /// lose silently.
+    #[cfg(unix)]
     fn rename_no_replace(&self, from: &Path, to: &Path) -> Result<()> {
-        // `symlink_metadata`, NOT `exists()`: `exists()` FOLLOWS the link, so a dangling
-        // symlink reports false and this method would replace the very name it promises
-        // to leave alone. Identical root cause to the guard in `rename_replace` above --
-        // that one was fixed first and this sibling site was missed.
-        if std::fs::symlink_metadata(to).is_ok() {
+        // ONE arm for Linux and macOS, because rustix already abstracts the two
+        // primitives §241.5 names separately: `RenameFlags::NOREPLACE` is
+        // `RENAME_NOREPLACE` on Linux and `RENAME_EXCL` on Apple (rustix
+        // src/backend/libc/fs/types.rs, the `#[cfg(apple)]` bitflags block), and
+        // `renameat_with` is gated `any(apple, linux_kernel, redox)`.
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+
+        // `std::io::Error::from(Errno)` is `from_raw_os_error`, so `raw_os_error()`
+        // SURVIVES the conversion and `FsError::from_io` can still classify -- verified
+        // at rustix-1.1.4/src/io/errno.rs:58-63. That matters here specifically: the
+        // comment on `FsError::source` records that rebuilding an error as
+        // `Error::other(..)` destroys `raw_os_error()`, and that doing so was MEASURED
+        // to turn `DiskFull` into `IoError`. Do not "improve" this line by adding
+        // context to the error.
+        let published = renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE)
+            .map_err(|e| FsError::from_io(std::io::Error::from(e)));
+
+        // THE TWO UNIXES DISAGREE ABOUT A NAME PUBLISHED ONTO ITSELF, and only CI could
+        // find it: `rename_no_replace_refuses_the_source_itself` was the ONE test of 171
+        // that failed on macos-latest while Linux and Windows were green. Linux's
+        // `RENAME_NOREPLACE` answers EEXIST. Apple's `RENAME_EXCL` does not -- it keeps
+        // POSIX `rename`'s rule that old and new naming the SAME existing file is a
+        // success that does nothing. Hard links are unaffected: macOS refuses those, and
+        // that test passed there.
+        //
+        // The name is occupied, so `AlreadyExists` is the answer on every platform, and
+        // this is the same veto the Windows arm carries for the same reason.
+        //
+        // CHECKED AFTER THE CALL, deliberately, and this is the half worth keeping. It
+        // costs no extra syscall, and it CANNOT invert the error priority the way a
+        // pre-check would -- a mistake already made and fixed once on the Windows arm.
+        // A missing source still answers ENOENT from the kernel rather than from us,
+        // because the kernel ran first. Letting it run is free precisely because the
+        // operation it performs in this case is nothing: renaming a name onto itself
+        // destroys nothing, so there is no damage to undo by the time we look.
+        if published.is_ok() && from == to {
             return Err(FsError::new(
                 flux_fs::Code::IoError,
                 std::io::Error::from(std::io::ErrorKind::AlreadyExists),
             ));
         }
-        std::fs::rename(from, to).map_err(FsError::from_io)
+        published
+    }
+
+    /// See the Unix twin for why this is atomic rather than check-then-act.
+    #[cfg(windows)]
+    fn rename_no_replace(&self, from: &Path, to: &Path) -> Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, MoveFileExW,
+        };
+
+        // No MOVEFILE_REPLACE_EXISTING is the whole point: without that flag
+        // MoveFileExW fails rather than replacing, which is the guarantee this method
+        // has always promised and until now only approximated.
+        //
+        // The interior-NUL rejection is not decoration, and leaving it out was a
+        // REGRESSION this method introduced. `encode_wide` emits an interior NUL
+        // happily, and `MoveFileExW` stops reading at the first one -- so a `to` of
+        // "pub\0lish" was MEASURED to publish at "pub" and return Ok, writing to a
+        // path the caller never asked for. `std::fs` never had that hole: its own
+        // `to_u16s` rejects the same input with InvalidInput ("strings passed to
+        // WinAPI cannot contain NULs"), and the check-then-act body this replaced got
+        // that for free by going through `std`. Going direct to the FFI means
+        // re-establishing it here. The Unix arm needs no equivalent: rustix rejects
+        // the same path with EINVAL, MEASURED.
+        let wide = |p: &Path| -> std::result::Result<Vec<u16>, std::io::Error> {
+            use std::os::windows::ffi::OsStrExt;
+            let mut w: Vec<u16> = p.as_os_str().encode_wide().collect();
+            if w.contains(&0) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "paths passed to the Windows API cannot contain interior NULs",
+                ));
+            }
+            w.push(0);
+            Ok(w)
+        };
+        let wfrom = wide(from).map_err(FsError::from_io)?;
+        let wto = wide(to).map_err(FsError::from_io)?;
+
+        // A SAME-OBJECT VETO, and deliberately NOT a destination pre-check.
+        //
+        // MoveFileExW without MOVEFILE_REPLACE_EXISTING does not refuse a target that
+        // IS the source. MEASURED: `from == to` returned Ok where Linux answers EEXIST,
+        // and -- worse -- two hardlinks to one file returned Ok having CONSUMED the
+        // source name. In that second case `to` is a genuinely distinct, existing
+        // directory entry, so §241.5's "refuses to replace an existing entry" was
+        // simply not kept. It is not a philosophical question about whether one object
+        // under two names counts as a collision.
+        //
+        // WHY THIS IS NOT THE SUBSTITUTE :10876 FORBIDS. That ban is on using a probe
+        // to AUTHORIZE a rename, which is what opens the TOCTOU window: check the name
+        // is free, then rename, and a concurrent publisher slips between the two. This
+        // probe only ever VETOES. Every path out of this block that is not an outright
+        // refusal falls through to MoveFileExW, which still decides atomically -- a
+        // publisher that creates `to` after the open below fails is caught there
+        // exactly as before. Nothing here can permit a rename the primitive would have
+        // refused, which is the property the ban exists to protect.
+        //
+        // Opening `to` FIRST is what bounds the cost. The common case -- publishing to
+        // a free name -- pays one FAILED open and stops, rather than the two successful
+        // opens plus two info queries an unconditional comparison would cost on every
+        // published file.
+        //
+        // The flags are the ones `metadata` documents above: `access_mode(0)` avoids
+        // both a sharing violation and a denial on a file this process may not read,
+        // and OPEN_REPARSE_POINT opens a link rather than its target.
+        //
+        // THE LEXICAL CHECK IS NOT REDUNDANT WITH THE IDENTITY ONE, and an earlier
+        // draft of this method had only the identity half. On a filesystem with no
+        // `FILE_ID_INFO` -- FAT32, exFAT -- `identity_of_handle` answers `Unavailable`,
+        // the comparison below falls through by design, and `MoveFileExW` then returns
+        // Ok for `from == to`, restoring the exact bug the veto exists to stop. A
+        // string comparison costs nothing, opens no handle, and works everywhere.
+        //
+        // It is deliberately EXACT rather than case-insensitive. A case-only change on
+        // Windows resolves to the same object and is refused by the identity half
+        // below, which matches both the check-then-act body this replaced (its
+        // `symlink_metadata` saw the target and refused -- MEASURED) and macOS, where
+        // `RENAME_EXCL` on case-insensitive APFS refuses it too. Renaming a name onto
+        // itself in a different case is `rename_replace`'s job, not this method's.
+        //
+        // WHAT THE TWO HALVES DO NOT COVER, stated because an earlier draft of this
+        // comment claimed they were "complete in practice" and that was an overclaim.
+        // They are complete only where a filesystem without `FILE_ID_INFO` also has no
+        // second name for one object. That holds for FAT32 and exFAT, which have no
+        // hard links -- but NOT for an SMB share whose server supports links while the
+        // protocol negotiation drops the id, and NOT for two lexically different paths
+        // to one object (a `subst` drive, a junction) on such a mount. There the names
+        // differ, the identity is unavailable, and `MoveFileExW` consumes the source
+        // name as it always did. That is a documented limit of the degraded path, not
+        // a reason to drop the guard: removing it would restore the `from == to` hole
+        // on every identity-less filesystem, which is strictly worse.
+        //
+        // `access_mode(0)` is load-bearing HERE for a second reason beyond the one
+        // `metadata` gives, and `rename_no_replace_vetoes_a_same_object_target_held_
+        // _open_exclusively` goes red if it is widened. Asking for no access means an
+        // exclusively-held target still PROBES, so the veto below fires rather than
+        // being skipped. The other way a probe can fail on an existing name is a deny
+        // ACE -- and there `MoveFileExW` fails too, PermissionDenied, raw 5, MEASURED,
+        // because a rename needs DELETE on the source. Those two failures being
+        // correlated is what makes the nesting below safe.
+        let probe = |p: &Path| {
+            OpenOptions::new()
+                .access_mode(0)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(p)
+        };
+
+        // BOTH halves live under this probe of `to`, and the nesting is load-bearing
+        // rather than tidiness. A `to` that does not open is either ABSENT or
+        // UNREACHABLE -- NOT necessarily free, as the deny-ACE case above shows -- and
+        // in both cases the KERNEL is the right one to answer rather than this method.
+        //
+        // WHAT it answers depends on `from`, and that dependence is the whole argument
+        // for not pre-empting it. With a valid `from`, an absent `to` is a SUCCESS --
+        // `rename_no_replace_succeeds_when_the_name_is_free` pins exactly that. With
+        // `from == to`, an absent `to` means `from` is absent too and NotFound is the
+        // honest reply. One condition, two opposite right answers, and only the kernel
+        // knows which applies. An earlier draft ran the lexical comparison
+        // first and unconditionally, which made `rename_no_replace(absent, absent)`
+        // answer AlreadyExists on Windows while Linux answered NotFound: MEASURED, and
+        // an inversion of exactly the error priority that
+        // `rename_no_replace_reports_a_missing_source_before_an_occupied_target` exists
+        // to pin. A guard that front-runs the filesystem inherits the obligation to be
+        // right about it.
+        if let Ok(dst) = probe(to) {
+            // An Unavailable identity -- a filesystem with no FILE_ID_INFO, or an id of
+            // zero, which §107 forbids treating as valid -- leaves `same` false on
+            // purpose. Refusing on an identity the filesystem cannot supply would fail
+            // CLOSED on every ordinary publish there.
+            let mut same = from == to;
+            if !same
+                && let Ok(src) = probe(from)
+                && let (FileIdentity::Strong(a), FileIdentity::Strong(b)) =
+                    (identity_of_handle(&src), identity_of_handle(&dst))
+            {
+                same = a == b;
+            }
+            if same {
+                return Err(FsError::new(
+                    flux_fs::Code::IoError,
+                    std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+                ));
+            }
+        }
+
+        // SAFETY: both buffers are NUL-terminated UTF-16 built immediately above and
+        // live for the duration of the call.
+        let ok = unsafe { MoveFileExW(wfrom.as_ptr(), wto.as_ptr(), 0) };
+        if ok == 0 {
+            return Err(FsError::from_io(std::io::Error::last_os_error()));
+        }
+        Ok(())
     }
 
     fn remove_file(&self, path: &Path) -> Result<()> {

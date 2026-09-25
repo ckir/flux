@@ -188,11 +188,26 @@ Each was measured, and each is deliberately NOT fixed in that PR.
 
 ## Repository and CI hygiene
 
-Promoted from the local anomalies inbox (triage of 2026-09-14); each was re-measured on `origin/main` that day.
+Promoted from the local anomalies inbox (triage of 2026-09-14, and of 2026-09-24 for the first item);
+each was re-measured on `origin/main` that day.
 
-- [ ] **No MSRV job.** Every `ci.yml` job uses the stable toolchain and Dependabot auto-merges cargo minor and
-      patch bumps, so a dependency raising its MSRV past the workspace's `rust-version` (1.85) is not caught.
-      Add a job running `cargo +1.85 check --workspace --all-targets`.
+- [ ] **The local gate is Windows-only, and two non-Windows compile breaks reached CI in PR #37.**
+      `just check` runs on the dev machine alone, so a `#[cfg]` mistake cannot fail locally. MEASURED
+      twice in one PR: an ungated `#[test]` calling a `#[cfg(windows)]` helper (`error[E0425]` on Linux,
+      caught only because a WSL cross-check was run by hand), and a test assuming `cfg(unix)` permits
+      non-UTF-8 filenames (macOS APFS/HFS+ enforce UTF-8 and returned `Os { code: 92, "Illegal byte
+      sequence" }` — caught only by CI). Add a `just check-linux` recipe wrapping the WSL leg so the
+      cross-check is a command rather than a habit, and note in the justfile that **macOS has no local
+      equivalent on this machine**, so the macOS leg is CI-only by construction.
+
+- [ ] **No MSRV job, and the policy change makes the original one moot.** `rust-version` now tracks the
+      current stable release (1.98.1) rather than the oldest toolchain that compiles, so the job this item
+      originally asked for — build at the floor, catch a dependency that outgrew it — cannot fail by
+      construction: nothing can require a rustc newer than the latest. What the policy needs instead is the
+      OPPOSITE check, that `rust-version` has not fallen behind stable, because a floor pinned to a specific
+      patch release goes stale the moment the next one ships and nothing in the repo notices. That is how the
+      previous value drifted: it read 1.85 while the code had needed 1.88 for some time, and `criterion`
+      already required 1.86. Decide which of the two this repo actually wants before writing either job.
 - [ ] **`ci.yml` has no `permissions:` or `concurrency:` block**, so its jobs get the repository's default token
       scope and superseded pull-request runs are not cancelled. Add `permissions: contents: read` and a
       concurrency group.

@@ -107,6 +107,52 @@ fn rename_no_replace_refuses_an_existing_target() {
 }
 
 #[test]
+fn rename_no_replace_refuses_a_directory_occupying_the_name() {
+    // A directory at the target is a case the old check-then-act body got right only
+    // by accident -- `symlink_metadata` says "something is there" without saying what.
+    // The atomic primitives refuse it as the OS's own answer, and on every platform.
+    let d = TempDir::new().unwrap();
+    let (from, to) = (d.path().join("from"), d.path().join("to"));
+    let fs = StdFileSystem;
+    fs.create_new(&from).unwrap();
+    std::fs::create_dir(&to).unwrap();
+
+    let err = fs.rename_no_replace(&from, &to).expect_err("a directory occupies the name");
+    assert_eq!(err.code, flux_fs::Code::IoError);
+
+    assert!(std::fs::metadata(&to).unwrap().is_dir(), "the directory must survive");
+    assert!(from.exists(), "the source must be untouched");
+}
+
+#[test]
+fn rename_no_replace_succeeds_when_the_name_is_free() {
+    // The happy path had no test at all: both existing tests assert refusal, so an
+    // implementation that refused EVERYTHING would have passed them both.
+    let d = TempDir::new().unwrap();
+    let (from, to) = (d.path().join("from"), d.path().join("to"));
+    let fs = StdFileSystem;
+    let mut f = fs.create_new(&from).unwrap();
+    f.write_all(b"payload").unwrap();
+    drop(f);
+
+    fs.rename_no_replace(&from, &to).expect("a free name must be claimable");
+
+    assert_eq!(std::fs::read(&to).unwrap(), b"payload");
+    assert!(!from.exists(), "the source name must be gone after a rename");
+}
+
+#[test]
+fn rename_no_replace_reports_a_missing_source() {
+    let d = TempDir::new().unwrap();
+    let (from, to) = (d.path().join("absent"), d.path().join("to"));
+    let fs = StdFileSystem;
+
+    let err = fs.rename_no_replace(&from, &to).expect_err("there is nothing to rename");
+    assert_eq!(err.code, flux_fs::Code::IoError);
+    assert!(!to.exists(), "nothing may appear at the target");
+}
+
+#[test]
 fn set_times_on_a_handle_moves_the_mtime() {
     let d = TempDir::new().unwrap();
     let p = d.path().join("a");
@@ -569,4 +615,243 @@ fn read_dir_reports_non_utf8_names_intact() {
     let got = StdFileSystem.read_dir(d.path()).unwrap();
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].name.as_bytes(), &[b'x', 0xFF, b'y'], "name survived intact");
+}
+
+#[test]
+fn rename_no_replace_refuses_a_path_with_an_interior_nul() {
+    // A REGRESSION pin, not a hypothetical. Going direct to MoveFileExW lost the
+    // interior-NUL rejection `std::fs` performs, and MoveFileExW stops reading at the
+    // first NUL -- so this published at "to" while the caller asked for "to\0bar", and
+    // returned Ok. A method whose whole contract is "publish exactly here or refuse"
+    // must never write to a path it was not given.
+    //
+    // Cross-platform on purpose: rustix rejects the same path with EINVAL, so both arms
+    // owe the same answer and this test is what holds them to it.
+    let d = TempDir::new().unwrap();
+    let from = d.path().join("from");
+    let fs = StdFileSystem;
+    fs.create_new(&from).unwrap();
+
+    let mut s = d.path().join("to").into_os_string();
+    s.push("\u{0}bar");
+    let to = std::path::PathBuf::from(s);
+
+    let err = fs.rename_no_replace(&from, &to).expect_err("an interior NUL is not a path");
+    assert_eq!(err.source.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(from.exists(), "the source must be untouched");
+    assert!(!d.path().join("to").exists(), "nothing may appear at the truncated path");
+}
+
+#[test]
+fn rename_no_replace_reports_a_missing_source_before_an_occupied_target() {
+    // THE ONE TEST THAT DISTINGUISHES THIS BODY FROM THE FORBIDDEN ONE, and the reason
+    // it is worth its own test rather than folding into the missing-source case above.
+    //
+    // check-then-act evaluates `symlink_metadata(to)` first, finds the target occupied
+    // and answers AlreadyExists -- without ever looking at the source. The atomic
+    // primitives hand both paths to the kernel, which resolves the source first and
+    // answers NotFound. MEASURED as ENOENT(2) under Linux and ERROR_FILE_NOT_FOUND(2)
+    // on Windows.
+    //
+    // So this asserts an ORDERING that only a real atomic primitive produces, and it is
+    // what stops a future commit quietly restoring the symlink_metadata pre-check that
+    // FLUX_FULL_UPDATED_SPEC_V16.md:10876 forbids by name. Every other test in this file
+    // passes against that body.
+    let d = TempDir::new().unwrap();
+    let from = d.path().join("absent");
+    let to = d.path().join("occupied");
+    let fs = StdFileSystem;
+    fs.create_new(&to).unwrap();
+
+    let err = fs.rename_no_replace(&from, &to).expect_err("there is nothing to rename");
+    assert_eq!(
+        err.source.kind(),
+        std::io::ErrorKind::NotFound,
+        "the kernel resolves the source first; a destination pre-check would say AlreadyExists"
+    );
+    assert!(to.exists(), "the occupying target must survive");
+}
+
+#[test]
+fn rename_no_replace_refuses_the_source_itself() {
+    // Publishing a name onto itself is a collision, not a no-op: the name is occupied,
+    // and by definition the occupant is not being replaced by something new. Linux and
+    // macOS answer EEXIST for free. Windows answers Ok, so the Windows arm has to veto
+    // it explicitly -- this is the test that holds it to the same contract.
+    let d = TempDir::new().unwrap();
+    let p = d.path().join("x");
+    let fs = StdFileSystem;
+    fs.create_new(&p).unwrap();
+
+    let err = fs.rename_no_replace(&p, &p).expect_err("a name cannot be published onto itself");
+    assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(p.exists(), "the object must survive");
+}
+
+#[test]
+fn rename_no_replace_refuses_a_second_link_to_the_source() {
+    // The sharper half, and the one that is unambiguously a contract breach rather than
+    // a question of taste: `to` is a DISTINCT directory entry that EXISTS. MEASURED
+    // before the veto existed -- Windows returned Ok and CONSUMED the source name,
+    // leaving one link where there had been two, while Linux refused with EEXIST.
+    let d = TempDir::new().unwrap();
+    let (a, b) = (d.path().join("a"), d.path().join("b"));
+    let fs = StdFileSystem;
+    fs.create_new(&a).unwrap();
+
+    // Hard links need filesystem support and, on some Windows configurations, a
+    // privilege this process may lack. Skip rather than fail, following the precedent
+    // the symlink and non-UTF-8 tests in this file set.
+    if std::fs::hard_link(&a, &b).is_err() {
+        eprintln!("SKIPPED: this filesystem will not create a hard link");
+        return;
+    }
+
+    let err = fs.rename_no_replace(&a, &b).expect_err("the target name is occupied");
+    assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(a.exists(), "the source link must survive");
+    assert!(b.exists(), "the target link must survive");
+}
+
+#[cfg(windows)]
+#[test]
+fn rename_no_replace_refuses_a_case_only_change() {
+    // Pinned because it READS like a defect and is not one, so the next person to
+    // notice it finds this test instead of "fixing" it. Windows resolves both names to
+    // one object, making this a same-object publish, which the identity half of the
+    // veto refuses.
+    //
+    // It is not a regression: the check-then-act body this method replaced refused it
+    // too -- MEASURED, `symlink_metadata("FILE.TXT")` succeeds on a case-insensitive
+    // volume -- and macOS refuses it as well, since `RENAME_EXCL` on case-insensitive
+    // APFS sees an occupied name. Changing a name's case is `rename_replace`'s job;
+    // this method publishes a NEW name without replacing, and the name is not new.
+    let d = TempDir::new().unwrap();
+    let lower = d.path().join("file.txt");
+    let upper = d.path().join("FILE.TXT");
+    let fs = StdFileSystem;
+    fs.create_new(&lower).unwrap();
+
+    let err = fs.rename_no_replace(&lower, &upper).expect_err("same object, occupied name");
+    assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(lower.exists(), "the object must survive");
+}
+
+#[test]
+fn rename_no_replace_reports_a_missing_source_even_when_it_is_its_own_target() {
+    // The same-object veto must not front-run the filesystem. `from == to` is a
+    // same-object publish ONLY when the object exists; when it does not, the honest
+    // answer is NotFound, which is what the kernel gives on both platforms.
+    //
+    // A REGRESSION PIN: an earlier draft ran the lexical comparison unconditionally
+    // and answered AlreadyExists here on Windows while Linux answered NotFound --
+    // MEASURED -- inverting the same error priority that
+    // `rename_no_replace_reports_a_missing_source_before_an_occupied_target` pins for
+    // the occupied case. Both belong to one rule: the source is resolved first.
+    let d = TempDir::new().unwrap();
+    let absent = d.path().join("absent");
+    let fs = StdFileSystem;
+
+    let err = fs.rename_no_replace(&absent, &absent).expect_err("there is nothing to rename");
+    assert_eq!(
+        err.source.kind(),
+        std::io::ErrorKind::NotFound,
+        "a missing source outranks a same-object collision that cannot exist"
+    );
+    assert!(!absent.exists(), "nothing may be created");
+}
+
+#[cfg(windows)]
+#[test]
+fn rename_no_replace_vetoes_a_same_object_target_held_open_exclusively() {
+    // `access_mode(0)` in the veto's probe is LOAD-BEARING, and this test is what says
+    // so. A reviewer argued the veto is bypassed whenever the probe fails for a reason
+    // other than absence, leaving MoveFileExW to answer Ok for `from == to`. MEASURED,
+    // that is not what happens on either reachable path:
+    //
+    //   exclusive lock (here)  probe SUCCEEDS -- requesting no access conflicts with
+    //                          nothing -- so the veto fires and answers AlreadyExists.
+    //   deny ACE               probe fails PermissionDenied, and MoveFileExW fails
+    //                          PermissionDenied too (raw 5), because a rename needs
+    //                          DELETE on the source. No false success.
+    //
+    // The two failure conditions are correlated, which is why the nesting is safe. That
+    // correlation depends on the probe asking for NO access: widen `access_mode` and
+    // this test goes red, which is the point of it.
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let d = TempDir::new().unwrap();
+    let p = d.path().join("exclusive");
+    let fs = StdFileSystem;
+    fs.create_new(&p).unwrap();
+
+    let _hold = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&p)
+        .expect("an exclusive open of a file we just created must succeed");
+
+    let err = fs.rename_no_replace(&p, &p).expect_err("same object, occupied name");
+    assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(p.exists(), "the object must survive");
+}
+
+#[test]
+fn rename_no_replace_lets_exactly_one_concurrent_publisher_win() {
+    // THE TEST THAT DEMANDS ATOMICITY, and the plan said one could not exist.
+    //
+    // Every other test here passes against the check-then-act body
+    // FLUX_FULL_UPDATED_SPEC_V16.md:10876 forbids by name -- MEASURED, on BOTH arms,
+    // including the error-ordering test, because a CAREFUL check-then-act that resolves
+    // the source before the target reproduces that ordering exactly. Eight lines of the
+    // forbidden body would have replaced this whole mechanism with a green suite.
+    //
+    // What no pre-check can reproduce is the single-syscall guarantee, and contention
+    // exposes it directly. N threads publish N DISTINCT sources onto ONE name. With a
+    // real no-replace primitive exactly one wins, every round. With check-then-act
+    // several threads see the name free before any of them claims it, and all of them
+    // "succeed" -- MEASURED at 3188 winners over 400 rounds where atomic gave 400.
+    //
+    // The assertion is ONE-SIDED BY CONSTRUCTION and therefore cannot flake CI red: a
+    // scheduler that never overlaps the threads yields exactly one winner, which is a
+    // PASS. Only a genuinely non-atomic body can push the count above the round count.
+    // That makes a miss possible and a false alarm impossible, which is the right way
+    // round for a timing-dependent test.
+    const ROUNDS: usize = 50;
+    const THREADS: usize = 8;
+
+    let d = TempDir::new().unwrap();
+    let fs = StdFileSystem;
+    let mut winners_total = 0usize;
+
+    for r in 0..ROUNDS {
+        let to = d.path().join(format!("target{r}"));
+        let sources: Vec<_> = (0..THREADS)
+            .map(|i| {
+                let p = d.path().join(format!("src{r}_{i}"));
+                fs.create_new(&p).unwrap();
+                p
+            })
+            .collect();
+
+        let barrier = std::sync::Barrier::new(THREADS);
+        let winners = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for p in &sources {
+                let (barrier, winners, to) = (&barrier, &winners, &to);
+                s.spawn(move || {
+                    barrier.wait();
+                    if StdFileSystem.rename_no_replace(p, to).is_ok() {
+                        winners.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+
+        let won = winners.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(won, 1, "round {r}: {won} publishers claimed one name; exactly one may");
+        winners_total += won;
+    }
+
+    assert_eq!(winners_total, ROUNDS, "one winner per round, and no round skipped");
 }
