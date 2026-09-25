@@ -143,6 +143,47 @@ mod posix {
         let err = root.open_dir(OsStr::new("flink")).unwrap_err();
         assert_eq!(err.code, flux_fs::Code::SafetyRejected);
     }
+
+    #[test]
+    fn remove_file_refuses_an_ordinary_directory() {
+        // MEASURED before the Windows guard existed: POSIX refused with
+        // IsADirectory while the Windows arm OPENED the directory and deleted it,
+        // returning Ok. remove_file removing a directory is silent structural damage,
+        // so both arms are pinned here.
+        let d = TempDir::new().unwrap();
+        std::fs::create_dir(d.path().join("adir")).unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+
+        let err = root.remove_file(OsStr::new("adir")).unwrap_err();
+        assert_eq!(err.source.kind(), std::io::ErrorKind::IsADirectory);
+        assert!(d.path().join("adir").is_dir(), "the directory must survive the refusal");
+    }
+
+    #[test]
+    fn a_missing_target_is_not_a_destination_error() {
+        // The distinction open_dir does NOT make, deliberately. A missing COMPONENT
+        // of the destination path is a destination problem and open_dir still says
+        // DestinationError. A missing file to remove, stat or rename is an ordinary
+        // not-found. MEASURED: this arm said DestinationError for all of them because
+        // open_dir's mapping had been copied into each helper.
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+
+        for err in [
+            root.remove_file(OsStr::new("nosuch")).unwrap_err(),
+            root.metadata(OsStr::new("nosuch")).unwrap_err(),
+            root.rename_no_replace(OsStr::new("nosuch"), &root, OsStr::new("dest")).unwrap_err(),
+        ] {
+            assert_eq!(err.code, flux_fs::Code::IoError);
+            assert_eq!(err.source.kind(), std::io::ErrorKind::NotFound);
+        }
+
+        // ... while the destination component itself still reports DestinationError.
+        assert_eq!(
+            root.open_dir(OsStr::new("nosuch")).unwrap_err().code,
+            flux_fs::Code::DestinationError
+        );
+    }
 }
 
 #[cfg(windows)]
@@ -329,5 +370,69 @@ mod windows_arm {
         let root = StdFileSystem.destination_root(d.path()).unwrap();
         let err = root.open_dir(OsStr::new("flink")).unwrap_err();
         assert_eq!(err.code, flux_fs::Code::SafetyRejected);
+    }
+
+    #[test]
+    fn an_over_long_name_creates_nothing_at_all() {
+        // The check_component bound, proven at the filesystem rather than in a unit
+        // test. MEASURED before it existed: this created a 100-character file and
+        // returned Ok, because UNICODE_STRING.Length is a u16 of BYTES and
+        // 32868 * 2 wraps to 200. The assertion that matters is the empty directory:
+        // a refusal that still wrote something would be no fix at all.
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let long: std::ffi::OsString = std::ffi::OsString::from("b".repeat(32868));
+
+        let err = match root.create_new(&long) {
+            Err(e) => e,
+            Ok(_) => panic!("an over-long name must not be created"),
+        };
+        assert_eq!(err.code, flux_fs::Code::SafetyRejected);
+        assert_eq!(
+            std::fs::read_dir(d.path()).unwrap().count(),
+            0,
+            "the refusal must leave the directory untouched"
+        );
+    }
+
+    #[test]
+    fn remove_file_refuses_an_ordinary_directory() {
+        // MEASURED before the Windows guard existed: POSIX refused with
+        // IsADirectory while the Windows arm OPENED the directory and deleted it,
+        // returning Ok. remove_file removing a directory is silent structural damage,
+        // so both arms are pinned here.
+        let d = TempDir::new().unwrap();
+        std::fs::create_dir(d.path().join("adir")).unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+
+        let err = root.remove_file(OsStr::new("adir")).unwrap_err();
+        assert_eq!(err.source.kind(), std::io::ErrorKind::IsADirectory);
+        assert!(d.path().join("adir").is_dir(), "the directory must survive the refusal");
+    }
+
+    #[test]
+    fn a_missing_target_is_not_a_destination_error() {
+        // The distinction open_dir does NOT make, deliberately. A missing COMPONENT
+        // of the destination path is a destination problem and open_dir still says
+        // DestinationError. A missing file to remove, stat or rename is an ordinary
+        // not-found. MEASURED: this arm said DestinationError for all of them because
+        // open_dir's mapping had been copied into each helper.
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+
+        for err in [
+            root.remove_file(OsStr::new("nosuch")).unwrap_err(),
+            root.metadata(OsStr::new("nosuch")).unwrap_err(),
+            root.rename_no_replace(OsStr::new("nosuch"), &root, OsStr::new("dest")).unwrap_err(),
+        ] {
+            assert_eq!(err.code, flux_fs::Code::IoError);
+            assert_eq!(err.source.kind(), std::io::ErrorKind::NotFound);
+        }
+
+        // ... while the destination component itself still reports DestinationError.
+        assert_eq!(
+            root.open_dir(OsStr::new("nosuch")).unwrap_err().code,
+            flux_fs::Code::DestinationError
+        );
     }
 }

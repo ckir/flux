@@ -326,7 +326,14 @@ fn metadata_at(p: &OwnedHandle, n: &OsStr) -> Result<Metadata> {
 
     if status != 0 {
         let code = match status {
-            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => Code::DestinationError,
+            // A missing TARGET is not a broken DESTINATION. MEASURED on both arms:
+            // POSIX answers IoError/NotFound here while this arm answered
+            // DestinationError, because open_dir's mapping was copied in. open_dir
+            // KEEPS DestinationError -- a missing component of the destination path
+            // IS a destination problem, and both arms' tests pin that -- but a
+            // missing file to remove, stat or rename is an ordinary not-found, and
+            // the engine must not read it as a broken tree.
+            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => Code::IoError,
             STATUS_ACCESS_DENIED => Code::PermissionDenied,
             _ => Code::IoError,
         };
@@ -371,7 +378,9 @@ fn remove_file_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {
     let status = unsafe {
         NtCreateFile(
             &raw mut raw,
-            DELETE | SYNCHRONIZE,
+            // FILE_READ_ATTRIBUTES is not decoration: the directory guard below
+            // queries this handle, and DELETE alone does not grant that query.
+            DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
             &raw const oa,
             &raw mut open_iosb,
             std::ptr::null(),
@@ -385,7 +394,14 @@ fn remove_file_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {
     };
     if status != 0 {
         let code = match status {
-            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => Code::DestinationError,
+            // A missing TARGET is not a broken DESTINATION. MEASURED on both arms:
+            // POSIX answers IoError/NotFound here while this arm answered
+            // DestinationError, because open_dir's mapping was copied in. open_dir
+            // KEEPS DestinationError -- a missing component of the destination path
+            // IS a destination problem, and both arms' tests pin that -- but a
+            // missing file to remove, stat or rename is an ordinary not-found, and
+            // the engine must not read it as a broken tree.
+            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => Code::IoError,
             STATUS_ACCESS_DENIED => Code::PermissionDenied,
             _ => Code::IoError,
         };
@@ -393,6 +409,28 @@ fn remove_file_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {
     }
     // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `raw` is a valid handle we own.
     let h = unsafe { OwnedHandle::from_raw_handle(raw as _) };
+
+    // REMOVE_FILE MUST NOT REMOVE A DIRECTORY, and without this it did.
+    //
+    // MEASURED, both arms, before this guard: POSIX `unlinkat(AtFlags::empty())`
+    // refuses an ordinary directory with EISDIR (IoError / IsADirectory), while this
+    // arm opened it and FileDispositionInformation DELETED it, returning Ok. The
+    // open omits FILE_NON_DIRECTORY_FILE on purpose -- a junction is a directory and
+    // must stay removable -- so the constraint the open cannot express is applied
+    // here instead.
+    //
+    // A reparse-point directory (a junction, a directory symlink) is still removed,
+    // which MATCHES POSIX: `unlinkat` unlinks a symlink whatever it points at. Only
+    // a PLAIN directory is refused.
+    if is_plain_directory(&h) {
+        return Err(FsError::new(
+            Code::IoError,
+            std::io::Error::new(
+                std::io::ErrorKind::IsADirectory,
+                "remove_file refuses a directory",
+            ),
+        ));
+    }
 
     let mut info = FILE_DISPOSITION_INFORMATION { DeleteFile: true };
     let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
@@ -448,7 +486,14 @@ fn rename_at(fd: &OwnedHandle, f: &OsStr, td: &OwnedHandle, t: &OsStr, r: bool) 
     };
     if status != 0 {
         let code = match status {
-            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => Code::DestinationError,
+            // A missing TARGET is not a broken DESTINATION. MEASURED on both arms:
+            // POSIX answers IoError/NotFound here while this arm answered
+            // DestinationError, because open_dir's mapping was copied in. open_dir
+            // KEEPS DestinationError -- a missing component of the destination path
+            // IS a destination problem, and both arms' tests pin that -- but a
+            // missing file to remove, stat or rename is an ordinary not-found, and
+            // the engine must not read it as a broken tree.
+            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => Code::IoError,
             STATUS_ACCESS_DENIED => Code::PermissionDenied,
             _ => Code::IoError,
         };
@@ -603,4 +648,48 @@ pub(crate) fn reparse_tag_of(
         return Ok(None);
     }
     Ok(Some(info.reparse_tag))
+}
+
+/// Is this handle an ORDINARY directory -- a directory that is not a reparse point?
+///
+/// `remove_file_at` needs the distinction and `reparse_tag_of` cannot give it: that
+/// function answers `None` both for a plain file and for a real directory, because
+/// all it reports is the tag. This reads the same information class and asks the
+/// other question. A failure answers `false`, because this only ever REFUSES an
+/// operation and must never invent a refusal it cannot justify.
+#[cfg(windows)]
+fn is_plain_directory(h: &std::os::windows::io::OwnedHandle) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FileAttributeTagInformation, NtQueryInformationFile,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    #[repr(C)]
+    struct FileAttributeTagInfo {
+        file_attributes: u32,
+        reparse_tag: u32,
+    }
+
+    let mut info = FileAttributeTagInfo { file_attributes: 0, reparse_tag: 0 };
+    let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a live, correctly sized FILE_ATTRIBUTE_TAG_INFORMATION and
+    // the handle outlives the call.
+    let status = unsafe {
+        NtQueryInformationFile(
+            h.as_raw_handle() as _,
+            &raw mut iosb,
+            (&raw mut info).cast(),
+            size_of::<FileAttributeTagInfo>() as u32,
+            FileAttributeTagInformation,
+        )
+    };
+    if status != 0 {
+        return false;
+    }
+    info.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0
+        && info.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
 }
