@@ -184,6 +184,8 @@ mod posix {
         let root = StdFileSystem.destination_root(d.path()).unwrap();
         let err = root.remove_file(OsStr::new("locked")).unwrap_err();
         chflags("nouchg"); // before any assert, or TempDir cannot clean up
+        // EPERM (1), not EACCES: otherwise this never reaches the branch it guards.
+        assert_eq!(err.source.raw_os_error(), Some(1), "expected EPERM, got {:?}", err.source);
         assert_eq!(err.code, flux_fs::Code::PermissionDenied);
         assert!(f.is_file(), "the file must survive the refusal");
     }
