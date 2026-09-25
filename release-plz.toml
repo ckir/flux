@@ -26,14 +26,13 @@ git_tag_enable = false
 git_release_enable = false
 pr_labels = ["release"]
 
-# flux-cli ships the `flux` binary, so it carries the tag, the release and the one changelog, which also
-# lists the commits of every other package (the root package owns everything outside crates/).
+# flux-cli ships the `flux` binary, but it does NOT carry the tag or the release, and an earlier
+# revision of this file had it do both. release-plz takes a git release's BODY from the changelog of
+# the package that CREATES that release, so splitting them -- release on flux-cli, aggregated changelog
+# on the root package -- published an EMPTY release. MEASURED: v0.1.0 carried 1164 bytes of notes while
+# the changelog still lived on flux-cli; v0.1.1 and v0.2.0 carried ZERO, the two releases after it moved.
 [[package]]
 name = "flux-cli"
-git_tag_enable = true
-git_tag_name = "v{{ version }}"
-git_release_enable = true
-git_release_name = "v{{ version }}"
 version_group = "flux"
 
 # The root package owns the changelog, because it is the only one release-plz attributes the whole
@@ -46,6 +45,11 @@ name = "flux"
 version_group = "flux"
 changelog_update = true
 changelog_path = "CHANGELOG.md"
+# The tag and the release live HERE, with the changelog they publish. One tag and one GitHub release
+# for the whole workspace, as before -- only the package that makes them has moved.
+git_tag_enable = true
+git_release_enable = true
+git_release_name = "v{{ version }}"
 # The commits under crates/ belong to those crates, not to this one, so the single changelog has to
 # pull them in explicitly. Listing all six is deliberate: a crate omitted here does not warn, it just
 # stops appearing in the release notes, which is the failure being fixed.
