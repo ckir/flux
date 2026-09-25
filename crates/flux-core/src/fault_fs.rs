@@ -4,8 +4,12 @@
 //! after a strict failure — so this records the call sequence and can fail any
 //! named call. None of that is reachable against a real disk.
 
-use flux_fs::{Code, DirEntry, FileHandle, FileSystem, FileType, FsError, Metadata, Perms, Result};
+use flux_fs::{
+    Code, DestinationRoot, DirEntry, DirHandle, FileHandle, FileSystem, FileType, FsError,
+    Metadata, Perms, Result, check_component,
+};
 use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -71,6 +75,49 @@ struct Inner {
     /// Pre-incremented, so the first object is 1 and nothing ever gets 0 - §107
     /// forbids treating a zero id as a valid identity.
     next_object: u128,
+    /// The `DirHandle` node graph: id -> node, kept SEPARATE from the path-keyed
+    /// maps above. A `DirHandle` reaches a child through the id it already holds --
+    /// never by re-walking a path -- which is what lets `repoint_for_test` stage
+    /// item 114's attack: rebinding a NAME in some node's `children` does not move
+    /// the id a handle minted from that name earlier.
+    dir_nodes: HashMap<u64, DirNode>,
+    /// path -> node id, consulted ONLY when a path is resolved by name from
+    /// scratch: `destination_root`'s argument, and `repoint_for_test`'s two path
+    /// arguments. No `DirHandle` method consults this map.
+    dir_node_by_path: HashMap<PathBuf, u64>,
+    next_dir_node: u64,
+}
+
+/// One node in the `DirHandle` graph, addressed by an opaque id rather than by
+/// path. `path` is a snapshot taken ONCE, when the node is minted, and used only to
+/// reach the legacy path-keyed maps above (`files`/`directories`/`types`) -- every
+/// `DirHandle` method reaches a node through its id and this snapshot, never by
+/// re-walking a name. `children` is the one place a name binding lives, and the one
+/// place `repoint_for_test` is allowed to write: rewriting an entry there changes
+/// what OPENING that name gets from now on, without moving the snapshot any handle
+/// that already resolved it is holding.
+struct DirNode {
+    path: PathBuf,
+    children: HashMap<OsString, u64>,
+}
+
+/// Get or mint the node for `path`, memoized by path so the same path always yields
+/// the same id. This is the only place a path is turned into a node id from
+/// scratch -- used by `destination_root` (which resolves its argument by name once,
+/// per the trait's own contract) and by `repoint_for_test` (which needs the id of
+/// both the name it is rewriting and the id it is rewriting that name onto). No
+/// `DirHandle` method calls this: a handle already has its id, and reaches a child
+/// through its own node's `children` map, never by feeding a path back through this
+/// cache.
+fn dir_node_for_path(g: &mut Inner, path: &Path) -> u64 {
+    if let Some(&id) = g.dir_node_by_path.get(path) {
+        return id;
+    }
+    g.next_dir_node += 1;
+    let id = g.next_dir_node;
+    g.dir_nodes.insert(id, DirNode { path: path.to_path_buf(), children: HashMap::new() });
+    g.dir_node_by_path.insert(path.to_path_buf(), id);
+    id
 }
 
 /// `NotFound` when the rename's source does not exist, as `std::fs::rename` gives.
@@ -351,6 +398,29 @@ impl FaultFs {
         g.grow.insert(path.to_path_buf(), extra.to_vec());
     }
 
+    /// Rebind the NAME at `name` (e.g. `/dst/target`) to whatever `new_target` (e.g.
+    /// `/elsewhere`) currently denotes, WITHOUT touching the node any handle already
+    /// holds for the old binding. This is item 114's attacker, staged without a
+    /// kernel: it can only change what a NAME means for the NEXT lookup, never reach
+    /// into a handle that already resolved that name to an id -- exactly the
+    /// property a real directory handle has and a path does not. Exists only for
+    /// `a_handle_still_addresses_its_directory_after_the_name_is_repointed`.
+    pub fn repoint_for_test(&self, name: impl AsRef<Path>, new_target: impl AsRef<Path>) {
+        let name = name.as_ref();
+        let new_target = new_target.as_ref();
+        let (Some(parent_path), Some(child_name)) = (name.parent(), name.file_name()) else {
+            return;
+        };
+        let mut g = self.inner.lock().unwrap();
+        let parent_id = dir_node_for_path(&mut g, parent_path);
+        let target_id = dir_node_for_path(&mut g, new_target);
+        g.dir_nodes
+            .get_mut(&parent_id)
+            .unwrap()
+            .children
+            .insert(child_name.to_os_string(), target_id);
+    }
+
     fn record(&self, call: String, key: &str) -> Result<()> {
         let mut g = self.inner.lock().unwrap();
         g.calls.push(call);
@@ -413,7 +483,14 @@ impl FileSystem for FaultFs {
         let p = path.to_path_buf();
         self.record(format!("create_new({})", p.display()), "create_new")?;
         let mut g = self.inner.lock().unwrap();
-        if g.files.contains_key(&p) {
+        // A DIRECTORY occupies the name too, and this used to check only `files`.
+        // MEASURED: `create_new` on a name held by a directory returned Ok and the
+        // fake created a file over it, while both real arms refuse with
+        // AlreadyExists -- std's `create_new` by path, and the handle arms, which
+        // were fixed for exactly this case. The fake was the only implementation
+        // that let it through, and it is the one the engine's tests will run
+        // against.
+        if g.files.contains_key(&p) || g.directories.contains(&p) {
             return Err(FsError::new(
                 Code::IoError,
                 std::io::Error::from(std::io::ErrorKind::AlreadyExists),
@@ -645,6 +722,181 @@ impl FileSystem for FaultFs {
         g.types.insert(p.clone(), FileType::Dir);
         mint_identity(&mut g, &p);
         Ok(())
+    }
+}
+
+impl DestinationRoot for FaultFs {
+    type Dir = FakeDirHandle;
+
+    fn destination_root(&self, path: &Path) -> Result<Self::Dir> {
+        let mut g = self.inner.lock().unwrap();
+        if !g.directories.contains(path) {
+            // A path that EXISTS but is not a directory is refused as
+            // NotADirectory, not NotFound. MEASURED before this: the fake said
+            // NotFound for both, while both real arms distinguish them -- and the
+            // distinction is the whole point of the trait's requirement, since a
+            // caller that passed a file needs to be told that rather than being
+            // told its destination is missing.
+            let exists = g.files.contains_key(path);
+            let kind = if exists {
+                std::io::ErrorKind::NotADirectory
+            } else {
+                std::io::ErrorKind::NotFound
+            };
+            return Err(FsError::new(Code::IoError, std::io::Error::from(kind)));
+        }
+        let id = dir_node_for_path(&mut g, path);
+        drop(g);
+        Ok(FakeDirHandle { id, inner: std::sync::Arc::clone(&self.inner) })
+    }
+}
+
+/// A handle onto one of the fake's directories, addressed by an id into
+/// `Inner::dir_nodes` -- never by the path it was opened through. See `DirNode`.
+pub struct FakeDirHandle {
+    id: u64,
+    inner: std::sync::Arc<Mutex<Inner>>,
+}
+
+// Manual, not derived: `Inner` holds a `Mutex` and is not `Debug`, and the id alone
+// is all `unwrap_err()` (used on `Result<FakeDirHandle, _>` in the tests) needs.
+impl std::fmt::Debug for FakeDirHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FakeDirHandle").field("id", &self.id).finish()
+    }
+}
+
+impl FakeDirHandle {
+    /// A fresh `FaultFs` sharing this handle's state, so a `DirHandle` operation can
+    /// be implemented by delegating to the matching `FileSystem` method on a full
+    /// path -- reusing its fault injection, call log and identity bookkeeping rather
+    /// than duplicating it.
+    fn fs(&self) -> FaultFs {
+        FaultFs { inner: std::sync::Arc::clone(&self.inner) }
+    }
+
+    /// This node's own snapshot path. Fixed at the moment this id was minted; never
+    /// re-derived by walking a name.
+    fn my_path(&self) -> PathBuf {
+        let g = self.inner.lock().unwrap();
+        g.dir_nodes
+            .get(&self.id)
+            .expect("a live FakeDirHandle always names a node still in the graph")
+            .path
+            .clone()
+    }
+}
+
+impl DirHandle for FakeDirHandle {
+    type Writer = FakeHandle;
+
+    fn open_dir(&self, name: &OsStr) -> Result<Self> {
+        check_component(name)?;
+        // Reuse the binding this handle's OWN node already has for `name`, if any.
+        // This is the map `repoint_for_test` rewrites, and reading it here -- rather
+        // than recomputing a path -- is what makes a repoint AFTER this call have no
+        // effect on the handle this call already returned.
+        {
+            let g = self.inner.lock().unwrap();
+            if let Some(&child_id) = g.dir_nodes.get(&self.id).and_then(|n| n.children.get(name)) {
+                return Ok(Self { id: child_id, inner: std::sync::Arc::clone(&self.inner) });
+            }
+        }
+        let child_path = self.my_path().join(name);
+        // A MISSING COMPONENT IS A DESTINATION ERROR, which is what both real arms
+        // answer and what their `a_missing_component_is_a_destination_error` tests
+        // pin. The fake reported whatever `metadata` reported -- IoError/NotFound --
+        // so it was the one implementation disagreeing with a rule the other two
+        // are tested against.
+        let meta = self.fs().metadata(&child_path).map_err(|e| {
+            if e.source.kind() == std::io::ErrorKind::NotFound {
+                FsError::new(Code::DestinationError, std::io::Error::from(e.source.kind()))
+            } else {
+                e
+            }
+        })?;
+        if meta.file_type == FileType::Symlink {
+            return Err(FsError::new(
+                Code::SafetyRejected,
+                std::io::Error::other("refuses to traverse a symlink or other name-surrogate"),
+            ));
+        }
+        if meta.file_type != FileType::Dir {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::other("not a directory"),
+            ));
+        }
+        let mut g = self.inner.lock().unwrap();
+        let child_id = dir_node_for_path(&mut g, &child_path);
+        g.dir_nodes.get_mut(&self.id).unwrap().children.insert(name.to_os_string(), child_id);
+        drop(g);
+        Ok(Self { id: child_id, inner: std::sync::Arc::clone(&self.inner) })
+    }
+
+    fn create_dir(&self, name: &OsStr) -> Result<Self> {
+        check_component(name)?;
+        let child_path = self.my_path().join(name);
+        self.fs().create_dir(&child_path)?;
+        let mut g = self.inner.lock().unwrap();
+        let child_id = dir_node_for_path(&mut g, &child_path);
+        g.dir_nodes.get_mut(&self.id).unwrap().children.insert(name.to_os_string(), child_id);
+        drop(g);
+        Ok(Self { id: child_id, inner: std::sync::Arc::clone(&self.inner) })
+    }
+
+    fn create_new(&self, name: &OsStr) -> Result<Self::Writer> {
+        check_component(name)?;
+        let child_path = self.my_path().join(name);
+        self.fs().create_new(&child_path)
+    }
+
+    fn metadata(&self, name: &OsStr) -> Result<Metadata> {
+        check_component(name)?;
+        let child_path = self.my_path().join(name);
+        self.fs().metadata(&child_path)
+    }
+
+    fn remove_file(&self, name: &OsStr) -> Result<()> {
+        check_component(name)?;
+        let child_path = self.my_path().join(name);
+        // REFUSE A DIRECTORY, with the kind both real arms use. MEASURED before
+        // this: the fake answered NotFound here -- it refused, but only because it
+        // found no FILE at the name, never because the object was a directory.
+        // Both real arms answer IsADirectory. A fake that refuses for a different
+        // reason than reality teaches the engine the wrong branch, which is the
+        // same trap as the no-replace kind recorded a few tests below.
+        {
+            let g = self.inner.lock().unwrap();
+            let is_dir = g.directories.contains(&child_path)
+                && g.types.get(&child_path) != Some(&FileType::Symlink);
+            if is_dir {
+                return Err(FsError::new(
+                    Code::IoError,
+                    std::io::Error::new(
+                        std::io::ErrorKind::IsADirectory,
+                        "remove_file refuses a directory",
+                    ),
+                ));
+            }
+        }
+        self.fs().remove_file(&child_path)
+    }
+
+    fn rename_no_replace(&self, from: &OsStr, other: &Self, to: &OsStr) -> Result<()> {
+        check_component(from)?;
+        check_component(to)?;
+        let from_path = self.my_path().join(from);
+        let to_path = other.my_path().join(to);
+        self.fs().rename_no_replace(&from_path, &to_path)
+    }
+
+    fn rename_replace(&self, from: &OsStr, other: &Self, to: &OsStr) -> Result<()> {
+        check_component(from)?;
+        check_component(to)?;
+        let from_path = self.my_path().join(from);
+        let to_path = other.my_path().join(to);
+        self.fs().rename_replace(&from_path, &to_path)
     }
 }
 
@@ -913,10 +1165,155 @@ mod tests {
         let err = fs.rename_no_replace(Path::new("/from"), Path::new("/to")).unwrap_err();
 
         // NOT AlreadyExists: the name is free. The filesystem cannot make the promise
-        // at all, which is a different fact and the one the engine cut branches on.
+        // at all, which is a different fact.
+        //
+        // THE KIND BELOW IS THIS FAKE'S CHOICE, NOT A CONTRACT, and an earlier version
+        // of this comment said it was "the one the engine cut branches on" -- which
+        // would be a trap if the engine took it literally. MEASURED on a real
+        // 9p-mounted volume: `rename_no_replace` there fails with EINVAL, so the kind
+        // is `InvalidInput`, NOT `Unsupported`. A third filesystem may well answer a
+        // third way.
+        //
+        // So the engine's §241.5 probe must treat ANY failure of an attempted
+        // no-replace publish as "the primitive is unavailable", and must not match on
+        // a particular `ErrorKind`. An engine written to pass against this fake by
+        // checking for `Unsupported` alone would pass its tests and miss the real
+        // case on Linux -- the exact inversion of what a fake is for. Tracked with
+        // the rest of the item-113 debt.
         assert_eq!(err.code, Code::IoError);
         assert_eq!(err.source.kind(), std::io::ErrorKind::Unsupported);
         assert!(!fs.exists("/to"), "an unsupported primitive must not fall back to a plain rename");
         assert!(fs.exists("/from"), "the source must be untouched");
+    }
+
+    #[test]
+    fn a_handle_still_addresses_its_directory_after_the_name_is_repointed() {
+        // Item 114's attack, staged without a kernel. The fake's handle is an id
+        // into its tree rather than a name, so repointing the NAME leaves the
+        // handle addressing the ORIGINAL node -- which is exactly what a real
+        // directory handle does, and exactly what a path does not.
+        //
+        // WHAT THIS PROVES, AND WHAT IT DOES NOT. Stated because an earlier reading
+        // of it claimed more, and the gap is the kind that looks like coverage.
+        //
+        // PROVES: the handle does not RE-RESOLVE its name at use time. MEASURED by
+        // mutation -- making `my_path` re-resolve this node's own last component
+        // through the parent's (repointable) `children` binding on every call reds
+        // this test, with this message, while its sibling stays green.
+        //
+        // DOES NOT PROVE: that a path-holding handle is refused. A `FakeDirHandle`
+        // storing a `PathBuf` snapshot taken at open time would also pass, because
+        // `Inner`'s maps are keyed flat by `PathBuf` and `repoint_for_test` rewrites
+        // only the `children` bindings -- so nothing re-aliases the stored path and
+        // the write lands where it always would. In the REAL arms that distinction
+        // does not exist: the kernel re-resolves a stored path on every syscall, so
+        // holding one IS the defect. The fake cannot express that yet.
+        //
+        // Closing it means re-keying this fake's storage by node id so its
+        // path-based methods traverse, and that is deliberately NOT done here. It is
+        // not a data-structure swap: `write_file` currently creates a file at any
+        // depth with no parent, `move_object` re-keys only the exact string (a
+        // renamed directory strands its children), and a symlink carries no target
+        // at all -- so a faithful double needs hierarchical strictness, descendant
+        // re-keying and a resolution engine with cycle limits. The consumer that
+        // fixes those requirements is cut 4's `copy_tree`, which does not exist yet;
+        // building them now would be designing against an imagined caller. The peer
+        // reviewing this first argued for re-keying immediately and reversed after
+        // measuring all three points above; the agreed disposition is to document
+        // the limit here and land the re-key in cut 4, where its caller defines it.
+        use flux_fs::{DestinationRoot, DirHandle};
+        use std::ffi::OsStr;
+
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.create_dir(Path::new("/dst/target")).unwrap();
+        fs.create_dir(Path::new("/elsewhere")).unwrap();
+
+        let root = fs.destination_root(Path::new("/dst")).unwrap();
+        let held = root.open_dir(OsStr::new("target")).unwrap();
+
+        // The attacker swaps what the NAME means.
+        fs.repoint_for_test(Path::new("/dst/target"), Path::new("/elsewhere"));
+
+        held.create_new(OsStr::new("payload")).unwrap();
+
+        assert!(
+            !fs.exists("/elsewhere/payload"),
+            "the write followed the swapped name; the handle was not load-bearing"
+        );
+    }
+
+    #[test]
+    fn the_fake_refuses_a_name_with_a_separator() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        use std::ffi::OsStr;
+
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/dst")).unwrap();
+        let root = fs.destination_root(Path::new("/dst")).unwrap();
+        let err = root.open_dir(OsStr::new("a/b")).unwrap_err();
+        assert_eq!(err.code, Code::SafetyRejected);
+    }
+
+    #[test]
+    fn the_fake_refuses_what_the_real_arms_refuse_and_says_the_same_thing() {
+        // A fake is only useful if it is wrong in the same places reality is. These
+        // three were MEASURED to diverge: the fake refused all of them, but for
+        // different reasons and with different kinds than the POSIX and Windows
+        // arms, so an engine written against it would learn the wrong branch and
+        // meet the real kind in production. The trait now states each of these as a
+        // requirement; this is what holds the fake to it.
+        use flux_fs::{DestinationRoot, DirHandle};
+        use std::ffi::OsStr;
+
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.create_dir(Path::new("/dst/adir")).unwrap();
+        fs.write_file("/dst/afile", b"x");
+        let root = fs.destination_root(Path::new("/dst")).unwrap();
+
+        // remove_file must refuse a DIRECTORY as IsADirectory, not NotFound.
+        let err = root.remove_file(OsStr::new("adir")).unwrap_err();
+        assert_eq!(err.source.kind(), std::io::ErrorKind::IsADirectory);
+        assert!(fs.exists("/dst/adir"), "the directory must survive the refusal");
+
+        // create_dir must refuse an occupied name as AlreadyExists.
+        let err = match root.create_dir(OsStr::new("adir")) {
+            Err(e) => e,
+            Ok(_) => panic!("create_dir must refuse an occupied name"),
+        };
+        assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
+
+        // A FILE as the destination root is NotADirectory; a MISSING one is
+        // NotFound. The fake used to answer NotFound to both.
+        let err = match fs.destination_root(Path::new("/dst/afile")) {
+            Err(e) => e,
+            Ok(_) => panic!("a file must not be accepted as a destination root"),
+        };
+        assert_eq!(err.source.kind(), std::io::ErrorKind::NotADirectory);
+        let err = match fs.destination_root(Path::new("/dst/nosuch")) {
+            Err(e) => e,
+            Ok(_) => panic!("a missing root must be refused"),
+        };
+        assert_eq!(err.source.kind(), std::io::ErrorKind::NotFound);
+
+        // create_new must see a DIRECTORY as occupying the name. MEASURED before
+        // this: the fake returned Ok and created a file over it, alone among the
+        // three implementations.
+        let err = match root.create_new(OsStr::new("adir")) {
+            Err(e) => e,
+            Ok(_) => panic!("a name a directory holds is taken"),
+        };
+        assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(fs.exists("/dst/adir"), "the directory must survive");
+
+        // A missing component is a DESTINATION error, which is the rule both real
+        // arms are tested against. The fake used to pass through metadata's
+        // IoError/NotFound.
+        let err = match root.open_dir(OsStr::new("absent")) {
+            Err(e) => e,
+            Ok(_) => panic!("a missing component must be refused"),
+        };
+        assert_eq!(err.code, Code::DestinationError);
     }
 }
