@@ -1073,4 +1073,51 @@ mod windows_arm {
             "the moved name must still resolve through the junction to the same target"
         );
     }
+
+    #[test]
+    fn rename_replace_refuses_a_read_only_target() {
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        drop(root.create_new(OsStr::new("from")).unwrap());
+        let to = d.path().join("to");
+        std::fs::write(&to, b"protected").unwrap();
+        let mut perms = std::fs::metadata(&to).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&to, perms).unwrap();
+
+        let err = root.rename_replace(OsStr::new("from"), &root, OsStr::new("to")).unwrap_err();
+
+        assert_eq!(err.code, flux_fs::Code::PermissionDenied);
+        assert!(err.source.raw_os_error().is_none(), "the guard must refuse, not the OS");
+        assert_eq!(std::fs::read(&to).unwrap(), b"protected", "the protected file must survive");
+        std::fs::remove_file(&to).expect("a read-only file must still be removable");
+    }
+
+    #[test]
+    fn rename_replace_refuses_a_target_denied_by_acl() {
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        drop(root.create_new(OsStr::new("from")).unwrap());
+        let to = d.path().join("to");
+        std::fs::write(&to, b"protected").unwrap();
+        let user = std::env::var("USERNAME").expect("USERNAME");
+        let denied = std::process::Command::new("icacls")
+            .args([&to.display().to_string(), "/deny", &format!("{user}:(W,D,DC)")])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !denied {
+            eprintln!("skipped: could not apply a deny ACE");
+            return;
+        }
+        assert!(!std::fs::metadata(&to).unwrap().permissions().readonly(), "attribute is unset");
+
+        let refused = root.rename_replace(OsStr::new("from"), &root, OsStr::new("to")).is_err();
+
+        let _ = std::process::Command::new("icacls")
+            .args([&to.display().to_string(), "/remove:d", &user])
+            .output();
+        let content = std::fs::read(&to).expect("the destination must still be readable");
+        assert!(refused, "a destination we may not write must be refused");
+        assert_eq!(content, b"protected", "the protected contents must survive");
+    }
 }
