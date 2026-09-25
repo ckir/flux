@@ -795,3 +795,63 @@ fn rename_no_replace_vetoes_a_same_object_target_held_open_exclusively() {
     assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
     assert!(p.exists(), "the object must survive");
 }
+
+#[test]
+fn rename_no_replace_lets_exactly_one_concurrent_publisher_win() {
+    // THE TEST THAT DEMANDS ATOMICITY, and the plan said one could not exist.
+    //
+    // Every other test here passes against the check-then-act body
+    // FLUX_FULL_UPDATED_SPEC_V16.md:10876 forbids by name -- MEASURED, on BOTH arms,
+    // including the error-ordering test, because a CAREFUL check-then-act that resolves
+    // the source before the target reproduces that ordering exactly. Eight lines of the
+    // forbidden body would have replaced this whole mechanism with a green suite.
+    //
+    // What no pre-check can reproduce is the single-syscall guarantee, and contention
+    // exposes it directly. N threads publish N DISTINCT sources onto ONE name. With a
+    // real no-replace primitive exactly one wins, every round. With check-then-act
+    // several threads see the name free before any of them claims it, and all of them
+    // "succeed" -- MEASURED at 3188 winners over 400 rounds where atomic gave 400.
+    //
+    // The assertion is ONE-SIDED BY CONSTRUCTION and therefore cannot flake CI red: a
+    // scheduler that never overlaps the threads yields exactly one winner, which is a
+    // PASS. Only a genuinely non-atomic body can push the count above the round count.
+    // That makes a miss possible and a false alarm impossible, which is the right way
+    // round for a timing-dependent test.
+    const ROUNDS: usize = 50;
+    const THREADS: usize = 8;
+
+    let d = TempDir::new().unwrap();
+    let fs = StdFileSystem;
+    let mut winners_total = 0usize;
+
+    for r in 0..ROUNDS {
+        let to = d.path().join(format!("target{r}"));
+        let sources: Vec<_> = (0..THREADS)
+            .map(|i| {
+                let p = d.path().join(format!("src{r}_{i}"));
+                fs.create_new(&p).unwrap();
+                p
+            })
+            .collect();
+
+        let barrier = std::sync::Barrier::new(THREADS);
+        let winners = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for p in &sources {
+                let (barrier, winners, to) = (&barrier, &winners, &to);
+                s.spawn(move || {
+                    barrier.wait();
+                    if StdFileSystem.rename_no_replace(p, to).is_ok() {
+                        winners.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+
+        let won = winners.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(won, 1, "round {r}: {won} publishers claimed one name; exactly one may");
+        winners_total += won;
+    }
+
+    assert_eq!(winners_total, ROUNDS, "one winner per round, and no round skipped");
+}

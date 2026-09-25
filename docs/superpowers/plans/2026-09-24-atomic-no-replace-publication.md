@@ -1023,7 +1023,23 @@ referenced anywhere, the two tasks that defined one having been deleted.
 
 **Known gaps, stated rather than hidden.**
 
-1. **Atomicity itself is not directly tested.** No test schedules two processes into the window. The tests pin the observable contract — refusal, on the cases the old body handled — and the mutants prove they discriminate. This is a real limit: a future body that reintroduced check-then-act would pass this suite. The compile-time structure is the guard, not the tests.
+1. ~~**Atomicity itself is not directly tested**, and cannot be — no test schedules two processes into
+   the window, so the compile-time structure is the guard rather than the tests.~~ **WITHDRAWN, and it
+   was wrong twice over.** The test audit that followed execution measured that the claim's own
+   consequence had already come true: a CAREFUL check-then-act — source resolved first, then target —
+   passed ALL 170 tests on BOTH arms, including the error-ordering test written specifically to catch
+   the forbidden body, because that test only distinguishes the NAIVE target-first form. Eight lines
+   would have replaced the whole mechanism with a green suite.
+   And the premise was false. Atomicity does not need two processes: eight THREADS publishing eight
+   distinct sources onto one name is enough, and the signal is not marginal — exactly 400 winners over
+   400 rounds against the atomic primitive, **3188** against check-then-act. That is now
+   `rename_no_replace_lets_exactly_one_concurrent_publisher_win`, and under the forbidden body it is the
+   ONLY test of the eleven that reds, on each arm. The assertion is one-sided by construction: a
+   scheduler that never overlaps the threads yields one winner and PASSES, so it can miss a defect but
+   cannot flake red.
+   The lesson worth keeping is not the test. It is that "this cannot be tested" was asserted rather than
+   attempted, survived six adversarial plan-review rounds and seven capstone rounds unchallenged, and
+   took eleven minutes to disprove once someone asked for a mutation the suite survives.
 2. **Long-path behaviour is not tested at all.** The tasks that tested it were deleted once `std` was
    shown to provide it, and nothing replaced them. That is a deliberate gap rather than an oversight:
    a test here would assert the standard library's behaviour, not Flux's. The risk it leaves is that a
