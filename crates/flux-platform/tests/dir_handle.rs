@@ -218,8 +218,14 @@ mod posix {
         assert_eq!(made.metadata(OsStr::new("inside")).unwrap().len, 0);
         assert!(d.path().join("fresh/inside").is_file());
 
-        // And it still refuses to create the same name twice.
-        assert!(root.create_dir(OsStr::new("fresh")).is_err());
+        // And it still refuses to create the same name twice -- checking WHICH
+        // error, because `is_err()` alone would also pass if the handle had stopped
+        // working entirely, which is the failure this test is meant to notice.
+        let err = match root.create_dir(OsStr::new("fresh")) {
+            Err(e) => e,
+            Ok(_) => panic!("create_dir must refuse an occupied name"),
+        };
+        assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
     }
 
     #[test]
@@ -322,8 +328,13 @@ mod windows_arm {
         let d = TempDir::new().unwrap();
         std::fs::create_dir(d.path().join("real")).unwrap();
         if !junction(&d.path().join("real"), &d.path().join("junc")) {
-            eprintln!("SKIPPED: could not create a junction");
-            return;
+            // NOT a skip. `mklink /J` needs no privilege on Windows -- every
+            // junction test in this file relies on that and they all run here --
+            // so a failure to make one is a broken environment, not a capability
+            // this machine legitimately lacks. A silent skip would let all of
+            // these vanish from a CI run while it still reported green, which is
+            // the one thing a skipping test must never do.
+            panic!("could not create a junction; mklink /J requires no privilege");
         }
         let root = StdFileSystem.destination_root(d.path()).unwrap();
         let err = root.open_dir(OsStr::new("junc")).unwrap_err();
@@ -395,7 +406,12 @@ mod windows_arm {
         let root = StdFileSystem.destination_root(d.path()).unwrap();
         let stage = root.open_dir(OsStr::new("stage")).unwrap();
 
-        stage.rename_no_replace(OsStr::new("tmp"), &root, OsStr::new("taken")).unwrap_err();
+        // The error is INSPECTED, not merely required to exist: a discarded
+        // unwrap_err() would pass if the rename failed for any unrelated reason,
+        // and this test is the one that proves the publish is handle-relative.
+        let err =
+            stage.rename_no_replace(OsStr::new("tmp"), &root, OsStr::new("taken")).unwrap_err();
+        assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(
             std::fs::read(d.path().join("taken")).unwrap(),
             b"old",
@@ -567,8 +583,14 @@ mod windows_arm {
         assert_eq!(made.metadata(OsStr::new("inside")).unwrap().len, 0);
         assert!(d.path().join("fresh/inside").is_file());
 
-        // And it still refuses to create the same name twice.
-        assert!(root.create_dir(OsStr::new("fresh")).is_err());
+        // And it still refuses to create the same name twice -- checking WHICH
+        // error, because `is_err()` alone would also pass if the handle had stopped
+        // working entirely, which is the failure this test is meant to notice.
+        let err = match root.create_dir(OsStr::new("fresh")) {
+            Err(e) => e,
+            Ok(_) => panic!("create_dir must refuse an occupied name"),
+        };
+        assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
     }
 
     #[test]
@@ -587,8 +609,13 @@ mod windows_arm {
         std::fs::create_dir(&real).unwrap();
         let link = d.path().join("rootlink");
         if !junction(&real, &link) {
-            eprintln!("SKIPPED: could not create a junction");
-            return;
+            // NOT a skip. `mklink /J` needs no privilege on Windows -- every
+            // junction test in this file relies on that and they all run here --
+            // so a failure to make one is a broken environment, not a capability
+            // this machine legitimately lacks. A silent skip would let all of
+            // these vanish from a CI run while it still reported green, which is
+            // the one thing a skipping test must never do.
+            panic!("could not create a junction; mklink /J requires no privilege");
         }
 
         let root = StdFileSystem.destination_root(&link).unwrap();
@@ -637,8 +664,13 @@ mod windows_arm {
         std::fs::create_dir(&target).unwrap();
         std::fs::write(target.join("precious"), b"x").unwrap();
         if !junction(&target, &d.path().join("link")) {
-            eprintln!("SKIPPED: could not create a junction");
-            return;
+            // NOT a skip. `mklink /J` needs no privilege on Windows -- every
+            // junction test in this file relies on that and they all run here --
+            // so a failure to make one is a broken environment, not a capability
+            // this machine legitimately lacks. A silent skip would let all of
+            // these vanish from a CI run while it still reported green, which is
+            // the one thing a skipping test must never do.
+            panic!("could not create a junction; mklink /J requires no privilege");
         }
 
         let root = StdFileSystem.destination_root(d.path()).unwrap();
@@ -734,8 +766,13 @@ mod windows_arm {
         let target = d.path().join("target");
         std::fs::create_dir(&target).unwrap();
         if !junction(&target, &d.path().join("link")) {
-            eprintln!("SKIPPED: could not create a junction");
-            return;
+            // NOT a skip. `mklink /J` needs no privilege on Windows -- every
+            // junction test in this file relies on that and they all run here --
+            // so a failure to make one is a broken environment, not a capability
+            // this machine legitimately lacks. A silent skip would let all of
+            // these vanish from a CI run while it still reported green, which is
+            // the one thing a skipping test must never do.
+            panic!("could not create a junction; mklink /J requires no privilege");
         }
 
         let root = StdFileSystem.destination_root(d.path()).unwrap();
