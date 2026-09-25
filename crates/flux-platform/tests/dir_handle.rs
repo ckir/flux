@@ -816,7 +816,12 @@ mod windows_arm {
             std::ffi::OsString::from_wide(&w)
         };
 
-        for tail in [":stream", r"\..\escape", "/escape"] {
+        // The corpus is EVERY rule the code-unit path enforces, not a sample of
+        // them. It held the colon and the two separators and omitted the NUL, and
+        // MEASURED: deleting the NUL arm from that path left the whole suite green.
+        // A validator with four rules needs four cases here, or the untested rule is
+        // the one that silently goes away.
+        for tail in [":stream", r"\..\escape", "/escape", "\0nul"] {
             let name = build(tail);
             assert!(name.to_str().is_none(), "the name must take the non-UTF-8 branch");
             let err = match root.create_new(&name) {
@@ -895,5 +900,38 @@ mod windows_arm {
         };
         assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
         assert!(!outside.exists(), "nothing may have been created at the link's TARGET");
+    }
+
+    #[test]
+    fn rename_moves_a_junction_itself_and_not_what_it_points_at() {
+        // The trait requires that NO mutating method traverses a name-surrogate, and
+        // rename_at passes FILE_OPEN_REPARSE_POINT for exactly that reason -- but
+        // nothing tested it. MEASURED: removing that flag left all 207 tests green,
+        // so the rule held only by the flag being there, not by anything noticing if
+        // it left. remove_file and create_new each had a guard; rename had none.
+        //
+        // Renaming a junction must move the LINK. If the open followed it instead,
+        // the rename would act on the target directory -- moving something outside
+        // the destination subtree that the caller never named.
+        let d = TempDir::new().unwrap();
+        let target = d.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("precious"), b"x").unwrap();
+        if !junction(&target, &d.path().join("link")) {
+            panic!("could not create a junction; mklink /J requires no privilege");
+        }
+
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        root.rename_no_replace(OsStr::new("link"), &root, OsStr::new("moved")).unwrap();
+
+        // The link moved.
+        assert!(!d.path().join("link").exists(), "the junction must have moved");
+        // Its target did not, and is still reachable through the moved link.
+        assert!(target.is_dir(), "the TARGET must not have been renamed");
+        assert!(target.join("precious").is_file(), "the target's contents must be untouched");
+        assert!(
+            d.path().join("moved/precious").is_file(),
+            "the moved name must still resolve through the junction to the same target"
+        );
     }
 }
