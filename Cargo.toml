@@ -69,7 +69,7 @@ serde_json = "1"
 toml = "1.1"
 # crates/flux-platform/tests/fs_semantics.rs probes (lock-model design Section 10)
 rustix = { version = "1.1", features = ["fs"] }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_Security", "Wdk_Foundation", "Wdk_Storage_FileSystem"] }
 walkdir = "2.5"
 # jwalk is in the spec §67 candidate list but crates.io currently ships it with the
 # description "Use `dua-core` instead" and it has not moved since 0.9.0 — treat it as

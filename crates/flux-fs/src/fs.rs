@@ -187,6 +187,132 @@ pub trait FileSystem: Send + Sync {
     fn create_dir(&self, path: &Path) -> Result<()>;
 }
 
+/// An open directory under `DEST` (§149.7).
+///
+/// Every destination entry is created or opened relative to one of these, never
+/// by a path the kernel re-resolves. That is the entire point: a path is checked
+/// and used as two operations, and the object beneath it can change in between.
+///
+/// Names are single components and are refused otherwise — see
+/// `crate::name::check_component`, which every method here must call before it
+/// touches the filesystem.
+///
+/// # What an implementation must REFUSE
+///
+/// These are the contract, not advice, and they are written out because the two
+/// implementations that exist enforce them while the trait only implied them. A
+/// third implementation that looked correct could quietly drop any of these, and
+/// the loss would be silent: the engine would keep working and the containment
+/// §149.7 exists for would be gone.
+///
+/// 1. **NEVER TRAVERSE A NAME-SURROGATE.** Not in `open_dir`, and not in any
+///    mutating method either. A symlink or junction standing where a child should
+///    be must be acted on AS THE LINK or refused — never followed. `open_dir`
+///    refuses it outright; `create_new` must treat the name as occupied rather
+///    than writing through to the target; `remove_file` removes the LINK and never
+///    what it points at. This is the whole clause: a method that follows one moves
+///    the write outside `DEST`, which is precisely the escape being prevented.
+/// 2. **REFUSE A NAME THAT IS NOT ONE COMPONENT**, before any syscall.
+/// 3. **DO NOT SUBSTITUTE A DIFFERENT NAME FOR THE ONE GIVEN.** Truncating,
+///    re-encoding or otherwise transforming a name so that a different object is
+///    addressed must be an error, never a silent success. Two such defects were
+///    found here by measurement, so this is a real failure mode and not a caution.
+///
+/// Where the error KIND is stated below, both existing implementations were
+/// measured to agree on it, and a third should too: the engine branches on it.
+pub trait DirHandle: Sized {
+    type Writer: FileHandle;
+
+    /// Open a child DIRECTORY, refusing to traverse a symlink, junction or other
+    /// name-surrogate reparse point. This is the operation §149.7 is about.
+    fn open_dir(&self, name: &std::ffi::OsStr) -> Result<Self>;
+
+    /// Create a child directory and return a handle to it.
+    ///
+    /// MUST FAIL if the name is already taken, by anything — a file, a directory
+    /// or a link — with `ErrorKind::AlreadyExists`. Succeeding on an existing
+    /// directory is the shortcut an implementor reaches for and it destroys the
+    /// caller's only evidence that it created what it is about to write into.
+    ///
+    /// The returned handle must address the directory THIS CALL created. Creating
+    /// it and then re-opening the NAME to obtain the handle is a different and
+    /// weaker thing: it is check-then-act on a name, and another process can put a
+    /// different directory there in between.
+    fn create_dir(&self, name: &std::ffi::OsStr) -> Result<Self>;
+
+    /// Create a child file exclusively, as `FileSystem::create_new` does by path.
+    ///
+    /// MUST FAIL with `ErrorKind::AlreadyExists` if the name is taken by anything,
+    /// INCLUDING a link — and in particular a DANGLING one, where following it
+    /// would find nothing to collide with and create the file at the link's target,
+    /// outside `DEST`. The name is occupied by the link itself.
+    fn create_new(&self, name: &std::ffi::OsStr) -> Result<Self::Writer>;
+
+    /// Metadata for a child, judging the NAME and never its target.
+    ///
+    /// A link reports as a link. Reporting its target's type is how a caller is
+    /// told a surrogate is an ordinary directory and walks into it.
+    fn metadata(&self, name: &std::ffi::OsStr) -> Result<Metadata>;
+
+    /// Remove a child FILE, or a link of any kind.
+    ///
+    /// MUST REFUSE A DIRECTORY, with `ErrorKind::IsADirectory`. POSIX is the
+    /// specification here: `unlinkat` without `AT_REMOVEDIR` refuses a directory
+    /// and unlinks a symlink whatever it points at. So a name-surrogate IS
+    /// removable — the link goes, its target does not — and a real directory is
+    /// not, including one carrying a non-surrogate reparse point such as a cloud
+    /// placeholder, which is a directory with extra metadata rather than a link.
+    ///
+    /// An implementation that cannot determine which it has must refuse. This
+    /// guard protects against destroying a tree, so being unable to tell is a
+    /// reason to stop, not a reason to proceed.
+    fn remove_file(&self, name: &std::ffi::OsStr) -> Result<()>;
+
+    /// Publish `from` in this directory onto `to` in `other`, atomically and
+    /// without replacing. The two-handle form is what makes staging in one
+    /// directory and publishing into another expressible at all.
+    fn rename_no_replace(
+        &self,
+        from: &std::ffi::OsStr,
+        other: &Self,
+        to: &std::ffi::OsStr,
+    ) -> Result<()>;
+
+    /// As `rename_no_replace`, but `to` may already exist and is replaced.
+    ///
+    /// Still atomic, and still handle-relative on BOTH sides. "Replaces" means the
+    /// object at `to` is destroyed, not merged with: no attribute of the old object
+    /// may survive on the new one.
+    fn rename_replace(
+        &self,
+        from: &std::ffi::OsStr,
+        other: &Self,
+        to: &std::ffi::OsStr,
+    ) -> Result<()>;
+}
+
+/// Resolving `DEST` once, at start, is the only path-based call in the writer.
+///
+/// This one DOES follow links: resolving `DEST` is exactly the operation §149.7
+/// exempts, because a user who points `DEST` at a symlink has chosen that
+/// destination. The clause protects what is BELOW it.
+pub trait DestinationRoot: FileSystem {
+    type Dir: DirHandle<Writer = Self::Writer>;
+
+    /// Resolve `DEST` and return a handle to it.
+    ///
+    /// MUST REFUSE A PATH THAT IS NOT A DIRECTORY, up front, with
+    /// `ErrorKind::NotADirectory`. Returning a handle that wraps a file is not a
+    /// harmless deferral: every later child operation then fails with an error
+    /// about the CHILD, and the caller is told its tree is broken when what is
+    /// actually wrong is the root it passed in. One arm made exactly this mistake,
+    /// because the flag it used to permit opening a directory did not also require
+    /// one.
+    ///
+    /// A path that does not exist is an ordinary not-found, not a refusal.
+    fn destination_root(&self, path: &Path) -> Result<Self::Dir>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

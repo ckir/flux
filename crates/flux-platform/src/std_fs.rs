@@ -12,6 +12,8 @@ use flux_fs::{
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
+#[cfg(unix)]
+use std::time::Duration;
 use std::time::SystemTime;
 
 /// The source handle. Read only -- it does not implement `Write` at all, so even a
@@ -40,6 +42,20 @@ impl FileHandle for StdFile {
     fn sync_all(&self) -> Result<()> {
         self.0.sync_all().map_err(FsError::from_io)
     }
+}
+
+/// Construct a writer from an already-open file. `DirHandle::create_new` opens
+/// relative to a directory handle, so it cannot go through the path-based
+/// `create_new` and needs this.
+///
+/// Ungated: `dir_unix.rs` and `dir_windows.rs` both call it. It was briefly
+/// `#[cfg(unix)]`, because for one task the POSIX arm was its only caller and
+/// Windows `just check` fails on `-D dead_code`; the comment then said the NEXT
+/// task would widen it, and named the wrong task. Nobody widened it, and the
+/// Windows arm hit it as a compile error instead. A gate whose removal is somebody
+/// else's homework is a gate that stays.
+pub(crate) fn std_file_from(f: File) -> StdFile {
+    StdFile(f)
 }
 
 pub struct StdFileSystem;
@@ -566,14 +582,69 @@ impl FileSystem for StdFileSystem {
     }
 }
 
+/// Resolving `DEST` is the one path-based call in the writer, and it DOES follow
+/// links -- §149.7 exempts it, because a user who points DEST at a symlink has
+/// chosen that destination. Everything BELOW it goes through a handle.
 #[cfg(unix)]
-fn perms_of(m: &std::fs::Metadata) -> Perms {
+impl flux_fs::DestinationRoot for StdFileSystem {
+    type Dir = crate::StdDir;
+
+    fn destination_root(&self, path: &Path) -> Result<Self::Dir> {
+        use rustix::fs::{CWD, Mode, OFlags, openat};
+        let fd =
+            openat(CWD, path, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())
+                .map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
+        Ok(crate::StdDir::from_fd(fd))
+    }
+}
+
+/// See the Unix twin: DEST itself is resolved by path and DOES follow links,
+/// because §149.7 exempts it. Everything below goes through a handle.
+#[cfg(windows)]
+impl flux_fs::DestinationRoot for StdFileSystem {
+    type Dir = crate::StdDir;
+
+    fn destination_root(&self, path: &Path) -> Result<Self::Dir> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+        let f = OpenOptions::new()
+            .access_mode(0x80 | 0x1 | 0x0010_0000)
+            .share_mode(7)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .map_err(FsError::from_io)?;
+
+        // THE ROOT MUST BE A DIRECTORY, and `FILE_FLAG_BACKUP_SEMANTICS` does not say
+        // so. It permits opening a directory; it does not REQUIRE one, and a file
+        // opens just as happily. MEASURED, before this check: `destination_root` on a
+        // plain file returned Ok and handed back a `DirHandle` wrapping a file, and
+        // the failure only surfaced later as a masked error on the first child
+        // operation. The Unix twin cannot make this mistake because `OFlags::DIRECTORY`
+        // states the requirement to the kernel, which answers `ENOTDIR`; this arm has
+        // to ask afterwards. The kind matches what POSIX returns, so a caller can
+        // branch on one answer.
+        let m = f.metadata().map_err(FsError::from_io)?;
+        if !m.is_dir() {
+            return Err(FsError::new(
+                flux_fs::Code::IoError,
+                std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    "a destination root must be a directory",
+                ),
+            ));
+        }
+        Ok(crate::StdDir::from_handle(f.into()))
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn perms_of(m: &std::fs::Metadata) -> Perms {
     use std::os::unix::fs::PermissionsExt;
     Perms::UnixMode(m.permissions().mode())
 }
 
 #[cfg(not(unix))]
-fn perms_of(m: &std::fs::Metadata) -> Perms {
+pub(crate) fn perms_of(m: &std::fs::Metadata) -> Perms {
     Perms::ReadOnly(m.permissions().readonly())
 }
 
@@ -581,7 +652,7 @@ fn perms_of(m: &std::fs::Metadata) -> Perms {
 /// `!is_symlink && is_directory`, so a junction or directory symlink is already
 /// excluded there -- but testing symlink first makes that independent of std's
 /// definition rather than reliant on it.
-fn type_of(m: &std::fs::Metadata) -> flux_fs::FileType {
+pub(crate) fn type_of(m: &std::fs::Metadata) -> flux_fs::FileType {
     let t = m.file_type();
     if t.is_symlink() {
         flux_fs::FileType::Symlink
@@ -599,13 +670,73 @@ fn type_of(m: &std::fs::Metadata) -> flux_fs::FileType {
 #[cfg(unix)]
 fn identity_of(m: &std::fs::Metadata) -> FileIdentity {
     use std::os::unix::fs::MetadataExt;
-    let index = u128::from(m.ino());
-    // §107: "The platform adapter must never treat `object_id == 0` as a valid
-    // universal object identity."
+    identity_of_raw(m.dev(), m.ino())
+}
+
+/// The §107 zero-inode rule, factored out so the path-based `identity_of` above
+/// and the handle-based `metadata_from_stat` below share ONE copy of it rather
+/// than risking two that drift.
+///
+/// §107: "The platform adapter must never treat `object_id == 0` as a valid
+/// universal object identity."
+#[cfg(unix)]
+fn identity_of_raw(dev: u64, ino: u64) -> FileIdentity {
+    let index = u128::from(ino);
     if index == 0 {
         return FileIdentity::Unavailable;
     }
-    FileIdentity::Strong(ObjectId { volume: m.dev(), index })
+    FileIdentity::Strong(ObjectId { volume: dev, index })
+}
+
+/// The handle-based twin of `FileSystem::metadata` above, for
+/// `DirHandle::metadata` (§149.7): the caller already has a `statat` result --
+/// taken relative to an open directory handle rather than by path -- and this
+/// builds the same `Metadata` from it without a second, path-based stat.
+///
+/// Shares `identity_of_raw` for the §107 rule; the file-type mapping goes through
+/// rustix's own `FileType::from_raw_mode` rather than reimplementing the
+/// `S_IFMT` bit test a second time.
+#[cfg(unix)]
+pub(crate) fn metadata_from_stat(st: &rustix::fs::Stat) -> Metadata {
+    use rustix::fs::FileType as RawFileType;
+    // Field widths differ by platform: macOS has `st_mode: u16` and `st_dev: i32`,
+    // Linux `u32` and `u64`, so each cast is a no-op on one and required on the
+    // other. They are std's own casts (`MetadataExt::mode`/`dev`), and `dev` must
+    // stay so: this identity is compared with the path-based one from
+    // `identity_of`, and a different `st_dev` conversion would make one object
+    // look like two.
+    #[allow(clippy::unnecessary_cast)]
+    let (mode, dev) = (st.st_mode as u32, st.st_dev as u64);
+    Metadata {
+        len: st.st_size as u64,
+        file_type: match RawFileType::from_raw_mode(st.st_mode) {
+            RawFileType::Directory => FileType::Dir,
+            RawFileType::Symlink => FileType::Symlink,
+            RawFileType::RegularFile => FileType::File,
+            _ => FileType::Other,
+        },
+        permissions: Some(Perms::UnixMode(mode)),
+        modified: mtime_from_stat(st),
+        identity: identity_of_raw(dev, st.st_ino),
+    }
+}
+
+/// `st_mtime`/`st_mtime_nsec` to `SystemTime`. POSIX keeps `st_*_nsec` a
+/// non-negative FORWARD offset even when the seconds field is negative (a
+/// timestamp before the epoch), so the two fields are combined as one signed
+/// total before splitting back into a `Duration` either side of `UNIX_EPOCH`,
+/// rather than risking a plain `Duration::new(negative_as_u64, nsec)` on the
+/// pre-epoch side.
+#[cfg(unix)]
+fn mtime_from_stat(st: &rustix::fs::Stat) -> Option<SystemTime> {
+    let total_nanos = i128::from(st.st_mtime) * 1_000_000_000 + i128::from(st.st_mtime_nsec);
+    let abs = total_nanos.unsigned_abs();
+    let d = Duration::new((abs / 1_000_000_000) as u64, (abs % 1_000_000_000) as u32);
+    if total_nanos >= 0 {
+        SystemTime::UNIX_EPOCH.checked_add(d)
+    } else {
+        SystemTime::UNIX_EPOCH.checked_sub(d)
+    }
 }
 
 /// The identity half of `metadata`, reading an ALREADY-OPEN handle.
@@ -615,7 +746,7 @@ fn identity_of(m: &std::fs::Metadata) -> FileIdentity {
 /// cannot enforce them, which is why it is private and takes a `&File` rather than
 /// a path.
 #[cfg(windows)]
-fn identity_of_handle(file: &File) -> FileIdentity {
+pub(crate) fn identity_of_handle(file: &File) -> FileIdentity {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,

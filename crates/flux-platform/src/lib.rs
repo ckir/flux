@@ -2,4 +2,14 @@
 
 pub mod std_fs;
 
+#[cfg(unix)]
+mod dir_unix;
+#[cfg(unix)]
+pub use dir_unix::StdDir;
+
+#[cfg(windows)]
+mod dir_windows;
+#[cfg(windows)]
+pub use dir_windows::StdDir;
+
 pub use std_fs::{StdFile, StdFileSystem, StdReader};

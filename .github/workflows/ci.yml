@@ -68,6 +68,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  clippy-macos:
+    # A separate job, not a matrix on `clippy`: a matrix renames the check, and "Clippy" is a required
+    # status check, so it would never report and every pull request would stay blocked. macOS needs its
+    # own run because `stat` field widths differ there (`st_mode: u16`, `st_dev: i32`), so a cast that is
+    # required on macOS is a lint on Linux and the reverse; the test job compiles macOS but never lints it.
+    name: Clippy (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
   workflow-lint:
     # actionlint checks every workflow's syntax, expressions, job references and action inputs, and runs
     # shellcheck over each `run:` step; the pinned image bundles both. It runs on every CI run rather than

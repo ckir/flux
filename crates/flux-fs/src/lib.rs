@@ -12,5 +12,10 @@ pub use options::{
 };
 
 pub mod fs;
+pub mod name;
 
-pub use fs::{DirEntry, FileHandle, FileIdentity, FileSystem, FileType, Metadata, ObjectId, Perms};
+pub use fs::{
+    DestinationRoot, DirEntry, DirHandle, FileHandle, FileIdentity, FileSystem, FileType, Metadata,
+    ObjectId, Perms,
+};
+pub use name::check_component;

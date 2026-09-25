@@ -18,6 +18,13 @@ extend-ignore-re = [
 ]
 
 [default.extend-words]
+# POSIX open(2) flag names, as rustix and libc spell them. WRONLY in particular
+# is read as a misspelling of WRONGLY, which would make the handle-relative
+# writer (§149.7) unbuildable without this line.
+WRONLY = "WRONLY"
+RDONLY = "RDONLY"
+RDWR = "RDWR"
+NOFOLLOW = "NOFOLLOW"
 # Domain terms that look like typos
 reflink = "reflink"
 reflinks = "reflinks"
