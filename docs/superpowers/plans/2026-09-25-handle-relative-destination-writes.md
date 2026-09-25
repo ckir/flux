@@ -621,7 +621,7 @@ impl DirHandle for StdDir {
         check_component(name)?;
         let st = statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
-        Ok(crate::metadata_from_stat(&st))
+        Ok(crate::std_fs::metadata_from_stat(&st))
     }
 
     fn remove_file(&self, name: &OsStr) -> Result<()> {
@@ -1008,7 +1008,7 @@ impl DirHandle for StdDir {
         // is a junction, so ask what it is. Dropping `opened` on the reject path
         // closes the handle, which matters: a refused directory must not leave a
         // sharing constraint behind for a later operation on the same tree.
-        let tag = crate::reparse_tag_of(&opened)?;
+        let tag = crate::dir_windows::reparse_tag_of(&opened)?;
         if let Some(tag) = tag
             && is_name_surrogate(tag)
         {
@@ -1023,40 +1023,66 @@ impl DirHandle for StdDir {
 
     fn create_dir(&self, name: &OsStr) -> Result<Self> {
         check_component(name)?;
-        crate::create_dir_at(&self.0, name)?;
+        crate::dir_windows::create_dir_at(&self.0, name)?;
         self.open_dir(name)
     }
 
     fn create_new(&self, name: &OsStr) -> Result<Self::Writer> {
         check_component(name)?;
-        crate::create_new_at(&self.0, name)
+        crate::dir_windows::create_new_at(&self.0, name)
     }
 
     fn metadata(&self, name: &OsStr) -> Result<Metadata> {
         check_component(name)?;
-        crate::metadata_at(&self.0, name)
+        crate::dir_windows::metadata_at(&self.0, name)
     }
 
     fn remove_file(&self, name: &OsStr) -> Result<()> {
         check_component(name)?;
-        crate::remove_file_at(&self.0, name)
+        crate::dir_windows::remove_file_at(&self.0, name)
     }
 
     fn rename_no_replace(&self, from: &OsStr, other: &Self, to: &OsStr) -> Result<()> {
         check_component(from)?;
         check_component(to)?;
-        crate::rename_at(&self.0, from, &other.0, to, false)
+        crate::dir_windows::rename_at(&self.0, from, &other.0, to, false)
     }
 
     fn rename_replace(&self, from: &OsStr, other: &Self, to: &OsStr) -> Result<()> {
         check_component(from)?;
         check_component(to)?;
-        crate::rename_at(&self.0, from, &other.0, to, true)
+        crate::dir_windows::rename_at(&self.0, from, &other.0, to, true)
     }
 }
 ```
 
-**Six helpers are referenced and do not exist yet:** `reparse_tag_of`, `create_dir_at`, `create_new_at`, `metadata_at`, `remove_file_at`, `rename_at`. They are Task 3's remaining work and each is its own `NtCreateFile` or `NtSetInformationFile` call against the same `RootDirectory` pattern. **Implement `reparse_tag_of` first**, because the safety test depends only on it:
+**Six helpers are referenced and do not exist yet. All six live in `dir_windows.rs` itself**, as
+private module functions — NOT at the crate root, which `crate::` alone would mean and which
+`crates/flux-platform/src/lib.rs` re-exports only three names into. Their signatures are pinned here so
+the implementer is extending a pattern rather than inventing an interface:
+
+```rust
+fn reparse_tag_of(h: &OwnedHandle) -> Result<Option<u32>>;
+fn create_dir_at(parent: &OwnedHandle, name: &OsStr) -> Result<()>;
+fn create_new_at(parent: &OwnedHandle, name: &OsStr) -> Result<crate::StdFile>;
+fn metadata_at(parent: &OwnedHandle, name: &OsStr) -> Result<Metadata>;
+fn remove_file_at(parent: &OwnedHandle, name: &OsStr) -> Result<()>;
+fn rename_at(from_dir: &OwnedHandle, from: &OsStr, to_dir: &OwnedHandle, to: &OsStr, replace: bool) -> Result<()>;
+```
+
+Each is an `NtCreateFile` or `NtSetInformationFile` call against the same `OBJECT_ATTRIBUTES` +
+`RootDirectory` pattern as `open_dir`, with `ShareAccess` and `DesiredAccess` stated rather than
+defaulted for the same reason. `rename_at` uses `FILE_RENAME_INFORMATION` with its `RootDirectory` field
+set to `to_dir` and `ReplaceIfExists` from the `replace` argument.
+
+**`reparse_tag_of` is given in full below and must be implemented FIRST**, because it is the only one
+the safety tests depend on — the other five can be stubbed with `unimplemented!()` long enough to get
+Step 6's five tests green, then filled in before Step 8's gate, which will not pass while a stub
+remains reachable from a compiled path.
+
+**This is the one place in this plan that asks you to extend a pattern rather than paste one.** If the
+pattern does not carry — if any of the five needs something `open_dir` does not show you — STOP and
+report `SCOPE: <which helper> needs <what>` rather than guessing at NT semantics.
 
 ```rust
 /// Read a handle's reparse tag, or `None` when it is not a reparse point.
