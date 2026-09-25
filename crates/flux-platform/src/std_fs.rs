@@ -465,19 +465,57 @@ impl FileSystem for StdFileSystem {
         // `rename_no_replace_reports_a_missing_source_before_an_occupied_target` exists
         // to pin. A guard that front-runs the filesystem inherits the obligation to be
         // right about it.
-        if let Ok(dst) = probe(to) {
-            // An Unavailable identity -- a filesystem with no FILE_ID_INFO, or an id of
-            // zero, which §107 forbids treating as valid -- leaves `same` false on
-            // purpose. Refusing on an identity the filesystem cannot supply would fail
-            // CLOSED on every ordinary publish there.
-            let mut same = from == to;
-            if !same
-                && let Ok(src) = probe(from)
-                && let (FileIdentity::Strong(a), FileIdentity::Strong(b)) =
-                    (identity_of_handle(&src), identity_of_handle(&dst))
-            {
-                same = a == b;
-            }
+        // BOTH probes gate the comparison, and `from`'s is what preserves the error
+        // order: a missing source with an occupied target must answer NotFound from the
+        // kernel, not AlreadyExists from here.
+        if let Ok(dst) = probe(to)
+            && let Ok(src) = probe(from)
+        {
+            let same = from == to
+                || match (identity_of_handle(&src), identity_of_handle(&dst)) {
+                    (FileIdentity::Strong(a), FileIdentity::Strong(b)) => a == b,
+                    // IDENTITY CANNOT ANSWER, SO REFUSE -- and the previous revision of
+                    // this arm did the opposite, on a reason that does not survive being
+                    // read carefully. It said refusing here "would fail CLOSED on every
+                    // ordinary publish" on such a filesystem. It would not, because this
+                    // branch is only reached when the target ALREADY EXISTS: an ordinary
+                    // publish goes to a free name, `probe(to)` fails, and the comparison
+                    // is never reached at all.
+                    //
+                    // Given a target that exists, refusing is right whichever way the
+                    // unanswerable question would have gone. A DIFFERENT object is one
+                    // `MoveFileExW` would itself refuse with ERROR_ALREADY_EXISTS, so the
+                    // answer is unchanged; the SAME object is the case where it returns
+                    // Ok and CONSUMES the source name, which is the defect. Refusing
+                    // costs a correct answer nothing and buys back the only wrong one.
+                    //
+                    // That matters on a mount with no `FILE_ID_INFO` that still has a
+                    // second name for one object -- an SMB share whose server supports
+                    // hard links while the negotiation drops the id, or a `subst` drive
+                    // or junction over one. There the paths differ, so the lexical half
+                    // misses it, and identity is `Unavailable`, so this half used to fall
+                    // through. It is very likely a REGRESSION against the check-then-act
+                    // body this method replaced, which refused ANY existing target on
+                    // EVERY filesystem.
+                    //
+                    // MEASURED ON A REAL FAT32 VOLUME, not reasoned. `zz_identity_probe`
+                    // against a mounted FAT32 disk reports `identity=Unavailable`, and
+                    // the same probe run either side of this arm gives:
+                    //
+                    //   without it   case_only_refused=false   <- the defect, reproduced
+                    //   with it      case_only_refused=true
+                    //
+                    // with `free_name_succeeds=true` in BOTH, which is what settles the
+                    // old objection: publishing to a free name never reaches this arm, so
+                    // refusing here costs the ordinary case nothing.
+                    //
+                    // Still unmeasured: the HARD LINK half. FAT32 has none
+                    // (`hard_links=false`), so the originally reported SMB scenario needs
+                    // a server that supports links while dropping the id, and no such
+                    // mount was available. NTFS and ReFS both answer `Strong`, so the arm
+                    // above decides there and their behaviour does not move.
+                    _ => true,
+                };
             if same {
                 return Err(FsError::new(
                     flux_fs::Code::IoError,
