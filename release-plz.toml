@@ -12,12 +12,18 @@ git_only = true
 publish = false
 # A binary with no published library API has nothing for cargo-semver-checks to compare against.
 semver_check = false
+# Every package generates a changelog, because `changelog_include` below MERGES the generated
+# changelogs of the packages it lists -- a package that generates nothing contributes nothing. With
+# this false, release-plz attributed every commit under crates/ to its own crate, those crates
+# generated nothing, and the notes silently dropped them: 38 of the 41 feat/fix commits in this
+# repository's history touch crates/, and NO release before v0.1.2 carried a Features or Bug fixes
+# section at all.
+changelog_update = true
 # Release only when the release pull request is merged, not on every push to main.
 release_always = false
 # One tag and one GitHub release for the whole workspace, made by flux-cli below.
 git_tag_enable = false
 git_release_enable = false
-changelog_update = false
 pr_labels = ["release"]
 
 # flux-cli ships the `flux` binary, so it carries the tag, the release and the one changelog, which also
@@ -28,7 +34,6 @@ git_tag_enable = true
 git_tag_name = "v{{ version }}"
 git_release_enable = true
 git_release_name = "v{{ version }}"
-changelog_update = false
 version_group = "flux"
 
 # The root package owns the changelog, because it is the only one release-plz attributes the whole
@@ -41,6 +46,10 @@ name = "flux"
 version_group = "flux"
 changelog_update = true
 changelog_path = "CHANGELOG.md"
+# The commits under crates/ belong to those crates, not to this one, so the single changelog has to
+# pull them in explicitly. Listing all six is deliberate: a crate omitted here does not warn, it just
+# stops appearing in the release notes, which is the failure being fixed.
+changelog_include = ["flux-cli", "flux-core", "flux-fs", "flux-platform", "flux-hash", "flux-ui"]
 git_tag_name = "v{{ version }}"
 
 [[package]]
