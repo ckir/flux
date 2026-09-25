@@ -147,6 +147,15 @@ pr title body="":
     branch=$(git rev-parse --abbrev-ref HEAD)
     if [ -n "{{body}}" ]; then
         gh pr create --base main --head "$branch" --title "{{title}}" --body-file "{{body}}"
+        # AUTO-MERGE: the PR merges itself, as a merge commit, once every required
+        # check passes. Opt out per PR with `gh pr merge --disable-auto <n>`. It
+        # does not update a branch that falls behind main -- merge main in and it
+        # proceeds. A failure here is reported, not fatal: the PR already exists.
+        gh pr merge "$branch" --auto --merge \
+            || echo "warning: could not enable auto-merge; merge it by hand." >&2
     else
+        # --web returns before the PR exists, so there is nothing to arm yet.
         gh pr create --base main --head "$branch" --title "{{title}}" --web
+        echo "note: auto-merge is not enabled for a PR composed in the browser;" \
+            "run 'gh pr merge --auto --merge' once it is open." >&2
     fi
