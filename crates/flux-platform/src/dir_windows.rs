@@ -1045,13 +1045,21 @@ mod judge_tests {
         // unwritten tag reads 0 and `is_name_surrogate(0)` is false, which refuses.
         // The STRUCTURAL point stands on its own though -- consulting a field the
         // ABI says to ignore is relying on unspecified behaviour, whatever today's
-        // kernel happens to write -- so the variant now encodes the bit and this
-        // pins it with a tag that WOULD be a surrogate if it were ever read.
-        let hostile = AttrQuery::Untagged { attributes: FILE_ATTRIBUTE_DIRECTORY };
-        assert!(!judge_removable(hostile), "a directory with no readable tag is not removable");
-        assert_eq!(judge_reparse(hostile).unwrap(), None, "no reparse bit means nothing to judge");
+        // kernel happens to write -- so the variant now ENCODES the bit, and the
+        // case below cannot carry a tag at all. That is the guarantee: with the
+        // attribute clear there is no `Tagged` to construct, so there is no tag
+        // for either judge to consult, correct or garbage.
+        //
+        // (A review read the earlier wording here as claiming this passes a tag
+        // that would be a surrogate. It does not -- `Untagged` has no tag field.
+        // The comment was wrong, not the test.)
+        let clear = AttrQuery::Untagged { attributes: FILE_ATTRIBUTE_DIRECTORY };
+        assert!(!judge_removable(clear), "a directory with no readable tag is not removable");
+        assert_eq!(judge_reparse(clear).unwrap(), None, "no reparse bit means nothing to judge");
 
-        // And the surrogate mask really is what would have been consulted.
+        // And the mask that a `Tagged` value WOULD be judged by, shown here so the
+        // two halves of the rule sit together: a junction is a surrogate, a plain
+        // directory's 0 is not, and a cloud placeholder's tag is not either.
         assert!(is_name_surrogate(JUNCTION));
         assert!(!is_name_surrogate(0));
         assert!(!is_name_surrogate(ONEDRIVE));
