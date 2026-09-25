@@ -30,3 +30,9 @@ __pycache__/
 # pcal.trans writes a backup of the module it rewrites, and a default configuration nothing uses
 models/lockproto/LockProtocol.old
 models/lockproto/LockProtocol.cfg
+
+# Per-crate changelogs, written by release-plz so that `changelog_include` in
+# release-plz.toml has something to merge. The repository ships ONE binary and one
+# release, so the aggregated root CHANGELOG.md is the changelog; these are inputs to
+# it, not artefacts anyone reads.
+crates/*/CHANGELOG.md
