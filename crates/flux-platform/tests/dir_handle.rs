@@ -166,6 +166,28 @@ mod posix {
         assert_eq!(err.code, flux_fs::Code::SafetyRejected);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_genuine_eperm_on_a_file_stays_permission_denied() {
+        // macOS answers EPERM both for a directory and for a forbidden unlink, and
+        // remove_file stats to tell them apart. This pins the other half: a FILE the
+        // owner has made immutable (`chflags uchg`, no root needed) must still say
+        // PERMISSION_DENIED, not be reclassified as a directory.
+        let d = TempDir::new().unwrap();
+        let f = d.path().join("locked");
+        std::fs::write(&f, b"x").unwrap();
+        let chflags = |flag: &str| {
+            let ok = std::process::Command::new("chflags").arg(flag).arg(&f).status().unwrap();
+            assert!(ok.success(), "chflags {flag} failed");
+        };
+        chflags("uchg");
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let err = root.remove_file(OsStr::new("locked")).unwrap_err();
+        chflags("nouchg"); // before any assert, or TempDir cannot clean up
+        assert_eq!(err.code, flux_fs::Code::PermissionDenied);
+        assert!(f.is_file(), "the file must survive the refusal");
+    }
+
     #[test]
     fn remove_file_refuses_an_ordinary_directory() {
         // MEASURED before the Windows guard existed: POSIX refused with

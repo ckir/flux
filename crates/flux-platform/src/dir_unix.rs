@@ -107,10 +107,36 @@ impl DirHandle for StdDir {
         Ok(crate::std_fs::metadata_from_stat(&st))
     }
 
+    /// A directory is refused with `IoError`/`IsADirectory` on every platform, the
+    /// shape the Windows arm builds explicitly. Linux gets it for free from EISDIR.
+    /// MEASURED on macOS CI: `unlinkat` answers EPERM for a directory, which maps to
+    /// PERMISSION_DENIED -- a code the user sees, for a failure that has nothing to
+    /// do with permissions. But EPERM is also what a genuinely forbidden unlink
+    /// returns there (an immutable file), so the errno alone cannot tell them apart.
+    /// As in `classify`, one `statat` separates them, and only on the failure path.
+    ///
+    /// The stat runs after the unlink failed, so the name can change in between;
+    /// the worst case is a wrong error CODE for an unlink that already refused,
+    /// never a removal. If the stat itself fails, the original EPERM stands.
     fn remove_file(&self, name: &OsStr) -> Result<()> {
+        use rustix::fs::FileType;
+        use rustix::io::Errno;
         check_component(name)?;
-        rustix::fs::unlinkat(&self.0, name, AtFlags::empty())
-            .map_err(|e| FsError::from_io(std::io::Error::from(e)))
+        rustix::fs::unlinkat(&self.0, name, AtFlags::empty()).map_err(|e| {
+            if e == Errno::PERM
+                && let Ok(st) = statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW)
+                && FileType::from_raw_mode(st.st_mode) == FileType::Directory
+            {
+                return FsError::new(
+                    Code::IoError,
+                    std::io::Error::new(
+                        std::io::ErrorKind::IsADirectory,
+                        "remove_file refuses a directory",
+                    ),
+                );
+            }
+            FsError::from_io(std::io::Error::from(e))
+        })
     }
 
     /// NO FALLBACK, and that is the decision rather than an omission.
