@@ -613,6 +613,26 @@ impl flux_fs::DestinationRoot for StdFileSystem {
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(path)
             .map_err(FsError::from_io)?;
+
+        // THE ROOT MUST BE A DIRECTORY, and `FILE_FLAG_BACKUP_SEMANTICS` does not say
+        // so. It permits opening a directory; it does not REQUIRE one, and a file
+        // opens just as happily. MEASURED, before this check: `destination_root` on a
+        // plain file returned Ok and handed back a `DirHandle` wrapping a file, and
+        // the failure only surfaced later as a masked error on the first child
+        // operation. The Unix twin cannot make this mistake because `OFlags::DIRECTORY`
+        // states the requirement to the kernel, which answers `ENOTDIR`; this arm has
+        // to ask afterwards. The kind matches what POSIX returns, so a caller can
+        // branch on one answer.
+        let m = f.metadata().map_err(FsError::from_io)?;
+        if !m.is_dir() {
+            return Err(FsError::new(
+                flux_fs::Code::IoError,
+                std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    "a destination root must be a directory",
+                ),
+            ));
+        }
         Ok(crate::StdDir::from_handle(f.into()))
     }
 }

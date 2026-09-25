@@ -184,6 +184,43 @@ mod posix {
             flux_fs::Code::DestinationError
         );
     }
+
+    #[test]
+    fn a_destination_root_must_be_a_directory() {
+        // MEASURED before the Windows check existed: POSIX refused with
+        // NotADirectory (OFlags::DIRECTORY states the requirement to the kernel)
+        // while Windows returned Ok and handed back a DirHandle wrapping a FILE,
+        // failing only later as a masked error on the first child operation.
+        let d = TempDir::new().unwrap();
+        let f = d.path().join("iamafile");
+        std::fs::write(&f, b"x").unwrap();
+
+        let err = match StdFileSystem.destination_root(&f) {
+            Err(e) => e,
+            Ok(_) => panic!("a file must not be accepted as a destination root"),
+        };
+        assert_eq!(err.source.kind(), std::io::ErrorKind::NotADirectory);
+    }
+
+    #[test]
+    fn a_created_directory_is_usable_without_reopening_its_name() {
+        // create_dir returns a handle to the directory it just made. On Windows that
+        // handle is the one NtCreateFile returned, rather than the result of
+        // re-opening the NAME -- re-opening was check-then-act on a name, the pattern
+        // this cut removes, and it let another process swap a different plain
+        // directory into the window. The handle must be as usable as open_dir's, so
+        // this writes through it and reads the child back.
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+
+        let made = root.create_dir(OsStr::new("fresh")).unwrap();
+        drop(made.create_new(OsStr::new("inside")).unwrap());
+        assert_eq!(made.metadata(OsStr::new("inside")).unwrap().len, 0);
+        assert!(d.path().join("fresh/inside").is_file());
+
+        // And it still refuses to create the same name twice.
+        assert!(root.create_dir(OsStr::new("fresh")).is_err());
+    }
 }
 
 #[cfg(windows)]
@@ -434,5 +471,42 @@ mod windows_arm {
             root.open_dir(OsStr::new("nosuch")).unwrap_err().code,
             flux_fs::Code::DestinationError
         );
+    }
+
+    #[test]
+    fn a_destination_root_must_be_a_directory() {
+        // MEASURED before the Windows check existed: POSIX refused with
+        // NotADirectory (OFlags::DIRECTORY states the requirement to the kernel)
+        // while Windows returned Ok and handed back a DirHandle wrapping a FILE,
+        // failing only later as a masked error on the first child operation.
+        let d = TempDir::new().unwrap();
+        let f = d.path().join("iamafile");
+        std::fs::write(&f, b"x").unwrap();
+
+        let err = match StdFileSystem.destination_root(&f) {
+            Err(e) => e,
+            Ok(_) => panic!("a file must not be accepted as a destination root"),
+        };
+        assert_eq!(err.source.kind(), std::io::ErrorKind::NotADirectory);
+    }
+
+    #[test]
+    fn a_created_directory_is_usable_without_reopening_its_name() {
+        // create_dir returns a handle to the directory it just made. On Windows that
+        // handle is the one NtCreateFile returned, rather than the result of
+        // re-opening the NAME -- re-opening was check-then-act on a name, the pattern
+        // this cut removes, and it let another process swap a different plain
+        // directory into the window. The handle must be as usable as open_dir's, so
+        // this writes through it and reads the child back.
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+
+        let made = root.create_dir(OsStr::new("fresh")).unwrap();
+        drop(made.create_new(OsStr::new("inside")).unwrap());
+        assert_eq!(made.metadata(OsStr::new("inside")).unwrap().len, 0);
+        assert!(d.path().join("fresh/inside").is_file());
+
+        // And it still refuses to create the same name twice.
+        assert!(root.create_dir(OsStr::new("fresh")).is_err());
     }
 }

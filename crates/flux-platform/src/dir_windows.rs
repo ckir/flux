@@ -169,8 +169,7 @@ impl DirHandle for StdDir {
 
     fn create_dir(&self, name: &OsStr) -> Result<Self> {
         check_component(name)?;
-        crate::dir_windows::create_dir_at(&self.0, name)?;
-        self.open_dir(name)
+        Ok(Self(crate::dir_windows::create_dir_at(&self.0, name)?))
     }
 
     fn create_new(&self, name: &OsStr) -> Result<Self::Writer> {
@@ -201,7 +200,7 @@ impl DirHandle for StdDir {
     }
 }
 
-fn create_dir_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {
+fn create_dir_at(p: &OwnedHandle, n: &OsStr) -> Result<OwnedHandle> {
     let mut wide: Vec<u16> = n.encode_wide().collect();
     let bytes = (wide.len() * 2) as u16;
     let us = UNICODE_STRING { Length: bytes, MaximumLength: bytes, Buffer: wide.as_mut_ptr() };
@@ -220,7 +219,10 @@ fn create_dir_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {
     let status = unsafe {
         NtCreateFile(
             &raw mut h,
-            FILE_LIST_DIRECTORY | SYNCHRONIZE,
+            // Matches `open_dir`'s mask exactly, because this handle is now
+            // RETURNED to the caller rather than closed, and must be as usable as
+            // one `open_dir` hands back.
+            FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | SYNCHRONIZE,
             &raw const oa,
             &raw mut iosb,
             std::ptr::null(),
@@ -242,12 +244,25 @@ fn create_dir_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {
         return Err(FsError::new(code, nt_io_error("NtCreateFile", status)));
     }
 
+    // RETURN the handle rather than closing it and re-opening the NAME.
+    //
+    // It used to drop this and let `DirHandle::create_dir` call `open_dir(name)`, so
+    // that the reparse-tag check ran on the thing just created. That was
+    // check-then-act on a name -- the exact pattern this cut exists to remove --
+    // and it bought nothing: `FILE_CREATE` with no EA buffer cannot produce a
+    // reparse point, so the tag check had no question to answer. What the re-open
+    // DID add was a window in which another process could rename the fresh directory
+    // away and leave a different one in its place, and `open_dir` would have accepted
+    // that one and handed it back as the directory we had just made.
+    //
+    // A surrogate substituted into that window was never the danger, since `open_dir`
+    // refuses those; a PLAIN directory was, and nothing refuses that. Returning the
+    // handle closes the window rather than narrowing it, and costs one syscall less.
+    // The POSIX arm cannot do the same -- `mkdirat` returns no descriptor, so it must
+    // re-open by name and keeps the race by necessity.
+    //
     // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `h` is a valid handle we own.
-    // `DirHandle::create_dir` calls `self.open_dir(name)` right after this returns,
-    // which is what runs the reparse-tag check on the thing just created -- so this
-    // handle is closed immediately rather than returned.
-    drop(unsafe { OwnedHandle::from_raw_handle(h as _) });
-    Ok(())
+    Ok(unsafe { OwnedHandle::from_raw_handle(h as _) })
 }
 
 fn create_new_at(p: &OwnedHandle, n: &OsStr) -> Result<crate::StdFile> {
@@ -422,12 +437,13 @@ fn remove_file_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {
     // A reparse-point directory (a junction, a directory symlink) is still removed,
     // which MATCHES POSIX: `unlinkat` unlinks a symlink whatever it points at. Only
     // a PLAIN directory is refused.
-    if is_plain_directory(&h) {
+    // NOT `== Some(true)`: an UNKNOWN kind refuses too. See `plain_directory`.
+    if plain_directory(&h) != Some(false) {
         return Err(FsError::new(
             Code::IoError,
             std::io::Error::new(
                 std::io::ErrorKind::IsADirectory,
-                "remove_file refuses a directory",
+                "remove_file refuses a directory, or could not determine that it is not one",
             ),
         ));
     }
@@ -655,10 +671,17 @@ pub(crate) fn reparse_tag_of(
 /// `remove_file_at` needs the distinction and `reparse_tag_of` cannot give it: that
 /// function answers `None` both for a plain file and for a real directory, because
 /// all it reports is the tag. This reads the same information class and asks the
-/// other question. A failure answers `false`, because this only ever REFUSES an
-/// operation and must never invent a refusal it cannot justify.
+/// other question.
+///
+/// `None` means UNKNOWN, and the caller must treat it as "do not delete". An earlier
+/// version of this returned a bare `bool` and answered `false` on a failed query,
+/// which made the guard FAIL OPEN: a query that did not answer became "not a
+/// directory", and an empty directory would then have been deleted -- reinstating the
+/// very defect the guard was added for. A guard on a destructive operation has to
+/// fail closed. The cost of refusing when the kind cannot be read is an error the
+/// caller sees; the cost of deleting is a directory the caller does not get back.
 #[cfg(windows)]
-fn is_plain_directory(h: &std::os::windows::io::OwnedHandle) -> bool {
+fn plain_directory(h: &std::os::windows::io::OwnedHandle) -> Option<bool> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Wdk::Storage::FileSystem::{
         FileAttributeTagInformation, NtQueryInformationFile,
@@ -688,8 +711,10 @@ fn is_plain_directory(h: &std::os::windows::io::OwnedHandle) -> bool {
         )
     };
     if status != 0 {
-        return false;
+        return None;
     }
-    info.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0
-        && info.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    Some(
+        info.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0
+            && info.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+    )
 }
