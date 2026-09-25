@@ -483,7 +483,14 @@ impl FileSystem for FaultFs {
         let p = path.to_path_buf();
         self.record(format!("create_new({})", p.display()), "create_new")?;
         let mut g = self.inner.lock().unwrap();
-        if g.files.contains_key(&p) {
+        // A DIRECTORY occupies the name too, and this used to check only `files`.
+        // MEASURED: `create_new` on a name held by a directory returned Ok and the
+        // fake created a file over it, while both real arms refuse with
+        // AlreadyExists -- std's `create_new` by path, and the handle arms, which
+        // were fixed for exactly this case. The fake was the only implementation
+        // that let it through, and it is the one the engine's tests will run
+        // against.
+        if g.files.contains_key(&p) || g.directories.contains(&p) {
             return Err(FsError::new(
                 Code::IoError,
                 std::io::Error::from(std::io::ErrorKind::AlreadyExists),
@@ -796,7 +803,18 @@ impl DirHandle for FakeDirHandle {
             }
         }
         let child_path = self.my_path().join(name);
-        let meta = self.fs().metadata(&child_path)?;
+        // A MISSING COMPONENT IS A DESTINATION ERROR, which is what both real arms
+        // answer and what their `a_missing_component_is_a_destination_error` tests
+        // pin. The fake reported whatever `metadata` reported -- IoError/NotFound --
+        // so it was the one implementation disagreeing with a rule the other two
+        // are tested against.
+        let meta = self.fs().metadata(&child_path).map_err(|e| {
+            if e.source.kind() == std::io::ErrorKind::NotFound {
+                FsError::new(Code::DestinationError, std::io::Error::from(e.source.kind()))
+            } else {
+                e
+            }
+        })?;
         if meta.file_type == FileType::Symlink {
             return Err(FsError::new(
                 Code::SafetyRejected,
@@ -1278,5 +1296,24 @@ mod tests {
             Ok(_) => panic!("a missing root must be refused"),
         };
         assert_eq!(err.source.kind(), std::io::ErrorKind::NotFound);
+
+        // create_new must see a DIRECTORY as occupying the name. MEASURED before
+        // this: the fake returned Ok and created a file over it, alone among the
+        // three implementations.
+        let err = match root.create_new(OsStr::new("adir")) {
+            Err(e) => e,
+            Ok(_) => panic!("a name a directory holds is taken"),
+        };
+        assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(fs.exists("/dst/adir"), "the directory must survive");
+
+        // A missing component is a DESTINATION error, which is the rule both real
+        // arms are tested against. The fake used to pass through metadata's
+        // IoError/NotFound.
+        let err = match root.open_dir(OsStr::new("absent")) {
+            Err(e) => e,
+            Ok(_) => panic!("a missing component must be refused"),
+        };
+        assert_eq!(err.code, Code::DestinationError);
     }
 }
