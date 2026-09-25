@@ -498,10 +498,22 @@ impl FileSystem for StdFileSystem {
                     // body this method replaced, which refused ANY existing target on
                     // EVERY filesystem.
                     //
-                    // Unverified by execution: no SMB share or FAT32 volume is mounted on
-                    // the machine this was written on. What IS verified is that NTFS
-                    // behaviour does not move, because there identity answers `Strong`
-                    // and the arm above decides.
+                    // MEASURED ON A REAL FAT32 VOLUME, not reasoned. `zz_identity_probe`
+                    // against a mounted FAT32 disk reports `identity=Unavailable`, and
+                    // the same probe run either side of this arm gives:
+                    //
+                    //   without it   case_only_refused=false   <- the defect, reproduced
+                    //   with it      case_only_refused=true
+                    //
+                    // with `free_name_succeeds=true` in BOTH, which is what settles the
+                    // old objection: publishing to a free name never reaches this arm, so
+                    // refusing here costs the ordinary case nothing.
+                    //
+                    // Still unmeasured: the HARD LINK half. FAT32 has none
+                    // (`hard_links=false`), so the originally reported SMB scenario needs
+                    // a server that supports links while dropping the id, and no such
+                    // mount was available. NTFS and ReFS both answer `Strong`, so the arm
+                    // above decides there and their behaviour does not move.
                     _ => true,
                 };
             if same {
