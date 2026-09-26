@@ -571,7 +571,7 @@ mod tests {
 
 - [ ] **Step 2: Wire it.** In `lib.rs`, add `pub mod tree;` after `pub mod walk;`, and after the `walk` re-export add `pub use tree::{DegradedGroup, FailureTally, TreeFailure, TreeFailureCause, TreeOutcome, WeakIdentityWarnings};`.
 - [ ] **Step 3: Run, expect PASS.** `cargo nextest run -p flux-core --no-fail-fast`, then `just check`. (`count` and `record` have no non-test caller until Task 5; the `cfg_attr(not(test), expect(dead_code, ...))` on each says so, and because an UNFULFILLED `expect` is itself a warning, Task 5 cannot forget to remove them.)
-- [ ] **Step 4: Mutation.** In `count`, make the `Copy` arm increment `create_dir` → `the_tally_counts_each_cause_in_its_own_field` RED; restore. In `record`, key `Weak` by `id.index` → `warnings_group_weak_by_volume_and_keep_the_first_example` RED; restore.
+- [ ] **Step 4: Mutation.** In `count`, make the `Copy` arm increment `create_dir` → `the_tally_counts_each_cause_in_its_own_field` RED; restore. In `record`, key `Weak` by `id.index as u64` → `warnings_group_weak_by_volume_and_keep_the_first_example` RED; restore. (Not bare `id.index`: that is a `u128` and fails to COMPILE, which proves only that the line is referenced - MEASURED in execution; the `as u64` mutant was run and goes red.)
 - [ ] **Step 5: Commit** — `feat(flux-core): the tree outcome types`.
 
 ---
