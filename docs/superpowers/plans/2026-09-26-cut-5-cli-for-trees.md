@@ -32,6 +32,7 @@
 3. **The dangling-destination-link test is Linux-only.** On Linux `open_dir`'s `O_NOFOLLOW|O_DIRECTORY` on a link answers `ENOTDIR`, which `crates/flux-platform/src/dir_unix.rs` `classify` maps to `SAFETY_REJECTED` (verified by reading: the `Errno::NOTDIR` arm, and its comment "with `O_DIRECTORY` also set the kernel reports the type mismatch first"). macOS's answer was not measured; if it is `ELOOP` the same run is `IO_ERROR`, exit 1 - still safe, nothing written.
 4. **The single-file weak-identity warning names the TARGET path** (the destination after §4.1 mapping), since the Step 2a comparison is about the destination. The spec says "the path the user supplied".
 5. **A single-file run now prints the summary line too** (spec: "Then one summary line"), with `created 0 directories`.
+6. **`clippy::result_large_err` is allowed where `TreeAbort` is returned** (found executing Task 2: the Err is at least 192 bytes, and `-D warnings` fails the gate). Owner ruling 2026-09-26 (agy concurred): `#[allow(clippy::result_large_err)]` with a one-line `//` reason, not boxing - the abort is returned once per operation, and boxing keeps the `Result` large anyway because `TreeOutcome` is the `Ok` side. Applied on `copy_tree` (`18ab5db`); Task 4's test helper `abort()` gets the same attribute if clippy fires there.
 
 ## File map
 
