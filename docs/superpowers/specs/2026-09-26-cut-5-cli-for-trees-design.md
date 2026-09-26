@@ -225,6 +225,8 @@ requires.
 - Then one summary line: files copied, bytes, directories created, failures, special files skipped. Its
   failure figure is the JSON `errors` value (so a `TreeAbort` counts as one), and a run that exits
   non-zero never prints a summary claiming zero failures (panel round 2).
+- A failure BEFORE the engine is called (a missing SOURCE, a resolution failure, K7) prints its one error
+  or record line and no warnings or summary: nothing ran to summarize. `--json` still prints (below).
 
 The plan fixes the exact wording. Tests pin the contract, not the prose: a weak-volume line contains the
 volume id (hex), the count, the example path, and `--safety=strict`; a record line starts with its `CODE:`.
