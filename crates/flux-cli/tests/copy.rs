@@ -296,6 +296,60 @@ fn a_missing_source_exits_1_and_counts_one_error() {
 }
 
 #[test]
+fn json_counts_a_replaced_single_file_as_overwritten() {
+    let d = TempDir::new().unwrap();
+    std::fs::write(d.path().join("a"), b"new").unwrap();
+    std::fs::write(d.path().join("b"), b"old").unwrap();
+
+    let replaced = flux()
+        .arg("copy")
+        .arg(d.path().join("a"))
+        .arg(d.path().join("b"))
+        .arg("--json")
+        .output()
+        .unwrap();
+    let fresh = flux()
+        .arg("copy")
+        .arg(d.path().join("a"))
+        .arg(d.path().join("c"))
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert_eq!(replaced.status.code(), Some(0), "stderr: {}", stderr(&replaced));
+    assert_eq!(std::fs::read(d.path().join("b")).unwrap(), b"new");
+    assert_eq!(json(&replaced)["files_overwritten"].as_u64(), Some(1));
+    assert_eq!(fresh.status.code(), Some(0), "stderr: {}", stderr(&fresh));
+    assert_eq!(json(&fresh)["files_overwritten"].as_u64(), Some(0));
+}
+
+#[test]
+fn closed_output_pipes_do_not_turn_a_finished_copy_into_a_crash() {
+    // The spec: a closed pipe is ignored, and the exit code is the operation's - never
+    // the 101 of a panicking write. Both read ends are closed BEFORE the spawn, so every
+    // write fails, with no race against the child.
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let dst = d.path().join("dst");
+    let (out_r, out_w) = std::io::pipe().unwrap();
+    let (err_r, err_w) = std::io::pipe().unwrap();
+    drop((out_r, err_r));
+
+    let status = flux()
+        .arg("copy")
+        .arg(&src)
+        .arg(&dst)
+        .arg("--json")
+        .stdout(out_w)
+        .stderr(err_w)
+        .status()
+        .unwrap();
+
+    assert_eq!(status.code(), Some(0));
+    assert_eq!(std::fs::read(dst.join("sub").join("b")).unwrap(), b"BB");
+}
+
+#[test]
 fn a_third_positional_is_a_usage_error() {
     let out = flux().args(["copy", "a", "b", "c"]).output().unwrap();
     assert_eq!(out.status.code(), Some(2));

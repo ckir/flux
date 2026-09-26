@@ -202,4 +202,22 @@ mod tests {
             );
         }
     }
+
+    /// Unix only: there, a path through a FILE fails with ENOTDIR, which the climb does
+    /// not treat as absent. (Windows reports it as not-found, and the climb continues.)
+    #[cfg(unix)]
+    #[test]
+    fn a_destination_under_a_file_fails_naming_the_destination() {
+        let (_d, tmp) = canonical_tmp();
+        std::fs::create_dir(tmp.join("src")).unwrap();
+        std::fs::write(tmp.join("f"), b"x").unwrap();
+        let dest = tmp.join("f").join("x");
+
+        match job(&tmp.join("src"), &dest) {
+            Err(Stop::Failed(line)) => {
+                assert!(line.contains(&dest.display().to_string()), "{line}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
 }
