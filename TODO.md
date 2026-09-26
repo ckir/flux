@@ -225,6 +225,13 @@ Each was measured, and each is deliberately NOT fixed in that PR.
 - [ ] **A dangling destination link is exit 3 on Linux only by measurement.** macOS's `open_dir` answer
       for a link (ENOTDIR vs ELOOP) was not measured; if ELOOP, the same run is `IO_ERROR`, exit 1 -
       safe, but not §55's refusal code (cut 5 plan, refinement 3).
+- [ ] **Symlinks are never recreated.** §25's default copies a symlink AS a link; this version has no
+      link-creating primitive, so every symlink in a tree fails with `SYMLINK_CREATION_UNAVAILABLE` (exit
+      1) and a symlink given as SOURCE is refused before the engine (K7). Needs a `symlink` operation on
+      the filesystem trait (Windows: file vs directory links, and the privilege they need) (cut 5).
+- [ ] **No progress output during a long copy.** `flux copy` prints each record as it happens and one
+      summary at the end; a large tree runs silently in between. §52's progress UI (files, bytes, speed,
+      ETA, skipped, degraded, errors) is not built; it needs the walk to know the totals up front (cut 5).
 
 ## Engine (walker cut 4) prerequisites
 
