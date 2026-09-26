@@ -23,6 +23,8 @@ fn repo() -> PathBuf {
 struct Tool {
     name: String,
     #[serde(default)]
+    why: String,
+    #[serde(default)]
     install: String,
     #[serde(default)]
     in_path: Option<String>,
@@ -79,6 +81,12 @@ fn code(value: &str) -> String {
         !value.contains('`'),
         "recommended-tools.json value {value:?} contains a backtick, which the generated table \
          cannot render inside a code span"
+    );
+    // A line break inside a cell ends the table row, and with it the table (capstone round 1).
+    assert!(
+        !value.contains(['\n', '\r']),
+        "recommended-tools.json value {value:?} contains a line break, which would end the \
+         generated table mid-row"
     );
     format!("`{}`", value.replace('|', "\\|"))
 }
@@ -145,21 +153,40 @@ fn without_generated(doc: &str) -> Result<String, String> {
     splice(doc, "")
 }
 
+/// Why the SessionStart hook would silently SKIP this entry, if it would. The hook drops an entry
+/// whose `name`, `why` or `install` is empty (`recommended-tooling-check.sh`, "required string
+/// fields"), so the table must not list such an entry as checked (capstone round 1).
+fn hook_skips(t: &Tool) -> Option<&'static str> {
+    match () {
+        _ if t.name.is_empty() => Some("no `name`"),
+        _ if t.why.is_empty() => Some("no `why`"),
+        _ if t.install.is_empty() => Some("no `install`"),
+        _ => None,
+    }
+}
+
 fn load_tools() -> Vec<Tool> {
     let json = std::fs::read_to_string(repo().join(".claude/recommended-tools.json"))
         .expect("read .claude/recommended-tools.json");
     let tools: Vec<Tool> = serde_json::from_str(&json).expect("parse recommended-tools.json");
     assert!(!tools.is_empty(), "recommended-tools.json declares no tools");
+    let skipped: Vec<String> = tools
+        .iter()
+        .filter_map(|t| hook_skips(t).map(|why| format!("{:?} ({why})", t.name)))
+        .collect();
+    assert!(
+        skipped.is_empty(),
+        "the SessionStart hook silently skips these recommended-tools.json entries, so neither the \
+         hook nor this doc may treat them as checked: {}",
+        skipped.join(", ")
+    );
     tools
 }
 
 #[test]
 fn every_recommended_tool_is_documented() {
     let root = repo();
-    let json = std::fs::read_to_string(root.join(".claude/recommended-tools.json"))
-        .expect("read .claude/recommended-tools.json");
-    let tools: Vec<Tool> = serde_json::from_str(&json).expect("parse recommended-tools.json");
-    assert!(!tools.is_empty(), "recommended-tools.json declares no tools");
+    let tools = load_tools();
 
     let doc_path = root.join("docs/dev-tooling.md");
     let doc = std::fs::read_to_string(&doc_path).expect("read docs/dev-tooling.md");
@@ -238,6 +265,7 @@ fn rewrite_tool_table() {
 fn tool(name: &str, install: &str, in_path: Option<&str>, file: Option<FileExists>) -> Tool {
     Tool {
         name: name.into(),
+        why: "a reason".into(),
         install: install.into(),
         in_path: in_path.map(Into::into),
         file_exists: file,
@@ -266,6 +294,22 @@ fn render_table_names_each_tool_its_install_and_its_check() {
 #[should_panic(expected = "contains a backtick")]
 fn render_table_refuses_a_backtick() {
     render_table(&[tool("x", "run `this`", Some("x"), None)]);
+}
+
+#[test]
+#[should_panic(expected = "contains a line break")]
+fn render_table_refuses_a_line_break() {
+    render_table(&[tool("x", "first\nsecond", Some("x"), None)]);
+}
+
+#[test]
+fn an_entry_the_hook_would_skip_is_named() {
+    assert_eq!(hook_skips(&tool("x", "i", Some("x"), None)), None);
+    assert_eq!(hook_skips(&tool("", "i", Some("x"), None)), Some("no `name`"));
+    assert_eq!(hook_skips(&tool("x", "", Some("x"), None)), Some("no `install`"));
+    let mut no_why = tool("x", "i", Some("x"), None);
+    no_why.why.clear();
+    assert_eq!(hook_skips(&no_why), Some("no `why`"));
 }
 
 #[test]
