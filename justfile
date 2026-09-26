@@ -64,8 +64,19 @@ check-linux:
     #!/usr/bin/env sh
     set -eu
     gate='cargo clippy --workspace --all-targets -- -D warnings && cargo nextest run --workspace --no-tests=pass --no-fail-fast'
+    # The prerequisite check runs on BOTH paths below - native Linux and WSL - so a
+    # missing tool is reported with its install command, never as cargo's own
+    # "no such command: nextest".
+    prereq='for tool in cargo cargo-nextest; do
+        command -v "$tool" >/dev/null || {
+            echo "check-linux: $tool is not on PATH." >&2
+            echo "  install: rustup (https://rustup.rs), then: cargo install --locked cargo-nextest" >&2
+            exit 1
+        }
+    done'
     case "$(uname -s)" in
-        Linux) exec sh -c "$gate" ;;
+        Linux) exec sh -c "$prereq
+            $gate" ;;
         MINGW*|MSYS*|CYGWIN*) ;;
         *) echo "check-linux: needs Linux, or Windows with WSL; this is $(uname -s). CI runs the Linux leg." >&2; exit 1 ;;
     esac
@@ -78,20 +89,15 @@ check-linux:
         exit 1
     fi
     # A Linux-side target directory: sharing the Windows one would make each side
-    # rebuild everything after the other ran. One per worktree, so two do not collide.
+    # rebuild everything after the other ran. Keyed on the FULL path, not the base
+    # name, so two checkouts named alike in different parents (E:/Rust/flux and
+    # D:/work/flux) do not share one: /mnt/e/Rust/flux-engine -> _mnt_e_Rust_flux-engine.
     # --exec, NOT `--`: without it wsl.exe joins the arguments into one string and
     # runs it through the distribution's default shell, which expands every `$var`
     # in the script (all unset there) before bash sees it. MEASURED:
     # `-- bash -c 'A=1; echo "[$A]"'` prints `[]`; `--exec bash -c ...` prints `[1]`.
-    wsl.exe -d "{{wsl_distro}}" --cd "$(pwd -W)" --exec bash -lc '
-        for tool in cargo cargo-nextest; do
-            command -v "$tool" >/dev/null || {
-                echo "check-linux: $tool is not on the WSL login PATH of {{wsl_distro}}." >&2
-                echo "  install: rustup (https://rustup.rs), then: cargo install --locked cargo-nextest" >&2
-                exit 1
-            }
-        done
-        export CARGO_TARGET_DIR="$HOME/.cache/flux-target/$(basename "$PWD")"
+    wsl.exe -d "{{wsl_distro}}" --cd "$(pwd -W)" --exec bash -lc "$prereq"'
+        export CARGO_TARGET_DIR="$HOME/.cache/flux-target/$(printf %s "$PWD" | tr -c "A-Za-z0-9._-" "_")"
         '"$gate"
 
 # macOS leg of the gate: macOS clippy by cross-compiling (runs no tests; see above)
