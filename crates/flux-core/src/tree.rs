@@ -29,6 +29,25 @@ pub struct TreeOutcome {
     pub warnings: WeakIdentityWarnings,
 }
 
+/// The operation stopped as a whole (cut 5, K1). `outcome` holds what was counted
+/// before it stopped, so a caller can report it and tell §55's exit 3 ("refused before
+/// changing anything") from exit 1.
+#[derive(Debug)]
+pub struct TreeAbort {
+    pub error: CopyError,
+    pub outcome: TreeOutcome,
+}
+
+impl TreeAbort {
+    /// Whether the destination may differ from before the run: a directory this
+    /// operation created, a file it published, or a temporary it could not remove.
+    pub fn changed(&self) -> bool {
+        self.outcome.directories_created > 0
+            || self.outcome.files_copied > 0
+            || self.error.leftover.is_some()
+    }
+}
+
 #[derive(Debug)]
 pub struct TreeFailure {
     /// Relative to the source root, as the walk reports it.
@@ -163,13 +182,33 @@ enum Frame<D> {
 /// - Every file is published with `Publish::NoReplace` whatever `opts.publish` says
 ///   (§241.5): an existing destination file is never replaced; it is reported
 ///   `DESTINATION_NAMESPACE_COLLISION`.
+// `TreeAbort` carries the whole partial `TreeOutcome` by design (cut 5, K1); it is
+// returned once per operation, never in a loop, so its size costs nothing.
+#[allow(clippy::result_large_err)]
 pub fn copy_tree<F: DestinationRoot>(
     fs: &F,
     src_root: &Path,
     dst_root: &Path,
     opts: &CopyOptions,
     on_failure: &mut dyn FnMut(TreeFailure),
-) -> std::result::Result<TreeOutcome, CopyError> {
+) -> std::result::Result<TreeOutcome, TreeAbort> {
+    let mut out = TreeOutcome::default();
+    match run_tree(fs, src_root, dst_root, opts, &mut out, on_failure) {
+        Ok(()) => Ok(out),
+        Err(error) => Err(TreeAbort { error, outcome: out }),
+    }
+}
+
+/// `copy_tree`'s body. Every `?` here is an abort; `copy_tree` pairs it with `out`,
+/// which holds whatever was counted before it.
+fn run_tree<F: DestinationRoot>(
+    fs: &F,
+    src_root: &Path,
+    dst_root: &Path,
+    opts: &CopyOptions,
+    out: &mut TreeOutcome,
+    on_failure: &mut dyn FnMut(TreeFailure),
+) -> std::result::Result<(), CopyError> {
     // 1. The source root. `walk` refuses a missing or non-directory root: the whole
     //    operation failing, before any destination call.
     let events = walk(fs, src_root).map_err(|e| CopyError::at(CopyStep::Source, e))?;
@@ -181,8 +220,6 @@ pub fn copy_tree<F: DestinationRoot>(
     if lexically_within(dst_root, src_root) {
         return Err(refuse("the destination is the source or lies inside it"));
     }
-
-    let mut out = TreeOutcome::default();
 
     // 3-5. Resolve the destination, compare it with the source, create the root.
     let resolve = |e| CopyError::at(CopyStep::Resolve, e);
@@ -234,7 +271,7 @@ pub fn copy_tree<F: DestinationRoot>(
             // a failure already reported once.
             Err(e) => {
                 if live {
-                    report(&mut out, on_failure, e.path, TreeFailureCause::Walk(e.cause));
+                    report(out, on_failure, e.path, TreeFailureCause::Walk(e.cause));
                 }
                 continue;
             }
@@ -242,15 +279,7 @@ pub fn copy_tree<F: DestinationRoot>(
         match event {
             WalkEvent::Dir { path, identity } => {
                 let frame = if live {
-                    enter_dir(
-                        &mut stack,
-                        &path,
-                        identity,
-                        root_identity,
-                        &opts,
-                        &mut out,
-                        on_failure,
-                    )?
+                    enter_dir(&mut stack, &path, identity, root_identity, &opts, out, on_failure)?
                 } else {
                     Frame::Skipped
                 };
@@ -271,27 +300,17 @@ pub fn copy_tree<F: DestinationRoot>(
             }
             WalkEvent::File { path } => {
                 if let Some(Frame::Live { dir, .. }) = stack.last() {
-                    copy_one(fs, src_root, dir, path, &opts, &mut out, on_failure)?;
+                    copy_one(fs, src_root, dir, path, &opts, out, on_failure)?;
                 }
             }
             WalkEvent::Symlink { path } => {
                 if live {
-                    report(
-                        &mut out,
-                        on_failure,
-                        path,
-                        TreeFailureCause::Unsupported(FileType::Symlink),
-                    );
+                    report(out, on_failure, path, TreeFailureCause::Unsupported(FileType::Symlink));
                 }
             }
             WalkEvent::Other { path } => {
                 if live {
-                    report(
-                        &mut out,
-                        on_failure,
-                        path,
-                        TreeFailureCause::Unsupported(FileType::Other),
-                    );
+                    report(out, on_failure, path, TreeFailureCause::Unsupported(FileType::Other));
                 }
             }
             WalkEvent::DirEnd { .. } => {
@@ -299,7 +318,7 @@ pub fn copy_tree<F: DestinationRoot>(
             }
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// A `Dir` event under a live frame: the dynamic §129 check, then decision 8.
@@ -552,6 +571,17 @@ mod tests {
         dst: &str,
         o: &CopyOptions,
     ) -> (std::result::Result<TreeOutcome, CopyError>, Vec<TreeFailure>) {
+        let (r, got) = run_full(fs, src, dst, o);
+        (r.map_err(|a| a.error), got)
+    }
+
+    /// `run`, keeping the whole `TreeAbort` (cut 5).
+    fn run_full(
+        fs: &FaultFs,
+        src: &str,
+        dst: &str,
+        o: &CopyOptions,
+    ) -> (std::result::Result<TreeOutcome, TreeAbort>, Vec<TreeFailure>) {
         let mut got = Vec::new();
         let r = copy_tree(fs, Path::new(src), Path::new(dst), o, &mut |f| got.push(f));
         (r, got)
@@ -1001,5 +1031,85 @@ mod tests {
 
         assert_eq!(r.unwrap_err().code(), Code::SafetyRejected);
         assert!(!fs.exists("/dst/sub/b"), "nothing was written through the alias");
+    }
+
+    #[test]
+    fn an_abort_before_anything_is_created_carries_an_empty_outcome() {
+        // The lexical floor (a weak source identity keeps the pre-flight out of it).
+        let fs = tree();
+        fs.set_identity("/src", FileIdentity::Weak(ObjectId { volume: 5, index: 1 }));
+
+        let (r, _) = run_full(&fs, "/src", "/src/backup", &opts());
+
+        let a = r.unwrap_err();
+        assert_eq!(a.error.code(), Code::SafetyRejected);
+        assert_eq!((a.outcome.files_copied, a.outcome.directories_created), (0, 0));
+        assert!(!a.changed());
+    }
+
+    #[test]
+    fn an_abort_into_an_existing_root_with_nothing_published_is_unchanged() {
+        // The exit-3 case of decision 3: the root pre-exists, the first publish aborts,
+        // and its temporary was removed.
+        let fs = tree();
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.set_no_replace_support(false);
+
+        let (r, _) = run_full(&fs, "/src", "/dst", &opts());
+
+        let a = r.unwrap_err();
+        assert_eq!(a.error.code(), Code::NoReplacePublishUnavailable);
+        assert!(a.error.leftover.is_none());
+        assert!(!a.changed());
+    }
+
+    #[test]
+    fn an_abort_after_the_root_was_created_reports_a_change() {
+        // `/dst` is absent, so step 5 creates it; the first publish then aborts.
+        let fs = tree();
+        fs.set_no_replace_support(false);
+
+        let (r, _) = run_full(&fs, "/src", "/dst", &opts());
+
+        let a = r.unwrap_err();
+        assert_eq!(a.error.code(), Code::NoReplacePublishUnavailable);
+        assert_eq!((a.outcome.directories_created, a.outcome.files_copied), (1, 0));
+        assert!(a.changed(), "the root this operation created is a change");
+    }
+
+    #[test]
+    fn an_abort_mid_walk_carries_what_was_copied_before_it() {
+        // `a` sorts before `sub`: it is copied, then `sub` (the destination by identity)
+        // aborts the operation.
+        let fs = tree();
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.set_identity("/src/sub", identity_of(&fs, "/dst"));
+
+        let (r, _) = run_full(&fs, "/src", "/dst", &opts());
+
+        let a = r.unwrap_err();
+        assert_eq!(a.error.code(), Code::SafetyRejected);
+        assert_eq!(
+            (a.outcome.files_copied, a.outcome.bytes_copied, a.outcome.directories_created),
+            (1, 1, 0)
+        );
+        assert!(a.changed());
+    }
+
+    #[test]
+    fn an_abort_that_leaves_a_temporary_reports_a_change() {
+        // Nothing created, nothing published - but the aborted publish's temporary could
+        // not be removed, so the destination differs (§55: exit 1, not 3).
+        let fs = tree();
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.set_no_replace_support(false);
+        fs.fail_always("remove_file", Code::PermissionDenied);
+
+        let (r, _) = run_full(&fs, "/src", "/dst", &opts());
+
+        let a = r.unwrap_err();
+        assert_eq!((a.outcome.directories_created, a.outcome.files_copied), (0, 0));
+        assert!(a.error.leftover.is_some(), "precondition: the temporary stayed");
+        assert!(a.changed());
     }
 }
