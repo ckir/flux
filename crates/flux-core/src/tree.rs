@@ -624,7 +624,9 @@ mod tests {
 
         let (r, got) = run(&fs, "/src", "/dst", &opts());
 
-        assert_eq!(r.unwrap_err().code(), Code::SafetyRejected);
+        let e = r.unwrap_err();
+        assert_eq!(e.code(), Code::SafetyRejected);
+        assert_eq!(e.step, CopyStep::Resolve, "a tree-level refusal belongs to no copy step");
         assert!(got.is_empty());
         assert!(!calls_since(&fs, n).iter().any(|c| c.starts_with("create")));
     }
@@ -648,6 +650,9 @@ mod tests {
         let (r, _) = run(&fs, "/src", "/dst", &opts());
         let e = r.unwrap_err();
         assert_eq!(e.cause.source.kind(), std::io::ErrorKind::NotADirectory);
+        // Test audit, cut 4b: without this, mislabelling the destination-resolution errors
+        // (the `resolve` closure) as another step left the whole suite green.
+        assert_eq!(e.step, CopyStep::Resolve);
         assert_eq!(fs.read_file("/dst").as_deref(), Some(&b"a file"[..]));
     }
 
@@ -780,8 +785,28 @@ mod tests {
 
         let (r, _) = run(&fs, "/src", "/dst", &opts());
 
-        assert_eq!(r.unwrap_err().code(), Code::SafetyRejected);
+        let e = r.unwrap_err();
+        assert_eq!(e.code(), Code::SafetyRejected);
+        assert_eq!(e.step, CopyStep::Resolve);
         assert!(!fs.exists("/dst/sub/b"));
+    }
+
+    #[test]
+    fn a_special_file_is_reported_unsupported_and_never_copied() {
+        // The walk types a device, socket or FIFO as `Other`; `copy_tree` reports it once and
+        // never calls copy_file_at for it (test audit, cut 4b: no tree test fed one).
+        let fs = tree();
+        fs.add_special("/src/dev");
+
+        let (r, got) = run(&fs, "/src", "/dst", &opts());
+
+        let out = r.unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].path, Path::new("dev"));
+        assert!(matches!(got[0].cause, TreeFailureCause::Unsupported(FileType::Other)));
+        assert!(!fs.exists("/dst/dev"));
+        assert_eq!(out.failures.unsupported, 1);
+        assert_eq!(out.files_copied, 2, "the rest of the tree still copies");
     }
 
     #[test]
