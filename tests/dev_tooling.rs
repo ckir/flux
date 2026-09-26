@@ -154,13 +154,22 @@ fn without_generated(doc: &str) -> Result<String, String> {
 }
 
 /// Why the SessionStart hook would silently SKIP this entry, if it would. The hook drops an entry
-/// whose `name`, `why` or `install` is empty (`recommended-tooling-check.sh`, "required string
-/// fields"), so the table must not list such an entry as checked (capstone round 1).
+/// whose `name`, `why` or `install` is empty ("required string fields"), and one with neither an
+/// `in_path` nor a non-empty `file_exists` ("not-evaluable"; an empty `in_path` string counts as
+/// none) - `recommended-tooling-check.sh`. The table must not list such an entry at all: the hook
+/// ignores it, so the JSON line is dead weight that reads as a requirement (capstone rounds 1-2).
 fn hook_skips(t: &Tool) -> Option<&'static str> {
+    let has_in_path = t.in_path.as_deref().is_some_and(|p| !p.is_empty());
+    let has_file = match &t.file_exists {
+        Some(FileExists::One(_)) => true,
+        Some(FileExists::Many(ps)) => !ps.is_empty(),
+        None => false,
+    };
     match () {
         _ if t.name.is_empty() => Some("no `name`"),
         _ if t.why.is_empty() => Some("no `why`"),
         _ if t.install.is_empty() => Some("no `install`"),
+        _ if !has_in_path && !has_file => Some("neither `in_path` nor `file_exists`"),
         _ => None,
     }
 }
@@ -310,6 +319,11 @@ fn an_entry_the_hook_would_skip_is_named() {
     let mut no_why = tool("x", "i", Some("x"), None);
     no_why.why.clear();
     assert_eq!(hook_skips(&no_why), Some("no `why`"));
+    let none = Some("neither `in_path` nor `file_exists`");
+    assert_eq!(hook_skips(&tool("x", "i", None, None)), none);
+    assert_eq!(hook_skips(&tool("x", "i", Some(""), None)), none, "an empty in_path is none");
+    assert_eq!(hook_skips(&tool("x", "i", None, Some(FileExists::Many(vec![])))), none);
+    assert_eq!(hook_skips(&tool("x", "i", None, Some(FileExists::One("f".into())))), None);
 }
 
 #[test]
