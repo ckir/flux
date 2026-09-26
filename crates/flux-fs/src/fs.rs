@@ -227,6 +227,12 @@ pub trait DirHandle: Sized {
     /// name-surrogate reparse point. This is the operation §149.7 is about.
     fn open_dir(&self, name: &std::ffi::OsStr) -> Result<Self>;
 
+    /// The identity of the directory this handle HOLDS - never of a path, so a name
+    /// re-pointed after the handle was opened does not change the answer (§149.7).
+    /// Containment is compared against the resolved destination through this (cut-4
+    /// amendment, decision 2).
+    fn identity(&self) -> Result<FileIdentity>;
+
     /// Create a child directory and return a handle to it.
     ///
     /// MUST FAIL if the name is already taken, by anything — a file, a directory
