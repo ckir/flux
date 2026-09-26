@@ -1035,4 +1035,19 @@ mod tests {
         assert_eq!(out.identity_degraded, None);
         assert_eq!(fs.read_file("/dst").as_deref(), Some(&b"new"[..]));
     }
+
+    #[test]
+    fn between_two_weak_identities_the_destination_is_reported() {
+        // `weaker`'s tie rule: both sides Weak, the DESTINATION's volume keys the
+        // warning, because that is the side the user did not name. (Test audit, cut 4a.)
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"new");
+        fs.write_file("/dst", b"old");
+        fs.set_identity("/src", weak(3));
+        fs.set_identity("/dst", weak(7));
+
+        let out = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap();
+
+        assert_eq!(out.identity_degraded, Some(weak(7)));
+    }
 }
