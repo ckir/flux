@@ -5,9 +5,15 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
 ## Open decisions
 
 - [ ] **Final dependency selection** (spec §67). `[workspace.dependencies]` pins
-      versions for the candidate crates but no member crate depends on any of them
-      yet. Each must be judged on performance, correctness, portability,
+      versions for the candidate crates; `clap` and `thiserror` are now adopted by
+      member crates (`crates/flux-cli/Cargo.toml`, `crates/flux-fs/Cargo.toml`), and
+      `walkdir`/`jwalk` were decided against (see the walker decision above). Still
+      undecided and depended on by no member crate: `rayon`, `crossbeam-channel`,
+      `blake3`, `indicatif`, `tracing`, `tracing-subscriber`, `anyhow`, `serde`,
+      `serde_json`. Each must be judged on performance, correctness, portability,
       maintenance, licensing and API stability before adoption.
+      (Narrowed 2026-09-26: `clap`/`thiserror` adopted and `walkdir`/`jwalk`
+      rejected already; the remaining nine candidates are unchanged.)
 - [x] **Directory walker — DECIDED 2026-09-23: no third-party walker.** Add a
       single-level `read_dir` primitive to `flux_fs::FileSystem`, returning one
       level of entries WITH their file type, and implement the ordered
@@ -65,6 +71,11 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
       but misleading: the operation would warn about filesystem capability when it
       actually hit a locked file. Fixing it means deciding what the walker should DO with
       the difference, so it belongs with the walker rather than here.
+      (Narrowed 2026-09-26: the Windows `metadata` open failing now returns the real
+      error rather than folding into `Unavailable` — `std_fs.rs`'s `metadata` fn's
+      `.open(path).map_err(FsError::from_io)?`; `Unavailable` comes only from
+      `GetFileInformationByHandleEx` failing on an already-open handle, `std_fs.rs:766`.
+      The ambiguity above is narrower than stated: it is confined to that one call.)
 - [ ] **Identity-based cycle detection is unavailable on weak-identity filesystems**
       (§107 names FAT32, exFAT and some SMB and NFS configurations). Negotiated to
       a bounded degradation rather than a refusal: the lexical containment test and
@@ -80,6 +91,10 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
       the visit. Mitigated by returning the file type WITH the entry so no
       re-stat is needed; a full fix wants `openat`-style directory-relative
       operations, which `std` does not expose.
+      (Narrowed 2026-09-26: the destination side of a copy now writes through
+      directory handles, not paths, since PR #44 / #48. What remains is the
+      source side: the walk still reads by path — `crates/flux-core/src/walk.rs:357`,
+      `self.fs.read_dir(&abs)` — so the race is confined to source reads.)
 - [ ] **Persistent state format** for the topology store and operation manifest
       (spec §17, §19). Must scale past RAM and survive a crash mid-write.
 - [ ] Repository housekeeping: enable GitHub private vulnerability reporting (see
@@ -90,14 +105,23 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
 
 ## Phase 2 — portable copy (next)
 
-- [ ] `flux-fs`: define the portable filesystem trait surface
-- [ ] `flux-platform`: Linux / macOS / Windows implementations behind it
-- [ ] `flux-core`: single-file copy with metadata preservation
+- [x] `flux-fs`: define the portable filesystem trait surface — done:
+      `crates/flux-fs/src/fs.rs:106` `trait FileSystem`, `:223` `trait DirHandle`,
+      `:299` `trait DestinationRoot`
+- [x] `flux-platform`: Linux / macOS / Windows implementations behind it — done:
+      `crates/flux-platform/src/std_fs.rs`, `dir_unix.rs`, `dir_windows.rs`; CI's
+      three test-matrix legs (`.github/workflows/ci.yml`, `Test (${{ matrix.os }})`)
+- [x] `flux-core`: single-file copy with metadata preservation — done:
+      `crates/flux-core/src/copy.rs` `copy_file` / `copy_file_at`, metadata applied
+      at steps 5-6 before publish
 - [ ] `flux-core`: recursive directory copy
-- [ ] `flux-core`: error taxonomy and mapping (spec §68.1 lists error mapping as
-      a required unit test)
+- [x] `flux-core`: error taxonomy and mapping (spec §68.1 lists error mapping as
+      a required unit test) — done: `crates/flux-fs/src/error.rs` `Code` enum,
+      `classify`/`from_io` (lines 80/91), unit-tested for `DiskFull` / `PermissionDenied`
+      / `IoError` (lines 127, 133, 147)
 - [ ] `flux-core`: statistics collection
-- [ ] `flux-cli`: wire `flux copy` to the above
+- [x] `flux-cli`: wire `flux copy` to the above — done:
+      `crates/flux-cli/src/main.rs:30` `Commands::Copy`
 - [ ] Integration tests: single file, directory, nested directory, multiple
       sources, zero-byte files, Unicode, spaces, newlines (spec §68.2)
 
@@ -114,16 +138,6 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
 
   Found by the PR 1 capstone widening its lens beyond that PR's range. Not fixed there because the
   function is PR #32's code and untouched by PR 1.
-
-- [ ] **`rename_no_replace` is a check-then-rename race**
-
-  `StdFileSystem::rename_no_replace` tests `to.exists()` and then renames. Between the two, another
-  process can create the target, and the rename replaces it — exactly what the method promises not to
-  do. The portable primitives are `renameat2(RENAME_NOREPLACE)` on Linux, `renamex_np(RENAME_EXCL)` on
-  macOS and `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` on Windows.
-
-  Not fixed now because single-file copy publishes with `Publish::Replace`; the consumer that needs an
-  atomic no-replace is the lock protocol, which is where the primitive belongs.
 
 - [ ] **A leftover temporary from a PREVIOUS run is never removed**
 
@@ -159,17 +173,15 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
 
 Each was measured, and each is deliberately NOT fixed in that PR.
 
-- [ ] **`rename_no_replace` is check-then-act.** It calls `symlink_metadata` and then
-      `rename`, so two processes can both see an empty name and one silently wins,
-      which is exactly what the method's contract forbids. Unlike the race in
-      `rename_replace`, this one HAS an atomic primitive: `rustix::fs::renameat_with`
-      with `RenameFlags::NOREPLACE`, verified present in rustix 1.1.5 source
-      (`src/fs/at.rs:302`, `types.rs:314`). Windows has the equivalent via
-      `FileRenameInfoEx` without `REPLACE_IF_EXISTS`, which `std` does not expose.
 - [ ] **A blocking pre-existing temporary is not reported.** If the step-1 leftover
       sweep fails and `create_new` then fails with `AlreadyExists`, `copy_file` returns
       `leftover: None` even though a temporary genuinely sits at the path and is
       blocking the copy. The caller is told nothing was left behind.
+      (Narrowed 2026-09-26: `crates/flux-cli/src/main.rs:38` names each temporary with
+      `std::process::id()`, so a crashed run's leftover never shares a later run's name
+      unless the OS reuses that pid against the same target — reachable, but narrower
+      than stated; it becomes live more broadly once §18.1 gives operations a
+      persisted, derivable id.)
 - [ ] **The read-only guard cannot be atomic.** `rename_replace` checks whether this
       process may replace the destination and then renames; a permission change landing
       in between is not seen, and `rename` is precisely what does not consult the file.
@@ -235,7 +247,6 @@ entries below are cut 4b's.
       `UNVERIFIABLE` 2026-09-22: completion is the state of one machine, which the repository
       cannot record. Observed at the time: `command -v cargo-mutants` says INSTALLED, and the tool
       is declared in `.claude/recommended-tools.json`.
-- [ ] Run `lefthook install` in each clone (or add it to a bootstrap recipe)
 - [ ] Replace the placeholder `benches/copy.rs` once there is a pipeline to measure
 - [ ] Replace the placeholder test in `tests/integration/mod.rs` with the first
       real case from spec §68.2
@@ -253,6 +264,10 @@ each was re-measured on `origin/main` that day.
       sequence" }` — caught only by CI). Add a `just check-linux` recipe wrapping the WSL leg so the
       cross-check is a command rather than a habit, and note in the justfile that **macOS has no local
       equivalent on this machine**, so the macOS leg is CI-only by construction.
+      (Narrowed 2026-09-26: `just check-linux` and `just check-mac` now exist, commit `4e2fc4d` — the
+      Linux leg runs clippy plus the full test suite through WSL, closing that half. What remains: the
+      macOS leg runs clippy only and no test, so a macOS RUNTIME difference — such as the `cfg(unix)`
+      non-UTF-8-filename assumption above — is still caught only by CI.)
 
 - [ ] **No MSRV job, and the policy change makes the original one moot.** `rust-version` now tracks the
       current stable release (1.98.1) rather than the oldest toolchain that compiles, so the job this item
@@ -265,8 +280,10 @@ each was re-measured on `origin/main` that day.
 - [ ] **`ci.yml` has no `permissions:` or `concurrency:` block**, so its jobs get the repository's default token
       scope and superseded pull-request runs are not cancelled. Add `permissions: contents: read` and a
       concurrency group.
-- [ ] **`_typos.toml` excludes the spec by its literal file name**, so renaming the spec (a new version) makes the
-      typos job scan it for the first time. Match the spec by a pattern instead.
+      (Narrowed 2026-09-26: `ci.yml` already has a `concurrency:` block —
+      `group: ci-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}`, added by commit
+      `e94b20c` to dedupe push/pull_request runs and cancel a superseded branch push. What remains is
+      `permissions:`, still absent.)
 - [ ] **An empty release pull request is indistinguishable from a real one.** `release-plz` opens one on
       every push to `main`, and `release-plz.toml` deliberately skips `spec`, `design`, `plan`, `model`,
       `docs`, `skills` and `test` — which is most work in this repository — so a typical push produces a
@@ -297,6 +314,10 @@ against spec V16.
 - [ ] **Windows file identity source.** §107 and §109.1 give only strength classes. The 64-bit file index is not
       guaranteed unique on ReFS (Dev Drives are ReFS); a strong identity needs `FILE_ID_INFO` (volume serial plus
       128-bit file id) from `GetFileInformationByHandleEx`.
+      (Narrowed 2026-09-26: the code side is done — `identity_of_handle` already reads `FILE_ID_INFO` via
+      `GetFileInformationByHandleEx`, `crates/flux-platform/src/std_fs.rs:749-774`. What remains is the spec
+      text: §107 and §109.1 in `FLUX_FULL_UPDATED_SPEC_V16.md` still give only the `Strong`/`Weak`/`Unavailable`
+      strength classes and name neither `FILE_ID_INFO` nor `GetFileInformationByHandleEx`.)
 - [ ] **WSL 9p mounts break two lock assumptions.** On `/mnt/c` (v9fs), `renameat2(RENAME_NOREPLACE)` onto a free
       name fails with `EINVAL`, and a file renamed while open is listed but cannot be `stat`ed until the handle
       closes. Lock-capability detection (§96.1, §99) must treat such a mount as lacking both, and fall back to the
@@ -441,3 +462,18 @@ item was, not only in a commit message.
 - `DONE` **Windows replacing rename is unnamed.** §241.5 now names the POSIX-semantics rename for
   replacing publication and states why `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` cannot serve, citing
   the FS-6 and FS-7 probes. Implemented as `StdFileSystem::rename_replace`.
+- `DONE` **`rename_no_replace` is a check-then-rename race** (was under "Known limits of the first
+  single-file copy"). `rename_no_replace` now publishes atomically instead of check-then-rename:
+  `crates/flux-platform/src/std_fs.rs:316` (Unix: `renameat_with` + `RenameFlags::NOREPLACE`),
+  `std_fs.rs:363` (Windows: `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`), and the `DirHandle`
+  forms at `crates/flux-platform/src/dir_unix.rs:167` and `dir_windows.rs`'s `fn rename_no_replace` ->
+  `rename_at(.., false)`. Landed in PR #38 (`feat/copy-tree`, "atomic no-replace publication").
+- `DONE` **`rename_no_replace` is check-then-act.** (was under "Known gaps in the single-file copy",
+  duplicate of the entry above). Same citations and same fix, PR #38.
+- `DONE` **Run `lefthook install` in each clone (or add it to a bootstrap recipe).** (was under
+  "Scaffolding follow-ups"). The bootstrap recipe already exists: `justfile:126-128` — `hooks:` runs
+  `lefthook install` — present since the initial scaffold commit `7d86f7b` and documented in
+  `CONTRIBUTING.md:15,30`.
+- `DONE` **`_typos.toml` excludes the spec by its literal file name** (was under "Repository and CI
+  hygiene"). Fixed by this branch's Task 1, commit `2f25822`: `_typos.toml`'s exclude is now the glob
+  `"FLUX_FULL_UPDATED_SPEC_V*.md"`.
