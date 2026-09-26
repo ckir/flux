@@ -19,7 +19,8 @@ and grep-verifies every citation.
 | K3 | Output | human output on stderr AND `--json` now, every field truthful | peer's pick (driver preferred deferring `--json`); owner chose it |
 | K4 | Flags | `--safety`, `--preserve-permissions`, `--preserve`, `--durability`, beside `--preserve-times` and `--json`; no `Preserve::Off` flag | same pick |
 | K5 | Symlink vs special file | a special file is SKIPPED and reported per record (§233.1, exit 0); a symlink is a failure (exit 1); the split lives in the engine | same pick |
-| K6 | Canonicalization | the CLI resolves the source root and the destination's nearest existing ancestor | same pick |
+| K6 | Canonicalization | the CLI resolves the source root and the destination's nearest existing ancestor, never SOURCE's final component | same pick |
+| K7 | A symlink given as SOURCE | never followed: `SYMLINK_CREATION_UNAVAILABLE`, exit 1, before the engine is called | converged after two AGY-NEGOTIATE rounds (peer opened with "never resolve", driver with "resolve"; the driver's cp/rsync precedent was wrong and withdrawn); owner asked for one agreed option |
 | - | `bytes_total` | `bytes_copied`; a failed file's size is not counted (no pre-scan) | owner |
 
 Consult: AGY-FIRST brief `.clavity/seams/cut5-forks.md`, reply `.clavity/scratch/cut5/forks.md` (local,
@@ -110,12 +111,20 @@ process: `resolve` (paths and §4.1), `report` (human lines and JSON), and `exit
 ### Resolve (K6)
 
 1. `symlink_metadata(SOURCE)`. Missing: print the error, exit 1.
-2. If SOURCE is a symlink, resolve it with `std::fs::canonicalize`, use the target's type, and pass the
-   RESOLVED path to the engine - for a folder AND for a file, so one rule covers both. (The library refuses
-   a symlinked source root by design; resolving it here is the walker design's assignment. A user-named
-   root is not an object "directly discovered ... by the scanner", which is what §25's invariant governs.)
-   A dangling SOURCE link is a missing source: exit 1.
-3. For a folder source, canonicalize the source root, and canonicalize DEST's nearest existing ancestor
+2. **SOURCE's final component is never resolved.** If `symlink_metadata(SOURCE)` reports a symlink
+   (dangling or not, to a folder or to a file), the CLI does NOT call the engine. It prints one record and
+   exits 1:
+   `SYMLINK_CREATION_UNAVAILABLE: <SOURCE as typed>: a symlink is copied as a link (§25), which this
+   version cannot create; name its target to copy what it points at`.
+   `--json` prints `files_total: 1`, `files_failed: 1`, `errors: 1`. This is the same code the tree
+   reports for a symlink met inside the walk, so one concept has one code; without the check the engine
+   would say `SPECIAL_FILE_UNSUPPORTED` "not a regular file" for a file link (`copy_file_at` step 2) and
+   refuse a folder link as a non-directory root, both misdescribing a link.
+   §25: "copy the symlink itself", "Following symlinks is opt-in". This SUPERSEDES the walker design's
+   assignment that the CLI resolves a symlinked source root (settled by AGY-NEGOTIATE at the owner's
+   request, see Decisions).
+3. For a folder source, canonicalize the source root (its final component is a real directory by step 2,
+   so only INTERMEDIATE links resolve - path resolution, not copying a link), and canonicalize DEST's nearest existing ancestor
    and append the absent remainder lexically (components that do not exist cannot be links). Both sides
    are canonicalized or neither, so Windows' `\\?\` prefix is on both.
 
@@ -128,7 +137,7 @@ not invalidate the containment decision".
 Every message shows paths as the user typed them; a `\\?\` path is never printed. Tree records are
 relative to the destination root and use `/` separators (§233.1).
 
-Apart from step 2, the single-file path keeps its paths as given: its Step 0 lexical check and Step 2a identity gate already
+Step 2 applies to both kinds of source. Otherwise the single-file path keeps its paths as given: its Step 0 lexical check and Step 2a identity gate already
 cover self-copy, and a degraded weak-identity case stages through a distinct temporary (the bytes
 published are the source's own).
 
@@ -165,7 +174,7 @@ basis is invariant 23 ("explicit strict failure") and the walker design, and `--
 | Code | When |
 |---|---|
 | 0 | no failure. Weak-identity warnings and skipped special files still exit 0. |
-| 1 | any streamed failure (including `PublishedWithComplaints`), a single-file error other than the refusal below, or a `TreeAbort` that is not an exit-3 refusal |
+| 1 | a symlink SOURCE (K7); any streamed failure (including `PublishedWithComplaints`), a single-file error other than the refusal below, or a `TreeAbort` that is not an exit-3 refusal |
 | 2 | a usage error: clap's own, or the §4.1 folder-onto-file case |
 | 3 | a `TreeAbort` with `changed() == false`, NO streamed failure before it (`outcome.failures.is_empty()`), and code `SAFETY_REJECTED` or `NOREPLACE_PUBLISH_UNAVAILABLE`; a single-file `SAFETY_REJECTED` (both of `copy_file`'s sites, Step 0 and the Step 2a gate, run before the temporary is created, so nothing has changed) |
 
@@ -272,7 +281,10 @@ Serialization uses `serde` + `serde_json` (already workspace dependencies), adde
 - `--safety=strict` sets `Safety::Strict` (pinned in the `exit`/options unit tests; a real weak-identity
   volume is not on CI);
 - `--json` parses, has every §53 key, and pins `files_copied`, `bytes_copied`, `verify_level`;
-- unix only: a FIFO is skipped with exit 0 and a record line; a symlink fails with exit 1.
+- unix only: a FIFO is skipped with exit 0 and a record line; a symlink inside the tree fails with exit 1;
+  a symlink given as SOURCE (to a folder, to a file, and dangling) exits 1 with the
+  `SYMLINK_CREATION_UNAVAILABLE` record and changes nothing at DEST. (Unix only because creating a symlink
+  on Windows needs a privilege CI does not grant.)
 
 The workspace-level integration placeholder (`tests/integration/mod.rs`) is untouched.
 
