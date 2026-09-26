@@ -127,6 +127,10 @@ process: `resolve` (paths and §4.1), `report` (human lines and JSON), and `exit
    so only INTERMEDIATE links resolve - path resolution, not copying a link), and canonicalize DEST's nearest existing ancestor
    and append the absent remainder lexically (components that do not exist cannot be links). Both sides
    are canonicalized or neither, so Windows' `\\?\` prefix is on both.
+   The nearest existing ancestor is found by trying `canonicalize` on DEST, then on each `parent()` in
+   turn, moving up ONLY on `ErrorKind::NotFound` (absent, or a dangling link) and collecting the skipped
+   components; any other error is a resolution failure (exit 1). A relative DEST is first joined to the
+   current directory, so the climb always ends at a root that exists.
 
 **Why it is still needed after 4b.** 4b resolves the destination and compares identities, which catches a
 symlinked destination when identity is `Strong`. On FAT32 and exFAT identity is weak, the identity checks
@@ -218,7 +222,9 @@ requires.
   - one line for the `Unavailable` bucket, same shape;
   - the single-file path renders `Outcome::identity_degraded` as one such line, with the path the user
     supplied.
-- Then one summary line: files copied, bytes, directories created, failures, special files skipped.
+- Then one summary line: files copied, bytes, directories created, failures, special files skipped. Its
+  failure figure is the JSON `errors` value (so a `TreeAbort` counts as one), and a run that exits
+  non-zero never prints a summary claiming zero failures (panel round 2).
 
 The plan fixes the exact wording. Tests pin the contract, not the prose: a weak-volume line contains the
 volume id (hex), the count, the example path, and `--safety=strict`; a record line starts with its `CODE:`.
@@ -229,8 +235,10 @@ would turn a finished copy into exit 101.)
 
 ### `--json` (stdout, one object, at the end)
 
-Printed whenever the operation ran - exit 0, 1 or 3, single file or tree, success, failure or abort - and
-never on a usage error (exit 2). Human output still goes to stderr. §53 calls its
+Printed on every exit except a usage error (exit 2): 0, 1 or 3, single file or tree, success, failure or
+abort. A failure BEFORE the engine is called - a missing SOURCE, or the CLI's own resolution failing -
+prints every count 0 with `errors: 1` (K7's symlink SOURCE is the one pre-engine case with
+`files_total: 1`, `files_failed: 1`, because the named object is known to be one entry). Human output still goes to stderr. §53 calls its
 list "Complete field list (not only an example)", so every field is present, and each value is true for
 what this cut does:
 
@@ -238,7 +246,7 @@ what this cut does:
 |---|---|
 | `files_total` | `TreeOutcome.files_total`; 1 for a single file |
 | `files_copied` | engine count (0 or 1 for a single file) |
-| `files_skipped` | `special_files_skipped` (tree); 0 for a single file |
+| `files_skipped` | `TreeOutcome.special_files_skipped` (tree); 0 for a single file |
 | `files_overwritten` | single file: 1 if the target existed when resolved and the copy succeeded; tree: 0 |
 | `files_hardlinked`, `files_reflinked`, `files_verified`, `files_mismatched` | 0 - none exist in this cut |
 | `files_degraded` | `TreeOutcome.files_degraded`; single file: 1 if `identity_degraded` is `Some` |
@@ -324,3 +332,7 @@ directory metadata.
   optional leftover (`crates/flux-core/src/copy.rs`, `impl Display for CopyError`); tree leftovers are
   rebuilt destination-relative, and no root path is embedded.
 - `REJECTED: dunce keeps the Windows verbatim prefix on long paths` - this spec uses no `dunce`; it prints user-typed paths.
+- `REJECTED: the exit-3 row omits the no-streamed-failure condition` (panel round 2) - the row carries it
+  ("NO streamed failure before it (`outcome.failures.is_empty()`)"); the quote offered does not appear in
+  the spec at `dd4b7d7`.
+- `REJECTED: TreeAbort is undefined` (panel round 2) - defined under "An abort keeps its partial outcome".
