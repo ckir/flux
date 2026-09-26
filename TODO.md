@@ -141,7 +141,7 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
   say "do not attempt metadata at all". `Off` is reachable only by a library caller in this cut, and
   is tested as one.
 
-- [ ] **The self-copy refusal compares paths, not filesystem identity**
+- [x] **The self-copy refusal compares paths, not filesystem identity**
 
   §2 Foundational Invariants item 22: *"Safety checks use filesystem identity and object identity where
   available, not only lexical path comparisons."* `copy_file` refuses only when `src == dst` as paths,
@@ -151,6 +151,9 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
 
   Blocked on the same primitive the lock protocol needs: `dev`+`ino` on Unix is one call, Windows needs
   `FILE_ID_INFO`, which is already an open item above. Do both at once.
+
+  DONE in cut 4a: `copy_file_at`'s Step 2a gate refuses a destination that is the source by identity;
+  the lexical Step 0 refusal stays in front of it.
 
 ## Known gaps in the single-file copy (from the PR #32 capstone)
 
@@ -173,10 +176,32 @@ Each was measured, and each is deliberately NOT fixed in that PR.
       `std::fs::rename` takes paths rather than the handle probed with, and neither
       platform offers "rename only if I may replace the target". `cp` has the same
       window. Documented in the code; recorded here so it is not rediscovered.
+- [ ] **The Windows read-only guard asks "may I delete", not "may I write".** A file whose ACL
+      denies only `(WD,AD)` cannot be opened for writing by this user, yet BOTH `rename_replace`
+      forms replace it (measured 2026-09-26, cut 4a test audit: the write open fails with code 5, both
+      renames succeed and the contents are gone). The POSIX twin refuses a file the user may not
+      write (`accessat W_OK`), so the platforms diverge, and `destination_is_write_protected`'s doc
+      comment ("asking the SAME question as the Unix half") is false for this ACL. The DELETE probe is
+      deliberate (`crates/flux-platform/src/std_fs.rs`: rename needs DELETE; a write-intent probe may
+      hydrate a cloud placeholder), so fixing it is a design decision: needs an AGY-FIRST consult on a
+      write-denial probe that does not hydrate. Owner ruled 2026-09-26: track, fix later.
+- [ ] **Handle and path `rename_replace` disagree when an ACL denies only read-attributes.** Under a
+      deny of `(RA)` alone, the handle form is refused by `NtSetInformationFile` (`0xC0000022`) and
+      reported as `IoError`, while the path form replaces the file (measured 2026-09-26). The user
+      CAN open that file for writing, so the path outcome matches the "may write" rule and the handle's
+      refusal is spurious and mislabelled (`rename_at` maps every `NtSetInformationFile` failure to
+      `IoError`). Rare ACL; decide it together with the item above.
+- [ ] **No test pins the leftover's spelling for a bare-name destination.** `copy_file` rebuilds a
+      leftover temporary's path from `dst` (`dst.with_file_name`), so `flux copy a b` reports
+      `b.flux-partial.<id>`, not `./b...`. Replacing that with `parent_path.join` leaves every test green
+      (measured, cut 4a test audit): the only leftover test uses `/dst`, where the two agree. `FaultFs`
+      refuses relative paths by design, so the test needs a working directory in the fake or a
+      real-filesystem fixture that can make removal fail. Owner deferred 2026-09-26.
 
 ## Engine (walker cut 4) prerequisites
 
-Promoted from the anomalies inbox, 2026-09-25. Cut 4's plan (`copy_tree`) opens with both.
+Cut 4 is split (see `docs/superpowers/specs/2026-09-25-cut-4-after-handle-relative-writes.md`); both
+entries below are cut 4b's.
 
 - [ ] **Item 113's up-front no-replace probe is not built.** A directory operation against a destination
       with no no-replace publication primitive must be refused with `NOREPLACE_PUBLISH_UNAVAILABLE`
@@ -189,12 +214,19 @@ Promoted from the anomalies inbox, 2026-09-25. Cut 4's plan (`copy_tree`) opens 
       "unavailable", never match an error kind:** `FaultFs` models the missing primitive as
       `ErrorKind::Unsupported` (`fault_fs.rs`, the `no_replace_support == Some(false)` arm), but the real
       9p volume answers `InvalidInput`, so a probe written against the fake passes its tests and misses
-      the real case.
+      the real case. DECIDED 2026-09-25 (owner, agy aligned): the probe stays deferred with the
+      workspace; cut 4b aborts the whole operation on the FIRST publish that fails with "primitive
+      unavailable" (Unsupported, or EINVAL/ENOSYS on unix after the temporary was created), exit 1.
 - [ ] **`FaultFs::move_object` strands a renamed directory's children.** It re-keys only the exact
       `from` and `to` paths; nothing walks the `from/` prefix, so every child keeps its old path. That is
       the stage-then-publish shape `copy_tree` will use, so an engine test that stages a tree and
       publishes it by rename would observe a wrong tree. Fix with the fake's move to node-id keys, which
-      §149.7's handle-relative writes (PR #44) also need.
+      §149.7's handle-relative writes (PR #44) also need. DECIDED 2026-09-25: not needed in cut 4 --
+      the engine renames only files. Stays debt for the first cut that renames a directory.
+- [ ] **§42 mount boundaries are not enforced.** The walk descends into a directory on another volume
+      (a mount), and would read `/proc` inside a copied tree. Needs a walk-level rule (the walk must not
+      even read the mounted subtree), a `--cross-filesystems` option, and a report channel. Its own cut,
+      decided 2026-09-25.
 
 ## Scaffolding follow-ups
 

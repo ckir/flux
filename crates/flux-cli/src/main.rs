@@ -1,7 +1,7 @@
 //! Flux CLI (spec §3.6): argument parsing and command dispatch.
 
 use clap::{Parser, Subcommand};
-use flux_fs::{CopyOptions, Durability, OperationId, Preserve, Publish};
+use flux_fs::{CopyOptions, Durability, OperationId, Preserve, Publish, Safety};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -34,6 +34,7 @@ fn main() -> ExitCode {
                 preserve_permissions: Preserve::Default,
                 durability: Durability::Normal,
                 publish: Publish::Replace,
+                safety: Safety::Default,
                 operation_id: OperationId::new(format!("{}", std::process::id())),
             };
             let fs = flux_platform::StdFileSystem;

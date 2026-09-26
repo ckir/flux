@@ -211,6 +211,16 @@ impl DirHandle for StdDir {
     fn rename_replace(&self, from: &OsStr, other: &Self, to: &OsStr) -> Result<()> {
         check_component(from)?;
         check_component(to)?;
+        // The TARGET lives in `other`. See `is_write_protected_at`.
+        if crate::dir_windows::is_write_protected_at(&other.0, to) {
+            return Err(FsError::new(
+                Code::PermissionDenied,
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "destination is read-only",
+                ),
+            ));
+        }
         crate::dir_windows::rename_at(&self.0, from, &other.0, to, true)
     }
 }
@@ -304,7 +314,11 @@ fn create_new_at(p: &OwnedHandle, n: &OsStr) -> Result<crate::StdFile> {
     let status = unsafe {
         NtCreateFile(
             &raw mut h,
-            FILE_GENERIC_WRITE | SYNCHRONIZE,
+            // FILE_READ_ATTRIBUTES because set_permissions reads the handle's
+            // attributes before changing the read-only bit; FILE_GENERIC_WRITE alone
+            // made that fail with ACCESS_DENIED (MEASURED, cut 4a Task 5). Not
+            // FILE_GENERIC_READ: nothing reads the data back.
+            FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
             &raw const oa,
             &raw mut iosb,
             std::ptr::null(),
@@ -508,6 +522,72 @@ fn remove_file_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {
     }
     drop(h);
     Ok(())
+}
+
+/// The handle-relative twin of `destination_is_write_protected` in `std_fs.rs`
+/// (Windows half), asking the same two questions of a NAME inside `p`.
+///
+/// Both halves, because the path version MEASURED that neither alone is enough: the
+/// read-only ATTRIBUTE is set while a DELETE-access open succeeds, and an ACL denying
+/// (W,D,DC) leaves the attribute unset while the DELETE open fails with ACCESS_DENIED.
+/// DELETE, not write, because rename needs DELETE on the target, and a write-intent
+/// open would ask a cloud-sync filter to hydrate an offline file. Only
+/// STATUS_ACCESS_DENIED counts: a sharing violation is someone else holding the file,
+/// not a protection, and the rename reports it itself. A symlink or junction is
+/// replaced as a name, never followed, so its target is never consulted.
+fn is_write_protected_at(p: &OwnedHandle, n: &OsStr) -> bool {
+    match metadata_at(p, n) {
+        // Nothing occupies the name, so there is nothing to protect.
+        Err(e) if e.source.kind() == std::io::ErrorKind::NotFound => false,
+        // The attributes could not be read. Unlike POSIX -- where the stat and the
+        // rename need the SAME search permission on the same directory, so a denied
+        // stat means a denied rename -- Windows opens for attributes and for DELETE
+        // separately. So still ask whether DELETE is denied, rather than treating an
+        // uninspectable file as writable. (Panel round 2.)
+        Err(_) => delete_access_denied_at(p, n),
+        Ok(m) if m.file_type == flux_fs::FileType::Symlink => false,
+        Ok(m) => {
+            m.permissions == Some(flux_fs::Perms::ReadOnly(true)) || delete_access_denied_at(p, n)
+        }
+    }
+}
+
+/// Whether a handle-relative open of `n` for DELETE is refused with ACCESS_DENIED.
+/// Same object attributes and share mode as `remove_file_at`'s open, and
+/// FILE_OPEN_REPARSE_POINT so a link is probed as the link.
+fn delete_access_denied_at(p: &OwnedHandle, n: &OsStr) -> bool {
+    let mut wide: Vec<u16> = n.encode_wide().collect();
+    let bytes = (wide.len() * 2) as u16;
+    let us = UNICODE_STRING { Length: bytes, MaximumLength: bytes, Buffer: wide.as_mut_ptr() };
+    let mut oa: OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    oa.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
+    oa.RootDirectory = p.as_raw_handle() as HANDLE;
+    oa.ObjectName = &raw const us;
+    let mut raw: HANDLE = std::ptr::null_mut();
+    let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    // SAFETY: every pointer is to a live local that outlives the call, and `wide`
+    // outlives `us` which borrows it.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut raw,
+            DELETE | SYNCHRONIZE,
+            &raw const oa,
+            &raw mut iosb,
+            std::ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status == 0 {
+        // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `raw` is a handle we own.
+        drop(unsafe { OwnedHandle::from_raw_handle(raw as _) });
+        return false;
+    }
+    status == STATUS_ACCESS_DENIED
 }
 
 fn rename_at(fd: &OwnedHandle, f: &OsStr, td: &OwnedHandle, t: &OsStr, r: bool) -> Result<()> {

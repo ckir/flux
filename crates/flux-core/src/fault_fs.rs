@@ -730,7 +730,10 @@ impl DestinationRoot for FaultFs {
 
     fn destination_root(&self, path: &Path) -> Result<Self::Dir> {
         let mut g = self.inner.lock().unwrap();
-        if !g.directories.contains(path) {
+        // A path that has a root but no parent IS a root (`/`, `C:\`), which exists on
+        // any real filesystem. Same rule `create_dir` applies to a root-level create.
+        let is_root = path.has_root() && path.parent().is_none();
+        if !is_root && !g.directories.contains(path) {
             // A path that EXISTS but is not a directory is refused as
             // NotADirectory, not NotFound. MEASURED before this: the fake said
             // NotFound for both, while both real arms distinguish them -- and the
@@ -1315,5 +1318,19 @@ mod tests {
             Ok(_) => panic!("a missing component must be refused"),
         };
         assert_eq!(err.code, Code::DestinationError);
+    }
+
+    #[test]
+    fn destination_root_accepts_the_filesystem_root() {
+        // A real filesystem always has its root, and create_dir already treats a
+        // root as present (the root-parent rule in `create_dir`). copy_file opens
+        // `/dst`'s parent through destination_root, so the fake must agree.
+        use flux_fs::{DestinationRoot, DirHandle};
+        let fs = FaultFs::new();
+        let root = fs.destination_root(Path::new("/")).expect("the root is a directory");
+        let mut w = root.create_new(std::ffi::OsStr::new("f")).unwrap();
+        std::io::Write::write_all(&mut w, b"x").unwrap();
+        drop(w);
+        assert_eq!(fs.read_file("/f").as_deref(), Some(&b"x"[..]));
     }
 }

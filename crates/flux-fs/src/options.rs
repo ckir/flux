@@ -47,12 +47,26 @@ impl OperationId {
     }
 }
 
+/// Whether a safety check that cannot be made with full confidence refuses or degrades.
+///
+/// An enum rather than a bool for the reason `Preserve`, `Durability` and `Publish` are:
+/// named states read better at every construction site, and a third mode is easy to add.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Safety {
+    /// Degrade to the lexical floor when identity is not `Strong` on both sides, and
+    /// report the degradation (`Outcome::identity_degraded`).
+    Default,
+    /// Refuse whenever identity is not `Strong` on both sides of an existing destination.
+    Strict,
+}
+
 #[derive(Debug, Clone)]
 pub struct CopyOptions {
     pub preserve_times: Preserve,
     pub preserve_permissions: Preserve,
     pub durability: Durability,
     pub publish: Publish,
+    pub safety: Safety,
     pub operation_id: OperationId,
 }
 
@@ -68,6 +82,12 @@ pub struct Outcome {
     /// Empty on a clean copy. Non-empty means published-with-complaints: the caller
     /// reports each as METADATA_APPLY_FAILED and the operation exits 1.
     pub metadata_failures: Vec<MetadataFailure>,
+    /// `Some` when the Step 2a identity gate could not compare the source with an
+    /// EXISTING destination and fell back to the lexical floor. Carries the WEAKER of
+    /// the two sides, which is what a warning aggregates on: `Weak(id)` names
+    /// `id.volume`, `Unavailable` names nothing. `None` on the normal path AND when the
+    /// destination did not exist, which is not a degradation.
+    pub identity_degraded: Option<crate::FileIdentity>,
 }
 
 /// `<target>.flux-partial.<operation-id>`, in the target's directory (§18.1, normative).
@@ -92,7 +112,8 @@ mod tests {
 
     #[test]
     fn a_clean_outcome_has_no_metadata_failures() {
-        let o = Outcome { bytes_copied: 10, metadata_failures: Vec::new() };
+        let o =
+            Outcome { bytes_copied: 10, metadata_failures: Vec::new(), identity_degraded: None };
         assert!(o.metadata_failures.is_empty());
         assert_eq!(o.bytes_copied, 10);
     }
