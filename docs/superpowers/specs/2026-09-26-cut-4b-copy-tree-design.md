@@ -41,8 +41,11 @@ pub fn copy_tree<F: DestinationRoot>(
 - **Outer `Err`** = the operation as a whole did not happen or had to stop: the source root missing or not
   a directory; the lexical floor; the §129 pre-flight (an identity match, or a degraded comparison under
   `Safety::Strict`); a per-directory anchor match, or a degraded per-directory comparison under
-  `Safety::Strict`; a destination root that cannot be resolved or created; and decision 3's first publish
-  reporting the primitive unavailable. This list is exhaustive; the plan routes nothing else to it. Every
+  `Safety::Strict`; a destination directory about to be entered that IS the source root by identity (both
+  `Strong`; added by the owner after capstone round 1 - a bind mount inside the destination can present the
+  source under a destination name, and `open_dir` refuses only name-surrogates; aliases of source
+  SUBdirectories remain the §42 mount cut's); a destination root that cannot be resolved or created; and
+  decision 3's first publish reporting the primitive unavailable. This list is exhaustive; the plan routes nothing else to it. Every
   other failure goes to `on_failure` and the walk continues.
 - **`TreeOutcome`**: `files_copied: u64`, `bytes_copied: u64`, `directories_created: u64`,
   `failures: FailureTally`, `warnings: WeakIdentityWarnings`. `WeakIdentityWarnings` and `DegradedGroup`

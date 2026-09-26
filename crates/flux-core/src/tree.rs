@@ -156,7 +156,8 @@ enum Frame<D> {
 ///   root missing or not a directory; the lexical floor; the §129 pre-flight (an
 ///   identity match, or a degraded comparison under `Safety::Strict`); a directory
 ///   reached mid-walk that is the destination by identity, or whose comparison is
-///   degraded under `Strict`; a destination root that cannot be resolved or created;
+///   degraded under `Strict`; a destination directory about to be entered that IS the
+///   source root by identity; a destination root that cannot be resolved or created;
 ///   and the first publish reporting that the no-replace primitive is unavailable.
 /// - Every other failure goes to `on_failure`, and the walk continues.
 /// - Every file is published with `Publish::NoReplace` whatever `opts.publish` says

@@ -247,7 +247,12 @@ entries below are cut 4b's.
 - [ ] **§42 mount boundaries are not enforced.** The walk descends into a directory on another volume
       (a mount), and would read `/proc` inside a copied tree. Needs a walk-level rule (the walk must not
       even read the mounted subtree), a `--cross-filesystems` option, and a report channel. Its own cut,
-      decided 2026-09-25.
+      decided 2026-09-25. **The destination half too:** a bind mount INSIDE the destination can present a
+      source directory under a destination name, and `copy_tree` merges into it (`open_dir` refuses only
+      name-surrogates), so new files can land in the source - never overwriting or deleting (every file
+      publishes no-replace), and with no loop. Cut 4b refuses the case where that directory is the source
+      ROOT (`copy_tree`'s Dir arm, capstone round 1, owner); an alias of a source SUBdirectory is still
+      merged into, and closing it needs the source identities this cut does not track.
 
 ## Scaffolding follow-ups
 
