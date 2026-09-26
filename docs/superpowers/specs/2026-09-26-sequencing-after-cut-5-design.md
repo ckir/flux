@@ -11,8 +11,10 @@ and 10 are provisional** - the re-run of this decision after cut 8 merges may re
 | Cut | Delivers | Closes or unblocks | Depends on |
 |---|---|---|---|
 | **6** | Lock-model debt that weakens what the model proves about behaviour the Rust lock will implement (the 11 items listed below) | those 11 `TODO.md` items | nothing |
-| **7** | The destination lock: §96.1, §99 commit-time revalidation, and §240 staleness and liveness including `--break-lock`. Also the workspace (`DEST/.flux/operations/<id>/`, spec:1378-1391), a versioned manifest (§19), a persisted operation ID, and `--restart` (§21.1). A prior operation's state is handled by §21.1's classification (spec:1595-1640): a live owner is `OPERATION_LOCKED` or `TARGET_LOCK_BUSY`; uncertain ownership or corrupt state is preserved; completed or ABANDONED lets the new run proceed; a resumable one fails `RESUMABLE_OPERATION_EXISTS` without mutating anything, unless `--restart` supersedes it. `--resume` is cut 9's. A **successful** run removes its own temporaries and
-workspace on completion (spec:1536-1548), so no successful copy leaves `.flux/` state behind. | "A leftover temporary from a PREVIOUS run is never removed"; "A blocking pre-existing temporary is not reported" (the id makes it live); "WSL 9p mounts break two lock assumptions" (the lock must handle it or refuse); the manifest half of "Persistent state format" | cut 6 |
+| **7** | The destination lock: §96.1, §99 commit-time revalidation, and §240 staleness and liveness including `--break-lock`. Also the workspace (`DEST/.flux/operations/<id>/`, spec:1378-1391), a versioned manifest (§19), a persisted operation ID, and `--restart` (§21.1). A prior operation's state is handled by §21.1's classification (spec:1595-1640): a live owner is `OPERATION_LOCKED` or `TARGET_LOCK_BUSY`; uncertain ownership or corrupt state is preserved; completed or ABANDONED lets the new run proceed; a resumable one fails `RESUMABLE_OPERATION_EXISTS` without mutating anything, unless `--restart` supersedes it. `--resume` is cut 9's. A **successful** run follows §218's completion lifecycle itself: it removes its temporaries and workspace
+(spec:1536-1548), and when a removal fails it durably records `COMPLETED` with `cleanup_pending` and the
+outstanding artifacts before releasing the lock (spec:9300-9330) - so a successful copy leaves `.flux/`
+state behind only as that record, which §21.1 lets a later run finish. | "A leftover temporary from a PREVIOUS run is never removed"; "A blocking pre-existing temporary is not reported" (the id makes it live); "WSL 9p mounts break two lock assumptions" (the lock must handle it or refuse); the manifest half of "Persistent state format" | cut 6 |
 | **8** | `state.db`, with its technology chosen in this cut next to its first consumer; the §241.5 claim records; and `flux copy` using them - a folder copy replaces an existing destination file (§5.1's default `--overwrite`). **Prerequisite inside this cut:** a destination directory that aliases a SOURCE subdirectory (a bind mount; `TODO.md` §42 entry, "The destination half too") must be refused before replacement ships - under no-replace publication that alias can only add files, under replacement it overwrites source files. The cut's spec decides the mechanism (it needs source identities the walk does not keep today). | "A tree copy never replaces an existing destination file"; "Item 113's up-front no-replace probe is not built"; the `state.db` half of "Persistent state format"; the state-DB part of "Final dependency selection" | cut 7 |
 | **9** (provisional) | Resume (§21), cleanup of a PRIOR completed operation (§218), GC of crashed or abandoned operations' state (§24.3, §222), stale-operation management | Phase 5's crash recovery and cleanup | cut 8 |
 | **10** (provisional) | Several sources (§18.3: one workspace, the manifest maps each source root) | "Several sources are a usage error"; the multiple-sources part of "Integration tests" | cut 7 (workspace); after 9 so a multi-source run is resumable like any other |
@@ -37,11 +39,16 @@ its first real consumer, lets that workload refute a bad choice before anything 
 cleanup: §240's recovery decision order, abandoned owner, uncertain ownership and `--break-lock` (spec:10528,
 :10535, :10569, :10613, :10640). A crashed run's lock is therefore recoverable from cut 7 on; what waits for
 cut 9 is reclaiming the disk a crashed run's workspace used. Resume is always an explicit operator command
-(spec:13603-13604), so omitting it in cut 7 leaves no path that silently resumes. A crashed or ABANDONED run's workspace stays on
-disk until cut 9's GC (§21.1 lets a new run proceed past it) - a leak bounded to failed runs, never to
-successful ones.
+(spec:13603-13604), so omitting it in cut 7 leaves no path that silently resumes. A crashed run's resumable state blocks the next
+run (`RESUMABLE_OPERATION_EXISTS`) until `--restart`, which deletes it before copying (spec item 9,
+spec:56-59), so repeated restarts do not accumulate workspaces; what waits for cut 9's GC is only state a new
+run proceeds past (ABANDONED, §21.1).
 
-**Every cut that adds durable state bumps the workspace format version** (the spec requires it versioned, spec:5717-5718), and a later binary that meets an earlier version classifies it under §21.1 - never misparses it. A crash under a cut-7 binary must leave a workspace a cut-8 or cut-9 binary handles.
+**Every cut that adds durable state bumps the workspace format version** (the spec requires it versioned, spec:5717-5718), and a later binary that meets an earlier version classifies it under §21.1 - never misparses it. A crash under a cut-7 binary must leave a workspace a cut-8 or cut-9 binary handles. Each cut
+that bumps the version owns, in its own spec, reading every earlier version. Cut 7's spec also fixes the
+creation order of the lock record and the workspace it names, so a crash between them is either impossible
+or classified: a lock whose workspace is missing is missing state, preserved and reported
+`ARTIFACT_OWNERSHIP_UNCERTAIN` (§249.4, spec:11293-11315).
 
 **Cut 7's size is decided in its own spec** (owner). agy proposed a seam if it is too large: 7a the lock, an
 empty workspace and `--restart`; 7b the versioned manifest. That seam writes no durable state except the
