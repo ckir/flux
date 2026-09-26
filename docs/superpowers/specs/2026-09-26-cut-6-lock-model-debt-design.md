@@ -29,7 +29,7 @@ branch-granular union, and M7's past-ids half is vacuous under strong identity.
    pin its own value (the `Classifiable` lesson).
 3. **Every closure is proven by its mutant.** The mutant is applied, the named run goes RED, the mutant is
    reverted; a closure with no red run is not closed.
-4. **New `SEED_*` constants are added by a one-off script** to every config and every run's `constants` in
+4. **Every new model constant - each `SEED_*`, and the M7 negative control's constant - is added by a one-off script** to every config and every run's `constants` in
    `expected.toml` / `expected-extended.toml`, as `FALSE` except in their own seeded run. The runner's
    exact-match check (`run.py:859-868`) is unchanged. Agreed with agy after one negotiation round: committed
    configs stay complete, so each still runs under raw TLC and the TLA+ Toolbox, which reject an unassigned
@@ -56,10 +56,15 @@ depth)` and drops the end of the span.
   nodes are grouped under the most recent 2772 action. Its callers (`run.py:1369`, `test_run.py:2085-2110`)
   follow the shape change.
 - **Expectations.** A top-level `branches` list in `expected.toml`, entries
-  `{ label = "...", arm = "<verbatim text of the arm's first line>", reason = "..." }`. Resolution at load time
+  `{ label = "...", arm = "<verbatim text of the arm's first line>", reason = "..." }` for `LockProtocol`, and
+  `{ module = "FsModel", operator = "FsHostCrash", arm = "...", reason = "..." }` for an arm in another module,
+  which has no PlusCal label. The runner validates the list like its other top-level lists: an unknown key, or an
+  entry with both or neither of `label` and `operator`, fails at load. Resolution at load time
   finds the arm text inside that label's action in the GENERATED module (`--check-translation` pins it), so an
   anchor that also appears elsewhere - `IF ident # tobj[self]` occurs in both `S240_5_s4` and `S240_5_s6` - is
-  unambiguous. Missing or ambiguous anchor: fail closed. Summed count over the union's logs of zero: fail.
+  unambiguous. Missing or ambiguous anchor: fail closed. Counts are summed over the NON-fixed logs only, as the
+  label union already does, so a `FIX_*` run cannot satisfy an arm the protocol as specified never reaches; a
+  summed count of zero fails.
 - **Where it is judged.** In `union_from_logs` (`run.py:1251`), beside the label union, so both `just model` and
   the CI `union` job (`--union-from`) enforce it. It costs no TLC time.
 - **Tests (`test_run.py`).** Arm parsing and depth from the new fixture; two logs where only one covers an arm
@@ -97,8 +102,9 @@ aligned):** turn it into a safety claim. Replace the witness ghost with `replace
 replaced lock's owner is a process that has NOT crashed; add `ReplacedOnlyDead == ~replacedLive` to every check
 run's invariants; add `SEED_RECOVER_LIVE` (a `Replaceable` disjunct admitting a live owner) with a seeded run
 expecting `ReplacedOnlyDead` violated. The five `NeverRecoveredAfterCrash` witness runs are retired: they restated
-`S240_3_s5`'s label coverage (the `TODO.md` entry). **Mutants:** drop the `crashed` test in the ghost's guard (the
-seeded run fails: no violation); delete the set (same). **Measure first:** whether the seeded path reaches
+`S240_3_s5`'s label coverage (the `TODO.md` entry). **Mutants:** drop the `crashed` test in the ghost's guard - the
+ghost now fires on an ordinary dead-owner recovery, so every check run fails; delete the set - the seeded run finds
+no violation and fails. **Measure first:** whether the seeded path reaches
 `S240_3_s5` past a live owner's OS-native lock. If it cannot, the seed moves to where the live owner is judged, or
 the item returns to the owner.
 
