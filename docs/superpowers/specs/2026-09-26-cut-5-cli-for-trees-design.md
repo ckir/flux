@@ -302,4 +302,4 @@ directory metadata.
 - `REJECTED: resolved root paths leak through CopyError's Display` - `Display` writes the `FsError` and an
   optional leftover (`crates/flux-core/src/copy.rs`, `impl Display for CopyError`); tree leftovers are
   rebuilt destination-relative, and no root path is embedded.
-- `REJECTED: dunce keeps \?\ on long paths` - this spec uses no `dunce`; it prints user-typed paths.
+- `REJECTED: dunce keeps the Windows verbatim prefix on long paths` - this spec uses no `dunce`; it prints user-typed paths.
