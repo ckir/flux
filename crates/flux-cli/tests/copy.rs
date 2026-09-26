@@ -360,10 +360,15 @@ fn a_symlink_given_as_source_is_never_followed() {
             flux().arg("copy").arg(d.path().join(link)).arg(&dst).arg("--json").output().unwrap();
 
         assert_eq!(out.status.code(), Some(1), "{link}: {}", stderr(&out));
-        assert!(
-            stderr(&out).starts_with("SYMLINK_CREATION_UNAVAILABLE: "),
-            "{link}: {}",
-            stderr(&out)
+        // K7: exactly one line, the whole explanation, and no summary.
+        assert_eq!(
+            stderr(&out),
+            format!(
+                "SYMLINK_CREATION_UNAVAILABLE: {}: a symlink is copied as a link (§25), which this version cannot create; name its target to copy what it points at
+",
+                d.path().join(link).display()
+            ),
+            "{link}"
         );
         assert!(std::fs::symlink_metadata(&dst).is_err(), "{link}: nothing was created");
         let v = json(&out);

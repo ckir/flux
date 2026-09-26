@@ -338,9 +338,11 @@ mod tests {
             line("dev", TreeFailureCause::SpecialFileSkipped),
             ["SPECIAL_FILE_UNSUPPORTED: dev: object_type=special action=skipped"]
         );
-        assert!(
-            line("l", TreeFailureCause::Symlink)[0]
-                .starts_with("SYMLINK_CREATION_UNAVAILABLE: l: ")
+        assert_eq!(
+            line("l", TreeFailureCause::Symlink),
+            [
+                "SYMLINK_CREATION_UNAVAILABLE: l: a symlink is copied as a link (§25), which this version cannot create"
+            ]
         );
         assert_eq!(
             line("s", TreeFailureCause::Walk(FsError::new(Code::PermissionDenied, io("denied")))),
