@@ -22,7 +22,7 @@ fn opts() -> CopyOptions {
 
 fn run(src: &Path, dst: &Path) -> (Result<TreeOutcome, CopyError>, Vec<TreeFailure>) {
     let mut got = Vec::new();
-    let r = copy_tree(&StdFileSystem, src, dst, &opts(), &mut |f| got.push(f));
+    let r = copy_tree(&StdFileSystem, src, dst, &opts(), &mut |f| got.push(f)).map_err(|a| a.error);
     (r, got)
 }
 

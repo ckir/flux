@@ -12,7 +12,7 @@ pub mod fault_fs;
 
 pub use copy::{copy_file, copy_file_at};
 pub use tree::{
-    DegradedGroup, FailureTally, TreeFailure, TreeFailureCause, TreeOutcome, WeakIdentityWarnings,
-    copy_tree,
+    DegradedGroup, FailureTally, TreeAbort, TreeFailure, TreeFailureCause, TreeOutcome,
+    WeakIdentityWarnings, copy_tree,
 };
 pub use walk::{DEFAULT_MAX_DEPTH, Walk, WalkError, WalkEvent, walk, walk_with_depth};

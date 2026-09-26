@@ -35,6 +35,10 @@ pub enum Code {
     /// a name or path the destination refuses as too long even through the
     /// extended-length call path. Path-scoped: it fails that ACTION, not the operation.
     DestinationError,
+    /// §127, §259.11. A symlink cannot be created at the destination; action-scoped.
+    /// This version recreates no symlinks at all, so the CLI reports every symlink it
+    /// meets - inside a tree, or given as SOURCE - with this code (cut 5, K5 and K7).
+    SymlinkCreationUnavailable,
     IoError,
 }
 
@@ -53,6 +57,7 @@ impl Code {
             Code::NoReplacePublishUnavailable => "NOREPLACE_PUBLISH_UNAVAILABLE",
             Code::DestinationNamespaceCollision => "DESTINATION_NAMESPACE_COLLISION",
             Code::DestinationError => "DESTINATION_ERROR",
+            Code::SymlinkCreationUnavailable => "SYMLINK_CREATION_UNAVAILABLE",
             Code::IoError => "IO_ERROR",
         }
     }
@@ -119,6 +124,7 @@ mod tests {
         assert_eq!(Code::NoReplacePublishUnavailable.as_str(), "NOREPLACE_PUBLISH_UNAVAILABLE");
         assert_eq!(Code::DestinationNamespaceCollision.as_str(), "DESTINATION_NAMESPACE_COLLISION");
         assert_eq!(Code::DestinationError.as_str(), "DESTINATION_ERROR");
+        assert_eq!(Code::SymlinkCreationUnavailable.as_str(), "SYMLINK_CREATION_UNAVAILABLE");
     }
 
     #[test]
