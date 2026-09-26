@@ -214,6 +214,7 @@ fn identity_gate<D: DirHandle>(
     name: &OsStr,
     src: &Metadata,
     safety: Safety,
+    publish: Publish,
 ) -> std::result::Result<Option<FileIdentity>, CopyError> {
     let refuse = |why: &'static str| {
         CopyError::at(
@@ -231,13 +232,34 @@ fn identity_gate<D: DirHandle>(
         Err(e) if e.source.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(_) => degraded(FileIdentity::Unavailable),
         Ok(m) if m.file_type == FileType::Dir => Err(refuse("the destination is a directory")),
-        Ok(m) => match (src.identity, m.identity) {
-            (FileIdentity::Strong(a), FileIdentity::Strong(b)) if a == b => {
-                Err(refuse("the destination is the source itself, by identity"))
+        Ok(m) => {
+            let verdict = match (src.identity, m.identity) {
+                (FileIdentity::Strong(a), FileIdentity::Strong(b)) if a == b => {
+                    return Err(refuse("the destination is the source itself, by identity"));
+                }
+                (FileIdentity::Strong(_), FileIdentity::Strong(_)) => None,
+                (s, d) => degraded(weaker(s, d))?,
+            };
+            // F3 (cut 4b): a publish that never replaces refuses an EXISTING destination
+            // here, after every identity row and before the temporary exists, instead of
+            // copying every byte and failing at the rename. Same code and kind the
+            // rename gives (IO_ERROR, AlreadyExists); `copy_tree` maps it to
+            // DESTINATION_NAMESPACE_COLLISION. A symlink occupying the name reaches this
+            // row too - the handle stat never follows it - and is left untouched.
+            if publish == Publish::NoReplace {
+                return Err(CopyError::at(
+                    CopyStep::Gate,
+                    FsError::new(
+                        Code::IoError,
+                        std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            "the destination exists and this publish never replaces",
+                        ),
+                    ),
+                ));
             }
-            (FileIdentity::Strong(_), FileIdentity::Strong(_)) => Ok(None),
-            (s, d) => degraded(weaker(s, d)),
-        },
+            Ok(verdict)
+        }
     }
 }
 
@@ -327,7 +349,7 @@ pub fn copy_file_at<F: DestinationRoot>(
 
     // 2a. the destination must not BE the source. Before the temporary exists, so a
     //     refusal changes nothing on disk.
-    let identity_degraded = identity_gate(parent, name, &src_meta, opts.safety)?;
+    let identity_degraded = identity_gate(parent, name, &src_meta, opts.safety, opts.publish)?;
 
     let mut reader = fs.open_read(src).map_err(|e| CopyError::at(CopyStep::Source, e))?;
 
@@ -1176,5 +1198,49 @@ mod tests {
         let publish = with_src();
         publish.fail("rename_replace", flux_fs::Code::PermissionDenied);
         assert_eq!(step(&publish, "/src", "/dst", &opts()), CopyStep::Publish);
+    }
+
+    #[test]
+    fn under_no_replace_an_existing_destination_is_refused_before_any_bytes_are_copied() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"new");
+        fs.write_file("/dst", b"existing");
+        let mut o = opts();
+        o.publish = Publish::NoReplace;
+
+        let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &o).unwrap_err();
+
+        assert_eq!(err.step, CopyStep::Gate);
+        assert_eq!(err.code(), flux_fs::Code::IoError);
+        assert_eq!(err.cause.source.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(!fs.called("create_new"), "refused before the temporary exists");
+        assert_eq!(fs.read_file("/dst").as_deref(), Some(&b"existing"[..]));
+    }
+
+    #[test]
+    fn under_no_replace_the_identity_rows_still_come_first() {
+        // An identity-equal destination is still SAFETY_REJECTED, not AlreadyExists.
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.write_file("/dst", b"hello");
+        let id = flux_fs::FileIdentity::Strong(flux_fs::ObjectId { volume: 1, index: 9_002 });
+        fs.set_identity("/src", id);
+        fs.set_identity("/dst", id);
+        let mut o = opts();
+        o.publish = Publish::NoReplace;
+
+        let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &o).unwrap_err();
+
+        assert_eq!(err.code(), flux_fs::Code::SafetyRejected);
+        assert_eq!(err.step, CopyStep::Gate);
+    }
+
+    #[test]
+    fn under_replace_an_existing_destination_is_still_replaced() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"new");
+        fs.write_file("/dst", b"old");
+        copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap();
+        assert_eq!(fs.read_file("/dst").as_deref(), Some(&b"new"[..]));
     }
 }
