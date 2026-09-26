@@ -61,6 +61,31 @@ pre-push hook for them; CI is the gate. A clean result is meaningful: a control 
 - `openapi.json` / `utoipa` / `prometheus-client` — no HTTP API, no metrics endpoint.
 - `testcontainers` — no external services to stand up in tests.
 
+## Required tools
+
+What `.claude/recommended-tools.json` declares: the tools a fresh checkout has to install, how, and how
+the SessionStart hook decides each one is present. Generated - edit the JSON, then run `just tools-doc`;
+the tables above carry the reasons.
+
+<!-- tools:begin - generated from .claude/recommended-tools.json by `just tools-doc`; do not edit by hand -->
+| Tool | Install | Checked by |
+|---|---|---|
+| `cargo-nextest` | `cargo binstall -y cargo-nextest` | on `PATH` as `cargo-nextest` |
+| `just` | `cargo binstall -y just` | on `PATH` as `just` |
+| `lefthook` | `cargo binstall -y lefthook` | on `PATH` as `lefthook` |
+| `cargo-deny` | `cargo binstall -y cargo-deny` | on `PATH` as `cargo-deny` |
+| `typos` | `cargo binstall -y typos-cli` | on `PATH` as `typos` |
+| `bacon` | `cargo binstall -y bacon` | on `PATH` as `bacon` |
+| `release-plz` | `cargo binstall -y release-plz` | on `PATH` as `release-plz` |
+| `cargo-mutants` | `cargo binstall -y cargo-mutants` | on `PATH` as `cargo-mutants` |
+| `java` | `winget install EclipseAdoptium.Temurin.21.JDK` | on `PATH` as `java` |
+| `tla2tools.jar` | `python -c "import sys; sys.path.insert(0, 'models/lockproto'); import run; print(run.ensure_jar())"` | file `target/tla/tla2tools.jar` |
+| `gh` | `winget install GitHub.cli` | on `PATH` as `gh` |
+| `python3` | `winget install Python.Python.3.14` | on `PATH` as `python3` |
+| `actionlint` | `winget install rhysd.actionlint` | on `PATH` as `actionlint` |
+| `shellcheck` | `winget install koalaman.shellcheck` | on `PATH` as `shellcheck` |
+<!-- tools:end -->
+
 ## Gate commands (the contract)
 
 ```
@@ -79,7 +104,9 @@ just lint-workflows # actionlint (+ shellcheck over run: steps); CI job "Workflo
 ## Keeping this file honest
 
 Every tool named here that an agent or a fresh checkout has to *install* is also declared in
-`.claude/recommended-tools.json`, which the SessionStart hook reads to report what is missing. The two are
+`.claude/recommended-tools.json`, which the SessionStart hook reads to report what is missing. The
+"Required tools" table is generated from that JSON by `just tools-doc`, and `just check` fails while it is
+stale. The two are
 machine-checked by `tests/dev_tooling.rs`: each tool in that JSON must appear in a table row above, and the
 prose in `README.md` and `CONTRIBUTING.md` must still point at both files. The check runs one way only —
 this file may document more than the JSON declares, because components that ship with the toolchain

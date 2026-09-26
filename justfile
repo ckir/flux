@@ -153,6 +153,11 @@ model-stamp:
     {{python}} models/lockproto/run.py
     cargo test --test model_stamp -- --ignored rewrite_unit_hashes --exact
 
+# Regenerate the "Required tools" table in docs/dev-tooling.md from .claude/recommended-tools.json.
+# `just check` fails while the two disagree (tests/dev_tooling.rs, the_generated_tool_table_is_current).
+tools-doc:
+    cargo test --test dev_tooling -- --ignored rewrite_tool_table --exact
+
 # Mutation testing over the engine
 mutants:
     cargo mutants --package flux-core
