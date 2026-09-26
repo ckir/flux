@@ -65,6 +65,8 @@ pre-push hook for them; CI is the gate. A clean result is meaningful: a control 
 
 ```
 just check          # fmt-check + clippy + test — the local gate
+just check-linux    # the Linux leg: clippy + all tests, natively or through WSL
+just check-mac      # the macOS leg: clippy only, cross-compiled; runs no tests
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo nextest run --workspace
