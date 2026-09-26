@@ -309,6 +309,14 @@ mod tests {
     }
 
     #[test]
+    fn a_single_file_onto_a_fresh_target_overwrites_nothing() {
+        let ok: Result<Outcome, CopyError> =
+            Ok(Outcome { bytes_copied: 5, metadata_failures: Vec::new(), identity_degraded: None });
+        let r = Report::file(&ok, false, 0);
+        assert_eq!((r.files_copied, r.files_overwritten), (1, 0));
+    }
+
+    #[test]
     fn a_pre_engine_report() {
         let r = Report::pre_engine(false);
         assert_eq!((r.files_total, r.files_failed, r.errors), (0, 0, 1));
