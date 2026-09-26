@@ -176,6 +176,27 @@ Each was measured, and each is deliberately NOT fixed in that PR.
       `std::fs::rename` takes paths rather than the handle probed with, and neither
       platform offers "rename only if I may replace the target". `cp` has the same
       window. Documented in the code; recorded here so it is not rediscovered.
+- [ ] **The Windows read-only guard asks "may I delete", not "may I write".** A file whose ACL
+      denies only `(WD,AD)` cannot be opened for writing by this user, yet BOTH `rename_replace`
+      forms replace it (measured 2026-09-26, cut 4a test audit: the write open fails with code 5, both
+      renames succeed and the contents are gone). The POSIX twin refuses a file the user may not
+      write (`accessat W_OK`), so the platforms diverge, and `destination_is_write_protected`'s doc
+      comment ("asking the SAME question as the Unix half") is false for this ACL. The DELETE probe is
+      deliberate (`crates/flux-platform/src/std_fs.rs`: rename needs DELETE; a write-intent probe may
+      hydrate a cloud placeholder), so fixing it is a design decision: needs an AGY-FIRST consult on a
+      write-denial probe that does not hydrate. Owner ruled 2026-09-26: track, fix later.
+- [ ] **Handle and path `rename_replace` disagree when an ACL denies only read-attributes.** Under a
+      deny of `(RA)` alone, the handle form is refused by `NtSetInformationFile` (`0xC0000022`) and
+      reported as `IoError`, while the path form replaces the file (measured 2026-09-26). The user
+      CAN open that file for writing, so the path outcome matches the "may write" rule and the handle's
+      refusal is spurious and mislabelled (`rename_at` maps every `NtSetInformationFile` failure to
+      `IoError`). Rare ACL; decide it together with the item above.
+- [ ] **No test pins the leftover's spelling for a bare-name destination.** `copy_file` rebuilds a
+      leftover temporary's path from `dst` (`dst.with_file_name`), so `flux copy a b` reports
+      `b.flux-partial.<id>`, not `./b...`. Replacing that with `parent_path.join` leaves every test green
+      (measured, cut 4a test audit): the only leftover test uses `/dst`, where the two agree. `FaultFs`
+      refuses relative paths by design, so the test needs a working directory in the fake or a
+      real-filesystem fixture that can make removal fail. Owner deferred 2026-09-26.
 
 ## Engine (walker cut 4) prerequisites
 
