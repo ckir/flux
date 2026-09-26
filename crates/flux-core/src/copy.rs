@@ -27,6 +27,32 @@ fn copy_code(e: &std::io::Error) -> Code {
     }
 }
 
+/// Where in `copy_file_at` (or its `copy_file` wrapper) a copy failed. A caller that
+/// must tell a failure at the exclusive create from one at the publish - both can say
+/// `AlreadyExists` - reads this instead of guessing from the error kind (cut 4b, F1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyStep {
+    /// Resolving the destination: the lexical Step 0 refusal, splitting the path,
+    /// opening the parent. Also any failure that belongs to no copy step.
+    Resolve,
+    /// Step 2: the source's metadata, its type, opening it.
+    Source,
+    /// Step 2a: the destination identity gate.
+    Gate,
+    /// Step 3: the exclusive create of the staging temporary.
+    Create,
+    /// Step 4: streaming the bytes.
+    Stream,
+    /// Step 5: strict durability.
+    Durability,
+    /// Step 6: applying metadata under `Preserve::Strict`.
+    Metadata,
+    /// Step 7: the source re-check.
+    Recheck,
+    /// Step 7: the publishing rename.
+    Publish,
+}
+
 /// The engine's error: a filesystem failure, plus anything the ENGINE knows that the
 /// filesystem layer cannot.
 ///
@@ -47,6 +73,8 @@ pub struct CopyError {
     /// with the reason removal failed. STRUCTURED, not pre-rendered: a caller that wants
     /// to sweep it needs the path itself, not a path inside a sentence.
     pub leftover: Option<(std::path::PathBuf, std::io::Error)>,
+    /// Which step failed. Set where the failure happens; see `CopyStep`.
+    pub step: CopyStep,
 }
 
 impl std::fmt::Display for CopyError {
@@ -69,8 +97,8 @@ impl std::error::Error for CopyError {
 }
 
 impl CopyError {
-    fn new(cause: FsError) -> Self {
-        CopyError { cause, leftover: None }
+    pub(crate) fn at(step: CopyStep, cause: FsError) -> Self {
+        CopyError { cause, leftover: None, step }
     }
 
     /// The spec code of the failure, which is what nearly every caller wants.
@@ -103,16 +131,17 @@ impl CopyError {
 fn discard<D: DirHandle>(
     parent: &D,
     temp: &OsStr,
+    step: CopyStep,
     code: Code,
     source: std::io::Error,
 ) -> CopyError {
     match parent.remove_file(temp) {
-        Ok(()) => CopyError::new(FsError::new(code, source)),
+        Ok(()) => CopyError::at(step, FsError::new(code, source)),
         // NotFound means it is already gone -- something else removed it, or it was
         // never created. Reporting a leftover here would send someone hunting a file
         // that does not exist.
         Err(e) if e.source.kind() == std::io::ErrorKind::NotFound => {
-            CopyError::new(FsError::new(code, source))
+            CopyError::at(step, FsError::new(code, source))
         }
         // Carry the removal's own error too, in `leftover` and NOT over `source`:
         // wrapping the primary failure in `Error::other(format!(..))` destroyed
@@ -121,6 +150,7 @@ fn discard<D: DirHandle>(
         Err(why) => CopyError {
             cause: FsError::new(code, source),
             leftover: Some((std::path::PathBuf::from(temp), why.source)),
+            step,
         },
     }
 }
@@ -137,12 +167,18 @@ fn temp_name(name: &OsStr, id: &OperationId) -> OsString {
 /// write, so it is a destination error. A bare name's parent is the EMPTY path,
 /// which names the working directory but which `destination_root` cannot open, so
 /// it becomes `.`.
-fn split_destination(dst: &Path) -> std::result::Result<(&Path, &OsStr), CopyError> {
+pub(crate) fn split_destination(dst: &Path) -> std::result::Result<(&Path, &OsStr), CopyError> {
     let Some(name) = dst.file_name() else {
-        return Err(CopyError::new(FsError::new(
-            Code::DestinationError,
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "the destination names no file"),
-        )));
+        return Err(CopyError::at(
+            CopyStep::Resolve,
+            FsError::new(
+                Code::DestinationError,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "the destination names no file",
+                ),
+            ),
+        ));
     };
     let parent = match dst.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
@@ -180,7 +216,10 @@ fn identity_gate<D: DirHandle>(
     safety: Safety,
 ) -> std::result::Result<Option<FileIdentity>, CopyError> {
     let refuse = |why: &'static str| {
-        CopyError::new(FsError::new(Code::SafetyRejected, std::io::Error::other(why)))
+        CopyError::at(
+            CopyStep::Gate,
+            FsError::new(Code::SafetyRejected, std::io::Error::other(why)),
+        )
     };
     let degraded = |weaker: FileIdentity| match safety {
         Safety::Default => Ok(Some(weaker)),
@@ -206,7 +245,7 @@ fn identity_gate<D: DirHandle>(
 /// `Unavailable` is weaker than `Weak`; between two `Weak`, the DESTINATION's volume
 /// keys it, because that is the side the user did not name (walker design,
 /// "Stand-downs").
-fn weaker(src: FileIdentity, dst: FileIdentity) -> FileIdentity {
+pub(crate) fn weaker(src: FileIdentity, dst: FileIdentity) -> FileIdentity {
     match (src, dst) {
         (FileIdentity::Unavailable, _) | (_, FileIdentity::Unavailable) => {
             FileIdentity::Unavailable
@@ -232,15 +271,19 @@ pub fn copy_file<F: DestinationRoot>(
     //    `copy_file_at`, which has to stat the destination and so cannot keep this
     //    step's promise; the two coexist rather than one replacing the other.
     if src == dst {
-        return Err(CopyError::new(FsError::new(
-            Code::SafetyRejected,
-            std::io::Error::other("source and destination are the same path"),
-        )));
+        return Err(CopyError::at(
+            CopyStep::Resolve,
+            FsError::new(
+                Code::SafetyRejected,
+                std::io::Error::other("source and destination are the same path"),
+            ),
+        ));
     }
     let (parent_path, name) = split_destination(dst)?;
     // The one path-based call on the write side. §149.7 exempts resolving the
     // destination itself: it may follow links, because the user named it.
-    let parent = fs.destination_root(parent_path).map_err(CopyError::new)?;
+    let parent =
+        fs.destination_root(parent_path).map_err(|e| CopyError::at(CopyStep::Resolve, e))?;
     copy_file_at(fs, src, &parent, name, opts).map_err(|mut e| {
         // Rebuilt from `dst`, NOT joined onto `parent_path`: for a bare name the
         // opened parent is a synthesized `.`, and joining would report
@@ -274,24 +317,24 @@ pub fn copy_file_at<F: DestinationRoot>(
 
     // 2. source, captured for the step-7 re-check
     // Safe to `?`: nothing has been created yet, so there is nothing to leak.
-    let src_meta = fs.metadata(src).map_err(CopyError::new)?;
+    let src_meta = fs.metadata(src).map_err(|e| CopyError::at(CopyStep::Source, e))?;
     if src_meta.file_type != FileType::File {
-        return Err(CopyError::new(FsError::new(
-            Code::SpecialFileUnsupported,
-            std::io::Error::other("not a regular file"),
-        )));
+        return Err(CopyError::at(
+            CopyStep::Source,
+            FsError::new(Code::SpecialFileUnsupported, std::io::Error::other("not a regular file")),
+        ));
     }
 
     // 2a. the destination must not BE the source. Before the temporary exists, so a
     //     refusal changes nothing on disk.
     let identity_degraded = identity_gate(parent, name, &src_meta, opts.safety)?;
 
-    let mut reader = fs.open_read(src).map_err(CopyError::new)?;
+    let mut reader = fs.open_read(src).map_err(|e| CopyError::at(CopyStep::Source, e))?;
 
     // 3. exclusive create (FS-1)
     // Still safe: if this FAILS, this call is precisely what did not create the
     // temporary, so there is nothing of ours on disk.
-    let mut writer = parent.create_new(&temp).map_err(CopyError::new)?;
+    let mut writer = parent.create_new(&temp).map_err(|e| CopyError::at(CopyStep::Create, e))?;
 
     // 4. stream
     let mut bytes_copied = 0u64;
@@ -300,10 +343,10 @@ pub fn copy_file_at<F: DestinationRoot>(
         let n = match std::io::Read::read(&mut reader, &mut buf) {
             Ok(0) => break,
             Ok(n) => n,
-            Err(e) => return Err(discard(parent, &temp, copy_code(&e), e)),
+            Err(e) => return Err(discard(parent, &temp, CopyStep::Stream, copy_code(&e), e)),
         };
         if let Err(e) = writer.write_all(&buf[..n]) {
-            return Err(discard(parent, &temp, copy_code(&e), e));
+            return Err(discard(parent, &temp, CopyStep::Stream, copy_code(&e), e));
         }
         bytes_copied += n as u64;
     }
@@ -312,7 +355,13 @@ pub fn copy_file_at<F: DestinationRoot>(
     if opts.durability == Durability::Strict
         && let Err(e) = writer.sync_all()
     {
-        return Err(discard(parent, &temp, Code::StrictDurabilityUnavailable, e.source));
+        return Err(discard(
+            parent,
+            &temp,
+            CopyStep::Durability,
+            Code::StrictDurabilityUnavailable,
+            e.source,
+        ));
     }
 
     // 6. metadata, on the temporary, BEFORE publication (§44.1)
@@ -322,7 +371,13 @@ pub fn copy_file_at<F: DestinationRoot>(
         && let Err(e) = fs.set_times(&writer, src_meta.modified)
     {
         if opts.preserve_times == Preserve::Strict {
-            return Err(discard(parent, &temp, Code::MetadataApplyFailed, e.source));
+            return Err(discard(
+                parent,
+                &temp,
+                CopyStep::Metadata,
+                Code::MetadataApplyFailed,
+                e.source,
+            ));
         }
         metadata_failures.push(MetadataFailure { item: MetadataItem::Times, error: e });
     }
@@ -331,7 +386,13 @@ pub fn copy_file_at<F: DestinationRoot>(
         && let Err(e) = fs.set_permissions(&writer, src_meta.permissions)
     {
         if opts.preserve_permissions == Preserve::Strict {
-            return Err(discard(parent, &temp, Code::MetadataApplyFailed, e.source));
+            return Err(discard(
+                parent,
+                &temp,
+                CopyStep::Metadata,
+                Code::MetadataApplyFailed,
+                e.source,
+            ));
         }
         metadata_failures.push(MetadataFailure { item: MetadataItem::Permissions, error: e });
     }
@@ -346,13 +407,13 @@ pub fn copy_file_at<F: DestinationRoot>(
         // failures.
         Err(e) if e.source.kind() == std::io::ErrorKind::NotFound => {
             let gone = std::io::Error::other("source disappeared during the copy");
-            return Err(discard(parent, &temp, Code::SourceChanged, gone));
+            return Err(discard(parent, &temp, CopyStep::Recheck, Code::SourceChanged, gone));
         }
-        Err(e) => return Err(discard(parent, &temp, e.code, e.source)),
+        Err(e) => return Err(discard(parent, &temp, CopyStep::Recheck, e.code, e.source)),
     };
     if now.len != src_meta.len || now.modified != src_meta.modified {
         let changed = std::io::Error::other("source changed");
-        return Err(discard(parent, &temp, Code::SourceChanged, changed));
+        return Err(discard(parent, &temp, CopyStep::Recheck, Code::SourceChanged, changed));
     }
 
     let published = match opts.publish {
@@ -363,7 +424,7 @@ pub fn copy_file_at<F: DestinationRoot>(
         // Keep whatever the platform layer mapped. A publish failure is NOT the content
         // copy -- that already succeeded -- so it must not be relabelled COPY_FAILED,
         // and an unclassified one stays IO_ERROR, the declared catch-all.
-        return Err(discard(parent, &temp, e.code, e.source));
+        return Err(discard(parent, &temp, CopyStep::Publish, e.code, e.source));
     }
 
     // A successful rename consumed the temporary; there is nothing left to remove.
@@ -820,7 +881,10 @@ mod tests {
         // introduced an untested line of its own.
         use std::error::Error as _;
 
-        let err = CopyError::new(FsError::new(Code::IoError, std::io::Error::from_raw_os_error(5)));
+        let err = CopyError::at(
+            CopyStep::Resolve,
+            FsError::new(Code::IoError, std::io::Error::from_raw_os_error(5)),
+        );
 
         let cause = err.source().expect("CopyError must expose its cause");
         let fs_err = cause.downcast_ref::<FsError>().expect("the cause is an FsError");
@@ -1049,5 +1113,68 @@ mod tests {
         let out = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap();
 
         assert_eq!(out.identity_degraded, Some(weak(7)));
+    }
+
+    #[test]
+    fn every_failure_names_the_step_it_failed_at() {
+        let step = |fs: &FaultFs, src: &str, dst: &str, o: &CopyOptions| {
+            copy_file(fs, Path::new(src), Path::new(dst), o).unwrap_err().step
+        };
+        let with_src = || {
+            let fs = FaultFs::new();
+            fs.write_file("/src", b"hello");
+            fs
+        };
+
+        // Resolve: the lexical refusal, a destination naming no file, a missing parent.
+        assert_eq!(step(&with_src(), "/src", "/src", &opts()), CopyStep::Resolve);
+        assert_eq!(step(&with_src(), "/src", "/", &opts()), CopyStep::Resolve);
+        assert_eq!(step(&with_src(), "/src", "/missing/dst", &opts()), CopyStep::Resolve);
+
+        // Source: missing, not a regular file, cannot be opened.
+        assert_eq!(step(&FaultFs::new(), "/nope", "/dst", &opts()), CopyStep::Source);
+        let special = FaultFs::new();
+        special.add_special("/src");
+        assert_eq!(step(&special, "/src", "/dst", &opts()), CopyStep::Source);
+        let unreadable = with_src();
+        unreadable.fail("open_read", flux_fs::Code::PermissionDenied);
+        assert_eq!(step(&unreadable, "/src", "/dst", &opts()), CopyStep::Source);
+
+        // Gate: the destination is the source by identity.
+        let alias = with_src();
+        alias.write_file("/dst", b"hello");
+        let id = flux_fs::FileIdentity::Strong(flux_fs::ObjectId { volume: 1, index: 9_001 });
+        alias.set_identity("/src", id);
+        alias.set_identity("/dst", id);
+        assert_eq!(step(&alias, "/src", "/dst", &opts()), CopyStep::Gate);
+
+        // Create, Stream, Durability, Metadata, Recheck, Publish.
+        let create = with_src();
+        create.fail("create_new", flux_fs::Code::PermissionDenied);
+        assert_eq!(step(&create, "/src", "/dst", &opts()), CopyStep::Create);
+
+        let stream = with_src();
+        stream.fail_write(std::io::Error::other("the device hiccupped"));
+        assert_eq!(step(&stream, "/src", "/dst", &opts()), CopyStep::Stream);
+
+        let durable = with_src();
+        durable.fail("sync_all", flux_fs::Code::IoError);
+        let mut strict_sync = opts();
+        strict_sync.durability = Durability::Strict;
+        assert_eq!(step(&durable, "/src", "/dst", &strict_sync), CopyStep::Durability);
+
+        let meta = with_src();
+        meta.fail("set_times", flux_fs::Code::PermissionDenied);
+        let mut strict_times = opts();
+        strict_times.preserve_times = Preserve::Strict;
+        assert_eq!(step(&meta, "/src", "/dst", &strict_times), CopyStep::Metadata);
+
+        let recheck = with_src();
+        recheck.vanish_on_second_metadata("/src");
+        assert_eq!(step(&recheck, "/src", "/dst", &opts()), CopyStep::Recheck);
+
+        let publish = with_src();
+        publish.fail("rename_replace", flux_fs::Code::PermissionDenied);
+        assert_eq!(step(&publish, "/src", "/dst", &opts()), CopyStep::Publish);
     }
 }
