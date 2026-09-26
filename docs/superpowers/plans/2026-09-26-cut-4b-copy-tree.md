@@ -129,7 +129,7 @@
     }
 ```
 
-  `std_fs.rs`: change the signature line `pub(crate) fn identity_of_handle(file: &File) -> FileIdentity {` to `pub(crate) fn identity_of_handle(file: &impl std::os::windows::io::AsRawHandle) -> FileIdentity {`, and in its doc comment replace `which is why it is private and takes a \`&File\` rather than` with `which is why it is private and takes an open handle rather than` (the next line, `a path.`, stays). The body is unchanged.
+  `std_fs.rs`: change the signature line `pub(crate) fn identity_of_handle(file: &File) -> FileIdentity {` to `pub(crate) fn identity_of_handle(file: &impl std::os::windows::io::AsRawHandle) -> FileIdentity {`, and in its doc comment replace `which is why it is private and takes a \`&File\` rather than` with `which is why it is private and takes an open handle rather than` (the next line, `a path.`, stays). In the body, delete the first line, `use std::os::windows::io::AsRawHandle;`: the new parameter bound brings the method into scope, and the import then fails `-D warnings` as unused (MEASURED in execution, commit `14ac43c`). The rest of the body is unchanged.
 
   `dir_windows.rs`, inside `impl DirHandle for StdDir`, directly after `fn open_dir`:
 
