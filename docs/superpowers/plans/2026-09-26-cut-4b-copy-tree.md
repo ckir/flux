@@ -662,6 +662,13 @@ mod tests {
     fn a_destination_inside_the_source_is_refused_lexically_before_any_call() {
         for dst in ["/src", "/src/backup"] {
             let fs = tree();
+            // A WEAK source identity, so the identity pre-flight cannot catch the overlap
+            // (it degrades under Default and proceeds): the lexical floor is then the only
+            // guard, and a mutant that disables it creates `/src/backup` and goes red.
+            // Without this, the pre-flight refuses both spellings on its own (the anchor IS
+            // `/src`) and the test could not tell the floor from the pre-flight (plan
+            // panel round 1).
+            fs.set_identity("/src", FileIdentity::Weak(ObjectId { volume: 5, index: 1 }));
             let n = fs.calls().len();
             let (r, _) = run(&fs, "/src", dst, &opts());
             assert_eq!(r.unwrap_err().code(), Code::SafetyRejected, "{dst}");
