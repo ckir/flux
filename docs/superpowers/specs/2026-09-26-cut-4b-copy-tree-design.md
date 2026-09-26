@@ -39,8 +39,10 @@ pub fn copy_tree<F: DestinationRoot>(
 ```
 
 - **Outer `Err`** = the operation as a whole did not happen or had to stop: the source root missing or not
-  a directory; the lexical floor; the §129 pre-flight; a per-directory anchor match; a destination root that
-  cannot be resolved or created; and decision 3's first publish reporting the primitive unavailable. Every
+  a directory; the lexical floor; the §129 pre-flight (an identity match, or a degraded comparison under
+  `Safety::Strict`); a per-directory anchor match, or a degraded per-directory comparison under
+  `Safety::Strict`; a destination root that cannot be resolved or created; and decision 3's first publish
+  reporting the primitive unavailable. This list is exhaustive; the plan routes nothing else to it. Every
   other failure goes to `on_failure` and the walk continues.
 - **`TreeOutcome`**: `files_copied: u64`, `bytes_copied: u64`, `directories_created: u64`,
   `failures: FailureTally`, `warnings: WeakIdentityWarnings`. `WeakIdentityWarnings` and `DegradedGroup`
@@ -86,19 +88,29 @@ pub fn copy_tree<F: DestinationRoot>(
    continue under `Safety::Default`; outer `Err` under `Safety::Strict`. Nothing has been created yet.
    Because the anchor is the RESOLVED destination's identity, a destination symlinked to the source is
    caught here by identity; the walker design's "refuse a `Symlink` anchor" rule is obsolete (decision 2).
-5. **Create the root if absent** by decision 8 on `parent` (below), with every failure the outer `Err`. On
-   success the root handle's identity joins the fold-collision set if `Strong`, and `directories_created`
-   counts it only if `create_dir` made it.
+5. **Create the root if absent** by decision 8 on `parent` (below), with every failure the outer `Err`
+   (there is no sibling on `parent` to collide with, so no fold check applies to the root).
+   `directories_created` counts it only if `create_dir` made it.
 6. **Walk**, keeping a stack of destination handles parallel to the walk (decision 7), the root at the
    bottom, and a set of skipped relative prefixes.
+
+   **The fold-collision set is per stack frame** - each frame holds the `Strong` identities of the
+   directories created INSIDE that destination directory, and is dropped when the frame pops. This refines
+   decision 8's single set (panel round 2): a fold is two source names in ONE source directory mapping onto
+   one destination name, so both creations happen on the same parent handle, in the same frame. An
+   operation-wide set would grow with the tree, against the spirit of spec line 997 (no in-memory list
+   proportional to the tree); the per-frame set is bounded like the walk's one-directory listing
+   (invariant 11). The root, created on `parent` in step 5, needs no entry: nothing else is created on
+   `parent`.
    - **`Dir { path, identity }`** (skipped if under a skipped prefix, which is then pushed for its
      `DirEnd`):
      - If `identity` and the destination ROOT's identity are both `Strong` and equal: outer `Err`,
        `SafetyRejected` (the dynamic half of §129/§149.6). Either not `Strong`: record a warning, or outer
        `Err` under `Strict`.
      - Create it on the top-of-stack handle by **decision 8**: `create_dir(name)` succeeds → push the
-       returned handle, `directories_created += 1`, its identity into the fold-collision set if `Strong`;
-       `AlreadyExists` → `open_dir(name)`: a directory whose `Strong` identity is in the set is
+       returned handle, `directories_created += 1`, its identity into the PARENT frame's fold-collision set
+       if `Strong`; `AlreadyExists` → `open_dir(name)`: a directory whose `Strong` identity is in the
+       parent frame's set is
        `DESTINATION_NAMESPACE_COLLISION` (fail the entry, skip the subtree), otherwise merge into it and
        push; `open_dir` `SAFETY_REJECTED` (a link) or `DESTINATION_ERROR` (a file, or the directory vanished)
        fail the entry and skip the subtree. Any other `create_dir` failure: fail the entry
@@ -189,7 +201,9 @@ replacing existing files (the §241.5 claim store); §42 mount boundaries; item 
 - **Step 2a to publish** is a window: a destination that becomes an alias in between is not caught (as in
   4a). Harm bounded to a broken hardlink.
 - **A per-directory abort happens mid-walk**: files copied before the aliased directory is reached stay
-  copied. The lexical floor catches the lexical case up front; only the aliased case is dynamic.
+  copied. The lexical floor catches the lexical case up front; only the aliased case is dynamic. The same
+  holds for a `Safety::Strict` abort on the first weak-identity directory met mid-walk: what was copied
+  before it stays.
 - **Folds on weak-identity volumes merge silently** (FAT32, exFAT: weak AND case-insensitive).
   `Safety::Strict` is the lever.
 - **A leftover temporary's reported path** is built from source names, so on a normalizing destination it
