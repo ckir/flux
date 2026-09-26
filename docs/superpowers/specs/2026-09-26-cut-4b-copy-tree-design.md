@@ -74,9 +74,11 @@ pub fn copy_tree<F: DestinationRoot>(
    every identity strength.
 3. **Resolve the destination.**
    - `dst_root` exists: `root = fs.destination_root(dst_root)` (it may follow a link: the user named it). A
-     non-directory is the outer `Err` (`DESTINATION_ERROR`, as `destination_root` reports). The anchor is
-     `root.identity()`.
-   - `dst_root` absent (`NotFound` from `destination_root`): split it as `copy_file` does (a root or a name
+     non-directory is the outer `Err` carrying `destination_root`'s error unchanged: `Code::IoError` with
+     `ErrorKind::NotADirectory` on every arm (`crates/flux-platform/src/std_fs.rs`, the Windows
+     `destination_root`'s is-directory check; POSIX's `ENOTDIR`; `FaultFs` likewise). The engine does not
+     remap it. The anchor is `root.identity()`.
+   - `dst_root` absent (`destination_root` fails with `e.source.kind() == ErrorKind::NotFound`): split it as `copy_file` does (a root or a name
      ending in `..` is `DESTINATION_ERROR`; an empty parent is `.`), `parent = destination_root(parent)`,
      anchor `parent.identity()`. The root is created in step 5, after the pre-flight.
 4. **§129 pre-flight.** Compare the source root's identity with the anchor's. Both `Strong` and equal:
@@ -129,8 +131,12 @@ pub fn copy_tree<F: DestinationRoot>(
    non-directory then meets this refusal. A destination whose stat failed (the "cannot be inspected" row)
    proceeds as before and is caught at publish, where the no-replace rename finds the name taken
    (`step: Publish`, the same mapping). A symlink occupying the name is a non-directory (the handle stat
-   never follows it), so it is refused here and left untouched. Single-file `Replace` callers (the CLI) are unaffected; a
-   single-file `NoReplace` caller gets the same error it got at publish, without the wasted copy.
+   never follows it), so it is refused here and left untouched. Single-file `Replace` callers (the CLI) are unaffected. A
+   single-file `NoReplace` caller gets the same code and kind it got at publish (`IoError`,
+   `AlreadyExists`), now with `step: Gate` instead of `Publish` and without the wasted copy; no temporary
+   is created, so none can be left over. The existing test `no_replace_refuses_an_existing_target_and_cleans_up`
+   (`crates/flux-core/src/copy.rs`) asserts exactly the code and the absence of a temporary, and so passes
+   unmodified.
 8. **Directory metadata** is not applied (walker design, "Directory metadata"): directories keep fresh
    timestamps.
 
@@ -188,6 +194,10 @@ replacing existing files (the §241.5 claim store); §42 mount boundaries; item 
   `Safety::Strict` is the lever.
 - **A leftover temporary's reported path** is built from source names, so on a normalizing destination it
   can differ from the name on disk.
+- **A symlinked source root is refused by the library** (the walk types the root with the non-following
+  `metadata`, so a link is not a directory), while a symlinked DESTINATION is followed (the user named it,
+  §149.7). Safe, and asymmetric: cut 5's CLI resolves the source root before calling the engine, as the
+  walker design already assigns it.
 - **A source nested inside the destination** (`flux copy /a/b /a`) is not refused as a whole; §129 names
   only the destination-inside-source case. Each file is still covered by the Step 2a gate.
 
