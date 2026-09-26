@@ -114,7 +114,7 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
 - [x] `flux-core`: single-file copy with metadata preservation — done:
       `crates/flux-core/src/copy.rs` `copy_file` / `copy_file_at`, metadata applied
       at steps 5-6 before publish
-- [ ] `flux-core`: recursive directory copy
+- [x] `flux-core`: recursive directory copy — done: `copy_tree` (cut 4b, `crates/flux-core/src/tree.rs`); the CLI surface is cut 5.
 - [x] `flux-core`: error taxonomy and mapping (spec §68.1 lists error mapping as
       a required unit test) — done: `crates/flux-fs/src/error.rs` `Code` enum,
       `classify`/`from_io` (lines 80/91), unit-tested for `DiskFull` / `PermissionDenied`
@@ -209,6 +209,11 @@ Each was measured, and each is deliberately NOT fixed in that PR.
       (measured, cut 4a test audit): the only leftover test uses `/dst`, where the two agree. `FaultFs`
       refuses relative paths by design, so the test needs a working directory in the fake or a
       real-filesystem fixture that can make removal fail. Owner deferred 2026-09-26.
+- [ ] **A tree copy never replaces an existing destination file.** `copy_tree` publishes every file
+      no-replace and reports an existing one `DESTINATION_NAMESPACE_COLLISION`, untouched (cut 4b, F3),
+      because §241.5's replacement claim needs the durable `state.db` of the operation workspace. So
+      §5.1's default `--overwrite` is unmet for directories until that store exists; `flux copy dir
+      existing-dir` reports one collision per pre-existing file.
 
 ## Engine (walker cut 4) prerequisites
 
@@ -229,6 +234,10 @@ entries below are cut 4b's.
       the real case. DECIDED 2026-09-25 (owner, agy aligned): the probe stays deferred with the
       workspace; cut 4b aborts the whole operation on the FIRST publish that fails with "primitive
       unavailable" (Unsupported, or EINVAL/ENOSYS on unix after the temporary was created), exit 1.
+      Cut 4b delivers the interim: `copy_tree` aborts the whole operation with
+      NOREPLACE_PUBLISH_UNAVAILABLE at the FIRST publish that reports the primitive unavailable
+      (`primitive_unavailable`, `crates/flux-core/src/tree.rs`). The up-front probe still waits for the
+      workspace.
 - [ ] **`FaultFs::move_object` strands a renamed directory's children.** It re-keys only the exact
       `from` and `to` paths; nothing walks the `from/` prefix, so every child keeps its old path. That is
       the stage-then-publish shape `copy_tree` will use, so an engine test that stages a tree and
