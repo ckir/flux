@@ -45,6 +45,72 @@ deny:
 # The local gate: fmt + clippy + typos + test
 check: fmt-check clippy typos test
 
+# --- Cross-platform legs of the local gate ---------------------------------
+# `just check` compiles and tests for THIS machine only, so a `#[cfg]` mistake for
+# another platform cannot fail it (two such breaks reached CI in PR #37). These two
+# close as much of that as one Windows machine can:
+#   check-linux  the full Linux gate (clippy + every test) in WSL: catches Linux
+#                compile AND runtime differences.
+#   check-mac    macOS clippy by cross-compiling: catches macOS compile and lint
+#                breaks ONLY. It runs no test, so a macOS runtime difference (APFS
+#                enforcing UTF-8 file names, for one) is still caught only by CI.
+# On a Linux or macOS machine each runs natively instead.
+
+wsl_distro := env_var_or_default("FLUX_WSL_DISTRO", "Ubuntu-26.04")
+mac_target := "aarch64-apple-darwin"
+
+# Linux leg of the gate: clippy + every test on Linux (through WSL on Windows)
+check-linux:
+    #!/usr/bin/env sh
+    set -eu
+    gate='cargo clippy --workspace --all-targets -- -D warnings && cargo nextest run --workspace --no-tests=pass --no-fail-fast'
+    case "$(uname -s)" in
+        Linux) exec sh -c "$gate" ;;
+        MINGW*|MSYS*|CYGWIN*) ;;
+        *) echo "check-linux: needs Linux, or Windows with WSL; this is $(uname -s). CI runs the Linux leg." >&2; exit 1 ;;
+    esac
+    # Git for Windows rewrites arguments that look like POSIX paths; nothing below
+    # may be rewritten.
+    export MSYS_NO_PATHCONV=1
+    if ! wsl.exe -d "{{wsl_distro}}" -- true >/dev/null 2>&1; then
+        echo "check-linux: the WSL distribution '{{wsl_distro}}' is not available." >&2
+        echo "  install it:  wsl --install -d {{wsl_distro}}   (or set FLUX_WSL_DISTRO to one you have)" >&2
+        exit 1
+    fi
+    # A Linux-side target directory: sharing the Windows one would make each side
+    # rebuild everything after the other ran. One per worktree, so two do not collide.
+    # --exec, NOT `--`: without it wsl.exe joins the arguments into one string and
+    # runs it through the distribution's default shell, which expands every `$var`
+    # in the script (all unset there) before bash sees it. MEASURED:
+    # `-- bash -c 'A=1; echo "[$A]"'` prints `[]`; `--exec bash -c ...` prints `[1]`.
+    wsl.exe -d "{{wsl_distro}}" --cd "$(pwd -W)" --exec bash -lc '
+        for tool in cargo cargo-nextest; do
+            command -v "$tool" >/dev/null || {
+                echo "check-linux: $tool is not on the WSL login PATH of {{wsl_distro}}." >&2
+                echo "  install: rustup (https://rustup.rs), then: cargo install --locked cargo-nextest" >&2
+                exit 1
+            }
+        done
+        export CARGO_TARGET_DIR="$HOME/.cache/flux-target/$(basename "$PWD")"
+        '"$gate"
+
+# macOS leg of the gate: macOS clippy by cross-compiling (runs no tests; see above)
+check-mac:
+    #!/usr/bin/env sh
+    set -eu
+    if [ "$(uname -s)" = "Darwin" ]; then
+        exec cargo clippy --workspace --all-targets -- -D warnings
+    fi
+    if ! rustup target list --installed | grep -qx "{{mac_target}}"; then
+        echo "check-mac: the Rust target {{mac_target}} is not installed." >&2
+        echo "  install it:  rustup target add {{mac_target}}" >&2
+        exit 1
+    fi
+    # The root crate is left out: criterion's `alloca` build script compiles C for
+    # the target and needs a macOS C toolchain. The member crates are where the
+    # #[cfg] code lives.
+    cargo clippy --workspace --exclude flux --all-targets --target {{mac_target}} -- -D warnings
+
 # Background watcher
 watch:
     bacon
