@@ -50,6 +50,11 @@ The priority the owner set: reach `copy_tree` soon, but carry no known hole into
      `Err(_) => false` (`std_fs.rs:83`, `:133`); a previous run's leftover is never removed; `flux copy`
      cannot ask for `Preserve::Off`.
    No entry is closed or narrowed on reasoning alone: each outcome cites what was read.
+   **`ROADMAP.md` in the same pass** (owner, 2026-09-26). It has no open items, but its state column is
+   stale (last edited 2026-09-09): the intro says nothing is implemented and every phase after 1 reads
+   "not started". The sweep sets each build-order phase to `done`, `in progress` or `not started`, naming
+   the merged PR(s) that show it, and rewrites the intro to match. Same rule as `TODO.md`: no state
+   changes on reasoning alone. The release-scope lists (spec §77-§80) are not touched.
 2. **Local cross-platform gate recipes** in the `justfile`:
    - `just check-linux` - the WSL leg: `cargo clippy --workspace --all-targets -- -D warnings` and
      `cargo nextest run --workspace --no-tests=pass --no-fail-fast`, with a Linux-side `CARGO_TARGET_DIR`
