@@ -114,14 +114,15 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
 - [x] `flux-core`: single-file copy with metadata preservation — done:
       `crates/flux-core/src/copy.rs` `copy_file` / `copy_file_at`, metadata applied
       at steps 5-6 before publish
-- [x] `flux-core`: recursive directory copy — done: `copy_tree` (cut 4b, `crates/flux-core/src/tree.rs`); the CLI surface is cut 5.
+- [x] `flux-core`: recursive directory copy — done: `copy_tree` (cut 4b, `crates/flux-core/src/tree.rs`), exposed by `flux copy` in cut 5.
 - [x] `flux-core`: error taxonomy and mapping (spec §68.1 lists error mapping as
       a required unit test) — done: `crates/flux-fs/src/error.rs` `Code` enum,
       `classify`/`from_io` (lines 80/91), unit-tested for `DiskFull` / `PermissionDenied`
       / `IoError` (lines 127, 133, 147)
 - [ ] `flux-core`: statistics collection
-- [x] `flux-cli`: wire `flux copy` to the above — done:
-      `crates/flux-cli/src/main.rs:30` `Commands::Copy`
+- [x] `flux-cli`: wire `flux copy` to the above — done: a file (cut 1) and a folder's contents
+      (cut 5): `crates/flux-cli/src/main.rs` `Commands::Copy`, logic in
+      `crates/flux-cli/src/{resolve,report,exit_code}.rs`
 - [ ] Integration tests: single file, directory, nested directory, multiple
       sources, zero-byte files, Unicode, spaces, newlines (spec §68.2)
 
@@ -177,7 +178,7 @@ Each was measured, and each is deliberately NOT fixed in that PR.
       sweep fails and `create_new` then fails with `AlreadyExists`, `copy_file` returns
       `leftover: None` even though a temporary genuinely sits at the path and is
       blocking the copy. The caller is told nothing was left behind.
-      (Narrowed 2026-09-26: `crates/flux-cli/src/main.rs:38` names each temporary with
+      (Narrowed 2026-09-26: `crates/flux-cli/src/main.rs` `options` names each temporary with
       `std::process::id()`, so a crashed run's leftover never shares a later run's name
       unless the OS reuses that pid against the same target — reachable, but narrower
       than stated; it becomes live more broadly once §18.1 gives operations a
@@ -214,6 +215,16 @@ Each was measured, and each is deliberately NOT fixed in that PR.
       because §241.5's replacement claim needs the durable `state.db` of the operation workspace. So
       §5.1's default `--overwrite` is unmet for directories until that store exists; `flux copy dir
       existing-dir` reports one collision per pre-existing file.
+- [ ] **`flux copy --json`'s `bytes_total` counts copied bytes only.** The walk never stats a file, so
+      a failed file's size is unknown; a pre-scan would double metadata I/O (owner, cut 5). `--help`
+      says so.
+- [ ] **A skipped special file is reported as `object_type=special`.** The walk types it `Other` from
+      `read_dir` and does not say FIFO, socket or device (§233.1 wants the object type).
+- [ ] **Several sources are a usage error.** §4.1's last row and §18.3 need the operation workspace;
+      `flux copy` takes exactly two positionals until then (cut 5).
+- [ ] **A dangling destination link is exit 3 on Linux only by measurement.** macOS's `open_dir` answer
+      for a link (ENOTDIR vs ELOOP) was not measured; if ELOOP, the same run is `IO_ERROR`, exit 1 -
+      safe, but not §55's refusal code (cut 5 plan, refinement 3).
 
 ## Engine (walker cut 4) prerequisites
 
