@@ -342,6 +342,8 @@ dependencies = [
  "flux-core",
  "flux-fs",
  "flux-platform",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 

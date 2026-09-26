@@ -3,3 +3,4 @@
 //! `resolve` (the two command-line paths to what the engine is asked to do).
 
 pub mod exit_code;
+pub mod report;
