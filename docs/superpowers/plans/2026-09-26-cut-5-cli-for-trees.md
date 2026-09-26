@@ -1814,7 +1814,7 @@ fn a_dangling_destination_link_is_refused_with_exit_3() {
 }
 ```
 
-- [ ] **Step 2: run, expect failures:** `cargo nextest run -p flux-cli --no-fail-fast` → the new tree/JSON/mapping tests and the two exit-3 assertions FAIL against the old `main.rs` (it copies only files and exits 1 on every error). Record which failed.
+- [ ] **Step 2: run, expect failures:** `cargo nextest run -p flux-cli --no-fail-fast` → the new tree/JSON/mapping tests and the two exit-3 assertions FAIL against the old `main.rs` (it copies only files and exits 1 on every error). Two new tests are EXPECTED TO PASS already and are not a plan defect: `a_third_positional_is_a_usage_error` (clap already bounds the positionals, exit 2) and `a_file_to_a_separator_path_whose_folder_is_missing_fails` (the old copy fails on the missing parent, exit 1). Record which failed. (Plan panel round 1.)
 
 - [ ] **Step 3: replace `crates/flux-cli/src/main.rs` entirely with:**
 
