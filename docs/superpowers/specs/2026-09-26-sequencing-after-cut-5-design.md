@@ -5,16 +5,17 @@ negotiation round). **Base:** `main` at `878af1f` (PR #53, cut 5, merged).
 
 ## The decision
 
-The next five cuts, in order. Each cut gets its own spec, plan and execution. **Re-run this decision after
-cut 8 merges**, rather than fixing the later order now.
+The next five cuts, in order. Each cut gets its own spec, plan and execution. Cuts 6 to 8 are decided; **cuts 9
+and 10 are provisional** - the re-run of this decision after cut 8 merges may reorder or re-scope them.
 
 | Cut | Delivers | Closes or unblocks | Depends on |
 |---|---|---|---|
 | **6** | Lock-model debt that weakens what the model proves about behaviour the Rust lock will implement (the 11 items listed below) | those 11 `TODO.md` items | nothing |
-| **7** | The destination lock: §96.1, §99 commit-time revalidation, and §240 staleness and liveness including `--break-lock`. Also the workspace (`DEST/.flux/operations/<id>/`, spec:1378-1391), a versioned manifest (§19), a persisted operation ID, and `--restart` (§21.1). A prior operation's state is handled by §21.1's classification (spec:1595-1640): a live owner is `OPERATION_LOCKED` or `TARGET_LOCK_BUSY`; uncertain ownership or corrupt state is preserved; completed or ABANDONED lets the new run proceed; a resumable one fails `RESUMABLE_OPERATION_EXISTS` without mutating anything, unless `--restart` supersedes it. `--resume` is cut 9's. | "A leftover temporary from a PREVIOUS run is never removed"; "A blocking pre-existing temporary is not reported" (the id makes it live); "WSL 9p mounts break two lock assumptions" (the lock must handle it or refuse); the manifest half of "Persistent state format" | cut 6 |
-| **8** | `state.db`, with its technology chosen in this cut next to its first consumer; the §241.5 claim records | "A tree copy never replaces an existing destination file"; "Item 113's up-front no-replace probe is not built"; the `state.db` half of "Persistent state format"; the state-DB part of "Final dependency selection" | cut 7 |
-| **9** | Resume (§21), GC (§24.3), completed-operation cleanup (§218), stale-operation management | Phase 5's crash recovery and cleanup | cut 8 |
-| **10** | Several sources (§18.3: one workspace, the manifest maps each source root) | "Several sources are a usage error"; the multiple-sources part of "Integration tests" | cut 7 (workspace); after 9 so a multi-source run is resumable like any other |
+| **7** | The destination lock: §96.1, §99 commit-time revalidation, and §240 staleness and liveness including `--break-lock`. Also the workspace (`DEST/.flux/operations/<id>/`, spec:1378-1391), a versioned manifest (§19), a persisted operation ID, and `--restart` (§21.1). A prior operation's state is handled by §21.1's classification (spec:1595-1640): a live owner is `OPERATION_LOCKED` or `TARGET_LOCK_BUSY`; uncertain ownership or corrupt state is preserved; completed or ABANDONED lets the new run proceed; a resumable one fails `RESUMABLE_OPERATION_EXISTS` without mutating anything, unless `--restart` supersedes it. `--resume` is cut 9's. A **successful** run removes its own temporaries and
+workspace on completion (spec:1536-1548), so no successful copy leaves `.flux/` state behind. | "A leftover temporary from a PREVIOUS run is never removed"; "A blocking pre-existing temporary is not reported" (the id makes it live); "WSL 9p mounts break two lock assumptions" (the lock must handle it or refuse); the manifest half of "Persistent state format" | cut 6 |
+| **8** | `state.db`, with its technology chosen in this cut next to its first consumer; the §241.5 claim records; and `flux copy` using them - a folder copy replaces an existing destination file (§5.1's default `--overwrite`). **Prerequisite inside this cut:** a destination directory that aliases a SOURCE subdirectory (a bind mount; `TODO.md` §42 entry, "The destination half too") must be refused before replacement ships - under no-replace publication that alias can only add files, under replacement it overwrites source files. The cut's spec decides the mechanism (it needs source identities the walk does not keep today). | "A tree copy never replaces an existing destination file"; "Item 113's up-front no-replace probe is not built"; the `state.db` half of "Persistent state format"; the state-DB part of "Final dependency selection" | cut 7 |
+| **9** (provisional) | Resume (§21), cleanup of a PRIOR completed operation (§218), GC of crashed or abandoned operations' state (§24.3, §222), stale-operation management | Phase 5's crash recovery and cleanup | cut 8 |
+| **10** (provisional) | Several sources (§18.3: one workspace, the manifest maps each source root) | "Several sources are a usage error"; the multiple-sources part of "Integration tests" | cut 7 (workspace); after 9 so a multi-source run is resumable like any other |
 
 **Why this order.** The owner ruled the priority is **unblock the most first**, with the lock-model
 follow-ups in scope. The operation workspace (spec §81 Phase 5, spec:3714-3727) is what the most open items
@@ -32,11 +33,13 @@ takes all 11 at once.
 "implementation-defined but must be versioned" (spec:5717-5718). Choosing it next to the claim workload,
 its first real consumer, lets that workload refute a bad choice before anything depends on it.
 
-**Why cut 7 need not implement cleanup to be safe.** Dead-owner recovery is part of the lock protocol, not of
+**Why cut 7 need not implement resume or GC to be safe.** Dead-owner recovery is part of the lock protocol, not of
 cleanup: §240's recovery decision order, abandoned owner, uncertain ownership and `--break-lock` (spec:10528,
 :10535, :10569, :10613, :10640). A crashed run's lock is therefore recoverable from cut 7 on; what waits for
-cut 9 is reclaiming the disk its workspace used. Resume is always an explicit operator command
-(spec:13603-13604), so omitting it in cut 7 leaves no path that silently resumes.
+cut 9 is reclaiming the disk a crashed run's workspace used. Resume is always an explicit operator command
+(spec:13603-13604), so omitting it in cut 7 leaves no path that silently resumes. A crashed or ABANDONED run's workspace stays on
+disk until cut 9's GC (§21.1 lets a new run proceed past it) - a leak bounded to failed runs, never to
+successful ones.
 
 **Every cut that adds durable state bumps the workspace format version** (the spec requires it versioned, spec:5717-5718), and a later binary that meets an earlier version classifies it under §21.1 - never misparses it. A crash under a cut-7 binary must leave a workspace a cut-8 or cut-9 binary handles.
 
@@ -73,7 +76,8 @@ The 11 + 14 are all 25 open items of the two "Lock-model follow-ups" sections of
 
 ## Everything else in `TODO.md` - after this sequence
 
-**Catch-all: every open `TODO.md` item not placed above is decided when this decision is re-run after cut 8.**
+**Catch-all: every open `TODO.md` item not placed in cuts 6 to 8 - including what cuts 9 and 10 now hold - is
+decided when this decision is re-run after cut 8.**
 None of them waits on the workspace, and none makes a cut above wrong if it stays open. For the record:
 
 - *Copy-path limits:* statistics collection; the rest of "Integration tests"; `destination_is_write_protected`
@@ -81,7 +85,8 @@ None of them waits on the workspace, and none makes a cut above wrong if it stay
   delete"; handle and path `rename_replace` disagree on read-attributes; no test pins the bare-name
   leftover's spelling; `bytes_total` counts copied bytes only; `object_type=special`; the dangling
   destination link is exit 3 on Linux only.
-- *Features outside Phase 5:* symlink recreation (§25); the §52 progress UI; §42 mount boundaries.
+- *Features outside Phase 5:* symlink recreation (§25); the §52 progress UI; §42 mount boundaries (except the
+  destination-alias half, which cut 8 takes as a prerequisite).
 - *Engine and walker:* `FaultFs::move_object` strands a renamed directory's children (needed by the first cut
   that renames a directory - revisit if cut 7 or 8 stages a directory); a transient failure and an
   unsupported filesystem both report `Unavailable`; identity-based cycle detection on weak-identity
