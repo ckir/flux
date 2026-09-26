@@ -427,6 +427,30 @@ mod posix {
             .args(["-n", "rm", "-f", &to.display().to_string()])
             .status();
     }
+
+    #[test]
+    fn a_handle_reports_the_identity_of_the_directory_it_holds() {
+        use flux_fs::FileSystem;
+        let d = TempDir::new().unwrap();
+        std::fs::create_dir(d.path().join("sub")).unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let sub = root.open_dir(OsStr::new("sub")).unwrap();
+        let made = root.create_dir(OsStr::new("made")).unwrap();
+
+        for (handle, path) in [
+            (&root, d.path().to_path_buf()),
+            (&sub, d.path().join("sub")),
+            (&made, d.path().join("made")),
+        ] {
+            let by_handle = handle.identity().unwrap();
+            assert!(
+                matches!(by_handle, flux_fs::FileIdentity::Strong(_)),
+                "{path:?}: {by_handle:?}"
+            );
+            assert_eq!(by_handle, StdFileSystem.metadata(&path).unwrap().identity, "{path:?}");
+        }
+        assert_ne!(root.identity().unwrap(), sub.identity().unwrap());
+    }
 }
 
 #[cfg(windows)]
@@ -1142,5 +1166,29 @@ mod windows_arm {
         assert!(m.permissions().readonly());
         assert_eq!(m.modified().unwrap(), when);
         std::fs::remove_file(d.path().join("f")).expect("a read-only file must still be removable");
+    }
+
+    #[test]
+    fn a_handle_reports_the_identity_of_the_directory_it_holds() {
+        use flux_fs::FileSystem;
+        let d = TempDir::new().unwrap();
+        std::fs::create_dir(d.path().join("sub")).unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let sub = root.open_dir(OsStr::new("sub")).unwrap();
+        let made = root.create_dir(OsStr::new("made")).unwrap();
+
+        for (handle, path) in [
+            (&root, d.path().to_path_buf()),
+            (&sub, d.path().join("sub")),
+            (&made, d.path().join("made")),
+        ] {
+            let by_handle = handle.identity().unwrap();
+            assert!(
+                matches!(by_handle, flux_fs::FileIdentity::Strong(_)),
+                "{path:?}: {by_handle:?}"
+            );
+            assert_eq!(by_handle, StdFileSystem.metadata(&path).unwrap().identity, "{path:?}");
+        }
+        assert_ne!(root.identity().unwrap(), sub.identity().unwrap());
     }
 }

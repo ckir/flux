@@ -743,11 +743,10 @@ fn mtime_from_stat(st: &rustix::fs::Stat) -> Option<SystemTime> {
 ///
 /// Split out from `identity_of(path)` so `metadata` opens once. The flags that
 /// handle must carry are documented at its one call site above; this function
-/// cannot enforce them, which is why it is private and takes a `&File` rather than
+/// cannot enforce them, which is why it is private and takes an open handle rather than
 /// a path.
 #[cfg(windows)]
-pub(crate) fn identity_of_handle(file: &File) -> FileIdentity {
-    use std::os::windows::io::AsRawHandle;
+pub(crate) fn identity_of_handle(file: &impl std::os::windows::io::AsRawHandle) -> FileIdentity {
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
     };

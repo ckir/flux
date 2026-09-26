@@ -793,6 +793,24 @@ impl FakeDirHandle {
 impl DirHandle for FakeDirHandle {
     type Writer = FakeHandle;
 
+    fn identity(&self) -> Result<flux_fs::FileIdentity> {
+        let path = self.my_path();
+        let mut g = self.inner.lock().unwrap();
+        // A root is implicitly present in the fake (`destination_root` and `create_dir`
+        // treat it so), so it gets an identity on first ask. Every other directory was
+        // minted when it was created, and a missing one is a creation path that skipped
+        // `mint_identity` - the same loud failure `metadata` gives.
+        if path.has_root() && path.parent().is_none() {
+            mint_identity(&mut g, &path);
+        }
+        Ok(*g.identities.get(&path).unwrap_or_else(|| {
+            panic!(
+                "no identity minted for {}: a creation path skipped mint_identity",
+                path.display()
+            )
+        }))
+    }
+
     fn open_dir(&self, name: &OsStr) -> Result<Self> {
         check_component(name)?;
         // Reuse the binding this handle's OWN node already has for `name`, if any.
@@ -1332,5 +1350,22 @@ mod tests {
         std::io::Write::write_all(&mut w, b"x").unwrap();
         drop(w);
         assert_eq!(fs.read_file("/f").as_deref(), Some(&b"x"[..]));
+    }
+
+    #[test]
+    fn a_fake_handle_reports_the_identity_of_its_directory() {
+        use flux_fs::{DestinationRoot, DirHandle, FileSystem};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let root = fs.destination_root(Path::new("/")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+
+        assert!(matches!(root.identity().unwrap(), flux_fs::FileIdentity::Strong(_)));
+        assert_eq!(d.identity().unwrap(), fs.metadata(Path::new("/d")).unwrap().identity);
+        assert_ne!(root.identity().unwrap(), d.identity().unwrap());
+        // Asking is not a filesystem call: it must not shift `fail_nth` counts.
+        let calls = fs.calls().len();
+        let _ = d.identity().unwrap();
+        assert_eq!(fs.calls().len(), calls);
     }
 }

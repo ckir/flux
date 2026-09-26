@@ -182,6 +182,10 @@ impl DirHandle for StdDir {
         Ok(Self(opened))
     }
 
+    fn identity(&self) -> Result<flux_fs::FileIdentity> {
+        Ok(crate::std_fs::identity_of_handle(&self.0))
+    }
+
     fn create_dir(&self, name: &OsStr) -> Result<Self> {
         check_component(name)?;
         Ok(Self(crate::dir_windows::create_dir_at(&self.0, name)?))

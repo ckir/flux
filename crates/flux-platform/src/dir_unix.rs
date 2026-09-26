@@ -81,6 +81,12 @@ impl DirHandle for StdDir {
         }
     }
 
+    fn identity(&self) -> Result<flux_fs::FileIdentity> {
+        let st =
+            rustix::fs::fstat(&self.0).map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
+        Ok(crate::std_fs::metadata_from_stat(&st).identity)
+    }
+
     fn create_dir(&self, name: &OsStr) -> Result<Self> {
         check_component(name)?;
         rustix::fs::mkdirat(&self.0, name, Mode::from_raw_mode(0o777))

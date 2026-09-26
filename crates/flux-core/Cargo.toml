@@ -10,3 +10,7 @@ publish.workspace = true
 
 [dependencies]
 flux-fs = { path = "../flux-fs" }
+
+[dev-dependencies]
+flux-platform = { path = "../flux-platform" }
+tempfile = { workspace = true }
