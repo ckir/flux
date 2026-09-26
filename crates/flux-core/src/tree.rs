@@ -6,8 +6,8 @@
 use crate::copy::{CopyError, CopyStep, copy_file_at, split_destination, weaker};
 use crate::walk::{WalkEvent, walk};
 use flux_fs::{
-    Code, CopyOptions, DestinationRoot, DirHandle, FileIdentity, FileType, FsError,
-    MetadataFailure, ObjectId, Publish, Safety,
+    Code, CopyOptions, DestinationRoot, DirHandle, FileIdentity, FsError, MetadataFailure,
+    ObjectId, Publish, Safety,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::io::ErrorKind;
@@ -27,6 +27,14 @@ pub struct TreeOutcome {
     /// Identity comparisons that were SKIPPED because a side was not `Strong`. Not
     /// failures: the copies happened. The engine captures; cut 5's CLI renders.
     pub warnings: WeakIdentityWarnings,
+    /// Every non-directory entry the walk yielded - file, symlink or special - including
+    /// those under a skipped subtree (the walk still yields them).
+    pub files_total: u64,
+    /// Files whose Step 2a identity comparison was skipped for a weak side. Directories'
+    /// skipped comparisons are in `warnings` only; §51's field is "files degraded".
+    pub files_degraded: u64,
+    /// Special files skipped (§233.1). Not failures.
+    pub special_files_skipped: u64,
 }
 
 /// The operation stopped as a whole (cut 5, K1). `outcome` holds what was counted
@@ -48,6 +56,7 @@ impl TreeAbort {
     }
 }
 
+/// One streamed record: every failure, plus the one non-failure `SpecialFileSkipped`.
 #[derive(Debug)]
 pub struct TreeFailure {
     /// Relative to the source root, as the walk reports it.
@@ -68,8 +77,14 @@ pub enum TreeFailureCause {
     /// One file's copy failed. `CopyError` intact, so a leftover temporary is still
     /// reported per file.
     Copy(CopyError),
-    /// A symlink or other non-regular entry, which this cut does not recreate.
-    Unsupported(FileType),
+    /// A symlink: §25's default is to copy it AS a link, which this version cannot do,
+    /// so the action fails (the CLI renders `SYMLINK_CREATION_UNAVAILABLE`).
+    Symlink,
+    /// NOT a failure: a device, socket or FIFO, skipped as §233.1 prescribes ("SKIP +
+    /// DURABLE WARNING") and streamed so each one is reported by its own record. The
+    /// one variant `FailureTally` does not count; `TreeOutcome` counts it in
+    /// `special_files_skipped`.
+    SpecialFileSkipped,
     /// The file IS at the destination; some of its metadata could not be applied.
     /// Published with complaints, which exits 1 like the single-file case.
     PublishedWithComplaints(Vec<MetadataFailure>),
@@ -82,14 +97,14 @@ pub struct FailureTally {
     pub walk: u64,
     pub create_dir: u64,
     pub copy: u64,
-    pub unsupported: u64,
+    pub symlink: u64,
     pub published_with_complaints: u64,
 }
 
 impl FailureTally {
     /// The only total. Derived, never stored beside the parts.
     pub fn total(&self) -> u64 {
-        self.walk + self.create_dir + self.copy + self.unsupported + self.published_with_complaints
+        self.walk + self.create_dir + self.copy + self.symlink + self.published_with_complaints
     }
 
     pub fn is_empty(&self) -> bool {
@@ -104,7 +119,10 @@ impl FailureTally {
             TreeFailureCause::Walk(_) => self.walk += 1,
             TreeFailureCause::CreateDir(_) => self.create_dir += 1,
             TreeFailureCause::Copy(_) => self.copy += 1,
-            TreeFailureCause::Unsupported(_) => self.unsupported += 1,
+            TreeFailureCause::Symlink => self.symlink += 1,
+            // Not a failure (§233.1): `report` counts it in
+            // `TreeOutcome::special_files_skipped`; named here so the match stays exhaustive.
+            TreeFailureCause::SpecialFileSkipped => {}
             TreeFailureCause::PublishedWithComplaints(_) => self.published_with_complaints += 1,
         }
     }
@@ -178,7 +196,8 @@ enum Frame<D> {
 ///   degraded under `Strict`; a destination directory about to be entered that IS the
 ///   source root by identity; a destination root that cannot be resolved or created;
 ///   and the first publish reporting that the no-replace primitive is unavailable.
-/// - Every other failure goes to `on_failure`, and the walk continues.
+/// - Every other failure, and every skipped special file (§233.1, not a failure), goes
+///   to `on_report`, and the walk continues.
 /// - Every file is published with `Publish::NoReplace` whatever `opts.publish` says
 ///   (§241.5): an existing destination file is never replaced; it is reported
 ///   `DESTINATION_NAMESPACE_COLLISION`.
@@ -190,10 +209,10 @@ pub fn copy_tree<F: DestinationRoot>(
     src_root: &Path,
     dst_root: &Path,
     opts: &CopyOptions,
-    on_failure: &mut dyn FnMut(TreeFailure),
+    on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<TreeOutcome, TreeAbort> {
     let mut out = TreeOutcome::default();
-    match run_tree(fs, src_root, dst_root, opts, &mut out, on_failure) {
+    match run_tree(fs, src_root, dst_root, opts, &mut out, on_report) {
         Ok(()) => Ok(out),
         Err(error) => Err(TreeAbort { error, outcome: out }),
     }
@@ -207,7 +226,7 @@ fn run_tree<F: DestinationRoot>(
     dst_root: &Path,
     opts: &CopyOptions,
     out: &mut TreeOutcome,
-    on_failure: &mut dyn FnMut(TreeFailure),
+    on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<(), CopyError> {
     // 1. The source root. `walk` refuses a missing or non-directory root: the whole
     //    operation failing, before any destination call.
@@ -271,7 +290,7 @@ fn run_tree<F: DestinationRoot>(
             // a failure already reported once.
             Err(e) => {
                 if live {
-                    report(out, on_failure, e.path, TreeFailureCause::Walk(e.cause));
+                    report(out, on_report, e.path, TreeFailureCause::Walk(e.cause));
                 }
                 continue;
             }
@@ -279,7 +298,7 @@ fn run_tree<F: DestinationRoot>(
         match event {
             WalkEvent::Dir { path, identity } => {
                 let frame = if live {
-                    enter_dir(&mut stack, &path, identity, root_identity, &opts, out, on_failure)?
+                    enter_dir(&mut stack, &path, identity, root_identity, &opts, out, on_report)?
                 } else {
                     Frame::Skipped
                 };
@@ -299,18 +318,21 @@ fn run_tree<F: DestinationRoot>(
                 stack.push(frame);
             }
             WalkEvent::File { path } => {
+                out.files_total += 1;
                 if let Some(Frame::Live { dir, .. }) = stack.last() {
-                    copy_one(fs, src_root, dir, path, &opts, out, on_failure)?;
+                    copy_one(fs, src_root, dir, path, &opts, out, on_report)?;
                 }
             }
             WalkEvent::Symlink { path } => {
+                out.files_total += 1;
                 if live {
-                    report(out, on_failure, path, TreeFailureCause::Unsupported(FileType::Symlink));
+                    report(out, on_report, path, TreeFailureCause::Symlink);
                 }
             }
             WalkEvent::Other { path } => {
+                out.files_total += 1;
                 if live {
-                    report(out, on_failure, path, TreeFailureCause::Unsupported(FileType::Other));
+                    report(out, on_report, path, TreeFailureCause::SpecialFileSkipped);
                 }
             }
             WalkEvent::DirEnd { .. } => {
@@ -329,7 +351,7 @@ fn enter_dir<D: DirHandle>(
     root_identity: FileIdentity,
     opts: &CopyOptions,
     out: &mut TreeOutcome,
-    on_failure: &mut dyn FnMut(TreeFailure),
+    on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<Frame<D>, CopyError> {
     // The dynamic half of §129 / §149.6: a directory reached mid-walk that IS the
     // destination root means the source reached it by an alias. Checked before
@@ -379,7 +401,7 @@ fn enter_dir<D: DirHandle>(
         },
         Err(e) => e,
     };
-    report(out, on_failure, path.to_path_buf(), TreeFailureCause::CreateDir(failure));
+    report(out, on_report, path.to_path_buf(), TreeFailureCause::CreateDir(failure));
     Ok(Frame::Skipped)
 }
 
@@ -391,7 +413,7 @@ fn copy_one<F: DestinationRoot>(
     path: PathBuf,
     opts: &CopyOptions,
     out: &mut TreeOutcome,
-    on_failure: &mut dyn FnMut(TreeFailure),
+    on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<(), CopyError> {
     let name = path.file_name().expect("a walk path ends in a name");
     match copy_file_at(fs, &src_root.join(&path), parent, name, opts) {
@@ -399,12 +421,13 @@ fn copy_one<F: DestinationRoot>(
             out.files_copied += 1;
             out.bytes_copied += o.bytes_copied;
             if let Some(weaker) = o.identity_degraded {
+                out.files_degraded += 1;
                 out.warnings.record(weaker, &path);
             }
             if !o.metadata_failures.is_empty() {
                 report(
                     out,
-                    on_failure,
+                    on_report,
                     path,
                     TreeFailureCause::PublishedWithComplaints(o.metadata_failures),
                 );
@@ -431,7 +454,7 @@ fn copy_one<F: DestinationRoot>(
             {
                 e.cause.code = Code::DestinationNamespaceCollision;
             }
-            report(out, on_failure, path, TreeFailureCause::Copy(e));
+            report(out, on_report, path, TreeFailureCause::Copy(e));
             Ok(())
         }
     }
@@ -490,15 +513,18 @@ fn refuse(why: &'static str) -> CopyError {
     CopyError::at(CopyStep::Resolve, FsError::new(Code::SafetyRejected, std::io::Error::other(why)))
 }
 
-/// Count the failure, then stream it. The only place either happens.
+/// Count the record, then stream it. The only place either happens.
 fn report(
     out: &mut TreeOutcome,
-    on_failure: &mut dyn FnMut(TreeFailure),
+    on_report: &mut dyn FnMut(TreeFailure),
     path: PathBuf,
     cause: TreeFailureCause,
 ) {
+    if matches!(cause, TreeFailureCause::SpecialFileSkipped) {
+        out.special_files_skipped += 1;
+    }
     out.failures.count(&cause);
-    on_failure(TreeFailure { path, cause });
+    on_report(TreeFailure { path, cause });
 }
 
 #[cfg(test)]
@@ -514,19 +540,20 @@ mod tests {
         t.count(&TreeFailureCause::Walk(e()));
         t.count(&TreeFailureCause::CreateDir(e()));
         t.count(&TreeFailureCause::Copy(CopyError::at(crate::copy::CopyStep::Create, e())));
-        t.count(&TreeFailureCause::Unsupported(FileType::Symlink));
+        t.count(&TreeFailureCause::Symlink);
         t.count(&TreeFailureCause::PublishedWithComplaints(Vec::new()));
+        t.count(&TreeFailureCause::SpecialFileSkipped);
         assert_eq!(
             t,
             FailureTally {
                 walk: 1,
                 create_dir: 1,
                 copy: 1,
-                unsupported: 1,
+                symlink: 1,
                 published_with_complaints: 1
             }
         );
-        assert_eq!(t.total(), 5);
+        assert_eq!(t.total(), 5, "a skipped special file is not a failure");
         assert!(!t.is_empty());
         assert!(FailureTally::default().is_empty());
     }
@@ -822,9 +849,8 @@ mod tests {
     }
 
     #[test]
-    fn a_special_file_is_reported_unsupported_and_never_copied() {
-        // The walk types a device, socket or FIFO as `Other`; `copy_tree` reports it once and
-        // never calls copy_file_at for it (test audit, cut 4b: no tree test fed one).
+    fn a_special_file_is_skipped_reported_and_not_a_failure() {
+        // §233.1: SKIP + DURABLE WARNING, reported per record; the run may still succeed.
         let fs = tree();
         fs.add_special("/src/dev");
 
@@ -833,9 +859,10 @@ mod tests {
         let out = r.unwrap();
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].path, Path::new("dev"));
-        assert!(matches!(got[0].cause, TreeFailureCause::Unsupported(FileType::Other)));
+        assert!(matches!(got[0].cause, TreeFailureCause::SpecialFileSkipped));
         assert!(!fs.exists("/dst/dev"));
-        assert_eq!(out.failures.unsupported, 1);
+        assert!(out.failures.is_empty(), "skipped, not failed");
+        assert_eq!(out.special_files_skipped, 1);
         assert_eq!(out.files_copied, 2, "the rest of the tree still copies");
     }
 
@@ -852,6 +879,7 @@ mod tests {
             out.warnings.weak[&7],
             DegradedGroup { count: 1, example: PathBuf::from("sub") }
         );
+        assert_eq!(out.files_degraded, 0, "a directory's skipped comparison is not a file's");
 
         let tight = tree();
         tight.set_identity("/src/sub", weak);
@@ -876,6 +904,7 @@ mod tests {
         assert!(stats[3].contains("dst"), "the 4th stat is the gate's: {stats:?}");
         assert!(got.is_empty(), "{got:?}");
         assert_eq!(out.files_copied, 1);
+        assert_eq!(out.files_degraded, 1);
         assert_eq!(
             out.warnings.unavailable,
             Some(DegradedGroup { count: 1, example: PathBuf::from("a") })
@@ -943,7 +972,7 @@ mod tests {
     }
 
     #[test]
-    fn a_symlink_is_reported_unsupported_and_never_copied() {
+    fn a_symlink_is_a_failure_and_never_copied() {
         let fs = tree();
         fs.add_symlink("/src/link");
 
@@ -952,9 +981,10 @@ mod tests {
         let out = r.unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].path, Path::new("link"));
-        assert!(matches!(got[0].cause, TreeFailureCause::Unsupported(FileType::Symlink)));
+        assert!(matches!(got[0].cause, TreeFailureCause::Symlink));
         assert!(!fs.exists("/dst/link"));
-        assert_eq!(out.failures.unsupported, 1);
+        assert_eq!(out.failures.symlink, 1);
+        assert_eq!(out.special_files_skipped, 0);
     }
 
     #[test]
@@ -1111,5 +1141,23 @@ mod tests {
         assert_eq!((a.outcome.directories_created, a.outcome.files_copied), (0, 0));
         assert!(a.error.leftover.is_some(), "precondition: the temporary stayed");
         assert!(a.changed());
+    }
+
+    #[test]
+    fn files_total_counts_every_non_directory_entry_even_under_a_skipped_subtree() {
+        let fs = tree(); // /src/a, /src/sub/b
+        fs.add_symlink("/src/link");
+        fs.add_special("/src/sub/dev");
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.write_file("/dst/sub", b"a file where a directory belongs");
+
+        let (r, got) = run(&fs, "/src", "/dst", &opts());
+
+        let out = r.unwrap();
+        // `a` and `link`, and - under the skipped `sub` - `b` and `dev`.
+        assert_eq!(out.files_total, 4);
+        assert_eq!(out.files_copied, 1);
+        assert_eq!(out.special_files_skipped, 0, "nothing under a skipped subtree is reported");
+        assert_eq!(got.len(), 2, "the symlink, and `sub` once: {got:?}");
     }
 }
