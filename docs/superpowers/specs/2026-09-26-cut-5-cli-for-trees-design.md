@@ -81,8 +81,9 @@ itself", which this cut cannot do, so a symlink is an unmet action - a failure.
 - `FailureTally` stays an exhaustive match with no wildcard; its `count` treats `SpecialFileSkipped` as
   not-a-failure explicitly.
 - Because the sink now carries a record that is not a failure, the parameter is renamed `on_failure` ->
-  `on_report` and its doc says so. The item type keeps its name `TreeFailure` only if the plan finds the
-  rename churns too much; the plan decides and records which.
+  `on_report` and its doc says so. The item type keeps its name `TreeFailure` (renaming it would churn
+  every 4b test for no behaviour); its doc states that `SpecialFileSkipped` is the one non-failure it
+  carries.
 
 `object_type` for a special file is reported as `special`: the walk types it `Other` from `read_dir` and
 does not say FIFO, socket or device. Stated residue.
@@ -92,9 +93,11 @@ does not say FIFO, socket or device. Stated residue.
 - `TreeOutcome.files_total: u64` - every non-directory entry the walk yields (file, symlink, special),
   INCLUDING entries under a skipped subtree (the walk still yields them; today they are silently passed
   over). Counted on the event, before the live/skipped test.
-- `files_degraded` is DERIVED, not stored: `WeakIdentityWarnings` gains `pub fn count(&self) -> u64`, the
-  sum of its groups' counts. It counts identity comparisons skipped for weak sides, which covers files AND
-  directories; the JSON field is named by §53 and documented as such.
+- `TreeOutcome.files_degraded: u64` - FILES whose Step 2a identity comparison was skipped for a weak side,
+  incremented in `copy_one` when `Outcome::identity_degraded` is `Some`. Stored, not derived from
+  `WeakIdentityWarnings`: those groups also record DIRECTORY comparisons (the pre-flight and the Dir rule),
+  and §51's field is "files degraded". (Panel round 1 corrected the approved "derived" wording, which would
+  have counted directories.)
 
 `copy_file` and its `Outcome` are unchanged.
 
@@ -107,9 +110,11 @@ process: `resolve` (paths and §4.1), `report` (human lines and JSON), and `exit
 ### Resolve (K6)
 
 1. `symlink_metadata(SOURCE)`. Missing: print the error, exit 1.
-2. If SOURCE is a symlink, resolve it with `std::fs::canonicalize` and use the target's type. (The
-   library refuses a symlinked source root by design; resolving it here is the walker design's
-   assignment.)
+2. If SOURCE is a symlink, resolve it with `std::fs::canonicalize`, use the target's type, and pass the
+   RESOLVED path to the engine - for a folder AND for a file, so one rule covers both. (The library refuses
+   a symlinked source root by design; resolving it here is the walker design's assignment. A user-named
+   root is not an object "directly discovered ... by the scanner", which is what §25's invariant governs.)
+   A dangling SOURCE link is a missing source: exit 1.
 3. For a folder source, canonicalize the source root, and canonicalize DEST's nearest existing ancestor
    and append the absent remainder lexically (components that do not exist cannot be links). Both sides
    are canonicalized or neither, so Windows' `\\?\` prefix is on both.
@@ -123,7 +128,7 @@ not invalidate the containment decision".
 Every message shows paths as the user typed them; a `\\?\` path is never printed. Tree records are
 relative to the destination root and use `/` separators (§233.1).
 
-The single-file path keeps its paths as given: its Step 0 lexical check and Step 2a identity gate already
+Apart from step 2, the single-file path keeps its paths as given: its Step 0 lexical check and Step 2a identity gate already
 cover self-copy, and a degraded weak-identity case stages through a distinct temporary (the bytes
 published are the source's own).
 
@@ -162,7 +167,7 @@ basis is invariant 23 ("explicit strict failure") and the walker design, and `--
 | 0 | no failure. Weak-identity warnings and skipped special files still exit 0. |
 | 1 | any streamed failure (including `PublishedWithComplaints`), a single-file error other than the refusal below, or a `TreeAbort` that is not an exit-3 refusal |
 | 2 | a usage error: clap's own, or the §4.1 folder-onto-file case |
-| 3 | a `TreeAbort` with `changed() == false` and code `SAFETY_REJECTED` or `NOREPLACE_PUBLISH_UNAVAILABLE`; a single-file `SAFETY_REJECTED` from Step 0 or Step 2a (refused before anything changed) |
+| 3 | a `TreeAbort` with `changed() == false` and code `SAFETY_REJECTED` or `NOREPLACE_PUBLISH_UNAVAILABLE`; a single-file `SAFETY_REJECTED` (both of `copy_file`'s sites, Step 0 and the Step 2a gate, run before the temporary is created, so nothing has changed) |
 
 A missing or unreadable source is 1, not 3: §55 reserves 3 for a refusal "because of the state of the
 destination, a prior operation, or the platform". An exit-3 condition that changed something is 1, as §55
@@ -191,9 +196,17 @@ requires.
     supplied.
 - Then one summary line: files copied, bytes, directories created, failures, special files skipped.
 
+The plan fixes the exact wording. Tests pin the contract, not the prose: a weak-volume line contains the
+volume id (hex), the count, the example path, and `--safety=strict`; a record line starts with its `CODE:`.
+
+Writes to stdout and stderr never panic: a closed pipe (`flux copy --json ... | head -c0`) is ignored,
+not a crash, and the exit code is the operation's. (`println!`/`eprintln!` panic on a failed write, which
+would turn a finished copy into exit 101.)
+
 ### `--json` (stdout, one object, at the end)
 
-Printed on success and on abort; not on a usage error. Human output still goes to stderr. §53 calls its
+Printed whenever the operation ran - exit 0, 1 or 3, single file or tree, success, failure or abort - and
+never on a usage error (exit 2). Human output still goes to stderr. §53 calls its
 list "Complete field list (not only an example)", so every field is present, and each value is true for
 what this cut does:
 
@@ -204,8 +217,8 @@ what this cut does:
 | `files_skipped` | 0 - no skip policy exists (see the note below on special files) |
 | `files_overwritten` | single file: 1 if the target existed when resolved and the copy succeeded; tree: 0 |
 | `files_hardlinked`, `files_reflinked`, `files_verified`, `files_mismatched` | 0 - none exist in this cut |
-| `files_degraded` | `warnings.count()`; single file: 1 if `identity_degraded` is `Some` |
-| `files_failed` | the tally's total minus `published_with_complaints` (those files ARE at the destination) |
+| `files_degraded` | `TreeOutcome.files_degraded`; single file: 1 if `identity_degraded` is `Some` |
+| `files_failed` | tree: the tally's `copy + symlink` (file-level failures; walk and create-dir failures are not files, and published-with-complaints files ARE at the destination). Single file: 1 on any error, else 0 |
 | `bytes_total` | `bytes_copied` (see below) |
 | `bytes_copied` | engine count |
 | `bytes_skipped` | 0 |
@@ -236,7 +249,7 @@ Serialization uses `serde` + `serde_json` (already workspace dependencies), adde
 - a special file is streamed as `SpecialFileSkipped`, counted in `special_files_skipped`, and absent
   from `FailureTally::total()`; a symlink is a failure.
 - `files_total` counts entries under a skipped subtree.
-- `WeakIdentityWarnings::count()` sums both kinds of group.
+- `files_degraded` counts a degraded FILE and not a degraded directory.
 
 **CLI (`crates/flux-cli/tests`, real temporary directories):**
 - each §4.1 row, including the trailing-separator case and folder-onto-file = exit 2;
@@ -266,7 +279,12 @@ directory metadata.
 - `bytes_total` omits the size of files that failed.
 - `object_type=special` does not name the kind of special file.
 - Skipped special files have no §53 field.
-- `files_degraded` counts skipped identity comparisons, directories included.
 - The §5.1 `--overwrite` gap for trees (above).
 - 4b's residues carry forward unchanged (Step 2a-to-publish window, mid-walk aborts leave earlier copies,
   weak-identity folds merge silently, subdirectory aliases are §42's).
+
+## Stand-downs
+
+- `REJECTED: a file published and then failed would escape changed()` - `copy_file_at`'s publish rename is
+  its final step; `Ok(Outcome ..)` follows it directly (`crates/flux-core/src/copy.rs`, the `published`
+  match), so there is no post-publish failure to miss.
