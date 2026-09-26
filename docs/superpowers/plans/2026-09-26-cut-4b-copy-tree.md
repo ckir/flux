@@ -1319,9 +1319,12 @@ fn preflight(
 /// check that sees through it. Paths are compared as given; cut 5's CLI canonicalizes
 /// both roots before calling the engine.
 fn lexically_within(inner: &Path, outer: &Path) -> bool {
-    let parts = |p: &Path| -> Vec<Component<'_>> {
+    // A nested `fn`, not a closure: a closure cannot state the higher-ranked
+    // `for<'a> fn(&'a Path) -> Vec<Component<'a>>` this needs (MEASURED in execution:
+    // "lifetime may not live long enough").
+    fn parts(p: &Path) -> Vec<Component<'_>> {
         p.components().filter(|c| !matches!(c, Component::CurDir)).collect()
-    };
+    }
     let (i, o) = (parts(inner), parts(outer));
     i.len() >= o.len() && i[..o.len()] == o[..]
 }
