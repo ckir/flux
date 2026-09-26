@@ -56,7 +56,6 @@ mod tests {
 
     // Returns `TreeAbort` by value like `copy_tree` does (plan refinement 6).
     #[allow(clippy::result_large_err)]
-    #[allow(clippy::field_reassign_with_default)]
     fn abort(code: Code, f: impl FnOnce(&mut TreeOutcome)) -> Result<TreeOutcome, TreeAbort> {
         let mut outcome = TreeOutcome::default();
         f(&mut outcome);
