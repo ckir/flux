@@ -253,6 +253,19 @@ pub fn copy_tree<F: DestinationRoot>(
                 } else {
                     Frame::Skipped
                 };
+                // A destination directory about to be entered must not BE the source root
+                // (owner, cut 4b capstone round 1): a bind mount inside the destination can
+                // present the source under a destination name, and `open_dir` refuses only
+                // name-surrogates. Aliases of source SUBdirectories stay the §42 mount cut's.
+                if let Frame::Live { dir, .. } = &frame
+                    && let (Ok(FileIdentity::Strong(a)), FileIdentity::Strong(b)) =
+                        (dir.identity(), src_identity)
+                    && a == b
+                {
+                    return Err(refuse(
+                        "a destination directory is the source root itself, by identity",
+                    ));
+                }
                 stack.push(frame);
             }
             WalkEvent::File { path } => {
@@ -946,5 +959,21 @@ mod tests {
             }
             other => panic!("expected Copy, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_destination_directory_that_is_the_source_root_aborts_the_operation() {
+        // A bind mount inside the destination can present the source root under a
+        // destination name; open_dir refuses only name-surrogates, so the merge must check
+        // identity (cut 4b capstone round 1, owner).
+        let fs = tree();
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.create_dir(Path::new("/dst/sub")).unwrap();
+        fs.set_identity("/dst/sub", identity_of(&fs, "/src"));
+
+        let (r, _) = run(&fs, "/src", "/dst", &opts());
+
+        assert_eq!(r.unwrap_err().code(), Code::SafetyRejected);
+        assert!(!fs.exists("/dst/sub/b"), "nothing was written through the alias");
     }
 }
