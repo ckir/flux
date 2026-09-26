@@ -247,6 +247,7 @@ entries below are cut 4b's.
       `UNVERIFIABLE` 2026-09-22: completion is the state of one machine, which the repository
       cannot record. Observed at the time: `command -v cargo-mutants` says INSTALLED, and the tool
       is declared in `.claude/recommended-tools.json`.
+- [ ] Run `lefthook install` in each clone (or add it to a bootstrap recipe)
 - [ ] Replace the placeholder `benches/copy.rs` once there is a pipeline to measure
 - [ ] Replace the placeholder test in `tests/integration/mod.rs` with the first
       real case from spec §68.2
@@ -470,10 +471,6 @@ item was, not only in a commit message.
   `rename_at(.., false)`. Landed in PR #38 (`feat/copy-tree`, "atomic no-replace publication").
 - `DONE` **`rename_no_replace` is check-then-act.** (was under "Known gaps in the single-file copy",
   duplicate of the entry above). Same citations and same fix, PR #38.
-- `DONE` **Run `lefthook install` in each clone (or add it to a bootstrap recipe).** (was under
-  "Scaffolding follow-ups"). The bootstrap recipe already exists: `justfile:126-128` — `hooks:` runs
-  `lefthook install` — present since the initial scaffold commit `7d86f7b` and documented in
-  `CONTRIBUTING.md:15,30`.
 - `DONE` **`_typos.toml` excludes the spec by its literal file name** (was under "Repository and CI
   hygiene"). Fixed by this branch's Task 1, commit `2f25822`: `_typos.toml`'s exclude is now the glob
   `"FLUX_FULL_UPDATED_SPEC_V*.md"`.

@@ -38,7 +38,7 @@ packed small-file transfers
 | Phase | Deliverable | State |
 |---|---|---|
 | 1 | Workspace — crates created and compiling | **done** (no PR — direct commit `7d86f7b`, before the PR workflow started) |
-| 2 | Portable copy — files, directories, metadata, errors, statistics | in progress (PR #32: files, metadata, errors; directories and full statistics not merged) |
+| 2 | Portable copy — files, directories, metadata, errors, statistics | in progress (PR #32: files, metadata, errors; PR #48: single-file copies write through a directory handle; directories and full statistics not merged) |
 | 3 | Streaming — scanner, selection, bounded queues, planner, workers; demonstrate bounded memory | not started |
 | 4 | Deterministic topology — ordered traversal, `FileIdentity`, hardlink canonicalization, persistent topology store, excluded members, dependency-aware links | in progress (PR #36, #37: ordered traversal and `FileIdentity`; hardlink canonicalization, topology store, excluded members and dependency-aware links not merged) |
 | 5 | Persistent operation state — manifest, operation ID, lock, heartbeat, state database, partial-file mapping, crash recovery, cleanup | not started |
