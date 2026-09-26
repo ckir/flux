@@ -167,7 +167,13 @@ basis is invariant 23 ("explicit strict failure") and the walker design, and `--
 | 0 | no failure. Weak-identity warnings and skipped special files still exit 0. |
 | 1 | any streamed failure (including `PublishedWithComplaints`), a single-file error other than the refusal below, or a `TreeAbort` that is not an exit-3 refusal |
 | 2 | a usage error: clap's own, or the §4.1 folder-onto-file case |
-| 3 | a `TreeAbort` with `changed() == false` and code `SAFETY_REJECTED` or `NOREPLACE_PUBLISH_UNAVAILABLE`; a single-file `SAFETY_REJECTED` (both of `copy_file`'s sites, Step 0 and the Step 2a gate, run before the temporary is created, so nothing has changed) |
+| 3 | a `TreeAbort` with `changed() == false`, NO streamed failure before it (`outcome.failures.is_empty()`), and code `SAFETY_REJECTED` or `NOREPLACE_PUBLISH_UNAVAILABLE`; a single-file `SAFETY_REJECTED` (both of `copy_file`'s sites, Step 0 and the Step 2a gate, run before the temporary is created, so nothing has changed) |
+
+A mid-walk abort that follows streamed failures is 1 even when nothing changed: the run acted on some
+paths before the refusal, which is §55's "a partial run hit a refusal on some paths only" (panel round 1).
+A failure of the CLI's own resolution - `canonicalize` on SOURCE or on DEST's nearest existing ancestor
+(for example a symlink loop, or a permission error) - prints the error and exits 1: it is not one of §55's
+named refusals, and nothing was attempted.
 
 A missing or unreadable source is 1, not 3: §55 reserves 3 for a refusal "because of the state of the
 destination, a prior operation, or the platform". An exit-3 condition that changed something is 1, as §55
@@ -214,7 +220,7 @@ what this cut does:
 |---|---|
 | `files_total` | `TreeOutcome.files_total`; 1 for a single file |
 | `files_copied` | engine count (0 or 1 for a single file) |
-| `files_skipped` | 0 - no skip policy exists (see the note below on special files) |
+| `files_skipped` | `special_files_skipped` (tree); 0 for a single file |
 | `files_overwritten` | single file: 1 if the target existed when resolved and the copy succeeded; tree: 0 |
 | `files_hardlinked`, `files_reflinked`, `files_verified`, `files_mismatched` | 0 - none exist in this cut |
 | `files_degraded` | `TreeOutcome.files_degraded`; single file: 1 if `identity_degraded` is `Some` |
@@ -228,9 +234,10 @@ what this cut does:
 | `verify_level` | `"none"` - this cut verifies nothing; never `"destination"` |
 | `hash_algorithm` | `"blake3"` - the only value `--hash` accepts (§5); no hashing runs |
 
-Note on `files_skipped`: §51 defines it as targets skipped by the existing-destination policy (§5.1).
-Skipped special files are reported as records and in the human summary, and are NOT folded into
-`files_skipped`; the JSON field list has no slot for them. Stated residue.
+Note on `files_skipped`: a skipped special file IS a skipped target (§233.1 `action=skipped`; §124 treats
+a skipped symlink "as for unsupported special files"), so it is counted there, and §233.3's "never
+disappear from the operation summary" holds in the JSON too. No skip POLICY (§5.1) exists in this cut, so
+this is the field's only source. (Panel round 1.)
 
 `bytes_total` is `bytes_copied` by the owner's choice: the walk never stats a file, so a failed file's
 size is unknown, and a pre-scan would double metadata I/O. Documented in `--help`'s JSON note and here.
@@ -258,6 +265,8 @@ Serialization uses `serde` + `serde_json` (already workspace dependencies), adde
   trigger (each mid-walk abort needs a bind mount, a weak-identity volume, or a filesystem without the
   no-replace primitive), so it is pinned in the `exit` module's unit tests with a constructed
   `TreeAbort`, one case per `changed()` input; the engine tests pin that each abort site sets them;
+- the collision test asserts more than the exit code: another file in the same run WAS copied and the
+  collision's record line was printed, so an engine that aborted on the first collision fails it;
 - the single-file hardlink refusal now exits 3 (the existing tests assert only `!success`; they gain the
   code);
 - `--safety=strict` sets `Safety::Strict` (pinned in the `exit`/options unit tests; a real weak-identity
@@ -278,7 +287,6 @@ directory metadata.
 
 - `bytes_total` omits the size of files that failed.
 - `object_type=special` does not name the kind of special file.
-- Skipped special files have no §53 field.
 - The §5.1 `--overwrite` gap for trees (above).
 - 4b's residues carry forward unchanged (Step 2a-to-publish window, mid-walk aborts leave earlier copies,
   weak-identity folds merge silently, subdirectory aliases are §42's).
@@ -288,3 +296,10 @@ directory metadata.
 - `REJECTED: a file published and then failed would escape changed()` - `copy_file_at`'s publish rename is
   its final step; `Ok(Outcome ..)` follows it directly (`crates/flux-core/src/copy.rs`, the `published`
   match), so there is no post-publish failure to miss.
+- `REJECTED: files_total cannot count a skipped subtree without extra I/O` - under a `Skipped` frame the
+  walk still reads and yields events; `copy_tree` passes over them (`crates/flux-core/src/tree.rs`, "Under
+  a skipped subtree the walk still reads"), so counting costs nothing.
+- `REJECTED: resolved root paths leak through CopyError's Display` - `Display` writes the `FsError` and an
+  optional leftover (`crates/flux-core/src/copy.rs`, `impl Display for CopyError`); tree leftovers are
+  rebuilt destination-relative, and no root path is embedded.
+- `REJECTED: dunce keeps \?\ on long paths` - this spec uses no `dunce`; it prints user-typed paths.
