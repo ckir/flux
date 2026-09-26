@@ -91,7 +91,9 @@ together.
 `tornRead` is set at `algorithm.txt:144`, before the judgement, so an unconditional set keeps the five witness
 runs violated. **Closure:** delete `tornRead` (`algorithm.txt:35`, `:144`); redefine
 `NeverTornRead == ~\E p \in Procs : seenRec[p] = Torn /\ classified[p] = "uncertain"` (the `TODO.md` entry's own
-suggestion). **Mutants:** (a) judge Torn as anything but uncertain (the `SEED_TORN_AS_FOREIGN` shape) - the five
+suggestion). The predicate covers the CLASSIFY read only: `S240_5_s5` reads into a local and writes neither
+`seenRec` nor `classified`, so a takeover's torn read is item 3's, through the union. **Mutants:** (a) judge Torn as
+anything but uncertain (the `SEED_TORN_AS_FOREIGN` shape) - the five
 `NeverTornRead` witness runs stop violating and fail; (b) drop `seenRec[self] := seen` (`:143`) - same.
 
 ### 5. M6 - `recoveredAfterCrash`'s guard is always true
@@ -113,11 +115,17 @@ the item returns to the owner.
 - **Flipped comparison** in `hostCrashChangedLock`'s update (`algorithm.txt:1023`). A witness run passes on any
   violation, so a flip that fires on every host crash still passes. **Closure:** a NEGATIVE CONTROL - a check run
   in which a host crash cannot change the lock, listing `NeverHostCrashChangedLock` as an invariant that must
-  HOLD. The design fixes the configuration in the plan (a constant permitting a host crash only before any actor
-  step works because the initial lock is durable, `FsModel.tla:94`). **Mutant:** the flip - the control fails.
+  HOLD. The constant is `HostCrashAtStartOnly` (TRUE only in this run): the environment may host-crash only before
+  any actor step, which cannot change the lock because the initial lock is durable (`FsModel.tla:94`). The run is
+  `recovery-posix-hostcrash-control`, the recovery pairing with `HostCrashes = TRUE`, in the per-pull-request suite.
+  Its state space is expected near `recovery-posix-check`'s, not the extended tier's 10.7-28.4 million (README
+  `models/lockproto/README.md:151`), because the only host crash falls before anything is written; measured. **Mutant:** the flip - the control fails.
 - **"Always keep new content" and "`Unflushed == {}`".** Both remove the old/torn outcomes of a host crash
-  (`FsModel.tla`, `FsHostCrash`'s `CASE` arms; `Unflushed` feeds them). **Closure:** `branches` entries on the
-  `"old"` and torn arms (resting on item 1's measurement for `CASE`-in-`LET` in another module). **Mutants:** the
+  (`FsModel.tla`, `FsHostCrash`'s `CASE` arms; `Unflushed` feeds them). **Closure:** `branches` entries
+  `{ module = "FsModel", operator = "FsHostCrash", arm = "CASE pick[o] = \"old\" ->" }` and
+  `{ module = "FsModel", operator = "FsHostCrash", arm = "[] OTHER -> Torn" }` (the arm texts as they stand in
+  `FsModel.tla`), resting on item 1's measurement for `CASE`-in-`LET` in another module; if that measurement shows
+  `CASE` arms get no nodes of their own, these two closures return to the owner. **Mutants:** the
   two above - the arms' counts go to zero.
 - **`FsInvariants == TRUE`.** Predicted already killed by `SEED_FS_LOCK_WITHOUT_HANDLE`
   (`recovery-posix-seeded-SEED_FS_LOCK_WITHOUT_HANDLE`, `expected.toml:82-89`, added after the M7 entry was
@@ -189,8 +197,19 @@ the recovery path's `S240_3_s4_lock_verify` queries `FsIdentityChoices(fs, P, Lo
 and `LockName` is re-created after a move-aside. **Closure:** weak-identity check runs for the recovery and mixed
 scenarios on POSIX, where a crash between re-creations gives `past[LockName]` two ids. **Mutant:** `past[d][c] = {}`
 (the gutting the strong seed of item 6 cannot see). **Measure:** the weak runs' state counts and times, recorded
-in `expected.toml` and the README like every other run; the design doc's rationale is corrected. If a weak run
-exceeds the CI budget, the plan splits it the way `breaklock-remote` was split.
+in `expected.toml` and the README like every other run; the design doc's rationale is corrected. The weak runs are
+measured FIRST, before the plan fixes the run list: `past` accumulates ids, so their size is not predictable from
+the strong runs. If one exceeds its tier's timeout, the plan splits it the way `breaklock-remote` was split, or the
+owner narrows item 13 to the recovery pairing.
+
+## Run placement (every new seeded run)
+
+Each new seeded run copies an existing seeded run of its scenario and changes only its own flag. The new
+`SEED_FS_*` seeds act where the existing ones do - an environment step beside `SEED_FS_LOCK_WITHOUT_HANDLE`
+(`algorithm.txt:1055`) - and run in the recovery POSIX pairing, like `recovery-posix-seeded-SEED_FS_ALIEN_CONTENT`.
+`SEED_RECOVER_LIVE` and `SEED_RECOVERER_GIVES_UP` also run in the recovery POSIX pairing (Owners o1, Recoverers
+r1 r2). The `S99_release_check` seed runs in that pairing too; the `S21_1_s3` seed and `SEED_TAKEOVER_FOREIGN` run
+in the breaklock POSIX pairing, which has a Breaker. The plan names each run and copies its constants.
 
 ## Run inventory (new runs)
 
