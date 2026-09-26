@@ -105,7 +105,7 @@ does not say FIFO, socket or device. Stated residue.
 ## CLI (`crates/flux-cli`)
 
 `main.rs` keeps argument parsing and dispatch; new modules hold the logic so it is unit-testable without a
-process: `resolve` (paths and §4.1), `report` (human lines and JSON), and `exit` (the §55 mapping).
+process: `resolve` (paths and §4.1), `report` (human lines and JSON), and `exit_code` (the §55 mapping).
 `flux-ui` stays a scaffold: it owns progress display (§52), which this cut does not build.
 
 ### Resolve (K6)
@@ -150,8 +150,17 @@ published are the source's own).
 | file | an existing folder, or a path ending in a separator | `copy_file(src, DEST/<name>)` |
 | file | anything else | `copy_file(src, DEST)` |
 
-"Ends in a separator" is tested on the raw argument (`/`, and `\` on Windows). Several sources (§18.3)
-stay out: they need the operation workspace. The single-file path keeps `Publish::Replace` (§5.1's
+"Ends in a separator" is tested on the raw argument (`/`, and `\` on Windows). DEST is classified with
+the FOLLOWING `std::fs::metadata`, because 4b follows a user-named destination (§149.7): a DEST link to a
+folder is "an existing folder", a DEST link to a file is "an existing file". `NotFound` - absent, or a
+dangling link - is "anything else"; for a folder source the engine then meets the dangling link at its
+root creation and refuses it (`open_dir` does not follow a link), which is an unchanged refusal, exit 3.
+A file source with a trailing-separator DEST that does not exist is sent to `copy_file(src, DEST/<name>)`
+and fails because the parent is missing (exit 1); §4.1 does not say to create it.
+
+Several sources (§18.3) stay out: they need the operation workspace. `flux copy` keeps exactly two
+positionals, so a third is clap's usage error (exit 2), and `--help` says several sources are not yet
+supported. The single-file path keeps `Publish::Replace` (§5.1's
 default `--overwrite`).
 
 ### Flags (K4)
@@ -233,11 +242,11 @@ what this cut does:
 | `files_overwritten` | single file: 1 if the target existed when resolved and the copy succeeded; tree: 0 |
 | `files_hardlinked`, `files_reflinked`, `files_verified`, `files_mismatched` | 0 - none exist in this cut |
 | `files_degraded` | `TreeOutcome.files_degraded`; single file: 1 if `identity_degraded` is `Some` |
-| `files_failed` | tree: the tally's `copy + symlink` (file-level failures; walk and create-dir failures are not files, and published-with-complaints files ARE at the destination). Single file: 1 on any error, else 0 |
+| `files_failed` | tree: the tally's `copy + symlink` (file-level failures; walk and create-dir failures are not files, and published-with-complaints files ARE at the destination). Single file: 1 on an error (including K7), else 0 |
 | `bytes_total` | `bytes_copied` (see below) |
 | `bytes_copied` | engine count |
 | `bytes_skipped` | 0 |
-| `errors` | the tally's total, plus 1 for a `TreeAbort` |
+| `errors` | tree: the tally's total, plus 1 for a `TreeAbort`. Single file: 1 on an error or on published-with-complaints, else 0 |
 | `duration_ms` | measured by the CLI around the engine call |
 | `average_bytes_per_second` | `bytes_copied * 1000 / max(duration_ms, 1)` |
 | `verify_level` | `"none"` - this cut verifies nothing; never `"destination"` |
@@ -272,13 +281,13 @@ Serialization uses `serde` + `serde_json` (already workspace dependencies), adde
 - exit 0 for a clean tree; exit 1 for a collision in an existing destination; exit 3 for a destination
   inside the source with nothing created. Exit 1 for an abort AFTER a change has no portable real-disk
   trigger (each mid-walk abort needs a bind mount, a weak-identity volume, or a filesystem without the
-  no-replace primitive), so it is pinned in the `exit` module's unit tests with a constructed
+  no-replace primitive), so it is pinned in the `exit_code` module's unit tests with a constructed
   `TreeAbort`, one case per `changed()` input; the engine tests pin that each abort site sets them;
 - the collision test asserts more than the exit code: another file in the same run WAS copied and the
   collision's record line was printed, so an engine that aborted on the first collision fails it;
 - the single-file hardlink refusal now exits 3 (the existing tests assert only `!success`; they gain the
   code);
-- `--safety=strict` sets `Safety::Strict` (pinned in the `exit`/options unit tests; a real weak-identity
+- `--safety=strict` sets `Safety::Strict` (pinned in the `exit_code`/options unit tests; a real weak-identity
   volume is not on CI);
 - `--json` parses, has every §53 key, and pins `files_copied`, `bytes_copied`, `verify_level`;
 - unix only: a FIFO is skipped with exit 0 and a record line; a symlink inside the tree fails with exit 1;
