@@ -120,3 +120,10 @@ AGY-NEGOTIATE round 1 (brief `.clavity/seams/seq-after-cut5-neg1.md`): agy withd
 confirmed "refuse or restart, never resume" is safe in cut 7 (spec:13603-13604; `--restart` keeps the target
 locked throughout, spec item 103 at :359), supplied the 11/14 triage and the cut-7 seam. `[VERDICT: ALIGNED]`.
 The owner approved the sequence, all 11 items in cut 6, and deciding cut 7's size in its own spec.
+
+## Stand-downs
+
+None below the floor and none accepted unverified. Adversarial panel (AGY-AFTER), three rounds: round 1 solo
+(2 folds) plus agy (5 findings, all folded); round 2 agy (3 folded; 1 REJECTED by measurement - repeated
+`--restart` does not accumulate workspaces, because it deletes the superseded state, spec:56-59); round 3
+agy GREEN. Briefs `.clavity/seams/seq-after-cut5-panel-r1.md` to `-r3.md`.
