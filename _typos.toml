@@ -4,8 +4,10 @@
 extend-exclude = [
     "target/",
     "Cargo.lock",
-    # The engineering spec is a delivered document; do not rewrite it.
-    "FLUX_FULL_UPDATED_SPEC_V16.md",
+    # The engineering spec is a delivered document; do not rewrite it. Matched by
+    # pattern, not by name, so a new spec version is excluded the day it lands
+    # instead of being scanned for the first time by CI.
+    "FLUX_FULL_UPDATED_SPEC_V*.md",
 ]
 
 [default]
