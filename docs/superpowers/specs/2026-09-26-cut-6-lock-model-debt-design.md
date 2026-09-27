@@ -81,9 +81,13 @@ depth)` and drops the end of the span.
   `S240_5_s5`'s continue arm. A summed count of zero fails.
 - **Where it is judged.** Twice, over the logs each tier already writes, so it costs no TLC time: in
   `union_from_logs` (`run.py:1251`) for `expected.toml` (`just model` and the per-PR CI `union` job,
-  `.github/workflows/model.yml:166`), and - new in this cut - in a union step of the extended tier
-  (`model-extended.yml`) for `expected-extended.toml`, whose exhaustive host-crash checks are the only complete
-  runs that evaluate `FsHostCrash` (item 6). A `branches` entry names the tier that judges it
+  `.github/workflows/model.yml:166`), and in the extended tier for `expected-extended.toml`, whose exhaustive
+  host-crash checks are the only complete runs that evaluate `FsHostCrash` (item 6). The extended tier has NO union
+  job today (`model-extended.yml:5-8` says the union moved to `model.yml`), so this cut ADDS one: a job in
+  `model-extended.yml` that downloads the scenario jobs' uploaded logs (`model-extended.yml:79` uploads them) and runs
+  `python models/lockproto/run.py --expected models/lockproto/expected-extended.toml --union-from <dir>`, which the
+  runner already accepts. It follows `model.yml`'s union job, including its `!cancelled()` rule
+  (`model-extended.yml:156` points at it). A `branches` entry names the tier that judges it
   (`tier = "per-pr"` default, or `"extended"`).
 - **Tests (`test_run.py`).** Arm parsing and depth from the new fixture; two logs where only one covers an arm
   (passes); an arm at zero (fails); a missing anchor and an ambiguous anchor (fail closed); an anchor scoped away
@@ -297,6 +301,8 @@ Model run, as `TODO.md` asks ("batch them rather than paying three times").
 - **Panel round 2 was reviewed by an independent Opus subagent, not agy** (owner, 2026-09-27): agy's two attempts
   at round 2 ended in error steps before any reply, and no agy console was open to read the cause. agy was back
   for the AGY-FIRST consult on the three forks that round raised.
+- Round 3 (agy): one `debt` finding (the extended-tier union job is new CI work; folded), no blocking finding, and
+  the Stop Arguer could name none: panel GREEN at round 3.
 - DISCARDED-BELOW-FLOOR (round 2): none. Two round-2 items were citation slips and are folded (`FsModel.tla:96`,
   `README.md:152`).
 
