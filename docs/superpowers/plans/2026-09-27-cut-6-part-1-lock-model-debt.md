@@ -39,7 +39,7 @@ The spec's union-based closures (items 1, 2, 3, 6) rest on what TLC prints for a
   cat LockProtocol.head algorithm.txt invariants.txt > LockProtocol.tla && \
   java -cp ../../target/tla/tla2tools.jar pcal.trans LockProtocol.tla && rm -f LockProtocol.cfg LockProtocol.old
   ```
-  then `python run.py --check-translation` must exit 0 with no output. (If `target/tla/tla2tools.jar` is missing, `python run.py --check-translation` fetches it.)
+  then `python run.py --check-translation` must exit 0 (it prints `run.py: LockProtocol.tla matches its sources`). (If `target/tla/tla2tools.jar` is missing, `python run.py --check-translation` fetches it.)
 - **A targeted TLC run** (from `models/lockproto`; always with a scratch `-metadir`, so no `states/` directory lands in the model):
   ```bash
   java -XX:+UseParallelGC -cp ../../target/tla/tla2tools.jar tlc2.TLC -workers auto \
