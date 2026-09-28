@@ -28,6 +28,26 @@ The spec's union-based closures (items 1, 2, 3, 6) rest on what TLC prints for a
 5. **Seeds are one-shot and never touch the foreign start object.** Every run may start from a `Foreign` lock (`algorithm.txt:18`); a seed that rewrites `foreignObj` also breaks `ForeignStaysAtLockPath`/`ForeignContentUntouched`, and one that points the lock path at a `NoContent` object sends a classifier into `seen.op` (`algorithm.txt:159`), an evaluation error. And a seed enabled in every state turns a gutted invariant's run into an unbounded exploration. So each new environment seed guards itself to fire once, excludes `foreignObj`, and the entries seed writes `DirLockName`'s class, whose only reader diverts to the backoff label (`algorithm.txt:205`).
 6. **Mutant runs are TARGETED TLC runs, not scenario runs.** A scenario run executes every run of the scenario (breaklock POSIX includes a 17-million-state check, `algorithm.txt:558`); the plan runs the ONE config a mutant is about, directly with TLC, and leaves full-scenario measurement to CI (Task 14).
 
+## Revision 3 (2026-09-29): TLC runs move to CI - this OVERRIDES every task from Task 5 on
+
+Local TLC runs overloaded the owner's machine (a scenario run was also killed by the harness for low memory). Owner
+ruling, agy aligned after one negotiation round:
+
+- **No local TLC model checking from Task 5 on.** A "targeted run" of an UNMUTATED config is not run locally; the full CI
+  Model run of Task 14 runs every config in `expected.toml` and judges it. A MUTANT step is not run locally either: it
+  becomes one `[[mutant]]` entry in `models/lockproto/mutants.toml` (Task 5a), run on CI by `run.py --mutants`.
+- **Translating a mutant step into an entry:** `file` = the source the step edits; `old` = the exact current text the step
+  replaces (enough lines to occur exactly once); `new` = the mutated text; `config` = the config the step names; and the
+  step's kill becomes `expect_absent = "<X>"` when the step says the run "no longer reports X" (a seeded or witness config),
+  or `expect_present = "<X>"` when it says the run "reports X violated" (a check config). `timeout_minutes` = 60 unless the
+  step says otherwise. A pure DELETION is written by including a neighbouring line in both `old` and `new` (`new` may
+  not be empty). Name: `<task>-<short>` in lower case, e.g. `t5-flip-hostcrash-compare`.
+- **Local gates only:** `python models/lockproto/run.py --check-translation` (exit 0), `--list-jobs` (exit 0),
+  `python models/lockproto/run.py --list-mutants models/lockproto/mutants.toml` (exit 0; validates the manifest, and each
+  entry's `old` must occur exactly once in the CURRENT sources - see Task 5a), `just model-test` (`OK`). No `java tlc2.TLC`.
+- Tasks 3 and 4 already ran their mutants locally (measured, `ea28f57`, `bc3f599`); Task 5a still records them in the
+  manifest, so the committed record is complete and re-runnable.
+
 ## Ground rules for every task
 
 - **Worktree:** `E:\Rust\flux-engine`, branch `spec/seq-after-cut5`. NEVER push; publishing is the owner's decision after the capstone and test audit.
@@ -375,6 +395,378 @@ ReplacedOnlyDead == ~replacedLive
 
 ---
 
+### Task 5a: the mutant runner and its manifest (revision 3)
+
+**Files:** Modify `models/lockproto/run.py`, `models/lockproto/test_run.py`, `models/lockproto/algorithm.txt` (one guard); regenerate `LockProtocol.tla`; create `models/lockproto/mutants.toml`, `.github/workflows/model-mutants.yml`.
+
+**State at the start of this task:** Task 5 is committed without its Step 5 and Step 9 runs (see Task 5's completion note in the execution record); its two mutants and Task 3/4's mutants become manifest entries here.
+
+- [ ] **Step 0: verify.** `run.py` defines `SOURCES = ("LockProtocol.head", "algorithm.txt", "invariants.txt")`, `IDENT`, `_require`, `ExpectedError`, `ToolingError`, `ensure_jar`, `interpret(exit_code, output, properties)`, `cfg_properties(text)`, `class Outcome` with fields `tooling_error, observed, distinct_states, trace`, and `TARGET = REPO / "target" / "tla"`; `main()`'s parser has `--zero-branches`; the environment block of `algorithm.txt` has `             await SEED_FS_LOCK_WITHOUT_HANDLE;`.
+
+- [ ] **Step 1: tests are already written - add them** at the end of `test_run.py`, before `if __name__ == "__main__":`:
+
+```python
+class MutantManifestTests(unittest.TestCase):
+    """run.py --mutants (cut 6, revision 3): exact-text mutants of the model, run on CI."""
+
+    def _write(self, body: str) -> tuple[Path, Path]:
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        tmp = Path(holder.name)
+        (tmp / "configs").mkdir()
+        (tmp / "configs" / "x.cfg").write_text("SPECIFICATION Spec\nINVARIANT A\n", encoding="utf-8")
+        manifest = tmp / "mutants.toml"
+        manifest.write_text(textwrap.dedent(body), encoding="utf-8")
+        return manifest, tmp
+
+    VALID = '''
+        [[mutant]]
+        name = "t9-demo"
+        file = "invariants.txt"
+        old = "A == TRUE"
+        new = "A == FALSE"
+        config = "configs/x.cfg"
+        expect_absent = "A"
+        '''
+
+    def test_a_valid_entry_loads(self) -> None:
+        manifest, base = self._write(self.VALID)
+        (m,) = run.load_mutants(manifest, base)
+        self.assertEqual((m.name, m.file, m.config, m.present, m.absent, m.timeout_minutes),
+                         ("t9-demo", "invariants.txt", "configs/x.cfg", None, "A", 60))
+
+    def test_each_malformed_entry_fails_at_load(self) -> None:
+        cases = {
+            "unknown key": self.VALID + 'extra = "no"\n',
+            "both expectations": self.VALID + 'expect_present = "B"\n',
+            "neither expectation": self.VALID.replace('expect_absent = "A"', ""),
+            "not a model source": self.VALID.replace('"invariants.txt"', '"run.py"'),
+            "missing config": self.VALID.replace("configs/x.cfg", "configs/missing.cfg"),
+            "old equals new": self.VALID.replace('new = "A == FALSE"', 'new = "A == TRUE"'),
+            "duplicate name": self.VALID + self.VALID,
+            "bad name": self.VALID.replace('"t9-demo"', '"T9 Demo"'),
+            # A misspelled expect_absent could never be reported, so every run would count as a kill.
+            "name not in config": self.VALID.replace('expect_absent = "A"', 'expect_absent = "Z"'),
+        }
+        for label, body in cases.items():
+            with self.subTest(label):
+                manifest, base = self._write(body)
+                with self.assertRaises(run.ExpectedError):
+                    run.load_mutants(manifest, base)
+
+    def test_old_must_occur_exactly_once(self) -> None:
+        manifest, base = self._write(self.VALID)
+        (m,) = run.load_mutants(manifest, base)
+        self.assertEqual(run.apply_mutant("X\nA == TRUE\nY\n", m), "X\nA == FALSE\nY\n")
+        for text, count in (("nothing here\n", 0), ("A == TRUE\nA == TRUE\n", 2)):
+            with self.subTest(count=count):
+                with self.assertRaises(run.ExpectedError) as err:
+                    run.apply_mutant(text, m)
+                self.assertIn(f"occurs {count} times", str(err.exception))
+
+    def test_judging_what_the_mutated_run_reported(self) -> None:
+        manifest, base = self._write(self.VALID)
+        (absent,) = run.load_mutants(manifest, base)
+        present = run.Mutant("t9-p", "invariants.txt", "a", "b", "configs/x.cfg", "A", None, 60)
+        ok = lambda observed: run.Outcome(None, frozenset(observed), 10, ())
+        bad = run.Outcome("TLC error 1000: boom", frozenset(), None, ())
+        self.assertTrue(run.judge_mutant(absent, ok([]))[0], "no error: the mutant stopped A reporting")
+        self.assertTrue(run.judge_mutant(absent, ok(["B"]))[0], "another invariant: still a kill")
+        self.assertFalse(run.judge_mutant(absent, ok(["A"]))[0], "A still reported: survived")
+        self.assertTrue(run.judge_mutant(present, ok(["A"]))[0])
+        self.assertFalse(run.judge_mutant(present, ok([]))[0])
+        for m in (absent, present):
+            killed, detail = run.judge_mutant(m, bad)
+            self.assertFalse(killed, "a tooling error is never a kill")
+            self.assertIn("tooling", detail)
+
+    def test_the_committed_manifest_is_valid_against_the_current_sources(self) -> None:
+        mutants = run.load_mutants(run.HERE / "mutants.toml", run.HERE)
+        self.assertTrue(mutants)
+        for m in mutants:
+            with self.subTest(m.name):
+                text = (run.HERE / m.file).read_text(encoding="utf-8").replace("\r\n", "\n")
+                run.apply_mutant(text, m)  # raises if 'old' is stale or ambiguous
+```
+
+- [ ] **Step 2:** `just model-test` → the five new tests ERROR (`run` has no `load_mutants`).
+
+- [ ] **Step 3: implement** in `run.py`, directly after `check_translation`:
+
+```python
+# Exact-text mutants of the model (cut 6, revision 3): each is applied to a scratch copy, the one config it names
+# is run, and what TLC reports is judged. Positional patches would drift as later edits move the lines; an exact
+# `old` text either still occurs exactly once or fails loudly as stale.
+MUTANT_KEYS = frozenset({"name", "file", "old", "new", "config", "expect_present", "expect_absent", "timeout_minutes"})
+MUTANT_FILES = (*SOURCES, "FsModel.tla")
+MUTANTS_OUT = TARGET / "mutants"
+
+
+@dataclass(frozen=True)
+class Mutant:
+    name: str
+    file: str
+    old: str
+    new: str
+    config: str
+    present: str | None  # the mutated run must REPORT this violated (a check config)
+    absent: str | None   # the mutated run must NOT report this (a seeded or witness config)
+    timeout_minutes: int
+
+
+def load_mutants(path: Path, base: Path) -> list[Mutant]:
+    """Parse and validate a mutants manifest. Unknown keys, a missing field, both or neither expectation, a file
+    that is not a model source, a config that does not exist, or a duplicate name all fail at load."""
+    try:
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as err:
+        raise ExpectedError(f"{path}: {err}") from err
+    _require(set(raw) <= {"mutant"}, f"{path}: only [[mutant]] tables are allowed")
+    entries = raw.get("mutant", [])
+    _require(isinstance(entries, list) and len(entries) > 0, f"{path}: no [[mutant]] entries")
+    mutants: list[Mutant] = []
+    seen: set[str] = set()
+    for i, e in enumerate(entries):
+        where = f"{path}: mutant {i + 1}"
+        _require(isinstance(e, dict), f"{where}: not a table")
+        unknown = set(e) - MUTANT_KEYS
+        _require(not unknown, f"{where}: unknown keys {sorted(unknown)}")
+        for key in ("name", "file", "old", "new", "config"):
+            _require(isinstance(e.get(key), str) and e[key] != "", f"{where}: '{key}' must be a non-empty string")
+        name = e["name"]
+        where = f"{path}: mutant '{name}'"
+        _require(re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", name) is not None,
+                 f"{where}: a name is lower-case words joined by '-'")
+        _require(name not in seen, f"{where}: duplicate name")
+        seen.add(name)
+        _require(e["file"] in MUTANT_FILES, f"{where}: file must be one of {', '.join(MUTANT_FILES)}")
+        _require(e["old"] != e["new"], f"{where}: 'new' equals 'old'")
+        _require((base / e["config"]).is_file(), f"{where}: config {e['config']} does not exist")
+        present, absent = e.get("expect_present"), e.get("expect_absent")
+        _require((present is None) != (absent is None), f"{where}: exactly one of expect_present and expect_absent")
+        # The name must be one the config checks: a misspelled expect_absent could never be reported, so
+        # every run would be judged a kill (independent review of this plan, MG-1).
+        cfg_text = (base / e["config"]).read_text(encoding="utf-8")
+        checked = [t for t in cfg_sections(cfg_text).get("INVARIANT", []) if IDENT.fullmatch(t)] + cfg_properties(cfg_text)
+        for key, value in (("expect_present", present), ("expect_absent", absent)):
+            _require(value is None or (isinstance(value, str) and value in checked),
+                     f"{where}: {key} must be an invariant or property that {e['config']} checks")
+        timeout = e.get("timeout_minutes", 60)
+        _require(isinstance(timeout, int) and not isinstance(timeout, bool) and 1 <= timeout <= 170,
+                 f"{where}: timeout_minutes must be an integer from 1 to 170")
+        mutants.append(Mutant(name, e["file"], e["old"], e["new"], e["config"], present, absent, timeout))
+    return mutants
+
+
+def apply_mutant(text: str, mutant: Mutant) -> str:
+    """The mutated source. `old` must occur EXACTLY once: absent means the manifest is stale, twice ambiguous."""
+    count = text.count(mutant.old)
+    if count != 1:
+        raise ExpectedError(f"mutant '{mutant.name}': 'old' occurs {count} times in {mutant.file} (must be exactly once)")
+    return text.replace(mutant.old, mutant.new, 1)
+
+
+def judge_mutant(mutant: Mutant, outcome: Outcome) -> tuple[bool, str]:
+    """Killed or not, with the reason. A tooling error - a TLC error, no Finished message - is never a kill."""
+    if outcome.tooling_error is not None:
+        return False, f"tooling: {outcome.tooling_error}"
+    reported = ", ".join(sorted(outcome.observed)) or "no error"
+    if mutant.present is not None:
+        return mutant.present in outcome.observed, f"expected {mutant.present} violated; reported: {reported}"
+    return mutant.absent not in outcome.observed, f"expected {mutant.absent} NOT reported; reported: {reported}"
+
+
+def run_mutant(mutant: Mutant, jar: Path, base: Path) -> tuple[bool, str]:
+    """Apply one mutant to a scratch copy of the model, regenerate LockProtocol.tla there, run TLC on its one
+    config, and judge. The repository is never modified, so there is nothing to revert."""
+    MUTANTS_OUT.mkdir(parents=True, exist_ok=True)
+    log = MUTANTS_OUT / f"{mutant.name}.log"
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        for name in MUTANT_FILES:
+            shutil.copyfile(base / name, work / name)
+        shutil.copytree(base / "configs", work / "configs")
+        source = work / mutant.file
+        source.write_text(apply_mutant(source.read_text(encoding="utf-8").replace("\r\n", "\n"), mutant),
+                          encoding="utf-8")
+        target = work / "LockProtocol.tla"
+        target.write_text("".join((work / n).read_text(encoding="utf-8") for n in SOURCES), encoding="utf-8")
+        trans = subprocess.run(["java", "-cp", str(jar), "pcal.trans", str(target)], capture_output=True, text=True)
+        if trans.returncode != 0:
+            return False, f"tooling: pcal.trans failed: {(trans.stdout + trans.stderr).strip()[-300:]}"
+        cmd = ["java", "-XX:+UseParallelGC", "-cp", str(jar), "tlc2.TLC", "-tool", "-workers", "auto",
+               "-metadir", str(work / "states"), "-config", str(work / mutant.config)]
+        if mutant.present is not None:
+            cmd.append("-continue")  # a check config: another invariant firing first must not hide this one
+        cmd.append("LockProtocol")
+        with log.open("w", encoding="utf-8") as out:
+            proc = subprocess.Popen(cmd, cwd=work, stdout=out, stderr=subprocess.STDOUT)
+            try:
+                code = proc.wait(timeout=mutant.timeout_minutes * 60)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                return False, f"tooling: TIMEOUT after {mutant.timeout_minutes} min"
+            except BaseException:  # never leave TLC running
+                proc.kill()
+                proc.wait()
+                raise
+    output = log.read_text(encoding="utf-8", errors="replace")
+    properties = cfg_properties((base / mutant.config).read_text(encoding="utf-8"))
+    return judge_mutant(mutant, interpret(code, output, properties))
+
+
+def mutants_main(path: Path, only: str | None, listing: bool) -> int:
+    try:
+        mutants = load_mutants(path, HERE)
+        for m in mutants:  # a stale entry fails before any TLC time is spent
+            apply_mutant((HERE / m.file).read_text(encoding="utf-8").replace("\r\n", "\n"), m)
+    except ExpectedError as err:
+        print(f"run.py: {err}", file=sys.stderr)
+        return 2
+    if only is not None:
+        mutants = [m for m in mutants if m.name == only]
+        if not mutants:
+            print(f"run.py: no mutant named {only!r}", file=sys.stderr)
+            return 2
+    if listing:
+        print(json.dumps([m.name for m in mutants]))
+        return 0
+    if shutil.which("java") is None:
+        print("run.py: java is not on PATH (TLC needs Java 11 or later; CI uses Temurin 21)", file=sys.stderr)
+        return 2
+    try:
+        jar = ensure_jar()
+    except (ToolingError, OSError) as err:
+        print(f"run.py: {err}", file=sys.stderr)
+        return 2
+    failed = 0
+    for m in mutants:
+        killed, detail = run_mutant(m, jar, HERE)
+        print(f"{'KILLED    ' if killed else 'NOT KILLED'} {m.name}: {detail}", flush=True)
+        failed += not killed
+    print(f"run.py: {len(mutants) - failed} of {len(mutants)} mutants killed", flush=True)
+    return 1 if failed else 0
+```
+
+  and in `main()`, after the `--zero-branches` argument:
+
+```python
+    parser.add_argument("--mutants", type=Path, metavar="TOML",
+                        help="run the exact-text mutants in TOML, each on a scratch copy of the model (cut 6)")
+    parser.add_argument("--list-mutants", type=Path, metavar="TOML",
+                        help="validate TOML against the current sources and print its mutant names as JSON")
+    parser.add_argument("--mutant", help="with --mutants or --list-mutants, only the mutant of this name")
+```
+
+  and right after `args = parser.parse_args(argv)`:
+
+```python
+    if args.mutant is not None and args.mutants is None and args.list_mutants is None:
+        print("run.py: --mutant requires --mutants or --list-mutants", file=sys.stderr)
+        return 2
+    if args.mutants is not None or args.list_mutants is not None:
+        return mutants_main(args.mutants or args.list_mutants, args.mutant, listing=args.list_mutants is not None)
+```
+
+- [ ] **Step 4: one-shot the existing seed.** In `algorithm.txt` replace `             await SEED_FS_LOCK_WITHOUT_HANDLE;` with `             await SEED_FS_LOCK_WITHOUT_HANDLE /\ LockImpliesHandle(fs);` and add, above it, `             \* Fires once (cut 6, revision 3): enabled in every state it let a gutted FsOk run past 65 million states.` Regenerate; `--check-translation` → exit 0.
+
+- [ ] **Step 5: the manifest** `models/lockproto/mutants.toml`, with a header comment explaining it (one paragraph: what an entry is, `run.py --mutants`, the CI workflow, and that `old` must occur exactly once), then one `[[mutant]]` per mutant of Tasks 3, 4 and 5 - translated by revision 3's rule, `old` copied from the CURRENT sources:
+  - `t3-torn-judged-foreign` (Task 3 M-a; `recovery-posix-witness-NeverTornRead.cfg`; `expect_absent = "NeverTornRead"`)
+  - `t3-no-seenrec` (Task 3 M-b; same config and expectation)
+  - `t4-replacedlive-unguarded` (Task 4 M-a; `recovery-posix-check.cfg`; `expect_present = "ReplacedOnlyDead"`)
+  - `t4-replacedlive-never-set` (Task 4 M-b; `recovery-posix-seeded-SEED_RECOVER_LIVE.cfg`; `expect_absent = "ReplacedOnlyDead"`)
+  - `t5-flip-hostcrash-compare` (Task 5 Step 4; `recovery-posix-hostcrash-control-check.cfg`; `expect_present = "NeverHostCrashChangedLock"`)
+  - `t5-fsinvariants-true` (Task 5 Step 5; `FsModel.tla`; `recovery-posix-seeded-SEED_FS_LOCK_WITHOUT_HANDLE.cfg`; `expect_absent = "FsOk"`)
+  - `t5-no-past-conjunct` (Task 5 Step 9; `FsModel.tla`; `recovery-posix-seeded-SEED_FS_PAST_UNALLOCATED.cfg`; `expect_absent = "FsOk"`)
+
+- [ ] **Step 6: the workflow** `.github/workflows/model-mutants.yml`:
+
+```yaml
+name: Model mutants
+
+# Cut 6, revision 3: each entry of models/lockproto/mutants.toml applies one exact-text mutant to a scratch copy
+# of the model, runs TLC on one config, and checks what it reports (`run.py --mutants`). Manual only: it is a
+# measurement of the model's checking net, run when the net changes, not a per-commit gate.
+on:
+  # A push that changes the manifest, the runner or this workflow runs every mutant: GitHub dispatches a
+  # workflow_dispatch workflow only once it exists on the default branch, so a branch that adds this file
+  # needs the push trigger to run it at all (independent review of this plan, LI-1).
+  push:
+    paths:
+      - models/lockproto/mutants.toml
+      - models/lockproto/run.py
+      - .github/workflows/model-mutants.yml
+  workflow_dispatch:
+    inputs:
+      mutant:
+        description: "run only the mutant of this name (empty: all)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: List the mutants
+        id: plan
+        env:
+          ONLY: ${{ inputs.mutant }}
+        run: |
+          set -euo pipefail
+          if [ -n "$ONLY" ]; then
+            matrix=$(python models/lockproto/run.py --list-mutants models/lockproto/mutants.toml --mutant "$ONLY")
+          else
+            matrix=$(python models/lockproto/run.py --list-mutants models/lockproto/mutants.toml)
+          fi
+          echo "matrix=$matrix"
+          { echo "matrix<<MATRIX_EOF"; echo "$matrix"; echo "MATRIX_EOF"; } >> "$GITHUB_OUTPUT"
+
+  mutant:
+    name: Mutant ${{ matrix.name }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        name: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Run the mutant
+        env:
+          NAME: ${{ matrix.name }}
+        run: python -u models/lockproto/run.py --mutants models/lockproto/mutants.toml --mutant "$NAME"
+      - name: Upload TLC output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutant-${{ matrix.name }}
+          path: target/tla/mutants/
+```
+
+- [ ] **Step 7: gates.** `just model-test` → `OK` (the five new tests pass); `python models/lockproto/run.py --list-mutants models/lockproto/mutants.toml` → exit 0 and prints the seven names; `--check-translation` → exit 0; `--list-jobs` → exit 0; `just lint-workflows` → exit 0 (actionlint; `just check` does not run it, `justfile:38-39`, `:46`); `just check` → exit 0.
+- [ ] **Step 8: commit** `run.py`, `test_run.py`, `algorithm.txt`, `LockProtocol.tla`, `mutants.toml`, `.github/workflows/model-mutants.yml`: `model: run the model's mutants on CI from an exact-text manifest (cut 6, revision 3)`.
+
+---
+
 ### Task 6: `FsOk`'s other conjuncts (item 7)
 
 - [ ] **Step 0: verify** the Task 5 past-seed block is followed by `\* Nothing crashes after all`; `rg -n "DirLockName" algorithm.txt` shows only `:205`'s `FsLookup(fs, P, DirLockName)` (its entry is read nowhere else). If it shows another read, STOP.
@@ -547,7 +939,7 @@ NeverSecondPastId == \A d \in Dirs, c \in Classes : Cardinality(fs.past[d][c]) <
 ### Task 14: Part 1 verification
 
 - [ ] **Step 1:** `--check-translation`, `--list-jobs`, `just model-test`, `just check` → all pass; `git status --short` clean.
-- [ ] **Step 2: STOP.** The full Model workflow (every scenario, both tiers) needs a pushed ref; pushing is the owner's decision. Report ready for the CI run.
+- [ ] **Step 2 (driver, owner-approved 2026-09-29):** push `spec/seq-after-cut5` (a branch push, no PR). The push itself runs `Model mutants` (its push trigger; it cannot be dispatched until it is on `main`). Dispatch `Model` (`gh workflow run model.yml --ref spec/seq-after-cut5`) and `Model (extended)` (`model-extended.yml`), which already exist on `main`; read every job's result. A run that mismatches its expectation, or a mutant NOT KILLED, reopens its task.
 
 ### Task 15: state counts (after the CI run)
 
