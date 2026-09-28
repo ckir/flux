@@ -1089,7 +1089,8 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
            }
            or {
              \* The whole host goes down.
-             await HostCrashes /\ crashes < MaxCrashes;
+             \* HostCrashAtDurableOnly (cut 6, item 6's negative control): crash only when nothing is unflushed.
+             await HostCrashes /\ crashes < MaxCrashes /\ (~HostCrashAtDurableOnly \/ (Unflushed(fs) = {} /\ \A d \in Dirs : fs.dentries[d] = fs.entries[d]));
              \* Each in-flight call lands or is dropped at the crash (Section 5.2): at most one issued release unlink
              \* can still name the lock file, so choosing one lander, or none, covers every outcome. What landed is
              \* unflushed, so the host crash can undo it.
@@ -1141,6 +1142,13 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
              };
            }
            or {
+             \* SEEDED ONLY: a name's past gains an id never allocated, which IdsNotReused's past conjunct
+             \* forbids (cut 6, items 6-7). Fires once (it disables itself), and is inert to the protocol under
+             \* strong identity: `past` is read only when IdentityStrength = "weak" (FsModel.tla).
+             await SEED_FS_PAST_UNALLOCATED /\ fs.next < MaxObjs /\ fs.past[P][ClassOf(LockName)] \subseteq 1..fs.next;
+             fs := [fs EXCEPT !.past[P][ClassOf(LockName)] = @ \cup {fs.next + 1}];
+           }
+           or {
              \* Nothing crashes after all: the environment may simply stop.
              goto env_done;
            };
@@ -1149,7 +1157,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "13027078" /\ chksum(tla) = "9951f3fe")
+\* BEGIN TRANSLATION (chksum(pcal) = "c91f6b11" /\ chksum(tla) = "f432efda")
 \* Procedure variable obj of procedure Classify at line 199 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
@@ -3364,7 +3372,7 @@ env_loop == /\ pc["env"] = "env_loop"
                                       /\ crashes' = crashes + 1
                              /\ pc' = [pc EXCEPT !["env"] = "env_loop"]
                              /\ UNCHANGED <<hostCrashChangedLock, leases>>
-                          \/ /\ HostCrashes /\ crashes < MaxCrashes
+                          \/ /\ HostCrashes /\ crashes < MaxCrashes /\ (~HostCrashAtDurableOnly \/ (Unflushed(fs) = {} /\ \A d \in Dirs : fs.dentries[d] = fs.entries[d]))
                              /\ \E lander \in {NoProc} \cup {q \in Procs : live[q]}:
                                   \E c \in FsUnlinkChoices:
                                     \E pick \in HostCrashPicks(LandUnlink(fs, lander, c)):
@@ -3398,6 +3406,10 @@ env_loop == /\ pc["env"] = "env_loop"
                           \/ /\ SEED_FS_ALIEN_CONTENT
                              /\ \E o \in {x \in Objs : fs.content[x] # NoContent}:
                                   fs' = [fs EXCEPT !.content[o] = NoProc]
+                             /\ pc' = [pc EXCEPT !["env"] = "env_loop"]
+                             /\ UNCHANGED <<crashed, holding, checked, writing, pendingUnlink, checkStale, writeStale, lostLock, landedAfterTakeover, hostCrashChangedLock, crashes, leases>>
+                          \/ /\ SEED_FS_PAST_UNALLOCATED /\ fs.next < MaxObjs /\ fs.past[P][ClassOf(LockName)] \subseteq 1..fs.next
+                             /\ fs' = [fs EXCEPT !.past[P][ClassOf(LockName)] = @ \cup {fs.next + 1}]
                              /\ pc' = [pc EXCEPT !["env"] = "env_loop"]
                              /\ UNCHANGED <<crashed, holding, checked, writing, pendingUnlink, checkStale, writeStale, lostLock, landedAfterTakeover, hostCrashChangedLock, crashes, leases>>
                           \/ /\ pc' = [pc EXCEPT !["env"] = "env_done"]

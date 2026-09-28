@@ -1008,7 +1008,8 @@
            }
            or {
              \* The whole host goes down.
-             await HostCrashes /\ crashes < MaxCrashes;
+             \* HostCrashAtDurableOnly (cut 6, item 6's negative control): crash only when nothing is unflushed.
+             await HostCrashes /\ crashes < MaxCrashes /\ (~HostCrashAtDurableOnly \/ (Unflushed(fs) = {} /\ \A d \in Dirs : fs.dentries[d] = fs.entries[d]));
              \* Each in-flight call lands or is dropped at the crash (Section 5.2): at most one issued release unlink
              \* can still name the lock file, so choosing one lander, or none, covers every outcome. What landed is
              \* unflushed, so the host crash can undo it.
@@ -1058,6 +1059,13 @@
              with (o \in {x \in Objs : fs.content[x] # NoContent}) {
                fs := [fs EXCEPT !.content[o] = NoProc];
              };
+           }
+           or {
+             \* SEEDED ONLY: a name's past gains an id never allocated, which IdsNotReused's past conjunct
+             \* forbids (cut 6, items 6-7). Fires once (it disables itself), and is inert to the protocol under
+             \* strong identity: `past` is read only when IdentityStrength = "weak" (FsModel.tla).
+             await SEED_FS_PAST_UNALLOCATED /\ fs.next < MaxObjs /\ fs.past[P][ClassOf(LockName)] \subseteq 1..fs.next;
+             fs := [fs EXCEPT !.past[P][ClassOf(LockName)] = @ \cup {fs.next + 1}];
            }
            or {
              \* Nothing crashes after all: the environment may simply stop.
