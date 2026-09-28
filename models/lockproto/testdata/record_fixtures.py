@@ -42,6 +42,8 @@ COVERAGE_CASES = {
     "smoke_check_coverage": ("Smoke", HERE.parent / "configs" / "selftest-check.cfg", HERE.parent, True),
     "smoke_seeded_coverage": ("Smoke", HERE.parent / "configs" / "selftest-seeded-SEED_OVERSHOOT.cfg",
                               HERE.parent, False),
+    # Cut 6, item 1: arms inside actions, a second module's LET/CASE, one operator at two call sites.
+    "arm_coverage": ("ArmFixture", HERE / "ArmFixture.cfg", HERE, True),
 }
 
 _BLOCK = re.compile(
@@ -135,6 +137,7 @@ def main() -> int:
     coverage_output = record_coverage_case(jar, "coverage", *COVERAGE_CASES["coverage"])
     smoke_output = record_coverage_case(jar, "smoke_check_coverage", *COVERAGE_CASES["smoke_check_coverage"])
     record_coverage_case(jar, "smoke_seeded_coverage", *COVERAGE_CASES["smoke_seeded_coverage"])
+    record_coverage_case(jar, "arm_coverage", *COVERAGE_CASES["arm_coverage"])
     build_two_block_fixture(coverage_output, smoke_output)
     return 0
 
