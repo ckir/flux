@@ -1069,6 +1069,23 @@
              fs := [fs EXCEPT !.past[P][ClassOf(LockName)] = @ \cup {fs.next + 1}];
            }
            or {
+             \* SEEDED ONLY: a second handle record for a process and object it already has open, differing
+             \* only in `del`, which NoDoubleOpen forbids (cut 6, item 7). Fires once. On POSIX the protocol
+             \* cannot produce this: `share` forces del = TRUE, so a real double open collapses into one record
+             \* (a residue in TODO.md).
+             await SEED_FS_DOUBLE_HANDLE /\ NoDoubleOpen(fs);
+             with (h \in fs.handles) {
+               fs := [fs EXCEPT !.handles = @ \cup {[h EXCEPT !.del = ~h.del]}];
+             };
+           }
+           or {
+             \* SEEDED ONLY: an entry names an id never allocated, which IdsNotReused's entries conjunct forbids
+             \* (cut 6, item 7). Fires once. DirLockName's entry, because its only reader diverts to the backoff
+             \* label: the lock path and any Foreign start object are untouched.
+             await SEED_FS_ENTRY_UNALLOCATED /\ fs.next < MaxObjs /\ fs.entries[P][ClassOf(DirLockName)] = NoObj;
+             fs := [fs EXCEPT !.entries[P][ClassOf(DirLockName)] = fs.next + 1];
+           }
+           or {
              \* Nothing crashes after all: the environment may simply stop.
              goto env_done;
            };

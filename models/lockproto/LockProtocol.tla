@@ -1150,6 +1150,23 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
              fs := [fs EXCEPT !.past[P][ClassOf(LockName)] = @ \cup {fs.next + 1}];
            }
            or {
+             \* SEEDED ONLY: a second handle record for a process and object it already has open, differing
+             \* only in `del`, which NoDoubleOpen forbids (cut 6, item 7). Fires once. On POSIX the protocol
+             \* cannot produce this: `share` forces del = TRUE, so a real double open collapses into one record
+             \* (a residue in TODO.md).
+             await SEED_FS_DOUBLE_HANDLE /\ NoDoubleOpen(fs);
+             with (h \in fs.handles) {
+               fs := [fs EXCEPT !.handles = @ \cup {[h EXCEPT !.del = ~h.del]}];
+             };
+           }
+           or {
+             \* SEEDED ONLY: an entry names an id never allocated, which IdsNotReused's entries conjunct forbids
+             \* (cut 6, item 7). Fires once. DirLockName's entry, because its only reader diverts to the backoff
+             \* label: the lock path and any Foreign start object are untouched.
+             await SEED_FS_ENTRY_UNALLOCATED /\ fs.next < MaxObjs /\ fs.entries[P][ClassOf(DirLockName)] = NoObj;
+             fs := [fs EXCEPT !.entries[P][ClassOf(DirLockName)] = fs.next + 1];
+           }
+           or {
              \* Nothing crashes after all: the environment may simply stop.
              goto env_done;
            };
@@ -1158,7 +1175,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "280d8508" /\ chksum(tla) = "62d2c9e5")
+\* BEGIN TRANSLATION (chksum(pcal) = "de5be7d1" /\ chksum(tla) = "4dd54cfb")
 \* Procedure variable obj of procedure Classify at line 199 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
@@ -3411,6 +3428,15 @@ env_loop == /\ pc["env"] = "env_loop"
                              /\ UNCHANGED <<crashed, holding, checked, writing, pendingUnlink, checkStale, writeStale, lostLock, landedAfterTakeover, hostCrashChangedLock, crashes, leases>>
                           \/ /\ SEED_FS_PAST_UNALLOCATED /\ fs.next < MaxObjs /\ fs.past[P][ClassOf(LockName)] \subseteq 1..fs.next
                              /\ fs' = [fs EXCEPT !.past[P][ClassOf(LockName)] = @ \cup {fs.next + 1}]
+                             /\ pc' = [pc EXCEPT !["env"] = "env_loop"]
+                             /\ UNCHANGED <<crashed, holding, checked, writing, pendingUnlink, checkStale, writeStale, lostLock, landedAfterTakeover, hostCrashChangedLock, crashes, leases>>
+                          \/ /\ SEED_FS_DOUBLE_HANDLE /\ NoDoubleOpen(fs)
+                             /\ \E h \in fs.handles:
+                                  fs' = [fs EXCEPT !.handles = @ \cup {[h EXCEPT !.del = ~h.del]}]
+                             /\ pc' = [pc EXCEPT !["env"] = "env_loop"]
+                             /\ UNCHANGED <<crashed, holding, checked, writing, pendingUnlink, checkStale, writeStale, lostLock, landedAfterTakeover, hostCrashChangedLock, crashes, leases>>
+                          \/ /\ SEED_FS_ENTRY_UNALLOCATED /\ fs.next < MaxObjs /\ fs.entries[P][ClassOf(DirLockName)] = NoObj
+                             /\ fs' = [fs EXCEPT !.entries[P][ClassOf(DirLockName)] = fs.next + 1]
                              /\ pc' = [pc EXCEPT !["env"] = "env_loop"]
                              /\ UNCHANGED <<crashed, holding, checked, writing, pendingUnlink, checkStale, writeStale, lostLock, landedAfterTakeover, hostCrashChangedLock, crashes, leases>>
                           \/ /\ pc' = [pc EXCEPT !["env"] = "env_done"]

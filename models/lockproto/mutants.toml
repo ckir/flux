@@ -74,3 +74,22 @@ new = """
     /\\ \\A d \\in Dirs, c \\in Classes : fs.entries[d][c] \\in (1..fs.next) \\cup {NoObj}"""
 config = "configs/recovery-posix-seeded-SEED_FS_PAST_UNALLOCATED.cfg"
 expect_absent = "FsOk"
+
+[[mutant]]
+name = "t6-no-double-open"
+file = "FsModel.tla"
+old = "FsInvariants(fs) == NoDoubleOpen(fs) /\\ LockImpliesHandle(fs) /\\ IdsNotReused(fs)"
+new = "FsInvariants(fs) == LockImpliesHandle(fs) /\\ IdsNotReused(fs)"
+config = "configs/recovery-posix-seeded-SEED_FS_DOUBLE_HANDLE.cfg"
+expect_absent = "FsOk"
+
+[[mutant]]
+name = "t6-no-entries-conjunct"
+file = "FsModel.tla"
+old = """
+    /\\ \\A d \\in Dirs, c \\in Classes : fs.past[d][c] \\subseteq 1..fs.next
+    /\\ \\A d \\in Dirs, c \\in Classes : fs.entries[d][c] \\in (1..fs.next) \\cup {NoObj}"""
+new = """
+    /\\ \\A d \\in Dirs, c \\in Classes : fs.past[d][c] \\subseteq 1..fs.next"""
+config = "configs/recovery-posix-seeded-SEED_FS_ENTRY_UNALLOCATED.cfg"
+expect_absent = "FsOk"

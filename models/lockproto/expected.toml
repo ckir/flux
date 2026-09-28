@@ -89,6 +89,26 @@ constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanu
 timeout_minutes = 20
 
 [[run]]
+name = "recovery-posix-seeded-SEED_FS_DOUBLE_HANDLE"
+module = "LockProtocol"
+config = "configs/recovery-posix-seeded-SEED_FS_DOUBLE_HANDLE.cfg"
+scenario = "recovery"
+kind = "seeded"
+violated = ["FsOk"]
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false, SEED_FS_LOCK_WITHOUT_HANDLE = false, SEED_FS_ALIEN_CONTENT = false, SEED_CHECK_REFUSES_UNTOUCHED = false, SEED_RECOVER_LIVE = false, SEED_FS_PAST_UNALLOCATED = false, SEED_FS_DOUBLE_HANDLE = true, SEED_FS_ENTRY_UNALLOCATED = false, SEED_FS_ALIEN_RECORD = false, SEED_RECOVERER_GIVES_UP = false, SEED_RELEASE_CHECK_REFUSES_UNTOUCHED = false, SEED_RESTART_CHECK_REFUSES_UNTOUCHED = false, SEED_TAKEOVER_FOREIGN = false, HostCrashAtDurableOnly = false }
+timeout_minutes = 20
+
+[[run]]
+name = "recovery-posix-seeded-SEED_FS_ENTRY_UNALLOCATED"
+module = "LockProtocol"
+config = "configs/recovery-posix-seeded-SEED_FS_ENTRY_UNALLOCATED.cfg"
+scenario = "recovery"
+kind = "seeded"
+violated = ["FsOk"]
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false, SEED_FS_LOCK_WITHOUT_HANDLE = false, SEED_FS_ALIEN_CONTENT = false, SEED_CHECK_REFUSES_UNTOUCHED = false, SEED_RECOVER_LIVE = false, SEED_FS_PAST_UNALLOCATED = false, SEED_FS_DOUBLE_HANDLE = false, SEED_FS_ENTRY_UNALLOCATED = true, SEED_FS_ALIEN_RECORD = false, SEED_RECOVERER_GIVES_UP = false, SEED_RELEASE_CHECK_REFUSES_UNTOUCHED = false, SEED_RESTART_CHECK_REFUSES_UNTOUCHED = false, SEED_TAKEOVER_FOREIGN = false, HostCrashAtDurableOnly = false }
+timeout_minutes = 20
+
+[[run]]
 name = "recovery-posix-seeded-SEED_FS_PAST_UNALLOCATED"
 module = "LockProtocol"
 config = "configs/recovery-posix-seeded-SEED_FS_PAST_UNALLOCATED.cfg"
