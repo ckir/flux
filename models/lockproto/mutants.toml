@@ -1,0 +1,76 @@
+# Exact-text mutants of the lock-protocol model (cut 6, revision 3). Each `[[mutant]]` entry names a
+# source file, the exact CURRENT text it edits (`old`, which must occur exactly once in that file), the
+# mutated text (`new`), the one config the mutant is targeted against, and what a killed mutant's TLC
+# run must report: `expect_present` for a check config (the mutation must make it VIOLATE that
+# invariant or property), or `expect_absent` for a seeded or witness config (the mutation must make it
+# STOP reporting the name its seed or witness exists to show). `python run.py --mutants mutants.toml`
+# applies each mutant to a scratch copy of the model - the repository itself is never touched - runs
+# TLC on its config, and judges the outcome; `--list-mutants` validates the manifest and its `old` text
+# against the CURRENT sources without running TLC. The GitHub workflow `model-mutants.yml` runs every
+# entry here, one per CI job, on a push that touches this file, `run.py`, or the workflow itself, or on
+# `workflow_dispatch`. A tooling failure (a parse error, a TLC error, a timeout) is never a kill.
+
+[[mutant]]
+name = "t3-torn-judged-foreign"
+file = "algorithm.txt"
+old = "             classified[self] := \"uncertain\";"
+new = "             classified[self] := IF seen = Torn THEN \"foreign\" ELSE \"uncertain\";"
+config = "configs/recovery-posix-witness-NeverTornRead.cfg"
+expect_absent = "NeverTornRead"
+
+[[mutant]]
+name = "t3-no-seenrec"
+file = "algorithm.txt"
+old = """
+             seenRec[self] := seen;
+             if ((seen = Torn /\\ ~SEED_TORN_AS_FOREIGN) \\/ seen = EmptyFile) {"""
+new = """
+             if ((seen = Torn /\\ ~SEED_TORN_AS_FOREIGN) \\/ seen = EmptyFile) {"""
+config = "configs/recovery-posix-witness-NeverTornRead.cfg"
+expect_absent = "NeverTornRead"
+
+[[mutant]]
+name = "t4-replacedlive-unguarded"
+file = "algorithm.txt"
+old = "           if (victim \\in Procs) { if (~crashed[victim]) { replacedLive := TRUE; }; };"
+new = "           if (victim \\in Procs) { replacedLive := TRUE; };"
+config = "configs/recovery-posix-check.cfg"
+expect_present = "ReplacedOnlyDead"
+
+[[mutant]]
+name = "t4-replacedlive-never-set"
+file = "algorithm.txt"
+old = """
+           if (victim \\in Procs) { if (~crashed[victim]) { replacedLive := TRUE; }; };
+           goto S240_3_release;"""
+new = """
+           goto S240_3_release;"""
+config = "configs/recovery-posix-seeded-SEED_RECOVER_LIVE.cfg"
+expect_absent = "ReplacedOnlyDead"
+
+[[mutant]]
+name = "t5-flip-hostcrash-compare"
+file = "algorithm.txt"
+old = "hostCrashChangedLock := (hostCrashChangedLock \\/ At(FsHostCrash(LandUnlink(fs, lander, c), pick, dirs), P, LockName) # At(LandUnlink(fs, lander, c), P, LockName));"
+new = "hostCrashChangedLock := (hostCrashChangedLock \\/ At(FsHostCrash(LandUnlink(fs, lander, c), pick, dirs), P, LockName) = At(LandUnlink(fs, lander, c), P, LockName));"
+config = "configs/recovery-posix-hostcrash-control-check.cfg"
+expect_present = "NeverHostCrashChangedLock"
+
+[[mutant]]
+name = "t5-fsinvariants-true"
+file = "FsModel.tla"
+old = "FsInvariants(fs) == NoDoubleOpen(fs) /\\ LockImpliesHandle(fs) /\\ IdsNotReused(fs)"
+new = "FsInvariants(fs) == TRUE"
+config = "configs/recovery-posix-seeded-SEED_FS_LOCK_WITHOUT_HANDLE.cfg"
+expect_absent = "FsOk"
+
+[[mutant]]
+name = "t5-no-past-conjunct"
+file = "FsModel.tla"
+old = """
+    /\\ \\A d \\in Dirs, c \\in Classes : fs.past[d][c] \\subseteq 1..fs.next
+    /\\ \\A d \\in Dirs, c \\in Classes : fs.entries[d][c] \\in (1..fs.next) \\cup {NoObj}"""
+new = """
+    /\\ \\A d \\in Dirs, c \\in Classes : fs.entries[d][c] \\in (1..fs.next) \\cup {NoObj}"""
+config = "configs/recovery-posix-seeded-SEED_FS_PAST_UNALLOCATED.cfg"
+expect_absent = "FsOk"

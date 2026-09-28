@@ -2140,5 +2140,88 @@ class PartialCoverageTests(unittest.TestCase):
             self.assertIn(name, out.getvalue())
 
 
+class MutantManifestTests(unittest.TestCase):
+    """run.py --mutants (cut 6, revision 3): exact-text mutants of the model, run on CI."""
+
+    def _write(self, body: str) -> tuple[Path, Path]:
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        tmp = Path(holder.name)
+        (tmp / "configs").mkdir()
+        (tmp / "configs" / "x.cfg").write_text("SPECIFICATION Spec\nINVARIANT A\n", encoding="utf-8")
+        manifest = tmp / "mutants.toml"
+        manifest.write_text(textwrap.dedent(body), encoding="utf-8")
+        return manifest, tmp
+
+    VALID = '''
+        [[mutant]]
+        name = "t9-demo"
+        file = "invariants.txt"
+        old = "A == TRUE"
+        new = "A == FALSE"
+        config = "configs/x.cfg"
+        expect_absent = "A"
+        '''
+
+    def test_a_valid_entry_loads(self) -> None:
+        manifest, base = self._write(self.VALID)
+        (m,) = run.load_mutants(manifest, base)
+        self.assertEqual((m.name, m.file, m.config, m.present, m.absent, m.timeout_minutes),
+                         ("t9-demo", "invariants.txt", "configs/x.cfg", None, "A", 60))
+
+    def test_each_malformed_entry_fails_at_load(self) -> None:
+        cases = {
+            "unknown key": self.VALID + 'extra = "no"\n',
+            "both expectations": self.VALID + 'expect_present = "B"\n',
+            "neither expectation": self.VALID.replace('expect_absent = "A"', ""),
+            "not a model source": self.VALID.replace('"invariants.txt"', '"run.py"'),
+            "missing config": self.VALID.replace("configs/x.cfg", "configs/missing.cfg"),
+            "old equals new": self.VALID.replace('new = "A == FALSE"', 'new = "A == TRUE"'),
+            "duplicate name": self.VALID + self.VALID,
+            "bad name": self.VALID.replace('"t9-demo"', '"T9 Demo"'),
+            # A misspelled expect_absent could never be reported, so every run would count as a kill.
+            "name not in config": self.VALID.replace('expect_absent = "A"', 'expect_absent = "Z"'),
+        }
+        for label, body in cases.items():
+            with self.subTest(label):
+                manifest, base = self._write(body)
+                with self.assertRaises(run.ExpectedError):
+                    run.load_mutants(manifest, base)
+
+    def test_old_must_occur_exactly_once(self) -> None:
+        manifest, base = self._write(self.VALID)
+        (m,) = run.load_mutants(manifest, base)
+        self.assertEqual(run.apply_mutant("X\nA == TRUE\nY\n", m), "X\nA == FALSE\nY\n")
+        for text, count in (("nothing here\n", 0), ("A == TRUE\nA == TRUE\n", 2)):
+            with self.subTest(count=count):
+                with self.assertRaises(run.ExpectedError) as err:
+                    run.apply_mutant(text, m)
+                self.assertIn(f"occurs {count} times", str(err.exception))
+
+    def test_judging_what_the_mutated_run_reported(self) -> None:
+        manifest, base = self._write(self.VALID)
+        (absent,) = run.load_mutants(manifest, base)
+        present = run.Mutant("t9-p", "invariants.txt", "a", "b", "configs/x.cfg", "A", None, 60)
+        ok = lambda observed: run.Outcome(None, frozenset(observed), 10, ())
+        bad = run.Outcome("TLC error 1000: boom", frozenset(), None, ())
+        self.assertTrue(run.judge_mutant(absent, ok([]))[0], "no error: the mutant stopped A reporting")
+        self.assertTrue(run.judge_mutant(absent, ok(["B"]))[0], "another invariant: still a kill")
+        self.assertFalse(run.judge_mutant(absent, ok(["A"]))[0], "A still reported: survived")
+        self.assertTrue(run.judge_mutant(present, ok(["A"]))[0])
+        self.assertFalse(run.judge_mutant(present, ok([]))[0])
+        for m in (absent, present):
+            killed, detail = run.judge_mutant(m, bad)
+            self.assertFalse(killed, "a tooling error is never a kill")
+            self.assertIn("tooling", detail)
+
+    def test_the_committed_manifest_is_valid_against_the_current_sources(self) -> None:
+        mutants = run.load_mutants(run.HERE / "mutants.toml", run.HERE)
+        self.assertTrue(mutants)
+        for m in mutants:
+            with self.subTest(m.name):
+                text = (run.HERE / m.file).read_text(encoding="utf-8").replace("\r\n", "\n")
+                run.apply_mutant(text, m)  # raises if 'old' is stale or ambiguous
+
+
 if __name__ == "__main__":
     unittest.main()

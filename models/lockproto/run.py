@@ -698,6 +698,161 @@ def check_translation(base: Path) -> int:
     return 1
 
 
+# Exact-text mutants of the model (cut 6, revision 3): each is applied to a scratch copy, the one config it names
+# is run, and what TLC reports is judged. Positional patches would drift as later edits move the lines; an exact
+# `old` text either still occurs exactly once or fails loudly as stale.
+MUTANT_KEYS = frozenset({"name", "file", "old", "new", "config", "expect_present", "expect_absent", "timeout_minutes"})
+MUTANT_FILES = (*SOURCES, "FsModel.tla")
+MUTANTS_OUT = TARGET / "mutants"
+
+
+@dataclass(frozen=True)
+class Mutant:
+    name: str
+    file: str
+    old: str
+    new: str
+    config: str
+    present: str | None  # the mutated run must REPORT this violated (a check config)
+    absent: str | None   # the mutated run must NOT report this (a seeded or witness config)
+    timeout_minutes: int
+
+
+def load_mutants(path: Path, base: Path) -> list[Mutant]:
+    """Parse and validate a mutants manifest. Unknown keys, a missing field, both or neither expectation, a file
+    that is not a model source, a config that does not exist, or a duplicate name all fail at load."""
+    try:
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as err:
+        raise ExpectedError(f"{path}: {err}") from err
+    _require(set(raw) <= {"mutant"}, f"{path}: only [[mutant]] tables are allowed")
+    entries = raw.get("mutant", [])
+    _require(isinstance(entries, list) and len(entries) > 0, f"{path}: no [[mutant]] entries")
+    mutants: list[Mutant] = []
+    seen: set[str] = set()
+    for i, e in enumerate(entries):
+        where = f"{path}: mutant {i + 1}"
+        _require(isinstance(e, dict), f"{where}: not a table")
+        unknown = set(e) - MUTANT_KEYS
+        _require(not unknown, f"{where}: unknown keys {sorted(unknown)}")
+        for key in ("name", "file", "old", "new", "config"):
+            _require(isinstance(e.get(key), str) and e[key] != "", f"{where}: '{key}' must be a non-empty string")
+        name = e["name"]
+        where = f"{path}: mutant '{name}'"
+        _require(re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", name) is not None,
+                 f"{where}: a name is lower-case words joined by '-'")
+        _require(name not in seen, f"{where}: duplicate name")
+        seen.add(name)
+        _require(e["file"] in MUTANT_FILES, f"{where}: file must be one of {', '.join(MUTANT_FILES)}")
+        _require(e["old"] != e["new"], f"{where}: 'new' equals 'old'")
+        _require((base / e["config"]).is_file(), f"{where}: config {e['config']} does not exist")
+        present, absent = e.get("expect_present"), e.get("expect_absent")
+        _require((present is None) != (absent is None), f"{where}: exactly one of expect_present and expect_absent")
+        # The name must be one the config checks: a misspelled expect_absent could never be reported, so
+        # every run would be judged a kill (independent review of this plan, MG-1).
+        cfg_text = (base / e["config"]).read_text(encoding="utf-8")
+        checked = [t for t in cfg_sections(cfg_text).get("INVARIANT", []) if IDENT.fullmatch(t)] + cfg_properties(cfg_text)
+        for key, value in (("expect_present", present), ("expect_absent", absent)):
+            _require(value is None or (isinstance(value, str) and value in checked),
+                     f"{where}: {key} must be an invariant or property that {e['config']} checks")
+        timeout = e.get("timeout_minutes", 60)
+        _require(isinstance(timeout, int) and not isinstance(timeout, bool) and 1 <= timeout <= 170,
+                 f"{where}: timeout_minutes must be an integer from 1 to 170")
+        mutants.append(Mutant(name, e["file"], e["old"], e["new"], e["config"], present, absent, timeout))
+    return mutants
+
+
+def apply_mutant(text: str, mutant: Mutant) -> str:
+    """The mutated source. `old` must occur EXACTLY once: absent means the manifest is stale, twice ambiguous."""
+    count = text.count(mutant.old)
+    if count != 1:
+        raise ExpectedError(f"mutant '{mutant.name}': 'old' occurs {count} times in {mutant.file} (must be exactly once)")
+    return text.replace(mutant.old, mutant.new, 1)
+
+
+def judge_mutant(mutant: Mutant, outcome: Outcome) -> tuple[bool, str]:
+    """Killed or not, with the reason. A tooling error - a TLC error, no Finished message - is never a kill."""
+    if outcome.tooling_error is not None:
+        return False, f"tooling: {outcome.tooling_error}"
+    reported = ", ".join(sorted(outcome.observed)) or "no error"
+    if mutant.present is not None:
+        return mutant.present in outcome.observed, f"expected {mutant.present} violated; reported: {reported}"
+    return mutant.absent not in outcome.observed, f"expected {mutant.absent} NOT reported; reported: {reported}"
+
+
+def run_mutant(mutant: Mutant, jar: Path, base: Path) -> tuple[bool, str]:
+    """Apply one mutant to a scratch copy of the model, regenerate LockProtocol.tla there, run TLC on its one
+    config, and judge. The repository is never modified, so there is nothing to revert."""
+    MUTANTS_OUT.mkdir(parents=True, exist_ok=True)
+    log = MUTANTS_OUT / f"{mutant.name}.log"
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        for name in MUTANT_FILES:
+            shutil.copyfile(base / name, work / name)
+        shutil.copytree(base / "configs", work / "configs")
+        source = work / mutant.file
+        source.write_text(apply_mutant(source.read_text(encoding="utf-8").replace("\r\n", "\n"), mutant),
+                          encoding="utf-8")
+        target = work / "LockProtocol.tla"
+        target.write_text("".join((work / n).read_text(encoding="utf-8") for n in SOURCES), encoding="utf-8")
+        trans = subprocess.run(["java", "-cp", str(jar), "pcal.trans", str(target)], capture_output=True, text=True)
+        if trans.returncode != 0:
+            return False, f"tooling: pcal.trans failed: {(trans.stdout + trans.stderr).strip()[-300:]}"
+        cmd = ["java", "-XX:+UseParallelGC", "-cp", str(jar), "tlc2.TLC", "-tool", "-workers", "auto",
+               "-metadir", str(work / "states"), "-config", str(work / mutant.config)]
+        if mutant.present is not None:
+            cmd.append("-continue")  # a check config: another invariant firing first must not hide this one
+        cmd.append("LockProtocol")
+        with log.open("w", encoding="utf-8") as out:
+            proc = subprocess.Popen(cmd, cwd=work, stdout=out, stderr=subprocess.STDOUT)
+            try:
+                code = proc.wait(timeout=mutant.timeout_minutes * 60)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                return False, f"tooling: TIMEOUT after {mutant.timeout_minutes} min"
+            except BaseException:  # never leave TLC running
+                proc.kill()
+                proc.wait()
+                raise
+    output = log.read_text(encoding="utf-8", errors="replace")
+    properties = cfg_properties((base / mutant.config).read_text(encoding="utf-8"))
+    return judge_mutant(mutant, interpret(code, output, properties))
+
+
+def mutants_main(path: Path, only: str | None, listing: bool) -> int:
+    try:
+        mutants = load_mutants(path, HERE)
+        for m in mutants:  # a stale entry fails before any TLC time is spent
+            apply_mutant((HERE / m.file).read_text(encoding="utf-8").replace("\r\n", "\n"), m)
+    except ExpectedError as err:
+        print(f"run.py: {err}", file=sys.stderr)
+        return 2
+    if only is not None:
+        mutants = [m for m in mutants if m.name == only]
+        if not mutants:
+            print(f"run.py: no mutant named {only!r}", file=sys.stderr)
+            return 2
+    if listing:
+        print(json.dumps([m.name for m in mutants]))
+        return 0
+    if shutil.which("java") is None:
+        print("run.py: java is not on PATH (TLC needs Java 11 or later; CI uses Temurin 21)", file=sys.stderr)
+        return 2
+    try:
+        jar = ensure_jar()
+    except (ToolingError, OSError) as err:
+        print(f"run.py: {err}", file=sys.stderr)
+        return 2
+    failed = 0
+    for m in mutants:
+        killed, detail = run_mutant(m, jar, HERE)
+        print(f"{'KILLED    ' if killed else 'NOT KILLED'} {m.name}: {detail}", flush=True)
+        failed += not killed
+    print(f"run.py: {len(mutants) - failed} of {len(mutants)} mutants killed", flush=True)
+    return 1 if failed else 0
+
+
 def platform_of(name: str, scenario: str) -> str:
     """The platform segment of a run name: the first word after the scenario."""
     return name[len(scenario) + 1:].split("-", 1)[0]
@@ -1386,11 +1541,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--zero-branches", type=Path, metavar="DIR",
                         help="report every expression TLC evaluated zero times, from logs under DIR "
                              "(a report, not a gate)")
+    parser.add_argument("--mutants", type=Path, metavar="TOML",
+                        help="run the exact-text mutants in TOML, each on a scratch copy of the model (cut 6)")
+    parser.add_argument("--list-mutants", type=Path, metavar="TOML",
+                        help="validate TOML against the current sources and print its mutant names as JSON")
+    parser.add_argument("--mutant", help="with --mutants or --list-mutants, only the mutant of this name")
     parser.add_argument("--list-scenarios", action="store_true", help="print the scenario names as JSON")
     parser.add_argument("--list-jobs", action="store_true",
                          help="print the distinct {scenario, platform} pairs as JSON")
     args = parser.parse_args(argv)
 
+    if args.mutant is not None and args.mutants is None and args.list_mutants is None:
+        print("run.py: --mutant requires --mutants or --list-mutants", file=sys.stderr)
+        return 2
+    if args.mutants is not None or args.list_mutants is not None:
+        return mutants_main(args.mutants or args.list_mutants, args.mutant, listing=args.list_mutants is not None)
     if args.platform is not None and args.scenario is None:
         print("run.py: --platform requires --scenario", file=sys.stderr)
         return 2

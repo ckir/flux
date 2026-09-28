@@ -1128,7 +1128,8 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
              \* which is what LockImpliesHandle forbids and therefore what FsOk must catch. The
              \* protocol cannot do this - FsTryLock requires the handle - so without the seed the
              \* invariant is true by construction and indistinguishable from TRUE (test audit, TA-1).
-             await SEED_FS_LOCK_WITHOUT_HANDLE;
+             \* Fires once (cut 6, revision 3): enabled in every state it let a gutted FsOk run past 65 million states.
+             await SEED_FS_LOCK_WITHOUT_HANDLE /\ LockImpliesHandle(fs);
              with (o \in {x \in Objs : fs.oslock[x] = NoProc}, q \in {r \in Procs : ~OpenBy(fs, r, o)}) {
                fs := [fs EXCEPT !.oslock[o] = q];
              };
@@ -1157,7 +1158,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "c91f6b11" /\ chksum(tla) = "f432efda")
+\* BEGIN TRANSLATION (chksum(pcal) = "280d8508" /\ chksum(tla) = "62d2c9e5")
 \* Procedure variable obj of procedure Classify at line 199 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
@@ -3397,7 +3398,7 @@ env_loop == /\ pc["env"] = "env_loop"
                                   /\ leases' = leases + 1
                              /\ pc' = [pc EXCEPT !["env"] = "env_loop"]
                              /\ UNCHANGED <<crashed, holding, checked, writing, pendingUnlink, checkStale, writeStale, landedAfterTakeover, hostCrashChangedLock, crashes>>
-                          \/ /\ SEED_FS_LOCK_WITHOUT_HANDLE
+                          \/ /\ SEED_FS_LOCK_WITHOUT_HANDLE /\ LockImpliesHandle(fs)
                              /\ \E o \in {x \in Objs : fs.oslock[x] = NoProc}:
                                   \E q \in {r \in Procs : ~OpenBy(fs, r, o)}:
                                     fs' = [fs EXCEPT !.oslock[o] = q]
