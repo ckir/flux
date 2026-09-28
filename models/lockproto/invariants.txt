@@ -62,7 +62,11 @@ ForeignUntouched == foreignObj # NoObj => LockObj = foreignObj /\ fs.content[for
 RefusalJustified == \A p \in Procs : refused[p] = "TARGET_LOCK_BUSY" => refusedOk[p]
 
 \* The ghost witnesses, for the witness runs.
-NeverTornRead == ~tornRead
+\* A classify read found a torn record and judged it uncertain (240.4). A state predicate, not a ghost:
+\* the judgement is protocol state, so a misplaced flag cannot make the witness violated for free
+\* (cut 6, item 4). It covers the CLASSIFY read only; a takeover's read at S240_5_s5 writes neither
+\* seenRec nor classified.
+NeverTornRead == ~\E p \in Procs : seenRec[p] = Torn /\ classified[p] = "uncertain"
 \* A write issued in an earlier tenure generation landed after a later tenure began (240.5; remote scenarios).
 NeverInflightLandedAfterTakeover == ~landedAfterTakeover
 \* A process passed its Section 99 check, so SingleWriter's ghost is set (design Section 7).
