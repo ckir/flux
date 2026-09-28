@@ -4,11 +4,11 @@
 \*
 \* Safety invariants hold in every reachable state and are checked in the scenario's `check` run.
 \* Reachability is proved two ways: a step a label performs is proved by that label's TLC coverage
-\* count (design Section 4), and the two facts no single label states - a read that found a torn
-\* record, and a replaced lock that a crash had left - keep a ghost flag and are checked as witnesses
-\* in their own small run without `-continue`, which stops at the first violation and prints one
-\* trace. To get a trace for any other path, re-run the configuration with that witness as an
-\* invariant and no `-continue`.
+\* count (design Section 4), and a fact no single label states is checked as a WITNESS in its own small
+\* run without `-continue`, which stops at the first violation and prints one trace - a state predicate
+\* where the state carries the fact (NeverTornRead, NeverSecondPastId), a ghost flag where it does not
+\* (NeverHostCrashChangedLock, NeverInflightLandedAfterTakeover). To get a trace for any other path,
+\* re-run the configuration with that witness as an invariant and no `-continue`.
 
 \* The filesystem model's own assumptions (FsModel.tla), so a simplification there cannot pass
 \* unnoticed.
@@ -61,7 +61,7 @@ ForeignUntouched == foreignObj # NoObj => LockObj = foreignObj /\ fs.content[for
 \* refusal rests on what the classifier observed, not on a re-read.
 RefusalJustified == \A p \in Procs : refused[p] = "TARGET_LOCK_BUSY" => refusedOk[p]
 
-\* The ghost witnesses, for the witness runs.
+\* The witnesses, for the witness runs.
 \* A classify read found a torn record and judged it uncertain (240.4). A state predicate, not a ghost:
 \* the judgement is protocol state, so a misplaced flag cannot make the witness violated for free
 \* (cut 6, item 4). It covers the CLASSIFY read only; a takeover's read at S240_5_s5 writes neither
@@ -71,7 +71,10 @@ NeverTornRead == ~\E p \in Procs : seenRec[p] = Torn /\ classified[p] = "uncerta
 NeverInflightLandedAfterTakeover == ~landedAfterTakeover
 \* A process passed its Section 99 check, so SingleWriter's ghost is set (design Section 7).
 NeverChecked == \A p \in Procs : ~checked[p]
-NeverRecoveredAfterCrash == ~recoveredAfterCrash
+\* 240.3 replaces only a DEAD owner's lock: the lock it moves aside and deletes never names an operation
+\* that has not crashed (cut 6, item 5). It replaces the witness NeverRecoveredAfterCrash, whose guard was
+\* true wherever it ran and so only restated S240_3_s5's label coverage.
+ReplacedOnlyDead == ~replacedLive
 \* The 235.1 capability refusal itself. Without verified OS-native locks, an operation that needs target
 \* exclusivity refuses outright. FIVE sites assign REMOTE_LOCK_UNSAFE, one per process kind (own_start,
 \* plain_start, rec_start, clean_start, brk_start), each guarded by `~SEED_NO_CAPABILITY_GATE`. A sixth

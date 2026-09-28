@@ -109,6 +109,16 @@ constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanu
 timeout_minutes = 20
 
 [[run]]
+name = "recovery-posix-seeded-SEED_RECOVER_LIVE"
+module = "LockProtocol"
+config = "configs/recovery-posix-seeded-SEED_RECOVER_LIVE.cfg"
+scenario = "recovery"
+kind = "seeded"
+violated = ["ReplacedOnlyDead"]
+constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false, SEED_FS_LOCK_WITHOUT_HANDLE = false, SEED_FS_ALIEN_CONTENT = false, SEED_CHECK_REFUSES_UNTOUCHED = false, SEED_RECOVER_LIVE = true, SEED_FS_PAST_UNALLOCATED = false, SEED_FS_DOUBLE_HANDLE = false, SEED_FS_ENTRY_UNALLOCATED = false, SEED_FS_ALIEN_RECORD = false, SEED_RECOVERER_GIVES_UP = false, SEED_RELEASE_CHECK_REFUSES_UNTOUCHED = false, SEED_RESTART_CHECK_REFUSES_UNTOUCHED = false, SEED_TAKEOVER_FOREIGN = false, HostCrashAtDurableOnly = false }
+timeout_minutes = 20
+
+[[run]]
 name = "recovery-posix-plain-check"
 module = "LockProtocol"
 config = "configs/recovery-posix-plain-check.cfg"
@@ -174,17 +184,6 @@ config = "configs/recovery-posix-witness-NeverTornRead.cfg"
 scenario = "recovery"
 kind = "witness"
 violated = ["NeverTornRead"]
-constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false, SEED_FS_LOCK_WITHOUT_HANDLE = false, SEED_FS_ALIEN_CONTENT = false, SEED_CHECK_REFUSES_UNTOUCHED = false, SEED_RECOVER_LIVE = false, SEED_FS_PAST_UNALLOCATED = false, SEED_FS_DOUBLE_HANDLE = false, SEED_FS_ENTRY_UNALLOCATED = false, SEED_FS_ALIEN_RECORD = false, SEED_RECOVERER_GIVES_UP = false, SEED_RELEASE_CHECK_REFUSES_UNTOUCHED = false, SEED_RESTART_CHECK_REFUSES_UNTOUCHED = false, SEED_TAKEOVER_FOREIGN = false, HostCrashAtDurableOnly = false }
-symmetry = { definition = "RecovererPerms", over = "Recoverers" }
-timeout_minutes = 30
-
-[[run]]
-name = "recovery-posix-witness-NeverRecoveredAfterCrash"
-module = "LockProtocol"
-config = "configs/recovery-posix-witness-NeverRecoveredAfterCrash.cfg"
-scenario = "recovery"
-kind = "witness"
-violated = ["NeverRecoveredAfterCrash"]
 constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false, SEED_FS_LOCK_WITHOUT_HANDLE = false, SEED_FS_ALIEN_CONTENT = false, SEED_CHECK_REFUSES_UNTOUCHED = false, SEED_RECOVER_LIVE = false, SEED_FS_PAST_UNALLOCATED = false, SEED_FS_DOUBLE_HANDLE = false, SEED_FS_ENTRY_UNALLOCATED = false, SEED_FS_ALIEN_RECORD = false, SEED_RECOVERER_GIVES_UP = false, SEED_RELEASE_CHECK_REFUSES_UNTOUCHED = false, SEED_RESTART_CHECK_REFUSES_UNTOUCHED = false, SEED_TAKEOVER_FOREIGN = false, HostCrashAtDurableOnly = false }
 symmetry = { definition = "RecovererPerms", over = "Recoverers" }
 timeout_minutes = 30
@@ -331,17 +330,6 @@ config = "configs/recovery-windows-witness-NeverTornRead.cfg"
 scenario = "recovery"
 kind = "witness"
 violated = ["NeverTornRead"]
-constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false, SEED_FS_LOCK_WITHOUT_HANDLE = false, SEED_FS_ALIEN_CONTENT = false, SEED_CHECK_REFUSES_UNTOUCHED = false, SEED_RECOVER_LIVE = false, SEED_FS_PAST_UNALLOCATED = false, SEED_FS_DOUBLE_HANDLE = false, SEED_FS_ENTRY_UNALLOCATED = false, SEED_FS_ALIEN_RECORD = false, SEED_RECOVERER_GIVES_UP = false, SEED_RELEASE_CHECK_REFUSES_UNTOUCHED = false, SEED_RESTART_CHECK_REFUSES_UNTOUCHED = false, SEED_TAKEOVER_FOREIGN = false, HostCrashAtDurableOnly = false }
-symmetry = { definition = "RecovererPerms", over = "Recoverers" }
-timeout_minutes = 30
-
-[[run]]
-name = "recovery-windows-witness-NeverRecoveredAfterCrash"
-module = "LockProtocol"
-config = "configs/recovery-windows-witness-NeverRecoveredAfterCrash.cfg"
-scenario = "recovery"
-kind = "witness"
-violated = ["NeverRecoveredAfterCrash"]
 constants = { Owners = ["o1"], Recoverers = ["r1", "r2"], PlainRuns = [], Cleanups = [], Breakers = [], MaxObjs = 3, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false, SEED_FS_LOCK_WITHOUT_HANDLE = false, SEED_FS_ALIEN_CONTENT = false, SEED_CHECK_REFUSES_UNTOUCHED = false, SEED_RECOVER_LIVE = false, SEED_FS_PAST_UNALLOCATED = false, SEED_FS_DOUBLE_HANDLE = false, SEED_FS_ENTRY_UNALLOCATED = false, SEED_FS_ALIEN_RECORD = false, SEED_RECOVERER_GIVES_UP = false, SEED_RELEASE_CHECK_REFUSES_UNTOUCHED = false, SEED_RESTART_CHECK_REFUSES_UNTOUCHED = false, SEED_TAKEOVER_FOREIGN = false, HostCrashAtDurableOnly = false }
 symmetry = { definition = "RecovererPerms", over = "Recoverers" }
 timeout_minutes = 30
@@ -654,16 +642,6 @@ unreached = [
 timeout_minutes = 60
 
 [[run]]
-name = "mixed-posix-witness-NeverRecoveredAfterCrash"
-module = "LockProtocol"
-config = "configs/mixed-posix-witness-NeverRecoveredAfterCrash.cfg"
-scenario = "mixed"
-kind = "witness"
-violated = ["NeverRecoveredAfterCrash"]
-constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = [], Cleanups = [], Breakers = ["b1"], MaxObjs = 4, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false, SEED_FS_LOCK_WITHOUT_HANDLE = false, SEED_FS_ALIEN_CONTENT = false, SEED_CHECK_REFUSES_UNTOUCHED = false, SEED_RECOVER_LIVE = false, SEED_FS_PAST_UNALLOCATED = false, SEED_FS_DOUBLE_HANDLE = false, SEED_FS_ENTRY_UNALLOCATED = false, SEED_FS_ALIEN_RECORD = false, SEED_RECOVERER_GIVES_UP = false, SEED_RELEASE_CHECK_REFUSES_UNTOUCHED = false, SEED_RESTART_CHECK_REFUSES_UNTOUCHED = false, SEED_TAKEOVER_FOREIGN = false, HostCrashAtDurableOnly = false }
-timeout_minutes = 30
-
-[[run]]
 name = "mixed-posix-witness-NeverUncertainLockWithPendingBreaker"
 module = "LockProtocol"
 config = "configs/mixed-posix-witness-NeverUncertainLockWithPendingBreaker.cfg"
@@ -671,16 +649,6 @@ scenario = "mixed"
 kind = "witness"
 violated = ["NeverUncertainLockWithPendingBreaker"]
 constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = [], Cleanups = [], Breakers = ["b1"], MaxObjs = 4, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "posix", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false, SEED_FS_LOCK_WITHOUT_HANDLE = false, SEED_FS_ALIEN_CONTENT = false, SEED_CHECK_REFUSES_UNTOUCHED = false, SEED_RECOVER_LIVE = false, SEED_FS_PAST_UNALLOCATED = false, SEED_FS_DOUBLE_HANDLE = false, SEED_FS_ENTRY_UNALLOCATED = false, SEED_FS_ALIEN_RECORD = false, SEED_RECOVERER_GIVES_UP = false, SEED_RELEASE_CHECK_REFUSES_UNTOUCHED = false, SEED_RESTART_CHECK_REFUSES_UNTOUCHED = false, SEED_TAKEOVER_FOREIGN = false, HostCrashAtDurableOnly = false }
-timeout_minutes = 30
-
-[[run]]
-name = "mixed-windows-witness-NeverRecoveredAfterCrash"
-module = "LockProtocol"
-config = "configs/mixed-windows-witness-NeverRecoveredAfterCrash.cfg"
-scenario = "mixed"
-kind = "witness"
-violated = ["NeverRecoveredAfterCrash"]
-constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = [], Cleanups = [], Breakers = ["b1"], MaxObjs = 4, MaxCrashes = 2, HostCrashes = false, MaxLeaseExpiries = 0, Platform = "windows", IdentityStrength = "strong", LockCapability = "strong", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false, SEED_FS_LOCK_WITHOUT_HANDLE = false, SEED_FS_ALIEN_CONTENT = false, SEED_CHECK_REFUSES_UNTOUCHED = false, SEED_RECOVER_LIVE = false, SEED_FS_PAST_UNALLOCATED = false, SEED_FS_DOUBLE_HANDLE = false, SEED_FS_ENTRY_UNALLOCATED = false, SEED_FS_ALIEN_RECORD = false, SEED_RECOVERER_GIVES_UP = false, SEED_RELEASE_CHECK_REFUSES_UNTOUCHED = false, SEED_RESTART_CHECK_REFUSES_UNTOUCHED = false, SEED_TAKEOVER_FOREIGN = false, HostCrashAtDurableOnly = false }
 timeout_minutes = 30
 
 [[run]]
@@ -938,16 +906,6 @@ kind = "witness"
 violated = ["NoLiveWriter"]
 constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = [], Cleanups = [], Breakers = ["b1"], MaxObjs = 5, MaxCrashes = 1, HostCrashes = false, MaxLeaseExpiries = 1, Platform = "posix", IdentityStrength = "strong", LockCapability = "remote", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false, SEED_FS_LOCK_WITHOUT_HANDLE = false, SEED_FS_ALIEN_CONTENT = false, SEED_CHECK_REFUSES_UNTOUCHED = false, SEED_RECOVER_LIVE = false, SEED_FS_PAST_UNALLOCATED = false, SEED_FS_DOUBLE_HANDLE = false, SEED_FS_ENTRY_UNALLOCATED = false, SEED_FS_ALIEN_RECORD = false, SEED_RECOVERER_GIVES_UP = false, SEED_RELEASE_CHECK_REFUSES_UNTOUCHED = false, SEED_RESTART_CHECK_REFUSES_UNTOUCHED = false, SEED_TAKEOVER_FOREIGN = false, HostCrashAtDurableOnly = false }
 timeout_minutes = 10
-
-[[run]]
-name = "mixed-remote-posix-witness-NeverRecoveredAfterCrash"
-module = "LockProtocol"
-config = "configs/mixed-remote-posix-witness-NeverRecoveredAfterCrash.cfg"
-scenario = "mixed-remote"
-kind = "witness"
-violated = ["NeverRecoveredAfterCrash"]
-constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = [], Cleanups = [], Breakers = ["b1"], MaxObjs = 5, MaxCrashes = 1, HostCrashes = false, MaxLeaseExpiries = 1, Platform = "posix", IdentityStrength = "strong", LockCapability = "remote", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false, SEED_FS_LOCK_WITHOUT_HANDLE = false, SEED_FS_ALIEN_CONTENT = false, SEED_CHECK_REFUSES_UNTOUCHED = false, SEED_RECOVER_LIVE = false, SEED_FS_PAST_UNALLOCATED = false, SEED_FS_DOUBLE_HANDLE = false, SEED_FS_ENTRY_UNALLOCATED = false, SEED_FS_ALIEN_RECORD = false, SEED_RECOVERER_GIVES_UP = false, SEED_RELEASE_CHECK_REFUSES_UNTOUCHED = false, SEED_RESTART_CHECK_REFUSES_UNTOUCHED = false, SEED_TAKEOVER_FOREIGN = false, HostCrashAtDurableOnly = false }
-timeout_minutes = 60
 
 [[run]]
 name = "mixed-remote-posix-witness-NeverUncertainLockWithPendingBreaker"
