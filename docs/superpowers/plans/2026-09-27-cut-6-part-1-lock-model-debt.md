@@ -43,9 +43,13 @@ The spec's union-based closures (items 1, 2, 3, 6) rest on what TLC prints for a
 - **A targeted TLC run** (from `models/lockproto`; always with a scratch `-metadir`, so no `states/` directory lands in the model):
   ```bash
   java -XX:+UseParallelGC -cp ../../target/tla/tla2tools.jar tlc2.TLC -workers auto \
-       -metadir ../../.clavity/scratch/cut6/states -config configs/<run>.cfg LockProtocol 2>&1 \
-    | grep -E "is violated|Temporal properties were violated|No error has been found|Error:|distinct states found"
+       -metadir ../../.clavity/scratch/cut6/states -config configs/<run>.cfg LockProtocol \
+       > ../../.clavity/scratch/cut6/<run>.log 2>&1
+  grep -E "is violated|Temporal properties were violated|No error has been found|Error:|distinct states found" \
+       ../../.clavity/scratch/cut6/<run>.log
   ```
+  The full output, trace included, stays in `.clavity/scratch/cut6/<run>.log` (gitignored); a step that asks for a
+  trace quotes it from there.
   Never add `-continue` for a seeded or witness config. A run that has not finished after 60 minutes: stop it and STOP the task.
 - **What counts as a kill.** For a seeded or witness config, the mutant is killed when TLC no longer reports the run's expected invariant (or property) as violated - it reports a DIFFERENT one, or `No error has been found`. For a check config, it is killed when TLC reports the named invariant violated. A TLC evaluation error, a parse or translation failure, or a timeout is NOT a kill: STOP and report the message. Record mutant, config, expected report and the observed lines. Revert every mutant, regenerate, and confirm `git diff` shows only the task's intended change.
 - **Gates per task:** `python models/lockproto/run.py --check-translation` (exit 0), `python models/lockproto/run.py --list-jobs` (exit 0: loading validates every config against its `constants`, `run.py:859-868`), `just model-test` (`OK`), and the task's named runs.
