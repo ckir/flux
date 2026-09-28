@@ -1167,6 +1167,16 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
              fs := [fs EXCEPT !.entries[P][ClassOf(DirLockName)] = fs.next + 1];
            }
            or {
+             \* SEEDED ONLY: record-shaped content that is not a record the protocol writes - IsRecord accepts it,
+             \* Records does not contain it (cut 6, item 8). A separate run from SEED_FS_ALIEN_CONTENT, because a
+             \* seeded run halts at its first violation. Fires once; never touches a Foreign start object; its
+             \* `op` is a real process, so a classifier that reads it evaluates `crashed[seen.op]` normally.
+             await SEED_FS_ALIEN_RECORD /\ \A x \in Objs : fs.content[x] = NoContent \/ fs.content[x] \in Contents;
+             with (o \in {x \in Objs : fs.content[x] # NoContent /\ x # foreignObj}, q \in Procs) {
+               fs := [fs EXCEPT !.content[o] = [tag |-> "record", op |-> q, kind |-> "alien"]];
+             };
+           }
+           or {
              \* Nothing crashes after all: the environment may simply stop.
              goto env_done;
            };
@@ -1175,7 +1185,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "de5be7d1" /\ chksum(tla) = "4dd54cfb")
+\* BEGIN TRANSLATION (chksum(pcal) = "b5129497" /\ chksum(tla) = "a903f182")
 \* Procedure variable obj of procedure Classify at line 199 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
@@ -3437,6 +3447,12 @@ env_loop == /\ pc["env"] = "env_loop"
                              /\ UNCHANGED <<crashed, holding, checked, writing, pendingUnlink, checkStale, writeStale, lostLock, landedAfterTakeover, hostCrashChangedLock, crashes, leases>>
                           \/ /\ SEED_FS_ENTRY_UNALLOCATED /\ fs.next < MaxObjs /\ fs.entries[P][ClassOf(DirLockName)] = NoObj
                              /\ fs' = [fs EXCEPT !.entries[P][ClassOf(DirLockName)] = fs.next + 1]
+                             /\ pc' = [pc EXCEPT !["env"] = "env_loop"]
+                             /\ UNCHANGED <<crashed, holding, checked, writing, pendingUnlink, checkStale, writeStale, lostLock, landedAfterTakeover, hostCrashChangedLock, crashes, leases>>
+                          \/ /\ SEED_FS_ALIEN_RECORD /\ \A x \in Objs : fs.content[x] = NoContent \/ fs.content[x] \in Contents
+                             /\ \E o \in {x \in Objs : fs.content[x] # NoContent /\ x # foreignObj}:
+                                  \E q \in Procs:
+                                    fs' = [fs EXCEPT !.content[o] = [tag |-> "record", op |-> q, kind |-> "alien"]]
                              /\ pc' = [pc EXCEPT !["env"] = "env_loop"]
                              /\ UNCHANGED <<crashed, holding, checked, writing, pendingUnlink, checkStale, writeStale, lostLock, landedAfterTakeover, hostCrashChangedLock, crashes, leases>>
                           \/ /\ pc' = [pc EXCEPT !["env"] = "env_done"]

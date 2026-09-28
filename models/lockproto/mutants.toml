@@ -93,3 +93,19 @@ new = """
     /\\ \\A d \\in Dirs, c \\in Classes : fs.past[d][c] \\subseteq 1..fs.next"""
 config = "configs/recovery-posix-seeded-SEED_FS_ENTRY_UNALLOCATED.cfg"
 expect_absent = "FsOk"
+
+[[mutant]]
+name = "t7-classifiable-noproc-only"
+file = "invariants.txt"
+old = "Classifiable == \\A o \\in Objs : fs.content[o] = NoContent \\/ fs.content[o] \\in Contents"
+new = "Classifiable == \\A o \\in Objs : fs.content[o] # NoProc"
+config = "configs/recovery-posix-seeded-SEED_FS_ALIEN_RECORD.cfg"
+expect_absent = "Classifiable"
+
+[[mutant]]
+name = "t7-classifiable-isrecord"
+file = "invariants.txt"
+old = "Classifiable == \\A o \\in Objs : fs.content[o] = NoContent \\/ fs.content[o] \\in Contents"
+new = "Classifiable == \\A o \\in Objs : fs.content[o] = NoContent \\/ fs.content[o] \\in {Torn, Foreign, EmptyFile} \\/ IsRecord(fs.content[o])"
+config = "configs/recovery-posix-seeded-SEED_FS_ALIEN_RECORD.cfg"
+expect_absent = "Classifiable"
