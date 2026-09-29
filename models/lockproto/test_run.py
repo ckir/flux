@@ -2214,6 +2214,46 @@ class MutantManifestTests(unittest.TestCase):
             self.assertFalse(killed, "a tooling error is never a kill")
             self.assertIn("tooling", detail)
 
+    CHECK_CFG = textwrap.dedent("""\
+        \\* header naming INVARIANTS A and PROPERTY L in a comment
+        SPECIFICATION Spec
+        SYMMETRY Perms
+        CONSTANTS
+            N = 3
+            S = "INVARIANT"
+        INVARIANTS
+            A
+            \\* a comment inside the list
+            B
+        PROPERTY
+            L
+        """)
+
+    def test_narrowing_a_check_config_to_one_invariant(self) -> None:
+        out = run.narrow_config(self.CHECK_CFG, "B")
+        sections = run.cfg_sections(out)
+        self.assertEqual(sections["INVARIANT"], ["B"])
+        self.assertNotIn("PROPERTY", sections)
+        before = run.cfg_sections(self.CHECK_CFG)
+        for key in ("SPECIFICATION", "SYMMETRY", "CONSTANT"):
+            self.assertEqual(sections[key], before[key])
+        head = self.CHECK_CFG[:self.CHECK_CFG.index("INVARIANTS\n")]
+        self.assertTrue(out.startswith(head), "everything before the cut sections is kept byte for byte")
+        self.assertTrue(out.endswith("\nINVARIANT B\n"))
+
+    def test_narrowing_to_a_property_and_to_a_last_section(self) -> None:
+        out = run.narrow_config(self.CHECK_CFG, "L")
+        self.assertEqual(run.cfg_sections(out).get("PROPERTY"), ["L"])
+        self.assertNotIn("INVARIANT", run.cfg_sections(out))
+        last = "SPECIFICATION Spec\nINVARIANT A\n"  # the section runs to the end of the text
+        self.assertEqual(run.narrow_config(last, "A"), "SPECIFICATION Spec\nINVARIANT A\n")
+
+    def test_narrowing_to_a_name_the_config_does_not_check_fails(self) -> None:
+        for name in ("Z", "Perms", "Spec"):
+            with self.subTest(name):
+                with self.assertRaises(run.ExpectedError):
+                    run.narrow_config(self.CHECK_CFG, name)
+
     def test_the_committed_manifest_is_valid_against_the_current_sources(self) -> None:
         mutants = run.load_mutants(run.HERE / "mutants.toml", run.HERE)
         self.assertTrue(mutants)

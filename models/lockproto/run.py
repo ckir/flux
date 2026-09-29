@@ -770,6 +770,36 @@ def apply_mutant(text: str, mutant: Mutant) -> str:
     return text.replace(mutant.old, mutant.new, 1)
 
 
+def narrow_config(text: str, name: str) -> str:
+    """The config with its INVARIANT and PROPERTY sections cut and one section checking only `name` appended.
+
+    A check-config mutant asks one question - does the mutant make `name` fail - so it runs without -continue,
+    which under many violations made TLC fail with error 2111 (CI run 36497846414). Every other byte is kept. A
+    section's span runs from its keyword to the next keyword (or the end); a comment inside it goes with it."""
+    sections = cfg_sections(text)
+    if name in sections.get("INVARIANT", []):
+        kept = "INVARIANT"
+    elif name in cfg_properties(text):
+        kept = "PROPERTY"
+    else:
+        raise ExpectedError(f"'{name}' is neither an INVARIANT nor a PROPERTY of the config")
+    keywords = [m for m in _CFG_TOKEN.finditer(text) if m.group(0) in CFG_KEYWORDS]
+    out, pos = [], 0
+    for i, m in enumerate(keywords):
+        if CFG_KEYWORDS[m.group(0)] in ("INVARIANT", "PROPERTY"):
+            end = keywords[i + 1].start() if i + 1 < len(keywords) else len(text)
+            out.append(text[pos:m.start()])
+            pos = end
+    out.append(text[pos:])
+    result = "".join(out).rstrip("\n") + f"\n{kept} {name}\n"
+    after = cfg_sections(result)
+    assert {k: after.get(k, []) for k in ("INVARIANT", "PROPERTY")} == \
+        {"INVARIANT": [name] if kept == "INVARIANT" else [], "PROPERTY": [name] if kept == "PROPERTY" else []}
+    assert {k: v for k, v in after.items() if k not in ("INVARIANT", "PROPERTY")} == \
+        {k: v for k, v in sections.items() if k not in ("INVARIANT", "PROPERTY")}
+    return result
+
+
 def judge_mutant(mutant: Mutant, outcome: Outcome) -> tuple[bool, str]:
     """Killed or not, with the reason. A tooling error - a TLC error, no Finished message - is never a kill."""
     if outcome.tooling_error is not None:
@@ -798,11 +828,12 @@ def run_mutant(mutant: Mutant, jar: Path, base: Path) -> tuple[bool, str]:
         trans = subprocess.run(["java", "-cp", str(jar), "pcal.trans", str(target)], capture_output=True, text=True)
         if trans.returncode != 0:
             return False, f"tooling: pcal.trans failed: {(trans.stdout + trans.stderr).strip()[-300:]}"
+        config = work / mutant.config
+        if mutant.present is not None:  # a check config: no other invariant may fire first and hide this one
+            config.write_text(narrow_config(config.read_text(encoding="utf-8"), mutant.present), encoding="utf-8")
+        properties = cfg_properties(config.read_text(encoding="utf-8"))  # the config TLC actually runs
         cmd = ["java", "-XX:+UseParallelGC", "-cp", str(jar), "tlc2.TLC", "-tool", "-workers", "auto",
-               "-metadir", str(work / "states"), "-config", str(work / mutant.config)]
-        if mutant.present is not None:
-            cmd.append("-continue")  # a check config: another invariant firing first must not hide this one
-        cmd.append("LockProtocol")
+               "-metadir", str(work / "states"), "-config", str(config), "LockProtocol"]
         with log.open("w", encoding="utf-8") as out:
             proc = subprocess.Popen(cmd, cwd=work, stdout=out, stderr=subprocess.STDOUT)
             try:
@@ -816,7 +847,6 @@ def run_mutant(mutant: Mutant, jar: Path, base: Path) -> tuple[bool, str]:
                 proc.wait()
                 raise
     output = log.read_text(encoding="utf-8", errors="replace")
-    properties = cfg_properties((base / mutant.config).read_text(encoding="utf-8"))
     return judge_mutant(mutant, interpret(code, output, properties))
 
 

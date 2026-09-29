@@ -45,6 +45,10 @@ ruling, agy aligned after one negotiation round:
 - **Local gates only:** `python models/lockproto/run.py --check-translation` (exit 0), `--list-jobs` (exit 0),
   `python models/lockproto/run.py --list-mutants models/lockproto/mutants.toml` (exit 0; validates the manifest, and each
   entry's `old` must occur exactly once in the CURRENT sources - see Task 5a), `just model-test` (`OK`). No `java tlc2.TLC`.
+- **Check-config mutants run on a narrowed config (2026-09-29, owner-approved, agy aligned at round 3).** CI run
+  36497846414: with `-continue`, both `expect_present` mutants reported their invariant violated and then TLC error
+  2111, so neither counted as killed. `run_mutant` now checks ONLY the expected name (`narrow_config`) and never
+  passes `-continue`. The same exposure in failing normal check runs is a TODO.md residue (Task 13).
 - Tasks 3 and 4 already ran their mutants locally (measured, `ea28f57`, `bc3f599`); Task 5a still records them in the
   manifest, so the committed record is complete and re-runnable.
 
