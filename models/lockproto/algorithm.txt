@@ -14,7 +14,7 @@
      \* Done, which is what keeps TLC's deadlock check meaningful.
      variables
        \* The filesystem (FsModel.tla). A run starts from an empty lock path, or from one holding an object
-       \* that is not a Flux lock record, which no actor ever writes (design Section 7, ForeignUntouched).
+       \* that is not a Flux lock record, which no actor ever writes (design Section 7, ForeignStaysAtLockPath, ForeignContentUntouched).
        fs \in {FsInit, FsWith(P, LockName, Foreign)},
        foreignObj = At(fs, P, LockName),         \* ghost: that Foreign object, or NoObj
        classified = [p \in Procs |-> "none"],     \* ghost: each process's last judgement

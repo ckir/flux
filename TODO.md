@@ -371,13 +371,16 @@ audit (`docs/agy-test-audit-ledger.md`), where the owner deferred them as minor.
 - [ ] **cp1252 stdout.** Python on Windows writes a piped stdout as cp1252, so a non-ASCII `reason` or TLC
       message crashes `run.py`. Call `sys.stdout.reconfigure(encoding="utf-8")` in `main`, or set
       `PYTHONIOENCODING` in the workflows.
-- [ ] **M5, `NeverTornRead` is placement-blind.** Setting `tornRead` unconditionally at `S240_1_read` keeps the
+- [x] **M5, `NeverTornRead` is placement-blind.** Setting `tornRead` unconditionally at `S240_1_read` keeps the
       witness violated. Replace the ghost with a state predicate over `seenRec` and `classified`.
-- [ ] **M6, `recoveredAfterCrash`'s guard is always true** at `S240_3_s5`, so moving or dropping it changes no
+      Closed in cut 6 (`ea28f57`): `NeverTornRead` is now a state predicate over `seenRec`/`classified`, no ghost.
+- [x] **M6, `recoveredAfterCrash`'s guard is always true** at `S240_3_s5`, so moving or dropping it changes no
       run; the witness restates the label's coverage.
-- [ ] **M7, host-crash net holes.** Flipping the comparison in the `hostCrashChangedLock` update, making
-      `FsHostCrash` always keep new content, emptying `Unflushed`, or `FsInvariants == TRUE` all leave the host-crash
-      runs green; the past-ids half of `IdsNotReused` is vacuous under strong identity.
+      Closed in cut 6 (`bc3f599`): `ReplacedOnlyDead` replaces the always-true `recoveredAfterCrash` witness.
+- [ ] **M7, host-crash net holes.** Two halves remain open: making `FsHostCrash` always keep new content, or
+      emptying `Unflushed`, both leave the host-crash runs green.
+      The negative control (flipping the comparison in the `hostCrashChangedLock` update) and the past-ids seed
+      for `IdsNotReused` landed in cut 6 (`7a52dd3`); Part 2's extended-tier branch union closes the rest.
 - [ ] **M8, the liveness consequent can be weakened undetectably.** Widening `UncertainReported` or making
       `DeadLockEventuallyCleared` trivially true keeps its witness violated and the liveness run green. Add a recovery
       seed (a Recoverer that gives up) that must violate the property.
@@ -395,14 +398,17 @@ by the commit that added this section.
       became dead when `LandUnlink` moved to resolving the lock NAME at the landing. As a per-process object id
       it carries `MaxObjs + 1` values per process against two for a boolean, and the remote checks run at 60M+
       states — a real state-space reduction, not tidiness.
-- [ ] **`tornRead` is set at one of the two labels that read a record.** The classify read sets it; `S240_5_s5`
+- [x] **`tornRead` is set at one of the two labels that read a record.** The classify read sets it; `S240_5_s5`
       does not, so a torn read during a takeover goes unrecorded and the ghost under-reports its own declared
       meaning. It feeds only `NeverTornRead`, which already fires from the classify path, so it buys no coverage
       today — do it while the states are being re-measured anyway.
-- [ ] **`IdentityStrength = "weak"` is dead across every run.** All 74 runs pin `"strong"` while `FsModel.tla`
+      Narrowed in cut 6 (`ea28f57`): the `tornRead` ghost is gone. Torn-versus-empty at takeover is a residue,
+      tracked below.
+- [x] **`IdentityStrength = "weak"` is dead across every run.** All 74 runs pin `"strong"` while `FsModel.tla`
       implements the weak value at four sites. The README justifies the pin only for `recovery`, and the one
-      protocol decision that discriminates on it (`algorithm.txt:434`) is in the Breaker/TakeOver path, which
+      protocol decision that discriminates on it (`algorithm.txt:443`) is in the Breaker/TakeOver path, which
       `recovery` has no actor for. Give it a `breaklock`-scoped justification, or drop the value.
+      Closed in cut 6 (`0e4e2cc`): weak-identity checks and the `NeverSecondPastId` witness give the value its own runs.
 
 **Coverage, where the gate is weaker than it reads.**
 
@@ -428,22 +434,30 @@ by the commit that added this section.
 **Seeds that pin their own seed rather than the property.** Each needs TLC, so each is CI-only; the mutant is
 stated so the next audit starts from a prediction rather than a hunt.
 
-- [ ] **`FsOk`'s other two conjuncts are still indistinguishable from `TRUE`.** `FsOk` is
+- [x] **`FsOk`'s other two conjuncts are still indistinguishable from `TRUE`.** `FsOk` is
       `NoDoubleOpen /\ LockImpliesHandle /\ IdsNotReused`, and `SEED_FS_LOCK_WITHOUT_HANDLE` breaks only the
       middle one. Mutant `FsInvariants(fs) == LockImpliesHandle(fs)` is predicted GREEN.
-- [ ] **`Classifiable`'s seed pins the seed.** `SEED_FS_ALIEN_CONTENT` writes `NoProc` specifically, so the
+      Closed in cut 6 (`5f8155f`): one seed per `FsOk` conjunct.
+- [x] **`Classifiable`'s seed pins the seed.** `SEED_FS_ALIEN_CONTENT` writes `NoProc` specifically, so the
       mutant `Classifiable == \A o \in Objs : fs.content[o] # NoProc` is predicted GREEN — the invariant gutted
       to a NoProc-check and still satisfied by its own seed.
-- [ ] **Two of `RefusalJustified`'s three `lostLock` sites remain unseeded.** `SEED_CHECK_REFUSES_UNTOUCHED`
+      Closed in cut 6 (`921c71d`): a record-shaped alien seed, so `Classifiable` cannot be gutted to its
+      `NoProc` case.
+- [x] **Two of `RefusalJustified`'s three `lostLock` sites remain unseeded.** `SEED_CHECK_REFUSES_UNTOUCHED`
       (added 2026-09-21) pins `S99_check`, because a seeded run halts at the first violating state. A mutant
       hardwiring `refusedOk` at `S99_release_check` or `S21_1_s3` still survives; closing it needs one run per
       site — the same shape that needed five `NeverRefusedUnsafe` witnesses.
-- [ ] **`PlainNeverOwnsUncertain`'s ghost is wired to one label.** `touchedUncertain` is assigned at
+      Closed in cut 6 (`fa9f5ce`): seeded runs for `RefusalJustified`'s release-check and restart-check sites.
+- [x] **`PlainNeverOwnsUncertain`'s ghost is wired to one label.** `touchedUncertain` is assigned at
       `algorithm.txt:299` and nowhere else, so only the move-aside is instrumented against an invariant that also
       covers removing, renaming and creating.
-- [ ] **`ForeignUntouched`'s content half is accepted as unreachable by reasoning.** The plan-2 audit
+      Narrowed in cut 6 (`1e9f7ee`): the invariant's claim is narrowed to the move-aside it instruments. The
+      uncovered cases (remove, rename, overwrite, create) are a residue, tracked below.
+- [x] **`ForeignUntouched`'s content half is accepted as unreachable by reasoning.** The plan-2 audit
       dispositioned it so and re-validation at HEAD agrees, but the argument is reasoned, not measured. Run its
       mutant alongside the others rather than on its own.
+      Closed in cut 6 (`a87a5c3`): `ForeignUntouched` is split into `ForeignStaysAtLockPath` and
+      `ForeignContentUntouched`, and the content half is seeded (`SEED_TAKEOVER_FOREIGN`).
 
 **Smaller, each independently shippable.**
 
@@ -475,6 +489,21 @@ stated so the next audit starts from a prediction rather than a hunt.
       `SEED_[A-Z0-9_]+` from `LockProtocol.tla`, collect `SEED_... = TRUE` across `configs/*.cfg`, subtract —
       which is how "the complement is empty" came to be measured rather than asserted. It belongs in
       `test_run.py`.
+
+**Residues from cut 6.**
+
+- [ ] **POSIX double open is invisible to `NoDoubleOpen`.** `share` forces `del = TRUE`, so a real double open
+      collapses into one handle record (cut 6, item 7).
+- [ ] **M8: a widening of `UncertainReported` that admits only `"RESTART"` is not killed by the gives-up seed**
+      (cut 6, item 9).
+- [ ] **`PlainNeverOwnsUncertain` covers only the move-aside (`S240_3_s2`).** Removing, renaming, overwriting or
+      creating an uncertain lock are not covered (cut 6, item 11).
+- [ ] **Torn versus empty at takeover.** No witness distinguishes a torn read from an empty one at `S240_5_s5`
+      (cut 6, item 3).
+- [ ] **A failing check or liveness run with `-continue` can be reported as "TLC error 2111" instead of "X
+      violated".** TLC failed internally while printing many violation traces (CI run 36497846414, mutants). It
+      stays red, never green; the mutant runner avoids it by narrowing (`e29dc38`); normal runs still use
+      `-continue` (`models/lockproto/run.py`, `tlc_command`).
 
 ## Closed
 

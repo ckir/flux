@@ -88,8 +88,15 @@ trace for any path, re-run that configuration with the witness as an invariant a
   snapshot. A label a run's actors cannot reach is listed in that run's `unreached` with its reason, and fails the run
   if it is covered after all.
 - A full `just model` also unions the coverage of every run. A label no run covers must be in `deferred`, naming
-  the planned scenario that will cover it (today `S96_1_backoff`, for `dirlock`, and `S240_3_putback`, for
-  `breaklock`), or in `never_reached`, if no run can ever cover it. Either list fails when its label is covered.
+  the planned scenario that will cover it (today `S96_1_backoff`, for `dirlock`), or in `never_reached`, if no run
+  can ever cover it. Either list fails when its label is covered.
+
+Coverage and passing runs answer "does the model explore this path", not "would the checking net catch a broken
+invariant". `models/lockproto/mutants.toml` lists exact-text mutants of the model, one invariant-breaking edit
+each; `run.py --mutants <toml>` applies each to a scratch copy, runs its one config, and checks the report against
+the manifest, while `run.py --list-mutants <toml>` only lists the names. The `Model mutants` CI workflow
+(`.github/workflows/model-mutants.yml`) runs the whole manifest on a change to it or to `run.py`, and on
+`workflow_dispatch`; it is a measurement of the checking net's own strength, not a per-commit gate.
 
 ## Bounds
 
@@ -116,9 +123,11 @@ kinds at once do not finish, so the check runs pair them, and each pairing is ex
 | `recovery-<platform>-plain-cleanup-check` | Owner, PlainRun, Cleanup | the plain rerun's own 240.3 path, which needs a dead cleanup lock | 1,067,868 / 1,471,158 |
 
 - Every run starts from an empty lock path or from one holding a `Foreign` object, which no actor writes, so
-  `ForeignUntouched` has something to hold over. The empty start keeps the whole acquisition prefix.
+  `ForeignStaysAtLockPath` and `ForeignContentUntouched` have something to hold over. The empty start keeps the
+  whole acquisition prefix.
 - Seven seeded runs show the scenario's invariants can fail at all. Four re-introduce a protocol defect
-  (design Section 8): `SEED_RECOVER_FOREIGN` must break `ForeignUntouched`, `SEED_RECOVER_UNCERTAIN`
+  (design Section 8): `SEED_RECOVER_FOREIGN` must break `ForeignStaysAtLockPath` (the new `SEED_TAKEOVER_FOREIGN`,
+  in `breaklock`, breaks `ForeignContentUntouched`), `SEED_RECOVER_UNCERTAIN`
   `PlainNeverOwnsUncertain` through a torn or empty record, `SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK`
   (clean-up pairing) the same invariant through a cleanup lock whose owner is uncertain, and `SEED_DEAD_AS_BUSY`
   (plain pairing) `RefusalJustified` through the evidence a refusal rests on. `SEED_CHECK_REFUSES_UNTOUCHED`
