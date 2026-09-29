@@ -2,6 +2,7 @@
 
 pub mod copy;
 pub mod ids;
+pub mod lock;
 pub mod tree;
 pub mod walk;
 
