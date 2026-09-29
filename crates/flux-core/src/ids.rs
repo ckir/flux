@@ -33,4 +33,11 @@ mod tests {
             assert!(!is_id(bad), "{bad}");
         }
     }
+
+    #[test]
+    fn is_id_rejects_a_longer_hex_string() {
+        let id = new_id();
+        assert!(!is_id(&format!("{id}0")), "33 hex digits");
+        assert!(!is_id(&format!("{id}{id}")), "64 hex digits");
+    }
 }

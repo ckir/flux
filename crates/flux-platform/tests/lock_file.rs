@@ -299,6 +299,48 @@ fn a_delete_pending_name_is_occupied_to_a_create_and_gone_to_an_open() {
     assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists, "{e:?}");
     let e = d.open_lock(OsStr::new(NAME)).expect_err("the object is logically gone");
     assert_eq!((e.code, e.source.kind()), (Code::IoError, std::io::ErrorKind::NotFound), "{e:?}");
+    // `create_new` (a data file's create) meets the same pending name the same way.
+    let e = match d.create_new(OsStr::new(NAME)) {
+        Ok(_) => panic!("still occupied to a data-file create"),
+        Err(e) => e,
+    };
+    assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists, "{e:?}");
     drop(pending);
     d.create_lock(OsStr::new(NAME)).expect("free once the last handle closes");
+}
+
+#[test]
+fn the_holder_writes_and_cuts_its_record_after_taking_the_lock() {
+    // The protocol's order (F5): take the lock, THEN write the record. Every other test writes before locking.
+    let (_tmp, d) = dir();
+    let holder = d.create_lock(OsStr::new(NAME)).unwrap();
+    assert!(holder.try_lock().unwrap());
+    holder.write_at_start(&[1u8; 5000]).expect("write while holding the lock");
+    holder.write_at_start(&[2u8; 4096]).expect("overwrite and cut while holding the lock");
+    holder.sync_all().unwrap();
+    let other = d.open_lock(OsStr::new(NAME)).unwrap();
+    assert!(!other.try_lock().unwrap(), "writing and cutting did not release the lock");
+    assert_eq!(
+        other.read_all(4096).unwrap(),
+        vec![2u8; 4096],
+        "another handle reads the new record"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn open_lock_refuses_a_file_symlink() {
+    // The junction test is refused earlier, as a directory; this one reaches the name-surrogate check itself.
+    let (tmp, d) = dir();
+    drop(d.create_lock(OsStr::new(NAME)).unwrap());
+    let link = tmp.path().join("link.flux-lock");
+    if let Err(e) = std::os::windows::fs::symlink_file(tmp.path().join(NAME), &link) {
+        // A file symlink needs SeCreateSymbolicLinkPrivilege (an administrator, or Developer Mode). CI's Windows
+        // runner has it, so there this test must run; a machine without it skips with a note.
+        assert!(std::env::var_os("CI").is_none(), "CI must be able to create a file symlink: {e}");
+        eprintln!("skipped: cannot create a file symlink here ({e})");
+        return;
+    }
+    let e = d.open_lock(OsStr::new("link.flux-lock")).expect_err("never follow a link");
+    assert_eq!(e.code, Code::SafetyRejected, "{e:?}");
 }

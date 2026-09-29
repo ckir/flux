@@ -322,4 +322,12 @@ mod tests {
         );
         assert_eq!(decode(&bytes), Decoded::Record(r));
     }
+
+    #[test]
+    fn a_field_that_is_not_utf8_is_malformed() {
+        let mut bytes = sample().encode();
+        // The first byte of the first field's text: magic 8, version 4, then its u16 length.
+        bytes[14] = 0xFF;
+        assert_eq!(decode(&reseal(bytes)), Decoded::Uncertain(Uncertain::Malformed));
+    }
 }
