@@ -14,5 +14,5 @@ mod dir_windows;
 #[cfg(windows)]
 pub use dir_windows::StdDir;
 
-pub use lock_file::StdLock;
+pub use lock_file::{StdLock, boot_session_id};
 pub use std_fs::{StdFile, StdFileSystem, StdReader};

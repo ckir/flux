@@ -280,3 +280,72 @@ pub(crate) fn capability_of(
         _ => flux_fs::LockCapability::Unsupported,
     })
 }
+
+/// The host's boot session, for the lock record's `boot_session_id` (§259.6, §229). `"unknown"` when the platform
+/// cannot say, and such a value never helps prove a reboot.
+#[cfg(target_os = "linux")]
+pub fn boot_session_id() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// `kern.boottime`, fixed for the whole boot.
+#[cfg(target_os = "macos")]
+pub fn boot_session_id() -> String {
+    let mut tv = libc::timeval { tv_sec: 0, tv_usec: 0 };
+    let mut len = std::mem::size_of::<libc::timeval>();
+    let name = c"kern.boottime";
+    // SAFETY: `name` is NUL-terminated; `tv` and `len` are live and correctly sized.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&raw mut tv).cast(),
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 { format!("{}.{:06}", tv.tv_sec, tv.tv_usec) } else { "unknown".to_string() }
+}
+
+/// `BootTime` from `SystemTimeOfDayInformation`, fixed at boot (100 ns units since 1601). Not "now minus
+/// GetTickCount64": that differs by a second between two processes of one boot (plan decision 2).
+#[cfg(windows)]
+pub fn boot_session_id() -> String {
+    use windows_sys::Wdk::System::SystemInformation::NtQuerySystemInformation;
+    // Layout only: the kernel fills every field, and only `boot_time` is read.
+    #[allow(dead_code)]
+    #[repr(C)]
+    struct SystemTimeOfDayInformation {
+        boot_time: i64,
+        current_time: i64,
+        time_zone_bias: i64,
+        time_zone_id: u32,
+        reserved: u32,
+        boot_time_bias: u64,
+        sleep_time_bias: u64,
+    }
+    const SYSTEM_TIME_OF_DAY_INFORMATION: i32 = 3;
+    let mut info: SystemTimeOfDayInformation = unsafe { std::mem::zeroed() };
+    let mut len = 0u32;
+    // SAFETY: `info` is live and its size is passed; the class is the documented SystemTimeOfDayInformation.
+    let status = unsafe {
+        NtQuerySystemInformation(
+            SYSTEM_TIME_OF_DAY_INFORMATION as _,
+            (&raw mut info).cast(),
+            std::mem::size_of::<SystemTimeOfDayInformation>() as u32,
+            &raw mut len,
+        )
+    };
+    if status == 0 && info.boot_time != 0 {
+        info.boot_time.to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub fn boot_session_id() -> String {
+    "unknown".to_string()
+}

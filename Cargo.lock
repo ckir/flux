@@ -372,6 +372,7 @@ name = "flux-platform"
 version = "0.4.0"
 dependencies = [
  "flux-fs",
+ "libc",
  "rustix",
  "tempfile",
  "windows-sys",

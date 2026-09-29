@@ -231,3 +231,15 @@ fn the_test_machines_scratch_directory_is_a_local_strong_filesystem() {
     let (_tmp, d) = dir();
     assert_eq!(d.lock_capability().unwrap(), flux_fs::LockCapability::LocalStrong);
 }
+
+#[test]
+fn the_boot_session_id_is_known_here_and_stable_within_one_boot() {
+    let a = flux_platform::boot_session_id();
+    let b = flux_platform::boot_session_id();
+    println!("boot_session_id = {a}");
+    assert_ne!(a, "unknown", "every supported platform exposes one");
+    assert!(!a.is_empty());
+    assert_eq!(a, b, "two reads in one boot agree");
+    #[cfg(target_os = "linux")]
+    assert_eq!(a, std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim());
+}
