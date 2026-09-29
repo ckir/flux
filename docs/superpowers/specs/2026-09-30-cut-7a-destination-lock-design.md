@@ -61,7 +61,7 @@ and two runs can no longer write one destination at once.
 | F2 | single-file state | the adjacent record `target.flux-state.<id>` (§218, spec:9296-9309: "the only on-disk name for the single-file state record"; the `.flux` control plane "MUST NOT be required"); no §250 catalog in 7a |
 | F3 | locks per operation | ONE: the target lock is also the operation lock, for a directory copy too, as §98 rules for a single file (spec:4840-4843); the workspace `lock` file (spec:1389) is not created. With the lock created first, a separate workspace operation lock would invert §98's order (spec:4832-4836), and the model has one lock |
 | F4 | manifest encoding | JSON, `format_version` checked before any other field; written crash-safely (temporary file, flush, rename over, flush the directory); unreadable or malformed = `STATE_CORRUPT`, unknown `format_version` = `INCOMPATIBLE_STATE`; never parsed heuristically (§193, spec:8385-8401) |
-| F5 | creation order | (B): create the lock file and take the OS-native lock (as §96.1 does), THEN create the workspace or state record, THEN write the lock record naming it. A crash before the record leaves an EMPTY lock - uncertain, "cleared by `--break-lock`" (spec:4709-4711) - never a record naming missing state, which `--break-lock` may not override (spec:10655-10659) |
+| F5 | creation order | (B): create the lock file and take the OS-native lock (as §96.1 does), THEN create the workspace or state record, THEN write the lock record naming it. **General rule (panel round 2): a lock record is never written naming state that does not already exist durably** - at acquisition, and at a §240.5 takeover's in-place overwrite. A crash before the record leaves an EMPTY lock - uncertain, "cleared by `--break-lock`" (spec:4709-4711) - never a record naming missing state, which `--break-lock` may not override (spec:10655-10659) |
 | F6 | a successful run cannot remove its workspace | exit 0 and report the leftover path as a warning; the COMPLETED manifest is the durable record of the leftover, and §21.1 lets later runs proceed past it. "A failed cleanup MUST NOT invalidate an otherwise successful transfer" (spec:9363) |
 | `.flux` | a source root containing `.flux` | copy it as ordinary data (§259.3, spec:12891-12915). Reserve `DEST/.flux/operations/`, `DEST/.flux/standalone/` and `DEST/.flux/atomic/`: a source entry whose destination is one of them, or below one, fails `CONTROL_PLANE_NAMESPACE_CONFLICT` (path-scoped, exit 1) |
 | ABANDONED | the spec contradicts itself (spec:2990-2991 "remain resumable" vs §20's table, spec:1526, "no (terminal)") | 7a follows §20 and §21.1: ABANDONED is terminal, and a new run proceeds past it |
@@ -135,7 +135,7 @@ A fixed **4096 bytes**, written with one write call through the handle that hold
 |---|---|
 | 0-7 | magic `FLUXLOCK` (ASCII) |
 | 8-11 | `format_version`, u32 little-endian = 1 |
-| 12- | the eight remaining fields in the order of spec:12975-12981 (`complete_lock_key` to `last_heartbeat_wall_time`; `format_version` is bytes 8-11), each a u16 little-endian byte length followed by UTF-8 |
+| 12- | the eight remaining fields in the order of spec:12975-12982 (`complete_lock_key` to `last_heartbeat_wall_time`; `format_version` is bytes 8-11), each a u16 little-endian byte length followed by UTF-8 |
 | ... | zero padding up to byte 4079 |
 | 4080-4095 | the first 16 bytes of the BLAKE3 hash of bytes 0-4079 |
 
@@ -156,11 +156,16 @@ So 4096 bytes always fits. An encoder that would exceed it is a bug (it panics i
 
 Decoding, in this order:
 - An EMPTY file: uncertain (spec:4709-4711).
-- A file whose bytes are ALL zero, of any length up to 4096: uncertain. A host crash can leave the write's extent
-  allocated but unwritten, and that is a torn record, never a foreign object (spec:12986-12987).
+- A file of at most 4096 bytes whose FIRST 8 bytes are all zero: uncertain. The first write into an empty lock file can
+  persist its later sectors while the leading one stays unwritten after a host crash; that is a torn record, never a
+  foreign object (spec:12986-12987).
 - A file that starts with the magic `FLUXLOCK` but is not exactly 4096 bytes, or whose checksum fails: uncertain (a
-  torn record; the model reaches a torn read, `algorithm.txt:144`).
-- Any other content: `CONTROL_PLANE_NAMESPACE_CONFLICT`, a foreign object, never overwritten (spec:4662-4677).
+  torn record; the model reaches a torn read, `algorithm.txt:144`). A torn IN-PLACE overwrite (§240.5 step 6) always
+  keeps the magic, because the old and the new record both start with it.
+- Any other content - the first 8 bytes non-zero and not the magic, or more than 4096 bytes without the magic:
+  `CONTROL_PLANE_NAMESPACE_CONFLICT`, a foreign object, never overwritten (spec:4662-4677). The residue of the
+  zero-prefix rule: a foreign file of at most 4096 bytes that begins with 8 zero bytes and sits at a lock path is read
+  as uncertain, so a `--break-lock` could overwrite it; accepted as exotic (the name `<target>.flux-lock` is Flux's).
 - An unknown `format_version` with a valid checksum: uncertain (a newer binary owns it). 7a never guesses at its
   layout.
 
@@ -229,7 +234,8 @@ The lock is:
      4. `rmdir` `operations/` and `.flux/` if they are empty (a failure because they are not empty is not an error);
      5. `still_owned` (`S99_release_check`);
      6. unlink the lock by name, then close the handle, which releases the OS-native lock (`S99_release`).
-   - A removal failure in steps 3-4 is reported, and the exit stays 0 (F6).
+   - A removal failure in steps 2-4 (temporaries, the workspace or record, the empty directories) is reported as a
+     warning, and the exit stays 0 (F6).
    - Failure: state `FAILED`, release the lock the same way, exit 1. `FAILED` is resumable, so the next run gets
      `RESUMABLE_OPERATION_EXISTS` until `--restart`.
    - Ownership lost (a failed `still_owned`) BEFORE the state is COMPLETED: stop, leave the state as it is, close the
@@ -302,7 +308,11 @@ live owner, or missing or corrupt state (spec:1664-1666).
 3. Try the OS-native lock; on failure, `TARGET_LOCK_BUSY`.
 4. The identity must match the path.
 5. Read the record. A live owner → BUSY; a different holder → start again.
-6. Overwrite the record in place in one write, flush, and re-check the identity; a mismatch → start again, not BUSY.
+6. Create this operation's state (the workspace and manifest, or the adjacent record) with state `CREATED`, durably,
+   THEN overwrite the record in place in one write naming it, flush, and re-check the identity; a mismatch → start
+   again, not BUSY. (F5's rule: otherwise a crash between the overwrite and the state's creation would leave a record
+   naming missing state, `ARTIFACT_OWNERSHIP_UNCERTAIN`, which `--break-lock` may not clear.) Step 5 of "The run" then
+   finds this state already created and does not write the record again.
 
 Errors are exit 3 before the write and exit 1 after it. The takeover record goes in this operation's `takeover` key;
 a takeover whose flush failed is never recorded (spec:10700-10701).
@@ -335,6 +345,7 @@ a takeover whose flush failed is never recorded (spec:10700-10701).
 |---|---|---|
 | before the lock file exists | nothing | proceeds |
 | between the lock file and its record (F5's window) | an empty lock, and possibly a CREATED state | `TARGET_LOCK_UNCERTAIN`; recovered with `--restart --break-lock`, which supersedes the CREATED state |
+| during a `--break-lock` takeover, after its state is created and before its overwrite | the prior (uncertain) lock unchanged, and the new run's CREATED state | `TARGET_LOCK_UNCERTAIN` again; a new `--restart --break-lock` takes over and supersedes both prior states |
 | during the copy | a TRANSFERRING state and a dead owner's lock | recovers the lock (§240.3), then `RESUMABLE_OPERATION_EXISTS`; recovered with `--restart` |
 | during `--restart` after ABANDONED | an ABANDONED prior | proceeds |
 | after COMPLETED | a completed state or its leftover | proceeds |
