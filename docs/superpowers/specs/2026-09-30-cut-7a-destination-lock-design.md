@@ -466,3 +466,18 @@ Seams in `.clavity/seams/`, replies in `.clavity/scratch/cut7/`:
 - `cut7a-nested.md`: agy chose to defer §97.1.
 
 The driver corrected its harm analysis: no-replace publication means nested copies cannot overwrite each other in 7a.
+
+## Stand-downs
+
+- **Panel (agy, 6 rounds): GREEN at round 6.** Rounds 1-5 folded 18 findings in `33d249c`, `5a1956d`, `71d41cc`,
+  `4423fb9` and `30ac958`, among them three crash dead ends: a record naming missing state after a takeover, the scan
+  abandoning the run's own takeover state, and a torn or zero-filled record read as foreign. Briefs
+  `.clavity/seams/cut7a-spec-panel-r1.md`..`-r6.md`, replies `.clavity/scratch/cut7/spec-panel-r1.md`..`-r6.md`.
+- REJECTED (round 4): "`DEST/.flux/operations/` grows forever" - a successful run removes its workspace (Finish, step 3)
+  and `--restart` deletes what it supersedes (`--restart`, step 4); only a completed run whose temporaries could not
+  be removed stays, which is cut 9's.
+- UNVERIFIED-ACCEPTED (owner, with this spec): a foreign file of at most 4096 bytes whose first 8 bytes happen to be
+  zero-or-magic is read as a torn record, so `--break-lock` could overwrite it (Decoding).
+- DISCARDED-BELOW-FLOOR (round 4, Fold Auditor): a crash between a takeover's flush and its `takeover` write loses the
+  audit trail. The guard: the lock record is already this operation's and its state is `CREATED`, so the next run
+  classifies and supersedes it (`--break-lock`, step 6); the report made before acting remains (spec:10702-10704).
