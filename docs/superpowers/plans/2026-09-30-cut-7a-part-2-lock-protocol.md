@@ -118,7 +118,11 @@ and the `plain`, `rec` and `brk` processes.
 10. **A `workspace_path` is trusted only when the record's `operation_id` passes `is_id`**, so that `operations/<id>`
     can never smuggle a path such as `../x` into the lookup.
 11. **Leftover `.broken.*` files.** `obtain` reports the one its own recovery could not delete. Noticing others beside
-    the lock needs a directory listing, which `DirHandle` does not offer, so that is Part 3's.
+    the lock needs a directory listing, which `DirHandle` does not offer, so that is Part 3's. An I/O error inside
+    `recover` after `S240_3_s4`'s create (while taking or verifying the new lock) leaves BOTH the new empty lock and
+    the moved `.broken.<id>` file (panel round 2). The design's crash table lists each alone; together they are
+    handled the same way. The next run finds an empty lock, `TARGET_LOCK_UNCERTAIN`, which `--restart --break-lock`
+    clears, and the moved file stays for cut 9's cleanup.
 12. **A plain run recovers a dead owner's lock (panel round 1).** The model's `plain` process refuses a dead
     operation's lock with `RESUMABLE_OPERATION_EXISTS` without touching it (`S21_1_decide`). The design spec, approved
     by the owner, has every run recover it first, which is the model's `rec` process:
@@ -2503,6 +2507,14 @@ Panel round 1 (agy), at `5e3321a`:
     behaviour (decision 12);
   - "`on_nth` stages a write the OS would block under the takeover's lock": the Unix lock is advisory, and the Windows
     lock covers one byte far past the record (Part 1 decision 1), so a concurrent record write does land.
+
+Panel round 2 (agy), at `6b881e2`: GREEN, with no blocking finding.
+- The Fold Auditor and the Part 3 Integrator found round 1's folds correct and every Part 3 step writable on these
+  APIs.
+- The Axiom Breaker restated decisions 7 and 12, which are declared.
+- DISCARDED-BELOW-FLOOR, then stated as debt in decision 11: an I/O error after `S240_3_s4` leaves the new empty lock
+  and the moved file together. The guard: the empty lock is classified `Uncertain` (`classify`, the
+  `Decoded::Uncertain(why) => Ok(Classified::Uncertain(why))` arm), so no run adopts it without `--break-lock`.
 
 **Type consistency:**
 
