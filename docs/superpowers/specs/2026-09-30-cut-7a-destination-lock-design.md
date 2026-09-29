@@ -156,15 +156,17 @@ So 4096 bytes always fits. An encoder that would exceed it is a bug (it panics i
 
 Decoding, in this order:
 - An EMPTY file: uncertain (spec:4709-4711).
-- A file of at most 4096 bytes whose FIRST 8 bytes are all zero: uncertain. The first write into an empty lock file can
-  persist its later sectors while the leading one stays unwritten after a host crash; that is a torn record, never a
-  foreign object (spec:12986-12987).
+- A file of at most 4096 bytes whose first 8 bytes are each EITHER zero OR the corresponding byte of `FLUXLOCK` (all
+  zero, a partly written magic such as `FLUX` followed by zeros, or the whole magic): a torn record, uncertain - unless
+  it is a whole valid record (below). The first write into an empty lock file can leave any prefix of it unwritten
+  after a host crash; that is a torn record, never a foreign object (spec:12986-12987).
 - A file that starts with the magic `FLUXLOCK` but is not exactly 4096 bytes, or whose checksum fails: uncertain (a
   torn record; the model reaches a torn read, `algorithm.txt:144`). A torn IN-PLACE overwrite (§240.5 step 6) always
   keeps the magic, because the old and the new record both start with it.
-- Any other content - the first 8 bytes non-zero and not the magic, or more than 4096 bytes without the magic:
+- Any other content - a first-8-byte pattern that is not zero-or-magic byte by byte, or more than 4096 bytes without
+  the magic:
   `CONTROL_PLANE_NAMESPACE_CONFLICT`, a foreign object, never overwritten (spec:4662-4677). The residue of the
-  zero-prefix rule: a foreign file of at most 4096 bytes that begins with 8 zero bytes and sits at a lock path is read
+  zero-or-magic rule: a foreign file of at most 4096 bytes whose first 8 bytes happen to fit it, at a lock path, is read
   as uncertain, so a `--break-lock` could overwrite it; accepted as exotic (the name `<target>.flux-lock` is Flux's).
 - An unknown `format_version` with a valid checksum: uncertain (a newer binary owns it). 7a never guesses at its
   layout.
@@ -215,7 +217,9 @@ The lock is:
    limit is refused `PATH_COMPONENT_INVALID`, exit 3; the directory-lock fallback is out of 7a.
 4. **Prior state (§21.1, spec:1595-1671).**
    - A directory copy reads every entry of `DEST/.flux/operations/`; a single-file copy reads every
-     `target.flux-state.*` beside the target.
+     `target.flux-state.*` beside the target. The entry named with THIS run's own `operation_id` is skipped: after a
+     `--break-lock` takeover this run's own CREATED state already exists (panel round 3), and it is never a prior
+     operation.
    - Each is classified (next section).
    - A refusal removes what this run created (the lock file, closed first) and exits 3. If that removal fails, it
      reports the path and exits 1 (spec:2896-2902).
@@ -308,9 +312,10 @@ live owner, or missing or corrupt state (spec:1664-1666).
 3. Try the OS-native lock; on failure, `TARGET_LOCK_BUSY`.
 4. The identity must match the path.
 5. Read the record. A live owner → BUSY; a different holder → start again.
-6. Create this operation's state (the workspace and manifest, or the adjacent record) with state `CREATED`, durably,
-   THEN overwrite the record in place in one write naming it, flush, and re-check the identity; a mismatch → start
-   again, not BUSY. (F5's rule: otherwise a crash between the overwrite and the state's creation would leave a record
+6. Create this operation's state (the workspace and manifest, or the adjacent record) with state `CREATED` and
+   `takeover` = `null`, durably, THEN overwrite the record in place in one write naming it, flush, and re-check the
+   identity; a mismatch → start again, not BUSY. Only after the flush succeeds, write the `takeover` key into the state
+   (a second crash-safe state write), so a takeover whose flush failed is never recorded (spec:10700-10701). (F5's rule: otherwise a crash between the overwrite and the state's creation would leave a record
    naming missing state, `ARTIFACT_OWNERSHIP_UNCERTAIN`, which `--break-lock` may not clear.) Step 5 of "The run" then
    finds this state already created and does not write the record again.
 
@@ -421,6 +426,10 @@ The plan cites these entries step by step.
    "fallback not implemented"; this names what is wrong with the path.
 7. **`--restart` finds a superseded run's partials by its exact operation id**, because 7a's state lists no
    artifacts; the authority is the valid prior state, and every deletion is revalidated.
+8. **A `--break-lock` takeover creates this operation's state before its in-place overwrite** (§240.5 step 6). The
+   model's `TakeOver` (`S240_5_s6_write_begin/_end`) writes only the record; the added state I/O touches only paths
+   under `DEST/.flux/` or the adjacent `target.flux-state.<id>`, which no model actor reads, so it lengthens the step in
+   time without adding states to the lock protocol. It exists so that no record ever names missing state (F5).
 
 ## Consult record
 
