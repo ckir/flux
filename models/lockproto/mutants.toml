@@ -140,3 +140,27 @@ new = "UncertainReported == \\E p \\in Recoverers \\cup Cleanups : refused[p] \\
 config = "configs/recovery-posix-seeded-SEED_RECOVERER_GIVES_UP.cfg"
 expect_absent = "DeadLockEventuallyCleared"
 timeout_minutes = 30
+
+[[mutant]]
+name = "t9-release-check-hardwired"
+file = "algorithm.txt"
+old = """
+           if (~StillOwned(self) \\/ SEED_RELEASE_CHECK_REFUSES_UNTOUCHED) {
+             refusedOk[self] := lostLock[self];"""
+new = """
+           if (~StillOwned(self) \\/ SEED_RELEASE_CHECK_REFUSES_UNTOUCHED) {
+             refusedOk[self] := TRUE;"""
+config = "configs/recovery-posix-seeded-SEED_RELEASE_CHECK_REFUSES_UNTOUCHED.cfg"
+expect_absent = "RefusalJustified"
+
+[[mutant]]
+name = "t9-restart-check-hardwired"
+file = "algorithm.txt"
+old = """
+           if (~StillOwned(self) \\/ SEED_RESTART_CHECK_REFUSES_UNTOUCHED) {
+             refusedOk[self] := lostLock[self];"""
+new = """
+           if (~StillOwned(self) \\/ SEED_RESTART_CHECK_REFUSES_UNTOUCHED) {
+             refusedOk[self] := TRUE;"""
+config = "configs/breaklock-posix-seeded-SEED_RESTART_CHECK_REFUSES_UNTOUCHED.cfg"
+expect_absent = "RefusalJustified"

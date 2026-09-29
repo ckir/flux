@@ -659,7 +659,7 @@
          else {
            checked[self] := FALSE;
            checkStale[self] := TRUE;
-           if (~StillOwned(self)) {
+           if (~StillOwned(self) \/ SEED_RELEASE_CHECK_REFUSES_UNTOUCHED) {
              refusedOk[self] := lostLock[self];
              refused[self] := "TARGET_LOCK_BUSY";
              holding[self] := FALSE;
@@ -925,7 +925,7 @@
          \* Revalidate the lock it now holds (Section 99).
          if (crashed[self] \/ ~holding[self]) { goto brk_end; }
          else {
-           if (~StillOwned(self)) {
+           if (~StillOwned(self) \/ SEED_RESTART_CHECK_REFUSES_UNTOUCHED) {
              refusedOk[self] := lostLock[self];
              refused[self] := "TARGET_LOCK_BUSY";
              holding[self] := FALSE;

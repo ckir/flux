@@ -740,7 +740,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          else {
            checked[self] := FALSE;
            checkStale[self] := TRUE;
-           if (~StillOwned(self)) {
+           if (~StillOwned(self) \/ SEED_RELEASE_CHECK_REFUSES_UNTOUCHED) {
              refusedOk[self] := lostLock[self];
              refused[self] := "TARGET_LOCK_BUSY";
              holding[self] := FALSE;
@@ -1006,7 +1006,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          \* Revalidate the lock it now holds (Section 99).
          if (crashed[self] \/ ~holding[self]) { goto brk_end; }
          else {
-           if (~StillOwned(self)) {
+           if (~StillOwned(self) \/ SEED_RESTART_CHECK_REFUSES_UNTOUCHED) {
              refusedOk[self] := lostLock[self];
              refused[self] := "TARGET_LOCK_BUSY";
              holding[self] := FALSE;
@@ -1187,7 +1187,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "7acd651c" /\ chksum(tla) = "8095eca5")
+\* BEGIN TRANSLATION (chksum(pcal) = "7456db1f" /\ chksum(tla) = "a5856546")
 \* Procedure variable obj of procedure Classify at line 199 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
@@ -2433,7 +2433,7 @@ S99_release_check(self) == /\ pc[self] = "S99_release_check"
                                                       refused >>
                                  ELSE /\ checked' = [checked EXCEPT ![self] = FALSE]
                                       /\ checkStale' = [checkStale EXCEPT ![self] = TRUE]
-                                      /\ IF ~StillOwned(self)
+                                      /\ IF ~StillOwned(self) \/ SEED_RELEASE_CHECK_REFUSES_UNTOUCHED
                                             THEN /\ refusedOk' = [refusedOk EXCEPT ![self] = lostLock[self]]
                                                  /\ refused' = [refused EXCEPT ![self] = "TARGET_LOCK_BUSY"]
                                                  /\ holding' = [holding EXCEPT ![self] = FALSE]
@@ -3209,7 +3209,7 @@ S21_1_s3(self) == /\ pc[self] = "S21_1_s3"
                   /\ IF crashed[self] \/ ~holding[self]
                         THEN /\ pc' = [pc EXCEPT ![self] = "brk_end"]
                              /\ UNCHANGED << holding, refusedOk, refused >>
-                        ELSE /\ IF ~StillOwned(self)
+                        ELSE /\ IF ~StillOwned(self) \/ SEED_RESTART_CHECK_REFUSES_UNTOUCHED
                                    THEN /\ refusedOk' = [refusedOk EXCEPT ![self] = lostLock[self]]
                                         /\ refused' = [refused EXCEPT ![self] = "TARGET_LOCK_BUSY"]
                                         /\ holding' = [holding EXCEPT ![self] = FALSE]
