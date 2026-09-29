@@ -145,3 +145,80 @@ fn open_lock_refuses_a_fifo_without_hanging() {
     let e = d.open_lock(OsStr::new("fifo.flux-lock")).expect_err("a FIFO is not a lock file");
     assert_eq!(e.code, Code::DestinationError);
 }
+
+/// What the child prints once it holds the lock. Distinctive, so no line libtest prints can match it.
+const CHILD_MARKER: &str = "FLUX_CHILD_HOLDS_LOCK";
+
+/// Run as a child by `a_lock_held_by_another_process_is_busy_and_readable_until_that_process_dies`: take the lock on
+/// the named file, say so, and hold it until killed.
+fn hold_lock_as_child(dir: &str) {
+    let d = StdFileSystem
+        .destination_root(std::path::Path::new(dir))
+        .expect("child opens the directory");
+    let lock = d.open_lock(OsStr::new(NAME)).expect("child opens the lock");
+    assert!(lock.try_lock().expect("child try_lock"), "the parent released it before spawning");
+    // A line of its own: libtest has already printed `test <name> ... ` WITHOUT a newline when the test body runs, so
+    // a bare marker would share that line and never match exactly (measured during execution).
+    println!("\n{CHILD_MARKER}");
+    use std::io::Write;
+    std::io::stdout().flush().unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(120));
+}
+
+#[test]
+fn a_lock_held_by_another_process_is_busy_and_readable_until_that_process_dies() {
+    if let Ok(dir) = std::env::var("FLUX_LOCK_CHILD_DIR") {
+        hold_lock_as_child(&dir);
+        return;
+    }
+    let (tmp, d) = dir();
+    let record: Vec<u8> = (0..4096u32).map(|i| (i % 253) as u8).collect();
+    {
+        let h = d.create_lock(OsStr::new(NAME)).unwrap();
+        h.write_at_start(&record).unwrap();
+        h.sync_all().unwrap();
+    } // closed: nobody holds the lock
+
+    /// Kills and reaps the child however this test ends. A failed assertion unwinds past any explicit kill, and on
+    /// Windows the child's open handle would also stop the scratch directory from being removed.
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "a_lock_held_by_another_process_is_busy_and_readable_until_that_process_dies",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("FLUX_LOCK_CHILD_DIR", tmp.path())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the child");
+    // Declared after `tmp`, so it is dropped first: the child is gone before the directory is removed.
+    let mut child = KillOnDrop(child);
+    let stdout = child.0.stdout.take().unwrap();
+    let mut lines = std::io::BufRead::lines(std::io::BufReader::new(stdout));
+    assert!(
+        lines.any(|l| l.map(|l| l.trim() == CHILD_MARKER).unwrap_or(false)),
+        "the child reports it holds the lock"
+    );
+
+    let probe = d.open_lock(OsStr::new(NAME)).unwrap();
+    assert!(!probe.try_lock().unwrap(), "another PROCESS holds it: TARGET_LOCK_BUSY");
+    assert_eq!(probe.read_all(4096).unwrap(), record, "and its record is readable meanwhile");
+
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    // The OS releases a dead process's lock when it closes the process's handles; allow it a moment.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !probe.try_lock().unwrap() {
+        assert!(std::time::Instant::now() < deadline, "a dead process's lock was never released");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
