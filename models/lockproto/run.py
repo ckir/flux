@@ -145,6 +145,7 @@ class Expected:
     runs: list[Run]
     never_reached: tuple[tuple[str, str], ...]
     deferred: tuple[tuple[str, str, str], ...]
+    branches: tuple[Branch, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -377,6 +378,39 @@ def _load_deferred(value: object, subject: str) -> tuple[tuple[str, str, str], .
     return tuple(entries)
 
 
+def _load_branches(value: object, base: Path) -> tuple[Branch, ...]:
+    """Validate expected.toml's `branches` and resolve each anchor. Unknown or missing keys, a bad name or side,
+    a module that does not exist, or an anchor that resolves to nothing or to two places all fail at load."""
+    _require(isinstance(value, list), "'branches' must be an array of tables")
+    assert isinstance(value, list)
+    branches: list[Branch] = []
+    for i, e in enumerate(value):
+        where = f"'branches' #{i + 1}"
+        _require(isinstance(e, dict), f"{where} must be a table")
+        assert isinstance(e, dict)
+        required = BRANCH_KEYS - {"module"}
+        _require(set(e) <= BRANCH_KEYS and required <= set(e),
+                 f"{where}: keys are name, label, guard, side, reason and optionally module; got {sorted(e)}")
+        for key, v in e.items():
+            _require(isinstance(v, str) and v != "", f"{where}: '{key}' must be a non-empty string")
+        name, module = e["name"], e.get("module", "LockProtocol")
+        where = f"'branches' {name!r}"
+        _require(re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", name) is not None,
+                 f"{where}: a name is lower-case words joined by '-'")
+        _require(e["side"] in ("then", "else"), f"{where}: side must be 'then' or 'else'")
+        path = base / f"{module}.tla"
+        _require(IDENT.fullmatch(module) is not None and path.is_file(), f"{where}: module {module}.tla not found")
+        try:
+            span = resolve_branch(path.read_text(encoding="utf-8"), e["label"], e["guard"], e["side"])
+        except ExpectedError as err:
+            raise ExpectedError(f"{where}: {err}") from err
+        branches.append(Branch(name, module, e["label"], e["guard"], e["side"], e["reason"], span))
+    names = [b.name for b in branches]
+    _require(len(set(names)) == len(names),
+             f"'branches': duplicate names {sorted({n for n in names if names.count(n) > 1})}")
+    return tuple(branches)
+
+
 def load_expected(path: Path) -> Expected:
     """Load and validate expected.toml; module and config paths are resolved beside it."""
     base = path.parent
@@ -385,8 +419,8 @@ def load_expected(path: Path) -> Expected:
     except (OSError, tomllib.TOMLDecodeError) as err:
         raise ExpectedError(f"cannot read {path}: {err}") from err
 
-    _require(set(data) <= {"scenarios", "run", "never_reached", "deferred"},
-             f"unknown top-level keys: {sorted(set(data) - {'scenarios', 'run', 'never_reached', 'deferred'})}")
+    top = {"scenarios", "run", "never_reached", "deferred", "branches"}
+    _require(set(data) <= top, f"unknown top-level keys: {sorted(set(data) - top)}")
     never_reached = _load_label_reasons(data.get("never_reached", []), "'never_reached'")
     deferred = _load_deferred(data.get("deferred", []), "'deferred'")
     scenarios = data.get("scenarios")
@@ -438,7 +472,7 @@ def load_expected(path: Path) -> Expected:
                  f"'deferred': label {label!r} is not in the label universe of any run's module")
         _require(scenario not in scenarios,
                  f"'deferred': scenario {scenario!r} is in 'scenarios' (the scenario is already built)")
-    return Expected(scenarios, runs, never_reached, deferred)
+    return Expected(scenarios, runs, never_reached, deferred, _load_branches(data.get("branches", []), base))
 
 
 def _constants_equal(a: object, b: object) -> bool:
@@ -1483,9 +1517,49 @@ def report(result: Result, tightened: tuple[str, str] | None = None) -> None:
             print(f"         full TLC output: {result.log}")
 
 
+def counts_for_branches(run: Run, base: Path) -> bool:
+    """Whether a run's coverage counts toward `branches`: it models the protocol AS SPECIFIED. A seeded run
+    reaches arms the protocol never does (SEED_TAKEOVER_FOREIGN sends a Foreign read into S240_5_s5's
+    continue arm), and a run whose CONFIG sets a FIX_* flag TRUE models a proposed fix - the flag lives in the
+    config, not in `constants` (breaklock-remote-posix-fixed-check.cfg). Witness runs halt, but what they did
+    reach is reachable, so they count (cut 6 Part 2)."""
+    if run.kind == "seeded":
+        return False
+    flags = cfg_constants((base / run.config).read_text(encoding="utf-8"))
+    return not any(k.startswith("FIX_") and v is True for k, v in flags.items())
+
+
+def judge_branches(branches: tuple[Branch, ...], logs: list[tuple[str, str]]) -> bool:
+    """Judge `branches` over (run name, TLC log) pairs of the runs that count; returns whether it failed. Each
+    arm's count is summed over the logs; zero fails, and so does an arm no log has a node for."""
+    if not branches:
+        return False
+    parsed: list[list[tuple[str, int, int, int, int]]] = []
+    for name, text in logs:
+        nodes = parse_cost_nodes(parse_messages(text))
+        if nodes is None:
+            print(f"run.py: cannot judge branches: {name}'s log carries no complete coverage block")
+            return True
+        parsed.append(nodes)
+    failed = False
+    for b in branches:
+        counts = [c for c in (arm_count(nodes, b) for nodes in parsed) if c is not None]
+        if not counts:
+            print(f"MISMATCH branch {b.name}: no coverage node inside its arm in any of {len(parsed)} counted logs")
+            failed = True
+        elif sum(counts) == 0:
+            print(f"MISMATCH branch {b.name}: the {b.side} arm of IF {b.guard} in {b.label} never ran "
+                  f"({len(counts)} counted logs)")
+            failed = True
+        else:
+            print(f"BRANCH {b.name}  {sum(counts):,} entries over {len(counts)} counted logs")
+    return failed
+
+
 def judge_union(executed: list[tuple[Run, bool, Result]], base: Path,
                  never_reached: tuple[tuple[str, str], ...],
-                 deferred: tuple[tuple[str, str, str], ...]) -> bool:
+                 deferred: tuple[tuple[str, str, str], ...],
+                 branches: tuple[Branch, ...] = ()) -> bool:
     """The suite-wide coverage union (design Section 4), judged only when every run in
     expected.toml was selected (no --scenario). `executed` is every (run, fixed, result) this
     invocation ran. A label of any run's module is covered if ANY run of that module - any
@@ -1504,7 +1578,13 @@ def judge_union(executed: list[tuple[Run, bool, Result]], base: Path,
         entries.append((run.module, result.log.read_text(encoding="utf-8", errors="replace")))
     partial = frozenset(run.name for run, fixed, _result in executed
                         if not fixed and run.kind in HALTING_KINDS)
-    return union_from_logs(entries, base, never_reached, deferred, partial)
+    failed = union_from_logs(entries, base, never_reached, deferred, partial)
+    if not branches:
+        return failed
+    counted = [(run.name, result.log.read_text(encoding="utf-8", errors="replace"))
+               for run, fixed, result in executed
+               if not fixed and counts_for_branches(run, base) and result.log is not None]
+    return judge_branches(branches, counted) or failed
 
 
 def union_from_logs(entries: list[tuple[str, str]], base: Path,
@@ -1599,6 +1679,11 @@ def judge_union_from(expected: Expected, base: Path, logs_dir: Path) -> int:
     partial = frozenset(r.name for r in wanted if r.kind in HALTING_KINDS)
     print(f"run.py: judging the union from {len(entries)} saved logs under {logs_dir}")
     failed = union_from_logs(entries, base, expected.never_reached, expected.deferred, partial)
+    if not expected.branches:
+        return 1 if failed else 0
+    counted = [(r.name, logs[r.name].read_text(encoding="utf-8", errors="replace"))
+               for r in wanted if counts_for_branches(r, base)]
+    failed = judge_branches(expected.branches, counted) or failed
     return 1 if failed else 0
 
 
@@ -1734,7 +1819,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.scenario is not None:
         print("run.py: suite-wide coverage not judged for a single scenario")
-    elif judge_union(executed, base, expected.never_reached, expected.deferred):
+    elif judge_union(executed, base, expected.never_reached, expected.deferred, expected.branches):
         code = 1  # a union failure counts like a run mismatch: it outranks a tooling failure too
 
     print(f"run.py: {len(results)} runs, exit {code}")

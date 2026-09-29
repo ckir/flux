@@ -2213,6 +2213,110 @@ class BranchResolveTests(unittest.TestCase):
                           "a node of another module never counts")
 
 
+BRANCHES_TOML = """
+
+[[branches]]
+name = "{name}"
+module = "ArmFixture"
+label = "branchy"
+guard = "{guard}"
+side = "then"
+reason = "a test"
+"""
+
+
+class BranchJudgeTests(unittest.TestCase):
+    """`branches` in expected.toml: loaded fail-closed, judged by --union-from over the runs that count."""
+
+    def expected_dir(self, extra: str) -> ExpectedDir:
+        d = ExpectedDir(GOOD_EXPECTED + extra)
+        self.addCleanup(d.close)
+        (d.path / "ArmFixture.tla").write_text((TESTDATA / "ArmFixture.tla").read_text(encoding="utf-8"),
+                                                encoding="utf-8")
+        return d
+
+    def logs(self, per_run: dict[str, str]) -> Path:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name) / "tlc-output-x-posix"
+        root.mkdir()
+        for name, text in per_run.items():
+            (root / f"{name}.log").write_text(text, encoding="utf-8")
+        return root.parent
+
+    def judge(self, d: ExpectedDir, per_run: dict[str, str]) -> tuple[int, str]:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = run.judge_union_from(d.load(), d.path, self.logs(per_run))
+        return code, out.getvalue()
+
+    def test_a_branch_loads_resolved(self) -> None:
+        (b,) = self.expected_dir(BRANCHES_TOML.format(name="dead", guard="i = 7")).load().branches
+        self.assertEqual((b.name, b.module, b.label, b.side), ("dead", "ArmFixture", "branchy", "then"))
+        self.assertEqual(b.span, ((51, 42), (52, 42)))
+
+    def test_each_malformed_branch_fails_at_load(self) -> None:
+        good = BRANCHES_TOML.format(name="dead", guard="i = 7")
+        cases = {
+            "unknown key": good + 'extra = "no"\n',
+            "missing reason": good.replace('reason = "a test"\n', ""),
+            "bad side": good.replace('side = "then"', 'side = "both"'),
+            "bad name": good.replace('name = "dead"', 'name = "Dead Arm"'),
+            "missing module": good.replace('module = "ArmFixture"', 'module = "Nope"'),
+            "unresolvable guard": good.replace('guard = "i = 7"', 'guard = "i = 9"'),
+            "duplicate name": good + good,
+        }
+        for why, extra in cases.items():
+            with self.subTest(why):
+                with self.assertRaises(run.ExpectedError):
+                    self.expected_dir(extra).load()
+
+    def test_an_arm_one_counted_log_covers_passes(self) -> None:
+        d = self.expected_dir(BRANCHES_TOML.format(name="live", guard="i = 1"))
+        covered = fixture("arm_coverage")[1]
+        zeroed = covered.replace("line 49, col 36 to line 49, col 44 of module ArmFixture: 1",
+                                 "line 49, col 36 to line 49, col 44 of module ArmFixture: 0")
+        self.assertNotEqual(covered, zeroed, "the replaced node line must exist, or this test asserts nothing")
+        names = [r.name for r in d.load().runs]
+        code, out = self.judge(d, {n: (covered if n == "demo-posix-check" else zeroed) for n in names})
+        self.assertEqual(code, 0, out)
+        self.assertIn("BRANCH live  1 entries", out)
+
+    def test_an_arm_no_counted_log_covers_fails(self) -> None:
+        d = self.expected_dir(BRANCHES_TOML.format(name="dead", guard="i = 7"))
+        code, out = self.judge(d, {r.name: fixture("arm_coverage")[1] for r in d.load().runs})
+        self.assertEqual(code, 1)
+        self.assertIn("MISMATCH branch dead", out)
+
+    def test_a_seeded_run_covering_the_arm_does_not_count(self) -> None:
+        d = self.expected_dir(BRANCHES_TOML.format(name="live", guard="i = 1"))
+        covered = fixture("arm_coverage")[1]
+        zeroed = covered.replace("line 49, col 36 to line 49, col 44 of module ArmFixture: 1",
+                                 "line 49, col 36 to line 49, col 44 of module ArmFixture: 0")
+        runs = d.load().runs
+        seeded = [r.name for r in runs if r.kind == "seeded"]
+        self.assertEqual(len(seeded), 1)
+        code, out = self.judge(d, {r.name: (covered if r.kind == "seeded" else zeroed) for r in runs})
+        self.assertEqual(code, 1, "only a seeded run reached the arm, and seeded runs do not count")
+        self.assertIn("MISMATCH branch live", out)
+
+    def test_which_runs_count(self) -> None:
+        d = self.expected_dir("")
+        runs = {r.kind: r for r in d.load().runs}
+        self.assertTrue(run.counts_for_branches(runs["check"], d.path), "check.cfg sets FIX_SAFE = FALSE")
+        self.assertTrue(run.counts_for_branches(runs["witness"], d.path))
+        self.assertFalse(run.counts_for_branches(runs["seeded"], d.path))
+        # The FIX_* flag is read from the CONFIG: expected.toml's `constants` does not carry it (measured on
+        # breaklock-remote-posix-fixed-check, whose constants omit FIX_REMOTE_LEASE_SPEC).
+        (d.path / "fixed.cfg").write_text("SPECIFICATION Spec\nCONSTANTS\n    FIX_SAFE = TRUE\nINVARIANT Safe\n",
+                                          encoding="utf-8")
+        fixed = dataclasses.replace(runs["check"], config="fixed.cfg")
+        self.assertFalse(run.counts_for_branches(fixed, d.path), "a run whose config sets FIX_* models a fix")
+
+    def test_no_branches_changes_nothing(self) -> None:
+        self.assertFalse(run.judge_branches((), [("any", "not even a log")]))
+
+
 class PartialCoverageTests(unittest.TestCase):
     """A seeded or witness run halts at its first counterexample, so its coverage block describes a
     PREFIX of the state space. Its positive coverage is sound; its SILENCE is not evidence."""
