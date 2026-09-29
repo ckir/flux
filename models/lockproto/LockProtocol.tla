@@ -3560,8 +3560,10 @@ SingleWriter == Cardinality({p \in Procs : (checked[p] \/ writing[p]) /\ ~Supers
 \* NOT supersede, so SingleWriter is bounding a real count there (capstone finding, plan 3).
 NoLiveWriter == Cardinality({p \in Procs : (checked[p] \/ writing[p]) /\ ~Superseded(p)}) = 0
 
-\* A process without `--break-lock` never removes, renames, or overwrites a lock it classified as
-\* uncertain, and creates a lock only at an empty lock path (Section 7).
+\* No process moves aside (240.3 step 2) a lock it judged uncertain: a plain process refuses such a lock,
+\* and a --break-lock process takes it over in place (240.5). The ghost is set at the move-aside only
+\* (S240_3_s2), so removing, renaming, overwriting or creating are NOT covered - a residue (cut 6,
+\* item 11). breaklock-posix-seeded-SEED_MOVE_ASIDE_FOR_UNCERTAIN, whose actors are Breakers, violates it.
 PlainNeverOwnsUncertain == ~touchedUncertain
 
 \* A `Foreign` object at a lock path is never written, renamed, or deleted (Section 7): the one an initial
