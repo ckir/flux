@@ -102,6 +102,16 @@ NeverHostCrashChangedLock == ~hostCrashChangedLock
 \* (cut 6, item 13).
 NeverSecondPastId == \A d \in Dirs, c \in Classes : Cardinality(fs.past[d][c]) <= 1
 
+\* A host crash reverted a lock record its Owner had written: the lock path still names the Owner's object,
+\* which is EmptyFile again after the Owner wrote its record there. Only FsHostCrash's "old" pick can do that,
+\* and only for an unflushed object: creation is the one writer of EmptyFile, and in the single-Owner pairing
+\* only the Owner creates, once (Acquire, called once from own_start), before writing - and the Owner never
+\* flushes the lock file. So "always keep new content" or an empty `Unflushed` leaves this witness unviolated
+\* (cut 6, item 6; TLC gives FsHostCrash's CASE arms no coverage node, so no branch entry can see them). Its
+\* run, recovery-posix-owneronly-hostcrash-witness-NeverRevertedOwnWrite, must stop with it violated.
+NeverRevertedOwnWrite ==
+    ~\E p \in Owners : crashed[p] /\ seenRec[p] = OwnRecord(p) /\ LockObj # NoObj /\ fs.content[LockObj] = EmptyFile
+
 \* ------------------------------------------------------------------------------------------
 \* Temporal properties (design Section 7). A configuration that checks one lists exactly one
 \* PROPERTY, because TLC reports a temporal violation without naming the property it belongs to.

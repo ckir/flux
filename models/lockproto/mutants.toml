@@ -537,3 +537,22 @@ old = '             if (IsRecord(seen) /\ seen # seenRec[self]) { refused[self] 
 new = '             if (~IsRecord(seen) \/ (IsRecord(seen) /\ seen # seenRec[self])) { refused[self] := "RESTART"; goto S240_5_close; }'
 config = "configs/breaklock-posix-plain-check.cfg"
 expect_zero_branch = "s240-5-s5-non-record"
+
+# Cut 6 Part 2, item 6 (M7's remaining halves): each removes the host crash's "old" outcome, so the single-Owner
+# witness run no longer finds NeverRevertedOwnWrite violated.
+
+[[mutant]]
+name = "p2-old-keeps-new"
+file = "FsModel.tla"
+old = '            ELSE CASE pick[o] = "old" -> IF fs.durable[o] = NoContent THEN EmptyFile ELSE fs.durable[o]'
+new = '            ELSE CASE pick[o] = "old" -> fs.content[o]'
+config = "configs/recovery-posix-owneronly-hostcrash-witness-NeverRevertedOwnWrite.cfg"
+expect_absent = "NeverRevertedOwnWrite"
+
+[[mutant]]
+name = "p2-unflushed-empty"
+file = "FsModel.tla"
+old = 'Unflushed(fs) == {o \in Objs : fs.content[o] \notin {NoContent, EmptyFile} /\ fs.durable[o] # fs.content[o]}'
+new = 'Unflushed(fs) == {}'
+config = "configs/recovery-posix-owneronly-hostcrash-witness-NeverRevertedOwnWrite.cfg"
+expect_absent = "NeverRevertedOwnWrite"
