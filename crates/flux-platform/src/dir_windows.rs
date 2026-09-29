@@ -239,6 +239,10 @@ impl DirHandle for StdDir {
         check_component(name)?;
         open_lock_at(&self.0, name, FILE_OPEN)
     }
+
+    fn lock_capability(&self) -> Result<flux_fs::LockCapability> {
+        crate::lock_file::capability_of(&self.0)
+    }
 }
 
 fn create_dir_at(p: &OwnedHandle, n: &OsStr) -> Result<OwnedHandle> {

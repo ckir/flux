@@ -161,3 +161,122 @@ fn read_loop(
     buf.truncate(n);
     Ok(buf)
 }
+
+/// The built-in LOCAL allowlist (cut 7a spec, F1). Everything else - SMB, NFS, 9p, FUSE, FAT, overlay - is
+/// `Unsupported`. An OS failure of the query is an `Err` carrying it (plan decision 6).
+#[cfg(target_os = "linux")]
+pub(crate) fn capability_of(fd: &std::os::fd::OwnedFd) -> Result<flux_fs::LockCapability> {
+    // ext2/3/4, XFS, Btrfs, tmpfs, F2FS (statfs(2) f_type magic numbers).
+    const LOCAL: [u32; 5] = [0xEF53, 0x5846_5342, 0x9123_683E, 0x0102_1994, 0xF2F5_2010];
+    let st = rustix::fs::fstatfs(fd).map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
+    // f_type's width and signedness differ by architecture; every magic fits in 32 bits.
+    #[allow(clippy::unnecessary_cast)]
+    let magic = st.f_type as u64 as u32;
+    Ok(if LOCAL.contains(&magic) {
+        flux_fs::LockCapability::LocalStrong
+    } else {
+        flux_fs::LockCapability::Unsupported
+    })
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn capability_of(fd: &std::os::fd::OwnedFd) -> Result<flux_fs::LockCapability> {
+    let st = rustix::fs::fstatfs(fd).map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
+    let name: Vec<u8> = st.f_fstypename.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+    Ok(match name.as_slice() {
+        b"apfs" | b"hfs" => flux_fs::LockCapability::LocalStrong,
+        _ => flux_fs::LockCapability::Unsupported,
+    })
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+pub(crate) fn capability_of(_fd: &std::os::fd::OwnedFd) -> Result<flux_fs::LockCapability> {
+    Ok(flux_fs::LockCapability::Unsupported)
+}
+
+/// NTFS or ReFS, on a fixed or removable drive. The filesystem NAME alone is not enough: an SMB share of an NTFS
+/// volume reports "NTFS", so the drive type decides local versus remote.
+#[cfg(windows)]
+pub(crate) fn capability_of(
+    h: &std::os::windows::io::OwnedHandle,
+) -> Result<flux_fs::LockCapability> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetDriveTypeW, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
+    };
+    const DRIVE_REMOVABLE: u32 = 2;
+    const DRIVE_FIXED: u32 = 3;
+    let raw = h.as_raw_handle() as HANDLE;
+    let os_error = || FsError::from_io(std::io::Error::last_os_error());
+
+    let mut fs_name = [0u16; 64];
+    // SAFETY: every out-pointer is either null (not wanted) or a live buffer with its length passed.
+    let ok = unsafe {
+        GetVolumeInformationByHandleW(
+            raw,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            fs_name.as_mut_ptr(),
+            fs_name.len() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(os_error());
+    }
+    let end = fs_name.iter().position(|&c| c == 0).unwrap_or(fs_name.len());
+    let fs_name = String::from_utf16_lossy(&fs_name[..end]);
+    if fs_name != "NTFS" && fs_name != "ReFS" {
+        return Ok(flux_fs::LockCapability::Unsupported);
+    }
+
+    // The directory's final path, first as VOLUME_NAME_GUID: `\\?\Volume{GUID}\...` names the volume itself, for
+    // every local volume, with or without a drive letter (a volume mounted in a folder has none). Its root is what
+    // GetDriveTypeW is asked about: never a path resolved against the current directory, never one a long-path limit
+    // truncates. A network share has no GUID path, so that query fails for it; the DOS form then tells a share
+    // (`\\?\UNC\...`: Unsupported) from a real failure (an error, plan decision 6).
+    const VOLUME_NAME_GUID: u32 = 0x1;
+    let final_path = |flags: u32| -> std::io::Result<String> {
+        let mut path = vec![0u16; 32_768];
+        // SAFETY: `path` is live and its length is passed.
+        let n =
+            unsafe { GetFinalPathNameByHandleW(raw, path.as_mut_ptr(), path.len() as u32, flags) }
+                as usize;
+        if n == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if n >= path.len() {
+            // The buffer holds the longest path Windows has; a longer answer is not one this code can read.
+            return Err(std::io::Error::other(
+                "the directory's final path is longer than 32767 units",
+            ));
+        }
+        path.truncate(n);
+        Ok(String::from_utf16_lossy(&path))
+    };
+    let guid_path = match final_path(VOLUME_NAME_GUID) {
+        Ok(p) => p,
+        Err(guid_error) => {
+            return match final_path(0) {
+                Ok(dos) if dos.starts_with(r"\\?\UNC\") => Ok(flux_fs::LockCapability::Unsupported),
+                _ => Err(FsError::from_io(guid_error)),
+            };
+        }
+    };
+    // "\\?\Volume{GUID}\rest" -> "\\?\Volume{GUID}\": the root runs up to and including the fourth backslash.
+    let root_len = guid_path.match_indices('\\').nth(3).map(|(i, _)| i + 1);
+    let (Some(root_len), true) = (root_len, guid_path.starts_with(r"\\?\Volume{")) else {
+        return Err(FsError::from_io(std::io::Error::other(format!(
+            "an unexpected volume path: {guid_path}"
+        ))));
+    };
+    let root: Vec<u16> = guid_path[..root_len].encode_utf16().chain(Some(0)).collect();
+    // SAFETY: `root` is NUL-terminated and live for the call.
+    Ok(match unsafe { GetDriveTypeW(root.as_ptr()) } {
+        DRIVE_FIXED | DRIVE_REMOVABLE => flux_fs::LockCapability::LocalStrong,
+        _ => flux_fs::LockCapability::Unsupported,
+    })
+}

@@ -2,7 +2,7 @@
 
 pub mod std_fs;
 
-mod lock_file;
+pub(crate) mod lock_file;
 
 #[cfg(unix)]
 mod dir_unix;

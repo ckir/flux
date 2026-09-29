@@ -204,6 +204,10 @@ impl DirHandle for StdDir {
         Ok(crate::StdLock::new(std::fs::File::from(fd)))
     }
 
+    fn lock_capability(&self) -> Result<flux_fs::LockCapability> {
+        crate::lock_file::capability_of(&self.0)
+    }
+
     fn open_lock(&self, name: &OsStr) -> Result<Self::Lock> {
         use rustix::fs::FileType;
         use rustix::io::Errno;

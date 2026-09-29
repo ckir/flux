@@ -312,6 +312,11 @@ pub trait DirHandle: Sized {
     /// `IsADirectory`); any other non-regular file where the platform can tell (`Code::DestinationError`). A missing
     /// name is `Code::IoError` with kind `NotFound`.
     fn open_lock(&self, name: &std::ffi::OsStr) -> Result<Self::Lock>;
+
+    /// The lock capability of the filesystem this directory is on (§235.1). A filesystem outside the allowlist is
+    /// `Ok(Unsupported)`. An OS failure of the query itself is `Err` carrying that failure: the caller refuses exactly
+    /// as for `Unsupported` (`REMOTE_LOCK_UNSAFE`, §235.4 prefers refusing) and reports the cause (plan decision 6).
+    fn lock_capability(&self) -> Result<crate::LockCapability>;
 }
 
 /// Resolving `DEST` once, at start, is the only path-based call in the writer.

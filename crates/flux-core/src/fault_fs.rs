@@ -1113,6 +1113,11 @@ impl DirHandle for FakeDirHandle {
         }
         self.lock_for(&child_path)
     }
+
+    fn lock_capability(&self) -> Result<LockCapability> {
+        self.fs().record("lock_capability()".to_string(), "lock_capability")?;
+        Ok(self.inner.lock().unwrap().lock_capability.unwrap_or(LockCapability::LocalStrong))
+    }
 }
 
 #[cfg(test)]
@@ -1669,5 +1674,16 @@ mod tests {
         fs.remove_file(Path::new("/d/x")).unwrap();
         drop(d.create_lock(OsStr::new("x")).unwrap());
         d.open_lock(OsStr::new("x")).expect("a lock created after the removal is a regular file");
+    }
+
+    #[test]
+    fn the_fake_answers_the_capability_it_is_told() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        assert_eq!(d.lock_capability().unwrap(), LockCapability::LocalStrong);
+        fs.set_lock_capability(LockCapability::Unsupported);
+        assert_eq!(d.lock_capability().unwrap(), LockCapability::Unsupported);
     }
 }

@@ -222,3 +222,12 @@ fn a_lock_held_by_another_process_is_busy_and_readable_until_that_process_dies()
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
+
+#[test]
+fn the_test_machines_scratch_directory_is_a_local_strong_filesystem() {
+    // CI and development machines put their temporary directory on a local filesystem (ext4 or tmpfs, APFS, NTFS or
+    // ReFS). WSL's /mnt/* (9p) is NOT local and would answer Unsupported - which is why `just check-linux` builds in
+    // the WSL-native filesystem.
+    let (_tmp, d) = dir();
+    assert_eq!(d.lock_capability().unwrap(), flux_fs::LockCapability::LocalStrong);
+}
