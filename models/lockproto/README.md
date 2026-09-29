@@ -98,6 +98,11 @@ the manifest, while `run.py --list-mutants <toml>` only lists the names. The `Mo
 (`.github/workflows/model-mutants.yml`) runs the whole manifest on a change to it or to `run.py`, and on
 `workflow_dispatch`; it is a measurement of the checking net's own strength, not a per-commit gate.
 
+Coverage is also judged below the label. `branches` in `expected.toml` names `IF` arms of the generated module by
+label, whole condition and side; `--union-from` counts each arm's first cost node over the runs that model the
+protocol as specified (not seeded, no `FIX_*` flag in the config), and a zero fails. A branch mutant
+(`expect_zero_branch` in `mutants.toml`) is killed only by a run that finishes with its arm at zero.
+
 ## Bounds
 
 **These bounds are the `recovery` scenario's, not the suite's.** Every pairing in the table below is a

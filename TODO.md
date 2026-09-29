@@ -377,10 +377,12 @@ audit (`docs/agy-test-audit-ledger.md`), where the owner deferred them as minor.
 - [x] **M6, `recoveredAfterCrash`'s guard is always true** at `S240_3_s5`, so moving or dropping it changes no
       run; the witness restates the label's coverage.
       Closed in cut 6 (`bc3f599`): `ReplacedOnlyDead` replaces the always-true `recoveredAfterCrash` witness.
-- [ ] **M7, host-crash net holes.** Two halves remain open: making `FsHostCrash` always keep new content, or
-      emptying `Unflushed`, both leave the host-crash runs green.
+- [x] **M7, host-crash net holes.** Making `FsHostCrash` always keep new content, or emptying `Unflushed`, left
+      the host-crash runs green.
       The negative control (flipping the comparison in the `hostCrashChangedLock` update) and the past-ids seed
-      for `IdsNotReused` landed in cut 6 (`7a52dd3`); Part 2's extended-tier branch union closes the rest.
+      for `IdsNotReused` landed in cut 6 (`7a52dd3`). Closed in cut 6 Part 2 (`8cb8947`): the single-Owner witness
+      `NeverRevertedOwnWrite` must be violated, and both mutants make it unreachable. The torn outcome is a residue
+      (below).
 - [ ] **M8, the liveness consequent can be weakened undetectably.** Widening `UncertainReported` or making
       `DeadLockEventuallyCleared` trivially true keeps its witness violated and the liveness run green. Add a recovery
       seed (a Recoverer that gives up) that must violate the property.
@@ -412,7 +414,8 @@ by the commit that added this section.
 
 **Coverage, where the gate is weaker than it reads.**
 
-- [ ] **Build the BRANCH-granular coverage union — it is debt, not a limit.** TLC's `-coverage 1` is
+- [x] **Build the BRANCH-granular coverage union — it is debt, not a limit.** Closed in cut 6 Part 2
+      (`1e9e235`, `b446616`): `branches` in `expected.toml`, judged by `--union-from`. TLC's `-coverage 1` is
       expression-granular (message 2221, nested, zeros included) and the repo's own fixture proves the shape at
       `models/lockproto/testdata/smoke_check_coverage.out:109`. `run.py` already parses that message and
       deliberately discards it, so a branch union is buildable from logs on disk at no TLC cost. Settle two things
@@ -478,10 +481,10 @@ stated so the next audit starts from a prediction rather than a hunt.
       differing by one docs line reported 6,105 against 6,976 states. 52 of 77 runs halt. Either use `-workers 1`
       for halting runs, or stop quoting exact counts for them — they evidence "the seed fires, roughly this
       deep", never a number.
-- [ ] **`S240_5_s6`'s two refusing branches are indistinguishable to every gate.** Both set
+- [x] **`S240_5_s6`'s two refusing branches are indistinguishable to every gate.** Both set
       `refused := "RESTART"` with identical successor state, `RefusalJustified` no longer reaches that label, and
       coverage is label-granular — so nothing can witness that the "another file is there" case is reached.
-      Closed by the branch-granular union above, if that lands.
+      Closed in cut 6 Part 2 (`d56eefc`, `5fd5040`): the `s240-5-s6-another-file` branch entry and its mutant.
 - [ ] **`trace.toml`'s exemption for family 259 states the wrong reason.** It reads "normative precedence between
       spec sections is outside the lock-protocol model's scope", but §259.13 ranks RUNTIME SIGNALS, not spec
       sections. The exemption may well be right; its stated reason describes something the section does not say.
@@ -508,6 +511,9 @@ stated so the next audit starts from a prediction rather than a hunt.
       `[](... => <>TRUE)` on `recovery-posix-seeded-SEED_RECOVERER_GIVES_UP` came back "Temporal properties were
       violated" (CI run 36506185735); the state-level tautology replaced it. Real properties have state-level
       arguments; a new property with a constant `<>` argument would need checking.
+- [ ] **`FsHostCrash`'s torn outcome has no net.** TLC gives the `CASE` arms inside its function constructor no
+      coverage node (measured: no node for `FsModel.tla:312-318` in any extended host-crash log), and no state
+      predicate separates a torn crash from a crash in the middle of a write (cut 6, item 6).
 
 ## Closed
 
