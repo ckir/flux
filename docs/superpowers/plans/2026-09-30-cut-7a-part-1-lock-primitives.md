@@ -542,7 +542,9 @@ fn read_loop(limit: usize, mut read_at: impl FnMut(&mut [u8], u64) -> std::io::R
         use rustix::fs::FileType;
         use rustix::io::Errno;
         check_component(name)?;
-        let fd = openat(&self.0, name, OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())
+        // NONBLOCK: an open of a FIFO planted at the lock's name must not hang (it is refused just below). It changes
+        // nothing for a regular file, whose reads and writes never block on it.
+        let fd = openat(&self.0, name, OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())
             .map_err(|e| match e {
                 // O_NOFOLLOW on a symlink in the final component: the link itself is refused, never followed.
                 Errno::LOOP => FsError::new(Code::SafetyRejected, std::io::Error::from(e)),
