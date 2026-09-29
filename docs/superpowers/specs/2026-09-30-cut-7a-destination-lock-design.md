@@ -238,7 +238,10 @@ The lock is:
    - Success:
      1. state `COMPLETED` (durable);
      2. remove the run's own temporaries;
-     3. remove the workspace directory (or the adjacent record);
+     3. ONLY IF every removal in step 2 succeeded: remove the state - for a tree, the `manifest` file, then the
+        now-empty workspace directory with a plain `rmdir`; for a single file, the adjacent record. If any step-2
+        removal failed, the state stays `COMPLETED` as the only record naming the leftover temporaries (the id that
+        finds them, refinement 7), and steps 3-4 are skipped (panel round 5);
      4. `rmdir` `operations/` and `.flux/` if they are empty (a failure because they are not empty is not an error);
      5. `still_owned` (`S99_release_check`);
      6. unlink the lock by name, then close the handle, which releases the OS-native lock (`S99_release`).
@@ -311,8 +314,10 @@ A leftover `.broken.*` file is classified by its recorded owner. An uncertain lo
 4. Delete its partials, then its workspace or record. 7a's state does not list partials (their records are `state.db`'s,
    cut 8), so they are found by the prior operation's EXACT id: every `<name>.flux-partial.<prior-id>` under DEST (a walk
    that skips only the three reserved subdirectories `DEST/.flux/operations/`, `standalone/` and `atomic/`, because
-   user files may legally live elsewhere under `DEST/.flux/`). The walk costs one traversal of DEST, the same order
-   as a copy, and runs only on an explicit `--restart`, or `target.flux-partial.<prior-id>` beside a single-file target. Authority comes from the
+   user files may legally live elsewhere under `DEST/.flux/`). The walk costs one traversal of the WHOLE existing
+   DEST - which can far exceed the copy itself when DEST is large and the source small - and runs only on an explicit
+   `--restart`. 7b's `roots` (the prior operation's source-to-destination mapping) and cut 8's recorded partials are
+   what bound it later, or `target.flux-partial.<prior-id>` beside a single-file target. Authority comes from the
    valid prior state naming that id, never from the name pattern alone (spec:9369-9371 forbids that only when the
    record is missing or corrupt), and `still_owned` runs before EACH deletion (spec:9365-9367).
 5. Continue at step 5 of the run: this operation's state, then the record written through the held handle
