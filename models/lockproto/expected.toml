@@ -761,6 +761,16 @@ unreached = [
     { label = "S240_5_seed_write_begin", reason = "reached only with SEED_RENAME_OVER_TAKEOVER; its seeded run reaches it" },
     { label = "S240_5_seed_write_end", reason = "reached only with SEED_RENAME_OVER_TAKEOVER; its seeded run reaches it" },
     { label = "S240_5_seed_rename", reason = "reached only with SEED_RENAME_OVER_TAKEOVER; its seeded run reaches it" },
+    { label = "S240_5_s2", reason = "240.5 takes over only under strong file identity: S240_5_s1 refuses under IdentityStrength = weak (cut 6, item 13)" },
+    { label = "S240_5_s3", reason = "240.5 takes over only under strong file identity: S240_5_s1 refuses under IdentityStrength = weak (cut 6, item 13)" },
+    { label = "S240_5_s4", reason = "240.5 takes over only under strong file identity: S240_5_s1 refuses under IdentityStrength = weak (cut 6, item 13)" },
+    { label = "S240_5_s5", reason = "240.5 takes over only under strong file identity: S240_5_s1 refuses under IdentityStrength = weak (cut 6, item 13)" },
+    { label = "S240_5_s6", reason = "240.5 takes over only under strong file identity: S240_5_s1 refuses under IdentityStrength = weak (cut 6, item 13)" },
+    { label = "S240_5_s6_seed", reason = "240.5 takes over only under strong file identity: S240_5_s1 refuses under IdentityStrength = weak (cut 6, item 13)" },
+    { label = "S240_5_s6_flush", reason = "240.5 takes over only under strong file identity: S240_5_s1 refuses under IdentityStrength = weak (cut 6, item 13)" },
+    { label = "S240_5_s6_write_begin", reason = "240.5 takes over only under strong file identity: S240_5_s1 refuses under IdentityStrength = weak (cut 6, item 13)" },
+    { label = "S240_5_s6_write_end", reason = "240.5 takes over only under strong file identity: S240_5_s1 refuses under IdentityStrength = weak (cut 6, item 13)" },
+    { label = "S240_5_close", reason = "240.5 takes over only under strong file identity: S240_5_s1 refuses under IdentityStrength = weak (cut 6, item 13)" },
 ]
 timeout_minutes = 60
 
