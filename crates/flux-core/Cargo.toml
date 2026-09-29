@@ -10,6 +10,8 @@ publish.workspace = true
 
 [dependencies]
 flux-fs = { path = "../flux-fs" }
+uuid = { workspace = true }
+blake3 = { workspace = true }
 
 [dev-dependencies]
 flux-platform = { path = "../flux-platform" }

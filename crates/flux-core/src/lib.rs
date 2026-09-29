@@ -1,6 +1,7 @@
 //! Flux engine (spec §3.1).
 
 pub mod copy;
+pub mod ids;
 pub mod tree;
 pub mod walk;
 
