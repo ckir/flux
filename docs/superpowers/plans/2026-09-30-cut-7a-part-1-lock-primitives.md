@@ -115,7 +115,7 @@ supplies:
   it makes is formatting, never a shape change.
 - **Gates:**
   - after each task: `just check` (the Windows host; the final line reports all tests passed);
-  - after any task that touches Unix code: `just check-linux` (it ends `GATE: linux OK`);
+  - after any task that touches Unix code: `just check-linux` (exit 0, and nextest's summary line reports every test passed; the recipe prints no gate banner);
   - after any task that touches macOS code: `just check-mac` (cross-clippy, exit 0).
 - **Commits:** named paths only; each commit message ends with a `Co-Authored-By:` line for the model you are.
 
@@ -961,7 +961,7 @@ impl Drop for FakeLock {
   - `cargo test -p flux-platform --test lock_file` → all pass on Windows.
   - `cargo test -p flux-core fault_fs` → all pass.
   - `just check`.
-  - `just check-linux` → `GATE: linux OK`; this runs the Unix arm and its tests.
+  - `just check-linux` → exit 0, nextest summary all passed; this runs the Unix arm and its tests.
   - `just check-mac` → exit 0.
 - [ ] **Step 8:** commit the files of this task:
   `feat: lock files through a directory handle, with a non-blocking OS-native lock (cut 7a Part 1)`.
@@ -1235,7 +1235,7 @@ pub(crate) fn capability_of(h: &std::os::windows::io::OwnedHandle) -> Result<flu
   - `cargo test -p flux-platform --test lock_file the_test_machines` → ok on Windows. The dev machine's scratch
     directory is on C: (NTFS) or E: (ReFS Dev Drive); report which.
   - `just check`.
-  - `just check-linux` → `GATE: linux OK`.
+  - `just check-linux` → exit 0, nextest summary all passed.
   - `just check-mac` → exit 0.
 - [ ] **Step 5: non-vacuity (do not commit).**
   - Make the Linux `LOCAL` list empty (`[u32; 0] = []`): `just check-linux` must fail
@@ -1350,7 +1350,7 @@ pub fn boot_session_id() -> String {
   - `cargo test -p flux-platform --test lock_file boot_session -- --nocapture` → ok, and a line
     `boot_session_id = <value>`; report the value.
   - `just check`.
-  - `just check-linux` → `GATE: linux OK`.
+  - `just check-linux` → exit 0, nextest summary all passed.
   - `just check-mac` → exit 0.
   - `cargo deny check` (or the repo's `just` recipe for it, if one exists) → passes with `libc` added.
 - [ ] **Step 5:** commit: `feat(platform): the host's boot session id (cut 7a Part 1)`.
@@ -1669,7 +1669,7 @@ mod tests {
 
 ### Task 8: Part 1 verification
 
-- [ ] **Step 1:** `just check`, `just check-linux` (`GATE: linux OK`) and `just check-mac` all pass; `git status --short`
+- [ ] **Step 1:** `just check`, `just check-linux` (exit 0, all passed) and `just check-mac` all pass; `git status --short`
   is clean.
 - [ ] **Step 2 (driver):** no local gate runs a macOS test (`just check-mac` only cross-compiles), so the macOS arms
   - `capability_of`, `boot_session_id`, the symlink refusal - are first EXECUTED by CI. Part 1 is not done until CI's
