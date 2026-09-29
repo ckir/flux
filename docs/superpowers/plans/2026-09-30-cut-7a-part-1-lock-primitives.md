@@ -95,6 +95,11 @@ supplies:
    by the old tail, and every reader would find the new owner's record uncertain. The cut is a length change, not a
    second write of content, so §259.6's "one write call" still holds. A crash between the write and the cut leaves a
    magic-prefixed oversized file: uncertain, the same class as any torn overwrite.
+6. **An OS failure of the capability query is an `Err` carrying it, not a silent `Unsupported`** (panel round 2; owner
+   ruling). The run still refuses exactly as the design spec says (`REMOTE_LOCK_UNSAFE`, exit 3, nothing touched), but
+   Part 2 puts the OS error in the refusal, so an operator who meets "access denied" on a volume query sees it. A
+   filesystem outside the allowlist stays `Ok(Unsupported)`. The design spec's "Lock capability" paragraph is amended
+   to match in the same commit as this plan revision.
 
 ## Ground rules
 
@@ -106,6 +111,8 @@ supplies:
   the exact signature the crate version exposes (a pointer cast, a type alias), when the behaviour is identical. Report
   it; do not stop.
 - **Oracle:** the tests in each task are already written - implement until they pass. Never edit a test to pass.
+- **Formatting:** the code in this plan is not guaranteed rustfmt-exact. Run `cargo fmt` before every gate; a change
+  it makes is formatting, never a shape change.
 - **Gates:**
   - after each task: `just check` (the Windows host; the final line reports all tests passed);
   - after any task that touches Unix code: `just check-linux` (it ends `GATE: linux OK`);
@@ -1093,8 +1100,9 @@ fn the_test_machines_scratch_directory_is_a_local_strong_filesystem() {
 
 ```rust
 
-    /// The lock capability of the filesystem this directory is on (§235.1). A failure to tell is `Unsupported`, never
-    /// an error: §235.4 prefers refusing.
+    /// The lock capability of the filesystem this directory is on (§235.1). A filesystem outside the allowlist is
+    /// `Ok(Unsupported)`. An OS failure of the query itself is `Err` carrying that failure: the caller refuses exactly
+    /// as for `Unsupported` (`REMOTE_LOCK_UNSAFE`, §235.4 prefers refusing) and reports the cause (plan decision 6).
     fn lock_capability(&self) -> Result<crate::LockCapability>;
 ```
 
@@ -1103,42 +1111,37 @@ fn the_test_machines_scratch_directory_is_a_local_strong_filesystem() {
 ```rust
 
 /// The built-in LOCAL allowlist (cut 7a spec, F1). Everything else - SMB, NFS, 9p, FUSE, FAT, overlay - is
-/// `Unsupported`, and so is any failure to tell.
+/// `Unsupported`. An OS failure of the query is an `Err` carrying it (plan decision 6).
 #[cfg(target_os = "linux")]
-pub(crate) fn capability_of(fd: &std::os::fd::OwnedFd) -> flux_fs::LockCapability {
+pub(crate) fn capability_of(fd: &std::os::fd::OwnedFd) -> Result<flux_fs::LockCapability> {
     // ext2/3/4, XFS, Btrfs, tmpfs, F2FS (statfs(2) f_type magic numbers).
     const LOCAL: [u32; 5] = [0xEF53, 0x5846_5342, 0x9123_683E, 0x0102_1994, 0xF2F5_2010];
-    match rustix::fs::fstatfs(fd) {
-        // f_type's width differs by architecture; every magic fits in 32 bits.
-        #[allow(clippy::unnecessary_cast)]
-        Ok(st) if LOCAL.contains(&(st.f_type as u64 as u32)) => flux_fs::LockCapability::LocalStrong,
-        _ => flux_fs::LockCapability::Unsupported,
-    }
+    let st = rustix::fs::fstatfs(fd).map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
+    // f_type's width and signedness differ by architecture; every magic fits in 32 bits.
+    #[allow(clippy::unnecessary_cast)]
+    let magic = st.f_type as u64 as u32;
+    Ok(if LOCAL.contains(&magic) { flux_fs::LockCapability::LocalStrong } else { flux_fs::LockCapability::Unsupported })
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn capability_of(fd: &std::os::fd::OwnedFd) -> flux_fs::LockCapability {
-    match rustix::fs::fstatfs(fd) {
-        Ok(st) => {
-            let name: Vec<u8> = st.f_fstypename.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
-            match name.as_slice() {
-                b"apfs" | b"hfs" => flux_fs::LockCapability::LocalStrong,
-                _ => flux_fs::LockCapability::Unsupported,
-            }
-        }
-        Err(_) => flux_fs::LockCapability::Unsupported,
-    }
+pub(crate) fn capability_of(fd: &std::os::fd::OwnedFd) -> Result<flux_fs::LockCapability> {
+    let st = rustix::fs::fstatfs(fd).map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
+    let name: Vec<u8> = st.f_fstypename.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+    Ok(match name.as_slice() {
+        b"apfs" | b"hfs" => flux_fs::LockCapability::LocalStrong,
+        _ => flux_fs::LockCapability::Unsupported,
+    })
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-pub(crate) fn capability_of(_fd: &std::os::fd::OwnedFd) -> flux_fs::LockCapability {
-    flux_fs::LockCapability::Unsupported
+pub(crate) fn capability_of(_fd: &std::os::fd::OwnedFd) -> Result<flux_fs::LockCapability> {
+    Ok(flux_fs::LockCapability::Unsupported)
 }
 
 /// NTFS or ReFS, on a fixed or removable drive. The filesystem NAME alone is not enough: an SMB share of an NTFS
 /// volume reports "NTFS", so the drive type decides local versus remote.
 #[cfg(windows)]
-pub(crate) fn capability_of(h: &std::os::windows::io::OwnedHandle) -> flux_fs::LockCapability {
+pub(crate) fn capability_of(h: &std::os::windows::io::OwnedHandle) -> Result<flux_fs::LockCapability> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -1147,6 +1150,7 @@ pub(crate) fn capability_of(h: &std::os::windows::io::OwnedHandle) -> flux_fs::L
     const DRIVE_REMOVABLE: u32 = 2;
     const DRIVE_FIXED: u32 = 3;
     let raw = h.as_raw_handle() as HANDLE;
+    let os_error = || FsError::from_io(std::io::Error::last_os_error());
 
     let mut fs_name = [0u16; 64];
     // SAFETY: every out-pointer is either null (not wanted) or a live buffer with its length passed.
@@ -1163,24 +1167,28 @@ pub(crate) fn capability_of(h: &std::os::windows::io::OwnedHandle) -> flux_fs::L
         )
     };
     if ok == 0 {
-        return flux_fs::LockCapability::Unsupported;
+        return Err(os_error());
     }
     let end = fs_name.iter().position(|&c| c == 0).unwrap_or(fs_name.len());
     let fs_name = String::from_utf16_lossy(&fs_name[..end]);
     if fs_name != "NTFS" && fs_name != "ReFS" {
-        return flux_fs::LockCapability::Unsupported;
+        return Ok(flux_fs::LockCapability::Unsupported);
     }
 
     let mut path = vec![0u16; 32_768];
     // SAFETY: `path` is live and its length is passed; flags 0 = FILE_NAME_NORMALIZED | VOLUME_NAME_DOS.
     let n = unsafe { GetFinalPathNameByHandleW(raw, path.as_mut_ptr(), path.len() as u32, 0) } as usize;
-    if n == 0 || n >= path.len() {
-        return flux_fs::LockCapability::Unsupported;
+    if n == 0 {
+        return Err(os_error());
+    }
+    if n >= path.len() {
+        // The buffer holds the longest path Windows has; a longer answer is not one this code can read.
+        return Err(FsError::from_io(std::io::Error::other("the directory's final path is longer than 32767 units")));
     }
     path.truncate(n);
     let text = String::from_utf16_lossy(&path);
     if text.starts_with(r"\\?\UNC\") {
-        return flux_fs::LockCapability::Unsupported;
+        return Ok(flux_fs::LockCapability::Unsupported);
     }
     // "\\?\C:\x" -> "C:\x": GetVolumePathNameW and GetDriveTypeW are given the ordinary form.
     let plain: Vec<u16> = text.strip_prefix(r"\\?\").unwrap_or(&text).encode_utf16().chain(Some(0)).collect();
@@ -1188,17 +1196,17 @@ pub(crate) fn capability_of(h: &std::os::windows::io::OwnedHandle) -> flux_fs::L
     // SAFETY: `plain` is NUL-terminated; `root` is live with its length passed.
     let ok = unsafe { GetVolumePathNameW(plain.as_ptr(), root.as_mut_ptr(), root.len() as u32) };
     if ok == 0 {
-        return flux_fs::LockCapability::Unsupported;
+        return Err(os_error());
     }
     // SAFETY: GetVolumePathNameW wrote a NUL-terminated root.
-    match unsafe { GetDriveTypeW(root.as_ptr()) } {
+    Ok(match unsafe { GetDriveTypeW(root.as_ptr()) } {
         DRIVE_FIXED | DRIVE_REMOVABLE => flux_fs::LockCapability::LocalStrong,
         _ => flux_fs::LockCapability::Unsupported,
-    }
+    })
 }
 ```
 
-  In `dir_unix.rs`'s `impl DirHandle` add `fn lock_capability(&self) -> Result<flux_fs::LockCapability> { Ok(crate::lock_file::capability_of(&self.0)) }`.
+  In `dir_unix.rs`'s `impl DirHandle` add `fn lock_capability(&self) -> Result<flux_fs::LockCapability> { crate::lock_file::capability_of(&self.0) }`.
   In `dir_windows.rs`'s `impl DirHandle` add the same body. Make the module visible to them: in `lib.rs` change
   `mod lock_file;` to `pub(crate) mod lock_file;`.
   In the fake's `impl DirHandle for FakeDirHandle` add:
@@ -1685,3 +1693,6 @@ Panel round 2 (agy), at `baf85de`:
 - FOLDED: the fake's `write_at_start` replaced the contents in one step, so no test could inject the crash window
   between the write and the cut; it now records a separate `lock_set_len` step, with a test of what a fault there
   leaves.
+- FOLDED (owner ruling, "Refuse, keep the cause"): an OS failure of the capability query was swallowed into
+  `Unsupported`, hiding the cause from the operator. It is now an `Err` (plan decision 6); the refusal stays
+  `REMOTE_LOCK_UNSAFE`, exit 3; the design spec's "Lock capability" paragraph is amended to match.

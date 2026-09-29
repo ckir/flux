@@ -84,8 +84,9 @@ and two runs can no longer write one destination at once.
   - macOS, `f_fstypename`: `apfs`, `hfs`;
   - Windows: the volume's filesystem name `NTFS` or `ReFS`, on a `DRIVE_FIXED` or `DRIVE_REMOVABLE` volume.
 
-  Anything else - SMB, NFS, 9p (WSL's `/mnt/*`), FUSE, FAT - is `Unsupported`. A detection failure is also
-  `Unsupported`: prefer refusing (§235.4, spec:10269-10274).
+  Anything else - SMB, NFS, 9p (WSL's `/mnt/*`), FUSE, FAT - is `Unsupported`. A detection failure is refused the same
+  way, `REMOTE_LOCK_UNSAFE`: prefer refusing (§235.4, spec:10269-10274). Its refusal also reports the OS error the
+  query failed with (owner ruling 2026-09-30, Part 1 plan panel round 2), so the operator sees the cause.
 - **`boot_session_id`**:
   - Linux: `/proc/sys/kernel/random/boot_id`;
   - macOS: `kern.boottime`;
