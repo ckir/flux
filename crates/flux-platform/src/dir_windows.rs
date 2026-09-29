@@ -57,8 +57,9 @@ fn nt_io_error(what: &str, status: i32) -> std::io::Error {
         // Mapping FILE_IS_A_DIRECTORY globally is safe HERE rather than merely
         // convenient: it can only be returned to a call that asked for a
         // non-directory, and `create_new_at` is the one call in this file that passes
-        // FILE_NON_DIRECTORY_FILE. If another call ever does, this mapping needs
-        // revisiting with it.
+        // FILE_NON_DIRECTORY_FILE. `open_lock_at` passes it too, and answers
+        // FILE_IS_A_DIRECTORY for an OPEN before calling this. If another call ever
+        // does, this mapping needs revisiting with it.
         STATUS_OBJECT_NAME_COLLISION | STATUS_FILE_IS_A_DIRECTORY => {
             std::io::ErrorKind::AlreadyExists
         }
@@ -96,6 +97,7 @@ impl StdDir {
 
 impl DirHandle for StdDir {
     type Writer = crate::StdFile;
+    type Lock = crate::StdLock;
 
     fn open_dir(&self, name: &OsStr) -> Result<Self> {
         check_component(name)?;
@@ -226,6 +228,16 @@ impl DirHandle for StdDir {
             ));
         }
         crate::dir_windows::rename_at(&self.0, from, &other.0, to, true)
+    }
+
+    fn create_lock(&self, name: &OsStr) -> Result<Self::Lock> {
+        check_component(name)?;
+        open_lock_at(&self.0, name, FILE_CREATE)
+    }
+
+    fn open_lock(&self, name: &OsStr) -> Result<Self::Lock> {
+        check_component(name)?;
+        open_lock_at(&self.0, name, FILE_OPEN)
     }
 }
 
@@ -368,6 +380,73 @@ fn create_new_at(p: &OwnedHandle, n: &OsStr) -> Result<crate::StdFile> {
     // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `h` is a valid handle we own.
     let opened = unsafe { OwnedHandle::from_raw_handle(h as _) };
     Ok(crate::std_fs::std_file_from(std::fs::File::from(opened)))
+}
+
+/// The lock file, created (`FILE_CREATE`) or opened (`FILE_OPEN`) relative to `p`, for reading AND writing.
+///
+/// `FILE_OPEN_REPARSE_POINT` for both, as `create_new_at` explains: a create through a dangling link must collide,
+/// and an open must get the LINK, which is then refused below rather than followed. Share modes: read, write and
+/// DELETE, because another process must be able to open the lock to classify it, and §240.3 renames a dead owner's
+/// lock aside while it is open.
+fn open_lock_at(p: &OwnedHandle, n: &OsStr, disposition: u32) -> Result<crate::StdLock> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
+    let mut wide: Vec<u16> = n.encode_wide().collect();
+    let bytes = (wide.len() * 2) as u16;
+    let us = UNICODE_STRING { Length: bytes, MaximumLength: bytes, Buffer: wide.as_mut_ptr() };
+    let mut oa: OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    oa.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
+    oa.RootDirectory = p.as_raw_handle() as HANDLE;
+    oa.ObjectName = &raw const us;
+    let mut h: HANDLE = std::ptr::null_mut();
+    let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    // SAFETY: every pointer is to a live local that outlives the call, and `wide` outlives `us`.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut h,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | SYNCHRONIZE,
+            &raw const oa,
+            &raw mut iosb,
+            std::ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            disposition,
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status != 0 {
+        // An OPEN that meets a directory is not a name collision: `nt_io_error` maps FILE_IS_A_DIRECTORY to
+        // AlreadyExists for `create_new_at`'s sake, so answer it here first.
+        if disposition == FILE_OPEN && status == STATUS_FILE_IS_A_DIRECTORY {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::new(
+                    std::io::ErrorKind::IsADirectory,
+                    "a directory is not a lock file",
+                ),
+            ));
+        }
+        let code = match status {
+            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => Code::IoError,
+            STATUS_ACCESS_DENIED => Code::PermissionDenied,
+            _ => Code::IoError,
+        };
+        return Err(FsError::new(code, nt_io_error("NtCreateFile", status)));
+    }
+    // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `h` is a valid handle we own.
+    let opened = unsafe { OwnedHandle::from_raw_handle(h as _) };
+    // The open succeeded even on a surrogate; refuse it, as `open_dir` does. A created file cannot be one.
+    if disposition == FILE_OPEN
+        && let Some(tag) = reparse_tag_of(&opened)?
+        && is_name_surrogate(tag)
+    {
+        return Err(FsError::new(
+            Code::SafetyRejected,
+            std::io::Error::other(format!("name-surrogate reparse point, tag 0x{tag:08X}")),
+        ));
+    }
+    Ok(crate::StdLock::new(File::from(opened)))
 }
 
 fn metadata_at(p: &OwnedHandle, n: &OsStr) -> Result<Metadata> {

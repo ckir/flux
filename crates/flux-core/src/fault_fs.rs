@@ -6,7 +6,7 @@
 
 use flux_fs::{
     Code, DestinationRoot, DirEntry, DirHandle, FileHandle, FileSystem, FileType, FsError,
-    Metadata, Perms, Result, check_component,
+    LockCapability, LockFile, Metadata, Perms, Result, check_component,
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -86,6 +86,12 @@ struct Inner {
     /// arguments. No `DirHandle` method consults this map.
     dir_node_by_path: HashMap<PathBuf, u64>,
     next_dir_node: u64,
+    /// Object index -> the `FakeLock` handle id holding its OS-native lock. Keyed by OBJECT, not path: a real
+    /// OS-native lock follows the file across a rename, and §240.3 renames a lock aside while holding it.
+    lock_holders: HashMap<u128, u64>,
+    next_lock_handle: u64,
+    /// What `lock_capability` answers; `None` means `LocalStrong`.
+    lock_capability: Option<LockCapability>,
 }
 
 /// One node in the `DirHandle` graph, addressed by an opaque id rather than by
@@ -250,6 +256,105 @@ impl FileHandle for FakeHandle {
     }
 }
 
+/// A lock file in the fake. It addresses its OBJECT (by identity), so a rename carries it.
+pub struct FakeLock {
+    object: u128,
+    handle: u64,
+    inner: std::sync::Arc<Mutex<Inner>>,
+}
+
+// Manual, as for `FakeDirHandle`: `Inner` is not `Debug`, and the tests call `unwrap_err()` on `Result<FakeLock, _>`.
+impl std::fmt::Debug for FakeLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FakeLock")
+            .field("object", &self.object)
+            .field("handle", &self.handle)
+            .finish()
+    }
+}
+
+impl FakeLock {
+    /// The path now holding this handle's object, or `NotFound` if none does (the fake does not model reading an
+    /// unlinked open file).
+    fn path(g: &Inner, object: u128) -> Result<PathBuf> {
+        g.identities
+            .iter()
+            .find(|(_, id)| matches!(id, flux_fs::FileIdentity::Strong(o) if o.index == object))
+            .map(|(p, _)| p.clone())
+            .ok_or_else(|| {
+                FsError::new(Code::IoError, std::io::Error::from(std::io::ErrorKind::NotFound))
+            })
+    }
+
+    fn record(&self, call: &str) -> Result<()> {
+        let fs = FaultFs { inner: std::sync::Arc::clone(&self.inner) };
+        let path = { Self::path(&self.inner.lock().unwrap(), self.object).unwrap_or_default() };
+        fs.record(format!("{call}({})", path.display()), call)
+    }
+}
+
+impl LockFile for FakeLock {
+    fn try_lock(&self) -> Result<bool> {
+        self.record("try_lock")?;
+        let mut g = self.inner.lock().unwrap();
+        match g.lock_holders.get(&self.object) {
+            Some(&h) if h != self.handle => Ok(false),
+            _ => {
+                g.lock_holders.insert(self.object, self.handle);
+                Ok(true)
+            }
+        }
+    }
+
+    fn read_all(&self, limit: usize) -> Result<Vec<u8>> {
+        self.record("read_all")?;
+        let g = self.inner.lock().unwrap();
+        let path = Self::path(&g, self.object)?;
+        let mut bytes = g.files.get(&path).cloned().unwrap_or_default();
+        bytes.truncate(limit + 1);
+        Ok(bytes)
+    }
+
+    /// Two steps, as on the real platforms: the write in place, then the cut. Each is a separate recorded call, so a
+    /// test can inject a fault at the cut (`lock_set_len`) and see the oversized file a crash there leaves behind.
+    fn write_at_start(&self, bytes: &[u8]) -> Result<()> {
+        self.record("write_at_start")?;
+        {
+            let mut g = self.inner.lock().unwrap();
+            let path = Self::path(&g, self.object)?;
+            let file = g.files.entry(path).or_default();
+            if file.len() < bytes.len() {
+                file.resize(bytes.len(), 0);
+            }
+            file[..bytes.len()].copy_from_slice(bytes);
+        }
+        self.record("lock_set_len")?;
+        let mut g = self.inner.lock().unwrap();
+        let path = Self::path(&g, self.object)?;
+        g.files.get_mut(&path).expect("written just above").truncate(bytes.len());
+        Ok(())
+    }
+
+    fn sync_all(&self) -> Result<()> {
+        self.record("lock_sync_all")
+    }
+
+    fn identity(&self) -> Result<flux_fs::FileIdentity> {
+        Ok(flux_fs::FileIdentity::Strong(flux_fs::ObjectId { volume: 1, index: self.object }))
+    }
+}
+
+impl Drop for FakeLock {
+    /// Closing the handle releases the OS-native lock, as on every real platform.
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.inner.lock()
+            && g.lock_holders.get(&self.object) == Some(&self.handle)
+        {
+            g.lock_holders.remove(&self.object);
+        }
+    }
+}
+
 impl FaultFs {
     pub fn new() -> Self {
         Self::default()
@@ -315,6 +420,11 @@ impl FaultFs {
 
     pub fn called(&self, prefix: &str) -> bool {
         self.calls().iter().any(|c| c.starts_with(prefix))
+    }
+
+    /// What every `lock_capability` call answers from now on (default `LocalStrong`).
+    pub fn set_lock_capability(&self, capability: LockCapability) {
+        self.inner.lock().unwrap().lock_capability = Some(capability);
     }
 
     /// The bytes the fake currently holds for `path`.
@@ -788,10 +898,26 @@ impl FakeDirHandle {
             .path
             .clone()
     }
+
+    /// A new `FakeLock` handle onto the object now at `path`.
+    fn lock_for(&self, path: &Path) -> Result<FakeLock> {
+        let mut g = self.inner.lock().unwrap();
+        let object = match g.identities.get(path) {
+            Some(flux_fs::FileIdentity::Strong(o)) => o.index,
+            _ => panic!(
+                "no strong identity minted for {}: a creation path skipped mint_identity",
+                path.display()
+            ),
+        };
+        g.next_lock_handle += 1;
+        let handle = g.next_lock_handle;
+        Ok(FakeLock { object, handle, inner: std::sync::Arc::clone(&self.inner) })
+    }
 }
 
 impl DirHandle for FakeDirHandle {
     type Writer = FakeHandle;
+    type Lock = FakeLock;
 
     fn identity(&self) -> Result<flux_fs::FileIdentity> {
         let path = self.my_path();
@@ -918,6 +1044,71 @@ impl DirHandle for FakeDirHandle {
         let from_path = self.my_path().join(from);
         let to_path = other.my_path().join(to);
         self.fs().rename_replace(&from_path, &to_path)
+    }
+
+    fn create_lock(&self, name: &OsStr) -> Result<Self::Lock> {
+        check_component(name)?;
+        let child_path = self.my_path().join(name);
+        self.fs().record(format!("create_lock({})", child_path.display()), "create_lock")?;
+        {
+            // Not through `create_new`: that would count as a `create_new` call for nth-fault injection and consume
+            // a pending `write_fault` meant for a data file. The refusal is the same: a file OR a directory holds the
+            // name (the reason is recorded in `create_new`).
+            let mut g = self.inner.lock().unwrap();
+            if g.files.contains_key(&child_path) || g.directories.contains(&child_path) {
+                return Err(FsError::new(
+                    Code::IoError,
+                    std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+                ));
+            }
+            g.files.insert(child_path.clone(), Vec::new());
+            mint_identity(&mut g, &child_path);
+        }
+        self.lock_for(&child_path)
+    }
+
+    fn open_lock(&self, name: &OsStr) -> Result<Self::Lock> {
+        check_component(name)?;
+        let child_path = self.my_path().join(name);
+        self.fs().record(format!("open_lock({})", child_path.display()), "open_lock")?;
+        {
+            let g = self.inner.lock().unwrap();
+            match g.types.get(&child_path) {
+                Some(FileType::Symlink) => {
+                    return Err(FsError::new(
+                        Code::SafetyRejected,
+                        std::io::Error::other(
+                            "refuses to follow a symlink or other name-surrogate",
+                        ),
+                    ));
+                }
+                Some(FileType::Other) => {
+                    return Err(FsError::new(
+                        Code::DestinationError,
+                        std::io::Error::other(
+                            "a lock path holds something other than a regular file",
+                        ),
+                    ));
+                }
+                _ => {}
+            }
+            if g.directories.contains(&child_path) {
+                return Err(FsError::new(
+                    Code::DestinationError,
+                    std::io::Error::new(
+                        std::io::ErrorKind::IsADirectory,
+                        "a directory is not a lock file",
+                    ),
+                ));
+            }
+            if !g.files.contains_key(&child_path) {
+                return Err(FsError::new(
+                    Code::IoError,
+                    std::io::Error::from(std::io::ErrorKind::NotFound),
+                ));
+            }
+        }
+        self.lock_for(&child_path)
     }
 }
 
@@ -1367,5 +1558,99 @@ mod tests {
         let calls = fs.calls().len();
         let _ = d.identity().unwrap();
         assert_eq!(fs.calls().len(), calls);
+    }
+    #[test]
+    fn a_fake_lock_is_exclusive_per_object_and_released_on_drop() {
+        use flux_fs::{DestinationRoot, DirHandle, FileSystem, LockFile};
+        use std::ffi::OsStr;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let first = d.create_lock(OsStr::new("x.flux-lock")).unwrap();
+        assert_eq!(
+            d.create_lock(OsStr::new("x.flux-lock")).unwrap_err().source.kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert!(first.try_lock().unwrap());
+        let second = d.open_lock(OsStr::new("x.flux-lock")).unwrap();
+        assert!(!second.try_lock().unwrap());
+        drop(first);
+        assert!(second.try_lock().unwrap());
+    }
+
+    #[test]
+    fn a_fake_lock_follows_its_object_across_a_rename() {
+        use flux_fs::{DestinationRoot, DirHandle, FileSystem, LockFile};
+        use std::ffi::OsStr;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let holder = d.create_lock(OsStr::new("x.flux-lock")).unwrap();
+        holder.write_at_start(b"record").unwrap();
+        assert!(holder.try_lock().unwrap());
+        d.rename_no_replace(OsStr::new("x.flux-lock"), &d, OsStr::new("x.flux-lock.broken.1"))
+            .unwrap();
+        let moved = d.open_lock(OsStr::new("x.flux-lock.broken.1")).unwrap();
+        assert!(!moved.try_lock().unwrap(), "the lock moved with the object");
+        assert_eq!(moved.read_all(4096).unwrap(), b"record");
+        assert_eq!(moved.identity().unwrap(), holder.identity().unwrap());
+    }
+
+    #[test]
+    fn a_fake_open_lock_refuses_what_the_real_ones_refuse() {
+        use flux_fs::{DestinationRoot, DirHandle, FileSystem};
+        use std::ffi::OsStr;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let e = d.open_lock(OsStr::new("absent")).unwrap_err();
+        assert_eq!((e.code, e.source.kind()), (Code::IoError, std::io::ErrorKind::NotFound));
+        fs.write_file("/d/link", b"");
+        fs.set_type("/d/link", FileType::Symlink);
+        assert_eq!(d.open_lock(OsStr::new("link")).unwrap_err().code, Code::SafetyRejected);
+        drop(d.create_dir(OsStr::new("sub")).unwrap());
+        let e = d.open_lock(OsStr::new("sub")).unwrap_err();
+        assert_eq!(
+            (e.code, e.source.kind()),
+            (Code::DestinationError, std::io::ErrorKind::IsADirectory)
+        );
+    }
+
+    #[test]
+    fn a_fake_lock_write_replaces_the_contents_and_cuts_the_old_tail() {
+        use flux_fs::{DestinationRoot, DirHandle, FileSystem, LockFile};
+        use std::ffi::OsStr;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let h = d.create_lock(OsStr::new("x")).unwrap();
+        h.write_at_start(&[1u8; 8]).unwrap();
+        let before = h.identity().unwrap();
+        h.write_at_start(&[2u8; 4]).unwrap();
+        assert_eq!(
+            h.read_all(100).unwrap(),
+            vec![2, 2, 2, 2],
+            "the old tail is cut, as on the real platforms"
+        );
+        assert_eq!(h.read_all(3).unwrap().len(), 4, "limit + 1");
+        assert_eq!(h.identity().unwrap(), before, "the same object");
+    }
+
+    #[test]
+    fn a_fault_at_the_fake_locks_cut_leaves_the_new_record_followed_by_the_old_tail() {
+        use flux_fs::{DestinationRoot, DirHandle, FileSystem, LockFile};
+        use std::ffi::OsStr;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let h = d.create_lock(OsStr::new("x")).unwrap();
+        h.write_at_start(&[1u8; 8]).unwrap();
+        fs.fail("lock_set_len", Code::IoError);
+        assert!(h.write_at_start(&[2u8; 4]).is_err());
+        assert_eq!(
+            h.read_all(100).unwrap(),
+            vec![2, 2, 2, 2, 1, 1, 1, 1],
+            "what a crash between write and cut leaves"
+        );
     }
 }

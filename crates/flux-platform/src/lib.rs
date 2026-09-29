@@ -2,6 +2,8 @@
 
 pub mod std_fs;
 
+mod lock_file;
+
 #[cfg(unix)]
 mod dir_unix;
 #[cfg(unix)]
@@ -12,4 +14,5 @@ mod dir_windows;
 #[cfg(windows)]
 pub use dir_windows::StdDir;
 
+pub use lock_file::StdLock;
 pub use std_fs::{StdFile, StdFileSystem, StdReader};

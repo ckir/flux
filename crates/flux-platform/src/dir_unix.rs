@@ -67,6 +67,7 @@ const fn libc_s_iflnk() -> u32 {
 
 impl DirHandle for StdDir {
     type Writer = crate::StdFile;
+    type Lock = crate::StdLock;
 
     fn open_dir(&self, name: &OsStr) -> Result<Self> {
         check_component(name)?;
@@ -189,6 +190,52 @@ impl DirHandle for StdDir {
         }
         rustix::fs::renameat(&self.0, from, &other.0, to)
             .map_err(|e| FsError::from_io(std::io::Error::from(e)))
+    }
+
+    fn create_lock(&self, name: &OsStr) -> Result<Self::Lock> {
+        check_component(name)?;
+        let fd = openat(
+            &self.0,
+            name,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o666),
+        )
+        .map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
+        Ok(crate::StdLock::new(std::fs::File::from(fd)))
+    }
+
+    fn open_lock(&self, name: &OsStr) -> Result<Self::Lock> {
+        use rustix::fs::FileType;
+        use rustix::io::Errno;
+        check_component(name)?;
+        // NONBLOCK: an open of a FIFO planted at the lock's name must not hang (it is refused just below). It changes
+        // nothing for a regular file, whose reads and writes never block on it.
+        let fd = openat(
+            &self.0,
+            name,
+            OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| match e {
+            // O_NOFOLLOW on a symlink in the final component: the link itself is refused, never followed.
+            Errno::LOOP => FsError::new(Code::SafetyRejected, std::io::Error::from(e)),
+            Errno::ISDIR => FsError::new(
+                Code::DestinationError,
+                std::io::Error::new(
+                    std::io::ErrorKind::IsADirectory,
+                    "a directory is not a lock file",
+                ),
+            ),
+            _ => FsError::from_io(std::io::Error::from(e)),
+        })?;
+        let st = rustix::fs::fstat(&fd).map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
+        if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::other("a lock path holds something other than a regular file"),
+            ));
+        }
+        Ok(crate::StdLock::new(std::fs::File::from(fd)))
     }
 }
 

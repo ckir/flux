@@ -223,6 +223,9 @@ pub trait FileSystem: Send + Sync {
 pub trait DirHandle: Sized {
     type Writer: FileHandle;
 
+    /// A lock file held open for reading and writing (§96.1). See `crate::LockFile`.
+    type Lock: crate::LockFile;
+
     /// Open a child DIRECTORY, refusing to traverse a symlink, junction or other
     /// name-surrogate reparse point. This is the operation §149.7 is about.
     fn open_dir(&self, name: &std::ffi::OsStr) -> Result<Self>;
@@ -295,6 +298,20 @@ pub trait DirHandle: Sized {
         other: &Self,
         to: &std::ffi::OsStr,
     ) -> Result<()>;
+
+    /// Create a lock file exclusively, open for reading AND writing (§96.1: "created with exclusive creation").
+    ///
+    /// The same refusals as `create_new`: MUST FAIL with `ErrorKind::AlreadyExists` if the name is taken by anything,
+    /// including a link, and never create through a link.
+    fn create_lock(&self, name: &std::ffi::OsStr) -> Result<Self::Lock>;
+
+    /// Open an EXISTING lock file for reading and writing, without creating it (§240.5 step 2; the classifier's open,
+    /// §240.1). Never follows a link.
+    ///
+    /// Refuses: a name-surrogate (`Code::SafetyRejected`); a directory (`Code::DestinationError`, kind
+    /// `IsADirectory`); any other non-regular file where the platform can tell (`Code::DestinationError`). A missing
+    /// name is `Code::IoError` with kind `NotFound`.
+    fn open_lock(&self, name: &std::ffi::OsStr) -> Result<Self::Lock>;
 }
 
 /// Resolving `DEST` once, at start, is the only path-based call in the writer.
