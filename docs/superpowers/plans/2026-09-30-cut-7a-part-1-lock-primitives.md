@@ -975,13 +975,18 @@ impl Drop for FakeLock {
 - [ ] **Step 1: append the test.**
 
 ```rust
+/// What the child prints once it holds the lock. Distinctive, so no line libtest prints can match it.
+const CHILD_MARKER: &str = "FLUX_CHILD_HOLDS_LOCK";
+
 /// Run as a child by `a_lock_held_by_another_process_is_busy_and_readable_until_that_process_dies`: take the lock on
 /// the named file, say so, and hold it until killed.
 fn hold_lock_as_child(dir: &str) {
     let d = StdFileSystem.destination_root(std::path::Path::new(dir)).expect("child opens the directory");
     let lock = d.open_lock(OsStr::new(NAME)).expect("child opens the lock");
     assert!(lock.try_lock().expect("child try_lock"), "the parent released it before spawning");
-    println!("LOCKED");
+    // A line of its own: libtest has already printed `test <name> ... ` WITHOUT a newline when the test body runs, so
+    // a bare marker would share that line and never match exactly (measured during execution).
+    println!("\n{CHILD_MARKER}");
     use std::io::Write;
     std::io::stdout().flush().unwrap();
     std::thread::sleep(std::time::Duration::from_secs(120));
@@ -1027,7 +1032,7 @@ fn a_lock_held_by_another_process_is_busy_and_readable_until_that_process_dies()
     let stdout = child.0.stdout.take().unwrap();
     let mut lines = std::io::BufRead::lines(std::io::BufReader::new(stdout));
     assert!(
-        lines.any(|l| l.map(|l| l.trim() == "LOCKED").unwrap_or(false)),
+        lines.any(|l| l.map(|l| l.trim() == CHILD_MARKER).unwrap_or(false)),
         "the child reports it holds the lock"
     );
 
@@ -1743,3 +1748,7 @@ which STOPs if it does not answer.
   other constant it uses is already imported at the top of the file it lands in: `FILE_CREATE`, `FILE_OPEN`,
   `FILE_NON_DIRECTORY_FILE`, `FILE_OPEN_REPARSE_POINT` (`crates/flux-platform/src/dir_windows.rs:18-20`) and
   `FILE_GENERIC_WRITE`, the share flags and `SYNCHRONIZE` (`dir_windows.rs:24-25`).
+
+During execution (Task 3): the child's bare `LOCKED` marker could never match, because libtest prints `test <name> ... `
+without a newline before the test body runs; measured from the child's raw stdout. The child now prints a newline and
+the distinctive `FLUX_CHILD_HOLDS_LOCK`, and the parent still matches the whole line exactly.
