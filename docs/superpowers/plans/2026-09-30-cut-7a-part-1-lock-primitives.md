@@ -89,6 +89,12 @@ supplies:
 4. **The fake keys a held lock by the file's object ID**, so a rename carries the lock, as §240.3's move-aside needs. It
    does not model reading an unlinked open file: such a read is `NotFound`. Part 2 extends the fake if a protocol test
    needs more.
+5. **`write_at_start` writes the record in ONE write call and then cuts the file to the record's length** (panel
+   round 1). §240.5 step 6 overwrites an uncertain lock in place, and a magic-prefixed file longer than 4096 bytes is
+   uncertain (design spec, "Decoding"). Without the cut, a takeover of such a file would leave the new record followed
+   by the old tail, and every reader would find the new owner's record uncertain. The cut is a length change, not a
+   second write of content, so §259.6's "one write call" still holds. A crash between the write and the cut leaves a
+   magic-prefixed oversized file: uncertain, the same class as any torn overwrite.
 
 ## Ground rules
 
@@ -168,7 +174,9 @@ pub trait LockFile {
     /// classifier reads the record whether or not its try-lock succeeded (§240.1).
     fn read_all(&self, limit: usize) -> Result<Vec<u8>>;
 
-    /// Write `bytes` at offset 0 in ONE write call (§259.6: "written in one write call"). A short write is an error.
+    /// Write `bytes` at offset 0 in ONE write call (§259.6: "written in one write call"), then cut the file to exactly
+    /// `bytes.len()`. A short write is an error. The cut matters for a takeover of an oversized torn lock: without it
+    /// the new record would be followed by the old tail and read as uncertain (plan decision 5).
     fn write_at_start(&self, bytes: &[u8]) -> Result<()>;
 
     fn sync_all(&self) -> Result<()>;
@@ -284,10 +292,11 @@ fn read_all_reads_one_byte_past_its_limit_so_an_oversized_file_shows() {
 fn write_at_start_overwrites_in_place_and_keeps_the_object() {
     let (_tmp, d) = dir();
     let h = d.create_lock(OsStr::new(NAME)).unwrap();
-    h.write_at_start(&[1u8; 4096]).unwrap();
+    // An oversized torn lock, as a takeover finds it: longer than the record it will be overwritten with.
+    h.write_at_start(&[1u8; 5000]).unwrap();
     let before = h.identity().unwrap();
     h.write_at_start(&[2u8; 4096]).unwrap();
-    assert_eq!(h.read_all(4096).unwrap(), vec![2u8; 4096]);
+    assert_eq!(h.read_all(4096).unwrap(), vec![2u8; 4096], "exactly the new record: the old tail is cut away");
     assert_eq!(h.identity().unwrap(), before, "§240.5 step 6 overwrites the SAME object");
 }
 
@@ -439,14 +448,22 @@ impl LockFile for StdLock {
     fn write_at_start(&self, bytes: &[u8]) -> Result<()> {
         use std::os::unix::fs::FileExt;
         let n = self.file.write_at(bytes, 0).map_err(FsError::from_io)?;
-        if n == bytes.len() { Ok(()) } else { Err(short_write()) }
+        if n != bytes.len() {
+            return Err(short_write());
+        }
+        // Cut any older, longer contents away (plan decision 5).
+        self.file.set_len(bytes.len() as u64).map_err(FsError::from_io)
     }
 
     #[cfg(windows)]
     fn write_at_start(&self, bytes: &[u8]) -> Result<()> {
         use std::os::windows::fs::FileExt;
         let n = self.file.seek_write(bytes, 0).map_err(FsError::from_io)?;
-        if n == bytes.len() { Ok(()) } else { Err(short_write()) }
+        if n != bytes.len() {
+            return Err(short_write());
+        }
+        // Cut any older, longer contents away (plan decision 5).
+        self.file.set_len(bytes.len() as u64).map_err(FsError::from_io)
     }
 
     fn sync_all(&self) -> Result<()> {
@@ -725,11 +742,8 @@ impl LockFile for FakeLock {
         self.record("write_at_start")?;
         let mut g = self.inner.lock().unwrap();
         let path = Self::path(&g, self.object)?;
-        let file = g.files.entry(path).or_default();
-        if file.len() < bytes.len() {
-            file.resize(bytes.len(), 0);
-        }
-        file[..bytes.len()].copy_from_slice(bytes);
+        // One write at 0 followed by the cut to `bytes.len()` leaves exactly `bytes`, as on the real platforms.
+        g.files.insert(path, bytes.to_vec());
         Ok(())
     }
 
@@ -893,17 +907,23 @@ impl Drop for FakeLock {
     }
 
     #[test]
-    fn a_fake_lock_write_overwrites_in_place() {
+    fn a_fake_lock_write_replaces_the_contents_and_cuts_the_old_tail() {
         let fs = FaultFs::new();
         fs.create_dir(Path::new("/d")).unwrap();
         let d = fs.destination_root(Path::new("/d")).unwrap();
         let h = d.create_lock(OsStr::new("x")).unwrap();
         h.write_at_start(&[1u8; 8]).unwrap();
+        let before = h.identity().unwrap();
         h.write_at_start(&[2u8; 4]).unwrap();
-        assert_eq!(h.read_all(100).unwrap(), vec![2, 2, 2, 2, 1, 1, 1, 1]);
+        assert_eq!(h.read_all(100).unwrap(), vec![2, 2, 2, 2], "the old tail is cut, as on the real platforms");
         assert_eq!(h.read_all(3).unwrap().len(), 4, "limit + 1");
+        assert_eq!(h.identity().unwrap(), before, "the same object");
     }
 ```
+
+- [ ] **Step 6b: non-vacuity (do not commit).** Temporarily delete the `set_len` line from the Windows
+  `write_at_start`: `write_at_start_overwrites_in_place_and_keeps_the_object` must fail at "the old tail is cut
+  away". Do the same on the Unix arm under `just check-linux`. Revert both, and report both outcomes.
 
 - [ ] **Step 7: gates.**
   - `cargo test -p flux-platform --test lock_file` → all pass on Windows.
@@ -1607,3 +1627,17 @@ mod tests {
   - `StdLock`, `FakeLock`, `capability_of`, `boot_session_id`;
   - `ids::{new_id, is_id}`;
   - `lock::record::{LockRecord, Decoded, Uncertain, decode, RECORD_LEN, MAGIC, FORMAT_VERSION}`.
+
+## Stand-downs
+
+Panel round 1 (agy), at `0504b15`:
+- FOLDED: `write_at_start` did not cut an older, longer file, so a takeover of an oversized torn lock left a record
+  every reader found uncertain; and the fake's test pinned that behaviour. Now plan decision 5, with a platform test
+  that starts from a 5000-byte file and a non-vacuity step.
+- Not adopted, lock the byte at offset 4096 instead of `1 << 62`: `read_all` reads `limit + 1` = 4097 bytes, so on an
+  oversized torn file a reader would hit the held byte and fail with a lock violation, instead of classifying the file.
+  `1 << 62` is never inside a file Flux reads.
+- Not adopted, a volatile registry key as the Windows boot ID: `HKCU\Volatile Environment` lives for a LOGON, not a
+  boot, and writing it mutates the host. In 7a the boot ID is recorded and reported only: a dead owner is decided by
+  the OS-native lock (design spec, the classification table's "the lock granted to us" row), so a wrong boot ID
+  cannot reclaim a lock. Its exactness matters from cut 7b (§229 lease recovery), which revisits the source.
