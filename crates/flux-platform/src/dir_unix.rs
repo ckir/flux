@@ -209,11 +209,11 @@ impl DirHandle for StdDir {
         use rustix::io::Errno;
         check_component(name)?;
         // NONBLOCK: an open of a FIFO planted at the lock's name must not hang (it is refused just below). It changes
-        // nothing for a regular file, whose reads and writes never block on it.
+        // nothing for a regular file, whose reads and writes never block on it. NOCTTY: a terminal device planted there must not become this process's controlling terminal.
         let fd = openat(
             &self.0,
             name,
-            OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
             Mode::empty(),
         )
         .map_err(|e| match e {

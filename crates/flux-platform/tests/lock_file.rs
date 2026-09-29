@@ -132,3 +132,16 @@ fn open_lock_refuses_a_junction() {
     // and neither may open the target.
     assert!(matches!(e.code, Code::SafetyRejected | Code::DestinationError), "{e:?}");
 }
+
+#[cfg(unix)]
+#[test]
+fn open_lock_refuses_a_fifo_without_hanging() {
+    let (tmp, d) = dir();
+    let status = std::process::Command::new("mkfifo")
+        .arg(tmp.path().join("fifo.flux-lock"))
+        .status()
+        .expect("run mkfifo");
+    assert!(status.success(), "mkfifo");
+    let e = d.open_lock(OsStr::new("fifo.flux-lock")).expect_err("a FIFO is not a lock file");
+    assert_eq!(e.code, Code::DestinationError);
+}

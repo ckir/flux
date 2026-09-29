@@ -750,6 +750,9 @@ impl FileSystem for FaultFs {
         g.identities.remove(&p);
         g.times.remove(&p);
         g.perms.remove(&p);
+        // And the type a test gave the name: a recreated file at this path is a new, regular object (cut 7a Part 1:
+        // `open_lock` reads `types`, so a stale `Symlink` would refuse a lock created after the removal).
+        g.types.remove(&p);
         Ok(())
     }
 
@@ -1652,5 +1655,19 @@ mod tests {
             vec![2, 2, 2, 2, 1, 1, 1, 1],
             "what a crash between write and cut leaves"
         );
+    }
+
+    #[test]
+    fn a_removed_name_forgets_the_type_a_test_gave_it() {
+        use flux_fs::{DestinationRoot, DirHandle, FileSystem};
+        use std::ffi::OsStr;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        fs.write_file("/d/x", b"");
+        fs.set_type("/d/x", FileType::Symlink);
+        fs.remove_file(Path::new("/d/x")).unwrap();
+        drop(d.create_lock(OsStr::new("x")).unwrap());
+        d.open_lock(OsStr::new("x")).expect("a lock created after the removal is a regular file");
     }
 }
