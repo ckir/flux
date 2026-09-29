@@ -738,12 +738,23 @@ impl LockFile for FakeLock {
         Ok(bytes)
     }
 
+    /// Two steps, as on the real platforms: the write in place, then the cut. Each is a separate recorded call, so a
+    /// test can inject a fault at the cut (`lock_set_len`) and see the oversized file a crash there leaves behind.
     fn write_at_start(&self, bytes: &[u8]) -> Result<()> {
         self.record("write_at_start")?;
+        {
+            let mut g = self.inner.lock().unwrap();
+            let path = Self::path(&g, self.object)?;
+            let file = g.files.entry(path).or_default();
+            if file.len() < bytes.len() {
+                file.resize(bytes.len(), 0);
+            }
+            file[..bytes.len()].copy_from_slice(bytes);
+        }
+        self.record("lock_set_len")?;
         let mut g = self.inner.lock().unwrap();
         let path = Self::path(&g, self.object)?;
-        // One write at 0 followed by the cut to `bytes.len()` leaves exactly `bytes`, as on the real platforms.
-        g.files.insert(path, bytes.to_vec());
+        g.files.get_mut(&path).expect("written just above").truncate(bytes.len());
         Ok(())
     }
 
@@ -855,7 +866,7 @@ impl Drop for FakeLock {
 
   Add these tests at the end of the fake's `mod tests`. They reach the fake through a `FakeDirHandle` from
   `destination_root`, as the module's other `DirHandle` tests do (`fault_fs.rs:1342-1359`), and they need the same
-  in-test imports those use. Put this line at the top of EACH of the four tests below (and of Task 4's fake test):
+  in-test imports those use. Put this line at the top of EACH test below that does not already carry it (and of Task 4's fake test):
   `use flux_fs::{DestinationRoot, DirHandle, FileSystem, LockFile}; use std::ffi::OsStr;`
 
 ```rust
@@ -919,6 +930,20 @@ impl Drop for FakeLock {
         assert_eq!(h.read_all(3).unwrap().len(), 4, "limit + 1");
         assert_eq!(h.identity().unwrap(), before, "the same object");
     }
+
+    #[test]
+    fn a_fault_at_the_fake_locks_cut_leaves_the_new_record_followed_by_the_old_tail() {
+        use flux_fs::{DestinationRoot, DirHandle, FileSystem, LockFile};
+        use std::ffi::OsStr;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let h = d.create_lock(OsStr::new("x")).unwrap();
+        h.write_at_start(&[1u8; 8]).unwrap();
+        fs.fail("lock_set_len", Code::IoError);
+        assert!(h.write_at_start(&[2u8; 4]).is_err());
+        assert_eq!(h.read_all(100).unwrap(), vec![2, 2, 2, 2, 1, 1, 1, 1], "what a crash between write and cut leaves");
+    }
 ```
 
 - [ ] **Step 6b: non-vacuity (do not commit).** Temporarily delete the `set_len` line from the Windows
@@ -969,7 +994,17 @@ fn a_lock_held_by_another_process_is_busy_and_readable_until_that_process_dies()
         h.sync_all().unwrap();
     } // closed: nobody holds the lock
 
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+    /// Kills and reaps the child however this test ends. A failed assertion unwinds past any explicit kill, and on
+    /// Windows the child's open handle would also stop the scratch directory from being removed.
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
             "a_lock_held_by_another_process_is_busy_and_readable_until_that_process_dies",
@@ -980,7 +1015,9 @@ fn a_lock_held_by_another_process_is_busy_and_readable_until_that_process_dies()
         .stdout(std::process::Stdio::piped())
         .spawn()
         .expect("spawn the child");
-    let stdout = child.stdout.take().unwrap();
+    // Declared after `tmp`, so it is dropped first: the child is gone before the directory is removed.
+    let mut child = KillOnDrop(child);
+    let stdout = child.0.stdout.take().unwrap();
     let mut lines = std::io::BufRead::lines(std::io::BufReader::new(stdout));
     assert!(
         lines.any(|l| l.map(|l| l.trim() == "LOCKED").unwrap_or(false)),
@@ -991,8 +1028,8 @@ fn a_lock_held_by_another_process_is_busy_and_readable_until_that_process_dies()
     assert!(!probe.try_lock().unwrap(), "another PROCESS holds it: TARGET_LOCK_BUSY");
     assert_eq!(probe.read_all(4096).unwrap(), record, "and its record is readable meanwhile");
 
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
     // The OS releases a dead process's lock when it closes the process's handles; allow it a moment.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !probe.try_lock().unwrap() {
@@ -1641,3 +1678,10 @@ Panel round 1 (agy), at `0504b15`:
   boot, and writing it mutates the host. In 7a the boot ID is recorded and reported only: a dead owner is decided by
   the OS-native lock (design spec, the classification table's "the lock granted to us" row), so a wrong boot ID
   cannot reclaim a lock. Its exactness matters from cut 7b (§229 lease recovery), which revisits the source.
+
+Panel round 2 (agy), at `baf85de`:
+- FOLDED: the cross-process test leaked its child (and, on Windows, the scratch directory) when an assertion failed; a
+  kill-on-drop guard now reaps it however the test ends.
+- FOLDED: the fake's `write_at_start` replaced the contents in one step, so no test could inject the crash window
+  between the write and the cut; it now records a separate `lock_set_len` step, with a test of what a fault there
+  leaves.
