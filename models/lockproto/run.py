@@ -921,7 +921,9 @@ def judge_mutant(mutant: Mutant, outcome: Outcome) -> tuple[bool, str]:
     reported = ", ".join(sorted(outcome.observed)) or "no error"
     if mutant.present is not None:
         return mutant.present in outcome.observed, f"expected {mutant.present} violated; reported: {reported}"
-    return mutant.absent not in outcome.observed, f"expected {mutant.absent} NOT reported; reported: {reported}"
+    # The run checks ONLY `absent` (narrow_config), so another invariant cannot halt it first: a kill is a run that
+    # explored everything with `absent` never violated. A deadlock report is a halt, never a kill (capstone, cut 6).
+    return not outcome.observed, f"expected {mutant.absent} NOT reported; reported: {reported}"
 
 
 def judge_zero_branch(mutant: Mutant, outcome: Outcome, count: int | None) -> tuple[bool, str]:
@@ -965,8 +967,9 @@ def run_mutant(mutant: Mutant, jar: Path, base: Path) -> tuple[bool, str]:
                 return False, f"tooling: {err}"
             branch = Branch(branch.name, branch.module, branch.label, branch.guard, branch.side, branch.reason, span)
         config = work / mutant.config
-        if mutant.present is not None:  # a check config: no other invariant may fire first and hide this one
-            config.write_text(narrow_config(config.read_text(encoding="utf-8"), mutant.present), encoding="utf-8")
+        expected = mutant.present if mutant.present is not None else mutant.absent
+        if expected is not None:  # no other invariant may fire first: it would hide `present`, or halt before `absent`
+            config.write_text(narrow_config(config.read_text(encoding="utf-8"), expected), encoding="utf-8")
         properties = cfg_properties(config.read_text(encoding="utf-8"))  # the config TLC actually runs
         cmd = ["java", "-XX:+UseParallelGC", "-cp", str(jar), "tlc2.TLC", "-tool", "-workers", "auto",
                "-metadir", str(work / "states"), "-config", str(config)]

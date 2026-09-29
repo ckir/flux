@@ -2412,7 +2412,9 @@ class MutantManifestTests(unittest.TestCase):
         ok = lambda observed: run.Outcome(None, frozenset(observed), 10, ())
         bad = run.Outcome("TLC error 1000: boom", frozenset(), None, ())
         self.assertTrue(run.judge_mutant(absent, ok([]))[0], "no error: the mutant stopped A reporting")
-        self.assertTrue(run.judge_mutant(absent, ok(["B"]))[0], "another invariant: still a kill")
+        # The run checks only A (narrow_config), so any report is a halt: a prefix, never a kill (capstone, cut 6).
+        self.assertFalse(run.judge_mutant(absent, ok(["B"]))[0], "another report halted the run: not a kill")
+        self.assertFalse(run.judge_mutant(absent, ok([run.DEADLOCK]))[0], "a deadlock halted the run: not a kill")
         self.assertFalse(run.judge_mutant(absent, ok(["A"]))[0], "A still reported: survived")
         self.assertTrue(run.judge_mutant(present, ok(["A"]))[0])
         self.assertFalse(run.judge_mutant(present, ok([]))[0])
