@@ -1733,3 +1733,13 @@ Panel round 4 (agy), at `3af610c`:
 - FOLDED: two steps asked for values no test printed; the boot-ID test prints its value under `--nocapture`, and the
   Linux capability mutant empties the whole allowlist instead of depending on a printed `f_type`.
 - FOLDED: macOS arms run only on CI; Task 8 now says Part 1 is not done until CI's macOS job is green.
+
+Panel round 5 (agy), at `1563206`: GREEN (no live challenge). The Windows API Skeptic checked `LockFileEx` beyond end of
+file, the access mask for read, write and `set_len`, `GetVolumeInformationByHandleW` on a directory handle,
+`GetDriveTypeW` on a volume-GUID root and `SystemTimeOfDayInformation`'s layout, and found none differing from its
+documentation. Its least-sure call, `GetDriveTypeW` on a GUID root, is first exercised by Task 4 on the Windows host,
+which STOPs if it does not answer.
+- DISCARDED-BELOW-FLOOR: "`open_lock_at` imports only `FILE_GENERIC_READ`" - unreachable as a defect because every
+  other constant it uses is already imported at the top of the file it lands in: `FILE_CREATE`, `FILE_OPEN`,
+  `FILE_NON_DIRECTORY_FILE`, `FILE_OPEN_REPARSE_POINT` (`crates/flux-platform/src/dir_windows.rs:18-20`) and
+  `FILE_GENERIC_WRITE`, the share flags and `SYNCHRONIZE` (`dir_windows.rs:24-25`).
