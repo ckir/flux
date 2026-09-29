@@ -119,6 +119,21 @@ and the `plain`, `rec` and `brk` processes.
     can never smuggle a path such as `../x` into the lookup.
 11. **Leftover `.broken.*` files.** `obtain` reports the one its own recovery could not delete. Noticing others beside
     the lock needs a directory listing, which `DirHandle` does not offer, so that is Part 3's.
+12. **A plain run recovers a dead owner's lock (panel round 1).** The model's `plain` process refuses a dead
+    operation's lock with `RESUMABLE_OPERATION_EXISTS` without touching it (`S21_1_decide`). The design spec, approved
+    by the owner, has every run recover it first, which is the model's `rec` process:
+    - the classification table's "a valid record, the lock granted to us ... §240.3 recovery";
+    - the crash table's "during the copy: recovers the lock (§240.3), then `RESUMABLE_OPERATION_EXISTS`".
+
+    `RESUMABLE_OPERATION_EXISTS` comes from Part 3's §21.1 prior-state step, which then discards the recovered, still
+    record-less lock. So `obtain` recovers a dead lock in every mode, and the refusal is Part 3's.
+13. **`S96_1_backoff` is guarded by the OS-native lock (panel round 1).**
+    - The model's backoff unlinks the lock by name before taking its OS-native lock.
+    - In that gap, a `--break-lock` run could take the still-empty file over, and the unlink would delete its lock.
+    - The model never reaches that branch, because no scenario creates `.flux-dir.lock` (`algorithm.txt`, the
+      `S96_1_dircheck` comment).
+    - Here the backoff unlinks only after taking the OS-native lock itself, and only while the path still names its
+      own empty file. Otherwise it closes without unlinking, and it refuses `TARGET_LOCK_BUSY` either way.
 
 ## Ground rules
 
@@ -300,7 +315,9 @@ impl LockCode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
     pub code: LockCode,
-    /// The holder's record, where it was readable (§96.2: a refusal reports the holder).
+    /// The holder's record, where it was readable (§96.2: a refusal reports the holder). For
+    /// `ARTIFACT_OWNERSHIP_UNCERTAIN` its `workspace_path` is what the caller turns into "the preserved path" the
+    /// refusal-guidance table asks the message to name.
     pub holder: Option<LockRecord>,
     pub detail: String,
 }
@@ -849,8 +866,13 @@ pub(crate) fn acquire<'a, D: DirHandle>(site: &LockSite<'a, D>) -> LockResult<Ac
         Err(e) => return Err(e.into()),
     };
     // S96_1_dircheck: a present directory lock means S96_1_backoff - remove what this pass created, refuse BUSY.
+    // Guarded by the OS-native lock (decision 13): a file another run already holds, or has written, is theirs now,
+    // and is closed without unlinking.
     if site.dir_lock_present()? {
-        site.dir().remove_file(site.lock_name())?;
+        let identity = lock.identity()?;
+        if lock.try_lock()? && still_empty_at_path(site, &lock, &identity)? {
+            site.dir().remove_file(site.lock_name())?;
+        }
         drop(lock);
         return Err(refuse(
             LockCode::TargetLockBusy,
@@ -949,6 +971,23 @@ mod tests {
     }
 
     #[test]
+    fn a_backoff_never_removes_a_file_another_run_has_locked() {
+        let (fs, d) = fake();
+        fs.write_file("/p/.flux-dir.lock", b"");
+        let slot = Arc::new(Mutex::new(None));
+        let keep = Arc::clone(&slot);
+        fs.on_nth("try_lock", 1, move |fs| {
+            let d = fs.destination_root(Path::new("/p")).unwrap();
+            let other = d.open_lock(OsStr::new("dest.flux-lock")).unwrap();
+            assert!(other.try_lock().unwrap());
+            *keep.lock().unwrap() = Some(other);
+        });
+        assert_eq!(refusal(acquire(&site(&d))).code, LockCode::TargetLockBusy);
+        assert!(fs.exists(LOCK), "decision 13: the file another run holds stays");
+        drop(slot);
+    }
+
+    #[test]
     fn a_lock_another_handle_takes_on_the_fresh_file_restarts_without_removing_it() {
         let (fs, d) = fake();
         let slot = Arc::new(Mutex::new(None));
@@ -1031,7 +1070,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4:** `cargo test -p flux-core lock::acquire` gives 9 passed. Then run `just check`.
+- [ ] **Step 4:** `cargo test -p flux-core lock::acquire` gives 10 passed. Then run `just check`.
 - [ ] **Step 5: non-vacuity (do not commit; report each):**
   - Drop the record half of `still_owned`: make the match arm `Decoded::Record(_) => true`.
     `a_written_record_is_owned_until_another_operation_overwrites_it` must FAIL.
@@ -1039,6 +1078,8 @@ mod tests {
     `a_lock_path_replaced_before_the_verify_restarts` must FAIL.
   - Drop the identity check in `discard`: remove the file unconditionally. `discard_removes_only_its_own_recordless_lock`
     must FAIL.
+  - Drop the backoff's guard: remove the file unconditionally in the `dir_lock_present` branch.
+    `a_backoff_never_removes_a_file_another_run_has_locked` must FAIL.
 - [ ] **Step 6:** commit `held.rs`, `acquire.rs` and `mod.rs`: `feat(core): acquire a destination lock (§96.1) and
   hold it (cut 7a Part 2)`.
 
@@ -2445,8 +2486,23 @@ Deferred to Part 3:
 - "Testing" item 4.
 
 **Declared against the spec or the model:** decisions 3 (recovery's record after the state), 6 (a held torn lock is
-BUSY), 7 (`discard` unlinks while holding), 8 (the takeover restarts on foreign content) and 9 (`still_owned` fails
-closed on `Unavailable`).
+BUSY), 7 (`discard` unlinks while holding), 8 (the takeover restarts on foreign content), 9 (`still_owned` fails
+closed on `Unavailable`), 12 (a plain run recovers, as the spec's `rec` reading) and 13 (a guarded backoff).
+
+## Stand-downs
+
+Panel round 1 (agy), at `5e3321a`:
+- FOLDED:
+  - `S96_1_backoff` could unlink a file a concurrent `--break-lock` had taken over (decision 13, plus a test);
+  - the plain run's recovery was undeclared against the model's `plain` process (decision 12);
+  - where an `ARTIFACT_OWNERSHIP_UNCERTAIN` message gets its path (the `Refusal::holder` doc).
+- REJECTED:
+  - "`still_owned` calls a nonexistent `read_exact_at`": the plan calls `read_all(RECORD_LEN)`, and `read_exact_at`
+    appears nowhere in it;
+  - "the test that a dead owner is recovered in every mode asserts wrong behaviour": it asserts the approved spec's
+    behaviour (decision 12);
+  - "`on_nth` stages a write the OS would block under the takeover's lock": the Unix lock is advisory, and the Windows
+    lock covers one byte far past the record (Part 1 decision 1), so a concurrent record write does land.
 
 **Type consistency:**
 
