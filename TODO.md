@@ -504,6 +504,10 @@ stated so the next audit starts from a prediction rather than a hunt.
       violated".** TLC failed internally while printing many violation traces (CI run 36497846414, mutants). It
       stays red, never green; the mutant runner avoids it by narrowing (`e29dc38`); normal runs still use
       `-continue` (`models/lockproto/run.py`, `tlc_command`).
+- [ ] **TLC 2.19 reported a valid property violated when a `<>` argument is a constant.** The mutant
+      `[](... => <>TRUE)` on `recovery-posix-seeded-SEED_RECOVERER_GIVES_UP` came back "Temporal properties were
+      violated" (CI run 36506185735); the state-level tautology replaced it. Real properties have state-level
+      arguments; a new property with a constant `<>` argument would need checking.
 
 ## Closed
 

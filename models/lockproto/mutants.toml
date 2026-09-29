@@ -110,15 +110,17 @@ new = "Classifiable == \\A o \\in Objs : fs.content[o] = NoContent \\/ fs.conten
 config = "configs/recovery-posix-seeded-SEED_FS_ALIEN_RECORD.cfg"
 expect_absent = "Classifiable"
 
+# A STATE-level tautology: TLC 2.19 reported `<>TRUE` (a constant argument) violated on this run
+# (CI run 36506185735), while the same property made true through state variables was killed.
 [[mutant]]
-name = "t8-cleared-consequent-true"
+name = "t8-cleared-consequent-tautology"
 file = "invariants.txt"
 old = """
 DeadLockEventuallyCleared ==
     [](DeadOwnerLock /\\ EnvQuiet /\\ PendingMover => <>(~DeadOwnerLock \\/ UncertainReported))"""
 new = """
 DeadLockEventuallyCleared ==
-    [](DeadOwnerLock /\\ EnvQuiet /\\ PendingMover => <>TRUE)"""
+    [](DeadOwnerLock /\\ EnvQuiet /\\ PendingMover => <>(DeadOwnerLock \\/ ~DeadOwnerLock))"""
 config = "configs/recovery-posix-seeded-SEED_RECOVERER_GIVES_UP.cfg"
 expect_absent = "DeadLockEventuallyCleared"
 timeout_minutes = 30
