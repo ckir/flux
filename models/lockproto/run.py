@@ -809,7 +809,8 @@ def check_translation(base: Path) -> int:
 # Exact-text mutants of the model (cut 6, revision 3): each is applied to a scratch copy, the one config it names
 # is run, and what TLC reports is judged. Positional patches would drift as later edits move the lines; an exact
 # `old` text either still occurs exactly once or fails loudly as stale.
-MUTANT_KEYS = frozenset({"name", "file", "old", "new", "config", "expect_present", "expect_absent", "timeout_minutes"})
+MUTANT_KEYS = frozenset({"name", "file", "old", "new", "config", "expect_present", "expect_absent", "timeout_minutes",
+                          "expect_zero_branch"})
 MUTANT_FILES = (*SOURCES, "FsModel.tla")
 MUTANTS_OUT = TARGET / "mutants"
 
@@ -824,6 +825,7 @@ class Mutant:
     present: str | None  # the mutated run must REPORT this violated (a check config)
     absent: str | None   # the mutated run must NOT report this (a seeded or witness config)
     timeout_minutes: int
+    zero_branch: str | None = None  # the mutated run must finish with this `branches` arm at zero (cut 6 Part 2)
 
 
 def load_mutants(path: Path, base: Path) -> list[Mutant]:
@@ -854,8 +856,12 @@ def load_mutants(path: Path, base: Path) -> list[Mutant]:
         _require(e["file"] in MUTANT_FILES, f"{where}: file must be one of {', '.join(MUTANT_FILES)}")
         _require(e["old"] != e["new"], f"{where}: 'new' equals 'old'")
         _require((base / e["config"]).is_file(), f"{where}: config {e['config']} does not exist")
-        present, absent = e.get("expect_present"), e.get("expect_absent")
-        _require((present is None) != (absent is None), f"{where}: exactly one of expect_present and expect_absent")
+        present, absent, zero = e.get("expect_present"), e.get("expect_absent"), e.get("expect_zero_branch")
+        _require([present, absent, zero].count(None) == 2,
+                 f"{where}: exactly one of expect_present, expect_absent and expect_zero_branch")
+        if zero is not None:
+            names = {b.name for b in load_expected(base / "expected.toml").branches}
+            _require(zero in names, f"{where}: expect_zero_branch must name a 'branches' entry of expected.toml")
         # The name must be one the config checks: a misspelled expect_absent could never be reported, so
         # every run would be judged a kill (independent review of this plan, MG-1).
         cfg_text = (base / e["config"]).read_text(encoding="utf-8")
@@ -866,7 +872,7 @@ def load_mutants(path: Path, base: Path) -> list[Mutant]:
         timeout = e.get("timeout_minutes", 60)
         _require(isinstance(timeout, int) and not isinstance(timeout, bool) and 1 <= timeout <= 170,
                  f"{where}: timeout_minutes must be an integer from 1 to 170")
-        mutants.append(Mutant(name, e["file"], e["old"], e["new"], e["config"], present, absent, timeout))
+        mutants.append(Mutant(name, e["file"], e["old"], e["new"], e["config"], present, absent, timeout, zero))
     return mutants
 
 
@@ -918,11 +924,27 @@ def judge_mutant(mutant: Mutant, outcome: Outcome) -> tuple[bool, str]:
     return mutant.absent not in outcome.observed, f"expected {mutant.absent} NOT reported; reported: {reported}"
 
 
+def judge_zero_branch(mutant: Mutant, outcome: Outcome, count: int | None) -> tuple[bool, str]:
+    """A branch mutant (cut 6 Part 2) is killed only by a run that FINISHED - a halted run's coverage is a
+    prefix, and its zero proves nothing - and whose named arm counted zero."""
+    if outcome.tooling_error is not None:
+        return False, f"tooling: {outcome.tooling_error}"
+    if outcome.observed:
+        return False, (f"the run halted at {', '.join(sorted(outcome.observed))}: a prefix cannot show "
+                       f"that {mutant.zero_branch} never runs")
+    if count is None:
+        return False, f"tooling: no coverage node inside {mutant.zero_branch}'s arm"
+    return count == 0, f"branch {mutant.zero_branch} ran {count} times"
+
+
 def run_mutant(mutant: Mutant, jar: Path, base: Path) -> tuple[bool, str]:
     """Apply one mutant to a scratch copy of the model, regenerate LockProtocol.tla there, run TLC on its one
     config, and judge. The repository is never modified, so there is nothing to revert."""
     MUTANTS_OUT.mkdir(parents=True, exist_ok=True)
     log = MUTANTS_OUT / f"{mutant.name}.log"
+    branch = None
+    if mutant.zero_branch is not None:
+        branch = next(b for b in load_expected(base / "expected.toml").branches if b.name == mutant.zero_branch)
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         for name in MUTANT_FILES:
@@ -936,12 +958,21 @@ def run_mutant(mutant: Mutant, jar: Path, base: Path) -> tuple[bool, str]:
         trans = subprocess.run(["java", "-cp", str(jar), "pcal.trans", str(target)], capture_output=True, text=True)
         if trans.returncode != 0:
             return False, f"tooling: pcal.trans failed: {(trans.stdout + trans.stderr).strip()[-300:]}"
+        if branch is not None:  # the arm's span in the MUTATED generated module
+            try:
+                span = resolve_branch(target.read_text(encoding="utf-8"), branch.label, branch.guard, branch.side)
+            except ExpectedError as err:
+                return False, f"tooling: {err}"
+            branch = Branch(branch.name, branch.module, branch.label, branch.guard, branch.side, branch.reason, span)
         config = work / mutant.config
         if mutant.present is not None:  # a check config: no other invariant may fire first and hide this one
             config.write_text(narrow_config(config.read_text(encoding="utf-8"), mutant.present), encoding="utf-8")
         properties = cfg_properties(config.read_text(encoding="utf-8"))  # the config TLC actually runs
         cmd = ["java", "-XX:+UseParallelGC", "-cp", str(jar), "tlc2.TLC", "-tool", "-workers", "auto",
-               "-metadir", str(work / "states"), "-config", str(config), "LockProtocol"]
+               "-metadir", str(work / "states"), "-config", str(config)]
+        if branch is not None:
+            cmd.extend(["-coverage", "1"])  # a branch mutant is judged from the arm's cost node
+        cmd.append("LockProtocol")
         with log.open("w", encoding="utf-8") as out:
             proc = subprocess.Popen(cmd, cwd=work, stdout=out, stderr=subprocess.STDOUT)
             try:
@@ -955,7 +986,11 @@ def run_mutant(mutant: Mutant, jar: Path, base: Path) -> tuple[bool, str]:
                 proc.wait()
                 raise
     output = log.read_text(encoding="utf-8", errors="replace")
-    return judge_mutant(mutant, interpret(code, output, properties))
+    outcome = interpret(code, output, properties)
+    if branch is not None:
+        nodes = parse_cost_nodes(parse_messages(output))
+        return judge_zero_branch(mutant, outcome, None if nodes is None else arm_count(nodes, branch))
+    return judge_mutant(mutant, outcome)
 
 
 def mutants_main(path: Path, only: str | None, listing: bool) -> int:

@@ -518,3 +518,22 @@ FsRenameReplace(fs, d, from, to) ==
                     @ ], o)'''
 config = "configs/mixed-posix-weak-witness-NeverSecondPastId.cfg"
 expect_absent = "NeverSecondPastId"
+
+# Cut 6 Part 2, items 2 and 3: branch mutants. Each is killed only if its run FINISHES (a halted run's coverage
+# is a prefix) with the named `branches` arm at zero.
+
+[[mutant]]
+name = "p2-another-file-swallowed"
+file = "algorithm.txt"
+old = '             if (ident = NoObj) { refused[self] := "RESTART"; goto S240_5_close; }'
+new = '             if (ident = NoObj \/ ident # tobj) { refused[self] := "RESTART"; goto S240_5_close; }'
+config = "configs/breaklock-remote-posix-plain-check.cfg"
+expect_zero_branch = "s240-5-s6-another-file"
+
+[[mutant]]
+name = "p2-non-record-refuses"
+file = "algorithm.txt"
+old = '             if (IsRecord(seen) /\ seen # seenRec[self]) { refused[self] := "RESTART"; goto S240_5_close; }'
+new = '             if (~IsRecord(seen) \/ (IsRecord(seen) /\ seen # seenRec[self])) { refused[self] := "RESTART"; goto S240_5_close; }'
+config = "configs/breaklock-posix-plain-check.cfg"
+expect_zero_branch = "s240-5-s5-non-record"

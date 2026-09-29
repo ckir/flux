@@ -2461,6 +2461,46 @@ class MutantManifestTests(unittest.TestCase):
                 with self.assertRaises(run.ExpectedError):
                     run.narrow_config(self.CHECK_CFG, name)
 
+    ZERO_BRANCH = '''
+        [[mutant]]
+        name = "t9-zero"
+        file = "algorithm.txt"
+        old = "a"
+        new = "b"
+        config = "configs/breaklock-posix-plain-check.cfg"
+        expect_zero_branch = "{branch}"
+        '''
+
+    def _write_real(self, body: str) -> Path:
+        """A manifest judged against the REAL model directory: expect_zero_branch names expected.toml's branches."""
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        manifest = Path(holder.name) / "mutants.toml"
+        manifest.write_text(textwrap.dedent(body), encoding="utf-8")
+        return manifest
+
+    def test_a_zero_branch_expectation_names_a_committed_branch(self) -> None:
+        (m,) = run.load_mutants(self._write_real(self.ZERO_BRANCH.format(branch="s240-5-s5-non-record")), run.HERE)
+        self.assertEqual((m.present, m.absent, m.zero_branch), (None, None, "s240-5-s5-non-record"))
+        for body in (self.ZERO_BRANCH.format(branch="no-such-branch"),
+                     self.ZERO_BRANCH.format(branch="s240-5-s5-non-record") + 'expect_absent = "FsOk"\n'):
+            with self.subTest(body=body[-60:]):
+                with self.assertRaises(run.ExpectedError):
+                    run.load_mutants(self._write_real(body), run.HERE)
+
+    def test_judging_a_zero_branch_mutant(self) -> None:
+        m = run.Mutant("t9-zero", "algorithm.txt", "a", "b", "configs/x.cfg", None, None, 60, "arm")
+        ok = run.Outcome(None, frozenset(), 10, ())
+        self.assertTrue(run.judge_zero_branch(m, ok, 0)[0], "a clean run whose arm counts zero: killed")
+        self.assertFalse(run.judge_zero_branch(m, ok, 5)[0], "the arm still ran: survived")
+        killed, detail = run.judge_zero_branch(m, run.Outcome(None, frozenset({"SingleWriter"}), 10, ()), 0)
+        self.assertFalse(killed, "a run that halted has only a prefix: its zero proves nothing")
+        self.assertIn("prefix", detail)
+        for outcome, count in ((run.Outcome("TLC error 1000: boom", frozenset(), None, ()), 0), (ok, None)):
+            killed, detail = run.judge_zero_branch(m, outcome, count)
+            self.assertFalse(killed, "a tooling error or an unreadable arm is never a kill")
+            self.assertIn("tooling", detail)
+
     def test_the_committed_manifest_is_valid_against_the_current_sources(self) -> None:
         mutants = run.load_mutants(run.HERE / "mutants.toml", run.HERE)
         self.assertTrue(mutants)
