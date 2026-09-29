@@ -27,21 +27,29 @@ impl LockCapability {
 ///
 /// Dropping the handle closes it, and closing it releases the OS-native lock, as does the death of the process that
 /// holds it. That is what makes a dead owner's lock recoverable (§240.2, §240.3).
+///
+/// The OS-native lock must never cover a byte that `read_all` or `write_at_start` touches: Windows range locks are
+/// mandatory, so a lock over the record would make it unreadable to every other handle.
 pub trait LockFile {
     /// Take the OS-native lock without waiting. `Ok(true)` means it was granted to THIS handle (again, if it already
-    /// held it); `Ok(false)` means another handle holds it. Any other failure is an error, never `false`.
+    /// held it); `Ok(false)` means another handle holds it. Any other failure is an error, never `false`. Windows
+    /// range locks do not nest, so an implementation remembers that its handle holds the lock rather than asking the
+    /// OS again.
     fn try_lock(&self) -> Result<bool>;
 
     /// The file's bytes from offset 0, reading at most `limit + 1` bytes, so that a caller can tell a file longer than
     /// `limit` from one of exactly `limit`. Readable while another handle holds the OS-native lock: the model's
-    /// classifier reads the record whether or not its try-lock succeeded (§240.1).
+    /// classifier reads the record whether or not its try-lock succeeded (§240.1). Positional: it neither uses nor
+    /// promises a file cursor. `limit` is a record-sized bound, never close to `usize::MAX`.
     fn read_all(&self, limit: usize) -> Result<Vec<u8>>;
 
     /// Write `bytes` at offset 0 in ONE write call (§259.6: "written in one write call"), then cut the file to exactly
     /// `bytes.len()`. A short write is an error. The cut matters for a takeover of an oversized torn lock: without it
-    /// the new record would be followed by the old tail and read as uncertain (plan decision 5).
+    /// the new record would be followed by the old tail and read as uncertain (plan decision 5). Positional, like
+    /// `read_all`.
     fn write_at_start(&self, bytes: &[u8]) -> Result<()>;
 
+    /// Flush the file's data and metadata, including the length `write_at_start` set.
     fn sync_all(&self) -> Result<()>;
 
     /// The identity of the object this handle holds - not of a path (§107, §240.3 step 3).
