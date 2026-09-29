@@ -250,6 +250,10 @@ pub mod record;
 //! `models/lockproto/` checks. Each protocol function names the model labels it implements; `impl-map.toml` there
 //! maps every label to its function.
 
+// Until Task 7 of the Part 2 plan adds `obtain`, the crate-internal protocol steps are reached only from tests.
+// Task 7 deletes this line, and its `just check` then proves nothing is left unused.
+#![cfg_attr(not(test), allow(dead_code))]
+
 pub mod error;
 pub mod record;
 pub mod site;
@@ -1590,7 +1594,7 @@ mod tests {
     use super::*;
     use crate::fault_fs::FakeDirHandle;
     use crate::lock::test_support::{dead_lock, fake, live_lock, record, refusal};
-    use flux_fs::FileSystem;
+    use flux_fs::{DestinationRoot, FileSystem};
     use std::ffi::OsStr;
     use std::path::Path;
 
@@ -1705,8 +1709,13 @@ mod tests {
 **Files:** Create `crates/flux-core/src/lock/obtain.rs`; modify `mod.rs`.
 
 - [ ] **Step 0:** `mod.rs` has `mod takeover;` (Task 6).
-- [ ] **Step 1:** in `mod.rs`, add `mod obtain;` after `mod held;`, and `pub use obtain::{MAX_ATTEMPTS, Mode,
-  Obtained, check_capability, obtain};` after `pub use held::...`.
+- [ ] **Step 1:** in `mod.rs`:
+  - add `mod obtain;` after `mod held;`;
+  - add `pub use obtain::{MAX_ATTEMPTS, Mode, Obtained, check_capability, obtain};` after `pub use held::...`;
+  - DELETE the two comment lines and the `#![cfg_attr(not(test), allow(dead_code))]` line that Task 2 added.
+
+  From here every protocol step is reachable from `obtain`, and Step 3's `just check` (clippy `-D warnings`) proves
+  it.
 - [ ] **Step 2:** create `crates/flux-core/src/lock/obtain.rs`:
 
 ```rust
