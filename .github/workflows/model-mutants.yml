@@ -1,8 +1,9 @@
 name: Model mutants
 
 # Cut 6, revision 3: each entry of models/lockproto/mutants.toml applies one exact-text mutant to a scratch copy
-# of the model, runs TLC on one config, and checks what it reports (`run.py --mutants`). Manual only: it is a
-# measurement of the model's checking net, run when the net changes, not a per-commit gate.
+# of the model, runs TLC on one config, and checks what it reports (`run.py --mutants`). It runs on dispatch and on
+# a push that changes the manifest, the runner or this file: a measurement of the model's checking net, run when
+# the net changes, not a per-commit gate.
 on:
   # A push that changes the manifest, the runner or this workflow runs every mutant: GitHub dispatches a
   # workflow_dispatch workflow only once it exists on the default branch, so a branch that adds this file

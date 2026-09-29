@@ -823,7 +823,7 @@ class Mutant:
     new: str
     config: str
     present: str | None  # the mutated run must REPORT this violated (a check config)
-    absent: str | None   # the mutated run must NOT report this (a seeded or witness config)
+    absent: str | None   # the mutated run, checking only this name, must report NOTHING (a seeded or witness config)
     timeout_minutes: int
     zero_branch: str | None = None  # the mutated run must finish with this `branches` arm at zero (cut 6 Part 2)
 
@@ -887,7 +887,7 @@ def apply_mutant(text: str, mutant: Mutant) -> str:
 def narrow_config(text: str, name: str) -> str:
     """The config with its INVARIANT and PROPERTY sections cut and one section checking only `name` appended.
 
-    A check-config mutant asks one question - does the mutant make `name` fail - so it runs without -continue,
+    A mutant asks one question - does the mutant make `name` fail, or stop failing - so it runs without -continue,
     which under many violations made TLC fail with error 2111 (CI run 36497846414). Every other byte is kept. A
     section's span runs from its keyword to the next keyword (or the end); a comment inside it goes with it."""
     sections = cfg_sections(text)
