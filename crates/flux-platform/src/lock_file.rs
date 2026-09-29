@@ -283,14 +283,20 @@ pub(crate) fn capability_of(
 
 /// The host's boot session, for the lock record's `boot_session_id` (§259.6, §229). `"unknown"` when the platform
 /// cannot say, and such a value never helps prove a reboot.
+///
+/// In 7a the ID is recorded and reported only: a dead owner is decided by the OS-native lock. The macOS and Windows
+/// sources are boot TIMES, which the OS may adjust when the wall clock is stepped; that is unmeasured, and cut 7b must
+/// settle it before any rule relies on two readings being equal within one boot.
 #[cfg(target_os = "linux")]
 pub fn boot_session_id() -> String {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
         .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "unknown".to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// `kern.boottime`, fixed for the whole boot.
+/// `kern.boottime`, set at boot (see the Linux arm's note on clock steps).
 #[cfg(target_os = "macos")]
 pub fn boot_session_id() -> String {
     let mut tv = libc::timeval { tv_sec: 0, tv_usec: 0 };
@@ -306,10 +312,15 @@ pub fn boot_session_id() -> String {
             0,
         )
     };
-    if rc == 0 { format!("{}.{:06}", tv.tv_sec, tv.tv_usec) } else { "unknown".to_string() }
+    // A write shorter than a whole `timeval` is not a boot time.
+    if rc == 0 && len == std::mem::size_of::<libc::timeval>() {
+        format!("{}.{:06}", tv.tv_sec, tv.tv_usec)
+    } else {
+        "unknown".to_string()
+    }
 }
 
-/// `BootTime` from `SystemTimeOfDayInformation`, fixed at boot (100 ns units since 1601). Not "now minus
+/// `BootTime` from `SystemTimeOfDayInformation`, set at boot (100 ns units since 1601; see the Linux arm's note). Not "now minus
 /// GetTickCount64": that differs by a second between two processes of one boot (plan decision 2).
 #[cfg(windows)]
 pub fn boot_session_id() -> String {
@@ -327,6 +338,7 @@ pub fn boot_session_id() -> String {
         sleep_time_bias: u64,
     }
     const SYSTEM_TIME_OF_DAY_INFORMATION: i32 = 3;
+    // SAFETY: every field is a plain integer, so all-zero is a valid value.
     let mut info: SystemTimeOfDayInformation = unsafe { std::mem::zeroed() };
     let mut len = 0u32;
     // SAFETY: `info` is live and its size is passed; the class is the documented SystemTimeOfDayInformation.
@@ -338,7 +350,8 @@ pub fn boot_session_id() -> String {
             &raw mut len,
         )
     };
-    if status == 0 && info.boot_time != 0 {
+    // NT_SUCCESS: a non-negative NTSTATUS.
+    if status >= 0 && info.boot_time != 0 {
         info.boot_time.to_string()
     } else {
         "unknown".to_string()
