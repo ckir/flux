@@ -135,7 +135,7 @@ A fixed **4096 bytes**, written with one write call through the handle that hold
 |---|---|
 | 0-7 | magic `FLUXLOCK` (ASCII) |
 | 8-11 | `format_version`, u32 little-endian = 1 |
-| 12- | nine fields in the order of spec:12973-12981, each a u16 little-endian byte length followed by UTF-8 |
+| 12- | the eight remaining fields in the order of spec:12975-12981 (`complete_lock_key` to `last_heartbeat_wall_time`; `format_version` is bytes 8-11), each a u16 little-endian byte length followed by UTF-8 |
 | ... | zero padding up to byte 4079 |
 | 4080-4095 | the first 16 bytes of the BLAKE3 hash of bytes 0-4079 |
 
@@ -154,10 +154,13 @@ Every field is bounded:
 
 So 4096 bytes always fits. An encoder that would exceed it is a bug (it panics in tests), never a truncation.
 
-Decoding:
-- Wrong magic, or a file that is not exactly 4096 bytes: `CONTROL_PLANE_NAMESPACE_CONFLICT` (not a Flux record,
-  spec:4662-4677), except for an EMPTY file, which is uncertain (spec:4709-4711).
-- A failed checksum: uncertain, never foreign (spec:12986-12987).
+Decoding, in this order:
+- An EMPTY file: uncertain (spec:4709-4711).
+- A file whose bytes are ALL zero, of any length up to 4096: uncertain. A host crash can leave the write's extent
+  allocated but unwritten, and that is a torn record, never a foreign object (spec:12986-12987).
+- A file that starts with the magic `FLUXLOCK` but is not exactly 4096 bytes, or whose checksum fails: uncertain (a
+  torn record; the model reaches a torn read, `algorithm.txt:144`).
+- Any other content: `CONTROL_PLANE_NAMESPACE_CONFLICT`, a foreign object, never overwritten (spec:4662-4677).
 - An unknown `format_version` with a valid checksum: uncertain (a newer binary owns it). 7a never guesses at its
   layout.
 
@@ -229,8 +232,12 @@ The lock is:
    - A removal failure in steps 3-4 is reported, and the exit stays 0 (F6).
    - Failure: state `FAILED`, release the lock the same way, exit 1. `FAILED` is resumable, so the next run gets
      `RESUMABLE_OPERATION_EXISTS` until `--restart`.
-   - Ownership lost (a failed `still_owned`): stop, leave the state as it is, close the handle without unlinking (the
-     path may now name another operation's lock, `S99_refuse_close`), exit 1 with `TARGET_LOCK_BUSY`.
+   - Ownership lost (a failed `still_owned`) BEFORE the state is COMPLETED: stop, leave the state as it is, close the
+     handle without unlinking (the path may now name another operation's lock, `S99_refuse_close`), exit 1 with
+     `TARGET_LOCK_BUSY`.
+   - Ownership lost at step 5 of the success path, AFTER COMPLETED: close without unlinking (`S99_refuse_close`), report
+     it as a warning, exit 0 - the transfer is complete and durable, and a failure after it "MUST NOT invalidate" it
+     (spec:9363, F6).
 
 ## Classifying an existing lock (§240.1-240.4; model `S240_1_*`)
 
@@ -277,7 +284,8 @@ A leftover `.broken.*` file is classified by its recorded owner. An uncertain lo
 3. `still_owned` (§99; `S21_1_s3`).
 4. Delete its partials, then its workspace or record. 7a's state does not list partials (their records are `state.db`'s,
    cut 8), so they are found by the prior operation's EXACT id: every `<name>.flux-partial.<prior-id>` under DEST (a walk
-   that skips `DEST/.flux/`), or `target.flux-partial.<prior-id>` beside a single-file target. Authority comes from the
+   that skips only the three reserved subdirectories `DEST/.flux/operations/`, `standalone/` and `atomic/`, because
+   user files may legally live elsewhere under `DEST/.flux/`), or `target.flux-partial.<prior-id>` beside a single-file target. Authority comes from the
    valid prior state naming that id, never from the name pattern alone (spec:9369-9371 forbids that only when the
    record is missing or corrupt), and `still_owned` runs before EACH deletion (spec:9365-9367).
 5. Continue at step 5 of the run: this operation's state, then the record written through the held handle
@@ -330,6 +338,7 @@ a takeover whose flush failed is never recorded (spec:10700-10701).
 | during the copy | a TRANSFERRING state and a dead owner's lock | recovers the lock (§240.3), then `RESUMABLE_OPERATION_EXISTS`; recovered with `--restart` |
 | during `--restart` after ABANDONED | an ABANDONED prior | proceeds |
 | after COMPLETED | a completed state or its leftover | proceeds |
+| during §240.3 recovery, between the move-aside and the new lock | no lock, and `<lock-name>.broken.<id>` beside the lock path | acquires a fresh lock and proceeds. 7a does NOT collect the `.broken.*` file (the spec classifies it by its recorded owner, spec:10620-10624, which is cut 9's cleanup); a run that sees one beside its lock path reports it as a warning |
 
 ## Model conformance
 
