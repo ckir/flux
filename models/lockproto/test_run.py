@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import json
 import re
@@ -2115,6 +2116,101 @@ class CostNodeTests(unittest.TestCase):
         self.assertIsNone(
             run.parse_cost_nodes(run.parse_messages(cut)),
             "an unterminated final block must be None, never a partial answer")
+
+
+def text_at(module_text: str, pos: tuple[int, int]) -> str:
+    """The module text from a 1-based (line, col) position to the end of that line."""
+    line, col = pos
+    return module_text.split("\n")[line - 1][col - 1:]
+
+
+# A generated-module shape with the two traps the resolver must avoid: a guard that is a PREFIX of another
+# guard in the same label (A), and the same guard in another label (B); C holds one guard twice.
+SYNTHETIC_ACTIONS = "\n".join([
+    'A(self) == /\\ pc[self] = "A"',
+    "           /\\ IF IsRecord(seen) /\\ seen # s",
+    "                 THEN /\\ y' = 1",
+    "                 ELSE /\\ IF IsRecord(seen)",
+    "                            THEN /\\ y' = 2",
+    "                            ELSE /\\ y' = 3",
+    "           /\\ UNCHANGED z",
+    "",
+    "B(self) == /\\ IF IsRecord(seen)",
+    "                 THEN /\\ y' = 4",
+    "                 ELSE /\\ y' = 5",
+    "",
+    "C(self) == /\\ IF x = 1",
+    "                 THEN /\\ y' = 6",
+    "                 ELSE /\\ IF x = 1",
+    "                            THEN /\\ y' = 7",
+    "                            ELSE /\\ y' = 8",
+    "",
+])
+
+
+class BranchResolveTests(unittest.TestCase):
+    """resolve_branch()/arm_count() (cut 6 Part 2): an arm of an IF inside a label, counted from TLC's cost nodes.
+
+    The recorded fixture is Task 1's measurement (testdata/arm_coverage.out, from ArmFixture.tla); its counts
+    are what TLC printed, not what this code expects."""
+
+    def setUp(self) -> None:
+        self.module = (TESTDATA / "ArmFixture.tla").read_text(encoding="utf-8")
+        self.nodes = run.parse_cost_nodes(run.parse_messages(fixture("arm_coverage")[1]))
+        self.assertIsNotNone(self.nodes)
+
+    def count(self, label: str, guard: str, side: str) -> int | None:
+        span = run.resolve_branch(self.module, label, guard, side)
+        branch = run.Branch("b", "ArmFixture", label, guard, side, "why", span)
+        return run.arm_count(self.nodes, branch)
+
+    def test_the_dead_arm_counts_zero_and_a_live_arm_does_not(self) -> None:
+        self.assertEqual(self.count("branchy", "i = 7", "then"), 0, "x := 99 never runs (arm_coverage.out:69)")
+        self.assertEqual(self.count("branchy", "i = 1", "then"), 1)
+
+    def test_an_arm_producing_only_duplicate_successors_still_counts(self) -> None:
+        # twins: both arms set y' = 5 (arm_coverage.out:96, :102)
+        self.assertEqual(self.count("twins", "j = 0", "then"), 3)
+        self.assertEqual(self.count("twins", "j # 0", "then"), 3)
+
+    def test_the_translator_fallback_else_counts_its_first_conjunct(self) -> None:
+        # `ELSE /\ TRUE` has no node on its own line; its arm's first node is `y' = y` (arm_coverage.out:105)
+        self.assertEqual(self.count("twins", "j # 0", "else"), 0)
+
+    def test_the_whole_condition_must_match_not_a_prefix(self) -> None:
+        inner = run.resolve_branch(SYNTHETIC_ACTIONS, "A", "IsRecord(seen)", "else")
+        self.assertEqual(text_at(SYNTHETIC_ACTIONS, inner[0]), "ELSE /\\ y' = 3")
+        outer = run.resolve_branch(SYNTHETIC_ACTIONS, "A", "IsRecord(seen) /\\ seen # s", "then")
+        self.assertEqual(text_at(SYNTHETIC_ACTIONS, outer[0]), "THEN /\\ y' = 1")
+        self.assertEqual(text_at(SYNTHETIC_ACTIONS, outer[1]), "ELSE /\\ IF IsRecord(seen)")
+        with self.assertRaises(run.ExpectedError):
+            run.resolve_branch(SYNTHETIC_ACTIONS, "A", "IsRecord", "then")
+
+    def test_the_same_guard_in_another_label_is_not_a_match(self) -> None:
+        span = run.resolve_branch(SYNTHETIC_ACTIONS, "B", "IsRecord(seen)", "then")
+        self.assertEqual(text_at(SYNTHETIC_ACTIONS, span[0]), "THEN /\\ y' = 4")
+
+    def test_an_else_arm_ends_where_the_action_dedents(self) -> None:
+        start, end = run.resolve_branch(SYNTHETIC_ACTIONS, "A", "IsRecord(seen)", "else")
+        self.assertEqual(end, (start[0] + 1, 1), "the ELSE arm stops at the next line indented no deeper")
+
+    def test_every_unresolvable_anchor_fails_closed(self) -> None:
+        cases = {
+            "guard twice in one label": ("C", "x = 1", "then"),
+            "no such guard": ("A", "x = 1", "then"),
+            "no such label": ("D", "x = 1", "then"),
+        }
+        for why, (label, guard, side) in cases.items():
+            with self.subTest(why):
+                with self.assertRaises(run.ExpectedError):
+                    run.resolve_branch(SYNTHETIC_ACTIONS, label, guard, side)
+
+    def test_a_log_with_no_node_inside_the_arm_gives_none(self) -> None:
+        span = run.resolve_branch(self.module, "branchy", "i = 7", "then")
+        branch = run.Branch("b", "ArmFixture", "branchy", "i = 7", "then", "why", span)
+        self.assertIsNone(run.arm_count([n for n in self.nodes if n[1] != 51], branch))
+        self.assertIsNone(run.arm_count(self.nodes, run.Branch("b", "Other", "branchy", "i = 7", "then", "why", span)),
+                          "a node of another module never counts")
 
 
 class PartialCoverageTests(unittest.TestCase):

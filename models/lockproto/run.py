@@ -124,6 +124,21 @@ class Run:
     job: str = ""
 
 
+BRANCH_KEYS = frozenset({"name", "module", "label", "guard", "side", "reason"})
+
+
+@dataclass(frozen=True)
+class Branch:
+    """One arm the suite must be seen to run (cut 6 Part 2), resolved at load time against the generated module."""
+    name: str
+    module: str
+    label: str
+    guard: str
+    side: str  # "then" or "else"
+    reason: str
+    span: tuple[tuple[int, int], tuple[int, int]]
+
+
 @dataclass(frozen=True)
 class Expected:
     scenarios: list[str]
@@ -634,6 +649,65 @@ def module_labels(module_text: str) -> LabelUniverse:
 
     all_labels = frozenset(label for labels in block_labels.values() for label in labels)
     return LabelUniverse(True, all_labels, {k: frozenset(v) for k, v in owners.items()}, process_sets)
+
+
+# One arm of a translated `IF` inside a label's action (cut 6 Part 2). pcal.trans prints `THEN` and `ELSE`
+# three columns right of their `IF`, which is what locates an arm without parsing TLA+.
+_IF_CONDITION = re.compile(r"(?<![A-Za-z0-9_])IF (.*\S)\s*$")
+
+
+def resolve_branch(module_text: str, label: str, guard: str, side: str) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Where one arm of an `IF` in `label`'s action lies in the GENERATED module: (start, end) as 1-based
+    (line, col) positions, end exclusive - the coordinates of TLC's cost nodes (message 2221).
+
+    `guard` is the WHOLE condition of the `IF`, exactly as pcal.trans printed it, so `IsRecord(seen)` does not
+    match `IsRecord(seen) /\\ seen # seenRec[self]`; only the named label's action is searched, so the same
+    guard in another label is no match. The THEN arm runs to its ELSE; the ELSE arm to the first line indented
+    no deeper than that ELSE. A label that is not exactly one action, a guard that is not exactly one `IF`, or
+    no THEN/ELSE where the translator puts them: ExpectedError - an anchor never resolves to nothing or to two
+    places."""
+    lines = module_text.split("\n")
+    heads = [i for i, text in enumerate(lines) if re.match(rf"{re.escape(label)}(\(self\))? ==", text)]
+    if len(heads) != 1:
+        raise ExpectedError(f"label {label!r}: {len(heads)} action definitions in the generated module (must be one)")
+    start = heads[0]
+    end = next((i for i in range(start + 1, len(lines)) if lines[i][:1] not in ("", " ")), len(lines))
+    hits = [(i, m.start()) for i in range(start, end)
+            for m in _IF_CONDITION.finditer(lines[i]) if m.group(1) == guard]
+    if len(hits) != 1:
+        raise ExpectedError(f"label {label!r}: guard {guard!r} matches {len(hits)} IFs (must be exactly one)")
+    line_if, col_if = hits[0]
+    col_kw = col_if + 3
+
+    def indent(text: str) -> int:
+        return len(text) - len(text.lstrip())
+
+    def keyword(word: str, after: int) -> int | None:
+        for j in range(after + 1, end):
+            if lines[j][:col_kw].strip() == "" and lines[j][col_kw:].startswith(word + " "):
+                return j
+            if lines[j].strip() and indent(lines[j]) <= col_if:
+                return None
+        return None
+
+    line_then = keyword("THEN", line_if)
+    line_else = keyword("ELSE", line_then) if line_then is not None else None
+    if line_then is None or line_else is None:
+        raise ExpectedError(f"label {label!r}: guard {guard!r} has no THEN/ELSE at column {col_kw + 1}")
+    if side == "then":
+        return (line_then + 1, col_kw + 1), (line_else + 1, col_kw + 1)
+    after = next((j for j in range(line_else + 1, end) if lines[j].strip() and indent(lines[j]) <= col_kw), end)
+    return (line_else + 1, col_kw + 1), (after + 1, 1)
+
+
+def arm_count(nodes: list[tuple[str, int, int, int, int]], branch: Branch) -> int | None:
+    """The count of the FIRST cost node inside the branch's arm - how often the arm was entered - or None when
+    this log has no node there. First by position; a child node sharing its parent's start comes after it."""
+    start, end = branch.span
+    inside = [n for n in nodes if n[0] == branch.module and start <= (n[1], n[2]) < end]
+    if not inside:
+        return None
+    return min(inside, key=lambda n: (n[1], n[2]))[3]
 
 
 SOURCES = ("LockProtocol.head", "algorithm.txt", "invariants.txt")
