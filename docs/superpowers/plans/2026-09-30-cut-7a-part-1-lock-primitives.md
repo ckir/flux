@@ -1190,8 +1190,15 @@ pub(crate) fn capability_of(h: &std::os::windows::io::OwnedHandle) -> Result<flu
     if text.starts_with(r"\\?\UNC\") {
         return Ok(flux_fs::LockCapability::Unsupported);
     }
-    // "\\?\C:\x" -> "C:\x": GetVolumePathNameW and GetDriveTypeW are given the ordinary form.
-    let plain: Vec<u16> = text.strip_prefix(r"\\?\").unwrap_or(&text).encode_utf16().chain(Some(0)).collect();
+    // "\\?\C:\x" -> "C:\x": GetVolumePathNameW and GetDriveTypeW are given the ordinary form. Anything that is not
+    // then an absolute drive path - "\\?\Volume{GUID}\x" for a volume without a letter - would be read RELATIVE to the
+    // current directory, and so would describe the wrong volume: refuse it instead.
+    let dos = text.strip_prefix(r"\\?\").unwrap_or(&text);
+    let b = dos.as_bytes();
+    if !(b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\') {
+        return Ok(flux_fs::LockCapability::Unsupported);
+    }
+    let plain: Vec<u16> = dos.encode_utf16().chain(Some(0)).collect();
     let mut root = vec![0u16; plain.len() + 1];
     // SAFETY: `plain` is NUL-terminated; `root` is live with its length passed.
     let ok = unsafe { GetVolumePathNameW(plain.as_ptr(), root.as_mut_ptr(), root.len() as u32) };
@@ -1293,6 +1300,8 @@ pub fn boot_session_id() -> String {
 #[cfg(windows)]
 pub fn boot_session_id() -> String {
     use windows_sys::Wdk::System::SystemInformation::NtQuerySystemInformation;
+    // Layout only: the kernel fills every field, and only `boot_time` is read.
+    #[allow(dead_code)]
     #[repr(C)]
     struct SystemTimeOfDayInformation {
         boot_time: i64,
@@ -1696,3 +1705,10 @@ Panel round 2 (agy), at `baf85de`:
 - FOLDED (owner ruling, "Refuse, keep the cause"): an OS failure of the capability query was swallowed into
   `Unsupported`, hiding the cause from the operator. It is now an `Err` (plan decision 6); the refusal stays
   `REMOTE_LOCK_UNSAFE`, exit 3; the design spec's "Lock capability" paragraph is amended to match.
+
+Panel round 3 (agy), at `d42d1ae`:
+- REJECTED: "the Linux `capability_of` has no `#[cfg]`": it carries `#[cfg(target_os = "linux")]` (Task 4, Step 3).
+- FOLDED: the Windows boot struct's unread fields would fail `-D warnings` as dead code; `#[allow(dead_code)]` with
+  the reason.
+- FOLDED: a final path without a drive letter (`\\?\Volume{GUID}\...`) would, once its prefix was stripped, be
+  resolved against the current directory and describe the wrong volume; it is now `Unsupported`.
