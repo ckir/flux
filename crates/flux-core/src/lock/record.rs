@@ -242,4 +242,84 @@ mod tests {
         r.target_path_key = "k".repeat(5000);
         r.encode();
     }
+
+    #[test]
+    fn the_layout_is_the_documented_one_byte_for_byte() {
+        let mut r = sample();
+        // Distinct times, so that swapping the two time fields shows.
+        r.last_heartbeat_wall_time = 1_790_000_000_987_654_321;
+        let bytes = r.encode();
+        assert_eq!(&bytes[..8], b"FLUXLOCK");
+        assert_eq!(&bytes[8..12], &1u32.to_le_bytes());
+        let creation = r.creation_wall_time.to_string();
+        let heartbeat = r.last_heartbeat_wall_time.to_string();
+        let mut at = 12;
+        for field in [
+            r.complete_lock_key.as_str(),
+            r.operation_id.as_str(),
+            r.owner_instance_id.as_str(),
+            r.boot_session_id.as_str(),
+            r.target_path_key.as_str(),
+            r.workspace_path.as_str(),
+            creation.as_str(),
+            heartbeat.as_str(),
+        ] {
+            assert_eq!(
+                &bytes[at..at + 2],
+                &(field.len() as u16).to_le_bytes(),
+                "length of {field}"
+            );
+            assert_eq!(&bytes[at + 2..at + 2 + field.len()], field.as_bytes());
+            at += 2 + field.len();
+        }
+        assert!(bytes[at..CHECKSUM_AT].iter().all(|&b| b == 0), "zero padding up to the checksum");
+        assert_eq!(&bytes[CHECKSUM_AT..], &blake3::hash(&bytes[..CHECKSUM_AT]).as_bytes()[..16]);
+    }
+
+    #[test]
+    fn a_flipped_padding_or_checksum_byte_is_a_checksum_failure() {
+        for at in [CHECKSUM_AT - 1, CHECKSUM_AT, RECORD_LEN - 1] {
+            let mut bytes = sample().encode();
+            bytes[at] ^= 1;
+            assert_eq!(decode(&bytes), Decoded::Uncertain(Uncertain::Checksum), "byte {at}");
+        }
+    }
+
+    #[test]
+    fn a_signed_time_is_malformed() {
+        let mut bytes = sample().encode();
+        let at = bytes.windows(19).position(|w| w == b"1790000000123456789").unwrap();
+        bytes[at] = b'+';
+        assert_eq!(decode(&reseal(bytes)), Decoded::Uncertain(Uncertain::Malformed));
+    }
+
+    #[test]
+    fn fields_that_exactly_fill_the_record_round_trip() {
+        let mut r = sample();
+        let others: usize = 12
+            + [
+                &r.complete_lock_key,
+                &r.operation_id,
+                &r.owner_instance_id,
+                &r.boot_session_id,
+                &r.workspace_path,
+            ]
+            .iter()
+            .map(|f| 2 + f.len())
+            .sum::<usize>()
+            + 2
+            + r.creation_wall_time.to_string().len()
+            + 2
+            + r.last_heartbeat_wall_time.to_string().len()
+            + 2;
+        r.target_path_key = "k".repeat(CHECKSUM_AT - others);
+        let bytes = r.encode();
+        assert_eq!(bytes.len(), RECORD_LEN);
+        assert_ne!(
+            bytes[CHECKSUM_AT - 1],
+            0,
+            "the last field reaches the checksum: no padding at all"
+        );
+        assert_eq!(decode(&bytes), Decoded::Record(r));
+    }
 }
