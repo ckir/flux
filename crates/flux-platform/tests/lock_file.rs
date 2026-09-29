@@ -243,3 +243,62 @@ fn the_boot_session_id_is_known_here_and_stable_within_one_boot() {
     #[cfg(target_os = "linux")]
     assert_eq!(a, std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim());
 }
+
+#[test]
+fn a_lock_name_removed_while_its_holder_is_open_can_be_created_and_locked_again_at_once() {
+    // The release unlinks and THEN closes (S99_release). In between, another run must be able to take the name:
+    // on Unix unlink removes it at once, and on Windows remove_file uses POSIX delete semantics so that it does too.
+    let (_tmp, d) = dir();
+    let old = d.create_lock(OsStr::new(NAME)).unwrap();
+    assert!(old.try_lock().unwrap());
+    old.write_at_start(&[1u8; 4096]).unwrap();
+    d.remove_file(OsStr::new(NAME)).expect("unlink the held lock by name");
+    let new = d
+        .create_lock(OsStr::new(NAME))
+        .expect("the name is free at once, before the old handle closes");
+    assert!(new.try_lock().unwrap(), "a new object: the old handle's lock is not on it");
+    assert_ne!(new.identity().unwrap(), old.identity().unwrap());
+    assert_eq!(
+        old.read_all(4096).unwrap(),
+        vec![1u8; 4096],
+        "the old handle still reads its own object"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_delete_pending_name_is_occupied_to_a_create_and_gone_to_an_open() {
+    // The legacy-semantics fallback, staged directly: mark the file deleted with the legacy disposition class
+    // while a handle keeps it open, which leaves the name "delete pending".
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_SHARE_ALL: u32 = 0x7;
+    let (tmp, d) = dir();
+    drop(d.create_lock(OsStr::new(NAME)).unwrap());
+    let pending = std::fs::OpenOptions::new()
+        .access_mode(DELETE | 0x0012_0089) // DELETE | FILE_GENERIC_READ
+        .share_mode(FILE_SHARE_ALL)
+        .open(tmp.path().join(NAME))
+        .expect("open for delete");
+    let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: `info` is a live FILE_DISPOSITION_INFO of the size given; the handle is open.
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            pending.as_raw_handle() as _,
+            FileDispositionInfo,
+            (&raw const info).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    assert_ne!(ok, 0, "legacy delete disposition: {}", std::io::Error::last_os_error());
+    let e = d.create_lock(OsStr::new(NAME)).expect_err("the name is still occupied");
+    assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists, "{e:?}");
+    let e = d.open_lock(OsStr::new(NAME)).expect_err("the object is logically gone");
+    assert_eq!((e.code, e.source.kind()), (Code::IoError, std::io::ErrorKind::NotFound), "{e:?}");
+    drop(pending);
+    d.create_lock(OsStr::new(NAME)).expect("free once the last handle closes");
+}

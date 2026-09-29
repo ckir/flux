@@ -16,11 +16,15 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_INFORMATION, FILE_NON_DIRECTORY_FILE,
+    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_DELETE, FILE_DISPOSITION_INFORMATION,
+    FILE_DISPOSITION_INFORMATION_EX, FILE_DISPOSITION_POSIX_SEMANTICS, FILE_NON_DIRECTORY_FILE,
     FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FileDispositionInformation,
-    FileRenameInformation, NtCreateFile, NtSetInformationFile,
+    FileDispositionInformationEx, FileRenameInformation, NtCreateFile, NtSetInformationFile,
 };
-use windows_sys::Win32::Foundation::{HANDLE, UNICODE_STRING};
+use windows_sys::Win32::Foundation::{
+    HANDLE, STATUS_DELETE_PENDING, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_INFO_CLASS,
+    STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED, UNICODE_STRING,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
 };
@@ -65,6 +69,10 @@ fn nt_io_error(what: &str, status: i32) -> std::io::Error {
         }
         STATUS_ACCESS_DENIED => std::io::ErrorKind::PermissionDenied,
         STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => std::io::ErrorKind::NotFound,
+        // The name's file was deleted while some handle still holds it open and the volume keeps legacy delete
+        // semantics: the object is logically gone. A CREATE path answers this as AlreadyExists before calling here,
+        // because to a create the name is still occupied (cut 7a Part 1 capstone).
+        STATUS_DELETE_PENDING => std::io::ErrorKind::NotFound,
         _ => std::io::ErrorKind::Other,
     };
     std::io::Error::new(kind, format!("{what}: 0x{:08X}", status as u32))
@@ -366,6 +374,16 @@ fn create_new_at(p: &OwnedHandle, n: &OsStr) -> Result<crate::StdFile> {
     };
 
     if status != 0 {
+        // As in `open_lock_at`: a create at a delete-pending name finds it occupied.
+        if status == STATUS_DELETE_PENDING {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("NtCreateFile: 0x{:08X}", status as u32),
+                ),
+            ));
+        }
         let code = match status {
             // Aligned with metadata_at, remove_file_at and rename_at, and with POSIX,
             // which answers IoError/NotFound. Only open_dir keeps DestinationError, for
@@ -428,6 +446,18 @@ fn open_lock_at(p: &OwnedHandle, n: &OsStr, disposition: u32) -> Result<crate::S
                 std::io::Error::new(
                     std::io::ErrorKind::IsADirectory,
                     "a directory is not a lock file",
+                ),
+            ));
+        }
+        // A CREATE at a name whose file is being deleted (legacy semantics, still open elsewhere): the name is
+        // occupied until that handle closes, which is AlreadyExists to a create. An OPEN falls through to
+        // `nt_io_error`, which answers NotFound.
+        if disposition == FILE_CREATE && status == STATUS_DELETE_PENDING {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("NtCreateFile: 0x{:08X}", status as u32),
                 ),
             ));
         }
@@ -589,6 +619,40 @@ fn remove_file_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {
                 "remove_file refuses a directory, or could not determine that it is not one",
             ),
         ));
+    }
+
+    // POSIX delete first: the NAME goes at once, as `unlinkat` does and as the test fake models, even while other
+    // handles hold the file open - the lock's release unlinks and THEN closes (spec S99_release). Legacy semantics
+    // leave the name "delete pending" until the last handle closes, and every create or open of it meanwhile fails
+    // with STATUS_DELETE_PENDING (measured on NTFS, cut 7a Part 1 capstone). A volume or system without POSIX delete
+    // (FAT, exFAT, some redirectors, Windows before 10 1709) refuses the class or the flag; only then fall back to the
+    // legacy call, and `nt_io_error` / the create paths map the pending state for whoever meets it.
+    let mut posix = FILE_DISPOSITION_INFORMATION_EX {
+        Flags: FILE_DISPOSITION_DELETE | FILE_DISPOSITION_POSIX_SEMANTICS,
+    };
+    let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    // SAFETY: `posix` is a live FILE_DISPOSITION_INFORMATION_EX of the size given, and the handle outlives the call.
+    let status = unsafe {
+        NtSetInformationFile(
+            h.as_raw_handle() as _,
+            &raw mut iosb,
+            (&raw mut posix).cast(),
+            size_of::<FILE_DISPOSITION_INFORMATION_EX>() as u32,
+            FileDispositionInformationEx,
+        )
+    };
+    if status == 0 {
+        drop(h);
+        return Ok(());
+    }
+    if !matches!(
+        status,
+        STATUS_INVALID_PARAMETER
+            | STATUS_NOT_SUPPORTED
+            | STATUS_INVALID_INFO_CLASS
+            | STATUS_INVALID_DEVICE_REQUEST
+    ) {
+        return Err(FsError::new(Code::IoError, nt_io_error("NtSetInformationFile", status)));
     }
 
     let mut info = FILE_DISPOSITION_INFORMATION { DeleteFile: true };
