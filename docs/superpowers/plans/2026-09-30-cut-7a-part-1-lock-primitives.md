@@ -1145,7 +1145,7 @@ pub(crate) fn capability_of(h: &std::os::windows::io::OwnedHandle) -> Result<flu
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Storage::FileSystem::{
-        GetDriveTypeW, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW, GetVolumePathNameW,
+        GetDriveTypeW, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
     };
     const DRIVE_REMOVABLE: u32 = 2;
     const DRIVE_FIXED: u32 = 3;
@@ -1175,37 +1175,42 @@ pub(crate) fn capability_of(h: &std::os::windows::io::OwnedHandle) -> Result<flu
         return Ok(flux_fs::LockCapability::Unsupported);
     }
 
-    let mut path = vec![0u16; 32_768];
-    // SAFETY: `path` is live and its length is passed; flags 0 = FILE_NAME_NORMALIZED | VOLUME_NAME_DOS.
-    let n = unsafe { GetFinalPathNameByHandleW(raw, path.as_mut_ptr(), path.len() as u32, 0) } as usize;
-    if n == 0 {
-        return Err(os_error());
-    }
-    if n >= path.len() {
-        // The buffer holds the longest path Windows has; a longer answer is not one this code can read.
-        return Err(FsError::from_io(std::io::Error::other("the directory's final path is longer than 32767 units")));
-    }
-    path.truncate(n);
-    let text = String::from_utf16_lossy(&path);
-    if text.starts_with(r"\\?\UNC\") {
-        return Ok(flux_fs::LockCapability::Unsupported);
-    }
-    // "\\?\C:\x" -> "C:\x": GetVolumePathNameW and GetDriveTypeW are given the ordinary form. Anything that is not
-    // then an absolute drive path - "\\?\Volume{GUID}\x" for a volume without a letter - would be read RELATIVE to the
-    // current directory, and so would describe the wrong volume: refuse it instead.
-    let dos = text.strip_prefix(r"\\?\").unwrap_or(&text);
-    let b = dos.as_bytes();
-    if !(b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\') {
-        return Ok(flux_fs::LockCapability::Unsupported);
-    }
-    let plain: Vec<u16> = dos.encode_utf16().chain(Some(0)).collect();
-    let mut root = vec![0u16; plain.len() + 1];
-    // SAFETY: `plain` is NUL-terminated; `root` is live with its length passed.
-    let ok = unsafe { GetVolumePathNameW(plain.as_ptr(), root.as_mut_ptr(), root.len() as u32) };
-    if ok == 0 {
-        return Err(os_error());
-    }
-    // SAFETY: GetVolumePathNameW wrote a NUL-terminated root.
+    // The directory's final path, first as VOLUME_NAME_GUID: `\\?\Volume{GUID}\...` names the volume itself, for
+    // every local volume, with or without a drive letter (a volume mounted in a folder has none). Its root is what
+    // GetDriveTypeW is asked about: never a path resolved against the current directory, never one a long-path limit
+    // truncates. A network share has no GUID path, so that query fails for it; the DOS form then tells a share
+    // (`\\?\UNC\...`: Unsupported) from a real failure (an error, plan decision 6).
+    const VOLUME_NAME_GUID: u32 = 0x1;
+    let final_path = |flags: u32| -> std::io::Result<String> {
+        let mut path = vec![0u16; 32_768];
+        // SAFETY: `path` is live and its length is passed.
+        let n = unsafe { GetFinalPathNameByHandleW(raw, path.as_mut_ptr(), path.len() as u32, flags) } as usize;
+        if n == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if n >= path.len() {
+            // The buffer holds the longest path Windows has; a longer answer is not one this code can read.
+            return Err(std::io::Error::other("the directory's final path is longer than 32767 units"));
+        }
+        path.truncate(n);
+        Ok(String::from_utf16_lossy(&path))
+    };
+    let guid_path = match final_path(VOLUME_NAME_GUID) {
+        Ok(p) => p,
+        Err(guid_error) => {
+            return match final_path(0) {
+                Ok(dos) if dos.starts_with(r"\\?\UNC\") => Ok(flux_fs::LockCapability::Unsupported),
+                _ => Err(FsError::from_io(guid_error)),
+            };
+        }
+    };
+    // "\\?\Volume{GUID}\rest" -> "\\?\Volume{GUID}\": the root runs up to and including the fourth backslash.
+    let root_len = guid_path.match_indices('\\').nth(3).map(|(i, _)| i + 1);
+    let (Some(root_len), true) = (root_len, guid_path.starts_with(r"\\?\Volume{")) else {
+        return Err(FsError::from_io(std::io::Error::other(format!("an unexpected volume path: {guid_path}"))));
+    };
+    let root: Vec<u16> = guid_path[..root_len].encode_utf16().chain(Some(0)).collect();
+    // SAFETY: `root` is NUL-terminated and live for the call.
     Ok(match unsafe { GetDriveTypeW(root.as_ptr()) } {
         DRIVE_FIXED | DRIVE_REMOVABLE => flux_fs::LockCapability::LocalStrong,
         _ => flux_fs::LockCapability::Unsupported,
@@ -1232,9 +1237,13 @@ pub(crate) fn capability_of(h: &std::os::windows::io::OwnedHandle) -> Result<flu
   - `just check`.
   - `just check-linux` → `GATE: linux OK`.
   - `just check-mac` → exit 0.
-- [ ] **Step 5: non-vacuity (do not commit).** Remove `0xEF53` from the Linux list: `just check-linux` must fail
-  `the_test_machines_scratch_directory_is_a_local_strong_filesystem` if its scratch directory is ext4. Report the
-  `f_type` it printed; if the scratch directory is tmpfs, remove `0x0102_1994` instead. Revert.
+- [ ] **Step 5: non-vacuity (do not commit).**
+  - Make the Linux `LOCAL` list empty (`[u32; 0] = []`): `just check-linux` must fail
+    `the_test_machines_scratch_directory_is_a_local_strong_filesystem` with `left: Unsupported`. Revert.
+  - Make the Windows arm's `DRIVE_FIXED | DRIVE_REMOVABLE` match arm return `Unsupported`: the same test must fail on
+    the Windows host. Revert. (If that test fails BEFORE this mutation - `GetDriveTypeW` not answering for a
+    `\\?\Volume{GUID}\` root - STOP and report it: the design depends on it.)
+  - Report both outcomes.
 - [ ] **Step 6:** commit: `feat: lock capability from a built-in local allowlist (cut 7a Part 1, F1)`.
 
 ---
@@ -1261,6 +1270,7 @@ libc = { workspace = true }
 fn the_boot_session_id_is_known_here_and_stable_within_one_boot() {
     let a = flux_platform::boot_session_id();
     let b = flux_platform::boot_session_id();
+    println!("boot_session_id = {a}");
     assert_ne!(a, "unknown", "every supported platform exposes one");
     assert!(!a.is_empty());
     assert_eq!(a, b, "two reads in one boot agree");
@@ -1337,7 +1347,8 @@ pub fn boot_session_id() -> String {
   `pub use lock_file::{StdLock, boot_session_id};`.
 
 - [ ] **Step 4: gates.**
-  - `cargo test -p flux-platform --test lock_file boot_session` → ok (report the value printed on this machine).
+  - `cargo test -p flux-platform --test lock_file boot_session -- --nocapture` → ok, and a line
+    `boot_session_id = <value>`; report the value.
   - `just check`.
   - `just check-linux` → `GATE: linux OK`.
   - `just check-mac` → exit 0.
@@ -1660,7 +1671,9 @@ mod tests {
 
 - [ ] **Step 1:** `just check`, `just check-linux` (`GATE: linux OK`) and `just check-mac` all pass; `git status --short`
   is clean.
-- [ ] **Step 2 (driver):** push `spec/cut-7a` (a branch push, no PR, once the owner approves it) so that CI's three
+- [ ] **Step 2 (driver):** no local gate runs a macOS test (`just check-mac` only cross-compiles), so the macOS arms
+  - `capability_of`, `boot_session_id`, the symlink refusal - are first EXECUTED by CI. Part 1 is not done until CI's
+  macOS test job is green. Push `spec/cut-7a` (a branch push, no PR, once the owner approves it) so that CI's three
   platforms run the new tests. Then write the Part 2 plan against the code this part created.
 
 ---
@@ -1712,3 +1725,11 @@ Panel round 3 (agy), at `d42d1ae`:
   the reason.
 - FOLDED: a final path without a drive letter (`\\?\Volume{GUID}\...`) would, once its prefix was stripped, be
   resolved against the current directory and describe the wrong volume; it is now `Unsupported`.
+
+Panel round 4 (agy), at `3af610c`:
+- FOLDED: requiring a drive letter refused a local volume mounted in a folder, and stripping `\\?\` broke long paths;
+  the Windows arm now asks GetDriveTypeW about the `\\?\Volume{GUID}\` root, which every local volume has, and tells a
+  share from a failure by the DOS form. `GetVolumePathNameW` is gone.
+- FOLDED: two steps asked for values no test printed; the boot-ID test prints its value under `--nocapture`, and the
+  Linux capability mutant empties the whole allowlist instead of depending on a printed `f_type`.
+- FOLDED: macOS arms run only on CI; Task 8 now says Part 1 is not done until CI's macOS job is green.
