@@ -108,7 +108,11 @@ and two runs can no longer write one destination at once.
   crash-safe write.
 - **`prior`**: §21.1 classification of a destination's prior state, and the `--restart` sequence.
 - **Engine hook**: `copy_file` and `copy_tree` call `still_owned` immediately before each mutation - creating a
-  temporary, creating a directory, and each publishing rename (§99, spec:4858-4906). A failed check stops the operation with `TARGET_LOCK_BUSY`, and its state stays resumable.
+  temporary, creating a directory, and each publishing rename (§99, spec:4858-4906).
+- **`still_owned` is cheap by construction** (panel round 4): it never opens the lock path. It (1) reads the metadata of
+  the lock path and compares its file identity with the identity of the handle this run holds, then (2) reads the
+  record through that held handle with one positioned read and compares `operation_id` and `owner_instance_id`. Both
+  are needed: a §240.5 takeover overwrites the record IN PLACE, so the identity alone stays the same (spec:4882-4885). A failed check stops the operation with `TARGET_LOCK_BUSY`, and its state stays resumable.
 
 ### flux-cli
 
@@ -264,6 +268,18 @@ Open the file without creating it, try the OS-native lock without waiting, read 
 Refusals report the holder's `owner_instance_id`, `boot_session_id`, `last_heartbeat_wall_time` and `workspace_path`
 where the record is readable (§96.2, spec:4755-4761).
 
+**Every refusal names what to do next** (panel round 4), because no flag in 7a clears preserved state:
+
+| Refusal | The message names | And tells the operator |
+|---|---|---|
+| `TARGET_LOCK_BUSY` | the lock path and the holder | another run holds it; wait for it to finish |
+| `TARGET_LOCK_UNCERTAIN` | the lock path and what was read | if no Flux run is active on this destination, run again with `--restart --break-lock` |
+| `RESUMABLE_OPERATION_EXISTS` | the prior operation's id and state path | run again with `--restart` to supersede it (its partials are deleted) |
+| `STATE_CORRUPT`, `ARTIFACT_OWNERSHIP_UNCERTAIN` | the preserved path | Flux never deletes state it cannot read (§249.4); inspect it, and remove it by hand if it is not needed. A later cut's `flux cleanup` automates this |
+| `INCOMPATIBLE_STATE` | the path and its `format_version` | it was written by a newer Flux; use that version, or remove it by hand |
+| `CONTROL_PLANE_NAMESPACE_CONFLICT` | the path | a non-Flux object occupies a Flux control path; move it away |
+| `REMOTE_LOCK_UNSAFE` | the destination filesystem type | this destination's filesystem is not supported yet |
+
 **§240.3 recovery** (spec:10588-10624; model `S240_3_*`):
 1. Re-read: the record must still name the same dead owner; take the OS-native lock without waiting, and on failure
    start again.
@@ -295,7 +311,8 @@ A leftover `.broken.*` file is classified by its recorded owner. An uncertain lo
 4. Delete its partials, then its workspace or record. 7a's state does not list partials (their records are `state.db`'s,
    cut 8), so they are found by the prior operation's EXACT id: every `<name>.flux-partial.<prior-id>` under DEST (a walk
    that skips only the three reserved subdirectories `DEST/.flux/operations/`, `standalone/` and `atomic/`, because
-   user files may legally live elsewhere under `DEST/.flux/`), or `target.flux-partial.<prior-id>` beside a single-file target. Authority comes from the
+   user files may legally live elsewhere under `DEST/.flux/`). The walk costs one traversal of DEST, the same order
+   as a copy, and runs only on an explicit `--restart`, or `target.flux-partial.<prior-id>` beside a single-file target. Authority comes from the
    valid prior state naming that id, never from the name pattern alone (spec:9369-9371 forbids that only when the
    record is missing or corrupt), and `still_owned` runs before EACH deletion (spec:9365-9367).
 5. Continue at step 5 of the run: this operation's state, then the record written through the held handle
@@ -317,7 +334,8 @@ live owner, or missing or corrupt state (spec:1664-1666).
    identity; a mismatch → start again, not BUSY. Only after the flush succeeds, write the `takeover` key into the state
    (a second crash-safe state write), so a takeover whose flush failed is never recorded (spec:10700-10701). (F5's rule: otherwise a crash between the overwrite and the state's creation would leave a record
    naming missing state, `ARTIFACT_OWNERSHIP_UNCERTAIN`, which `--break-lock` may not clear.) Step 5 of "The run" then
-   finds this state already created and does not write the record again.
+   finds this state already created: it neither creates it nor writes the record again, and it still moves the state
+   from `CREATED` to `TRANSFERRING` before the copy starts.
 
 Errors are exit 3 before the write and exit 1 after it. The takeover record goes in this operation's `takeover` key;
 a takeover whose flush failed is never recorded (spec:10700-10701).
