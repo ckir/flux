@@ -884,7 +884,9 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          if (crashed[self]) { goto rec_end; }
          else {
            refusedOk[self] := RefusalEvidence(self);
-           if (Replaceable(self)) { goto rec_recover; }
+           \* SEED_RECOVERER_GIVES_UP (cut 6, item 9): it judged the lock replaceable and then does nothing,
+           \* refusing nothing - the dead lock stays and no uncertainty is reported.
+           if (Replaceable(self)) { if (SEED_RECOVERER_GIVES_UP) { goto rec_end; } else { goto rec_recover; }; }
            else if (classified[self] = "empty") { goto rec_acquire; }
            else if (classified[self] = "uncertain" \/ ownerLive[self] = "uncertain") {
              refused[self] := "TARGET_LOCK_UNCERTAIN";
@@ -1185,7 +1187,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "b5129497" /\ chksum(tla) = "a903f182")
+\* BEGIN TRANSLATION (chksum(pcal) = "7acd651c" /\ chksum(tla) = "8095eca5")
 \* Procedure variable obj of procedure Classify at line 199 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
@@ -2803,7 +2805,9 @@ rec_decide(self) == /\ pc[self] = "rec_decide"
                                /\ UNCHANGED << refusedOk, refused >>
                           ELSE /\ refusedOk' = [refusedOk EXCEPT ![self] = RefusalEvidence(self)]
                                /\ IF Replaceable(self)
-                                     THEN /\ pc' = [pc EXCEPT ![self] = "rec_recover"]
+                                     THEN /\ IF SEED_RECOVERER_GIVES_UP
+                                                THEN /\ pc' = [pc EXCEPT ![self] = "rec_end"]
+                                                ELSE /\ pc' = [pc EXCEPT ![self] = "rec_recover"]
                                           /\ UNCHANGED refused
                                      ELSE /\ IF classified[self] = "empty"
                                                 THEN /\ pc' = [pc EXCEPT ![self] = "rec_acquire"]

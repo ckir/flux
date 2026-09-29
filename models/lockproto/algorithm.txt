@@ -803,7 +803,9 @@
          if (crashed[self]) { goto rec_end; }
          else {
            refusedOk[self] := RefusalEvidence(self);
-           if (Replaceable(self)) { goto rec_recover; }
+           \* SEED_RECOVERER_GIVES_UP (cut 6, item 9): it judged the lock replaceable and then does nothing,
+           \* refusing nothing - the dead lock stays and no uncertainty is reported.
+           if (Replaceable(self)) { if (SEED_RECOVERER_GIVES_UP) { goto rec_end; } else { goto rec_recover; }; }
            else if (classified[self] = "empty") { goto rec_acquire; }
            else if (classified[self] = "uncertain" \/ ownerLive[self] = "uncertain") {
              refused[self] := "TARGET_LOCK_UNCERTAIN";

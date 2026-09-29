@@ -109,3 +109,34 @@ old = "Classifiable == \\A o \\in Objs : fs.content[o] = NoContent \\/ fs.conten
 new = "Classifiable == \\A o \\in Objs : fs.content[o] = NoContent \\/ fs.content[o] \\in {Torn, Foreign, EmptyFile} \\/ IsRecord(fs.content[o])"
 config = "configs/recovery-posix-seeded-SEED_FS_ALIEN_RECORD.cfg"
 expect_absent = "Classifiable"
+
+[[mutant]]
+name = "t8-cleared-consequent-true"
+file = "invariants.txt"
+old = """
+DeadLockEventuallyCleared ==
+    [](DeadOwnerLock /\\ EnvQuiet /\\ PendingMover => <>(~DeadOwnerLock \\/ UncertainReported))"""
+new = """
+DeadLockEventuallyCleared ==
+    [](DeadOwnerLock /\\ EnvQuiet /\\ PendingMover => <>TRUE)"""
+config = "configs/recovery-posix-seeded-SEED_RECOVERER_GIVES_UP.cfg"
+expect_absent = "DeadLockEventuallyCleared"
+timeout_minutes = 30
+
+[[mutant]]
+name = "t8-uncertain-reported-true"
+file = "invariants.txt"
+old = "UncertainReported == \\E p \\in Recoverers \\cup Cleanups : refused[p] = \"TARGET_LOCK_UNCERTAIN\""
+new = "UncertainReported == TRUE"
+config = "configs/recovery-posix-seeded-SEED_RECOVERER_GIVES_UP.cfg"
+expect_absent = "DeadLockEventuallyCleared"
+timeout_minutes = 30
+
+[[mutant]]
+name = "t8-uncertain-admits-none"
+file = "invariants.txt"
+old = "UncertainReported == \\E p \\in Recoverers \\cup Cleanups : refused[p] = \"TARGET_LOCK_UNCERTAIN\""
+new = "UncertainReported == \\E p \\in Recoverers \\cup Cleanups : refused[p] \\in {\"TARGET_LOCK_UNCERTAIN\", \"none\"}"
+config = "configs/recovery-posix-seeded-SEED_RECOVERER_GIVES_UP.cfg"
+expect_absent = "DeadLockEventuallyCleared"
+timeout_minutes = 30
