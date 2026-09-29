@@ -42,10 +42,12 @@ NoLiveWriter == Cardinality({p \in Procs : (checked[p] \/ writing[p]) /\ ~Supers
 \* item 11). breaklock-posix-seeded-SEED_MOVE_ASIDE_FOR_UNCERTAIN, whose actors are Breakers, violates it.
 PlainNeverOwnsUncertain == ~touchedUncertain
 
-\* A `Foreign` object at a lock path is never written, renamed, or deleted (Section 7): the one an initial
-\* state holds is still the object at the lock path and still holds Foreign. A state predicate, so no
-\* misplaced ghost can make it vacuous.
-ForeignUntouched == foreignObj # NoObj => LockObj = foreignObj /\ fs.content[foreignObj] = Foreign
+\* A `Foreign` object at a lock path is never written, renamed, or deleted (Section 7). Two invariants, not one
+\* (cut 6, item 12): a seed that breaks only the content half is followed on the same trace by a release that
+\* moves the lock path, and a single invariant would report that as the same name. State predicates, so no
+\* misplaced ghost can make either vacuous.
+ForeignStaysAtLockPath == foreignObj # NoObj => LockObj = foreignObj
+ForeignContentUntouched == foreignObj # NoObj => fs.content[foreignObj] = Foreign
 
 \* A REGRESSION GUARD, not a liveness check. TARGET_LOCK_BUSY means the target's lock is held, not that
 \* its recorded owner is alive (240.2): a held OS-native lock cannot tell the owner from another

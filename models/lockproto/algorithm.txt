@@ -910,7 +910,11 @@
              if (SEED_MOVE_ASIDE_FOR_UNCERTAIN) { goto brk_recover; } else { goto brk_takeover; };
            }
            else if (ownerLive[self] = "uncertain") { refused[self] := "TARGET_LOCK_UNCERTAIN"; }
-           else if (classified[self] = "foreign") { refused[self] := "CONTROL_PLANE_NAMESPACE_CONFLICT"; }
+           \* SEED_TAKEOVER_FOREIGN (cut 6, item 12): --break-lock takes over an object that is not a lock.
+           else if (classified[self] = "foreign") {
+             if (SEED_TAKEOVER_FOREIGN) { goto brk_takeover; }
+             else { refused[self] := "CONTROL_PLANE_NAMESPACE_CONFLICT"; };
+           }
            else { refused[self] := "TARGET_LOCK_BUSY"; };
          };
        brk_refused:

@@ -991,7 +991,11 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
              if (SEED_MOVE_ASIDE_FOR_UNCERTAIN) { goto brk_recover; } else { goto brk_takeover; };
            }
            else if (ownerLive[self] = "uncertain") { refused[self] := "TARGET_LOCK_UNCERTAIN"; }
-           else if (classified[self] = "foreign") { refused[self] := "CONTROL_PLANE_NAMESPACE_CONFLICT"; }
+           \* SEED_TAKEOVER_FOREIGN (cut 6, item 12): --break-lock takes over an object that is not a lock.
+           else if (classified[self] = "foreign") {
+             if (SEED_TAKEOVER_FOREIGN) { goto brk_takeover; }
+             else { refused[self] := "CONTROL_PLANE_NAMESPACE_CONFLICT"; };
+           }
            else { refused[self] := "TARGET_LOCK_BUSY"; };
          };
        brk_refused:
@@ -1187,7 +1191,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "7456db1f" /\ chksum(tla) = "a5856546")
+\* BEGIN TRANSLATION (chksum(pcal) = "a21e1099" /\ chksum(tla) = "8aab1f4b")
 \* Procedure variable obj of procedure Classify at line 199 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
@@ -3129,10 +3133,15 @@ S21_1_restart_decide(self) == /\ pc[self] = "S21_1_restart_decide"
                                                                           /\ UNCHANGED refused
                                                                      ELSE /\ IF ownerLive[self] = "uncertain"
                                                                                 THEN /\ refused' = [refused EXCEPT ![self] = "TARGET_LOCK_UNCERTAIN"]
+                                                                                     /\ pc' = [pc EXCEPT ![self] = "brk_refused"]
                                                                                 ELSE /\ IF classified[self] = "foreign"
-                                                                                           THEN /\ refused' = [refused EXCEPT ![self] = "CONTROL_PLANE_NAMESPACE_CONFLICT"]
+                                                                                           THEN /\ IF SEED_TAKEOVER_FOREIGN
+                                                                                                      THEN /\ pc' = [pc EXCEPT ![self] = "brk_takeover"]
+                                                                                                           /\ UNCHANGED refused
+                                                                                                      ELSE /\ refused' = [refused EXCEPT ![self] = "CONTROL_PLANE_NAMESPACE_CONFLICT"]
+                                                                                                           /\ pc' = [pc EXCEPT ![self] = "brk_refused"]
                                                                                            ELSE /\ refused' = [refused EXCEPT ![self] = "TARGET_LOCK_BUSY"]
-                                                                          /\ pc' = [pc EXCEPT ![self] = "brk_refused"]
+                                                                                                /\ pc' = [pc EXCEPT ![self] = "brk_refused"]
                               /\ UNCHANGED << fs, foreignObj, classified, 
                                               ownerLive, sawLive, seenRec, 
                                               crashed, live, holding, checked, 
@@ -3566,10 +3575,12 @@ NoLiveWriter == Cardinality({p \in Procs : (checked[p] \/ writing[p]) /\ ~Supers
 \* item 11). breaklock-posix-seeded-SEED_MOVE_ASIDE_FOR_UNCERTAIN, whose actors are Breakers, violates it.
 PlainNeverOwnsUncertain == ~touchedUncertain
 
-\* A `Foreign` object at a lock path is never written, renamed, or deleted (Section 7): the one an initial
-\* state holds is still the object at the lock path and still holds Foreign. A state predicate, so no
-\* misplaced ghost can make it vacuous.
-ForeignUntouched == foreignObj # NoObj => LockObj = foreignObj /\ fs.content[foreignObj] = Foreign
+\* A `Foreign` object at a lock path is never written, renamed, or deleted (Section 7). Two invariants, not one
+\* (cut 6, item 12): a seed that breaks only the content half is followed on the same trace by a release that
+\* moves the lock path, and a single invariant would report that as the same name. State predicates, so no
+\* misplaced ghost can make either vacuous.
+ForeignStaysAtLockPath == foreignObj # NoObj => LockObj = foreignObj
+ForeignContentUntouched == foreignObj # NoObj => fs.content[foreignObj] = Foreign
 
 \* A REGRESSION GUARD, not a liveness check. TARGET_LOCK_BUSY means the target's lock is held, not that
 \* its recorded owner is alive (240.2): a held OS-native lock cannot tell the owner from another

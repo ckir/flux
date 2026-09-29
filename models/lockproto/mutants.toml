@@ -164,3 +164,11 @@ new = """
              refusedOk[self] := TRUE;"""
 config = "configs/breaklock-posix-seeded-SEED_RESTART_CHECK_REFUSES_UNTOUCHED.cfg"
 expect_absent = "RefusalJustified"
+
+[[mutant]]
+name = "t11-content-untouched-true"
+file = "invariants.txt"
+old = "ForeignContentUntouched == foreignObj # NoObj => fs.content[foreignObj] = Foreign"
+new = "ForeignContentUntouched == TRUE"
+config = "configs/breaklock-posix-seeded-SEED_TAKEOVER_FOREIGN.cfg"
+expect_absent = "ForeignContentUntouched"
