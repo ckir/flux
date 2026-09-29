@@ -2316,6 +2316,13 @@ class BranchJudgeTests(unittest.TestCase):
     def test_no_branches_changes_nothing(self) -> None:
         self.assertFalse(run.judge_branches((), [("any", "not even a log")]))
 
+    def test_the_committed_branches_resolve_against_the_generated_module(self) -> None:
+        branches = {b.name: b for b in run.load_expected(run.HERE / "expected.toml").branches}
+        self.assertEqual(sorted(branches), ["s240-5-s5-non-record", "s240-5-s6-another-file"])
+        module = (run.HERE / "LockProtocol.tla").read_text(encoding="utf-8")
+        self.assertTrue(text_at(module, branches["s240-5-s6-another-file"].span[0]).startswith("THEN /\\ refused' = "))
+        self.assertTrue(text_at(module, branches["s240-5-s5-non-record"].span[0]).startswith("ELSE /\\ pc' = "))
+
 
 class PartialCoverageTests(unittest.TestCase):
     """A seeded or witness run halts at its first counterexample, so its coverage block describes a

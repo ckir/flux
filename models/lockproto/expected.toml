@@ -1097,3 +1097,23 @@ kind = "witness"
 violated = ["NeverHostCrashChangedLock"]
 constants = { Owners = ["o1"], Recoverers = ["r1"], PlainRuns = [], Cleanups = [], Breakers = ["b1"], MaxObjs = 5, MaxCrashes = 1, HostCrashes = true, MaxLeaseExpiries = 1, Platform = "posix", IdentityStrength = "strong", LockCapability = "remote", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false, SEED_FS_LOCK_WITHOUT_HANDLE = false, SEED_FS_ALIEN_CONTENT = false, SEED_CHECK_REFUSES_UNTOUCHED = false, SEED_RECOVER_LIVE = false, SEED_FS_PAST_UNALLOCATED = false, SEED_FS_DOUBLE_HANDLE = false, SEED_FS_ENTRY_UNALLOCATED = false, SEED_FS_ALIEN_RECORD = false, SEED_RECOVERER_GIVES_UP = false, SEED_RELEASE_CHECK_REFUSES_UNTOUCHED = false, SEED_RESTART_CHECK_REFUSES_UNTOUCHED = false, SEED_TAKEOVER_FOREIGN = false, HostCrashAtDurableOnly = false }
 timeout_minutes = 60
+
+# ---------------------------------------------------------------------------------------------------------
+# Branches (cut 6 Part 2): arms INSIDE a label that the label-granular gate cannot see. Each names an `IF` of
+# the GENERATED module by its whole condition, inside one label's action, and the arm (`then` or `else`)
+# whose first cost node must count above zero, summed over the logs of runs that model the protocol as
+# specified (not seeded, no FIX_* flag). Judged by --union-from, with the label union.
+
+[[branches]]
+name = "s240-5-s6-another-file"
+label = "S240_5_s6"
+guard = "ident # tobj[self]"
+side = "then"
+reason = "240.5 step 6: another operation claimed the lock path while the takeover was in flight, so it starts again. Its RESTART equals the empty-path arm's, so only this count tells the two apart (cut 6, item 2). The remote-lease runs reach it."
+
+[[branches]]
+name = "s240-5-s5-non-record"
+label = "S240_5_s5"
+guard = "IsRecord(seen)"
+side = "else"
+reason = "240.5 step 5: a takeover that reads a non-record (torn, empty or foreign) continues to step 6 (cut 6, item 3, narrowed). Torn versus empty is not told apart: a residue in TODO.md."
