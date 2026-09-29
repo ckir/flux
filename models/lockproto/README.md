@@ -122,10 +122,10 @@ kinds at once do not finish, so the check runs pair them, and each pairing is ex
 
 | Pairing | Actors | What only this pairing explores | Distinct states, POSIX / Windows |
 |---|---|---|---|
-| `recovery-<platform>-check` | Owner, 2 Recoverers, with `SYMMETRY` over the Recoverers | two recoverers racing to move the same dead lock aside (240.3 step 2) | 950,004 / 1,393,668 |
-| `recovery-<platform>-plain-check` | Owner, Recoverer, PlainRun | a plain rerun (21.1) meeting a lock a recoverer is working on | 1,645,500 / 2,334,831 |
-| `recovery-<platform>-cleanup-check` | Owner, Recoverer, Cleanup | two movers of different kinds, both entitled to move the lock aside | 1,199,193 / 1,709,754 |
-| `recovery-<platform>-plain-cleanup-check` | Owner, PlainRun, Cleanup | the plain rerun's own 240.3 path, which needs a dead cleanup lock | 1,067,868 / 1,471,158 |
+| `recovery-<platform>-check` | Owner, 2 Recoverers, with `SYMMETRY` over the Recoverers | two recoverers racing to move the same dead lock aside (240.3 step 2) | 1,835,103 / 2,069,778 |
+| `recovery-<platform>-plain-check` | Owner, Recoverer, PlainRun | a plain rerun (21.1) meeting a lock a recoverer is working on | 3,145,722 / 3,421,296 |
+| `recovery-<platform>-cleanup-check` | Owner, Recoverer, Cleanup | two movers of different kinds, both entitled to move the lock aside | 2,403,783 / 2,776,194 |
+| `recovery-<platform>-plain-cleanup-check` | Owner, PlainRun, Cleanup | the plain rerun's own 240.3 path, which needs a dead cleanup lock | 2,135,748 / 2,382,285 |
 
 - Every run starts from an empty lock path or from one holding a `Foreign` object, which no actor writes, so
   `ForeignStaysAtLockPath` and `ForeignContentUntouched` have something to hold over. The empty start keeps the
@@ -155,8 +155,10 @@ kinds at once do not finish, so the check runs pair them, and each pairing is ex
   measurement. Nothing enforces it now: no invariant asserts that bound, so an edit giving an actor a
   second create would make `MaxObjs` start binding and `FsCreate` start failing, silently, rather than
   erroring (capstone, plan 3). Making it an invariant is the obvious fix and is not done yet.
-- `IdentityStrength = "strong"` only. Measured, the weak-identity variant explores an identical state graph here,
-  because no name in this scenario is reused.
+- `IdentityStrength = "strong"` in these pairings. The weak-identity runs are separate (cut 6): `recovery-posix-weak-check`
+  explores 2,008,428 distinct states against the strong run's 1,835,103, because a re-created lock name keeps its old
+  id in `past`; `mixed-posix-weak-check` explores 5,236,116 against 7,781,181, because a takeover refuses at once
+  under weak identity. Their witnesses, `NeverSecondPastId`, show the second id is reached.
 - `LockCapability = "strong"` only in these runs. The weak capability refuses every operation under 235.1;
   what covers that refusal belongs to `breaklock`, not here, and is described under "The 235.1 refusal"
   below.
@@ -170,9 +172,8 @@ kinds at once do not finish, so the check runs pair them, and each pairing is ex
 - The host crash keeps a directory's unflushed entry operations all-or-nothing, not as the prefix a journaled
   filesystem keeps. A partial prefix followed by a further crash is not explored (design Section 5.2).
 - The liveness run, `recovery-posix-liveness` (`DeadLockEventuallyCleared`, Owner and 2 Recoverers, no symmetry),
-  holds over 1,894,344 distinct states and is untightened: timed twice on CI at 258-261s before the `Foreign`
-  start state added 24,810 states, it fits its 30-minute
-  limit several times over.
+  holds over 3,661,143 distinct states (CI run 36523907574) and is untightened. It was timed twice on CI at
+  258-261s at 1,894,344 states, before cut 6; its 30-minute limit has not been re-measured since.
 
 ## The 235.1 refusal, and what covers it
 
