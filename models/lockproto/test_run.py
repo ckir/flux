@@ -11,6 +11,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -2316,6 +2317,47 @@ class BranchJudgeTests(unittest.TestCase):
     def test_no_branches_changes_nothing(self) -> None:
         self.assertFalse(run.judge_branches((), [("any", "not even a log")]))
 
+    ARM_1 = "line 49, col 36 to line 49, col 44 of module ArmFixture: 1"
+    ARM_0 = "line 49, col 36 to line 49, col 44 of module ArmFixture: 0"
+
+    def test_a_counted_log_without_a_coverage_block_fails_the_branches(self) -> None:
+        """A counted log that parses to no complete coverage block must FAIL the branches (test audit, cut 6).
+        Without the check, arm_count iterates None and the union crashes instead of reporting."""
+        span = run.resolve_branch((TESTDATA / "ArmFixture.tla").read_text(encoding="utf-8"), "branchy", "i = 1", "then")
+        branch = run.Branch("live", "ArmFixture", "branchy", "i = 1", "then", "why", span)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            failed = run.judge_branches((branch,), [("good", fixture("arm_coverage")[1]), ("silent", "no coverage")])
+        self.assertTrue(failed, "an unreadable counted log must fail the branches, never pass or crash")
+        self.assertIn("silent's log carries no complete coverage block", out.getvalue())
+
+    def judge_union(self, d: ExpectedDir, covered_kind: str) -> tuple[bool, str]:
+        """judge_union - the path `just model` takes after running every run - with only runs of `covered_kind`
+        entering arm `live`, every other log showing it at zero."""
+        expected = d.load()
+        covered = fixture("arm_coverage")[1]
+        zeroed = covered.replace(self.ARM_1, self.ARM_0)
+        self.assertNotEqual(covered, zeroed, "the replaced node line must exist, or this test asserts nothing")
+        executed = []
+        for r in expected.runs:
+            log = d.path / f"{r.name}.log"
+            log.write_text(covered if r.kind == covered_kind else zeroed, encoding="utf-8")
+            executed.append((r, False, run.Result(r.name, "ok", frozenset(), frozenset(), None, 1.0, "", (), log)))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            failed = run.judge_union(executed, d.path, expected.never_reached, expected.deferred, expected.branches)
+        return failed, out.getvalue()
+
+    def test_judge_union_counts_a_check_run_but_not_a_seeded_one(self) -> None:
+        """The same filter as --union-from, on the path a full local run takes (test audit, cut 6)."""
+        d = self.expected_dir(BRANCHES_TOML.format(name="live", guard="i = 1"))
+        failed, out = self.judge_union(d, "check")
+        self.assertFalse(failed, out)
+        self.assertIn("BRANCH live  1 entries", out)
+        failed, out = self.judge_union(d, "seeded")
+        self.assertTrue(failed, "only a seeded run entered the arm, and seeded runs do not count")
+        self.assertIn("MISMATCH branch live", out)
+
     def test_the_committed_branches_resolve_against_the_generated_module(self) -> None:
         branches = {b.name: b for b in run.load_expected(run.HERE / "expected.toml").branches}
         self.assertEqual(sorted(branches), ["s240-5-s5-non-record", "s240-5-s6-another-file"])
@@ -2388,6 +2430,8 @@ class MutantManifestTests(unittest.TestCase):
             "bad name": self.VALID.replace('"t9-demo"', '"T9 Demo"'),
             # A misspelled expect_absent could never be reported, so every run would count as a kill.
             "name not in config": self.VALID.replace('expect_absent = "A"', 'expect_absent = "Z"'),
+            # A top-level key outside every [[mutant]] table (test audit, cut 6).
+            "top-level key": 'note = "x"\n' + self.VALID,
         }
         for label, body in cases.items():
             with self.subTest(label):
@@ -2502,6 +2546,47 @@ class MutantManifestTests(unittest.TestCase):
             killed, detail = run.judge_zero_branch(m, outcome, count)
             self.assertFalse(killed, "a tooling error or an unreadable arm is never a kill")
             self.assertIn("tooling", detail)
+
+    def run_mutant_captured(self, name: str) -> tuple[list[str], str]:
+        """run_mutant on a committed mutant with the translator and TLC replaced: the command and the config
+        text TLC would have been given (test audit, cut 6). No TLC runs."""
+        (mutant,) = [m for m in run.load_mutants(run.HERE / "mutants.toml", run.HERE) if m.name == name]
+        seen: list[tuple[list[str], str]] = []
+
+        def translate(cmd, **_kwargs):  # the generated module the translator would write, unmutated
+            Path(cmd[-1]).write_text((run.HERE / "LockProtocol.tla").read_text(encoding="utf-8"), encoding="utf-8")
+            return run.subprocess.CompletedProcess(cmd, 0, "", "")
+
+        class FakeTLC:
+            def __init__(self, cmd, **_kwargs):
+                seen.append((cmd, Path(cmd[cmd.index("-config") + 1]).read_text(encoding="utf-8")))
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        with (mock.patch.object(run, "MUTANTS_OUT", Path(holder.name)),
+              mock.patch.object(run.subprocess, "run", translate),
+              mock.patch.object(run.subprocess, "Popen", FakeTLC)):
+            run.run_mutant(mutant, Path("tla2tools.jar"), run.HERE)
+        (captured,) = seen
+        return captured
+
+    def test_run_mutant_narrows_a_named_expectation_and_not_a_branch_mutant(self) -> None:
+        cmd, cfg = self.run_mutant_captured("t6-no-entries-conjunct")  # expect_absent FsOk, a seeded config
+        self.assertEqual(run.cfg_sections(cfg).get("INVARIANT"), ["FsOk"], "only the absent name is checked")
+        self.assertNotIn("-continue", cmd)
+        cmd, cfg = self.run_mutant_captured("t4-replacedlive-unguarded")  # expect_present ReplacedOnlyDead
+        self.assertEqual(run.cfg_sections(cfg).get("INVARIANT"), ["ReplacedOnlyDead"])
+        self.assertNotIn("-continue", cmd)
+        cmd, cfg = self.run_mutant_captured("p2-non-record-refuses")  # a branch mutant: the whole config
+        original = (run.HERE / "configs" / "breaklock-posix-plain-check.cfg").read_text(encoding="utf-8")
+        self.assertEqual(run.cfg_sections(cfg), run.cfg_sections(original), "a branch mutant is never narrowed")
+        self.assertIn("-coverage", cmd)
 
     def test_the_committed_manifest_is_valid_against_the_current_sources(self) -> None:
         mutants = run.load_mutants(run.HERE / "mutants.toml", run.HERE)

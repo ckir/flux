@@ -829,8 +829,8 @@ class Mutant:
 
 
 def load_mutants(path: Path, base: Path) -> list[Mutant]:
-    """Parse and validate a mutants manifest. Unknown keys, a missing field, both or neither expectation, a file
-    that is not a model source, a config that does not exist, or a duplicate name all fail at load."""
+    """Parse and validate a mutants manifest. Unknown keys, a missing field, other than exactly one expectation, a
+    file that is not a model source, a config that does not exist, or a duplicate name all fail at load."""
     try:
         raw = tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError) as err:
@@ -862,8 +862,8 @@ def load_mutants(path: Path, base: Path) -> list[Mutant]:
         if zero is not None:
             names = {b.name for b in load_expected(base / "expected.toml").branches}
             _require(zero in names, f"{where}: expect_zero_branch must name a 'branches' entry of expected.toml")
-        # The name must be one the config checks: a misspelled expect_absent could never be reported, so
-        # every run would be judged a kill (independent review of this plan, MG-1).
+        # The name must be one the config checks: a misspelled expect_absent is checked by nothing, so it fails
+        # here, before any TLC time is spent (independent review of this plan, MG-1; narrow_config would raise later).
         cfg_text = (base / e["config"]).read_text(encoding="utf-8")
         checked = [t for t in cfg_sections(cfg_text).get("INVARIANT", []) if IDENT.fullmatch(t)] + cfg_properties(cfg_text)
         for key, value in (("expect_present", present), ("expect_absent", absent)):
