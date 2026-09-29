@@ -3629,6 +3629,12 @@ NeverRefusedUnsafe == \A p \in Procs : refused[p] # "REMOTE_LOCK_UNSAFE"
 \* process crash (design Section 11).
 NeverHostCrashChangedLock == ~hostCrashChangedLock
 
+\* Weak identity was exercised: some name's past holds a second id, which only a re-created name under
+\* IdentityStrength = "weak" produces (FsCreate, FsModel.tla). Its weak runs must stop with it violated;
+\* without it, gutting `past` to {} would reduce weak identity to strong and change nothing any run checks
+\* (cut 6, item 13).
+NeverSecondPastId == \A d \in Dirs, c \in Classes : Cardinality(fs.past[d][c]) <= 1
+
 \* ------------------------------------------------------------------------------------------
 \* Temporal properties (design Section 7). A configuration that checks one lists exactly one
 \* PROPERTY, because TLC reports a temporal violation without naming the property it belongs to.

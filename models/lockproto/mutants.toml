@@ -172,3 +172,347 @@ old = "ForeignContentUntouched == foreignObj # NoObj => fs.content[foreignObj] =
 new = "ForeignContentUntouched == TRUE"
 config = "configs/breaklock-posix-seeded-SEED_TAKEOVER_FOREIGN.cfg"
 expect_absent = "ForeignContentUntouched"
+
+[[mutant]]
+name = "t12-no-weak-past-recovery"
+file = "FsModel.tla"
+old = '''
+                !.past[d][ClassOf(n)] = IF IdentityStrength = "weak" THEN @ \cup {o} ELSE @,
+                !.handles = @ \cup {[proc |-> p, obj |-> o, del |-> share]},
+                !.next = o ], o)
+
+\* Open an existing name without creating. Fails if absent, or (Windows) if the object has a
+\* pending delete. A process never opens a name it already has open in these models; the protocol
+\* keeps one handle per object per process, and `NoDoubleOpen` below checks that.
+FsOpen(fs, d, n, p, del) ==
+    LET o == At(fs, d, n) IN
+    IF o = NoObj \/ (Windows /\ o \in fs.deleted) THEN Fail(fs)
+    ELSE LET share == IF Posix THEN TRUE ELSE del IN
+         Ok([fs EXCEPT !.handles = @ \cup {[proc |-> p, obj |-> o, del |-> share]}], o)
+
+\* Close one handle: drops it, releases its OS-native lock, and on Windows removes a pending-delete
+\* object's name when its last handle goes.
+FsClose(fs, p, o) ==
+    IF o = NoObj \/ ~OpenBy(fs, p, o) THEN Fail(fs) ELSE
+    LET rest == fs.handles \ {h \in fs.handles : h.proc = p /\ h.obj = o}
+        lock == IF fs.oslock[o] = p THEN NoProc ELSE fs.oslock[o]
+        gone == Windows /\ o \in fs.deleted /\ {h \in rest : h.obj = o} = {}
+        names == {<<d, c>> \in Dirs \X Classes : fs.entries[d][c] = o}
+    IN Ok([ fs EXCEPT
+              !.handles = rest,
+              !.oslock[o] = lock,
+              !.entries = IF gone
+                          THEN [d \in Dirs |-> [c \in Classes |->
+                                  IF <<d, c>> \in names THEN NoObj ELSE fs.entries[d][c]]]
+                          ELSE fs.entries,
+              !.deleted = IF gone THEN @ \ {o} ELSE @ ], o)
+
+\* The OS-native lock, scoped to the handle that takes it (probe FS-11) and unavailable when the
+\* capability is weak (Section 235.1).
+\*
+\* This does NOT model a poisoned descriptor. A lock lost to a lapsed lease leaves the kernel's
+\* NFS_LOCK_LOST state on the descriptor, so the holder cannot take that lock back through it - it must
+\* close the file and open it again (design Section 5.3). `FsLeaseExpiry` only clears `oslock`, so this
+\* operator would happily hand the lapsed holder its lock back on the same handle. What makes that sound
+\* is the PROTOCOL, not this primitive, and in two parts - NOT, as this comment first claimed, because
+\* every caller locks an object it has just opened. Two of the four sites are re-entered from a wait
+\* loop (`S96_1_ownlock_wait`, `S240_3_s4_lock_wait`), with any number of environment steps - lease
+\* expiries included - in between. What holds instead: (a) a wait label is reachable ONLY from a FAILED
+\* try-lock, so the caller has never held that object's lock and nothing of its can have lapsed; and
+\* (b) once a try-lock succeeds the control flow is strictly forward, with no edge back to the lock
+\* label. The one label that did retake a lapsed lock was deleted on 2026-09-16. A new caller that
+\* re-locks a descriptor whose lease lapsed would be admitted here and would be wrong - add the
+\* poisoned state before writing one (capstone finding, plan 3).
+FsTryLock(fs, p, o) ==
+    IF o = NoObj \/ LockCapability = "weak" \/ ~OpenBy(fs, p, o) \/ fs.oslock[o] # NoProc THEN Fail(fs)
+    ELSE Ok([fs EXCEPT !.oslock[o] = p], o)
+
+\* A remote lock's lease lapses (design Section 5.1): the lock is gone, the holder keeps its handle and
+\* is not told.
+FsLeaseExpiry(fs, o) ==
+    IF o = NoObj \/ fs.oslock[o] = NoProc THEN Fail(fs) ELSE Ok([fs EXCEPT !.oslock[o] = NoProc], o)
+
+FsUnlock(fs, p, o) ==
+    IF o = NoObj \/ fs.oslock[o] # p THEN Fail(fs) ELSE Ok([fs EXCEPT !.oslock[o] = NoProc], o)
+
+\* Rename without replacing: fails if the target class exists. On POSIX it succeeds even while the
+\* object is open and OS-locked (FS-4); on Windows every open handle must allow delete sharing
+\* (FS-6, FS-7).
+FsRenameNoReplace(fs, d, from, to) ==
+    LET o == At(fs, d, from) IN
+    IF o = NoObj \/ Exists(fs, d, to) \/ ~DeleteAllowed(fs, o) THEN Fail(fs)
+    ELSE Ok([ fs EXCEPT
+                !.entries[d][ClassOf(from)] = NoObj,
+                !.entries[d][ClassOf(to)] = o,
+                !.past[d][ClassOf(to)] =
+                    IF IdentityStrength = "weak" THEN @ \cup {o} ELSE @ ], o)
+
+\* Rename, replacing (design Section 5.1): atomically points the target at the source object whether or
+\* not the target existed; the replaced object keeps its open handles and loses its name. Windows needs
+\* delete sharing on every handle of both objects.
+FsRenameReplace(fs, d, from, to) ==
+    LET o == At(fs, d, from)
+        old == At(fs, d, to) IN
+    IF o = NoObj \/ ~DeleteAllowed(fs, o) \/ (old # NoObj /\ ~DeleteAllowed(fs, old)) THEN Fail(fs)
+    ELSE Ok([ fs EXCEPT
+                !.entries[d][ClassOf(from)] = NoObj,
+                !.entries[d][ClassOf(to)] = o,
+                !.past[d][ClassOf(to)] =
+                    IF IdentityStrength = "weak" THEN @ \cup {o} ELSE @ ], o)'''
+new = '''
+                !.past[d][ClassOf(n)] = @,
+                !.handles = @ \cup {[proc |-> p, obj |-> o, del |-> share]},
+                !.next = o ], o)
+
+\* Open an existing name without creating. Fails if absent, or (Windows) if the object has a
+\* pending delete. A process never opens a name it already has open in these models; the protocol
+\* keeps one handle per object per process, and `NoDoubleOpen` below checks that.
+FsOpen(fs, d, n, p, del) ==
+    LET o == At(fs, d, n) IN
+    IF o = NoObj \/ (Windows /\ o \in fs.deleted) THEN Fail(fs)
+    ELSE LET share == IF Posix THEN TRUE ELSE del IN
+         Ok([fs EXCEPT !.handles = @ \cup {[proc |-> p, obj |-> o, del |-> share]}], o)
+
+\* Close one handle: drops it, releases its OS-native lock, and on Windows removes a pending-delete
+\* object's name when its last handle goes.
+FsClose(fs, p, o) ==
+    IF o = NoObj \/ ~OpenBy(fs, p, o) THEN Fail(fs) ELSE
+    LET rest == fs.handles \ {h \in fs.handles : h.proc = p /\ h.obj = o}
+        lock == IF fs.oslock[o] = p THEN NoProc ELSE fs.oslock[o]
+        gone == Windows /\ o \in fs.deleted /\ {h \in rest : h.obj = o} = {}
+        names == {<<d, c>> \in Dirs \X Classes : fs.entries[d][c] = o}
+    IN Ok([ fs EXCEPT
+              !.handles = rest,
+              !.oslock[o] = lock,
+              !.entries = IF gone
+                          THEN [d \in Dirs |-> [c \in Classes |->
+                                  IF <<d, c>> \in names THEN NoObj ELSE fs.entries[d][c]]]
+                          ELSE fs.entries,
+              !.deleted = IF gone THEN @ \ {o} ELSE @ ], o)
+
+\* The OS-native lock, scoped to the handle that takes it (probe FS-11) and unavailable when the
+\* capability is weak (Section 235.1).
+\*
+\* This does NOT model a poisoned descriptor. A lock lost to a lapsed lease leaves the kernel's
+\* NFS_LOCK_LOST state on the descriptor, so the holder cannot take that lock back through it - it must
+\* close the file and open it again (design Section 5.3). `FsLeaseExpiry` only clears `oslock`, so this
+\* operator would happily hand the lapsed holder its lock back on the same handle. What makes that sound
+\* is the PROTOCOL, not this primitive, and in two parts - NOT, as this comment first claimed, because
+\* every caller locks an object it has just opened. Two of the four sites are re-entered from a wait
+\* loop (`S96_1_ownlock_wait`, `S240_3_s4_lock_wait`), with any number of environment steps - lease
+\* expiries included - in between. What holds instead: (a) a wait label is reachable ONLY from a FAILED
+\* try-lock, so the caller has never held that object's lock and nothing of its can have lapsed; and
+\* (b) once a try-lock succeeds the control flow is strictly forward, with no edge back to the lock
+\* label. The one label that did retake a lapsed lock was deleted on 2026-09-16. A new caller that
+\* re-locks a descriptor whose lease lapsed would be admitted here and would be wrong - add the
+\* poisoned state before writing one (capstone finding, plan 3).
+FsTryLock(fs, p, o) ==
+    IF o = NoObj \/ LockCapability = "weak" \/ ~OpenBy(fs, p, o) \/ fs.oslock[o] # NoProc THEN Fail(fs)
+    ELSE Ok([fs EXCEPT !.oslock[o] = p], o)
+
+\* A remote lock's lease lapses (design Section 5.1): the lock is gone, the holder keeps its handle and
+\* is not told.
+FsLeaseExpiry(fs, o) ==
+    IF o = NoObj \/ fs.oslock[o] = NoProc THEN Fail(fs) ELSE Ok([fs EXCEPT !.oslock[o] = NoProc], o)
+
+FsUnlock(fs, p, o) ==
+    IF o = NoObj \/ fs.oslock[o] # p THEN Fail(fs) ELSE Ok([fs EXCEPT !.oslock[o] = NoProc], o)
+
+\* Rename without replacing: fails if the target class exists. On POSIX it succeeds even while the
+\* object is open and OS-locked (FS-4); on Windows every open handle must allow delete sharing
+\* (FS-6, FS-7).
+FsRenameNoReplace(fs, d, from, to) ==
+    LET o == At(fs, d, from) IN
+    IF o = NoObj \/ Exists(fs, d, to) \/ ~DeleteAllowed(fs, o) THEN Fail(fs)
+    ELSE Ok([ fs EXCEPT
+                !.entries[d][ClassOf(from)] = NoObj,
+                !.entries[d][ClassOf(to)] = o,
+                !.past[d][ClassOf(to)] =
+                    @ ], o)
+
+\* Rename, replacing (design Section 5.1): atomically points the target at the source object whether or
+\* not the target existed; the replaced object keeps its open handles and loses its name. Windows needs
+\* delete sharing on every handle of both objects.
+FsRenameReplace(fs, d, from, to) ==
+    LET o == At(fs, d, from)
+        old == At(fs, d, to) IN
+    IF o = NoObj \/ ~DeleteAllowed(fs, o) \/ (old # NoObj /\ ~DeleteAllowed(fs, old)) THEN Fail(fs)
+    ELSE Ok([ fs EXCEPT
+                !.entries[d][ClassOf(from)] = NoObj,
+                !.entries[d][ClassOf(to)] = o,
+                !.past[d][ClassOf(to)] =
+                    @ ], o)'''
+config = "configs/recovery-posix-weak-witness-NeverSecondPastId.cfg"
+expect_absent = "NeverSecondPastId"
+
+[[mutant]]
+name = "t12-no-weak-past-mixed"
+file = "FsModel.tla"
+old = '''
+                !.past[d][ClassOf(n)] = IF IdentityStrength = "weak" THEN @ \cup {o} ELSE @,
+                !.handles = @ \cup {[proc |-> p, obj |-> o, del |-> share]},
+                !.next = o ], o)
+
+\* Open an existing name without creating. Fails if absent, or (Windows) if the object has a
+\* pending delete. A process never opens a name it already has open in these models; the protocol
+\* keeps one handle per object per process, and `NoDoubleOpen` below checks that.
+FsOpen(fs, d, n, p, del) ==
+    LET o == At(fs, d, n) IN
+    IF o = NoObj \/ (Windows /\ o \in fs.deleted) THEN Fail(fs)
+    ELSE LET share == IF Posix THEN TRUE ELSE del IN
+         Ok([fs EXCEPT !.handles = @ \cup {[proc |-> p, obj |-> o, del |-> share]}], o)
+
+\* Close one handle: drops it, releases its OS-native lock, and on Windows removes a pending-delete
+\* object's name when its last handle goes.
+FsClose(fs, p, o) ==
+    IF o = NoObj \/ ~OpenBy(fs, p, o) THEN Fail(fs) ELSE
+    LET rest == fs.handles \ {h \in fs.handles : h.proc = p /\ h.obj = o}
+        lock == IF fs.oslock[o] = p THEN NoProc ELSE fs.oslock[o]
+        gone == Windows /\ o \in fs.deleted /\ {h \in rest : h.obj = o} = {}
+        names == {<<d, c>> \in Dirs \X Classes : fs.entries[d][c] = o}
+    IN Ok([ fs EXCEPT
+              !.handles = rest,
+              !.oslock[o] = lock,
+              !.entries = IF gone
+                          THEN [d \in Dirs |-> [c \in Classes |->
+                                  IF <<d, c>> \in names THEN NoObj ELSE fs.entries[d][c]]]
+                          ELSE fs.entries,
+              !.deleted = IF gone THEN @ \ {o} ELSE @ ], o)
+
+\* The OS-native lock, scoped to the handle that takes it (probe FS-11) and unavailable when the
+\* capability is weak (Section 235.1).
+\*
+\* This does NOT model a poisoned descriptor. A lock lost to a lapsed lease leaves the kernel's
+\* NFS_LOCK_LOST state on the descriptor, so the holder cannot take that lock back through it - it must
+\* close the file and open it again (design Section 5.3). `FsLeaseExpiry` only clears `oslock`, so this
+\* operator would happily hand the lapsed holder its lock back on the same handle. What makes that sound
+\* is the PROTOCOL, not this primitive, and in two parts - NOT, as this comment first claimed, because
+\* every caller locks an object it has just opened. Two of the four sites are re-entered from a wait
+\* loop (`S96_1_ownlock_wait`, `S240_3_s4_lock_wait`), with any number of environment steps - lease
+\* expiries included - in between. What holds instead: (a) a wait label is reachable ONLY from a FAILED
+\* try-lock, so the caller has never held that object's lock and nothing of its can have lapsed; and
+\* (b) once a try-lock succeeds the control flow is strictly forward, with no edge back to the lock
+\* label. The one label that did retake a lapsed lock was deleted on 2026-09-16. A new caller that
+\* re-locks a descriptor whose lease lapsed would be admitted here and would be wrong - add the
+\* poisoned state before writing one (capstone finding, plan 3).
+FsTryLock(fs, p, o) ==
+    IF o = NoObj \/ LockCapability = "weak" \/ ~OpenBy(fs, p, o) \/ fs.oslock[o] # NoProc THEN Fail(fs)
+    ELSE Ok([fs EXCEPT !.oslock[o] = p], o)
+
+\* A remote lock's lease lapses (design Section 5.1): the lock is gone, the holder keeps its handle and
+\* is not told.
+FsLeaseExpiry(fs, o) ==
+    IF o = NoObj \/ fs.oslock[o] = NoProc THEN Fail(fs) ELSE Ok([fs EXCEPT !.oslock[o] = NoProc], o)
+
+FsUnlock(fs, p, o) ==
+    IF o = NoObj \/ fs.oslock[o] # p THEN Fail(fs) ELSE Ok([fs EXCEPT !.oslock[o] = NoProc], o)
+
+\* Rename without replacing: fails if the target class exists. On POSIX it succeeds even while the
+\* object is open and OS-locked (FS-4); on Windows every open handle must allow delete sharing
+\* (FS-6, FS-7).
+FsRenameNoReplace(fs, d, from, to) ==
+    LET o == At(fs, d, from) IN
+    IF o = NoObj \/ Exists(fs, d, to) \/ ~DeleteAllowed(fs, o) THEN Fail(fs)
+    ELSE Ok([ fs EXCEPT
+                !.entries[d][ClassOf(from)] = NoObj,
+                !.entries[d][ClassOf(to)] = o,
+                !.past[d][ClassOf(to)] =
+                    IF IdentityStrength = "weak" THEN @ \cup {o} ELSE @ ], o)
+
+\* Rename, replacing (design Section 5.1): atomically points the target at the source object whether or
+\* not the target existed; the replaced object keeps its open handles and loses its name. Windows needs
+\* delete sharing on every handle of both objects.
+FsRenameReplace(fs, d, from, to) ==
+    LET o == At(fs, d, from)
+        old == At(fs, d, to) IN
+    IF o = NoObj \/ ~DeleteAllowed(fs, o) \/ (old # NoObj /\ ~DeleteAllowed(fs, old)) THEN Fail(fs)
+    ELSE Ok([ fs EXCEPT
+                !.entries[d][ClassOf(from)] = NoObj,
+                !.entries[d][ClassOf(to)] = o,
+                !.past[d][ClassOf(to)] =
+                    IF IdentityStrength = "weak" THEN @ \cup {o} ELSE @ ], o)'''
+new = '''
+                !.past[d][ClassOf(n)] = @,
+                !.handles = @ \cup {[proc |-> p, obj |-> o, del |-> share]},
+                !.next = o ], o)
+
+\* Open an existing name without creating. Fails if absent, or (Windows) if the object has a
+\* pending delete. A process never opens a name it already has open in these models; the protocol
+\* keeps one handle per object per process, and `NoDoubleOpen` below checks that.
+FsOpen(fs, d, n, p, del) ==
+    LET o == At(fs, d, n) IN
+    IF o = NoObj \/ (Windows /\ o \in fs.deleted) THEN Fail(fs)
+    ELSE LET share == IF Posix THEN TRUE ELSE del IN
+         Ok([fs EXCEPT !.handles = @ \cup {[proc |-> p, obj |-> o, del |-> share]}], o)
+
+\* Close one handle: drops it, releases its OS-native lock, and on Windows removes a pending-delete
+\* object's name when its last handle goes.
+FsClose(fs, p, o) ==
+    IF o = NoObj \/ ~OpenBy(fs, p, o) THEN Fail(fs) ELSE
+    LET rest == fs.handles \ {h \in fs.handles : h.proc = p /\ h.obj = o}
+        lock == IF fs.oslock[o] = p THEN NoProc ELSE fs.oslock[o]
+        gone == Windows /\ o \in fs.deleted /\ {h \in rest : h.obj = o} = {}
+        names == {<<d, c>> \in Dirs \X Classes : fs.entries[d][c] = o}
+    IN Ok([ fs EXCEPT
+              !.handles = rest,
+              !.oslock[o] = lock,
+              !.entries = IF gone
+                          THEN [d \in Dirs |-> [c \in Classes |->
+                                  IF <<d, c>> \in names THEN NoObj ELSE fs.entries[d][c]]]
+                          ELSE fs.entries,
+              !.deleted = IF gone THEN @ \ {o} ELSE @ ], o)
+
+\* The OS-native lock, scoped to the handle that takes it (probe FS-11) and unavailable when the
+\* capability is weak (Section 235.1).
+\*
+\* This does NOT model a poisoned descriptor. A lock lost to a lapsed lease leaves the kernel's
+\* NFS_LOCK_LOST state on the descriptor, so the holder cannot take that lock back through it - it must
+\* close the file and open it again (design Section 5.3). `FsLeaseExpiry` only clears `oslock`, so this
+\* operator would happily hand the lapsed holder its lock back on the same handle. What makes that sound
+\* is the PROTOCOL, not this primitive, and in two parts - NOT, as this comment first claimed, because
+\* every caller locks an object it has just opened. Two of the four sites are re-entered from a wait
+\* loop (`S96_1_ownlock_wait`, `S240_3_s4_lock_wait`), with any number of environment steps - lease
+\* expiries included - in between. What holds instead: (a) a wait label is reachable ONLY from a FAILED
+\* try-lock, so the caller has never held that object's lock and nothing of its can have lapsed; and
+\* (b) once a try-lock succeeds the control flow is strictly forward, with no edge back to the lock
+\* label. The one label that did retake a lapsed lock was deleted on 2026-09-16. A new caller that
+\* re-locks a descriptor whose lease lapsed would be admitted here and would be wrong - add the
+\* poisoned state before writing one (capstone finding, plan 3).
+FsTryLock(fs, p, o) ==
+    IF o = NoObj \/ LockCapability = "weak" \/ ~OpenBy(fs, p, o) \/ fs.oslock[o] # NoProc THEN Fail(fs)
+    ELSE Ok([fs EXCEPT !.oslock[o] = p], o)
+
+\* A remote lock's lease lapses (design Section 5.1): the lock is gone, the holder keeps its handle and
+\* is not told.
+FsLeaseExpiry(fs, o) ==
+    IF o = NoObj \/ fs.oslock[o] = NoProc THEN Fail(fs) ELSE Ok([fs EXCEPT !.oslock[o] = NoProc], o)
+
+FsUnlock(fs, p, o) ==
+    IF o = NoObj \/ fs.oslock[o] # p THEN Fail(fs) ELSE Ok([fs EXCEPT !.oslock[o] = NoProc], o)
+
+\* Rename without replacing: fails if the target class exists. On POSIX it succeeds even while the
+\* object is open and OS-locked (FS-4); on Windows every open handle must allow delete sharing
+\* (FS-6, FS-7).
+FsRenameNoReplace(fs, d, from, to) ==
+    LET o == At(fs, d, from) IN
+    IF o = NoObj \/ Exists(fs, d, to) \/ ~DeleteAllowed(fs, o) THEN Fail(fs)
+    ELSE Ok([ fs EXCEPT
+                !.entries[d][ClassOf(from)] = NoObj,
+                !.entries[d][ClassOf(to)] = o,
+                !.past[d][ClassOf(to)] =
+                    @ ], o)
+
+\* Rename, replacing (design Section 5.1): atomically points the target at the source object whether or
+\* not the target existed; the replaced object keeps its open handles and loses its name. Windows needs
+\* delete sharing on every handle of both objects.
+FsRenameReplace(fs, d, from, to) ==
+    LET o == At(fs, d, from)
+        old == At(fs, d, to) IN
+    IF o = NoObj \/ ~DeleteAllowed(fs, o) \/ (old # NoObj /\ ~DeleteAllowed(fs, old)) THEN Fail(fs)
+    ELSE Ok([ fs EXCEPT
+                !.entries[d][ClassOf(from)] = NoObj,
+                !.entries[d][ClassOf(to)] = o,
+                !.past[d][ClassOf(to)] =
+                    @ ], o)'''
+config = "configs/mixed-posix-weak-witness-NeverSecondPastId.cfg"
+expect_absent = "NeverSecondPastId"
