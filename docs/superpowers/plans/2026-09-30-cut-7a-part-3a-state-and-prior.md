@@ -143,6 +143,10 @@ The seams are `.clavity/seams/cut7a-p3-forks.md` and `cut7a-p3-forks-2.md`. The 
   workspace. A crash in between leaves a manifest-less workspace: `STATE_CORRUPT`. 3b should first retire the
   workspace to a name that is not an id (for example `<id>.removing`). The same applies to `--restart` step 4, which
   deletes the prior operation's workspace.
+- **A state write's temporary goes with its state (panel round 2).** When 3b removes a single-file record (the finish
+  path, `--restart` step 4), it also removes `<record>.tmp`. A crash inside a later rewrite leaves that temporary
+  beside the record, and the valid record naming the id is the authority to delete it. The same applies to
+  `manifest.tmp` inside a workspace being removed.
 - `RunError` (P3-H), the engine hook (P3-C), DEST's creation (P3-E), the reserved paths (P3-F), the `.broken` warning
   (P3-G) and the partial sweep (P3-J) are all settled calls. 3b implements them.
 
@@ -2769,6 +2773,7 @@ fn the_scan_finds_a_resumable_workspace_and_passes_over_a_creating_one() {
   - "Declared refinements of the spec" ends with item 8, whose last sentence is `It exists so that no record ever names
     missing state (F5).`.
   - The crash table's last row begins `| during §240.3 recovery, between the move-aside and the new lock |`.
+  - "What this closes, and what it leaves" has a list headed `**New residues:**`.
 
 - [ ] **Step 1: the edits.**
   - Replace `` `<name>.tmp.<id>` in the same directory`` with `` `<name>.tmp` in the same directory (refinement 10)``.
@@ -2790,10 +2795,19 @@ fn the_scan_finds_a_resumable_workspace_and_passes_over_a_creating_one() {
     never read back for a decision.
 ```
 
-  - Append a row to "What each crash window leaves":
+  - Append three rows to "What each crash window leaves":
 
 ```markdown
 | while creating a tree operation's workspace, before its rename | an empty lock, and `operations/<id>.creating/` | `TARGET_LOCK_UNCERTAIN`; `--restart --break-lock` proceeds, and the scan passes over the `.creating` directory (cut 9's) |
+| while writing a single-file operation's first state record, before its rename | an empty lock, and `<target>.flux-state.<id>.tmp` | `TARGET_LOCK_UNCERTAIN`; `--restart --break-lock` proceeds, and the scan passes over the `.tmp` file (cut 9's) |
+| while rewriting a state, before its rename | the previous state, whole, and `<name>.tmp` beside it | as the previous state says; removing that state later removes its `.tmp` too |
+```
+
+  - In "What this closes, and what it leaves", append to the "**New residues:**" list:
+
+```markdown
+- Crash leftovers of a first state write that never completed - `operations/<id>.creating/` and
+  `<target>.flux-state.<id>.tmp` - which no state names, so only cut 9's cleanup reclaims them (refinements 9-10).
 ```
 
 - [ ] **Step 2:** `just typos` passes (`just check` runs it too).
@@ -2855,4 +2869,20 @@ refinements 9-11, or in the scan's comments.
 
 ## Stand-downs
 
-(Filled by the AGY-AFTER panel rounds.)
+Panel round 1 (agy), at `7d1b803`:
+- REJECTED: "`oa.ObjectName = &raw const us` does not compile, the field is `*mut`". windows-sys 0.61
+  `Wdk/Foundation/mod.rs:1611` declares `pub ObjectName: *const ...UNICODE_STRING`, and `dir_windows.rs:119` assigns
+  it the same way in code that builds today. agy withdrew it on the negotiation turn.
+- Agreed below the floor: let-chains are stable on the 1.98.1 toolchain and already used in the repo.
+
+Panel round 2 (agy), at `7d1b803`. Every task's Step 0 quotes were checked, and every named mutant was traced to its
+test going red.
+- FOLDED: a crash during a single-file state write leaves `<target>.flux-state.<id>.tmp` in the user's directory.
+  This adds the crash-table rows and a residue (Task 10), and the handoff that 3b removes a state's `.tmp` together
+  with the state.
+- DISCARDED-BELOW-FLOOR: "the fake's `remove_dir` does not model a delete-pending directory".
+  - `delete_open` tries POSIX delete first, which frees the name at once on NTFS and ReFS (`dir_windows.rs:624-647`
+    today).
+  - The legacy fallback runs only on a volume without POSIX delete, and `capability_of` refuses every volume that is
+    not NTFS or ReFS (`lock_file.rs:232`) before any state exists.
+  - What is left is NTFS on Windows 10 before 1709, which is out of support.
