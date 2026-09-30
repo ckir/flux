@@ -1142,6 +1142,46 @@ impl DirHandle for FakeDirHandle {
     fn read_dir(&self) -> Result<Vec<DirEntry>> {
         self.fs().read_dir(&self.my_path())
     }
+
+    fn read_file(&self, name: &OsStr, limit: usize) -> Result<Vec<u8>> {
+        check_component(name)?;
+        let child_path = self.my_path().join(name);
+        self.fs().record(format!("read_file({})", child_path.display()), "read_file")?;
+        let g = self.inner.lock().unwrap();
+        match g.types.get(&child_path) {
+            Some(FileType::Symlink) => {
+                return Err(FsError::new(
+                    Code::SafetyRejected,
+                    std::io::Error::other("refuses to follow a symlink or other name-surrogate"),
+                ));
+            }
+            Some(FileType::Other) => {
+                return Err(FsError::new(
+                    Code::DestinationError,
+                    std::io::Error::other("not a regular file"),
+                ));
+            }
+            _ => {}
+        }
+        if g.directories.contains(&child_path) {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::new(
+                    std::io::ErrorKind::IsADirectory,
+                    "a directory is not a state file",
+                ),
+            ));
+        }
+        let Some(bytes) = g.files.get(&child_path) else {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            ));
+        };
+        let mut bytes = bytes.clone();
+        bytes.truncate(limit + 1);
+        Ok(bytes)
+    }
 }
 
 #[cfg(test)]
@@ -1738,5 +1778,26 @@ mod tests {
         );
         assert!(fs.called("read_dir("), "{:?}", fs.calls());
         drop(sub);
+    }
+
+    #[test]
+    fn a_fake_handle_reads_a_file_and_refuses_what_the_real_ones_refuse() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/p")).unwrap();
+        let d = fs.destination_root(Path::new("/p")).unwrap();
+        fs.write_file("/p/s", b"0123456789");
+        assert_eq!(d.read_file(OsStr::new("s"), 4).unwrap(), b"01234");
+        let e = d.read_file(OsStr::new("absent"), 4).unwrap_err();
+        assert_eq!((e.code, e.source.kind()), (Code::IoError, std::io::ErrorKind::NotFound));
+        drop(d.create_dir(OsStr::new("sub")).unwrap());
+        let e = d.read_file(OsStr::new("sub"), 4).unwrap_err();
+        assert_eq!(
+            (e.code, e.source.kind()),
+            (Code::DestinationError, std::io::ErrorKind::IsADirectory)
+        );
+        fs.write_file("/p/l", b"");
+        fs.set_type("/p/l", FileType::Symlink);
+        assert_eq!(d.read_file(OsStr::new("l"), 4).unwrap_err().code, Code::SafetyRejected);
+        assert!(fs.called("read_file("), "{:?}", fs.calls());
     }
 }

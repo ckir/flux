@@ -145,7 +145,7 @@ fn os_try_lock(file: &File) -> Result<bool> {
 }
 
 /// Read from offset 0 until end of file or `limit + 1` bytes, whichever comes first.
-fn read_loop(
+pub(crate) fn read_loop(
     limit: usize,
     mut read_at: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
 ) -> Result<Vec<u8>> {

@@ -2,9 +2,10 @@
 //! empty directory, flushing a directory, and renaming a directory - each through a directory handle, never following
 //! a link (§149.7).
 
-use flux_fs::{DestinationRoot, DirHandle, FileType};
+use flux_fs::{Code, DestinationRoot, DirHandle, FileType};
 use flux_platform::StdFileSystem;
 use std::ffi::{OsStr, OsString};
+use std::io::ErrorKind;
 use std::path::Path;
 
 fn dir() -> (tempfile::TempDir, flux_platform::StdDir) {
@@ -69,4 +70,60 @@ fn read_dir_works_on_created_and_opened_handles_and_starts_again_each_call() {
         want,
         "a second listing through the same handle lists everything again"
     );
+}
+
+#[test]
+fn read_file_reads_at_most_one_byte_past_its_limit() {
+    let (tmp, d) = dir();
+    std::fs::write(tmp.path().join("s"), b"0123456789").unwrap();
+    assert_eq!(d.read_file(OsStr::new("s"), 64).unwrap(), b"0123456789");
+    assert_eq!(
+        d.read_file(OsStr::new("s"), 4).unwrap(),
+        b"01234",
+        "limit + 1 bytes, so an oversized file shows"
+    );
+}
+
+#[test]
+fn read_file_refuses_a_missing_name_and_a_directory() {
+    let (_tmp, d) = dir();
+    let e = d.read_file(OsStr::new("absent"), 8).expect_err("nothing there");
+    assert_eq!((e.code, e.source.kind()), (Code::IoError, ErrorKind::NotFound));
+    drop(d.create_dir(OsStr::new("adir")).unwrap());
+    let e = d.read_file(OsStr::new("adir"), 8).expect_err("a directory is not a state file");
+    assert_eq!((e.code, e.source.kind()), (Code::DestinationError, ErrorKind::IsADirectory));
+}
+
+#[test]
+fn read_file_never_follows_a_link() {
+    let (tmp, d) = dir();
+    #[cfg(unix)]
+    {
+        std::fs::write(tmp.path().join("real"), b"secret").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("real"), tmp.path().join("link")).unwrap();
+        let e = d.read_file(OsStr::new("link"), 64).expect_err("never follow a link");
+        assert_eq!(e.code, Code::SafetyRejected, "{e:?}");
+    }
+    #[cfg(windows)]
+    {
+        std::fs::create_dir(tmp.path().join("real")).unwrap();
+        dir_link(&tmp.path().join("real"), &tmp.path().join("link"));
+        let e = d.read_file(OsStr::new("link"), 64).expect_err("never follow a link");
+        // FILE_NON_DIRECTORY_FILE meets the junction first; either refusal is a refusal (as `open_lock`'s junction
+        // test says), and neither reads the target.
+        assert!(matches!(e.code, Code::SafetyRejected | Code::DestinationError), "{e:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn read_file_refuses_a_fifo_without_hanging() {
+    let (tmp, d) = dir();
+    let status = std::process::Command::new("mkfifo")
+        .arg(tmp.path().join("fifo"))
+        .status()
+        .expect("run mkfifo");
+    assert!(status.success(), "mkfifo");
+    let e = d.read_file(OsStr::new("fifo"), 8).expect_err("a FIFO is not a state file");
+    assert_eq!(e.code, Code::DestinationError);
 }

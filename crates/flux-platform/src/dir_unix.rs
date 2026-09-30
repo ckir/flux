@@ -277,6 +277,46 @@ impl DirHandle for StdDir {
         }
         Ok(out)
     }
+
+    fn read_file(&self, name: &OsStr, limit: usize) -> Result<Vec<u8>> {
+        use rustix::fs::FileType;
+        use std::os::unix::fs::FileExt;
+        check_component(name)?;
+        // `open_lock`'s flags, read-only: NOFOLLOW refuses a link, NONBLOCK keeps a FIFO from hanging the open, NOCTTY
+        // keeps a terminal from becoming this process's.
+        let fd = openat(
+            &self.0,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| match e {
+            rustix::io::Errno::LOOP => FsError::new(Code::SafetyRejected, std::io::Error::from(e)),
+            _ => FsError::from_io(std::io::Error::from(e)),
+        })?;
+        let st = rustix::fs::fstat(&fd).map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
+        match FileType::from_raw_mode(st.st_mode) {
+            FileType::RegularFile => {}
+            // A read-only open of a directory succeeds on POSIX, so it is refused here rather than by the kernel.
+            FileType::Directory => {
+                return Err(FsError::new(
+                    Code::DestinationError,
+                    std::io::Error::new(
+                        std::io::ErrorKind::IsADirectory,
+                        "a directory is not a state file",
+                    ),
+                ));
+            }
+            _ => {
+                return Err(FsError::new(
+                    Code::DestinationError,
+                    std::io::Error::other("not a regular file"),
+                ));
+            }
+        }
+        let file = std::fs::File::from(fd);
+        crate::lock_file::read_loop(limit, |buf, at| file.read_at(buf, at))
+    }
 }
 
 /// The handle-relative twin of `destination_is_write_protected` in `std_fs.rs`,

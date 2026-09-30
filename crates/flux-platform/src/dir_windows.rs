@@ -257,6 +257,11 @@ impl DirHandle for StdDir {
     fn read_dir(&self) -> Result<Vec<flux_fs::DirEntry>> {
         read_dir_at(&self.0)
     }
+
+    fn read_file(&self, name: &OsStr, limit: usize) -> Result<Vec<u8>> {
+        check_component(name)?;
+        read_file_at(&self.0, name, limit)
+    }
 }
 
 /// The directory `p` holds, opened AGAIN relative to itself (an empty name), with `access`. The fresh handle carries
@@ -371,6 +376,68 @@ fn entry_type(attributes: u32, ea_size: u32) -> flux_fs::FileType {
     } else {
         flux_fs::FileType::File
     }
+}
+
+/// A child regular file, read. Opened as `open_lock_at` opens one (`FILE_OPEN_REPARSE_POINT`, so a link is the object
+/// opened and then refused), for reading only.
+fn read_file_at(p: &OwnedHandle, n: &OsStr, limit: usize) -> Result<Vec<u8>> {
+    use std::os::windows::fs::FileExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
+    let mut wide: Vec<u16> = n.encode_wide().collect();
+    let bytes = (wide.len() * 2) as u16;
+    let us = UNICODE_STRING { Length: bytes, MaximumLength: bytes, Buffer: wide.as_mut_ptr() };
+    let mut oa: OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    oa.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
+    oa.RootDirectory = p.as_raw_handle() as HANDLE;
+    oa.ObjectName = &raw const us;
+    let mut h: HANDLE = std::ptr::null_mut();
+    let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    // SAFETY: every pointer is to a live local that outlives the call, and `wide` outlives `us`.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut h,
+            FILE_GENERIC_READ | SYNCHRONIZE,
+            &raw const oa,
+            &raw mut iosb,
+            std::ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status != 0 {
+        // Answered first: `nt_io_error` maps FILE_IS_A_DIRECTORY to AlreadyExists, for `create_new_at`'s sake.
+        if status == STATUS_FILE_IS_A_DIRECTORY {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::new(
+                    std::io::ErrorKind::IsADirectory,
+                    "a directory is not a state file",
+                ),
+            ));
+        }
+        let code = match status {
+            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => Code::IoError,
+            STATUS_ACCESS_DENIED => Code::PermissionDenied,
+            _ => Code::IoError,
+        };
+        return Err(FsError::new(code, nt_io_error("NtCreateFile", status)));
+    }
+    // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `h` is a valid handle we own.
+    let opened = unsafe { OwnedHandle::from_raw_handle(h as _) };
+    if let Some(tag) = reparse_tag_of(&opened)?
+        && is_name_surrogate(tag)
+    {
+        return Err(FsError::new(
+            Code::SafetyRejected,
+            std::io::Error::other(format!("name-surrogate reparse point, tag 0x{tag:08X}")),
+        ));
+    }
+    let file = File::from(opened);
+    crate::lock_file::read_loop(limit, |buf, at| file.seek_read(buf, at))
 }
 
 fn create_dir_at(p: &OwnedHandle, n: &OsStr) -> Result<OwnedHandle> {

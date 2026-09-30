@@ -324,6 +324,14 @@ pub trait DirHandle: Sized {
     /// `FileType::Symlink`, never its target's type. A directory carrying a non-surrogate reparse point (a cloud
     /// placeholder) is a `Dir`, as `open_dir` treats it.
     fn read_dir(&self) -> Result<Vec<crate::DirEntry>>;
+
+    /// Read a child REGULAR FILE: at most `limit + 1` bytes, so a caller can tell a file longer than `limit` (as
+    /// `LockFile::read_all` does). Never follows a link.
+    ///
+    /// Refuses as `open_lock` does: a name-surrogate (`Code::SafetyRejected`); a directory (`Code::DestinationError`,
+    /// kind `IsADirectory`); any other non-regular file where the platform can tell (`Code::DestinationError`). A
+    /// missing name is `Code::IoError` with kind `NotFound`.
+    fn read_file(&self, name: &std::ffi::OsStr, limit: usize) -> Result<Vec<u8>>;
 }
 
 /// Resolving `DEST` once, at start, is the only path-based call in the writer.
