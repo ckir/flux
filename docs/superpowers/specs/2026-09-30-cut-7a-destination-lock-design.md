@@ -193,10 +193,11 @@ One JSON object; the reader checks `format_version` before interpreting any othe
 takeover's own `creation_wall_time`; `null` when this run took no lock over.
 
 - A tree copy keeps it at `DEST/.flux/operations/<id>/manifest`. A single-file copy keeps it at
-  `target.flux-state.<id>`, beside the target.
+  `target.flux-state.<id>`, beside the target. A tree workspace is built as `operations/<id>.creating/` and renamed
+  to `<id>` once its manifest is written (refinement 9).
 - Unknown keys are refused as `STATE_CORRUPT`: a newer writer bumps `format_version` instead of adding keys.
-- Written crash-safely: `<name>.tmp.<id>` in the same directory, `sync`, rename over the final name, `sync` the
-  directory.
+- Written crash-safely: `<name>.tmp` in the same directory (refinement 10), `sync`, rename over the final name,
+  `sync` the directory.
 - 7b bumps `format_version` to 2 and owns reading version 1 (the sequencing doc: every cut that adds durable state
   bumps the version and reads every earlier one).
 
@@ -379,6 +380,9 @@ a takeover whose flush failed is never recorded (spec:10700-10701).
 | during `--restart` after ABANDONED | an ABANDONED prior | proceeds |
 | after COMPLETED | a completed state or its leftover | proceeds |
 | during §240.3 recovery, between the move-aside and the new lock | no lock, and `<lock-name>.broken.<id>` beside the lock path | acquires a fresh lock and proceeds. 7a does NOT collect the `.broken.*` file (the spec classifies it by its recorded owner, spec:10620-10624, which is cut 9's cleanup); a run that sees one beside its lock path reports it as a warning |
+| while creating a tree operation's workspace, before its rename | an empty lock, and `operations/<id>.creating/` | `TARGET_LOCK_UNCERTAIN`; `--restart --break-lock` proceeds, and the scan passes over the `.creating` directory (cut 9's) |
+| while writing a single-file operation's first state record, before its rename | an empty lock, and `<target>.flux-state.<id>.tmp` | `TARGET_LOCK_UNCERTAIN`; `--restart --break-lock` proceeds, and the scan passes over the `.tmp` file (cut 9's) |
+| while rewriting a state, before its rename | the previous state, whole, and `<name>.tmp` beside it | as the previous state says; removing that state later removes its `.tmp` too |
 
 ## Model conformance
 
@@ -435,6 +439,8 @@ The plan cites these entries step by step.
 - Remote lock capability (after the §240.5 amendment).
 - The spec's ABANDONED contradiction (spec:2990-2991 vs spec:1526), for an owner ruling on the spec text.
 - A leftover COMPLETED workspace is reclaimed only by cut 9.
+- Crash leftovers of a first state write that never completed - `operations/<id>.creating/` and
+  `<target>.flux-state.<id>.tmp` - which no state names, so only cut 9's cleanup reclaims them (refinements 9-10).
 
 ## Declared refinements of the spec
 
@@ -454,6 +460,16 @@ The plan cites these entries step by step.
    model's `TakeOver` (`S240_5_s6_write_begin/_end`) writes only the record; the added state I/O touches only paths
    under `DEST/.flux/` or the adjacent `target.flux-state.<id>`, which no model actor reads, so it lengthens the step in
    time without adding states to the lock protocol. It exists so that no record ever names missing state (F5).
+9. **A tree workspace never exists without its manifest** (Part 3a, owner-approved K1). It is built as
+   `operations/<id>.creating/`, its manifest is written inside crash-safely, and it is renamed to `<id>` without
+   replacing. The §21.1 scan ignores every entry of `operations/` that is not a directory named by an id. Otherwise a
+   crash between the `mkdir` and the manifest's rename would leave a manifest-less workspace (`STATE_CORRUPT`, which
+   no flag clears) behind an empty lock. Part 3b retires a workspace the same way before removing it.
+10. **A state file's temporary is `<name>.tmp`** (Part 3a, L2), not `<name>.tmp.<id>`: the name it stages already
+    carries the operation id. A single-file run whose longest name (its record's temporary, target + 48 units) would
+    exceed the name-length limit is refused `PATH_COMPONENT_INVALID` before anything is created.
+11. **`destination_root` is the path's display form** (Part 3a, M1): lossy for a path that is not valid Unicode, and
+    never read back for a decision.
 
 ## Consult record
 
