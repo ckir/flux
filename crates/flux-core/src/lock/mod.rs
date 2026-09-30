@@ -11,6 +11,7 @@ mod classify;
 pub mod error;
 mod held;
 pub mod record;
+mod recover;
 pub mod site;
 #[cfg(test)]
 pub(crate) mod test_support;
