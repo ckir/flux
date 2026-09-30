@@ -277,6 +277,21 @@ mod tests {
     }
 
     #[test]
+    fn a_takeover_that_restarts_every_pass_gives_up_uncertain() {
+        let (fs, d) = fake();
+        dead_lock(&d, NAME, b"");
+        // The lock path's identity never matches the opened file's, so every takeover's step 4 starts again.
+        fs.set_identity(
+            "/p/dest.flux-lock",
+            flux_fs::FileIdentity::Strong(flux_fs::ObjectId { volume: 9, index: 9 }),
+        );
+        let r = refusal(obtain(&site(&d), STRONG, Mode::BreakLock, &me()));
+        assert_eq!(r.code, LockCode::TargetLockUncertain, "{}", r.detail);
+        let opens = fs.calls().iter().filter(|c| c.starts_with("open_lock")).count();
+        assert_eq!(opens, 2 * MAX_ATTEMPTS as usize, "each pass classified and tried a takeover");
+    }
+
+    #[test]
     fn giving_up_reports_what_the_last_pass_saw() {
         let code = |l| match give_up(l) {
             LockError::Refused(r) => r.code,

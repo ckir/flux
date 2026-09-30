@@ -147,6 +147,16 @@ mod tests {
     }
 
     #[test]
+    fn a_directory_without_strong_identity_stays_uncertain() {
+        let (fs, d) = fake();
+        dead_lock(&d, NAME, b"");
+        fs.set_identity("/p", FileIdentity::Weak(flux_fs::ObjectId { volume: 1, index: 999 }));
+        let r = take_over(&site(&d), STRONG, Uncertain::Empty);
+        assert_eq!(refusal(r).code, LockCode::TargetLockUncertain);
+        assert_eq!(fs.read_file(LOCK).as_deref(), Some(&b""[..]));
+    }
+
+    #[test]
     fn an_empty_lock_is_claimed_then_overwritten_in_place() {
         let (fs, d) = fake();
         let site = site(&d);

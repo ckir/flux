@@ -217,6 +217,34 @@ mod tests {
     }
 
     #[test]
+    fn a_new_lock_another_handle_holds_restarts_and_drops_the_moved_file() {
+        let (fs, d) = fake();
+        let site = site(&d);
+        let (old, old_id, rec) = dead(&fs, &site);
+        // Recovery's own `try_lock` on the new file is the next one: another handle takes the lock just before it.
+        let next = fs.calls().iter().filter(|c| c.starts_with("try_lock")).count() as u32 + 1;
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let keep = std::sync::Arc::clone(&slot);
+        fs.on_nth("try_lock", next, move |fs| {
+            let d = fs.destination_root(Path::new("/p")).unwrap();
+            let other = d.open_lock(OsStr::new(NAME)).unwrap();
+            assert!(other.try_lock().unwrap());
+            *keep.lock().unwrap() = Some(other);
+        });
+        let me = crate::ids::new_id();
+        assert!(matches!(
+            recover(&site, old, old_id, &rec, &me).unwrap(),
+            Recovered::Restart(Last::HeldByOther)
+        ));
+        assert!(
+            !fs.exists(format!("/p/dest.flux-lock.broken.{me}")),
+            "S240_3_s4_lock_close, then S240_3_s4_drop"
+        );
+        assert_eq!(fs.read_file(LOCK).as_deref(), Some(&b""[..]), "the new lock is never unlinked");
+        drop(slot);
+    }
+
+    #[test]
     fn a_moved_file_that_cannot_be_deleted_is_reported_as_a_leftover() {
         let (fs, d) = fake();
         let site = site(&d);

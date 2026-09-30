@@ -197,6 +197,97 @@ mod tests {
     }
 
     #[test]
+    fn a_holder_that_lets_go_while_the_acquirer_waits_is_outlasted() {
+        let (fs, d) = fake();
+        let slot = Arc::new(Mutex::new(None));
+        let keep = Arc::clone(&slot);
+        fs.on_nth("try_lock", 1, move |fs| {
+            let d = fs.destination_root(Path::new("/p")).unwrap();
+            let other = d.open_lock(OsStr::new("dest.flux-lock")).unwrap();
+            assert!(other.try_lock().unwrap());
+            *keep.lock().unwrap() = Some(other);
+        });
+        // The wait's emptiness check is the first `read_all`: the transient holder closes just before it.
+        let release = Arc::clone(&slot);
+        fs.on_nth("read_all", 1, move |_| drop(release.lock().unwrap().take()));
+        let held = acquired(acquire(&site(&d)).unwrap());
+        assert!(held.record().is_none());
+        assert_eq!(fs.read_file(LOCK).as_deref(), Some(&b""[..]));
+    }
+
+    #[test]
+    fn a_record_written_into_the_fresh_file_before_the_verify_restarts() {
+        let (fs, d) = fake();
+        let bytes = record(&site(&d), &crate::ids::new_id(), "none").encode();
+        let written = bytes.clone();
+        // Another handle writes the file without holding its lock: the path still names it, but it is not empty.
+        fs.on_nth("try_lock", 1, move |fs| {
+            let d = fs.destination_root(Path::new("/p")).unwrap();
+            d.open_lock(OsStr::new("dest.flux-lock")).unwrap().write_at_start(&written).unwrap();
+        });
+        assert!(matches!(acquire(&site(&d)).unwrap(), Acquire::Restart(Last::Other)));
+        assert_eq!(fs.read_file(LOCK), Some(bytes), "another run's record is left alone");
+    }
+
+    #[test]
+    fn a_backoff_never_removes_a_file_another_run_has_written() {
+        let (fs, d) = fake();
+        fs.write_file("/p/.flux-dir.lock", b"");
+        let bytes = record(&site(&d), &crate::ids::new_id(), "none").encode();
+        let written = bytes.clone();
+        fs.on_nth("try_lock", 1, move |fs| {
+            let d = fs.destination_root(Path::new("/p")).unwrap();
+            d.open_lock(OsStr::new("dest.flux-lock")).unwrap().write_at_start(&written).unwrap();
+        });
+        assert_eq!(refusal(acquire(&site(&d))).code, LockCode::TargetLockBusy);
+        assert_eq!(fs.read_file(LOCK), Some(bytes), "decision 13: a written file is theirs");
+    }
+
+    #[test]
+    fn release_and_discard_unlink_while_the_lock_is_still_held() {
+        for discard in [false, true] {
+            let (fs, d) = fake();
+            let site = site(&d);
+            let mut held = acquired(acquire(&site).unwrap());
+            let seen = Arc::new(Mutex::new(None));
+            let out = Arc::clone(&seen);
+            fs.on_nth("remove_file", 1, move |fs| {
+                let d = fs.destination_root(Path::new("/p")).unwrap();
+                let other = d.open_lock(OsStr::new("dest.flux-lock")).unwrap();
+                *out.lock().unwrap() = Some(other.try_lock().unwrap());
+            });
+            if discard {
+                held.discard().unwrap();
+            } else {
+                held.write_record(record(&site, &crate::ids::new_id(), "none")).unwrap();
+                assert_eq!(held.release().unwrap(), Released::Unlinked);
+            }
+            assert!(!fs.exists(LOCK));
+            assert_eq!(
+                *seen.lock().unwrap(),
+                Some(false),
+                "decision 7 (discard={discard}): the OS-native lock is held at the unlink"
+            );
+        }
+    }
+
+    #[test]
+    fn a_record_of_the_same_operation_by_another_instance_is_not_owned() {
+        let (_fs, d) = fake();
+        let site = site(&d);
+        let mut held = acquired(acquire(&site).unwrap());
+        let mine = record(&site, &crate::ids::new_id(), "none");
+        held.write_record(mine.clone()).unwrap();
+        let theirs = record(&site, &mine.operation_id, "none");
+        assert_ne!(theirs.owner_instance_id, mine.owner_instance_id);
+        d.open_lock(OsStr::new("dest.flux-lock"))
+            .unwrap()
+            .write_at_start(&theirs.encode())
+            .unwrap();
+        assert!(!held.still_owned().unwrap(), "both the operation and the instance must match");
+    }
+
+    #[test]
     fn a_written_record_is_owned_until_another_operation_overwrites_it() {
         let (fs, d) = fake();
         let site = site(&d);
