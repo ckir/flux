@@ -2906,3 +2906,8 @@ test going red.
 Panel round 3 (agy), at `7047448`. The Fold Auditor found round 2's fold correct and its spec anchor present.
 - FOLDED: `scan_file` passed over a directory or link at a record's exact name, where the spec classifies every record.
   It is now `STATE_CORRUPT` (decision 9, `scan_file`, a test and its mutant).
+
+Panel round 4 (agy), at `12dc8d0`: GREEN, with no findings.
+- The Fold Auditor traced the new `scan_file` branch through the fake's listing and saw its mutant go red.
+- The Consistency Checker found the fold consistent with decision 3, the crash rows and the `.tmp` pass-over.
+- No ordinary crash reaches the new `STATE_CORRUPT`.
