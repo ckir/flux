@@ -127,7 +127,7 @@ fn give_up(last: Last) -> LockError {
             LockCode::TargetLockUncertain,
             None,
             format!(
-                "gave up after {MAX_ATTEMPTS} attempts on an empty or torn lock that nobody holds; run again with --restart --break-lock"
+                "gave up after {MAX_ATTEMPTS} attempts on an empty or torn lock that nobody holds; another run may be taking it over at the same time"
             ),
         ),
         Last::HeldByOther | Last::Other => refuse(

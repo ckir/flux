@@ -77,7 +77,7 @@ pub(crate) fn recover<'a, D: DirHandle>(
             return Ok(Recovered::Restart(last));
         }
     };
-    // S240_3_s5: delete the moved file (S240_3_release closes `old` first). A failure leaves it for a later
+    // S240_3_s5: delete the moved file (`old` is closed first here; the model closes it after (`S240_3_release`), a deliberate reorder that changes no state another actor can observe). A failure leaves it for a later
     // cleanup; the crash table accepts the same leftover.
     drop(old);
     let leftover = match dir.remove_file(&broken) {
