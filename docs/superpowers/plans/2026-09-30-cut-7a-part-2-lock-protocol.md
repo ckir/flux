@@ -1428,7 +1428,7 @@ mod tests {
         let site = site(&d);
         let (old, old_id, rec) = dead(&fs, &site);
         let me = crate::ids::new_id();
-        let Recovered::Held { held, leftover } = recover(&site, old, old_id.clone(), &rec, &me).unwrap() else {
+        let Recovered::Held { held, leftover } = recover(&site, old, old_id, &rec, &me).unwrap() else {
             panic!("expected Held")
         };
         assert_eq!(leftover, None);
@@ -1591,7 +1591,7 @@ pub(crate) fn take_over<'a, D: DirHandle>(
     }
     // S240_5_s4: the open file is still the one at the lock path.
     let identity = lock.identity()?;
-    if at_path(site.dir(), &site.lock_name().to_os_string())? != Some(identity.clone()) {
+    if at_path(site.dir(), &site.lock_name().to_os_string())? != Some(identity) {
         return Ok(TakeOver::Restart(Last::Other));
     }
     // S240_5_s5: a record written meanwhile is another holder (and, locked by us, a dead one: recovery's case), and
@@ -1621,7 +1621,7 @@ impl<'a, D: DirHandle> Claimed<'a, D> {
     pub fn overwrite(self, record: LockRecord) -> LockResult<Overwritten<'a, D>> {
         self.lock.write_at_start(&record.encode())?;
         self.lock.sync_all()?;
-        if at_path(self.dir, &self.lock_name)? != Some(self.identity.clone()) {
+        if at_path(self.dir, &self.lock_name)? != Some(self.identity) {
             return Ok(Overwritten::Restart);
         }
         Ok(Overwritten::Held(Held {
