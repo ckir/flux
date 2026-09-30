@@ -64,6 +64,19 @@ impl<'a, D: DirHandle> LockSite<'a, D> {
     }
 
     fn named(dir: &'a D, name: &OsStr, kind: SiteKind) -> LockResult<Self> {
+        // One path component, refused up front: otherwise `a/b` would reach `create_lock` and fail there as an I/O
+        // error instead of this refusal (capstone round 2).
+        if let Err(e) = flux_fs::check_component(name) {
+            return Err(refuse(
+                LockCode::PathComponentInvalid,
+                None,
+                format!(
+                    "the target name {} is not one path component: {}",
+                    name.to_string_lossy(),
+                    e.source
+                ),
+            ));
+        }
         let mut lock_name = name.to_os_string();
         lock_name.push(LOCK_SUFFIX);
         if name_len(&lock_name) > NAME_LIMIT {
@@ -221,6 +234,15 @@ mod tests {
             OsStr::new("t.bin.flux-lock")
         );
         assert_eq!(LockSite::root(&d).lock_name(), OsStr::new(".flux-root.lock"));
+    }
+
+    #[test]
+    fn a_target_name_that_is_not_one_component_is_path_component_invalid() {
+        let (_fs, d) = fake();
+        for bad in ["a/b", "a\\b", "", ".."] {
+            let r = refusal(LockSite::directory(&d, OsStr::new(bad)));
+            assert_eq!(r.code, LockCode::PathComponentInvalid, "{bad:?}");
+        }
     }
 
     #[test]

@@ -45,6 +45,17 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// `label` appears in `text` as a whole label: a prefix of a longer label (`S240_3_s4_lock` inside
+/// `S240_3_s4_lock_close`) does not count (capstone round 2, cut 7a Part 2).
+fn mentions_label(text: &str, label: &str) -> bool {
+    text.match_indices(label).any(|(i, _)| {
+        let after = text[i + label.len()..].chars().next();
+        let before = text[..i].chars().next_back();
+        let part = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        !part(after) && !part(before)
+    })
+}
+
 /// The text of `fn name` in `src`: its doc comment and attributes, its signature, and its body up to the closing
 /// brace at the same indentation. `None` when the file defines no such function.
 fn function_region(src: &str, name: &str) -> Option<String> {
@@ -106,7 +117,7 @@ fn every_entry_names_a_function_that_mentions_its_label_or_a_reason() {
                 // The function's own doc comment and body, not merely the file: another function in the same file
                 // mentioning the label must not stand in for it (capstone round 1, cut 7a Part 2).
                 assert!(
-                    region.contains(label.as_str()),
+                    mentions_label(&region, &label),
                     "{label}: fn {func} in {file} never mentions the label"
                 );
             }

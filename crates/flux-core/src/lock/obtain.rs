@@ -89,7 +89,7 @@ pub fn obtain<'a, D: DirHandle>(
                 return Err(refuse(
                     LockCode::ArtifactOwnershipUncertain,
                     Some(record),
-                    "the dead owner's record names a workspace that is missing or not one Flux trusts",
+                    "the dead owner's record names a workspace that is missing or not one Flux trusts; Flux never deletes state it cannot read: inspect it, and remove it by hand if it is not needed",
                 ));
             }
             Classified::Uncertain(why) => match mode {
