@@ -3,7 +3,13 @@
 //! it. `format_version` is judged before any other key, and nothing is parsed heuristically (§193).
 
 use crate::ids::is_id;
+use crate::lock::error::refuse;
+use crate::lock::site::{NAME_LIMIT, name_len};
+use crate::lock::{LockCode, LockError, LockResult};
+use flux_fs::{Code, DirHandle, FileHandle, FsError};
 use serde::{Deserialize, Serialize};
+use std::ffi::{OsStr, OsString};
+use std::io::{ErrorKind, Write};
 use std::path::Path;
 
 /// The version this binary writes and reads. 7b bumps it and reads this one too.
@@ -208,6 +214,135 @@ pub fn wall_time_ns() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
 }
 
+/// `DEST/.flux`, the control plane.
+pub const FLUX_DIR: &str = ".flux";
+/// `DEST/.flux/operations`, where tree workspaces live.
+pub const OPERATIONS_DIR: &str = "operations";
+/// A tree operation's state, inside its workspace.
+pub const MANIFEST: &str = "manifest";
+/// A state file's temporary: `<name>.tmp` (decision 4; the name it stages already carries the operation id).
+pub const TEMP_SUFFIX: &str = ".tmp";
+/// A workspace being built: `<id>.creating`, renamed to `<id>` once its manifest is written (decision 3).
+pub const CREATING_SUFFIX: &str = ".creating";
+/// The single-file state record is `<target>.flux-state.<id>` (F2).
+pub const RECORD_INFIX: &str = ".flux-state.";
+
+/// `<target>.flux-state.<id>`.
+pub fn record_name(target: &OsStr, operation_id: &str) -> OsString {
+    let mut name = target.to_os_string();
+    name.push(RECORD_INFIX);
+    name.push(operation_id);
+    name
+}
+
+/// `<name>.tmp`.
+pub fn temp_name(name: &OsStr) -> OsString {
+    let mut temp = name.to_os_string();
+    temp.push(TEMP_SUFFIX);
+    temp
+}
+
+/// Whether every name a single-file run creates beside `target` fits `NAME_LIMIT`. The longest is its state record's
+/// temporary, target + 48 units. The lock (+10) and the copy's partial (+46) are shorter. Part 3b refuses
+/// `PATH_COMPONENT_INVALID` up front when this is false (decision 4).
+pub fn file_names_fit(target: &OsStr) -> bool {
+    name_len(&temp_name(&record_name(target, &"0".repeat(32)))) <= NAME_LIMIT
+}
+
+/// Write `state` to `name` in `dir` crash-safely (F4): `<name>.tmp` written and flushed, renamed over `name`, `dir`
+/// flushed. On a failure before the rename the temporary is removed where it can be, and `name` still holds what it
+/// held before: the rename is the commit point.
+pub fn write_state<D: DirHandle>(
+    dir: &D,
+    name: &OsStr,
+    state: &OperationState,
+) -> flux_fs::Result<()> {
+    let temp = temp_name(name);
+    let mut file = dir.create_new(&temp)?;
+    let written =
+        file.write_all(&state.encode()).map_err(FsError::from_io).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(e) = written.and_then(|()| dir.rename_replace(&temp, dir, name)) {
+        let _ = dir.remove_file(&temp);
+        return Err(e);
+    }
+    dir.sync()
+}
+
+/// Read and decode the state record `name` in `dir`. The outer error is I/O (a refused link or directory among it);
+/// the inner one says what the bytes are not.
+pub fn read_state<D: DirHandle>(
+    dir: &D,
+    name: &OsStr,
+) -> flux_fs::Result<Result<OperationState, Unusable>> {
+    Ok(decode(&dir.read_file(name, STATE_LIMIT)?))
+}
+
+/// Create a tree operation's workspace `operations/<id>/`, holding its manifest, so that it never exists without one
+/// (decision 3):
+/// 1. build it as `<id>.creating`, with the manifest written inside crash-safely;
+/// 2. rename it to `<id>` without replacing;
+/// 3. flush `operations/`.
+///
+/// A crash before the rename leaves only `<id>.creating`, which the §21.1 scan ignores (cut 9's cleanup). Returns the
+/// workspace's handle.
+pub fn create_workspace<D: DirHandle>(
+    operations: &D,
+    state: &OperationState,
+) -> flux_fs::Result<D> {
+    let id = OsStr::new(&state.operation_id);
+    let mut creating = id.to_os_string();
+    creating.push(CREATING_SUFFIX);
+    {
+        let building = operations.create_dir(&creating)?;
+        write_state(&building, OsStr::new(MANIFEST), state)?;
+        // Closed before the rename.
+    }
+    operations.rename_no_replace(&creating, operations, id)?;
+    operations.sync()?;
+    operations.open_dir(id)
+}
+
+/// `DEST/.flux/operations/`, creating `.flux` and `operations` as needed (the run's step 5) and flushing each parent a
+/// creation changed. A non-directory at either name is `CONTROL_PLANE_NAMESPACE_CONFLICT`: step 2 checks it first, and
+/// this repeats the check because the name can change in between.
+pub fn operations_dir<D: DirHandle>(dest: &D, dest_shown: &Path) -> LockResult<D> {
+    let flux_shown = dest_shown.join(FLUX_DIR);
+    let flux = control_dir(dest, FLUX_DIR, &flux_shown)?;
+    control_dir(&flux, OPERATIONS_DIR, &flux_shown.join(OPERATIONS_DIR))
+}
+
+fn control_dir<D: DirHandle>(parent: &D, name: &str, shown: &Path) -> LockResult<D> {
+    let name = OsStr::new(name);
+    match parent.create_dir(name) {
+        Ok(d) => {
+            parent.sync()?;
+            Ok(d)
+        }
+        Err(e) if e.source.kind() == ErrorKind::AlreadyExists => match parent.open_dir(name) {
+            Ok(d) => Ok(d),
+            Err(e) if matches!(e.code, Code::SafetyRejected | Code::DestinationError) => {
+                Err(control_path_conflict(shown))
+            }
+            Err(e) => Err(e.into()),
+        },
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `CONTROL_PLANE_NAMESPACE_CONFLICT` for a control path a non-Flux object occupies, with the refusal-guidance
+/// table's advice.
+pub(crate) fn control_path_conflict(shown: &Path) -> LockError {
+    refuse(
+        LockCode::ControlPlaneNamespaceConflict,
+        None,
+        format!(
+            "a non-Flux object occupies {}, a Flux control path; move it away",
+            shown.display()
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,5 +458,123 @@ mod tests {
         );
         let s = OperationState { takeover: Some(t), superseded_by: Some(id(2)), ..created() };
         assert_eq!(decode(&s.encode()), Ok(s));
+    }
+
+    use crate::fault_fs::{FakeDirHandle, FaultFs};
+    use crate::lock::test_support::refusal;
+    use flux_fs::{DestinationRoot, FileSystem, FileType};
+
+    /// A fake with `/p/dest`; the handle is on it.
+    fn dest() -> (FaultFs, FakeDirHandle) {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/p")).unwrap();
+        fs.create_dir(Path::new("/p/dest")).unwrap();
+        let d = fs.destination_root(Path::new("/p/dest")).unwrap();
+        (fs, d)
+    }
+
+    fn position(calls: &[String], prefix: &str) -> usize {
+        calls
+            .iter()
+            .position(|c| c.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no {prefix} in {calls:?}"))
+    }
+
+    #[test]
+    fn a_state_is_written_through_a_flushed_temporary_then_renamed_and_the_directory_flushed() {
+        let (fs, d) = dest();
+        write_state(&d, OsStr::new("rec"), &created()).unwrap();
+        assert_eq!(read_state(&d, OsStr::new("rec")).unwrap(), Ok(created()));
+        assert!(!fs.exists("/p/dest/rec.tmp"));
+        let calls = fs.calls();
+        let order = ["create_new(", "sync_all(", "rename_replace(", "sync_dir("]
+            .map(|p| position(&calls, p));
+        assert!(order.is_sorted(), "{calls:?}");
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_old_state_and_no_temporary() {
+        let (fs, d) = dest();
+        write_state(&d, OsStr::new("rec"), &created()).unwrap();
+        let newer = OperationState { state: OpState::Transferring, ..created() };
+        fs.fail("rename_replace", Code::IoError);
+        assert!(write_state(&d, OsStr::new("rec"), &newer).is_err());
+        assert_eq!(
+            read_state(&d, OsStr::new("rec")).unwrap(),
+            Ok(created()),
+            "the rename is the commit"
+        );
+        assert!(!fs.exists("/p/dest/rec.tmp"));
+        fs.fail("sync_all", Code::IoError);
+        assert!(write_state(&d, OsStr::new("rec"), &newer).is_err());
+        assert_eq!(read_state(&d, OsStr::new("rec")).unwrap(), Ok(created()));
+        assert!(!fs.exists("/p/dest/rec.tmp"));
+    }
+
+    #[test]
+    fn a_workspace_appears_only_with_its_manifest() {
+        let (fs, d) = dest();
+        let ops = operations_dir(&d, Path::new("D")).unwrap();
+        let ws = create_workspace(&ops, &created()).unwrap();
+        let path = format!("/p/dest/.flux/operations/{}", id(1));
+        assert_eq!(read_state(&ws, OsStr::new(MANIFEST)).unwrap(), Ok(created()));
+        assert!(fs.exists(format!("{path}/manifest")));
+        assert!(!fs.exists(format!("{path}.creating")));
+        let calls = fs.calls();
+        let rename = position(&calls, "rename_no_replace(");
+        assert!(calls[rename].contains(".creating"), "{}", calls[rename]);
+        assert!(
+            calls[..rename].iter().any(|c| c.starts_with("rename_replace(")),
+            "the manifest is committed before the workspace appears: {calls:?}"
+        );
+        assert!(
+            calls[rename + 1..].iter().any(|c| c.starts_with("sync_dir(")),
+            "operations/ is flushed after: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_workspace_whose_rename_fails_is_left_only_under_its_creating_name() {
+        let (fs, d) = dest();
+        let ops = operations_dir(&d, Path::new("D")).unwrap();
+        fs.fail("rename_no_replace", Code::IoError);
+        assert!(create_workspace(&ops, &created()).is_err());
+        let path = format!("/p/dest/.flux/operations/{}", id(1));
+        assert!(fs.exists(format!("{path}.creating/manifest")));
+        assert!(!fs.exists(&path));
+    }
+
+    #[test]
+    fn the_operations_directory_is_made_once_and_a_foreign_object_is_a_conflict() {
+        let (fs, d) = dest();
+        drop(operations_dir(&d, Path::new("D")).unwrap());
+        assert!(fs.exists("/p/dest/.flux/operations"));
+        drop(operations_dir(&d, Path::new("D")).expect("a second call opens what the first made"));
+
+        let (fs, d) = dest();
+        fs.write_file("/p/dest/.flux", b"not a directory");
+        let r = refusal(operations_dir(&d, Path::new("D")));
+        assert_eq!(r.code, LockCode::ControlPlaneNamespaceConflict);
+        assert!(r.detail.contains(".flux") && r.detail.contains("move it away"), "{}", r.detail);
+
+        let (fs, d) = dest();
+        fs.create_dir(Path::new("/p/dest/.flux")).unwrap();
+        fs.write_file("/p/dest/.flux/operations", b"");
+        fs.set_type("/p/dest/.flux/operations", FileType::Symlink);
+        assert_eq!(
+            refusal(operations_dir(&d, Path::new("D"))).code,
+            LockCode::ControlPlaneNamespaceConflict
+        );
+    }
+
+    #[test]
+    fn state_names_and_the_longest_name_a_single_file_run_creates() {
+        assert_eq!(
+            record_name(OsStr::new("t"), &id(1)),
+            OsString::from(format!("t.flux-state.{}", id(1)))
+        );
+        assert_eq!(temp_name(OsStr::new("manifest")), OsString::from("manifest.tmp"));
+        assert!(file_names_fit(OsStr::new(&"n".repeat(NAME_LIMIT - 48))));
+        assert!(!file_names_fit(OsStr::new(&"n".repeat(NAME_LIMIT - 47))));
     }
 }

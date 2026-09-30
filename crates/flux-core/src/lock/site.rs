@@ -206,13 +206,13 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 }
 
 #[cfg(windows)]
-fn name_len(name: &OsStr) -> usize {
+pub(crate) fn name_len(name: &OsStr) -> usize {
     use std::os::windows::ffi::OsStrExt;
     name.encode_wide().count()
 }
 
 #[cfg(not(windows))]
-fn name_len(name: &OsStr) -> usize {
+pub(crate) fn name_len(name: &OsStr) -> usize {
     name.as_encoded_bytes().len()
 }
 
