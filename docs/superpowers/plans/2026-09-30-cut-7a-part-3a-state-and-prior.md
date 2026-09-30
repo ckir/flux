@@ -132,7 +132,10 @@ The seams are `.clavity/seams/cut7a-p3-forks.md` and `cut7a-p3-forks-2.md`. The 
 9. **An entry that changes between the listing and its read** is judged as what the read finds:
    - a workspace that is gone, or no longer a directory, is not an operation;
    - a single-file record that is gone was removed by its own finishing run;
-   - a workspace whose manifest is gone is `STATE_CORRUPT` (§21.1's last row).
+   - a workspace whose manifest is gone is `STATE_CORRUPT` (§21.1's last row);
+   - a record's exact name holding anything but a regular file is `STATE_CORRUPT` (panel round 3). The spec
+     classifies every record. Unlike an `operations/` entry (decision 3), the name beside a user's target is Flux's by
+     F2 alone, and no crash leaves a non-file there.
 10. **The fake moves a directory** (with its subtree, its identities, and the snapshot paths of handles open on or
     below it) only through `rename_no_replace`. `rename_replace` of a directory is not modelled, and the fake panics
     on it.
@@ -2460,18 +2463,21 @@ pub fn scan_file<D: DirHandle>(
             continue;
         };
         let Some(id) = std::str::from_utf8(rest).ok().filter(|r| is_id(r)) else { continue };
-        if entry.file_type != FileType::File || id == own_id {
+        if id == own_id {
             continue;
         }
         let shown = parent_shown.join(&entry.name);
+        // A record's exact name beside a user's target is Flux's (F2), and no crash leaves anything but a regular file
+        // there: anything else is unreadable state (§21.1), refused rather than passed over (decision 9; panel round 3).
+        if entry.file_type != FileType::File {
+            return Err(corrupt(&shown, "a record's name holds something other than a regular file"));
+        }
         let state = match read_state(parent, &entry.name) {
             Ok(decoded) => usable(decoded, &shown)?,
-            // Removed by its own finishing run since the listing, or no longer a regular file: not a record now.
-            Err(e)
-                if e.source.kind() == ErrorKind::NotFound
-                    || matches!(e.code, Code::SafetyRejected | Code::DestinationError) =>
-            {
-                continue;
+            // Removed by its own finishing run since the listing: not a record now.
+            Err(e) if e.source.kind() == ErrorKind::NotFound => continue,
+            Err(e) if matches!(e.code, Code::SafetyRejected | Code::DestinationError) => {
+                return Err(corrupt(&shown, &format!("the record is not a regular file: {}", e.source)));
             }
             Err(e) => return Err(e.into()),
         };
@@ -2710,6 +2716,13 @@ mod tests {
             LockCode::StateCorrupt,
             "a tree's state in a single file's record"
         );
+        let (fs, d) = dest();
+        fs.create_dir(Path::new(&format!("/p/dest/{}", rec(9)))).unwrap();
+        assert_eq!(
+            refusal(scan_file(&d, OsStr::new("t"), Path::new("P"), &id(0))).code,
+            LockCode::StateCorrupt,
+            "a directory at a record's exact name is never passed over"
+        );
     }
 
     #[test]
@@ -2756,6 +2769,9 @@ fn the_scan_finds_a_resumable_workspace_and_passes_over_a_creating_one() {
     - Replace `.filter(|n| is_id(n))` with `.filter(|_| true)` in `scan_tree`.
       `what_is_not_a_directory_named_by_an_id_is_not_an_operation` must fail. Revert it.
     - Delete `if state.state.is_resumable()` (push every state). The same `only_created...` test must fail. Revert it.
+    - In `scan_file`, replace the `if entry.file_type != FileType::File { return Err(corrupt(...)); }` block with
+      `if entry.file_type != FileType::File { continue; }`. `a_single_file_scan_reads_only_its_targets_records` must
+      fail at "a directory at a record's exact name". Revert it.
   - Then run `just check`.
 - [ ] **Step 4:** commit the three files: `feat(core): the §21.1 prior-state scan for trees and single files (cut 7a
   Part 3a)`.
@@ -2886,3 +2902,7 @@ test going red.
   - The legacy fallback runs only on a volume without POSIX delete, and `capability_of` refuses every volume that is
     not NTFS or ReFS (`lock_file.rs:232`) before any state exists.
   - What is left is NTFS on Windows 10 before 1709, which is out of support.
+
+Panel round 3 (agy), at `7047448`. The Fold Auditor found round 2's fold correct and its spec anchor present.
+- FOLDED: `scan_file` passed over a directory or link at a record's exact name, where the spec classifies every record.
+  It is now `STATE_CORRUPT` (decision 9, `scan_file`, a test and its mutant).
