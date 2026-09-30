@@ -92,6 +92,11 @@ struct Inner {
     next_lock_handle: u64,
     /// What `lock_capability` answers; `None` means `LocalStrong`.
     lock_capability: Option<LockCapability>,
+    /// call name -> (which call, an action). The action runs just BEFORE that call, outside the fake's own lock,
+    /// so it can drive the fake itself: "another process acts between two of this one's calls" (cut 7a Part 2's
+    /// protocol tests). Consumed on use.
+    #[allow(clippy::type_complexity)]
+    hooks: HashMap<String, (u32, Box<dyn FnOnce(&FaultFs) + Send>)>,
 }
 
 /// One node in the `DirHandle` graph, addressed by an opaque id rather than by
@@ -427,6 +432,11 @@ impl FaultFs {
         self.inner.lock().unwrap().lock_capability = Some(capability);
     }
 
+    /// Run `action` just before the `nth` call to `name` (1-based, counted like `fail_nth`).
+    pub fn on_nth(&self, name: &str, nth: u32, action: impl FnOnce(&FaultFs) + Send + 'static) {
+        self.inner.lock().unwrap().hooks.insert(name.to_string(), (nth, Box::new(action)));
+    }
+
     /// The bytes the fake currently holds for `path`.
     pub fn read_file(&self, path: impl AsRef<Path>) -> Option<Vec<u8>> {
         let path = path.as_ref();
@@ -539,6 +549,16 @@ impl FaultFs {
             *c += 1;
             *c
         };
+        let hook = match g.hooks.get(key) {
+            Some((at, _)) if *at == n => g.hooks.remove(key),
+            _ => None,
+        };
+        if let Some((_, action)) = hook {
+            // Released first: the action calls back into the fake, and `std::sync::Mutex` is not reentrant.
+            drop(g);
+            action(&FaultFs { inner: std::sync::Arc::clone(&self.inner) });
+            g = self.inner.lock().unwrap();
+        }
         if let Some(&(nth, code, kind)) = g.nth_faults.get(key)
             && n == nth
         {
@@ -1685,5 +1705,15 @@ mod tests {
         assert_eq!(d.lock_capability().unwrap(), LockCapability::LocalStrong);
         fs.set_lock_capability(LockCapability::Unsupported);
         assert_eq!(d.lock_capability().unwrap(), LockCapability::Unsupported);
+    }
+
+    #[test]
+    fn a_hook_runs_just_before_the_nth_call_and_can_drive_the_fake() {
+        use flux_fs::FileSystem;
+        let fs = FaultFs::new();
+        fs.on_nth("metadata", 2, |fs| fs.write_file("/b", b"y"));
+        assert!(fs.metadata(Path::new("/b")).is_err(), "first call: the hook has not run");
+        assert!(fs.metadata(Path::new("/b")).is_ok(), "second call: the hook ran just before it");
+        assert!(fs.metadata(Path::new("/b")).is_ok(), "a hook runs once");
     }
 }
