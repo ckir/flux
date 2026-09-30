@@ -460,6 +460,45 @@ mod tests {
         assert_eq!(decode(&s.encode()), Ok(s));
     }
 
+    /// Each takeover check refuses on its own (capstone round 2: no test exercised a rejection, so deleting any of
+    /// them left the suite green). The base takeover is valid with READ values, so a case that decodes must be that
+    /// one field's fault.
+    #[test]
+    fn each_malformed_takeover_field_is_corrupt() {
+        let read = Takeover {
+            operation_id: id(3),
+            owner_instance_id: id(4),
+            boot_session_id: "boot".to_string(),
+            last_heartbeat_wall_time: "7".to_string(),
+            creation_wall_time: "9".to_string(),
+        };
+        let valid = OperationState { takeover: Some(read.clone()), ..created() };
+        assert_eq!(decode(&valid.encode()), Ok(valid), "the base case is valid");
+        type Edit = fn(&mut Takeover);
+        let cases: [(&str, Edit); 6] = [
+            ("an operation_id that is neither an id nor unreadable", |t| {
+                t.operation_id = "x".to_string()
+            }),
+            ("an owner_instance_id that is neither", |t| t.owner_instance_id = "x".to_string()),
+            ("an empty boot_session_id", |t| t.boot_session_id = String::new()),
+            ("a last_heartbeat_wall_time that is neither a time nor unreadable", |t| {
+                t.last_heartbeat_wall_time = "later".to_string()
+            }),
+            ("a creation_wall_time that is not a time", |t| {
+                t.creation_wall_time = "later".to_string()
+            }),
+            ("a creation_wall_time of unreadable: it is the takeover's own time", |t| {
+                t.creation_wall_time = UNREADABLE.to_string()
+            }),
+        ];
+        for (what, edit) in cases {
+            let mut t = read.clone();
+            edit(&mut t);
+            let s = OperationState { takeover: Some(t), ..created() };
+            assert!(matches!(decode(&s.encode()), Err(Unusable::Corrupt(_))), "{what}");
+        }
+    }
+
     use crate::fault_fs::{FakeDirHandle, FaultFs};
     use crate::lock::test_support::refusal;
     use flux_fs::{DestinationRoot, FileSystem, FileType};
