@@ -1,0 +1,72 @@
+//! The directory primitives the operation state rests on (cut 7a Part 3a): listing, reading a small file, removing an
+//! empty directory, flushing a directory, and renaming a directory - each through a directory handle, never following
+//! a link (§149.7).
+
+use flux_fs::{DestinationRoot, DirHandle, FileType};
+use flux_platform::StdFileSystem;
+use std::ffi::{OsStr, OsString};
+use std::path::Path;
+
+fn dir() -> (tempfile::TempDir, flux_platform::StdDir) {
+    let tmp = tempfile::tempdir().expect("scratch directory");
+    let d = StdFileSystem.destination_root(tmp.path()).expect("open the scratch directory");
+    (tmp, d)
+}
+
+/// The listing, sorted by name.
+fn listing(d: &flux_platform::StdDir) -> Vec<(OsString, FileType)> {
+    let mut v: Vec<_> =
+        d.read_dir().expect("list").into_iter().map(|e| (e.name, e.file_type)).collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+/// A link to the directory `target` at `link`: a symlink on Unix, a junction on Windows (`mklink /J` needs no
+/// privilege, so this never skips).
+fn dir_link(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).expect("symlink");
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .status()
+            .expect("run mklink");
+        assert!(status.success(), "mklink /J needs no privilege");
+    }
+}
+
+#[test]
+fn read_dir_lists_files_directories_and_links_as_links() {
+    let (tmp, d) = dir();
+    assert!(listing(&d).is_empty(), "an empty directory lists nothing: no . and no ..");
+    std::fs::write(tmp.path().join("a"), b"x").unwrap();
+    std::fs::create_dir(tmp.path().join("sub")).unwrap();
+    dir_link(&tmp.path().join("sub"), &tmp.path().join("link"));
+    assert_eq!(
+        listing(&d),
+        vec![
+            (OsString::from("a"), FileType::File),
+            (OsString::from("link"), FileType::Symlink),
+            (OsString::from("sub"), FileType::Dir),
+        ]
+    );
+}
+
+#[test]
+fn read_dir_works_on_created_and_opened_handles_and_starts_again_each_call() {
+    let (_tmp, d) = dir();
+    let sub = d.create_dir(OsStr::new("sub")).unwrap();
+    drop(sub.create_new(OsStr::new("f")).unwrap());
+    let want = vec![(OsString::from("f"), FileType::File)];
+    assert_eq!(listing(&sub), want);
+    let again = d.open_dir(OsStr::new("sub")).unwrap();
+    assert_eq!(listing(&again), want);
+    assert_eq!(
+        listing(&again),
+        want,
+        "a second listing through the same handle lists everything again"
+    );
+}

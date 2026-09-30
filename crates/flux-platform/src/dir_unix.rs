@@ -242,6 +242,41 @@ impl DirHandle for StdDir {
         }
         Ok(crate::StdLock::new(std::fs::File::from(fd)))
     }
+
+    fn read_dir(&self) -> Result<Vec<flux_fs::DirEntry>> {
+        use rustix::fs::{Dir, FileType};
+        use std::os::unix::ffi::OsStrExt;
+        let io = |e: rustix::io::Errno| FsError::from_io(std::io::Error::from(e));
+        let mut out = Vec::new();
+        // `read_from` reads through a descriptor of its own (an `openat` of "."), so this handle is untouched and every
+        // call lists from the start.
+        for entry in Dir::read_from(&self.0).map_err(io)? {
+            let entry = entry.map_err(io)?;
+            let bytes = entry.file_name().to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            let name = OsStr::from_bytes(bytes).to_os_string();
+            let kind = match entry.file_type() {
+                // No `d_type` on this filesystem: ask the name itself, never its target.
+                FileType::Unknown => match statat(&self.0, &name, AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(st) => FileType::from_raw_mode(st.st_mode),
+                    // Gone since the listing: no longer an entry.
+                    Err(rustix::io::Errno::NOENT) => continue,
+                    Err(e) => return Err(io(e)),
+                },
+                known => known,
+            };
+            let file_type = match kind {
+                FileType::RegularFile => flux_fs::FileType::File,
+                FileType::Directory => flux_fs::FileType::Dir,
+                FileType::Symlink => flux_fs::FileType::Symlink,
+                _ => flux_fs::FileType::Other,
+            };
+            out.push(flux_fs::DirEntry { name, file_type });
+        }
+        Ok(out)
+    }
 }
 
 /// The handle-relative twin of `destination_is_write_protected` in `std_fs.rs`,

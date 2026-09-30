@@ -32,6 +32,8 @@ use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
 const FILE_READ_ATTRIBUTES: u32 = 0x80;
 const FILE_LIST_DIRECTORY: u32 = 0x1;
+#[allow(dead_code)] // used by Task 4's sync
+const FILE_ADD_FILE: u32 = 0x2;
 const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
 
 const STATUS_NOT_A_DIRECTORY: i32 = 0xC000_0103u32 as i32;
@@ -250,6 +252,124 @@ impl DirHandle for StdDir {
 
     fn lock_capability(&self) -> Result<flux_fs::LockCapability> {
         crate::lock_file::capability_of(&self.0)
+    }
+
+    fn read_dir(&self) -> Result<Vec<flux_fs::DirEntry>> {
+        read_dir_at(&self.0)
+    }
+}
+
+/// The directory `p` holds, opened AGAIN relative to itself (an empty name), with `access`. The fresh handle carries
+/// the access this caller needs and an enumeration cursor of its own. MEASURED on NTFS and ReFS (cut 7a Part 3a): the
+/// empty-name open succeeds, the new handle lists the directory, and with `FILE_ADD_FILE` it can be flushed.
+fn reopen(p: &OwnedHandle, access: u32) -> Result<OwnedHandle> {
+    let us = UNICODE_STRING { Length: 0, MaximumLength: 0, Buffer: std::ptr::null_mut() };
+    let mut oa: OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    oa.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
+    oa.RootDirectory = p.as_raw_handle() as HANDLE;
+    oa.ObjectName = &raw const us;
+    let mut h: HANDLE = std::ptr::null_mut();
+    let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    // SAFETY: every pointer is to a live local that outlives the call. ShareAccess matches `open_dir`'s reasoning.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut h,
+            access | SYNCHRONIZE,
+            &raw const oa,
+            &raw mut iosb,
+            std::ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status != 0 {
+        let code =
+            if status == STATUS_ACCESS_DENIED { Code::PermissionDenied } else { Code::IoError };
+        return Err(FsError::new(code, nt_io_error("NtCreateFile", status)));
+    }
+    // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `h` is a valid handle we own.
+    Ok(unsafe { OwnedHandle::from_raw_handle(h as _) })
+}
+
+fn read_dir_at(p: &OwnedHandle) -> Result<Vec<flux_fs::DirEntry>> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::ERROR_NO_MORE_FILES;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FULL_DIR_INFO, FileFullDirectoryInfo, FileFullDirectoryRestartInfo,
+        GetFileInformationByHandleEx,
+    };
+    let h = reopen(p, FILE_LIST_DIRECTORY)?;
+    // `u64` words, not bytes: each record starts 8-byte aligned inside the buffer (`NextEntryOffset` keeps it so), so
+    // the buffer itself must be, for the reason `rename_at` records.
+    let mut buf: Vec<u64> = vec![0u64; 8192];
+    let mut out = Vec::new();
+    let mut class = FileFullDirectoryRestartInfo;
+    loop {
+        // SAFETY: `buf` is live and writable for exactly the size given, and the handle outlives the call.
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                h.as_raw_handle() as _,
+                class,
+                buf.as_mut_ptr().cast(),
+                (buf.len() * size_of::<u64>()) as u32,
+            )
+        };
+        if ok == 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                break;
+            }
+            return Err(FsError::from_io(e));
+        }
+        class = FileFullDirectoryInfo;
+        let base: *const u8 = buf.as_ptr().cast();
+        let mut off = 0usize;
+        loop {
+            // SAFETY: the call filled `buf` with a chain of FILE_FULL_DIR_INFO records. `off` is 0 or a sum of
+            // `NextEntryOffset`s, each landing on the next record inside the buffer, and each name is
+            // `FileNameLength` bytes long.
+            let (next, attributes, tag, name) = unsafe {
+                let info = base.add(off).cast::<FILE_FULL_DIR_INFO>();
+                let units = (*info).FileNameLength as usize / 2;
+                let name =
+                    std::slice::from_raw_parts((&raw const (*info).FileName).cast::<u16>(), units);
+                (
+                    (*info).NextEntryOffset,
+                    (*info).FileAttributes,
+                    (*info).EaSize,
+                    std::ffi::OsString::from_wide(name),
+                )
+            };
+            if name != "." && name != ".." {
+                out.push(flux_fs::DirEntry { name, file_type: entry_type(attributes, tag) });
+            }
+            if next == 0 {
+                break;
+            }
+            off += next as usize;
+        }
+    }
+    Ok(out)
+}
+
+/// An entry's type from what enumeration reports. On a reparse point `EaSize` carries the reparse TAG, not an EA size.
+/// MEASURED (cut 7a Part 3a, NTFS and ReFS): a junction lists as `0x410` with `EaSize` `0xA0000003`, while a plain
+/// entry's `EaSize` is a real size (`0xDC` for `..` on NTFS), so it is read as a tag only when the bit is set. A
+/// name-surrogate is a link; any other reparse point on a directory is a directory, as `open_dir` treats it.
+fn entry_type(attributes: u32, ea_size: u32) -> flux_fs::FileType {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && is_name_surrogate(ea_size) {
+        flux_fs::FileType::Symlink
+    } else if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        flux_fs::FileType::Dir
+    } else {
+        flux_fs::FileType::File
     }
 }
 
@@ -1294,5 +1414,19 @@ mod judge_tests {
         assert!(is_name_surrogate(JUNCTION));
         assert!(!is_name_surrogate(0));
         assert!(!is_name_surrogate(ONEDRIVE));
+    }
+
+    #[test]
+    fn a_listed_entry_type_reads_the_tag_only_on_a_reparse_point() {
+        // Measured (cut 7a Part 3a): a junction lists as 0x410 with EaSize 0xA0000003.
+        assert_eq!(entry_type(0x410, JUNCTION), flux_fs::FileType::Symlink);
+        // A cloud placeholder directory is a directory, as `open_dir` treats it.
+        assert_eq!(
+            entry_type(FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT, ONEDRIVE),
+            flux_fs::FileType::Dir
+        );
+        // EaSize is a real EA size when the reparse bit is clear, even one with the surrogate bit set.
+        assert_eq!(entry_type(FILE_ATTRIBUTE_DIRECTORY, JUNCTION), flux_fs::FileType::Dir);
+        assert_eq!(entry_type(FILE_ATTRIBUTE_NORMAL, JUNCTION), flux_fs::FileType::File);
     }
 }

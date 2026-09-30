@@ -317,6 +317,13 @@ pub trait DirHandle: Sized {
     /// `Ok(Unsupported)`. An OS failure of the query itself is `Err` carrying that failure: the caller refuses exactly
     /// as for `Unsupported` (`REMOTE_LOCK_UNSAFE`, §235.4 prefers refusing) and reports the cause (plan decision 6).
     fn lock_capability(&self) -> Result<crate::LockCapability>;
+
+    /// The entries of the directory this handle holds, without `.` and `..`, in no particular order (§21.1's scan).
+    ///
+    /// Each entry's type judges the NAME, as `metadata` does: a symlink, junction or other name-surrogate is
+    /// `FileType::Symlink`, never its target's type. A directory carrying a non-surrogate reparse point (a cloud
+    /// placeholder) is a `Dir`, as `open_dir` treats it.
+    fn read_dir(&self) -> Result<Vec<crate::DirEntry>>;
 }
 
 /// Resolving `DEST` once, at start, is the only path-based call in the writer.

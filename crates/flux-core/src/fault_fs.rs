@@ -1138,6 +1138,10 @@ impl DirHandle for FakeDirHandle {
         self.fs().record("lock_capability()".to_string(), "lock_capability")?;
         Ok(self.inner.lock().unwrap().lock_capability.unwrap_or(LockCapability::LocalStrong))
     }
+
+    fn read_dir(&self) -> Result<Vec<DirEntry>> {
+        self.fs().read_dir(&self.my_path())
+    }
 }
 
 #[cfg(test)]
@@ -1715,5 +1719,24 @@ mod tests {
         assert!(fs.metadata(Path::new("/b")).is_err(), "first call: the hook has not run");
         assert!(fs.metadata(Path::new("/b")).is_ok(), "second call: the hook ran just before it");
         assert!(fs.metadata(Path::new("/b")).is_ok(), "a hook runs once");
+    }
+
+    #[test]
+    fn a_fake_handle_lists_its_directory() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/p")).unwrap();
+        let d = fs.destination_root(Path::new("/p")).unwrap();
+        fs.write_file("/p/a", b"x");
+        let sub = d.create_dir(OsStr::new("sub")).unwrap();
+        fs.write_file("/p/sub/deeper", b"y");
+        let mut got: Vec<_> =
+            d.read_dir().unwrap().into_iter().map(|e| (e.name, e.file_type)).collect();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            vec![(OsString::from("a"), FileType::File), (OsString::from("sub"), FileType::Dir)]
+        );
+        assert!(fs.called("read_dir("), "{:?}", fs.calls());
+        drop(sub);
     }
 }
