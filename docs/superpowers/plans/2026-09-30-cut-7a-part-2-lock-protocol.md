@@ -1530,7 +1530,6 @@ mod tests {
 //! §240.5: take an uncertain lock over IN PLACE, so the lock path is never empty. Steps 1-5 here; step 6's overwrite
 //! waits until Part 3 has created this operation's state (F5, the design's refinement 8).
 
-use super::acquire::Last;
 use super::error::{LockCode, LockResult, refuse};
 use super::held::Held;
 use super::record::{Decoded, LockRecord, RECORD_LEN, Uncertain, decode};
@@ -1557,7 +1556,8 @@ pub enum Overwritten<'a, D: DirHandle> {
 
 pub(crate) enum TakeOver<'a, D: DirHandle> {
     Claimed(Claimed<'a, D>),
-    Restart(Last),
+    /// Start again. No payload: `obtain` records what the pass saw itself (decision 2).
+    Restart,
 }
 
 /// `S240_5_s1` to `S240_5_s5`; `S240_5_close` is `lock` dropping on every non-claimed return.
@@ -1581,7 +1581,7 @@ pub(crate) fn take_over<'a, D: DirHandle>(
             if e.source.kind() == ErrorKind::NotFound
                 || matches!(e.code, Code::SafetyRejected | Code::DestinationError) =>
         {
-            return Ok(TakeOver::Restart(Last::Other));
+            return Ok(TakeOver::Restart);
         }
         Err(e) => return Err(e.into()),
     };
@@ -1592,13 +1592,13 @@ pub(crate) fn take_over<'a, D: DirHandle>(
     // S240_5_s4: the open file is still the one at the lock path.
     let identity = lock.identity()?;
     if at_path(site.dir(), site.lock_name())? != Some(identity) {
-        return Ok(TakeOver::Restart(Last::Other));
+        return Ok(TakeOver::Restart);
     }
     // S240_5_s5: a record written meanwhile is another holder (and, locked by us, a dead one: recovery's case), and
     // foreign content goes back through classification (decision 8). Still unreadable: continue.
     match decode(&lock.read_all(RECORD_LEN)?) {
         Decoded::Uncertain(_) => {}
-        Decoded::Record(_) | Decoded::Foreign => return Ok(TakeOver::Restart(Last::Other)),
+        Decoded::Record(_) | Decoded::Foreign => return Ok(TakeOver::Restart),
     }
     Ok(TakeOver::Claimed(Claimed {
         dir: site.dir(),
@@ -1662,7 +1662,7 @@ mod tests {
     fn claimed<'a>(t: TakeOver<'a, FakeDirHandle>) -> Claimed<'a, FakeDirHandle> {
         match t {
             TakeOver::Claimed(c) => c,
-            TakeOver::Restart(l) => panic!("expected Claimed, got Restart({l:?})"),
+            TakeOver::Restart => panic!("expected Claimed, got Restart"),
         }
     }
 
@@ -1699,7 +1699,7 @@ mod tests {
     #[test]
     fn a_vanished_lock_restarts() {
         let (_fs, d) = fake();
-        assert!(matches!(take_over(&site(&d), STRONG, Uncertain::Empty).unwrap(), TakeOver::Restart(_)));
+        assert!(matches!(take_over(&site(&d), STRONG, Uncertain::Empty).unwrap(), TakeOver::Restart));
     }
 
     #[test]
@@ -1707,7 +1707,7 @@ mod tests {
         let (_fs, d) = fake();
         let site = site(&d);
         dead_lock(&d, NAME, &record(&site, &crate::ids::new_id(), "none").encode());
-        assert!(matches!(take_over(&site, STRONG, Uncertain::Empty).unwrap(), TakeOver::Restart(_)));
+        assert!(matches!(take_over(&site, STRONG, Uncertain::Empty).unwrap(), TakeOver::Restart));
         let (fs, d) = fake();
         dead_lock(&d, NAME, b"");
         fs.on_nth("read_all", 1, |fs| {
@@ -1715,7 +1715,7 @@ mod tests {
             d.open_lock(OsStr::new(NAME)).unwrap().write_at_start(b"hello, not a lock").unwrap();
         });
         let site = LockSite::directory(&d, OsStr::new("dest")).unwrap();
-        assert!(matches!(take_over(&site, STRONG, Uncertain::Empty).unwrap(), TakeOver::Restart(_)), "decision 8");
+        assert!(matches!(take_over(&site, STRONG, Uncertain::Empty).unwrap(), TakeOver::Restart), "decision 8");
         assert_eq!(fs.read_file(LOCK).as_deref(), Some(&b"hello, not a lock"[..]), "never overwritten");
     }
 
@@ -1727,7 +1727,7 @@ mod tests {
             fs.rename_no_replace(Path::new(LOCK), Path::new("/p/aside")).unwrap();
             fs.write_file(LOCK, b"");
         });
-        assert!(matches!(take_over(&site(&d), STRONG, Uncertain::Empty).unwrap(), TakeOver::Restart(_)));
+        assert!(matches!(take_over(&site(&d), STRONG, Uncertain::Empty).unwrap(), TakeOver::Restart));
     }
 
     #[test]
@@ -1871,7 +1871,7 @@ pub fn obtain<'a, D: DirHandle>(
                 }
                 Mode::BreakLock => match take_over(site, capability, why)? {
                     TakeOver::Claimed(c) => return Ok(Obtained::Claimed(c)),
-                    TakeOver::Restart(_) => last = Last::EmptyOrTornUnheld,
+                    TakeOver::Restart => last = Last::EmptyOrTornUnheld,
                 },
             },
             Classified::Dead { lock, identity, record } => {
