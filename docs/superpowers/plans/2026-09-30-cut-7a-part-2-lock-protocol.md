@@ -1447,6 +1447,8 @@ mod tests {
         d.open_lock(OsStr::new(NAME)).unwrap().write_at_start(&other.encode()).unwrap();
         assert!(matches!(recover(&site, old, old_id, &rec, &crate::ids::new_id()).unwrap(), Recovered::Restart(_)));
         assert_eq!(fs.read_file(LOCK), Some(other.encode()), "S240_3_s1 moved nothing");
+        // Without s1, s3 would catch the rewrite too, but only AFTER moving the file and putting it back.
+        assert!(!fs.called("rename_no_replace"), "S240_3_s1 stops before any move");
     }
 
     #[test]
