@@ -3,6 +3,7 @@
 pub mod copy;
 pub mod ids;
 pub mod lock;
+pub mod prior;
 pub mod state;
 pub mod tree;
 pub mod walk;

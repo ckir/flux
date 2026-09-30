@@ -30,3 +30,18 @@ fn a_workspace_is_created_and_its_manifest_rewritten_leaving_nothing_else() {
     assert_eq!(state::read_state(&ws, OsStr::new(state::MANIFEST)).unwrap(), Ok(moving));
     assert_eq!(names(&ws), vec![OsString::from(state::MANIFEST)], "no temporary is left");
 }
+
+#[test]
+fn the_scan_finds_a_resumable_workspace_and_passes_over_a_creating_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = StdFileSystem.destination_root(tmp.path()).unwrap();
+    let ops = state::operations_dir(&dest, tmp.path()).unwrap();
+    let prior = OperationState::created(&flux_core::ids::new_id(), Kind::Tree, tmp.path(), 1);
+    drop(state::create_workspace(&ops, &prior).unwrap());
+    let mut creating = flux_core::ids::new_id();
+    creating.push_str(state::CREATING_SUFFIX);
+    drop(ops.create_dir(OsStr::new(&creating)).unwrap());
+    let scan = flux_core::prior::scan_tree(&dest, tmp.path(), &flux_core::ids::new_id()).unwrap();
+    assert_eq!(scan.resumable.len(), 1);
+    assert_eq!(scan.resumable[0].state, prior);
+}
