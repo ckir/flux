@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 mod acquire;
+mod classify;
 pub mod error;
 mod held;
 pub mod record;
