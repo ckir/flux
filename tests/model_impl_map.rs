@@ -45,6 +45,33 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// The text of `fn name` in `src`: its doc comment and attributes, its signature, and its body up to the closing
+/// brace at the same indentation. `None` when the file defines no such function.
+fn function_region(src: &str, name: &str) -> Option<String> {
+    let lines: Vec<&str> = src.lines().collect();
+    let def = lines.iter().position(|l| {
+        let t = l.trim_start();
+        let t = t.strip_prefix("pub(crate) ").or_else(|| t.strip_prefix("pub ")).unwrap_or(t);
+        t.starts_with(&format!("fn {name}(")) || t.starts_with(&format!("fn {name}<"))
+    })?;
+    let indent = &lines[def][..lines[def].len() - lines[def].trim_start().len()];
+    let mut start = def;
+    while start > 0 {
+        let above = lines[start - 1].trim_start();
+        if above.starts_with("///") || above.starts_with("#[") {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    let closing = format!("{indent}}}");
+    let end = (def..lines.len()).find(|&i| lines[i] == closing)?;
+    Some(lines[start..=end].join(
+        "
+",
+    ))
+}
+
 #[test]
 fn every_protocol_label_has_exactly_one_entry() {
     let labels = model_labels();
@@ -74,11 +101,14 @@ fn every_entry_names_a_function_that_mentions_its_label_or_a_reason() {
                     .split_once("::")
                     .unwrap_or_else(|| panic!("{label}: item {item} has no ::"));
                 let src = read(file);
+                let region = function_region(&src, func)
+                    .unwrap_or_else(|| panic!("{label}: {file} defines no fn {func}"));
+                // The function's own doc comment and body, not merely the file: another function in the same file
+                // mentioning the label must not stand in for it (capstone round 1, cut 7a Part 2).
                 assert!(
-                    src.contains(&format!("fn {func}")),
-                    "{label}: {file} defines no fn {func}"
+                    region.contains(label.as_str()),
+                    "{label}: fn {func} in {file} never mentions the label"
                 );
-                assert!(src.contains(label.as_str()), "{label}: {file} never mentions the label");
             }
             (None, Some(status)) => {
                 assert!(STATUSES.contains(&status), "{label}: unknown status {status}");
