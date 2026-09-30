@@ -1536,7 +1536,7 @@ use super::held::Held;
 use super::record::{Decoded, LockRecord, RECORD_LEN, Uncertain, decode};
 use super::site::LockSite;
 use flux_fs::{Code, DirHandle, FileIdentity, LockCapability, LockFile};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::ErrorKind;
 
 /// An uncertain lock this run has opened and locked, whose record it has not yet overwritten.
@@ -1591,7 +1591,7 @@ pub(crate) fn take_over<'a, D: DirHandle>(
     }
     // S240_5_s4: the open file is still the one at the lock path.
     let identity = lock.identity()?;
-    if at_path(site.dir(), &site.lock_name().to_os_string())? != Some(identity) {
+    if at_path(site.dir(), site.lock_name())? != Some(identity) {
         return Ok(TakeOver::Restart(Last::Other));
     }
     // S240_5_s5: a record written meanwhile is another holder (and, locked by us, a dead one: recovery's case), and
@@ -1634,7 +1634,7 @@ impl<'a, D: DirHandle> Claimed<'a, D> {
     }
 }
 
-fn at_path<D: DirHandle>(dir: &D, name: &OsString) -> LockResult<Option<FileIdentity>> {
+fn at_path<D: DirHandle>(dir: &D, name: &OsStr) -> LockResult<Option<FileIdentity>> {
     match dir.metadata(name) {
         Ok(m) => Ok(Some(m.identity)),
         Err(e) if e.source.kind() == ErrorKind::NotFound => Ok(None),
