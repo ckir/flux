@@ -3,7 +3,7 @@
 use super::record::LockRecord;
 use flux_fs::FsError;
 
-/// The spec's error codes the lock protocol produces ("Errors and exit statuses"). The CLI maps them to exits.
+/// The spec's error codes the lock protocol and the prior-state scan produce ("Errors and exit statuses"). The CLI maps them to exits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockCode {
     TargetLockBusy,
@@ -12,6 +12,9 @@ pub enum LockCode {
     ArtifactOwnershipUncertain,
     PathComponentInvalid,
     RemoteLockUnsafe,
+    StateCorrupt,
+    IncompatibleState,
+    ResumableOperationExists,
 }
 
 impl LockCode {
@@ -23,6 +26,9 @@ impl LockCode {
             Self::ArtifactOwnershipUncertain => "ARTIFACT_OWNERSHIP_UNCERTAIN",
             Self::PathComponentInvalid => "PATH_COMPONENT_INVALID",
             Self::RemoteLockUnsafe => "REMOTE_LOCK_UNSAFE",
+            Self::StateCorrupt => "STATE_CORRUPT",
+            Self::IncompatibleState => "INCOMPATIBLE_STATE",
+            Self::ResumableOperationExists => "RESUMABLE_OPERATION_EXISTS",
         }
     }
 }
@@ -77,5 +83,8 @@ mod tests {
         assert_eq!(LockCode::ArtifactOwnershipUncertain.as_str(), "ARTIFACT_OWNERSHIP_UNCERTAIN");
         assert_eq!(LockCode::PathComponentInvalid.as_str(), "PATH_COMPONENT_INVALID");
         assert_eq!(LockCode::RemoteLockUnsafe.as_str(), "REMOTE_LOCK_UNSAFE");
+        assert_eq!(LockCode::StateCorrupt.as_str(), "STATE_CORRUPT");
+        assert_eq!(LockCode::IncompatibleState.as_str(), "INCOMPATIBLE_STATE");
+        assert_eq!(LockCode::ResumableOperationExists.as_str(), "RESUMABLE_OPERATION_EXISTS");
     }
 }

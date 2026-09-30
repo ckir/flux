@@ -12,6 +12,8 @@ publish.workspace = true
 flux-fs = { path = "../flux-fs" }
 uuid = { workspace = true }
 blake3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 flux-platform = { path = "../flux-platform" }
