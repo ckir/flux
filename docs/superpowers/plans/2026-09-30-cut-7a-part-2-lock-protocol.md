@@ -152,6 +152,8 @@ and the `plain`, `rec` and `brk` processes.
   - adding a derive the tests need to compile.
 - **Oracle:** the tests in each task are already written. Implement until they pass; never edit an assertion.
 - **Formatting:** run `cargo fmt` before every gate.
+- **Exit status:** read a gate's exit status directly (`just check; echo rc=$?`), never through a pipe such as
+  `just check | tail`: a pipeline reports the LAST command's status.
 - **Gates after each task:**
   - `just check` (the Windows host) must exit 0 with nextest reporting every test passed.
   - Tasks 8 and 10 also run `just check-linux` (exit 0, nextest summary all passed) and `just check-mac` (exit 0).
@@ -269,9 +271,9 @@ pub mod record;
 //! `models/lockproto/` checks. Each protocol function names the model labels it implements; `impl-map.toml` there
 //! maps every label to its function.
 
-// Until Task 7 of the Part 2 plan adds `obtain`, the crate-internal protocol steps are reached only from tests.
-// Task 7 deletes this line, and its `just check` then proves nothing is left unused.
-#![cfg_attr(not(test), allow(dead_code))]
+// Until Task 7 of the Part 2 plan adds `obtain`, the crate-internal protocol steps (and the test scaffolding's later
+// helpers) are not all reached yet. Task 7 deletes this line, and its `just check` then proves nothing is unused.
+#![allow(dead_code)]
 
 pub mod error;
 pub mod record;
@@ -328,7 +330,9 @@ pub struct Refusal {
 
 #[derive(Debug)]
 pub enum LockError {
-    Refused(Refusal),
+    /// Boxed: a `Refusal` carries a whole `LockRecord`, and an unboxed one makes every `LockResult` large
+    /// (`clippy::result_large_err`).
+    Refused(Box<Refusal>),
     Io(FsError),
 }
 
@@ -341,7 +345,7 @@ impl From<FsError> for LockError {
 pub type LockResult<T> = std::result::Result<T, LockError>;
 
 pub(crate) fn refuse(code: LockCode, holder: Option<LockRecord>, detail: impl Into<String>) -> LockError {
-    LockError::Refused(Refusal { code, holder, detail: detail.into() })
+    LockError::Refused(Box::new(Refusal { code, holder, detail: detail.into() }))
 }
 
 #[cfg(test)]
@@ -703,7 +707,7 @@ pub(crate) fn live_lock(d: &FakeDirHandle, name: &str, bytes: &[u8]) -> FakeLock
 /// The refusal a protocol call returned; panics on success or an I/O error.
 pub(crate) fn refusal<T>(r: LockResult<T>) -> Refusal {
     match r {
-        Err(LockError::Refused(x)) => x,
+        Err(LockError::Refused(x)) => *x,
         Err(LockError::Io(e)) => panic!("expected a refusal, got an I/O error: {e:?}"),
         Ok(_) => panic!("expected a refusal, got success"),
     }
@@ -1757,7 +1761,7 @@ mod tests {
 - [ ] **Step 1:** in `mod.rs`:
   - add `mod obtain;` after `mod held;`;
   - add `pub use obtain::{MAX_ATTEMPTS, Mode, Obtained, check_capability, obtain};` after `pub use held::...`;
-  - DELETE the two comment lines and the `#![cfg_attr(not(test), allow(dead_code))]` line that Task 2 added.
+  - DELETE the two comment lines and the `#![allow(dead_code)]` line that Task 2 added.
 
   From here every protocol step is reachable from `obtain`, and Step 3's `just check` (clippy `-D warnings`) proves
   it.
