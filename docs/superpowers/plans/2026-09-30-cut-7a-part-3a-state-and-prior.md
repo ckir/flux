@@ -340,7 +340,7 @@ fn read_dir_works_on_created_and_opened_handles_and_starts_again_each_call() {
 
 ```rust
     #[test]
-    fn a_listed_entrys_type_reads_the_tag_only_on_a_reparse_point() {
+    fn a_listed_entry_type_reads_the_tag_only_on_a_reparse_point() {
         // Measured (cut 7a Part 3a): a junction lists as 0x410 with EaSize 0xA0000003.
         assert_eq!(entry_type(0x410, JUNCTION), flux_fs::FileType::Symlink);
         // A cloud placeholder directory is a directory, as `open_dir` treats it.
@@ -545,7 +545,7 @@ fn entry_type(attributes: u32, ea_size: u32) -> flux_fs::FileType {
 
 - [ ] **Step 6:**
   - `cargo test -p flux-platform --test dir_control` passes 2 tests.
-  - `cargo test -p flux-platform a_listed_entrys_type` passes 1 test (Windows).
+  - `cargo test -p flux-platform a_listed_entry_type` passes 1 test (Windows).
   - `cargo test -p flux-core a_fake_handle_lists` passes 1 test.
   - Non-vacuity: delete the `if bytes == b"." || bytes == b".."` check (Linux, in `just check-linux`) and the
     `if name != "." && name != ".."` guard (Windows). `read_dir_lists_files_directories_and_links_as_links` must fail
