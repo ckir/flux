@@ -184,3 +184,53 @@ fn a_directory_is_renamed_without_replacing_and_keeps_its_contents() {
     assert_eq!(e.source.kind(), ErrorKind::AlreadyExists, "{e:?}");
     assert!(tmp.path().join("w").join("manifest").is_file(), "the source stays");
 }
+
+/// Holds a PowerShell process that holds an AF_UNIX socket open. .NET deletes the socket file when the socket closes,
+/// so the file exists only while this lives.
+#[cfg(windows)]
+struct HeldSocket(std::process::Child);
+
+#[cfg(windows)]
+impl Drop for HeldSocket {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A socket file at `path`, held until the returned value drops. POSIX binds one with std. Windows 10 and later
+/// create one on an AF_UNIX `bind`, which std cannot do there, so PowerShell (.NET) binds it.
+#[cfg(unix)]
+fn socket_file(path: &Path) -> std::os::unix::net::UnixListener {
+    std::os::unix::net::UnixListener::bind(path).expect("bind a unix socket")
+}
+
+#[cfg(windows)]
+fn socket_file(path: &Path) -> HeldSocket {
+    let script = format!(
+        "$s = [System.Net.Sockets.Socket]::new([System.Net.Sockets.AddressFamily]::Unix, \
+         [System.Net.Sockets.SocketType]::Stream, [System.Net.Sockets.ProtocolType]::Unspecified); \
+         $s.Bind([System.Net.Sockets.UnixDomainSocketEndPoint]::new('{}')); Start-Sleep -Seconds 300",
+        path.display()
+    );
+    let child = std::process::Command::new("pwsh")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .spawn()
+        .expect("pwsh is on PATH (it is on the GitHub Windows image)");
+    let held = HeldSocket(child);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::fs::symlink_metadata(path).is_err() {
+        assert!(std::time::Instant::now() < deadline, "the socket file never appeared");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    held
+}
+
+#[test]
+fn a_socket_file_lists_as_other_and_is_never_read_as_a_state_file() {
+    let (tmp, d) = dir();
+    let _held = socket_file(&tmp.path().join("sock"));
+    assert_eq!(listing(&d), vec![(OsString::from("sock"), FileType::Other)]);
+    let e = d.read_file(OsStr::new("sock"), 8).expect_err("a socket is not a state file");
+    assert_eq!(e.code, Code::DestinationError, "{e:?}");
+}

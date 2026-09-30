@@ -292,6 +292,18 @@ impl DirHandle for StdDir {
         )
         .map_err(|e| match e {
             rustix::io::Errno::LOOP => FsError::new(Code::SafetyRejected, std::io::Error::from(e)),
+            // A socket fails the open itself, so the `fstat` refusal below never sees it. MEASURED (cut 7a Part 3a
+            // capstone): Linux answers ENXIO, and macOS answers differently. Ask the name what it is instead: anything
+            // that is not a regular file is refused as `fstat` would refuse it. The name is gone, or is a regular file
+            // the open could not read (EACCES): report the open's own error.
+            _ if statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW)
+                .is_ok_and(|st| FileType::from_raw_mode(st.st_mode) != FileType::RegularFile) =>
+            {
+                FsError::new(
+                    Code::DestinationError,
+                    std::io::Error::other(format!("not a regular file ({e})")),
+                )
+            }
             _ => FsError::from_io(std::io::Error::from(e)),
         })?;
         let st = rustix::fs::fstat(&fd).map_err(|e| FsError::from_io(std::io::Error::from(e)))?;

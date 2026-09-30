@@ -94,6 +94,11 @@ const fn is_name_surrogate(tag: u32) -> bool {
     tag & 0x2000_0000 != 0
 }
 
+/// `IO_REPARSE_TAG_AF_UNIX`: an AF_UNIX socket file (Windows 10 and later). Its name-surrogate bit is clear, so the
+/// checks above would treat it as an ordinary file. MEASURED (cut 7a Part 3a capstone, NTFS): read, it gives 0 bytes.
+/// It is a socket, not a regular file, and the POSIX arm refuses a socket through `fstat`.
+const IO_REPARSE_TAG_AF_UNIX: u32 = 0x8000_0023;
+
 /// `Debug` is required, not decorative: the tests call `.unwrap_err()` on a
 /// `Result<StdDir, _>`, which needs `StdDir: Debug` to compile.
 #[derive(Debug)]
@@ -373,13 +378,17 @@ fn read_dir_at(p: &OwnedHandle) -> Result<Vec<flux_fs::DirEntry>> {
 /// An entry's type from what enumeration reports. On a reparse point `EaSize` carries the reparse TAG, not an EA size.
 /// MEASURED (cut 7a Part 3a, NTFS and ReFS): a junction lists as `0x410` with `EaSize` `0xA0000003`, while a plain
 /// entry's `EaSize` is a real size (`0xDC` for `..` on NTFS), so it is read as a tag only when the bit is set. A
-/// name-surrogate is a link; any other reparse point on a directory is a directory, as `open_dir` treats it.
+/// name-surrogate is a link, and an AF_UNIX socket file is `Other`, as POSIX lists a socket. Any other reparse point on a
+/// directory is a directory, as `open_dir` treats it.
 fn entry_type(attributes: u32, ea_size: u32) -> flux_fs::FileType {
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
     };
-    if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && is_name_surrogate(ea_size) {
+    let reparse = attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    if reparse && is_name_surrogate(ea_size) {
         flux_fs::FileType::Symlink
+    } else if reparse && ea_size == IO_REPARSE_TAG_AF_UNIX {
+        flux_fs::FileType::Other
     } else if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
         flux_fs::FileType::Dir
     } else {
@@ -437,13 +446,21 @@ fn read_file_at(p: &OwnedHandle, n: &OsStr, limit: usize) -> Result<Vec<u8>> {
     }
     // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `h` is a valid handle we own.
     let opened = unsafe { OwnedHandle::from_raw_handle(h as _) };
-    if let Some(tag) = reparse_tag_of(&opened)?
-        && is_name_surrogate(tag)
-    {
-        return Err(FsError::new(
-            Code::SafetyRejected,
-            std::io::Error::other(format!("name-surrogate reparse point, tag 0x{tag:08X}")),
-        ));
+    if let Some(tag) = reparse_tag_of(&opened)? {
+        if is_name_surrogate(tag) {
+            return Err(FsError::new(
+                Code::SafetyRejected,
+                std::io::Error::other(format!("name-surrogate reparse point, tag 0x{tag:08X}")),
+            ));
+        }
+        // Any other reparse point is read, since a cloud placeholder file (OneDrive, 0x9000701A) is a regular file.
+        // A socket is not one (capstone round 1).
+        if tag == IO_REPARSE_TAG_AF_UNIX {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::other("not a regular file (an AF_UNIX socket)"),
+            ));
+        }
     }
     let file = File::from(opened);
     crate::lock_file::read_loop(limit, |buf, at| file.seek_read(buf, at))
@@ -1593,5 +1610,19 @@ mod judge_tests {
         // EaSize is a real EA size when the reparse bit is clear, even one with the surrogate bit set.
         assert_eq!(entry_type(FILE_ATTRIBUTE_DIRECTORY, JUNCTION), flux_fs::FileType::Dir);
         assert_eq!(entry_type(FILE_ATTRIBUTE_NORMAL, JUNCTION), flux_fs::FileType::File);
+    }
+
+    #[test]
+    fn an_af_unix_socket_file_lists_as_other() {
+        // Measured (cut 7a Part 3a capstone): a socket file is ARCHIVE | REPARSE_POINT with tag 0x80000023.
+        assert_eq!(
+            entry_type(0x20 | FILE_ATTRIBUTE_REPARSE_POINT, IO_REPARSE_TAG_AF_UNIX),
+            flux_fs::FileType::Other
+        );
+        // The tag counts only with the reparse bit: otherwise EaSize is a real size.
+        assert_eq!(
+            entry_type(FILE_ATTRIBUTE_NORMAL, IO_REPARSE_TAG_AF_UNIX),
+            flux_fs::FileType::File
+        );
     }
 }
