@@ -167,3 +167,20 @@ fn sync_flushes_every_kind_of_directory_handle() {
     sub.sync().expect("a created directory");
     d.open_dir(OsStr::new("sub")).unwrap().sync().expect("an opened directory");
 }
+
+#[test]
+fn a_directory_is_renamed_without_replacing_and_keeps_its_contents() {
+    let (tmp, d) = dir();
+    let building = d.create_dir(OsStr::new("w.creating")).unwrap();
+    drop(building.create_new(OsStr::new("manifest")).unwrap());
+    drop(building);
+    d.rename_no_replace(OsStr::new("w.creating"), &d, OsStr::new("w")).expect("rename a directory");
+    assert!(tmp.path().join("w").join("manifest").is_file());
+    assert!(!tmp.path().join("w.creating").exists());
+    drop(d.create_dir(OsStr::new("x")).unwrap());
+    let e = d
+        .rename_no_replace(OsStr::new("w"), &d, OsStr::new("x"))
+        .expect_err("never replaces a directory");
+    assert_eq!(e.source.kind(), ErrorKind::AlreadyExists, "{e:?}");
+    assert!(tmp.path().join("w").join("manifest").is_file(), "the source stays");
+}

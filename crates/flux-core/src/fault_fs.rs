@@ -100,7 +100,7 @@ struct Inner {
 }
 
 /// One node in the `DirHandle` graph, addressed by an opaque id rather than by
-/// path. `path` is a snapshot taken ONCE, when the node is minted, and used only to
+/// path. `path` is a snapshot taken when the node is minted - moved only when a directory rename moves that directory or an ancestor, since the object moved (cut 7a Part 3a) - and used only to
 /// reach the legacy path-keyed maps above (`files`/`directories`/`types`) -- every
 /// `DirHandle` method reaches a node through its id and this snapshot, never by
 /// re-walking a name. `children` is the one place a name binding lives, and the one
@@ -138,7 +138,7 @@ fn dir_node_for_path(g: &mut Inner, path: &Path) -> u64 {
 /// it, so the next `metadata` on that path hit the unreachable-by-construction panic.
 /// MEASURED before this guard: `Ok`, `/dest` existed, `metadata` panicked.
 fn missing_source(g: &Inner, from: &Path) -> Result<()> {
-    if g.files.contains_key(from) {
+    if g.files.contains_key(from) || g.directories.contains(from) {
         return Ok(());
     }
     Err(FsError::new(Code::IoError, std::io::Error::from(std::io::ErrorKind::NotFound)))
@@ -166,6 +166,10 @@ fn mint_identity(g: &mut Inner, path: &Path) {
 /// permissions applied to the temporary vanished at publication, so no test could
 /// assert that the §44.1 ordering achieved anything.
 fn move_object(g: &mut Inner, from: &Path, to: &Path) {
+    if g.directories.contains(from) {
+        move_directory(g, from, to);
+        return;
+    }
     let bytes = g.files.remove(from).unwrap_or_default();
     g.files.insert(to.to_path_buf(), bytes);
     // REPLACE, never merge. A rename destroys the object at `to`, so where the source
@@ -198,6 +202,54 @@ fn move_object(g: &mut Inner, from: &Path, to: &Path) {
         None => {
             g.identities.remove(to);
         }
+    }
+}
+
+/// A directory rename moves its whole subtree, and every handle open on it or below it follows the OBJECT, as on a
+/// real filesystem (cut 7a Part 3a: a workspace is built under one name and renamed to another). The name binding moves
+/// from the old parent's node to the new parent's.
+fn move_directory(g: &mut Inner, from: &Path, to: &Path) {
+    let moved = |p: &Path| -> Option<PathBuf> {
+        let rest = p.strip_prefix(from).ok()?;
+        Some(if rest.as_os_str().is_empty() { to.to_path_buf() } else { to.join(rest) })
+    };
+    fn rekey<V>(map: &mut HashMap<PathBuf, V>, moved: &dyn Fn(&Path) -> Option<PathBuf>) {
+        let keys: Vec<PathBuf> = map.keys().filter(|k| moved(k).is_some()).cloned().collect();
+        for key in keys {
+            let value = map.remove(&key).expect("listed just above");
+            map.insert(moved(&key).expect("filtered just above"), value);
+        }
+    }
+    rekey(&mut g.files, &moved);
+    rekey(&mut g.times, &moved);
+    rekey(&mut g.perms, &moved);
+    rekey(&mut g.identities, &moved);
+    rekey(&mut g.types, &moved);
+    rekey(&mut g.dir_node_by_path, &moved);
+    let dirs: Vec<PathBuf> = g.directories.iter().filter(|d| moved(d).is_some()).cloned().collect();
+    for dir in dirs {
+        g.directories.remove(&dir);
+        g.directories.insert(moved(&dir).expect("filtered just above"));
+    }
+    for node in g.dir_nodes.values_mut() {
+        if let Some(p) = moved(&node.path) {
+            node.path = p;
+        }
+    }
+    let node = g.dir_node_by_path.get(to).copied();
+    if let (Some(parent), Some(name)) = (from.parent(), from.file_name())
+        && let Some(pid) = g.dir_node_by_path.get(parent).copied()
+    {
+        g.dir_nodes.get_mut(&pid).expect("a bound id names a node").children.remove(name);
+    }
+    if let (Some(parent), Some(name), Some(id)) = (to.parent(), to.file_name(), node)
+        && let Some(pid) = g.dir_node_by_path.get(parent).copied()
+    {
+        g.dir_nodes
+            .get_mut(&pid)
+            .expect("a bound id names a node")
+            .children
+            .insert(name.to_os_string(), id);
     }
 }
 
@@ -716,6 +768,10 @@ impl FileSystem for FaultFs {
         )?;
         let mut g = self.inner.lock().unwrap();
         missing_source(&g, &f)?;
+        assert!(
+            !g.directories.contains(&f),
+            "the fake moves a directory only through rename_no_replace (cut 7a Part 3a, decision 10)"
+        );
         move_object(&mut g, &f, &t);
         Ok(())
     }
@@ -741,7 +797,7 @@ impl FileSystem for FaultFs {
                 ),
             ));
         }
-        if g.files.contains_key(&t) {
+        if g.files.contains_key(&t) || g.directories.contains(&t) {
             return Err(FsError::new(
                 Code::IoError,
                 std::io::Error::from(std::io::ErrorKind::AlreadyExists),
@@ -1892,5 +1948,32 @@ mod tests {
         assert!(fs.called("sync_dir("), "{:?}", fs.calls());
         fs.fail("sync_dir", Code::IoError);
         assert!(d.sync().is_err());
+    }
+
+    #[test]
+    fn a_fake_directory_rename_moves_the_subtree_and_open_handles_follow() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/p")).unwrap();
+        let d = fs.destination_root(Path::new("/p")).unwrap();
+        let building = d.create_dir(OsStr::new("w.creating")).unwrap();
+        fs.write_file("/p/w.creating/manifest", b"m");
+        let dir_id = fs.metadata(Path::new("/p/w.creating")).unwrap().identity;
+        let file_id = fs.metadata(Path::new("/p/w.creating/manifest")).unwrap().identity;
+        d.rename_no_replace(OsStr::new("w.creating"), &d, OsStr::new("w")).unwrap();
+        assert!(!fs.exists("/p/w.creating") && !fs.exists("/p/w.creating/manifest"));
+        assert_eq!(fs.read_file("/p/w/manifest").as_deref(), Some(&b"m"[..]));
+        assert_eq!(fs.metadata(Path::new("/p/w")).unwrap().identity, dir_id, "the same object");
+        assert_eq!(fs.metadata(Path::new("/p/w/manifest")).unwrap().identity, file_id);
+        assert_eq!(
+            building.read_file(OsStr::new("manifest"), 8).unwrap(),
+            b"m",
+            "a handle opened before the rename follows the directory"
+        );
+        let opened = d.open_dir(OsStr::new("w")).unwrap();
+        assert_eq!(opened.read_file(OsStr::new("manifest"), 8).unwrap(), b"m");
+        assert_eq!(d.open_dir(OsStr::new("w.creating")).unwrap_err().code, Code::DestinationError);
+        drop(d.create_dir(OsStr::new("x")).unwrap());
+        let e = d.rename_no_replace(OsStr::new("w"), &d, OsStr::new("x")).unwrap_err();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists);
     }
 }
