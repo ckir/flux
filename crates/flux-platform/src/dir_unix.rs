@@ -317,6 +317,13 @@ impl DirHandle for StdDir {
         let file = std::fs::File::from(fd);
         crate::lock_file::read_loop(limit, |buf, at| file.read_at(buf, at))
     }
+
+    fn remove_dir(&self, name: &OsStr) -> Result<()> {
+        check_component(name)?;
+        // `AT_REMOVEDIR` refuses a symlink with ENOTDIR even when it points at a directory: a link is never followed.
+        rustix::fs::unlinkat(&self.0, name, AtFlags::REMOVEDIR)
+            .map_err(|e| FsError::from_io(std::io::Error::from(e)))
+    }
 }
 
 /// The handle-relative twin of `destination_is_write_protected` in `std_fs.rs`,

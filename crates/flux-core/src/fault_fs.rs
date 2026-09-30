@@ -1182,6 +1182,52 @@ impl DirHandle for FakeDirHandle {
         bytes.truncate(limit + 1);
         Ok(bytes)
     }
+
+    fn remove_dir(&self, name: &OsStr) -> Result<()> {
+        check_component(name)?;
+        let child_path = self.my_path().join(name);
+        self.fs().record(format!("remove_dir({})", child_path.display()), "remove_dir")?;
+        let mut g = self.inner.lock().unwrap();
+        // A link (of any kind) or a file: as `unlinkat(AT_REMOVEDIR)` answers, never followed.
+        if g.types.get(&child_path) == Some(&FileType::Symlink) || g.files.contains_key(&child_path)
+        {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    "remove_dir refuses what is not a directory",
+                ),
+            ));
+        }
+        if !g.directories.contains(&child_path) {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            ));
+        }
+        let occupied = g
+            .files
+            .keys()
+            .chain(g.directories.iter())
+            .any(|k| k.parent() == Some(child_path.as_path()));
+        if occupied {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::from(std::io::ErrorKind::DirectoryNotEmpty),
+            ));
+        }
+        g.directories.remove(&child_path);
+        g.types.remove(&child_path);
+        g.identities.remove(&child_path);
+        g.times.remove(&child_path);
+        g.perms.remove(&child_path);
+        // The name no longer binds a node: a directory made there later is a new one.
+        g.dir_node_by_path.remove(&child_path);
+        if let Some(node) = g.dir_nodes.get_mut(&self.id) {
+            node.children.remove(name);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1799,5 +1845,37 @@ mod tests {
         fs.set_type("/p/l", FileType::Symlink);
         assert_eq!(d.read_file(OsStr::new("l"), 4).unwrap_err().code, Code::SafetyRejected);
         assert!(fs.called("read_file("), "{:?}", fs.calls());
+    }
+
+    #[test]
+    fn a_fake_remove_dir_removes_only_an_empty_real_directory() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/p")).unwrap();
+        let d = fs.destination_root(Path::new("/p")).unwrap();
+        let empty = d.create_dir(OsStr::new("empty")).unwrap();
+        let before = fs.metadata(Path::new("/p/empty")).unwrap().identity;
+        drop(empty);
+        d.remove_dir(OsStr::new("empty")).unwrap();
+        assert!(!fs.exists("/p/empty"));
+        drop(d.create_dir(OsStr::new("empty")).unwrap());
+        assert_ne!(
+            fs.metadata(Path::new("/p/empty")).unwrap().identity,
+            before,
+            "a directory made again at the name is a new object"
+        );
+        drop(d.create_dir(OsStr::new("full")).unwrap());
+        fs.write_file("/p/full/f", b"x");
+        let e = d.remove_dir(OsStr::new("full")).unwrap_err();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::DirectoryNotEmpty);
+        fs.write_file("/p/file", b"x");
+        let e = d.remove_dir(OsStr::new("file")).unwrap_err();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::NotADirectory);
+        drop(d.create_dir(OsStr::new("link")).unwrap());
+        fs.set_type("/p/link", FileType::Symlink);
+        let e = d.remove_dir(OsStr::new("link")).unwrap_err();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::NotADirectory);
+        assert!(fs.exists("/p/link"));
+        let e = d.remove_dir(OsStr::new("absent")).unwrap_err();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::NotFound);
     }
 }

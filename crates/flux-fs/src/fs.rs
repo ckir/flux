@@ -332,6 +332,13 @@ pub trait DirHandle: Sized {
     /// kind `IsADirectory`); any other non-regular file where the platform can tell (`Code::DestinationError`). A
     /// missing name is `Code::IoError` with kind `NotFound`.
     fn read_file(&self, name: &std::ffi::OsStr, limit: usize) -> Result<Vec<u8>>;
+
+    /// Remove an EMPTY child directory (`rmdir`).
+    ///
+    /// Refuses, with these kinds (the engine branches on them): a name that is not a directory - a file, or a link of
+    /// any kind, which is never followed and never removed here - `NotADirectory`; a directory that is not empty,
+    /// `DirectoryNotEmpty`; a missing name, `NotFound`.
+    fn remove_dir(&self, name: &std::ffi::OsStr) -> Result<()>;
 }
 
 /// Resolving `DEST` once, at start, is the only path-based call in the writer.

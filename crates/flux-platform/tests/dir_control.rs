@@ -127,3 +127,34 @@ fn read_file_refuses_a_fifo_without_hanging() {
     let e = d.read_file(OsStr::new("fifo"), 8).expect_err("a FIFO is not a state file");
     assert_eq!(e.code, Code::DestinationError);
 }
+
+#[test]
+fn remove_dir_removes_an_empty_directory_and_refuses_a_full_or_missing_one() {
+    let (tmp, d) = dir();
+    drop(d.create_dir(OsStr::new("empty")).unwrap());
+    d.remove_dir(OsStr::new("empty")).expect("an empty directory");
+    assert!(!tmp.path().join("empty").exists());
+    let full = d.create_dir(OsStr::new("full")).unwrap();
+    drop(full.create_new(OsStr::new("f")).unwrap());
+    drop(full);
+    let e = d.remove_dir(OsStr::new("full")).expect_err("not empty");
+    assert_eq!(e.source.kind(), ErrorKind::DirectoryNotEmpty, "{e:?}");
+    assert!(tmp.path().join("full").join("f").exists(), "nothing inside is touched");
+    let e = d.remove_dir(OsStr::new("absent")).expect_err("nothing there");
+    assert_eq!(e.source.kind(), ErrorKind::NotFound, "{e:?}");
+}
+
+#[test]
+fn remove_dir_refuses_a_file_and_a_link_and_never_follows_one() {
+    let (tmp, d) = dir();
+    std::fs::write(tmp.path().join("file"), b"x").unwrap();
+    let e = d.remove_dir(OsStr::new("file")).expect_err("a file is not a directory");
+    assert_eq!(e.source.kind(), ErrorKind::NotADirectory, "{e:?}");
+    assert!(tmp.path().join("file").exists());
+    std::fs::create_dir(tmp.path().join("target")).unwrap();
+    dir_link(&tmp.path().join("target"), &tmp.path().join("link"));
+    let e = d.remove_dir(OsStr::new("link")).expect_err("a link is not removed as a directory");
+    assert_eq!(e.source.kind(), ErrorKind::NotADirectory, "{e:?}");
+    assert!(std::fs::symlink_metadata(tmp.path().join("link")).is_ok(), "the link stays");
+    assert!(tmp.path().join("target").is_dir(), "and so does its target");
+}

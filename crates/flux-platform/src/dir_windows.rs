@@ -42,6 +42,7 @@ const STATUS_OBJECT_PATH_NOT_FOUND: i32 = 0xC000_003Au32 as i32;
 const STATUS_ACCESS_DENIED: i32 = 0xC000_0022u32 as i32;
 const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035u32 as i32;
 const STATUS_FILE_IS_A_DIRECTORY: i32 = 0xC000_00BAu32 as i32;
+const STATUS_DIRECTORY_NOT_EMPTY: i32 = 0xC000_0101u32 as i32;
 
 /// An `NTSTATUS` as a `std::io::Error` that KEEPS its kind.
 ///
@@ -261,6 +262,11 @@ impl DirHandle for StdDir {
     fn read_file(&self, name: &OsStr, limit: usize) -> Result<Vec<u8>> {
         check_component(name)?;
         read_file_at(&self.0, name, limit)
+    }
+
+    fn remove_dir(&self, name: &OsStr) -> Result<()> {
+        check_component(name)?;
+        remove_dir_at(&self.0, name)
     }
 }
 
@@ -808,12 +814,24 @@ fn remove_file_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {
         ));
     }
 
-    // POSIX delete first: the NAME goes at once, as `unlinkat` does and as the test fake models, even while other
-    // handles hold the file open - the lock's release unlinks and THEN closes (spec S99_release). Legacy semantics
-    // leave the name "delete pending" until the last handle closes, and every create or open of it meanwhile fails
-    // with STATUS_DELETE_PENDING (measured on NTFS, cut 7a Part 1 capstone). A volume or system without POSIX delete
-    // (FAT, exFAT, some redirectors, Windows before 10 1709) refuses the class or the flag; only then fall back to the
-    // legacy call, and `nt_io_error` / the create paths map the pending state for whoever meets it.
+    let status = delete_open(&h);
+    if status != 0 {
+        return Err(FsError::new(Code::IoError, nt_io_error("NtSetInformationFile", status)));
+    }
+    drop(h);
+    Ok(())
+}
+
+/// Mark the object `h` holds deleted; the final `NTSTATUS`, 0 on success. Shared by `remove_file_at` and
+/// `remove_dir_at`.
+///
+/// POSIX delete first: the NAME goes at once, as `unlinkat` does and as the test fake models, even while other handles
+/// hold the file open - the lock's release unlinks and THEN closes (spec S99_release). Legacy semantics leave the name
+/// "delete pending" until the last handle closes, and every create or open of it meanwhile fails with
+/// STATUS_DELETE_PENDING (measured on NTFS, cut 7a Part 1 capstone). A volume or system without POSIX delete (FAT,
+/// exFAT, some redirectors, Windows before 10 1709) refuses the class or the flag; only then fall back to the legacy
+/// call, and `nt_io_error` / the create paths map the pending state for whoever meets it.
+fn delete_open(h: &OwnedHandle) -> i32 {
     let mut posix = FILE_DISPOSITION_INFORMATION_EX {
         Flags: FILE_DISPOSITION_DELETE | FILE_DISPOSITION_POSIX_SEMANTICS,
     };
@@ -828,10 +846,7 @@ fn remove_file_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {
             FileDispositionInformationEx,
         )
     };
-    if status == 0 {
-        drop(h);
-        return Ok(());
-    }
+    // Success, or a failure the legacy call would not cure.
     if !matches!(
         status,
         STATUS_INVALID_PARAMETER
@@ -839,14 +854,12 @@ fn remove_file_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {
             | STATUS_INVALID_INFO_CLASS
             | STATUS_INVALID_DEVICE_REQUEST
     ) {
-        return Err(FsError::new(Code::IoError, nt_io_error("NtSetInformationFile", status)));
+        return status;
     }
-
     let mut info = FILE_DISPOSITION_INFORMATION { DeleteFile: true };
     let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
-    // SAFETY: `info` is a live FILE_DISPOSITION_INFORMATION of the size given, and
-    // the handle outlives the call.
-    let status = unsafe {
+    // SAFETY: `info` is a live FILE_DISPOSITION_INFORMATION of the size given, and the handle outlives the call.
+    unsafe {
         NtSetInformationFile(
             h.as_raw_handle() as _,
             &raw mut iosb,
@@ -854,7 +867,76 @@ fn remove_file_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {
             size_of::<FILE_DISPOSITION_INFORMATION>() as u32,
             FileDispositionInformation,
         )
+    }
+}
+
+/// `rmdir`, relative to `p`. Opened for DELETE as a DIRECTORY with `FILE_OPEN_REPARSE_POINT`, so a junction or directory
+/// symlink is the object opened - and then refused, as `unlinkat(AT_REMOVEDIR)` refuses a symlink. A file is refused
+/// by the open itself. A non-surrogate reparse point (a cloud placeholder) is a real directory and is removed.
+fn remove_dir_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {
+    let not_a_directory = || {
+        FsError::new(
+            Code::IoError,
+            std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                "remove_dir refuses what is not a directory",
+            ),
+        )
     };
+    let mut wide: Vec<u16> = n.encode_wide().collect();
+    let bytes = (wide.len() * 2) as u16;
+    let us = UNICODE_STRING { Length: bytes, MaximumLength: bytes, Buffer: wide.as_mut_ptr() };
+    let mut oa: OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    oa.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
+    oa.RootDirectory = p.as_raw_handle() as HANDLE;
+    oa.ObjectName = &raw const us;
+    let mut raw: HANDLE = std::ptr::null_mut();
+    let mut open_iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    // SAFETY: every pointer is to a live local that outlives the call, and `wide` outlives `us`. FILE_READ_ATTRIBUTES
+    // because the reparse check below queries this handle.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut raw,
+            DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+            &raw const oa,
+            &raw mut open_iosb,
+            std::ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status != 0 {
+        if status == STATUS_NOT_A_DIRECTORY {
+            return Err(not_a_directory());
+        }
+        let code = match status {
+            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => Code::IoError,
+            STATUS_ACCESS_DENIED => Code::PermissionDenied,
+            _ => Code::IoError,
+        };
+        return Err(FsError::new(code, nt_io_error("NtCreateFile", status)));
+    }
+    // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `raw` is a valid handle we own.
+    let h = unsafe { OwnedHandle::from_raw_handle(raw as _) };
+    if let Some(tag) = reparse_tag_of(&h)?
+        && is_name_surrogate(tag)
+    {
+        return Err(not_a_directory());
+    }
+    let status = delete_open(&h);
+    if status == STATUS_DIRECTORY_NOT_EMPTY {
+        return Err(FsError::new(
+            Code::IoError,
+            std::io::Error::new(
+                std::io::ErrorKind::DirectoryNotEmpty,
+                format!("NtSetInformationFile: 0x{:08X}", status as u32),
+            ),
+        ));
+    }
     if status != 0 {
         return Err(FsError::new(Code::IoError, nt_io_error("NtSetInformationFile", status)));
     }
