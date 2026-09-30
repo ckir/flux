@@ -6,11 +6,14 @@
 // helpers) are not all reached yet. Task 7 deletes this line, and its `just check` then proves nothing is unused.
 #![allow(dead_code)]
 
+mod acquire;
 pub mod error;
+mod held;
 pub mod record;
 pub mod site;
 #[cfg(test)]
 pub(crate) mod test_support;
 
 pub use error::{LockCode, LockError, LockResult, Refusal};
+pub use held::{Held, Released};
 pub use site::{LockSite, SiteKind};
