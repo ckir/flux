@@ -316,4 +316,27 @@ mod tests {
         drop(claim);
         assert!(d.open_lock(OsStr::new(NAME)).unwrap().try_lock().unwrap());
     }
+
+    #[test]
+    fn a_released_lock_still_open_elsewhere_under_legacy_delete_is_busy_until_it_closes() {
+        let (fs, d) = fake();
+        fs.set_legacy_delete(true);
+        let site = site(&d);
+        let Obtained::Held { held: mut theirs, .. } =
+            obtain(&site, STRONG, Mode::Plain, &me()).unwrap()
+        else {
+            panic!("expected Held")
+        };
+        theirs.write_record(record(&site, &me(), "none")).unwrap();
+        // Another run's classification handle, still open when the holder releases.
+        let classifier = d.open_lock(OsStr::new(NAME)).unwrap();
+        assert_eq!(theirs.release().unwrap(), crate::lock::Released::Unlinked);
+        let r = refusal(obtain(&site, STRONG, Mode::Plain, &me()));
+        assert_eq!(r.code, LockCode::TargetLockBusy, "{}", r.detail);
+        drop(classifier);
+        assert!(matches!(
+            obtain(&site, STRONG, Mode::Plain, &me()).unwrap(),
+            Obtained::Held { .. }
+        ));
+    }
 }

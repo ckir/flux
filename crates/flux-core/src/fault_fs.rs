@@ -97,6 +97,12 @@ struct Inner {
     /// protocol tests). Consumed on use.
     #[allow(clippy::type_complexity)]
     hooks: HashMap<String, (u32, Box<dyn FnOnce(&FaultFs) + Send>)>,
+    /// Windows' legacy delete (cut 7a Part 1 capstone; `set_legacy_delete`).
+    legacy_delete: bool,
+    /// Object index -> live `FakeLock` handles on it.
+    open_locks: HashMap<u128, u32>,
+    /// Paths removed while a lock handle was open under legacy delete: still occupying their name, found by nothing.
+    pending: HashSet<PathBuf>,
 }
 
 /// One node in the `DirHandle` graph, addressed by an opaque id rather than by
@@ -160,6 +166,15 @@ fn mint_identity(g: &mut Inner, path: &Path) {
     g.next_object += 1;
     let id = flux_fs::ObjectId { volume: 1, index: g.next_object };
     g.identities.insert(path.to_path_buf(), flux_fs::FileIdentity::Strong(id));
+}
+
+/// Forget a removed file: its bytes and everything keyed by its path, so a later object at the path starts fresh.
+fn purge(g: &mut Inner, path: &Path) {
+    g.files.remove(path);
+    g.identities.remove(path);
+    g.times.remove(path);
+    g.perms.remove(path);
+    g.types.remove(path);
 }
 
 /// Move a name's content AND its metadata. Moving only the bytes meant the times and
@@ -404,10 +419,25 @@ impl LockFile for FakeLock {
 impl Drop for FakeLock {
     /// Closing the handle releases the OS-native lock, as on every real platform.
     fn drop(&mut self) {
-        if let Ok(mut g) = self.inner.lock()
-            && g.lock_holders.get(&self.object) == Some(&self.handle)
-        {
+        let Ok(mut g) = self.inner.lock() else { return };
+        if g.lock_holders.get(&self.object) == Some(&self.handle) {
             g.lock_holders.remove(&self.object);
+        }
+        let left = match g.open_locks.get_mut(&self.object) {
+            Some(n) => {
+                *n -= 1;
+                *n
+            }
+            None => 0,
+        };
+        if left == 0 {
+            g.open_locks.remove(&self.object);
+            // The last handle closed: a delete-pending name goes now.
+            if let Ok(path) = FakeLock::path(&g, self.object)
+                && g.pending.remove(&path)
+            {
+                purge(&mut g, &path);
+            }
         }
     }
 }
@@ -487,6 +517,13 @@ impl FaultFs {
     /// Run `action` just before the `nth` call to `name` (1-based, counted like `fail_nth`).
     pub fn on_nth(&self, name: &str, nth: u32, action: impl FnOnce(&FaultFs) + Send + 'static) {
         self.inner.lock().unwrap().hooks.insert(name.to_string(), (nth, Box::new(action)));
+    }
+
+    /// Windows' legacy delete semantics (a volume without POSIX delete; cut 7a Part 1 capstone). A file removed while
+    /// a lock handle on it is open stays at its name, "delete pending", until the last such handle closes. Meanwhile a
+    /// create at the name finds it occupied, and a stat, an open or a read finds nothing.
+    pub fn set_legacy_delete(&self, on: bool) {
+        self.inner.lock().unwrap().legacy_delete = on;
     }
 
     /// The bytes the fake currently holds for `path`.
@@ -700,6 +737,12 @@ impl FileSystem for FaultFs {
         let p = path.to_path_buf();
         self.record(format!("metadata({})", p.display()), "metadata")?;
         let mut g = self.inner.lock().unwrap();
+        if g.pending.contains(&p) {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            ));
+        }
         // Copy the count out: holding the entry's `&mut` across the blocks below
         // borrows `g` for too long, and they each need it again.
         let reads = {
@@ -814,21 +857,23 @@ impl FileSystem for FaultFs {
         // `discard` branches on it. A fake that returned Ok here would make that
         // branch untestable and hide the difference.
         let mut g = self.inner.lock().unwrap();
-        if g.files.remove(&p).is_none() {
+        if g.pending.contains(&p) || !g.files.contains_key(&p) {
             return Err(FsError::new(
                 Code::IoError,
                 std::io::Error::from(std::io::ErrorKind::NotFound),
             ));
         }
-        // The object is gone, so its state goes with it. Leaving these behind let a
-        // later file created at the SAME path inherit a dead object's identity and
-        // permissions - MEASURED, a recreated path reported the removed file's perms.
-        g.identities.remove(&p);
-        g.times.remove(&p);
-        g.perms.remove(&p);
-        // And the type a test gave the name: a recreated file at this path is a new, regular object (cut 7a Part 1:
-        // `open_lock` reads `types`, so a stale `Symlink` would refuse a lock created after the removal).
-        g.types.remove(&p);
+        let object = match g.identities.get(&p) {
+            Some(flux_fs::FileIdentity::Strong(o)) => Some(o.index),
+            _ => None,
+        };
+        if g.legacy_delete && object.is_some_and(|o| g.open_locks.get(&o).is_some_and(|&n| n > 0)) {
+            g.pending.insert(p);
+            return Ok(());
+        }
+        // The object is gone, so its state goes with it: a later file at the SAME path must not inherit a dead
+        // object's identity, permissions or type (each MEASURED as a leak before it was removed here).
+        purge(&mut g, &p);
         Ok(())
     }
 
@@ -989,6 +1034,7 @@ impl FakeDirHandle {
             ),
         };
         g.next_lock_handle += 1;
+        *g.open_locks.entry(object).or_insert(0) += 1;
         let handle = g.next_lock_handle;
         Ok(FakeLock { object, handle, inner: std::sync::Arc::clone(&self.inner) })
     }
@@ -1152,6 +1198,12 @@ impl DirHandle for FakeDirHandle {
         self.fs().record(format!("open_lock({})", child_path.display()), "open_lock")?;
         {
             let g = self.inner.lock().unwrap();
+            if g.pending.contains(&child_path) {
+                return Err(FsError::new(
+                    Code::IoError,
+                    std::io::Error::from(std::io::ErrorKind::NotFound),
+                ));
+            }
             match g.types.get(&child_path) {
                 Some(FileType::Symlink) => {
                     return Err(FsError::new(
@@ -1204,6 +1256,12 @@ impl DirHandle for FakeDirHandle {
         let child_path = self.my_path().join(name);
         self.fs().record(format!("read_file({})", child_path.display()), "read_file")?;
         let g = self.inner.lock().unwrap();
+        if g.pending.contains(&child_path) {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            ));
+        }
         match g.types.get(&child_path) {
             Some(FileType::Symlink) => {
                 return Err(FsError::new(
@@ -1975,5 +2033,43 @@ mod tests {
         drop(d.create_dir(OsStr::new("x")).unwrap());
         let e = d.rename_no_replace(OsStr::new("w"), &d, OsStr::new("x")).unwrap_err();
         assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn legacy_delete_keeps_a_name_occupied_until_the_last_lock_handle_closes() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/p")).unwrap();
+        let d = fs.destination_root(Path::new("/p")).unwrap();
+        fs.set_legacy_delete(true);
+        let name = OsStr::new("x.flux-lock");
+        let held = d.create_lock(name).unwrap();
+        let other = d.open_lock(name).unwrap();
+        d.remove_file(name).unwrap();
+        drop(held);
+        let gone = |e: FsError| e.source.kind() == std::io::ErrorKind::NotFound;
+        assert!(gone(d.metadata(name).unwrap_err()), "a stat finds nothing");
+        assert!(gone(d.open_lock(name).unwrap_err()), "an open finds nothing");
+        assert!(gone(d.read_file(name, 8).unwrap_err()), "a read finds nothing");
+        assert_eq!(
+            d.create_lock(name).unwrap_err().source.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "a create finds the name occupied"
+        );
+        drop(other);
+        assert!(!fs.exists("/p/x.flux-lock"), "the last close deletes it");
+        drop(d.create_lock(name).unwrap());
+    }
+
+    #[test]
+    fn without_legacy_delete_a_removal_is_immediate_even_while_a_handle_is_open() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/p")).unwrap();
+        let d = fs.destination_root(Path::new("/p")).unwrap();
+        let name = OsStr::new("x.flux-lock");
+        let held = d.create_lock(name).unwrap();
+        d.remove_file(name).unwrap();
+        assert!(!fs.exists("/p/x.flux-lock"));
+        drop(d.create_lock(name).unwrap());
+        drop(held);
     }
 }
