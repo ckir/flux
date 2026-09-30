@@ -1228,6 +1228,10 @@ impl DirHandle for FakeDirHandle {
         }
         Ok(())
     }
+
+    fn sync(&self) -> Result<()> {
+        self.fs().record(format!("sync_dir({})", self.my_path().display()), "sync_dir")
+    }
 }
 
 #[cfg(test)]
@@ -1877,5 +1881,16 @@ mod tests {
         assert!(fs.exists("/p/link"));
         let e = d.remove_dir(OsStr::new("absent")).unwrap_err();
         assert_eq!(e.source.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn a_fake_sync_is_recorded_and_can_fail() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/p")).unwrap();
+        let d = fs.destination_root(Path::new("/p")).unwrap();
+        d.sync().unwrap();
+        assert!(fs.called("sync_dir("), "{:?}", fs.calls());
+        fs.fail("sync_dir", Code::IoError);
+        assert!(d.sync().is_err());
     }
 }

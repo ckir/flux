@@ -32,7 +32,6 @@ use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
 const FILE_READ_ATTRIBUTES: u32 = 0x80;
 const FILE_LIST_DIRECTORY: u32 = 0x1;
-#[allow(dead_code)] // used by Task 4's sync
 const FILE_ADD_FILE: u32 = 0x2;
 const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
 
@@ -267,6 +266,10 @@ impl DirHandle for StdDir {
     fn remove_dir(&self, name: &OsStr) -> Result<()> {
         check_component(name)?;
         remove_dir_at(&self.0, name)
+    }
+
+    fn sync(&self) -> Result<()> {
+        sync_at(&self.0)
     }
 }
 
@@ -941,6 +944,19 @@ fn remove_dir_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {
         return Err(FsError::new(Code::IoError, nt_io_error("NtSetInformationFile", status)));
     }
     drop(h);
+    Ok(())
+}
+
+/// Flush the directory `p` holds. MEASURED (cut 7a Part 3a, NTFS and ReFS): `FlushFileBuffers` on a directory needs
+/// write access - `FILE_ADD_FILE` suffices, and the list-only handle a `StdDir` holds answers ACCESS_DENIED - so the
+/// flush goes through a reopened handle.
+fn sync_at(p: &OwnedHandle) -> Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::FlushFileBuffers;
+    let h = reopen(p, FILE_ADD_FILE)?;
+    // SAFETY: the handle is live for the call.
+    if unsafe { FlushFileBuffers(h.as_raw_handle() as _) } == 0 {
+        return Err(FsError::from_io(std::io::Error::last_os_error()));
+    }
     Ok(())
 }
 

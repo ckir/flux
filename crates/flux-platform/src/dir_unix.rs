@@ -324,6 +324,10 @@ impl DirHandle for StdDir {
         rustix::fs::unlinkat(&self.0, name, AtFlags::REMOVEDIR)
             .map_err(|e| FsError::from_io(std::io::Error::from(e)))
     }
+
+    fn sync(&self) -> Result<()> {
+        rustix::fs::fsync(&self.0).map_err(|e| FsError::from_io(std::io::Error::from(e)))
+    }
 }
 
 /// The handle-relative twin of `destination_is_write_protected` in `std_fs.rs`,

@@ -339,6 +339,10 @@ pub trait DirHandle: Sized {
     /// any kind, which is never followed and never removed here - `NotADirectory`; a directory that is not empty,
     /// `DirectoryNotEmpty`; a missing name, `NotFound`.
     fn remove_dir(&self, name: &std::ffi::OsStr) -> Result<()>;
+
+    /// Flush this directory's entries to stable storage, so that a create, rename or removal inside it survives a
+    /// crash (the crash-safe state write: temporary, flush, rename, flush the directory).
+    fn sync(&self) -> Result<()>;
 }
 
 /// Resolving `DEST` once, at start, is the only path-based call in the writer.

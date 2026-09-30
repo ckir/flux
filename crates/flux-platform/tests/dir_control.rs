@@ -158,3 +158,12 @@ fn remove_dir_refuses_a_file_and_a_link_and_never_follows_one() {
     assert!(std::fs::symlink_metadata(tmp.path().join("link")).is_ok(), "the link stays");
     assert!(tmp.path().join("target").is_dir(), "and so does its target");
 }
+
+#[test]
+fn sync_flushes_every_kind_of_directory_handle() {
+    let (_tmp, d) = dir();
+    d.sync().expect("the destination root");
+    let sub = d.create_dir(OsStr::new("sub")).unwrap();
+    sub.sync().expect("a created directory");
+    d.open_dir(OsStr::new("sub")).unwrap().sync().expect("an opened directory");
+}
