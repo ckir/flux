@@ -749,7 +749,9 @@ pub struct Held<'a, D: DirHandle> {
     pub(crate) lock_name: OsString,
     pub(crate) lock: D::Lock,
     pub(crate) identity: FileIdentity,
-    pub(crate) record: Option<LockRecord>,
+    /// Boxed: an inline record makes `Held` about 250 bytes, and every enum carrying one trips
+    /// `clippy::large_enum_variant`.
+    pub(crate) record: Option<Box<LockRecord>>,
 }
 
 /// What `release` did.
@@ -767,7 +769,7 @@ impl<'a, D: DirHandle> Held<'a, D> {
     }
 
     pub fn record(&self) -> Option<&LockRecord> {
-        self.record.as_ref()
+        self.record.as_deref()
     }
 
     /// `S96_1_record_begin` / `S96_1_record_end`, and after a recovery `S240_3_s4_record_begin` /
@@ -777,7 +779,7 @@ impl<'a, D: DirHandle> Held<'a, D> {
         assert!(self.record.is_none(), "a lock record is written once per tenure");
         self.lock.write_at_start(&record.encode())?;
         self.lock.sync_all()?;
-        self.record = Some(record);
+        self.record = Some(Box::new(record));
         Ok(())
     }
 
@@ -1625,7 +1627,7 @@ impl<'a, D: DirHandle> Claimed<'a, D> {
             lock_name: self.lock_name,
             lock: self.lock,
             identity: self.identity,
-            record: Some(record),
+            record: Some(Box::new(record)),
         }))
     }
 }
