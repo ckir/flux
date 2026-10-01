@@ -224,6 +224,8 @@ pub const MANIFEST: &str = "manifest";
 pub const TEMP_SUFFIX: &str = ".tmp";
 /// A workspace being built: `<id>.creating`, renamed to `<id>` once its manifest is written (decision 3).
 pub const CREATING_SUFFIX: &str = ".creating";
+/// The reserved subdirectories of `DEST/.flux` (the design's `.flux` ruling): Flux's own, never written by a copy.
+pub const RESERVED_DIRS: [&str; 3] = [OPERATIONS_DIR, "standalone", "atomic"];
 /// The single-file state record is `<target>.flux-state.<id>` (F2).
 pub const RECORD_INFIX: &str = ".flux-state.";
 
