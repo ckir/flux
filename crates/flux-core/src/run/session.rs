@@ -240,9 +240,16 @@ pub(crate) fn lost() -> RunError {
 }
 
 /// A lock-protocol error as the run's: a refusal keeps its code; an I/O error is the run's failure at `step`, `path`.
+/// A refusal of the lock names the path to act on - the lock, or the directory that would hold it - as the
+/// refusal-guidance table requires (Part 3b-2 decision 7).
 pub(crate) fn from_lock(e: LockError, step: RunStep, path: &Path, changed: bool) -> RunError {
     match e {
-        LockError::Refused(refusal) => RunError::Refused { refusal, changed, not_removed: None },
+        LockError::Refused(mut refusal) => {
+            if step == RunStep::Lock {
+                refusal.detail = format!("{}: {}", path.display(), refusal.detail);
+            }
+            RunError::Refused { refusal, changed, not_removed: None }
+        }
         LockError::Io(error) => RunError::Failed { step, path: path.to_path_buf(), error },
     }
 }

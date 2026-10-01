@@ -32,8 +32,12 @@ use std::path::{Path, PathBuf};
 /// no workspace", which a dead owner's classification treats as recoverable (`lock/site.rs`, `workspace`).
 const NO_WORKSPACE: &str = "none";
 
+/// A test hook (Part 3b-2): called before every guarded destination mutation of the copy, before its §99 check. The CLI
+/// installs one only in a debug build, to stop a run at a known point and kill it there.
+pub type BeforeMutation = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 /// What the operator asked of the run, beyond the copy itself.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RunConfig {
     /// `--restart`: supersede every resumable prior operation.
     pub restart: bool,
@@ -45,6 +49,21 @@ pub struct RunConfig {
     pub owner_instance_id: String,
     /// `flux_platform::boot_session_id()`, or `unknown`.
     pub boot_session_id: String,
+    /// `None` outside a test.
+    pub before_mutation: Option<BeforeMutation>,
+}
+
+impl std::fmt::Debug for RunConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunConfig")
+            .field("restart", &self.restart)
+            .field("break_lock", &self.break_lock)
+            .field("operation_id", &self.operation_id)
+            .field("owner_instance_id", &self.owner_instance_id)
+            .field("boot_session_id", &self.boot_session_id)
+            .field("before_mutation", &self.before_mutation.is_some())
+            .finish()
+    }
 }
 
 /// What a run did. `copy` is `None` when the run stopped before the copy; otherwise it is what `copy_tree` /
@@ -191,7 +210,12 @@ pub fn tree<F: DestinationRoot>(
     // Step 6: the copy, with §99 before every destination mutation.
     let mut leftovers = false;
     let walked = {
-        let guard = || guarded(&locked.held);
+        let guard = || {
+            if let Some(hook) = &cfg.before_mutation {
+                hook();
+            }
+            guarded(&locked.held)
+        };
         let cx = Shared { fs, src_root, src_identity: source.identity, opts: &opts, guard: &guard };
         let root = place.dest.take().expect("step 5 made DEST");
         let mut report = |f: TreeFailure| {
@@ -292,7 +316,12 @@ pub fn file<F: DestinationRoot>(
     };
     // Step 6, under §99.
     let copied = {
-        let guard = || guarded(&locked.held);
+        let guard = || {
+            if let Some(hook) = &cfg.before_mutation {
+                hook();
+            }
+            guarded(&locked.held)
+        };
         copy_file_guarded(fs, src, &parent, name, &opts, &guard)
     }
     .map_err(|mut e| {

@@ -11,6 +11,7 @@ use flux_fs::{
     DestinationRoot, Durability, FileSystem, LockCapability, OperationId, Preserve, Publish, Safety,
 };
 use std::ffi::OsStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// This run's operation id.
@@ -28,6 +29,7 @@ fn cfg() -> RunConfig {
         operation_id: ID.to_string(),
         owner_instance_id: id(0xee),
         boot_session_id: "test-boot".to_string(),
+        before_mutation: None,
     }
 }
 
@@ -722,4 +724,58 @@ fn a_takeover_that_never_holds_gives_up_and_says_its_state_exists() {
     assert_eq!(refused(&r.stop), (LockCode::TargetLockBusy, true));
     assert!(r.copy.is_none());
     assert_eq!(manifest(&fs, ID).state, OpState::Created, "the state stays for a later --restart");
+}
+
+// Part 3b-2.
+
+#[test]
+fn a_refusal_of_the_lock_names_the_lock_path() {
+    let fs = fake();
+    let p = fs.destination_root(Path::new("/p")).unwrap();
+    dead_lock(&p, "dest.flux-lock", b"");
+    let (r, _) = run_tree(&fs, &cfg());
+    let Some(RunError::Refused { refusal, .. }) = &r.stop else { panic!("{:?}", r.stop) };
+    assert_eq!(refusal.code, LockCode::TargetLockUncertain);
+    assert!(refusal.detail.replace('\\', "/").starts_with(LOCK), "{}", refusal.detail);
+}
+
+#[test]
+fn the_hook_runs_once_before_each_guarded_mutation() {
+    // A tree's guarded mutations: `a`'s sweep, temporary and publish; `sub`'s creation; `sub/b`'s three. A single
+    // file's: its sweep, temporary and publish.
+    for (tree_run, expected) in [(true, 7), (false, 3)] {
+        let fs = fake();
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&count);
+        let hook: BeforeMutation = Arc::new(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        });
+        let c = RunConfig { before_mutation: Some(hook), ..cfg() };
+        if tree_run {
+            ok(&run_tree(&fs, &c).0);
+        } else {
+            let r = run_file(&fs, &c);
+            assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?}", r.stop);
+        }
+        assert_eq!(count.load(Ordering::SeqCst), expected, "tree {tree_run}");
+    }
+}
+
+#[test]
+fn a_hook_that_never_returns_stops_the_copy_before_that_mutation() {
+    let fs = fake();
+    let count = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&count);
+    // The third guarded mutation is `a`'s publish; the CLI's hook blocks there forever, this one panics instead.
+    let hook: BeforeMutation = Arc::new(move || {
+        if seen.fetch_add(1, Ordering::SeqCst) + 1 == 3 {
+            panic!("the test's stall point");
+        }
+    });
+    let c = RunConfig { before_mutation: Some(hook), ..cfg() };
+    let stalled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_tree(&fs, &c)));
+    assert!(stalled.is_err(), "the hook stopped the run");
+    assert_eq!(count.load(Ordering::SeqCst), 3);
+    assert!(fs.exists(format!("/p/dest/a.flux-partial.{ID}")), "the temporary was made");
+    assert!(!fs.exists("/p/dest/a"), "the publish did not happen");
 }
