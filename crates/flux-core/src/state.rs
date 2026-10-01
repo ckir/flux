@@ -229,6 +229,21 @@ pub const RESERVED_DIRS: [&str; 3] = [OPERATIONS_DIR, "standalone", "atomic"];
 /// The single-file state record is `<target>.flux-state.<id>` (F2).
 pub const RECORD_INFIX: &str = ".flux-state.";
 
+/// A copy's temporary is `<name>.flux-partial.<id>` (§18.1, normative; `flux_fs::temp_path`).
+pub const PARTIAL_INFIX: &str = ".flux-partial.";
+/// A workspace being removed: `<id>.removing`, a name the §21.1 scan passes over (refinement 9, reversed).
+pub const REMOVING_SUFFIX: &str = ".removing";
+
+/// The operation id that ends `name` after `infix`: `name` is `<something><infix><32 lowercase hex>` with `<something>`
+/// not empty. A single-file record (`.flux-state.`) and a copy's temporary (`.flux-partial.`) are named this way.
+pub fn id_after<'n>(name: &'n OsStr, infix: &str) -> Option<&'n str> {
+    let bytes = name.as_encoded_bytes();
+    let start = bytes.len().checked_sub(32)?;
+    let id = std::str::from_utf8(&bytes[start..]).ok().filter(|s| is_id(s))?;
+    let head = bytes[..start].strip_suffix(infix.as_bytes())?;
+    (!head.is_empty()).then_some(id)
+}
+
 /// `<target>.flux-state.<id>`.
 pub fn record_name(target: &OsStr, operation_id: &str) -> OsString {
     let mut name = target.to_os_string();
@@ -260,6 +275,14 @@ pub fn write_state<D: DirHandle>(
     state: &OperationState,
 ) -> flux_fs::Result<()> {
     let temp = temp_name(name);
+    // Part 3b: a temporary left by an earlier failed write of this same state would make `create_new` fail forever.
+    // Its name carries the operation's id, and the writer holds the destination's lock, so it is the writer's to
+    // remove.
+    match dir.remove_file(&temp) {
+        Ok(()) => {}
+        Err(e) if e.source.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     let mut file = dir.create_new(&temp)?;
     let written =
         file.write_all(&state.encode()).map_err(FsError::from_io).and_then(|()| file.sync_all());
@@ -312,6 +335,65 @@ pub fn operations_dir<D: DirHandle>(dest: &D, dest_shown: &Path) -> LockResult<D
     let flux_shown = dest_shown.join(FLUX_DIR);
     let flux = control_dir(dest, FLUX_DIR, &flux_shown)?;
     control_dir(&flux, OPERATIONS_DIR, &flux_shown.join(OPERATIONS_DIR))
+}
+
+/// Remove a tree operation's workspace without ever leaving `operations/<id>` without its manifest (refinement 9,
+/// reversed; Part 3b decision 17): rename it to `<id>.removing`, which the §21.1 scan passes over, then remove its
+/// `manifest`, a crash's `manifest.tmp`, and the directory. A failure part-way leaves only `<id>.removing` (cut 9's).
+pub fn retire_workspace<D: DirHandle>(operations: &D, id: &str) -> flux_fs::Result<()> {
+    let mut retired = OsString::from(id);
+    retired.push(REMOVING_SUFFIX);
+    operations.rename_no_replace(OsStr::new(id), operations, &retired)?;
+    {
+        let dir = operations.open_dir(&retired)?;
+        for name in [OsString::from(MANIFEST), temp_name(OsStr::new(MANIFEST))] {
+            remove_if_present(&dir, &name)?;
+        }
+        // Closed before the directory is removed.
+    }
+    operations.remove_dir(&retired)
+}
+
+/// Remove a single-file operation's state record, then a crash's `<record>.tmp` beside it.
+pub fn remove_record<D: DirHandle>(dir: &D, name: &OsStr) -> flux_fs::Result<()> {
+    remove_if_present(dir, name)?;
+    remove_if_present(dir, &temp_name(name))
+}
+
+/// Finish step 4: `DEST/.flux/operations/`, then `DEST/.flux/`, each only if it is empty. Absent, not empty, or not a
+/// directory Flux can open is not an error: whatever else is there is not this run's.
+pub fn remove_empty_control_dirs<D: DirHandle>(dest: &D) -> flux_fs::Result<()> {
+    let tolerated =
+        |e: &FsError| matches!(e.source.kind(), ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty);
+    {
+        let flux = match dest.open_dir(OsStr::new(FLUX_DIR)) {
+            Ok(f) => f,
+            Err(e) if e.source.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(e) if matches!(e.code, Code::DestinationError | Code::SafetyRejected) => {
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        match flux.remove_dir(OsStr::new(OPERATIONS_DIR)) {
+            Ok(()) => {}
+            Err(e) if tolerated(&e) => {}
+            Err(e) => return Err(e),
+        }
+        // `.flux` is closed before it is removed.
+    }
+    match dest.remove_dir(OsStr::new(FLUX_DIR)) {
+        Ok(()) => Ok(()),
+        Err(e) if tolerated(&e) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn remove_if_present<D: DirHandle>(dir: &D, name: &OsStr) -> flux_fs::Result<()> {
+    match dir.remove_file(name) {
+        Ok(()) => Ok(()),
+        Err(e) if e.source.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 fn control_dir<D: DirHandle>(parent: &D, name: &str, shown: &Path) -> LockResult<D> {
@@ -617,5 +699,84 @@ mod tests {
         assert_eq!(temp_name(OsStr::new("manifest")), OsString::from("manifest.tmp"));
         assert!(file_names_fit(OsStr::new(&"n".repeat(NAME_LIMIT - 48))));
         assert!(!file_names_fit(OsStr::new(&"n".repeat(NAME_LIMIT - 47))));
+    }
+
+    #[test]
+    fn an_id_is_read_after_its_infix_and_nothing_else_is() {
+        let id = "a".repeat(32);
+        let after = |n: String| id_after(OsStr::new(&n), RECORD_INFIX).map(str::to_string);
+        assert_eq!(after(format!("t.flux-state.{id}")), Some(id.clone()));
+        assert_eq!(after(format!(".flux-state.{id}")), None, "no target before the infix");
+        assert_eq!(after(format!("t.flux-state.{id}.tmp")), None, "a temporary");
+        assert_eq!(after(format!("t.flux-state.{}", "A".repeat(32))), None, "not lowercase");
+        assert_eq!(after(format!("t.flux-partial.{id}")), None, "another infix");
+        assert_eq!(after(format!("t.flux-state.{}", &id[1..])), None, "31 digits");
+        assert_eq!(
+            id_after(OsStr::new(&format!("x.flux-partial.{id}")), PARTIAL_INFIX),
+            Some(id.as_str())
+        );
+    }
+
+    #[test]
+    fn a_stale_temporary_of_the_same_state_does_not_wedge_its_next_write() {
+        let (fs, d) = dest();
+        fs.write_file("/p/dest/rec.tmp", b"left by an earlier failed write");
+        write_state(&d, OsStr::new("rec"), &created()).unwrap();
+        assert_eq!(read_state(&d, OsStr::new("rec")).unwrap(), Ok(created()));
+        assert!(!fs.exists("/p/dest/rec.tmp"));
+    }
+
+    #[test]
+    fn a_workspace_is_retired_to_a_non_id_name_before_it_is_removed() {
+        let (fs, d) = dest();
+        let ops = operations_dir(&d, Path::new("D")).unwrap();
+        drop(create_workspace(&ops, &created()).unwrap());
+        let path = format!("/p/dest/.flux/operations/{}", id(1));
+        fs.write_file(format!("{path}/manifest.tmp"), b"a crash's temporary");
+        retire_workspace(&ops, &id(1)).unwrap();
+        assert!(!fs.exists(&path) && !fs.exists(format!("{path}.removing")));
+        let calls: Vec<String> = fs.calls().iter().map(|c| c.replace('\\', "/")).collect();
+        let retire = position(&calls, &format!("rename_no_replace({path} -> {path}.removing)"));
+        let manifest = position(&calls, &format!("remove_file({path}.removing/manifest)"));
+        assert!(retire < manifest, "the id name goes first: {calls:?}");
+    }
+
+    #[test]
+    fn a_retire_that_stops_part_way_leaves_nothing_the_scan_reads() {
+        let (fs, d) = dest();
+        let ops = operations_dir(&d, Path::new("D")).unwrap();
+        drop(create_workspace(&ops, &created()).unwrap());
+        // The manifest's removal fails, as if the run crashed right after the rename.
+        fs.fail("remove_file", Code::IoError);
+        assert!(retire_workspace(&ops, &id(1)).is_err());
+        assert!(fs.exists(format!("/p/dest/.flux/operations/{}.removing/manifest", id(1))));
+        let scan = crate::prior::scan_tree(&d, Path::new("D"), &id(9)).unwrap();
+        assert!(scan.resumable.is_empty(), "a `.removing` workspace is not an operation");
+    }
+
+    #[test]
+    fn a_record_is_removed_with_its_temporary_and_absence_is_not_an_error() {
+        let (fs, d) = dest();
+        let rec = record_name(OsStr::new("t"), &id(1));
+        let shown = format!("/p/dest/{}", rec.to_string_lossy());
+        write_state(&d, &rec, &created()).unwrap();
+        fs.write_file(format!("{shown}.tmp"), b"a crash's temporary");
+        remove_record(&d, &rec).unwrap();
+        assert!(!fs.exists(&shown) && !fs.exists(format!("{shown}.tmp")));
+        remove_record(&d, &rec).expect("already gone is not an error");
+    }
+
+    #[test]
+    fn empty_control_directories_are_removed_and_a_non_empty_one_is_kept() {
+        let (fs, d) = dest();
+        drop(operations_dir(&d, Path::new("D")).unwrap());
+        remove_empty_control_dirs(&d).unwrap();
+        assert!(!fs.exists("/p/dest/.flux"));
+        remove_empty_control_dirs(&d).expect("absent is not an error");
+        drop(operations_dir(&d, Path::new("D")).unwrap());
+        fs.write_file("/p/dest/.flux/user-file", b"the user's");
+        remove_empty_control_dirs(&d).unwrap();
+        assert!(!fs.exists("/p/dest/.flux/operations"), "the empty one goes");
+        assert!(fs.exists("/p/dest/.flux/user-file"), "a .flux holding anything else stays");
     }
 }

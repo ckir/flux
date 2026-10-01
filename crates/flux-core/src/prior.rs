@@ -7,8 +7,8 @@ use crate::ids::is_id;
 use crate::lock::error::refuse;
 use crate::lock::{LockCode, LockError, LockResult};
 use crate::state::{
-    FLUX_DIR, Kind, MANIFEST, OPERATIONS_DIR, OperationState, RECORD_INFIX, Unusable,
-    control_path_conflict, read_state,
+    FLUX_DIR, Kind, MANIFEST, OPERATIONS_DIR, OperationState, RECORD_INFIX, RESERVED_DIRS,
+    Unusable, control_path_conflict, read_state,
 };
 use flux_fs::{Code, DirHandle, FileType};
 use std::ffi::OsStr;
@@ -150,6 +150,19 @@ pub fn resumable_refusal(op: &PriorOp) -> LockError {
             op.shown.display()
         ),
     )
+}
+
+/// Step 2 of "The run": `DEST/.flux` and its reserved subdirectories, where they exist, are directories. Read-only: a
+/// foreign object at any of them is `CONTROL_PLANE_NAMESPACE_CONFLICT` before anything is created.
+pub fn check_control_plane<D: DirHandle>(dest: &D, dest_shown: &Path) -> LockResult<()> {
+    let flux_shown = dest_shown.join(FLUX_DIR);
+    let Some(flux) = existing_dir(dest, FLUX_DIR, &flux_shown)? else {
+        return Ok(());
+    };
+    for name in RESERVED_DIRS {
+        existing_dir(&flux, name, &flux_shown.join(name))?;
+    }
+    Ok(())
 }
 
 fn usable(decoded: Result<OperationState, Unusable>, shown: &Path) -> LockResult<OperationState> {
@@ -471,5 +484,28 @@ mod tests {
         for part in [id(1).as_str(), "FAILED", "--restart", "manifest"] {
             assert!(r.detail.contains(part), "{part}: {}", r.detail);
         }
+    }
+
+    #[test]
+    fn the_control_plane_check_refuses_a_foreign_object_at_any_reserved_name() {
+        for reserved in ["operations", "standalone", "atomic"] {
+            let (fs, d) = dest();
+            fs.create_dir(Path::new("/p/dest/.flux")).unwrap();
+            fs.write_file(format!("/p/dest/.flux/{reserved}"), b"x");
+            let r = refusal(check_control_plane(&d, Path::new("D")));
+            assert_eq!(r.code, LockCode::ControlPlaneNamespaceConflict, "{reserved}");
+            assert!(r.detail.contains(reserved), "{}", r.detail);
+        }
+        let (fs, d) = dest();
+        check_control_plane(&d, Path::new("D")).expect("no .flux at all");
+        fs.create_dir(Path::new("/p/dest/.flux")).unwrap();
+        fs.write_file("/p/dest/.flux/other", b"user data");
+        check_control_plane(&d, Path::new("D")).expect("any other name under .flux is data");
+        let (fs, d) = dest();
+        fs.write_file("/p/dest/.flux", b"x");
+        assert_eq!(
+            refusal(check_control_plane(&d, Path::new("D"))).code,
+            LockCode::ControlPlaneNamespaceConflict
+        );
     }
 }
