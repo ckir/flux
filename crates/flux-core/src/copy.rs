@@ -229,7 +229,7 @@ pub(crate) fn split_destination(dst: &Path) -> std::result::Result<(&Path, &OsSt
 /// so a destination that becomes an alias in between is not caught. The harm is
 /// bounded to a broken hardlink, not lost data -- the published bytes were read from
 /// the source before the destination was touched.
-fn identity_gate<D: DirHandle>(
+pub(crate) fn identity_gate<D: DirHandle>(
     parent: &D,
     name: &OsStr,
     src: &Metadata,
@@ -335,6 +335,38 @@ pub fn copy_file<F: DestinationRoot>(
         }
         e
     })
+}
+
+/// B1 (cut 7a Part 3b): `copy_file`'s checks that need no lock - Step 0, the source's type (Step 2) and the identity
+/// gate (Step 2a) - made by the run before it takes the destination's lock, so a refusal there creates nothing. The
+/// copy makes Steps 2 and 2a again under the lock. Returns DEST's parent, its path, and the target's name.
+pub(crate) fn prepare_file<'d, F: DestinationRoot>(
+    fs: &F,
+    src: &Path,
+    dst: &'d Path,
+    opts: &CopyOptions,
+) -> std::result::Result<(F::Dir, &'d Path, &'d OsStr), CopyError> {
+    if src == dst {
+        return Err(CopyError::at(
+            CopyStep::Resolve,
+            FsError::new(
+                Code::SafetyRejected,
+                std::io::Error::other("source and destination are the same path"),
+            ),
+        ));
+    }
+    let (parent_path, name) = split_destination(dst)?;
+    let parent =
+        fs.destination_root(parent_path).map_err(|e| CopyError::at(CopyStep::Resolve, e))?;
+    let src_meta = fs.metadata(src).map_err(|e| CopyError::at(CopyStep::Source, e))?;
+    if src_meta.file_type != FileType::File {
+        return Err(CopyError::at(
+            CopyStep::Source,
+            FsError::new(Code::SpecialFileUnsupported, std::io::Error::other("not a regular file")),
+        ));
+    }
+    identity_gate(&parent, name, &src_meta, opts.safety, opts.publish)?;
+    Ok((parent, parent_path, name))
 }
 
 /// Copy `src` to `name` inside `parent`, writing ONLY through `parent`, holding no lock: `copy_file_guarded` with a

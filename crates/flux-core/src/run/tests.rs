@@ -1,6 +1,7 @@
 //! The run on the fake filesystem (cut 7a Part 3b-1). `/src` is the source; `/p` is DEST's parent and holds the lock.
 
 use super::*;
+use crate::copy::CopyStep;
 use crate::fault_fs::FaultFs;
 use crate::lock::LockCode;
 use crate::lock::record::{Decoded, decode};
@@ -438,4 +439,102 @@ fn restart_stops_when_ownership_is_lost_and_deletes_nothing_after() {
     assert!(r.copy.is_none());
     assert!(fs.exists(&partial), "§99 failed: nothing more is deleted");
     assert_eq!(fs.read_file(LOCK).as_deref(), Some(&b"another run's bytes"[..]), "never unlinked");
+}
+
+const T_LOCK: &str = "/p/t.flux-lock";
+
+fn record_path(id: &str) -> String {
+    format!("/p/t.flux-state.{id}")
+}
+
+fn run_file(fs: &FaultFs, c: &RunConfig) -> Run<Result<flux_fs::Outcome, CopyError>> {
+    file(fs, Path::new("/src/a"), Path::new("/p/t"), &opts(), c)
+}
+
+fn file_prior(fs: &FaultFs, n: u8) {
+    let prior = OperationState {
+        state: OpState::Failed,
+        ..OperationState::created(&id(n), Kind::File, Path::new("/p/t"), 1)
+    };
+    fs.write_file(record_path(&id(n)), &prior.encode());
+}
+
+#[test]
+fn a_single_file_run_copies_and_leaves_no_record_behind() {
+    let fs = fake();
+    let r = run_file(&fs, &cfg());
+    assert!(r.stop.is_none() && r.warnings.is_empty(), "{:?} {:?}", r.stop, r.warnings);
+    assert!(matches!(r.copy, Some(Ok(_))), "{:?}", r.copy);
+    assert_eq!(fs.read_file("/p/t").as_deref(), Some(&b"A"[..]));
+    assert!(!fs.exists(record_path(ID)) && !fs.exists(T_LOCK));
+    let c = calls(&fs);
+    let lock = at(&c, "create_lock(/p/t.flux-lock)");
+    let state = at(&c, &format!("create_new(/p/t.flux-state.{ID}.tmp)"));
+    assert!(lock < state, "{c:?}");
+}
+
+#[test]
+fn a_target_name_too_long_for_its_record_is_refused_before_anything_is_made() {
+    let fs = fake();
+    let long = format!("/p/{}", "n".repeat(255 - 47));
+    let r = file(&fs, Path::new("/src/a"), Path::new(&long), &opts(), &cfg());
+    assert_eq!(refused(&r.stop), (LockCode::PathComponentInvalid, false));
+    assert!(!fs.called("create_lock") && !fs.called("create_new"));
+}
+
+#[test]
+fn a_mistyped_source_creates_nothing() {
+    let fs = fake();
+    let r = file(&fs, Path::new("/src/missing"), Path::new("/p/t"), &opts(), &cfg());
+    assert!(r.stop.is_none());
+    assert!(matches!(&r.copy, Some(Err(e)) if e.step == CopyStep::Source), "{:?}", r.copy);
+    assert!(!fs.called("create_lock"), "B1: {:?}", fs.calls());
+}
+
+#[test]
+fn a_failed_single_file_copy_leaves_a_failed_record_and_releases_the_lock() {
+    let fs = fake();
+    // `create_new`: the CREATED record (1), TRANSFERRING (2), then the copy's temporary (3), whose write fails.
+    fs.on_nth("create_new", 3, |fs| fs.fail_write(std::io::Error::other("injected write")));
+    let r = run_file(&fs, &cfg());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert!(matches!(&r.copy, Some(Err(e)) if e.step == CopyStep::Stream), "{:?}", r.copy);
+    let state = decode_state(&fs.read_file(record_path(ID)).unwrap()).unwrap();
+    assert_eq!(state.state, OpState::Failed);
+    assert!(!fs.exists(T_LOCK));
+}
+
+#[test]
+fn a_resumable_single_file_prior_is_refused_without_restart() {
+    let fs = fake();
+    file_prior(&fs, 5);
+    let r = run_file(&fs, &cfg());
+    assert_eq!(refused(&r.stop), (LockCode::ResumableOperationExists, false));
+    assert!(!fs.exists(T_LOCK) && !fs.exists("/p/t"));
+}
+
+#[test]
+fn restart_supersedes_a_single_files_prior_and_its_partial() {
+    let fs = fake();
+    file_prior(&fs, 5);
+    fs.write_file(format!("/p/t.flux-partial.{}", id(5)), b"half");
+    let r = run_file(&fs, &restart());
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+    assert!(!fs.exists(record_path(&id(5))) && !fs.exists(format!("/p/t.flux-partial.{}", id(5))));
+}
+
+#[test]
+fn a_single_file_refusal_under_the_lock_is_rolled_back() {
+    let fs = fake();
+    // B1's checks pass; then, as the lock is created, the target becomes a directory: the copy's own gate refuses it.
+    fs.on_nth("create_lock", 1, |fs| fs.create_dir(Path::new("/p/t")).unwrap());
+    let r = run_file(&fs, &cfg());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert!(
+        matches!(&r.copy, Some(Err(e)) if e.code() == Code::SafetyRejected && e.leftover.is_none()),
+        "{:?}",
+        r.copy
+    );
+    assert!(!fs.exists(record_path(ID)) && !fs.exists(T_LOCK), "what the run made is gone");
+    assert!(fs.exists("/p/t"));
 }

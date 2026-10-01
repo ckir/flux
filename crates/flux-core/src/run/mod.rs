@@ -14,15 +14,17 @@ mod session;
 #[cfg(test)]
 mod tests;
 
+use crate::copy::{CopyError, copy_file_guarded, prepare_file};
 use crate::lock::record::LockRecord;
-use crate::lock::{LockSite, Refusal, Released, check_capability};
+use crate::lock::site::NAME_LIMIT;
+use crate::lock::{LockCode, LockSite, Refusal, Released, check_capability};
 use crate::prior::check_control_plane;
-use crate::state::OpState;
+use crate::state::{OpState, file_names_fit};
 use crate::tree::{
     Shared, TreeAbort, TreeFailure, TreeFailureCause, TreeOutcome, copy_tree_at, prepare_source,
 };
-use flux_fs::{Code, CopyOptions, DestinationRoot, DirHandle, FsError, OperationId};
-use place::{Place, TreePlace, locate_tree};
+use flux_fs::{Code, CopyOptions, DestinationRoot, DirHandle, FsError, OperationId, Outcome};
+use place::{FilePlace, Place, TreePlace, locate_tree};
 use session::{Locked, from_lock, guarded, lock_io, open_operation, owned};
 use std::path::{Path, PathBuf};
 
@@ -221,6 +223,95 @@ pub fn tree<F: DestinationRoot>(
         }
     }
     run.copy = Some(result);
+    run
+}
+
+/// A single-file copy under the destination's lock ("The run"; its state is the record beside the target, F2).
+pub fn file<F: DestinationRoot>(
+    fs: &F,
+    src: &Path,
+    dst: &Path,
+    opts: &CopyOptions,
+    cfg: &RunConfig,
+) -> Run<Result<Outcome, CopyError>> {
+    let mut run = Run { copy: None, stop: None, warnings: Vec::new() };
+    let opts =
+        CopyOptions { operation_id: OperationId::new(cfg.operation_id.as_str()), ..opts.clone() };
+    // B1.
+    let (parent, parent_path, name) = match prepare_file(fs, src, dst, &opts) {
+        Ok(p) => p,
+        Err(e) => {
+            run.copy = Some(Err(e));
+            return run;
+        }
+    };
+    // Every name the run makes beside the target must fit (Part 3a decision 4), before anything is made.
+    if !file_names_fit(name) {
+        run.stop = Some(RunError::Refused {
+            refusal: Box::new(Refusal {
+                code: LockCode::PathComponentInvalid,
+                holder: None,
+                detail: format!(
+                    "the target name {} leaves no room for the names Flux keeps beside it (its state record's temporary is the name plus 48 units, over {NAME_LIMIT})",
+                    name.to_string_lossy()
+                ),
+            }),
+            changed: false,
+            not_removed: None,
+        });
+        return run;
+    }
+    // Step 1.
+    let capability = match check_capability(&parent) {
+        Ok(c) => c,
+        Err(e) => {
+            run.stop = Some(from_lock(e, RunStep::Lock, parent_path, false));
+            return run;
+        }
+    };
+    let site = match LockSite::file(&parent, name) {
+        Ok(s) => s,
+        Err(e) => {
+            run.stop = Some(from_lock(e, RunStep::Lock, parent_path, false));
+            return run;
+        }
+    };
+    let mut place = FilePlace {
+        dir: &parent,
+        dir_shown: parent_path.to_path_buf(),
+        target: name.to_os_string(),
+        destination: dst.to_path_buf(),
+    };
+    // Steps 3-5.
+    let locked = match open_operation(&site, capability, &mut place, cfg, &mut run.warnings) {
+        Ok(l) => l,
+        Err(e) => {
+            run.stop = Some(e);
+            return run;
+        }
+    };
+    // Step 6, under §99.
+    let copied = {
+        let guard = || guarded(&locked.held);
+        copy_file_guarded(fs, src, &parent, name, &opts, &guard)
+    }
+    .map_err(|mut e| {
+        // As `copy_file` reports it: the leftover in the frame of the path the operator gave.
+        if let Some((path, _)) = e.leftover.as_mut() {
+            *path = dst.with_file_name(&*path);
+        }
+        e
+    });
+    let ended = match &copied {
+        Ok(_) => Ended::Completed { leftovers: false },
+        Err(e) if e.code() == Code::TargetLockBusy => Ended::Lost,
+        Err(e) if e.code() == Code::SafetyRejected && e.leftover.is_none() => {
+            Ended::RefusedUnchanged
+        }
+        Err(_) => Ended::Failed,
+    };
+    run.stop = finish(&mut place, locked, ended, &mut run.warnings);
+    run.copy = Some(copied);
     run
 }
 

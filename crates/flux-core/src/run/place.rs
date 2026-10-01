@@ -6,14 +6,18 @@ use super::session::{Fault, failed, from_lock, owned};
 use super::{RunError, RunStep, RunWarning};
 use crate::copy::{CopyError, CopyStep, split_destination};
 use crate::lock::{Held, LockResult};
-use crate::prior::{PriorOp, Scan, scan_tree};
+use crate::prior::{PriorOp, Scan, scan_file, scan_tree};
 use crate::state::{
     FLUX_DIR, Kind, MANIFEST, OPERATIONS_DIR, OperationState, PARTIAL_INFIX, create_workspace,
-    id_after, operations_dir, remove_empty_control_dirs, retire_workspace, write_state,
+    id_after, operations_dir, record_name, remove_empty_control_dirs, remove_record,
+    retire_workspace, write_state,
 };
 use crate::tree::{WeakIdentityWarnings, preflight, reserved_path};
 use crate::walk::{WalkEvent, walk};
-use flux_fs::{Code, DestinationRoot, DirHandle, FileIdentity, FileType, FsError, Safety};
+use flux_fs::{
+    Code, DestinationRoot, DirHandle, FileIdentity, FileType, FsError, OperationId, Safety,
+    temp_path,
+};
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::io::ErrorKind;
@@ -303,4 +307,83 @@ fn remove_below<D: DirHandle>(dest: &D, rel: &Path) -> flux_fs::Result<()> {
         opened = Some(next);
     }
     opened.as_ref().unwrap_or(dest).remove_file(name)
+}
+
+/// A single file's directory: it holds the lock, the record `<target>.flux-state.<id>` and the copy.
+pub(crate) struct FilePlace<'p, D: DirHandle> {
+    pub(crate) dir: &'p D,
+    pub(crate) dir_shown: PathBuf,
+    pub(crate) target: OsString,
+    /// The destination as the operator gave it.
+    pub(crate) destination: PathBuf,
+}
+
+impl<D: DirHandle> Place<D> for FilePlace<'_, D> {
+    fn kind(&self) -> Kind {
+        Kind::File
+    }
+
+    fn destination(&self) -> &Path {
+        &self.destination
+    }
+
+    fn holder_shown(&self) -> &Path {
+        &self.dir_shown
+    }
+
+    fn workspace_path(&self, id: &str) -> String {
+        format!("adjacent/{id}")
+    }
+
+    fn shown(&self, id: &str) -> PathBuf {
+        self.dir_shown.join(record_name(&self.target, id))
+    }
+
+    fn scan(&self, own_id: &str) -> LockResult<Scan> {
+        scan_file(self.dir, &self.target, &self.dir_shown, own_id)
+    }
+
+    fn create(&mut self, state: &OperationState) -> Result<(), RunError> {
+        self.write(state).map_err(|e| failed(RunStep::State, &self.shown(&state.operation_id), e))
+    }
+
+    fn write(&self, state: &OperationState) -> flux_fs::Result<()> {
+        write_state(self.dir, &record_name(&self.target, &state.operation_id), state)
+    }
+
+    fn sweep(
+        &self,
+        priors: &[PriorOp],
+        held: &Held<'_, D>,
+        lock_shown: &Path,
+        warnings: &mut Vec<RunWarning>,
+    ) -> Result<Vec<String>, Fault> {
+        let mut gone = Vec::new();
+        for prior in priors {
+            let id = &prior.state.operation_id;
+            // `<target>.flux-partial.<id>`, looked up by this target's own name (E3).
+            let partial =
+                temp_path(Path::new(&self.target), &OperationId::new(id.as_str())).into_os_string();
+            owned(held, lock_shown)?;
+            match self.dir.remove_file(&partial) {
+                Ok(()) => gone.push(id.clone()),
+                Err(e) if e.source.kind() == ErrorKind::NotFound => gone.push(id.clone()),
+                Err(error) => warnings.push(RunWarning::PartialKept {
+                    path: self.dir_shown.join(&partial),
+                    error,
+                    kept: prior.shown.clone(),
+                }),
+            }
+        }
+        Ok(gone)
+    }
+
+    fn remove(&self, id: &str) -> Result<(), (PathBuf, FsError)> {
+        remove_record(self.dir, &record_name(&self.target, id)).map_err(|e| (self.shown(id), e))
+    }
+
+    fn remove_control_dirs(&mut self, _rollback: bool) -> Result<(), (PathBuf, FsError)> {
+        // A single file's state needs no control directory (F2).
+        Ok(())
+    }
 }
