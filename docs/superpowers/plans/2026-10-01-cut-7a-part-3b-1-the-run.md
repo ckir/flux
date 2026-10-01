@@ -43,7 +43,7 @@ exit statuses".
   - `pub fn copy_file` (`:283-318`), whose Step 0 refusal is `src == dst` with the message `"source and destination
     are the same path"` (`:296-305`);
   - `pub fn copy_file_at` (`:320-452`): the step-1 sweep `let _ = parent.remove_file(&temp);` (`:338`), the exclusive
-    create (`:359`), the seven `discard(` calls (`:368`, `:371`, `:380`, `:396`, `:411`, `:432`, `:434`, `:438`,
+    create (`:359`), the `discard(` calls (`:368`, `:371`, `:380`, `:396`, `:411`, `:432`, `:434`, `:438`,
     `:449` - nine call sites), the publish `let published = match opts.publish {` (`:441`);
   - `mod tests` with `fn opts()` (`operation_id: OperationId::new("op1")`, `publish: Publish::Replace`).
 - `crates/flux-core/src/tree.rs`:
