@@ -630,6 +630,13 @@ mod tests {
         assert_eq!(clean.errors, 0);
         let stopped = Report::tree_run(&run(Some(Ok(TreeOutcome::default())), Some(refused())), 1);
         assert_eq!(stopped.errors, 1, "a stop after the copy is an error");
+        let aborted = || {
+            let cause = FsError::new(Code::SafetyRejected, std::io::Error::other("x"));
+            let error = CopyError { cause, leftover: None, step: CopyStep::Resolve };
+            Some(Err(TreeAbort { error, outcome: TreeOutcome::default() }))
+        };
+        assert_eq!(Report::tree_run(&run(aborted(), None), 1).errors, 1, "the abort is an error");
+        assert_eq!(Report::tree_run(&run(aborted(), Some(refused())), 1).errors, 2);
         let before = Report::tree_run(&run(None, Some(refused())), 1);
         assert_eq!((before.errors, before.files_total), (1, 0), "a stop before the copy");
     }
