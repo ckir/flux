@@ -538,3 +538,188 @@ fn a_single_file_refusal_under_the_lock_is_rolled_back() {
     assert!(!fs.exists(record_path(ID)) && !fs.exists(T_LOCK), "what the run made is gone");
     assert!(fs.exists("/p/t"));
 }
+
+// Part 3b-1 test audit (round 1): each test below was red under the mutant named in its comment.
+
+fn aborted(r: &Run<Result<TreeOutcome, TreeAbort>>) -> &TreeAbort {
+    match &r.copy {
+        Some(Err(a)) => a,
+        other => panic!("expected an abort, got {other:?}"),
+    }
+}
+
+fn failed_at(stop: &Option<RunError>) -> (RunStep, String) {
+    match stop {
+        Some(RunError::Failed { step, path, .. }) => {
+            (*step, path.to_string_lossy().replace('\\', "/"))
+        }
+        other => panic!("expected a failure, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_symlink_at_dest_is_refused_before_anything_is_made() {
+    let fs = fake();
+    fs.add_symlink("/p/dest");
+    let (r, _) = run_tree(&fs, &cfg());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert_eq!(aborted(&r).error.code(), Code::SafetyRejected);
+    assert!(!fs.called("create_lock"), "{:?}", fs.calls());
+}
+
+#[test]
+fn a_file_at_dest_is_a_destination_error_before_anything_is_made() {
+    let fs = fake();
+    fs.write_file("/p/dest", b"a file");
+    let (r, _) = run_tree(&fs, &cfg());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert_eq!(aborted(&r).error.code(), Code::DestinationError);
+    assert!(!fs.called("create_lock"), "{:?}", fs.calls());
+}
+
+#[test]
+fn an_ownership_check_that_cannot_read_the_lock_is_a_failure_not_a_loss() {
+    let fs = fake();
+    // `rename_replace`: the CREATED record (1), TRANSFERRING (2), the publish (3). Just before the publish, every
+    // later read of the lock fails: the finish's `still_owned` cannot tell.
+    fs.on_nth("rename_replace", 3, |fs| fs.fail_always("read_all", Code::IoError));
+    let r = run_file(&fs, &cfg());
+    assert!(matches!(r.copy, Some(Ok(_))), "{:?}", r.copy);
+    assert_eq!(failed_at(&r.stop), (RunStep::State, T_LOCK.to_string()));
+    let state = decode_state(&fs.read_file(record_path(ID)).unwrap()).unwrap();
+    assert_eq!(state.state, OpState::Transferring, "nothing written without proof of ownership");
+    assert!(fs.exists(T_LOCK), "never unlinked");
+}
+
+#[test]
+fn a_guard_that_cannot_read_the_lock_aborts_the_copy_as_target_lock_busy() {
+    let fs = fake();
+    // `create_new`: the CREATED record (1), TRANSFERRING (2), the copy's temporary (3). From there every read of the
+    // lock fails, so the publish's guard cannot tell.
+    fs.on_nth("create_new", 3, |fs| fs.fail_always("read_all", Code::IoError));
+    let r = run_file(&fs, &cfg());
+    assert!(matches!(&r.copy, Some(Err(e)) if e.code() == Code::TargetLockBusy), "{:?}", r.copy);
+    assert!(!fs.exists("/p/t"), "never published");
+}
+
+#[test]
+fn a_failed_transferring_write_still_records_failed_and_releases_the_lock() {
+    let fs = fake();
+    // `rename_replace`: the CREATED record (1), then TRANSFERRING (2), which fails.
+    fs.fail_nth("rename_replace", 2, Code::IoError, std::io::ErrorKind::Other);
+    let r = run_file(&fs, &cfg());
+    assert!(r.copy.is_none(), "{:?}", r.copy);
+    assert_eq!(failed_at(&r.stop).0, RunStep::State);
+    let state = decode_state(&fs.read_file(record_path(ID)).unwrap()).unwrap();
+    assert_eq!(state.state, OpState::Failed);
+    assert!(!fs.exists(T_LOCK), "released");
+}
+
+#[test]
+fn a_failed_write_of_failed_is_reported_beside_the_copy_error() {
+    let fs = fake();
+    // The copy's temporary is the 3rd `create_new`, and its write fails; the FAILED write is the 3rd `rename_replace`
+    // (after the CREATED and TRANSFERRING ones), and it fails too.
+    fs.on_nth("create_new", 3, |fs| fs.fail_write(std::io::Error::other("injected write")));
+    fs.fail_nth("rename_replace", 3, Code::IoError, std::io::ErrorKind::Other);
+    let r = run_file(&fs, &cfg());
+    assert!(matches!(&r.copy, Some(Err(e)) if e.step == CopyStep::Stream), "{:?}", r.copy);
+    let (step, path) = failed_at(&r.stop);
+    assert_eq!((step, path), (RunStep::State, record_path(ID)));
+    assert!(!fs.exists(T_LOCK), "still released");
+}
+
+#[test]
+fn a_directory_the_restart_sweep_cannot_read_keeps_every_prior() {
+    let fs = fake();
+    prior(&fs, 5, OpState::Failed);
+    // `d` lists as a directory but cannot be listed itself: the walk reports it and goes on.
+    fs.write_file("/p/dest/d", b"");
+    fs.set_type("/p/dest/d", flux_fs::FileType::Dir);
+    let (r, _) = run_tree(&fs, &restart());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert!(
+        r.warnings.iter().any(|w| matches!(w, RunWarning::PartialKept { path, .. }
+            if path.to_string_lossy().replace('\\', "/").ends_with("/p/dest/d"))),
+        "{:?}",
+        r.warnings
+    );
+    let kept = manifest(&fs, &id(5));
+    assert_eq!((kept.state, kept.superseded_by.as_deref()), (OpState::Abandoned, Some(ID)));
+}
+
+#[test]
+fn a_partial_inside_a_reserved_control_directory_is_never_swept() {
+    let fs = fake();
+    prior(&fs, 5, OpState::Failed);
+    fs.create_dir(Path::new("/p/dest/.flux/standalone")).unwrap();
+    let reserved = format!("/p/dest/.flux/standalone/y.flux-partial.{}", id(5));
+    fs.write_file(&reserved, b"not the sweep's");
+    let (r, _) = run_tree(&fs, &restart());
+    ok(&r);
+    assert!(fs.exists(&reserved));
+}
+
+#[test]
+fn a_single_files_partial_that_cannot_be_deleted_keeps_its_prior() {
+    let fs = fake();
+    file_prior(&fs, 5);
+    let partial = format!("/p/t.flux-partial.{}", id(5));
+    fs.write_file(&partial, b"half");
+    // `remove_file`: the CREATED and ABANDONED writes clear their temporaries (1, 2); then the partial (3).
+    fs.fail_nth("remove_file", 3, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let r = run_file(&fs, &restart());
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+    assert!(fs.exists(&partial));
+    let kept = decode_state(&fs.read_file(record_path(&id(5))).unwrap()).unwrap();
+    assert_eq!((kept.state, kept.superseded_by.as_deref()), (OpState::Abandoned, Some(ID)));
+    assert!(
+        r.warnings.iter().any(|w| matches!(w, RunWarning::PartialKept { .. })),
+        "{:?}",
+        r.warnings
+    );
+}
+
+#[test]
+fn a_prior_whose_state_cannot_be_removed_is_a_warning() {
+    let fs = fake();
+    prior(&fs, 5, OpState::Failed);
+    // `rename_no_replace`: this run's workspace into place (1), then the prior's retire (2), which fails.
+    fs.fail_nth(
+        "rename_no_replace",
+        2,
+        Code::PermissionDenied,
+        std::io::ErrorKind::PermissionDenied,
+    );
+    let (r, _) = run_tree(&fs, &restart());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert!(
+        r.warnings.iter().any(|w| matches!(w, RunWarning::NotRemoved { path, .. }
+            if path.to_string_lossy().contains(&id(5)))),
+        "{:?}",
+        r.warnings
+    );
+    assert_eq!(manifest(&fs, &id(5)).state, OpState::Abandoned, "passed over by every later run");
+}
+
+/// Before the `n`-th flush of a claimed lock's overwrite, move the claimed file away and leave a fresh empty lock in
+/// its place, and arm the same for the next flush: every `--break-lock` attempt has to start again.
+fn keep_moving_the_lock(fs: &FaultFs, n: u32) {
+    fs.on_nth("lock_sync_all", n, move |fs| {
+        fs.rename_replace(Path::new(LOCK), Path::new(&format!("/p/moved{n}"))).unwrap();
+        fs.write_file(LOCK, b"");
+        keep_moving_the_lock(fs, n + 1);
+    });
+}
+
+#[test]
+fn a_takeover_that_never_holds_gives_up_and_says_its_state_exists() {
+    let fs = fake();
+    let p = fs.destination_root(Path::new("/p")).unwrap();
+    dead_lock(&p, "dest.flux-lock", b"");
+    keep_moving_the_lock(&fs, 1);
+    let (r, _) = run_tree(&fs, &RunConfig { break_lock: true, ..restart() });
+    assert_eq!(refused(&r.stop), (LockCode::TargetLockBusy, true));
+    assert!(r.copy.is_none());
+    assert_eq!(manifest(&fs, ID).state, OpState::Created, "the state stays for a later --restart");
+}
