@@ -3,6 +3,7 @@
 //! returns text, and `main` writes it.
 
 use flux_core::copy::CopyError;
+use flux_core::run::{RunError, RunWarning};
 use flux_core::{TreeFailure, TreeFailureCause, TreeOutcome, WeakIdentityWarnings};
 use flux_fs::{Code, FileIdentity, MetadataFailure, MetadataItem, Outcome};
 use serde::Serialize;
@@ -212,11 +213,74 @@ pub fn summary_line(r: &Report, directories_created: u64) -> String {
     )
 }
 
+/// A run's stop (cut 7a), as stderr lines. A refusal is `CODE: detail` - the detail names the path and what to do next
+/// (the refusal-guidance table) - then one indented line per field of the holder's record where it was readable
+/// (§96.2), then what the run created and could not remove again. A failure of the run's own step is
+/// `CODE: <step> at <path>: <error>`.
+pub fn stop_lines(e: &RunError) -> Vec<String> {
+    match e {
+        RunError::Refused { refusal, not_removed, .. } => {
+            let mut v = vec![format!("{}: {}", refusal.code.as_str(), refusal.detail)];
+            if let Some(h) = &refusal.holder {
+                v.push(format!("  holder owner_instance_id: {}", h.owner_instance_id));
+                v.push(format!("  holder boot_session_id: {}", h.boot_session_id));
+                v.push(format!(
+                    "  holder last_heartbeat_wall_time: {}",
+                    h.last_heartbeat_wall_time
+                ));
+                v.push(format!("  holder workspace_path: {}", h.workspace_path));
+            }
+            if let Some((path, why)) = not_removed {
+                v.push(format!("  not removed: {} ({})", path.display(), why.source));
+            }
+            v
+        }
+        RunError::Failed { step, path, error } => vec![format!(
+            "{}: {} at {}: {}",
+            error.code.as_str(),
+            step.as_str(),
+            path.display(),
+            error.source
+        )],
+    }
+}
+
+/// One of a run's warnings (F6: never a failure), as one stderr line.
+pub fn run_warning_line(w: &RunWarning) -> String {
+    match w {
+        RunWarning::BrokenLeftover(p) => format!(
+            "warning: a dead run's lock was moved aside to {} and could not be deleted; remove it when no Flux run is active",
+            p.display()
+        ),
+        RunWarning::NotRemoved { path, error } => format!(
+            "warning: could not remove {} ({}); the copy itself is complete",
+            path.display(),
+            error.source
+        ),
+        RunWarning::StateKept(p) => format!(
+            "warning: a temporary this run could not remove keeps its state at {}, the record that names it",
+            p.display()
+        ),
+        RunWarning::PartialKept { path, error, kept } => format!(
+            "warning: could not delete the superseded partial {} ({}); its operation's state stays at {}",
+            path.display(),
+            error.source,
+            kept.display()
+        ),
+        RunWarning::OwnershipLostAfterCompletion(p) => format!(
+            "warning: the lock {} was taken over after this copy completed; it was left in place",
+            p.display()
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use flux_core::DegradedGroup;
     use flux_core::copy::CopyStep;
+    use flux_core::lock::{LockCode, Refusal};
+    use flux_core::run::{RunError, RunStep, RunWarning};
     use flux_fs::{FsError, ObjectId};
     use std::path::PathBuf;
 
@@ -403,5 +467,93 @@ mod tests {
             summary_line(&r, 0),
             "copied 0 files (0 bytes), created 0 directories; 1 failed, 0 skipped"
         );
+    }
+
+    fn holder() -> flux_core::lock::record::LockRecord {
+        flux_core::lock::record::LockRecord {
+            complete_lock_key: "k".to_string(),
+            operation_id: "1".repeat(32),
+            owner_instance_id: "2".repeat(32),
+            boot_session_id: "boot".to_string(),
+            target_path_key: "t".to_string(),
+            workspace_path: "operations/x".to_string(),
+            creation_wall_time: 5,
+            last_heartbeat_wall_time: 7,
+        }
+    }
+
+    #[test]
+    fn a_refusal_prints_its_code_and_detail_then_one_line_per_holder_field() {
+        let e = RunError::Refused {
+            refusal: Box::new(Refusal {
+                code: LockCode::TargetLockBusy,
+                holder: Some(holder()),
+                detail: "/p/d.flux-lock: another run holds the lock; wait for it to finish"
+                    .to_string(),
+            }),
+            changed: false,
+            not_removed: None,
+        };
+        assert_eq!(
+            stop_lines(&e),
+            vec![
+                "TARGET_LOCK_BUSY: /p/d.flux-lock: another run holds the lock; wait for it to finish".to_string(),
+                format!("  holder owner_instance_id: {}", "2".repeat(32)),
+                "  holder boot_session_id: boot".to_string(),
+                "  holder last_heartbeat_wall_time: 7".to_string(),
+                "  holder workspace_path: operations/x".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_refusal_names_what_it_could_not_remove_and_a_failure_names_its_step_and_path() {
+        let e = RunError::Refused {
+            refusal: Box::new(Refusal {
+                code: LockCode::StateCorrupt,
+                holder: None,
+                detail: "D/m: not JSON".to_string(),
+            }),
+            changed: true,
+            not_removed: Some((
+                PathBuf::from("P/d.flux-lock"),
+                FsError::new(Code::PermissionDenied, std::io::Error::other("denied")),
+            )),
+        };
+        assert_eq!(
+            stop_lines(&e),
+            vec![
+                "STATE_CORRUPT: D/m: not JSON".to_string(),
+                "  not removed: P/d.flux-lock (denied)".to_string()
+            ]
+        );
+        let f = RunError::Failed {
+            step: RunStep::State,
+            path: PathBuf::from("D/m"),
+            error: FsError::new(Code::DiskFull, std::io::Error::other("full")),
+        };
+        assert_eq!(
+            stop_lines(&f),
+            vec!["DISK_FULL: writing the operation's state at D/m: full".to_string()]
+        );
+    }
+
+    #[test]
+    fn every_run_warning_is_one_warning_line_naming_its_path() {
+        let io = || FsError::new(Code::IoError, std::io::Error::other("busy"));
+        let p = || PathBuf::from("X/the-path");
+        let all = [
+            RunWarning::BrokenLeftover(p()),
+            RunWarning::NotRemoved { path: p(), error: io() },
+            RunWarning::StateKept(p()),
+            RunWarning::PartialKept { path: p(), error: io(), kept: PathBuf::from("X/kept") },
+            RunWarning::OwnershipLostAfterCompletion(p()),
+        ];
+        for w in &all {
+            let line = run_warning_line(w);
+            assert!(line.starts_with("warning: ") && line.contains("the-path"), "{line}");
+            assert!(!line.contains('\n'), "{line}");
+        }
+        assert!(run_warning_line(&all[3]).contains("X/kept"));
     }
 }
