@@ -119,6 +119,16 @@ impl CopyError {
 // it. The three sites that legitimately use `?` all run BEFORE the temporary exists, and
 // say so explicitly.
 
+/// §99's check before a destination mutation (cut 7a Part 3b): `Ok` while the run still owns the destination's lock.
+/// The run's guard fails with `Code::TargetLockBusy`, and the copy then makes no further mutation. A copy that holds no
+/// lock passes `&unguarded`.
+pub type Guard<'g> = dyn Fn() -> flux_fs::Result<()> + 'g;
+
+/// The guard of a copy that holds no lock.
+pub(crate) fn unguarded() -> flux_fs::Result<()> {
+    Ok(())
+}
+
 /// Remove the temporary after a failure and build the error to return.
 ///
 /// The removal is never discarded: if the temporary survives, its path goes into the
@@ -134,7 +144,17 @@ fn discard<D: DirHandle>(
     step: CopyStep,
     code: Code,
     source: std::io::Error,
+    guard: &Guard<'_>,
 ) -> CopyError {
+    // §99: an unlink is a mutation too (spec:4858-4870). Without the lock the temporary stays, reported as a
+    // leftover, with the guard's failure as the reason it was kept.
+    if let Err(lost) = guard() {
+        return CopyError {
+            cause: FsError::new(code, source),
+            leftover: Some((std::path::PathBuf::from(temp), lost.source)),
+            step,
+        };
+    }
     match parent.remove_file(temp) {
         Ok(()) => CopyError::at(step, FsError::new(code, source)),
         // NotFound means it is already gone -- something else removed it, or it was
@@ -317,11 +337,8 @@ pub fn copy_file<F: DestinationRoot>(
     })
 }
 
-/// Copy `src` to `name` inside `parent`, writing ONLY through `parent`.
-///
-/// Nothing below re-resolves a destination path: the staging temporary, the
-/// metadata, the publish and the cleanup all go through the handle, so a parent
-/// swapped for a link after it was opened cannot redirect the write (item 114).
+/// Copy `src` to `name` inside `parent`, writing ONLY through `parent`, holding no lock: `copy_file_guarded` with a
+/// guard that always passes.
 pub fn copy_file_at<F: DestinationRoot>(
     fs: &F,
     src: &Path,
@@ -329,12 +346,34 @@ pub fn copy_file_at<F: DestinationRoot>(
     name: &OsStr,
     opts: &CopyOptions,
 ) -> std::result::Result<Outcome, CopyError> {
+    copy_file_guarded(fs, src, parent, name, opts, &unguarded)
+}
+
+/// Copy `src` to `name` inside `parent`, writing ONLY through `parent`.
+///
+/// Nothing below re-resolves a destination path: the staging temporary, the
+/// metadata, the publish and the cleanup all go through the handle, so a parent
+/// swapped for a link after it was opened cannot redirect the write (item 114).
+///
+/// `guard` runs before every destination mutation - the step-1 sweep, the exclusive create, the publishing rename and a
+/// failed copy's removal of its temporary - which is §99's `S99_check` before each `S99_write` (cut 7a Part 3b). A
+/// failed guard stops the copy at that point: before the create it creates nothing, and at the publish or a removal
+/// the temporary stays, reported as `leftover`.
+pub fn copy_file_guarded<F: DestinationRoot>(
+    fs: &F,
+    src: &Path,
+    parent: &F::Dir,
+    name: &OsStr,
+    opts: &CopyOptions,
+    guard: &Guard<'_>,
+) -> std::result::Result<Outcome, CopyError> {
     let temp = temp_name(name, &opts.operation_id);
 
     // 1. this invocation's own leftover, if any (§18.1). A no-op in practice: the
     //    operation id is generated per invocation and never persisted, so nothing from
     //    an earlier run carries this name. It stays because §18.1 asks the id to be
     //    "deterministic enough for discovery", and a derivable id makes this live.
+    guard().map_err(|e| CopyError::at(CopyStep::Create, e))?;
     let _ = parent.remove_file(&temp);
 
     // 2. source, captured for the step-7 re-check
@@ -356,6 +395,8 @@ pub fn copy_file_at<F: DestinationRoot>(
     // 3. exclusive create (FS-1)
     // Still safe: if this FAILS, this call is precisely what did not create the
     // temporary, so there is nothing of ours on disk.
+    // §99 before the temporary exists: a failure here has created nothing.
+    guard().map_err(|e| CopyError::at(CopyStep::Create, e))?;
     let mut writer = parent.create_new(&temp).map_err(|e| CopyError::at(CopyStep::Create, e))?;
 
     // 4. stream
@@ -365,10 +406,12 @@ pub fn copy_file_at<F: DestinationRoot>(
         let n = match std::io::Read::read(&mut reader, &mut buf) {
             Ok(0) => break,
             Ok(n) => n,
-            Err(e) => return Err(discard(parent, &temp, CopyStep::Stream, copy_code(&e), e)),
+            Err(e) => {
+                return Err(discard(parent, &temp, CopyStep::Stream, copy_code(&e), e, guard));
+            }
         };
         if let Err(e) = writer.write_all(&buf[..n]) {
-            return Err(discard(parent, &temp, CopyStep::Stream, copy_code(&e), e));
+            return Err(discard(parent, &temp, CopyStep::Stream, copy_code(&e), e, guard));
         }
         bytes_copied += n as u64;
     }
@@ -383,6 +426,7 @@ pub fn copy_file_at<F: DestinationRoot>(
             CopyStep::Durability,
             Code::StrictDurabilityUnavailable,
             e.source,
+            guard,
         ));
     }
 
@@ -399,6 +443,7 @@ pub fn copy_file_at<F: DestinationRoot>(
                 CopyStep::Metadata,
                 Code::MetadataApplyFailed,
                 e.source,
+                guard,
             ));
         }
         metadata_failures.push(MetadataFailure { item: MetadataItem::Times, error: e });
@@ -414,6 +459,7 @@ pub fn copy_file_at<F: DestinationRoot>(
                 CopyStep::Metadata,
                 Code::MetadataApplyFailed,
                 e.source,
+                guard,
             ));
         }
         metadata_failures.push(MetadataFailure { item: MetadataItem::Permissions, error: e });
@@ -429,15 +475,33 @@ pub fn copy_file_at<F: DestinationRoot>(
         // failures.
         Err(e) if e.source.kind() == std::io::ErrorKind::NotFound => {
             let gone = std::io::Error::other("source disappeared during the copy");
-            return Err(discard(parent, &temp, CopyStep::Recheck, Code::SourceChanged, gone));
+            return Err(discard(
+                parent,
+                &temp,
+                CopyStep::Recheck,
+                Code::SourceChanged,
+                gone,
+                guard,
+            ));
         }
-        Err(e) => return Err(discard(parent, &temp, CopyStep::Recheck, e.code, e.source)),
+        Err(e) => return Err(discard(parent, &temp, CopyStep::Recheck, e.code, e.source, guard)),
     };
     if now.len != src_meta.len || now.modified != src_meta.modified {
         let changed = std::io::Error::other("source changed");
-        return Err(discard(parent, &temp, CopyStep::Recheck, Code::SourceChanged, changed));
+        return Err(discard(parent, &temp, CopyStep::Recheck, Code::SourceChanged, changed, guard));
     }
 
+    // §99 (`S99_check`, then the `S99_write` below): publish only while the lock is still this run's. Otherwise the
+    // temporary stays - removing it would be a mutation too - and is reported as the leftover.
+    if let Err(lost) = guard() {
+        return Err(CopyError {
+            leftover: Some((
+                std::path::PathBuf::from(&temp),
+                std::io::Error::other("kept: this run no longer holds the destination's lock"),
+            )),
+            ..CopyError::at(CopyStep::Publish, lost)
+        });
+    }
     let published = match opts.publish {
         Publish::Replace => parent.rename_replace(&temp, parent, name),
         Publish::NoReplace => parent.rename_no_replace(&temp, parent, name),
@@ -446,7 +510,7 @@ pub fn copy_file_at<F: DestinationRoot>(
         // Keep whatever the platform layer mapped. A publish failure is NOT the content
         // copy -- that already succeeded -- so it must not be relabelled COPY_FAILED,
         // and an unclassified one stays IO_ERROR, the declared catch-all.
-        return Err(discard(parent, &temp, CopyStep::Publish, e.code, e.source));
+        return Err(discard(parent, &temp, CopyStep::Publish, e.code, e.source, guard));
     }
 
     // A successful rename consumed the temporary; there is nothing left to remove.
@@ -1242,5 +1306,74 @@ mod tests {
         fs.write_file("/dst", b"old");
         copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap();
         assert_eq!(fs.read_file("/dst").as_deref(), Some(&b"new"[..]));
+    }
+
+    fn lost() -> flux_fs::Result<()> {
+        Err(FsError::new(Code::TargetLockBusy, std::io::Error::other("lost")))
+    }
+
+    /// A guard that passes its first `owned` calls and fails every one after, counting them.
+    fn guard_failing_after(
+        owned: u32,
+        calls: &std::cell::Cell<u32>,
+    ) -> impl Fn() -> flux_fs::Result<()> + '_ {
+        move || {
+            calls.set(calls.get() + 1);
+            if calls.get() <= owned { Ok(()) } else { lost() }
+        }
+    }
+
+    #[test]
+    fn a_guard_that_fails_first_stops_the_copy_before_anything_is_touched() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        let root = fs.destination_root(Path::new("/")).unwrap();
+        let e = copy_file_guarded(&fs, Path::new("/src"), &root, OsStr::new("dst"), &opts(), &lost)
+            .unwrap_err();
+        assert_eq!((e.code(), e.step), (Code::TargetLockBusy, CopyStep::Create));
+        assert!(!fs.called("remove_file") && !fs.called("create_new"), "{:?}", fs.calls());
+        assert!(!fs.exists("/dst"));
+    }
+
+    #[test]
+    fn a_guard_that_fails_at_the_publish_keeps_the_temporary_and_never_renames() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        let root = fs.destination_root(Path::new("/")).unwrap();
+        let calls = std::cell::Cell::new(0);
+        // Owned for the step-1 sweep and the create (calls 1 and 2), lost at the publish (call 3).
+        let guard = guard_failing_after(2, &calls);
+        let e =
+            copy_file_guarded(&fs, Path::new("/src"), &root, OsStr::new("dst"), &opts(), &guard)
+                .unwrap_err();
+        assert_eq!((e.code(), e.step), (Code::TargetLockBusy, CopyStep::Publish));
+        assert_eq!(calls.get(), 3);
+        assert!(!fs.exists("/dst"), "never published");
+        assert!(
+            fs.exists("/dst.flux-partial.op1"),
+            "an unlink is a mutation too: the temporary stays"
+        );
+        let (left, _) = e.leftover.as_ref().expect("the kept temporary is reported");
+        assert_eq!(left, Path::new("dst.flux-partial.op1"));
+        assert!(!fs.called("rename_"), "{:?}", fs.calls());
+    }
+
+    #[test]
+    fn a_guard_that_fails_before_a_discard_keeps_the_temporary_as_a_leftover() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.fail_write(std::io::Error::other("injected write"));
+        let root = fs.destination_root(Path::new("/")).unwrap();
+        let calls = std::cell::Cell::new(0);
+        // Owned for the sweep and the create; lost when the failed copy would remove its temporary (call 3).
+        let guard = guard_failing_after(2, &calls);
+        let e =
+            copy_file_guarded(&fs, Path::new("/src"), &root, OsStr::new("dst"), &opts(), &guard)
+                .unwrap_err();
+        assert_eq!(e.step, CopyStep::Stream);
+        assert!(e.leftover.is_some(), "the kept temporary is reported");
+        assert!(fs.exists("/dst.flux-partial.op1"));
+        let removals = fs.calls().iter().filter(|c| c.starts_with("remove_file(")).count();
+        assert_eq!(removals, 1, "only the step-1 sweep, never the discard: {:?}", fs.calls());
     }
 }
