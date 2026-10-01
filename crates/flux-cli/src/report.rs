@@ -630,13 +630,21 @@ mod tests {
         assert_eq!(clean.errors, 0);
         let stopped = Report::tree_run(&run(Some(Ok(TreeOutcome::default())), Some(refused())), 1);
         assert_eq!(stopped.errors, 1, "a stop after the copy is an error");
+        let mut one_failed = TreeOutcome::default();
+        one_failed.failures.copy = 1;
+        let both = Report::tree_run(&run(Some(Ok(one_failed)), Some(refused())), 1);
+        assert_eq!(both.errors, 2, "a stop adds to the copy's own errors");
+        // An abort after one streamed failure: the failure, the abort and the stop are each an error.
         let aborted = || {
             let cause = FsError::new(Code::SafetyRejected, std::io::Error::other("x"));
             let error = CopyError { cause, leftover: None, step: CopyStep::Resolve };
-            Some(Err(TreeAbort { error, outcome: TreeOutcome::default() }))
+            let mut outcome = TreeOutcome::default();
+            outcome.failures.copy = 1;
+            Some(Err(TreeAbort { error, outcome }))
         };
-        assert_eq!(Report::tree_run(&run(aborted(), None), 1).errors, 1, "the abort is an error");
-        assert_eq!(Report::tree_run(&run(aborted(), Some(refused())), 1).errors, 2);
+        let abort = Report::tree_run(&run(aborted(), None), 1);
+        assert_eq!((abort.errors, abort.files_failed), (2, 1), "the abort's own counts are kept");
+        assert_eq!(Report::tree_run(&run(aborted(), Some(refused())), 1).errors, 3);
         let before = Report::tree_run(&run(None, Some(refused())), 1);
         assert_eq!((before.errors, before.files_total), (1, 0), "a stop before the copy");
     }
@@ -649,6 +657,16 @@ mod tests {
         };
         assert_eq!(Report::file_run(&run(Some(copied()), None), false, 1).errors, 0);
         assert_eq!(Report::file_run(&run(Some(copied()), Some(refused())), false, 1).errors, 1);
+        let failed = || {
+            let cause = FsError::new(Code::IoError, std::io::Error::other("x"));
+            Err(CopyError { cause, leftover: None, step: CopyStep::Resolve })
+        };
+        let both = Report::file_run(&run(Some(failed()), Some(refused())), false, 1);
+        assert_eq!(
+            (both.errors, both.files_failed),
+            (2, 1),
+            "a failed copy and a stop are two errors"
+        );
         let before = Report::file_run(&run(None, Some(refused())), false, 1);
         assert_eq!((before.errors, before.files_total), (1, 0), "a stop before the copy");
     }
