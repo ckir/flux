@@ -40,6 +40,12 @@ pub enum Code {
     /// meets - inside a tree, or given as SOURCE - with this code (cut 5, K5 and K7).
     SymlinkCreationUnavailable,
     IoError,
+    /// §96, §99 (cut 7a). The destination's target lock belongs to another run, or this run lost it mid-run (a failed
+    /// `still_owned`). The engine raises it from its guard and stops the whole operation, never one file.
+    TargetLockBusy,
+    /// §259.3 (cut 7a). A source entry whose destination is a reserved Flux control path - `DEST/.flux/operations`,
+    /// `standalone` or `atomic`, or below one. Path-scoped: that entry fails, and the rest of the copy continues.
+    ControlPlaneNamespaceConflict,
 }
 
 impl Code {
@@ -59,6 +65,8 @@ impl Code {
             Code::DestinationError => "DESTINATION_ERROR",
             Code::SymlinkCreationUnavailable => "SYMLINK_CREATION_UNAVAILABLE",
             Code::IoError => "IO_ERROR",
+            Code::TargetLockBusy => "TARGET_LOCK_BUSY",
+            Code::ControlPlaneNamespaceConflict => "CONTROL_PLANE_NAMESPACE_CONFLICT",
         }
     }
 }
@@ -125,6 +133,11 @@ mod tests {
         assert_eq!(Code::DestinationNamespaceCollision.as_str(), "DESTINATION_NAMESPACE_COLLISION");
         assert_eq!(Code::DestinationError.as_str(), "DESTINATION_ERROR");
         assert_eq!(Code::SymlinkCreationUnavailable.as_str(), "SYMLINK_CREATION_UNAVAILABLE");
+        assert_eq!(Code::TargetLockBusy.as_str(), "TARGET_LOCK_BUSY");
+        assert_eq!(
+            Code::ControlPlaneNamespaceConflict.as_str(),
+            "CONTROL_PLANE_NAMESPACE_CONFLICT"
+        );
     }
 
     #[test]
