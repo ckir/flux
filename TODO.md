@@ -140,13 +140,16 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
   Found by the PR 1 capstone widening its lens beyond that PR's range. Not fixed there because the
   function is PR #32's code and untouched by PR 1.
 
-- [ ] **A leftover temporary from a PREVIOUS run is never removed**
+- [x] **A leftover temporary from a PREVIOUS run is never removed**
 
   `<target>.flux-partial.<operation-id>` is named with a per-invocation id (the pid), so the leftover
   sweep only ever removes this invocation's own temporary — which, with an id that is never persisted,
   means it removes nothing at all. §18.1 wants an id "deterministic enough for discovery"; that needs
   operation state to record it, which this cut does not have. A crashed run therefore leaves a
   temporary that nothing collects.
+
+  DONE in cut 7a: each operation's id is persisted in its state, and `flux copy --restart` deletes every
+  `<name>.flux-partial.<id>` of the operation it supersedes (the design's `--restart`, step 3).
 
 - [ ] **`flux copy` cannot ask for `Preserve::Off`**
 
@@ -183,6 +186,9 @@ Each was measured, and each is deliberately NOT fixed in that PR.
       unless the OS reuses that pid against the same target — reachable, but narrower
       than stated; it becomes live more broadly once §18.1 gives operations a
       persisted, derivable id.)
+      (Cut 7a: the operation id is now persisted and per operation, so a blocking temporary names an operation
+      whose state finds it; but the copy still returns `leftover: None` in this case, so the reporting gap stays
+      open.)
 - [ ] **The read-only guard cannot be atomic.** `rename_replace` checks whether this
       process may replace the destination and then renames; a permission change landing
       in between is not seen, and `rename` is precisely what does not consult the file.
@@ -351,10 +357,12 @@ against spec V16.
       `GetFileInformationByHandleEx`, `crates/flux-platform/src/std_fs.rs:749-774`. What remains is the spec
       text: §107 and §109.1 in `FLUX_FULL_UPDATED_SPEC_V16.md` still give only the `Strong`/`Weak`/`Unavailable`
       strength classes and name neither `FILE_ID_INFO` nor `GetFileInformationByHandleEx`.)
-- [ ] **WSL 9p mounts break two lock assumptions.** On `/mnt/c` (v9fs), `renameat2(RENAME_NOREPLACE)` onto a free
+- [x] **WSL 9p mounts break two lock assumptions.** On `/mnt/c` (v9fs), `renameat2(RENAME_NOREPLACE)` onto a free
       name fails with `EINVAL`, and a file renamed while open is listed but cannot be `stat`ed until the handle
       closes. Lock-capability detection (§96.1, §99) must treat such a mount as lacking both, and fall back to the
       directory lock or refuse.
+      DONE in cut 7a: 9p is not on the lock-capability allowlist, so a copy onto such a mount is refused
+      `REMOTE_LOCK_UNSAFE` before anything is created.
 
 ## Lock-model follow-ups
 

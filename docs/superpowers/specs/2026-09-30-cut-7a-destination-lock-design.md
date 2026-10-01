@@ -446,8 +446,8 @@ The plan cites these entries step by step.
 **Closes:**
 - "A leftover temporary from a PREVIOUS run is never removed": `--restart` deletes a superseded operation's partials,
   found through its state.
-- "A blocking pre-existing temporary is not reported": the id is persisted, so a blocking temporary names its
-  operation.
+- Not closed: "A blocking pre-existing temporary is not reported". The id is persisted, so such a temporary names its
+  operation, but the copy still reports no leftover in that case (`TODO.md`).
 - "WSL 9p mounts break two lock assumptions": 9p is not on the allowlist, so it is refused `REMOTE_LOCK_UNSAFE`.
 - The manifest half of "Persistent state format", for version 1 (7b extends it).
 
