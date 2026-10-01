@@ -2,17 +2,19 @@
 //! `DEST/.flux/operations/<id>/manifest` and its lock is beside DEST; a single file's state is the record
 //! `<target>.flux-state.<id>` beside the target, with its lock.
 
-use super::session::{failed, from_lock};
-use super::{RunError, RunStep};
+use super::session::{Fault, failed, from_lock, owned};
+use super::{RunError, RunStep, RunWarning};
 use crate::copy::{CopyError, CopyStep, split_destination};
-use crate::lock::LockResult;
-use crate::prior::{Scan, scan_tree};
+use crate::lock::{Held, LockResult};
+use crate::prior::{PriorOp, Scan, scan_tree};
 use crate::state::{
-    FLUX_DIR, Kind, MANIFEST, OPERATIONS_DIR, OperationState, create_workspace, operations_dir,
-    remove_empty_control_dirs, retire_workspace, write_state,
+    FLUX_DIR, Kind, MANIFEST, OPERATIONS_DIR, OperationState, PARTIAL_INFIX, create_workspace,
+    id_after, operations_dir, remove_empty_control_dirs, retire_workspace, write_state,
 };
-use crate::tree::{WeakIdentityWarnings, preflight};
+use crate::tree::{WeakIdentityWarnings, preflight, reserved_path};
+use crate::walk::{WalkEvent, walk};
 use flux_fs::{Code, DestinationRoot, DirHandle, FileIdentity, FileType, FsError, Safety};
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -35,6 +37,15 @@ pub(crate) trait Place<D: DirHandle> {
     fn create(&mut self, state: &OperationState) -> Result<(), RunError>;
     /// Rewrite `state` where its operation's state lives: this run's, or a prior's under `--restart`.
     fn write(&self, state: &OperationState) -> flux_fs::Result<()>;
+    /// `--restart`: delete the superseded operations' partials, `still_owned` before each deletion. Returns the ids
+    /// whose partials are all gone; a partial that stays keeps its operation's ABANDONED state as its record (J1).
+    fn sweep(
+        &self,
+        priors: &[PriorOp],
+        held: &Held<'_, D>,
+        lock_shown: &Path,
+        warnings: &mut Vec<RunWarning>,
+    ) -> Result<Vec<String>, Fault>;
     /// Remove operation `id`'s state: a workspace, retired first (decision 17), or a record and its temporary.
     fn remove(&self, id: &str) -> Result<(), (PathBuf, FsError)>;
     /// Finish step 4: the empty control directories; on a `rollback` (Q-I), also a DEST this run made.
@@ -108,7 +119,6 @@ pub(crate) fn locate_tree<F: DestinationRoot>(
 
 /// A tree's DEST: its parent holds the lock, and its state lives under `DEST/.flux/operations/`.
 pub(crate) struct TreePlace<'p, F: DestinationRoot> {
-    #[allow(dead_code)] // read by the --restart sweep (Task 8)
     pub(crate) fs: &'p F,
     /// DEST's parent, which holds the lock - or DEST itself, for a filesystem root.
     pub(crate) holder: &'p F::Dir,
@@ -196,6 +206,73 @@ impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {
         write_state(&workspace, OsStr::new(MANIFEST), state)
     }
 
+    fn sweep(
+        &self,
+        priors: &[PriorOp],
+        held: &Held<'_, F::Dir>,
+        lock_shown: &Path,
+        warnings: &mut Vec<RunWarning>,
+    ) -> Result<Vec<String>, Fault> {
+        let ids: BTreeSet<&str> = priors.iter().map(|p| p.state.operation_id.as_str()).collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dest = self.dest.as_ref().expect("DEST exists once this run's state does");
+        let operations = self.operations_shown();
+        let mut kept: BTreeSet<&str> = BTreeSet::new();
+        // J1: every `<name>.flux-partial.<prior-id>` under DEST, found by a walk of DEST by path that skips the
+        // reserved control directories, and deleted through handles opened from DEST's own, one component at a time.
+        let events = match walk(self.fs, &self.dest_shown) {
+            Ok(events) => events,
+            Err(error) => {
+                warnings.push(RunWarning::PartialKept {
+                    path: self.dest_shown.clone(),
+                    error,
+                    kept: operations,
+                });
+                return Ok(Vec::new());
+            }
+        };
+        for item in events {
+            let path = match item {
+                Ok(WalkEvent::File { path }) => path,
+                Ok(_) => continue,
+                // A directory the sweep cannot read may hold a partial: every prior's state stays as its record.
+                Err(e) => {
+                    let path = self.dest_shown.join(&e.path);
+                    warnings.push(RunWarning::PartialKept {
+                        path,
+                        error: e.cause,
+                        kept: operations.clone(),
+                    });
+                    kept.extend(ids.iter().copied());
+                    continue;
+                }
+            };
+            if reserved_path(&path) {
+                continue;
+            }
+            let Some(prior) = path
+                .file_name()
+                .and_then(|n| id_after(n, PARTIAL_INFIX))
+                .and_then(|i| ids.get(i).copied())
+            else {
+                continue;
+            };
+            owned(held, lock_shown)?;
+            if let Err(error) = remove_below(dest, &path) {
+                let shown = self.dest_shown.join(&path);
+                warnings.push(RunWarning::PartialKept {
+                    path: shown,
+                    error,
+                    kept: self.shown(prior),
+                });
+                kept.insert(prior);
+            }
+        }
+        Ok(ids.difference(&kept).map(|i| (*i).to_string()).collect())
+    }
+
     fn remove(&self, id: &str) -> Result<(), (PathBuf, FsError)> {
         retire_workspace(self.operations(), id).map_err(|e| (self.operations_shown().join(id), e))
     }
@@ -213,4 +290,17 @@ impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {
         }
         Ok(())
     }
+}
+
+/// Remove the file at `rel` below `dest` through handles opened one component at a time, so no link is followed
+/// (§149.7; J1).
+fn remove_below<D: DirHandle>(dest: &D, rel: &Path) -> flux_fs::Result<()> {
+    let mut parts: Vec<&OsStr> = rel.iter().collect();
+    let name = parts.pop().expect("a walk path ends in a name");
+    let mut opened: Option<D> = None;
+    for part in parts {
+        let next = opened.as_ref().unwrap_or(dest).open_dir(part)?;
+        opened = Some(next);
+    }
+    opened.as_ref().unwrap_or(dest).remove_file(name)
 }

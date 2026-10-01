@@ -366,3 +366,76 @@ fn a_dead_owners_lock_left_beside_the_new_one_is_a_warning() {
     );
     assert!(broken, "{:?}", r.warnings);
 }
+
+#[test]
+fn restart_supersedes_a_prior_deleting_its_partials_then_its_workspace() {
+    let fs = fake();
+    prior(&fs, 5, OpState::Failed);
+    let partial = format!("/p/dest/old.flux-partial.{}", id(5));
+    fs.write_file(&partial, b"half");
+    let other = format!("/p/dest/other.flux-partial.{}", id(6));
+    fs.write_file(&other, b"not a superseded operation's");
+    let (r, _) = run_tree(&fs, &restart());
+    ok(&r);
+    assert!(!fs.exists(&partial), "the superseded operation's partial is deleted");
+    assert!(fs.exists(&other), "only a superseded operation's partials");
+    assert!(!fs.exists(format!("/p/dest/.flux/operations/{}", id(5))), "and then its workspace");
+    let c = calls(&fs);
+    let record = at(&c, "write_at_start(");
+    let abandon =
+        at(&c, &format!("rename_replace(/p/dest/.flux/operations/{}/manifest.tmp", id(5)));
+    let delete = at(&c, &format!("remove_file({partial})"));
+    let retire = at(&c, &format!("rename_no_replace(/p/dest/.flux/operations/{} ", id(5)));
+    assert!(record < abandon && abandon < delete && delete < retire, "Q-H (a): {c:?}");
+}
+
+#[test]
+fn a_partial_restart_cannot_delete_keeps_its_prior_abandoned() {
+    let fs = fake();
+    prior(&fs, 5, OpState::Failed);
+    let partial = format!("/p/dest/old.flux-partial.{}", id(5));
+    fs.write_file(&partial, b"half");
+    // `remove_file`: this run's CREATED and the prior's ABANDONED state writes clear their temporaries (1, 2); then
+    // the partial (3).
+    fs.fail_nth("remove_file", 3, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let (r, _) = run_tree(&fs, &restart());
+    ok(&r);
+    let c = calls(&fs);
+    let removals: Vec<&String> = c.iter().filter(|x| x.starts_with("remove_file(")).collect();
+    assert!(
+        removals[2].contains("old.flux-partial"),
+        "the 3rd removal is the partial: {removals:?}"
+    );
+    assert!(fs.exists(&partial));
+    let kept = manifest(&fs, &id(5));
+    assert_eq!((kept.state, kept.superseded_by.as_deref()), (OpState::Abandoned, Some(ID)));
+    assert!(
+        r.warnings.iter().any(|w| matches!(w, RunWarning::PartialKept { .. })),
+        "{:?}",
+        r.warnings
+    );
+}
+
+#[test]
+fn restart_with_nothing_to_supersede_is_a_plain_run() {
+    let fs = fake();
+    let (r, _) = run_tree(&fs, &restart());
+    ok(&r);
+    assert!(!fs.exists("/p/dest/.flux") && !fs.exists(LOCK));
+}
+
+#[test]
+fn restart_stops_when_ownership_is_lost_and_deletes_nothing_after() {
+    let fs = fake();
+    prior(&fs, 5, OpState::Failed);
+    let partial = format!("/p/dest/old.flux-partial.{}", id(5));
+    fs.write_file(&partial, b"half");
+    // `rename_replace`: this run's CREATED manifest (1), then the prior's ABANDONED one (2): just before it, the
+    // lock is taken over.
+    fs.on_nth("rename_replace", 2, |fs| fs.write_file(LOCK, b"another run's bytes"));
+    let (r, _) = run_tree(&fs, &restart());
+    assert_eq!(refused(&r.stop), (LockCode::TargetLockBusy, true));
+    assert!(r.copy.is_none());
+    assert!(fs.exists(&partial), "§99 failed: nothing more is deleted");
+    assert_eq!(fs.read_file(LOCK).as_deref(), Some(&b"another run's bytes"[..]), "never unlinked");
+}

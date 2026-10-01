@@ -9,6 +9,7 @@
 //! change it.
 
 mod place;
+mod restart;
 mod session;
 #[cfg(test)]
 mod tests;

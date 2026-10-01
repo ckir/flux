@@ -2,6 +2,7 @@
 //! errors as the run's.
 
 use super::place::Place;
+use super::restart::supersede;
 use super::{RunConfig, RunError, RunStep, RunWarning, stop_after_record};
 use crate::lock::record::LockRecord;
 use crate::lock::{
@@ -50,9 +51,9 @@ pub(crate) fn open_operation<'a, D: DirHandle, P: Place<D>>(
         // Step 3.
         let obtained = obtain(site, capability, mode, id)
             .map_err(|e| from_lock(e, RunStep::Lock, &lock_shown, made.is_some()))?;
-        // Step 4. (Task 8 binds the resumable operations for `--restart`.)
-        match place.scan(id) {
-            Ok(scan) if scan.resumable.is_empty() || cfg.restart => {}
+        // Step 4.
+        let priors = match place.scan(id) {
+            Ok(scan) if scan.resumable.is_empty() || cfg.restart => scan.resumable,
             Ok(scan) => {
                 let refused = resumable_refusal(&scan.resumable[0]);
                 let error =
@@ -63,7 +64,7 @@ pub(crate) fn open_operation<'a, D: DirHandle, P: Place<D>>(
                 let error = from_lock(e, RunStep::Inspect, place.destination(), made.is_some());
                 return Err(give_back(obtained, error, &lock_shown));
             }
-        }
+        };
         // Step 5 (F5): the state first.
         if made.is_none() {
             let state =
@@ -112,6 +113,16 @@ pub(crate) fn open_operation<'a, D: DirHandle, P: Place<D>>(
                 Err(e) => return Err(from_lock(e, RunStep::Record, &lock_shown, true)),
             },
         };
+        // Q-H (a): `--restart` supersedes, with this operation's state and record already written. When §99 fails
+        // there, `locked` drops without unlinking (`S21_1_s3_refuse_close`).
+        if let Err(fault) = supersede(place, &locked, &priors, warnings) {
+            return Err(match fault {
+                Fault::Lost => lost(),
+                Fault::Io(path, error) => {
+                    stop_after_record(place, locked, RunStep::Restart, path, error)
+                }
+            });
+        }
         // The last write of step 5: TRANSFERRING, under §99.
         if let Err(fault) = owned(&locked.held, &locked.lock_shown) {
             return Err(fault.into_error(RunStep::State));
