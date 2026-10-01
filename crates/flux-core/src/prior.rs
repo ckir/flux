@@ -384,6 +384,82 @@ mod tests {
         );
     }
 
+    fn rec(target: &OsStr, n: u8) -> PathBuf {
+        Path::new("/p/dest").join(record_name(target, &id(n)))
+    }
+
+    #[test]
+    fn a_single_files_record_naming_another_operation_or_written_by_a_newer_flux_is_refused() {
+        let t = OsStr::new("t");
+        for (bytes, code) in [
+            (state(3, Kind::File, OpState::Created).encode(), LockCode::StateCorrupt),
+            (br#"{"format_version":2}"#.to_vec(), LockCode::IncompatibleState),
+        ] {
+            let (fs, d) = dest();
+            fs.write_file(rec(t, 4), &bytes);
+            let r = refusal(scan_file(&d, t, Path::new("P"), &id(0)));
+            assert_eq!(r.code, code, "{}", r.detail);
+            assert!(r.detail.contains(&id(4)), "{}", r.detail);
+        }
+    }
+
+    #[test]
+    fn what_changes_after_the_listing_is_passed_over() {
+        // Decision 9: a workspace that is no longer a directory when it is opened.
+        let (fs, d) = dest();
+        operations(&fs);
+        workspace(&fs, 1, Some(&state(1, Kind::Tree, OpState::Created).encode()));
+        workspace(&fs, 2, Some(&state(2, Kind::Tree, OpState::Created).encode()));
+        fs.set_type(format!("{OPS}/{}", id(2)), FileType::File);
+        assert_eq!(ids(&scan(&d, 0).unwrap()), vec![id(1)]);
+
+        // A record its own finishing run removed between the listing and the read.
+        let (fs, d) = dest();
+        let t = OsStr::new("t");
+        for n in [1, 2] {
+            fs.write_file(rec(t, n), &state(n, Kind::File, OpState::Created).encode());
+        }
+        let gone = rec(t, 1);
+        fs.on_nth("read_file", 1, move |fs| fs.remove_file(&gone).unwrap());
+        assert_eq!(ids(&scan_file(&d, t, Path::new("P"), &id(0)).unwrap()), vec![id(2)]);
+    }
+
+    #[test]
+    fn a_manifest_that_is_not_a_regular_file_is_state_corrupt() {
+        for link in [false, true] {
+            let (fs, d) = dest();
+            operations(&fs);
+            workspace(&fs, 1, None);
+            let manifest = format!("{OPS}/{}/manifest", id(1));
+            if link {
+                fs.add_symlink(&manifest);
+            } else {
+                fs.create_dir(Path::new(&manifest)).unwrap();
+            }
+            let r = refusal(scan(&d, 0));
+            assert_eq!(r.code, LockCode::StateCorrupt, "link {link}: {}", r.detail);
+            assert!(r.detail.contains("not a regular file"), "link {link}: {}", r.detail);
+        }
+    }
+
+    #[test]
+    fn a_non_utf8_targets_records_are_found() {
+        #[cfg(unix)]
+        let target = {
+            use std::os::unix::ffi::OsStrExt;
+            OsStr::from_bytes(b"t\xff").to_os_string()
+        };
+        #[cfg(windows)]
+        let target = {
+            use std::os::windows::ffi::OsStringExt;
+            std::ffi::OsString::from_wide(&[u16::from(b't'), 0xD800])
+        };
+        assert!(target.to_str().is_none());
+        let (fs, d) = dest();
+        fs.write_file(rec(&target, 1), &state(1, Kind::File, OpState::Created).encode());
+        assert_eq!(ids(&scan_file(&d, &target, Path::new("P"), &id(0)).unwrap()), vec![id(1)]);
+    }
+
     #[test]
     fn a_resumable_refusal_names_the_operation_and_the_way_out() {
         let op = PriorOp {

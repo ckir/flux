@@ -405,12 +405,12 @@ mod tests {
         let mut v: serde_json::Value = serde_json::from_slice(&created().encode()).unwrap();
         v["extra"] = serde_json::json!(true);
         assert!(
-            matches!(decode(v.to_string().as_bytes()), Err(Unusable::Corrupt(w)) if w.contains("extra"))
+            matches!(decode(v.to_string().as_bytes()), Err(Unusable::Corrupt(w)) if w == "unknown key extra")
         );
         let mut v: serde_json::Value = serde_json::from_slice(&created().encode()).unwrap();
         v.as_object_mut().unwrap().remove("superseded_by");
         assert!(
-            matches!(decode(v.to_string().as_bytes()), Err(Unusable::Corrupt(w)) if w.contains("superseded_by"))
+            matches!(decode(v.to_string().as_bytes()), Err(Unusable::Corrupt(w)) if w == "missing key superseded_by")
         );
     }
 

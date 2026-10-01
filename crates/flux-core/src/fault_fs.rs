@@ -2036,6 +2036,25 @@ mod tests {
     }
 
     #[test]
+    fn a_fake_directory_rename_carries_types_permissions_and_times() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/p")).unwrap();
+        let d = fs.destination_root(Path::new("/p")).unwrap();
+        drop(d.create_dir(OsStr::new("w.creating")).unwrap());
+        fs.add_symlink("/p/w.creating/link");
+        fs.write_file("/p/w.creating/f", b"f");
+        fs.set_file_perms("/p/w.creating/f", Perms::UnixMode(0o600));
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(7);
+        let w = fs.create_new(Path::new("/p/w.creating/timed")).unwrap();
+        fs.set_times(&w, Some(t)).unwrap();
+        drop(w);
+        d.rename_no_replace(OsStr::new("w.creating"), &d, OsStr::new("w")).unwrap();
+        assert_eq!(fs.metadata(Path::new("/p/w/link")).unwrap().file_type, FileType::Symlink);
+        assert_eq!(fs.permissions("/p/w/f"), Some(Perms::UnixMode(0o600)));
+        assert_eq!(fs.modified("/p/w/timed"), Some(t));
+    }
+
+    #[test]
     fn legacy_delete_keeps_a_name_occupied_until_the_last_lock_handle_closes() {
         let fs = FaultFs::new();
         fs.create_dir(Path::new("/p")).unwrap();
