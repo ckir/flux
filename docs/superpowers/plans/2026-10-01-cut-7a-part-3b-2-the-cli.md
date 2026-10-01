@@ -942,6 +942,9 @@ fn an_empty_lock_is_uncertain_until_restart_break_lock_takes_it_over() {
     assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
     let e = stderr(&out);
     assert!(e.contains("TARGET_LOCK_UNCERTAIN") && e.contains("--restart --break-lock"), "{e}");
+    let out = copy(&[os("--restart"), src.as_os_str(), dst.as_os_str()]);
+    assert_eq!(out.status.code(), Some(3), "--restart alone never takes a lock over: {}", stderr(&out));
+    assert!(stderr(&out).contains("TARGET_LOCK_UNCERTAIN"), "{}", stderr(&out));
     let out = copy(&[os("--break-lock"), src.as_os_str(), dst.as_os_str()]);
     assert_eq!(out.status.code(), Some(2), "--break-lock alone is a usage error: {}", stderr(&out));
     let out = copy(&[os("--restart"), os("--break-lock"), src.as_os_str(), dst.as_os_str()]);
@@ -1060,6 +1063,9 @@ message) and report it - never loosen an assertion to make it pass.
   - in `crates/flux-core/src/run/session.rs`, make `open_operation`'s scan arm accept resumable priors without
     `--restart` (`Ok(scan) if scan.resumable.is_empty() || cfg.restart || true => ...`):
     `a_killed_run_leaves_a_resumable_operation_that_restart_supersedes` FAILED;
+  - in `crates/flux-core/src/run/session.rs`, take an uncertain lock over under `--restart` alone
+    (`let mode = if cfg.break_lock || cfg.restart { ... }`): `an_empty_lock_is_uncertain_until_restart_break_lock...`
+    FAILED (panel round 1);
   - in `crates/flux-cli/src/report.rs`, drop the holder lines: `a_live_holder_makes_another_run_busy...` and
     `a_dead_owners_record...` FAILED;
   - in `crates/flux-cli/src/main.rs`, in both `None =>` arms of `copy`, print
