@@ -1,0 +1,368 @@
+//! The run on the fake filesystem (cut 7a Part 3b-1). `/src` is the source; `/p` is DEST's parent and holds the lock.
+
+use super::*;
+use crate::fault_fs::FaultFs;
+use crate::lock::LockCode;
+use crate::lock::record::{Decoded, decode};
+use crate::lock::test_support::{dead_lock, live_lock, record};
+use crate::state::{Kind, OperationState, UNREADABLE, decode as decode_state};
+use flux_fs::{
+    DestinationRoot, Durability, FileSystem, LockCapability, OperationId, Preserve, Publish, Safety,
+};
+use std::ffi::OsStr;
+use std::sync::{Arc, Mutex};
+
+/// This run's operation id.
+const ID: &str = "11111111111111111111111111111111";
+const LOCK: &str = "/p/dest.flux-lock";
+
+fn id(n: u8) -> String {
+    format!("{n:032x}")
+}
+
+fn cfg() -> RunConfig {
+    RunConfig {
+        restart: false,
+        break_lock: false,
+        operation_id: ID.to_string(),
+        owner_instance_id: id(0xee),
+        boot_session_id: "test-boot".to_string(),
+    }
+}
+
+fn restart() -> RunConfig {
+    RunConfig { restart: true, ..cfg() }
+}
+
+fn opts() -> CopyOptions {
+    CopyOptions {
+        preserve_times: Preserve::Default,
+        preserve_permissions: Preserve::Default,
+        durability: Durability::Normal,
+        publish: Publish::Replace,
+        safety: Safety::Default,
+        operation_id: OperationId::new("replaced by the run"),
+    }
+}
+
+/// `/src/a` (1 byte) and `/src/sub/b` (2 bytes); `/p` exists and `/p/dest` does not. Three `create_dir` calls.
+fn fake() -> FaultFs {
+    let fs = FaultFs::new();
+    for d in ["/src", "/src/sub", "/p"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    fs.write_file("/src/a", b"A");
+    fs.write_file("/src/sub/b", b"BB");
+    fs
+}
+
+fn run_tree(
+    fs: &FaultFs,
+    c: &RunConfig,
+) -> (Run<Result<TreeOutcome, TreeAbort>>, Vec<TreeFailure>) {
+    let mut got = Vec::new();
+    let r = tree(fs, Path::new("/src"), Path::new("/p/dest"), &opts(), c, &mut |f| got.push(f));
+    (r, got)
+}
+
+/// The call log, with `/` separators on every platform.
+fn calls(fs: &FaultFs) -> Vec<String> {
+    fs.calls().iter().map(|c| c.replace('\\', "/")).collect()
+}
+
+/// The index of the first call starting with `prefix`.
+fn at(calls: &[String], prefix: &str) -> usize {
+    calls
+        .iter()
+        .position(|c| c.starts_with(prefix))
+        .unwrap_or_else(|| panic!("no {prefix} in {calls:?}"))
+}
+
+fn refused(stop: &Option<RunError>) -> (LockCode, bool) {
+    match stop {
+        Some(RunError::Refused { refusal, changed, .. }) => (refusal.code, *changed),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+fn manifest(fs: &FaultFs, id: &str) -> OperationState {
+    let bytes = fs
+        .read_file(format!("/p/dest/.flux/operations/{id}/manifest"))
+        .unwrap_or_else(|| panic!("no manifest for {id}"));
+    decode_state(&bytes).unwrap()
+}
+
+/// A prior tree operation `n` in state `s`, with its workspace under `/p/dest`.
+fn prior(fs: &FaultFs, n: u8, s: OpState) {
+    for d in ["/p/dest", "/p/dest/.flux", "/p/dest/.flux/operations"] {
+        if !fs.exists(d) {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+    }
+    fs.create_dir(Path::new(&format!("/p/dest/.flux/operations/{}", id(n)))).unwrap();
+    let state = OperationState {
+        state: s,
+        ..OperationState::created(&id(n), Kind::Tree, Path::new("/p/dest"), 1)
+    };
+    fs.write_file(format!("/p/dest/.flux/operations/{}/manifest", id(n)), &state.encode());
+}
+
+fn ok(r: &Run<Result<TreeOutcome, TreeAbort>>) -> &TreeOutcome {
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    match &r.copy {
+        Some(Ok(o)) => o,
+        other => panic!("expected a finished copy, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_tree_run_copies_and_leaves_no_state_behind() {
+    let fs = fake();
+    let (r, got) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert!(got.is_empty() && r.warnings.is_empty(), "{got:?} {:?}", r.warnings);
+    assert_eq!((out.files_copied, out.directories_created), (2, 2), "DEST and sub");
+    assert_eq!(fs.read_file("/p/dest/sub/b").as_deref(), Some(&b"BB"[..]));
+    assert!(!fs.exists("/p/dest/.flux") && !fs.exists(LOCK));
+}
+
+#[test]
+fn the_lock_comes_first_then_the_state_then_the_record_naming_it() {
+    let fs = fake();
+    let (r, _) = run_tree(&fs, &cfg());
+    ok(&r);
+    let c = calls(&fs);
+    let lock = at(&c, "create_lock(/p/dest.flux-lock)");
+    let state = at(&c, &format!("create_dir(/p/dest/.flux/operations/{ID}.creating)"));
+    let record = at(&c, "write_at_start(");
+    let copy = at(&c, &format!("create_new(/p/dest/a.flux-partial.{ID})"));
+    assert!(lock < state && state < record && record < copy, "F5: {c:?}");
+}
+
+#[test]
+fn the_record_stops_naming_the_state_before_the_state_is_removed() {
+    let fs = fake();
+    let seen: Arc<Mutex<Option<Vec<u8>>>> = Arc::default();
+    let keep = Arc::clone(&seen);
+    // Renames without replacing: the workspace into place (1), `a` and `sub/b` published (2, 3), the retire (4).
+    fs.on_nth("rename_no_replace", 4, move |fs| *keep.lock().unwrap() = fs.read_file(LOCK));
+    let (r, _) = run_tree(&fs, &cfg());
+    ok(&r);
+    let c = calls(&fs);
+    let renames: Vec<&String> = c.iter().filter(|x| x.starts_with("rename_no_replace(")).collect();
+    assert!(renames[3].contains(&format!("{ID}.removing")), "the 4th is the retire: {renames:?}");
+    let bytes = seen.lock().unwrap().clone().expect("the lock exists at the retire");
+    let Decoded::Record(rec) = decode(&bytes) else { panic!("a whole record") };
+    assert_eq!((rec.operation_id.as_str(), rec.workspace_path.as_str()), (ID, "none"));
+}
+
+#[test]
+fn an_unsupported_filesystem_is_refused_before_anything_is_created() {
+    let fs = fake();
+    fs.set_lock_capability(LockCapability::Unsupported);
+    let (r, _) = run_tree(&fs, &cfg());
+    assert_eq!(refused(&r.stop), (LockCode::RemoteLockUnsafe, false));
+    assert!(r.copy.is_none());
+    assert!(!fs.called("create_lock") && !fs.exists("/p/dest"));
+}
+
+#[test]
+fn a_foreign_object_at_a_reserved_control_path_is_refused_before_the_lock() {
+    let fs = fake();
+    for d in ["/p/dest", "/p/dest/.flux"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    fs.write_file("/p/dest/.flux/atomic", b"not Flux's");
+    let (r, _) = run_tree(&fs, &cfg());
+    assert_eq!(refused(&r.stop), (LockCode::ControlPlaneNamespaceConflict, false));
+    assert!(!fs.called("create_lock"));
+}
+
+#[test]
+fn a_busy_lock_is_refused_and_left_alone() {
+    let fs = fake();
+    let p = fs.destination_root(Path::new("/p")).unwrap();
+    let site = LockSite::directory(&p, OsStr::new("dest")).unwrap();
+    let theirs = record(&site, &id(5), "none").encode();
+    let _holder = live_lock(&p, "dest.flux-lock", &theirs);
+    let (r, _) = run_tree(&fs, &cfg());
+    assert_eq!(refused(&r.stop), (LockCode::TargetLockBusy, false));
+    assert_eq!(fs.read_file(LOCK), Some(theirs));
+    assert!(!fs.exists("/p/dest"));
+}
+
+#[test]
+fn an_empty_lock_without_break_lock_is_uncertain_and_left_alone() {
+    let fs = fake();
+    let p = fs.destination_root(Path::new("/p")).unwrap();
+    dead_lock(&p, "dest.flux-lock", b"");
+    let (r, _) = run_tree(&fs, &cfg());
+    assert_eq!(refused(&r.stop), (LockCode::TargetLockUncertain, false));
+    assert_eq!(fs.read_file(LOCK).as_deref(), Some(&b""[..]));
+}
+
+#[test]
+fn a_resumable_prior_operation_is_refused_and_the_lock_removed_again() {
+    let fs = fake();
+    prior(&fs, 5, OpState::Failed);
+    let (r, _) = run_tree(&fs, &cfg());
+    assert_eq!(refused(&r.stop), (LockCode::ResumableOperationExists, false));
+    assert!(!fs.exists(LOCK), "the lock this run created is gone");
+    assert_eq!(manifest(&fs, &id(5)).state, OpState::Failed, "untouched");
+    assert!(!fs.exists(format!("/p/dest/.flux/operations/{ID}")));
+}
+
+#[test]
+fn ownership_lost_mid_copy_stops_and_leaves_the_state_and_the_lock() {
+    let fs = fake();
+    // `create_new`: this run's CREATED (1) and TRANSFERRING (2) manifests, then `a`'s temporary (3).
+    fs.on_nth("create_new", 3, |fs| fs.write_file(LOCK, b"another run's bytes"));
+    let (r, _) = run_tree(&fs, &cfg());
+    assert!(r.stop.is_none(), "the copy's abort is the report: {:?}", r.stop);
+    let Some(Err(a)) = &r.copy else { panic!("the copy aborted: {:?}", r.copy) };
+    assert_eq!(a.error.code(), Code::TargetLockBusy);
+    assert_eq!(manifest(&fs, ID).state, OpState::Transferring, "the state stays as it is");
+    assert_eq!(fs.read_file(LOCK).as_deref(), Some(&b"another run's bytes"[..]), "never unlinked");
+    assert!(!fs.exists("/p/dest/a"));
+}
+
+#[test]
+fn a_copy_refusal_that_changed_nothing_is_rolled_back_so_it_stays_exit_3() {
+    let fs = FaultFs::new();
+    for d in ["/src", "/src/sub", "/p", "/p/dest"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    fs.write_file("/src/sub/b", b"BB");
+    // `sub` IS DEST by identity: the copy refuses it before creating anything (cut 4b).
+    fs.set_identity("/src/sub", fs.metadata(Path::new("/p/dest")).unwrap().identity);
+    let (r, _) = run_tree(&fs, &cfg());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    let Some(Err(a)) = &r.copy else { panic!("the copy refused: {:?}", r.copy) };
+    assert!(a.refused_unchanged(), "{a:?}");
+    assert!(!fs.exists("/p/dest/.flux") && !fs.exists(LOCK), "what the run made is gone");
+    assert!(fs.exists("/p/dest"), "DEST was the operator's");
+}
+
+#[test]
+fn a_rollback_removes_a_dest_the_run_made() {
+    let fs = FaultFs::new();
+    for d in ["/src", "/src/sub", "/p"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    fs.write_file("/src/sub/b", b"BB");
+    // `create_dir`: the setup's three, then DEST (4) and `.flux` (5). Once DEST exists, `sub` becomes it by identity.
+    fs.on_nth("create_dir", 5, |fs| {
+        let dest = fs.metadata(Path::new("/p/dest")).unwrap().identity;
+        fs.set_identity("/src/sub", dest);
+    });
+    let (r, _) = run_tree(&fs, &cfg());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    let Some(Err(a)) = &r.copy else { panic!("the copy refused: {:?}", r.copy) };
+    assert!(a.refused_unchanged() && a.outcome.directories_created == 0, "{a:?}");
+    assert!(!fs.exists("/p/dest") && !fs.exists(LOCK));
+}
+
+#[test]
+fn a_temporary_the_copy_could_not_remove_keeps_the_completed_state() {
+    let fs = fake();
+    // `a`'s copy fails while streaming (its temporary is the 3rd `create_new`), and removing that temporary fails
+    // too: the 4th `remove_file` (the two state writes clear their temporaries, then `a`'s step-1 sweep).
+    fs.on_nth("create_new", 3, |fs| fs.fail_write(std::io::Error::other("injected write")));
+    fs.fail_nth("remove_file", 4, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let (r, got) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert_eq!(out.failures.copy, 1, "{got:?}");
+    assert!(r.warnings.iter().any(|w| matches!(w, RunWarning::StateKept(_))), "{:?}", r.warnings);
+    assert_eq!(manifest(&fs, ID).state, OpState::Completed);
+    assert!(fs.exists(format!("/p/dest/a.flux-partial.{ID}")));
+    assert!(!fs.exists(LOCK), "the lock is still released");
+}
+
+#[test]
+fn break_lock_takes_an_empty_lock_over_and_records_the_takeover_in_the_state() {
+    let fs = fake();
+    let p = fs.destination_root(Path::new("/p")).unwrap();
+    dead_lock(&p, "dest.flux-lock", b"");
+    let seen: Arc<Mutex<Option<Vec<u8>>>> = Arc::default();
+    let keep = Arc::clone(&seen);
+    // `create_new`: the CREATED manifest (1), the takeover (2), TRANSFERRING (3), then `a`'s temporary (4).
+    let path = format!("/p/dest/.flux/operations/{ID}/manifest");
+    fs.on_nth("create_new", 4, move |fs| *keep.lock().unwrap() = fs.read_file(&path));
+    let (r, _) = run_tree(&fs, &RunConfig { break_lock: true, ..restart() });
+    ok(&r);
+    let state = decode_state(&seen.lock().unwrap().clone().expect("the manifest exists")).unwrap();
+    assert_eq!(state.state, OpState::Transferring);
+    let t = state.takeover.expect("the takeover is recorded");
+    assert_eq!((t.operation_id.as_str(), t.owner_instance_id.as_str()), (UNREADABLE, UNREADABLE));
+    assert!(!fs.exists(LOCK) && !fs.exists("/p/dest/.flux"));
+}
+
+#[test]
+fn a_takeover_whose_lock_moves_starts_again_and_reuses_its_state() {
+    let fs = fake();
+    let p = fs.destination_root(Path::new("/p")).unwrap();
+    dead_lock(&p, "dest.flux-lock", b"");
+    // The takeover's overwrite is written, and before its flush the claimed file is moved away (`lock_sync_all` 1).
+    fs.on_nth("lock_sync_all", 1, |fs| {
+        fs.rename_replace(Path::new(LOCK), Path::new("/p/moved")).unwrap();
+    });
+    let (r, _) = run_tree(&fs, &RunConfig { break_lock: true, ..restart() });
+    ok(&r);
+    let c = calls(&fs);
+    let creating = format!("create_dir(/p/dest/.flux/operations/{ID}.creating)");
+    assert_eq!(
+        c.iter().filter(|x| x.starts_with(&creating)).count(),
+        1,
+        "made once, reused: {c:?}"
+    );
+    assert!(fs.exists("/p/moved") && !fs.exists(LOCK));
+}
+
+#[test]
+fn a_refusal_whose_lock_cannot_be_removed_names_it_and_is_exit_1() {
+    let fs = fake();
+    prior(&fs, 5, OpState::Failed);
+    // The refusal's removal of the lock this run created is the run's first `remove_file`.
+    fs.fail_nth("remove_file", 1, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let (r, _) = run_tree(&fs, &cfg());
+    let Some(RunError::Refused { refusal, changed, not_removed }) = &r.stop else {
+        panic!("expected a refusal, got {:?}", r.stop)
+    };
+    assert_eq!((refusal.code, *changed), (LockCode::ResumableOperationExists, true));
+    let (path, _) = not_removed.as_ref().expect("the lock it could not remove is named");
+    assert_eq!(path.to_string_lossy().replace('\\', "/"), LOCK);
+}
+
+#[test]
+fn ownership_lost_after_completed_is_a_warning_and_the_lock_is_left() {
+    let fs = fake();
+    // The retire is the 4th rename without replacing (the workspace, then the two publishes); just before it, the
+    // lock is taken over. The transfer is complete and durable by then.
+    fs.on_nth("rename_no_replace", 4, |fs| fs.write_file(LOCK, b"another run's bytes"));
+    let (r, _) = run_tree(&fs, &cfg());
+    ok(&r);
+    assert!(
+        r.warnings.iter().any(|w| matches!(w, RunWarning::OwnershipLostAfterCompletion(_))),
+        "{:?}",
+        r.warnings
+    );
+    assert_eq!(fs.read_file(LOCK).as_deref(), Some(&b"another run's bytes"[..]), "never unlinked");
+}
+
+#[test]
+fn a_dead_owners_lock_left_beside_the_new_one_is_a_warning() {
+    let fs = fake();
+    prior(&fs, 5, OpState::Completed);
+    let p = fs.destination_root(Path::new("/p")).unwrap();
+    let site = LockSite::directory(&p, OsStr::new("dest")).unwrap();
+    let dead = record(&site, &id(5), &format!("operations/{}", id(5))).encode();
+    dead_lock(&p, "dest.flux-lock", &dead);
+    // §240.3 step 5 deletes the moved-aside lock: the run's first `remove_file`. It fails.
+    fs.fail_nth("remove_file", 1, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let (r, _) = run_tree(&fs, &cfg());
+    ok(&r);
+    let broken = r.warnings.iter().any(
+        |w| matches!(w, RunWarning::BrokenLeftover(p) if p.to_string_lossy().contains(".broken.")),
+    );
+    assert!(broken, "{:?}", r.warnings);
+}
