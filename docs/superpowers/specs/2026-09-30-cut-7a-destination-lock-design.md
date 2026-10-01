@@ -208,7 +208,8 @@ The lock is:
 - `T/.flux-root.lock` for a filesystem root (spec:4738-4748);
 - `target.flux-lock` for a single file.
 
-1. **Capability.** Classify the destination filesystem. `Unsupported` → `REMOTE_LOCK_UNSAFE`, exit 3, nothing touched.
+1. **Capability.** Classify the filesystem of the directory that holds the lock - DEST's parent, or DEST for a root
+   (refinement 14). `Unsupported` → `REMOTE_LOCK_UNSAFE`, exit 3, nothing touched.
 2. **`DEST/.flux`.** If it exists and is not a directory, or a reserved subdirectory is not a directory:
    `CONTROL_PLANE_NAMESPACE_CONFLICT`, exit 3. (A single file skips this step.)
 3. **Acquire** (§96.1, spec:4647-4715; model `S96_1_*`):
@@ -237,20 +238,27 @@ The lock is:
    rest continues. `still_owned` also runs before each temporary is created and before each directory is created, since
    §99 covers every write, rename and unlink (spec:4858-4870), not only the publishing rename.
 7. **Finish.**
-   - Success:
-     1. state `COMPLETED` (durable);
-     2. remove the run's own temporaries;
-     3. ONLY IF every removal in step 2 succeeded: remove the state - for a tree, the `manifest` file, then the
-        now-empty workspace directory with a plain `rmdir`; for a single file, the adjacent record. If any step-2
-        removal failed, the state stays `COMPLETED` as the only record naming the leftover temporaries (the id that
-        finds them, refinement 7), and steps 3-4 are skipped (panel round 5);
+   - Success - the copy's walk finished, even with per-entry failures (refinement 12):
+     1. state `COMPLETED` (durable), after `still_owned`;
+     2. remove the run's own temporaries: the copy removes a failed file's temporary at once, and that removal is this
+        step (refinement 19);
+     3. ONLY IF no temporary was left: rewrite the held record in place with `workspace_path` = `none` (refinement
+        17), then remove the state - for a tree, the workspace retired to `operations/<id>.removing`, then its
+        `manifest` and a crash's `manifest.tmp`, then the directory (refinement 9); for a single file, the adjacent
+        record and its `.tmp`. If a temporary was left, the state stays `COMPLETED` as the only record naming it (the
+        id that finds it, refinement 7), and steps 3-4 are skipped (panel round 5);
      4. `rmdir` `operations/` and `.flux/` if they are empty (a failure because they are not empty is not an error);
      5. `still_owned` (`S99_release_check`);
      6. unlink the lock by name, then close the handle, which releases the OS-native lock (`S99_release`).
    - A removal failure in steps 2-4 (temporaries, the workspace or record, the empty directories) is reported as a
      warning, and the exit stays 0 (F6).
-   - Failure: state `FAILED`, release the lock the same way, exit 1. `FAILED` is resumable, so the next run gets
+   - Failure - an abort of the copy, a single-file copy error, or a failure of the run's own steps
+     (refinement 12): state `FAILED`, release the lock the same way, exit 1. `FAILED` is resumable, so the next run gets
      `RESUMABLE_OPERATION_EXISTS` until `--restart`.
+   - A refusal of the copy that changed nothing (`SAFETY_REJECTED`, `NOREPLACE_PUBLISH_UNAVAILABLE`): the run removes
+     what it created - the record rewritten to `none` first, then the state, the control directories it emptied, and
+     a DEST it made - and releases the lock, so the refusal stays exit 3 (refinement 16, §55). A removal that fails
+     is exit 1, naming the path.
    - Ownership lost (a failed `still_owned`) BEFORE the state is COMPLETED: stop, leave the state as it is, close the
      handle without unlinking (the path may now name another operation's lock, `S99_refuse_close`), exit 1 with
      `TARGET_LOCK_BUSY`.
@@ -309,24 +317,31 @@ A leftover `.broken.*` file is classified by its recorded owner. An uncertain lo
 
 ## `--restart` and `--break-lock`
 
-**`--restart`** (spec:1646-1668), holding the lock throughout:
-1. The prior operation's lock was already acquired or recovered at step 3.
-2. Durably set every resumable prior operation to `ABANDONED` with `superseded_by` = this operation.
-3. `still_owned` (§99; `S21_1_s3`).
-4. Delete its partials, then its workspace or record. 7a's state does not list partials (their records are `state.db`'s,
-   cut 8), so they are found by the prior operation's EXACT id: every `<name>.flux-partial.<prior-id>` under DEST (a walk
-   that skips only the three reserved subdirectories `DEST/.flux/operations/`, `standalone/` and `atomic/`, because
-   user files may legally live elsewhere under `DEST/.flux/`). The walk costs one traversal of the WHOLE existing
-   DEST - which can far exceed the copy itself when DEST is large and the source small - and runs only on an explicit
-   `--restart`. 7b's `roots` (the prior operation's source-to-destination mapping) and cut 8's recorded partials are
-   what bound it later, or `target.flux-partial.<prior-id>` beside a single-file target. Authority comes from the
-   valid prior state naming that id, never from the name pattern alone (spec:9369-9371 forbids that only when the
-   record is missing or corrupt), and `still_owned` runs before EACH deletion (spec:9365-9367).
-5. Continue at step 5 of the run: this operation's state, then the record written through the held handle
-   (`S21_1_s5_write_begin/_end`).
+**`--restart`** (spec:1646-1668), holding the lock throughout. This operation's state and record come FIRST
+(refinement 15): `still_owned` needs a record to compare, and none exists before step 5 (F5).
+1. The prior operation's lock was already acquired or recovered at step 3, and step 5 created this operation's state
+   (CREATED) and wrote the record naming it.
+2. For each resumable prior operation: `still_owned` (§99; `S21_1_s3`), then durably set it `ABANDONED` with
+   `superseded_by` = this operation.
+3. Delete their partials. 7a's state does not list partials (their records are `state.db`'s, cut 8), so they are
+   found by the prior operation's EXACT id: every `<name>.flux-partial.<prior-id>` under DEST (a walk that skips only
+   the three reserved subdirectories `DEST/.flux/operations/`, `standalone/` and `atomic/`, because user files may
+   legally live elsewhere under `DEST/.flux/`), deleted through handles opened from DEST's one component at a time.
+   The walk costs one traversal of the WHOLE existing DEST - which can far exceed the copy itself when DEST is large
+   and the source small - and runs only on an explicit `--restart`. 7b's `roots` and cut 8's recorded partials are
+   what bound it later. Beside a single-file target the partial is `target.flux-partial.<prior-id>`, looked up by the
+   target's own name (refinement 13). Authority comes from the valid prior state naming that id, never from the name
+   pattern alone (spec:9369-9371 forbids that only when the record is missing or corrupt), and `still_owned` runs
+   before EACH deletion (spec:9365-9367). A partial that cannot be deleted keeps its prior's ABANDONED state as the
+   record naming it, reported as a warning.
+4. Remove each prior's state whose partials are all gone (a workspace retired first, refinement 9), `still_owned`
+   before each.
+5. Continue with step 5's last write: TRANSFERRING.
 
-A crash in 3-5 leaves the prior operation ABANDONED, and the next run proceeds past it. `--restart` never overrides a
-live owner, or missing or corrupt state (spec:1664-1666).
+A crash during 2-4 leaves this operation's CREATED state and its record, now a dead owner's, and each prior ABANDONED
+or still resumable: the next run recovers the lock (§240.3), gets `RESUMABLE_OPERATION_EXISTS` for this operation's
+state, and a new `--restart` supersedes everything. `--restart` never overrides a live owner, or missing or corrupt
+state (spec:1664-1666).
 
 **`--break-lock`** is valid only with `--restart` (otherwise a usage error, exit 2), and only for
 `TARGET_LOCK_UNCERTAIN` (spec:10655-10659). §240.5 (spec:10655-10722; model `S240_5_*`), after reporting the holder:
@@ -377,8 +392,11 @@ a takeover whose flush failed is never recorded (spec:10700-10701).
 | between the lock file and its record (F5's window) | an empty lock, and possibly a CREATED state | `TARGET_LOCK_UNCERTAIN`; recovered with `--restart --break-lock`, which supersedes the CREATED state |
 | during a `--break-lock` takeover, after its state is created and before its overwrite | the prior (uncertain) lock unchanged, and the new run's CREATED state | `TARGET_LOCK_UNCERTAIN` again; a new `--restart --break-lock` takes over and supersedes both prior states |
 | during the copy | a TRANSFERRING state and a dead owner's lock | recovers the lock (§240.3), then `RESUMABLE_OPERATION_EXISTS`; recovered with `--restart` |
-| during `--restart` after ABANDONED | an ABANDONED prior | proceeds |
-| after COMPLETED | a completed state or its leftover | proceeds |
+| during `--restart`'s supersede | this operation's CREATED state and its record (a dead owner's), and each prior ABANDONED or still resumable | recovers the lock (§240.3), then `RESUMABLE_OPERATION_EXISTS` for this operation's state; a new `--restart` supersedes it and the rest |
+| after COMPLETED, before the record is rewritten | a dead owner's record naming the COMPLETED state | recovers the lock and proceeds past the COMPLETED state |
+| during the record's in-place rewrite (refinement 17) | a torn record | `TARGET_LOCK_UNCERTAIN`; `--restart --break-lock` clears it |
+| after the record names `none` | a dead owner's record naming no workspace, and the COMPLETED state whole, retired (`<id>.removing`) or gone | recovers the lock and proceeds; a `.removing` workspace is cut 9's |
+| during a refused copy's rollback (refinement 16) | as the three rows above, with this operation's state CREATED or TRANSFERRING before the rewrite | before the rewrite: recovers the lock, then `RESUMABLE_OPERATION_EXISTS` (cleared by `--restart`); after it: proceeds |
 | during §240.3 recovery, between the move-aside and the new lock | no lock, and `<lock-name>.broken.<id>` beside the lock path | acquires a fresh lock and proceeds. 7a does NOT collect the `.broken.*` file (the spec classifies it by its recorded owner, spec:10620-10624, which is cut 9's cleanup); a run that sees one beside its lock path reports it as a warning |
 | while creating a tree operation's workspace, before its rename | an empty lock, and `operations/<id>.creating/` | `TARGET_LOCK_UNCERTAIN`; `--restart --break-lock` proceeds, and the scan passes over the `.creating` directory (cut 9's) |
 | while writing a single-file operation's first state record, before its rename | an empty lock, and `<target>.flux-state.<id>.tmp` | `TARGET_LOCK_UNCERTAIN`; `--restart --break-lock` proceeds, and the scan passes over the `.tmp` file (cut 9's) |
@@ -470,6 +488,31 @@ The plan cites these entries step by step.
     exceed the name-length limit is refused `PATH_COMPONENT_INVALID` before anything is created.
 11. **`destination_root` is the path's display form** (Part 3a, M1): lossy for a path that is not valid Unicode, and
     never read back for a decision.
+12. **A copy whose walk finished is COMPLETED** (Part 3b, A1), even with per-entry failures (exit 1 stays the copy's).
+    FAILED is for an abort, a single-file copy error, or a failure of the run's own steps. Otherwise every repeat
+    copy into a non-empty DEST - collisions are per-entry failures - would need `--restart`.
+13. **A single file's records are found by name lookup** (Part 3b, E3): for each `*.flux-state.<id>` beside the
+    target, `<target>.flux-state.<id>` is looked up by the target's own name, and the filesystem's equivalence (case,
+    normalization) decides. Exact bytes would miss a record on NTFS or APFS for a target spelled in another case;
+    folding in Flux would claim another file's record on Linux.
+14. **The source side comes first, and the capability is the lock's** (Part 3b, B1). The source checks, DEST's
+    resolution through its parent (a symlink at DEST is refused `SAFETY_REJECTED`) and the identity pre-flight run
+    before step 1, so a mistyped source creates nothing. Step 1 classifies the filesystem of the directory that holds
+    the lock.
+15. **`--restart` writes this operation's state and record before it supersedes** (Part 3b, Q-H (a)). `still_owned`
+    compares the record, and F5 writes none before step 5; the model's `Recover` and `TakeOver` also write it before
+    `S21_1_s3`. A crash mid-restart then leaves a dead owner's record and a resumable state, not an empty lock.
+16. **A refused copy that changed nothing is rolled back** (Part 3b, Q-I): the run removes what it created and keeps
+    the copy's exit 3 (§55: created and removed again does not count).
+17. **The record stops naming the state before the state goes** (Part 3b, Q-K): the held record is rewritten in place
+    with `workspace_path` = `none` before the finish or a rollback removes this operation's state. Otherwise a crash
+    between the state's removal and the lock's unlink leaves a dead owner's record naming missing state,
+    `ARTIFACT_OWNERSHIP_UNCERTAIN`, which no flag clears. A crash during the rewrite leaves a torn record,
+    `TARGET_LOCK_UNCERTAIN`, cleared by `--restart --break-lock`.
+18. **A takeover that must start again keeps its state** (Part 3b, D1): when the in-place overwrite finds the lock path
+    moved, the run obtains the lock again (at most `MAX_ATTEMPTS` times) and reuses the state it already created.
+19. **The copy's immediate removal of a failed file's temporary is finish step 2** (Part 3b, G2): the finish does not
+    retry it, and a temporary that stayed keeps the COMPLETED state as its record.
 
 ## Consult record
 
