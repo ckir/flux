@@ -120,6 +120,27 @@ fn a_killed_run_leaves_a_resumable_operation_that_restart_supersedes() {
 }
 
 #[test]
+fn a_killed_single_file_run_leaves_a_resumable_record_that_restart_supersedes() {
+    let d = TempDir::new().unwrap();
+    let marks = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let t = d.path().join("t");
+    // The single file's guarded mutations: its sweep (1), its temporary (2), its publish (3): killed with the
+    // temporary written and the record beside the target.
+    Stalled::start(&src.join("a"), &t, 3, marks.path()).kill();
+    let left = names(d.path());
+    assert!(left.iter().any(|n| n.starts_with("t.flux-partial.")), "{left:?}");
+    assert!(left.iter().any(|n| n.starts_with("t.flux-state.")), "{left:?}");
+    let out = copy(&[src.join("a").as_os_str(), t.as_os_str()]);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(stderr(&out).contains("RESUMABLE_OPERATION_EXISTS"), "{}", stderr(&out));
+    let out = copy(&[os("--restart"), src.join("a").as_os_str(), t.as_os_str()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(names(d.path()), ["src", "t"], "the record, the partial and the lock are gone");
+    assert_eq!(std::fs::read(&t).unwrap(), b"A");
+}
+
+#[test]
 fn a_live_holder_makes_another_run_busy_and_names_the_lock_and_the_holder() {
     let d = TempDir::new().unwrap();
     let marks = TempDir::new().unwrap();

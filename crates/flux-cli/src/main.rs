@@ -5,7 +5,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use flux_cli::exit_code;
 use flux_cli::report::{self, Report};
 use flux_cli::resolve::{self, Job, Stop};
-use flux_core::run::{RunConfig, RunError, RunWarning};
+use flux_core::run::RunConfig;
 use flux_fs::{Code, CopyOptions, Durability, OperationId, Preserve, Publish, Safety};
 use std::io::Write;
 use std::path::PathBuf;
@@ -174,29 +174,24 @@ fn copy(args: &CopyArgs) -> u8 {
                 }
             });
             let ms = millis(started);
-            let rep = match &run.copy {
+            let rep = Report::tree_run(&run, ms);
+            match &run.copy {
                 Some(result) => {
-                    let (outcome, aborted) = match result {
-                        Ok(out) => (out, false),
+                    let outcome = match result {
+                        Ok(out) => out,
                         Err(a) => {
                             err(&a.error.to_string());
-                            (&a.outcome, true)
+                            &a.outcome
                         }
                     };
                     for line in report::warning_lines(&outcome.warnings) {
                         err(&line);
                     }
-                    run_lines(&run.stop, &run.warnings);
-                    let mut rep = Report::tree(outcome, aborted, ms);
-                    rep.errors += u64::from(run.stop.is_some());
+                    lines(report::run_lines(&run));
                     err(&report::summary_line(&rep, outcome.directories_created));
-                    rep
                 }
-                None => {
-                    run_lines(&run.stop, &run.warnings);
-                    Report::pre_engine(false)
-                }
-            };
+                None => lines(report::run_lines(&run)),
+            }
             json(args, &rep);
             exit_code::for_tree_run(&run)
         }
@@ -204,7 +199,8 @@ fn copy(args: &CopyArgs) -> u8 {
             let started = Instant::now();
             let run = flux_core::run::file(&fs, &src, &dst, &opts, &cfg);
             let ms = millis(started);
-            let rep = match &run.copy {
+            let rep = Report::file_run(&run, target_existed, ms);
+            match &run.copy {
                 Some(result) => {
                     match result {
                         Ok(o) => {
@@ -224,32 +220,21 @@ fn copy(args: &CopyArgs) -> u8 {
                         // could not be removed - the one thing the user needs to clean up.
                         Err(e) => err(&e.to_string()),
                     }
-                    run_lines(&run.stop, &run.warnings);
-                    let mut rep = Report::file(result, target_existed, ms);
-                    rep.errors += u64::from(run.stop.is_some());
+                    lines(report::run_lines(&run));
                     err(&report::summary_line(&rep, 0));
-                    rep
                 }
-                None => {
-                    run_lines(&run.stop, &run.warnings);
-                    Report::pre_engine(false)
-                }
-            };
+                None => lines(report::run_lines(&run)),
+            }
             json(args, &rep);
             exit_code::for_file_run(&run)
         }
     }
 }
 
-/// The run's own stop and warnings (cut 7a), after the copy's lines and before the summary.
-fn run_lines(stop: &Option<RunError>, warnings: &[RunWarning]) {
-    if let Some(e) = stop {
-        for line in report::stop_lines(e) {
-            err(&line);
-        }
-    }
-    for w in warnings {
-        err(&report::run_warning_line(w));
+/// Each line to stderr.
+fn lines(v: Vec<String>) {
+    for line in v {
+        err(&line);
     }
 }
 

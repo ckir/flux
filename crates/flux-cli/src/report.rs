@@ -3,8 +3,8 @@
 //! returns text, and `main` writes it.
 
 use flux_core::copy::CopyError;
-use flux_core::run::{RunError, RunWarning};
-use flux_core::{TreeFailure, TreeFailureCause, TreeOutcome, WeakIdentityWarnings};
+use flux_core::run::{Run, RunError, RunWarning};
+use flux_core::{TreeAbort, TreeFailure, TreeFailureCause, TreeOutcome, WeakIdentityWarnings};
 use flux_fs::{Code, FileIdentity, MetadataFailure, MetadataItem, Outcome};
 use serde::Serialize;
 use std::path::Path;
@@ -110,6 +110,32 @@ impl Report {
             r.files_failed = 1;
         }
         r
+    }
+
+    /// A tree copy under the destination's lock (cut 7a, Part 3b-2 decision 1): §53's fields only. The copy's counts,
+    /// plus one error for a stop of the run outside the copy; a run that stopped before its copy is that one error.
+    pub fn tree_run(run: &Run<Result<TreeOutcome, TreeAbort>>, duration_ms: u64) -> Self {
+        let mut rep = match &run.copy {
+            Some(Ok(out)) => Self::tree(out, false, duration_ms),
+            Some(Err(a)) => Self::tree(&a.outcome, true, duration_ms),
+            None => return Self::pre_engine(false),
+        };
+        rep.errors += u64::from(run.stop.is_some());
+        rep
+    }
+
+    /// `tree_run`, for a single file.
+    pub fn file_run(
+        run: &Run<Result<Outcome, CopyError>>,
+        target_existed: bool,
+        duration_ms: u64,
+    ) -> Self {
+        let mut rep = match &run.copy {
+            Some(result) => Self::file(result, target_existed, duration_ms),
+            None => return Self::pre_engine(false),
+        };
+        rep.errors += u64::from(run.stop.is_some());
+        rep
     }
 
     fn timed(mut self, duration_ms: u64) -> Self {
@@ -272,6 +298,13 @@ pub fn run_warning_line(w: &RunWarning) -> String {
             p.display()
         ),
     }
+}
+
+/// A run's own stop, then its warnings (cut 7a): the stderr lines that follow the copy's and precede the summary.
+pub fn run_lines<T>(run: &Run<T>) -> Vec<String> {
+    let mut v = run.stop.as_ref().map(stop_lines).unwrap_or_default();
+    v.extend(run.warnings.iter().map(run_warning_line));
+    v
 }
 
 #[cfg(test)]
@@ -555,5 +588,61 @@ mod tests {
             assert!(!line.contains('\n'), "{line}");
         }
         assert!(run_warning_line(&all[3]).contains("X/kept"));
+    }
+
+    // Part 3b-2 test audit (round 1): each test below was red under the mutant named in its comment.
+
+    fn refused() -> RunError {
+        RunError::Refused {
+            refusal: Box::new(Refusal {
+                code: LockCode::StateCorrupt,
+                holder: None,
+                detail: "D/m: not JSON".to_string(),
+            }),
+            changed: true,
+            not_removed: None,
+        }
+    }
+
+    fn kept() -> RunWarning {
+        RunWarning::StateKept(PathBuf::from("X/kept-state"))
+    }
+
+    #[test]
+    fn a_runs_lines_are_its_stop_then_every_warning() {
+        let run: Run<()> =
+            Run { copy: None, stop: Some(refused()), warnings: vec![kept(), kept()] };
+        let lines = run_lines(&run);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines[0].starts_with("STATE_CORRUPT: "), "{lines:?}");
+        assert!(
+            lines[1..].iter().all(|l| l.starts_with("warning: ") && l.contains("kept-state")),
+            "{lines:?}"
+        );
+        let quiet: Run<()> = Run { copy: None, stop: None, warnings: vec![kept()] };
+        assert_eq!(run_lines(&quiet).len(), 1, "warnings print without a stop too");
+    }
+
+    #[test]
+    fn a_tree_runs_report_counts_a_stop_as_one_more_error() {
+        let run = |copy, stop| Run { copy, stop, warnings: Vec::new() };
+        let clean = Report::tree_run(&run(Some(Ok(TreeOutcome::default())), None), 1);
+        assert_eq!(clean.errors, 0);
+        let stopped = Report::tree_run(&run(Some(Ok(TreeOutcome::default())), Some(refused())), 1);
+        assert_eq!(stopped.errors, 1, "a stop after the copy is an error");
+        let before = Report::tree_run(&run(None, Some(refused())), 1);
+        assert_eq!((before.errors, before.files_total), (1, 0), "a stop before the copy");
+    }
+
+    #[test]
+    fn a_file_runs_report_counts_a_stop_as_one_more_error() {
+        let run = |copy, stop| Run { copy, stop, warnings: Vec::new() };
+        let copied = || {
+            Ok(Outcome { bytes_copied: 1, metadata_failures: Vec::new(), identity_degraded: None })
+        };
+        assert_eq!(Report::file_run(&run(Some(copied()), None), false, 1).errors, 0);
+        assert_eq!(Report::file_run(&run(Some(copied()), Some(refused())), false, 1).errors, 1);
+        let before = Report::file_run(&run(None, Some(refused())), false, 1);
+        assert_eq!((before.errors, before.files_total), (1, 0), "a stop before the copy");
     }
 }
