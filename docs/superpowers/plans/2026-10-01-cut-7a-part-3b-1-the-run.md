@@ -617,7 +617,6 @@ pub const RESERVED_DIRS: [&str; 3] = [OPERATIONS_DIR, "standalone", "atomic"];
 ```rust
 /// The source side of a tree copy, checked before anything at the destination is touched.
 pub(crate) struct Source<'a, F: FileSystem> {
-    pub(crate) root: &'a Path,
     pub(crate) events: Walk<'a, F>,
     pub(crate) identity: FileIdentity,
 }
@@ -639,7 +638,7 @@ pub(crate) fn prepare_source<'a, F: FileSystem>(
     if lexically_within(dst_root, src_root) {
         return Err(refuse("the destination is the source or lies inside it"));
     }
-    Ok(Source { root: src_root, events, identity })
+    Ok(Source { events, identity })
 }
 
 /// What every entry of one tree copy shares.
