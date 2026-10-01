@@ -133,7 +133,8 @@ prior's ABANDONED state as its record (J1).
 9. **Q-I - a refusal of the copy that changed nothing is rolled back.** `SAFETY_REJECTED` or
    `NOREPLACE_PUBLISH_UNAVAILABLE` with nothing changed: the run removes its state, the control directories it
    emptied and a DEST it made, releases the lock, and the refusal keeps exit 3 (§55). A failure while doing so is exit
-   1, naming the path.
+   1, naming the path. The control directories go only when empty, exactly as at the finish (finish step 4), so a
+   `.flux` the operator had left empty goes too; an empty directory named `.flux` holds nothing (panel round 1).
 10. **Q-K - the record stops naming the state before the state goes.** Before any removal of this run's own state
     (the finish, the rollback), the held record is rewritten in place with `workspace_path` = `none`. Otherwise a crash
     between the state's removal and the lock's unlink leaves a dead owner's record naming missing state:
