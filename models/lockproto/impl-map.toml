@@ -99,8 +99,7 @@ reason = "SEED_RENAME_OVER_TAKEOVER's rename over the lock"
 [S99_check]
 item = "crates/flux-core/src/lock/held.rs::still_owned"
 [S99_write]
-status = "part-3"
-reason = "the engine's mutation after its still_owned check (copy_file and copy_tree hooks)"
+item = "crates/flux-core/src/copy.rs::copy_file_guarded"
 [S240_5_inflight_lands]
 status = "model-only"
 reason = "an issued write completing after a takeover: an event the model checks, not a step the code takes"
@@ -122,17 +121,13 @@ item = "crates/flux-core/src/lock/obtain.rs::obtain"
 [S21_1_restart_decide]
 item = "crates/flux-core/src/lock/obtain.rs::obtain"
 [S21_1_s3]
-status = "part-3"
-reason = "--restart's revalidation before rewriting the record"
+item = "crates/flux-core/src/run/restart.rs::supersede"
 [S21_1_s5_write_begin]
-status = "part-3"
-reason = "--restart's record write for the new operation"
+item = "crates/flux-core/src/run/session.rs::open_operation"
 [S21_1_s5_write_end]
-status = "part-3"
-reason = "--restart's record write for the new operation"
+item = "crates/flux-core/src/run/session.rs::open_operation"
 [S21_1_s3_refuse_close]
-status = "part-3"
-reason = "--restart's refusal close"
+item = "crates/flux-core/src/run/session.rs::open_operation"
 
 [S251_1_classify]
 status = "not-in-7a"
