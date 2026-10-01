@@ -3535,3 +3535,16 @@ green, including the macOS test job (the real filesystem name-equivalence test, 
   it); the D1 budget's exhaustion (`MAX_ATTEMPTS` moves in a row). The test audit may scope them.
 - **Types.** `Guard<'g>`, `Shared<'c, F>`, `Source<'a, F>`, `Locked<'a, D>`, `Fault`, `Place<D>`, `TreePlace<'p, F>`,
   `FilePlace<'p, D>` are each defined once, in the task that first uses them; every later reference matches.
+
+## Stand-downs
+
+- **Panel (agy, 2 rounds): GREEN at round 2.** Briefs `.clavity/seams/cut7a-p3b1-plan-panel-r1.md` and `-r2.md`, replies
+  `.clavity/scratch/cut7a-p3b1-plan-panel/r1-reply.md` and `r2-reply.md`. Folded: decision 9 states that a rollback
+  removes an empty `.flux` as the finish does (round 1, open question). Earlier, while planning: the finish-order crash
+  window (Q-K) and `--restart`'s revalidation before any record (Q-H), each an owner ruling after an AGY-FIRST consult.
+- REJECTED (round 1): "`scan_file` compares the entry's name byte for byte" - the quoted line is in neither the plan
+  nor the code; Task 5's `scan_file` reads only the trailing id (`id_after`) and looks the record up by the target's
+  own name. The reviewer withdrew it after reading Task 5.
+- REJECTED (round 2): "a rolled-back refusal exits 0" - the exit rule (this plan, "What Part 3b-2 builds on") gives a
+  run with no `stop` the copy's own rule, and `exit_code::for_tree` (`crates/flux-cli/src/exit_code.rs:14-16`) gives
+  an unchanged refusal exit 3. The reviewer withdrew it after reading those lines.
