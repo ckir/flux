@@ -8,7 +8,7 @@ use crate::lock::error::refuse;
 use crate::lock::{LockCode, LockError, LockResult};
 use crate::state::{
     FLUX_DIR, Kind, MANIFEST, OPERATIONS_DIR, OperationState, RECORD_INFIX, RESERVED_DIRS,
-    Unusable, control_path_conflict, read_state,
+    Unusable, control_path_conflict, id_after, read_state, record_name,
 };
 use flux_fs::{Code, DirHandle, FileType};
 use std::ffi::OsStr;
@@ -86,39 +86,49 @@ pub fn scan_tree<D: DirHandle>(dest: &D, dest_shown: &Path, own_id: &str) -> Loc
 
 /// A single file's prior operations: the records `<target>.flux-state.<id>` in `parent`. `parent_shown` is the
 /// target's directory as messages name it.
+///
+/// E3 (Part 3b): every `*.flux-state.<id>` here is a candidate, and its record is looked up by THIS target's name, so
+/// the filesystem's own name equivalence decides whether it is this target's - case on NTFS and APFS, Unicode
+/// normalization on APFS - and `NotFound` means another target's. Exact bytes would miss `t.flux-state.<id>` for a
+/// target spelled `T` on NTFS; folding in Flux would claim `T`'s record for `t` on a case-sensitive Linux directory,
+/// where `T` is another file under another lock.
 pub fn scan_file<D: DirHandle>(
     parent: &D,
     target: &OsStr,
     parent_shown: &Path,
     own_id: &str,
 ) -> LockResult<Scan> {
-    let mut prefix = target.to_os_string();
-    prefix.push(RECORD_INFIX);
-    let mut entries = parent.read_dir()?;
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut ids: Vec<String> = parent
+        .read_dir()?
+        .iter()
+        .filter_map(|e| id_after(&e.name, RECORD_INFIX))
+        .filter(|id| *id != own_id)
+        .map(str::to_string)
+        .collect();
+    ids.sort();
+    ids.dedup();
     let mut scan = Scan::default();
-    for entry in entries {
-        // Exactly `<target>.flux-state.<id>`: another target's record, or a temporary (`<id>.tmp`), is not one.
-        let Some(rest) = entry.name.as_encoded_bytes().strip_prefix(prefix.as_encoded_bytes())
-        else {
-            continue;
-        };
-        let Some(id) = std::str::from_utf8(rest).ok().filter(|r| is_id(r)) else { continue };
-        if id == own_id {
-            continue;
+    for id in ids {
+        let name = record_name(target, &id);
+        let shown = parent_shown.join(&name);
+        match parent.metadata(&name) {
+            // Another target's record, or removed by its own finishing run since the listing.
+            Err(e) if e.source.kind() == ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+            // A record's name beside a user's target is Flux's (F2), and no crash leaves anything but a regular file
+            // there: anything else is unreadable state (§21.1), refused rather than passed over (decision 9; panel
+            // round 3).
+            Ok(m) if m.file_type != FileType::File => {
+                return Err(corrupt(
+                    &shown,
+                    "a record's name holds something other than a regular file",
+                ));
+            }
+            Ok(_) => {}
         }
-        let shown = parent_shown.join(&entry.name);
-        // A record's exact name beside a user's target is Flux's (F2), and no crash leaves anything but a regular file
-        // there: anything else is unreadable state (§21.1), refused rather than passed over (decision 9; panel round 3).
-        if entry.file_type != FileType::File {
-            return Err(corrupt(
-                &shown,
-                "a record's name holds something other than a regular file",
-            ));
-        }
-        let state = match read_state(parent, &entry.name) {
+        let state = match read_state(parent, &name) {
             Ok(decoded) => usable(decoded, &shown)?,
-            // Removed by its own finishing run since the listing: not a record now.
+            // Removed by its own finishing run since the lookup: not a record now.
             Err(e) if e.source.kind() == ErrorKind::NotFound => continue,
             Err(e) if matches!(e.code, Code::SafetyRejected | Code::DestinationError) => {
                 return Err(corrupt(
@@ -507,5 +517,19 @@ mod tests {
             refusal(check_control_plane(&d, Path::new("D"))).code,
             LockCode::ControlPlaneNamespaceConflict
         );
+    }
+
+    #[test]
+    fn a_record_is_looked_up_by_this_targets_own_name() {
+        let (fs, d) = dest();
+        // On a case-sensitive directory (the fake), `T`'s record is not `t`'s.
+        fs.write_file(rec(OsStr::new("T"), 1), &state(1, Kind::File, OpState::Created).encode());
+        assert_eq!(
+            scan_file(&d, OsStr::new("t"), Path::new("P"), &id(0)).unwrap(),
+            Scan::default()
+        );
+        let calls: Vec<String> = fs.calls().iter().map(|c| c.replace('\\', "/")).collect();
+        let wanted = format!("metadata(/p/dest/t.flux-state.{})", id(1));
+        assert!(calls.contains(&wanted), "looked up under this target's name: {calls:?}");
     }
 }

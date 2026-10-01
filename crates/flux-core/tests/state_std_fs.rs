@@ -45,3 +45,23 @@ fn the_scan_finds_a_resumable_workspace_and_passes_over_a_creating_one() {
     assert_eq!(scan.resumable.len(), 1);
     assert_eq!(scan.resumable[0].state, prior);
 }
+
+#[test]
+fn a_record_is_matched_the_way_the_filesystem_matches_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The filesystem's own answer, measured here: does `probe` name `PROBE`?
+    std::fs::write(tmp.path().join("PROBE"), b"").unwrap();
+    let folds = tmp.path().join("probe").exists();
+    std::fs::remove_file(tmp.path().join("PROBE")).unwrap();
+    let id = flux_core::ids::new_id();
+    let prior = OperationState::created(&id, Kind::File, tmp.path(), 1);
+    std::fs::write(tmp.path().join(format!("T.flux-state.{id}")), prior.encode()).unwrap();
+    let dir = StdFileSystem.destination_root(tmp.path()).unwrap();
+    let own = flux_core::ids::new_id();
+    let scan = flux_core::prior::scan_file(&dir, OsStr::new("t"), tmp.path(), &own).unwrap();
+    assert_eq!(
+        scan.resumable.len(),
+        usize::from(folds),
+        "the record is `t`'s exactly when this filesystem says `t` names `T` (folds = {folds})"
+    );
+}
