@@ -669,5 +669,8 @@ mod tests {
         );
         let before = Report::file_run(&run(None, Some(refused())), false, 1);
         assert_eq!((before.errors, before.files_total), (1, 0), "a stop before the copy");
+        // An existing target changes nothing about a run that never reached its copy.
+        let over = Report::file_run(&run(None, Some(refused())), true, 1);
+        assert_eq!((over.errors, over.files_total, over.files_failed), (1, 0, 0), "over a target");
     }
 }
