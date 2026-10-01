@@ -46,6 +46,7 @@ Status column says otherwise (verified 2026-09-09).
 | `java` | — | Runs the TLA+ tools in the pinned `tla2tools.jar` (Java 11 or later; CI uses Temurin 21). Locally it runs only the PlusCal translator and the SANY parser when `models/lockproto/algorithm.txt` changes. The TLC model checks themselves are too heavy for a development machine and run only on CI (owner ruling, 2026-09-13) — do not run `just model` locally. Not needed by `just check`. | Temurin 21 (`winget install EclipseAdoptium.Temurin.21.JDK`) |
 | `tla2tools.jar` | — | The pinned TLA+ tools jar (TLC 2.19, SHA-256 checked by `models/lockproto/run.py`) that the local translation and SANY parse need; see `java`. `run.py` downloads it into `target/tla/` on first use. | fetched on demand |
 | `python3` | — | Runs `models/lockproto/run.py` (the model-check runner) and its unit tests (`just model`, `just model-test`). Python 3.14 is what CI and the development machines use; `run.py` accepts 3.11 or later (`tomllib`). Not needed by `just check`. | 3.14 (`winget install Python.Python.3.14`) |
+| `zig` | `tools/mac-cc/` | The macOS C compiler for `just check-mac` on a Windows host: blake3 (flux-core, the root crate) and criterion's `alloca` compile C for the target in their build scripts, which failed the cross-check once flux-core took blake3 for the lock record. The recipe calls it through the `tools/mac-cc/` wrappers with `CRATE_CC_NO_DEFAULTS=1`, since the cc crate would otherwise add an `arm64-apple-macosx` target that zig rejects. Measured with zig 0.16.0; the whole workspace, root crate included, now passes. | 0.16.0 (download from ziglang.org, put on PATH) |
 
 `actionlint` and `shellcheck` are winget installs, which Git Bash on this machine does not see until its PATH is reloaded, so there is no
 pre-push hook for them; CI is the gate. A clean result is meaningful: a control workflow with an unquoted variable
@@ -84,6 +85,7 @@ the tables above carry the reasons.
 | `python3` | `winget install Python.Python.3.14` | on `PATH` as `python3` |
 | `actionlint` | `winget install rhysd.actionlint` | on `PATH` as `actionlint` |
 | `shellcheck` | `winget install koalaman.shellcheck` | on `PATH` as `shellcheck` |
+| `zig` | `https://ziglang.org/download/ (unpack and put zig on PATH)` | on `PATH` as `zig` |
 <!-- tools:end -->
 
 ## Gate commands (the contract)

@@ -1,6 +1,7 @@
 //! §55's exit codes, decided from what the engine returned (cut 5).
 
 use flux_core::copy::CopyError;
+use flux_core::run::{Run, RunError};
 use flux_core::{TreeAbort, TreeOutcome};
 use flux_fs::{Code, Outcome};
 
@@ -16,9 +17,7 @@ pub fn for_tree(r: &Result<TreeOutcome, TreeAbort>) -> u8 {
     match r {
         Ok(out) if out.failures.is_empty() => SUCCESS,
         Ok(_) => FAILED,
-        Err(a) if !a.changed() && a.outcome.failures.is_empty() && is_refusal(a.error.code()) => {
-            REFUSED
-        }
+        Err(a) if a.refused_unchanged() => REFUSED,
         Err(_) => FAILED,
     }
 }
@@ -34,15 +33,33 @@ pub fn for_file(r: &Result<Outcome, CopyError>) -> u8 {
     }
 }
 
-/// §55's exit-3 refusals this engine can raise.
-fn is_refusal(code: Code) -> bool {
-    matches!(code, Code::SafetyRejected | Code::NoReplacePublishUnavailable)
+/// A run under the destination's lock (cut 7a): its own stop decides first - a refusal that changed nothing is 3
+/// (§55), any other stop is 1 - and with no stop the copy's own rule decides. Warnings never change it.
+pub fn for_tree_run(r: &Run<Result<TreeOutcome, TreeAbort>>) -> u8 {
+    for_stop(&r.stop)
+        .unwrap_or_else(|| for_tree(r.copy.as_ref().expect("a run with no stop has a copy")))
+}
+
+/// `for_tree_run`, for a single file.
+pub fn for_file_run(r: &Run<Result<Outcome, CopyError>>) -> u8 {
+    for_stop(&r.stop)
+        .unwrap_or_else(|| for_file(r.copy.as_ref().expect("a run with no stop has a copy")))
+}
+
+fn for_stop(stop: &Option<RunError>) -> Option<u8> {
+    match stop {
+        None => None,
+        Some(RunError::Refused { changed: false, .. }) => Some(REFUSED),
+        Some(_) => Some(FAILED),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use flux_core::copy::CopyStep;
+    use flux_core::lock::{LockCode, Refusal};
+    use flux_core::run::{Run, RunError, RunStep};
     use flux_fs::{FsError, MetadataFailure, MetadataItem};
     use std::path::PathBuf;
 
@@ -123,5 +140,49 @@ mod tests {
         assert_eq!(for_file(&ok(1)), FAILED);
         assert_eq!(for_file(&Err(err(Code::SafetyRejected))), REFUSED);
         assert_eq!(for_file(&Err(err(Code::IoError))), FAILED);
+    }
+
+    fn refused(changed: bool) -> RunError {
+        RunError::Refused {
+            refusal: Box::new(Refusal {
+                code: LockCode::TargetLockBusy,
+                holder: None,
+                detail: "x".to_string(),
+            }),
+            changed,
+            not_removed: None,
+        }
+    }
+
+    fn failed() -> RunError {
+        RunError::Failed {
+            step: RunStep::State,
+            path: PathBuf::from("p"),
+            error: FsError::new(Code::IoError, std::io::Error::other("x")),
+        }
+    }
+
+    #[test]
+    fn a_tree_runs_own_stop_decides_before_its_copy() {
+        let run = |copy, stop| Run { copy, stop, warnings: Vec::new() };
+        assert_eq!(for_tree_run(&run(None, Some(refused(false)))), REFUSED);
+        assert_eq!(for_tree_run(&run(None, Some(refused(true)))), FAILED);
+        assert_eq!(for_tree_run(&run(None, Some(failed()))), FAILED);
+        assert_eq!(for_tree_run(&run(Some(Ok(TreeOutcome::default())), Some(failed()))), FAILED);
+        assert_eq!(for_tree_run(&run(Some(Ok(TreeOutcome::default())), None)), SUCCESS);
+        let rolled_back = abort(Code::SafetyRejected, |_| {});
+        assert_eq!(for_tree_run(&run(Some(rolled_back), None)), REFUSED, "a refusal rolled back");
+    }
+
+    #[test]
+    fn a_file_runs_own_stop_decides_before_its_copy() {
+        let run = |copy, stop| Run { copy, stop, warnings: Vec::new() };
+        let copied = || {
+            Ok(Outcome { bytes_copied: 1, metadata_failures: Vec::new(), identity_degraded: None })
+        };
+        assert_eq!(for_file_run(&run(None, Some(refused(false)))), REFUSED);
+        assert_eq!(for_file_run(&run(Some(copied()), Some(refused(true)))), FAILED);
+        assert_eq!(for_file_run(&run(Some(copied()), None)), SUCCESS);
+        assert_eq!(for_file_run(&run(Some(Err(err(Code::SafetyRejected))), None)), REFUSED);
     }
 }

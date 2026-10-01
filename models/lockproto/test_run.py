@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import json
 import re
@@ -10,6 +11,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -2117,6 +2119,253 @@ class CostNodeTests(unittest.TestCase):
             "an unterminated final block must be None, never a partial answer")
 
 
+def text_at(module_text: str, pos: tuple[int, int]) -> str:
+    """The module text from a 1-based (line, col) position to the end of that line."""
+    line, col = pos
+    return module_text.split("\n")[line - 1][col - 1:]
+
+
+# A generated-module shape with the two traps the resolver must avoid: a guard that is a PREFIX of another
+# guard in the same label (A), and the same guard in another label (B); C holds one guard twice.
+SYNTHETIC_ACTIONS = "\n".join([
+    'A(self) == /\\ pc[self] = "A"',
+    "           /\\ IF IsRecord(seen) /\\ seen # s",
+    "                 THEN /\\ y' = 1",
+    "                 ELSE /\\ IF IsRecord(seen)",
+    "                            THEN /\\ y' = 2",
+    "                            ELSE /\\ y' = 3",
+    "           /\\ UNCHANGED z",
+    "",
+    "B(self) == /\\ IF IsRecord(seen)",
+    "                 THEN /\\ y' = 4",
+    "                 ELSE /\\ y' = 5",
+    "",
+    "C(self) == /\\ IF x = 1",
+    "                 THEN /\\ y' = 6",
+    "                 ELSE /\\ IF x = 1",
+    "                            THEN /\\ y' = 7",
+    "                            ELSE /\\ y' = 8",
+    "",
+])
+
+
+class BranchResolveTests(unittest.TestCase):
+    """resolve_branch()/arm_count() (cut 6 Part 2): an arm of an IF inside a label, counted from TLC's cost nodes.
+
+    The recorded fixture is Task 1's measurement (testdata/arm_coverage.out, from ArmFixture.tla); its counts
+    are what TLC printed, not what this code expects."""
+
+    def setUp(self) -> None:
+        self.module = (TESTDATA / "ArmFixture.tla").read_text(encoding="utf-8")
+        self.nodes = run.parse_cost_nodes(run.parse_messages(fixture("arm_coverage")[1]))
+        self.assertIsNotNone(self.nodes)
+
+    def count(self, label: str, guard: str, side: str) -> int | None:
+        span = run.resolve_branch(self.module, label, guard, side)
+        branch = run.Branch("b", "ArmFixture", label, guard, side, "why", span)
+        return run.arm_count(self.nodes, branch)
+
+    def test_the_dead_arm_counts_zero_and_a_live_arm_does_not(self) -> None:
+        self.assertEqual(self.count("branchy", "i = 7", "then"), 0, "x := 99 never runs (arm_coverage.out:69)")
+        self.assertEqual(self.count("branchy", "i = 1", "then"), 1)
+
+    def test_an_arm_producing_only_duplicate_successors_still_counts(self) -> None:
+        # twins: both arms set y' = 5 (arm_coverage.out:96, :102)
+        self.assertEqual(self.count("twins", "j = 0", "then"), 3)
+        self.assertEqual(self.count("twins", "j # 0", "then"), 3)
+
+    def test_the_translator_fallback_else_counts_its_first_conjunct(self) -> None:
+        # `ELSE /\ TRUE` has no node on its own line; its arm's first node is `y' = y` (arm_coverage.out:105)
+        self.assertEqual(self.count("twins", "j # 0", "else"), 0)
+
+    def test_the_whole_condition_must_match_not_a_prefix(self) -> None:
+        inner = run.resolve_branch(SYNTHETIC_ACTIONS, "A", "IsRecord(seen)", "else")
+        self.assertEqual(text_at(SYNTHETIC_ACTIONS, inner[0]), "ELSE /\\ y' = 3")
+        outer = run.resolve_branch(SYNTHETIC_ACTIONS, "A", "IsRecord(seen) /\\ seen # s", "then")
+        self.assertEqual(text_at(SYNTHETIC_ACTIONS, outer[0]), "THEN /\\ y' = 1")
+        self.assertEqual(text_at(SYNTHETIC_ACTIONS, outer[1]), "ELSE /\\ IF IsRecord(seen)")
+        with self.assertRaises(run.ExpectedError):
+            run.resolve_branch(SYNTHETIC_ACTIONS, "A", "IsRecord", "then")
+
+    def test_the_same_guard_in_another_label_is_not_a_match(self) -> None:
+        span = run.resolve_branch(SYNTHETIC_ACTIONS, "B", "IsRecord(seen)", "then")
+        self.assertEqual(text_at(SYNTHETIC_ACTIONS, span[0]), "THEN /\\ y' = 4")
+
+    def test_an_else_arm_ends_where_the_action_dedents(self) -> None:
+        start, end = run.resolve_branch(SYNTHETIC_ACTIONS, "A", "IsRecord(seen)", "else")
+        self.assertEqual(end, (start[0] + 1, 1), "the ELSE arm stops at the next line indented no deeper")
+
+    def test_every_unresolvable_anchor_fails_closed(self) -> None:
+        cases = {
+            "guard twice in one label": ("C", "x = 1", "then"),
+            "no such guard": ("A", "x = 1", "then"),
+            "no such label": ("D", "x = 1", "then"),
+        }
+        for why, (label, guard, side) in cases.items():
+            with self.subTest(why):
+                with self.assertRaises(run.ExpectedError):
+                    run.resolve_branch(SYNTHETIC_ACTIONS, label, guard, side)
+
+    def test_a_log_with_no_node_inside_the_arm_gives_none(self) -> None:
+        span = run.resolve_branch(self.module, "branchy", "i = 7", "then")
+        branch = run.Branch("b", "ArmFixture", "branchy", "i = 7", "then", "why", span)
+        self.assertIsNone(run.arm_count([n for n in self.nodes if n[1] != 51], branch))
+        self.assertIsNone(run.arm_count(self.nodes, run.Branch("b", "Other", "branchy", "i = 7", "then", "why", span)),
+                          "a node of another module never counts")
+
+
+BRANCHES_TOML = """
+
+[[branches]]
+name = "{name}"
+module = "ArmFixture"
+label = "branchy"
+guard = "{guard}"
+side = "then"
+reason = "a test"
+"""
+
+
+class BranchJudgeTests(unittest.TestCase):
+    """`branches` in expected.toml: loaded fail-closed, judged by --union-from over the runs that count."""
+
+    def expected_dir(self, extra: str) -> ExpectedDir:
+        d = ExpectedDir(GOOD_EXPECTED + extra)
+        self.addCleanup(d.close)
+        (d.path / "ArmFixture.tla").write_text((TESTDATA / "ArmFixture.tla").read_text(encoding="utf-8"),
+                                                encoding="utf-8")
+        return d
+
+    def logs(self, per_run: dict[str, str]) -> Path:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name) / "tlc-output-x-posix"
+        root.mkdir()
+        for name, text in per_run.items():
+            (root / f"{name}.log").write_text(text, encoding="utf-8")
+        return root.parent
+
+    def judge(self, d: ExpectedDir, per_run: dict[str, str]) -> tuple[int, str]:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = run.judge_union_from(d.load(), d.path, self.logs(per_run))
+        return code, out.getvalue()
+
+    def test_a_branch_loads_resolved(self) -> None:
+        (b,) = self.expected_dir(BRANCHES_TOML.format(name="dead", guard="i = 7")).load().branches
+        self.assertEqual((b.name, b.module, b.label, b.side), ("dead", "ArmFixture", "branchy", "then"))
+        self.assertEqual(b.span, ((51, 42), (52, 42)))
+
+    def test_each_malformed_branch_fails_at_load(self) -> None:
+        good = BRANCHES_TOML.format(name="dead", guard="i = 7")
+        cases = {
+            "unknown key": good + 'extra = "no"\n',
+            "missing reason": good.replace('reason = "a test"\n', ""),
+            "bad side": good.replace('side = "then"', 'side = "both"'),
+            "bad name": good.replace('name = "dead"', 'name = "Dead Arm"'),
+            "missing module": good.replace('module = "ArmFixture"', 'module = "Nope"'),
+            "unresolvable guard": good.replace('guard = "i = 7"', 'guard = "i = 9"'),
+            "duplicate name": good + good,
+        }
+        for why, extra in cases.items():
+            with self.subTest(why):
+                with self.assertRaises(run.ExpectedError):
+                    self.expected_dir(extra).load()
+
+    def test_an_arm_one_counted_log_covers_passes(self) -> None:
+        d = self.expected_dir(BRANCHES_TOML.format(name="live", guard="i = 1"))
+        covered = fixture("arm_coverage")[1]
+        zeroed = covered.replace("line 49, col 36 to line 49, col 44 of module ArmFixture: 1",
+                                 "line 49, col 36 to line 49, col 44 of module ArmFixture: 0")
+        self.assertNotEqual(covered, zeroed, "the replaced node line must exist, or this test asserts nothing")
+        names = [r.name for r in d.load().runs]
+        code, out = self.judge(d, {n: (covered if n == "demo-posix-check" else zeroed) for n in names})
+        self.assertEqual(code, 0, out)
+        self.assertIn("BRANCH live  1 entries", out)
+
+    def test_an_arm_no_counted_log_covers_fails(self) -> None:
+        d = self.expected_dir(BRANCHES_TOML.format(name="dead", guard="i = 7"))
+        code, out = self.judge(d, {r.name: fixture("arm_coverage")[1] for r in d.load().runs})
+        self.assertEqual(code, 1)
+        self.assertIn("MISMATCH branch dead", out)
+
+    def test_a_seeded_run_covering_the_arm_does_not_count(self) -> None:
+        d = self.expected_dir(BRANCHES_TOML.format(name="live", guard="i = 1"))
+        covered = fixture("arm_coverage")[1]
+        zeroed = covered.replace("line 49, col 36 to line 49, col 44 of module ArmFixture: 1",
+                                 "line 49, col 36 to line 49, col 44 of module ArmFixture: 0")
+        runs = d.load().runs
+        seeded = [r.name for r in runs if r.kind == "seeded"]
+        self.assertEqual(len(seeded), 1)
+        code, out = self.judge(d, {r.name: (covered if r.kind == "seeded" else zeroed) for r in runs})
+        self.assertEqual(code, 1, "only a seeded run reached the arm, and seeded runs do not count")
+        self.assertIn("MISMATCH branch live", out)
+
+    def test_which_runs_count(self) -> None:
+        d = self.expected_dir("")
+        runs = {r.kind: r for r in d.load().runs}
+        self.assertTrue(run.counts_for_branches(runs["check"], d.path), "check.cfg sets FIX_SAFE = FALSE")
+        self.assertTrue(run.counts_for_branches(runs["witness"], d.path))
+        self.assertFalse(run.counts_for_branches(runs["seeded"], d.path))
+        # The FIX_* flag is read from the CONFIG: expected.toml's `constants` does not carry it (measured on
+        # breaklock-remote-posix-fixed-check, whose constants omit FIX_REMOTE_LEASE_SPEC).
+        (d.path / "fixed.cfg").write_text("SPECIFICATION Spec\nCONSTANTS\n    FIX_SAFE = TRUE\nINVARIANT Safe\n",
+                                          encoding="utf-8")
+        fixed = dataclasses.replace(runs["check"], config="fixed.cfg")
+        self.assertFalse(run.counts_for_branches(fixed, d.path), "a run whose config sets FIX_* models a fix")
+
+    def test_no_branches_changes_nothing(self) -> None:
+        self.assertFalse(run.judge_branches((), [("any", "not even a log")]))
+
+    ARM_1 = "line 49, col 36 to line 49, col 44 of module ArmFixture: 1"
+    ARM_0 = "line 49, col 36 to line 49, col 44 of module ArmFixture: 0"
+
+    def test_a_counted_log_without_a_coverage_block_fails_the_branches(self) -> None:
+        """A counted log that parses to no complete coverage block must FAIL the branches (test audit, cut 6).
+        Without the check, arm_count iterates None and the union crashes instead of reporting."""
+        span = run.resolve_branch((TESTDATA / "ArmFixture.tla").read_text(encoding="utf-8"), "branchy", "i = 1", "then")
+        branch = run.Branch("live", "ArmFixture", "branchy", "i = 1", "then", "why", span)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            failed = run.judge_branches((branch,), [("good", fixture("arm_coverage")[1]), ("silent", "no coverage")])
+        self.assertTrue(failed, "an unreadable counted log must fail the branches, never pass or crash")
+        self.assertIn("silent's log carries no complete coverage block", out.getvalue())
+
+    def judge_union(self, d: ExpectedDir, covered_kind: str) -> tuple[bool, str]:
+        """judge_union - the path `just model` takes after running every run - with only runs of `covered_kind`
+        entering arm `live`, every other log showing it at zero."""
+        expected = d.load()
+        covered = fixture("arm_coverage")[1]
+        zeroed = covered.replace(self.ARM_1, self.ARM_0)
+        self.assertNotEqual(covered, zeroed, "the replaced node line must exist, or this test asserts nothing")
+        executed = []
+        for r in expected.runs:
+            log = d.path / f"{r.name}.log"
+            log.write_text(covered if r.kind == covered_kind else zeroed, encoding="utf-8")
+            executed.append((r, False, run.Result(r.name, "ok", frozenset(), frozenset(), None, 1.0, "", (), log)))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            failed = run.judge_union(executed, d.path, expected.never_reached, expected.deferred, expected.branches)
+        return failed, out.getvalue()
+
+    def test_judge_union_counts_a_check_run_but_not_a_seeded_one(self) -> None:
+        """The same filter as --union-from, on the path a full local run takes (test audit, cut 6)."""
+        d = self.expected_dir(BRANCHES_TOML.format(name="live", guard="i = 1"))
+        failed, out = self.judge_union(d, "check")
+        self.assertFalse(failed, out)
+        self.assertIn("BRANCH live  1 entries", out)
+        failed, out = self.judge_union(d, "seeded")
+        self.assertTrue(failed, "only a seeded run entered the arm, and seeded runs do not count")
+        self.assertIn("MISMATCH branch live", out)
+
+    def test_the_committed_branches_resolve_against_the_generated_module(self) -> None:
+        branches = {b.name: b for b in run.load_expected(run.HERE / "expected.toml").branches}
+        self.assertEqual(sorted(branches), ["s240-5-s5-non-record", "s240-5-s6-another-file"])
+        module = (run.HERE / "LockProtocol.tla").read_text(encoding="utf-8")
+        self.assertTrue(text_at(module, branches["s240-5-s6-another-file"].span[0]).startswith("THEN /\\ refused' = "))
+        self.assertTrue(text_at(module, branches["s240-5-s5-non-record"].span[0]).startswith("ELSE /\\ pc' = "))
+
+
 class PartialCoverageTests(unittest.TestCase):
     """A seeded or witness run halts at its first counterexample, so its coverage block describes a
     PREFIX of the state space. Its positive coverage is sound; its SILENCE is not evidence."""
@@ -2138,6 +2387,214 @@ class PartialCoverageTests(unittest.TestCase):
         self.assertIn("PREFIX", out.getvalue(), "a union built partly from halting runs must say so")
         for name in halting:
             self.assertIn(name, out.getvalue())
+
+
+class MutantManifestTests(unittest.TestCase):
+    """run.py --mutants (cut 6, revision 3): exact-text mutants of the model, run on CI."""
+
+    def _write(self, body: str) -> tuple[Path, Path]:
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        tmp = Path(holder.name)
+        (tmp / "configs").mkdir()
+        (tmp / "configs" / "x.cfg").write_text("SPECIFICATION Spec\nINVARIANT A\n", encoding="utf-8")
+        manifest = tmp / "mutants.toml"
+        manifest.write_text(textwrap.dedent(body), encoding="utf-8")
+        return manifest, tmp
+
+    VALID = '''
+        [[mutant]]
+        name = "t9-demo"
+        file = "invariants.txt"
+        old = "A == TRUE"
+        new = "A == FALSE"
+        config = "configs/x.cfg"
+        expect_absent = "A"
+        '''
+
+    def test_a_valid_entry_loads(self) -> None:
+        manifest, base = self._write(self.VALID)
+        (m,) = run.load_mutants(manifest, base)
+        self.assertEqual((m.name, m.file, m.config, m.present, m.absent, m.timeout_minutes),
+                         ("t9-demo", "invariants.txt", "configs/x.cfg", None, "A", 60))
+
+    def test_each_malformed_entry_fails_at_load(self) -> None:
+        cases = {
+            "unknown key": self.VALID + 'extra = "no"\n',
+            "both expectations": self.VALID + 'expect_present = "B"\n',
+            "neither expectation": self.VALID.replace('expect_absent = "A"', ""),
+            "not a model source": self.VALID.replace('"invariants.txt"', '"run.py"'),
+            "missing config": self.VALID.replace("configs/x.cfg", "configs/missing.cfg"),
+            "old equals new": self.VALID.replace('new = "A == FALSE"', 'new = "A == TRUE"'),
+            "duplicate name": self.VALID + self.VALID,
+            "bad name": self.VALID.replace('"t9-demo"', '"T9 Demo"'),
+            # A misspelled expect_absent could never be reported, so every run would count as a kill.
+            "name not in config": self.VALID.replace('expect_absent = "A"', 'expect_absent = "Z"'),
+            # A top-level key outside every [[mutant]] table (test audit, cut 6).
+            "top-level key": 'note = "x"\n' + self.VALID,
+        }
+        for label, body in cases.items():
+            with self.subTest(label):
+                manifest, base = self._write(body)
+                with self.assertRaises(run.ExpectedError):
+                    run.load_mutants(manifest, base)
+
+    def test_old_must_occur_exactly_once(self) -> None:
+        manifest, base = self._write(self.VALID)
+        (m,) = run.load_mutants(manifest, base)
+        self.assertEqual(run.apply_mutant("X\nA == TRUE\nY\n", m), "X\nA == FALSE\nY\n")
+        for text, count in (("nothing here\n", 0), ("A == TRUE\nA == TRUE\n", 2)):
+            with self.subTest(count=count):
+                with self.assertRaises(run.ExpectedError) as err:
+                    run.apply_mutant(text, m)
+                self.assertIn(f"occurs {count} times", str(err.exception))
+
+    def test_judging_what_the_mutated_run_reported(self) -> None:
+        manifest, base = self._write(self.VALID)
+        (absent,) = run.load_mutants(manifest, base)
+        present = run.Mutant("t9-p", "invariants.txt", "a", "b", "configs/x.cfg", "A", None, 60)
+        ok = lambda observed: run.Outcome(None, frozenset(observed), 10, ())
+        bad = run.Outcome("TLC error 1000: boom", frozenset(), None, ())
+        self.assertTrue(run.judge_mutant(absent, ok([]))[0], "no error: the mutant stopped A reporting")
+        # The run checks only A (narrow_config), so any report is a halt: a prefix, never a kill (capstone, cut 6).
+        self.assertFalse(run.judge_mutant(absent, ok(["B"]))[0], "another report halted the run: not a kill")
+        self.assertFalse(run.judge_mutant(absent, ok([run.DEADLOCK]))[0], "a deadlock halted the run: not a kill")
+        self.assertFalse(run.judge_mutant(absent, ok(["A"]))[0], "A still reported: survived")
+        self.assertTrue(run.judge_mutant(present, ok(["A"]))[0])
+        self.assertFalse(run.judge_mutant(present, ok([]))[0])
+        for m in (absent, present):
+            killed, detail = run.judge_mutant(m, bad)
+            self.assertFalse(killed, "a tooling error is never a kill")
+            self.assertIn("tooling", detail)
+
+    CHECK_CFG = textwrap.dedent("""\
+        \\* header naming INVARIANTS A and PROPERTY L in a comment
+        SPECIFICATION Spec
+        SYMMETRY Perms
+        CONSTANTS
+            N = 3
+            S = "INVARIANT"
+        INVARIANTS
+            A
+            \\* a comment inside the list
+            B
+        PROPERTY
+            L
+        """)
+
+    def test_narrowing_a_check_config_to_one_invariant(self) -> None:
+        out = run.narrow_config(self.CHECK_CFG, "B")
+        sections = run.cfg_sections(out)
+        self.assertEqual(sections["INVARIANT"], ["B"])
+        self.assertNotIn("PROPERTY", sections)
+        before = run.cfg_sections(self.CHECK_CFG)
+        for key in ("SPECIFICATION", "SYMMETRY", "CONSTANT"):
+            self.assertEqual(sections[key], before[key])
+        head = self.CHECK_CFG[:self.CHECK_CFG.index("INVARIANTS\n")]
+        self.assertTrue(out.startswith(head), "everything before the cut sections is kept byte for byte")
+        self.assertTrue(out.endswith("\nINVARIANT B\n"))
+
+    def test_narrowing_to_a_property_and_to_a_last_section(self) -> None:
+        out = run.narrow_config(self.CHECK_CFG, "L")
+        self.assertEqual(run.cfg_sections(out).get("PROPERTY"), ["L"])
+        self.assertNotIn("INVARIANT", run.cfg_sections(out))
+        last = "SPECIFICATION Spec\nINVARIANT A\n"  # the section runs to the end of the text
+        self.assertEqual(run.narrow_config(last, "A"), "SPECIFICATION Spec\nINVARIANT A\n")
+
+    def test_narrowing_to_a_name_the_config_does_not_check_fails(self) -> None:
+        for name in ("Z", "Perms", "Spec"):
+            with self.subTest(name):
+                with self.assertRaises(run.ExpectedError):
+                    run.narrow_config(self.CHECK_CFG, name)
+
+    ZERO_BRANCH = '''
+        [[mutant]]
+        name = "t9-zero"
+        file = "algorithm.txt"
+        old = "a"
+        new = "b"
+        config = "configs/breaklock-posix-plain-check.cfg"
+        expect_zero_branch = "{branch}"
+        '''
+
+    def _write_real(self, body: str) -> Path:
+        """A manifest judged against the REAL model directory: expect_zero_branch names expected.toml's branches."""
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        manifest = Path(holder.name) / "mutants.toml"
+        manifest.write_text(textwrap.dedent(body), encoding="utf-8")
+        return manifest
+
+    def test_a_zero_branch_expectation_names_a_committed_branch(self) -> None:
+        (m,) = run.load_mutants(self._write_real(self.ZERO_BRANCH.format(branch="s240-5-s5-non-record")), run.HERE)
+        self.assertEqual((m.present, m.absent, m.zero_branch), (None, None, "s240-5-s5-non-record"))
+        for body in (self.ZERO_BRANCH.format(branch="no-such-branch"),
+                     self.ZERO_BRANCH.format(branch="s240-5-s5-non-record") + 'expect_absent = "FsOk"\n'):
+            with self.subTest(body=body[-60:]):
+                with self.assertRaises(run.ExpectedError):
+                    run.load_mutants(self._write_real(body), run.HERE)
+
+    def test_judging_a_zero_branch_mutant(self) -> None:
+        m = run.Mutant("t9-zero", "algorithm.txt", "a", "b", "configs/x.cfg", None, None, 60, "arm")
+        ok = run.Outcome(None, frozenset(), 10, ())
+        self.assertTrue(run.judge_zero_branch(m, ok, 0)[0], "a clean run whose arm counts zero: killed")
+        self.assertFalse(run.judge_zero_branch(m, ok, 5)[0], "the arm still ran: survived")
+        killed, detail = run.judge_zero_branch(m, run.Outcome(None, frozenset({"SingleWriter"}), 10, ()), 0)
+        self.assertFalse(killed, "a run that halted has only a prefix: its zero proves nothing")
+        self.assertIn("prefix", detail)
+        for outcome, count in ((run.Outcome("TLC error 1000: boom", frozenset(), None, ()), 0), (ok, None)):
+            killed, detail = run.judge_zero_branch(m, outcome, count)
+            self.assertFalse(killed, "a tooling error or an unreadable arm is never a kill")
+            self.assertIn("tooling", detail)
+
+    def run_mutant_captured(self, name: str) -> tuple[list[str], str]:
+        """run_mutant on a committed mutant with the translator and TLC replaced: the command and the config
+        text TLC would have been given (test audit, cut 6). No TLC runs."""
+        (mutant,) = [m for m in run.load_mutants(run.HERE / "mutants.toml", run.HERE) if m.name == name]
+        seen: list[tuple[list[str], str]] = []
+
+        def translate(cmd, **_kwargs):  # the generated module the translator would write, unmutated
+            Path(cmd[-1]).write_text((run.HERE / "LockProtocol.tla").read_text(encoding="utf-8"), encoding="utf-8")
+            return run.subprocess.CompletedProcess(cmd, 0, "", "")
+
+        class FakeTLC:
+            def __init__(self, cmd, **_kwargs):
+                seen.append((cmd, Path(cmd[cmd.index("-config") + 1]).read_text(encoding="utf-8")))
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        with (mock.patch.object(run, "MUTANTS_OUT", Path(holder.name)),
+              mock.patch.object(run.subprocess, "run", translate),
+              mock.patch.object(run.subprocess, "Popen", FakeTLC)):
+            run.run_mutant(mutant, Path("tla2tools.jar"), run.HERE)
+        (captured,) = seen
+        return captured
+
+    def test_run_mutant_narrows_a_named_expectation_and_not_a_branch_mutant(self) -> None:
+        cmd, cfg = self.run_mutant_captured("t6-no-entries-conjunct")  # expect_absent FsOk, a seeded config
+        self.assertEqual(run.cfg_sections(cfg).get("INVARIANT"), ["FsOk"], "only the absent name is checked")
+        self.assertNotIn("-continue", cmd)
+        cmd, cfg = self.run_mutant_captured("t4-replacedlive-unguarded")  # expect_present ReplacedOnlyDead
+        self.assertEqual(run.cfg_sections(cfg).get("INVARIANT"), ["ReplacedOnlyDead"])
+        self.assertNotIn("-continue", cmd)
+        cmd, cfg = self.run_mutant_captured("p2-non-record-refuses")  # a branch mutant: the whole config
+        original = (run.HERE / "configs" / "breaklock-posix-plain-check.cfg").read_text(encoding="utf-8")
+        self.assertEqual(run.cfg_sections(cfg), run.cfg_sections(original), "a branch mutant is never narrowed")
+        self.assertIn("-coverage", cmd)
+
+    def test_the_committed_manifest_is_valid_against_the_current_sources(self) -> None:
+        mutants = run.load_mutants(run.HERE / "mutants.toml", run.HERE)
+        self.assertTrue(mutants)
+        for m in mutants:
+            with self.subTest(m.name):
+                text = (run.HERE / m.file).read_text(encoding="utf-8").replace("\r\n", "\n")
+                run.apply_mutant(text, m)  # raises if 'old' is stale or ambiguous
 
 
 if __name__ == "__main__":

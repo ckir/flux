@@ -14,7 +14,7 @@
      \* Done, which is what keeps TLC's deadlock check meaningful.
      variables
        \* The filesystem (FsModel.tla). A run starts from an empty lock path, or from one holding an object
-       \* that is not a Flux lock record, which no actor ever writes (design Section 7, ForeignUntouched).
+       \* that is not a Flux lock record, which no actor ever writes (design Section 7, ForeignStaysAtLockPath, ForeignContentUntouched).
        fs \in {FsInit, FsWith(P, LockName, Foreign)},
        foreignObj = At(fs, P, LockName),         \* ghost: that Foreign object, or NoObj
        classified = [p \in Procs |-> "none"],     \* ghost: each process's last judgement
@@ -31,8 +31,7 @@
        writeStale = [p \in Procs |-> TRUE],       \* a lock tenure began after it issued its publishing write
        lostLock = [p \in Procs |-> FALSE],        \* ghost: another process's write, unlink, rename or a lease lapse hit its lock file
        landedAfterTakeover = FALSE,               \* witness: a write issued in an earlier generation landed
-       recoveredAfterCrash = FALSE,               \* witness: a lock left by a crash was replaced
-       tornRead = FALSE,                          \* witness: a process read a torn record
+       replacedLive = FALSE,                      \* ghost: 240.3 replaced a lock whose owner had not crashed
        hostCrashChangedLock = FALSE,              \* witness: a host crash changed what is at the lock path
        touchedUncertain = FALSE,                  \* a lock judged uncertain was mutated
        refusedOk = [p \in Procs |-> FALSE],       \* the refusal below was justified
@@ -102,6 +101,7 @@
                          \/ (classified[p] = "cleanuplock" /\ ownerLive[p] = "dead")
                          \/ (SEED_RECOVER_UNCERTAIN /\ classified[p] = "uncertain" /\ ownerLive[p] = "none")
                          \/ (SEED_RECOVER_FOREIGN /\ classified[p] = "foreign")
+                         \/ (SEED_RECOVER_LIVE /\ ownerLive[p] = "live")
                          \/ (SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK /\ classified[p] = "cleanuplock"
                                                                 /\ ownerLive[p] = "uncertain")
        \* The states the liveness properties are about, and the two state witnesses (Section 7).
@@ -141,7 +141,6 @@
            \* record cannot show a dead owner: uncertain (96.1, 240.4, 259.6).
            with (seen = fs.content[obj]) {
              seenRec[self] := seen;
-             if (seen = Torn) { tornRead := TRUE; };
              if ((seen = Torn /\ ~SEED_TORN_AS_FOREIGN) \/ seen = EmptyFile) {
                classified[self] := "uncertain";
                ownerLive[self] := "none";
@@ -371,7 +370,7 @@
          if (crashed[self]) { goto recover_crashed; }
          else {
            with (c \in FsUnlinkChoices) { fs := FsUnlink(fs, P, BrokenOf(self), c).fs; };
-           if (victim \in Procs) { if (crashed[victim]) { recoveredAfterCrash := TRUE; }; };
+           if (victim \in Procs) { if (~crashed[victim]) { replacedLive := TRUE; }; };
            goto S240_3_release;
          };
        S240_3_s4_drop:
@@ -484,11 +483,8 @@
          \* alive is the oracle's judgement, as in classification (design Section 6.1).
          if (crashed[self]) { goto takeover_crashed; }
          else {
-           \* A torn record read HERE is deliberately not recorded in `tornRead`, unlike the classify read.
-           \* That ghost is a witness only (`NeverTornRead`), it already fires from the classify path, so
-           \* setting it here buys no coverage and changes no verdict, which is the whole reason. (It also
-           \* used to cite the breaklock-remote job's budget; that job has since been split and the reason
-           \* no longer needs it - capstone, plan 3.)
+           \* A non-record read here (torn, empty, or foreign) continues to step 6, which judges by identity.
+           \* No witness distinguishes a torn read from an empty one at this label (cut 6, item 3: a residue).
            with (seen = fs.content[tobj]) {
              if (IsRecord(seen) /\ seen # seenRec[self]) { refused[self] := "RESTART"; goto S240_5_close; }
              else if (IsRecord(seen)) {
@@ -663,7 +659,7 @@
          else {
            checked[self] := FALSE;
            checkStale[self] := TRUE;
-           if (~StillOwned(self)) {
+           if (~StillOwned(self) \/ SEED_RELEASE_CHECK_REFUSES_UNTOUCHED) {
              refusedOk[self] := lostLock[self];
              refused[self] := "TARGET_LOCK_BUSY";
              holding[self] := FALSE;
@@ -807,7 +803,9 @@
          if (crashed[self]) { goto rec_end; }
          else {
            refusedOk[self] := RefusalEvidence(self);
-           if (Replaceable(self)) { goto rec_recover; }
+           \* SEED_RECOVERER_GIVES_UP (cut 6, item 9): it judged the lock replaceable and then does nothing,
+           \* refusing nothing - the dead lock stays and no uncertainty is reported.
+           if (Replaceable(self)) { if (SEED_RECOVERER_GIVES_UP) { goto rec_end; } else { goto rec_recover; }; }
            else if (classified[self] = "empty") { goto rec_acquire; }
            else if (classified[self] = "uncertain" \/ ownerLive[self] = "uncertain") {
              refused[self] := "TARGET_LOCK_UNCERTAIN";
@@ -912,7 +910,11 @@
              if (SEED_MOVE_ASIDE_FOR_UNCERTAIN) { goto brk_recover; } else { goto brk_takeover; };
            }
            else if (ownerLive[self] = "uncertain") { refused[self] := "TARGET_LOCK_UNCERTAIN"; }
-           else if (classified[self] = "foreign") { refused[self] := "CONTROL_PLANE_NAMESPACE_CONFLICT"; }
+           \* SEED_TAKEOVER_FOREIGN (cut 6, item 12): --break-lock takes over an object that is not a lock.
+           else if (classified[self] = "foreign") {
+             if (SEED_TAKEOVER_FOREIGN) { goto brk_takeover; }
+             else { refused[self] := "CONTROL_PLANE_NAMESPACE_CONFLICT"; };
+           }
            else { refused[self] := "TARGET_LOCK_BUSY"; };
          };
        brk_refused:
@@ -927,7 +929,7 @@
          \* Revalidate the lock it now holds (Section 99).
          if (crashed[self] \/ ~holding[self]) { goto brk_end; }
          else {
-           if (~StillOwned(self)) {
+           if (~StillOwned(self) \/ SEED_RESTART_CHECK_REFUSES_UNTOUCHED) {
              refusedOk[self] := lostLock[self];
              refused[self] := "TARGET_LOCK_BUSY";
              holding[self] := FALSE;
@@ -1012,7 +1014,8 @@
            }
            or {
              \* The whole host goes down.
-             await HostCrashes /\ crashes < MaxCrashes;
+             \* HostCrashAtDurableOnly (cut 6, item 6's negative control): crash only when nothing is unflushed.
+             await HostCrashes /\ crashes < MaxCrashes /\ (~HostCrashAtDurableOnly \/ (Unflushed(fs) = {} /\ \A d \in Dirs : fs.dentries[d] = fs.entries[d]));
              \* Each in-flight call lands or is dropped at the crash (Section 5.2): at most one issued release unlink
              \* can still name the lock file, so choosing one lander, or none, covers every outcome. What landed is
              \* unflushed, so the host crash can undo it.
@@ -1050,7 +1053,8 @@
              \* which is what LockImpliesHandle forbids and therefore what FsOk must catch. The
              \* protocol cannot do this - FsTryLock requires the handle - so without the seed the
              \* invariant is true by construction and indistinguishable from TRUE (test audit, TA-1).
-             await SEED_FS_LOCK_WITHOUT_HANDLE;
+             \* Fires once (cut 6, revision 3): enabled in every state it let a gutted FsOk run past 65 million states.
+             await SEED_FS_LOCK_WITHOUT_HANDLE /\ LockImpliesHandle(fs);
              with (o \in {x \in Objs : fs.oslock[x] = NoProc}, q \in {r \in Procs : ~OpenBy(fs, r, o)}) {
                fs := [fs EXCEPT !.oslock[o] = q];
              };
@@ -1061,6 +1065,40 @@
              await SEED_FS_ALIEN_CONTENT;
              with (o \in {x \in Objs : fs.content[x] # NoContent}) {
                fs := [fs EXCEPT !.content[o] = NoProc];
+             };
+           }
+           or {
+             \* SEEDED ONLY: a name's past gains an id never allocated, which IdsNotReused's past conjunct
+             \* forbids (cut 6, items 6-7). Fires once (it disables itself), and is inert to the protocol under
+             \* strong identity: `past` is read only when IdentityStrength = "weak" (FsModel.tla).
+             await SEED_FS_PAST_UNALLOCATED /\ fs.next < MaxObjs /\ fs.past[P][ClassOf(LockName)] \subseteq 1..fs.next;
+             fs := [fs EXCEPT !.past[P][ClassOf(LockName)] = @ \cup {fs.next + 1}];
+           }
+           or {
+             \* SEEDED ONLY: a second handle record for a process and object it already has open, differing
+             \* only in `del`, which NoDoubleOpen forbids (cut 6, item 7). Fires once. On POSIX the protocol
+             \* cannot produce this: `share` forces del = TRUE, so a real double open collapses into one record
+             \* (a residue in TODO.md).
+             await SEED_FS_DOUBLE_HANDLE /\ NoDoubleOpen(fs);
+             with (h \in fs.handles) {
+               fs := [fs EXCEPT !.handles = @ \cup {[h EXCEPT !.del = ~h.del]}];
+             };
+           }
+           or {
+             \* SEEDED ONLY: an entry names an id never allocated, which IdsNotReused's entries conjunct forbids
+             \* (cut 6, item 7). Fires once. DirLockName's entry, because its only reader diverts to the backoff
+             \* label: the lock path and any Foreign start object are untouched.
+             await SEED_FS_ENTRY_UNALLOCATED /\ fs.next < MaxObjs /\ fs.entries[P][ClassOf(DirLockName)] = NoObj;
+             fs := [fs EXCEPT !.entries[P][ClassOf(DirLockName)] = fs.next + 1];
+           }
+           or {
+             \* SEEDED ONLY: record-shaped content that is not a record the protocol writes - IsRecord accepts it,
+             \* Records does not contain it (cut 6, item 8). A separate run from SEED_FS_ALIEN_CONTENT, because a
+             \* seeded run halts at its first violation. Fires once; never touches a Foreign start object; its
+             \* `op` is a real process, so a classifier that reads it evaluates `crashed[seen.op]` normally.
+             await SEED_FS_ALIEN_RECORD /\ \A x \in Objs : fs.content[x] = NoContent \/ fs.content[x] \in Contents;
+             with (o \in {x \in Objs : fs.content[x] # NoContent /\ x # foreignObj}, q \in Procs) {
+               fs := [fs EXCEPT !.content[o] = [tag |-> "record", op |-> q, kind |-> "alien"]];
              };
            }
            or {

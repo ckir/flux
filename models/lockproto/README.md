@@ -88,8 +88,20 @@ trace for any path, re-run that configuration with the witness as an invariant a
   snapshot. A label a run's actors cannot reach is listed in that run's `unreached` with its reason, and fails the run
   if it is covered after all.
 - A full `just model` also unions the coverage of every run. A label no run covers must be in `deferred`, naming
-  the planned scenario that will cover it (today `S96_1_backoff`, for `dirlock`, and `S240_3_putback`, for
-  `breaklock`), or in `never_reached`, if no run can ever cover it. Either list fails when its label is covered.
+  the planned scenario that will cover it (today `S96_1_backoff`, for `dirlock`), or in `never_reached`, if no run
+  can ever cover it. Either list fails when its label is covered.
+
+Coverage and passing runs answer "does the model explore this path", not "would the checking net catch a broken
+invariant". `models/lockproto/mutants.toml` lists exact-text mutants of the model, one invariant-breaking edit
+each; `run.py --mutants <toml>` applies each to a scratch copy, runs its one config, and checks the report against
+the manifest, while `run.py --list-mutants <toml>` only lists the names. The `Model mutants` CI workflow
+(`.github/workflows/model-mutants.yml`) runs the whole manifest on a change to it or to `run.py`, and on
+`workflow_dispatch`; it is a measurement of the checking net's own strength, not a per-commit gate.
+
+Coverage is also judged below the label. `branches` in `expected.toml` names `IF` arms of the generated module by
+label, whole condition and side; `--union-from` counts each arm's first cost node over the runs that model the
+protocol as specified (not seeded, no `FIX_*` flag in the config), and a zero fails. A branch mutant
+(`expect_zero_branch` in `mutants.toml`) is killed only by a run that finishes with its arm at zero.
 
 ## Bounds
 
@@ -110,15 +122,17 @@ kinds at once do not finish, so the check runs pair them, and each pairing is ex
 
 | Pairing | Actors | What only this pairing explores | Distinct states, POSIX / Windows |
 |---|---|---|---|
-| `recovery-<platform>-check` | Owner, 2 Recoverers, with `SYMMETRY` over the Recoverers | two recoverers racing to move the same dead lock aside (240.3 step 2) | 950,004 / 1,393,668 |
-| `recovery-<platform>-plain-check` | Owner, Recoverer, PlainRun | a plain rerun (21.1) meeting a lock a recoverer is working on | 1,645,500 / 2,334,831 |
-| `recovery-<platform>-cleanup-check` | Owner, Recoverer, Cleanup | two movers of different kinds, both entitled to move the lock aside | 1,199,193 / 1,709,754 |
-| `recovery-<platform>-plain-cleanup-check` | Owner, PlainRun, Cleanup | the plain rerun's own 240.3 path, which needs a dead cleanup lock | 1,067,868 / 1,471,158 |
+| `recovery-<platform>-check` | Owner, 2 Recoverers, with `SYMMETRY` over the Recoverers | two recoverers racing to move the same dead lock aside (240.3 step 2) | 1,835,103 / 2,069,778 |
+| `recovery-<platform>-plain-check` | Owner, Recoverer, PlainRun | a plain rerun (21.1) meeting a lock a recoverer is working on | 3,145,722 / 3,421,296 |
+| `recovery-<platform>-cleanup-check` | Owner, Recoverer, Cleanup | two movers of different kinds, both entitled to move the lock aside | 2,403,783 / 2,776,194 |
+| `recovery-<platform>-plain-cleanup-check` | Owner, PlainRun, Cleanup | the plain rerun's own 240.3 path, which needs a dead cleanup lock | 2,135,748 / 2,382,285 |
 
 - Every run starts from an empty lock path or from one holding a `Foreign` object, which no actor writes, so
-  `ForeignUntouched` has something to hold over. The empty start keeps the whole acquisition prefix.
+  `ForeignStaysAtLockPath` and `ForeignContentUntouched` have something to hold over. The empty start keeps the
+  whole acquisition prefix.
 - Seven seeded runs show the scenario's invariants can fail at all. Four re-introduce a protocol defect
-  (design Section 8): `SEED_RECOVER_FOREIGN` must break `ForeignUntouched`, `SEED_RECOVER_UNCERTAIN`
+  (design Section 8): `SEED_RECOVER_FOREIGN` must break `ForeignStaysAtLockPath` (the new `SEED_TAKEOVER_FOREIGN`,
+  in `breaklock`, breaks `ForeignContentUntouched`), `SEED_RECOVER_UNCERTAIN`
   `PlainNeverOwnsUncertain` through a torn or empty record, `SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK`
   (clean-up pairing) the same invariant through a cleanup lock whose owner is uncertain, and `SEED_DEAD_AS_BUSY`
   (plain pairing) `RefusalJustified` through the evidence a refusal rests on. `SEED_CHECK_REFUSES_UNTOUCHED`
@@ -141,8 +155,10 @@ kinds at once do not finish, so the check runs pair them, and each pairing is ex
   measurement. Nothing enforces it now: no invariant asserts that bound, so an edit giving an actor a
   second create would make `MaxObjs` start binding and `FsCreate` start failing, silently, rather than
   erroring (capstone, plan 3). Making it an invariant is the obvious fix and is not done yet.
-- `IdentityStrength = "strong"` only. Measured, the weak-identity variant explores an identical state graph here,
-  because no name in this scenario is reused.
+- `IdentityStrength = "strong"` in these pairings. The weak-identity runs are separate (cut 6): `recovery-posix-weak-check`
+  explores 2,008,428 distinct states against the strong run's 1,835,103, because a re-created lock name keeps its old
+  id in `past`; `mixed-posix-weak-check` explores 5,236,116 against 7,781,181, because a takeover refuses at once
+  under weak identity. Their witnesses, `NeverSecondPastId`, show the second id is reached.
 - `LockCapability = "strong"` only in these runs. The weak capability refuses every operation under 235.1;
   what covers that refusal belongs to `breaklock`, not here, and is described under "The 235.1 refusal"
   below.
@@ -156,9 +172,8 @@ kinds at once do not finish, so the check runs pair them, and each pairing is ex
 - The host crash keeps a directory's unflushed entry operations all-or-nothing, not as the prefix a journaled
   filesystem keeps. A partial prefix followed by a further crash is not explored (design Section 5.2).
 - The liveness run, `recovery-posix-liveness` (`DeadLockEventuallyCleared`, Owner and 2 Recoverers, no symmetry),
-  holds over 1,894,344 distinct states and is untightened: timed twice on CI at 258-261s before the `Foreign`
-  start state added 24,810 states, it fits its 30-minute
-  limit several times over.
+  holds over 3,661,143 distinct states (CI run 36523907574) and is untightened. It was timed twice on CI at
+  258-261s at 1,894,344 states, before cut 6; its 30-minute limit has not been re-measured since.
 
 ## The 235.1 refusal, and what covers it
 

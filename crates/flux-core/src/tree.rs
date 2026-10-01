@@ -3,11 +3,14 @@
 //!
 //! Design authority: `docs/superpowers/specs/2026-09-26-cut-4b-copy-tree-design.md`.
 
-use crate::copy::{CopyError, CopyStep, copy_file_at, split_destination, weaker};
-use crate::walk::{WalkEvent, walk};
+use crate::copy::{
+    CopyError, CopyStep, Guard, copy_file_guarded, split_destination, unguarded, weaker,
+};
+use crate::state::{FLUX_DIR, RESERVED_DIRS};
+use crate::walk::{Walk, WalkEvent, walk};
 use flux_fs::{
-    Code, CopyOptions, DestinationRoot, DirHandle, FileIdentity, FsError, MetadataFailure,
-    ObjectId, Publish, Safety,
+    Code, CopyOptions, DestinationRoot, DirHandle, FileIdentity, FileSystem, FsError,
+    MetadataFailure, ObjectId, Publish, Safety,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::io::ErrorKind;
@@ -53,6 +56,14 @@ impl TreeAbort {
         self.outcome.directories_created > 0
             || self.outcome.files_copied > 0
             || self.error.leftover.is_some()
+    }
+
+    /// §55's exit-3 rule for an abort: a refusal code, after nothing changed and no streamed failure. The CLI's exit
+    /// code and the run's rollback of a refused copy (cut 7a Part 3b, Q-I) decide by this one rule.
+    pub fn refused_unchanged(&self) -> bool {
+        !self.changed()
+            && self.outcome.failures.is_empty()
+            && matches!(self.error.code(), Code::SafetyRejected | Code::NoReplacePublishUnavailable)
     }
 }
 
@@ -218,6 +229,42 @@ pub fn copy_tree<F: DestinationRoot>(
     }
 }
 
+/// The source side of a tree copy, checked before anything at the destination is touched.
+pub(crate) struct Source<'a, F: FileSystem> {
+    pub(crate) events: Walk<'a, F>,
+    pub(crate) identity: FileIdentity,
+}
+
+/// Steps 1-2 of `copy_tree`, which touch no destination: the source root and its identity, and the lexical floor. The
+/// run (cut 7a Part 3b, B1) calls this before it takes the destination's lock, so a mistyped source creates nothing.
+pub(crate) fn prepare_source<'a, F: FileSystem>(
+    fs: &'a F,
+    src_root: &'a Path,
+    dst_root: &Path,
+) -> std::result::Result<Source<'a, F>, CopyError> {
+    // 1. The source root. `walk` refuses a missing or non-directory root: the whole
+    //    operation failing, before any destination call.
+    let events = walk(fs, src_root).map_err(|e| CopyError::at(CopyStep::Source, e))?;
+    let identity = fs.metadata(src_root).map_err(|e| CopyError::at(CopyStep::Source, e))?.identity;
+
+    // 2. The lexical floor, before any destination call (§129's own example, `/data`
+    //    into `/data/backup`). Runs at every identity strength.
+    if lexically_within(dst_root, src_root) {
+        return Err(refuse("the destination is the source or lies inside it"));
+    }
+    Ok(Source { events, identity })
+}
+
+/// What every entry of one tree copy shares.
+pub(crate) struct Shared<'c, F: DestinationRoot> {
+    pub(crate) fs: &'c F,
+    pub(crate) src_root: &'c Path,
+    pub(crate) src_identity: FileIdentity,
+    pub(crate) opts: &'c CopyOptions,
+    /// §99's check before each destination mutation; `&unguarded` for a copy that holds no lock.
+    pub(crate) guard: &'c Guard<'c>,
+}
+
 /// `copy_tree`'s body. Every `?` here is an abort; `copy_tree` pairs it with `out`,
 /// which holds whatever was counted before it.
 fn run_tree<F: DestinationRoot>(
@@ -228,24 +275,14 @@ fn run_tree<F: DestinationRoot>(
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<(), CopyError> {
-    // 1. The source root. `walk` refuses a missing or non-directory root: the whole
-    //    operation failing, before any destination call.
-    let events = walk(fs, src_root).map_err(|e| CopyError::at(CopyStep::Source, e))?;
-    let src_identity =
-        fs.metadata(src_root).map_err(|e| CopyError::at(CopyStep::Source, e))?.identity;
-
-    // 2. The lexical floor, before any destination call (§129's own example, `/data`
-    //    into `/data/backup`). Runs at every identity strength.
-    if lexically_within(dst_root, src_root) {
-        return Err(refuse("the destination is the source or lies inside it"));
-    }
+    let source = prepare_source(fs, src_root, dst_root)?;
 
     // 3-5. Resolve the destination, compare it with the source, create the root.
     let resolve = |e| CopyError::at(CopyStep::Resolve, e);
     let root = match fs.destination_root(dst_root) {
         Ok(root) => {
             preflight(
-                src_identity,
+                source.identity,
                 root.identity().map_err(resolve)?,
                 opts.safety,
                 &mut out.warnings,
@@ -256,7 +293,7 @@ fn run_tree<F: DestinationRoot>(
             let (parent_path, name) = split_destination(dst_root)?;
             let parent = fs.destination_root(parent_path).map_err(resolve)?;
             preflight(
-                src_identity,
+                source.identity,
                 parent.identity().map_err(resolve)?,
                 opts.safety,
                 &mut out.warnings,
@@ -276,12 +313,56 @@ fn run_tree<F: DestinationRoot>(
         }
         Err(e) => return Err(resolve(e)),
     };
-    let root_identity = root.identity().map_err(resolve)?;
+    let cx = Shared { fs, src_root, src_identity: source.identity, opts, guard: &unguarded };
+    copy_tree_at(&cx, source.events, root, out, on_report).1
+}
 
+/// Step 6 of `copy_tree`: the walk, writing through `root` and only below it, and `root` handed back with the result
+/// for a caller that goes on writing through it (the run's finish).
+///
+/// `cx.guard` runs before every destination mutation (§99, cut 7a Part 3b): before each directory is created here, and
+/// inside `copy_file_guarded` for each file. A failed guard aborts the whole copy with `TARGET_LOCK_BUSY`. A source
+/// entry whose destination is a reserved control path (`reserved_path`) fails with `CONTROL_PLANE_NAMESPACE_CONFLICT`
+/// and the rest continues.
+pub(crate) fn copy_tree_at<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    events: Walk<'_, F>,
+    root: F::Dir,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) -> (F::Dir, std::result::Result<(), CopyError>) {
+    let root_identity = match root.identity() {
+        Ok(i) => i,
+        Err(e) => return (root, Err(CopyError::at(CopyStep::Resolve, e))),
+    };
+    let mut stack = vec![Frame::Live { dir: root, created: HashSet::new() }];
+    let walked = walk_into(cx, events, root_identity, &mut stack, out, on_report);
+    // The walk emits no `Dir` for the root, so no `DirEnd` pops it, and a frame is skipped only when pushed.
+    match stack.into_iter().next() {
+        Some(Frame::Live { dir, .. }) => (dir, walked),
+        _ => unreachable!("the root frame is never popped, and never skipped"),
+    }
+}
+
+/// `copy_tree_at`'s loop. Every `?` here is an abort.
+fn walk_into<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    events: Walk<'_, F>,
+    root_identity: FileIdentity,
+    stack: &mut Vec<Frame<F::Dir>>,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) -> std::result::Result<(), CopyError> {
     // 6. The walk. NoReplace is mandatory in a tree (§241.5): every target is planned
     //    as new, and an existing one is refused at Step 2a (F3).
-    let opts = CopyOptions { publish: Publish::NoReplace, ..opts.clone() };
-    let mut stack = vec![Frame::Live { dir: root, created: HashSet::new() }];
+    let opts = CopyOptions { publish: Publish::NoReplace, ..cx.opts.clone() };
+    let cx = Shared {
+        fs: cx.fs,
+        src_root: cx.src_root,
+        src_identity: cx.src_identity,
+        opts: &opts,
+        guard: cx.guard,
+    };
     for item in events {
         let live = matches!(stack.last(), Some(Frame::Live { .. }));
         let event = match item {
@@ -297,10 +378,16 @@ fn run_tree<F: DestinationRoot>(
         };
         match event {
             WalkEvent::Dir { path, identity } => {
-                let frame = if live {
-                    enter_dir(&mut stack, &path, identity, root_identity, &opts, out, on_report)?
-                } else {
+                let frame = if !live {
                     Frame::Skipped
+                } else if reserved_path(&path) {
+                    let conflict = TreeFailureCause::CreateDir(reserved_conflict());
+                    report(out, on_report, path.clone(), conflict);
+                    Frame::Skipped
+                } else {
+                    // §99 before the directory's creation.
+                    (cx.guard)().map_err(|e| CopyError::at(CopyStep::Create, e))?;
+                    enter_dir(stack, &path, identity, root_identity, cx.opts, out, on_report)?
                 };
                 // A destination directory about to be entered must not BE the source root
                 // (owner, cut 4b capstone round 1): a bind mount inside the destination can
@@ -308,7 +395,7 @@ fn run_tree<F: DestinationRoot>(
                 // name-surrogates. Aliases of source SUBdirectories stay the §42 mount cut's.
                 if let Frame::Live { dir, .. } = &frame
                     && let (Ok(FileIdentity::Strong(a)), FileIdentity::Strong(b)) =
-                        (dir.identity(), src_identity)
+                        (dir.identity(), cx.src_identity)
                     && a == b
                 {
                     return Err(refuse(
@@ -320,7 +407,12 @@ fn run_tree<F: DestinationRoot>(
             WalkEvent::File { path } => {
                 out.files_total += 1;
                 if let Some(Frame::Live { dir, .. }) = stack.last() {
-                    copy_one(fs, src_root, dir, path, &opts, out, on_report)?;
+                    if reserved_path(&path) {
+                        let conflict = CopyError::at(CopyStep::Gate, reserved_conflict());
+                        report(out, on_report, path, TreeFailureCause::Copy(conflict));
+                    } else {
+                        copy_one(&cx, dir, path, out, on_report)?;
+                    }
                 }
             }
             WalkEvent::Symlink { path } => {
@@ -341,6 +433,30 @@ fn run_tree<F: DestinationRoot>(
         }
     }
     Ok(())
+}
+
+/// P3-F: a path below the source root, so below DEST, that IS a reserved control directory - `.flux/operations`,
+/// `.flux/standalone`, `.flux/atomic` - or lies below one. ASCII case-insensitive, because a case-folding destination
+/// folds `.FLUX/Operations` onto the reserved name. Everything else under `.flux` is ordinary data (§259.3).
+pub(crate) fn reserved_path(path: &Path) -> bool {
+    let mut parts = path.components();
+    let (Some(Component::Normal(first)), Some(Component::Normal(second))) =
+        (parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let same =
+        |a: &std::ffi::OsStr, b: &str| a.as_encoded_bytes().eq_ignore_ascii_case(b.as_bytes());
+    same(first, FLUX_DIR) && RESERVED_DIRS.iter().any(|r| same(second, r))
+}
+
+fn reserved_conflict() -> FsError {
+    FsError::new(
+        Code::ControlPlaneNamespaceConflict,
+        std::io::Error::other(
+            "its destination is a reserved Flux control path (DEST/.flux/operations, standalone or atomic); not copied",
+        ),
+    )
 }
 
 /// A `Dir` event under a live frame: the dynamic §129 check, then decision 8.
@@ -407,16 +523,14 @@ fn enter_dir<D: DirHandle>(
 
 /// A `File` event under a live frame.
 fn copy_one<F: DestinationRoot>(
-    fs: &F,
-    src_root: &Path,
+    cx: &Shared<'_, F>,
     parent: &F::Dir,
     path: PathBuf,
-    opts: &CopyOptions,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<(), CopyError> {
     let name = path.file_name().expect("a walk path ends in a name");
-    match copy_file_at(fs, &src_root.join(&path), parent, name, opts) {
+    match copy_file_guarded(cx.fs, &cx.src_root.join(&path), parent, name, cx.opts, cx.guard) {
         Ok(o) => {
             out.files_copied += 1;
             out.bytes_copied += o.bytes_copied;
@@ -439,6 +553,10 @@ fn copy_one<F: DestinationRoot>(
             // the tree's frame, relative to the destination root.
             if let Some((p, _)) = e.leftover.as_mut() {
                 *p = path.with_file_name(&*p);
+            }
+            // §99 (cut 7a Part 3b): this run no longer owns the destination's lock. The whole operation stops.
+            if e.code() == Code::TargetLockBusy {
+                return Err(e);
             }
             // Decision 3: this destination lacks a no-replace primitive. Found at the
             // FIRST publish, so the whole operation stops instead of failing every file.
@@ -473,7 +591,7 @@ fn primitive_unavailable(e: &std::io::Error) -> bool {
 
 /// The §129 pre-flight: the source root against the RESOLVED destination anchor
 /// (decision 2). A destination symlinked to the source is caught here, by identity.
-fn preflight(
+pub(crate) fn preflight(
     src: FileIdentity,
     anchor: FileIdentity,
     safety: Safety,
@@ -1159,5 +1277,161 @@ mod tests {
         assert_eq!(out.files_copied, 1);
         assert_eq!(out.special_files_skipped, 0, "nothing under a skipped subtree is reported");
         assert_eq!(got.len(), 2, "the symlink, and `sub` once: {got:?}");
+    }
+
+    #[test]
+    fn a_reserved_control_path_is_matched_case_insensitively_and_nothing_else_is() {
+        for p in [".flux/operations", ".flux/standalone/x", ".FLUX/Atomic", ".Flux/OPERATIONS/a/b"]
+        {
+            assert!(reserved_path(Path::new(p)), "{p}");
+        }
+        for p in [
+            ".flux",
+            ".flux/other",
+            ".flux/operationsx",
+            "x/.flux/operations",
+            "flux/operations",
+            "a",
+        ] {
+            assert!(!reserved_path(Path::new(p)), "{p}");
+        }
+    }
+
+    #[test]
+    fn a_source_entry_landing_in_a_reserved_control_path_fails_and_the_rest_is_copied() {
+        let fs = FaultFs::new();
+        for d in ["/src", "/src/.flux", "/src/.flux/operations", "/src/.flux/other", "/src/.FLUX"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        fs.create_dir(Path::new("/src/.FLUX/Standalone")).unwrap();
+        fs.write_file("/src/.flux/operations/x", b"x");
+        fs.write_file("/src/.flux/atomic", b"y");
+        fs.write_file("/src/.flux/other/z", b"z");
+        let (r, got) = run(&fs, "/src", "/dst", &opts());
+        let out = r.unwrap();
+        let mut conflicts: Vec<String> = got
+            .iter()
+            .filter(|f| match &f.cause {
+                TreeFailureCause::CreateDir(e) => e.code == Code::ControlPlaneNamespaceConflict,
+                TreeFailureCause::Copy(e) => e.code() == Code::ControlPlaneNamespaceConflict,
+                _ => false,
+            })
+            .map(|f| f.path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        conflicts.sort();
+        assert_eq!(conflicts, [".FLUX/Standalone", ".flux/atomic", ".flux/operations"]);
+        assert_eq!(
+            fs.read_file("/dst/.flux/other/z").as_deref(),
+            Some(&b"z"[..]),
+            "the rest of .flux is data"
+        );
+        assert!(!fs.exists("/dst/.flux/operations") && !fs.exists("/dst/.flux/atomic"));
+        assert!(!fs.exists("/dst/.FLUX/Standalone"));
+        assert_eq!(out.failures.total(), 3);
+    }
+
+    /// `copy_tree_at` into a fresh `/dst`, with `guard`.
+    fn guarded(
+        fs: &FaultFs,
+        guard: &Guard<'_>,
+    ) -> (std::result::Result<(), CopyError>, TreeOutcome) {
+        let source = prepare_source(fs, Path::new("/src"), Path::new("/dst")).unwrap();
+        fs.create_dir(Path::new("/dst")).unwrap();
+        let root = fs.destination_root(Path::new("/dst")).unwrap();
+        let o = opts();
+        let cx = Shared {
+            fs,
+            src_root: Path::new("/src"),
+            src_identity: source.identity,
+            opts: &o,
+            guard,
+        };
+        let mut out = TreeOutcome::default();
+        let (_root, r) = copy_tree_at(&cx, source.events, root, &mut out, &mut |_| {});
+        (r, out)
+    }
+
+    fn failing_after(
+        owned: u32,
+        calls: &std::cell::Cell<u32>,
+    ) -> impl Fn() -> flux_fs::Result<()> + '_ {
+        move || {
+            calls.set(calls.get() + 1);
+            if calls.get() <= owned {
+                Ok(())
+            } else {
+                Err(FsError::new(Code::TargetLockBusy, std::io::Error::other("lost")))
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_guard_aborts_the_whole_tree_with_target_lock_busy() {
+        let fs = tree();
+        let calls = std::cell::Cell::new(0);
+        // `a` first: its sweep (1) passes, its create (2) fails.
+        let (r, out) = guarded(&fs, &failing_after(1, &calls));
+        assert_eq!(r.unwrap_err().code(), Code::TargetLockBusy);
+        assert_eq!(
+            (out.files_copied, out.failures.total()),
+            (0, 0),
+            "an abort, never a per-file failure"
+        );
+        assert!(!fs.exists("/dst/a") && !fs.exists("/dst/sub"));
+    }
+
+    #[test]
+    fn the_guard_runs_before_each_directory_is_created() {
+        let fs = tree();
+        let calls = std::cell::Cell::new(0);
+        // `a`: sweep, create, publish (1-3); then `sub`'s creation (4) fails.
+        let (r, out) = guarded(&fs, &failing_after(3, &calls));
+        assert_eq!(r.unwrap_err().code(), Code::TargetLockBusy);
+        assert_eq!(calls.get(), 4);
+        assert_eq!(fs.read_file("/dst/a").as_deref(), Some(&b"A"[..]));
+        assert!(!fs.exists("/dst/sub"));
+        assert_eq!(out.directories_created, 0);
+    }
+
+    #[test]
+    fn copy_tree_at_hands_the_root_back() {
+        let fs = tree();
+        let (r, _) = guarded(&fs, &unguarded);
+        r.unwrap();
+        let source = prepare_source(&fs, Path::new("/src"), Path::new("/dst")).unwrap();
+        let root = fs.destination_root(Path::new("/dst")).unwrap();
+        let o = opts();
+        let cx = Shared {
+            fs: &fs,
+            src_root: Path::new("/src"),
+            src_identity: source.identity,
+            opts: &o,
+            guard: &unguarded,
+        };
+        let mut out = TreeOutcome::default();
+        let (back, r) = copy_tree_at(&cx, source.events, root, &mut out, &mut |_| {});
+        assert!(r.is_ok());
+        assert_eq!(back.identity().unwrap(), identity_of(&fs, "/dst"), "the same directory");
+    }
+
+    #[test]
+    fn a_refused_unchanged_abort_is_exactly_the_exit_3_rule() {
+        let abort = |code, f: fn(&mut TreeOutcome)| {
+            let mut outcome = TreeOutcome::default();
+            f(&mut outcome);
+            TreeAbort {
+                error: CopyError::at(
+                    CopyStep::Resolve,
+                    FsError::new(code, std::io::Error::other("x")),
+                ),
+                outcome,
+            }
+        };
+        assert!(abort(Code::SafetyRejected, |_| {}).refused_unchanged());
+        assert!(abort(Code::NoReplacePublishUnavailable, |_| {}).refused_unchanged());
+        assert!(!abort(Code::IoError, |_| {}).refused_unchanged());
+        assert!(!abort(Code::TargetLockBusy, |_| {}).refused_unchanged());
+        assert!(!abort(Code::SafetyRejected, |o| o.files_copied = 1).refused_unchanged());
+        assert!(!abort(Code::SafetyRejected, |o| o.failures.walk = 1).refused_unchanged());
     }
 }

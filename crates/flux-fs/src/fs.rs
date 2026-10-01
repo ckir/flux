@@ -223,6 +223,9 @@ pub trait FileSystem: Send + Sync {
 pub trait DirHandle: Sized {
     type Writer: FileHandle;
 
+    /// A lock file held open for reading and writing (§96.1). See `crate::LockFile`.
+    type Lock: crate::LockFile;
+
     /// Open a child DIRECTORY, refusing to traverse a symlink, junction or other
     /// name-surrogate reparse point. This is the operation §149.7 is about.
     fn open_dir(&self, name: &std::ffi::OsStr) -> Result<Self>;
@@ -295,6 +298,51 @@ pub trait DirHandle: Sized {
         other: &Self,
         to: &std::ffi::OsStr,
     ) -> Result<()>;
+
+    /// Create a lock file exclusively, open for reading AND writing (§96.1: "created with exclusive creation").
+    ///
+    /// The same refusals as `create_new`: MUST FAIL with `ErrorKind::AlreadyExists` if the name is taken by anything,
+    /// including a link, and never create through a link.
+    fn create_lock(&self, name: &std::ffi::OsStr) -> Result<Self::Lock>;
+
+    /// Open an EXISTING lock file for reading and writing, without creating it (§240.5 step 2; the classifier's open,
+    /// §240.1). Never follows a link.
+    ///
+    /// Refuses: a name-surrogate (`Code::SafetyRejected`); a directory (`Code::DestinationError`, kind
+    /// `IsADirectory`); any other non-regular file where the platform can tell (`Code::DestinationError`). A missing
+    /// name is `Code::IoError` with kind `NotFound`.
+    fn open_lock(&self, name: &std::ffi::OsStr) -> Result<Self::Lock>;
+
+    /// The lock capability of the filesystem this directory is on (§235.1). A filesystem outside the allowlist is
+    /// `Ok(Unsupported)`. An OS failure of the query itself is `Err` carrying that failure: the caller refuses exactly
+    /// as for `Unsupported` (`REMOTE_LOCK_UNSAFE`, §235.4 prefers refusing) and reports the cause (plan decision 6).
+    fn lock_capability(&self) -> Result<crate::LockCapability>;
+
+    /// The entries of the directory this handle holds, without `.` and `..`, in no particular order (§21.1's scan).
+    ///
+    /// Each entry's type judges the NAME, as `metadata` does: a symlink, junction or other name-surrogate is
+    /// `FileType::Symlink`, never its target's type. A directory carrying a non-surrogate reparse point (a cloud
+    /// placeholder) is a `Dir`, as `open_dir` treats it.
+    fn read_dir(&self) -> Result<Vec<crate::DirEntry>>;
+
+    /// Read a child REGULAR FILE: at most `limit + 1` bytes, so a caller can tell a file longer than `limit` (as
+    /// `LockFile::read_all` does). Never follows a link.
+    ///
+    /// Refuses as `open_lock` does: a name-surrogate (`Code::SafetyRejected`); a directory (`Code::DestinationError`,
+    /// kind `IsADirectory`); any other non-regular file where the platform can tell (`Code::DestinationError`). A
+    /// missing name is `Code::IoError` with kind `NotFound`.
+    fn read_file(&self, name: &std::ffi::OsStr, limit: usize) -> Result<Vec<u8>>;
+
+    /// Remove an EMPTY child directory (`rmdir`).
+    ///
+    /// Refuses, with these kinds (the engine branches on them): a name that is not a directory - a file, or a link of
+    /// any kind, which is never followed and never removed here - `NotADirectory`; a directory that is not empty,
+    /// `DirectoryNotEmpty`; a missing name, `NotFound`.
+    fn remove_dir(&self, name: &std::ffi::OsStr) -> Result<()>;
+
+    /// Flush this directory's entries to stable storage, so that a create, rename or removal inside it survives a
+    /// crash (the crash-safe state write: temporary, flush, rename, flush the directory).
+    fn sync(&self) -> Result<()>;
 }
 
 /// Resolving `DEST` once, at start, is the only path-based call in the writer.

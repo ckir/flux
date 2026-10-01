@@ -124,12 +124,28 @@ class Run:
     job: str = ""
 
 
+BRANCH_KEYS = frozenset({"name", "module", "label", "guard", "side", "reason"})
+
+
+@dataclass(frozen=True)
+class Branch:
+    """One arm the suite must be seen to run (cut 6 Part 2), resolved at load time against the generated module."""
+    name: str
+    module: str
+    label: str
+    guard: str
+    side: str  # "then" or "else"
+    reason: str
+    span: tuple[tuple[int, int], tuple[int, int]]
+
+
 @dataclass(frozen=True)
 class Expected:
     scenarios: list[str]
     runs: list[Run]
     never_reached: tuple[tuple[str, str], ...]
     deferred: tuple[tuple[str, str, str], ...]
+    branches: tuple[Branch, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -362,6 +378,39 @@ def _load_deferred(value: object, subject: str) -> tuple[tuple[str, str, str], .
     return tuple(entries)
 
 
+def _load_branches(value: object, base: Path) -> tuple[Branch, ...]:
+    """Validate expected.toml's `branches` and resolve each anchor. Unknown or missing keys, a bad name or side,
+    a module that does not exist, or an anchor that resolves to nothing or to two places all fail at load."""
+    _require(isinstance(value, list), "'branches' must be an array of tables")
+    assert isinstance(value, list)
+    branches: list[Branch] = []
+    for i, e in enumerate(value):
+        where = f"'branches' #{i + 1}"
+        _require(isinstance(e, dict), f"{where} must be a table")
+        assert isinstance(e, dict)
+        required = BRANCH_KEYS - {"module"}
+        _require(set(e) <= BRANCH_KEYS and required <= set(e),
+                 f"{where}: keys are name, label, guard, side, reason and optionally module; got {sorted(e)}")
+        for key, v in e.items():
+            _require(isinstance(v, str) and v != "", f"{where}: '{key}' must be a non-empty string")
+        name, module = e["name"], e.get("module", "LockProtocol")
+        where = f"'branches' {name!r}"
+        _require(re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", name) is not None,
+                 f"{where}: a name is lower-case words joined by '-'")
+        _require(e["side"] in ("then", "else"), f"{where}: side must be 'then' or 'else'")
+        path = base / f"{module}.tla"
+        _require(IDENT.fullmatch(module) is not None and path.is_file(), f"{where}: module {module}.tla not found")
+        try:
+            span = resolve_branch(path.read_text(encoding="utf-8"), e["label"], e["guard"], e["side"])
+        except ExpectedError as err:
+            raise ExpectedError(f"{where}: {err}") from err
+        branches.append(Branch(name, module, e["label"], e["guard"], e["side"], e["reason"], span))
+    names = [b.name for b in branches]
+    _require(len(set(names)) == len(names),
+             f"'branches': duplicate names {sorted({n for n in names if names.count(n) > 1})}")
+    return tuple(branches)
+
+
 def load_expected(path: Path) -> Expected:
     """Load and validate expected.toml; module and config paths are resolved beside it."""
     base = path.parent
@@ -370,8 +419,8 @@ def load_expected(path: Path) -> Expected:
     except (OSError, tomllib.TOMLDecodeError) as err:
         raise ExpectedError(f"cannot read {path}: {err}") from err
 
-    _require(set(data) <= {"scenarios", "run", "never_reached", "deferred"},
-             f"unknown top-level keys: {sorted(set(data) - {'scenarios', 'run', 'never_reached', 'deferred'})}")
+    top = {"scenarios", "run", "never_reached", "deferred", "branches"}
+    _require(set(data) <= top, f"unknown top-level keys: {sorted(set(data) - top)}")
     never_reached = _load_label_reasons(data.get("never_reached", []), "'never_reached'")
     deferred = _load_deferred(data.get("deferred", []), "'deferred'")
     scenarios = data.get("scenarios")
@@ -423,7 +472,7 @@ def load_expected(path: Path) -> Expected:
                  f"'deferred': label {label!r} is not in the label universe of any run's module")
         _require(scenario not in scenarios,
                  f"'deferred': scenario {scenario!r} is in 'scenarios' (the scenario is already built)")
-    return Expected(scenarios, runs, never_reached, deferred)
+    return Expected(scenarios, runs, never_reached, deferred, _load_branches(data.get("branches", []), base))
 
 
 def _constants_equal(a: object, b: object) -> bool:
@@ -636,6 +685,65 @@ def module_labels(module_text: str) -> LabelUniverse:
     return LabelUniverse(True, all_labels, {k: frozenset(v) for k, v in owners.items()}, process_sets)
 
 
+# One arm of a translated `IF` inside a label's action (cut 6 Part 2). pcal.trans prints `THEN` and `ELSE`
+# three columns right of their `IF`, which is what locates an arm without parsing TLA+.
+_IF_CONDITION = re.compile(r"(?<![A-Za-z0-9_])IF (.*\S)\s*$")
+
+
+def resolve_branch(module_text: str, label: str, guard: str, side: str) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Where one arm of an `IF` in `label`'s action lies in the GENERATED module: (start, end) as 1-based
+    (line, col) positions, end exclusive - the coordinates of TLC's cost nodes (message 2221).
+
+    `guard` is the WHOLE condition of the `IF`, exactly as pcal.trans printed it, so `IsRecord(seen)` does not
+    match `IsRecord(seen) /\\ seen # seenRec[self]`; only the named label's action is searched, so the same
+    guard in another label is no match. The THEN arm runs to its ELSE; the ELSE arm to the first line indented
+    no deeper than that ELSE. A label that is not exactly one action, a guard that is not exactly one `IF`, or
+    no THEN/ELSE where the translator puts them: ExpectedError - an anchor never resolves to nothing or to two
+    places."""
+    lines = module_text.split("\n")
+    heads = [i for i, text in enumerate(lines) if re.match(rf"{re.escape(label)}(\(self\))? ==", text)]
+    if len(heads) != 1:
+        raise ExpectedError(f"label {label!r}: {len(heads)} action definitions in the generated module (must be one)")
+    start = heads[0]
+    end = next((i for i in range(start + 1, len(lines)) if lines[i][:1] not in ("", " ")), len(lines))
+    hits = [(i, m.start()) for i in range(start, end)
+            for m in _IF_CONDITION.finditer(lines[i]) if m.group(1) == guard]
+    if len(hits) != 1:
+        raise ExpectedError(f"label {label!r}: guard {guard!r} matches {len(hits)} IFs (must be exactly one)")
+    line_if, col_if = hits[0]
+    col_kw = col_if + 3
+
+    def indent(text: str) -> int:
+        return len(text) - len(text.lstrip())
+
+    def keyword(word: str, after: int) -> int | None:
+        for j in range(after + 1, end):
+            if lines[j][:col_kw].strip() == "" and lines[j][col_kw:].startswith(word + " "):
+                return j
+            if lines[j].strip() and indent(lines[j]) <= col_if:
+                return None
+        return None
+
+    line_then = keyword("THEN", line_if)
+    line_else = keyword("ELSE", line_then) if line_then is not None else None
+    if line_then is None or line_else is None:
+        raise ExpectedError(f"label {label!r}: guard {guard!r} has no THEN/ELSE at column {col_kw + 1}")
+    if side == "then":
+        return (line_then + 1, col_kw + 1), (line_else + 1, col_kw + 1)
+    after = next((j for j in range(line_else + 1, end) if lines[j].strip() and indent(lines[j]) <= col_kw), end)
+    return (line_else + 1, col_kw + 1), (after + 1, 1)
+
+
+def arm_count(nodes: list[tuple[str, int, int, int, int]], branch: Branch) -> int | None:
+    """The count of the FIRST cost node inside the branch's arm - how often the arm was entered - or None when
+    this log has no node there. First by position; a child node sharing its parent's start comes after it."""
+    start, end = branch.span
+    inside = [n for n in nodes if n[0] == branch.module and start <= (n[1], n[2]) < end]
+    if not inside:
+        return None
+    return min(inside, key=lambda n: (n[1], n[2]))[3]
+
+
 SOURCES = ("LockProtocol.head", "algorithm.txt", "invariants.txt")
 
 
@@ -696,6 +804,229 @@ def check_translation(base: Path) -> int:
     if len(diff) > 60:
         print(f"        ... {len(diff) - 60} more diff lines", file=sys.stderr)
     return 1
+
+
+# Exact-text mutants of the model (cut 6, revision 3): each is applied to a scratch copy, the one config it names
+# is run, and what TLC reports is judged. Positional patches would drift as later edits move the lines; an exact
+# `old` text either still occurs exactly once or fails loudly as stale.
+MUTANT_KEYS = frozenset({"name", "file", "old", "new", "config", "expect_present", "expect_absent", "timeout_minutes",
+                          "expect_zero_branch"})
+MUTANT_FILES = (*SOURCES, "FsModel.tla")
+MUTANTS_OUT = TARGET / "mutants"
+
+
+@dataclass(frozen=True)
+class Mutant:
+    name: str
+    file: str
+    old: str
+    new: str
+    config: str
+    present: str | None  # the mutated run must REPORT this violated (a check config)
+    absent: str | None   # the mutated run, checking only this name, must report NOTHING (a seeded or witness config)
+    timeout_minutes: int
+    zero_branch: str | None = None  # the mutated run must finish with this `branches` arm at zero (cut 6 Part 2)
+
+
+def load_mutants(path: Path, base: Path) -> list[Mutant]:
+    """Parse and validate a mutants manifest. Unknown keys, a missing field, other than exactly one expectation, a
+    file that is not a model source, a config that does not exist, or a duplicate name all fail at load."""
+    try:
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as err:
+        raise ExpectedError(f"{path}: {err}") from err
+    _require(set(raw) <= {"mutant"}, f"{path}: only [[mutant]] tables are allowed")
+    entries = raw.get("mutant", [])
+    _require(isinstance(entries, list) and len(entries) > 0, f"{path}: no [[mutant]] entries")
+    mutants: list[Mutant] = []
+    seen: set[str] = set()
+    for i, e in enumerate(entries):
+        where = f"{path}: mutant {i + 1}"
+        _require(isinstance(e, dict), f"{where}: not a table")
+        unknown = set(e) - MUTANT_KEYS
+        _require(not unknown, f"{where}: unknown keys {sorted(unknown)}")
+        for key in ("name", "file", "old", "new", "config"):
+            _require(isinstance(e.get(key), str) and e[key] != "", f"{where}: '{key}' must be a non-empty string")
+        name = e["name"]
+        where = f"{path}: mutant '{name}'"
+        _require(re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", name) is not None,
+                 f"{where}: a name is lower-case words joined by '-'")
+        _require(name not in seen, f"{where}: duplicate name")
+        seen.add(name)
+        _require(e["file"] in MUTANT_FILES, f"{where}: file must be one of {', '.join(MUTANT_FILES)}")
+        _require(e["old"] != e["new"], f"{where}: 'new' equals 'old'")
+        _require((base / e["config"]).is_file(), f"{where}: config {e['config']} does not exist")
+        present, absent, zero = e.get("expect_present"), e.get("expect_absent"), e.get("expect_zero_branch")
+        _require([present, absent, zero].count(None) == 2,
+                 f"{where}: exactly one of expect_present, expect_absent and expect_zero_branch")
+        if zero is not None:
+            names = {b.name for b in load_expected(base / "expected.toml").branches}
+            _require(zero in names, f"{where}: expect_zero_branch must name a 'branches' entry of expected.toml")
+        # The name must be one the config checks: a misspelled expect_absent is checked by nothing, so it fails
+        # here, before any TLC time is spent (independent review of this plan, MG-1; narrow_config would raise later).
+        cfg_text = (base / e["config"]).read_text(encoding="utf-8")
+        checked = [t for t in cfg_sections(cfg_text).get("INVARIANT", []) if IDENT.fullmatch(t)] + cfg_properties(cfg_text)
+        for key, value in (("expect_present", present), ("expect_absent", absent)):
+            _require(value is None or (isinstance(value, str) and value in checked),
+                     f"{where}: {key} must be an invariant or property that {e['config']} checks")
+        timeout = e.get("timeout_minutes", 60)
+        _require(isinstance(timeout, int) and not isinstance(timeout, bool) and 1 <= timeout <= 170,
+                 f"{where}: timeout_minutes must be an integer from 1 to 170")
+        mutants.append(Mutant(name, e["file"], e["old"], e["new"], e["config"], present, absent, timeout, zero))
+    return mutants
+
+
+def apply_mutant(text: str, mutant: Mutant) -> str:
+    """The mutated source. `old` must occur EXACTLY once: absent means the manifest is stale, twice ambiguous."""
+    count = text.count(mutant.old)
+    if count != 1:
+        raise ExpectedError(f"mutant '{mutant.name}': 'old' occurs {count} times in {mutant.file} (must be exactly once)")
+    return text.replace(mutant.old, mutant.new, 1)
+
+
+def narrow_config(text: str, name: str) -> str:
+    """The config with its INVARIANT and PROPERTY sections cut and one section checking only `name` appended.
+
+    A mutant asks one question - does the mutant make `name` fail, or stop failing - so it runs without -continue,
+    which under many violations made TLC fail with error 2111 (CI run 36497846414). Every other byte is kept. A
+    section's span runs from its keyword to the next keyword (or the end); a comment inside it goes with it."""
+    sections = cfg_sections(text)
+    if name in sections.get("INVARIANT", []):
+        kept = "INVARIANT"
+    elif name in cfg_properties(text):
+        kept = "PROPERTY"
+    else:
+        raise ExpectedError(f"'{name}' is neither an INVARIANT nor a PROPERTY of the config")
+    keywords = [m for m in _CFG_TOKEN.finditer(text) if m.group(0) in CFG_KEYWORDS]
+    out, pos = [], 0
+    for i, m in enumerate(keywords):
+        if CFG_KEYWORDS[m.group(0)] in ("INVARIANT", "PROPERTY"):
+            end = keywords[i + 1].start() if i + 1 < len(keywords) else len(text)
+            out.append(text[pos:m.start()])
+            pos = end
+    out.append(text[pos:])
+    result = "".join(out).rstrip("\n") + f"\n{kept} {name}\n"
+    after = cfg_sections(result)
+    assert {k: after.get(k, []) for k in ("INVARIANT", "PROPERTY")} == \
+        {"INVARIANT": [name] if kept == "INVARIANT" else [], "PROPERTY": [name] if kept == "PROPERTY" else []}
+    assert {k: v for k, v in after.items() if k not in ("INVARIANT", "PROPERTY")} == \
+        {k: v for k, v in sections.items() if k not in ("INVARIANT", "PROPERTY")}
+    return result
+
+
+def judge_mutant(mutant: Mutant, outcome: Outcome) -> tuple[bool, str]:
+    """Killed or not, with the reason. A tooling error - a TLC error, no Finished message - is never a kill."""
+    if outcome.tooling_error is not None:
+        return False, f"tooling: {outcome.tooling_error}"
+    reported = ", ".join(sorted(outcome.observed)) or "no error"
+    if mutant.present is not None:
+        return mutant.present in outcome.observed, f"expected {mutant.present} violated; reported: {reported}"
+    # The run checks ONLY `absent` (narrow_config), so another invariant cannot halt it first: a kill is a run that
+    # explored everything with `absent` never violated. A deadlock report is a halt, never a kill (capstone, cut 6).
+    return not outcome.observed, f"expected {mutant.absent} NOT reported; reported: {reported}"
+
+
+def judge_zero_branch(mutant: Mutant, outcome: Outcome, count: int | None) -> tuple[bool, str]:
+    """A branch mutant (cut 6 Part 2) is killed only by a run that FINISHED - a halted run's coverage is a
+    prefix, and its zero proves nothing - and whose named arm counted zero."""
+    if outcome.tooling_error is not None:
+        return False, f"tooling: {outcome.tooling_error}"
+    if outcome.observed:
+        return False, (f"the run halted at {', '.join(sorted(outcome.observed))}: a prefix cannot show "
+                       f"that {mutant.zero_branch} never runs")
+    if count is None:
+        return False, f"tooling: no coverage node inside {mutant.zero_branch}'s arm"
+    return count == 0, f"branch {mutant.zero_branch} ran {count} times"
+
+
+def run_mutant(mutant: Mutant, jar: Path, base: Path) -> tuple[bool, str]:
+    """Apply one mutant to a scratch copy of the model, regenerate LockProtocol.tla there, run TLC on its one
+    config, and judge. The repository is never modified, so there is nothing to revert."""
+    MUTANTS_OUT.mkdir(parents=True, exist_ok=True)
+    log = MUTANTS_OUT / f"{mutant.name}.log"
+    branch = None
+    if mutant.zero_branch is not None:
+        branch = next(b for b in load_expected(base / "expected.toml").branches if b.name == mutant.zero_branch)
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        for name in MUTANT_FILES:
+            shutil.copyfile(base / name, work / name)
+        shutil.copytree(base / "configs", work / "configs")
+        source = work / mutant.file
+        source.write_text(apply_mutant(source.read_text(encoding="utf-8").replace("\r\n", "\n"), mutant),
+                          encoding="utf-8")
+        target = work / "LockProtocol.tla"
+        target.write_text("".join((work / n).read_text(encoding="utf-8") for n in SOURCES), encoding="utf-8")
+        trans = subprocess.run(["java", "-cp", str(jar), "pcal.trans", str(target)], capture_output=True, text=True)
+        if trans.returncode != 0:
+            return False, f"tooling: pcal.trans failed: {(trans.stdout + trans.stderr).strip()[-300:]}"
+        if branch is not None:  # the arm's span in the MUTATED generated module
+            try:
+                span = resolve_branch(target.read_text(encoding="utf-8"), branch.label, branch.guard, branch.side)
+            except ExpectedError as err:
+                return False, f"tooling: {err}"
+            branch = Branch(branch.name, branch.module, branch.label, branch.guard, branch.side, branch.reason, span)
+        config = work / mutant.config
+        expected = mutant.present if mutant.present is not None else mutant.absent
+        if expected is not None:  # no other invariant may fire first: it would hide `present`, or halt before `absent`
+            config.write_text(narrow_config(config.read_text(encoding="utf-8"), expected), encoding="utf-8")
+        properties = cfg_properties(config.read_text(encoding="utf-8"))  # the config TLC actually runs
+        cmd = ["java", "-XX:+UseParallelGC", "-cp", str(jar), "tlc2.TLC", "-tool", "-workers", "auto",
+               "-metadir", str(work / "states"), "-config", str(config)]
+        if branch is not None:
+            cmd.extend(["-coverage", "1"])  # a branch mutant is judged from the arm's cost node
+        cmd.append("LockProtocol")
+        with log.open("w", encoding="utf-8") as out:
+            proc = subprocess.Popen(cmd, cwd=work, stdout=out, stderr=subprocess.STDOUT)
+            try:
+                code = proc.wait(timeout=mutant.timeout_minutes * 60)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                return False, f"tooling: TIMEOUT after {mutant.timeout_minutes} min"
+            except BaseException:  # never leave TLC running
+                proc.kill()
+                proc.wait()
+                raise
+    output = log.read_text(encoding="utf-8", errors="replace")
+    outcome = interpret(code, output, properties)
+    if branch is not None:
+        nodes = parse_cost_nodes(parse_messages(output))
+        return judge_zero_branch(mutant, outcome, None if nodes is None else arm_count(nodes, branch))
+    return judge_mutant(mutant, outcome)
+
+
+def mutants_main(path: Path, only: str | None, listing: bool) -> int:
+    try:
+        mutants = load_mutants(path, HERE)
+        for m in mutants:  # a stale entry fails before any TLC time is spent
+            apply_mutant((HERE / m.file).read_text(encoding="utf-8").replace("\r\n", "\n"), m)
+    except ExpectedError as err:
+        print(f"run.py: {err}", file=sys.stderr)
+        return 2
+    if only is not None:
+        mutants = [m for m in mutants if m.name == only]
+        if not mutants:
+            print(f"run.py: no mutant named {only!r}", file=sys.stderr)
+            return 2
+    if listing:
+        print(json.dumps([m.name for m in mutants]))
+        return 0
+    if shutil.which("java") is None:
+        print("run.py: java is not on PATH (TLC needs Java 11 or later; CI uses Temurin 21)", file=sys.stderr)
+        return 2
+    try:
+        jar = ensure_jar()
+    except (ToolingError, OSError) as err:
+        print(f"run.py: {err}", file=sys.stderr)
+        return 2
+    failed = 0
+    for m in mutants:
+        killed, detail = run_mutant(m, jar, HERE)
+        print(f"{'KILLED    ' if killed else 'NOT KILLED'} {m.name}: {detail}", flush=True)
+        failed += not killed
+    print(f"run.py: {len(mutants) - failed} of {len(mutants)} mutants killed", flush=True)
+    return 1 if failed else 0
 
 
 def platform_of(name: str, scenario: str) -> str:
@@ -1224,9 +1555,49 @@ def report(result: Result, tightened: tuple[str, str] | None = None) -> None:
             print(f"         full TLC output: {result.log}")
 
 
+def counts_for_branches(run: Run, base: Path) -> bool:
+    """Whether a run's coverage counts toward `branches`: it models the protocol AS SPECIFIED. A seeded run
+    reaches arms the protocol never does (SEED_TAKEOVER_FOREIGN sends a Foreign read into S240_5_s5's
+    continue arm), and a run whose CONFIG sets a FIX_* flag TRUE models a proposed fix - the flag lives in the
+    config, not in `constants` (breaklock-remote-posix-fixed-check.cfg). Witness runs halt, but what they did
+    reach is reachable, so they count (cut 6 Part 2)."""
+    if run.kind == "seeded":
+        return False
+    flags = cfg_constants((base / run.config).read_text(encoding="utf-8"))
+    return not any(k.startswith("FIX_") and v is True for k, v in flags.items())
+
+
+def judge_branches(branches: tuple[Branch, ...], logs: list[tuple[str, str]]) -> bool:
+    """Judge `branches` over (run name, TLC log) pairs of the runs that count; returns whether it failed. Each
+    arm's count is summed over the logs; zero fails, and so does an arm no log has a node for."""
+    if not branches:
+        return False
+    parsed: list[list[tuple[str, int, int, int, int]]] = []
+    for name, text in logs:
+        nodes = parse_cost_nodes(parse_messages(text))
+        if nodes is None:
+            print(f"run.py: cannot judge branches: {name}'s log carries no complete coverage block")
+            return True
+        parsed.append(nodes)
+    failed = False
+    for b in branches:
+        counts = [c for c in (arm_count(nodes, b) for nodes in parsed) if c is not None]
+        if not counts:
+            print(f"MISMATCH branch {b.name}: no coverage node inside its arm in any of {len(parsed)} counted logs")
+            failed = True
+        elif sum(counts) == 0:
+            print(f"MISMATCH branch {b.name}: the {b.side} arm of IF {b.guard} in {b.label} never ran "
+                  f"({len(counts)} counted logs)")
+            failed = True
+        else:
+            print(f"BRANCH {b.name}  {sum(counts):,} entries over {len(counts)} counted logs")
+    return failed
+
+
 def judge_union(executed: list[tuple[Run, bool, Result]], base: Path,
                  never_reached: tuple[tuple[str, str], ...],
-                 deferred: tuple[tuple[str, str, str], ...]) -> bool:
+                 deferred: tuple[tuple[str, str, str], ...],
+                 branches: tuple[Branch, ...] = ()) -> bool:
     """The suite-wide coverage union (design Section 4), judged only when every run in
     expected.toml was selected (no --scenario). `executed` is every (run, fixed, result) this
     invocation ran. A label of any run's module is covered if ANY run of that module - any
@@ -1245,7 +1616,13 @@ def judge_union(executed: list[tuple[Run, bool, Result]], base: Path,
         entries.append((run.module, result.log.read_text(encoding="utf-8", errors="replace")))
     partial = frozenset(run.name for run, fixed, _result in executed
                         if not fixed and run.kind in HALTING_KINDS)
-    return union_from_logs(entries, base, never_reached, deferred, partial)
+    failed = union_from_logs(entries, base, never_reached, deferred, partial)
+    if not branches:
+        return failed
+    counted = [(run.name, result.log.read_text(encoding="utf-8", errors="replace"))
+               for run, fixed, result in executed
+               if not fixed and counts_for_branches(run, base) and result.log is not None]
+    return judge_branches(branches, counted) or failed
 
 
 def union_from_logs(entries: list[tuple[str, str]], base: Path,
@@ -1340,6 +1717,11 @@ def judge_union_from(expected: Expected, base: Path, logs_dir: Path) -> int:
     partial = frozenset(r.name for r in wanted if r.kind in HALTING_KINDS)
     print(f"run.py: judging the union from {len(entries)} saved logs under {logs_dir}")
     failed = union_from_logs(entries, base, expected.never_reached, expected.deferred, partial)
+    if not expected.branches:
+        return 1 if failed else 0
+    counted = [(r.name, logs[r.name].read_text(encoding="utf-8", errors="replace"))
+               for r in wanted if counts_for_branches(r, base)]
+    failed = judge_branches(expected.branches, counted) or failed
     return 1 if failed else 0
 
 
@@ -1386,11 +1768,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--zero-branches", type=Path, metavar="DIR",
                         help="report every expression TLC evaluated zero times, from logs under DIR "
                              "(a report, not a gate)")
+    parser.add_argument("--mutants", type=Path, metavar="TOML",
+                        help="run the exact-text mutants in TOML, each on a scratch copy of the model (cut 6)")
+    parser.add_argument("--list-mutants", type=Path, metavar="TOML",
+                        help="validate TOML against the current sources and print its mutant names as JSON")
+    parser.add_argument("--mutant", help="with --mutants or --list-mutants, only the mutant of this name")
     parser.add_argument("--list-scenarios", action="store_true", help="print the scenario names as JSON")
     parser.add_argument("--list-jobs", action="store_true",
                          help="print the distinct {scenario, platform} pairs as JSON")
     args = parser.parse_args(argv)
 
+    if args.mutant is not None and args.mutants is None and args.list_mutants is None:
+        print("run.py: --mutant requires --mutants or --list-mutants", file=sys.stderr)
+        return 2
+    if args.mutants is not None or args.list_mutants is not None:
+        return mutants_main(args.mutants or args.list_mutants, args.mutant, listing=args.list_mutants is not None)
     if args.platform is not None and args.scenario is None:
         print("run.py: --platform requires --scenario", file=sys.stderr)
         return 2
@@ -1465,7 +1857,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.scenario is not None:
         print("run.py: suite-wide coverage not judged for a single scenario")
-    elif judge_union(executed, base, expected.never_reached, expected.deferred):
+    elif judge_union(executed, base, expected.never_reached, expected.deferred, expected.branches):
         code = 1  # a union failure counts like a run mismatch: it outranks a tooling failure too
 
     print(f"run.py: {len(results)} runs, exit {code}")

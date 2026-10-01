@@ -43,6 +43,17 @@ CONSTANTS
     \* construction: a mutant hardwiring `refusedOk` TRUE at S99_check left the suite green (test
     \* audit, plan 3, TB-1). This seed is the wrong refusal itself.
     SEED_CHECK_REFUSES_UNTOUCHED, \* a Section 99 check that refuses a holder nobody dispossessed
+    \* Cut 6 (design 2026-09-26-cut-6). One seed per conjunct or site; FALSE outside their own run.
+    SEED_RECOVER_LIVE,                     \* 240.3 replaces a live owner's lock (item 5)
+    SEED_FS_PAST_UNALLOCATED,              \* a name's past holds an id never allocated (items 6, 7)
+    SEED_FS_DOUBLE_HANDLE,                 \* two handle records for one process and object (item 7)
+    SEED_FS_ENTRY_UNALLOCATED,             \* an entry names an id never allocated (item 7)
+    SEED_FS_ALIEN_RECORD,                  \* a record-shaped content outside Records (item 8)
+    SEED_RECOVERER_GIVES_UP,               \* a Recoverer that judged a lock dead does nothing (item 9)
+    SEED_RELEASE_CHECK_REFUSES_UNTOUCHED,  \* S99_release_check refuses an undispossessed holder (item 10)
+    SEED_RESTART_CHECK_REFUSES_UNTOUCHED,  \* S21_1_s3 refuses an undispossessed holder (item 10)
+    SEED_TAKEOVER_FOREIGN,                 \* --break-lock takes over a foreign object (item 12)
+    HostCrashAtDurableOnly,                \* the host may crash only when nothing is unflushed (item 6)
     FIX_REMOTE_LEASE_SPEC  \* fix flag of the open finding on SingleWriter: the remote-lease spec amendments (design Section 11)
 
 Procs == Owners \cup Recoverers \cup PlainRuns \cup Cleanups \cup Breakers

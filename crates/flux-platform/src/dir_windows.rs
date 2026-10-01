@@ -16,11 +16,15 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_INFORMATION, FILE_NON_DIRECTORY_FILE,
+    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_DELETE, FILE_DISPOSITION_INFORMATION,
+    FILE_DISPOSITION_INFORMATION_EX, FILE_DISPOSITION_POSIX_SEMANTICS, FILE_NON_DIRECTORY_FILE,
     FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FileDispositionInformation,
-    FileRenameInformation, NtCreateFile, NtSetInformationFile,
+    FileDispositionInformationEx, FileRenameInformation, NtCreateFile, NtSetInformationFile,
 };
-use windows_sys::Win32::Foundation::{HANDLE, UNICODE_STRING};
+use windows_sys::Win32::Foundation::{
+    HANDLE, STATUS_DELETE_PENDING, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_INFO_CLASS,
+    STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED, UNICODE_STRING,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
 };
@@ -28,6 +32,7 @@ use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
 const FILE_READ_ATTRIBUTES: u32 = 0x80;
 const FILE_LIST_DIRECTORY: u32 = 0x1;
+const FILE_ADD_FILE: u32 = 0x2;
 const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
 
 const STATUS_NOT_A_DIRECTORY: i32 = 0xC000_0103u32 as i32;
@@ -36,6 +41,7 @@ const STATUS_OBJECT_PATH_NOT_FOUND: i32 = 0xC000_003Au32 as i32;
 const STATUS_ACCESS_DENIED: i32 = 0xC000_0022u32 as i32;
 const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035u32 as i32;
 const STATUS_FILE_IS_A_DIRECTORY: i32 = 0xC000_00BAu32 as i32;
+const STATUS_DIRECTORY_NOT_EMPTY: i32 = 0xC000_0101u32 as i32;
 
 /// An `NTSTATUS` as a `std::io::Error` that KEEPS its kind.
 ///
@@ -57,13 +63,18 @@ fn nt_io_error(what: &str, status: i32) -> std::io::Error {
         // Mapping FILE_IS_A_DIRECTORY globally is safe HERE rather than merely
         // convenient: it can only be returned to a call that asked for a
         // non-directory, and `create_new_at` is the one call in this file that passes
-        // FILE_NON_DIRECTORY_FILE. If another call ever does, this mapping needs
-        // revisiting with it.
+        // FILE_NON_DIRECTORY_FILE. `open_lock_at` passes it too, and answers
+        // FILE_IS_A_DIRECTORY for an OPEN before calling this. If another call ever
+        // does, this mapping needs revisiting with it.
         STATUS_OBJECT_NAME_COLLISION | STATUS_FILE_IS_A_DIRECTORY => {
             std::io::ErrorKind::AlreadyExists
         }
         STATUS_ACCESS_DENIED => std::io::ErrorKind::PermissionDenied,
         STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => std::io::ErrorKind::NotFound,
+        // The name's file was deleted while some handle still holds it open and the volume keeps legacy delete
+        // semantics: the object is logically gone. A CREATE path answers this as AlreadyExists before calling here,
+        // because to a create the name is still occupied (cut 7a Part 1 capstone).
+        STATUS_DELETE_PENDING => std::io::ErrorKind::NotFound,
         _ => std::io::ErrorKind::Other,
     };
     std::io::Error::new(kind, format!("{what}: 0x{:08X}", status as u32))
@@ -83,6 +94,11 @@ const fn is_name_surrogate(tag: u32) -> bool {
     tag & 0x2000_0000 != 0
 }
 
+/// `IO_REPARSE_TAG_AF_UNIX`: an AF_UNIX socket file (Windows 10 and later). Its name-surrogate bit is clear, so the
+/// checks above would treat it as an ordinary file. MEASURED (cut 7a Part 3a capstone, NTFS): read, it gives 0 bytes.
+/// It is a socket, not a regular file, and the POSIX arm refuses a socket through `fstat`.
+const IO_REPARSE_TAG_AF_UNIX: u32 = 0x8000_0023;
+
 /// `Debug` is required, not decorative: the tests call `.unwrap_err()` on a
 /// `Result<StdDir, _>`, which needs `StdDir: Debug` to compile.
 #[derive(Debug)]
@@ -96,6 +112,7 @@ impl StdDir {
 
 impl DirHandle for StdDir {
     type Writer = crate::StdFile;
+    type Lock = crate::StdLock;
 
     fn open_dir(&self, name: &OsStr) -> Result<Self> {
         check_component(name)?;
@@ -227,6 +244,226 @@ impl DirHandle for StdDir {
         }
         crate::dir_windows::rename_at(&self.0, from, &other.0, to, true)
     }
+
+    fn create_lock(&self, name: &OsStr) -> Result<Self::Lock> {
+        check_component(name)?;
+        open_lock_at(&self.0, name, FILE_CREATE)
+    }
+
+    fn open_lock(&self, name: &OsStr) -> Result<Self::Lock> {
+        check_component(name)?;
+        open_lock_at(&self.0, name, FILE_OPEN)
+    }
+
+    fn lock_capability(&self) -> Result<flux_fs::LockCapability> {
+        crate::lock_file::capability_of(&self.0)
+    }
+
+    fn read_dir(&self) -> Result<Vec<flux_fs::DirEntry>> {
+        read_dir_at(&self.0)
+    }
+
+    fn read_file(&self, name: &OsStr, limit: usize) -> Result<Vec<u8>> {
+        check_component(name)?;
+        read_file_at(&self.0, name, limit)
+    }
+
+    fn remove_dir(&self, name: &OsStr) -> Result<()> {
+        check_component(name)?;
+        remove_dir_at(&self.0, name)
+    }
+
+    fn sync(&self) -> Result<()> {
+        sync_at(&self.0)
+    }
+}
+
+/// The directory `p` holds, opened AGAIN relative to itself (an empty name), with `access`. The fresh handle carries
+/// the access this caller needs and an enumeration cursor of its own. MEASURED on NTFS and ReFS (cut 7a Part 3a): the
+/// empty-name open succeeds, the new handle lists the directory, and with `FILE_ADD_FILE` it can be flushed.
+fn reopen(p: &OwnedHandle, access: u32) -> Result<OwnedHandle> {
+    let us = UNICODE_STRING { Length: 0, MaximumLength: 0, Buffer: std::ptr::null_mut() };
+    let mut oa: OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    oa.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
+    oa.RootDirectory = p.as_raw_handle() as HANDLE;
+    oa.ObjectName = &raw const us;
+    let mut h: HANDLE = std::ptr::null_mut();
+    let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    // SAFETY: every pointer is to a live local that outlives the call. ShareAccess matches `open_dir`'s reasoning.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut h,
+            access | SYNCHRONIZE,
+            &raw const oa,
+            &raw mut iosb,
+            std::ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status != 0 {
+        let code =
+            if status == STATUS_ACCESS_DENIED { Code::PermissionDenied } else { Code::IoError };
+        return Err(FsError::new(code, nt_io_error("NtCreateFile", status)));
+    }
+    // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `h` is a valid handle we own.
+    Ok(unsafe { OwnedHandle::from_raw_handle(h as _) })
+}
+
+fn read_dir_at(p: &OwnedHandle) -> Result<Vec<flux_fs::DirEntry>> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::ERROR_NO_MORE_FILES;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FULL_DIR_INFO, FileFullDirectoryInfo, FileFullDirectoryRestartInfo,
+        GetFileInformationByHandleEx,
+    };
+    let h = reopen(p, FILE_LIST_DIRECTORY)?;
+    // `u64` words, not bytes: each record starts 8-byte aligned inside the buffer (`NextEntryOffset` keeps it so), so
+    // the buffer itself must be, for the reason `rename_at` records.
+    let mut buf: Vec<u64> = vec![0u64; 8192];
+    let mut out = Vec::new();
+    let mut class = FileFullDirectoryRestartInfo;
+    loop {
+        // SAFETY: `buf` is live and writable for exactly the size given, and the handle outlives the call.
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                h.as_raw_handle() as _,
+                class,
+                buf.as_mut_ptr().cast(),
+                (buf.len() * size_of::<u64>()) as u32,
+            )
+        };
+        if ok == 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                break;
+            }
+            return Err(FsError::from_io(e));
+        }
+        class = FileFullDirectoryInfo;
+        let base: *const u8 = buf.as_ptr().cast();
+        let mut off = 0usize;
+        loop {
+            // SAFETY: the call filled `buf` with a chain of FILE_FULL_DIR_INFO records. `off` is 0 or a sum of
+            // `NextEntryOffset`s, each landing on the next record inside the buffer, and each name is
+            // `FileNameLength` bytes long.
+            let (next, attributes, tag, name) = unsafe {
+                let info = base.add(off).cast::<FILE_FULL_DIR_INFO>();
+                let units = (*info).FileNameLength as usize / 2;
+                let name =
+                    std::slice::from_raw_parts((&raw const (*info).FileName).cast::<u16>(), units);
+                (
+                    (*info).NextEntryOffset,
+                    (*info).FileAttributes,
+                    (*info).EaSize,
+                    std::ffi::OsString::from_wide(name),
+                )
+            };
+            if name != "." && name != ".." {
+                out.push(flux_fs::DirEntry { name, file_type: entry_type(attributes, tag) });
+            }
+            if next == 0 {
+                break;
+            }
+            off += next as usize;
+        }
+    }
+    Ok(out)
+}
+
+/// An entry's type from what enumeration reports. On a reparse point `EaSize` carries the reparse TAG, not an EA size.
+/// MEASURED (cut 7a Part 3a, NTFS and ReFS): a junction lists as `0x410` with `EaSize` `0xA0000003`, while a plain
+/// entry's `EaSize` is a real size (`0xDC` for `..` on NTFS), so it is read as a tag only when the bit is set. A
+/// name-surrogate is a link, and an AF_UNIX socket file is `Other`, as POSIX lists a socket. Any other reparse point on a
+/// directory is a directory, as `open_dir` treats it.
+fn entry_type(attributes: u32, ea_size: u32) -> flux_fs::FileType {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+    let reparse = attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    if reparse && is_name_surrogate(ea_size) {
+        flux_fs::FileType::Symlink
+    } else if reparse && ea_size == IO_REPARSE_TAG_AF_UNIX {
+        flux_fs::FileType::Other
+    } else if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        flux_fs::FileType::Dir
+    } else {
+        flux_fs::FileType::File
+    }
+}
+
+/// A child regular file, read. Opened as `open_lock_at` opens one (`FILE_OPEN_REPARSE_POINT`, so a link is the object
+/// opened and then refused), for reading only.
+fn read_file_at(p: &OwnedHandle, n: &OsStr, limit: usize) -> Result<Vec<u8>> {
+    use std::os::windows::fs::FileExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
+    let mut wide: Vec<u16> = n.encode_wide().collect();
+    let bytes = (wide.len() * 2) as u16;
+    let us = UNICODE_STRING { Length: bytes, MaximumLength: bytes, Buffer: wide.as_mut_ptr() };
+    let mut oa: OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    oa.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
+    oa.RootDirectory = p.as_raw_handle() as HANDLE;
+    oa.ObjectName = &raw const us;
+    let mut h: HANDLE = std::ptr::null_mut();
+    let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    // SAFETY: every pointer is to a live local that outlives the call, and `wide` outlives `us`.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut h,
+            FILE_GENERIC_READ | SYNCHRONIZE,
+            &raw const oa,
+            &raw mut iosb,
+            std::ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status != 0 {
+        // Answered first: `nt_io_error` maps FILE_IS_A_DIRECTORY to AlreadyExists, for `create_new_at`'s sake.
+        if status == STATUS_FILE_IS_A_DIRECTORY {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::new(
+                    std::io::ErrorKind::IsADirectory,
+                    "a directory is not a state file",
+                ),
+            ));
+        }
+        let code = match status {
+            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => Code::IoError,
+            STATUS_ACCESS_DENIED => Code::PermissionDenied,
+            _ => Code::IoError,
+        };
+        return Err(FsError::new(code, nt_io_error("NtCreateFile", status)));
+    }
+    // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `h` is a valid handle we own.
+    let opened = unsafe { OwnedHandle::from_raw_handle(h as _) };
+    if let Some(tag) = reparse_tag_of(&opened)? {
+        if is_name_surrogate(tag) {
+            return Err(FsError::new(
+                Code::SafetyRejected,
+                std::io::Error::other(format!("name-surrogate reparse point, tag 0x{tag:08X}")),
+            ));
+        }
+        // Any other reparse point is read, since a cloud placeholder file (OneDrive, 0x9000701A) is a regular file.
+        // A socket is not one (capstone round 1).
+        if tag == IO_REPARSE_TAG_AF_UNIX {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::other("not a regular file (an AF_UNIX socket)"),
+            ));
+        }
+    }
+    let file = File::from(opened);
+    crate::lock_file::read_loop(limit, |buf, at| file.seek_read(buf, at))
 }
 
 fn create_dir_at(p: &OwnedHandle, n: &OsStr) -> Result<OwnedHandle> {
@@ -350,6 +587,16 @@ fn create_new_at(p: &OwnedHandle, n: &OsStr) -> Result<crate::StdFile> {
     };
 
     if status != 0 {
+        // As in `open_lock_at`: a create at a delete-pending name finds it occupied.
+        if status == STATUS_DELETE_PENDING {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("NtCreateFile: 0x{:08X}", status as u32),
+                ),
+            ));
+        }
         let code = match status {
             // Aligned with metadata_at, remove_file_at and rename_at, and with POSIX,
             // which answers IoError/NotFound. Only open_dir keeps DestinationError, for
@@ -368,6 +615,85 @@ fn create_new_at(p: &OwnedHandle, n: &OsStr) -> Result<crate::StdFile> {
     // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `h` is a valid handle we own.
     let opened = unsafe { OwnedHandle::from_raw_handle(h as _) };
     Ok(crate::std_fs::std_file_from(std::fs::File::from(opened)))
+}
+
+/// The lock file, created (`FILE_CREATE`) or opened (`FILE_OPEN`) relative to `p`, for reading AND writing.
+///
+/// `FILE_OPEN_REPARSE_POINT` for both, as `create_new_at` explains: a create through a dangling link must collide,
+/// and an open must get the LINK, which is then refused below rather than followed. Share modes: read, write and
+/// DELETE, because another process must be able to open the lock to classify it, and §240.3 renames a dead owner's
+/// lock aside while it is open.
+fn open_lock_at(p: &OwnedHandle, n: &OsStr, disposition: u32) -> Result<crate::StdLock> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
+    let mut wide: Vec<u16> = n.encode_wide().collect();
+    let bytes = (wide.len() * 2) as u16;
+    let us = UNICODE_STRING { Length: bytes, MaximumLength: bytes, Buffer: wide.as_mut_ptr() };
+    let mut oa: OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    oa.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
+    oa.RootDirectory = p.as_raw_handle() as HANDLE;
+    oa.ObjectName = &raw const us;
+    let mut h: HANDLE = std::ptr::null_mut();
+    let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    // SAFETY: every pointer is to a live local that outlives the call, and `wide` outlives `us`.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut h,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | SYNCHRONIZE,
+            &raw const oa,
+            &raw mut iosb,
+            std::ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            disposition,
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status != 0 {
+        // An OPEN that meets a directory is not a name collision: `nt_io_error` maps FILE_IS_A_DIRECTORY to
+        // AlreadyExists for `create_new_at`'s sake, so answer it here first.
+        if disposition == FILE_OPEN && status == STATUS_FILE_IS_A_DIRECTORY {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::new(
+                    std::io::ErrorKind::IsADirectory,
+                    "a directory is not a lock file",
+                ),
+            ));
+        }
+        // A CREATE at a name whose file is being deleted (legacy semantics, still open elsewhere): the name is
+        // occupied until that handle closes, which is AlreadyExists to a create. An OPEN falls through to
+        // `nt_io_error`, which answers NotFound.
+        if disposition == FILE_CREATE && status == STATUS_DELETE_PENDING {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("NtCreateFile: 0x{:08X}", status as u32),
+                ),
+            ));
+        }
+        let code = match status {
+            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => Code::IoError,
+            STATUS_ACCESS_DENIED => Code::PermissionDenied,
+            _ => Code::IoError,
+        };
+        return Err(FsError::new(code, nt_io_error("NtCreateFile", status)));
+    }
+    // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `h` is a valid handle we own.
+    let opened = unsafe { OwnedHandle::from_raw_handle(h as _) };
+    // The open succeeded even on a surrogate; refuse it, as `open_dir` does. A created file cannot be one.
+    if disposition == FILE_OPEN
+        && let Some(tag) = reparse_tag_of(&opened)?
+        && is_name_surrogate(tag)
+    {
+        return Err(FsError::new(
+            Code::SafetyRejected,
+            std::io::Error::other(format!("name-surrogate reparse point, tag 0x{tag:08X}")),
+        ));
+    }
+    Ok(crate::StdLock::new(File::from(opened)))
 }
 
 fn metadata_at(p: &OwnedHandle, n: &OsStr) -> Result<Metadata> {
@@ -508,11 +834,52 @@ fn remove_file_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {
         ));
     }
 
+    let status = delete_open(&h);
+    if status != 0 {
+        return Err(FsError::new(Code::IoError, nt_io_error("NtSetInformationFile", status)));
+    }
+    drop(h);
+    Ok(())
+}
+
+/// Mark the object `h` holds deleted; the final `NTSTATUS`, 0 on success. Shared by `remove_file_at` and
+/// `remove_dir_at`.
+///
+/// POSIX delete first: the NAME goes at once, as `unlinkat` does and as the test fake models, even while other handles
+/// hold the file open - the lock's release unlinks and THEN closes (spec S99_release). Legacy semantics leave the name
+/// "delete pending" until the last handle closes, and every create or open of it meanwhile fails with
+/// STATUS_DELETE_PENDING (measured on NTFS, cut 7a Part 1 capstone). A volume or system without POSIX delete (FAT,
+/// exFAT, some redirectors, Windows before 10 1709) refuses the class or the flag; only then fall back to the legacy
+/// call, and `nt_io_error` / the create paths map the pending state for whoever meets it.
+fn delete_open(h: &OwnedHandle) -> i32 {
+    let mut posix = FILE_DISPOSITION_INFORMATION_EX {
+        Flags: FILE_DISPOSITION_DELETE | FILE_DISPOSITION_POSIX_SEMANTICS,
+    };
+    let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    // SAFETY: `posix` is a live FILE_DISPOSITION_INFORMATION_EX of the size given, and the handle outlives the call.
+    let status = unsafe {
+        NtSetInformationFile(
+            h.as_raw_handle() as _,
+            &raw mut iosb,
+            (&raw mut posix).cast(),
+            size_of::<FILE_DISPOSITION_INFORMATION_EX>() as u32,
+            FileDispositionInformationEx,
+        )
+    };
+    // Success, or a failure the legacy call would not cure.
+    if !matches!(
+        status,
+        STATUS_INVALID_PARAMETER
+            | STATUS_NOT_SUPPORTED
+            | STATUS_INVALID_INFO_CLASS
+            | STATUS_INVALID_DEVICE_REQUEST
+    ) {
+        return status;
+    }
     let mut info = FILE_DISPOSITION_INFORMATION { DeleteFile: true };
     let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
-    // SAFETY: `info` is a live FILE_DISPOSITION_INFORMATION of the size given, and
-    // the handle outlives the call.
-    let status = unsafe {
+    // SAFETY: `info` is a live FILE_DISPOSITION_INFORMATION of the size given, and the handle outlives the call.
+    unsafe {
         NtSetInformationFile(
             h.as_raw_handle() as _,
             &raw mut iosb,
@@ -520,11 +887,93 @@ fn remove_file_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {
             size_of::<FILE_DISPOSITION_INFORMATION>() as u32,
             FileDispositionInformation,
         )
+    }
+}
+
+/// `rmdir`, relative to `p`. Opened for DELETE as a DIRECTORY with `FILE_OPEN_REPARSE_POINT`, so a junction or directory
+/// symlink is the object opened - and then refused, as `unlinkat(AT_REMOVEDIR)` refuses a symlink. A file is refused
+/// by the open itself. A non-surrogate reparse point (a cloud placeholder) is a real directory and is removed.
+fn remove_dir_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {
+    let not_a_directory = || {
+        FsError::new(
+            Code::IoError,
+            std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                "remove_dir refuses what is not a directory",
+            ),
+        )
     };
+    let mut wide: Vec<u16> = n.encode_wide().collect();
+    let bytes = (wide.len() * 2) as u16;
+    let us = UNICODE_STRING { Length: bytes, MaximumLength: bytes, Buffer: wide.as_mut_ptr() };
+    let mut oa: OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    oa.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
+    oa.RootDirectory = p.as_raw_handle() as HANDLE;
+    oa.ObjectName = &raw const us;
+    let mut raw: HANDLE = std::ptr::null_mut();
+    let mut open_iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    // SAFETY: every pointer is to a live local that outlives the call, and `wide` outlives `us`. FILE_READ_ATTRIBUTES
+    // because the reparse check below queries this handle.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut raw,
+            DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+            &raw const oa,
+            &raw mut open_iosb,
+            std::ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status != 0 {
+        if status == STATUS_NOT_A_DIRECTORY {
+            return Err(not_a_directory());
+        }
+        let code = match status {
+            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => Code::IoError,
+            STATUS_ACCESS_DENIED => Code::PermissionDenied,
+            _ => Code::IoError,
+        };
+        return Err(FsError::new(code, nt_io_error("NtCreateFile", status)));
+    }
+    // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `raw` is a valid handle we own.
+    let h = unsafe { OwnedHandle::from_raw_handle(raw as _) };
+    if let Some(tag) = reparse_tag_of(&h)?
+        && is_name_surrogate(tag)
+    {
+        return Err(not_a_directory());
+    }
+    let status = delete_open(&h);
+    if status == STATUS_DIRECTORY_NOT_EMPTY {
+        return Err(FsError::new(
+            Code::IoError,
+            std::io::Error::new(
+                std::io::ErrorKind::DirectoryNotEmpty,
+                format!("NtSetInformationFile: 0x{:08X}", status as u32),
+            ),
+        ));
+    }
     if status != 0 {
         return Err(FsError::new(Code::IoError, nt_io_error("NtSetInformationFile", status)));
     }
     drop(h);
+    Ok(())
+}
+
+/// Flush the directory `p` holds. MEASURED (cut 7a Part 3a, NTFS and ReFS): `FlushFileBuffers` on a directory needs
+/// write access - `FILE_ADD_FILE` suffices, and the list-only handle a `StdDir` holds answers ACCESS_DENIED - so the
+/// flush goes through a reopened handle.
+fn sync_at(p: &OwnedHandle) -> Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::FlushFileBuffers;
+    let h = reopen(p, FILE_ADD_FILE)?;
+    // SAFETY: the handle is live for the call.
+    if unsafe { FlushFileBuffers(h.as_raw_handle() as _) } == 0 {
+        return Err(FsError::from_io(std::io::Error::last_os_error()));
+    }
     Ok(())
 }
 
@@ -1147,5 +1596,33 @@ mod judge_tests {
         assert!(is_name_surrogate(JUNCTION));
         assert!(!is_name_surrogate(0));
         assert!(!is_name_surrogate(ONEDRIVE));
+    }
+
+    #[test]
+    fn a_listed_entry_type_reads_the_tag_only_on_a_reparse_point() {
+        // Measured (cut 7a Part 3a): a junction lists as 0x410 with EaSize 0xA0000003.
+        assert_eq!(entry_type(0x410, JUNCTION), flux_fs::FileType::Symlink);
+        // A cloud placeholder directory is a directory, as `open_dir` treats it.
+        assert_eq!(
+            entry_type(FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT, ONEDRIVE),
+            flux_fs::FileType::Dir
+        );
+        // EaSize is a real EA size when the reparse bit is clear, even one with the surrogate bit set.
+        assert_eq!(entry_type(FILE_ATTRIBUTE_DIRECTORY, JUNCTION), flux_fs::FileType::Dir);
+        assert_eq!(entry_type(FILE_ATTRIBUTE_NORMAL, JUNCTION), flux_fs::FileType::File);
+    }
+
+    #[test]
+    fn an_af_unix_socket_file_lists_as_other() {
+        // Measured (cut 7a Part 3a capstone): a socket file is ARCHIVE | REPARSE_POINT with tag 0x80000023.
+        assert_eq!(
+            entry_type(0x20 | FILE_ATTRIBUTE_REPARSE_POINT, IO_REPARSE_TAG_AF_UNIX),
+            flux_fs::FileType::Other
+        );
+        // The tag counts only with the reparse bit: otherwise EaSize is a real size.
+        assert_eq!(
+            entry_type(FILE_ATTRIBUTE_NORMAL, IO_REPARSE_TAG_AF_UNIX),
+            flux_fs::FileType::File
+        );
     }
 }
