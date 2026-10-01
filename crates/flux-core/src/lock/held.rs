@@ -46,6 +46,24 @@ impl<'a, D: DirHandle> Held<'a, D> {
         Ok(())
     }
 
+    /// Q-K (cut 7a Part 3b): rewrite this operation's record IN PLACE - one write through the handle holding the lock,
+    /// flushed - keeping its `operation_id` and `owner_instance_id`, so `still_owned` still holds. The run rewrites
+    /// `workspace_path` to `none` before it removes the state the record names: a crash after that removal must not
+    /// leave a dead owner's record naming missing state (`ARTIFACT_OWNERSHIP_UNCERTAIN`, which no flag clears). A
+    /// crash DURING this write leaves a torn record, `TARGET_LOCK_UNCERTAIN`, which `--restart --break-lock` clears.
+    pub fn rewrite_record(&mut self, record: LockRecord) -> LockResult<()> {
+        let mine = self.record.as_deref().expect("rewrite_record follows write_record");
+        assert!(
+            record.operation_id == mine.operation_id
+                && record.owner_instance_id == mine.owner_instance_id,
+            "a rewrite keeps the owner"
+        );
+        self.lock.write_at_start(&record.encode())?;
+        self.lock.sync_all()?;
+        self.record = Some(Box::new(record));
+        Ok(())
+    }
+
     /// §99, `S99_check` (and `S99_release_check`): the lock path still names the file this run holds, AND the record
     /// in it is still this operation's. Both: a §240.5 takeover overwrites the record in place, so the identity alone
     /// stays the same (spec:4882-4885). Never opens the lock path (the design's "cheap by construction").
@@ -93,5 +111,57 @@ impl<'a, D: DirHandle> Held<'a, D> {
             self.dir.remove_file(&self.lock_name)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lock::test_support::{fake, record};
+    use crate::lock::{LockSite, Mode, Obtained, obtain};
+    use flux_fs::LockCapability;
+    use std::ffi::OsStr;
+
+    const ID: &str = "11111111111111111111111111111111";
+
+    #[test]
+    fn a_record_is_rewritten_in_place_keeping_its_owner() {
+        let (fs, d) = fake();
+        let site = LockSite::directory(&d, OsStr::new("dest")).unwrap();
+        let Ok(Obtained::Held { mut held, .. }) =
+            obtain(&site, LockCapability::LocalStrong, Mode::Plain, ID)
+        else {
+            panic!("a fresh lock is acquired");
+        };
+        let first = record(&site, ID, &format!("operations/{ID}"));
+        held.write_record(first.clone()).unwrap();
+        let none = LockRecord { workspace_path: "none".to_string(), ..first };
+        held.rewrite_record(none.clone()).unwrap();
+        let on_disk = decode(&fs.read_file("/p/dest.flux-lock").unwrap());
+        assert_eq!(on_disk, Decoded::Record(none.clone()));
+        assert_eq!(held.record(), Some(&none));
+        assert!(held.still_owned().unwrap(), "the same file, the same owner");
+        let calls = fs.calls();
+        let count = |p: &str| calls.iter().filter(|c| c.starts_with(p)).count();
+        assert_eq!(
+            (count("write_at_start("), count("lock_sync_all(")),
+            (2, 2),
+            "each write is flushed: {calls:?}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a rewrite keeps the owner")]
+    fn a_rewrite_never_changes_the_owner() {
+        let (_fs, d) = fake();
+        let site = LockSite::directory(&d, OsStr::new("dest")).unwrap();
+        let Ok(Obtained::Held { mut held, .. }) =
+            obtain(&site, LockCapability::LocalStrong, Mode::Plain, ID)
+        else {
+            panic!("a fresh lock is acquired");
+        };
+        let first = record(&site, ID, "none");
+        held.write_record(first.clone()).unwrap();
+        let _ = held.rewrite_record(LockRecord { owner_instance_id: "2".repeat(32), ..first });
     }
 }
