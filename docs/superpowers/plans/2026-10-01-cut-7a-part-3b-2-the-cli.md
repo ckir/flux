@@ -1161,3 +1161,16 @@ the end-to-end tests on Windows, Ubuntu and macOS.
 - **"Errors and exit statuses":** every row's exit status is produced by `for_stop` or the copy's own rule (Task 2).
 - **Types:** `BeforeMutation`, `RunConfig::before_mutation`, `for_tree_run`, `for_file_run`, `stop_lines`,
   `run_warning_line`, `run_config`, `debug_hook`, `run_lines` are each defined once and used with the same names.
+
+## Stand-downs
+
+- **Panel (agy, 2 rounds): GREEN at round 2.** Briefs `.clavity/seams/cut7a-p3b2-plan-panel-r1.md` and `-r2.md`, replies
+  `.clavity/scratch/cut7a-p3b2-plan-panel/r1-reply.md` and `r2-reply.md`. FOLDED (round 1, `030375a`): `--restart` alone
+  against an empty lock was untested; Task 5 now asserts exit 3 and `TARGET_LOCK_UNCERTAIN`, with its mutant.
+- REJECTED (round 1): "the tree copy is concurrent, so the hook's count is reordered" - `walk_into` is one sequential loop
+  over a walk sorted by name (`crates/flux-core/src/tree.rs` `walk_into`, `walk.rs` `sorted`), so `a`'s three mutations
+  always precede `sub`'s. Withdrawn by the reviewer.
+- REJECTED (round 1): "`Code` is not imported in `main.rs`" - `crates/flux-cli/src/main.rs:8` imports it. Withdrawn.
+- REJECTED (round 2): "the new tests in `exit_code.rs` and `report.rs` cannot see `FsError` or `Code`" - both test
+  modules import `FsError` (`exit_code.rs:46`, `report.rs:220`) and reach `Code` through `use super::*`. Withdrawn.
+
