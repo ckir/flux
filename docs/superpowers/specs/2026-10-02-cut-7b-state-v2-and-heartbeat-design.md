@@ -96,8 +96,10 @@ A `FileIdentity` is a string:
 - `"strong:<volume>:<id>"`, `"weak:<volume>:<id>"`, or `"unavailable"`;
 - `volume` and `id` are the decimal `ObjectId` fields (`crates/flux-fs/src/fs.rs:52-76`; `id` is a u128).
 
-**A tree manifest** carries only the "both kinds" keys. §249.1 governs the adjacent record; the tree's identity
-metadata arrives with the cuts that read it.
+**A tree manifest** carries only the "both kinds" keys. §249.1 governs the adjacent record. §218's minimum list
+(`attempt_id`, `target_identity`, `source_identity`, `artifact_generation`, spec:9330-9340) sits under "For isolated
+single-file operations" (spec:9296-9297), so it binds the adjacent record too. The tree's identity metadata arrives
+with the cuts that read it.
 
 **Consistency (version 2; a violation is `STATE_CORRUPT`):**
 - `cleanup_pending = true` only with `state` `COMPLETED`. A `COMPLETED` record always has it `true` (decision 10).
@@ -138,6 +140,8 @@ FAILED and COMPLETED writes, and `--restart` setting ABANDONED and `superseded_b
   - **Torn:** the ownership check fails, nothing more is written, and the lock is closed without unlinking. The next run
     meets `TARGET_LOCK_UNCERTAIN`, which `--restart --break-lock` clears.
   - Either way the report names the heartbeat failure, not a lost lock.
+  - Once a heartbeat has failed, the run makes no further heartbeat attempt. The copy's removal of its temporary, the
+    guards around it, and the finish run without one, so a second failure can never replace or nest inside the first.
 
 ## The finish (changed from 7a)
 
