@@ -395,20 +395,24 @@ fn complete<D: DirHandle, P: Place<D>>(
     if let Err(fault) = owned(&locked.held, &locked.lock_shown) {
         return Some(fault.into_error(RunStep::State));
     }
-    locked.state.state = OpState::Completed;
     // §218 (cut 7b decision 10): cleanup_pending in this same COMPLETED write, before anything is removed, with what
-    // the copy left; a single file also records its published target.
-    if let Some(c) = &mut locked.state.cleanup {
+    // the copy left; a single file also records its published target. Built as a copy and adopted only once written:
+    // if the write fails, `fail` writes FAILED from the state as it was, never a FAILED record carrying the COMPLETED
+    // write's `cleanup_pending`, which the next run would refuse as STATE_CORRUPT (capstone r4).
+    let mut done = locked.state.clone();
+    done.state = OpState::Completed;
+    if let Some(c) = &mut done.cleanup {
         c.cleanup_pending = true;
         c.cleanup_pending_artifacts = leftovers.iter().map(|p| native_hex(p)).collect();
     }
-    if let (Some(f), Some(id)) = (&mut locked.state.file, published) {
+    if let (Some(f), Some(id)) = (&mut done.file, published) {
         f.target_identity = Some(identity_text(id));
     }
-    if let Err(error) = place.write(&locked.state) {
+    if let Err(error) = place.write(&done) {
         let path = place.shown(&locked.state.operation_id);
         return Some(stop_after_record(place, locked, RunStep::State, path, error));
     }
+    locked.state = done;
     if !leftovers.is_empty() {
         warnings.push(RunWarning::StateKept(place.shown(&locked.state.operation_id)));
     } else if let Err((path, error)) = remove_own(place, &mut locked, false) {

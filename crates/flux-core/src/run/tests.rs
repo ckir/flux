@@ -921,6 +921,20 @@ fn a_completed_record_says_cleanup_pending_and_names_its_target_before_anything_
 }
 
 #[test]
+fn a_failed_completed_write_leaves_a_failed_record_the_next_run_can_read() {
+    let fs = fake();
+    // `rename_replace`: CREATED (1), TRANSFERRING (2), the publish (3), then COMPLETED (4), which fails; the FAILED
+    // write after it (5) succeeds. The record must not carry the COMPLETED write's `cleanup_pending` (capstone r4).
+    fs.fail_nth("rename_replace", 4, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let r = run_file(&fs, &cfg());
+    assert!(matches!(&r.stop, Some(RunError::Failed { step: RunStep::State, .. })), "{:?}", r.stop);
+    let s = decode_state(&fs.read_file(record_path(ID)).unwrap())
+        .expect("a record the next run can read");
+    assert_eq!(s.state, OpState::Failed);
+    assert_eq!(s.cleanup.map(|c| c.cleanup_pending), Some(false));
+}
+
+#[test]
 fn a_clean_trees_completed_manifest_says_cleanup_pending_with_an_empty_list() {
     let fs = fake();
     let s = kept_tree_manifest(&fs);
