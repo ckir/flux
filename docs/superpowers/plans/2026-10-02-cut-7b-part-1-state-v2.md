@@ -665,7 +665,7 @@ git commit -m "state: version 2 - cleanup_pending, the single-file record's §24
 `crates/flux-platform/tests/dir_handle.rs` and `crates/flux-core/src/fault_fs.rs`.
 
 - [ ] **Step 0: verify state.** Confirm:
-  - `pub trait FileHandle: Write { fn sync_all(&self) -> Result<()>; }` at `crates/flux-fs/src/fs.rs:99-101`;
+  - `pub trait FileHandle: Write { fn sync_all(&self) -> Result<()>; }` at `crates/flux-fs/src/fs.rs:102-104`;
   - `impl FileHandle for StdFile` at `std_fs.rs:41-45`;
   - `impl FileHandle for FakeHandle` at `fault_fs.rs:316`;
   - `impl FileHandle for NullWriter` at `fs.rs:393`;
@@ -1295,3 +1295,12 @@ Part 2 (the heartbeat) is planned after this part lands, against its code:
 - `copy_file_guarded`'s signature, which Task 3 does not change (it changes the `Outcome` it returns);
 - `open_operation`'s single `now`;
 - the finish's `complete`, as Task 5 leaves it.
+
+## Stand-downs
+
+Plan panel (agy, rounds 1-2; briefs `.clavity/seams/cut7b-p1-plan-panel-r{1,2}.md`):
+- FOLDED r1 MG-1: Task 1's version-1 encoding mutant is caught only by the byte-exact test (`68a31e7`).
+- FOLDED r2 (citation census, row 10): `FileHandle` is at `crates/flux-fs/src/fs.rs:102-104`, not `99-101`.
+- Noted, no change: r2's census row 6 quoted a line that is not in `crates/flux-core/src/run/mod.rs:265`. The plan's
+  own citation of that line is correct, so the census row was the error. The three fault counts were confirmed by the
+  call-count seat, and each still carries a verify-before-relying instruction for the executing subagent.
