@@ -617,8 +617,8 @@ pub fn decode(bytes: &[u8]) -> Result<OperationState, Unusable> {
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
-            let odd = Path::new(OsStr::from_bytes(b"caf\xe9"));
-            assert_eq!(native_hex(odd), "636166e9", "the raw bytes, not a UTF-8 replacement");
+            let odd = Path::new(OsStr::from_bytes(b"ab\xff"));
+            assert_eq!(native_hex(odd), "6162ff", "the raw bytes, not a UTF-8 replacement");
             assert_eq!(from_native_hex(&native_hex(odd)).as_deref(), Some(odd));
         }
         #[cfg(windows)]
