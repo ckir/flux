@@ -85,7 +85,7 @@ One JSON object, as in version 1. `format_version` is still judged before any ot
 | Key | Value |
 |---|---|
 | `artifact_type` | `"file"` |
-| `attempt_id` | a fresh 32-hex id, generated once per run with the same generator as `operation_id`. It is an `AttemptId`, not the ordinal `attempt_number` (spec:4244-4250). |
+| `attempt_id` | a fresh 32-hex id, generated once per run with the same generator as `operation_id`. It is an `AttemptId`, not the ordinal `attempt_number` (spec:4244-4250). A `--restart` run mints its own; superseding a prior never changes the prior's. |
 | `artifact_generation` | `1` (a counter; one generation per operation until retries exist) |
 | `source_identity` | the source file's `FileIdentity`, taken by the run's source check before the lock (7a B1) |
 | `target_identity` | nullable. At creation: the identity of the object already at the target name, or `null` if none. In the `COMPLETED` write: the published target's identity. |
@@ -133,13 +133,15 @@ FAILED and COMPLETED writes, and `--restart` setting ABANDONED and `superseded_b
   - both at every other ownership check the run makes after its record exists, so a long `--restart` sweep (one
     ownership check before each deletion, 7a Q-H) heartbeats too.
 - Before the record is written (7a step 5), the heartbeat does nothing: there is no record to refresh.
-- **Failure (decision 7):** after the retry fails, the copy stops at that point and the run's stop is a failure at
-  the lock (`RunError::Failed`, naming the lock path and the I/O error), never `TARGET_LOCK_BUSY`. The finish takes the
-  failure path, and whatever the record then holds decides it:
+- **Failure (decision 7):** after the retry fails, the copy stops at that point. The run's report is exactly ONE error
+  for it: the I/O error, naming the lock path. It is never `TARGET_LOCK_BUSY`, and never a second line for the same
+  event; exit 1. The finish takes the failure path, and whatever the record then holds decides it:
   - **Intact:** FAILED and the release proceed as for any failure.
-  - **Torn:** the ownership check fails, nothing more is written, and the lock is closed without unlinking. The next run
-    meets `TARGET_LOCK_UNCERTAIN`, which `--restart --break-lock` clears.
-  - Either way the report names the heartbeat failure, not a lost lock.
+  - **Torn:** the finish's ownership check fails. 7a's `fail` would turn that into a lost lock (`owned` maps `false` to
+    `Fault::Lost`, `crates/flux-core/src/run/session.rs:208-213`), so after a heartbeat failure the finish handles it
+    instead: it writes nothing, adds no stop of its own, and closes the lock without unlinking. The next run meets
+    `TARGET_LOCK_UNCERTAIN`, which `--restart --break-lock` clears.
+  - Either way the report names the heartbeat failure, not a lost lock. A test pins both paths.
   - Once a heartbeat has failed, the run makes no further heartbeat attempt. The copy's removal of its temporary, the
     guards around it, and the finish run without one, so a second failure can never replace or nest inside the first.
 
@@ -147,7 +149,16 @@ FAILED and COMPLETED writes, and `--restart` setting ABANDONED and `superseded_b
 
 `complete` writes `COMPLETED` with `cleanup_pending = true` and the leftover list, durably and while owned, as 7a's
 single `COMPLETED` write does today. A single file also sets `target_identity` to the published target's identity in
-that write. Then, as in 7a:
+that write.
+
+That identity comes from the copy, never from a fresh look-up by name: the copy reads it from the open handle of the
+temporary it published (a rename keeps the object) and returns it with its outcome, and the run carries it to the
+finish. That needs a file-handle identity in `flux-fs` (`FileIdentity` from an open file; today only a directory handle
+has `identity`, `crates/flux-fs/src/fs.rs:237`), implemented for POSIX, Windows and the fake. It follows the copy's rule
+that nothing re-resolves a destination path (`crates/flux-core/src/copy.rs:386-389`); a look-up after the rename could
+name an object a non-Flux process put there in between.
+
+Then, as in 7a:
 - no leftovers: Q-K, then remove the state, then the release;
 - leftovers: keep the state, then the release.
 
@@ -183,6 +194,8 @@ All on the fake unless named:
   `operation_id`/`owner_instance_id` stay. A failed heartbeat write is retried once; two failures stop the run naming
   the lock path; a torn heartbeat write is reported as that failure, not `TARGET_LOCK_BUSY`. No heartbeat write
   syncs.
+- **File-handle identity:** on each platform and the fake, the identity read from an open file equals the identity a
+  directory look-up of its name gives, and stays the same across a rename.
 - **End to end (CLI):** a stalled debug run with a short `FLUX_TEST_HEARTBEAT_INTERVAL_MS` shows the lock record's
   heartbeat move.
 
@@ -195,3 +208,9 @@ Every new test is proven red under a mutant of the behaviour it pins.
 - §249.1's `last_heartbeat_wall_time` in the adjacent record is the creation value. The lock record carries the live
   heartbeat (§229.2 places the lease in the lock record).
 - The state's version follows its writer: a rewrite never upgrades a record.
+
+## Stand-downs
+
+- DISCARDED-BELOW-FLOOR (panel r1, Cascade Analyst): a crash between removing the manifest and removing the operation
+  directory leaves an empty directory. Unreachable as a corruption, because 7a first retires the workspace to
+  `<id>.removing` (`crates/flux-core/src/state.rs:235`, `REMOVING_SUFFIX`), which the §21.1 scan passes over.
