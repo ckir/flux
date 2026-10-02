@@ -78,7 +78,7 @@ One JSON object, as in version 1. `format_version` is still judged before any ot
 | Key | Value |
 |---|---|
 | `cleanup_pending` | `false` until the `COMPLETED` write, `true` from it on (decision 10) |
-| `cleanup_pending_artifacts` | an array of strings, `[]` until the `COMPLETED` write. Each string is a leftover temporary's path, in the hex encoding `target_path_key` uses (the hex of the OS-encoded bytes, `crates/flux-core/src/lock/site.rs:116-117`). For a tree it is relative to DEST, with `/` between components; for a single file it is the name in the target's directory. Lossless, so a non-UTF-8 name can never be listed wrongly. |
+| `cleanup_pending_artifacts` | an array of strings, `[]` until the `COMPLETED` write. Each string is a leftover temporary's path as lowercase hex of the platform's NATIVE name units: the raw bytes on POSIX (`OsStrExt::as_bytes`), the UTF-16 code units little-endian on Windows (`OsStrExt::encode_wide`). For a tree it is relative to DEST, with `/` (as a native unit) between components; for a single file it is the name in the target's directory. Lossless and specified, so a non-UTF-8 name is never listed wrongly. Not `as_encoded_bytes`: Rust documents that encoding as unspecified and platform-specific (panel r2, PD-1). |
 
 **A single file adds** (§249.1; decision 4):
 
@@ -141,7 +141,9 @@ FAILED and COMPLETED writes, and `--restart` setting ABANDONED and `superseded_b
     `Fault::Lost`, `crates/flux-core/src/run/session.rs:208-213`), so after a heartbeat failure the finish handles it
     instead: it writes nothing, adds no stop of its own, and closes the lock without unlinking. The next run meets
     `TARGET_LOCK_UNCERTAIN`, which `--restart --break-lock` clears.
-  - Either way the report names the heartbeat failure, not a lost lock. A test pins both paths.
+  - Either way the report names the heartbeat failure, not a lost lock. A test pins both paths. A later, DIFFERENT
+    failure - the FAILED write itself failing, say - is still reported beside it, as 7a reports it beside a copy error
+    (`a_failed_write_of_failed_is_reported_beside_the_copy_error`).
   - Once a heartbeat has failed, the run makes no further heartbeat attempt. The copy's removal of its temporary, the
     guards around it, and the finish run without one, so a second failure can never replace or nest inside the first.
 
@@ -181,7 +183,8 @@ implementation map needs no new item. This is a claim for the plan panel to chec
 ## Testing
 
 All on the fake unless named:
-- **Codec:** version 2 round-trips for both kinds; every required key is checked (a missing one is `STATE_CORRUPT`);
+- **Codec:** version 2 round-trips for both kinds; an artifact path round-trips through the native-unit hex, including
+  an unpaired surrogate on Windows and a non-UTF-8 byte on POSIX; every required key is checked (a missing one is `STATE_CORRUPT`);
   version 1 still decodes and classifies as before; version 3 is `INCOMPATIBLE_STATE`; a superseded version-1 prior is
   rewritten as version 1; a `FileIdentity` string round-trips each variant, including a u128 id above u64.
 - **Single-file record:** all 16 §249.1 keys are present. `target_identity` is `null` for a new target, holds the old
@@ -194,6 +197,8 @@ All on the fake unless named:
   `operation_id`/`owner_instance_id` stay. A failed heartbeat write is retried once; two failures stop the run naming
   the lock path; a torn heartbeat write is reported as that failure, not `TARGET_LOCK_BUSY`. No heartbeat write
   syncs.
+- **Heartbeat during `--restart`:** with a zero interval, a `--restart` that supersedes priors refreshes the lock
+  record during its sweep, before the copy starts.
 - **File-handle identity:** on each platform and the fake, the identity read from an open file equals the identity a
   directory look-up of its name gives, and stays the same across a rename.
 - **End to end (CLI):** a stalled debug run with a short `FLUX_TEST_HEARTBEAT_INTERVAL_MS` shows the lock record's
