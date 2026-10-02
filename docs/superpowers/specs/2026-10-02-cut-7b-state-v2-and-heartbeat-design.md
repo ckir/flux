@@ -146,7 +146,10 @@ FAILED and COMPLETED writes, and `--restart` setting ABANDONED and `superseded_b
     themselves, immediately before their own check:
     - the `--restart` sweep, before each ownership check;
     - the run's guard closure, before each guarded mutation;
-    - the copy loop, every 64 KiB.
+    - the copy loop, every 64 KiB. The loop calls no guard today (`crates/flux-core/src/copy.rs:437-449`; the guard
+      runs only before the create, the publish and the removal of a temporary), so `copy_file_guarded` and the tree
+      copy that calls it take the heartbeat as a second callback beside the guard. A copy outside a run (the unlocked
+      `copy_file` and `copy_tree` wrappers) passes one that does nothing.
     "Every ownership check" in the bullet above means these three places.
   - The FINISH never heartbeats: its ownership checks (`complete`, `fail`, the rollback) only check, because nothing
     in it makes the heartbeat call. The Q-K rewrite
@@ -243,3 +246,6 @@ Every new test is proven red under a mutant of the behaviour it pins.
 - DISCARDED-BELOW-FLOOR (panel r1, Cascade Analyst): a crash between removing the manifest and removing the operation
   directory leaves an empty directory. Unreachable as a corruption, because 7a first retires the workspace to
   `<id>.removing` (`crates/flux-core/src/state.rs:235`, `REMOVING_SUFFIX`), which the §21.1 scan passes over.
+- REJECTED (panel r6, Fold Auditor): "the 64 KiB copy loop ... calling the injected `guard()` closure". The loop
+  calls no guard (`crates/flux-core/src/copy.rs:437-449`); the finding's substance, how the heartbeat reaches the loop,
+  was settled in the same round (a second callback).
