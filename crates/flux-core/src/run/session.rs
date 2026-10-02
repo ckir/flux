@@ -14,7 +14,9 @@ use crate::state::{
     ARTIFACT_STATE, FileFields, OpState, OperationState, Takeover, identity_text, wall_time_ns,
 };
 use flux_fs::{Code, DirHandle, FsError, LockCapability};
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// The lock this run holds, its record written, and this operation's state as last written.
 pub(crate) struct Locked<'a, D: DirHandle> {
@@ -22,6 +24,62 @@ pub(crate) struct Locked<'a, D: DirHandle> {
     pub(crate) state: OperationState,
     /// The lock's path, as messages name it.
     pub(crate) lock_shown: PathBuf,
+    /// The heartbeat (cut 7b): due, done, or failed.
+    pub(crate) pulse: Pulse,
+}
+
+/// The run's heartbeat (cut 7b, §101, decisions 6-7): the interval, the instant of the last record write, and whether
+/// a heartbeat has failed. In `Cell`s: the heartbeat runs where the run holds only a shared borrow of its lock - the
+/// copy's callbacks and the `--restart` sweep's checks.
+pub(crate) struct Pulse {
+    interval: Duration,
+    last: Cell<Instant>,
+    failed: Cell<bool>,
+}
+
+impl Pulse {
+    /// Made as the record is written: the interval counts from then.
+    pub(crate) fn new(interval: Duration) -> Self {
+        Pulse { interval, last: Cell::new(Instant::now()), failed: Cell::new(false) }
+    }
+
+    /// A heartbeat has failed: the run makes no further attempt, and the finish handles a record it can no longer read
+    /// as its own (`fail`).
+    pub(crate) fn failed(&self) -> bool {
+        self.failed.get()
+    }
+
+    /// Refresh `held`'s record once the interval has passed since the last write; a failed write is retried once, at
+    /// once (decision 7). After a failure, nothing: a second failure can never replace or nest inside the first. The
+    /// error is the plain I/O error; each caller names the lock.
+    pub(crate) fn beat<D: DirHandle>(&self, held: &Held<'_, D>) -> flux_fs::Result<()> {
+        if self.failed.get() || self.last.get().elapsed() < self.interval {
+            return Ok(());
+        }
+        let now = wall_time_ns();
+        match held.heartbeat(now).or_else(|_| held.heartbeat(now)) {
+            Ok(()) => {
+                self.last.set(Instant::now());
+                Ok(())
+            }
+            Err(e) => {
+                self.failed.set(true);
+                Err(lock_io(e))
+            }
+        }
+    }
+}
+
+/// A heartbeat failure as the copy reports it (decision 7): the I/O error, naming the lock path, never
+/// TARGET_LOCK_BUSY.
+pub(crate) fn beat_error(lock_shown: &Path, e: FsError) -> FsError {
+    let code = if e.code == Code::TargetLockBusy { Code::IoError } else { e.code };
+    let message = format!(
+        "the heartbeat could not refresh the lock record {}: {}",
+        lock_shown.display(),
+        e.source
+    );
+    FsError::new(code, std::io::Error::new(e.source.kind(), message))
 }
 
 /// Steps 3-5 of "The run", then `--restart`'s supersede, then TRANSFERRING: returns the lock with this operation's
@@ -112,11 +170,21 @@ pub(crate) fn open_operation<'a, D: DirHandle, P: Place<D>>(
                     let unwritten = Obtained::Held { held, leftover_broken: None };
                     return Err(give_back(unwritten, error, &lock_shown));
                 }
-                Locked { held, state, lock_shown: lock_shown.clone() }
+                Locked {
+                    held,
+                    state,
+                    lock_shown: lock_shown.clone(),
+                    pulse: Pulse::new(cfg.heartbeat_interval),
+                }
             }
             Obtained::Claimed(claimed) => match claimed.overwrite(record) {
                 Ok(Overwritten::Held(held)) => {
-                    let mut locked = Locked { held, state, lock_shown: lock_shown.clone() };
+                    let mut locked = Locked {
+                        held,
+                        state,
+                        lock_shown: lock_shown.clone(),
+                        pulse: Pulse::new(cfg.heartbeat_interval),
+                    };
                     // §240.5 step 6, after the flush succeeded: the takeover, in this operation's state.
                     locked.state.takeover = Some(Takeover::of_unreadable(wall_time_ns()));
                     if let Err(error) = place.write(&locked.state) {
@@ -233,12 +301,20 @@ pub(crate) fn owned<D: DirHandle>(held: &Held<'_, D>, lock_shown: &Path) -> Resu
 const LOST: &str =
     "this run no longer holds the destination's lock: another run took it over or removed it";
 
+const AFTER_HEARTBEAT: &str = "kept: a heartbeat write failed, so this run cannot tell whether the destination's lock is still its own";
+
 /// The copy's guard (`copy_file_guarded`, `copy_tree_at`): §99 as the `FsError` the engine aborts on. A check that
-/// cannot tell counts as lost: the copy must not go on writing.
-pub(crate) fn guarded<D: DirHandle>(held: &Held<'_, D>) -> flux_fs::Result<()> {
+/// cannot tell counts as lost: the copy must not go on writing. After a failed heartbeat (cut 7b) its reason names the
+/// heartbeat: the record may be the one the heartbeat tore, not another run's.
+pub(crate) fn guarded<D: DirHandle>(held: &Held<'_, D>, pulse: &Pulse) -> flux_fs::Result<()> {
+    let why = if pulse.failed() { AFTER_HEARTBEAT } else { LOST };
     match held.still_owned() {
         Ok(true) => Ok(()),
-        Ok(false) => Err(FsError::new(Code::TargetLockBusy, std::io::Error::other(LOST))),
+        Ok(false) => Err(FsError::new(Code::TargetLockBusy, std::io::Error::other(why))),
+        Err(e) if pulse.failed() => Err(FsError::new(
+            Code::TargetLockBusy,
+            std::io::Error::other(format!("{why}: {}", lock_io(e).source)),
+        )),
         Err(e) => Err(FsError::new(Code::TargetLockBusy, lock_io(e).source)),
     }
 }

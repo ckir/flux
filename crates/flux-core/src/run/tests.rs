@@ -4,7 +4,7 @@ use super::*;
 use crate::copy::CopyStep;
 use crate::fault_fs::FaultFs;
 use crate::lock::LockCode;
-use crate::lock::record::{Decoded, decode};
+use crate::lock::record::{Decoded, LockRecord, decode};
 use crate::lock::test_support::{dead_lock, live_lock, record};
 use crate::state::{Kind, OperationState, UNREADABLE, decode as decode_state};
 use flux_fs::{
@@ -30,6 +30,8 @@ fn cfg() -> RunConfig {
         owner_instance_id: id(0xee),
         boot_session_id: "test-boot".to_string(),
         before_mutation: None,
+        // Plan decision 6: the existing tests never heartbeat.
+        heartbeat_interval: std::time::Duration::from_secs(3600),
     }
 }
 
@@ -1013,4 +1015,198 @@ fn a_clean_trees_completed_manifest_says_cleanup_pending_with_an_empty_list() {
     assert_eq!(s.state, OpState::Completed);
     let c = s.cleanup.expect("version 2");
     assert!(c.cleanup_pending && c.cleanup_pending_artifacts.is_empty(), "{c:?}");
+}
+
+// Cut 7b Part 2: the heartbeat.
+
+/// Every heartbeat due at once.
+fn beating() -> RunConfig {
+    RunConfig { heartbeat_interval: std::time::Duration::ZERO, ..cfg() }
+}
+
+fn lock_record(bytes: &[u8]) -> LockRecord {
+    match decode(bytes) {
+        Decoded::Record(r) => r,
+        other => panic!("expected a record, got {other:?}"),
+    }
+}
+
+fn count(calls: &[String], prefix: &str) -> usize {
+    calls.iter().filter(|c| c.starts_with(prefix)).count()
+}
+
+/// Calls 1 (this run's record) and on succeed; the `nth` and the `nth + 1` `write_at_start` fail - a heartbeat and its
+/// retry. With `tear`, the lock's bytes are torn just before the first of them.
+fn fail_heartbeat(fs: &FaultFs, nth: u32, lock: &'static str, tear: bool) {
+    fs.on_nth("write_at_start", nth, move |fs| {
+        if tear {
+            fs.write_file(lock, b"torn");
+        }
+        fs.fail("write_at_start", Code::IoError);
+    });
+    fs.fail_nth("write_at_start", nth, Code::IoError, std::io::ErrorKind::Other);
+}
+
+fn file_error(r: &Run<Result<flux_fs::Outcome, CopyError>>) -> &CopyError {
+    match &r.copy {
+        Some(Err(e)) => e,
+        other => panic!("expected a failed copy, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_heartbeat_refreshes_the_lock_record_keeping_its_owner_and_never_flushes() {
+    let fs = fake();
+    let seen = Arc::new(Mutex::new(None));
+    let keep = Arc::clone(&seen);
+    // `rename_replace`: CREATED (1), TRANSFERRING (2), the publish (3), after the copy's heartbeats.
+    fs.on_nth("rename_replace", 3, move |fs| *keep.lock().unwrap() = fs.read_file(T_LOCK));
+    let r = run_file(&fs, &beating());
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+    let during = lock_record(&seen.lock().unwrap().clone().expect("the lock, read at the publish"));
+    assert!(
+        during.last_heartbeat_wall_time > during.creation_wall_time,
+        "the heartbeat moved: {during:?}"
+    );
+    assert_eq!((during.operation_id.as_str(), during.owner_instance_id), (ID, id(0xee)));
+    assert_eq!(during.workspace_path, format!("adjacent/{ID}"));
+    let c = calls(&fs);
+    assert!(count(&c, "write_at_start(") > 2, "heartbeats were written: {c:?}");
+    assert_eq!(count(&c, "lock_sync_all("), 2, "only the record and Q-K flush: {c:?}");
+}
+
+#[test]
+fn a_heartbeat_waits_for_its_interval() {
+    let fs = fake();
+    let r = run_file(&fs, &cfg());
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?}", r.stop);
+    assert_eq!(count(&calls(&fs), "write_at_start("), 2, "the record and Q-K, no heartbeat");
+}
+
+#[test]
+fn a_failed_heartbeat_write_is_retried_once() {
+    let fs = fake();
+    // The first heartbeat (write 2) fails; its retry (write 3) succeeds.
+    fs.fail_nth("write_at_start", 2, Code::IoError, std::io::ErrorKind::Other);
+    let r = run_file(&fs, &beating());
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+    assert!(!fs.exists(T_LOCK) && !fs.exists(record_path(ID)), "a clean run");
+}
+
+#[test]
+fn two_failed_heartbeat_writes_stop_the_copy_naming_the_lock_and_the_run_records_failed() {
+    let fs = fake();
+    fail_heartbeat(&fs, 2, T_LOCK, false);
+    let r = run_file(&fs, &beating());
+    let e = file_error(&r);
+    assert_eq!((e.step, e.code()), (CopyStep::Heartbeat, Code::IoError));
+    let message = e.cause.source.to_string().replace('\\', "/");
+    assert!(message.contains(T_LOCK), "names the lock: {message}");
+    assert!(r.stop.is_none(), "one error for it: {:?}", r.stop);
+    assert_eq!(file_record(&fs, ID).state, OpState::Failed, "the record was intact");
+    assert!(!fs.exists(T_LOCK), "released");
+    assert!(!fs.exists("/p/t"), "never published");
+}
+
+#[test]
+fn a_torn_heartbeat_is_that_failure_never_a_lost_lock() {
+    let fs = fake();
+    fail_heartbeat(&fs, 2, T_LOCK, true);
+    let r = run_file(&fs, &beating());
+    let e = file_error(&r);
+    assert_eq!((e.step, e.code()), (CopyStep::Heartbeat, Code::IoError));
+    assert!(r.stop.is_none(), "no stop of the finish's own, no TARGET_LOCK_BUSY: {:?}", r.stop);
+    assert_eq!(
+        file_record(&fs, ID).state,
+        OpState::Transferring,
+        "nothing written without proof of ownership"
+    );
+    assert_eq!(fs.read_file(T_LOCK).as_deref(), Some(&b"torn"[..]), "closed without unlinking");
+}
+
+#[test]
+fn a_temporary_kept_after_a_torn_heartbeat_names_the_heartbeat_not_another_run() {
+    let fs = fake();
+    // Writes: the record (1), then the sweep's (2), the create's (3) and the chunk's (4) heartbeats; the publish's (5)
+    // and its retry (6) fail, the record torn.
+    fail_heartbeat(&fs, 5, T_LOCK, true);
+    let r = run_file(&fs, &beating());
+    let e = file_error(&r);
+    assert_eq!(e.step, CopyStep::Heartbeat);
+    let (left, why) =
+        e.leftover.as_ref().expect("the temporary stays: the guard fails on the torn record");
+    assert!(left.to_string_lossy().contains("t.flux-partial."), "{left:?}");
+    let why = why.to_string();
+    assert!(why.contains("heartbeat") && !why.contains("another run"), "{why}");
+    assert!(fs.exists(format!("/p/t.flux-partial.{ID}")));
+}
+
+#[test]
+fn a_tree_stops_at_a_failed_heartbeat_and_records_failed() {
+    let fs = fake();
+    fail_heartbeat(&fs, 2, LOCK, false);
+    let (r, got) = run_tree(&fs, &beating());
+    let a = aborted(&r);
+    assert_eq!((a.error.step, a.error.code()), (CopyStep::Heartbeat, Code::IoError));
+    assert!(got.is_empty(), "an abort, never a file's failure: {got:?}");
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert_eq!(manifest(&fs, ID).state, OpState::Failed);
+    assert!(!fs.exists(LOCK), "released");
+    assert!(!fs.exists("/p/dest/a"));
+}
+
+/// The first heartbeat (write 2) and its retry (write 3) fail with `code`.
+fn fail_heartbeat_with(fs: &FaultFs, code: Code) {
+    fs.on_nth("write_at_start", 2, move |fs| fs.fail("write_at_start", code));
+    fs.fail_nth("write_at_start", 2, code, std::io::ErrorKind::Other);
+}
+
+#[test]
+fn a_failed_heartbeat_is_the_copys_failure_whatever_its_code() {
+    let fs = fake();
+    // From the copy itself, SAFETY_REJECTED with no leftover is a refusal that changed nothing (Q-I's rollback).
+    fail_heartbeat_with(&fs, Code::SafetyRejected);
+    let r = run_file(&fs, &beating());
+    let e = file_error(&r);
+    assert_eq!((e.step, e.code()), (CopyStep::Heartbeat, Code::SafetyRejected), "the code is kept");
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert_eq!(file_record(&fs, ID).state, OpState::Failed, "recorded FAILED, never rolled back");
+}
+
+#[test]
+fn a_tree_whose_heartbeat_fails_is_failed_whatever_its_code() {
+    let fs = fake();
+    // Nothing is copied before the first heartbeat, so from the copy itself this abort would be a refusal that
+    // changed nothing (`TreeAbort::refused_unchanged`), rolled back.
+    fail_heartbeat_with(&fs, Code::SafetyRejected);
+    let (r, _) = run_tree(&fs, &beating());
+    let a = aborted(&r);
+    assert_eq!((a.error.step, a.error.code()), (CopyStep::Heartbeat, Code::SafetyRejected));
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert_eq!(manifest(&fs, ID).state, OpState::Failed, "recorded FAILED, never rolled back");
+}
+
+#[test]
+fn a_heartbeat_failure_is_never_reported_as_target_lock_busy() {
+    let fs = fake();
+    fail_heartbeat_with(&fs, Code::TargetLockBusy);
+    let r = run_file(&fs, &beating());
+    let e = file_error(&r);
+    assert_eq!((e.step, e.code()), (CopyStep::Heartbeat, Code::IoError));
+    assert_eq!(file_record(&fs, ID).state, OpState::Failed, "a failure, not a lost lock");
+}
+
+#[test]
+fn the_finish_never_heartbeats() {
+    let fs = fake();
+    let r = run_file(&fs, &beating());
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?}", r.stop);
+    let c = calls(&fs);
+    let publish = at(&c, &format!("rename_replace(/p/t.flux-partial.{ID}"));
+    let after = &c[publish..];
+    assert_eq!(
+        (count(after, "write_at_start("), count(after, "lock_sync_all(")),
+        (1, 1),
+        "after the publish only Q-K writes the record: {after:?}"
+    );
 }

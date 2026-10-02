@@ -113,6 +113,7 @@ fn run_config(args: &CopyArgs) -> RunConfig {
         owner_instance_id: flux_core::ids::new_id(),
         boot_session_id: flux_platform::boot_session_id(),
         before_mutation: debug_hook(),
+        heartbeat_interval: flux_core::run::HEARTBEAT_INTERVAL,
     }
 }
 

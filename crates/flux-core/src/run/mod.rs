@@ -14,7 +14,7 @@ mod session;
 #[cfg(test)]
 mod tests;
 
-use crate::copy::{CopyError, copy_file_guarded, no_heartbeat, prepare_file};
+use crate::copy::{CopyError, copy_file_guarded, prepare_file};
 use crate::lock::record::LockRecord;
 use crate::lock::site::NAME_LIMIT;
 use crate::lock::{LockCode, LockSite, Refusal, Released, check_capability};
@@ -27,7 +27,7 @@ use flux_fs::{
     Code, CopyOptions, DestinationRoot, DirHandle, FileIdentity, FsError, OperationId, Outcome,
 };
 use place::{FilePlace, Place, TreePlace, locate_tree};
-use session::{Locked, from_lock, guarded, lock_io, open_operation, owned};
+use session::{Locked, beat_error, from_lock, guarded, lock_io, open_operation, owned};
 use std::path::{Path, PathBuf};
 
 /// The `workspace_path` a record carries once the state it named is about to go (Q-K): the spec's literal for "names
@@ -53,7 +53,12 @@ pub struct RunConfig {
     pub boot_session_id: String,
     /// `None` outside a test.
     pub before_mutation: Option<BeforeMutation>,
+    /// §101: how often the run refreshes its lock record's heartbeat (cut 7b). The CLI passes `HEARTBEAT_INTERVAL`.
+    pub heartbeat_interval: std::time::Duration,
 }
+
+/// §101's heartbeat interval: 5 s.
+pub const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl std::fmt::Debug for RunConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -64,6 +69,7 @@ impl std::fmt::Debug for RunConfig {
             .field("owner_instance_id", &self.owner_instance_id)
             .field("boot_session_id", &self.boot_session_id)
             .field("before_mutation", &self.before_mutation.is_some())
+            .field("heartbeat_interval", &self.heartbeat_interval)
             .finish()
     }
 }
@@ -216,15 +222,17 @@ pub fn tree<F: DestinationRoot>(
             if let Some(hook) = &cfg.before_mutation {
                 hook();
             }
-            guarded(&locked.held)
+            guarded(&locked.held, &locked.pulse)
         };
+        let beat =
+            || locked.pulse.beat(&locked.held).map_err(|e| beat_error(&locked.lock_shown, e));
         let cx = Shared {
             fs,
             src_root,
             src_identity: source.identity,
             opts: &opts,
             guard: &guard,
-            beat: &no_heartbeat,
+            beat: &beat,
         };
         let root = place.dest.take().expect("step 5 made DEST");
         let mut report = |f: TreeFailure| {
@@ -245,6 +253,8 @@ pub fn tree<F: DestinationRoot>(
     };
     let ended = match &result {
         Ok(_) => Ended::Completed { leftovers, published: None },
+        // Cut 7b: a failed heartbeat is the copy's failure, whatever its code.
+        Err(_) if locked.pulse.failed() => Ended::Failed,
         Err(a) if a.error.code() == Code::TargetLockBusy => Ended::Lost,
         Err(a) if a.refused_unchanged() => Ended::RefusedUnchanged,
         Err(_) => Ended::Failed,
@@ -332,9 +342,11 @@ pub fn file<F: DestinationRoot>(
             if let Some(hook) = &cfg.before_mutation {
                 hook();
             }
-            guarded(&locked.held)
+            guarded(&locked.held, &locked.pulse)
         };
-        copy_file_guarded(fs, src, &parent, name, &opts, &guard, &no_heartbeat)
+        let beat =
+            || locked.pulse.beat(&locked.held).map_err(|e| beat_error(&locked.lock_shown, e));
+        copy_file_guarded(fs, src, &parent, name, &opts, &guard, &beat)
     }
     .map_err(|mut e| {
         // As `copy_file` reports it: the leftover in the frame of the path the operator gave.
@@ -345,6 +357,8 @@ pub fn file<F: DestinationRoot>(
     });
     let ended = match &copied {
         Ok(o) => Ended::Completed { leftovers: Vec::new(), published: Some(o.published_identity) },
+        // Cut 7b: a failed heartbeat is the copy's failure, whatever its code.
+        Err(_) if locked.pulse.failed() => Ended::Failed,
         Err(e) if e.code() == Code::TargetLockBusy => Ended::Lost,
         Err(e) if e.code() == Code::SafetyRejected && e.leftover.is_none() => {
             Ended::RefusedUnchanged
@@ -455,9 +469,16 @@ fn remove_own<D: DirHandle, P: Place<D>>(
 }
 
 /// The failure path: FAILED (resumable: the next run gets RESUMABLE_OPERATION_EXISTS until `--restart`), then the
-/// release "the same way". The copy's own error is the report; a failure here is reported beside it.
+/// release "the same way". The copy's own error is the report; a failure here is reported beside it. After a failed
+/// heartbeat, a failed check ends it with nothing written (cut 7b).
 fn fail<D: DirHandle, P: Place<D>>(place: &P, mut locked: Locked<'_, D>) -> Option<RunError> {
     if let Err(fault) = owned(&locked.held, &locked.lock_shown) {
+        // Cut 7b decision 7, "Torn": after a failed heartbeat, a record that no longer proves ownership is most likely
+        // the one the heartbeat tore. That failure is already the report: write nothing, add no stop, and close without
+        // unlinking as `locked` drops. The next run meets TARGET_LOCK_UNCERTAIN, which `--restart --break-lock` clears.
+        if locked.pulse.failed() {
+            return None;
+        }
         return Some(fault.into_error(RunStep::State));
     }
     locked.state.state = OpState::Failed;
