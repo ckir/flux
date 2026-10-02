@@ -641,8 +641,10 @@ pub fn decode(bytes: &[u8]) -> Result<OperationState, Unusable> {
     `version_2s_consistency_rules_are_state_corrupt` goes red;
   - (b) in `decode`, skip `expected.extend(FILE_KEYS)`:
     `a_version_2_file_record_carries_all_sixteen_of_section_249_1_and_round_trips` goes red;
-  - (c) in `encode`, delete the `if self.format_version == V1` early return: `a_rewrite_keeps_its_records_version`
-    and `a_state_encodes_to_the_documented_json_and_back` go red;
+  - (c) in `encode`, delete the `if self.format_version == V1` early return:
+    `a_state_encodes_to_the_documented_json_and_back` goes red. It is the only test that pins version 1's key ORDER:
+    the map path writes the same 8 keys, alphabetically, so `a_rewrite_keeps_its_records_version` stays green under
+    this mutant by design (panel r1, MG-1). That test pins the version, which Task 6's mutant attacks;
   - (d) in `parse_identity`, drop the leading-zero rule:
     `a_file_identity_round_trips_through_its_text_and_nothing_else_parses` goes red.
 
