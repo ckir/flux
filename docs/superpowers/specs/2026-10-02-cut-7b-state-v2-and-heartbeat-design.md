@@ -141,9 +141,15 @@ FAILED and COMPLETED writes, and `--restart` setting ABANDONED and `superseded_b
   - The newest heartbeat time lives in a `Cell` inside `Held`, and every later encode of the record (Q-K's rewrite)
     uses it.
   - The run keeps its last-write instant and its "a heartbeat has failed" flag in `Cell`s too.
-  - "Every ownership check" means the run's own check helper (`owned`, `crates/flux-core/src/run/session.rs:208`),
-    which calls the heartbeat before `still_owned`; `Held::still_owned` itself stays read-only.
-- **Failure (decision 7):** after the retry fails, the copy stops at that point. The run's report is exactly ONE error
+  - "Every ownership check" means the run's own checks during the `--restart` sweep and the copy (the guard, and
+    `owned`, `crates/flux-core/src/run/session.rs:208`, where the sweep calls it). The heartbeat runs before
+    `still_owned`; `Held::still_owned` itself stays read-only.
+  - The FINISH never heartbeats: its ownership checks (`complete`, `fail`, the rollback) only check. The Q-K rewrite
+    and the `COMPLETED` write follow at once and carry the newest time, so a heartbeat there would buy nothing, and a
+    failure there would have no step to report it (panel r4, FA-1).
+- **Failure (decision 7):** after the retry fails, the step the heartbeat interrupted stops at that point and carries
+  the report: during the copy, the copy's own error (a tree's abort, a single file's error); during the `--restart`
+  sweep, before any copy, the run's stop (`RunError::Failed` at the lock step). The run's report is exactly ONE error
   for it: the I/O error, naming the lock path. It is never `TARGET_LOCK_BUSY`, and never a second line for the same
   event; exit 1. The finish takes the failure path, and whatever the record then holds decides it:
   - **Intact:** FAILED and the release proceed as for any failure.
@@ -208,7 +214,10 @@ All on the fake unless named:
   the lock path; a torn heartbeat write is reported as that failure, not `TARGET_LOCK_BUSY`. No heartbeat write
   syncs.
 - **Heartbeat during `--restart`:** with a zero interval, a `--restart` that supersedes priors refreshes the lock
-  record during its sweep, before the copy starts.
+  record during its sweep, before the copy starts; a failed heartbeat there stops the run with one error naming the
+  lock path, and no copy runs.
+- **No heartbeat in the finish:** a heartbeat fault armed for the finish's ownership checks is never reached, so the
+  run still ends COMPLETED with exit 0.
 - **File-handle identity:** on each platform and the fake, the identity read from an open file equals the identity a
   directory look-up of its name gives, and stays the same across a rename.
 - **End to end (CLI):** a stalled debug run with a short `FLUX_TEST_HEARTBEAT_INTERVAL_MS` shows the lock record's
