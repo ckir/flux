@@ -754,6 +754,33 @@ fn a_tree_stops_at_a_failed_heartbeat_and_records_failed() {
     assert!(!fs.exists("/p/dest/a"));
 }
 
+/// The first heartbeat (write 2) and its retry (write 3) fail with `code`.
+fn fail_heartbeat_with(fs: &FaultFs, code: Code) {
+    fs.on_nth("write_at_start", 2, move |fs| fs.fail("write_at_start", code));
+    fs.fail_nth("write_at_start", 2, code, std::io::ErrorKind::Other);
+}
+
+#[test]
+fn a_failed_heartbeat_is_the_copys_failure_whatever_its_code() {
+    let fs = fake();
+    // From the copy itself, SAFETY_REJECTED with no leftover is a refusal that changed nothing (Q-I's rollback).
+    fail_heartbeat_with(&fs, Code::SafetyRejected);
+    let r = run_file(&fs, &beating());
+    assert_eq!(file_error(&r).step, CopyStep::Heartbeat);
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert_eq!(file_record(&fs, ID).state, OpState::Failed, "recorded FAILED, never rolled back");
+}
+
+#[test]
+fn a_heartbeat_failure_is_never_reported_as_target_lock_busy() {
+    let fs = fake();
+    fail_heartbeat_with(&fs, Code::TargetLockBusy);
+    let r = run_file(&fs, &beating());
+    let e = file_error(&r);
+    assert_eq!((e.step, e.code()), (CopyStep::Heartbeat, Code::IoError));
+    assert_eq!(file_record(&fs, ID).state, OpState::Failed, "a failure, not a lost lock");
+}
+
 #[test]
 fn the_finish_never_heartbeats() {
     let fs = fake();
@@ -986,7 +1013,7 @@ it with nothing written (cut 7b)."
 - [ ] **Step 4: Run.**
 
 Run: `cargo test --workspace`
-Expected: all `ok`, including the eight new tests.
+Expected: all `ok`, including the ten new tests.
 
 Run: `cargo clippy --workspace --all-targets -- -D warnings`
 Expected: clean.
@@ -1363,6 +1390,8 @@ git commit -m "spec: the copy calls the heartbeat beside its guard (cut 7b Part 
 | `session.rs` `beat`: drop `\|\| self.last.get().elapsed() < self.interval` | `a_heartbeat_waits_for_its_interval` |
 | `session.rs` `beat`: drop `.or_else(\|_\| held.heartbeat(now))` | `a_failed_heartbeat_write_is_retried_once` |
 | `session.rs` `beat_error`: keep `e.source` unwrapped | `two_failed_heartbeat_writes_stop_the_copy_naming_the_lock_and_the_run_records_failed` |
+| `session.rs` `beat_error`: `let code = e.code;` | `a_heartbeat_failure_is_never_reported_as_target_lock_busy` |
+| `mod.rs` file `Ended`: delete the `Err(_) if locked.pulse.failed()` arm | `a_failed_heartbeat_is_the_copys_failure_whatever_its_code` |
 | `mod.rs` `fail`: delete the `pulse.failed()` early return | `a_torn_heartbeat_is_that_failure_never_a_lost_lock` |
 | `session.rs` `guarded`: `why` always `LOST` | `a_temporary_kept_after_a_torn_heartbeat_names_the_heartbeat_not_another_run` |
 | `mod.rs` `complete`: add `let _ = locked.pulse.beat(&locked.held);` first | `the_finish_never_heartbeats` |
