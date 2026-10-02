@@ -1,7 +1,7 @@
 //! `flux copy` under the destination's lock (cut 7a Part 3b-2): the design's Testing item 4, end to end on the real
 //! filesystem. The crash hook exists only in a debug build, which is what `cargo test` builds.
 
-use flux_core::lock::record::LockRecord;
+use flux_core::lock::record::{Decoded, LockRecord, decode};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -48,6 +48,11 @@ struct Stalled(Child);
 
 impl Stalled {
     fn start(src: &Path, dst: &Path, at: u32, marks: &Path) -> Self {
+        Self::start_env(src, dst, at, marks, &[])
+    }
+
+    /// `start`, with extra environment variables for the run.
+    fn start_env(src: &Path, dst: &Path, at: u32, marks: &Path, env: &[(&str, &str)]) -> Self {
         let announced = marks.join(format!("stalled-{at}"));
         let child = flux()
             .arg("copy")
@@ -55,6 +60,7 @@ impl Stalled {
             .arg(dst)
             .env("FLUX_TEST_STALL_AT", at.to_string())
             .env("FLUX_TEST_STALL_FILE", &announced)
+            .envs(env.iter().copied())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -153,6 +159,46 @@ fn a_killed_single_file_run_leaves_a_resumable_record_that_restart_supersedes() 
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert_eq!(names(d.path()), ["src", "t"], "the record, the partial and the lock are gone");
     assert_eq!(std::fs::read(&t).unwrap(), b"A");
+}
+
+/// The lock record a stalled run holds at `lock`.
+fn held_record(lock: &Path) -> LockRecord {
+    match decode(&std::fs::read(lock).unwrap()) {
+        Decoded::Record(r) => r,
+        other => panic!("expected a record, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_running_copy_moves_its_lock_records_heartbeat() {
+    let d = TempDir::new().unwrap();
+    let marks = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let dst = d.path().join("dst");
+    // Interval 0: `a`'s heartbeat runs before its first guarded mutation, where the run stalls.
+    let s = Stalled::start_env(
+        &src,
+        &dst,
+        1,
+        marks.path(),
+        &[("FLUX_TEST_HEARTBEAT_INTERVAL_MS", "0")],
+    );
+    let r = held_record(&d.path().join("dst.flux-lock"));
+    assert!(r.last_heartbeat_wall_time > r.creation_wall_time, "{r:?}");
+    s.kill();
+}
+
+#[test]
+fn without_the_override_a_short_run_keeps_its_creation_heartbeat() {
+    let d = TempDir::new().unwrap();
+    let marks = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let dst = d.path().join("dst");
+    // 5 s have not passed by the first guarded mutation.
+    let s = Stalled::start(&src, &dst, 1, marks.path());
+    let r = held_record(&d.path().join("dst.flux-lock"));
+    assert_eq!(r.last_heartbeat_wall_time, r.creation_wall_time, "{r:?}");
+    s.kill();
 }
 
 #[test]

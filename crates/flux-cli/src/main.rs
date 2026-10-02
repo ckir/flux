@@ -103,8 +103,9 @@ fn options(args: &CopyArgs) -> CopyOptions {
     }
 }
 
-/// The run's configuration: two fresh ids for this invocation (the operation and this process, cut 7a) and the boot
-/// session; in a debug build, the crash hook `debug_hook` reads from the environment.
+/// The run's configuration: two fresh ids for this invocation (the operation and this process, cut 7a), the boot
+/// session, and §101's heartbeat interval; in a debug build, the crash hook `debug_hook` and the interval override
+/// `heartbeat_interval` read from the environment.
 fn run_config(args: &CopyArgs) -> RunConfig {
     RunConfig {
         restart: args.restart,
@@ -113,7 +114,7 @@ fn run_config(args: &CopyArgs) -> RunConfig {
         owner_instance_id: flux_core::ids::new_id(),
         boot_session_id: flux_platform::boot_session_id(),
         before_mutation: debug_hook(),
-        heartbeat_interval: flux_core::run::HEARTBEAT_INTERVAL,
+        heartbeat_interval: heartbeat_interval(),
     }
 }
 
@@ -138,6 +139,22 @@ fn debug_hook() -> Option<flux_core::run::BeforeMutation> {
 #[cfg(not(debug_assertions))]
 fn debug_hook() -> Option<flux_core::run::BeforeMutation> {
     None
+}
+
+/// §101's 5 s (cut 7b). In a debug build, `FLUX_TEST_HEARTBEAT_INTERVAL_MS=<n>` replaces it, so an end-to-end test can
+/// watch the lock record's heartbeat move. A release build has no override.
+#[cfg(debug_assertions)]
+fn heartbeat_interval() -> std::time::Duration {
+    std::env::var("FLUX_TEST_HEARTBEAT_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(flux_core::run::HEARTBEAT_INTERVAL)
+}
+
+#[cfg(not(debug_assertions))]
+fn heartbeat_interval() -> std::time::Duration {
+    flux_core::run::HEARTBEAT_INTERVAL
 }
 
 fn copy(args: &CopyArgs) -> u8 {
