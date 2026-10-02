@@ -1162,7 +1162,7 @@ fn fail_heartbeat_with(fs: &FaultFs, code: Code) {
 }
 
 #[test]
-fn a_failed_heartbeat_is_the_copys_failure_whatever_its_code() {
+fn a_failed_heartbeat_fails_the_copy_whatever_its_code() {
     let fs = fake();
     // From the copy itself, SAFETY_REJECTED with no leftover is a refusal that changed nothing (Q-I's rollback).
     fail_heartbeat_with(&fs, Code::SafetyRejected);
