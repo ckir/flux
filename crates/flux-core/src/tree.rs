@@ -4,7 +4,8 @@
 //! Design authority: `docs/superpowers/specs/2026-09-26-cut-4b-copy-tree-design.md`.
 
 use crate::copy::{
-    CopyError, CopyStep, Guard, copy_file_guarded, split_destination, unguarded, weaker,
+    CopyError, CopyStep, Guard, Heartbeat, copy_file_guarded, no_heartbeat, split_destination,
+    unguarded, weaker,
 };
 use crate::state::{FLUX_DIR, RESERVED_DIRS};
 use crate::walk::{Walk, WalkEvent, walk};
@@ -263,6 +264,8 @@ pub(crate) struct Shared<'c, F: DestinationRoot> {
     pub(crate) opts: &'c CopyOptions,
     /// §99's check before each destination mutation; `&unguarded` for a copy that holds no lock.
     pub(crate) guard: &'c Guard<'c>,
+    /// §101's heartbeat (cut 7b), beside the guard; `&no_heartbeat` for a copy that holds no lock.
+    pub(crate) beat: &'c Heartbeat<'c>,
 }
 
 /// `copy_tree`'s body. Every `?` here is an abort; `copy_tree` pairs it with `out`,
@@ -313,7 +316,14 @@ fn run_tree<F: DestinationRoot>(
         }
         Err(e) => return Err(resolve(e)),
     };
-    let cx = Shared { fs, src_root, src_identity: source.identity, opts, guard: &unguarded };
+    let cx = Shared {
+        fs,
+        src_root,
+        src_identity: source.identity,
+        opts,
+        guard: &unguarded,
+        beat: &no_heartbeat,
+    };
     copy_tree_at(&cx, source.events, root, out, on_report).1
 }
 
@@ -323,7 +333,8 @@ fn run_tree<F: DestinationRoot>(
 /// `cx.guard` runs before every destination mutation (§99, cut 7a Part 3b): before each directory is created here, and
 /// inside `copy_file_guarded` for each file. A failed guard aborts the whole copy with `TARGET_LOCK_BUSY`. A source
 /// entry whose destination is a reserved control path (`reserved_path`) fails with `CONTROL_PLANE_NAMESPACE_CONFLICT`
-/// and the rest continues.
+/// and the rest continues. `cx.beat` runs before each of those guard calls; its failure aborts the whole copy too
+/// (cut 7b).
 pub(crate) fn copy_tree_at<F: DestinationRoot>(
     cx: &Shared<'_, F>,
     events: Walk<'_, F>,
@@ -362,6 +373,7 @@ fn walk_into<F: DestinationRoot>(
         src_identity: cx.src_identity,
         opts: &opts,
         guard: cx.guard,
+        beat: cx.beat,
     };
     for item in events {
         let live = matches!(stack.last(), Some(Frame::Live { .. }));
@@ -385,7 +397,8 @@ fn walk_into<F: DestinationRoot>(
                     report(out, on_report, path.clone(), conflict);
                     Frame::Skipped
                 } else {
-                    // §99 before the directory's creation.
+                    // §101, then §99, before the directory's creation.
+                    (cx.beat)().map_err(|e| CopyError::at(CopyStep::Heartbeat, e))?;
                     (cx.guard)().map_err(|e| CopyError::at(CopyStep::Create, e))?;
                     enter_dir(stack, &path, identity, root_identity, cx.opts, out, on_report)?
                 };
@@ -530,7 +543,15 @@ fn copy_one<F: DestinationRoot>(
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<(), CopyError> {
     let name = path.file_name().expect("a walk path ends in a name");
-    match copy_file_guarded(cx.fs, &cx.src_root.join(&path), parent, name, cx.opts, cx.guard) {
+    match copy_file_guarded(
+        cx.fs,
+        &cx.src_root.join(&path),
+        parent,
+        name,
+        cx.opts,
+        cx.guard,
+        cx.beat,
+    ) {
         Ok(o) => {
             out.files_copied += 1;
             out.bytes_copied += o.bytes_copied;
@@ -554,8 +575,9 @@ fn copy_one<F: DestinationRoot>(
             if let Some((p, _)) = e.leftover.as_mut() {
                 *p = path.with_file_name(&*p);
             }
-            // §99 (cut 7a Part 3b): this run no longer owns the destination's lock. The whole operation stops.
-            if e.code() == Code::TargetLockBusy {
+            // §99 (cut 7a Part 3b): this run no longer owns the destination's lock; or §101 (cut 7b): its heartbeat
+            // failed. The whole operation stops.
+            if e.code() == Code::TargetLockBusy || e.step == CopyStep::Heartbeat {
                 return Err(e);
             }
             // Decision 3: this destination lacks a no-replace primitive. Found at the
@@ -1345,6 +1367,7 @@ mod tests {
             src_identity: source.identity,
             opts: &o,
             guard,
+            beat: &no_heartbeat,
         };
         let mut out = TreeOutcome::default();
         let (_root, r) = copy_tree_at(&cx, source.events, root, &mut out, &mut |_| {});
@@ -1394,6 +1417,73 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_heartbeat_aborts_the_whole_tree() {
+        let fs = tree();
+        let source = prepare_source(&fs, Path::new("/src"), Path::new("/dst")).unwrap();
+        fs.create_dir(Path::new("/dst")).unwrap();
+        let root = fs.destination_root(Path::new("/dst")).unwrap();
+        let o = opts();
+        let calls = std::cell::Cell::new(0);
+        // `a`'s sweep, create, one chunk and publish pass (1-4); `sub`'s creation's (5) fails.
+        let beat = || {
+            calls.set(calls.get() + 1);
+            if calls.get() >= 5 {
+                Err(FsError::new(Code::IoError, std::io::Error::other("beat")))
+            } else {
+                Ok(())
+            }
+        };
+        let cx = Shared {
+            fs: &fs,
+            src_root: Path::new("/src"),
+            src_identity: source.identity,
+            opts: &o,
+            guard: &unguarded,
+            beat: &beat,
+        };
+        let mut out = TreeOutcome::default();
+        let mut reported = 0;
+        let (_root, r) = copy_tree_at(&cx, source.events, root, &mut out, &mut |_| reported += 1);
+        assert_eq!(r.unwrap_err().step, CopyStep::Heartbeat);
+        assert_eq!(calls.get(), 5, "no heartbeat after the failed one");
+        assert_eq!((reported, out.failures.total()), (0, 0), "an abort, never a per-file failure");
+        assert!(fs.exists("/dst/a") && !fs.exists("/dst/sub"));
+    }
+
+    #[test]
+    fn a_heartbeat_failure_inside_a_file_aborts_the_whole_tree() {
+        let fs = tree();
+        let source = prepare_source(&fs, Path::new("/src"), Path::new("/dst")).unwrap();
+        fs.create_dir(Path::new("/dst")).unwrap();
+        let root = fs.destination_root(Path::new("/dst")).unwrap();
+        let o = opts();
+        let calls = std::cell::Cell::new(0);
+        // `a`'s sweep (1) and create (2) pass; its chunk's (3) fails.
+        let beat = || {
+            calls.set(calls.get() + 1);
+            if calls.get() >= 3 {
+                Err(FsError::new(Code::IoError, std::io::Error::other("beat")))
+            } else {
+                Ok(())
+            }
+        };
+        let cx = Shared {
+            fs: &fs,
+            src_root: Path::new("/src"),
+            src_identity: source.identity,
+            opts: &o,
+            guard: &unguarded,
+            beat: &beat,
+        };
+        let mut out = TreeOutcome::default();
+        let mut reported = 0;
+        let (_root, r) = copy_tree_at(&cx, source.events, root, &mut out, &mut |_| reported += 1);
+        assert_eq!(r.unwrap_err().step, CopyStep::Heartbeat);
+        assert_eq!((reported, out.files_copied), (0, 0), "the walk stops at the failed file");
+        assert!(!fs.exists("/dst/a") && !fs.exists("/dst/sub"));
+    }
+
+    #[test]
     fn copy_tree_at_hands_the_root_back() {
         let fs = tree();
         let (r, _) = guarded(&fs, &unguarded);
@@ -1407,6 +1497,7 @@ mod tests {
             src_identity: source.identity,
             opts: &o,
             guard: &unguarded,
+            beat: &no_heartbeat,
         };
         let mut out = TreeOutcome::default();
         let (back, r) = copy_tree_at(&cx, source.events, root, &mut out, &mut |_| {});

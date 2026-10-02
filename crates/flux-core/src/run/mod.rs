@@ -14,7 +14,7 @@ mod session;
 #[cfg(test)]
 mod tests;
 
-use crate::copy::{CopyError, copy_file_guarded, prepare_file};
+use crate::copy::{CopyError, copy_file_guarded, no_heartbeat, prepare_file};
 use crate::lock::record::LockRecord;
 use crate::lock::site::NAME_LIMIT;
 use crate::lock::{LockCode, LockSite, Refusal, Released, check_capability};
@@ -218,7 +218,14 @@ pub fn tree<F: DestinationRoot>(
             }
             guarded(&locked.held)
         };
-        let cx = Shared { fs, src_root, src_identity: source.identity, opts: &opts, guard: &guard };
+        let cx = Shared {
+            fs,
+            src_root,
+            src_identity: source.identity,
+            opts: &opts,
+            guard: &guard,
+            beat: &no_heartbeat,
+        };
         let root = place.dest.take().expect("step 5 made DEST");
         let mut report = |f: TreeFailure| {
             if let TreeFailureCause::Copy(e) = &f.cause
@@ -327,7 +334,7 @@ pub fn file<F: DestinationRoot>(
             }
             guarded(&locked.held)
         };
-        copy_file_guarded(fs, src, &parent, name, &opts, &guard)
+        copy_file_guarded(fs, src, &parent, name, &opts, &guard, &no_heartbeat)
     }
     .map_err(|mut e| {
         // As `copy_file` reports it: the leftover in the frame of the path the operator gave.
