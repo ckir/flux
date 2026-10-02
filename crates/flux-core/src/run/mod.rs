@@ -262,7 +262,7 @@ pub fn file<F: DestinationRoot>(
     let opts =
         CopyOptions { operation_id: OperationId::new(cfg.operation_id.as_str()), ..opts.clone() };
     // B1.
-    let (parent, parent_path, name) = match prepare_file(fs, src, dst, &opts) {
+    let (parent, parent_path, name, _source_identity) = match prepare_file(fs, src, dst, &opts) {
         Ok(p) => p,
         Err(e) => {
             run.copy = Some(Err(e));

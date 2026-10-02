@@ -339,13 +339,14 @@ pub fn copy_file<F: DestinationRoot>(
 
 /// B1 (cut 7a Part 3b): `copy_file`'s checks that need no lock - Step 0, the source's type (Step 2) and the identity
 /// gate (Step 2a) - made by the run before it takes the destination's lock, so a refusal there creates nothing. The
-/// copy makes Steps 2 and 2a again under the lock. Returns DEST's parent, its path, and the target's name.
+/// copy makes Steps 2 and 2a again under the lock. Returns DEST's parent, its path, and the target's name, and the source's
+/// identity, for the single-file record (cut 7b).
 pub(crate) fn prepare_file<'d, F: DestinationRoot>(
     fs: &F,
     src: &Path,
     dst: &'d Path,
     opts: &CopyOptions,
-) -> std::result::Result<(F::Dir, &'d Path, &'d OsStr), CopyError> {
+) -> std::result::Result<(F::Dir, &'d Path, &'d OsStr, FileIdentity), CopyError> {
     if src == dst {
         return Err(CopyError::at(
             CopyStep::Resolve,
@@ -366,7 +367,7 @@ pub(crate) fn prepare_file<'d, F: DestinationRoot>(
         ));
     }
     identity_gate(&parent, name, &src_meta, opts.safety, opts.publish)?;
-    Ok((parent, parent_path, name))
+    Ok((parent, parent_path, name, src_meta.identity))
 }
 
 /// Copy `src` to `name` inside `parent`, writing ONLY through `parent`, holding no lock: `copy_file_guarded` with a
@@ -534,6 +535,9 @@ pub fn copy_file_guarded<F: DestinationRoot>(
             ..CopyError::at(CopyStep::Publish, lost)
         });
     }
+    // Cut 7b: the object about to be published, read from its own handle - a rename keeps it - so the run records the
+    // target's identity without a look-up by name after the rename.
+    let published_identity = writer.identity().unwrap_or(FileIdentity::Unavailable);
     let published = match opts.publish {
         Publish::Replace => parent.rename_replace(&temp, parent, name),
         Publish::NoReplace => parent.rename_no_replace(&temp, parent, name),
@@ -547,7 +551,7 @@ pub fn copy_file_guarded<F: DestinationRoot>(
 
     // A successful rename consumed the temporary; there is nothing left to remove.
 
-    Ok(Outcome { bytes_copied, metadata_failures, identity_degraded })
+    Ok(Outcome { bytes_copied, metadata_failures, identity_degraded, published_identity })
 }
 
 #[cfg(test)]
@@ -1407,5 +1411,16 @@ mod tests {
         assert!(fs.exists("/dst.flux-partial.op1"));
         let removals = fs.calls().iter().filter(|c| c.starts_with("remove_file(")).count();
         assert_eq!(removals, 1, "only the step-1 sweep, never the discard: {:?}", fs.calls());
+    }
+
+    #[test]
+    fn a_copy_returns_its_published_targets_identity() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.write_file("/s", b"abc");
+        let parent = fs.destination_root(Path::new("/d")).unwrap();
+        let out = copy_file_at(&fs, Path::new("/s"), &parent, OsStr::new("t"), &opts()).unwrap();
+        assert_eq!(out.published_identity, fs.metadata(Path::new("/d/t")).unwrap().identity);
+        assert!(matches!(out.published_identity, FileIdentity::Strong(_)));
     }
 }
