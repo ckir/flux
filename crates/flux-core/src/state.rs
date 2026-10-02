@@ -6,14 +6,16 @@ use crate::ids::is_id;
 use crate::lock::error::refuse;
 use crate::lock::site::{NAME_LIMIT, name_len};
 use crate::lock::{LockCode, LockError, LockResult};
-use flux_fs::{Code, DirHandle, FileHandle, FsError};
+use flux_fs::{Code, DirHandle, FileHandle, FileIdentity, FsError, ObjectId};
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
 use std::io::{ErrorKind, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-/// The version this binary writes and reads. 7b bumps it and reads this one too.
-pub const FORMAT_VERSION: u64 = 1;
+/// The version this binary writes (cut 7b). It reads `V1` too and never upgrades a record it rewrites (decision 5).
+pub const FORMAT_VERSION: u64 = 2;
+/// Cut 7a's version: read, classified as 7a classifies it, and rewritten as itself.
+pub const V1: u64 = 1;
 /// The longest state record read. A version-1 record is well under 1 KiB; anything longer is not one.
 pub const STATE_LIMIT: usize = 64 * 1024;
 /// A takeover's value for a prior holder's field it could not read (spec:10705-10709).
@@ -28,6 +30,21 @@ const KEYS: [&str; 8] = [
     "superseded_by",
     "created_at",
     "takeover",
+];
+/// Version 2's keys for both kinds (§218).
+const CLEANUP_KEYS: [&str; 2] = ["cleanup_pending", "cleanup_pending_artifacts"];
+/// Version 2's keys a single-file record adds (§249.1).
+const FILE_KEYS: [&str; 10] = [
+    "artifact_type",
+    "attempt_id",
+    "artifact_generation",
+    "source_identity",
+    "target_identity",
+    "target_path_key",
+    "owner_instance_id",
+    "boot_session_id",
+    "creation_wall_time",
+    "last_heartbeat_wall_time",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,7 +108,36 @@ impl Takeover {
     }
 }
 
-/// One operation's state, version 1.
+/// §218's record (cut 7b, version 2, both kinds): `cleanup_pending` is true from the `COMPLETED` write on, and the
+/// artifacts are the temporaries the copy could not remove, each in `native_hex`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Cleanup {
+    pub cleanup_pending: bool,
+    pub cleanup_pending_artifacts: Vec<String>,
+}
+
+/// §249.1's fields a single-file record adds in version 2 (cut 7b decision 4). The identities are `identity_text`;
+/// `target_identity` is `None` while no object stood at the target name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileFields {
+    pub artifact_type: String,
+    pub attempt_id: String,
+    pub artifact_generation: u64,
+    pub source_identity: String,
+    pub target_identity: Option<String>,
+    pub target_path_key: String,
+    pub owner_instance_id: String,
+    pub boot_session_id: String,
+    pub creation_wall_time: String,
+    pub last_heartbeat_wall_time: String,
+}
+
+/// A single file's `artifact_type`.
+pub const ARTIFACT_FILE: &str = "file";
+
+/// One operation's state, version 1 or 2.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperationState {
@@ -106,6 +152,12 @@ pub struct OperationState {
     /// Nanoseconds since the Unix epoch, UTC, as decimal ASCII.
     pub created_at: String,
     pub takeover: Option<Takeover>,
+    /// Version 2 (cut 7b, §218): `Some` exactly when `format_version` is 2.
+    #[serde(skip)]
+    pub cleanup: Option<Cleanup>,
+    /// Version 2, a single file (cut 7b, §249.1): `Some` exactly for a version-2 `Kind::File` record.
+    #[serde(skip)]
+    pub file: Option<FileFields>,
 }
 
 /// Why a state record cannot be used.
@@ -118,15 +170,16 @@ pub enum Unusable {
 }
 
 impl OperationState {
-    /// A new operation's state, `CREATED`.
-    pub fn created(
+    /// A new operation's state as cut 7a wrote it: version 1, `CREATED`. A real run writes version 2 (`created`); tests
+    /// use this to stage the state a 7a binary leaves behind.
+    pub fn created_v1(
         operation_id: &str,
         kind: Kind,
         destination_root: &Path,
         created_at: u64,
     ) -> Self {
         Self {
-            format_version: FORMAT_VERSION,
+            format_version: V1,
             operation_id: operation_id.to_string(),
             kind,
             destination_root: destination_root.display().to_string(),
@@ -134,17 +187,56 @@ impl OperationState {
             superseded_by: None,
             created_at: created_at.to_string(),
             takeover: None,
+            cleanup: None,
+            file: None,
         }
     }
 
-    /// The record's bytes: the keys in `KEYS`' order, compact JSON.
+    /// A new operation's state, version 2, `CREATED`, as a run writes it. `file` is the single-file record's §249.1
+    /// fields: `Some` exactly for `Kind::File`.
+    pub fn created(
+        operation_id: &str,
+        kind: Kind,
+        destination_root: &Path,
+        created_at: u64,
+        file: Option<FileFields>,
+    ) -> Self {
+        assert_eq!(
+            kind == Kind::File,
+            file.is_some(),
+            "a single file's record, and only it, carries §249.1's fields"
+        );
+        Self {
+            format_version: FORMAT_VERSION,
+            cleanup: Some(Cleanup {
+                cleanup_pending: false,
+                cleanup_pending_artifacts: Vec::new(),
+            }),
+            file,
+            ..Self::created_v1(operation_id, kind, destination_root, created_at)
+        }
+    }
+
+    /// The record's bytes, in the record's OWN version (decision 5: a rewrite never upgrades it). Version 1 is the
+    /// derived struct, keys in `KEYS`' order, byte for byte as 7a wrote it. Version 2 adds `Cleanup` and, for a single
+    /// file, `FileFields`, as one object.
     pub fn encode(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("an operation state always serializes")
+        if self.format_version == V1 {
+            return serde_json::to_vec(self).expect("an operation state always serializes");
+        }
+        let mut map = object(self);
+        if let Some(c) = &self.cleanup {
+            map.extend(object(c));
+        }
+        if let Some(f) = &self.file {
+            map.extend(object(f));
+        }
+        serde_json::to_vec(&map).expect("an operation state always serializes")
     }
 }
 
 /// Decode a state record. In order: the size; JSON; an object; `format_version` (before any other key, F4); exactly
-/// the eight keys; their types; their values.
+/// that version's keys for its kind; their types; their values.
 pub fn decode(bytes: &[u8]) -> Result<OperationState, Unusable> {
     use serde_json::Value;
     if bytes.len() > STATE_LIMIT {
@@ -152,7 +244,7 @@ pub fn decode(bytes: &[u8]) -> Result<OperationState, Unusable> {
     }
     let value: Value =
         serde_json::from_slice(bytes).map_err(|e| Unusable::Corrupt(format!("not JSON: {e}")))?;
-    let Value::Object(map) = &value else {
+    let Value::Object(mut map) = value else {
         return Err(Unusable::Corrupt("not a JSON object".to_string()));
     };
     let version = match map.get("format_version") {
@@ -161,19 +253,53 @@ pub fn decode(bytes: &[u8]) -> Result<OperationState, Unusable> {
         })?,
         None => return Err(Unusable::Corrupt("no format_version".to_string())),
     };
-    if version != FORMAT_VERSION {
+    if version != V1 && version != FORMAT_VERSION {
         return Err(Unusable::Incompatible(version));
     }
-    if let Some(key) = map.keys().find(|k| !KEYS.contains(&k.as_str())) {
+    let v2 = version == FORMAT_VERSION;
+    let file = v2 && map.get("kind").and_then(Value::as_str) == Some("file");
+    let mut expected: Vec<&str> = KEYS.to_vec();
+    if v2 {
+        expected.extend(CLEANUP_KEYS);
+    }
+    if file {
+        expected.extend(FILE_KEYS);
+    }
+    if let Some(key) = map.keys().find(|k| !expected.contains(&k.as_str())) {
         return Err(Unusable::Corrupt(format!("unknown key {key}")));
     }
-    if let Some(key) = KEYS.iter().find(|k| !map.contains_key(**k)) {
+    if let Some(key) = expected.iter().find(|k| !map.contains_key(**k)) {
         return Err(Unusable::Corrupt(format!("missing key {key}")));
     }
-    let state: OperationState =
-        serde_json::from_value(value).map_err(|e| Unusable::Corrupt(format!("malformed: {e}")))?;
+    let malformed = |e: serde_json::Error| Unusable::Corrupt(format!("malformed: {e}"));
+    let mut take = |keys: &[&str]| -> Value {
+        Value::Object(
+            keys.iter().filter_map(|k| map.remove(*k).map(|v| (k.to_string(), v))).collect(),
+        )
+    };
+    let cleanup = if v2 {
+        Some(serde_json::from_value::<Cleanup>(take(&CLEANUP_KEYS)).map_err(malformed)?)
+    } else {
+        None
+    };
+    let fields = if file {
+        Some(serde_json::from_value::<FileFields>(take(&FILE_KEYS)).map_err(malformed)?)
+    } else {
+        None
+    };
+    let mut state: OperationState =
+        serde_json::from_value(Value::Object(map)).map_err(malformed)?;
+    state.cleanup = cleanup;
+    state.file = fields;
     validate(&state).map_err(Unusable::Corrupt)?;
     Ok(state)
+}
+
+fn object<T: Serialize>(v: &T) -> serde_json::Map<String, serde_json::Value> {
+    match serde_json::to_value(v).expect("a state part always serializes") {
+        serde_json::Value::Object(m) => m,
+        other => unreachable!("a state part is a JSON object, not {other}"),
+    }
 }
 
 fn validate(s: &OperationState) -> Result<(), String> {
@@ -204,6 +330,63 @@ fn validate(s: &OperationState) -> Result<(), String> {
             return Err("the takeover's creation_wall_time is not a time".to_string());
         }
     }
+    let v2 = s.format_version == FORMAT_VERSION;
+    if v2 != s.cleanup.is_some() || (v2 && s.kind == Kind::File) != s.file.is_some() {
+        return Err("the record's fields do not match its version and kind".to_string());
+    }
+    if let Some(c) = &s.cleanup {
+        if c.cleanup_pending != (s.state == OpState::Completed) {
+            return Err(format!(
+                "cleanup_pending is {} in a {} record",
+                c.cleanup_pending,
+                s.state.as_str()
+            ));
+        }
+        if let Some(bad) = c.cleanup_pending_artifacts.iter().find(|a| from_native_hex(a).is_none())
+        {
+            return Err(format!("a cleanup_pending_artifacts entry is not native-unit hex: {bad}"));
+        }
+    }
+    if let Some(f) = &s.file {
+        let hex = |v: &str| {
+            !v.is_empty()
+                && v.len().is_multiple_of(2)
+                && v.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        };
+        if f.artifact_type != ARTIFACT_FILE {
+            return Err(format!("artifact_type is not {ARTIFACT_FILE}: {}", f.artifact_type));
+        }
+        if !is_id(&f.attempt_id) || !is_id(&f.owner_instance_id) {
+            return Err("attempt_id or owner_instance_id is not an id".to_string());
+        }
+        if f.boot_session_id.is_empty() {
+            return Err("boot_session_id is empty".to_string());
+        }
+        if f.artifact_generation == 0 {
+            return Err("artifact_generation is 0".to_string());
+        }
+        if !digits(&f.creation_wall_time) || !digits(&f.last_heartbeat_wall_time) {
+            return Err(
+                "creation_wall_time or last_heartbeat_wall_time is not decimal nanoseconds"
+                    .to_string(),
+            );
+        }
+        if !hex(&f.target_path_key) {
+            return Err(format!("target_path_key is not hex: {}", f.target_path_key));
+        }
+        if parse_identity(&f.source_identity).is_none() {
+            return Err(format!("source_identity is not an identity: {}", f.source_identity));
+        }
+        match &f.target_identity {
+            Some(t) if parse_identity(t).is_none() => {
+                return Err(format!("target_identity is not an identity: {t}"));
+            }
+            None if s.state == OpState::Completed => {
+                return Err("a COMPLETED single-file record has no target_identity".to_string());
+            }
+            _ => {}
+        }
+    }
     Ok(())
 }
 
@@ -212,6 +395,111 @@ pub fn wall_time_ns() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+}
+
+/// A `FileIdentity` as version 2 writes it: `strong:<volume>:<index>`, `weak:<volume>:<index>` or `unavailable`, the
+/// numbers decimal (`flux_fs::ObjectId`).
+pub fn identity_text(id: FileIdentity) -> String {
+    match id {
+        FileIdentity::Strong(o) => format!("strong:{}:{}", o.volume, o.index),
+        FileIdentity::Weak(o) => format!("weak:{}:{}", o.volume, o.index),
+        FileIdentity::Unavailable => UNAVAILABLE.to_string(),
+    }
+}
+
+/// `identity_text`'s inverse: `None` for anything it could not have written (a leading zero included, so the text
+/// round-trips exactly).
+pub fn parse_identity(text: &str) -> Option<FileIdentity> {
+    if text == UNAVAILABLE {
+        return Some(FileIdentity::Unavailable);
+    }
+    let mut parts = text.split(':');
+    let (strength, volume, index) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    let canonical = |v: &str| {
+        !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) && (v == "0" || !v.starts_with('0'))
+    };
+    if !canonical(volume) || !canonical(index) {
+        return None;
+    }
+    let o = ObjectId { volume: volume.parse().ok()?, index: index.parse().ok()? };
+    match strength {
+        "strong" => Some(FileIdentity::Strong(o)),
+        "weak" => Some(FileIdentity::Weak(o)),
+        _ => None,
+    }
+}
+
+const UNAVAILABLE: &str = "unavailable";
+
+/// A path as lowercase hex of the platform's NATIVE name units (cut 7b, `cleanup_pending_artifacts`): the raw bytes on
+/// POSIX, the UTF-16 code units little-endian on Windows, with `/` (as a native unit) between components. Lossless
+/// and specified - not `as_encoded_bytes`, whose encoding Rust leaves unspecified (spec panel r2, PD-1).
+pub fn native_hex(path: &Path) -> String {
+    let mut units = Vec::new();
+    for (i, part) in path.iter().enumerate() {
+        if i > 0 {
+            units.extend(native_units(OsStr::new("/")));
+        }
+        units.extend(native_units(part));
+    }
+    crate::lock::site::hex(&units)
+}
+
+/// `native_hex`'s inverse: `None` for text it could not have produced (empty, odd, upper-case, an empty component).
+pub fn from_native_hex(text: &str) -> Option<PathBuf> {
+    if text.is_empty()
+        || !text.len().is_multiple_of(2)
+        || !text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+    let bytes: Vec<u8> = (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16))
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let mut path = PathBuf::new();
+    for part in native_parts(&bytes)? {
+        path.push(part);
+    }
+    Some(path)
+}
+
+#[cfg(unix)]
+fn native_units(s: &OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    s.as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+fn native_units(s: &OsStr) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+    s.encode_wide().flat_map(u16::to_le_bytes).collect()
+}
+
+#[cfg(unix)]
+fn native_parts(bytes: &[u8]) -> Option<Vec<OsString>> {
+    use std::os::unix::ffi::OsStringExt;
+    bytes
+        .split(|b| *b == b'/')
+        .map(|p| (!p.is_empty()).then(|| OsString::from_vec(p.to_vec())))
+        .collect()
+}
+
+#[cfg(windows)]
+fn native_parts(bytes: &[u8]) -> Option<Vec<OsString>> {
+    use std::os::windows::ffi::OsStringExt;
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let units: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
+    units
+        .split(|u| *u == u16::from(b'/'))
+        .map(|p| (!p.is_empty()).then(|| OsString::from_wide(p)))
+        .collect()
 }
 
 /// `DEST/.flux`, the control plane.
@@ -436,7 +724,7 @@ mod tests {
     }
 
     fn created() -> OperationState {
-        OperationState::created(&id(1), Kind::Tree, Path::new("/d"), 5)
+        OperationState::created_v1(&id(1), Kind::Tree, Path::new("/d"), 5)
     }
 
     #[test]
@@ -476,8 +764,8 @@ mod tests {
     #[test]
     fn format_version_is_judged_before_any_other_key() {
         assert_eq!(
-            decode(br#"{"format_version":2,"anything":[1,2]}"#),
-            Err(Unusable::Incompatible(2))
+            decode(br#"{"format_version":3,"anything":[1,2]}"#),
+            Err(Unusable::Incompatible(3))
         );
         assert!(matches!(decode(br#"{"kind":"tree"}"#), Err(Unusable::Corrupt(_))), "none");
         assert!(matches!(decode(br#"{"format_version":"1"}"#), Err(Unusable::Corrupt(_))), "text");
@@ -778,5 +1066,252 @@ mod tests {
         remove_empty_control_dirs(&d).unwrap();
         assert!(!fs.exists("/p/dest/.flux/operations"), "the empty one goes");
         assert!(fs.exists("/p/dest/.flux/user-file"), "a .flux holding anything else stays");
+    }
+
+    fn file_fields() -> FileFields {
+        FileFields {
+            artifact_type: ARTIFACT_FILE.to_string(),
+            attempt_id: id(7),
+            artifact_generation: 1,
+            source_identity: "strong:3:9".to_string(),
+            target_identity: None,
+            target_path_key: "74".to_string(),
+            owner_instance_id: id(8),
+            boot_session_id: "boot".to_string(),
+            creation_wall_time: "5".to_string(),
+            last_heartbeat_wall_time: "5".to_string(),
+        }
+    }
+
+    fn tree_v2() -> OperationState {
+        OperationState::created(&id(1), Kind::Tree, Path::new("/d"), 5, None)
+    }
+
+    fn file_v2() -> OperationState {
+        OperationState::created(&id(1), Kind::File, Path::new("/d/t"), 5, Some(file_fields()))
+    }
+
+    fn keys(s: &OperationState) -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_slice(&s.encode()).unwrap();
+        let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        k.sort();
+        k
+    }
+
+    #[test]
+    fn a_version_2_tree_state_carries_the_cleanup_keys_and_round_trips() {
+        let s = tree_v2();
+        let mut want: Vec<String> =
+            KEYS.iter().chain(CLEANUP_KEYS.iter()).map(|k| k.to_string()).collect();
+        want.sort();
+        assert_eq!(keys(&s), want);
+        assert_eq!(decode(&s.encode()), Ok(s));
+    }
+
+    #[test]
+    fn a_version_2_file_record_carries_all_sixteen_of_section_249_1_and_round_trips() {
+        let s = file_v2();
+        let k = keys(&s);
+        assert_eq!(k.len(), 8 + 2 + 10, "{k:?}");
+        for need in [
+            "format_version",
+            "artifact_type",
+            "operation_id",
+            "attempt_id",
+            "target_identity",
+            "target_path_key",
+            "source_identity",
+            "artifact_generation",
+            "owner_instance_id",
+            "boot_session_id",
+            "creation_wall_time",
+            "last_heartbeat_wall_time",
+            "state",
+            "superseded_by",
+            "cleanup_pending",
+            "cleanup_pending_artifacts",
+        ] {
+            assert!(k.iter().any(|x| x == need), "§249.1's {need} is missing: {k:?}");
+        }
+        let text = String::from_utf8(s.encode()).unwrap();
+        assert!(text.contains(r#""target_identity":null"#), "{text}");
+        assert_eq!(decode(&s.encode()), Ok(s));
+    }
+
+    #[test]
+    fn a_version_1_record_decodes_as_version_1_with_no_new_fields() {
+        let s = decode(&created().encode()).unwrap();
+        assert_eq!((s.format_version, s.cleanup.is_none(), s.file.is_none()), (V1, true, true));
+    }
+
+    #[test]
+    fn a_rewrite_keeps_its_records_version() {
+        let v1 =
+            OperationState { state: OpState::Abandoned, superseded_by: Some(id(2)), ..created() };
+        assert_eq!(keys(&v1).len(), 8, "a version-1 record stays version 1");
+        assert_eq!(decode(&v1.encode()).unwrap().format_version, V1);
+        let v2 =
+            OperationState { state: OpState::Abandoned, superseded_by: Some(id(2)), ..file_v2() };
+        assert_eq!(decode(&v2.encode()).unwrap(), v2);
+    }
+
+    #[test]
+    fn each_version_2_key_is_required_and_no_other_is_accepted() {
+        let edited =
+            |s: &OperationState, edit: &dyn Fn(&mut serde_json::Map<String, serde_json::Value>)| {
+                let mut v: serde_json::Value = serde_json::from_slice(&s.encode()).unwrap();
+                edit(v.as_object_mut().unwrap());
+                decode(v.to_string().as_bytes())
+            };
+        for key in CLEANUP_KEYS.iter().chain(FILE_KEYS.iter()) {
+            let r = edited(&file_v2(), &|m| {
+                m.remove(*key);
+            });
+            assert!(
+                matches!(&r, Err(Unusable::Corrupt(w)) if *w == format!("missing key {key}")),
+                "{key}: {r:?}"
+            );
+        }
+        let r = edited(&tree_v2(), &|m| {
+            m.insert("attempt_id".to_string(), id(7).into());
+        });
+        assert!(
+            matches!(&r, Err(Unusable::Corrupt(w)) if w == "unknown key attempt_id"),
+            "a tree has no file keys: {r:?}"
+        );
+        let r = edited(&created(), &|m| {
+            m.insert("cleanup_pending".to_string(), false.into());
+        });
+        assert!(
+            matches!(&r, Err(Unusable::Corrupt(w)) if w == "unknown key cleanup_pending"),
+            "version 1 has none: {r:?}"
+        );
+    }
+
+    #[test]
+    fn version_2s_consistency_rules_are_state_corrupt() {
+        let completed = |f: &dyn Fn(&mut OperationState)| {
+            let mut s = OperationState { state: OpState::Completed, ..file_v2() };
+            s.cleanup.as_mut().unwrap().cleanup_pending = true;
+            s.file.as_mut().unwrap().target_identity = Some("strong:3:10".to_string());
+            f(&mut s);
+            decode(&s.encode())
+        };
+        assert!(completed(&|_| {}).is_ok(), "the baseline is valid");
+        for (what, r) in [
+            (
+                "pending while not COMPLETED",
+                decode(
+                    &{
+                        let mut s = file_v2();
+                        s.cleanup.as_mut().unwrap().cleanup_pending = true;
+                        s
+                    }
+                    .encode(),
+                ),
+            ),
+            (
+                "COMPLETED without pending",
+                completed(&|s| s.cleanup.as_mut().unwrap().cleanup_pending = false),
+            ),
+            (
+                "an artifact that is not hex",
+                completed(&|s| {
+                    s.cleanup.as_mut().unwrap().cleanup_pending_artifacts = vec!["xyz".into()]
+                }),
+            ),
+            (
+                "COMPLETED with no target_identity",
+                completed(&|s| s.file.as_mut().unwrap().target_identity = None),
+            ),
+            (
+                "a target_identity that is not one",
+                completed(&|s| s.file.as_mut().unwrap().target_identity = Some("strong:3".into())),
+            ),
+            (
+                "a source_identity that is not one",
+                completed(&|s| s.file.as_mut().unwrap().source_identity = "x".into()),
+            ),
+            (
+                "an attempt_id that is not an id",
+                completed(&|s| s.file.as_mut().unwrap().attempt_id = "1".into()),
+            ),
+            (
+                "an empty boot_session_id",
+                completed(&|s| s.file.as_mut().unwrap().boot_session_id = String::new()),
+            ),
+            (
+                "artifact_generation 0",
+                completed(&|s| s.file.as_mut().unwrap().artifact_generation = 0),
+            ),
+            (
+                "another artifact_type",
+                completed(&|s| s.file.as_mut().unwrap().artifact_type = "partial".into()),
+            ),
+            (
+                "a target_path_key that is not hex",
+                completed(&|s| s.file.as_mut().unwrap().target_path_key = "t".into()),
+            ),
+            (
+                "a time that is not decimal",
+                completed(&|s| s.file.as_mut().unwrap().creation_wall_time = "5s".into()),
+            ),
+        ] {
+            assert!(matches!(r, Err(Unusable::Corrupt(_))), "{what}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn a_file_identity_round_trips_through_its_text_and_nothing_else_parses() {
+        let big = ObjectId { volume: u64::MAX, index: u128::from(u64::MAX) + 1 };
+        for id in [
+            FileIdentity::Strong(big),
+            FileIdentity::Weak(ObjectId { volume: 0, index: 7 }),
+            FileIdentity::Unavailable,
+        ] {
+            assert_eq!(parse_identity(&identity_text(id)), Some(id), "{}", identity_text(id));
+        }
+        for bad in [
+            "",
+            "strong:1",
+            "strong:1:2:3",
+            "strong:01:2",
+            "Strong:1:2",
+            "strong:-1:2",
+            "unknown",
+            "weak:1:x",
+        ] {
+            assert_eq!(parse_identity(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_path_round_trips_through_native_unit_hex() {
+        let p = Path::new("sub").join("a.flux-partial.op");
+        assert_eq!(from_native_hex(&native_hex(&p)).as_deref(), Some(p.as_path()));
+        for bad in ["", "7", "7G", "AA", "2f00"] {
+            assert_eq!(from_native_hex(bad), None, "{bad}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let odd = Path::new(OsStr::from_bytes(b"ab\xff"));
+            assert_eq!(native_hex(odd), "6162ff", "the raw bytes, not a UTF-8 replacement");
+            assert_eq!(from_native_hex(&native_hex(odd)).as_deref(), Some(odd));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            let lone = std::ffi::OsString::from_wide(&[u16::from(b'a'), 0xD800]);
+            assert_eq!(
+                native_hex(Path::new(&lone)),
+                "610000d8",
+                "UTF-16LE units, an unpaired surrogate kept"
+            );
+            assert_eq!(
+                from_native_hex(&native_hex(Path::new(&lone))).as_deref(),
+                Some(Path::new(&lone))
+            );
+        }
     }
 }

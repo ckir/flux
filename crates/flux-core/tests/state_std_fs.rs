@@ -17,7 +17,7 @@ fn a_workspace_is_created_and_its_manifest_rewritten_leaving_nothing_else() {
     let tmp = tempfile::tempdir().unwrap();
     let dest = StdFileSystem.destination_root(tmp.path()).unwrap();
     let id = flux_core::ids::new_id();
-    let s = OperationState::created(&id, Kind::Tree, tmp.path(), state::wall_time_ns());
+    let s = OperationState::created_v1(&id, Kind::Tree, tmp.path(), state::wall_time_ns());
     let ops = state::operations_dir(&dest, tmp.path()).unwrap();
     let ws = state::create_workspace(&ops, &s).unwrap();
     assert_eq!(
@@ -36,7 +36,7 @@ fn the_scan_finds_a_resumable_workspace_and_passes_over_a_creating_one() {
     let tmp = tempfile::tempdir().unwrap();
     let dest = StdFileSystem.destination_root(tmp.path()).unwrap();
     let ops = state::operations_dir(&dest, tmp.path()).unwrap();
-    let prior = OperationState::created(&flux_core::ids::new_id(), Kind::Tree, tmp.path(), 1);
+    let prior = OperationState::created_v1(&flux_core::ids::new_id(), Kind::Tree, tmp.path(), 1);
     drop(state::create_workspace(&ops, &prior).unwrap());
     let mut creating = flux_core::ids::new_id();
     creating.push_str(state::CREATING_SUFFIX);
@@ -54,7 +54,7 @@ fn a_record_is_matched_the_way_the_filesystem_matches_names() {
     let folds = tmp.path().join("probe").exists();
     std::fs::remove_file(tmp.path().join("PROBE")).unwrap();
     let id = flux_core::ids::new_id();
-    let prior = OperationState::created(&id, Kind::File, tmp.path(), 1);
+    let prior = OperationState::created_v1(&id, Kind::File, tmp.path(), 1);
     std::fs::write(tmp.path().join(format!("T.flux-state.{id}")), prior.encode()).unwrap();
     let dir = StdFileSystem.destination_root(tmp.path()).unwrap();
     let own = flux_core::ids::new_id();

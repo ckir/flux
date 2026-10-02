@@ -68,7 +68,7 @@ pub(crate) fn open_operation<'a, D: DirHandle, P: Place<D>>(
         // Step 5 (F5): the state first.
         if made.is_none() {
             let state =
-                OperationState::created(id, place.kind(), place.destination(), wall_time_ns());
+                OperationState::created_v1(id, place.kind(), place.destination(), wall_time_ns());
             if let Err(e) = place.create(&state) {
                 return Err(give_back(obtained, e, &lock_shown));
             }

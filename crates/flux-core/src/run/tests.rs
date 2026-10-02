@@ -105,7 +105,7 @@ fn prior(fs: &FaultFs, n: u8, s: OpState) {
     fs.create_dir(Path::new(&format!("/p/dest/.flux/operations/{}", id(n)))).unwrap();
     let state = OperationState {
         state: s,
-        ..OperationState::created(&id(n), Kind::Tree, Path::new("/p/dest"), 1)
+        ..OperationState::created_v1(&id(n), Kind::Tree, Path::new("/p/dest"), 1)
     };
     fs.write_file(format!("/p/dest/.flux/operations/{}/manifest", id(n)), &state.encode());
 }
@@ -456,7 +456,7 @@ fn run_file(fs: &FaultFs, c: &RunConfig) -> Run<Result<flux_fs::Outcome, CopyErr
 fn file_prior(fs: &FaultFs, n: u8) {
     let prior = OperationState {
         state: OpState::Failed,
-        ..OperationState::created(&id(n), Kind::File, Path::new("/p/t"), 1)
+        ..OperationState::created_v1(&id(n), Kind::File, Path::new("/p/t"), 1)
     };
     fs.write_file(record_path(&id(n)), &prior.encode());
 }
