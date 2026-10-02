@@ -133,6 +133,16 @@ FAILED and COMPLETED writes, and `--restart` setting ABANDONED and `superseded_b
   - both at every other ownership check the run makes after its record exists, so a long `--restart` sweep (one
     ownership check before each deletion, 7a Q-H) heartbeats too.
 - Before the record is written (7a step 5), the heartbeat does nothing: there is no record to refresh.
+- Borrowing: the heartbeat runs where the run holds only a shared borrow of its lock (the copy's guard closure, the
+  ownership checks). It needs no `&mut`:
+  - `LockFile::write_at_start` already takes `&self` (`crates/flux-fs/src/lock.rs:50`).
+  - `Held` gains a heartbeat method on `&self` that encodes the held record with the new time and writes it without a
+    sync.
+  - The newest heartbeat time lives in a `Cell` inside `Held`, and every later encode of the record (Q-K's rewrite)
+    uses it.
+  - The run keeps its last-write instant and its "a heartbeat has failed" flag in `Cell`s too.
+  - "Every ownership check" means the run's own check helper (`owned`, `crates/flux-core/src/run/session.rs:208`),
+    which calls the heartbeat before `still_owned`; `Held::still_owned` itself stays read-only.
 - **Failure (decision 7):** after the retry fails, the copy stops at that point. The run's report is exactly ONE error
   for it: the I/O error, naming the lock path. It is never `TARGET_LOCK_BUSY`, and never a second line for the same
   event; exit 1. The finish takes the failure path, and whatever the record then holds decides it:
