@@ -766,9 +766,23 @@ fn a_failed_heartbeat_is_the_copys_failure_whatever_its_code() {
     // From the copy itself, SAFETY_REJECTED with no leftover is a refusal that changed nothing (Q-I's rollback).
     fail_heartbeat_with(&fs, Code::SafetyRejected);
     let r = run_file(&fs, &beating());
-    assert_eq!(file_error(&r).step, CopyStep::Heartbeat);
+    let e = file_error(&r);
+    assert_eq!((e.step, e.code()), (CopyStep::Heartbeat, Code::SafetyRejected), "the code is kept");
     assert!(r.stop.is_none(), "{:?}", r.stop);
     assert_eq!(file_record(&fs, ID).state, OpState::Failed, "recorded FAILED, never rolled back");
+}
+
+#[test]
+fn a_tree_whose_heartbeat_fails_is_failed_whatever_its_code() {
+    let fs = fake();
+    // Nothing is copied before the first heartbeat, so from the copy itself this abort would be a refusal that
+    // changed nothing (`TreeAbort::refused_unchanged`), rolled back.
+    fail_heartbeat_with(&fs, Code::SafetyRejected);
+    let (r, _) = run_tree(&fs, &beating());
+    let a = aborted(&r);
+    assert_eq!((a.error.step, a.error.code()), (CopyStep::Heartbeat, Code::SafetyRejected));
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert_eq!(manifest(&fs, ID).state, OpState::Failed, "recorded FAILED, never rolled back");
 }
 
 #[test]
@@ -1013,7 +1027,7 @@ it with nothing written (cut 7b)."
 - [ ] **Step 4: Run.**
 
 Run: `cargo test --workspace`
-Expected: all `ok`, including the ten new tests.
+Expected: all `ok`, including the eleven new tests.
 
 Run: `cargo clippy --workspace --all-targets -- -D warnings`
 Expected: clean.
@@ -1392,6 +1406,7 @@ git commit -m "spec: the copy calls the heartbeat beside its guard (cut 7b Part 
 | `session.rs` `beat_error`: keep `e.source` unwrapped | `two_failed_heartbeat_writes_stop_the_copy_naming_the_lock_and_the_run_records_failed` |
 | `session.rs` `beat_error`: `let code = e.code;` | `a_heartbeat_failure_is_never_reported_as_target_lock_busy` |
 | `mod.rs` file `Ended`: delete the `Err(_) if locked.pulse.failed()` arm | `a_failed_heartbeat_is_the_copys_failure_whatever_its_code` |
+| `mod.rs` tree `Ended`: delete the `Err(_) if locked.pulse.failed()` arm | `a_tree_whose_heartbeat_fails_is_failed_whatever_its_code` |
 | `mod.rs` `fail`: delete the `pulse.failed()` early return | `a_torn_heartbeat_is_that_failure_never_a_lost_lock` |
 | `session.rs` `guarded`: `why` always `LOST` | `a_temporary_kept_after_a_torn_heartbeat_names_the_heartbeat_not_another_run` |
 | `mod.rs` `complete`: add `let _ = locked.pulse.beat(&locked.held);` first | `the_finish_never_heartbeats` |
