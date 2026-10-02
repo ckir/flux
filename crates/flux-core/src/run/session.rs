@@ -206,6 +206,10 @@ pub(crate) fn open_operation<'a, D: DirHandle, P: Place<D>>(
                 Fault::Io(path, error) => {
                     stop_after_record(place, locked, RunStep::Restart, path, error)
                 }
+                // Decision 7: the run's stop, at the lock step, naming the lock.
+                Fault::Heartbeat(path, error) => {
+                    stop_after_record(place, locked, RunStep::Lock, path, error)
+                }
             });
         }
         // The last write of step 5: TRANSFERRING, under §99.
@@ -278,6 +282,8 @@ pub(crate) enum Fault {
     Lost,
     /// It could not tell, or a step after it failed, at this path.
     Io(PathBuf, FsError),
+    /// The heartbeat before it failed, twice (cut 7b decision 7), at the lock's path.
+    Heartbeat(PathBuf, FsError),
 }
 
 impl Fault {
@@ -285,6 +291,8 @@ impl Fault {
         match self {
             Fault::Lost => lost(),
             Fault::Io(path, error) => RunError::Failed { step, path, error },
+            // Decision 7: a heartbeat outside the copy fails the lock step, whatever step it interrupted.
+            Fault::Heartbeat(path, error) => RunError::Failed { step: RunStep::Lock, path, error },
         }
     }
 }
@@ -296,6 +304,15 @@ pub(crate) fn owned<D: DirHandle>(held: &Held<'_, D>, lock_shown: &Path) -> Resu
         Ok(false) => Err(Fault::Lost),
         Err(e) => Err(Fault::Io(lock_shown.to_path_buf(), lock_io(e))),
     }
+}
+
+/// The `--restart` sweep's check (cut 7b, "The heartbeat"): the heartbeat, then §99. Two calls: `owned` stays a pure
+/// check.
+pub(crate) fn checked<D: DirHandle>(locked: &Locked<'_, D>) -> Result<(), Fault> {
+    if let Err(e) = locked.pulse.beat(&locked.held) {
+        return Err(Fault::Heartbeat(locked.lock_shown.clone(), e));
+    }
+    owned(&locked.held, &locked.lock_shown)
 }
 
 const LOST: &str =

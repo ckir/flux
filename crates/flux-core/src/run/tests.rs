@@ -1210,3 +1210,38 @@ fn the_finish_never_heartbeats() {
         "after the publish only Q-K writes the record: {after:?}"
     );
 }
+
+#[test]
+fn restart_heartbeats_during_its_sweep_before_the_copy() {
+    let fs = fake();
+    prior(&fs, 5, OpState::Failed);
+    let partial = format!("/p/dest/old.flux-partial.{}", id(5));
+    fs.write_file(&partial, b"half");
+    let (r, _) =
+        run_tree(&fs, &RunConfig { heartbeat_interval: std::time::Duration::ZERO, ..restart() });
+    ok(&r);
+    let c = calls(&fs);
+    let before = &c[..at(&c, &format!("remove_file({partial})"))];
+    // The record (1), then the heartbeats before the ABANDONED write and before the partial's deletion.
+    assert_eq!(count(before, "write_at_start("), 3, "{before:?}");
+    assert_eq!(count(before, "lock_sync_all("), 1, "only the record flushes: {before:?}");
+}
+
+#[test]
+fn a_failed_heartbeat_during_restart_stops_the_run_at_the_lock_step_and_copies_nothing() {
+    let fs = fake();
+    prior(&fs, 5, OpState::Failed);
+    let partial = format!("/p/dest/old.flux-partial.{}", id(5));
+    fs.write_file(&partial, b"half");
+    // The first heartbeat, before the ABANDONED write, and its retry.
+    fail_heartbeat(&fs, 2, LOCK, false);
+    let (r, _) =
+        run_tree(&fs, &RunConfig { heartbeat_interval: std::time::Duration::ZERO, ..restart() });
+    assert_eq!(failed_at(&r.stop), (RunStep::Lock, LOCK.to_string()));
+    assert!(r.copy.is_none(), "no copy runs");
+    assert!(r.warnings.is_empty(), "one error for it: {:?}", r.warnings);
+    assert_eq!(manifest(&fs, &id(5)).state, OpState::Failed, "the prior is untouched");
+    assert!(fs.exists(&partial));
+    assert_eq!(manifest(&fs, ID).state, OpState::Failed, "the record was intact");
+    assert!(!fs.exists(LOCK), "released");
+}

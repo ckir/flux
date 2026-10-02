@@ -2,7 +2,7 @@
 
 use super::RunWarning;
 use super::place::Place;
-use super::session::{Fault, Locked, owned};
+use super::session::{Fault, Locked, checked};
 use crate::prior::PriorOp;
 use crate::state::{OpState, OperationState};
 use flux_fs::DirHandle;
@@ -14,7 +14,7 @@ use flux_fs::DirHandle;
 /// `S21_1_s3`: §99's `still_owned` before EVERY one of those mutations (spec:9365-9367); when it fails, the caller
 /// closes the lock without unlinking (`S21_1_s3_refuse_close`). A partial that cannot be deleted keeps its operation's
 /// ABANDONED state as the record naming it (J1). A state that cannot be removed is a warning: an ABANDONED operation
-/// is passed over by every later run.
+/// is passed over by every later run. Each check is preceded by the heartbeat (cut 7b).
 pub(crate) fn supersede<D: DirHandle, P: Place<D>>(
     place: &P,
     locked: &Locked<'_, D>,
@@ -23,7 +23,7 @@ pub(crate) fn supersede<D: DirHandle, P: Place<D>>(
 ) -> Result<(), Fault> {
     let own = &locked.state.operation_id;
     for prior in priors {
-        owned(&locked.held, &locked.lock_shown)?;
+        checked(locked)?;
         let abandoned = OperationState {
             state: OpState::Abandoned,
             superseded_by: Some(own.clone()),
@@ -31,9 +31,9 @@ pub(crate) fn supersede<D: DirHandle, P: Place<D>>(
         };
         place.write(&abandoned).map_err(|e| Fault::Io(prior.shown.clone(), e))?;
     }
-    let gone = place.sweep(priors, &locked.held, &locked.lock_shown, warnings)?;
+    let gone = place.sweep(priors, locked, warnings)?;
     for prior in priors.iter().filter(|p| gone.contains(&p.state.operation_id)) {
-        owned(&locked.held, &locked.lock_shown)?;
+        checked(locked)?;
         if let Err((path, error)) = place.remove(&prior.state.operation_id) {
             warnings.push(RunWarning::NotRemoved { path, error });
         }
