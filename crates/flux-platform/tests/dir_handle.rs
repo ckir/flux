@@ -1192,3 +1192,21 @@ mod windows_arm {
         assert_ne!(root.identity().unwrap(), sub.identity().unwrap());
     }
 }
+
+/// Cut 7b: a written file's handle names its object, the one a look-up of its name finds, before and after a rename.
+#[test]
+fn a_written_files_handle_identity_is_its_objects_across_a_rename() {
+    use flux_fs::{DestinationRoot, DirHandle, FileHandle, FileIdentity};
+    use std::ffi::OsStr;
+    use std::io::Write;
+    let d = tempfile::TempDir::new().unwrap();
+    let root = flux_platform::StdFileSystem.destination_root(d.path()).unwrap();
+    let mut w = root.create_new(OsStr::new("t.tmp")).unwrap();
+    w.write_all(b"x").unwrap();
+    let held = w.identity().unwrap();
+    assert!(!matches!(held, FileIdentity::Unavailable), "{held:?}");
+    assert_eq!(root.metadata(OsStr::new("t.tmp")).unwrap().identity, held);
+    root.rename_replace(OsStr::new("t.tmp"), &root, OsStr::new("t")).unwrap();
+    assert_eq!(root.metadata(OsStr::new("t")).unwrap().identity, held, "a rename keeps the object");
+    assert_eq!(w.identity().unwrap(), held);
+}

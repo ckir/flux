@@ -101,6 +101,9 @@ pub struct Metadata {
 /// A handle open for writing. Deliberately NOT `Read`: see `FileSystem::Reader`.
 pub trait FileHandle: Write {
     fn sync_all(&self) -> Result<()>;
+    /// The identity of the file this handle HOLDS - never of a path (cut 7b): a rename keeps it, so the copy reads the
+    /// published target's identity from its temporary's handle.
+    fn identity(&self) -> Result<FileIdentity>;
 }
 
 pub trait FileSystem: Send + Sync {
@@ -393,6 +396,9 @@ mod tests {
     impl FileHandle for NullWriter {
         fn sync_all(&self) -> crate::Result<()> {
             Ok(())
+        }
+        fn identity(&self) -> crate::Result<crate::FileIdentity> {
+            Ok(crate::FileIdentity::Unavailable)
         }
     }
 

@@ -42,6 +42,18 @@ impl FileHandle for StdFile {
     fn sync_all(&self) -> Result<()> {
         self.0.sync_all().map_err(FsError::from_io)
     }
+
+    #[cfg(unix)]
+    fn identity(&self) -> Result<FileIdentity> {
+        let st =
+            rustix::fs::fstat(&self.0).map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
+        Ok(metadata_from_stat(&st).identity)
+    }
+
+    #[cfg(windows)]
+    fn identity(&self) -> Result<FileIdentity> {
+        Ok(identity_of_handle(&self.0))
+    }
 }
 
 /// Construct a writer from an already-open file. `DirHandle::create_new` opens
