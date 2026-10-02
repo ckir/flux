@@ -423,6 +423,36 @@ fn a_partial_restart_cannot_delete_keeps_its_prior_abandoned() {
         "{:?}",
         r.warnings
     );
+    let bytes = fs.read_file(format!("/p/dest/.flux/operations/{}/manifest", id(5))).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["format_version"], 1, "a version-1 prior is rewritten as version 1");
+    assert_eq!(v.as_object().unwrap().len(), 8, "with only its own eight keys");
+}
+
+#[test]
+fn a_version_2_prior_superseded_by_restart_stays_version_2() {
+    let fs = fake();
+    for d in ["/p/dest", "/p/dest/.flux", "/p/dest/.flux/operations"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    fs.create_dir(Path::new(&format!("/p/dest/.flux/operations/{}", id(5)))).unwrap();
+    let prior = OperationState {
+        state: OpState::Failed,
+        ..OperationState::created(&id(5), Kind::Tree, Path::new("/p/dest"), 1, None)
+    };
+    fs.write_file(format!("/p/dest/.flux/operations/{}/manifest", id(5)), &prior.encode());
+    let partial = format!("/p/dest/old.flux-partial.{}", id(5));
+    fs.write_file(&partial, b"half");
+    // As `a_partial_restart_cannot_delete_keeps_its_prior_abandoned`: the 3rd `remove_file` is the partial.
+    fs.fail_nth("remove_file", 3, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let (r, _) = run_tree(&fs, &restart());
+    ok(&r);
+    let kept = manifest(&fs, &id(5));
+    assert_eq!(
+        (kept.format_version, kept.state),
+        (crate::state::FORMAT_VERSION, OpState::Abandoned)
+    );
+    assert_eq!(kept.cleanup.map(|c| c.cleanup_pending), Some(false));
 }
 
 #[test]
