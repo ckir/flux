@@ -1518,6 +1518,9 @@ mod tests {
         .unwrap_err();
         assert_eq!((e.code(), e.step), (Code::IoError, CopyStep::Heartbeat));
         assert_eq!(calls.get(), 3, "no heartbeat after the failed one");
+        // Mid-stream, before step 7: the source was stat'ed once (step 2), never re-checked.
+        let stats = fs.calls().iter().filter(|c| c.as_str() == "metadata(/src)").count();
+        assert_eq!(stats, 1, "{:?}", fs.calls());
         assert!(
             e.leftover.is_none() && !fs.exists("/dst.flux-partial.op1"),
             "the temporary is removed"
