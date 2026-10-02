@@ -102,6 +102,7 @@ impl<'a, D: DirHandle> Claimed<'a, D> {
             lock: self.lock,
             identity: self.identity,
             record: Some(Box::new(record)),
+            beat: std::cell::Cell::new(None),
         }))
     }
 }

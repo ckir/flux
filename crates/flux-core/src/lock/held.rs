@@ -3,6 +3,7 @@
 use super::error::LockResult;
 use super::record::{Decoded, LockRecord, RECORD_LEN, decode};
 use flux_fs::{DirHandle, FileIdentity, LockFile};
+use std::cell::Cell;
 use std::ffi::OsString;
 use std::io::ErrorKind;
 
@@ -15,6 +16,9 @@ pub struct Held<'a, D: DirHandle> {
     /// Boxed: an inline record makes `Held` about 250 bytes, and every enum carrying one trips
     /// `clippy::large_enum_variant`.
     pub(crate) record: Option<Box<LockRecord>>,
+    /// Cut 7b: the newest `last_heartbeat_wall_time` a heartbeat wrote, `None` before the first. Kept beside the record,
+    /// because a heartbeat runs where the run holds only a shared borrow of its lock. `rewrite_record` carries it.
+    pub(crate) beat: Cell<Option<u64>>,
 }
 
 /// What `release` did.
@@ -51,6 +55,7 @@ impl<'a, D: DirHandle> Held<'a, D> {
     /// `workspace_path` to `none` before it removes the state the record names: a crash after that removal must not
     /// leave a dead owner's record naming missing state (`ARTIFACT_OWNERSHIP_UNCERTAIN`, which no flag clears). A
     /// crash DURING this write leaves a torn record, `TARGET_LOCK_UNCERTAIN`, which `--restart --break-lock` clears.
+    /// Cut 7b: the record keeps the newest heartbeat time (`heartbeat`), whatever `record` carries.
     pub fn rewrite_record(&mut self, record: LockRecord) -> LockResult<()> {
         let mine = self.record.as_deref().expect("rewrite_record follows write_record");
         assert!(
@@ -58,9 +63,27 @@ impl<'a, D: DirHandle> Held<'a, D> {
                 && record.owner_instance_id == mine.owner_instance_id,
             "a rewrite keeps the owner"
         );
+        // Cut 7b: a rewrite never moves the heartbeat back.
+        let record = match self.beat.get() {
+            Some(t) => LockRecord { last_heartbeat_wall_time: t, ..record },
+            None => record,
+        };
         self.lock.write_at_start(&record.encode())?;
         self.lock.sync_all()?;
         self.record = Some(Box::new(record));
+        Ok(())
+    }
+
+    /// Cut 7b (§101, H-1, H-3, H-4): refresh this operation's record with `last_heartbeat_wall_time` = `now`, every
+    /// other field unchanged, so `still_owned` still holds - one write through the handle holding the lock, NOT flushed:
+    /// the value is advisory, and a crash can tear the record whether or not it was flushed. No `still_owned` first: the
+    /// held handle owns the OS-native lock, which a `--break-lock` takeover must acquire before it writes. Does nothing
+    /// before `write_record`: there is no record to refresh.
+    pub fn heartbeat(&self, now: u64) -> LockResult<()> {
+        let Some(mine) = self.record.as_deref() else { return Ok(()) };
+        let beaten = LockRecord { last_heartbeat_wall_time: now, ..mine.clone() };
+        self.lock.write_at_start(&beaten.encode())?;
+        self.beat.set(Some(now));
         Ok(())
     }
 
@@ -163,5 +186,56 @@ mod tests {
         let first = record(&site, ID, "none");
         held.write_record(first.clone()).unwrap();
         let _ = held.rewrite_record(LockRecord { owner_instance_id: "2".repeat(32), ..first });
+    }
+
+    #[test]
+    fn a_heartbeat_rewrites_only_its_time_and_never_flushes() {
+        let (fs, d) = fake();
+        let site = LockSite::directory(&d, OsStr::new("dest")).unwrap();
+        let Ok(Obtained::Held { mut held, .. }) =
+            obtain(&site, LockCapability::LocalStrong, Mode::Plain, ID)
+        else {
+            panic!("a fresh lock is acquired");
+        };
+        // Before the record exists there is nothing to refresh.
+        held.heartbeat(5).unwrap();
+        assert!(!fs.called("write_at_start("), "{:?}", fs.calls());
+        let first = record(&site, ID, &format!("operations/{ID}"));
+        held.write_record(first.clone()).unwrap();
+        let later = first.last_heartbeat_wall_time + 7;
+        held.heartbeat(later).unwrap();
+        let on_disk = decode(&fs.read_file("/p/dest.flux-lock").unwrap());
+        let beaten = LockRecord { last_heartbeat_wall_time: later, ..first };
+        assert_eq!(on_disk, Decoded::Record(beaten));
+        assert!(held.still_owned().unwrap(), "the same file, the same owner");
+        let calls = fs.calls();
+        let count = |p: &str| calls.iter().filter(|c| c.starts_with(p)).count();
+        assert_eq!(
+            (count("write_at_start("), count("lock_sync_all(")),
+            (2, 1),
+            "the heartbeat writes, and only the record write flushes: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_rewrite_after_a_heartbeat_keeps_the_newest_time() {
+        let (fs, d) = fake();
+        let site = LockSite::directory(&d, OsStr::new("dest")).unwrap();
+        let Ok(Obtained::Held { mut held, .. }) =
+            obtain(&site, LockCapability::LocalStrong, Mode::Plain, ID)
+        else {
+            panic!("a fresh lock is acquired");
+        };
+        let first = record(&site, ID, &format!("operations/{ID}"));
+        held.write_record(first.clone()).unwrap();
+        let later = first.last_heartbeat_wall_time + 7;
+        held.heartbeat(later).unwrap();
+        // Q-K builds its record from `record()`, whose time is the creation one.
+        let none = LockRecord { workspace_path: "none".to_string(), ..first };
+        held.rewrite_record(none.clone()).unwrap();
+        let newest = LockRecord { last_heartbeat_wall_time: later, ..none };
+        let on_disk = decode(&fs.read_file("/p/dest.flux-lock").unwrap());
+        assert_eq!(on_disk, Decoded::Record(newest.clone()));
+        assert_eq!(held.record(), Some(&newest));
     }
 }
