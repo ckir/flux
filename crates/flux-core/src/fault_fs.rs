@@ -331,13 +331,13 @@ impl FileHandle for FakeHandle {
         // The object at the handle's path: a writer's path is its temporary's until the rename, and `move_object`
         // carries the identity across it, so the copy reads this before publishing (cut 7b Part 1 decision 5).
         let Some(sink) = &self.sink else { return Ok(flux_fs::FileIdentity::Unavailable) };
-        Ok(sink
-            .lock()
-            .unwrap()
-            .identities
-            .get(&self.path)
-            .copied()
-            .unwrap_or(flux_fs::FileIdentity::Unavailable))
+        let mut g = sink.lock().unwrap();
+        // `fail("handle_identity", ..)`: one injected failure of this read (cut 7b Part 1 test audit, G4). Its own name:
+        // a directory handle's `identity` is a different read.
+        if let Some(code) = g.faults.remove("handle_identity") {
+            return Err(FsError::new(code, std::io::Error::other("injected")));
+        }
+        Ok(g.identities.get(&self.path).copied().unwrap_or(flux_fs::FileIdentity::Unavailable))
     }
 }
 

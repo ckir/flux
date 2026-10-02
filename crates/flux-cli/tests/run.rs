@@ -131,6 +131,21 @@ fn a_killed_single_file_run_leaves_a_resumable_record_that_restart_supersedes() 
     let left = names(d.path());
     assert!(left.iter().any(|n| n.starts_with("t.flux-partial.")), "{left:?}");
     assert!(left.iter().any(|n| n.starts_with("t.flux-state.")), "{left:?}");
+    // Cut 7b: the record a REAL run left is version 2 and carries real identities (test audit A4).
+    let record = left.iter().find(|n| n.starts_with("t.flux-state.")).unwrap();
+    let state = flux_core::state::decode(&std::fs::read(d.path().join(record)).unwrap())
+        .expect("the record decodes");
+    assert_eq!(state.format_version, flux_core::state::FORMAT_VERSION);
+    let f = state.file.expect("a single-file record carries §249.1's fields");
+    assert!(
+        matches!(
+            flux_core::state::parse_identity(&f.source_identity),
+            Some(flux_fs::FileIdentity::Strong(_))
+        ),
+        "a real source's identity: {}",
+        f.source_identity
+    );
+    assert_eq!(f.target_identity, None, "no object stood at the target");
     let out = copy(&[src.join("a").as_os_str(), t.as_os_str()]);
     assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
     assert!(stderr(&out).contains("RESUMABLE_OPERATION_EXISTS"), "{}", stderr(&out));

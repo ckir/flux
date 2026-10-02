@@ -1247,6 +1247,10 @@ mod tests {
                 completed(&|s| s.file.as_mut().unwrap().artifact_generation = 0),
             ),
             (
+                "an owner_instance_id that is not an id",
+                completed(&|s| s.file.as_mut().unwrap().owner_instance_id = "x".into()),
+            ),
+            (
                 "another artifact_type",
                 completed(&|s| s.file.as_mut().unwrap().artifact_type = "file".into()),
             ),

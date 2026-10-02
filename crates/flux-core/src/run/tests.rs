@@ -935,6 +935,78 @@ fn a_failed_completed_write_leaves_a_failed_record_the_next_run_can_read() {
 }
 
 #[test]
+fn an_existing_target_that_cannot_be_read_is_recorded_unavailable_not_absent() {
+    let fs = fake();
+    fs.write_file("/p/t", b"old");
+    // `metadata`: the source (1), the target's identity gate (2), the lock's two checks (3, 4), then the record's
+    // read of the existing target under the lock (5), which fails with something other than NotFound.
+    fs.fail_nth("metadata", 5, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let s = failed_file_run(&fs);
+    assert_eq!(s.file.unwrap().target_identity.as_deref(), Some("unavailable"));
+}
+
+#[test]
+fn a_version_2_single_file_prior_superseded_by_restart_keeps_its_fields() {
+    let fs = fake();
+    let fields = crate::state::FileFields {
+        artifact_type: crate::state::ARTIFACT_STATE.to_string(),
+        attempt_id: id(7),
+        artifact_generation: 1,
+        source_identity: "strong:1:2".to_string(),
+        target_identity: None,
+        target_path_key: crate::lock::site::hex(b"t"),
+        owner_instance_id: id(8),
+        boot_session_id: "boot".to_string(),
+        creation_wall_time: "1".to_string(),
+        last_heartbeat_wall_time: "1".to_string(),
+    };
+    let prior = OperationState {
+        state: OpState::Failed,
+        ..OperationState::created(&id(5), Kind::File, Path::new("/p/t"), 1, Some(fields.clone()))
+    };
+    fs.write_file(record_path(&id(5)), &prior.encode());
+    fs.write_file(format!("/p/t.flux-partial.{}", id(5)), b"half");
+    // `remove_file`: this run's CREATED write (1), the prior's ABANDONED write (2), then the prior's partial (3), which
+    // fails, so the ABANDONED record stays as the partial's record (J1).
+    fs.fail_nth("remove_file", 3, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let r = run_file(&fs, &restart());
+    assert!(matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+    let kept = file_record(&fs, &id(5));
+    assert_eq!((kept.state, kept.superseded_by.as_deref()), (OpState::Abandoned, Some(ID)));
+    assert_eq!(kept.file, Some(fields), "superseding keeps the prior's §249.1 fields");
+}
+
+#[test]
+fn a_leftover_inside_a_folder_is_listed_by_its_path_below_dest() {
+    let fs = fake();
+    // `sub/b`'s copy fails while streaming: `create_new` is the manifest (1), TRANSFERRING (2), `a`'s temporary (3),
+    // `sub/b`'s (4). Removing it fails too: `remove_file` is the two state writes (1, 2), `a`'s sweep (3), `sub/b`'s
+    // sweep (4), then `sub/b`'s temporary (5).
+    fs.on_nth("create_new", 4, |fs| fs.fail_write(std::io::Error::other("injected write")));
+    fs.fail_nth("remove_file", 5, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let (r, got) = run_tree(&fs, &cfg());
+    ok(&r);
+    assert_eq!(got.len(), 1, "{got:?}");
+    let c = manifest(&fs, ID).cleanup.expect("version 2");
+    let leftover = Path::new("sub").join(format!("b.flux-partial.{ID}"));
+    assert_eq!(c.cleanup_pending_artifacts, vec![crate::state::native_hex(&leftover)]);
+}
+
+#[test]
+fn a_published_target_whose_identity_cannot_be_read_is_recorded_unavailable() {
+    let fs = fake();
+    fs.fail("handle_identity", Code::IoError);
+    // As `a_completed_record_says_cleanup_pending_and_names_its_target_before_anything_is_removed`: the record's own
+    // removal (the 5th `remove_file`) fails, so the COMPLETED record stays to be read.
+    fs.fail_nth("remove_file", 5, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let r = run_file(&fs, &cfg());
+    assert!(matches!(r.copy, Some(Ok(_))), "{:?}", r.copy);
+    let s = file_record(&fs, ID);
+    assert_eq!(s.state, OpState::Completed);
+    assert_eq!(s.file.unwrap().target_identity.as_deref(), Some("unavailable"));
+}
+
+#[test]
 fn a_clean_trees_completed_manifest_says_cleanup_pending_with_an_empty_list() {
     let fs = fake();
     let s = kept_tree_manifest(&fs);
