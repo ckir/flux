@@ -141,10 +141,15 @@ FAILED and COMPLETED writes, and `--restart` setting ABANDONED and `superseded_b
   - The newest heartbeat time lives in a `Cell` inside `Held`, and every later encode of the record (Q-K's rewrite)
     uses it.
   - The run keeps its last-write instant and its "a heartbeat has failed" flag in `Cell`s too.
-  - "Every ownership check" means the run's own checks during the `--restart` sweep and the copy (the guard, and
-    `owned`, `crates/flux-core/src/run/session.rs:208`, where the sweep calls it). The heartbeat runs before
-    `still_owned`; `Held::still_owned` itself stays read-only.
-  - The FINISH never heartbeats: its ownership checks (`complete`, `fail`, the rollback) only check. The Q-K rewrite
+  - The heartbeat is its OWN call, never folded into a check. `owned` (`crates/flux-core/src/run/session.rs:208`) and
+    `Held::still_owned` stay pure, read-only checks, unchanged from 7a. Three callers make the heartbeat call
+    themselves, immediately before their own check:
+    - the `--restart` sweep, before each ownership check;
+    - the run's guard closure, before each guarded mutation;
+    - the copy loop, every 64 KiB.
+    "Every ownership check" in the bullet above means these three places.
+  - The FINISH never heartbeats: its ownership checks (`complete`, `fail`, the rollback) only check, because nothing
+    in it makes the heartbeat call. The Q-K rewrite
     and the `COMPLETED` write follow at once and carry the newest time, so a heartbeat there would buy nothing, and a
     failure there would have no step to report it (panel r4, FA-1).
 - **Failure (decision 7):** after the retry fails, the step the heartbeat interrupted stops at that point and carries
