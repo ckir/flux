@@ -11,7 +11,7 @@ use crate::lock::{
 };
 use crate::prior::resumable_refusal;
 use crate::state::{
-    ARTIFACT_FILE, FileFields, OpState, OperationState, Takeover, identity_text, wall_time_ns,
+    ARTIFACT_STATE, FileFields, OpState, OperationState, Takeover, identity_text, wall_time_ns,
 };
 use flux_fs::{Code, DirHandle, FsError, LockCapability};
 use std::path::{Path, PathBuf};
@@ -74,7 +74,7 @@ pub(crate) fn open_operation<'a, D: DirHandle, P: Place<D>>(
         // Step 5 (F5): the state first.
         if made.is_none() {
             let file = place.file_identities().map(|(source, existing)| FileFields {
-                artifact_type: ARTIFACT_FILE.to_string(),
+                artifact_type: ARTIFACT_STATE.to_string(),
                 attempt_id: attempt_id.clone(),
                 artifact_generation: 1,
                 source_identity: identity_text(source),

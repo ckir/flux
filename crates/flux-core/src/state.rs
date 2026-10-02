@@ -134,8 +134,10 @@ pub struct FileFields {
     pub last_heartbeat_wall_time: String,
 }
 
-/// A single file's `artifact_type`.
-pub const ARTIFACT_FILE: &str = "file";
+/// The adjacent state record's `artifact_type`. §215 and §249 use it to tell apart the artifacts kept beside a target
+/// (the lock, the partial, the state record), so it names the record's ROLE; the operation's kind is `kind` (cut 7b
+/// Part 1 capstone round 3, owner ruling).
+pub const ARTIFACT_STATE: &str = "state";
 
 /// One operation's state, version 1 or 2.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -353,8 +355,8 @@ fn validate(s: &OperationState) -> Result<(), String> {
                 && v.len().is_multiple_of(2)
                 && v.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
         };
-        if f.artifact_type != ARTIFACT_FILE {
-            return Err(format!("artifact_type is not {ARTIFACT_FILE}: {}", f.artifact_type));
+        if f.artifact_type != ARTIFACT_STATE {
+            return Err(format!("artifact_type is not {ARTIFACT_STATE}: {}", f.artifact_type));
         }
         if !is_id(&f.attempt_id) || !is_id(&f.owner_instance_id) {
             return Err("attempt_id or owner_instance_id is not an id".to_string());
@@ -1070,7 +1072,7 @@ mod tests {
 
     fn file_fields() -> FileFields {
         FileFields {
-            artifact_type: ARTIFACT_FILE.to_string(),
+            artifact_type: ARTIFACT_STATE.to_string(),
             attempt_id: id(7),
             artifact_generation: 1,
             source_identity: "strong:3:9".to_string(),
@@ -1246,7 +1248,7 @@ mod tests {
             ),
             (
                 "another artifact_type",
-                completed(&|s| s.file.as_mut().unwrap().artifact_type = "partial".into()),
+                completed(&|s| s.file.as_mut().unwrap().artifact_type = "file".into()),
             ),
             (
                 "a target_path_key that is not hex",

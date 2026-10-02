@@ -835,7 +835,7 @@ fn a_single_file_record_carries_section_249_1_from_its_creation() {
     let s = failed_file_run(&fs);
     let f = s.file.clone().expect("a version-2 single-file record");
     assert_eq!(s.format_version, crate::state::FORMAT_VERSION);
-    assert_eq!(f.artifact_type, "file");
+    assert_eq!(f.artifact_type, "state");
     assert!(crate::ids::is_id(&f.attempt_id) && f.attempt_id != ID, "{}", f.attempt_id);
     assert_eq!(f.artifact_generation, 1);
     let src = fs.metadata(Path::new("/src/a")).unwrap().identity;

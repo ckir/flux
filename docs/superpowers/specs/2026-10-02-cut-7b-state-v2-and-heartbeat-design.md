@@ -84,7 +84,7 @@ One JSON object, as in version 1. `format_version` is still judged before any ot
 
 | Key | Value |
 |---|---|
-| `artifact_type` | `"file"` |
+| `artifact_type` | `"state"`: the artifact's role among those kept beside a target (lock, partial, state record; §215, §249). The operation's kind is `kind` (capstone r3, owner) |
 | `attempt_id` | a fresh 32-hex id, generated once per run with the same generator as `operation_id`. It is an `AttemptId`, not the ordinal `attempt_number` (spec:4244-4250). A `--restart` run mints its own; superseding a prior never changes the prior's. |
 | `artifact_generation` | `1` (a counter; one generation per operation until retries exist) |
 | `source_identity` | the source file's `FileIdentity`, taken by the run's source check before the lock (7a B1) |
@@ -111,7 +111,7 @@ with the cuts that read it.
 - `attempt_id` and `owner_instance_id` are 32-hex ids; `boot_session_id` is non-empty (it is a dashed UUID, a boot
   time or `unknown`, `crates/flux-platform/src/lock_file.rs:291-310`); the two times are decimal digits, as version 1
   already checks for `operation_id` and `created_at`.
-- `artifact_type` is `file`; `artifact_generation` is at least 1; `target_path_key` is non-empty lowercase hex; both
+- `artifact_type` is `state`; `artifact_generation` is at least 1; `target_path_key` is non-empty lowercase hex; both
   identities parse.
 
 **Reading.** A reader accepts versions 1 and 2. A version-1 state yields the same classification 7a gives, and its new
