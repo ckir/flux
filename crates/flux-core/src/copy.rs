@@ -1391,8 +1391,16 @@ mod tests {
         let fs = FaultFs::new();
         fs.write_file("/src", b"hello");
         let root = fs.destination_root(Path::new("/")).unwrap();
-        let e = copy_file_guarded(&fs, Path::new("/src"), &root, OsStr::new("dst"), &opts(), &lost, &no_heartbeat)
-            .unwrap_err();
+        let e = copy_file_guarded(
+            &fs,
+            Path::new("/src"),
+            &root,
+            OsStr::new("dst"),
+            &opts(),
+            &lost,
+            &no_heartbeat,
+        )
+        .unwrap_err();
         assert_eq!((e.code(), e.step), (Code::TargetLockBusy, CopyStep::Create));
         assert!(!fs.called("remove_file") && !fs.called("create_new"), "{:?}", fs.calls());
         assert!(!fs.exists("/dst"));
@@ -1476,8 +1484,16 @@ mod tests {
         let root = fs.destination_root(Path::new("/")).unwrap();
         let calls = std::cell::Cell::new(0);
         let beat = beat_counting(0, &calls);
-        copy_file_guarded(&fs, Path::new("/src"), &root, OsStr::new("dst"), &opts(), &unguarded, &beat)
-            .unwrap();
+        copy_file_guarded(
+            &fs,
+            Path::new("/src"),
+            &root,
+            OsStr::new("dst"),
+            &opts(),
+            &unguarded,
+            &beat,
+        )
+        .unwrap();
         // The sweep, the create, three chunks (64 + 64 + 2 KiB), the publish.
         assert_eq!(calls.get(), 6);
     }
@@ -1490,11 +1506,22 @@ mod tests {
         let calls = std::cell::Cell::new(0);
         // The sweep (1) and the create (2) pass; the first chunk's (3) fails.
         let beat = beat_counting(3, &calls);
-        let e = copy_file_guarded(&fs, Path::new("/src"), &root, OsStr::new("dst"), &opts(), &unguarded, &beat)
-            .unwrap_err();
+        let e = copy_file_guarded(
+            &fs,
+            Path::new("/src"),
+            &root,
+            OsStr::new("dst"),
+            &opts(),
+            &unguarded,
+            &beat,
+        )
+        .unwrap_err();
         assert_eq!((e.code(), e.step), (Code::IoError, CopyStep::Heartbeat));
         assert_eq!(calls.get(), 3, "no heartbeat after the failed one");
-        assert!(e.leftover.is_none() && !fs.exists("/dst.flux-partial.op1"), "the temporary is removed");
+        assert!(
+            e.leftover.is_none() && !fs.exists("/dst.flux-partial.op1"),
+            "the temporary is removed"
+        );
         assert!(!fs.exists("/dst") && !fs.called("rename_"), "{:?}", fs.calls());
     }
 
@@ -1505,8 +1532,16 @@ mod tests {
         let root = fs.destination_root(Path::new("/")).unwrap();
         let calls = std::cell::Cell::new(0);
         let beat = beat_counting(1, &calls);
-        let e = copy_file_guarded(&fs, Path::new("/src"), &root, OsStr::new("dst"), &opts(), &unguarded, &beat)
-            .unwrap_err();
+        let e = copy_file_guarded(
+            &fs,
+            Path::new("/src"),
+            &root,
+            OsStr::new("dst"),
+            &opts(),
+            &unguarded,
+            &beat,
+        )
+        .unwrap_err();
         assert_eq!(e.step, CopyStep::Heartbeat);
         assert!(!fs.called("remove_file") && !fs.called("create_new"), "{:?}", fs.calls());
     }
@@ -1519,8 +1554,16 @@ mod tests {
         let calls = std::cell::Cell::new(0);
         // The sweep (1), the create (2), one chunk (3); the publish's (4) fails.
         let beat = beat_counting(4, &calls);
-        let e = copy_file_guarded(&fs, Path::new("/src"), &root, OsStr::new("dst"), &opts(), &unguarded, &beat)
-            .unwrap_err();
+        let e = copy_file_guarded(
+            &fs,
+            Path::new("/src"),
+            &root,
+            OsStr::new("dst"),
+            &opts(),
+            &unguarded,
+            &beat,
+        )
+        .unwrap_err();
         assert_eq!(e.step, CopyStep::Heartbeat);
         assert!(!fs.exists("/dst") && !fs.exists("/dst.flux-partial.op1"), "{:?}", fs.calls());
     }
