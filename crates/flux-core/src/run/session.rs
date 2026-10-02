@@ -10,7 +10,9 @@ use crate::lock::{
     Refusal, obtain,
 };
 use crate::prior::resumable_refusal;
-use crate::state::{OpState, OperationState, Takeover, wall_time_ns};
+use crate::state::{
+    ARTIFACT_FILE, FileFields, OpState, OperationState, Takeover, identity_text, wall_time_ns,
+};
 use flux_fs::{Code, DirHandle, FsError, LockCapability};
 use std::path::{Path, PathBuf};
 
@@ -47,6 +49,10 @@ pub(crate) fn open_operation<'a, D: DirHandle, P: Place<D>>(
     let mode = if cfg.break_lock { Mode::BreakLock } else { Mode::Plain };
     // This run's state, once it exists (D1).
     let mut made: Option<OperationState> = None;
+    // Cut 7b: one wall-clock reading for the state and its record, so the record's fields equal the lock record's
+    // (Part 1 decision 7), and one attempt id per run.
+    let now = wall_time_ns();
+    let attempt_id = crate::ids::new_id();
     for _ in 0..MAX_ATTEMPTS {
         // Step 3.
         let obtained = obtain(site, capability, mode, id)
@@ -67,15 +73,26 @@ pub(crate) fn open_operation<'a, D: DirHandle, P: Place<D>>(
         };
         // Step 5 (F5): the state first.
         if made.is_none() {
-            let state =
-                OperationState::created_v1(id, place.kind(), place.destination(), wall_time_ns());
+            let file = place.file_identities().map(|(source, existing)| FileFields {
+                artifact_type: ARTIFACT_FILE.to_string(),
+                attempt_id: attempt_id.clone(),
+                artifact_generation: 1,
+                source_identity: identity_text(source),
+                target_identity: existing.map(identity_text),
+                target_path_key: site.target_path_key(),
+                owner_instance_id: cfg.owner_instance_id.clone(),
+                boot_session_id: cfg.boot_session_id.clone(),
+                creation_wall_time: now.to_string(),
+                last_heartbeat_wall_time: now.to_string(),
+            });
+            let state = OperationState::created(id, place.kind(), place.destination(), now, file);
             if let Err(e) = place.create(&state) {
                 return Err(give_back(obtained, e, &lock_shown));
             }
             made = Some(state);
         }
         let state = made.clone().expect("made above");
-        let record = match record_for(site, cfg, place.workspace_path(id)) {
+        let record = match record_for(site, cfg, place.workspace_path(id), now) {
             Ok(r) => r,
             Err(e) => {
                 let error = from_lock(e, RunStep::Record, &lock_shown, true);
@@ -168,13 +185,13 @@ fn give_back<D: DirHandle>(
 }
 
 /// This operation's lock record for `site` (§259.6's fields; in 7a `last_heartbeat_wall_time` equals
-/// `creation_wall_time`).
+/// `creation_wall_time`; both are the run's one `now` (cut 7b)).
 fn record_for<D: DirHandle>(
     site: &LockSite<'_, D>,
     cfg: &RunConfig,
     workspace_path: String,
+    now: u64,
 ) -> LockResult<LockRecord> {
-    let now = wall_time_ns();
     Ok(LockRecord {
         complete_lock_key: site.complete_lock_key()?,
         operation_id: cfg.operation_id.clone(),

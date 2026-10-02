@@ -54,6 +54,10 @@ pub(crate) trait Place<D: DirHandle> {
     fn remove(&self, id: &str) -> Result<(), (PathBuf, FsError)>;
     /// Finish step 4: the empty control directories; on a `rollback` (Q-I), also a DEST this run made.
     fn remove_control_dirs(&mut self, rollback: bool) -> Result<(), (PathBuf, FsError)>;
+    /// A single file's identities for its record (cut 7b): the source's, and the object at the target name now
+    /// (`None` if there is none, `Unavailable` if it cannot be read). Read under the lock, as the state is made. `None`
+    /// for a tree.
+    fn file_identities(&self) -> Option<(FileIdentity, Option<FileIdentity>)>;
 }
 
 /// What B1 resolved for a tree's DEST: the directory holding the lock, DEST's name in it, and DEST if it exists.
@@ -294,6 +298,10 @@ impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {
         }
         Ok(())
     }
+
+    fn file_identities(&self) -> Option<(FileIdentity, Option<FileIdentity>)> {
+        None
+    }
 }
 
 /// Remove the file at `rel` below `dest` through handles opened one component at a time, so no link is followed
@@ -316,6 +324,8 @@ pub(crate) struct FilePlace<'p, D: DirHandle> {
     pub(crate) target: OsString,
     /// The destination as the operator gave it.
     pub(crate) destination: PathBuf,
+    /// The source's identity, read when the source was opened (cut 7b).
+    pub(crate) source_identity: FileIdentity,
 }
 
 impl<D: DirHandle> Place<D> for FilePlace<'_, D> {
@@ -385,5 +395,14 @@ impl<D: DirHandle> Place<D> for FilePlace<'_, D> {
     fn remove_control_dirs(&mut self, _rollback: bool) -> Result<(), (PathBuf, FsError)> {
         // A single file's state needs no control directory (F2).
         Ok(())
+    }
+
+    fn file_identities(&self) -> Option<(FileIdentity, Option<FileIdentity>)> {
+        let existing = match self.dir.metadata(&self.target) {
+            Ok(m) => Some(m.identity),
+            Err(e) if e.source.kind() == ErrorKind::NotFound => None,
+            Err(_) => Some(FileIdentity::Unavailable),
+        };
+        Some((self.source_identity, existing))
     }
 }

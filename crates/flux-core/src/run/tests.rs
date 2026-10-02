@@ -279,6 +279,12 @@ fn a_temporary_the_copy_could_not_remove_keeps_the_completed_state() {
     assert_eq!(manifest(&fs, ID).state, OpState::Completed);
     assert!(fs.exists(format!("/p/dest/a.flux-partial.{ID}")));
     assert!(!fs.exists(LOCK), "the lock is still released");
+    let c = manifest(&fs, ID).cleanup.expect("version 2");
+    assert!(c.cleanup_pending);
+    assert_eq!(
+        c.cleanup_pending_artifacts,
+        vec![crate::state::native_hex(Path::new(&format!("a.flux-partial.{ID}")))]
+    );
 }
 
 #[test]
@@ -778,4 +784,117 @@ fn a_hook_that_never_returns_stops_the_copy_before_that_mutation() {
     assert_eq!(count.load(Ordering::SeqCst), 3);
     assert!(fs.exists(format!("/p/dest/a.flux-partial.{ID}")), "the temporary was made");
     assert!(!fs.exists("/p/dest/a"), "the publish did not happen");
+}
+
+fn file_record(fs: &FaultFs, id: &str) -> OperationState {
+    decode_state(&fs.read_file(record_path(id)).unwrap()).unwrap()
+}
+
+/// `create_new`: the CREATED record (1), TRANSFERRING (2), then the copy's temporary (3), whose write fails: the
+/// FAILED record stays, with every field the run wrote at creation.
+fn failed_file_run(fs: &FaultFs) -> OperationState {
+    fs.on_nth("create_new", 3, |fs| fs.fail_write(std::io::Error::other("injected write")));
+    let r = run_file(fs, &cfg());
+    assert!(matches!(&r.copy, Some(Err(e)) if e.step == CopyStep::Stream), "{:?}", r.copy);
+    file_record(fs, ID)
+}
+
+#[test]
+fn a_single_file_record_carries_section_249_1_from_its_creation() {
+    let fs = fake();
+    let s = failed_file_run(&fs);
+    let f = s.file.clone().expect("a version-2 single-file record");
+    assert_eq!(s.format_version, crate::state::FORMAT_VERSION);
+    assert_eq!(f.artifact_type, "file");
+    assert!(crate::ids::is_id(&f.attempt_id) && f.attempt_id != ID, "{}", f.attempt_id);
+    assert_eq!(f.artifact_generation, 1);
+    let src = fs.metadata(Path::new("/src/a")).unwrap().identity;
+    assert_eq!(f.source_identity, crate::state::identity_text(src));
+    assert_eq!(f.target_identity, None, "no object stood at /p/t");
+    assert_eq!(f.target_path_key, crate::lock::site::hex(b"t"));
+    assert_eq!(
+        (f.owner_instance_id.as_str(), f.boot_session_id.as_str()),
+        (id(0xee).as_str(), "test-boot")
+    );
+    assert_eq!(f.creation_wall_time, s.created_at);
+    assert_eq!(f.last_heartbeat_wall_time, s.created_at);
+    let other = fake();
+    assert_ne!(
+        failed_file_run(&other).file.unwrap().attempt_id,
+        f.attempt_id,
+        "one attempt id per run"
+    );
+}
+
+#[test]
+fn a_replaced_targets_identity_is_recorded_when_the_state_is_made() {
+    let fs = fake();
+    fs.write_file("/p/t", b"old");
+    let old = fs.metadata(Path::new("/p/t")).unwrap().identity;
+    let s = failed_file_run(&fs);
+    assert_eq!(s.file.unwrap().target_identity, Some(crate::state::identity_text(old)));
+}
+
+/// A clean tree run whose COMPLETED workspace cannot be retired, so its manifest stays to be read. `rename_no_replace`:
+/// the workspace (1), `a`'s and `sub/b`'s publishes (2, 3), then the retire (4), which fails.
+fn kept_tree_manifest(fs: &FaultFs) -> OperationState {
+    fs.fail_nth(
+        "rename_no_replace",
+        4,
+        Code::PermissionDenied,
+        std::io::ErrorKind::PermissionDenied,
+    );
+    let (r, _) = run_tree(fs, &cfg());
+    ok(&r);
+    manifest(fs, ID)
+}
+
+#[test]
+fn a_tree_manifest_is_version_2_with_cleanup_keys_and_no_file_fields() {
+    let fs = fake();
+    let s = kept_tree_manifest(&fs);
+    assert_eq!(s.format_version, crate::state::FORMAT_VERSION);
+    assert!(s.file.is_none());
+    assert!(s.cleanup.is_some());
+}
+
+#[test]
+fn the_single_file_record_and_its_lock_record_carry_one_time() {
+    let fs = fake();
+    // As `failed_file_run`, and the lock's own removal at the release fails, so the lock record stays to be read.
+    // `remove_file`: CREATED's and TRANSFERRING's temporaries (1, 2), the copy's step-1 sweep (3), the failed copy's
+    // temporary (4), FAILED's temporary (5), then the lock (6).
+    fs.fail_nth("remove_file", 6, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let s = failed_file_run(&fs);
+    let Decoded::Record(rec) = decode(&fs.read_file(T_LOCK).expect("the lock stays")) else {
+        panic!("a whole record")
+    };
+    let f = s.file.unwrap();
+    assert_eq!(f.creation_wall_time, rec.creation_wall_time.to_string());
+    assert_eq!(f.last_heartbeat_wall_time, rec.last_heartbeat_wall_time.to_string());
+}
+
+#[test]
+fn a_completed_record_says_cleanup_pending_and_names_its_target_before_anything_is_removed() {
+    let fs = fake();
+    // `remove_file`: CREATED and TRANSFERRING clear their temporaries (1, 2), the copy's step-1 sweep (3), COMPLETED
+    // (4), then the record itself (5), which fails: the COMPLETED record stays, as a crash there would leave it.
+    fs.fail_nth("remove_file", 5, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let r = run_file(&fs, &cfg());
+    assert!(matches!(r.copy, Some(Ok(_))), "{:?}", r.copy);
+    let s = file_record(&fs, ID);
+    assert_eq!(s.state, OpState::Completed);
+    let c = s.cleanup.expect("version 2");
+    assert!(c.cleanup_pending && c.cleanup_pending_artifacts.is_empty(), "{c:?}");
+    let published = fs.metadata(Path::new("/p/t")).unwrap().identity;
+    assert_eq!(s.file.unwrap().target_identity, Some(crate::state::identity_text(published)));
+}
+
+#[test]
+fn a_clean_trees_completed_manifest_says_cleanup_pending_with_an_empty_list() {
+    let fs = fake();
+    let s = kept_tree_manifest(&fs);
+    assert_eq!(s.state, OpState::Completed);
+    let c = s.cleanup.expect("version 2");
+    assert!(c.cleanup_pending && c.cleanup_pending_artifacts.is_empty(), "{c:?}");
 }
