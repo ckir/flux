@@ -149,7 +149,8 @@ FAILED and COMPLETED writes, and `--restart` setting ABANDONED and `superseded_b
     `Held::still_owned` stay pure, read-only checks, unchanged from 7a. Three callers make the heartbeat call
     themselves, immediately before their own check:
     - the `--restart` sweep, before each ownership check;
-    - the run's guard closure, before each guarded mutation;
+    - the copy, immediately before each guard call that precedes a guarded mutation (Part 2 plan, decision 1: inside
+      the guard closure its failure would be a per-file failure at `CopyStep::Create`, or `TARGET_LOCK_BUSY`);
     - the copy loop, every 64 KiB. The loop calls no guard today (`crates/flux-core/src/copy.rs:437-449`; the guard
       runs only before the create, the publish and the removal of a temporary), so `copy_file_guarded` and the tree
       copy that calls it take the heartbeat as a second callback beside the guard. A copy outside a run (the unlocked
@@ -245,6 +246,10 @@ Every new test is proven red under a mutant of the behaviour it pins.
 - §249.1's `last_heartbeat_wall_time` in the adjacent record is the creation value. The lock record carries the live
   heartbeat (§229.2 places the lease in the lock record).
 - The state's version follows its writer: a rewrite never upgrades a record.
+- The copy calls the heartbeat beside its guard, not inside the run's guard closure: its failure is
+  `CopyStep::Heartbeat`, which a tree treats as an abort, as it treats `TARGET_LOCK_BUSY`. A failed copy's removal of
+  its temporary is guarded but does not heartbeat. After a failed heartbeat, the guard's reason for keeping a temporary
+  names the heartbeat (Part 2 plan, decisions 1 and 4).
 
 ## Stand-downs
 
