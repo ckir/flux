@@ -5,6 +5,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use flux_cli::exit_code;
 use flux_cli::report::{self, Report};
 use flux_cli::resolve::{self, Job, Stop};
+use flux_core::run::RunConfig;
 use flux_fs::{Code, CopyOptions, Durability, OperationId, Preserve, Publish, Safety};
 use std::io::Write;
 use std::path::PathBuf;
@@ -53,6 +54,13 @@ struct CopyArgs {
     /// the size of a file that failed is not known.
     #[arg(long)]
     json: bool,
+    /// Supersede every resumable prior operation on DEST: its state is marked ABANDONED and its partial files are
+    /// deleted, then this copy runs.
+    #[arg(long)]
+    restart: bool,
+    /// With --restart: take over a lock that a crashed run left empty or unreadable (§240.5).
+    #[arg(long, requires = "restart")]
+    break_lock: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -90,8 +98,45 @@ fn options(args: &CopyArgs) -> CopyOptions {
             SafetyArg::Default => Safety::Default,
             SafetyArg::Strict => Safety::Strict,
         },
-        operation_id: OperationId::new(format!("{}", std::process::id())),
+        // A placeholder: the run replaces it with its own operation id (`RunConfig::operation_id`).
+        operation_id: OperationId::new(String::new()),
     }
+}
+
+/// The run's configuration: two fresh ids for this invocation (the operation and this process, cut 7a) and the boot
+/// session; in a debug build, the crash hook `debug_hook` reads from the environment.
+fn run_config(args: &CopyArgs) -> RunConfig {
+    RunConfig {
+        restart: args.restart,
+        break_lock: args.break_lock,
+        operation_id: flux_core::ids::new_id(),
+        owner_instance_id: flux_core::ids::new_id(),
+        boot_session_id: flux_platform::boot_session_id(),
+        before_mutation: debug_hook(),
+    }
+}
+
+/// Part 3b-2, decision 2 (debug builds only): with `FLUX_TEST_STALL_AT=<n>` and `FLUX_TEST_STALL_FILE=<path>`, the
+/// run creates `<path>` and then blocks forever just before its n-th guarded mutation, so an end-to-end test can kill
+/// it at a known point. A release build has no hook.
+#[cfg(debug_assertions)]
+fn debug_hook() -> Option<flux_core::run::BeforeMutation> {
+    let at: u64 = std::env::var("FLUX_TEST_STALL_AT").ok()?.parse().ok()?;
+    let file = PathBuf::from(std::env::var_os("FLUX_TEST_STALL_FILE")?);
+    let seen = std::sync::atomic::AtomicU64::new(0);
+    Some(std::sync::Arc::new(move || {
+        if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == at {
+            let _ = std::fs::write(&file, b"stalled");
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            }
+        }
+    }))
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_hook() -> Option<flux_core::run::BeforeMutation> {
+    None
 }
 
 fn copy(args: &CopyArgs) -> u8 {
@@ -118,56 +163,78 @@ fn copy(args: &CopyArgs) -> u8 {
         }
     };
     let opts = options(args);
+    let cfg = run_config(args);
     let fs = flux_platform::StdFileSystem;
     match job {
         Job::Tree { src, dst } => {
             let started = Instant::now();
-            let result = flux_core::copy_tree(&fs, &src, &dst, &opts, &mut |f| {
+            let run = flux_core::run::tree(&fs, &src, &dst, &opts, &cfg, &mut |f| {
                 for line in report::record_lines(&f) {
                     err(&line);
                 }
             });
             let ms = millis(started);
-            let (outcome, aborted) = match &result {
-                Ok(out) => (out, false),
-                Err(a) => {
-                    err(&a.error.to_string());
-                    (&a.outcome, true)
+            let rep = Report::tree_run(&run, ms);
+            match &run.copy {
+                Some(result) => {
+                    let outcome = match result {
+                        Ok(out) => out,
+                        Err(a) => {
+                            err(&a.error.to_string());
+                            &a.outcome
+                        }
+                    };
+                    for line in report::warning_lines(&outcome.warnings) {
+                        err(&line);
+                    }
+                    lines(report::run_lines(&run));
+                    err(&report::summary_line(&rep, outcome.directories_created));
                 }
-            };
-            for line in report::warning_lines(&outcome.warnings) {
-                err(&line);
+                None => lines(report::run_lines(&run)),
             }
-            let rep = Report::tree(outcome, aborted, ms);
-            err(&report::summary_line(&rep, outcome.directories_created));
             json(args, &rep);
-            exit_code::for_tree(&result)
+            exit_code::for_tree_run(&run)
         }
         Job::File { src, dst, target_existed } => {
             let started = Instant::now();
-            let result = flux_core::copy_file(&fs, &src, &dst, &opts);
+            let run = flux_core::run::file(&fs, &src, &dst, &opts, &cfg);
             let ms = millis(started);
-            match &result {
-                Ok(o) => {
-                    let target = dst.display().to_string();
-                    for m in &o.metadata_failures {
-                        err(&report::complaint_line(&target, m));
+            let rep = Report::file_run(&run, target_existed, ms);
+            match &run.copy {
+                Some(result) => {
+                    match result {
+                        Ok(o) => {
+                            let target = dst.display().to_string();
+                            for m in &o.metadata_failures {
+                                err(&report::complaint_line(&target, m));
+                            }
+                            if let Some(w) = o
+                                .identity_degraded
+                                .as_ref()
+                                .and_then(|d| report::file_warning(d, &dst))
+                            {
+                                err(&w);
+                            }
+                        }
+                        // `CopyError`'s Display is "CODE: source" plus a staging temporary that
+                        // could not be removed - the one thing the user needs to clean up.
+                        Err(e) => err(&e.to_string()),
                     }
-                    if let Some(w) =
-                        o.identity_degraded.as_ref().and_then(|d| report::file_warning(d, &dst))
-                    {
-                        err(&w);
-                    }
+                    lines(report::run_lines(&run));
+                    err(&report::summary_line(&rep, 0));
                 }
-                // `CopyError`'s Display is "CODE: source" plus a staging temporary that
-                // could not be removed - the one thing the user needs to clean up.
-                Err(e) => err(&e.to_string()),
+                None => lines(report::run_lines(&run)),
             }
-            let rep = Report::file(&result, target_existed, ms);
-            err(&report::summary_line(&rep, 0));
             json(args, &rep);
-            exit_code::for_file(&result)
+            exit_code::for_file_run(&run)
         }
+    }
+}
+
+/// Each line to stderr.
+fn lines(v: Vec<String>) {
+    for line in v {
+        err(&line);
     }
 }
 
@@ -241,5 +308,20 @@ mod tests {
     #[test]
     fn an_unknown_value_is_a_usage_error() {
         assert!(Cli::try_parse_from(["flux", "copy", "a", "b", "--safety=loose"]).is_err());
+    }
+
+    #[test]
+    fn break_lock_needs_restart_and_each_run_gets_fresh_ids() {
+        assert!(Cli::try_parse_from(["flux", "copy", "a", "b", "--break-lock"]).is_err());
+        let both = parse(&["--restart", "--break-lock"]);
+        assert!(both.restart && both.break_lock);
+        let cfg = run_config(&parse(&["--restart"]));
+        assert!(cfg.restart && !cfg.break_lock);
+        assert!(
+            flux_core::ids::is_id(&cfg.operation_id)
+                && flux_core::ids::is_id(&cfg.owner_instance_id)
+        );
+        assert_ne!(cfg.operation_id, cfg.owner_instance_id);
+        assert_ne!(run_config(&parse(&[])).operation_id, cfg.operation_id, "one id per invocation");
     }
 }

@@ -67,6 +67,7 @@ const fn libc_s_iflnk() -> u32 {
 
 impl DirHandle for StdDir {
     type Writer = crate::StdFile;
+    type Lock = crate::StdLock;
 
     fn open_dir(&self, name: &OsStr) -> Result<Self> {
         check_component(name)?;
@@ -189,6 +190,155 @@ impl DirHandle for StdDir {
         }
         rustix::fs::renameat(&self.0, from, &other.0, to)
             .map_err(|e| FsError::from_io(std::io::Error::from(e)))
+    }
+
+    fn create_lock(&self, name: &OsStr) -> Result<Self::Lock> {
+        check_component(name)?;
+        let fd = openat(
+            &self.0,
+            name,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o666),
+        )
+        .map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
+        Ok(crate::StdLock::new(std::fs::File::from(fd)))
+    }
+
+    fn lock_capability(&self) -> Result<flux_fs::LockCapability> {
+        crate::lock_file::capability_of(&self.0)
+    }
+
+    fn open_lock(&self, name: &OsStr) -> Result<Self::Lock> {
+        use rustix::fs::FileType;
+        use rustix::io::Errno;
+        check_component(name)?;
+        // NONBLOCK: an open of a FIFO planted at the lock's name must not hang (it is refused just below). It changes
+        // nothing for a regular file, whose reads and writes never block on it. NOCTTY: a terminal device planted
+        // there must not become this process's controlling terminal.
+        let fd = openat(
+            &self.0,
+            name,
+            OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| match e {
+            // O_NOFOLLOW on a symlink in the final component: the link itself is refused, never followed.
+            Errno::LOOP => FsError::new(Code::SafetyRejected, std::io::Error::from(e)),
+            Errno::ISDIR => FsError::new(
+                Code::DestinationError,
+                std::io::Error::new(
+                    std::io::ErrorKind::IsADirectory,
+                    "a directory is not a lock file",
+                ),
+            ),
+            _ => FsError::from_io(std::io::Error::from(e)),
+        })?;
+        let st = rustix::fs::fstat(&fd).map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
+        if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::other("a lock path holds something other than a regular file"),
+            ));
+        }
+        Ok(crate::StdLock::new(std::fs::File::from(fd)))
+    }
+
+    fn read_dir(&self) -> Result<Vec<flux_fs::DirEntry>> {
+        use rustix::fs::{Dir, FileType};
+        use std::os::unix::ffi::OsStrExt;
+        let io = |e: rustix::io::Errno| FsError::from_io(std::io::Error::from(e));
+        let mut out = Vec::new();
+        // `read_from` reads through a descriptor of its own (an `openat` of "."), so this handle is untouched and every
+        // call lists from the start.
+        for entry in Dir::read_from(&self.0).map_err(io)? {
+            let entry = entry.map_err(io)?;
+            let bytes = entry.file_name().to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            let name = OsStr::from_bytes(bytes).to_os_string();
+            let kind = match entry.file_type() {
+                // No `d_type` on this filesystem: ask the name itself, never its target.
+                FileType::Unknown => match statat(&self.0, &name, AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(st) => FileType::from_raw_mode(st.st_mode),
+                    // Gone since the listing: no longer an entry.
+                    Err(rustix::io::Errno::NOENT) => continue,
+                    Err(e) => return Err(io(e)),
+                },
+                known => known,
+            };
+            let file_type = match kind {
+                FileType::RegularFile => flux_fs::FileType::File,
+                FileType::Directory => flux_fs::FileType::Dir,
+                FileType::Symlink => flux_fs::FileType::Symlink,
+                _ => flux_fs::FileType::Other,
+            };
+            out.push(flux_fs::DirEntry { name, file_type });
+        }
+        Ok(out)
+    }
+
+    fn read_file(&self, name: &OsStr, limit: usize) -> Result<Vec<u8>> {
+        use rustix::fs::FileType;
+        use std::os::unix::fs::FileExt;
+        check_component(name)?;
+        // `open_lock`'s flags, read-only: NOFOLLOW refuses a link, NONBLOCK keeps a FIFO from hanging the open, NOCTTY
+        // keeps a terminal from becoming this process's.
+        let fd = openat(
+            &self.0,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| match e {
+            rustix::io::Errno::LOOP => FsError::new(Code::SafetyRejected, std::io::Error::from(e)),
+            // A socket fails the open itself, so the `fstat` refusal below never sees it. MEASURED (cut 7a Part 3a
+            // capstone): Linux answers ENXIO, and macOS answers differently. Ask the name what it is instead: anything
+            // that is not a regular file is refused as `fstat` would refuse it. The name is gone, or is a regular file
+            // the open could not read (EACCES): report the open's own error.
+            _ if statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW)
+                .is_ok_and(|st| FileType::from_raw_mode(st.st_mode) != FileType::RegularFile) =>
+            {
+                FsError::new(
+                    Code::DestinationError,
+                    std::io::Error::other(format!("not a regular file ({e})")),
+                )
+            }
+            _ => FsError::from_io(std::io::Error::from(e)),
+        })?;
+        let st = rustix::fs::fstat(&fd).map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
+        match FileType::from_raw_mode(st.st_mode) {
+            FileType::RegularFile => {}
+            // A read-only open of a directory succeeds on POSIX, so it is refused here rather than by the kernel.
+            FileType::Directory => {
+                return Err(FsError::new(
+                    Code::DestinationError,
+                    std::io::Error::new(
+                        std::io::ErrorKind::IsADirectory,
+                        "a directory is not a state file",
+                    ),
+                ));
+            }
+            _ => {
+                return Err(FsError::new(
+                    Code::DestinationError,
+                    std::io::Error::other("not a regular file"),
+                ));
+            }
+        }
+        let file = std::fs::File::from(fd);
+        crate::lock_file::read_loop(limit, |buf, at| file.read_at(buf, at))
+    }
+
+    fn remove_dir(&self, name: &OsStr) -> Result<()> {
+        check_component(name)?;
+        // `AT_REMOVEDIR` refuses a symlink with ENOTDIR even when it points at a directory: a link is never followed.
+        rustix::fs::unlinkat(&self.0, name, AtFlags::REMOVEDIR)
+            .map_err(|e| FsError::from_io(std::io::Error::from(e)))
+    }
+
+    fn sync(&self) -> Result<()> {
+        rustix::fs::fsync(&self.0).map_err(|e| FsError::from_io(std::io::Error::from(e)))
     }
 }
 

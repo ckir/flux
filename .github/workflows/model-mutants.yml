@@ -1,0 +1,78 @@
+name: Model mutants
+
+# Cut 6, revision 3: each entry of models/lockproto/mutants.toml applies one exact-text mutant to a scratch copy
+# of the model, runs TLC on one config, and checks what it reports (`run.py --mutants`). It runs on dispatch and on
+# a push that changes the manifest, the runner or this file: a measurement of the model's checking net, run when
+# the net changes, not a per-commit gate.
+on:
+  # A push that changes the manifest, the runner or this workflow runs every mutant: GitHub dispatches a
+  # workflow_dispatch workflow only once it exists on the default branch, so a branch that adds this file
+  # needs the push trigger to run it at all (independent review of this plan, LI-1).
+  push:
+    paths:
+      - models/lockproto/mutants.toml
+      - models/lockproto/run.py
+      - .github/workflows/model-mutants.yml
+  workflow_dispatch:
+    inputs:
+      mutant:
+        description: "run only the mutant of this name (empty: all)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: List the mutants
+        id: plan
+        env:
+          ONLY: ${{ inputs.mutant }}
+        run: |
+          set -euo pipefail
+          if [ -n "$ONLY" ]; then
+            matrix=$(python models/lockproto/run.py --list-mutants models/lockproto/mutants.toml --mutant "$ONLY")
+          else
+            matrix=$(python models/lockproto/run.py --list-mutants models/lockproto/mutants.toml)
+          fi
+          echo "matrix=$matrix"
+          { echo "matrix<<MATRIX_EOF"; echo "$matrix"; echo "MATRIX_EOF"; } >> "$GITHUB_OUTPUT"
+
+  mutant:
+    name: Mutant ${{ matrix.name }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        name: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Run the mutant
+        env:
+          NAME: ${{ matrix.name }}
+        run: python -u models/lockproto/run.py --mutants models/lockproto/mutants.toml --mutant "$NAME"
+      - name: Upload TLC output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutant-${{ matrix.name }}
+          path: target/tla/mutants/

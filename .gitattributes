@@ -1,0 +1,8 @@
+# Every text file is LF in the working tree as in the index, whatever core.autocrlf says: agents rewrite files, and
+# a mixed LF/CRLF tree made every rewrite flip a file's endings and every git call warn (owner, 2026-09-30).
+* text=auto eol=lf
+
+# The zig wrappers used by `just check-mac`: a shell script with CRLF breaks its shebang, a .cmd with LF
+# trips older cmd.exe parsing. Pin both, whatever core.autocrlf says.
+tools/mac-cc/*.sh text eol=lf
+tools/mac-cc/*.cmd text eol=crlf

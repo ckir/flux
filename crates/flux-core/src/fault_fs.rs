@@ -6,7 +6,7 @@
 
 use flux_fs::{
     Code, DestinationRoot, DirEntry, DirHandle, FileHandle, FileSystem, FileType, FsError,
-    Metadata, Perms, Result, check_component,
+    LockCapability, LockFile, Metadata, Perms, Result, check_component,
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -86,10 +86,27 @@ struct Inner {
     /// arguments. No `DirHandle` method consults this map.
     dir_node_by_path: HashMap<PathBuf, u64>,
     next_dir_node: u64,
+    /// Object index -> the `FakeLock` handle id holding its OS-native lock. Keyed by OBJECT, not path: a real
+    /// OS-native lock follows the file across a rename, and §240.3 renames a lock aside while holding it.
+    lock_holders: HashMap<u128, u64>,
+    next_lock_handle: u64,
+    /// What `lock_capability` answers; `None` means `LocalStrong`.
+    lock_capability: Option<LockCapability>,
+    /// call name -> (which call, an action). The action runs just BEFORE that call, outside the fake's own lock,
+    /// so it can drive the fake itself: "another process acts between two of this one's calls" (cut 7a Part 2's
+    /// protocol tests). Consumed on use.
+    #[allow(clippy::type_complexity)]
+    hooks: HashMap<String, (u32, Box<dyn FnOnce(&FaultFs) + Send>)>,
+    /// Windows' legacy delete (cut 7a Part 1 capstone; `set_legacy_delete`).
+    legacy_delete: bool,
+    /// Object index -> live `FakeLock` handles on it.
+    open_locks: HashMap<u128, u32>,
+    /// Paths removed while a lock handle was open under legacy delete: still occupying their name, found by nothing.
+    pending: HashSet<PathBuf>,
 }
 
 /// One node in the `DirHandle` graph, addressed by an opaque id rather than by
-/// path. `path` is a snapshot taken ONCE, when the node is minted, and used only to
+/// path. `path` is a snapshot taken when the node is minted - moved only when a directory rename moves that directory or an ancestor, since the object moved (cut 7a Part 3a) - and used only to
 /// reach the legacy path-keyed maps above (`files`/`directories`/`types`) -- every
 /// `DirHandle` method reaches a node through its id and this snapshot, never by
 /// re-walking a name. `children` is the one place a name binding lives, and the one
@@ -127,7 +144,7 @@ fn dir_node_for_path(g: &mut Inner, path: &Path) -> u64 {
 /// it, so the next `metadata` on that path hit the unreachable-by-construction panic.
 /// MEASURED before this guard: `Ok`, `/dest` existed, `metadata` panicked.
 fn missing_source(g: &Inner, from: &Path) -> Result<()> {
-    if g.files.contains_key(from) {
+    if g.files.contains_key(from) || g.directories.contains(from) {
         return Ok(());
     }
     Err(FsError::new(Code::IoError, std::io::Error::from(std::io::ErrorKind::NotFound)))
@@ -151,10 +168,23 @@ fn mint_identity(g: &mut Inner, path: &Path) {
     g.identities.insert(path.to_path_buf(), flux_fs::FileIdentity::Strong(id));
 }
 
+/// Forget a removed file: its bytes and everything keyed by its path, so a later object at the path starts fresh.
+fn purge(g: &mut Inner, path: &Path) {
+    g.files.remove(path);
+    g.identities.remove(path);
+    g.times.remove(path);
+    g.perms.remove(path);
+    g.types.remove(path);
+}
+
 /// Move a name's content AND its metadata. Moving only the bytes meant the times and
 /// permissions applied to the temporary vanished at publication, so no test could
 /// assert that the §44.1 ordering achieved anything.
 fn move_object(g: &mut Inner, from: &Path, to: &Path) {
+    if g.directories.contains(from) {
+        move_directory(g, from, to);
+        return;
+    }
     let bytes = g.files.remove(from).unwrap_or_default();
     g.files.insert(to.to_path_buf(), bytes);
     // REPLACE, never merge. A rename destroys the object at `to`, so where the source
@@ -187,6 +217,54 @@ fn move_object(g: &mut Inner, from: &Path, to: &Path) {
         None => {
             g.identities.remove(to);
         }
+    }
+}
+
+/// A directory rename moves its whole subtree, and every handle open on it or below it follows the OBJECT, as on a
+/// real filesystem (cut 7a Part 3a: a workspace is built under one name and renamed to another). The name binding moves
+/// from the old parent's node to the new parent's.
+fn move_directory(g: &mut Inner, from: &Path, to: &Path) {
+    let moved = |p: &Path| -> Option<PathBuf> {
+        let rest = p.strip_prefix(from).ok()?;
+        Some(if rest.as_os_str().is_empty() { to.to_path_buf() } else { to.join(rest) })
+    };
+    fn rekey<V>(map: &mut HashMap<PathBuf, V>, moved: &dyn Fn(&Path) -> Option<PathBuf>) {
+        let keys: Vec<PathBuf> = map.keys().filter(|k| moved(k).is_some()).cloned().collect();
+        for key in keys {
+            let value = map.remove(&key).expect("listed just above");
+            map.insert(moved(&key).expect("filtered just above"), value);
+        }
+    }
+    rekey(&mut g.files, &moved);
+    rekey(&mut g.times, &moved);
+    rekey(&mut g.perms, &moved);
+    rekey(&mut g.identities, &moved);
+    rekey(&mut g.types, &moved);
+    rekey(&mut g.dir_node_by_path, &moved);
+    let dirs: Vec<PathBuf> = g.directories.iter().filter(|d| moved(d).is_some()).cloned().collect();
+    for dir in dirs {
+        g.directories.remove(&dir);
+        g.directories.insert(moved(&dir).expect("filtered just above"));
+    }
+    for node in g.dir_nodes.values_mut() {
+        if let Some(p) = moved(&node.path) {
+            node.path = p;
+        }
+    }
+    let node = g.dir_node_by_path.get(to).copied();
+    if let (Some(parent), Some(name)) = (from.parent(), from.file_name())
+        && let Some(pid) = g.dir_node_by_path.get(parent).copied()
+    {
+        g.dir_nodes.get_mut(&pid).expect("a bound id names a node").children.remove(name);
+    }
+    if let (Some(parent), Some(name), Some(id)) = (to.parent(), to.file_name(), node)
+        && let Some(pid) = g.dir_node_by_path.get(parent).copied()
+    {
+        g.dir_nodes
+            .get_mut(&pid)
+            .expect("a bound id names a node")
+            .children
+            .insert(name.to_os_string(), id);
     }
 }
 
@@ -247,6 +325,120 @@ impl FileHandle for FakeHandle {
             return Err(FsError::new(code, std::io::Error::other("injected")));
         }
         Ok(())
+    }
+}
+
+/// A lock file in the fake. It addresses its OBJECT (by identity), so a rename carries it.
+pub struct FakeLock {
+    object: u128,
+    handle: u64,
+    inner: std::sync::Arc<Mutex<Inner>>,
+}
+
+// Manual, as for `FakeDirHandle`: `Inner` is not `Debug`, and the tests call `unwrap_err()` on `Result<FakeLock, _>`.
+impl std::fmt::Debug for FakeLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FakeLock")
+            .field("object", &self.object)
+            .field("handle", &self.handle)
+            .finish()
+    }
+}
+
+impl FakeLock {
+    /// The path now holding this handle's object, or `NotFound` if none does (the fake does not model reading an
+    /// unlinked open file).
+    fn path(g: &Inner, object: u128) -> Result<PathBuf> {
+        g.identities
+            .iter()
+            .find(|(_, id)| matches!(id, flux_fs::FileIdentity::Strong(o) if o.index == object))
+            .map(|(p, _)| p.clone())
+            .ok_or_else(|| {
+                FsError::new(Code::IoError, std::io::Error::from(std::io::ErrorKind::NotFound))
+            })
+    }
+
+    fn record(&self, call: &str) -> Result<()> {
+        let fs = FaultFs { inner: std::sync::Arc::clone(&self.inner) };
+        let path = { Self::path(&self.inner.lock().unwrap(), self.object).unwrap_or_default() };
+        fs.record(format!("{call}({})", path.display()), call)
+    }
+}
+
+impl LockFile for FakeLock {
+    fn try_lock(&self) -> Result<bool> {
+        self.record("try_lock")?;
+        let mut g = self.inner.lock().unwrap();
+        match g.lock_holders.get(&self.object) {
+            Some(&h) if h != self.handle => Ok(false),
+            _ => {
+                g.lock_holders.insert(self.object, self.handle);
+                Ok(true)
+            }
+        }
+    }
+
+    fn read_all(&self, limit: usize) -> Result<Vec<u8>> {
+        self.record("read_all")?;
+        let g = self.inner.lock().unwrap();
+        let path = Self::path(&g, self.object)?;
+        let mut bytes = g.files.get(&path).cloned().unwrap_or_default();
+        bytes.truncate(limit + 1);
+        Ok(bytes)
+    }
+
+    /// Two steps, as on the real platforms: the write in place, then the cut. Each is a separate recorded call, so a
+    /// test can inject a fault at the cut (`lock_set_len`) and see the oversized file a crash there leaves behind.
+    fn write_at_start(&self, bytes: &[u8]) -> Result<()> {
+        self.record("write_at_start")?;
+        {
+            let mut g = self.inner.lock().unwrap();
+            let path = Self::path(&g, self.object)?;
+            let file = g.files.entry(path).or_default();
+            if file.len() < bytes.len() {
+                file.resize(bytes.len(), 0);
+            }
+            file[..bytes.len()].copy_from_slice(bytes);
+        }
+        self.record("lock_set_len")?;
+        let mut g = self.inner.lock().unwrap();
+        let path = Self::path(&g, self.object)?;
+        g.files.get_mut(&path).expect("written just above").truncate(bytes.len());
+        Ok(())
+    }
+
+    fn sync_all(&self) -> Result<()> {
+        self.record("lock_sync_all")
+    }
+
+    fn identity(&self) -> Result<flux_fs::FileIdentity> {
+        Ok(flux_fs::FileIdentity::Strong(flux_fs::ObjectId { volume: 1, index: self.object }))
+    }
+}
+
+impl Drop for FakeLock {
+    /// Closing the handle releases the OS-native lock, as on every real platform.
+    fn drop(&mut self) {
+        let Ok(mut g) = self.inner.lock() else { return };
+        if g.lock_holders.get(&self.object) == Some(&self.handle) {
+            g.lock_holders.remove(&self.object);
+        }
+        let left = match g.open_locks.get_mut(&self.object) {
+            Some(n) => {
+                *n -= 1;
+                *n
+            }
+            None => 0,
+        };
+        if left == 0 {
+            g.open_locks.remove(&self.object);
+            // The last handle closed: a delete-pending name goes now.
+            if let Ok(path) = FakeLock::path(&g, self.object)
+                && g.pending.remove(&path)
+            {
+                purge(&mut g, &path);
+            }
+        }
     }
 }
 
@@ -315,6 +507,23 @@ impl FaultFs {
 
     pub fn called(&self, prefix: &str) -> bool {
         self.calls().iter().any(|c| c.starts_with(prefix))
+    }
+
+    /// What every `lock_capability` call answers from now on (default `LocalStrong`).
+    pub fn set_lock_capability(&self, capability: LockCapability) {
+        self.inner.lock().unwrap().lock_capability = Some(capability);
+    }
+
+    /// Run `action` just before the `nth` call to `name` (1-based, counted like `fail_nth`).
+    pub fn on_nth(&self, name: &str, nth: u32, action: impl FnOnce(&FaultFs) + Send + 'static) {
+        self.inner.lock().unwrap().hooks.insert(name.to_string(), (nth, Box::new(action)));
+    }
+
+    /// Windows' legacy delete semantics (a volume without POSIX delete; cut 7a Part 1 capstone). A file removed while
+    /// a lock handle on it is open stays at its name, "delete pending", until the last such handle closes. Meanwhile a
+    /// create at the name finds it occupied, and a stat, an open or a read finds nothing.
+    pub fn set_legacy_delete(&self, on: bool) {
+        self.inner.lock().unwrap().legacy_delete = on;
     }
 
     /// The bytes the fake currently holds for `path`.
@@ -429,6 +638,16 @@ impl FaultFs {
             *c += 1;
             *c
         };
+        let hook = match g.hooks.get(key) {
+            Some((at, _)) if *at == n => g.hooks.remove(key),
+            _ => None,
+        };
+        if let Some((_, action)) = hook {
+            // Released first: the action calls back into the fake, and `std::sync::Mutex` is not reentrant.
+            drop(g);
+            action(&FaultFs { inner: std::sync::Arc::clone(&self.inner) });
+            g = self.inner.lock().unwrap();
+        }
         if let Some(&(nth, code, kind)) = g.nth_faults.get(key)
             && n == nth
         {
@@ -518,6 +737,12 @@ impl FileSystem for FaultFs {
         let p = path.to_path_buf();
         self.record(format!("metadata({})", p.display()), "metadata")?;
         let mut g = self.inner.lock().unwrap();
+        if g.pending.contains(&p) {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            ));
+        }
         // Copy the count out: holding the entry's `&mut` across the blocks below
         // borrows `g` for too long, and they each need it again.
         let reads = {
@@ -586,6 +811,10 @@ impl FileSystem for FaultFs {
         )?;
         let mut g = self.inner.lock().unwrap();
         missing_source(&g, &f)?;
+        assert!(
+            !g.directories.contains(&f),
+            "the fake moves a directory only through rename_no_replace (cut 7a Part 3a, decision 10)"
+        );
         move_object(&mut g, &f, &t);
         Ok(())
     }
@@ -611,7 +840,7 @@ impl FileSystem for FaultFs {
                 ),
             ));
         }
-        if g.files.contains_key(&t) {
+        if g.files.contains_key(&t) || g.directories.contains(&t) {
             return Err(FsError::new(
                 Code::IoError,
                 std::io::Error::from(std::io::ErrorKind::AlreadyExists),
@@ -628,18 +857,23 @@ impl FileSystem for FaultFs {
         // `discard` branches on it. A fake that returned Ok here would make that
         // branch untestable and hide the difference.
         let mut g = self.inner.lock().unwrap();
-        if g.files.remove(&p).is_none() {
+        if g.pending.contains(&p) || !g.files.contains_key(&p) {
             return Err(FsError::new(
                 Code::IoError,
                 std::io::Error::from(std::io::ErrorKind::NotFound),
             ));
         }
-        // The object is gone, so its state goes with it. Leaving these behind let a
-        // later file created at the SAME path inherit a dead object's identity and
-        // permissions - MEASURED, a recreated path reported the removed file's perms.
-        g.identities.remove(&p);
-        g.times.remove(&p);
-        g.perms.remove(&p);
+        let object = match g.identities.get(&p) {
+            Some(flux_fs::FileIdentity::Strong(o)) => Some(o.index),
+            _ => None,
+        };
+        if g.legacy_delete && object.is_some_and(|o| g.open_locks.get(&o).is_some_and(|&n| n > 0)) {
+            g.pending.insert(p);
+            return Ok(());
+        }
+        // The object is gone, so its state goes with it: a later file at the SAME path must not inherit a dead
+        // object's identity, permissions or type (each MEASURED as a leak before it was removed here).
+        purge(&mut g, &p);
         Ok(())
     }
 
@@ -788,10 +1022,27 @@ impl FakeDirHandle {
             .path
             .clone()
     }
+
+    /// A new `FakeLock` handle onto the object now at `path`.
+    fn lock_for(&self, path: &Path) -> Result<FakeLock> {
+        let mut g = self.inner.lock().unwrap();
+        let object = match g.identities.get(path) {
+            Some(flux_fs::FileIdentity::Strong(o)) => o.index,
+            _ => panic!(
+                "no strong identity minted for {}: a creation path skipped mint_identity",
+                path.display()
+            ),
+        };
+        g.next_lock_handle += 1;
+        *g.open_locks.entry(object).or_insert(0) += 1;
+        let handle = g.next_lock_handle;
+        Ok(FakeLock { object, handle, inner: std::sync::Arc::clone(&self.inner) })
+    }
 }
 
 impl DirHandle for FakeDirHandle {
     type Writer = FakeHandle;
+    type Lock = FakeLock;
 
     fn identity(&self) -> Result<flux_fs::FileIdentity> {
         let path = self.my_path();
@@ -918,6 +1169,182 @@ impl DirHandle for FakeDirHandle {
         let from_path = self.my_path().join(from);
         let to_path = other.my_path().join(to);
         self.fs().rename_replace(&from_path, &to_path)
+    }
+
+    fn create_lock(&self, name: &OsStr) -> Result<Self::Lock> {
+        check_component(name)?;
+        let child_path = self.my_path().join(name);
+        self.fs().record(format!("create_lock({})", child_path.display()), "create_lock")?;
+        {
+            // Not through `create_new`: that would count as a `create_new` call for nth-fault injection and consume
+            // a pending `write_fault` meant for a data file. The refusal is the same: a file OR a directory holds the
+            // name (the reason is recorded in `create_new`).
+            let mut g = self.inner.lock().unwrap();
+            if g.files.contains_key(&child_path) || g.directories.contains(&child_path) {
+                return Err(FsError::new(
+                    Code::IoError,
+                    std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+                ));
+            }
+            g.files.insert(child_path.clone(), Vec::new());
+            mint_identity(&mut g, &child_path);
+        }
+        self.lock_for(&child_path)
+    }
+
+    fn open_lock(&self, name: &OsStr) -> Result<Self::Lock> {
+        check_component(name)?;
+        let child_path = self.my_path().join(name);
+        self.fs().record(format!("open_lock({})", child_path.display()), "open_lock")?;
+        {
+            let g = self.inner.lock().unwrap();
+            if g.pending.contains(&child_path) {
+                return Err(FsError::new(
+                    Code::IoError,
+                    std::io::Error::from(std::io::ErrorKind::NotFound),
+                ));
+            }
+            match g.types.get(&child_path) {
+                Some(FileType::Symlink) => {
+                    return Err(FsError::new(
+                        Code::SafetyRejected,
+                        std::io::Error::other(
+                            "refuses to follow a symlink or other name-surrogate",
+                        ),
+                    ));
+                }
+                Some(FileType::Other) => {
+                    return Err(FsError::new(
+                        Code::DestinationError,
+                        std::io::Error::other(
+                            "a lock path holds something other than a regular file",
+                        ),
+                    ));
+                }
+                _ => {}
+            }
+            if g.directories.contains(&child_path) {
+                return Err(FsError::new(
+                    Code::DestinationError,
+                    std::io::Error::new(
+                        std::io::ErrorKind::IsADirectory,
+                        "a directory is not a lock file",
+                    ),
+                ));
+            }
+            if !g.files.contains_key(&child_path) {
+                return Err(FsError::new(
+                    Code::IoError,
+                    std::io::Error::from(std::io::ErrorKind::NotFound),
+                ));
+            }
+        }
+        self.lock_for(&child_path)
+    }
+
+    fn lock_capability(&self) -> Result<LockCapability> {
+        self.fs().record("lock_capability()".to_string(), "lock_capability")?;
+        Ok(self.inner.lock().unwrap().lock_capability.unwrap_or(LockCapability::LocalStrong))
+    }
+
+    fn read_dir(&self) -> Result<Vec<DirEntry>> {
+        self.fs().read_dir(&self.my_path())
+    }
+
+    fn read_file(&self, name: &OsStr, limit: usize) -> Result<Vec<u8>> {
+        check_component(name)?;
+        let child_path = self.my_path().join(name);
+        self.fs().record(format!("read_file({})", child_path.display()), "read_file")?;
+        let g = self.inner.lock().unwrap();
+        if g.pending.contains(&child_path) {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            ));
+        }
+        match g.types.get(&child_path) {
+            Some(FileType::Symlink) => {
+                return Err(FsError::new(
+                    Code::SafetyRejected,
+                    std::io::Error::other("refuses to follow a symlink or other name-surrogate"),
+                ));
+            }
+            Some(FileType::Other) => {
+                return Err(FsError::new(
+                    Code::DestinationError,
+                    std::io::Error::other("not a regular file"),
+                ));
+            }
+            _ => {}
+        }
+        if g.directories.contains(&child_path) {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::new(
+                    std::io::ErrorKind::IsADirectory,
+                    "a directory is not a state file",
+                ),
+            ));
+        }
+        let Some(bytes) = g.files.get(&child_path) else {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            ));
+        };
+        let mut bytes = bytes.clone();
+        bytes.truncate(limit + 1);
+        Ok(bytes)
+    }
+
+    fn remove_dir(&self, name: &OsStr) -> Result<()> {
+        check_component(name)?;
+        let child_path = self.my_path().join(name);
+        self.fs().record(format!("remove_dir({})", child_path.display()), "remove_dir")?;
+        let mut g = self.inner.lock().unwrap();
+        // A link (of any kind) or a file: as `unlinkat(AT_REMOVEDIR)` answers, never followed.
+        if g.types.get(&child_path) == Some(&FileType::Symlink) || g.files.contains_key(&child_path)
+        {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    "remove_dir refuses what is not a directory",
+                ),
+            ));
+        }
+        if !g.directories.contains(&child_path) {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            ));
+        }
+        let occupied = g
+            .files
+            .keys()
+            .chain(g.directories.iter())
+            .any(|k| k.parent() == Some(child_path.as_path()));
+        if occupied {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::from(std::io::ErrorKind::DirectoryNotEmpty),
+            ));
+        }
+        g.directories.remove(&child_path);
+        g.types.remove(&child_path);
+        g.identities.remove(&child_path);
+        g.times.remove(&child_path);
+        g.perms.remove(&child_path);
+        // The name no longer binds a node: a directory made there later is a new one.
+        g.dir_node_by_path.remove(&child_path);
+        if let Some(node) = g.dir_nodes.get_mut(&self.id) {
+            node.children.remove(name);
+        }
+        Ok(())
+    }
+
+    fn sync(&self) -> Result<()> {
+        self.fs().record(format!("sync_dir({})", self.my_path().display()), "sync_dir")
     }
 }
 
@@ -1367,5 +1794,301 @@ mod tests {
         let calls = fs.calls().len();
         let _ = d.identity().unwrap();
         assert_eq!(fs.calls().len(), calls);
+    }
+    #[test]
+    fn a_fake_lock_is_exclusive_per_object_and_released_on_drop() {
+        use flux_fs::{DestinationRoot, DirHandle, FileSystem, LockFile};
+        use std::ffi::OsStr;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let first = d.create_lock(OsStr::new("x.flux-lock")).unwrap();
+        assert_eq!(
+            d.create_lock(OsStr::new("x.flux-lock")).unwrap_err().source.kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert!(first.try_lock().unwrap());
+        let second = d.open_lock(OsStr::new("x.flux-lock")).unwrap();
+        assert!(!second.try_lock().unwrap());
+        drop(first);
+        assert!(second.try_lock().unwrap());
+    }
+
+    #[test]
+    fn a_fake_lock_follows_its_object_across_a_rename() {
+        use flux_fs::{DestinationRoot, DirHandle, FileSystem, LockFile};
+        use std::ffi::OsStr;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let holder = d.create_lock(OsStr::new("x.flux-lock")).unwrap();
+        holder.write_at_start(b"record").unwrap();
+        assert!(holder.try_lock().unwrap());
+        d.rename_no_replace(OsStr::new("x.flux-lock"), &d, OsStr::new("x.flux-lock.broken.1"))
+            .unwrap();
+        let moved = d.open_lock(OsStr::new("x.flux-lock.broken.1")).unwrap();
+        assert!(!moved.try_lock().unwrap(), "the lock moved with the object");
+        assert_eq!(moved.read_all(4096).unwrap(), b"record");
+        assert_eq!(moved.identity().unwrap(), holder.identity().unwrap());
+    }
+
+    #[test]
+    fn a_fake_open_lock_refuses_what_the_real_ones_refuse() {
+        use flux_fs::{DestinationRoot, DirHandle, FileSystem};
+        use std::ffi::OsStr;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let e = d.open_lock(OsStr::new("absent")).unwrap_err();
+        assert_eq!((e.code, e.source.kind()), (Code::IoError, std::io::ErrorKind::NotFound));
+        fs.write_file("/d/link", b"");
+        fs.set_type("/d/link", FileType::Symlink);
+        assert_eq!(d.open_lock(OsStr::new("link")).unwrap_err().code, Code::SafetyRejected);
+        drop(d.create_dir(OsStr::new("sub")).unwrap());
+        let e = d.open_lock(OsStr::new("sub")).unwrap_err();
+        assert_eq!(
+            (e.code, e.source.kind()),
+            (Code::DestinationError, std::io::ErrorKind::IsADirectory)
+        );
+    }
+
+    #[test]
+    fn a_fake_lock_write_replaces_the_contents_and_cuts_the_old_tail() {
+        use flux_fs::{DestinationRoot, DirHandle, FileSystem, LockFile};
+        use std::ffi::OsStr;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let h = d.create_lock(OsStr::new("x")).unwrap();
+        h.write_at_start(&[1u8; 8]).unwrap();
+        let before = h.identity().unwrap();
+        h.write_at_start(&[2u8; 4]).unwrap();
+        assert_eq!(
+            h.read_all(100).unwrap(),
+            vec![2, 2, 2, 2],
+            "the old tail is cut, as on the real platforms"
+        );
+        assert_eq!(h.read_all(3).unwrap().len(), 4, "limit + 1");
+        assert_eq!(h.identity().unwrap(), before, "the same object");
+    }
+
+    #[test]
+    fn a_fault_at_the_fake_locks_cut_leaves_the_new_record_followed_by_the_old_tail() {
+        use flux_fs::{DestinationRoot, DirHandle, FileSystem, LockFile};
+        use std::ffi::OsStr;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let h = d.create_lock(OsStr::new("x")).unwrap();
+        h.write_at_start(&[1u8; 8]).unwrap();
+        fs.fail("lock_set_len", Code::IoError);
+        assert!(h.write_at_start(&[2u8; 4]).is_err());
+        assert_eq!(
+            h.read_all(100).unwrap(),
+            vec![2, 2, 2, 2, 1, 1, 1, 1],
+            "what a crash between write and cut leaves"
+        );
+    }
+
+    #[test]
+    fn a_removed_name_forgets_the_type_a_test_gave_it() {
+        use flux_fs::{DestinationRoot, DirHandle, FileSystem};
+        use std::ffi::OsStr;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        fs.write_file("/d/x", b"");
+        fs.set_type("/d/x", FileType::Symlink);
+        fs.remove_file(Path::new("/d/x")).unwrap();
+        drop(d.create_lock(OsStr::new("x")).unwrap());
+        d.open_lock(OsStr::new("x")).expect("a lock created after the removal is a regular file");
+    }
+
+    #[test]
+    fn the_fake_answers_the_capability_it_is_told() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        assert_eq!(d.lock_capability().unwrap(), LockCapability::LocalStrong);
+        fs.set_lock_capability(LockCapability::Unsupported);
+        assert_eq!(d.lock_capability().unwrap(), LockCapability::Unsupported);
+    }
+
+    #[test]
+    fn a_hook_runs_just_before_the_nth_call_and_can_drive_the_fake() {
+        use flux_fs::FileSystem;
+        let fs = FaultFs::new();
+        fs.on_nth("metadata", 2, |fs| fs.write_file("/b", b"y"));
+        assert!(fs.metadata(Path::new("/b")).is_err(), "first call: the hook has not run");
+        assert!(fs.metadata(Path::new("/b")).is_ok(), "second call: the hook ran just before it");
+        assert!(fs.metadata(Path::new("/b")).is_ok(), "a hook runs once");
+    }
+
+    #[test]
+    fn a_fake_handle_lists_its_directory() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/p")).unwrap();
+        let d = fs.destination_root(Path::new("/p")).unwrap();
+        fs.write_file("/p/a", b"x");
+        let sub = d.create_dir(OsStr::new("sub")).unwrap();
+        fs.write_file("/p/sub/deeper", b"y");
+        let mut got: Vec<_> =
+            d.read_dir().unwrap().into_iter().map(|e| (e.name, e.file_type)).collect();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            vec![(OsString::from("a"), FileType::File), (OsString::from("sub"), FileType::Dir)]
+        );
+        assert!(fs.called("read_dir("), "{:?}", fs.calls());
+        drop(sub);
+    }
+
+    #[test]
+    fn a_fake_handle_reads_a_file_and_refuses_what_the_real_ones_refuse() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/p")).unwrap();
+        let d = fs.destination_root(Path::new("/p")).unwrap();
+        fs.write_file("/p/s", b"0123456789");
+        assert_eq!(d.read_file(OsStr::new("s"), 4).unwrap(), b"01234");
+        let e = d.read_file(OsStr::new("absent"), 4).unwrap_err();
+        assert_eq!((e.code, e.source.kind()), (Code::IoError, std::io::ErrorKind::NotFound));
+        drop(d.create_dir(OsStr::new("sub")).unwrap());
+        let e = d.read_file(OsStr::new("sub"), 4).unwrap_err();
+        assert_eq!(
+            (e.code, e.source.kind()),
+            (Code::DestinationError, std::io::ErrorKind::IsADirectory)
+        );
+        fs.write_file("/p/l", b"");
+        fs.set_type("/p/l", FileType::Symlink);
+        assert_eq!(d.read_file(OsStr::new("l"), 4).unwrap_err().code, Code::SafetyRejected);
+        assert!(fs.called("read_file("), "{:?}", fs.calls());
+    }
+
+    #[test]
+    fn a_fake_remove_dir_removes_only_an_empty_real_directory() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/p")).unwrap();
+        let d = fs.destination_root(Path::new("/p")).unwrap();
+        let empty = d.create_dir(OsStr::new("empty")).unwrap();
+        let before = fs.metadata(Path::new("/p/empty")).unwrap().identity;
+        drop(empty);
+        d.remove_dir(OsStr::new("empty")).unwrap();
+        assert!(!fs.exists("/p/empty"));
+        drop(d.create_dir(OsStr::new("empty")).unwrap());
+        assert_ne!(
+            fs.metadata(Path::new("/p/empty")).unwrap().identity,
+            before,
+            "a directory made again at the name is a new object"
+        );
+        drop(d.create_dir(OsStr::new("full")).unwrap());
+        fs.write_file("/p/full/f", b"x");
+        let e = d.remove_dir(OsStr::new("full")).unwrap_err();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::DirectoryNotEmpty);
+        fs.write_file("/p/file", b"x");
+        let e = d.remove_dir(OsStr::new("file")).unwrap_err();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::NotADirectory);
+        drop(d.create_dir(OsStr::new("link")).unwrap());
+        fs.set_type("/p/link", FileType::Symlink);
+        let e = d.remove_dir(OsStr::new("link")).unwrap_err();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::NotADirectory);
+        assert!(fs.exists("/p/link"));
+        let e = d.remove_dir(OsStr::new("absent")).unwrap_err();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn a_fake_sync_is_recorded_and_can_fail() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/p")).unwrap();
+        let d = fs.destination_root(Path::new("/p")).unwrap();
+        d.sync().unwrap();
+        assert!(fs.called("sync_dir("), "{:?}", fs.calls());
+        fs.fail("sync_dir", Code::IoError);
+        assert!(d.sync().is_err());
+    }
+
+    #[test]
+    fn a_fake_directory_rename_moves_the_subtree_and_open_handles_follow() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/p")).unwrap();
+        let d = fs.destination_root(Path::new("/p")).unwrap();
+        let building = d.create_dir(OsStr::new("w.creating")).unwrap();
+        fs.write_file("/p/w.creating/manifest", b"m");
+        let dir_id = fs.metadata(Path::new("/p/w.creating")).unwrap().identity;
+        let file_id = fs.metadata(Path::new("/p/w.creating/manifest")).unwrap().identity;
+        d.rename_no_replace(OsStr::new("w.creating"), &d, OsStr::new("w")).unwrap();
+        assert!(!fs.exists("/p/w.creating") && !fs.exists("/p/w.creating/manifest"));
+        assert_eq!(fs.read_file("/p/w/manifest").as_deref(), Some(&b"m"[..]));
+        assert_eq!(fs.metadata(Path::new("/p/w")).unwrap().identity, dir_id, "the same object");
+        assert_eq!(fs.metadata(Path::new("/p/w/manifest")).unwrap().identity, file_id);
+        assert_eq!(
+            building.read_file(OsStr::new("manifest"), 8).unwrap(),
+            b"m",
+            "a handle opened before the rename follows the directory"
+        );
+        let opened = d.open_dir(OsStr::new("w")).unwrap();
+        assert_eq!(opened.read_file(OsStr::new("manifest"), 8).unwrap(), b"m");
+        assert_eq!(d.open_dir(OsStr::new("w.creating")).unwrap_err().code, Code::DestinationError);
+        drop(d.create_dir(OsStr::new("x")).unwrap());
+        let e = d.rename_no_replace(OsStr::new("w"), &d, OsStr::new("x")).unwrap_err();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn a_fake_directory_rename_carries_types_permissions_and_times() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/p")).unwrap();
+        let d = fs.destination_root(Path::new("/p")).unwrap();
+        drop(d.create_dir(OsStr::new("w.creating")).unwrap());
+        fs.add_symlink("/p/w.creating/link");
+        fs.write_file("/p/w.creating/f", b"f");
+        fs.set_file_perms("/p/w.creating/f", Perms::UnixMode(0o600));
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(7);
+        let w = fs.create_new(Path::new("/p/w.creating/timed")).unwrap();
+        fs.set_times(&w, Some(t)).unwrap();
+        drop(w);
+        d.rename_no_replace(OsStr::new("w.creating"), &d, OsStr::new("w")).unwrap();
+        assert_eq!(fs.metadata(Path::new("/p/w/link")).unwrap().file_type, FileType::Symlink);
+        assert_eq!(fs.permissions("/p/w/f"), Some(Perms::UnixMode(0o600)));
+        assert_eq!(fs.modified("/p/w/timed"), Some(t));
+    }
+
+    #[test]
+    fn legacy_delete_keeps_a_name_occupied_until_the_last_lock_handle_closes() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/p")).unwrap();
+        let d = fs.destination_root(Path::new("/p")).unwrap();
+        fs.set_legacy_delete(true);
+        let name = OsStr::new("x.flux-lock");
+        let held = d.create_lock(name).unwrap();
+        let other = d.open_lock(name).unwrap();
+        d.remove_file(name).unwrap();
+        drop(held);
+        let gone = |e: FsError| e.source.kind() == std::io::ErrorKind::NotFound;
+        assert!(gone(d.metadata(name).unwrap_err()), "a stat finds nothing");
+        assert!(gone(d.open_lock(name).unwrap_err()), "an open finds nothing");
+        assert!(gone(d.read_file(name, 8).unwrap_err()), "a read finds nothing");
+        assert_eq!(
+            d.create_lock(name).unwrap_err().source.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "a create finds the name occupied"
+        );
+        drop(other);
+        assert!(!fs.exists("/p/x.flux-lock"), "the last close deletes it");
+        drop(d.create_lock(name).unwrap());
+    }
+
+    #[test]
+    fn without_legacy_delete_a_removal_is_immediate_even_while_a_handle_is_open() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/p")).unwrap();
+        let d = fs.destination_root(Path::new("/p")).unwrap();
+        let name = OsStr::new("x.flux-lock");
+        let held = d.create_lock(name).unwrap();
+        d.remove_file(name).unwrap();
+        assert!(!fs.exists("/p/x.flux-lock"));
+        drop(d.create_lock(name).unwrap());
+        drop(held);
     }
 }

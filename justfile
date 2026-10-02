@@ -112,10 +112,23 @@ check-mac:
         echo "  install it:  rustup target add {{mac_target}}" >&2
         exit 1
     fi
-    # The root crate is left out: criterion's `alloca` build script compiles C for
-    # the target and needs a macOS C toolchain. The member crates are where the
-    # #[cfg] code lives.
-    cargo clippy --workspace --exclude flux --all-targets --target {{mac_target}} -- -D warnings
+    # Build scripts compile C for the target (blake3 in flux-core and the root crate,
+    # criterion's `alloca`), so the check needs a macOS C toolchain: zig. The
+    # wrappers in tools/mac-cc name the target themselves, and CRATE_CC_NO_DEFAULTS
+    # stops the cc crate adding `--target=arm64-apple-macosx`, which zig rejects.
+    if ! command -v zig >/dev/null 2>&1; then
+        echo "check-mac: zig is not on PATH; it is the macOS C compiler for build scripts." >&2
+        echo "  install: https://ziglang.org/download/ (measured with 0.16.0)" >&2
+        exit 1
+    fi
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) ext=cmd; root="$(pwd -W)" ;;
+        *) ext=sh; root="$(pwd)" ;;
+    esac
+    CRATE_CC_NO_DEFAULTS=1 \
+    CC_aarch64_apple_darwin="$root/tools/mac-cc/zig-cc.$ext" \
+    AR_aarch64_apple_darwin="$root/tools/mac-cc/zig-ar.$ext" \
+    cargo clippy --workspace --all-targets --target {{mac_target}} -- -D warnings
 
 # Background watcher
 watch:

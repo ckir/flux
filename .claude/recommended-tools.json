@@ -82,5 +82,11 @@
     "why": "Lets actionlint check the shell inside workflow `run:` steps (`just lint-workflows`); actionlint disables that rule when shellcheck is not on PATH. CI's Workflow lint image bundles it.",
     "install": "winget install koalaman.shellcheck",
     "in_path": "shellcheck"
+  },
+  {
+    "name": "zig",
+    "why": "The macOS C compiler for `just check-mac` on a non-mac host: blake3 (flux-core, the root crate) and criterion's `alloca` compile C for the target in their build scripts. The recipe calls it through tools/mac-cc/ wrappers with CRATE_CC_NO_DEFAULTS=1. Measured with 0.16.0 on Windows.",
+    "install": "https://ziglang.org/download/ (unpack and put zig on PATH)",
+    "in_path": "zig"
   }
 ]
