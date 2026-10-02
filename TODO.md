@@ -523,6 +523,19 @@ stated so the next audit starts from a prediction rather than a hunt.
       coverage node (measured: no node for `FsModel.tla:312-318` in any extended host-crash log), and no state
       predicate separates a torn crash from a crash in the middle of a write (cut 6, item 6).
 
+## Deferred from cut 7b
+
+Each is deferred to the cut that first reads it (cut 7b spec, `docs/superpowers/specs/2026-10-02-cut-7b-state-v2-and-heartbeat-design.md`, Scope).
+
+- [ ] **`configuration_fingerprint` (§19, §121)** - cut 9: read only by resume; most §121 options do not exist yet.
+- [ ] **Checkpoints and `last_checkpoint` (§19, §139, §148, §164)** - cuts 8/9: the spec defines them only through
+      the WAL and `state.db` (§119's layout).
+- [ ] **`roots` (§19, §18.3)** - cut 10: one root until several sources exist.
+- [ ] **`last_heartbeat_monotonic` (§229.2)** - cut 9: "diagnostic/current-session data only".
+- [ ] **Finishing a prior run's `cleanup_pending` (§21.1 "may", §218)** - cut 9: a COMPLETED prior with
+      `cleanup_pending = true` and its artifact list is proceeded past and left.
+- [ ] **Stale classification from heartbeat age (§102)** - cut 9.
+
 ## Closed
 
 Triaged 2026-09-22. Kept here rather than deleted: the evidence for a closure belongs where the

@@ -93,8 +93,9 @@ One JSON object, as in version 1. `format_version` is still judged before any ot
 | `owner_instance_id`, `boot_session_id`, `creation_wall_time`, `last_heartbeat_wall_time` | the same values as this run's lock record at creation. The state writes `last_heartbeat_wall_time` once (owner); only the lock record's copy is refreshed. |
 
 A `FileIdentity` is a string:
-- `"strong:<volume>:<id>"`, `"weak:<volume>:<id>"`, or `"unavailable"`;
-- `volume` and `id` are the decimal `ObjectId` fields (`crates/flux-fs/src/fs.rs:52-76`; `id` is a u128).
+- `"strong:<volume>:<index>"`, `"weak:<volume>:<index>"`, or `"unavailable"`;
+- `volume` and `index` are the decimal `ObjectId` fields, with no leading zero (`crates/flux-fs/src/fs.rs:52-76`;
+  `index` is a u128).
 
 **A tree manifest** carries only the "both kinds" keys. §249.1 governs the adjacent record. §218's minimum list
 (`attempt_id`, `target_identity`, `source_identity`, `artifact_generation`, spec:9330-9340) sits under "For isolated
@@ -103,12 +104,15 @@ with the cuts that read it.
 
 **Consistency (version 2; a violation is `STATE_CORRUPT`):**
 - `cleanup_pending = true` only with `state` `COMPLETED`. A `COMPLETED` record always has it `true` (decision 10).
-- A non-empty `cleanup_pending_artifacts` only with `cleanup_pending = true`. Each entry is non-empty lowercase hex of
-  even length.
+- A non-empty `cleanup_pending_artifacts` only with `cleanup_pending = true`. Each entry is non-empty lowercase hex that
+  decodes back to a path (`from_native_hex`).
 - In a single-file record, `COMPLETED` requires a non-null `target_identity`. A published target whose identity cannot
   be read records `"unavailable"`, never `null`.
-- `attempt_id`, `owner_instance_id` and `boot_session_id` are 32-hex ids, and the two times are decimal digits, as
-  version 1 already checks for `operation_id` and `created_at`.
+- `attempt_id` and `owner_instance_id` are 32-hex ids; `boot_session_id` is non-empty (it is a dashed UUID, a boot
+  time or `unknown`, `crates/flux-platform/src/lock_file.rs:291-310`); the two times are decimal digits, as version 1
+  already checks for `operation_id` and `created_at`.
+- `artifact_type` is `file`; `artifact_generation` is at least 1; `target_path_key` is non-empty lowercase hex; both
+  identities parse.
 
 **Reading.** A reader accepts versions 1 and 2. A version-1 state yields the same classification 7a gives, and its new
 fields are absent. Version 3 or higher is `INCOMPATIBLE_STATE`, as an unknown version is today. 7a's test
@@ -216,7 +220,8 @@ All on the fake unless named:
   differs between runs and from `operation_id`.
 - **`cleanup_pending`:** a clean run's `COMPLETED` write carries `true` and `[]`, shown by a fault on the state's
   removal that leaves the record behind. A run with an undeletable temporary keeps `true` and lists it in the hex
-  encoding, including a non-UTF-8 name on Linux (real filesystem).
+  encoding. The encoding's losslessness is a unit test of `native_hex` (a non-UTF-8 byte on POSIX, an unpaired
+  surrogate on Windows); the run's listing is tested on the fake (Part 1 plan, decision 8).
 - **Heartbeat:** with a zero interval, the lock record's `last_heartbeat_wall_time` advances during a copy and
   `operation_id`/`owner_instance_id` stay. A failed heartbeat write is retried once; two failures stop the run naming
   the lock path; a torn heartbeat write is reported as that failure, not `TARGET_LOCK_BUSY`. No heartbeat write
