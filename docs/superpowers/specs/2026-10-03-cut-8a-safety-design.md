@@ -72,7 +72,7 @@ workspace, and the single-file place does nothing. `open_operation` retries when
 | The publish succeeds and the removal succeeds | The run continues. |
 | The publish fails as "primitive unavailable" (the same classification `primitive_unavailable` in `tree.rs` applies at `CopyStep::Publish`) | The run is refused with `NOREPLACE_PUBLISH_UNAVAILABLE`. It takes the existing "refused with nothing changed" rollback (`rollback`, `run/mod.rs`): the workspace, the lock record and lock, the control directories it emptied, and DEST if this run created it, are removed again. Exit 3 (section 55: created and removed again does not count as a change). How `RunError` carries a code that is not a lock code is the plan's to decide. |
 | The publish fails for any other reason | The run fails with that error, through the run's existing failure path. |
-| What the probe wrote (`noreplace-probe`, or the temporary) cannot be removed | A warning naming it. The file goes with the workspace when cleanup removes it. If the run is also being refused, it exits 1 instead of 3 (spec section 55). |
+| What the probe wrote (`noreplace-probe`, or the temporary) cannot be removed | A warning naming it. The file goes with the workspace when cleanup removes it. If the run is also being refused, it exits 1 instead of 3 (spec section 55); the report still names `NOREPLACE_PUBLISH_UNAVAILABLE` as the refusal, beside the warning, so the cause is not hidden behind the cleanup failure. |
 
 **`--dry-run`.** Flux has no `--dry-run` today, so the spec's dry-run clause has nothing to attach to. It applies
 when that flag lands, and the probe then writes nothing and reports "unprobed".
@@ -204,7 +204,10 @@ Every rule gets a test that fails under a mutant of the code it guards. The in-m
     leaves the source unchanged.
   - **Linux query:** checked against the same mount.
 - **Windows CI (the gate):** A, with a junction in a parent component of DEST pointing into a source
-  subdirectory. A junction needs no administrator rights. The copy is refused and the source is unchanged.
+  subdirectory. A junction needs no administrator rights. The fixture puts a file in the source that the walk
+  reaches BEFORE the overlapping directory, so a run without Part A would write it into the source before the walk's
+  own check stops it. The test asserts the refusal names Part A's containment check, that no lock or workspace was
+  ever created under DEST, and that the source is byte-for-byte unchanged.
 - **macOS CI job:** the device-number comparison through the platform test of the new query, against a known
   mount (the system's own `/dev` is a separate mount).
 
@@ -222,6 +225,9 @@ turn the job into a permanent silent skip.
 
 Panel findings rejected, recorded so they are not raised again:
 
+- Round 2 (agy): "exit 1 instead of 3 masks `NOREPLACE_PUBLISH_UNAVAILABLE`". The exit code is REJECTED as a change:
+  spec section 241.5 fixes it ("if the operation is being refused, it exits 1 instead of 3"). The visibility half is
+  folded: the report names the code.
 - Round 1 (agy): "`GetFinalPathNameByHandleW`'s `\\?\` prefix makes the containment test miss". REJECTED: Part A
   canonicalises BOTH the source root and the anchor through the same query, so both carry the same prefix; the
   scenario compared a canonical anchor with a raw source path, which the spec never does.
