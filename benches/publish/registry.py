@@ -76,7 +76,7 @@ def _comparator(i: int, e: object) -> Comparator:
         raise RegistryError(f"{where}: unknown keys {sorted(unknown)}")
     name = e.get("name")
     if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name):
-        raise RegistryError(f"{where}: `name` must be lowercase letters, digits, '-' or '_'")
+        raise RegistryError(f"{where}: `name` must be a lowercase letter or digit, then letters, digits, '-' or '_'")
     if name == "flux":
         raise RegistryError(f"{where}: `flux` is not a comparator; it is always measured")
     where = f"comparator {name!r}"

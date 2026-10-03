@@ -41,15 +41,18 @@ for attempt in 1 2 3 4 5; do
   if git -C data push origin "HEAD:refs/heads/$branch"; then
     # Only the real data branch is served. A dispatch with the job's GITHUB_TOKEN always starts a run (GitHub's docs:
     # "workflow_dispatch and repository_dispatch events always create workflow runs"); see plan decision 9.
+    # Both dispatches are attempted even if the first fails; a failure is reported after them (the data is pushed
+    # either way, and a stale site should show as a failed job).
+    status=0
     if [ "$branch" = bench-data ]; then
       if [ "$mode" = bench ] && [ -s "$flag" ]; then
         echo "a runner image is not yet calibrated; starting a calibration"
-        gh workflow run bench-calibrate.yml
+        gh workflow run bench-calibrate.yml || status=1
       fi
       echo "redeploying the site with the new data"
-      gh workflow run docs.yml
+      gh workflow run docs.yml || status=1
     fi
-    exit 0
+    exit "$status"
   fi
   echo "push rejected (attempt $attempt of 5): re-fetching and redoing the update"
 done
