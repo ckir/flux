@@ -1245,3 +1245,73 @@ fn a_failed_heartbeat_during_restart_stops_the_run_at_the_lock_step_and_copies_n
     assert_eq!(manifest(&fs, ID).state, OpState::Failed, "the record was intact");
     assert!(!fs.exists(LOCK), "released");
 }
+
+// Cut 7b Part 2 test audit: each test below was red under the mutant named in its comment.
+
+#[test]
+fn restart_heartbeats_and_checks_ownership_before_removing_a_superseded_state() {
+    // Mutant: delete `checked(locked)?` in `supersede`'s removal loop (restart.rs).
+    let fs = fake();
+    prior(&fs, 5, OpState::Failed);
+    let partial = format!("/p/dest/old.flux-partial.{}", id(5));
+    fs.write_file(&partial, b"half");
+    // Writes: the record (1), the heartbeats before the ABANDONED write (2) and the partial's deletion (3); the one
+    // before the prior's state is removed (4) fails, and its retry.
+    fail_heartbeat(&fs, 4, LOCK, false);
+    let (r, _) =
+        run_tree(&fs, &RunConfig { heartbeat_interval: std::time::Duration::ZERO, ..restart() });
+    assert_eq!(failed_at(&r.stop), (RunStep::Lock, LOCK.to_string()));
+    assert!(!fs.exists(&partial), "the sweep ran");
+    assert_eq!(
+        manifest(&fs, &id(5)).state,
+        OpState::Abandoned,
+        "the prior's state was not removed"
+    );
+}
+
+#[test]
+fn restart_stops_before_removing_a_superseded_state_once_ownership_is_lost() {
+    // Mutant: delete `checked(locked)?` in `supersede`'s removal loop (restart.rs).
+    let fs = fake();
+    prior(&fs, 5, OpState::Failed);
+    let partial = format!("/p/dest/old.flux-partial.{}", id(5));
+    fs.write_file(&partial, b"half");
+    // `remove_file`: this run's CREATED and the prior's ABANDONED state writes clear their temporaries (1, 2); then
+    // the partial (3). Just before it, the lock is taken over, so the next check is the removal loop's.
+    fs.on_nth("remove_file", 3, |fs| fs.write_file(LOCK, b"another run's bytes"));
+    let (r, _) = run_tree(&fs, &restart());
+    assert_eq!(refused(&r.stop), (LockCode::TargetLockBusy, true));
+    assert_eq!(
+        manifest(&fs, &id(5)).state,
+        OpState::Abandoned,
+        "the prior's state was not removed"
+    );
+}
+
+#[test]
+fn a_heartbeat_restarts_its_interval() {
+    // Mutant: delete `self.last.set(Instant::now());` in `Pulse::beat` (session.rs).
+    let fs = fake();
+    let first = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&first);
+    // The single file's heartbeats come before its sweep, its create, its one chunk and its publish. The hook runs at
+    // the sweep's guard and waits out the interval, so the create's heartbeat is due and the two after it are not.
+    let hook: BeforeMutation = Arc::new(move || {
+        if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+        }
+    });
+    let c = RunConfig {
+        heartbeat_interval: std::time::Duration::from_secs(1),
+        before_mutation: Some(hook),
+        ..cfg()
+    };
+    let r = run_file(&fs, &c);
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+    assert_eq!(
+        count(&calls(&fs), "write_at_start("),
+        3,
+        "the record, one heartbeat, and Q-K: {:?}",
+        calls(&fs)
+    );
+}
