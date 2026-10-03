@@ -15,7 +15,7 @@ publishes how Flux compares with other copiers, and how that changes over time, 
    - Graphviz lays out node-and-edge graphs; it does not draw bar or line charts.
    - Filling in a README template needs a bot commit to `main`, which branch protection blocks.
 4. **Comparators are a registry,** open to more tools later (FastCopy, for example), not a fixed pair.
-5. **Panel round 1 changed one agreed detail, for the owner to confirm:** the harness times the runs itself rather than
+5. **Panel round 1 changed one agreed detail, owner-confirmed 2026-10-03:** the harness times the runs itself rather than
    through `hyperfine` (see "Measuring" for why).
 
 ## What a visitor sees
