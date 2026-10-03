@@ -51,6 +51,13 @@ jsDelivr with SRI.
    - A tool that fails in one round is skipped for that case's remaining rounds; it is already `failed`, with no
      ratio.
    - When every measure job fails, `publish` finds no results and exits 0 having written nothing.
+9. **The site is redeployed by an explicit dispatch, not by `workflow_run`.** The spec says `docs.yml` runs "on
+   `workflow_run` of `bench.yml`". The calibration, though, is itself started by a dispatch made with the job's
+   `GITHUB_TOKEN`. GitHub documents that such a dispatch "always create[s] workflow runs", and that "events triggered
+   by the GITHUB_TOKEN will not create a new workflow run" otherwise. It documents nothing about a `workflow_run`
+   following a run that a token-made dispatch started (both checked in GitHub's docs, 2026-10-03; plan panel r1). So
+   `push.sh` runs `gh workflow run docs.yml` after every successful push to `bench-data`, from both publish jobs, each
+   holding `actions: write`. That rests only on the documented dispatch rule, and `docs.yml` needs no new trigger.
 
 ## File structure
 
@@ -707,15 +714,16 @@ class MeasureTests(unittest.TestCase):
             src = small_tree(Path(d))
             dst = Path(d) / "dst"
             subprocess.run([sys.executable, "-c", COPY, str(src), str(dst)], check=True)
-            self.assertIsNone(measure.check_copy(src, dst))
+            expected = measure.tree_digest(src)
+            self.assertIsNone(measure.check_copy(expected, dst))
             (dst / "extra").write_bytes(b"x")
-            self.assertIn("extra", measure.check_copy(src, dst) or "")
+            self.assertIn("extra", measure.check_copy(expected, dst) or "")
             (dst / "extra").unlink()
             (dst / "a.bin").write_bytes(b"alphA")
-            self.assertIn("a.bin", measure.check_copy(src, dst) or "")
+            self.assertIn("a.bin", measure.check_copy(expected, dst) or "")
             (dst / "a.bin").unlink()
-            self.assertIn("missing", measure.check_copy(src, dst) or "")
-            self.assertIn("no destination", measure.check_copy(src, Path(d) / "absent") or "")
+            self.assertIn("missing", measure.check_copy(expected, dst) or "")
+            self.assertIn("no destination", measure.check_copy(expected, Path(d) / "absent") or "")
 
     def test_a_copy_that_consumed_little_space_shares_blocks(self) -> None:
         gib = 1024 * 1024 * 1024
@@ -918,11 +926,12 @@ def tree_digest(root: Path) -> dict[str, str]:
     return out
 
 
-def check_copy(src: Path, dst: Path) -> str | None:
-    """None when `dst` holds exactly `src`'s files with the same bytes; otherwise what is wrong."""
+def check_copy(expected: dict[str, str], dst: Path) -> str | None:
+    """None when `dst` holds exactly the files of `expected` (the source's `tree_digest`) with the same bytes;
+    otherwise what is wrong."""
     if not dst.is_dir():
         return "no destination"
-    a, b = tree_digest(src), tree_digest(dst)
+    a, b = expected, tree_digest(dst)
     missing, extra = sorted(set(a) - set(b)), sorted(set(b) - set(a))
     if missing:
         return f"missing {missing[0]}"
@@ -966,6 +975,8 @@ def measure_case(
 ) -> dict:
     """One case on this runner: the spec's "Measuring" steps 2-5."""
     dst = work / "dst"
+    # The source is hashed once per case; each copy is compared against it (plan panel r1).
+    expected = tree_digest(src)
     times: dict[str, list[float]] = {t.name: [] for t in tools}
     failed: dict[str, str] = {}
     if os_name == "windows":
@@ -988,7 +999,7 @@ def measure_case(
                 failed[t.name] = f"exit code {proc.returncode}: {err}"
             elif shares_blocks(nbytes, before, free(work)):
                 failed[t.name] = "the copy shares blocks with its source: a clone, not a copy"
-            elif (problem := check_copy(src, dst)) is not None:
+            elif (problem := check_copy(expected, dst)) is not None:
                 failed[t.name] = problem
             else:
                 times[t.name].append(elapsed)
@@ -1852,9 +1863,15 @@ for attempt in 1 2 3 4 5; do
   fi
   git -C data commit -qm "bench: $mode at ${GITHUB_SHA:-unknown}"
   if git -C data push origin "HEAD:refs/heads/$branch"; then
-    if [ "$mode" = bench ] && [ -s "$flag" ] && [ "$branch" = bench-data ]; then
-      echo "a runner image is not yet calibrated; starting a calibration"
-      gh workflow run bench-calibrate.yml
+    # Only the real data branch is served. A dispatch with the job's GITHUB_TOKEN always starts a run (GitHub's docs:
+    # "workflow_dispatch and repository_dispatch events always create workflow runs"); see plan decision 9.
+    if [ "$branch" = bench-data ]; then
+      if [ "$mode" = bench ] && [ -s "$flag" ]; then
+        echo "a runner image is not yet calibrated; starting a calibration"
+        gh workflow run bench-calibrate.yml
+      fi
+      echo "redeploying the site with the new data"
+      gh workflow run docs.yml
     fi
     exit 0
   fi
@@ -2225,6 +2242,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
     concurrency:
       group: bench
       cancel-in-progress: false
@@ -2241,6 +2259,7 @@ jobs:
       - name: Publish the calibration to the data branch
         env:
           DATA_BRANCH: ${{ github.ref_name == 'main' && 'bench-data' || 'bench-dry' }}
+          GH_TOKEN: ${{ github.token }}
         run: bash benches/publish/push.sh calibrate
 ```
 
@@ -2260,22 +2279,9 @@ jobs:
       - run: python -W error -m unittest discover -s benches/publish -p "test_*.py"
 ```
 
-- [ ] **Step 5: The site.** In `.github/workflows/docs.yml`, replace the `on:` block (lines 3-6) with:
-
-```yaml
-on:
-  push:
-    branches: [main]
-  workflow_dispatch:
-  # A new benchmark or calibration on main changes the data branch the site serves from bench/.
-  workflow_run:
-    workflows: [Bench, Bench calibration]
-    types: [completed]
-    branches: [main]
-```
-
-and insert, immediately before the comment block that precedes `- uses: actions/upload-pages-artifact@v5` (the
-`# No actions/configure-pages:` comment, line 92):
+- [ ] **Step 5: The site.** `docs.yml`'s triggers stay as they are: `push.sh` dispatches it after each successful
+  push to `bench-data` (plan decision 9). Insert, immediately before the comment block that precedes
+  `- uses: actions/upload-pages-artifact@v5` (the `# No actions/configure-pages:` comment, line 92):
 
 ```yaml
       - name: Add the benchmark pages
