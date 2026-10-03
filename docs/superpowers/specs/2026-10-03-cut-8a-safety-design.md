@@ -70,7 +70,7 @@ workspace, and the single-file place does nothing. `open_operation` retries when
 | Outcome | Result |
 |---|---|
 | The publish succeeds and the removal succeeds | The run continues. |
-| The publish fails as "primitive unavailable" (the same classification `primitive_unavailable` in `tree.rs` applies at `CopyStep::Publish`) | The run is refused with `NOREPLACE_PUBLISH_UNAVAILABLE`. It takes the existing "refused with nothing changed" rollback (`rollback`, `run/mod.rs`): the workspace, the lock record and lock, the control directories it emptied, and DEST if this run created it, are removed again. Exit 3 (section 55: created and removed again does not count as a change). How `RunError` carries a code that is not a lock code is the plan's to decide. |
+| The publish fails as "primitive unavailable" (the same classification `primitive_unavailable` in `tree.rs` applies at `CopyStep::Publish`) | The run is refused with `NOREPLACE_PUBLISH_UNAVAILABLE`. It takes the existing "refused with nothing changed" rollback (`rollback`, `run/mod.rs`): the workspace, the lock record and lock, the control directories it emptied, and DEST if this run created it, are removed again. Exit 3 (section 55: created and removed again does not count as a change). The contract: the stop is a refusal carrying the code `NOREPLACE_PUBLISH_UNAVAILABLE`, with `changed: false`, and `not_removed` set when the probe's own file could not be removed (which makes it exit 1, as `RunError::Refused` already does for what a refusal could not remove). Today `RunError::Refused`'s `Refusal` carries only a lock code; whether that code widens or a sibling variant is added is the plan's choice. |
 | The publish fails for any other reason | The run fails with that error, through the run's existing failure path. |
 | What the probe wrote (`noreplace-probe`, or the temporary) cannot be removed | A warning naming it. The file goes with the workspace when cleanup removes it. If the run is also being refused, it exits 1 instead of 3 (spec section 55); the report still names `NOREPLACE_PUBLISH_UNAVAILABLE` as the refusal, beside the warning, so the cause is not hidden behind the cleanup failure. |
 
@@ -116,6 +116,9 @@ different device number.
 
 **The source-root check stays.** The walk's existing check that a destination directory is not the source root,
 by identity, keeps aborting the whole operation. It is a stronger statement than a mount point and is not changed.
+It runs FIRST: on a pre-existing directory, the source-root identity check comes before the mount-root query, so a
+destination mount that presents the source root itself still aborts the operation instead of becoming a skipped
+subtree (today that check runs only on a live frame, `tree.rs` walk loop, so the order has to be moved, not kept).
 
 ## Part A: a destination inside the source, through a link in a parent component
 
@@ -159,7 +162,10 @@ dynamic check (`enter_dir`) all stay. Part A adds a check; it removes none.
 None new, and no new feature. Measured against the locked versions: `rustix` 1.1.5 (already a Unix dependency of
 `flux-platform`, feature `fs`) has `statx` with `StatxAttributes::MOUNT_ROOT` and, on Apple targets,
 `rustix::fs::getpath` (`F_GETPATH`). `windows-sys` 0.61 with the workspace's `Win32_Storage_FileSystem` feature has
-`GetFinalPathNameByHandleW`. Linux's `/proc/self/fd/<n>` is read with `std::fs::read_link`.
+`GetFinalPathNameByHandleW`. Linux's `/proc/self/fd/<n>` is read with `std::fs::read_link`; the identity re-check of a returned path uses
+`std::fs::symlink_metadata` (it does not follow a final link) and the existing identity mapping in `std_fs.rs`.
+`GetFinalPathNameByHandleW` needs no access beyond what the directory handles already have: they are read for
+identity (`FILE_ID_INFO`) today.
 
 ## Known limits
 
@@ -238,6 +244,10 @@ Panel findings rejected, recorded so they are not raised again:
 - Round 1 (agy): "`GetFinalPathNameByHandleW`'s `\\?\` prefix makes the containment test miss". REJECTED: Part A
   canonicalises BOTH the source root and the anchor through the same query, so both carry the same prefix; the
   scenario compared a canonical anchor with a raw source path, which the spec never does.
+
+- Round 3 (agy): "use `openat2` with `RESOLVE_BENEATH` instead of canonical paths". REJECTED: it confines a
+  resolution to below a directory handle, which is not Part A's question (whether DEST's already-resolved location
+  lies inside the SOURCE), and it exists only on Linux.
 
 ## Design record
 
