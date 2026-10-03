@@ -50,8 +50,9 @@ impl Pulse {
     }
 
     /// Refresh `held`'s record once the interval has passed since the last write; a failed write is retried once, at
-    /// once (decision 7). After a failure, nothing: a second failure can never replace or nest inside the first. The
-    /// error is the plain I/O error; each caller names the lock.
+    /// once (decision 7). After a failure it writes nothing and returns `Ok(())`: the failure was already reported once,
+    /// and a second one can never replace or nest inside it. The error is the plain I/O error; each caller names the
+    /// lock.
     pub(crate) fn beat<D: DirHandle>(&self, held: &Held<'_, D>) -> flux_fs::Result<()> {
         if self.failed.get() || self.last.get().elapsed() < self.interval {
             return Ok(());
