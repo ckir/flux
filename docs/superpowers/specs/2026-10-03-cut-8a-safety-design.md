@@ -203,7 +203,7 @@ Every rule gets a test that fails under a mutant of the code it guards. The in-m
   - a pre-existing mount root is skipped and reported, and its siblings are copied;
   - a directory this run created is not queried;
   - "cannot tell" warns under default and refuses the subtree under strict;
-  - the source-root alias still aborts.
+  - the source-root alias still aborts, even when that directory is also a mount root (the order).
 - **A:**
   - a destination whose canonical anchor lies inside the source is refused before the lock;
   - a merely similar name (`/database` against `/data`) is not;
