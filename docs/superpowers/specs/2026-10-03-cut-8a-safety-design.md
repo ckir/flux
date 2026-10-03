@@ -38,18 +38,20 @@ Each design fork went to agy first; the owner chose. The reasoning lives under "
 4. **A's mechanism:** canonicalise the source root and the destination from their open handles, then test
    containment component by component. When the query is unsupported, the default warns and `--safety strict`
    refuses; any other failure aborts.
-5. **P:** exactly as spec section 241.5 states it. It runs once the workspace exists and before the walk, on every
-   run.
+5. **P:** exactly as spec section 241.5 states it. It runs once the workspace and the lock record exist and before
+   `--restart`'s supersede, on every run.
 6. **Tests:** the in-memory fake for every rule, plus a real bind mount on Linux CI and a real junction on Windows CI.
 
 ## Part P: the no-replace probe
 
 The normative text is spec section 241.5 (`FLUX_FULL_UPDATED_SPEC_V16.md`, around lines 10874-10887).
 
-**When it runs.** In `run::tree` (`crates/flux-core/src/run/mod.rs`), after `open_operation` has made the workspace
-and written the lock record, and before step 6 (`copy_tree_at`). Before that point the workspace the probe must
-write into does not exist. After it, the copy has started. It runs on every run, `--restart` included: a restart may
-meet a different filesystem under the same name.
+**When it runs.** Inside `open_operation` (`crates/flux-core/src/run/session.rs`), once this run's workspace exists
+and its lock record is written, and BEFORE `--restart`'s supersede (`supersede`, `run/restart.rs`). Before that point
+the workspace the probe must write into does not exist, and the lock is not this run's. After it, the supersede marks
+every prior operation ABANDONED and deletes their partials, so a refusal there would not leave the destination
+unchanged. It runs on every run, `--restart` included: a restart may meet a different filesystem under the same
+name. A refusal therefore leaves every prior operation exactly as it was, still resumable.
 
 **What it does.** The run's section 99 guard runs before its first write, as before every destination mutation.
 1. It stages a temporary in the operation's workspace.
@@ -63,7 +65,7 @@ meet a different filesystem under the same name.
 | Outcome | Result |
 |---|---|
 | The publish succeeds and the removal succeeds | The run continues. |
-| The publish fails as "primitive unavailable" (the same classification `primitive_unavailable` in `tree.rs` applies at `CopyStep::Publish`) | The run is refused with `NOREPLACE_PUBLISH_UNAVAILABLE` and ends `Ended::RefusedUnchanged`: rollback removes the workspace, the lock, and DEST if this run created it. Exit 3. |
+| The publish fails as "primitive unavailable" (the same classification `primitive_unavailable` in `tree.rs` applies at `CopyStep::Publish`) | The run is refused with `NOREPLACE_PUBLISH_UNAVAILABLE`. It takes the existing "refused with nothing changed" rollback (`rollback`, `run/mod.rs`): the workspace, the lock record and lock, the control directories it emptied, and DEST if this run created it, are removed again. Exit 3 (section 55: created and removed again does not count as a change). How `RunError` carries a code that is not a lock code is the plan's to decide. |
 | The publish fails for any other reason | The run fails with that error, through the run's existing failure path. |
 | What the probe wrote (`noreplace-probe`, or the temporary) cannot be removed | A warning naming it. The file goes with the workspace when cleanup removes it. If the run is also being refused, it exits 1 instead of 3 (spec section 55). |
 
@@ -94,7 +96,7 @@ an error, reported as that subtree's failure exactly as a failed `open_dir` is, 
 
 | Platform | "A mount root" when | "Cannot tell" when |
 |---|---|---|
-| Linux | `statx` on the child reports `STATX_ATTR_MOUNT_ROOT` in its attributes; or, where the attribute mask does not include it, the child's device number differs from the parent's | the mask does not include the attribute and the device numbers are equal |
+| Linux | `statx` on the child reports `STATX_ATTR_MOUNT_ROOT` in its attributes; or, where the attribute mask does not include it, the child's device number differs from the parent's (the volume inside each handle's own identity) | the mask does not include the attribute and the device numbers are equal |
 | macOS | the child's device number differs from the parent's | never |
 | Windows | never: a mounted-volume folder is a name-surrogate reparse point, which `open_dir` already refuses | never |
 
@@ -132,8 +134,10 @@ does, the run is refused with `SAFETY_REJECTED` before the lock is taken. This h
 The query is asked of the very handle the run then writes through: the anchor handle `locate_tree` opens and hands
 on (DEST, or the holder that creates DEST). A path swapped after the check therefore changes nothing the run
 touches. The source root is opened for the query the way the walk opens it, and closed after it. A new query is
-added to the platform traits for each. On Linux, a `readlink` result ending in `" (deleted)"` means the directory
-was removed; it counts as "any other error" below.
+added to the platform traits for each. A returned path is checked before it is used: the object found at it, without
+following a final link, must have the handle's own identity. A mismatch (on Linux, for example, a removed
+directory, whose `readlink` text gains a `" (deleted)"` suffix that a real name may also carry) counts as "any other
+error" below. The text is never inspected for that suffix.
 
 **When the query fails:**
 
@@ -176,7 +180,7 @@ Every rule gets a test that fails under a mutant of the code it guards. The in-m
     and rolls back;
   - a probe file that cannot be removed gives the warning, and exit 1 on a refusal;
   - another publish error fails the run;
-  - `--restart` probes again.
+  - `--restart` probes again, and a refusal there leaves the prior operations un-superseded and resumable.
 - **M:**
   - a pre-existing mount root is skipped and reported, and its siblings are copied;
   - a directory this run created is not queried;
@@ -207,6 +211,14 @@ rather than passing silently.
 - Everything in 8b: `state.db`, claim records, replacement, `--update`, `--skip-existing`.
 - `--dry-run`.
 - `--cross-filesystems` and the source-side section 42 rule.
+
+## Stand-downs
+
+Panel findings rejected, recorded so they are not raised again:
+
+- Round 1 (agy): "`GetFinalPathNameByHandleW`'s `\?\` prefix makes the containment test miss". REJECTED: Part A
+  canonicalises BOTH the source root and the anchor through the same query, so both carry the same prefix; the
+  scenario compared a canonical anchor with a raw source path, which the spec never does.
 
 ## Design record
 
