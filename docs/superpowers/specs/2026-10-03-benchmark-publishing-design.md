@@ -15,6 +15,8 @@ publishes how Flux compares with other copiers, and how that changes over time, 
    - Graphviz lays out node-and-edge graphs; it does not draw bar or line charts.
    - Filling in a README template needs a bot commit to `main`, which branch protection blocks.
 4. **Comparators are a registry,** open to more tools later (FastCopy, for example), not a fixed pair.
+5. **Panel round 1 changed one agreed detail, for the owner to confirm:** the harness times the runs itself rather than
+   through `hyperfine` (see "Measuring" for why).
 
 ## What a visitor sees
 
@@ -42,9 +44,11 @@ seed so every run copies the same bytes:
 | `small` | 5,000 files of 4 KiB in 50 folders |
 | `mixed` | 500 files totalling 512 MiB, sizes spread from 4 KiB to 64 MiB, in a three-level tree |
 
-Every case copies a folder into a destination that does not exist yet, contents only. Each tool's command does that
-and nothing more (see the registry). Flux runs as a release build of `flux-cli` from the commit under test, with its
-default options.
+Every case copies a folder into a destination that does not exist yet: the files' contents, their modification times
+and their permissions. Flux does that with its default options: it applies times and permissions unless told
+otherwise (`crates/flux-cli/src/main.rs`, `--preserve-times` and `--preserve-permissions` only make a failure to apply
+them fatal). Each comparator's command is chosen to do the same work and no less (see the registry), so a ratio never
+compares a full copy with a contents-only one. Flux runs as a release build of `flux-cli` from the commit under test.
 
 ## The comparator registry
 
@@ -54,9 +58,9 @@ default options.
 |---|---|
 | `name` | shown on the charts |
 | `os` | the runner OSes it runs on: any of `windows`, `linux`, `macos` |
-| `command` | the copy command, with `{src}` and `{dst}` placeholders, run without a shell |
+| `command` | the copy command as an ARRAY of arguments, e.g. `["cp", "-Rp", "{src}/.", "{dst}"]`. Placeholders are substituted inside each argument, and the array is run directly, never through a shell, so a path with spaces stays one argument |
 | `ok_exit_codes` | exit codes that mean success (robocopy's 1 means "files copied") |
-| `version` | a command whose first output line is recorded as the version |
+| `version` | an argument array whose first output line is recorded as the version |
 | `source` | `preinstalled`, or `download` with `url` and `sha256` |
 | `note` | optional, shown on the trend page (a licence condition, a feature it lacks) |
 
@@ -64,9 +68,13 @@ Starting set:
 
 | Name | OS | Command |
 |---|---|---|
-| `robocopy` | windows | `robocopy {src} {dst} /E /NJH /NJS /NFL /NDL /NP` (ok 0-7) |
-| `cp` | linux, macos | `cp -R {src}/. {dst}` |
-| `rsync` | linux, macos | `rsync -r {src}/ {dst}/` |
+| `robocopy` | windows | `robocopy {src} {dst} /E /COPY:DAT /DCOPY:T /NJH /NJS /NFL /NDL /NP` (ok 0-7) |
+| `cp` | linux, macos | `cp -Rp {src}/. {dst}` |
+| `rsync` | linux, macos | `rsync -rtp {src}/ {dst}/` |
+
+`/COPY:DAT` is robocopy's default (data, attributes, timestamps), written out so the work is explicit. `-p` makes `cp`
+keep times and permissions; `-t` and `-p` do the same for `rsync`. None of them syncs to disk, and neither does Flux by
+default (`--durability normal`).
 
 Flux itself is fixed, not a registry entry: `flux copy {src} {dst}`.
 
@@ -82,29 +90,77 @@ CI use is decided then and recorded in its `note`.
 
 ## Measuring
 
-The harness is `benches/publish/` in Python 3.14 (standard library only) and `hyperfine`, pinned by version and SHA-256
-like a downloaded comparator. For each case:
+The harness is `benches/publish/` in Python 3.14, standard library only, installed on the runners by
+`actions/setup-python`. It times the runs itself (`time.perf_counter` around `subprocess.run` of the argument array).
+It does not use `hyperfine`, for three reasons:
+- hyperfine runs one command's repetitions back to back, while this design interleaves the tools;
+- hyperfine's preparation step needs a shell;
+- hyperfine stops on any non-zero exit, and robocopy's success code is 1.
 
-1. Generate the source tree once.
-2. For each tool on this OS, run `hyperfine` with `--runs 5`, a `--prepare` step that deletes the destination and, on
-   Linux and macOS, drops the page cache (`sync; echo 3 | sudo tee /proc/sys/vm/drop_caches`; `sudo purge`), and
-   `--warmup 1` on Windows, which cannot drop it. Tools run in an order rotated by case, so no tool always goes first.
-3. Check every destination: file count and total bytes equal the source's. A tool whose copy is wrong is recorded as
-   failed for that case, never timed.
-4. Record each tool's median and spread, and the ratio of Flux's median to each comparator's.
+For each case on a runner:
 
-The run also records the commit, the date, the runner OS and image version (`ImageOS`, `ImageVersion`), and each
-tool's version.
+1. **Generate** the source tree once, from a fixed seed, under the runner's temporary directory.
+2. **Warm up** (Windows only, which cannot drop its cache): one untimed copy by each tool.
+3. **Time five rounds.** Round `r` runs Flux and every comparator for this OS, in the tool list rotated by `r`, so each
+   tool goes first in some round. Before every timed copy, the harness:
+   - deletes the destination;
+   - on Linux, runs `sync` and then `sudo sh -c "echo 3 > /proc/sys/vm/drop_caches"`, as an argument array;
+   - on macOS, runs `sync` and then `sudo purge`.
+
+   Only the copy itself is inside the timed region.
+4. **Check** every copy after it is timed, outside the timed region: the destination has the same relative paths as
+   the source, and each file's SHA-256 matches. A tool whose copy is wrong, or whose exit code is not in its
+   `ok_exit_codes`, is recorded as `failed` for that case and gets no ratio. The check runs on every round, so a tool
+   cannot pass by copying correctly only once.
+5. **Record** each tool's median of the five times, the spread (minimum and maximum), and the ratio of Flux's median to
+   each comparator's.
+
+### Result shapes
+
+Each measure job writes one file, `result-<os>.json`, uploaded as its artifact:
+
+```json
+{
+  "schema": 1,
+  "commit": "<40-hex sha>",
+  "date": "<UTC ISO 8601>",
+  "os": "linux",
+  "image": {"os": "<ImageOS>", "version": "<ImageVersion>"},
+  "cache": "cold",
+  "defender": null,
+  "tools": {"flux": "<version line>", "cp": "<version line>"},
+  "cases": {
+    "small": {
+      "times_s": {"flux": [0.0, 0.0, 0.0, 0.0, 0.0], "cp": [0.0, 0.0, 0.0, 0.0, 0.0]},
+      "median_s": {"flux": 0.0, "cp": 0.0},
+      "failed": [],
+      "ratio": {"cp": 0.0}
+    }
+  }
+}
+```
+
+`cache` is `cold` or `warm`, and `defender` is `true`, `false` or `null` (not Windows). `data.json` on `bench-data` is
+`{"schema": 1, "runs": [ ... ]}`, where each run is one such object. A run is identified by (`commit`, `os`): a second
+result for the same pair replaces the first, so a re-run never duplicates a point. `stability.json` is
+`{"schema": 1, "pairs": {"<os>/<case>/<comparator>": {"cv": 0.0, "stable": true, "calibrated": "<date>", "image": "<ImageVersion>"}}}`.
+A reader that meets a `schema` it does not know stops and draws nothing, rather than misreading the fields.
 
 ## Noise
 
 - **Same-job ratios.** Both tools see the same VM at nearly the same moment, so much of the run-to-run swing cancels.
   That is a claim about these runners, so it is measured before anything is published (next bullet).
-- **The stability gate.** A calibration workflow (`workflow_dispatch`) runs the benchmark job 10 times in parallel on
-  each runner. For each (runner, case, comparator), it computes the coefficient of variation of the 10 ratios. A pair
-  at or below 3% is `stable`, which is enough to show a 10% regression. A pair above it is `unstable` and stays off the
-  page until a later calibration passes. Calibration results are stored beside the data (`stability.json`), and the
-  page shows when each pair was last calibrated.
+- **The stability gate.** A calibration workflow (`bench-calibrate.yml`) runs the benchmark job 10 times in parallel on
+  each runner, at the same commit. For each (runner, case, comparator), it computes the coefficient of variation of the
+  10 ratios. A pair at or below 3% is `stable`, which is enough to show a 10% regression. A pair above it is `unstable`
+  and stays off the page until a later calibration passes. Results go to `stability.json`, and the page shows when each
+  pair was last calibrated.
+- **The gate is re-checked over time,** because 10 parallel jobs measure the spread between machines at one moment,
+  not drift over weeks. Calibration runs weekly on a schedule, on `workflow_dispatch`, and from `bench.yml` whenever a
+  runner reports an `ImageVersion` that `stability.json` has not seen. Between calibrations, the publish job computes
+  the coefficient of variation of each pair's last 10 points at unchanged Flux source. A pair whose rolling figure
+  exceeds 3% is demoted to `unstable` until the next calibration. Points at unchanged source are those whose commits
+  changed no file under `crates/`, `Cargo.toml` or `Cargo.lock` since the previous point.
 - **Cache.** Cold on Linux and macOS, warm on Windows; the page states which.
 - **Windows is charted apart.** A warm cache, and Defender's on-access scan if it is active on the runner, measure a
   different profile from a cold Linux or macOS copy. The two are never on one chart. The dry run records whether
@@ -118,8 +174,10 @@ tool's version.
   `latest.svg`. No bot commits to `main`; nothing expires.
 - **The benchmark workflow** (`.github/workflows/bench.yml`):
   - **Trigger:** every push to `main`, plus `workflow_dispatch`.
-  - **Measure jobs:** one per runner OS, with `contents: read`. Each uploads its results as an artifact.
-  - **Publish job:** the only job with `contents: write`. It appends the results to `data.json`, redraws
+  - **Measure jobs:** one per runner OS, with `contents: read`. Each uploads `result-<os>.json` as an artifact.
+  - **Publish job:** the only job with `contents: write`. It runs after the measure jobs whether or not each succeeded
+    (`if: always()`), and publishes the results that exist; a failed runner simply has no point for that commit. It
+    appends the results to `data.json`, redraws
     `latest.svg`, and pushes to `bench-data`, rebasing and retrying if another push landed first. It runs under the
     concurrency group `bench`, which queues runs and never cancels one. It pushes with the job's `GITHUB_TOKEN`, and
     GitHub starts no workflow run for a push made with that token. That matters: `ci.yml` runs on every branch
@@ -128,7 +186,9 @@ tool's version.
 - **`latest.svg`** is drawn by the harness in Python: a small table-like image, one row per (runner, case, comparator)
   that is `stable`, with the ratio, the commit and the date.
 - **The site:** `docs.yml` runs on its existing triggers and also on `workflow_run` of `bench.yml`. Before it uploads its
-  Pages artifact, it checks out `bench-data` into `target/doc/bench/` and copies in the trend page
+  Pages artifact, it asks whether `bench-data` exists (`git ls-remote --heads origin bench-data`). If it does not
+  (before the first benchmark, or after the branch was deleted), the docs deploy without a `bench/` folder and the step
+  says so in its log. If it does, it checks out `bench-data` into `target/doc/bench/` and copies in the trend page
   (`benches/publish/site/index.html`). One deploy serves both the docs and the benchmark pages. Pages here is built by
   Actions (`build_type: workflow`, measured), so a second deploying workflow would replace the docs, and a `gh-pages`
   branch would never be served.
@@ -137,17 +197,28 @@ tool's version.
 
 ## Failure behaviour
 
-- **A measure job fails:** that runner's point is missing from the run. Nothing published is overwritten.
+- **A measure job fails:** that runner's point is missing from the run; the other runners' points still publish.
+  Nothing published is overwritten.
+- **`bench-data` is force-pushed back or deleted:** the history it held is lost from the page; the next run starts a
+  new `data.json`. No other workflow fails.
 - **The publish push fails after its retries:** the run fails visibly in Actions; the data branch keeps its last state.
 - **`bench-data` is unreachable at deploy:** `docs.yml` deploys the docs without a `bench/` folder. The README image then
   shows as broken until the next good deploy. Visitors see a missing image, never wrong numbers.
 
 ## Testing
 
-- **The harness's own logic** has unit tests in Python, run in CI: registry parsing and validation (a missing
-  placeholder, an unknown OS, a `download` entry with no `sha256`), the ratio and median arithmetic, the coefficient of
-  variation and the gate, the `data.json` append (no duplicate commit per runner), the image-version break, and the
-  `latest.svg` content (stable rows only).
+- **The harness's own logic** has unit tests in Python, run in CI:
+  - registry parsing and validation: a missing placeholder, an unknown OS, a `download` entry with no `sha256`, a
+    `command` that is not an array;
+  - the rotation (each tool first in some round);
+  - the copy check: a destination with a missing file, an extra file, or one wrong byte fails;
+  - the exit-code rule;
+  - the ratio and median arithmetic;
+  - the coefficient of variation, the gate and the rolling demotion;
+  - the `data.json` replace-by-(`commit`, `os`) rule;
+  - an unknown `schema`;
+  - the image-version break;
+  - the `latest.svg` content (stable rows only).
 - **A dry run** of the benchmark workflow on a branch, with tiny cases, writing to a scratch branch instead of
   `bench-data`, before the first real run.
 - **The first calibration** runs before the README links anything. Its outcome decides which pairs appear.
@@ -158,3 +229,12 @@ tool's version.
 - `flux benchmark` (the CLI command in spec §4) and criterion micro-benchmarks. `benches/copy.rs` stays a placeholder.
 - Alerting on a regression. The chart makes one visible; failing a build on it is a later decision.
 - Refreshing the rest of the stale README ("pre-implementation").
+
+## Stand-downs
+
+- DISCARDED-BELOW-FLOOR (panel r1): a CDN outage leaves the trend page blank. The README's image is served by Pages,
+  not the CDN, so the README is unaffected, and the page shows no numbers rather than wrong ones.
+- DISCARDED-BELOW-FLOOR (panel r1): the publish job racing itself. It runs in the concurrency group `bench`, which queues
+  runs, and its push rebases and retries.
+- REJECTED (panel r1): "Python 3.14 does not exist yet." Python 3.14 was released in October 2025, and
+  `actions/setup-python` installs it.
