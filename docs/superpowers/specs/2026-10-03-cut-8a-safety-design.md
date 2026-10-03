@@ -154,6 +154,13 @@ error" below. The text is never inspected for that suffix.
 **What does not change.** The lexical floor (`prepare_source`), the identity pre-flight (`preflight`) and the walk's
 dynamic check (`enter_dir`) all stay. Part A adds a check; it removes none.
 
+## Dependencies
+
+None new, and no new feature. Measured against the locked versions: `rustix` 1.1.5 (already a Unix dependency of
+`flux-platform`, feature `fs`) has `statx` with `StatxAttributes::MOUNT_ROOT` and, on Apple targets,
+`rustix::fs::getpath` (`F_GETPATH`). `windows-sys` 0.61 with the workspace's `Win32_Storage_FileSystem` feature has
+`GetFinalPathNameByHandleW`. Linux's `/proc/self/fd/<n>` is read with `std::fs::read_link`.
+
 ## Known limits
 
 Each is recorded in `TODO.md` by this cut.
