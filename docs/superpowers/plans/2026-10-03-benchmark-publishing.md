@@ -2393,3 +2393,15 @@ The driver runs this: it pushes, reads CI, and judges the results.
   - The first push to `main` runs `Bench` into `bench-data`, and that new image triggers `Bench calibration`.
   - The `Docs` deploy then serves `https://ckir.github.io/flux/bench/`.
   - Check that the README image renders on GitHub, and record it in the memory ledger.
+
+## Stand-downs (plan panel)
+
+- REJECTED (r1): "GITHUB_TOKEN cannot start a workflow_dispatch run". GitHub's docs: "workflow_dispatch and
+  repository_dispatch events always create workflow runs" (decision 9).
+- REJECTED (r2): "`target/release/flux.exe` does not exist". `crates/flux-cli/Cargo.toml` names the binary `flux`
+  (`[[bin]] name = "flux"`), and the CLI tests run it as `CARGO_BIN_EXE_flux`.
+- REJECTED (r2): "the destination is hashed every round". The spec requires every round's copy to be checked.
+- DISCARDED-BELOW-FLOOR (r1): free-space noise in the clone check. The threshold is half of a copy of at least 64 MiB;
+  background writes on a runner are far smaller.
+- DISCARDED-BELOW-FLOOR (r2): `docs.yml` deploys on a push to `main` and again on the publish job's dispatch. The first
+  carries the doc changes at once, the second the new data.
