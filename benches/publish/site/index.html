@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Flux benchmarks</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      max-width: 980px; margin: 40px auto; padding: 0 20px; line-height: 1.6;
+    }
+    h1 { border-bottom: 1px solid #8884; padding-bottom: 10px; }
+    h2 { margin-top: 2.2em; }
+    .note { font-size: .92em; opacity: .75; }
+    .hidden { font-size: .9em; opacity: .8; }
+    canvas { max-height: 320px; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js"
+          integrity="sha384-jb8JQMbMoBUzgWatfe6COACi2ljcDdZQ2OxczGA3bGNeWe+6DChMTBJemed7ZnvJ"
+          crossorigin="anonymous"></script>
+</head>
+<body>
+  <h1>Flux benchmarks</h1>
+  <p>
+    Each point is <b>Flux's median time divided by a comparator's</b>, both measured in the same GitHub Actions job.
+    <b>Below 1.0, Flux is faster.</b> Six interleaved rounds per case; every copy is checked file by file (SHA-256).
+    Linux and macOS drop the page cache before each copy; Windows cannot, and is measured warm, under its own heading.
+    A pair is drawn only after a calibration (10 parallel runs) shows its ratio varies by at most 3%, and only on the
+    runner image it was calibrated on. A new runner image breaks the line.
+  </p>
+  <p class="note">
+    Cases: <code>large</code>, one 1 GiB file; <code>small</code>, 5,000 files of 4 KiB; <code>mixed</code>, 500 files
+    totalling 512 MiB. Source: <code>benches/publish/</code> in the repository.
+  </p>
+  <div id="out"></div>
+  <script>
+    "use strict";
+    const OSES = [["linux", "Linux"], ["macos", "macOS"], ["windows", "Windows"]];
+    const CASES = ["large", "small", "mixed"];
+    const key = r => r.run.split(".").map(Number);
+    const order = (a, b) => key(a)[0] - key(b)[0] || key(a)[1] - key(b)[1];
+
+    function status(stab, os, cs, comp, image) {
+      const e = stab.pairs[`${os}/${cs}/${comp}`];
+      if (!e || e.image !== image) return "not yet calibrated on this image";
+      return e.stable ? "stable" : "too noisy";
+    }
+
+    function plotted(data) {
+      const best = new Map();
+      for (const r of data.runs) {
+        const k = `${r.commit}|${r.os}|${r.image.version}`;
+        const b = best.get(k);
+        if (!b || order(r, b) > 0) best.set(k, r);
+      }
+      return [...best.values()].sort(order);
+    }
+
+    function chart(parent, title, runs, stab, os, cs) {
+      const comps = [...new Set(runs.flatMap(r => Object.keys(r.tools).filter(t => t !== "flux")))];
+      const labels = [], meta = [], series = Object.fromEntries(comps.map(c => [c, []]));
+      let image = null;
+      for (const r of runs) {
+        if (image !== null && r.image.version !== image) {
+          labels.push(`new image ${r.image.version}`); meta.push(null);
+          for (const c of comps) series[c].push(null);
+        }
+        image = r.image.version;
+        labels.push(r.commit.slice(0, 7)); meta.push(r);
+        for (const c of comps) {
+          const v = r.cases[cs] && r.cases[cs].ratio[c];
+          series[c].push(v !== undefined && status(stab, os, cs, c, r.image.version) === "stable" ? v : null);
+        }
+      }
+      const h = document.createElement("h3"); h.textContent = title; parent.append(h);
+      const canvas = document.createElement("canvas"); parent.append(canvas);
+      new Chart(canvas, {
+        type: "line",
+        data: { labels, datasets: comps.map(c => ({ label: `vs ${c}`, data: series[c], spanGaps: false })) },
+        options: {
+          scales: { y: { title: { display: true, text: "Flux time / comparator time (below 1.0: Flux faster)" } } },
+          plugins: { tooltip: { callbacks: { afterBody: items => {
+            const r = meta[items[0].dataIndex];
+            if (!r) return "";
+            const tools = Object.entries(r.tools).map(([t, v]) => `${t}: ${v}`);
+            return [`${r.commit.slice(0, 12)}  ${r.date}`, `image ${r.image.os} ${r.image.version}`, ...tools];
+          } } } },
+        },
+      });
+      const last = runs[runs.length - 1], hidden = [];
+      for (const c of comps) {
+        const lc = last.cases[cs];
+        if (!lc) continue;
+        if (lc.failed.includes(c) || lc.failed.includes("flux")) hidden.push(`vs ${c}: the copy failed its check`);
+        else {
+          const s = status(stab, os, cs, c, last.image.version);
+          if (s !== "stable") hidden.push(`vs ${c}: ${s}`);
+        }
+      }
+      if (hidden.length) {
+        const p = document.createElement("p"); p.className = "hidden";
+        p.textContent = `Not shown in the latest run: ${hidden.join("; ")}.`; parent.append(p);
+      }
+    }
+
+    async function main() {
+      const out = document.getElementById("out");
+      let data, stab;
+      try {
+        [data, stab] = await Promise.all(["data.json", "stability.json"].map(f => fetch(f).then(r => {
+          if (!r.ok) throw new Error(`${f}: ${r.status}`);
+          return r.json();
+        })));
+      } catch (e) {
+        out.textContent = `No benchmark data yet (${e.message}).`;
+        return;
+      }
+      if (data.schema !== 1 || stab.schema !== 1) {
+        out.textContent = "The data uses a schema this page does not know; nothing is drawn.";
+        return;
+      }
+      if (typeof Chart === "undefined") {
+        out.textContent = "The chart library did not load; the data is at data.json.";
+        return;
+      }
+      const runs = plotted(data);
+      for (const [os, label] of OSES) {
+        const rs = runs.filter(r => r.os === os);
+        if (!rs.length) continue;
+        const last = rs[rs.length - 1];
+        const h = document.createElement("h2");
+        h.textContent = `${label}: ${last.cache} cache` +
+          (os === "windows" ? `, Defender ${last.defender === true ? "on" : last.defender === false ? "off" : "unknown"}` : "");
+        out.append(h);
+        for (const cs of CASES) chart(out, cs, rs, stab, os, cs);
+      }
+    }
+    main();
+  </script>
+</body>
+</html>
