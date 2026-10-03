@@ -2,14 +2,10 @@ name: Bench calibration
 
 # Ten parallel measurements per runner at one commit decide which pairs are stable (spec "Noise"). Weekly, on
 # dispatch, and from bench.yml when a runner reports an image no pair was calibrated on.
-#
-# DRY RUN (plan decision 2, removed by Task 9): a push to spec/bench-publish runs the tiny cases into bench-dry.
 on:
   schedule:
     - cron: "17 3 * * 1"
   workflow_dispatch:
-  push:
-    branches: [spec/bench-publish]
 
 permissions:
   contents: read

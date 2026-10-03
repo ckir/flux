@@ -1,12 +1,10 @@
 name: Bench
 
-# Every push to main is measured on each runner and published to the data branch (spec "Where the data lives").
-#
-# DRY RUN (plan decision 2, removed by Task 9): a push to spec/bench-publish runs the tiny cases into bench-dry,
-# because workflow_dispatch reaches only workflows already on the default branch.
+# Every push to main is measured on each runner and published to the data branch (spec "Where the data lives"). A run
+# on any other ref uses the tiny cases and writes to bench-dry, never bench-data.
 on:
   push:
-    branches: [main, spec/bench-publish]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
