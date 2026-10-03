@@ -36,3 +36,18 @@ One section per audited change, newest at the bottom.
   **Compensation:** the check is one comparison against `bytes.len()` on each arm, and the fake's `write_at_start`
   gives Part 2's protocol tests their own fault injection (`write_at_start` and `lock_set_len` are recorded calls).
   Owner-accepted 2026-09-29.
+
+## Cut 7b Part 2 - the heartbeat (test audit 2026-10-03)
+
+- **A heartbeat failure is not driven end to end through the `flux` binary.** A real filesystem cannot be made to
+  fail one lock write on demand, and a debug hook in `RunConfig` would inject the failure instead of the real write
+  (`Held::heartbeat`), so an end-to-end test could pass while the real failure path was broken. Agreed with the peer
+  after one negotiation turn, owner-approved.
+  **Compensation:** the error itself - its code, its step, the lock path and the wording the operator reads - is
+  pinned by `run::tests::two_failed_heartbeat_writes_stop_the_copy_naming_the_lock_and_the_run_records_failed` and
+  `run::tests::a_heartbeat_failure_message_names_the_lock` (`crates/flux-core/src/run/tests.rs`); the binary printing a
+  single-file copy error and exiting 1 by `a_missing_source_exits_1_and_counts_one_error`
+  (`crates/flux-cli/tests/copy.rs`); the next run after an unreadable lock, the torn case, by
+  `an_empty_lock_is_uncertain_until_restart_break_lock_takes_it_over` (`crates/flux-cli/tests/run.rs`); and how a
+  `--restart` heartbeat failure prints, a `RunError::Failed` at the lock step, by `report.rs`
+  `a_refusal_names_what_it_could_not_remove_and_a_failure_names_its_step_and_path`. Owner-accepted 2026-10-03.

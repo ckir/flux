@@ -1315,3 +1315,18 @@ fn a_heartbeat_restarts_its_interval() {
         calls(&fs)
     );
 }
+
+#[test]
+fn a_heartbeat_failure_message_names_the_lock() {
+    // Mutant: change the wording `beat_error` builds (session.rs). The operator reads this line; it must say what
+    // failed.
+    let fs = fake();
+    fail_heartbeat(&fs, 2, T_LOCK, false);
+    let r = run_file(&fs, &beating());
+    let message = file_error(&r).to_string().replace('\\', "/");
+    assert!(
+        message.contains(&format!("the heartbeat could not refresh the lock record {T_LOCK}: ")),
+        "{message}"
+    );
+    assert!(message.starts_with("IO_ERROR: "), "{message}");
+}
