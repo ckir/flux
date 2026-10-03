@@ -101,8 +101,10 @@ For each case on a runner:
 
 1. **Generate** the source tree once, from a fixed seed, under the runner's temporary directory.
 2. **Warm up** (Windows only, which cannot drop its cache): one untimed copy by each tool.
-3. **Time five rounds.** Round `r` runs Flux and every comparator for this OS, in the tool list rotated by `r`, so each
-   tool goes first in some round. Before every timed copy, the harness:
+3. **Time six rounds.** Round `r` runs Flux and every comparator for this OS, in the tool list rotated by `r`. Six is a
+   multiple of both tool counts in the starting set (two on Windows, three on Linux and macOS), so each tool holds each
+   position equally often. A registry that gives an OS a tool count not dividing six raises the round count to the
+   next multiple of it. Before every timed copy, the harness:
    - deletes the destination;
    - on Linux, runs `sync` and then `sudo sh -c "echo 3 > /proc/sys/vm/drop_caches"`, as an argument array;
    - on macOS, runs `sync` and then `sudo purge`.
@@ -112,8 +114,8 @@ For each case on a runner:
    the source, and each file's SHA-256 matches. A tool whose copy is wrong, or whose exit code is not in its
    `ok_exit_codes`, is recorded as `failed` for that case and gets no ratio. The check runs on every round, so a tool
    cannot pass by copying correctly only once.
-5. **Record** each tool's median of the five times, the spread (minimum and maximum), and the ratio of Flux's median to
-   each comparator's.
+5. **Record** each tool's median of its times, the spread (minimum and maximum), and the ratio of Flux's median to each
+   comparator's.
 
 ### Result shapes
 
@@ -123,6 +125,7 @@ Each measure job writes one file, `result-<os>.json`, uploaded as its artifact:
 {
   "schema": 1,
   "commit": "<40-hex sha>",
+  "run": "<GITHUB_RUN_ID>.<GITHUB_RUN_ATTEMPT>",
   "date": "<UTC ISO 8601>",
   "os": "linux",
   "image": {"os": "<ImageOS>", "version": "<ImageVersion>"},
@@ -131,7 +134,7 @@ Each measure job writes one file, `result-<os>.json`, uploaded as its artifact:
   "tools": {"flux": "<version line>", "cp": "<version line>"},
   "cases": {
     "small": {
-      "times_s": {"flux": [0.0, 0.0, 0.0, 0.0, 0.0], "cp": [0.0, 0.0, 0.0, 0.0, 0.0]},
+      "times_s": {"flux": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "cp": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]},
       "median_s": {"flux": 0.0, "cp": 0.0},
       "failed": [],
       "ratio": {"cp": 0.0}
@@ -141,9 +144,13 @@ Each measure job writes one file, `result-<os>.json`, uploaded as its artifact:
 ```
 
 `cache` is `cold` or `warm`, and `defender` is `true`, `false` or `null` (not Windows). `data.json` on `bench-data` is
-`{"schema": 1, "runs": [ ... ]}`, where each run is one such object. A run is identified by (`commit`, `os`): a second
-result for the same pair replaces the first, so a re-run never duplicates a point. `stability.json` is
-`{"schema": 1, "pairs": {"<os>/<case>/<comparator>": {"cv": 0.0, "stable": true, "calibrated": "<date>", "image": "<ImageVersion>"}}}`.
+`{"schema": 1, "runs": [ ... ]}`, where each run is one such object. It is append-only: a re-run of a commit adds a new
+object and never replaces or edits one, so no measurement is ever lost (a re-run on a newer image, or one where a
+comparator was missing). The page decides what to plot: for each (`commit`, `os`, image version) it plots the run with
+the latest `date`; a run of the same commit on another image version is a separate point, on the far side of the
+image break. `stability.json` is
+`{"schema": 1, "pairs": {"<os>/<case>/<comparator>": {"cv": 0.0, "stable": true, "source": "calibration", "calibrated": "<date>", "image": "<ImageVersion>"}}}`,
+where `source` is `calibration` or `rolling` (see "Noise").
 A reader that meets a `schema` it does not know stops and draws nothing, rather than misreading the fields.
 
 ## Noise
@@ -157,10 +164,18 @@ A reader that meets a `schema` it does not know stops and draws nothing, rather 
   pair was last calibrated.
 - **The gate is re-checked over time,** because 10 parallel jobs measure the spread between machines at one moment,
   not drift over weeks. Calibration runs weekly on a schedule, on `workflow_dispatch`, and from `bench.yml` whenever a
-  runner reports an `ImageVersion` that `stability.json` has not seen. Between calibrations, the publish job computes
-  the coefficient of variation of each pair's last 10 points at unchanged Flux source. A pair whose rolling figure
-  exceeds 3% is demoted to `unstable` until the next calibration. Points at unchanged source are those whose commits
-  changed no file under `crates/`, `Cargo.toml` or `Cargo.lock` since the previous point.
+  runner reports an `ImageVersion` that `stability.json` has not seen.
+- **Between calibrations, a rolling check.** After each benchmark, the publish job looks at each `stable` pair's points
+  measured AFTER that pair's `calibrated` date, on the calibrated image version, at unchanged Flux source. Unchanged
+  source means the commit changed no file under `crates/`, `Cargo.toml` or `Cargo.lock` since the previous such point,
+  so a real change in Flux is never counted as noise.
+  - Fewer than 10 such points: no rolling verdict, and the calibration stands. On a busy branch this can last until the
+    next weekly calibration, which still re-checks the pair.
+  - At least 10 such points and their coefficient of variation above 3%: the pair is demoted to `unstable`, with
+    `source: "rolling"`.
+  - A demotion stands until the next calibration. A calibration always overwrites the pair, with
+    `source: "calibration"`, and the rolling check counts only points after it, so a demotion never outlives the
+    calibration that follows it.
 - **Cache.** Cold on Linux and macOS, warm on Windows; the page states which.
 - **Windows is charted apart.** A warm cache, and Defender's on-access scan if it is active on the runner, measure a
   different profile from a cold Linux or macOS copy. The two are never on one chart. The dry run records whether
@@ -177,14 +192,23 @@ A reader that meets a `schema` it does not know stops and draws nothing, rather 
   - **Measure jobs:** one per runner OS, with `contents: read`. Each uploads `result-<os>.json` as an artifact.
   - **Publish job:** the only job with `contents: write`. It runs after the measure jobs whether or not each succeeded
     (`if: always()`), and publishes the results that exist; a failed runner simply has no point for that commit. It
-    appends the results to `data.json`, redraws
-    `latest.svg`, and pushes to `bench-data`, rebasing and retrying if another push landed first. It runs under the
-    concurrency group `bench`, which queues runs and never cancels one. It pushes with the job's `GITHUB_TOKEN`, and
+    appends the results to `data.json`, runs the rolling check, redraws `latest.svg`, and pushes to `bench-data`. If
+    the push is rejected because another push landed first, it re-fetches `bench-data` and repeats the whole update
+    on the new contents, up to five times; it never asks git to merge the JSON files. It runs under the concurrency
+    group `bench`, which queues runs and never cancels one; the calibration workflow's publish job runs in the same
+    group, so the two never write `bench-data` at the same time. It pushes with the job's `GITHUB_TOKEN`, and
     GitHub starts no workflow run for a push made with that token. That matters: `ci.yml` runs on every branch
     (`branches: ["**"]`), and a CI run on `bench-data`, which holds no code, would fail. Branch protection covers only
     `main` (measured: no rulesets; `main` has 9 required checks), so the push to `bench-data` is not blocked.
-- **`latest.svg`** is drawn by the harness in Python: a small table-like image, one row per (runner, case, comparator)
-  that is `stable`, with the ratio, the commit and the date.
+- **`latest.svg`** is drawn by the harness in Python: a small table-like image of the latest run on `main`. It must say,
+  in the image itself:
+  - what the number is: "Flux time / comparator time. Below 1.0, Flux is faster";
+  - one block per runner OS, each headed with its OS, its cache (cold or warm) and, on Windows, Defender's state, so a
+    Windows row is never read against a Linux row;
+  - one row per (case, comparator) that is `stable`, with its ratio;
+  - "Not shown, too noisy to publish:" followed by the pairs that are `unstable` or `failed` in that run, so a missing
+    row is never read as Flux failing;
+  - "Latest benchmark of `main`", the commit's short sha and the run's date.
 - **The site:** `docs.yml` runs on its existing triggers and also on `workflow_run` of `bench.yml`. Before it uploads its
   Pages artifact, it asks whether `bench-data` exists (`git ls-remote --heads origin bench-data`). If it does not
   (before the first benchmark, or after the branch was deleted), the docs deploy without a `bench/` folder and the step
@@ -193,7 +217,9 @@ A reader that meets a `schema` it does not know stops and draws nothing, rather 
   Actions (`build_type: workflow`, measured), so a second deploying workflow would replace the docs, and a `gh-pages`
   branch would never be served.
 - **The trend page** reads `data.json` and `stability.json` and draws with Chart.js, loaded from a CDN at a pinned
-  version with a subresource-integrity hash. It shows only `stable` pairs, with the method stated at the top.
+  version with a subresource-integrity hash. It shows only `stable` pairs, with the method stated at the top. It carries
+  the same reading aids as the image: what the ratio means, Windows under its own heading, and a list of the pairs
+  not shown and why (`unstable` from calibration or from the rolling check, with the date).
 
 ## Failure behaviour
 
@@ -215,7 +241,9 @@ A reader that meets a `schema` it does not know stops and draws nothing, rather 
   - the exit-code rule;
   - the ratio and median arithmetic;
   - the coefficient of variation, the gate and the rolling demotion;
-  - the `data.json` replace-by-(`commit`, `os`) rule;
+  - `data.json` is append-only, and the page picks the latest run per (`commit`, `os`, image version);
+  - the rolling check: no verdict below 10 points, points before the calibration ignored, a calibration overriding a
+    demotion;
   - an unknown `schema`;
   - the image-version break;
   - the `latest.svg` content (stable rows only).
@@ -235,6 +263,6 @@ A reader that meets a `schema` it does not know stops and draws nothing, rather 
 - DISCARDED-BELOW-FLOOR (panel r1): a CDN outage leaves the trend page blank. The README's image is served by Pages,
   not the CDN, so the README is unaffected, and the page shows no numbers rather than wrong ones.
 - DISCARDED-BELOW-FLOOR (panel r1): the publish job racing itself. It runs in the concurrency group `bench`, which queues
-  runs, and its push rebases and retries.
+  runs, and a rejected push re-fetches and repeats the update.
 - REJECTED (panel r1): "Python 3.14 does not exist yet." Python 3.14 was released in October 2025, and
   `actions/setup-python` installs it.
