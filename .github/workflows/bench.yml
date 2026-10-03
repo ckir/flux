@@ -1,0 +1,54 @@
+name: Bench
+
+# Every push to main is measured on each runner and published to the data branch (spec "Where the data lives").
+#
+# DRY RUN (plan decision 2, removed by Task 9): a push to spec/bench-publish runs the tiny cases into bench-dry,
+# because workflow_dispatch reaches only workflows already on the default branch.
+on:
+  push:
+    branches: [main, spec/bench-publish]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    uses: ./.github/workflows/bench-measure.yml
+    with:
+      os: ${{ matrix.os }}
+      tiny: ${{ github.ref_name != 'main' }}
+      artifact: result-${{ matrix.os }}
+
+  publish:
+    name: Publish
+    needs: measure
+    # A failed runner has no point for this commit; the others still publish (spec "Failure behaviour").
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    # Shared with bench-calibrate.yml, so the two never write the data branch at once. Queued, never cancelled.
+    concurrency:
+      group: bench
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: result-*
+          path: results
+          merge-multiple: true
+      - name: Publish to the data branch
+        env:
+          DATA_BRANCH: ${{ github.ref_name == 'main' && 'bench-data' || 'bench-dry' }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash benches/publish/push.sh bench

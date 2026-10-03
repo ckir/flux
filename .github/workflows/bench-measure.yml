@@ -1,0 +1,56 @@
+name: Bench (measure)
+
+# One runner's measurement (spec "Measuring"), called by bench.yml and bench-calibrate.yml. It uploads one
+# result-<os>-<artifact>.json as the artifact named `artifact`.
+on:
+  workflow_call:
+    inputs:
+      os:
+        description: The runner label.
+        type: string
+        required: true
+      tiny:
+        description: Tiny cases, for the dry run only.
+        type: boolean
+        default: false
+      artifact:
+        description: The artifact's name, unique within the calling run.
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    name: Measure
+    runs-on: ${{ inputs.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Flux (release)
+        run: cargo build --release -p flux-cli
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Measure
+        shell: bash
+        env:
+          TINY: ${{ inputs.tiny }}
+          ARTIFACT: ${{ inputs.artifact }}
+        run: |
+          case "$RUNNER_OS" in
+            Linux) os=linux; flux=target/release/flux ;;
+            macOS) os=macos; flux=target/release/flux ;;
+            Windows) os=windows; flux=target/release/flux.exe ;;
+            *) echo "unknown runner OS $RUNNER_OS" >&2; exit 1 ;;
+          esac
+          args=(--os "$os" --flux "$flux" --work "$RUNNER_TEMP/bench" --out "result-$os-$ARTIFACT.json")
+          if [ "$TINY" = true ]; then args+=(--tiny); fi
+          python -u benches/publish/measure.py "${args[@]}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.artifact }}
+          path: result-*.json
+          if-no-files-found: error
