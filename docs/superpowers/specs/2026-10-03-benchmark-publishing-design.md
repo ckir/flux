@@ -106,8 +106,9 @@ tool's version.
   page until a later calibration passes. Calibration results are stored beside the data (`stability.json`), and the
   page shows when each pair was last calibrated.
 - **Cache.** Cold on Linux and macOS, warm on Windows; the page states which.
-- **Windows is charted apart.** A warm cache and Defender's on-access scan measure a different profile from a cold
-  Linux or macOS copy. The two are never on one chart.
+- **Windows is charted apart.** A warm cache, and Defender's on-access scan if it is active on the runner, measure a
+  different profile from a cold Linux or macOS copy. The two are never on one chart. The dry run records whether
+  Defender's real-time protection is on (`Get-MpComputerStatus`), and the page states it.
 - **Runner image changes.** A change of `ImageVersion` between two points is drawn as a break in the line. A new image
   can shift every ratio, and that shift is not a Flux regression.
 
@@ -120,7 +121,10 @@ tool's version.
   - **Measure jobs:** one per runner OS, with `contents: read`. Each uploads its results as an artifact.
   - **Publish job:** the only job with `contents: write`. It appends the results to `data.json`, redraws
     `latest.svg`, and pushes to `bench-data`, rebasing and retrying if another push landed first. It runs under the
-    concurrency group `bench`, which queues runs and never cancels one.
+    concurrency group `bench`, which queues runs and never cancels one. It pushes with the job's `GITHUB_TOKEN`, and
+    GitHub starts no workflow run for a push made with that token. That matters: `ci.yml` runs on every branch
+    (`branches: ["**"]`), and a CI run on `bench-data`, which holds no code, would fail. Branch protection covers only
+    `main` (measured: no rulesets; `main` has 9 required checks), so the push to `bench-data` is not blocked.
 - **`latest.svg`** is drawn by the harness in Python: a small table-like image, one row per (runner, case, comparator)
   that is `stable`, with the ratio, the commit and the date.
 - **The site:** `docs.yml` runs on its existing triggers and also on `workflow_run` of `bench.yml`. Before it uploads its
