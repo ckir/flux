@@ -1,4 +1,110 @@
 {
- "pairs": {},
+ "pairs": {
+  "linux/large/cp": {
+   "calibrated": "2026-10-03T11:02:51Z",
+   "cv": 0.0229,
+   "image": "20260927.320.1",
+   "source": "calibration",
+   "stable": true
+  },
+  "linux/large/rsync": {
+   "calibrated": "2026-10-03T11:02:51Z",
+   "cv": 0.0064,
+   "image": "20260927.320.1",
+   "source": "calibration",
+   "stable": true
+  },
+  "linux/mixed/cp": {
+   "calibrated": "2026-10-03T11:02:51Z",
+   "cv": 0.041,
+   "image": "20260927.320.1",
+   "source": "calibration",
+   "stable": false
+  },
+  "linux/mixed/rsync": {
+   "calibrated": "2026-10-03T11:02:51Z",
+   "cv": 0.0874,
+   "image": "20260927.320.1",
+   "source": "calibration",
+   "stable": false
+  },
+  "linux/small/cp": {
+   "calibrated": "2026-10-03T11:02:51Z",
+   "cv": 0.0829,
+   "image": "20260927.320.1",
+   "source": "calibration",
+   "stable": false
+  },
+  "linux/small/rsync": {
+   "calibrated": "2026-10-03T11:02:51Z",
+   "cv": 0.1168,
+   "image": "20260927.320.1",
+   "source": "calibration",
+   "stable": false
+  },
+  "macos/large/cp": {
+   "calibrated": "2026-10-03T11:02:51Z",
+   "cv": 0.241,
+   "image": "20260907.0351.1",
+   "source": "calibration",
+   "stable": false
+  },
+  "macos/large/rsync": {
+   "calibrated": "2026-10-03T11:02:51Z",
+   "cv": 0.1687,
+   "image": "20260907.0351.1",
+   "source": "calibration",
+   "stable": false
+  },
+  "macos/mixed/cp": {
+   "calibrated": "2026-10-03T11:02:51Z",
+   "cv": 0.1732,
+   "image": "20260907.0351.1",
+   "source": "calibration",
+   "stable": false
+  },
+  "macos/mixed/rsync": {
+   "calibrated": "2026-10-03T11:02:51Z",
+   "cv": 0.2067,
+   "image": "20260907.0351.1",
+   "source": "calibration",
+   "stable": false
+  },
+  "macos/small/cp": {
+   "calibrated": "2026-10-03T11:02:51Z",
+   "cv": 0.1459,
+   "image": "20260907.0351.1",
+   "source": "calibration",
+   "stable": false
+  },
+  "macos/small/rsync": {
+   "calibrated": "2026-10-03T11:02:51Z",
+   "cv": 0.0855,
+   "image": "20260907.0351.1",
+   "source": "calibration",
+   "stable": false
+  },
+  "windows/large/robocopy": {
+   "calibrated": "2026-10-03T11:02:51Z",
+   "cv": 0.0286,
+   "image": "20260925.250.1",
+   "source": "calibration",
+   "stable": true
+  },
+  "windows/mixed/robocopy": {
+   "calibrated": "2026-10-03T11:02:51Z",
+   "cv": 0.0525,
+   "image": "20260925.250.1",
+   "source": "calibration",
+   "stable": false
+  },
+  "windows/small/robocopy": {
+   "calibrated": "2026-10-03T11:02:51Z",
+   "cv": 0.0493,
+   "image": "20260925.250.1",
+   "source": "calibration",
+   "stable": false
+  }
+ },
  "schema": 1
 }
