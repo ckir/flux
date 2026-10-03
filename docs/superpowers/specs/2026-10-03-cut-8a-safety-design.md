@@ -58,7 +58,8 @@ unaffected"). So the probe is a new step of the `Place` trait (`run/place.rs`): 
 workspace, and the single-file place does nothing. `open_operation` retries when the lock it took over moves
 (`Overwritten::Restart`); the probe runs in the attempt whose record write succeeded, once per run.
 
-**What it does.** The run's section 99 guard runs before its first write, as before every destination mutation.
+**What it does.** The run's section 99 guard runs before its first write, as before every mutation the run makes
+under its lock.
 1. It stages a temporary in the operation's workspace.
 2. It publishes the temporary onto the fixed name `noreplace-probe` with `DirHandle::rename_no_replace`, the same
    primitive every tree file publishes with.
@@ -70,7 +71,7 @@ workspace, and the single-file place does nothing. `open_operation` retries when
 | Outcome | Result |
 |---|---|
 | The publish succeeds and the removal succeeds | The run continues. |
-| The publish fails as "primitive unavailable" (the same classification `primitive_unavailable` in `tree.rs` applies at `CopyStep::Publish`) | The run is refused with `NOREPLACE_PUBLISH_UNAVAILABLE`. It takes the existing "refused with nothing changed" rollback (`rollback`, `run/mod.rs`): the workspace, the lock record and lock, the control directories it emptied, and DEST if this run created it, are removed again. Exit 3 (section 55: created and removed again does not count as a change). The contract: the stop is a refusal carrying the code `NOREPLACE_PUBLISH_UNAVAILABLE`, with `changed: false`, and `not_removed` set when the probe's own file could not be removed (which makes it exit 1, as `RunError::Refused` already does for what a refusal could not remove). Today `RunError::Refused`'s `Refusal` carries only a lock code; whether that code widens or a sibling variant is added is the plan's choice. |
+| The publish fails as "primitive unavailable" (the same classification `primitive_unavailable` in `tree.rs` applies at `CopyStep::Publish`) | The run is refused with `NOREPLACE_PUBLISH_UNAVAILABLE`. It takes the existing "refused with nothing changed" rollback (`rollback`, `run/mod.rs`): the workspace, the lock record and lock, the control directories it emptied, and DEST if this run created it, are removed again. Exit 3 (section 55: created and removed again does not count as a change). The contract: the stop is a refusal carrying the code `NOREPLACE_PUBLISH_UNAVAILABLE`, with `changed: false` when everything was removed again (exit 3). When the probe's own file could not be removed, `not_removed` names it and `changed` is set to `true`, which exits 1: the pairing `give_back` in `run/session.rs` already uses for a lock it could not remove (`for_stop` reads only `changed`). Today `RunError::Refused`'s `Refusal` carries only a lock code; whether that code widens or a sibling variant is added is the plan's choice. |
 | The publish fails for any other reason | The run fails with that error, through the run's existing failure path. |
 | What the probe wrote (`noreplace-probe`, or the temporary) cannot be removed | A warning naming it. The file goes with the workspace when cleanup removes it. If the run is also being refused, it exits 1 instead of 3 (spec section 55); the report still names `NOREPLACE_PUBLISH_UNAVAILABLE` as the refusal, beside the warning, so the cause is not hidden behind the cleanup failure. |
 
@@ -115,7 +116,7 @@ different device number.
 - **`--safety strict`:** the subtree is refused as above.
 
 **The source-root check stays.** The walk's existing check that a destination directory is not the source root,
-by identity, keeps aborting the whole operation. It is a stronger statement than a mount point and is not changed.
+by identity, keeps aborting the whole operation. It is a stronger statement than a mount point, and what it checks is not changed; where it runs is.
 It runs FIRST: on a pre-existing directory, the source-root identity check comes before the mount-root query, so a
 destination mount that presents the source root itself still aborts the operation instead of becoming a skipped
 subtree (today that check runs only on a live frame, `tree.rs` walk loop, so the order has to be moved, not kept).
@@ -129,7 +130,8 @@ paths of two directories:
 - the destination anchor: DEST if it exists, otherwise DEST's parent.
 
 If the anchor equals the source root or lies inside it, compared component by component as `lexically_within`
-does, the run is refused with `SAFETY_REJECTED` before the lock is taken. This holds in every safety mode.
+does, the run is refused with `SAFETY_REJECTED` before the lock is taken. This holds in every safety mode. The check
+runs inside `locate_tree`, after its existing identity pre-flight (`preflight`) and before it returns.
 
 **How the paths are obtained.** From open handles, never by resolving the path a second time:
 
@@ -163,7 +165,9 @@ None new, and no new feature. Measured against the locked versions: `rustix` 1.1
 `flux-platform`, feature `fs`) has `statx` with `StatxAttributes::MOUNT_ROOT` and, on Apple targets,
 `rustix::fs::getpath` (`F_GETPATH`). `windows-sys` 0.61 with the workspace's `Win32_Storage_FileSystem` feature has
 `GetFinalPathNameByHandleW`. Linux's `/proc/self/fd/<n>` is read with `std::fs::read_link`; the identity re-check of a returned path uses
-`std::fs::symlink_metadata` (it does not follow a final link) and the existing identity mapping in `std_fs.rs`.
+the existing `FileSystem::metadata` (`crates/flux-platform/src/std_fs.rs`), which reads identity without following a
+final link on every platform: `symlink_metadata` on Unix, and on Windows a handle opened with
+`FILE_FLAG_OPEN_REPARSE_POINT` and read for `FILE_ID_INFO` (std's own `Metadata` carries no file id there).
 `GetFinalPathNameByHandleW` needs no access beyond what the directory handles already have: they are read for
 identity (`FILE_ID_INFO`) today.
 
@@ -248,6 +252,10 @@ Panel findings rejected, recorded so they are not raised again:
 - Round 3 (agy): "use `openat2` with `RESOLVE_BENEATH` instead of canonical paths". REJECTED: it confines a
   resolution to below a directory handle, which is not Part A's question (whether DEST's already-resolved location
   lies inside the SOURCE), and it exists only on Linux.
+
+- Round 4 (agy): "canonical string paths reintroduce check-then-use races". REJECTED: the paths come from the
+  handles the run then writes through and are identity-checked (Part A), the option agy itself proposed in the F3
+  negotiation; a path swapped afterwards changes nothing the run touches.
 
 ## Design record
 
