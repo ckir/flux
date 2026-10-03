@@ -51,6 +51,9 @@ pub enum CopyStep {
     Recheck,
     /// Step 7: the publishing rename.
     Publish,
+    /// Cut 7b: refreshing the destination lock's heartbeat (§101). Its failure stops the copy at that point, and a
+    /// tree's whole walk.
+    Heartbeat,
 }
 
 /// The engine's error: a filesystem failure, plus anything the ENGINE knows that the
@@ -126,6 +129,16 @@ pub type Guard<'g> = dyn Fn() -> flux_fs::Result<()> + 'g;
 
 /// The guard of a copy that holds no lock.
 pub(crate) fn unguarded() -> flux_fs::Result<()> {
+    Ok(())
+}
+
+/// §101's heartbeat (cut 7b): called before every guarded destination mutation and after every 64 KiB written. The run
+/// refreshes its lock record there once the interval has passed; its failure stops the copy at `CopyStep::Heartbeat`. A
+/// copy that holds no lock passes `&no_heartbeat`.
+pub type Heartbeat<'g> = dyn Fn() -> flux_fs::Result<()> + 'g;
+
+/// The heartbeat of a copy that holds no lock.
+pub(crate) fn no_heartbeat() -> flux_fs::Result<()> {
     Ok(())
 }
 
@@ -339,13 +352,14 @@ pub fn copy_file<F: DestinationRoot>(
 
 /// B1 (cut 7a Part 3b): `copy_file`'s checks that need no lock - Step 0, the source's type (Step 2) and the identity
 /// gate (Step 2a) - made by the run before it takes the destination's lock, so a refusal there creates nothing. The
-/// copy makes Steps 2 and 2a again under the lock. Returns DEST's parent, its path, and the target's name.
+/// copy makes Steps 2 and 2a again under the lock. Returns DEST's parent, its path, and the target's name, and the source's
+/// identity, for the single-file record (cut 7b).
 pub(crate) fn prepare_file<'d, F: DestinationRoot>(
     fs: &F,
     src: &Path,
     dst: &'d Path,
     opts: &CopyOptions,
-) -> std::result::Result<(F::Dir, &'d Path, &'d OsStr), CopyError> {
+) -> std::result::Result<(F::Dir, &'d Path, &'d OsStr, FileIdentity), CopyError> {
     if src == dst {
         return Err(CopyError::at(
             CopyStep::Resolve,
@@ -366,11 +380,11 @@ pub(crate) fn prepare_file<'d, F: DestinationRoot>(
         ));
     }
     identity_gate(&parent, name, &src_meta, opts.safety, opts.publish)?;
-    Ok((parent, parent_path, name))
+    Ok((parent, parent_path, name, src_meta.identity))
 }
 
 /// Copy `src` to `name` inside `parent`, writing ONLY through `parent`, holding no lock: `copy_file_guarded` with a
-/// guard that always passes.
+/// guard that always passes and no heartbeat.
 pub fn copy_file_at<F: DestinationRoot>(
     fs: &F,
     src: &Path,
@@ -378,7 +392,7 @@ pub fn copy_file_at<F: DestinationRoot>(
     name: &OsStr,
     opts: &CopyOptions,
 ) -> std::result::Result<Outcome, CopyError> {
-    copy_file_guarded(fs, src, parent, name, opts, &unguarded)
+    copy_file_guarded(fs, src, parent, name, opts, &unguarded, &no_heartbeat)
 }
 
 /// Copy `src` to `name` inside `parent`, writing ONLY through `parent`.
@@ -391,6 +405,10 @@ pub fn copy_file_at<F: DestinationRoot>(
 /// failed copy's removal of its temporary - which is §99's `S99_check` before each `S99_write` (cut 7a Part 3b). A
 /// failed guard stops the copy at that point: before the create it creates nothing, and at the publish or a removal
 /// the temporary stays, reported as `leftover`.
+///
+/// `beat` runs immediately before each of those guard calls except the removal's, and after every 64 KiB written (cut
+/// 7b). Its failure is `CopyStep::Heartbeat`: before the create it creates nothing; after it, the temporary is removed
+/// as for any other failure.
 pub fn copy_file_guarded<F: DestinationRoot>(
     fs: &F,
     src: &Path,
@@ -398,6 +416,7 @@ pub fn copy_file_guarded<F: DestinationRoot>(
     name: &OsStr,
     opts: &CopyOptions,
     guard: &Guard<'_>,
+    beat: &Heartbeat<'_>,
 ) -> std::result::Result<Outcome, CopyError> {
     let temp = temp_name(name, &opts.operation_id);
 
@@ -405,6 +424,7 @@ pub fn copy_file_guarded<F: DestinationRoot>(
     //    operation id is generated per invocation and never persisted, so nothing from
     //    an earlier run carries this name. It stays because §18.1 asks the id to be
     //    "deterministic enough for discovery", and a derivable id makes this live.
+    beat().map_err(|e| CopyError::at(CopyStep::Heartbeat, e))?;
     guard().map_err(|e| CopyError::at(CopyStep::Create, e))?;
     let _ = parent.remove_file(&temp);
 
@@ -428,6 +448,7 @@ pub fn copy_file_guarded<F: DestinationRoot>(
     // Still safe: if this FAILS, this call is precisely what did not create the
     // temporary, so there is nothing of ours on disk.
     // §99 before the temporary exists: a failure here has created nothing.
+    beat().map_err(|e| CopyError::at(CopyStep::Heartbeat, e))?;
     guard().map_err(|e| CopyError::at(CopyStep::Create, e))?;
     let mut writer = parent.create_new(&temp).map_err(|e| CopyError::at(CopyStep::Create, e))?;
 
@@ -446,6 +467,10 @@ pub fn copy_file_guarded<F: DestinationRoot>(
             return Err(discard(parent, &temp, CopyStep::Stream, copy_code(&e), e, guard));
         }
         bytes_copied += n as u64;
+        // §101 (cut 7b): the heartbeat, once per 64 KiB chunk.
+        if let Err(e) = beat() {
+            return Err(discard(parent, &temp, CopyStep::Heartbeat, e.code, e.source, guard));
+        }
     }
 
     // 5. durability
@@ -525,6 +550,9 @@ pub fn copy_file_guarded<F: DestinationRoot>(
 
     // §99 (`S99_check`, then the `S99_write` below): publish only while the lock is still this run's. Otherwise the
     // temporary stays - removing it would be a mutation too - and is reported as the leftover.
+    if let Err(e) = beat() {
+        return Err(discard(parent, &temp, CopyStep::Heartbeat, e.code, e.source, guard));
+    }
     if let Err(lost) = guard() {
         return Err(CopyError {
             leftover: Some((
@@ -534,6 +562,9 @@ pub fn copy_file_guarded<F: DestinationRoot>(
             ..CopyError::at(CopyStep::Publish, lost)
         });
     }
+    // Cut 7b: the object about to be published, read from its own handle - a rename keeps it - so the run records the
+    // target's identity without a look-up by name after the rename.
+    let published_identity = writer.identity().unwrap_or(FileIdentity::Unavailable);
     let published = match opts.publish {
         Publish::Replace => parent.rename_replace(&temp, parent, name),
         Publish::NoReplace => parent.rename_no_replace(&temp, parent, name),
@@ -547,7 +578,7 @@ pub fn copy_file_guarded<F: DestinationRoot>(
 
     // A successful rename consumed the temporary; there is nothing left to remove.
 
-    Ok(Outcome { bytes_copied, metadata_failures, identity_degraded })
+    Ok(Outcome { bytes_copied, metadata_failures, identity_degraded, published_identity })
 }
 
 #[cfg(test)]
@@ -1360,8 +1391,16 @@ mod tests {
         let fs = FaultFs::new();
         fs.write_file("/src", b"hello");
         let root = fs.destination_root(Path::new("/")).unwrap();
-        let e = copy_file_guarded(&fs, Path::new("/src"), &root, OsStr::new("dst"), &opts(), &lost)
-            .unwrap_err();
+        let e = copy_file_guarded(
+            &fs,
+            Path::new("/src"),
+            &root,
+            OsStr::new("dst"),
+            &opts(),
+            &lost,
+            &no_heartbeat,
+        )
+        .unwrap_err();
         assert_eq!((e.code(), e.step), (Code::TargetLockBusy, CopyStep::Create));
         assert!(!fs.called("remove_file") && !fs.called("create_new"), "{:?}", fs.calls());
         assert!(!fs.exists("/dst"));
@@ -1375,9 +1414,16 @@ mod tests {
         let calls = std::cell::Cell::new(0);
         // Owned for the step-1 sweep and the create (calls 1 and 2), lost at the publish (call 3).
         let guard = guard_failing_after(2, &calls);
-        let e =
-            copy_file_guarded(&fs, Path::new("/src"), &root, OsStr::new("dst"), &opts(), &guard)
-                .unwrap_err();
+        let e = copy_file_guarded(
+            &fs,
+            Path::new("/src"),
+            &root,
+            OsStr::new("dst"),
+            &opts(),
+            &guard,
+            &no_heartbeat,
+        )
+        .unwrap_err();
         assert_eq!((e.code(), e.step), (Code::TargetLockBusy, CopyStep::Publish));
         assert_eq!(calls.get(), 3);
         assert!(!fs.exists("/dst"), "never published");
@@ -1399,13 +1445,140 @@ mod tests {
         let calls = std::cell::Cell::new(0);
         // Owned for the sweep and the create; lost when the failed copy would remove its temporary (call 3).
         let guard = guard_failing_after(2, &calls);
-        let e =
-            copy_file_guarded(&fs, Path::new("/src"), &root, OsStr::new("dst"), &opts(), &guard)
-                .unwrap_err();
+        let e = copy_file_guarded(
+            &fs,
+            Path::new("/src"),
+            &root,
+            OsStr::new("dst"),
+            &opts(),
+            &guard,
+            &no_heartbeat,
+        )
+        .unwrap_err();
         assert_eq!(e.step, CopyStep::Stream);
         assert!(e.leftover.is_some(), "the kept temporary is reported");
         assert!(fs.exists("/dst.flux-partial.op1"));
         let removals = fs.calls().iter().filter(|c| c.starts_with("remove_file(")).count();
         assert_eq!(removals, 1, "only the step-1 sweep, never the discard: {:?}", fs.calls());
+    }
+
+    /// A heartbeat that counts its calls, and fails the `fail_at`-th and every one after (0: never).
+    fn beat_counting(
+        fail_at: u32,
+        calls: &std::cell::Cell<u32>,
+    ) -> impl Fn() -> flux_fs::Result<()> + '_ {
+        move || {
+            calls.set(calls.get() + 1);
+            if fail_at != 0 && calls.get() >= fail_at {
+                Err(FsError::new(Code::IoError, std::io::Error::other("beat")))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn the_copy_heartbeats_before_each_guarded_mutation_and_every_64_kib() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", &vec![7u8; 130 * 1024]);
+        let root = fs.destination_root(Path::new("/")).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let beat = beat_counting(0, &calls);
+        copy_file_guarded(
+            &fs,
+            Path::new("/src"),
+            &root,
+            OsStr::new("dst"),
+            &opts(),
+            &unguarded,
+            &beat,
+        )
+        .unwrap();
+        // The sweep, the create, three chunks (64 + 64 + 2 KiB), the publish.
+        assert_eq!(calls.get(), 6);
+    }
+
+    #[test]
+    fn a_heartbeat_failure_in_the_loop_removes_the_temporary_and_never_publishes() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", &vec![7u8; 130 * 1024]);
+        let root = fs.destination_root(Path::new("/")).unwrap();
+        let calls = std::cell::Cell::new(0);
+        // The sweep (1) and the create (2) pass; the first chunk's (3) fails.
+        let beat = beat_counting(3, &calls);
+        let e = copy_file_guarded(
+            &fs,
+            Path::new("/src"),
+            &root,
+            OsStr::new("dst"),
+            &opts(),
+            &unguarded,
+            &beat,
+        )
+        .unwrap_err();
+        assert_eq!((e.code(), e.step), (Code::IoError, CopyStep::Heartbeat));
+        assert_eq!(calls.get(), 3, "no heartbeat after the failed one");
+        // Mid-stream, before step 7: the source was stat'ed once (step 2), never re-checked.
+        let stats = fs.calls().iter().filter(|c| c.as_str() == "metadata(/src)").count();
+        assert_eq!(stats, 1, "{:?}", fs.calls());
+        assert!(
+            e.leftover.is_none() && !fs.exists("/dst.flux-partial.op1"),
+            "the temporary is removed"
+        );
+        assert!(!fs.exists("/dst") && !fs.called("rename_"), "{:?}", fs.calls());
+    }
+
+    #[test]
+    fn a_heartbeat_failure_before_the_create_creates_nothing() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        let root = fs.destination_root(Path::new("/")).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let beat = beat_counting(1, &calls);
+        let e = copy_file_guarded(
+            &fs,
+            Path::new("/src"),
+            &root,
+            OsStr::new("dst"),
+            &opts(),
+            &unguarded,
+            &beat,
+        )
+        .unwrap_err();
+        assert_eq!(e.step, CopyStep::Heartbeat);
+        assert!(!fs.called("remove_file") && !fs.called("create_new"), "{:?}", fs.calls());
+    }
+
+    #[test]
+    fn a_heartbeat_failure_at_the_publish_removes_the_temporary() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        let root = fs.destination_root(Path::new("/")).unwrap();
+        let calls = std::cell::Cell::new(0);
+        // The sweep (1), the create (2), one chunk (3); the publish's (4) fails.
+        let beat = beat_counting(4, &calls);
+        let e = copy_file_guarded(
+            &fs,
+            Path::new("/src"),
+            &root,
+            OsStr::new("dst"),
+            &opts(),
+            &unguarded,
+            &beat,
+        )
+        .unwrap_err();
+        assert_eq!(e.step, CopyStep::Heartbeat);
+        assert!(!fs.exists("/dst") && !fs.exists("/dst.flux-partial.op1"), "{:?}", fs.calls());
+    }
+
+    #[test]
+    fn a_copy_returns_its_published_targets_identity() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.write_file("/s", b"abc");
+        let parent = fs.destination_root(Path::new("/d")).unwrap();
+        let out = copy_file_at(&fs, Path::new("/s"), &parent, OsStr::new("t"), &opts()).unwrap();
+        assert_eq!(out.published_identity, fs.metadata(Path::new("/d/t")).unwrap().identity);
+        assert!(matches!(out.published_identity, FileIdentity::Strong(_)));
     }
 }

@@ -4,7 +4,7 @@ use super::*;
 use crate::copy::CopyStep;
 use crate::fault_fs::FaultFs;
 use crate::lock::LockCode;
-use crate::lock::record::{Decoded, decode};
+use crate::lock::record::{Decoded, LockRecord, decode};
 use crate::lock::test_support::{dead_lock, live_lock, record};
 use crate::state::{Kind, OperationState, UNREADABLE, decode as decode_state};
 use flux_fs::{
@@ -30,6 +30,8 @@ fn cfg() -> RunConfig {
         owner_instance_id: id(0xee),
         boot_session_id: "test-boot".to_string(),
         before_mutation: None,
+        // Plan decision 6: the existing tests never heartbeat.
+        heartbeat_interval: std::time::Duration::from_secs(3600),
     }
 }
 
@@ -105,7 +107,7 @@ fn prior(fs: &FaultFs, n: u8, s: OpState) {
     fs.create_dir(Path::new(&format!("/p/dest/.flux/operations/{}", id(n)))).unwrap();
     let state = OperationState {
         state: s,
-        ..OperationState::created(&id(n), Kind::Tree, Path::new("/p/dest"), 1)
+        ..OperationState::created_v1(&id(n), Kind::Tree, Path::new("/p/dest"), 1)
     };
     fs.write_file(format!("/p/dest/.flux/operations/{}/manifest", id(n)), &state.encode());
 }
@@ -279,6 +281,12 @@ fn a_temporary_the_copy_could_not_remove_keeps_the_completed_state() {
     assert_eq!(manifest(&fs, ID).state, OpState::Completed);
     assert!(fs.exists(format!("/p/dest/a.flux-partial.{ID}")));
     assert!(!fs.exists(LOCK), "the lock is still released");
+    let c = manifest(&fs, ID).cleanup.expect("version 2");
+    assert!(c.cleanup_pending);
+    assert_eq!(
+        c.cleanup_pending_artifacts,
+        vec![crate::state::native_hex(Path::new(&format!("a.flux-partial.{ID}")))]
+    );
 }
 
 #[test]
@@ -417,6 +425,36 @@ fn a_partial_restart_cannot_delete_keeps_its_prior_abandoned() {
         "{:?}",
         r.warnings
     );
+    let bytes = fs.read_file(format!("/p/dest/.flux/operations/{}/manifest", id(5))).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["format_version"], 1, "a version-1 prior is rewritten as version 1");
+    assert_eq!(v.as_object().unwrap().len(), 8, "with only its own eight keys");
+}
+
+#[test]
+fn a_version_2_prior_superseded_by_restart_stays_version_2() {
+    let fs = fake();
+    for d in ["/p/dest", "/p/dest/.flux", "/p/dest/.flux/operations"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    fs.create_dir(Path::new(&format!("/p/dest/.flux/operations/{}", id(5)))).unwrap();
+    let prior = OperationState {
+        state: OpState::Failed,
+        ..OperationState::created(&id(5), Kind::Tree, Path::new("/p/dest"), 1, None)
+    };
+    fs.write_file(format!("/p/dest/.flux/operations/{}/manifest", id(5)), &prior.encode());
+    let partial = format!("/p/dest/old.flux-partial.{}", id(5));
+    fs.write_file(&partial, b"half");
+    // As `a_partial_restart_cannot_delete_keeps_its_prior_abandoned`: the 3rd `remove_file` is the partial.
+    fs.fail_nth("remove_file", 3, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let (r, _) = run_tree(&fs, &restart());
+    ok(&r);
+    let kept = manifest(&fs, &id(5));
+    assert_eq!(
+        (kept.format_version, kept.state),
+        (crate::state::FORMAT_VERSION, OpState::Abandoned)
+    );
+    assert_eq!(kept.cleanup.map(|c| c.cleanup_pending), Some(false));
 }
 
 #[test]
@@ -456,7 +494,7 @@ fn run_file(fs: &FaultFs, c: &RunConfig) -> Run<Result<flux_fs::Outcome, CopyErr
 fn file_prior(fs: &FaultFs, n: u8) {
     let prior = OperationState {
         state: OpState::Failed,
-        ..OperationState::created(&id(n), Kind::File, Path::new("/p/t"), 1)
+        ..OperationState::created_v1(&id(n), Kind::File, Path::new("/p/t"), 1)
     };
     fs.write_file(record_path(&id(n)), &prior.encode());
 }
@@ -778,4 +816,517 @@ fn a_hook_that_never_returns_stops_the_copy_before_that_mutation() {
     assert_eq!(count.load(Ordering::SeqCst), 3);
     assert!(fs.exists(format!("/p/dest/a.flux-partial.{ID}")), "the temporary was made");
     assert!(!fs.exists("/p/dest/a"), "the publish did not happen");
+}
+
+fn file_record(fs: &FaultFs, id: &str) -> OperationState {
+    decode_state(&fs.read_file(record_path(id)).unwrap()).unwrap()
+}
+
+/// `create_new`: the CREATED record (1), TRANSFERRING (2), then the copy's temporary (3), whose write fails: the
+/// FAILED record stays, with every field the run wrote at creation.
+fn failed_file_run(fs: &FaultFs) -> OperationState {
+    fs.on_nth("create_new", 3, |fs| fs.fail_write(std::io::Error::other("injected write")));
+    let r = run_file(fs, &cfg());
+    assert!(matches!(&r.copy, Some(Err(e)) if e.step == CopyStep::Stream), "{:?}", r.copy);
+    file_record(fs, ID)
+}
+
+#[test]
+fn a_single_file_record_carries_section_249_1_from_its_creation() {
+    let fs = fake();
+    let s = failed_file_run(&fs);
+    let f = s.file.clone().expect("a version-2 single-file record");
+    assert_eq!(s.format_version, crate::state::FORMAT_VERSION);
+    assert_eq!(f.artifact_type, "state");
+    assert!(crate::ids::is_id(&f.attempt_id) && f.attempt_id != ID, "{}", f.attempt_id);
+    assert_eq!(f.artifact_generation, 1);
+    let src = fs.metadata(Path::new("/src/a")).unwrap().identity;
+    assert_eq!(f.source_identity, crate::state::identity_text(src));
+    assert_eq!(f.target_identity, None, "no object stood at /p/t");
+    assert_eq!(f.target_path_key, crate::lock::site::hex(b"t"));
+    assert_eq!(
+        (f.owner_instance_id.as_str(), f.boot_session_id.as_str()),
+        (id(0xee).as_str(), "test-boot")
+    );
+    assert_eq!(f.creation_wall_time, s.created_at);
+    assert_eq!(f.last_heartbeat_wall_time, s.created_at);
+    let other = fake();
+    assert_ne!(
+        failed_file_run(&other).file.unwrap().attempt_id,
+        f.attempt_id,
+        "one attempt id per run"
+    );
+}
+
+#[test]
+fn a_replaced_targets_identity_is_recorded_when_the_state_is_made() {
+    let fs = fake();
+    fs.write_file("/p/t", b"old");
+    let old = fs.metadata(Path::new("/p/t")).unwrap().identity;
+    let s = failed_file_run(&fs);
+    assert_eq!(s.file.unwrap().target_identity, Some(crate::state::identity_text(old)));
+}
+
+/// A clean tree run whose COMPLETED workspace cannot be retired, so its manifest stays to be read. `rename_no_replace`:
+/// the workspace (1), `a`'s and `sub/b`'s publishes (2, 3), then the retire (4), which fails.
+fn kept_tree_manifest(fs: &FaultFs) -> OperationState {
+    fs.fail_nth(
+        "rename_no_replace",
+        4,
+        Code::PermissionDenied,
+        std::io::ErrorKind::PermissionDenied,
+    );
+    let (r, _) = run_tree(fs, &cfg());
+    ok(&r);
+    manifest(fs, ID)
+}
+
+#[test]
+fn a_tree_manifest_is_version_2_with_cleanup_keys_and_no_file_fields() {
+    let fs = fake();
+    let s = kept_tree_manifest(&fs);
+    assert_eq!(s.format_version, crate::state::FORMAT_VERSION);
+    assert!(s.file.is_none());
+    assert!(s.cleanup.is_some());
+}
+
+#[test]
+fn the_single_file_record_and_its_lock_record_carry_one_time() {
+    let fs = fake();
+    // As `failed_file_run`, and the lock's own removal at the release fails, so the lock record stays to be read.
+    // `remove_file`: CREATED's and TRANSFERRING's temporaries (1, 2), the copy's step-1 sweep (3), the failed copy's
+    // temporary (4), FAILED's temporary (5), then the lock (6).
+    fs.fail_nth("remove_file", 6, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let s = failed_file_run(&fs);
+    let Decoded::Record(rec) = decode(&fs.read_file(T_LOCK).expect("the lock stays")) else {
+        panic!("a whole record")
+    };
+    let f = s.file.unwrap();
+    assert_eq!(f.creation_wall_time, rec.creation_wall_time.to_string());
+    assert_eq!(f.last_heartbeat_wall_time, rec.last_heartbeat_wall_time.to_string());
+}
+
+#[test]
+fn a_completed_record_says_cleanup_pending_and_names_its_target_before_anything_is_removed() {
+    let fs = fake();
+    // `remove_file`: CREATED and TRANSFERRING clear their temporaries (1, 2), the copy's step-1 sweep (3), COMPLETED
+    // (4), then the record itself (5), which fails: the COMPLETED record stays, as a crash there would leave it.
+    fs.fail_nth("remove_file", 5, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let r = run_file(&fs, &cfg());
+    assert!(matches!(r.copy, Some(Ok(_))), "{:?}", r.copy);
+    let s = file_record(&fs, ID);
+    assert_eq!(s.state, OpState::Completed);
+    let c = s.cleanup.expect("version 2");
+    assert!(c.cleanup_pending && c.cleanup_pending_artifacts.is_empty(), "{c:?}");
+    let published = fs.metadata(Path::new("/p/t")).unwrap().identity;
+    assert_eq!(s.file.unwrap().target_identity, Some(crate::state::identity_text(published)));
+}
+
+#[test]
+fn a_failed_completed_write_leaves_a_failed_record_the_next_run_can_read() {
+    let fs = fake();
+    // `rename_replace`: CREATED (1), TRANSFERRING (2), the publish (3), then COMPLETED (4), which fails; the FAILED
+    // write after it (5) succeeds. The record must not carry the COMPLETED write's `cleanup_pending` (capstone r4).
+    fs.fail_nth("rename_replace", 4, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let r = run_file(&fs, &cfg());
+    assert!(matches!(&r.stop, Some(RunError::Failed { step: RunStep::State, .. })), "{:?}", r.stop);
+    let s = decode_state(&fs.read_file(record_path(ID)).unwrap())
+        .expect("a record the next run can read");
+    assert_eq!(s.state, OpState::Failed);
+    assert_eq!(s.cleanup.map(|c| c.cleanup_pending), Some(false));
+}
+
+#[test]
+fn an_existing_target_that_cannot_be_read_is_recorded_unavailable_not_absent() {
+    let fs = fake();
+    fs.write_file("/p/t", b"old");
+    // `metadata`: the source (1), the target's identity gate (2), the lock's two checks (3, 4), then the record's
+    // read of the existing target under the lock (5), which fails with something other than NotFound.
+    fs.fail_nth("metadata", 5, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let s = failed_file_run(&fs);
+    assert_eq!(s.file.unwrap().target_identity.as_deref(), Some("unavailable"));
+}
+
+#[test]
+fn a_version_2_single_file_prior_superseded_by_restart_keeps_its_fields() {
+    let fs = fake();
+    let fields = crate::state::FileFields {
+        artifact_type: crate::state::ARTIFACT_STATE.to_string(),
+        attempt_id: id(7),
+        artifact_generation: 1,
+        source_identity: "strong:1:2".to_string(),
+        target_identity: None,
+        target_path_key: crate::lock::site::hex(b"t"),
+        owner_instance_id: id(8),
+        boot_session_id: "boot".to_string(),
+        creation_wall_time: "1".to_string(),
+        last_heartbeat_wall_time: "1".to_string(),
+    };
+    let prior = OperationState {
+        state: OpState::Failed,
+        ..OperationState::created(&id(5), Kind::File, Path::new("/p/t"), 1, Some(fields.clone()))
+    };
+    fs.write_file(record_path(&id(5)), &prior.encode());
+    fs.write_file(format!("/p/t.flux-partial.{}", id(5)), b"half");
+    // `remove_file`: this run's CREATED write (1), the prior's ABANDONED write (2), then the prior's partial (3), which
+    // fails, so the ABANDONED record stays as the partial's record (J1).
+    fs.fail_nth("remove_file", 3, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let r = run_file(&fs, &restart());
+    assert!(matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+    let kept = file_record(&fs, &id(5));
+    assert_eq!((kept.state, kept.superseded_by.as_deref()), (OpState::Abandoned, Some(ID)));
+    assert_eq!(kept.file, Some(fields), "superseding keeps the prior's §249.1 fields");
+}
+
+#[test]
+fn a_leftover_inside_a_folder_is_listed_by_its_path_below_dest() {
+    let fs = fake();
+    // `sub/b`'s copy fails while streaming: `create_new` is the manifest (1), TRANSFERRING (2), `a`'s temporary (3),
+    // `sub/b`'s (4). Removing it fails too: `remove_file` is the two state writes (1, 2), `a`'s sweep (3), `sub/b`'s
+    // sweep (4), then `sub/b`'s temporary (5).
+    fs.on_nth("create_new", 4, |fs| fs.fail_write(std::io::Error::other("injected write")));
+    fs.fail_nth("remove_file", 5, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let (r, got) = run_tree(&fs, &cfg());
+    ok(&r);
+    assert_eq!(got.len(), 1, "{got:?}");
+    let c = manifest(&fs, ID).cleanup.expect("version 2");
+    let leftover = Path::new("sub").join(format!("b.flux-partial.{ID}"));
+    assert_eq!(c.cleanup_pending_artifacts, vec![crate::state::native_hex(&leftover)]);
+}
+
+#[test]
+fn a_published_target_whose_identity_cannot_be_read_is_recorded_unavailable() {
+    let fs = fake();
+    fs.fail("handle_identity", Code::IoError);
+    // As `a_completed_record_says_cleanup_pending_and_names_its_target_before_anything_is_removed`: the record's own
+    // removal (the 5th `remove_file`) fails, so the COMPLETED record stays to be read.
+    fs.fail_nth("remove_file", 5, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let r = run_file(&fs, &cfg());
+    assert!(matches!(r.copy, Some(Ok(_))), "{:?}", r.copy);
+    let s = file_record(&fs, ID);
+    assert_eq!(s.state, OpState::Completed);
+    assert_eq!(s.file.unwrap().target_identity.as_deref(), Some("unavailable"));
+}
+
+#[test]
+fn a_clean_trees_completed_manifest_says_cleanup_pending_with_an_empty_list() {
+    let fs = fake();
+    let s = kept_tree_manifest(&fs);
+    assert_eq!(s.state, OpState::Completed);
+    let c = s.cleanup.expect("version 2");
+    assert!(c.cleanup_pending && c.cleanup_pending_artifacts.is_empty(), "{c:?}");
+}
+
+// Cut 7b Part 2: the heartbeat.
+
+/// Every heartbeat due at once.
+fn beating() -> RunConfig {
+    RunConfig { heartbeat_interval: std::time::Duration::ZERO, ..cfg() }
+}
+
+fn lock_record(bytes: &[u8]) -> LockRecord {
+    match decode(bytes) {
+        Decoded::Record(r) => r,
+        other => panic!("expected a record, got {other:?}"),
+    }
+}
+
+fn count(calls: &[String], prefix: &str) -> usize {
+    calls.iter().filter(|c| c.starts_with(prefix)).count()
+}
+
+/// Calls 1 (this run's record) and on succeed; the `nth` and the `nth + 1` `write_at_start` fail - a heartbeat and its
+/// retry. With `tear`, the lock's bytes are torn just before the first of them.
+fn fail_heartbeat(fs: &FaultFs, nth: u32, lock: &'static str, tear: bool) {
+    fs.on_nth("write_at_start", nth, move |fs| {
+        if tear {
+            fs.write_file(lock, b"torn");
+        }
+        fs.fail("write_at_start", Code::IoError);
+    });
+    fs.fail_nth("write_at_start", nth, Code::IoError, std::io::ErrorKind::Other);
+}
+
+fn file_error(r: &Run<Result<flux_fs::Outcome, CopyError>>) -> &CopyError {
+    match &r.copy {
+        Some(Err(e)) => e,
+        other => panic!("expected a failed copy, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_heartbeat_refreshes_the_lock_record_keeping_its_owner_and_never_flushes() {
+    let fs = fake();
+    let seen = Arc::new(Mutex::new(None));
+    let keep = Arc::clone(&seen);
+    // `rename_replace`: CREATED (1), TRANSFERRING (2), the publish (3), after the copy's heartbeats.
+    fs.on_nth("rename_replace", 3, move |fs| *keep.lock().unwrap() = fs.read_file(T_LOCK));
+    let r = run_file(&fs, &beating());
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+    let during = lock_record(&seen.lock().unwrap().clone().expect("the lock, read at the publish"));
+    assert!(
+        during.last_heartbeat_wall_time > during.creation_wall_time,
+        "the heartbeat moved: {during:?}"
+    );
+    assert_eq!((during.operation_id.as_str(), during.owner_instance_id), (ID, id(0xee)));
+    assert_eq!(during.workspace_path, format!("adjacent/{ID}"));
+    let c = calls(&fs);
+    assert!(count(&c, "write_at_start(") > 2, "heartbeats were written: {c:?}");
+    assert_eq!(count(&c, "lock_sync_all("), 2, "only the record and Q-K flush: {c:?}");
+}
+
+#[test]
+fn a_heartbeat_waits_for_its_interval() {
+    let fs = fake();
+    let r = run_file(&fs, &cfg());
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?}", r.stop);
+    assert_eq!(count(&calls(&fs), "write_at_start("), 2, "the record and Q-K, no heartbeat");
+}
+
+#[test]
+fn a_failed_heartbeat_write_is_retried_once() {
+    let fs = fake();
+    // The first heartbeat (write 2) fails; its retry (write 3) succeeds.
+    fs.fail_nth("write_at_start", 2, Code::IoError, std::io::ErrorKind::Other);
+    let r = run_file(&fs, &beating());
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+    assert!(!fs.exists(T_LOCK) && !fs.exists(record_path(ID)), "a clean run");
+}
+
+#[test]
+fn two_failed_heartbeat_writes_stop_the_copy_naming_the_lock_and_the_run_records_failed() {
+    let fs = fake();
+    fail_heartbeat(&fs, 2, T_LOCK, false);
+    let r = run_file(&fs, &beating());
+    let e = file_error(&r);
+    assert_eq!((e.step, e.code()), (CopyStep::Heartbeat, Code::IoError));
+    let message = e.cause.source.to_string().replace('\\', "/");
+    assert!(message.contains(T_LOCK), "names the lock: {message}");
+    assert!(r.stop.is_none(), "one error for it: {:?}", r.stop);
+    assert_eq!(file_record(&fs, ID).state, OpState::Failed, "the record was intact");
+    assert!(!fs.exists(T_LOCK), "released");
+    assert!(!fs.exists("/p/t"), "never published");
+}
+
+#[test]
+fn a_torn_heartbeat_is_that_failure_never_a_lost_lock() {
+    let fs = fake();
+    fail_heartbeat(&fs, 2, T_LOCK, true);
+    let r = run_file(&fs, &beating());
+    let e = file_error(&r);
+    assert_eq!((e.step, e.code()), (CopyStep::Heartbeat, Code::IoError));
+    assert!(r.stop.is_none(), "no stop of the finish's own, no TARGET_LOCK_BUSY: {:?}", r.stop);
+    assert_eq!(
+        file_record(&fs, ID).state,
+        OpState::Transferring,
+        "nothing written without proof of ownership"
+    );
+    assert_eq!(fs.read_file(T_LOCK).as_deref(), Some(&b"torn"[..]), "closed without unlinking");
+}
+
+#[test]
+fn a_temporary_kept_after_a_torn_heartbeat_names_the_heartbeat_not_another_run() {
+    let fs = fake();
+    // Writes: the record (1), then the sweep's (2), the create's (3) and the chunk's (4) heartbeats; the publish's (5)
+    // and its retry (6) fail, the record torn.
+    fail_heartbeat(&fs, 5, T_LOCK, true);
+    let r = run_file(&fs, &beating());
+    let e = file_error(&r);
+    assert_eq!(e.step, CopyStep::Heartbeat);
+    let (left, why) =
+        e.leftover.as_ref().expect("the temporary stays: the guard fails on the torn record");
+    assert!(left.to_string_lossy().contains("t.flux-partial."), "{left:?}");
+    let why = why.to_string();
+    assert!(why.contains("heartbeat") && !why.contains("another run"), "{why}");
+    assert!(fs.exists(format!("/p/t.flux-partial.{ID}")));
+}
+
+#[test]
+fn a_tree_stops_at_a_failed_heartbeat_and_records_failed() {
+    let fs = fake();
+    fail_heartbeat(&fs, 2, LOCK, false);
+    let (r, got) = run_tree(&fs, &beating());
+    let a = aborted(&r);
+    assert_eq!((a.error.step, a.error.code()), (CopyStep::Heartbeat, Code::IoError));
+    assert!(got.is_empty(), "an abort, never a file's failure: {got:?}");
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert_eq!(manifest(&fs, ID).state, OpState::Failed);
+    assert!(!fs.exists(LOCK), "released");
+    assert!(!fs.exists("/p/dest/a"));
+}
+
+/// The first heartbeat (write 2) and its retry (write 3) fail with `code`.
+fn fail_heartbeat_with(fs: &FaultFs, code: Code) {
+    fs.on_nth("write_at_start", 2, move |fs| fs.fail("write_at_start", code));
+    fs.fail_nth("write_at_start", 2, code, std::io::ErrorKind::Other);
+}
+
+#[test]
+fn a_failed_heartbeat_fails_the_copy_whatever_its_code() {
+    let fs = fake();
+    // From the copy itself, SAFETY_REJECTED with no leftover is a refusal that changed nothing (Q-I's rollback).
+    fail_heartbeat_with(&fs, Code::SafetyRejected);
+    let r = run_file(&fs, &beating());
+    let e = file_error(&r);
+    assert_eq!((e.step, e.code()), (CopyStep::Heartbeat, Code::SafetyRejected), "the code is kept");
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert_eq!(file_record(&fs, ID).state, OpState::Failed, "recorded FAILED, never rolled back");
+}
+
+#[test]
+fn a_tree_whose_heartbeat_fails_is_failed_whatever_its_code() {
+    let fs = fake();
+    // Nothing is copied before the first heartbeat, so from the copy itself this abort would be a refusal that
+    // changed nothing (`TreeAbort::refused_unchanged`), rolled back.
+    fail_heartbeat_with(&fs, Code::SafetyRejected);
+    let (r, _) = run_tree(&fs, &beating());
+    let a = aborted(&r);
+    assert_eq!((a.error.step, a.error.code()), (CopyStep::Heartbeat, Code::SafetyRejected));
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert_eq!(manifest(&fs, ID).state, OpState::Failed, "recorded FAILED, never rolled back");
+}
+
+#[test]
+fn a_heartbeat_failure_is_never_reported_as_target_lock_busy() {
+    let fs = fake();
+    fail_heartbeat_with(&fs, Code::TargetLockBusy);
+    let r = run_file(&fs, &beating());
+    let e = file_error(&r);
+    assert_eq!((e.step, e.code()), (CopyStep::Heartbeat, Code::IoError));
+    assert_eq!(file_record(&fs, ID).state, OpState::Failed, "a failure, not a lost lock");
+}
+
+#[test]
+fn the_finish_never_heartbeats() {
+    let fs = fake();
+    let r = run_file(&fs, &beating());
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?}", r.stop);
+    let c = calls(&fs);
+    let publish = at(&c, &format!("rename_replace(/p/t.flux-partial.{ID}"));
+    let after = &c[publish..];
+    assert_eq!(
+        (count(after, "write_at_start("), count(after, "lock_sync_all(")),
+        (1, 1),
+        "after the publish only Q-K writes the record: {after:?}"
+    );
+}
+
+#[test]
+fn restart_heartbeats_during_its_sweep_before_the_copy() {
+    let fs = fake();
+    prior(&fs, 5, OpState::Failed);
+    let partial = format!("/p/dest/old.flux-partial.{}", id(5));
+    fs.write_file(&partial, b"half");
+    let (r, _) =
+        run_tree(&fs, &RunConfig { heartbeat_interval: std::time::Duration::ZERO, ..restart() });
+    ok(&r);
+    let c = calls(&fs);
+    let before = &c[..at(&c, &format!("remove_file({partial})"))];
+    // The record (1), then the heartbeats before the ABANDONED write and before the partial's deletion.
+    assert_eq!(count(before, "write_at_start("), 3, "{before:?}");
+    assert_eq!(count(before, "lock_sync_all("), 1, "only the record flushes: {before:?}");
+}
+
+#[test]
+fn a_failed_heartbeat_during_restart_stops_the_run_at_the_lock_step_and_copies_nothing() {
+    let fs = fake();
+    prior(&fs, 5, OpState::Failed);
+    let partial = format!("/p/dest/old.flux-partial.{}", id(5));
+    fs.write_file(&partial, b"half");
+    // The first heartbeat, before the ABANDONED write, and its retry.
+    fail_heartbeat(&fs, 2, LOCK, false);
+    let (r, _) =
+        run_tree(&fs, &RunConfig { heartbeat_interval: std::time::Duration::ZERO, ..restart() });
+    assert_eq!(failed_at(&r.stop), (RunStep::Lock, LOCK.to_string()));
+    assert!(r.copy.is_none(), "no copy runs");
+    assert!(r.warnings.is_empty(), "one error for it: {:?}", r.warnings);
+    assert_eq!(manifest(&fs, &id(5)).state, OpState::Failed, "the prior is untouched");
+    assert!(fs.exists(&partial));
+    assert_eq!(manifest(&fs, ID).state, OpState::Failed, "the record was intact");
+    assert!(!fs.exists(LOCK), "released");
+}
+
+// Cut 7b Part 2 test audit: each test below was red under the mutant named in its comment.
+
+#[test]
+fn restart_heartbeats_and_checks_ownership_before_removing_a_superseded_state() {
+    // Mutant: delete `checked(locked)?` in `supersede`'s removal loop (restart.rs).
+    let fs = fake();
+    prior(&fs, 5, OpState::Failed);
+    let partial = format!("/p/dest/old.flux-partial.{}", id(5));
+    fs.write_file(&partial, b"half");
+    // Writes: the record (1), the heartbeats before the ABANDONED write (2) and the partial's deletion (3); the one
+    // before the prior's state is removed (4) fails, and its retry.
+    fail_heartbeat(&fs, 4, LOCK, false);
+    let (r, _) =
+        run_tree(&fs, &RunConfig { heartbeat_interval: std::time::Duration::ZERO, ..restart() });
+    assert_eq!(failed_at(&r.stop), (RunStep::Lock, LOCK.to_string()));
+    assert!(!fs.exists(&partial), "the sweep ran");
+    assert_eq!(
+        manifest(&fs, &id(5)).state,
+        OpState::Abandoned,
+        "the prior's state was not removed"
+    );
+}
+
+#[test]
+fn restart_stops_before_removing_a_superseded_state_once_ownership_is_lost() {
+    // Mutant: delete `checked(locked)?` in `supersede`'s removal loop (restart.rs).
+    let fs = fake();
+    prior(&fs, 5, OpState::Failed);
+    let partial = format!("/p/dest/old.flux-partial.{}", id(5));
+    fs.write_file(&partial, b"half");
+    // `remove_file`: this run's CREATED and the prior's ABANDONED state writes clear their temporaries (1, 2); then
+    // the partial (3). Just before it, the lock is taken over, so the next check is the removal loop's.
+    fs.on_nth("remove_file", 3, |fs| fs.write_file(LOCK, b"another run's bytes"));
+    let (r, _) = run_tree(&fs, &restart());
+    assert_eq!(refused(&r.stop), (LockCode::TargetLockBusy, true));
+    assert_eq!(
+        manifest(&fs, &id(5)).state,
+        OpState::Abandoned,
+        "the prior's state was not removed"
+    );
+}
+
+#[test]
+fn a_heartbeat_restarts_its_interval() {
+    // Mutant: delete `self.last.set(Instant::now());` in `Pulse::beat` (session.rs).
+    let fs = fake();
+    let first = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&first);
+    // The single file's heartbeats come before its sweep, its create, its one chunk and its publish. The hook runs at
+    // the sweep's guard and waits out the interval, so the create's heartbeat is due and the two after it are not.
+    let hook: BeforeMutation = Arc::new(move || {
+        if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+        }
+    });
+    let c = RunConfig {
+        heartbeat_interval: std::time::Duration::from_secs(1),
+        before_mutation: Some(hook),
+        ..cfg()
+    };
+    let r = run_file(&fs, &c);
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+    assert_eq!(
+        count(&calls(&fs), "write_at_start("),
+        3,
+        "the record, one heartbeat, and Q-K: {:?}",
+        calls(&fs)
+    );
+}
+
+#[test]
+fn a_heartbeat_failure_message_names_the_lock() {
+    // Mutant: change the wording `beat_error` builds (session.rs). The operator reads this line; it must say what
+    // failed.
+    let fs = fake();
+    fail_heartbeat(&fs, 2, T_LOCK, false);
+    let r = run_file(&fs, &beating());
+    let message = file_error(&r).to_string().replace('\\', "/");
+    assert!(
+        message.contains(&format!("the heartbeat could not refresh the lock record {T_LOCK}: ")),
+        "{message}"
+    );
+    assert!(message.starts_with("IO_ERROR: "), "{message}");
 }

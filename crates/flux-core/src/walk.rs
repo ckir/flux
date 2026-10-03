@@ -759,6 +759,9 @@ mod tests {
         fn sync_all(&self) -> Result<()> {
             Ok(())
         }
+        fn identity(&self) -> Result<flux_fs::FileIdentity> {
+            Ok(flux_fs::FileIdentity::Unavailable)
+        }
     }
 
     struct EscapingFs;

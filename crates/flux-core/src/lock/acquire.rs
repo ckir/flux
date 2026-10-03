@@ -86,6 +86,7 @@ pub(crate) fn own_lock<'a, D: DirHandle>(
         lock,
         identity,
         record: None,
+        beat: std::cell::Cell::new(None),
     }))
 }
 

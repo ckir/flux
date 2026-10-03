@@ -88,6 +88,9 @@ pub struct Outcome {
     /// `id.volume`, `Unavailable` names nothing. `None` on the normal path AND when the
     /// destination did not exist, which is not a degradation.
     pub identity_degraded: Option<crate::FileIdentity>,
+    /// The published target's identity, read from the temporary's own handle just before the publishing rename (a
+    /// rename keeps the object; cut 7b). `Unavailable` where the platform cannot say.
+    pub published_identity: crate::FileIdentity,
 }
 
 /// `<target>.flux-partial.<operation-id>`, in the target's directory (§18.1, normative).
@@ -112,8 +115,12 @@ mod tests {
 
     #[test]
     fn a_clean_outcome_has_no_metadata_failures() {
-        let o =
-            Outcome { bytes_copied: 10, metadata_failures: Vec::new(), identity_degraded: None };
+        let o = Outcome {
+            bytes_copied: 10,
+            metadata_failures: Vec::new(),
+            identity_degraded: None,
+            published_identity: crate::FileIdentity::Unavailable,
+        };
         assert!(o.metadata_failures.is_empty());
         assert_eq!(o.bytes_copied, 10);
     }

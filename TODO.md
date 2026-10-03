@@ -523,6 +523,55 @@ stated so the next audit starts from a prediction rather than a hunt.
       coverage node (measured: no node for `FsModel.tla:312-318` in any extended host-crash log), and no state
       predicate separates a torn crash from a crash in the middle of a write (cut 6, item 6).
 
+## Performance (preliminary speed probe, 2026-10-02)
+
+Measured at cut 7b Part 1 (`f755c50`, release build) against robocopy and FastCopy 5.12.0 (`fcp.exe`). Method:
+- C: (NTFS, not the ReFS Dev Drive, where Windows' own copy can clone blocks);
+- every copy checked for file count and bytes;
+- tool order rotated so each tool went first once per case;
+- the figures are the three runs where the tool was NOT first.
+
+Running first costs every tool extra time, apparently because Defender's on-access scan is paid by whoever touches a file first. An earlier probe that always ran Flux first overstated the small-file gap at 7x.
+
+Uncontrolled: Defender real-time protection was on for every tool, with about 24% background CPU on a 4-core machine.
+
+| Case | Flux | robocopy | robocopy `/MT:8` | FastCopy |
+|---|---|---|---|---|
+| 1 x 4 GiB | 31.1-34.1 s (~126 MiB/s) | 14.7-17.6 s | 20.2-21.5 s | 28.2-30.7 s |
+| 10,000 x 4 KiB | 9.2 ms/file | 3.1-3.3 ms/file | 1.1-1.2 ms/file | 7.1-7.4 ms/file |
+| 2,000 files, 10.5 GiB | 93.5-95.8 s (~112 MiB/s) | 56.4-57.7 s | 65.5-66.0 s | 79.4-88.0 s |
+
+The lock costs little. A pre-7a build (`5fe1f62`, no lock) copied the 10,000 files at 8.4-8.5 ms/file against 8.9-9.3 for the locked build, about 5-10%.
+
+- [ ] **Large-file throughput: Flux is ~2.1x slower than robocopy on one 4 GiB file.** The copy streams through a
+      64 KiB user-space read/write loop (`crates/flux-core/src/copy.rs`, step 4). Unverified candidates:
+      - a larger buffer;
+      - `CopyFileEx` / `copy_file_range` / reflink fast paths;
+      - unbuffered I/O for large files, as FastCopy does from 64 MiB.
+
+      Measure before choosing.
+- [ ] **Small-file throughput: Flux is ~2.8x slower than robocopy and ~8x slower than robocopy `/MT:8`.** Flux
+      copies one file at a time. `/MT:8` shows that copying several files at once is the largest lever. The per-file
+      work also counts: three ownership checks, each a stat plus a 4 KiB read of the lock, the temporary-then-rename
+      publish, and extra source stats.
+
+      Profile one run, for example with Windows Performance Recorder, before choosing.
+- [ ] **Re-probe after each change, with the order rotated.** Single runs and a fixed tool order are not
+      measurements here (see the first-toucher effect above).
+
+## Deferred from cut 7b
+
+Each is deferred to the cut that first reads it (cut 7b spec, `docs/superpowers/specs/2026-10-02-cut-7b-state-v2-and-heartbeat-design.md`, Scope).
+
+- [ ] **`configuration_fingerprint` (§19, §121)** - cut 9: read only by resume; most §121 options do not exist yet.
+- [ ] **Checkpoints and `last_checkpoint` (§19, §139, §148, §164)** - cuts 8/9: the spec defines them only through
+      the WAL and `state.db` (§119's layout).
+- [ ] **`roots` (§19, §18.3)** - cut 10: one root until several sources exist.
+- [ ] **`last_heartbeat_monotonic` (§229.2)** - cut 9: "diagnostic/current-session data only".
+- [ ] **Finishing a prior run's `cleanup_pending` (§21.1 "may", §218)** - cut 9: a COMPLETED prior with
+      `cleanup_pending = true` and its artifact list is proceeded past and left.
+- [ ] **Stale classification from heartbeat age (§102)** - cut 9.
+
 ## Closed
 
 Triaged 2026-09-22. Kept here rather than deleted: the evidence for a closure belongs where the

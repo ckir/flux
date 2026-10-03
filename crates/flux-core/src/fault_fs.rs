@@ -326,6 +326,19 @@ impl FileHandle for FakeHandle {
         }
         Ok(())
     }
+
+    fn identity(&self) -> Result<flux_fs::FileIdentity> {
+        // The object at the handle's path: a writer's path is its temporary's until the rename, and `move_object`
+        // carries the identity across it, so the copy reads this before publishing (cut 7b Part 1 decision 5).
+        let Some(sink) = &self.sink else { return Ok(flux_fs::FileIdentity::Unavailable) };
+        let mut g = sink.lock().unwrap();
+        // `fail("handle_identity", ..)`: one injected failure of this read (cut 7b Part 1 test audit, G4). Its own name:
+        // a directory handle's `identity` is a different read.
+        if let Some(code) = g.faults.remove("handle_identity") {
+            return Err(FsError::new(code, std::io::Error::other("injected")));
+        }
+        Ok(g.identities.get(&self.path).copied().unwrap_or(flux_fs::FileIdentity::Unavailable))
+    }
 }
 
 /// A lock file in the fake. It addresses its OBJECT (by identity), so a rename carries it.
@@ -1351,6 +1364,7 @@ impl DirHandle for FakeDirHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flux_fs::FileIdentity;
 
     #[test]
     fn it_records_the_order_of_calls() {
@@ -2090,5 +2104,18 @@ mod tests {
         assert!(!fs.exists("/p/x.flux-lock"));
         drop(d.create_lock(name).unwrap());
         drop(held);
+    }
+
+    #[test]
+    fn a_fake_writers_identity_is_its_objects_and_a_rename_carries_it() {
+        use flux_fs::{DestinationRoot, DirHandle, FileHandle};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/p")).unwrap();
+        let p = fs.destination_root(Path::new("/p")).unwrap();
+        let w = p.create_new(OsStr::new("t.tmp")).unwrap();
+        let held = w.identity().unwrap();
+        assert!(matches!(held, FileIdentity::Strong(_)));
+        p.rename_replace(OsStr::new("t.tmp"), &p, OsStr::new("t")).unwrap();
+        assert_eq!(fs.metadata(Path::new("/p/t")).unwrap().identity, held);
     }
 }

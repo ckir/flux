@@ -134,6 +134,7 @@ mod tests {
                     })
                     .collect(),
                 identity_degraded: None,
+                published_identity: flux_fs::FileIdentity::Unavailable,
             })
         };
         assert_eq!(for_file(&ok(0)), SUCCESS);
@@ -178,7 +179,12 @@ mod tests {
     fn a_file_runs_own_stop_decides_before_its_copy() {
         let run = |copy, stop| Run { copy, stop, warnings: Vec::new() };
         let copied = || {
-            Ok(Outcome { bytes_copied: 1, metadata_failures: Vec::new(), identity_degraded: None })
+            Ok(Outcome {
+                bytes_copied: 1,
+                metadata_failures: Vec::new(),
+                identity_degraded: None,
+                published_identity: flux_fs::FileIdentity::Unavailable,
+            })
         };
         assert_eq!(for_file_run(&run(None, Some(refused(false)))), REFUSED);
         assert_eq!(for_file_run(&run(Some(copied()), Some(refused(true)))), FAILED);

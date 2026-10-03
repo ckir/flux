@@ -389,6 +389,7 @@ mod tests {
             bytes_copied: 5,
             metadata_failures: Vec::new(),
             identity_degraded: Some(FileIdentity::Unavailable),
+            published_identity: flux_fs::FileIdentity::Unavailable,
         });
         let r = Report::file(&ok, true, 0);
         assert_eq!((r.files_total, r.files_copied, r.files_overwritten), (1, 1, 1));
@@ -407,8 +408,12 @@ mod tests {
 
     #[test]
     fn a_single_file_onto_a_fresh_target_overwrites_nothing() {
-        let ok: Result<Outcome, CopyError> =
-            Ok(Outcome { bytes_copied: 5, metadata_failures: Vec::new(), identity_degraded: None });
+        let ok: Result<Outcome, CopyError> = Ok(Outcome {
+            bytes_copied: 5,
+            metadata_failures: Vec::new(),
+            identity_degraded: None,
+            published_identity: flux_fs::FileIdentity::Unavailable,
+        });
         let r = Report::file(&ok, false, 0);
         assert_eq!((r.files_copied, r.files_overwritten), (1, 0));
     }
@@ -653,7 +658,12 @@ mod tests {
     fn a_file_runs_report_counts_a_stop_as_one_more_error() {
         let run = |copy, stop| Run { copy, stop, warnings: Vec::new() };
         let copied = || {
-            Ok(Outcome { bytes_copied: 1, metadata_failures: Vec::new(), identity_degraded: None })
+            Ok(Outcome {
+                bytes_copied: 1,
+                metadata_failures: Vec::new(),
+                identity_degraded: None,
+                published_identity: flux_fs::FileIdentity::Unavailable,
+            })
         };
         assert_eq!(Report::file_run(&run(Some(copied()), None), false, 1).errors, 0);
         assert_eq!(Report::file_run(&run(Some(copied()), Some(refused())), false, 1).errors, 1);

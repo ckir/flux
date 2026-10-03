@@ -19,13 +19,15 @@ use crate::lock::record::LockRecord;
 use crate::lock::site::NAME_LIMIT;
 use crate::lock::{LockCode, LockSite, Refusal, Released, check_capability};
 use crate::prior::check_control_plane;
-use crate::state::{OpState, file_names_fit};
+use crate::state::{OpState, file_names_fit, identity_text, native_hex};
 use crate::tree::{
     Shared, TreeAbort, TreeFailure, TreeFailureCause, TreeOutcome, copy_tree_at, prepare_source,
 };
-use flux_fs::{Code, CopyOptions, DestinationRoot, DirHandle, FsError, OperationId, Outcome};
+use flux_fs::{
+    Code, CopyOptions, DestinationRoot, DirHandle, FileIdentity, FsError, OperationId, Outcome,
+};
 use place::{FilePlace, Place, TreePlace, locate_tree};
-use session::{Locked, from_lock, guarded, lock_io, open_operation, owned};
+use session::{Locked, beat_error, from_lock, guarded, lock_io, open_operation, owned};
 use std::path::{Path, PathBuf};
 
 /// The `workspace_path` a record carries once the state it named is about to go (Q-K): the spec's literal for "names
@@ -51,7 +53,12 @@ pub struct RunConfig {
     pub boot_session_id: String,
     /// `None` outside a test.
     pub before_mutation: Option<BeforeMutation>,
+    /// §101: how often the run refreshes its lock record's heartbeat (cut 7b). The CLI passes `HEARTBEAT_INTERVAL`.
+    pub heartbeat_interval: std::time::Duration,
 }
+
+/// §101's heartbeat interval: 5 s.
+pub const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl std::fmt::Debug for RunConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -62,6 +69,7 @@ impl std::fmt::Debug for RunConfig {
             .field("owner_instance_id", &self.owner_instance_id)
             .field("boot_session_id", &self.boot_session_id)
             .field("before_mutation", &self.before_mutation.is_some())
+            .field("heartbeat_interval", &self.heartbeat_interval)
             .finish()
     }
 }
@@ -208,19 +216,30 @@ pub fn tree<F: DestinationRoot>(
         }
     };
     // Step 6: the copy, with §99 before every destination mutation.
-    let mut leftovers = false;
+    let mut leftovers: Vec<PathBuf> = Vec::new();
     let walked = {
         let guard = || {
             if let Some(hook) = &cfg.before_mutation {
                 hook();
             }
-            guarded(&locked.held)
+            guarded(&locked.held, &locked.pulse)
         };
-        let cx = Shared { fs, src_root, src_identity: source.identity, opts: &opts, guard: &guard };
+        let beat =
+            || locked.pulse.beat(&locked.held).map_err(|e| beat_error(&locked.lock_shown, e));
+        let cx = Shared {
+            fs,
+            src_root,
+            src_identity: source.identity,
+            opts: &opts,
+            guard: &guard,
+            beat: &beat,
+        };
         let root = place.dest.take().expect("step 5 made DEST");
         let mut report = |f: TreeFailure| {
-            if matches!(&f.cause, TreeFailureCause::Copy(e) if e.leftover.is_some()) {
-                leftovers = true;
+            if let TreeFailureCause::Copy(e) = &f.cause
+                && let Some((path, _)) = &e.leftover
+            {
+                leftovers.push(path.clone());
             }
             on_report(f);
         };
@@ -233,7 +252,9 @@ pub fn tree<F: DestinationRoot>(
         Err(error) => Err(TreeAbort { error, outcome: out }),
     };
     let ended = match &result {
-        Ok(_) => Ended::Completed { leftovers },
+        Ok(_) => Ended::Completed { leftovers, published: None },
+        // Cut 7b: a failed heartbeat is the copy's failure, whatever its code.
+        Err(_) if locked.pulse.failed() => Ended::Failed,
         Err(a) if a.error.code() == Code::TargetLockBusy => Ended::Lost,
         Err(a) if a.refused_unchanged() => Ended::RefusedUnchanged,
         Err(_) => Ended::Failed,
@@ -262,7 +283,7 @@ pub fn file<F: DestinationRoot>(
     let opts =
         CopyOptions { operation_id: OperationId::new(cfg.operation_id.as_str()), ..opts.clone() };
     // B1.
-    let (parent, parent_path, name) = match prepare_file(fs, src, dst, &opts) {
+    let (parent, parent_path, name, source_identity) = match prepare_file(fs, src, dst, &opts) {
         Ok(p) => p,
         Err(e) => {
             run.copy = Some(Err(e));
@@ -305,6 +326,7 @@ pub fn file<F: DestinationRoot>(
         dir_shown: parent_path.to_path_buf(),
         target: name.to_os_string(),
         destination: dst.to_path_buf(),
+        source_identity,
     };
     // Steps 3-5.
     let locked = match open_operation(&site, capability, &mut place, cfg, &mut run.warnings) {
@@ -320,9 +342,11 @@ pub fn file<F: DestinationRoot>(
             if let Some(hook) = &cfg.before_mutation {
                 hook();
             }
-            guarded(&locked.held)
+            guarded(&locked.held, &locked.pulse)
         };
-        copy_file_guarded(fs, src, &parent, name, &opts, &guard)
+        let beat =
+            || locked.pulse.beat(&locked.held).map_err(|e| beat_error(&locked.lock_shown, e));
+        copy_file_guarded(fs, src, &parent, name, &opts, &guard, &beat)
     }
     .map_err(|mut e| {
         // As `copy_file` reports it: the leftover in the frame of the path the operator gave.
@@ -332,7 +356,9 @@ pub fn file<F: DestinationRoot>(
         e
     });
     let ended = match &copied {
-        Ok(_) => Ended::Completed { leftovers: false },
+        Ok(o) => Ended::Completed { leftovers: Vec::new(), published: Some(o.published_identity) },
+        // Cut 7b: a failed heartbeat is the copy's failure, whatever its code.
+        Err(_) if locked.pulse.failed() => Ended::Failed,
         Err(e) if e.code() == Code::TargetLockBusy => Ended::Lost,
         Err(e) if e.code() == Code::SafetyRejected && e.leftover.is_none() => {
             Ended::RefusedUnchanged
@@ -346,8 +372,9 @@ pub fn file<F: DestinationRoot>(
 
 /// How the copy ended, as the finish needs it.
 enum Ended {
-    /// The walk finished, or the single file was copied (A1). `leftovers`: a temporary the copy could not remove.
-    Completed { leftovers: bool },
+    /// The walk finished, or the single file was copied (A1). `leftovers`: the temporaries the copy could not remove,
+    /// relative to DEST (a tree). `published`: a single file's published target (cut 7b).
+    Completed { leftovers: Vec<PathBuf>, published: Option<FileIdentity> },
     /// The copy stopped because this run no longer owns the lock.
     Lost,
     /// The copy refused with nothing changed (Q-I).
@@ -364,7 +391,9 @@ fn finish<D: DirHandle, P: Place<D>>(
     warnings: &mut Vec<RunWarning>,
 ) -> Option<RunError> {
     match ended {
-        Ended::Completed { leftovers } => complete(place, locked, leftovers, warnings),
+        Ended::Completed { leftovers, published } => {
+            complete(place, locked, leftovers, published, warnings)
+        }
         // Ownership lost before COMPLETED (decision 13): the state stays as it is, and `locked` drops here, closing
         // the lock without unlinking it (`S99_refuse_close`). The copy's own TARGET_LOCK_BUSY is the report.
         Ended::Lost => None,
@@ -373,24 +402,39 @@ fn finish<D: DirHandle, P: Place<D>>(
     }
 }
 
-/// The success path: COMPLETED, durably and while still owned; then, unless a leftover temporary keeps it (G2), the
+/// The success path: COMPLETED, durably and while still owned; then, unless a leftover temporary keeps it (G2; the
+/// COMPLETED write carries `cleanup_pending` and the leftovers (cut 7b)), the
 /// record stops naming the state (Q-K), the state goes, and the empty control directories; then the release. After
 /// COMPLETED nothing may fail the run (F6, spec:9363): each failure from here is a warning.
 fn complete<D: DirHandle, P: Place<D>>(
     place: &mut P,
     mut locked: Locked<'_, D>,
-    leftovers: bool,
+    leftovers: Vec<PathBuf>,
+    published: Option<FileIdentity>,
     warnings: &mut Vec<RunWarning>,
 ) -> Option<RunError> {
     if let Err(fault) = owned(&locked.held, &locked.lock_shown) {
         return Some(fault.into_error(RunStep::State));
     }
-    locked.state.state = OpState::Completed;
-    if let Err(error) = place.write(&locked.state) {
+    // §218 (cut 7b decision 10): cleanup_pending in this same COMPLETED write, before anything is removed, with what
+    // the copy left; a single file also records its published target. Built as a copy and adopted only once written:
+    // if the write fails, `fail` writes FAILED from the state as it was, never a FAILED record carrying the COMPLETED
+    // write's `cleanup_pending`, which the next run would refuse as STATE_CORRUPT (capstone r4).
+    let mut done = locked.state.clone();
+    done.state = OpState::Completed;
+    if let Some(c) = &mut done.cleanup {
+        c.cleanup_pending = true;
+        c.cleanup_pending_artifacts = leftovers.iter().map(|p| native_hex(p)).collect();
+    }
+    if let (Some(f), Some(id)) = (&mut done.file, published) {
+        f.target_identity = Some(identity_text(id));
+    }
+    if let Err(error) = place.write(&done) {
         let path = place.shown(&locked.state.operation_id);
         return Some(stop_after_record(place, locked, RunStep::State, path, error));
     }
-    if leftovers {
+    locked.state = done;
+    if !leftovers.is_empty() {
         warnings.push(RunWarning::StateKept(place.shown(&locked.state.operation_id)));
     } else if let Err((path, error)) = remove_own(place, &mut locked, false) {
         warnings.push(RunWarning::NotRemoved { path, error });
@@ -425,9 +469,16 @@ fn remove_own<D: DirHandle, P: Place<D>>(
 }
 
 /// The failure path: FAILED (resumable: the next run gets RESUMABLE_OPERATION_EXISTS until `--restart`), then the
-/// release "the same way". The copy's own error is the report; a failure here is reported beside it.
+/// release "the same way". The copy's own error is the report; a failure here is reported beside it. After a failed
+/// heartbeat, a failed check ends it with nothing written (cut 7b).
 fn fail<D: DirHandle, P: Place<D>>(place: &P, mut locked: Locked<'_, D>) -> Option<RunError> {
     if let Err(fault) = owned(&locked.held, &locked.lock_shown) {
+        // Cut 7b decision 7, "Torn": after a failed heartbeat, a record that no longer proves ownership is most likely
+        // the one the heartbeat tore. That failure is already the report: write nothing, add no stop, and close without
+        // unlinking as `locked` drops. The next run meets TARGET_LOCK_UNCERTAIN, which `--restart --break-lock` clears.
+        if locked.pulse.failed() {
+            return None;
+        }
         return Some(fault.into_error(RunStep::State));
     }
     locked.state.state = OpState::Failed;

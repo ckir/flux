@@ -2,10 +2,10 @@
 //! `DEST/.flux/operations/<id>/manifest` and its lock is beside DEST; a single file's state is the record
 //! `<target>.flux-state.<id>` beside the target, with its lock.
 
-use super::session::{Fault, failed, from_lock, owned};
+use super::session::{Fault, Locked, checked, failed, from_lock};
 use super::{RunError, RunStep, RunWarning};
 use crate::copy::{CopyError, CopyStep, split_destination};
-use crate::lock::{Held, LockResult};
+use crate::lock::LockResult;
 use crate::prior::{PriorOp, Scan, scan_file, scan_tree};
 use crate::state::{
     FLUX_DIR, Kind, MANIFEST, OPERATIONS_DIR, OperationState, PARTIAL_INFIX, create_workspace,
@@ -41,19 +41,23 @@ pub(crate) trait Place<D: DirHandle> {
     fn create(&mut self, state: &OperationState) -> Result<(), RunError>;
     /// Rewrite `state` where its operation's state lives: this run's, or a prior's under `--restart`.
     fn write(&self, state: &OperationState) -> flux_fs::Result<()>;
-    /// `--restart`: delete the superseded operations' partials, `still_owned` before each deletion. Returns the ids
-    /// whose partials are all gone; a partial that stays keeps its operation's ABANDONED state as its record (J1).
+    /// `--restart`: delete the superseded operations' partials, the heartbeat and `still_owned` before each deletion.
+    /// Returns the ids whose partials are all gone; a partial that stays keeps its operation's ABANDONED state as its
+    /// record (J1).
     fn sweep(
         &self,
         priors: &[PriorOp],
-        held: &Held<'_, D>,
-        lock_shown: &Path,
+        locked: &Locked<'_, D>,
         warnings: &mut Vec<RunWarning>,
     ) -> Result<Vec<String>, Fault>;
     /// Remove operation `id`'s state: a workspace, retired first (decision 17), or a record and its temporary.
     fn remove(&self, id: &str) -> Result<(), (PathBuf, FsError)>;
     /// Finish step 4: the empty control directories; on a `rollback` (Q-I), also a DEST this run made.
     fn remove_control_dirs(&mut self, rollback: bool) -> Result<(), (PathBuf, FsError)>;
+    /// A single file's identities for its record (cut 7b): the source's, and the object at the target name now
+    /// (`None` if there is none, `Unavailable` if it cannot be read). Read under the lock, as the state is made. `None`
+    /// for a tree.
+    fn file_identities(&self) -> Option<(FileIdentity, Option<FileIdentity>)>;
 }
 
 /// What B1 resolved for a tree's DEST: the directory holding the lock, DEST's name in it, and DEST if it exists.
@@ -213,8 +217,7 @@ impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {
     fn sweep(
         &self,
         priors: &[PriorOp],
-        held: &Held<'_, F::Dir>,
-        lock_shown: &Path,
+        locked: &Locked<'_, F::Dir>,
         warnings: &mut Vec<RunWarning>,
     ) -> Result<Vec<String>, Fault> {
         let ids: BTreeSet<&str> = priors.iter().map(|p| p.state.operation_id.as_str()).collect();
@@ -263,7 +266,7 @@ impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {
             else {
                 continue;
             };
-            owned(held, lock_shown)?;
+            checked(locked)?;
             if let Err(error) = remove_below(dest, &path) {
                 let shown = self.dest_shown.join(&path);
                 warnings.push(RunWarning::PartialKept {
@@ -294,6 +297,10 @@ impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {
         }
         Ok(())
     }
+
+    fn file_identities(&self) -> Option<(FileIdentity, Option<FileIdentity>)> {
+        None
+    }
 }
 
 /// Remove the file at `rel` below `dest` through handles opened one component at a time, so no link is followed
@@ -316,6 +323,8 @@ pub(crate) struct FilePlace<'p, D: DirHandle> {
     pub(crate) target: OsString,
     /// The destination as the operator gave it.
     pub(crate) destination: PathBuf,
+    /// The source's identity, read when the source was opened (cut 7b).
+    pub(crate) source_identity: FileIdentity,
 }
 
 impl<D: DirHandle> Place<D> for FilePlace<'_, D> {
@@ -354,8 +363,7 @@ impl<D: DirHandle> Place<D> for FilePlace<'_, D> {
     fn sweep(
         &self,
         priors: &[PriorOp],
-        held: &Held<'_, D>,
-        lock_shown: &Path,
+        locked: &Locked<'_, D>,
         warnings: &mut Vec<RunWarning>,
     ) -> Result<Vec<String>, Fault> {
         let mut gone = Vec::new();
@@ -364,7 +372,7 @@ impl<D: DirHandle> Place<D> for FilePlace<'_, D> {
             // `<target>.flux-partial.<id>`, looked up by this target's own name (E3).
             let partial =
                 temp_path(Path::new(&self.target), &OperationId::new(id.as_str())).into_os_string();
-            owned(held, lock_shown)?;
+            checked(locked)?;
             match self.dir.remove_file(&partial) {
                 Ok(()) => gone.push(id.clone()),
                 Err(e) if e.source.kind() == ErrorKind::NotFound => gone.push(id.clone()),
@@ -385,5 +393,14 @@ impl<D: DirHandle> Place<D> for FilePlace<'_, D> {
     fn remove_control_dirs(&mut self, _rollback: bool) -> Result<(), (PathBuf, FsError)> {
         // A single file's state needs no control directory (F2).
         Ok(())
+    }
+
+    fn file_identities(&self) -> Option<(FileIdentity, Option<FileIdentity>)> {
+        let existing = match self.dir.metadata(&self.target) {
+            Ok(m) => Some(m.identity),
+            Err(e) if e.source.kind() == ErrorKind::NotFound => None,
+            Err(_) => Some(FileIdentity::Unavailable),
+        };
+        Some((self.source_identity, existing))
     }
 }
