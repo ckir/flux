@@ -1,32 +1,30 @@
 # Flux dev tooling
 
-The toolchain inherited from `aishelter` (`C:\Users\user\Development\Rust\aishelter`),
-audited against what Flux actually needs. Flux is an offline cross-platform CLI
-file-copy engine, so aishelter's server/DB/serverless tooling is dropped (see
-"Deliberately not carried over" at the bottom).
+The toolchain audited against what Flux actually needs. Flux is an offline cross-platform CLI
+file-copy engine.
 
-Everything under "Carried over" is **already installed on this machine** unless the
+Everything under "Standard tools" is **already installed on this machine** unless the
 Status column says otherwise (verified 2026-09-09).
 
-## Carried over from aishelter
+## Standard tools
 
 | Tool | Config file | What it does for us | Status |
 |---|---|---|---|
-| `rustup` / `rustc` / `cargo` | `rust-toolchain.toml` | Pins the toolchain channel so CI and local agree. aishelter pins `stable`. | 1.98.0 |
-| `rustfmt` | `rustfmt.toml` | Formatting. aishelter: `edition 2024`, `max_width 100`, `use_small_heuristics = "Max"`, `reorder_imports`. Gate is `cargo fmt --check`. | bundled |
-| `clippy` | `clippy.toml` | Lints. aishelter sets `msrv`, `allow-dbg-in-tests`, `allow-unwrap-in-tests`. Gate is `cargo clippy --workspace --all-targets -- -D warnings`. | bundled |
+| `rustup` / `rustc` / `cargo` | `rust-toolchain.toml` | Pins the toolchain channel so CI and local agree. Pins `stable`. | 1.98.0 |
+| `rustfmt` | `rustfmt.toml` | Formatting. `edition 2024`, `max_width 100`, `use_small_heuristics = "Max"`, `reorder_imports`. Gate is `cargo fmt --check`. | bundled |
+| `clippy` | `clippy.toml` | Lints. Sets `msrv`, `allow-dbg-in-tests`, `allow-unwrap-in-tests`. Gate is `cargo clippy --workspace --all-targets -- -D warnings`. | bundled |
 | `cargo-nextest` | — | Test runner used by CI (`cargo nextest run --workspace`). Per-test process isolation, which matters for Flux: tests touch real files, temp dirs, and permissions. Does **not** run doctests — pair with `cargo test --doc`. | 0.9.x |
-| `cargo-deny` | `deny.toml` | Advisory/licence/ban/source auditing. aishelter allow-lists MIT/Apache/BSD/ISC/Unicode/MPL/Zlib/CC0, denies `openssl-sys` in favour of rustls, denies unknown git sources. Targets list is per-platform — Flux must add macOS + aarch64 targets. | 0.16.x |
+| `cargo-deny` | `deny.toml` | Advisory/licence/ban/source auditing. Allow-lists MIT/Apache/BSD/ISC/Unicode/MPL/Zlib/CC0, denies `openssl-sys` in favour of rustls, denies unknown git sources. Targets list is per-platform — Flux must add macOS + aarch64 targets. | 0.16.x |
 | `typos` (typos-cli) | `_typos.toml` | Prose + source spell-check, run as its own CI job. Needs a Flux-specific `extend-words` (e.g. `reflink`, `dedup`, `hardlink`, `ckir`). | 1.48.0 |
-| `just` | `justfile` | Task runner; the single entry point for `build` / `test` / `clippy` / `fmt` / `check` / `clean`. aishelter's `default` recipe is `just check` = fmt-check + clippy + test. | 1.46.0 |
+| `just` | `justfile` | Task runner; the single entry point for `build` / `test` / `clippy` / `fmt` / `check` / `clean`. The `default` recipe is `just check` = fmt-check + clippy + test. | 1.46.0 |
 | `bacon` | `bacon.toml` | Background watcher during development (`check`, `check-all`, `clippy`, `clippy-all`, `test`, `doc` jobs; default `check-all`). | 3.25.0 |
-| `lefthook` | `lefthook.yml` | Git hooks. aishelter ran fmt + clippy on **both** pre-commit and pre-push. Flux runs them on **pre-push only**, and invokes them as `just fmt-check` / `just clippy` / `just typos` so the hook and CI share one definition. Commits stay fast. | 2.1.12 |
-| `release-plz` | `release-plz.toml`, `.github/workflows/release-plz.yml` | Release automation, replacing aishelter's `git-cliff` + `cargo-release`. In CI it keeps one release PR open (shared version bump, `Cargo.lock`, `CHANGELOG.md` from commit messages, grouped by the `[changelog]` parsers); merging it creates the `v{version}` tag and GitHub release, and the tag starts `release.yml`. Git-only mode: versions come from tags, nothing goes to crates.io. Uses `PR_UPDATER_TOKEN` so CI runs on the PR and the tag triggers workflows. Local `release-plz update` previews the result. | 0.3.167 |
+| `lefthook` | `lefthook.yml` | Git hooks. Flux runs fmt + clippy on **pre-push only**, and invokes them as `just fmt-check` / `just clippy` / `just typos` so the hook and CI share one definition. Commits stay fast. | 2.1.12 |
+| `release-plz` | `release-plz.toml`, `.github/workflows/release-plz.yml` | Release automation. In CI it keeps one release PR open (shared version bump, `Cargo.lock`, `CHANGELOG.md` from commit messages); merging it creates the `v{version}` tag and GitHub release, and the tag starts `release.yml`. Git-only mode: versions come from tags, nothing goes to crates.io. Uses `PR_UPDATER_TOKEN` so CI runs on the PR and the tag triggers workflows. Local `release-plz update` previews the result. | 0.3.167 |
 | `cargo-binstall` | — | How every one of the above gets installed without a source build. | 1.x |
-| GitHub Actions | `.github/workflows/ci.yml` | aishelter runs four jobs: `fmt`, `typos`, `clippy`, `test`. Uses `dtolnay/rust-toolchain@stable`, `Swatinem/rust-cache@v2`, `taiki-e/install-action@nextest`. | — |
+| GitHub Actions | `.github/workflows/ci.yml` | Runs four jobs: `fmt`, `typos`, `clippy`, `test`. Uses `dtolnay/rust-toolchain@stable`, `Swatinem/rust-cache@v2`, `taiki-e/install-action@nextest`. | — |
 | GitHub Actions release | `.github/workflows/release.yml` | Tag-triggered (`v*`) cross-platform binary matrix. Flux's tags come from release-plz; the builds attach to the release it creates. | — |
 
-## Installed here, not used by aishelter — candidates for Flux
+## Other installed candidates for Flux
 
 | Tool | Why it may matter for Flux | Status |
 |---|---|---|
@@ -51,16 +49,6 @@ Status column says otherwise (verified 2026-09-09).
 `actionlint` and `shellcheck` are winget installs, which Git Bash on this machine does not see until its PATH is reloaded, so there is no
 pre-push hook for them; CI is the gate. A clean result is meaningful: a control workflow with an unquoted variable
 (SC2086) and an undefined context property is reported (verified 2026-09-15).
-
-## Deliberately not carried over
-
-- `sqlx` / `cargo-sqlx` / `migrations/` — aishelter is Postgres-backed; Flux persists its
-  operation workspace on the filesystem.
-- `docker-compose.yml` / `.github/workflows/docker.yml` — no service to containerise.
-- `pnpm` / `package.json` / `wrangler` / `pnpm-workspace.yaml` — aishelter's Cloudflare
-  Workers + Lambda targets. Flux has no JS surface.
-- `openapi.json` / `utoipa` / `prometheus-client` — no HTTP API, no metrics endpoint.
-- `testcontainers` — no external services to stand up in tests.
 
 ## Required tools
 
@@ -87,7 +75,6 @@ the tables above carry the reasons.
 | `shellcheck` | `winget install koalaman.shellcheck` | on `PATH` as `shellcheck` |
 | `zig` | `https://ziglang.org/download/ (unpack and put zig on PATH)` | on `PATH` as `zig` |
 <!-- tools:end -->
-
 ## Gate commands (the contract)
 
 ```
