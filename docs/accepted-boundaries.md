@@ -51,3 +51,14 @@ One section per audited change, newest at the bottom.
   `an_empty_lock_is_uncertain_until_restart_break_lock_takes_it_over` (`crates/flux-cli/tests/run.rs`); and how a
   `--restart` heartbeat failure prints, a `RunError::Failed` at the lock step, by `report.rs`
   `a_refusal_names_what_it_could_not_remove_and_a_failure_names_its_step_and_path`. Owner-accepted 2026-10-03.
+
+## Benchmark publishing (test audit 2026-10-03)
+
+- **`benches/publish/measure.py`'s `main()` is not unit-tested.** It builds the run's header from the CI environment
+  (`GITHUB_SHA`, `GITHUB_RUN_ID`/`_ATTEMPT`, `ImageOS`/`ImageVersion`, `git rev-parse` for `source`), checks which
+  comparators exist on the runner, and reads Defender's state. Testing it needs a refactor to separate those reads,
+  which would reopen the capstone; the owner chose a boundary instead.
+  **Compensation:** `test_every_header_field_reaches_the_result` pins that every header field reaches the result
+  unchanged, and the dry run on all three hosted runners (Bench run 37112559659) produced complete headers: commit,
+  run, a three-id `source`, image, cache, Defender (off on the Windows runner) and tool versions. Owner-accepted
+  2026-10-03.

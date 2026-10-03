@@ -91,6 +91,14 @@ class RollingTests(unittest.TestCase):
         mixed_source["runs"][-1]["source"] = "s2"
         self.assertEqual(stability.rolling(self.stab, mixed_source), [], "only points at the latest source count")
 
+    def test_an_unstable_pair_is_left_to_its_calibration(self) -> None:
+        # Test audit G3: the rolling check judges only stable pairs; an unstable verdict stays the calibration's.
+        stab = stability.empty()
+        stability.calibrate(stab, [result("linux", 1.0 + (0.3 if i % 2 else 0.0)) for i in range(10)], "2026-10-04T00:00:00Z")
+        self.assertFalse(stab["pairs"]["linux/small/cp"]["stable"])
+        self.assertEqual(stability.rolling(stab, self.points([1.0 + (0.3 if i % 2 else 0.0) for i in range(10)])), [])
+        self.assertEqual(stab["pairs"]["linux/small/cp"]["source"], "calibration")
+
     def test_a_calibration_overrides_a_demotion(self) -> None:
         stability.rolling(self.stab, self.points([1.0 + (0.3 if i % 2 else 0.0) for i in range(10)]))
         stability.calibrate(self.stab, [result("linux", 1.0)] * 10, "2026-10-06T00:00:00Z")

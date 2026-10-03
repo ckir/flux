@@ -90,6 +90,14 @@ class RegistryTests(unittest.TestCase):
         with self.assertRaisesRegex(registry.RegistryError, "unknown keys"):
             registry.parse(entry(speed='"fast"'))
 
+    def test_a_name_must_be_lowercase_letters_digits_dashes_or_underscores(self) -> None:
+        # Test audit G7.
+        for name in ('"Cp"', '"c p"', '"-cp"', '"cp!"', '""'):
+            with self.subTest(name=name), self.assertRaisesRegex(registry.RegistryError, "name"):
+                registry.parse(entry(name=name))
+        (ok,) = registry.parse(entry(name='"fast_copy-2"'))
+        self.assertEqual(ok.name, "fast_copy-2")
+
     def test_bad_exit_codes_are_refused(self) -> None:
         for codes in ("[]", '["0"]', "[true]"):
             with self.subTest(codes=codes), self.assertRaisesRegex(registry.RegistryError, "ok_exit_codes"):

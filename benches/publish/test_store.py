@@ -49,6 +49,19 @@ class StoreTests(unittest.TestCase):
         latest = store.latest_per_os(data)
         self.assertEqual({k: v["run"] for k, v in latest.items()}, {"linux": "12.1", "macos": "10.1"})
 
+    def test_the_latest_run_is_the_highest_not_the_last_listed(self) -> None:
+        # Test audit G2: a re-run of an older commit can be appended after a newer run.
+        data = {"schema": 1, "runs": [run("c2", "linux", "12.1"), run("c1", "linux", "10.1")]}
+        self.assertEqual(store.latest_per_os(data)["linux"]["run"], "12.1")
+
+    def test_a_file_without_a_schema_stops(self) -> None:
+        # Test audit G6.
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "data.json"
+            path.write_text(json.dumps({"runs": []}))
+            with self.assertRaises(store.SchemaError):
+                store.load(path)
+
     def test_saving_and_loading_round_trips(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "data.json"

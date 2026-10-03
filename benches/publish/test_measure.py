@@ -24,8 +24,8 @@ CORRUPT = (
     "b = bytearray(f.read_bytes()); b[0] ^= 1; f.write_bytes(bytes(b))"
 )
 EXIT = "import shutil, sys; shutil.copytree(sys.argv[1], sys.argv[2]); sys.exit(int(sys.argv[3]))"
-# Copies correctly, but only after 3 s: only the timeout can fail it.
-SLOW = "import shutil, sys, time; time.sleep(3); shutil.copytree(sys.argv[1], sys.argv[2])"
+# Copies correctly, but only after 5 s: only the 2 s timeout can fail it.
+SLOW = "import shutil, sys, time; time.sleep(5); shutil.copytree(sys.argv[1], sys.argv[2])"
 
 
 def tool(name: str, script: str, *extra: str, ok: frozenset[int] = frozenset({0})) -> measure.Tool:
@@ -155,7 +155,7 @@ class MeasureTests(unittest.TestCase):
                 clock=fake.clock,
                 free=lambda _: 0,
                 log=lambda _: None,
-                timeout=1.0,
+                timeout=2.0,
             )
             self.assertEqual(got["failed"], ["slow"])
             self.assertEqual(got["ratio"], {})
@@ -221,6 +221,21 @@ class MeasureTests(unittest.TestCase):
             self.assertEqual(got["commit"], "c" * 40)
             self.assertEqual(list(got["cases"]), ["large"])
             self.assertEqual(got["cases"]["large"]["ratio"], {"other": 2.0})
+
+    def test_every_header_field_reaches_the_result(self) -> None:
+        # Test audit G5: the run's provenance is the spec's "Result shapes" fields, carried through unchanged.
+        header = {
+            "commit": "c" * 40, "run": "5.1", "source": "a+b+c", "date": "2026-10-05T00:00:00Z", "os": "linux",
+            "image": {"os": "ubuntu24", "version": "1"}, "cache": "cold", "defender": None,
+            "tools": {"flux": "flux 0.5.0", "other": "unrecorded"},
+        }
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake({"flux": 2.0, "other": 1.0})
+            got = measure.measure_all(
+                [], [tool("flux", COPY), tool("other", COPY)], "linux", Path(d), header=header,
+                run=fake.run, clock=fake.clock, free=lambda _: 0, log=lambda _: None,
+            )
+            self.assertEqual(got, {"schema": 1, **header, "cases": {}})
 
 
 if __name__ == "__main__":
