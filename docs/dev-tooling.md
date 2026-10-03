@@ -16,14 +16,13 @@ Status column says otherwise (verified 2026-09-09).
 | `cargo-nextest` | — | Test runner used by CI (`cargo nextest run --workspace`). Per-test process isolation, which matters for Flux: tests touch real files, temp dirs, and permissions. Does **not** run doctests — pair with `cargo test --doc`. | 0.9.x |
 | `cargo-deny` | `deny.toml` | Advisory/licence/ban/source auditing. Allow-lists MIT/Apache/BSD/ISC/Unicode/MPL/Zlib/CC0, denies `openssl-sys` in favour of rustls, denies unknown git sources. Targets list is per-platform — Flux must add macOS + aarch64 targets. | 0.16.x |
 | `typos` (typos-cli) | `_typos.toml` | Prose + source spell-check, run as its own CI job. Needs a Flux-specific `extend-words` (e.g. `reflink`, `dedup`, `hardlink`, `ckir`). | 1.48.0 |
-| `just` | `justfile` | Task runner; the single entry point for `build` / `test` / `clippy` / `fmt` / `check` / `clean` / `changelog` / `release`. The `default` recipe is `just check` = fmt-check + clippy + test. | 1.46.0 |
+| `just` | `justfile` | Task runner; the single entry point for `build` / `test` / `clippy` / `fmt` / `check` / `clean`. The `default` recipe is `just check` = fmt-check + clippy + test. | 1.46.0 |
 | `bacon` | `bacon.toml` | Background watcher during development (`check`, `check-all`, `clippy`, `clippy-all`, `test`, `doc` jobs; default `check-all`). | 3.25.0 |
 | `lefthook` | `lefthook.yml` | Git hooks. Flux runs fmt + clippy on **pre-push only**, and invokes them as `just fmt-check` / `just clippy` / `just typos` so the hook and CI share one definition. Commits stay fast. | 2.1.12 |
-| `git-cliff` | `cliff.toml` | Conventional-commit changelog generation (`just changelog`). Parsers for feat/fix/docs/perf/refactor/test/ci/chore. | 2.13.1 |
-| `cargo-release` | `[workspace.metadata.release]` in root `Cargo.toml` | Lockstep version bump + `v{{version}}` tag across all workspace crates. | 0.25.x |
+| `release-plz` | `release-plz.toml`, `.github/workflows/release-plz.yml` | Release automation. In CI it keeps one release PR open (shared version bump, `Cargo.lock`, `CHANGELOG.md` from commit messages); merging it creates the `v{version}` tag and GitHub release, and the tag starts `release.yml`. Git-only mode: versions come from tags, nothing goes to crates.io. Uses `PR_UPDATER_TOKEN` so CI runs on the PR and the tag triggers workflows. Local `release-plz update` previews the result. | 0.3.167 |
 | `cargo-binstall` | — | How every one of the above gets installed without a source build. | 1.x |
 | GitHub Actions | `.github/workflows/ci.yml` | Runs four jobs: `fmt`, `typos`, `clippy`, `test`. Uses `dtolnay/rust-toolchain@stable`, `Swatinem/rust-cache@v2`, `taiki-e/install-action@nextest`. | — |
-| GitHub Actions release | `.github/workflows/release.yml` | Tag-triggered (`v*`) cross-platform binary matrix. Directly reusable for shipping the `flux` binary. | — |
+| GitHub Actions release | `.github/workflows/release.yml` | Tag-triggered (`v*`) cross-platform binary matrix. Flux's tags come from release-plz; the builds attach to the release it creates. | — |
 
 ## Other installed candidates for Flux
 
@@ -35,14 +34,70 @@ Status column says otherwise (verified 2026-09-09).
 | `cargo-zigbuild` | Cross-compiling to Linux/macOS targets from this Windows box. | installed |
 | `criterion` (crate, not a binary) | Spec §3 asks for `benches/` and the CLI has a `flux benchmark` command. | add as dev-dep |
 
+## Added for Flux
+
+| Tool | Config file | What it does for us | Status |
+|---|---|---|---|
+| `actionlint` | — | Lints every GitHub Actions workflow: YAML syntax, `${{ }}` expressions against the context types, job and step references, action inputs. The workflows change often (the model check's per-scenario matrix, the extended tier's label and schedule triggers, Dependabot action bumps), and those mistakes otherwise surface only when CI runs. `just lint-workflows` locally; the `Workflow lint` job in `ci.yml` runs the pinned `rhysd/actionlint:1.7.12` image on every CI run. | 1.7.12 (`winget install rhysd.actionlint`) |
+| `shellcheck` | — | actionlint runs every workflow `run:` step through it when it is on PATH, and silently skips that check when it is not (visible only with `actionlint -verbose`). The CI image bundles it. | 0.11.0 (`winget install koalaman.shellcheck`) |
+| `gh` | — | GitHub CLI. The model checks run only on CI, so their results come back through `gh run watch`, `gh run view --log` and `gh run download` (the TLC log artifacts). Pull requests, labels such as `model-extended`, and Dependabot auto-merge are driven through it too. | (`winget install GitHub.cli`) |
+| `java` | — | Runs the TLA+ tools in the pinned `tla2tools.jar` (Java 11 or later; CI uses Temurin 21). Locally it runs only the PlusCal translator and the SANY parser when `models/lockproto/algorithm.txt` changes. The TLC model checks themselves are too heavy for a development machine and run only on CI (owner ruling, 2026-09-13) — do not run `just model` locally. Not needed by `just check`. | Temurin 21 (`winget install EclipseAdoptium.Temurin.21.JDK`) |
+| `tla2tools.jar` | — | The pinned TLA+ tools jar (TLC 2.19, SHA-256 checked by `models/lockproto/run.py`) that the local translation and SANY parse need; see `java`. `run.py` downloads it into `target/tla/` on first use. | fetched on demand |
+| `python3` | — | Runs `models/lockproto/run.py` (the model-check runner) and its unit tests (`just model`, `just model-test`). Python 3.14 is what CI and the development machines use; `run.py` accepts 3.11 or later (`tomllib`). Not needed by `just check`. | 3.14 (`winget install Python.Python.3.14`) |
+| `zig` | `tools/mac-cc/` | The macOS C compiler for `just check-mac` on a Windows host: blake3 (flux-core, the root crate) and criterion's `alloca` compile C for the target in their build scripts, which failed the cross-check once flux-core took blake3 for the lock record. The recipe calls it through the `tools/mac-cc/` wrappers with `CRATE_CC_NO_DEFAULTS=1`, since the cc crate would otherwise add an `arm64-apple-macosx` target that zig rejects. Measured with zig 0.16.0; the whole workspace, root crate included, now passes. | 0.16.0 (download from ziglang.org, put on PATH) |
+
+`actionlint` and `shellcheck` are winget installs, which Git Bash on this machine does not see until its PATH is reloaded, so there is no
+pre-push hook for them; CI is the gate. A clean result is meaningful: a control workflow with an unquoted variable
+(SC2086) and an undefined context property is reported (verified 2026-09-15).
+
+## Required tools
+
+What `.claude/recommended-tools.json` declares: the tools a fresh checkout has to install, how, and how
+the SessionStart hook decides each one is present. Generated - edit the JSON, then run `just tools-doc`;
+the tables above carry the reasons.
+
+<!-- tools:begin - generated from .claude/recommended-tools.json by `just tools-doc`; do not edit by hand -->
+| Tool | Install | Checked by |
+|---|---|---|
+| `cargo-nextest` | `cargo binstall -y cargo-nextest` | on `PATH` as `cargo-nextest` |
+| `just` | `cargo binstall -y just` | on `PATH` as `just` |
+| `lefthook` | `cargo binstall -y lefthook` | on `PATH` as `lefthook` |
+| `cargo-deny` | `cargo binstall -y cargo-deny` | on `PATH` as `cargo-deny` |
+| `typos` | `cargo binstall -y typos-cli` | on `PATH` as `typos` |
+| `bacon` | `cargo binstall -y bacon` | on `PATH` as `bacon` |
+| `release-plz` | `cargo binstall -y release-plz` | on `PATH` as `release-plz` |
+| `cargo-mutants` | `cargo binstall -y cargo-mutants` | on `PATH` as `cargo-mutants` |
+| `java` | `winget install EclipseAdoptium.Temurin.21.JDK` | on `PATH` as `java` |
+| `tla2tools.jar` | `python -c "import sys; sys.path.insert(0, 'models/lockproto'); import run; print(run.ensure_jar())"` | file `target/tla/tla2tools.jar` |
+| `gh` | `winget install GitHub.cli` | on `PATH` as `gh` |
+| `python3` | `winget install Python.Python.3.14` | on `PATH` as `python3` |
+| `actionlint` | `winget install rhysd.actionlint` | on `PATH` as `actionlint` |
+| `shellcheck` | `winget install koalaman.shellcheck` | on `PATH` as `shellcheck` |
+| `zig` | `https://ziglang.org/download/ (unpack and put zig on PATH)` | on `PATH` as `zig` |
+<!-- tools:end -->
 ## Gate commands (the contract)
 
 ```
 just check          # fmt-check + clippy + test — the local gate
+just check-linux    # the Linux leg: clippy + all tests, natively or through WSL
+just check-mac      # the macOS leg: clippy only, cross-compiled; runs no tests
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo nextest run --workspace
 cargo test --doc    # nextest does not run doctests
 cargo deny check
 typos
+just lint-workflows # actionlint (+ shellcheck over run: steps); CI job "Workflow lint"
 ```
+
+## Keeping this file honest
+
+Every tool named here that an agent or a fresh checkout has to *install* is also declared in
+`.claude/recommended-tools.json`, which the SessionStart hook reads to report what is missing. The
+"Required tools" table is generated from that JSON by `just tools-doc`, and `just check` fails while it is
+stale. The two are
+machine-checked by `tests/dev_tooling.rs`: each tool in that JSON must appear in a table row above, and the
+prose in `README.md` and `CONTRIBUTING.md` must still point at both files. The check runs one way only —
+this file may document more than the JSON declares, because components that ship with the toolchain
+(`rustfmt`, `clippy`), the installer that fetches the rest (`cargo-binstall`), and merely-installed
+candidates all belong here but not in the file the hook acts on.

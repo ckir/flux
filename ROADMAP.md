@@ -1,8 +1,8 @@
 # Flux Roadmap
 
-Release scope follows spec §77–§80; the build order follows spec §81. Nothing
-below is implemented yet — the workspace is scaffolded and compiles, and that is
-Phase 1.
+Release scope follows spec §77–§80; the build order follows spec §81. The State
+column below is the build order's progress, each state naming the merged pull
+requests behind it (checked 2026-09-26).
 
 ## Release scope
 
@@ -37,13 +37,13 @@ packed small-file transfers
 
 | Phase | Deliverable | State |
 |---|---|---|
-| 1 | Workspace — crates created and compiling | **done** |
-| 2 | Portable copy — files, directories, metadata, errors, statistics | not started |
+| 1 | Workspace — crates created and compiling | **done** (no PR — direct commit `7d86f7b`, before the PR workflow started) |
+| 2 | Portable copy — files, directories, metadata, errors, statistics | in progress (PR #32: files, metadata, errors; PR #48: single-file copies write through a directory handle; directories and full statistics not merged) |
 | 3 | Streaming — scanner, selection, bounded queues, planner, workers; demonstrate bounded memory | not started |
-| 4 | Deterministic topology — ordered traversal, `FileIdentity`, hardlink canonicalization, persistent topology store, excluded members, dependency-aware links | not started |
+| 4 | Deterministic topology — ordered traversal, `FileIdentity`, hardlink canonicalization, persistent topology store, excluded members, dependency-aware links | in progress (PR #36, #37: ordered traversal and `FileIdentity`; hardlink canonicalization, topology store, excluded members and dependency-aware links not merged) |
 | 5 | Persistent operation state — manifest, operation ID, lock, heartbeat, state database, partial-file mapping, crash recovery, cleanup | not started |
 | 6 | Verification — BLAKE3, source-stream hashing, destination verification, `verify` command | not started |
-| 7 | Safety — filesystem identity, destination nesting, mount boundaries, symlink policy, source mutation | not started |
+| 7 | Safety — filesystem identity, destination nesting, mount boundaries, symlink policy, source mutation | in progress (PR #32: source mutation, symlink not followed; PR #48: filesystem identity gate; destination nesting and mount boundaries not merged) |
 | 8 | UX — progress, JSON, logging, dry-run, statistics | not started |
 | 9 | Advanced filesystem operations — resume, checkpoint validation, atomic replacement, capacity planning, sparse, reflink | not started |
 | 10 | Performance — worker count, queue depth, buffer size, filesystem APIs, metadata calls, topology lookup, small-file scheduling | not started |

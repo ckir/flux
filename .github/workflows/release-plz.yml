@@ -1,0 +1,67 @@
+name: Release-plz
+
+# Releases without anyone running a command (release-plz.toml has the details):
+# - release-plz-pr opens, or refreshes, one release pull request after every push to main. It bumps the shared
+#   workspace version, updates Cargo.lock and adds the next CHANGELOG.md section from the commit messages.
+# - release-plz-release runs on the same pushes and does nothing until that pull request is merged; it then
+#   creates the `v{version}` tag and its GitHub release. The tag starts release.yml, which builds the binaries
+#   and attaches them to that release.
+#
+# Token: a pull request or tag created with the workflow's own GITHUB_TOKEN does not trigger workflow runs, so
+# the required checks would never run on the release pull request and the tag would never start release.yml.
+# Both jobs therefore use PR_UPDATER_TOKEN, the fine-grained personal access token that
+# update-auto-merge-prs.yml already uses: scoped to this repository only, with Contents and Pull requests set
+# to read and write.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-plz-release:
+    name: Release-plz release
+    runs-on: ubuntu-latest
+    if: github.repository == 'ckir/flux'
+    concurrency:
+      group: release-plz-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz release
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.PR_UPDATER_TOKEN }}
+
+  release-plz-pr:
+    name: Release-plz PR
+    runs-on: ubuntu-latest
+    if: github.repository == 'ckir/flux'
+    concurrency:
+      group: release-plz-pr
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz release-pr
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.PR_UPDATER_TOKEN }}

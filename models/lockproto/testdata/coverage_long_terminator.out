@@ -1,0 +1,570 @@
+exit=0
+@!@!@STARTMSG 2201:0 @!@!@
+The coverage statistics at 2026-09-13 16:51:12
+@!@!@ENDMSG 2201 @!@!@
+@!@!@STARTMSG 2773:0 @!@!@
+<Init line 594, col 1 to line 594, col 4 of module LockProtocol>: 1:1
+@!@!@ENDMSG 2773 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_1_open line 628, col 1 to line 628, col 17 of module LockProtocol>: 16201:40011
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_1_trylock line 655, col 1 to line 655, col 20 of module LockProtocol>: 18497:44651
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_1_read line 673, col 1 to line 673, col 17 of module LockProtocol>: 32762:99011
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_1_close line 707, col 1 to line 707, col 18 of module LockProtocol>: 36448:169343
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<classify_crashed line 727, col 1 to line 727, col 22 of module LockProtocol>: 4200:108608
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S96_1_create line 744, col 1 to line 744, col 18 of module LockProtocol>: 11280:43469
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S96_1_dircheck line 766, col 1 to line 766, col 20 of module LockProtocol>: 8503:25947
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S96_1_ownlock line 779, col 1 to line 779, col 19 of module LockProtocol>: 6198:24131
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S96_1_record_begin line 796, col 1 to line 796, col 24 of module LockProtocol>: 6911:23264
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S96_1_record_end line 810, col 1 to line 810, col 22 of module LockProtocol>: 10273:28579
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S96_1_backoff line 828, col 1 to line 828, col 19 of module LockProtocol>: 0:0
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S96_1_ownlock_backoff line 846, col 1 to line 846, col 27 of module LockProtocol>: 1067:14851
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<acquire_crashed line 865, col 1 to line 865, col 21 of module LockProtocol>: 8642:35877
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s1 line 882, col 1 to line 882, col 15 of module LockProtocol>: 6047:6688
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s2 line 901, col 1 to line 901, col 15 of module LockProtocol>: 3895:4784
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s3 line 926, col 1 to line 926, col 15 of module LockProtocol>: 3609:4771
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s4 line 940, col 1 to line 940, col 15 of module LockProtocol>: 2214:3628
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s4_lock line 957, col 1 to line 957, col 20 of module LockProtocol>: 2088:2692
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s4_record_begin line 974, col 1 to line 974, col 28 of module LockProtocol>: 1175:1932
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s4_record_end line 990, col 1 to line 990, col 26 of module LockProtocol>: 1017:1255
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s5 line 1006, col 1 to line 1006, col 15 of module LockProtocol>: 1062:1355
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s4_drop line 1026, col 1 to line 1026, col 20 of module LockProtocol>: 805:932
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s4_lock_backoff line 1041, col 1 to line 1041, col 28 of module LockProtocol>: 276:402
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_putback line 1058, col 1 to line 1058, col 20 of module LockProtocol>: 0:0
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_restart line 1076, col 1 to line 1076, col 20 of module LockProtocol>: 943:1201
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_release line 1086, col 1 to line 1086, col 20 of module LockProtocol>: 1169:1858
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<recover_crashed line 1105, col 1 to line 1105, col 21 of module LockProtocol>: 2357:4328
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S99_check line 1125, col 1 to line 1125, col 15 of module LockProtocol>: 16422:64694
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S99_write line 1146, col 1 to line 1146, col 15 of module LockProtocol>: 12576:60714
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S99_release line 1158, col 1 to line 1158, col 17 of module LockProtocol>: 17162:84610
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S99_close line 1174, col 1 to line 1174, col 15 of module LockProtocol>: 22224:111787
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<publish_crashed line 1191, col 1 to line 1191, col 21 of module LockProtocol>: 0:69022
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<own_start line 1205, col 1 to line 1205, col 15 of module LockProtocol>: 136:10544
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<own_publish line 1220, col 1 to line 1220, col 17 of module LockProtocol>: 22698:103070
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<own_end line 1235, col 1 to line 1235, col 13 of module LockProtocol>: 38328:177723
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<plain_start line 1247, col 1 to line 1247, col 17 of module LockProtocol>: 2363:10690
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S21_1_decide line 1266, col 1 to line 1266, col 18 of module LockProtocol>: 23644:75085
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S21_1_refused line 1294, col 1 to line 1294, col 19 of module LockProtocol>: 27092:69281
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<plain_recover line 1303, col 1 to line 1303, col 19 of module LockProtocol>: 0:0
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<plain_recovered line 1319, col 1 to line 1319, col 21 of module LockProtocol>: 0:0
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<plain_recovered_done line 1335, col 1 to line 1335, col 26 of module LockProtocol>: 0:0
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<plain_acquire line 1346, col 1 to line 1346, col 19 of module LockProtocol>: 10678:27516
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<plain_publish line 1360, col 1 to line 1360, col 19 of module LockProtocol>: 23707:59551
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<plain_end line 1375, col 1 to line 1375, col 15 of module LockProtocol>: 58727:154233
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<clean_start line 1527, col 1 to line 1527, col 17 of module LockProtocol>: 10264:14661
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S251_1_classify line 1546, col 1 to line 1546, col 21 of module LockProtocol>: 78328:106534
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<clean_refused line 1569, col 1 to line 1569, col 19 of module LockProtocol>: 96168:125429
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<clean_recover line 1578, col 1 to line 1578, col 19 of module LockProtocol>: 6703:7550
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S251_1_delete line 1594, col 1 to line 1594, col 19 of module LockProtocol>: 1678:3055
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S251_1_close line 1612, col 1 to line 1612, col 18 of module LockProtocol>: 298:367
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<clean_end line 1628, col 1 to line 1628, col 15 of module LockProtocol>: 126493:157601
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<env_loop line 1643, col 1 to line 1643, col 8 of module LockProtocol>: 97841:537356
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<env_done line 1670, col 1 to line 1670, col 8 of module LockProtocol>: 50174:286482
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<Terminating line 1682, col 1 to line 1682, col 11 of module LockProtocol>: 0:459
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2774:0 @!@!@
+<FsOk line 1714, col 1 to line 1714, col 4 of module LockProtocol>
+@!@!@ENDMSG 2774 @!@!@
+@!@!@STARTMSG 2774:0 @!@!@
+<Classifiable line 1718, col 1 to line 1718, col 12 of module LockProtocol>
+@!@!@ENDMSG 2774 @!@!@
+@!@!@STARTMSG 2774:0 @!@!@
+<SingleWriter line 1723, col 1 to line 1723, col 12 of module LockProtocol>
+@!@!@ENDMSG 2774 @!@!@
+@!@!@STARTMSG 2774:0 @!@!@
+<PlainNeverOwnsUncertain line 1727, col 1 to line 1727, col 23 of module LockProtocol>
+@!@!@ENDMSG 2774 @!@!@
+@!@!@STARTMSG 2774:0 @!@!@
+<ForeignUntouched line 1730, col 1 to line 1730, col 16 of module LockProtocol>
+@!@!@ENDMSG 2774 @!@!@
+@!@!@STARTMSG 2774:0 @!@!@
+<RefusalJustified line 1739, col 1 to line 1739, col 16 of module LockProtocol>
+@!@!@ENDMSG 2774 @!@!@
+@!@!@STARTMSG 2202:0 @!@!@
+End of statistics.
+@!@!@ENDMSG 2202 @!@!@
+@!@!@STARTMSG 2201:0 @!@!@
+The coverage statistics at 2026-09-13 16:53:12
+@!@!@ENDMSG 2201 @!@!@
+@!@!@STARTMSG 2773:0 @!@!@
+<Init line 594, col 1 to line 594, col 4 of module LockProtocol>: 1:1
+@!@!@ENDMSG 2773 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_1_open line 628, col 1 to line 628, col 17 of module LockProtocol>: 16711:42180
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_1_trylock line 655, col 1 to line 655, col 20 of module LockProtocol>: 20413:51192
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_1_read line 673, col 1 to line 673, col 17 of module LockProtocol>: 37792:119217
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_1_close line 707, col 1 to line 707, col 18 of module LockProtocol>: 42828:217629
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<classify_crashed line 727, col 1 to line 727, col 22 of module LockProtocol>: 4292:141324
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S96_1_create line 744, col 1 to line 744, col 18 of module LockProtocol>: 12663:48351
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S96_1_dircheck line 766, col 1 to line 766, col 20 of module LockProtocol>: 9986:30318
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S96_1_ownlock line 779, col 1 to line 779, col 19 of module LockProtocol>: 7684:30318
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S96_1_record_begin line 796, col 1 to line 796, col 24 of module LockProtocol>: 9133:31701
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S96_1_record_end line 810, col 1 to line 810, col 22 of module LockProtocol>: 14224:39495
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S96_1_backoff line 828, col 1 to line 828, col 19 of module LockProtocol>: 0:0
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S96_1_ownlock_backoff line 846, col 1 to line 846, col 27 of module LockProtocol>: 1078:16146
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<acquire_crashed line 865, col 1 to line 865, col 21 of module LockProtocol>: 11999:45966
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s1 line 882, col 1 to line 882, col 15 of module LockProtocol>: 11402:12927
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s2 line 901, col 1 to line 901, col 15 of module LockProtocol>: 6547:8378
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s3 line 926, col 1 to line 926, col 15 of module LockProtocol>: 7354:12919
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s4 line 940, col 1 to line 940, col 15 of module LockProtocol>: 7068:12910
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s4_lock line 957, col 1 to line 957, col 20 of module LockProtocol>: 7422:9610
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s4_record_begin line 974, col 1 to line 974, col 28 of module LockProtocol>: 5415:9659
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s4_record_end line 990, col 1 to line 990, col 26 of module LockProtocol>: 6853:9549
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s5 line 1006, col 1 to line 1006, col 15 of module LockProtocol>: 10560:18211
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s4_drop line 1026, col 1 to line 1026, col 20 of module LockProtocol>: 4925:11472
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s4_lock_backoff line 1041, col 1 to line 1041, col 28 of module LockProtocol>: 627:1452
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_putback line 1058, col 1 to line 1058, col 20 of module LockProtocol>: 0:0
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_restart line 1076, col 1 to line 1076, col 20 of module LockProtocol>: 5471:8100
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_release line 1086, col 1 to line 1086, col 20 of module LockProtocol>: 12182:33078
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<recover_crashed line 1105, col 1 to line 1105, col 21 of module LockProtocol>: 9586:23703
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S99_check line 1125, col 1 to line 1125, col 15 of module LockProtocol>: 26417:107411
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S99_write line 1146, col 1 to line 1146, col 15 of module LockProtocol>: 21622:106442
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S99_release line 1158, col 1 to line 1158, col 17 of module LockProtocol>: 33308:147638
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S99_close line 1174, col 1 to line 1174, col 15 of module LockProtocol>: 44621:243899
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<publish_crashed line 1191, col 1 to line 1191, col 21 of module LockProtocol>: 0:165224
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<own_start line 1205, col 1 to line 1205, col 15 of module LockProtocol>: 136:11592
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<own_publish line 1220, col 1 to line 1220, col 17 of module LockProtocol>: 27763:134257
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<own_end line 1235, col 1 to line 1235, col 13 of module LockProtocol>: 51951:316032
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<plain_start line 1247, col 1 to line 1247, col 17 of module LockProtocol>: 2389:11082
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S21_1_decide line 1266, col 1 to line 1266, col 18 of module LockProtocol>: 28022:89337
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S21_1_refused line 1294, col 1 to line 1294, col 19 of module LockProtocol>: 34393:92340
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<plain_recover line 1303, col 1 to line 1303, col 19 of module LockProtocol>: 278:357
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<plain_recovered line 1319, col 1 to line 1319, col 21 of module LockProtocol>: 114:131
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<plain_recovered_done line 1335, col 1 to line 1335, col 26 of module LockProtocol>: 49:61
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<plain_acquire line 1346, col 1 to line 1346, col 19 of module LockProtocol>: 11651:30063
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<plain_publish line 1360, col 1 to line 1360, col 19 of module LockProtocol>: 35079:90712
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<plain_end line 1375, col 1 to line 1375, col 15 of module LockProtocol>: 101634:287504
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<clean_start line 1527, col 1 to line 1527, col 17 of module LockProtocol>: 10423:15054
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S251_1_classify line 1546, col 1 to line 1546, col 21 of module LockProtocol>: 94826:134313
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<clean_refused line 1569, col 1 to line 1569, col 19 of module LockProtocol>: 126930:170190
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<clean_recover line 1578, col 1 to line 1578, col 19 of module LockProtocol>: 10833:12570
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S251_1_delete line 1594, col 1 to line 1594, col 19 of module LockProtocol>: 28108:37872
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S251_1_close line 1612, col 1 to line 1612, col 18 of module LockProtocol>: 18726:26131
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<clean_end line 1628, col 1 to line 1628, col 15 of module LockProtocol>: 210601:269773
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<env_loop line 1643, col 1 to line 1643, col 8 of module LockProtocol>: 143541:783547
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<env_done line 1670, col 1 to line 1670, col 8 of module LockProtocol>: 82974:474628
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<Terminating line 1682, col 1 to line 1682, col 11 of module LockProtocol>: 0:3752
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2774:0 @!@!@
+<FsOk line 1714, col 1 to line 1714, col 4 of module LockProtocol>
+@!@!@ENDMSG 2774 @!@!@
+@!@!@STARTMSG 2774:0 @!@!@
+<Classifiable line 1718, col 1 to line 1718, col 12 of module LockProtocol>
+@!@!@ENDMSG 2774 @!@!@
+@!@!@STARTMSG 2774:0 @!@!@
+<SingleWriter line 1723, col 1 to line 1723, col 12 of module LockProtocol>
+@!@!@ENDMSG 2774 @!@!@
+@!@!@STARTMSG 2774:0 @!@!@
+<PlainNeverOwnsUncertain line 1727, col 1 to line 1727, col 23 of module LockProtocol>
+@!@!@ENDMSG 2774 @!@!@
+@!@!@STARTMSG 2774:0 @!@!@
+<ForeignUntouched line 1730, col 1 to line 1730, col 16 of module LockProtocol>
+@!@!@ENDMSG 2774 @!@!@
+@!@!@STARTMSG 2774:0 @!@!@
+<RefusalJustified line 1739, col 1 to line 1739, col 16 of module LockProtocol>
+@!@!@ENDMSG 2774 @!@!@
+@!@!@STARTMSG 2777:0 @!@!@
+End of statistics (please note that for performance reasons large models
+are best checked with coverage and cost statistics disabled).
+@!@!@ENDMSG 2777 @!@!@
+@!@!@STARTMSG 2201:0 @!@!@
+The coverage statistics at 2026-09-13 16:53:16
+@!@!@ENDMSG 2201 @!@!@
+@!@!@STARTMSG 2773:0 @!@!@
+<Init line 594, col 1 to line 594, col 4 of module LockProtocol>: 1:1
+@!@!@ENDMSG 2773 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_1_open line 628, col 1 to line 628, col 17 of module LockProtocol>: 16711:42180
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_1_trylock line 655, col 1 to line 655, col 20 of module LockProtocol>: 20413:51192
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_1_read line 673, col 1 to line 673, col 17 of module LockProtocol>: 37792:119217
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_1_close line 707, col 1 to line 707, col 18 of module LockProtocol>: 42828:217629
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<classify_crashed line 727, col 1 to line 727, col 22 of module LockProtocol>: 4292:141324
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S96_1_create line 744, col 1 to line 744, col 18 of module LockProtocol>: 12663:48351
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S96_1_dircheck line 766, col 1 to line 766, col 20 of module LockProtocol>: 9986:30318
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S96_1_ownlock line 779, col 1 to line 779, col 19 of module LockProtocol>: 7684:30318
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S96_1_record_begin line 796, col 1 to line 796, col 24 of module LockProtocol>: 9133:31701
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S96_1_record_end line 810, col 1 to line 810, col 22 of module LockProtocol>: 14224:39495
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S96_1_backoff line 828, col 1 to line 828, col 19 of module LockProtocol>: 0:0
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S96_1_ownlock_backoff line 846, col 1 to line 846, col 27 of module LockProtocol>: 1078:16146
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<acquire_crashed line 865, col 1 to line 865, col 21 of module LockProtocol>: 12001:45972
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s1 line 882, col 1 to line 882, col 15 of module LockProtocol>: 11402:12927
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s2 line 901, col 1 to line 901, col 15 of module LockProtocol>: 6548:8379
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s3 line 926, col 1 to line 926, col 15 of module LockProtocol>: 7359:12924
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s4 line 940, col 1 to line 940, col 15 of module LockProtocol>: 7078:12924
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s4_lock line 957, col 1 to line 957, col 20 of module LockProtocol>: 7453:9657
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s4_record_begin line 974, col 1 to line 974, col 28 of module LockProtocol>: 5492:9822
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s4_record_end line 990, col 1 to line 990, col 26 of module LockProtocol>: 7160:9954
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s5 line 1006, col 1 to line 1006, col 15 of module LockProtocol>: 11123:19833
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s4_drop line 1026, col 1 to line 1026, col 20 of module LockProtocol>: 4925:11484
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_s4_lock_backoff line 1041, col 1 to line 1041, col 28 of module LockProtocol>: 627:1452
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_putback line 1058, col 1 to line 1058, col 20 of module LockProtocol>: 0:0
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_restart line 1076, col 1 to line 1076, col 20 of module LockProtocol>: 5471:8100
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S240_3_release line 1086, col 1 to line 1086, col 20 of module LockProtocol>: 12459:34362
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<recover_crashed line 1105, col 1 to line 1105, col 21 of module LockProtocol>: 10078:25281
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S99_check line 1125, col 1 to line 1125, col 15 of module LockProtocol>: 26641:109383
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S99_write line 1146, col 1 to line 1146, col 15 of module LockProtocol>: 21882:109383
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S99_release line 1158, col 1 to line 1158, col 17 of module LockProtocol>: 33885:152040
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S99_close line 1174, col 1 to line 1174, col 15 of module LockProtocol>: 45559:250920
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<publish_crashed line 1191, col 1 to line 1191, col 21 of module LockProtocol>: 0:170115
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<own_start line 1205, col 1 to line 1205, col 15 of module LockProtocol>: 136:11592
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<own_publish line 1220, col 1 to line 1220, col 17 of module LockProtocol>: 27774:134928
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<own_end line 1235, col 1 to line 1235, col 13 of module LockProtocol>: 52384:320871
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<plain_start line 1247, col 1 to line 1247, col 17 of module LockProtocol>: 2389:11082
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S21_1_decide line 1266, col 1 to line 1266, col 18 of module LockProtocol>: 28022:89337
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S21_1_refused line 1294, col 1 to line 1294, col 19 of module LockProtocol>: 34393:92340
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<plain_recover line 1303, col 1 to line 1303, col 19 of module LockProtocol>: 278:357
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<plain_recovered line 1319, col 1 to line 1319, col 21 of module LockProtocol>: 266:309
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<plain_recovered_done line 1335, col 1 to line 1335, col 26 of module LockProtocol>: 468:546
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<plain_acquire line 1346, col 1 to line 1346, col 19 of module LockProtocol>: 11651:30063
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<plain_publish line 1360, col 1 to line 1360, col 19 of module LockProtocol>: 35100:91032
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<plain_end line 1375, col 1 to line 1375, col 15 of module LockProtocol>: 102810:292557
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<clean_start line 1527, col 1 to line 1527, col 17 of module LockProtocol>: 10423:15054
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S251_1_classify line 1546, col 1 to line 1546, col 21 of module LockProtocol>: 94826:134313
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<clean_refused line 1569, col 1 to line 1569, col 19 of module LockProtocol>: 126930:170190
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<clean_recover line 1578, col 1 to line 1578, col 19 of module LockProtocol>: 10833:12570
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S251_1_delete line 1594, col 1 to line 1594, col 19 of module LockProtocol>: 29644:40308
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<S251_1_close line 1612, col 1 to line 1612, col 18 of module LockProtocol>: 20018:28152
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<clean_end line 1628, col 1 to line 1628, col 15 of module LockProtocol>: 214400:276090
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<env_loop line 1643, col 1 to line 1643, col 8 of module LockProtocol>: 144886:789377
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<env_done line 1670, col 1 to line 1670, col 8 of module LockProtocol>: 84769:482116
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2772:0 @!@!@
+<Terminating line 1682, col 1 to line 1682, col 11 of module LockProtocol>: 0:3980
+@!@!@ENDMSG 2772 @!@!@
+@!@!@STARTMSG 2774:0 @!@!@
+<FsOk line 1714, col 1 to line 1714, col 4 of module LockProtocol>
+@!@!@ENDMSG 2774 @!@!@
+@!@!@STARTMSG 2774:0 @!@!@
+<Classifiable line 1718, col 1 to line 1718, col 12 of module LockProtocol>
+@!@!@ENDMSG 2774 @!@!@
+@!@!@STARTMSG 2774:0 @!@!@
+<SingleWriter line 1723, col 1 to line 1723, col 12 of module LockProtocol>
+@!@!@ENDMSG 2774 @!@!@
+@!@!@STARTMSG 2774:0 @!@!@
+<PlainNeverOwnsUncertain line 1727, col 1 to line 1727, col 23 of module LockProtocol>
+@!@!@ENDMSG 2774 @!@!@
+@!@!@STARTMSG 2774:0 @!@!@
+<ForeignUntouched line 1730, col 1 to line 1730, col 16 of module LockProtocol>
+@!@!@ENDMSG 2774 @!@!@
+@!@!@STARTMSG 2774:0 @!@!@
+<RefusalJustified line 1739, col 1 to line 1739, col 16 of module LockProtocol>
+@!@!@ENDMSG 2774 @!@!@
+@!@!@STARTMSG 2777:0 @!@!@
+End of statistics (please note that for performance reasons large models
+are best checked with coverage and cost statistics disabled).
+@!@!@ENDMSG 2777 @!@!@

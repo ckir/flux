@@ -6,9 +6,9 @@
 
 [package]
 name = "flux"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.98.1"
 license = "PolyForm-Noncommercial-1.0.0"
 publish = false
 
@@ -25,6 +25,7 @@ harness = false
 blake3 = { workspace = true }
 criterion = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 toml = { workspace = true }
 
 [workspace]
@@ -39,9 +40,9 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.5.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.98.1"
 license = "PolyForm-Noncommercial-1.0.0"
 repository = "https://github.com/ckir/flux"
 publish = false
@@ -57,6 +58,7 @@ clap = { version = "4.6", features = ["derive"] }
 rayon = "1.12"
 crossbeam-channel = "0.5"
 blake3 = "1.8"
+uuid = { version = "1", features = ["v4"] }
 indicatif = "0.18"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
@@ -68,7 +70,8 @@ serde_json = "1"
 toml = "1.1"
 # crates/flux-platform/tests/fs_semantics.rs probes (lock-model design Section 10)
 rustix = { version = "1.1", features = ["fs"] }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_Security", "Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_SystemInformation"] }
+libc = "0.2"
 walkdir = "2.5"
 # jwalk is in the spec §67 candidate list but crates.io currently ships it with the
 # description "Use `dua-core` instead" and it has not moved since 0.9.0 — treat it as
@@ -86,14 +89,18 @@ criterion = "0.8"
 proptest = "1.11"
 tempfile = "3"
 
-[workspace.metadata.release]
-shared-version = true
-tag-name = "v{{version}}"
-tag-prefix = ""
-pre-release-commit-message = "release: v{{version}}"
-publish = false
-
 [profile.ci]
 inherits = "dev"
 debug = 0
 strip = "debuginfo"
+
+# The shipped binary. `panic = "abort"` means a panic is a hard crash with no unwinding, so no Drop
+# runs and a held lock file is left behind rather than released - which is the dead-owner case the
+# lock protocol already models and recovers (240.2, 240.3), not a new failure mode. `strip = true`
+# removes the symbols, so a field panic gives no backtrace; the debug build keeps them.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -10,6 +10,15 @@ deterministic traversal, resumability and filesystem-native acceleration.
 engine code exists yet. The authoritative design is
 [`FLUX_FULL_UPDATED_SPEC_V16.md`](FLUX_FULL_UPDATED_SPEC_V16.md).
 
+## Performance
+
+![Flux against other copiers: the latest benchmark of main](https://ckir.github.io/flux/bench/latest.svg)
+
+Each figure is Flux's median time divided by another copier's (robocopy on Windows; `cp` and `rsync` on Linux and
+macOS), measured in the same GitHub Actions job: below 1.0, Flux is faster. Linux and macOS copy with a cold cache,
+Windows with a warm one, and a pair appears only once a calibration shows its ratio is steady.
+[The trend over time, and how it is measured.](https://ckir.github.io/flux/bench/)
+
 ## Goals
 
 - High throughput, but **correctness before performance**
@@ -60,7 +69,7 @@ flux cleanup
 
 ## Building
 
-Requires Rust 1.85+ (edition 2024).
+Requires Rust 1.98.1+ (edition 2024).
 
 ```
 cargo build --workspace

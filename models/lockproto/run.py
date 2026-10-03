@@ -21,6 +21,8 @@ import json  # noqa: E402
 import re  # noqa: E402
 import shutil  # noqa: E402
 import subprocess  # noqa: E402
+import tempfile  # noqa: E402
+import difflib  # noqa: E402
 import time  # noqa: E402
 import tomllib  # noqa: E402
 import urllib.request  # noqa: E402
@@ -37,8 +39,13 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 TARGET = REPO / "target" / "tla"
 
-KINDS = ("check", "liveness", "seeded")
-RUN_KEYS = {"name", "module", "config", "scenario", "kind", "violated", "open_findings", "timeout_minutes"}
+KINDS = ("check", "liveness", "seeded", "witness")
+# The kinds that halt at their first counterexample, so their coverage block is a PREFIX. Derived
+# rather than restated: it is the exact complement of the kinds that get `-continue`, and two
+# copies in opposite polarity would let a sixth kind fall between them (capstone, plan 3, round 6).
+HALTING_KINDS = tuple(k for k in KINDS if k not in ("check", "liveness"))
+RUN_KEYS = {"name", "module", "config", "scenario", "kind", "violated", "open_findings", "unreached", "timeout_minutes",
+            "constants", "symmetry", "tightened", "job"}
 FINDING_KEYS = {"name", "tracking", "fix_flag"}
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 FIX_FLAG = re.compile(r"FIX_[A-Z0-9_]+")
@@ -56,6 +63,17 @@ C_COUNTEREXAMPLE = 2264  # "The following behavior constitutes a counter-example
 ALLOWED_ERROR_CODES = {C_INVARIANT_INITIAL, C_INVARIANT, C_DEADLOCK, C_TEMPORAL, C_BEHAVIOR, C_COUNTEREXAMPLE}
 SEVERITY_ERROR = 1
 
+# '-coverage 1' message codes (design Section 4, "Five things about reading that report").
+C_COVERAGE_START = 2201  # "The coverage statistics at ..."
+C_COVERAGE_ACTION = 2772  # one action's line: <Name ...>: DISTINCT:TOTAL - a label
+C_COVERAGE_INIT = 2773  # the Init action's line, same shape - not a label
+C_COVERAGE_DEF = 2774  # an invariant or definition being evaluated, no counts - not a label
+C_COVERAGE_COST = 2221  # an indented cost sub-line for an expression - not a label
+C_COVERAGE_END = 2202  # "End of statistics[...]"
+C_COVERAGE_END_LONG = 2777  # "End of statistics (please note that for performance reasons ...)";
+# TLC prints this form, instead of 2202, once a run has gone on long enough to warn about the cost
+# of leaving coverage/cost statistics on.
+
 DEADLOCK = "DEADLOCK"
 TRACE_STATES_SHOWN = 60
 
@@ -66,7 +84,7 @@ CFG_KEYWORDS = {
     "PROPERTY": "PROPERTY", "PROPERTIES": "PROPERTY", "SYMMETRY": "SYMMETRY",
     "CONSTRAINT": "CONSTRAINT", "CONSTRAINTS": "CONSTRAINT", "ACTION_CONSTRAINT": "ACTION_CONSTRAINT",
     "ACTION_CONSTRAINTS": "ACTION_CONSTRAINT", "VIEW": "VIEW", "CHECK_DEADLOCK": "CHECK_DEADLOCK",
-    "POSTCONDITION": "POSTCONDITION", "ALIAS": "ALIAS",
+    "POSTCONDITION": "POSTCONDITION", "ALIAS": "ALIAS", "TYPE": "TYPE", "TYPE_CONSTRAINT": "TYPE_CONSTRAINT",
 }
 
 
@@ -94,7 +112,40 @@ class Run:
     kind: str
     violated: tuple[str, ...]
     open_findings: tuple[OpenFinding, ...]
+    unreached: tuple[tuple[str, str], ...]
     timeout_minutes: int
+    constants: tuple[tuple[str, object], ...]
+    symmetry: tuple[str, str] | None
+    tightened: tuple[str, str] | None
+    # The CI job this run belongs to. Defaults to the run's platform, so one job per
+    # (scenario, platform); a run may name a longer id to split a scenario that does not fit one
+    # job's budget. It always starts with the platform, so the job's display name stays true.
+    # The empty default is for test helpers that build a Run directly; _load_run always sets it.
+    job: str = ""
+
+
+BRANCH_KEYS = frozenset({"name", "module", "label", "guard", "side", "reason"})
+
+
+@dataclass(frozen=True)
+class Branch:
+    """One arm the suite must be seen to run (cut 6 Part 2), resolved at load time against the generated module."""
+    name: str
+    module: str
+    label: str
+    guard: str
+    side: str  # "then" or "else"
+    reason: str
+    span: tuple[tuple[int, int], tuple[int, int]]
+
+
+@dataclass(frozen=True)
+class Expected:
+    scenarios: list[str]
+    runs: list[Run]
+    never_reached: tuple[tuple[str, str], ...]
+    deferred: tuple[tuple[str, str, str], ...]
+    branches: tuple[Branch, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -161,6 +212,96 @@ def cfg_properties(text: str) -> list[str]:
     return [t for t in cfg_sections(text).get("PROPERTY", []) if IDENT.fullmatch(t)]
 
 
+def cfg_constants(text: str) -> dict[str, object]:
+    """Parse the literal-valued assignments in a TLC .cfg's CONSTANT/CONSTANTS section.
+
+    An entry is returned only for a literal value: an integer literal (int, optionally negative), TRUE/FALSE
+    (bool), a double-quoted string (str, unquoted), or a set literal of identifiers ({a, b} or {}, frozenset[str]).
+    A model-value assignment (NAME = someIdentifier) is omitted: it names no literal the runner can compare
+    against 'constants'. The .cfg is the one file a person can edit to make a failing run pass, so this parser
+    fails CLOSED (raises ExpectedError) rather than silently skipping anything else it cannot read: a `<-`
+    substitution, the same constant assigned twice, a value that is none of the literal shapes above and is not
+    a single identifier, or any token sequence that is not `NAME = VALUE` (a missing '=', a stray token, an
+    unterminated set, or a set element that is not an identifier)."""
+    tokens: list[tuple[str, int, int]] = []
+    current: str | None = None
+    for match in _CFG_TOKEN.finditer(text):
+        token = match.group(0)
+        if _is_comment(token):
+            continue
+        if token in CFG_KEYWORDS:
+            current = CFG_KEYWORDS[token]
+            continue
+        if current == "CONSTANT":
+            tokens.append((token, match.start(), match.end()))
+
+    result: dict[str, object] = {}
+    seen: set[str] = set()
+    i, n = 0, len(tokens)
+    while i < n:
+        name, _, _ = tokens[i]
+        if IDENT.fullmatch(name) is None:
+            raise ExpectedError(f"the config's CONSTANT section has an unexpected token where a constant name "
+                                 f"was expected: {name!r}")
+        i += 1
+        if i >= n:
+            raise ExpectedError(f"the config's CONSTANT section ends after {name!r} with no '=' and value")
+        op, _, _ = tokens[i]
+        i += 1
+        if op == "<-":
+            raise ExpectedError(f"the config substitutes an operator for {name!r} ('{name} <- ...'), which this "
+                                 "runner cannot read as a literal constant")
+        if op != "=":
+            raise ExpectedError(f"the config's CONSTANT section has {name!r} not followed by '=' (found {op!r})")
+        if name in seen:
+            raise ExpectedError(f"the config assigns {name!r} more than once in its CONSTANT section")
+        seen.add(name)
+        if i >= n:
+            raise ExpectedError(f"the config's CONSTANT section assigns {name!r} no value")
+        value, vstart, vend = tokens[i]
+        i += 1
+        if value.startswith('"'):
+            result[name] = value[1:-1]
+        elif value == "{":
+            elements: list[str] = []
+            expect_element = True
+            closed = False
+            while i < n:
+                tok, _, _ = tokens[i]
+                if tok == "}":
+                    if expect_element and elements:
+                        raise ExpectedError(f"the config's set for {name!r} has a trailing comma before '}}'")
+                    i += 1
+                    closed = True
+                    break
+                if expect_element:
+                    if IDENT.fullmatch(tok) is None:
+                        raise ExpectedError(f"the config's set for {name!r} has a non-identifier element {tok!r}")
+                    elements.append(tok)
+                    expect_element = False
+                else:
+                    if tok != ",":
+                        raise ExpectedError(f"the config's set for {name!r} is missing a comma before {tok!r}")
+                    expect_element = True
+                i += 1
+            if not closed:
+                raise ExpectedError(f"the config's set for {name!r} is never closed with '}}'")
+            result[name] = frozenset(elements)
+        elif value.isdigit():
+            result[name] = int(value)
+        elif value == "-" and i < n and tokens[i][0].isdigit() and tokens[i][1] == vend:
+            digits, _, _ = tokens[i]
+            i += 1
+            result[name] = -int(digits)
+        elif value in ("TRUE", "FALSE"):
+            result[name] = value == "TRUE"
+        elif IDENT.fullmatch(value) is not None:
+            pass  # a model value; not a literal, and not an error
+        else:
+            raise ExpectedError(f"the config assigns {name!r} a value this runner cannot read: {value!r}")
+    return result
+
+
 def fixed_cfg_text(text: str, flags: list[str]) -> str:
     """Return the .cfg text with each fix flag switched from FALSE to TRUE (comments are left alone)."""
     for flag in flags:
@@ -191,7 +332,86 @@ def _str_list(value: object, where: str) -> tuple[str, ...]:
     return tuple(value)
 
 
-def load_expected(path: Path) -> tuple[list[str], list[Run]]:
+def _load_label_reasons(value: object, subject: str) -> tuple[tuple[str, str], ...]:
+    """Parse a list of {label, reason} tables, as used by 'unreached' and 'never_reached'.
+
+    `subject` names the field for error messages, e.g. "run 'x-check': unreached" or "'never_reached'".
+    A label must be a non-empty TLA+ identifier: real PlusCal labels (e.g. `plain_recover`) do not all
+    start with `S<digits>_`, so that stricter shape is not checked here. Whether the label exists in the
+    model at all is a later task's concern."""
+    _require(isinstance(value, list), f"{subject} must be an array of tables")
+    assert isinstance(value, list)
+    entries: list[tuple[str, str]] = []
+    for item in value:
+        _require(isinstance(item, dict) and set(item) == {"label", "reason"},
+                 f"{subject}: each entry has exactly 'label' and 'reason'")
+        label, reason = item.get("label"), item.get("reason")
+        _require(isinstance(label, str) and IDENT.fullmatch(label) is not None,
+                 f"{subject}: each label must be a TLA+ identifier")
+        _require(isinstance(reason, str) and reason, f"{subject}: each reason must be a non-empty string")
+        entries.append((label, reason))
+    labels = [label for label, _ in entries]
+    _require(len(set(labels)) == len(labels), f"{subject} has duplicate labels")
+    return tuple(entries)
+
+
+def _load_deferred(value: object, subject: str) -> tuple[tuple[str, str, str], ...]:
+    """Parse the top-level 'deferred' list (design Section 4): {label, scenario, reason} tables
+    holding a label that no BUILT scenario covers but a planned one will. Unlike 'never_reached', a
+    deferred label is reachable and keeps its trace.toml entries. Whether the label exists in some
+    run's module, whether it collides with 'never_reached', and whether its scenario is already
+    built are checked by the caller, which has the label universe and 'scenarios' list to hand."""
+    _require(isinstance(value, list), f"{subject} must be an array of tables")
+    assert isinstance(value, list)
+    entries: list[tuple[str, str, str]] = []
+    for item in value:
+        _require(isinstance(item, dict) and set(item) == {"label", "scenario", "reason"},
+                 f"{subject}: each entry has exactly 'label', 'scenario', 'reason'")
+        label, scenario, reason = item.get("label"), item.get("scenario"), item.get("reason")
+        _require(isinstance(label, str) and IDENT.fullmatch(label) is not None,
+                 f"{subject}: each label must be a TLA+ identifier")
+        _require(isinstance(scenario, str) and scenario, f"{subject}: each scenario must be a non-empty string")
+        _require(isinstance(reason, str) and reason, f"{subject}: each reason must be a non-empty string")
+        entries.append((label, scenario, reason))
+    labels = [label for label, _, _ in entries]
+    _require(len(set(labels)) == len(labels), f"{subject} has duplicate labels")
+    return tuple(entries)
+
+
+def _load_branches(value: object, base: Path) -> tuple[Branch, ...]:
+    """Validate expected.toml's `branches` and resolve each anchor. Unknown or missing keys, a bad name or side,
+    a module that does not exist, or an anchor that resolves to nothing or to two places all fail at load."""
+    _require(isinstance(value, list), "'branches' must be an array of tables")
+    assert isinstance(value, list)
+    branches: list[Branch] = []
+    for i, e in enumerate(value):
+        where = f"'branches' #{i + 1}"
+        _require(isinstance(e, dict), f"{where} must be a table")
+        assert isinstance(e, dict)
+        required = BRANCH_KEYS - {"module"}
+        _require(set(e) <= BRANCH_KEYS and required <= set(e),
+                 f"{where}: keys are name, label, guard, side, reason and optionally module; got {sorted(e)}")
+        for key, v in e.items():
+            _require(isinstance(v, str) and v != "", f"{where}: '{key}' must be a non-empty string")
+        name, module = e["name"], e.get("module", "LockProtocol")
+        where = f"'branches' {name!r}"
+        _require(re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", name) is not None,
+                 f"{where}: a name is lower-case words joined by '-'")
+        _require(e["side"] in ("then", "else"), f"{where}: side must be 'then' or 'else'")
+        path = base / f"{module}.tla"
+        _require(IDENT.fullmatch(module) is not None and path.is_file(), f"{where}: module {module}.tla not found")
+        try:
+            span = resolve_branch(path.read_text(encoding="utf-8"), e["label"], e["guard"], e["side"])
+        except ExpectedError as err:
+            raise ExpectedError(f"{where}: {err}") from err
+        branches.append(Branch(name, module, e["label"], e["guard"], e["side"], e["reason"], span))
+    names = [b.name for b in branches]
+    _require(len(set(names)) == len(names),
+             f"'branches': duplicate names {sorted({n for n in names if names.count(n) > 1})}")
+    return tuple(branches)
+
+
+def load_expected(path: Path) -> Expected:
     """Load and validate expected.toml; module and config paths are resolved beside it."""
     base = path.parent
     try:
@@ -199,7 +419,10 @@ def load_expected(path: Path) -> tuple[list[str], list[Run]]:
     except (OSError, tomllib.TOMLDecodeError) as err:
         raise ExpectedError(f"cannot read {path}: {err}") from err
 
-    _require(set(data) <= {"scenarios", "run"}, f"unknown top-level keys: {sorted(set(data) - {'scenarios', 'run'})}")
+    top = {"scenarios", "run", "never_reached", "deferred", "branches"}
+    _require(set(data) <= top, f"unknown top-level keys: {sorted(set(data) - top)}")
+    never_reached = _load_label_reasons(data.get("never_reached", []), "'never_reached'")
+    deferred = _load_deferred(data.get("deferred", []), "'deferred'")
     scenarios = data.get("scenarios")
     _require(isinstance(scenarios, list) and scenarios and all(isinstance(s, str) for s in scenarios),
              "'scenarios' must be a non-empty list of names")
@@ -219,12 +442,596 @@ def load_expected(path: Path) -> tuple[list[str], list[Run]]:
     _require(len(set(names)) == len(names), f"duplicate run names: {sorted({n for n in names if names.count(n) > 1})}")
     for s in scenarios:
         _require(any(r.scenario == s for r in runs), f"scenario {s!r} has no runs")
+    # NOTE this guard reads DECLARED open_findings, and the two scenarios that actually carry an open
+    # finding - breaklock-remote and mixed-remote, on SingleWriter - do not declare one: their check runs
+    # cannot, because TLC dies building the traces, so the finding is carried by a witness/-fixed pair of
+    # hand-written configs instead. The guard is therefore inert for exactly the scenarios it is for. That
+    # bites nothing today (neither has a seeded run) and would, the moment one is added.
     for run in runs:
         if run.kind == "seeded":
             open_names = {f.name for r in runs if r.scenario == run.scenario for f in r.open_findings}
             _require(run.violated[0] not in open_names,
                      f"{run.name}: its scenario carries an open finding on {run.violated[0]}, so the seed cannot be judged")
-    return scenarios, runs
+
+    # 'never_reached' excuses a label from every run's coverage; it must exist in some run's module.
+    module_universes = {r.module: module_labels((base / f"{r.module}.tla").read_text(encoding="utf-8"))
+                         for r in runs}
+    every_label = frozenset(label for u in module_universes.values() for label in u.labels)
+    for label, _reason in never_reached:
+        _require(label in every_label,
+                 f"'never_reached': label {label!r} is not in the label universe of any run's module")
+
+    # 'deferred' names a reachable label a scenario not yet built will cover (design Section 4): it
+    # must not collide with 'never_reached', must exist in some run's module, and its scenario must
+    # not already be one of 'scenarios' (the runner does not read trace.toml's planned_scenarios).
+    never_reached_labels = {label for label, _reason in never_reached}
+    for label, scenario, _reason in deferred:
+        _require(label not in never_reached_labels,
+                 f"'deferred': label {label!r} is also in 'never_reached'")
+        _require(label in every_label,
+                 f"'deferred': label {label!r} is not in the label universe of any run's module")
+        _require(scenario not in scenarios,
+                 f"'deferred': scenario {scenario!r} is in 'scenarios' (the scenario is already built)")
+    return Expected(scenarios, runs, never_reached, deferred, _load_branches(data.get("branches", []), base))
+
+
+def _constants_equal(a: object, b: object) -> bool:
+    """Compare two constants values: an int never equals a bool, even though bool is an int subclass."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a == b
+    if isinstance(a, int) and isinstance(b, int):
+        return a == b
+    if isinstance(a, str) and isinstance(b, str):
+        return a == b
+    if isinstance(a, frozenset) and isinstance(b, frozenset):
+        return a == b
+    return False
+
+
+def _load_constants(raw: dict, where: str) -> dict[str, object]:
+    """Parse and shape-check the 'constants' table: int (not bool), bool, str, or a set of strings."""
+    _require("constants" in raw, f"{where}: 'constants' is required")
+    value = raw["constants"]
+    _require(isinstance(value, dict), f"{where}: constants must be a table")
+    assert isinstance(value, dict)
+    result: dict[str, object] = {}
+    for key, v in value.items():
+        _require(isinstance(key, str) and IDENT.fullmatch(key) is not None,
+                 f"{where}: constants key {key!r} must be a TLA+ identifier")
+        _require(FIX_FLAG.fullmatch(key) is None, f"{where}: constants must not contain a fix flag ({key})")
+        if isinstance(v, bool):
+            result[key] = v
+        elif isinstance(v, int):
+            result[key] = v
+        elif isinstance(v, str):
+            result[key] = v
+        elif isinstance(v, list) and all(isinstance(e, str) for e in v):
+            _require(len(set(v)) == len(v), f"{where}: constants {key!r} has duplicate elements")
+            result[key] = frozenset(v)
+        else:
+            _require(False, f"{where}: constants {key!r} must be an int, bool, string, or array of strings")
+    return result
+
+
+def strip_tla_comments(text: str) -> str:
+    """Remove TLA+ comments from `text`: block comments `(* ... *)`, which nest (a depth counter),
+    and line comments from `\\*` to end of line. Used before a textual search for a definition, so a
+    definition that exists only inside a comment cannot satisfy the search."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    depth = 0
+    while i < n:
+        if depth > 0:
+            if text.startswith("(*", i):
+                depth += 1
+                i += 2
+            elif text.startswith("*)", i):
+                depth -= 1
+                i += 2
+            else:
+                i += 1
+            continue
+        if text.startswith("(*", i):
+            depth = 1
+            i += 2
+            continue
+        if text.startswith("\\*", i):
+            nl = text.find("\n", i)
+            if nl == -1:
+                i = n
+            else:
+                out.append("\n")
+                i = nl + 1
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+# ---------------------------------------------------------------------------------------
+# The model's labels and who owns them (design Section 4: the coverage gate's "four rules")
+
+
+_ALGORITHM_START = re.compile(r"\(\*\s*--(?:fair\s+algorithm|algorithm)\b")
+_PROCESS_HEADER = re.compile(r"\bprocess\s*\(\s*([A-Za-z_]\w*)\s*(\\in|=)\s*")
+_PROCEDURE_HEADER = re.compile(r"\bprocedure\s+([A-Za-z_]\w*)\s*\(")
+_CALL = re.compile(r"\bcall\s+([A-Za-z_]\w*)\s*\(")
+_LABEL_LINE = re.compile(r"^[ \t]*([A-Za-z_]\w*):(?!=)")
+_TOPLEVEL_DEF = re.compile(r"^([A-Za-z_]\w*)\s*==", re.M)
+
+
+@dataclass(frozen=True)
+class LabelUniverse:
+    """A module's label universe (design Section 4) and, for a PlusCal module, how to tell whether
+    a run's constants make a label exempt from the coverage gate.
+
+    `owners[label]` is the set of process-block ids (a process's bound name, e.g. "own", "env")
+    that own `label`, directly or by calling (transitively, through `procedure`s) the block it is
+    in; a label absent from `owners` (or mapped to an empty set) is inside a procedure no process
+    reaches, which is never exempt, so a dead procedure fails the per-run gate instead of passing it
+    vacuously (design Section 4). `blocks[block_id]` is that process block's `\\in` set
+    constant name, or None if it is declared `= VALUE` (always instantiated, so any label it owns is
+    never exempt). Both dicts are empty, and nothing is ever exempt, for a non-PlusCal module."""
+    pluscal: bool
+    labels: frozenset[str]
+    owners: dict[str, frozenset[str]]
+    blocks: dict[str, str | None]
+
+    def is_exempt(self, label: str, constants: dict[str, object]) -> bool:
+        if not self.pluscal:
+            return False
+        owners = self.owners.get(label, frozenset())
+        if not owners:  # a procedure no process calls: dead code the gate must catch, never exempt
+            return False
+        for block in owners:
+            setname = self.blocks.get(block)
+            if setname is None:  # a `= VALUE` process: always instantiated, never exempt
+                return False
+            value = constants.get(setname)
+            if not (isinstance(value, frozenset) and len(value) == 0):
+                return False
+        return True
+
+
+def _strip_line_comments(text: str) -> str:
+    """Truncate each line of `text` at its first '\\*' (a TLA+ line comment); code is left intact."""
+    return "\n".join(line.split("\\*", 1)[0] for line in text.split("\n"))
+
+
+def _find_matching_close(text: str, open_pos: int) -> int:
+    """Return the index just past the '*)' that matches the '(*' at open_pos (nesting-aware)."""
+    depth, i, n = 0, open_pos, len(text)
+    while i < n:
+        if text.startswith("(*", i):
+            depth += 1
+            i += 2
+        elif text.startswith("*)", i):
+            depth -= 1
+            i += 2
+            if depth == 0:
+                return i
+        else:
+            i += 1
+    raise ExpectedError("the module's PlusCal algorithm comment is never closed with '*)'")
+
+
+def _pcal_block(module_text: str) -> str | None:
+    """Return the source of the module's PlusCal algorithm (the whole '(* --algorithm ... *)' or
+    '(* --fair algorithm ... *)' comment, nesting-aware), or None if it has none."""
+    match = _ALGORITHM_START.search(module_text)
+    if match is None:
+        return None
+    return module_text[match.start(): _find_matching_close(module_text, match.start())]
+
+
+def module_labels(module_text: str) -> LabelUniverse:
+    """The label universe of a .tla module, and (for a PlusCal module) each label's owners."""
+    block = _pcal_block(module_text)
+    if block is None:
+        labels = frozenset(m.group(1) for m in _TOPLEVEL_DEF.finditer(strip_tla_comments(module_text)))
+        return LabelUniverse(False, labels, {}, {})
+
+    text = _strip_line_comments(block)
+
+    # (position, block id, kind, `\in` set name or None) for every process/procedure header, in
+    # the order they appear; a block runs from its header to the next header or the block's end.
+    headers: list[tuple[int, str, str, str | None]] = []
+    for m in _PROCESS_HEADER.finditer(text):
+        proc_name, op = m.group(1), m.group(2)
+        if op == "\\in":
+            setname_match = re.match(r"([A-Za-z_]\w*)\s*\)", text[m.end():])
+            if setname_match is None:
+                raise ExpectedError(f"process ({proc_name} \\in ...) must name a single identifier "
+                                     "as its process set")
+            headers.append((m.start(), proc_name, "process", setname_match.group(1)))
+        else:
+            headers.append((m.start(), proc_name, "process", None))
+    for m in _PROCEDURE_HEADER.finditer(text):
+        headers.append((m.start(), m.group(1), "procedure", None))
+    headers.sort(key=lambda h: h[0])
+
+    process_sets: dict[str, str | None] = {}
+    block_kind: dict[str, str] = {}
+    block_labels: dict[str, set[str]] = {}
+    block_calls: dict[str, set[str]] = {}
+    for idx, (pos, block_id, kind, setname) in enumerate(headers):
+        end = headers[idx + 1][0] if idx + 1 < len(headers) else len(text)
+        span = text[pos:end]
+        block_kind[block_id] = kind
+        if kind == "process":
+            process_sets[block_id] = setname
+        block_labels[block_id] = {match.group(1) for line in span.split("\n")
+                                   for match in [_LABEL_LINE.match(line)] if match}
+        block_calls[block_id] = {m.group(1) for m in _CALL.finditer(span)}
+
+    # Forward reachability from each process block, over call edges through procedures: a label is
+    # owned by every process block whose call graph reaches the block the label is defined in.
+    owners: dict[str, set[str]] = {}
+    for root, kind in block_kind.items():
+        if kind != "process":
+            continue
+        seen: set[str] = set()
+        stack = [root]
+        while stack:
+            current = stack.pop()
+            if current in seen or current not in block_labels:
+                continue
+            seen.add(current)
+            for label in block_labels[current]:
+                owners.setdefault(label, set()).add(root)
+            stack.extend(block_calls.get(current, ()))
+
+    all_labels = frozenset(label for labels in block_labels.values() for label in labels)
+    return LabelUniverse(True, all_labels, {k: frozenset(v) for k, v in owners.items()}, process_sets)
+
+
+# One arm of a translated `IF` inside a label's action (cut 6 Part 2). pcal.trans prints `THEN` and `ELSE`
+# three columns right of their `IF`, which is what locates an arm without parsing TLA+.
+_IF_CONDITION = re.compile(r"(?<![A-Za-z0-9_])IF (.*\S)\s*$")
+
+
+def resolve_branch(module_text: str, label: str, guard: str, side: str) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Where one arm of an `IF` in `label`'s action lies in the GENERATED module: (start, end) as 1-based
+    (line, col) positions, end exclusive - the coordinates of TLC's cost nodes (message 2221).
+
+    `guard` is the WHOLE condition of the `IF`, exactly as pcal.trans printed it, so `IsRecord(seen)` does not
+    match `IsRecord(seen) /\\ seen # seenRec[self]`; only the named label's action is searched, so the same
+    guard in another label is no match. The THEN arm runs to its ELSE; the ELSE arm to the first line indented
+    no deeper than that ELSE. A label that is not exactly one action, a guard that is not exactly one `IF`, or
+    no THEN/ELSE where the translator puts them: ExpectedError - an anchor never resolves to nothing or to two
+    places."""
+    lines = module_text.split("\n")
+    heads = [i for i, text in enumerate(lines) if re.match(rf"{re.escape(label)}(\(self\))? ==", text)]
+    if len(heads) != 1:
+        raise ExpectedError(f"label {label!r}: {len(heads)} action definitions in the generated module (must be one)")
+    start = heads[0]
+    end = next((i for i in range(start + 1, len(lines)) if lines[i][:1] not in ("", " ")), len(lines))
+    hits = [(i, m.start()) for i in range(start, end)
+            for m in _IF_CONDITION.finditer(lines[i]) if m.group(1) == guard]
+    if len(hits) != 1:
+        raise ExpectedError(f"label {label!r}: guard {guard!r} matches {len(hits)} IFs (must be exactly one)")
+    line_if, col_if = hits[0]
+    col_kw = col_if + 3
+
+    def indent(text: str) -> int:
+        return len(text) - len(text.lstrip())
+
+    def keyword(word: str, after: int) -> int | None:
+        for j in range(after + 1, end):
+            if lines[j][:col_kw].strip() == "" and lines[j][col_kw:].startswith(word + " "):
+                return j
+            if lines[j].strip() and indent(lines[j]) <= col_if:
+                return None
+        return None
+
+    line_then = keyword("THEN", line_if)
+    line_else = keyword("ELSE", line_then) if line_then is not None else None
+    if line_then is None or line_else is None:
+        raise ExpectedError(f"label {label!r}: guard {guard!r} has no THEN/ELSE at column {col_kw + 1}")
+    if side == "then":
+        return (line_then + 1, col_kw + 1), (line_else + 1, col_kw + 1)
+    after = next((j for j in range(line_else + 1, end) if lines[j].strip() and indent(lines[j]) <= col_kw), end)
+    return (line_else + 1, col_kw + 1), (after + 1, 1)
+
+
+def arm_count(nodes: list[tuple[str, int, int, int, int]], branch: Branch) -> int | None:
+    """The count of the FIRST cost node inside the branch's arm - how often the arm was entered - or None when
+    this log has no node there. First by position; a child node sharing its parent's start comes after it."""
+    start, end = branch.span
+    inside = [n for n in nodes if n[0] == branch.module and start <= (n[1], n[2]) < end]
+    if not inside:
+        return None
+    return min(inside, key=lambda n: (n[1], n[2]))[3]
+
+
+SOURCES = ("LockProtocol.head", "algorithm.txt", "invariants.txt")
+
+
+def check_translation(base: Path) -> int:
+    """Re-derive LockProtocol.tla from its sources and fail if the committed file differs.
+
+    LockProtocol.tla is generated - `cat LockProtocol.head algorithm.txt invariants.txt`, then
+    `pcal.trans` - and committed so that run.py needs no translator. Nothing re-derived it, so a
+    source edited without re-running the translator left TLC checking a model the sources no longer
+    described (capstone finding, plan 3). test_run.py catches the cheap half with no Java: everything
+    OUTSIDE the inserted translation block must equal the sources. Only this can catch the other
+    half, a translation block that does not match the algorithm it claims to translate.
+
+    Works in a temporary directory, because pcal.trans rewrites its input in place.
+    """
+    committed = base / "LockProtocol.tla"
+    if not committed.is_file():
+        print(f"run.py: {committed} not found", file=sys.stderr)
+        return 2
+    if shutil.which("java") is None:
+        print("run.py: java is not on PATH (the translator needs Java 11 or later)", file=sys.stderr)
+        return 2
+    try:
+        jar = ensure_jar()
+    except (ToolingError, OSError) as err:
+        print(f"run.py: {err}", file=sys.stderr)
+        return 2
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        # FsModel.tla goes along so the translator sees the same directory the module EXTENDS.
+        for name in (*SOURCES, "FsModel.tla"):
+            shutil.copyfile(base / name, work / name)
+        target = work / "LockProtocol.tla"
+        target.write_text("".join((work / name).read_text(encoding="utf-8") for name in SOURCES),
+                          encoding="utf-8")
+        proc = subprocess.run(["java", "-cp", str(jar), "pcal.trans", str(target)],
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            print(f"run.py: pcal.trans failed:\n{proc.stdout}{proc.stderr}", file=sys.stderr)
+            return 2
+        # Compare by lines, so a checkout that normalised line endings is not reported as a mismatch.
+        fresh = target.read_text(encoding="utf-8").splitlines()
+        have = committed.read_text(encoding="utf-8").splitlines()
+
+    if fresh == have:
+        print("run.py: LockProtocol.tla matches its sources")
+        return 0
+    diff = list(difflib.unified_diff(have, fresh, "committed LockProtocol.tla", "pcal.trans output",
+                                     lineterm="", n=2))
+    print("run.py: LockProtocol.tla is STALE - it is not what pcal.trans emits for its sources.",
+          file=sys.stderr)
+    print("        Regenerate: cat " + " ".join(SOURCES) + " > LockProtocol.tla && \\", file=sys.stderr)
+    print("        java -cp target/tla/tla2tools.jar pcal.trans LockProtocol.tla  (then delete "
+          "LockProtocol.cfg)", file=sys.stderr)
+    for line in diff[:60]:
+        print(f"        {line}", file=sys.stderr)
+    if len(diff) > 60:
+        print(f"        ... {len(diff) - 60} more diff lines", file=sys.stderr)
+    return 1
+
+
+# Exact-text mutants of the model (cut 6, revision 3): each is applied to a scratch copy, the one config it names
+# is run, and what TLC reports is judged. Positional patches would drift as later edits move the lines; an exact
+# `old` text either still occurs exactly once or fails loudly as stale.
+MUTANT_KEYS = frozenset({"name", "file", "old", "new", "config", "expect_present", "expect_absent", "timeout_minutes",
+                          "expect_zero_branch"})
+MUTANT_FILES = (*SOURCES, "FsModel.tla")
+MUTANTS_OUT = TARGET / "mutants"
+
+
+@dataclass(frozen=True)
+class Mutant:
+    name: str
+    file: str
+    old: str
+    new: str
+    config: str
+    present: str | None  # the mutated run must REPORT this violated (a check config)
+    absent: str | None   # the mutated run, checking only this name, must report NOTHING (a seeded or witness config)
+    timeout_minutes: int
+    zero_branch: str | None = None  # the mutated run must finish with this `branches` arm at zero (cut 6 Part 2)
+
+
+def load_mutants(path: Path, base: Path) -> list[Mutant]:
+    """Parse and validate a mutants manifest. Unknown keys, a missing field, other than exactly one expectation, a
+    file that is not a model source, a config that does not exist, or a duplicate name all fail at load."""
+    try:
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as err:
+        raise ExpectedError(f"{path}: {err}") from err
+    _require(set(raw) <= {"mutant"}, f"{path}: only [[mutant]] tables are allowed")
+    entries = raw.get("mutant", [])
+    _require(isinstance(entries, list) and len(entries) > 0, f"{path}: no [[mutant]] entries")
+    mutants: list[Mutant] = []
+    seen: set[str] = set()
+    for i, e in enumerate(entries):
+        where = f"{path}: mutant {i + 1}"
+        _require(isinstance(e, dict), f"{where}: not a table")
+        unknown = set(e) - MUTANT_KEYS
+        _require(not unknown, f"{where}: unknown keys {sorted(unknown)}")
+        for key in ("name", "file", "old", "new", "config"):
+            _require(isinstance(e.get(key), str) and e[key] != "", f"{where}: '{key}' must be a non-empty string")
+        name = e["name"]
+        where = f"{path}: mutant '{name}'"
+        _require(re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", name) is not None,
+                 f"{where}: a name is lower-case words joined by '-'")
+        _require(name not in seen, f"{where}: duplicate name")
+        seen.add(name)
+        _require(e["file"] in MUTANT_FILES, f"{where}: file must be one of {', '.join(MUTANT_FILES)}")
+        _require(e["old"] != e["new"], f"{where}: 'new' equals 'old'")
+        _require((base / e["config"]).is_file(), f"{where}: config {e['config']} does not exist")
+        present, absent, zero = e.get("expect_present"), e.get("expect_absent"), e.get("expect_zero_branch")
+        _require([present, absent, zero].count(None) == 2,
+                 f"{where}: exactly one of expect_present, expect_absent and expect_zero_branch")
+        if zero is not None:
+            names = {b.name for b in load_expected(base / "expected.toml").branches}
+            _require(zero in names, f"{where}: expect_zero_branch must name a 'branches' entry of expected.toml")
+        # The name must be one the config checks: a misspelled expect_absent is checked by nothing, so it fails
+        # here, before any TLC time is spent (independent review of this plan, MG-1; narrow_config would raise later).
+        cfg_text = (base / e["config"]).read_text(encoding="utf-8")
+        checked = [t for t in cfg_sections(cfg_text).get("INVARIANT", []) if IDENT.fullmatch(t)] + cfg_properties(cfg_text)
+        for key, value in (("expect_present", present), ("expect_absent", absent)):
+            _require(value is None or (isinstance(value, str) and value in checked),
+                     f"{where}: {key} must be an invariant or property that {e['config']} checks")
+        timeout = e.get("timeout_minutes", 60)
+        _require(isinstance(timeout, int) and not isinstance(timeout, bool) and 1 <= timeout <= 170,
+                 f"{where}: timeout_minutes must be an integer from 1 to 170")
+        mutants.append(Mutant(name, e["file"], e["old"], e["new"], e["config"], present, absent, timeout, zero))
+    return mutants
+
+
+def apply_mutant(text: str, mutant: Mutant) -> str:
+    """The mutated source. `old` must occur EXACTLY once: absent means the manifest is stale, twice ambiguous."""
+    count = text.count(mutant.old)
+    if count != 1:
+        raise ExpectedError(f"mutant '{mutant.name}': 'old' occurs {count} times in {mutant.file} (must be exactly once)")
+    return text.replace(mutant.old, mutant.new, 1)
+
+
+def narrow_config(text: str, name: str) -> str:
+    """The config with its INVARIANT and PROPERTY sections cut and one section checking only `name` appended.
+
+    A mutant asks one question - does the mutant make `name` fail, or stop failing - so it runs without -continue,
+    which under many violations made TLC fail with error 2111 (CI run 36497846414). Every other byte is kept. A
+    section's span runs from its keyword to the next keyword (or the end); a comment inside it goes with it."""
+    sections = cfg_sections(text)
+    if name in sections.get("INVARIANT", []):
+        kept = "INVARIANT"
+    elif name in cfg_properties(text):
+        kept = "PROPERTY"
+    else:
+        raise ExpectedError(f"'{name}' is neither an INVARIANT nor a PROPERTY of the config")
+    keywords = [m for m in _CFG_TOKEN.finditer(text) if m.group(0) in CFG_KEYWORDS]
+    out, pos = [], 0
+    for i, m in enumerate(keywords):
+        if CFG_KEYWORDS[m.group(0)] in ("INVARIANT", "PROPERTY"):
+            end = keywords[i + 1].start() if i + 1 < len(keywords) else len(text)
+            out.append(text[pos:m.start()])
+            pos = end
+    out.append(text[pos:])
+    result = "".join(out).rstrip("\n") + f"\n{kept} {name}\n"
+    after = cfg_sections(result)
+    assert {k: after.get(k, []) for k in ("INVARIANT", "PROPERTY")} == \
+        {"INVARIANT": [name] if kept == "INVARIANT" else [], "PROPERTY": [name] if kept == "PROPERTY" else []}
+    assert {k: v for k, v in after.items() if k not in ("INVARIANT", "PROPERTY")} == \
+        {k: v for k, v in sections.items() if k not in ("INVARIANT", "PROPERTY")}
+    return result
+
+
+def judge_mutant(mutant: Mutant, outcome: Outcome) -> tuple[bool, str]:
+    """Killed or not, with the reason. A tooling error - a TLC error, no Finished message - is never a kill."""
+    if outcome.tooling_error is not None:
+        return False, f"tooling: {outcome.tooling_error}"
+    reported = ", ".join(sorted(outcome.observed)) or "no error"
+    if mutant.present is not None:
+        return mutant.present in outcome.observed, f"expected {mutant.present} violated; reported: {reported}"
+    # The run checks ONLY `absent` (narrow_config), so another invariant cannot halt it first: a kill is a run that
+    # explored everything with `absent` never violated. A deadlock report is a halt, never a kill (capstone, cut 6).
+    return not outcome.observed, f"expected {mutant.absent} NOT reported; reported: {reported}"
+
+
+def judge_zero_branch(mutant: Mutant, outcome: Outcome, count: int | None) -> tuple[bool, str]:
+    """A branch mutant (cut 6 Part 2) is killed only by a run that FINISHED - a halted run's coverage is a
+    prefix, and its zero proves nothing - and whose named arm counted zero."""
+    if outcome.tooling_error is not None:
+        return False, f"tooling: {outcome.tooling_error}"
+    if outcome.observed:
+        return False, (f"the run halted at {', '.join(sorted(outcome.observed))}: a prefix cannot show "
+                       f"that {mutant.zero_branch} never runs")
+    if count is None:
+        return False, f"tooling: no coverage node inside {mutant.zero_branch}'s arm"
+    return count == 0, f"branch {mutant.zero_branch} ran {count} times"
+
+
+def run_mutant(mutant: Mutant, jar: Path, base: Path) -> tuple[bool, str]:
+    """Apply one mutant to a scratch copy of the model, regenerate LockProtocol.tla there, run TLC on its one
+    config, and judge. The repository is never modified, so there is nothing to revert."""
+    MUTANTS_OUT.mkdir(parents=True, exist_ok=True)
+    log = MUTANTS_OUT / f"{mutant.name}.log"
+    branch = None
+    if mutant.zero_branch is not None:
+        branch = next(b for b in load_expected(base / "expected.toml").branches if b.name == mutant.zero_branch)
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        for name in MUTANT_FILES:
+            shutil.copyfile(base / name, work / name)
+        shutil.copytree(base / "configs", work / "configs")
+        source = work / mutant.file
+        source.write_text(apply_mutant(source.read_text(encoding="utf-8").replace("\r\n", "\n"), mutant),
+                          encoding="utf-8")
+        target = work / "LockProtocol.tla"
+        target.write_text("".join((work / n).read_text(encoding="utf-8") for n in SOURCES), encoding="utf-8")
+        trans = subprocess.run(["java", "-cp", str(jar), "pcal.trans", str(target)], capture_output=True, text=True)
+        if trans.returncode != 0:
+            return False, f"tooling: pcal.trans failed: {(trans.stdout + trans.stderr).strip()[-300:]}"
+        if branch is not None:  # the arm's span in the MUTATED generated module
+            try:
+                span = resolve_branch(target.read_text(encoding="utf-8"), branch.label, branch.guard, branch.side)
+            except ExpectedError as err:
+                return False, f"tooling: {err}"
+            branch = Branch(branch.name, branch.module, branch.label, branch.guard, branch.side, branch.reason, span)
+        config = work / mutant.config
+        expected = mutant.present if mutant.present is not None else mutant.absent
+        if expected is not None:  # no other invariant may fire first: it would hide `present`, or halt before `absent`
+            config.write_text(narrow_config(config.read_text(encoding="utf-8"), expected), encoding="utf-8")
+        properties = cfg_properties(config.read_text(encoding="utf-8"))  # the config TLC actually runs
+        cmd = ["java", "-XX:+UseParallelGC", "-cp", str(jar), "tlc2.TLC", "-tool", "-workers", "auto",
+               "-metadir", str(work / "states"), "-config", str(config)]
+        if branch is not None:
+            cmd.extend(["-coverage", "1"])  # a branch mutant is judged from the arm's cost node
+        cmd.append("LockProtocol")
+        with log.open("w", encoding="utf-8") as out:
+            proc = subprocess.Popen(cmd, cwd=work, stdout=out, stderr=subprocess.STDOUT)
+            try:
+                code = proc.wait(timeout=mutant.timeout_minutes * 60)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                return False, f"tooling: TIMEOUT after {mutant.timeout_minutes} min"
+            except BaseException:  # never leave TLC running
+                proc.kill()
+                proc.wait()
+                raise
+    output = log.read_text(encoding="utf-8", errors="replace")
+    outcome = interpret(code, output, properties)
+    if branch is not None:
+        nodes = parse_cost_nodes(parse_messages(output))
+        return judge_zero_branch(mutant, outcome, None if nodes is None else arm_count(nodes, branch))
+    return judge_mutant(mutant, outcome)
+
+
+def mutants_main(path: Path, only: str | None, listing: bool) -> int:
+    try:
+        mutants = load_mutants(path, HERE)
+        for m in mutants:  # a stale entry fails before any TLC time is spent
+            apply_mutant((HERE / m.file).read_text(encoding="utf-8").replace("\r\n", "\n"), m)
+    except ExpectedError as err:
+        print(f"run.py: {err}", file=sys.stderr)
+        return 2
+    if only is not None:
+        mutants = [m for m in mutants if m.name == only]
+        if not mutants:
+            print(f"run.py: no mutant named {only!r}", file=sys.stderr)
+            return 2
+    if listing:
+        print(json.dumps([m.name for m in mutants]))
+        return 0
+    if shutil.which("java") is None:
+        print("run.py: java is not on PATH (TLC needs Java 11 or later; CI uses Temurin 21)", file=sys.stderr)
+        return 2
+    try:
+        jar = ensure_jar()
+    except (ToolingError, OSError) as err:
+        print(f"run.py: {err}", file=sys.stderr)
+        return 2
+    failed = 0
+    for m in mutants:
+        killed, detail = run_mutant(m, jar, HERE)
+        print(f"{'KILLED    ' if killed else 'NOT KILLED'} {m.name}: {detail}", flush=True)
+        failed += not killed
+    print(f"run.py: {len(mutants) - failed} of {len(mutants)} mutants killed", flush=True)
+    return 1 if failed else 0
+
+
+def platform_of(name: str, scenario: str) -> str:
+    """The platform segment of a run name: the first word after the scenario."""
+    return name[len(scenario) + 1:].split("-", 1)[0]
 
 
 def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
@@ -237,9 +1044,37 @@ def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
 
     _require(kind in KINDS, f"{where}: kind must be one of {KINDS}")
     _require(scenario in scenarios, f"{where}: scenario {scenario!r} is not in 'scenarios'")
-    seed = r"-[A-Z][A-Z0-9_]*" if kind == "seeded" else ""
-    _require(re.fullmatch(rf"{re.escape(scenario)}-[a-z0-9]+(-[a-z0-9]+)*-{kind}{seed}", name) is not None,
-             f"{where}: name must be '<scenario>-<variant>-<kind>', plus '-<SEED_FLAG>' exactly when it is seeded")
+
+    # violated: forbidden for check/liveness (reachability comes from coverage, a later task), required
+    # (exactly one) for seeded/witness.
+    if kind in ("check", "liveness"):
+        _require("violated" not in raw, f"{where}: a {kind} run must not declare 'violated'")
+        violated: tuple[str, ...] = ()
+    else:
+        _require("violated" in raw, f"{where}: a {kind} run needs 'violated'")
+        violated = _str_list(raw["violated"], f"{where}: violated")
+        _require(len(violated) == 1, f"{where}: a {kind} run names exactly one invariant or property")
+
+    if kind == "seeded":
+        suffix = r"-[A-Z][A-Z0-9_]*"
+        suffix_help = ", plus '-<SEED_FLAG>' exactly when it is seeded"
+    elif kind == "witness":
+        suffix = "-" + re.escape(violated[0])
+        suffix_help = ", plus '-<Invariant>' equal to violated[0] when it is a witness"
+    else:
+        suffix = ""
+        suffix_help = ", plus '-<SEED_FLAG>' exactly when it is seeded"
+    _require(re.fullmatch(rf"{re.escape(scenario)}-[a-z0-9]+(-[a-z0-9]+)*-{kind}{suffix}", name) is not None,
+             f"{where}: name must be '<scenario>-<variant>-<kind>'{suffix_help}")
+    platform = platform_of(name, scenario)
+    job = raw.get("job", platform)
+    _require(isinstance(job, str) and re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", job) is not None,
+             f"{where}: job must be a lower-case dash-separated word")
+    _require(job == platform or job.startswith(f"{platform}-"),
+             f"{where}: job {job!r} must be the run's platform {platform!r} or start with it, so the CI "
+             f"job's displayed platform is true")
+    _require(name.startswith(f"{scenario}-{job}-") or job == platform,
+             f"{where}: job {job!r} must be a prefix of the run's variant")
     _require(IDENT.fullmatch(module) is not None and (base / f"{module}.tla").is_file(),
              f"{where}: module {module}.tla not found beside expected.toml")
     _require(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_][A-Za-z0-9_.-]*)*\.cfg", config) is not None
@@ -253,22 +1088,11 @@ def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
     _require(isinstance(timeout, int) and not isinstance(timeout, bool) and timeout >= 1,
              f"{where}: timeout_minutes must be a whole number of minutes, at least 1")
 
-    if kind == "liveness":
-        _require("violated" not in raw, f"{where}: a liveness run has no 'violated'")
-        violated: tuple[str, ...] = ()
-    else:
-        _require("violated" in raw, f"{where}: a {kind} run needs 'violated'")
-        violated = _str_list(raw["violated"], f"{where}: violated")
-        if kind == "seeded":
-            _require(len(violated) == 1, f"{where}: a seeded run names exactly one invariant or property")
-        else:
-            # The witnesses prove the run reached its paths; without one, a model that explores nothing would pass.
-            _require(bool(violated), f"{where}: a check run lists at least one reachability witness")
-
     findings: list[OpenFinding] = []
+    _require(kind in ("check", "liveness") or "open_findings" not in raw,
+             f"{where}: open_findings is only allowed for check and liveness runs")
     raw_findings = raw.get("open_findings", [])
     _require(isinstance(raw_findings, list), f"{where}: open_findings must be an array of tables")
-    _require(kind != "seeded" or not raw_findings, f"{where}: a seeded run has no open_findings")
     for f in raw_findings:
         _require(isinstance(f, dict) and set(f) == FINDING_KEYS,
                  f"{where}: each open finding has exactly name, tracking, fix_flag")
@@ -279,19 +1103,107 @@ def _load_run(raw: dict, i: int, scenarios: list[str], base: Path) -> Run:
         findings.append(OpenFinding(f["name"], f["tracking"], f["fix_flag"]))
     _require(len({f.name for f in findings}) == len(findings), f"{where}: duplicate open findings")
 
+    _require(kind in ("check", "liveness") or "unreached" not in raw,
+             f"{where}: unreached is only allowed for check and liveness runs")
+    unreached = _load_label_reasons(raw.get("unreached", []), f"{where}: unreached")
+
+    raw_tightened = raw.get("tightened")
+    _require(kind == "liveness" or raw_tightened is None, f"{where}: tightened is only allowed for liveness runs")
+    tightened: tuple[str, str] | None = None
+    if raw_tightened is not None:
+        _require(isinstance(raw_tightened, dict) and set(raw_tightened) == {"rung", "measurement"},
+                 f"{where}: tightened must be a table with 'rung' and 'measurement'")
+        rung, measurement = raw_tightened.get("rung"), raw_tightened.get("measurement")
+        _require(isinstance(rung, str) and rung, f"{where}: tightened.rung must be a non-empty string")
+        _require(isinstance(measurement, str) and measurement, f"{where}: tightened.measurement must be a non-empty string")
+        tightened = (rung, measurement)
+
+    declared_constants = _load_constants(raw, where)
+
+    module_text = (base / f"{module}.tla").read_text(encoding="utf-8")
+    universe = module_labels(module_text)
+    for label, _reason in unreached:
+        _require(label in universe.labels, f"{where}: unreached label {label!r} is not in {module}.tla's labels")
+        _require(not universe.is_exempt(label, declared_constants),
+                 f"{where}: unreached label {label!r} needs no entry: its actor does not run here")
+
+    raw_symmetry = raw.get("symmetry")
+    _require(kind != "liveness" or raw_symmetry is None, f"{where}: a liveness run must not declare symmetry")
+    symmetry: tuple[str, str] | None = None
+    if raw_symmetry is not None:
+        _require(isinstance(raw_symmetry, dict) and set(raw_symmetry) == {"definition", "over"},
+                 f"{where}: symmetry must be a table with 'definition' and 'over'")
+        definition, over = raw_symmetry.get("definition"), raw_symmetry.get("over")
+        _require(isinstance(definition, str) and IDENT.fullmatch(definition) is not None,
+                 f"{where}: symmetry.definition must be a non-empty TLA+ identifier")
+        _require(isinstance(over, str) and IDENT.fullmatch(over) is not None,
+                 f"{where}: symmetry.over must be a non-empty TLA+ identifier")
+        symmetry = (definition, over)
+
     text = cfg_path.read_text(encoding="utf-8")
     sections = cfg_sections(text)
     _require("CHECK_DEADLOCK" not in sections, f"{where}: the config must not set CHECK_DEADLOCK (deadlock checking stays on)")
+    # A state or action constraint, or a VIEW, cuts or merges states while every constant still agrees with
+    # expected.toml, so a .cfg could make a failing run pass through them (design Section 4). TYPE and
+    # TYPE_CONSTRAINT are TLC 2.19 keywords too (its ModelConfig lists them) whose effect on the explored states
+    # the runner cannot vouch for, so they are refused with the rest.
+    for shrinking in ("CONSTRAINT", "ACTION_CONSTRAINT", "VIEW", "TYPE", "TYPE_CONSTRAINT"):
+        _require(shrinking not in sections,
+                 f"{where}: the config must not shrink the state space with {shrinking}; bound the run through its constants")
+    _require(kind != "check" or "PROPERTY" not in sections,
+             f"{where}: a check run's config must not declare a PROPERTY (TLC reports a temporal violation "
+             "without naming it)")
+    if kind == "witness":
+        invariants = [t for t in sections.get("INVARIANT", []) if IDENT.fullmatch(t)]
+        _require(invariants == [violated[0]],
+                 f"{where}: a witness run's config lists exactly one invariant, {violated[0]!r}")
+        _require("PROPERTY" not in sections, f"{where}: a witness run's config must not declare a PROPERTY")
     properties = cfg_properties(text)
     temporal_run = kind == "liveness" or (kind == "seeded" and violated[0] in properties)
+    if kind == "seeded" and not temporal_run:
+        # A seeded run names the invariant its seed is meant to break. Its config lists the
+        # scenario's whole invariant set, so this is membership, not the equality a witness gets -
+        # but it must be there at all. Witness runs were checked and seeded runs were not, so a
+        # seed could name an invariant its config never declares; TLC would then report nothing
+        # and the run would fail confusingly, hours in, instead of here (test audit, plan 3, TA-4).
+        _require(violated[0] in [tok for tok in sections.get("INVARIANT", []) if IDENT.fullmatch(tok)],
+                 f"{where}: a seeded run's config must check {violated[0]!r}, the invariant its seed "
+                 f"is meant to break")
     if temporal_run:
         _require(len(properties) == 1, f"{where}: a run that checks a temporal property lists exactly one PROPERTY "
                                        "(TLC does not name the property it reports violated)")
         _require("SYMMETRY" not in sections, f"{where}: symmetry is unsound with liveness checking")
+
+    _require(("SYMMETRY" in sections) == (symmetry is not None),
+             f"{where}: the config has a SYMMETRY section if and only if the run declares 'symmetry'")
+    if symmetry is not None:
+        definition, over = symmetry
+        _require(sections["SYMMETRY"] == [definition],
+                 f"{where}: the config's SYMMETRY must name exactly {definition!r}")
+        def_pattern = re.compile(rf"\b{re.escape(definition)}\b\s*==\s*Permutations\s*\(\s*{re.escape(over)}\s*\)")
+        _require(def_pattern.search(strip_tla_comments(module_text)) is not None,
+                 f"{where}: {module}.tla must define {definition} == Permutations({over})")
+        over_value = declared_constants.get(over)
+        _require(isinstance(over_value, frozenset) and len(over_value) >= 2,
+                 f"{where}: symmetry.over ({over}) must be a 'constants' entry that is a set of at least two elements")
+
+    cfg_consts = cfg_constants(text)
+    for cname, cvalue in cfg_consts.items():
+        if FIX_FLAG.fullmatch(cname):
+            continue
+        _require(cname in declared_constants,
+                 f"{where}: the config assigns {cname}, which is not declared in 'constants'")
+        _require(_constants_equal(cvalue, declared_constants[cname]),
+                 f"{where}: constants.{cname} does not match the config's {cname} = {cvalue!r}")
+    for dname in declared_constants:
+        _require(dname in cfg_consts, f"{where}: constants has {dname!r}, which the config does not assign")
+
     if findings:
         fixed_cfg_text(text, [f.fix_flag for f in findings])  # raises if a flag is missing
 
-    return Run(name, module, config, scenario, kind, violated, tuple(findings), timeout)
+    constants = tuple(sorted(declared_constants.items()))
+    return Run(name, module, config, scenario, kind, violated, tuple(findings), unreached, timeout,
+               constants, symmetry, tightened, job)
 
 
 # ---------------------------------------------------------------------------------------
@@ -355,6 +1267,127 @@ def interpret(exit_code: int, output: str, properties: list[str]) -> Outcome:
     if not agrees.get(exit_code, False):
         return tooling(f"TLC exit status {exit_code} does not match its messages")
     return Outcome(None, frozenset(observed), states, trace)
+
+
+_COVERAGE_ACTION_NAME = re.compile(r"^<([A-Za-z_]\w*)\b")
+_COVERAGE_COUNTS = re.compile(r"(\d+):(\d+)\s*$")
+
+
+def parse_coverage(messages: list[Message]) -> dict[str, tuple[int, int]] | None:
+    """Parse the FINAL '-coverage 1' block (the one starting at the LAST 2201) in `messages` into
+    {action name: (distinct, total)}, summing the counts of a name that appears twice in that
+    block. '-coverage 1' prints a snapshot every minute and a final block; TLC ends a block with
+    2202 ("End of statistics.") normally, but switches to 2777 (the same message, plus a note
+    about the cost of leaving coverage/cost statistics on) once a run has gone on long enough - both
+    end a block equally. Only the block starting at the LAST 2201 can be the whole run's final
+    report, so this fails CLOSED: if that last 2201 is not followed by a 2202 or 2777 (the run was
+    killed mid-write, or -coverage output was cut short), this returns None rather than falling
+    back to an earlier complete block, because an earlier block is only a partial snapshot and
+    judging coverage from it can pass a run wrongly (or fail one wrongly, for a label that finishes
+    covered only late). Returns None when there is no 2201 at all, too."""
+    last_start: int | None = None
+    for i, m in enumerate(messages):
+        if m.code == C_COVERAGE_START:
+            last_start = i
+    if last_start is None:
+        return None
+    # last_start is the LAST 2201 in `messages`, so nothing after it can be another 2201; scan
+    # forward for its terminator only.
+    last_block: list[Message] | None = None
+    for i in range(last_start + 1, len(messages)):
+        if messages[i].code in (C_COVERAGE_END, C_COVERAGE_END_LONG):
+            last_block = messages[last_start: i + 1]
+            break
+    if last_block is None:
+        return None
+
+    result: dict[str, tuple[int, int]] = {}
+    for m in last_block:
+        if m.code != C_COVERAGE_ACTION:
+            continue  # 2773 (Init), 2774 (a definition, no counts), 2221 (a cost sub-line): not labels
+        name_match = _COVERAGE_ACTION_NAME.match(m.text)
+        counts_match = _COVERAGE_COUNTS.search(m.text)
+        if not name_match or not counts_match:
+            continue
+        name = name_match.group(1)
+        distinct, total = int(counts_match.group(1)), int(counts_match.group(2))
+        prev = result.get(name, (0, 0))
+        result[name] = (prev[0] + distinct, prev[1] + total)
+    return result
+
+
+# TLC marks a cost node's NESTING DEPTH with leading `|` characters, and the nested ones are the
+# intra-action sub-expressions - exactly the branch-level data this is for. The first version of
+# this pattern began `^\s*line`, and `\s` does not match `|`, so it dropped 7 of the 17 nodes in
+# the repo's own fixture while looking like it had read them all (capstone, plan 3, round 6).
+_COVERAGE_COST_NODE = re.compile(
+    r"^\s*(\|*)\s*line (\d+), col (\d+) to line (\d+), col (\d+) of module (\w+): (\d+)\s*$")
+
+
+def parse_cost_nodes(messages: list[Message]) -> list[tuple[str, int, int, int, int]] | None:
+    """Every EXPRESSION node of the last coverage block: (module, line, col, count, depth).
+
+    TLC's `-coverage 1` is expression-granular, not action-granular: alongside each action (2772) it
+    emits indented cost sub-lines (2221) carrying a source span and a count, and a count of ZERO for
+    an expression that never evaluated. `parse_coverage` deliberately keeps only the actions, which
+    is what makes this suite's coverage gate LABEL-granular - and a guarded branch inside a label the
+    non-taking path also reaches is therefore invisible to it. That blind spot produced two findings
+    (capstone, plan 3, rounds 3 and 4), and the data to close it was in every log all along.
+
+    Same last-block rule and the same fail-closed contract as `parse_coverage`: None when there is no
+    complete final block, rather than a partial one.
+
+    NOTE the spans are line/col of the GENERATED LockProtocol.tla, so a caller mapping them back to
+    `algorithm.txt` must go through that file - which `--check-translation` pins.
+    """
+    last_start = None
+    for i, m in enumerate(messages):
+        if m.code == C_COVERAGE_START:
+            last_start = i
+    if last_start is None:
+        return None
+    last_block = None
+    for i in range(last_start + 1, len(messages)):
+        if messages[i].code in (C_COVERAGE_END, C_COVERAGE_END_LONG):
+            last_block = messages[last_start: i + 1]
+            break
+    if last_block is None:
+        return None
+
+    nodes: list[tuple[str, int, int, int, int]] = []
+    for m in last_block:
+        if m.code != C_COVERAGE_COST:
+            continue
+        match = _COVERAGE_COST_NODE.match(m.text)
+        if match is None:
+            # A 2221 line this does not understand. Fail CLOSED rather than drop it: an
+            # unparsable node and an absent node are indistinguishable downstream, and a silent
+            # drop is how "no zero branches found" would come to mean "I could not read them".
+            return None
+        nodes.append((match.group(6), int(match.group(2)), int(match.group(3)),
+                      int(match.group(7)), len(match.group(1))))
+    return nodes
+
+
+def judge_coverage(run: Run, universe: LabelUniverse, coverage: dict[str, tuple[int, int]]) -> list[str]:
+    """The per-run coverage gate (design Section 4, "four rules"): failures for one check/liveness
+    run that is not -fixed and finished without a tooling error or timeout (the caller decides
+    whether the gate applies at all; this only judges `coverage` against `universe`). Empty means
+    the gate passed."""
+    unreached_labels = {label for label, _ in run.unreached}
+    if universe.pluscal:
+        gated = {label for label in universe.labels if not universe.is_exempt(label, dict(run.constants))}
+    else:
+        gated = {name for name in coverage if name in universe.labels}
+
+    failures: list[str] = []
+    for label in sorted(gated):
+        if coverage.get(label, (0, 0))[1] == 0 and label not in unreached_labels:
+            failures.append(f"{label}: gated label not covered (TOTAL 0)")
+    for label in sorted(unreached_labels):
+        if coverage.get(label, (0, 0))[1] > 0:
+            failures.append(f"{label}: covered - remove it from unreached")
+    return failures
 
 
 def expected_set(run: Run, fixed: bool) -> frozenset[str]:
@@ -432,11 +1465,15 @@ def ensure_jar(target: Path = TARGET, fetch: Callable[[str, Path], None] = downl
 # Running TLC
 
 
-def tlc_command(jar: Path, run: Run, cfg: Path, metadir: Path) -> list[str]:
+def tlc_command(jar: Path, run: Run, cfg: Path, metadir: Path, fixed: bool) -> list[str]:
     cmd = ["java", "-XX:+UseParallelGC", "-cp", str(jar), "tlc2.TLC", "-tool", "-workers", "auto",
            "-metadir", str(metadir), "-config", str(cfg)]
     if run.kind in ("check", "liveness"):
         cmd.append("-continue")
+    if not fixed:
+        # Every non-fixed run carries coverage: the per-run gate needs it for check/liveness, and
+        # the suite-wide union needs it for every kind (design Section 4).
+        cmd.extend(["-coverage", "1"])
     cmd.append(run.module)
     return cmd
 
@@ -458,7 +1495,7 @@ def execute(run: Run, jar: Path, base: Path, fixed: bool) -> Result:
 
     start = time.monotonic()
     with log.open("w", encoding="utf-8") as out:
-        proc = subprocess.Popen(tlc_command(jar, run, cfg, metadir), cwd=base, stdout=out,
+        proc = subprocess.Popen(tlc_command(jar, run, cfg, metadir, fixed), cwd=base, stdout=out,
                                 stderr=subprocess.STDOUT)
         try:
             code = proc.wait(timeout=run.timeout_minutes * 60)
@@ -479,17 +1516,36 @@ def execute(run: Run, jar: Path, base: Path, fixed: bool) -> Result:
                       f"TIMEOUT after {run.timeout_minutes} min", (), log)
     outcome = interpret(code, output, cfg_properties(text))
     status = judge(run, outcome, fixed)
+    detail = outcome.tooling_error or ""
+
+    # The per-run coverage gate (design Section 4): check/liveness only, not -fixed, and only when
+    # the run finished without a tooling error (a timed-out run never reaches this point at all).
+    if run.kind in ("check", "liveness") and not fixed and outcome.tooling_error is None:
+        coverage = parse_coverage(parse_messages(output))
+        if coverage is None:
+            status = "tooling"
+            detail = "no coverage report"
+        else:
+            universe = module_labels((base / f"{run.module}.tla").read_text(encoding="utf-8"))
+            failures = judge_coverage(run, universe, coverage)
+            if failures:
+                status = "mismatch"
+                detail = "; ".join(f for f in [detail, "; ".join(failures)] if f)
+
     return Result(name, status, expected, outcome.observed, outcome.distinct_states, seconds,
-                  outcome.tooling_error or "", outcome.trace, log)
+                  detail, outcome.trace, log)
 
 
-def report(result: Result) -> None:
+def report(result: Result, tightened: tuple[str, str] | None = None) -> None:
     def names(s: frozenset[str]) -> str:
         return ",".join(sorted(s)) or "-"
 
     states = "?" if result.distinct_states is None else f"{result.distinct_states:,}"
     print(f"{result.status.upper():8} {result.name}  expected={names(result.expected)}  "
           f"observed={names(result.observed)}  states={states}  {result.seconds:.0f}s")
+    if tightened is not None:
+        rung, measurement = tightened
+        print(f"         tightened: {rung} ({measurement})")
     if result.status != "ok":
         if result.detail:
             print(f"         {result.detail}")
@@ -499,25 +1555,278 @@ def report(result: Result) -> None:
             print(f"         full TLC output: {result.log}")
 
 
+def counts_for_branches(run: Run, base: Path) -> bool:
+    """Whether a run's coverage counts toward `branches`: it models the protocol AS SPECIFIED. A seeded run
+    reaches arms the protocol never does (SEED_TAKEOVER_FOREIGN sends a Foreign read into S240_5_s5's
+    continue arm), and a run whose CONFIG sets a FIX_* flag TRUE models a proposed fix - the flag lives in the
+    config, not in `constants` (breaklock-remote-posix-fixed-check.cfg). Witness runs halt, but what they did
+    reach is reachable, so they count (cut 6 Part 2)."""
+    if run.kind == "seeded":
+        return False
+    flags = cfg_constants((base / run.config).read_text(encoding="utf-8"))
+    return not any(k.startswith("FIX_") and v is True for k, v in flags.items())
+
+
+def judge_branches(branches: tuple[Branch, ...], logs: list[tuple[str, str]]) -> bool:
+    """Judge `branches` over (run name, TLC log) pairs of the runs that count; returns whether it failed. Each
+    arm's count is summed over the logs; zero fails, and so does an arm no log has a node for."""
+    if not branches:
+        return False
+    parsed: list[list[tuple[str, int, int, int, int]]] = []
+    for name, text in logs:
+        nodes = parse_cost_nodes(parse_messages(text))
+        if nodes is None:
+            print(f"run.py: cannot judge branches: {name}'s log carries no complete coverage block")
+            return True
+        parsed.append(nodes)
+    failed = False
+    for b in branches:
+        counts = [c for c in (arm_count(nodes, b) for nodes in parsed) if c is not None]
+        if not counts:
+            print(f"MISMATCH branch {b.name}: no coverage node inside its arm in any of {len(parsed)} counted logs")
+            failed = True
+        elif sum(counts) == 0:
+            print(f"MISMATCH branch {b.name}: the {b.side} arm of IF {b.guard} in {b.label} never ran "
+                  f"({len(counts)} counted logs)")
+            failed = True
+        else:
+            print(f"BRANCH {b.name}  {sum(counts):,} entries over {len(counts)} counted logs")
+    return failed
+
+
+def judge_union(executed: list[tuple[Run, bool, Result]], base: Path,
+                 never_reached: tuple[tuple[str, str], ...],
+                 deferred: tuple[tuple[str, str, str], ...],
+                 branches: tuple[Branch, ...] = ()) -> bool:
+    """The suite-wide coverage union (design Section 4), judged only when every run in
+    expected.toml was selected (no --scenario). `executed` is every (run, fixed, result) this
+    invocation ran. A label of any run's module is covered if ANY run of that module - any
+    scenario, any kind, not -fixed - reports it with TOTAL > 0 in its last coverage block; whatever
+    is not covered that way must be listed in `never_reached` or `deferred`, and a listed label
+    that IS covered that way fails too. Prints the one-line report and returns whether the union
+    failed (which counts like a run mismatch in the exit code)."""
+    if any(result.status == "tooling" for _run, _fixed, result in executed):
+        print("run.py: suite-wide coverage not judged: a run failed or timed out")
+        return False
+    entries = []
+    for run, fixed, result in executed:
+        if fixed:
+            continue
+        assert result.log is not None, "a non-tooling result always has a log"
+        entries.append((run.module, result.log.read_text(encoding="utf-8", errors="replace")))
+    partial = frozenset(run.name for run, fixed, _result in executed
+                        if not fixed and run.kind in HALTING_KINDS)
+    failed = union_from_logs(entries, base, never_reached, deferred, partial)
+    if not branches:
+        return failed
+    counted = [(run.name, result.log.read_text(encoding="utf-8", errors="replace"))
+               for run, fixed, result in executed
+               if not fixed and counts_for_branches(run, base) and result.log is not None]
+    return judge_branches(branches, counted) or failed
+
+
+def union_from_logs(entries: list[tuple[str, str]], base: Path,
+                    never_reached: tuple[tuple[str, str], ...],
+                    deferred: tuple[tuple[str, str, str], ...],
+                    partial: frozenset[str] = frozenset()) -> bool:
+    """The union arithmetic itself, over (module, TLC log text) pairs.
+
+    Split out so the union can be judged from logs SAVED BY EARLIER JOBS rather than only from runs
+    this invocation made - see --union-from. Returns whether the union failed.
+
+    `partial` names the runs whose coverage block describes only a PREFIX of the state space: a
+    seeded or witness run halts at its first counterexample, so a label it does not report may
+    simply lie beyond the halt. Their POSITIVE coverage is sound - a label they did reach is
+    genuinely reachable - so it still counts, and `uncovered` still fails closed. What a prefix
+    CANNOT support is the opposite inference, and one check rests on exactly that: a `never_reached`
+    or `deferred` label is caught only by appearing in `all_covered`, so a label that a halting run
+    would have covered had it continued escapes. That is unfixable from a halting run by
+    construction - it is reported here rather than left implied (capstone, plan 3, round 5)."""
+    never_reached_labels = {label for label, _ in never_reached}
+    deferred_labels = {label for label, _scenario, _reason in deferred}
+    universes: dict[str, LabelUniverse] = {}
+    covered: dict[str, set[str]] = {}
+    reported: dict[str, set[str]] = {}
+    silent: list[str] = []
+    for module, log_text in entries:
+        if module not in universes:
+            universes[module] = module_labels((base / f"{module}.tla").read_text(encoding="utf-8"))
+        coverage = parse_coverage(parse_messages(log_text))
+        if coverage is None:
+            # parse_coverage fails CLOSED on purpose - it returns None rather than judging from a
+            # partial block. `or {}` used to turn that refusal into "this run covered nothing", which
+            # is not fail-closed in both directions: it inflates `uncovered` (loud) but SHRINKS
+            # `all_covered`, and `all_covered` is the only detector for a never_reached or deferred
+            # label that IS covered - so those two checks failed OPEN. execute() has always treated
+            # this condition as a tooling failure; the union now does too (capstone, plan 3).
+            silent.append(module)
+            continue
+        reported.setdefault(module, set()).update(coverage)
+        covered.setdefault(module, set()).update(name for name, (_d, total) in coverage.items() if total > 0)
+
+    if silent:
+        print(f"run.py: cannot judge the union: {len(silent)} log(s) carry no complete coverage block "
+              f"(truncated, empty, or -coverage output cut short)")
+        return True
+    if partial:
+        print(f"run.py: note: {len(partial)} of {len(entries)} runs halt at a counterexample, so their "
+              f"coverage is a PREFIX. Their positive coverage counts and 'uncovered' still fails "
+              f"closed; a never_reached or deferred label they would have covered later cannot be "
+              f"detected: {', '.join(sorted(partial))}")
+    all_covered: set[str] = set().union(*covered.values()) if covered else set()
+    uncovered: set[str] = set()
+    covered_in_universe: set[str] = set()
+    for module, universe in universes.items():
+        gated = universe.labels if universe.pluscal else (universe.labels & reported.get(module, set()))
+        module_covered = covered.get(module, set())
+        covered_in_universe |= gated & module_covered
+        uncovered |= ({label for label in gated if label not in module_covered}
+                      - never_reached_labels - deferred_labels)
+    wrongly_covered = never_reached_labels & all_covered
+    wrongly_covered_deferred = deferred_labels & all_covered
+
+    if uncovered or wrongly_covered or wrongly_covered_deferred:
+        print(f"MISMATCH suite coverage  uncovered: {','.join(sorted(uncovered)) or '-'}; "
+              f"never_reached but covered: {','.join(sorted(wrongly_covered)) or '-'}; "
+              f"deferred but covered: {','.join(sorted(wrongly_covered_deferred)) or '-'}")
+        return True
+    print(f"COVERAGE suite  {len(covered_in_universe)} labels covered, {len(never_reached_labels)} never_reached, "
+          f"{len(deferred_labels)} deferred")
+    return False
+
+
+def judge_union_from(expected: Expected, base: Path, logs_dir: Path) -> int:
+    """Judge the suite-wide coverage union from TLC logs the scenario jobs already wrote.
+
+    The union used to be judged by RE-RUNNING every run of expected.toml in one job. Measured
+    (CI 35188279927), that job cannot fit: it ran exactly its 180-minute cap and was killed, and
+    `breaklock-remote` alone is ~2.5h - so the one place the union is judged was never judging it.
+    The scenario jobs already upload `target/tla/out/`, and the union needs nothing from a run but
+    its last coverage block, so it is arithmetic over those logs and costs no TLC time at all.
+
+    A log that is MISSING is a hard failure, not a gap to skip: a union computed from some of the
+    runs would under-report coverage and fail honest labels, or over-report and excuse real ones."""
+    logs = {path.stem: path for path in sorted(logs_dir.rglob("*.log"))}
+    wanted = [r for r in expected.runs]
+    missing = [r.name for r in wanted if r.name not in logs]
+    if missing:
+        print(f"run.py: cannot judge the union: no TLC log for {len(missing)} run(s) under {logs_dir}: "
+              f"{', '.join(sorted(missing))}", file=sys.stderr)
+        return 2
+    entries = [(r.module, logs[r.name].read_text(encoding="utf-8", errors="replace")) for r in wanted]
+    partial = frozenset(r.name for r in wanted if r.kind in HALTING_KINDS)
+    print(f"run.py: judging the union from {len(entries)} saved logs under {logs_dir}")
+    failed = union_from_logs(entries, base, expected.never_reached, expected.deferred, partial)
+    if not expected.branches:
+        return 1 if failed else 0
+    counted = [(r.name, logs[r.name].read_text(encoding="utf-8", errors="replace"))
+               for r in wanted if counts_for_branches(r, base)]
+    failed = judge_branches(expected.branches, counted) or failed
+    return 1 if failed else 0
+
+
+def report_zero_branches(expected: Expected, logs_dir: Path) -> int:
+    """List every expression TLC evaluated ZERO times, per run, from saved logs.
+
+    A REPORT, not a gate. Making it a gate needs an expectations surface - which zeros are intended -
+    and nobody has measured how many there are yet; this is how that gets measured. It is also not
+    yet known what node shape TLC emits for a PlusCal `if`/`else if` INSIDE a label: the recorded
+    fixtures cover a raw TLA+ module and a three-action PlusCal one, and this suite is neither."""
+    logs = {path.stem: path for path in sorted(logs_dir.rglob("*.log"))}
+    total_zero = 0
+    for run in expected.runs:
+        path = logs.get(run.name)
+        if path is None:
+            print(f"  {run.name}: no log")
+            continue
+        nodes = parse_cost_nodes(parse_messages(path.read_text(encoding="utf-8", errors="replace")))
+        if nodes is None:
+            print(f"  {run.name}: no complete coverage block")
+            continue
+        zeros = [n for n in nodes if n[3] == 0]
+        total_zero += len(zeros)
+        nested = sum(1 for n in nodes if n[4] > 0)
+        print(f"  {run.name}: {len(zeros)} zero of {len(nodes)} expression nodes "
+              f"({nested} nested)")
+        for module, line, col, _count, depth in zeros:
+            print(f"      {module} line {line}, col {col}{'  (depth ' + str(depth) + ')' if depth else ''}")
+    print(f"run.py: {total_zero} zero-count expression nodes across {len(expected.runs)} runs")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the lock-protocol model check.")
     parser.add_argument("--expected", type=Path, default=HERE / "expected.toml")
     parser.add_argument("--scenario", help="run only this scenario")
+    parser.add_argument("--platform", help="with --scenario, run only this platform")
+    parser.add_argument("--job", help="run only the runs in this CI job (see --list-jobs)")
+    parser.add_argument("--check-translation", action="store_true",
+                        help="re-run the PlusCal translator and fail if LockProtocol.tla is stale")
+    parser.add_argument("--union-from", type=Path, metavar="DIR",
+                        help="judge the suite-wide coverage union from TLC logs already written under DIR, "
+                             "instead of re-running every run")
+    parser.add_argument("--zero-branches", type=Path, metavar="DIR",
+                        help="report every expression TLC evaluated zero times, from logs under DIR "
+                             "(a report, not a gate)")
+    parser.add_argument("--mutants", type=Path, metavar="TOML",
+                        help="run the exact-text mutants in TOML, each on a scratch copy of the model (cut 6)")
+    parser.add_argument("--list-mutants", type=Path, metavar="TOML",
+                        help="validate TOML against the current sources and print its mutant names as JSON")
+    parser.add_argument("--mutant", help="with --mutants or --list-mutants, only the mutant of this name")
     parser.add_argument("--list-scenarios", action="store_true", help="print the scenario names as JSON")
+    parser.add_argument("--list-jobs", action="store_true",
+                         help="print the distinct {scenario, platform} pairs as JSON")
     args = parser.parse_args(argv)
 
+    if args.mutant is not None and args.mutants is None and args.list_mutants is None:
+        print("run.py: --mutant requires --mutants or --list-mutants", file=sys.stderr)
+        return 2
+    if args.mutants is not None or args.list_mutants is not None:
+        return mutants_main(args.mutants or args.list_mutants, args.mutant, listing=args.list_mutants is not None)
+    if args.platform is not None and args.scenario is None:
+        print("run.py: --platform requires --scenario", file=sys.stderr)
+        return 2
+
     try:
-        scenarios, runs = load_expected(args.expected)
+        expected = load_expected(args.expected)
     except ExpectedError as err:
         print(f"run.py: {err}", file=sys.stderr)
         return 2
+    scenarios = expected.scenarios
     if args.list_scenarios:
         print(json.dumps(scenarios))
         return 0
+    if args.list_jobs:
+        jobs: list[dict[str, str]] = []
+        for s in scenarios:
+            for r in expected.runs:
+                if r.scenario != s:
+                    continue
+                entry = {"scenario": s, "platform": platform_of(r.name, s), "job": r.job}
+                if entry not in jobs:
+                    jobs.append(entry)
+        print(json.dumps(jobs))
+        return 0
+    if args.check_translation:
+        return check_translation(args.expected.resolve().parent)
+    if args.union_from is not None:
+        return judge_union_from(expected, args.expected.resolve().parent, args.union_from)
+    if args.zero_branches is not None:
+        return report_zero_branches(expected, args.zero_branches)
     if args.scenario is not None and args.scenario not in scenarios:
         print(f"run.py: unknown scenario {args.scenario!r}; known: {', '.join(scenarios)}", file=sys.stderr)
         return 2
-    selected = [r for r in runs if args.scenario is None or r.scenario == args.scenario]
+    selected = [r for r in expected.runs if args.scenario is None or r.scenario == args.scenario]
+    if args.platform is not None:
+        selected = [r for r in selected if r.name.startswith(f"{args.scenario}-{args.platform}-")]
+        if not selected:
+            print(f"run.py: no runs for scenario {args.scenario} on platform {args.platform}", file=sys.stderr)
+            return 2
+    if args.job is not None:
+        selected = [r for r in selected if r.job == args.job]
+        if not selected:
+            print(f"run.py: no runs in job {args.job!r}", file=sys.stderr)
+            return 2
 
     if shutil.which("java") is None:
         print("run.py: java is not on PATH (TLC needs Java 11 or later; CI uses Temurin 21)", file=sys.stderr)
@@ -530,6 +1839,7 @@ def main(argv: list[str] | None = None) -> int:
 
     base = args.expected.resolve().parent
     results: list[Result] = []
+    executed: list[tuple[Run, bool, Result]] = []
     try:
         for run in selected:
             for fixed in (False, True) if run.open_findings else (False,):
@@ -537,12 +1847,19 @@ def main(argv: list[str] | None = None) -> int:
                     result = execute(run, jar, base, fixed)
                 except (OSError, ExpectedError) as err:
                     result = Result(run.name, "tooling", frozenset(), frozenset(), None, 0.0, str(err), (), None)
-                report(result)
+                report(result, run.tightened)
                 results.append(result)
+                executed.append((run, fixed, result))
     except KeyboardInterrupt:
         print(f"run.py: interrupted after {len(results)} runs", file=sys.stderr)
         return 2
     code = exit_code(results)
+
+    if args.scenario is not None:
+        print("run.py: suite-wide coverage not judged for a single scenario")
+    elif judge_union(executed, base, expected.never_reached, expected.deferred, expected.branches):
+        code = 1  # a union failure counts like a run mismatch: it outranks a tooling failure too
+
     print(f"run.py: {len(results)} runs, exit {code}")
     return code
 

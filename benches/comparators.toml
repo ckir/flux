@@ -1,0 +1,26 @@
+# The copiers Flux is measured against in CI (docs/superpowers/specs/2026-10-03-benchmark-publishing-design.md,
+# "The comparator registry"). One [[comparator]] table per tool. `command` and `version` are argument arrays, run
+# without a shell; `{src}` and `{dst}` are replaced inside each argument. Every command copies contents, times and
+# permissions, as Flux does by default. To add a tool (FastCopy, say), add a table; `source = "download"` needs a
+# pinned https `url` and its `sha256`.
+
+[[comparator]]
+name = "robocopy"
+os = ["windows"]
+command = ["robocopy", "{src}", "{dst}", "/E", "/COPY:DAT", "/DCOPY:T", "/NJH", "/NJS", "/NFL", "/NDL", "/NP"]
+# robocopy's success codes: 0 nothing copied, 1 files copied, up to 7 with extra or mismatched files reported.
+ok_exit_codes = [0, 1, 2, 3, 4, 5, 6, 7]
+source = "preinstalled"
+
+[[comparator]]
+name = "cp"
+os = ["linux", "macos"]
+command = ["cp", "-Rp", "{src}/.", "{dst}"]
+source = "preinstalled"
+
+[[comparator]]
+name = "rsync"
+os = ["linux", "macos"]
+command = ["rsync", "-rtp", "{src}/", "{dst}/"]
+version = ["rsync", "--version"]
+source = "preinstalled"

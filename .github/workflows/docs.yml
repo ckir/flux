@@ -89,12 +89,26 @@ jobs:
           </html>
           EOF
 
+      - name: Add the benchmark pages
+        # The data branch goes into target/doc/bench/ beside the trend page, so one deploy serves the docs and the
+        # benchmarks (spec "Where the data lives"). Before the first benchmark, or if the branch was deleted, the docs
+        # deploy alone.
+        run: |
+          if git ls-remote --exit-code --heads origin bench-data > /dev/null; then
+            git fetch --depth 1 origin bench-data
+            mkdir -p target/doc/bench
+            git archive FETCH_HEAD | tar -x -C target/doc/bench
+            cp benches/publish/site/index.html target/doc/bench/index.html
+          else
+            echo "no bench-data branch yet: deploying the docs without bench/"
+          fi
+
       # No actions/configure-pages: its only job is computing base_url for static
       # site generators, which rustdoc does not consume, and `enablement` defaults
       # to false so it never creates the site either. Pages is already enabled with
       # build_type=workflow, so the step is dead weight — and dropping it keeps the
       # build job honestly at contents:read.
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: target/doc
 
@@ -110,4 +124,4 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

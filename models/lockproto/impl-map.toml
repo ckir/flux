@@ -1,0 +1,140 @@
+# Every protocol label of algorithm.txt, and the Rust function that implements it, or why none does (cut 7a design,
+# "Model conformance"). `item` is "<file relative to the repository>::<function>"; the file must define that function
+# AND mention the label. `status` is one of: part-3 (cut 7a Part 3 implements it), seed-only (a seeded defect, never
+# implemented), model-only (an event of the model, not a step of the code), not-in-7a (a later cut). Checked by
+# tests/model_impl_map.rs.
+
+[S240_1_open]
+item = "crates/flux-core/src/lock/classify.rs::classify"
+[S240_1_trylock]
+item = "crates/flux-core/src/lock/classify.rs::classify"
+[S240_1_read]
+item = "crates/flux-core/src/lock/classify.rs::classify"
+[S240_1_close]
+item = "crates/flux-core/src/lock/classify.rs::classify"
+
+[S96_1_create]
+item = "crates/flux-core/src/lock/acquire.rs::acquire"
+[S96_1_dircheck]
+item = "crates/flux-core/src/lock/acquire.rs::acquire"
+[S96_1_backoff]
+item = "crates/flux-core/src/lock/acquire.rs::acquire"
+[S96_1_ownlock]
+item = "crates/flux-core/src/lock/acquire.rs::own_lock"
+[S96_1_ownlock_wait]
+item = "crates/flux-core/src/lock/acquire.rs::own_lock"
+[S96_1_ownlock_verify]
+item = "crates/flux-core/src/lock/acquire.rs::own_lock"
+[S96_1_ownlock_close]
+item = "crates/flux-core/src/lock/acquire.rs::own_lock"
+[S96_1_record_begin]
+item = "crates/flux-core/src/lock/held.rs::write_record"
+[S96_1_record_end]
+item = "crates/flux-core/src/lock/held.rs::write_record"
+
+[S240_3_s1]
+item = "crates/flux-core/src/lock/recover.rs::recover"
+[S240_3_s2]
+item = "crates/flux-core/src/lock/recover.rs::recover"
+[S240_3_s3]
+item = "crates/flux-core/src/lock/recover.rs::recover"
+[S240_3_s4]
+item = "crates/flux-core/src/lock/recover.rs::recover"
+[S240_3_s4_lock]
+item = "crates/flux-core/src/lock/acquire.rs::own_lock"
+[S240_3_s4_lock_wait]
+item = "crates/flux-core/src/lock/acquire.rs::own_lock"
+[S240_3_s4_lock_verify]
+item = "crates/flux-core/src/lock/acquire.rs::own_lock"
+[S240_3_s4_lock_close]
+item = "crates/flux-core/src/lock/acquire.rs::own_lock"
+[S240_3_s4_record_begin]
+item = "crates/flux-core/src/lock/held.rs::write_record"
+[S240_3_s4_record_end]
+item = "crates/flux-core/src/lock/held.rs::write_record"
+[S240_3_s5]
+item = "crates/flux-core/src/lock/recover.rs::recover"
+[S240_3_s4_drop]
+item = "crates/flux-core/src/lock/recover.rs::recover"
+[S240_3_putback]
+item = "crates/flux-core/src/lock/recover.rs::recover"
+[S240_3_restart]
+item = "crates/flux-core/src/lock/recover.rs::recover"
+[S240_3_release]
+item = "crates/flux-core/src/lock/recover.rs::recover"
+
+[S240_5_s1]
+item = "crates/flux-core/src/lock/takeover.rs::take_over"
+[S240_5_s2]
+item = "crates/flux-core/src/lock/takeover.rs::take_over"
+[S240_5_s3]
+item = "crates/flux-core/src/lock/takeover.rs::take_over"
+[S240_5_s4]
+item = "crates/flux-core/src/lock/takeover.rs::take_over"
+[S240_5_s5]
+item = "crates/flux-core/src/lock/takeover.rs::take_over"
+[S240_5_close]
+item = "crates/flux-core/src/lock/takeover.rs::take_over"
+[S240_5_s6_write_begin]
+item = "crates/flux-core/src/lock/takeover.rs::overwrite"
+[S240_5_s6_write_end]
+item = "crates/flux-core/src/lock/takeover.rs::overwrite"
+[S240_5_s6_flush]
+item = "crates/flux-core/src/lock/takeover.rs::overwrite"
+[S240_5_s6]
+item = "crates/flux-core/src/lock/takeover.rs::overwrite"
+[S240_5_s6_seed]
+status = "seed-only"
+reason = "SEED_RENAME_OVER_TAKEOVER: a takeover by rename-over, a defect the model seeds; 7a overwrites in place"
+[S240_5_seed_write_begin]
+status = "seed-only"
+reason = "SEED_RENAME_OVER_TAKEOVER's private record write"
+[S240_5_seed_write_end]
+status = "seed-only"
+reason = "SEED_RENAME_OVER_TAKEOVER's private record write"
+[S240_5_seed_rename]
+status = "seed-only"
+reason = "SEED_RENAME_OVER_TAKEOVER's rename over the lock"
+
+[S99_check]
+item = "crates/flux-core/src/lock/held.rs::still_owned"
+[S99_write]
+item = "crates/flux-core/src/copy.rs::copy_file_guarded"
+[S240_5_inflight_lands]
+status = "model-only"
+reason = "an issued write completing after a takeover: an event the model checks, not a step the code takes"
+[S99_release_check]
+item = "crates/flux-core/src/lock/held.rs::release"
+[S99_release]
+item = "crates/flux-core/src/lock/held.rs::release"
+[S99_release_lands]
+item = "crates/flux-core/src/lock/held.rs::release"
+[S99_close]
+item = "crates/flux-core/src/lock/held.rs::release"
+[S99_refuse_close]
+item = "crates/flux-core/src/lock/held.rs::release"
+
+[S21_1_decide]
+item = "crates/flux-core/src/lock/obtain.rs::obtain"
+[S21_1_refused]
+item = "crates/flux-core/src/lock/obtain.rs::obtain"
+[S21_1_restart_decide]
+item = "crates/flux-core/src/lock/obtain.rs::obtain"
+[S21_1_s3]
+item = "crates/flux-core/src/run/restart.rs::supersede"
+[S21_1_s5_write_begin]
+item = "crates/flux-core/src/run/session.rs::open_operation"
+[S21_1_s5_write_end]
+item = "crates/flux-core/src/run/session.rs::open_operation"
+[S21_1_s3_refuse_close]
+item = "crates/flux-core/src/run/session.rs::open_operation"
+
+[S251_1_classify]
+status = "not-in-7a"
+reason = "flux cleanup (a later cut)"
+[S251_1_delete]
+status = "not-in-7a"
+reason = "flux cleanup (a later cut)"
+[S251_1_close]
+status = "not-in-7a"
+reason = "flux cleanup (a later cut)"

@@ -1,10 +1,39 @@
 name: CI
 
 on:
+  # Every branch, not just main: a branch pushed BEFORE its pull request exists matched neither
+  # trigger and got zero checks, so work could sit on the remote untested for as long as the PR
+  # was unopened. `'**'` matches branch names containing a slash; it deliberately does NOT match
+  # tags, which would otherwise run the whole suite again on every release tag.
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
     branches: [main]
+  # Manual runs (`gh workflow run ci.yml --ref <branch>`), for when GitHub drops a push event and a pull request
+  # gets no checks.
+  workflow_dispatch:
+
+# Dedup WITHIN an event stream, never ACROSS one - the event name is in the key on purpose.
+#
+# MEASURED, and this cost a broken pull request before it was understood: keying only on the branch
+# put the push and pull_request runs for the same commit in one bucket, so GitHub cancelled one of
+# them. A cancelled check run still reports its contexts against that commit, so all eight REQUIRED
+# contexts appeared twice on the PR - once SUCCESS, once CANCELLED - and branch protection read the
+# cancelled ones. `mergeStateStatus` was BLOCKED; re-running the cancelled run to success flipped it
+# to UNSTABLE immediately, which is what identified the cause.
+#
+# So the two event streams are kept apart. A push to a PR branch does run CI twice, which is the
+# price of having branch pushes checked at all; at roughly a minute for eight jobs that is cheap,
+# and an unmergeable pull request is not.
+#
+# What the group still buys: a rapid second push cancels the first push's run. That run belongs to
+# the superseded commit, and contexts are per-commit, so cancelling it cannot affect the new head.
+#
+# Cancelling is scoped to feature branches. A run on main is the record of what that commit did, so
+# a rapid second push must not erase the first one's verdict.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: ${{ github.ref_name != 'main' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -39,12 +68,51 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  clippy-macos:
+    # A separate job, not a matrix on `clippy`: a matrix renames the check, and "Clippy" is a required
+    # status check, so it would never report and every pull request would stay blocked. macOS needs its
+    # own run because `stat` field widths differ there (`st_mode: u16`, `st_dev: i32`), so a cast that is
+    # required on macOS is a lint on Linux and the reverse; the test job compiles macOS but never lints it.
+    name: Clippy (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  workflow-lint:
+    # actionlint checks every workflow's syntax, expressions, job references and action inputs, and runs
+    # shellcheck over each `run:` step; the pinned image bundles both. It runs on every CI run rather than
+    # behind a path filter, so it can be made a required check without a skipped run blocking a merge.
+    name: Workflow lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: actionlint
+        uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color
+
   deny:
     name: Cargo deny
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  bench-harness:
+    # The benchmark harness's own tests (benches/publish/), as models/lockproto's are run in model.yml.
+    name: Bench harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - run: python -W error -m unittest discover -s benches/publish -p "test_*.py"
 
   test:
     # Flux is a filesystem engine: hardlinks, symlinks, sparse files, reflinks and

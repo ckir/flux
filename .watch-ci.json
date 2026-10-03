@@ -1,0 +1,15 @@
+{
+  "branch": "main",
+  "max_retries": 3,
+  "max_total_minutes": 300,
+  "paths_denylist": [
+    ".github/workflows/",
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    "justfile",
+    "FLUX_FULL_UPDATED_SPEC_V16.md",
+    "models/",
+    "docs/"
+  ]
+}

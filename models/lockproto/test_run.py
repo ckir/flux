@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import json
+import re
 import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -27,8 +30,8 @@ module = "M"
 config = "check.cfg"
 scenario = "demo"
 kind = "check"
-violated = ["NeverDone"]
 open_findings = [{ name = "Safe", tracking = "TODO.md: demo", fix_flag = "FIX_SAFE" }]
+constants = {}
 timeout_minutes = 5
 
 [[run]]
@@ -37,6 +40,8 @@ module = "M"
 config = "live.cfg"
 scenario = "demo"
 kind = "liveness"
+open_findings = [{ name = "LiveWitness", tracking = "TODO.md: demo-live", fix_flag = "FIX_LIVE" }]
+constants = {}
 timeout_minutes = 5
 
 [[run]]
@@ -46,14 +51,28 @@ config = "seed.cfg"
 scenario = "demo"
 kind = "seeded"
 violated = ["Other"]
+constants = {}
+timeout_minutes = 5
+
+[[run]]
+name = "demo-posix-witness-Other2"
+module = "M"
+config = "witness.cfg"
+scenario = "demo"
+kind = "witness"
+violated = ["Other2"]
+constants = {}
 timeout_minutes = 5
 """
 
 CFGS = {
     "check.cfg": "SPECIFICATION Spec\nCONSTANTS\n    FIX_SAFE = FALSE\nINVARIANTS Safe NeverDone\n",
-    "live.cfg": "SPECIFICATION Spec\nCONSTANT FIX_SAFE = FALSE\nPROPERTY Eventually\n",
-    "seed.cfg": "SPECIFICATION Spec\nCONSTANT FIX_SAFE = FALSE\nINVARIANT Other\n",
+    "live.cfg": "SPECIFICATION Spec\nCONSTANTS\n    FIX_LIVE = FALSE\nINVARIANT LiveWitness\nPROPERTY Eventually\n",
+    "seed.cfg": "SPECIFICATION Spec\nCONSTANT FIX_SAFE = FALSE\nINVARIANT Other Safe\n",
+    "witness.cfg": "SPECIFICATION Spec\nCONSTANT FIX_SAFE = FALSE\nINVARIANT Other2\n",
 }
+
+DEFAULT_MODULE = "---- MODULE M ----\n====\n"
 
 
 def fixture(case: str) -> tuple[int, str]:
@@ -65,15 +84,16 @@ def fixture(case: str) -> tuple[int, str]:
 class ExpectedDir:
     """A temporary directory holding expected.toml, M.tla and the configs."""
 
-    def __init__(self, expected: str = GOOD_EXPECTED, cfgs: dict[str, str] | None = None) -> None:
+    def __init__(self, expected: str = GOOD_EXPECTED, cfgs: dict[str, str] | None = None,
+                 module_text: str | None = None) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.path = Path(self._tmp.name)
-        (self.path / "M.tla").write_text("---- MODULE M ----\n====\n", encoding="utf-8")
+        (self.path / "M.tla").write_text(module_text or DEFAULT_MODULE, encoding="utf-8")
         for name, text in (CFGS if cfgs is None else cfgs).items():
             (self.path / name).write_text(text, encoding="utf-8")
         (self.path / "expected.toml").write_text(textwrap.dedent(expected), encoding="utf-8")
 
-    def load(self) -> tuple[list[str], list[run.Run]]:
+    def load(self) -> run.Expected:
         return run.load_expected(self.path / "expected.toml")
 
     def close(self) -> None:
@@ -81,27 +101,35 @@ class ExpectedDir:
 
 
 class LoadExpectedTests(unittest.TestCase):
-    def load(self, expected: str, cfgs: dict[str, str] | None = None) -> tuple[list[str], list[run.Run]]:
-        d = ExpectedDir(expected, cfgs)
+    def load(self, expected: str, cfgs: dict[str, str] | None = None, module_text: str | None = None) -> run.Expected:
+        d = ExpectedDir(expected, cfgs, module_text)
         self.addCleanup(d.close)
         return d.load()
 
-    def assertRejected(self, expected: str, fragment: str, cfgs: dict[str, str] | None = None) -> None:
+    def assertRejected(self, expected: str, fragment: str, cfgs: dict[str, str] | None = None,
+                        module_text: str | None = None) -> None:
         with self.assertRaises(run.ExpectedError) as ctx:
-            self.load(expected, cfgs)
+            self.load(expected, cfgs, module_text)
         self.assertIn(fragment, str(ctx.exception))
 
     def test_good_file_loads(self) -> None:
-        scenarios, runs = self.load(GOOD_EXPECTED)
-        self.assertEqual(scenarios, ["demo"])
-        self.assertEqual([r.kind for r in runs], ["check", "liveness", "seeded"])
-        self.assertEqual(runs[0].open_findings, (run.OpenFinding("Safe", "TODO.md: demo", "FIX_SAFE"),))
-        self.assertEqual(runs[1].violated, ())
+        expected = self.load(GOOD_EXPECTED)
+        self.assertEqual(expected.scenarios, ["demo"])
+        self.assertEqual([r.kind for r in expected.runs], ["check", "liveness", "seeded", "witness"])
+        self.assertEqual(expected.runs[0].open_findings, (run.OpenFinding("Safe", "TODO.md: demo", "FIX_SAFE"),))
+        self.assertEqual(expected.runs[2].violated, ("Other",))
 
     def test_the_repository_file_loads(self) -> None:
-        scenarios, runs = run.load_expected(HERE / "expected.toml")
-        self.assertTrue(scenarios)
-        self.assertTrue(runs)
+        expected = run.load_expected(HERE / "expected.toml")
+        self.assertTrue(expected.scenarios)
+        self.assertTrue(expected.runs)
+
+    def test_the_extended_repository_file_loads(self) -> None:
+        expected = run.load_expected(HERE / "expected-extended.toml")
+        # breaklock joined recovery here on 2026-09-22, when the deep liveness run moved off the
+        # per-pull-request tier. This list is the file's contents, not a property of the loader.
+        self.assertEqual(expected.scenarios, ["breaklock", "recovery"])
+        self.assertTrue(expected.runs)
 
     def test_unknown_kind(self) -> None:
         self.assertRejected(GOOD_EXPECTED.replace('kind = "liveness"', 'kind = "live"'), "kind must be one of")
@@ -125,15 +153,47 @@ class LoadExpectedTests(unittest.TestCase):
 
     def test_duplicate_names(self) -> None:
         self.assertRejected(GOOD_EXPECTED.replace('"demo-posix-seeded-SEED_X"', '"demo-posix-check"')
-                            .replace('kind = "seeded"', 'kind = "check"'), "duplicate run names")
+                            .replace('kind = "seeded"\nviolated = ["Other"]', 'kind = "check"'), "duplicate run names")
 
-    def test_liveness_with_violated(self) -> None:
-        self.assertRejected(GOOD_EXPECTED.replace('kind = "liveness"', 'kind = "liveness"\nviolated = ["X"]'),
-                            "a liveness run has no 'violated'")
+    def test_witness_is_accepted(self) -> None:
+        expected = self.load(GOOD_EXPECTED)
+        witness = expected.runs[3]
+        self.assertEqual(witness.kind, "witness")
+        self.assertEqual(witness.violated, ("Other2",))
+        self.assertEqual(witness.name, "demo-posix-witness-Other2")
 
-    def test_check_needs_a_witness(self) -> None:
-        self.assertRejected(GOOD_EXPECTED.replace('violated = ["NeverDone"]', 'violated = []'),
-                            "at least one reachability witness")
+    def test_witness_name_suffix_must_equal_violated(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace('"demo-posix-witness-Other2"', '"demo-posix-witness-WrongName"'),
+                            "name must be")
+
+    def test_witness_cfg_must_list_exactly_its_invariant(self) -> None:
+        cfgs = dict(CFGS, **{"witness.cfg": "SPECIFICATION Spec\nCONSTANT FIX_SAFE = FALSE\nINVARIANT Other2 Extra\n"})
+        self.assertRejected(GOOD_EXPECTED, "lists exactly one invariant", cfgs)
+
+    def test_witness_cfg_must_not_declare_a_property(self) -> None:
+        cfgs = dict(CFGS, **{"witness.cfg": CFGS["witness.cfg"] + "PROPERTY Eventually\n"})
+        self.assertRejected(GOOD_EXPECTED, "must not declare a PROPERTY", cfgs)
+
+    def test_check_with_violated_is_rejected(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace('kind = "check"\nopen_findings',
+                                                  'kind = "check"\nviolated = ["Anything"]\nopen_findings'),
+                            "must not declare 'violated'")
+
+    def test_liveness_with_violated_is_rejected(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace('kind = "liveness"\nopen_findings',
+                                                  'kind = "liveness"\nviolated = ["Anything"]\nopen_findings'),
+                            "must not declare 'violated'")
+
+    def test_open_findings_on_a_witness_is_rejected(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace(
+            'kind = "witness"\nviolated = ["Other2"]',
+            'kind = "witness"\nviolated = ["Other2"]\n'
+            'open_findings = [{ name = "X", tracking = "y", fix_flag = "FIX_X" }]'),
+            "only allowed for check and liveness runs")
+
+    def test_seeded_needs_violated(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace('kind = "seeded"\nviolated = ["Other"]', 'kind = "seeded"'),
+                            "a seeded run needs 'violated'")
 
     def test_seeded_needs_exactly_one(self) -> None:
         self.assertRejected(GOOD_EXPECTED.replace('violated = ["Other"]', 'violated = ["Other", "More"]'),
@@ -153,6 +213,16 @@ class LoadExpectedTests(unittest.TestCase):
     def test_deadlock_check_cannot_be_turned_off(self) -> None:
         cfgs = dict(CFGS, **{"seed.cfg": CFGS["seed.cfg"] + "CHECK_DEADLOCK FALSE\n"})
         self.assertRejected(GOOD_EXPECTED, "must not set CHECK_DEADLOCK", cfgs)
+
+    def test_state_space_shrinking_sections_are_rejected_in_every_kind(self) -> None:
+        # CONSTRAINT, ACTION_CONSTRAINT and VIEW all cut or merge states while every constant still matches
+        # expected.toml, so a .cfg could make a failing run pass (design Section 4: the .cfg may only agree).
+        for cfg in ("check.cfg", "live.cfg", "seed.cfg"):
+            for section in ("CONSTRAINT Safe", "CONSTRAINTS Safe", "ACTION_CONSTRAINT Safe", "ACTION_CONSTRAINTS Safe",
+                            "VIEW x", "TYPE Safe", "TYPE_CONSTRAINT Safe"):
+                with self.subTest(cfg=cfg, section=section):
+                    cfgs = dict(CFGS, **{cfg: CFGS[cfg] + section + "\n"})
+                    self.assertRejected(GOOD_EXPECTED, "must not shrink the state space", cfgs)
 
     def test_liveness_needs_one_property(self) -> None:
         cfgs = dict(CFGS, **{"live.cfg": "SPECIFICATION Spec\nPROPERTIES Eventually Always\n"})
@@ -177,10 +247,429 @@ class LoadExpectedTests(unittest.TestCase):
     def test_missing_config_file(self) -> None:
         self.assertRejected(GOOD_EXPECTED.replace('"seed.cfg"', '"missing.cfg"'), "config missing.cfg not found")
 
+    def test_check_config_must_not_declare_a_property(self) -> None:
+        cfgs = dict(CFGS, **{"check.cfg": CFGS["check.cfg"] + "PROPERTY Eventually\n"})
+        self.assertRejected(GOOD_EXPECTED, "must not declare a PROPERTY", cfgs)
+
+    def test_unreached_well_formed_is_parsed(self) -> None:
+        expected_toml = GOOD_EXPECTED.replace(
+            'kind = "check"\nopen_findings',
+            'kind = "check"\nunreached = [{ label = "S12_3", reason = "not reached in this variant" }]\nopen_findings')
+        expected = self.load(expected_toml, module_text="---- MODULE M ----\nS12_3 == TRUE\n====\n")
+        self.assertEqual(expected.runs[0].unreached, (("S12_3", "not reached in this variant"),))
+
+    def test_unreached_must_be_a_list(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace('kind = "check"\nopen_findings',
+                                                  'kind = "check"\nunreached = "S12_3"\nopen_findings'),
+                            "unreached must be an array of tables")
+
+    def test_unreached_entry_needs_exactly_label_and_reason(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace('kind = "check"\nopen_findings',
+                                                  'kind = "check"\nunreached = [{ label = "S12_3" }]\nopen_findings'),
+                            "exactly 'label' and 'reason'")
+
+    def test_unreached_label_must_be_an_identifier(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace(
+            'kind = "check"\nopen_findings',
+            'kind = "check"\nunreached = [{ label = "not-a-label", reason = "x" }]\nopen_findings'),
+            "must be a TLA+ identifier")
+
+    def test_unreached_label_like_plain_recover_is_accepted(self) -> None:
+        expected_toml = GOOD_EXPECTED.replace(
+            'kind = "check"\nopen_findings',
+            'kind = "check"\nunreached = [{ label = "plain_recover", reason = "x" }]\nopen_findings')
+        expected = self.load(expected_toml, module_text="---- MODULE M ----\nplain_recover == TRUE\n====\n")
+        self.assertEqual(expected.runs[0].unreached, (("plain_recover", "x"),))
+
+    def test_unreached_reason_must_be_non_empty(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace(
+            'kind = "check"\nopen_findings',
+            'kind = "check"\nunreached = [{ label = "S12_3", reason = "" }]\nopen_findings'),
+            "reason must be a non-empty string")
+
+    def test_unreached_labels_must_be_unique(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace(
+            'kind = "check"\nopen_findings',
+            'kind = "check"\n'
+            'unreached = [{ label = "S12_3", reason = "a" }, { label = "S12_3", reason = "b" }]\n'
+            'open_findings'),
+            "has duplicate labels")
+
+    def test_unreached_is_not_allowed_on_a_seeded_run(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace(
+            'violated = ["Other"]',
+            'violated = ["Other"]\nunreached = [{ label = "S12_3", reason = "x" }]'),
+            "only allowed for check and liveness runs")
+
+    def test_never_reached_well_formed_is_parsed(self) -> None:
+        d = ExpectedDir(GOOD_EXPECTED + '\n[[never_reached]]\nlabel = "S99_1"\nreason = "no scenario reaches it"\n',
+                         module_text="---- MODULE M ----\nS99_1 == TRUE\n====\n")
+        self.addCleanup(d.close)
+        expected = d.load()
+        self.assertEqual(expected.never_reached, (("S99_1", "no scenario reaches it"),))
+
+    def test_never_reached_label_must_be_in_some_module(self) -> None:
+        self.assertRejected(GOOD_EXPECTED + '\n[[never_reached]]\nlabel = "NoSuchLabel"\nreason = "x"\n',
+                            "is not in the label universe of any run's module")
+
+    def test_never_reached_label_must_be_an_identifier(self) -> None:
+        self.assertRejected(GOOD_EXPECTED + '\n[[never_reached]]\nlabel = "not-an-ident"\nreason = "x"\n',
+                            "must be a TLA+ identifier")
+
     def test_unknown_run_key(self) -> None:
         self.assertRejected(GOOD_EXPECTED.replace("timeout_minutes = 5\n\n[[run]]\nname = \"demo-posix-liveness\"",
                                                   "timeout_minutes = 5\nnotes = \"x\"\n\n[[run]]\nname = \"demo-posix-liveness\""),
                             "unknown keys")
+
+    def test_unknown_top_level_key_is_rejected(self) -> None:
+        self.assertRejected('bogus = "x"\n' + GOOD_EXPECTED, "unknown top-level keys")
+
+    def test_duplicate_scenarios_are_rejected(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace('scenarios = ["demo"]', 'scenarios = ["demo", "demo"]'),
+                            "has duplicates")
+
+    def test_timeout_must_be_a_positive_whole_number(self) -> None:
+        for literal in ("0", "-1", "true", '"5"'):
+            with self.subTest(literal=literal):
+                self.assertRejected(GOOD_EXPECTED.replace("timeout_minutes = 5", f"timeout_minutes = {literal}"),
+                                    "timeout_minutes must be a whole number")
+
+    def test_duplicate_open_finding_names_are_rejected(self) -> None:
+        expected = GOOD_EXPECTED.replace(
+            'open_findings = [{ name = "Safe", tracking = "TODO.md: demo", fix_flag = "FIX_SAFE" }]',
+            'open_findings = [{ name = "Safe", tracking = "TODO.md: demo", fix_flag = "FIX_SAFE" }, '
+            '{ name = "Safe", tracking = "TODO.md: demo2", fix_flag = "FIX_SAFE" }]')
+        self.assertRejected(expected, "duplicate open findings")
+
+    def test_unknown_module_is_rejected(self) -> None:
+        self.assertRejected(GOOD_EXPECTED.replace('module = "M"', 'module = "NoSuchModule"'),
+                            "not found beside expected.toml")
+
+
+class DeferredLoadTests(unittest.TestCase):
+    """Load-time validation of the top-level 'deferred' list (design Section 4)."""
+
+    MODULE_WITH_S99_1 = "---- MODULE M ----\nS99_1 == TRUE\n====\n"
+
+    def load(self, expected: str, module_text: str | None = None) -> run.Expected:
+        d = ExpectedDir(expected, module_text=module_text)
+        self.addCleanup(d.close)
+        return d.load()
+
+    def assertRejected(self, expected: str, fragment: str, module_text: str | None = None) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            self.load(expected, module_text)
+        self.assertIn(fragment, str(ctx.exception))
+
+    def test_deferred_well_formed_is_parsed(self) -> None:
+        expected = self.load(
+            GOOD_EXPECTED + '\n[[deferred]]\nlabel = "S99_1"\nscenario = "future"\nreason = "not built yet"\n',
+            module_text=self.MODULE_WITH_S99_1)
+        self.assertEqual(expected.deferred, (("S99_1", "future", "not built yet"),))
+
+    def test_duplicate_deferred_label_is_rejected(self) -> None:
+        self.assertRejected(
+            GOOD_EXPECTED + '\n[[deferred]]\nlabel = "S99_1"\nscenario = "future"\nreason = "a"\n'
+                            '\n[[deferred]]\nlabel = "S99_1"\nscenario = "later"\nreason = "b"\n',
+            "has duplicate labels", module_text=self.MODULE_WITH_S99_1)
+
+    def test_deferred_label_also_in_never_reached_is_rejected(self) -> None:
+        self.assertRejected(
+            GOOD_EXPECTED + '\n[[never_reached]]\nlabel = "S99_1"\nreason = "x"\n'
+                            '\n[[deferred]]\nlabel = "S99_1"\nscenario = "future"\nreason = "y"\n',
+            "is also in 'never_reached'", module_text=self.MODULE_WITH_S99_1)
+
+    def test_unknown_deferred_label_is_rejected(self) -> None:
+        self.assertRejected(
+            GOOD_EXPECTED + '\n[[deferred]]\nlabel = "NoSuchLabel"\nscenario = "future"\nreason = "x"\n',
+            "is not in the label universe of any run's module")
+
+    def test_deferred_scenario_already_built_is_rejected(self) -> None:
+        self.assertRejected(
+            GOOD_EXPECTED + '\n[[deferred]]\nlabel = "S99_1"\nscenario = "demo"\nreason = "x"\n',
+            "is in 'scenarios'", module_text=self.MODULE_WITH_S99_1)
+
+    def test_deferred_empty_reason_is_rejected(self) -> None:
+        self.assertRejected(
+            GOOD_EXPECTED + '\n[[deferred]]\nlabel = "S99_1"\nscenario = "future"\nreason = ""\n',
+            "reason must be a non-empty string", module_text=self.MODULE_WITH_S99_1)
+
+    def test_deferred_missing_reason_is_rejected(self) -> None:
+        self.assertRejected(
+            GOOD_EXPECTED + '\n[[deferred]]\nlabel = "S99_1"\nscenario = "future"\n',
+            "exactly 'label', 'scenario', 'reason'", module_text=self.MODULE_WITH_S99_1)
+
+    def test_deferred_unknown_key_is_rejected(self) -> None:
+        self.assertRejected(
+            GOOD_EXPECTED + '\n[[deferred]]\nlabel = "S99_1"\nscenario = "future"\nreason = "x"\nextra = "z"\n',
+            "exactly 'label', 'scenario', 'reason'", module_text=self.MODULE_WITH_S99_1)
+
+
+class ConstantsLoadTests(unittest.TestCase):
+    """Load-time validation of the 'constants' table against the .cfg's CONSTANT section."""
+
+    CFGS = {
+        "constants.cfg": ('SPECIFICATION Spec\nCONSTANTS\n    N = 3\n    FLAG = TRUE\n    LABEL = "x"\n'
+                          '    NAMES = {a, b}\n    FIX_X = FALSE\nINVARIANT Safe\n'),
+    }
+
+    @staticmethod
+    def toml(literal: str) -> str:
+        return f"""
+scenarios = ["demo"]
+
+[[run]]
+name = "demo-posix-check"
+module = "M"
+config = "constants.cfg"
+scenario = "demo"
+kind = "check"
+constants = {literal}
+timeout_minutes = 5
+"""
+
+    def load(self, literal: str) -> run.Expected:
+        d = ExpectedDir(self.toml(literal), self.CFGS)
+        self.addCleanup(d.close)
+        return d.load()
+
+    def assertRejected(self, literal: str, fragment: str) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            self.load(literal)
+        self.assertIn(fragment, str(ctx.exception))
+
+    def test_matching_constants_are_accepted(self) -> None:
+        expected = self.load('{ N = 3, FLAG = true, LABEL = "x", NAMES = ["a", "b"] }')
+        self.assertEqual(dict(expected.runs[0].constants),
+                         {"N": 3, "FLAG": True, "LABEL": "x", "NAMES": frozenset({"a", "b"})})
+
+    def test_fix_flag_cfg_constant_is_not_required_in_constants(self) -> None:
+        expected = self.load('{ N = 3, FLAG = true, LABEL = "x", NAMES = ["a", "b"] }')
+        self.assertNotIn("FIX_X", dict(expected.runs[0].constants))
+
+    def test_set_comparison_is_order_insensitive(self) -> None:
+        self.load('{ N = 3, FLAG = true, LABEL = "x", NAMES = ["b", "a"] }')
+
+    def test_wrong_int_is_rejected(self) -> None:
+        self.assertRejected('{ N = 4, FLAG = true, LABEL = "x", NAMES = ["a", "b"] }', "does not match")
+
+    def test_wrong_bool_is_rejected(self) -> None:
+        self.assertRejected('{ N = 3, FLAG = false, LABEL = "x", NAMES = ["a", "b"] }', "does not match")
+
+    def test_wrong_string_is_rejected(self) -> None:
+        self.assertRejected('{ N = 3, FLAG = true, LABEL = "y", NAMES = ["a", "b"] }', "does not match")
+
+    def test_wrong_set_is_rejected(self) -> None:
+        self.assertRejected('{ N = 3, FLAG = true, LABEL = "x", NAMES = ["a", "c"] }', "does not match")
+
+    def test_int_does_not_satisfy_a_boolean(self) -> None:
+        self.assertRejected('{ N = 3, FLAG = 1, LABEL = "x", NAMES = ["a", "b"] }', "does not match")
+
+    def test_cfg_constant_missing_from_constants_is_rejected(self) -> None:
+        self.assertRejected('{ FLAG = true, LABEL = "x", NAMES = ["a", "b"] }', "not declared in 'constants'")
+
+    def test_extra_constants_key_is_rejected(self) -> None:
+        self.assertRejected('{ N = 3, FLAG = true, LABEL = "x", NAMES = ["a", "b"], EXTRA = 1 }',
+                            "which the config does not assign")
+
+    def test_fix_key_in_constants_is_rejected(self) -> None:
+        self.assertRejected('{ N = 3, FLAG = true, LABEL = "x", NAMES = ["a", "b"], FIX_X = false }',
+                            "must not contain a fix flag")
+
+
+class CfgConstantsTests(unittest.TestCase):
+    """Direct tests of cfg_constants(), independent of expected.toml loading.
+
+    cfg_constants fails CLOSED: the .cfg is the one file a person can edit to make a failing run
+    pass, so anything it cannot read as one of the literal shapes below is an ExpectedError, not a
+    silent skip."""
+
+    def test_returns_typed_literals_and_omits_model_values(self) -> None:
+        text = (
+            "CONSTANTS\n"
+            "    N = 3\n"
+            "    FLAG = TRUE\n"
+            '    LABEL = "x"\n'
+            "    NAMES = {a, b}\n"
+            "    EMPTY = {}\n"
+            "    NoProc = nobody\n"
+        )
+        self.assertEqual(run.cfg_constants(text), {
+            "N": 3,
+            "FLAG": True,
+            "LABEL": "x",
+            "NAMES": frozenset({"a", "b"}),
+            "EMPTY": frozenset(),
+        })
+
+    def test_negative_integer_is_parsed(self) -> None:
+        self.assertEqual(run.cfg_constants("CONSTANT N = -1\n"), {"N": -1})
+
+    def test_negative_integer_needs_no_space(self) -> None:
+        with self.assertRaises(run.ExpectedError):
+            run.cfg_constants("CONSTANT N = - 1\n")
+
+    def test_substitution_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANT P <- dirOp\n")
+        self.assertIn("substitutes an operator for 'P'", str(ctx.exception))
+
+    def test_duplicate_assignment_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANTS\n    N = 3\n    N = 4\n")
+        self.assertIn("more than once", str(ctx.exception))
+
+    def test_duplicate_assignment_is_rejected_even_as_a_model_value(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANTS\n    P = dir\n    P = other\n")
+        self.assertIn("more than once", str(ctx.exception))
+
+    def test_unparsable_value_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANT N = 3x\n")
+        self.assertIn("N", str(ctx.exception))
+
+    def test_set_with_a_string_element_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants('CONSTANT NAMES = {a, "b"}\n')
+        self.assertIn("non-identifier element", str(ctx.exception))
+
+    def test_unterminated_set_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANT NAMES = {a, b\n")
+        self.assertIn("never closed", str(ctx.exception))
+
+    def test_missing_equals_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANT N 3\n")
+        self.assertIn("not followed by '='", str(ctx.exception))
+
+    def test_set_missing_a_comma_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANT NAMES = {a b}\n")
+        self.assertIn("missing a comma", str(ctx.exception))
+
+    def test_stray_token_after_assignment_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANT N = 3 4\n")
+        self.assertIn("unexpected token where a constant name", str(ctx.exception))
+
+    def test_bare_name_with_no_value_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANT N\n")
+        self.assertIn("with no '=' and value", str(ctx.exception))
+
+    def test_name_equals_nothing_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANT N =\n")
+        self.assertIn("no value", str(ctx.exception))
+
+    def test_trailing_comma_in_set_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            run.cfg_constants("CONSTANT S = {a, b,}\n")
+        self.assertIn("trailing comma", str(ctx.exception))
+
+
+SYMMETRY_MODULE = "---- MODULE M ----\nPerms == Permutations(Recoverers)\n====\n"
+SYMMETRY_CFG = {"symmetry.cfg": "SPECIFICATION Spec\nCONSTANTS\n    Recoverers = {r1, r2}\nSYMMETRY Perms\nINVARIANT Safe\n"}
+NO_SYMMETRY_CFG = {"symmetry.cfg": "SPECIFICATION Spec\nCONSTANTS\n    Recoverers = {r1, r2}\nINVARIANT Safe\n"}
+
+
+def symmetry_toml(kind: str = "check", symmetry_literal: str | None = '{ definition = "Perms", over = "Recoverers" }',
+                   constants_literal: str = '{ Recoverers = ["r1", "r2"] }') -> str:
+    sym_line = f"symmetry = {symmetry_literal}\n" if symmetry_literal is not None else ""
+    return f"""
+scenarios = ["demo"]
+
+[[run]]
+name = "demo-posix-{kind}"
+module = "M"
+config = "symmetry.cfg"
+scenario = "demo"
+kind = "{kind}"
+{sym_line}constants = {constants_literal}
+timeout_minutes = 5
+"""
+
+
+class SymmetryTests(unittest.TestCase):
+    def load(self, toml_text: str, cfgs: dict[str, str], module_text: str = SYMMETRY_MODULE) -> run.Expected:
+        d = ExpectedDir(toml_text, cfgs, module_text)
+        self.addCleanup(d.close)
+        return d.load()
+
+    def assertRejected(self, toml_text: str, fragment: str, cfgs: dict[str, str] = SYMMETRY_CFG,
+                        module_text: str = SYMMETRY_MODULE) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            self.load(toml_text, cfgs, module_text)
+        self.assertIn(fragment, str(ctx.exception))
+
+    def test_valid_symmetry_is_accepted(self) -> None:
+        expected = self.load(symmetry_toml(), SYMMETRY_CFG)
+        self.assertEqual(expected.runs[0].symmetry, ("Perms", "Recoverers"))
+
+    def test_symmetry_declared_but_absent_from_cfg_is_rejected(self) -> None:
+        self.assertRejected(symmetry_toml(), "if and only if", cfgs=NO_SYMMETRY_CFG)
+
+    def test_symmetry_in_cfg_but_undeclared_is_rejected(self) -> None:
+        self.assertRejected(symmetry_toml(symmetry_literal=None), "if and only if")
+
+    def test_wrong_symmetry_definition_is_rejected(self) -> None:
+        cfgs = {"symmetry.cfg": "SPECIFICATION Spec\nCONSTANTS\n    Recoverers = {r1, r2}\nSYMMETRY OtherPerms\nINVARIANT Safe\n"}
+        self.assertRejected(symmetry_toml(), "must name exactly", cfgs=cfgs)
+
+    def test_module_without_permutations_definition_is_rejected(self) -> None:
+        self.assertRejected(symmetry_toml(), "must define", module_text=DEFAULT_MODULE)
+
+    def test_definition_only_in_a_line_comment_is_rejected(self) -> None:
+        module = "---- MODULE M ----\n\\* Perms == Permutations(Recoverers)\n====\n"
+        self.assertRejected(symmetry_toml(), "must define", module_text=module)
+
+    def test_definition_only_in_a_block_comment_is_rejected(self) -> None:
+        module = "---- MODULE M ----\n(* Perms == Permutations(Recoverers) *)\n====\n"
+        self.assertRejected(symmetry_toml(), "must define", module_text=module)
+
+    def test_definition_inside_a_nested_block_comment_is_rejected(self) -> None:
+        # Correct nesting treats the whole span, first `(*` to last `*)`, as one comment. A
+        # stripper that is not nesting-aware closes at the first `*)` instead, which would wrongly
+        # leave the definition below visible as real code.
+        module = "---- MODULE M ----\n(* (* inner *) Perms == Permutations(Recoverers) *)\n====\n"
+        self.assertRejected(symmetry_toml(), "must define", module_text=module)
+
+    def test_symmetry_over_must_be_a_set_of_at_least_two(self) -> None:
+        self.assertRejected(symmetry_toml(constants_literal='{ Recoverers = ["r1"] }'),
+                            "set of at least two elements")
+
+    def test_symmetry_on_a_liveness_run_is_rejected(self) -> None:
+        self.assertRejected(symmetry_toml(kind="liveness"), "must not declare symmetry")
+
+
+class TightenedTests(unittest.TestCase):
+    def test_tightened_on_a_non_liveness_run_is_rejected(self) -> None:
+        expected = GOOD_EXPECTED.replace(
+            'kind = "check"\nopen_findings',
+            'kind = "check"\ntightened = { rung = "one crash", measurement = "did not fit" }\nopen_findings')
+        d = ExpectedDir(expected)
+        self.addCleanup(d.close)
+        with self.assertRaises(run.ExpectedError) as ctx:
+            d.load()
+        self.assertIn("tightened is only allowed for liveness runs", str(ctx.exception))
+
+    def test_tightened_on_a_liveness_run_is_accepted_and_stored(self) -> None:
+        expected = GOOD_EXPECTED.replace(
+            'kind = "liveness"\nopen_findings',
+            'kind = "liveness"\ntightened = { rung = "one crash", measurement = "did not fit" }\nopen_findings')
+        d = ExpectedDir(expected)
+        self.addCleanup(d.close)
+        loaded = d.load()
+        self.assertEqual(loaded.runs[1].tightened, ("one crash", "did not fit"))
+
+    def test_report_prints_tightened_line(self) -> None:
+        result = run.Result("demo-posix-liveness", "ok", frozenset(), frozenset(), 10, 1.0, "", (), None)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            run.report(result, ("one crash", "did not fit"))
+        self.assertIn("tightened: one crash (did not fit)", out.getvalue())
 
 
 class CfgTests(unittest.TestCase):
@@ -210,6 +699,25 @@ class CfgTests(unittest.TestCase):
     def test_fixed_cfg_rejects_a_missing_flag(self) -> None:
         with self.assertRaises(run.ExpectedError):
             run.fixed_cfg_text("CONSTANT FIX_A = TRUE\n", ["FIX_A"])
+
+
+class CommentStrippingTests(unittest.TestCase):
+    """Direct tests of strip_tla_comments(), used by the symmetry check (Part A) and by the
+    PlusCal label parser (Part B)."""
+
+    def test_removes_line_and_block_comments(self) -> None:
+        text = "A\n\\* comment\nB (* block *) C\n"
+        self.assertEqual(run.strip_tla_comments(text), "A\n\nB  C\n")
+
+    def test_nested_block_comments_are_honoured(self) -> None:
+        text = "before (* outer (* inner *) still-comment *) after"
+        self.assertEqual(run.strip_tla_comments(text), "before  after")
+
+    def test_real_definition_survives_stripping(self) -> None:
+        text = "\\* not this one: Perms == Permutations(X)\nPerms == Permutations(Recoverers)\n"
+        stripped = run.strip_tla_comments(text)
+        self.assertNotIn("Permutations(X)", stripped)
+        self.assertIn("Perms == Permutations(Recoverers)", stripped)
 
 
 class InterpretTests(unittest.TestCase):
@@ -259,41 +767,91 @@ class InterpretTests(unittest.TestCase):
 
     def test_exit_status_must_agree_with_messages(self) -> None:
         _, output = fixture("clean")
-        self.assertIn("does not match", run.interpret(12, output, []).tooling_error or "")
+        for exit_code in (11, 12, 13):
+            with self.subTest(exit_code=exit_code):
+                # A clean run's messages carry no deadlock, invariant or temporal report, so none of the
+                # violation exit codes agrees with them.
+                self.assertIn("does not match", run.interpret(exit_code, output, ["P"]).tooling_error or "")
+
+    def test_an_unknown_exit_status_is_a_tooling_failure(self) -> None:
+        """The catch-all in `agrees.get(exit_code, False)` had no test, so its default could be
+        flipped to accept any unrecognised code and the suite stayed green (test audit, plan 3,
+        TA-3). An exit status TLC is not documented to produce must never be read as a verdict."""
+        _, output = fixture("clean")
+        for exit_code in (77, 1, 255):
+            with self.subTest(exit_code=exit_code):
+                detail = run.interpret(exit_code, output, []).tooling_error or ""
+                self.assertIn("does not match", detail)
+                self.assertIn(str(exit_code), detail)
 
     def test_crlf_output_parses(self) -> None:
         code, output = fixture("continue_two_invariants")
         self.assertEqual(run.interpret(code, output.replace("\n", "\r\n"), []).observed, {"NeverTwo", "NeverThree"})
+
+    def test_success_exit_with_a_deadlock_message_is_a_tooling_failure(self) -> None:
+        # "clean" carries Finished + Success (exit 0's messages); splicing in a message TLC would
+        # never emit alongside a clean success (a deadlock, or a temporal violation) must still be
+        # caught as a tooling failure - the exit code no longer agrees with the messages.
+        _, output = fixture("clean")
+        variants = {
+            "deadlock": ("@!@!@STARTMSG 2114:1 @!@!@\nDeadlock reached.\n@!@!@ENDMSG 2114 @!@!@\n", []),
+            "temporal": ("@!@!@STARTMSG 2116:1 @!@!@\nTemporal properties were violated.\n@!@!@ENDMSG 2116 @!@!@\n",
+                        ["EventuallyFive"]),
+        }
+        for case, (extra, properties) in variants.items():
+            with self.subTest(case=case):
+                result = run.interpret(0, output + extra, properties)
+                self.assertIn("does not match", result.tooling_error or "")
+
+    def test_unreadable_invariant_name_is_a_tooling_failure(self) -> None:
+        _, output = fixture("clean")
+        extra = "@!@!@STARTMSG 2110:1 @!@!@\nSomething is wrong here.\n@!@!@ENDMSG 2110 @!@!@\n"
+        result = run.interpret(12, output + extra, [])
+        self.assertIn("cannot read the invariant name", result.tooling_error or "")
+
+    def test_distinct_states_takes_the_last_report(self) -> None:
+        messages = [run.Message(run.C_COVERAGE_START, 0, "5 distinct states found"),
+                   run.Message(run.C_COVERAGE_START, 0, "9 distinct states found")]
+        self.assertEqual(run.distinct_states(messages), 9)
 
 
 class JudgeTests(unittest.TestCase):
     def setUp(self) -> None:
         d = ExpectedDir()
         self.addCleanup(d.close)
-        _, runs = d.load()
-        self.check, self.liveness, self.seeded = runs
+        expected = d.load()
+        self.check, self.liveness, self.seeded, self.witness = expected.runs
 
     @staticmethod
     def seen(*names: str) -> run.Outcome:
         return run.Outcome(None, frozenset(names), 10, ())
 
-    def test_check_needs_witnesses_and_open_findings(self) -> None:
-        self.assertEqual(run.judge(self.check, self.seen("NeverDone", "Safe"), fixed=False), "ok")
-        self.assertEqual(run.judge(self.check, self.seen("NeverDone"), fixed=False), "mismatch")
-        self.assertEqual(run.judge(self.check, self.seen("NeverDone", "Safe", "Extra"), fixed=False), "mismatch")
+    def test_check_passes_only_on_its_open_findings(self) -> None:
+        self.assertEqual(run.judge(self.check, self.seen("Safe"), fixed=False), "ok")
+        self.assertEqual(run.judge(self.check, self.seen(), fixed=False), "mismatch")
+        self.assertEqual(run.judge(self.check, self.seen("Safe", "Extra"), fixed=False), "mismatch")
 
     def test_fixed_run_drops_open_findings(self) -> None:
-        self.assertEqual(run.judge(self.check, self.seen("NeverDone"), fixed=True), "ok")
-        self.assertEqual(run.judge(self.check, self.seen("NeverDone", "Safe"), fixed=True), "mismatch")
+        self.assertEqual(run.judge(self.check, self.seen(), fixed=True), "ok")
+        self.assertEqual(run.judge(self.check, self.seen("Safe"), fixed=True), "mismatch")
 
-    def test_liveness_passes_only_clean(self) -> None:
-        self.assertEqual(run.judge(self.liveness, self.seen(), fixed=False), "ok")
-        self.assertEqual(run.judge(self.liveness, self.seen("Eventually"), fixed=False), "mismatch")
+    def test_liveness_passes_only_on_its_open_findings(self) -> None:
+        self.assertEqual(run.judge(self.liveness, self.seen("LiveWitness"), fixed=False), "ok")
+        self.assertEqual(run.judge(self.liveness, self.seen(), fixed=False), "mismatch")
+        self.assertEqual(run.judge(self.liveness, self.seen("LiveWitness", "Eventually"), fixed=False), "mismatch")
+
+    def test_liveness_fixed_run_drops_open_findings(self) -> None:
+        self.assertEqual(run.judge(self.liveness, self.seen(), fixed=True), "ok")
+        self.assertEqual(run.judge(self.liveness, self.seen("LiveWitness"), fixed=True), "mismatch")
 
     def test_seeded_needs_its_violation(self) -> None:
         self.assertEqual(run.judge(self.seeded, self.seen("Other"), fixed=False), "ok")
         self.assertEqual(run.judge(self.seeded, self.seen(), fixed=False), "mismatch")
         self.assertEqual(run.judge(self.seeded, self.seen(run.DEADLOCK), fixed=False), "mismatch")
+
+    def test_witness_needs_its_violation(self) -> None:
+        self.assertEqual(run.judge(self.witness, self.seen("Other2"), fixed=False), "ok")
+        self.assertEqual(run.judge(self.witness, self.seen(), fixed=False), "mismatch")
 
     def test_tooling_error_is_never_a_match(self) -> None:
         self.assertEqual(run.judge(self.liveness, run.Outcome("boom", frozenset(), None, ()), fixed=False), "tooling")
@@ -376,7 +934,8 @@ class ExecuteTests(unittest.TestCase):
         d = ExpectedDir()
         self.addCleanup(d.close)
         self.base = d.path
-        _, (self.check, _, _) = d.load()
+        expected = d.load()
+        self.check = expected.runs[0]
         target = tempfile.TemporaryDirectory()
         self.addCleanup(target.cleanup)
         self.target = Path(target.name)
@@ -386,15 +945,17 @@ class ExecuteTests(unittest.TestCase):
         self.commands: list[list[str]] = []
 
     def fake_tlc(self, script: str) -> None:
-        def command(jar: Path, r: run.Run, cfg: Path, metadir: Path) -> list[str]:
+        def command(jar: Path, r: run.Run, cfg: Path, metadir: Path, fixed: bool) -> list[str]:
             self.commands.append([str(cfg)])
             return [sys.executable, "-c", script]
         run.tlc_command = command
 
     def test_replayed_output_is_judged_and_logged(self) -> None:
+        # kind "seeded" (not "check"/"liveness"): the coverage gate does not apply, so replaying a
+        # plain recorded run - no coverage block - still judges cleanly.
         self.fake_tlc(f"import sys; text = open({str(TESTDATA / 'clean.out')!r}).read(); "
                       "sys.stdout.write(text.partition(chr(10))[2]); sys.exit(0)")
-        clean = run.Run("demo-posix-check", "M", "check.cfg", "demo", "check", (), (), 1)
+        clean = run.Run("demo-posix-check", "M", "check.cfg", "demo", "seeded", (), (), (), 1, (), None, None)
         result = run.execute(clean, Path("unused.jar"), self.base, fixed=False)
         self.assertEqual((result.status, result.observed, result.distinct_states), ("ok", frozenset(), 4))
         self.assertIsNotNone(result.log)
@@ -434,7 +995,7 @@ class ExecuteTests(unittest.TestCase):
 
     def test_timeout_is_reported_as_a_tooling_failure(self) -> None:
         self.fake_tlc("import time; time.sleep(30)")
-        slow = run.Run("demo-posix-check", "M", "check.cfg", "demo", "check", ("NeverDone",), (), 0)
+        slow = run.Run("demo-posix-check", "M", "check.cfg", "demo", "check", ("NeverDone",), (), (), 0, (), None, None)
         result = run.execute(slow, Path("unused.jar"), self.base, fixed=False)
         self.assertEqual(result.status, "tooling")
         self.assertEqual(result.detail, "TIMEOUT after 0 min")
@@ -464,7 +1025,10 @@ class MainTests(unittest.TestCase):
         self.assertEqual(run.main(["--expected", str(HERE / "expected.toml")]), 2)
 
     def main_with(self, statuses: dict[tuple[str, bool], str]) -> tuple[int, list[tuple[str, bool]]]:
-        """Run main() over GOOD_EXPECTED with execute() stubbed: each (run, fixed) reports its status, default ok."""
+        """Run main() over GOOD_EXPECTED with execute() stubbed: each (run, fixed) reports its status,
+        default ok. Scoped to --scenario demo (GOOD_EXPECTED's only scenario) so the suite-wide
+        coverage union - which needs a real TLC log per run - is skipped; that union has its own
+        tests (CoverageUnionTests) against real recorded logs."""
         d = ExpectedDir()
         self.addCleanup(d.close)
         run.ensure_jar = lambda: Path("unused.jar")
@@ -478,15 +1042,17 @@ class MainTests(unittest.TestCase):
             return ExitCodeTests.result(status)
         run.execute = execute
         with contextlib.redirect_stdout(io.StringIO()):
-            code = run.main(["--expected", str(d.path / "expected.toml")])
+            code = run.main(["--expected", str(d.path / "expected.toml"), "--scenario", "demo"])
         return code, calls
 
     def test_all_runs_ok_is_exit_0(self) -> None:
         code, calls = self.main_with({})
         self.assertEqual(code, 0)
-        # The run with an open finding runs twice: as written, then with its fix flag set.
+        # Runs with an open finding run twice: as written, then with their fix flags set.
         self.assertEqual(calls, [("demo-posix-check", False), ("demo-posix-check", True),
-                                 ("demo-posix-liveness", False), ("demo-posix-seeded-SEED_X", False)])
+                                 ("demo-posix-liveness", False), ("demo-posix-liveness", True),
+                                 ("demo-posix-seeded-SEED_X", False),
+                                 ("demo-posix-witness-Other2", False)])
 
     def test_a_mismatch_is_exit_1_even_beside_a_tooling_failure(self) -> None:
         code, _ = self.main_with({("demo-posix-check", True): "tooling", ("demo-posix-liveness", False): "mismatch"})
@@ -499,7 +1065,7 @@ class MainTests(unittest.TestCase):
     def test_an_error_inside_one_run_is_exit_2_and_later_runs_still_run(self) -> None:
         code, calls = self.main_with({("demo-posix-check", False): "raise"})
         self.assertEqual(code, 2)
-        self.assertEqual(calls[-1], ("demo-posix-seeded-SEED_X", False))
+        self.assertEqual(calls[-1], ("demo-posix-witness-Other2", False))
 
     def test_list_scenarios_prints_the_names_as_json_without_java(self) -> None:
         d = ExpectedDir(GOOD_EXPECTED.replace('scenarios = ["demo"]', 'scenarios = ["demo", "other"]') + """
@@ -509,6 +1075,7 @@ module = "M"
 config = "live.cfg"
 scenario = "other"
 kind = "liveness"
+constants = {}
 timeout_minutes = 5
 """)
         self.addCleanup(d.close)
@@ -525,18 +1092,1509 @@ timeout_minutes = 5
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out.getvalue()), ["demo", "other"])
 
+    def test_list_jobs_orders_by_scenario_then_first_platform_appearance(self) -> None:
+        d = ExpectedDir("""
+scenarios = ["alpha", "beta"]
 
-class CommandTests(unittest.TestCase):
-    def test_check_and_liveness_continue_seeded_halts(self) -> None:
+[[run]]
+name = "alpha-windows-check"
+module = "M"
+config = "check.cfg"
+scenario = "alpha"
+kind = "check"
+constants = {}
+timeout_minutes = 5
+
+[[run]]
+name = "alpha-posix-liveness"
+module = "M"
+config = "live.cfg"
+scenario = "alpha"
+kind = "liveness"
+constants = {}
+timeout_minutes = 5
+
+[[run]]
+name = "beta-posix-check"
+module = "M"
+config = "check.cfg"
+scenario = "beta"
+kind = "check"
+constants = {}
+timeout_minutes = 5
+""")
+        self.addCleanup(d.close)
+        run.shutil.which = lambda _name: None
+
+        def refuse(*_args: object) -> Path:
+            raise AssertionError("--list-jobs must not fetch or run TLC")
+        run.ensure_jar = refuse
+        run.execute = refuse
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = run.main(["--expected", str(d.path / "expected.toml"), "--list-jobs"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue()), [
+            {"scenario": "alpha", "platform": "windows", "job": "windows"},
+            {"scenario": "alpha", "platform": "posix", "job": "posix"},
+            {"scenario": "beta", "platform": "posix", "job": "posix"},
+        ])
+
+    def test_list_jobs_on_the_repository_file_includes_both_recovery_platforms(self) -> None:
+        run.shutil.which = lambda _name: None
+
+        def refuse(*_args: object) -> Path:
+            raise AssertionError("--list-jobs must not fetch or run TLC")
+        run.ensure_jar = refuse
+        run.execute = refuse
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = run.main(["--expected", str(HERE / "expected.toml"), "--list-jobs"])
+        self.assertEqual(code, 0)
+        jobs = json.loads(out.getvalue())
+        self.assertIn({"scenario": "recovery", "platform": "posix", "job": "posix"}, jobs)
+        self.assertIn({"scenario": "recovery", "platform": "windows", "job": "windows"}, jobs)
+
+    def test_list_jobs_on_the_extended_repository_file(self) -> None:
+        run.shutil.which = lambda _name: None
+
+        def refuse(*_args: object) -> Path:
+            raise AssertionError("--list-jobs must not fetch or run TLC")
+        run.ensure_jar = refuse
+        run.execute = refuse
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = run.main(["--expected", str(HERE / "expected-extended.toml"), "--list-jobs"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue()), [{"scenario": "breaklock", "platform": "posix", "job": "posix"},
+                                                      {"scenario": "recovery", "platform": "posix", "job": "posix"},
+                                                      {"scenario": "recovery", "platform": "windows", "job": "windows"}])
+
+    def test_platform_without_scenario_exits_2(self) -> None:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = run.main(["--expected", str(HERE / "expected.toml"), "--platform", "posix"])
+        self.assertEqual(code, 2)
+        self.assertIn("--platform requires --scenario", err.getvalue())
+
+    def test_unknown_platform_exits_2(self) -> None:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = run.main(["--expected", str(HERE / "expected.toml"), "--scenario", "recovery",
+                             "--platform", "solaris"])
+        self.assertEqual(code, 2)
+        self.assertIn("no runs for scenario recovery on platform solaris", err.getvalue())
+
+    def test_platform_selects_exactly_the_matching_runs(self) -> None:
+        d = ExpectedDir("""
+scenarios = ["demo"]
+
+[[run]]
+name = "demo-windows-check"
+module = "M"
+config = "check.cfg"
+scenario = "demo"
+kind = "check"
+constants = {}
+timeout_minutes = 5
+
+[[run]]
+name = "demo-posix-check"
+module = "M"
+config = "check.cfg"
+scenario = "demo"
+kind = "check"
+constants = {}
+timeout_minutes = 5
+""")
+        self.addCleanup(d.close)
+        run.ensure_jar = lambda: Path("unused.jar")
+        calls: list[str] = []
+
+        def execute(r: run.Run, _jar: Path, _base: Path, fixed: bool) -> run.Result:
+            calls.append(r.name)
+            return ExitCodeTests.result("ok")
+        run.execute = execute
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = run.main(["--expected", str(d.path / "expected.toml"), "--scenario", "demo",
+                             "--platform", "posix"])
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, ["demo-posix-check"])
+
+    def test_bad_expected_file_exits_2_with_the_error(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        bad = Path(tmp.name) / "expected.toml"
+        bad.write_text("this is not valid toml [[[\n", encoding="utf-8")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = run.main(["--expected", str(bad)])
+        self.assertEqual(code, 2)
+        self.assertIn("run.py:", err.getvalue())
+
+    def test_missing_java_exits_2_before_any_run(self) -> None:
         d = ExpectedDir()
         self.addCleanup(d.close)
-        _, (check, liveness, seeded) = d.load()
+        run.shutil.which = lambda _name: None
+        called: list[str] = []
+
+        def ensure_jar() -> Path:
+            called.append("ensure_jar")
+            return Path("unused.jar")
+
+        def execute(*_args: object) -> run.Result:
+            called.append("execute")
+            return ExitCodeTests.result("ok")
+        run.ensure_jar = ensure_jar
+        run.execute = execute
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = run.main(["--expected", str(d.path / "expected.toml")])
+        self.assertEqual(code, 2)
+        self.assertIn("java is not on PATH", err.getvalue())
+        self.assertEqual(called, [])
+
+
+class CommandTests(unittest.TestCase):
+    def test_check_and_liveness_continue_seeded_and_witness_halt(self) -> None:
+        d = ExpectedDir()
+        self.addCleanup(d.close)
+        expected = d.load()
+        check, liveness, seeded, witness = expected.runs
         jar, cfg, meta = Path("j.jar"), Path("c.cfg"), Path("m")
-        self.assertIn("-continue", run.tlc_command(jar, check, cfg, meta))
-        self.assertIn("-continue", run.tlc_command(jar, liveness, cfg, meta))
-        self.assertNotIn("-continue", run.tlc_command(jar, seeded, cfg, meta))
-        self.assertNotIn("-deadlock", run.tlc_command(jar, check, cfg, meta))
-        self.assertEqual(run.tlc_command(jar, check, cfg, meta)[-1], "M")
+        self.assertIn("-continue", run.tlc_command(jar, check, cfg, meta, fixed=False))
+        self.assertIn("-continue", run.tlc_command(jar, liveness, cfg, meta, fixed=False))
+        self.assertNotIn("-continue", run.tlc_command(jar, seeded, cfg, meta, fixed=False))
+        self.assertNotIn("-continue", run.tlc_command(jar, witness, cfg, meta, fixed=False))
+        self.assertNotIn("-deadlock", run.tlc_command(jar, check, cfg, meta, fixed=False))
+        self.assertEqual(run.tlc_command(jar, check, cfg, meta, fixed=False)[-1], "M")
+
+    def test_coverage_added_for_every_kind_unless_fixed(self) -> None:
+        d = ExpectedDir()
+        self.addCleanup(d.close)
+        expected = d.load()
+        jar, cfg, meta = Path("j.jar"), Path("c.cfg"), Path("m")
+        for r in expected.runs:
+            with self.subTest(kind=r.kind):
+                cmd = run.tlc_command(jar, r, cfg, meta, fixed=False)
+                self.assertIn("-coverage", cmd)
+                self.assertEqual(cmd[cmd.index("-coverage") + 1], "1")
+                self.assertNotIn("-coverage", run.tlc_command(jar, r, cfg, meta, fixed=True))
+
+
+def coverage_messages(case: str) -> list[run.Message]:
+    """Parse one testdata/<case>.out recording into Messages (the 'exit=' line stripped)."""
+    _, output = fixture(case)
+    return run.parse_messages(output)
+
+
+class ParseCoverageTests(unittest.TestCase):
+    """parse_coverage(), against real recorded '-coverage 1' output (testdata/*.out)."""
+
+    def test_takes_the_final_block(self) -> None:
+        # coverage_two_blocks.out splices the CoverageFixture recording's block in as an early
+        # snapshot, ahead of the real final block from smoke_check_coverage.out (record_fixtures.py
+        # says so). Only the CoverageFixture block carries 'only_alpha_step'. Renamed from
+        # test_takes_the_last_complete_block: parse_coverage() no longer searches backward for the
+        # last COMPLETE block among several - it takes ONLY the block starting at the last 2201, and
+        # fails closed (None) if that one block is not terminated. This fixture's last block is
+        # complete, so the observed result is unchanged; test_trailing_2201_without_a_terminator_
+        # returns_none below is what actually exercises the no-fallback behaviour.
+        coverage = run.parse_coverage(coverage_messages("coverage_two_blocks"))
+        self.assertEqual(coverage, {"Step": (4, 8), "Overshoot": (0, 0), "Finished": (0, 1)})
+
+    def test_returns_none_without_a_complete_block(self) -> None:
+        text = "@!@!@STARTMSG 2201:0 @!@!@\nThe coverage statistics at now\n@!@!@ENDMSG 2201 @!@!@\n"
+        self.assertIsNone(run.parse_coverage(run.parse_messages(text)))
+
+    def test_returns_none_with_no_block_at_all(self) -> None:
+        self.assertIsNone(run.parse_coverage(coverage_messages("clean")))
+
+    def test_a_2777_terminated_final_block_is_returned(self) -> None:
+        # coverage_long_terminator.out (measured defect): TLC switches from 2202 to 2777 ("End of
+        # statistics (please note ...)") once a run has gone on long enough. The pre-fix parser
+        # accepted only 2202 and so returned the file's SECOND block (2201..2202), where
+        # plain_recover is 0:0; the true final block (2201..2777) has plain_recover 278:357.
+        coverage = run.parse_coverage(coverage_messages("coverage_long_terminator"))
+        assert coverage is not None
+        self.assertEqual(coverage["plain_recover"], (278, 357))
+
+    def test_trailing_2201_without_a_terminator_returns_none(self) -> None:
+        # An earlier block (2201..2202) is complete, but the last 2201 in the file has no 2202 or
+        # 2777 after it at all. The fix must fail closed here, not fall back to the earlier block.
+        text = (
+            "@!@!@STARTMSG 2201:0 @!@!@\nThe coverage statistics at now\n@!@!@ENDMSG 2201 @!@!@\n"
+            "@!@!@STARTMSG 2772:0 @!@!@\n<Step line 1, col 1 to line 1, col 4 of module M>: 2:3\n"
+            "@!@!@ENDMSG 2772 @!@!@\n"
+            "@!@!@STARTMSG 2202:0 @!@!@\nEnd of statistics.\n@!@!@ENDMSG 2202 @!@!@\n"
+            "@!@!@STARTMSG 2201:0 @!@!@\nThe coverage statistics at later\n@!@!@ENDMSG 2201 @!@!@\n"
+            "@!@!@STARTMSG 2772:0 @!@!@\n<Step line 1, col 1 to line 1, col 4 of module M>: 9:9\n"
+            "@!@!@ENDMSG 2772 @!@!@\n"
+        )
+        self.assertIsNone(run.parse_coverage(run.parse_messages(text)))
+
+    def test_sums_a_repeated_name(self) -> None:
+        text = (
+            "@!@!@STARTMSG 2201:0 @!@!@\nThe coverage statistics at now\n@!@!@ENDMSG 2201 @!@!@\n"
+            "@!@!@STARTMSG 2772:0 @!@!@\n<Step line 1, col 1 to line 1, col 4 of module M>: 2:3\n"
+            "@!@!@ENDMSG 2772 @!@!@\n"
+            "@!@!@STARTMSG 2772:0 @!@!@\n<Step line 5, col 1 to line 5, col 4 of module M>: 1:1\n"
+            "@!@!@ENDMSG 2772 @!@!@\n"
+            "@!@!@STARTMSG 2202:0 @!@!@\nEnd of statistics.\n@!@!@ENDMSG 2202 @!@!@\n"
+        )
+        self.assertEqual(run.parse_coverage(run.parse_messages(text)), {"Step": (3, 4)})
+
+    def test_ignores_init_definition_and_cost_lines(self) -> None:
+        coverage = run.parse_coverage(coverage_messages("smoke_check_coverage"))
+        assert coverage is not None
+        self.assertNotIn("Init", coverage)  # 2773
+        self.assertNotIn("WithinBound", coverage)  # 2774
+        self.assertNotIn("AtMostThree", coverage)  # 2774
+
+    def test_zero_distinct_nonzero_total_is_executed(self) -> None:
+        # 'Finished' reports 0:1 in the recorded check run: never a NEW state, but executed once.
+        coverage = run.parse_coverage(coverage_messages("smoke_check_coverage"))
+        assert coverage is not None
+        self.assertEqual(coverage["Finished"], (0, 1))
+
+
+MIXED_CALLERS_MODULE = """---- MODULE Mixed ----
+(* --algorithm Mixed {
+  procedure Shared()
+  {
+    shared_step:
+      skip;
+      return;
+  }
+
+  process (p1 \\in SetA)
+  {
+    p1_step:
+      call Shared();
+  }
+
+  process (p2 \\in SetB)
+  {
+    p2_step:
+      call Shared();
+  }
+}
+*)
+====
+"""
+
+
+class LabelUniverseTests(unittest.TestCase):
+    """module_labels() and LabelUniverse.is_exempt(), against the real committed fixture module
+    (CoverageFixture.tla, recorded by record_fixtures.py) and Smoke.tla."""
+
+    def setUp(self) -> None:
+        self.universe = run.module_labels((TESTDATA / "CoverageFixture.tla").read_text(encoding="utf-8"))
+
+    def test_finds_process_and_procedure_labels(self) -> None:
+        self.assertEqual(self.universe.labels, {
+            "a_step", "a_done", "only_alpha_step", "b_step", "b_guarded",
+            "calls_helper_step", "calls_helper_after", "helper_step", "env_step",
+        })
+
+    def test_ownership_follows_transitive_calls(self) -> None:
+        # helper_step is in procedure Helper, called only by CallsHelper, called only by process b.
+        self.assertEqual(self.universe.owners["helper_step"], frozenset({"b"}))
+
+    def test_process_label_is_exempt_when_its_set_is_empty(self) -> None:
+        empty = {"Alphas": frozenset(), "Betas": frozenset({"b1"})}
+        self.assertTrue(self.universe.is_exempt("a_step", empty))
+        self.assertTrue(self.universe.is_exempt("a_done", empty))
+
+    def test_process_label_is_not_exempt_when_its_set_is_non_empty(self) -> None:
+        non_empty = {"Alphas": frozenset({"a1"}), "Betas": frozenset({"b1"})}
+        self.assertFalse(self.universe.is_exempt("a_step", non_empty))
+
+    def test_procedure_label_exempt_only_when_its_only_caller_is_empty(self) -> None:
+        empty = {"Alphas": frozenset(), "Betas": frozenset({"b1"})}
+        self.assertTrue(self.universe.is_exempt("only_alpha_step", empty))  # only called via Alphas
+        self.assertFalse(self.universe.is_exempt("helper_step", empty))  # only called via Betas (non-empty)
+
+    def test_equals_value_process_is_never_exempt(self) -> None:
+        self.assertFalse(self.universe.is_exempt("env_step", {"Alphas": frozenset(), "Betas": frozenset()}))
+
+    def test_a_genuinely_unguarded_label_is_never_executed_in_the_recording(self) -> None:
+        # b_guarded (await FALSE) is real recorded TOTAL 0 (testdata/coverage.out), and is NOT
+        # exempt (Betas is non-empty in that recording) - the gate must catch it.
+        coverage = run.parse_coverage(coverage_messages("coverage"))
+        assert coverage is not None
+        self.assertEqual(coverage["b_guarded"][1], 0)
+        self.assertFalse(self.universe.is_exempt("b_guarded", {"Alphas": frozenset(), "Betas": frozenset({"b1"})}))
+
+    def test_procedure_label_exempt_only_when_every_calling_set_is_empty(self) -> None:
+        # A hand-written module (not real TLC output: this tests our own graph logic, not TLC's
+        # behaviour) where one procedure has two different process callers.
+        universe = run.module_labels(MIXED_CALLERS_MODULE)
+        self.assertEqual(universe.owners["shared_step"], frozenset({"p1", "p2"}))
+        self.assertTrue(universe.is_exempt("shared_step", {"SetA": frozenset(), "SetB": frozenset()}))
+        self.assertFalse(universe.is_exempt("shared_step", {"SetA": frozenset(), "SetB": frozenset({"x"})}))
+        self.assertFalse(universe.is_exempt("shared_step", {"SetA": frozenset({"x"}), "SetB": frozenset()}))
+
+    def test_procedure_no_process_calls_is_gated_not_exempt(self) -> None:
+        # A procedure nothing calls has no owner. "Every caller's set is empty" holds vacuously, but
+        # design Section 4 says attributing such labels to nobody is the case the exemption must get
+        # right: dead labels must fail the per-run gate, not pass it silently.
+        universe = run.module_labels(MIXED_CALLERS_MODULE.replace(
+            "  process (p1 \\in SetA)", "  procedure Orphan()\n  {\n    orphan_step:\n      return;\n  }\n\n"
+            "  process (p1 \\in SetA)"))
+        self.assertIn("orphan_step", universe.labels)
+        self.assertEqual(universe.owners.get("orphan_step", frozenset()), frozenset())
+        self.assertFalse(universe.is_exempt("orphan_step", {"SetA": frozenset(), "SetB": frozenset()}))
+        self.assertFalse(universe.is_exempt("orphan_step", {"SetA": frozenset({"x"}), "SetB": frozenset()}))
+
+    def test_non_pluscal_universe_is_the_top_level_operators(self) -> None:
+        universe = run.module_labels((HERE / "Smoke.tla").read_text(encoding="utf-8"))
+        self.assertFalse(universe.pluscal)
+        self.assertEqual(universe.labels, {
+            "Limit", "Init", "Step", "Overshoot", "Finished", "Next", "Spec",
+            "WithinBound", "AtMostThree", "NeverReachedTwo", "ReachesLimit", "vars",
+        })
+        self.assertFalse(universe.is_exempt("Overshoot", {}))  # nothing is exempt without PlusCal
+
+
+class UnreachedLoadTimeValidationTests(unittest.TestCase):
+    """_load_run()'s load-time checks on 'unreached' against the real module universe (Smoke.tla),
+    beyond the shape checks LoadExpectedTests already covers."""
+
+    TOML = """
+scenarios = ["selftest"]
+
+[[run]]
+name = "selftest-posix-check"
+module = "M"
+config = "check.cfg"
+scenario = "selftest"
+kind = "check"
+unreached = [{{ label = "{label}", reason = "x" }}]
+constants = {{ SEED_OVERSHOOT = false }}
+timeout_minutes = 2
+"""
+    CFG = {"check.cfg": "SPECIFICATION Spec\nCONSTANTS\n    SEED_OVERSHOOT = FALSE\n    FIX_BOUND = FALSE\n"
+                        "INVARIANT WithinBound\n"}
+
+    def load(self, label: str) -> run.Expected:
+        d = ExpectedDir(self.TOML.format(label=label), self.CFG, (HERE / "Smoke.tla").read_text(encoding="utf-8"))
+        self.addCleanup(d.close)
+        return d.load()
+
+    def test_unknown_unreached_label_is_rejected(self) -> None:
+        with self.assertRaises(run.ExpectedError) as ctx:
+            self.load("NoSuchLabel")
+        self.assertIn("is not in", str(ctx.exception))
+
+    def test_known_never_exempt_label_is_accepted(self) -> None:
+        # Overshoot is real and, for a non-PlusCal module, never exempt.
+        expected = self.load("Overshoot")
+        self.assertEqual(expected.runs[0].unreached, (("Overshoot", "x"),))
+
+    COVERAGE_FIXTURE_TOML = """
+scenarios = ["cov"]
+
+[[run]]
+name = "cov-posix-check"
+module = "M"
+config = "check.cfg"
+scenario = "cov"
+kind = "check"
+unreached = [{{ label = "a_step", reason = "x" }}]
+constants = {{ Alphas = {alphas}, Betas = ["b1"] }}
+timeout_minutes = 2
+"""
+
+    @staticmethod
+    def coverage_fixture_cfg(alphas_cfg_set: str) -> dict[str, str]:
+        return {"check.cfg": f"SPECIFICATION Spec\nCONSTANTS\n    Alphas = {alphas_cfg_set}\n"
+                             "    Betas = {b1}\nINVARIANT Safe\n"}
+
+    def load_coverage_fixture(self, alphas_toml: str, alphas_cfg_set: str) -> run.Expected:
+        d = ExpectedDir(self.COVERAGE_FIXTURE_TOML.format(alphas=alphas_toml),
+                        self.coverage_fixture_cfg(alphas_cfg_set),
+                        (TESTDATA / "CoverageFixture.tla").read_text(encoding="utf-8"))
+        self.addCleanup(d.close)
+        return d.load()
+
+    def test_exempt_pluscal_unreached_label_is_rejected(self) -> None:
+        # a_step is owned only by process (a \\in Alphas); with Alphas emptied by the run's
+        # constants, its actor never runs here, so listing it in 'unreached' needs no entry.
+        with self.assertRaises(run.ExpectedError) as ctx:
+            self.load_coverage_fixture("[]", "{}")
+        self.assertIn("needs no entry", str(ctx.exception))
+
+    def test_exempt_pluscal_unreached_label_with_non_empty_set_is_accepted(self) -> None:
+        # Same label, but Alphas is non-empty: process a does run here, so a_step is not exempt
+        # and 'unreached' may list it.
+        expected = self.load_coverage_fixture('["a1"]', "{a1}")
+        self.assertEqual(expected.runs[0].unreached, (("a_step", "x"),))
+
+
+class CoverageGateTests(unittest.TestCase):
+    """judge_coverage(), against real recorded coverage (testdata/*.out) and Smoke.tla's real
+    (non-PlusCal) universe."""
+
+    def setUp(self) -> None:
+        self.universe = run.module_labels((HERE / "Smoke.tla").read_text(encoding="utf-8"))
+
+    @staticmethod
+    def coverage(case: str) -> dict[str, tuple[int, int]]:
+        result = run.parse_coverage(coverage_messages(case))
+        assert result is not None
+        return result
+
+    @staticmethod
+    def run_with(unreached: tuple[tuple[str, str], ...]) -> run.Run:
+        return run.Run("x-check", "Smoke", "c", "x", "check", (), (), unreached, 2,
+                       (("SEED_OVERSHOOT", False),), None, None)
+
+    def test_fails_on_an_uncovered_unlisted_label(self) -> None:
+        failures = run.judge_coverage(self.run_with(()), self.universe, self.coverage("smoke_check_coverage"))
+        self.assertEqual(failures, ["Overshoot: gated label not covered (TOTAL 0)"])
+
+    def test_fails_on_a_listed_but_covered_label(self) -> None:
+        failures = run.judge_coverage(self.run_with((("Overshoot", "wrongly excused"),)), self.universe,
+                                      self.coverage("smoke_seeded_coverage"))
+        self.assertIn("Overshoot: covered - remove it from unreached", failures)
+
+    def test_passes_when_every_gated_label_is_covered_or_listed(self) -> None:
+        failures = run.judge_coverage(self.run_with((("Overshoot", "SEED_OVERSHOOT is off"),)), self.universe,
+                                      self.coverage("smoke_check_coverage"))
+        self.assertEqual(failures, [])
+
+    def test_pluscal_gate_skips_an_exempt_label_and_gates_the_rest(self) -> None:
+        pluscal_universe = run.module_labels((TESTDATA / "CoverageFixture.tla").read_text(encoding="utf-8"))
+
+        def run_with_constants(constants: tuple[tuple[str, object], ...]) -> run.Run:
+            return run.Run("x-check", "CoverageFixture", "c", "x", "check", (), (), (), 2, constants, None, None)
+
+        empty_alphas = (("Alphas", frozenset()), ("Betas", frozenset({"b1"})))
+        non_empty_alphas = (("Alphas", frozenset({"a1"})), ("Betas", frozenset({"b1"})))
+
+        # a_step is exempt when Alphas is empty: no failure is reported for it.
+        failures = run.judge_coverage(run_with_constants(empty_alphas), pluscal_universe, {})
+        self.assertNotIn("a_step: gated label not covered (TOTAL 0)", failures)
+
+        # Same label, Alphas non-empty: not exempt, and zero coverage, so it DOES fail.
+        failures = run.judge_coverage(run_with_constants(non_empty_alphas), pluscal_universe, {})
+        self.assertIn("a_step: gated label not covered (TOTAL 0)", failures)
+
+        # env_step is never exempt (its process is declared '= "env"'); even when it is absent
+        # from the coverage dict entirely (not merely TOTAL 0), it must still be gated.
+        coverage_missing_env = {label: (1, 1) for label in pluscal_universe.labels if label != "env_step"}
+        failures = run.judge_coverage(run_with_constants(non_empty_alphas), pluscal_universe, coverage_missing_env)
+        self.assertIn("env_step: gated label not covered (TOTAL 0)", failures)
+
+
+class ExecuteCoverageGateTests(unittest.TestCase):
+    """execute() wired end-to-end against Smoke.tla's real content, replaying real recorded TLC
+    output (no Java: TLC is replaced by a small script)."""
+
+    def setUp(self) -> None:
+        smoke_text = (HERE / "Smoke.tla").read_text(encoding="utf-8")
+        toml = """
+scenarios = ["demo"]
+
+[[run]]
+name = "demo-posix-check"
+module = "M"
+config = "check.cfg"
+scenario = "demo"
+kind = "check"
+open_findings = [{ name = "AtMostThree", tracking = "t", fix_flag = "FIX_BOUND" }]
+unreached = [{ label = "Overshoot", reason = "SEED_OVERSHOOT is off in this run" }]
+constants = { SEED_OVERSHOOT = false }
+timeout_minutes = 5
+"""
+        cfgs = {"check.cfg": "SPECIFICATION Spec\nCONSTANTS\n    SEED_OVERSHOOT = FALSE\n    FIX_BOUND = FALSE\n"
+                             "INVARIANTS\n    WithinBound\n    AtMostThree\n"}
+        d = ExpectedDir(toml, cfgs, smoke_text)
+        self.addCleanup(d.close)
+        self.base = d.path
+        self.check = d.load().runs[0]
+        target = tempfile.TemporaryDirectory()
+        self.addCleanup(target.cleanup)
+        self.target = Path(target.name)
+        for name in ("TARGET", "tlc_command"):
+            self.addCleanup(setattr, run, name, getattr(run, name))
+        run.TARGET = self.target
+
+    def replay(self, case: str) -> None:
+        script = (f"import sys; text = open({str(TESTDATA / f'{case}.out')!r}).read(); "
+                  "sys.stdout.write(text.partition(chr(10))[2]); sys.exit(0)")
+
+        def command(jar: Path, r: run.Run, cfg: Path, metadir: Path, fixed: bool) -> list[str]:
+            return [sys.executable, "-c", script]
+        run.tlc_command = command
+
+    def test_real_check_coverage_passes_with_the_gap_listed(self) -> None:
+        self.replay("smoke_check_coverage")
+        result = run.execute(self.check, Path("unused.jar"), self.base, fixed=False)
+        self.assertEqual(result.status, "ok")
+
+    def test_missing_coverage_report_is_a_tooling_failure(self) -> None:
+        self.replay("clean")  # a recording with no coverage block at all
+        result = run.execute(self.check, Path("unused.jar"), self.base, fixed=False)
+        self.assertEqual(result.status, "tooling")
+        self.assertEqual(result.detail, "no coverage report")
+
+    def test_no_gate_for_a_fixed_run(self) -> None:
+        # -fixed skips -coverage entirely (B1); replaying a report-less recording must not turn
+        # into "no coverage report" for a -fixed run.
+        self.replay("clean")
+        result = run.execute(self.check, Path("unused.jar"), self.base, fixed=True)
+        self.assertNotEqual(result.detail, "no coverage report")
+
+    def test_no_gate_for_a_witness_run(self) -> None:
+        witness = run.Run("demo-posix-witness", "M", "check.cfg", "demo", "witness",
+                          ("NeverReachedTwo",), (), (), 5, self.check.constants, None, None)
+        self.replay("clean")
+        result = run.execute(witness, Path("unused.jar"), self.base, fixed=False)
+        self.assertNotEqual(result.detail, "no coverage report")
+
+    def test_no_gate_for_a_seeded_run(self) -> None:
+        seeded = run.Run("demo-posix-seeded-SEED_X", "M", "check.cfg", "demo", "seeded",
+                         ("WithinBound",), (), (), 5, self.check.constants, None, None)
+        self.replay("clean")
+        result = run.execute(seeded, Path("unused.jar"), self.base, fixed=False)
+        self.assertNotEqual(result.detail, "no coverage report")
+
+
+class CoverageUnionTests(unittest.TestCase):
+    """judge_union(): the suite-wide coverage union (design Section 4), against real recorded logs."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name)
+        (self.base / "Smoke.tla").write_text((HERE / "Smoke.tla").read_text(encoding="utf-8"), encoding="utf-8")
+
+    def log_for(self, case: str) -> Path:
+        log = self.base / f"{case}.log"
+        log.write_text(fixture(case)[1], encoding="utf-8")
+        return log
+
+    def entry(self, name: str, kind: str, fixed: bool, case: str | None,
+             status: str = "ok") -> tuple[run.Run, bool, run.Result]:
+        r = run.Run(name, "Smoke", "c", "x", kind, (), (), (), 2, (("SEED_OVERSHOOT", kind == "seeded"),),
+                   None, None)
+        log = self.log_for(case) if case is not None else None
+        result = run.Result(name, status, frozenset(), frozenset(), None, 1.0, "", (), log)
+        return (r, fixed, result)
+
+    def test_union_counts_a_seeded_runs_coverage(self) -> None:
+        executed = [self.entry("x-check", "check", False, "smoke_check_coverage"),
+                   self.entry("x-seeded", "seeded", False, "smoke_seeded_coverage")]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            failed = run.judge_union(executed, self.base, (), ())
+        self.assertFalse(failed)
+        self.assertIn("COVERAGE suite", out.getvalue())
+
+    def test_union_fails_on_an_uncovered_label(self) -> None:
+        # No seeded run here, so Overshoot (TOTAL 0 in the check run) is covered by nothing.
+        executed = [self.entry("x-check", "check", False, "smoke_check_coverage")]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            failed = run.judge_union(executed, self.base, (), ())
+        self.assertTrue(failed)
+        self.assertIn("Overshoot", out.getvalue())
+
+    def test_union_fails_on_a_covered_never_reached_label(self) -> None:
+        executed = [self.entry("x-check", "check", False, "smoke_check_coverage"),
+                   self.entry("x-seeded", "seeded", False, "smoke_seeded_coverage")]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            failed = run.judge_union(executed, self.base, (("Overshoot", "thought unreachable"),), ())
+        self.assertTrue(failed)
+        self.assertIn("never_reached but covered", out.getvalue())
+
+    def test_union_skipped_when_a_run_had_a_tooling_failure(self) -> None:
+        executed = [self.entry("x-check", "check", False, "smoke_check_coverage"),
+                   self.entry("x-seeded", "seeded", False, None, status="tooling")]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            failed = run.judge_union(executed, self.base, (), ())
+        self.assertFalse(failed)
+        self.assertIn("not judged: a run failed or timed out", out.getvalue())
+
+    def test_union_failure_sets_exit_1_through_main(self) -> None:
+        toml = """
+scenarios = ["demo"]
+
+[[run]]
+name = "demo-posix-check"
+module = "Smoke"
+config = "c.cfg"
+scenario = "demo"
+kind = "check"
+unreached = [{ label = "Overshoot", reason = "not seeded in this run" }]
+constants = { SEED_OVERSHOOT = false }
+timeout_minutes = 5
+"""
+        cfg_text = "SPECIFICATION Spec\nCONSTANTS\n    SEED_OVERSHOOT = FALSE\n    FIX_BOUND = FALSE\n" \
+                   "INVARIANT WithinBound\n"
+        (self.base / "expected.toml").write_text(toml, encoding="utf-8")
+        (self.base / "c.cfg").write_text(cfg_text, encoding="utf-8")
+        log = self.log_for("smoke_check_coverage")
+
+        def execute(r: run.Run, _jar: Path, _base: Path, fixed: bool) -> run.Result:
+            return run.Result(r.name, "ok", frozenset(), frozenset(), 10, 1.0, "", (), log)
+
+        for name in ("execute", "ensure_jar"):
+            self.addCleanup(setattr, run, name, getattr(run, name))
+        self.addCleanup(setattr, run.shutil, "which", run.shutil.which)
+        run.shutil.which = lambda _name: "java"
+        run.ensure_jar = lambda: Path("unused.jar")
+        run.execute = execute
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = run.main(["--expected", str(self.base / "expected.toml")])
+        self.assertEqual(code, 1)
+        self.assertIn("MISMATCH suite coverage", out.getvalue())
+
+    def test_union_gates_a_pluscal_label_no_run_reported(self) -> None:
+        # A PlusCal module's label is gated even if it appears in NO run's coverage report at all
+        # (unlike a non-PlusCal module, which only gates names that were reported at least once).
+        (self.base / "CoverageFixture.tla").write_text(
+            (TESTDATA / "CoverageFixture.tla").read_text(encoding="utf-8"), encoding="utf-8")
+        log_text = (
+            "@!@!@STARTMSG 2201:0 @!@!@\nThe coverage statistics at now\n@!@!@ENDMSG 2201 @!@!@\n"
+            "@!@!@STARTMSG 2772:0 @!@!@\n<a_step line 1, col 1 to line 1, col 4 of module CoverageFixture>: 1:1\n"
+            "@!@!@ENDMSG 2772 @!@!@\n"
+            "@!@!@STARTMSG 2202:0 @!@!@\nEnd of statistics.\n@!@!@ENDMSG 2202 @!@!@\n"
+        )
+        log = self.base / "cf.log"
+        log.write_text(log_text, encoding="utf-8")
+        r = run.Run("x-check", "CoverageFixture", "c", "x", "check", (), (), (), 2,
+                   (("Alphas", frozenset({"a1"})), ("Betas", frozenset({"b1"}))), None, None)
+        result = run.Result("x-check", "ok", frozenset(), frozenset(), None, 1.0, "", (), log)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            failed = run.judge_union([(r, False, result)], self.base, (), ())
+        self.assertTrue(failed)
+        self.assertIn("env_step", out.getvalue())
+
+    def test_union_ignores_a_fixed_runs_coverage(self) -> None:
+        # The only run that covers Overshoot here is -fixed; a -fixed run's coverage must not
+        # count toward the union, so Overshoot stays uncovered.
+        executed = [self.entry("x-check", "check", False, "smoke_check_coverage"),
+                   self.entry("x-seeded", "seeded", True, "smoke_seeded_coverage")]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            failed = run.judge_union(executed, self.base, (), ())
+        self.assertTrue(failed)
+        self.assertIn("Overshoot", out.getvalue())
+
+
+class DeferredUnionTests(unittest.TestCase):
+    """judge_union()'s 'deferred' handling (design Section 4), against real recorded logs."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name)
+        (self.base / "Smoke.tla").write_text((HERE / "Smoke.tla").read_text(encoding="utf-8"), encoding="utf-8")
+
+    def log_for(self, case: str) -> Path:
+        log = self.base / f"{case}.log"
+        log.write_text(fixture(case)[1], encoding="utf-8")
+        return log
+
+    def entry(self, name: str, kind: str, case: str) -> tuple[run.Run, bool, run.Result]:
+        r = run.Run(name, "Smoke", "c", "x", kind, (), (), (), 2, (("SEED_OVERSHOOT", kind == "seeded"),),
+                   None, None)
+        result = run.Result(name, "ok", frozenset(), frozenset(), None, 1.0, "", (), self.log_for(case))
+        return (r, False, result)
+
+    def test_uncovered_deferred_label_passes_and_is_counted(self) -> None:
+        executed = [self.entry("x-check", "check", "smoke_check_coverage")]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            failed = run.judge_union(executed, self.base, (), (("Overshoot", "future", "not built yet"),))
+        self.assertFalse(failed)
+        self.assertIn("0 never_reached, 1 deferred", out.getvalue())
+
+    def test_covered_deferred_label_fails_the_union(self) -> None:
+        executed = [self.entry("x-check", "check", "smoke_check_coverage"),
+                   self.entry("x-seeded", "seeded", "smoke_seeded_coverage")]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            failed = run.judge_union(executed, self.base, (), (("Overshoot", "future", "not built yet"),))
+        self.assertTrue(failed)
+        self.assertIn("deferred but covered: Overshoot", out.getvalue())
+
+    def test_covered_deferred_label_exit_code_1_through_main(self) -> None:
+        toml = """
+scenarios = ["demo"]
+
+[[run]]
+name = "demo-posix-check"
+module = "Smoke"
+config = "c.cfg"
+scenario = "demo"
+kind = "check"
+constants = { SEED_OVERSHOOT = false }
+timeout_minutes = 5
+
+[[run]]
+name = "demo-posix-seeded-SEED_X"
+module = "Smoke"
+config = "seed.cfg"
+scenario = "demo"
+kind = "seeded"
+violated = ["WithinBound"]
+constants = { SEED_OVERSHOOT = true }
+timeout_minutes = 5
+
+[[deferred]]
+label = "Overshoot"
+scenario = "future"
+reason = "not built yet"
+"""
+        check_cfg_text = "SPECIFICATION Spec\nCONSTANTS\n    SEED_OVERSHOOT = FALSE\n    FIX_BOUND = FALSE\nINVARIANT WithinBound\n"
+        seed_cfg_text = "SPECIFICATION Spec\nCONSTANT SEED_OVERSHOOT = TRUE\nINVARIANT WithinBound\n"
+        (self.base / "expected.toml").write_text(toml, encoding="utf-8")
+        (self.base / "c.cfg").write_text(check_cfg_text, encoding="utf-8")
+        (self.base / "seed.cfg").write_text(seed_cfg_text, encoding="utf-8")
+        check_log = self.log_for("smoke_check_coverage")
+        seeded_log = self.log_for("smoke_seeded_coverage")
+
+        def execute(r: run.Run, _jar: Path, _base: Path, fixed: bool) -> run.Result:
+            log = check_log if r.kind == "check" else seeded_log
+            return run.Result(r.name, "ok", frozenset(), frozenset(), 10, 1.0, "", (), log)
+
+        for name in ("execute", "ensure_jar"):
+            self.addCleanup(setattr, run, name, getattr(run, name))
+        self.addCleanup(setattr, run.shutil, "which", run.shutil.which)
+        run.shutil.which = lambda _name: "java"
+        run.ensure_jar = lambda: Path("unused.jar")
+        run.execute = execute
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = run.main(["--expected", str(self.base / "expected.toml")])
+        self.assertEqual(code, 1)
+        self.assertIn("deferred but covered", out.getvalue())
+
+
+class MainUnionRoutingTests(unittest.TestCase):
+    def test_scenario_run_skips_the_union(self) -> None:
+        d = ExpectedDir()
+        self.addCleanup(d.close)
+        for name in ("execute", "ensure_jar"):
+            self.addCleanup(setattr, run, name, getattr(run, name))
+        self.addCleanup(setattr, run.shutil, "which", run.shutil.which)
+        run.shutil.which = lambda _name: "java"
+        run.ensure_jar = lambda: Path("unused.jar")
+        run.execute = lambda r, _jar, _base, fixed: ExitCodeTests.result("ok")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            run.main(["--expected", str(d.path / "expected.toml"), "--scenario", "demo"])
+        self.assertIn("not judged for a single scenario", out.getvalue())
+
+
+class GeneratedModuleTests(unittest.TestCase):
+    """LockProtocol.tla is generated (README.md): `cat LockProtocol.head algorithm.txt invariants.txt`,
+    then `pcal.trans`, which INSERTS a translation block after the algorithm's closing `*)`. Nothing in
+    the justfile, the workflows or these tests re-derived it, so a source edited without re-running the
+    translator left CI checking a model the sources no longer described, silently (capstone, plan 3).
+
+    This catches that case with no Java: everything OUTSIDE the inserted block must still be exactly the
+    three sources concatenated. It does NOT catch a hand-edited translation block - only a real
+    `pcal.trans` run can, and that needs the jar, so it belongs in CI rather than here.
+    """
+
+    BEGIN = "\\* BEGIN TRANSLATION"
+    END = "\\* END TRANSLATION"
+
+    def test_generated_module_matches_its_sources(self) -> None:
+        d = Path(__file__).resolve().parent
+        sources = "".join((d / name).read_text(encoding="utf-8")
+                          for name in ("LockProtocol.head", "algorithm.txt", "invariants.txt"))
+        generated = (d / "LockProtocol.tla").read_text(encoding="utf-8")
+
+        lines = generated.splitlines(keepends=True)
+        starts = [i for i, ln in enumerate(lines) if ln.startswith(self.BEGIN)]
+        ends = [i for i, ln in enumerate(lines) if ln.startswith(self.END)]
+        self.assertEqual(len(starts), 1, "expected exactly one BEGIN TRANSLATION marker")
+        self.assertEqual(len(ends), 1, "expected exactly one END TRANSLATION marker")
+        self.assertLess(starts[0], ends[0], "END TRANSLATION precedes BEGIN TRANSLATION")
+
+        without_translation = "".join(lines[:starts[0]] + lines[ends[0] + 1:])
+        self.assertEqual(
+            without_translation, sources,
+            "LockProtocol.tla no longer matches LockProtocol.head + algorithm.txt + invariants.txt. "
+            "Re-run the translator: cat the three sources into LockProtocol.tla, then "
+            "`java -cp target/tla/tla2tools.jar pcal.trans LockProtocol.tla` (and delete the "
+            "LockProtocol.cfg it writes beside it).")
+
+
+class ConfigConsistencyTests(unittest.TestCase):
+    """The .cfg files are hand-written copies of each other - TLC's format has no include - so nothing
+    stops one drifting from the rest. Adding a CONSTANT means editing 70-odd files by hand, and the
+    `-fixed-check` configs exist only to be their `-check` sibling with the fix flag flipped. These
+    two guards make that duplication safe to keep (capstone, plan 3)."""
+
+    def configs(self) -> dict[str, str]:
+        d = Path(__file__).resolve().parent / "configs"
+        # The selftest configs belong to Smoke.tla, a different module with its own constants.
+        return {c.name: c.read_text(encoding="utf-8") for c in sorted(d.glob("*.cfg"))
+                if not c.name.startswith("selftest-")}
+
+    @staticmethod
+    def constant_names(text: str) -> frozenset[str]:
+        """The names assigned in the CONSTANT/CONSTANTS section.
+
+        Parsed per line rather than from cfg_sections' token stream: a set-literal value such as
+        `Owners = {o1}` is several tokens, so the stream has no fixed stride to step over."""
+        body = text[text.index("CONSTANT"):]
+        for keyword in ("INVARIANT", "PROPERTY", "SYMMETRY", "SPECIFICATION"):
+            if keyword in body:
+                body = body[:body.index(keyword)]
+        return frozenset(m.group(1) for m in re.finditer(r"^\s+([A-Za-z_][A-Za-z0-9_]*)\s*=", body, re.M))
+
+    def test_every_config_declares_the_same_constants(self) -> None:
+        names = {name: self.constant_names(text) for name, text in self.configs().items()}
+        self.assertTrue(names, "expected LockProtocol configs beside the tests")
+        every = frozenset().union(*names.values())
+        # Assert something was PARSED, not only that the gaps between files are empty. Without
+        # this a parser that extracts nothing gives every file an empty set, so `gaps` is empty
+        # and the guard passes while guarding nothing (test audit, plan 3, TA-2 - the same shape
+        # as the parse_cost_nodes defect: assert on the filtered result, never on the count).
+        self.assertIn("LockCapability", every,
+                      "the constant parser returned nothing recognisable; this guard is vacuous")
+        self.assertGreater(len(every), 10, f"only {len(every)} constants parsed across {len(names)} configs")
+        # Reported per CONSTANT rather than against one chosen file: whichever config is the odd one
+        # out, the message must name IT, not the other seventy.
+        gaps = {constant: sorted(f for f, declared in names.items() if constant not in declared)
+                for constant in sorted(every)}
+        gaps = {c: files for c, files in gaps.items() if files}
+        self.assertEqual(
+            gaps, {},
+            "every LockProtocol config must assign every constant the module declares, because adding "
+            "one means editing them all by hand and TLC's format has no include. Not declared by: "
+            + "; ".join(f"{c} <- {', '.join(files)}" for c, files in gaps.items()))
+
+    def test_fixed_check_configs_match_their_sibling(self) -> None:
+        configs = self.configs()
+        pairs = [(n, n.replace("-fixed-check.cfg", "-check.cfg")) for n in configs
+                 if n.endswith("-fixed-check.cfg")]
+        self.assertTrue(pairs, "expected at least one -fixed-check config")
+        for fixed_name, check_name in pairs:
+            self.assertIn(check_name, configs, f"{fixed_name} has no -check sibling")
+            fixed, check = run.cfg_constants(configs[fixed_name]), run.cfg_constants(configs[check_name])
+            self.assertEqual(
+                fixed.get("FIX_REMOTE_LEASE_SPEC"), True, f"{fixed_name} must set FIX_REMOTE_LEASE_SPEC")
+            self.assertEqual(
+                check.get("FIX_REMOTE_LEASE_SPEC"), False, f"{check_name} must clear FIX_REMOTE_LEASE_SPEC")
+            differing = {k for k in set(fixed) | set(check) if fixed.get(k) != check.get(k)}
+            self.assertEqual(
+                differing, {"FIX_REMOTE_LEASE_SPEC"},
+                f"{fixed_name} and {check_name} must differ in FIX_REMOTE_LEASE_SPEC alone, "
+                f"but also differ in {sorted(differing - {'FIX_REMOTE_LEASE_SPEC'})}")
+
+            def invariants(text: str) -> set[str]:
+                sections = run.cfg_sections(text)
+                return set(sections.get("INVARIANT", []))
+
+            self.assertEqual(
+                invariants(configs[fixed_name]), invariants(configs[check_name]) | {"SingleWriter"},
+                f"{fixed_name} must check exactly its sibling's invariants plus SingleWriter: the "
+                f"sibling drops SingleWriter because it carries the open finding, and the whole point "
+                f"of the fixed run is to check it with the flag on")
+
+
+class UnionFromLogsTests(unittest.TestCase):
+    """--union-from: judge the union from logs earlier CI jobs already wrote.
+
+    The union used to be judged by re-running every run in one job; measured, that job could not fit
+    its 180-minute cap, so the only place the union was judged never judged it (capstone, plan 3)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.logs = Path(self._tmp.name) / "artifacts"
+        # nested, as `gh run download` lays artifacts out: one directory per uploading job
+        (self.logs / "tlc-output-x-posix").mkdir(parents=True)
+
+    def write_log(self, name: str, case: str = "smoke_check_coverage") -> None:
+        (self.logs / "tlc-output-x-posix" / f"{name}.log").write_text(fixture(case)[1], encoding="utf-8")
+
+    def test_a_missing_log_fails_rather_than_under_reporting(self) -> None:
+        d = ExpectedDir()
+        self.addCleanup(d.close)
+        expected = d.load()
+        self.write_log(expected.runs[0].name)
+        for extra in expected.runs[1:]:
+            pass  # deliberately not written
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            code = run.judge_union_from(expected, d.path, self.logs)
+        if len(expected.runs) > 1:
+            self.assertEqual(code, 2)
+            self.assertIn("cannot judge the union", out.getvalue())
+            self.assertIn(expected.runs[1].name, out.getvalue())
+
+    def test_a_log_with_no_complete_coverage_block_fails(self) -> None:
+        """A log that is PRESENT but silent must fail, not count as "covered nothing".
+
+        parse_coverage returns None rather than judging from a partial block. `or {}` used to turn
+        that refusal into an empty coverage set, which inflates `uncovered` (loud) but SHRINKS
+        all_covered - and all_covered is the only detector for a never_reached or deferred label
+        that IS covered, so those two checks failed OPEN. Reachable because the per-run coverage
+        gate covers check/liveness only, while witness and seeded runs also carry -coverage 1.
+        """
+        d = ExpectedDir()
+        self.addCleanup(d.close)
+        expected = d.load()
+        for r in expected.runs:
+            self.write_log(r.name)
+        # one run's log is present and parses to no complete coverage block
+        (self.logs / "tlc-output-x-posix" / f"{expected.runs[0].name}.log").write_text("", encoding="utf-8")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = run.judge_union_from(expected, d.path, self.logs)
+        self.assertEqual(code, 1, "a silent log must fail the union, never be read as covering nothing")
+        self.assertIn("no complete coverage block", out.getvalue())
+
+    def test_no_logs_at_all_fails(self) -> None:
+        d = ExpectedDir()
+        self.addCleanup(d.close)
+        expected = d.load()
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            code = run.judge_union_from(expected, d.path, self.logs)
+        self.assertEqual(code, 2, "an empty artifact directory must fail, never pass vacuously")
+        self.assertIn("cannot judge the union", out.getvalue())
+
+
+class CostNodeTests(unittest.TestCase):
+    """parse_cost_nodes(): the expression-granular data TLC emits and run.py used to discard.
+
+    The suite's coverage gate is LABEL-granular, so a guarded branch inside a label that the
+    non-taking path also reaches is invisible to it. That blind spot produced two capstone findings.
+    TLC's `-coverage 1` has carried per-expression counts (message 2221) all along, including zeros.
+    """
+
+    def test_reads_every_cost_node_including_the_nested_ones(self) -> None:
+        """The NESTED nodes are the branch-level ones, and the first version of this parser dropped
+        them: TLC prefixes a node's depth with `|`, and the pattern matched leading whitespace
+        only. It returned 10 of 17 while looking like it had read them all. Assert the COUNT,
+        absence of this assertion is exactly what let that through."""
+        text = fixture("smoke_check_coverage")[1]
+        nodes = run.parse_cost_nodes(run.parse_messages(text))
+        self.assertIsNotNone(nodes)
+        self.assertEqual(len(nodes), text.count("@!@!@STARTMSG 2221"),
+                         "every message-2221 line must be parsed, nested ones included")
+        self.assertTrue(any(depth > 0 for *_rest, depth in nodes),
+                        "the fixture carries nested nodes; if none parse, the depth support is dead")
+
+    def test_an_unreadable_cost_line_fails_closed(self) -> None:
+        text = fixture("smoke_check_coverage")[1]
+        broken = text.replace("line 26, col 8", "LINE 26, col 8", 1)
+        self.assertIsNone(run.parse_cost_nodes(run.parse_messages(broken)),
+                          "a 2221 line the parser cannot read must be None, never a silent drop")
+
+    def test_extracts_the_zero_count_nodes_of_a_constant_guarded_body(self) -> None:
+        nodes = run.parse_cost_nodes(run.parse_messages(fixture("smoke_check_coverage")[1]))
+        self.assertIsNotNone(nodes)
+        zeros = [(module, line) for module, line, _col, count, _depth in nodes if count == 0]
+        # Smoke.tla's Overshoot body is guarded by the constant SEED_OVERSHOOT and reports zero
+        # in the non-seeded run. NOTE it is NOT the R4-1 shape, though this comment used to say
+        # so: Overshoot is a top-level action whose own action line reads `0:0`, so the
+        # LABEL-granular gate already catches it. R4-1's shape is a zero branch inside an action
+        # that IS covered, and no recorded fixture contains one - so what this pins is that the
+        # parser reads zero-count nodes at all, not that the blind spot is instrumented.
+        self.assertEqual(zeros, [("Smoke", 26), ("Smoke", 27)])
+
+    def test_fails_closed_like_parse_coverage(self) -> None:
+        # No coverage block at all, and a block whose terminator never arrived.
+        self.assertIsNone(run.parse_cost_nodes(run.parse_messages("no coverage here")))
+        started = fixture("smoke_check_coverage")[1]
+        cut = started[: started.rindex("@!@!@STARTMSG 2201")] + "@!@!@STARTMSG 2201:0 @!@!@" + chr(10)
+        self.assertIsNone(
+            run.parse_cost_nodes(run.parse_messages(cut)),
+            "an unterminated final block must be None, never a partial answer")
+
+
+def text_at(module_text: str, pos: tuple[int, int]) -> str:
+    """The module text from a 1-based (line, col) position to the end of that line."""
+    line, col = pos
+    return module_text.split("\n")[line - 1][col - 1:]
+
+
+# A generated-module shape with the two traps the resolver must avoid: a guard that is a PREFIX of another
+# guard in the same label (A), and the same guard in another label (B); C holds one guard twice.
+SYNTHETIC_ACTIONS = "\n".join([
+    'A(self) == /\\ pc[self] = "A"',
+    "           /\\ IF IsRecord(seen) /\\ seen # s",
+    "                 THEN /\\ y' = 1",
+    "                 ELSE /\\ IF IsRecord(seen)",
+    "                            THEN /\\ y' = 2",
+    "                            ELSE /\\ y' = 3",
+    "           /\\ UNCHANGED z",
+    "",
+    "B(self) == /\\ IF IsRecord(seen)",
+    "                 THEN /\\ y' = 4",
+    "                 ELSE /\\ y' = 5",
+    "",
+    "C(self) == /\\ IF x = 1",
+    "                 THEN /\\ y' = 6",
+    "                 ELSE /\\ IF x = 1",
+    "                            THEN /\\ y' = 7",
+    "                            ELSE /\\ y' = 8",
+    "",
+])
+
+
+class BranchResolveTests(unittest.TestCase):
+    """resolve_branch()/arm_count() (cut 6 Part 2): an arm of an IF inside a label, counted from TLC's cost nodes.
+
+    The recorded fixture is Task 1's measurement (testdata/arm_coverage.out, from ArmFixture.tla); its counts
+    are what TLC printed, not what this code expects."""
+
+    def setUp(self) -> None:
+        self.module = (TESTDATA / "ArmFixture.tla").read_text(encoding="utf-8")
+        self.nodes = run.parse_cost_nodes(run.parse_messages(fixture("arm_coverage")[1]))
+        self.assertIsNotNone(self.nodes)
+
+    def count(self, label: str, guard: str, side: str) -> int | None:
+        span = run.resolve_branch(self.module, label, guard, side)
+        branch = run.Branch("b", "ArmFixture", label, guard, side, "why", span)
+        return run.arm_count(self.nodes, branch)
+
+    def test_the_dead_arm_counts_zero_and_a_live_arm_does_not(self) -> None:
+        self.assertEqual(self.count("branchy", "i = 7", "then"), 0, "x := 99 never runs (arm_coverage.out:69)")
+        self.assertEqual(self.count("branchy", "i = 1", "then"), 1)
+
+    def test_an_arm_producing_only_duplicate_successors_still_counts(self) -> None:
+        # twins: both arms set y' = 5 (arm_coverage.out:96, :102)
+        self.assertEqual(self.count("twins", "j = 0", "then"), 3)
+        self.assertEqual(self.count("twins", "j # 0", "then"), 3)
+
+    def test_the_translator_fallback_else_counts_its_first_conjunct(self) -> None:
+        # `ELSE /\ TRUE` has no node on its own line; its arm's first node is `y' = y` (arm_coverage.out:105)
+        self.assertEqual(self.count("twins", "j # 0", "else"), 0)
+
+    def test_the_whole_condition_must_match_not_a_prefix(self) -> None:
+        inner = run.resolve_branch(SYNTHETIC_ACTIONS, "A", "IsRecord(seen)", "else")
+        self.assertEqual(text_at(SYNTHETIC_ACTIONS, inner[0]), "ELSE /\\ y' = 3")
+        outer = run.resolve_branch(SYNTHETIC_ACTIONS, "A", "IsRecord(seen) /\\ seen # s", "then")
+        self.assertEqual(text_at(SYNTHETIC_ACTIONS, outer[0]), "THEN /\\ y' = 1")
+        self.assertEqual(text_at(SYNTHETIC_ACTIONS, outer[1]), "ELSE /\\ IF IsRecord(seen)")
+        with self.assertRaises(run.ExpectedError):
+            run.resolve_branch(SYNTHETIC_ACTIONS, "A", "IsRecord", "then")
+
+    def test_the_same_guard_in_another_label_is_not_a_match(self) -> None:
+        span = run.resolve_branch(SYNTHETIC_ACTIONS, "B", "IsRecord(seen)", "then")
+        self.assertEqual(text_at(SYNTHETIC_ACTIONS, span[0]), "THEN /\\ y' = 4")
+
+    def test_an_else_arm_ends_where_the_action_dedents(self) -> None:
+        start, end = run.resolve_branch(SYNTHETIC_ACTIONS, "A", "IsRecord(seen)", "else")
+        self.assertEqual(end, (start[0] + 1, 1), "the ELSE arm stops at the next line indented no deeper")
+
+    def test_every_unresolvable_anchor_fails_closed(self) -> None:
+        cases = {
+            "guard twice in one label": ("C", "x = 1", "then"),
+            "no such guard": ("A", "x = 1", "then"),
+            "no such label": ("D", "x = 1", "then"),
+        }
+        for why, (label, guard, side) in cases.items():
+            with self.subTest(why):
+                with self.assertRaises(run.ExpectedError):
+                    run.resolve_branch(SYNTHETIC_ACTIONS, label, guard, side)
+
+    def test_a_log_with_no_node_inside_the_arm_gives_none(self) -> None:
+        span = run.resolve_branch(self.module, "branchy", "i = 7", "then")
+        branch = run.Branch("b", "ArmFixture", "branchy", "i = 7", "then", "why", span)
+        self.assertIsNone(run.arm_count([n for n in self.nodes if n[1] != 51], branch))
+        self.assertIsNone(run.arm_count(self.nodes, run.Branch("b", "Other", "branchy", "i = 7", "then", "why", span)),
+                          "a node of another module never counts")
+
+
+BRANCHES_TOML = """
+
+[[branches]]
+name = "{name}"
+module = "ArmFixture"
+label = "branchy"
+guard = "{guard}"
+side = "then"
+reason = "a test"
+"""
+
+
+class BranchJudgeTests(unittest.TestCase):
+    """`branches` in expected.toml: loaded fail-closed, judged by --union-from over the runs that count."""
+
+    def expected_dir(self, extra: str) -> ExpectedDir:
+        d = ExpectedDir(GOOD_EXPECTED + extra)
+        self.addCleanup(d.close)
+        (d.path / "ArmFixture.tla").write_text((TESTDATA / "ArmFixture.tla").read_text(encoding="utf-8"),
+                                                encoding="utf-8")
+        return d
+
+    def logs(self, per_run: dict[str, str]) -> Path:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name) / "tlc-output-x-posix"
+        root.mkdir()
+        for name, text in per_run.items():
+            (root / f"{name}.log").write_text(text, encoding="utf-8")
+        return root.parent
+
+    def judge(self, d: ExpectedDir, per_run: dict[str, str]) -> tuple[int, str]:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = run.judge_union_from(d.load(), d.path, self.logs(per_run))
+        return code, out.getvalue()
+
+    def test_a_branch_loads_resolved(self) -> None:
+        (b,) = self.expected_dir(BRANCHES_TOML.format(name="dead", guard="i = 7")).load().branches
+        self.assertEqual((b.name, b.module, b.label, b.side), ("dead", "ArmFixture", "branchy", "then"))
+        self.assertEqual(b.span, ((51, 42), (52, 42)))
+
+    def test_each_malformed_branch_fails_at_load(self) -> None:
+        good = BRANCHES_TOML.format(name="dead", guard="i = 7")
+        cases = {
+            "unknown key": good + 'extra = "no"\n',
+            "missing reason": good.replace('reason = "a test"\n', ""),
+            "bad side": good.replace('side = "then"', 'side = "both"'),
+            "bad name": good.replace('name = "dead"', 'name = "Dead Arm"'),
+            "missing module": good.replace('module = "ArmFixture"', 'module = "Nope"'),
+            "unresolvable guard": good.replace('guard = "i = 7"', 'guard = "i = 9"'),
+            "duplicate name": good + good,
+        }
+        for why, extra in cases.items():
+            with self.subTest(why):
+                with self.assertRaises(run.ExpectedError):
+                    self.expected_dir(extra).load()
+
+    def test_an_arm_one_counted_log_covers_passes(self) -> None:
+        d = self.expected_dir(BRANCHES_TOML.format(name="live", guard="i = 1"))
+        covered = fixture("arm_coverage")[1]
+        zeroed = covered.replace("line 49, col 36 to line 49, col 44 of module ArmFixture: 1",
+                                 "line 49, col 36 to line 49, col 44 of module ArmFixture: 0")
+        self.assertNotEqual(covered, zeroed, "the replaced node line must exist, or this test asserts nothing")
+        names = [r.name for r in d.load().runs]
+        code, out = self.judge(d, {n: (covered if n == "demo-posix-check" else zeroed) for n in names})
+        self.assertEqual(code, 0, out)
+        self.assertIn("BRANCH live  1 entries", out)
+
+    def test_an_arm_no_counted_log_covers_fails(self) -> None:
+        d = self.expected_dir(BRANCHES_TOML.format(name="dead", guard="i = 7"))
+        code, out = self.judge(d, {r.name: fixture("arm_coverage")[1] for r in d.load().runs})
+        self.assertEqual(code, 1)
+        self.assertIn("MISMATCH branch dead", out)
+
+    def test_a_seeded_run_covering_the_arm_does_not_count(self) -> None:
+        d = self.expected_dir(BRANCHES_TOML.format(name="live", guard="i = 1"))
+        covered = fixture("arm_coverage")[1]
+        zeroed = covered.replace("line 49, col 36 to line 49, col 44 of module ArmFixture: 1",
+                                 "line 49, col 36 to line 49, col 44 of module ArmFixture: 0")
+        runs = d.load().runs
+        seeded = [r.name for r in runs if r.kind == "seeded"]
+        self.assertEqual(len(seeded), 1)
+        code, out = self.judge(d, {r.name: (covered if r.kind == "seeded" else zeroed) for r in runs})
+        self.assertEqual(code, 1, "only a seeded run reached the arm, and seeded runs do not count")
+        self.assertIn("MISMATCH branch live", out)
+
+    def test_which_runs_count(self) -> None:
+        d = self.expected_dir("")
+        runs = {r.kind: r for r in d.load().runs}
+        self.assertTrue(run.counts_for_branches(runs["check"], d.path), "check.cfg sets FIX_SAFE = FALSE")
+        self.assertTrue(run.counts_for_branches(runs["witness"], d.path))
+        self.assertFalse(run.counts_for_branches(runs["seeded"], d.path))
+        # The FIX_* flag is read from the CONFIG: expected.toml's `constants` does not carry it (measured on
+        # breaklock-remote-posix-fixed-check, whose constants omit FIX_REMOTE_LEASE_SPEC).
+        (d.path / "fixed.cfg").write_text("SPECIFICATION Spec\nCONSTANTS\n    FIX_SAFE = TRUE\nINVARIANT Safe\n",
+                                          encoding="utf-8")
+        fixed = dataclasses.replace(runs["check"], config="fixed.cfg")
+        self.assertFalse(run.counts_for_branches(fixed, d.path), "a run whose config sets FIX_* models a fix")
+
+    def test_no_branches_changes_nothing(self) -> None:
+        self.assertFalse(run.judge_branches((), [("any", "not even a log")]))
+
+    ARM_1 = "line 49, col 36 to line 49, col 44 of module ArmFixture: 1"
+    ARM_0 = "line 49, col 36 to line 49, col 44 of module ArmFixture: 0"
+
+    def test_a_counted_log_without_a_coverage_block_fails_the_branches(self) -> None:
+        """A counted log that parses to no complete coverage block must FAIL the branches (test audit, cut 6).
+        Without the check, arm_count iterates None and the union crashes instead of reporting."""
+        span = run.resolve_branch((TESTDATA / "ArmFixture.tla").read_text(encoding="utf-8"), "branchy", "i = 1", "then")
+        branch = run.Branch("live", "ArmFixture", "branchy", "i = 1", "then", "why", span)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            failed = run.judge_branches((branch,), [("good", fixture("arm_coverage")[1]), ("silent", "no coverage")])
+        self.assertTrue(failed, "an unreadable counted log must fail the branches, never pass or crash")
+        self.assertIn("silent's log carries no complete coverage block", out.getvalue())
+
+    def judge_union(self, d: ExpectedDir, covered_kind: str) -> tuple[bool, str]:
+        """judge_union - the path `just model` takes after running every run - with only runs of `covered_kind`
+        entering arm `live`, every other log showing it at zero."""
+        expected = d.load()
+        covered = fixture("arm_coverage")[1]
+        zeroed = covered.replace(self.ARM_1, self.ARM_0)
+        self.assertNotEqual(covered, zeroed, "the replaced node line must exist, or this test asserts nothing")
+        executed = []
+        for r in expected.runs:
+            log = d.path / f"{r.name}.log"
+            log.write_text(covered if r.kind == covered_kind else zeroed, encoding="utf-8")
+            executed.append((r, False, run.Result(r.name, "ok", frozenset(), frozenset(), None, 1.0, "", (), log)))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            failed = run.judge_union(executed, d.path, expected.never_reached, expected.deferred, expected.branches)
+        return failed, out.getvalue()
+
+    def test_judge_union_counts_a_check_run_but_not_a_seeded_one(self) -> None:
+        """The same filter as --union-from, on the path a full local run takes (test audit, cut 6)."""
+        d = self.expected_dir(BRANCHES_TOML.format(name="live", guard="i = 1"))
+        failed, out = self.judge_union(d, "check")
+        self.assertFalse(failed, out)
+        self.assertIn("BRANCH live  1 entries", out)
+        failed, out = self.judge_union(d, "seeded")
+        self.assertTrue(failed, "only a seeded run entered the arm, and seeded runs do not count")
+        self.assertIn("MISMATCH branch live", out)
+
+    def test_the_committed_branches_resolve_against_the_generated_module(self) -> None:
+        branches = {b.name: b for b in run.load_expected(run.HERE / "expected.toml").branches}
+        self.assertEqual(sorted(branches), ["s240-5-s5-non-record", "s240-5-s6-another-file"])
+        module = (run.HERE / "LockProtocol.tla").read_text(encoding="utf-8")
+        self.assertTrue(text_at(module, branches["s240-5-s6-another-file"].span[0]).startswith("THEN /\\ refused' = "))
+        self.assertTrue(text_at(module, branches["s240-5-s5-non-record"].span[0]).startswith("ELSE /\\ pc' = "))
+
+
+class PartialCoverageTests(unittest.TestCase):
+    """A seeded or witness run halts at its first counterexample, so its coverage block describes a
+    PREFIX of the state space. Its positive coverage is sound; its SILENCE is not evidence."""
+
+    def test_the_union_reports_which_runs_contributed_a_prefix(self) -> None:
+        d = ExpectedDir()
+        self.addCleanup(d.close)
+        expected = d.load()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        logs = Path(tmp.name)
+        for r in expected.runs:
+            (logs / f"{r.name}.log").write_text(fixture("smoke_check_coverage")[1], encoding="utf-8")
+        halting = frozenset(r.name for r in expected.runs if r.kind in run.HALTING_KINDS)
+        self.assertTrue(halting, "the fixture must contain a halting run or this test asserts nothing")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            run.judge_union_from(expected, d.path, logs)
+        self.assertIn("PREFIX", out.getvalue(), "a union built partly from halting runs must say so")
+        for name in halting:
+            self.assertIn(name, out.getvalue())
+
+
+class MutantManifestTests(unittest.TestCase):
+    """run.py --mutants (cut 6, revision 3): exact-text mutants of the model, run on CI."""
+
+    def _write(self, body: str) -> tuple[Path, Path]:
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        tmp = Path(holder.name)
+        (tmp / "configs").mkdir()
+        (tmp / "configs" / "x.cfg").write_text("SPECIFICATION Spec\nINVARIANT A\n", encoding="utf-8")
+        manifest = tmp / "mutants.toml"
+        manifest.write_text(textwrap.dedent(body), encoding="utf-8")
+        return manifest, tmp
+
+    VALID = '''
+        [[mutant]]
+        name = "t9-demo"
+        file = "invariants.txt"
+        old = "A == TRUE"
+        new = "A == FALSE"
+        config = "configs/x.cfg"
+        expect_absent = "A"
+        '''
+
+    def test_a_valid_entry_loads(self) -> None:
+        manifest, base = self._write(self.VALID)
+        (m,) = run.load_mutants(manifest, base)
+        self.assertEqual((m.name, m.file, m.config, m.present, m.absent, m.timeout_minutes),
+                         ("t9-demo", "invariants.txt", "configs/x.cfg", None, "A", 60))
+
+    def test_each_malformed_entry_fails_at_load(self) -> None:
+        cases = {
+            "unknown key": self.VALID + 'extra = "no"\n',
+            "both expectations": self.VALID + 'expect_present = "B"\n',
+            "neither expectation": self.VALID.replace('expect_absent = "A"', ""),
+            "not a model source": self.VALID.replace('"invariants.txt"', '"run.py"'),
+            "missing config": self.VALID.replace("configs/x.cfg", "configs/missing.cfg"),
+            "old equals new": self.VALID.replace('new = "A == FALSE"', 'new = "A == TRUE"'),
+            "duplicate name": self.VALID + self.VALID,
+            "bad name": self.VALID.replace('"t9-demo"', '"T9 Demo"'),
+            # A misspelled expect_absent could never be reported, so every run would count as a kill.
+            "name not in config": self.VALID.replace('expect_absent = "A"', 'expect_absent = "Z"'),
+            # A top-level key outside every [[mutant]] table (test audit, cut 6).
+            "top-level key": 'note = "x"\n' + self.VALID,
+        }
+        for label, body in cases.items():
+            with self.subTest(label):
+                manifest, base = self._write(body)
+                with self.assertRaises(run.ExpectedError):
+                    run.load_mutants(manifest, base)
+
+    def test_old_must_occur_exactly_once(self) -> None:
+        manifest, base = self._write(self.VALID)
+        (m,) = run.load_mutants(manifest, base)
+        self.assertEqual(run.apply_mutant("X\nA == TRUE\nY\n", m), "X\nA == FALSE\nY\n")
+        for text, count in (("nothing here\n", 0), ("A == TRUE\nA == TRUE\n", 2)):
+            with self.subTest(count=count):
+                with self.assertRaises(run.ExpectedError) as err:
+                    run.apply_mutant(text, m)
+                self.assertIn(f"occurs {count} times", str(err.exception))
+
+    def test_judging_what_the_mutated_run_reported(self) -> None:
+        manifest, base = self._write(self.VALID)
+        (absent,) = run.load_mutants(manifest, base)
+        present = run.Mutant("t9-p", "invariants.txt", "a", "b", "configs/x.cfg", "A", None, 60)
+        ok = lambda observed: run.Outcome(None, frozenset(observed), 10, ())
+        bad = run.Outcome("TLC error 1000: boom", frozenset(), None, ())
+        self.assertTrue(run.judge_mutant(absent, ok([]))[0], "no error: the mutant stopped A reporting")
+        # The run checks only A (narrow_config), so any report is a halt: a prefix, never a kill (capstone, cut 6).
+        self.assertFalse(run.judge_mutant(absent, ok(["B"]))[0], "another report halted the run: not a kill")
+        self.assertFalse(run.judge_mutant(absent, ok([run.DEADLOCK]))[0], "a deadlock halted the run: not a kill")
+        self.assertFalse(run.judge_mutant(absent, ok(["A"]))[0], "A still reported: survived")
+        self.assertTrue(run.judge_mutant(present, ok(["A"]))[0])
+        self.assertFalse(run.judge_mutant(present, ok([]))[0])
+        for m in (absent, present):
+            killed, detail = run.judge_mutant(m, bad)
+            self.assertFalse(killed, "a tooling error is never a kill")
+            self.assertIn("tooling", detail)
+
+    CHECK_CFG = textwrap.dedent("""\
+        \\* header naming INVARIANTS A and PROPERTY L in a comment
+        SPECIFICATION Spec
+        SYMMETRY Perms
+        CONSTANTS
+            N = 3
+            S = "INVARIANT"
+        INVARIANTS
+            A
+            \\* a comment inside the list
+            B
+        PROPERTY
+            L
+        """)
+
+    def test_narrowing_a_check_config_to_one_invariant(self) -> None:
+        out = run.narrow_config(self.CHECK_CFG, "B")
+        sections = run.cfg_sections(out)
+        self.assertEqual(sections["INVARIANT"], ["B"])
+        self.assertNotIn("PROPERTY", sections)
+        before = run.cfg_sections(self.CHECK_CFG)
+        for key in ("SPECIFICATION", "SYMMETRY", "CONSTANT"):
+            self.assertEqual(sections[key], before[key])
+        head = self.CHECK_CFG[:self.CHECK_CFG.index("INVARIANTS\n")]
+        self.assertTrue(out.startswith(head), "everything before the cut sections is kept byte for byte")
+        self.assertTrue(out.endswith("\nINVARIANT B\n"))
+
+    def test_narrowing_to_a_property_and_to_a_last_section(self) -> None:
+        out = run.narrow_config(self.CHECK_CFG, "L")
+        self.assertEqual(run.cfg_sections(out).get("PROPERTY"), ["L"])
+        self.assertNotIn("INVARIANT", run.cfg_sections(out))
+        last = "SPECIFICATION Spec\nINVARIANT A\n"  # the section runs to the end of the text
+        self.assertEqual(run.narrow_config(last, "A"), "SPECIFICATION Spec\nINVARIANT A\n")
+
+    def test_narrowing_to_a_name_the_config_does_not_check_fails(self) -> None:
+        for name in ("Z", "Perms", "Spec"):
+            with self.subTest(name):
+                with self.assertRaises(run.ExpectedError):
+                    run.narrow_config(self.CHECK_CFG, name)
+
+    ZERO_BRANCH = '''
+        [[mutant]]
+        name = "t9-zero"
+        file = "algorithm.txt"
+        old = "a"
+        new = "b"
+        config = "configs/breaklock-posix-plain-check.cfg"
+        expect_zero_branch = "{branch}"
+        '''
+
+    def _write_real(self, body: str) -> Path:
+        """A manifest judged against the REAL model directory: expect_zero_branch names expected.toml's branches."""
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        manifest = Path(holder.name) / "mutants.toml"
+        manifest.write_text(textwrap.dedent(body), encoding="utf-8")
+        return manifest
+
+    def test_a_zero_branch_expectation_names_a_committed_branch(self) -> None:
+        (m,) = run.load_mutants(self._write_real(self.ZERO_BRANCH.format(branch="s240-5-s5-non-record")), run.HERE)
+        self.assertEqual((m.present, m.absent, m.zero_branch), (None, None, "s240-5-s5-non-record"))
+        for body in (self.ZERO_BRANCH.format(branch="no-such-branch"),
+                     self.ZERO_BRANCH.format(branch="s240-5-s5-non-record") + 'expect_absent = "FsOk"\n'):
+            with self.subTest(body=body[-60:]):
+                with self.assertRaises(run.ExpectedError):
+                    run.load_mutants(self._write_real(body), run.HERE)
+
+    def test_judging_a_zero_branch_mutant(self) -> None:
+        m = run.Mutant("t9-zero", "algorithm.txt", "a", "b", "configs/x.cfg", None, None, 60, "arm")
+        ok = run.Outcome(None, frozenset(), 10, ())
+        self.assertTrue(run.judge_zero_branch(m, ok, 0)[0], "a clean run whose arm counts zero: killed")
+        self.assertFalse(run.judge_zero_branch(m, ok, 5)[0], "the arm still ran: survived")
+        killed, detail = run.judge_zero_branch(m, run.Outcome(None, frozenset({"SingleWriter"}), 10, ()), 0)
+        self.assertFalse(killed, "a run that halted has only a prefix: its zero proves nothing")
+        self.assertIn("prefix", detail)
+        for outcome, count in ((run.Outcome("TLC error 1000: boom", frozenset(), None, ()), 0), (ok, None)):
+            killed, detail = run.judge_zero_branch(m, outcome, count)
+            self.assertFalse(killed, "a tooling error or an unreadable arm is never a kill")
+            self.assertIn("tooling", detail)
+
+    def run_mutant_captured(self, name: str) -> tuple[list[str], str]:
+        """run_mutant on a committed mutant with the translator and TLC replaced: the command and the config
+        text TLC would have been given (test audit, cut 6). No TLC runs."""
+        (mutant,) = [m for m in run.load_mutants(run.HERE / "mutants.toml", run.HERE) if m.name == name]
+        seen: list[tuple[list[str], str]] = []
+
+        def translate(cmd, **_kwargs):  # the generated module the translator would write, unmutated
+            Path(cmd[-1]).write_text((run.HERE / "LockProtocol.tla").read_text(encoding="utf-8"), encoding="utf-8")
+            return run.subprocess.CompletedProcess(cmd, 0, "", "")
+
+        class FakeTLC:
+            def __init__(self, cmd, **_kwargs):
+                seen.append((cmd, Path(cmd[cmd.index("-config") + 1]).read_text(encoding="utf-8")))
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        with (mock.patch.object(run, "MUTANTS_OUT", Path(holder.name)),
+              mock.patch.object(run.subprocess, "run", translate),
+              mock.patch.object(run.subprocess, "Popen", FakeTLC)):
+            run.run_mutant(mutant, Path("tla2tools.jar"), run.HERE)
+        (captured,) = seen
+        return captured
+
+    def test_run_mutant_narrows_a_named_expectation_and_not_a_branch_mutant(self) -> None:
+        cmd, cfg = self.run_mutant_captured("t6-no-entries-conjunct")  # expect_absent FsOk, a seeded config
+        self.assertEqual(run.cfg_sections(cfg).get("INVARIANT"), ["FsOk"], "only the absent name is checked")
+        self.assertNotIn("-continue", cmd)
+        cmd, cfg = self.run_mutant_captured("t4-replacedlive-unguarded")  # expect_present ReplacedOnlyDead
+        self.assertEqual(run.cfg_sections(cfg).get("INVARIANT"), ["ReplacedOnlyDead"])
+        self.assertNotIn("-continue", cmd)
+        cmd, cfg = self.run_mutant_captured("p2-non-record-refuses")  # a branch mutant: the whole config
+        original = (run.HERE / "configs" / "breaklock-posix-plain-check.cfg").read_text(encoding="utf-8")
+        self.assertEqual(run.cfg_sections(cfg), run.cfg_sections(original), "a branch mutant is never narrowed")
+        self.assertIn("-coverage", cmd)
+
+    def test_the_committed_manifest_is_valid_against_the_current_sources(self) -> None:
+        mutants = run.load_mutants(run.HERE / "mutants.toml", run.HERE)
+        self.assertTrue(mutants)
+        for m in mutants:
+            with self.subTest(m.name):
+                text = (run.HERE / m.file).read_text(encoding="utf-8").replace("\r\n", "\n")
+                run.apply_mutant(text, m)  # raises if 'old' is stale or ambiguous
 
 
 if __name__ == "__main__":
