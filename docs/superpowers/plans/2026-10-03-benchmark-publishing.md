@@ -719,7 +719,7 @@ class MeasureTests(unittest.TestCase):
             (dst / "extra").write_bytes(b"x")
             self.assertIn("extra", measure.check_copy(expected, dst) or "")
             (dst / "extra").unlink()
-            (dst / "a.bin").write_bytes(b"alphA")
+            (dst / "a.bin").write_bytes(b"alpha!")
             self.assertIn("a.bin", measure.check_copy(expected, dst) or "")
             (dst / "a.bin").unlink()
             self.assertIn("missing", measure.check_copy(expected, dst) or "")
