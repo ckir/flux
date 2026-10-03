@@ -99,7 +99,9 @@ It does not use `hyperfine`, for three reasons:
 
 For each case on a runner:
 
-1. **Generate** the source tree once, from a fixed seed, under the runner's temporary directory.
+1. **Generate** the source tree once, under the runner's temporary directory. File contents are pseudo-random bytes from
+   a fixed seed, so every run copies the same bytes, and no file is compressible or has runs of zeros a filesystem
+   could store sparsely.
 2. **Warm up** (Windows only, which cannot drop its cache): one untimed copy by each tool.
 3. **Time six rounds.** Round `r` runs Flux and every comparator for this OS, in the tool list rotated by `r`. Six is a
    multiple of both tool counts in the starting set (two on Windows, three on Linux and macOS), so each tool holds each
@@ -126,6 +128,7 @@ Each measure job writes one file, `result-<os>.json`, uploaded as its artifact:
   "schema": 1,
   "commit": "<40-hex sha>",
   "run": "<GITHUB_RUN_ID>.<GITHUB_RUN_ATTEMPT>",
+  "source": "<git object ids of HEAD:crates, HEAD:Cargo.toml and HEAD:Cargo.lock, joined by '+'>",
   "date": "<UTC ISO 8601>",
   "os": "linux",
   "image": {"os": "<ImageOS>", "version": "<ImageVersion>"},
@@ -147,8 +150,10 @@ Each measure job writes one file, `result-<os>.json`, uploaded as its artifact:
 `{"schema": 1, "runs": [ ... ]}`, where each run is one such object. It is append-only: a re-run of a commit adds a new
 object and never replaces or edits one, so no measurement is ever lost (a re-run on a newer image, or one where a
 comparator was missing). The page decides what to plot: for each (`commit`, `os`, image version) it plots the run with
-the latest `date`; a run of the same commit on another image version is a separate point, on the far side of the
-image break. `stability.json` is
+the highest `run` (the run id, then the attempt, compared as numbers; dates can tie); a run of the same commit on
+another image version is a separate point, on the far side of the image break. `source` is read by the measure job
+from its own checkout (`git rev-parse HEAD:crates HEAD:Cargo.toml HEAD:Cargo.lock`), so no job needs the repository's
+history to tell whether Flux changed between two runs. `stability.json` is
 `{"schema": 1, "pairs": {"<os>/<case>/<comparator>": {"cv": 0.0, "stable": true, "source": "calibration", "calibrated": "<date>", "image": "<ImageVersion>"}}}`,
 where `source` is `calibration` or `rolling` (see "Noise").
 A reader that meets a `schema` it does not know stops and draws nothing, rather than misreading the fields.
@@ -162,13 +167,16 @@ A reader that meets a `schema` it does not know stops and draws nothing, rather 
   10 ratios. A pair at or below 3% is `stable`, which is enough to show a 10% regression. A pair above it is `unstable`
   and stays off the page until a later calibration passes. Results go to `stability.json`, and the page shows when each
   pair was last calibrated.
+- **A pair is `stable` only on the image it was calibrated on.** A point measured on another `ImageVersion` is
+  recorded but not published (in `latest.svg` or on the trend page) until a calibration on that image marks the pair
+  `stable` again; meanwhile both list it as "not yet calibrated on this image". So a new runner image never publishes
+  an unchecked number.
 - **The gate is re-checked over time,** because 10 parallel jobs measure the spread between machines at one moment,
   not drift over weeks. Calibration runs weekly on a schedule, on `workflow_dispatch`, and from `bench.yml` whenever a
   runner reports an `ImageVersion` that `stability.json` has not seen.
 - **Between calibrations, a rolling check.** After each benchmark, the publish job looks at each `stable` pair's points
   measured AFTER that pair's `calibrated` date, on the calibrated image version, at unchanged Flux source. Unchanged
-  source means the commit changed no file under `crates/`, `Cargo.toml` or `Cargo.lock` since the previous such point,
-  so a real change in Flux is never counted as noise.
+  source means the same `source` value as the latest point, so a real change in Flux is never counted as noise.
   - Fewer than 10 such points: no rolling verdict, and the calibration stands. On a busy branch this can last until the
     next weekly calibration, which still re-checks the pair.
   - At least 10 such points and their coefficient of variation above 3%: the pair is demoted to `unstable`, with
@@ -206,8 +214,8 @@ A reader that meets a `schema` it does not know stops and draws nothing, rather 
   - one block per runner OS, each headed with its OS, its cache (cold or warm) and, on Windows, Defender's state, so a
     Windows row is never read against a Linux row;
   - one row per (case, comparator) that is `stable`, with its ratio;
-  - "Not shown, too noisy to publish:" followed by the pairs that are `unstable` or `failed` in that run, so a missing
-    row is never read as Flux failing;
+  - "Not shown:" followed by each pair left out and why: too noisy (`unstable`), the copy failed its check (`failed`),
+    or not yet calibrated on this image, so a missing row is never read as Flux failing;
   - "Latest benchmark of `main`", the commit's short sha and the run's date.
 - **The site:** `docs.yml` runs on its existing triggers and also on `workflow_run` of `bench.yml`. Before it uploads its
   Pages artifact, it asks whether `bench-data` exists (`git ls-remote --heads origin bench-data`). If it does not
