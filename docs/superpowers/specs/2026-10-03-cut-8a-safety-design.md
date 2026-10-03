@@ -53,6 +53,11 @@ every prior operation ABANDONED and deletes their partials, so a refusal there w
 unchanged. It runs on every run, `--restart` included: a restart may meet a different filesystem under the same
 name. A refusal therefore leaves every prior operation exactly as it was, still resumable.
 
+`open_operation` serves the single-file run too, which spec section 241.5 exempts ("Single-file operations are
+unaffected"). So the probe is a new step of the `Place` trait (`run/place.rs`): the tree's place probes its
+workspace, and the single-file place does nothing. `open_operation` retries when the lock it took over moves
+(`Overwritten::Restart`); the probe runs in the attempt whose record write succeeded, once per run.
+
 **What it does.** The run's section 99 guard runs before its first write, as before every destination mutation.
 1. It stages a temporary in the operation's workspace.
 2. It publishes the temporary onto the fixed name `noreplace-probe` with `DirHandle::rename_no_replace`, the same
@@ -203,8 +208,9 @@ Every rule gets a test that fails under a mutant of the code it guards. The in-m
 - **macOS CI job:** the device-number comparison through the platform test of the new query, against a known
   mount (the system's own `/dev` is a separate mount).
 
-The real-system tests skip with a stated reason where the facility is missing (no sudo, no junction support),
-rather than passing silently.
+Locally, a real-system test skips with a stated reason where the facility is missing (no sudo, no junction
+support). On CI (`CI` set in the environment) a missing facility FAILS the test instead, so a runner change cannot
+turn the job into a permanent silent skip.
 
 ## Out of scope
 
