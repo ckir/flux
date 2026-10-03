@@ -24,6 +24,8 @@ CORRUPT = (
     "b = bytearray(f.read_bytes()); b[0] ^= 1; f.write_bytes(bytes(b))"
 )
 EXIT = "import shutil, sys; shutil.copytree(sys.argv[1], sys.argv[2]); sys.exit(int(sys.argv[3]))"
+# Copies correctly, but only after 3 s: only the timeout can fail it.
+SLOW = "import shutil, sys, time; time.sleep(3); shutil.copytree(sys.argv[1], sys.argv[2])"
 
 
 def tool(name: str, script: str, *extra: str, ok: frozenset[int] = frozenset({0})) -> measure.Tool:
@@ -138,6 +140,26 @@ class MeasureTests(unittest.TestCase):
             self.assertEqual(got["failed"], ["bad", "exit3"])
             self.assertEqual(got["ratio"], {"exit1": 1.0})
             self.assertEqual(len(got["times_s"]["exit1"]), 8, "four tools: eight rounds")
+
+    def test_a_copy_that_does_not_finish_in_time_fails_the_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            src = small_tree(Path(d))
+            fake = Fake({"flux": 1.0, "slow": 1.0})
+            got = measure.measure_case(
+                src,
+                9,
+                [tool("flux", COPY), tool("slow", SLOW)],
+                "windows",
+                Path(d),
+                run=fake.run,
+                clock=fake.clock,
+                free=lambda _: 0,
+                log=lambda _: None,
+                timeout=1.0,
+            )
+            self.assertEqual(got["failed"], ["slow"])
+            self.assertEqual(got["ratio"], {})
+            self.assertEqual(len(got["times_s"]["flux"]), 6, "the other tool is still timed")
 
     def test_a_clone_fails_the_tool_on_a_big_enough_case(self) -> None:
         with tempfile.TemporaryDirectory() as d:

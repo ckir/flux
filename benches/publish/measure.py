@@ -32,6 +32,8 @@ import stats  # noqa: E402
 SCHEMA = 1
 # A case at least this big is checked for a copy that shares blocks with its source (plan decision 4).
 SHARE_MIN = 64 * 1024 * 1024
+# A timed copy still running after this many seconds has hung; the largest case copies 1 GiB.
+COPY_TIMEOUT = 600.0
 
 Runner = Callable[..., subprocess.CompletedProcess]
 
@@ -114,8 +116,10 @@ def measure_case(
     clock: Callable[[], float] = time.perf_counter,
     free: Callable[[Path], int] = _free,
     log: Callable[[str], None] = print,
+    timeout: float = COPY_TIMEOUT,
 ) -> dict:
-    """One case on this runner: the spec's "Measuring" steps 2-5."""
+    """One case on this runner: the spec's "Measuring" steps 2-5. A copy still running after `timeout` seconds is
+    killed and its tool `failed` (capstone r1: a hung tool must not hold the runner)."""
     dst = work / "dst"
     # The source is hashed once per case; each copy is compared against it (plan panel r1).
     expected = tree_digest(src)
@@ -134,7 +138,13 @@ def measure_case(
                 run(argv, check=True)
             before = free(work)
             start = clock()
-            proc = run(t.argv(str(src), str(dst)), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            try:
+                proc = run(
+                    t.argv(str(src), str(dst)), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=timeout
+                )
+            except subprocess.TimeoutExpired:
+                failed[t.name] = f"did not finish within {timeout:g} s"
+                continue
             elapsed = clock() - start
             if proc.returncode not in t.ok_exit_codes:
                 err = (proc.stderr or b"")[-300:].decode("utf-8", "replace")

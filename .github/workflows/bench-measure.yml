@@ -25,6 +25,8 @@ jobs:
   measure:
     name: Measure
     runs-on: ${{ inputs.os }}
+    # A backstop beside measure.py's per-copy timeout: a hung step never holds a runner for GitHub's default 6 hours.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

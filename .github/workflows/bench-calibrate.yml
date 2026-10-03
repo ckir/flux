@@ -10,6 +10,13 @@ on:
 permissions:
   contents: read
 
+# Until the first calibration on a new runner image publishes, every push to main asks for one (bench.yml, via
+# push.sh). This group keeps that to one calibration running and one pending; GitHub replaces an older pending run
+# with the newer one rather than queueing them all.
+concurrency:
+  group: bench-calibrate
+  cancel-in-progress: false
+
 jobs:
   measure:
     strategy:
