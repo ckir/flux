@@ -103,6 +103,17 @@ jobs:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
 
+  bench-harness:
+    # The benchmark harness's own tests (benches/publish/), as models/lockproto's are run in model.yml.
+    name: Bench harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - run: python -W error -m unittest discover -s benches/publish -p "test_*.py"
+
   test:
     # Flux is a filesystem engine: hardlinks, symlinks, sparse files, reflinks and
     # path case-folding all differ per platform, so every OS is a first-class gate.
