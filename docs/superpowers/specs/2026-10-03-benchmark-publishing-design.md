@@ -274,3 +274,7 @@ A reader that meets a `schema` it does not know stops and draws nothing, rather 
   runs, and a rejected push re-fetches and repeats the update.
 - REJECTED (panel r1): "Python 3.14 does not exist yet." Python 3.14 was released in October 2025, and
   `actions/setup-python` installs it.
+- DISCARDED-BELOW-FLOOR (panel r4): after a runner-image change, that OS's rows read "not yet calibrated on this image"
+  until the calibration it triggers finishes. Intended: an unchecked number is never published.
+- DISCARDED-BELOW-FLOOR (panel r4): a change to a test or a doc under `crates/` changes `source`, so the rolling check
+  gathers its 10 points more slowly. The weekly calibration still re-checks every pair.
