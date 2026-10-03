@@ -26,7 +26,7 @@ directory can add files there but never overwrite one. Once 8b lets it replace, 
 
 Each design fork went to agy first; the owner chose. The reasoning lives under "Design record".
 
-1. **Scope:** P, M and A. The case where DEST itself is a same-filesystem bind mount of a source subdirectory is a
+1. **Scope:** P, M and A. The case where DEST or an ancestor of it is a same-filesystem bind mount of a source subdirectory is a
    known limit, recorded and not built (see "Known limits").
 2. **M on finding a mount point:** fail only that subtree and continue, reported as `SAFETY_REJECTED`.
 3. **M's detection:**
@@ -51,11 +51,12 @@ and written the lock record, and before step 6 (`copy_tree_at`). Before that poi
 write into does not exist. After it, the copy has started. It runs on every run, `--restart` included: a restart may
 meet a different filesystem under the same name.
 
-**What it does.**
+**What it does.** The run's section 99 guard runs before its first write, as before every destination mutation.
 1. It stages a temporary in the operation's workspace.
 2. It publishes the temporary onto the fixed name `noreplace-probe` with `DirHandle::rename_no_replace`, the same
    primitive every tree file publishes with.
-3. It removes `noreplace-probe`.
+3. It removes `noreplace-probe`, or, if the publish failed, the staged temporary: the probe removes whatever it
+   wrote.
 
 **Its outcomes:**
 
@@ -64,7 +65,7 @@ meet a different filesystem under the same name.
 | The publish succeeds and the removal succeeds | The run continues. |
 | The publish fails as "primitive unavailable" (the same classification `primitive_unavailable` in `tree.rs` applies at `CopyStep::Publish`) | The run is refused with `NOREPLACE_PUBLISH_UNAVAILABLE` and ends `Ended::RefusedUnchanged`: rollback removes the workspace, the lock, and DEST if this run created it. Exit 3. |
 | The publish fails for any other reason | The run fails with that error, through the run's existing failure path. |
-| The probe's file cannot be removed | A warning naming it. The file goes with the workspace when cleanup removes it. If the run is also being refused, it exits 1 instead of 3 (spec section 55). |
+| What the probe wrote (`noreplace-probe`, or the temporary) cannot be removed | A warning naming it. The file goes with the workspace when cleanup removes it. If the run is also being refused, it exits 1 instead of 3 (spec section 55). |
 
 **`--dry-run`.** Flux has no `--dry-run` today, so the spec's dry-run clause has nothing to attach to. It applies
 when that flag lands, and the probe then writes nothing and reports "unprobed".
@@ -84,8 +85,8 @@ exits 1.
 
 A directory this run created is never checked: it cannot be a mount root.
 
-**The query.** A new `DirHandle` method, answered from the open handle of the child and of its parent. Its three
-answers:
+**The query.** A new `DirHandle` method, answered from the open handle of the child and of its parent. It returns
+an error, reported as that subtree's failure exactly as a failed `open_dir` is, or one of three answers:
 
 - "a mount root";
 - "not a mount root";
@@ -102,7 +103,8 @@ different device number.
 
 **"Cannot tell".** It follows the weak-identity rule that `enter_dir` already applies (`WeakIdentityWarnings`):
 
-- **Default:** a warning that groups every such directory, with a count and the first path; then merge.
+- **Default:** a new warning in the tree's outcome, beside `WeakIdentityWarnings` and rendered the same way: one
+  group with a count and the first path, relative to the source root. Then merge.
 - **`--safety strict`:** the subtree is refused as above.
 
 **The source-root check stays.** The walk's existing check that a destination directory is not the source root,
@@ -127,14 +129,17 @@ does, the run is refused with `SAFETY_REJECTED` before the lock is taken. This h
 | macOS | `fcntl(F_GETPATH)` |
 | Windows | `GetFinalPathNameByHandleW`, which gives both paths in the same form and the same letter case |
 
-The destination anchor is already open in `locate_tree`. The source root is opened for the query and closed after
-it. A new query is added to the platform traits for each.
+The query is asked of the very handle the run then writes through: the anchor handle `locate_tree` opens and hands
+on (DEST, or the holder that creates DEST). A path swapped after the check therefore changes nothing the run
+touches. The source root is opened for the query the way the walk opens it, and closed after it. A new query is
+added to the platform traits for each. On Linux, a `readlink` result ending in `" (deleted)"` means the directory
+was removed; it counts as "any other error" below.
 
 **When the query fails:**
 
 | Failure | Default | `--safety strict` |
 |---|---|---|
-| Unsupported by the filesystem or the system (`ErrorKind::Unsupported`, `ENOSYS`, Windows `ERROR_INVALID_FUNCTION`, `/proc` not mounted) | the lexical floor (which already ran) is the only containment check; a warning says the check was degraded; the run continues | refused with `SAFETY_REJECTED` |
+| Unsupported by the filesystem or the system (`ErrorKind::Unsupported`, `ENOSYS`, Windows `ERROR_INVALID_FUNCTION`, `/proc` not mounted) | the lexical floor (which already ran) is the only containment check; a new warning in the tree's outcome says the containment check was degraded, naming the path whose query failed; the run continues | refused with `SAFETY_REJECTED` |
 | Any other error (access denied, the directory vanished) | the run aborts with that error at the resolve step | the same |
 
 **What does not change.** The lexical floor (`prepare_source`), the identity pre-flight (`preflight`) and the walk's
@@ -144,9 +149,10 @@ dynamic check (`enter_dir`) all stay. Part A adds a check; it removes none.
 
 Each is recorded in `TODO.md` by this cut.
 
-1. **DEST itself is a same-filesystem bind mount of a source subdirectory.** M checks only directories the copy
-   merges into below DEST, and A's canonical paths show the mount's own path, not its target. Refusing every DEST
-   that is a mount root would refuse ordinary targets such as `/mnt/usb`. Detecting this case needs the source
+1. **DEST, or any of its ancestors, is a same-filesystem bind mount of a source subdirectory** (for example DEST
+   `/dst/b/out`, with `/dst/b` a bind mount of `/src/sub`). M checks only directories the copy merges into below
+   DEST, and A's canonical paths show the mount's own path, not its target. Refusing every DEST or ancestor that is
+   a mount root would refuse ordinary targets such as `/mnt/usb`. Detecting this case needs the source
    identities that the memory bound forbids (spec line 997: no in-memory list proportional to the tree).
 2. **Linux without `STATX_ATTR_MOUNT_ROOT`** (kernels before 5.8, or a filesystem that does not report it): a
    same-filesystem bind mount is "cannot tell", so the default warns and merges.
