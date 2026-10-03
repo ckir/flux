@@ -216,7 +216,7 @@ rather than passing silently.
 
 Panel findings rejected, recorded so they are not raised again:
 
-- Round 1 (agy): "`GetFinalPathNameByHandleW`'s `\?\` prefix makes the containment test miss". REJECTED: Part A
+- Round 1 (agy): "`GetFinalPathNameByHandleW`'s `\\?\` prefix makes the containment test miss". REJECTED: Part A
   canonicalises BOTH the source root and the anchor through the same query, so both carry the same prefix; the
   scenario compared a canonical anchor with a raw source path, which the spec never does.
 
