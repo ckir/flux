@@ -2054,11 +2054,32 @@ image), and the trend page bullet in "Where the data lives". Plan decision 7 (th
 </html>
 ```
 
-- [ ] **Step 2: Check it by hand.** In a scratch folder outside the repository, run the Task 5 test data through
-  `publish.py` (any `result-*.json` from `test_publish.py`'s shape), copy `index.html` beside the generated files, and
-  serve the folder with `python -m http.server 8000`. Open `http://localhost:8000/`. Expected: a heading per OS, three
-  charts, a "Not shown" line for each pair that is not calibrated, and no console error. Record what was seen in the
-  report.
+- [ ] **Step 2: Check it by hand,** in a scratch folder OUTSIDE the repository (`$SCRATCH` below), from the repository
+  root:
+
+```bash
+cargo build --release -p flux-cli
+mkdir -p "$SCRATCH/results" "$SCRATCH/data"
+python benches/publish/measure.py --os windows --flux target/release/flux.exe --tiny --work "$SCRATCH/work" \
+  --out "$SCRATCH/results/result-windows.json"
+```
+
+  (On Linux or macOS: `--os linux` or `--os macos`, and `--flux target/release/flux`.) Then:
+
+```bash
+python benches/publish/publish.py bench --data "$SCRATCH/data" --results "$SCRATCH/results" \
+  --calibrate-flag "$SCRATCH/flag"
+cp benches/publish/site/index.html "$SCRATCH/data/"
+python -m http.server 8000 --directory "$SCRATCH/data"
+```
+
+  Open `http://localhost:8000/`. Expected:
+  - one heading for the OS;
+  - three charts, with no points drawn (nothing is calibrated yet);
+  - a "Not shown in the latest run" line naming each pair "not yet calibrated on this image";
+  - no error in the browser console.
+
+  Record what was seen in the report.
 
 - [ ] **Step 3: Commit.**
 
