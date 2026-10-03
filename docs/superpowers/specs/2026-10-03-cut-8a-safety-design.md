@@ -73,7 +73,8 @@ under its lock.
 | The publish succeeds and the removal succeeds | The run continues. |
 | The publish fails as "primitive unavailable" (the same classification `primitive_unavailable` in `tree.rs` applies at `CopyStep::Publish`) | The run is refused with `NOREPLACE_PUBLISH_UNAVAILABLE`. It takes the existing "refused with nothing changed" rollback (`rollback`, `run/mod.rs`): the workspace, the lock record and lock, the control directories it emptied, and DEST if this run created it, are removed again. Exit 3 (section 55: created and removed again does not count as a change). The contract: the stop is a refusal carrying the code `NOREPLACE_PUBLISH_UNAVAILABLE`, with `changed: false` when everything was removed again (exit 3). When the probe's own file could not be removed, `not_removed` names it and `changed` is set to `true`, which exits 1: the pairing `give_back` in `run/session.rs` already uses for a lock it could not remove (`for_stop` reads only `changed`). Today `RunError::Refused`'s `Refusal` carries only a lock code; whether that code widens or a sibling variant is added is the plan's choice. |
 | The publish fails for any other reason | The run fails with that error, through the run's existing failure path. |
-| What the probe wrote (`noreplace-probe`, or the temporary) cannot be removed | A warning naming it. The file goes with the workspace when cleanup removes it. If the run is also being refused, it exits 1 instead of 3 (spec section 55); the report still names `NOREPLACE_PUBLISH_UNAVAILABLE` as the refusal, beside the warning, so the cause is not hidden behind the cleanup failure. |
+| What the probe wrote (`noreplace-probe`, or the temporary) cannot be removed, and the run CONTINUES | A warning naming it. At the run's end the workspace cannot be removed either; that is the existing `RunWarning::NotRemoved`, not a failure (after COMPLETED nothing fails the run). |
+| What the probe wrote cannot be removed, and the run is REFUSED | The rollback runs as above, but its workspace removal is expected to fail on that file (`retire_workspace` removes only the manifest files, so its final `remove_dir` meets a non-empty directory). That failure does NOT become the run's stop: the stop stays the `NOREPLACE_PUBLISH_UNAVAILABLE` refusal, with `changed: true` and `not_removed` naming the probe's file, so it exits 1 (spec section 55) and the report names both the code and the file. The lock record stops naming the workspace first (as `remove_own` already does) and the lock is still released. The workspace is left under its retired `<id>.removing` name, which the section 21.1 scan passes over and leftover cleanup removes later; the control directories are left, since they are not empty. |
 
 **`--dry-run`.** Flux has no `--dry-run` today, so the spec's dry-run clause has nothing to attach to. It applies
 when that flag lands, and the probe then writes nothing and reports "unprobed".
@@ -131,7 +132,8 @@ paths of two directories:
 
 If the anchor equals the source root or lies inside it, compared component by component as `lexically_within`
 does, the run is refused with `SAFETY_REJECTED` before the lock is taken. This holds in every safety mode. The check
-runs inside `locate_tree`, after its existing identity pre-flight (`preflight`) and before it returns.
+runs inside `locate_tree`, on BOTH of its paths: the filesystem-root branch (DEST is a root, `holder` is DEST) and
+the named-DEST branch. On each it runs after that branch's own `preflight` call and before that branch returns.
 
 **How the paths are obtained.** From open handles, never by resolving the path a second time:
 
@@ -200,7 +202,9 @@ Every rule gets a test that fails under a mutant of the code it guards. The in-m
   - a probe that succeeds leaves no `noreplace-probe`;
   - an unavailable primitive refuses with `NOREPLACE_PUBLISH_UNAVAILABLE`, nothing written outside the workspace,
     and rolls back;
-  - a probe file that cannot be removed gives the warning, and exit 1 on a refusal;
+  - a probe file that cannot be removed gives the warning when the run continues; on a refusal it exits 1, the stop
+    is still `NOREPLACE_PUBLISH_UNAVAILABLE` (not a rollback failure), the lock is released and the workspace is
+    left retired;
   - another publish error fails the run;
   - `--restart` probes again, and a refusal there leaves the prior operations un-superseded and resumable.
 - **M:**
