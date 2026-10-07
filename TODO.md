@@ -279,9 +279,26 @@ Recorded by cut 8a (`docs/superpowers/specs/2026-10-03-cut-8a-safety-design.md`,
       a mount root would refuse ordinary targets such as `/mnt/usb`. Detecting this case needs the source
       identities that the memory bound forbids (spec line 997: no in-memory list proportional to the tree).
 - [ ] **Linux without `STATX_ATTR_MOUNT_ROOT`** (kernels before 5.8, or a filesystem that does not report it): a
-      same-filesystem bind mount is "cannot tell", so the default warns and merges.
+      same-filesystem bind mount is "cannot tell", so the default warns and merges. On kernels before 5.8 (the device-number
+      fallback) a btrfs subvolume or other non-mount with a different `st_dev` is reported as a mount root and its
+      subtree skipped (a false positive), not only "cannot tell".
 - [ ] **Source-side mounts** (section 42's walk rule and `--cross-filesystems`) stay with the dedicated mount-boundary
       cut.
+
+## Cut 8a debt
+
+From the final review of cut 8a; none is a reachable defect without a race or privilege.
+
+- [ ] **Part A's source handle is not compared with `src_identity`.** `containment` opens the source with
+      `fs.destination_root(src_root)` and never checks it against the identity `prepare_source` took, so a source
+      path swapped between the two would make Part A check another directory.
+- [ ] **`locate_tree`'s filesystem-root branch opens DEST twice.** It runs `containment` on `holder` but then opens
+      DEST again by path (`fs.destination_root(dst_root)`), so the checked handle and the used handle are two opens.
+- [ ] **POSIX `create_dir` is `mkdirat` then `open_dir(name)`** (`dir_unix.rs`). A mount placed over the new name in
+      that window is merged into unchecked, contradicting "a directory this run created cannot be a mount root".
+- [ ] **An early stop drops the containment warnings.** When the run stops before the copy (for example a probe
+      refusal), `run.copy` is `None`, so `containment_degraded` and the identity warnings set in `locate_tree` are
+      never printed (the tree job in `main.rs`).
 
 ## Scaffolding follow-ups
 
