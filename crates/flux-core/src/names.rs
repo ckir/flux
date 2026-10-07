@@ -189,6 +189,12 @@ mod tests {
         }
     }
 
+    /// The call log with `\\` read as `/`: the fake joins paths with `PathBuf::join`, so on Windows an entry reads
+    /// `metadata(/d\\FILE.TXT)`.
+    fn calls_norm(fs: &FaultFs) -> Vec<String> {
+        fs.calls().into_iter().map(|c| c.replace('\\', "/")).collect()
+    }
+
     fn key(s: &str) -> FluxPathKey {
         FluxPathKey(s.as_bytes().to_vec())
     }
@@ -231,12 +237,12 @@ mod tests {
         let mut idx = NameIndex::for_existing(&d).unwrap();
         assert_eq!(stored(idx.resolve(&d, OsStr::new("file.txt"))), "FILE.TXT");
         assert_eq!(stored(idx.resolve(&d, OsStr::new("other.txt"))), "OTHER.TXT");
-        let count = |p: &str| fs.calls().iter().filter(|c| c.as_str() == p).count();
+        let count = |p: &str| calls_norm(&fs).iter().filter(|c| c.as_str() == p).count();
         // Each listing entry is stat-ed once for the table; the planned names are stat-ed once per resolution
         // (the case-insensitive fake logs the normalized stored spelling for both).
         assert_eq!(count("metadata(/d/FILE.TXT)"), 2); // table + planned `file.txt`
         assert_eq!(count("metadata(/d/OTHER.TXT)"), 2); // table + planned `other.txt`
-        assert_eq!(fs.calls().iter().filter(|c| c.starts_with("read_dir(")).count(), 1);
+        assert_eq!(calls_norm(&fs).iter().filter(|c| c.starts_with("read_dir(")).count(), 1);
     }
 
     #[test]
@@ -317,7 +323,7 @@ mod tests {
         let fs = fs_with(&[]);
         let idx = NameIndex::for_new_dir();
         assert!(idx.listing.is_empty());
-        assert!(fs.calls().iter().all(|c| !c.starts_with("read_dir(")));
+        assert!(calls_norm(&fs).iter().all(|c| !c.starts_with("read_dir(")));
     }
 
     #[test]
@@ -358,7 +364,7 @@ mod tests {
         let before = fs.calls().len(); // the fixture's own create_dir / read_dir are not under test
         idx.resolve(&d, OsStr::new("file.txt")).unwrap().unwrap();
         idx.resolve(&d, OsStr::new("nope")).unwrap().unwrap();
-        let calls = fs.calls().split_off(before);
+        let calls = calls_norm(&fs).split_off(before);
         assert!(!calls.is_empty());
         assert!(calls.iter().all(|c| c.starts_with("metadata(")), "{calls:?}");
         assert_eq!(fs.read_file("/d/FILE.TXT"), Some(b"x".to_vec()));
