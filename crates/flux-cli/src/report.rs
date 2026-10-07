@@ -73,6 +73,9 @@ impl Report {
         r.files_overwritten = out.files_overwritten;
         r.bytes_skipped = out.bytes_skipped;
         r.files_degraded = out.files_degraded;
+        // Only `copy` and `symlink` are failed FILES. A `ClaimNotRecorded` failure is counted in
+        // `FailureTally::total()` (so in `errors`) and in `claim_not_recorded`, but not here: the file was published
+        // and counted as copied.
         r.files_failed = out.failures.copy + out.failures.symlink;
         r.bytes_total = out.bytes_copied;
         r.bytes_copied = out.bytes_copied;
@@ -429,6 +432,15 @@ mod tests {
             (0, 0, 0, 0)
         );
         assert_eq!(Report::tree(&out, true, 10).errors, 5, "an abort counts as one");
+    }
+
+    #[test]
+    fn a_claim_not_recorded_failure_is_not_a_failed_file() {
+        let mut out = TreeOutcome::default();
+        out.failures.claim_not_recorded = 1;
+        let r = Report::tree(&out, false, 10);
+        assert_eq!(r.files_failed, 0);
+        assert_eq!(r.errors, 1);
     }
 
     #[test]

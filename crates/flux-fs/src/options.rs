@@ -65,7 +65,8 @@ pub enum Safety {
 pub enum ExistingPolicy {
     /// Replace it (the default).
     Overwrite,
-    /// Replace it only when the source is newer.
+    /// Replace it when the source is newer or the size differs; when either
+    /// modification time is unavailable, compare sizes only; equal: keep it.
     Update,
     /// Leave it untouched.
     SkipExisting,

@@ -164,7 +164,15 @@ fn a_killed_run_leaves_the_claims_up_to_the_last_sync() {
     let tx = db.begin_read().unwrap();
     let claims = tx.open_table(TableDefinition::<&[u8], &[u8]>::new("claims")).unwrap();
     let count = claims.len().unwrap() as usize;
-    assert!((1..=FILES).contains(&count), "claims survived: {count}");
+    // Lower bound: each directory holds FILES / 3 = 100 replaced files, so the first directory keyed 100 claims, and
+    // its DirEnd flush (a synced commit) ran before the stall at the 500th guarded mutation (300 mutations for the
+    // first directory, the 500th is inside the second). Upper bound: the second directory's claims are unsynced and
+    // may be lost, but never more than all FILES exist.
+    assert!(
+        (FILES / 3..=FILES).contains(&count),
+        "claims survived: {count}, want at least the first directory's {}",
+        FILES / 3
+    );
     let mut seen = std::collections::BTreeSet::new();
     for row in claims.iter().unwrap() {
         let (k, v) = row.unwrap();

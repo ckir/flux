@@ -27,7 +27,8 @@ enum Commands {
     ///
     /// What happens to a file that already exists at DEST is chosen by one of
     /// --overwrite (the default: replace it), --update (replace it when the source is
-    /// newer or the size differs) or --skip-existing (leave it untouched); at most one
+    /// newer or the size differs; when either modification time is unavailable, only
+    /// the sizes are compared, and equal sizes keep the file) or --skip-existing (leave it untouched); at most one
     /// may be given. A skipped file is not a failure. A symlink given as SOURCE is not
     /// followed. Several sources are not supported yet.
     Copy(CopyArgs),

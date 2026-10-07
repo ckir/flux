@@ -28,6 +28,18 @@ fn real_store_passes_the_conformance_suite_strict() {
 }
 
 #[test]
+fn strict_durability_never_accumulates_unsynced_commits() {
+    let mut s = fresh(Durability::Strict);
+    let parent = ObjectId { volume: 1, index: 1 };
+    for i in 0u32..5 {
+        let key = ClaimKey::new(parent, OsStr::new(&format!("k{i}")));
+        let rec = ClaimRecord { target: FluxPathKey(b"t".to_vec()), status: ClaimStatus::Existing };
+        s.insert_if_absent(&key, &rec).unwrap();
+        assert_eq!(s.unsynced(), 0);
+    }
+}
+
+#[test]
 fn the_cap_syncs_every_1000_unsynced_commits() {
     let mut s = fresh(Durability::Normal);
     let parent = ObjectId { volume: 1, index: 1 };

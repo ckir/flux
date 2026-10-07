@@ -14,6 +14,9 @@ pub struct FluxPathKey(pub Vec<u8>);
 impl FluxPathKey {
     /// An empty path is the empty key; a component containing 0x00 is
     /// `Code::DestinationError`.
+    ///
+    /// Callers must pass a normalized relative path: ParentDir, RootDir and Prefix
+    /// components are dropped, not rejected.
     pub fn from_relative(rel: &Path) -> Result<Self> {
         let mut out = Vec::new();
         let mut first = true;
@@ -286,6 +289,13 @@ mod tests {
         assert_eq!(FluxPathKey::from_relative(Path::new("a/b/c")).unwrap().0, b"a\0b\0c");
         assert_eq!(FluxPathKey::from_relative(Path::new("")).unwrap().0, Vec::<u8>::new());
         assert_eq!(FluxPathKey::from_relative(Path::new("./a")).unwrap().0, b"a");
+    }
+
+    #[test]
+    fn flux_path_key_rejects_a_component_containing_nul() {
+        let p = std::path::PathBuf::from(std::ffi::OsString::from("a\0b"));
+        let err = FluxPathKey::from_relative(&p).unwrap_err();
+        assert_eq!(err.code, Code::DestinationError);
     }
 
     #[test]

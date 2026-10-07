@@ -17,6 +17,9 @@ pub(crate) struct NameIndex {
     owners: HashMap<OsString, FluxPathKey>,
     /// Publications recorded while `table` is `None`, replayed over the table when it is built.
     pending: Vec<Pending>,
+    /// The `stored` arguments of the publications, in the order they were recorded: the spellings the directory
+    /// held BEFORE this run replaced them, which is what a later resolution should answer with.
+    learned: Vec<OsString>,
 }
 
 struct Pending {
@@ -57,7 +60,13 @@ fn add_spellings(
 impl NameIndex {
     /// A directory this run created: empty listing; `resolve` is not used for it (decision 6).
     pub(crate) fn for_new_dir() -> Self {
-        Self { listing: BTreeSet::new(), table: None, owners: HashMap::new(), pending: Vec::new() }
+        Self {
+            listing: BTreeSet::new(),
+            table: None,
+            owners: HashMap::new(),
+            pending: Vec::new(),
+            learned: Vec::new(),
+        }
     }
 
     /// A pre-existing directory: reads `dir.read_dir()` once.
@@ -67,6 +76,13 @@ impl NameIndex {
         Ok(index)
     }
 
+    /// The stored spelling of `planned`, or `Absent`.
+    ///
+    /// An exact listing hit whose entry vanished before the stat returns the OUTER `Err(NotFound)`, not `Absent`
+    /// (intended: the listing said it exists, so a disappearance is a fault of the run, not an absent name).
+    ///
+    /// When several spellings of one object belong to the same target the answer is order-independent: the spelling
+    /// learned FIRST from a publication's `stored` argument if any, else the lexicographically smallest.
     pub(crate) fn resolve<D: DirHandle>(
         &mut self,
         dir: &D,
@@ -89,15 +105,22 @@ impl NameIndex {
             Some(s) if !s.is_empty() => s,
             _ => return Ok(Err(NameError::Unresolvable)),
         };
-        let first = &spellings[0];
+        // Independent of the order the spellings were learned in (that depends on whether the table was built before
+        // or after a publication): the first publication-`stored` spelling, else the lexicographically smallest.
+        let chosen = self
+            .learned
+            .iter()
+            .find(|l| spellings.contains(l))
+            .or_else(|| spellings.iter().min())
+            .expect("spellings is non-empty");
         if spellings.len() > 1 {
             // Several spellings are ONE entry only when this run wrote every one of them for the same target.
-            let owner = self.owners.get(first);
+            let owner = self.owners.get(chosen);
             if owner.is_none() || spellings.iter().any(|s| self.owners.get(s) != owner) {
                 return Ok(Err(NameError::Unresolvable));
             }
         }
-        Ok(Ok(Resolved::Entry { stored: first.clone(), meta }))
+        Ok(Ok(Resolved::Entry { stored: chosen.clone(), meta }))
     }
 
     /// Stat every listing entry once per directory. A failed build is not remembered, so the next call retries.
@@ -147,6 +170,9 @@ impl NameIndex {
     ) {
         let mut spellings = Vec::with_capacity(2);
         if let Some(s) = stored {
+            if !self.learned.iter().any(|l| l == s) {
+                self.learned.push(s.to_os_string());
+            }
             spellings.push(s.to_os_string());
         }
         if !spellings.iter().any(|s| s == planned) {
@@ -189,8 +215,8 @@ mod tests {
         }
     }
 
-    /// The call log with `\\` read as `/`: the fake joins paths with `PathBuf::join`, so on Windows an entry reads
-    /// `metadata(/d\\FILE.TXT)`.
+    /// The call log with `\` read as `/`: the fake joins paths with `PathBuf::join`, so on Windows an entry reads
+    /// `metadata(/d\FILE.TXT)`.
     fn calls_norm(fs: &FaultFs) -> Vec<String> {
         fs.calls().into_iter().map(|c| c.replace('\\', "/")).collect()
     }
@@ -368,5 +394,48 @@ mod tests {
         assert!(!calls.is_empty());
         assert!(calls.iter().all(|c| c.starts_with("metadata(")), "{calls:?}");
         assert_eq!(fs.read_file("/d/FILE.TXT"), Some(b"x".to_vec()));
+    }
+
+    #[test]
+    fn a_weak_planned_entry_is_unresolvable_even_when_a_strong_listing_entry_shares_its_object_id()
+    {
+        let fs = fs_with(&["a.txt"]);
+        let id = strong(&fs, "/d/a.txt");
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let mut idx = NameIndex::for_existing(&d).unwrap();
+        // Created after the listing was read: not in the listing, so it is resolved by identity - and its Weak
+        // identity names the same object id as the Strong listing entry.
+        fs.write_file("/d/late.txt", b"x");
+        fs.set_identity("/d/late.txt", FileIdentity::Weak(id));
+        assert_eq!(idx.resolve(&d, OsStr::new("late.txt")).unwrap(), Err(NameError::Unresolvable));
+    }
+
+    #[test]
+    fn the_stored_spelling_does_not_depend_on_whether_the_table_was_built_before_the_publication() {
+        let publish = |idx: &mut NameIndex, id: ObjectId| {
+            idx.record_publication(
+                &key("t"),
+                Some(OsStr::new("file.txt")),
+                OsStr::new("File.txt"),
+                None,
+                FileIdentity::Strong(id),
+            );
+        };
+        // Built before: resolve once (by identity, via a third spelling) to build the table, then publish.
+        let fs = fs_with(&["file.txt"]);
+        let id = strong(&fs, "/d/file.txt");
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let mut before = NameIndex::for_existing(&d).unwrap();
+        assert_eq!(stored(before.resolve(&d, OsStr::new("FILE.TXT"))), "file.txt");
+        publish(&mut before, id);
+        // Built after: publish first; the lazy build then sees both spellings in the listing.
+        let mut after = NameIndex::for_existing(&d).unwrap();
+        publish(&mut after, id);
+        let (a, b) = (
+            stored(before.resolve(&d, OsStr::new("FILE.txt"))),
+            stored(after.resolve(&d, OsStr::new("FILE.txt"))),
+        );
+        assert_eq!(a, "file.txt");
+        assert_eq!(a, b);
     }
 }

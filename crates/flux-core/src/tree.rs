@@ -119,7 +119,8 @@ pub enum TreeFailureCause {
     /// Published with complaints, which exits 1 like the single-file case.
     PublishedWithComplaints(Vec<MetadataFailure>),
     /// The file IS published and counted; its claim was not recorded (for a directory flush failure the
-    /// path is the directory).
+    /// path is the directory). Counted in `FailureTally::total()` and `claim_not_recorded` but NOT in the report's
+    /// `files_failed`, because the file was published and counted as copied.
     ClaimNotRecorded(FsError),
 }
 
@@ -527,7 +528,9 @@ fn walk_into<F: DestinationRoot>(
                 {
                     (cx.beat)().map_err(|e| CopyError::at(CopyStep::Heartbeat, e))?;
                     (cx.guard)().map_err(|e| CopyError::at(CopyStep::Create, e))?;
-                    if let Err(e) = claims.borrow_mut().flush() {
+                    // Held in a local so the `RefMut` is dropped before the report callback runs.
+                    let r = claims.borrow_mut().flush();
+                    if let Err(e) = r {
                         report(out, on_report, path, TreeFailureCause::ClaimNotRecorded(e));
                     }
                 }
@@ -781,7 +784,7 @@ fn copy_one<F: DestinationRoot>(
             cx.beat,
             &no_before_create,
         );
-        return finish_copy(cx, path, published, out, on_report);
+        return finish_copy(path, published, out, on_report);
     };
     let target = match FluxPathKey::from_relative(&path) {
         Ok(t) => t,
@@ -878,7 +881,7 @@ fn copy_one<F: DestinationRoot>(
                 Ok(o) => Some(o.published_identity),
                 Err(_) => None,
             };
-            finish_copy(cx, path.clone(), result, out, on_report)?;
+            finish_copy(path.clone(), result, out, on_report)?;
             if let Some(identity) = published {
                 let recorded = record_claim(
                     claims,
@@ -933,7 +936,7 @@ fn copy_one<F: DestinationRoot>(
                 Ok(o) => Some(o.published_identity),
                 Err(_) => None,
             };
-            finish_copy(cx, path.clone(), result, out, on_report)?;
+            finish_copy(path.clone(), result, out, on_report)?;
             if let Some(identity) = published {
                 out.files_overwritten += 1;
                 // The entry now holds the new object under its stored name (and, on some systems, the planned one).
@@ -979,8 +982,7 @@ fn record_claim<C: ClaimStore>(
 
 /// Count what `copy_file_guarded` did for one target, or report and map its failure. `Err` only when the whole
 /// operation must stop.
-fn finish_copy<F: DestinationRoot>(
-    _cx: &Shared<'_, F>,
+fn finish_copy(
     path: PathBuf,
     result: std::result::Result<flux_fs::Outcome, CopyError>,
     out: &mut TreeOutcome,
@@ -988,6 +990,7 @@ fn finish_copy<F: DestinationRoot>(
 ) -> std::result::Result<(), CopyError> {
     match result {
         Ok(o) => {
+            debug_assert!(!o.skipped, "the tree never lets the copy path skip");
             out.files_copied += 1;
             out.bytes_copied += o.bytes_copied;
             if let Some(weaker) = o.identity_degraded {

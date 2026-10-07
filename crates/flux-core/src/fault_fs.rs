@@ -783,6 +783,11 @@ impl FaultFs {
     /// `create_new`, `create_dir`, `rename_*` (both paths), `remove_file` and `read_dir` has each component replaced by the
     /// STORED spelling of an existing sibling that matches it case-insensitively. Default false. The `DirHandle`
     /// operations delegate to those methods, so they follow the mode too. The call log shows the NORMALIZED path.
+    ///
+    /// NOT normalized (they take the spelling asked for): `read_file`, `remove_dir`, `create_lock`, `open_lock`,
+    /// `create_claim_store`, the path-level `open_read`, and the test helpers `write_file`, `read_file` and `exists`.
+    /// The folding is ASCII-only. `stored()` is UNSPECIFIED, not deterministic across runs, when two existing entries
+    /// differ only by case and neither equals the requested spelling (the maps it scans have no order).
     pub fn set_case_insensitive(&self, on: bool) {
         self.inner.lock().unwrap().case_insensitive = on;
     }
@@ -2699,5 +2704,41 @@ mod tests {
             assert_eq!(names(&fs, "/d"), vec![want]);
             assert_eq!(fs.read_file(format!("/d/{want}")), Some(b"new".to_vec()));
         }
+    }
+
+    #[test]
+    fn remove_file_under_another_case_removes_the_stored_entry() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        // Path level.
+        let fs = ci_fs();
+        fs.set_case_insensitive(true);
+        fs.remove_file(Path::new("/d/FILE.TXT")).unwrap();
+        assert!(names(&fs, "/d").is_empty());
+        assert!(called_norm(&fs, "remove_file(/d/file.txt)"));
+        // Through a handle: a file ...
+        let fs = ci_fs();
+        fs.set_case_insensitive(true);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        d.remove_file(OsStr::new("FILE.TXT")).unwrap();
+        assert!(names(&fs, "/d").is_empty());
+        // ... and a directory stored under another spelling is still refused as a directory.
+        let fs = ci_fs();
+        fs.create_dir(Path::new("/d/Sub")).unwrap();
+        fs.set_case_insensitive(true);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let e = d.remove_file(OsStr::new("SUB")).unwrap_err();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::IsADirectory);
+    }
+
+    #[test]
+    fn open_dir_under_another_case_opens_the_stored_directory() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        let fs = ci_fs();
+        fs.create_dir(Path::new("/d/Sub")).unwrap();
+        fs.set_case_insensitive(true);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let sub = d.open_dir(OsStr::new("SUB")).unwrap();
+        let canon = sub.canonical_path().unwrap();
+        assert_eq!(canon.to_string_lossy().replace('\\', "/"), "/d/Sub");
     }
 }

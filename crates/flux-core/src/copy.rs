@@ -429,7 +429,16 @@ pub fn copy_file_at<F: DestinationRoot>(
 /// `beat` runs immediately before each of those guard calls except the removal's, and after every 64 KiB written (cut
 /// 7b). Its failure is `CopyStep::Heartbeat`: before the create it creates nothing; after it, the temporary is removed
 /// as for any other failure.
-// Eight parameters: the signature is the cut 8b plan's contract (guard, beat, before_create arrive together).
+///
+/// `before_create` (cut 8b) is called exactly once per copy that reaches the create: after the heartbeat and guard that
+/// precede the exclusive create, and before the temporary exists. Its error stops the copy there, creating nothing.
+/// A copy that is refused by the gate or skipped by the policy never calls it.
+///
+/// Step 2b is the existing-destination policy decision, taken after the identity gate (which already refused a
+/// directory at the name): `Overwrite` proceeds, `SkipExisting` returns a skipped outcome changing nothing on disk,
+/// and `Update` proceeds when the source is newer or the sizes differ (sizes alone when either time is unavailable).
+///
+/// Eight parameters: the signature is the cut 8b plan's contract (guard, beat, before_create arrive together).
 #[allow(clippy::too_many_arguments)]
 pub fn copy_file_guarded<F: DestinationRoot>(
     fs: &F,
@@ -1851,6 +1860,45 @@ mod tests {
             let want = if replaced { sb } else { db };
             assert_eq!(fs.read_file("/dst").as_deref(), Some(want), "case {i}");
             assert_eq!(fs.called("create_new(/dst.flux-partial"), replaced, "case {i}");
+        }
+    }
+
+    #[test]
+    fn skip_existing_over_an_existing_directory_is_refused_by_the_gate_not_skipped() {
+        directory_at_the_destination_is_refused(flux_fs::ExistingPolicy::SkipExisting);
+    }
+
+    #[test]
+    fn update_over_an_existing_directory_is_refused_by_the_gate_not_skipped() {
+        directory_at_the_destination_is_refused(flux_fs::ExistingPolicy::Update);
+    }
+
+    fn directory_at_the_destination_is_refused(policy: flux_fs::ExistingPolicy) {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.create_dir(Path::new("/dst")).unwrap();
+        let mut o = opts();
+        o.existing = policy;
+        let err = guarded_with(&fs, &o, &no_before_create).unwrap_err();
+        assert_eq!(err.code(), flux_fs::Code::SafetyRejected);
+        assert!(err.to_string().contains("directory"), "names the reason: {err}");
+        assert!(!fs.called("create_new"), "{:?}", fs.calls());
+    }
+
+    #[test]
+    fn update_replaces_when_an_mtime_is_unavailable_and_the_sizes_differ() {
+        let mut o = opts();
+        o.existing = flux_fs::ExistingPolicy::Update;
+        // (source time, destination time): each side unavailable in turn, then both.
+        for (i, (st, dt)) in
+            [(None, at_secs(10)), (at_secs(10), None), (None, None)].into_iter().enumerate()
+        {
+            let fs = FaultFs::new();
+            put(&fs, "/src", b"new!", st);
+            put(&fs, "/dst", b"old", dt);
+            let out = guarded_with(&fs, &o, &no_before_create).unwrap();
+            assert!(!out.skipped, "case {i}");
+            assert_eq!(fs.read_file("/dst").as_deref(), Some(&b"new!"[..]), "case {i}");
         }
     }
 }

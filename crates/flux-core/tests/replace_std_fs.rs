@@ -202,28 +202,37 @@ mod linux_vfat {
         let f = std::fs::File::create(image).unwrap();
         f.set_len(16 * 1024 * 1024).unwrap();
         drop(f);
+        // Each attempt's stderr (or its spawn error) is kept, so a CI failure says why.
+        let mut mkfs_log = String::new();
         let made = ["mkfs.vfat", "/usr/sbin/mkfs.vfat", "/sbin/mkfs.vfat"].iter().any(|bin| {
-            Command::new(bin)
-                .arg(image)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
+            match Command::new(bin).arg(image).output() {
+                Ok(o) if o.status.success() => true,
+                Ok(o) => {
+                    mkfs_log.push_str(&format!("{bin}: {}\n", String::from_utf8_lossy(&o.stderr)));
+                    false
+                }
+                Err(e) => {
+                    mkfs_log.push_str(&format!("{bin}: {e}\n"));
+                    false
+                }
+            }
         });
         if !made {
-            return fail("`mkfs.vfat` (dosfstools) is missing");
+            return fail(&format!("`mkfs.vfat` (dosfstools) is missing or failed:\n{mkfs_log}"));
         }
-        let ok = Command::new("sudo")
+        let mount_log = match Command::new("sudo")
             .args(["-n", "mount", "-o"])
             .arg(format!("loop,uid={},gid={}", id("-u"), id("-g")))
             .arg(image)
             .arg(at)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !ok {
-            return fail("passwordless `sudo -n mount -o loop`");
+            .output()
+        {
+            Ok(o) if o.status.success() => None,
+            Ok(o) => Some(String::from_utf8_lossy(&o.stderr).into_owned()),
+            Err(e) => Some(e.to_string()),
+        };
+        if let Some(log) = mount_log {
+            return fail(&format!("passwordless `sudo -n mount -o loop`:\n{log}"));
         }
         Some(Mounted(at.to_path_buf()))
     }
