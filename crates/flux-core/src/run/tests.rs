@@ -2345,6 +2345,48 @@ fn a_fold_in_a_destination_the_run_created_is_refused_by_the_no_replace_rename_e
     );
 }
 
+/// Case-folding sources `File.txt` / `file.txt` and a DEST that ALREADY EXISTED (empty), with the first claim failing.
+fn fold_into_existing() -> FaultFs {
+    let fs = FaultFs::new();
+    for d in ["/src", "/p", "/p/dest"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    fs.write_file("/src/File.txt", b"upper");
+    fs.write_file("/src/file.txt", b"lower");
+    fs.set_case_insensitive(true);
+    fs.fail_nth("claim_insert", 1, Code::IoError, std::io::ErrorKind::Other);
+    fs
+}
+
+fn assert_existing_fold_refused(fs: &FaultFs) {
+    let (r, got) = run_tree(fs, &cfg());
+    let out = ok(&r);
+    assert_fold_refused_by_no_replace(&got, out, "File.txt", "file.txt");
+    assert_eq!(
+        fs.read_file("/p/dest/File.txt").as_deref(),
+        Some(&b"upper"[..]),
+        "the FIRST source's content"
+    );
+    assert!(
+        !calls(fs).iter().any(|x| x.starts_with("rename_replace(/p/dest/File")
+            || x.starts_with("rename_replace(/p/dest/file")),
+        "no replacing rename: {:?}",
+        calls(fs)
+    );
+}
+
+#[test]
+fn a_fold_in_a_pre_existing_directory_is_refused_even_when_the_first_claim_failed() {
+    assert_existing_fold_refused(&fold_into_existing());
+}
+
+#[test]
+fn a_fold_in_a_pre_existing_directory_is_refused_even_when_the_first_claim_failed_windows_style() {
+    let fs = fold_into_existing();
+    fs.set_replace_renames(true);
+    assert_existing_fold_refused(&fs);
+}
+
 // Cut 8b Task 11: the directory-end flush and the final sync. Each test is red under the one-line mutant named in its
 // comment.
 

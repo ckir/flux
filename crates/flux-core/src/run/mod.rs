@@ -272,9 +272,10 @@ pub fn tree<F: DestinationRoot>(
         Err(a) if a.refused_unchanged() => Ended::RefusedUnchanged,
         Err(_) => Ended::Failed,
     };
-    // Cut 8b, "Claim syncing", the final sync: the claims written since the last directory end, only when the
-    // workspace is KEPT. Never on a clean completion (the file is unlinked right after), a refusal (the workspace is
-    // removed) or a lost lock (no ownership: no write).
+    // Cut 8b, "Claim syncing", the explicit final sync: the claims written since the last directory end, only when the
+    // workspace is KEPT. NOTE: closing the redb store below is itself a commit and an fsync of `state.db` on EVERY
+    // path (clean completion, refusal and lost lock included), and under `Normal` it makes earlier `None` commits
+    // durable. Harmless (it is this run's own workspace file) but not avoidable: redb has no non-committing close.
     if let Some(claims) = &claims {
         match &ended {
             // Best effort: the heartbeat intact and ownership held; its error never replaces the primary one.

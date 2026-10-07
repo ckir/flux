@@ -19,7 +19,9 @@ pub(crate) struct NameIndex {
     pending: Vec<Pending>,
     /// The `stored` arguments of the publications, in the order they were recorded: the spellings the directory
     /// held BEFORE this run replaced them, which is what a later resolution should answer with.
-    learned: Vec<OsString>,
+    learned: HashMap<OsString, u64>,
+    /// The next sequence number for `learned`.
+    next_seq: u64,
 }
 
 struct Pending {
@@ -65,7 +67,8 @@ impl NameIndex {
             table: None,
             owners: HashMap::new(),
             pending: Vec::new(),
-            learned: Vec::new(),
+            learned: HashMap::new(),
+            next_seq: 0,
         }
     }
 
@@ -74,6 +77,11 @@ impl NameIndex {
         let mut index = Self::for_new_dir();
         index.listing = dir.read_dir()?.into_iter().map(|e| e.name).collect();
         Ok(index)
+    }
+
+    /// The target of this run that wrote `spelling`, if any.
+    pub(crate) fn owner(&self, spelling: &OsStr) -> Option<&FluxPathKey> {
+        self.owners.get(spelling)
     }
 
     /// The stored spelling of `planned`, or `Absent`.
@@ -107,10 +115,11 @@ impl NameIndex {
         };
         // Independent of the order the spellings were learned in (that depends on whether the table was built before
         // or after a publication): the first publication-`stored` spelling, else the lexicographically smallest.
-        let chosen = self
-            .learned
+        let chosen = spellings
             .iter()
-            .find(|l| spellings.contains(l))
+            .filter_map(|s| self.learned.get(s).map(|seq| (seq, s)))
+            .min()
+            .map(|(_, s)| s)
             .or_else(|| spellings.iter().min())
             .expect("spellings is non-empty");
         if spellings.len() > 1 {
@@ -170,8 +179,9 @@ impl NameIndex {
     ) {
         let mut spellings = Vec::with_capacity(2);
         if let Some(s) = stored {
-            if !self.learned.iter().any(|l| l == s) {
-                self.learned.push(s.to_os_string());
+            if !self.learned.contains_key(s) {
+                self.learned.insert(s.to_os_string(), self.next_seq);
+                self.next_seq += 1;
             }
             spellings.push(s.to_os_string());
         }
@@ -437,5 +447,43 @@ mod tests {
         );
         assert_eq!(a, "file.txt");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn learned_spellings_are_deduplicated_and_sequenced_so_resolution_scans_only_the_candidates() {
+        // A wall-clock assertion would be flaky, so the O(1) property is pinned structurally: each spelling is
+        // inserted once with a sequence number, a repeat does not grow the map, and the choice among a handful of
+        // candidate spellings never walks the 20_000 learned entries.
+        let fs = fs_with(&["file.txt"]);
+        let id = strong(&fs, "/d/file.txt");
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let mut idx = NameIndex::for_existing(&d).unwrap();
+        for i in 0..20_000 {
+            let s = format!("other{i}");
+            idx.record_publication(
+                &key(&s),
+                Some(OsStr::new(&s)),
+                OsStr::new(&s),
+                None,
+                FileIdentity::Unavailable,
+            );
+        }
+        idx.record_publication(
+            &key("t"),
+            Some(OsStr::new("file.txt")),
+            OsStr::new("File.txt"),
+            None,
+            FileIdentity::Strong(id),
+        );
+        idx.record_publication(
+            &key("t"),
+            Some(OsStr::new("file.txt")),
+            OsStr::new("File.txt"),
+            None,
+            FileIdentity::Strong(id),
+        );
+        assert_eq!(idx.learned.len(), 20_001);
+        assert_eq!(idx.next_seq, 20_001);
+        assert_eq!(stored(idx.resolve(&d, OsStr::new("FILE.txt"))), "file.txt");
     }
 }

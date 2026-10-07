@@ -335,9 +335,20 @@ are the spec's).
       Required outcome: a per-target result, never a traversal of the junction.
 - [ ] **8. A hardlink alias on a case-insensitive destination:** an alias of an existing entry in the same directory
       makes the alias's target fail rather than replace (no unique identity match).
+- [ ] **9. Closing the claim store always commits:** `redb` 4.3.0 `Database::drop` is an `Immediate` write commit plus
+      a header fsync, so `state.db` is written and synced once on every path, including `Lost` (a write without
+      ownership, though only to this run's own workspace file) and a clean `Completed`; the spec's "never on a clean
+      `Completed` / `Lost`" covers only the explicit final sync. A non-committing close needs `redb` support or a
+      different backend.
+- [ ] **10. A FIFO, device or other special file at a destination name** is replaced like a regular file by a
+      replacement (spec section 4 is silent). A later cut may refine it.
+- [ ] **11. In a weak-identity destination directory `--skip-existing`** reports existing files as collisions (exit 1)
+      instead of skipping, as the spec text says. A later cut may refine it.
 
 ## Cut 8b debt
 
+- [ ] **Closing the redb claim store always commits** (known limit 9): a non-committing close needs `redb` support or
+      a different backend; the `Lost`-path close is a write without ownership.
 - [ ] **Propose the section 241.5 clarifications to the spec owner.** Cut 8b made these choices where the spec is
       silent: the claim key is the parent directory's identity plus the stored entry name; a claim is never released; a
       claim is written before the temporary is created and after the section 129 gate; a published new entry gets a

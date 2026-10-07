@@ -824,6 +824,20 @@ fn copy_one<F: DestinationRoot>(
         Ok(Ok(Resolved::Absent)) => Plan::New,
         // 4. An existing entry.
         Ok(Ok(Resolved::Entry { stored, meta })) => {
+            // §241.5: an entry another target of this run already published (even if its claim was not recorded)
+            // is that target's. Refused before any policy decision, without consulting or writing the store.
+            if names.owner(&stored).is_some_and(|t| t != &target) {
+                let e = CopyError::at(
+                    CopyStep::Claim,
+                    FsError::new(
+                        Code::DestinationNamespaceCollision,
+                        std::io::Error::other(
+                            "another target of this operation already wrote that destination entry",
+                        ),
+                    ),
+                );
+                return finish_copy(path, Err(e), out, on_report);
+            }
             if meta.file_type == FileType::Dir {
                 let cause = target_failure(
                     CopyStep::Gate,
