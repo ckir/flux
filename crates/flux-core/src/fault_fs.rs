@@ -343,6 +343,16 @@ fn move_object(g: &mut Inner, from: &Path, to: &Path) {
             g.perms.remove(to);
         }
     }
+    // The type is the object's too: a regular file renamed over a symlink leaves a regular file at the name, not the
+    // link (cut 8b: a symlink at the destination is replaced as a link).
+    match g.types.remove(from) {
+        Some(v) => {
+            g.types.insert(to.to_path_buf(), v);
+        }
+        None => {
+            g.types.remove(to);
+        }
+    }
     // Identity follows the OBJECT, not the name: a real filesystem preserves the inode
     // across a rename, and §149.4's whole point is detecting when the object under a
     // path CHANGED.

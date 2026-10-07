@@ -7,13 +7,16 @@ use crate::copy::{
     CopyError, CopyStep, Guard, Heartbeat, copy_file_guarded, no_before_create, no_heartbeat,
     split_destination, unguarded, weaker,
 };
+use crate::names::{NameIndex, Resolved};
 use crate::state::{FLUX_DIR, RESERVED_DIRS};
 use crate::walk::{Walk, WalkEvent, walk};
 use flux_fs::{
-    Code, CopyOptions, DestinationRoot, DirHandle, FileIdentity, FileSystem, FsError,
-    MetadataFailure, MountRoot, ObjectId, Publish, Safety,
+    ClaimKey, ClaimOutcome, ClaimRecord, ClaimStatus, ClaimStore, Code, CopyOptions,
+    DestinationRoot, DirHandle, ExistingPolicy, FileIdentity, FileSystem, FileType, FluxPathKey,
+    FsError, Metadata, MetadataFailure, MountRoot, ObjectId, Publish, Safety,
 };
 use std::collections::{BTreeMap, HashSet};
+use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
@@ -217,6 +220,8 @@ impl WeakIdentityWarnings {
 /// refused. One entry per `Dir` the walk emits, popped at its `DirEnd`: `walk.rs`'s
 /// `enter` pushes a frame of its own before it returns `Dir` and none on `Err`, and
 /// `next` emits `DirEnd` for every such frame, so this stack cannot drift from the walk.
+// `Skipped` is a marker on a stack that holds one frame per directory DEPTH; the size of `Live` costs nothing there.
+#[allow(clippy::large_enum_variant)]
 enum Frame<D> {
     Live {
         dir: D,
@@ -226,6 +231,13 @@ enum Frame<D> {
         /// frame, which bounds it like the walk's one-directory listing (spec line 997,
         /// invariant 11).
         created: HashSet<ObjectId>,
+        /// Cut 8b: this directory's names (its listing, the identity table, who wrote which spelling), dropped with the
+        /// frame. A directory this run created has an empty listing.
+        names: NameIndex,
+        /// Cut 8b: the directory's `Strong` identity when the run has a claim store, the key every claim under it is
+        /// made with; `None` for a copy without claims and for a directory whose identity is not `Strong`
+        /// (`replace_degraded`), where every target is planned as new and an existing file is a collision.
+        claim_parent: Option<ObjectId>,
     },
     /// Its directory failed; everything below it is skipped, and was reported once.
     Skipped,
@@ -300,7 +312,6 @@ pub(crate) struct Shared<'c, F: DestinationRoot> {
     /// §101's heartbeat (cut 7b), beside the guard; `&no_heartbeat` for a copy that holds no lock.
     pub(crate) beat: &'c Heartbeat<'c>,
     /// The run's claim store, open for the walk (cut 8b); `None` for a copy that holds no lock.
-    #[allow(dead_code)] // consumed by Task 10 of the cut 8b plan; remove then
     pub(crate) claims: Option<&'c std::cell::RefCell<<F::Dir as DirHandle>::Claims>>,
 }
 
@@ -385,7 +396,35 @@ pub(crate) fn copy_tree_at<F: DestinationRoot>(
         Ok(i) => i,
         Err(e) => return (root, Err(CopyError::at(CopyStep::Resolve, e))),
     };
-    let mut stack = vec![Frame::Live { dir: root, created: HashSet::new() }];
+    let claim_parent = match (cx.claims, root_identity) {
+        (None, _) => None,
+        (Some(_), FileIdentity::Strong(id)) => Some(id),
+        (Some(_), _) => match cx.opts.safety {
+            Safety::Default => {
+                DegradedGroup::note(&mut out.replace_degraded, Path::new(""));
+                None
+            }
+            Safety::Strict => {
+                return (
+                    root,
+                    Err(refuse(
+                        "the destination's identity is not strong enough to key claims, which --safety strict refuses",
+                    )),
+                );
+            }
+        },
+    };
+    // The root may have been made by this run or may pre-exist; its listing is read either way (a made one holds
+    // only the run's own control directory), so a pre-existing entry is found whichever it was.
+    let names = if claim_parent.is_some() {
+        match NameIndex::for_existing(&root) {
+            Ok(names) => names,
+            Err(e) => return (root, Err(CopyError::at(CopyStep::Resolve, e))),
+        }
+    } else {
+        NameIndex::for_new_dir()
+    };
+    let mut stack = vec![Frame::Live { dir: root, created: HashSet::new(), names, claim_parent }];
     let walked = walk_into(cx, events, root_identity, &mut stack, out, on_report);
     // The walk emits no `Dir` for the root, so no `DirEnd` pops it, and a frame is skipped only when pushed.
     match stack.into_iter().next() {
@@ -403,18 +442,8 @@ fn walk_into<F: DestinationRoot>(
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<(), CopyError> {
-    // 6. The walk. NoReplace is mandatory in a tree (§241.5): every target is planned
-    //    as new, and an existing one is refused at Step 2a (F3).
-    let opts = CopyOptions { publish: Publish::NoReplace, ..cx.opts.clone() };
-    let cx = Shared {
-        fs: cx.fs,
-        src_root: cx.src_root,
-        src_identity: cx.src_identity,
-        opts: &opts,
-        guard: cx.guard,
-        beat: cx.beat,
-        claims: cx.claims,
-    };
+    // 6. The walk. Every target is published by `copy_one`, which picks the publish primitive per target: no-replace
+    //    for a new name and for any directory that cannot key claims (§241.5), replace only under a claim (cut 8b).
     for item in events {
         let live = matches!(stack.last(), Some(Frame::Live { .. }));
         let event = match item {
@@ -447,6 +476,7 @@ fn walk_into<F: DestinationRoot>(
                         root_identity,
                         cx.src_identity,
                         cx.opts,
+                        cx.claims.is_some(),
                         out,
                         on_report,
                     )?
@@ -455,12 +485,12 @@ fn walk_into<F: DestinationRoot>(
             }
             WalkEvent::File { path } => {
                 out.files_total += 1;
-                if let Some(Frame::Live { dir, .. }) = stack.last() {
+                if let Some(Frame::Live { dir, names, claim_parent, .. }) = stack.last_mut() {
                     if reserved_path(&path) {
                         let conflict = CopyError::at(CopyStep::Gate, reserved_conflict());
                         report(out, on_report, path, TreeFailureCause::Copy(conflict));
                     } else {
-                        copy_one(&cx, dir, path, out, on_report)?;
+                        copy_one(cx, dir, names, *claim_parent, path, out, on_report)?;
                     }
                 }
             }
@@ -509,7 +539,7 @@ fn reserved_conflict() -> FsError {
 }
 
 /// A `Dir` event under a live frame: the dynamic §129 check, then decision 8.
-// The signature is the plan's: eight inputs, each a distinct piece of walk state.
+// The signature is the plan's: nine inputs, each a distinct piece of walk state.
 #[allow(clippy::too_many_arguments)]
 fn enter_dir<D: DirHandle>(
     stack: &mut [Frame<D>],
@@ -518,6 +548,7 @@ fn enter_dir<D: DirHandle>(
     root_identity: FileIdentity,
     src_identity: FileIdentity,
     opts: &CopyOptions,
+    claims_on: bool,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<Frame<D>, CopyError> {
@@ -539,7 +570,7 @@ fn enter_dir<D: DirHandle>(
         },
     }
 
-    let Some(Frame::Live { dir: parent, created }) = stack.last_mut() else {
+    let Some(Frame::Live { dir: parent, created, .. }) = stack.last_mut() else {
         unreachable!("enter_dir is called only under a live frame");
     };
     let name = path.file_name().expect("a walk path ends in a name");
@@ -593,7 +624,8 @@ fn enter_dir<D: DirHandle>(
     // a bind mount inside the destination can present the source under a destination name, and `open_dir`
     // refuses only name-surrogates. Aliases of source SUBdirectories stay the section 42 mount cut's. Before the
     // mount query, so a mount presenting the source root aborts rather than becoming a skipped subtree.
-    if let (Ok(FileIdentity::Strong(a)), FileIdentity::Strong(b)) = (child_identity, src_identity)
+    if let (Some(FileIdentity::Strong(a)), FileIdentity::Strong(b)) =
+        (child_identity.as_ref().ok().copied(), src_identity)
         && a == b
     {
         return Err(refuse("a destination directory is the source root itself, by identity"));
@@ -628,28 +660,299 @@ fn enter_dir<D: DirHandle>(
             return Ok(Frame::Skipped);
         }
     }
-    Ok(Frame::Live { dir: child, created: HashSet::new() })
+
+    // Cut 8b: a directory that cannot key claims gets none, and its targets are planned as new (no replacement).
+    let claim_parent = match (claims_on, child_identity) {
+        (false, _) => None,
+        (true, Ok(FileIdentity::Strong(id))) => Some(id),
+        (true, _) => match opts.safety {
+            Safety::Default => {
+                DegradedGroup::note(&mut out.replace_degraded, path);
+                None
+            }
+            Safety::Strict => {
+                let failure = FsError::new(
+                    Code::SafetyRejected,
+                    std::io::Error::other(
+                        "a destination directory whose identity is not strong enough to key claims is never merged into under --safety strict",
+                    ),
+                );
+                report(out, on_report, path.to_path_buf(), TreeFailureCause::CreateDir(failure));
+                return Ok(Frame::Skipped);
+            }
+        },
+    };
+    // A directory this run created is empty; a pre-existing one is listed once, here.
+    let names = if pre_existing && claim_parent.is_some() {
+        match NameIndex::for_existing(&child) {
+            Ok(names) => names,
+            Err(e) => {
+                report(out, on_report, path.to_path_buf(), TreeFailureCause::CreateDir(e));
+                return Ok(Frame::Skipped);
+            }
+        }
+    } else {
+        NameIndex::for_new_dir()
+    };
+    Ok(Frame::Live { dir: child, created: HashSet::new(), names, claim_parent })
 }
 
-/// A `File` event under a live frame.
+/// What the tree decided for one file target.
+enum Plan {
+    /// Not at the destination (or nothing to resolve): publish with no replacement.
+    New,
+    /// An existing file or link stored as `stored` (metadata `meta`) is replaced, under a claim on `stored`.
+    Replace { stored: OsString, meta: Metadata },
+}
+
+/// `Update`'s rule, the same as the copy path's: a newer source or a different size; with either modification time
+/// unavailable, the lengths alone decide.
+fn update_replaces(src: &Metadata, dest: &Metadata) -> bool {
+    src.len != dest.len || matches!((src.modified, dest.modified), (Some(s), Some(d)) if s > d)
+}
+
+fn target_failure(step: CopyStep, code: Code, why: &'static str) -> TreeFailureCause {
+    TreeFailureCause::Copy(CopyError::at(step, FsError::new(code, std::io::Error::other(why))))
+}
+
+/// A `File` event under a live frame. See the design, "The per-file protocol".
+///
+/// The tree decides what an existing destination means and tells the copy path `ExistingPolicy::Overwrite`, so the
+/// copy path never skips on its own and never produces `Outcome.skipped` here; the tree counts skips itself.
 fn copy_one<F: DestinationRoot>(
     cx: &Shared<'_, F>,
     parent: &F::Dir,
+    names: &mut NameIndex,
+    claim_parent: Option<ObjectId>,
     path: PathBuf,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<(), CopyError> {
-    let name = path.file_name().expect("a walk path ends in a name");
-    match copy_file_guarded(
-        cx.fs,
-        &cx.src_root.join(&path),
-        parent,
-        name,
-        cx.opts,
-        cx.guard,
-        cx.beat,
-        &no_before_create,
-    ) {
+    let name_owned = path.file_name().expect("a walk path ends in a name").to_os_string();
+    let name = name_owned.as_os_str();
+    let src = cx.src_root.join(&path);
+    let (Some(parent_id), Some(claims)) = (claim_parent, cx.claims) else {
+        // No claims for this directory (a lockless copy, or an identity that cannot key them): exactly the cut 4b
+        // behaviour. An existing name is a collision.
+        let opts = CopyOptions {
+            existing: ExistingPolicy::Overwrite,
+            publish: Publish::NoReplace,
+            ..cx.opts.clone()
+        };
+        let published = copy_file_guarded(
+            cx.fs,
+            &src,
+            parent,
+            name,
+            &opts,
+            cx.guard,
+            cx.beat,
+            &no_before_create,
+        );
+        return finish_copy(cx, path, published, out, on_report);
+    };
+    let target = match FluxPathKey::from_relative(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            report(
+                out,
+                on_report,
+                path,
+                TreeFailureCause::Copy(CopyError::at(CopyStep::Resolve, e)),
+            );
+            return Ok(());
+        }
+    };
+
+    // 1-2. Resolve the planned name to the entry it denotes.
+    let plan = match names.resolve(parent, name) {
+        Err(e) => {
+            report(
+                out,
+                on_report,
+                path,
+                TreeFailureCause::Copy(CopyError::at(CopyStep::Resolve, e)),
+            );
+            return Ok(());
+        }
+        Ok(Err(_)) => {
+            let cause = target_failure(
+                CopyStep::Resolve,
+                Code::DestinationError,
+                "cannot determine the stored name of the destination entry",
+            );
+            report(out, on_report, path, cause);
+            return Ok(());
+        }
+        Ok(Ok(Resolved::Absent)) => Plan::New,
+        // 4. An existing entry.
+        Ok(Ok(Resolved::Entry { stored, meta })) => {
+            if meta.file_type == FileType::Dir {
+                let cause = target_failure(
+                    CopyStep::Gate,
+                    Code::DestinationError,
+                    "the destination is a directory",
+                );
+                report(out, on_report, path, cause);
+                return Ok(());
+            }
+            let skip = match cx.opts.existing {
+                ExistingPolicy::Overwrite => None,
+                policy => {
+                    let src_meta = match cx.fs.metadata(&src) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            let cause = TreeFailureCause::Copy(CopyError::at(CopyStep::Source, e));
+                            report(out, on_report, path, cause);
+                            return Ok(());
+                        }
+                    };
+                    let replace =
+                        policy == ExistingPolicy::Update && update_replaces(&src_meta, &meta);
+                    (!replace).then_some(src_meta.len)
+                }
+            };
+            if let Some(len) = skip {
+                out.files_skipped += 1;
+                out.bytes_skipped += len;
+                return Ok(());
+            }
+            Plan::Replace { stored, meta }
+        }
+    };
+
+    let own = |status| ClaimRecord { target: target.clone(), status };
+    match plan {
+        // 3. Plan as new.
+        Plan::New => {
+            let opts = CopyOptions {
+                existing: ExistingPolicy::Overwrite,
+                publish: Publish::NoReplace,
+                ..cx.opts.clone()
+            };
+            let result = copy_file_guarded(
+                cx.fs,
+                &src,
+                parent,
+                name,
+                &opts,
+                cx.guard,
+                cx.beat,
+                &no_before_create,
+            );
+            let published = match &result {
+                Ok(o) => Some(o.published_identity),
+                Err(_) => None,
+            };
+            finish_copy(cx, path.clone(), result, out, on_report)?;
+            if let Some(identity) = published {
+                let recorded = record_claim(
+                    claims,
+                    &ClaimKey::new(parent_id, name),
+                    &own(ClaimStatus::Created),
+                );
+                if let Err(e) = recorded {
+                    report(out, on_report, path, TreeFailureCause::ClaimNotRecorded(e));
+                }
+                names.record_publication(&target, None, name, None, identity);
+            }
+            Ok(())
+        }
+        // 5. Replace, under a claim on the stored name made after the gate and the section 99 checks.
+        Plan::Replace { stored, meta } => {
+            let key_stored = ClaimKey::new(parent_id, &stored);
+            let before_create = || -> std::result::Result<(), CopyError> {
+                let claimed =
+                    claims.borrow_mut().insert_if_absent(&key_stored, &own(ClaimStatus::Existing));
+                match claimed {
+                    Ok(ClaimOutcome::Inserted) => Ok(()),
+                    // A target that finds its own claim proceeds.
+                    Ok(ClaimOutcome::Present(r)) if r.target == target => Ok(()),
+                    Ok(ClaimOutcome::Present(_)) => Err(CopyError::at(
+                        CopyStep::Claim,
+                        FsError::new(
+                            Code::DestinationNamespaceCollision,
+                            std::io::Error::other(
+                                "another target of this operation already claimed that destination entry",
+                            ),
+                        ),
+                    )),
+                    Err(e) => Err(CopyError::at(CopyStep::Claim, e)),
+                }
+            };
+            let opts = CopyOptions {
+                existing: ExistingPolicy::Overwrite,
+                publish: Publish::Replace,
+                ..cx.opts.clone()
+            };
+            let result = copy_file_guarded(
+                cx.fs,
+                &src,
+                parent,
+                name,
+                &opts,
+                cx.guard,
+                cx.beat,
+                &before_create,
+            );
+            let published = match &result {
+                Ok(o) => Some(o.published_identity),
+                Err(_) => None,
+            };
+            finish_copy(cx, path.clone(), result, out, on_report)?;
+            if let Some(identity) = published {
+                out.files_overwritten += 1;
+                // The entry now holds the new object under its stored name (and, on some systems, the planned one).
+                let mut recorded = claims.borrow_mut().upgrade_own_claim(&key_stored, &target);
+                if name != stored {
+                    let planned = record_claim(
+                        claims,
+                        &ClaimKey::new(parent_id, name),
+                        &own(ClaimStatus::Created),
+                    );
+                    recorded = recorded.and(planned);
+                }
+                if let Err(e) = recorded {
+                    report(out, on_report, path, TreeFailureCause::ClaimNotRecorded(e));
+                }
+                let replaced = match meta.identity {
+                    FileIdentity::Strong(id) => Some(id),
+                    _ => None,
+                };
+                names.record_publication(&target, Some(&stored), name, replaced, identity);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Insert `record` at `key`; an existing record of the SAME target is fine (a resumed target), another target's is an
+/// engine defect, reported as a claim that could not be recorded.
+fn record_claim<C: ClaimStore>(
+    claims: &std::cell::RefCell<C>,
+    key: &ClaimKey,
+    record: &ClaimRecord,
+) -> std::result::Result<(), FsError> {
+    match claims.borrow_mut().insert_if_absent(key, record)? {
+        ClaimOutcome::Inserted => Ok(()),
+        ClaimOutcome::Present(r) if r.target == record.target => Ok(()),
+        ClaimOutcome::Present(_) => Err(FsError::new(
+            Code::IoError,
+            std::io::Error::other("the claim for this name belongs to another target"),
+        )),
+    }
+}
+
+/// Count what `copy_file_guarded` did for one target, or report and map its failure. `Err` only when the whole
+/// operation must stop.
+fn finish_copy<F: DestinationRoot>(
+    _cx: &Shared<'_, F>,
+    path: PathBuf,
+    result: std::result::Result<flux_fs::Outcome, CopyError>,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) -> std::result::Result<(), CopyError> {
+    match result {
         Ok(o) => {
             out.files_copied += 1;
             out.bytes_copied += o.bytes_copied;
@@ -692,6 +995,8 @@ fn copy_one<F: DestinationRoot>(
             {
                 e.cause.code = Code::DestinationNamespaceCollision;
             }
+            // Cut 8b: a claim failure (a store error, or a collision with another target's claim) fails this target
+            // only, with the code it carries.
             report(out, on_report, path, TreeFailureCause::Copy(e));
             Ok(())
         }

@@ -1726,6 +1726,78 @@ mod tests {
         assert!(!ran.get());
     }
 
+    /// Run the copy with the given guard and heartbeat and a `before_create` that counts its calls.
+    fn guarded_counting(
+        fs: &FaultFs,
+        guard: &Guard<'_>,
+        beat: &Heartbeat<'_>,
+        calls: &std::cell::Cell<u32>,
+    ) -> std::result::Result<Outcome, CopyError> {
+        let root = fs.destination_root(Path::new("/")).unwrap();
+        let cb = || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+        copy_file_guarded(
+            fs,
+            Path::new("/src"),
+            &root,
+            OsStr::new("dst"),
+            &opts(),
+            guard,
+            beat,
+            &cb,
+        )
+    }
+
+    fn lock_lost() -> flux_fs::FsError {
+        FsError::new(Code::TargetLockBusy, std::io::Error::other("lost"))
+    }
+
+    #[test]
+    fn before_create_is_not_called_when_the_guard_or_heartbeat_fails() {
+        // Section 99: the heartbeat and the guard come BEFORE the claim. The copy path calls each twice before
+        // the claim (the leftover removal, then the exclusive create), so fail the first call and, separately,
+        // the SECOND call, which is the one that sits directly in front of `before_create`.
+        for nth in [1u32, 2] {
+            let fs = FaultFs::new();
+            fs.write_file("/src", b"hello");
+            let n = std::cell::Cell::new(0u32);
+            let guard = || {
+                n.set(n.get() + 1);
+                if n.get() == nth { Err(lock_lost()) } else { Ok(()) }
+            };
+            let ran = std::cell::Cell::new(0);
+            let e = guarded_counting(&fs, &guard, &no_heartbeat, &ran).unwrap_err();
+            assert_eq!(e.code(), Code::TargetLockBusy, "guard failing at call {nth}");
+            assert_eq!(ran.get(), 0, "the claim ran after a failed guard (call {nth})");
+            assert!(!fs.called("create_new"), "{:?}", fs.calls());
+
+            let fs = FaultFs::new();
+            fs.write_file("/src", b"hello");
+            let n = std::cell::Cell::new(0u32);
+            let beat = || {
+                n.set(n.get() + 1);
+                if n.get() == nth { Err(lock_lost()) } else { Ok(()) }
+            };
+            let ran = std::cell::Cell::new(0);
+            let e = guarded_counting(&fs, &unguarded, &beat, &ran).unwrap_err();
+            assert_eq!(e.step, CopyStep::Heartbeat, "heartbeat failing at call {nth}");
+            assert_eq!(ran.get(), 0, "the claim ran after a failed heartbeat (call {nth})");
+            assert!(!fs.called("create_new"), "{:?}", fs.calls());
+        }
+    }
+
+    #[test]
+    fn before_create_runs_exactly_once_per_copy() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        let ran = std::cell::Cell::new(0);
+        guarded_counting(&fs, &unguarded, &no_heartbeat, &ran).unwrap();
+        assert_eq!(ran.get(), 1);
+        assert_eq!(fs.read_file("/dst").as_deref(), Some(&b"hello"[..]));
+    }
+
     #[test]
     fn skip_existing_leaves_the_destination_untouched() {
         let fs = FaultFs::new();

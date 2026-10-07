@@ -156,24 +156,50 @@ fn a_folders_contents_are_copied_onto_a_fresh_destination() {
 }
 
 #[test]
-fn a_folder_merges_into_an_existing_folder_and_reports_each_collision() {
+fn a_folder_merges_into_an_existing_folder_and_replaces_each_existing_file() {
     let d = TempDir::new().unwrap();
     let src = tree_in(d.path());
     let dst = d.path().join("dst");
     std::fs::create_dir(&dst).unwrap();
     std::fs::write(dst.join("a"), b"old").unwrap();
 
-    let out = flux().arg("copy").arg(&src).arg(&dst).output().unwrap();
+    let out = flux().arg("copy").arg(&src).arg(&dst).arg("--json").output().unwrap();
 
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
-    let err = stderr(&out);
-    assert!(err.lines().any(|l| l.starts_with("DESTINATION_NAMESPACE_COLLISION: a: ")), "{err}");
-    assert_eq!(std::fs::read(dst.join("a")).unwrap(), b"old", "never replaced");
-    assert_eq!(
-        std::fs::read(dst.join("sub").join("b")).unwrap(),
-        b"BB",
-        "the walk continued past the collision"
-    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("0 failed"), "a replacement is not a failure: {}", stderr(&out));
+    let v = json(&out);
+    assert_eq!(v["files_overwritten"].as_u64(), Some(1), "{v}");
+    assert_eq!(v["files_copied"].as_u64(), Some(2), "{v}");
+    assert_eq!(v["files_skipped"].as_u64(), Some(0), "{v}");
+    assert_eq!(std::fs::read(dst.join("a")).unwrap(), b"A", "replaced");
+    assert_eq!(std::fs::read(dst.join("sub").join("b")).unwrap(), b"BB");
+}
+
+#[test]
+fn a_folder_over_a_folder_with_skip_existing_reports_skipped_files() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let dst = d.path().join("dst");
+    std::fs::create_dir(&dst).unwrap();
+    std::fs::write(dst.join("a"), b"old").unwrap();
+
+    let out = flux()
+        .arg("copy")
+        .arg(&src)
+        .arg(&dst)
+        .arg("--skip-existing")
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let v = json(&out);
+    assert_eq!(v["files_skipped"].as_u64(), Some(1), "{v}");
+    assert_eq!(v["files_overwritten"].as_u64(), Some(0), "{v}");
+    assert_eq!(v["files_copied"].as_u64(), Some(1), "only sub/b is new: {v}");
+    assert_eq!(v["bytes_skipped"].as_u64(), Some(1), "the source length of a: {v}");
+    assert_eq!(std::fs::read(dst.join("a")).unwrap(), b"old", "content unchanged");
+    assert_eq!(std::fs::read(dst.join("sub").join("b")).unwrap(), b"BB");
 }
 
 #[test]
@@ -270,7 +296,8 @@ fn json_is_printed_when_the_copy_fails() {
     let src = tree_in(d.path());
     let dst = d.path().join("dst");
     std::fs::create_dir(&dst).unwrap();
-    std::fs::write(dst.join("a"), b"old").unwrap();
+    // A directory in the way of the file `a` is the failure (a file there is now replaced, not a collision).
+    std::fs::create_dir(dst.join("a")).unwrap();
 
     let out = flux().arg("copy").arg(&src).arg(&dst).arg("--json").output().unwrap();
 
