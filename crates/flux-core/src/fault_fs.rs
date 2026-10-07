@@ -5,8 +5,9 @@
 //! named call. None of that is reachable against a real disk.
 
 use flux_fs::{
-    Code, DestinationRoot, DirEntry, DirHandle, FileHandle, FileSystem, FileType, FsError,
-    LockCapability, LockFile, Metadata, MountRoot, Perms, Result, check_component,
+    ClaimKey, ClaimOutcome, ClaimRecord, ClaimStore, Code, DestinationRoot, DirEntry, DirHandle,
+    Durability, FileHandle, FileSystem, FileType, FluxPathKey, FsError, LockCapability, LockFile,
+    Metadata, MountRoot, Perms, Result, check_component,
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -109,6 +110,85 @@ struct Inner {
     open_locks: HashMap<u128, u32>,
     /// Paths removed while a lock handle was open under legacy delete: still occupying their name, found by nothing.
     pending: HashSet<PathBuf>,
+    /// Every claim store `create_claim_store` made, in creation order. Each holds the encoded claims (`ClaimKey::encode`
+    /// -> `ClaimRecord::encode`), the encodings of the real store.
+    claim_stores: Vec<ClaimMap>,
+}
+
+type ClaimMap = std::sync::Arc<Mutex<std::collections::BTreeMap<Vec<u8>, Vec<u8>>>>;
+
+/// The fake's claim store: the real store's key and value encodings over an in-memory map, with the call log and the
+/// fault keys `claim_insert`, `claim_upgrade`, `claim_flush`.
+pub struct FakeClaimStore {
+    map: ClaimMap,
+    inner: std::sync::Arc<Mutex<Inner>>,
+}
+
+impl FakeClaimStore {
+    fn record(&self, call: String, key: &str) -> Result<()> {
+        FaultFs { inner: std::sync::Arc::clone(&self.inner) }.record(call, key)
+    }
+}
+
+fn corrupt_claim() -> FsError {
+    FsError::new(Code::IoError, std::io::Error::other("undecodable claim record"))
+}
+
+impl ClaimStore for FakeClaimStore {
+    fn insert_if_absent(&mut self, key: &ClaimKey, record: &ClaimRecord) -> Result<ClaimOutcome> {
+        self.record(
+            format!("claim_insert({})", String::from_utf8_lossy(&key.name)),
+            "claim_insert",
+        )?;
+        let mut m = self.map.lock().unwrap();
+        let k = key.encode();
+        match m.get(&k) {
+            Some(v) => Ok(ClaimOutcome::Present(ClaimRecord::decode(v).ok_or_else(corrupt_claim)?)),
+            None => {
+                m.insert(k, record.encode());
+                Ok(ClaimOutcome::Inserted)
+            }
+        }
+    }
+
+    fn get(&self, key: &ClaimKey) -> Result<Option<ClaimRecord>> {
+        let m = self.map.lock().unwrap();
+        match m.get(&key.encode()) {
+            Some(v) => Ok(Some(ClaimRecord::decode(v).ok_or_else(corrupt_claim)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn upgrade_own_claim(&mut self, key: &ClaimKey, target: &FluxPathKey) -> Result<()> {
+        self.record(
+            format!("claim_upgrade({})", String::from_utf8_lossy(&key.name)),
+            "claim_upgrade",
+        )?;
+        let mut m = self.map.lock().unwrap();
+        let k = key.encode();
+        let stored = match m.get(&k) {
+            Some(v) => ClaimRecord::decode(v).ok_or_else(corrupt_claim)?,
+            None => {
+                return Err(FsError::new(
+                    Code::IoError,
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "no such claim"),
+                ));
+            }
+        };
+        if stored.target != *target {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::other("the claim belongs to another target"),
+            ));
+        }
+        let upgraded = ClaimRecord { target: stored.target, status: flux_fs::ClaimStatus::Created };
+        m.insert(k, upgraded.encode());
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.record("claim_flush".to_string(), "claim_flush")
+    }
 }
 
 /// One node in the `DirHandle` graph, addressed by an opaque id rather than by
@@ -518,6 +598,21 @@ impl FaultFs {
     /// reach the cleanup that `discard` performs.
     pub fn fail_always(&self, name: &str, code: Code) {
         self.inner.lock().unwrap().always.insert(name.to_string(), code);
+    }
+
+    /// Claims across every store created from this fake.
+    pub fn claim_count(&self) -> usize {
+        let g = self.inner.lock().unwrap();
+        g.claim_stores.iter().map(|m| m.lock().unwrap().len()).sum()
+    }
+
+    /// The claim at `(parent, name)` in any store created from this fake.
+    pub fn claim(&self, parent: flux_fs::ObjectId, name: &str) -> Option<ClaimRecord> {
+        let k = ClaimKey::new(parent, OsStr::new(name)).encode();
+        let g = self.inner.lock().unwrap();
+        g.claim_stores
+            .iter()
+            .find_map(|m| m.lock().unwrap().get(&k).and_then(|v| ClaimRecord::decode(v)))
     }
 
     pub fn calls(&self) -> Vec<String> {
@@ -1090,6 +1185,7 @@ impl FakeDirHandle {
 impl DirHandle for FakeDirHandle {
     type Writer = FakeHandle;
     type Lock = FakeLock;
+    type Claims = FakeClaimStore;
 
     fn mount_root(&self, _parent: &Self) -> Result<MountRoot> {
         let path = self.my_path();
@@ -1254,6 +1350,27 @@ impl DirHandle for FakeDirHandle {
             mint_identity(&mut g, &child_path);
         }
         self.lock_for(&child_path)
+    }
+
+    fn create_claim_store(&self, name: &OsStr, _durability: Durability) -> Result<Self::Claims> {
+        check_component(name)?;
+        let child_path = self.my_path().join(name);
+        self.fs().record(
+            format!("create_claim_store({})", child_path.display()),
+            "create_claim_store",
+        )?;
+        let mut g = self.inner.lock().unwrap();
+        if g.files.contains_key(&child_path) || g.directories.contains(&child_path) {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+            ));
+        }
+        g.files.insert(child_path.clone(), Vec::new());
+        mint_identity(&mut g, &child_path);
+        let map = ClaimMap::default();
+        g.claim_stores.push(std::sync::Arc::clone(&map));
+        Ok(FakeClaimStore { map, inner: std::sync::Arc::clone(&self.inner) })
     }
 
     fn open_lock(&self, name: &OsStr) -> Result<Self::Lock> {
@@ -2244,5 +2361,82 @@ mod tests {
         assert!(matches!(held, FileIdentity::Strong(_)));
         p.rename_replace(OsStr::new("t.tmp"), &p, OsStr::new("t")).unwrap();
         assert_eq!(fs.metadata(Path::new("/p/t")).unwrap().identity, held);
+    }
+
+    #[test]
+    fn the_fake_claim_store_passes_the_conformance_suite() {
+        use flux_fs::{DestinationRoot, DirHandle, Durability};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let n = std::cell::Cell::new(0u32);
+        flux_fs::claims::conformance::run_all(|| {
+            n.set(n.get() + 1);
+            let name = format!("state{}.db", n.get());
+            d.create_claim_store(OsStr::new(&name), Durability::Normal).unwrap()
+        });
+    }
+
+    #[test]
+    fn create_claim_store_refuses_a_taken_name() {
+        use flux_fs::{DestinationRoot, DirHandle, Durability};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let _first = d.create_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap();
+        assert!(fs.exists("/d/state.db"), "an empty file entry is visible at the path");
+        assert!(fs.called("create_claim_store(/d/state.db)"));
+        let err = match d.create_claim_store(OsStr::new("state.db"), Durability::Normal) {
+            Err(e) => e,
+            Ok(_) => panic!("a taken name must be refused"),
+        };
+        assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn a_claim_fault_is_injected_and_consumed() {
+        use flux_fs::{
+            ClaimKey, ClaimRecord, ClaimStatus, ClaimStore, DestinationRoot, DirHandle, Durability,
+            FluxPathKey, ObjectId,
+        };
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let mut s = d.create_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap();
+        let key = ClaimKey::new(ObjectId { volume: 1, index: 1 }, OsStr::new("a"));
+        let rec = ClaimRecord { target: FluxPathKey(b"a".to_vec()), status: ClaimStatus::Existing };
+        fs.fail("claim_insert", Code::IoError);
+        assert!(s.insert_if_absent(&key, &rec).is_err());
+        assert!(s.insert_if_absent(&key, &rec).is_ok(), "the fault is consumed");
+        assert!(fs.called("claim_insert(a)"));
+        fs.fail("claim_upgrade", Code::IoError);
+        assert!(s.upgrade_own_claim(&key, &rec.target).is_err());
+        assert!(s.upgrade_own_claim(&key, &rec.target).is_ok());
+        assert!(fs.called("claim_upgrade(a)"));
+        fs.fail("claim_flush", Code::IoError);
+        assert!(s.flush().is_err());
+        assert!(s.flush().is_ok());
+        assert!(fs.called("claim_flush"));
+    }
+
+    #[test]
+    fn claims_are_visible_through_the_fake_accessors() {
+        use flux_fs::{
+            ClaimKey, ClaimRecord, ClaimStatus, ClaimStore, DestinationRoot, DirHandle, Durability,
+            FluxPathKey, ObjectId,
+        };
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let mut s = d.create_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap();
+        assert_eq!(fs.claim_count(), 0);
+        let parent = ObjectId { volume: 1, index: 9 };
+        let rec = ClaimRecord { target: FluxPathKey(b"t".to_vec()), status: ClaimStatus::Existing };
+        s.insert_if_absent(&ClaimKey::new(parent, OsStr::new("x")), &rec).unwrap();
+        assert_eq!(fs.claim_count(), 1);
+        assert_eq!(fs.claim(parent, "x"), Some(rec.clone()));
+        assert_eq!(fs.claim(parent, "y"), None);
+        s.upgrade_own_claim(&ClaimKey::new(parent, OsStr::new("x")), &rec.target).unwrap();
+        assert_eq!(fs.claim(parent, "x").unwrap().status, ClaimStatus::Created);
     }
 }

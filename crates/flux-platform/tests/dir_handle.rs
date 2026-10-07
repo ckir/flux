@@ -342,6 +342,62 @@ mod posix {
     }
 
     #[test]
+    fn create_claim_store_makes_a_store_through_the_handle() {
+        use flux_fs::{ClaimKey, ClaimRecord, ClaimStatus, ClaimStore, Durability, FluxPathKey};
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let mut store =
+            root.create_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap();
+        let key = ClaimKey::new(flux_fs::ObjectId { volume: 1, index: 1 }, OsStr::new("a"));
+        let rec = ClaimRecord { target: FluxPathKey(b"a".to_vec()), status: ClaimStatus::Existing };
+        store.insert_if_absent(&key, &rec).unwrap();
+        store.flush().unwrap();
+        assert!(
+            d.path().join("state.db").is_file(),
+            "the store is a file in the handle's directory"
+        );
+        let err = match root.create_claim_store(OsStr::new("state.db"), Durability::Normal) {
+            Err(e) => e,
+            Ok(_) => panic!("a taken name must be refused"),
+        };
+        assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn the_real_store_passes_the_conformance_suite_through_the_handle() {
+        use flux_fs::Durability;
+        let d = TempDir::new().unwrap();
+        let n = std::cell::Cell::new(0u32);
+        flux_fs::claims::conformance::run_all(|| {
+            n.set(n.get() + 1);
+            let sub = format!("c{}", n.get());
+            std::fs::create_dir(d.path().join(&sub)).unwrap();
+            let root = StdFileSystem.destination_root(&d.path().join(&sub)).unwrap();
+            root.create_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap()
+        });
+    }
+
+    #[test]
+    fn create_claim_store_never_follows_a_link() {
+        let d = TempDir::new().unwrap();
+        let outside = d.path().join("outside");
+        std::os::unix::fs::symlink(&outside, d.path().join("state.db")).unwrap();
+        assert!(!outside.exists(), "the link must dangle for this to mean anything");
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let err = match root.create_claim_store(OsStr::new("state.db"), flux_fs::Durability::Normal)
+        {
+            Err(e) => e,
+            Ok(_) => panic!("a name a symlink holds is taken"),
+        };
+        assert!(
+            err.source.kind() == std::io::ErrorKind::AlreadyExists
+                || err.code == flux_fs::Code::SafetyRejected,
+            "got {err:?}"
+        );
+        assert!(!outside.exists(), "nothing may have been created at the link's TARGET");
+    }
+
+    #[test]
     fn a_symlink_is_accepted_as_the_destination_root() {
         // The POSIX twin of a_junction_is_accepted_as_the_destination_root. Every
         // component BELOW the root is refused if it is a link -- that is what
@@ -508,6 +564,66 @@ mod windows_arm {
         assert_eq!(through.canonical_path().unwrap(), expected);
         assert_eq!(direct.canonical_path().unwrap(), expected);
         assert!(expected.to_string_lossy().starts_with(r"\\?\"), "{expected:?}");
+    }
+
+    #[test]
+    fn create_claim_store_makes_a_store_through_the_handle() {
+        use flux_fs::{ClaimKey, ClaimRecord, ClaimStatus, ClaimStore, Durability, FluxPathKey};
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let mut store =
+            root.create_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap();
+        let key = ClaimKey::new(flux_fs::ObjectId { volume: 1, index: 1 }, OsStr::new("a"));
+        let rec = ClaimRecord { target: FluxPathKey(b"a".to_vec()), status: ClaimStatus::Existing };
+        store.insert_if_absent(&key, &rec).unwrap();
+        store.flush().unwrap();
+        assert!(
+            d.path().join("state.db").is_file(),
+            "the store is a file in the handle's directory"
+        );
+        let err = match root.create_claim_store(OsStr::new("state.db"), Durability::Normal) {
+            Err(e) => e,
+            Ok(_) => panic!("a taken name must be refused"),
+        };
+        assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn the_real_store_passes_the_conformance_suite_through_the_handle() {
+        use flux_fs::Durability;
+        let d = TempDir::new().unwrap();
+        let n = std::cell::Cell::new(0u32);
+        flux_fs::claims::conformance::run_all(|| {
+            n.set(n.get() + 1);
+            let sub = format!("c{}", n.get());
+            std::fs::create_dir(d.path().join(&sub)).unwrap();
+            let root = StdFileSystem.destination_root(&d.path().join(&sub)).unwrap();
+            root.create_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap()
+        });
+    }
+
+    #[test]
+    fn create_claim_store_never_follows_a_link() {
+        let d = TempDir::new().unwrap();
+        std::fs::create_dir(d.path().join("real")).unwrap();
+        if !junction(&d.path().join("real"), &d.path().join("state.db")) {
+            panic!("could not create a junction; mklink /J requires no privilege");
+        }
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let err = match root.create_claim_store(OsStr::new("state.db"), flux_fs::Durability::Normal)
+        {
+            Err(e) => e,
+            Ok(_) => panic!("a name a junction holds is taken"),
+        };
+        assert!(
+            err.source.kind() == std::io::ErrorKind::AlreadyExists
+                || err.code == flux_fs::Code::SafetyRejected,
+            "got {err:?}"
+        );
+        assert!(
+            std::fs::read_dir(d.path().join("real")).unwrap().next().is_none(),
+            "nothing may have been created at the junction's TARGET"
+        );
     }
 
     fn junction(target: &std::path::Path, link: &std::path::Path) -> bool {
