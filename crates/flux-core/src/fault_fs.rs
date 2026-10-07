@@ -2550,6 +2550,12 @@ mod tests {
         fs
     }
 
+    /// Exact match on a logged call, separator-insensitive: the fake joins paths with `Path::join`, which yields
+    /// backslashes on Windows.
+    fn called_norm(fs: &FaultFs, call: &str) -> bool {
+        fs.calls().iter().any(|c| c.replace('\\', "/") == call)
+    }
+
     fn names(fs: &FaultFs, dir: &str) -> Vec<String> {
         let mut v: Vec<String> = fs
             .read_dir(Path::new(dir))
@@ -2575,8 +2581,8 @@ mod tests {
         // A directory component folds too, and the log shows the NORMALIZED path.
         let c = fs.metadata(Path::new("/D/File.Txt")).unwrap();
         assert_eq!(a.identity, c.identity);
-        assert!(fs.called("metadata(/d/file.txt)"));
-        assert!(!fs.called("metadata(/D/File.Txt)"));
+        assert!(called_norm(&fs, "metadata(/d/file.txt)"));
+        assert!(!called_norm(&fs, "metadata(/D/File.Txt)"));
     }
 
     #[test]
@@ -2633,7 +2639,7 @@ mod tests {
         fs.set_case_insensitive(true);
         // The directory is named in another case; the entries come back as stored.
         assert_eq!(names(&fs, "/D"), vec!["Sub", "file.txt"]);
-        assert!(fs.called("read_dir(/d)"));
+        assert!(called_norm(&fs, "read_dir(/d)"));
     }
 
     #[test]
