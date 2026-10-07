@@ -39,8 +39,8 @@ settled by a measured spike on Linux, macOS and Windows. The reasoning is under 
    (`rename_replace` already refuses it). No unlink-then-rename.
 5. **Flags:** all three, mutually exclusive (exit 2); `--update` compares metadata only; `files_overwritten`,
    `files_skipped` and `bytes_skipped` are filled for directories.
-6. **Lifecycle:** `state.db` is created in the unpublished workspace `<id>.creating`, removed with the workspace and by
-   every unwind; a kept workspace keeps it.
+6. **Lifecycle:** `state.db` is created in the workspace immediately after it is published (Windows refuses to rename a
+   directory containing an open file), removed with the workspace and by every unwind; a kept workspace keeps it.
 7. **Verification:** one conformance suite run against the in-memory fake and the real store; the TLA+ `claims` scenario
    stays planned.
 8. **Name resolution (Q8):** see "Name resolution".
@@ -275,12 +275,15 @@ durability only decides what the WAL cut finds after a crash. The mapping:
 
 ## Workspace lifecycle
 
-- `TreePlace::create` (`run/place.rs`) order: `begin_workspace`, the cut 8a probe, `create_claim_store("state.db")`, then
-  `publish_workspace`. The store handle lives in the run's `Locked` state and is passed to the walk through `Shared`
+- `TreePlace::create` (`run/place.rs`) order: `begin_workspace`, the cut 8a probe, `publish_workspace`, then
+  `create_claim_store("state.db")` on the published `<id>` handle (Windows refuses to rename a directory with an open
+  file inside it). A creation error retires the published workspace and the control directories it made. A crash
+  between publish and creation leaves a manifest-only workspace that `--restart` supersedes (retire tolerates a missing
+  `state.db`). The store handle lives in the run's `Locked` state and is passed to the walk through `Shared`
   (`None` for the lockless copy).
 - The store is dropped (closed) BEFORE any removal of the file (Windows).
-- `retire_workspace`, `unwind_creating` and the probe's error path remove `state.db` (a constant beside the probe names
-  in `state.rs`). A kept workspace (FAILED, a leftover temporary) keeps it. `--restart`'s supersede retires a prior
+- `retire_workspace` removes `state.db` (a constant beside the probe names in `state.rs`); `unwind_creating` and the
+  probe's error path never see one. A kept workspace (FAILED, a leftover temporary) keeps it. `--restart`'s supersede retires a prior
   operation's workspace, which removes its `state.db`.
 - `crates/flux-core/src/prior.rs` ignores the file (it reads the manifest); the manifest does not change.
 
@@ -350,7 +353,7 @@ cross-filesystem and mount-boundary cut; directory replacement; reflink or hardl
 ## Design record
 
 - **Scoping consult.** agy picked one cut, a custom append-only file, claim-before and claim-after rename, replace by
-  `rename_replace`, all three flags, state.db in `<id>.creating`, a fake plus a shared conformance suite. The driver
+  `rename_replace`, all three flags, state.db in the operation workspace, a fake plus a shared conformance suite. The driver
   agreed on all but the store and the claim-key detail.
 - **Negotiation round 1.** On the store, agy conceded that an append-only file has no index and so breaks section 10.1
   (spec lines for "never held wholesale in memory"), and accepted a `ClaimStore` interface over an existing indexed

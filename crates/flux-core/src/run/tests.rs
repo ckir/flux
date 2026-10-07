@@ -1789,14 +1789,17 @@ fn a_tree_run_creates_state_db_in_the_workspace_and_removes_it_with_it() {
             creating("noreplace-probe")
         ),
     );
-    let store = at(&c, &format!("create_claim_store({})", creating("state.db")));
     let published = at(
         &c,
         &format!(
             "rename_no_replace(/p/dest/.flux/operations/{ID}.creating -> /p/dest/.flux/operations/{ID})"
         ),
     );
-    assert!(probe < store && store < published, "{c:?}");
+    // Created in the published `<id>`, never in `<id>.creating` (Windows refuses to rename a directory holding an
+    // open file).
+    let store = at(&c, &format!("create_claim_store(/p/dest/.flux/operations/{ID}/state.db)"));
+    assert!(probe < published && published < store, "{c:?}");
+    assert!(!c.iter().any(|x| x.contains(".creating/state.db")), "{c:?}");
     assert!(!fs.exists("/p/dest/.flux"), "the workspace and its state.db are gone");
     assert!(!fs.exists(format!("/p/dest/.flux/operations/{ID}.removing")));
 }
@@ -1820,7 +1823,10 @@ fn a_failed_state_db_creation_unwinds_and_names_the_file() {
     let (step, path) = failed_at(&r.stop);
     assert_eq!(step, RunStep::State);
     assert!(path.ends_with("state.db"), "{path}");
-    assert!(!fs.exists(format!("/p/dest/.flux/operations/{ID}.creating")));
+    for suffix in ["", ".removing", ".creating"] {
+        assert!(!fs.exists(format!("/p/dest/.flux/operations/{ID}{suffix}")), "{suffix}");
+    }
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
     assert!(!fs.exists("/p/dest"), "control dirs and the DEST this run made are gone");
     assert!(!fs.exists(LOCK), "the lock is released");
     assert_eq!(fs.claim_stores_open(), 0);

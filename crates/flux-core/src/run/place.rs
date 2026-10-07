@@ -201,32 +201,12 @@ impl<F: DestinationRoot> TreePlace<'_, F> {
         self.dest_shown.join(FLUX_DIR).join(OPERATIONS_DIR)
     }
 
-    /// Remove `<id>.creating` (its `state.db` first, when `store_attempted`: the store is dropped before its file is
-    /// removed), then the control directories (and a DEST this run made); the first failed removal.
-    fn unwind_creating(
-        &mut self,
-        operations: F::Dir,
-        id: &str,
-        store_attempted: bool,
-    ) -> Option<(PathBuf, FsError)> {
-        self.claims = None;
-        let creating = creating_name(id);
-        let shown = self.operations_shown().join(&creating);
-        let mut not_removed = None;
-        if store_attempted {
-            let removed = operations.open_dir(&creating).and_then(|dir| {
-                match dir.remove_file(OsStr::new(STATE_DB)) {
-                    Err(e) if e.source.kind() == ErrorKind::NotFound => Ok(()),
-                    other => other,
-                }
-            });
-            if let Err(e) = removed {
-                not_removed = Some((shown.join(STATE_DB), e));
-            }
-        }
-        if let Err(e) = operations.remove_dir(&creating) {
-            not_removed.get_or_insert((shown, e));
-        }
+    /// Remove `<id>.creating`, then the control directories (and a DEST this run made); the first failed removal.
+    fn unwind_creating(&mut self, operations: F::Dir, id: &str) -> Option<(PathBuf, FsError)> {
+        let mut not_removed = operations
+            .remove_dir(&creating_name(id))
+            .err()
+            .map(|e| (self.operations_shown().join(creating_name(id)), e));
         self.operations = Some(operations);
         if let Err(first) = self.remove_control_dirs(true) {
             not_removed.get_or_insert(first);
@@ -244,7 +224,7 @@ impl<F: DestinationRoot> TreePlace<'_, F> {
     ) -> RunError {
         let shown = self.operations_shown().join(creating_name(id));
         let leftover = leftover.map(|(n, e)| (shown.join(n), e));
-        let unwound = self.unwind_creating(operations, id, false);
+        let unwound = self.unwind_creating(operations, id);
         let not_removed = leftover.or(unwound);
         RunError::Refused {
             refusal: Box::new(Refusal {
@@ -340,25 +320,34 @@ impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {
             Err((at, error)) => {
                 drop(building);
                 // Best effort, but a leftover is reported: the CLI prints the warnings of a stopped run too.
-                if let Some((path, error)) = self.unwind_creating(operations, id, false) {
+                if let Some((path, error)) = self.unwind_creating(operations, id) {
                     warnings.push(RunWarning::NotRemoved { path, error });
                 }
                 let file = if at == ProbeAt::Create { PROBE_TEMP } else { PROBE };
                 return Err(failed(RunStep::Probe, &shown_creating.join(file), error));
             }
         }
-        match building.create_claim_store(OsStr::new(STATE_DB), self.durability) {
-            Ok(store) => self.claims = Some(store),
-            Err(error) => {
-                drop(building);
-                if let Some((path, error)) = self.unwind_creating(operations, id, true) {
-                    warnings.push(RunWarning::NotRemoved { path, error });
-                }
-                return Err(failed(RunStep::State, &shown_creating.join(STATE_DB), error));
-            }
-        }
         let workspace = publish_workspace(&operations, building, state)
             .map_err(|e| failed(RunStep::State, &self.shown(id), e))?;
+        // After the publishing rename: Windows refuses to rename a directory with an open file inside it.
+        match workspace.create_claim_store(OsStr::new(STATE_DB), self.durability) {
+            Ok(store) => self.claims = Some(store),
+            Err(error) => {
+                drop(workspace);
+                // Retire the published workspace (it holds only its manifest), then the control directories.
+                let shown_id = self.operations_shown().join(id);
+                let mut not_removed =
+                    retire_workspace(&operations, id).err().map(|e| (shown_id.clone(), e));
+                self.operations = Some(operations);
+                if let Err(first) = self.remove_control_dirs(true) {
+                    not_removed.get_or_insert(first);
+                }
+                if let Some((path, error)) = not_removed {
+                    warnings.push(RunWarning::NotRemoved { path, error });
+                }
+                return Err(failed(RunStep::State, &shown_id.join(STATE_DB), error));
+            }
+        }
         drop(workspace);
         self.operations = Some(operations);
         Ok(())
