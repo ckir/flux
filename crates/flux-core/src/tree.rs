@@ -1458,6 +1458,51 @@ mod tests {
     }
 
     #[test]
+    fn a_strict_cannot_tell_mount_root_is_refused_with_safety_rejected() {
+        let fs = tree();
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.create_dir(Path::new("/dst/sub")).unwrap();
+        fs.set_mount_root("/dst/sub", flux_fs::MountRoot::Unknown);
+
+        let (r, got) = run(&fs, "/src", "/dst", &strict());
+
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].path, PathBuf::from("sub"));
+        let TreeFailureCause::CreateDir(e) = &got[0].cause else { panic!("{:?}", got[0].cause) };
+        assert_eq!(e.code, Code::SafetyRejected);
+        assert!(e.source.to_string().contains("cannot be told"), "{}", e.source);
+        assert!(!fs.exists("/dst/sub/b"), "nothing was written into the unknown directory");
+    }
+
+    #[test]
+    fn two_cannot_tell_mount_roots_are_one_group_with_count_two_and_the_first_example() {
+        // `tree()` has a FILE `/src/a`, so this builds its own source.
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/")).unwrap();
+        fs.create_dir(Path::new("/src")).unwrap();
+        fs.create_dir(Path::new("/src/a")).unwrap();
+        fs.create_dir(Path::new("/src/b")).unwrap();
+        fs.write_file("/src/a/x", b"X");
+        fs.write_file("/src/b/y", b"Y");
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.create_dir(Path::new("/dst/a")).unwrap();
+        fs.create_dir(Path::new("/dst/b")).unwrap();
+        fs.set_mount_root("/dst/a", flux_fs::MountRoot::Unknown);
+        fs.set_mount_root("/dst/b", flux_fs::MountRoot::Unknown);
+
+        let (r, got) = run(&fs, "/src", "/dst", &opts());
+
+        let out = r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(
+            out.mount_unknown,
+            Some(DegradedGroup { count: 2, example: PathBuf::from("a") })
+        );
+        assert!(fs.exists("/dst/a/x") && fs.exists("/dst/b/y"), "both subtrees were merged");
+    }
+
+    #[test]
     fn the_source_root_check_runs_before_the_mount_query() {
         // A mount inside DEST presenting the SOURCE ROOT: the whole operation aborts (section 129), it does not
         // become a skipped subtree, and the mount query is never asked.

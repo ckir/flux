@@ -31,6 +31,8 @@ struct Inner {
     mount_roots: HashMap<PathBuf, MountRoot>,
     /// directory snapshot path -> what `canonical_path` answers (absent: the path itself)
     canonical: HashMap<PathBuf, PathBuf>,
+    /// directory snapshot path -> the fault `canonical_path` raises on that one directory, every time
+    canonical_faults: HashMap<PathBuf, (Code, std::io::ErrorKind)>,
     times: HashMap<PathBuf, Option<SystemTime>>,
     /// path -> bytes appended on the second `metadata` call
     grow: HashMap<PathBuf, Vec<u8>>,
@@ -588,6 +590,22 @@ impl FaultFs {
         self.inner.lock().unwrap().canonical.insert(path.to_path_buf(), canonical.to_path_buf());
     }
 
+    /// Make `canonical_path` fail EVERY time on the directory whose snapshot path is `path`, and only there.
+    /// The global `fail`/`fail_kind` fault is consumed by whichever handle asks first, so it cannot aim at the
+    /// second of two queries; this one can.
+    pub fn fail_canonical_path_of(
+        &self,
+        path: impl AsRef<Path>,
+        code: Code,
+        kind: std::io::ErrorKind,
+    ) {
+        self.inner
+            .lock()
+            .unwrap()
+            .canonical_faults
+            .insert(path.as_ref().to_path_buf(), (code, kind));
+    }
+
     /// Whether this fake's `rename_no_replace` has an atomic no-replace primitive.
     /// Defaults to `true`; set `false` to make it report the platform's unsupported
     /// error, which is how a caller's behaviour on such a destination is tested
@@ -1084,6 +1102,9 @@ impl DirHandle for FakeDirHandle {
         let path = self.my_path();
         self.fs().record(format!("canonical_path({})", path.display()), "canonical_path")?;
         let g = self.inner.lock().unwrap();
+        if let Some(&(code, kind)) = g.canonical_faults.get(&path) {
+            return Err(FsError::new(code, std::io::Error::new(kind, "injected")));
+        }
         Ok(g.canonical.get(&path).cloned().unwrap_or(path))
     }
 
@@ -1565,6 +1586,28 @@ mod tests {
         let e = d.canonical_path().unwrap_err();
         assert_eq!(e.source.kind(), std::io::ErrorKind::Unsupported);
         assert_eq!(d.canonical_path().unwrap(), PathBuf::from("/d"), "consumed on use");
+    }
+
+    #[test]
+    fn a_per_directory_canonical_path_fault_hits_only_that_directory_and_every_time() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.create_dir(Path::new("/d/x")).unwrap();
+        fs.fail_canonical_path_of(
+            "/d/x",
+            Code::PermissionDenied,
+            std::io::ErrorKind::PermissionDenied,
+        );
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let x = d.open_dir(OsStr::new("x")).unwrap();
+        assert_eq!(d.canonical_path().unwrap(), PathBuf::from("/d"));
+        for _ in 0..2 {
+            let e = x.canonical_path().unwrap_err();
+            assert_eq!(
+                (e.code, e.source.kind()),
+                (Code::PermissionDenied, std::io::ErrorKind::PermissionDenied)
+            );
+        }
     }
 
     #[test]

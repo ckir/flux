@@ -1648,3 +1648,116 @@ fn a_heartbeat_failure_message_names_the_lock() {
     );
     assert!(message.starts_with("IO_ERROR: "), "{message}");
 }
+
+// Cut 8a test audit: each test below is red under the one-line mutant named in its comment.
+
+/// The path a `Refused` names as not removed, with `/` separators.
+fn not_removed_path(stop: &Option<RunError>) -> Option<String> {
+    match stop {
+        Some(RunError::Refused { not_removed, .. }) => {
+            not_removed.as_ref().map(|(p, _)| p.to_string_lossy().replace('\\', "/"))
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+// Mutant: place.rs `refuse_no_replace` keeps only `leftover` and drops what `unwind_creating` could not remove.
+#[test]
+fn a_refusal_whose_only_leftover_is_the_creating_directory_names_it_and_is_exit_1() {
+    let fs = fake();
+    fs.set_no_replace_support(false);
+    // The probe temporary is removed (no fault on `remove_file`); the run's first `remove_dir` is `<id>.creating`'s.
+    fs.fail_kind("remove_dir", Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let (r, _) = run_tree(&fs, &cfg());
+    let first_remove_dir = calls(&fs).into_iter().find(|c| c.starts_with("remove_dir(")).unwrap();
+    assert_eq!(first_remove_dir, format!("remove_dir(/p/dest/.flux/operations/{ID}.creating)"));
+    let Some(RunError::Refused { refusal, changed, .. }) = &r.stop else { panic!("{:?}", r.stop) };
+    assert_eq!((refusal.code, *changed), (LockCode::NoReplacePublishUnavailable, true));
+    let left = creating("").trim_end_matches('/').to_string();
+    assert_eq!(not_removed_path(&r.stop), Some(left.clone()));
+    assert!(fs.exists(&left), "left where it is");
+    assert!(!fs.exists(creating("noreplace-probe.tmp")), "the probe temporary was removed");
+    assert!(!fs.exists(LOCK), "the lock is still released");
+}
+
+// Mutant: place.rs `unwind_creating` ignores a failure to remove the control directories.
+#[test]
+fn a_refusal_whose_control_directories_cannot_be_removed_is_exit_1() {
+    let fs = fake();
+    fs.set_no_replace_support(false);
+    // The run's remove_dir calls are `<id>.creating`, `.flux/operations`, `.flux`, DEST: fail the second.
+    fs.fail_nth("remove_dir", 2, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let (r, _) = run_tree(&fs, &cfg());
+    let removed: Vec<String> =
+        calls(&fs).into_iter().filter(|c| c.starts_with("remove_dir(")).collect();
+    assert_eq!(removed[1], "remove_dir(/p/dest/.flux/operations)", "{removed:?}");
+    let Some(RunError::Refused { refusal, changed, .. }) = &r.stop else { panic!("{:?}", r.stop) };
+    assert_eq!((refusal.code, *changed), (LockCode::NoReplacePublishUnavailable, true));
+    assert_eq!(not_removed_path(&r.stop), Some("/p/dest/.flux".to_string()));
+    assert!(fs.exists("/p/dest"), "DEST is kept: the unwind stopped at the control directory");
+    assert!(!fs.exists(LOCK), "the lock is still released");
+}
+
+// Mutant for the four tests below: tree.rs `containment` takes the source side as the lexical `src_root`, confirmed,
+// without querying it (`let s = Canonical { path: src_root.to_path_buf(), confirmed: true };`).
+#[test]
+fn a_source_root_whose_canonical_path_is_unsupported_degrades_containment() {
+    let lax = fake();
+    // Per path: the global fault would be consumed by the anchor's query, which comes first.
+    lax.fail_canonical_path_of("/src", Code::IoError, std::io::ErrorKind::Unsupported);
+    let (r, _) = run_tree(&lax, &cfg());
+    let out = ok(&r);
+    assert_eq!(out.files_copied, 2);
+    assert_eq!(
+        out.containment_degraded.as_deref(),
+        Some(Path::new("/src")),
+        "the source root's query failed, so the source root is named"
+    );
+
+    let tight = fake();
+    tight.fail_canonical_path_of("/src", Code::IoError, std::io::ErrorKind::Unsupported);
+    let mut got = Vec::new();
+    let strict = CopyOptions { safety: Safety::Strict, ..opts() };
+    let r = tree(&tight, Path::new("/src"), Path::new("/p/dest"), &strict, &cfg(), &mut |f| {
+        got.push(f)
+    });
+    assert_eq!(aborted(&r).error.code(), Code::SafetyRejected);
+    assert!(!tight.called("create_lock") && !tight.exists("/p/dest"));
+}
+
+#[test]
+fn another_source_root_canonical_path_error_aborts_before_the_lock() {
+    let fs = fake();
+    fs.fail_canonical_path_of("/src", Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let (r, _) = run_tree(&fs, &cfg());
+    let a = aborted(&r);
+    assert_eq!((a.error.code(), a.error.step), (Code::PermissionDenied, CopyStep::Resolve));
+    assert!(!fs.called("create_lock"));
+}
+
+#[test]
+fn a_source_root_canonical_path_naming_another_object_aborts_before_the_lock() {
+    let fs = fake();
+    fs.create_dir(Path::new("/elsewhere")).unwrap(); // keeps its own Strong identity: not `/src`'s
+    fs.set_canonical_path("/src", "/elsewhere");
+    let (r, _) = run_tree(&fs, &cfg());
+    let a = aborted(&r);
+    assert_eq!((a.error.code(), a.error.step), (Code::DestinationError, CopyStep::Resolve));
+    assert!(!fs.called("create_lock"));
+}
+
+#[test]
+fn an_unconfirmed_source_canonical_path_alone_degrades_the_check() {
+    let fs = fake();
+    fs.create_dir(Path::new("/srcs")).unwrap();
+    fs.set_canonical_path("/src", "/srcs");
+    fs.set_identity("/srcs", FileIdentity::Weak(ObjectId { volume: 1, index: 77 }));
+    let (r, _) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert_eq!(out.files_copied, 2);
+    assert_eq!(
+        out.containment_degraded.as_deref(),
+        Some(Path::new("/p")),
+        "the anchor is confirmed and outside the source; only the source side is unconfirmed"
+    );
+}
