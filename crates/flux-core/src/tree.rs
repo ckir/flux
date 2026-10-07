@@ -518,8 +518,19 @@ fn walk_into<F: DestinationRoot>(
                     report(out, on_report, path, TreeFailureCause::SpecialFileSkipped);
                 }
             }
-            WalkEvent::DirEnd { .. } => {
-                stack.pop();
+            WalkEvent::DirEnd { path } => {
+                // Cut 8b, "Claim syncing": a directory that keyed claims is flushed at its end. A synced commit is a
+                // write under DEST, so §101 and §99 come first, as before a directory's creation. A skipped
+                // directory flushed nothing.
+                if let Some(Frame::Live { claim_parent: Some(_), .. }) = stack.pop()
+                    && let Some(claims) = cx.claims
+                {
+                    (cx.beat)().map_err(|e| CopyError::at(CopyStep::Heartbeat, e))?;
+                    (cx.guard)().map_err(|e| CopyError::at(CopyStep::Create, e))?;
+                    if let Err(e) = claims.borrow_mut().flush() {
+                        report(out, on_report, path, TreeFailureCause::ClaimNotRecorded(e));
+                    }
+                }
             }
         }
     }
@@ -1151,7 +1162,7 @@ fn refuse(why: &'static str) -> CopyError {
 }
 
 /// Count the record, then stream it. The only place either happens.
-fn report(
+pub(crate) fn report(
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
     path: PathBuf,

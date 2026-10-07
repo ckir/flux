@@ -22,9 +22,11 @@ use crate::prior::check_control_plane;
 use crate::state::{OpState, file_names_fit, identity_text, native_hex};
 use crate::tree::{
     Shared, TreeAbort, TreeFailure, TreeFailureCause, TreeOutcome, copy_tree_at, prepare_source,
+    report,
 };
 use flux_fs::{
-    Code, CopyOptions, DestinationRoot, DirHandle, FileIdentity, FsError, OperationId, Outcome,
+    ClaimStore, Code, CopyOptions, DestinationRoot, DirHandle, FileIdentity, FsError, OperationId,
+    Outcome,
 };
 use place::{FilePlace, Place, TreePlace, locate_tree};
 use session::{Locked, beat_error, from_lock, guarded, lock_io, open_operation, owned};
@@ -225,18 +227,16 @@ pub fn tree<F: DestinationRoot>(
     };
     // Step 6: the copy, with §99 before every destination mutation.
     let mut leftovers: Vec<PathBuf> = Vec::new();
+    let guard = || {
+        if let Some(hook) = &cfg.before_mutation {
+            hook();
+        }
+        guarded(&locked.held, &locked.pulse)
+    };
+    let beat = || locked.pulse.beat(&locked.held).map_err(|e| beat_error(&locked.lock_shown, e));
+    // The store stays open past the walk, for the final sync; it is dropped before `finish` removes the file.
+    let claims = place.claims.take().map(std::cell::RefCell::new);
     let walked = {
-        let guard = || {
-            if let Some(hook) = &cfg.before_mutation {
-                hook();
-            }
-            guarded(&locked.held, &locked.pulse)
-        };
-        let beat =
-            || locked.pulse.beat(&locked.held).map_err(|e| beat_error(&locked.lock_shown, e));
-        // The store lives only for the walk: the cell is dropped at the end of this block, before `finish`
-        // removes the file.
-        let claims = place.claims.take().map(std::cell::RefCell::new);
         let cx = Shared {
             fs,
             src_root,
@@ -272,6 +272,38 @@ pub fn tree<F: DestinationRoot>(
         Err(a) if a.refused_unchanged() => Ended::RefusedUnchanged,
         Err(_) => Ended::Failed,
     };
+    // Cut 8b, "Claim syncing", the final sync: the claims written since the last directory end, only when the
+    // workspace is KEPT. Never on a clean completion (the file is unlinked right after), a refusal (the workspace is
+    // removed) or a lost lock (no ownership: no write).
+    if let Some(claims) = &claims {
+        match &ended {
+            // Best effort: the heartbeat intact and ownership held; its error never replaces the primary one.
+            Ended::Failed => {
+                if !locked.pulse.failed() && owned(&locked.held, &locked.lock_shown).is_ok() {
+                    let _ignored = claims.borrow_mut().flush();
+                }
+            }
+            // A failure is reported, and counted before `finish`.
+            Ended::Completed { leftovers, .. } if !leftovers.is_empty() => {
+                let synced =
+                    beat().and_then(|()| guard()).and_then(|()| claims.borrow_mut().flush());
+                if let Err(e) = synced {
+                    let outcome = match &mut result {
+                        Ok(o) => o,
+                        Err(a) => &mut a.outcome,
+                    };
+                    report(
+                        outcome,
+                        on_report,
+                        PathBuf::new(),
+                        TreeFailureCause::ClaimNotRecorded(e),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    drop(claims);
     run.stop = finish(&mut place, locked, ended, &mut run.warnings);
     // E1: a DEST this run made counts among the directories it created, unless a rollback removed it again.
     if place.created_dest {

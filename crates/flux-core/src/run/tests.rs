@@ -1110,9 +1110,9 @@ fn a_refusal_of_the_lock_names_the_lock_path() {
 
 #[test]
 fn the_hook_runs_once_before_each_guarded_mutation() {
-    // A tree's guarded mutations: `a`'s sweep, temporary and publish; `sub`'s creation; `sub/b`'s three. A single
-    // file's: its sweep, temporary and publish.
-    for (tree_run, expected) in [(true, 7), (false, 3)] {
+    // A tree's guarded mutations: `a`'s sweep, temporary and publish; `sub`'s creation; `sub/b`'s three; `sub`'s
+    // directory-end flush (cut 8b). A single file's: its sweep, temporary and publish.
+    for (tree_run, expected) in [(true, 8), (false, 3)] {
         let fs = fake();
         let count = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&count);
@@ -2343,4 +2343,185 @@ fn a_fold_in_a_destination_the_run_created_is_refused_by_the_no_replace_rename_e
         !calls(&fs).iter().any(|x| x.starts_with("rename_replace(/p/dest/File")),
         "no replacing rename"
     );
+}
+
+// Cut 8b Task 11: the directory-end flush and the final sync. Each test is red under the one-line mutant named in its
+// comment.
+
+/// `fake()` plus a second directory, `/src/sub2/c`, so a run has two directories below the root.
+fn fake_two_dirs() -> FaultFs {
+    let fs = fake();
+    fs.create_dir(Path::new("/src/sub2")).unwrap();
+    fs.write_file("/src/sub2/c", b"C");
+    fs
+}
+
+/// The number of `claim_flush` calls in the log.
+fn flushes(fs: &FaultFs) -> usize {
+    count(&calls(fs), "claim_flush")
+}
+
+// Mutant: tree.rs `walk_into`'s `DirEnd` arm drops the `(cx.guard)()` call before the flush.
+#[test]
+fn a_directory_end_flushes_after_the_heartbeat_and_the_guard() {
+    let fs = fake();
+    let hooks = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&hooks);
+    let hook: BeforeMutation = Arc::new(move || {
+        seen.fetch_add(1, Ordering::SeqCst);
+    });
+    // The guard hooks counted just before `sub/b`'s claim insert (the 2nd) and just before the flush.
+    let (at_upgrade, at_flush) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (h, u) = (Arc::clone(&hooks), Arc::clone(&at_upgrade));
+    fs.on_nth("claim_insert", 2, move |_| u.store(h.load(Ordering::SeqCst), Ordering::SeqCst));
+    let (h, f) = (Arc::clone(&hooks), Arc::clone(&at_flush));
+    fs.on_nth("claim_flush", 1, move |_| f.store(h.load(Ordering::SeqCst), Ordering::SeqCst));
+    let c = RunConfig { before_mutation: Some(hook), ..beating() };
+    let (r, got) = run_tree(&fs, &c);
+    ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(
+        at_flush.load(Ordering::SeqCst),
+        at_upgrade.load(Ordering::SeqCst) + 1,
+        "exactly one guard between the last claim of `sub` and its flush"
+    );
+    let c = calls(&fs);
+    let upgrade = at(&c, "claim_insert(b)");
+    let beat = after(&c, upgrade, "write_at_start(");
+    let flush = after(&c, upgrade, "claim_flush");
+    assert!(upgrade < beat && beat < flush, "the heartbeat sits between: {c:?}");
+}
+
+// Mutant: the `DirEnd` arm flushes whatever frame it pops, `Frame::Skipped` included.
+#[test]
+fn a_skipped_directory_flushes_nothing() {
+    let fs = dest_fake();
+    fs.add_symlink("/p/dest/sub");
+    let (r, got) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].path, PathBuf::from("sub"));
+    assert_eq!(out.failures.claim_not_recorded, 0);
+    assert_eq!(flushes(&fs), 0, "{:?}", calls(&fs));
+}
+
+// Mutant: the `DirEnd` arm discards the flush error (`let _ = ...flush();`).
+#[test]
+fn a_flush_error_is_claim_not_recorded_for_that_directory_and_the_walk_continues() {
+    let fs = fake_two_dirs();
+    fs.fail_nth("claim_flush", 1, Code::IoError, std::io::ErrorKind::Other);
+    let (r, got) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(matches!(&got[0].cause, TreeFailureCause::ClaimNotRecorded(_)), "{got:?}");
+    assert_eq!(got[0].path, PathBuf::from("sub"));
+    assert_eq!(out.failures.claim_not_recorded, 1);
+    assert_eq!(fs.read_file("/p/dest/sub/b").as_deref(), Some(&b"BB"[..]));
+    assert_eq!(fs.read_file("/p/dest/sub2/c").as_deref(), Some(&b"C"[..]), "the walk continued");
+    assert_eq!(flushes(&fs), 2, "the sibling was flushed too");
+}
+
+// Mutant: the `DirEnd` arm drops the `(cx.guard)()?` line (or ignores its error).
+#[test]
+fn a_lost_lock_aborts_at_the_directory_end_flush() {
+    let fs = fake();
+    // Just before `sub/b`'s claim insert (the 2nd) the lock is taken over; nothing after the insert guards but the
+    // directory end.
+    fs.on_nth("claim_insert", 2, |fs| fs.write_file(LOCK, b"another run's bytes"));
+    let (r, _) = run_tree(&fs, &cfg());
+    assert!(r.stop.is_none(), "the copy's abort is the report: {:?}", r.stop);
+    let a = aborted(&r);
+    assert_eq!(a.error.code(), Code::TargetLockBusy);
+    assert_eq!(flushes(&fs), 0, "no flush, no final sync: {:?}", calls(&fs));
+}
+
+// Mutant: `run::tree` makes the final sync for every `Ended`.
+#[test]
+fn a_clean_run_makes_no_final_sync() {
+    let fs = fake_two_dirs();
+    let (r, got) = run_tree(&fs, &cfg());
+    ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(flushes(&fs), 2, "one per directory, the root excluded: {:?}", calls(&fs));
+}
+
+/// A run that fails after `a` and `sub/b`'s directory were made: the no-replace publish of `sub/b` is unavailable.
+/// `rename_no_replace` calls before it are the workspace's and `a`'s.
+fn failing_run(fs: &FaultFs, nth: u32) {
+    fs.fail_nth("rename_no_replace", nth, Code::IoError, std::io::ErrorKind::Unsupported);
+}
+
+// Mutants: `run::tree` skips the final sync for `Ended::Failed`; it syncs when the heartbeat failed.
+#[test]
+fn a_kept_workspace_after_a_failure_gets_a_final_sync() {
+    let fs = fake();
+    failing_run(&fs, 4);
+    let (r, _) = run_tree(&fs, &cfg());
+    let a = aborted(&r);
+    assert_eq!(a.error.code(), Code::NoReplacePublishUnavailable, "{a:?}");
+    assert_eq!(manifest(&fs, ID).state, OpState::Failed);
+    assert_eq!(flushes(&fs), 1, "the final sync: `sub` never ended: {:?}", calls(&fs));
+    let c = calls(&fs);
+    assert!(at(&c, "claim_insert(a)") < at(&c, "claim_flush"), "{c:?}");
+    assert!(!fs.exists(LOCK), "released");
+
+    // After a failed heartbeat nothing is written: no final sync. The abort is the heartbeat's.
+    let fs = fake();
+    fail_heartbeat(&fs, 2, LOCK, false);
+    let (r, _) = run_tree(&fs, &beating());
+    let a = aborted(&r);
+    assert_eq!(a.error.step, CopyStep::Heartbeat);
+    assert_eq!(flushes(&fs), 0, "{:?}", calls(&fs));
+}
+
+// Mutants: `run::tree` skips the final sync for a completed run with leftovers; it lets a failed one go unreported.
+#[test]
+fn a_completed_run_with_leftovers_gets_a_final_sync_and_reports_its_failure() {
+    let fs = fake();
+    // As `a_temporary_the_copy_could_not_remove_keeps_the_completed_state`; the flushes are `sub`'s (1), then the final
+    // sync's (2), which fails.
+    fs.on_nth("create_new", 4, |fs| fs.fail_write(std::io::Error::other("injected write")));
+    fs.fail_nth("remove_file", 5, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    fs.fail_nth("claim_flush", 2, Code::IoError, std::io::ErrorKind::Other);
+    let (r, got) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert_eq!(flushes(&fs), 2, "{:?}", calls(&fs));
+    let last = got.last().expect("the final sync's failure is streamed");
+    assert!(matches!(&last.cause, TreeFailureCause::ClaimNotRecorded(_)), "{got:?}");
+    assert_eq!(last.path, PathBuf::new(), "the root");
+    assert_eq!((out.failures.claim_not_recorded, out.failures.copy), (1, 1), "{got:?}");
+    assert!(r.warnings.iter().any(|w| matches!(w, RunWarning::StateKept(_))), "{:?}", r.warnings);
+    assert_eq!(manifest(&fs, ID).state, OpState::Completed);
+
+    // Without the injected flush failure the final sync is silent.
+    let fs = fake();
+    fs.on_nth("create_new", 4, |fs| fs.fail_write(std::io::Error::other("injected write")));
+    fs.fail_nth("remove_file", 5, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let (r, got) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert_eq!(flushes(&fs), 2, "{:?}", calls(&fs));
+    assert_eq!(out.failures.claim_not_recorded, 0, "{got:?}");
+}
+
+// Mutants: `run::tree` syncs for `Ended::RefusedUnchanged`; it syncs for `Ended::Lost`.
+#[test]
+fn no_final_sync_after_a_refusal_or_a_lost_lock() {
+    // A refusal: `sub` is DEST by identity, nothing changed, the workspace is removed again.
+    let fs = FaultFs::new();
+    for d in ["/src", "/src/sub", "/p", "/p/dest"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    fs.write_file("/src/sub/b", b"BB");
+    fs.set_identity("/src/sub", fs.metadata(Path::new("/p/dest")).unwrap().identity);
+    let (r, _) = run_tree(&fs, &cfg());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert!(aborted(&r).refused_unchanged());
+    assert_eq!(flushes(&fs), 0, "{:?}", calls(&fs));
+
+    // A lost lock, before the first directory ends and where the walk's own guard notices.
+    let fs = fake();
+    fs.on_nth("create_new", 4, |fs| fs.write_file(LOCK, b"another run's bytes"));
+    let (r, _) = run_tree(&fs, &cfg());
+    assert_eq!(aborted(&r).error.code(), Code::TargetLockBusy);
+    assert_eq!(flushes(&fs), 0, "{:?}", calls(&fs));
 }
