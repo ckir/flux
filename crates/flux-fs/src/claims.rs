@@ -106,6 +106,11 @@ pub enum ClaimOutcome {
 pub trait ClaimStore {
     fn insert_if_absent(&mut self, key: &ClaimKey, record: &ClaimRecord) -> Result<ClaimOutcome>;
     fn get(&self, key: &ClaimKey) -> Result<Option<ClaimRecord>>;
+    /// Rewrites the claim at `key` with status `Created`, keeping its target.
+    ///
+    /// Errors when `key` is missing, and when the stored record's target differs from
+    /// `target`: that is what a "foreign owner" means here. The claim is left untouched
+    /// in both cases.
     fn upgrade_own_claim(&mut self, key: &ClaimKey, target: &FluxPathKey) -> Result<()>;
     fn flush(&mut self) -> Result<()>;
 }
