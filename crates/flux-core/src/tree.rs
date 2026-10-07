@@ -42,6 +42,9 @@ pub struct TreeOutcome {
     /// Part M: pre-existing destination directories whose mount-root query could not tell, merged into under
     /// `Safety::Default`. The example is relative to the source root, as `warnings` are.
     pub mount_unknown: Option<DegradedGroup>,
+    /// Part A: the canonical-path query was unsupported, so containment was checked lexically only. The path
+    /// whose query failed, as the operator gave it (DEST, its parent, or the source root).
+    pub containment_degraded: Option<PathBuf>,
 }
 
 /// The operation stopped as a whole (cut 5, K1). `outcome` holds what was counted
@@ -704,12 +707,83 @@ pub(crate) fn preflight(
     }
 }
 
+/// A canonical path from a handle; `confirmed` is true when the object at it was seen to have the handle's own
+/// `Strong` identity (decision 4).
+struct Canonical {
+    path: PathBuf,
+    confirmed: bool,
+}
+
+/// The canonical path of `dir`: `Ok(None)` when the query is unsupported; `Err` for any other failure, including a
+/// path holding another `Strong` object (the mismatch).
+fn canonical_of<F: DestinationRoot>(
+    fs: &F,
+    dir: &F::Dir,
+) -> std::result::Result<Option<Canonical>, FsError> {
+    let path = match dir.canonical_path() {
+        Ok(p) => p,
+        Err(e) if e.source.kind() == ErrorKind::Unsupported => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let there = fs.metadata(&path)?.identity;
+    let confirmed = match (dir.identity()?, there) {
+        (FileIdentity::Strong(a), FileIdentity::Strong(b)) if a == b => true,
+        (FileIdentity::Strong(_), FileIdentity::Strong(_)) => {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::other(
+                    "the path reported for an open directory now holds a different object",
+                ),
+            ));
+        }
+        _ => false,
+    };
+    Ok(Some(Canonical { path, confirmed }))
+}
+
+/// Part A: the resolved destination anchor must not be the source root or lie inside it. `anchor` is the handle
+/// the run then writes through; `anchor_shown` names it in the warning. Runs after the identity pre-flight.
+pub(crate) fn containment<F: DestinationRoot>(
+    fs: &F,
+    src_root: &Path,
+    anchor: &F::Dir,
+    anchor_shown: &Path,
+    safety: Safety,
+    out: &mut TreeOutcome,
+) -> std::result::Result<(), CopyError> {
+    let resolve = |e| CopyError::at(CopyStep::Resolve, e);
+    let degraded = |shown: &Path, out: &mut TreeOutcome| match safety {
+        Safety::Default => {
+            out.containment_degraded.get_or_insert_with(|| shown.to_path_buf());
+            Ok(())
+        }
+        Safety::Strict => Err(refuse(
+            "the destination's location cannot be resolved from its handle, so containment cannot be checked with full confidence",
+        )),
+    };
+    let Some(a) = canonical_of(fs, anchor).map_err(resolve)? else {
+        return degraded(anchor_shown, out);
+    };
+    let src = fs.destination_root(src_root).map_err(resolve)?;
+    let Some(s) = canonical_of(fs, &src).map_err(resolve)? else {
+        return degraded(src_root, out);
+    };
+    drop(src);
+    if lexically_within(&a.path, &s.path) {
+        return Err(refuse("the destination's resolved location is the source or lies inside it"));
+    }
+    if !(a.confirmed && s.confirmed) {
+        return degraded(anchor_shown, out);
+    }
+    Ok(())
+}
+
 /// `inner` equals `outer` or lies inside it, compared component by component with `.`
 /// dropped and no filesystem access. `..` is not resolved (that needs the
 /// filesystem): a spelling through `..` is compared as written, and identity is the
 /// check that sees through it. Paths are compared as given; cut 5's CLI canonicalizes
 /// both roots before calling the engine.
-fn lexically_within(inner: &Path, outer: &Path) -> bool {
+pub(crate) fn lexically_within(inner: &Path, outer: &Path) -> bool {
     fn parts(p: &Path) -> Vec<Component<'_>> {
         p.components().filter(|c| !matches!(c, Component::CurDir)).collect()
     }

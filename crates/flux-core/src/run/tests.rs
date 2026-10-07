@@ -8,7 +8,8 @@ use crate::lock::record::{Decoded, LockRecord, decode};
 use crate::lock::test_support::{dead_lock, live_lock, record};
 use crate::state::{Kind, OperationState, UNREADABLE, decode as decode_state};
 use flux_fs::{
-    DestinationRoot, Durability, FileSystem, LockCapability, OperationId, Preserve, Publish, Safety,
+    DestinationRoot, Durability, FileIdentity, FileSystem, LockCapability, ObjectId, OperationId,
+    Preserve, Publish, Safety,
 };
 use std::ffi::OsStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -615,6 +616,133 @@ fn a_file_at_dest_is_a_destination_error_before_anything_is_made() {
     assert!(r.stop.is_none(), "{:?}", r.stop);
     assert_eq!(aborted(&r).error.code(), Code::DestinationError);
     assert!(!fs.called("create_lock"), "{:?}", fs.calls());
+}
+
+/// `run_tree` with the destination chosen by the test.
+fn run_tree_to(fs: &FaultFs, dst: &str) -> (Run<Result<TreeOutcome, TreeAbort>>, Vec<TreeFailure>) {
+    let mut got = Vec::new();
+    let r = tree(fs, Path::new("/src"), Path::new(dst), &opts(), &cfg(), &mut |f| got.push(f));
+    (r, got)
+}
+
+#[test]
+fn a_destination_whose_resolved_anchor_lies_inside_the_source_is_refused_before_the_lock() {
+    // DEST is absent, so the anchor is its parent `/p`, which (through a link in a parent component) IS `/src/sub`:
+    // its canonical path says so, and the object at that path has the handle's identity.
+    let fs = fake();
+    fs.set_canonical_path("/p", "/src/sub");
+    fs.set_identity("/src/sub", fs.metadata(Path::new("/p")).unwrap().identity);
+    let (r, _) = run_tree(&fs, &cfg());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    let a = aborted(&r);
+    assert_eq!((a.error.code(), a.error.step), (Code::SafetyRejected, CopyStep::Resolve));
+    assert!(a.refused_unchanged());
+    assert!(a.error.to_string().contains("resolved location"), "{}", a.error);
+    assert!(!fs.called("create_lock"), "{:?}", calls(&fs));
+    assert!(!fs.exists("/p/dest"));
+}
+
+#[test]
+fn an_existing_destination_whose_resolved_path_lies_inside_the_source_is_refused() {
+    let fs = fake();
+    fs.create_dir(Path::new("/p/dest")).unwrap();
+    fs.set_canonical_path("/p/dest", "/src/sub");
+    fs.set_identity("/src/sub", fs.metadata(Path::new("/p/dest")).unwrap().identity);
+    let (r, _) = run_tree(&fs, &cfg());
+    assert_eq!(aborted(&r).error.code(), Code::SafetyRejected);
+    assert!(!fs.called("create_lock") && !fs.exists("/p/dest/.flux"));
+}
+
+#[test]
+fn a_root_destination_whose_resolved_location_lies_inside_the_source_is_refused() {
+    // `locate_tree`'s filesystem-root branch (Review Focus 4).
+    let fs = fake();
+    fs.set_canonical_path("/", "/src/sub");
+    fs.set_identity("/src/sub", fs.destination_root(Path::new("/")).unwrap().identity().unwrap());
+    let (r, _) = run_tree_to(&fs, "/");
+    assert_eq!(aborted(&r).error.code(), Code::SafetyRejected);
+    assert!(!fs.called("create_lock"));
+}
+
+#[test]
+fn a_merely_similar_resolved_name_is_not_inside_the_source() {
+    let fs = fake();
+    fs.create_dir(Path::new("/srcs")).unwrap();
+    fs.set_canonical_path("/p", "/srcs");
+    fs.set_identity("/srcs", fs.metadata(Path::new("/p")).unwrap().identity);
+    let (r, _) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert_eq!(out.files_copied, 2);
+    assert!(out.containment_degraded.is_none());
+}
+
+#[test]
+fn an_unsupported_canonical_path_query_warns_under_default_and_refuses_under_strict() {
+    let lax = fake();
+    lax.fail_kind("canonical_path", Code::IoError, std::io::ErrorKind::Unsupported);
+    let (r, _) = run_tree(&lax, &cfg());
+    let out = ok(&r);
+    assert_eq!(
+        out.containment_degraded.as_deref(),
+        Some(Path::new("/p")),
+        "the anchor's query failed"
+    );
+
+    let tight = fake();
+    tight.fail_kind("canonical_path", Code::IoError, std::io::ErrorKind::Unsupported);
+    let mut got = Vec::new();
+    let strict = CopyOptions { safety: Safety::Strict, ..opts() };
+    let r = tree(&tight, Path::new("/src"), Path::new("/p/dest"), &strict, &cfg(), &mut |f| {
+        got.push(f)
+    });
+    assert_eq!(aborted(&r).error.code(), Code::SafetyRejected);
+    assert!(!tight.called("create_lock") && !tight.exists("/p/dest"));
+}
+
+#[test]
+fn another_canonical_path_error_aborts_before_the_lock() {
+    let fs = fake();
+    fs.fail_kind("canonical_path", Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let (r, _) = run_tree(&fs, &cfg());
+    let a = aborted(&r);
+    assert_eq!((a.error.code(), a.error.step), (Code::PermissionDenied, CopyStep::Resolve));
+    assert!(!fs.called("create_lock"));
+}
+
+#[test]
+fn a_canonical_path_naming_another_object_aborts_before_the_lock() {
+    // The handle's directory was renamed away and another directory holds the reported name (Review Focus 3).
+    let fs = fake();
+    fs.set_canonical_path("/p", "/src/sub"); // `/src/sub` keeps its own identity: not `/p`'s
+    let (r, _) = run_tree(&fs, &cfg());
+    let a = aborted(&r);
+    assert_eq!((a.error.code(), a.error.step), (Code::DestinationError, CopyStep::Resolve));
+    assert!(!fs.called("create_lock"));
+}
+
+#[test]
+fn an_unconfirmed_path_outside_the_source_is_degraded_but_one_inside_it_is_still_refused() {
+    // Weak identity at the reported path: the all-clear cannot be confirmed (warn / strict-refuse)...
+    let outside = fake();
+    outside.create_dir(Path::new("/srcs")).unwrap();
+    outside.set_canonical_path("/p", "/srcs");
+    outside.set_identity("/srcs", FileIdentity::Weak(ObjectId { volume: 1, index: 77 }));
+    let (r, _) = run_tree(&outside, &cfg());
+    assert_eq!(ok(&r).containment_degraded.as_deref(), Some(Path::new("/p")));
+
+    // ...but a reported path INSIDE the source refuses in every mode, confirmed or not (agy panel r1).
+    for safety in [Safety::Default, Safety::Strict] {
+        let inside = fake();
+        inside.set_canonical_path("/p", "/src/sub");
+        inside.set_identity("/src/sub", FileIdentity::Weak(ObjectId { volume: 1, index: 77 }));
+        let mut got = Vec::new();
+        let o = CopyOptions { safety, ..opts() };
+        let r = tree(&inside, Path::new("/src"), Path::new("/p/dest"), &o, &cfg(), &mut |f| {
+            got.push(f)
+        });
+        assert_eq!(aborted(&r).error.code(), Code::SafetyRejected, "{safety:?}");
+        assert!(!inside.called("create_lock"));
+    }
 }
 
 #[test]

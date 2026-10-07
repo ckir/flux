@@ -12,7 +12,7 @@ use crate::state::{
     id_after, operations_dir, record_name, remove_empty_control_dirs, remove_record,
     retire_workspace, write_state,
 };
-use crate::tree::{WeakIdentityWarnings, preflight, reserved_path};
+use crate::tree::{TreeOutcome, containment, preflight, reserved_path};
 use crate::walk::{WalkEvent, walk};
 use flux_fs::{
     Code, DestinationRoot, DirHandle, FileIdentity, FileType, FsError, OperationId, Safety,
@@ -73,15 +73,17 @@ pub(crate) struct LocatedTree<D> {
 /// is absent, before anything is created. A filesystem root holds its own lock (`T/.flux-root.lock`).
 pub(crate) fn locate_tree<F: DestinationRoot>(
     fs: &F,
+    src_root: &Path,
     dst_root: &Path,
     src_identity: FileIdentity,
     safety: Safety,
-    warnings: &mut WeakIdentityWarnings,
+    out: &mut TreeOutcome,
 ) -> Result<LocatedTree<F::Dir>, CopyError> {
     let resolve = |e| CopyError::at(CopyStep::Resolve, e);
     if dst_root.file_name().is_none() {
         let holder = fs.destination_root(dst_root).map_err(resolve)?;
-        preflight(src_identity, holder.identity().map_err(resolve)?, safety, warnings)?;
+        preflight(src_identity, holder.identity().map_err(resolve)?, safety, &mut out.warnings)?;
+        containment(fs, src_root, &holder, dst_root, safety, out)?;
         let dest = fs.destination_root(dst_root).map_err(resolve)?;
         return Ok(LocatedTree {
             holder,
@@ -116,7 +118,12 @@ pub(crate) fn locate_tree<F: DestinationRoot>(
         None => holder.identity(),
     }
     .map_err(resolve)?;
-    preflight(src_identity, anchor, safety, warnings)?;
+    preflight(src_identity, anchor, safety, &mut out.warnings)?;
+    let (anchor_handle, anchor_shown) = match &dest {
+        Some(d) => (d, dst_root),
+        None => (&holder, parent_path),
+    };
+    containment(fs, src_root, anchor_handle, anchor_shown, safety, out)?;
     Ok(LocatedTree {
         holder,
         holder_shown: parent_path.to_path_buf(),

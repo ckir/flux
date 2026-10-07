@@ -163,7 +163,8 @@ pub fn tree<F: DestinationRoot>(
             return run;
         }
     };
-    let located = match locate_tree(fs, dst_root, source.identity, opts.safety, &mut out.warnings) {
+    let located = match locate_tree(fs, src_root, dst_root, source.identity, opts.safety, &mut out)
+    {
         Ok(l) => l,
         Err(error) => {
             run.copy = Some(Err(TreeAbort { error, outcome: out }));
