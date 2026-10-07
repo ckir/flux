@@ -69,8 +69,10 @@ taken (Part A).
    object at the returned path "must have the handle's own identity" and a mismatch "counts as any other error",
    but says nothing about a weak identity. This plan: `Strong` and equal passes; `Strong` on both sides and unequal
    is the mismatch, an abort with `Code::DestinationError` at `CopyStep::Resolve`; anything weaker on either side
-   cannot confirm the path and is treated as UNSUPPORTED (warn under default, refuse under strict), the rule this
-   cut applies to every check it cannot make with full confidence.
+   leaves the path UNCONFIRMED. An unconfirmed path still counts for the REFUSAL: the open handle itself reported
+   it, so if it lies inside the source the run is refused in every safety mode (spec: "This holds in every safety
+   mode"; agy panel r1, Axiom Breaker). It is only the all-clear that needs confirmation: an unconfirmed path
+   outside the source is the degraded case (warn under default, refuse under strict).
 5. **The new warnings are two fields on `TreeOutcome`, not members of `WeakIdentityWarnings`.** The spec puts them
    "beside" the weak-identity warnings. `mount_unknown: Option<DegradedGroup>` (count + first path relative to the
    source root, as `DegradedGroup` already is) and `containment_degraded: Option<PathBuf>` (the path whose query
@@ -632,9 +634,13 @@ git commit -m "feat: never merge into a pre-existing destination mount root (cut
       out: &mut TreeOutcome,
   ) -> std::result::Result<(), CopyError>
 
-  /// The canonical path of `dir`, identity-checked (decision 4): `Ok(None)` when the query is unsupported or the
-  /// identities cannot confirm it; `Err` for any other failure, including a path that holds another object.
-  fn canonical_of<F: DestinationRoot>(fs: &F, dir: &F::Dir) -> std::result::Result<Option<PathBuf>, FsError>
+  /// A canonical path from a handle; `confirmed` is true when the object at it was seen to have the handle's own
+  /// `Strong` identity (decision 4).
+  struct Canonical { path: PathBuf, confirmed: bool }
+
+  /// The canonical path of `dir`: `Ok(None)` when the query is unsupported; `Err` for any other failure, including a
+  /// path holding another `Strong` object (the mismatch).
+  fn canonical_of<F: DestinationRoot>(fs: &F, dir: &F::Dir) -> std::result::Result<Option<Canonical>, FsError>
   ```
   and `locate_tree`'s new signature:
   ```rust
@@ -752,13 +758,26 @@ fn a_canonical_path_naming_another_object_aborts_before_the_lock() {
 }
 
 #[test]
-fn a_weak_identity_at_the_resolved_path_is_treated_as_unsupported() {
-    let fs = fake();
-    fs.set_canonical_path("/p", "/src/sub");
-    fs.set_identity("/src/sub", FileIdentity::Weak(ObjectId { volume: 1, index: 77 }));
-    let (r, _) = run_tree(&fs, &cfg());
-    let out = ok(&r);
-    assert_eq!(out.containment_degraded.as_deref(), Some(Path::new("/p")));
+fn an_unconfirmed_path_outside_the_source_is_degraded_but_one_inside_it_is_still_refused() {
+    // Weak identity at the reported path: the all-clear cannot be confirmed (warn / strict-refuse)...
+    let outside = fake();
+    outside.create_dir(Path::new("/srcs")).unwrap();
+    outside.set_canonical_path("/p", "/srcs");
+    outside.set_identity("/srcs", FileIdentity::Weak(ObjectId { volume: 1, index: 77 }));
+    let (r, _) = run_tree(&outside, &cfg());
+    assert_eq!(ok(&r).containment_degraded.as_deref(), Some(Path::new("/p")));
+
+    // ...but a reported path INSIDE the source refuses in every mode, confirmed or not (agy panel r1).
+    for safety in [Safety::Default, Safety::Strict] {
+        let inside = fake();
+        inside.set_canonical_path("/p", "/src/sub");
+        inside.set_identity("/src/sub", FileIdentity::Weak(ObjectId { volume: 1, index: 77 }));
+        let mut got = Vec::new();
+        let o = CopyOptions { safety, ..opts() };
+        let r = tree(&inside, Path::new("/src"), Path::new("/p/dest"), &o, &cfg(), &mut |f| got.push(f));
+        assert_eq!(aborted(&r).error.code(), Code::SafetyRejected, "{safety:?}");
+        assert!(!inside.called("create_lock"));
+    }
 }
 ```
   (`ObjectId` and `FileIdentity` come from `flux_fs`; add them to the file's `use flux_fs::{..}` at `:10-12`.)
@@ -770,15 +789,17 @@ Expected: compile error on `containment_degraded`; after adding the field as a s
 assertions.
 
 - [ ] **Step 3: Implement `canonical_of` and `containment` in `tree.rs`** beside `preflight`; make `lexically_within`
-  `pub(crate)`. `containment`: `canonical_of(fs, anchor)` first; on `Ok(None)` apply the degraded rule with
-  `anchor_shown`; then `let src = fs.destination_root(src_root)` and `canonical_of(fs, &src)`, degraded rule with
-  `src_root`; the handle is dropped there; `if lexically_within(&dest, &src) { return Err(refuse(..)) }`. The
-  degraded rule: `Safety::Default` sets `out.containment_degraded = Some(shown.to_path_buf())` (first one wins) and
+  `pub(crate)`. `containment`, in this order: `canonical_of(fs, anchor)`; `None` -> degraded rule with `anchor_shown`, then
+  return. Then `let src = fs.destination_root(src_root)`, `canonical_of(fs, &src)` (handle dropped after); `None` ->
+  degraded rule with `src_root`, then return. With both `Some(a)`, `Some(s)`: `lexically_within(&a.path, &s.path)`
+  -> `Err(refuse(..))` whatever `confirmed` says; otherwise, if `!(a.confirmed && s.confirmed)` -> degraded rule
+  with `anchor_shown`; otherwise `Ok(())`. The degraded rule: `Safety::Default` sets `out.containment_degraded = Some(shown.to_path_buf())` (first one wins) and
   returns `Ok(())`; `Safety::Strict` returns `Err(refuse(<strict text>))`. Every `Err` from `canonical_of` and from
   `destination_root` is `CopyError::at(CopyStep::Resolve, e)`.
   `canonical_of`: `dir.canonical_path()`: `Err(e) if e.source.kind() == ErrorKind::Unsupported` is `Ok(None)`; other
   `Err` is `Err(e)`; `Ok(path)`: `fs.metadata(&path)?.identity` against `dir.identity()?`: both `Strong` and equal
-  is `Ok(Some(path))`, both `Strong` and unequal is the mismatch `Err`, anything else `Ok(None)`.
+  is `Some(Canonical { path, confirmed: true })`, both `Strong` and unequal is the mismatch `Err`, anything else
+  `Some(Canonical { path, confirmed: false })`.
 
 - [ ] **Step 4: Change `locate_tree`** (`place.rs:74-125`): the signature above; both `preflight` calls pass
   `&mut out.warnings`; on the root branch, after `preflight`, `containment(fs, src_root, &holder, dst_root, safety, out)?`;
@@ -815,9 +836,12 @@ git commit -m "feat: refuse a destination whose resolved location lies inside th
 - Consumes: `TreeOutcome.mount_unknown`, `TreeOutcome.containment_degraded` (Tasks 3, 4).
 - Produces:
   ```rust
-  /// Cut 8a's two safety warnings, after the identity ones: the mount-root checks that could not tell, then the
-  /// containment check that fell back to the lexical floor. Empty when neither degraded.
+  /// Cut 8a's two safety warnings: the mount-root checks that could not tell, then the containment check that fell
+  /// back to the lexical floor. Empty when neither degraded.
   pub fn safety_warning_lines(out: &TreeOutcome) -> Vec<String>
+
+  /// Every tree warning in print order: the identity ones (`warning_lines`), then `safety_warning_lines`.
+  pub fn tree_warning_lines(out: &TreeOutcome) -> Vec<String>
   ```
   Exact copy:
   - `format!("warning: could not tell whether a pre-existing destination directory is a mount root ({count} checks, e.g. {example}); merged anyway - --safety=strict refuses instead")` with `example` through `rel`.
@@ -840,6 +864,12 @@ fn both_safety_warnings_render_after_the_identity_ones() {
         assert!(v[1].contains(needle), "{needle}: {}", v[1]);
     }
     assert!(safety_warning_lines(&TreeOutcome::default()).is_empty());
+
+    // The order is pinned where it is decided: identity lines first, then these two.
+    out.warnings.unavailable = Some(DegradedGroup { count: 1, example: PathBuf::new() });
+    let all = tree_warning_lines(&out);
+    assert_eq!(all.len(), 3);
+    assert!(all[0].contains("identity") && all[1].contains("mount root") && all[2].contains("lexically"), "{all:?}");
 }
 ```
 
@@ -848,8 +878,8 @@ fn both_safety_warnings_render_after_the_identity_ones() {
 Run: `cargo nextest run -p flux-cli both_safety_warnings`
 Expected: compile error naming `safety_warning_lines`.
 
-- [ ] **Step 3: Implement `safety_warning_lines`** and, in `main.rs` after the `warning_lines` loop (`:205-207`),
-  `for line in report::safety_warning_lines(outcome) { err(&line); }`.
+- [ ] **Step 3: Implement `safety_warning_lines` and `tree_warning_lines`** and, in `main.rs` (`:205-207`),
+  replace the `warning_lines` loop with `for line in report::tree_warning_lines(outcome) { err(&line); }`.
 
 - [ ] **Step 4: Run the gate**
 
@@ -1025,6 +1055,7 @@ fn another_probe_publish_error_fails_the_run_at_the_probe_step() {
     let (step, path) = failed_at(&r.stop);
     assert_eq!((step, path), (RunStep::Probe, creating("noreplace-probe")));
     assert!(!fs.exists(creating("noreplace-probe.tmp")), "the temporary is removed best-effort");
+    assert!(!fs.exists("/p/dest"), "a DEST this run made does not strand on a probe failure");
     assert!(!fs.exists(LOCK));
 }
 
@@ -1097,8 +1128,10 @@ Expected: compile errors on `RunStep::Probe`, `RunWarning::ProbeNotRemoved`, `Lo
      - `Ok(Probe::Available { leftover: Some((name, error)) })`: `warnings.push(RunWarning::ProbeNotRemoved { path: self.operations_shown().join(id).join(name), error })`
        (the file's path once the workspace is published).
      - `Ok(Probe::Unavailable { leftover })`: `drop(building)`; `return Err(self.refuse_no_replace(operations, id, leftover))`.
-     - `Err(error)`: `drop(building)`; `let _ = operations.remove_dir(&creating_name(id))`; `return
-       Err(failed(RunStep::Probe, &shown_creating.join(PROBE), error))`.
+     - `Err(error)`: `drop(building)`; the same best-effort clean-up as the refusal (`refuse_no_replace`'s
+       removals, errors ignored, so a DEST this run made and the control directories do not strand); `return
+       Err(failed(RunStep::Probe, &shown_creating.join(PROBE), error))`. Test:
+       `another_probe_publish_error_fails_the_run_at_the_probe_step` also asserts `!fs.exists("/p/dest")`.
   4. `let workspace = publish_workspace(&operations, building, state).map_err(|e| failed(RunStep::State, &self.shown(id), e))?; drop(workspace); self.operations = Some(operations); Ok(())`.
 
   `refuse_no_replace(&mut self, operations: F::Dir, id: &str, leftover: Option<(OsString, FsError)>) -> RunError`:
@@ -1112,7 +1145,11 @@ Expected: compile errors on `RunStep::Probe`, `RunWarning::ProbeNotRemoved`, `Lo
 - [ ] **Step 7: Thread `warnings` through** `Place::create` (trait `:41`, `FilePlace` `:355` ignores it) and the
   call in `open_operation` (`session.rs:148`: `place.create(&state, warnings)`). `place.rs` needs
   `use crate::lock::{LockCode, Refusal}` beside its existing `LockResult` import (`:9`), and `use
-  crate::tree::primitive_unavailable`. `give_back` (`:231`) already
+  crate::tree::primitive_unavailable`. `give_back` (`session.rs:243`) overwrites a `Refused`'s `not_removed` with the lock when the lock's own removal
+  fails (`:251-256`); change it to move the displaced entry into `refusal.detail` (`"; also not removed: <path> (<error>)"`)
+  so the probe's leftover is never dropped from the report, and test it with
+  `a_refusal_keeps_the_probe_leftover_when_the_lock_cannot_be_removed` (set_no_replace_support(false), `fail_always("remove_file", ..)` so the
+  probe temporary AND the lock both fail to go: assert `refusal.detail` contains `noreplace-probe.tmp` and `not_removed` names `LOCK`). It already
   handles a `Refused` from `create`: it removes the lock this run created and names it if that fails.
 
 - [ ] **Step 8: Run the tests**
