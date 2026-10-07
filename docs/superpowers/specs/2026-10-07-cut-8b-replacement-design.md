@@ -97,8 +97,13 @@ the other degraded warnings) counts such directories. Under `--safety strict` th
   that writes under DEST go through directory handles (section 149.7). A backend that can only open a file by path is
   ineligible: this rules out SQLite, which opens by path and keeps a journal beside the database.
 - The first candidate is `redb` (pure Rust, copy-on-write B-tree, accepts an open file). It is the default unless the
-  first task of the plan shows it fails the acceptance test: after N durable-free commits under `Durability::Normal`,
-  `kill -9` the process and reopen; every committed claim must be present, and the file must open. If it fails, the
+  first task of the plan shows it fails the acceptance test: a child process makes claim commits under `Durability::Normal`
+  and is killed (`std::process::Child::kill`: SIGKILL on Unix, `TerminateProcess` on Windows) at several points, including
+  in the middle of a commit; after each kill the store is reopened and must open, and the claims present must be a
+  PREFIX of the commit sequence (if commit k is present, all commits before k are), with every commit the child reported
+  complete before the kill present. The test runs on the Linux, macOS and Windows CI legs. The same first task confirms
+  that the pinned `redb` version builds a database from an already-open `std::fs::File` (not only from a path) on all
+  three systems; that cannot be determined from here. If it fails, the
   plan stops and brings the owner a new fork (a purpose-built indexed store, or a different backend); it does not
   silently lower the durability claim.
 - Resident memory is bounded (section 10.1): the backend's cache is set to a small fixed size, and the engine holds no
@@ -141,29 +146,42 @@ For a file target with planned name P in destination directory D (a `Frame::Live
 
 1. **Resolve P** (above). Result: absent, or an existing entry with stored name `E` and metadata `M`.
 2. **Absent:** plan as new. Publish with `rename_no_replace`; `AlreadyExists` is `DESTINATION_NAMESPACE_COLLISION`
-   exactly as in cut 4b. After the rename, insert a `Created` claim for `(D.identity, P)`.
+   exactly as in cut 4b. After the rename, insert a `Created` claim for `(D.identity, P)` and update the frame (Name resolution, step 3).
+   A failure of that claim write is reported as a claim failure (below): the file IS published and is counted.
 3. **Existing, a directory:** fail the target (`DESTINATION_ERROR`), whatever the policy: nothing can be placed there.
 4. **Existing, a file or symlink:** apply the policy.
-   - `SkipExisting`: no claim; the target is skipped (`files_skipped`, `bytes_skipped`).
+   - `SkipExisting`: no claim; the target is skipped (`files_skipped += 1`, `bytes_skipped += S.len`, the SOURCE length: the bytes the engine chose not to transfer).
    - `Update`: replace only when `S.modified > M.modified` or `S.len != M.len`; when either modification time is
      unavailable, compare lengths only (equal lengths: skip). Otherwise skipped as above.
    - `Overwrite`: replace.
-5. **Replace:**
-   1. `insert_if_absent((D.identity, E), { target, Existing })`. A returned record with another target:
+5. **Replace.** The order follows the existing copy path (`copy_file_guarded`): the section 129 identity gate (Step 2a)
+   runs first, the heartbeat and the section 99 guard run before every mutation under DEST, and the claim is a mutation
+   of `state.db` under DEST, so it comes AFTER the gate and after one heartbeat and guard call. The copy path therefore
+   gains a `before_create` callback (beside `guard` and `beat`), called after the gate and the heartbeat and guard that
+   precede the exclusive create, and before that create; the single-file path passes a no-op.
+   1. The identity gate runs (unchanged). A refusal stops the target with nothing claimed.
+   2. Heartbeat, then the section 99 guard (unchanged). A failure stops the whole operation as today, with nothing claimed.
+   3. `before_create`: `insert_if_absent((D.identity, E), { target, Existing })`. A returned record with another target:
       `DESTINATION_NAMESPACE_COLLISION`, nothing copied, nothing published. A record with this target: proceed.
-   2. The existing copy path runs unchanged: the section 129 identity gate, the section 99 guard and the heartbeat, the
-      temporary, metadata, the source re-check.
-   3. `rename_replace(temp, D, P)`.
-   4. `upgrade_own_claim((D.identity, E), target)`; if `P != E` also `insert_if_absent((D.identity, P),
-      { target, Created })` (a returned foreign record here is an engine bug and fails the target loudly).
-   5. `files_overwritten += 1`; update the frame (Resolution, step 3).
-6. **A later target that resolves to an entry some earlier target claimed** hits step 5.1 and is reported
+   4. The temporary is created and written, metadata applied, the source re-checked (unchanged).
+   5. `rename_replace(temp, D, P)`.
+   6. `upgrade_own_claim((D.identity, E), target)`; if `P != E` also `insert_if_absent((D.identity, P),
+      { target, Created })` (a returned foreign record here is an engine bug and is a claim failure).
+   7. `files_copied += 1`, `files_overwritten += 1`; update the frame (Name resolution, step 3).
+7. **A later target that resolves to an entry some earlier target claimed** hits step 5.3 and is reported
    `DESTINATION_NAMESPACE_COLLISION`.
 
-The claim (5.1) precedes the copy so a colliding target copies no bytes; if a later step of the same target fails (the identity gate, a metadata or heartbeat failure, the rename), the claim stays: it is never released, and a later target that resolves to the same entry is a collision.
+The claim (5.3) precedes the copy so a colliding target copies no bytes. If a later step of the same target fails
+(a metadata or heartbeat failure, the source re-check, the rename), the claim stays: it is never released, and a later
+target that resolves to the same entry is a collision.
 
-A claim write that fails (store I/O error) fails that one target with the store's error; the run continues. A claim is
-never released, even when its target later fails.
+**Claim failures.** A store error BEFORE the rename (step 5.3) fails that target with the store's error, nothing
+published. A store error AFTER the rename (step 2's created claim; steps 5.6) leaves the file published: it is counted
+as copied (and as overwritten for a replacement) and reported as a new failure cause,
+`TreeFailureCause::ClaimNotRecorded(FsError)`, with its own `FailureTally` counter; it makes the run exit 1 like any
+streamed failure, and the report's `errors` includes it. The destination is not misreported as unchanged.
+
+The run continues after any single target's claim failure.
 
 ## Policy and flags
 
@@ -196,8 +214,10 @@ never released, even when its target later fails.
 | Process crash under `Normal` | Committed claims survive (to be proven by the acceptance test above). |
 | Power loss under `Normal` | Un-synced claims may be lost, like the un-synced data. |
 | Any crash under `Strict` | Every claim write is synced; a claim never trails its rename by more than the rename-to-claim window. |
-| Crash between a publish rename and its claim write | A published entry with no claim, until the WAL cut reconciles it. Documented limit. |
-| Store I/O error on a claim | That target fails; the run continues; the entry state on disk is whatever the rename left. |
+| Crash between a NEW target's publish rename and its created claim | A published entry with no claim, until the WAL cut reconciles it. Documented limit. |
+| Crash between a REPLACEMENT's `rename_replace` and its claim upgrade | The key holds the target's `Existing` claim (and the planned-name claim, if it differs, is absent): the entry holds the new content, a later target that resolves to it still collides through the `Existing` key, and the missing `Created` status is reconciled by the WAL cut. |
+| Store I/O error on a claim after the rename | The file is published and counted; the run reports `ClaimNotRecorded` and exits 1. |
+| Store I/O error on a claim before the rename | That target fails with the store's error; nothing was published; the run continues. |
 | Store corruption on open | Not reachable in this cut (the store is always created fresh). |
 
 ## Testing
