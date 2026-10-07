@@ -11,10 +11,12 @@ pub use options::{
     Publish, Safety, temp_path,
 };
 
+pub mod claims;
 pub mod fs;
 pub mod lock;
 pub mod name;
 
+pub use claims::{ClaimKey, ClaimOutcome, ClaimRecord, ClaimStatus, ClaimStore, FluxPathKey};
 pub use fs::{
     DestinationRoot, DirEntry, DirHandle, FileHandle, FileIdentity, FileSystem, FileType, Metadata,
     MountRoot, ObjectId, Perms,
