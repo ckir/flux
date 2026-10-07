@@ -4,8 +4,8 @@
 //! Design authority: `docs/superpowers/specs/2026-09-26-cut-4b-copy-tree-design.md`.
 
 use crate::copy::{
-    CopyError, CopyStep, Guard, Heartbeat, copy_file_guarded, no_heartbeat, split_destination,
-    unguarded, weaker,
+    CopyError, CopyStep, Guard, Heartbeat, copy_file_guarded, no_before_create, no_heartbeat,
+    split_destination, unguarded, weaker,
 };
 use crate::state::{FLUX_DIR, RESERVED_DIRS};
 use crate::walk::{Walk, WalkEvent, walk};
@@ -624,6 +624,7 @@ fn copy_one<F: DestinationRoot>(
         cx.opts,
         cx.guard,
         cx.beat,
+        &no_before_create,
     ) {
         Ok(o) => {
             out.files_copied += 1;

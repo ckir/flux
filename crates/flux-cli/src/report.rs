@@ -85,8 +85,10 @@ impl Report {
         rep.files_total = 1;
         match r {
             Ok(o) => {
-                rep.files_copied = 1;
-                rep.files_overwritten = u64::from(target_existed);
+                rep.files_skipped = u64::from(o.skipped);
+                rep.files_copied = u64::from(!o.skipped);
+                rep.files_overwritten = u64::from(target_existed && !o.skipped);
+                // `bytes_skipped` stays 0: the engine does not stat the source separately for a single file.
                 rep.files_degraded = u64::from(o.identity_degraded.is_some());
                 rep.bytes_total = o.bytes_copied;
                 rep.bytes_copied = o.bytes_copied;
@@ -450,6 +452,21 @@ mod tests {
         });
         let r = Report::file(&ok, false, 0);
         assert_eq!((r.files_copied, r.files_overwritten), (1, 0));
+    }
+
+    #[test]
+    fn a_skipped_single_file_reports_one_skipped_and_none_copied() {
+        let skipped: Result<Outcome, CopyError> = Ok(Outcome {
+            skipped: true,
+            bytes_copied: 0,
+            metadata_failures: Vec::new(),
+            identity_degraded: None,
+            published_identity: flux_fs::FileIdentity::Unavailable,
+        });
+        let r = Report::file(&skipped, true, 0);
+        assert_eq!((r.files_total, r.files_skipped, r.files_copied), (1, 1, 0));
+        assert_eq!((r.files_overwritten, r.files_failed, r.errors), (0, 0, 0));
+        assert_eq!(r.bytes_skipped, 0);
     }
 
     #[test]

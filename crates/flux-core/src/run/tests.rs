@@ -706,6 +706,18 @@ fn a_single_file_run_copies_and_leaves_no_record_behind() {
 }
 
 #[test]
+fn a_skipped_single_file_run_completes_and_records_no_published_identity() {
+    let fs = fake();
+    fs.write_file("/p/t", b"old");
+    let o = CopyOptions { existing: flux_fs::ExistingPolicy::SkipExisting, ..opts() };
+    let r = file(&fs, Path::new("/src/a"), Path::new("/p/t"), &o, &cfg());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert!(matches!(&r.copy, Some(Ok(out)) if out.skipped), "{:?}", r.copy);
+    assert!(!fs.exists(record_path(ID)) && !fs.exists(T_LOCK));
+    assert_eq!(fs.read_file("/p/t").as_deref(), Some(&b"old"[..]));
+}
+
+#[test]
 fn a_target_name_too_long_for_its_record_is_refused_before_anything_is_made() {
     let fs = fake();
     let long = format!("/p/{}", "n".repeat(255 - 47));
