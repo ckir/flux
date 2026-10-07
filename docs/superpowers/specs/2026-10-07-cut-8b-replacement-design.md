@@ -44,8 +44,10 @@ settled by a measured spike on Linux, macOS and Windows. The reasoning is under 
 7. **Verification:** one conformance suite run against the in-memory fake and the real store; the TLA+ `claims` scenario
    stays planned.
 8. **Name resolution (Q8):** see "Name resolution".
-9. **Durability:** a claim write is committed without a sync under `Durability::Normal` and synced under
-   `Durability::Strict`.
+9. **Durability (amended 2026-10-07 after the plan found that `redb` cannot keep unsynced commits across a process
+   kill):** under `Durability::Normal` a claim commit is not synced; the store syncs at each directory's end, at the
+   end of the walk when the workspace will be kept, and every 1000 unsynced commits. Under `Durability::Strict` every
+   claim commit is synced. See "Claim syncing".
 10. **The lockless `copy_tree` stays no-replace.** It has no workspace, so it cannot hold claims.
 11. **Single-file copies honour the flags** (section 5.1: the policy applies per file target).
 12. **`FaultFs` gains a case-insensitive mode**, so name resolution is testable without a real filesystem.
@@ -100,6 +102,9 @@ pub trait ClaimStore {
     fn insert_if_absent(&mut self, key: &ClaimKey, record: &ClaimRecord) -> Result<ClaimOutcome>;
     fn get(&self, key: &ClaimKey) -> Result<Option<ClaimRecord>>;
     fn upgrade_own_claim(&mut self, key: &ClaimKey, target: &FluxPathKey) -> Result<()>;
+    /// Make every commit so far durable (a synced commit). A no-op under `Durability::Strict`, where every commit
+    /// already was.
+    fn flush(&mut self) -> Result<()>;
 }
 pub trait DirHandle {
     type Claims: ClaimStore;
@@ -131,10 +136,11 @@ version (`format` = 1). The fake stores the same keys and values in a `BTreeMap`
   ineligible: this rules out SQLite, which opens by path and keeps a journal beside the database.
 - The first candidate is `redb` (pure Rust, copy-on-write B-tree, accepts an open file). It is the default unless the
   first task of the plan shows it fails the acceptance test: a child process makes claim commits under `Durability::Normal`
-  and is killed (`std::process::Child::kill`: SIGKILL on Unix, `TerminateProcess` on Windows) at several points, including
+  (unsynced, with syncs as in "Claim syncing") and is killed (`std::process::Child::kill`: SIGKILL on Unix, `TerminateProcess` on Windows) at several points, including
   in the middle of a commit; after each kill the store is reopened and must open, and the claims present must be a
-  PREFIX of the commit sequence (if commit k is present, all commits before k are), with every commit the child reported
-  complete before the kill present. The test runs on the Linux, macOS and Windows CI legs. The same first task confirms
+  PREFIX of the commit sequence (if commit k is present, all commits before k are), with every claim up to the
+  last sync the child reported complete before the kill present (a sync is "reported complete" when `flush`, or the
+  cap's internal sync, returned `Ok`). Under `Durability::Strict` the prefix must contain every commit reported complete. The test runs on the Linux, macOS and Windows CI legs. The same first task confirms
   that the pinned `redb` version builds a database from an already-open `std::fs::File` (not only from a path) on all
   three systems; that cannot be determined from here. If it fails, the
   plan stops and brings the owner a new fork (a purpose-built indexed store, or a different backend); it does not
@@ -227,6 +233,33 @@ streamed failure, and the report's `errors` includes it. The destination is not 
 
 The run continues after any single target's claim failure.
 
+## Claim syncing
+
+`redb` 4.3.0 has two commit levels, `None` and `Immediate`. A `None` commit is visible to later transactions of the same
+process but is not on disk until a later `Immediate` commit (`page_manager.rs`, `non_durable_commit`: the new roots go to
+an in-memory header slot and the pages join an in-memory `unpersisted` set that only a durable commit clears), so a
+process kill loses every `None` commit since the last `Immediate` one. Nothing reopens `state.db` in this cut, so
+durability only decides what the WAL cut finds after a crash. The mapping:
+
+1. **`Normal`:** every claim commit is a `None` commit.
+2. **Cap.** The store counts its unsynced commits and performs an `Immediate` commit itself inside the claim call that
+   reaches 1000 (`insert_if_absent` and `upgrade_own_claim`), bounding the `unpersisted` set. Those calls already sit
+   after the engine's heartbeat and section 99 guard (per-file protocol, steps 5.2 and 5.3), so the cap sync is guarded.
+3. **Directory end.** At each `Frame::Live` `DirEnd` the walk calls `(beat)()` then `(guard)()` (as before a directory
+   creation: a synced commit is a write under DEST, section 99) and then `ClaimStore::flush`. A guard or heartbeat
+   failure aborts the operation like every other one. A `Frame::Skipped` `DirEnd` flushes nothing. The root frame is
+   never popped, so its claims are synced by the cap or by the final sync.
+4. **A `flush` failure** is a streamed `TreeFailureCause::ClaimNotRecorded(FsError)` naming the directory (the root:
+   the empty path); counted in `FailureTally`, exit 1; the walk continues.
+5. **Final sync** (the claims written since the last directory end or cap sync): only when the workspace will be KEPT,
+   that is `Ended::Failed` with the heartbeat intact and ownership held (best effort; its error never replaces the
+   primary error), or `Ended::Completed` with leftovers (a failure is a `ClaimNotRecorded`). Never on a clean
+   `Completed` (the file is unlinked right after), `Ended::RefusedUnchanged` (the workspace is removed) or `Ended::Lost`
+   (no ownership: no write). The call sits in `run::tree`, after `copy_tree_at` returns and before `finish`, with the
+   store still open.
+6. **`Strict`:** every claim commit is `Immediate`; `flush` does nothing.
+7. The store is dropped before the workspace's removal (Windows).
+
 ## Policy and flags
 
 - `ExistingPolicy` lives in `CopyOptions`; the default is `Overwrite`.
@@ -255,9 +288,10 @@ The run continues after any single target's claim failure.
 
 | Event | Result |
 |---|---|
-| Process crash under `Normal` | Committed claims survive (to be proven by the acceptance test above). |
+| Process crash under `Normal` | Claims up to the last completed sync (a directory end, the 1000-commit cap, or the final sync of a kept workspace) survive; the current directory's later claims may be lost, leaving unclaimed published entries for the WAL cut. |
+| A `flush` fails | `ClaimNotRecorded` for that directory; the run exits 1; the published files are fine. |
 | Power loss under `Normal` | Un-synced claims may be lost, like the un-synced data. |
-| Any crash under `Strict` | Every claim write is synced; a claim never trails its rename by more than the rename-to-claim window. |
+| Any crash under `Strict` | Every claim commit is synced; a claim never trails its rename by more than the rename-to-claim window. |
 | Crash between a NEW target's publish rename and its created claim | A published entry with no claim, until the WAL cut reconciles it. Documented limit. |
 | Crash between a REPLACEMENT's `rename_replace` and its claim upgrade | The key holds the target's `Existing` claim (and the planned-name claim, if it differs, is absent): the entry holds the new content, a later target that resolves to it still collides through the `Existing` key, and the missing `Created` status is reconciled by the WAL cut. |
 | Store I/O error on a claim after the rename | The file is published and counted; the run reports `ClaimNotRecorded` and exits 1. |
@@ -293,6 +327,8 @@ The run continues after any single target's claim failure.
 3. WSL 9p and network filesystems: whether the backend's file locking works there is unmeasured.
 4. A directory with millions of entries holds its listing in memory while the walk is inside it (the source side
    already does).
+4a. Under `Normal` a process kill can lose the current directory's claims (up to 1000 commits): documented, reconciled by
+   the WAL cut.
 5. A replacement reads the destination's metadata twice (the policy decision, then the section 129 gate): one extra stat
    per replaced file, accepted. If an outside process removes the destination entry between those two reads the gate sees
    `NotFound`, the claim is still written for the vanished entry and the file is published as new but counted as an
@@ -338,6 +374,11 @@ cross-filesystem and mount-boundary cut; directory replacement; reflink or hardl
 - **Backend and file handles.** Writing the spec showed the backend must accept an already-open file so that `state.db`
   is created through the workspace handle (section 149.7). SQLite opens by path and keeps a journal, so it is ineligible;
   `redb` is the first candidate. This narrows the owner-approved "redb or SQLite" to redb plus the acceptance test.
+- **Durability amendment (plan stage).** The plan found that `redb` cannot keep unsynced commits across a process kill,
+  so decision 9's first form could not pass its own acceptance test. agy and the driver weighed five mappings (a synced
+  commit per claim; per directory; every N; before each rename only; another backend) and agreed on the mapping in
+  "Claim syncing". The driver added two refinements that agy confirmed: every sync is a write under DEST and is guarded
+  (section 99), and the final sync runs only when the workspace is kept. The owner approved it.
 - **Clarifications for section 241.5** (the spec is silent on both): the created-entry claim of a replacement is an
   upgrade of the target's own record, and a differing spelling after publication adds a second claim. Both are proposed
   back to the spec text.
