@@ -342,4 +342,13 @@ cross-filesystem and mount-boundary cut; directory replacement; reflink or hardl
   upgrade of the target's own record, and a differing spelling after publication adds a second claim. Both are proposed
   back to the spec text.
 
+## Stand-downs
+
+Panel review (agy, four rounds, commits `273a061` to `de0fc7a`): every finding was verified against the spec text and the
+code and folded; none was stood down below the floor. Rejected before the panel: a flat append-only file as `state.db`
+(no key index), SQLite as the backend (opens by path, journal file), a handle-to-path query as the stored-name oracle
+(measured wrong on Linux and macOS), run-scoped in-memory claims (breaks section 10.1 and the durability claim).
+Unmeasured and deferred to the plan's first task: `redb` from an open `File` on Windows, its kill-survival and its
+file locking on network filesystems.
+
 End of the cut 8b design.
