@@ -190,18 +190,21 @@ git commit -m "feat: the claim model, FluxPathKey, the ClaimStore trait and its 
   counter through a `#[cfg(test)]`-free public accessor `RedbClaimStore::unsynced(&self) -> u32` and assert it is 500
   (2500 mod 1000), and after `flush()` it is 0.
 - [ ] **Step 2: Write the gate** `crates/flux-platform/tests/claims_kill.rs`:
-  - `#[test] #[ignore] fn child_writer()`: reads env `FLUX_KILL_FILE` (path), `FLUX_KILL_MODE` (`normal` | `strict`),
+  - `#[test] #[ignore] fn child_writer()`: reads env `FLUX_KILL_FILE` (path), `FLUX_KILL_MODE` (`normal` | `normal-nocap-test` | `strict`),
     creates the file with `create_new`, builds a `RedbClaimStore`, then loops `i` from 0 forever: inserts the claim whose
     key name is `i` as 8 big-endian bytes under one parent; after the insert returns `Ok` prints `C <i>` and flushes
-    stdout; in `normal` mode every 50th claim (`i % 50 == 49`) calls `flush()` and on `Ok` prints `F <i>`.
+    stdout; in `normal` mode every 50th claim (`i % 50 == 49`) calls `flush()` and on `Ok` prints `F <i>`; in `normal-nocap-test`
+    mode it NEVER calls `flush()`, so only the store's own cap sync (`SYNC_CAP`) makes anything durable.
   - `#[test] fn killed_mid_stream_the_store_reopens_with_a_prefix()`: for each of 24 iterations (kill thresholds taken
     from the list `[1, 2, 3, 7, 49, 50, 51, 99, 100, 101, 149, 150, 333, 1000, 1001, 1500, 2000, 3, 60, 120, 240, 480, 960, 1920]`)
-    and for each mode: spawn `std::env::current_exe()` with args `--exact child_writer --ignored --nocapture`
+    and for each of the three modes: spawn `std::env::current_exe()` with args `--exact child_writer --ignored --nocapture`
     (and `--test-threads=1`) with the two env vars, read its stdout lines until the number of `C` lines reaches the
     threshold, then `Child::kill()` and `wait()`. Reopen the file with `Builder::new().create_file(OpenOptions` read
     and write`)` (it must return `Ok`: this is the "the file must open" assertion), read every key of the `claims`
     table, and assert: the present indices are exactly `0..m` for some `m` (a PREFIX, no holes); and `m` is at least
-    the count implied by the last `F <i>` line seen (normal: `i + 1`) or by the last `C <i>` line seen (strict: `i + 1`).
+    the count implied by the last `F <i>` line seen (normal: `i + 1`) or by the last `C <i>` line seen (strict: `i + 1`); in `normal-nocap-test` mode `m` is at
+    least `1000 * floor((last C index + 1) / 1000)` (every full cap block was synced by the store itself; thresholds
+    1000, 1001, 1500, 2000 exercise it).
     Print the mode, threshold, `m`, and the last `F`/`C` seen for every iteration (a `--no-capture` run reads as a table).
   - `#[test] fn a_store_builds_from_an_already_open_file()`: create a file through `std::fs`, build the store from the open
     `File` (not from a path), insert a claim, drop the store, reopen the file by path with plain redb and read it back.
