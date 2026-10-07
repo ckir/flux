@@ -2,14 +2,10 @@
 //! same mount) and a link in a parent component of DEST (Part A). Locally a missing facility skips with a stated
 //! reason; when `CI` is set it fails instead.
 
-use flux_core::run::{RunConfig, tree};
-use flux_core::{TreeFailure, TreeFailureCause, TreeOutcome};
-use flux_fs::{
-    Code, CopyOptions, DestinationRoot, DirHandle, Durability, MountRoot, OperationId, Preserve,
-    Publish, Safety,
-};
+use flux_core::run::RunConfig;
+use flux_fs::{Code, CopyOptions, Durability, OperationId, Preserve, Publish, Safety};
 use flux_platform::StdFileSystem;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tempfile::TempDir;
 
 fn opts() -> CopyOptions {
@@ -23,16 +19,6 @@ fn opts() -> CopyOptions {
     }
 }
 
-fn run(
-    src: &Path,
-    dst: &Path,
-) -> (Result<TreeOutcome, flux_core::copy::CopyError>, Vec<TreeFailure>) {
-    let mut got = Vec::new();
-    let r = tree(&StdFileSystem, src, dst, &opts(), &run_cfg(), &mut |f| got.push(f));
-    assert!(r.stop.is_none(), "{:?}", r.stop);
-    (r.copy.expect("the copy ran").map_err(|a| a.error), got)
-}
-
 fn names(dir: &Path) -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
@@ -42,19 +28,32 @@ fn names(dir: &Path) -> Vec<String> {
     v
 }
 
-/// `src/a` (1 byte) and `src/sub/b` (2 bytes) under `d`.
-#[cfg(target_os = "linux")]
-fn tree_in(d: &Path) -> PathBuf {
-    let src = d.join("src");
-    std::fs::create_dir_all(src.join("sub")).unwrap();
-    std::fs::write(src.join("a"), b"A").unwrap();
-    std::fs::write(src.join("sub").join("b"), b"BB").unwrap();
-    src
-}
-
 #[cfg(target_os = "linux")]
 mod linux_mount {
     use super::*;
+    use flux_core::run::tree;
+    use flux_core::{TreeFailure, TreeFailureCause, TreeOutcome};
+    use flux_fs::{DestinationRoot, DirHandle, MountRoot};
+    use std::path::PathBuf;
+
+    /// `src/a` (1 byte) and `src/sub/b` (2 bytes) under `d`.
+    fn tree_in(d: &Path) -> PathBuf {
+        let src = d.join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a"), b"A").unwrap();
+        std::fs::write(src.join("sub").join("b"), b"BB").unwrap();
+        src
+    }
+
+    fn run(
+        src: &Path,
+        dst: &Path,
+    ) -> (Result<TreeOutcome, flux_core::copy::CopyError>, Vec<TreeFailure>) {
+        let mut got = Vec::new();
+        let r = tree(&StdFileSystem, src, dst, &opts(), &run_cfg(), &mut |f| got.push(f));
+        assert!(r.stop.is_none(), "{:?}", r.stop);
+        (r.copy.expect("the copy ran").map_err(|a| a.error), got)
+    }
 
     /// `sudo -n mount --bind src dst`, unmounted on drop. `None` when the facility is missing locally; on CI
     /// (`CI` set) a missing facility is a failure, never a skip.
@@ -78,7 +77,15 @@ mod linux_mount {
 
     impl Drop for Bind {
         fn drop(&mut self) {
-            let _ = std::process::Command::new("sudo").args(["-n", "umount"]).arg(&self.0).status();
+            let ok = std::process::Command::new("sudo")
+                .args(["-n", "umount"])
+                .arg(&self.0)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                eprintln!("warning: could not unmount {}", self.0.display());
+            }
         }
     }
 
@@ -155,6 +162,7 @@ fn assert_refused_before_the_lock(src: &Path, dst: &Path) {
     assert!(a.refused_unchanged());
     assert_eq!(names(&src.join("sub")), vec!["b"], "no `out`, no lock, no workspace in the source");
     assert_eq!(std::fs::read(src.join("0-first")).unwrap(), b"F");
+    assert_eq!(std::fs::read(src.join("sub").join("b")).unwrap(), b"BB");
     assert!(got.is_empty());
 }
 
