@@ -1400,3 +1400,15 @@ git commit -m "docs: cut 8a closes item 113 and the destination half of section 
   `locate_tree(fs, src_root, dst_root, src_identity, safety, out)`; `containment(fs, src_root, anchor, anchor_shown, safety, out)`;
   `safety_warning_lines(&TreeOutcome)`; the fake's `set_mount_root`, `set_canonical_path`, keys `mount_root`,
   `canonical_path`.
+
+## Stand-downs
+
+Panel findings stood down, recorded so they are not raised again:
+
+- Round 2 (agy), Open Question 3: a runtime per-entry `st_dev` check, or an `openat("..")` ascent to prove containment
+  when `canonical_path` is unsupported. REJECTED: the spec's Part A decides the degraded case (lexical floor, warn or
+  strict-refuse), and the ascent needs the source identities that known limit 1 says the memory bound forbids.
+- Round 2 (agy), Fold Auditor and Dependency Cynic: the quoted plan lines (`workspace_place.rs`, `stx_mnt_id`) and the
+  crate paths under `crates/flux-engine/` do not exist in this repository; the underlying gaps (the eighth test's body
+  living only in prose, the Linux fallback set) were real and are FOLDED in `dfdc2a8`.
+- Round 2 (agy), Open Question 1: consolidate the two clean-up arms. FOLDED as `unwind_creating`.
