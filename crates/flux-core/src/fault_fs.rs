@@ -29,6 +29,8 @@ struct Inner {
     faults: HashMap<String, Code>,
     /// directory snapshot path -> what `mount_root` answers (absent: `No`)
     mount_roots: HashMap<PathBuf, MountRoot>,
+    /// directory snapshot path -> what `canonical_path` answers (absent: the path itself)
+    canonical: HashMap<PathBuf, PathBuf>,
     times: HashMap<PathBuf, Option<SystemTime>>,
     /// path -> bytes appended on the second `metadata` call
     grow: HashMap<PathBuf, Vec<u8>>,
@@ -580,6 +582,12 @@ impl FaultFs {
         self.inner.lock().unwrap().mount_roots.insert(path.to_path_buf(), answer);
     }
 
+    /// What `canonical_path` answers for the directory at `path` (default: the directory's own snapshot path).
+    pub fn set_canonical_path(&self, path: impl AsRef<Path>, canonical: impl AsRef<Path>) {
+        let (path, canonical) = (path.as_ref(), canonical.as_ref());
+        self.inner.lock().unwrap().canonical.insert(path.to_path_buf(), canonical.to_path_buf());
+    }
+
     /// Whether this fake's `rename_no_replace` has an atomic no-replace primitive.
     /// Defaults to `true`; set `false` to make it report the platform's unsupported
     /// error, which is how a caller's behaviour on such a destination is tested
@@ -1072,6 +1080,13 @@ impl DirHandle for FakeDirHandle {
         Ok(g.mount_roots.get(&path).copied().unwrap_or(MountRoot::No))
     }
 
+    fn canonical_path(&self) -> Result<PathBuf> {
+        let path = self.my_path();
+        self.fs().record(format!("canonical_path({})", path.display()), "canonical_path")?;
+        let g = self.inner.lock().unwrap();
+        Ok(g.canonical.get(&path).cloned().unwrap_or(path))
+    }
+
     fn identity(&self) -> Result<flux_fs::FileIdentity> {
         let path = self.my_path();
         let mut g = self.inner.lock().unwrap();
@@ -1527,6 +1542,29 @@ mod tests {
         let after = fs.metadata(std::path::Path::new("/b")).unwrap().identity;
 
         assert_eq!(before, after, "a rename moves the name, not the object");
+    }
+
+    #[test]
+    fn canonical_path_is_the_handles_own_path_unless_a_test_set_one() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.create_dir(Path::new("/d/x")).unwrap();
+        fs.set_canonical_path("/d/x", "/elsewhere/x");
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let x = d.open_dir(OsStr::new("x")).unwrap();
+        assert_eq!(d.canonical_path().unwrap(), PathBuf::from("/d"));
+        assert_eq!(x.canonical_path().unwrap(), PathBuf::from("/elsewhere/x"));
+    }
+
+    #[test]
+    fn canonical_path_takes_an_injected_fault_with_its_kind() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.fail_kind("canonical_path", Code::IoError, std::io::ErrorKind::Unsupported);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let e = d.canonical_path().unwrap_err();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::Unsupported);
+        assert_eq!(d.canonical_path().unwrap(), PathBuf::from("/d"), "consumed on use");
     }
 
     #[test]

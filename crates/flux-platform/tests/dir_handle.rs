@@ -19,6 +19,19 @@ mod posix {
     }
 
     #[test]
+    fn canonical_path_names_the_directory_the_handle_holds_even_through_a_link() {
+        let d = TempDir::new().unwrap();
+        std::fs::create_dir(d.path().join("real")).unwrap();
+        std::os::unix::fs::symlink(d.path().join("real"), d.path().join("alias")).unwrap();
+        // `destination_root` follows a link AT the root (section 149.7 exempts it); the handle holds `real`.
+        let through = StdFileSystem.destination_root(&d.path().join("alias")).unwrap();
+        let direct = StdFileSystem.destination_root(&d.path().join("real")).unwrap();
+        let expected = std::fs::canonicalize(d.path().join("real")).unwrap();
+        assert_eq!(through.canonical_path().unwrap(), expected);
+        assert_eq!(direct.canonical_path().unwrap(), expected);
+    }
+
+    #[test]
     fn a_child_directory_opens() {
         let d = TempDir::new().unwrap();
         std::fs::create_dir(d.path().join("child")).unwrap();
@@ -480,6 +493,21 @@ mod windows_arm {
         let root = StdFileSystem.destination_root(d.path()).unwrap();
         let sub = root.open_dir(OsStr::new("sub")).unwrap();
         assert_eq!(sub.mount_root(&root).unwrap(), flux_fs::MountRoot::No);
+    }
+
+    #[test]
+    fn canonical_path_names_the_junctions_target_in_the_same_form_as_canonicalize() {
+        let d = TempDir::new().unwrap();
+        std::fs::create_dir(d.path().join("real")).unwrap();
+        if !junction(&d.path().join("real"), &d.path().join("junc")) {
+            panic!("could not create a junction; mklink /J requires no privilege");
+        }
+        let through = StdFileSystem.destination_root(&d.path().join("junc")).unwrap();
+        let direct = StdFileSystem.destination_root(&d.path().join("real")).unwrap();
+        let expected = std::fs::canonicalize(d.path().join("real")).unwrap();
+        assert_eq!(through.canonical_path().unwrap(), expected);
+        assert_eq!(direct.canonical_path().unwrap(), expected);
+        assert!(expected.to_string_lossy().starts_with(r"\\?\"), "{expected:?}");
     }
 
     fn junction(target: &std::path::Path, link: &std::path::Path) -> bool {

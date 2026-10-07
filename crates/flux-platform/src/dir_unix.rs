@@ -374,6 +374,43 @@ impl DirHandle for StdDir {
         })
     }
 
+    fn canonical_path(&self) -> Result<std::path::PathBuf> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let link = format!("/proc/self/fd/{}", self.0.as_raw_fd());
+            // The text is used as is: never inspected for a " (deleted)" suffix. The caller's identity re-check
+            // is what catches a vanished directory.
+            std::fs::read_link(link).map_err(|e| {
+                // `NotFound` here means /proc is not mounted (the fd itself is open); 38 is ENOSYS.
+                if e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(38) {
+                    FsError::new(
+                        Code::IoError,
+                        std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            format!("/proc is not mounted: {e}"),
+                        ),
+                    )
+                } else {
+                    FsError::from_io(e)
+                }
+            })
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use rustix::io::Errno;
+            use std::os::unix::ffi::OsStringExt;
+            match rustix::fs::getpath(&self.0) {
+                Ok(c) => Ok(std::path::PathBuf::from(std::ffi::OsString::from_vec(c.into_bytes()))),
+                Err(e @ (Errno::NOSYS | Errno::NOTSUP | Errno::OPNOTSUPP)) => Err(FsError::new(
+                    Code::IoError,
+                    std::io::Error::new(std::io::ErrorKind::Unsupported, std::io::Error::from(e)),
+                )),
+                Err(e) => Err(FsError::from_io(std::io::Error::from(e))),
+            }
+        }
+    }
+
     fn sync(&self) -> Result<()> {
         rustix::fs::fsync(&self.0).map_err(|e| FsError::from_io(std::io::Error::from(e)))
     }

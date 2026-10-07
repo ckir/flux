@@ -26,7 +26,8 @@ use windows_sys::Win32::Foundation::{
     STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
+    DELETE, FILE_GENERIC_WRITE, FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, GetFinalPathNameByHandleW, SYNCHRONIZE, VOLUME_NAME_DOS,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -118,6 +119,40 @@ impl DirHandle for StdDir {
     /// (see its reparse-point check), so no handle this arm holds can be the root of a mount.
     fn mount_root(&self, _parent: &Self) -> Result<MountRoot> {
         Ok(MountRoot::No)
+    }
+
+    fn canonical_path(&self) -> Result<std::path::PathBuf> {
+        use std::os::windows::ffi::OsStringExt;
+        let mut buf = vec![0u16; 512];
+        loop {
+            // SAFETY: `buf` is a live, writable buffer of `buf.len()` u16s and the handle is open for `self`'s life.
+            let n = unsafe {
+                GetFinalPathNameByHandleW(
+                    self.0.as_raw_handle() as HANDLE,
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                    FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+                )
+            } as usize;
+            if n == 0 {
+                let e = std::io::Error::last_os_error();
+                // 1 is ERROR_INVALID_FUNCTION.
+                return Err(if e.raw_os_error() == Some(1) {
+                    FsError::new(
+                        Code::IoError,
+                        std::io::Error::new(std::io::ErrorKind::Unsupported, e),
+                    )
+                } else {
+                    FsError::from_io(e)
+                });
+            }
+            if n >= buf.len() {
+                // Too small: `n` is the needed length including the terminator.
+                buf.resize(n, 0);
+                continue;
+            }
+            return Ok(std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf[..n])));
+        }
     }
 
     fn open_dir(&self, name: &OsStr) -> Result<Self> {

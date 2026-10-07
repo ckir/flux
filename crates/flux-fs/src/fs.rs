@@ -349,6 +349,14 @@ pub trait DirHandle: Sized {
     /// name-surrogate reparse point, which `open_dir` already refuses. An `Err` is the query's own failure.
     fn mount_root(&self, parent: &Self) -> Result<MountRoot>;
 
+    /// The path of the directory this handle holds, obtained FROM the handle (never by resolving a path again):
+    /// Linux `readlink` of `/proc/self/fd/<n>`; macOS `fcntl(F_GETPATH)`; Windows `GetFinalPathNameByHandleW`
+    /// (`FILE_NAME_NORMALIZED | VOLUME_NAME_DOS`, so it carries the `\\?\` prefix). The text is reported as the
+    /// platform gives it; the caller checks the object at it against this handle's identity before trusting it.
+    /// Where the system or filesystem cannot answer (`/proc` not mounted, `ENOSYS`, `ERROR_INVALID_FUNCTION`) the
+    /// error's kind is `ErrorKind::Unsupported`; every other failure keeps its own kind.
+    fn canonical_path(&self) -> Result<std::path::PathBuf>;
+
     /// Flush this directory's entries to stable storage, so that a create, rename or removal inside it survives a
     /// crash (the crash-safe state write: temporary, flush, rename, flush the directory).
     fn sync(&self) -> Result<()>;
