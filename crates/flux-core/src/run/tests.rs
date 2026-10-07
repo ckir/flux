@@ -546,8 +546,7 @@ fn a_missing_no_replace_primitive_is_refused_with_nothing_changed() {
 fn a_probe_file_that_cannot_be_removed_is_a_warning_and_the_run_continues() {
     let fs = fake();
     // The probe's removal of `noreplace-probe` is the run's first `remove_file` (no lock exists to clean up and the
-    // probe precedes the manifest's `.tmp` sweep). If the call log says otherwise, use `fail_nth` with the index
-    // the log shows.
+    // probe precedes the manifest's `.tmp` sweep). Retirement then removes the file with the workspace (spec 241.5).
     fs.fail("remove_file", Code::PermissionDenied);
     let (r, got) = run_tree(&fs, &cfg());
     let out = ok(&r);
@@ -558,15 +557,46 @@ fn a_probe_file_that_cannot_be_removed_is_a_warning_and_the_run_continues() {
         "{:?}", r.warnings
     );
     assert!(
-        r.warnings.iter().any(|w| matches!(w, RunWarning::NotRemoved { .. })),
-        "the workspace cannot go either: {:?}",
+        !r.warnings.iter().any(|w| matches!(w, RunWarning::NotRemoved { .. })),
+        "the retire removes the probe file with the workspace: {:?}",
         r.warnings
     );
+    assert!(!fs.exists(&kept), "the probe file is gone");
     assert!(
-        fs.exists(format!("/p/dest/.flux/operations/{ID}.removing/noreplace-probe")),
-        "retired, not removed"
+        !fs.exists(format!("/p/dest/.flux/operations/{ID}.removing")),
+        "no stranded `.removing`"
     );
     assert!(!fs.exists(LOCK), "the lock is still released");
+}
+
+#[test]
+fn a_probe_error_whose_cleanup_also_fails_reports_the_leftover_as_a_warning() {
+    let fs = fake();
+    fs.fail_always("remove_file", Code::PermissionDenied);
+    fs.fail("rename_no_replace", Code::PermissionDenied);
+    let (r, _) = run_tree(&fs, &cfg());
+    let (step, path) = failed_at(&r.stop);
+    assert_eq!((step, path), (RunStep::Probe, creating("noreplace-probe")));
+    let left = creating("").trim_end_matches('/').to_string();
+    assert!(
+        r.warnings.iter().any(|w| matches!(w, RunWarning::NotRemoved { path, .. }
+            if path.to_string_lossy().replace('\\', "/") == left)),
+        "the `.creating` leftover is named: {:?}",
+        r.warnings
+    );
+    assert!(fs.exists(&left), "left where it is");
+}
+
+#[test]
+fn a_failed_probe_temporary_create_names_the_temporary() {
+    let fs = fake();
+    // The probe's temporary is the run's first `create_new`.
+    fs.fail("create_new", Code::PermissionDenied);
+    let (r, _) = run_tree(&fs, &cfg());
+    assert!(r.copy.is_none());
+    let (step, path) = failed_at(&r.stop);
+    assert_eq!((step, path), (RunStep::Probe, creating("noreplace-probe.tmp")));
+    assert!(!fs.exists("/p/dest"), "a DEST this run made does not strand on a probe failure");
 }
 
 #[test]

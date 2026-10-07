@@ -304,6 +304,7 @@ fn run_tree<F: DestinationRoot>(
                 opts.safety,
                 &mut out.warnings,
             )?;
+            containment(fs, src_root, &root, dst_root, opts.safety, out)?;
             root
         }
         Err(e) if e.source.kind() == ErrorKind::NotFound => {
@@ -315,6 +316,7 @@ fn run_tree<F: DestinationRoot>(
                 opts.safety,
                 &mut out.warnings,
             )?;
+            containment(fs, src_root, &parent, parent_path, opts.safety, out)?;
             // Decision 8 on the root, every failure fatal. Nothing else is created on
             // `parent`, so there is no sibling to fold against.
             match parent.create_dir(name) {
@@ -899,6 +901,8 @@ mod tests {
     /// `/src/a` (1 byte) and `/src/sub/b` (2 bytes). `/dst` absent.
     fn tree() -> FaultFs {
         let fs = FaultFs::new();
+        // A real filesystem has its root; the fake only stats it once it is made (Part A reads the parent's identity).
+        fs.create_dir(Path::new("/")).unwrap();
         fs.create_dir(Path::new("/src")).unwrap();
         fs.create_dir(Path::new("/src/sub")).unwrap();
         fs.write_file("/src/a", b"A");
@@ -968,6 +972,55 @@ mod tests {
         assert_eq!(e.step, CopyStep::Resolve, "a tree-level refusal belongs to no copy step");
         assert!(got.is_empty());
         assert!(!calls_since(&fs, n).iter().any(|c| c.starts_with("create")));
+    }
+
+    #[test]
+    fn an_existing_destination_resolving_inside_the_source_is_refused_before_anything_is_created() {
+        let fs = tree();
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.set_canonical_path("/dst", "/src/sub");
+        fs.set_identity("/src/sub", identity_of(&fs, "/dst"));
+        let n = fs.calls().len();
+
+        let (r, got) = run(&fs, "/src", "/dst", &opts());
+
+        let e = r.unwrap_err();
+        assert_eq!((e.code(), e.step), (Code::SafetyRejected, CopyStep::Resolve));
+        assert!(e.to_string().contains("resolved location"), "{e}");
+        assert!(got.is_empty());
+        assert!(!calls_since(&fs, n).iter().any(|c| c.starts_with("create")), "{:?}", fs.calls());
+        assert!(!fs.exists("/dst/sub"));
+    }
+
+    #[test]
+    fn an_absent_destination_whose_parent_resolves_inside_the_source_is_refused_before_anything_is_created()
+     {
+        let fs = tree();
+        fs.create_dir(Path::new("/out")).unwrap();
+        fs.set_canonical_path("/out", "/src/sub");
+        fs.set_identity("/src/sub", identity_of(&fs, "/out"));
+        let n = fs.calls().len();
+
+        let (r, _) = run(&fs, "/src", "/out/copy", &opts());
+
+        assert_eq!(r.unwrap_err().code(), Code::SafetyRejected);
+        assert!(!fs.exists("/out/copy"));
+        assert!(!calls_since(&fs, n).iter().any(|c| c.starts_with("create")), "{:?}", fs.calls());
+    }
+
+    #[test]
+    fn a_merely_similar_resolved_name_is_not_inside_the_source() {
+        let fs = tree();
+        fs.create_dir(Path::new("/srcs")).unwrap();
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.set_canonical_path("/dst", "/srcs");
+        fs.set_identity("/srcs", identity_of(&fs, "/dst"));
+
+        let (r, _) = run(&fs, "/src", "/dst", &opts());
+
+        let out = r.unwrap();
+        assert_eq!(out.files_copied, 2);
+        assert!(out.containment_degraded.is_none());
     }
 
     #[test]
@@ -1171,19 +1224,20 @@ mod tests {
 
     #[test]
     fn a_file_whose_destination_cannot_be_inspected_lands_in_the_unavailable_bucket() {
-        // metadata calls in order: walk's root stat (1), copy_tree's source identity (2),
-        // copy_file_at's source stat (3), the Step 2a gate's destination stat (4).
+        // metadata calls in order: walk's root stat (1), copy_tree's source identity (2), Part A's canonical
+        // stats of DEST (3) and of the source (4), copy_file_at's source stat (5), the Step 2a gate's
+        // destination stat (6).
         let fs = FaultFs::new();
         fs.create_dir(Path::new("/src")).unwrap();
         fs.create_dir(Path::new("/dst")).unwrap();
         fs.write_file("/src/a", b"A");
-        fs.fail_nth("metadata", 4, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+        fs.fail_nth("metadata", 6, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
 
         let (r, got) = run(&fs, "/src", "/dst", &opts());
         let out = r.unwrap();
 
         let stats: Vec<_> = fs.calls().into_iter().filter(|c| c.starts_with("metadata(")).collect();
-        assert!(stats[3].contains("dst"), "the 4th stat is the gate's: {stats:?}");
+        assert!(stats[5].contains("dst"), "the 6th stat is the gate's: {stats:?}");
         assert!(got.is_empty(), "{got:?}");
         assert_eq!(out.files_copied, 1);
         assert_eq!(out.files_degraded, 1);
@@ -1311,6 +1365,7 @@ mod tests {
     #[test]
     fn a_leftover_temporary_is_reported_by_its_destination_relative_path() {
         let fs = FaultFs::new();
+        fs.create_dir(Path::new("/")).unwrap();
         fs.create_dir(Path::new("/src")).unwrap();
         fs.create_dir(Path::new("/src/sub")).unwrap();
         fs.write_file("/src/sub/b", b"BB");
@@ -1576,6 +1631,7 @@ mod tests {
     #[test]
     fn a_source_entry_landing_in_a_reserved_control_path_fails_and_the_rest_is_copied() {
         let fs = FaultFs::new();
+        fs.create_dir(Path::new("/")).unwrap();
         for d in ["/src", "/src/.flux", "/src/.flux/operations", "/src/.flux/other", "/src/.FLUX"] {
             fs.create_dir(Path::new(d)).unwrap();
         }

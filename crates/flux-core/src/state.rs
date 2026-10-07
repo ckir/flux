@@ -510,6 +510,10 @@ pub const FLUX_DIR: &str = ".flux";
 pub const OPERATIONS_DIR: &str = "operations";
 /// A tree operation's state, inside its workspace.
 pub const MANIFEST: &str = "manifest";
+/// Section 241.5's probe file, inside a workspace (cut 8a, Part P).
+pub const PROBE: &str = "noreplace-probe";
+/// The probe's staging temporary.
+pub const PROBE_TEMP: &str = "noreplace-probe.tmp";
 /// A state file's temporary: `<name>.tmp` (decision 4; the name it stages already carries the operation id).
 pub const TEMP_SUFFIX: &str = ".tmp";
 /// A workspace being built: `<id>.creating`, renamed to `<id>` once its manifest is written (decision 3).
@@ -655,7 +659,12 @@ pub fn retire_workspace<D: DirHandle>(operations: &D, id: &str) -> flux_fs::Resu
     operations.rename_no_replace(OsStr::new(id), operations, &retired)?;
     {
         let dir = operations.open_dir(&retired)?;
-        for name in [OsString::from(MANIFEST), temp_name(OsStr::new(MANIFEST))] {
+        for name in [
+            OsString::from(MANIFEST),
+            temp_name(OsStr::new(MANIFEST)),
+            OsString::from(PROBE),
+            OsString::from(PROBE_TEMP),
+        ] {
             remove_if_present(&dir, &name)?;
         }
         // Closed before the directory is removed.
@@ -1063,6 +1072,18 @@ mod tests {
         let retire = position(&calls, &format!("rename_no_replace({path} -> {path}.removing)"));
         let manifest = position(&calls, &format!("remove_file({path}.removing/manifest)"));
         assert!(retire < manifest, "the id name goes first: {calls:?}");
+    }
+
+    #[test]
+    fn a_retire_removes_the_probe_file_and_its_temporary() {
+        let (fs, d) = dest();
+        let ops = operations_dir(&d, Path::new("D")).unwrap();
+        drop(create_workspace(&ops, &created()).unwrap());
+        let path = format!("/p/dest/.flux/operations/{}", id(1));
+        fs.write_file(format!("{path}/{PROBE}"), b"");
+        fs.write_file(format!("{path}/{PROBE_TEMP}"), b"");
+        retire_workspace(&ops, &id(1)).unwrap();
+        assert!(!fs.exists(&path) && !fs.exists(format!("{path}.removing")));
     }
 
     #[test]

@@ -8,8 +8,8 @@ use crate::copy::{CopyError, CopyStep, split_destination};
 use crate::lock::{LockCode, LockResult, Refusal};
 use crate::prior::{PriorOp, Scan, scan_file, scan_tree};
 use crate::state::{
-    FLUX_DIR, Kind, MANIFEST, OPERATIONS_DIR, OperationState, PARTIAL_INFIX, begin_workspace,
-    creating_name, id_after, operations_dir, publish_workspace, record_name,
+    FLUX_DIR, Kind, MANIFEST, OPERATIONS_DIR, OperationState, PARTIAL_INFIX, PROBE, PROBE_TEMP,
+    begin_workspace, creating_name, id_after, operations_dir, publish_workspace, record_name,
     remove_empty_control_dirs, remove_record, retire_workspace, write_state,
 };
 use crate::tree::{TreeOutcome, containment, preflight, primitive_unavailable, reserved_path};
@@ -65,9 +65,12 @@ pub(crate) trait Place<D: DirHandle> {
     fn file_identities(&self) -> Option<(FileIdentity, Option<FileIdentity>)>;
 }
 
-/// Section 241.5's fixed name, and its staging temporary.
-pub(crate) const PROBE: &str = "noreplace-probe";
-pub(crate) const PROBE_TEMP: &str = "noreplace-probe.tmp";
+/// Which file of the probe a failure was at: the temporary's creation, or the publish onto `PROBE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProbeAt {
+    Create,
+    Publish,
+}
 
 /// What the probe found. A `leftover` is a file of the probe's that could not be removed again, by name.
 pub(crate) enum Probe {
@@ -79,12 +82,14 @@ pub(crate) enum Probe {
 
 /// Part P: stage `PROBE_TEMP` in `workspace` (an empty file), publish it onto `PROBE` with `rename_no_replace`,
 /// then remove what was written. `Err` is any failure other than "primitive unavailable" of the publish, or a
-/// failed create; the temporary is removed best-effort before returning it.
-pub(crate) fn probe_no_replace<D: DirHandle>(workspace: &D) -> flux_fs::Result<Probe> {
+/// failed create; the temporary is removed best-effort before returning it. The `Err` says which of the two failed.
+pub(crate) fn probe_no_replace<D: DirHandle>(
+    workspace: &D,
+) -> std::result::Result<Probe, (ProbeAt, FsError)> {
     let temp = OsStr::new(PROBE_TEMP);
     let name = OsStr::new(PROBE);
     // Nothing is written: the writer is dropped at once.
-    drop(workspace.create_new(temp)?);
+    drop(workspace.create_new(temp).map_err(|e| (ProbeAt::Create, e))?);
     let remove = |n: &OsStr| workspace.remove_file(n).err().map(|e| (n.to_os_string(), e));
     match workspace.rename_no_replace(temp, workspace, name) {
         Ok(()) => Ok(Probe::Available { leftover: remove(name) }),
@@ -93,7 +98,7 @@ pub(crate) fn probe_no_replace<D: DirHandle>(workspace: &D) -> flux_fs::Result<P
         }
         Err(e) => {
             let _ = workspace.remove_file(temp);
-            Err(e)
+            Err((ProbeAt::Publish, e))
         }
     }
 }
@@ -308,11 +313,14 @@ impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {
                 drop(building);
                 return Err(self.refuse_no_replace(operations, id, leftover));
             }
-            Err(error) => {
+            Err((at, error)) => {
                 drop(building);
-                // Best effort: a DEST this run made and the control directories must not strand.
-                let _ = self.unwind_creating(operations, id);
-                return Err(failed(RunStep::Probe, &shown_creating.join(PROBE), error));
+                // Best effort, but a leftover is reported: the CLI prints the warnings of a stopped run too.
+                if let Some((path, error)) = self.unwind_creating(operations, id) {
+                    warnings.push(RunWarning::NotRemoved { path, error });
+                }
+                let file = if at == ProbeAt::Create { PROBE_TEMP } else { PROBE };
+                return Err(failed(RunStep::Probe, &shown_creating.join(file), error));
             }
         }
         let workspace = publish_workspace(&operations, building, state)
