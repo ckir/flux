@@ -9,7 +9,7 @@
 //! Dropping the flag is not an alternative -- without it `NtCreateFile` FOLLOWS
 //! the junction, which is the traversal §149.7 forbids.
 
-use flux_fs::{Code, DirHandle, FsError, Metadata, Result, check_component};
+use flux_fs::{Code, DirHandle, FsError, Metadata, MountRoot, Result, check_component};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::os::windows::ffi::OsStrExt;
@@ -113,6 +113,12 @@ impl StdDir {
 impl DirHandle for StdDir {
     type Writer = crate::StdFile;
     type Lock = crate::StdLock;
+
+    /// Always `No`: a mounted-volume folder is a name-surrogate reparse point, which `open_dir` already refuses
+    /// (see its reparse-point check), so no handle this arm holds can be the root of a mount.
+    fn mount_root(&self, _parent: &Self) -> Result<MountRoot> {
+        Ok(MountRoot::No)
+    }
 
     fn open_dir(&self, name: &OsStr) -> Result<Self> {
         check_component(name)?;

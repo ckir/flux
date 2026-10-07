@@ -1,6 +1,6 @@
 //! The POSIX `DirHandle`: `openat` with `O_NOFOLLOW | O_DIRECTORY` (§149.7).
 
-use flux_fs::{Code, DirHandle, FsError, Metadata, Result, check_component};
+use flux_fs::{Code, DirHandle, FsError, Metadata, MountRoot, Result, check_component};
 use rustix::fs::{Access, AtFlags, Mode, OFlags, accessat, openat, statat};
 use std::ffi::OsStr;
 use std::os::fd::OwnedFd;
@@ -335,6 +335,43 @@ impl DirHandle for StdDir {
         // `AT_REMOVEDIR` refuses a symlink with ENOTDIR even when it points at a directory: a link is never followed.
         rustix::fs::unlinkat(&self.0, name, AtFlags::REMOVEDIR)
             .map_err(|e| FsError::from_io(std::io::Error::from(e)))
+    }
+
+    fn mount_root(&self, parent: &Self) -> Result<MountRoot> {
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::fs::{StatxAttributes, StatxFlags, statx};
+            use rustix::io::Errno;
+            match statx(&self.0, "", AtFlags::EMPTY_PATH, StatxFlags::empty()) {
+                Ok(st) if st.stx_attributes_mask.contains(StatxAttributes::MOUNT_ROOT) => {
+                    return Ok(if st.stx_attributes.contains(StatxAttributes::MOUNT_ROOT) {
+                        MountRoot::Yes
+                    } else {
+                        MountRoot::No
+                    });
+                }
+                // The kernel did not report the attribute: judge by device numbers.
+                Ok(_) => {}
+                // `OPNOTSUPP` is the same value as `NOTSUP` on Linux; naming both is an unreachable pattern.
+                Err(Errno::NOSYS | Errno::NOTSUP) => {}
+                Err(e) => return Err(FsError::from_io(std::io::Error::from(e))),
+            }
+        }
+        let child =
+            rustix::fs::fstat(&self.0).map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
+        let above =
+            rustix::fs::fstat(&parent.0).map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
+        // `st_dev` is `i32` on macOS and `u64` on Linux: widen both to one type.
+        #[allow(clippy::unnecessary_cast)]
+        let (child_dev, parent_dev) = (child.st_dev as u64, above.st_dev as u64);
+        Ok(if child_dev != parent_dev {
+            MountRoot::Yes
+        } else if cfg!(target_os = "macos") {
+            // macOS has no same-filesystem bind mount of its own.
+            MountRoot::No
+        } else {
+            MountRoot::Unknown
+        })
     }
 
     fn sync(&self) -> Result<()> {

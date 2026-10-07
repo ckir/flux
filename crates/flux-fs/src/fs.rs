@@ -343,9 +343,23 @@ pub trait DirHandle: Sized {
     /// `DirectoryNotEmpty`; a missing name, `NotFound`.
     fn remove_dir(&self, name: &std::ffi::OsStr) -> Result<()>;
 
+    /// Whether the directory this handle holds is the root of a mount, judged from this handle and `parent`'s (the
+    /// directory it was opened from), never from a path. `Unknown` only where the platform cannot tell (Linux without
+    /// `STATX_ATTR_MOUNT_ROOT` and equal device numbers); Windows answers `No`: a mounted-volume folder is a
+    /// name-surrogate reparse point, which `open_dir` already refuses. An `Err` is the query's own failure.
+    fn mount_root(&self, parent: &Self) -> Result<MountRoot>;
+
     /// Flush this directory's entries to stable storage, so that a create, rename or removal inside it survives a
     /// crash (the crash-safe state write: temporary, flush, rename, flush the directory).
     fn sync(&self) -> Result<()>;
+}
+
+/// Whether a directory is the root of a mount (cut 8a, Part M), asked of the child with its parent's handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountRoot {
+    Yes,
+    No,
+    Unknown,
 }
 
 /// Resolving `DEST` once, at start, is the only path-based call in the writer.

@@ -17,7 +17,7 @@ pub mod name;
 
 pub use fs::{
     DestinationRoot, DirEntry, DirHandle, FileHandle, FileIdentity, FileSystem, FileType, Metadata,
-    ObjectId, Perms,
+    MountRoot, ObjectId, Perms,
 };
 pub use lock::{LockCapability, LockFile};
 pub use name::check_component;

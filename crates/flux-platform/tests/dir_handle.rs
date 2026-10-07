@@ -6,6 +6,19 @@ mod posix {
     use tempfile::TempDir;
 
     #[test]
+    fn a_subdirectory_is_not_a_mount_root_and_the_dev_mount_is() {
+        let d = TempDir::new().unwrap();
+        std::fs::create_dir(d.path().join("sub")).unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let sub = root.open_dir(OsStr::new("sub")).unwrap();
+        assert_eq!(sub.mount_root(&root).unwrap(), flux_fs::MountRoot::No);
+        // `/dev` is its own mount on Linux (devtmpfs) and on macOS (devfs): a different device from `/`.
+        let slash = StdFileSystem.destination_root(std::path::Path::new("/")).unwrap();
+        let dev = slash.open_dir(OsStr::new("dev")).unwrap();
+        assert_eq!(dev.mount_root(&slash).unwrap(), flux_fs::MountRoot::Yes);
+    }
+
+    #[test]
     fn a_child_directory_opens() {
         let d = TempDir::new().unwrap();
         std::fs::create_dir(d.path().join("child")).unwrap();
@@ -459,6 +472,15 @@ mod windows_arm {
     use flux_platform::StdFileSystem;
     use std::ffi::OsStr;
     use tempfile::TempDir;
+
+    #[test]
+    fn mount_root_is_never_reported_on_windows() {
+        let d = TempDir::new().unwrap();
+        std::fs::create_dir(d.path().join("sub")).unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let sub = root.open_dir(OsStr::new("sub")).unwrap();
+        assert_eq!(sub.mount_root(&root).unwrap(), flux_fs::MountRoot::No);
+    }
 
     fn junction(target: &std::path::Path, link: &std::path::Path) -> bool {
         std::process::Command::new("cmd")

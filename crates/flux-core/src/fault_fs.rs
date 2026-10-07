@@ -6,7 +6,7 @@
 
 use flux_fs::{
     Code, DestinationRoot, DirEntry, DirHandle, FileHandle, FileSystem, FileType, FsError,
-    LockCapability, LockFile, Metadata, Perms, Result, check_component,
+    LockCapability, LockFile, Metadata, MountRoot, Perms, Result, check_component,
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -27,6 +27,8 @@ struct Inner {
     /// accessor then -- it is not needed now.
     calls: Vec<String>,
     faults: HashMap<String, Code>,
+    /// directory snapshot path -> what `mount_root` answers (absent: `No`)
+    mount_roots: HashMap<PathBuf, MountRoot>,
     times: HashMap<PathBuf, Option<SystemTime>>,
     /// path -> bytes appended on the second `metadata` call
     grow: HashMap<PathBuf, Vec<u8>>,
@@ -572,6 +574,12 @@ impl FaultFs {
         self.inner.lock().unwrap().identities.insert(path.to_path_buf(), identity);
     }
 
+    /// What `mount_root` answers for the directory at `path` (default for every directory: `No`).
+    pub fn set_mount_root(&self, path: impl AsRef<Path>, answer: MountRoot) {
+        let path = path.as_ref();
+        self.inner.lock().unwrap().mount_roots.insert(path.to_path_buf(), answer);
+    }
+
     /// Whether this fake's `rename_no_replace` has an atomic no-replace primitive.
     /// Defaults to `true`; set `false` to make it report the platform's unsupported
     /// error, which is how a caller's behaviour on such a destination is tested
@@ -1057,6 +1065,13 @@ impl DirHandle for FakeDirHandle {
     type Writer = FakeHandle;
     type Lock = FakeLock;
 
+    fn mount_root(&self, _parent: &Self) -> Result<MountRoot> {
+        let path = self.my_path();
+        self.fs().record(format!("mount_root({})", path.display()), "mount_root")?;
+        let g = self.inner.lock().unwrap();
+        Ok(g.mount_roots.get(&path).copied().unwrap_or(MountRoot::No))
+    }
+
     fn identity(&self) -> Result<flux_fs::FileIdentity> {
         let path = self.my_path();
         let mut g = self.inner.lock().unwrap();
@@ -1512,6 +1527,37 @@ mod tests {
         let after = fs.metadata(std::path::Path::new("/b")).unwrap().identity;
 
         assert_eq!(before, after, "a rename moves the name, not the object");
+    }
+
+    #[test]
+    fn mount_root_answers_no_by_default_and_what_a_test_set() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.create_dir(Path::new("/d/m")).unwrap();
+        fs.create_dir(Path::new("/d/n")).unwrap();
+        fs.set_mount_root("/d/m", MountRoot::Yes);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let m = d.open_dir(OsStr::new("m")).unwrap();
+        let n = d.open_dir(OsStr::new("n")).unwrap();
+        assert_eq!(m.mount_root(&d).unwrap(), MountRoot::Yes);
+        assert_eq!(n.mount_root(&d).unwrap(), MountRoot::No);
+        assert!(
+            fs.calls().iter().any(|c| c.replace('\\', "/") == "mount_root(/d/m)"),
+            "{:?}",
+            fs.calls()
+        );
+    }
+
+    #[test]
+    fn mount_root_takes_an_injected_fault() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.create_dir(Path::new("/d/m")).unwrap();
+        fs.fail("mount_root", Code::PermissionDenied);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let m = d.open_dir(OsStr::new("m")).unwrap();
+        assert_eq!(m.mount_root(&d).unwrap_err().code, Code::PermissionDenied);
+        assert_eq!(m.mount_root(&d).unwrap(), MountRoot::No, "consumed on use");
     }
 
     #[test]
