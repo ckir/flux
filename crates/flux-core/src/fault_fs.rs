@@ -120,6 +120,8 @@ struct Inner {
     claim_stores: Vec<ClaimMap>,
     /// Fake claim stores created and not yet dropped (`claim_stores_open`).
     claim_stores_open: usize,
+    /// `claim_stores_open` when a handle last asked to remove a file named `state.db`.
+    open_at_state_db_removal: Option<usize>,
 }
 
 type ClaimMap = std::sync::Arc<Mutex<std::collections::BTreeMap<Vec<u8>, Vec<u8>>>>;
@@ -651,6 +653,11 @@ impl FaultFs {
     /// Fake claim stores created from this fake and not yet dropped.
     pub fn claim_stores_open(&self) -> usize {
         self.inner.lock().unwrap().claim_stores_open
+    }
+
+    /// The number of open fake claim stores when a handle last removed a `state.db`; `None` if none was removed.
+    pub fn claim_stores_open_at_last_state_db_removal(&self) -> Option<usize> {
+        self.inner.lock().unwrap().open_at_state_db_removal
     }
 
     /// Claims across every store created from this fake.
@@ -1396,6 +1403,10 @@ impl DirHandle for FakeDirHandle {
                     ),
                 ));
             }
+        }
+        if name == OsStr::new("state.db") {
+            let mut g = self.inner.lock().unwrap();
+            g.open_at_state_db_removal = Some(g.claim_stores_open);
         }
         self.fs().remove_file(&child_path)
     }

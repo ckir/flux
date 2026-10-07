@@ -1837,11 +1837,14 @@ fn a_kept_workspace_keeps_state_db() {
 }
 
 #[test]
-fn the_store_is_dropped_before_the_workspace_is_removed() {
+fn the_store_is_closed_when_state_db_is_removed_and_after_the_run() {
     let fs = fake();
     let (r, _) = run_tree(&fs, &cfg());
     ok(&r);
+    assert_eq!(
+        fs.claim_stores_open_at_last_state_db_removal(),
+        Some(0),
+        "state.db was removed while its store was still open (or never removed)"
+    );
     assert_eq!(fs.claim_stores_open(), 0);
-    let c = calls(&fs);
-    assert!(c.iter().any(|x| x.starts_with("create_claim_store(")), "a store was made");
 }
