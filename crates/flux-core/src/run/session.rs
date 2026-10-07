@@ -145,7 +145,7 @@ pub(crate) fn open_operation<'a, D: DirHandle, P: Place<D>>(
                 last_heartbeat_wall_time: now.to_string(),
             });
             let state = OperationState::created(id, place.kind(), place.destination(), now, file);
-            if let Err(e) = place.create(&state) {
+            if let Err(e) = place.create(&state, warnings) {
                 return Err(give_back(obtained, e, &lock_shown));
             }
             made = Some(state);
@@ -249,10 +249,18 @@ fn give_back<D: DirHandle>(
         return error;
     };
     if let Err(e) = held.discard()
-        && let RunError::Refused { changed, not_removed, .. } = &mut error
+        && let RunError::Refused { refusal, changed, not_removed } = &mut error
     {
         *changed = true;
-        *not_removed = Some((lock_shown.to_path_buf(), lock_io(e)));
+        // A removal already recorded (the probe's leftover) is kept in the detail, never dropped from the report.
+        if let Some((path, displaced)) = not_removed.replace((lock_shown.to_path_buf(), lock_io(e)))
+        {
+            refusal.detail.push_str(&format!(
+                "; also not removed: {} ({})",
+                path.display(),
+                displaced.source
+            ));
+        }
     }
     error
 }

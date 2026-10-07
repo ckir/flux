@@ -677,7 +677,7 @@ fn copy_one<F: DestinationRoot>(
 /// one Flux raised itself (an interior NUL), not the filesystem. Sound only for a
 /// failure at `CopyStep::Publish`: the temporary's name contains the target's, so a
 /// name the filesystem rejects fails at `Create` first.
-fn primitive_unavailable(e: &std::io::Error) -> bool {
+pub(crate) fn primitive_unavailable(e: &std::io::Error) -> bool {
     e.kind() == ErrorKind::Unsupported
         || (cfg!(unix) && e.kind() == ErrorKind::InvalidInput && e.raw_os_error().is_some())
 }

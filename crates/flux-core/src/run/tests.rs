@@ -150,13 +150,13 @@ fn the_record_stops_naming_the_state_before_the_state_is_removed() {
     let fs = fake();
     let seen: Arc<Mutex<Option<Vec<u8>>>> = Arc::default();
     let keep = Arc::clone(&seen);
-    // Renames without replacing: the workspace into place (1), `a` and `sub/b` published (2, 3), the retire (4).
-    fs.on_nth("rename_no_replace", 4, move |fs| *keep.lock().unwrap() = fs.read_file(LOCK));
+    // Renames without replacing: the probe (1), the workspace into place (2), `a` and `sub/b` published (3, 4), the retire (5).
+    fs.on_nth("rename_no_replace", 5, move |fs| *keep.lock().unwrap() = fs.read_file(LOCK));
     let (r, _) = run_tree(&fs, &cfg());
     ok(&r);
     let c = calls(&fs);
     let renames: Vec<&String> = c.iter().filter(|x| x.starts_with("rename_no_replace(")).collect();
-    assert!(renames[3].contains(&format!("{ID}.removing")), "the 4th is the retire: {renames:?}");
+    assert!(renames[4].contains(&format!("{ID}.removing")), "the 5th is the retire: {renames:?}");
     let bytes = seen.lock().unwrap().clone().expect("the lock exists at the retire");
     let Decoded::Record(rec) = decode(&bytes) else { panic!("a whole record") };
     assert_eq!((rec.operation_id.as_str(), rec.workspace_path.as_str()), (ID, "none"));
@@ -221,8 +221,8 @@ fn a_resumable_prior_operation_is_refused_and_the_lock_removed_again() {
 #[test]
 fn ownership_lost_mid_copy_stops_and_leaves_the_state_and_the_lock() {
     let fs = fake();
-    // `create_new`: this run's CREATED (1) and TRANSFERRING (2) manifests, then `a`'s temporary (3).
-    fs.on_nth("create_new", 3, |fs| fs.write_file(LOCK, b"another run's bytes"));
+    // `create_new`: the probe's temporary (1), this run's CREATED (2) and TRANSFERRING (3) manifests, then `a`'s temporary (4).
+    fs.on_nth("create_new", 4, |fs| fs.write_file(LOCK, b"another run's bytes"));
     let (r, _) = run_tree(&fs, &cfg());
     assert!(r.stop.is_none(), "the copy's abort is the report: {:?}", r.stop);
     let Some(Err(a)) = &r.copy else { panic!("the copy aborted: {:?}", r.copy) };
@@ -271,10 +271,10 @@ fn a_rollback_removes_a_dest_the_run_made() {
 #[test]
 fn a_temporary_the_copy_could_not_remove_keeps_the_completed_state() {
     let fs = fake();
-    // `a`'s copy fails while streaming (its temporary is the 3rd `create_new`), and removing that temporary fails
-    // too: the 4th `remove_file` (the two state writes clear their temporaries, then `a`'s step-1 sweep).
-    fs.on_nth("create_new", 3, |fs| fs.fail_write(std::io::Error::other("injected write")));
-    fs.fail_nth("remove_file", 4, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    // `a`'s copy fails while streaming (its temporary is the 4th `create_new`, after the probe's), and removing that temporary fails
+    // too: the 5th `remove_file` (the probe's removal, the two state writes clear their temporaries, then `a`'s step-1 sweep).
+    fs.on_nth("create_new", 4, |fs| fs.fail_write(std::io::Error::other("injected write")));
+    fs.fail_nth("remove_file", 5, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
     let (r, got) = run_tree(&fs, &cfg());
     let out = ok(&r);
     assert_eq!(out.failures.copy, 1, "{got:?}");
@@ -297,9 +297,9 @@ fn break_lock_takes_an_empty_lock_over_and_records_the_takeover_in_the_state() {
     dead_lock(&p, "dest.flux-lock", b"");
     let seen: Arc<Mutex<Option<Vec<u8>>>> = Arc::default();
     let keep = Arc::clone(&seen);
-    // `create_new`: the CREATED manifest (1), the takeover (2), TRANSFERRING (3), then `a`'s temporary (4).
+    // `create_new`: the probe's temporary (1), the CREATED manifest (2), the takeover (3), TRANSFERRING (4), then `a`'s temporary (5).
     let path = format!("/p/dest/.flux/operations/{ID}/manifest");
-    fs.on_nth("create_new", 4, move |fs| *keep.lock().unwrap() = fs.read_file(&path));
+    fs.on_nth("create_new", 5, move |fs| *keep.lock().unwrap() = fs.read_file(&path));
     let (r, _) = run_tree(&fs, &RunConfig { break_lock: true, ..restart() });
     ok(&r);
     let state = decode_state(&seen.lock().unwrap().clone().expect("the manifest exists")).unwrap();
@@ -348,9 +348,9 @@ fn a_refusal_whose_lock_cannot_be_removed_names_it_and_is_exit_1() {
 #[test]
 fn ownership_lost_after_completed_is_a_warning_and_the_lock_is_left() {
     let fs = fake();
-    // The retire is the 4th rename without replacing (the workspace, then the two publishes); just before it, the
+    // The retire is the 5th rename without replacing (the probe, the workspace, then the two publishes); just before it, the
     // lock is taken over. The transfer is complete and durable by then.
-    fs.on_nth("rename_no_replace", 4, |fs| fs.write_file(LOCK, b"another run's bytes"));
+    fs.on_nth("rename_no_replace", 5, |fs| fs.write_file(LOCK, b"another run's bytes"));
     let (r, _) = run_tree(&fs, &cfg());
     ok(&r);
     assert!(
@@ -407,16 +407,16 @@ fn a_partial_restart_cannot_delete_keeps_its_prior_abandoned() {
     prior(&fs, 5, OpState::Failed);
     let partial = format!("/p/dest/old.flux-partial.{}", id(5));
     fs.write_file(&partial, b"half");
-    // `remove_file`: this run's CREATED and the prior's ABANDONED state writes clear their temporaries (1, 2); then
-    // the partial (3).
-    fs.fail_nth("remove_file", 3, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    // `remove_file`: the probe's removal of `noreplace-probe` (1); this run's CREATED and the prior's ABANDONED state
+    // writes clear their temporaries (2, 3); then the partial (4).
+    fs.fail_nth("remove_file", 4, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
     let (r, _) = run_tree(&fs, &restart());
     ok(&r);
     let c = calls(&fs);
     let removals: Vec<&String> = c.iter().filter(|x| x.starts_with("remove_file(")).collect();
     assert!(
-        removals[2].contains("old.flux-partial"),
-        "the 3rd removal is the partial: {removals:?}"
+        removals[3].contains("old.flux-partial"),
+        "the 4th removal is the partial: {removals:?}"
     );
     assert!(fs.exists(&partial));
     let kept = manifest(&fs, &id(5));
@@ -447,7 +447,7 @@ fn a_version_2_prior_superseded_by_restart_stays_version_2() {
     let partial = format!("/p/dest/old.flux-partial.{}", id(5));
     fs.write_file(&partial, b"half");
     // As `a_partial_restart_cannot_delete_keeps_its_prior_abandoned`: the 3rd `remove_file` is the partial.
-    fs.fail_nth("remove_file", 3, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    fs.fail_nth("remove_file", 4, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
     let (r, _) = run_tree(&fs, &restart());
     ok(&r);
     let kept = manifest(&fs, &id(5));
@@ -480,6 +480,166 @@ fn restart_stops_when_ownership_is_lost_and_deletes_nothing_after() {
     assert!(r.copy.is_none());
     assert!(fs.exists(&partial), "§99 failed: nothing more is deleted");
     assert_eq!(fs.read_file(LOCK).as_deref(), Some(&b"another run's bytes"[..]), "never unlinked");
+}
+
+/// `/p/dest/.flux/operations/<ID>.creating/<name>`, as the call log shows it.
+fn creating(name: &str) -> String {
+    format!("/p/dest/.flux/operations/{ID}.creating/{name}")
+}
+
+#[test]
+fn the_probe_is_the_runs_first_no_replace_rename_and_leaves_nothing_in_the_workspace() {
+    let fs = fake();
+    let (r, _) = run_tree(&fs, &cfg());
+    ok(&r);
+    let c = calls(&fs);
+    let probe = at(
+        &c,
+        &format!(
+            "rename_no_replace({} -> {})",
+            creating("noreplace-probe.tmp"),
+            creating("noreplace-probe")
+        ),
+    );
+    let removed = at(&c, &format!("remove_file({})", creating("noreplace-probe")));
+    let manifest = at(&c, &format!("create_new({})", creating("manifest.tmp")));
+    let published = at(
+        &c,
+        &format!(
+            "rename_no_replace(/p/dest/.flux/operations/{ID}.creating -> /p/dest/.flux/operations/{ID})"
+        ),
+    );
+    assert!(probe < removed && removed < manifest && manifest < published, "{c:?}");
+    assert_eq!(
+        c.iter()
+            .filter(|x| x.starts_with("rename_no_replace(") && x.contains("noreplace-probe"))
+            .count(),
+        1,
+        "once per run"
+    );
+}
+
+#[test]
+fn a_missing_no_replace_primitive_is_refused_with_nothing_changed() {
+    let fs = fake();
+    fs.set_no_replace_support(false);
+    let (r, got) = run_tree(&fs, &cfg());
+    assert!(r.copy.is_none() && got.is_empty(), "{:?}", r.copy);
+    let Some(RunError::Refused { refusal, changed, not_removed }) = &r.stop else {
+        panic!("{:?}", r.stop)
+    };
+    assert_eq!(
+        (refusal.code, *changed, not_removed.is_none()),
+        (LockCode::NoReplacePublishUnavailable, false, true)
+    );
+    assert!(refusal.detail.contains("noreplace-probe"), "{}", refusal.detail);
+    assert!(!fs.exists("/p/dest"), "DEST this run made is removed again");
+    assert!(!fs.exists(LOCK));
+    assert!(
+        !calls(&fs).iter().any(|c| c.contains("manifest.tmp")),
+        "no manifest was ever staged: {:?}",
+        calls(&fs)
+    );
+}
+
+#[test]
+fn a_probe_file_that_cannot_be_removed_is_a_warning_and_the_run_continues() {
+    let fs = fake();
+    // The probe's removal of `noreplace-probe` is the run's first `remove_file` (no lock exists to clean up and the
+    // probe precedes the manifest's `.tmp` sweep). If the call log says otherwise, use `fail_nth` with the index
+    // the log shows.
+    fs.fail("remove_file", Code::PermissionDenied);
+    let (r, got) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert_eq!((out.files_copied, got.len()), (2, 0));
+    let kept = format!("/p/dest/.flux/operations/{ID}/noreplace-probe");
+    assert!(
+        r.warnings.iter().any(|w| matches!(w, RunWarning::ProbeNotRemoved { path, .. } if path.to_string_lossy().replace('\\', "/") == kept)),
+        "{:?}", r.warnings
+    );
+    assert!(
+        r.warnings.iter().any(|w| matches!(w, RunWarning::NotRemoved { .. })),
+        "the workspace cannot go either: {:?}",
+        r.warnings
+    );
+    assert!(
+        fs.exists(format!("/p/dest/.flux/operations/{ID}.removing/noreplace-probe")),
+        "retired, not removed"
+    );
+    assert!(!fs.exists(LOCK), "the lock is still released");
+}
+
+#[test]
+fn a_refused_probe_whose_temporary_cannot_be_removed_names_it_and_is_exit_1() {
+    let fs = fake();
+    fs.set_no_replace_support(false);
+    fs.fail("remove_file", Code::PermissionDenied);
+    let (r, _) = run_tree(&fs, &cfg());
+    let Some(RunError::Refused { refusal, changed, not_removed }) = &r.stop else {
+        panic!("{:?}", r.stop)
+    };
+    assert_eq!((refusal.code, *changed), (LockCode::NoReplacePublishUnavailable, true));
+    let (path, _) = not_removed.as_ref().expect("the temporary is named");
+    assert_eq!(path.to_string_lossy().replace('\\', "/"), creating("noreplace-probe.tmp"));
+    assert!(
+        fs.exists(creating("noreplace-probe.tmp")) && fs.exists("/p/dest"),
+        "left where they are"
+    );
+    assert!(!fs.exists(LOCK), "the lock is still released");
+}
+
+#[test]
+fn another_probe_publish_error_fails_the_run_at_the_probe_step() {
+    let fs = fake();
+    // The probe's publish is the run's first `rename_no_replace`.
+    fs.fail("rename_no_replace", Code::PermissionDenied);
+    let (r, _) = run_tree(&fs, &cfg());
+    assert!(r.copy.is_none());
+    let (step, path) = failed_at(&r.stop);
+    assert_eq!((step, path), (RunStep::Probe, creating("noreplace-probe")));
+    assert!(!fs.exists(creating("noreplace-probe.tmp")), "the temporary is removed best-effort");
+    assert!(!fs.exists("/p/dest"), "a DEST this run made does not strand on a probe failure");
+    assert!(!fs.exists(LOCK));
+}
+
+#[test]
+fn restart_probes_again_and_a_refusal_there_leaves_the_priors_resumable() {
+    let fs = fake();
+    prior(&fs, 5, OpState::Failed);
+    fs.set_no_replace_support(false);
+    let (r, _) = run_tree(&fs, &restart());
+    assert_eq!(refused(&r.stop), (LockCode::NoReplacePublishUnavailable, false));
+    assert_eq!(manifest(&fs, &id(5)).state, OpState::Failed, "not superseded");
+    assert!(!fs.exists(format!("/p/dest/.flux/operations/{ID}.creating")) && !fs.exists(LOCK));
+    assert!(fs.exists("/p/dest"), "DEST was the operator's");
+}
+
+#[test]
+fn a_refusal_keeps_the_probe_leftover_when_the_lock_cannot_be_removed() {
+    let fs = fake();
+    fs.set_no_replace_support(false);
+    fs.fail_always("remove_file", Code::PermissionDenied); // the probe temporary AND the lock both stay
+    let (r, _) = run_tree(&fs, &cfg());
+    let Some(RunError::Refused { refusal, changed, not_removed }) = &r.stop else {
+        panic!("{:?}", r.stop)
+    };
+    assert_eq!((refusal.code, *changed), (LockCode::NoReplacePublishUnavailable, true));
+    assert!(
+        refusal.detail.contains("noreplace-probe.tmp"),
+        "the displaced leftover is kept: {}",
+        refusal.detail
+    );
+    let (path, _) = not_removed.as_ref().expect("the lock is named");
+    assert_eq!(path.to_string_lossy().replace('\\', "/"), LOCK);
+}
+
+#[test]
+fn a_single_file_run_never_probes() {
+    let fs = fake();
+    fs.set_no_replace_support(false);
+    let r = run_file(&fs, &cfg());
+    assert!(r.stop.is_none() && r.copy.as_ref().is_some_and(|c| c.is_ok()), "{r:?}");
+    assert!(!calls(&fs).iter().any(|c| c.contains("noreplace-probe")));
 }
 
 const T_LOCK: &str = "/p/t.flux-lock";
@@ -852,10 +1012,10 @@ fn a_single_files_partial_that_cannot_be_deleted_keeps_its_prior() {
 fn a_prior_whose_state_cannot_be_removed_is_a_warning() {
     let fs = fake();
     prior(&fs, 5, OpState::Failed);
-    // `rename_no_replace`: this run's workspace into place (1), then the prior's retire (2), which fails.
+    // `rename_no_replace`: the probe (1), this run's workspace into place (2), then the prior's retire (3), which fails.
     fs.fail_nth(
         "rename_no_replace",
-        2,
+        3,
         Code::PermissionDenied,
         std::io::ErrorKind::PermissionDenied,
     );
@@ -996,11 +1156,11 @@ fn a_replaced_targets_identity_is_recorded_when_the_state_is_made() {
 }
 
 /// A clean tree run whose COMPLETED workspace cannot be retired, so its manifest stays to be read. `rename_no_replace`:
-/// the workspace (1), `a`'s and `sub/b`'s publishes (2, 3), then the retire (4), which fails.
+/// the probe (1), the workspace (2), `a`'s and `sub/b`'s publishes (3, 4), then the retire (5), which fails.
 fn kept_tree_manifest(fs: &FaultFs) -> OperationState {
     fs.fail_nth(
         "rename_no_replace",
-        4,
+        5,
         Code::PermissionDenied,
         std::io::ErrorKind::PermissionDenied,
     );
@@ -1109,11 +1269,11 @@ fn a_version_2_single_file_prior_superseded_by_restart_keeps_its_fields() {
 #[test]
 fn a_leftover_inside_a_folder_is_listed_by_its_path_below_dest() {
     let fs = fake();
-    // `sub/b`'s copy fails while streaming: `create_new` is the manifest (1), TRANSFERRING (2), `a`'s temporary (3),
-    // `sub/b`'s (4). Removing it fails too: `remove_file` is the two state writes (1, 2), `a`'s sweep (3), `sub/b`'s
-    // sweep (4), then `sub/b`'s temporary (5).
-    fs.on_nth("create_new", 4, |fs| fs.fail_write(std::io::Error::other("injected write")));
-    fs.fail_nth("remove_file", 5, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    // `sub/b`'s copy fails while streaming: `create_new` is the probe's temporary (1), the manifest (2), TRANSFERRING (3),
+    // `a`'s temporary (4), `sub/b`'s (5). Removing it fails too: `remove_file` is the probe's (1), the two state writes
+    // (2, 3), `a`'s sweep (4), `sub/b`'s sweep (5), then `sub/b`'s temporary (6).
+    fs.on_nth("create_new", 5, |fs| fs.fail_write(std::io::Error::other("injected write")));
+    fs.fail_nth("remove_file", 6, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
     let (r, got) = run_tree(&fs, &cfg());
     ok(&r);
     assert_eq!(got.len(), 1, "{got:?}");
@@ -1404,9 +1564,9 @@ fn restart_stops_before_removing_a_superseded_state_once_ownership_is_lost() {
     prior(&fs, 5, OpState::Failed);
     let partial = format!("/p/dest/old.flux-partial.{}", id(5));
     fs.write_file(&partial, b"half");
-    // `remove_file`: this run's CREATED and the prior's ABANDONED state writes clear their temporaries (1, 2); then
-    // the partial (3). Just before it, the lock is taken over, so the next check is the removal loop's.
-    fs.on_nth("remove_file", 3, |fs| fs.write_file(LOCK, b"another run's bytes"));
+    // `remove_file`: the probe's removal of `noreplace-probe` (1); this run's CREATED and the prior's ABANDONED state
+    // writes clear their temporaries (2, 3); then the partial (4). Just before it, the lock is taken over, so the next check is the removal loop's.
+    fs.on_nth("remove_file", 4, |fs| fs.write_file(LOCK, b"another run's bytes"));
     let (r, _) = run_tree(&fs, &restart());
     assert_eq!(refused(&r.stop), (LockCode::TargetLockBusy, true));
     assert_eq!(

@@ -5,14 +5,14 @@
 use super::session::{Fault, Locked, checked, failed, from_lock};
 use super::{RunError, RunStep, RunWarning};
 use crate::copy::{CopyError, CopyStep, split_destination};
-use crate::lock::LockResult;
+use crate::lock::{LockCode, LockResult, Refusal};
 use crate::prior::{PriorOp, Scan, scan_file, scan_tree};
 use crate::state::{
-    FLUX_DIR, Kind, MANIFEST, OPERATIONS_DIR, OperationState, PARTIAL_INFIX, create_workspace,
-    id_after, operations_dir, record_name, remove_empty_control_dirs, remove_record,
-    retire_workspace, write_state,
+    FLUX_DIR, Kind, MANIFEST, OPERATIONS_DIR, OperationState, PARTIAL_INFIX, begin_workspace,
+    creating_name, id_after, operations_dir, publish_workspace, record_name,
+    remove_empty_control_dirs, remove_record, retire_workspace, write_state,
 };
-use crate::tree::{TreeOutcome, containment, preflight, reserved_path};
+use crate::tree::{TreeOutcome, containment, preflight, primitive_unavailable, reserved_path};
 use crate::walk::{WalkEvent, walk};
 use flux_fs::{
     Code, DestinationRoot, DirHandle, FileIdentity, FileType, FsError, OperationId, Safety,
@@ -37,8 +37,13 @@ pub(crate) trait Place<D: DirHandle> {
     fn shown(&self, id: &str) -> PathBuf;
     /// Step 4: the prior operations (§21.1).
     fn scan(&self, own_id: &str) -> LockResult<Scan>;
-    /// Step 5: create this operation's state, CREATED; for a tree, DEST first where it is absent (E1).
-    fn create(&mut self, state: &OperationState) -> Result<(), RunError>;
+    /// Step 5: create this operation's state, CREATED; for a tree, DEST first where it is absent (E1), then the
+    /// section 241.5 probe inside the unpublished workspace (cut 8a, Part P), then the workspace published.
+    fn create(
+        &mut self,
+        state: &OperationState,
+        warnings: &mut Vec<RunWarning>,
+    ) -> Result<(), RunError>;
     /// Rewrite `state` where its operation's state lives: this run's, or a prior's under `--restart`.
     fn write(&self, state: &OperationState) -> flux_fs::Result<()>;
     /// `--restart`: delete the superseded operations' partials, the heartbeat and `still_owned` before each deletion.
@@ -58,6 +63,39 @@ pub(crate) trait Place<D: DirHandle> {
     /// (`None` if there is none, `Unavailable` if it cannot be read). Read under the lock, as the state is made. `None`
     /// for a tree.
     fn file_identities(&self) -> Option<(FileIdentity, Option<FileIdentity>)>;
+}
+
+/// Section 241.5's fixed name, and its staging temporary.
+pub(crate) const PROBE: &str = "noreplace-probe";
+pub(crate) const PROBE_TEMP: &str = "noreplace-probe.tmp";
+
+/// What the probe found. A `leftover` is a file of the probe's that could not be removed again, by name.
+pub(crate) enum Probe {
+    /// The primitive is there; `leftover` is `noreplace-probe` (a warning, it goes with the workspace).
+    Available { leftover: Option<(OsString, FsError)> },
+    /// The primitive is missing (`primitive_unavailable`); `leftover` is the staged temporary.
+    Unavailable { leftover: Option<(OsString, FsError)> },
+}
+
+/// Part P: stage `PROBE_TEMP` in `workspace` (an empty file), publish it onto `PROBE` with `rename_no_replace`,
+/// then remove what was written. `Err` is any failure other than "primitive unavailable" of the publish, or a
+/// failed create; the temporary is removed best-effort before returning it.
+pub(crate) fn probe_no_replace<D: DirHandle>(workspace: &D) -> flux_fs::Result<Probe> {
+    let temp = OsStr::new(PROBE_TEMP);
+    let name = OsStr::new(PROBE);
+    // Nothing is written: the writer is dropped at once.
+    drop(workspace.create_new(temp)?);
+    let remove = |n: &OsStr| workspace.remove_file(n).err().map(|e| (n.to_os_string(), e));
+    match workspace.rename_no_replace(temp, workspace, name) {
+        Ok(()) => Ok(Probe::Available { leftover: remove(name) }),
+        Err(e) if primitive_unavailable(&e.source) => {
+            Ok(Probe::Unavailable { leftover: remove(temp) })
+        }
+        Err(e) => {
+            let _ = workspace.remove_file(temp);
+            Err(e)
+        }
+    }
 }
 
 /// What B1 resolved for a tree's DEST: the directory holding the lock, DEST's name in it, and DEST if it exists.
@@ -154,6 +192,46 @@ impl<F: DestinationRoot> TreePlace<'_, F> {
         self.dest_shown.join(FLUX_DIR).join(OPERATIONS_DIR)
     }
 
+    /// Remove `<id>.creating`, then the control directories (and a DEST this run made); the first failed removal.
+    fn unwind_creating(&mut self, operations: F::Dir, id: &str) -> Option<(PathBuf, FsError)> {
+        let mut not_removed = operations
+            .remove_dir(&creating_name(id))
+            .err()
+            .map(|e| (self.operations_shown().join(creating_name(id)), e));
+        self.operations = Some(operations);
+        if let Err(first) = self.remove_control_dirs(true) {
+            not_removed.get_or_insert(first);
+        }
+        not_removed
+    }
+
+    /// The refusal for a destination without the no-replace primitive: nothing was published, and what this run
+    /// made is removed again; a leftover makes it `changed`.
+    fn refuse_no_replace(
+        &mut self,
+        operations: F::Dir,
+        id: &str,
+        leftover: Option<(OsString, FsError)>,
+    ) -> RunError {
+        let shown = self.operations_shown().join(creating_name(id));
+        let leftover = leftover.map(|(n, e)| (shown.join(n), e));
+        let unwound = self.unwind_creating(operations, id);
+        let not_removed = leftover.or(unwound);
+        RunError::Refused {
+            refusal: Box::new(Refusal {
+                code: LockCode::NoReplacePublishUnavailable,
+                holder: None,
+                detail: format!(
+                    "{}: the destination has no atomic no-replace publication primitive, which a directory copy needs so that it never replaces a file (probed at {})",
+                    self.dest_shown.display(),
+                    shown.join(PROBE).display()
+                ),
+            }),
+            changed: not_removed.is_some(),
+            not_removed,
+        }
+    }
+
     fn operations(&self) -> &F::Dir {
         self.operations
             .as_ref()
@@ -189,7 +267,11 @@ impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {
         }
     }
 
-    fn create(&mut self, state: &OperationState) -> Result<(), RunError> {
+    fn create(
+        &mut self,
+        state: &OperationState,
+        warnings: &mut Vec<RunWarning>,
+    ) -> Result<(), RunError> {
         if self.dest.is_none() {
             let name = self.name.as_deref().expect("only a named DEST can be absent");
             let dest = match self.holder.create_dir(name) {
@@ -209,8 +291,32 @@ impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {
         let operations = operations_dir(dest, &self.dest_shown).map_err(|e| {
             from_lock(e, RunStep::State, &self.operations_shown(), self.created_dest)
         })?;
-        let workspace = create_workspace(&operations, state)
-            .map_err(|e| failed(RunStep::State, &self.shown(&state.operation_id), e))?;
+        let id = state.operation_id.as_str();
+        let shown_creating = self.operations_shown().join(creating_name(id));
+        let building = begin_workspace(&operations, id)
+            .map_err(|e| failed(RunStep::State, &shown_creating, e))?;
+        match probe_no_replace(&building) {
+            Ok(Probe::Available { leftover: None }) => {}
+            Ok(Probe::Available { leftover: Some((name, error)) }) => {
+                // The file's path once the workspace is published.
+                warnings.push(RunWarning::ProbeNotRemoved {
+                    path: self.operations_shown().join(id).join(name),
+                    error,
+                });
+            }
+            Ok(Probe::Unavailable { leftover }) => {
+                drop(building);
+                return Err(self.refuse_no_replace(operations, id, leftover));
+            }
+            Err(error) => {
+                drop(building);
+                // Best effort: a DEST this run made and the control directories must not strand.
+                let _ = self.unwind_creating(operations, id);
+                return Err(failed(RunStep::Probe, &shown_creating.join(PROBE), error));
+            }
+        }
+        let workspace = publish_workspace(&operations, building, state)
+            .map_err(|e| failed(RunStep::State, &self.shown(id), e))?;
         drop(workspace);
         self.operations = Some(operations);
         Ok(())
@@ -359,7 +465,11 @@ impl<D: DirHandle> Place<D> for FilePlace<'_, D> {
         scan_file(self.dir, &self.target, &self.dir_shown, own_id)
     }
 
-    fn create(&mut self, state: &OperationState) -> Result<(), RunError> {
+    fn create(
+        &mut self,
+        state: &OperationState,
+        _warnings: &mut Vec<RunWarning>,
+    ) -> Result<(), RunError> {
         self.write(state).map_err(|e| failed(RunStep::State, &self.shown(&state.operation_id), e))
     }
 

@@ -15,6 +15,9 @@ pub enum LockCode {
     StateCorrupt,
     IncompatibleState,
     ResumableOperationExists,
+    /// Raised by the run (section 241.5), not by the lock protocol, as `PathComponentInvalid` already is: the
+    /// destination has no atomic no-replace publication primitive.
+    NoReplacePublishUnavailable,
 }
 
 impl LockCode {
@@ -29,6 +32,7 @@ impl LockCode {
             Self::StateCorrupt => "STATE_CORRUPT",
             Self::IncompatibleState => "INCOMPATIBLE_STATE",
             Self::ResumableOperationExists => "RESUMABLE_OPERATION_EXISTS",
+            Self::NoReplacePublishUnavailable => "NOREPLACE_PUBLISH_UNAVAILABLE",
         }
     }
 }
@@ -86,5 +90,6 @@ mod tests {
         assert_eq!(LockCode::StateCorrupt.as_str(), "STATE_CORRUPT");
         assert_eq!(LockCode::IncompatibleState.as_str(), "INCOMPATIBLE_STATE");
         assert_eq!(LockCode::ResumableOperationExists.as_str(), "RESUMABLE_OPERATION_EXISTS");
+        assert_eq!(LockCode::NoReplacePublishUnavailable.as_str(), "NOREPLACE_PUBLISH_UNAVAILABLE");
     }
 }

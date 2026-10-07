@@ -593,11 +593,39 @@ pub fn read_state<D: DirHandle>(
     Ok(decode(&dir.read_file(name, STATE_LIMIT)?))
 }
 
+/// `<id>.creating`.
+pub fn creating_name(id: &str) -> OsString {
+    let mut creating = OsString::from(id);
+    creating.push(CREATING_SUFFIX);
+    creating
+}
+
+/// Step 1 of `create_workspace`: `<id>.creating`, empty, as a handle.
+pub fn begin_workspace<D: DirHandle>(operations: &D, id: &str) -> flux_fs::Result<D> {
+    operations.create_dir(&creating_name(id))
+}
+
+/// Steps 2-3: the manifest written into `building` crash-safely, `building` closed, `<id>.creating` renamed onto
+/// `<id>` without replacing, `operations/` flushed; returns the published workspace's handle.
+pub fn publish_workspace<D: DirHandle>(
+    operations: &D,
+    building: D,
+    state: &OperationState,
+) -> flux_fs::Result<D> {
+    let id = OsStr::new(&state.operation_id);
+    write_state(&building, OsStr::new(MANIFEST), state)?;
+    // Closed before the rename.
+    drop(building);
+    operations.rename_no_replace(&creating_name(&state.operation_id), operations, id)?;
+    operations.sync()?;
+    operations.open_dir(id)
+}
+
 /// Create a tree operation's workspace `operations/<id>/`, holding its manifest, so that it never exists without one
 /// (decision 3):
-/// 1. build it as `<id>.creating`, with the manifest written inside crash-safely;
-/// 2. rename it to `<id>` without replacing;
-/// 3. flush `operations/`.
+/// 1. build it as `<id>.creating` (`begin_workspace`);
+/// 2. write the manifest inside crash-safely, rename it to `<id>` without replacing, and flush `operations/`
+///    (`publish_workspace`).
 ///
 /// A crash before the rename leaves only `<id>.creating`, which the §21.1 scan ignores (cut 9's cleanup). Returns the
 /// workspace's handle.
@@ -605,17 +633,8 @@ pub fn create_workspace<D: DirHandle>(
     operations: &D,
     state: &OperationState,
 ) -> flux_fs::Result<D> {
-    let id = OsStr::new(&state.operation_id);
-    let mut creating = id.to_os_string();
-    creating.push(CREATING_SUFFIX);
-    {
-        let building = operations.create_dir(&creating)?;
-        write_state(&building, OsStr::new(MANIFEST), state)?;
-        // Closed before the rename.
-    }
-    operations.rename_no_replace(&creating, operations, id)?;
-    operations.sync()?;
-    operations.open_dir(id)
+    let building = begin_workspace(operations, &state.operation_id)?;
+    publish_workspace(operations, building, state)
 }
 
 /// `DEST/.flux/operations/`, creating `.flux` and `operations` as needed (the run's step 5) and flushing each parent a
@@ -922,6 +941,21 @@ mod tests {
         assert!(write_state(&d, OsStr::new("rec"), &newer).is_err());
         assert_eq!(read_state(&d, OsStr::new("rec")).unwrap(), Ok(created()));
         assert!(!fs.exists("/p/dest/rec.tmp"));
+    }
+
+    #[test]
+    fn begin_then_publish_is_create_workspace() {
+        let (fs, d) = dest();
+        let ops = operations_dir(&d, Path::new("D")).unwrap();
+        let path = format!("/p/dest/.flux/operations/{}", id(1));
+        let building = begin_workspace(&ops, &created().operation_id).unwrap();
+        assert!(
+            fs.exists(format!("{path}.creating"))
+                && !fs.exists(format!("{path}.creating/manifest"))
+        );
+        let ws = publish_workspace(&ops, building, &created()).unwrap();
+        assert_eq!(read_state(&ws, OsStr::new(MANIFEST)).unwrap(), Ok(created()));
+        assert!(fs.exists(format!("{path}/manifest")) && !fs.exists(format!("{path}.creating")));
     }
 
     #[test]

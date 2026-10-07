@@ -324,6 +324,11 @@ pub fn run_warning_line(w: &RunWarning) -> String {
             "warning: the lock {} was taken over after this copy completed; it was left in place",
             p.display()
         ),
+        RunWarning::ProbeNotRemoved { path, error } => format!(
+            "warning: the no-replace probe {} could not be removed ({}); it goes when the operation's state is removed",
+            path.display(),
+            error.source
+        ),
     }
 }
 
@@ -641,6 +646,7 @@ mod tests {
             RunWarning::StateKept(p()),
             RunWarning::PartialKept { path: p(), error: io(), kept: PathBuf::from("X/kept") },
             RunWarning::OwnershipLostAfterCompletion(p()),
+            RunWarning::ProbeNotRemoved { path: p(), error: io() },
         ];
         for w in &all {
             let line = run_warning_line(w);
