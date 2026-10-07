@@ -111,6 +111,8 @@ pub enum RunStep {
     Restart,
     /// Removing what a refused copy left (Q-I).
     Rollback,
+    /// The section 241.5 no-replace probe inside the unpublished workspace (cut 8a, Part P).
+    Probe,
 }
 
 impl RunStep {
@@ -122,6 +124,7 @@ impl RunStep {
             Self::Record => "writing the lock record",
             Self::Restart => "superseding a prior operation",
             Self::Rollback => "removing what the refused copy left",
+            Self::Probe => "probing the destination for no-replace publication",
         }
     }
 }
@@ -140,6 +143,8 @@ pub enum RunWarning {
     PartialKept { path: PathBuf, error: FsError, kept: PathBuf },
     /// Ownership was lost after COMPLETED (finish step 5): the lock was closed without unlinking.
     OwnershipLostAfterCompletion(PathBuf),
+    /// A file of the no-replace probe could not be removed (Part P); it goes with the operation's state.
+    ProbeNotRemoved { path: PathBuf, error: FsError },
 }
 
 /// A directory copy under the destination's lock ("The run").
@@ -163,7 +168,8 @@ pub fn tree<F: DestinationRoot>(
             return run;
         }
     };
-    let located = match locate_tree(fs, dst_root, source.identity, opts.safety, &mut out.warnings) {
+    let located = match locate_tree(fs, src_root, dst_root, source.identity, opts.safety, &mut out)
+    {
         Ok(l) => l,
         Err(error) => {
             run.copy = Some(Err(TreeAbort { error, outcome: out }));

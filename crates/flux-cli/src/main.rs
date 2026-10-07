@@ -202,7 +202,7 @@ fn copy(args: &CopyArgs) -> u8 {
                             &a.outcome
                         }
                     };
-                    for line in report::warning_lines(&outcome.warnings) {
+                    for line in report::tree_warning_lines(outcome) {
                         err(&line);
                     }
                     lines(report::run_lines(&run));

@@ -6,7 +6,7 @@
 
 use flux_fs::{
     Code, DestinationRoot, DirEntry, DirHandle, FileHandle, FileSystem, FileType, FsError,
-    LockCapability, LockFile, Metadata, Perms, Result, check_component,
+    LockCapability, LockFile, Metadata, MountRoot, Perms, Result, check_component,
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -27,6 +27,12 @@ struct Inner {
     /// accessor then -- it is not needed now.
     calls: Vec<String>,
     faults: HashMap<String, Code>,
+    /// directory snapshot path -> what `mount_root` answers (absent: `No`)
+    mount_roots: HashMap<PathBuf, MountRoot>,
+    /// directory snapshot path -> what `canonical_path` answers (absent: the path itself)
+    canonical: HashMap<PathBuf, PathBuf>,
+    /// directory snapshot path -> the fault `canonical_path` raises on that one directory, every time
+    canonical_faults: HashMap<PathBuf, (Code, std::io::ErrorKind)>,
     times: HashMap<PathBuf, Option<SystemTime>>,
     /// path -> bytes appended on the second `metadata` call
     grow: HashMap<PathBuf, Vec<u8>>,
@@ -572,6 +578,34 @@ impl FaultFs {
         self.inner.lock().unwrap().identities.insert(path.to_path_buf(), identity);
     }
 
+    /// What `mount_root` answers for the directory at `path` (default for every directory: `No`).
+    pub fn set_mount_root(&self, path: impl AsRef<Path>, answer: MountRoot) {
+        let path = path.as_ref();
+        self.inner.lock().unwrap().mount_roots.insert(path.to_path_buf(), answer);
+    }
+
+    /// What `canonical_path` answers for the directory at `path` (default: the directory's own snapshot path).
+    pub fn set_canonical_path(&self, path: impl AsRef<Path>, canonical: impl AsRef<Path>) {
+        let (path, canonical) = (path.as_ref(), canonical.as_ref());
+        self.inner.lock().unwrap().canonical.insert(path.to_path_buf(), canonical.to_path_buf());
+    }
+
+    /// Make `canonical_path` fail EVERY time on the directory whose snapshot path is `path`, and only there.
+    /// The global `fail`/`fail_kind` fault is consumed by whichever handle asks first, so it cannot aim at the
+    /// second of two queries; this one can.
+    pub fn fail_canonical_path_of(
+        &self,
+        path: impl AsRef<Path>,
+        code: Code,
+        kind: std::io::ErrorKind,
+    ) {
+        self.inner
+            .lock()
+            .unwrap()
+            .canonical_faults
+            .insert(path.as_ref().to_path_buf(), (code, kind));
+    }
+
     /// Whether this fake's `rename_no_replace` has an atomic no-replace primitive.
     /// Defaults to `true`; set `false` to make it report the platform's unsupported
     /// error, which is how a caller's behaviour on such a destination is tested
@@ -1057,6 +1091,23 @@ impl DirHandle for FakeDirHandle {
     type Writer = FakeHandle;
     type Lock = FakeLock;
 
+    fn mount_root(&self, _parent: &Self) -> Result<MountRoot> {
+        let path = self.my_path();
+        self.fs().record(format!("mount_root({})", path.display()), "mount_root")?;
+        let g = self.inner.lock().unwrap();
+        Ok(g.mount_roots.get(&path).copied().unwrap_or(MountRoot::No))
+    }
+
+    fn canonical_path(&self) -> Result<PathBuf> {
+        let path = self.my_path();
+        self.fs().record(format!("canonical_path({})", path.display()), "canonical_path")?;
+        let g = self.inner.lock().unwrap();
+        if let Some(&(code, kind)) = g.canonical_faults.get(&path) {
+            return Err(FsError::new(code, std::io::Error::new(kind, "injected")));
+        }
+        Ok(g.canonical.get(&path).cloned().unwrap_or(path))
+    }
+
     fn identity(&self) -> Result<flux_fs::FileIdentity> {
         let path = self.my_path();
         let mut g = self.inner.lock().unwrap();
@@ -1512,6 +1563,82 @@ mod tests {
         let after = fs.metadata(std::path::Path::new("/b")).unwrap().identity;
 
         assert_eq!(before, after, "a rename moves the name, not the object");
+    }
+
+    #[test]
+    fn canonical_path_is_the_handles_own_path_unless_a_test_set_one() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.create_dir(Path::new("/d/x")).unwrap();
+        fs.set_canonical_path("/d/x", "/elsewhere/x");
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let x = d.open_dir(OsStr::new("x")).unwrap();
+        assert_eq!(d.canonical_path().unwrap(), PathBuf::from("/d"));
+        assert_eq!(x.canonical_path().unwrap(), PathBuf::from("/elsewhere/x"));
+    }
+
+    #[test]
+    fn canonical_path_takes_an_injected_fault_with_its_kind() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.fail_kind("canonical_path", Code::IoError, std::io::ErrorKind::Unsupported);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let e = d.canonical_path().unwrap_err();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::Unsupported);
+        assert_eq!(d.canonical_path().unwrap(), PathBuf::from("/d"), "consumed on use");
+    }
+
+    #[test]
+    fn a_per_directory_canonical_path_fault_hits_only_that_directory_and_every_time() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.create_dir(Path::new("/d/x")).unwrap();
+        fs.fail_canonical_path_of(
+            "/d/x",
+            Code::PermissionDenied,
+            std::io::ErrorKind::PermissionDenied,
+        );
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let x = d.open_dir(OsStr::new("x")).unwrap();
+        assert_eq!(d.canonical_path().unwrap(), PathBuf::from("/d"));
+        for _ in 0..2 {
+            let e = x.canonical_path().unwrap_err();
+            assert_eq!(
+                (e.code, e.source.kind()),
+                (Code::PermissionDenied, std::io::ErrorKind::PermissionDenied)
+            );
+        }
+    }
+
+    #[test]
+    fn mount_root_answers_no_by_default_and_what_a_test_set() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.create_dir(Path::new("/d/m")).unwrap();
+        fs.create_dir(Path::new("/d/n")).unwrap();
+        fs.set_mount_root("/d/m", MountRoot::Yes);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let m = d.open_dir(OsStr::new("m")).unwrap();
+        let n = d.open_dir(OsStr::new("n")).unwrap();
+        assert_eq!(m.mount_root(&d).unwrap(), MountRoot::Yes);
+        assert_eq!(n.mount_root(&d).unwrap(), MountRoot::No);
+        assert!(
+            fs.calls().iter().any(|c| c.replace('\\', "/") == "mount_root(/d/m)"),
+            "{:?}",
+            fs.calls()
+        );
+    }
+
+    #[test]
+    fn mount_root_takes_an_injected_fault() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.create_dir(Path::new("/d/m")).unwrap();
+        fs.fail("mount_root", Code::PermissionDenied);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let m = d.open_dir(OsStr::new("m")).unwrap();
+        assert_eq!(m.mount_root(&d).unwrap_err().code, Code::PermissionDenied);
+        assert_eq!(m.mount_root(&d).unwrap(), MountRoot::No, "consumed on use");
     }
 
     #[test]

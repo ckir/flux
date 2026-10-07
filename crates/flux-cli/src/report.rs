@@ -211,6 +211,33 @@ pub fn warning_lines(w: &WeakIdentityWarnings) -> Vec<String> {
     v
 }
 
+/// Cut 8a's two safety warnings: the mount-root checks that could not tell, then the containment check that fell
+/// back to the lexical floor. Empty when neither degraded.
+pub fn safety_warning_lines(out: &TreeOutcome) -> Vec<String> {
+    let mut v = Vec::new();
+    if let Some(g) = &out.mount_unknown {
+        v.push(format!(
+            "warning: could not tell whether a pre-existing destination directory is a mount root ({} checks, e.g. {}); merged anyway - --safety=strict refuses instead",
+            g.count,
+            rel(&g.example)
+        ));
+    }
+    if let Some(path) = &out.containment_degraded {
+        v.push(format!(
+            "warning: the location of {} could not be resolved from its handle; containment was checked lexically only - --safety=strict refuses instead",
+            path.display()
+        ));
+    }
+    v
+}
+
+/// Every tree warning in print order: the identity ones (`warning_lines`), then `safety_warning_lines`.
+pub fn tree_warning_lines(out: &TreeOutcome) -> Vec<String> {
+    let mut v = warning_lines(&out.warnings);
+    v.extend(safety_warning_lines(out));
+    v
+}
+
 /// The single-file form. `degraded` is the weaker side; `target` is the destination
 /// after §4.1 mapping. `None` for `Strong`, which is not a degradation.
 pub fn file_warning(degraded: &FileIdentity, target: &Path) -> Option<String> {
@@ -296,6 +323,11 @@ pub fn run_warning_line(w: &RunWarning) -> String {
         RunWarning::OwnershipLostAfterCompletion(p) => format!(
             "warning: the lock {} was taken over after this copy completed; it was left in place",
             p.display()
+        ),
+        RunWarning::ProbeNotRemoved { path, error } => format!(
+            "warning: the no-replace probe {} could not be removed ({}); it goes when the operation's state is removed",
+            path.display(),
+            error.source
         ),
     }
 }
@@ -488,6 +520,34 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn both_safety_warnings_render_after_the_identity_ones() {
+        let mut out = TreeOutcome::default();
+        out.mount_unknown = Some(DegradedGroup { count: 2, example: PathBuf::from("sub") });
+        out.containment_degraded = Some(PathBuf::from("/p"));
+        let v = safety_warning_lines(&out);
+        assert_eq!(v.len(), 2);
+        for needle in ["mount root", "2 checks", "e.g. sub", "--safety=strict"] {
+            assert!(v[0].contains(needle), "{needle}: {}", v[0]);
+        }
+        for needle in ["/p", "lexically", "--safety=strict"] {
+            assert!(v[1].contains(needle), "{needle}: {}", v[1]);
+        }
+        assert!(safety_warning_lines(&TreeOutcome::default()).is_empty());
+
+        // The order is pinned where it is decided: identity lines first, then these two.
+        out.warnings.unavailable = Some(DegradedGroup { count: 1, example: PathBuf::new() });
+        let all = tree_warning_lines(&out);
+        assert_eq!(all.len(), 3);
+        assert!(
+            all[0].contains("identity")
+                && all[1].contains("mount root")
+                && all[2].contains("lexically"),
+            "{all:?}"
+        );
+    }
+
+    #[test]
     fn a_single_file_warning_names_the_target() {
         let weak = FileIdentity::Weak(ObjectId { volume: 0x10, index: 1 });
         let line = file_warning(&weak, Path::new("out.txt")).unwrap();
@@ -586,6 +646,7 @@ mod tests {
             RunWarning::StateKept(p()),
             RunWarning::PartialKept { path: p(), error: io(), kept: PathBuf::from("X/kept") },
             RunWarning::OwnershipLostAfterCompletion(p()),
+            RunWarning::ProbeNotRemoved { path: p(), error: io() },
         ];
         for w in &all {
             let line = run_warning_line(w);

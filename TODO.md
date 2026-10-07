@@ -244,24 +244,15 @@ Each was measured, and each is deliberately NOT fixed in that PR.
 Cut 4 is split (see `docs/superpowers/specs/2026-09-25-cut-4-after-handle-relative-writes.md`); both
 entries below are cut 4b's.
 
-- [ ] **Item 113's up-front no-replace probe is not built.** A directory operation against a destination
-      with no no-replace publication primitive must be refused with `NOREPLACE_PUBLISH_UNAVAILABLE`
-      (exit 3) before anything changes (spec item 113, probe at §241.5). The normative probe writes
-      `noreplace-probe` inside the operation workspace (§18.2), which no walker cut builds, so the owner
-      deferred it with the workspace. Until then the engine discovers the missing primitive at the first
-      publish and fails that action instead of refusing the operation. Such destinations are real: on a
-      WSL 9p mount `rename_no_replace` fails with `EINVAL` even for a free target name (measured during
-      the §149.7 review). **The probe must treat ANY failure of an attempted no-replace publish as
-      "unavailable", never match an error kind:** `FaultFs` models the missing primitive as
-      `ErrorKind::Unsupported` (`fault_fs.rs`, the `no_replace_support == Some(false)` arm), but the real
-      9p volume answers `InvalidInput`, so a probe written against the fake passes its tests and misses
-      the real case. DECIDED 2026-09-25 (owner, agy aligned): the probe stays deferred with the
-      workspace; cut 4b aborts the whole operation on the FIRST publish that fails with "primitive
-      unavailable" (Unsupported, or EINVAL/ENOSYS on unix after the temporary was created), exit 1.
-      Cut 4b delivers the interim: `copy_tree` aborts the whole operation with
-      NOREPLACE_PUBLISH_UNAVAILABLE at the FIRST publish that reports the primitive unavailable
-      (`primitive_unavailable`, `crates/flux-core/src/tree.rs`). The up-front probe still waits for the
-      workspace.
+- [x] **Item 113's up-front no-replace probe — DONE in cut 8a (`d236fd7`).** A directory operation
+      against a destination with no no-replace publication primitive is refused with
+      `NOREPLACE_PUBLISH_UNAVAILABLE` (exit 3) before anything changes (spec item 113, probe at §241.5).
+      The probe (`probe_no_replace`, `crates/flux-core/src/run/place.rs`) stages `noreplace-probe.tmp`
+      inside `<id>.creating`, the unpublished workspace, and publishes it onto `noreplace-probe` with
+      `rename_no_replace`; any failure that `primitive_unavailable` classifies refuses the run, never an error
+      kind match (the real WSL 9p answer is `InvalidInput`, the fake's is `Unsupported`). It sits inside
+      `<id>.creating` because `publish_workspace`'s own `rename_no_replace` would otherwise stop the run first.
+      The first-publish backstop in `copy_tree` stays.
 - [ ] **`FaultFs::move_object` strands a renamed directory's children.** It re-keys only the exact
       `from` and `to` paths; nothing walks the `from/` prefix, so every child keeps its old path. That is
       the stage-then-publish shape `copy_tree` will use, so an engine test that stages a tree and
@@ -275,8 +266,46 @@ entries below are cut 4b's.
       source directory under a destination name, and `copy_tree` merges into it (`open_dir` refuses only
       name-surrogates), so new files can land in the source - never overwriting or deleting (every file
       publishes no-replace), and with no loop. Cut 4b refuses the case where that directory is the source
-      ROOT (`copy_tree`'s Dir arm, capstone round 1, owner); an alias of a source SUBdirectory is still
-      merged into, and closing it needs the source identities this cut does not track.
+      ROOT (`copy_tree`'s Dir arm, capstone round 1, owner). Cut 8a refuses a pre-existing destination mount
+      root (Part M); the remaining case is known limit 1 under "Cut 8a known limits".
+
+## Cut 8a known limits
+
+Recorded by cut 8a (`docs/superpowers/specs/2026-10-03-cut-8a-safety-design.md`, "Known limits").
+
+- [ ] **DEST, or any of its ancestors, is a same-filesystem bind mount of a source subdirectory** (for example DEST
+      `/dst/b/out`, with `/dst/b` a bind mount of `/src/sub`). M checks only directories the copy merges into below
+      DEST, and A's canonical paths show the mount's own path, not its target. Refusing every DEST or ancestor that is
+      a mount root would refuse ordinary targets such as `/mnt/usb`. Detecting this case needs the source
+      identities that the memory bound forbids (spec line 997: no in-memory list proportional to the tree).
+- [ ] **Linux without `STATX_ATTR_MOUNT_ROOT`** (kernels before 5.8, or a filesystem that does not report it): a
+      same-filesystem bind mount is "cannot tell", so the default warns and merges. On kernels before 5.8 (the device-number
+      fallback) a btrfs subvolume or other non-mount with a different `st_dev` is reported as a mount root and its
+      subtree skipped (a false positive), not only "cannot tell".
+- [ ] **Source-side mounts** (section 42's walk rule and `--cross-filesystems`) stay with the dedicated mount-boundary
+      cut.
+
+## Cut 8a debt
+
+- [ ] **Part A's containment compare is case-sensitive.** `containment` compares the canonical paths with
+      `lexically_within`, which compares components exactly. On case-insensitive macOS (APFS) `F_GETPATH` may
+      report different casing for two handles to one directory reached through differently cased paths, so the
+      check could pass; the walk's own dynamic check (`enter_dir`) would still stop the run, after sibling files
+      were written into the source. Unverified (no Mac to measure on); reported by the cut 8a capstone, round 1.
+      A fix compares identities of the ancestors instead (needs a parent-handle ascent), or folds case on
+      case-insensitive volumes. (Single-file copies are not subject to Part A by design: it guards the walk.)
+From the final review of cut 8a; none is a reachable defect without a race or privilege.
+
+- [ ] **Part A's source handle is not compared with `src_identity`.** `containment` opens the source with
+      `fs.destination_root(src_root)` and never checks it against the identity `prepare_source` took, so a source
+      path swapped between the two would make Part A check another directory.
+- [ ] **`locate_tree`'s filesystem-root branch opens DEST twice.** It runs `containment` on `holder` but then opens
+      DEST again by path (`fs.destination_root(dst_root)`), so the checked handle and the used handle are two opens.
+- [ ] **POSIX `create_dir` is `mkdirat` then `open_dir(name)`** (`dir_unix.rs`). A mount placed over the new name in
+      that window is merged into unchecked, contradicting "a directory this run created cannot be a mount root".
+- [ ] **An early stop drops the containment warnings.** When the run stops before the copy (for example a probe
+      refusal), `run.copy` is `None`, so `containment_degraded` and the identity warnings set in `locate_tree` are
+      never printed (the tree job in `main.rs`).
 
 ## Scaffolding follow-ups
 
