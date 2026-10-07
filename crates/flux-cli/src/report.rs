@@ -422,6 +422,7 @@ mod tests {
             metadata_failures: Vec::new(),
             identity_degraded: Some(FileIdentity::Unavailable),
             published_identity: flux_fs::FileIdentity::Unavailable,
+            skipped: false,
         });
         let r = Report::file(&ok, true, 0);
         assert_eq!((r.files_total, r.files_copied, r.files_overwritten), (1, 1, 1));
@@ -445,6 +446,7 @@ mod tests {
             metadata_failures: Vec::new(),
             identity_degraded: None,
             published_identity: flux_fs::FileIdentity::Unavailable,
+            skipped: false,
         });
         let r = Report::file(&ok, false, 0);
         assert_eq!((r.files_copied, r.files_overwritten), (1, 0));
@@ -724,6 +726,7 @@ mod tests {
                 metadata_failures: Vec::new(),
                 identity_degraded: None,
                 published_identity: flux_fs::FileIdentity::Unavailable,
+                skipped: false,
             })
         };
         assert_eq!(Report::file_run(&run(Some(copied()), None), false, 1).errors, 0);

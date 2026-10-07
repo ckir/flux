@@ -867,6 +867,7 @@ mod tests {
             publish: Publish::Replace,
             safety: Safety::Default,
             operation_id: OperationId::new("op1"),
+            existing: flux_fs::ExistingPolicy::Overwrite,
         }
     }
 

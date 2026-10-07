@@ -355,6 +355,12 @@ fn a_third_positional_is_a_usage_error() {
     assert_eq!(out.status.code(), Some(2));
 }
 
+#[test]
+fn two_policy_flags_exit_2() {
+    let out = flux().args(["copy", "a", "b", "--overwrite", "--update"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+}
+
 #[cfg(unix)]
 #[test]
 fn a_fifo_in_a_folder_is_skipped_reported_and_exits_0() {

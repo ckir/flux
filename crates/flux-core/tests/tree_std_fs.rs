@@ -17,6 +17,7 @@ fn opts() -> CopyOptions {
         publish: Publish::Replace,
         safety: Safety::Default,
         operation_id: OperationId::new("t"),
+        existing: flux_fs::ExistingPolicy::Overwrite,
     }
 }
 

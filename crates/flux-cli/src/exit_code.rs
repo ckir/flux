@@ -135,6 +135,7 @@ mod tests {
                     .collect(),
                 identity_degraded: None,
                 published_identity: flux_fs::FileIdentity::Unavailable,
+                skipped: false,
             })
         };
         assert_eq!(for_file(&ok(0)), SUCCESS);
@@ -184,6 +185,7 @@ mod tests {
                 metadata_failures: Vec::new(),
                 identity_degraded: None,
                 published_identity: flux_fs::FileIdentity::Unavailable,
+                skipped: false,
             })
         };
         assert_eq!(for_file_run(&run(None, Some(refused(false)))), REFUSED);

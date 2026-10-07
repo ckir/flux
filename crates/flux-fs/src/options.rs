@@ -60,6 +60,17 @@ pub enum Safety {
     Strict,
 }
 
+/// What a copy does when a file already exists at the destination (§5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExistingPolicy {
+    /// Replace it (the default).
+    Overwrite,
+    /// Replace it only when the source is newer.
+    Update,
+    /// Leave it untouched.
+    SkipExisting,
+}
+
 #[derive(Debug, Clone)]
 pub struct CopyOptions {
     pub preserve_times: Preserve,
@@ -68,6 +79,7 @@ pub struct CopyOptions {
     pub publish: Publish,
     pub safety: Safety,
     pub operation_id: OperationId,
+    pub existing: ExistingPolicy,
 }
 
 #[derive(Debug)]
@@ -91,6 +103,8 @@ pub struct Outcome {
     /// The published target's identity, read from the temporary's own handle just before the publishing rename (a
     /// rename keeps the object; cut 7b). `Unavailable` where the platform cannot say.
     pub published_identity: crate::FileIdentity,
+    /// `true`: the existing destination was left untouched; `bytes_copied == 0`.
+    pub skipped: bool,
 }
 
 /// `<target>.flux-partial.<operation-id>`, in the target's directory (§18.1, normative).
@@ -120,6 +134,7 @@ mod tests {
             metadata_failures: Vec::new(),
             identity_degraded: None,
             published_identity: crate::FileIdentity::Unavailable,
+            skipped: false,
         };
         assert!(o.metadata_failures.is_empty());
         assert_eq!(o.bytes_copied, 10);

@@ -578,7 +578,13 @@ pub fn copy_file_guarded<F: DestinationRoot>(
 
     // A successful rename consumed the temporary; there is nothing left to remove.
 
-    Ok(Outcome { bytes_copied, metadata_failures, identity_degraded, published_identity })
+    Ok(Outcome {
+        bytes_copied,
+        metadata_failures,
+        identity_degraded,
+        published_identity,
+        skipped: false,
+    })
 }
 
 #[cfg(test)]
@@ -595,6 +601,7 @@ mod tests {
             publish: Publish::Replace,
             safety: flux_fs::Safety::Default,
             operation_id: OperationId::new("op1"),
+            existing: flux_fs::ExistingPolicy::Overwrite,
         }
     }
 
