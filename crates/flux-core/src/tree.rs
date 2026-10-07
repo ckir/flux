@@ -45,6 +45,15 @@ pub struct TreeOutcome {
     /// Part A: the canonical-path query was unsupported, so containment was checked lexically only. The path
     /// whose query failed, as the operator gave it (DEST, its parent, or the source root).
     pub containment_degraded: Option<PathBuf>,
+    /// Cut 8b: existing files replaced (a claimed name already present at the destination).
+    pub files_overwritten: u64,
+    /// Cut 8b: files skipped (not copied, not failures).
+    pub files_skipped: u64,
+    /// Cut 8b: the bytes of the files counted in `files_skipped`.
+    pub bytes_skipped: u64,
+    /// Cut 8b: directories where claims could not be keyed, so existing files there are reported as collisions.
+    /// The example is relative to the source root.
+    pub replace_degraded: Option<DegradedGroup>,
 }
 
 /// The operation stopped as a whole (cut 5, K1). `outcome` holds what was counted
@@ -106,6 +115,9 @@ pub enum TreeFailureCause {
     /// The file IS at the destination; some of its metadata could not be applied.
     /// Published with complaints, which exits 1 like the single-file case.
     PublishedWithComplaints(Vec<MetadataFailure>),
+    /// The file IS published and counted; its claim was not recorded (for a directory flush failure the
+    /// path is the directory).
+    ClaimNotRecorded(FsError),
 }
 
 /// One counter per `TreeFailureCause` variant. Fixed size: it costs the same on a
@@ -117,12 +129,18 @@ pub struct FailureTally {
     pub copy: u64,
     pub symlink: u64,
     pub published_with_complaints: u64,
+    pub claim_not_recorded: u64,
 }
 
 impl FailureTally {
     /// The only total. Derived, never stored beside the parts.
     pub fn total(&self) -> u64 {
-        self.walk + self.create_dir + self.copy + self.symlink + self.published_with_complaints
+        self.walk
+            + self.create_dir
+            + self.copy
+            + self.symlink
+            + self.published_with_complaints
+            + self.claim_not_recorded
     }
 
     pub fn is_empty(&self) -> bool {
@@ -142,6 +160,7 @@ impl FailureTally {
             // `TreeOutcome::special_files_skipped`; named here so the match stays exhaustive.
             TreeFailureCause::SpecialFileSkipped => {}
             TreeFailureCause::PublishedWithComplaints(_) => self.published_with_complaints += 1,
+            TreeFailureCause::ClaimNotRecorded(_) => self.claim_not_recorded += 1,
         }
     }
 }
@@ -828,6 +847,7 @@ mod tests {
         t.count(&TreeFailureCause::Symlink);
         t.count(&TreeFailureCause::PublishedWithComplaints(Vec::new()));
         t.count(&TreeFailureCause::SpecialFileSkipped);
+        t.count(&TreeFailureCause::ClaimNotRecorded(e()));
         assert_eq!(
             t,
             FailureTally {
@@ -835,10 +855,11 @@ mod tests {
                 create_dir: 1,
                 copy: 1,
                 symlink: 1,
-                published_with_complaints: 1
+                published_with_complaints: 1,
+                claim_not_recorded: 1
             }
         );
-        assert_eq!(t.total(), 5, "a skipped special file is not a failure");
+        assert_eq!(t.total(), 6, "a skipped special file is not a failure");
         assert!(!t.is_empty());
         assert!(FailureTally::default().is_empty());
     }
