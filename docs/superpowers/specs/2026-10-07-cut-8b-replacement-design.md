@@ -91,6 +91,37 @@ reported `DESTINATION_NAMESPACE_COLLISION` as today, and `TreeOutcome.replace_de
 the other degraded warnings) counts such directories. Under `--safety strict` that directory's subtree is skipped as
 `SAFETY_REJECTED`.
 
+## Interfaces
+
+```rust
+// flux-fs
+pub enum ExistingPolicy { Overwrite, Update, SkipExisting }          // field `existing: ExistingPolicy` in CopyOptions, default Overwrite
+pub trait ClaimStore {
+    fn insert_if_absent(&mut self, key: &ClaimKey, record: &ClaimRecord) -> Result<ClaimOutcome>;
+    fn get(&self, key: &ClaimKey) -> Result<Option<ClaimRecord>>;
+    fn upgrade_own_claim(&mut self, key: &ClaimKey, target: &FluxPathKey) -> Result<()>;
+}
+pub trait DirHandle {
+    type Claims: ClaimStore;
+    /// Create `name` exclusively through this handle (read and write, never following a link) and open a store on it.
+    /// `Durability::Normal` commits without a sync; `Durability::Strict` syncs every commit.
+    fn create_claim_store(&self, name: &OsStr, durability: Durability) -> Result<Self::Claims>;
+    // existing methods unchanged
+}
+pub struct Outcome { /* existing fields */ pub skipped: bool }
+
+// flux-core (copy.rs)
+pub type BeforeCreate<'g> = dyn Fn() -> std::result::Result<(), CopyError> + 'g;   // beside Guard and Heartbeat
+pub enum CopyStep { /* existing */ Claim }                            // the claim step
+// A claim collision is Err(CopyError::at(CopyStep::Claim, FsError::new(Code::DestinationNamespaceCollision, ..)));
+// a store error is Err(CopyError::at(CopyStep::Claim, <the store's FsError>)).
+```
+
+**Key layout (the real store).** One table of byte-string keys and byte-string values. Key: the parent `ObjectId` as
+`volume` (u64, big endian) then `index` (u128, big endian), then the entry name bytes (`OsStr::as_encoded_bytes`).
+Value: one status byte (`0` Existing, `1` Created) then the `FluxPathKey` bytes. A second table, `meta`, holds the schema
+version (`format` = 1). The fake stores the same keys and values in a `BTreeMap`.
+
 ## The store and its backend
 
 - The store is one file, `state.db`, in the operation workspace. A backend that needs auxiliary files is ineligible.
@@ -145,8 +176,9 @@ and macOS and the NEW name on Windows. So:
    when every one of the spellings is tied to a single target of this run: then they are one entry, any of them resolves
    it, and the target's claim on any of them makes the later target a collision. Any other several-match makes that target
    fail with `DESTINATION_ERROR`, as before.
-4. **After a replacement** the engine claims both the stored name used before the publish and the planned name (the same
-   key on Linux and macOS, two keys on Windows), and does not query the name afterwards.
+4. **After a replacement** the engine claims both the stored name used before the publish and the planned name (one key when
+   `P` equals `E`, two keys otherwise, on every platform: a differing planned spelling is claimed too, so a later target
+   that resolves to either spelling collides), and does not query the name afterwards.
 
 No case-folding or Unicode-normalization table is used, so no dependency is added; the cost on a case-sensitive
 destination is the one listing per pre-existing directory.
@@ -276,7 +308,7 @@ The run continues after any single target's claim failure.
 
 ## Out of scope
 
-The WAL and recovery; resume; `--atomic` (including its usage error with `--update` and `--skip-existing`); dry run; the
+The WAL and recovery; resume; live progress indicators (not built in the engine yet); `--atomic` (including its usage error with `--update` and `--skip-existing`); dry run; the
 cross-filesystem and mount-boundary cut; directory replacement; reflink or hardlink fast paths.
 
 ## Design record
