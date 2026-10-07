@@ -1,6 +1,6 @@
 # Cut 8b: replacement, claims and the policy flags
 
-Status: draft for review (2026-10-07). Branch `spec/cut-8b`, from `main` dc951e5 (cut 8a merged).
+Status: implemented on branch `spec/cut-8b` at e94337a (2026-10-08); not yet merged. From `main` dc951e5 (cut 8a merged).
 
 ## Why
 
@@ -385,6 +385,12 @@ cross-filesystem and mount-boundary cut; directory replacement; reflink or hardl
 - **Clarifications for section 241.5** (the spec is silent on both): the created-entry claim of a replacement is an
   upgrade of the target's own record, and a differing spelling after publication adds a second claim. Both are proposed
   back to the spec text.
+- **Implemented (2026-10-08).** Commits `096d725` to `e94337a` on `spec/cut-8b` (`git log --oneline 1bcf945..HEAD`), CI green on
+  Linux, macOS and Windows. Notable deviations from the text above: `state.db` is created right after the workspace is
+  published, not before, because Windows refuses to rename a directory that contains an open file (a crash in between
+  leaves a manifest-only workspace that `--restart` supersedes); and a directory this run created is planned as new
+  (`Frame::Live.fresh`), so every target in it is planned as new (no name resolution) and published with the no-replace primitive, which
+  also refuses a fold between two source names.
 
 ## Stand-downs
 

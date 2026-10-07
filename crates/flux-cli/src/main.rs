@@ -26,10 +26,10 @@ enum Commands {
     /// Copy a file, or a folder's contents, to DEST (§4.1).
     ///
     /// What happens to a file that already exists at DEST is chosen by one of
-    /// --overwrite (the default: replace it), --update (replace it only when the source
-    /// is newer) or --skip-existing (leave it untouched); at most one may be given. A
-    /// skipped file is not a failure. A symlink given as SOURCE is not followed. Several
-    /// sources are not supported yet.
+    /// --overwrite (the default: replace it), --update (replace it when the source is
+    /// newer or the size differs) or --skip-existing (leave it untouched); at most one
+    /// may be given. A skipped file is not a failure. A symlink given as SOURCE is not
+    /// followed. Several sources are not supported yet.
     Copy(CopyArgs),
 }
 
@@ -68,7 +68,9 @@ struct CopyArgs {
     /// Replace a file that already exists at DEST (the default; §5.1).
     #[arg(long)]
     overwrite: bool,
-    /// Replace an existing file at DEST only when the source is newer (§5.1).
+    /// Replace an existing file at DEST when the source is newer or the size differs;
+    /// with either modification time unavailable only the sizes are compared, and equal
+    /// sizes keep the file (§5.1).
     #[arg(long)]
     update: bool,
     /// Leave an existing file at DEST untouched (§5.1).
