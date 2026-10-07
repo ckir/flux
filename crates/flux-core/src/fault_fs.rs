@@ -2385,7 +2385,11 @@ mod tests {
         let d = fs.destination_root(Path::new("/d")).unwrap();
         let _first = d.create_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap();
         assert!(fs.exists("/d/state.db"), "an empty file entry is visible at the path");
-        assert!(fs.called("create_claim_store(/d/state.db)"));
+        assert!(
+            fs.calls().iter().any(|c| c.replace('\\', "/") == "create_claim_store(/d/state.db)"),
+            "the call log names the path: {:?}",
+            fs.calls()
+        );
         let err = match d.create_claim_store(OsStr::new("state.db"), Durability::Normal) {
             Err(e) => e,
             Ok(_) => panic!("a taken name must be refused"),
