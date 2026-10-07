@@ -58,6 +58,11 @@ struct Inner {
     /// assumes it. Setting it `false` is how the engine cut exercises a destination
     /// whose filesystem cannot make the promise, without owning such a filesystem.
     no_replace_support: Option<bool>,
+    /// Name lookup folds ASCII case (`set_case_insensitive`). Default false.
+    case_insensitive: bool,
+    /// With `case_insensitive`: a `rename_replace` over an entry stored under another spelling takes the NEW spelling
+    /// (`set_replace_renames`). Default false: the old spelling is kept.
+    replace_renames: bool,
     perms: HashMap<PathBuf, Option<Perms>>,
     /// consumed by the next `write` on a handle from `create_new`
     write_fault: Option<std::io::Error>,
@@ -252,6 +257,39 @@ fn mint_identity(g: &mut Inner, path: &Path) {
     g.next_object += 1;
     let id = flux_fs::ObjectId { volume: 1, index: g.next_object };
     g.identities.insert(path.to_path_buf(), flux_fs::FileIdentity::Strong(id));
+}
+
+/// The path with each component replaced by the STORED spelling of an existing sibling that matches it ASCII
+/// case-insensitively (an exact match wins). Identity when the mode is off, and for a component with no such sibling
+/// (the leaf of a create, for instance, keeps the spelling it was asked for).
+fn stored(g: &Inner, path: &Path) -> PathBuf {
+    if !g.case_insensitive {
+        return path.to_path_buf();
+    }
+    let mut cur = PathBuf::new();
+    for comp in path.components() {
+        let std::path::Component::Normal(name) = comp else {
+            cur.push(comp.as_os_str());
+            continue;
+        };
+        let mut found: Option<&OsStr> = None;
+        for key in g.files.keys().chain(g.directories.iter()) {
+            if key.parent() != Some(cur.as_path()) {
+                continue;
+            }
+            let Some(n) = key.file_name() else { continue };
+            if n == name {
+                found = Some(n);
+                break;
+            }
+            if found.is_none() && n.as_encoded_bytes().eq_ignore_ascii_case(name.as_encoded_bytes())
+            {
+                found = Some(n);
+            }
+        }
+        cur.push(found.unwrap_or(name));
+    }
+    cur
 }
 
 /// Forget a removed file: its bytes and everything keyed by its path, so a later object at the path starts fresh.
@@ -709,6 +747,33 @@ impl FaultFs {
         self.inner.lock().unwrap().no_replace_support = Some(supported);
     }
 
+    /// Name lookup folds ASCII case (the fake's stand-in for NTFS/APFS/casefold): every path argument of `metadata`,
+    /// `create_new`, `create_dir`, `rename_*` (both paths), `remove_file` and `read_dir` has each component replaced by the
+    /// STORED spelling of an existing sibling that matches it case-insensitively. Default false. The `DirHandle`
+    /// operations delegate to those methods, so they follow the mode too. The call log shows the NORMALIZED path.
+    pub fn set_case_insensitive(&self, on: bool) {
+        self.inner.lock().unwrap().case_insensitive = on;
+    }
+
+    /// With `set_case_insensitive(true)`: a `rename_replace` over an entry stored under another spelling makes the entry take
+    /// the NEW spelling (Windows). Default false: the OLD spelling is kept (Linux and macOS, measured).
+    pub fn set_replace_renames(&self, on: bool) {
+        self.inner.lock().unwrap().replace_renames = on;
+    }
+
+    /// `path` with each component in its stored spelling (identity unless the mode is on).
+    fn norm(&self, path: &Path) -> PathBuf {
+        stored(&self.inner.lock().unwrap(), path)
+    }
+
+    /// Like `norm`, but the LEAF keeps the spelling asked for: the name a replacing rename gives the entry on Windows.
+    fn norm_keep_leaf(&self, path: &Path) -> PathBuf {
+        match (path.parent(), path.file_name()) {
+            (Some(parent), Some(leaf)) => self.norm(parent).join(leaf),
+            _ => path.to_path_buf(),
+        }
+    }
+
     /// Make `metadata` report `path` as something other than a regular file -- a
     /// directory, a symlink, a device. Without this the fake reported `is_file: true`
     /// for everything and SPECIAL_FILE_UNSUPPORTED had no test that produced it.
@@ -841,7 +906,7 @@ impl FileSystem for FaultFs {
     }
 
     fn create_new(&self, path: &Path) -> Result<Self::Writer> {
-        let p = path.to_path_buf();
+        let p = self.norm(path);
         self.record(format!("create_new({})", p.display()), "create_new")?;
         let mut g = self.inner.lock().unwrap();
         // A DIRECTORY occupies the name too, and this used to check only `files`.
@@ -876,7 +941,7 @@ impl FileSystem for FaultFs {
     }
 
     fn metadata(&self, path: &Path) -> Result<Metadata> {
-        let p = path.to_path_buf();
+        let p = self.norm(path);
         self.record(format!("metadata({})", p.display()), "metadata")?;
         let mut g = self.inner.lock().unwrap();
         if g.pending.contains(&p) {
@@ -946,7 +1011,8 @@ impl FileSystem for FaultFs {
     }
 
     fn rename_replace(&self, from: &Path, to: &Path) -> Result<()> {
-        let (f, t) = (from.to_path_buf(), to.to_path_buf());
+        let (f, t) = (self.norm(from), self.norm(to));
+        let requested = self.norm_keep_leaf(to);
         self.record(
             format!("rename_replace({} -> {})", f.display(), t.display()),
             "rename_replace",
@@ -958,11 +1024,15 @@ impl FileSystem for FaultFs {
             "the fake moves a directory only through rename_no_replace (cut 7a Part 3a, decision 10)"
         );
         move_object(&mut g, &f, &t);
+        if g.replace_renames && requested != t {
+            // Windows: the replaced entry takes the NEW spelling.
+            move_object(&mut g, &t, &requested);
+        }
         Ok(())
     }
 
     fn rename_no_replace(&self, from: &Path, to: &Path) -> Result<()> {
-        let (f, t) = (from.to_path_buf(), to.to_path_buf());
+        let (f, t) = (self.norm(from), self.norm(to));
         self.record(
             format!("rename_no_replace({} -> {})", f.display(), t.display()),
             "rename_no_replace",
@@ -993,7 +1063,7 @@ impl FileSystem for FaultFs {
     }
 
     fn remove_file(&self, path: &Path) -> Result<()> {
-        let p = path.to_path_buf();
+        let p = self.norm(path);
         self.record(format!("remove_file({})", p.display()), "remove_file")?;
         // NotFound when it is not there, because `std::fs::remove_file` does that and
         // `discard` branches on it. A fake that returned Ok here would make that
@@ -1020,7 +1090,7 @@ impl FileSystem for FaultFs {
     }
 
     fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>> {
-        let p = path.to_path_buf();
+        let p = self.norm(path);
         self.record(format!("read_dir({})", p.display()), "read_dir")?;
         let g = self.inner.lock().unwrap();
         if !g.directories.contains(&p) {
@@ -1066,7 +1136,7 @@ impl FileSystem for FaultFs {
             "FaultFs models a rooted filesystem and has no working directory, so a \
              relative path cannot be created in it: {path:?}"
         );
-        let p = path.to_path_buf();
+        let p = self.norm(path);
         self.record(format!("create_dir({})", p.display()), "create_dir")?;
         let mut g = self.inner.lock().unwrap();
         if g.directories.contains(&p) || g.files.contains_key(&p) {
@@ -1234,7 +1304,7 @@ impl DirHandle for FakeDirHandle {
                 return Ok(Self { id: child_id, inner: std::sync::Arc::clone(&self.inner) });
             }
         }
-        let child_path = self.my_path().join(name);
+        let child_path = self.fs().norm(&self.my_path().join(name));
         // A MISSING COMPONENT IS A DESTINATION ERROR, which is what both real arms
         // answer and what their `a_missing_component_is_a_destination_error` tests
         // pin. The fake reported whatever `metadata` reported -- IoError/NotFound --
@@ -1291,7 +1361,7 @@ impl DirHandle for FakeDirHandle {
 
     fn remove_file(&self, name: &OsStr) -> Result<()> {
         check_component(name)?;
-        let child_path = self.my_path().join(name);
+        let child_path = self.fs().norm(&self.my_path().join(name));
         // REFUSE A DIRECTORY, with the kind both real arms use. MEASURED before
         // this: the fake answered NotFound here -- it refused, but only because it
         // found no FILE at the name, never because the object was a directory.
@@ -2442,5 +2512,149 @@ mod tests {
         assert_eq!(fs.claim(parent, "y"), None);
         s.upgrade_own_claim(&ClaimKey::new(parent, OsStr::new("x")), &rec.target).unwrap();
         assert_eq!(fs.claim(parent, "x").unwrap().status, ClaimStatus::Created);
+    }
+
+    // ---- case-insensitive mode (cut 8b, Task 6) ----
+
+    fn ci_fs() -> FaultFs {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.write_file("/d/file.txt", b"old");
+        fs
+    }
+
+    fn names(fs: &FaultFs, dir: &str) -> Vec<String> {
+        let mut v: Vec<String> = fs
+            .read_dir(Path::new(dir))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name.to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn a_lookup_by_another_case_finds_the_entry_with_the_same_identity() {
+        let fs = ci_fs();
+        // Sensitive default: another spelling is another (absent) name.
+        let e = fs.metadata(Path::new("/d/FILE.TXT")).unwrap_err();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::NotFound);
+        fs.set_case_insensitive(true);
+        let a = fs.metadata(Path::new("/d/file.txt")).unwrap();
+        let b = fs.metadata(Path::new("/d/FILE.TXT")).unwrap();
+        assert_eq!(a.identity, b.identity);
+        assert_eq!(a.len, b.len);
+        // A directory component folds too, and the log shows the NORMALIZED path.
+        let c = fs.metadata(Path::new("/D/File.Txt")).unwrap();
+        assert_eq!(a.identity, c.identity);
+        assert!(fs.called("metadata(/d/file.txt)"));
+        assert!(!fs.called("metadata(/D/File.Txt)"));
+    }
+
+    #[test]
+    fn create_new_over_another_case_is_already_exists() {
+        let fs = ci_fs();
+        fs.set_case_insensitive(true);
+        let e = fs.create_new(Path::new("/d/FILE.TXT")).err().unwrap();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists);
+        let e = fs.create_dir(Path::new("/d/FILE.TXT")).unwrap_err();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(names(&fs, "/d"), vec!["file.txt"]);
+    }
+
+    #[test]
+    fn rename_no_replace_onto_another_case_is_already_exists() {
+        let fs = ci_fs();
+        fs.write_file("/d/src", b"new");
+        fs.set_case_insensitive(true);
+        let e = fs.rename_no_replace(Path::new("/d/src"), Path::new("/d/FILE.TXT")).unwrap_err();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs.read_file("/d/file.txt"), Some(b"old".to_vec()));
+    }
+
+    #[test]
+    fn rename_replace_over_another_case_keeps_the_old_spelling_by_default() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.write_file("/d/FILE.TXT", b"old");
+        fs.write_file("/d/src", b"new");
+        fs.set_case_insensitive(true);
+        fs.rename_replace(Path::new("/d/src"), Path::new("/d/file.txt")).unwrap();
+        assert_eq!(names(&fs, "/d"), vec!["FILE.TXT"]);
+        assert_eq!(fs.read_file("/d/FILE.TXT"), Some(b"new".to_vec()));
+    }
+
+    #[test]
+    fn rename_replace_renames_when_asked() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.write_file("/d/FILE.TXT", b"old");
+        fs.write_file("/d/src", b"new");
+        fs.set_case_insensitive(true);
+        fs.set_replace_renames(true);
+        fs.rename_replace(Path::new("/d/src"), Path::new("/d/file.txt")).unwrap();
+        assert_eq!(names(&fs, "/d"), vec!["file.txt"]);
+        assert_eq!(fs.read_file("/d/file.txt"), Some(b"new".to_vec()));
+        assert!(!fs.exists("/d/FILE.TXT"));
+    }
+
+    #[test]
+    fn read_dir_returns_stored_spellings() {
+        let fs = ci_fs();
+        fs.create_dir(Path::new("/d/Sub")).unwrap();
+        fs.set_case_insensitive(true);
+        // The directory is named in another case; the entries come back as stored.
+        assert_eq!(names(&fs, "/D"), vec!["Sub", "file.txt"]);
+        assert!(fs.called("read_dir(/d)"));
+    }
+
+    #[test]
+    fn the_mode_is_off_by_default() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.write_file("/d/a", b"1");
+        fs.write_file("/d/A", b"2");
+        assert_eq!(names(&fs, "/d"), vec!["A", "a"]);
+        assert_eq!(fs.read_file("/d/a"), Some(b"1".to_vec()));
+        assert_eq!(fs.read_file("/d/A"), Some(b"2".to_vec()));
+    }
+
+    #[test]
+    fn handle_metadata_follows_the_case_insensitive_mode() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        let fs = ci_fs();
+        fs.set_case_insensitive(true);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let a = d.metadata(OsStr::new("file.txt")).unwrap();
+        let b = d.metadata(OsStr::new("FILE.TXT")).unwrap();
+        assert_eq!(a.identity, b.identity);
+    }
+
+    #[test]
+    fn handle_create_new_follows_the_case_insensitive_mode() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        let fs = ci_fs();
+        fs.set_case_insensitive(true);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let e = d.create_new(OsStr::new("FILE.TXT")).err().unwrap();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn handle_rename_replace_follows_the_case_insensitive_mode() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        for (renames, want) in [(false, "FILE.TXT"), (true, "file.txt")] {
+            let fs = FaultFs::new();
+            fs.create_dir(Path::new("/d")).unwrap();
+            fs.write_file("/d/FILE.TXT", b"old");
+            fs.write_file("/d/src", b"new");
+            fs.set_case_insensitive(true);
+            fs.set_replace_renames(renames);
+            let d = fs.destination_root(Path::new("/d")).unwrap();
+            d.rename_replace(OsStr::new("src"), &d, OsStr::new("file.txt")).unwrap();
+            assert_eq!(names(&fs, "/d"), vec![want]);
+            assert_eq!(fs.read_file(format!("/d/{want}")), Some(b"new".to_vec()));
+        }
     }
 }
