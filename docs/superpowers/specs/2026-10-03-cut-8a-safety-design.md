@@ -20,7 +20,7 @@ directory can add files there but never overwrite one. Once 8b lets it replace, 
 |---|---|---|
 | P | The engine learns at the first publish that the destination has no no-replace primitive, instead of refusing before anything changes (spec item 113). | `TODO.md`, "Item 113's up-front no-replace probe is not built" |
 | M | A mount inside the destination can show a source subdirectory under a destination name, and the copy merges into it, so new files land in the source. | `TODO.md`, section 42 entry, "The destination half too" |
-| A | A destination reached through a symlink in a parent component into a source subdirectory passes the pre-flight, so files are written into the source before the walk's own check stops the run. | none yet (found in this cut's design consult) |
+| A | The CLI resolves a link in a parent component of DEST before the engine runs (`flux-cli/src/resolve.rs`), so the lexical floor refuses it there. An engine caller that does not canonicalize, or a link swapped between the CLI's path-based resolution and the engine's open of DEST's parent, passes the pre-flight, and files are written into the source before the walk's own check stops the run. | none yet (found in this cut's design consult) |
 
 ## Decisions
 
@@ -46,21 +46,24 @@ Each design fork went to agy first; the owner chose. The reasoning lives under "
 
 The normative text is spec section 241.5 (`FLUX_FULL_UPDATED_SPEC_V16.md`, around lines 10874-10887).
 
-**When it runs.** Inside `open_operation` (`crates/flux-core/src/run/session.rs`), once this run's workspace exists
-and its lock record is written, and BEFORE `--restart`'s supersede (`supersede`, `run/restart.rs`). Before that point
-the workspace the probe must write into does not exist, and the lock is not this run's. After it, the supersede marks
-every prior operation ABANDONED and deletes their partials, so a refusal there would not leave the destination
-unchanged. It runs on every run, `--restart` included: a restart may meet a different filesystem under the same
-name. A refusal therefore leaves every prior operation exactly as it was, still resumable.
+**When it runs.** Inside `<id>.creating`, the unpublished workspace directory, which `TreePlace::create`
+(`crates/flux-core/src/run/place.rs`) makes with `begin_workspace` (`state.rs`): after that directory is created and
+before its manifest is written and it is published (`publish_workspace`). The lock is this run's (just obtained), the
+record is not yet written, so the probe is guarded as the manifest write is. `--restart`'s supersede (`supersede`,
+`run/restart.rs`) comes later still, so a refusal leaves every prior operation exactly as it was, still resumable.
+The probe runs on every run, `--restart` included: a restart may meet a different filesystem under the same name.
+
+The probe cannot run after the workspace is published: `publish_workspace` itself publishes `<id>.creating` onto
+`<id>` with `rename_no_replace`, so on a destination without the primitive the run would stop there with a plain
+failure, never reaching a probe placed after it (see the Design record, "Part P's placement").
 
 `open_operation` serves the single-file run too, which spec section 241.5 exempts ("Single-file operations are
-unaffected"). So the probe is a new step of the `Place` trait (`run/place.rs`): the tree's place probes its
-workspace, and the single-file place does nothing. `open_operation` retries when the lock it took over moves
-(`Overwritten::Restart`); the probe runs in the attempt whose record write succeeded, once per run.
+unaffected"). So the probe is part of the `Place` trait's `create` (`run/place.rs`): the tree's place probes inside
+`<id>.creating`, and the single-file place does nothing. The function is `probe_no_replace`.
 
 **What it does.** The run's section 99 guard runs before its first write, as before every mutation the run makes
 under its lock.
-1. It stages a temporary in the operation's workspace.
+1. It stages a temporary (`noreplace-probe.tmp`) in `<id>.creating`.
 2. It publishes the temporary onto the fixed name `noreplace-probe` with `DirHandle::rename_no_replace`, the same
    primitive every tree file publishes with.
 3. It removes `noreplace-probe`, or, if the publish failed, the staged temporary: the probe removes whatever it
@@ -71,10 +74,10 @@ under its lock.
 | Outcome | Result |
 |---|---|
 | The publish succeeds and the removal succeeds | The run continues. |
-| The publish fails as "primitive unavailable" (the same classification `primitive_unavailable` in `tree.rs` applies at `CopyStep::Publish`) | The run is refused with `NOREPLACE_PUBLISH_UNAVAILABLE`. It takes the existing "refused with nothing changed" rollback (`rollback`, `run/mod.rs`): the workspace, the lock record and lock, the control directories it emptied, and DEST if this run created it, are removed again. Exit 3 (section 55: created and removed again does not count as a change). The contract: the stop is a refusal carrying the code `NOREPLACE_PUBLISH_UNAVAILABLE`, with `changed: false` when everything was removed again (exit 3). When the probe's own file could not be removed, `not_removed` names it and `changed` is set to `true`, which exits 1: the pairing `give_back` in `run/session.rs` already uses for a lock it could not remove (`for_stop` reads only `changed`). Today `RunError::Refused`'s `Refusal` carries only a lock code; whether that code widens or a sibling variant is added is the plan's choice. |
-| The publish fails for any other reason | The run fails with that error, through the run's existing failure path. |
-| What the probe wrote (`noreplace-probe`, or the temporary) cannot be removed, and the run CONTINUES | A warning naming it. At the run's end the workspace cannot be removed either; that is the existing `RunWarning::NotRemoved`, not a failure (after COMPLETED nothing fails the run). |
-| What the probe wrote cannot be removed, and the run is REFUSED | The rollback runs as above, but its workspace removal is expected to fail on that file (`retire_workspace` removes only the manifest files, so its final `remove_dir` meets a non-empty directory). That failure does NOT become the run's stop: the stop stays the `NOREPLACE_PUBLISH_UNAVAILABLE` refusal, with `changed: true` and `not_removed` naming the probe's file, so it exits 1 (spec section 55) and the report names both the code and the file. The lock record stops naming the workspace first (as `remove_own` already does) and the lock is still released. The workspace is left under its retired `<id>.removing` name, which the section 21.1 scan passes over and leftover cleanup removes later; the control directories are left, since they are not empty. |
+| The publish fails as "primitive unavailable" (the same classification `primitive_unavailable` in `tree.rs` applies at `CopyStep::Publish`) | The run is refused with `NOREPLACE_PUBLISH_UNAVAILABLE` (`refuse_no_replace`). `<id>.creating` is removed again (`unwind_creating`), then the control directories it emptied, and DEST if this run created it; the lock is released. Exit 3 (section 55: created and removed again does not count as a change). The stop is a refusal carrying the code, with `changed: false` when everything was removed again. When a file the probe wrote could not be removed, `not_removed` names it and `changed` is `true`, which exits 1: the pairing `give_back` in `run/session.rs` already uses for a lock it could not remove (`for_stop` reads only `changed`). |
+| The publish fails for any other reason | The run fails with that error (`RunError::Failed`, step `Probe`), through the run's existing failure path; `<id>.creating` and the control directories are removed best-effort. |
+| A probe file stays after a SUCCESSFUL publish (`noreplace-probe` could not be removed) | `RunWarning::ProbeNotRemoved` naming the file at its published path, and the run continues. The workspace's retirement then fails to remove the non-empty directory, reported as `RunWarning::NotRemoved` (after COMPLETED nothing fails the run). On a successful run the retire leaves `<id>.removing` with the file inside; cleaning up `<id>.removing` is a later cut. The CLI's warning text says the file "goes when the operation's state is removed"; that wording is not accurate for this case and is noted here rather than changed in this cut. |
+| The publish was REFUSED and a probe file stays (the staged temporary could not be removed) | The stop stays `NOREPLACE_PUBLISH_UNAVAILABLE` with `changed: true` and `not_removed` naming the temporary under `<id>.creating`, so it exits 1 (spec section 55) and the report names both the code and the file. `<id>.creating` stays (the section 21.1 scan passes it over, `prior.rs:47-49`); the control directories and DEST stay since they are not empty; the lock is released. |
 
 **`--dry-run`.** Flux has no `--dry-run` today, so the spec's dry-run clause has nothing to attach to. It applies
 when that flag lands, and the probe then writes nothing and reports "unprobed".
@@ -123,6 +126,8 @@ destination mount that presents the source root itself still aborts the operatio
 subtree (today that check runs only on a live frame, `tree.rs` walk loop, so the order has to be moved, not kept).
 
 ## Part A: a destination inside the source, through a link in a parent component
+
+The CLI resolves a link in a parent component before the engine runs; Part A closes the engine API (a caller that does not canonicalize) and the check-then-use window between that resolution and the engine's open of DEST's parent.
 
 **The rule.** Before anything is created, `locate_tree` (`crates/flux-core/src/run/place.rs`) obtains the canonical
 paths of two directories:
@@ -282,6 +287,25 @@ Panel findings rejected, recorded so they are not raised again:
   agy showed that the driver's third reason was weak (the existing checks do not stop the sibling writes). It then
   proposed handle-based canonicalisation, which removes the permission failures the driver had worried about. The
   common option, adopted by the owner, is in Part A.
+- **Part P's placement (plan, 2026-10-07).** Measured on the fake (`set_no_replace_support(false)` and a tree run):
+  with the probe placed as this spec first approved it, after the workspace exists, the run stops earlier, at
+  `create_workspace`'s own `rename_no_replace` (`state.rs`), with a plain `RunError::Failed` (step `State`, exit 1)
+  and `<id>.creating` left behind. On the motivating filesystem (WSL 9p, `EINVAL` for a free name) the probe as
+  approved was therefore unreachable. agy weighed four options:
+  - literal: keep the placement and the `noreplace-probe` file as written (unreachable, as measured);
+  - the workspace publish is the probe: no `noreplace-probe` file, `publish_workspace`'s own refusal is the probe;
+  - both: the publish as the probe, plus the file;
+  - a tolerant `rename_replace` for the workspace publish.
+
+  agy recommended folding the probe into the workspace publish (no `noreplace-probe` file). It also named a fifth
+  placement, the probe inside `<id>.creating`. The owner declined the recommendation and adopted that placement,
+  keeping section 241.5's letter (a `noreplace-probe` file) while making it reachable. Built as `probe_no_replace`,
+  called from `TreePlace::create`, with `refuse_no_replace` and `unwind_creating` for the refusal. A consequence the
+  table records: a probe file that stays after a successful run leaves `<id>.removing` non-empty, cleaned by a later
+  cut.
+- **Part A's reachable value (plan, 2026-10-07).** The CLI canonicalizes both roots before the engine sees them, so
+  the parent-link case is refused lexically at the CLI. Part A still closes the engine API and the check-then-use
+  window; its tests drive the engine directly.
 - **Rejected test ideas.** Merging into `/sys` or `/dev/shm`, and a Windows junction for M: none exercises the new
   code (Windows junctions are already refused).
 

@@ -165,9 +165,10 @@ impl DirHandle for StdDir {
     /// Failing loudly is therefore correct here. What is MISSING is upstream: §241.5
     /// wants a destination with no no-replace primitive refused UP FRONT with
     /// NoReplacePublishUnavailable, before anything changes, rather than discovered
-    /// at the first publish. That probe belongs to the engine, which does not exist
-    /// yet, and is tracked; this measurement is the evidence that such destinations
-    /// are real and reachable rather than hypothetical.
+    /// at the first publish. That probe now lives in the engine
+    /// (`probe_no_replace`, `flux-core/src/run/place.rs`); this measurement remains
+    /// the evidence that such destinations are real and reachable rather than
+    /// hypothetical.
     fn rename_no_replace(&self, from: &OsStr, other: &Self, to: &OsStr) -> Result<()> {
         check_component(from)?;
         check_component(to)?;
