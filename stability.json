@@ -43,64 +43,64 @@
    "stable": false
   },
   "macos/large/cp": {
-   "calibrated": "2026-10-05T10:47:07Z",
-   "cv": 0.1755,
+   "calibrated": "2026-10-07T18:34:19Z",
+   "cv": 0.2176,
    "image": "20260907.0351.1",
    "source": "calibration",
    "stable": false
   },
   "macos/large/rsync": {
-   "calibrated": "2026-10-05T10:47:07Z",
-   "cv": 0.1317,
+   "calibrated": "2026-10-07T18:34:19Z",
+   "cv": 0.157,
    "image": "20260907.0351.1",
    "source": "calibration",
    "stable": false
   },
   "macos/mixed/cp": {
-   "calibrated": "2026-10-05T10:47:07Z",
-   "cv": 0.1335,
+   "calibrated": "2026-10-07T18:34:19Z",
+   "cv": 0.0843,
    "image": "20260907.0351.1",
    "source": "calibration",
    "stable": false
   },
   "macos/mixed/rsync": {
-   "calibrated": "2026-10-05T10:47:07Z",
-   "cv": 0.0931,
+   "calibrated": "2026-10-07T18:34:19Z",
+   "cv": 0.0739,
    "image": "20260907.0351.1",
    "source": "calibration",
    "stable": false
   },
   "macos/small/cp": {
-   "calibrated": "2026-10-05T10:47:07Z",
-   "cv": 0.083,
+   "calibrated": "2026-10-07T18:34:19Z",
+   "cv": 0.1379,
    "image": "20260907.0351.1",
    "source": "calibration",
    "stable": false
   },
   "macos/small/rsync": {
-   "calibrated": "2026-10-05T10:47:07Z",
-   "cv": 0.1068,
+   "calibrated": "2026-10-07T18:34:19Z",
+   "cv": 0.1092,
    "image": "20260907.0351.1",
    "source": "calibration",
    "stable": false
   },
   "windows/large/robocopy": {
-   "calibrated": "2026-10-05T10:47:07Z",
-   "cv": 0.0328,
+   "calibrated": "2026-10-07T18:34:19Z",
+   "cv": 0.0406,
    "image": "20260925.250.1",
    "source": "calibration",
    "stable": false
   },
   "windows/mixed/robocopy": {
-   "calibrated": "2026-10-05T10:47:07Z",
-   "cv": 0.0474,
+   "calibrated": "2026-10-07T18:34:19Z",
+   "cv": 0.0384,
    "image": "20260925.250.1",
    "source": "calibration",
    "stable": false
   },
   "windows/small/robocopy": {
-   "calibrated": "2026-10-05T10:47:07Z",
-   "cv": 0.0324,
+   "calibrated": "2026-10-07T18:34:19Z",
+   "cv": 0.0587,
    "image": "20260925.250.1",
    "source": "calibration",
    "stable": false
