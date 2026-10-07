@@ -287,6 +287,13 @@ Recorded by cut 8a (`docs/superpowers/specs/2026-10-03-cut-8a-safety-design.md`,
 
 ## Cut 8a debt
 
+- [ ] **Part A's containment compare is case-sensitive.** `containment` compares the canonical paths with
+      `lexically_within`, which compares components exactly. On case-insensitive macOS (APFS) `F_GETPATH` may
+      report different casing for two handles to one directory reached through differently cased paths, so the
+      check could pass; the walk's own dynamic check (`enter_dir`) would still stop the run, after sibling files
+      were written into the source. Unverified (no Mac to measure on); reported by the cut 8a capstone, round 1.
+      A fix compares identities of the ancestors instead (needs a parent-handle ascent), or folds case on
+      case-insensitive volumes. (Single-file copies are not subject to Part A by design: it guards the walk.)
 From the final review of cut 8a; none is a reachable defect without a race or privilege.
 
 - [ ] **Part A's source handle is not compared with `src_identity`.** `containment` opens the source with
