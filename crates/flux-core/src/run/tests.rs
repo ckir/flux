@@ -2062,19 +2062,26 @@ fn assert_one_replaced_one_collides(
     got: &[TreeFailure],
     out: &TreeOutcome,
     at: &str,
+    stored: &str,
 ) {
     assert_eq!(got.len(), 1, "{got:?}");
     assert_eq!(code_of(&got[0]), Code::DestinationNamespaceCollision);
     assert_eq!(got[0].path, PathBuf::from("file.txt"));
     assert_eq!((out.files_overwritten, out.files_copied), (1, 1));
     assert_eq!(fs.read_file(at).as_deref(), Some(&b"upper"[..]), "the first source's content");
+    // Both spellings are claimed for the first source, whatever the platform left on disk: the stored name `stored`
+    // (upgraded to Created) and the planned name `File.txt` (inserted Created).
+    let dest = strong(fs, "/p/dest");
+    let created = |t: &str| Some(ClaimRecord { target: key(t), status: ClaimStatus::Created });
+    assert_eq!(fs.claim(dest, stored), created("File.txt"), "the stored spelling");
+    assert_eq!(fs.claim(dest, "File.txt"), created("File.txt"), "the planned spelling");
 }
 
 #[test]
 fn two_source_names_folding_onto_one_existing_entry_collide() {
     let fs = folding("FILE.TXT");
     let (r, got) = run_tree(&fs, &cfg());
-    assert_one_replaced_one_collides(&fs, &got, ok(&r), "/p/dest/FILE.TXT");
+    assert_one_replaced_one_collides(&fs, &got, ok(&r), "/p/dest/FILE.TXT", "FILE.TXT");
     // The entry keeps its old spelling on this platform (Linux and macOS).
     assert!(!fs.exists("/p/dest/File.txt"));
 }
@@ -2085,14 +2092,14 @@ fn two_source_names_folding_onto_one_existing_entry_collide_when_a_replace_renam
     fs.set_replace_renames(true);
     let (r, got) = run_tree(&fs, &cfg());
     // Windows: the entry takes the planned spelling of the first source.
-    assert_one_replaced_one_collides(&fs, &got, ok(&r), "/p/dest/File.txt");
+    assert_one_replaced_one_collides(&fs, &got, ok(&r), "/p/dest/File.txt", "FILE.TXT");
 }
 
 #[test]
 fn two_source_names_folding_onto_one_entry_stored_lowercase_collide() {
     let fs = folding("file.txt");
     let (r, got) = run_tree(&fs, &cfg());
-    assert_one_replaced_one_collides(&fs, &got, ok(&r), "/p/dest/file.txt");
+    assert_one_replaced_one_collides(&fs, &got, ok(&r), "/p/dest/file.txt", "file.txt");
 }
 
 #[test]
@@ -2114,6 +2121,8 @@ fn a_directory_in_the_way_fails_only_that_target() {
 #[test]
 fn a_symlink_at_the_destination_is_replaced_as_a_link() {
     let fs = dest_fake();
+    // The fake's links point nowhere, so the link's "target" is a file beside it that must stay as it is.
+    fs.write_file("/p/target", b"T");
     fs.add_symlink("/p/dest/a");
     let (r, got) = run_tree(&fs, &cfg());
     let out = ok(&r);
@@ -2121,6 +2130,8 @@ fn a_symlink_at_the_destination_is_replaced_as_a_link() {
     assert_eq!((out.files_overwritten, out.files_copied), (1, 2));
     assert_eq!(fs.metadata(Path::new("/p/dest/a")).unwrap().file_type, FileType::File);
     assert_eq!(fs.read_file("/p/dest/a").as_deref(), Some(&b"A"[..]));
+    assert!(fs.exists("/p/target"), "the link's target still exists");
+    assert_eq!(fs.read_file("/p/target").as_deref(), Some(&b"T"[..]), "and is untouched");
 }
 
 #[test]
@@ -2249,7 +2260,8 @@ fn a_target_that_finds_its_own_claim_proceeds() {
     };
     let mut out = TreeOutcome::default();
     let mut got = Vec::new();
-    let (_root, walked) = copy_tree_at(&cx, source.events, root, &mut out, &mut |f| got.push(f));
+    let (_root, walked) =
+        copy_tree_at(&cx, source.events, root, false, &mut out, &mut |f| got.push(f));
     walked.unwrap();
     assert!(got.is_empty(), "{got:?}");
     assert_eq!((out.files_overwritten, out.files_copied), (1, 2));
@@ -2257,5 +2269,78 @@ fn a_target_that_finds_its_own_claim_proceeds() {
     assert_eq!(
         fs.claim(dest, "a").map(|r| (r.target, r.status)),
         Some((key("a"), ClaimStatus::Created))
+    );
+}
+
+/// Case-folding sources `File.txt` / `file.txt` under `dir` of `/src`, and a DEST the run creates.
+fn fold_into_created(dir: &str) -> FaultFs {
+    let fs = FaultFs::new();
+    for d in ["/src", "/p"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    if !dir.is_empty() {
+        fs.create_dir(Path::new(&format!("/src/{dir}"))).unwrap();
+    }
+    let at = |n: &str| if dir.is_empty() { format!("/src/{n}") } else { format!("/src/{dir}/{n}") };
+    fs.write_file(at("File.txt"), b"upper");
+    fs.write_file(at("file.txt"), b"lower");
+    fs.set_case_insensitive(true);
+    // The first target's post-publish claim fails, so only the no-replace rename can refuse the second.
+    fs.fail_nth("claim_insert", 1, Code::IoError, std::io::ErrorKind::Other);
+    fs
+}
+
+fn assert_fold_refused_by_no_replace(
+    got: &[TreeFailure],
+    out: &TreeOutcome,
+    first: &str,
+    second: &str,
+) {
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert!(matches!(&got[0].cause, TreeFailureCause::ClaimNotRecorded(_)), "{got:?}");
+    assert_eq!(got[0].path, PathBuf::from(first));
+    assert_eq!(code_of(&got[1]), Code::DestinationNamespaceCollision);
+    assert_eq!(got[1].path, PathBuf::from(second));
+    assert_eq!(
+        (out.files_copied, out.files_overwritten),
+        (1, 0),
+        "the first is published and counted"
+    );
+    assert_eq!(out.failures.claim_not_recorded, 1);
+}
+
+#[test]
+fn a_fold_in_a_created_directory_is_refused_by_the_no_replace_rename_even_when_the_first_claim_failed()
+ {
+    let fs = fold_into_created("sub");
+    let (r, got) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert_fold_refused_by_no_replace(&got, out, "sub/File.txt", "sub/file.txt");
+    assert_eq!(
+        fs.read_file("/p/dest/sub/File.txt").as_deref(),
+        Some(&b"upper"[..]),
+        "the FIRST source's content"
+    );
+    assert!(
+        !calls(&fs).iter().any(|x| x.starts_with("rename_replace(/p/dest/sub/")),
+        "no replacing rename"
+    );
+}
+
+#[test]
+fn a_fold_in_a_destination_the_run_created_is_refused_by_the_no_replace_rename_even_when_the_first_claim_failed()
+ {
+    let fs = fold_into_created("");
+    let (r, got) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert_fold_refused_by_no_replace(&got, out, "File.txt", "file.txt");
+    assert_eq!(
+        fs.read_file("/p/dest/File.txt").as_deref(),
+        Some(&b"upper"[..]),
+        "the FIRST source's content"
+    );
+    assert!(
+        !calls(&fs).iter().any(|x| x.starts_with("rename_replace(/p/dest/File")),
+        "no replacing rename"
     );
 }

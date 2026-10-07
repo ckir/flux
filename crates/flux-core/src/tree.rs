@@ -238,6 +238,11 @@ enum Frame<D> {
         /// made with; `None` for a copy without claims and for a directory whose identity is not `Strong`
         /// (`replace_degraded`), where every target is planned as new and an existing file is a collision.
         claim_parent: Option<ObjectId>,
+        /// Cut 8b: this run CREATED the directory, so it is empty of anything but this run's own entries and every
+        /// target in it is planned as new (no name resolution), published with the no-replace primitive. A fold between
+        /// two source names is then refused by that rename (`AlreadyExists`, a collision), whether or not the first
+        /// target's claim was recorded.
+        fresh: bool,
     },
     /// Its directory failed; everything below it is skipped, and was reported once.
     Skipped,
@@ -374,7 +379,7 @@ fn run_tree<F: DestinationRoot>(
         beat: &no_heartbeat,
         claims: None,
     };
-    copy_tree_at(&cx, source.events, root, out, on_report).1
+    copy_tree_at(&cx, source.events, root, false, out, on_report).1
 }
 
 /// Step 6 of `copy_tree`: the walk, writing through `root` and only below it, and `root` handed back with the result
@@ -389,6 +394,7 @@ pub(crate) fn copy_tree_at<F: DestinationRoot>(
     cx: &Shared<'_, F>,
     events: Walk<'_, F>,
     root: F::Dir,
+    root_created: bool,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> (F::Dir, std::result::Result<(), CopyError>) {
@@ -414,9 +420,8 @@ pub(crate) fn copy_tree_at<F: DestinationRoot>(
             }
         },
     };
-    // The root may have been made by this run or may pre-exist; its listing is read either way (a made one holds
-    // only the run's own control directory), so a pre-existing entry is found whichever it was.
-    let names = if claim_parent.is_some() {
+    // A pre-existing root is listed once; a root this run made is `fresh` and needs no listing.
+    let names = if claim_parent.is_some() && !root_created {
         match NameIndex::for_existing(&root) {
             Ok(names) => names,
             Err(e) => return (root, Err(CopyError::at(CopyStep::Resolve, e))),
@@ -424,7 +429,13 @@ pub(crate) fn copy_tree_at<F: DestinationRoot>(
     } else {
         NameIndex::for_new_dir()
     };
-    let mut stack = vec![Frame::Live { dir: root, created: HashSet::new(), names, claim_parent }];
+    let mut stack = vec![Frame::Live {
+        dir: root,
+        created: HashSet::new(),
+        names,
+        claim_parent,
+        fresh: root_created,
+    }];
     let walked = walk_into(cx, events, root_identity, &mut stack, out, on_report);
     // The walk emits no `Dir` for the root, so no `DirEnd` pops it, and a frame is skipped only when pushed.
     match stack.into_iter().next() {
@@ -485,12 +496,13 @@ fn walk_into<F: DestinationRoot>(
             }
             WalkEvent::File { path } => {
                 out.files_total += 1;
-                if let Some(Frame::Live { dir, names, claim_parent, .. }) = stack.last_mut() {
+                if let Some(Frame::Live { dir, names, claim_parent, fresh, .. }) = stack.last_mut()
+                {
                     if reserved_path(&path) {
                         let conflict = CopyError::at(CopyStep::Gate, reserved_conflict());
                         report(out, on_report, path, TreeFailureCause::Copy(conflict));
                     } else {
-                        copy_one(cx, dir, names, *claim_parent, path, out, on_report)?;
+                        copy_one(cx, dir, names, *claim_parent, *fresh, path, out, on_report)?;
                     }
                 }
             }
@@ -694,7 +706,13 @@ fn enter_dir<D: DirHandle>(
     } else {
         NameIndex::for_new_dir()
     };
-    Ok(Frame::Live { dir: child, created: HashSet::new(), names, claim_parent })
+    Ok(Frame::Live {
+        dir: child,
+        created: HashSet::new(),
+        names,
+        claim_parent,
+        fresh: !pre_existing,
+    })
 }
 
 /// What the tree decided for one file target.
@@ -719,11 +737,14 @@ fn target_failure(step: CopyStep, code: Code, why: &'static str) -> TreeFailureC
 ///
 /// The tree decides what an existing destination means and tells the copy path `ExistingPolicy::Overwrite`, so the
 /// copy path never skips on its own and never produces `Outcome.skipped` here; the tree counts skips itself.
+// One input per piece of frame state the protocol reads.
+#[allow(clippy::too_many_arguments)]
 fn copy_one<F: DestinationRoot>(
     cx: &Shared<'_, F>,
     parent: &F::Dir,
     names: &mut NameIndex,
     claim_parent: Option<ObjectId>,
+    fresh: bool,
     path: PathBuf,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
@@ -765,7 +786,9 @@ fn copy_one<F: DestinationRoot>(
     };
 
     // 1-2. Resolve the planned name to the entry it denotes.
-    let plan = match names.resolve(parent, name) {
+    // A directory this run created plans every target as new (plan decision 6).
+    let resolved = if fresh { Ok(Ok(Resolved::Absent)) } else { names.resolve(parent, name) };
+    let plan = match resolved {
         Err(e) => {
             report(
                 out,
@@ -2059,7 +2082,7 @@ mod tests {
             claims: None,
         };
         let mut out = TreeOutcome::default();
-        let (_root, r) = copy_tree_at(&cx, source.events, root, &mut out, &mut |_| {});
+        let (_root, r) = copy_tree_at(&cx, source.events, root, false, &mut out, &mut |_| {});
         (r, out)
     }
 
@@ -2133,7 +2156,8 @@ mod tests {
         };
         let mut out = TreeOutcome::default();
         let mut reported = 0;
-        let (_root, r) = copy_tree_at(&cx, source.events, root, &mut out, &mut |_| reported += 1);
+        let (_root, r) =
+            copy_tree_at(&cx, source.events, root, false, &mut out, &mut |_| reported += 1);
         assert_eq!(r.unwrap_err().step, CopyStep::Heartbeat);
         assert_eq!(calls.get(), 5, "no heartbeat after the failed one");
         assert_eq!((reported, out.failures.total()), (0, 0), "an abort, never a per-file failure");
@@ -2168,7 +2192,8 @@ mod tests {
         };
         let mut out = TreeOutcome::default();
         let mut reported = 0;
-        let (_root, r) = copy_tree_at(&cx, source.events, root, &mut out, &mut |_| reported += 1);
+        let (_root, r) =
+            copy_tree_at(&cx, source.events, root, false, &mut out, &mut |_| reported += 1);
         assert_eq!(r.unwrap_err().step, CopyStep::Heartbeat);
         assert_eq!((reported, out.files_copied), (0, 0), "the walk stops at the failed file");
         assert!(!fs.exists("/dst/a") && !fs.exists("/dst/sub"));
@@ -2192,7 +2217,7 @@ mod tests {
             claims: None,
         };
         let mut out = TreeOutcome::default();
-        let (back, r) = copy_tree_at(&cx, source.events, root, &mut out, &mut |_| {});
+        let (back, r) = copy_tree_at(&cx, source.events, root, false, &mut out, &mut |_| {});
         assert!(r.is_ok());
         assert_eq!(back.identity().unwrap(), identity_of(&fs, "/dst"), "the same directory");
     }

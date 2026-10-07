@@ -255,7 +255,8 @@ pub fn tree<F: DestinationRoot>(
             }
             on_report(f);
         };
-        let (root, walked) = copy_tree_at(&cx, source.events, root, &mut out, &mut report);
+        let (root, walked) =
+            copy_tree_at(&cx, source.events, root, place.created_dest, &mut out, &mut report);
         place.dest = Some(root);
         walked
     };
