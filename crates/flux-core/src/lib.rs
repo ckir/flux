@@ -3,6 +3,8 @@
 pub mod copy;
 pub mod ids;
 pub mod lock;
+#[allow(dead_code)] // consumed by Task 10 of the cut 8b plan (the replacement walk); remove then
+mod names;
 pub mod prior;
 pub mod run;
 pub mod state;
