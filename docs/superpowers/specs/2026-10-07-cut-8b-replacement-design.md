@@ -84,7 +84,9 @@ ClaimOutcome{ Inserted, Present(ClaimRecord) }
 "Same target" is a bytewise comparison of `FluxPathKey` (section 103), never an identity (hardlinks share identity,
 section 241.5). A target that finds its own claim proceeds, so a resumed target never collides with itself.
 
-A directory whose identity is not `Strong` cannot key claims. Its targets use no-replace publication, an existing file is
+A directory whose identity is not `Strong` cannot key claims, so NO claim is written for any target in it, new or
+replacing: every step of the per-file protocol below that inserts, upgrades or checks a claim is skipped there, and the
+frame's name tracking is skipped too. Its targets use no-replace publication, an existing file is
 reported `DESTINATION_NAMESPACE_COLLISION` as today, and `TreeOutcome.replace_degraded` (a `DegradedGroup`, rendered like
 the other degraded warnings) counts such directories. Under `--safety strict` that directory's subtree is skipped as
 `SAFETY_REJECTED`.
@@ -131,9 +133,18 @@ and macOS and the NEW name on Windows. So:
      built lazily at the first such hit (one `metadata` call per listing entry, once per directory). A unique match gives
      the stored name. No match, or several (hardlink aliases in one directory), makes THAT target fail
      (`DESTINATION_ERROR`, "cannot determine the stored name"); the run continues.
-3. **Keep the frame current.** After a target publishes, the frame adds the published entry's spelling(s) to the listing
-   set and the published object's identity (`Outcome.published_identity`) to the table, so a later target that resolves
-   to the entry this operation just wrote finds it and collides.
+3. **Keep the frame current.** After a target publishes, the frame records the published entry's spelling(s) in the
+   listing set and ties them to the target that wrote them, and updates the identity table:
+   - the replaced object's identity (the old `M.identity`) is removed from the table (that object is gone);
+   - the published object's identity (`Outcome.published_identity`) is added, mapped to every spelling this target
+     claimed: the stored name `E` and, when different, the planned name `P` (on Windows only `P` exists on disk
+     afterwards, but the frame cannot know that without a query, so it keeps both).
+   When `published_identity` is `Unavailable` the table gains nothing, and a later target that needs that entry fails
+   safely (below).
+   **Resolution of several matches.** An identity that maps to several spellings is ambiguous (hardlink aliases) EXCEPT
+   when every one of the spellings is tied to a single target of this run: then they are one entry, any of them resolves
+   it, and the target's claim on any of them makes the later target a collision. Any other several-match makes that target
+   fail with `DESTINATION_ERROR`, as before.
 4. **After a replacement** the engine claims both the stored name used before the publish and the planned name (the same
    key on Linux and macOS, two keys on Windows), and does not query the name afterwards.
 
@@ -146,7 +157,8 @@ For a file target with planned name P in destination directory D (a `Frame::Live
 
 1. **Resolve P** (above). Result: absent, or an existing entry with stored name `E` and metadata `M`.
 2. **Absent:** plan as new. Publish with `rename_no_replace`; `AlreadyExists` is `DESTINATION_NAMESPACE_COLLISION`
-   exactly as in cut 4b. After the rename, insert a `Created` claim for `(D.identity, P)` and update the frame (Name resolution, step 3).
+   exactly as in cut 4b. After the rename, when D has a `Strong` identity, insert a `Created` claim for `(D.identity, P)` and update the frame
+   (Name resolution, step 3); in a replace-degraded directory (see "The claim model") neither happens.
    A failure of that claim write is reported as a claim failure (below): the file IS published and is counted.
 3. **Existing, a directory:** fail the target (`DESTINATION_ERROR`), whatever the policy: nothing can be placed there.
 4. **Existing, a file or symlink:** apply the policy.
@@ -234,6 +246,9 @@ The run continues after any single target's claim failure.
   that fails the upgrade.
 - **Real-system tests:** replacement on the default filesystem of every CI system; on Linux CI a loopback vfat image
   (`sudo mount`, as the cut 8a bind-mount test does; a missing facility fails on CI and skips locally).
+- **Windows junction at the destination name:** a real-system test replaces a file over a junction at the same name and
+  records the outcome (failure of that target, or replacement of the junction itself); it must never write through
+  the junction's target.
 - **Crash test:** the CLI's existing stall hook (`FLUX_TEST_STALL_AT`) kills a run after k files, the test reopens the
   store and counts claims.
 - **Mutant proof:** every new test must go red under a one-line mutant of the code it guards, measured by the driver.
@@ -246,7 +261,17 @@ The run continues after any single target's claim failure.
 3. WSL 9p and network filesystems: whether the backend's file locking works there is unmeasured.
 4. A directory with millions of entries holds its listing in memory while the walk is inside it (the source side
    already does).
-5. On a case-insensitive destination, a hardlink alias of an existing entry in the same directory makes the
+5. A replacement reads the destination's metadata twice (the policy decision, then the section 129 gate): one extra stat
+   per replaced file, accepted. If an outside process removes the destination entry between those two reads the gate sees
+   `NotFound`, the claim is still written for the vanished entry and the file is published as new but counted as an
+   overwrite: the same bounded window the gate already documents (`copy.rs`, `identity_gate`). It never overwrites
+   anything the engine did not plan to replace.
+6. The claim insertion (inside the copy path, `before_create`) and the claim upgrade and frame update (in `tree.rs`, after
+   the copy path returns) are in two modules; this is accepted to keep the claim after the gate and guard.
+7. On case-insensitive Windows an existing directory reparse point (a junction) at the destination name is reported by
+   `metadata` as a link; whether `rename_replace` of a file over it fails or replaces the junction itself is unmeasured.
+   The real-system tests measure it (below); the required outcome is a per-target result, never a traversal of the junction.
+8. On a case-insensitive destination, a hardlink alias of an existing entry in the same directory makes the
    alias's target fail rather than replace (no unique identity match).
 
 ## Out of scope
