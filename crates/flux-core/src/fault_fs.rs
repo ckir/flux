@@ -118,6 +118,8 @@ struct Inner {
     /// Every claim store `create_claim_store` made, in creation order. Each holds the encoded claims (`ClaimKey::encode`
     /// -> `ClaimRecord::encode`), the encodings of the real store.
     claim_stores: Vec<ClaimMap>,
+    /// Fake claim stores created and not yet dropped (`claim_stores_open`).
+    claim_stores_open: usize,
 }
 
 type ClaimMap = std::sync::Arc<Mutex<std::collections::BTreeMap<Vec<u8>, Vec<u8>>>>;
@@ -127,6 +129,14 @@ type ClaimMap = std::sync::Arc<Mutex<std::collections::BTreeMap<Vec<u8>, Vec<u8>
 pub struct FakeClaimStore {
     map: ClaimMap,
     inner: std::sync::Arc<Mutex<Inner>>,
+}
+
+impl Drop for FakeClaimStore {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.claim_stores_open -= 1;
+        }
+    }
 }
 
 impl FakeClaimStore {
@@ -636,6 +646,11 @@ impl FaultFs {
     /// reach the cleanup that `discard` performs.
     pub fn fail_always(&self, name: &str, code: Code) {
         self.inner.lock().unwrap().always.insert(name.to_string(), code);
+    }
+
+    /// Fake claim stores created from this fake and not yet dropped.
+    pub fn claim_stores_open(&self) -> usize {
+        self.inner.lock().unwrap().claim_stores_open
     }
 
     /// Claims across every store created from this fake.
@@ -1440,6 +1455,7 @@ impl DirHandle for FakeDirHandle {
         mint_identity(&mut g, &child_path);
         let map = ClaimMap::default();
         g.claim_stores.push(std::sync::Arc::clone(&map));
+        g.claim_stores_open += 1;
         Ok(FakeClaimStore { map, inner: std::sync::Arc::clone(&self.inner) })
     }
 

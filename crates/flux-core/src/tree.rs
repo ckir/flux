@@ -299,6 +299,9 @@ pub(crate) struct Shared<'c, F: DestinationRoot> {
     pub(crate) guard: &'c Guard<'c>,
     /// §101's heartbeat (cut 7b), beside the guard; `&no_heartbeat` for a copy that holds no lock.
     pub(crate) beat: &'c Heartbeat<'c>,
+    /// The run's claim store, open for the walk (cut 8b); `None` for a copy that holds no lock.
+    #[allow(dead_code)] // consumed by Task 10 of the cut 8b plan; remove then
+    pub(crate) claims: Option<&'c std::cell::RefCell<<F::Dir as DirHandle>::Claims>>,
 }
 
 /// `copy_tree`'s body. Every `?` here is an abort; `copy_tree` pairs it with `out`,
@@ -358,6 +361,7 @@ fn run_tree<F: DestinationRoot>(
         opts,
         guard: &unguarded,
         beat: &no_heartbeat,
+        claims: None,
     };
     copy_tree_at(&cx, source.events, root, out, on_report).1
 }
@@ -409,6 +413,7 @@ fn walk_into<F: DestinationRoot>(
         opts: &opts,
         guard: cx.guard,
         beat: cx.beat,
+        claims: cx.claims,
     };
     for item in events {
         let live = matches!(stack.last(), Some(Frame::Live { .. }));
@@ -1746,6 +1751,7 @@ mod tests {
             opts: &o,
             guard,
             beat: &no_heartbeat,
+            claims: None,
         };
         let mut out = TreeOutcome::default();
         let (_root, r) = copy_tree_at(&cx, source.events, root, &mut out, &mut |_| {});
@@ -1818,6 +1824,7 @@ mod tests {
             opts: &o,
             guard: &unguarded,
             beat: &beat,
+            claims: None,
         };
         let mut out = TreeOutcome::default();
         let mut reported = 0;
@@ -1852,6 +1859,7 @@ mod tests {
             opts: &o,
             guard: &unguarded,
             beat: &beat,
+            claims: None,
         };
         let mut out = TreeOutcome::default();
         let mut reported = 0;
@@ -1876,6 +1884,7 @@ mod tests {
             opts: &o,
             guard: &unguarded,
             beat: &no_heartbeat,
+            claims: None,
         };
         let mut out = TreeOutcome::default();
         let (back, r) = copy_tree_at(&cx, source.events, root, &mut out, &mut |_| {});

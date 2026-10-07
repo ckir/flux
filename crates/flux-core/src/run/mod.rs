@@ -212,6 +212,8 @@ pub fn tree<F: DestinationRoot>(
         dest_shown: dst_root.to_path_buf(),
         created_dest: false,
         operations: None,
+        claims: None,
+        durability: opts.durability,
     };
     // Steps 3-5 (and `--restart`): the lock, then this operation's state and the record naming it.
     let locked = match open_operation(&site, capability, &mut place, cfg, &mut run.warnings) {
@@ -232,6 +234,9 @@ pub fn tree<F: DestinationRoot>(
         };
         let beat =
             || locked.pulse.beat(&locked.held).map_err(|e| beat_error(&locked.lock_shown, e));
+        // The store lives only for the walk: the cell is dropped at the end of this block, before `finish`
+        // removes the file.
+        let claims = place.claims.take().map(std::cell::RefCell::new);
         let cx = Shared {
             fs,
             src_root,
@@ -239,6 +244,7 @@ pub fn tree<F: DestinationRoot>(
             opts: &opts,
             guard: &guard,
             beat: &beat,
+            claims: claims.as_ref(),
         };
         let root = place.dest.take().expect("step 5 made DEST");
         let mut report = |f: TreeFailure| {

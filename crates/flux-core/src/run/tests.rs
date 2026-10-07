@@ -1774,3 +1774,74 @@ fn an_unconfirmed_source_canonical_path_alone_degrades_the_check() {
         "the anchor is confirmed and outside the source; only the source side is unconfirmed"
     );
 }
+
+#[test]
+fn a_tree_run_creates_state_db_in_the_workspace_and_removes_it_with_it() {
+    let fs = fake();
+    let (r, _) = run_tree(&fs, &cfg());
+    ok(&r);
+    let c = calls(&fs);
+    let probe = at(
+        &c,
+        &format!(
+            "rename_no_replace({} -> {})",
+            creating("noreplace-probe.tmp"),
+            creating("noreplace-probe")
+        ),
+    );
+    let store = at(&c, &format!("create_claim_store({})", creating("state.db")));
+    let published = at(
+        &c,
+        &format!(
+            "rename_no_replace(/p/dest/.flux/operations/{ID}.creating -> /p/dest/.flux/operations/{ID})"
+        ),
+    );
+    assert!(probe < store && store < published, "{c:?}");
+    assert!(!fs.exists("/p/dest/.flux"), "the workspace and its state.db are gone");
+    assert!(!fs.exists(format!("/p/dest/.flux/operations/{ID}.removing")));
+}
+
+#[test]
+fn a_refused_probe_removes_nothing_it_did_not_make() {
+    let fs = fake();
+    fs.set_no_replace_support(false);
+    let (r, _) = run_tree(&fs, &cfg());
+    assert!(matches!(r.stop, Some(RunError::Refused { .. })), "{:?}", r.stop);
+    let c = calls(&fs);
+    assert!(!c.iter().any(|x| x.starts_with("create_claim_store(")), "{c:?}");
+    assert!(!c.iter().any(|x| x.contains("state.db")), "{c:?}");
+}
+
+#[test]
+fn a_failed_state_db_creation_unwinds_and_names_the_file() {
+    let fs = fake();
+    fs.fail("create_claim_store", Code::PermissionDenied);
+    let (r, _) = run_tree(&fs, &cfg());
+    let (step, path) = failed_at(&r.stop);
+    assert_eq!(step, RunStep::State);
+    assert!(path.ends_with("state.db"), "{path}");
+    assert!(!fs.exists(format!("/p/dest/.flux/operations/{ID}.creating")));
+    assert!(!fs.exists("/p/dest"), "control dirs and the DEST this run made are gone");
+    assert!(!fs.exists(LOCK), "the lock is released");
+    assert_eq!(fs.claim_stores_open(), 0);
+}
+
+#[test]
+fn a_kept_workspace_keeps_state_db() {
+    let fs = fake();
+    fs.on_nth("create_new", 4, |fs| fs.fail_write(std::io::Error::other("injected write")));
+    fs.fail_nth("remove_file", 5, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let (r, _) = run_tree(&fs, &cfg());
+    assert!(r.warnings.iter().any(|w| matches!(w, RunWarning::StateKept(_))), "{:?}", r.warnings);
+    assert!(fs.exists(format!("/p/dest/.flux/operations/{ID}/state.db")));
+}
+
+#[test]
+fn the_store_is_dropped_before_the_workspace_is_removed() {
+    let fs = fake();
+    let (r, _) = run_tree(&fs, &cfg());
+    ok(&r);
+    assert_eq!(fs.claim_stores_open(), 0);
+    let c = calls(&fs);
+    assert!(c.iter().any(|x| x.starts_with("create_claim_store(")), "a store was made");
+}
