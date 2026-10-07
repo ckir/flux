@@ -11,7 +11,7 @@ use crate::state::{FLUX_DIR, RESERVED_DIRS};
 use crate::walk::{Walk, WalkEvent, walk};
 use flux_fs::{
     Code, CopyOptions, DestinationRoot, DirHandle, FileIdentity, FileSystem, FsError,
-    MetadataFailure, ObjectId, Publish, Safety,
+    MetadataFailure, MountRoot, ObjectId, Publish, Safety,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::io::ErrorKind;
@@ -39,6 +39,9 @@ pub struct TreeOutcome {
     pub files_degraded: u64,
     /// Special files skipped (§233.1). Not failures.
     pub special_files_skipped: u64,
+    /// Part M: pre-existing destination directories whose mount-root query could not tell, merged into under
+    /// `Safety::Default`. The example is relative to the source root, as `warnings` are.
+    pub mount_unknown: Option<DegradedGroup>,
 }
 
 /// The operation stopped as a whole (cut 5, K1). `outcome` holds what was counted
@@ -156,6 +159,14 @@ pub struct DegradedGroup {
     /// The first path that degraded, relative to the source root. The EMPTY path is the
     /// source root itself (the §129 pre-flight).
     pub example: PathBuf,
+}
+
+impl DegradedGroup {
+    /// Count one more degraded check into `slot`, keeping the first example.
+    pub(crate) fn note(slot: &mut Option<DegradedGroup>, example: &Path) {
+        slot.get_or_insert_with(|| DegradedGroup { count: 0, example: example.to_path_buf() })
+            .count += 1;
+    }
 }
 
 impl WeakIdentityWarnings {
@@ -400,21 +411,17 @@ fn walk_into<F: DestinationRoot>(
                     // §101, then §99, before the directory's creation.
                     (cx.beat)().map_err(|e| CopyError::at(CopyStep::Heartbeat, e))?;
                     (cx.guard)().map_err(|e| CopyError::at(CopyStep::Create, e))?;
-                    enter_dir(stack, &path, identity, root_identity, cx.opts, out, on_report)?
+                    enter_dir(
+                        stack,
+                        &path,
+                        identity,
+                        root_identity,
+                        cx.src_identity,
+                        cx.opts,
+                        out,
+                        on_report,
+                    )?
                 };
-                // A destination directory about to be entered must not BE the source root
-                // (owner, cut 4b capstone round 1): a bind mount inside the destination can
-                // present the source under a destination name, and `open_dir` refuses only
-                // name-surrogates. Aliases of source SUBdirectories stay the §42 mount cut's.
-                if let Frame::Live { dir, .. } = &frame
-                    && let (Ok(FileIdentity::Strong(a)), FileIdentity::Strong(b)) =
-                        (dir.identity(), cx.src_identity)
-                    && a == b
-                {
-                    return Err(refuse(
-                        "a destination directory is the source root itself, by identity",
-                    ));
-                }
                 stack.push(frame);
             }
             WalkEvent::File { path } => {
@@ -473,11 +480,14 @@ fn reserved_conflict() -> FsError {
 }
 
 /// A `Dir` event under a live frame: the dynamic §129 check, then decision 8.
+// The signature is the plan's: eight inputs, each a distinct piece of walk state.
+#[allow(clippy::too_many_arguments)]
 fn enter_dir<D: DirHandle>(
     stack: &mut [Frame<D>],
     path: &Path,
     identity: FileIdentity,
     root_identity: FileIdentity,
+    src_identity: FileIdentity,
     opts: &CopyOptions,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
@@ -505,33 +515,91 @@ fn enter_dir<D: DirHandle>(
     };
     let name = path.file_name().expect("a walk path ends in a name");
     // Decision 8: create first; open on AlreadyExists. Neither call traverses a link.
-    let failure = match parent.create_dir(name) {
+    let (child, child_identity, pre_existing) = match parent.create_dir(name) {
         Ok(child) => {
             out.directories_created += 1;
-            if let Ok(FileIdentity::Strong(id)) = child.identity() {
+            let child_identity = child.identity();
+            if let Ok(FileIdentity::Strong(id)) = child_identity {
                 created.insert(id);
             }
-            return Ok(Frame::Live { dir: child, created: HashSet::new() });
+            (child, child_identity, false)
         }
         Err(e) if e.source.kind() == ErrorKind::AlreadyExists => match parent.open_dir(name) {
-            Ok(child) => match child.identity() {
-                // Created by THIS operation moments ago, under another source name.
-                Ok(FileIdentity::Strong(id)) if created.contains(&id) => FsError::new(
-                    Code::DestinationNamespaceCollision,
-                    std::io::Error::other(
-                        "this operation already created that directory under another source name",
-                    ),
-                ),
-                // Pre-existing: merge into it.
-                _ => return Ok(Frame::Live { dir: child, created: HashSet::new() }),
-            },
+            Ok(child) => {
+                let child_identity = child.identity();
+                match child_identity {
+                    // Created by THIS operation moments ago, under another source name.
+                    Ok(FileIdentity::Strong(id)) if created.contains(&id) => {
+                        let failure = FsError::new(
+                            Code::DestinationNamespaceCollision,
+                            std::io::Error::other(
+                                "this operation already created that directory under another source name",
+                            ),
+                        );
+                        report(
+                            out,
+                            on_report,
+                            path.to_path_buf(),
+                            TreeFailureCause::CreateDir(failure),
+                        );
+                        return Ok(Frame::Skipped);
+                    }
+                    // Pre-existing: merge into it.
+                    _ => (child, child_identity, true),
+                }
+            }
             // SAFETY_REJECTED (a link) or DESTINATION_ERROR (a file, or it vanished).
-            Err(e) => e,
+            Err(e) => {
+                report(out, on_report, path.to_path_buf(), TreeFailureCause::CreateDir(e));
+                return Ok(Frame::Skipped);
+            }
         },
-        Err(e) => e,
+        Err(e) => {
+            report(out, on_report, path.to_path_buf(), TreeFailureCause::CreateDir(e));
+            return Ok(Frame::Skipped);
+        }
     };
-    report(out, on_report, path.to_path_buf(), TreeFailureCause::CreateDir(failure));
-    Ok(Frame::Skipped)
+
+    // A destination directory about to be entered must not BE the source root (owner, cut 4b capstone round 1):
+    // a bind mount inside the destination can present the source under a destination name, and `open_dir`
+    // refuses only name-surrogates. Aliases of source SUBdirectories stay the section 42 mount cut's. Before the
+    // mount query, so a mount presenting the source root aborts rather than becoming a skipped subtree.
+    if let (Ok(FileIdentity::Strong(a)), FileIdentity::Strong(b)) = (child_identity, src_identity)
+        && a == b
+    {
+        return Err(refuse("a destination directory is the source root itself, by identity"));
+    }
+
+    // Part M: a pre-existing destination directory that is the root of a mount is never merged into.
+    if pre_existing {
+        let refusal = match child.mount_root(&*parent) {
+            Ok(MountRoot::No) => None,
+            Ok(MountRoot::Yes) => Some(FsError::new(
+                Code::SafetyRejected,
+                std::io::Error::other(
+                    "a pre-existing destination directory is the root of a mount, which a copy never merges into",
+                ),
+            )),
+            Ok(MountRoot::Unknown) => match opts.safety {
+                Safety::Default => {
+                    DegradedGroup::note(&mut out.mount_unknown, path);
+                    None
+                }
+                Safety::Strict => Some(FsError::new(
+                    Code::SafetyRejected,
+                    std::io::Error::other(
+                        "whether a pre-existing destination directory is a mount root cannot be told with full confidence",
+                    ),
+                )),
+            },
+            Err(e) => Some(e),
+        };
+        if let Some(failure) = refusal {
+            report(out, on_report, path.to_path_buf(), TreeFailureCause::CreateDir(failure));
+            return Ok(Frame::Skipped);
+        }
+    }
+    Ok(Frame::Live { dir: child, created: HashSet::new() })
 }
 
 /// A `File` event under a live frame.
@@ -1201,6 +1269,118 @@ mod tests {
 
         assert_eq!(r.unwrap_err().code(), Code::SafetyRejected);
         assert!(!fs.exists("/dst/sub/b"), "nothing was written through the alias");
+    }
+
+    #[test]
+    fn a_pre_existing_mount_root_is_skipped_and_reported_and_its_siblings_are_copied() {
+        let fs = tree();
+        fs.write_file("/src/c", b"C");
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.create_dir(Path::new("/dst/sub")).unwrap();
+        fs.set_mount_root("/dst/sub", flux_fs::MountRoot::Yes);
+
+        let (r, got) = run(&fs, "/src", "/dst", &opts());
+
+        let out = r.unwrap();
+        assert_eq!((out.files_copied, out.failures.create_dir), (2, 1), "{got:?}");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].path, PathBuf::from("sub"));
+        let TreeFailureCause::CreateDir(e) = &got[0].cause else { panic!("{:?}", got[0].cause) };
+        assert_eq!(e.code, Code::SafetyRejected);
+        assert!(fs.exists("/dst/a") && fs.exists("/dst/c"));
+        assert!(!fs.exists("/dst/sub/b"), "nothing was written into the mount");
+    }
+
+    #[test]
+    fn a_directory_this_run_created_and_dest_itself_are_never_queried() {
+        let fs = tree();
+        fs.create_dir(Path::new("/dst")).unwrap();
+        // DEST may be a mount root (`/mnt/usb`): known limit 1, never checked. `sub` is created by this run.
+        fs.set_mount_root("/dst", flux_fs::MountRoot::Yes);
+        let (r, got) = run(&fs, "/src", "/dst", &opts());
+        assert!(r.is_ok() && got.is_empty(), "{got:?}");
+        assert!(!fs.called("mount_root("), "{:?}", fs.calls());
+    }
+
+    #[test]
+    fn a_mount_query_that_cannot_tell_warns_under_default_and_refuses_the_subtree_under_strict() {
+        let lax = tree();
+        lax.create_dir(Path::new("/dst")).unwrap();
+        lax.create_dir(Path::new("/dst/sub")).unwrap();
+        lax.set_mount_root("/dst/sub", flux_fs::MountRoot::Unknown);
+        let (r, got) = run(&lax, "/src", "/dst", &opts());
+        let out = r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(
+            out.mount_unknown,
+            Some(DegradedGroup { count: 1, example: PathBuf::from("sub") })
+        );
+        assert!(lax.exists("/dst/sub/b"), "merged anyway");
+
+        let tight = tree();
+        tight.create_dir(Path::new("/dst")).unwrap();
+        tight.create_dir(Path::new("/dst/sub")).unwrap();
+        tight.set_mount_root("/dst/sub", flux_fs::MountRoot::Unknown);
+        let (r, got) = run(&tight, "/src", "/dst", &strict());
+        let out = r.unwrap();
+        assert_eq!(out.failures.create_dir, 1, "{got:?}");
+        assert!(out.mount_unknown.is_none());
+        assert!(!tight.exists("/dst/sub/b"));
+    }
+
+    #[test]
+    fn the_source_root_check_runs_before_the_mount_query() {
+        // A mount inside DEST presenting the SOURCE ROOT: the whole operation aborts (section 129), it does not
+        // become a skipped subtree, and the mount query is never asked.
+        let fs = tree();
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.create_dir(Path::new("/dst/sub")).unwrap();
+        fs.set_identity("/dst/sub", identity_of(&fs, "/src"));
+        fs.set_mount_root("/dst/sub", flux_fs::MountRoot::Yes);
+
+        let (r, got) = run(&fs, "/src", "/dst", &opts());
+
+        assert_eq!(r.unwrap_err().code(), Code::SafetyRejected);
+        assert!(got.is_empty(), "an abort, not a streamed failure: {got:?}");
+        assert!(!fs.called("mount_root("), "{:?}", fs.calls());
+    }
+
+    #[test]
+    fn a_failed_mount_query_fails_that_subtree_like_a_failed_open() {
+        let fs = tree();
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.create_dir(Path::new("/dst/sub")).unwrap();
+        fs.fail("mount_root", Code::PermissionDenied);
+        let (r, got) = run(&fs, "/src", "/dst", &opts());
+        let out = r.unwrap();
+        assert_eq!((out.files_copied, out.failures.create_dir), (1, 1));
+        let TreeFailureCause::CreateDir(e) = &got[0].cause else { panic!("{:?}", got[0].cause) };
+        assert_eq!(e.code, Code::PermissionDenied);
+        assert!(!fs.exists("/dst/sub/b"));
+    }
+
+    #[test]
+    fn a_folded_directory_is_a_collision_before_any_mount_query() {
+        // Two source names folding onto one destination directory (Review Focus 1), staged exactly as
+        // `two_source_directories_folded_into_one_destination_are_a_collision` (`:948`) stages it: `/dst/a` pre-exists
+        // carrying the identity `/dst/A` gets when this run makes it. The fold is reported as today, and the mount
+        // query is never reached for it even though `/dst/a` is marked a mount root.
+        let fs = FaultFs::new();
+        for d in ["/src", "/src/A", "/src/a", "/dst", "/dst/a"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        fs.write_file("/src/A/x", b"x");
+        fs.write_file("/src/a/y", b"y");
+        let folded = FileIdentity::Strong(ObjectId { volume: 1, index: 9_003 });
+        fs.set_identity("/dst/A", folded);
+        fs.set_identity("/dst/a", folded);
+        fs.set_mount_root("/dst/a", flux_fs::MountRoot::Yes);
+        let (r, got) = run(&fs, "/src", "/dst", &opts());
+        let out = r.unwrap();
+        assert_eq!(out.failures.create_dir, 1, "{got:?}");
+        let TreeFailureCause::CreateDir(e) = &got[0].cause else { panic!("{:?}", got[0].cause) };
+        assert_eq!(e.code, Code::DestinationNamespaceCollision);
+        assert!(!fs.called("mount_root("), "{:?}", fs.calls());
     }
 
     #[test]
