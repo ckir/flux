@@ -222,7 +222,7 @@ Expected: a compile error naming `MountRoot` / `mount_root`.
   - Linux (`#[cfg(target_os = "linux")]`): `rustix::fs::statx(&self.0, "", AtFlags::EMPTY_PATH, StatxFlags::empty())`.
     `Ok(st)`: if `st.stx_attributes_mask.contains(StatxAttributes::MOUNT_ROOT)` answer `Yes` / `No` from
     `st.stx_attributes.contains(StatxAttributes::MOUNT_ROOT)`; else fall through to the device comparison with
-    `Unknown` when equal. `Err(Errno::NOSYS)`: the device comparison. Any other `Err`: `FsError::from_io`.
+    `Unknown` when equal. `Err(Errno::NOSYS | Errno::NOTSUP | Errno::OPNOTSUPP)`: the device comparison (the macOS arm's unsupported set). Any other `Err`: `FsError::from_io`.
   - The device comparison, shared: `fstat` both handles; `child.st_dev != parent.st_dev` is `Yes`; equal is
     `Unknown` on Linux and `No` on macOS (`#[cfg(target_os = "macos")]`: the spec, "macOS has no same-filesystem bind
     mount of its own").
@@ -1072,6 +1072,19 @@ fn restart_probes_again_and_a_refusal_there_leaves_the_priors_resumable() {
 }
 
 #[test]
+fn a_refusal_keeps_the_probe_leftover_when_the_lock_cannot_be_removed() {
+    let fs = fake();
+    fs.set_no_replace_support(false);
+    fs.fail_always("remove_file", Code::PermissionDenied); // the probe temporary AND the lock both stay
+    let (r, _) = run_tree(&fs, &cfg());
+    let Some(RunError::Refused { refusal, changed, not_removed }) = &r.stop else { panic!("{:?}", r.stop) };
+    assert_eq!((refusal.code, *changed), (LockCode::NoReplacePublishUnavailable, true));
+    assert!(refusal.detail.contains("noreplace-probe.tmp"), "the displaced leftover is kept: {}", refusal.detail);
+    let (path, _) = not_removed.as_ref().expect("the lock is named");
+    assert_eq!(path.to_string_lossy().replace('\\', "/"), LOCK);
+}
+
+#[test]
 fn a_single_file_run_never_probes() {
     let fs = fake();
     fs.set_no_replace_support(false);
@@ -1105,7 +1118,7 @@ fn begin_then_publish_is_create_workspace() {
 
 Run: `cargo nextest run -p flux-core run::tests state::tests lock::error && cargo nextest run -p flux-cli`
 Expected: compile errors on `RunStep::Probe`, `RunWarning::ProbeNotRemoved`, `LockCode::NoReplacePublishUnavailable`,
-`begin_workspace`; once those exist as stubs, the seven run tests fail on their first assertion.
+`begin_workspace`; once those exist as stubs, the eight run tests fail on their first assertion.
 
 - [ ] **Step 3: Split `create_workspace`** in `state.rs` into `creating_name`, `begin_workspace`, `publish_workspace`,
   with `create_workspace` composing them. Behaviour of the composition is byte-identical to today (`:604-620`).
@@ -1128,8 +1141,9 @@ Expected: compile errors on `RunStep::Probe`, `RunWarning::ProbeNotRemoved`, `Lo
      - `Ok(Probe::Available { leftover: Some((name, error)) })`: `warnings.push(RunWarning::ProbeNotRemoved { path: self.operations_shown().join(id).join(name), error })`
        (the file's path once the workspace is published).
      - `Ok(Probe::Unavailable { leftover })`: `drop(building)`; `return Err(self.refuse_no_replace(operations, id, leftover))`.
-     - `Err(error)`: `drop(building)`; the same best-effort clean-up as the refusal (`refuse_no_replace`'s
-       removals, errors ignored, so a DEST this run made and the control directories do not strand); `return
+     - `Err(error)`: `drop(building)`; the same best-effort clean-up as the refusal (the private helper
+       `unwind_creating(&mut self, operations, id) -> Option<(PathBuf, FsError)>` that `refuse_no_replace` also calls: it
+       removes `<id>.creating`, then runs `remove_control_dirs(true)`, and returns the first failed removal; the error arm ignores the return, so a DEST this run made and the control directories do not strand); `return
        Err(failed(RunStep::Probe, &shown_creating.join(PROBE), error))`. Test:
        `another_probe_publish_error_fails_the_run_at_the_probe_step` also asserts `!fs.exists("/p/dest")`.
   4. `let workspace = publish_workspace(&operations, building, state).map_err(|e| failed(RunStep::State, &self.shown(id), e))?; drop(workspace); self.operations = Some(operations); Ok(())`.
@@ -1147,9 +1161,8 @@ Expected: compile errors on `RunStep::Probe`, `RunWarning::ProbeNotRemoved`, `Lo
   `use crate::lock::{LockCode, Refusal}` beside its existing `LockResult` import (`:9`), and `use
   crate::tree::primitive_unavailable`. `give_back` (`session.rs:243`) overwrites a `Refused`'s `not_removed` with the lock when the lock's own removal
   fails (`:251-256`); change it to move the displaced entry into `refusal.detail` (`"; also not removed: <path> (<error>)"`)
-  so the probe's leftover is never dropped from the report, and test it with
-  `a_refusal_keeps_the_probe_leftover_when_the_lock_cannot_be_removed` (set_no_replace_support(false), `fail_always("remove_file", ..)` so the
-  probe temporary AND the lock both fail to go: assert `refusal.detail` contains `noreplace-probe.tmp` and `not_removed` names `LOCK`). It already
+  so the probe's leftover is never dropped from the report, and the test for it is
+  `a_refusal_keeps_the_probe_leftover_when_the_lock_cannot_be_removed` (Step 1). It already
   handles a `Refused` from `create`: it removes the lock this run created and names it if that fails.
 
 - [ ] **Step 8: Run the tests**
