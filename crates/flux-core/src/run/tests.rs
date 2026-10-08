@@ -48,6 +48,7 @@ fn opts() -> CopyOptions {
         publish: Publish::Replace,
         safety: Safety::Default,
         operation_id: OperationId::new("replaced by the run"),
+        existing: flux_fs::ExistingPolicy::Overwrite,
     }
 }
 
@@ -705,6 +706,18 @@ fn a_single_file_run_copies_and_leaves_no_record_behind() {
 }
 
 #[test]
+fn a_skipped_single_file_run_completes_and_records_no_published_identity() {
+    let fs = fake();
+    fs.write_file("/p/t", b"old");
+    let o = CopyOptions { existing: flux_fs::ExistingPolicy::SkipExisting, ..opts() };
+    let r = file(&fs, Path::new("/src/a"), Path::new("/p/t"), &o, &cfg());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert!(matches!(&r.copy, Some(Ok(out)) if out.skipped), "{:?}", r.copy);
+    assert!(!fs.exists(record_path(ID)) && !fs.exists(T_LOCK));
+    assert_eq!(fs.read_file("/p/t").as_deref(), Some(&b"old"[..]));
+}
+
+#[test]
 fn a_target_name_too_long_for_its_record_is_refused_before_anything_is_made() {
     let fs = fake();
     let long = format!("/p/{}", "n".repeat(255 - 47));
@@ -1097,9 +1110,9 @@ fn a_refusal_of_the_lock_names_the_lock_path() {
 
 #[test]
 fn the_hook_runs_once_before_each_guarded_mutation() {
-    // A tree's guarded mutations: `a`'s sweep, temporary and publish; `sub`'s creation; `sub/b`'s three. A single
-    // file's: its sweep, temporary and publish.
-    for (tree_run, expected) in [(true, 7), (false, 3)] {
+    // A tree's guarded mutations: `a`'s sweep, temporary and publish; `sub`'s creation; `sub/b`'s three; `sub`'s
+    // directory-end flush (cut 8b). A single file's: its sweep, temporary and publish.
+    for (tree_run, expected) in [(true, 8), (false, 3)] {
         let fs = fake();
         let count = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&count);
@@ -1760,4 +1773,797 @@ fn an_unconfirmed_source_canonical_path_alone_degrades_the_check() {
         Some(Path::new("/p")),
         "the anchor is confirmed and outside the source; only the source side is unconfirmed"
     );
+}
+
+#[test]
+fn a_tree_run_creates_state_db_in_the_workspace_and_removes_it_with_it() {
+    let fs = fake();
+    let (r, _) = run_tree(&fs, &cfg());
+    ok(&r);
+    let c = calls(&fs);
+    let probe = at(
+        &c,
+        &format!(
+            "rename_no_replace({} -> {})",
+            creating("noreplace-probe.tmp"),
+            creating("noreplace-probe")
+        ),
+    );
+    let published = at(
+        &c,
+        &format!(
+            "rename_no_replace(/p/dest/.flux/operations/{ID}.creating -> /p/dest/.flux/operations/{ID})"
+        ),
+    );
+    // Created in the published `<id>`, never in `<id>.creating` (Windows refuses to rename a directory holding an
+    // open file).
+    let store = at(&c, &format!("create_claim_store(/p/dest/.flux/operations/{ID}/state.db)"));
+    assert!(probe < published && published < store, "{c:?}");
+    assert!(!c.iter().any(|x| x.contains(".creating/state.db")), "{c:?}");
+    assert!(!fs.exists("/p/dest/.flux"), "the workspace and its state.db are gone");
+    assert!(!fs.exists(format!("/p/dest/.flux/operations/{ID}.removing")));
+}
+
+#[test]
+fn a_refused_probe_removes_nothing_it_did_not_make() {
+    let fs = fake();
+    fs.set_no_replace_support(false);
+    let (r, _) = run_tree(&fs, &cfg());
+    assert!(matches!(r.stop, Some(RunError::Refused { .. })), "{:?}", r.stop);
+    let c = calls(&fs);
+    assert!(!c.iter().any(|x| x.starts_with("create_claim_store(")), "{c:?}");
+    assert!(!c.iter().any(|x| x.contains("state.db")), "{c:?}");
+}
+
+#[test]
+fn a_failed_state_db_creation_unwinds_and_names_the_file() {
+    let fs = fake();
+    fs.fail("create_claim_store", Code::PermissionDenied);
+    let (r, _) = run_tree(&fs, &cfg());
+    let (step, path) = failed_at(&r.stop);
+    assert_eq!(step, RunStep::State);
+    assert!(path.ends_with("state.db"), "{path}");
+    for suffix in ["", ".removing", ".creating"] {
+        assert!(!fs.exists(format!("/p/dest/.flux/operations/{ID}{suffix}")), "{suffix}");
+    }
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert!(!fs.exists("/p/dest"), "control dirs and the DEST this run made are gone");
+    assert!(!fs.exists(LOCK), "the lock is released");
+    assert_eq!(fs.claim_stores_open(), 0);
+}
+
+#[test]
+fn a_kept_workspace_keeps_state_db() {
+    let fs = fake();
+    fs.on_nth("create_new", 4, |fs| fs.fail_write(std::io::Error::other("injected write")));
+    fs.fail_nth("remove_file", 5, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let (r, _) = run_tree(&fs, &cfg());
+    assert!(r.warnings.iter().any(|w| matches!(w, RunWarning::StateKept(_))), "{:?}", r.warnings);
+    assert!(fs.exists(format!("/p/dest/.flux/operations/{ID}/state.db")));
+}
+
+#[test]
+fn the_store_is_closed_when_state_db_is_removed_and_after_the_run() {
+    let fs = fake();
+    let (r, _) = run_tree(&fs, &cfg());
+    ok(&r);
+    assert_eq!(
+        fs.claim_stores_open_at_last_state_db_removal(),
+        Some(0),
+        "state.db was removed while its store was still open (or never removed)"
+    );
+    assert_eq!(fs.claim_stores_open(), 0);
+}
+
+// ---- Cut 8b, Task 10: the replacement protocol in the walk ------------------------------------------------------
+
+use crate::tree::{TreeFailure, TreeFailureCause};
+use flux_fs::{
+    ClaimOutcome, ClaimRecord, ClaimStatus, ClaimStore, ExistingPolicy, FileType, FluxPathKey,
+};
+
+fn with_policy(policy: ExistingPolicy) -> CopyOptions {
+    CopyOptions { existing: policy, ..opts() }
+}
+
+fn run_tree_with(
+    fs: &FaultFs,
+    c: &RunConfig,
+    o: &CopyOptions,
+) -> (Run<Result<TreeOutcome, TreeAbort>>, Vec<TreeFailure>) {
+    let mut got = Vec::new();
+    let r = tree(fs, Path::new("/src"), Path::new("/p/dest"), o, c, &mut |f| got.push(f));
+    (r, got)
+}
+
+/// `fake()` with `/p/dest` already there.
+fn dest_fake() -> FaultFs {
+    let fs = fake();
+    fs.create_dir(Path::new("/p/dest")).unwrap();
+    fs
+}
+
+fn strong(fs: &FaultFs, path: &str) -> ObjectId {
+    match fs.metadata(Path::new(path)).unwrap().identity {
+        FileIdentity::Strong(id) => id,
+        other => panic!("{path} is not strong: {other:?}"),
+    }
+}
+
+fn key(s: &str) -> FluxPathKey {
+    FluxPathKey(s.as_bytes().to_vec())
+}
+
+/// Write `bytes` at `path` with the given modified time (`write_file` leaves it unavailable).
+fn put(fs: &FaultFs, path: &str, bytes: &[u8], secs: u64) {
+    let mut w = fs.create_new(Path::new(path)).unwrap();
+    std::io::Write::write_all(&mut w, bytes).unwrap();
+    let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+    fs.set_times(&w, Some(t)).unwrap();
+}
+
+fn code_of(f: &TreeFailure) -> Code {
+    match &f.cause {
+        TreeFailureCause::Copy(e) => e.code(),
+        TreeFailureCause::CreateDir(e) | TreeFailureCause::ClaimNotRecorded(e) => e.code,
+        other => panic!("unexpected cause {other:?}"),
+    }
+}
+
+/// The index of the first call starting with `prefix` at or after `from`.
+fn after(calls: &[String], from: usize, prefix: &str) -> usize {
+    from + calls[from..]
+        .iter()
+        .position(|c| c.starts_with(prefix))
+        .unwrap_or_else(|| panic!("no {prefix} after {from} in {calls:?}"))
+}
+
+#[test]
+fn an_existing_file_is_replaced_by_default() {
+    let fs = dest_fake();
+    fs.write_file("/p/dest/a", b"old");
+    let dest = strong(&fs, "/p/dest");
+    let (r, got) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!((out.files_overwritten, out.files_copied, out.files_skipped), (1, 2, 0));
+    assert!(out.failures.is_empty());
+    assert_eq!(fs.read_file("/p/dest/a").as_deref(), Some(&b"A"[..]));
+    assert_eq!(
+        fs.claim(dest, "a"),
+        Some(ClaimRecord { target: key("a"), status: ClaimStatus::Created })
+    );
+    let sub = strong(&fs, "/p/dest/sub");
+    assert_eq!(
+        fs.claim(sub, "b"),
+        Some(ClaimRecord { target: key("sub\0b"), status: ClaimStatus::Created })
+    );
+    // The protocol claims one key per target whose planned and stored names agree: `(dest, "a")` for the replaced
+    // entry (inserted `Existing`, upgraded to `Created`) and `(sub, "b")` for the new file. Nothing else claims.
+    assert_eq!(fs.claim_count(), 2);
+}
+
+#[test]
+fn the_claim_comes_after_the_gate_and_before_the_temporary() {
+    let fs = dest_fake();
+    fs.write_file("/p/dest/a", b"old");
+    let (r, _) = run_tree(&fs, &cfg());
+    ok(&r);
+    let c = calls(&fs);
+    let first = at(&c, "metadata(/p/dest/a)");
+    let claim = at(&c, "claim_insert(a)");
+    // The resolve stat and the identity gate's stat both precede the claim.
+    let stats = c[..claim].iter().filter(|x| *x == "metadata(/p/dest/a)").count();
+    assert!(stats >= 2, "resolve and gate stat before the claim: {c:?}");
+    let temp = after(&c, claim, &format!("create_new(/p/dest/a.flux-partial.{ID}"));
+    let rename = after(&c, temp, "rename_replace(");
+    let upgrade = at(&c, "claim_upgrade(a)");
+    assert!(first < claim && claim < temp && temp < rename && rename < upgrade, "{c:?}");
+}
+
+#[test]
+fn skip_existing_skips_and_claims_nothing() {
+    let fs = dest_fake();
+    fs.write_file("/p/dest/a", b"old");
+    let dest = strong(&fs, "/p/dest");
+    let (r, got) = run_tree_with(&fs, &cfg(), &with_policy(ExistingPolicy::SkipExisting));
+    let out = ok(&r);
+    assert!(got.is_empty(), "a skipped file is not a failure: {got:?}");
+    assert_eq!((out.files_skipped, out.bytes_skipped), (1, 1), "the SOURCE length of a");
+    assert_eq!((out.files_copied, out.files_overwritten), (1, 0), "only sub/b is new");
+    assert_eq!(fs.read_file("/p/dest/a").as_deref(), Some(&b"old"[..]));
+    assert_eq!(fs.claim(dest, "a"), None);
+    assert_eq!(fs.claim_count(), 1, "sub/b only");
+    let c = calls(&fs);
+    assert!(!c.iter().any(|x| x.starts_with("claim_insert(a)") || x.contains("a.flux-partial")));
+}
+
+#[test]
+fn update_replaces_only_a_newer_or_different_size_file() {
+    let fs = FaultFs::new();
+    for d in ["/src", "/src/sub", "/p", "/p/dest", "/p/dest/sub"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    // (name, source bytes, source time, destination bytes, destination time, replaced)
+    put(&fs, "/src/a", b"new", 20);
+    put(&fs, "/p/dest/a", b"old", 10); // newer source: replaced
+    put(&fs, "/src/c", b"CCC", 5);
+    put(&fs, "/p/dest/c", b"dd", 99); // different size: replaced, though older
+    put(&fs, "/src/d", b"new", 5);
+    put(&fs, "/p/dest/d", b"old", 99); // older, same size: skipped
+    put(&fs, "/src/sub/b", b"new", 30);
+    put(&fs, "/p/dest/sub/b", b"old", 30); // same time, same size: skipped
+    let (r, got) = run_tree_with(&fs, &cfg(), &with_policy(ExistingPolicy::Update));
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(fs.read_file("/p/dest/a").as_deref(), Some(&b"new"[..]));
+    assert_eq!(fs.read_file("/p/dest/c").as_deref(), Some(&b"CCC"[..]));
+    assert_eq!(fs.read_file("/p/dest/d").as_deref(), Some(&b"old"[..]));
+    assert_eq!(fs.read_file("/p/dest/sub/b").as_deref(), Some(&b"old"[..]));
+    assert_eq!((out.files_overwritten, out.files_copied), (2, 2));
+    assert_eq!((out.files_skipped, out.bytes_skipped), (2, 6), "d and sub/b, 3 source bytes each");
+    assert_eq!(fs.claim_count(), 2, "only the replaced entries are claimed");
+}
+
+#[test]
+fn a_new_file_is_claimed_created() {
+    let fs = fake();
+    let (r, got) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!((out.files_copied, out.files_overwritten, out.files_skipped), (2, 0, 0));
+    let dest = strong(&fs, "/p/dest");
+    let sub = strong(&fs, "/p/dest/sub");
+    assert_eq!(
+        fs.claim(dest, "a"),
+        Some(ClaimRecord { target: key("a"), status: ClaimStatus::Created })
+    );
+    assert_eq!(
+        fs.claim(sub, "b"),
+        Some(ClaimRecord { target: key("sub\0b"), status: ClaimStatus::Created })
+    );
+    assert_eq!(fs.claim_count(), 2);
+    assert!(!calls(&fs).iter().any(|x| x.starts_with("rename_replace(/p/dest/a.flux-partial")));
+}
+
+#[test]
+fn a_policy_over_new_files_copies_them_and_the_copy_path_never_skips() {
+    for policy in [ExistingPolicy::SkipExisting, ExistingPolicy::Update] {
+        // DEST made by the run, and DEST pre-existing with the files absent.
+        for fs in [fake(), dest_fake()] {
+            let (r, got) = run_tree_with(&fs, &cfg(), &with_policy(policy));
+            let out = ok(&r);
+            assert!(got.is_empty(), "{policy:?}: {got:?}");
+            assert_eq!(out.files_copied, 2, "{policy:?}");
+            assert_eq!((out.files_skipped, out.bytes_skipped, out.files_overwritten), (0, 0, 0));
+            assert_eq!(fs.read_file("/p/dest/a").as_deref(), Some(&b"A"[..]));
+            assert_eq!(fs.read_file("/p/dest/sub/b").as_deref(), Some(&b"BB"[..]));
+        }
+    }
+}
+
+/// A case-folding destination `/p/dest` holding `existing` (content `old`), and two sources that fold together.
+fn folding(existing: &str) -> FaultFs {
+    let fs = FaultFs::new();
+    for d in ["/src", "/p", "/p/dest"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    fs.write_file("/src/File.txt", b"upper");
+    fs.write_file("/src/file.txt", b"lower");
+    fs.write_file(format!("/p/dest/{existing}"), b"old");
+    fs.set_case_insensitive(true);
+    fs
+}
+
+/// One of the two folding sources replaced the entry, the other is a collision, and the entry holds the FIRST
+/// source's content (the walk sorts `File.txt` before `file.txt`).
+fn assert_one_replaced_one_collides(
+    fs: &FaultFs,
+    got: &[TreeFailure],
+    out: &TreeOutcome,
+    at: &str,
+    stored: &str,
+) {
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(code_of(&got[0]), Code::DestinationNamespaceCollision);
+    assert_eq!(got[0].path, PathBuf::from("file.txt"));
+    assert_eq!((out.files_overwritten, out.files_copied), (1, 1));
+    assert_eq!(fs.read_file(at).as_deref(), Some(&b"upper"[..]), "the first source's content");
+    // Both spellings are claimed for the first source, whatever the platform left on disk: the stored name `stored`
+    // (upgraded to Created) and the planned name `File.txt` (inserted Created).
+    let dest = strong(fs, "/p/dest");
+    let created = |t: &str| Some(ClaimRecord { target: key(t), status: ClaimStatus::Created });
+    assert_eq!(fs.claim(dest, stored), created("File.txt"), "the stored spelling");
+    assert_eq!(fs.claim(dest, "File.txt"), created("File.txt"), "the planned spelling");
+}
+
+#[test]
+fn two_source_names_folding_onto_one_existing_entry_collide() {
+    let fs = folding("FILE.TXT");
+    let (r, got) = run_tree(&fs, &cfg());
+    assert_one_replaced_one_collides(&fs, &got, ok(&r), "/p/dest/FILE.TXT", "FILE.TXT");
+    // The entry keeps its old spelling on this platform (Linux and macOS).
+    assert!(!fs.exists("/p/dest/File.txt"));
+}
+
+#[test]
+fn two_source_names_folding_onto_one_existing_entry_collide_when_a_replace_renames() {
+    let fs = folding("FILE.TXT");
+    fs.set_replace_renames(true);
+    let (r, got) = run_tree(&fs, &cfg());
+    // Windows: the entry takes the planned spelling of the first source.
+    assert_one_replaced_one_collides(&fs, &got, ok(&r), "/p/dest/File.txt", "FILE.TXT");
+}
+
+#[test]
+fn two_source_names_folding_onto_one_entry_stored_lowercase_collide() {
+    let fs = folding("file.txt");
+    let (r, got) = run_tree(&fs, &cfg());
+    assert_one_replaced_one_collides(&fs, &got, ok(&r), "/p/dest/file.txt", "file.txt");
+}
+
+#[test]
+fn a_directory_in_the_way_fails_only_that_target() {
+    let fs = dest_fake();
+    fs.create_dir(Path::new("/p/dest/a")).unwrap();
+    let dest = strong(&fs, "/p/dest");
+    let (r, got) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(code_of(&got[0]), Code::DestinationError);
+    assert_eq!(got[0].path, PathBuf::from("a"));
+    assert_eq!((out.files_copied, out.files_overwritten), (1, 0), "sub/b is copied");
+    assert_eq!(fs.metadata(Path::new("/p/dest/a")).unwrap().file_type, FileType::Dir);
+    assert_eq!(fs.claim(dest, "a"), None);
+    assert_eq!(fs.read_file("/p/dest/sub/b").as_deref(), Some(&b"BB"[..]));
+}
+
+#[test]
+fn a_symlink_at_the_destination_is_replaced_as_a_link() {
+    let fs = dest_fake();
+    // The fake's links point nowhere, so the link's "target" is a file beside it that must stay as it is.
+    fs.write_file("/p/target", b"T");
+    fs.add_symlink("/p/dest/a");
+    let (r, got) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!((out.files_overwritten, out.files_copied), (1, 2));
+    assert_eq!(fs.metadata(Path::new("/p/dest/a")).unwrap().file_type, FileType::File);
+    assert_eq!(fs.read_file("/p/dest/a").as_deref(), Some(&b"A"[..]));
+    assert!(fs.exists("/p/target"), "the link's target still exists");
+    assert_eq!(fs.read_file("/p/target").as_deref(), Some(&b"T"[..]), "and is untouched");
+}
+
+#[test]
+fn a_read_only_destination_fails_that_target_with_permission_denied() {
+    let fs = dest_fake();
+    fs.write_file("/p/dest/a", b"old");
+    let dest = strong(&fs, "/p/dest");
+    // The fake has no read-only bit: the refusal of the replacing rename is how cut 4 tests model it. Armed at the
+    // claim, so the fault meets `a`'s publish and not the state manifest's earlier `rename_replace`.
+    fs.on_nth("claim_insert", 1, |fs| {
+        fs.fail_kind(
+            "rename_replace",
+            Code::PermissionDenied,
+            std::io::ErrorKind::PermissionDenied,
+        );
+    });
+    let (r, got) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(code_of(&got[0]), Code::PermissionDenied);
+    assert_eq!(got[0].path, PathBuf::from("a"));
+    assert_eq!(fs.read_file("/p/dest/a").as_deref(), Some(&b"old"[..]));
+    assert_eq!((out.files_copied, out.files_overwritten), (1, 0));
+    assert_eq!(fs.read_file("/p/dest/sub/b").as_deref(), Some(&b"BB"[..]));
+    // The claim stays: it is never released.
+    assert_eq!(fs.claim(dest, "a").map(|r| r.status), Some(ClaimStatus::Existing));
+}
+
+#[test]
+fn a_weak_parent_identity_degrades_to_no_replace() {
+    let fs = dest_fake();
+    fs.write_file("/p/dest/a", b"old");
+    fs.set_identity("/p/dest", FileIdentity::Weak(ObjectId { volume: 9, index: 9 }));
+    let (r, got) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(code_of(&got[0]), Code::DestinationNamespaceCollision);
+    assert_eq!(got[0].path, PathBuf::from("a"));
+    assert_eq!(fs.read_file("/p/dest/a").as_deref(), Some(&b"old"[..]));
+    assert_eq!((out.files_overwritten, out.files_copied), (0, 1), "sub/b is new");
+    assert_eq!(out.replace_degraded.as_ref().map(|g| g.count), Some(1));
+    // `sub` was created by this run and has a Strong identity: its file is claimed; the weak root claims nothing.
+    assert_eq!(fs.claim_count(), 1);
+    assert!(!calls(&fs).iter().any(|x| x.starts_with("claim_insert(a)")));
+}
+
+#[test]
+fn a_weak_directory_under_strict_safety_is_rejected_with_its_subtree() {
+    let fs = dest_fake();
+    fs.create_dir(Path::new("/p/dest/sub")).unwrap();
+    fs.write_file("/p/dest/sub/b", b"old");
+    fs.set_identity("/p/dest/sub", FileIdentity::Weak(ObjectId { volume: 9, index: 9 }));
+    let strict = CopyOptions { safety: Safety::Strict, ..opts() };
+    let (r, got) = run_tree_with(&fs, &cfg(), &strict);
+    let out = ok(&r);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(code_of(&got[0]), Code::SafetyRejected);
+    assert_eq!(got[0].path, PathBuf::from("sub"));
+    assert_eq!(fs.read_file("/p/dest/sub/b").as_deref(), Some(&b"old"[..]));
+    assert_eq!((out.files_copied, out.files_overwritten), (1, 0), "a is new; sub is skipped");
+    assert!(out.replace_degraded.is_none());
+}
+
+#[test]
+fn a_claim_store_error_before_the_rename_fails_that_target_only() {
+    let fs = dest_fake();
+    fs.write_file("/p/dest/a", b"old");
+    fs.fail("claim_insert", Code::IoError);
+    let (r, got) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(code_of(&got[0]), Code::IoError);
+    assert_eq!(got[0].path, PathBuf::from("a"));
+    assert!(matches!(&got[0].cause, TreeFailureCause::Copy(e) if e.step == CopyStep::Claim));
+    assert_eq!(fs.read_file("/p/dest/a").as_deref(), Some(&b"old"[..]));
+    assert!(
+        !calls(&fs).iter().any(|x| x.starts_with("create_new(/p/dest/a.flux-partial")),
+        "nothing was created for it"
+    );
+    assert_eq!((out.files_copied, out.files_overwritten), (1, 0), "the sibling is copied");
+    assert_eq!(fs.read_file("/p/dest/sub/b").as_deref(), Some(&b"BB"[..]));
+}
+
+#[test]
+fn a_claim_store_error_after_the_rename_is_claim_not_recorded_and_the_file_is_counted() {
+    let fs = dest_fake();
+    fs.write_file("/p/dest/a", b"old");
+    fs.fail_nth("claim_upgrade", 1, Code::IoError, std::io::ErrorKind::Other);
+    let (r, got) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(matches!(&got[0].cause, TreeFailureCause::ClaimNotRecorded(_)), "{got:?}");
+    assert_eq!(got[0].path, PathBuf::from("a"));
+    assert_eq!(fs.read_file("/p/dest/a").as_deref(), Some(&b"A"[..]), "published");
+    assert_eq!((out.files_overwritten, out.files_copied), (1, 2));
+    assert_eq!(out.failures.claim_not_recorded, 1);
+    assert_eq!(out.failures.total(), 1, "exit 1 follows from a counted failure");
+    let dest = strong(&fs, "/p/dest");
+    assert_eq!(fs.claim(dest, "a").map(|r| r.status), Some(ClaimStatus::Existing));
+}
+
+#[test]
+fn a_target_that_finds_its_own_claim_proceeds() {
+    use crate::copy::{no_heartbeat, unguarded};
+    use crate::tree::{Shared, copy_tree_at, prepare_source};
+    let fs = dest_fake();
+    fs.write_file("/p/dest/a", b"old");
+    let root = fs.destination_root(Path::new("/p/dest")).unwrap();
+    let dest = strong(&fs, "/p/dest");
+    // A claim already on `(dest, "a")` for this very target, as a resumed target would find it.
+    let mut store = root.create_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap();
+    let own = ClaimRecord { target: key("a"), status: ClaimStatus::Existing };
+    let key_a = flux_fs::ClaimKey::new(dest, OsStr::new("a"));
+    assert!(matches!(store.insert_if_absent(&key_a, &own).unwrap(), ClaimOutcome::Inserted));
+    let claims = std::cell::RefCell::new(store);
+    let source = prepare_source(&fs, Path::new("/src"), Path::new("/p/dest")).unwrap();
+    let o = opts();
+    let cx = Shared {
+        fs: &fs,
+        src_root: Path::new("/src"),
+        src_identity: source.identity,
+        opts: &o,
+        guard: &unguarded,
+        beat: &no_heartbeat,
+        claims: Some(&claims),
+    };
+    let mut out = TreeOutcome::default();
+    let mut got = Vec::new();
+    let (_root, walked) =
+        copy_tree_at(&cx, source.events, root, false, &mut out, &mut |f| got.push(f));
+    walked.unwrap();
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!((out.files_overwritten, out.files_copied), (1, 2));
+    assert_eq!(fs.read_file("/p/dest/a").as_deref(), Some(&b"A"[..]));
+    assert_eq!(
+        fs.claim(dest, "a").map(|r| (r.target, r.status)),
+        Some((key("a"), ClaimStatus::Created))
+    );
+}
+
+/// Case-folding sources `File.txt` / `file.txt` under `dir` of `/src`, and a DEST the run creates.
+fn fold_into_created(dir: &str) -> FaultFs {
+    let fs = FaultFs::new();
+    for d in ["/src", "/p"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    if !dir.is_empty() {
+        fs.create_dir(Path::new(&format!("/src/{dir}"))).unwrap();
+    }
+    let at = |n: &str| if dir.is_empty() { format!("/src/{n}") } else { format!("/src/{dir}/{n}") };
+    fs.write_file(at("File.txt"), b"upper");
+    fs.write_file(at("file.txt"), b"lower");
+    fs.set_case_insensitive(true);
+    // The first target's post-publish claim fails, so only the no-replace rename can refuse the second.
+    fs.fail_nth("claim_insert", 1, Code::IoError, std::io::ErrorKind::Other);
+    fs
+}
+
+fn assert_fold_refused_by_no_replace(
+    got: &[TreeFailure],
+    out: &TreeOutcome,
+    first: &str,
+    second: &str,
+) {
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert!(matches!(&got[0].cause, TreeFailureCause::ClaimNotRecorded(_)), "{got:?}");
+    assert_eq!(got[0].path, PathBuf::from(first));
+    assert_eq!(code_of(&got[1]), Code::DestinationNamespaceCollision);
+    assert_eq!(got[1].path, PathBuf::from(second));
+    assert_eq!(
+        (out.files_copied, out.files_overwritten),
+        (1, 0),
+        "the first is published and counted"
+    );
+    assert_eq!(out.failures.claim_not_recorded, 1);
+}
+
+#[test]
+fn a_fold_in_a_created_directory_is_refused_by_the_no_replace_rename_even_when_the_first_claim_failed()
+ {
+    let fs = fold_into_created("sub");
+    let (r, got) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert_fold_refused_by_no_replace(&got, out, "sub/File.txt", "sub/file.txt");
+    assert_eq!(
+        fs.read_file("/p/dest/sub/File.txt").as_deref(),
+        Some(&b"upper"[..]),
+        "the FIRST source's content"
+    );
+    assert!(
+        !calls(&fs).iter().any(|x| x.starts_with("rename_replace(/p/dest/sub/")),
+        "no replacing rename"
+    );
+}
+
+#[test]
+fn a_fold_in_a_destination_the_run_created_is_refused_by_the_no_replace_rename_even_when_the_first_claim_failed()
+ {
+    let fs = fold_into_created("");
+    let (r, got) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert_fold_refused_by_no_replace(&got, out, "File.txt", "file.txt");
+    assert_eq!(
+        fs.read_file("/p/dest/File.txt").as_deref(),
+        Some(&b"upper"[..]),
+        "the FIRST source's content"
+    );
+    assert!(
+        !calls(&fs).iter().any(|x| x.starts_with("rename_replace(/p/dest/File")),
+        "no replacing rename"
+    );
+}
+
+/// Case-folding sources `File.txt` / `file.txt` and a DEST that ALREADY EXISTED (empty), with the first claim failing.
+fn fold_into_existing() -> FaultFs {
+    let fs = FaultFs::new();
+    for d in ["/src", "/p", "/p/dest"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    fs.write_file("/src/File.txt", b"upper");
+    fs.write_file("/src/file.txt", b"lower");
+    fs.set_case_insensitive(true);
+    fs.fail_nth("claim_insert", 1, Code::IoError, std::io::ErrorKind::Other);
+    fs
+}
+
+fn assert_existing_fold_refused(fs: &FaultFs) {
+    let (r, got) = run_tree(fs, &cfg());
+    let out = ok(&r);
+    assert_fold_refused_by_no_replace(&got, out, "File.txt", "file.txt");
+    assert_eq!(
+        fs.read_file("/p/dest/File.txt").as_deref(),
+        Some(&b"upper"[..]),
+        "the FIRST source's content"
+    );
+    assert!(
+        !calls(fs).iter().any(|x| x.starts_with("rename_replace(/p/dest/File")
+            || x.starts_with("rename_replace(/p/dest/file")),
+        "no replacing rename: {:?}",
+        calls(fs)
+    );
+}
+
+#[test]
+fn a_fold_in_a_pre_existing_directory_is_refused_even_when_the_first_claim_failed() {
+    assert_existing_fold_refused(&fold_into_existing());
+}
+
+#[test]
+fn a_fold_in_a_pre_existing_directory_is_refused_even_when_the_first_claim_failed_windows_style() {
+    let fs = fold_into_existing();
+    fs.set_replace_renames(true);
+    assert_existing_fold_refused(&fs);
+}
+
+// Cut 8b Task 11: the directory-end flush and the final sync. Each test is red under the one-line mutant named in its
+// comment.
+
+/// `fake()` plus a second directory, `/src/sub2/c`, so a run has two directories below the root.
+fn fake_two_dirs() -> FaultFs {
+    let fs = fake();
+    fs.create_dir(Path::new("/src/sub2")).unwrap();
+    fs.write_file("/src/sub2/c", b"C");
+    fs
+}
+
+/// The number of `claim_flush` calls in the log.
+fn flushes(fs: &FaultFs) -> usize {
+    count(&calls(fs), "claim_flush")
+}
+
+// Mutant: tree.rs `walk_into`'s `DirEnd` arm drops the `(cx.guard)()` call before the flush.
+#[test]
+fn a_directory_end_flushes_after_the_heartbeat_and_the_guard() {
+    let fs = fake();
+    let hooks = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&hooks);
+    let hook: BeforeMutation = Arc::new(move || {
+        seen.fetch_add(1, Ordering::SeqCst);
+    });
+    // The guard hooks counted just before `sub/b`'s claim insert (the 2nd) and just before the flush.
+    let (at_upgrade, at_flush) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (h, u) = (Arc::clone(&hooks), Arc::clone(&at_upgrade));
+    fs.on_nth("claim_insert", 2, move |_| u.store(h.load(Ordering::SeqCst), Ordering::SeqCst));
+    let (h, f) = (Arc::clone(&hooks), Arc::clone(&at_flush));
+    fs.on_nth("claim_flush", 1, move |_| f.store(h.load(Ordering::SeqCst), Ordering::SeqCst));
+    let c = RunConfig { before_mutation: Some(hook), ..beating() };
+    let (r, got) = run_tree(&fs, &c);
+    ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(
+        at_flush.load(Ordering::SeqCst),
+        at_upgrade.load(Ordering::SeqCst) + 1,
+        "exactly one guard between the last claim of `sub` and its flush"
+    );
+    let c = calls(&fs);
+    let upgrade = at(&c, "claim_insert(b)");
+    let beat = after(&c, upgrade, "write_at_start(");
+    let flush = after(&c, upgrade, "claim_flush");
+    assert!(upgrade < beat && beat < flush, "the heartbeat sits between: {c:?}");
+}
+
+// Mutant: the `DirEnd` arm flushes whatever frame it pops, `Frame::Skipped` included.
+#[test]
+fn a_skipped_directory_flushes_nothing() {
+    let fs = dest_fake();
+    fs.add_symlink("/p/dest/sub");
+    let (r, got) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].path, PathBuf::from("sub"));
+    assert_eq!(out.failures.claim_not_recorded, 0);
+    assert_eq!(flushes(&fs), 0, "{:?}", calls(&fs));
+}
+
+// Mutant: the `DirEnd` arm discards the flush error (`let _ = ...flush();`).
+#[test]
+fn a_flush_error_is_claim_not_recorded_for_that_directory_and_the_walk_continues() {
+    let fs = fake_two_dirs();
+    fs.fail_nth("claim_flush", 1, Code::IoError, std::io::ErrorKind::Other);
+    let (r, got) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(matches!(&got[0].cause, TreeFailureCause::ClaimNotRecorded(_)), "{got:?}");
+    assert_eq!(got[0].path, PathBuf::from("sub"));
+    assert_eq!(out.failures.claim_not_recorded, 1);
+    assert_eq!(fs.read_file("/p/dest/sub/b").as_deref(), Some(&b"BB"[..]));
+    assert_eq!(fs.read_file("/p/dest/sub2/c").as_deref(), Some(&b"C"[..]), "the walk continued");
+    assert_eq!(flushes(&fs), 2, "the sibling was flushed too");
+}
+
+// Mutant: the `DirEnd` arm drops the `(cx.guard)()?` line (or ignores its error).
+#[test]
+fn a_lost_lock_aborts_at_the_directory_end_flush() {
+    let fs = fake();
+    // Just before `sub/b`'s claim insert (the 2nd) the lock is taken over; nothing after the insert guards but the
+    // directory end.
+    fs.on_nth("claim_insert", 2, |fs| fs.write_file(LOCK, b"another run's bytes"));
+    let (r, _) = run_tree(&fs, &cfg());
+    assert!(r.stop.is_none(), "the copy's abort is the report: {:?}", r.stop);
+    let a = aborted(&r);
+    assert_eq!(a.error.code(), Code::TargetLockBusy);
+    assert_eq!(flushes(&fs), 0, "no flush, no final sync: {:?}", calls(&fs));
+}
+
+// Mutant: `run::tree` makes the final sync for every `Ended`.
+#[test]
+fn a_clean_run_makes_no_final_sync() {
+    let fs = fake_two_dirs();
+    let (r, got) = run_tree(&fs, &cfg());
+    ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(flushes(&fs), 2, "one per directory, the root excluded: {:?}", calls(&fs));
+}
+
+/// A run that fails after `a` and `sub/b`'s directory were made: the no-replace publish of `sub/b` is unavailable.
+/// `rename_no_replace` calls before it are the workspace's and `a`'s.
+fn failing_run(fs: &FaultFs, nth: u32) {
+    fs.fail_nth("rename_no_replace", nth, Code::IoError, std::io::ErrorKind::Unsupported);
+}
+
+// Mutants: `run::tree` skips the final sync for `Ended::Failed`; it syncs when the heartbeat failed.
+#[test]
+fn a_kept_workspace_after_a_failure_gets_a_final_sync() {
+    let fs = fake();
+    failing_run(&fs, 4);
+    let (r, _) = run_tree(&fs, &cfg());
+    let a = aborted(&r);
+    assert_eq!(a.error.code(), Code::NoReplacePublishUnavailable, "{a:?}");
+    assert_eq!(manifest(&fs, ID).state, OpState::Failed);
+    assert_eq!(flushes(&fs), 1, "the final sync: `sub` never ended: {:?}", calls(&fs));
+    let c = calls(&fs);
+    assert!(at(&c, "claim_insert(a)") < at(&c, "claim_flush"), "{c:?}");
+    assert!(!fs.exists(LOCK), "released");
+
+    // After a failed heartbeat nothing is written: no final sync. The abort is the heartbeat's.
+    let fs = fake();
+    fail_heartbeat(&fs, 2, LOCK, false);
+    let (r, _) = run_tree(&fs, &beating());
+    let a = aborted(&r);
+    assert_eq!(a.error.step, CopyStep::Heartbeat);
+    assert_eq!(flushes(&fs), 0, "{:?}", calls(&fs));
+}
+
+// Mutants: `run::tree` skips the final sync for a completed run with leftovers; it lets a failed one go unreported.
+#[test]
+fn a_completed_run_with_leftovers_gets_a_final_sync_and_reports_its_failure() {
+    let fs = fake();
+    // As `a_temporary_the_copy_could_not_remove_keeps_the_completed_state`; the flushes are `sub`'s (1), then the final
+    // sync's (2), which fails.
+    fs.on_nth("create_new", 4, |fs| fs.fail_write(std::io::Error::other("injected write")));
+    fs.fail_nth("remove_file", 5, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    fs.fail_nth("claim_flush", 2, Code::IoError, std::io::ErrorKind::Other);
+    let (r, got) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert_eq!(flushes(&fs), 2, "{:?}", calls(&fs));
+    let last = got.last().expect("the final sync's failure is streamed");
+    assert!(matches!(&last.cause, TreeFailureCause::ClaimNotRecorded(_)), "{got:?}");
+    assert_eq!(last.path, PathBuf::new(), "the root");
+    assert_eq!((out.failures.claim_not_recorded, out.failures.copy), (1, 1), "{got:?}");
+    assert!(r.warnings.iter().any(|w| matches!(w, RunWarning::StateKept(_))), "{:?}", r.warnings);
+    assert_eq!(manifest(&fs, ID).state, OpState::Completed);
+
+    // Without the injected flush failure the final sync is silent.
+    let fs = fake();
+    fs.on_nth("create_new", 4, |fs| fs.fail_write(std::io::Error::other("injected write")));
+    fs.fail_nth("remove_file", 5, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let (r, got) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert_eq!(flushes(&fs), 2, "{:?}", calls(&fs));
+    assert_eq!(out.failures.claim_not_recorded, 0, "{got:?}");
+}
+
+// Mutants: `run::tree` syncs for `Ended::RefusedUnchanged`; it syncs for `Ended::Lost`.
+#[test]
+fn no_final_sync_after_a_refusal_or_a_lost_lock() {
+    // A refusal: `sub` is DEST by identity, nothing changed, the workspace is removed again.
+    let fs = FaultFs::new();
+    for d in ["/src", "/src/sub", "/p", "/p/dest"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    fs.write_file("/src/sub/b", b"BB");
+    fs.set_identity("/src/sub", fs.metadata(Path::new("/p/dest")).unwrap().identity);
+    let (r, _) = run_tree(&fs, &cfg());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert!(aborted(&r).refused_unchanged());
+    assert_eq!(flushes(&fs), 0, "{:?}", calls(&fs));
+
+    // A lost lock, before the first directory ends and where the walk's own guard notices.
+    let fs = fake();
+    fs.on_nth("create_new", 4, |fs| fs.write_file(LOCK, b"another run's bytes"));
+    let (r, _) = run_tree(&fs, &cfg());
+    assert_eq!(aborted(&r).error.code(), Code::TargetLockBusy);
+    assert_eq!(flushes(&fs), 0, "{:?}", calls(&fs));
 }

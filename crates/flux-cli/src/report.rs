@@ -69,8 +69,13 @@ impl Report {
         let mut r = Self::zero();
         r.files_total = out.files_total;
         r.files_copied = out.files_copied;
-        r.files_skipped = out.special_files_skipped;
+        r.files_skipped = out.special_files_skipped + out.files_skipped;
+        r.files_overwritten = out.files_overwritten;
+        r.bytes_skipped = out.bytes_skipped;
         r.files_degraded = out.files_degraded;
+        // Only `copy` and `symlink` are failed FILES. A `ClaimNotRecorded` failure is counted in
+        // `FailureTally::total()` (so in `errors`) and in `claim_not_recorded`, but not here: the file was published
+        // and counted as copied.
         r.files_failed = out.failures.copy + out.failures.symlink;
         r.bytes_total = out.bytes_copied;
         r.bytes_copied = out.bytes_copied;
@@ -85,8 +90,10 @@ impl Report {
         rep.files_total = 1;
         match r {
             Ok(o) => {
-                rep.files_copied = 1;
-                rep.files_overwritten = u64::from(target_existed);
+                rep.files_skipped = u64::from(o.skipped);
+                rep.files_copied = u64::from(!o.skipped);
+                rep.files_overwritten = u64::from(target_existed && !o.skipped);
+                // `bytes_skipped` stays 0: the engine does not stat the source separately for a single file.
                 rep.files_degraded = u64::from(o.identity_degraded.is_some());
                 rep.bytes_total = o.bytes_copied;
                 rep.bytes_copied = o.bytes_copied;
@@ -175,6 +182,11 @@ pub fn record_lines(f: &TreeFailure) -> Vec<String> {
         TreeFailureCause::PublishedWithComplaints(v) => {
             v.iter().map(|m| complaint_line(&p, m)).collect()
         }
+        TreeFailureCause::ClaimNotRecorded(e) => vec![format!(
+            "{}: {p}: {}; the file was published but its claim was not recorded",
+            e.code.as_str(),
+            e.source
+        )],
     }
 }
 
@@ -226,6 +238,13 @@ pub fn safety_warning_lines(out: &TreeOutcome) -> Vec<String> {
         v.push(format!(
             "warning: the location of {} could not be resolved from its handle; containment was checked lexically only - --safety=strict refuses instead",
             path.display()
+        ));
+    }
+    if let Some(g) = &out.replace_degraded {
+        v.push(format!(
+            "warning: could not key claims in {} directories (e.g. {}); existing files there are reported as collisions - --safety=strict skips them instead",
+            g.count,
+            rel(&g.example)
         ));
     }
     v
@@ -416,12 +435,36 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_not_recorded_failure_is_not_a_failed_file() {
+        let mut out = TreeOutcome::default();
+        out.failures.claim_not_recorded = 1;
+        let r = Report::tree(&out, false, 10);
+        assert_eq!(r.files_failed, 0);
+        assert_eq!(r.errors, 1);
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn a_tree_report_counts_skipped_overwritten_and_skipped_bytes() {
+        let mut out = TreeOutcome::default();
+        out.special_files_skipped = 1;
+        out.files_skipped = 3;
+        out.files_overwritten = 2;
+        out.bytes_skipped = 99;
+        let r = Report::tree(&out, false, 10);
+        assert_eq!(r.files_skipped, 4, "special files plus skipped files");
+        assert_eq!(r.files_overwritten, 2);
+        assert_eq!(r.bytes_skipped, 99);
+    }
+
+    #[test]
     fn a_single_file_report() {
         let ok: Result<Outcome, CopyError> = Ok(Outcome {
             bytes_copied: 5,
             metadata_failures: Vec::new(),
             identity_degraded: Some(FileIdentity::Unavailable),
             published_identity: flux_fs::FileIdentity::Unavailable,
+            skipped: false,
         });
         let r = Report::file(&ok, true, 0);
         assert_eq!((r.files_total, r.files_copied, r.files_overwritten), (1, 1, 1));
@@ -445,9 +488,25 @@ mod tests {
             metadata_failures: Vec::new(),
             identity_degraded: None,
             published_identity: flux_fs::FileIdentity::Unavailable,
+            skipped: false,
         });
         let r = Report::file(&ok, false, 0);
         assert_eq!((r.files_copied, r.files_overwritten), (1, 0));
+    }
+
+    #[test]
+    fn a_skipped_single_file_reports_one_skipped_and_none_copied() {
+        let skipped: Result<Outcome, CopyError> = Ok(Outcome {
+            skipped: true,
+            bytes_copied: 0,
+            metadata_failures: Vec::new(),
+            identity_degraded: None,
+            published_identity: flux_fs::FileIdentity::Unavailable,
+        });
+        let r = Report::file(&skipped, true, 0);
+        assert_eq!((r.files_total, r.files_skipped, r.files_copied), (1, 1, 0));
+        assert_eq!((r.files_overwritten, r.files_failed, r.errors), (0, 0, 0));
+        assert_eq!(r.bytes_skipped, 0);
     }
 
     #[test]
@@ -500,6 +559,17 @@ mod tests {
             line("a", TreeFailureCause::PublishedWithComplaints(v)),
             ["METADATA_APPLY_FAILED: a: times: no", "METADATA_APPLY_FAILED: a: permissions: no"]
         );
+        assert_eq!(
+            line(
+                "sub/a",
+                TreeFailureCause::ClaimNotRecorded(FsError::new(Code::IoError, io("disk full")))
+            ),
+            ["IO_ERROR: sub/a: disk full; the file was published but its claim was not recorded"]
+        );
+        assert_eq!(
+            line("", TreeFailureCause::ClaimNotRecorded(FsError::new(Code::IoError, io("sync")))),
+            ["IO_ERROR: .: sync; the file was published but its claim was not recorded"]
+        );
     }
 
     #[test]
@@ -525,24 +595,30 @@ mod tests {
         let mut out = TreeOutcome::default();
         out.mount_unknown = Some(DegradedGroup { count: 2, example: PathBuf::from("sub") });
         out.containment_degraded = Some(PathBuf::from("/p"));
+        out.replace_degraded = Some(DegradedGroup { count: 4, example: PathBuf::from("d") });
         let v = safety_warning_lines(&out);
-        assert_eq!(v.len(), 2);
+        assert_eq!(v.len(), 3);
         for needle in ["mount root", "2 checks", "e.g. sub", "--safety=strict"] {
             assert!(v[0].contains(needle), "{needle}: {}", v[0]);
         }
         for needle in ["/p", "lexically", "--safety=strict"] {
             assert!(v[1].contains(needle), "{needle}: {}", v[1]);
         }
+        assert_eq!(
+            v[2],
+            "warning: could not key claims in 4 directories (e.g. d); existing files there are reported as collisions - --safety=strict skips them instead"
+        );
         assert!(safety_warning_lines(&TreeOutcome::default()).is_empty());
 
         // The order is pinned where it is decided: identity lines first, then these two.
         out.warnings.unavailable = Some(DegradedGroup { count: 1, example: PathBuf::new() });
         let all = tree_warning_lines(&out);
-        assert_eq!(all.len(), 3);
+        assert_eq!(all.len(), 4);
         assert!(
             all[0].contains("identity")
                 && all[1].contains("mount root")
-                && all[2].contains("lexically"),
+                && all[2].contains("lexically")
+                && all[3].contains("could not key claims"),
             "{all:?}"
         );
     }
@@ -724,6 +800,7 @@ mod tests {
                 metadata_failures: Vec::new(),
                 identity_degraded: None,
                 published_identity: flux_fs::FileIdentity::Unavailable,
+                skipped: false,
             })
         };
         assert_eq!(Report::file_run(&run(Some(copied()), None), false, 1).errors, 0);

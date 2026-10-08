@@ -216,11 +216,13 @@ Each was measured, and each is deliberately NOT fixed in that PR.
       (measured, cut 4a test audit): the only leftover test uses `/dst`, where the two agree. `FaultFs`
       refuses relative paths by design, so the test needs a working directory in the fake or a
       real-filesystem fixture that can make removal fail. Owner deferred 2026-09-26.
-- [ ] **A tree copy never replaces an existing destination file.** `copy_tree` publishes every file
-      no-replace and reports an existing one `DESTINATION_NAMESPACE_COLLISION`, untouched (cut 4b, F3),
-      because §241.5's replacement claim needs the durable `state.db` of the operation workspace. So
-      §5.1's default `--overwrite` is unmet for directories until that store exists; `flux copy dir
-      existing-dir` reports one collision per pre-existing file.
+- [x] **A tree copy never replaces an existing destination file — DONE in cut 8b (branch `spec/cut-8b`, no PR yet).**
+      Was: `copy_tree` published every file no-replace and reported an existing one
+      `DESTINATION_NAMESPACE_COLLISION`, untouched (cut 4b, F3), because §241.5's replacement claim needs the
+      durable `state.db` of the operation workspace. Now a folder copy replaces an existing destination file by
+      default (§5.1's `--overwrite`), under a claim recorded in `state.db`; `--update` and `--skip-existing`
+      select the other two policies. Design: `docs/superpowers/specs/2026-10-07-cut-8b-replacement-design.md`.
+      The lockless `copy_tree` stays no-replace. Open follow-ups: "Cut 8b known limits" and "Cut 8b debt".
 - [ ] **`flux copy --json`'s `bytes_total` counts copied bytes only.** The walk never stats a file, so
       a failed file's size is unknown; a pre-scan would double metadata I/O (owner, cut 5). `--help`
       says so.
@@ -306,6 +308,76 @@ From the final review of cut 8a; none is a reachable defect without a race or pr
 - [ ] **An early stop drops the containment warnings.** When the run stops before the copy (for example a probe
       refusal), `run.copy` is `None`, so `containment_degraded` and the identity warnings set in `locate_tree` are
       never printed (the tree job in `main.rs`).
+
+## Cut 8b known limits
+
+Recorded by cut 8b (`docs/superpowers/specs/2026-10-07-cut-8b-replacement-design.md`, "Known limits"; the numbers
+are the spec's).
+
+- [ ] **1. A crash between a publish rename and its claim write** leaves an unclaimed published entry until the WAL cut.
+- [ ] **2. Not in this cut:** resume, `PREPARE_COMMIT` / `COMMIT` and commit recovery (sections 182-184), hardlink
+      groups (section 253.7), `--atomic`, `--dry-run` and the TLA+ `claims` scenario.
+- [ ] **3. WSL 9p and network filesystems:** whether the backend's (`redb`) file locking works there is unmeasured.
+- [ ] **4. A directory with millions of entries** holds its listing in memory while the walk is inside it (the source
+      side already does).
+- [ ] **4a. Under `Durability::Normal` a process kill can lose the current directory's claims** (up to 1000 commits):
+      documented, reconciled by the WAL cut.
+- [ ] **5. A replacement reads the destination's metadata twice** (the policy decision, then the section 129 gate): one
+      extra stat per replaced file, accepted. If an outside process removes the entry between the two reads, the gate
+      sees `NotFound`, the claim is still written and the file is published as new but counted as an overwrite (the
+      bounded window `copy.rs` `identity_gate` documents). It never overwrites anything the engine did not plan to
+      replace.
+- [ ] **6. The claim insertion and the claim upgrade live in two modules:** insertion in the copy path
+      (`before_create`), the upgrade and frame update in `tree.rs` after the copy path returns. Accepted, to keep the
+      claim after the gate and guard.
+- [ ] **7. A junction at the destination name on case-insensitive Windows:** `metadata` reports it as a link; whether
+      `rename_replace` of a file over it fails or replaces the junction itself is unmeasured (see the debt entry below).
+      Required outcome: a per-target result, never a traversal of the junction.
+- [ ] **8. A hardlink alias on a case-insensitive destination:** an alias of an existing entry in the same directory
+      makes the alias's target fail rather than replace (no unique identity match).
+- [ ] **9. Closing the claim store always commits:** `redb` 4.3.0 `Database::drop` is an `Immediate` write commit plus
+      a header fsync, so `state.db` is written and synced once on every path, including `Lost` (a write without
+      ownership, though only to this run's own workspace file) and a clean `Completed`; the spec's "never on a clean
+      `Completed` / `Lost`" covers only the explicit final sync. A non-committing close needs `redb` support or a
+      different backend.
+- [ ] **10. A FIFO, device or other special file at a destination name** is replaced like a regular file by a
+      replacement (spec section 4 is silent). A later cut may refine it.
+- [ ] **11. In a weak-identity destination directory `--skip-existing`** reports existing files as collisions (exit 1)
+      instead of skipping, as the spec text says. A later cut may refine it.
+- [ ] **12. A destination entry changed by an external process during the payload transfer is overwritten.** The
+      identity gate (section 129) runs before the bytes stream and `rename_replace` publishes after; Flux does not
+      re-stat the destination in between, and does not lock against non-Flux actors. The claim serializes Flux's own
+      targets only. Same model as the existing Walker TOCTOU entry; named by capstone round 2 of cut 8b.
+
+## Cut 8b debt
+
+- [ ] **Closing the redb claim store always commits** (known limit 9): a non-committing close needs `redb` support or
+      a different backend; the `Lost`-path close is a write without ownership.
+- [ ] **Propose the section 241.5 clarifications to the spec owner.** Cut 8b made these choices where the spec is
+      silent: the claim key is the parent directory's identity plus the stored entry name; a claim is never released; a
+      claim is written before the temporary is created and after the section 129 gate; a published new entry gets a
+      `Created` claim (the upgrade of the target's own record, plus a second claim for a differing spelling after
+      publication); a directory whose identity is not `Strong` degrades to no-replace.
+- [ ] **The unsynced-claim window.** Under `Durability::Normal`, claims written since the last directory end or the
+      store's 1000-claim cap are lost on a process crash. The WAL cut must reconcile "unclaimed published entries".
+- [ ] **`state.db` is created right after the workspace is published** (Windows refuses to rename a directory that
+      contains an open file). A crash between the publish and the creation leaves a manifest-only workspace that
+      `--restart` supersedes.
+- [ ] **The Windows outcome of `rename_replace` of a file over a directory junction is not recorded.** The test
+      `a_file_over_a_junction_at_the_destination_name` pins only that nothing is written through the junction. Read the
+      observed outcome from a CI run with output capture, then pin it.
+- [ ] **The Windows kill test is slow.** `claims_kill` (`crates/flux-platform/tests/claims_kill.rs`) takes about 5
+      minutes on windows-latest (strict mode, an fsync per claim, 24 thresholds). Trim the thresholds in strict mode, or
+      run it on a schedule.
+- [ ] **`redb` file locking on network or 9p mounts is unmeasured** (known limit 3).
+- [ ] **The macOS case-folding comparison** stays the existing debt: see "Part A's containment compare is
+      case-sensitive" under "Cut 8a debt".
+- [ ] **The fake `FaultFs` case-insensitive mode is ASCII-only** and does not normalize `read_file`, `remove_dir`,
+      `create_lock`, `open_lock`, `create_claim_store` or the path-level `open_read`.
+- [ ] **Nothing pins the claim store's cache bound.** Removing `Builder::set_cache_size(CACHE_BYTES)` in
+      `crates/flux-platform/src/claims.rs` leaves every test green (measured at `6bee900`; redb has no cache-size
+      getter, only `cache_stats()`). A pin would insert enough claims to exceed 16 MiB of pages and assert
+      `evictions > 0`; it was left out as slow (the AGY-TEST-AUDIT gap, deferred by the controller pending the owner).
 
 ## Scaffolding follow-ups
 

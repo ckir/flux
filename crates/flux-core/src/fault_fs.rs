@@ -5,8 +5,9 @@
 //! named call. None of that is reachable against a real disk.
 
 use flux_fs::{
-    Code, DestinationRoot, DirEntry, DirHandle, FileHandle, FileSystem, FileType, FsError,
-    LockCapability, LockFile, Metadata, MountRoot, Perms, Result, check_component,
+    ClaimKey, ClaimOutcome, ClaimRecord, ClaimStore, Code, DestinationRoot, DirEntry, DirHandle,
+    Durability, FileHandle, FileSystem, FileType, FluxPathKey, FsError, LockCapability, LockFile,
+    Metadata, MountRoot, Perms, Result, check_component,
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -57,6 +58,11 @@ struct Inner {
     /// assumes it. Setting it `false` is how the engine cut exercises a destination
     /// whose filesystem cannot make the promise, without owning such a filesystem.
     no_replace_support: Option<bool>,
+    /// Name lookup folds ASCII case (`set_case_insensitive`). Default false.
+    case_insensitive: bool,
+    /// With `case_insensitive`: a `rename_replace` over an entry stored under another spelling takes the NEW spelling
+    /// (`set_replace_renames`). Default false: the old spelling is kept.
+    replace_renames: bool,
     perms: HashMap<PathBuf, Option<Perms>>,
     /// consumed by the next `write` on a handle from `create_new`
     write_fault: Option<std::io::Error>,
@@ -109,6 +115,97 @@ struct Inner {
     open_locks: HashMap<u128, u32>,
     /// Paths removed while a lock handle was open under legacy delete: still occupying their name, found by nothing.
     pending: HashSet<PathBuf>,
+    /// Every claim store `create_claim_store` made, in creation order. Each holds the encoded claims (`ClaimKey::encode`
+    /// -> `ClaimRecord::encode`), the encodings of the real store.
+    claim_stores: Vec<ClaimMap>,
+    /// Fake claim stores created and not yet dropped (`claim_stores_open`).
+    claim_stores_open: usize,
+    /// `claim_stores_open` when a handle last asked to remove a file named `state.db`.
+    open_at_state_db_removal: Option<usize>,
+}
+
+type ClaimMap = std::sync::Arc<Mutex<std::collections::BTreeMap<Vec<u8>, Vec<u8>>>>;
+
+/// The fake's claim store: the real store's key and value encodings over an in-memory map, with the call log and the
+/// fault keys `claim_insert`, `claim_upgrade`, `claim_flush`.
+pub struct FakeClaimStore {
+    map: ClaimMap,
+    inner: std::sync::Arc<Mutex<Inner>>,
+}
+
+impl Drop for FakeClaimStore {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.claim_stores_open -= 1;
+        }
+    }
+}
+
+impl FakeClaimStore {
+    fn record(&self, call: String, key: &str) -> Result<()> {
+        FaultFs { inner: std::sync::Arc::clone(&self.inner) }.record(call, key)
+    }
+}
+
+fn corrupt_claim() -> FsError {
+    FsError::new(Code::IoError, std::io::Error::other("undecodable claim record"))
+}
+
+impl ClaimStore for FakeClaimStore {
+    fn insert_if_absent(&mut self, key: &ClaimKey, record: &ClaimRecord) -> Result<ClaimOutcome> {
+        self.record(
+            format!("claim_insert({})", String::from_utf8_lossy(&key.name)),
+            "claim_insert",
+        )?;
+        let mut m = self.map.lock().unwrap();
+        let k = key.encode();
+        match m.get(&k) {
+            Some(v) => Ok(ClaimOutcome::Present(ClaimRecord::decode(v).ok_or_else(corrupt_claim)?)),
+            None => {
+                m.insert(k, record.encode());
+                Ok(ClaimOutcome::Inserted)
+            }
+        }
+    }
+
+    fn get(&self, key: &ClaimKey) -> Result<Option<ClaimRecord>> {
+        let m = self.map.lock().unwrap();
+        match m.get(&key.encode()) {
+            Some(v) => Ok(Some(ClaimRecord::decode(v).ok_or_else(corrupt_claim)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn upgrade_own_claim(&mut self, key: &ClaimKey, target: &FluxPathKey) -> Result<()> {
+        self.record(
+            format!("claim_upgrade({})", String::from_utf8_lossy(&key.name)),
+            "claim_upgrade",
+        )?;
+        let mut m = self.map.lock().unwrap();
+        let k = key.encode();
+        let stored = match m.get(&k) {
+            Some(v) => ClaimRecord::decode(v).ok_or_else(corrupt_claim)?,
+            None => {
+                return Err(FsError::new(
+                    Code::IoError,
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "no such claim"),
+                ));
+            }
+        };
+        if stored.target != *target {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::other("the claim belongs to another target"),
+            ));
+        }
+        let upgraded = ClaimRecord { target: stored.target, status: flux_fs::ClaimStatus::Created };
+        m.insert(k, upgraded.encode());
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.record("claim_flush".to_string(), "claim_flush")
+    }
 }
 
 /// One node in the `DirHandle` graph, addressed by an opaque id rather than by
@@ -174,6 +271,39 @@ fn mint_identity(g: &mut Inner, path: &Path) {
     g.identities.insert(path.to_path_buf(), flux_fs::FileIdentity::Strong(id));
 }
 
+/// The path with each component replaced by the STORED spelling of an existing sibling that matches it ASCII
+/// case-insensitively (an exact match wins). Identity when the mode is off, and for a component with no such sibling
+/// (the leaf of a create, for instance, keeps the spelling it was asked for).
+fn stored(g: &Inner, path: &Path) -> PathBuf {
+    if !g.case_insensitive {
+        return path.to_path_buf();
+    }
+    let mut cur = PathBuf::new();
+    for comp in path.components() {
+        let std::path::Component::Normal(name) = comp else {
+            cur.push(comp.as_os_str());
+            continue;
+        };
+        let mut found: Option<&OsStr> = None;
+        for key in g.files.keys().chain(g.directories.iter()) {
+            if key.parent() != Some(cur.as_path()) {
+                continue;
+            }
+            let Some(n) = key.file_name() else { continue };
+            if n == name {
+                found = Some(n);
+                break;
+            }
+            if found.is_none() && n.as_encoded_bytes().eq_ignore_ascii_case(name.as_encoded_bytes())
+            {
+                found = Some(n);
+            }
+        }
+        cur.push(found.unwrap_or(name));
+    }
+    cur
+}
+
 /// Forget a removed file: its bytes and everything keyed by its path, so a later object at the path starts fresh.
 fn purge(g: &mut Inner, path: &Path) {
     g.files.remove(path);
@@ -211,6 +341,16 @@ fn move_object(g: &mut Inner, from: &Path, to: &Path) {
         }
         None => {
             g.perms.remove(to);
+        }
+    }
+    // The type is the object's too: a regular file renamed over a symlink leaves a regular file at the name, not the
+    // link (cut 8b: a symlink at the destination is replaced as a link).
+    match g.types.remove(from) {
+        Some(v) => {
+            g.types.insert(to.to_path_buf(), v);
+        }
+        None => {
+            g.types.remove(to);
         }
     }
     // Identity follows the OBJECT, not the name: a real filesystem preserves the inode
@@ -520,6 +660,31 @@ impl FaultFs {
         self.inner.lock().unwrap().always.insert(name.to_string(), code);
     }
 
+    /// Fake claim stores created from this fake and not yet dropped.
+    pub fn claim_stores_open(&self) -> usize {
+        self.inner.lock().unwrap().claim_stores_open
+    }
+
+    /// The number of open fake claim stores when a handle last removed a `state.db`; `None` if none was removed.
+    pub fn claim_stores_open_at_last_state_db_removal(&self) -> Option<usize> {
+        self.inner.lock().unwrap().open_at_state_db_removal
+    }
+
+    /// Claims across every store created from this fake.
+    pub fn claim_count(&self) -> usize {
+        let g = self.inner.lock().unwrap();
+        g.claim_stores.iter().map(|m| m.lock().unwrap().len()).sum()
+    }
+
+    /// The claim at `(parent, name)` in any store created from this fake.
+    pub fn claim(&self, parent: flux_fs::ObjectId, name: &str) -> Option<ClaimRecord> {
+        let k = ClaimKey::new(parent, OsStr::new(name)).encode();
+        let g = self.inner.lock().unwrap();
+        g.claim_stores
+            .iter()
+            .find_map(|m| m.lock().unwrap().get(&k).and_then(|v| ClaimRecord::decode(v)))
+    }
+
     pub fn calls(&self) -> Vec<String> {
         self.inner.lock().unwrap().calls.clone()
     }
@@ -612,6 +777,38 @@ impl FaultFs {
     /// without a filesystem that genuinely lacks one.
     pub fn set_no_replace_support(&self, supported: bool) {
         self.inner.lock().unwrap().no_replace_support = Some(supported);
+    }
+
+    /// Name lookup folds ASCII case (the fake's stand-in for NTFS/APFS/casefold): every path argument of `metadata`,
+    /// `create_new`, `create_dir`, `rename_*` (both paths), `remove_file` and `read_dir` has each component replaced by the
+    /// STORED spelling of an existing sibling that matches it case-insensitively. Default false. The `DirHandle`
+    /// operations delegate to those methods, so they follow the mode too. The call log shows the NORMALIZED path.
+    ///
+    /// NOT normalized (they take the spelling asked for): `read_file`, `remove_dir`, `create_lock`, `open_lock`,
+    /// `create_claim_store`, the path-level `open_read`, and the test helpers `write_file`, `read_file` and `exists`.
+    /// The folding is ASCII-only. `stored()` is UNSPECIFIED, not deterministic across runs, when two existing entries
+    /// differ only by case and neither equals the requested spelling (the maps it scans have no order).
+    pub fn set_case_insensitive(&self, on: bool) {
+        self.inner.lock().unwrap().case_insensitive = on;
+    }
+
+    /// With `set_case_insensitive(true)`: a `rename_replace` over an entry stored under another spelling makes the entry take
+    /// the NEW spelling (Windows). Default false: the OLD spelling is kept (Linux and macOS, measured).
+    pub fn set_replace_renames(&self, on: bool) {
+        self.inner.lock().unwrap().replace_renames = on;
+    }
+
+    /// `path` with each component in its stored spelling (identity unless the mode is on).
+    fn norm(&self, path: &Path) -> PathBuf {
+        stored(&self.inner.lock().unwrap(), path)
+    }
+
+    /// Like `norm`, but the LEAF keeps the spelling asked for: the name a replacing rename gives the entry on Windows.
+    fn norm_keep_leaf(&self, path: &Path) -> PathBuf {
+        match (path.parent(), path.file_name()) {
+            (Some(parent), Some(leaf)) => self.norm(parent).join(leaf),
+            _ => path.to_path_buf(),
+        }
     }
 
     /// Make `metadata` report `path` as something other than a regular file -- a
@@ -746,7 +943,7 @@ impl FileSystem for FaultFs {
     }
 
     fn create_new(&self, path: &Path) -> Result<Self::Writer> {
-        let p = path.to_path_buf();
+        let p = self.norm(path);
         self.record(format!("create_new({})", p.display()), "create_new")?;
         let mut g = self.inner.lock().unwrap();
         // A DIRECTORY occupies the name too, and this used to check only `files`.
@@ -781,7 +978,7 @@ impl FileSystem for FaultFs {
     }
 
     fn metadata(&self, path: &Path) -> Result<Metadata> {
-        let p = path.to_path_buf();
+        let p = self.norm(path);
         self.record(format!("metadata({})", p.display()), "metadata")?;
         let mut g = self.inner.lock().unwrap();
         if g.pending.contains(&p) {
@@ -851,7 +1048,8 @@ impl FileSystem for FaultFs {
     }
 
     fn rename_replace(&self, from: &Path, to: &Path) -> Result<()> {
-        let (f, t) = (from.to_path_buf(), to.to_path_buf());
+        let (f, t) = (self.norm(from), self.norm(to));
+        let requested = self.norm_keep_leaf(to);
         self.record(
             format!("rename_replace({} -> {})", f.display(), t.display()),
             "rename_replace",
@@ -863,11 +1061,15 @@ impl FileSystem for FaultFs {
             "the fake moves a directory only through rename_no_replace (cut 7a Part 3a, decision 10)"
         );
         move_object(&mut g, &f, &t);
+        if g.replace_renames && requested != t {
+            // Windows: the replaced entry takes the NEW spelling.
+            move_object(&mut g, &t, &requested);
+        }
         Ok(())
     }
 
     fn rename_no_replace(&self, from: &Path, to: &Path) -> Result<()> {
-        let (f, t) = (from.to_path_buf(), to.to_path_buf());
+        let (f, t) = (self.norm(from), self.norm(to));
         self.record(
             format!("rename_no_replace({} -> {})", f.display(), t.display()),
             "rename_no_replace",
@@ -898,7 +1100,7 @@ impl FileSystem for FaultFs {
     }
 
     fn remove_file(&self, path: &Path) -> Result<()> {
-        let p = path.to_path_buf();
+        let p = self.norm(path);
         self.record(format!("remove_file({})", p.display()), "remove_file")?;
         // NotFound when it is not there, because `std::fs::remove_file` does that and
         // `discard` branches on it. A fake that returned Ok here would make that
@@ -925,7 +1127,7 @@ impl FileSystem for FaultFs {
     }
 
     fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>> {
-        let p = path.to_path_buf();
+        let p = self.norm(path);
         self.record(format!("read_dir({})", p.display()), "read_dir")?;
         let g = self.inner.lock().unwrap();
         if !g.directories.contains(&p) {
@@ -971,7 +1173,7 @@ impl FileSystem for FaultFs {
             "FaultFs models a rooted filesystem and has no working directory, so a \
              relative path cannot be created in it: {path:?}"
         );
-        let p = path.to_path_buf();
+        let p = self.norm(path);
         self.record(format!("create_dir({})", p.display()), "create_dir")?;
         let mut g = self.inner.lock().unwrap();
         if g.directories.contains(&p) || g.files.contains_key(&p) {
@@ -1090,6 +1292,7 @@ impl FakeDirHandle {
 impl DirHandle for FakeDirHandle {
     type Writer = FakeHandle;
     type Lock = FakeLock;
+    type Claims = FakeClaimStore;
 
     fn mount_root(&self, _parent: &Self) -> Result<MountRoot> {
         let path = self.my_path();
@@ -1138,7 +1341,7 @@ impl DirHandle for FakeDirHandle {
                 return Ok(Self { id: child_id, inner: std::sync::Arc::clone(&self.inner) });
             }
         }
-        let child_path = self.my_path().join(name);
+        let child_path = self.fs().norm(&self.my_path().join(name));
         // A MISSING COMPONENT IS A DESTINATION ERROR, which is what both real arms
         // answer and what their `a_missing_component_is_a_destination_error` tests
         // pin. The fake reported whatever `metadata` reported -- IoError/NotFound --
@@ -1195,7 +1398,7 @@ impl DirHandle for FakeDirHandle {
 
     fn remove_file(&self, name: &OsStr) -> Result<()> {
         check_component(name)?;
-        let child_path = self.my_path().join(name);
+        let child_path = self.fs().norm(&self.my_path().join(name));
         // REFUSE A DIRECTORY, with the kind both real arms use. MEASURED before
         // this: the fake answered NotFound here -- it refused, but only because it
         // found no FILE at the name, never because the object was a directory.
@@ -1215,6 +1418,10 @@ impl DirHandle for FakeDirHandle {
                     ),
                 ));
             }
+        }
+        if name == OsStr::new("state.db") {
+            let mut g = self.inner.lock().unwrap();
+            g.open_at_state_db_removal = Some(g.claim_stores_open);
         }
         self.fs().remove_file(&child_path)
     }
@@ -1254,6 +1461,28 @@ impl DirHandle for FakeDirHandle {
             mint_identity(&mut g, &child_path);
         }
         self.lock_for(&child_path)
+    }
+
+    fn create_claim_store(&self, name: &OsStr, _durability: Durability) -> Result<Self::Claims> {
+        check_component(name)?;
+        let child_path = self.my_path().join(name);
+        self.fs().record(
+            format!("create_claim_store({})", child_path.display()),
+            "create_claim_store",
+        )?;
+        let mut g = self.inner.lock().unwrap();
+        if g.files.contains_key(&child_path) || g.directories.contains(&child_path) {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+            ));
+        }
+        g.files.insert(child_path.clone(), Vec::new());
+        mint_identity(&mut g, &child_path);
+        let map = ClaimMap::default();
+        g.claim_stores.push(std::sync::Arc::clone(&map));
+        g.claim_stores_open += 1;
+        Ok(FakeClaimStore { map, inner: std::sync::Arc::clone(&self.inner) })
     }
 
     fn open_lock(&self, name: &OsStr) -> Result<Self::Lock> {
@@ -2244,5 +2473,272 @@ mod tests {
         assert!(matches!(held, FileIdentity::Strong(_)));
         p.rename_replace(OsStr::new("t.tmp"), &p, OsStr::new("t")).unwrap();
         assert_eq!(fs.metadata(Path::new("/p/t")).unwrap().identity, held);
+    }
+
+    #[test]
+    fn the_fake_claim_store_passes_the_conformance_suite() {
+        use flux_fs::{DestinationRoot, DirHandle, Durability};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let n = std::cell::Cell::new(0u32);
+        flux_fs::claims::conformance::run_all(|| {
+            n.set(n.get() + 1);
+            let name = format!("state{}.db", n.get());
+            d.create_claim_store(OsStr::new(&name), Durability::Normal).unwrap()
+        });
+    }
+
+    #[test]
+    fn create_claim_store_refuses_a_taken_name() {
+        use flux_fs::{DestinationRoot, DirHandle, Durability};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let _first = d.create_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap();
+        assert!(fs.exists("/d/state.db"), "an empty file entry is visible at the path");
+        assert!(
+            fs.calls().iter().any(|c| c.replace('\\', "/") == "create_claim_store(/d/state.db)"),
+            "the call log names the path: {:?}",
+            fs.calls()
+        );
+        let err = match d.create_claim_store(OsStr::new("state.db"), Durability::Normal) {
+            Err(e) => e,
+            Ok(_) => panic!("a taken name must be refused"),
+        };
+        assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn a_claim_fault_is_injected_and_consumed() {
+        use flux_fs::{
+            ClaimKey, ClaimRecord, ClaimStatus, ClaimStore, DestinationRoot, DirHandle, Durability,
+            FluxPathKey, ObjectId,
+        };
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let mut s = d.create_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap();
+        let key = ClaimKey::new(ObjectId { volume: 1, index: 1 }, OsStr::new("a"));
+        let rec = ClaimRecord { target: FluxPathKey(b"a".to_vec()), status: ClaimStatus::Existing };
+        fs.fail("claim_insert", Code::IoError);
+        assert!(s.insert_if_absent(&key, &rec).is_err());
+        assert!(s.insert_if_absent(&key, &rec).is_ok(), "the fault is consumed");
+        assert!(fs.called("claim_insert(a)"));
+        fs.fail("claim_upgrade", Code::IoError);
+        assert!(s.upgrade_own_claim(&key, &rec.target).is_err());
+        assert!(s.upgrade_own_claim(&key, &rec.target).is_ok());
+        assert!(fs.called("claim_upgrade(a)"));
+        fs.fail("claim_flush", Code::IoError);
+        assert!(s.flush().is_err());
+        assert!(s.flush().is_ok());
+        assert!(fs.called("claim_flush"));
+    }
+
+    #[test]
+    fn claims_are_visible_through_the_fake_accessors() {
+        use flux_fs::{
+            ClaimKey, ClaimRecord, ClaimStatus, ClaimStore, DestinationRoot, DirHandle, Durability,
+            FluxPathKey, ObjectId,
+        };
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let mut s = d.create_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap();
+        assert_eq!(fs.claim_count(), 0);
+        let parent = ObjectId { volume: 1, index: 9 };
+        let rec = ClaimRecord { target: FluxPathKey(b"t".to_vec()), status: ClaimStatus::Existing };
+        s.insert_if_absent(&ClaimKey::new(parent, OsStr::new("x")), &rec).unwrap();
+        assert_eq!(fs.claim_count(), 1);
+        assert_eq!(fs.claim(parent, "x"), Some(rec.clone()));
+        assert_eq!(fs.claim(parent, "y"), None);
+        s.upgrade_own_claim(&ClaimKey::new(parent, OsStr::new("x")), &rec.target).unwrap();
+        assert_eq!(fs.claim(parent, "x").unwrap().status, ClaimStatus::Created);
+    }
+
+    // ---- case-insensitive mode (cut 8b, Task 6) ----
+
+    fn ci_fs() -> FaultFs {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.write_file("/d/file.txt", b"old");
+        fs
+    }
+
+    /// Exact match on a logged call, separator-insensitive: the fake joins paths with `Path::join`, which yields
+    /// backslashes on Windows.
+    fn called_norm(fs: &FaultFs, call: &str) -> bool {
+        fs.calls().iter().any(|c| c.replace('\\', "/") == call)
+    }
+
+    fn names(fs: &FaultFs, dir: &str) -> Vec<String> {
+        let mut v: Vec<String> = fs
+            .read_dir(Path::new(dir))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name.to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn a_lookup_by_another_case_finds_the_entry_with_the_same_identity() {
+        let fs = ci_fs();
+        // Sensitive default: another spelling is another (absent) name.
+        let e = fs.metadata(Path::new("/d/FILE.TXT")).unwrap_err();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::NotFound);
+        fs.set_case_insensitive(true);
+        let a = fs.metadata(Path::new("/d/file.txt")).unwrap();
+        let b = fs.metadata(Path::new("/d/FILE.TXT")).unwrap();
+        assert_eq!(a.identity, b.identity);
+        assert_eq!(a.len, b.len);
+        // A directory component folds too, and the log shows the NORMALIZED path.
+        let c = fs.metadata(Path::new("/D/File.Txt")).unwrap();
+        assert_eq!(a.identity, c.identity);
+        assert!(called_norm(&fs, "metadata(/d/file.txt)"));
+        assert!(!called_norm(&fs, "metadata(/D/File.Txt)"));
+    }
+
+    #[test]
+    fn create_new_over_another_case_is_already_exists() {
+        let fs = ci_fs();
+        fs.set_case_insensitive(true);
+        let e = fs.create_new(Path::new("/d/FILE.TXT")).err().unwrap();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists);
+        let e = fs.create_dir(Path::new("/d/FILE.TXT")).unwrap_err();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(names(&fs, "/d"), vec!["file.txt"]);
+    }
+
+    #[test]
+    fn rename_no_replace_onto_another_case_is_already_exists() {
+        let fs = ci_fs();
+        fs.write_file("/d/src", b"new");
+        fs.set_case_insensitive(true);
+        let e = fs.rename_no_replace(Path::new("/d/src"), Path::new("/d/FILE.TXT")).unwrap_err();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs.read_file("/d/file.txt"), Some(b"old".to_vec()));
+    }
+
+    #[test]
+    fn rename_replace_over_another_case_keeps_the_old_spelling_by_default() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.write_file("/d/FILE.TXT", b"old");
+        fs.write_file("/d/src", b"new");
+        fs.set_case_insensitive(true);
+        fs.rename_replace(Path::new("/d/src"), Path::new("/d/file.txt")).unwrap();
+        assert_eq!(names(&fs, "/d"), vec!["FILE.TXT"]);
+        assert_eq!(fs.read_file("/d/FILE.TXT"), Some(b"new".to_vec()));
+    }
+
+    #[test]
+    fn rename_replace_renames_when_asked() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.write_file("/d/FILE.TXT", b"old");
+        fs.write_file("/d/src", b"new");
+        fs.set_case_insensitive(true);
+        fs.set_replace_renames(true);
+        fs.rename_replace(Path::new("/d/src"), Path::new("/d/file.txt")).unwrap();
+        assert_eq!(names(&fs, "/d"), vec!["file.txt"]);
+        assert_eq!(fs.read_file("/d/file.txt"), Some(b"new".to_vec()));
+        assert!(!fs.exists("/d/FILE.TXT"));
+    }
+
+    #[test]
+    fn read_dir_returns_stored_spellings() {
+        let fs = ci_fs();
+        fs.create_dir(Path::new("/d/Sub")).unwrap();
+        fs.set_case_insensitive(true);
+        // The directory is named in another case; the entries come back as stored.
+        assert_eq!(names(&fs, "/D"), vec!["Sub", "file.txt"]);
+        assert!(called_norm(&fs, "read_dir(/d)"));
+    }
+
+    #[test]
+    fn the_mode_is_off_by_default() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.write_file("/d/a", b"1");
+        fs.write_file("/d/A", b"2");
+        assert_eq!(names(&fs, "/d"), vec!["A", "a"]);
+        assert_eq!(fs.read_file("/d/a"), Some(b"1".to_vec()));
+        assert_eq!(fs.read_file("/d/A"), Some(b"2".to_vec()));
+    }
+
+    #[test]
+    fn handle_metadata_follows_the_case_insensitive_mode() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        let fs = ci_fs();
+        fs.set_case_insensitive(true);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let a = d.metadata(OsStr::new("file.txt")).unwrap();
+        let b = d.metadata(OsStr::new("FILE.TXT")).unwrap();
+        assert_eq!(a.identity, b.identity);
+    }
+
+    #[test]
+    fn handle_create_new_follows_the_case_insensitive_mode() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        let fs = ci_fs();
+        fs.set_case_insensitive(true);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let e = d.create_new(OsStr::new("FILE.TXT")).err().unwrap();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn handle_rename_replace_follows_the_case_insensitive_mode() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        for (renames, want) in [(false, "FILE.TXT"), (true, "file.txt")] {
+            let fs = FaultFs::new();
+            fs.create_dir(Path::new("/d")).unwrap();
+            fs.write_file("/d/FILE.TXT", b"old");
+            fs.write_file("/d/src", b"new");
+            fs.set_case_insensitive(true);
+            fs.set_replace_renames(renames);
+            let d = fs.destination_root(Path::new("/d")).unwrap();
+            d.rename_replace(OsStr::new("src"), &d, OsStr::new("file.txt")).unwrap();
+            assert_eq!(names(&fs, "/d"), vec![want]);
+            assert_eq!(fs.read_file(format!("/d/{want}")), Some(b"new".to_vec()));
+        }
+    }
+
+    #[test]
+    fn remove_file_under_another_case_removes_the_stored_entry() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        // Path level.
+        let fs = ci_fs();
+        fs.set_case_insensitive(true);
+        fs.remove_file(Path::new("/d/FILE.TXT")).unwrap();
+        assert!(names(&fs, "/d").is_empty());
+        assert!(called_norm(&fs, "remove_file(/d/file.txt)"));
+        // Through a handle: a file ...
+        let fs = ci_fs();
+        fs.set_case_insensitive(true);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        d.remove_file(OsStr::new("FILE.TXT")).unwrap();
+        assert!(names(&fs, "/d").is_empty());
+        // ... and a directory stored under another spelling is still refused as a directory.
+        let fs = ci_fs();
+        fs.create_dir(Path::new("/d/Sub")).unwrap();
+        fs.set_case_insensitive(true);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let e = d.remove_file(OsStr::new("SUB")).unwrap_err();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::IsADirectory);
+    }
+
+    #[test]
+    fn open_dir_under_another_case_opens_the_stored_directory() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        let fs = ci_fs();
+        fs.create_dir(Path::new("/d/Sub")).unwrap();
+        fs.set_case_insensitive(true);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let sub = d.open_dir(OsStr::new("SUB")).unwrap();
+        let canon = sub.canonical_path().unwrap();
+        assert_eq!(canon.to_string_lossy().replace('\\', "/"), "/d/Sub");
     }
 }

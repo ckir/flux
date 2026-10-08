@@ -14,7 +14,7 @@ mod session;
 #[cfg(test)]
 mod tests;
 
-use crate::copy::{CopyError, copy_file_guarded, prepare_file};
+use crate::copy::{CopyError, copy_file_guarded, no_before_create, prepare_file};
 use crate::lock::record::LockRecord;
 use crate::lock::site::NAME_LIMIT;
 use crate::lock::{LockCode, LockSite, Refusal, Released, check_capability};
@@ -22,9 +22,11 @@ use crate::prior::check_control_plane;
 use crate::state::{OpState, file_names_fit, identity_text, native_hex};
 use crate::tree::{
     Shared, TreeAbort, TreeFailure, TreeFailureCause, TreeOutcome, copy_tree_at, prepare_source,
+    report,
 };
 use flux_fs::{
-    Code, CopyOptions, DestinationRoot, DirHandle, FileIdentity, FsError, OperationId, Outcome,
+    ClaimStore, Code, CopyOptions, DestinationRoot, DirHandle, FileIdentity, FsError, OperationId,
+    Outcome,
 };
 use place::{FilePlace, Place, TreePlace, locate_tree};
 use session::{Locked, beat_error, from_lock, guarded, lock_io, open_operation, owned};
@@ -212,6 +214,8 @@ pub fn tree<F: DestinationRoot>(
         dest_shown: dst_root.to_path_buf(),
         created_dest: false,
         operations: None,
+        claims: None,
+        durability: opts.durability,
     };
     // Steps 3-5 (and `--restart`): the lock, then this operation's state and the record naming it.
     let locked = match open_operation(&site, capability, &mut place, cfg, &mut run.warnings) {
@@ -223,15 +227,16 @@ pub fn tree<F: DestinationRoot>(
     };
     // Step 6: the copy, with §99 before every destination mutation.
     let mut leftovers: Vec<PathBuf> = Vec::new();
+    let guard = || {
+        if let Some(hook) = &cfg.before_mutation {
+            hook();
+        }
+        guarded(&locked.held, &locked.pulse)
+    };
+    let beat = || locked.pulse.beat(&locked.held).map_err(|e| beat_error(&locked.lock_shown, e));
+    // The store stays open past the walk, for the final sync; it is dropped before `finish` removes the file.
+    let claims = place.claims.take().map(std::cell::RefCell::new);
     let walked = {
-        let guard = || {
-            if let Some(hook) = &cfg.before_mutation {
-                hook();
-            }
-            guarded(&locked.held, &locked.pulse)
-        };
-        let beat =
-            || locked.pulse.beat(&locked.held).map_err(|e| beat_error(&locked.lock_shown, e));
         let cx = Shared {
             fs,
             src_root,
@@ -239,6 +244,7 @@ pub fn tree<F: DestinationRoot>(
             opts: &opts,
             guard: &guard,
             beat: &beat,
+            claims: claims.as_ref(),
         };
         let root = place.dest.take().expect("step 5 made DEST");
         let mut report = |f: TreeFailure| {
@@ -249,7 +255,8 @@ pub fn tree<F: DestinationRoot>(
             }
             on_report(f);
         };
-        let (root, walked) = copy_tree_at(&cx, source.events, root, &mut out, &mut report);
+        let (root, walked) =
+            copy_tree_at(&cx, source.events, root, place.created_dest, &mut out, &mut report);
         place.dest = Some(root);
         walked
     };
@@ -265,6 +272,39 @@ pub fn tree<F: DestinationRoot>(
         Err(a) if a.refused_unchanged() => Ended::RefusedUnchanged,
         Err(_) => Ended::Failed,
     };
+    // Cut 8b, "Claim syncing", the explicit final sync: the claims written since the last directory end, only when the
+    // workspace is KEPT. NOTE: closing the redb store below is itself a commit and an fsync of `state.db` on EVERY
+    // path (clean completion, refusal and lost lock included), and under `Normal` it makes earlier `None` commits
+    // durable. Harmless (it is this run's own workspace file) but not avoidable: redb has no non-committing close.
+    if let Some(claims) = &claims {
+        match &ended {
+            // Best effort: the heartbeat intact and ownership held; its error never replaces the primary one.
+            Ended::Failed => {
+                if !locked.pulse.failed() && owned(&locked.held, &locked.lock_shown).is_ok() {
+                    let _ignored = claims.borrow_mut().flush();
+                }
+            }
+            // A failure is reported, and counted before `finish`.
+            Ended::Completed { leftovers, .. } if !leftovers.is_empty() => {
+                let synced =
+                    beat().and_then(|()| guard()).and_then(|()| claims.borrow_mut().flush());
+                if let Err(e) = synced {
+                    let outcome = match &mut result {
+                        Ok(o) => o,
+                        Err(a) => &mut a.outcome,
+                    };
+                    report(
+                        outcome,
+                        on_report,
+                        PathBuf::new(),
+                        TreeFailureCause::ClaimNotRecorded(e),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    drop(claims);
     run.stop = finish(&mut place, locked, ended, &mut run.warnings);
     // E1: a DEST this run made counts among the directories it created, unless a rollback removed it again.
     if place.created_dest {
@@ -352,7 +392,7 @@ pub fn file<F: DestinationRoot>(
         };
         let beat =
             || locked.pulse.beat(&locked.held).map_err(|e| beat_error(&locked.lock_shown, e));
-        copy_file_guarded(fs, src, &parent, name, &opts, &guard, &beat)
+        copy_file_guarded(fs, src, &parent, name, &opts, &guard, &beat, &no_before_create)
     }
     .map_err(|mut e| {
         // As `copy_file` reports it: the leftover in the frame of the path the operator gave.
@@ -362,7 +402,11 @@ pub fn file<F: DestinationRoot>(
         e
     });
     let ended = match &copied {
-        Ok(o) => Ended::Completed { leftovers: Vec::new(), published: Some(o.published_identity) },
+        // A skipped file published nothing, so it records no identity.
+        Ok(o) => Ended::Completed {
+            leftovers: Vec::new(),
+            published: (!o.skipped).then_some(o.published_identity),
+        },
         // Cut 7b: a failed heartbeat is the copy's failure, whatever its code.
         Err(_) if locked.pulse.failed() => Ended::Failed,
         Err(e) if e.code() == Code::TargetLockBusy => Ended::Lost,

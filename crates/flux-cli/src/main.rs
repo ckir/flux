@@ -6,7 +6,9 @@ use flux_cli::exit_code;
 use flux_cli::report::{self, Report};
 use flux_cli::resolve::{self, Job, Stop};
 use flux_core::run::RunConfig;
-use flux_fs::{Code, CopyOptions, Durability, OperationId, Preserve, Publish, Safety};
+use flux_fs::{
+    Code, CopyOptions, Durability, ExistingPolicy, OperationId, Preserve, Publish, Safety,
+};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -23,14 +25,17 @@ struct Cli {
 enum Commands {
     /// Copy a file, or a folder's contents, to DEST (§4.1).
     ///
-    /// A folder copy never replaces an existing file at DEST: each one is reported as
-    /// DESTINATION_NAMESPACE_COLLISION and left intact (exit 1) until replacement is
-    /// supported. A symlink given as SOURCE is not followed. Several sources are not
-    /// supported yet.
+    /// What happens to a file that already exists at DEST is chosen by one of
+    /// --overwrite (the default: replace it), --update (replace it when the source is
+    /// newer or the size differs; when either modification time is unavailable, only
+    /// the sizes are compared, and equal sizes keep the file) or --skip-existing (leave it untouched); at most one
+    /// may be given. A skipped file is not a failure. A symlink given as SOURCE is not
+    /// followed. Several sources are not supported yet.
     Copy(CopyArgs),
 }
 
 #[derive(Args)]
+#[command(group(clap::ArgGroup::new("existing").args(["overwrite", "update", "skip_existing"]).multiple(false)))]
 struct CopyArgs {
     source: PathBuf,
     destination: PathBuf,
@@ -61,6 +66,17 @@ struct CopyArgs {
     /// With --restart: take over a lock that a crashed run left empty or unreadable (§240.5).
     #[arg(long, requires = "restart")]
     break_lock: bool,
+    /// Replace a file that already exists at DEST (the default; §5.1).
+    #[arg(long)]
+    overwrite: bool,
+    /// Replace an existing file at DEST when the source is newer or the size differs;
+    /// with either modification time unavailable only the sizes are compared, and equal
+    /// sizes keep the file (§5.1).
+    #[arg(long)]
+    update: bool,
+    /// Leave an existing file at DEST untouched (§5.1).
+    #[arg(long)]
+    skip_existing: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -100,6 +116,13 @@ fn options(args: &CopyArgs) -> CopyOptions {
         },
         // A placeholder: the run replaces it with its own operation id (`RunConfig::operation_id`).
         operation_id: OperationId::new(String::new()),
+        existing: if args.update {
+            ExistingPolicy::Update
+        } else if args.skip_existing {
+            ExistingPolicy::SkipExisting
+        } else {
+            ExistingPolicy::Overwrite
+        },
     }
 }
 
@@ -297,6 +320,26 @@ mod tests {
     #[test]
     fn safety_strict_reaches_the_options() {
         assert_eq!(options(&parse(&["--safety=strict"])).safety, Safety::Strict);
+    }
+
+    #[test]
+    fn existing_policy_defaults_to_overwrite() {
+        assert_eq!(options(&parse(&[])).existing, ExistingPolicy::Overwrite);
+        assert_eq!(options(&parse(&["--overwrite"])).existing, ExistingPolicy::Overwrite);
+    }
+
+    #[test]
+    fn update_and_skip_existing_reach_the_options() {
+        assert_eq!(options(&parse(&["--update"])).existing, ExistingPolicy::Update);
+        assert_eq!(options(&parse(&["--skip-existing"])).existing, ExistingPolicy::SkipExisting);
+    }
+
+    #[test]
+    fn giving_two_policies_is_a_usage_error() {
+        let err = Cli::try_parse_from(["flux", "copy", "a", "b", "--update", "--skip-existing"])
+            .err()
+            .expect("two policies must be rejected");
+        assert_eq!(err.exit_code(), 2);
     }
 
     #[test]

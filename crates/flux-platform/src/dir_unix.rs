@@ -68,6 +68,7 @@ const fn libc_s_iflnk() -> u32 {
 impl DirHandle for StdDir {
     type Writer = crate::StdFile;
     type Lock = crate::StdLock;
+    type Claims = crate::RedbClaimStore;
 
     fn open_dir(&self, name: &OsStr) -> Result<Self> {
         check_component(name)?;
@@ -203,6 +204,22 @@ impl DirHandle for StdDir {
         )
         .map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
         Ok(crate::StdLock::new(std::fs::File::from(fd)))
+    }
+
+    fn create_claim_store(
+        &self,
+        name: &OsStr,
+        durability: flux_fs::Durability,
+    ) -> Result<Self::Claims> {
+        check_component(name)?;
+        let fd = openat(
+            &self.0,
+            name,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o666),
+        )
+        .map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
+        crate::RedbClaimStore::from_file(std::fs::File::from(fd), durability)
     }
 
     fn lock_capability(&self) -> Result<flux_fs::LockCapability> {

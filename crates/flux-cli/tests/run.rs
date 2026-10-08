@@ -125,6 +125,70 @@ fn a_killed_run_leaves_a_resumable_operation_that_restart_supersedes() {
     assert_eq!(names(d.path()), ["dst", "src"], "and its lock");
 }
 
+/// Cut 8b, "Claim syncing": a run killed mid-tree leaves `<id>/state.db` holding the claims up to the last sync (a
+/// directory end), every record decodable and no key twice. 300 files in three directories, each already present at
+/// the destination, so every file is a replacement and so a claim. The stall is placed well inside the second
+/// directory, so the first has ended (its claims synced) and the second has claimed some files that were never synced.
+#[test]
+fn a_killed_run_leaves_the_claims_up_to_the_last_sync() {
+    use flux_fs::{ClaimRecord, ClaimStatus};
+    use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
+
+    const FILES: usize = 300;
+    let d = TempDir::new().unwrap();
+    let marks = TempDir::new().unwrap();
+    let src = d.path().join("src");
+    let dst = d.path().join("dst");
+    for tree in [&src, &dst] {
+        for dir in 0..3 {
+            let sub = tree.join(format!("d{dir}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            for f in 0..FILES / 3 {
+                let body: &[u8] = if tree == &src { b"new" } else { b"old" };
+                std::fs::write(sub.join(format!("f{f:03}")), body).unwrap();
+            }
+        }
+    }
+    // Three guarded mutations per replaced file (sweep, temporary, publish): the 500th falls in the second directory.
+    Stalled::start(&src, &dst, 500, marks.path()).kill();
+
+    let ops = dst.join(".flux").join("operations");
+    let ids = names(&ops);
+    assert_eq!(ids.len(), 1, "one kept workspace: {ids:?}");
+    let db_path = ops.join(&ids[0]).join("state.db");
+    assert!(db_path.is_file(), "the killed run kept its claim store at {}", db_path.display());
+
+    // `redb`'s read-only open refuses a store its owner never closed (`RepairAborted`, measured); the ordinary open
+    // repairs it, which is also what a later run would have to do.
+    let db = Database::open(&db_path).expect("the killed run's store opens");
+    let tx = db.begin_read().unwrap();
+    let claims = tx.open_table(TableDefinition::<&[u8], &[u8]>::new("claims")).unwrap();
+    let count = claims.len().unwrap() as usize;
+    // Lower bound: each directory holds FILES / 3 = 100 replaced files, so the first directory keyed 100 claims, and
+    // its DirEnd flush (a synced commit) ran before the stall at the 500th guarded mutation (300 mutations for the
+    // first directory, the 500th is inside the second). Upper bound: the second directory's claims are unsynced and
+    // may be lost, but never more than all FILES exist.
+    assert!(
+        (FILES / 3..=FILES).contains(&count),
+        "claims survived: {count}, want at least the first directory's {}",
+        FILES / 3
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    for row in claims.iter().unwrap() {
+        let (k, v) = row.unwrap();
+        let record = ClaimRecord::decode(v.value()).expect("every record decodes");
+        assert!(
+            matches!(record.status, ClaimStatus::Existing | ClaimStatus::Created),
+            "{:?}",
+            record.status
+        );
+        assert!(seen.insert(k.value().to_vec()), "a key repeated: {:?}", k.value());
+    }
+    assert_eq!(seen.len(), count);
+    let meta = tx.open_table(TableDefinition::<&str, u64>::new("meta")).unwrap();
+    assert_eq!(meta.get("format").unwrap().map(|g| g.value()), Some(1));
+}
+
 #[test]
 fn a_killed_single_file_run_leaves_a_resumable_record_that_restart_supersedes() {
     let d = TempDir::new().unwrap();

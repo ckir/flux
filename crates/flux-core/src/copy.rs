@@ -54,6 +54,24 @@ pub enum CopyStep {
     /// Cut 7b: refreshing the destination lock's heartbeat (§101). Its failure stops the copy at that point, and a
     /// tree's whole walk.
     Heartbeat,
+    /// Cut 8b: the claim made before the temporary is created.
+    Claim,
+}
+
+/// Cut 8b: runs after the identity gate and the policy decision and before the temporary is created. Its `Err` stops
+/// the copy there, with nothing created.
+pub type BeforeCreate<'g> = dyn Fn() -> std::result::Result<(), CopyError> + 'g;
+
+/// A `BeforeCreate` that always passes: the lockless copy and the tree (until its claims land) make no claim.
+pub(crate) fn no_before_create() -> std::result::Result<(), CopyError> {
+    Ok(())
+}
+
+/// What the Step 2a identity gate read: the weaker identity when the comparison degraded, and the destination's
+/// metadata (`None` when it is absent), so the policy decision needs no second stat.
+pub(crate) struct GateRead {
+    pub degraded: Option<FileIdentity>,
+    pub existing: Option<Metadata>,
 }
 
 /// The engine's error: a filesystem failure, plus anything the ENGINE knows that the
@@ -248,7 +266,7 @@ pub(crate) fn identity_gate<D: DirHandle>(
     src: &Metadata,
     safety: Safety,
     publish: Publish,
-) -> std::result::Result<Option<FileIdentity>, CopyError> {
+) -> std::result::Result<GateRead, CopyError> {
     let refuse = |why: &'static str| {
         CopyError::at(
             CopyStep::Gate,
@@ -262,8 +280,10 @@ pub(crate) fn identity_gate<D: DirHandle>(
         )),
     };
     match parent.metadata(name) {
-        Err(e) if e.source.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => degraded(FileIdentity::Unavailable),
+        Err(e) if e.source.kind() == std::io::ErrorKind::NotFound => {
+            Ok(GateRead { degraded: None, existing: None })
+        }
+        Err(_) => Ok(GateRead { degraded: degraded(FileIdentity::Unavailable)?, existing: None }),
         Ok(m) if m.file_type == FileType::Dir => Err(refuse("the destination is a directory")),
         Ok(m) => {
             let verdict = match (src.identity, m.identity) {
@@ -291,7 +311,7 @@ pub(crate) fn identity_gate<D: DirHandle>(
                     ),
                 ));
             }
-            Ok(verdict)
+            Ok(GateRead { degraded: verdict, existing: Some(m) })
         }
     }
 }
@@ -392,7 +412,7 @@ pub fn copy_file_at<F: DestinationRoot>(
     name: &OsStr,
     opts: &CopyOptions,
 ) -> std::result::Result<Outcome, CopyError> {
-    copy_file_guarded(fs, src, parent, name, opts, &unguarded, &no_heartbeat)
+    copy_file_guarded(fs, src, parent, name, opts, &unguarded, &no_heartbeat, &no_before_create)
 }
 
 /// Copy `src` to `name` inside `parent`, writing ONLY through `parent`.
@@ -409,6 +429,17 @@ pub fn copy_file_at<F: DestinationRoot>(
 /// `beat` runs immediately before each of those guard calls except the removal's, and after every 64 KiB written (cut
 /// 7b). Its failure is `CopyStep::Heartbeat`: before the create it creates nothing; after it, the temporary is removed
 /// as for any other failure.
+///
+/// `before_create` (cut 8b) is called exactly once per copy that reaches the create: after the heartbeat and guard that
+/// precede the exclusive create, and before the temporary exists. Its error stops the copy there, creating nothing.
+/// A copy that is refused by the gate or skipped by the policy never calls it.
+///
+/// Step 2b is the existing-destination policy decision, taken after the identity gate (which already refused a
+/// directory at the name): `Overwrite` proceeds, `SkipExisting` returns a skipped outcome changing nothing on disk,
+/// and `Update` proceeds when the source is newer or the sizes differ (sizes alone when either time is unavailable).
+///
+/// Eight parameters: the signature is the cut 8b plan's contract (guard, beat, before_create arrive together).
+#[allow(clippy::too_many_arguments)]
 pub fn copy_file_guarded<F: DestinationRoot>(
     fs: &F,
     src: &Path,
@@ -417,6 +448,7 @@ pub fn copy_file_guarded<F: DestinationRoot>(
     opts: &CopyOptions,
     guard: &Guard<'_>,
     beat: &Heartbeat<'_>,
+    before_create: &BeforeCreate<'_>,
 ) -> std::result::Result<Outcome, CopyError> {
     let temp = temp_name(name, &opts.operation_id);
 
@@ -440,7 +472,31 @@ pub fn copy_file_guarded<F: DestinationRoot>(
 
     // 2a. the destination must not BE the source. Before the temporary exists, so a
     //     refusal changes nothing on disk.
-    let identity_degraded = identity_gate(parent, name, &src_meta, opts.safety, opts.publish)?;
+    let gate = identity_gate(parent, name, &src_meta, opts.safety, opts.publish)?;
+
+    // 2b. cut 8b, the existing-destination policy (single file): a skip changes nothing on disk. A directory at the
+    //     name was already refused by the gate.
+    if let Some(dest) = &gate.existing {
+        let proceed = match opts.existing {
+            flux_fs::ExistingPolicy::Overwrite => true,
+            flux_fs::ExistingPolicy::SkipExisting => false,
+            // Newer source or a different size; with either time unavailable, the lengths alone decide.
+            flux_fs::ExistingPolicy::Update => {
+                src_meta.len != dest.len
+                    || matches!((src_meta.modified, dest.modified), (Some(s), Some(d)) if s > d)
+            }
+        };
+        if !proceed {
+            return Ok(Outcome {
+                skipped: true,
+                bytes_copied: 0,
+                metadata_failures: vec![],
+                identity_degraded: gate.degraded,
+                published_identity: FileIdentity::Unavailable,
+            });
+        }
+    }
+    let identity_degraded = gate.degraded;
 
     let mut reader = fs.open_read(src).map_err(|e| CopyError::at(CopyStep::Source, e))?;
 
@@ -450,6 +506,8 @@ pub fn copy_file_guarded<F: DestinationRoot>(
     // §99 before the temporary exists: a failure here has created nothing.
     beat().map_err(|e| CopyError::at(CopyStep::Heartbeat, e))?;
     guard().map_err(|e| CopyError::at(CopyStep::Create, e))?;
+    // Cut 8b: the claim, after the gate and the section 99 check, before the temporary exists.
+    before_create()?;
     let mut writer = parent.create_new(&temp).map_err(|e| CopyError::at(CopyStep::Create, e))?;
 
     // 4. stream
@@ -578,7 +636,13 @@ pub fn copy_file_guarded<F: DestinationRoot>(
 
     // A successful rename consumed the temporary; there is nothing left to remove.
 
-    Ok(Outcome { bytes_copied, metadata_failures, identity_degraded, published_identity })
+    Ok(Outcome {
+        bytes_copied,
+        metadata_failures,
+        identity_degraded,
+        published_identity,
+        skipped: false,
+    })
 }
 
 #[cfg(test)]
@@ -595,6 +659,7 @@ mod tests {
             publish: Publish::Replace,
             safety: flux_fs::Safety::Default,
             operation_id: OperationId::new("op1"),
+            existing: flux_fs::ExistingPolicy::Overwrite,
         }
     }
 
@@ -1399,6 +1464,7 @@ mod tests {
             &opts(),
             &lost,
             &no_heartbeat,
+            &no_before_create,
         )
         .unwrap_err();
         assert_eq!((e.code(), e.step), (Code::TargetLockBusy, CopyStep::Create));
@@ -1422,6 +1488,7 @@ mod tests {
             &opts(),
             &guard,
             &no_heartbeat,
+            &no_before_create,
         )
         .unwrap_err();
         assert_eq!((e.code(), e.step), (Code::TargetLockBusy, CopyStep::Publish));
@@ -1453,6 +1520,7 @@ mod tests {
             &opts(),
             &guard,
             &no_heartbeat,
+            &no_before_create,
         )
         .unwrap_err();
         assert_eq!(e.step, CopyStep::Stream);
@@ -1492,6 +1560,7 @@ mod tests {
             &opts(),
             &unguarded,
             &beat,
+            &no_before_create,
         )
         .unwrap();
         // The sweep, the create, three chunks (64 + 64 + 2 KiB), the publish.
@@ -1514,6 +1583,7 @@ mod tests {
             &opts(),
             &unguarded,
             &beat,
+            &no_before_create,
         )
         .unwrap_err();
         assert_eq!((e.code(), e.step), (Code::IoError, CopyStep::Heartbeat));
@@ -1543,6 +1613,7 @@ mod tests {
             &opts(),
             &unguarded,
             &beat,
+            &no_before_create,
         )
         .unwrap_err();
         assert_eq!(e.step, CopyStep::Heartbeat);
@@ -1565,6 +1636,7 @@ mod tests {
             &opts(),
             &unguarded,
             &beat,
+            &no_before_create,
         )
         .unwrap_err();
         assert_eq!(e.step, CopyStep::Heartbeat);
@@ -1580,5 +1652,253 @@ mod tests {
         let out = copy_file_at(&fs, Path::new("/s"), &parent, OsStr::new("t"), &opts()).unwrap();
         assert_eq!(out.published_identity, fs.metadata(Path::new("/d/t")).unwrap().identity);
         assert!(matches!(out.published_identity, FileIdentity::Strong(_)));
+    }
+
+    /// Write `bytes` at `path` with the given modified time (`write_file` leaves it unavailable).
+    fn put(fs: &FaultFs, path: &str, bytes: &[u8], modified: Option<std::time::SystemTime>) {
+        let mut w = fs.create_new(Path::new(path)).unwrap();
+        std::io::Write::write_all(&mut w, bytes).unwrap();
+        fs.set_times(&w, modified).unwrap();
+    }
+
+    fn at_secs(s: u64) -> Option<std::time::SystemTime> {
+        Some(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(s))
+    }
+
+    fn guarded_with(
+        fs: &FaultFs,
+        o: &CopyOptions,
+        before_create: &BeforeCreate<'_>,
+    ) -> std::result::Result<Outcome, CopyError> {
+        let root = fs.destination_root(Path::new("/")).unwrap();
+        copy_file_guarded(
+            fs,
+            Path::new("/src"),
+            &root,
+            OsStr::new("dst"),
+            o,
+            &unguarded,
+            &no_heartbeat,
+            before_create,
+        )
+    }
+
+    #[test]
+    fn a_before_create_error_stops_the_copy_before_the_temporary_exists() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        let claim = || {
+            Err(CopyError::at(
+                CopyStep::Claim,
+                FsError::new(Code::IoError, std::io::Error::other("no claim")),
+            ))
+        };
+        let e = guarded_with(&fs, &opts(), &claim).unwrap_err();
+        assert_eq!((e.code(), e.step), (Code::IoError, CopyStep::Claim));
+        assert!(!fs.called("create_new"), "{:?}", fs.calls());
+        assert!(!fs.exists("/dst") && !fs.exists("/dst.flux-partial.op1"));
+        assert!(e.leftover.is_none());
+    }
+
+    #[test]
+    fn before_create_runs_after_the_gate_and_before_the_create() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        let at = std::cell::Cell::new(None);
+        let cb = || {
+            at.set(Some(fs.calls().len()));
+            Ok(())
+        };
+        guarded_with(&fs, &opts(), &cb).unwrap();
+        let ran = at.get().expect("the callback ran");
+        let calls = fs.calls();
+        let gate = calls.iter().position(|c| c == "metadata(/dst)").expect("the gate stat");
+        let create = calls.iter().position(|c| c.starts_with("create_new")).expect("create");
+        assert!(gate < ran && ran <= create, "gate {gate}, callback {ran}, create {create}");
+    }
+
+    #[test]
+    fn the_identity_gate_refusal_skips_before_create() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.write_file("/dst", b"hello");
+        let id = FileIdentity::Strong(flux_fs::ObjectId { volume: 1, index: 77 });
+        fs.set_identity("/src", id);
+        fs.set_identity("/dst", id);
+        let ran = std::cell::Cell::new(false);
+        let cb = || {
+            ran.set(true);
+            Ok(())
+        };
+        let e = guarded_with(&fs, &opts(), &cb).unwrap_err();
+        assert_eq!((e.code(), e.step), (Code::SafetyRejected, CopyStep::Gate));
+        assert!(!ran.get());
+    }
+
+    /// Run the copy with the given guard and heartbeat and a `before_create` that counts its calls.
+    fn guarded_counting(
+        fs: &FaultFs,
+        guard: &Guard<'_>,
+        beat: &Heartbeat<'_>,
+        calls: &std::cell::Cell<u32>,
+    ) -> std::result::Result<Outcome, CopyError> {
+        let root = fs.destination_root(Path::new("/")).unwrap();
+        let cb = || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+        copy_file_guarded(
+            fs,
+            Path::new("/src"),
+            &root,
+            OsStr::new("dst"),
+            &opts(),
+            guard,
+            beat,
+            &cb,
+        )
+    }
+
+    fn lock_lost() -> flux_fs::FsError {
+        FsError::new(Code::TargetLockBusy, std::io::Error::other("lost"))
+    }
+
+    #[test]
+    fn before_create_is_not_called_when_the_guard_or_heartbeat_fails() {
+        // Section 99: the heartbeat and the guard come BEFORE the claim. The copy path calls each twice before
+        // the claim (the leftover removal, then the exclusive create), so fail the first call and, separately,
+        // the SECOND call, which is the one that sits directly in front of `before_create`.
+        for nth in [1u32, 2] {
+            let fs = FaultFs::new();
+            fs.write_file("/src", b"hello");
+            let n = std::cell::Cell::new(0u32);
+            let guard = || {
+                n.set(n.get() + 1);
+                if n.get() == nth { Err(lock_lost()) } else { Ok(()) }
+            };
+            let ran = std::cell::Cell::new(0);
+            let e = guarded_counting(&fs, &guard, &no_heartbeat, &ran).unwrap_err();
+            assert_eq!(e.code(), Code::TargetLockBusy, "guard failing at call {nth}");
+            assert_eq!(ran.get(), 0, "the claim ran after a failed guard (call {nth})");
+            assert!(!fs.called("create_new"), "{:?}", fs.calls());
+
+            let fs = FaultFs::new();
+            fs.write_file("/src", b"hello");
+            let n = std::cell::Cell::new(0u32);
+            let beat = || {
+                n.set(n.get() + 1);
+                if n.get() == nth { Err(lock_lost()) } else { Ok(()) }
+            };
+            let ran = std::cell::Cell::new(0);
+            let e = guarded_counting(&fs, &unguarded, &beat, &ran).unwrap_err();
+            assert_eq!(e.step, CopyStep::Heartbeat, "heartbeat failing at call {nth}");
+            assert_eq!(ran.get(), 0, "the claim ran after a failed heartbeat (call {nth})");
+            assert!(!fs.called("create_new"), "{:?}", fs.calls());
+        }
+    }
+
+    #[test]
+    fn before_create_runs_exactly_once_per_copy() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        let ran = std::cell::Cell::new(0);
+        guarded_counting(&fs, &unguarded, &no_heartbeat, &ran).unwrap();
+        assert_eq!(ran.get(), 1);
+        assert_eq!(fs.read_file("/dst").as_deref(), Some(&b"hello"[..]));
+    }
+
+    #[test]
+    fn skip_existing_leaves_the_destination_untouched() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.write_file("/dst", b"old");
+        let mut o = opts();
+        o.existing = flux_fs::ExistingPolicy::SkipExisting;
+        let ran = std::cell::Cell::new(false);
+        let cb = || {
+            ran.set(true);
+            Ok(())
+        };
+        let out = guarded_with(&fs, &o, &cb).unwrap();
+        assert!(out.skipped);
+        assert_eq!(out.bytes_copied, 0);
+        assert_eq!(out.published_identity, FileIdentity::Unavailable);
+        assert_eq!(fs.read_file("/dst").as_deref(), Some(&b"old"[..]));
+        assert!(!fs.called("create_new") && !fs.called("rename_"), "{:?}", fs.calls());
+        assert!(!ran.get(), "a skip claims nothing");
+    }
+
+    #[test]
+    fn skip_existing_with_no_destination_copies() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        let mut o = opts();
+        o.existing = flux_fs::ExistingPolicy::SkipExisting;
+        let out = guarded_with(&fs, &o, &no_before_create).unwrap();
+        assert!(!out.skipped);
+        assert_eq!(out.bytes_copied, 5);
+        assert_eq!(fs.read_file("/dst").as_deref(), Some(&b"hello"[..]));
+    }
+
+    #[test]
+    fn update_replaces_only_when_the_source_is_newer_or_the_size_differs() {
+        let mut o = opts();
+        o.existing = flux_fs::ExistingPolicy::Update;
+        // (source time, source bytes, destination time, destination bytes, replaced)
+        let cases: [(_, &[u8], _, &[u8], bool); 4] = [
+            (at_secs(20), b"new", at_secs(10), b"old", true),
+            (at_secs(10), b"new", at_secs(20), b"old", false),
+            (at_secs(10), b"new!", at_secs(10), b"old", true),
+            (None, b"new", at_secs(10), b"old", false),
+        ];
+        for (i, (st, sb, dt, db, replaced)) in cases.into_iter().enumerate() {
+            let fs = FaultFs::new();
+            put(&fs, "/src", sb, st);
+            put(&fs, "/dst", db, dt);
+            let out = guarded_with(&fs, &o, &no_before_create).unwrap();
+            assert_eq!(out.skipped, !replaced, "case {i}");
+            let want = if replaced { sb } else { db };
+            assert_eq!(fs.read_file("/dst").as_deref(), Some(want), "case {i}");
+            assert_eq!(fs.called("create_new(/dst.flux-partial"), replaced, "case {i}");
+        }
+    }
+
+    #[test]
+    fn skip_existing_over_an_existing_directory_is_refused_by_the_gate_not_skipped() {
+        directory_at_the_destination_is_refused(flux_fs::ExistingPolicy::SkipExisting);
+    }
+
+    #[test]
+    fn update_over_an_existing_directory_is_refused_by_the_gate_not_skipped() {
+        directory_at_the_destination_is_refused(flux_fs::ExistingPolicy::Update);
+    }
+
+    fn directory_at_the_destination_is_refused(policy: flux_fs::ExistingPolicy) {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.create_dir(Path::new("/dst")).unwrap();
+        let mut o = opts();
+        o.existing = policy;
+        let err = guarded_with(&fs, &o, &no_before_create).unwrap_err();
+        assert_eq!(err.code(), flux_fs::Code::SafetyRejected);
+        assert!(err.to_string().contains("directory"), "names the reason: {err}");
+        assert!(!fs.called("create_new"), "{:?}", fs.calls());
+    }
+
+    #[test]
+    fn update_replaces_when_an_mtime_is_unavailable_and_the_sizes_differ() {
+        let mut o = opts();
+        o.existing = flux_fs::ExistingPolicy::Update;
+        // (source time, destination time): each side unavailable in turn, then both.
+        for (i, (st, dt)) in
+            [(None, at_secs(10)), (at_secs(10), None), (None, None)].into_iter().enumerate()
+        {
+            let fs = FaultFs::new();
+            put(&fs, "/src", b"new!", st);
+            put(&fs, "/dst", b"old", dt);
+            let out = guarded_with(&fs, &o, &no_before_create).unwrap();
+            assert!(!out.skipped, "case {i}");
+            assert_eq!(fs.read_file("/dst").as_deref(), Some(&b"new!"[..]), "case {i}");
+        }
     }
 }

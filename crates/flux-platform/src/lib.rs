@@ -4,6 +4,9 @@ pub mod std_fs;
 
 pub(crate) mod lock_file;
 
+mod claims;
+pub use claims::{CACHE_BYTES, RedbClaimStore, SYNC_CAP};
+
 #[cfg(unix)]
 mod dir_unix;
 #[cfg(unix)]

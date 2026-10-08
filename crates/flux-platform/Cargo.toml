@@ -10,6 +10,7 @@ publish.workspace = true
 
 [dependencies]
 flux-fs = { path = "../flux-fs" }
+redb = { workspace = true }
 
 # `accessat` for the write-protection guard in `std_fs.rs`. Unix only: Windows has no
 # equivalent that is worth the cost, and its own `rename` already refuses a read-only

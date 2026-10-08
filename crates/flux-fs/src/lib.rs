@@ -7,14 +7,16 @@ pub use error::{Code, FsError, Result};
 pub mod options;
 
 pub use options::{
-    CopyOptions, Durability, MetadataFailure, MetadataItem, OperationId, Outcome, Preserve,
-    Publish, Safety, temp_path,
+    CopyOptions, Durability, ExistingPolicy, MetadataFailure, MetadataItem, OperationId, Outcome,
+    Preserve, Publish, Safety, temp_path,
 };
 
+pub mod claims;
 pub mod fs;
 pub mod lock;
 pub mod name;
 
+pub use claims::{ClaimKey, ClaimOutcome, ClaimRecord, ClaimStatus, ClaimStore, FluxPathKey};
 pub use fs::{
     DestinationRoot, DirEntry, DirHandle, FileHandle, FileIdentity, FileSystem, FileType, Metadata,
     MountRoot, ObjectId, Perms,

@@ -229,6 +229,9 @@ pub trait DirHandle: Sized {
     /// A lock file held open for reading and writing (§96.1). See `crate::LockFile`.
     type Lock: crate::LockFile;
 
+    /// The claim store `create_claim_store` opens (cut 8b). See `crate::ClaimStore`.
+    type Claims: crate::ClaimStore;
+
     /// Open a child DIRECTORY, refusing to traverse a symlink, junction or other
     /// name-surrogate reparse point. This is the operation §149.7 is about.
     fn open_dir(&self, name: &std::ffi::OsStr) -> Result<Self>;
@@ -307,6 +310,15 @@ pub trait DirHandle: Sized {
     /// The same refusals as `create_new`: MUST FAIL with `ErrorKind::AlreadyExists` if the name is taken by anything,
     /// including a link, and never create through a link.
     fn create_lock(&self, name: &std::ffi::OsStr) -> Result<Self::Lock>;
+
+    /// Create `name` exclusively through this handle (read and write, never following a link) and open a claim store on
+    /// it. `Durability::Normal` commits without a sync; `Durability::Strict` syncs every commit. Fails with
+    /// `ErrorKind::AlreadyExists` if the name is taken.
+    fn create_claim_store(
+        &self,
+        name: &std::ffi::OsStr,
+        durability: crate::Durability,
+    ) -> Result<Self::Claims>;
 
     /// Open an EXISTING lock file for reading and writing, without creating it (§240.5 step 2; the classifier's open,
     /// §240.1). Never follows a link.

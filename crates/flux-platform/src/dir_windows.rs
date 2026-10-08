@@ -114,6 +114,7 @@ impl StdDir {
 impl DirHandle for StdDir {
     type Writer = crate::StdFile;
     type Lock = crate::StdLock;
+    type Claims = crate::RedbClaimStore;
 
     /// Always `No`: a mounted-volume folder is a name-surrogate reparse point, which `open_dir` already refuses
     /// (see its reparse-point check), so no handle this arm holds can be the root of a mount.
@@ -294,6 +295,17 @@ impl DirHandle for StdDir {
     fn open_lock(&self, name: &OsStr) -> Result<Self::Lock> {
         check_component(name)?;
         open_lock_at(&self.0, name, FILE_OPEN)
+    }
+
+    fn create_claim_store(
+        &self,
+        name: &OsStr,
+        durability: flux_fs::Durability,
+    ) -> Result<Self::Claims> {
+        check_component(name)?;
+        // The same exclusive, reparse-point-refusing create as `create_lock`; only the wrapper differs.
+        let file = open_file_at(&self.0, name, FILE_CREATE)?;
+        crate::RedbClaimStore::from_file(file, durability)
     }
 
     fn lock_capability(&self) -> Result<flux_fs::LockCapability> {
@@ -665,6 +677,11 @@ fn create_new_at(p: &OwnedHandle, n: &OsStr) -> Result<crate::StdFile> {
 /// DELETE, because another process must be able to open the lock to classify it, and §240.3 renames a dead owner's
 /// lock aside while it is open.
 fn open_lock_at(p: &OwnedHandle, n: &OsStr, disposition: u32) -> Result<crate::StdLock> {
+    Ok(crate::StdLock::new(open_file_at(p, n, disposition)?))
+}
+
+/// `open_lock_at`'s open, returning the bare `File` (the claim store takes the same file the lock wraps).
+fn open_file_at(p: &OwnedHandle, n: &OsStr, disposition: u32) -> Result<File> {
     use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
     let mut wide: Vec<u16> = n.encode_wide().collect();
     let bytes = (wide.len() * 2) as u16;
@@ -734,7 +751,7 @@ fn open_lock_at(p: &OwnedHandle, n: &OsStr, disposition: u32) -> Result<crate::S
             std::io::Error::other(format!("name-surrogate reparse point, tag 0x{tag:08X}")),
         ));
     }
-    Ok(crate::StdLock::new(File::from(opened)))
+    Ok(File::from(opened))
 }
 
 fn metadata_at(p: &OwnedHandle, n: &OsStr) -> Result<Metadata> {

@@ -512,6 +512,8 @@ pub const OPERATIONS_DIR: &str = "operations";
 pub const MANIFEST: &str = "manifest";
 /// Section 241.5's probe file, inside a workspace (cut 8a, Part P).
 pub const PROBE: &str = "noreplace-probe";
+/// The claim store (cut 8b), inside a workspace: created beside the manifest and removed with it.
+pub const STATE_DB: &str = "state.db";
 /// The probe's staging temporary.
 pub const PROBE_TEMP: &str = "noreplace-probe.tmp";
 /// A state file's temporary: `<name>.tmp` (decision 4; the name it stages already carries the operation id).
@@ -664,6 +666,7 @@ pub fn retire_workspace<D: DirHandle>(operations: &D, id: &str) -> flux_fs::Resu
             temp_name(OsStr::new(MANIFEST)),
             OsString::from(PROBE),
             OsString::from(PROBE_TEMP),
+            OsString::from(STATE_DB),
         ] {
             remove_if_present(&dir, &name)?;
         }
@@ -1082,6 +1085,17 @@ mod tests {
         let path = format!("/p/dest/.flux/operations/{}", id(1));
         fs.write_file(format!("{path}/{PROBE}"), b"");
         fs.write_file(format!("{path}/{PROBE_TEMP}"), b"");
+        retire_workspace(&ops, &id(1)).unwrap();
+        assert!(!fs.exists(&path) && !fs.exists(format!("{path}.removing")));
+    }
+
+    #[test]
+    fn retire_removes_state_db() {
+        let (fs, d) = dest();
+        let ops = operations_dir(&d, Path::new("D")).unwrap();
+        drop(create_workspace(&ops, &created()).unwrap());
+        let path = format!("/p/dest/.flux/operations/{}", id(1));
+        fs.write_file(format!("{path}/{STATE_DB}"), b"");
         retire_workspace(&ops, &id(1)).unwrap();
         assert!(!fs.exists(&path) && !fs.exists(format!("{path}.removing")));
     }

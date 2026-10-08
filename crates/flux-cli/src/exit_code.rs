@@ -88,6 +88,13 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_not_recorded_failure_exits_1() {
+        let mut out = TreeOutcome::default();
+        out.failures.claim_not_recorded = 1;
+        assert_eq!(for_tree(&Ok(out)), FAILED);
+    }
+
+    #[test]
     #[allow(clippy::field_reassign_with_default)]
     fn warnings_and_skipped_special_files_still_exit_0() {
         let mut out = TreeOutcome::default();
@@ -135,6 +142,7 @@ mod tests {
                     .collect(),
                 identity_degraded: None,
                 published_identity: flux_fs::FileIdentity::Unavailable,
+                skipped: false,
             })
         };
         assert_eq!(for_file(&ok(0)), SUCCESS);
@@ -184,6 +192,7 @@ mod tests {
                 metadata_failures: Vec::new(),
                 identity_degraded: None,
                 published_identity: flux_fs::FileIdentity::Unavailable,
+                skipped: false,
             })
         };
         assert_eq!(for_file_run(&run(None, Some(refused(false)))), REFUSED);

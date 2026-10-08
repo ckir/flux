@@ -3,6 +3,7 @@
 pub mod copy;
 pub mod ids;
 pub mod lock;
+mod names;
 pub mod prior;
 pub mod run;
 pub mod state;

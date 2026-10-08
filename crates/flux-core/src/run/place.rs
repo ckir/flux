@@ -9,14 +9,14 @@ use crate::lock::{LockCode, LockResult, Refusal};
 use crate::prior::{PriorOp, Scan, scan_file, scan_tree};
 use crate::state::{
     FLUX_DIR, Kind, MANIFEST, OPERATIONS_DIR, OperationState, PARTIAL_INFIX, PROBE, PROBE_TEMP,
-    begin_workspace, creating_name, id_after, operations_dir, publish_workspace, record_name,
-    remove_empty_control_dirs, remove_record, retire_workspace, write_state,
+    STATE_DB, begin_workspace, creating_name, id_after, operations_dir, publish_workspace,
+    record_name, remove_empty_control_dirs, remove_record, retire_workspace, write_state,
 };
 use crate::tree::{TreeOutcome, containment, preflight, primitive_unavailable, reserved_path};
 use crate::walk::{WalkEvent, walk};
 use flux_fs::{
-    Code, DestinationRoot, DirHandle, FileIdentity, FileType, FsError, OperationId, Safety,
-    temp_path,
+    Code, DestinationRoot, DirHandle, Durability, FileIdentity, FileType, FsError, OperationId,
+    Safety, temp_path,
 };
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
@@ -190,6 +190,10 @@ pub(crate) struct TreePlace<'p, F: DestinationRoot> {
     pub(crate) created_dest: bool,
     /// `DEST/.flux/operations/`, once step 5 made or opened it.
     pub(crate) operations: Option<F::Dir>,
+    /// The run's claim store (`<id>/state.db`), from its creation until `run::tree` takes it for the walk.
+    pub(crate) claims: Option<<F::Dir as DirHandle>::Claims>,
+    /// `opts.durability`, for the store's creation.
+    pub(crate) durability: Durability,
 }
 
 impl<F: DestinationRoot> TreePlace<'_, F> {
@@ -325,6 +329,25 @@ impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {
         }
         let workspace = publish_workspace(&operations, building, state)
             .map_err(|e| failed(RunStep::State, &self.shown(id), e))?;
+        // After the publishing rename: Windows refuses to rename a directory with an open file inside it.
+        match workspace.create_claim_store(OsStr::new(STATE_DB), self.durability) {
+            Ok(store) => self.claims = Some(store),
+            Err(error) => {
+                drop(workspace);
+                // Retire the published workspace (it holds only its manifest), then the control directories.
+                let shown_id = self.operations_shown().join(id);
+                let mut not_removed =
+                    retire_workspace(&operations, id).err().map(|e| (shown_id.clone(), e));
+                self.operations = Some(operations);
+                if let Err(first) = self.remove_control_dirs(true) {
+                    not_removed.get_or_insert(first);
+                }
+                if let Some((path, error)) = not_removed {
+                    warnings.push(RunWarning::NotRemoved { path, error });
+                }
+                return Err(failed(RunStep::State, &shown_id.join(STATE_DB), error));
+            }
+        }
         drop(workspace);
         self.operations = Some(operations);
         Ok(())
