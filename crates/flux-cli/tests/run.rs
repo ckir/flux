@@ -550,6 +550,17 @@ fn a_killed_tree_copy_resumes_as_the_same_operation() {
     let summary = e.find("copied ").unwrap_or_else(|| panic!("{e}"));
     assert!(note < resumed && resumed < summary, "note, then resumed, then the summary: {e}");
     let v = json_of(&out);
+    let n: u64 = e[resumed + "resumed ".len()..]
+        .split(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap_or_else(|_| panic!("{e}"));
+    assert_eq!(
+        Some(n),
+        v["files_skipped"].as_u64(),
+        "the resumed count is the skipped count: {e} {v}"
+    );
     assert_eq!(v["files_total"].as_u64(), Some(300), "{v}");
     let (copied, skipped) =
         (v["files_copied"].as_u64().unwrap(), v["files_skipped"].as_u64().unwrap());
@@ -568,17 +579,26 @@ fn a_resume_killed_again_resumes_a_third_time() {
     let (src, dst) = big_tree_in(d.path());
     Stalled::start(&src, &dst, 500, marks1.path()).kill();
     let id = the_operation(&dst);
-    // The resume skips the first directory (and any claimed file) and stalls 200 mutations into what is left.
-    Stalled::start_args(&src, &dst, 200, marks2.path(), &["--resume"]).kill();
+    let after_first = published(&dst);
+    // The resume skips d0 and re-copies d1 (its claims were unsynced). Stall 400 (not 200: that lands where the first
+    // stall did, measured 165 published both times): past d1 and into d2, so progress past the first stall is real.
+    Stalled::start_args(&src, &dst, 400, marks2.path(), &["--resume"]).kill();
     assert_eq!(the_operation(&dst), id, "the same operation, not a new one");
     assert!(claim_count(&dst, &id) >= 100, "the claims survived both kills");
     let m = manifest_of(&dst, &id);
     assert_eq!(m.format_version, 3);
     assert_eq!(m.state, flux_core::state::OpState::Transferring);
-    assert!(published(&dst) > 100, "the second run made progress past the first directory");
+    assert!(
+        published(&dst) > after_first,
+        "the second run published past the first stall: {} then {after_first}",
+        published(&dst)
+    );
 
-    let out = copy(&[os("--resume"), src.as_os_str(), dst.as_os_str()]);
+    let out = copy(&[os("--resume"), os("--json"), src.as_os_str(), dst.as_os_str()]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v = json_of(&out);
+    assert!(v["files_skipped"].as_u64().unwrap() >= 100, "{v}");
+    assert_eq!(v["files_total"].as_u64(), Some(300), "{v}");
     assert!(stderr(&out).contains(&format!("resuming operation {id} (")), "{}", stderr(&out));
     same_bytes(&src, &dst);
     assert!(!dst.join(".flux").exists());
@@ -660,6 +680,11 @@ fn a_killed_single_file_copy_resumes_keeping_its_id_and_bumping_its_generation()
 
     // Killed with the temporary written (sweep 1, temporary 2, publish 3).
     Stalled::start(&src.join("a"), &t, 3, m1.path()).kill();
+    let left = names(d.path());
+    assert!(
+        left.iter().any(|n| n.starts_with("t.flux-partial.")),
+        "the stall landed after the temporary: {left:?}"
+    );
     let (_, first) = record_of(d.path());
     let first_file = first.file.clone().expect("a single-file record");
     assert_eq!(first_file.artifact_generation, 1);
@@ -687,4 +712,47 @@ fn a_killed_single_file_copy_resumes_keeping_its_id_and_bumping_its_generation()
     assert!(note < summary, "the note comes before the summary: {e}");
     assert_eq!(std::fs::read(&t).unwrap(), b"A");
     assert_eq!(names(d.path()), ["src", "t"]);
+}
+
+/// Spec "Testing": under the default overwrite policy the claim count equals the file count. Guard calls (measured
+/// by the published-file counts and the stall announcements below): d0's create is #1, its 100 files #2..#301, its
+/// DirEnd flush #302, d1's create #303. Stall 1 at 303: d0 whole and its claims synced, d1 not begun. The resume
+/// (`--durability strict`, allowed from normal and recorded) skips d0's files, so its calls are d0 create + DirEnd
+/// (2) + d1 (1 + 300 + 1) + d2 (302) = 606: stall at 606, d2's DirEnd flush, every file published, every claim durable.
+#[test]
+fn the_claim_count_equals_the_file_count_under_the_default_policy() {
+    let d = TempDir::new().unwrap();
+    let (m1, m2) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (src, dst) = big_tree_in(d.path());
+    Stalled::start(&src, &dst, 303, m1.path()).kill();
+    let id = the_operation(&dst);
+    assert_eq!(published(&dst), 100, "d0 whole, d1 not begun");
+    assert_eq!(claim_count(&dst, &id), 100, "d0's claims were synced at its end");
+
+    Stalled::start_args(&src, &dst, 606, m2.path(), &["--resume", "--durability", "strict"]).kill();
+    assert_eq!(the_operation(&dst), id);
+    assert_eq!(published(&dst), 300, "every file is published at d2's flush");
+    same_bytes(&src, &dst);
+    assert_eq!(claim_count(&dst, &id), 300, "the claim count equals the file count");
+    let m = manifest_of(&dst, &id);
+    assert_eq!(m.format_version, 3);
+    assert_eq!(m.state, flux_core::state::OpState::Transferring);
+    assert_eq!(m.config.expect("format 3 carries a config").options.durability, "strict");
+
+    let out = copy(&[
+        os("--resume"),
+        os("--durability"),
+        os("strict"),
+        os("--json"),
+        src.as_os_str(),
+        dst.as_os_str(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let e = stderr(&out);
+    assert!(e.contains(&format!("resuming operation {id} (300 entries claimed)")), "{e}");
+    let v = json_of(&out);
+    assert_eq!(v["files_skipped"].as_u64(), Some(300), "{v}");
+    assert_eq!(v["files_copied"].as_u64(), Some(0), "{v}");
+    same_bytes(&src, &dst);
+    assert!(!dst.join(".flux").exists());
 }
