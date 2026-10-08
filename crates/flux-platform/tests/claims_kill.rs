@@ -17,6 +17,13 @@ const THRESHOLDS: [u64; 24] = [
     480, 960, 1920,
 ];
 const MODES: [&str; 3] = ["normal", "normal-nocap-test", "strict"];
+/// The largest threshold `strict` mode is run at; larger ones are skipped for `strict` only.
+///
+/// Strict commits are `Immediate` on every claim, so each claim is an fsync, and past this point
+/// the extra claims cost minutes on Windows and add no new coverage: the cap-sync behaviour at
+/// 1000 and above is exercised by `normal-nocap-test`, which keeps every threshold. The owner
+/// approved this gate change in 2026-10 (cut 8b); `normal` and `normal-nocap-test` are unchanged.
+const STRICT_MAX_THRESHOLD: u64 = 332;
 
 fn key_for(i: u64) -> ClaimKey {
     ClaimKey { parent: PARENT, name: i.to_be_bytes().to_vec() }
@@ -59,6 +66,9 @@ fn killed_mid_stream_the_store_reopens_with_a_prefix() {
     let mut run = 0u32;
     for &threshold in &THRESHOLDS {
         for mode in MODES {
+            if mode == "strict" && threshold > STRICT_MAX_THRESHOLD {
+                continue;
+            }
             run += 1;
             let path = dir.path().join(format!("{run}-{mode}-{threshold}.db"));
             let mut child = Command::new(&exe)

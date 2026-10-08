@@ -318,11 +318,6 @@ From the final review of cut 8a; none is a reachable defect without a race or pr
       only for an absent DEST, not an existing DEST or a filesystem-root DEST. No test marks a pre-existing directory
       `MountRoot::No` explicitly (the fake's default does it implicitly); the Linux `Unknown` outcome of `mount_root`
       and the macOS device comparison run only on CI.
-- [ ] **The dev box lacks the macOS and Windows cross targets** (`aarch64-apple-darwin`, `x86_64-pc-windows-msvc`), so
-      `just check-mac` cannot run locally and a macOS compile error cost a CI round trip (cut 8b spike). Declaring the
-      targets in `.claude/recommended-tools.json` is not expressible yet: its checks are `in_path` / `file_exists` only,
-      and a rustup target is a directory under a toolchain-specific path. Either extend the schema or document
-      `rustup target add` in the contributor notes.
 
 ## Cut 8b known limits
 
@@ -336,7 +331,8 @@ are the spec's).
 - [ ] **4. A directory with millions of entries** holds its listing in memory while the walk is inside it (the source
       side already does).
 - [ ] **4a. Under `Durability::Normal` a process kill can lose the current directory's claims** (up to 1000 commits):
-      documented, reconciled by the WAL cut.
+      claims written since the last directory end or the store's 1000-claim cap are lost on a process crash. Documented;
+      cut 9's WAL/recovery must reconcile the resulting "unclaimed published entries".
 - [ ] **5. A replacement reads the destination's metadata twice** (the policy decision, then the section 129 gate): one
       extra stat per replaced file, accepted. If an outside process removes the entry between the two reads, the gate
       sees `NotFound`, the claim is still written and the file is published as new but counted as an overwrite (the
@@ -346,8 +342,10 @@ are the spec's).
       (`before_create`), the upgrade and frame update in `tree.rs` after the copy path returns. Accepted, to keep the
       claim after the gate and guard.
 - [ ] **7. A junction at the destination name on case-insensitive Windows:** `metadata` reports it as a link; whether
-      `rename_replace` of a file over it fails or replaces the junction itself is unmeasured (see the debt entry below).
-      Required outcome: a per-target result, never a traversal of the junction.
+      `rename_replace` of a file over it fails or replaces the junction itself is unmeasured. Required outcome: a
+      per-target result, never a traversal of the junction. The test `a_file_over_a_junction_at_the_destination_name`
+      pins only that nothing is written through the junction; CI hides a passing test's printed outcome, so read the
+      observed outcome from a run with output capture, then pin it.
 - [ ] **8. A hardlink alias on a case-insensitive destination:** an alias of an existing entry in the same directory
       makes the alias's target fail rather than replace (no unique identity match).
 - [ ] **9. Closing the claim store always commits:** `redb` 4.3.0 `Database::drop` is an `Immediate` write commit plus
@@ -366,27 +364,21 @@ are the spec's).
 
 ## Cut 8b debt
 
-- [ ] **Closing the redb claim store always commits** (known limit 9): a non-committing close needs `redb` support or
-      a different backend; the `Lost`-path close is a write without ownership.
 - [ ] **Propose the section 241.5 clarifications to the spec owner.** Cut 8b made these choices where the spec is
       silent: the claim key is the parent directory's identity plus the stored entry name; a claim is never released; a
       claim is written before the temporary is created and after the section 129 gate; a published new entry gets a
       `Created` claim (the upgrade of the target's own record, plus a second claim for a differing spelling after
       publication); a directory whose identity is not `Strong` degrades to no-replace.
-- [ ] **The unsynced-claim window.** Under `Durability::Normal`, claims written since the last directory end or the
-      store's 1000-claim cap are lost on a process crash. The WAL cut must reconcile "unclaimed published entries".
 - [ ] **`state.db` is created right after the workspace is published** (Windows refuses to rename a directory that
       contains an open file). A crash between the publish and the creation leaves a manifest-only workspace that
       `--restart` supersedes.
-- [ ] **The Windows outcome of `rename_replace` of a file over a directory junction is not recorded.** The test
-      `a_file_over_a_junction_at_the_destination_name` pins only that nothing is written through the junction. Read the
-      observed outcome from a CI run with output capture, then pin it.
-- [ ] **The Windows kill test is slow.** `claims_kill` (`crates/flux-platform/tests/claims_kill.rs`) takes about 5
-      minutes on windows-latest (strict mode, an fsync per claim, 24 thresholds). Trim the thresholds in strict mode, or
-      run it on a schedule.
-- [ ] **`redb` file locking on network or 9p mounts is unmeasured** (known limit 3).
-- [ ] **The macOS case-folding comparison** stays the existing debt: see "Part A's containment compare is
-      case-sensitive" under "Cut 8a debt".
+- [x] **The Windows kill test is slow - RESOLVED in the hygiene sweep PR (commit `test: skip the large strict-mode kill
+      thresholds (an owner-approved gate change)`).** Was: `claims_kill` (`crates/flux-platform/tests/claims_kill.rs`)
+      took about 5 minutes on windows-latest (strict mode, an fsync per claim, 24 thresholds). Now, in strict mode only,
+      thresholds >= 333 are skipped (strict rows 24 -> 16); `normal` and `normal-nocap-test` keep all 24, so the
+      cap-sync coverage is unchanged. Windows `killed_mid_stream_the_store_reopens_with_a_prefix`: PASS in 86.7 s in CI
+      run 37722253880, versus 311.7 s before. One run each, not a controlled measurement (hosted runners swing about 40%
+      run to run).
 - [ ] **The fake `FaultFs` case-insensitive mode is ASCII-only** and does not normalize `read_file`, `remove_dir`,
       `create_lock`, `open_lock`, `create_claim_store` or the path-level `open_read`.
 - [ ] **Nothing pins the claim store's cache bound.** Removing `Builder::set_cache_size(CACHE_BYTES)` in
@@ -396,11 +388,6 @@ are the spec's).
 
 ## Scaffolding follow-ups
 
-- [ ] Install `cargo-mutants` (`cargo binstall -y cargo-mutants`) — it is the one
-      tool in `.claude/recommended-tools.json` not yet present on the dev box
-      `UNVERIFIABLE` 2026-09-22: completion is the state of one machine, which the repository
-      cannot record. Observed at the time: `command -v cargo-mutants` says INSTALLED, and the tool
-      is declared in `.claude/recommended-tools.json`.
 - [ ] Run `lefthook install` in each clone (or add it to a bootstrap recipe)
 - [ ] Replace the placeholder `benches/copy.rs` once there is a pipeline to measure
 - [ ] Replace the placeholder test in `tests/integration/mod.rs` with the first
@@ -432,13 +419,10 @@ each was re-measured on `origin/main` that day.
       patch release goes stale the moment the next one ships and nothing in the repo notices. That is how the
       previous value drifted: it read 1.85 while the code had needed 1.88 for some time, and `criterion`
       already required 1.86. Decide which of the two this repo actually wants before writing either job.
-- [ ] **`ci.yml` has no `permissions:` or `concurrency:` block**, so its jobs get the repository's default token
-      scope and superseded pull-request runs are not cancelled. Add `permissions: contents: read` and a
-      concurrency group.
-      (Narrowed 2026-09-26: `ci.yml` already has a `concurrency:` block —
-      `group: ci-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}`, added by commit
-      `e94b20c` to dedupe push/pull_request runs and cancel a superseded branch push. What remains is
-      `permissions:`, still absent.)
+- [x] **`ci.yml` token scope - DONE in the hygiene sweep PR (commit `ci: restrict the CI token to contents: read`).**
+      Was: jobs got the repository's default token scope. `ci.yml` now sets a top-level `permissions: contents: read`.
+      The `concurrency:` block already existed (`group: ci-${{ github.event_name }}-${{ github.head_ref ||
+      github.ref_name }}`, added by commit `e94b20c`), so nothing was added there.
 - [ ] **An empty release pull request is indistinguishable from a real one.** `release-plz` opens one on
       every push to `main`, and `release-plz.toml` deliberately skips `spec`, `design`, `plan`, `model`,
       `docs`, `skills` and `test` — which is most work in this repository — so a typical push produces a
@@ -452,14 +436,13 @@ each was re-measured on `origin/main` that day.
 
 Triage of 2026-09-23 adds one more, re-measured that day.
 
-- [ ] **`cargo-mutants` reports false `MISSED` for a package whose tests live in `tests/`.** On `flux-platform` it
-      called 12 of 26 mutants missed, including `destination_is_write_protected -> false`; applying that mutant by
-      hand fails two tests, `rename_replace_refuses_a_read_only_target` and `..._denied_by_acl`. The package has
-      **zero** `#[test]` functions in `src/` and 22 across `tests/std_fs.rs` and `tests/fs_semantics.rs`, and the
-      mutants harness is not running them. `flux-core`'s results are trustworthy for the opposite reason — its tests
-      are lib tests. Until this is pinned down, read a `flux-platform` mutants report as unverified: confirm each
-      claimed survivor by applying it by hand. Fix by giving the package a `.cargo/mutants.toml` with the right
-      test scope, or by proving which invocation the harness actually uses.
+- [ ] **A `flux-platform` mutants report covers the Unix half only.** The original observation (12 of 26 mutants missed,
+      made on the previous Windows development machine) is unverified here and was not reproduced on Linux: for `cargo
+      mutants -p flux-platform --re destination_is_write_protected --no-shuffle`, 10 mutants ran, 5 CAUGHT and 5 MISSED.
+      All 5 `#[cfg(unix)]` mutants (including `-> true` and `-> false`) are caught; the 5 MISSED are the
+      `#[cfg(windows)]` twin, which is not compiled on Linux, so no Linux test can catch them. No `.cargo/mutants.toml`
+      is needed for the Linux result. A Windows-only mutant can be judged only on Windows (the CI Windows leg or a
+      Windows box), so read a `flux-platform` mutants report as covering the Unix half only until then.
 
 ## Spec gaps from the filesystem probes
 
@@ -485,8 +468,12 @@ against spec V16.
 From plan 2, now merged (was PR #3). Each was verified by measurement; M5 to M8 come from the plan-2 test
 audit (`docs/agy-test-audit-ledger.md`), where the owner deferred them as minor.
 
-- [ ] **Cache the TLC jar in CI.** Each `model.yml` scenario job downloads and checksums `tla2tools.jar` on its own;
-      an `actions/cache` step keyed on the pinned tag removes the repeated downloads and their failure chances.
+- [x] **Cache the TLC jar in CI - DONE in the hygiene sweep PR (commit `ci: cache the pinned TLC jar across the model
+      jobs`).** Was: each `model.yml` scenario job downloaded and checksummed `tla2tools.jar` on its own. Now
+      `actions/cache@v6` restores the jar, keyed on the pin read from `models/lockproto/run.py`, and `run.py` still
+      SHA-256 checks the restored jar. A manual `Model` dispatch run on the branch (GitHub Actions run 37722300785) was
+      started to exercise a cold cache; it was still in progress when this was written, so its result is not recorded
+      here.
 - [ ] **`--no-renames` is unpinned.** Removing it from `model.yml`'s change detection keeps every test green, and
       then a pull request that only moves a file out of `models/` skips the model jobs. Test the step itself, or move
       change detection into `run.py`.
@@ -640,6 +627,12 @@ stated so the next audit starts from a prediction rather than a hunt.
       predicate separates a torn crash from a crash in the middle of a write (cut 6, item 6).
 
 ## Performance (preliminary speed probe, 2026-10-02)
+
+The figures below were measured on the previous Windows development machine (NTFS C:, Defender on). The development
+machine is now a Linux ext4 box with 8 cores and no `robocopy`, so they are not a baseline here. A re-probe needs
+a fresh baseline on this machine with comparators that exist here (`cp`, `rsync`); a `robocopy` comparison needs a
+Windows machine or the CI Windows leg. Any measurement waits for the owner's OK, an idle machine and two runs
+quoted as a range.
 
 Measured at cut 7b Part 1 (`f755c50`, release build) against robocopy and FastCopy 5.12.0 (`fcp.exe`). Method:
 - C: (NTFS, not the ReFS Dev Drive, where Windows' own copy can clone blocks);

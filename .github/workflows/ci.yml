@@ -35,6 +35,12 @@ concurrency:
   group: ci-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: ${{ github.ref_name != 'main' }}
 
+# The default GITHUB_TOKEN scope is set per repository and can be read-write. No job here comments on a
+# pull request, pushes, uploads a release or writes a check, so the whole workflow gets read-only
+# contents; a job that ever needs more must declare its own `permissions:` rather than widen this.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
