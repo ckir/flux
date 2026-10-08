@@ -145,14 +145,32 @@ impl CopyError {
 /// lock passes `&unguarded`.
 pub type Guard<'g> = dyn Fn() -> flux_fs::Result<()> + 'g;
 
+/// The largest read buffer of the copy loop. Measured 2026-10 on Linux ext4 (one 4 GiB file): pooled over 18 runs per
+/// side the 64 KiB buffer's median wall time was about 33% higher than 256 KiB's (7.02 s versus 5.28 s), with slow
+/// outliers (7 of 18 runs over 8 s versus none); 1 MiB and 4 MiB were no better. The buffer is allocated per file, so
+/// a larger fixed size would also cost every small copy a zero-filled allocation, and multiply memory under parallel
+/// copy.
+pub(crate) const COPY_BUF_MAX: usize = 256 * 1024;
+
+/// The smallest read buffer: an empty or tiny source still needs a usable buffer. The source can grow while it is
+/// copied (the post-copy re-check catches that), so the buffer is never sized to a length of 0.
+pub(crate) const COPY_BUF_MIN: usize = 4 * 1024;
+
+/// The copy loop's buffer length for a source of `src_len` bytes: the length clamped into
+/// `COPY_BUF_MIN..=COPY_BUF_MAX`. Sized from the source because the buffer is allocated per file, so small files must
+/// not pay for a large one. The clamp is done in `u64` before the cast, so it is exact on 32-bit targets.
+pub(crate) fn copy_buffer_len(src_len: u64) -> usize {
+    src_len.clamp(COPY_BUF_MIN as u64, COPY_BUF_MAX as u64) as usize
+}
+
 /// The guard of a copy that holds no lock.
 pub(crate) fn unguarded() -> flux_fs::Result<()> {
     Ok(())
 }
 
-/// §101's heartbeat (cut 7b): called before every guarded destination mutation and after every 64 KiB written. The run
-/// refreshes its lock record there once the interval has passed; its failure stops the copy at `CopyStep::Heartbeat`. A
-/// copy that holds no lock passes `&no_heartbeat`.
+/// §101's heartbeat (cut 7b): called before every guarded destination mutation and after every chunk written (at
+/// most `COPY_BUF_MAX` bytes). The run refreshes its lock record there once the interval has passed; its failure
+/// stops the copy at `CopyStep::Heartbeat`. A copy that holds no lock passes `&no_heartbeat`.
 pub type Heartbeat<'g> = dyn Fn() -> flux_fs::Result<()> + 'g;
 
 /// The heartbeat of a copy that holds no lock.
@@ -426,9 +444,9 @@ pub fn copy_file_at<F: DestinationRoot>(
 /// failed guard stops the copy at that point: before the create it creates nothing, and at the publish or a removal
 /// the temporary stays, reported as `leftover`.
 ///
-/// `beat` runs immediately before each of those guard calls except the removal's, and after every 64 KiB written (cut
-/// 7b). Its failure is `CopyStep::Heartbeat`: before the create it creates nothing; after it, the temporary is removed
-/// as for any other failure.
+/// `beat` runs immediately before each of those guard calls except the removal's, and after every chunk written (cut
+/// 7b; at most `COPY_BUF_MAX` bytes). Its failure is `CopyStep::Heartbeat`: before the create it creates nothing;
+/// after it, the temporary is removed as for any other failure.
 ///
 /// `before_create` (cut 8b) is called exactly once per copy that reaches the create: after the heartbeat and guard that
 /// precede the exclusive create, and before the temporary exists. Its error stops the copy there, creating nothing.
@@ -512,7 +530,7 @@ pub fn copy_file_guarded<F: DestinationRoot>(
 
     // 4. stream
     let mut bytes_copied = 0u64;
-    let mut buf = vec![0u8; 64 * 1024];
+    let mut buf = vec![0u8; copy_buffer_len(src_meta.len)];
     loop {
         let n = match std::io::Read::read(&mut reader, &mut buf) {
             Ok(0) => break,
@@ -525,7 +543,7 @@ pub fn copy_file_guarded<F: DestinationRoot>(
             return Err(discard(parent, &temp, CopyStep::Stream, copy_code(&e), e, guard));
         }
         bytes_copied += n as u64;
-        // §101 (cut 7b): the heartbeat, once per 64 KiB chunk.
+        // §101 (cut 7b): the heartbeat, once per chunk (at most COPY_BUF_MAX bytes).
         if let Err(e) = beat() {
             return Err(discard(parent, &temp, CopyStep::Heartbeat, e.code, e.source, guard));
         }
@@ -942,15 +960,56 @@ mod tests {
     #[test]
     fn a_source_larger_than_the_buffer_copies_every_byte() {
         // Every other test uses five bytes, so the read loop has only ever run once.
-        // The buffer is 64 KiB; this forces several iterations and a short final read.
+        // The buffer is at most COPY_BUF_MAX; this forces several iterations and a short final read.
         let fs = FaultFs::new();
-        let big: Vec<u8> = (0..(64 * 1024 * 2 + 7)).map(|i| (i % 251) as u8).collect();
+        let big: Vec<u8> = (0..(COPY_BUF_MAX * 2 + 7)).map(|i| (i % 251) as u8).collect();
         fs.write_file("/src", &big);
 
         let out = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap();
 
         assert_eq!(out.bytes_copied, big.len() as u64);
         assert_eq!(fs.read_file("/dst").as_deref(), Some(&big[..]));
+    }
+
+    #[test]
+    fn the_copy_buffer_is_the_source_length_clamped_to_4_kib_and_256_kib() {
+        let table: [(u64, usize); 10] = [
+            (0, 4096),
+            (1, 4096),
+            (4095, 4096),
+            (4096, 4096),
+            (10_000, 10_000),
+            (262_143, 262_143),
+            (262_144, 262_144),
+            (262_145, 262_144),
+            (4_294_967_296, 262_144),
+            (u64::MAX, 262_144),
+        ];
+        for (len, want) in table {
+            assert_eq!(copy_buffer_len(len), want, "source length {len}");
+        }
+    }
+
+    #[test]
+    fn an_empty_source_copies_to_an_empty_file() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"");
+        let out = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap();
+        assert_eq!(out.bytes_copied, 0);
+        assert_eq!(fs.read_file("/dst").as_deref(), Some(&b""[..]));
+    }
+
+    #[test]
+    fn a_source_of_exactly_the_cap_and_one_byte_over_copy_every_byte() {
+        for len in [COPY_BUF_MAX, COPY_BUF_MAX + 1] {
+            let fs = FaultFs::new();
+            // Non-repeating over the whole length: a short or repeated read changes some byte.
+            let data: Vec<u8> = (0..len).map(|i| ((i * 31 + i / 251) % 256) as u8).collect();
+            fs.write_file("/src", &data);
+            let out = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &opts()).unwrap();
+            assert_eq!(out.bytes_copied, len as u64, "length {len}");
+            assert_eq!(fs.read_file("/dst").as_deref(), Some(&data[..]), "length {len}");
+        }
     }
 
     #[test]
@@ -1546,9 +1605,9 @@ mod tests {
     }
 
     #[test]
-    fn the_copy_heartbeats_before_each_guarded_mutation_and_every_64_kib() {
+    fn the_copy_heartbeats_before_each_guarded_mutation_and_every_chunk() {
         let fs = FaultFs::new();
-        fs.write_file("/src", &vec![7u8; 130 * 1024]);
+        fs.write_file("/src", &vec![7u8; COPY_BUF_MAX * 2 + 7]);
         let root = fs.destination_root(Path::new("/")).unwrap();
         let calls = std::cell::Cell::new(0);
         let beat = beat_counting(0, &calls);
@@ -1563,14 +1622,14 @@ mod tests {
             &no_before_create,
         )
         .unwrap();
-        // The sweep, the create, three chunks (64 + 64 + 2 KiB), the publish.
+        // The sweep, the create, three chunks (COPY_BUF_MAX + COPY_BUF_MAX + 7 bytes), the publish.
         assert_eq!(calls.get(), 6);
     }
 
     #[test]
     fn a_heartbeat_failure_in_the_loop_removes_the_temporary_and_never_publishes() {
         let fs = FaultFs::new();
-        fs.write_file("/src", &vec![7u8; 130 * 1024]);
+        fs.write_file("/src", &vec![7u8; COPY_BUF_MAX * 2 + 7]);
         let root = fs.destination_root(Path::new("/")).unwrap();
         let calls = std::cell::Cell::new(0);
         // The sweep (1) and the create (2) pass; the first chunk's (3) fails.
