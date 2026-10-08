@@ -2291,6 +2291,7 @@ fn a_target_that_finds_its_own_claim_proceeds() {
         guard: &unguarded,
         beat: &no_heartbeat,
         claims: Some(&claims),
+        resume: false,
     };
     let mut out = TreeOutcome::default();
     let mut got = Vec::new();
@@ -3230,4 +3231,303 @@ fn a_refused_unchanged_single_file_after_adoption_keeps_the_record() {
         (OpState::Failed, 3, id(5).as_str())
     );
     assert!(!fs.exists(T_LOCK), "released");
+}
+
+// Cut 9a Task 7: the walk's resume branch.
+
+/// `/src/a` (1 byte, modified at `a_secs`) and `/src/sub/b` (2 bytes, modified at 100); `/p` exists.
+fn fake_src(a_secs: u64) -> FaultFs {
+    let fs = FaultFs::new();
+    for d in ["/src", "/src/sub", "/p"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    put(&fs, "/src/a", b"A", a_secs);
+    put(&fs, "/src/sub/b", b"BB", 100);
+    fs
+}
+
+/// A claim `(/p/dest, name) -> target, status` in prior `n`'s store, flushed and dropped.
+fn claimed(fs: &FaultFs, n: u8, name: &str, status: ClaimStatus, target: &str) {
+    claimed_under(fs, n, strong(fs, "/p/dest"), name, status, target);
+}
+
+fn claimed_under(
+    fs: &FaultFs,
+    n: u8,
+    dir: ObjectId,
+    name: &str,
+    status: ClaimStatus,
+    target: &str,
+) {
+    let mut store = prior_store(fs, n);
+    let record = ClaimRecord { target: key(target), status };
+    let k = ClaimKey::new(dir, OsStr::new(name));
+    assert!(matches!(store.insert_if_absent(&k, &record).unwrap(), ClaimOutcome::Inserted));
+    store.flush().unwrap();
+}
+
+/// A resumable prior 5 over a destination holding `a` (`bytes`, modified at `dest_secs`) and a claim on it.
+fn resumable(src_secs: u64, dest_bytes: &[u8], dest_secs: u64, status: ClaimStatus) -> FaultFs {
+    resumable_with(&opts(), src_secs, dest_bytes, dest_secs, status)
+}
+
+/// `resumable`, the prior having run with `o` (a resume must run with the same options).
+fn resumable_with(
+    o: &CopyOptions,
+    src_secs: u64,
+    dest_bytes: &[u8],
+    dest_secs: u64,
+    status: ClaimStatus,
+) -> FaultFs {
+    let fs = fake_src(src_secs);
+    prior3_with(&fs, 5, OpState::Transferring, o);
+    put(&fs, "/p/dest/a", dest_bytes, dest_secs);
+    claimed(&fs, 5, "a", status, "a");
+    fs
+}
+
+fn step_of(f: &TreeFailure) -> CopyStep {
+    match &f.cause {
+        TreeFailureCause::Copy(e) => e.step,
+        other => panic!("unexpected cause {other:?}"),
+    }
+}
+
+fn why(f: &TreeFailure) -> String {
+    match &f.cause {
+        TreeFailureCause::Copy(e) => e.cause.to_string(),
+        other => panic!("unexpected cause {other:?}"),
+    }
+}
+
+#[test]
+fn an_own_created_claim_with_matching_size_and_mtime_is_skipped_as_resumed() {
+    let fs = resumable(100, b"o", 101, ClaimStatus::Created);
+    let (r, got) = run_tree_with(&fs, &resume(), &opts());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!((out.files_resumed, out.bytes_resumed), (1, 1));
+    assert_eq!((out.files_copied, out.files_overwritten), (1, 0));
+    // Only the run's own calls: the setup inserted the claim.
+    let all = calls(&fs);
+    let c = &all[at(&all, "open_claim_store(")..];
+    assert!(c.iter().any(|x| x == "claim_get(a)"), "{c:?}");
+    assert!(!c.iter().any(|x| x.starts_with("create_new(/p/dest/a.flux-partial.")), "{c:?}");
+    assert!(!c.iter().any(|x| x == "claim_insert(a)" || x == "claim_upgrade(a)"), "{c:?}");
+    assert_eq!(fs.read_file("/p/dest/a").unwrap(), b"o");
+    adopted(&r, 5, Some(1));
+}
+
+#[test]
+fn an_mtime_outside_two_seconds_is_recopied_and_two_seconds_counts_as_equal() {
+    // (source mtime, destination mtime, resumed)
+    for (src, dest, resumed) in
+        [(100, 102, true), (100, 103, false), (103, 100, false), (102, 100, true)]
+    {
+        let fs = resumable(src, b"o", dest, ClaimStatus::Created);
+        let (r, got) = run_tree_with(&fs, &resume(), &with_policy(ExistingPolicy::Overwrite));
+        let out = ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(out.files_resumed, u64::from(resumed), "src {src} dest {dest}");
+        assert_eq!(out.files_overwritten, u64::from(!resumed), "src {src} dest {dest}");
+    }
+}
+
+#[test]
+fn a_size_mismatch_goes_to_the_normal_path_under_each_policy() {
+    // (policy, overwritten, skipped)
+    for (policy, overwritten, skipped) in [
+        (ExistingPolicy::Overwrite, 1, 0),
+        (ExistingPolicy::Update, 1, 0),
+        (ExistingPolicy::SkipExisting, 0, 1),
+    ] {
+        let o = with_policy(policy);
+        let fs = resumable_with(&o, 100, b"old!", 100, ClaimStatus::Created);
+        let (r, got) = run_tree_with(&fs, &resume(), &o);
+        let out = ok(&r);
+        assert!(got.is_empty(), "{policy:?}: {got:?}");
+        assert_eq!(out.files_resumed, 0, "{policy:?}");
+        assert_eq!(
+            (out.files_overwritten, out.files_skipped),
+            (overwritten, skipped),
+            "{policy:?}"
+        );
+        if skipped == 1 {
+            assert_eq!(fs.read_file("/p/dest/a").unwrap(), b"old!");
+        }
+    }
+}
+
+#[test]
+fn a_missing_or_unknown_mtime_never_resumes() {
+    // The destination written with `write_file` has no modified time in the fake.
+    let fs = fake_src(100);
+    prior3(&fs, 5, OpState::Transferring);
+    fs.write_file("/p/dest/a", b"o");
+    claimed(&fs, 5, "a", ClaimStatus::Created, "a");
+    let (r, _) = run_tree_with(&fs, &resume(), &opts());
+    let out = ok(&r);
+    assert_eq!((out.files_resumed, out.files_overwritten), (0, 1));
+    // Times not preserved: nothing to compare, so never.
+    let o = CopyOptions { preserve_times: Preserve::Off, ..opts() };
+    let fs = resumable_with(&o, 100, b"o", 100, ClaimStatus::Created);
+    let (r, _) = run_tree_with(&fs, &resume(), &o);
+    let out = ok(&r);
+    assert_eq!((out.files_resumed, out.files_overwritten), (0, 1));
+}
+
+#[test]
+fn an_absent_destination_with_an_own_created_claim_takes_the_new_file_path() {
+    let fs = fake_src(100);
+    prior3(&fs, 5, OpState::Transferring);
+    claimed(&fs, 5, "a", ClaimStatus::Created, "a");
+    let (r, got) = run_tree_with(&fs, &resume(), &opts());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!((out.files_copied, out.files_resumed), (2, 0));
+    let rec = fs.claim(strong(&fs, "/p/dest"), "a").expect("the claim stays");
+    assert_eq!((rec.target, rec.status), (key("a"), ClaimStatus::Created));
+}
+
+#[test]
+fn a_directory_at_a_claimed_name_fails_that_target_as_a_destination_error() {
+    let fs = fake_src(100);
+    prior3(&fs, 5, OpState::Transferring);
+    fs.create_dir(Path::new("/p/dest/a")).unwrap();
+    claimed(&fs, 5, "a", ClaimStatus::Created, "a");
+    let (r, got) = run_tree_with(&fs, &resume(), &opts());
+    let out = ok(&r);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(
+        (got[0].path.clone(), code_of(&got[0])),
+        (PathBuf::from("a"), Code::DestinationError)
+    );
+    assert_eq!(out.files_copied, 1, "sub/b copied");
+}
+
+#[test]
+fn an_own_existing_claim_is_redone() {
+    let fs = resumable(100, b"o", 100, ClaimStatus::Existing);
+    let (r, got) = run_tree_with(&fs, &resume(), &opts());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!((out.files_overwritten, out.files_resumed), (1, 0));
+}
+
+#[test]
+fn a_foreign_claim_on_resume_is_a_collision() {
+    let fs = fake_src(100);
+    prior3(&fs, 5, OpState::Transferring);
+    put(&fs, "/p/dest/a", b"o", 100);
+    claimed(&fs, 5, "a", ClaimStatus::Created, "other");
+    let (r, got) = run_tree_with(&fs, &resume(), &opts());
+    ok(&r);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].path, PathBuf::from("a"));
+    assert_eq!(code_of(&got[0]), Code::DestinationNamespaceCollision);
+    assert_eq!(step_of(&got[0]), CopyStep::Claim);
+    assert_eq!(fs.read_file("/p/dest/a").unwrap(), b"o");
+}
+
+#[test]
+fn a_claim_lookup_error_fails_that_target_only() {
+    let fs = resumable(100, b"o", 100, ClaimStatus::Created);
+    fs.fail("claim_get", Code::IoError);
+    let (r, got) = run_tree_with(&fs, &resume(), &opts());
+    let out = ok(&r);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].path, PathBuf::from("a"));
+    assert_eq!((code_of(&got[0]), step_of(&got[0])), (Code::IoError, CopyStep::Claim));
+    assert_eq!(out.files_copied, 1, "sub/b copied");
+}
+
+#[test]
+fn a_resumed_skip_registers_the_owner_so_a_fold_onto_it_is_refused() {
+    let fs = FaultFs::new();
+    for d in ["/src", "/p"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    put(&fs, "/src/B", b"1", 100);
+    put(&fs, "/src/b", b"2", 100);
+    prior3(&fs, 5, OpState::Transferring);
+    put(&fs, "/p/dest/B", b"1", 100);
+    claimed(&fs, 5, "B", ClaimStatus::Created, "B");
+    fs.set_case_insensitive(true);
+    let (r, got) = run_tree_with(&fs, &resume(), &opts());
+    let out = ok(&r);
+    assert_eq!(out.files_resumed, 1);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].path, PathBuf::from("b"));
+    assert_eq!(code_of(&got[0]), Code::DestinationNamespaceCollision);
+    assert!(why(&got[0]).contains("already wrote that destination entry"), "{}", why(&got[0]));
+}
+
+#[test]
+fn a_claim_keyed_by_another_directory_identity_resumes_nothing_and_copies_safely() {
+    let fs = fake_src(100);
+    prior3(&fs, 5, OpState::Transferring);
+    put(&fs, "/p/dest/a", b"o", 100);
+    let elsewhere = ObjectId { volume: 1, index: 999 };
+    claimed_under(&fs, 5, elsewhere, "a", ClaimStatus::Created, "a");
+    let (r, got) = run_tree_with(&fs, &resume(), &opts());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!((out.files_resumed, out.files_overwritten), (0, 1));
+}
+
+#[test]
+fn a_weak_identity_directory_reports_existing_files_as_collisions_on_resume() {
+    let fs = fake_src(100);
+    prior3(&fs, 5, OpState::Transferring);
+    put(&fs, "/p/dest/a", b"o", 100);
+    drop(prior_store(&fs, 5));
+    fs.set_identity("/p/dest", FileIdentity::Weak(ObjectId { volume: 1, index: 1 }));
+    let (r, got) = run_tree_with(&fs, &resume(), &opts());
+    let out = ok(&r);
+    assert_eq!(out.files_resumed, 0);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(code_of(&got[0]), Code::DestinationNamespaceCollision);
+    assert!(out.replace_degraded.is_some());
+}
+
+#[test]
+fn a_source_that_became_unreadable_between_runs_fails_that_target() {
+    let fs = resumable(100, b"o", 100, ClaimStatus::Created);
+    // The 2nd `metadata` call of the run: the 1st is `/src/a`... measured from `calls(&fs)` below, not assumed.
+    let probe = resumable(100, b"o", 100, ClaimStatus::Created);
+    run_tree_with(&probe, &resume(), &opts());
+    let c = calls(&probe);
+    let k = c.iter().filter(|x| x.starts_with("metadata(")).position(|x| x == "metadata(/src/a)");
+    let k = k.expect("a stat of /src/a") + 1;
+    // The first stat of `/src/a` is the resume branch's (it follows `metadata(/p/dest/a)`, precedes `claim_get(a)`).
+    let at_a = at(&c, "metadata(/src/a)");
+    assert_eq!(
+        (c[at_a - 1].as_str(), c[at_a + 1].as_str()),
+        ("metadata(/p/dest/a)", "claim_get(a)")
+    );
+    fs.fail_nth(
+        "metadata",
+        u32::try_from(k).unwrap(),
+        Code::PermissionDenied,
+        std::io::ErrorKind::PermissionDenied,
+    );
+    let (r, got) = run_tree_with(&fs, &resume(), &opts());
+    ok(&r);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].path, PathBuf::from("a"));
+    assert_eq!((code_of(&got[0]), step_of(&got[0])), (Code::PermissionDenied, CopyStep::Source));
+}
+
+#[test]
+fn the_lockless_copy_tree_never_resumes() {
+    let fs = fake_src(100);
+    fs.create_dir(Path::new("/p/dest")).unwrap();
+    put(&fs, "/p/dest/a", b"o", 100);
+    let mut got = Vec::new();
+    let out = crate::copy_tree(&fs, Path::new("/src"), Path::new("/p/dest"), &opts(), &mut |f| {
+        got.push(f)
+    })
+    .unwrap();
+    assert_eq!(out.files_resumed, 0);
+    assert!(!calls(&fs).iter().any(|x| x.starts_with("claim_get")));
 }

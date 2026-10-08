@@ -131,7 +131,7 @@ struct Inner {
 type ClaimMap = std::sync::Arc<Mutex<std::collections::BTreeMap<Vec<u8>, Vec<u8>>>>;
 
 /// The fake's claim store: the real store's key and value encodings over an in-memory map, with the call log and the
-/// fault keys `claim_insert`, `claim_upgrade`, `claim_flush`.
+/// fault keys `claim_insert`, `claim_get`, `claim_upgrade`, `claim_flush`.
 pub struct FakeClaimStore {
     map: ClaimMap,
     inner: std::sync::Arc<Mutex<Inner>>,
@@ -178,6 +178,7 @@ impl ClaimStore for FakeClaimStore {
     }
 
     fn get(&self, key: &ClaimKey) -> Result<Option<ClaimRecord>> {
+        self.record(format!("claim_get({})", String::from_utf8_lossy(&key.name)), "claim_get")?;
         let m = self.map.lock().unwrap();
         match m.get(&key.encode()) {
             Some(v) => Ok(Some(ClaimRecord::decode(v).ok_or_else(corrupt_claim)?)),

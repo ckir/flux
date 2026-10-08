@@ -13,7 +13,7 @@ use crate::walk::{Walk, WalkEvent, walk};
 use flux_fs::{
     ClaimKey, ClaimOutcome, ClaimRecord, ClaimStatus, ClaimStore, Code, CopyOptions,
     DestinationRoot, DirHandle, ExistingPolicy, FileIdentity, FileSystem, FileType, FluxPathKey,
-    FsError, Metadata, MetadataFailure, MountRoot, ObjectId, Publish, Safety,
+    FsError, Metadata, MetadataFailure, MountRoot, ObjectId, Preserve, Publish, Safety,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
@@ -57,6 +57,10 @@ pub struct TreeOutcome {
     /// Cut 8b: directories where claims could not be keyed, so existing files there are reported as collisions.
     /// The example is relative to the source root.
     pub replace_degraded: Option<DegradedGroup>,
+    /// Cut 9a: files the prior run completed, verified and skipped. Not in `files_skipped`; the CLI adds them.
+    pub files_resumed: u64,
+    /// Cut 9a: the source bytes of the files in `files_resumed`.
+    pub bytes_resumed: u64,
 }
 
 /// The operation stopped as a whole (cut 5, K1). `outcome` holds what was counted
@@ -319,6 +323,8 @@ pub(crate) struct Shared<'c, F: DestinationRoot> {
     pub(crate) beat: &'c Heartbeat<'c>,
     /// The run's claim store, open for the walk (cut 8b); `None` for a copy that holds no lock.
     pub(crate) claims: Option<&'c std::cell::RefCell<<F::Dir as DirHandle>::Claims>>,
+    /// Cut 9a: `--resume`: an own `Created` claim may skip its target.
+    pub(crate) resume: bool,
 }
 
 /// `copy_tree`'s body. Every `?` here is an abort; `copy_tree` pairs it with `out`,
@@ -379,6 +385,7 @@ fn run_tree<F: DestinationRoot>(
         guard: &unguarded,
         beat: &no_heartbeat,
         claims: None,
+        resume: false,
     };
     copy_tree_at(&cx, source.events, root, false, out, on_report).1
 }
@@ -743,6 +750,23 @@ fn update_replaces(src: &Metadata, dest: &Metadata) -> bool {
     src.len != dest.len || matches!((src.modified, dest.modified), (Some(s), Some(d)) if s > d)
 }
 
+/// Cut 9a, decision 2: the destination entry is a regular file of the source's length and, with times preserved
+/// (`preserve_times != Preserve::Off`), both modification times are known and differ by at most 2 seconds.
+/// With `Preserve::Off`, or either time unknown, never true.
+fn resumed_complete(src: &Metadata, dest: &Metadata, preserve_times: Preserve) -> bool {
+    if dest.file_type != FileType::File || src.len != dest.len || preserve_times == Preserve::Off {
+        return false;
+    }
+    match (src.modified, dest.modified) {
+        (Some(s), Some(d)) => {
+            let gap =
+                s.duration_since(d).or_else(|e| Ok::<_, ()>(e.duration())).unwrap_or_default();
+            gap <= std::time::Duration::from_secs(2)
+        }
+        _ => false,
+    }
+}
+
 fn target_failure(step: CopyStep, code: Code, why: &'static str) -> TreeFailureCause {
     TreeFailureCause::Copy(CopyError::at(step, FsError::new(code, std::io::Error::other(why))))
 }
@@ -838,6 +862,59 @@ fn copy_one<F: DestinationRoot>(
                 );
                 return finish_copy(path, Err(e), out, on_report);
             }
+            // Cut 9a: `--resume`. The branch mutates nothing at the destination, so it neither beats nor guards.
+            let mut src_known: Option<Metadata> = None;
+            if cx.resume {
+                let src_meta = match cx.fs.metadata(&src) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        let cause = TreeFailureCause::Copy(CopyError::at(CopyStep::Source, e));
+                        report(out, on_report, path, cause);
+                        return Ok(());
+                    }
+                };
+                let found = claims.borrow().get(&ClaimKey::new(parent_id, &stored));
+                match found {
+                    Err(e) => {
+                        return finish_copy(
+                            path,
+                            Err(CopyError::at(CopyStep::Claim, e)),
+                            out,
+                            on_report,
+                        );
+                    }
+                    Ok(Some(r)) if r.target == target => {
+                        if r.status == ClaimStatus::Created
+                            && resumed_complete(&src_meta, &meta, cx.opts.preserve_times)
+                        {
+                            out.files_resumed += 1;
+                            out.bytes_resumed += src_meta.len;
+                            names.record_publication(
+                                &target,
+                                Some(&stored),
+                                name,
+                                None,
+                                meta.identity,
+                            );
+                            return Ok(());
+                        }
+                    }
+                    Ok(Some(_)) => {
+                        let e = CopyError::at(
+                            CopyStep::Claim,
+                            FsError::new(
+                                Code::DestinationNamespaceCollision,
+                                std::io::Error::other(
+                                    "another target of this operation already claimed that destination entry",
+                                ),
+                            ),
+                        );
+                        return finish_copy(path, Err(e), out, on_report);
+                    }
+                    Ok(None) => {}
+                }
+                src_known = Some(src_meta);
+            }
             if meta.file_type == FileType::Dir {
                 let cause = target_failure(
                     CopyStep::Gate,
@@ -850,13 +927,17 @@ fn copy_one<F: DestinationRoot>(
             let skip = match cx.opts.existing {
                 ExistingPolicy::Overwrite => None,
                 policy => {
-                    let src_meta = match cx.fs.metadata(&src) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            let cause = TreeFailureCause::Copy(CopyError::at(CopyStep::Source, e));
-                            report(out, on_report, path, cause);
-                            return Ok(());
-                        }
+                    let src_meta = match src_known {
+                        Some(m) => m,
+                        None => match cx.fs.metadata(&src) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                let cause =
+                                    TreeFailureCause::Copy(CopyError::at(CopyStep::Source, e));
+                                report(out, on_report, path, cause);
+                                return Ok(());
+                            }
+                        },
                     };
                     let replace =
                         policy == ExistingPolicy::Update && update_replaces(&src_meta, &meta);
@@ -2108,6 +2189,7 @@ mod tests {
             guard,
             beat: &no_heartbeat,
             claims: None,
+            resume: false,
         };
         let mut out = TreeOutcome::default();
         let (_root, r) = copy_tree_at(&cx, source.events, root, false, &mut out, &mut |_| {});
@@ -2181,6 +2263,7 @@ mod tests {
             guard: &unguarded,
             beat: &beat,
             claims: None,
+            resume: false,
         };
         let mut out = TreeOutcome::default();
         let mut reported = 0;
@@ -2217,6 +2300,7 @@ mod tests {
             guard: &unguarded,
             beat: &beat,
             claims: None,
+            resume: false,
         };
         let mut out = TreeOutcome::default();
         let mut reported = 0;
@@ -2243,6 +2327,7 @@ mod tests {
             guard: &unguarded,
             beat: &no_heartbeat,
             claims: None,
+            resume: false,
         };
         let mut out = TreeOutcome::default();
         let (back, r) = copy_tree_at(&cx, source.events, root, false, &mut out, &mut |_| {});
