@@ -30,7 +30,7 @@ whatever the claims did not record.** That is safe because every published file 
    one that makes a new operation.) Temporary names `<name>.flux-partial.<id>` therefore match the killed run's, and the existing step-1 leftover sweep in
    `copy_file_guarded` removes the killed run's partial for the same target.
 2. **A target that finds its own `Created` claim** verifies the destination entry by **size and, when `preserve_times` is not `Off`, modification time**
-   against the source (the spec's `metadata` verification level; stronger levels are slice 9d). Match: skip (counted as resumed). Mismatch or absent: the normal path decides (the existing-file policy, exactly as for any existing destination file), so `--update` and `--skip-existing` never clobber a destination file someone changed during the downtime. With `preserve_times = Off` there is no source mtime to compare and a size alone is never enough (spec invariant 14), so the check cannot pass and the normal path decides; the CLI cannot request `Off` today (its flags yield `default` or `strict`).
+   against the source, two times counting as equal when they differ by at most 2 seconds (FAT stores 2-second times and a copy onto it truncates the source's, so an exact comparison would redo every file on such a destination) (the spec's `metadata` verification level; stronger levels are slice 9d). Match: skip (counted as resumed). Mismatch: the normal path decides (the existing-file policy, exactly as for any existing destination file; an absent entry takes the new-file path), so `--update` and `--skip-existing` never clobber a destination file someone changed during the downtime. With `preserve_times = Off` there is no source mtime to compare and a size alone is never enough (spec invariant 14), so the check cannot pass and the normal path decides; the CLI cannot request `Off` today (its flags yield `default` or `strict`).
 3. **A published file whose claim was lost** is reconciled by the existing-file policy: overwrite re-copies, update compares, skip-existing leaves it. No
    shortcut that treats a metadata-equal unclaimed file as ours (invariants 14 and 15 of the spec: size or timestamp equality alone is never strong validation).
 4. **Configuration fingerprint.** The manifest stores an `options` object (compared field by field, so a mismatch names the option) and a
@@ -48,7 +48,7 @@ whatever the claims did not record.** That is safe because every published file 
 10. **Single files.** `--resume` adopts the prior id and copies the whole file again (the old partial is removed by the step-1 sweep); validating a partial and
     continuing from its end is slice 9d.
 11. **Flags.** `--resume` with `--restart` is a usage error (exit 2). `--break-lock` already requires `--restart` (clap `requires`). `--resume` with no prior operation starts
-    a new one and prints `no prior operation; starting new`. `--dry-run` does not exist yet and stays out.
+    a new one and prints `no prior operation; starting new`; a clean completion removes its own state, so `--resume` after a finished copy finds nothing and copies everything again under the existing-file policy (spec 21.1: "scripts may always pass `--resume`"), exactly as running the copy again would. `--dry-run` does not exist yet and stays out.
 
 ## Behaviour
 
@@ -71,7 +71,7 @@ operation id becomes the prior's** (`locked.state.operation_id`; the places in `
 the effective id instead), `record_for` writes the lock record with the prior's `workspace_path`, and the manifest is written `TRANSFERRING` under section 99
 (`owned(...)` first). For a single-file record the adoption bumps `artifact_generation` and takes a new `attempt_id`. A directional change (durability normal to strict) is stored in `options` at that write.
 
-**Order inside adoption** (a crash between any two steps leaves a state the next `--resume` accepts): (1) validate the prior (format, compatibility); (2) open `state.db`, or for a manifest in `CREATED` with none, create it and let its creation commit durably; a failure here leaves the prior workspace untouched, and the lock this run took is released as for any refusal; (3) write the lock record naming the prior id and workspace (`record_for` must take the effective id: it reads `cfg.operation_id` today, `session.rs:285`); (4) write the manifest `TRANSFERRING`. `TRANSFERRING` is therefore never on disk without a `state.db`, which is what lets decision 7 call a missing `state.db` in any later state corrupt.
+**Order inside adoption** (a crash between any two steps leaves a state the next `--resume` accepts): (1) validate the prior (format, compatibility); (2) open `state.db`, or for a manifest in `CREATED` with none, create it and let its creation commit durably; a failure here leaves the prior workspace untouched, and the lock this run took is released as for any refusal; (3) write the lock record naming the prior id and workspace (`record_for` must take the effective id: it reads `cfg.operation_id` today, `session.rs:285`); (4) write the manifest `TRANSFERRING`. `TRANSFERRING` is therefore never on disk without a `state.db`, which is what lets decision 7 call a missing `state.db` in any later state corrupt. `CopyOptions` must carry the effective id too: `run::file` builds its options from `cfg.operation_id` before `open_operation` runs (`run/mod.rs:330`) and `run::tree` does likewise, so both build them from the locked state's id after adoption; otherwise the step-1 sweep looks for the wrong partial name and the killed run's partial is never removed.
 
 ### Compatibility (spec 121)
 
@@ -79,7 +79,7 @@ the effective id instead), `record_for` writes the lock record with the prior's 
 |---|---|---|
 | `roots` (source root path as native-hex, source root identity, destination prefix) | equal; identity only when both `Strong` | `INCOMPATIBLE_STATE`, naming the mapping |
 | `preserve_times`, `preserve_permissions`, `safety`, `existing` | equal | `INCOMPATIBLE_STATE`, naming the option |
-| `durability` | `normal` to `strict` allowed (recorded); `strict` to `normal` refused | `INCOMPATIBLE_STATE` |
+| `durability` | `normal` to `strict` allowed (recorded at adoption: a resume that is then killed leaves `strict` in the manifest); `strict` to `normal` refused | `INCOMPATIBLE_STATE: durability: the operation runs with strict durability; pass --durability strict` |
 | `configuration_fingerprint` | recomputed from the stored `options` and compared with the stored hash first; a difference means the stored options were changed or damaged since they were written (the fingerprint's purpose is to prevent accidental resume with incompatible semantics, section 19; `roots` and `durability` are compared directly, not through it) | `STATE_CORRUPT` |
 
 `retries` and `--resume-verify` do not exist yet; the object grows with the options. The fingerprint covers the exact-match options only: canonical bytes
@@ -110,7 +110,7 @@ identities already exist (cut 7b). Unknown keys stay `STATE_CORRUPT`; the 64 KiB
 
 `flux-fs`: `DirHandle::open_claim_store(&self, name: &OsStr, durability: Durability) -> Result<Self::Claims>` (no create, never follows a link); `ClaimStore` gains
 `fn count(&self) -> Result<u64>`. `flux-platform`: `RedbClaimStore::create_file` (today's `from_file`, writes `meta.format`) and `RedbClaimStore::open_file(file, durability)`: redb has no open-from-`File` entry point (`Database::open` and `Builder::open` take a path; only `Builder::create_file(File)` takes a handle, redb-4.3.0 `db.rs:2242`), so `open_file` calls `create_file` on the `File` that `open_claim_store` opened without `O_CREAT` (Windows: `FILE_OPEN`), which opens and repairs an existing valid database (the `claims_kill` harness already relies on this); because `create_file` would silently initialise an EMPTY file as a fresh database, `open_file` first rejects a zero-length file as `STATE_CORRUPT`, then reads `meta.format` (an absent `meta` or `claims` table is corrupt; a value other than 1 is incompatible); POSIX opens `O_RDWR | O_NOFOLLOW | O_CLOEXEC`,
-Windows reuses `open_file_at` with `FILE_OPEN`. The fake (`FaultFs`) gets the same method and the conformance suite gains an open case. The errors reach the run as
+Windows reuses `open_file_at` with `FILE_OPEN`. The fake (`FaultFs`) gets the same method and the conformance suite gains an open case. redb errors on a NON-EMPTY file map by kind, never by byte count: `StorageError::Corrupted` (including a truncated file below redb's minimum size) and `DatabaseError::RepairAborted` are `STATE_CORRUPT`; `DatabaseError::UpgradeRequired` and a `meta.format` other than 1 are `INCOMPATIBLE_STATE`; `StorageError::Io` and `PreviousIo` stay `IO_ERROR`; `DatabaseAlreadyOpen` (the destination lock should make it unreachable) is `IO_ERROR`. The errors reach the run as
 `STATE_CORRUPT` and `INCOMPATIBLE_STATE` (the plan decides whether that needs two new `flux_fs::Code` values or a typed error).
 
 ### Messages and exit codes
@@ -119,7 +119,8 @@ Windows reuses `open_file_at` with `FILE_OPEN`. The fake (`FaultFs`) gets the sa
 |---|---|---|
 | `--resume`, no prior | `no prior operation; starting new` | as the run |
 | `--resume` adopted | `resuming operation <id> (<n> entries claimed)` then the normal report, with `resumed <m> already-complete files` | as the run |
-| resumable prior, no flag | `RESUMABLE_OPERATION_EXISTS: operation <id> is <STATE> (<manifest path>); run again with --resume to continue it or --restart to supersede it (its partials are deleted)` | 3 |
+| resumable prior, no flag | `RESUMABLE_OPERATION_EXISTS: operation <id> is <STATE> (<manifest path>); run again with --resume to continue it or --restart to supersede it (its partials and its recorded progress are deleted)` | 3 |
+| more than one resumable prior, with or without `--resume` | `RESUMABLE_OPERATION_EXISTS: operations <id1> (<STATE1>, <path1>), <id2> (<STATE2>, <path2>)[, ...]; --resume needs exactly one; run again with --restart to supersede all of them (their partials and their recorded progress are deleted)` | 3 |
 | `--resume --restart` | clap usage error | 2 |
 | incompatible | `INCOMPATIBLE_STATE: <what differs>` | 3 |
 
@@ -143,6 +144,7 @@ Resuming a resume is safe by induction: the operation id never changes, claims a
 5. A manifest-only workspace in state `CREATED` resumes with zero progress; one in any later state without `state.db` is `STATE_CORRUPT`.
 6. Claim keys contain the filesystem's device number. Linux does not guarantee that `st_dev` is stable across a reboot (device numbers of removable, LVM or network-backed volumes can change), and an interrupted copy is often followed by a reboot: when the numbers change every claim misses and the resume copies everything again under the existing-file policy (safe, but the resume saves nothing). Not testable in CI; to be measured on real systems before slice 9c.
 7. Weak-identity destination directories never get claims: a resumed run reports their existing files as collisions (see the walk section).
+8. A destination that cannot take the source's modification times (`preserve_times = Default` records the failure and still publishes) holds the copy time instead, so the mtime check never matches: every file of such a destination is copied again on each resume (safe, but the resume saves nothing there). `--preserve-times` (strict) fails those files instead.
 
 ## Not in this cut
 
@@ -172,3 +174,4 @@ Panel round 1 (solo panel plus agy), 2026-10-08. Every finding was disposed of; 
 - `DISCARDED-BELOW-FLOOR: the fingerprint does not cover roots or durability` unreachable as a defect because both are compared directly against the invocation in the Compatibility table above, and the fingerprint's purpose is to prevent accidental resume with incompatible semantics (`FLUX_FULL_UPDATED_SPEC_V16.md` section 19, line 1475), not to detect manifest tampering.
 - `REJECTED: destination root identity is missing from the roots check` because the workspace lives inside DEST (`DEST/.flux/operations/<id>`, found by `prior.rs` `scan_tree` through the handle opened at DEST itself) and claim keys carry the volume identity of each directory (`crates/flux-fs/src/claims.rs` `ClaimKey`), so a different volume mounted at the same path has neither a prior to find nor claims that match.
 - Owner decisions raised by the panel and pending: decision 8 (the refusal no longer carries a claim count); decision 2 as amended (a mismatch goes to the normal path, not a forced redo).
+- Panel round 2 (agy, two new seats): `REJECTED: conflicting existing-file flags lack clap mutual exclusion` because the three flags are one clap `ArgGroup` with `multiple(false)` (`crates/flux-cli/src/main.rs:38`) and `giving_two_policies_is_a_usage_error` pins exit 2 (`main.rs:338`); `REJECTED: --resume on a COMPLETED operation silently overwrites` as a defect because spec 21.1 (lines 1639-1642) defines exactly this ("scripts may always pass `--resume`"); a clean completion removes its own state (`run/mod.rs` `complete`/`remove_own`), the message now says what happens; `REJECTED: a strict durability recorded by a killed resume locks the workspace` as a defect because section 121 makes strict to normal an `INCOMPATIBLE_STATE` by rule and the refusal now names the fix.
