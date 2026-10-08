@@ -248,18 +248,25 @@ fn give_back<D: DirHandle>(
     let Obtained::Held { held, .. } = obtained else {
         return error;
     };
-    if let Err(e) = held.discard()
-        && let RunError::Refused { refusal, changed, not_removed } = &mut error
-    {
-        *changed = true;
-        // A removal already recorded (the probe's leftover) is kept in the detail, never dropped from the report.
-        if let Some((path, displaced)) = not_removed.replace((lock_shown.to_path_buf(), lock_io(e)))
-        {
-            refusal.detail.push_str(&format!(
-                "; also not removed: {} ({})",
-                path.display(),
-                displaced.source
-            ));
+    if let Err(e) = held.discard() {
+        match &mut error {
+            RunError::Refused { refusal, changed, not_removed } => {
+                *changed = true;
+                // A removal already recorded (the probe's leftover) is kept in the detail, never dropped from the
+                // report.
+                if let Some((path, displaced)) =
+                    not_removed.replace((lock_shown.to_path_buf(), lock_io(e)))
+                {
+                    refusal.detail.push_str(&format!(
+                        "; also not removed: {} ({})",
+                        path.display(),
+                        displaced.source
+                    ));
+                }
+            }
+            RunError::Failed { not_removed, .. } => {
+                *not_removed = Some((lock_shown.to_path_buf(), lock_io(e)));
+            }
         }
     }
     error
@@ -299,9 +306,11 @@ impl Fault {
     pub(crate) fn into_error(self, step: RunStep) -> RunError {
         match self {
             Fault::Lost => lost(),
-            Fault::Io(path, error) => RunError::Failed { step, path, error },
+            Fault::Io(path, error) => RunError::Failed { step, path, error, not_removed: None },
             // Decision 7: a heartbeat outside the copy fails the lock step, whatever step it interrupted.
-            Fault::Heartbeat(path, error) => RunError::Failed { step: RunStep::Lock, path, error },
+            Fault::Heartbeat(path, error) => {
+                RunError::Failed { step: RunStep::Lock, path, error, not_removed: None }
+            }
         }
     }
 }
@@ -369,13 +378,15 @@ pub(crate) fn from_lock(e: LockError, step: RunStep, path: &Path, changed: bool)
             }
             RunError::Refused { refusal, changed, not_removed: None }
         }
-        LockError::Io(error) => RunError::Failed { step, path: path.to_path_buf(), error },
+        LockError::Io(error) => {
+            RunError::Failed { step, path: path.to_path_buf(), error, not_removed: None }
+        }
     }
 }
 
 /// An I/O failure as the run's, at `step` and `path`.
 pub(crate) fn failed(step: RunStep, path: &Path, error: FsError) -> RunError {
-    RunError::Failed { step, path: path.to_path_buf(), error }
+    RunError::Failed { step, path: path.to_path_buf(), error, not_removed: None }
 }
 
 /// The I/O error inside a lock-protocol error. A refusal cannot come from the calls this is used on; its detail is

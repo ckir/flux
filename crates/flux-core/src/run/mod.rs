@@ -94,8 +94,9 @@ pub enum RunError {
     /// state exists. `not_removed` is something this run created and could not remove while refusing
     /// (spec:2896-2902).
     Refused { refusal: Box<Refusal>, changed: bool, not_removed: Option<(PathBuf, FsError)> },
-    /// An I/O failure in one of the run's own steps, at `path` (exit 1).
-    Failed { step: RunStep, path: PathBuf, error: FsError },
+    /// An I/O failure in one of the run's own steps, at `path` (exit 1). `not_removed` is something this run created
+    /// and could not remove while failing.
+    Failed { step: RunStep, path: PathBuf, error: FsError, not_removed: Option<(PathBuf, FsError)> },
 }
 
 /// The run's own steps, for a failure's message.
@@ -536,6 +537,7 @@ fn fail<D: DirHandle, P: Place<D>>(place: &P, mut locked: Locked<'_, D>) -> Opti
         step: RunStep::State,
         path: place.shown(&locked.state.operation_id),
         error,
+        not_removed: None,
     });
     match locked.held.release() {
         Ok(_) => stop,
@@ -543,6 +545,7 @@ fn fail<D: DirHandle, P: Place<D>>(place: &P, mut locked: Locked<'_, D>) -> Opti
             step: RunStep::State,
             path: locked.lock_shown,
             error: lock_io(e),
+            not_removed: None,
         })),
     }
 }
@@ -558,7 +561,7 @@ fn stop_after_record<D: DirHandle, P: Place<D>>(
     error: FsError,
 ) -> RunError {
     let _second = fail(place, locked);
-    RunError::Failed { step, path, error }
+    RunError::Failed { step, path, error, not_removed: None }
 }
 
 /// Q-I: the copy refused with nothing changed, after this run's state exists. What the run created is removed again -
@@ -575,7 +578,7 @@ fn rollback<D: DirHandle, P: Place<D>>(
     if let Err((path, error)) = remove_own(place, &mut locked, true) {
         // `release` unlinks only a lock that is still this run's; its own failure leaves a dead owner's lock.
         let _released = locked.held.release();
-        return Some(RunError::Failed { step: RunStep::Rollback, path, error });
+        return Some(RunError::Failed { step: RunStep::Rollback, path, error, not_removed: None });
     }
     match locked.held.release() {
         Ok(Released::Unlinked) => None,
@@ -584,6 +587,7 @@ fn rollback<D: DirHandle, P: Place<D>>(
             step: RunStep::Rollback,
             path: locked.lock_shown,
             error: lock_io(e),
+            not_removed: None,
         }),
     }
 }

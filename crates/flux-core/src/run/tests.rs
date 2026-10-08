@@ -1833,6 +1833,39 @@ fn a_failed_state_db_creation_unwinds_and_names_the_file() {
 }
 
 #[test]
+fn a_failed_state_creation_that_cannot_remove_its_lock_reports_the_leftover() {
+    let fs = fake();
+    fs.fail("create_claim_store", Code::PermissionDenied);
+    // The lock this run created is given back after the unwinding, so its removal is the run's last `remove_file`:
+    // the probe and manifest temporaries (1, 2), the five files of the renamed operation directory (3-7), then the
+    // lock (8).
+    fs.fail_nth("remove_file", 8, Code::DiskFull, std::io::ErrorKind::StorageFull);
+    let (r, _) = run_tree(&fs, &cfg());
+    let Some(RunError::Failed { step, path, error, not_removed }) = &r.stop else {
+        panic!("expected a failure, got {:?}", r.stop)
+    };
+    assert_eq!(*step, RunStep::State);
+    assert!(path.ends_with("state.db"), "{path:?}");
+    assert_eq!(error.code, Code::PermissionDenied, "the original error is unchanged");
+    let (left, why) = not_removed.as_ref().expect("the lock it could not remove is named");
+    assert_eq!(left.to_string_lossy().replace('\\', "/"), LOCK);
+    assert_eq!(why.code, Code::DiskFull);
+}
+
+#[test]
+fn a_failed_run_with_a_removable_lock_reports_no_leftover() {
+    let fs = fake();
+    fs.fail("create_claim_store", Code::PermissionDenied);
+    let (r, _) = run_tree(&fs, &cfg());
+    let Some(RunError::Failed { step, not_removed, .. }) = &r.stop else {
+        panic!("expected a failure, got {:?}", r.stop)
+    };
+    assert_eq!(*step, RunStep::State);
+    assert!(not_removed.is_none(), "{not_removed:?}");
+    assert!(!fs.exists(LOCK));
+}
+
+#[test]
 fn a_kept_workspace_keeps_state_db() {
     let fs = fake();
     fs.on_nth("create_new", 4, |fs| fs.fail_write(std::io::Error::other("injected write")));

@@ -31,6 +31,8 @@ libc = { workspace = true }
 # lock-model design Section 10).
 [dev-dependencies]
 tempfile = { workspace = true }
+# `cache_metrics` makes `cache_stats()` real; dev-dependency only, so the shipped build is unchanged.
+redb = { workspace = true, features = ["cache_metrics"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 rustix = { workspace = true }

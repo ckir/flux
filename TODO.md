@@ -308,10 +308,12 @@ From the final review of cut 8a; none is a reachable defect without a race or pr
 - [ ] **An early stop drops the containment warnings.** When the run stops before the copy (for example a probe
       refusal), `run.copy` is `None`, so `containment_degraded` and the identity warnings set in `locate_tree` are
       never printed (the tree job in `main.rs`).
-- [ ] **`give_back` drops a failed lock discard for any `RunError::Failed`.** The disposal result is reported only for
-      `RunError::Refused` (`crates/flux-core/src/run/session.rs`, `give_back`), so a `place.create` failure (the probe-error
-      arm included) plus a lock that cannot be removed leaves the lock file unreported. Identical gating existed before cut 8a;
-      found by the cut 8a capstone, round 1.
+- [x] **`give_back` dropped a failed lock discard for any `RunError::Failed` - RESOLVED in the stabilize PR (commit
+      `fix: report a lock this run created and could not remove when the run fails`).** Was: the disposal result was
+      reported only for `RunError::Refused` (`crates/flux-core/src/run/session.rs`, `give_back`), so a `place.create`
+      failure (the probe-error arm included) plus a lock that cannot be removed left the lock file unreported. Now
+      `RunError::Failed` gained `not_removed`, mirroring `Refused`, and the report prints the leftover lock. Found by
+      the cut 8a capstone, round 1.
 - [ ] **Two cut 8a test gaps (minor, left out of the owner's A-D scope).** The strict containment refusal test
       (`an_unsupported_canonical_path_query_warns_under_default_and_refuses_under_strict`) asserts only the code, not the
       strict message, so a mutant swapping in the inside-source message survives; the degraded `anchor_shown` is asserted
@@ -341,11 +343,14 @@ are the spec's).
 - [ ] **6. The claim insertion and the claim upgrade live in two modules:** insertion in the copy path
       (`before_create`), the upgrade and frame update in `tree.rs` after the copy path returns. Accepted, to keep the
       claim after the gate and guard.
-- [ ] **7. A junction at the destination name on case-insensitive Windows:** `metadata` reports it as a link; whether
-      `rename_replace` of a file over it fails or replaces the junction itself is unmeasured. Required outcome: a
-      per-target result, never a traversal of the junction. The test `a_file_over_a_junction_at_the_destination_name`
-      pins only that nothing is written through the junction; CI hides a passing test's printed outcome, so read the
-      observed outcome from a run with output capture, then pin it.
+- [ ] **7. A junction at the destination name on case-insensitive Windows:** `metadata` reports it as a link.
+      Measured on windows-latest in October 2026 (a throwaway probe branch, CI run 37728541751): replacing a file over
+      a directory junction fails that target alone with `IO_ERROR` / `PermissionDenied`
+      (`NtSetInformationFile: 0xC0000022`, access denied) at the publish step; the junction is left intact, the
+      junction's target directory is unchanged, no temporary is left, and the run completes with that one failure.
+      The test `a_file_over_a_junction_at_the_destination_name` pins exactly that (commit `test: pin the measured
+      Windows outcome of a file over a directory junction`). So a per-target result, never a traversal of the
+      junction.
 - [ ] **8. A hardlink alias on a case-insensitive destination:** an alias of an existing entry in the same directory
       makes the alias's target fail rather than replace (no unique identity match).
 - [ ] **9. Closing the claim store always commits:** `redb` 4.3.0 `Database::drop` is an `Immediate` write commit plus
@@ -381,10 +386,14 @@ are the spec's).
       run to run).
 - [ ] **The fake `FaultFs` case-insensitive mode is ASCII-only** and does not normalize `read_file`, `remove_dir`,
       `create_lock`, `open_lock`, `create_claim_store` or the path-level `open_read`.
-- [ ] **Nothing pins the claim store's cache bound.** Removing `Builder::set_cache_size(CACHE_BYTES)` in
-      `crates/flux-platform/src/claims.rs` leaves every test green (measured at `6bee900`; redb has no cache-size
-      getter, only `cache_stats()`). A pin would insert enough claims to exceed 16 MiB of pages and assert
-      `evictions > 0`; it was left out as slow (the AGY-TEST-AUDIT gap, deferred by the controller pending the owner).
+- [x] **The claim store's cache bound was not pinned - RESOLVED in the stabilize PR (commit `test: pin the claim
+      store's cache bound`).** Was: removing `Builder::set_cache_size(CACHE_BYTES)` in
+      `crates/flux-platform/src/claims.rs` left every test green. Now `RedbClaimStore::from_file` delegates to a
+      private `with_cache_size`; the test `the_cache_size_setting_reaches_redb` (a 1 MiB bound, about 1,000 claims of
+      about 4,000 bytes, asserts evictions > 0; red without `set_cache_size`) and `the_cache_bound_is_16_mib` pin it.
+      redb's `cache_stats()` reads zero unless its `cache_metrics` feature is on, so flux-platform enables it as a
+      dev-dependency feature only (the normal dependency graph is unchanged). Remaining uncovered mutant: `from_file`
+      passing a number other than `CACHE_BYTES` (a one-line delegation).
 
 ## Scaffolding follow-ups
 
