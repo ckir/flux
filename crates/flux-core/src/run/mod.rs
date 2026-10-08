@@ -477,6 +477,11 @@ fn finish<D: DirHandle, P: Place<D>>(
         // Ownership lost before COMPLETED (decision 13): the state stays as it is, and `locked` drops here, closing
         // the lock without unlinking it (`S99_refuse_close`). The copy's own TARGET_LOCK_BUSY is the report.
         Ended::Lost => None,
+        // Q-I removes what THIS run created. An adopted prior is not that: its workspace and recorded progress go only
+        // under `--restart`, so it is kept FAILED (still resumable) and the copy's refusal stays the report.
+        Ended::RefusedUnchanged if matches!(locked.resumed, Some(ResumeNote::Adopted { .. })) => {
+            fail(place, locked)
+        }
         Ended::RefusedUnchanged => rollback(place, locked),
         Ended::Failed => fail(place, locked),
     }

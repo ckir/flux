@@ -3038,13 +3038,30 @@ fn the_claim_count_is_reported_on_adoption() {
 #[test]
 fn a_resume_that_fails_before_transferring_can_be_resumed_again() {
     let fs = fake();
-    prior3(&fs, 5, OpState::Failed);
+    prior3(&fs, 5, OpState::Created);
     drop(prior_store(&fs, 5));
-    // The TRANSFERRING write is the first `rename_replace`.
+    // The TRANSFERRING write is the first `rename_replace`; the failure path's FAILED write is the second, and just
+    // before it the manifest on disk must still be the prior's CREATED.
     fs.fail_nth("rename_replace", 1, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let seen: Arc<Mutex<Option<OpState>>> = Arc::default();
+    let keep = Arc::clone(&seen);
+    fs.on_nth("rename_replace", 2, move |fs| {
+        *keep.lock().unwrap() = Some(manifest(fs, &id(5)).state)
+    });
     let (r, _) = run_tree(&fs, &resume());
     assert_eq!(failed_at(&r.stop).0, RunStep::State);
-    assert_eq!(manifest(&fs, &id(5)).state, OpState::Failed);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        Some(OpState::Created),
+        "TRANSFERRING never reached the disk"
+    );
+    let c = calls(&fs);
+    assert!(
+        at(&c, "open_claim_store(") < at(&c, "rename_replace(")
+            && !c.iter().any(|x| x.contains("flux-partial")),
+        "{c:?}"
+    );
+    assert_eq!(manifest(&fs, &id(5)).state, OpState::Failed, "resumable");
     let (r, _) = run_tree(&fs, &resume());
     ok(&r);
     adopted(&r, 5, Some(0));
@@ -3058,7 +3075,7 @@ fn file_prior3(fs: &FaultFs, n: u8, source_identity: Option<&str>) -> OperationS
         attempt_id: id(7),
         artifact_generation: 1,
         source_identity: shown.clone(),
-        target_identity: None,
+        target_identity: Some("strong:3:3".to_string()),
         target_path_key: crate::lock::site::hex(b"t"),
         owner_instance_id: id(8),
         boot_session_id: "boot".to_string(),
@@ -3089,7 +3106,7 @@ fn a_single_file_resume_adopts_the_record_bumping_its_generation() {
     fs.write_file(&partial, b"half");
     let seen: Arc<Mutex<Option<OperationState>>> = Arc::default();
     let keep = Arc::clone(&seen);
-    let rec = Arc::new(Mutex::new(None));
+    let rec: Arc<Mutex<Option<Decoded>>> = Arc::new(Mutex::new(None));
     let keep_rec = Arc::clone(&rec);
     // `create_new`: the TRANSFERRING record (1), then the copy's temporary (2).
     fs.on_nth("create_new", 2, move |fs| {
@@ -3108,7 +3125,14 @@ fn a_single_file_resume_adopts_the_record_bumping_its_generation() {
     assert_eq!((s.state, f.artifact_generation), (OpState::Transferring, 2));
     assert!(crate::ids::is_id(&f.attempt_id) && f.attempt_id != id(7), "{}", f.attempt_id);
     assert_eq!(f.owner_instance_id, id(0xee));
+    assert_eq!(f.boot_session_id, "test-boot", "the run's session, not the prior's");
+    assert_ne!(f.last_heartbeat_wall_time, "1", "refreshed");
+    assert_eq!(f.last_heartbeat_wall_time, lock_time(&rec), "the run's one reading");
     assert_eq!(f.creation_wall_time, "1");
+    let src = identity_text(fs.metadata(Path::new("/src/a")).unwrap().identity);
+    assert_eq!(f.source_identity, src, "kept");
+    assert_eq!(f.target_identity.as_deref(), Some("strong:3:3"), "kept");
+    assert_eq!(f.target_path_key, crate::lock::site::hex(b"t"), "kept");
     let Some(Decoded::Record(lock)) = rec.lock().unwrap().clone() else {
         panic!("the lock record during the copy")
     };
@@ -3119,6 +3143,13 @@ fn a_single_file_resume_adopts_the_record_bumping_its_generation() {
     assert!(removed < created, "{c:?}");
     assert_eq!(fs.read_file("/p/t").as_deref(), Some(&b"A"[..]));
     assert!(!fs.exists(record_path(&id(5))) && !fs.exists(T_LOCK));
+}
+
+fn lock_time(rec: &Arc<Mutex<Option<Decoded>>>) -> String {
+    match rec.lock().unwrap().clone() {
+        Some(Decoded::Record(r)) => r.last_heartbeat_wall_time.to_string(),
+        other => panic!("the lock record during the copy: {}", other.is_some()),
+    }
 }
 
 #[test]
@@ -3148,4 +3179,55 @@ fn restart_still_supersedes_everything_and_ignores_resume_semantics() {
         );
     }
     assert!(!fs.exists("/p/dest/.flux") && !fs.exists(LOCK));
+}
+
+#[test]
+fn a_refused_unchanged_copy_after_adoption_keeps_the_adopted_workspace() {
+    let fs = FaultFs::new();
+    for d in ["/src", "/src/sub", "/p", "/p/dest"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    fs.write_file("/src/sub/b", b"BB");
+    let p = prior3(&fs, 5, OpState::Failed);
+    let mut store = prior_store(&fs, 5);
+    let key = ClaimKey::new(ObjectId { volume: 1, index: 1 }, OsStr::new("x"));
+    let rec = flux_fs::ClaimRecord {
+        target: flux_fs::FluxPathKey(b"x".to_vec()),
+        status: flux_fs::ClaimStatus::Created,
+    };
+    store.insert_if_absent(&key, &rec).unwrap();
+    store.flush().unwrap();
+    drop(store);
+    // `sub` IS DEST by identity: the copy refuses it before creating anything.
+    fs.set_identity("/src/sub", fs.metadata(Path::new("/p/dest")).unwrap().identity);
+    let (r, _) = run_tree(&fs, &resume());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    let Some(Err(a)) = &r.copy else { panic!("the copy refused: {:?}", r.copy) };
+    assert!(a.refused_unchanged(), "{a:?}");
+    adopted(&r, 5, Some(1));
+    assert!(fs.exists(state_db(5)), "the recorded progress survives");
+    let m = manifest(&fs, &id(5));
+    assert_eq!((m.state, m.format_version, m.operation_id), (OpState::Failed, 3, id(5)));
+    assert_eq!(m.config, p.config);
+    assert!(!fs.exists(LOCK), "released");
+}
+
+#[test]
+fn a_refused_unchanged_single_file_after_adoption_keeps_the_record() {
+    let fs = fake();
+    file_prior3(&fs, 5, None);
+    fs.on_nth("create_lock", 1, |fs| fs.create_dir(Path::new("/p/t")).unwrap());
+    let r = run_file(&fs, &resume());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert!(
+        matches!(&r.copy, Some(Err(e)) if e.code() == Code::SafetyRejected && e.leftover.is_none()),
+        "{:?}",
+        r.copy
+    );
+    let s = file_record(&fs, &id(5));
+    assert_eq!(
+        (s.state, s.format_version, s.operation_id.as_str()),
+        (OpState::Failed, 3, id(5).as_str())
+    );
+    assert!(!fs.exists(T_LOCK), "released");
 }
