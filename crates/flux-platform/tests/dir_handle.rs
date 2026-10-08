@@ -378,6 +378,36 @@ mod posix {
     }
 
     #[test]
+    fn open_claim_store_refuses_a_link_a_directory_and_a_missing_name() {
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let open = |name: &str| match root
+            .open_claim_store(OsStr::new(name), flux_fs::Durability::Normal)
+        {
+            Err(e) => e,
+            Ok(_) => panic!("{name} must be refused"),
+        };
+
+        std::os::unix::fs::symlink(d.path().join("elsewhere"), d.path().join("lnk")).unwrap();
+        assert_eq!(open("lnk").code, flux_fs::Code::SafetyRejected);
+
+        std::fs::create_dir(d.path().join("adir")).unwrap();
+        let e = open("adir");
+        assert_eq!(e.code, flux_fs::Code::DestinationError);
+        assert_eq!(e.source.kind(), std::io::ErrorKind::IsADirectory);
+
+        let e = open("missing");
+        assert_eq!(e.source.kind(), std::io::ErrorKind::NotFound);
+
+        let store =
+            root.create_claim_store(OsStr::new("state.db"), flux_fs::Durability::Normal).unwrap();
+        drop(store);
+        let store =
+            root.open_claim_store(OsStr::new("state.db"), flux_fs::Durability::Normal).unwrap();
+        assert_eq!(flux_fs::ClaimStore::count(&store).unwrap(), 0);
+    }
+
+    #[test]
     fn create_claim_store_never_follows_a_link() {
         let d = TempDir::new().unwrap();
         let outside = d.path().join("outside");

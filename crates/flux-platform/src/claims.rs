@@ -25,6 +25,46 @@ fn io_err(e: impl std::error::Error + Send + Sync + 'static) -> FsError {
     FsError::new(Code::IoError, io::Error::other(e))
 }
 
+fn storage_err(e: redb::StorageError) -> FsError {
+    match e {
+        redb::StorageError::Corrupted(_) => FsError::new(Code::StateCorrupt, io::Error::other(e)),
+        // redb reports a non-empty file with the wrong magic number as `Io(InvalidData)`, not `Corrupted`
+        // (redb-4.3.0 src/tree_store/page_store/page_manager.rs:1136). That is a corrupt store, not an I/O failure.
+        redb::StorageError::Io(ref io_e) if io_e.kind() == io::ErrorKind::InvalidData => {
+            FsError::new(Code::StateCorrupt, io::Error::other(e))
+        }
+        // `Io`, `PreviousIo` and every other storage error.
+        _ => FsError::new(Code::IoError, io::Error::other(e)),
+    }
+}
+
+fn database_err(e: redb::DatabaseError) -> FsError {
+    match e {
+        redb::DatabaseError::RepairAborted => FsError::new(Code::StateCorrupt, io::Error::other(e)),
+        redb::DatabaseError::UpgradeRequired(_) => {
+            FsError::new(Code::IncompatibleState, io::Error::other(e))
+        }
+        redb::DatabaseError::Storage(s) => storage_err(s),
+        // `DatabaseAlreadyOpen`, `TransactionInProgress` and anything else.
+        _ => FsError::new(Code::IoError, io::Error::other(e)),
+    }
+}
+
+fn table_err(e: redb::TableError) -> FsError {
+    match e {
+        redb::TableError::Storage(s) => storage_err(s),
+        // `TableDoesNotExist` and every other table error.
+        _ => FsError::new(Code::StateCorrupt, io::Error::other(e)),
+    }
+}
+
+fn transaction_err(e: redb::TransactionError) -> FsError {
+    match e {
+        redb::TransactionError::Storage(s) => storage_err(s),
+        _ => FsError::new(Code::IoError, io::Error::other(e)),
+    }
+}
+
 pub struct RedbClaimStore {
     db: Database,
     durability: Durability,
@@ -32,10 +72,55 @@ pub struct RedbClaimStore {
 }
 
 impl RedbClaimStore {
-    /// `file` must be empty (a fresh `state.db`) or a valid database. Writes the `meta`
-    /// entry `format` = 1 durably.
-    pub fn from_file(file: File, durability: Durability) -> Result<Self> {
+    /// `file` must be empty (a fresh `state.db`). Writes the `meta` entry `format` = 1 durably.
+    pub fn create_file(file: File, durability: Durability) -> Result<Self> {
         Self::with_cache_size(file, durability, CACHE_BYTES)
+    }
+
+    /// Open an EXISTING store. A zero-length file is `Code::StateCorrupt` (redb would silently
+    /// initialise it); a missing `meta` or `claims` table is `StateCorrupt`; a `format` other
+    /// than 1 is `Code::IncompatibleState`.
+    pub fn open_file(file: File, durability: Durability) -> Result<Self> {
+        Self::open_with_cache_size(file, durability, CACHE_BYTES)
+    }
+
+    fn open_with_cache_size(
+        file: File,
+        durability: Durability,
+        cache_bytes: usize,
+    ) -> Result<Self> {
+        let len = file.metadata().map_err(FsError::from_io)?.len();
+        if len == 0 {
+            return Err(FsError::new(
+                Code::StateCorrupt,
+                io::Error::other("zero-length claim store"),
+            ));
+        }
+        let db =
+            Builder::new().set_cache_size(cache_bytes).create_file(file).map_err(database_err)?;
+        {
+            let tx = db.begin_read().map_err(transaction_err)?;
+            let meta = tx.open_table(META).map_err(table_err)?;
+            match meta.get("format").map_err(storage_err)?.map(|g| g.value()) {
+                Some(FORMAT) => {}
+                Some(n) => {
+                    return Err(FsError::new(
+                        Code::IncompatibleState,
+                        io::Error::other(format!(
+                            "claim store format {n}, this binary reads {FORMAT}"
+                        )),
+                    ));
+                }
+                None => {
+                    return Err(FsError::new(
+                        Code::StateCorrupt,
+                        io::Error::other("claim store has no format"),
+                    ));
+                }
+            }
+            tx.open_table(CLAIMS).map_err(table_err)?;
+        }
+        Ok(RedbClaimStore { db, durability, unsynced: 0 })
     }
 
     fn with_cache_size(file: File, durability: Durability, cache_bytes: usize) -> Result<Self> {
@@ -137,9 +222,9 @@ impl ClaimStore for RedbClaimStore {
     }
 
     fn count(&self) -> Result<u64> {
-        let tx = self.db.begin_read().map_err(io_err)?;
-        let table = tx.open_table(CLAIMS).map_err(io_err)?;
-        table.len().map_err(io_err)
+        let tx = self.db.begin_read().map_err(transaction_err)?;
+        let table = tx.open_table(CLAIMS).map_err(table_err)?;
+        table.len().map_err(storage_err)
     }
 }
 

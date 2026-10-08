@@ -36,7 +36,7 @@ fn child_writer() {
     let mode = std::env::var("FLUX_KILL_MODE").unwrap();
     let file = OpenOptions::new().read(true).write(true).create_new(true).open(path).unwrap();
     let durability = if mode == "strict" { Durability::Strict } else { Durability::Normal };
-    let mut store = RedbClaimStore::from_file(file, durability).unwrap();
+    let mut store = RedbClaimStore::create_file(file, durability).unwrap();
     let rec = ClaimRecord { target: FluxPathKey(b"t".to_vec()), status: ClaimStatus::Existing };
     let stdout = std::io::stdout();
     let mut i: u64 = 0;
@@ -113,6 +113,19 @@ fn killed_mid_stream_the_store_reopens_with_a_prefix() {
             }
             present.sort_unstable();
             let m = present.len() as u64;
+            drop(table);
+            drop(tx);
+            drop(db);
+            // The engine path: reopen through `open_file`, then keep claiming.
+            let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+            let mut reopened = RedbClaimStore::open_file(file, Durability::Strict)
+                .expect("open_file must reopen a killed store");
+            assert_eq!(reopened.count().unwrap(), m, "{mode}/{threshold}: count after reopen");
+            let rec =
+                ClaimRecord { target: FluxPathKey(b"x".to_vec()), status: ClaimStatus::Created };
+            reopened.insert_if_absent(&key_for(u64::MAX), &rec).unwrap();
+            assert_eq!(reopened.count().unwrap(), m + 1, "{mode}/{threshold}: count after insert");
+            drop(reopened);
             let prefix = present.iter().enumerate().all(|(idx, &v)| v == idx as u64);
             let floor = match mode {
                 "normal" => last_f.map_or(0, |i| i + 1),
@@ -144,7 +157,7 @@ fn a_store_builds_from_an_already_open_file() {
     let path = dir.path().join("state.db");
     let file =
         std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path).unwrap();
-    let mut store = RedbClaimStore::from_file(file, Durability::Strict).unwrap();
+    let mut store = RedbClaimStore::create_file(file, Durability::Strict).unwrap();
     let key = key_for(5);
     let rec = ClaimRecord { target: FluxPathKey(b"x".to_vec()), status: ClaimStatus::Created };
     store.insert_if_absent(&key, &rec).unwrap();
