@@ -287,14 +287,33 @@ fn a_file_over_a_junction_at_the_destination_name() {
     let mut got = Vec::new();
     let r = tree(&StdFileSystem, &src, &dst, &opts(), &run_cfg(), &mut |f| got.push(f));
 
-    // The outcome is recorded for the CI log; the property asserted is the safety one.
+    // MEASURED on windows-latest in 2026-10: the run completes, and the file is refused as ONE per-target failure at
+    // the publish step (IoError; the OS answered access denied), with no leftover temporary, and the destination name
+    // is still the junction. On a different outcome, re-measure; do not weaken these assertions.
     let entry = std::fs::symlink_metadata(dst.join("j"));
     eprintln!(
         "junction outcome: stop={:?} copy_ok={} failures={got:?} dst/j={:?}",
         r.stop,
-        r.copy.as_ref().map(|c| c.is_ok()).unwrap_or(false),
+        matches!(r.copy, Some(Ok(_))),
         entry.as_ref().map(|m| (m.is_file(), m.is_dir(), m.file_type().is_symlink())),
     );
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert!(matches!(r.copy, Some(Ok(_))), "the copy ran and the walk completed");
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].path, Path::new("j"));
+    match &got[0].cause {
+        TreeFailureCause::Copy(e) => {
+            assert_eq!(e.step, flux_core::copy::CopyStep::Publish, "{e:?}");
+            assert_eq!(e.cause.code, Code::IoError, "{e:?}");
+            assert!(e.leftover.is_none(), "no temporary stays: {e:?}");
+        }
+        other => panic!("expected a copy failure, got {other:?}"),
+    }
+    let entry = entry.expect("the destination name still exists");
+    assert!(entry.file_type().is_symlink(), "dst/j is still the junction");
+    for n in names(&dst) {
+        assert!(!n.contains("flux-partial"), "no partial stays: {n}");
+    }
     assert_eq!(names(&target), ["keep"], "nothing was created inside the junction's target");
     assert_eq!(std::fs::read(target.join("keep")).unwrap(), b"keep");
     assert_eq!(std::fs::read(src.join("j")).unwrap(), b"FILE");
