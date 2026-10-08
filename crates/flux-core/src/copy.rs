@@ -145,9 +145,11 @@ impl CopyError {
 /// lock passes `&unguarded`.
 pub type Guard<'g> = dyn Fn() -> flux_fs::Result<()> + 'g;
 
-/// The largest read buffer of the copy loop. Measured 2026-10 on Linux ext4 (one 4 GiB file): 64 KiB was ~35% slower
-/// than 256 KiB, and 1 MiB and 4 MiB were no better. The buffer is allocated per file, so a larger fixed size would
-/// also cost every small copy a zero-filled allocation, and multiply memory under parallel copy.
+/// The largest read buffer of the copy loop. Measured 2026-10 on Linux ext4 (one 4 GiB file): pooled over 18 runs per
+/// side the 64 KiB buffer's median wall time was about 33% higher than 256 KiB's (7.02 s versus 5.28 s), with slow
+/// outliers (7 of 18 runs over 8 s versus none); 1 MiB and 4 MiB were no better. The buffer is allocated per file, so
+/// a larger fixed size would also cost every small copy a zero-filled allocation, and multiply memory under parallel
+/// copy.
 pub(crate) const COPY_BUF_MAX: usize = 256 * 1024;
 
 /// The smallest read buffer: an empty or tiny source still needs a usable buffer. The source can grow while it is
@@ -166,9 +168,9 @@ pub(crate) fn unguarded() -> flux_fs::Result<()> {
     Ok(())
 }
 
-/// §101's heartbeat (cut 7b): called before every guarded destination mutation and after every chunk written (at most `COPY_BUF_MAX` bytes). The run
-/// refreshes its lock record there once the interval has passed; its failure stops the copy at `CopyStep::Heartbeat`. A
-/// copy that holds no lock passes `&no_heartbeat`.
+/// §101's heartbeat (cut 7b): called before every guarded destination mutation and after every chunk written (at
+/// most `COPY_BUF_MAX` bytes). The run refreshes its lock record there once the interval has passed; its failure
+/// stops the copy at `CopyStep::Heartbeat`. A copy that holds no lock passes `&no_heartbeat`.
 pub type Heartbeat<'g> = dyn Fn() -> flux_fs::Result<()> + 'g;
 
 /// The heartbeat of a copy that holds no lock.
@@ -443,8 +445,8 @@ pub fn copy_file_at<F: DestinationRoot>(
 /// the temporary stays, reported as `leftover`.
 ///
 /// `beat` runs immediately before each of those guard calls except the removal's, and after every chunk written (cut
-/// 7b; at most `COPY_BUF_MAX` bytes). Its failure is `CopyStep::Heartbeat`: before the create it creates nothing; after it, the temporary is removed
-/// as for any other failure.
+/// 7b; at most `COPY_BUF_MAX` bytes). Its failure is `CopyStep::Heartbeat`: before the create it creates nothing;
+/// after it, the temporary is removed as for any other failure.
 ///
 /// `before_create` (cut 8b) is called exactly once per copy that reaches the create: after the heartbeat and guard that
 /// precede the exclusive create, and before the temporary exists. Its error stops the copy there, creating nothing.

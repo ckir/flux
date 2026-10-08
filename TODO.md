@@ -694,7 +694,7 @@ Method: this box is a Linux (Ubuntu, kernel 7.0) VM, 8 vCPUs (AMD EPYC), 23 GiB 
 - each run followed by `sync` (timed separately, about 3-4 s for 4 GiB for every tool);
 - release binaries built from the same commit differing only in the copy buffer;
 - tool order rotated each pass so every tool went first once per rotation;
-- machine idle (whole-machine busy 1.7-4.1% before, between and after the runs, with a control loop that added 11-14
+- machine idle (whole-machine busy 1.7-4.1% before, between and after the runs, with a control loop that added 10-14
   points, proving the check can see load).
 
 Uncontrolled: `agy`, `opencode` and the controller's own process in the background (about 2% busy), VM neighbours (steal
@@ -723,9 +723,13 @@ are kept on the development box under `~/flux-probe` (not in the repository).
 
 - [ ] **Heartbeat cadence per chunk.** The copy loop calls the heartbeat once per chunk; a chunk is now up to 256 KiB
       (was 64 KiB), so beats per byte fell fourfold for large files. The beat is rate-limited to once per 5 s and
-      section 101 sets no maximum gap per chunk; with the 30 s stale-eligibility threshold the worst case holds above
-      about 10.5 KiB/s of sustained throughput (it was about 2.6 KiB/s at 64 KiB). Very slow media could appear stale
-      during one slow chunk. This is a documented trade-off, not a defect.
+      section 101 sets no maximum gap per chunk. The 30 s stale-lease threshold comes from the spec (items at lines
+      4186 and 5005 of `FLUX_FULL_UPDATED_SPEC_V16.md`), not from a constant in the code, which has only the 5 s
+      `HEARTBEAT_INTERVAL` (`crates/flux-core/src/run/mod.rs`). Because the beat can lag the last call by up to 5 s,
+      a chunk must complete within 25 s to keep the heartbeat under 30 s old: the worst case holds above about
+      10 KiB/s of sustained throughput (256 KiB / 25 s = 10.24 KiB/s; it was about 2.6 KiB/s at 64 KiB). Very slow
+      media could appear stale during one slow chunk, though staleness also requires that no live process holds the
+      lock (section 102). This is a documented trade-off, not a defect.
 
 ## Deferred from cut 7b
 
