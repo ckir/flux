@@ -8,7 +8,9 @@ use flux_fs::{
     ClaimKey, ClaimOutcome, ClaimRecord, ClaimStatus, ClaimStore, Code, Durability, FluxPathKey,
     FsError, Result,
 };
-use redb::{Builder, Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    Builder, Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+};
 
 /// `redb`'s page cache: small and fixed (section 10.1).
 pub const CACHE_BYTES: usize = 16 * 1024 * 1024;
@@ -132,6 +134,12 @@ impl ClaimStore for RedbClaimStore {
             self.unsynced = 0;
         }
         Ok(())
+    }
+
+    fn count(&self) -> Result<u64> {
+        let tx = self.db.begin_read().map_err(io_err)?;
+        let table = tx.open_table(CLAIMS).map_err(io_err)?;
+        table.len().map_err(io_err)
     }
 }
 

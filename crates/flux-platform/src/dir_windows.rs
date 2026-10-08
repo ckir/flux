@@ -308,6 +308,15 @@ impl DirHandle for StdDir {
         crate::RedbClaimStore::from_file(file, durability)
     }
 
+    fn open_claim_store(
+        &self,
+        _name: &OsStr,
+        _durability: flux_fs::Durability,
+    ) -> Result<Self::Claims> {
+        // Stub until cut 9a Task 2 replaces it.
+        Err(FsError::new(Code::IoError, std::io::Error::from(std::io::ErrorKind::Unsupported)))
+    }
+
     fn lock_capability(&self) -> Result<flux_fs::LockCapability> {
         crate::lock_file::capability_of(&self.0)
     }

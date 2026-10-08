@@ -152,6 +152,10 @@ fn corrupt_claim() -> FsError {
 }
 
 impl ClaimStore for FakeClaimStore {
+    fn count(&self) -> Result<u64> {
+        Ok(self.map.lock().unwrap().len() as u64)
+    }
+
     fn insert_if_absent(&mut self, key: &ClaimKey, record: &ClaimRecord) -> Result<ClaimOutcome> {
         self.record(
             format!("claim_insert({})", String::from_utf8_lossy(&key.name)),
@@ -1483,6 +1487,11 @@ impl DirHandle for FakeDirHandle {
         g.claim_stores.push(std::sync::Arc::clone(&map));
         g.claim_stores_open += 1;
         Ok(FakeClaimStore { map, inner: std::sync::Arc::clone(&self.inner) })
+    }
+
+    fn open_claim_store(&self, _name: &OsStr, _durability: Durability) -> Result<Self::Claims> {
+        // Stub until cut 9a Task 3 replaces it.
+        Err(FsError::new(Code::IoError, std::io::Error::from(std::io::ErrorKind::Unsupported)))
     }
 
     fn open_lock(&self, name: &OsStr) -> Result<Self::Lock> {

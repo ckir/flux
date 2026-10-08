@@ -320,6 +320,16 @@ pub trait DirHandle: Sized {
         durability: crate::Durability,
     ) -> Result<Self::Claims>;
 
+    /// Open the EXISTING claim store `name` (cut 9a): read and write, never following a link, never creating.
+    /// A missing name is `Code::IoError` kind `NotFound`; a link `Code::SafetyRejected`; a directory
+    /// `Code::DestinationError` kind `IsADirectory`; a zero-length or undecodable file `Code::StateCorrupt`; a
+    /// store of another format `Code::IncompatibleState`.
+    fn open_claim_store(
+        &self,
+        name: &std::ffi::OsStr,
+        durability: crate::Durability,
+    ) -> Result<Self::Claims>;
+
     /// Open an EXISTING lock file for reading and writing, without creating it (§240.5 step 2; the classifier's open,
     /// §240.1). Never follows a link.
     ///
