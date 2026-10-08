@@ -94,6 +94,24 @@ jobs:
         with:
           python-version: "3.14"
       - uses: taiki-e/install-action@just
+      - name: Pinned TLC version
+        id: tla
+        # Read from run.py so the cache key cannot drift from the pin.
+        run: |
+          python - >> "$GITHUB_OUTPUT" <<'PY'
+          import sys
+          sys.path.insert(0, "models/lockproto")
+          import run
+          print(f"key=tla2tools-{run.TLA_TAG}-{run.TLA_SHA256}")
+          PY
+      - name: Cache the TLC jar
+        # Only the jar, not target/tla/out. run.py still SHA-256 checks whatever is restored and
+        # re-downloads on a mismatch, so a stale or corrupt entry costs a download, never a wrong jar.
+        # A cold cache is a plain miss: run.py downloads the jar and the post step saves it.
+        uses: actions/cache@v6
+        with:
+          path: target/tla/tla2tools.jar
+          key: ${{ steps.tla.outputs.key }}
       - name: Run the model check
         env:
           SCENARIO: ${{ matrix.job.scenario }}
@@ -125,6 +143,24 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.14"
+      - name: Pinned TLC version
+        id: tla
+        # Read from run.py so the cache key cannot drift from the pin.
+        run: |
+          python - >> "$GITHUB_OUTPUT" <<'PY'
+          import sys
+          sys.path.insert(0, "models/lockproto")
+          import run
+          print(f"key=tla2tools-{run.TLA_TAG}-{run.TLA_SHA256}")
+          PY
+      - name: Cache the TLC jar
+        # Only the jar, not target/tla/out. run.py still SHA-256 checks whatever is restored and
+        # re-downloads on a mismatch, so a stale or corrupt entry costs a download, never a wrong jar.
+        # A cold cache is a plain miss: run.py downloads the jar and the post step saves it.
+        uses: actions/cache@v6
+        with:
+          path: target/tla/tla2tools.jar
+          key: ${{ steps.tla.outputs.key }}
       - name: Re-run pcal.trans and diff
         run: python models/lockproto/run.py --check-translation
 
