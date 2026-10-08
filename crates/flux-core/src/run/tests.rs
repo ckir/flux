@@ -2992,22 +2992,35 @@ fn a_transferring_or_failed_manifest_without_a_usable_state_db_is_state_corrupt(
     }
 }
 
+/// After a failed or refused adoption the prior is untouched: its manifest decodes to the state it was staged with,
+/// its `state.db` is still there, and no `.removing` / `.creating` sibling of its workspace appeared.
+fn assert_prior_survives(fs: &FaultFs, staged: &OperationState) {
+    assert_eq!(&manifest(fs, &id(5)), staged, "the prior's manifest is unchanged");
+    assert_eq!(staged.format_version, 3);
+    assert!(fs.exists(format!("/p/dest/.flux/operations/{}/state.db", id(5))), "state.db survives");
+    for suffix in ["removing", "creating"] {
+        let sibling = format!("/p/dest/.flux/operations/{}.{suffix}", id(5));
+        assert!(!fs.exists(&sibling), "no {sibling}");
+    }
+}
+
 #[test]
 fn an_incompatible_state_db_is_refused() {
     let fs = fake();
-    prior3(&fs, 5, OpState::Failed);
+    let p = prior3(&fs, 5, OpState::Failed);
     drop(prior_store(&fs, 5));
     fs.set_claim_store_format(state_db(5), 2);
     let (r, _) = run_tree(&fs, &resume());
     assert_eq!(refused(&r.stop), (LockCode::IncompatibleState, false));
     assert!(detail(&r.stop).contains("state.db"), "{}", detail(&r.stop));
     assert!(!fs.exists(LOCK));
+    assert_prior_survives(&fs, &p);
 }
 
 #[test]
 fn a_state_db_that_cannot_be_opened_fails_the_run_at_the_state_step() {
     let fs = fake();
-    prior3(&fs, 5, OpState::Failed);
+    let p = prior3(&fs, 5, OpState::Failed);
     drop(prior_store(&fs, 5));
     fs.fail("open_claim_store", Code::PermissionDenied);
     let (r, _) = run_tree(&fs, &resume());
@@ -3015,6 +3028,7 @@ fn a_state_db_that_cannot_be_opened_fails_the_run_at_the_state_step() {
     assert_eq!(step, RunStep::State);
     assert!(path.ends_with("state.db"), "{path}");
     assert!(!fs.exists(LOCK));
+    assert_prior_survives(&fs, &p);
 }
 
 #[test]
@@ -3038,7 +3052,7 @@ fn a_state_corrupt_or_incompatible_claim_count_is_the_same_refusal_as_open() {
 #[test]
 fn another_claim_count_error_fails_the_run_at_the_state_step() {
     let fs = fake();
-    prior3(&fs, 5, OpState::Failed);
+    let p = prior3(&fs, 5, OpState::Failed);
     drop(prior_store(&fs, 5));
     fs.fail("claim_count", Code::PermissionDenied);
     let (r, _) = run_tree(&fs, &resume());
@@ -3046,6 +3060,7 @@ fn another_claim_count_error_fails_the_run_at_the_state_step() {
     assert_eq!(step, RunStep::State);
     assert!(path.ends_with("state.db"), "{path}");
     assert!(!fs.exists(LOCK));
+    assert_prior_survives(&fs, &p);
 }
 
 #[test]
@@ -3444,6 +3459,16 @@ fn an_own_existing_claim_is_redone() {
     let out = ok(&r);
     assert!(got.is_empty(), "{got:?}");
     assert_eq!((out.files_overwritten, out.files_resumed), (1, 0));
+    assert_eq!(
+        fs.read_file("/p/dest/a").as_deref(),
+        Some(&b"A"[..]),
+        "the redo wrote the source bytes"
+    );
+    assert_eq!(
+        fs.claim(strong(&fs, "/p/dest"), "a"),
+        Some(ClaimRecord { target: key("a"), status: ClaimStatus::Created }),
+        "the own Existing claim is upgraded to Created"
+    );
 }
 
 #[test]

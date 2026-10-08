@@ -783,6 +783,18 @@ mod tests {
         assert!(run_warning_line(&all[3]).contains("X/kept"));
     }
 
+    #[test]
+    fn a_resume_mapping_by_path_warning_is_this_exact_line() {
+        let path = PathBuf::from("X/the-path");
+        assert_eq!(
+            run_warning_line(&RunWarning::ResumeMappingByPath(path.clone())),
+            format!(
+                "warning: the source root's identity could not confirm the mapping, so {} was matched by its path alone",
+                path.display()
+            )
+        );
+    }
+
     // Part 3b-2 test audit (round 1): each test below was red under the mutant named in its comment.
 
     fn refused() -> RunError {
