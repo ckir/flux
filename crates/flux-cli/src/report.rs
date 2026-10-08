@@ -3,7 +3,7 @@
 //! returns text, and `main` writes it.
 
 use flux_core::copy::CopyError;
-use flux_core::run::{Run, RunError, RunWarning};
+use flux_core::run::{ResumeNote, Run, RunError, RunWarning};
 use flux_core::{TreeAbort, TreeFailure, TreeFailureCause, TreeOutcome, WeakIdentityWarnings};
 use flux_fs::{Code, FileIdentity, MetadataFailure, MetadataItem, Outcome};
 use serde::Serialize;
@@ -69,9 +69,9 @@ impl Report {
         let mut r = Self::zero();
         r.files_total = out.files_total;
         r.files_copied = out.files_copied;
-        r.files_skipped = out.special_files_skipped + out.files_skipped;
+        r.files_skipped = out.special_files_skipped + out.files_skipped + out.files_resumed;
         r.files_overwritten = out.files_overwritten;
-        r.bytes_skipped = out.bytes_skipped;
+        r.bytes_skipped = out.bytes_skipped + out.bytes_resumed;
         r.files_degraded = out.files_degraded;
         // Only `copy` and `symlink` are failed FILES. A `ClaimNotRecorded` failure is counted in
         // `FailureTally::total()` (so in `errors`) and in `claim_not_recorded`, but not here: the file was published
@@ -365,6 +365,25 @@ pub fn run_warning_line(w: &RunWarning) -> String {
 pub fn run_lines<T>(run: &Run<T>) -> Vec<String> {
     let mut v = run.stop.as_ref().map(stop_lines).unwrap_or_default();
     v.extend(run.warnings.iter().map(run_warning_line));
+    v
+}
+
+/// Cut 9a: the run's resume note, then `resumed <n> already-complete files` when `files_resumed > 0`.
+pub fn resume_lines<T>(run: &Run<T>, files_resumed: u64) -> Vec<String> {
+    let mut v = Vec::new();
+    match &run.resumed {
+        None => {}
+        Some(ResumeNote::StartedNew) => v.push("no prior operation; starting new".to_string()),
+        Some(ResumeNote::Adopted { operation_id, claims: Some(n) }) => {
+            v.push(format!("resuming operation {operation_id} ({n} entries claimed)"));
+        }
+        Some(ResumeNote::Adopted { operation_id, claims: None }) => {
+            v.push(format!("resuming operation {operation_id}"));
+        }
+    }
+    if files_resumed > 0 {
+        v.push(format!("resumed {files_resumed} already-complete files"));
+    }
     v
 }
 
@@ -780,6 +799,47 @@ mod tests {
 
     fn kept() -> RunWarning {
         RunWarning::StateKept(PathBuf::from("X/kept-state"))
+    }
+
+    #[test]
+    fn resume_lines_name_the_operation_and_the_counts() {
+        use flux_core::run::ResumeNote;
+        let with = |resumed| Run::<()> { copy: None, stop: None, warnings: Vec::new(), resumed };
+        assert_eq!(
+            resume_lines(&with(Some(ResumeNote::StartedNew)), 0),
+            vec!["no prior operation; starting new".to_string()]
+        );
+        let adopted = |claims| Some(ResumeNote::Adopted { operation_id: "op1".into(), claims });
+        assert_eq!(
+            resume_lines(&with(adopted(Some(3))), 0),
+            vec!["resuming operation op1 (3 entries claimed)".to_string()]
+        );
+        assert_eq!(
+            resume_lines(&with(adopted(None)), 0),
+            vec!["resuming operation op1".to_string()]
+        );
+        assert_eq!(
+            resume_lines(&with(adopted(Some(3))), 7),
+            vec![
+                "resuming operation op1 (3 entries claimed)".to_string(),
+                "resumed 7 already-complete files".to_string()
+            ]
+        );
+        assert!(resume_lines(&with(None), 0).is_empty());
+    }
+
+    #[test]
+    fn a_tree_report_folds_resumed_files_into_skipped() {
+        let out = TreeOutcome {
+            files_skipped: 3,
+            files_resumed: 4,
+            special_files_skipped: 1,
+            bytes_skipped: 10,
+            bytes_resumed: 5,
+            ..TreeOutcome::default()
+        };
+        let r = Report::tree(&out, false, 1);
+        assert_eq!((r.files_skipped, r.bytes_skipped), (8, 15));
     }
 
     #[test]

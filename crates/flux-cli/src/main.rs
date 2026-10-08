@@ -63,6 +63,10 @@ struct CopyArgs {
     /// deleted, then this copy runs.
     #[arg(long)]
     restart: bool,
+    /// Continue the one resumable prior operation on DEST as itself: files it completed are verified and skipped,
+    /// the rest are copied under the existing-file policy. With no prior operation a new one starts.
+    #[arg(long, conflicts_with = "restart")]
+    resume: bool,
     /// With --restart: take over a lock that a crashed run left empty or unreadable (§240.5).
     #[arg(long, requires = "restart")]
     break_lock: bool,
@@ -138,7 +142,7 @@ fn run_config(args: &CopyArgs) -> RunConfig {
         boot_session_id: flux_platform::boot_session_id(),
         before_mutation: debug_hook(),
         heartbeat_interval: heartbeat_interval(),
-        resume: false,
+        resume: args.resume,
     }
 }
 
@@ -230,6 +234,7 @@ fn copy(args: &CopyArgs) -> u8 {
                         err(&line);
                     }
                     lines(report::run_lines(&run));
+                    lines(report::resume_lines(&run, outcome.files_resumed));
                     err(&report::summary_line(&rep, outcome.directories_created));
                 }
                 None => lines(report::run_lines(&run)),
@@ -263,6 +268,7 @@ fn copy(args: &CopyArgs) -> u8 {
                         Err(e) => err(&e.to_string()),
                     }
                     lines(report::run_lines(&run));
+                    lines(report::resume_lines(&run, 0));
                     err(&report::summary_line(&rep, 0));
                 }
                 None => lines(report::run_lines(&run)),
@@ -370,6 +376,20 @@ mod tests {
     #[test]
     fn an_unknown_value_is_a_usage_error() {
         assert!(Cli::try_parse_from(["flux", "copy", "a", "b", "--safety=loose"]).is_err());
+    }
+
+    #[test]
+    fn resume_and_restart_together_is_a_usage_error() {
+        let err = Cli::try_parse_from(["flux", "copy", "a", "b", "--resume", "--restart"])
+            .err()
+            .expect("--resume with --restart must be rejected");
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn resume_reaches_the_config() {
+        assert!(run_config(&parse(&["--resume"])).resume);
+        assert!(!run_config(&parse(&[])).resume);
     }
 
     #[test]

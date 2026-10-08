@@ -329,6 +329,7 @@ are the spec's).
 - [ ] **1. A crash between a publish rename and its claim write** leaves an unclaimed published entry until the WAL cut.
 - [ ] **2. Not in this cut:** resume, `PREPARE_COMMIT` / `COMMIT` and commit recovery (sections 182-184), hardlink
       groups (section 253.7), `--atomic`, `--dry-run` and the TLA+ `claims` scenario.
+      (file-granular resume landed in cut 9a; the rest stays)
 - [ ] **3. WSL 9p and network filesystems:** whether the backend's (`redb`) file locking works there is unmeasured.
 - [ ] **4. A directory with millions of entries** holds its listing in memory while the walk is inside it (the source
       side already does).
@@ -394,6 +395,41 @@ are the spec's).
       redb's `cache_stats()` reads zero unless its `cache_metrics` feature is on, so flux-platform enables it as a
       dev-dependency feature only (the normal dependency graph is unchanged). Remaining uncovered mutant: `from_file`
       passing a number other than `CACHE_BYTES` (a one-line delegation).
+
+## Cut 9a known limits
+
+Recorded by cut 9a (`docs/superpowers/specs/2026-10-08-cut-9a-resume-design.md`, "Known limits"; the numbers
+are the spec's).
+
+- [ ] **1. Claims are keyed by directory identity**: a destination directory deleted and recreated between runs has a
+      new identity, so its old claims miss and its files are copied again (safe). If the filesystem reuses an inode
+      number, a stale claim can make a later target see a foreign claim and fail loudly with
+      `DESTINATION_NAMESPACE_COLLISION` (never a silent overwrite).
+- [ ] **2. A destination changed during the downtime** is caught only by the size and mtime check; a same-size,
+      same-mtime change is not.
+- [ ] **3. Files published in the unsynced window** (limit 4a of cut 8b) are copied again under overwrite.
+- [ ] **4. Orphan partials of targets that vanished between the runs** are not swept (slice 9b).
+- [ ] **5. A manifest-only workspace in state `CREATED`** resumes with zero progress; one in any later state without
+      `state.db` is `STATE_CORRUPT`.
+- [ ] **6. Claim keys contain the filesystem's device number**. Linux does not guarantee that `st_dev` is stable
+      across a reboot (device numbers of removable, LVM or network-backed volumes can change), and an interrupted copy
+      is often followed by a reboot: when the numbers change every claim misses and the resume copies everything again
+      under the existing-file policy (safe, but the resume saves nothing). Not testable in CI; to be measured on real
+      systems before slice 9c.
+- [ ] **7. Weak-identity destination directories never get claims**: a resumed run reports their existing files as
+      collisions (see the walk section).
+- [ ] **8. A destination that cannot take the source's modification times** (`preserve_times = Default` records the
+      failure and still publishes) holds the copy time instead, so the mtime check never matches: every file of such a
+      destination is copied again on each resume (safe, but the resume saves nothing there). `--preserve-times`
+      (strict) fails those files instead.
+- [ ] **9. A binary older than this cut** (cut 8b and earlier) reads format 3 as an unknown version: it refuses with
+      `INCOMPATIBLE_STATE` (exit 3) before it looks at `--restart`, so it cannot supersede a format-3 prior. Use the
+      newer binary, or remove `DEST/.flux/operations/<id>` by hand. The same holds for every future format and cannot
+      be changed in binaries already shipped.
+- [ ] **10. A destination used from two environments that identify things differently** (native Windows and WSL on one
+      NTFS volume) cannot be resumed from the other side: source paths are encoded and written differently (UTF-16
+      versus UTF-8 hex) and object identities are derived differently, so the mapping check refuses with
+      `INCOMPATIBLE_STATE` or every claim misses. Resume in the environment that started the copy (see also limit 6).
 
 ## Scaffolding follow-ups
 
