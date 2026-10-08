@@ -668,14 +668,64 @@ The lock costs little. A pre-7a build (`5fe1f62`, no lock) copied the 10,000 fil
       - unbuffered I/O for large files, as FastCopy does from 64 MiB.
 
       Measure before choosing.
+
+      Progress 2026-10-08: the first lever, a larger user-space buffer, is done in the commit with the subject `perf:
+      size the copy buffer from the source, capped at 256 KiB` (buffer = source length clamped to 4 KiB..256 KiB; on
+      Linux about 25% lower median wall time for a 4 GiB file and no slow outliers; not yet measured on Windows or
+      macOS). The Windows figure stands until re-measured on Windows. Remaining candidates unchanged (`copy_file_range`
+      / reflink / `CopyFileEx` fast paths, unbuffered I/O for large files).
 - [ ] **Small-file throughput: Flux is ~2.8x slower than robocopy and ~8x slower than robocopy `/MT:8`.** Flux
       copies one file at a time. `/MT:8` shows that copying several files at once is the largest lever. The per-file
       work also counts: three ownership checks, each a stat plus a 4 KiB read of the lock, the temporary-then-rename
       publish, and extra source stats.
 
       Profile one run, for example with Windows Performance Recorder, before choosing.
+
+      Linux figures 2026-10-08 (see the re-probe below): Flux is about 5x slower than `cp -r` on 10,000 x 4 KiB,
+      per-file work dominates, and the buffer change is neutral.
 - [ ] **Re-probe after each change, with the order rotated.** Single runs and a fixed tool order are not
       measurements here (see the first-toucher effect above).
+
+## Re-probe on the Linux development box (2026-10-08)
+
+Method: this box is a Linux (Ubuntu, kernel 7.0) VM, 8 vCPUs (AMD EPYC), 23 GiB RAM, ext4.
+
+- all runs warm page cache (no cache drop);
+- each run followed by `sync` (timed separately, about 3-4 s for 4 GiB for every tool);
+- release binaries built from the same commit differing only in the copy buffer;
+- tool order rotated each pass so every tool went first once per rotation;
+- machine idle (whole-machine busy 1.7-4.1% before, between and after the runs, with a control loop that added 11-14
+  points, proving the check can see load).
+
+Uncontrolled: `agy`, `opencode` and the controller's own process in the background (about 2% busy), VM neighbours (steal
+time not measured), writeback throttling by the kernel (the dominant noise source: `cp` alone ranged 2.6-10.9 s on one
+input).
+
+Results:
+- One 4 GiB file, the old fixed 64 KiB buffer versus 256 KiB, 1 MiB and 4 MiB (two independent rotated passes of 6 runs
+  each, 12 per tool): wall medians 7.77 s (64 KiB), 4.96 s (256 KiB), 5.11 s (1 MiB), 5.13 s (4 MiB), `cp` 6.47 s. 64
+  KiB is slower than each larger size (permutation test on the difference of medians, p = 0.003, 0.026, 0.004); 256 KiB,
+  1 MiB and 4 MiB are indistinguishable. 6 of 12 runs of 64 KiB took over 8 s, versus 0, 1 and 0 for the larger sizes.
+  CPU time (user+sys, kernel time dominates; second pass, 6 runs per tool): median 5.54 s (64 KiB) versus 3.92 s (256
+  KiB), 3.83 s (1 MiB), 3.92 s (4 MiB).
+- Re-probe of the shipped change (old main = fixed 64 KiB versus new = buffer sized from the source length, clamped to 4
+  KiB..256 KiB; 6 runs each): one 4 GiB file wall median 6.09 s (old; one 35.09 s outlier) versus 5.62 s (new; range
+  4.89-6.43), `cp` 4.99 s. Pooled over all three sets of large-file runs (18 per side: the 64 KiB buffer versus the 256
+  KiB buffer, old/new binaries included): median 7.02 s versus 5.28 s (25% lower), permutation p = 0.006, 7 of 18 runs
+  over 8 s versus 0 of 18.
+- 10,000 files of 4 KiB in 100 directories (folder copy, 6 runs each): Flux old 2.49 s median (0.25 ms/file), Flux new
+  2.26 s (p = 0.20 for the difference, so no regression), `cp -r` 0.42 s, `rsync -r` 0.99 s. So on this box Flux's
+  small-file throughput is about 5x slower than `cp -r` and 2.3x slower than `rsync -r`, which the buffer change does
+  not touch.
+
+These figures are NOT comparable with the table above (different machine, filesystem and tools). Raw results and scripts
+are kept on the development box under `~/flux-probe` (not in the repository).
+
+- [ ] **Heartbeat cadence per chunk.** The copy loop calls the heartbeat once per chunk; a chunk is now up to 256 KiB
+      (was 64 KiB), so beats per byte fell fourfold for large files. The beat is rate-limited to once per 5 s and
+      section 101 sets no maximum gap per chunk; with the 30 s stale-eligibility threshold the worst case holds above
+      about 10.5 KiB/s of sustained throughput (it was about 2.6 KiB/s at 64 KiB). Very slow media could appear stale
+      during one slow chunk. This is a documented trade-off, not a defect.
 
 ## Deferred from cut 7b
 
