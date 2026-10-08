@@ -168,6 +168,7 @@ mod tests {
             step: RunStep::State,
             path: PathBuf::from("p"),
             error: FsError::new(Code::IoError, std::io::Error::other("x")),
+            not_removed: None,
         }
     }
 

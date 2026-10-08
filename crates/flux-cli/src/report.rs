@@ -307,13 +307,19 @@ pub fn stop_lines(e: &RunError) -> Vec<String> {
             }
             v
         }
-        RunError::Failed { step, path, error } => vec![format!(
-            "{}: {} at {}: {}",
-            error.code.as_str(),
-            step.as_str(),
-            path.display(),
-            error.source
-        )],
+        RunError::Failed { step, path, error, not_removed } => {
+            let mut v = vec![format!(
+                "{}: {} at {}: {}",
+                error.code.as_str(),
+                step.as_str(),
+                path.display(),
+                error.source
+            )];
+            if let Some((path, why)) = not_removed {
+                v.push(format!("  not removed: {} ({})", path.display(), why.source));
+            }
+            v
+        }
     }
 }
 
@@ -705,10 +711,31 @@ mod tests {
             step: RunStep::State,
             path: PathBuf::from("D/m"),
             error: FsError::new(Code::DiskFull, std::io::Error::other("full")),
+            not_removed: None,
         };
         assert_eq!(
             stop_lines(&f),
             vec!["DISK_FULL: writing the operation's state at D/m: full".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_failed_run_with_a_leftover_lock_prints_an_also_not_removed_line() {
+        let f = RunError::Failed {
+            step: RunStep::State,
+            path: PathBuf::from("D/m"),
+            error: FsError::new(Code::DiskFull, std::io::Error::other("full")),
+            not_removed: Some((
+                PathBuf::from("P/d.flux-lock"),
+                FsError::new(Code::PermissionDenied, std::io::Error::other("denied")),
+            )),
+        };
+        assert_eq!(
+            stop_lines(&f),
+            vec![
+                "DISK_FULL: writing the operation's state at D/m: full".to_string(),
+                "  not removed: P/d.flux-lock (denied)".to_string()
+            ]
         );
     }
 
