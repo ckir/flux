@@ -118,6 +118,10 @@ struct Inner {
     /// Every claim store `create_claim_store` made, in creation order. Each holds the encoded claims (`ClaimKey::encode`
     /// -> `ClaimRecord::encode`), the encodings of the real store.
     claim_stores: Vec<ClaimMap>,
+    /// path -> the map `create_claim_store` made there, so `open_claim_store` can reopen it.
+    claim_files: HashMap<PathBuf, ClaimMap>,
+    /// `set_claim_store_format`; an absent path means format 1.
+    claim_formats: HashMap<PathBuf, u64>,
     /// Fake claim stores created and not yet dropped (`claim_stores_open`).
     claim_stores_open: usize,
     /// `claim_stores_open` when a handle last asked to remove a file named `state.db`.
@@ -127,7 +131,7 @@ struct Inner {
 type ClaimMap = std::sync::Arc<Mutex<std::collections::BTreeMap<Vec<u8>, Vec<u8>>>>;
 
 /// The fake's claim store: the real store's key and value encodings over an in-memory map, with the call log and the
-/// fault keys `claim_insert`, `claim_upgrade`, `claim_flush`.
+/// fault keys `claim_insert`, `claim_get`, `claim_upgrade`, `claim_flush`.
 pub struct FakeClaimStore {
     map: ClaimMap,
     inner: std::sync::Arc<Mutex<Inner>>,
@@ -152,6 +156,11 @@ fn corrupt_claim() -> FsError {
 }
 
 impl ClaimStore for FakeClaimStore {
+    fn count(&self) -> Result<u64> {
+        self.record("claim_count".to_string(), "claim_count")?;
+        Ok(self.map.lock().unwrap().len() as u64)
+    }
+
     fn insert_if_absent(&mut self, key: &ClaimKey, record: &ClaimRecord) -> Result<ClaimOutcome> {
         self.record(
             format!("claim_insert({})", String::from_utf8_lossy(&key.name)),
@@ -169,6 +178,7 @@ impl ClaimStore for FakeClaimStore {
     }
 
     fn get(&self, key: &ClaimKey) -> Result<Option<ClaimRecord>> {
+        self.record(format!("claim_get({})", String::from_utf8_lossy(&key.name)), "claim_get")?;
         let m = self.map.lock().unwrap();
         match m.get(&key.encode()) {
             Some(v) => Ok(Some(ClaimRecord::decode(v).ok_or_else(corrupt_claim)?)),
@@ -670,6 +680,11 @@ impl FaultFs {
         self.inner.lock().unwrap().open_at_state_db_removal
     }
 
+    /// The next `open_claim_store` of `path` answers `Code::IncompatibleState` when `format != 1`.
+    pub fn set_claim_store_format(&self, path: impl AsRef<Path>, format: u64) {
+        self.inner.lock().unwrap().claim_formats.insert(path.as_ref().to_path_buf(), format);
+    }
+
     /// Claims across every store created from this fake.
     pub fn claim_count(&self) -> usize {
         let g = self.inner.lock().unwrap();
@@ -830,6 +845,12 @@ impl FaultFs {
         g.files.insert(path.to_path_buf(), Vec::new());
         g.types.insert(path.to_path_buf(), FileType::Symlink);
         mint_identity(&mut g, path);
+    }
+
+    /// Give any existing entry (a directory or a link too) a modified time, directly.
+    pub fn set_modified(&self, path: impl AsRef<Path>, modified: SystemTime) {
+        let path = path.as_ref();
+        self.inner.lock().unwrap().times.insert(path.to_path_buf(), Some(modified));
     }
 
     /// Give a file permissions, so a copy has something to carry across.
@@ -1422,6 +1443,7 @@ impl DirHandle for FakeDirHandle {
         if name == OsStr::new("state.db") {
             let mut g = self.inner.lock().unwrap();
             g.open_at_state_db_removal = Some(g.claim_stores_open);
+            g.claim_files.remove(&child_path);
         }
         self.fs().remove_file(&child_path)
     }
@@ -1481,6 +1503,49 @@ impl DirHandle for FakeDirHandle {
         mint_identity(&mut g, &child_path);
         let map = ClaimMap::default();
         g.claim_stores.push(std::sync::Arc::clone(&map));
+        g.claim_files.insert(child_path.clone(), std::sync::Arc::clone(&map));
+        g.claim_stores_open += 1;
+        Ok(FakeClaimStore { map, inner: std::sync::Arc::clone(&self.inner) })
+    }
+
+    fn open_claim_store(&self, name: &OsStr, _durability: Durability) -> Result<Self::Claims> {
+        check_component(name)?;
+        let child_path = self.my_path().join(name);
+        self.fs()
+            .record(format!("open_claim_store({})", child_path.display()), "open_claim_store")?;
+        let mut g = self.inner.lock().unwrap();
+        if g.types.get(&child_path) == Some(&FileType::Symlink) {
+            return Err(FsError::new(
+                Code::SafetyRejected,
+                std::io::Error::other("a symlink is not a claim store"),
+            ));
+        }
+        if g.directories.contains(&child_path) {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::new(
+                    std::io::ErrorKind::IsADirectory,
+                    "a directory is not a claim store",
+                ),
+            ));
+        }
+        let Some(bytes) = g.files.get(&child_path) else {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            ));
+        };
+        let empty = bytes.is_empty();
+        if g.claim_formats.get(&child_path).is_some_and(|f| *f != 1) {
+            return Err(FsError::new(
+                Code::IncompatibleState,
+                std::io::Error::other("claim store format is not supported"),
+            ));
+        }
+        let Some(map) = g.claim_files.get(&child_path).cloned() else {
+            let msg = if empty { "zero-length claim store" } else { "not a claim store" };
+            return Err(FsError::new(Code::StateCorrupt, std::io::Error::other(msg)));
+        };
         g.claim_stores_open += 1;
         Ok(FakeClaimStore { map, inner: std::sync::Arc::clone(&self.inner) })
     }
@@ -2507,6 +2572,74 @@ mod tests {
             Ok(_) => panic!("a taken name must be refused"),
         };
         assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn open_claim_store_reopens_what_create_made() {
+        use flux_fs::{
+            ClaimKey, ClaimRecord, ClaimStatus, ClaimStore, DestinationRoot, DirHandle, Durability,
+            FluxPathKey, ObjectId,
+        };
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let ka = ClaimKey::new(ObjectId { volume: 1, index: 1 }, OsStr::new("a"));
+        let kb = ClaimKey::new(ObjectId { volume: 1, index: 1 }, OsStr::new("b"));
+        let ra = ClaimRecord { target: FluxPathKey(b"a".to_vec()), status: ClaimStatus::Existing };
+        let rb = ClaimRecord { target: FluxPathKey(b"b".to_vec()), status: ClaimStatus::Created };
+        {
+            let mut s = d.create_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap();
+            s.insert_if_absent(&ka, &ra).unwrap();
+            s.insert_if_absent(&kb, &rb).unwrap();
+        }
+        assert_eq!(fs.claim_stores_open(), 0);
+        let s = d.open_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap();
+        assert_eq!(fs.claim_stores_open(), 1);
+        assert_eq!(s.get(&ka).unwrap(), Some(ra));
+        assert_eq!(s.get(&kb).unwrap(), Some(rb));
+        assert_eq!(s.count().unwrap(), 2);
+        assert!(
+            fs.calls().iter().any(|c| c.replace('\\', "/") == "open_claim_store(/d/state.db)"),
+            "the call log names the path: {:?}",
+            fs.calls()
+        );
+        drop(s);
+        assert_eq!(fs.claim_stores_open(), 0);
+    }
+
+    #[test]
+    fn open_claim_store_refuses_what_is_not_a_store() {
+        use flux_fs::{DestinationRoot, DirHandle, Durability};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let open = |n: &str| d.open_claim_store(OsStr::new(n), Durability::Normal);
+        let err = open("missing.db").err().expect("missing");
+        assert_eq!(err.source.kind(), std::io::ErrorKind::NotFound);
+        fs.write_file("/d/empty.db", b"");
+        assert_eq!(open("empty.db").err().expect("empty").code, Code::StateCorrupt);
+        fs.write_file("/d/junk.db", b"garbage");
+        assert_eq!(open("junk.db").err().expect("junk").code, Code::StateCorrupt);
+        fs.create_dir(Path::new("/d/dir.db")).unwrap();
+        assert_eq!(open("dir.db").err().expect("dir").code, Code::DestinationError);
+        fs.add_symlink("/d/link.db");
+        assert_eq!(open("link.db").err().expect("link").code, Code::SafetyRejected);
+        drop(d.create_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap());
+        fs.set_claim_store_format("/d/state.db", 2);
+        assert_eq!(open("state.db").err().expect("format").code, Code::IncompatibleState);
+    }
+
+    #[test]
+    fn open_claim_store_is_fault_injectable() {
+        use flux_fs::{DestinationRoot, DirHandle, Durability};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        drop(d.create_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap());
+        fs.fail("open_claim_store", Code::PermissionDenied);
+        let err =
+            d.open_claim_store(OsStr::new("state.db"), Durability::Normal).err().expect("fault");
+        assert_eq!(err.code, Code::PermissionDenied);
     }
 
     #[test]

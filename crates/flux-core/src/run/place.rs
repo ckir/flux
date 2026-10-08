@@ -8,15 +8,16 @@ use crate::copy::{CopyError, CopyStep, split_destination};
 use crate::lock::{LockCode, LockResult, Refusal};
 use crate::prior::{PriorOp, Scan, scan_file, scan_tree};
 use crate::state::{
-    FLUX_DIR, Kind, MANIFEST, OPERATIONS_DIR, OperationState, PARTIAL_INFIX, PROBE, PROBE_TEMP,
-    STATE_DB, begin_workspace, creating_name, id_after, operations_dir, publish_workspace,
-    record_name, remove_empty_control_dirs, remove_record, retire_workspace, write_state,
+    FLUX_DIR, Kind, MANIFEST, OPERATIONS_DIR, OpState, OperationState, PARTIAL_INFIX, PROBE,
+    PROBE_TEMP, Root, STATE_DB, absolute_lexical, begin_workspace, creating_name, id_after,
+    identity_text, native_hex, operations_dir, publish_workspace, record_name,
+    remove_empty_control_dirs, remove_record, retire_workspace, write_state,
 };
 use crate::tree::{TreeOutcome, containment, preflight, primitive_unavailable, reserved_path};
 use crate::walk::{WalkEvent, walk};
 use flux_fs::{
-    Code, DestinationRoot, DirHandle, Durability, FileIdentity, FileType, FsError, OperationId,
-    Safety, temp_path,
+    ClaimStore, Code, DestinationRoot, DirHandle, Durability, FileIdentity, FileType, FsError,
+    OperationId, Safety, temp_path,
 };
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
@@ -63,6 +64,16 @@ pub(crate) trait Place<D: DirHandle> {
     /// (`None` if there is none, `Unavailable` if it cannot be read). Read under the lock, as the state is made. `None`
     /// for a tree.
     fn file_identities(&self) -> Option<(FileIdentity, Option<FileIdentity>)>;
+    /// Cut 9a: the one root this run records (format 3 `roots`).
+    fn roots(&self) -> Vec<Root>;
+    /// Cut 9a: adopt a validated prior. A tree opens `operations/<id>/state.db` (`open_claim_store`), or, while
+    /// `prior.state` is `CREATED` and the file is absent, zero-length or `Code::StateCorrupt`, removes what is there
+    /// and creates a fresh store; returns the claim count. A single file opens nothing and returns `None`.
+    fn adopt(
+        &mut self,
+        prior: &OperationState,
+        durability: Durability,
+    ) -> Result<Option<u64>, RunError>;
 }
 
 /// Which file of the probe a failure was at: the temporary's creation, or the publish onto `PROBE`.
@@ -194,6 +205,40 @@ pub(crate) struct TreePlace<'p, F: DestinationRoot> {
     pub(crate) claims: Option<<F::Dir as DirHandle>::Claims>,
     /// `opts.durability`, for the store's creation.
     pub(crate) durability: Durability,
+    /// The source root as the operator named it, and its identity, for the record's `roots` (cut 9a).
+    pub(crate) src_root: PathBuf,
+    pub(crate) src_identity: FileIdentity,
+}
+
+/// A refusal of the adopted state that changed nothing.
+fn refused_state(code: LockCode, detail: String) -> RunError {
+    RunError::Refused {
+        refusal: Box::new(Refusal { code, holder: None, detail }),
+        changed: false,
+        not_removed: None,
+    }
+}
+
+const BY_HAND: &str = "Flux never deletes state it cannot read (§249.4): inspect it, and remove it by hand if it is not needed";
+
+/// The one mapping of a claim-store error met while adopting a prior (`open` and `count` alike): a store that cannot
+/// be read is a refusal, anything else fails the run at the state step.
+fn state_error(db: &Path, e: FsError) -> RunError {
+    match e.code {
+        Code::StateCorrupt => refused_state(
+            LockCode::StateCorrupt,
+            format!("{}: {}; {BY_HAND}", db.display(), e.source),
+        ),
+        Code::IncompatibleState => refused_state(
+            LockCode::IncompatibleState,
+            format!(
+                "{}: {}; use the Flux version that wrote it, or run again with --restart to supersede it",
+                db.display(),
+                e.source
+            ),
+        ),
+        _ => failed(RunStep::State, db, e),
+    }
 }
 
 impl<F: DestinationRoot> TreePlace<'_, F> {
@@ -445,6 +490,61 @@ impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {
     fn file_identities(&self) -> Option<(FileIdentity, Option<FileIdentity>)> {
         None
     }
+
+    fn roots(&self) -> Vec<Root> {
+        vec![Root {
+            source_root: native_hex(&absolute_lexical(&self.src_root)),
+            source_identity: identity_text(self.src_identity),
+            destination_prefix: String::new(),
+        }]
+    }
+
+    fn adopt(
+        &mut self,
+        prior: &OperationState,
+        durability: Durability,
+    ) -> Result<Option<u64>, RunError> {
+        let id = prior.operation_id.as_str();
+        let db = self.operations_shown().join(id).join(STATE_DB);
+        let dest = self.dest.as_ref().expect("the scan found the prior under DEST");
+        let operations = operations_dir(dest, &self.dest_shown)
+            .map_err(|e| from_lock(e, RunStep::State, &self.operations_shown(), false))?;
+        let workspace = operations
+            .open_dir(OsStr::new(id))
+            .map_err(|e| failed(RunStep::State, &self.operations_shown().join(id), e))?;
+        let name = OsStr::new(STATE_DB);
+        let store = match workspace.open_claim_store(name, durability) {
+            Ok(store) => store,
+            Err(e)
+                if (e.source.kind() == ErrorKind::NotFound || e.code == Code::StateCorrupt)
+                    && prior.state == OpState::Created =>
+            {
+                // A crash between the manifest and the store's creation: nothing was claimed. Start the store again.
+                match workspace.remove_file(name) {
+                    Ok(()) => {}
+                    Err(e) if e.source.kind() == ErrorKind::NotFound => {}
+                    Err(e) => return Err(failed(RunStep::State, &db, e)),
+                }
+                let store = workspace
+                    .create_claim_store(name, durability)
+                    .map_err(|e| failed(RunStep::State, &db, e))?;
+                self.claims = Some(store);
+                self.operations = Some(operations);
+                return Ok(Some(0));
+            }
+            Err(e) if e.source.kind() == ErrorKind::NotFound => {
+                return Err(refused_state(
+                    LockCode::StateCorrupt,
+                    format!("{}: the workspace has no state.db; {BY_HAND}", db.display()),
+                ));
+            }
+            Err(e) => return Err(state_error(&db, e)),
+        };
+        let claims = store.count().map_err(|e| state_error(&db, e))?;
+        self.claims = Some(store);
+        self.operations = Some(operations);
+        Ok(Some(claims))
+    }
 }
 
 /// Remove the file at `rel` below `dest` through handles opened one component at a time, so no link is followed
@@ -469,6 +569,8 @@ pub(crate) struct FilePlace<'p, D: DirHandle> {
     pub(crate) destination: PathBuf,
     /// The source's identity, read when the source was opened (cut 7b).
     pub(crate) source_identity: FileIdentity,
+    /// The source file as the operator named it (cut 9a: the record's root).
+    pub(crate) src: PathBuf,
 }
 
 impl<D: DirHandle> Place<D> for FilePlace<'_, D> {
@@ -550,5 +652,21 @@ impl<D: DirHandle> Place<D> for FilePlace<'_, D> {
             Err(_) => Some(FileIdentity::Unavailable),
         };
         Some((self.source_identity, existing))
+    }
+
+    fn roots(&self) -> Vec<Root> {
+        vec![Root {
+            source_root: native_hex(&absolute_lexical(&self.src)),
+            source_identity: identity_text(self.source_identity),
+            destination_prefix: native_hex(Path::new(&self.target)),
+        }]
+    }
+
+    fn adopt(
+        &mut self,
+        _prior: &OperationState,
+        _durability: Durability,
+    ) -> Result<Option<u64>, RunError> {
+        Ok(None)
     }
 }

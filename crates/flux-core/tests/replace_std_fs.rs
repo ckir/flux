@@ -30,6 +30,7 @@ fn run_cfg() -> RunConfig {
         boot_session_id: "test".to_string(),
         before_mutation: None,
         heartbeat_interval: std::time::Duration::from_secs(3600),
+        resume: false,
     }
 }
 
@@ -128,7 +129,7 @@ fn replacement_works_on_the_default_filesystem() {
     let db = ops.join(&ids[0]).join("state.db");
     let file =
         std::fs::OpenOptions::new().read(true).write(true).open(&db).expect("state.db is kept");
-    let store = flux_platform::RedbClaimStore::from_file(file, Durability::Strict)
+    let store = flux_platform::RedbClaimStore::create_file(file, Durability::Strict)
         .expect("the kept store opens");
     let root = StdFileSystem.destination_root(&dst2).unwrap();
     let FileIdentity::Strong(parent) = root.identity().unwrap() else {

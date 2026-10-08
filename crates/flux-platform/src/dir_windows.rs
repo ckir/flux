@@ -305,7 +305,18 @@ impl DirHandle for StdDir {
         check_component(name)?;
         // The same exclusive, reparse-point-refusing create as `create_lock`; only the wrapper differs.
         let file = open_file_at(&self.0, name, FILE_CREATE)?;
-        crate::RedbClaimStore::from_file(file, durability)
+        crate::RedbClaimStore::create_file(file, durability)
+    }
+
+    fn open_claim_store(
+        &self,
+        name: &OsStr,
+        durability: flux_fs::Durability,
+    ) -> Result<Self::Claims> {
+        check_component(name)?;
+        // The same reparse-point-refusing open as `open_lock`; only the wrapper differs.
+        let file = open_file_at(&self.0, name, FILE_OPEN)?;
+        crate::RedbClaimStore::open_file(file, durability)
     }
 
     fn lock_capability(&self) -> Result<flux_fs::LockCapability> {

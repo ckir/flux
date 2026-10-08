@@ -116,6 +116,8 @@ pub trait ClaimStore {
     /// in both cases.
     fn upgrade_own_claim(&mut self, key: &ClaimKey, target: &FluxPathKey) -> Result<()>;
     fn flush(&mut self) -> Result<()>;
+    /// The number of claims in the store.
+    fn count(&self) -> Result<u64>;
 }
 
 /// Backend-independent cases every `ClaimStore` must pass.
@@ -144,6 +146,25 @@ pub mod conformance {
         names_differing_only_in_case_are_different_keys(new_store());
         flush_is_idempotent_and_keeps_every_claim(new_store());
         many_keys_round_trip(new_store());
+        count_follows_inserts_and_upgrades(new_store());
+    }
+
+    pub fn count_follows_inserts_and_upgrades<S: ClaimStore>(mut s: S) {
+        assert_eq!(s.count().unwrap(), 0, "count: a fresh store must count 0");
+        let r = rec("t", ClaimStatus::Existing);
+        for k in [key(1, "a"), key(1, "b"), key(2, "a")] {
+            s.insert_if_absent(&k, &r).unwrap();
+        }
+        assert_eq!(s.count().unwrap(), 3, "count: three inserts must count 3");
+        assert!(
+            matches!(s.insert_if_absent(&key(1, "a"), &r).unwrap(), ClaimOutcome::Present(_)),
+            "count: a re-insert must be Present"
+        );
+        assert_eq!(s.count().unwrap(), 3, "count: a Present re-insert must keep 3");
+        s.upgrade_own_claim(&key(1, "a"), &r.target).unwrap();
+        assert_eq!(s.count().unwrap(), 3, "count: an upgrade must keep 3");
+        s.flush().unwrap();
+        assert_eq!(s.count().unwrap(), 3, "count: a flush must keep 3");
     }
 
     pub fn insert_if_absent_inserts_then_reports_present<S: ClaimStore>(mut s: S) {

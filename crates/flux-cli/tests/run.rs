@@ -53,9 +53,27 @@ impl Stalled {
 
     /// `start`, with extra environment variables for the run.
     fn start_env(src: &Path, dst: &Path, at: u32, marks: &Path, env: &[(&str, &str)]) -> Self {
+        Self::start_with(src, dst, at, marks, env, &[])
+    }
+
+    /// `start`, with extra arguments before the paths (`--resume`). Each stalled run of one test needs its own
+    /// `marks` directory: the announcement file is named by `at` alone.
+    fn start_args(src: &Path, dst: &Path, at: u32, marks: &Path, args: &[&str]) -> Self {
+        Self::start_with(src, dst, at, marks, &[], args)
+    }
+
+    fn start_with(
+        src: &Path,
+        dst: &Path,
+        at: u32,
+        marks: &Path,
+        env: &[(&str, &str)],
+        args: &[&str],
+    ) -> Self {
         let announced = marks.join(format!("stalled-{at}"));
         let child = flux()
             .arg("copy")
+            .args(args)
             .arg(src)
             .arg(dst)
             .env("FLUX_TEST_STALL_AT", at.to_string())
@@ -119,6 +137,7 @@ fn a_killed_run_leaves_a_resumable_operation_that_restart_supersedes() {
     assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
     let e = stderr(&out);
     assert!(e.contains("RESUMABLE_OPERATION_EXISTS") && e.contains("--restart"), "{e}");
+    assert!(e.contains("--resume to continue it"), "{e}");
     let out = copy(&[os("--restart"), src.as_os_str(), dst.as_os_str()]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert_eq!(names(&dst), ["a", "sub"], "the killed run's temporary and state are gone");
@@ -201,7 +220,7 @@ fn a_killed_single_file_run_leaves_a_resumable_record_that_restart_supersedes() 
     let left = names(d.path());
     assert!(left.iter().any(|n| n.starts_with("t.flux-partial.")), "{left:?}");
     assert!(left.iter().any(|n| n.starts_with("t.flux-state.")), "{left:?}");
-    // Cut 7b: the record a REAL run left is version 2 and carries real identities (test audit A4).
+    // Cut 7b: the record a REAL run left is the current format and carries real identities (test audit A4).
     let record = left.iter().find(|n| n.starts_with("t.flux-state.")).unwrap();
     let state = flux_core::state::decode(&std::fs::read(d.path().join(record)).unwrap())
         .expect("the record decodes");
@@ -309,7 +328,7 @@ fn an_empty_lock_is_uncertain_until_restart_break_lock_takes_it_over() {
 #[test]
 fn unreadable_or_newer_state_is_refused_and_preserved() {
     let corrupt: &[u8] = b"garbage";
-    let newer: &[u8] = br#"{"format_version":3}"#;
+    let newer: &[u8] = br#"{"format_version":4}"#;
     for (bytes, code) in [(corrupt, "STATE_CORRUPT"), (newer, "INCOMPATIBLE_STATE")] {
         let d = TempDir::new().unwrap();
         let src = tree_in(d.path());
@@ -407,4 +426,333 @@ fn json_on_a_refusal_has_exactly_the_section_53_fields_and_one_error() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v.as_object().unwrap().len(), 18, "§53's complete field list: {v}");
     assert_eq!(v["errors"].as_u64(), Some(1));
+}
+
+// ---- Cut 9a: kill and resume, end to end -------------------------------------------------------------------------
+
+/// Every file under `dir` (relative path with `/` separators -> bytes), skipping the top-level `.flux`.
+fn files_under(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let e = e.unwrap();
+            let path = e.path();
+            let rel = path.strip_prefix(root).unwrap();
+            if rel == Path::new(".flux") {
+                continue;
+            }
+            if e.file_type().unwrap().is_dir() {
+                walk(root, &path, out);
+            } else {
+                let key: Vec<_> = rel.iter().map(|c| c.to_string_lossy().into_owned()).collect();
+                out.insert(key.join("/"), std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// `dst` holds every file of `src` with equal bytes and no other file outside `.flux`.
+fn same_bytes(src: &Path, dst: &Path) {
+    let (want, got) = (files_under(src), files_under(dst));
+    assert_eq!(want.len(), got.len(), "the same number of files");
+    for (k, v) in &want {
+        assert_eq!(got.get(k), Some(v), "{k} differs or is missing");
+    }
+}
+
+/// Every file under `dir` including `.flux`, for a "nothing changed" comparison.
+fn snapshot(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let path = e.unwrap().path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else {
+                let rel = path.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+                out.insert(rel, std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+const BIG_FILES: usize = 300;
+
+/// 300 files in three directories (`d0`..`d2`, 100 each) under `src`, and the path of a destination that does not
+/// exist: every file is new, so a file is still three guarded mutations (sweep, temporary, publish) and a
+/// directory one, as in `a_killed_run_leaves_the_claims_up_to_the_last_sync`.
+fn big_tree_in(d: &Path) -> (PathBuf, PathBuf) {
+    let src = d.join("src");
+    for dir in 0..3 {
+        let sub = src.join(format!("d{dir}"));
+        std::fs::create_dir_all(&sub).unwrap();
+        for f in 0..BIG_FILES / 3 {
+            std::fs::write(sub.join(format!("f{f:03}")), format!("body {dir} {f}")).unwrap();
+        }
+    }
+    (src, d.join("dst"))
+}
+
+/// The one operation id under `dst/.flux/operations`.
+fn the_operation(dst: &Path) -> String {
+    let ids = names(&dst.join(".flux").join("operations"));
+    assert_eq!(ids.len(), 1, "one kept workspace: {ids:?}");
+    ids.into_iter().next().unwrap()
+}
+
+/// The claims in the killed run's store (the ordinary open repairs a store its owner never closed).
+fn claim_count(dst: &Path, id: &str) -> usize {
+    use redb::{Database, ReadableDatabase, ReadableTableMetadata, TableDefinition};
+    let db_path = dst.join(".flux").join("operations").join(id).join("state.db");
+    let db = Database::open(&db_path).expect("the killed run's store opens");
+    let tx = db.begin_read().unwrap();
+    let claims = tx.open_table(TableDefinition::<&[u8], &[u8]>::new("claims")).unwrap();
+    claims.len().unwrap() as usize
+}
+
+fn manifest_of(dst: &Path, id: &str) -> flux_core::state::OperationState {
+    let path = dst.join(".flux").join("operations").join(id).join("manifest");
+    flux_core::state::decode(&std::fs::read(path).unwrap()).expect("the manifest decodes")
+}
+
+/// Files published at `dst` (not temporaries), counted to prove where a stall landed.
+fn published(dst: &Path) -> usize {
+    files_under(dst).keys().filter(|k| !k.contains(".flux-partial.")).count()
+}
+
+fn json_of(out: &Output) -> serde_json::Value {
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {}", stderr(out)))
+}
+
+#[test]
+fn a_killed_tree_copy_resumes_as_the_same_operation() {
+    let d = TempDir::new().unwrap();
+    let marks = TempDir::new().unwrap();
+    let (src, dst) = big_tree_in(d.path());
+    // 1 + 3 * 100 mutations for d0 and its end, then the second directory: the 500th is inside it.
+    Stalled::start(&src, &dst, 500, marks.path()).kill();
+    let id = the_operation(&dst);
+    // The stall landed in the second directory: the first is whole, the third not begun.
+    let done = published(&dst);
+    assert!((100..200).contains(&done), "the stall landed in d1: {done} files published");
+    assert!(claim_count(&dst, &id) >= 100, "the first directory's claims were synced at its end");
+
+    let out = copy(&[os("--resume"), os("--json"), src.as_os_str(), dst.as_os_str()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let e = stderr(&out);
+    let note = e.find(&format!("resuming operation {id} (")).unwrap_or_else(|| panic!("{e}"));
+    let resumed = e.find("resumed ").unwrap_or_else(|| panic!("{e}"));
+    assert!(e.contains(" already-complete files"), "{e}");
+    let summary = e.find("copied ").unwrap_or_else(|| panic!("{e}"));
+    assert!(note < resumed && resumed < summary, "note, then resumed, then the summary: {e}");
+    let v = json_of(&out);
+    let n: u64 = e[resumed + "resumed ".len()..]
+        .split(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap_or_else(|_| panic!("{e}"));
+    assert_eq!(
+        Some(n),
+        v["files_skipped"].as_u64(),
+        "the resumed count is the skipped count: {e} {v}"
+    );
+    assert_eq!(v["files_total"].as_u64(), Some(300), "{v}");
+    let (copied, skipped) =
+        (v["files_copied"].as_u64().unwrap(), v["files_skipped"].as_u64().unwrap());
+    assert_eq!(copied + skipped, 300, "{v}");
+    assert!(skipped >= 100, "the first directory was not copied again: {v}");
+    assert!(copied <= 200, "{v}");
+    same_bytes(&src, &dst);
+    assert!(!dst.join(".flux").exists(), "the workspace is gone");
+    assert!(!d.path().join("dst.flux-lock").exists(), "and the lock");
+}
+
+#[test]
+fn a_resume_killed_again_resumes_a_third_time() {
+    let d = TempDir::new().unwrap();
+    let (marks1, marks2) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (src, dst) = big_tree_in(d.path());
+    Stalled::start(&src, &dst, 500, marks1.path()).kill();
+    let id = the_operation(&dst);
+    let after_first = published(&dst);
+    // The resume skips d0 and re-copies d1 (its claims were unsynced). Stall 400 (not 200: that lands where the first
+    // stall did, measured 165 published both times): past d1 and into d2, so progress past the first stall is real.
+    Stalled::start_args(&src, &dst, 400, marks2.path(), &["--resume"]).kill();
+    assert_eq!(the_operation(&dst), id, "the same operation, not a new one");
+    assert!(claim_count(&dst, &id) >= 100, "the claims survived both kills");
+    let m = manifest_of(&dst, &id);
+    assert_eq!(m.format_version, 3);
+    assert_eq!(m.state, flux_core::state::OpState::Transferring);
+    assert!(
+        published(&dst) > after_first,
+        "the second run published past the first stall: {} then {after_first}",
+        published(&dst)
+    );
+
+    let out = copy(&[os("--resume"), os("--json"), src.as_os_str(), dst.as_os_str()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v = json_of(&out);
+    assert!(v["files_skipped"].as_u64().unwrap() >= 100, "{v}");
+    assert_eq!(v["files_total"].as_u64(), Some(300), "{v}");
+    assert!(stderr(&out).contains(&format!("resuming operation {id} (")), "{}", stderr(&out));
+    same_bytes(&src, &dst);
+    assert!(!dst.join(".flux").exists());
+    assert!(!d.path().join("dst.flux-lock").exists());
+}
+
+#[test]
+fn resume_against_an_incompatible_option_exits_3_and_changes_nothing() {
+    let d = TempDir::new().unwrap();
+    let marks = TempDir::new().unwrap();
+    let (src, dst) = big_tree_in(d.path());
+    Stalled::start(&src, &dst, 500, marks.path()).kill();
+    let id = the_operation(&dst);
+    let manifest = dst.join(".flux").join("operations").join(&id).join("manifest");
+    let before_manifest = std::fs::read(&manifest).unwrap();
+    let before = snapshot(d.path());
+    let lock = d.path().join("dst.flux-lock");
+    assert!(lock.is_file(), "the killed run's lock");
+
+    let out = copy(&[os("--resume"), os("--skip-existing"), src.as_os_str(), dst.as_os_str()]);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    let e = stderr(&out);
+    assert!(e.contains("INCOMPATIBLE_STATE") && e.contains("existing:"), "{e}");
+    assert_eq!(std::fs::read(&manifest).unwrap(), before_manifest, "the manifest is untouched");
+    let mut after = snapshot(d.path());
+    // The destination lock is the one thing outside the workspace that moves: the spec's step 3 takes it over from
+    // the dead owner before the options are compared, and the refusal then releases it (measured: it is gone).
+    assert!(!lock.exists(), "the refusal released the lock it took over");
+    let mut before = before;
+    before.remove("dst.flux-lock");
+    after.remove("dst.flux-lock");
+    let changed: Vec<_> =
+        before.keys().chain(after.keys()).filter(|k| before.get(*k) != after.get(*k)).collect();
+    assert!(changed.is_empty(), "changed: {changed:?}");
+
+    let out = copy(&[os("--resume"), src.as_os_str(), dst.as_os_str()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    same_bytes(&src, &dst);
+}
+
+#[test]
+fn resume_with_nothing_to_resume_starts_new() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let dst = d.path().join("dst");
+    let out = copy(&[os("--resume"), src.as_os_str(), dst.as_os_str()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let e = stderr(&out);
+    let note = e.find("no prior operation; starting new").unwrap_or_else(|| panic!("{e}"));
+    let summary = e.find("copied ").unwrap_or_else(|| panic!("{e}"));
+    assert!(note < summary, "the note comes before the summary: {e}");
+    same_bytes(&src, &dst);
+}
+
+#[test]
+fn resume_and_restart_together_is_a_usage_error() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let dst = d.path().join("dst");
+    let out = copy(&[os("--resume"), os("--restart"), src.as_os_str(), dst.as_os_str()]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(!dst.exists());
+}
+
+#[test]
+fn a_killed_single_file_copy_resumes_keeping_its_id_and_bumping_its_generation() {
+    let d = TempDir::new().unwrap();
+    let (m1, m2) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let src = tree_in(d.path());
+    let t = d.path().join("t");
+    let record_of = |d: &Path| -> (String, flux_core::state::OperationState) {
+        let recs: Vec<String> =
+            names(d).into_iter().filter(|n| n.starts_with("t.flux-state.")).collect();
+        assert_eq!(recs.len(), 1, "exactly one record: {recs:?}");
+        let state = flux_core::state::decode(&std::fs::read(d.join(&recs[0])).unwrap())
+            .expect("the record decodes");
+        (recs[0].clone(), state)
+    };
+
+    // Killed with the temporary written (sweep 1, temporary 2, publish 3).
+    Stalled::start(&src.join("a"), &t, 3, m1.path()).kill();
+    let left = names(d.path());
+    assert!(
+        left.iter().any(|n| n.starts_with("t.flux-partial.")),
+        "the stall landed after the temporary: {left:?}"
+    );
+    let (_, first) = record_of(d.path());
+    let first_file = first.file.clone().expect("a single-file record");
+    assert_eq!(first_file.artifact_generation, 1);
+
+    // The resume stalls at 2: after its sweep removed the old partial, before the new one is written.
+    Stalled::start_args(&src.join("a"), &t, 2, m2.path(), &["--resume"]).kill();
+    let (name, second) = record_of(d.path());
+    assert_eq!(second.operation_id, first.operation_id, "the same operation");
+    assert!(name.ends_with(&first.operation_id), "{name}");
+    let second_file = second.file.clone().expect("a single-file record");
+    assert_eq!(second_file.artifact_generation, 2);
+    assert_ne!(second_file.attempt_id, first_file.attempt_id);
+    assert_eq!(second.state, flux_core::state::OpState::Transferring);
+    let left = names(d.path());
+    assert!(!left.iter().any(|n| n.starts_with("t.flux-partial.")), "{left:?}");
+
+    let out = copy(&[os("--resume"), src.join("a").as_os_str(), t.as_os_str()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let e = stderr(&out);
+    let note = e
+        .find(&format!("resuming operation {}", first.operation_id))
+        .unwrap_or_else(|| panic!("{e}"));
+    assert!(!e.contains("entries claimed"), "a single file has no count: {e}");
+    let summary = e.find("copied ").unwrap_or_else(|| panic!("{e}"));
+    assert!(note < summary, "the note comes before the summary: {e}");
+    assert_eq!(std::fs::read(&t).unwrap(), b"A");
+    assert_eq!(names(d.path()), ["src", "t"]);
+}
+
+/// Spec "Testing": under the default overwrite policy the claim count equals the file count. Guard calls (measured
+/// by the published-file counts and the stall announcements below): d0's create is #1, its 100 files #2..#301, its
+/// DirEnd flush #302, d1's create #303. Stall 1 at 303: d0 whole and its claims synced, d1 not begun. The resume
+/// (`--durability strict`, allowed from normal and recorded) skips d0's files, so its calls are d0 create + DirEnd
+/// (2) + d1 (1 + 300 + 1) + d2 (302) = 606: stall at 606, d2's DirEnd flush, every file published, every claim durable.
+#[test]
+fn the_claim_count_equals_the_file_count_under_the_default_policy() {
+    let d = TempDir::new().unwrap();
+    let (m1, m2) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (src, dst) = big_tree_in(d.path());
+    Stalled::start(&src, &dst, 303, m1.path()).kill();
+    let id = the_operation(&dst);
+    assert_eq!(published(&dst), 100, "d0 whole, d1 not begun");
+    assert_eq!(claim_count(&dst, &id), 100, "d0's claims were synced at its end");
+
+    Stalled::start_args(&src, &dst, 606, m2.path(), &["--resume", "--durability", "strict"]).kill();
+    assert_eq!(the_operation(&dst), id);
+    assert_eq!(published(&dst), 300, "every file is published at d2's flush");
+    same_bytes(&src, &dst);
+    assert_eq!(claim_count(&dst, &id), 300, "the claim count equals the file count");
+    let m = manifest_of(&dst, &id);
+    assert_eq!(m.format_version, 3);
+    assert_eq!(m.state, flux_core::state::OpState::Transferring);
+    assert_eq!(m.config.expect("format 3 carries a config").options.durability, "strict");
+
+    let out = copy(&[
+        os("--resume"),
+        os("--durability"),
+        os("strict"),
+        os("--json"),
+        src.as_os_str(),
+        dst.as_os_str(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let e = stderr(&out);
+    assert!(e.contains(&format!("resuming operation {id} (300 entries claimed)")), "{e}");
+    let v = json_of(&out);
+    assert_eq!(v["files_skipped"].as_u64(), Some(300), "{v}");
+    assert_eq!(v["files_copied"].as_u64(), Some(0), "{v}");
+    same_bytes(&src, &dst);
+    assert!(!dst.join(".flux").exists());
 }

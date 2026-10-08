@@ -219,7 +219,41 @@ impl DirHandle for StdDir {
             Mode::from_raw_mode(0o666),
         )
         .map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
-        crate::RedbClaimStore::from_file(std::fs::File::from(fd), durability)
+        crate::RedbClaimStore::create_file(std::fs::File::from(fd), durability)
+    }
+
+    fn open_claim_store(
+        &self,
+        name: &OsStr,
+        durability: flux_fs::Durability,
+    ) -> Result<Self::Claims> {
+        use rustix::fs::FileType;
+        use rustix::io::Errno;
+        check_component(name)?;
+        let fd =
+            openat(&self.0, name, OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())
+                .map_err(|e| match e {
+                    // O_NOFOLLOW on a symlink in the final component: the link itself is refused, never followed.
+                    Errno::LOOP => FsError::new(Code::SafetyRejected, std::io::Error::from(e)),
+                    Errno::ISDIR => FsError::new(
+                        Code::DestinationError,
+                        std::io::Error::new(
+                            std::io::ErrorKind::IsADirectory,
+                            "a directory is not a claim store",
+                        ),
+                    ),
+                    _ => FsError::from_io(std::io::Error::from(e)),
+                })?;
+        let st = rustix::fs::fstat(&fd).map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
+        if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::other(
+                    "a claim store path holds something other than a regular file",
+                ),
+            ));
+        }
+        crate::RedbClaimStore::open_file(std::fs::File::from(fd), durability)
     }
 
     fn lock_capability(&self) -> Result<flux_fs::LockCapability> {

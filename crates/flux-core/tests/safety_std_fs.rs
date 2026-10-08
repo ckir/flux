@@ -130,6 +130,7 @@ fn run_cfg() -> RunConfig {
         boot_session_id: "test".to_string(),
         before_mutation: None,
         heartbeat_interval: std::time::Duration::from_secs(3600),
+        resume: false,
     }
 }
 

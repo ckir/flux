@@ -46,6 +46,10 @@ pub enum Code {
     /// §259.3 (cut 7a). A source entry whose destination is a reserved Flux control path - `DEST/.flux/operations`,
     /// `standalone` or `atomic`, or below one. Path-scoped: that entry fails, and the rest of the copy continues.
     ControlPlaneNamespaceConflict,
+    /// Cut 9a. A state file that is zero-length or cannot be decoded.
+    StateCorrupt,
+    /// Cut 9a. A state file written in another format than this build reads.
+    IncompatibleState,
 }
 
 impl Code {
@@ -67,6 +71,8 @@ impl Code {
             Code::IoError => "IO_ERROR",
             Code::TargetLockBusy => "TARGET_LOCK_BUSY",
             Code::ControlPlaneNamespaceConflict => "CONTROL_PLANE_NAMESPACE_CONFLICT",
+            Code::StateCorrupt => "STATE_CORRUPT",
+            Code::IncompatibleState => "INCOMPATIBLE_STATE",
         }
     }
 }
@@ -134,6 +140,8 @@ mod tests {
         assert_eq!(Code::DestinationError.as_str(), "DESTINATION_ERROR");
         assert_eq!(Code::SymlinkCreationUnavailable.as_str(), "SYMLINK_CREATION_UNAVAILABLE");
         assert_eq!(Code::TargetLockBusy.as_str(), "TARGET_LOCK_BUSY");
+        assert_eq!(Code::StateCorrupt.as_str(), "STATE_CORRUPT");
+        assert_eq!(Code::IncompatibleState.as_str(), "INCOMPATIBLE_STATE");
         assert_eq!(
             Code::ControlPlaneNamespaceConflict.as_str(),
             "CONTROL_PLANE_NAMESPACE_CONFLICT"

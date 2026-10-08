@@ -3,7 +3,7 @@
 //! returns text, and `main` writes it.
 
 use flux_core::copy::CopyError;
-use flux_core::run::{Run, RunError, RunWarning};
+use flux_core::run::{ResumeNote, Run, RunError, RunWarning};
 use flux_core::{TreeAbort, TreeFailure, TreeFailureCause, TreeOutcome, WeakIdentityWarnings};
 use flux_fs::{Code, FileIdentity, MetadataFailure, MetadataItem, Outcome};
 use serde::Serialize;
@@ -69,9 +69,9 @@ impl Report {
         let mut r = Self::zero();
         r.files_total = out.files_total;
         r.files_copied = out.files_copied;
-        r.files_skipped = out.special_files_skipped + out.files_skipped;
+        r.files_skipped = out.special_files_skipped + out.files_skipped + out.files_resumed;
         r.files_overwritten = out.files_overwritten;
-        r.bytes_skipped = out.bytes_skipped;
+        r.bytes_skipped = out.bytes_skipped + out.bytes_resumed;
         r.files_degraded = out.files_degraded;
         // Only `copy` and `symlink` are failed FILES. A `ClaimNotRecorded` failure is counted in
         // `FailureTally::total()` (so in `errors`) and in `claim_not_recorded`, but not here: the file was published
@@ -354,6 +354,10 @@ pub fn run_warning_line(w: &RunWarning) -> String {
             path.display(),
             error.source
         ),
+        RunWarning::ResumeMappingByPath(p) => format!(
+            "warning: the source root's identity could not confirm the mapping, so {} was matched by its path alone",
+            p.display()
+        ),
     }
 }
 
@@ -361,6 +365,25 @@ pub fn run_warning_line(w: &RunWarning) -> String {
 pub fn run_lines<T>(run: &Run<T>) -> Vec<String> {
     let mut v = run.stop.as_ref().map(stop_lines).unwrap_or_default();
     v.extend(run.warnings.iter().map(run_warning_line));
+    v
+}
+
+/// Cut 9a: the run's resume note, then `resumed <n> already-complete files` when `files_resumed > 0`.
+pub fn resume_lines<T>(run: &Run<T>, files_resumed: u64) -> Vec<String> {
+    let mut v = Vec::new();
+    match &run.resumed {
+        None => {}
+        Some(ResumeNote::StartedNew) => v.push("no prior operation; starting new".to_string()),
+        Some(ResumeNote::Adopted { operation_id, claims: Some(n) }) => {
+            v.push(format!("resuming operation {operation_id} ({n} entries claimed)"));
+        }
+        Some(ResumeNote::Adopted { operation_id, claims: None }) => {
+            v.push(format!("resuming operation {operation_id}"));
+        }
+    }
+    if files_resumed > 0 {
+        v.push(format!("resumed {files_resumed} already-complete files"));
+    }
     v
 }
 
@@ -750,6 +773,7 @@ mod tests {
             RunWarning::PartialKept { path: p(), error: io(), kept: PathBuf::from("X/kept") },
             RunWarning::OwnershipLostAfterCompletion(p()),
             RunWarning::ProbeNotRemoved { path: p(), error: io() },
+            RunWarning::ResumeMappingByPath(p()),
         ];
         for w in &all {
             let line = run_warning_line(w);
@@ -757,6 +781,18 @@ mod tests {
             assert!(!line.contains('\n'), "{line}");
         }
         assert!(run_warning_line(&all[3]).contains("X/kept"));
+    }
+
+    #[test]
+    fn a_resume_mapping_by_path_warning_is_this_exact_line() {
+        let path = PathBuf::from("X/the-path");
+        assert_eq!(
+            run_warning_line(&RunWarning::ResumeMappingByPath(path.clone())),
+            format!(
+                "warning: the source root's identity could not confirm the mapping, so {} was matched by its path alone",
+                path.display()
+            )
+        );
     }
 
     // Part 3b-2 test audit (round 1): each test below was red under the mutant named in its comment.
@@ -778,9 +814,54 @@ mod tests {
     }
 
     #[test]
+    fn resume_lines_name_the_operation_and_the_counts() {
+        use flux_core::run::ResumeNote;
+        let with = |resumed| Run::<()> { copy: None, stop: None, warnings: Vec::new(), resumed };
+        assert_eq!(
+            resume_lines(&with(Some(ResumeNote::StartedNew)), 0),
+            vec!["no prior operation; starting new".to_string()]
+        );
+        let adopted = |claims| Some(ResumeNote::Adopted { operation_id: "op1".into(), claims });
+        assert_eq!(
+            resume_lines(&with(adopted(Some(3))), 0),
+            vec!["resuming operation op1 (3 entries claimed)".to_string()]
+        );
+        assert_eq!(
+            resume_lines(&with(adopted(None)), 0),
+            vec!["resuming operation op1".to_string()]
+        );
+        assert_eq!(
+            resume_lines(&with(adopted(Some(3))), 7),
+            vec![
+                "resuming operation op1 (3 entries claimed)".to_string(),
+                "resumed 7 already-complete files".to_string()
+            ]
+        );
+        assert!(resume_lines(&with(None), 0).is_empty());
+    }
+
+    #[test]
+    fn a_tree_report_folds_resumed_files_into_skipped() {
+        let out = TreeOutcome {
+            files_skipped: 3,
+            files_resumed: 4,
+            special_files_skipped: 1,
+            bytes_skipped: 10,
+            bytes_resumed: 5,
+            ..TreeOutcome::default()
+        };
+        let r = Report::tree(&out, false, 1);
+        assert_eq!((r.files_skipped, r.bytes_skipped), (8, 15));
+    }
+
+    #[test]
     fn a_runs_lines_are_its_stop_then_every_warning() {
-        let run: Run<()> =
-            Run { copy: None, stop: Some(refused()), warnings: vec![kept(), kept()] };
+        let run: Run<()> = Run {
+            copy: None,
+            stop: Some(refused()),
+            warnings: vec![kept(), kept()],
+            resumed: None,
+        };
         let lines = run_lines(&run);
         assert_eq!(lines.len(), 3, "{lines:?}");
         assert!(lines[0].starts_with("STATE_CORRUPT: "), "{lines:?}");
@@ -788,13 +869,13 @@ mod tests {
             lines[1..].iter().all(|l| l.starts_with("warning: ") && l.contains("kept-state")),
             "{lines:?}"
         );
-        let quiet: Run<()> = Run { copy: None, stop: None, warnings: vec![kept()] };
+        let quiet: Run<()> = Run { copy: None, stop: None, warnings: vec![kept()], resumed: None };
         assert_eq!(run_lines(&quiet).len(), 1, "warnings print without a stop too");
     }
 
     #[test]
     fn a_tree_runs_report_counts_a_stop_as_one_more_error() {
-        let run = |copy, stop| Run { copy, stop, warnings: Vec::new() };
+        let run = |copy, stop| Run { copy, stop, warnings: Vec::new(), resumed: None };
         let clean = Report::tree_run(&run(Some(Ok(TreeOutcome::default())), None), 1);
         assert_eq!(clean.errors, 0);
         let stopped = Report::tree_run(&run(Some(Ok(TreeOutcome::default())), Some(refused())), 1);
@@ -820,7 +901,7 @@ mod tests {
 
     #[test]
     fn a_file_runs_report_counts_a_stop_as_one_more_error() {
-        let run = |copy, stop| Run { copy, stop, warnings: Vec::new() };
+        let run = |copy, stop| Run { copy, stop, warnings: Vec::new(), resumed: None };
         let copied = || {
             Ok(Outcome {
                 bytes_copied: 1,
