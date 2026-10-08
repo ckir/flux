@@ -308,6 +308,21 @@ From the final review of cut 8a; none is a reachable defect without a race or pr
 - [ ] **An early stop drops the containment warnings.** When the run stops before the copy (for example a probe
       refusal), `run.copy` is `None`, so `containment_degraded` and the identity warnings set in `locate_tree` are
       never printed (the tree job in `main.rs`).
+- [ ] **`give_back` drops a failed lock discard for any `RunError::Failed`.** The disposal result is reported only for
+      `RunError::Refused` (`crates/flux-core/src/run/session.rs`, `give_back`), so a `place.create` failure (the probe-error
+      arm included) plus a lock that cannot be removed leaves the lock file unreported. Identical gating existed before cut 8a;
+      found by the cut 8a capstone, round 1.
+- [ ] **Two cut 8a test gaps (minor, left out of the owner's A-D scope).** The strict containment refusal test
+      (`an_unsupported_canonical_path_query_warns_under_default_and_refuses_under_strict`) asserts only the code, not the
+      strict message, so a mutant swapping in the inside-source message survives; the degraded `anchor_shown` is asserted
+      only for an absent DEST, not an existing DEST or a filesystem-root DEST. No test marks a pre-existing directory
+      `MountRoot::No` explicitly (the fake's default does it implicitly); the Linux `Unknown` outcome of `mount_root`
+      and the macOS device comparison run only on CI.
+- [ ] **The dev box lacks the macOS and Windows cross targets** (`aarch64-apple-darwin`, `x86_64-pc-windows-msvc`), so
+      `just check-mac` cannot run locally and a macOS compile error cost a CI round trip (cut 8b spike). Declaring the
+      targets in `.claude/recommended-tools.json` is not expressible yet: its checks are `in_path` / `file_exists` only,
+      and a rustup target is a directory under a toolchain-specific path. Either extend the schema or document
+      `rustup target add` in the contributor notes.
 
 ## Cut 8b known limits
 
