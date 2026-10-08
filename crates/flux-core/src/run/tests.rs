@@ -3308,6 +3308,7 @@ fn an_own_created_claim_with_matching_size_and_mtime_is_skipped_as_resumed() {
     assert!(got.is_empty(), "{got:?}");
     assert_eq!((out.files_resumed, out.bytes_resumed), (1, 1));
     assert_eq!((out.files_copied, out.files_overwritten), (1, 0));
+    assert_eq!((out.files_skipped, out.bytes_skipped), (0, 0));
     // Only the run's own calls: the setup inserted the claim.
     let all = calls(&fs);
     let c = &all[at(&all, "open_claim_store(")..];
@@ -3530,4 +3531,89 @@ fn the_lockless_copy_tree_never_resumes() {
     .unwrap();
     assert_eq!(out.files_resumed, 0);
     assert!(!calls(&fs).iter().any(|x| x.starts_with("claim_get")));
+}
+
+#[test]
+fn two_and_a_half_seconds_is_recopied_while_exactly_two_resumes() {
+    // (destination mtime in ms, resumed); the source is at 100 000 ms.
+    for (dest_ms, resumed) in [(102_000, true), (102_500, false), (97_500, false), (98_000, true)] {
+        let fs = resumable(100, b"o", 0, ClaimStatus::Created);
+        fs.set_modified(
+            "/src/a",
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(100_000),
+        );
+        fs.set_modified(
+            "/p/dest/a",
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(dest_ms),
+        );
+        let (r, got) = run_tree_with(&fs, &resume(), &opts());
+        let out = ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(out.files_resumed, u64::from(resumed), "dest {dest_ms} ms");
+    }
+}
+
+#[test]
+fn a_strict_times_resume_still_skips_a_matching_file() {
+    let o = CopyOptions { preserve_times: Preserve::Strict, ..opts() };
+    let fs = resumable_with(&o, 100, b"o", 101, ClaimStatus::Created);
+    let (r, got) = run_tree_with(&fs, &resume(), &o);
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!((out.files_resumed, out.files_overwritten), (1, 0));
+}
+
+#[test]
+fn a_non_regular_destination_that_matches_in_size_and_time_is_never_skipped() {
+    // A 0-byte source `a` at 100 s; the destination entry has length 0 and the same time.
+    for kind in ["dir", "link"] {
+        let fs = FaultFs::new();
+        for d in ["/src", "/p"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        put(&fs, "/src/a", b"", 100);
+        prior3(&fs, 5, OpState::Transferring);
+        if kind == "dir" {
+            fs.create_dir(Path::new("/p/dest/a")).unwrap();
+        } else {
+            fs.add_symlink("/p/dest/a");
+        }
+        fs.set_modified(
+            "/p/dest/a",
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100),
+        );
+        claimed(&fs, 5, "a", ClaimStatus::Created, "a");
+        let (r, got) = run_tree_with(&fs, &resume(), &opts());
+        let out = ok(&r);
+        assert_eq!(out.files_resumed, 0, "{kind}");
+        if kind == "dir" {
+            assert_eq!(got.len(), 1, "{got:?}");
+            assert_eq!(code_of(&got[0]), Code::DestinationError);
+        } else {
+            assert!(got.is_empty(), "{got:?}");
+            assert_eq!(out.files_overwritten, 1, "the link is replaced, not skipped");
+        }
+    }
+}
+
+#[test]
+fn a_resumed_skip_under_a_different_stored_spelling_registers_the_owner() {
+    let fs = FaultFs::new();
+    for d in ["/src", "/p"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    put(&fs, "/src/B", b"1", 100);
+    put(&fs, "/src/b", b"2", 100);
+    prior3(&fs, 5, OpState::Transferring);
+    // Planned `B`, stored `b`: the claim is under the stored spelling.
+    put(&fs, "/p/dest/b", b"1", 100);
+    claimed(&fs, 5, "b", ClaimStatus::Created, "B");
+    fs.set_case_insensitive(true);
+    let (r, got) = run_tree_with(&fs, &resume(), &opts());
+    let out = ok(&r);
+    assert_eq!(out.files_resumed, 1);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].path, PathBuf::from("b"));
+    assert_eq!(code_of(&got[0]), Code::DestinationNamespaceCollision);
+    assert!(why(&got[0]).contains("already wrote that destination entry"), "{}", why(&got[0]));
 }

@@ -847,6 +847,12 @@ impl FaultFs {
         mint_identity(&mut g, path);
     }
 
+    /// Give any existing entry (a directory or a link too) a modified time, directly.
+    pub fn set_modified(&self, path: impl AsRef<Path>, modified: SystemTime) {
+        let path = path.as_ref();
+        self.inner.lock().unwrap().times.insert(path.to_path_buf(), Some(modified));
+    }
+
     /// Give a file permissions, so a copy has something to carry across.
     pub fn set_file_perms(&self, path: impl AsRef<Path>, perms: Perms) {
         let path = path.as_ref();
