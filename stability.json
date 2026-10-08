@@ -43,64 +43,64 @@
    "stable": false
   },
   "macos/large/cp": {
-   "calibrated": "2026-10-08T03:13:50Z",
-   "cv": 0.2435,
+   "calibrated": "2026-10-08T04:59:49Z",
+   "cv": 0.3023,
    "image": "20260907.0351.1",
    "source": "calibration",
    "stable": false
   },
   "macos/large/rsync": {
-   "calibrated": "2026-10-08T03:13:50Z",
-   "cv": 0.2366,
+   "calibrated": "2026-10-08T04:59:49Z",
+   "cv": 0.2372,
    "image": "20260907.0351.1",
    "source": "calibration",
    "stable": false
   },
   "macos/mixed/cp": {
-   "calibrated": "2026-10-08T03:13:50Z",
-   "cv": 0.1488,
+   "calibrated": "2026-10-08T04:59:49Z",
+   "cv": 0.1674,
    "image": "20260907.0351.1",
    "source": "calibration",
    "stable": false
   },
   "macos/mixed/rsync": {
-   "calibrated": "2026-10-08T03:13:50Z",
-   "cv": 0.1818,
+   "calibrated": "2026-10-08T04:59:49Z",
+   "cv": 0.2117,
    "image": "20260907.0351.1",
    "source": "calibration",
    "stable": false
   },
   "macos/small/cp": {
-   "calibrated": "2026-10-08T03:13:50Z",
-   "cv": 0.0927,
+   "calibrated": "2026-10-08T04:59:49Z",
+   "cv": 0.1272,
    "image": "20260907.0351.1",
    "source": "calibration",
    "stable": false
   },
   "macos/small/rsync": {
-   "calibrated": "2026-10-08T03:13:50Z",
-   "cv": 0.1381,
+   "calibrated": "2026-10-08T04:59:49Z",
+   "cv": 0.1071,
    "image": "20260907.0351.1",
    "source": "calibration",
    "stable": false
   },
   "windows/large/robocopy": {
-   "calibrated": "2026-10-08T03:13:50Z",
-   "cv": 0.0419,
+   "calibrated": "2026-10-08T04:59:49Z",
+   "cv": 0.0222,
    "image": "20260925.250.1",
    "source": "calibration",
-   "stable": false
+   "stable": true
   },
   "windows/mixed/robocopy": {
-   "calibrated": "2026-10-08T03:13:50Z",
-   "cv": 0.044,
+   "calibrated": "2026-10-08T04:59:49Z",
+   "cv": 0.0491,
    "image": "20260925.250.1",
    "source": "calibration",
    "stable": false
   },
   "windows/small/robocopy": {
-   "calibrated": "2026-10-08T03:13:50Z",
-   "cv": 0.0228,
+   "calibrated": "2026-10-08T04:59:49Z",
+   "cv": 0.0291,
    "image": "20260925.250.1",
    "source": "calibration",
    "stable": true
