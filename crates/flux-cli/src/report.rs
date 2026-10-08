@@ -354,6 +354,10 @@ pub fn run_warning_line(w: &RunWarning) -> String {
             path.display(),
             error.source
         ),
+        RunWarning::ResumeMappingByPath(p) => format!(
+            "warning: the source root's identity could not confirm the mapping, so {} was matched by its path alone",
+            p.display()
+        ),
     }
 }
 
@@ -750,6 +754,7 @@ mod tests {
             RunWarning::PartialKept { path: p(), error: io(), kept: PathBuf::from("X/kept") },
             RunWarning::OwnershipLostAfterCompletion(p()),
             RunWarning::ProbeNotRemoved { path: p(), error: io() },
+            RunWarning::ResumeMappingByPath(p()),
         ];
         for w in &all {
             let line = run_warning_line(w);

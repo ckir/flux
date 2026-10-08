@@ -190,7 +190,7 @@ fn usable(decoded: Result<OperationState, Unusable>, shown: &Path) -> LockResult
     }
 }
 
-fn corrupt(shown: &Path, why: &str) -> LockError {
+pub(crate) fn corrupt(shown: &Path, why: &str) -> LockError {
     refuse(
         LockCode::StateCorrupt,
         None,

@@ -10,6 +10,7 @@
 
 mod place;
 mod restart;
+mod resume;
 mod session;
 #[cfg(test)]
 mod tests;
@@ -148,6 +149,9 @@ pub enum RunWarning {
     OwnershipLostAfterCompletion(PathBuf),
     /// A file of the no-replace probe could not be removed (Part P); it goes with the operation's state.
     ProbeNotRemoved { path: PathBuf, error: FsError },
+    /// Cut 9a: the source root's identity could not decide the mapping check (a side is not Strong), so the
+    /// stored path decided, byte for byte. `path` is the source root this run names.
+    ResumeMappingByPath(PathBuf),
 }
 
 /// A directory copy under the destination's lock ("The run").
