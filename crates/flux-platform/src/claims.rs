@@ -33,7 +33,11 @@ impl RedbClaimStore {
     /// `file` must be empty (a fresh `state.db`) or a valid database. Writes the `meta`
     /// entry `format` = 1 durably.
     pub fn from_file(file: File, durability: Durability) -> Result<Self> {
-        let db = Builder::new().set_cache_size(CACHE_BYTES).create_file(file).map_err(io_err)?;
+        Self::with_cache_size(file, durability, CACHE_BYTES)
+    }
+
+    fn with_cache_size(file: File, durability: Durability, cache_bytes: usize) -> Result<Self> {
+        let db = Builder::new().set_cache_size(cache_bytes).create_file(file).map_err(io_err)?;
         let mut tx = db.begin_write().map_err(io_err)?;
         tx.set_durability(redb::Durability::Immediate).map_err(io_err)?;
         {
@@ -128,5 +132,44 @@ impl ClaimStore for RedbClaimStore {
             self.unsynced = 0;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flux_fs::{ClaimStatus, ObjectId};
+    use std::ffi::OsStr;
+
+    #[test]
+    fn the_cache_bound_is_16_mib() {
+        assert_eq!(CACHE_BYTES, 16 * 1024 * 1024);
+    }
+
+    /// Needs redb's `cache_metrics` (a dev-dependency feature); without it `cache_stats()` is all zeros.
+    #[test]
+    fn the_cache_size_setting_reaches_redb() {
+        const BOUND: usize = 1 << 20;
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(dir.path().join("state.db"))
+            .unwrap();
+        let mut store = RedbClaimStore::with_cache_size(file, Durability::Normal, BOUND).unwrap();
+        let parent = ObjectId { volume: 1, index: 1 };
+        // About 4x the bound in pages: 1000 claims of ~4000 bytes.
+        for i in 0u32..1000 {
+            let key = ClaimKey::new(parent, OsStr::new(&format!("claim-{i}")));
+            let mut target = format!("t{i}-").into_bytes();
+            target.resize(4000, b'x');
+            let rec = ClaimRecord { target: FluxPathKey(target), status: ClaimStatus::Existing };
+            store.insert_if_absent(&key, &rec).unwrap();
+        }
+        let stats = store.db.cache_stats();
+        eprintln!("MEASURED evictions={} used_bytes={}", stats.evictions(), stats.used_bytes());
+        assert!(stats.evictions() > 0, "{stats:?}");
+        assert!(stats.used_bytes() <= BOUND + BOUND / 8, "{stats:?}");
     }
 }
