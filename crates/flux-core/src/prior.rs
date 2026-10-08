@@ -342,7 +342,7 @@ mod tests {
     fn an_unreadable_newer_or_mismatched_manifest_is_refused() {
         for (bytes, code) in [
             (b"garbage".to_vec(), LockCode::StateCorrupt),
-            (br#"{"format_version":3}"#.to_vec(), LockCode::IncompatibleState),
+            (br#"{"format_version":4}"#.to_vec(), LockCode::IncompatibleState),
             (state(3, Kind::Tree, OpState::Created).encode(), LockCode::StateCorrupt),
             (state(4, Kind::File, OpState::Created).encode(), LockCode::StateCorrupt),
         ] {
@@ -352,7 +352,7 @@ mod tests {
             let r = refusal(scan(&d, 0));
             assert_eq!(r.code, code, "{}", r.detail);
             if code == LockCode::IncompatibleState {
-                assert!(r.detail.contains("format_version 3"), "{}", r.detail);
+                assert!(r.detail.contains("format_version 4"), "{}", r.detail);
             }
         }
     }
@@ -416,7 +416,7 @@ mod tests {
         let t = OsStr::new("t");
         for (bytes, code) in [
             (state(3, Kind::File, OpState::Created).encode(), LockCode::StateCorrupt),
-            (br#"{"format_version":3}"#.to_vec(), LockCode::IncompatibleState),
+            (br#"{"format_version":4}"#.to_vec(), LockCode::IncompatibleState),
         ] {
             let (fs, d) = dest();
             fs.write_file(rec(t, 4), &bytes);

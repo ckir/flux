@@ -12,8 +12,11 @@ use std::ffi::{OsStr, OsString};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
-/// The version this binary writes (cut 7b). It reads `V1` too and never upgrades a record it rewrites (decision 5).
-pub const FORMAT_VERSION: u64 = 2;
+/// The version this binary writes (cut 9a). It reads `V1` and `V2` too and never upgrades a record it rewrites
+/// (decision 5).
+pub const FORMAT_VERSION: u64 = 3;
+/// Cut 7b's version: read, and rewritten as itself.
+pub const V2: u64 = 2;
 /// Cut 7a's version: read, classified as 7a classifies it, and rewritten as itself.
 pub const V1: u64 = 1;
 /// The longest state record read. A version-1 record is well under 1 KiB; anything longer is not one.
@@ -46,6 +49,117 @@ const FILE_KEYS: [&str; 10] = [
     "creation_wall_time",
     "last_heartbeat_wall_time",
 ];
+/// Version 3's keys for both kinds (cut 9a, "Manifest format 3").
+const CONFIG_KEYS: [&str; 3] = ["roots", "options", "configuration_fingerprint"];
+/// The first line of the canonical configuration bytes the fingerprint hashes.
+pub const FINGERPRINT_HEADER: &str = "flux-config-v1\n";
+
+/// One source root of a version-3 record (exactly one today).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Root {
+    /// `native_hex` of the absolute source root.
+    pub source_root: String,
+    /// `identity_text` of the source root.
+    pub source_identity: String,
+    /// `""` for a tree; `native_hex` of the target's name for a single file.
+    pub destination_prefix: String,
+}
+
+/// The run's options as the manifest spells them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Options {
+    pub preserve_times: String,
+    pub preserve_permissions: String,
+    pub durability: String,
+    pub safety: String,
+    pub existing: String,
+}
+
+impl Options {
+    /// The run's options as the manifest spells them.
+    pub fn of(opts: &flux_fs::CopyOptions) -> Self {
+        use flux_fs::{Durability, ExistingPolicy, Preserve, Safety};
+        let preserve = |p: Preserve| match p {
+            Preserve::Off => "off",
+            Preserve::Default => "default",
+            Preserve::Strict => "strict",
+        };
+        Self {
+            preserve_times: preserve(opts.preserve_times).to_string(),
+            preserve_permissions: preserve(opts.preserve_permissions).to_string(),
+            durability: match opts.durability {
+                Durability::Normal => "normal",
+                Durability::Strict => "strict",
+            }
+            .to_string(),
+            safety: match opts.safety {
+                Safety::Default => "default",
+                Safety::Strict => "strict",
+            }
+            .to_string(),
+            existing: match opts.existing {
+                ExistingPolicy::Overwrite => "overwrite",
+                ExistingPolicy::Update => "update",
+                ExistingPolicy::SkipExisting => "skip-existing",
+            }
+            .to_string(),
+        }
+    }
+
+    /// `FINGERPRINT_HEADER`, then the four covered options, one `name=value` line each. `durability` is not covered
+    /// (it is compared by rule at resume).
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        format!(
+            "{FINGERPRINT_HEADER}preserve_times={}\npreserve_permissions={}\nsafety={}\nexisting={}\n",
+            self.preserve_times, self.preserve_permissions, self.safety, self.existing
+        )
+        .into_bytes()
+    }
+
+    /// Lowercase hex of `blake3(canonical_bytes())`.
+    pub fn fingerprint(&self) -> String {
+        blake3::hash(&self.canonical_bytes()).to_hex().to_string()
+    }
+}
+
+/// Version 3's configuration: the roots, the options and the fingerprint of the options.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    pub roots: Vec<Root>,
+    pub options: Options,
+    pub configuration_fingerprint: String,
+}
+
+impl Config {
+    /// The configuration with its fingerprint computed from `options`.
+    pub fn new(roots: Vec<Root>, options: Options) -> Self {
+        let configuration_fingerprint = options.fingerprint();
+        Self { roots, options, configuration_fingerprint }
+    }
+}
+
+/// `std::path::absolute(path)` with `.` components dropped and each `..` popping the previous normal component (a
+/// `..` at the root is dropped). Links are not resolved.
+pub fn absolute_lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut out = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -160,6 +274,9 @@ pub struct OperationState {
     /// Version 2, a single file (cut 7b, §249.1): `Some` exactly for a version-2 `Kind::File` record.
     #[serde(skip)]
     pub file: Option<FileFields>,
+    /// Version 3 (cut 9a): `Some` exactly when `format_version` is 3.
+    #[serde(skip)]
+    pub config: Option<Config>,
 }
 
 /// Why a state record cannot be used.
@@ -191,12 +308,13 @@ impl OperationState {
             takeover: None,
             cleanup: None,
             file: None,
+            config: None,
         }
     }
 
-    /// A new operation's state, version 2, `CREATED`, as a run writes it. `file` is the single-file record's §249.1
-    /// fields: `Some` exactly for `Kind::File`.
-    pub fn created(
+    /// A new operation's state, version 2, `CREATED`, as a 7b binary wrote it (tests stage it). `file` is the
+    /// single-file record's §249.1 fields: `Some` exactly for `Kind::File`.
+    pub fn created_v2(
         operation_id: &str,
         kind: Kind,
         destination_root: &Path,
@@ -209,13 +327,29 @@ impl OperationState {
             "a single file's record, and only it, carries §249.1's fields"
         );
         Self {
-            format_version: FORMAT_VERSION,
+            format_version: V2,
             cleanup: Some(Cleanup {
                 cleanup_pending: false,
                 cleanup_pending_artifacts: Vec::new(),
             }),
             file,
             ..Self::created_v1(operation_id, kind, destination_root, created_at)
+        }
+    }
+
+    /// A new operation's state as THIS binary writes it: version 3, `CREATED`.
+    pub fn created(
+        operation_id: &str,
+        kind: Kind,
+        destination_root: &Path,
+        created_at: u64,
+        file: Option<FileFields>,
+        config: Config,
+    ) -> Self {
+        Self {
+            format_version: FORMAT_VERSION,
+            config: Some(config),
+            ..Self::created_v2(operation_id, kind, destination_root, created_at, file)
         }
     }
 
@@ -232,6 +366,9 @@ impl OperationState {
         }
         if let Some(f) = &self.file {
             map.extend(object(f));
+        }
+        if let Some(c) = &self.config {
+            map.extend(object(c));
         }
         serde_json::to_vec(&map).expect("an operation state always serializes")
     }
@@ -255,10 +392,11 @@ pub fn decode(bytes: &[u8]) -> Result<OperationState, Unusable> {
         })?,
         None => return Err(Unusable::Corrupt("no format_version".to_string())),
     };
-    if version != V1 && version != FORMAT_VERSION {
+    if version != V1 && version != V2 && version != FORMAT_VERSION {
         return Err(Unusable::Incompatible(version));
     }
-    let v2 = version == FORMAT_VERSION;
+    let v2 = version >= V2;
+    let v3 = version == FORMAT_VERSION;
     let file = v2 && map.get("kind").and_then(Value::as_str) == Some("file");
     let mut expected: Vec<&str> = KEYS.to_vec();
     if v2 {
@@ -266,6 +404,9 @@ pub fn decode(bytes: &[u8]) -> Result<OperationState, Unusable> {
     }
     if file {
         expected.extend(FILE_KEYS);
+    }
+    if v3 {
+        expected.extend(CONFIG_KEYS);
     }
     if let Some(key) = map.keys().find(|k| !expected.contains(&k.as_str())) {
         return Err(Unusable::Corrupt(format!("unknown key {key}")));
@@ -289,10 +430,16 @@ pub fn decode(bytes: &[u8]) -> Result<OperationState, Unusable> {
     } else {
         None
     };
+    let config = if v3 {
+        Some(serde_json::from_value::<Config>(take(&CONFIG_KEYS)).map_err(malformed)?)
+    } else {
+        None
+    };
     let mut state: OperationState =
         serde_json::from_value(Value::Object(map)).map_err(malformed)?;
     state.cleanup = cleanup;
     state.file = fields;
+    state.config = config;
     validate(&state).map_err(Unusable::Corrupt)?;
     Ok(state)
 }
@@ -332,9 +479,49 @@ fn validate(s: &OperationState) -> Result<(), String> {
             return Err("the takeover's creation_wall_time is not a time".to_string());
         }
     }
-    let v2 = s.format_version == FORMAT_VERSION;
-    if v2 != s.cleanup.is_some() || (v2 && s.kind == Kind::File) != s.file.is_some() {
+    let v2 = s.format_version >= V2;
+    if (s.format_version == FORMAT_VERSION) != s.config.is_some()
+        || v2 != s.cleanup.is_some()
+        || (v2 && s.kind == Kind::File) != s.file.is_some()
+    {
         return Err("the record's fields do not match its version and kind".to_string());
+    }
+    if let Some(c) = &s.config {
+        if c.roots.len() != 1 {
+            return Err(format!("roots has {} entries, not 1", c.roots.len()));
+        }
+        for r in &c.roots {
+            if from_native_hex(&r.source_root).is_none() {
+                return Err(format!("source_root is not native-unit hex: {}", r.source_root));
+            }
+            if parse_identity(&r.source_identity).is_none() {
+                return Err(format!("source_identity is not an identity: {}", r.source_identity));
+            }
+            if !r.destination_prefix.is_empty() && from_native_hex(&r.destination_prefix).is_none()
+            {
+                return Err(format!(
+                    "destination_prefix is not native-unit hex: {}",
+                    r.destination_prefix
+                ));
+            }
+        }
+        let o = &c.options;
+        let one_of = |name: &str, v: &str, set: &[&str]| {
+            if set.contains(&v) {
+                Ok(())
+            } else {
+                Err(format!("{name} is not one of {set:?}: {v}"))
+            }
+        };
+        one_of("preserve_times", &o.preserve_times, &["off", "default", "strict"])?;
+        one_of("preserve_permissions", &o.preserve_permissions, &["off", "default", "strict"])?;
+        one_of("durability", &o.durability, &["normal", "strict"])?;
+        one_of("safety", &o.safety, &["default", "strict"])?;
+        one_of("existing", &o.existing, &["overwrite", "update", "skip-existing"])?;
+        let f = &c.configuration_fingerprint;
+        if f.len() != 64 || !f.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return Err(format!("configuration_fingerprint is not 64 lowercase hex: {f}"));
+        }
     }
     if let Some(c) = &s.cleanup {
         if c.cleanup_pending != (s.state == OpState::Completed) {
@@ -440,17 +627,22 @@ const UNAVAILABLE: &str = "unavailable";
 /// POSIX, the UTF-16 code units little-endian on Windows, with `/` (as a native unit) between components. Lossless
 /// and specified - not `as_encoded_bytes`, whose encoding Rust leaves unspecified (spec panel r2, PD-1).
 pub fn native_hex(path: &Path) -> String {
+    use std::path::Component;
     let mut units = Vec::new();
-    for (i, part) in path.iter().enumerate() {
-        if i > 0 {
+    let mut after_root = false;
+    for (i, part) in path.components().enumerate() {
+        // No separator after a root or prefix: `/s` is `/` then `s`, and `C:\a` is `C:`, `\`, `a`.
+        if i > 0 && !after_root {
             units.extend(native_units(OsStr::new("/")));
         }
-        units.extend(native_units(part));
+        after_root = matches!(part, Component::RootDir | Component::Prefix(_));
+        units.extend(native_units(part.as_os_str()));
     }
     crate::lock::site::hex(&units)
 }
 
 /// `native_hex`'s inverse: `None` for text it could not have produced (empty, odd, upper-case, an empty component).
+/// On POSIX exactly one leading `/` is the root (`/` alone is the root path).
 pub fn from_native_hex(text: &str) -> Option<PathBuf> {
     if text.is_empty()
         || !text.len().is_multiple_of(2)
@@ -485,10 +677,22 @@ fn native_units(s: &OsStr) -> Vec<u8> {
 #[cfg(unix)]
 fn native_parts(bytes: &[u8]) -> Option<Vec<OsString>> {
     use std::os::unix::ffi::OsStringExt;
-    bytes
+    let (root, rest) = match bytes.strip_prefix(b"/") {
+        Some(rest) => (Some(OsString::from("/")), rest),
+        None => (None, bytes),
+    };
+    if root.is_some() && rest.is_empty() {
+        return root.map(|r| vec![r]);
+    }
+    let parts: Option<Vec<OsString>> = rest
         .split(|b| *b == b'/')
-        .map(|p| (!p.is_empty()).then(|| OsString::from_vec(p.to_vec())))
-        .collect()
+        // A NUL cannot be in a POSIX name, so text holding one was not produced by `native_hex`.
+        .map(|p| (!p.is_empty() && !p.contains(&0)).then(|| OsString::from_vec(p.to_vec())))
+        .collect();
+    parts.map(|mut parts| {
+        parts.splice(0..0, root);
+        parts
+    })
 }
 
 #[cfg(windows)]
@@ -797,8 +1001,8 @@ mod tests {
     #[test]
     fn format_version_is_judged_before_any_other_key() {
         assert_eq!(
-            decode(br#"{"format_version":3,"anything":[1,2]}"#),
-            Err(Unusable::Incompatible(3))
+            decode(br#"{"format_version":4,"anything":[1,2]}"#),
+            Err(Unusable::Incompatible(4))
         );
         assert!(matches!(decode(br#"{"kind":"tree"}"#), Err(Unusable::Corrupt(_))), "none");
         assert!(matches!(decode(br#"{"format_version":"1"}"#), Err(Unusable::Corrupt(_))), "text");
@@ -1155,11 +1359,11 @@ mod tests {
     }
 
     fn tree_v2() -> OperationState {
-        OperationState::created(&id(1), Kind::Tree, Path::new("/d"), 5, None)
+        OperationState::created_v2(&id(1), Kind::Tree, Path::new("/d"), 5, None)
     }
 
     fn file_v2() -> OperationState {
-        OperationState::created(&id(1), Kind::File, Path::new("/d/t"), 5, Some(file_fields()))
+        OperationState::created_v2(&id(1), Kind::File, Path::new("/d/t"), 5, Some(file_fields()))
     }
 
     fn keys(s: &OperationState) -> Vec<String> {
@@ -1361,6 +1565,36 @@ mod tests {
     }
 
     #[test]
+    fn an_absolute_path_round_trips_through_native_unit_hex() {
+        #[cfg(unix)]
+        {
+            assert_eq!(native_hex(Path::new("/s")), "2f73");
+            assert_eq!(native_hex(Path::new("/")), "2f");
+            assert_eq!(native_hex(Path::new("a/b")), "612f62", "relative output is unchanged");
+            for p in ["/s", "/a/b", "/"] {
+                assert_eq!(
+                    from_native_hex(&native_hex(Path::new(p))).as_deref(),
+                    Some(Path::new(p))
+                );
+            }
+            // "//s", "/a//b", a trailing empty component, and the empty text.
+            for bad in ["2f2f73", "2f612f2f62", "612f", "2f612f", ""] {
+                assert_eq!(from_native_hex(bad), None, "{bad}");
+            }
+        }
+        #[cfg(windows)]
+        {
+            for p in [r"C:\a\b", r"C:\"] {
+                assert_eq!(
+                    from_native_hex(&native_hex(Path::new(p))).as_deref(),
+                    Some(Path::new(p))
+                );
+            }
+            assert_eq!(from_native_hex(""), None);
+        }
+    }
+
+    #[test]
     fn a_path_round_trips_through_native_unit_hex() {
         let p = Path::new("sub").join("a.flux-partial.op");
         assert_eq!(from_native_hex(&native_hex(&p)).as_deref(), Some(p.as_path()));
@@ -1387,6 +1621,198 @@ mod tests {
                 from_native_hex(&native_hex(Path::new(&lone))).as_deref(),
                 Some(Path::new(&lone))
             );
+        }
+    }
+
+    fn options_default() -> Options {
+        Options::of(&flux_fs::CopyOptions {
+            preserve_times: flux_fs::Preserve::Default,
+            preserve_permissions: flux_fs::Preserve::Default,
+            durability: flux_fs::Durability::Normal,
+            publish: flux_fs::Publish::Replace,
+            safety: flux_fs::Safety::Default,
+            operation_id: flux_fs::OperationId::new(id(1)),
+            existing: flux_fs::ExistingPolicy::Overwrite,
+        })
+    }
+
+    fn config() -> Config {
+        Config::new(
+            vec![Root {
+                source_root: native_hex(Path::new("/s")),
+                source_identity: "strong:3:9".into(),
+                destination_prefix: String::new(),
+            }],
+            options_default(),
+        )
+    }
+
+    fn tree_v3() -> OperationState {
+        OperationState::created(&id(1), Kind::Tree, Path::new("/d"), 5, None, config())
+    }
+
+    fn file_v3() -> OperationState {
+        OperationState::created(
+            &id(1),
+            Kind::File,
+            Path::new("/d/t"),
+            5,
+            Some(file_fields()),
+            config(),
+        )
+    }
+
+    fn sorted(parts: &[&[&str]]) -> Vec<String> {
+        let mut k: Vec<String> =
+            parts.iter().flat_map(|p| p.iter()).map(|k| k.to_string()).collect();
+        k.sort();
+        k
+    }
+
+    #[test]
+    fn a_version_3_tree_state_carries_the_config_keys_and_round_trips() {
+        let s = tree_v3();
+        assert_eq!(keys(&s), sorted(&[&KEYS, &CLEANUP_KEYS, &CONFIG_KEYS]));
+        assert_eq!(s.format_version, 3);
+        assert_eq!(decode(&s.encode()), Ok(s));
+    }
+
+    #[test]
+    fn a_version_3_file_record_carries_the_file_and_config_keys_and_round_trips() {
+        let s = file_v3();
+        assert_eq!(keys(&s), sorted(&[&KEYS, &CLEANUP_KEYS, &FILE_KEYS, &CONFIG_KEYS]));
+        assert_eq!(decode(&s.encode()), Ok(s));
+    }
+
+    #[test]
+    fn created_v2_still_writes_version_2() {
+        let s = tree_v2();
+        assert_eq!(s.format_version, 2);
+        assert!(s.config.is_none());
+        assert_eq!(keys(&s), sorted(&[&KEYS, &CLEANUP_KEYS]));
+        assert_eq!(decode(&s.encode()), Ok(s));
+    }
+
+    #[test]
+    fn options_of_spells_every_value_as_the_spec_does() {
+        use flux_fs::{CopyOptions, Durability, ExistingPolicy, Preserve, Safety};
+        let with = |f: &dyn Fn(&mut CopyOptions)| {
+            let mut o = flux_fs::CopyOptions {
+                preserve_times: Preserve::Default,
+                preserve_permissions: Preserve::Default,
+                durability: Durability::Normal,
+                publish: flux_fs::Publish::Replace,
+                safety: Safety::Default,
+                operation_id: flux_fs::OperationId::new(id(1)),
+                existing: ExistingPolicy::Overwrite,
+            };
+            f(&mut o);
+            Options::of(&o)
+        };
+        for (p, text) in
+            [(Preserve::Off, "off"), (Preserve::Default, "default"), (Preserve::Strict, "strict")]
+        {
+            assert_eq!(with(&|o| o.preserve_times = p).preserve_times, text);
+            assert_eq!(with(&|o| o.preserve_permissions = p).preserve_permissions, text);
+        }
+        for (d, text) in [(Durability::Normal, "normal"), (Durability::Strict, "strict")] {
+            assert_eq!(with(&|o| o.durability = d).durability, text);
+        }
+        for (v, text) in [(Safety::Default, "default"), (Safety::Strict, "strict")] {
+            assert_eq!(with(&|o| o.safety = v).safety, text);
+        }
+        for (e, text) in [
+            (ExistingPolicy::Overwrite, "overwrite"),
+            (ExistingPolicy::Update, "update"),
+            (ExistingPolicy::SkipExisting, "skip-existing"),
+        ] {
+            assert_eq!(with(&|o| o.existing = e).existing, text);
+        }
+    }
+
+    #[test]
+    fn the_fingerprint_is_blake3_of_the_canonical_lines_and_ignores_durability() {
+        let o = options_default();
+        assert_eq!(
+            o.canonical_bytes(),
+            b"flux-config-v1\npreserve_times=default\npreserve_permissions=default\nsafety=default\nexisting=overwrite\n"
+        );
+        assert_eq!(o.fingerprint(), blake3::hash(&o.canonical_bytes()).to_hex().to_string());
+        let strict = Options { durability: "strict".into(), ..o.clone() };
+        assert_eq!(strict.fingerprint(), o.fingerprint());
+        let update = Options { existing: "update".into(), ..o.clone() };
+        assert_ne!(update.fingerprint(), o.fingerprint());
+    }
+
+    #[test]
+    fn version_3_consistency_rules_are_state_corrupt() {
+        use serde_json::{Value, json};
+        let edited = |edit: &dyn Fn(&mut serde_json::Map<String, Value>)| {
+            let mut v: Value = serde_json::from_slice(&tree_v3().encode()).unwrap();
+            edit(v.as_object_mut().unwrap());
+            decode(v.to_string().as_bytes())
+        };
+        let root = |f: &str, v: &str| {
+            edited(&|m| {
+                m["roots"][0][f] = json!(v);
+            })
+        };
+        let option = |f: &str, v: &str| {
+            edited(&|m| {
+                m["options"][f] = json!(v);
+            })
+        };
+        assert!(edited(&|_| {}).is_ok(), "the baseline is valid");
+        let missing = edited(&|m| {
+            m.remove("roots");
+        });
+        assert_eq!(missing, Err(Unusable::Corrupt("missing key roots".into())));
+        let mut v2: Value = serde_json::from_slice(&tree_v2().encode()).unwrap();
+        v2["roots"] = json!([]);
+        assert_eq!(
+            decode(v2.to_string().as_bytes()),
+            Err(Unusable::Corrupt("unknown key roots".into()))
+        );
+        let one = serde_json::to_value(&config().roots[0]).unwrap();
+        let upper = "A".repeat(64);
+        for (what, r) in [
+            ("no roots", edited(&|m| m["roots"] = json!([]))),
+            ("two roots", edited(&|m| m["roots"] = json!([one.clone(), one.clone()]))),
+            ("source_root not hex", root("source_root", "zz")),
+            ("source_identity", root("source_identity", "strong:x")),
+            ("destination_prefix", root("destination_prefix", "zz")),
+            ("existing", option("existing", "keep")),
+            ("preserve_times", option("preserve_times", "yes")),
+            ("durability", option("durability", "fast")),
+            ("safety", option("safety", "loose")),
+            (
+                "short fingerprint",
+                edited(&|m| m["configuration_fingerprint"] = json!("a".repeat(63))),
+            ),
+            ("uppercase fingerprint", edited(&|m| m["configuration_fingerprint"] = json!(upper))),
+        ] {
+            assert!(matches!(r, Err(Unusable::Corrupt(_))), "{what}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn a_version_4_record_is_incompatible() {
+        assert_eq!(decode(br#"{"format_version":4}"#), Err(Unusable::Incompatible(4)));
+    }
+
+    #[test]
+    fn absolute_lexical_normalizes_dot_and_dot_dot_without_resolving_links() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(absolute_lexical(Path::new("x/./y/../z")), cwd.join("x").join("z"));
+        #[cfg(unix)]
+        {
+            assert_eq!(absolute_lexical(Path::new("/a/b/../c")), Path::new("/a/c"));
+            assert_eq!(absolute_lexical(Path::new("/..")), Path::new("/"));
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(absolute_lexical(Path::new(r"C:\a\b\..\c")), Path::new(r"C:\a\c"));
+            assert_eq!(absolute_lexical(Path::new(r"C:\..")), Path::new(r"C:\"));
         }
     }
 }

@@ -144,7 +144,8 @@ pub(crate) fn open_operation<'a, D: DirHandle, P: Place<D>>(
                 creation_wall_time: now.to_string(),
                 last_heartbeat_wall_time: now.to_string(),
             });
-            let state = OperationState::created(id, place.kind(), place.destination(), now, file);
+            let state =
+                OperationState::created_v2(id, place.kind(), place.destination(), now, file);
             if let Err(e) = place.create(&state, warnings) {
                 return Err(give_back(obtained, e, &lock_shown));
             }

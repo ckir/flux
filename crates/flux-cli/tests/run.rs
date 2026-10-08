@@ -205,7 +205,8 @@ fn a_killed_single_file_run_leaves_a_resumable_record_that_restart_supersedes() 
     let record = left.iter().find(|n| n.starts_with("t.flux-state.")).unwrap();
     let state = flux_core::state::decode(&std::fs::read(d.path().join(record)).unwrap())
         .expect("the record decodes");
-    assert_eq!(state.format_version, flux_core::state::FORMAT_VERSION);
+    // until task 6 (cut 9a): a real run writes format 3 from then on
+    assert_eq!(state.format_version, flux_core::state::V2);
     let f = state.file.expect("a single-file record carries §249.1's fields");
     assert!(
         matches!(
@@ -309,7 +310,7 @@ fn an_empty_lock_is_uncertain_until_restart_break_lock_takes_it_over() {
 #[test]
 fn unreadable_or_newer_state_is_refused_and_preserved() {
     let corrupt: &[u8] = b"garbage";
-    let newer: &[u8] = br#"{"format_version":3}"#;
+    let newer: &[u8] = br#"{"format_version":4}"#;
     for (bytes, code) in [(corrupt, "STATE_CORRUPT"), (newer, "INCOMPATIBLE_STATE")] {
         let d = TempDir::new().unwrap();
         let src = tree_in(d.path());

@@ -442,7 +442,7 @@ fn a_version_2_prior_superseded_by_restart_stays_version_2() {
     fs.create_dir(Path::new(&format!("/p/dest/.flux/operations/{}", id(5)))).unwrap();
     let prior = OperationState {
         state: OpState::Failed,
-        ..OperationState::created(&id(5), Kind::Tree, Path::new("/p/dest"), 1, None)
+        ..OperationState::created_v2(&id(5), Kind::Tree, Path::new("/p/dest"), 1, None)
     };
     fs.write_file(format!("/p/dest/.flux/operations/{}/manifest", id(5)), &prior.encode());
     let partial = format!("/p/dest/old.flux-partial.{}", id(5));
@@ -452,10 +452,7 @@ fn a_version_2_prior_superseded_by_restart_stays_version_2() {
     let (r, _) = run_tree(&fs, &restart());
     ok(&r);
     let kept = manifest(&fs, &id(5));
-    assert_eq!(
-        (kept.format_version, kept.state),
-        (crate::state::FORMAT_VERSION, OpState::Abandoned)
-    );
+    assert_eq!((kept.format_version, kept.state), (crate::state::V2, OpState::Abandoned));
     assert_eq!(kept.cleanup.map(|c| c.cleanup_pending), Some(false));
 }
 
@@ -1167,7 +1164,8 @@ fn a_single_file_record_carries_section_249_1_from_its_creation() {
     let fs = fake();
     let s = failed_file_run(&fs);
     let f = s.file.clone().expect("a version-2 single-file record");
-    assert_eq!(s.format_version, crate::state::FORMAT_VERSION);
+    // until task 6 (cut 9a): a real run writes format 3 from then on
+    assert_eq!(s.format_version, crate::state::V2);
     assert_eq!(f.artifact_type, "state");
     assert!(crate::ids::is_id(&f.attempt_id) && f.attempt_id != ID, "{}", f.attempt_id);
     assert_eq!(f.artifact_generation, 1);
@@ -1216,7 +1214,8 @@ fn kept_tree_manifest(fs: &FaultFs) -> OperationState {
 fn a_tree_manifest_is_version_2_with_cleanup_keys_and_no_file_fields() {
     let fs = fake();
     let s = kept_tree_manifest(&fs);
-    assert_eq!(s.format_version, crate::state::FORMAT_VERSION);
+    // until task 6 (cut 9a): a real run writes format 3 from then on
+    assert_eq!(s.format_version, crate::state::V2);
     assert!(s.file.is_none());
     assert!(s.cleanup.is_some());
 }
@@ -1295,7 +1294,7 @@ fn a_version_2_single_file_prior_superseded_by_restart_keeps_its_fields() {
     };
     let prior = OperationState {
         state: OpState::Failed,
-        ..OperationState::created(&id(5), Kind::File, Path::new("/p/t"), 1, Some(fields.clone()))
+        ..OperationState::created_v2(&id(5), Kind::File, Path::new("/p/t"), 1, Some(fields.clone()))
     };
     fs.write_file(record_path(&id(5)), &prior.encode());
     fs.write_file(format!("/p/t.flux-partial.{}", id(5)), b"half");
