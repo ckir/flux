@@ -2926,7 +2926,7 @@ fn a_mapping_mismatch_is_refused_and_strong_identities_decide() {
     assert!(
         r.warnings
             .iter()
-            .any(|w| matches!(w, RunWarning::ResumeMappingByPath(p) if p == Path::new("/src"))),
+            .any(|w| matches!(w, RunWarning::ResumeMappingByPath(p) if *p == absolute_lexical(Path::new("/src")))),
         "{:?} {:?}",
         r.warnings,
         r.stop
