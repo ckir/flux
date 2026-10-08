@@ -416,6 +416,8 @@ are the spec's).
       is often followed by a reboot: when the numbers change every claim misses and the resume copies everything again
       under the existing-file policy (safe, but the resume saves nothing). Not testable in CI; to be measured on real
       systems before slice 9c.
+      The source root's `Strong` identity also contains `st_dev`: if the source volume's device number changes across a
+      reboot, `--resume` is refused with `INCOMPATIBLE_STATE` ("the source root differs"); use `--restart`.
 - [ ] **7. Weak-identity destination directories never get claims**: a resumed run reports their existing files as
       collisions (see the walk section).
 - [ ] **8. A destination that cannot take the source's modification times** (`preserve_times = Default` records the
@@ -430,6 +432,20 @@ are the spec's).
       NTFS volume) cannot be resumed from the other side: source paths are encoded and written differently (UTF-16
       versus UTF-8 hex) and object identities are derived differently, so the mapping check refuses with
       `INCOMPATIBLE_STATE` or every claim misses. Resume in the environment that started the copy (see also limit 6).
+- [ ] **11. Progress is discarded when a tree finishes with per-file failures**: the walk returns `Ok`, the run
+      completes, the workspace and its claims are removed, so a later `--resume` starts new and copies everything again
+      under the existing-file policy (safe; a retry of only the failed files is a later cut).
+
+## Cut 9a debt
+
+- [ ] Slice 9b must validate `cleanup_pending_artifacts` entries as relative paths without `..` (`from_native_hex`
+      now accepts absolute paths for the format-3 `source_root`) before deleting by them.
+- [ ] Stale-lease classification (9b) should know that a long resume skip refreshes no heartbeat.
+- [ ] State writes do not enforce `STATE_LIMIT` (a source root of more than 16K units on Windows makes a format-3
+      manifest unreadable).
+- [ ] The resume note prints after the per-file failure lines (spec order: note, then report).
+- [ ] A single-file case-variant target on a case-insensitive filesystem is offered `--resume` by the refusal but
+      refused by the byte-exact `destination_prefix` check.
 
 ## Scaffolding follow-ups
 

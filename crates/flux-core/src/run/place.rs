@@ -221,6 +221,26 @@ fn refused_state(code: LockCode, detail: String) -> RunError {
 
 const BY_HAND: &str = "Flux never deletes state it cannot read (§249.4): inspect it, and remove it by hand if it is not needed";
 
+/// The one mapping of a claim-store error met while adopting a prior (`open` and `count` alike): a store that cannot
+/// be read is a refusal, anything else fails the run at the state step.
+fn state_error(db: &Path, e: FsError) -> RunError {
+    match e.code {
+        Code::StateCorrupt => refused_state(
+            LockCode::StateCorrupt,
+            format!("{}: {}; {BY_HAND}", db.display(), e.source),
+        ),
+        Code::IncompatibleState => refused_state(
+            LockCode::IncompatibleState,
+            format!(
+                "{}: {}; use the Flux version that wrote it, or run again with --restart to supersede it",
+                db.display(),
+                e.source
+            ),
+        ),
+        _ => failed(RunStep::State, db, e),
+    }
+}
+
 impl<F: DestinationRoot> TreePlace<'_, F> {
     fn operations_shown(&self) -> PathBuf {
         self.dest_shown.join(FLUX_DIR).join(OPERATIONS_DIR)
@@ -518,25 +538,9 @@ impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {
                     format!("{}: the workspace has no state.db; {BY_HAND}", db.display()),
                 ));
             }
-            Err(e) if e.code == Code::StateCorrupt => {
-                return Err(refused_state(
-                    LockCode::StateCorrupt,
-                    format!("{}: {}; {BY_HAND}", db.display(), e.source),
-                ));
-            }
-            Err(e) if e.code == Code::IncompatibleState => {
-                return Err(refused_state(
-                    LockCode::IncompatibleState,
-                    format!(
-                        "{}: {}; use the Flux version that wrote it, or run again with --restart to supersede it",
-                        db.display(),
-                        e.source
-                    ),
-                ));
-            }
-            Err(e) => return Err(failed(RunStep::State, &db, e)),
+            Err(e) => return Err(state_error(&db, e)),
         };
-        let claims = store.count().map_err(|e| failed(RunStep::State, &db, e))?;
+        let claims = store.count().map_err(|e| state_error(&db, e))?;
         self.claims = Some(store);
         self.operations = Some(operations);
         Ok(Some(claims))

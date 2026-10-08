@@ -3018,6 +3018,37 @@ fn a_state_db_that_cannot_be_opened_fails_the_run_at_the_state_step() {
 }
 
 #[test]
+fn a_state_corrupt_or_incompatible_claim_count_is_the_same_refusal_as_open() {
+    for (code, want) in [
+        (Code::StateCorrupt, LockCode::StateCorrupt),
+        (Code::IncompatibleState, LockCode::IncompatibleState),
+    ] {
+        let fs = fake();
+        let p = prior3(&fs, 5, OpState::Failed);
+        drop(prior_store(&fs, 5));
+        fs.fail("claim_count", code);
+        let (r, _) = run_tree(&fs, &resume());
+        assert_eq!(refused(&r.stop), (want, false), "{code:?}");
+        assert!(detail(&r.stop).contains("state.db"), "{}", detail(&r.stop));
+        assert!(!fs.exists(LOCK), "{code:?}");
+        assert_eq!(manifest(&fs, &id(5)), p, "{code:?}");
+    }
+}
+
+#[test]
+fn another_claim_count_error_fails_the_run_at_the_state_step() {
+    let fs = fake();
+    prior3(&fs, 5, OpState::Failed);
+    drop(prior_store(&fs, 5));
+    fs.fail("claim_count", Code::PermissionDenied);
+    let (r, _) = run_tree(&fs, &resume());
+    let (step, path) = failed_at(&r.stop);
+    assert_eq!(step, RunStep::State);
+    assert!(path.ends_with("state.db"), "{path}");
+    assert!(!fs.exists(LOCK));
+}
+
+#[test]
 fn the_claim_count_is_reported_on_adoption() {
     let fs = fake();
     prior3(&fs, 5, OpState::Failed);
@@ -3428,6 +3459,24 @@ fn a_foreign_claim_on_resume_is_a_collision() {
     assert_eq!(code_of(&got[0]), Code::DestinationNamespaceCollision);
     assert_eq!(step_of(&got[0]), CopyStep::Claim);
     assert_eq!(fs.read_file("/p/dest/a").unwrap(), b"o");
+}
+
+#[test]
+fn a_foreign_claim_on_resume_is_a_collision_under_skip_and_update_not_a_policy_skip() {
+    for policy in [ExistingPolicy::SkipExisting, ExistingPolicy::Update] {
+        let fs = fake_src(100);
+        prior3_with(&fs, 5, OpState::Transferring, &with_policy(policy));
+        put(&fs, "/p/dest/a", b"o", 100);
+        claimed(&fs, 5, "a", ClaimStatus::Created, "other");
+        let (r, got) = run_tree_with(&fs, &resume(), &with_policy(policy));
+        let out = ok(&r);
+        let a: Vec<_> = got.iter().filter(|f| f.path.as_path() == Path::new("a")).collect();
+        assert_eq!(a.len(), 1, "{policy:?} {got:?}");
+        assert_eq!(code_of(a[0]), Code::DestinationNamespaceCollision, "{policy:?}");
+        assert_eq!(step_of(a[0]), CopyStep::Claim, "{policy:?}");
+        assert_eq!(out.files_skipped, 0, "{policy:?}: the policy must not skip it");
+        assert_eq!(fs.read_file("/p/dest/a").unwrap(), b"o");
+    }
 }
 
 #[test]

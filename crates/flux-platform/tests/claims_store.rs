@@ -149,4 +149,20 @@ mod open {
         drop(db);
         assert_eq!(open_err(&path).code, Code::StateCorrupt);
     }
+
+    #[test]
+    fn a_store_missing_its_claims_table_is_state_corrupt_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let file = OpenOptions::new().read(true).write(true).create_new(true).open(&path).unwrap();
+        let db = Builder::new().create_file(file).unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut meta = tx.open_table(META).unwrap();
+            meta.insert("format", 1u64).unwrap();
+        }
+        tx.commit().unwrap();
+        drop(db);
+        assert_eq!(open_err(&path).code, Code::StateCorrupt);
+    }
 }

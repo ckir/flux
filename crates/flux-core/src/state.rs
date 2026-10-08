@@ -1796,6 +1796,22 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_key_inside_a_root_or_the_options_is_corrupt() {
+        use serde_json::{Value, json};
+        let with = |edit: &dyn Fn(&mut Value)| {
+            let mut v: Value = serde_json::from_slice(&tree_v3().encode()).unwrap();
+            edit(&mut v);
+            decode(v.to_string().as_bytes())
+        };
+        for (what, r) in [
+            ("roots[0]", with(&|v| v["roots"][0]["extra"] = json!(true))),
+            ("options", with(&|v| v["options"]["extra"] = json!(true))),
+        ] {
+            assert!(matches!(r, Err(Unusable::Corrupt(_))), "{what}: {r:?}");
+        }
+    }
+
+    #[test]
     fn a_version_4_record_is_incompatible() {
         assert_eq!(decode(br#"{"format_version":4}"#), Err(Unusable::Incompatible(4)));
     }
