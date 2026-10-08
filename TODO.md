@@ -344,6 +344,10 @@ are the spec's).
       replacement (spec section 4 is silent). A later cut may refine it.
 - [ ] **11. In a weak-identity destination directory `--skip-existing`** reports existing files as collisions (exit 1)
       instead of skipping, as the spec text says. A later cut may refine it.
+- [ ] **12. A destination entry changed by an external process during the payload transfer is overwritten.** The
+      identity gate (section 129) runs before the bytes stream and `rename_replace` publishes after; Flux does not
+      re-stat the destination in between, and does not lock against non-Flux actors. The claim serializes Flux's own
+      targets only. Same model as the existing Walker TOCTOU entry; named by capstone round 2 of cut 8b.
 
 ## Cut 8b debt
 
@@ -370,6 +374,10 @@ are the spec's).
       case-sensitive" under "Cut 8a debt".
 - [ ] **The fake `FaultFs` case-insensitive mode is ASCII-only** and does not normalize `read_file`, `remove_dir`,
       `create_lock`, `open_lock`, `create_claim_store` or the path-level `open_read`.
+- [ ] **Nothing pins the claim store's cache bound.** Removing `Builder::set_cache_size(CACHE_BYTES)` in
+      `crates/flux-platform/src/claims.rs` leaves every test green (measured at `6bee900`; redb has no cache-size
+      getter, only `cache_stats()`). A pin would insert enough claims to exceed 16 MiB of pages and assert
+      `evictions > 0`; it was left out as slow (the AGY-TEST-AUDIT gap, deferred by the controller pending the owner).
 
 ## Scaffolding follow-ups
 
