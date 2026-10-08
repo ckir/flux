@@ -784,8 +784,12 @@ mod tests {
 
     #[test]
     fn a_runs_lines_are_its_stop_then_every_warning() {
-        let run: Run<()> =
-            Run { copy: None, stop: Some(refused()), warnings: vec![kept(), kept()] };
+        let run: Run<()> = Run {
+            copy: None,
+            stop: Some(refused()),
+            warnings: vec![kept(), kept()],
+            resumed: None,
+        };
         let lines = run_lines(&run);
         assert_eq!(lines.len(), 3, "{lines:?}");
         assert!(lines[0].starts_with("STATE_CORRUPT: "), "{lines:?}");
@@ -793,13 +797,13 @@ mod tests {
             lines[1..].iter().all(|l| l.starts_with("warning: ") && l.contains("kept-state")),
             "{lines:?}"
         );
-        let quiet: Run<()> = Run { copy: None, stop: None, warnings: vec![kept()] };
+        let quiet: Run<()> = Run { copy: None, stop: None, warnings: vec![kept()], resumed: None };
         assert_eq!(run_lines(&quiet).len(), 1, "warnings print without a stop too");
     }
 
     #[test]
     fn a_tree_runs_report_counts_a_stop_as_one_more_error() {
-        let run = |copy, stop| Run { copy, stop, warnings: Vec::new() };
+        let run = |copy, stop| Run { copy, stop, warnings: Vec::new(), resumed: None };
         let clean = Report::tree_run(&run(Some(Ok(TreeOutcome::default())), None), 1);
         assert_eq!(clean.errors, 0);
         let stopped = Report::tree_run(&run(Some(Ok(TreeOutcome::default())), Some(refused())), 1);
@@ -825,7 +829,7 @@ mod tests {
 
     #[test]
     fn a_file_runs_report_counts_a_stop_as_one_more_error() {
-        let run = |copy, stop| Run { copy, stop, warnings: Vec::new() };
+        let run = |copy, stop| Run { copy, stop, warnings: Vec::new(), resumed: None };
         let copied = || {
             Ok(Outcome {
                 bytes_copied: 1,

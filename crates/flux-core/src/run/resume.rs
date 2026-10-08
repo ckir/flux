@@ -1,9 +1,6 @@
 //! Cut 9a's compatibility check for `--resume` (spec 121, "Compatibility"): whether a prior operation's stored
 //! configuration admits this run. Pure: it reads the prior's state and the run's roots and options, and decides.
 
-// Task 6 wires `validate` into `open_operation`; until then only the tests call it.
-#![allow(dead_code)]
-
 use super::{RunError, RunWarning};
 use crate::lock::{LockCode, LockError};
 use crate::prior::{PriorOp, corrupt};

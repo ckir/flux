@@ -3,17 +3,19 @@
 
 use super::place::Place;
 use super::restart::supersede;
-use super::{RunConfig, RunError, RunStep, RunWarning, stop_after_record};
+use super::resume::validate;
+use super::{ResumeNote, RunConfig, RunError, RunStep, RunWarning, stop_after_record};
 use crate::lock::record::LockRecord;
 use crate::lock::{
     Held, LockCode, LockError, LockResult, LockSite, MAX_ATTEMPTS, Mode, Obtained, Overwritten,
     Refusal, obtain,
 };
-use crate::prior::resumable_refusal;
+use crate::prior::{PriorOp, resumable_refusal};
 use crate::state::{
-    ARTIFACT_STATE, FileFields, OpState, OperationState, Takeover, identity_text, wall_time_ns,
+    ARTIFACT_STATE, Config, FileFields, OpState, OperationState, Options, Takeover, identity_text,
+    wall_time_ns,
 };
-use flux_fs::{Code, DirHandle, FsError, LockCapability};
+use flux_fs::{Code, CopyOptions, DirHandle, FsError, LockCapability};
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -26,6 +28,8 @@ pub(crate) struct Locked<'a, D: DirHandle> {
     pub(crate) lock_shown: PathBuf,
     /// The heartbeat (cut 7b): due, done, or failed.
     pub(crate) pulse: Pulse,
+    /// Cut 9a: what `--resume` did; `None` without the flag.
+    pub(crate) resumed: Option<ResumeNote>,
 }
 
 /// The run's heartbeat (cut 7b, §101, decisions 6-7): the interval, the instant of the last record write, and whether
@@ -101,26 +105,33 @@ pub(crate) fn open_operation<'a, D: DirHandle, P: Place<D>>(
     capability: LockCapability,
     place: &mut P,
     cfg: &RunConfig,
+    opts: &CopyOptions,
     warnings: &mut Vec<RunWarning>,
 ) -> Result<Locked<'a, D>, RunError> {
-    let id = cfg.operation_id.as_str();
+    let own_id = cfg.operation_id.as_str();
     let lock_shown = place.holder_shown().join(site.lock_name());
     let mode = if cfg.break_lock { Mode::BreakLock } else { Mode::Plain };
     // This run's state, once it exists (D1).
     let mut made: Option<OperationState> = None;
+    // Cut 9a: what `--resume` did, once step 5 has (it survives a D1 restart with `made`).
+    let mut resumed: Option<ResumeNote> = None;
     // Cut 7b: one wall-clock reading for the state and its record, so the record's fields equal the lock record's
     // (Part 1 decision 7), and one attempt id per run.
     let now = wall_time_ns();
     let attempt_id = crate::ids::new_id();
     for _ in 0..MAX_ATTEMPTS {
         // Step 3.
-        let obtained = obtain(site, capability, mode, id)
+        let obtained = obtain(site, capability, mode, own_id)
             .map_err(|e| from_lock(e, RunStep::Lock, &lock_shown, made.is_some()))?;
         // Step 4.
-        let priors = match place.scan(id) {
-            Ok(scan) if scan.resumable.is_empty() || cfg.restart => scan.resumable,
+        let (priors, adopt): (Vec<PriorOp>, Option<PriorOp>) = match place.scan(own_id) {
+            Ok(scan) if cfg.restart => (scan.resumable, None),
+            Ok(scan) if scan.resumable.is_empty() => (Vec::new(), None),
+            Ok(mut scan) if cfg.resume && scan.resumable.len() == 1 => {
+                (Vec::new(), Some(scan.resumable.remove(0)))
+            }
             Ok(scan) => {
-                let refused = resumable_refusal(&scan.resumable[0]);
+                let refused = resumable_refusal(&scan.resumable);
                 let error =
                     from_lock(refused, RunStep::Inspect, place.destination(), made.is_some());
                 return Err(give_back(obtained, error, &lock_shown));
@@ -144,15 +155,53 @@ pub(crate) fn open_operation<'a, D: DirHandle, P: Place<D>>(
                 creation_wall_time: now.to_string(),
                 last_heartbeat_wall_time: now.to_string(),
             });
-            let state =
-                OperationState::created_v2(id, place.kind(), place.destination(), now, file);
-            if let Err(e) = place.create(&state, warnings) {
-                return Err(give_back(obtained, e, &lock_shown));
+            if let Some(prior) = adopt {
+                // Cut 9a, "Order inside adoption": (1) validate, (2) open or create state.db; the manifest is written
+                // TRANSFERRING last, so TRANSFERRING is never on disk without a state.db.
+                let config = match validate(&prior, &place.roots(), opts, warnings) {
+                    Ok(c) => c,
+                    Err(e) => return Err(give_back(obtained, e, &lock_shown)),
+                };
+                let claims = match place.adopt(&prior.state, opts.durability) {
+                    Ok(c) => c,
+                    Err(e) => return Err(give_back(obtained, e, &lock_shown)),
+                };
+                let mut state = prior.state.clone();
+                state.config = Some(config);
+                if file.is_some()
+                    && let Some(f) = &mut state.file
+                {
+                    f.attempt_id = attempt_id.clone();
+                    f.artifact_generation += 1;
+                    f.owner_instance_id = cfg.owner_instance_id.clone();
+                    f.boot_session_id = cfg.boot_session_id.clone();
+                    f.last_heartbeat_wall_time = now.to_string();
+                }
+                resumed =
+                    Some(ResumeNote::Adopted { operation_id: state.operation_id.clone(), claims });
+                made = Some(state);
+            } else {
+                if cfg.resume {
+                    resumed = Some(ResumeNote::StartedNew);
+                }
+                let state = OperationState::created(
+                    own_id,
+                    place.kind(),
+                    place.destination(),
+                    now,
+                    file,
+                    Config::new(place.roots(), Options::of(opts)),
+                );
+                if let Err(e) = place.create(&state, warnings) {
+                    return Err(give_back(obtained, e, &lock_shown));
+                }
+                made = Some(state);
             }
-            made = Some(state);
         }
         let state = made.clone().expect("made above");
-        let record = match record_for(site, cfg, place.workspace_path(id), now) {
+        let effective = state.operation_id.clone();
+        let id = effective.as_str();
+        let record = match record_for(site, id, cfg, place.workspace_path(id), now) {
             Ok(r) => r,
             Err(e) => {
                 let error = from_lock(e, RunStep::Record, &lock_shown, true);
@@ -177,6 +226,7 @@ pub(crate) fn open_operation<'a, D: DirHandle, P: Place<D>>(
                     state,
                     lock_shown: lock_shown.clone(),
                     pulse: Pulse::new(cfg.heartbeat_interval),
+                    resumed: resumed.clone(),
                 }
             }
             Obtained::Claimed(claimed) => match claimed.overwrite(record) {
@@ -186,6 +236,7 @@ pub(crate) fn open_operation<'a, D: DirHandle, P: Place<D>>(
                         state,
                         lock_shown: lock_shown.clone(),
                         pulse: Pulse::new(cfg.heartbeat_interval),
+                        resumed: resumed.clone(),
                     };
                     // §240.5 step 6, after the flush succeeded: the takeover, in this operation's state.
                     locked.state.takeover = Some(Takeover::of_unreadable(wall_time_ns()));
@@ -277,13 +328,14 @@ fn give_back<D: DirHandle>(
 /// `creation_wall_time`; both are the run's one `now` (cut 7b)).
 fn record_for<D: DirHandle>(
     site: &LockSite<'_, D>,
+    operation_id: &str,
     cfg: &RunConfig,
     workspace_path: String,
     now: u64,
 ) -> LockResult<LockRecord> {
     Ok(LockRecord {
         complete_lock_key: site.complete_lock_key()?,
-        operation_id: cfg.operation_id.clone(),
+        operation_id: operation_id.to_string(),
         owner_instance_id: cfg.owner_instance_id.clone(),
         boot_session_id: cfg.boot_session_id.clone(),
         target_path_key: site.target_path_key(),

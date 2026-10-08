@@ -33,6 +33,7 @@ fn cfg() -> RunConfig {
         before_mutation: None,
         // Plan decision 6: the existing tests never heartbeat.
         heartbeat_interval: std::time::Duration::from_secs(3600),
+        resume: false,
     }
 }
 
@@ -214,6 +215,9 @@ fn a_resumable_prior_operation_is_refused_and_the_lock_removed_again() {
     prior(&fs, 5, OpState::Failed);
     let (r, _) = run_tree(&fs, &cfg());
     assert_eq!(refused(&r.stop), (LockCode::ResumableOperationExists, false));
+    let d = detail(&r.stop);
+    assert!(d.contains("created by an older version") && d.contains("--restart"), "{d}");
+    assert!(!d.contains("--resume to continue"), "{d}");
     assert!(!fs.exists(LOCK), "the lock this run created is gone");
     assert_eq!(manifest(&fs, &id(5)).state, OpState::Failed, "untouched");
     assert!(!fs.exists(format!("/p/dest/.flux/operations/{ID}")));
@@ -1164,8 +1168,7 @@ fn a_single_file_record_carries_section_249_1_from_its_creation() {
     let fs = fake();
     let s = failed_file_run(&fs);
     let f = s.file.clone().expect("a version-2 single-file record");
-    // until task 6 (cut 9a): a real run writes format 3 from then on
-    assert_eq!(s.format_version, crate::state::V2);
+    assert_eq!(s.format_version, crate::state::FORMAT_VERSION);
     assert_eq!(f.artifact_type, "state");
     assert!(crate::ids::is_id(&f.attempt_id) && f.attempt_id != ID, "{}", f.attempt_id);
     assert_eq!(f.artifact_generation, 1);
@@ -1211,11 +1214,10 @@ fn kept_tree_manifest(fs: &FaultFs) -> OperationState {
 }
 
 #[test]
-fn a_tree_manifest_is_version_2_with_cleanup_keys_and_no_file_fields() {
+fn a_tree_manifest_is_the_current_version_with_cleanup_keys_and_no_file_fields() {
     let fs = fake();
     let s = kept_tree_manifest(&fs);
-    // until task 6 (cut 9a): a real run writes format 3 from then on
-    assert_eq!(s.format_version, crate::state::V2);
+    assert_eq!(s.format_version, crate::state::FORMAT_VERSION);
     assert!(s.file.is_none());
     assert!(s.cleanup.is_some());
 }
@@ -2598,4 +2600,552 @@ fn no_final_sync_after_a_refusal_or_a_lost_lock() {
     let (r, _) = run_tree(&fs, &cfg());
     assert_eq!(aborted(&r).error.code(), Code::TargetLockBusy);
     assert_eq!(flushes(&fs), 0, "{:?}", calls(&fs));
+}
+
+// Cut 9a Task 6: `--resume` adopts the one resumable prior.
+
+use crate::fault_fs::FakeClaimStore;
+use crate::state::{Config, Options, Root, absolute_lexical, identity_text, native_hex};
+use flux_fs::{ClaimKey, DirHandle};
+
+fn resume() -> RunConfig {
+    RunConfig { resume: true, ..cfg() }
+}
+
+fn detail(stop: &Option<RunError>) -> String {
+    match stop {
+        Some(RunError::Refused { refusal, .. }) => refusal.detail.clone(),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+fn state_db(n: u8) -> String {
+    format!("/p/dest/.flux/operations/{}/state.db", id(n))
+}
+
+fn tree_config(fs: &FaultFs, o: &CopyOptions) -> Config {
+    Config::new(
+        vec![Root {
+            source_root: native_hex(&absolute_lexical(Path::new("/src"))),
+            source_identity: identity_text(fs.metadata(Path::new("/src")).unwrap().identity),
+            destination_prefix: String::new(),
+        }],
+        Options::of(o),
+    )
+}
+
+fn write_manifest(fs: &FaultFs, state: &OperationState) {
+    fs.write_file(
+        format!("/p/dest/.flux/operations/{}/manifest", state.operation_id),
+        &state.encode(),
+    );
+}
+
+/// A version-3 prior tree operation `n` in state `s`, written under `/p/dest` with `o`'s options.
+fn prior3_with(fs: &FaultFs, n: u8, s: OpState, o: &CopyOptions) -> OperationState {
+    for d in ["/p/dest", "/p/dest/.flux", "/p/dest/.flux/operations"] {
+        if !fs.exists(d) {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+    }
+    fs.create_dir(Path::new(&format!("/p/dest/.flux/operations/{}", id(n)))).unwrap();
+    let state = OperationState {
+        state: s,
+        ..OperationState::created(
+            &id(n),
+            Kind::Tree,
+            Path::new("/p/dest"),
+            1,
+            None,
+            tree_config(fs, o),
+        )
+    };
+    write_manifest(fs, &state);
+    state
+}
+
+fn prior3(fs: &FaultFs, n: u8, s: OpState) -> OperationState {
+    prior3_with(fs, n, s, &opts())
+}
+
+fn prior_store(fs: &FaultFs, n: u8) -> FakeClaimStore {
+    fs.destination_root(Path::new(&format!("/p/dest/.flux/operations/{}", id(n))))
+        .unwrap()
+        .create_claim_store(OsStr::new("state.db"), Durability::Normal)
+        .unwrap()
+}
+
+fn adopted(r: &Run<Result<TreeOutcome, TreeAbort>>, n: u8, claims: Option<u64>) {
+    assert_eq!(
+        r.resumed,
+        Some(ResumeNote::Adopted { operation_id: id(n), claims }),
+        "{:?} {:?}",
+        r.stop,
+        r.resumed
+    );
+}
+
+fn lock_record_during(fs: &FaultFs, nth_create_new: u32) -> Arc<Mutex<Option<LockRecord>>> {
+    let seen: Arc<Mutex<Option<LockRecord>>> = Arc::default();
+    let keep = Arc::clone(&seen);
+    fs.on_nth("create_new", nth_create_new, move |fs| {
+        if let Some(Decoded::Record(rec)) = fs.read_file(LOCK).map(|b| decode(&b)) {
+            *keep.lock().unwrap() = Some(rec);
+        }
+    });
+    seen
+}
+
+#[test]
+fn resume_with_no_prior_starts_a_new_operation_and_says_so() {
+    let fs = fake();
+    let seen: Arc<Mutex<Option<OperationState>>> = Arc::default();
+    let keep = Arc::clone(&seen);
+    // `create_new`: the probe's temporary (1), CREATED (2), TRANSFERRING (3), then `a`'s temporary (4).
+    fs.on_nth("create_new", 4, move |fs| *keep.lock().unwrap() = Some(manifest(fs, ID)));
+    let (r, _) = run_tree(&fs, &resume());
+    ok(&r);
+    assert_eq!(r.resumed, Some(ResumeNote::StartedNew));
+    let m = seen.lock().unwrap().clone().expect("read during the copy");
+    assert_eq!(m.format_version, crate::state::FORMAT_VERSION);
+    let src = identity_text(fs.metadata(Path::new("/src")).unwrap().identity);
+    assert_eq!(m.config.unwrap().roots[0].source_identity, src);
+    assert!(!fs.exists("/p/dest/.flux") && !fs.exists(LOCK));
+    assert_eq!(run_tree(&fake(), &cfg()).0.resumed, None, "no flag, no note");
+}
+
+#[test]
+fn a_new_tree_manifest_is_version_3_with_roots_options_and_fingerprint() {
+    let fs = fake();
+    let s = kept_tree_manifest(&fs);
+    assert_eq!(s.format_version, 3);
+    let c = s.config.expect("version 3 carries its configuration");
+    assert_eq!(c.roots.len(), 1);
+    assert_eq!(c.roots[0].destination_prefix, "");
+    assert_eq!(c.roots[0].source_root, native_hex(&absolute_lexical(Path::new("/src"))));
+    assert_eq!(c.options, Options::of(&opts()));
+    assert_eq!(c.configuration_fingerprint, c.options.fingerprint());
+}
+
+#[test]
+fn resume_adopts_a_prior_in_each_resumable_state_under_its_own_id() {
+    for s in [OpState::Created, OpState::Transferring, OpState::Failed] {
+        let fs = fake();
+        prior3(&fs, 5, s);
+        drop(prior_store(&fs, 5));
+        // `create_new`: the TRANSFERRING manifest (1), then `a`'s temporary (2).
+        let rec = lock_record_during(&fs, 2);
+        let (r, _) = run_tree(&fs, &resume());
+        let out = ok(&r);
+        adopted(&r, 5, Some(0));
+        assert_eq!(out.files_copied, 2, "{s:?}");
+        let c = calls(&fs);
+        assert!(!c.iter().any(|x| {
+            x.starts_with(&format!("create_dir(/p/dest/.flux/operations/{ID}.creating)"))
+        }));
+        let created = c.iter().filter(|x| x.starts_with("create_claim_store(")).count();
+        assert_eq!(created, 1, "{s:?}: only the staging made a store: {c:?}");
+        let rec = rec.lock().unwrap().clone().expect("the record during the copy");
+        assert_eq!(rec.operation_id, id(5));
+        assert_eq!(rec.workspace_path, format!("operations/{}", id(5)));
+        assert!(!fs.exists("/p/dest/.flux") && !fs.exists(LOCK), "{s:?}");
+    }
+}
+
+#[test]
+fn the_adopted_id_names_the_partials_and_the_old_partial_is_swept() {
+    let fs = fake();
+    prior3(&fs, 5, OpState::Failed);
+    drop(prior_store(&fs, 5));
+    let partial = format!("/p/dest/a.flux-partial.{}", id(5));
+    fs.write_file(&partial, b"half");
+    let (r, _) = run_tree(&fs, &resume());
+    ok(&r);
+    let c = calls(&fs);
+    let removed = at(&c, &format!("remove_file({partial})"));
+    let created = at(&c, &format!("create_new({partial})"));
+    assert!(removed < created, "{c:?}");
+    assert!(!c.iter().any(|x| x.contains(&format!("flux-partial.{ID}"))), "{c:?}");
+}
+
+#[test]
+fn the_adopted_manifest_goes_transferring_before_the_copy() {
+    let fs = fake();
+    let before = prior3(&fs, 5, OpState::Failed);
+    drop(prior_store(&fs, 5));
+    let seen: Arc<Mutex<Option<OperationState>>> = Arc::default();
+    let keep = Arc::clone(&seen);
+    fs.on_nth("create_new", 2, move |fs| *keep.lock().unwrap() = Some(manifest(fs, &id(5))));
+    let (r, _) = run_tree(&fs, &resume());
+    ok(&r);
+    let m = seen.lock().unwrap().clone().expect("read during the copy");
+    assert_eq!((m.state, m.format_version), (OpState::Transferring, 3));
+    assert_eq!(m.config, before.config);
+}
+
+#[test]
+fn two_resumable_priors_are_refused_naming_both_with_and_without_resume() {
+    for c in [cfg(), resume()] {
+        let fs = fake();
+        prior3(&fs, 5, OpState::Failed);
+        prior3(&fs, 6, OpState::Created);
+        let (r, _) = run_tree(&fs, &c);
+        assert_eq!(refused(&r.stop), (LockCode::ResumableOperationExists, false));
+        let d = detail(&r.stop);
+        for part in [id(5).as_str(), id(6).as_str(), "--resume needs exactly one"] {
+            assert!(d.contains(part), "{part}: {d}");
+        }
+        assert!(!fs.exists(LOCK));
+        assert_eq!(manifest(&fs, &id(5)).state, OpState::Failed);
+        assert_eq!(manifest(&fs, &id(6)).state, OpState::Created);
+    }
+}
+
+#[test]
+fn a_single_format_3_prior_without_resume_advertises_resume() {
+    let fs = fake();
+    prior3(&fs, 5, OpState::Failed);
+    let (r, _) = run_tree(&fs, &cfg());
+    assert_eq!(refused(&r.stop), (LockCode::ResumableOperationExists, false));
+    let d = detail(&r.stop);
+    assert!(d.contains("--resume to continue it") && d.contains("--restart"), "{d}");
+}
+
+#[test]
+fn a_format_1_or_2_prior_is_refused_with_the_older_version_messages() {
+    for version in [1_u64, 2] {
+        let stage = |fs: &FaultFs| {
+            if version == 1 {
+                prior(fs, 5, OpState::Failed);
+            } else {
+                prior(fs, 5, OpState::Failed);
+                let v2 = OperationState {
+                    state: OpState::Failed,
+                    ..OperationState::created_v2(&id(5), Kind::Tree, Path::new("/p/dest"), 1, None)
+                };
+                write_manifest(fs, &v2);
+            }
+        };
+        let fs = fake();
+        stage(&fs);
+        let (r, _) = run_tree(&fs, &cfg());
+        assert_eq!(refused(&r.stop), (LockCode::ResumableOperationExists, false));
+        let d = detail(&r.stop);
+        assert!(d.contains("created by an older version") && d.contains("--restart"), "{d}");
+        assert!(!d.contains("--resume to continue"), "{d}");
+        let fs = fake();
+        stage(&fs);
+        let before = fs.read_file(format!("/p/dest/.flux/operations/{}/manifest", id(5)));
+        let (r, _) = run_tree(&fs, &resume());
+        assert_eq!(refused(&r.stop), (LockCode::IncompatibleState, false));
+        let d = detail(&r.stop);
+        assert!(d.contains(&format!("format {version}")) && d.contains("--restart"), "{d}");
+        assert!(!fs.exists(LOCK));
+        assert_eq!(
+            fs.read_file(format!("/p/dest/.flux/operations/{}/manifest", id(5))),
+            before,
+            "untouched"
+        );
+    }
+}
+
+#[test]
+fn an_incompatible_option_is_refused_naming_it_and_nothing_changes() {
+    let fs = fake();
+    let mut p = prior3(&fs, 5, OpState::Failed);
+    drop(prior_store(&fs, 5));
+    let mut options = Options::of(&opts());
+    options.existing = "update".to_string();
+    p.config = Some(Config::new(p.config.unwrap().roots, options));
+    write_manifest(&fs, &p);
+    let (r, _) = run_tree(&fs, &resume());
+    assert_eq!(refused(&r.stop), (LockCode::IncompatibleState, false));
+    assert!(detail(&r.stop).starts_with("existing:"), "{}", detail(&r.stop));
+    assert_eq!(manifest(&fs, &id(5)), p);
+    assert!(!fs.exists(LOCK));
+    assert!(!fs.called("open_claim_store("), "validate comes before the store is opened");
+}
+
+#[test]
+fn durability_normal_to_strict_is_recorded_on_adoption() {
+    let strict = CopyOptions { durability: Durability::Strict, ..opts() };
+    let fs = fake();
+    prior3(&fs, 5, OpState::Failed);
+    drop(prior_store(&fs, 5));
+    // The first heartbeat and its retry fail: the copy aborts and the run records FAILED.
+    fail_heartbeat_with(&fs, Code::IoError);
+    let mut got = Vec::new();
+    let c = RunConfig { resume: true, ..beating() };
+    let r = tree(&fs, Path::new("/src"), Path::new("/p/dest"), &strict, &c, &mut |f| got.push(f));
+    adopted(&r, 5, Some(0));
+    let kept = manifest(&fs, &id(5));
+    assert_eq!(kept.state, OpState::Failed, "{:?} {:?}", r.stop, r.copy);
+    assert_eq!(kept.config.unwrap().options.durability, "strict");
+    // The reverse is refused with the spec's text.
+    let fs = fake();
+    prior3_with(&fs, 5, OpState::Failed, &strict);
+    drop(prior_store(&fs, 5));
+    let (r, _) = run_tree(&fs, &resume());
+    assert_eq!(refused(&r.stop), (LockCode::IncompatibleState, false));
+    assert_eq!(
+        detail(&r.stop),
+        "durability: the operation runs with strict durability; pass --durability strict"
+    );
+}
+
+#[test]
+fn a_mapping_mismatch_is_refused_and_strong_identities_decide() {
+    let edit = |fs: &FaultFs, f: &dyn Fn(&mut Root)| {
+        let mut p = prior3(fs, 5, OpState::Failed);
+        drop(prior_store(fs, 5));
+        let mut c = p.config.take().unwrap();
+        f(&mut c.roots[0]);
+        p.config = Some(c);
+        write_manifest(fs, &p);
+    };
+    // (a) another identity.
+    let fs = fake();
+    edit(&fs, &|r| r.source_identity = "strong:7:7".to_string());
+    let (r, _) = run_tree(&fs, &resume());
+    assert_eq!(refused(&r.stop), (LockCode::IncompatibleState, false));
+    assert!(detail(&r.stop).contains("source root"), "{}", detail(&r.stop));
+    // (b) another spelling of the same Strong identity.
+    let fs = fake();
+    edit(&fs, &|r| r.source_root = native_hex(Path::new("/elsewhere")));
+    let (r, _) = run_tree(&fs, &resume());
+    ok(&r);
+    adopted(&r, 5, Some(0));
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    // (c) a Weak identity: the path decides, and says so.
+    let fs = fake();
+    let weak = FileIdentity::Weak(ObjectId { volume: 9, index: 9 });
+    fs.set_identity("/src", weak);
+    edit(&fs, &|r| r.source_identity = identity_text(weak));
+    let (r, _) = run_tree(&fs, &resume());
+    adopted(&r, 5, Some(0));
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| matches!(w, RunWarning::ResumeMappingByPath(p) if p == Path::new("/src"))),
+        "{:?} {:?}",
+        r.warnings,
+        r.stop
+    );
+}
+
+#[test]
+fn a_tampered_fingerprint_is_state_corrupt_on_resume() {
+    let fs = fake();
+    let mut p = prior3(&fs, 5, OpState::Failed);
+    drop(prior_store(&fs, 5));
+    p.config.as_mut().unwrap().configuration_fingerprint = "0".repeat(64);
+    write_manifest(&fs, &p);
+    let (r, _) = run_tree(&fs, &resume());
+    assert_eq!(refused(&r.stop), (LockCode::StateCorrupt, false));
+    assert!(!fs.exists(LOCK));
+}
+
+/// The three ways a workspace has no usable `state.db`: absent, zero-length, garbage.
+fn break_store(fs: &FaultFs, how: u8) {
+    match how {
+        0 => {}
+        1 => fs.write_file(state_db(5), b""),
+        _ => fs.write_file(state_db(5), b"garbage"),
+    }
+}
+
+#[test]
+fn a_created_manifest_without_a_usable_state_db_resumes_with_a_fresh_store() {
+    for how in 0..3 {
+        let fs = fake();
+        prior3(&fs, 5, OpState::Created);
+        break_store(&fs, how);
+        let (r, _) = run_tree(&fs, &resume());
+        ok(&r);
+        adopted(&r, 5, Some(0));
+        let c = calls(&fs);
+        let open = at(&c, &format!("open_claim_store({})", state_db(5)));
+        let create = at(&c, &format!("create_claim_store({})", state_db(5)));
+        assert!(open < create, "{how}: {c:?}");
+        if how > 0 {
+            let removed = at(&c, &format!("remove_file({})", state_db(5)));
+            assert!(open < removed && removed < create, "{how}: {c:?}");
+        }
+    }
+}
+
+#[test]
+fn a_transferring_or_failed_manifest_without_a_usable_state_db_is_state_corrupt() {
+    for s in [OpState::Transferring, OpState::Failed] {
+        for how in 0..3 {
+            let fs = fake();
+            let p = prior3(&fs, 5, s);
+            break_store(&fs, how);
+            let (r, _) = run_tree(&fs, &resume());
+            assert_eq!(refused(&r.stop), (LockCode::StateCorrupt, false), "{s:?} {how}");
+            assert!(detail(&r.stop).contains("state.db"), "{}", detail(&r.stop));
+            assert!(!fs.exists(LOCK));
+            assert_eq!(manifest(&fs, &id(5)), p);
+            assert!(!fs.called("create_claim_store("));
+        }
+    }
+}
+
+#[test]
+fn an_incompatible_state_db_is_refused() {
+    let fs = fake();
+    prior3(&fs, 5, OpState::Failed);
+    drop(prior_store(&fs, 5));
+    fs.set_claim_store_format(state_db(5), 2);
+    let (r, _) = run_tree(&fs, &resume());
+    assert_eq!(refused(&r.stop), (LockCode::IncompatibleState, false));
+    assert!(detail(&r.stop).contains("state.db"), "{}", detail(&r.stop));
+    assert!(!fs.exists(LOCK));
+}
+
+#[test]
+fn a_state_db_that_cannot_be_opened_fails_the_run_at_the_state_step() {
+    let fs = fake();
+    prior3(&fs, 5, OpState::Failed);
+    drop(prior_store(&fs, 5));
+    fs.fail("open_claim_store", Code::PermissionDenied);
+    let (r, _) = run_tree(&fs, &resume());
+    let (step, path) = failed_at(&r.stop);
+    assert_eq!(step, RunStep::State);
+    assert!(path.ends_with("state.db"), "{path}");
+    assert!(!fs.exists(LOCK));
+}
+
+#[test]
+fn the_claim_count_is_reported_on_adoption() {
+    let fs = fake();
+    prior3(&fs, 5, OpState::Failed);
+    let mut store = prior_store(&fs, 5);
+    for name in ["x", "y"] {
+        let key = ClaimKey::new(ObjectId { volume: 1, index: 1 }, OsStr::new(name));
+        let rec = ClaimRecord {
+            target: FluxPathKey(name.as_bytes().to_vec()),
+            status: ClaimStatus::Created,
+        };
+        store.insert_if_absent(&key, &rec).unwrap();
+    }
+    store.flush().unwrap();
+    drop(store);
+    let (r, _) = run_tree(&fs, &resume());
+    adopted(&r, 5, Some(2));
+}
+
+#[test]
+fn a_resume_that_fails_before_transferring_can_be_resumed_again() {
+    let fs = fake();
+    prior3(&fs, 5, OpState::Failed);
+    drop(prior_store(&fs, 5));
+    // The TRANSFERRING write is the first `rename_replace`.
+    fs.fail_nth("rename_replace", 1, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let (r, _) = run_tree(&fs, &resume());
+    assert_eq!(failed_at(&r.stop).0, RunStep::State);
+    assert_eq!(manifest(&fs, &id(5)).state, OpState::Failed);
+    let (r, _) = run_tree(&fs, &resume());
+    ok(&r);
+    adopted(&r, 5, Some(0));
+}
+
+fn file_prior3(fs: &FaultFs, n: u8, source_identity: Option<&str>) -> OperationState {
+    let src = identity_text(fs.metadata(Path::new("/src/a")).unwrap().identity);
+    let shown = source_identity.map_or(src, str::to_string);
+    let fields = crate::state::FileFields {
+        artifact_type: crate::state::ARTIFACT_STATE.to_string(),
+        attempt_id: id(7),
+        artifact_generation: 1,
+        source_identity: shown.clone(),
+        target_identity: None,
+        target_path_key: crate::lock::site::hex(b"t"),
+        owner_instance_id: id(8),
+        boot_session_id: "boot".to_string(),
+        creation_wall_time: "1".to_string(),
+        last_heartbeat_wall_time: "1".to_string(),
+    };
+    let config = Config::new(
+        vec![Root {
+            source_root: native_hex(&absolute_lexical(Path::new("/src/a"))),
+            source_identity: shown,
+            destination_prefix: native_hex(Path::new("t")),
+        }],
+        Options::of(&opts()),
+    );
+    let state = OperationState {
+        state: OpState::Failed,
+        ..OperationState::created(&id(n), Kind::File, Path::new("/p/t"), 1, Some(fields), config)
+    };
+    fs.write_file(record_path(&id(n)), &state.encode());
+    state
+}
+
+#[test]
+fn a_single_file_resume_adopts_the_record_bumping_its_generation() {
+    let fs = fake();
+    file_prior3(&fs, 5, None);
+    let partial = format!("/p/t.flux-partial.{}", id(5));
+    fs.write_file(&partial, b"half");
+    let seen: Arc<Mutex<Option<OperationState>>> = Arc::default();
+    let keep = Arc::clone(&seen);
+    let rec = Arc::new(Mutex::new(None));
+    let keep_rec = Arc::clone(&rec);
+    // `create_new`: the TRANSFERRING record (1), then the copy's temporary (2).
+    fs.on_nth("create_new", 2, move |fs| {
+        *keep.lock().unwrap() = Some(file_record(fs, &id(5)));
+        *keep_rec.lock().unwrap() = fs.read_file(T_LOCK).map(|b| decode(&b));
+    });
+    let r = run_file(&fs, &resume());
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+    assert_eq!(
+        r.resumed,
+        Some(ResumeNote::Adopted { operation_id: id(5), claims: None }),
+        "no claim store for a single file"
+    );
+    let s = seen.lock().unwrap().clone().expect("read during the copy");
+    let f = s.file.expect("a single-file record");
+    assert_eq!((s.state, f.artifact_generation), (OpState::Transferring, 2));
+    assert!(crate::ids::is_id(&f.attempt_id) && f.attempt_id != id(7), "{}", f.attempt_id);
+    assert_eq!(f.owner_instance_id, id(0xee));
+    assert_eq!(f.creation_wall_time, "1");
+    let Some(Decoded::Record(lock)) = rec.lock().unwrap().clone() else {
+        panic!("the lock record during the copy")
+    };
+    assert_eq!(lock.operation_id, id(5));
+    let c = calls(&fs);
+    let removed = at(&c, &format!("remove_file({partial})"));
+    let created = at(&c, &format!("create_new({partial})"));
+    assert!(removed < created, "{c:?}");
+    assert_eq!(fs.read_file("/p/t").as_deref(), Some(&b"A"[..]));
+    assert!(!fs.exists(record_path(&id(5))) && !fs.exists(T_LOCK));
+}
+
+#[test]
+fn a_single_file_record_for_another_source_is_refused() {
+    let fs = fake();
+    let p = file_prior3(&fs, 5, Some("strong:7:7"));
+    let r = run_file(&fs, &resume());
+    assert_eq!(refused(&r.stop), (LockCode::IncompatibleState, false));
+    assert!(!fs.exists(T_LOCK));
+    assert_eq!(file_record(&fs, &id(5)), p, "untouched");
+}
+
+#[test]
+fn restart_still_supersedes_everything_and_ignores_resume_semantics() {
+    let fs = fake();
+    prior3(&fs, 5, OpState::Failed);
+    prior3(&fs, 6, OpState::Created);
+    let (r, _) = run_tree(&fs, &restart());
+    ok(&r);
+    assert_eq!(r.resumed, None);
+    let c = calls(&fs);
+    for n in [5, 6] {
+        assert!(
+            c.iter().any(|x| x.starts_with("rename_no_replace(")
+                && x.contains(&format!("operations/{} ", id(n)))),
+            "{n} retired: {c:?}"
+        );
+    }
+    assert!(!fs.exists("/p/dest/.flux") && !fs.exists(LOCK));
 }

@@ -58,6 +58,8 @@ pub struct RunConfig {
     pub before_mutation: Option<BeforeMutation>,
     /// §101: how often the run refreshes its lock record's heartbeat (cut 7b). The CLI passes `HEARTBEAT_INTERVAL`.
     pub heartbeat_interval: std::time::Duration,
+    /// `--resume`: continue the one resumable prior operation as itself.
+    pub resume: bool,
 }
 
 /// §101's heartbeat interval: 5 s.
@@ -73,6 +75,7 @@ impl std::fmt::Debug for RunConfig {
             .field("boot_session_id", &self.boot_session_id)
             .field("before_mutation", &self.before_mutation.is_some())
             .field("heartbeat_interval", &self.heartbeat_interval)
+            .field("resume", &self.resume)
             .finish()
     }
 }
@@ -85,6 +88,18 @@ pub struct Run<T> {
     pub copy: Option<T>,
     pub stop: Option<RunError>,
     pub warnings: Vec<RunWarning>,
+    /// Cut 9a: set once the run adopted or started under `--resume`; `None` without the flag or when the run stopped
+    /// before step 5.
+    pub resumed: Option<ResumeNote>,
+}
+
+/// What `--resume` did (cut 9a).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeNote {
+    /// `--resume` found no resumable prior: a new operation started.
+    StartedNew,
+    /// The prior adopted; `claims` is its claim count (a tree), `None` for a single file.
+    Adopted { operation_id: String, claims: Option<u64> },
 }
 
 /// Why the run stopped outside the copy.
@@ -163,7 +178,7 @@ pub fn tree<F: DestinationRoot>(
     cfg: &RunConfig,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> Run<Result<TreeOutcome, TreeAbort>> {
-    let mut run = Run { copy: None, stop: None, warnings: Vec::new() };
+    let mut run = Run { copy: None, stop: None, warnings: Vec::new(), resumed: None };
     let opts =
         CopyOptions { operation_id: OperationId::new(cfg.operation_id.as_str()), ..opts.clone() };
     let mut out = TreeOutcome::default();
@@ -221,15 +236,21 @@ pub fn tree<F: DestinationRoot>(
         operations: None,
         claims: None,
         durability: opts.durability,
+        src_root: src_root.to_path_buf(),
+        src_identity: source.identity,
     };
     // Steps 3-5 (and `--restart`): the lock, then this operation's state and the record naming it.
-    let locked = match open_operation(&site, capability, &mut place, cfg, &mut run.warnings) {
+    let locked = match open_operation(&site, capability, &mut place, cfg, &opts, &mut run.warnings)
+    {
         Ok(l) => l,
         Err(e) => {
             run.stop = Some(e);
             return run;
         }
     };
+    run.resumed = locked.resumed.clone();
+    // Cut 9a: under `--resume` the effective id is the prior's; the partials are named by it.
+    let opts = CopyOptions { operation_id: OperationId::new(&locked.state.operation_id), ..opts };
     // Step 6: the copy, with §99 before every destination mutation.
     let mut leftovers: Vec<PathBuf> = Vec::new();
     let guard = || {
@@ -330,7 +351,7 @@ pub fn file<F: DestinationRoot>(
     opts: &CopyOptions,
     cfg: &RunConfig,
 ) -> Run<Result<Outcome, CopyError>> {
-    let mut run = Run { copy: None, stop: None, warnings: Vec::new() };
+    let mut run = Run { copy: None, stop: None, warnings: Vec::new(), resumed: None };
     let opts =
         CopyOptions { operation_id: OperationId::new(cfg.operation_id.as_str()), ..opts.clone() };
     // B1.
@@ -378,15 +399,19 @@ pub fn file<F: DestinationRoot>(
         target: name.to_os_string(),
         destination: dst.to_path_buf(),
         source_identity,
+        src: src.to_path_buf(),
     };
     // Steps 3-5.
-    let locked = match open_operation(&site, capability, &mut place, cfg, &mut run.warnings) {
+    let locked = match open_operation(&site, capability, &mut place, cfg, &opts, &mut run.warnings)
+    {
         Ok(l) => l,
         Err(e) => {
             run.stop = Some(e);
             return run;
         }
     };
+    run.resumed = locked.resumed.clone();
+    let opts = CopyOptions { operation_id: OperationId::new(&locked.state.operation_id), ..opts };
     // Step 6, under §99.
     let copied = {
         let guard = || {

@@ -7,8 +7,8 @@ use crate::ids::is_id;
 use crate::lock::error::refuse;
 use crate::lock::{LockCode, LockError, LockResult};
 use crate::state::{
-    FLUX_DIR, Kind, MANIFEST, OPERATIONS_DIR, OperationState, RECORD_INFIX, RESERVED_DIRS,
-    Unusable, control_path_conflict, id_after, read_state, record_name,
+    FLUX_DIR, FORMAT_VERSION, Kind, MANIFEST, OPERATIONS_DIR, OperationState, RECORD_INFIX,
+    RESERVED_DIRS, Unusable, control_path_conflict, id_after, read_state, record_name,
 };
 use flux_fs::{Code, DirHandle, FileType};
 use std::ffi::OsStr;
@@ -148,18 +148,42 @@ pub fn scan_file<D: DirHandle>(
     Ok(scan)
 }
 
-/// `RESUMABLE_OPERATION_EXISTS` for `op`, naming it and the way out (the refusal-guidance table).
-pub fn resumable_refusal(op: &PriorOp) -> LockError {
-    refuse(
-        LockCode::ResumableOperationExists,
-        None,
-        format!(
-            "operation {} is {} ({}); run again with --restart to supersede it (its partials are deleted)",
+/// `RESUMABLE_OPERATION_EXISTS` for the resumable priors found (at least one), with the way out (cut 9a): `--resume`
+/// for exactly one at the current format, `--restart` otherwise.
+pub fn resumable_refusal(ops: &[PriorOp]) -> LockError {
+    let wipe = "(its partials and its recorded progress are deleted)";
+    let detail = match ops {
+        [op] if op.state.format_version >= FORMAT_VERSION => format!(
+            "operation {} is {} ({}); run again with --resume to continue it or --restart to supersede it {wipe}",
             op.state.operation_id,
             op.state.state.as_str(),
             op.shown.display()
         ),
-    )
+        [op] => format!(
+            "operation {} is {} ({}), created by an older version, so --resume cannot continue it; run again with --restart to supersede it {wipe}",
+            op.state.operation_id,
+            op.state.state.as_str(),
+            op.shown.display()
+        ),
+        _ => {
+            let named: Vec<String> = ops
+                .iter()
+                .map(|op| {
+                    format!(
+                        "{} ({}, {})",
+                        op.state.operation_id,
+                        op.state.state.as_str(),
+                        op.shown.display()
+                    )
+                })
+                .collect();
+            format!(
+                "operations {}; --resume needs exactly one; run again with --restart to supersede all of them (their partials and their recorded progress are deleted)",
+                named.join(", ")
+            )
+        }
+    };
+    refuse(LockCode::ResumableOperationExists, None, detail)
 }
 
 /// Step 2 of "The run": `DEST/.flux` and its reserved subdirectories, where they exist, are directories. Read-only: a
@@ -485,14 +509,34 @@ mod tests {
 
     #[test]
     fn a_resumable_refusal_names_the_operation_and_the_way_out() {
-        let op = PriorOp {
-            state: state(1, Kind::Tree, OpState::Failed),
-            shown: PathBuf::from("D/.flux/operations/x/manifest"),
+        let op = |n: u8, v: u64, s: OpState| {
+            let mut state = state(n, Kind::Tree, s);
+            state.format_version = v;
+            PriorOp { state, shown: PathBuf::from(format!("D/.flux/operations/{n}/manifest")) }
         };
-        let r = refusal::<()>(Err(resumable_refusal(&op)));
+        let detail = |ops: &[PriorOp]| refusal::<()>(Err(resumable_refusal(ops))).detail;
+        let r = refusal::<()>(Err(resumable_refusal(&[op(1, 3, OpState::Failed)])));
         assert_eq!(r.code, LockCode::ResumableOperationExists);
-        for part in [id(1).as_str(), "FAILED", "--restart", "manifest"] {
+        for part in [id(1).as_str(), "FAILED", "--resume to continue it", "--restart", "manifest"] {
             assert!(r.detail.contains(part), "{part}: {}", r.detail);
+        }
+        for v in [1, 2] {
+            let d = detail(&[op(1, v, OpState::Created)]);
+            for part in ["created by an older version", "--restart", "recorded progress"] {
+                assert!(d.contains(part), "{part}: {d}");
+            }
+            assert!(!d.contains("--resume to continue"), "{d}");
+        }
+        let d = detail(&[op(1, 3, OpState::Failed), op(2, 3, OpState::Transferring)]);
+        for part in [
+            id(1).as_str(),
+            id(2).as_str(),
+            "(FAILED, ",
+            "(TRANSFERRING, ",
+            "--resume needs exactly one",
+            "supersede all of them",
+        ] {
+            assert!(d.contains(part), "{part}: {d}");
         }
     }
 

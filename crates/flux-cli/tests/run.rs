@@ -201,12 +201,11 @@ fn a_killed_single_file_run_leaves_a_resumable_record_that_restart_supersedes() 
     let left = names(d.path());
     assert!(left.iter().any(|n| n.starts_with("t.flux-partial.")), "{left:?}");
     assert!(left.iter().any(|n| n.starts_with("t.flux-state.")), "{left:?}");
-    // Cut 7b: the record a REAL run left is version 2 and carries real identities (test audit A4).
+    // Cut 7b: the record a REAL run left is the current format and carries real identities (test audit A4).
     let record = left.iter().find(|n| n.starts_with("t.flux-state.")).unwrap();
     let state = flux_core::state::decode(&std::fs::read(d.path().join(record)).unwrap())
         .expect("the record decodes");
-    // until task 6 (cut 9a): a real run writes format 3 from then on
-    assert_eq!(state.format_version, flux_core::state::V2);
+    assert_eq!(state.format_version, flux_core::state::FORMAT_VERSION);
     let f = state.file.expect("a single-file record carries §249.1's fields");
     assert!(
         matches!(

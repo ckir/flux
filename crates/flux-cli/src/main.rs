@@ -138,6 +138,7 @@ fn run_config(args: &CopyArgs) -> RunConfig {
         boot_session_id: flux_platform::boot_session_id(),
         before_mutation: debug_hook(),
         heartbeat_interval: heartbeat_interval(),
+        resume: false,
     }
 }
 
