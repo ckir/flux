@@ -1,8 +1,6 @@
 //! Discovery (cut 9b): gathers the facts about every entry of one DEST without taking the lock, and classifies each
 //! with `status::classify`. Read-only: the one lock probe never writes and holds nothing afterwards.
 
-#![allow(dead_code, reason = "the report and the deletion pass (cut 9b tasks 4-5) consume this")]
-
 use super::status::{
     Age, Facts, LockProbe, LockRecordFacts, ManifestProblem, Subject, Thresholds, classify,
 };
@@ -13,8 +11,8 @@ use crate::lock::{LockError, LockSite, check_capability};
 use crate::prior::check_control_plane;
 use crate::run::place::{LocatedTree, locate_dest};
 use crate::state::{
-    CREATING_SUFFIX, FLUX_DIR, Kind, MANIFEST, OPERATIONS_DIR, REMOVING_SUFFIX, Unusable,
-    read_state,
+    CREATING_SUFFIX, FLUX_DIR, Kind, MANIFEST, OPERATIONS_DIR, OperationState, REMOVING_SUFFIX,
+    Unusable, read_state,
 };
 use flux_fs::{Code, DestinationRoot, DirHandle, FileType, FsError, LockCapability, LockFile};
 use std::ffi::{OsStr, OsString};
@@ -119,7 +117,7 @@ fn refused_by(e: LockError) -> Refused {
     }
 }
 
-fn thresholds(cfg: &CleanupConfig) -> Thresholds {
+pub(crate) fn thresholds(cfg: &CleanupConfig) -> Thresholds {
     Thresholds {
         retention_secs: cfg.retention.as_secs(),
         lease_secs: cfg.lease_threshold.as_secs(),
@@ -145,12 +143,13 @@ fn entry(kind: EntryKind, id: String, facts: Facts, t: &Thresholds) -> (Entry, F
     (row, facts)
 }
 
-/// What an operation's manifest says, and the manifest's age.
-fn manifest_of<D: DirHandle>(
+/// What an operation's manifest says, and the manifest's age; the whole record when it is usable. The deletion pass
+/// re-reads through this under the lock, so listing and deletion decide on the same reading rule.
+pub(crate) fn read_manifest<D: DirHandle>(
     workspace: &D,
     id: &str,
     now: u64,
-) -> (Result<crate::state::OpState, ManifestProblem>, Age) {
+) -> (Result<OperationState, ManifestProblem>, Age) {
     let name = OsStr::new(MANIFEST);
     let age = match workspace.metadata(name) {
         Ok(m) => age_of(now, m.modified),
@@ -167,14 +166,24 @@ fn manifest_of<D: DirHandle>(
         Ok(Ok(s)) if s.operation_id != id || s.kind != Kind::Tree => {
             Err(ManifestProblem::WrongOperation)
         }
-        Ok(Ok(s)) => Ok(s.state),
+        Ok(Ok(s)) => Ok(s),
     };
     (manifest, age)
 }
 
+/// `read_manifest`, keeping only the state.
+fn manifest_of<D: DirHandle>(
+    workspace: &D,
+    id: &str,
+    now: u64,
+) -> (Result<crate::state::OpState, ManifestProblem>, Age) {
+    let (manifest, age) = read_manifest(workspace, id, now);
+    (manifest.map(|s| s.state), age)
+}
+
 /// The directory `name` in `parent`: `None` when it is absent (or not a directory, which `check_control_plane`
 /// refuses before this is reached); any other failure is an error, never an empty listing.
-fn child_dir<D: DirHandle>(parent: &D, name: &str) -> flux_fs::Result<Option<D>> {
+pub(crate) fn child_dir<D: DirHandle>(parent: &D, name: &str) -> flux_fs::Result<Option<D>> {
     let name = OsStr::new(name);
     match parent.metadata(name) {
         Err(e) if e.source.kind() == ErrorKind::NotFound => Ok(None),

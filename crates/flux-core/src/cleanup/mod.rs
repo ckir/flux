@@ -1,9 +1,12 @@
 //! `flux cleanup` (cut 9b): removes what finished or dead operations left behind.
 
 use crate::state::OpState;
+use flux_fs::{DestinationRoot, FsError};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub mod artifacts;
+pub(crate) mod delete;
 pub mod discover;
 pub mod status;
 
@@ -90,4 +93,71 @@ pub struct Entry {
 pub struct Refused {
     pub code: &'static str,
     pub detail: String,
+}
+
+/// One thing the deletion pass did, or declined to do.
+#[derive(Debug)]
+pub enum Action {
+    Removed(PathBuf),
+    Kept { path: PathBuf, error: FsError },
+    Skipped { id: String, reason: String },
+}
+
+/// What `flux cleanup` found and did.
+#[derive(Debug, Default)]
+pub struct CleanupReport {
+    pub entries: Vec<Entry>,
+    pub actions: Vec<Action>,
+    pub listing_failed: Option<(PathBuf, FsError)>,
+    /// The pass lost the lock (`Fault`) at this path: exit 1.
+    pub lost: Option<(PathBuf, FsError)>,
+}
+
+/// The summary line's counts. `entries`, `eligible` and `skipped` count rows; `removed` and `kept` count action lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Summary {
+    pub entries: u64,
+    pub eligible: u64,
+    pub removed: u64,
+    pub kept: u64,
+    pub skipped: u64,
+}
+
+impl CleanupReport {
+    pub fn summary(&self) -> Summary {
+        let count =
+            |f: &dyn Fn(&Action) -> bool| self.actions.iter().filter(|a| f(a)).count() as u64;
+        Summary {
+            entries: self.entries.len() as u64,
+            eligible: self.entries.iter().filter(|e| e.eligible).count() as u64,
+            removed: count(&|a| matches!(a, Action::Removed(_))),
+            kept: count(&|a| matches!(a, Action::Kept { .. })),
+            skipped: count(&|a| matches!(a, Action::Skipped { .. })),
+        }
+    }
+
+    /// Exit 1 (decision 10): a deletion that was attempted failed, a directory could not be listed, or the lock was lost.
+    pub fn failed(&self) -> bool {
+        self.listing_failed.is_some()
+            || self.lost.is_some()
+            || self.actions.iter().any(|a| matches!(a, Action::Kept { .. }))
+    }
+}
+
+/// `flux cleanup DEST`: discover, classify, and unless `cfg.dry_run` run one deletion pass. `Err` is exit 3.
+pub fn cleanup<F: DestinationRoot>(
+    fs: &F,
+    dst_root: &Path,
+    cfg: &CleanupConfig,
+) -> Result<CleanupReport, Refused> {
+    let mut discovered = discover::discover(fs, dst_root, cfg)?;
+    let mut report = CleanupReport {
+        entries: discovered.entries.iter().map(|(entry, _)| entry.clone()).collect(),
+        listing_failed: discovered.listing_failed.take(),
+        ..CleanupReport::default()
+    };
+    if !cfg.dry_run {
+        delete::run_pass(fs, &discovered, cfg, &mut report);
+    }
+    Ok(report)
 }
