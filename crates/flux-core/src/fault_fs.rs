@@ -7,7 +7,7 @@
 use flux_fs::{
     ClaimKey, ClaimOutcome, ClaimRecord, ClaimStore, Code, DestinationRoot, DirEntry, DirHandle,
     Durability, FileHandle, FileSystem, FileType, FluxPathKey, FsError, LockCapability, LockFile,
-    Metadata, MountRoot, Perms, Result, check_component,
+    Metadata, MountRoot, Perms, PreparedRecord, RecoveryOp, Result, check_component,
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -216,6 +216,40 @@ impl ClaimStore for FakeClaimStore {
     fn flush(&mut self) -> Result<()> {
         self.record("claim_flush".to_string(), "claim_flush")
     }
+
+    fn supports_prepared(&self) -> bool {
+        false
+    }
+
+    fn prepare(&mut self, _key: &ClaimKey, _record: &PreparedRecord) -> Result<()> {
+        Err(unsupported())
+    }
+
+    fn commit_prepared(
+        &mut self,
+        _key: &ClaimKey,
+        _target: &FluxPathKey,
+        _planned: Option<&ClaimKey>,
+    ) -> Result<()> {
+        Err(unsupported())
+    }
+
+    fn discard_prepared(&mut self, _key: &ClaimKey) -> Result<()> {
+        Err(unsupported())
+    }
+
+    fn prepared(&self) -> Result<Vec<(ClaimKey, PreparedRecord)>> {
+        Ok(Vec::new())
+    }
+
+    fn apply_recovery(&mut self, _ops: &[RecoveryOp]) -> Result<()> {
+        Err(unsupported())
+    }
+}
+
+// Stub until the prepared-note surface lands here (cut 9c).
+fn unsupported() -> FsError {
+    FsError::new(Code::IoError, std::io::Error::from(std::io::ErrorKind::Unsupported))
 }
 
 /// One node in the `DirHandle` graph, addressed by an opaque id rather than by

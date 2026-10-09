@@ -6,7 +6,7 @@ use std::io;
 
 use flux_fs::{
     ClaimKey, ClaimOutcome, ClaimRecord, ClaimStatus, ClaimStore, Code, Durability, FluxPathKey,
-    FsError, Result,
+    FsError, PreparedRecord, RecoveryOp, Result,
 };
 use redb::{
     Builder, Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
@@ -226,6 +226,40 @@ impl ClaimStore for RedbClaimStore {
         let table = tx.open_table(CLAIMS).map_err(table_err)?;
         table.len().map_err(storage_err)
     }
+
+    fn supports_prepared(&self) -> bool {
+        false
+    }
+
+    fn prepare(&mut self, _key: &ClaimKey, _record: &PreparedRecord) -> Result<()> {
+        Err(unsupported())
+    }
+
+    fn commit_prepared(
+        &mut self,
+        _key: &ClaimKey,
+        _target: &FluxPathKey,
+        _planned: Option<&ClaimKey>,
+    ) -> Result<()> {
+        Err(unsupported())
+    }
+
+    fn discard_prepared(&mut self, _key: &ClaimKey) -> Result<()> {
+        Err(unsupported())
+    }
+
+    fn prepared(&self) -> Result<Vec<(ClaimKey, PreparedRecord)>> {
+        Ok(Vec::new())
+    }
+
+    fn apply_recovery(&mut self, _ops: &[RecoveryOp]) -> Result<()> {
+        Err(unsupported())
+    }
+}
+
+// Stub until the prepared-note surface lands here (cut 9c).
+fn unsupported() -> FsError {
+    FsError::new(Code::IoError, std::io::Error::from(std::io::ErrorKind::Unsupported))
 }
 
 #[cfg(test)]
