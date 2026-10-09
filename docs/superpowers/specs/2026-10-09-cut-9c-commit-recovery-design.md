@@ -4,7 +4,7 @@ Status: APPROVED by the owner (2026-10-09, including writer's rulings W1-W10), b
 (consults `.clavity/seams/cut9c-{scope,forks,negotiate-r1}.md`, replies in `.clavity/scratch/cut9c-scope/`) and approved by the owner on 2026-10-09;
 section "Writer's rulings" lists what the owner has not yet seen. Parent spec: `FLUX_FULL_UPDATED_SPEC_V16.md` (sections 119, 156-163, 170-178,
 180-184, 189, 193-194, 241.5, 249, 259.8, 55). Previous slices: `docs/superpowers/specs/2026-10-08-cut-9a-resume-design.md`,
-`docs/superpowers/specs/2026-10-08-cut-9b-cleanup-design.md`.
+`docs/superpowers/specs/2026-10-08-cut-9b-cleanup-design.md`; implemented by docs/superpowers/plans/2026-10-09-cut-9c-commit-recovery.md.
 
 ## Why this cut, and why it is not "the WAL"
 
@@ -191,7 +191,7 @@ W10. **Spec gaps found:** G2 to G5 and the 259.8 wording "may finalize the commi
 2. The crash-point matrix of section 180 for a Strict publication: after the source recheck and before `prepare`; after `prepare` and before the final
    heartbeat and guard; after the guard and before the rename (T present, D absent or the old object); after the rename and before `commit_prepared` (D holds R); after `commit_prepared`; each with the `link()`+`unlink()`
    fallback (both names present). Fault injection on the fake and real-redb end-to-end runs with hand-built states.
-3. All-or-nothing: two notes, one RENAMED and one UNCERTAIN: nothing is applied, the refusal is exit 3 and the store is byte-identical afterwards.
+3. All-or-nothing: two notes, one RENAMED and one UNCERTAIN: nothing is applied, the refusal is exit 3 and the store is logically identical afterwards (every claim, note and meta row unchanged; redb itself rewrites its file header on every open).
 4. Normal is unchanged: the same crash under Normal writes no note and resumes exactly as in 9a (a pinned test of the call log: no `prepare` call).
 5. `prepare` failing under Strict: the file fails before the rename, nothing is published, no note remains.
 6. Format: an older reader refuses a format-2 store; a format-2 store with an empty `prepared` table resumes as 9a; a format-1 store is adopted without notes.

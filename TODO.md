@@ -490,6 +490,27 @@ the spec's numbers, 9-10 were learned during execution).
 - [ ] A transient I/O error during the pass's re-read is reported as "changed since listing".
 - [ ] `--json` has no fields for a failed listing or a lost lock (the cause is on stderr only).
 
+## Cut 9c known limits
+
+1. Under `--durability=normal` nothing is recoverable beyond 9a: a kill loses up to 1000 batched claims and their files are re-copied by the existing-file
+   policy.
+2. A format-2 store cannot be resumed by a binary older than this cut (`INCOMPATIBLE_STATE`; `--restart` or the newer binary).
+3. A 9a or 9b operation resumed under 9c behaves as 9a (format 1, no notes).
+4. Strict pays one extra synced commit per published file (two instead of one).
+5. A note whose directory was renamed, replaced by a link or removed while the operation was down is UNCERTAIN or GONE by the matrix; the operator resolves it.
+6. Single-file operations have no commit recovery yet (the rule is in the amendment); the J1 sweep and the existing-file policy still apply to them.
+7. The walk is sequential today, so no other target can claim an entry between its `prepare` and its `commit_prepared`; a parallel walk must claim the
+   entry at `prepare` time (insert-if-absent), which the row's key already allows.
+8. `--restart` and `flux cleanup` never run commit recovery: they supersede or remove the operation, sweep its partials by id and never touch the
+   object a note leaves in doubt.
+9. The parent directory of an UNCERTAIN note may be on a case-insensitive filesystem under another spelling: the directory is opened by the recorded
+   spelling, so a different case reads as absent and the verdict is GONE or UNCERTAIN, never RENAMED.
+
+## Cut 9c debt
+
+- [ ] A test for a heartbeat failure after the note is written is missing.
+- [ ] The Normal path builds the note template needlessly.
+
 ## Scaffolding follow-ups
 
 - [ ] Run `lefthook install` in each clone (or add it to a bootstrap recipe)
