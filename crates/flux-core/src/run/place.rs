@@ -5,14 +5,17 @@
 use super::session::{Fault, Locked, checked, failed, from_lock};
 use super::sweep::sweep_partials;
 use super::{RunError, RunStep, RunWarning};
+use crate::cleanup::Action;
+use crate::cleanup::artifacts::remove_validated;
+use crate::cleanup::delete;
 use crate::copy::{CopyError, CopyStep, split_destination};
 use crate::lock::{LockCode, LockResult, Refusal};
 use crate::prior::{PriorOp, Scan, scan_file, scan_tree};
 use crate::state::{
     FLUX_DIR, Kind, MANIFEST, OPERATIONS_DIR, OpState, OperationState, PROBE, PROBE_TEMP, Root,
-    STATE_DB, absolute_lexical, begin_workspace, creating_name, identity_text, native_hex,
-    operations_dir, publish_workspace, record_name, remove_empty_control_dirs, remove_record,
-    retire_workspace, write_state,
+    STATE_DB, absolute_lexical, begin_workspace, creating_name, from_native_hex, identity_text,
+    native_hex, operations_dir, publish_workspace, record_name, remove_empty_control_dirs,
+    remove_record, retire_workspace, write_state,
 };
 use crate::tree::{TreeOutcome, containment, preflight, primitive_unavailable};
 use flux_fs::{
@@ -64,6 +67,22 @@ pub(crate) trait Place<D: DirHandle> {
     /// (`None` if there is none, `Unavailable` if it cannot be read). Read under the lock, as the state is made. `None`
     /// for a tree.
     fn file_identities(&self) -> Option<(FileIdentity, Option<FileIdentity>)>;
+    /// Cut 9b: finish `prior`'s recorded cleanup under this run's lock: its leftovers, then its state. `Ok(Some(n))`:
+    /// `n` leftovers removed and the state with them (a `PriorCleaned` warning is pushed); `Ok(None)`: something was
+    /// kept (a `PriorCleanupFailed` warning is pushed). Only losing the lock is an `Err`.
+    fn finish_completed(
+        &self,
+        prior: &PriorOp,
+        locked: &Locked<'_, D>,
+        warnings: &mut Vec<RunWarning>,
+    ) -> Result<Option<u64>, Fault>;
+    /// Cut 9b: remove one `<id>.creating` / `<id>.removing` directory; a tree only (a single file has none).
+    fn remove_debris(
+        &self,
+        name: &OsStr,
+        locked: &Locked<'_, D>,
+        warnings: &mut Vec<RunWarning>,
+    ) -> Result<(), Fault>;
     /// Cut 9a: the one root this run records (format 3 `roots`).
     fn roots(&self) -> Vec<Root>;
     /// Cut 9a: adopt a validated prior. A tree opens `operations/<id>/state.db` (`open_claim_store`), or, while
@@ -454,6 +473,60 @@ impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {
         retire_workspace(self.operations(), id).map_err(|e| (self.operations_shown().join(id), e))
     }
 
+    fn finish_completed(
+        &self,
+        prior: &PriorOp,
+        locked: &Locked<'_, F::Dir>,
+        warnings: &mut Vec<RunWarning>,
+    ) -> Result<Option<u64>, Fault> {
+        let dest = self.dest.as_ref().expect("DEST exists once this run's state does");
+        let mut actions = Vec::new();
+        let done = delete::finish_completed(
+            dest,
+            &self.dest_shown,
+            self.operations(),
+            &self.operations_shown(),
+            &prior.state,
+            &mut || checked(locked),
+            &mut actions,
+        )?;
+        let operation_id = prior.state.operation_id.clone();
+        match done {
+            Some(removed) => warnings.push(RunWarning::PriorCleaned { operation_id, removed }),
+            None => {
+                if let Some(Action::Kept { path, error }) =
+                    actions.into_iter().find(|a| matches!(a, Action::Kept { .. }))
+                {
+                    warnings.push(RunWarning::PriorCleanupFailed { operation_id, path, error });
+                }
+            }
+        }
+        Ok(done)
+    }
+
+    fn remove_debris(
+        &self,
+        name: &OsStr,
+        locked: &Locked<'_, F::Dir>,
+        warnings: &mut Vec<RunWarning>,
+    ) -> Result<(), Fault> {
+        let mut actions = Vec::new();
+        delete::remove_debris(
+            self.operations(),
+            &self.operations_shown(),
+            name,
+            &mut || checked(locked),
+            &mut actions,
+        )?;
+        if let Some(Action::Kept { path, error }) =
+            actions.into_iter().find(|a| matches!(a, Action::Kept { .. }))
+        {
+            let operation_id = name.to_string_lossy().into_owned();
+            warnings.push(RunWarning::PriorCleanupFailed { operation_id, path, error });
+        }
+        Ok(())
+    }
+
     fn remove_control_dirs(&mut self, rollback: bool) -> Result<(), (PathBuf, FsError)> {
         // Each handle closes before its directory is removed.
         self.operations = None;
@@ -606,6 +679,71 @@ impl<D: DirHandle> Place<D> for FilePlace<'_, D> {
 
     fn remove(&self, id: &str) -> Result<(), (PathBuf, FsError)> {
         remove_record(self.dir, &record_name(&self.target, id)).map_err(|e| (self.shown(id), e))
+    }
+
+    fn finish_completed(
+        &self,
+        prior: &PriorOp,
+        locked: &Locked<'_, D>,
+        warnings: &mut Vec<RunWarning>,
+    ) -> Result<Option<u64>, Fault> {
+        let id = prior.state.operation_id.as_str();
+        // Spec "Artifact rules": the only artifact of a single file is this target's own partial for the id.
+        let own = temp_path(Path::new(&self.target), &OperationId::new(id));
+        let hexes: &[String] =
+            prior.state.cleanup.as_ref().map_or(&[], |c| &c.cleanup_pending_artifacts);
+        let kept = |path: PathBuf, error: FsError, warnings: &mut Vec<RunWarning>| {
+            warnings.push(RunWarning::PriorCleanupFailed {
+                operation_id: id.to_string(),
+                path,
+                error,
+            });
+        };
+        // Every artifact is checked before anything is deleted: one stranger keeps the whole record.
+        for hex in hexes {
+            if from_native_hex(hex).as_deref() != Some(own.as_path()) {
+                let shown = from_native_hex(hex).unwrap_or_else(|| PathBuf::from(hex));
+                let error = FsError::new(
+                    Code::SafetyRejected,
+                    std::io::Error::other("not a recognized leftover"),
+                );
+                kept(self.dir_shown.join(shown), error, warnings);
+                return Ok(None);
+            }
+        }
+        let mut removed = 0;
+        for _ in hexes {
+            checked(locked)?;
+            // `AlreadyGone` converges a re-run after a kill (artifact rule 4).
+            match remove_validated(self.dir, &own) {
+                Ok(_) => removed += 1,
+                Err(error) => {
+                    kept(self.dir_shown.join(&own), error, warnings);
+                    return Ok(None);
+                }
+            }
+        }
+        checked(locked)?;
+        match remove_record(self.dir, &record_name(&self.target, id)) {
+            Ok(()) => {
+                warnings.push(RunWarning::PriorCleaned { operation_id: id.to_string(), removed });
+                Ok(Some(removed))
+            }
+            Err(error) => {
+                kept(prior.shown.clone(), error, warnings);
+                Ok(None)
+            }
+        }
+    }
+
+    fn remove_debris(
+        &self,
+        _name: &OsStr,
+        _locked: &Locked<'_, D>,
+        _warnings: &mut Vec<RunWarning>,
+    ) -> Result<(), Fault> {
+        // A single file has no workspace to leave debris.
+        Ok(())
     }
 
     fn remove_control_dirs(&mut self, _rollback: bool) -> Result<(), (PathBuf, FsError)> {

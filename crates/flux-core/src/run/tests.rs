@@ -3691,3 +3691,247 @@ fn a_resumed_skip_under_a_different_stored_spelling_registers_the_owner() {
     assert_eq!(code_of(&got[0]), Code::DestinationNamespaceCollision);
     assert!(why(&got[0]).contains("already wrote that destination entry"), "{}", why(&got[0]));
 }
+
+// Cut 9b Task 6: a copy finishes a COMPLETED prior's recorded cleanup and removes workspace debris.
+
+/// A COMPLETED prior tree operation `n` (version 2) naming `leftovers` (relative to `/p/dest`) as its pending artifacts.
+fn completed_prior(fs: &FaultFs, n: u8, leftovers: &[&str]) {
+    for d in ["/p/dest", "/p/dest/.flux", "/p/dest/.flux/operations"] {
+        if !fs.exists(d) {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+    }
+    fs.create_dir(Path::new(&format!("/p/dest/.flux/operations/{}", id(n)))).unwrap();
+    let state = OperationState {
+        state: OpState::Completed,
+        cleanup: Some(crate::state::Cleanup {
+            cleanup_pending: true,
+            cleanup_pending_artifacts: leftovers.iter().map(|l| native_hex(Path::new(l))).collect(),
+        }),
+        ..OperationState::created_v2(&id(n), Kind::Tree, Path::new("/p/dest"), 1, None)
+    };
+    fs.write_file(format!("/p/dest/.flux/operations/{}/manifest", id(n)), &state.encode());
+}
+
+fn leftover_of(n: u8) -> (String, String) {
+    let name = format!("a.flux-partial.{}", id(n));
+    (name.clone(), format!("/p/dest/{name}"))
+}
+
+#[test]
+fn a_copy_finishes_a_completed_priors_leftovers_and_notes_it() {
+    let fs = fake();
+    let (name, path) = leftover_of(5);
+    completed_prior(&fs, 5, &[&name]);
+    fs.write_file(&path, b"half");
+    let (r, _) = run_tree(&fs, &cfg());
+    ok(&r);
+    assert!(!fs.exists(&path), "the leftover is removed");
+    assert!(!fs.exists(format!("/p/dest/.flux/operations/{}", id(5))), "and the workspace");
+    assert!(
+        matches!(r.warnings.as_slice(),
+            [RunWarning::PriorCleaned { operation_id, removed: 1 }] if *operation_id == id(5)),
+        "{:?}",
+        r.warnings
+    );
+    let c = calls(&fs);
+    let record = at(&c, "write_at_start(");
+    let removal = at(&c, &format!("remove_file({path})"));
+    let transferring =
+        at(&c, &format!("rename_replace(/p/dest/.flux/operations/{ID}/manifest.tmp"));
+    assert!(record < removal && removal < transferring, "{c:?}");
+}
+
+#[test]
+fn a_prior_leftover_that_cannot_be_removed_warns_and_the_copy_succeeds() {
+    let fs = fake();
+    let (name, path) = leftover_of(5);
+    completed_prior(&fs, 5, &[&name]);
+    fs.write_file(&path, b"half");
+    // `remove_file`: the probe's removal of `noreplace-probe` (1), this run's CREATED write clearing its temporary (2),
+    // then the prior's leftover (3), which fails.
+    fs.fail_nth("remove_file", 3, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let (r, _) = run_tree(&fs, &cfg());
+    ok(&r);
+    let c = calls(&fs);
+    let removals: Vec<&String> = c.iter().filter(|x| x.starts_with("remove_file(")).collect();
+    assert!(
+        removals[2].contains("a.flux-partial"),
+        "the 3rd removal is the leftover: {removals:?}"
+    );
+    assert!(
+        matches!(r.warnings.as_slice(),
+            [RunWarning::PriorCleanupFailed { operation_id, path: p, .. }]
+                if *operation_id == id(5) && p.to_string_lossy().contains("a.flux-partial")),
+        "{:?}",
+        r.warnings
+    );
+    assert!(fs.exists(&path));
+    assert_eq!(manifest(&fs, &id(5)).state, OpState::Completed);
+}
+
+#[test]
+fn a_copy_removes_creating_and_removing_debris() {
+    let fs = fake();
+    prior(&fs, 9, OpState::Completed);
+    let ops = "/p/dest/.flux/operations";
+    fs.create_dir(Path::new(&format!("{ops}/{}.creating", id(2)))).unwrap();
+    fs.write_file(format!("{ops}/{}.creating/manifest.tmp", id(2)), b"half a manifest");
+    fs.create_dir(Path::new(&format!("{ops}/{}.removing", id(3)))).unwrap();
+    let (r, _) = run_tree(&fs, &cfg());
+    ok(&r);
+    assert!(!fs.exists(format!("{ops}/{}.creating", id(2))));
+    assert!(!fs.exists(format!("{ops}/{}.removing", id(3))));
+    assert!(
+        r.warnings.iter().all(|w| matches!(w, RunWarning::PriorCleaned { .. })),
+        "no warning for debris: {:?}",
+        r.warnings
+    );
+}
+
+#[test]
+fn debris_with_a_stranger_inside_is_kept_and_the_copy_succeeds() {
+    let fs = fake();
+    let ops = "/p/dest/.flux/operations";
+    for d in ["/p/dest", "/p/dest/.flux", ops] {
+        if !fs.exists(d) {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+    }
+    let debris = format!("{ops}/{}.creating", id(2));
+    fs.create_dir(Path::new(&debris)).unwrap();
+    fs.write_file(format!("{debris}/not-flux's"), b"a stranger");
+    let (r, _) = run_tree(&fs, &cfg());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert!(fs.exists(format!("{debris}/not-flux's")), "never emptied");
+}
+
+#[test]
+fn a_copy_leaves_abandoned_and_resumable_priors_to_cleanup() {
+    let fs = fake();
+    prior(&fs, 4, OpState::Abandoned);
+    let (r, _) = run_tree(&fs, &cfg());
+    ok(&r);
+    assert_eq!(manifest(&fs, &id(4)).state, OpState::Abandoned, "an ABANDONED prior stays");
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    // A FAILED prior still refuses, and the COMPLETED one beside it is not finished: the run refused at step 4.
+    let fs = fake();
+    prior(&fs, 5, OpState::Failed);
+    let (name, path) = leftover_of(6);
+    completed_prior(&fs, 6, &[&name]);
+    fs.write_file(&path, b"half");
+    let (r, _) = run_tree(&fs, &cfg());
+    assert_eq!(refused(&r.stop).0, LockCode::ResumableOperationExists);
+    assert!(fs.exists(&path), "nothing was cleaned");
+    assert_eq!(manifest(&fs, &id(6)).state, OpState::Completed);
+}
+
+#[test]
+fn prior_cleanup_runs_after_a_restart_supersede() {
+    let fs = fake();
+    prior(&fs, 5, OpState::Failed);
+    let (name, path) = leftover_of(6);
+    completed_prior(&fs, 6, &[&name]);
+    fs.write_file(&path, b"half");
+    let (r, _) = run_tree(&fs, &restart());
+    ok(&r);
+    assert!(!fs.exists(format!("/p/dest/.flux/operations/{}", id(5))));
+    assert!(!fs.exists(format!("/p/dest/.flux/operations/{}", id(6))));
+    assert!(!fs.exists(&path));
+    let c = calls(&fs);
+    let abandon =
+        at(&c, &format!("rename_replace(/p/dest/.flux/operations/{}/manifest.tmp", id(5)));
+    let removal = at(&c, &format!("remove_file({path})"));
+    assert!(abandon < removal, "{c:?}");
+}
+
+#[test]
+fn prior_cleanup_checks_ownership_before_each_removal() {
+    // Mutant: delete `checked(locked)` from the closure `TreePlace::finish_completed` passes (place.rs).
+    let fs = fake();
+    let (name, path) = leftover_of(5);
+    completed_prior(&fs, 5, &[&name]);
+    fs.write_file(&path, b"half");
+    let (r, _) = run_tree(&fs, &cfg());
+    ok(&r);
+    let c = calls(&fs);
+    let record = at(&c, "write_at_start(");
+    let removal = at(&c, &format!("remove_file({path})"));
+    let check = c[record..removal].iter().position(|x| x.starts_with(&format!("metadata({LOCK})")));
+    assert!(check.is_some(), "an ownership check sits between the record and the removal: {c:?}");
+}
+
+#[test]
+fn prior_cleanup_stops_the_run_once_ownership_is_lost() {
+    // Mutant: swallow the `Fault` from the prior's cleanup in `open_operation` (session.rs).
+    let fs = fake();
+    let (name, path) = leftover_of(5);
+    completed_prior(&fs, 5, &[&name]);
+    fs.write_file(&path, b"half");
+    // `remove_file`: the probe's (1), the CREATED write's temporary (2), then the leftover (3): the lock is taken over as
+    // it goes, so the check before the workspace's retirement fails.
+    fs.on_nth("remove_file", 3, |fs| fs.write_file(LOCK, b"another run's bytes"));
+    let (r, _) = run_tree(&fs, &cfg());
+    assert_eq!(refused(&r.stop), (LockCode::TargetLockBusy, true));
+    assert_eq!(manifest(&fs, &id(5)).state, OpState::Completed, "the workspace stays");
+}
+
+fn file_artifact_prior(fs: &FaultFs, n: u8, artifact: &str) {
+    let fields = crate::state::FileFields {
+        artifact_type: crate::state::ARTIFACT_STATE.to_string(),
+        attempt_id: id(7),
+        artifact_generation: 1,
+        source_identity: "strong:1:2".to_string(),
+        target_identity: Some("strong:1:3".to_string()),
+        target_path_key: crate::lock::site::hex(b"t"),
+        owner_instance_id: id(8),
+        boot_session_id: "boot".to_string(),
+        creation_wall_time: "1".to_string(),
+        last_heartbeat_wall_time: "1".to_string(),
+    };
+    let state = OperationState {
+        state: OpState::Completed,
+        cleanup: Some(crate::state::Cleanup {
+            cleanup_pending: true,
+            cleanup_pending_artifacts: vec![native_hex(Path::new(artifact))],
+        }),
+        ..OperationState::created_v2(&id(n), Kind::File, Path::new("/p/t"), 1, Some(fields))
+    };
+    fs.write_file(record_path(&id(n)), &state.encode());
+}
+
+#[test]
+fn a_single_file_copy_finishes_its_targets_completed_record() {
+    let fs = fake();
+    let own = format!("t.flux-partial.{}", id(5));
+    file_artifact_prior(&fs, 5, &own);
+    fs.write_file(format!("/p/{own}"), b"half");
+    let r = run_file(&fs, &cfg());
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+    assert!(!fs.exists(format!("/p/{own}")) && !fs.exists(record_path(&id(5))));
+    assert!(
+        matches!(r.warnings.as_slice(),
+            [RunWarning::PriorCleaned { operation_id, removed: 1 }] if *operation_id == id(5)),
+        "{:?}",
+        r.warnings
+    );
+}
+
+#[test]
+fn a_single_file_artifact_that_is_not_the_targets_own_partial_is_kept() {
+    // Mutant: drop the name comparison in `FilePlace::finish_completed` (place.rs).
+    let fs = fake();
+    let other = format!("u.flux-partial.{}", id(5));
+    file_artifact_prior(&fs, 5, &other);
+    fs.write_file(format!("/p/{other}"), b"another target's");
+    let r = run_file(&fs, &cfg());
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+    assert!(fs.exists(format!("/p/{other}")), "nothing is deleted");
+    assert!(fs.exists(record_path(&id(5))), "and the record stays");
+    assert!(
+        matches!(r.warnings.as_slice(),
+            [RunWarning::PriorCleanupFailed { operation_id, .. }] if *operation_id == id(5)),
+        "{:?}",
+        r.warnings
+    );
+}

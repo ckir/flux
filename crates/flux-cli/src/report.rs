@@ -358,6 +358,14 @@ pub fn run_warning_line(w: &RunWarning) -> String {
             "warning: the source root's identity could not confirm the mapping, so {} was matched by its path alone",
             p.display()
         ),
+        RunWarning::PriorCleaned { operation_id, removed } => format!(
+            "note: finished cleaning up the earlier operation {operation_id} ({removed} leftovers removed)"
+        ),
+        RunWarning::PriorCleanupFailed { operation_id, path, error } => format!(
+            "warning: could not finish the cleanup of the earlier operation {operation_id}: {}: {}",
+            path.display(),
+            error.source
+        ),
     }
 }
 
@@ -791,6 +799,27 @@ mod tests {
             format!(
                 "warning: the source root's identity could not confirm the mapping, so {} was matched by its path alone",
                 path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn prior_cleanup_lines_are_the_specs() {
+        // Mutant: swap the two arms' formats in `run_warning_line`.
+        let a = "0123456789abcdef0123456789abcdef".to_string();
+        assert_eq!(
+            run_warning_line(&RunWarning::PriorCleaned { operation_id: a.clone(), removed: 2 }),
+            format!("note: finished cleaning up the earlier operation {a} (2 leftovers removed)")
+        );
+        let error = FsError::new(Code::IoError, io("busy"));
+        assert_eq!(
+            run_warning_line(&RunWarning::PriorCleanupFailed {
+                operation_id: a.clone(),
+                path: PathBuf::from("X/the-path"),
+                error
+            }),
+            format!(
+                "warning: could not finish the cleanup of the earlier operation {a}: X/the-path: busy"
             )
         );
     }
