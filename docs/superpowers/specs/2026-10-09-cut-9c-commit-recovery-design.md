@@ -201,8 +201,17 @@ W10. **Spec gaps found:** G2 to G5 and the 259.8 wording "may finalize the commi
 10. No wedge: a rename (or guard) failing after `prepare` leaves no note; a note whose temporary is gone while D is the old Strong object is GONE and the
     file is redone; a replacement note with T present and a Weak D is NOT RENAMED; a no-replace note with T present and a Weak D is UNCERTAIN (the link
     fallback); a failed removal of the stray temp name in row 1 is a warning and the adoption succeeds.
-11. A hostile note (unknown version, trailing bytes, a `temp_name` that is not `<name>.flux-partial.<id>`, a `dir_path` whose resolved identity differs from
+11. A hostile note (unknown version, trailing bytes, a `temp_name` that is not `<planned_name or name>.flux-partial.<id>`, a `dir_path` whose resolved identity differs from
     the key's parent): UNCERTAIN, nothing touched.
+
+## Left to the plan (nothing here is undecided policy)
+
+- Whether `BeforePublish` is a ninth parameter of `copy_file_guarded` or part of a bundle with `before_create` (the contract above is fixed either way).
+- The names of the conformance cases and the fault keys of the fake store; the exact `RunWarning` variant for the stray-temp-name removal failure (it
+  reuses the `PartialKept` shape); the exact wording of the `recovered <k> interrupted publications` line (the number and the words are fixed).
+- The mapping of a failing recovery transaction (a store error during phase 2) to the adoption error table of 9a (`state_error`): a refusal when the
+  store is corrupt or incompatible, a `Failed` run otherwise, as for `count()`.
+- The order of tasks and the mutant list per task.
 
 ## Appendix: Amendment text for `FLUX_FULL_UPDATED_SPEC_V16.md`
 
