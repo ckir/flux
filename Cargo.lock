@@ -329,8 +329,12 @@ version = "0.10.0"
 dependencies = [
  "blake3",
  "criterion",
+ "flux-core",
+ "flux-fs",
+ "flux-platform",
  "serde",
  "serde_json",
+ "tempfile",
  "toml",
 ]
 
