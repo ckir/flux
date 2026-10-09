@@ -30,6 +30,46 @@ fn real_store_passes_the_conformance_suite_strict() {
 }
 
 #[test]
+fn real_store_passes_the_prepared_conformance_suite_normal() {
+    conformance::run_prepared_all(|| fresh(Durability::Normal));
+}
+
+#[test]
+fn real_store_passes_the_prepared_conformance_suite_strict() {
+    conformance::run_prepared_all(|| fresh(Durability::Strict));
+}
+
+#[test]
+fn a_fresh_store_is_format_2() {
+    let s = fresh(Durability::Strict);
+    assert_eq!(s.format(), 2);
+    assert!(s.supports_prepared());
+}
+
+#[test]
+fn note_commits_are_immediate_under_normal() {
+    let mut s = fresh(Durability::Normal);
+    let parent = ObjectId { volume: 1, index: 1 };
+    let note = flux_fs::PreparedRecord {
+        target: FluxPathKey(b"t".to_vec()),
+        temp_name: b"n.flux-partial.x".to_vec(),
+        identity: "strong:1:9".to_string(),
+        dir_path: String::new(),
+        name: b"n".to_vec(),
+        planned_name: Vec::new(),
+        replacement: false,
+    };
+    for i in 0u32..5 {
+        s.prepare(&ClaimKey::new(parent, OsStr::new(&format!("n{i}"))), &note).unwrap();
+        assert_eq!(s.unsynced(), 0);
+    }
+    assert_eq!(s.unsynced(), 0);
+    let rec = ClaimRecord { target: FluxPathKey(b"t".to_vec()), status: ClaimStatus::Existing };
+    s.insert_if_absent(&ClaimKey::new(parent, OsStr::new("c")), &rec).unwrap();
+    assert_eq!(s.unsynced(), 1);
+}
+
+#[test]
 fn strict_durability_never_accumulates_unsynced_commits() {
     let mut s = fresh(Durability::Strict);
     let parent = ObjectId { volume: 1, index: 1 };
@@ -118,21 +158,75 @@ mod open {
     const CLAIMS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("claims");
     const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 
-    #[test]
-    fn a_store_whose_format_is_not_1_is_incompatible_on_open() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
-        let file = OpenOptions::new().read(true).write(true).create_new(true).open(&path).unwrap();
+    const PREPARED: TableDefinition<&[u8], &[u8]> = TableDefinition::new("prepared");
+
+    fn build(path: &std::path::Path, format: u64, with_prepared: bool) {
+        let file = OpenOptions::new().read(true).write(true).create_new(true).open(path).unwrap();
         let db = Builder::new().create_file(file).unwrap();
         let tx = db.begin_write().unwrap();
         {
             tx.open_table(CLAIMS).unwrap();
+            if with_prepared {
+                tx.open_table(PREPARED).unwrap();
+            }
             let mut meta = tx.open_table(META).unwrap();
-            meta.insert("format", 2u64).unwrap();
+            meta.insert("format", format).unwrap();
         }
         tx.commit().unwrap();
-        drop(db);
+    }
+
+    #[test]
+    fn a_format_3_store_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        build(&path, 3, true);
         assert_eq!(open_err(&path).code, Code::IncompatibleState);
+    }
+
+    #[test]
+    fn a_format_2_store_without_a_prepared_table_is_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        build(&path, 2, false);
+        assert_eq!(open_err(&path).code, Code::StateCorrupt);
+    }
+
+    #[test]
+    fn a_format_1_store_opens_with_supports_prepared_false_and_refuses_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        build(&path, 1, false);
+        let mut s = RedbClaimStore::open_file(open_rw(&path), Durability::Strict).unwrap();
+        assert_eq!(s.format(), 1);
+        assert!(!s.supports_prepared());
+        let note = flux_fs::PreparedRecord {
+            target: FluxPathKey(b"t".to_vec()),
+            temp_name: b"x".to_vec(),
+            identity: "strong:1:9".to_string(),
+            dir_path: String::new(),
+            name: b"n".to_vec(),
+            planned_name: Vec::new(),
+            replacement: false,
+        };
+        assert_eq!(s.prepare(&key(0), &note).unwrap_err().code, Code::IncompatibleState);
+        assert_eq!(s.discard_prepared(&key(0)).unwrap_err().code, Code::IncompatibleState);
+        assert_eq!(
+            s.commit_prepared(&key(0), &rec().target, None).unwrap_err().code,
+            Code::IncompatibleState
+        );
+        assert_eq!(s.apply_recovery(&[]).unwrap_err().code, Code::IncompatibleState);
+        assert!(s.prepared().unwrap().is_empty());
+        assert_eq!(s.insert_if_absent(&key(1), &rec()).unwrap(), flux_fs::ClaimOutcome::Inserted);
+        drop(s);
+        // Never upgraded in place: meta.format is still 1 and no prepared table exists.
+        let db = redb::Database::open(&path).unwrap();
+        let tx = redb::ReadableDatabase::begin_read(&db).unwrap();
+        let meta = redb::ReadableTable::get(&tx.open_table(META).unwrap(), "format")
+            .unwrap()
+            .unwrap()
+            .value();
+        assert_eq!(meta, 1);
+        assert!(tx.open_table(PREPARED).is_err(), "no prepared table may appear");
     }
 
     #[test]

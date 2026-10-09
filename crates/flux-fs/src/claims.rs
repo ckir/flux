@@ -281,6 +281,21 @@ pub mod conformance {
         discard_prepared_is_idempotent(new_store());
         apply_recovery_applies_every_op_or_none(new_store());
         notes_and_claims_share_keys_but_not_tables(new_store());
+        prepared_lists_notes_in_claim_key_byte_order(new_store());
+    }
+
+    pub fn prepared_lists_notes_in_claim_key_byte_order<S: ClaimStore>(mut s: S) {
+        // Deliberately not in sorted order; the expected order is `ClaimKey::encode` bytes.
+        let inserted = [key(2, "a"), key(1, "c"), key(1, "a"), key(1, "b")];
+        for k in &inserted {
+            s.prepare(k, &note("t")).unwrap();
+        }
+        let want = vec![key(1, "a"), key(1, "b"), key(1, "c"), key(2, "a")];
+        let mut by_bytes = inserted.to_vec();
+        by_bytes.sort_by_key(|k| k.encode());
+        assert_eq!(by_bytes, want, "order: the expectation itself is the encode byte order");
+        let listed: Vec<ClaimKey> = s.prepared().unwrap().into_iter().map(|(k, _)| k).collect();
+        assert_eq!(listed, want, "order: prepared() lists notes in ClaimKey::encode byte order");
     }
 
     pub fn supports_prepared_is_true_for_a_fresh_store<S: ClaimStore>(s: S) {
@@ -396,6 +411,18 @@ pub mod conformance {
         assert!(listed.contains(&c), "recovery: the fresh note is still listed");
         assert!(s.get(&c).unwrap().is_none(), "recovery: no claim was added for it");
         assert_eq!(s.count().unwrap(), before, "recovery: no claim added");
+
+        // A Discard that PRECEDES the failing Commit must be rolled back with it.
+        let d = key(1, "d");
+        s.prepare(&d, &note("d")).unwrap();
+        let res = s.apply_recovery(&[
+            RecoveryOp::Discard { key: d.clone() },
+            RecoveryOp::Commit { key: f.clone(), target: tgt("f"), planned: None },
+        ]);
+        assert!(res.is_err(), "recovery: a foreign claim fails a batch that starts with a discard");
+        let listed: Vec<ClaimKey> = s.prepared().unwrap().into_iter().map(|(k, _)| k).collect();
+        assert!(listed.contains(&d), "recovery: the earlier discard was rolled back");
+        assert!(listed.contains(&f), "recovery: the foreign note is still listed");
     }
 
     pub fn notes_and_claims_share_keys_but_not_tables<S: ClaimStore>(mut s: S) {
