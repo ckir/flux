@@ -91,7 +91,13 @@ fn probe_with_workspace<D: DirHandle>(
             None,
         ));
     };
-    let missing = site.workspace(&record).map_err(io_failure)? == Workspace::Missing;
+    let workspace = site.workspace(&record).map_err(io_failure)?;
+    // A free lock whose record names a workspace Flux does not trust is a lock a copy refuses
+    // (ARTIFACT_OWNERSHIP_UNCERTAIN): it must show as a row, so it reads as unreadable (row 13).
+    if free && workspace == Workspace::Untrusted {
+        return Ok((LockProbe::Unreadable, None));
+    }
+    let missing = workspace == Workspace::Missing;
     let probe = if free {
         LockProbe::Free {
             record: Some(LockRecordFacts {
@@ -166,6 +172,18 @@ fn manifest_of<D: DirHandle>(
     (manifest, age)
 }
 
+/// The directory `name` in `parent`: `None` when it is absent (or not a directory, which `check_control_plane`
+/// refuses before this is reached); any other failure is an error, never an empty listing.
+fn child_dir<D: DirHandle>(parent: &D, name: &str) -> flux_fs::Result<Option<D>> {
+    let name = OsStr::new(name);
+    match parent.metadata(name) {
+        Err(e) if e.source.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+        Ok(m) if m.file_type == FileType::Dir => parent.open_dir(name).map(Some),
+        Ok(_) => Ok(None),
+    }
+}
+
 /// Gathers and classifies every entry of the DEST at `dst_root`. Lock-free: one probe of each lock file, nothing
 /// written. A refusal means nothing was examined.
 pub(crate) fn discover<F: DestinationRoot>(
@@ -203,14 +221,20 @@ pub(crate) fn discover<F: DestinationRoot>(
     // The operations listing: an absent `.flux` or `operations/` is an empty one.
     if let Some(dest) = &located.dest {
         let operations_shown = dst_root.join(FLUX_DIR).join(OPERATIONS_DIR);
-        let operations = dest
-            .metadata(OsStr::new(FLUX_DIR))
-            .ok()
-            .and_then(|_| dest.open_dir(OsStr::new(FLUX_DIR)).ok())
-            .and_then(|flux| {
-                flux.metadata(OsStr::new(OPERATIONS_DIR)).ok()?;
-                flux.open_dir(OsStr::new(OPERATIONS_DIR)).ok()
-            });
+        let operations = match child_dir(dest, FLUX_DIR) {
+            Ok(Some(flux)) => match child_dir(&flux, OPERATIONS_DIR) {
+                Ok(found) => found,
+                Err(e) => {
+                    listing_failed = Some((operations_shown.clone(), e));
+                    None
+                }
+            },
+            Ok(None) => None,
+            Err(e) => {
+                listing_failed = Some((dst_root.join(FLUX_DIR), e));
+                None
+            }
+        };
         if let Some(operations) = operations {
             match operations.read_dir() {
                 Err(e) => listing_failed = Some((operations_shown.clone(), e)),
@@ -580,32 +604,109 @@ mod tests {
         assert!(found.listing_failed.is_none());
     }
 
+    /// A fake with a dead, decodable lock beside DEST, so a probe made before a refusal would call `try_lock`.
+    fn with_dead_lock() -> FaultFs {
+        let (fs, d) = fake();
+        put_lock(&d, "dest.flux-lock", 1, &format!("operations/{}", id(1)), NOW - 60 * SEC);
+        fs
+    }
+
+    fn probed_after(fs: &FaultFs, from: usize) -> bool {
+        fs.calls()[from..].iter().any(|c| c.starts_with("try_lock("))
+    }
+
     #[test]
     fn refusals_before_any_probe() {
-        let (fs, d) = setup();
-        put_lock(&d, "dest.flux-lock", 1, &format!("operations/{}", id(1)), NOW - 60 * SEC);
-        let baseline = try_locks(&fs);
         // DEST is a file.
-        let (file_fs, _d) = fake();
-        file_fs.write_file("/p/dest", b"x");
-        let r = refused(run(&file_fs, &cfg()));
-        assert_eq!(r.code, "DESTINATION_ERROR");
-        assert_eq!(try_locks(&file_fs), 0);
+        let fs = with_dead_lock();
+        fs.write_file("/p/dest", b"x");
+        let from = fs.calls().len();
+        assert_eq!(refused(run(&fs, &cfg())).code, "DESTINATION_ERROR");
+        assert!(!probed_after(&fs, from), "{:?}", fs.calls());
+        // A symlink at DEST.
+        let fs = with_dead_lock();
+        fs.add_symlink("/p/dest");
+        let from = fs.calls().len();
+        assert_eq!(refused(run(&fs, &cfg())).code, "SAFETY_REJECTED");
+        assert!(!probed_after(&fs, from), "{:?}", fs.calls());
         // DEST/.flux is a file.
+        let fs = with_dead_lock();
+        fs.create_dir(Path::new("/p/dest")).unwrap();
         fs.write_file("/p/dest/.flux", b"x");
-        let r = refused(run(&fs, &cfg()));
-        assert_eq!(r.code, "CONTROL_PLANE_NAMESPACE_CONFLICT");
-        assert_eq!(try_locks(&fs), baseline);
+        let from = fs.calls().len();
+        assert_eq!(refused(run(&fs, &cfg())).code, "CONTROL_PLANE_NAMESPACE_CONFLICT");
+        assert!(!probed_after(&fs, from), "{:?}", fs.calls());
         // A lock capability that does not allow exclusivity.
+        for capability in [LockCapability::RemoteUnverified, LockCapability::Unsupported] {
+            let fs = with_dead_lock();
+            fs.create_dir(Path::new("/p/dest")).unwrap();
+            fs.set_lock_capability(capability);
+            let from = fs.calls().len();
+            assert_eq!(refused(run(&fs, &cfg())).code, "REMOTE_LOCK_UNSAFE", "{capability:?}");
+            assert!(!probed_after(&fs, from), "{capability:?} {:?}", fs.calls());
+        }
+    }
+
+    #[test]
+    fn the_record_is_read_before_the_lock_is_tried() {
         let (fs, d) = setup();
         put_lock(&d, "dest.flux-lock", 1, &format!("operations/{}", id(1)), NOW - 60 * SEC);
-        let baseline = try_locks(&fs);
-        for capability in [LockCapability::RemoteUnverified, LockCapability::Unsupported] {
-            fs.set_lock_capability(capability);
-            let r = refused(run(&fs, &cfg()));
-            assert_eq!(r.code, "REMOTE_LOCK_UNSAFE", "{capability:?}");
-            assert_eq!(try_locks(&fs), baseline);
+        let from = fs.calls().len();
+        probe_lock(&d, OsStr::new("dest.flux-lock"), &site(&d), NOW).unwrap();
+        let calls = &fs.calls()[from..];
+        let at = |p: &str| calls.iter().position(|c| c.starts_with(p)).unwrap();
+        assert!(at("read_all(") < at("try_lock("), "{calls:?}");
+    }
+
+    #[test]
+    fn an_untrusted_workspace_path_is_an_uncertain_root_lock_row() {
+        for force in [false, true] {
+            let (fs, d) = setup();
+            put_lock(&d, "dest.flux-lock", 1, "garbage", NOW - 600 * SEC);
+            let found = run(&fs, &CleanupConfig { force, ..cfg() }).unwrap();
+            assert_eq!(
+                summary(&found),
+                vec![(EntryKind::RootLock, "dest.flux-lock".to_string(), Status::Uncertain)]
+            );
+            assert!(!found.entries[0].0.eligible);
         }
+    }
+
+    #[test]
+    fn an_unreadable_flux_dir_is_a_failed_listing_not_an_empty_one() {
+        let build = || {
+            let (fs, d) = setup();
+            ops_dir(&fs);
+            put_lock(&d, "dest.flux-lock", 9, &format!("operations/{}", id(9)), NOW - 60 * SEC);
+            fs
+        };
+        // Which `metadata` call is discovery's own look at `.flux`: the last one at that path.
+        let probe = build();
+        run(&probe, &cfg()).unwrap();
+        let n = probe
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("metadata("))
+            .enumerate()
+            .filter(|(_, c)| c.as_str() == "metadata(/p/dest/.flux)")
+            .map(|(i, _)| i + 1)
+            .last()
+            .unwrap();
+        let fs = build();
+        fs.fail_nth(
+            "metadata",
+            n as u32,
+            Code::PermissionDenied,
+            std::io::ErrorKind::PermissionDenied,
+        );
+        let found = run(&fs, &cfg()).unwrap();
+        let (path, error) = found.listing_failed.as_ref().expect("reported, not swallowed");
+        assert!(path.ends_with(".flux"), "{path:?}");
+        assert_eq!(error.code, Code::PermissionDenied);
+        assert_eq!(
+            summary(&found),
+            vec![(EntryKind::RootLock, "dest.flux-lock".to_string(), Status::Stale)]
+        );
     }
 
     #[test]
