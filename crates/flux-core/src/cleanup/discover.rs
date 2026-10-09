@@ -429,8 +429,13 @@ mod tests {
         found.entries.iter().map(|(e, _)| (e.kind, e.id.clone(), e.status)).collect()
     }
 
+    /// The fake's call log with `\` folded to `/`, so assertions hold on Windows too.
+    fn calls(fs: &FaultFs) -> Vec<String> {
+        fs.calls().iter().map(|c| c.replace('\\', "/")).collect()
+    }
+
     fn try_locks(fs: &FaultFs) -> usize {
-        fs.calls().iter().filter(|c| c.starts_with("try_lock(")).count()
+        calls(fs).iter().filter(|c| c.starts_with("try_lock(")).count()
     }
 
     fn site(d: &FakeDirHandle) -> LockSite<'_, FakeDirHandle> {
@@ -475,7 +480,7 @@ mod tests {
             }
         );
         assert_eq!(try_locks(&fs) - before, 1);
-        let all_calls = fs.calls();
+        let all_calls = calls(&fs);
         let probe_calls = &all_calls[calls_before..];
         assert!(
             probe_calls.iter().all(|c| ["open_lock(", "read_all(", "try_lock(", "metadata("]
@@ -612,7 +617,7 @@ mod tests {
     }
 
     fn probed_after(fs: &FaultFs, from: usize) -> bool {
-        fs.calls()[from..].iter().any(|c| c.starts_with("try_lock("))
+        calls(fs)[from..].iter().any(|c| c.starts_with("try_lock("))
     }
 
     #[test]
@@ -653,7 +658,7 @@ mod tests {
         put_lock(&d, "dest.flux-lock", 1, &format!("operations/{}", id(1)), NOW - 60 * SEC);
         let from = fs.calls().len();
         probe_lock(&d, OsStr::new("dest.flux-lock"), &site(&d), NOW).unwrap();
-        let calls = &fs.calls()[from..];
+        let calls = &calls(&fs)[from..];
         let at = |p: &str| calls.iter().position(|c| c.starts_with(p)).unwrap();
         assert!(at("read_all(") < at("try_lock("), "{calls:?}");
     }
@@ -683,8 +688,7 @@ mod tests {
         // Which `metadata` call is discovery's own look at `.flux`: the last one at that path.
         let probe = build();
         run(&probe, &cfg()).unwrap();
-        let n = probe
-            .calls()
+        let n = calls(&probe)
             .iter()
             .filter(|c| c.starts_with("metadata("))
             .enumerate()

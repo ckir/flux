@@ -101,6 +101,11 @@ mod tests {
     use crate::state::native_hex;
     use flux_fs::{DestinationRoot, FileSystem};
 
+    /// The fake's call log with `\` folded to `/`, so assertions hold on Windows too.
+    fn calls(fs: &FaultFs) -> Vec<String> {
+        fs.calls().iter().map(|c| c.replace('\\', "/")).collect()
+    }
+
     const ID: &str = "0123456789abcdef0123456789abcdef";
     const OTHER: &str = "fedcba9876543210fedcba9876543210";
 
@@ -175,11 +180,11 @@ mod tests {
         assert_eq!(remove_validated(&dest, &rel).unwrap(), Removed::AlreadyGone);
 
         // The fake records `open_dir` as the `metadata` of the directory it opens.
-        let calls = fs.calls();
+        let calls = calls(&fs);
         let opened = calls.iter().position(|c| c == "metadata(/dest/sub)").expect("sub opened");
         let removed = calls
             .iter()
-            .position(|c| *c == format!("remove_file({})", file.display()))
+            .position(|c| *c == format!("remove_file({})", file.display()).replace('\\', "/"))
             .expect("leaf removed");
         assert!(opened < removed, "{calls:?}");
         // A name that vanishes between the `metadata` and the `remove_file` is also `AlreadyGone`.
