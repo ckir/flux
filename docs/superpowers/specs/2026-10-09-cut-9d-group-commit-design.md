@@ -69,6 +69,11 @@ own durable note first.
    names differ only by case, onto a case-folding destination, are today resolved in order: the second sees the first. The batch keeps that by
    tracking the folded names (ASCII fold, the same fold `reserved_path` uses) of the pending entries per frame, and flushing before it would stage a
    second entry with the same fold. A pending fresh-directory entry cannot collide with anything else on disk.
+   The ASCII fold is a cheap pre-check, not the guarantee: a destination may fold more than ASCII (`É`/`é`, and on some systems more). The
+   backstop that does not depend on any fold table: if `stage_file`'s exclusive create fails with `AlreadyExists` while the frame has pending
+   entries, the frame's batch is flushed and the stage is retried ONCE (the earlier name is then published, so the retry meets the collision exactly
+   where an unbatched copy does, at `rename_no_replace`, and gets its `DestinationNamespaceCollision` classification). The temporaries are named
+   `<name>.flux-partial.<operation id>` (copy.rs `temp_name`), so two such names also collide as temporaries, which is why the create is where it shows.
 7. **Failure isolation = cut 9c's, by falling back to the per-file path.** If `prepare_many` errs, nothing was written (all-or-nothing). The flush
    then retries each entry on its own through the existing `prepare` (one commit each), so a store error is attributed to the files it actually
    hits, exactly as in cut 9c, and an entry whose own `prepare` fails is discarded and reported at `CopyStep::Claim`. If the `apply_recovery` commit errs, nothing
@@ -126,7 +131,10 @@ format and `meta.format` 2, and every Normal-durability behaviour. A Strict sing
   the same final state as an unbatched run; fault-injected through `FaultFs` (a failing rename at entry j; a failing `apply_recovery`) and one real
   kill-and-resume e2e.
 - Equivalence: the same tree copied with batching on (default) and off (`BATCH_FILES = 1`, a test seam) yields the same destination bytes, the
-  same claims and the same report.
+  same claims and the same report, AND the counting store's call log differs as the design says (on: `ceil(N / 64)` `prepare_many` calls and no
+  per-file `prepare`; off: N per-file `prepare` calls and no `prepare_many`), so an implementation that ignores the seam fails the test.
+- Non-ASCII fold collision (reasoned, not measured: no case-folding filesystem on the dev box): a FaultFs destination that folds `É`/`é` and
+  fails the second exclusive create with `AlreadyExists`; the copy flushes, retries, and reports `DestinationNamespaceCollision` for the second file.
 - Existing tests that depend on the old order (decision 11) are listed in the plan and re-derived, not loosened.
 
 ## Measurement (acceptance)
@@ -196,3 +204,8 @@ Panel round 3 (2026-10-09; reply `.clavity/scratch/cut9d-panel/r3-reply.md`, com
   "completely defeats the batching benefit", is overstated: a replaced file goes from 4 syncs to 2.
 - FOLDED: decision 11 names the Strict stall (index 606) of the claim-count test as the affected one. REJECTED in part: agy's index 303 is the
   test's first run under the default (Normal) policy, which does not batch (run.rs:727), so it does not move.
+
+Panel round 4 (2026-10-09; reply `.clavity/scratch/cut9d-panel/r4-reply.md`; every seat "no new findings", the Crash-Window Cartographer found no
+wrong or undecidable pair; two answers to open questions were findings).
+- FOLDED: the non-ASCII fold gap and its backstop (agy's answer to question 2; reasoned, flagged so in Tests).
+- FOLDED: the equivalence test also asserts the store-call log (agy's answer to question 3).
