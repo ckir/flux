@@ -416,7 +416,7 @@ Revision history:
         checks supersession before cancellation and writes `PAUSED` only
         over `TRANSFERRING` (Sections 99, 120, 259.6).
     121. A target's created-entry claim is written in the same durable
-        transaction as its `COMMIT` record (Sections 182, 183, 241.5).
+        transaction as its commit record (Sections 182.1, 183, 241.5).
 
     V16 adds acceptance tests 31--146 to Section 259.14.
 
@@ -2889,8 +2889,8 @@ Exit codes (normative):
    whole because of the state of the destination, a prior operation, or
    the platform (for example TARGET_LOCK_BUSY, OPERATION_LOCKED,
    TARGET_LOCK_UNCERTAIN, LEASE_AGE_UNCERTAIN, RESUMABLE_OPERATION_EXISTS,
-   INCOMPATIBLE_STATE, STATE_CORRUPT, REMOTE_LOCK_UNSAFE, or
-   SAFETY_REJECTED from the containment check of Section 129), and
+   INCOMPATIBLE_STATE, STATE_CORRUPT, REMOTE_LOCK_UNSAFE,
+   COMMIT_STATE_UNCERTAIN, or SAFETY_REJECTED from the containment check of Section 129), and
    nothing was changed
 ```
 
@@ -5725,6 +5725,10 @@ DEST/
             └── lock
 ```
 
+The `wal/` and `checkpoints/` directories are created only by a slice
+that writes them (a WAL file, chunk checkpoints); a workspace without
+them is valid.
+
 The exact on-disk database format is implementation-defined but must be
 versioned.
 
@@ -7997,7 +8001,9 @@ Anything after that boundary remains replayable.
 # 178. WAL Rotation
 
 Large WALs must be rotated into segments, stored in the operation
-workspace's `wal/` directory.
+workspace's `wal/` directory. The directory is created only by the
+slice that writes a WAL file (chunk checkpoints); a workspace without it
+is valid.
 
 Example:
 
@@ -8137,6 +8143,30 @@ flush WAL
 The exact optimization may collapse records, but recovery semantics must
 remain equivalent.
 
+**182.1 Collapsed commit record.** A tree publication under
+`--durability=strict` records PREPARE_COMMIT and COMMIT as one `prepared`
+row in the operation's claim store (`state.db`): the row is written and
+synced before the rename and is replaced by the target's `Created` claim
+in the same transaction after it. Recovery semantics are those of Section
+183. Under `--durability=normal` no commit record is written and Section
+183 does not apply: the existing-file policy reconciles a published but
+unclaimed file. A single-file operation follows the same rule with a
+`commit` field in its adjacent state record. An append-only WAL file is
+required only for the record kinds that need it (chunk checkpoints,
+Section 158).
+
+**182.2 Resolved gaps.**
+
+- G2: the commit record and the claim are rows of one redb file, so "the
+  same durable transaction" is literal.
+- G3: the publications that get a commit record are the tree
+  publications of a `--durability=strict` run.
+- G4: a crashed publication leaves its `prepared` row; an `Existing`
+  claim of a replacement stays blocking, as 241.5 says ("never
+  released").
+- G5: the record is the row of decision 5; the WAL record-type list
+  (Section 224) is not a closed list for this cut and stays "conceptual".
+
 ------------------------------------------------------------------------
 
 # 183. Commit Recovery
@@ -8167,6 +8197,13 @@ rename did not occur
 
 It must never assume either outcome solely from the presence of
 `PREPARE_COMMIT`.
+
+Recovery classifies every `prepared` row first and applies the outcomes
+only if none is undecidable; it finalizes (writes the claim, removes the
+row) exactly when the evidence of Section 259.8 establishes the rename,
+discards the row when it establishes that no rename happened or that no
+object of the operation exists at either name, and otherwise refuses with
+COMMIT_STATE_UNCERTAIN.
 
 ------------------------------------------------------------------------
 
@@ -8397,6 +8434,9 @@ checkpoint_format = 2
 
 A future Flux release must be able to reject incompatible formats
 cleanly.
+
+The claim store (`state.db`) carries its own format number
+(`meta.format`), independent of the manifest's.
 
 No heuristic parsing of unknown formats is permitted.
 
@@ -10842,8 +10882,8 @@ not take (Section 97). It happens at publication:
     bytes as the filesystem reports them), the claiming target's `FluxPathKey` (Section 103), and whether it claims an
     existing entry or one this operation created. Claims are looked up in `state.db`, never held wholesale in memory
     (the resident-memory bound of Section 10.1 applies). A target's created-entry claim is written in the same
-    durable transaction as its `COMMIT` record (Section 182), so a committed target always has its claim. Recovery
-    of a `PREPARE_COMMIT` without `COMMIT` that finds the rename happened (Section 183) writes both, before any other
+    durable transaction as its commit record (Section 182.1), so a committed target always has its claim. Recovery
+    of a `prepared` row (a `PREPARE_COMMIT` without `COMMIT`) that finds the rename happened (Section 183) writes both, before any other
     target is planned or published. A dependent hardlink member whose name maps to a different directory
     entry from its canonical member never collides with the group's claims; one that the destination folds onto the
     same entry (the example below) is a collision like any other and is reported `DESTINATION_NAMESPACE_COLLISION`,
@@ -13028,7 +13068,7 @@ lock ownership
 filesystem namespace observation
 ```
 
-If the evidence uniquely establishes the intended publication, recovery may finalize the commit.
+If the evidence uniquely establishes the intended publication, recovery finalizes the commit.
 
 If it cannot distinguish completed publication from non-completion, recovery must enter:
 

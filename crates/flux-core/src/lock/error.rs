@@ -18,6 +18,9 @@ pub enum LockCode {
     /// Raised by the run (section 241.5), not by the lock protocol, as `PathComponentInvalid` already is: the
     /// destination has no atomic no-replace publication primitive.
     NoReplacePublishUnavailable,
+    /// Raised by `--resume` adoption (cut 9c): a prepared note whose publication the evidence cannot decide. A
+    /// refusal that changed nothing (exit 3).
+    CommitStateUncertain,
 }
 
 impl LockCode {
@@ -33,6 +36,7 @@ impl LockCode {
             Self::IncompatibleState => "INCOMPATIBLE_STATE",
             Self::ResumableOperationExists => "RESUMABLE_OPERATION_EXISTS",
             Self::NoReplacePublishUnavailable => "NOREPLACE_PUBLISH_UNAVAILABLE",
+            Self::CommitStateUncertain => "COMMIT_STATE_UNCERTAIN",
         }
     }
 }
@@ -91,5 +95,11 @@ mod tests {
         assert_eq!(LockCode::IncompatibleState.as_str(), "INCOMPATIBLE_STATE");
         assert_eq!(LockCode::ResumableOperationExists.as_str(), "RESUMABLE_OPERATION_EXISTS");
         assert_eq!(LockCode::NoReplacePublishUnavailable.as_str(), "NOREPLACE_PUBLISH_UNAVAILABLE");
+    }
+
+    #[test]
+    fn the_lock_code_string_is_the_specs() {
+        // Cut 9c spec, "Recovery at --resume": an undecidable prepared note refuses the adoption with this code.
+        assert_eq!(LockCode::CommitStateUncertain.as_str(), "COMMIT_STATE_UNCERTAIN");
     }
 }

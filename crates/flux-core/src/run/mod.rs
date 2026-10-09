@@ -9,6 +9,7 @@
 //! change it.
 
 pub(crate) mod place;
+mod recover;
 mod restart;
 mod resume;
 pub(crate) mod session;
@@ -16,7 +17,9 @@ pub(crate) mod sweep;
 #[cfg(test)]
 mod tests;
 
-use crate::copy::{CopyError, copy_file_guarded, no_before_create, prepare_file};
+use crate::copy::{
+    CopyError, copy_file_guarded, no_before_create, no_before_publish, prepare_file,
+};
 use crate::lock::record::LockRecord;
 use crate::lock::site::NAME_LIMIT;
 use crate::lock::{LockCode, LockSite, Refusal, Released, check_capability};
@@ -99,8 +102,9 @@ pub struct Run<T> {
 pub enum ResumeNote {
     /// `--resume` found no resumable prior: a new operation started.
     StartedNew,
-    /// The prior adopted; `claims` is its claim count (a tree), `None` for a single file.
-    Adopted { operation_id: String, claims: Option<u64> },
+    /// The prior adopted; `claims` is its claim count (a tree), `None` for a single file. `recovered` is the number of
+    /// interrupted publications commit recovery found published (cut 9c, RENAMED notes only; 0 for a single file).
+    Adopted { operation_id: String, claims: Option<u64>, recovered: u64 },
 }
 
 /// Why the run stopped outside the copy.
@@ -431,7 +435,17 @@ pub fn file<F: DestinationRoot>(
         };
         let beat =
             || locked.pulse.beat(&locked.held).map_err(|e| beat_error(&locked.lock_shown, e));
-        copy_file_guarded(fs, src, &parent, name, &opts, &guard, &beat, &no_before_create)
+        copy_file_guarded(
+            fs,
+            src,
+            &parent,
+            name,
+            &opts,
+            &guard,
+            &beat,
+            &no_before_create,
+            &no_before_publish,
+        )
     }
     .map_err(|mut e| {
         // As `copy_file` reports it: the leftover in the frame of the path the operator gave.

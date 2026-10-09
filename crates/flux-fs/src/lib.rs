@@ -16,7 +16,10 @@ pub mod fs;
 pub mod lock;
 pub mod name;
 
-pub use claims::{ClaimKey, ClaimOutcome, ClaimRecord, ClaimStatus, ClaimStore, FluxPathKey};
+pub use claims::{
+    ClaimKey, ClaimOutcome, ClaimRecord, ClaimStatus, ClaimStore, FluxPathKey, PreparedRecord,
+    RecoveryOp,
+};
 pub use fs::{
     DestinationRoot, DirEntry, DirHandle, FileHandle, FileIdentity, FileSystem, FileType, Metadata,
     MountRoot, ObjectId, Perms,

@@ -1,12 +1,13 @@
-//! The `redb`-backed claim store (cut 8b). One file, two tables: `claims` (key =
-//! `ClaimKey::encode`, value = `ClaimRecord::encode`) and `meta`.
+//! The `redb`-backed claim store (cut 8b, format 2 in cut 9c). One file, three tables: `claims`
+//! (key = `ClaimKey::encode`, value = `ClaimRecord::encode`), `prepared` (key = `ClaimKey::encode`,
+//! value = `PreparedRecord::encode`; absent in a format-1 store) and `meta`.
 
 use std::fs::File;
 use std::io;
 
 use flux_fs::{
     ClaimKey, ClaimOutcome, ClaimRecord, ClaimStatus, ClaimStore, Code, Durability, FluxPathKey,
-    FsError, Result,
+    FsError, ObjectId, PreparedRecord, RecoveryOp, Result,
 };
 use redb::{
     Builder, Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
@@ -19,7 +20,9 @@ pub const SYNC_CAP: u32 = 1000;
 
 const CLAIMS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("claims");
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
-const FORMAT: u64 = 1;
+const PREPARED: TableDefinition<&[u8], &[u8]> = TableDefinition::new("prepared");
+/// Written by `create_file`. `open_file` also reads 1 (no `prepared` table), never upgrading it.
+pub const FORMAT: u64 = 2;
 
 fn io_err(e: impl std::error::Error + Send + Sync + 'static) -> FsError {
     FsError::new(Code::IoError, io::Error::other(e))
@@ -69,17 +72,19 @@ pub struct RedbClaimStore {
     db: Database,
     durability: Durability,
     unsynced: u32,
+    format: u64,
 }
 
 impl RedbClaimStore {
-    /// `file` must be empty (a fresh `state.db`). Writes the `meta` entry `format` = 1 durably.
+    /// `file` must be empty (a fresh `state.db`). Writes the `meta` entry `format` = 2 durably.
     pub fn create_file(file: File, durability: Durability) -> Result<Self> {
         Self::with_cache_size(file, durability, CACHE_BYTES)
     }
 
     /// Open an EXISTING store. A zero-length file is `Code::StateCorrupt` (redb would silently
-    /// initialise it); a missing `meta` or `claims` table is `StateCorrupt`; a `format` other
-    /// than 1 is `Code::IncompatibleState`.
+    /// initialise it); a missing `meta` or `claims` table is `StateCorrupt`, and so is a
+    /// missing `prepared` table in a format-2 store; a `format` other than 1 or 2 is
+    /// `Code::IncompatibleState`. A format-1 store is opened as it is, never upgraded.
     pub fn open_file(file: File, durability: Durability) -> Result<Self> {
         Self::open_with_cache_size(file, durability, CACHE_BYTES)
     }
@@ -98,16 +103,17 @@ impl RedbClaimStore {
         }
         let db =
             Builder::new().set_cache_size(cache_bytes).create_file(file).map_err(database_err)?;
+        let format;
         {
             let tx = db.begin_read().map_err(transaction_err)?;
             let meta = tx.open_table(META).map_err(table_err)?;
             match meta.get("format").map_err(storage_err)?.map(|g| g.value()) {
-                Some(FORMAT) => {}
+                Some(n @ (1 | 2)) => format = n,
                 Some(n) => {
                     return Err(FsError::new(
                         Code::IncompatibleState,
                         io::Error::other(format!(
-                            "claim store format {n}, this binary reads {FORMAT}"
+                            "claim store format {n}, this binary reads 1 and {FORMAT}"
                         )),
                     ));
                 }
@@ -119,8 +125,11 @@ impl RedbClaimStore {
                 }
             }
             tx.open_table(CLAIMS).map_err(table_err)?;
+            if format == 2 {
+                tx.open_table(PREPARED).map_err(table_err)?;
+            }
         }
-        Ok(RedbClaimStore { db, durability, unsynced: 0 })
+        Ok(RedbClaimStore { db, durability, unsynced: 0, format })
     }
 
     fn with_cache_size(file: File, durability: Durability, cache_bytes: usize) -> Result<Self> {
@@ -129,11 +138,38 @@ impl RedbClaimStore {
         tx.set_durability(redb::Durability::Immediate).map_err(io_err)?;
         {
             tx.open_table(CLAIMS).map_err(io_err)?;
+            tx.open_table(PREPARED).map_err(io_err)?;
             let mut meta = tx.open_table(META).map_err(io_err)?;
             meta.insert("format", FORMAT).map_err(io_err)?;
         }
         tx.commit().map_err(io_err)?;
-        Ok(RedbClaimStore { db, durability, unsynced: 0 })
+        Ok(RedbClaimStore { db, durability, unsynced: 0, format: FORMAT })
+    }
+
+    /// The format read at open (or written by `create_file`): 1 or 2.
+    pub fn format(&self) -> u64 {
+        self.format
+    }
+
+    fn require_prepared(&self) -> Result<()> {
+        if self.format == 2 {
+            return Ok(());
+        }
+        Err(FsError::new(
+            Code::IncompatibleState,
+            io::Error::other("the claim store has no prepared table"),
+        ))
+    }
+
+    /// One Immediate write transaction running `f`; any error drops the transaction, so nothing
+    /// changes. Does not touch `unsynced` (an Immediate commit syncs earlier unsynced commits too,
+    /// but the count is left for the next claim commit to reset).
+    fn immediate<T>(&self, f: impl FnOnce(&redb::WriteTransaction) -> Result<T>) -> Result<T> {
+        let mut tx = self.db.begin_write().map_err(io_err)?;
+        tx.set_durability(redb::Durability::Immediate).map_err(io_err)?;
+        let out = f(&tx)?;
+        tx.commit().map_err(io_err)?;
+        Ok(out)
     }
 
     /// Commits made since the last synced commit (always 0 under `Strict`).
@@ -226,6 +262,138 @@ impl ClaimStore for RedbClaimStore {
         let table = tx.open_table(CLAIMS).map_err(table_err)?;
         table.len().map_err(storage_err)
     }
+
+    fn supports_prepared(&self) -> bool {
+        self.format == 2
+    }
+
+    fn prepare(&mut self, key: &ClaimKey, record: &PreparedRecord) -> Result<()> {
+        self.require_prepared()?;
+        self.immediate(|tx| {
+            let mut table = tx.open_table(PREPARED).map_err(io_err)?;
+            let k = key.encode();
+            if table.get(k.as_slice()).map_err(io_err)?.is_some() {
+                return Err(FsError::new(
+                    Code::IoError,
+                    io::Error::other("a prepared note already exists at this key"),
+                ));
+            }
+            table.insert(k.as_slice(), record.encode().as_slice()).map_err(io_err)?;
+            Ok(())
+        })
+    }
+
+    fn commit_prepared(
+        &mut self,
+        key: &ClaimKey,
+        target: &FluxPathKey,
+        planned: Option<&ClaimKey>,
+    ) -> Result<()> {
+        self.require_prepared()?;
+        let op = RecoveryOp::Commit {
+            key: key.clone(),
+            target: target.clone(),
+            planned: planned.cloned(),
+        };
+        self.immediate(|tx| apply_in(tx, &op))
+    }
+
+    fn discard_prepared(&mut self, key: &ClaimKey) -> Result<()> {
+        self.require_prepared()?;
+        let op = RecoveryOp::Discard { key: key.clone() };
+        self.immediate(|tx| apply_in(tx, &op))
+    }
+
+    fn prepared(&self) -> Result<Vec<(ClaimKey, PreparedRecord)>> {
+        if self.format != 2 {
+            return Ok(Vec::new());
+        }
+        let tx = self.db.begin_read().map_err(transaction_err)?;
+        let table = tx.open_table(PREPARED).map_err(table_err)?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(storage_err)? {
+            let (k, v) = entry.map_err(storage_err)?;
+            let corrupt =
+                |what: &str| FsError::new(Code::StateCorrupt, io::Error::other(what.to_string()));
+            let key = decode_key(k.value()).ok_or_else(|| corrupt("corrupt prepared key"))?;
+            let rec = PreparedRecord::decode(v.value())
+                .ok_or_else(|| corrupt("corrupt prepared note"))?;
+            out.push((key, rec));
+        }
+        Ok(out)
+    }
+
+    fn apply_recovery(&mut self, ops: &[RecoveryOp]) -> Result<()> {
+        self.require_prepared()?;
+        self.immediate(|tx| ops.iter().try_for_each(|op| apply_in(tx, op)))
+    }
+}
+
+/// Inverse of `ClaimKey::encode` (volume u64 BE, index u128 BE, name bytes).
+fn decode_key(bytes: &[u8]) -> Option<ClaimKey> {
+    let (volume, rest) = bytes.split_first_chunk::<8>()?;
+    let (index, name) = rest.split_first_chunk::<16>()?;
+    Some(ClaimKey {
+        parent: ObjectId {
+            volume: u64::from_be_bytes(*volume),
+            index: u128::from_be_bytes(*index),
+        },
+        name: name.to_vec(),
+    })
+}
+
+/// One recovery operation inside `tx`: `commit_prepared`'s and `discard_prepared`'s rules.
+fn apply_in(tx: &redb::WriteTransaction, op: &RecoveryOp) -> Result<()> {
+    let mut prepared = tx.open_table(PREPARED).map_err(io_err)?;
+    match op {
+        RecoveryOp::Discard { key } => {
+            prepared.remove(key.encode().as_slice()).map_err(io_err)?;
+        }
+        RecoveryOp::Commit { key, target, planned } => {
+            let mut claims = tx.open_table(CLAIMS).map_err(io_err)?;
+            let foreign = || {
+                FsError::new(
+                    Code::IoError,
+                    io::Error::other("a claim owned by another target is in the way"),
+                )
+            };
+            let owned_by_other =
+                |claims: &redb::Table<&[u8], &[u8]>, k: &[u8]| -> Result<Option<bool>> {
+                    // None: absent. Some(false): ours. Some(true): foreign. An undecodable record is a corrupt store
+                    // (as on every other path), not somebody else's claim.
+                    match claims.get(k).map_err(io_err)? {
+                        None => Ok(None),
+                        Some(g) => match ClaimRecord::decode(g.value()) {
+                            Some(r) => Ok(Some(r.target != *target)),
+                            None => Err(FsError::new(
+                                Code::StateCorrupt,
+                                io::Error::other("undecodable claim record"),
+                            )),
+                        },
+                    }
+                };
+            let k = key.encode();
+            if owned_by_other(&claims, k.as_slice())? == Some(true) {
+                return Err(foreign());
+            }
+            let pk = planned.as_ref().map(|p| p.encode());
+            let planned_absent = match &pk {
+                Some(pk) => match owned_by_other(&claims, pk.as_slice())? {
+                    Some(true) => return Err(foreign()),
+                    Some(false) => false,
+                    None => true,
+                },
+                None => false,
+            };
+            let created = ClaimRecord { target: target.clone(), status: ClaimStatus::Created };
+            claims.insert(k.as_slice(), created.encode().as_slice()).map_err(io_err)?;
+            if let (Some(pk), true) = (&pk, planned_absent) {
+                claims.insert(pk.as_slice(), created.encode().as_slice()).map_err(io_err)?;
+            }
+            prepared.remove(k.as_slice()).map_err(io_err)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

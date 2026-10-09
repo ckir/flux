@@ -169,3 +169,98 @@ fn a_store_builds_from_an_already_open_file() {
     let got = table.get(key.encode().as_slice()).unwrap().unwrap();
     assert_eq!(ClaimRecord::decode(got.value()), Some(rec));
 }
+
+fn note_for(i: u64) -> flux_fs::PreparedRecord {
+    flux_fs::PreparedRecord {
+        target: FluxPathKey(i.to_be_bytes().to_vec()),
+        temp_name: b"n.flux-partial.x".to_vec(),
+        identity: "strong:1:9".to_string(),
+        dir_path: String::new(),
+        name: i.to_be_bytes().to_vec(),
+        planned_name: Vec::new(),
+        replacement: false,
+    }
+}
+
+#[test]
+#[ignore]
+fn child_note_writer() {
+    let path = std::env::var("FLUX_KILL_FILE").unwrap();
+    let file = OpenOptions::new().read(true).write(true).create_new(true).open(path).unwrap();
+    let mut store = RedbClaimStore::create_file(file, Durability::Normal).unwrap();
+    let stdout = std::io::stdout();
+    let mut i: u64 = 0;
+    loop {
+        store.prepare(&key_for(i), &note_for(i)).unwrap();
+        {
+            let mut o = stdout.lock();
+            writeln!(o, "P {i}").unwrap();
+            o.flush().unwrap();
+        }
+        if i.is_multiple_of(2) {
+            store
+                .commit_prepared(&key_for(i), &FluxPathKey(i.to_be_bytes().to_vec()), None)
+                .unwrap();
+            let mut o = stdout.lock();
+            writeln!(o, "K {i}").unwrap();
+            o.flush().unwrap();
+        }
+        i += 1;
+    }
+}
+
+#[test]
+fn a_killed_writer_keeps_every_prepared_note_under_normal() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = std::env::current_exe().unwrap();
+    for (run, &threshold) in [1u64, 2, 3, 7, 20, 51, 100].iter().enumerate() {
+        let path = dir.path().join(format!("{run}.db"));
+        let mut child = Command::new(&exe)
+            .args(["--exact", "child_note_writer", "--ignored", "--nocapture", "--test-threads=1"])
+            .env("FLUX_KILL_FILE", &path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let mut reader = BufReader::new(child.stdout.take().unwrap());
+        let (mut p_seen, mut committed) = (Vec::new(), Vec::new());
+        let mut line = String::new();
+        while (p_seen.len() as u64) < threshold {
+            line.clear();
+            if reader.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            let mut it = line.split_whitespace();
+            match (it.next(), it.next().and_then(|n| n.parse::<u64>().ok())) {
+                (Some("P"), Some(n)) => p_seen.push(n),
+                (Some("K"), Some(n)) => committed.push(n),
+                _ => {}
+            }
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(p_seen.len() as u64, threshold, "{threshold}: child ended early");
+
+        let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let store = RedbClaimStore::open_file(file, Durability::Strict)
+            .expect("open_file must reopen a killed store");
+        let listed: Vec<ClaimKey> = store.prepared().unwrap().into_iter().map(|(k, _)| k).collect();
+        for &i in &p_seen {
+            let key = key_for(i);
+            let has_note = listed.contains(&key);
+            let claim = store.get(&key).unwrap();
+            let want = ClaimRecord {
+                target: FluxPathKey(i.to_be_bytes().to_vec()),
+                status: ClaimStatus::Created,
+            };
+            match (has_note, claim) {
+                (true, None) => {
+                    assert!(!committed.contains(&i), "{threshold}/{i}: acknowledged commit lost")
+                }
+                (false, Some(c)) => assert_eq!(c, want, "{threshold}/{i}: committed claim"),
+                (true, Some(_)) => panic!("{threshold}/{i}: both the note and the claim"),
+                (false, None) => panic!("{threshold}/{i}: neither the note nor the claim"),
+            }
+        }
+    }
+}

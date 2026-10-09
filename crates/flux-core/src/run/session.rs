@@ -165,7 +165,8 @@ pub(crate) fn open_operation<'a, D: DirHandle, P: Place<D>>(
                     Ok(c) => c,
                     Err(e) => return Err(give_back(obtained, e, &lock_shown)),
                 };
-                let claims = match place.adopt(&prior.state, opts.durability) {
+                // Cut 9c: a tree's adoption runs commit recovery; a refusal there changed nothing.
+                let store = match place.adopt(&prior.state, opts.durability, warnings) {
                     Ok(c) => c,
                     Err(e) => return Err(give_back(obtained, e, &lock_shown)),
                 };
@@ -180,8 +181,11 @@ pub(crate) fn open_operation<'a, D: DirHandle, P: Place<D>>(
                     f.boot_session_id = cfg.boot_session_id.clone();
                     f.last_heartbeat_wall_time = now.to_string();
                 }
-                resumed =
-                    Some(ResumeNote::Adopted { operation_id: state.operation_id.clone(), claims });
+                resumed = Some(ResumeNote::Adopted {
+                    operation_id: state.operation_id.clone(),
+                    claims: store.map(|s| s.claims),
+                    recovered: store.map_or(0, |s| s.recovered),
+                });
                 made = Some(state);
             } else {
                 if cfg.resume {

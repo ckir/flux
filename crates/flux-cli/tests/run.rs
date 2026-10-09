@@ -205,7 +205,7 @@ fn a_killed_run_leaves_the_claims_up_to_the_last_sync() {
     }
     assert_eq!(seen.len(), count);
     let meta = tx.open_table(TableDefinition::<&str, u64>::new("meta")).unwrap();
-    assert_eq!(meta.get("format").unwrap().map(|g| g.value()), Some(1));
+    assert_eq!(meta.get("format").unwrap().map(|g| g.value()), Some(2));
 }
 
 #[test]
