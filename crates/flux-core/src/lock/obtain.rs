@@ -141,10 +141,12 @@ pub struct CleanupObtained<'a, D: DirHandle> {
     pub reclaimed: Option<LockRecord>,
 }
 
-/// Cut 9b: `obtain` for cleanup. Differs in exactly one arm: an `Orphan` whose heartbeat is not in the future and is at least
-/// `lease_threshold_ns` old is recovered (section 240.3); younger, or future, it is refused `ARTIFACT_OWNERSHIP_UNCERTAIN` with the
-/// detail "the dead owner's lock is younger than the lease threshold". `Uncertain` is always refused (`TARGET_LOCK_UNCERTAIN`; no
-/// --break-lock).
+/// Cut 9b: `obtain` for cleanup. Differs in two arms and in always refusing an uncertain lock. An `Orphan` whose heartbeat is not in
+/// the future and is at least `lease_threshold_ns` old is recovered (section 240.3); younger, or future, it is refused
+/// `ARTIFACT_OWNERSHIP_UNCERTAIN` ("the dead owner's lock is younger than the lease threshold"), where `obtain` refuses every orphan.
+/// A `Dead` owner's lock is recovered only past the same gate; younger, or future, it is refused `TARGET_LOCK_BUSY`, where `obtain`
+/// recovers it at once. `Uncertain` is always refused (`TARGET_LOCK_UNCERTAIN`; no --break-lock). Every other classification behaves
+/// as in `obtain`.
 pub fn obtain_cleanup_lock<'a, D: DirHandle>(
     site: &LockSite<'a, D>,
     capability: LockCapability,

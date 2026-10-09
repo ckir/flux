@@ -470,11 +470,13 @@ the spec's numbers, 9-11 were learned during execution).
       only (macOS and Windows boot identifiers are boot times and are unmeasured under clock steps).
 - [ ] **8. `--break-lock` for cleanup, `--target`, the standalone catalog and `P/.flux/atomic/` do not exist**; an
       UNCERTAIN row can only be reported.
-- [ ] **9. After a young lease**: when a dead owner's lock (a killed `flux cleanup`, a crashed resume) has a heartbeat
-      younger than 30 s, a deleting pass skips every eligible row with `skipped <id>: destination lock busy` and exits
-      0. The real reason, "the previous owner's lock is younger than the lease threshold", is not in the line.
+- [ ] **9. A dead owner's lock with a young or future heartbeat** (a killed `flux cleanup`, a crashed resume; a future
+      heartbeat fails the gate like a young one) makes a deleting pass skip every eligible row with
+      `skipped <id>: destination lock busy` and exit 0. The real reason, "the previous owner's lock is younger than the
+      lease threshold", is not in the line. A younger orphan lock is refused as `ARTIFACT_OWNERSHIP_UNCERTAIN` and the
+      pass exits 1.
 - [ ] **10. An unreadable `DEST/.flux`** is reported as a whole-run refusal (exit 3) because `check_control_plane`
-      stats it before discovery lists anything, not as a failed listing (exit 1).
+      stats and opens it before discovery lists anything, not as a failed listing (exit 1).
 - [ ] **11. A `<lock>.broken.*` file** is classified by its own record whether or not the workspace it names exists
       (spec row 11 wording corrected).
 
@@ -482,7 +484,6 @@ the spec's numbers, 9-11 were learned during execution).
 
 - [ ] The single-file orphan-lock refusal also appends the `flux cleanup DEST` pointer sentence although `flux cleanup`
       does not handle single-file operations (`crates/flux-core/src/lock/obtain.rs`, the Orphan arm of `obtain`).
-- [ ] The doc comment on `obtain_cleanup_lock` says it differs from `obtain` in one arm; it is two.
 - [ ] The `Skipped` reason text for a young dead lock (see limit 9).
 - [ ] `S251_1_close` stays `not-in-7a` only because `tests/model_impl_map.rs:141` needs one such label.
 - [ ] The lock model has no notion of time or leases, so it does not capture the lease gate on the Dead and Orphan arms.
@@ -845,7 +846,6 @@ item was, not only in a commit message.
 - `DONE` **Validate `cleanup_pending_artifacts` entries as relative paths without `..`** (was under "Cut 9a
   debt"). Done by cut 9b: `cleanup::artifacts::validate` in `crates/flux-core/src/cleanup/artifacts.rs` applies the
   artifact rules before anything is deleted by an entry.
-
 - `DONE` **Model-check the lock protocol before implementing it.** Done by lock-model plans 1 to 3.
   The item asked for two recoverers, two `--break-lock` takeovers, a stalled prior owner and a plain
   run, checking that at most one operation ever owns a target: `recovery` runs `Recoverers = {r1, r2}`,
