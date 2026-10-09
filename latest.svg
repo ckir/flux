@@ -2,15 +2,15 @@
 <rect width="720" height="540" fill="#ffffff"/>
 <text x="12" y="20" fill="#111111" font-weight="bold" xml:space="preserve">Flux benchmark - Latest benchmark of main</text>
 <text x="12" y="40" fill="#555555" font-weight="normal" xml:space="preserve">Flux time / comparator time. Below 1.0, Flux is faster.</text>
-<text x="12" y="80" fill="#111111" font-weight="bold" xml:space="preserve">Linux - cold cache - 31a53f8 2026-10-09</text>
-<text x="12" y="100" fill="#111111" font-weight="normal" xml:space="preserve">large  vs cp         1.00</text>
+<text x="12" y="80" fill="#111111" font-weight="bold" xml:space="preserve">Linux - cold cache - c8e04e9 2026-10-09</text>
+<text x="12" y="100" fill="#111111" font-weight="normal" xml:space="preserve">large  vs cp         1.01</text>
 <text x="12" y="120" fill="#111111" font-weight="normal" xml:space="preserve">large  vs rsync      0.99</text>
-<text x="12" y="140" fill="#111111" font-weight="normal" xml:space="preserve">mixed  vs cp         1.03</text>
-<text x="12" y="160" fill="#111111" font-weight="normal" xml:space="preserve">mixed  vs rsync      0.96</text>
+<text x="12" y="140" fill="#111111" font-weight="normal" xml:space="preserve">mixed  vs cp         1.02</text>
+<text x="12" y="160" fill="#111111" font-weight="normal" xml:space="preserve">mixed  vs rsync      0.95</text>
 <text x="12" y="180" fill="#555555" font-weight="normal" xml:space="preserve">Not shown:</text>
 <text x="12" y="200" fill="#555555" font-weight="normal" xml:space="preserve">  small vs cp: too noisy</text>
 <text x="12" y="220" fill="#555555" font-weight="normal" xml:space="preserve">  small vs rsync: too noisy</text>
-<text x="12" y="260" fill="#111111" font-weight="bold" xml:space="preserve">macOS - cold cache - 31a53f8 2026-10-09</text>
+<text x="12" y="260" fill="#111111" font-weight="bold" xml:space="preserve">macOS - cold cache - c8e04e9 2026-10-09</text>
 <text x="12" y="280" fill="#555555" font-weight="normal" xml:space="preserve">Not shown:</text>
 <text x="12" y="300" fill="#555555" font-weight="normal" xml:space="preserve">  large vs cp: too noisy</text>
 <text x="12" y="320" fill="#555555" font-weight="normal" xml:space="preserve">  large vs rsync: too noisy</text>
@@ -18,7 +18,7 @@
 <text x="12" y="360" fill="#555555" font-weight="normal" xml:space="preserve">  small vs rsync: too noisy</text>
 <text x="12" y="380" fill="#555555" font-weight="normal" xml:space="preserve">  mixed vs cp: too noisy</text>
 <text x="12" y="400" fill="#555555" font-weight="normal" xml:space="preserve">  mixed vs rsync: too noisy</text>
-<text x="12" y="440" fill="#111111" font-weight="bold" xml:space="preserve">Windows - warm cache, Defender off - 31a53f8 2026-10-09</text>
+<text x="12" y="440" fill="#111111" font-weight="bold" xml:space="preserve">Windows - warm cache, Defender off - c8e04e9 2026-10-09</text>
 <text x="12" y="460" fill="#555555" font-weight="normal" xml:space="preserve">Not shown:</text>
 <text x="12" y="480" fill="#555555" font-weight="normal" xml:space="preserve">  large vs robocopy: too noisy</text>
 <text x="12" y="500" fill="#555555" font-weight="normal" xml:space="preserve">  small vs robocopy: too noisy</text>
