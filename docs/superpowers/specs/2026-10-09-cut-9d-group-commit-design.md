@@ -46,8 +46,9 @@ own durable note first.
    2. `prepare_many`: ONE Immediate transaction inserting every note of the batch (new `ClaimStore` method, all-or-nothing). The data of every file
       is already durable (decision 1: `stage_file` synced each writer under Strict), so section 164's ordering holds for the whole batch.
    3. For each pending entry in order: `publish_staged` (final `beat()`/`guard()`, rename).
-   4. `commit_many`: ONE Immediate transaction applying a `commit_prepared` for every entry that renamed (new method, built on `apply_in` like
-      `apply_recovery`; it takes `RecoveryOp::Commit` values).
+   4. `apply_recovery` (cut 9c's existing method: ONE Immediate transaction, each op with `commit_prepared`'s rules, nothing changes when any
+      errs) called with a `RecoveryOp::Commit` for every entry that renamed. It is NOT called when no entry renamed (an empty call costs a sync;
+      cut 9c deferred minor).
    5. For each entry that failed its rename: `discard_prepared` for its note (best effort, as cut 9c) and the temporary is discarded as today.
 5. **Flush triggers.** The batch flushes (a) when it holds `BATCH_FILES` = 64 entries or `BATCH_BYTES` = 64 MiB of staged source bytes
    (section 148.3's threshold), (b) when the next file to stage is itself at least `BATCH_BYTES` long (the pending small files publish first, then the
@@ -61,16 +62,19 @@ own durable note first.
    second entry with the same fold. A pending fresh-directory entry cannot collide with anything else on disk.
 7. **Failure isolation = cut 9c's, by falling back to the per-file path.** If `prepare_many` errs, nothing was written (all-or-nothing). The flush
    then retries each entry on its own through the existing `prepare` (one commit each), so a store error is attributed to the files it actually
-   hits, exactly as in cut 9c, and an entry whose own `prepare` fails is discarded and reported at `CopyStep::Claim`. If `commit_many` errs, nothing
+   hits, exactly as in cut 9c, and an entry whose own `prepare` fails is discarded and reported at `CopyStep::Claim`. If the `apply_recovery` commit errs, nothing
    changed; the flush retries each renamed entry through `commit_prepared`, and an entry whose own commit fails is reported `ClaimNotRecorded`
    with its note left for recovery. The fallback is the ONLY place the per-file calls remain, so the common path writes two commits per batch.
-8. **Stopping the run.** A lost lock (`guard()` fails at entry k) or a heartbeat failure stops the whole operation as today. The flush then: commits
-   the claims of the entries 0..k-1 that renamed (they are published; their notes must become claims or be left for recovery), discards the notes of
-   the entries not yet renamed, discards their temporaries, and returns the stop. If the commit itself cannot be written, the notes stay and cut 9c
-   recovery decides at `--resume` (rows 1 to 4 of its matrix).
+8. **Stopping the run.** A lost lock (`guard()` fails at entry k) or a heartbeat failure stops the whole operation as today. The flush then:
+   commits the claims of the entries 0..k-1 that renamed (they are published), and returns the stop. The entries k.. are NOT touched on disk: a
+   temporary is not removed once this run no longer holds the lock (cut 9c's rule in `copy_file_guarded`: removing it would be a mutation), so each
+   is reported as a leftover (`CopyError.leftover`) exactly as an unbatched copy reports it, and its note, if written, stays for recovery (the
+   store is the run's own file, as in cut 9c's `discard_note_on_failure`, which discards best effort). If the commit itself cannot be written,
+   the notes stay and cut 9c recovery decides at `--resume` (rows 1 to 4 of its matrix). A heartbeat failure with the lock still held discards
+   the unrenamed entries' temporaries and notes as an unbatched failure does.
 9. **Recovery is unchanged.** A kill leaves, per file of the batch: no note and a temporary (before `prepare_many`: the leftover sweep removes
    the temporary at `--resume`); a note and a temporary (after `prepare_many`, before that file's rename: matrix rows 2, 3 or 3b, NOT RENAMED); a note and a
-   published target (after the rename, before `commit_many`: matrix row 1, RENAMED); or a claim (after `commit_many`). Up to `BATCH_FILES` notes
+   published target (after the rename, before the commit: matrix row 1, RENAMED); or a claim (after the commit). Up to `BATCH_FILES` notes
    can coexist; cut 9c's phase 1 classifies any number and phase 2 applies them in one transaction. No change to `run/recover.rs`.
 10. **Memory.** The pending list is bounded by `BATCH_FILES` entries (a path, a key, a note template, a `Staged`): well under 100 KiB. No file
     descriptor is held by a staged entry (decision 1). Peak RSS must stay at the baseline's 19 MiB class (acceptance, below).
@@ -82,11 +86,10 @@ own durable note first.
 
 - `flux_fs::ClaimStore::prepare_many(&mut self, notes: &[(ClaimKey, PreparedRecord)]) -> Result<()>`: one Immediate transaction; a key that
   already has a note is `Code::IoError` and NOTHING changes.
-- `flux_fs::ClaimStore::commit_many(&mut self, ops: &[CommitOp]) -> Result<()>` with `CommitOp { key, target, planned }`: one Immediate
-  transaction, each with `commit_prepared`'s rules; any error leaves the store unchanged.
-- conformance cases for both (flux-fs `conformance`), run against the redb store and the fake.
+- No `commit_many`: the commit side reuses `apply_recovery` with `RecoveryOp::Commit` values (decision 4.4).
+- a conformance case for `prepare_many` (flux-fs `conformance`), run against the redb store and the fake.
 - `copy::stage_file`, `copy::publish_staged`, `copy::Staged` (crate-private).
-- `FaultFs` fake: the fault keys `prepare_many` and `commit_many`, and the existing keys keep their meaning for the fallback path.
+- `FaultFs` fake: the fault key `prepare_many` (the existing `apply_recovery` key covers the commit), and the existing keys keep their meaning for the fallback path.
 
 ## Behaviour that does not change
 
@@ -96,15 +99,16 @@ format and `meta.format` 2, and every Normal-durability behaviour. A Strict sing
 ## Tests
 
 - Counting, the point of the cut. With a counting `ClaimStore` (a wrapper on the fake): N files in one directory under Strict produce
-  `ceil(N / 64)` `prepare_many` and `commit_many` calls and ZERO per-file `prepare`/`commit_prepared` calls; Normal produces none of them.
+  `ceil(N / 64)` `prepare_many` and `apply_recovery` calls and ZERO per-file `prepare`/`commit_prepared` calls; Normal produces none of them.
 - Real filesystem (crates/flux-cli/tests or tests/integration): `strace`-free proxy: the claim store's transaction count for 1000 small files.
 - Each trigger of decision 5 has a test that fails if the trigger is removed (64 files, 64 MiB via a sparse source, a large file between small ones,
   `DirEnd` with pending entries in a nested tree, age via an injected clock, walk end, case-fold collision).
-- Failure isolation (decision 7): `prepare_many` failing, then one entry's own `prepare` failing; `commit_many` failing, then one entry's own
+- Failure isolation (decision 7): `prepare_many` failing, then one entry's own `prepare` failing; the `apply_recovery` commit failing, then one entry's own
   commit failing; each asserts WHICH files are reported and that no file is both published and reported failed.
-- Lost lock mid-publish (decision 8): the guard fails at entry k; entries before k are claims, entries from k have neither note nor temporary.
-- Crash matrix (cut 9c's six rows, extended): kill after `prepare_many`, after j renames, after all renames before `commit_many`; each resumes to
-  the same final state as an unbatched run; fault-injected through `FaultFs` (a failing rename at entry j; a failing `commit_many`) and one real
+- Lost lock mid-publish (decision 8): the guard fails at entry k; entries before k are claims, entries from k keep their temporaries (reported as
+  leftovers) and nothing under DEST is removed after the loss.
+- Crash matrix (cut 9c's six rows, extended): kill after `prepare_many`, after j renames, after all renames before the `apply_recovery` commit; each resumes to
+  the same final state as an unbatched run; fault-injected through `FaultFs` (a failing rename at entry j; a failing `apply_recovery`) and one real
   kill-and-resume e2e.
 - Equivalence: the same tree copied with batching on (default) and off (`BATCH_FILES = 1`, a test seam) yields the same destination bytes, the
   same claims and the same report.
