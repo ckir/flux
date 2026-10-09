@@ -2679,7 +2679,7 @@ fn prior_store(fs: &FaultFs, n: u8) -> FakeClaimStore {
 fn adopted(r: &Run<Result<TreeOutcome, TreeAbort>>, n: u8, claims: Option<u64>) {
     assert_eq!(
         r.resumed,
-        Some(ResumeNote::Adopted { operation_id: id(n), claims }),
+        Some(ResumeNote::Adopted { operation_id: id(n), claims, recovered: 0 }),
         "{:?} {:?}",
         r.stop,
         r.resumed
@@ -3164,7 +3164,7 @@ fn a_single_file_resume_adopts_the_record_bumping_its_generation() {
     assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
     assert_eq!(
         r.resumed,
-        Some(ResumeNote::Adopted { operation_id: id(5), claims: None }),
+        Some(ResumeNote::Adopted { operation_id: id(5), claims: None, recovered: 0 }),
         "no claim store for a single file"
     );
     let s = seen.lock().unwrap().clone().expect("read during the copy");
@@ -4317,4 +4317,507 @@ fn the_note_precedes_the_publish_heartbeat_and_guard() {
         matches!((beat, guard), (Some(b), Some(g)) if b < g),
         "the heartbeat, then the guard, between the note and the rename: {window:?}"
     );
+}
+
+// Cut 9c Task 6: commit recovery at `--resume` (spec "Recovery at --resume"). Every note of the adopted store is
+// classified by the matrix (rows 1, 2, 3, 3b, 4, 5 in order) before the walk plans anything; all verdicts are applied
+// in one transaction, or the adoption is refused with COMMIT_STATE_UNCERTAIN and nothing changes.
+
+use flux_fs::PreparedRecord;
+
+/// Prior `n`'s claim store: created on first use, reopened after (the fake refuses a second creation).
+fn store_of(fs: &FaultFs, n: u8) -> FakeClaimStore {
+    let ws =
+        fs.destination_root(Path::new(&format!("/p/dest/.flux/operations/{}", id(n)))).unwrap();
+    if fs.exists(state_db(n)) {
+        ws.open_claim_store(OsStr::new("state.db"), Durability::Strict).unwrap()
+    } else {
+        ws.create_claim_store(OsStr::new("state.db"), Durability::Strict).unwrap()
+    }
+}
+
+/// `name`'s temporary under prior `n`.
+fn temp_of(name: &str, n: u8) -> String {
+    format!("{name}.flux-partial.{}", id(n))
+}
+
+/// Write `record` at `key` in prior `n`'s store, as a Strict publication's `prepare` did.
+fn note_at(fs: &FaultFs, n: u8, key: &ClaimKey, record: &PreparedRecord) {
+    store_of(fs, n).prepare(key, record).unwrap();
+}
+
+/// The note a Strict publication of `target` at `/p/dest/<dir_path>/<name>` leaves in prior `n`'s store: the
+/// temporary is named from `planned` (or `name` when `planned` is empty), the key is the directory's Strong identity.
+#[allow(clippy::too_many_arguments)]
+fn noted(
+    fs: &FaultFs,
+    n: u8,
+    name: &str,
+    target: &str,
+    temp_identity: FileIdentity,
+    dir_path: &str,
+    replacement: bool,
+    planned: &str,
+) {
+    let dir =
+        if dir_path.is_empty() { "/p/dest".to_string() } else { format!("/p/dest/{dir_path}") };
+    let used = if planned.is_empty() { name } else { planned };
+    let record = PreparedRecord {
+        target: key(target),
+        temp_name: temp_of(used, n).into_bytes(),
+        identity: identity_text(temp_identity),
+        dir_path: if dir_path.is_empty() { String::new() } else { native_hex(Path::new(dir_path)) },
+        name: name.as_bytes().to_vec(),
+        planned_name: planned.as_bytes().to_vec(),
+        replacement,
+    };
+    note_at(fs, n, &ClaimKey::new(strong(fs, &dir), OsStr::new(name)), &record);
+}
+
+/// A Strict prior 5 (TRANSFERRING) over `fake_src(100)`: `/p/dest` and `/p/dest/sub` exist, the store is empty.
+fn strict_prior() -> FaultFs {
+    let fs = fake_src(100);
+    prior3_with(&fs, 5, OpState::Transferring, &strict());
+    fs.create_dir(Path::new("/p/dest/sub")).unwrap();
+    drop(store_of(&fs, 5));
+    fs
+}
+
+fn identity_of(fs: &FaultFs, path: &str) -> FileIdentity {
+    fs.metadata(Path::new(path)).unwrap().identity
+}
+
+/// The same object id, but only `Weak`.
+fn weakened(i: FileIdentity) -> FileIdentity {
+    match i {
+        FileIdentity::Strong(o) => FileIdentity::Weak(o),
+        other => panic!("not strong: {other:?}"),
+    }
+}
+
+/// A Strong identity no object of the fake has.
+fn another() -> FileIdentity {
+    FileIdentity::Strong(ObjectId { volume: 9, index: 9999 })
+}
+
+fn recover(fs: &FaultFs) -> (Run<Result<TreeOutcome, TreeAbort>>, Vec<TreeFailure>) {
+    run_tree_with(fs, &resume(), &strict())
+}
+
+fn adopted_recovering(r: &Run<Result<TreeOutcome, TreeAbort>>, claims: u64, recovered: u64) {
+    assert_eq!(
+        r.resumed,
+        Some(ResumeNote::Adopted { operation_id: id(5), claims: Some(claims), recovered }),
+        "{:?} {:?}",
+        r.stop,
+        r.resumed
+    );
+}
+
+/// The refusal is COMMIT_STATE_UNCERTAIN, changed nothing, and its detail (separators folded) is returned.
+fn uncertain(r: &Run<Result<TreeOutcome, TreeAbort>>) -> String {
+    assert_eq!(refused(&r.stop), (LockCode::CommitStateUncertain, false), "{:?}", r.stop);
+    detail(&r.stop).replace('\\', "/")
+}
+
+const NOT_PUBLISHED_TAIL: &str = "the operation's state is preserved. Move or delete the destination ENTRY you do not want (not the temporary file) so it reads as absent (the next resume then redoes the file), or run again with --restart to supersede this operation";
+
+fn created(target: &str) -> Option<ClaimRecord> {
+    Some(ClaimRecord { target: key(target), status: ClaimStatus::Created })
+}
+
+#[test]
+fn recovery_row_1_renamed_commits_the_claim() {
+    // Mutants (recover.rs): row 1 accepts a Weak D (treat Weak as Strong); row 4 before row 1.
+    let fs = strict_prior();
+    put(&fs, "/p/dest/a", b"A", 101);
+    let r_id = identity_of(&fs, "/p/dest/a");
+    noted(&fs, 5, "a", "a", r_id, "", false, "");
+    let (r, got) = recover(&fs);
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    adopted_recovering(&r, 0, 1);
+    assert_eq!(fs.claim(strong(&fs, "/p/dest"), "a"), created("a"));
+    assert_eq!(fs.prepared_count(), 0);
+    assert_eq!(out.files_resumed, 1, "the walk skips the recovered file as resumed: {out:?}");
+    let c = calls(&fs);
+    assert!(!c.iter().any(|x| x.starts_with("create_new(/p/dest/a.flux-partial.")), "{c:?}");
+
+    // Distractor: D holds the same numbers, but only Weak: existence is never proof of the rename (259.8).
+    let fs = strict_prior();
+    put(&fs, "/p/dest/a", b"A", 101);
+    let r_id = identity_of(&fs, "/p/dest/a");
+    noted(&fs, 5, "a", "a", r_id, "", false, "");
+    fs.set_identity("/p/dest/a", weakened(r_id));
+    let (r, _) = recover(&fs);
+    let d = uncertain(&r);
+    assert!(
+        d.contains("/p/dest/a: cannot tell whether this file was published (identity unavailable)"),
+        "{d}"
+    );
+    assert_eq!(fs.prepared_count(), 1);
+}
+
+/// A row-1 destination whose temporary name still holds the same object (the `link()`+`unlink()` fallback). The engine
+/// has no such fallback today (the probe refuses NOREPLACE_PUBLISH_UNAVAILABLE), so the state is built by hand.
+fn renamed_with_a_stray_temp() -> FaultFs {
+    let fs = strict_prior();
+    put(&fs, "/p/dest/a", b"A", 101);
+    let r_id = identity_of(&fs, "/p/dest/a");
+    let temp = format!("/p/dest/{}", temp_of("a", 5));
+    fs.write_file(&temp, b"A");
+    fs.set_identity(&temp, r_id);
+    noted(&fs, 5, "a", "a", r_id, "", false, "");
+    fs
+}
+
+#[test]
+fn recovery_row_1_removes_a_stray_temp_name_of_the_same_object() {
+    // Mutant (recover.rs): `remove_temp` always false; a failed removal returned as an error.
+    let fs = renamed_with_a_stray_temp();
+    let temp = format!("/p/dest/{}", temp_of("a", 5));
+    let (r, got) = recover(&fs);
+    ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    adopted_recovering(&r, 0, 1);
+    let c = calls(&fs);
+    let apply = at(&c, "claim_apply_recovery");
+    let removed = at(&c, &format!("remove_file({temp})"));
+    assert!(apply < removed, "the stray name goes after the transaction: {c:?}");
+    assert!(!fs.exists(&temp));
+    assert!(
+        !r.warnings.iter().any(|w| matches!(w, RunWarning::PartialKept { .. })),
+        "{:?}",
+        r.warnings
+    );
+
+    // The removal fails: a warning naming the temporary, and the adoption still succeeds. `remove_file`'s first call
+    // in this run is that removal (measured from the green log above: nothing earlier in a resume removes a file).
+    let fs = renamed_with_a_stray_temp();
+    fs.fail_nth("remove_file", 1, Code::IoError, std::io::ErrorKind::Other);
+    let (r, _) = recover(&fs);
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    adopted_recovering(&r, 0, 1);
+    let manifest = format!("/p/dest/.flux/operations/{}/manifest", id(5));
+    assert!(
+        r.warnings.iter().any(|w| matches!(w, RunWarning::PartialKept { path, kept, .. }
+            if path.to_string_lossy().replace('\\', "/") == temp
+                && kept.to_string_lossy().replace('\\', "/") == manifest)),
+        "{:?}",
+        r.warnings
+    );
+    assert_eq!(fs.claim(strong(&fs, "/p/dest"), "a"), created("a"));
+}
+
+/// The temporary of `a` under prior 5 is on disk with some identity.
+fn temp_present(fs: &FaultFs) -> FileIdentity {
+    let temp = format!("/p/dest/{}", temp_of("a", 5));
+    fs.write_file(&temp, b"h");
+    identity_of(fs, &temp)
+}
+
+#[test]
+fn recovery_row_2_not_renamed_discards_and_the_walk_redoes() {
+    // Mutant (recover.rs): row 2 dropped (T present, D absent falls to UNCERTAIN).
+    let fs = strict_prior();
+    let t = temp_present(&fs);
+    noted(&fs, 5, "a", "a", t, "", false, "");
+    let (r, got) = recover(&fs);
+    let out = ok(&r);
+    // The walk's own `prepare(a)` would fail on a note left at the key, so a clean copy shows the note was discarded.
+    assert!(got.is_empty(), "{got:?}");
+    adopted_recovering(&r, 0, 0);
+    assert_eq!(out.files_copied, 2, "{out:?}");
+    assert_eq!(fs.read_file("/p/dest/a").as_deref(), Some(&b"A"[..]));
+    assert_eq!(fs.claim(strong(&fs, "/p/dest"), "a"), created("a"));
+    assert_eq!(fs.prepared_count(), 0);
+    assert!(calls(&fs).iter().any(|x| x == "claim_apply_recovery"));
+
+    // Distractor: T present and D present (Weak) for a no-replace note - the link fallback leaves two names: UNCERTAIN.
+    let fs = strict_prior();
+    let t = temp_present(&fs);
+    put(&fs, "/p/dest/a", b"o", 101);
+    fs.set_identity("/p/dest/a", weakened(identity_of(&fs, "/p/dest/a")));
+    noted(&fs, 5, "a", "a", t, "", false, "");
+    let (r, _) = recover(&fs);
+    assert!(uncertain(&r).contains("(identity unavailable)"));
+}
+
+#[test]
+fn recovery_row_3_a_replacement_with_the_temp_present_is_not_renamed_whatever_d_is() {
+    // Mutant (recover.rs): row 3 dropped (a replacement with T present and a Weak D falls to UNCERTAIN).
+    let fs = strict_prior();
+    let t = temp_present(&fs);
+    put(&fs, "/p/dest/a", b"old", 101);
+    fs.set_identity("/p/dest/a", weakened(identity_of(&fs, "/p/dest/a")));
+    noted(&fs, 5, "a", "a", t, "", true, "");
+    let (r, got) = recover(&fs);
+    ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    adopted_recovering(&r, 0, 0);
+    assert_eq!(fs.read_file("/p/dest/a").as_deref(), Some(&b"A"[..]), "redone");
+    assert_eq!(fs.prepared_count(), 0);
+
+    // Distractor: the same evidence for a no-replace note is UNCERTAIN.
+    let fs = strict_prior();
+    let t = temp_present(&fs);
+    put(&fs, "/p/dest/a", b"old", 101);
+    fs.set_identity("/p/dest/a", weakened(identity_of(&fs, "/p/dest/a")));
+    noted(&fs, 5, "a", "a", t, "", false, "");
+    let (r, _) = recover(&fs);
+    uncertain(&r);
+    assert_eq!(fs.read_file("/p/dest/a").as_deref(), Some(&b"old"[..]));
+}
+
+#[test]
+fn recovery_row_3b_a_no_replace_note_whose_entry_was_taken_is_not_renamed() {
+    // Mutant (recover.rs): row 3b dropped (T == R with another Strong object at D falls to UNCERTAIN).
+    let fs = strict_prior();
+    let t = temp_present(&fs);
+    put(&fs, "/p/dest/a", b"theirs", 101);
+    noted(&fs, 5, "a", "a", t, "", false, "");
+    let (r, got) = recover(&fs);
+    ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    adopted_recovering(&r, 0, 0);
+    assert_eq!(fs.prepared_count(), 0);
+    assert_eq!(
+        fs.read_file("/p/dest/a").as_deref(),
+        Some(&b"A"[..]),
+        "the policy (overwrite) decides"
+    );
+
+    // Distractor: T holds another Strong object than the recorded one: UNCERTAIN.
+    let fs = strict_prior();
+    temp_present(&fs);
+    put(&fs, "/p/dest/a", b"theirs", 101);
+    noted(&fs, 5, "a", "a", another(), "", false, "");
+    let (r, _) = recover(&fs);
+    assert!(uncertain(&r).contains("(destination holds another object)"));
+    assert_eq!(fs.read_file("/p/dest/a").as_deref(), Some(&b"theirs"[..]));
+}
+
+#[test]
+fn recovery_row_4_gone_discards() {
+    // Mutants (recover.rs): row 4 accepts a Weak D (treat Weak as Strong); apply_recovery per note instead of once.
+    let fs = strict_prior();
+    noted(&fs, 5, "a", "a", another(), "", false, "");
+    put(&fs, "/p/dest/sub/b", b"theirs", 101);
+    noted(&fs, 5, "b", "sub\0b", another(), "sub", false, "");
+    let (r, got) = recover(&fs);
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    adopted_recovering(&r, 0, 0);
+    assert_eq!(fs.prepared_count(), 0);
+    assert_eq!(out.files_copied, 2, "{out:?}");
+    assert_eq!(fs.read_file("/p/dest/sub/b").as_deref(), Some(&b"BB"[..]), "the policy decides");
+    assert_eq!(count(&calls(&fs), "claim_apply_recovery"), 1, "one transaction for both notes");
+
+    // Distractor: T absent and D Weak: UNCERTAIN.
+    let fs = strict_prior();
+    put(&fs, "/p/dest/a", b"theirs", 101);
+    fs.set_identity("/p/dest/a", weakened(identity_of(&fs, "/p/dest/a")));
+    noted(&fs, 5, "a", "a", another(), "", false, "");
+    let (r, _) = recover(&fs);
+    assert!(uncertain(&r).contains("(identity unavailable)"));
+}
+
+#[test]
+fn a_note_whose_directory_is_gone_reads_both_names_absent() {
+    // Spec: "a component that is missing or is not a directory makes both T and D absent" (row 4), while a link
+    // component is refused by the link-refusing handles (UNCERTAIN). Mutant (recover.rs): every `open_dir` error
+    // UNCERTAIN.
+    let fs = strict_prior();
+    noted(&fs, 5, "b", "sub\0b", another(), "sub", false, "");
+    fs.destination_root(Path::new("/p/dest")).unwrap().remove_dir(OsStr::new("sub")).unwrap();
+    fs.write_file("/p/dest/file", b"f");
+    let parent = strong(&fs, "/p/dest");
+    let rec = |name: &str, dir: &str| PreparedRecord {
+        target: key(name),
+        temp_name: temp_of(name, 5).into_bytes(),
+        identity: identity_text(another()),
+        dir_path: native_hex(Path::new(dir)),
+        name: name.as_bytes().to_vec(),
+        planned_name: Vec::new(),
+        replacement: false,
+    };
+    note_at(&fs, 5, &ClaimKey::new(parent, OsStr::new("x")), &rec("x", "file"));
+    let (r, got) = recover(&fs);
+    ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(fs.prepared_count(), 0);
+
+    // Distractor: a link component is UNCERTAIN.
+    let fs = strict_prior();
+    fs.add_symlink("/p/dest/link");
+    note_at(&fs, 5, &ClaimKey::new(strong(&fs, "/p/dest"), OsStr::new("y")), &rec("y", "link"));
+    let (r, _) = recover(&fs);
+    assert!(
+        uncertain(&r).contains(
+            "/p/dest/y: cannot tell whether this file was published (unreadable directory)"
+        )
+    );
+}
+
+#[test]
+fn one_uncertain_note_refuses_the_adoption_and_changes_nothing() {
+    // Mutant (recover.rs): apply the decidable notes before refusing.
+    let fs = strict_prior();
+    put(&fs, "/p/dest/a", b"A", 101);
+    noted(&fs, 5, "a", "a", identity_of(&fs, "/p/dest/a"), "", false, "");
+    put(&fs, "/p/dest/sub/b", b"BB", 101);
+    fs.set_identity("/p/dest/sub/b", weakened(identity_of(&fs, "/p/dest/sub/b")));
+    noted(&fs, 5, "b", "sub\0b", another(), "sub", false, "");
+    let (r, _) = recover(&fs);
+    let d = uncertain(&r);
+    assert!(
+        d.contains(
+            "/p/dest/sub/b: cannot tell whether this file was published (identity unavailable)"
+        ),
+        "{d}"
+    );
+    assert!(d.contains(NOT_PUBLISHED_TAIL), "{d}");
+    assert!(!d.contains("/p/dest/a:"), "only the undecided note is named: {d}");
+    let c = calls(&fs);
+    assert!(!c.iter().any(|x| x.starts_with("claim_apply_recovery")), "{c:?}");
+    assert!(
+        !c.iter().any(|x| x.starts_with("create_new(/p/dest/") && x.contains(".flux-partial.")),
+        "{c:?}"
+    );
+    assert_eq!(fs.prepared_count(), 2);
+    assert_eq!(fs.claim(strong(&fs, "/p/dest"), "a"), None);
+    assert!(!matches!(r.resumed, Some(ResumeNote::Adopted { .. })), "{:?}", r.resumed);
+}
+
+#[test]
+fn a_note_whose_directory_identity_changed_is_uncertain() {
+    // Mutant (recover.rs): skip the directory identity check.
+    let fs = strict_prior();
+    put(&fs, "/p/dest/sub/b", b"BB", 101);
+    noted(&fs, 5, "b", "sub\0b", identity_of(&fs, "/p/dest/sub/b"), "sub", false, "");
+    fs.set_identity("/p/dest/sub", another());
+    let (r, _) = recover(&fs);
+    let d = uncertain(&r);
+    assert!(
+        d.contains("/p/dest/sub/b: cannot tell whether this file was published (destination holds another object)"),
+        "{d}"
+    );
+    assert_eq!(fs.prepared_count(), 1);
+
+    // Distractor: the same note with the directory unchanged is RENAMED.
+    let fs = strict_prior();
+    put(&fs, "/p/dest/sub/b", b"BB", 101);
+    noted(&fs, 5, "b", "sub\0b", identity_of(&fs, "/p/dest/sub/b"), "sub", false, "");
+    let (r, got) = recover(&fs);
+    ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    adopted_recovering(&r, 0, 1);
+}
+
+#[test]
+fn recovery_of_a_renamed_replacement_writes_the_planned_claim_too() {
+    // Mutant (recover.rs): commit with `planned: None`.
+    let fs = strict_prior();
+    put(&fs, "/p/dest/A", b"A", 101);
+    noted(&fs, 5, "A", "a", identity_of(&fs, "/p/dest/A"), "", true, "a");
+    fs.set_case_insensitive(true);
+    let (r, got) = recover(&fs);
+    ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    adopted_recovering(&r, 0, 1);
+    let dest = strong(&fs, "/p/dest");
+    assert_eq!(fs.claim(dest, "A"), created("a"), "the stored spelling");
+    assert_eq!(fs.claim(dest, "a"), created("a"), "the planned spelling");
+    assert_eq!(fs.prepared_count(), 0);
+}
+
+#[test]
+fn a_hostile_note_is_uncertain_and_touches_nothing() {
+    // Mutants (recover.rs): skip the `dir_path` component check; skip the `temp_name` check.
+    let fs = strict_prior();
+    let parent = strong(&fs, "/p/dest");
+    let rec = |name: &str, temp: String, dir_path: String| PreparedRecord {
+        target: key(name),
+        temp_name: temp.into_bytes(),
+        identity: identity_text(another()),
+        dir_path,
+        name: name.as_bytes().to_vec(),
+        planned_name: Vec::new(),
+        replacement: false,
+    };
+    #[cfg(unix)]
+    let absolute = native_hex(Path::new("/etc"));
+    #[cfg(windows)]
+    let absolute = native_hex(Path::new("C:\\etc"));
+    let notes = [
+        ("h1", rec("h1", temp_of("h1", 5), absolute)),
+        ("h2", rec("h2", temp_of("h2", 5), native_hex(Path::new("..")))),
+        ("h3", rec("h3", temp_of("h3", 6), String::new())),
+    ];
+    for (name, record) in &notes {
+        note_at(&fs, 5, &ClaimKey::new(parent, OsStr::new(name)), record);
+    }
+    let (r, _) = recover(&fs);
+    let d = uncertain(&r);
+    for name in ["h1", "h2", "h3"] {
+        assert!(
+            d.contains(&format!(
+                "/p/dest/{name}: cannot tell whether this file was published (invalid note)"
+            )),
+            "{d}"
+        );
+    }
+    let c = calls(&fs);
+    let after = &c[at(&c, "claim_prepared")..];
+    assert!(
+        !after.iter().any(|x| x.starts_with("metadata(/p/dest/")
+            || x.starts_with("metadata(/etc")
+            || x.starts_with("metadata(/p)")
+            || x.contains("C:")),
+        "nothing is looked at for an invalid note: {after:?}"
+    );
+    assert_eq!(fs.prepared_count(), 3);
+}
+
+/// Two decidable notes: `a` NOT RENAMED (row 2), `sub/b` GONE (row 4).
+fn two_decidable() -> FaultFs {
+    let fs = strict_prior();
+    let t = temp_present(&fs);
+    noted(&fs, 5, "a", "a", t, "", false, "");
+    noted(&fs, 5, "b", "sub\0b", another(), "sub", false, "");
+    fs
+}
+
+#[test]
+fn recovery_applies_everything_in_one_transaction() {
+    // Mutant (recover.rs): `discard_prepared` per note instead of one `apply_recovery`.
+    let fs = two_decidable();
+    fs.fail("claim_apply_recovery", Code::IoError);
+    let (r, _) = recover(&fs);
+    match &r.stop {
+        Some(RunError::Failed { step, path, .. }) => {
+            assert_eq!(*step, RunStep::State);
+            assert_eq!(path.to_string_lossy().replace('\\', "/"), state_db(5));
+        }
+        other => panic!("expected a failed state step, got {other:?}"),
+    }
+    assert_eq!(fs.prepared_count(), 2, "nothing applied");
+    let c = calls(&fs);
+    assert!(!c.iter().any(|x| x.starts_with("claim_discard_prepared(")), "{c:?}");
+}
+
+#[test]
+fn recovery_runs_before_the_walk_plans_anything() {
+    // Mutant (place.rs): recovery skipped at adoption (the walk meets the notes).
+    let fs = two_decidable();
+    let (r, got) = recover(&fs);
+    ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    let c = calls(&fs);
+    let apply = at(&c, "claim_apply_recovery");
+    // Inside the adoption: before the manifest goes TRANSFERRING, before the walk lists DEST or makes a temporary.
+    let manifest = format!("create_new(/p/dest/.flux/operations/{}/manifest.tmp)", id(5));
+    assert!(apply < after(&c, at(&c, "claim_prepared"), &manifest), "{c:?}");
+    assert!(apply < at(&c, "read_dir(/p/dest)"), "{c:?}");
+    assert!(apply < at(&c, "create_new(/p/dest/a.flux-partial."), "{c:?}");
 }

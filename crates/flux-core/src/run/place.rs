@@ -2,6 +2,7 @@
 //! `DEST/.flux/operations/<id>/manifest` and its lock is beside DEST; a single file's state is the record
 //! `<target>.flux-state.<id>` beside the target, with its lock.
 
+use super::recover::{RecoverError, recover_publications, uncertain_detail};
 use super::session::{Fault, Locked, checked, failed, from_lock};
 use super::sweep::sweep_partials;
 use super::{RunError, RunStep, RunWarning};
@@ -87,12 +88,23 @@ pub(crate) trait Place<D: DirHandle> {
     fn roots(&self) -> Vec<Root>;
     /// Cut 9a: adopt a validated prior. A tree opens `operations/<id>/state.db` (`open_claim_store`), or, while
     /// `prior.state` is `CREATED` and the file is absent, zero-length or `Code::StateCorrupt`, removes what is there
-    /// and creates a fresh store; returns the claim count. A single file opens nothing and returns `None`.
+    /// and creates a fresh store; returns the claim count. Cut 9c: then runs commit recovery over the store's prepared
+    /// notes (`recover::recover_publications`) before the store is handed to the walk. A single file opens nothing and
+    /// returns `None`.
     fn adopt(
         &mut self,
         prior: &OperationState,
         durability: Durability,
-    ) -> Result<Option<u64>, RunError>;
+        warnings: &mut Vec<RunWarning>,
+    ) -> Result<Option<AdoptedStore>, RunError>;
+}
+
+/// What a tree's adoption found in its claim store: the claim count (before recovery), and the RENAMED notes commit
+/// recovery turned into claims (cut 9c).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AdoptedStore {
+    pub claims: u64,
+    pub recovered: u64,
 }
 
 /// Which file of the probe a failure was at: the temporary's creation, or the publish onto `PROBE`.
@@ -557,7 +569,8 @@ impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {
         &mut self,
         prior: &OperationState,
         durability: Durability,
-    ) -> Result<Option<u64>, RunError> {
+        warnings: &mut Vec<RunWarning>,
+    ) -> Result<Option<AdoptedStore>, RunError> {
         let id = prior.operation_id.as_str();
         let db = self.operations_shown().join(id).join(STATE_DB);
         let dest = self.dest.as_ref().expect("the scan found the prior under DEST");
@@ -584,7 +597,7 @@ impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {
                     .map_err(|e| failed(RunStep::State, &db, e))?;
                 self.claims = Some(store);
                 self.operations = Some(operations);
-                return Ok(Some(0));
+                return Ok(Some(AdoptedStore { claims: 0, recovered: 0 }));
             }
             Err(e) if e.source.kind() == ErrorKind::NotFound => {
                 return Err(refused_state(
@@ -595,9 +608,27 @@ impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {
             Err(e) => return Err(state_error(&db, e)),
         };
         let claims = store.count().map_err(|e| state_error(&db, e))?;
+        let mut store = store;
+        // Cut 9c (spec decision 7): commit recovery runs here, before the store is handed to the walk, so the walk plans
+        // nothing before every interrupted publication is decided. A format-1 store has no notes.
+        let mut recovered = 0;
+        if store.supports_prepared() {
+            let manifest = self.shown(id);
+            match recover_publications(dest, &self.dest_shown, id, &mut store, warnings, &manifest)
+            {
+                Ok(r) => recovered = r.recovered,
+                Err(RecoverError::Uncertain(list)) => {
+                    return Err(refused_state(
+                        LockCode::CommitStateUncertain,
+                        uncertain_detail(&list),
+                    ));
+                }
+                Err(RecoverError::Store(e)) => return Err(state_error(&db, e)),
+            }
+        }
         self.claims = Some(store);
         self.operations = Some(operations);
-        Ok(Some(claims))
+        Ok(Some(AdoptedStore { claims, recovered }))
     }
 }
 
@@ -772,7 +803,8 @@ impl<D: DirHandle> Place<D> for FilePlace<'_, D> {
         &mut self,
         _prior: &OperationState,
         _durability: Durability,
-    ) -> Result<Option<u64>, RunError> {
+        _warnings: &mut Vec<RunWarning>,
+    ) -> Result<Option<AdoptedStore>, RunError> {
         Ok(None)
     }
 }

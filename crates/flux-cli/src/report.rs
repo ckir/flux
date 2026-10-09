@@ -376,17 +376,22 @@ pub fn run_lines<T>(run: &Run<T>) -> Vec<String> {
     v
 }
 
-/// Cut 9a: the run's resume note, then `resumed <n> already-complete files` when `files_resumed > 0`.
+/// Cut 9a: the run's resume note, then (cut 9c) `recovered <k> interrupted publications` when `k > 0`, then
+/// `resumed <n> already-complete files` when `files_resumed > 0`.
 pub fn resume_lines<T>(run: &Run<T>, files_resumed: u64) -> Vec<String> {
     let mut v = Vec::new();
     match &run.resumed {
         None => {}
         Some(ResumeNote::StartedNew) => v.push("no prior operation; starting new".to_string()),
-        Some(ResumeNote::Adopted { operation_id, claims: Some(n) }) => {
-            v.push(format!("resuming operation {operation_id} ({n} entries claimed)"));
-        }
-        Some(ResumeNote::Adopted { operation_id, claims: None }) => {
-            v.push(format!("resuming operation {operation_id}"));
+        Some(ResumeNote::Adopted { operation_id, claims, recovered }) => {
+            v.push(match claims {
+                Some(n) => format!("resuming operation {operation_id} ({n} entries claimed)"),
+                None => format!("resuming operation {operation_id}"),
+            });
+            // Cut 9c: the interrupted publications commit recovery found published.
+            if *recovered > 0 {
+                v.push(format!("recovered {recovered} interrupted publications"));
+            }
         }
     }
     if files_resumed > 0 {
@@ -850,7 +855,8 @@ mod tests {
             resume_lines(&with(Some(ResumeNote::StartedNew)), 0),
             vec!["no prior operation; starting new".to_string()]
         );
-        let adopted = |claims| Some(ResumeNote::Adopted { operation_id: "op1".into(), claims });
+        let adopted =
+            |claims| Some(ResumeNote::Adopted { operation_id: "op1".into(), claims, recovered: 0 });
         assert_eq!(
             resume_lines(&with(adopted(Some(3))), 0),
             vec!["resuming operation op1 (3 entries claimed)".to_string()]
@@ -867,6 +873,29 @@ mod tests {
             ]
         );
         assert!(resume_lines(&with(None), 0).is_empty());
+        // Cut 9c: the recovered publications follow the note, and precede the resumed files.
+        let recovering = |recovered| {
+            Some(ResumeNote::Adopted { operation_id: "op1".into(), claims: Some(3), recovered })
+        };
+        assert_eq!(
+            resume_lines(&with(recovering(2)), 0),
+            vec![
+                "resuming operation op1 (3 entries claimed)".to_string(),
+                "recovered 2 interrupted publications".to_string()
+            ]
+        );
+        assert_eq!(
+            resume_lines(&with(recovering(0)), 0),
+            vec!["resuming operation op1 (3 entries claimed)".to_string()]
+        );
+        assert_eq!(
+            resume_lines(&with(recovering(2)), 7),
+            vec![
+                "resuming operation op1 (3 entries claimed)".to_string(),
+                "recovered 2 interrupted publications".to_string(),
+                "resumed 7 already-complete files".to_string()
+            ]
+        );
     }
 
     #[test]

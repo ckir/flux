@@ -9,6 +9,7 @@
 //! change it.
 
 pub(crate) mod place;
+mod recover;
 mod restart;
 mod resume;
 pub(crate) mod session;
@@ -101,8 +102,9 @@ pub struct Run<T> {
 pub enum ResumeNote {
     /// `--resume` found no resumable prior: a new operation started.
     StartedNew,
-    /// The prior adopted; `claims` is its claim count (a tree), `None` for a single file.
-    Adopted { operation_id: String, claims: Option<u64> },
+    /// The prior adopted; `claims` is its claim count (a tree), `None` for a single file. `recovered` is the number of
+    /// interrupted publications commit recovery found published (cut 9c, RENAMED notes only; 0 for a single file).
+    Adopted { operation_id: String, claims: Option<u64>, recovered: u64 },
 }
 
 /// Why the run stopped outside the copy.
