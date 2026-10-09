@@ -4044,3 +4044,277 @@ fn a_copy_leaves_an_abandoned_single_file_record_alone() {
     assert!(fs.exists(&own) && fs.exists(record_path(&id(5))));
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
 }
+
+// Cut 9c Task 5: a Strict tree publication writes a prepared note before the rename, commits it with the claim after
+// it, and discards it when the publication fails after the note. Normal (or a format-1 store) is cut 9a's path.
+
+fn strict() -> CopyOptions {
+    CopyOptions { durability: Durability::Strict, ..opts() }
+}
+
+/// The index of `name`'s publish under `/p/dest` (a new file: `rename_no_replace` of this run's temporary).
+fn publish_of(c: &[String], name: &str) -> usize {
+    at(c, &format!("rename_no_replace(/p/dest/{name}.flux-partial.{ID} -> /p/dest/{name})"))
+}
+
+#[test]
+fn a_strict_publication_prepares_before_the_rename_and_commits_after_it() {
+    // Mutants (tree.rs): no hook for a new file under Strict; `record_claim` kept in place of `commit_prepared`.
+    let fs = fake();
+    let (r, got) = run_tree_with(&fs, &cfg(), &strict());
+    ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    let c = calls(&fs);
+    let prepare = at(&c, "claim_prepare(a)");
+    let rename = publish_of(&c, "a");
+    let commit = at(&c, "claim_commit_prepared(a)");
+    assert!(prepare < rename && rename < commit, "{c:?}");
+    assert_eq!(count(&c, "claim_prepare(a)"), 1, "{c:?}");
+    assert!(
+        !c.iter().any(|x| x.starts_with("claim_insert(a)")),
+        "commit_prepared replaces the insert: {c:?}"
+    );
+    assert_eq!(fs.prepared_count(), 0);
+    let dest = strong(&fs, "/p/dest");
+    assert_eq!(
+        fs.claim(dest, "a"),
+        Some(ClaimRecord { target: key("a"), status: ClaimStatus::Created })
+    );
+}
+
+#[test]
+fn a_normal_publication_writes_no_note() {
+    // Mutant: drop the `Durability::Strict` test from the gate (tree.rs): notes under Normal.
+    let fs = fake();
+    let (r, got) = run_tree(&fs, &cfg());
+    ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    let c = calls(&fs);
+    assert!(!c.iter().any(|x| x.starts_with("claim_prepare(")), "{c:?}");
+    assert!(!c.iter().any(|x| x.starts_with("claim_commit_prepared(")), "{c:?}");
+    assert!(publish_of(&c, "a") < at(&c, "claim_insert(a)"), "today's claim path: {c:?}");
+}
+
+#[test]
+fn a_format_1_store_under_strict_writes_no_note() {
+    // Mutant: drop the `supports_prepared()` test from the gate (tree.rs): a format-1 store is asked for notes.
+    let fs = resumable_with(&strict(), 100, b"o", 101, ClaimStatus::Created);
+    fs.set_claim_store_format(state_db(5), 1);
+    let (r, got) = run_tree_with(&fs, &resume(), &strict());
+    let out = ok(&r);
+    adopted(&r, 5, Some(1));
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(
+        (out.files_resumed, out.files_copied),
+        (1, 1),
+        "a resumed, sub/b published: {out:?}"
+    );
+    assert_eq!(fs.read_file("/p/dest/sub/b").as_deref(), Some(&b"BB"[..]), "sub/b is published");
+    let c = calls(&fs);
+    assert!(!c.iter().any(|x| x.starts_with("claim_prepare(")), "{c:?}");
+    assert!(c.iter().any(|x| x.starts_with("claim_insert(b)")), "today's claim path: {c:?}");
+}
+
+#[test]
+fn a_prepare_failure_fails_the_file_before_the_rename() {
+    // Mutant: map the hook's error to `Ok(())` (tree.rs): the file is published without a note.
+    let fs = fake();
+    fs.fail("claim_prepare", Code::IoError);
+    let (r, got) = run_tree_with(&fs, &cfg(), &strict());
+    let out = ok(&r);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].path, PathBuf::from("a"));
+    assert_eq!(step_of(&got[0]), CopyStep::Claim);
+    let c = calls(&fs);
+    assert!(!c.iter().any(|x| x.starts_with("rename_no_replace(/p/dest/a.flux-partial")), "{c:?}");
+    assert!(
+        !c.iter().any(|x| x.starts_with("claim_discard_prepared(")),
+        "no note to discard: {c:?}"
+    );
+    assert!(!fs.exists(format!("/p/dest/a.flux-partial.{ID}")), "the temporary is discarded");
+    assert!(!fs.exists("/p/dest/a"));
+    assert_eq!(fs.prepared_count(), 0);
+    assert_eq!(out.files_copied, 1, "{out:?}");
+    assert_eq!(
+        fs.read_file("/p/dest/sub/b").as_deref(),
+        Some(&b"BB"[..]),
+        "the rest of the tree is copied"
+    );
+}
+
+#[test]
+fn a_commit_failure_keeps_the_note_and_reports_claim_not_recorded() {
+    // Mutant: discard the note when `commit_prepared` fails (tree.rs).
+    let fs = fake();
+    fs.fail("claim_commit_prepared", Code::IoError);
+    let (r, got) = run_tree_with(&fs, &cfg(), &strict());
+    let out = ok(&r);
+    assert_eq!(fs.read_file("/p/dest/a").as_deref(), Some(&b"A"[..]), "the file IS published");
+    assert_eq!(out.files_copied, 2, "{out:?}");
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].path, PathBuf::from("a"));
+    assert!(matches!(got[0].cause, TreeFailureCause::ClaimNotRecorded(_)), "{got:?}");
+    assert_eq!(fs.prepared_count(), 1, "the note stays for recovery");
+    let c = calls(&fs);
+    assert!(!c.iter().any(|x| x.starts_with("claim_discard_prepared(")), "{c:?}");
+}
+
+#[test]
+fn a_publish_failure_after_the_note_discards_it() {
+    // Mutant: skip the discard (tree.rs).
+    let fs = fake();
+    // `rename_no_replace`: the no-replace probe (1), the workspace publish `<ID>.creating -> <ID>` (2), then `a`'s
+    // publish (3), measured from a green Strict run's call log.
+    fs.fail_nth("rename_no_replace", 3, Code::IoError, std::io::ErrorKind::Other);
+    let (r, got) = run_tree_with(&fs, &cfg(), &strict());
+    ok(&r);
+    let c = calls(&fs);
+    let prepare = at(&c, "claim_prepare(a)");
+    let rename = publish_of(&c, "a");
+    let discard = at(&c, "claim_discard_prepared(a)");
+    assert!(prepare < rename && rename < discard, "{c:?}");
+    assert!(!c.iter().any(|x| x.starts_with("claim_commit_prepared(a)")), "{c:?}");
+    assert_eq!(fs.prepared_count(), 0);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].path, PathBuf::from("a"));
+    assert_eq!(step_of(&got[0]), CopyStep::Publish);
+    assert!(!fs.exists("/p/dest/a"));
+}
+
+#[test]
+fn a_lost_lock_after_the_note_discards_it_and_keeps_the_temporary() {
+    // Mutant: discard only after `finish_copy(..)?` (tree.rs): the abort returns first and the note stays.
+    let fs = fake();
+    // The idiom of `restart_stops_when_ownership_is_lost_and_deletes_nothing_after`: the lock is taken over, here just
+    // before `a`'s note is written, so the publish guard that follows the note finds it gone.
+    fs.on_nth("claim_prepare", 1, |fs| fs.write_file(LOCK, b"another run's bytes"));
+    let (r, _) = run_tree_with(&fs, &cfg(), &strict());
+    assert!(r.stop.is_none(), "the copy's abort is the report: {:?}", r.stop);
+    let a = aborted(&r);
+    assert_eq!(a.error.code(), Code::TargetLockBusy);
+    assert!(a.error.leftover.is_some(), "{:?}", a.error);
+    let c = calls(&fs);
+    assert!(at(&c, "claim_prepare(a)") < at(&c, "claim_discard_prepared(a)"), "{c:?}");
+    assert!(!c.iter().any(|x| x.starts_with("rename_no_replace(/p/dest/a.flux-partial")), "{c:?}");
+    assert_eq!(fs.prepared_count(), 0);
+    assert!(
+        fs.exists(format!("/p/dest/a.flux-partial.{ID}")),
+        "the guard forbids removing the temporary"
+    );
+    assert!(!fs.exists("/p/dest/a") && !fs.exists("/p/dest/sub/b"), "the run stops");
+    assert_eq!(fs.read_file(LOCK).as_deref(), Some(&b"another run's bytes"[..]), "never unlinked");
+}
+
+#[test]
+fn a_strict_replacement_commits_the_planned_claim_too() {
+    // Mutant: pass `None` as `commit_prepared`'s planned key (tree.rs).
+    let fs = FaultFs::new();
+    for d in ["/src", "/p", "/p/dest"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    fs.write_file("/src/a", b"new");
+    fs.write_file("/p/dest/A", b"old");
+    fs.set_case_insensitive(true);
+    let (r, got) = run_tree_with(&fs, &cfg(), &strict());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(out.files_overwritten, 1, "{out:?}");
+    let c = calls(&fs);
+    let prepare = at(&c, "claim_prepare(A)");
+    // The fake logs the rename's target as the name it resolved to: the stored spelling.
+    let rename = at(&c, &format!("rename_replace(/p/dest/a.flux-partial.{ID} -> "));
+    let commit = at(&c, "claim_commit_prepared(A)");
+    assert!(prepare < rename && rename < commit, "{c:?}");
+    assert!(!c.iter().any(|x| x.starts_with("claim_upgrade(")), "{c:?}");
+    assert!(!c.iter().any(|x| x.starts_with("claim_insert(a)")), "{c:?}");
+    let dest = strong(&fs, "/p/dest");
+    let created = Some(ClaimRecord { target: key("a"), status: ClaimStatus::Created });
+    assert_eq!(fs.claim(dest, "A"), created, "the stored spelling");
+    assert_eq!(fs.claim(dest, "a"), created, "the planned spelling");
+    assert_eq!(fs.prepared_count(), 0);
+}
+
+/// Every note in prior 5's store, read through a second handle.
+fn notes_of_prior_5(fs: &FaultFs) -> Vec<(ClaimKey, flux_fs::PreparedRecord)> {
+    fs.destination_root(Path::new(&format!("/p/dest/.flux/operations/{}", id(5))))
+        .unwrap()
+        .open_claim_store(OsStr::new("state.db"), Durability::Strict)
+        .unwrap()
+        .prepared()
+        .unwrap()
+}
+
+#[test]
+fn a_strict_note_carries_the_publications_fields() {
+    // Mutants: `dir_path` from the full path; `planned_name` always the planned name; `replacement` always false.
+    let fs = fake();
+    prior3_with(&fs, 5, OpState::Transferring, &strict());
+    drop(prior_store(&fs, 5));
+    fs.write_file("/p/dest/A", b"old");
+    fs.set_case_insensitive(true);
+    let seen: Arc<Mutex<Vec<(ClaimKey, flux_fs::PreparedRecord)>>> = Arc::default();
+    let keep = Arc::clone(&seen);
+    // Read each note just before its commit: `A`'s (1), then `sub/b`'s (2).
+    fs.on_nth("claim_commit_prepared", 1, move |fs| {
+        keep.lock().unwrap().extend(notes_of_prior_5(fs));
+        let keep = Arc::clone(&keep);
+        fs.on_nth("claim_commit_prepared", 2, move |fs| {
+            keep.lock().unwrap().extend(notes_of_prior_5(fs));
+        });
+    });
+    let (r, got) = run_tree_with(&fs, &resume(), &strict());
+    ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    let notes = seen.lock().unwrap().clone();
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    let identity = |p: &str| identity_text(fs.metadata(Path::new(p)).unwrap().identity);
+    let temp = |name: &str| format!("{name}.flux-partial.{}", id(5)).into_bytes();
+    let (k, n) = &notes[0];
+    assert_eq!(*k, ClaimKey::new(strong(&fs, "/p/dest"), OsStr::new("A")));
+    assert_eq!(
+        *n,
+        flux_fs::PreparedRecord {
+            target: key("a"),
+            temp_name: temp("a"),
+            identity: identity("/p/dest/a"),
+            dir_path: String::new(),
+            name: b"A".to_vec(),
+            planned_name: b"a".to_vec(),
+            replacement: true,
+        }
+    );
+    let (k, n) = &notes[1];
+    assert_eq!(*k, ClaimKey::new(strong(&fs, "/p/dest/sub"), OsStr::new("b")));
+    assert_eq!(
+        *n,
+        flux_fs::PreparedRecord {
+            target: key("sub\0b"),
+            temp_name: temp("b"),
+            identity: identity("/p/dest/sub/b"),
+            dir_path: native_hex(Path::new("sub")),
+            name: b"b".to_vec(),
+            planned_name: Vec::new(),
+            replacement: false,
+        }
+    );
+    assert_eq!(fs.prepared_count(), 0);
+}
+
+#[test]
+fn the_note_precedes_the_publish_heartbeat_and_guard() {
+    // Mutant (copy.rs, reverted by hand): call `before_publish` after the final `beat()` and `guard()`.
+    let fs = fake();
+    let (r, got) = run_tree_with(&fs, &beating(), &strict());
+    ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    let c = calls(&fs);
+    let prepare = at(&c, "claim_prepare(a)");
+    let rename = publish_of(&c, "a");
+    let window = &c[prepare..rename];
+    let beat = window.iter().position(|x| x.starts_with("write_at_start("));
+    let guard = window.iter().rposition(|x| *x == format!("metadata({LOCK})"));
+    assert!(
+        matches!((beat, guard), (Some(b), Some(g)) if b < g),
+        "the heartbeat, then the guard, between the note and the rename: {window:?}"
+    );
+}

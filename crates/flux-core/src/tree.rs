@@ -4,16 +4,17 @@
 //! Design authority: `docs/superpowers/specs/2026-09-26-cut-4b-copy-tree-design.md`.
 
 use crate::copy::{
-    CopyError, CopyStep, Guard, Heartbeat, copy_file_guarded, no_before_create, no_before_publish,
-    no_heartbeat, split_destination, unguarded, weaker,
+    BeforePublish, CopyError, CopyStep, Guard, Heartbeat, PublishIntent, copy_file_guarded,
+    no_before_create, no_before_publish, no_heartbeat, split_destination, unguarded, weaker,
 };
 use crate::names::{NameIndex, Resolved};
-use crate::state::{FLUX_DIR, RESERVED_DIRS};
+use crate::state::{FLUX_DIR, RESERVED_DIRS, identity_text, native_hex};
 use crate::walk::{Walk, WalkEvent, walk};
 use flux_fs::{
     ClaimKey, ClaimOutcome, ClaimRecord, ClaimStatus, ClaimStore, Code, CopyOptions,
-    DestinationRoot, DirHandle, ExistingPolicy, FileIdentity, FileSystem, FileType, FluxPathKey,
-    FsError, Metadata, MetadataFailure, MountRoot, ObjectId, Preserve, Publish, Safety,
+    DestinationRoot, DirHandle, Durability, ExistingPolicy, FileIdentity, FileSystem, FileType,
+    FluxPathKey, FsError, Metadata, MetadataFailure, MountRoot, ObjectId, PreparedRecord, Preserve,
+    Publish, Safety,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
@@ -955,9 +956,26 @@ fn copy_one<F: DestinationRoot>(
     };
 
     let own = |status| ClaimRecord { target: target.clone(), status };
+    // Cut 9c: a Strict publication into a store with the `prepared` table writes a note before its rename (the hook),
+    // commits it with the claim after it, and discards it when the copy fails after the note. Otherwise: cut 9a.
+    let strict = cx.opts.durability == Durability::Strict && claims.borrow().supports_prepared();
+    let wrote = std::cell::Cell::new(false);
     match plan {
         // 3. Plan as new.
         Plan::New => {
+            let key = ClaimKey::new(parent_id, name);
+            let template = PreparedRecord {
+                target: target.clone(),
+                temp_name: Vec::new(),
+                identity: String::new(),
+                dir_path: note_dir(&path),
+                name: name.as_encoded_bytes().to_vec(),
+                planned_name: Vec::new(),
+                replacement: false,
+            };
+            let hook = |intent: &PublishIntent| write_note(claims, &key, &template, &wrote, intent);
+            let before_publish: &BeforePublish<'_> =
+                if strict { &hook } else { &no_before_publish };
             let opts = CopyOptions {
                 existing: ExistingPolicy::Overwrite,
                 publish: Publish::NoReplace,
@@ -972,19 +990,20 @@ fn copy_one<F: DestinationRoot>(
                 cx.guard,
                 cx.beat,
                 &no_before_create,
-                &no_before_publish,
+                before_publish,
             );
+            discard_note_on_failure(claims, &key, &wrote, &result);
             let published = match &result {
                 Ok(o) => Some(o.published_identity),
                 Err(_) => None,
             };
             finish_copy(path.clone(), result, out, on_report)?;
             if let Some(identity) = published {
-                let recorded = record_claim(
-                    claims,
-                    &ClaimKey::new(parent_id, name),
-                    &own(ClaimStatus::Created),
-                );
+                let recorded = if strict {
+                    claims.borrow_mut().commit_prepared(&key, &target, None)
+                } else {
+                    record_claim(claims, &key, &own(ClaimStatus::Created))
+                };
                 if let Err(e) = recorded {
                     report(out, on_report, path, TreeFailureCause::ClaimNotRecorded(e));
                 }
@@ -1014,6 +1033,23 @@ fn copy_one<F: DestinationRoot>(
                     Err(e) => Err(CopyError::at(CopyStep::Claim, e)),
                 }
             };
+            let template = PreparedRecord {
+                target: target.clone(),
+                temp_name: Vec::new(),
+                identity: String::new(),
+                dir_path: note_dir(&path),
+                name: stored.as_encoded_bytes().to_vec(),
+                planned_name: if name != stored {
+                    name.as_encoded_bytes().to_vec()
+                } else {
+                    Vec::new()
+                },
+                replacement: true,
+            };
+            let hook =
+                |intent: &PublishIntent| write_note(claims, &key_stored, &template, &wrote, intent);
+            let before_publish: &BeforePublish<'_> =
+                if strict { &hook } else { &no_before_publish };
             let opts = CopyOptions {
                 existing: ExistingPolicy::Overwrite,
                 publish: Publish::Replace,
@@ -1028,8 +1064,9 @@ fn copy_one<F: DestinationRoot>(
                 cx.guard,
                 cx.beat,
                 &before_create,
-                &no_before_publish,
+                before_publish,
             );
+            discard_note_on_failure(claims, &key_stored, &wrote, &result);
             let published = match &result {
                 Ok(o) => Some(o.published_identity),
                 Err(_) => None,
@@ -1038,15 +1075,21 @@ fn copy_one<F: DestinationRoot>(
             if let Some(identity) = published {
                 out.files_overwritten += 1;
                 // The entry now holds the new object under its stored name (and, on some systems, the planned one).
-                let mut recorded = claims.borrow_mut().upgrade_own_claim(&key_stored, &target);
-                if name != stored {
-                    let planned = record_claim(
-                        claims,
-                        &ClaimKey::new(parent_id, name),
-                        &own(ClaimStatus::Created),
-                    );
-                    recorded = recorded.and(planned);
-                }
+                let recorded = if strict {
+                    let planned = (name != stored).then(|| ClaimKey::new(parent_id, name));
+                    claims.borrow_mut().commit_prepared(&key_stored, &target, planned.as_ref())
+                } else {
+                    let mut recorded = claims.borrow_mut().upgrade_own_claim(&key_stored, &target);
+                    if name != stored {
+                        let planned = record_claim(
+                            claims,
+                            &ClaimKey::new(parent_id, name),
+                            &own(ClaimStatus::Created),
+                        );
+                        recorded = recorded.and(planned);
+                    }
+                    recorded
+                };
                 if let Err(e) = recorded {
                     report(out, on_report, path, TreeFailureCause::ClaimNotRecorded(e));
                 }
@@ -1058,6 +1101,48 @@ fn copy_one<F: DestinationRoot>(
             }
             Ok(())
         }
+    }
+}
+
+/// Cut 9c: `native_hex` of the entry's directory relative to DEST; empty for DEST itself (spec decision 5).
+fn note_dir(path: &Path) -> String {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => native_hex(dir),
+        _ => String::new(),
+    }
+}
+
+/// Cut 9c: `before_publish` for a Strict publication: `template` completed with the temporary's name and identity,
+/// written as the note at `key`. A store error fails the copy at `CopyStep::Claim` (the temporary is discarded);
+/// `wrote` remembers a written note, so a failure after it discards it.
+fn write_note<C: ClaimStore>(
+    claims: &std::cell::RefCell<C>,
+    key: &ClaimKey,
+    template: &PreparedRecord,
+    wrote: &std::cell::Cell<bool>,
+    intent: &PublishIntent,
+) -> std::result::Result<(), CopyError> {
+    let record = PreparedRecord {
+        temp_name: intent.temp.as_encoded_bytes().to_vec(),
+        identity: identity_text(intent.identity),
+        ..template.clone()
+    };
+    claims.borrow_mut().prepare(key, &record).map_err(|e| CopyError::at(CopyStep::Claim, e))?;
+    wrote.set(true);
+    Ok(())
+}
+
+/// Cut 9c: a copy that failed after its note was written (the heartbeat, the guard or the rename) did not publish, so
+/// the note is discarded at once, before `finish_copy` can stop the run. Best effort: a note left behind is decided by
+/// the recovery matrix at the next resume.
+fn discard_note_on_failure<C: ClaimStore>(
+    claims: &std::cell::RefCell<C>,
+    key: &ClaimKey,
+    wrote: &std::cell::Cell<bool>,
+    result: &std::result::Result<flux_fs::Outcome, CopyError>,
+) {
+    if wrote.get() && result.is_err() {
+        let _ = claims.borrow_mut().discard_prepared(key);
     }
 }
 
