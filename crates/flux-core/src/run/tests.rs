@@ -3009,7 +3009,7 @@ fn an_incompatible_state_db_is_refused() {
     let fs = fake();
     let p = prior3(&fs, 5, OpState::Failed);
     drop(prior_store(&fs, 5));
-    fs.set_claim_store_format(state_db(5), 2);
+    fs.set_claim_store_format(state_db(5), 3);
     let (r, _) = run_tree(&fs, &resume());
     assert_eq!(refused(&r.stop), (LockCode::IncompatibleState, false));
     assert!(detail(&r.stop).contains("state.db"), "{}", detail(&r.stop));

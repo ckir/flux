@@ -120,7 +120,11 @@ struct Inner {
     claim_stores: Vec<ClaimMap>,
     /// path -> the map `create_claim_store` made there, so `open_claim_store` can reopen it.
     claim_files: HashMap<PathBuf, ClaimMap>,
-    /// `set_claim_store_format`; an absent path means format 1.
+    /// Every claim store's prepared notes (`ClaimKey::encode` -> `PreparedRecord::encode`), parallel to `claim_stores`.
+    prepared_stores: Vec<ClaimMap>,
+    /// path -> the prepared-note map of the store created there.
+    prepared_files: HashMap<PathBuf, ClaimMap>,
+    /// `set_claim_store_format`; an absent path means format 2.
     claim_formats: HashMap<PathBuf, u64>,
     /// Fake claim stores created and not yet dropped (`claim_stores_open`).
     claim_stores_open: usize,
@@ -134,6 +138,8 @@ type ClaimMap = std::sync::Arc<Mutex<std::collections::BTreeMap<Vec<u8>, Vec<u8>
 /// fault keys `claim_insert`, `claim_get`, `claim_upgrade`, `claim_flush`.
 pub struct FakeClaimStore {
     map: ClaimMap,
+    prepared: ClaimMap,
+    path: PathBuf,
     inner: std::sync::Arc<Mutex<Inner>>,
 }
 
@@ -149,6 +155,82 @@ impl FakeClaimStore {
     fn record(&self, call: String, key: &str) -> Result<()> {
         FaultFs { inner: std::sync::Arc::clone(&self.inner) }.record(call, key)
     }
+
+    /// This store's format: `set_claim_store_format`, else 2.
+    fn format(&self) -> u64 {
+        self.inner.lock().unwrap().claim_formats.get(&self.path).copied().unwrap_or(2)
+    }
+
+    fn require_prepared(&self) -> Result<()> {
+        if self.format() == 2 {
+            return Ok(());
+        }
+        Err(FsError::new(
+            Code::IncompatibleState,
+            std::io::Error::other("the claim store has no prepared table"),
+        ))
+    }
+
+    /// `ops` against clones of both maps, swapped in only if every op succeeds (the real store's one transaction).
+    fn apply(&self, ops: &[RecoveryOp]) -> Result<()> {
+        let mut claims = self.map.lock().unwrap();
+        let mut prepared = self.prepared.lock().unwrap();
+        let mut c = claims.clone();
+        let mut p = prepared.clone();
+        for op in ops {
+            apply_op(&mut c, &mut p, op)?;
+        }
+        *claims = c;
+        *prepared = p;
+        Ok(())
+    }
+}
+
+type Bytes = std::collections::BTreeMap<Vec<u8>, Vec<u8>>;
+
+/// One recovery operation: the real store's `apply_in` rules over plain maps.
+fn apply_op(claims: &mut Bytes, prepared: &mut Bytes, op: &RecoveryOp) -> Result<()> {
+    match op {
+        RecoveryOp::Discard { key } => {
+            prepared.remove(&key.encode());
+        }
+        RecoveryOp::Commit { key, target, planned } => {
+            let foreign = || {
+                FsError::new(
+                    Code::IoError,
+                    std::io::Error::other("a claim owned by another target is in the way"),
+                )
+            };
+            // None: absent. Some(false): ours. Some(true): foreign (or undecodable).
+            let owned_by_other = |claims: &Bytes, k: &[u8]| -> Option<bool> {
+                claims.get(k).map(|v| match ClaimRecord::decode(v) {
+                    Some(r) => r.target != *target,
+                    None => true,
+                })
+            };
+            let k = key.encode();
+            if owned_by_other(claims, &k) == Some(true) {
+                return Err(foreign());
+            }
+            let pk = planned.as_ref().map(|p| p.encode());
+            let planned_absent = match &pk {
+                Some(pk) => match owned_by_other(claims, pk) {
+                    Some(true) => return Err(foreign()),
+                    Some(false) => false,
+                    None => true,
+                },
+                None => false,
+            };
+            let created =
+                ClaimRecord { target: target.clone(), status: flux_fs::ClaimStatus::Created };
+            claims.insert(k.clone(), created.encode());
+            if let (Some(pk), true) = (pk, planned_absent) {
+                claims.insert(pk, created.encode());
+            }
+            prepared.remove(&k);
+        }
+    }
+    Ok(())
 }
 
 fn corrupt_claim() -> FsError {
@@ -218,38 +300,87 @@ impl ClaimStore for FakeClaimStore {
     }
 
     fn supports_prepared(&self) -> bool {
-        false
+        self.format() == 2
     }
 
-    fn prepare(&mut self, _key: &ClaimKey, _record: &PreparedRecord) -> Result<()> {
-        Err(unsupported())
+    fn prepare(&mut self, key: &ClaimKey, record: &PreparedRecord) -> Result<()> {
+        self.record(
+            format!("claim_prepare({})", String::from_utf8_lossy(&key.name)),
+            "claim_prepare",
+        )?;
+        self.require_prepared()?;
+        let mut p = self.prepared.lock().unwrap();
+        let k = key.encode();
+        if p.contains_key(&k) {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::other("a prepared note already exists at this key"),
+            ));
+        }
+        p.insert(k, record.encode());
+        Ok(())
     }
 
     fn commit_prepared(
         &mut self,
-        _key: &ClaimKey,
-        _target: &FluxPathKey,
-        _planned: Option<&ClaimKey>,
+        key: &ClaimKey,
+        target: &FluxPathKey,
+        planned: Option<&ClaimKey>,
     ) -> Result<()> {
-        Err(unsupported())
+        self.record(
+            format!("claim_commit_prepared({})", String::from_utf8_lossy(&key.name)),
+            "claim_commit_prepared",
+        )?;
+        self.require_prepared()?;
+        self.apply(&[RecoveryOp::Commit {
+            key: key.clone(),
+            target: target.clone(),
+            planned: planned.cloned(),
+        }])
     }
 
-    fn discard_prepared(&mut self, _key: &ClaimKey) -> Result<()> {
-        Err(unsupported())
+    fn discard_prepared(&mut self, key: &ClaimKey) -> Result<()> {
+        self.record(
+            format!("claim_discard_prepared({})", String::from_utf8_lossy(&key.name)),
+            "claim_discard_prepared",
+        )?;
+        self.require_prepared()?;
+        self.apply(&[RecoveryOp::Discard { key: key.clone() }])
     }
 
     fn prepared(&self) -> Result<Vec<(ClaimKey, PreparedRecord)>> {
-        Ok(Vec::new())
+        self.record("claim_prepared".to_string(), "claim_prepared")?;
+        if self.format() != 2 {
+            return Ok(Vec::new());
+        }
+        let p = self.prepared.lock().unwrap();
+        let mut out = Vec::new();
+        for (k, v) in p.iter() {
+            let corrupt = |what: &str| {
+                FsError::new(Code::StateCorrupt, std::io::Error::other(what.to_string()))
+            };
+            let (volume, rest) =
+                k.split_first_chunk::<8>().ok_or_else(|| corrupt("corrupt prepared key"))?;
+            let (index, name) =
+                rest.split_first_chunk::<16>().ok_or_else(|| corrupt("corrupt prepared key"))?;
+            let key = ClaimKey {
+                parent: flux_fs::ObjectId {
+                    volume: u64::from_be_bytes(*volume),
+                    index: u128::from_be_bytes(*index),
+                },
+                name: name.to_vec(),
+            };
+            let rec = PreparedRecord::decode(v).ok_or_else(|| corrupt("corrupt prepared note"))?;
+            out.push((key, rec));
+        }
+        Ok(out)
     }
 
-    fn apply_recovery(&mut self, _ops: &[RecoveryOp]) -> Result<()> {
-        Err(unsupported())
+    fn apply_recovery(&mut self, ops: &[RecoveryOp]) -> Result<()> {
+        self.record("claim_apply_recovery".to_string(), "claim_apply_recovery")?;
+        self.require_prepared()?;
+        self.apply(ops)
     }
-}
-
-// Stub until the prepared-note surface lands here (cut 9c).
-fn unsupported() -> FsError {
-    FsError::new(Code::IoError, std::io::Error::from(std::io::ErrorKind::Unsupported))
 }
 
 /// One node in the `DirHandle` graph, addressed by an opaque id rather than by
@@ -714,9 +845,16 @@ impl FaultFs {
         self.inner.lock().unwrap().open_at_state_db_removal
     }
 
-    /// The next `open_claim_store` of `path` answers `Code::IncompatibleState` when `format != 1`.
+    /// Sets the format of the claim store at `path` (default 2). The next `open_claim_store` answers
+    /// `Code::IncompatibleState` when `format` is not 1 or 2; at 1 the store refuses notes and lists none.
     pub fn set_claim_store_format(&self, path: impl AsRef<Path>, format: u64) {
         self.inner.lock().unwrap().claim_formats.insert(path.as_ref().to_path_buf(), format);
+    }
+
+    /// Prepared notes across every store created from this fake.
+    pub fn prepared_count(&self) -> usize {
+        let g = self.inner.lock().unwrap();
+        g.prepared_stores.iter().map(|m| m.lock().unwrap().len()).sum()
     }
 
     /// Claims across every store created from this fake.
@@ -1538,8 +1676,16 @@ impl DirHandle for FakeDirHandle {
         let map = ClaimMap::default();
         g.claim_stores.push(std::sync::Arc::clone(&map));
         g.claim_files.insert(child_path.clone(), std::sync::Arc::clone(&map));
+        let prepared = ClaimMap::default();
+        g.prepared_stores.push(std::sync::Arc::clone(&prepared));
+        g.prepared_files.insert(child_path.clone(), std::sync::Arc::clone(&prepared));
         g.claim_stores_open += 1;
-        Ok(FakeClaimStore { map, inner: std::sync::Arc::clone(&self.inner) })
+        Ok(FakeClaimStore {
+            map,
+            prepared,
+            path: child_path,
+            inner: std::sync::Arc::clone(&self.inner),
+        })
     }
 
     fn open_claim_store(&self, name: &OsStr, _durability: Durability) -> Result<Self::Claims> {
@@ -1570,7 +1716,7 @@ impl DirHandle for FakeDirHandle {
             ));
         };
         let empty = bytes.is_empty();
-        if g.claim_formats.get(&child_path).is_some_and(|f| *f != 1) {
+        if g.claim_formats.get(&child_path).is_some_and(|f| *f != 1 && *f != 2) {
             return Err(FsError::new(
                 Code::IncompatibleState,
                 std::io::Error::other("claim store format is not supported"),
@@ -1580,8 +1726,14 @@ impl DirHandle for FakeDirHandle {
             let msg = if empty { "zero-length claim store" } else { "not a claim store" };
             return Err(FsError::new(Code::StateCorrupt, std::io::Error::other(msg)));
         };
+        let prepared = g.prepared_files.get(&child_path).cloned().unwrap_or_default();
         g.claim_stores_open += 1;
-        Ok(FakeClaimStore { map, inner: std::sync::Arc::clone(&self.inner) })
+        Ok(FakeClaimStore {
+            map,
+            prepared,
+            path: child_path,
+            inner: std::sync::Arc::clone(&self.inner),
+        })
     }
 
     fn open_lock(&self, name: &OsStr) -> Result<Self::Lock> {
@@ -2589,6 +2741,130 @@ mod tests {
     }
 
     #[test]
+    fn the_fake_store_passes_the_prepared_conformance_suite() {
+        use flux_fs::{DestinationRoot, DirHandle, Durability};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let n = std::cell::Cell::new(0u32);
+        flux_fs::claims::conformance::run_prepared_all(|| {
+            n.set(n.get() + 1);
+            let name = format!("state{}.db", n.get());
+            d.create_claim_store(OsStr::new(&name), Durability::Normal).unwrap()
+        });
+    }
+
+    fn test_note(target: &str) -> flux_fs::PreparedRecord {
+        flux_fs::PreparedRecord {
+            target: flux_fs::FluxPathKey(target.as_bytes().to_vec()),
+            temp_name: b"n.flux-partial.x".to_vec(),
+            identity: "strong:1:9".to_string(),
+            dir_path: String::new(),
+            name: b"n".to_vec(),
+            planned_name: Vec::new(),
+            replacement: false,
+        }
+    }
+
+    #[test]
+    fn a_format_1_fake_store_refuses_notes() {
+        use flux_fs::{
+            ClaimKey, ClaimStore, DestinationRoot, DirHandle, Durability, ObjectId, RecoveryOp,
+        };
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let mut s = d.create_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap();
+        assert!(s.supports_prepared(), "a created store is format 2");
+        fs.set_claim_store_format("/d/state.db", 1);
+        assert!(!s.supports_prepared());
+        let k = ClaimKey::new(ObjectId { volume: 1, index: 1 }, OsStr::new("a"));
+        let code = |r: Result<()>| r.expect_err("refused").code;
+        assert_eq!(code(s.prepare(&k, &test_note("a"))), Code::IncompatibleState);
+        assert_eq!(
+            code(s.commit_prepared(&k, &flux_fs::FluxPathKey(b"a".to_vec()), None)),
+            Code::IncompatibleState
+        );
+        assert_eq!(code(s.discard_prepared(&k)), Code::IncompatibleState);
+        assert_eq!(
+            code(s.apply_recovery(&[RecoveryOp::Discard { key: k }])),
+            Code::IncompatibleState
+        );
+        assert!(s.prepared().unwrap().is_empty());
+        assert_eq!(fs.prepared_count(), 0);
+        // A format-1 file still opens.
+        drop(s);
+        assert!(d.open_claim_store(OsStr::new("state.db"), Durability::Normal).is_ok());
+    }
+
+    #[test]
+    fn prepare_records_its_call_and_honours_a_fault() {
+        use flux_fs::{ClaimKey, ClaimStore, DestinationRoot, DirHandle, Durability, ObjectId};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let mut s = d.create_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap();
+        let k = ClaimKey::new(ObjectId { volume: 1, index: 1 }, OsStr::new("n"));
+        fs.fail("claim_prepare", Code::IoError);
+        assert_eq!(s.prepare(&k, &test_note("n")).expect_err("fault").code, Code::IoError);
+        assert_eq!(fs.prepared_count(), 0, "a faulted prepare leaves no note");
+        assert!(fs.calls().iter().any(|c| c == "claim_prepare(n)"), "{:?}", fs.calls());
+        s.prepare(&k, &test_note("n")).unwrap();
+        assert_eq!(fs.prepared_count(), 1);
+        s.prepared().unwrap();
+        fs.fail("claim_prepared", Code::IoError);
+        assert!(s.prepared().is_err());
+        s.commit_prepared(&k, &flux_fs::FluxPathKey(b"n".to_vec()), None).unwrap();
+        s.discard_prepared(&k).unwrap();
+        s.apply_recovery(&[]).unwrap();
+        for c in [
+            "claim_commit_prepared(n)",
+            "claim_discard_prepared(n)",
+            "claim_prepared",
+            "claim_apply_recovery",
+        ] {
+            assert!(fs.calls().iter().any(|x| x == c), "{c} in {:?}", fs.calls());
+        }
+    }
+
+    #[test]
+    fn apply_recovery_on_the_fake_is_all_or_nothing() {
+        use flux_fs::{
+            ClaimKey, ClaimRecord, ClaimStatus, ClaimStore, DestinationRoot, DirHandle, Durability,
+            FluxPathKey, ObjectId, RecoveryOp,
+        };
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let mut s = d.create_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap();
+        let p = ObjectId { volume: 1, index: 1 };
+        let (ka, kb) = (ClaimKey::new(p, OsStr::new("a")), ClaimKey::new(p, OsStr::new("b")));
+        s.prepare(&ka, &test_note("a")).unwrap();
+        s.prepare(&kb, &test_note("b")).unwrap();
+        // b is claimed by another target, so the second op fails and the first must not stick.
+        let foreign =
+            ClaimRecord { target: FluxPathKey(b"other".to_vec()), status: ClaimStatus::Existing };
+        s.insert_if_absent(&kb, &foreign).unwrap();
+        let ops = [
+            RecoveryOp::Commit {
+                key: ka.clone(),
+                target: FluxPathKey(b"a".to_vec()),
+                planned: None,
+            },
+            RecoveryOp::Commit {
+                key: kb.clone(),
+                target: FluxPathKey(b"b".to_vec()),
+                planned: None,
+            },
+        ];
+        assert_eq!(s.apply_recovery(&ops).expect_err("foreign").code, Code::IoError);
+        assert_eq!(fs.prepared_count(), 2, "no note removed");
+        assert_eq!(fs.claim_count(), 1, "no claim written");
+        assert_eq!(s.get(&ka).unwrap(), None);
+        assert_eq!(s.get(&kb).unwrap(), Some(foreign));
+    }
+
+    #[test]
     fn create_claim_store_refuses_a_taken_name() {
         use flux_fs::{DestinationRoot, DirHandle, Durability};
         let fs = FaultFs::new();
@@ -2659,7 +2935,7 @@ mod tests {
         fs.add_symlink("/d/link.db");
         assert_eq!(open("link.db").err().expect("link").code, Code::SafetyRejected);
         drop(d.create_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap());
-        fs.set_claim_store_format("/d/state.db", 2);
+        fs.set_claim_store_format("/d/state.db", 3);
         assert_eq!(open("state.db").err().expect("format").code, Code::IncompatibleState);
     }
 
