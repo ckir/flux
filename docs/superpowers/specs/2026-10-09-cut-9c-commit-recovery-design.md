@@ -1,6 +1,6 @@
 # Cut 9c: recoverable publication under `--durability=strict`
 
-Status: DRAFT for owner review (2026-10-09), branch `spec/cut-9c` off the merged cut 9b. The four scope decisions below were negotiated with agy
+Status: APPROVED by the owner (2026-10-09, including writer's rulings W1-W10), branch `spec/cut-9c` off the merged cut 9b. The four scope decisions below were negotiated with agy
 (consults `.clavity/seams/cut9c-{scope,forks,negotiate-r1}.md`, replies in `.clavity/scratch/cut9c-scope/`) and approved by the owner on 2026-10-09;
 section "Writer's rulings" lists what the owner has not yet seen. Parent spec: `FLUX_FULL_UPDATED_SPEC_V16.md` (sections 119, 156-163, 170-178,
 180-184, 189, 193-194, 241.5, 249, 259.8, 55). Previous slices: `docs/superpowers/specs/2026-10-08-cut-9a-resume-design.md`,
