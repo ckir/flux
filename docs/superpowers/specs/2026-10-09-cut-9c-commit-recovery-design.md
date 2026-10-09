@@ -111,7 +111,7 @@ operation made is not at either name, so redo is the 9a behaviour (the policy ma
 
 Phase 2 runs only when no row is UNCERTAIN. It applies every verdict in ONE redb transaction (synced) so recovery is all-or-nothing. If any row is
 UNCERTAIN, nothing is applied and adoption is refused: `COMMIT_STATE_UNCERTAIN`, exit 3, `changed: false` (the refusal changes nothing, as the exit-3
-rule requires), detail `<path>: cannot tell whether this file was published (<evidence>); the operation's state is preserved. Move or delete the entry you do not want so it reads as absent (the next
+rule requires), detail `<path>: cannot tell whether this file was published (<evidence>); the operation's state is preserved. Move or delete the destination ENTRY you do not want (not the temporary file) so it reads as absent (the next
 resume then redoes the file), or run again with --restart to supersede this operation`, naming up to ten uncertain targets (each with the evidence that kept it undecided: `identity unavailable`, `destination holds another object`, `unreadable directory`, `invalid note`) and the total count, so the operator sees the whole set at once. `--restart` supersedes the
 operation (ABANDONED, partials swept by id, workspace removed) and never touches the object in doubt.
 
@@ -133,8 +133,8 @@ after the resume note: `recovered <k> interrupted publications` when `k > 0` (RE
   gains `fn supports_prepared(&self) -> bool`, `fn prepare(&mut self, key: &ClaimKey, record: &PreparedRecord) -> Result<()>` (inserts the note; a note
   already at `key` is `Code::IoError`), `fn commit_prepared(&mut self, key: &ClaimKey, target: &FluxPathKey, planned: Option<&ClaimKey>) -> Result<()>` (one transaction: the
   claim at `key` becomes `Created` for this target, inserted if absent and upgraded if `Existing` of the same target; when `planned` is given, a
-  `Created` claim for it is inserted too (a replacement the filesystem stored under another spelling, as `tree.rs` records today); the note is
-  deleted; a foreign claim is an error and nothing changes), `fn discard_prepared(&mut self, key: &ClaimKey) -> Result<()>` (idempotent: a key with no note is `Ok`), `fn prepared(&self) -> Result<Vec<(ClaimKey, PreparedRecord)>>`;
+  `Created` claim for it is inserted too (a replacement the filesystem stored under another spelling, as `tree.rs` records today; an existing claim at `planned` owned by the SAME target is accepted, so a retry is idempotent, and one owned by another target is an error and nothing changes); the note is
+  deleted; a foreign claim is an error and nothing changes), `fn discard_prepared(&mut self, key: &ClaimKey) -> Result<()>` (idempotent: a key with no note is `Ok`), `fn apply_recovery(&mut self, ops: &[RecoveryOp]) -> Result<()>` with `RecoveryOp::{Commit { key, target, planned }, Discard { key }}` (ALL operations in ONE synced transaction; this is what phase 2 calls, so recovery is all-or-nothing; nothing changes when any operation errors), `fn prepared(&self) -> Result<Vec<(ClaimKey, PreparedRecord)>>`;
   conformance cases for each (including atomicity: a failed `commit_prepared` leaves both note and claim as they were).
 - `flux-platform/src/claims.rs`: format 2, the `prepared` table (`TableDefinition<&[u8], &[u8]>::new("prepared")`: key `ClaimKey::encode()`, value `PreparedRecord::encode()`), the methods above with `Strict`/`Normal` commit modes (the `prepare` and
   `commit_prepared` commits are ALWAYS `Immediate`; they are only called under Strict), format-1 reading.
@@ -188,8 +188,8 @@ W10. **Spec gaps found:** G2 to G5 and the 259.8 wording "may finalize the commi
 ## Tests (Review Focus; each is pinned by a named test in the plan)
 
 1. The recovery matrix, one test per row and a distractor for each neighbour (R weak, D weak, T present with another identity, D a different object).
-2. The crash-point matrix of section 180 for a Strict publication: after the guard and before `prepare`; after `prepare` and before the rename (T present,
-   D absent or the old object); after the rename and before `commit_prepared` (D holds R); after `commit_prepared`; each with the `link()`+`unlink()`
+2. The crash-point matrix of section 180 for a Strict publication: after the source recheck and before `prepare`; after `prepare` and before the final
+   heartbeat and guard; after the guard and before the rename (T present, D absent or the old object); after the rename and before `commit_prepared` (D holds R); after `commit_prepared`; each with the `link()`+`unlink()`
    fallback (both names present). Fault injection on the fake and real-redb end-to-end runs with hand-built states.
 3. All-or-nothing: two notes, one RENAMED and one UNCERTAIN: nothing is applied, the refusal is exit 3 and the store is byte-identical afterwards.
 4. Normal is unchanged: the same crash under Normal writes no note and resumes exactly as in 9a (a pinned test of the call log: no `prepare` call).
