@@ -1,6 +1,6 @@
 # Cut 9b: the cleanup lifecycle (`flux cleanup`, and finishing a prior run's cleanup)
 
-Status: APPROVED by the owner (2026-10-09, including writer's rulings W1-W9), branch `spec/cut-9b` off the merged cut 9a. Scope and every fork below were negotiated with agy
+Status: APPROVED by the owner (2026-10-09, including writer's rulings W1-W9; implemented by docs/superpowers/plans/2026-10-09-cut-9b-cleanup.md), branch `spec/cut-9b` off the merged cut 9a. Scope and every fork below were negotiated with agy
 (consults in `.clavity/seams/cut9b-*.md`, replies in `.clavity/scratch/cut9b-scope/`) and decided by the owner on 2026-10-08; section "Writer's
 rulings" lists what the owner has not yet seen and must confirm at this review. Parent spec: `FLUX_FULL_UPDATED_SPEC_V16.md` (sections 21.1, 24,
 102, 130, 216-218, 222-223, 229.5, 234.2, 240.1, 240.3, 251, 259.6). Previous slice: `docs/superpowers/specs/2026-10-08-cut-9a-resume-design.md`.
@@ -81,7 +81,7 @@ Evaluated per entry in this order; the first match wins. "Lock free" means the p
 | 8 | resumable, retention age >= 7 days, lease age >= 30 s | `STALE` | lock free |
 | 9 | resumable otherwise (so lease age >= 30 s here) | `RESUMABLE` | only with `--force`, lock free |
 | 10 | `debris` (`.creating` / `.removing`) | `STALE` (note: debris) | lock free |
-| 11 | `root-lock` (the lock, or a `.broken.*`): free, record decodes, the workspace it names is missing, heartbeat not in the future, lease age >= 30 s | `STALE` (note: orphan lock) | yes (acquisition reclaims it) |
+| 11 | `root-lock` (the lock, or a `.broken.*`): free, record decodes, the owner is gone, heartbeat not in the future, lease age >= 30 s; for the root lock itself the workspace it names is also missing, a `.broken.*` file needs no missing workspace (its record decodes, the owner is gone, the lease gate holds) | `STALE` (note: orphan lock) | yes (acquisition reclaims it) |
 | 12 | `root-lock` as row 11 but lease age < 30 s, or the heartbeat is in the future | `UNCERTAIN` (note: "lease younger than 30 s", or `LEASE_AGE_UNCERTAIN`) | never |
 | 13 | `root-lock` or lock file whose bytes are torn, empty, newer-versioned or not a Flux record | `UNCERTAIN` (note: needs `--break-lock`, not in 9b) | never |
 
@@ -113,7 +113,7 @@ kept: each leftover, each swept partial, each retired workspace, each reclaimed 
 
 `--json` prints one object on stdout: `{"destination": <string>, "dry_run": <bool>, "entries": [{"status","eligible","kind","id","state","age_seconds","note"}],
 "actions": [{"action": "removed"|"kept"|"skipped","path","reason"}], "summary": {"entries","eligible","removed","kept","skipped"}}`; `state`, `age_seconds` and
-`reason` are `null` when absent. This is the cleanup command's own report; the copy report keeps its 18 keys.
+`reason` are `null` when absent. This is the cleanup command's own report; the copy report keeps its 18 keys. The JSON is produced from a serialisable struct, so the key order is fixed, and a skipped action carries the row id in `path`.
 
 ### Exit codes (section 251, section 55)
 
@@ -135,6 +135,8 @@ Classification, including `--dry-run`, probes the lock once (decision 5) and hol
 (decision 8). `TARGET_LOCK_BUSY` is not an error: every eligible row is reported `skipped <id>: destination lock busy`, nothing is retried, and the
 exit code is 0 (a live run is the normal reason). If the pass later loses ownership (the `checked` test fails), it stops, the remaining eligible rows are
 `skipped <id>: lock lost`, and the exit code is 1.
+
+Both recovery paths (an orphan lock and a dead owner's lock) apply the 30 s lease gate. A lock younger than that is skipped as "destination lock busy" with exit 0.
 
 ## Deletion procedure (per eligible row, under DEST's root lock)
 
@@ -205,8 +207,9 @@ written its own state and lock record (so `checked` can prove ownership):
 - `DEST` and its parent are opened exactly as `flux copy` opens them (`run/place.rs`), so the lock site and the capability check are the same.
 - The J1 walk is extracted from `TreePlace::sweep` into a free function taking the filesystem, DEST's handle and shown path, the set of ids and a check
   callback; `sweep` and `delete.rs` both call it (a plan-level refactor with the existing `--restart` tests as its oracle).
-- `obtain_cleanup_lock(site, capability, cfg: &CleanupConfig, operation_id)`: `operation_id` is a fresh id recorded with `workspace_path = "none"`;
-  the config supplies `now` and the lease threshold for the gate on reclaiming an orphan lock.
+- `obtain_cleanup_lock(site, capability, operation_id, now_ns, lease_threshold_ns)`: `operation_id` is a fresh id recorded with `workspace_path = "none"`;
+  `now_ns` and `lease_threshold_ns` supply the gate on reclaiming an orphan lock; the Durations are converted by
+  `u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)`.
 - The end-to-end kill test uses the debug-build stall hook (`FLUX_TEST_STALL_AT`, `flux-cli/src/main.rs`), which counts guarded mutations; cleanup's
   mutations pass through the same `checked` guard so the hook can stop it between any two.
 - `prior.rs`: `Scan` gains `completed` and `debris`; `session.rs` calls the delete procedure; `lock/` gains `obtain_cleanup_lock`.

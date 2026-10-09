@@ -135,4 +135,4 @@ item = "crates/flux-core/src/lock/obtain.rs::obtain_cleanup_lock"
 item = "crates/flux-core/src/cleanup/delete.rs::run_pass"
 [S251_1_close]
 status = "not-in-7a"
-reason = "flux cleanup (a later cut)"
+reason = "closing the cleanup pass's lock handle; it has no function of its own in cut 9b (the handle drops at the end of run_pass); the label stays not-in-7a because tests/model_impl_map.rs needs one"

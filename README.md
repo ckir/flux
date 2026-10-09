@@ -56,6 +56,16 @@ flux benchmark
 flux cleanup
 ```
 
+### Cleanup
+
+`flux cleanup DEST [--dry-run] [--force] [--json]` lists the operations under `DEST/.flux/operations/` and the
+destination's root lock. Statuses: `LIVE` (held by a running process, never touched), `RESUMABLE` (`--resume` can
+continue it, kept), `STALE` (abandoned, debris or older than 7 days, removed), `COMPLETED_BUT_UNCLEAN` (finished with
+leftovers, removed), `UNCERTAIN` (ownership or age unknown, reported only), `CORRUPT` (unreadable records, kept).
+`--dry-run` deletes nothing; `--force` bypasses the 7-day retention only. Exit codes: 0 done, 1 a deletion or listing
+failed, 2 usage error, 3 refused as a whole. A normal `flux copy` finishes the cleanup of a previous run's recorded
+leftovers by itself.
+
 ## Workspace
 
 | Crate | Responsibility (spec §3) |
