@@ -68,8 +68,10 @@ Derived from the above and the spec (the matrix and the failure rule were agreed
    4-byte big-endian length followed by that many bytes (`identity` is the ASCII `identity_text` of `state.rs`: `strong:<volume>:<index>`,
    `weak:<volume>:<index>` or `unavailable`; `dir_path` is the lowercase hex of `native_hex`), then one byte `replacement` (0 or 1). A record that does not
    decode, has trailing bytes, or carries a version other than 1 is UNCERTAIN. **Validation in phase 1 before any filesystem access:** `name` and
-   `planned_name` (when not empty) are single normal path components; `temp_name` equals `<name>.flux-partial.<this operation's id>` (derived, so a
-   hostile row cannot name another file); `dir_path` decodes to a relative path of normal components; and once the directory is resolved, its
+   `planned_name` (when not empty) are single normal path components; `temp_name` equals `<planned_name or, when that is empty, name>.flux-partial.<this operation's id>` (derived: `copy_file_guarded` names the temporary
+   from the name the plan used, `copy.rs` `temp_name(name, ..)`, so a hostile row cannot name another file and a case-folding replacement validates);
+   `dir_path` is the empty string (the entry is directly under DEST) or decodes with `from_native_hex` to a relative path of normal components
+   (`from_native_hex("")` is `None`, so the empty string is handled first); and once the directory is resolved, its
    `FileIdentity` equals the row key's `parent` (when either is not `Strong` the row is UNCERTAIN). Any failure is UNCERTAIN.
 6. **Order of a Strict publication:** copy, verify, metadata, flush (as today); the final recheck of the source (as today); NEW `prepare` (one
    synced commit) through a hook called once, after that recheck and BEFORE the final heartbeat and section 99 guard, so the ownership check still
@@ -86,7 +88,7 @@ Derived from the above and the spec (the matrix and the failure rule were agreed
 
 ## Recovery at `--resume`
 
-Phase 1 (read-only) classifies every row of `prepared`. For a row: open the entry's directory component by component from DEST through link-refusing
+Recovery runs on every adoption of a format-2 store whose `prepared` table is not empty, whatever the resume's `--durability` (9a already refuses a Strict operation resumed under Normal, `resume.rs`, so notes and a Normal resume cannot meet). Phase 1 (read-only) classifies every row of `prepared`. For a row: open the entry's directory component by component from DEST through link-refusing
 handles (the `artifacts::remove_validated` pattern; a component that is missing or is not a directory makes both T and D absent), then read T, the
 state of `temp_name` there (`Absent`, or `Present(identity)` when it is a regular file), and D, the state of the entry `name` (`Absent`, or `Entry(identity)`;
 never following a link). With R the recorded `temp_identity`:
@@ -100,6 +102,8 @@ never following a link). With R the recorded `temp_identity`:
 | 4 | T is `Absent` and either D is `Absent`, or D is `Entry(i)` with R and `i` both `Strong` and `i != R` | GONE | `discard_prepared`; no object of the operation's exists at either name (an aborted publication whose note outlived its temporary, or our object replaced afterwards by someone else), so the normal path decides by the existing-file policy exactly as in 9a |
 | 5 | anything else: a `Weak` or `Unavailable` identity where a comparison needs a `Strong` one (R or D); T present with D present for a no-replace row when the identities cannot show `i != R`; a row that fails validation; an unreadable directory | UNCERTAIN | none |
 
+Rows are evaluated in order and the first that matches decides (so a RENAMED row 1 is never read as row 3).
+
 Row 1 needs strong identity on both sides (section 259.8: existence, size or timestamp alone never prove the rename). Rows 2, 3 and 4 (the `D absent` form) need no identity: a rename moves the name, so
 `T present and D absent` cannot follow a completed rename, a replacement never leaves two names, and with neither name present there is no object of ours
 to protect. Row 4's second form needs both identities `Strong`: if R is the recorded object and D is a different object while T is gone, the object this
@@ -107,8 +111,8 @@ operation made is not at either name, so redo is the 9a behaviour (the policy ma
 
 Phase 2 runs only when no row is UNCERTAIN. It applies every verdict in ONE redb transaction (synced) so recovery is all-or-nothing. If any row is
 UNCERTAIN, nothing is applied and adoption is refused: `COMMIT_STATE_UNCERTAIN`, exit 3, `changed: false` (the refusal changes nothing, as the exit-3
-rule requires), detail `<path>: cannot tell whether this file was published (<evidence>); the operation's state is preserved. Fix the destination by hand,
-or run again with --restart to supersede this operation`, naming the first uncertain target and how many others there are. `--restart` supersedes the
+rule requires), detail `<path>: cannot tell whether this file was published (<evidence>); the operation's state is preserved. Move or delete the entry you do not want so it reads as absent (the next
+resume then redoes the file), or run again with --restart to supersede this operation`, naming up to ten uncertain targets (each with the evidence that kept it undecided: `identity unavailable`, `destination holds another object`, `unreadable directory`, `invalid note`) and the total count, so the operator sees the whole set at once. `--restart` supersedes the
 operation (ABANDONED, partials swept by id, workspace removed) and never touches the object in doubt.
 
 A RENAMED file's claim is now `Created`; the walk finds it, passes the size and mtime check (9a) and skips it as resumed. The report gets one extra line
@@ -130,9 +134,9 @@ after the resume note: `recovered <k> interrupted publications` when `k > 0` (RE
   already at `key` is `Code::IoError`), `fn commit_prepared(&mut self, key: &ClaimKey, target: &FluxPathKey, planned: Option<&ClaimKey>) -> Result<()>` (one transaction: the
   claim at `key` becomes `Created` for this target, inserted if absent and upgraded if `Existing` of the same target; when `planned` is given, a
   `Created` claim for it is inserted too (a replacement the filesystem stored under another spelling, as `tree.rs` records today); the note is
-  deleted; a foreign claim is an error and nothing changes), `fn discard_prepared(&mut self, key: &ClaimKey) -> Result<()>`, `fn prepared(&self) -> Result<Vec<(ClaimKey, PreparedRecord)>>`;
+  deleted; a foreign claim is an error and nothing changes), `fn discard_prepared(&mut self, key: &ClaimKey) -> Result<()>` (idempotent: a key with no note is `Ok`), `fn prepared(&self) -> Result<Vec<(ClaimKey, PreparedRecord)>>`;
   conformance cases for each (including atomicity: a failed `commit_prepared` leaves both note and claim as they were).
-- `flux-platform/src/claims.rs`: format 2, the `prepared` table, the methods above with `Strict`/`Normal` commit modes (the `prepare` and
+- `flux-platform/src/claims.rs`: format 2, the `prepared` table (`TableDefinition<&[u8], &[u8]>::new("prepared")`: key `ClaimKey::encode()`, value `PreparedRecord::encode()`), the methods above with `Strict`/`Normal` commit modes (the `prepare` and
   `commit_prepared` commits are ALWAYS `Immediate`; they are only called under Strict), format-1 reading.
 - `flux-core/src/fault_fs.rs`: the fake store implements the same methods with fault keys (`prepare`, `commit_prepared`, `discard_prepared`).
 - `flux-core/src/copy.rs`: `PublishIntent { temp: OsString, identity: FileIdentity }` and a `BeforePublish` hook called exactly once per copy that reaches the
