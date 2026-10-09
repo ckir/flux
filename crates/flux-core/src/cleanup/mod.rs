@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 pub mod artifacts;
+pub mod status;
 
 /// How long a finished operation's state is kept before cleanup may remove it: seven days.
 pub const DEFAULT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -23,4 +24,48 @@ pub struct CleanupConfig {
     pub boot_session_id: String,
     pub before_mutation: Option<crate::run::BeforeMutation>,
     pub heartbeat_interval: Duration,
+}
+
+/// The six names of section 251.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Live,
+    Resumable,
+    Stale,
+    CompletedButUnclean,
+    Uncertain,
+    Corrupt,
+}
+
+impl Status {
+    /// The spelling the report prints.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "LIVE",
+            Self::Resumable => "RESUMABLE",
+            Self::Stale => "STALE",
+            Self::CompletedButUnclean => "COMPLETED_BUT_UNCLEAN",
+            Self::Uncertain => "UNCERTAIN",
+            Self::Corrupt => "CORRUPT",
+        }
+    }
+}
+
+/// What kind of thing an entry is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    Operation,
+    Debris,
+    RootLock,
+}
+
+impl EntryKind {
+    /// The spelling the report prints.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Operation => "operation",
+            Self::Debris => "debris",
+            Self::RootLock => "root-lock",
+        }
+    }
 }
