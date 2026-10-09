@@ -63,7 +63,7 @@ own durable note first.
    in that frame (section 148.3's threshold), (b) when the next file to stage is itself at least `BATCH_BYTES` long (the pending small files publish first, then the
    large file is staged alone), (c) at a `WalkEvent::DirEnd` whose frame has pending entries, in this order: pop the frame, flush its batch using the popped frame's
    directory handle, then the existing `claims.flush()` (with its `beat()`/`guard()`), then drop the handle (the flush needs the handle for the renames), (d) when the batch is older than `BATCH_AGE` = 1 s at the next staging, (e) when the walk ends or stops with an
-   error (every live frame's flush runs before the error is returned, decision 8), (f) before staging a file whose name case-folds equal to a pending name in the
+   error (every live frame's flush runs before the error is returned, decision 8). Implementation constraint: `walk_into` returns its aborts with `?`, which would drop the frame stack and its pending batches unflushed; every abort therefore goes through one exit that drains the stack from the top, flushes each frame's batch (dropping a flush's own stop per decision 8), and only then returns the first error. A test aborts the walk (a lost lock at a `DirEnd`) with pending entries in two nested frames and asserts both batches were flushed or recovered, (f) before staging a file whose name case-folds equal to a pending name in the
    same frame (decision 6). The thresholds are constants in `tree.rs`; there is no flag.
 6. **Name hazards while files are pending.** Staged names are not in the destination yet and not in the frame's `NameIndex`. Two source files whose
    names differ only by case, onto a case-folding destination, are today resolved in order: the second sees the first. The batch keeps that by
@@ -209,3 +209,7 @@ Panel round 4 (2026-10-09; reply `.clavity/scratch/cut9d-panel/r4-reply.md`; eve
 wrong or undecidable pair; two answers to open questions were findings).
 - FOLDED: the non-ASCII fold gap and its backstop (agy's answer to question 2; reasoned, flagged so in Tests).
 - FOLDED: the equivalence test also asserts the store-call log (agy's answer to question 3).
+
+Panel round 5 (2026-10-09; reply `.clavity/scratch/cut9d-panel/r5-reply.md`; every seat "no new findings", Boundary Smuggler checked six name hazards
+against code lines and found each safe; PANEL VERDICT: minor).
+- FOLDED: the abort-drains-the-stack implementation constraint (agy's answer to question 3, an implementation-plan risk, not a spec defect).
