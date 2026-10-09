@@ -108,9 +108,11 @@ cleanup: <entries> entries, <removed> removed, <kept> kept, <skipped> skipped
 For a `root-lock` entry the `ID` is the lock file's name (`<name>.flux-lock`, `.flux-dir.lock`, `.flux-root.lock` or `<lock>.broken.<id>`), `STATE` is `-` / `null`,
 and AGE is the lease age. AGE prints the retention age as `<n>s`, `<n>m`, `<n>h` or `<n>d` (largest unit with a non-zero count), `-` when unknown. With `--dry-run` the action
 lines are absent and the summary reads `cleanup (dry run): <entries> entries, <eligible> eligible`.
+Counting: `entries` counts rows; `eligible` counts rows marked eligible at listing; `removed` and `kept` count ACTION LINES (one per path removed or
+kept: each leftover, each swept partial, each retired workspace, each reclaimed lock file), not rows; `skipped` counts rows skipped at deletion time.
 
 `--json` prints one object on stdout: `{"destination": <string>, "dry_run": <bool>, "entries": [{"status","eligible","kind","id","state","age_seconds","note"}],
-"actions": [{"action": "removed"|"kept"|"skipped","path","reason"}], "summary": {"entries","removed","kept","skipped"}}`; `state`, `age_seconds` and
+"actions": [{"action": "removed"|"kept"|"skipped","path","reason"}], "summary": {"entries","eligible","removed","kept","skipped"}}`; `state`, `age_seconds` and
 `reason` are `null` when absent. This is the cleanup command's own report; the copy report keeps its 18 keys.
 
 ### Exit codes (section 251, section 55)
@@ -195,7 +197,8 @@ written its own state and lock record (so `checked` can prove ownership):
 
 - `flux-core/src/cleanup/artifacts.rs`: the artifact rules; pure on strings, plus the handle walk.
 - `.../status.rs`: `classify(Facts) -> (Status, Eligible)`, the table above; pure, no I/O, table-tested.
-- `.../discover.rs`: lock-free listing of `DEST/.flux/operations/`, the probe (D1), the facts; produces the entries.
+- `.../discover.rs`: lock-free listing of `DEST/.flux/operations/` and a non-recursive listing of the lock's directory (`P/`, or `DEST/` for a
+  filesystem root) for the root lock and its `.broken.*` files, the probe (D1), the facts; produces the entries.
 - `.../delete.rs`: the deletion procedure; reuses `state::retire_workspace`, `Place::sweep` and `lock::recover`.
 - `CleanupConfig { retention, lease_threshold, now, force, dry_run }` with `DEFAULT_RETENTION = 7 days` and `LEASE_THRESHOLD = 30 s`; `now` is an
   injected wall-clock reading in nanoseconds (tests move it).
