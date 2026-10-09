@@ -5144,3 +5144,37 @@ fn a_renamed_note_meeting_an_undecodable_claim_refuses_state_corrupt() {
     assert_eq!(fs.prepared_count(), 1);
     assert!(!matches!(r.resumed, Some(ResumeNote::Adopted { .. })), "{:?}", r.resumed);
 }
+
+#[test]
+fn a_single_file_copy_under_strict_writes_no_note_and_touches_no_claim_store() {
+    // Spec: single-file operations have no commit recovery in this cut. Mutant (run/mod.rs, the single-file
+    // `copy_file_guarded` call): pass a `before_publish` that creates a claim store and prepares a note.
+    let fs = fake();
+    let r = file(&fs, Path::new("/src/a"), Path::new("/p/t"), &strict(), &cfg());
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+    assert_eq!(fs.read_file("/p/t").as_deref(), Some(&b"A"[..]));
+    let c = calls(&fs);
+    assert!(!c.iter().any(|x| x.starts_with("claim_")), "{c:?}");
+    assert_eq!(fs.prepared_count(), 0);
+}
+
+#[test]
+fn a_failed_recovery_transaction_is_retried_by_the_next_resume() {
+    // Mutant (recover.rs): discard each note from the store before `apply_recovery`, so a failed apply leaves none.
+    let fs = two_decidable();
+    fs.fail_nth("claim_apply_recovery", 1, Code::IoError, std::io::ErrorKind::Other);
+    let (r, _) = recover(&fs);
+    assert!(matches!(&r.stop, Some(RunError::Failed { step: RunStep::State, .. })), "{:?}", r.stop);
+    assert_eq!(fs.prepared_count(), 2, "nothing applied");
+    assert_eq!(fs.claim_count(), 0, "no claim added");
+
+    let (r, got) = recover(&fs);
+    ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    // `two_decidable`'s notes are NOT RENAMED / GONE: both discarded (recovered 0), then the walk redoes both files.
+    adopted_recovering(&r, 0, 0);
+    assert_eq!(count(&calls(&fs), "claim_apply_recovery"), 2, "the failed call, then the retry");
+    assert_eq!(fs.prepared_count(), 0);
+    assert_eq!(fs.claim(strong(&fs, "/p/dest"), "a"), created("a"));
+    assert_eq!(fs.claim(strong(&fs, "/p/dest/sub"), "b"), created("sub\0b"));
+}

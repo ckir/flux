@@ -672,6 +672,39 @@ mod tests {
         assert_eq!(PreparedRecord::decode(&[]), None, "empty input");
     }
 
+    /// The byte offset of the first data byte of field `index` (0 target, 1 temp_name, 2 identity, 3 dir_path, 4 name,
+    /// 5 planned_name) in an encoded note: after the version byte, each field is a u32 BE length and its bytes.
+    fn data_offset(encoded: &[u8], index: usize) -> usize {
+        let mut at = 1;
+        for _ in 0..index {
+            let len = u32::from_be_bytes(encoded[at..at + 4].try_into().unwrap()) as usize;
+            at += 4 + len;
+        }
+        at + 4
+    }
+
+    #[test]
+    fn prepared_record_rejects_non_utf8_identity_and_dir_path() {
+        let good = full_note().encode();
+        for (index, what) in [(2, "identity"), (3, "dir_path")] {
+            let mut bad = good.clone();
+            bad[data_offset(&good, index)] = 0xFF;
+            assert_eq!(PreparedRecord::decode(&bad), None, "non-UTF-8 {what}");
+        }
+        // Control: the byte-string fields take any bytes.
+        for (index, what) in [(1, "temp_name"), (4, "name"), (5, "planned_name")] {
+            let mut odd = good.clone();
+            odd[data_offset(&good, index)] = 0xFF;
+            let got = PreparedRecord::decode(&odd).unwrap_or_else(|| panic!("{what} decodes"));
+            let field = match index {
+                1 => &got.temp_name,
+                4 => &got.name,
+                _ => &got.planned_name,
+            };
+            assert_eq!(field[0], 0xFF, "{what}");
+        }
+    }
+
     #[test]
     fn prepared_record_layout_is_the_specs() {
         let r = PreparedRecord {
