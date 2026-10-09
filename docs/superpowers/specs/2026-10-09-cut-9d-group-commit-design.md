@@ -50,8 +50,8 @@ own durable note first.
       is already durable (decision 1: `stage_file` synced each writer under Strict), so section 164's ordering holds for the whole batch.
    3. For each pending entry in order: `publish_staged` (final `beat()`/`guard()`, rename).
    4. `apply_recovery` (cut 9c's existing method: ONE Immediate transaction, each op with `commit_prepared`'s rules, nothing changes when any
-      errs) called with a `RecoveryOp::Commit` for every entry that renamed. It is NOT called when no entry renamed (an empty call costs a sync;
-      cut 9c deferred minor).
+      errs) called with a `RecoveryOp::Commit` for every entry that renamed. The call is skipped only when it would carry no
+      op at all (an empty call costs a sync; cut 9c deferred minor); step 5 adds the Discard ops to it.
    5. Entries that failed their rename: their temporaries are discarded as today and their notes go in the SAME `apply_recovery` call as
       `RecoveryOp::Discard` ops, so step 4 is one transaction for the whole batch (Commit ops for the renamed, Discard ops for the failed; the
       call is skipped when both lists are empty). A batch of failing renames costs one sync, not one per file.
@@ -72,7 +72,7 @@ own durable note first.
 7. **Failure isolation = cut 9c's, by falling back to the per-file path.** If `prepare_many` errs, nothing was written (all-or-nothing). The flush
    then retries each entry on its own through the existing `prepare` (one commit each), so a store error is attributed to the files it actually
    hits, exactly as in cut 9c, and an entry whose own `prepare` fails is discarded and reported at `CopyStep::Claim`. If the `apply_recovery` commit errs, nothing
-   changed; the flush retries each renamed entry through `commit_prepared`, and an entry whose own commit fails is reported `ClaimNotRecorded`
+   changed; the flush retries each renamed entry through `commit_prepared` and each failed-rename entry through `discard_prepared` (best effort), and an entry whose own commit fails is reported `ClaimNotRecorded`
    with its note left for recovery. The fallback is the ONLY place the per-file calls remain, so the common path writes two commits per batch.
 8. **Stopping the run.**
    - *Lost lock* (`guard()` fails at entry k): the flush writes NOTHING more and removes NOTHING. The renamed entries 0..k-1 keep their notes (no
@@ -92,7 +92,9 @@ own durable note first.
     descriptor is held by a staged entry (decision 1). Peak RSS must stay at the baseline's 19 MiB class (acceptance, below).
 11. **Mutation hook order.** `before_mutation` is called from the run's `guard` closure (run/mod.rs:269 and :431). The guard still runs once before
     each exclusive create and once before each rename, but the creates of a batch now precede its renames. Tests that stall "at the n-th guarded
-    mutation" (crates/flux-cli/tests/run.rs) keep working only if n is recomputed; the plan lists each such test and its new n.
+    mutation" (crates/flux-cli/tests/run.rs) keep working only if n is recomputed; the plan lists each such test and its new n. A stall run under
+    Normal durability (for example the first run of `the_claim_count_equals_the_file_count_under_the_default_policy`, index 303) does not batch and
+    keeps its n; the Strict runs do (that test's `--resume --durability strict` run at index 606, and the Strict stalls of the recovery e2e tests).
 
 ## Interfaces added (names are the plan's contract; signatures are final in the plan)
 
@@ -152,6 +154,11 @@ quoted, and what was not controlled is stated.
 5. The age bound is checked at the next staging, not by a timer: a long file being copied delays the publication of the files staged before it,
    unless it is at least `BATCH_BYTES` long (decision 5(b)).
 
+6. A Replace target (an existing destination file, `Plan::Replace`) still pays one synced commit for its `Existing` claim in `before_create`,
+   because `insert_if_absent` is Immediate under Strict (crates/flux-platform/src/claims.rs:183, `next_commit`): a replaced file costs 4 syncs
+   today (data, `Existing` claim, note, claim) and about 2 after this cut (data, `Existing` claim). Folding the `Existing` claim into
+   `prepare_many` is the later fix; it needs the exclusivity the claim gives (decision 1) to come from the in-frame pending names instead.
+
 ## Out of scope
 
 Chunk checkpoints, partial-file resume, `--resume-verify`, snapshots, compaction, rotation and any WAL file (cut 9e, whose own design decides WAL
@@ -182,3 +189,10 @@ incomplete in form; every claim was verified against the code before folding).
   (agy's open question 2): the function receives the ADOPTED prior's id (crates/flux-core/src/run/place.rs:403 `let id = state.operation_id`,
   :618 `recover_publications(dest, &self.dest_shown, id, ...)`), and cut 9c's e2e test `a_renamed_publication_is_recovered_and_reported` resumes
   through it.
+
+Panel round 3 (2026-10-09; reply `.clavity/scratch/cut9d-panel/r3-reply.md`, complete with census and verdict `FINDINGS`; tree unchanged).
+- FOLDED: decision 4.4 contradicted 4.5 and the `apply_recovery` fallback ignored failed-rename notes (agy's Protocol Pedant); both reworded.
+- FOLDED as a recorded limit: Replace targets keep the synced `Existing` claim (agy's Cascade Analyst; verified at claims.rs:183). agy's wording,
+  "completely defeats the batching benefit", is overstated: a replaced file goes from 4 syncs to 2.
+- FOLDED: decision 11 names the Strict stall (index 606) of the claim-count test as the affected one. REJECTED in part: agy's index 303 is the
+  test's first run under the default (Normal) policy, which does not batch (run.rs:727), so it does not move.
