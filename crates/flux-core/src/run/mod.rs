@@ -11,7 +11,8 @@
 pub(crate) mod place;
 mod restart;
 mod resume;
-mod session;
+pub(crate) mod session;
+pub(crate) mod sweep;
 #[cfg(test)]
 mod tests;
 

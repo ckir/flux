@@ -130,8 +130,7 @@ item = "crates/flux-core/src/run/session.rs::open_operation"
 item = "crates/flux-core/src/run/session.rs::open_operation"
 
 [S251_1_classify]
-status = "not-in-7a"
-reason = "flux cleanup (a later cut)"
+item = "crates/flux-core/src/lock/obtain.rs::obtain_cleanup_lock"
 [S251_1_delete]
 status = "not-in-7a"
 reason = "flux cleanup (a later cut)"

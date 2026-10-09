@@ -380,10 +380,19 @@ pub(crate) fn owned<D: DirHandle>(held: &Held<'_, D>, lock_shown: &Path) -> Resu
 /// The `--restart` sweep's check (cut 7b, "The heartbeat"): the heartbeat, then §99. Two calls: `owned` stays a pure
 /// check.
 pub(crate) fn checked<D: DirHandle>(locked: &Locked<'_, D>) -> Result<(), Fault> {
-    if let Err(e) = locked.pulse.beat(&locked.held) {
-        return Err(Fault::Heartbeat(locked.lock_shown.clone(), e));
+    checked_held(&locked.held, &locked.lock_shown, &locked.pulse)
+}
+
+/// `checked` for a caller that holds the pieces rather than a `Locked` (cut 9b's cleanup).
+pub(crate) fn checked_held<D: DirHandle>(
+    held: &Held<'_, D>,
+    lock_shown: &Path,
+    pulse: &Pulse,
+) -> Result<(), Fault> {
+    if let Err(e) = pulse.beat(held) {
+        return Err(Fault::Heartbeat(lock_shown.to_path_buf(), e));
     }
-    owned(&locked.held, &locked.lock_shown)
+    owned(held, lock_shown)
 }
 
 const LOST: &str =

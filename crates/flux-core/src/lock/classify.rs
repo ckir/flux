@@ -15,8 +15,11 @@ pub(crate) enum Classified<D: DirHandle> {
     Uncertain(Uncertain),
     /// Not a Flux lock: `CONTROL_PLANE_NAMESPACE_CONFLICT`, never overwritten.
     Foreign,
-    /// A dead owner whose recorded workspace is missing or untrusted: `ARTIFACT_OWNERSHIP_UNCERTAIN`.
+    /// A dead owner whose recorded workspace is untrusted: `ARTIFACT_OWNERSHIP_UNCERTAIN`.
     Untrusted(LockRecord),
+    /// Cut 9b: a dead owner whose trusted-shaped workspace path names nothing on disk. The handle and its OS-native lock are KEPT
+    /// so that cleanup can recover it (section 240.3); `obtain` refuses it as `Untrusted`.
+    Orphan { lock: D::Lock, identity: FileIdentity, record: LockRecord },
     /// A dead owner with a trusted workspace. The handle and its OS-native lock are KEPT for §240.3 recovery.
     Dead { lock: D::Lock, identity: FileIdentity, record: LockRecord },
 }
@@ -36,7 +39,7 @@ pub(crate) fn classify<D: DirHandle>(site: &LockSite<'_, D>) -> LockResult<Class
     let got = lock.try_lock()?;
     // S240_1_read
     let decoded = decode(&lock.read_all(RECORD_LEN)?);
-    // S240_1_close happens as `lock` drops on every return except `Dead`.
+    // S240_1_close happens as `lock` drops on every return except `Dead` and `Orphan`.
     match decoded {
         Decoded::Foreign => Ok(Classified::Foreign),
         Decoded::Record(record) if !got => Ok(Classified::Busy(Some(record))),
@@ -47,7 +50,11 @@ pub(crate) fn classify<D: DirHandle>(site: &LockSite<'_, D>) -> LockResult<Class
                 let identity = lock.identity()?;
                 Ok(Classified::Dead { lock, identity, record })
             }
-            Workspace::Missing | Workspace::Untrusted => Ok(Classified::Untrusted(record)),
+            Workspace::Missing => {
+                let identity = lock.identity()?;
+                Ok(Classified::Orphan { lock, identity, record })
+            }
+            Workspace::Untrusted => Ok(Classified::Untrusted(record)),
         },
     }
 }
@@ -170,11 +177,25 @@ mod tests {
     }
 
     #[test]
-    fn a_dead_owner_whose_workspace_is_missing_is_untrusted_and_released() {
+    fn a_dead_owner_whose_workspace_is_missing_is_an_orphan_and_the_lock_is_kept() {
         let (_fs, d) = fake();
         let site = site(&d);
         let id = crate::ids::new_id();
         let rec = record(&site, &id, &format!("operations/{id}"));
+        dead_lock(&d, NAME, &rec.encode());
+        let orphan = classify(&site).unwrap();
+        assert!(matches!(&orphan, Classified::Orphan { record, .. } if *record == rec));
+        let other = d.open_lock(OsStr::new(NAME)).unwrap();
+        assert!(!other.try_lock().unwrap(), "kept for recovery");
+        drop(orphan);
+        assert!(other.try_lock().unwrap(), "released once the classification drops");
+    }
+
+    #[test]
+    fn a_dead_owner_whose_workspace_path_is_garbage_is_untrusted_and_released() {
+        let (_fs, d) = fake();
+        let site = site(&d);
+        let rec = record(&site, &crate::ids::new_id(), "garbage");
         dead_lock(&d, NAME, &rec.encode());
         assert!(matches!(classify(&site).unwrap(), Classified::Untrusted(r) if r == rec));
         assert!(d.open_lock(OsStr::new(NAME)).unwrap().try_lock().unwrap(), "closed on refusal");
