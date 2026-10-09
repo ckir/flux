@@ -37,9 +37,11 @@ own durable note first.
    including the cut 9c `before_publish` hook, which stays between the two halves for them.
 2. **Batching applies to exactly one case:** a tree publication under `--durability=strict` into a store with `supports_prepared()`. Normal
    durability, format-1 stores, single-file copies and lockless copies never batch (they write no notes; nothing to batch).
-3. **The batch.** `walk_into` (crates/flux-core/src/tree.rs) owns one pending list of `Pending { depth, path, key, template, staged, plan, target }`
-   (`depth` = index of its directory frame on the walk stack). `copy_one` for a batching target runs everything up to and including `stage_file`,
-   then appends to the list instead of publishing. Counting (`files_copied`, `bytes_copied`, `files_overwritten`), `finish_copy`'s reports, the claim,
+3. **The batch lives in the directory frame.** `Frame::Live` (crates/flux-core/src/tree.rs) gains `pending: Vec<Pending>` with
+   `Pending { path, key, template, staged, plan, target }` and the batch's start time and staged-byte total. Each frame has its own batch, so a
+   staged entry is always next to the directory handle its rename needs, and the `DirEnd` flush runs on the frame that is about to drop that
+   handle. `copy_one` for a batching target runs everything up to and including `stage_file`, then appends to its frame's list instead of
+   publishing. Counting (`files_copied`, `bytes_copied`, `files_overwritten`), `finish_copy`'s reports, the claim,
    and `names.record_publication` all move to the flush, in list order, so the report order of one directory is unchanged.
 4. **The flush**, in this order, always:
    1. `beat()` and `guard()` (the section 101 and 99 checks), as before any synced write under DEST.
@@ -51,10 +53,10 @@ own durable note first.
       cut 9c deferred minor).
    5. For each entry that failed its rename: `discard_prepared` for its note (best effort, as cut 9c) and the temporary is discarded as today.
 5. **Flush triggers.** The batch flushes (a) when it holds `BATCH_FILES` = 64 entries or `BATCH_BYTES` = 64 MiB of staged source bytes
-   (section 148.3's threshold), (b) when the next file to stage is itself at least `BATCH_BYTES` long (the pending small files publish first, then the
+   in that frame (section 148.3's threshold), (b) when the next file to stage is itself at least `BATCH_BYTES` long (the pending small files publish first, then the
    large file is staged alone), (c) at a `WalkEvent::DirEnd` whose frame has pending entries (the frame's directory handle is about to be dropped; the
    flush needs it for the renames), (d) when the batch is older than `BATCH_AGE` = 1 s at the next staging, (e) when the walk ends or stops with an
-   error (the flush runs before the error is returned, decision 8), (f) before staging a file whose name case-folds equal to a pending name in the
+   error (every live frame's flush runs before the error is returned, decision 8), (f) before staging a file whose name case-folds equal to a pending name in the
    same frame (decision 6). The thresholds are constants in `tree.rs`; there is no flag.
 6. **Name hazards while files are pending.** Staged names are not in the destination yet and not in the frame's `NameIndex`. Two source files whose
    names differ only by case, onto a case-folding destination, are today resolved in order: the second sees the first. The batch keeps that by
@@ -65,13 +67,16 @@ own durable note first.
    hits, exactly as in cut 9c, and an entry whose own `prepare` fails is discarded and reported at `CopyStep::Claim`. If the `apply_recovery` commit errs, nothing
    changed; the flush retries each renamed entry through `commit_prepared`, and an entry whose own commit fails is reported `ClaimNotRecorded`
    with its note left for recovery. The fallback is the ONLY place the per-file calls remain, so the common path writes two commits per batch.
-8. **Stopping the run.** A lost lock (`guard()` fails at entry k) or a heartbeat failure stops the whole operation as today. The flush then:
-   commits the claims of the entries 0..k-1 that renamed (they are published), and returns the stop. The entries k.. are NOT touched on disk: a
-   temporary is not removed once this run no longer holds the lock (cut 9c's rule in `copy_file_guarded`: removing it would be a mutation), so each
-   is reported as a leftover (`CopyError.leftover`) exactly as an unbatched copy reports it, and its note, if written, stays for recovery (the
-   store is the run's own file, as in cut 9c's `discard_note_on_failure`, which discards best effort). If the commit itself cannot be written,
-   the notes stay and cut 9c recovery decides at `--resume` (rows 1 to 4 of its matrix). A heartbeat failure with the lock still held discards
-   the unrenamed entries' temporaries and notes as an unbatched failure does.
+8. **Stopping the run.**
+   - *Lost lock* (`guard()` fails at entry k): the flush writes NOTHING more and removes NOTHING. The renamed entries 0..k-1 keep their notes (no
+     claim is committed after the loss), the entries k.. keep their temporaries, reported as leftovers (`CopyError.leftover`) exactly as an
+     unbatched copy reports them (cut 9c's rule in `copy_file_guarded`: removing a temporary after the loss would be a mutation), and the
+     notes of all of them stay. `--resume` classifies them by cut 9c's matrix: rows 1 (RENAMED, finalized), 2/3/3b (NOT RENAMED, redone), 4 (GONE).
+   - *Heartbeat failure with the lock still held*: the entries that renamed are committed through `apply_recovery`; the unrenamed entries'
+     temporaries and notes are discarded as an unbatched failure discards them.
+   - *Which error returns.* A flush reports per-entry failures through `on_report` (`ClaimNotRecorded`, the claim-step failures) and returns `Err`
+     only for a stop (the two cases above). When the walk already holds an error, the flush still runs (clause 5(e)) but its stop is dropped: the
+     walk's error is the one returned, because both come from the same lost lock or heartbeat and the report would say the same thing twice.
 9. **Recovery is unchanged.** A kill leaves, per file of the batch: no note and a temporary (before `prepare_many`: the leftover sweep removes
    the temporary at `--resume`); a note and a temporary (after `prepare_many`, before that file's rename: matrix rows 2, 3 or 3b, NOT RENAMED); a note and a
    published target (after the rename, before the commit: matrix row 1, RENAMED); or a claim (after the commit). Up to `BATCH_FILES` notes
@@ -122,6 +127,10 @@ Re-run the 2026-10-09 protocol on the same box: `baseline.py` (large, small, mix
   sync per file; the figure is a prediction, not a promise).
 - Normal: no change outside the baseline's spread. Strict large and Strict mixed: not worse than the baseline's spread.
 - Peak RSS within 2 MiB of the baseline's 19 MiB.
+- Shapes, reported whether or not they gate (a flat 5000-file directory is the best case for the batch, so it alone proves too little): (i) the
+  flat 5000 x 4 KiB case above; (ii) nested, 500 directories x 10 files x 4 KiB (batches of 10): syncs per file at most 1.3; (iii) 5000 directories x
+  1 file (no batching by known limit 1): the measured syncs per file and wall time are reported next to the baseline's, so the owner sees the shape
+  the cut does not help. Only (i) and (ii) gate.
 Timing follows the standing discipline: the owner approves each run, the main thread runs it idle in the background, two passes, the range is
 quoted, and what was not controlled is stated.
 
@@ -139,3 +148,16 @@ quoted, and what was not controlled is stated.
 
 Chunk checkpoints, partial-file resume, `--resume-verify`, snapshots, compaction, rotation and any WAL file (cut 9e, whose own design decides WAL
 file versus redb rows); single-file notes; batching the data syncs; a CLI flag for the batch size.
+
+## Stand-downs
+
+Panel round 1 (2026-10-09, solo seats plus agy; reply `.clavity/scratch/cut9d-panel/r1-reply.md`, flagged `[13b] TRUNCATED REPLY` because its token
+order was wrong; the file copy holds the same seven-seat report, so no content was missing).
+- FOLDED: decision 8 - lost lock writes and removes nothing (agy's "state.db split-brain" mechanism is false: `state.db` is a redb file held under
+  an exclusive file lock by this process, so a new owner cannot open it; the conclusion is kept because cut 9c recovery already covers the
+  uncommitted renames).
+- FOLDED: the pending list lives in `Frame::Live` (agy's Literal Implementer and question 2).
+- FOLDED: which error returns from a flush (agy's Protocol Pedant); the shape table in Measurement (agy's Mechanism Gamer and question 3).
+- REJECTED: "falling back to per-entry `prepare` after a failed `prepare_many` spams a broken store" (agy's Axiom Breaker): an unbatched Strict
+  copy already fails and reports each file separately and the run continues (crates/flux-core/src/tree.rs:1003-1010, `ClaimNotRecorded` per file),
+  so the fallback reproduces cut 9c's behaviour; its extra cost is bounded by `BATCH_FILES` = 64 failed commits.
