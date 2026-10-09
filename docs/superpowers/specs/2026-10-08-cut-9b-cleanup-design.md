@@ -1,6 +1,6 @@
 # Cut 9b: the cleanup lifecycle (`flux cleanup`, and finishing a prior run's cleanup)
 
-Status: DRAFT for owner review (2026-10-08), branch `spec/cut-9b` off the merged cut 9a. Scope and every fork below were negotiated with agy
+Status: APPROVED by the owner (2026-10-09, including writer's rulings W1-W9), branch `spec/cut-9b` off the merged cut 9a. Scope and every fork below were negotiated with agy
 (consults in `.clavity/seams/cut9b-*.md`, replies in `.clavity/scratch/cut9b-scope/`) and decided by the owner on 2026-10-08; section "Writer's
 rulings" lists what the owner has not yet seen and must confirm at this review. Parent spec: `FLUX_FULL_UPDATED_SPEC_V16.md` (sections 21.1, 24,
 102, 130, 216-218, 222-223, 229.5, 234.2, 240.1, 240.3, 251, 259.6). Previous slice: `docs/superpowers/specs/2026-10-08-cut-9a-resume-design.md`.
