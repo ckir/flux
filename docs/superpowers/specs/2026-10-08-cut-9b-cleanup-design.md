@@ -74,15 +74,16 @@ Evaluated per entry in this order; the first match wins. "Lock free" means the p
 | 1 | The lock is busy and its record names this operation | `LIVE` | no |
 | 2 | Manifest missing, not a regular file, undecodable, naming another id, or not a tree record | `CORRUPT` (kept for diagnosis) | never |
 | 3 | Manifest of a format this binary does not know | `UNCERTAIN` (note: "format N") | never |
-| 4 | `COMPLETED` (`cleanup_pending` holds by the format-2/3 invariant; the workspace or a leftover still exists) | `COMPLETED_BUT_UNCLEAN` | lock free |
+| 4 | `COMPLETED` (any format; `cleanup_pending` holds by the format-2/3 invariant, and a format-1 manifest has no artifact list, so it has none; the workspace or a leftover still exists) | `COMPLETED_BUT_UNCLEAN` | lock free |
 | 5 | `ABANDONED` | `STALE` | lock free |
 | 6 | `CREATED`, `TRANSFERRING`, `FAILED`: mtime unreadable or in the future, or a record heartbeat in the future | `UNCERTAIN` (`LEASE_AGE_UNCERTAIN`) | never |
 | 7 | resumable, lease age < 30 s | `RESUMABLE` | never (not even `--force`) |
 | 8 | resumable, retention age >= 7 days, lease age >= 30 s | `STALE` | lock free |
-| 9 | resumable otherwise | `RESUMABLE` | only with `--force`, lock free, lease age >= 30 s |
+| 9 | resumable otherwise (so lease age >= 30 s here) | `RESUMABLE` | only with `--force`, lock free |
 | 10 | `debris` (`.creating` / `.removing`) | `STALE` (note: debris) | lock free |
-| 11 | `root-lock` (the lock, or a `.broken.*`): free, record decodes, the workspace it names is missing, lease age >= 30 s | `STALE` (note: orphan lock) | yes (acquisition reclaims it) |
-| 12 | `root-lock` or lock file whose bytes are torn, empty, newer-versioned or not a Flux record | `UNCERTAIN` (note: needs `--break-lock`, not in 9b) | never |
+| 11 | `root-lock` (the lock, or a `.broken.*`): free, record decodes, the workspace it names is missing, heartbeat not in the future, lease age >= 30 s | `STALE` (note: orphan lock) | yes (acquisition reclaims it) |
+| 12 | `root-lock` as row 11 but lease age < 30 s, or the heartbeat is in the future | `UNCERTAIN` (note: "lease younger than 30 s", or `LEASE_AGE_UNCERTAIN`) | never |
+| 13 | `root-lock` or lock file whose bytes are torn, empty, newer-versioned or not a Flux record | `UNCERTAIN` (note: needs `--break-lock`, not in 9b) | never |
 
 When the lock is busy and its record names another operation, or names none, every other row of this DEST is classified by the table but all are
 ineligible in this pass and carry the note "destination lock held by <op or unknown>". The classification never turns a row into LIVE except row 1.
@@ -104,7 +105,8 @@ skipped <id>: <reason>
 cleanup: <entries> entries, <removed> removed, <kept> kept, <skipped> skipped
 ```
 
-AGE prints the retention age as `<n>s`, `<n>m`, `<n>h` or `<n>d` (largest unit with a non-zero count), `-` when unknown. With `--dry-run` the action
+For a `root-lock` entry the `ID` is the lock file's name (`<name>.flux-lock`, `.flux-dir.lock`, `.flux-root.lock` or `<lock>.broken.<id>`), `STATE` is `-` / `null`,
+and AGE is the lease age. AGE prints the retention age as `<n>s`, `<n>m`, `<n>h` or `<n>d` (largest unit with a non-zero count), `-` when unknown. With `--dry-run` the action
 lines are absent and the summary reads `cleanup (dry run): <entries> entries, <eligible> eligible`.
 
 `--json` prints one object on stdout: `{"destination": <string>, "dry_run": <bool>, "entries": [{"status","eligible","kind","id","state","age_seconds","note"}],
@@ -117,9 +119,13 @@ lines are absent and the summary reads `cleanup (dry run): <entries> entries, <e
   skipped by revalidation.
 - 1: a deletion that was attempted failed, or a directory cleanup needed to list could not be listed (its classification is incomplete).
 - 2: usage error (clap; a missing DEST).
-- 3: refused as a whole: DEST is missing or not a directory (`DESTINATION_ERROR`); `DEST/.flux` or `DEST/.flux/operations` is not a directory
-  (`CONTROL_PLANE_NAMESPACE_CONFLICT`); the lock capability check of `lock/obtain.rs` fails (`REMOTE_LOCK_UNSAFE`), checked before any probe.
-  A DEST without `.flux/operations` is not an error: the report is empty and the exit code 0.
+- 3: refused as a whole: DEST exists and is not a directory (`DESTINATION_ERROR`); DEST's parent cannot be opened (`DESTINATION_ERROR`);
+  `DEST/.flux` or `DEST/.flux/operations` is not a directory (`CONTROL_PLANE_NAMESPACE_CONFLICT`); the lock capability check of `lock/obtain.rs`
+  fails (`REMOTE_LOCK_UNSAFE`), checked before any probe.
+  The root lock (and its `.broken.*` files) lives beside DEST, not in it, so it is ALWAYS examined, including when DEST has no `.flux/operations`
+  and when DEST does not exist at all (a copy that crashed between taking the lock and creating DEST leaves exactly that, and a copy refuses it
+  with a pointer to `flux cleanup DEST`). Such a DEST yields only the lock's rows (possibly none), exit 0; nothing is an error just because the
+  operations directory is absent.
 
 ## Locking
 
@@ -161,6 +167,9 @@ A `cleanup_pending_artifacts` entry (native hex, `state.rs`) is used for deletio
 3. It is reached one component at a time through `DirHandle::open_dir`, which refuses links (`SAFETY_REJECTED` or `DESTINATION_ERROR`; either is
    `kept`), and its last component is a regular file (checked by `metadata` on the handle, not by following a path).
 
+4. A component that does not exist (`NotFound`) at any step of the walk means the leftover is already gone: it counts as removed, not kept. A cleanup
+   killed after deleting some leftovers therefore converges on re-run instead of sticking on the first missing one.
+
 For a single file, the artifact must equal that target's own partial name for that id exactly (the name `copy::temp_path` yields for this target and
 id); anything else is refused. A refused entry is reported (`kept <path>: not a recognized leftover`), the operation stays COMPLETED_BUT_UNCLEAN, and
 nothing else is deleted for it.
@@ -190,6 +199,13 @@ written its own state and lock record (so `checked` can prove ownership):
 - `.../delete.rs`: the deletion procedure; reuses `state::retire_workspace`, `Place::sweep` and `lock::recover`.
 - `CleanupConfig { retention, lease_threshold, now, force, dry_run }` with `DEFAULT_RETENTION = 7 days` and `LEASE_THRESHOLD = 30 s`; `now` is an
   injected wall-clock reading in nanoseconds (tests move it).
+- `DEST` and its parent are opened exactly as `flux copy` opens them (`run/place.rs`), so the lock site and the capability check are the same.
+- The J1 walk is extracted from `TreePlace::sweep` into a free function taking the filesystem, DEST's handle and shown path, the set of ids and a check
+  callback; `sweep` and `delete.rs` both call it (a plan-level refactor with the existing `--restart` tests as its oracle).
+- `obtain_cleanup_lock(site, capability, cfg: &CleanupConfig, operation_id)`: `operation_id` is a fresh id recorded with `workspace_path = "none"`;
+  the config supplies `now` and the lease threshold for the gate on reclaiming an orphan lock.
+- The end-to-end kill test uses the debug-build stall hook (`FLUX_TEST_STALL_AT`, `flux-cli/src/main.rs`), which counts guarded mutations; cleanup's
+  mutations pass through the same `checked` guard so the hook can stop it between any two.
 - `prior.rs`: `Scan` gains `completed` and `debris`; `session.rs` calls the delete procedure; `lock/` gains `obtain_cleanup_lock`.
 - `flux-cli`: `Commands::Cleanup`, `cleanup_report.rs` (text and JSON), the exit-code mapping.
 - `FaultFs` (`fault_fs.rs`) gains whatever the tests need to move modification times and fail removals (it has `set_modified`, a claim-count fault key).
@@ -240,10 +256,11 @@ W9. **Spec gaps found:** section 251.1 does not say whether `COMPLETED_BUT_UNCLE
    lock, and a second cleanup finishes it. At least one end-to-end kill test with a real process.
 5. A copy finishes a prior's leftovers and still succeeds (exit 0, 18 JSON keys) when the leftover cannot be removed.
 6. `--force` bypasses retention only: a RESUMABLE operation with lease age under 30 s, a LIVE one, an UNCERTAIN one and a CORRUPT one stay.
-7. A backward clock gives UNCERTAIN and deletes nothing.
+7. A backward clock gives UNCERTAIN and deletes nothing. An orphan root lock with lease age 29 s is UNCERTAIN and stays; at 30 s it is reclaimed.
+   A leftover already deleted (the first of two) does not stop the second from being deleted on re-run.
 8. Locking: a busy lock skips every eligible row with exit 0; a lock lost mid-pass stops the pass with exit 1. Probe: a held lock is LIVE in `--dry-run` and in a real run; a free lock is not left held afterwards.
 9. CLI: exit codes 0, 1, 2, 3; text and JSON shapes; `--dry-run` changes nothing on disk (a before/after listing).
-10. Orphan root lock: a dead owner's lock naming a missing workspace is reclaimed by cleanup (and only reported by `--dry-run`); a copy still refuses
+10. Orphan root lock (also with no `.flux/operations`, and with no DEST at all): a dead owner's lock naming a missing workspace is reclaimed by cleanup (and only reported by `--dry-run`); a copy still refuses
     it with the pointer text; a live owner, a torn record and a foreign file are never touched; a `.broken.*` is removed only when its record decodes
     and its owner is gone.
 11. Partials: a STALE operation's partial in a subdirectory and of a vanished target is swept by its id; a partial of another id is untouched.
