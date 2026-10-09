@@ -240,8 +240,12 @@ pr title body="":
         # AUTO-MERGE: the PR merges itself, as a merge commit, once every required
         # check passes. Opt out per PR with `gh pr merge --disable-auto <n>`. It
         # does not update a branch that falls behind main -- merge main in and it
-        # proceeds. A failure here is reported, not fatal: the PR already exists.
+        # proceeds. GitHub refuses --auto on a PR that is already mergeable ("Pull request
+        # is in clean status": every required check passed on the pushed branch before the
+        # PR existed), so the fallback merges it now; branch protection still decides
+        # whether that is allowed. A failure here is reported, not fatal: the PR exists.
         gh pr merge "$branch" --auto --merge \
+            || gh pr merge "$branch" --merge \
             || echo "warning: could not enable auto-merge; merge it by hand." >&2
     else
         # --web returns before the PR exists, so there is nothing to arm yet.
