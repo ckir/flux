@@ -299,8 +299,9 @@ fn a_hand_written_uncertain_note_refuses_resume_with_exit_3_and_changes_nothing(
     assert!(e.contains("COMMIT_STATE_UNCERTAIN"), "{e}");
     assert!(e.contains("Move or delete the destination ENTRY you do not want"), "{e}");
     assert!(e.contains("or run again with --restart to supersede this operation"), "{e}");
-    let target = dst.join("d0").join("f000");
-    assert!(e.contains(&target.display().to_string()), "the file's path {}: {e}", target.display());
+    // The CLI canonicalizes DEST (macOS /var -> /private/var, Windows \\?\ prefix), so assert the tail that survives.
+    let tail = Path::new("d0").join("f000").display().to_string();
+    assert!(e.contains(&tail), "the file's path ends {tail}: {e}");
     assert_eq!(rows(&dst, &id), rows_before, "state.db holds the same rows (claims, notes, meta)");
     assert_eq!(
         std::fs::read(&manifest).unwrap(),
