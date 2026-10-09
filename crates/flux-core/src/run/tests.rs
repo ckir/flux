@@ -3791,6 +3791,7 @@ fn a_copy_removes_creating_and_removing_debris() {
 
 #[test]
 fn debris_with_a_stranger_inside_is_kept_and_the_copy_succeeds() {
+    // Mutant: drop the debris warning in `TreePlace::remove_debris` (place.rs).
     let fs = fake();
     let ops = "/p/dest/.flux/operations";
     for d in ["/p/dest", "/p/dest/.flux", ops] {
@@ -3798,12 +3799,48 @@ fn debris_with_a_stranger_inside_is_kept_and_the_copy_succeeds() {
             fs.create_dir(Path::new(d)).unwrap();
         }
     }
-    let debris = format!("{ops}/{}.creating", id(2));
+    let name = format!("{}.creating", id(2));
+    let debris = format!("{ops}/{name}");
     fs.create_dir(Path::new(&debris)).unwrap();
+    fs.write_file(format!("{debris}/manifest"), b"half");
     fs.write_file(format!("{debris}/not-flux's"), b"a stranger");
     let (r, _) = run_tree(&fs, &cfg());
     assert!(r.stop.is_none(), "{:?}", r.stop);
     assert!(fs.exists(format!("{debris}/not-flux's")), "never emptied");
+    assert!(!fs.exists(format!("{debris}/manifest")), "Flux's own file goes");
+    assert!(
+        matches!(r.warnings.as_slice(),
+            [RunWarning::PriorCleanupFailed { operation_id, path, .. }]
+                if *operation_id == name && path.to_string_lossy().replace('\\', "/").ends_with(&name)),
+        "{:?}",
+        r.warnings
+    );
+}
+
+#[test]
+fn user_objects_named_like_debris_are_left_alone_by_a_copy() {
+    // Mutants: loosen the id test or drop the directory test in `scan_tree` (prior.rs).
+    let fs = fake();
+    prior(&fs, 9, OpState::Abandoned);
+    let ops = "/p/dest/.flux/operations";
+    fs.create_dir(Path::new(&format!("{ops}/notes.creating"))).unwrap();
+    fs.write_file(format!("{ops}/notes.creating/manifest"), b"the user's");
+    let upper = format!("{}.creating", id(0xab).to_uppercase());
+    fs.create_dir(Path::new(&format!("{ops}/{upper}"))).unwrap();
+    fs.write_file(format!("{ops}/{}.removing", id(4)), b"a file, not a directory");
+    let bak = format!("{ops}/{}.creating.bak", id(3));
+    fs.create_dir(Path::new(&bak)).unwrap();
+    let (r, _) = run_tree(&fs, &cfg());
+    ok(&r);
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    for kept in [
+        format!("{ops}/notes.creating/manifest"),
+        format!("{ops}/{upper}"),
+        format!("{ops}/{}.removing", id(4)),
+        bak,
+    ] {
+        assert!(fs.exists(&kept), "{kept}");
+    }
 }
 
 #[test]
@@ -3934,4 +3971,76 @@ fn a_single_file_artifact_that_is_not_the_targets_own_partial_is_kept() {
         "{:?}",
         r.warnings
     );
+}
+
+fn abandoned_file_record(fs: &FaultFs, n: u8) {
+    file_artifact_prior(fs, n, &format!("t.flux-partial.{}", id(n)));
+    let bytes = fs.read_file(record_path(&id(n))).unwrap();
+    let mut state = decode_state(&bytes).unwrap();
+    state.state = OpState::Abandoned;
+    state.superseded_by = Some(id(9));
+    state.cleanup = Some(crate::state::Cleanup {
+        cleanup_pending: false,
+        cleanup_pending_artifacts: Vec::new(),
+    });
+    fs.write_file(record_path(&id(n)), &state.encode());
+}
+
+#[test]
+fn a_single_file_prior_whose_artifact_cannot_be_removed_keeps_its_record() {
+    // Mutant: remove the record even when the artifact's removal failed (`FilePlace::finish_completed`).
+    let fs = fake();
+    let own = format!("/p/t.flux-partial.{}", id(5));
+    file_artifact_prior(&fs, 5, &format!("t.flux-partial.{}", id(5)));
+    fs.write_file(&own, b"half");
+    // `remove_file`: this run's CREATED record write clears its temporary (1), then the artifact (2), which fails.
+    fs.fail_nth("remove_file", 2, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let r = run_file(&fs, &cfg());
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+    let c = calls(&fs);
+    let removals: Vec<&String> = c.iter().filter(|x| x.starts_with("remove_file(")).collect();
+    assert!(
+        removals[1].contains("t.flux-partial"),
+        "the 2nd removal is the artifact: {removals:?}"
+    );
+    assert!(fs.exists(&own) && fs.exists(record_path(&id(5))));
+    assert!(
+        matches!(r.warnings.as_slice(),
+            [RunWarning::PriorCleanupFailed { operation_id, .. }] if *operation_id == id(5)),
+        "{:?}",
+        r.warnings
+    );
+}
+
+#[test]
+fn single_file_prior_cleanup_checks_ownership_before_each_removal() {
+    // Mutant: delete both `checked(locked)?` calls in `FilePlace::finish_completed` (place.rs).
+    let fs = fake();
+    let own = format!("/p/t.flux-partial.{}", id(5));
+    file_artifact_prior(&fs, 5, &format!("t.flux-partial.{}", id(5)));
+    fs.write_file(&own, b"half");
+    let r = run_file(&fs, &cfg());
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+    let c = calls(&fs);
+    let record = at(&c, "write_at_start(");
+    let artifact = at(&c, &format!("remove_file({own})"));
+    let state = at(&c, &format!("remove_file({})", record_path(&id(5))));
+    let checks = |from: usize, to: usize| {
+        c[from..to].iter().filter(|x| x.starts_with(&format!("metadata({T_LOCK})"))).count()
+    };
+    assert!(checks(record, artifact) >= 1, "a check before the artifact: {c:?}");
+    assert!(checks(artifact, state) >= 1, "a check before the record's removal: {c:?}");
+}
+
+#[test]
+fn a_copy_leaves_an_abandoned_single_file_record_alone() {
+    // Mutant: collect ABANDONED records in `scan_file`'s `completed` (prior.rs).
+    let fs = fake();
+    abandoned_file_record(&fs, 5);
+    let own = format!("/p/t.flux-partial.{}", id(5));
+    fs.write_file(&own, b"half");
+    let r = run_file(&fs, &cfg());
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+    assert!(fs.exists(&own) && fs.exists(record_path(&id(5))));
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
 }

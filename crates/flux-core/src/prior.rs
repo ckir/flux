@@ -378,6 +378,33 @@ mod tests {
     }
 
     #[test]
+    fn user_objects_named_like_debris_are_not_debris() {
+        // Mutants: accept any `*.creating` (loosen the id test); drop the `FileType::Dir` test.
+        let (fs, d) = dest();
+        operations(&fs);
+        let (h31, h33) = ("a".repeat(31), "a".repeat(33));
+        let upper = id(0xab).to_uppercase();
+        for dir in [
+            "notes.creating".to_string(),
+            format!("{h31}.creating"),
+            format!("{h33}.removing"),
+            format!("{upper}.creating"),
+            format!("{}.creating.bak", id(3)),
+        ] {
+            fs.create_dir(Path::new(&format!("{OPS}/{dir}"))).unwrap();
+        }
+        fs.write_file(format!("{OPS}/notes.creating/manifest"), b"the user's");
+        fs.write_file(format!("{OPS}/{}.removing", id(4)), b"a file, not a directory");
+        assert!(scan(&d, 0).unwrap().debris.is_empty());
+        // Control: a real `<id>.removing` directory is debris.
+        fs.create_dir(Path::new(&format!("{OPS}/{}.removing", id(5)))).unwrap();
+        assert_eq!(
+            scan(&d, 0).unwrap().debris,
+            vec![OsString::from(format!("{}.removing", id(5)))]
+        );
+    }
+
+    #[test]
     fn a_copy_never_removes_its_own_creating_directory() {
         // Mutant: drop the `own_id` test on the debris branch of `scan_tree`.
         let (fs, d) = dest();
