@@ -8,7 +8,7 @@ use super::error::{LockCode, LockError, LockResult, refuse};
 use super::held::Held;
 use super::record::LockRecord;
 use super::recover::{Recovered, recover};
-use super::site::LockSite;
+use super::site::{LockSite, SiteKind};
 use super::takeover::{Claimed, TakeOver, take_over};
 use flux_fs::{DirHandle, LockCapability};
 use std::ffi::OsString;
@@ -96,13 +96,15 @@ pub fn obtain<'a, D: DirHandle>(
                 ));
             }
             Classified::Orphan { record, .. } => {
-                return Err(refuse(
-                    LockCode::ArtifactOwnershipUncertain,
-                    Some(record),
+                // Cleanup does not handle single-file operations, so it is no way out for a File site.
+                let detail = if site.kind() == SiteKind::File {
+                    UNTRUSTED_DETAIL.to_string()
+                } else {
                     format!(
                         "{UNTRUSTED_DETAIL}; flux cleanup DEST removes a dead owner's lock whose workspace is gone"
-                    ),
-                ));
+                    )
+                };
+                return Err(refuse(LockCode::ArtifactOwnershipUncertain, Some(record), detail));
             }
             Classified::Uncertain(why) => match mode {
                 Mode::Plain => {
@@ -154,6 +156,7 @@ pub fn obtain_cleanup_lock<'a, D: DirHandle>(
     now_ns: u64,
     lease_threshold_ns: u64,
 ) -> LockResult<CleanupObtained<'a, D>> {
+    // Cleanup never takes over a lock, so the capability is not needed after the caller's check.
     let _ = capability;
     let mut last = Last::Other;
     for _ in 0..MAX_ATTEMPTS {
@@ -390,6 +393,25 @@ mod tests {
         assert_eq!(r.code, LockCode::ArtifactOwnershipUncertain);
         assert_eq!(r.holder, Some(rec));
         assert!(r.detail.contains("flux cleanup"), "the way out is named: {}", r.detail);
+    }
+
+    #[test]
+    fn the_cleanup_pointer_is_not_offered_for_a_single_file_orphan() {
+        let (_fs, d) = fake();
+        let file = LockSite::file(&d, OsStr::new("dest")).unwrap();
+        let id = me();
+        dead_lock(&d, NAME, &record(&file, &id, &format!("adjacent/{id}")).encode());
+        let r = refusal(obtain(&file, STRONG, Mode::Plain, &me()));
+        assert_eq!(r.code, LockCode::ArtifactOwnershipUncertain);
+        assert!(!r.detail.contains("flux cleanup"), "no pointer for a file: {}", r.detail);
+
+        let (_fs, d) = fake();
+        let dir = site(&d);
+        let id = me();
+        dead_lock(&d, NAME, &record(&dir, &id, &format!("operations/{id}")).encode());
+        let r = refusal(obtain(&dir, STRONG, Mode::Plain, &me()));
+        assert_eq!(r.code, LockCode::ArtifactOwnershipUncertain);
+        assert!(r.detail.contains("flux cleanup"), "the pointer for a directory: {}", r.detail);
     }
 
     const NOW: u64 = 31_000_000_000;

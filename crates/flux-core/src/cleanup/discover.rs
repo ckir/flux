@@ -203,8 +203,15 @@ pub(crate) fn discover<F: DestinationRoot>(
     let located = locate_dest(fs, dst_root)
         .map_err(|e| Refused { code: e.cause.code.as_str(), detail: e.to_string() })?;
     let capability = check_capability(&located.holder).map_err(refused_by)?;
+    // A namespace conflict refuses the whole run (exit 3); an I/O error is only a directory cleanup could not
+    // list (exit 1): the operations listing is skipped and the root lock is still examined.
+    let mut control_plane_failed = None;
     if let Some(dest) = &located.dest {
-        check_control_plane(dest, dst_root).map_err(refused_by)?;
+        match check_control_plane(dest, dst_root) {
+            Ok(()) => {}
+            Err(LockError::Io(e)) => control_plane_failed = Some((dst_root.join(FLUX_DIR), e)),
+            Err(e) => return Err(refused_by(e)),
+        }
     }
     let site = match &located.name {
         Some(name) => LockSite::directory(&located.holder, name).map_err(refused_by)?,
@@ -212,7 +219,7 @@ pub(crate) fn discover<F: DestinationRoot>(
     };
     let t = thresholds(cfg);
     let mut entries = Vec::new();
-    let mut listing_failed = None;
+    let mut listing_failed = control_plane_failed;
 
     // The root lock first: its record feeds the operation it names. A probe that fails is not readable, and
     // nothing is eligible beside it.
@@ -228,7 +235,7 @@ pub(crate) fn discover<F: DestinationRoot>(
     };
 
     // The operations listing: an absent `.flux` or `operations/` is an empty one.
-    if let Some(dest) = &located.dest {
+    if let Some(dest) = located.dest.as_ref().filter(|_| listing_failed.is_none()) {
         let operations_shown = dst_root.join(FLUX_DIR).join(OPERATIONS_DIR);
         let operations = match child_dir(dest, FLUX_DIR) {
             Ok(Some(flux)) => match child_dir(&flux, OPERATIONS_DIR) {
@@ -694,24 +701,10 @@ mod tests {
             put_lock(&d, "dest.flux-lock", 9, &format!("operations/{}", id(9)), NOW - 60 * SEC);
             fs
         };
-        // Which `metadata` call is discovery's own look at `.flux`: the last one at that path.
-        let probe = build();
-        run(&probe, &cfg()).unwrap();
-        let n = calls(&probe)
-            .iter()
-            .filter(|c| c.starts_with("metadata("))
-            .enumerate()
-            .filter(|(_, c)| c.as_str() == "metadata(/p/dest/.flux)")
-            .map(|(i, _)| i + 1)
-            .last()
-            .unwrap();
+        // The first two `metadata` calls look at the destination itself (`locate_dest`); the third is the control
+        // plane check's first look at `.flux`. An I/O error there is a failed listing, not a refusal.
         let fs = build();
-        fs.fail_nth(
-            "metadata",
-            n as u32,
-            Code::PermissionDenied,
-            std::io::ErrorKind::PermissionDenied,
-        );
+        fs.fail_nth("metadata", 3, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
         let found = run(&fs, &cfg()).unwrap();
         let (path, error) = found.listing_failed.as_ref().expect("reported, not swallowed");
         assert!(path.ends_with(".flux"), "{path:?}");

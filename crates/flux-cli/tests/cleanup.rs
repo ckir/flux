@@ -106,6 +106,20 @@ impl Drop for Stalled {
     }
 }
 
+/// A file's bytes, or a placeholder when it cannot be read. A live copy can hold a file with a mandatory lock (on
+/// Windows redb's `state.db` gives error 33), and the snapshot is the proof that nothing was deleted: an unreadable
+/// file must stay in it (length and error kind), and one deleted since the listing must differ from what it was.
+fn contents_or_placeholder(path: &Path) -> Vec<u8> {
+    match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => b"<gone>".to_vec(),
+        Err(e) => {
+            let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            format!("<unreadable: {:?}, {len} bytes>", e.kind()).into_bytes()
+        }
+    }
+}
+
 /// Every file and directory under `root` (and `root` itself), keyed by its path relative to `root`; a file maps to
 /// its bytes, a directory to `None`.
 fn snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
@@ -118,7 +132,7 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
                 out.insert(rel, None);
                 walk(root, &path, out);
             } else {
-                out.insert(rel, Some(std::fs::read(&path).unwrap()));
+                out.insert(rel, Some(contents_or_placeholder(&path)));
             }
         }
     }
@@ -410,10 +424,13 @@ fn exit_codes_and_json_shape() {
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let text = stdout(&out);
     assert_eq!(text.lines().count(), 1, "{text}");
+    // The JSON carries the destination as the CLI resolved it (`main.rs` passes the canonical path to
+    // `cleanup_report::json`): macOS `/private/var/...`, Windows `\\?\C:\...`. Never the raw argument.
+    let expected = flux_cli::resolve::canonical_with_remainder(&dst).unwrap();
     assert!(
         text.starts_with(&format!(
             "{{\"destination\":{},\"dry_run\":false,\"entries\":[],\"actions\":[],\"summary\":{{",
-            serde_json::to_string(&dst.display().to_string()).unwrap()
+            serde_json::to_string(&expected.display().to_string()).unwrap()
         )),
         "{text}"
     );
@@ -453,6 +470,50 @@ impl Drop for Restore {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn the_snapshot_keeps_an_unreadable_file_and_sees_its_deletion() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = TempDir::new().unwrap();
+    let f = d.path().join("locked");
+    std::fs::write(&f, b"secret").unwrap();
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&f).is_ok() {
+        println!("skipped: running as root, file permissions are not enforced");
+        return;
+    }
+    let before = snapshot(d.path());
+    assert!(before.contains_key(Path::new("locked")), "an unreadable file is still recorded");
+    assert_eq!(before, snapshot(d.path()), "stable while nothing changes");
+    std::fs::remove_file(&f).unwrap();
+    assert_ne!(before, snapshot(d.path()), "its deletion is a difference");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_flux_dir_exits_1_and_still_lists_the_root_lock() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = TempDir::new().unwrap();
+    let dst = d.path().join("dst");
+    completed_fixture(&dst);
+    let flux_dir = dst.join(".flux");
+    let _restore = Restore(flux_dir.clone());
+    std::fs::set_permissions(&flux_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Root ignores permissions: probe, and say so rather than fail.
+    if std::fs::read_dir(&flux_dir).is_ok() {
+        println!("skipped: running as root, directory permissions are not enforced");
+        return;
+    }
+    let out = cleanup(&dst, &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("could not list"), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("STATUS"),
+        "the table header is still printed: {}",
+        stdout(&out)
+    );
 }
 
 #[cfg(unix)]

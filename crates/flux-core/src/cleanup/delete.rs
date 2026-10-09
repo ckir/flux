@@ -291,7 +291,8 @@ pub(crate) fn run_pass<F: DestinationRoot>(
     let obtained = match obtained {
         Ok(o) => o,
         Err(LockError::Refused(refusal)) if refusal.code == LockCode::TargetLockBusy => {
-            skip_all(&rows, "destination lock busy", &mut report.actions);
+            let reason = format!("destination lock busy: {}", refusal.detail);
+            skip_all(&rows, &reason, &mut report.actions);
             return;
         }
         Err(refused) => {
@@ -992,7 +993,13 @@ mod tests {
         });
         let r = run(&fs, &cfg());
         assert!(r.entries[0].eligible);
-        assert_eq!(lines(&r), vec![format!("skipped {}: destination lock busy", id(1))]);
+        assert_eq!(
+            lines(&r),
+            vec![format!(
+                "skipped {}: destination lock busy: another run holds the lock; wait for it to finish",
+                id(1)
+            )]
+        );
         assert!(!r.failed());
         assert!(fs.exists(format!("{OPS}/{}", id(1))), "nothing was deleted");
         drop(held);
@@ -1130,7 +1137,10 @@ mod tests {
         });
         let r = run(&fs, &cfg());
         assert!(r.entries[0].eligible, "the listing saw it STALE");
-        assert_eq!(lines(&r), vec![format!("skipped {}: destination lock busy", id(1))]);
+        let line = lines(&r).remove(0);
+        assert_eq!(lines(&r).len(), 1);
+        assert!(line.starts_with(&format!("skipped {}: destination lock busy: ", id(1))), "{line}");
+        assert!(line.contains("younger than the lease threshold"), "{line}");
         assert!(!r.failed());
         assert_eq!(manifest(&fs, 1).state, OpState::Failed, "not ABANDONED");
         assert!(fs.exists(format!("/p/dest/{x}")) && fs.exists(format!("{OPS}/{}", id(1))));

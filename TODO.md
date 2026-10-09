@@ -451,10 +451,11 @@ are the spec's).
 ## Cut 9b known limits
 
 Recorded by cut 9b (`docs/superpowers/specs/2026-10-08-cut-9b-cleanup-design.md`, "Known limits"; limits 1-8 are
-the spec's numbers, 9-11 were learned during execution).
+the spec's numbers, 9-10 were learned during execution).
 
 - [ ] **1. A copy that starts in the instant a cleanup (or a classification) probes the lock** is refused with
-      `TARGET_LOCK_BUSY` (D1). Cleanup probes once per operation directory and holds nothing across the listing.
+      `TARGET_LOCK_BUSY` (D1). Cleanup probes once per lock file it probes (the root
+      lock and each `<lock>.broken.*`) and holds nothing across the listing.
 - [ ] **2. Partials of a vanished target** are swept only when their operation is removed by `flux cleanup` (STALE or
       forced) or superseded by `--restart` (the J1 walk). A run resumed to completion does not record them: they stay
       (9a limit 4, narrowed, not closed).
@@ -472,22 +473,22 @@ the spec's numbers, 9-11 were learned during execution).
       UNCERTAIN row can only be reported.
 - [ ] **9. A dead owner's lock with a young or future heartbeat** (a killed `flux cleanup`, a crashed resume; a future
       heartbeat fails the gate like a young one) makes a deleting pass skip every eligible row with
-      `skipped <id>: destination lock busy` and exit 0. The real reason, "the previous owner's lock is younger than the
-      lease threshold", is not in the line. A younger orphan lock is refused as `ARTIFACT_OWNERSHIP_UNCERTAIN` and the
-      pass exits 1.
-- [ ] **10. An unreadable `DEST/.flux`** is reported as a whole-run refusal (exit 3) because `check_control_plane`
-      stats and opens it before discovery lists anything, not as a failed listing (exit 1).
-- [ ] **11. A `<lock>.broken.*` file** is classified by its own record whether or not the workspace it names exists
+      `skipped <id>: destination lock busy: <detail>` (the detail names "younger than the lease threshold") and exit 0.
+      A younger orphan lock is refused as `ARTIFACT_OWNERSHIP_UNCERTAIN` and the pass exits 1.
+- [ ] **10. A `<lock>.broken.*` file** is classified by its own record whether or not the workspace it names exists
       (spec row 11 wording corrected).
 
 ## Cut 9b debt
 
-- [ ] The single-file orphan-lock refusal also appends the `flux cleanup DEST` pointer sentence although `flux cleanup`
-      does not handle single-file operations (`crates/flux-core/src/lock/obtain.rs`, the Orphan arm of `obtain`).
-- [ ] The `Skipped` reason text for a young dead lock (see limit 9).
 - [ ] `S251_1_close` stays `not-in-7a` only because `tests/model_impl_map.rs:141` needs one such label.
 - [ ] The lock model has no notion of time or leases, so it does not capture the lease gate on the Dead and Orphan arms.
 - [ ] The age test does not pin 86_399 -> 23h.
+- [ ] A `<lock>.broken.*` row can show eligible while the root lock is busy (nothing is deleted: acquisition reports busy).
+- [ ] `classify` now calls `identity()` before returning `Orphan`, so a failing identity call gives a copy an I/O error
+      instead of its old exit-3 refusal.
+- [ ] The lock model's `clean` process never creates a lock while the implementation does.
+- [ ] A transient I/O error during the pass's re-read is reported as "changed since listing".
+- [ ] `--json` has no fields for a failed listing or a lost lock (the cause is on stderr only).
 
 ## Scaffolding follow-ups
 

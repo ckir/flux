@@ -837,7 +837,7 @@ pub fn publish_workspace<D: DirHandle>(
 /// 2. write the manifest inside crash-safely, rename it to `<id>` without replacing, and flush `operations/`
 ///    (`publish_workspace`).
 ///
-/// A crash before the rename leaves only `<id>.creating`, which the §21.1 scan ignores (cut 9's cleanup). Returns the
+/// A crash before the rename leaves only `<id>.creating`, which the §21.1 scan reports as debris (cut 9b: `flux cleanup` and the next copy remove it). Returns the
 /// workspace's handle.
 pub fn create_workspace<D: DirHandle>(
     operations: &D,
@@ -858,7 +858,7 @@ pub fn operations_dir<D: DirHandle>(dest: &D, dest_shown: &Path) -> LockResult<D
 
 /// Remove a tree operation's workspace without ever leaving `operations/<id>` without its manifest (refinement 9,
 /// reversed; Part 3b decision 17): rename it to `<id>.removing`, which the §21.1 scan passes over, then remove its
-/// `manifest`, a crash's `manifest.tmp`, and the directory. A failure part-way leaves only `<id>.removing` (cut 9's).
+/// `manifest`, a crash's `manifest.tmp`, and the directory. A failure part-way leaves only `<id>.removing`, which cut 9b's cleanup (and the next copy) removes.
 pub fn retire_workspace<D: DirHandle>(operations: &D, id: &str) -> flux_fs::Result<()> {
     let mut retired = OsString::from(id);
     retired.push(REMOVING_SUFFIX);
