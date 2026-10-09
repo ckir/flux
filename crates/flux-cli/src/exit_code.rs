@@ -46,6 +46,12 @@ pub fn for_file_run(r: &Run<Result<Outcome, CopyError>>) -> u8 {
         .unwrap_or_else(|| for_file(r.copy.as_ref().expect("a run with no stop has a copy")))
 }
 
+/// `flux cleanup` (cut 9b): 1 when a deletion failed, a directory could not be listed or the lock was lost; the
+/// whole-run refusal (3) is decided by the caller from `Err(Refused)`.
+pub fn for_cleanup(r: &flux_core::cleanup::CleanupReport) -> u8 {
+    if r.failed() { FAILED } else { SUCCESS }
+}
+
 fn for_stop(stop: &Option<RunError>) -> Option<u8> {
     match stop {
         None => None,
@@ -149,6 +155,32 @@ mod tests {
         assert_eq!(for_file(&ok(1)), FAILED);
         assert_eq!(for_file(&Err(err(Code::SafetyRejected))), REFUSED);
         assert_eq!(for_file(&Err(err(Code::IoError))), FAILED);
+    }
+
+    #[test]
+    fn cleanup_exits_1_only_on_a_kept_action_a_failed_listing_or_a_lost_lock() {
+        use flux_core::cleanup::{Action, CleanupReport};
+        let io = || FsError::new(Code::IoError, std::io::Error::other("x"));
+        let p = || PathBuf::from("p");
+        assert_eq!(for_cleanup(&CleanupReport::default()), SUCCESS);
+        let ok = CleanupReport {
+            actions: vec![
+                Action::Removed(p()),
+                Action::Skipped { id: "i".into(), reason: "r".into() },
+            ],
+            ..CleanupReport::default()
+        };
+        assert_eq!(for_cleanup(&ok), SUCCESS);
+        let kept = CleanupReport {
+            actions: vec![Action::Kept { path: p(), error: io() }],
+            ..CleanupReport::default()
+        };
+        assert_eq!(for_cleanup(&kept), FAILED);
+        let listing =
+            CleanupReport { listing_failed: Some((p(), io())), ..CleanupReport::default() };
+        assert_eq!(for_cleanup(&listing), FAILED);
+        let lost = CleanupReport { lost: Some((p(), io())), ..CleanupReport::default() };
+        assert_eq!(for_cleanup(&lost), FAILED);
     }
 
     fn refused(changed: bool) -> RunError {
