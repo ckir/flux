@@ -372,7 +372,16 @@ pub(crate) fn run_pass<F: DestinationRoot>(
             Err(error) => {
                 let path = dest_shown.join(FLUX_DIR);
                 report.actions.push(Action::Kept { path, error });
-                rows.retain(|row| row.0.kind == EntryKind::RootLock);
+                // Every operation and debris row is dropped here, and says so.
+                rows.retain(|row| {
+                    let keep = row.0.kind == EntryKind::RootLock;
+                    if !keep {
+                        report
+                            .actions
+                            .push(skipped(&row.0, "cannot open the operations directory"));
+                    }
+                    keep
+                });
             }
         }
     }
@@ -1103,6 +1112,99 @@ mod tests {
         run(&fs, &cfg);
         // Two leftovers, the workspace, and the control directories.
         assert_eq!(count.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn a_young_dead_lock_naming_the_operation_is_never_abandoned() {
+        let (fs, _d) = setup();
+        let x = partial("x", 1);
+        fs.write_file(format!("/p/dest/{x}"), b"half");
+        workspace(&fs, &v1(1, OpState::Failed), Some(NOW - 8 * DAY));
+        // After the listing, a resume of A takes the lock and crashes seconds ago, its workspace still there.
+        fs.on_nth("create_lock", 1, |fs| {
+            let d = fs.destination_root(Path::new("/p")).unwrap();
+            let site = LockSite::directory(&d, OsStr::new("dest")).unwrap();
+            let mut rec = record(&site, &id(1), &format!("operations/{}", id(1)));
+            rec.last_heartbeat_wall_time = NOW - 5 * SEC;
+            dead_lock(&d, "dest.flux-lock", &rec.encode());
+        });
+        let r = run(&fs, &cfg());
+        assert!(r.entries[0].eligible, "the listing saw it STALE");
+        assert_eq!(lines(&r), vec![format!("skipped {}: destination lock busy", id(1))]);
+        assert!(!r.failed());
+        assert_eq!(manifest(&fs, 1).state, OpState::Failed, "not ABANDONED");
+        assert!(fs.exists(format!("/p/dest/{x}")) && fs.exists(format!("{OPS}/{}", id(1))));
+        let c = calls(&fs);
+        assert!(
+            !c.iter().any(|x| x.starts_with("remove_file(") || x.starts_with("rename_no_replace(")),
+            "{c:?}"
+        );
+    }
+
+    /// A COMPLETED v1 operation 1 and a `.creating` debris directory 2, both eligible.
+    fn two_rows() -> FaultFs {
+        let (fs, _d) = setup();
+        workspace(&fs, &v1(1, OpState::Completed), Some(NOW));
+        fs.create_dir(Path::new(&format!("{OPS}/{}.creating", id(2)))).unwrap();
+        fs
+    }
+
+    #[test]
+    fn unopenable_operations_dir_skips_every_eligible_row() {
+        // Discovery and `check_control_plane` run before the pass and `fail_nth` counts from the start, so the fault
+        // is armed from a hook that fires when the pass writes its lock record: the very next `metadata` call is
+        // the pass's own look at `.flux`.
+        let fs = two_rows();
+        fs.on_nth("lock_sync_all", 1, |fs| {
+            let seen = fs.calls().iter().filter(|c| c.starts_with("metadata(")).count();
+            let nth = u32::try_from(seen).unwrap() + 1;
+            fs.fail_nth("metadata", nth, Code::PermissionDenied, ErrorKind::PermissionDenied);
+        });
+        let r = run(&fs, &cfg());
+        let l = lines(&r);
+        assert_eq!(l.len(), 3, "{l:?}");
+        assert!(l[0].starts_with("kept /p/dest/.flux: "), "{l:?}");
+        assert!(
+            l.contains(&format!("skipped {}: cannot open the operations directory", id(1))),
+            "{l:?}"
+        );
+        assert!(
+            l.contains(&format!(
+                "skipped {}.creating: cannot open the operations directory",
+                id(2)
+            )),
+            "{l:?}"
+        );
+        assert!(r.failed());
+        assert!(fs.exists(format!("{OPS}/{}", id(1))), "nothing was removed");
+    }
+
+    #[test]
+    fn the_pass_orders_debris_and_completed_before_abandon_before_broken() {
+        let (fs, d) = setup();
+        // The listing order (by name) is the reverse of the pass order: the stale operation is 1, the debris 2, the
+        // COMPLETED operation 3, and the moved-aside lock comes last in the listing as well.
+        let (x, a) = (partial("x", 1), partial("a", 3));
+        fs.write_file(format!("/p/dest/{x}"), b"half");
+        fs.write_file(format!("/p/dest/{a}"), b"x");
+        workspace(&fs, &v1(1, OpState::Failed), Some(NOW - 8 * DAY));
+        fs.create_dir(Path::new(&format!("{OPS}/{}.removing", id(2)))).unwrap();
+        workspace(&fs, &completed(3, std::slice::from_ref(&a)), Some(NOW));
+        put_lock(&d, &format!("dest.flux-lock.broken.{}", id(60)), 60, NOW - 60 * SEC);
+        let r = run(&fs, &cfg());
+        assert!(r.entries.iter().all(|e| e.eligible), "{:?}", r.entries);
+        let l = lines(&r);
+        let at = |what: String| {
+            l.iter()
+                .position(|x| *x == format!("removed {what}"))
+                .unwrap_or_else(|| panic!("{what}: {l:?}"))
+        };
+        let debris = at(format!("{OPS}/{}.removing", id(2)));
+        let leftover = at(format!("/p/dest/{a}"));
+        let partial_x = at(format!("/p/dest/{x}"));
+        let broken = at(format!("{LOCK}.broken.{}", id(60)));
+        assert!(debris < partial_x && leftover < partial_x, "debris and COMPLETED first: {l:?}");
+        assert!(partial_x < broken, "the broken file last: {l:?}");
     }
 
     // ---------- the root lock ----------

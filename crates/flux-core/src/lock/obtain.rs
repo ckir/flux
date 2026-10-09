@@ -219,6 +219,16 @@ pub fn obtain_cleanup_lock<'a, D: DirHandle>(
                 }
             }
             Classified::Dead { lock, identity, record } => {
+                // The same lease gate as an orphan: a dead owner whose record is young may be an operation that was
+                // resumed and crashed seconds ago, and the caller's manifest-age reading would not see that.
+                let beat = record.last_heartbeat_wall_time;
+                if beat > now_ns || now_ns - beat < lease_threshold_ns {
+                    return Err(refuse(
+                        LockCode::TargetLockBusy,
+                        Some(record),
+                        "the previous owner's lock is younger than the lease threshold; wait, or retry once it is older",
+                    ));
+                }
                 match recover(site, lock, identity, &record, operation_id)? {
                     Recovered::Held { held, leftover } => {
                         return Ok(CleanupObtained {
@@ -459,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_recovers_a_dead_owner_with_its_workspace_without_the_lease_gate() {
+    fn cleanup_recovers_a_dead_owner_with_its_workspace_past_the_lease_gate() {
         let (fs, d) = fake();
         let site = site(&d);
         let id = me();
@@ -471,9 +481,37 @@ mod tests {
         ] {
             fs.create_dir(Path::new(dir)).unwrap();
         }
-        dead_lock(&d, NAME, &record(&site, &id, &format!("operations/{id}")).encode());
+        let mut rec = record(&site, &id, &format!("operations/{id}"));
+        rec.last_heartbeat_wall_time = NOW - LEASE;
+        dead_lock(&d, NAME, &rec.encode());
         let got = obtain_cleanup_lock(&site, STRONG, &me(), NOW, LEASE).unwrap();
         assert_eq!(got.reclaimed, None, "only an orphan is reported as reclaimed");
+    }
+
+    #[test]
+    fn cleanup_refuses_a_young_or_future_dead_lock_as_busy() {
+        for beat in [NOW - 5_000_000_000, NOW + 1] {
+            let (fs, d) = fake();
+            let site = site(&d);
+            let id = me();
+            for dir in [
+                "/p/dest",
+                "/p/dest/.flux",
+                "/p/dest/.flux/operations",
+                &format!("/p/dest/.flux/operations/{id}"),
+            ] {
+                fs.create_dir(Path::new(dir)).unwrap();
+            }
+            let mut rec = record(&site, &id, &format!("operations/{id}"));
+            rec.last_heartbeat_wall_time = beat;
+            dead_lock(&d, NAME, &rec.encode());
+            let before = bytes(&d);
+            let r = refusal(obtain_cleanup_lock(&site, STRONG, &me(), NOW, LEASE));
+            assert_eq!(r.code, LockCode::TargetLockBusy, "beat {beat}");
+            assert_eq!(r.holder, Some(rec));
+            assert!(r.detail.contains("younger than the lease threshold"), "{}", r.detail);
+            assert_eq!(bytes(&d), before, "the file is untouched");
+        }
     }
 
     #[test]
