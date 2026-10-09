@@ -4,8 +4,8 @@
 //! Design authority: `docs/superpowers/specs/2026-09-26-cut-4b-copy-tree-design.md`.
 
 use crate::copy::{
-    CopyError, CopyStep, Guard, Heartbeat, copy_file_guarded, no_before_create, no_heartbeat,
-    split_destination, unguarded, weaker,
+    CopyError, CopyStep, Guard, Heartbeat, copy_file_guarded, no_before_create, no_before_publish,
+    no_heartbeat, split_destination, unguarded, weaker,
 };
 use crate::names::{NameIndex, Resolved};
 use crate::state::{FLUX_DIR, RESERVED_DIRS};
@@ -807,6 +807,7 @@ fn copy_one<F: DestinationRoot>(
             cx.guard,
             cx.beat,
             &no_before_create,
+            &no_before_publish,
         );
         return finish_copy(path, published, out, on_report);
     };
@@ -971,6 +972,7 @@ fn copy_one<F: DestinationRoot>(
                 cx.guard,
                 cx.beat,
                 &no_before_create,
+                &no_before_publish,
             );
             let published = match &result {
                 Ok(o) => Some(o.published_identity),
@@ -1026,6 +1028,7 @@ fn copy_one<F: DestinationRoot>(
                 cx.guard,
                 cx.beat,
                 &before_create,
+                &no_before_publish,
             );
             let published = match &result {
                 Ok(o) => Some(o.published_identity),

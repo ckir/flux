@@ -67,6 +67,22 @@ pub(crate) fn no_before_create() -> std::result::Result<(), CopyError> {
     Ok(())
 }
 
+/// Cut 9c: the object about to be published, as `copy_file_guarded` hands it to `before_publish`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishIntent {
+    pub temp: std::ffi::OsString,
+    pub identity: FileIdentity,
+}
+
+/// Cut 9c: runs once per copy that reaches the publish, after the source recheck and BEFORE the final heartbeat and guard.
+/// Its `Err` stops the copy there: the temporary is discarded (as any pre-rename failure) and the error is returned as is.
+pub type BeforePublish<'g> = dyn Fn(&PublishIntent) -> std::result::Result<(), CopyError> + 'g;
+
+/// A `BeforePublish` that always passes: every caller until the commit-recovery note lands.
+pub(crate) fn no_before_publish(_: &PublishIntent) -> std::result::Result<(), CopyError> {
+    Ok(())
+}
+
 /// What the Step 2a identity gate read: the weaker identity when the comparison degraded, and the destination's
 /// metadata (`None` when it is absent), so the policy decision needs no second stat.
 pub(crate) struct GateRead {
@@ -430,7 +446,17 @@ pub fn copy_file_at<F: DestinationRoot>(
     name: &OsStr,
     opts: &CopyOptions,
 ) -> std::result::Result<Outcome, CopyError> {
-    copy_file_guarded(fs, src, parent, name, opts, &unguarded, &no_heartbeat, &no_before_create)
+    copy_file_guarded(
+        fs,
+        src,
+        parent,
+        name,
+        opts,
+        &unguarded,
+        &no_heartbeat,
+        &no_before_create,
+        &no_before_publish,
+    )
 }
 
 /// Copy `src` to `name` inside `parent`, writing ONLY through `parent`.
@@ -456,7 +482,12 @@ pub fn copy_file_at<F: DestinationRoot>(
 /// directory at the name): `Overwrite` proceeds, `SkipExisting` returns a skipped outcome changing nothing on disk,
 /// and `Update` proceeds when the source is newer or the sizes differ (sizes alone when either time is unavailable).
 ///
-/// Eight parameters: the signature is the cut 8b plan's contract (guard, beat, before_create arrive together).
+/// `before_publish` (cut 9c) is called exactly once per copy that reaches the publish: after the source recheck and
+/// before the final heartbeat and guard, with the temporary's name and identity. Its error discards the temporary and
+/// is returned as is; a copy that fails the recheck never calls it.
+///
+/// Nine parameters: the signature is the cut 8b plan's contract (guard, beat, before_create arrive together), plus
+/// cut 9c's `before_publish`.
 #[allow(clippy::too_many_arguments)]
 pub fn copy_file_guarded<F: DestinationRoot>(
     fs: &F,
@@ -467,6 +498,7 @@ pub fn copy_file_guarded<F: DestinationRoot>(
     guard: &Guard<'_>,
     beat: &Heartbeat<'_>,
     before_create: &BeforeCreate<'_>,
+    before_publish: &BeforePublish<'_>,
 ) -> std::result::Result<Outcome, CopyError> {
     let temp = temp_name(name, &opts.operation_id);
 
@@ -624,6 +656,21 @@ pub fn copy_file_guarded<F: DestinationRoot>(
         return Err(discard(parent, &temp, CopyStep::Recheck, Code::SourceChanged, changed, guard));
     }
 
+    // Cut 7b: the object about to be published, read from its own handle - a rename keeps it - so the run records the
+    // target's identity without a look-up by name after the rename.
+    let published_identity = writer.identity().unwrap_or(FileIdentity::Unavailable);
+    // Cut 9c: the hook sees the temporary and its identity before the final heartbeat and guard. Its error is returned
+    // as is, after the temporary is discarded like any other pre-rename failure.
+    let intent = PublishIntent { temp: temp.clone(), identity: published_identity };
+    if let Err(e) = before_publish(&intent) {
+        let CopyError { cause, leftover, step } = e;
+        let mut out = discard(parent, &temp, step, cause.code, cause.source, guard);
+        if out.leftover.is_none() {
+            out.leftover = leftover;
+        }
+        return Err(out);
+    }
+
     // §99 (`S99_check`, then the `S99_write` below): publish only while the lock is still this run's. Otherwise the
     // temporary stays - removing it would be a mutation too - and is reported as the leftover.
     if let Err(e) = beat() {
@@ -638,9 +685,6 @@ pub fn copy_file_guarded<F: DestinationRoot>(
             ..CopyError::at(CopyStep::Publish, lost)
         });
     }
-    // Cut 7b: the object about to be published, read from its own handle - a rename keeps it - so the run records the
-    // target's identity without a look-up by name after the rename.
-    let published_identity = writer.identity().unwrap_or(FileIdentity::Unavailable);
     let published = match opts.publish {
         Publish::Replace => parent.rename_replace(&temp, parent, name),
         Publish::NoReplace => parent.rename_no_replace(&temp, parent, name),
@@ -1524,6 +1568,7 @@ mod tests {
             &lost,
             &no_heartbeat,
             &no_before_create,
+            &no_before_publish,
         )
         .unwrap_err();
         assert_eq!((e.code(), e.step), (Code::TargetLockBusy, CopyStep::Create));
@@ -1548,6 +1593,7 @@ mod tests {
             &guard,
             &no_heartbeat,
             &no_before_create,
+            &no_before_publish,
         )
         .unwrap_err();
         assert_eq!((e.code(), e.step), (Code::TargetLockBusy, CopyStep::Publish));
@@ -1580,6 +1626,7 @@ mod tests {
             &guard,
             &no_heartbeat,
             &no_before_create,
+            &no_before_publish,
         )
         .unwrap_err();
         assert_eq!(e.step, CopyStep::Stream);
@@ -1620,6 +1667,7 @@ mod tests {
             &unguarded,
             &beat,
             &no_before_create,
+            &no_before_publish,
         )
         .unwrap();
         // The sweep, the create, three chunks (COPY_BUF_MAX + COPY_BUF_MAX + 7 bytes), the publish.
@@ -1643,6 +1691,7 @@ mod tests {
             &unguarded,
             &beat,
             &no_before_create,
+            &no_before_publish,
         )
         .unwrap_err();
         assert_eq!((e.code(), e.step), (Code::IoError, CopyStep::Heartbeat));
@@ -1673,6 +1722,7 @@ mod tests {
             &unguarded,
             &beat,
             &no_before_create,
+            &no_before_publish,
         )
         .unwrap_err();
         assert_eq!(e.step, CopyStep::Heartbeat);
@@ -1696,6 +1746,7 @@ mod tests {
             &unguarded,
             &beat,
             &no_before_create,
+            &no_before_publish,
         )
         .unwrap_err();
         assert_eq!(e.step, CopyStep::Heartbeat);
@@ -1739,6 +1790,7 @@ mod tests {
             &unguarded,
             &no_heartbeat,
             before_create,
+            &no_before_publish,
         )
     }
 
@@ -1794,6 +1846,109 @@ mod tests {
         assert!(!ran.get());
     }
 
+    /// Cut 9c: run the copy with the given guard and `before_publish`.
+    fn publishing_with(
+        fs: &FaultFs,
+        guard: &Guard<'_>,
+        before_publish: &BeforePublish<'_>,
+    ) -> std::result::Result<Outcome, CopyError> {
+        let root = fs.destination_root(Path::new("/")).unwrap();
+        copy_file_guarded(
+            fs,
+            Path::new("/src"),
+            &root,
+            OsStr::new("dst"),
+            &opts(),
+            guard,
+            &no_heartbeat,
+            &no_before_create,
+            before_publish,
+        )
+    }
+
+    #[test]
+    fn before_publish_runs_after_the_recheck_and_before_the_final_guard_with_the_temps_identity() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        let seen = std::cell::RefCell::new(Vec::new());
+        // The guard leaves a mark in the call log, so its last call (the one directly in front of the rename) is findable.
+        let guard = || {
+            let _ = fs.metadata(Path::new("/guard-probe"));
+            Ok(())
+        };
+        let hook = |intent: &PublishIntent| {
+            seen.borrow_mut().push(intent.clone());
+            let _ = fs.metadata(Path::new("/marker"));
+            Ok(())
+        };
+        let out = publishing_with(&fs, &guard, &hook).unwrap();
+
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 1, "called once");
+        assert_eq!(seen[0].temp, OsStr::new("dst.flux-partial.op1"));
+        assert_eq!(seen[0].identity, fs.metadata(Path::new("/dst")).unwrap().identity);
+        assert_eq!(seen[0].identity, out.published_identity);
+        assert!(matches!(seen[0].identity, FileIdentity::Strong(_)));
+
+        let calls = fs.calls();
+        let marker = calls.iter().position(|c| c == "metadata(/marker)").expect("the hook ran");
+        let recheck = calls.iter().rposition(|c| c == "metadata(/src)").expect("the recheck");
+        let last_guard =
+            calls.iter().rposition(|c| c.starts_with("metadata(/guard-probe")).expect("the guard");
+        let rename = calls.iter().position(|c| c.starts_with("rename_")).expect("the rename");
+        assert!(recheck < marker, "recheck {recheck}, hook {marker}: {calls:?}");
+        assert!(
+            marker < last_guard && last_guard < rename,
+            "hook {marker}, guard {last_guard}, rename {rename}: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_before_publish_error_discards_the_temporary_and_publishes_nothing() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        let hook = |_: &PublishIntent| {
+            Err(CopyError::at(
+                CopyStep::Claim,
+                FsError::new(Code::IoError, std::io::Error::other("no note")),
+            ))
+        };
+        let e = publishing_with(&fs, &unguarded, &hook).unwrap_err();
+        assert_eq!((e.code(), e.step), (Code::IoError, CopyStep::Claim));
+        assert!(!fs.exists("/dst") && !fs.exists("/dst.flux-partial.op1"), "{:?}", fs.calls());
+        assert!(!fs.called("rename_"), "{:?}", fs.calls());
+        assert!(e.leftover.is_none());
+    }
+
+    #[test]
+    fn before_publish_is_not_called_when_the_recheck_fails() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.grow_on_second_metadata("/src", b" world");
+        let ran = std::cell::Cell::new(0);
+        let hook = |_: &PublishIntent| {
+            ran.set(ran.get() + 1);
+            Ok(())
+        };
+        let e = publishing_with(&fs, &unguarded, &hook).unwrap_err();
+        assert_eq!((e.code(), e.step), (Code::SourceChanged, CopyStep::Recheck));
+        assert_eq!(ran.get(), 0);
+    }
+
+    #[test]
+    fn the_lockless_copy_never_calls_before_publish() {
+        // `copy_file_at` passes `no_before_publish`: a completed lockless copy publishes with no hook in the way.
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        let root = fs.destination_root(Path::new("/")).unwrap();
+        let out = copy_file_at(&fs, Path::new("/src"), &root, OsStr::new("dst"), &opts()).unwrap();
+        assert!(fs.exists("/dst"));
+        assert!(!out.skipped);
+        // The no-op hook is the one `copy_file_at` is built on.
+        let intent = PublishIntent { temp: "t".into(), identity: FileIdentity::Unavailable };
+        assert!(no_before_publish(&intent).is_ok());
+    }
+
     /// Run the copy with the given guard and heartbeat and a `before_create` that counts its calls.
     fn guarded_counting(
         fs: &FaultFs,
@@ -1815,6 +1970,7 @@ mod tests {
             guard,
             beat,
             &cb,
+            &no_before_publish,
         )
     }
 
