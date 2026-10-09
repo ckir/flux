@@ -100,7 +100,8 @@ pub(crate) trait Place<D: DirHandle> {
 }
 
 /// What a tree's adoption found in its claim store: the claim count (before recovery), and the RENAMED notes commit
-/// recovery turned into claims (cut 9c).
+/// recovery turned into claims (cut 9c). The report's `entries claimed` count is `claims`, so it is taken before
+/// recovery and does not include the RENAMED notes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AdoptedStore {
     pub claims: u64,

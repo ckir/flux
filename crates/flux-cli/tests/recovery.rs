@@ -321,11 +321,48 @@ fn a_hand_written_uncertain_note_refuses_resume_with_exit_3_and_changes_nothing(
     same_bytes(&src, &dst);
 }
 
-/// The crash after the rename and before the claim is durable: the engine's own note stays, and the temporary has
-/// been renamed to the entry. (Reproduced by renaming the held temporary by hand; the note's identity is then checked
-/// against the published file's real identity, so the engine's encoding is what recovery compares.)
+/// A record that does not decode is a corrupt store, not an undecided file: `--resume` refuses STATE_CORRUPT (exit 3),
+/// changes nothing, and `--restart` is the way out (spec decision 5).
 #[test]
-fn a_hand_written_renamed_note_is_recovered_and_reported() {
+fn a_note_that_does_not_decode_makes_resume_refuse_state_corrupt_and_change_nothing() {
+    let d = TempDir::new().unwrap();
+    let marks = TempDir::new().unwrap();
+    let (src, dst) = big_tree_in(d.path());
+    let id = killed_strict(&src, &dst, AT_D1_CREATE, marks.path());
+    // Version byte 9: no build of this format reads it.
+    let key = ClaimKey::new(strong_id(&dst.join("d0")), os("zzz"));
+    {
+        let db = store(&dst, &id);
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(PREPARED).unwrap();
+            table.insert(key.encode().as_slice(), [9u8, 0, 0, 0, 0].as_slice()).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    assert_eq!(prepared_count(&dst, &id), 1);
+    let manifest = operation_dir(&dst, &id).join("manifest");
+    let (rows_before, manifest_before) = (rows(&dst, &id), std::fs::read(&manifest).unwrap());
+
+    let out =
+        copy(&[os("--resume"), os("--durability"), os("strict"), src.as_os_str(), dst.as_os_str()]);
+    let e = stderr(&out);
+    assert_eq!(out.status.code(), Some(3), "{e}");
+    assert!(e.contains("STATE_CORRUPT"), "{e}");
+    assert!(!e.contains("COMMIT_STATE_UNCERTAIN"), "{e}");
+    assert_eq!(rows(&dst, &id), rows_before, "state.db holds the same rows");
+    assert_eq!(
+        std::fs::read(&manifest).unwrap(),
+        manifest_before,
+        "the manifest is byte-identical"
+    );
+}
+
+/// The crash after the rename and before the claim is durable: the engine's own note stays, and the temporary has
+/// been renamed to the entry. (Reproduced by renaming the held temporary by hand. The note is the one the engine
+/// wrote, so this is a true writer-to-validator round trip: its identity is checked against the published file's.)
+#[test]
+fn a_renamed_publication_is_recovered_and_reported() {
     let d = TempDir::new().unwrap();
     let marks = TempDir::new().unwrap();
     let (src, dst) = big_tree_in(d.path());
@@ -337,8 +374,6 @@ fn a_hand_written_renamed_note_is_recovered_and_reported() {
     let engine_note = notes(&dst, &id).remove(0).1;
     assert_eq!(engine_note.identity, identity_text(identity_of(&entry)));
     assert!(engine_note.identity.starts_with("strong:"), "{}", engine_note.identity);
-    // A hand-written note for the same object replaces it, so the test does not rest on the engine's note alone.
-    note(&dst, &id, "d1", "f000", &identity_text(identity_of(&entry)));
     assert_eq!(prepared_count(&dst, &id), 1);
 
     let out = copy(&[
@@ -377,7 +412,7 @@ fn a_normal_copy_never_writes_a_note() {
 }
 
 #[test]
-fn an_older_reader_refuses_a_format_2_store() {
+fn a_strict_copy_writes_format_2() {
     // The refusal of an older binary is pinned at the unit level by the format-3 test; here: this binary WRITES 2.
     let d = TempDir::new().unwrap();
     let marks = TempDir::new().unwrap();

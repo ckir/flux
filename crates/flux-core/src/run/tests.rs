@@ -4821,3 +4821,275 @@ fn recovery_runs_before_the_walk_plans_anything() {
     assert!(apply < at(&c, "read_dir(/p/dest)"), "{c:?}");
     assert!(apply < at(&c, "create_new(/p/dest/a.flux-partial."), "{c:?}");
 }
+
+// Cut 9c final review: evidence labels, validation, a writer-to-validator round trip, and the stray-name guard.
+
+#[test]
+fn a_note_that_does_not_decode_makes_the_store_corrupt_and_changes_nothing() {
+    // Spec decision 5. Mutant (fault_fs.rs, `prepared`): skip an undecodable row instead of failing with StateCorrupt.
+    let fs = strict_prior();
+    let parent = strong(&fs, "/p/dest");
+    // Version byte 9: no build of this format reads it.
+    fs.put_raw_note(state_db(5), &ClaimKey::new(parent, OsStr::new("a")), &[9, 0, 0, 0, 0]);
+    let (r, _) = recover(&fs);
+    assert_eq!(refused(&r.stop), (LockCode::StateCorrupt, false), "{:?}", r.stop);
+    assert!(detail(&r.stop).contains("corrupt prepared note"), "{}", detail(&r.stop));
+    assert_eq!(fs.prepared_count(), 1);
+    let c = calls(&fs);
+    assert!(!c.iter().any(|x| x.starts_with("claim_apply_recovery")), "{c:?}");
+    assert!(!matches!(r.resumed, Some(ResumeNote::Adopted { .. })), "{:?}", r.resumed);
+}
+
+#[test]
+fn a_weak_directory_identity_is_unavailable_and_a_strong_other_is_another_object() {
+    // Mutant (recover.rs): `Ok(FileIdentity::Strong(_))` arm dropped, so the catch-all `Ok(_)` answers
+    // ANOTHER_OBJECT for a Weak directory (the old labelling).
+    let fs = strict_prior();
+    put(&fs, "/p/dest/sub/b", b"BB", 101);
+    noted(&fs, 5, "b", "sub\0b", identity_of(&fs, "/p/dest/sub/b"), "sub", false, "");
+    fs.set_identity("/p/dest/sub", weakened(identity_of(&fs, "/p/dest/sub")));
+    let (r, _) = recover(&fs);
+    let d = uncertain(&r);
+    assert!(
+        d.contains(
+            "/p/dest/sub/b: cannot tell whether this file was published (identity unavailable)"
+        ),
+        "{d}"
+    );
+
+    // Distractor: a Strong identity that is not the key's parent is another object.
+    let fs = strict_prior();
+    put(&fs, "/p/dest/sub/b", b"BB", 101);
+    noted(&fs, 5, "b", "sub\0b", identity_of(&fs, "/p/dest/sub/b"), "sub", false, "");
+    fs.set_identity("/p/dest/sub", another());
+    let (r, _) = recover(&fs);
+    let d = uncertain(&r);
+    assert!(
+        d.contains(
+            "/p/dest/sub/b: cannot tell whether this file was published (destination holds another object)"
+        ),
+        "{d}"
+    );
+}
+
+#[test]
+fn a_link_at_the_temporary_name_is_another_object_and_an_unreadable_name_is_unreadable() {
+    // Mutant (recover.rs): the `Ok(_)` arm of the temporary's metadata answers UNREADABLE_DIRECTORY (old labelling).
+    let fs = strict_prior();
+    fs.add_symlink(format!("/p/dest/{}", temp_of("a", 5)));
+    noted(&fs, 5, "a", "a", another(), "", false, "");
+    let (r, _) = recover(&fs);
+    let d = uncertain(&r);
+    assert!(
+        d.contains(
+            "/p/dest/a: cannot tell whether this file was published (destination holds another object)"
+        ),
+        "{d}"
+    );
+
+    // Distractor: the temporary's metadata fails with something other than NotFound: unreadable.
+    let fs = strict_prior();
+    noted(&fs, 5, "a", "a", another(), "", false, "");
+    fs.on_nth("claim_prepared", 1, |fs| fs.fail("metadata", Code::IoError));
+    let (r, _) = recover(&fs);
+    let d = uncertain(&r);
+    assert!(
+        d.contains("/p/dest/a: cannot tell whether this file was published (unreadable directory)"),
+        "{d}"
+    );
+}
+
+/// A valid note for a published `/p/dest/a`, to be made hostile in one field.
+fn valid_note_for_a(fs: &FaultFs) -> PreparedRecord {
+    PreparedRecord {
+        target: key("a"),
+        temp_name: temp_of("a", 5).into_bytes(),
+        identity: identity_text(identity_of(fs, "/p/dest/a")),
+        dir_path: String::new(),
+        name: b"a".to_vec(),
+        planned_name: Vec::new(),
+        replacement: false,
+    }
+}
+
+/// `record` is the only note, keyed at `key_name`; the adoption is UNCERTAIN `invalid note`, nothing under DEST was
+/// looked at for it, and the note is still there.
+fn assert_invalid_note(
+    record: impl FnOnce(&FaultFs, PreparedRecord) -> PreparedRecord,
+    key_name: &str,
+) {
+    let fs = strict_prior();
+    put(&fs, "/p/dest/a", b"A", 101);
+    let hostile = record(&fs, valid_note_for_a(&fs));
+    let parent = strong(&fs, "/p/dest");
+    note_at(&fs, 5, &ClaimKey::new(parent, OsStr::new(key_name)), &hostile);
+    let (r, _) = recover(&fs);
+    let d = uncertain(&r);
+    assert!(d.contains("cannot tell whether this file was published (invalid note)"), "{d}");
+    let c = calls(&fs);
+    let after = &c[at(&c, "claim_prepared")..];
+    assert!(
+        !after.iter().any(|x| x.starts_with("metadata(/p/dest/") || x.starts_with("open_dir(")),
+        "nothing is looked at for an invalid note: {after:?}"
+    );
+    assert_eq!(fs.prepared_count(), 1);
+}
+
+#[test]
+fn a_valid_note_of_the_hostile_tests_shape_proceeds() {
+    // The control of the four tests below: the same builder, unmodified, is RENAMED and the probe sees its lookups.
+    let fs = strict_prior();
+    put(&fs, "/p/dest/a", b"A", 101);
+    let record = valid_note_for_a(&fs);
+    note_at(&fs, 5, &ClaimKey::new(strong(&fs, "/p/dest"), OsStr::new("a")), &record);
+    let (r, got) = recover(&fs);
+    ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    adopted_recovering(&r, 0, 1);
+    let c = calls(&fs);
+    assert!(
+        c[at(&c, "claim_prepared")..].iter().any(|x| x.starts_with("metadata(/p/dest/a")),
+        "{c:?}"
+    );
+}
+
+#[test]
+fn a_note_whose_key_names_another_entry_is_invalid() {
+    // Mutant (recover.rs, `validate`): drop the `key.name != note.name` check.
+    assert_invalid_note(|_, r| r, "x");
+}
+
+#[test]
+fn a_note_with_a_name_that_is_not_one_component_is_invalid() {
+    // Mutants (recover.rs, `validate`): drop the `component(&note.name)` check; drop the `planned_name` check.
+    assert_invalid_note(
+        |_, mut r| {
+            // Its temporary's name (`...flux-partial.<id>`) is a valid component, so only the name's own check fails.
+            r.name = b"..".to_vec();
+            r.temp_name = temp_of("..", 5).into_bytes();
+            r
+        },
+        "..",
+    );
+    assert_invalid_note(
+        |_, mut r| {
+            r.planned_name = b"..".to_vec();
+            r.temp_name = temp_of("..", 5).into_bytes();
+            r
+        },
+        "a",
+    );
+}
+
+#[test]
+fn a_note_with_a_bad_dir_path_is_invalid() {
+    // Mutants (recover.rs, `validate`): `from_native_hex(..)?` made lenient; the all-Normal-components check dropped.
+    assert_invalid_note(
+        |_, mut r| {
+            r.dir_path = "zz".to_string();
+            r
+        },
+        "a",
+    );
+    assert_invalid_note(
+        |_, mut r| {
+            r.dir_path = native_hex(Path::new("sub/.."));
+            r
+        },
+        "a",
+    );
+}
+
+#[test]
+fn a_note_with_an_unparsable_identity_is_invalid() {
+    // Mutant (recover.rs, `validate`): `parse_identity(..)` replaced by `unwrap_or(FileIdentity::Unavailable)`.
+    assert_invalid_note(
+        |_, mut r| {
+            r.identity = "strong:not-a-number".to_string();
+            r
+        },
+        "a",
+    );
+}
+
+#[test]
+fn a_crashed_case_variant_replacement_is_recovered_with_both_claims() {
+    // A writer-to-validator round trip on the fake: the note is the one a Strict run wrote, not a hand-built one.
+    // Mutant (recover.rs): commit with `planned: None`; or validate the temporary against `name` instead of
+    // `planned_name`.
+    let fs = fake_src(100);
+    fs.create_dir(Path::new("/p/dest")).unwrap();
+    fs.write_file("/p/dest/A", b"old");
+    fs.set_case_insensitive(true);
+    fs.fail("claim_commit_prepared", Code::IoError);
+    // The 4th guarded mutation is `sub`'s creation, after `a`'s publish and its failed commit: the run dies there.
+    let count = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&count);
+    let hook: BeforeMutation = Arc::new(move || {
+        if seen.fetch_add(1, Ordering::SeqCst) + 1 == 4 {
+            panic!("the test's crash point");
+        }
+    });
+    let first = RunConfig { before_mutation: Some(hook), ..cfg() };
+    let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_tree_with(&fs, &first, &strict())
+    }));
+    assert!(died.is_err(), "the run died");
+    assert_eq!(fs.prepared_count(), 1, "the crash left the engine's own note");
+    assert_eq!(
+        fs.read_file("/p/dest/A").as_deref(),
+        Some(&b"A"[..]),
+        "published under the stored spelling"
+    );
+    assert!(
+        !fs.exists(format!("/p/dest/a.flux-partial.{ID}"))
+            && !fs.exists(format!("/p/dest/A.flux-partial.{ID}"))
+    );
+    let again = RunConfig { operation_id: id(0x77), ..resume() };
+    let before = calls(&fs).len();
+    let (r, _) = run_tree_with(&fs, &again, &strict());
+    let out = ok(&r);
+    // Recovered, not redone: the walk skips the case-variant file as resumed and makes no temporary for it.
+    assert_eq!(out.files_resumed, 1, "{out:?}");
+    let c = calls(&fs);
+    assert!(
+        !c[before..].iter().any(|x| x.starts_with("create_new(/p/dest/a.flux-partial.")
+            || x.starts_with("create_new(/p/dest/A.flux-partial.")),
+        "{c:?}"
+    );
+    let dest = strong(&fs, "/p/dest");
+    // `claims` is taken before recovery: the replacement's `Existing` claim of the old file.
+    assert_eq!(
+        r.resumed,
+        Some(ResumeNote::Adopted { operation_id: ID.to_string(), claims: Some(1), recovered: 1 }),
+        "{:?}",
+        r.resumed
+    );
+    assert_eq!(fs.claim(dest, "A"), created("a"), "the stored spelling");
+    assert_eq!(fs.claim(dest, "a"), created("a"), "the planned spelling");
+    assert_eq!(fs.prepared_count(), 0);
+}
+
+#[test]
+fn a_stray_temp_name_that_changed_hands_is_kept_with_a_warning() {
+    // Mutant (recover.rs): `remove_stray` removes without re-reading the temporary's identity.
+    let fs = renamed_with_a_stray_temp();
+    let temp = format!("/p/dest/{}", temp_of("a", 5));
+    let hook = temp.clone();
+    // After classification, just before phase 2: another object takes the temporary's name.
+    fs.on_nth("claim_apply_recovery", 1, move |fs| fs.set_identity(&hook, another()));
+    let (r, _) = recover(&fs);
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    adopted_recovering(&r, 0, 1);
+    assert!(fs.exists(&temp), "not ours any more: kept");
+    let manifest = format!("/p/dest/.flux/operations/{}/manifest", id(5));
+    assert!(
+        r.warnings.iter().any(|w| matches!(w, RunWarning::PartialKept { path, kept, .. }
+            if path.to_string_lossy().replace('\\', "/") == temp
+                && kept.to_string_lossy().replace('\\', "/") == manifest)),
+        "{:?}",
+        r.warnings
+    );
+    assert_eq!(fs.claim(strong(&fs, "/p/dest"), "a"), created("a"));
+    assert!(!calls(&fs).iter().any(|x| x == &format!("remove_file({temp})")));
+}

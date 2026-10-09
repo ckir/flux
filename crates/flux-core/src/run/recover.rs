@@ -148,13 +148,18 @@ pub(crate) fn classify<D: DirHandle>(
     let dir = held.as_ref().unwrap_or(dest);
     match dir.identity() {
         Ok(FileIdentity::Strong(o)) if o == key.parent => {}
-        Ok(_) => return uncertain(ANOTHER_OBJECT),
+        // Another directory is at the recorded path: that is an object, not a missing identity.
+        Ok(FileIdentity::Strong(_)) => return uncertain(ANOTHER_OBJECT),
+        // Weak or unavailable: nothing can show it is the directory the note was written in.
+        Ok(_) => return uncertain(IDENTITY_UNAVAILABLE),
         Err(_) => return uncertain(UNREADABLE_DIRECTORY),
     }
     let t: Seen = match dir.metadata(&v.temp) {
         Ok(m) if m.file_type == FileType::File => Some(m.identity),
+        // A link, a directory or anything else at the temporary's name is another object, not an unreadable one.
+        Ok(_) => return uncertain(ANOTHER_OBJECT),
         Err(e) if e.source.kind() == ErrorKind::NotFound => None,
-        _ => return uncertain(UNREADABLE_DIRECTORY),
+        Err(_) => return uncertain(UNREADABLE_DIRECTORY),
     };
     let d: Seen = match dir.metadata(&v.name) {
         Ok(m) => Some(m.identity),
@@ -219,6 +224,33 @@ fn target_path(note: &PreparedRecord) -> PathBuf {
     note.target.0.split(|b| *b == 0).map(|c| String::from_utf8_lossy(c).into_owned()).collect()
 }
 
+/// Row 1's stray temp name, removed only while it still holds the published object `recorded`. Anything else at the
+/// name (it was replaced between classification and now) is kept and reported like a failed removal.
+fn remove_stray<D: DirHandle>(dest: &D, rel: &Path, recorded: FileIdentity) -> Result<(), FsError> {
+    let parts: Vec<&OsStr> = rel.iter().collect();
+    let Some((leaf, dirs)) = parts.split_last() else { return Ok(()) };
+    let mut held: Option<D> = None;
+    for name in dirs {
+        match held.as_ref().unwrap_or(dest).open_dir(name) {
+            Ok(next) => held = Some(next),
+            Err(e) if e.source.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    }
+    match held.as_ref().unwrap_or(dest).metadata(leaf) {
+        Ok(m) if m.identity == recorded => {}
+        Ok(_) => {
+            return Err(FsError::new(
+                Code::SafetyRejected,
+                std::io::Error::other("the temporary's name no longer holds the published object"),
+            ));
+        }
+        Err(e) if e.source.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    }
+    remove_validated(dest, rel).map(|_| ())
+}
+
 /// Both phases: classify every note, then `apply_recovery` once, then remove the stray temp names of RENAMED rows. A
 /// failed removal is a `PartialKept` warning (the object IS published) and never fails the adoption.
 pub(crate) fn recover_publications<D: DirHandle, S: ClaimStore>(
@@ -243,7 +275,7 @@ pub(crate) fn recover_publications<D: DirHandle, S: ClaimStore>(
                 recovered += 1;
                 // `classify` validated the note, so this is `Some`.
                 if remove_temp && let Some(v) = validate(operation_id, &key, &note) {
-                    strays.push(v.dir.join(v.temp));
+                    strays.push((v.dir.join(v.temp), v.recorded));
                 }
                 let planned = (!note.planned_name.is_empty())
                     .then(|| ClaimKey { parent: key.parent, name: note.planned_name.clone() });
@@ -257,8 +289,8 @@ pub(crate) fn recover_publications<D: DirHandle, S: ClaimStore>(
         return Err(RecoverError::Uncertain(undecided));
     }
     store.apply_recovery(&ops).map_err(RecoverError::Store)?;
-    for rel in strays {
-        if let Err(error) = remove_validated(dest, &rel) {
+    for (rel, recorded) in strays {
+        if let Err(error) = remove_stray(dest, &rel, recorded) {
             warnings.push(RunWarning::PartialKept {
                 path: dest_shown.join(&rel),
                 error,

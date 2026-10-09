@@ -503,6 +503,8 @@ the spec's numbers, 9-10 were learned during execution).
    entry at `prepare` time (insert-if-absent), which the row's key already allows.
 8. `--restart` and `flux cleanup` never run commit recovery: they supersede or remove the operation, sweep its partials by id and never touch the
    object a note leaves in doubt.
+9. A destination name that is not valid Unicode on Windows (an unpaired surrogate) cannot be recorded in a note; its publication under Strict reads as an
+   invalid note at --resume and only --restart clears it.
 9. The parent directory of an UNCERTAIN note may be on a case-insensitive filesystem under another spelling: the directory is opened by the recorded
    spelling, so a different case reads as absent and the verdict is GONE or UNCERTAIN, never RENAMED.
 

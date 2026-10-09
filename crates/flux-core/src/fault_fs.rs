@@ -851,6 +851,14 @@ impl FaultFs {
         self.inner.lock().unwrap().claim_formats.insert(path.as_ref().to_path_buf(), format);
     }
 
+    /// Test helper: puts `raw` bytes, undecoded, as the prepared note at `key` of the claim store created at `path`
+    /// (a hostile or foreign-version record, which no `prepare` call can write). Panics when no store is there.
+    pub fn put_raw_note(&self, path: impl AsRef<Path>, key: &ClaimKey, raw: &[u8]) {
+        let g = self.inner.lock().unwrap();
+        let map = g.prepared_files.get(path.as_ref()).expect("a claim store was created there");
+        map.lock().unwrap().insert(key.encode(), raw.to_vec());
+    }
+
     /// Prepared notes across every store created from this fake.
     pub fn prepared_count(&self) -> usize {
         let g = self.inner.lock().unwrap();

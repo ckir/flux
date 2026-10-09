@@ -66,8 +66,7 @@ Derived from the above and the spec (the matrix and the failure rule were agreed
    open writer handle immediately before the rename (`copy.rs`, "a rename keeps it").
    **Encoding (version 1):** one version byte `1`, then in this order `target`, `temp_name`, `identity`, `dir_path`, `name`, `planned_name`, each as a
    4-byte big-endian length followed by that many bytes (`identity` is the ASCII `identity_text` of `state.rs`: `strong:<volume>:<index>`,
-   `weak:<volume>:<index>` or `unavailable`; `dir_path` is the lowercase hex of `native_hex`), then one byte `replacement` (0 or 1). A record that does not
-   decode, has trailing bytes, or carries a version other than 1 is UNCERTAIN. **Validation in phase 1 before any filesystem access:** `name` and
+   `weak:<volume>:<index>` or `unavailable`; `dir_path` is the lowercase hex of `native_hex`), then one byte `replacement` (0 or 1). A record that does not decode (another version byte, trailing bytes, a short field) makes the store STATE_CORRUPT (exit 3, nothing changed; `--restart` is the way out); a record that decodes but fails validation is UNCERTAIN (`invalid note`). **Validation in phase 1 before any filesystem access:** `name` and
    `planned_name` (when not empty) are single normal path components; `temp_name` equals `<planned_name or, when that is empty, name>.flux-partial.<this operation's id>` (derived: `copy_file_guarded` names the temporary
    from the name the plan used, `copy.rs` `temp_name(name, ..)`, so a hostile row cannot name another file and a case-folding replacement validates);
    `dir_path` is the empty string (the entry is directly under DEST) or decodes with `from_native_hex` to a relative path of normal components
@@ -201,7 +200,7 @@ W10. **Spec gaps found:** G2 to G5 and the 259.8 wording "may finalize the commi
 10. No wedge: a rename (or guard) failing after `prepare` leaves no note; a note whose temporary is gone while D is the old Strong object is GONE and the
     file is redone; a replacement note with T present and a Weak D is NOT RENAMED; a no-replace note with T present and a Weak D is UNCERTAIN (the link
     fallback); a failed removal of the stray temp name in row 1 is a warning and the adoption succeeds.
-11. A hostile note (unknown version, trailing bytes, a `temp_name` that is not `<planned_name or name>.flux-partial.<id>`, a `dir_path` whose resolved identity differs from
+11. A record that does not decode (an unknown version byte, trailing bytes): `--resume` refuses STATE_CORRUPT (exit 3) and changes nothing. A hostile note that decodes (a `temp_name` that is not `<planned_name or name>.flux-partial.<id>`, a `dir_path` whose resolved identity differs from
     the key's parent): UNCERTAIN, nothing touched.
 
 ## Left to the plan (nothing here is undecided policy)
