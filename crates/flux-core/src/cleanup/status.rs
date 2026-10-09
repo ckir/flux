@@ -392,6 +392,40 @@ mod tests {
     }
 
     #[test]
+    fn row_11_a_root_lock_whose_workspace_exists_is_never_eligible() {
+        for force in [false, true] {
+            let v = verdict(
+                Subject::RootLock { moved_aside: false },
+                rec("live", false, Age::Seconds(3600)),
+                force,
+            );
+            assert_eq!((v.status, v.eligible), (Status::Uncertain, false));
+            assert_eq!(v.note, "workspace exists");
+        }
+        // Distractor: a moved-aside file is reclaimed whatever its record says (Decision 8).
+        let v = verdict(
+            Subject::RootLock { moved_aside: true },
+            rec("live", false, Age::Seconds(3600)),
+            false,
+        );
+        assert_eq!((v.status, v.eligible), (Status::Stale, true));
+    }
+
+    #[test]
+    fn a_young_manifest_age_is_the_lease_when_no_record_names_this_operation() {
+        for force in [false, true] {
+            let v = verdict(op(OpState::Failed, Age::Seconds(10)), LockProbe::Absent, force);
+            assert_eq!((v.status, v.eligible), (Status::Resumable, false));
+            let v = verdict(
+                op(OpState::Failed, Age::Seconds(10)),
+                rec("other", false, Age::Seconds(3600)),
+                force,
+            );
+            assert_eq!((v.status, v.eligible), (Status::Resumable, false));
+        }
+    }
+
+    #[test]
     fn row_12_a_young_or_future_orphan_lock_is_uncertain() {
         let v = verdict(
             Subject::RootLock { moved_aside: false },
