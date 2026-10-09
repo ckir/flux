@@ -133,11 +133,15 @@ mod tests {
                 "{name}"
             );
         }
-        assert_eq!(validate("2f2f", ID), Err(ArtifactProblem::NotHex));
-        // `Path::components` drops an interior `.`, so `native_hex` cannot make one: spell the bytes out.
-        let interior: String =
-            format!("sub/./{}", partial("")).bytes().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(validate(&interior, ID), Err(ArtifactProblem::BadComponent));
+        // Spelled-out bytes are UTF-8/POSIX units; Windows decodes native text as UTF-16, so these are unix-only.
+        #[cfg(unix)]
+        {
+            assert_eq!(validate("2f2f", ID), Err(ArtifactProblem::NotHex));
+            // `Path::components` drops an interior `.`, so `native_hex` cannot make one: spell the bytes out.
+            let interior: String =
+                format!("sub/./{}", partial("")).bytes().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(validate(&interior, ID), Err(ArtifactProblem::BadComponent));
+        }
     }
 
     #[test]
@@ -211,5 +215,15 @@ mod tests {
             err.code
         );
         assert!(fs.exists(&leaf));
+
+        fs.add_symlink(format!("/dest/dir/c.flux-partial.{ID}"));
+        let err =
+            remove_validated(&dest, Path::new(&format!("dir/c.flux-partial.{ID}"))).unwrap_err();
+        assert!(
+            matches!(err.code, Code::SafetyRejected | Code::DestinationError),
+            "{:?}",
+            err.code
+        );
+        assert!(fs.exists(format!("/dest/dir/c.flux-partial.{ID}")));
     }
 }
