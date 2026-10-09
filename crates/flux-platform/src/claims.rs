@@ -357,15 +357,21 @@ fn apply_in(tx: &redb::WriteTransaction, op: &RecoveryOp) -> Result<()> {
                     io::Error::other("a claim owned by another target is in the way"),
                 )
             };
-            let owned_by_other = |claims: &redb::Table<&[u8], &[u8]>,
-                                  k: &[u8]|
-             -> Result<Option<bool>> {
-                // None: absent. Some(false): ours. Some(true): foreign (or undecodable).
-                Ok(claims.get(k).map_err(io_err)?.map(|g| match ClaimRecord::decode(g.value()) {
-                    Some(r) => r.target != *target,
-                    None => true,
-                }))
-            };
+            let owned_by_other =
+                |claims: &redb::Table<&[u8], &[u8]>, k: &[u8]| -> Result<Option<bool>> {
+                    // None: absent. Some(false): ours. Some(true): foreign. An undecodable record is a corrupt store
+                    // (as on every other path), not somebody else's claim.
+                    match claims.get(k).map_err(io_err)? {
+                        None => Ok(None),
+                        Some(g) => match ClaimRecord::decode(g.value()) {
+                            Some(r) => Ok(Some(r.target != *target)),
+                            None => Err(FsError::new(
+                                Code::StateCorrupt,
+                                io::Error::other("undecodable claim record"),
+                            )),
+                        },
+                    }
+                };
             let k = key.encode();
             if owned_by_other(&claims, k.as_slice())? == Some(true) {
                 return Err(foreign());

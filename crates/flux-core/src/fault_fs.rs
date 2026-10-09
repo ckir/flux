@@ -201,20 +201,26 @@ fn apply_op(claims: &mut Bytes, prepared: &mut Bytes, op: &RecoveryOp) -> Result
                     std::io::Error::other("a claim owned by another target is in the way"),
                 )
             };
-            // None: absent. Some(false): ours. Some(true): foreign (or undecodable).
-            let owned_by_other = |claims: &Bytes, k: &[u8]| -> Option<bool> {
-                claims.get(k).map(|v| match ClaimRecord::decode(v) {
-                    Some(r) => r.target != *target,
-                    None => true,
-                })
+            // None: absent. Some(false): ours. Some(true): foreign. Undecodable: a corrupt store, as in the real one.
+            let owned_by_other = |claims: &Bytes, k: &[u8]| -> Result<Option<bool>> {
+                match claims.get(k) {
+                    None => Ok(None),
+                    Some(v) => match ClaimRecord::decode(v) {
+                        Some(r) => Ok(Some(r.target != *target)),
+                        None => Err(FsError::new(
+                            Code::StateCorrupt,
+                            std::io::Error::other("undecodable claim record"),
+                        )),
+                    },
+                }
             };
             let k = key.encode();
-            if owned_by_other(claims, &k) == Some(true) {
+            if owned_by_other(claims, &k)? == Some(true) {
                 return Err(foreign());
             }
             let pk = planned.as_ref().map(|p| p.encode());
             let planned_absent = match &pk {
-                Some(pk) => match owned_by_other(claims, pk) {
+                Some(pk) => match owned_by_other(claims, pk)? {
                     Some(true) => return Err(foreign()),
                     Some(false) => false,
                     None => true,
@@ -856,6 +862,13 @@ impl FaultFs {
     pub fn put_raw_note(&self, path: impl AsRef<Path>, key: &ClaimKey, raw: &[u8]) {
         let g = self.inner.lock().unwrap();
         let map = g.prepared_files.get(path.as_ref()).expect("a claim store was created there");
+        map.lock().unwrap().insert(key.encode(), raw.to_vec());
+    }
+
+    /// Test helper: puts `raw` bytes, undecoded, as the claim at `key` of the claim store created at `path`.
+    pub fn put_raw_claim(&self, path: impl AsRef<Path>, key: &ClaimKey, raw: &[u8]) {
+        let g = self.inner.lock().unwrap();
+        let map = g.claim_files.get(path.as_ref()).expect("a claim store was created there");
         map.lock().unwrap().insert(key.encode(), raw.to_vec());
     }
 

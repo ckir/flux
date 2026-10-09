@@ -5093,3 +5093,54 @@ fn a_stray_temp_name_that_changed_hands_is_kept_with_a_warning() {
     assert_eq!(fs.claim(strong(&fs, "/p/dest"), "a"), created("a"));
     assert!(!calls(&fs).iter().any(|x| x == &format!("remove_file({temp})")));
 }
+
+#[test]
+fn an_undecodable_claim_is_state_corrupt_in_the_fake_store_too() {
+    // Mutant (fault_fs.rs `apply_op`): `None => true` (foreign, IoError) for an undecodable claim.
+    for planned in [false, true] {
+        let fs = strict_prior();
+        let parent = strong(&fs, "/p/dest");
+        let record = PreparedRecord {
+            target: key("a"),
+            temp_name: temp_of("a", 5).into_bytes(),
+            identity: "strong:1:9".to_string(),
+            dir_path: String::new(),
+            name: b"a".to_vec(),
+            planned_name: Vec::new(),
+            replacement: false,
+        };
+        let k = ClaimKey::new(parent, OsStr::new("a"));
+        note_at(&fs, 5, &k, &record);
+        let bad = if planned { ClaimKey::new(parent, OsStr::new("A")) } else { k.clone() };
+        fs.put_raw_claim(state_db(5), &bad, &[0xff; 3]);
+        let mut store = store_of(&fs, 5);
+        let want = planned.then_some(&bad);
+        let e = store.commit_prepared(&k, &key("a"), want).unwrap_err();
+        assert_eq!(e.code, Code::StateCorrupt, "{e:?}");
+        let op = flux_fs::RecoveryOp::Commit {
+            key: k.clone(),
+            target: key("a"),
+            planned: want.cloned(),
+        };
+        let e = store.apply_recovery(&[op]).unwrap_err();
+        assert_eq!(e.code, Code::StateCorrupt, "{e:?}");
+        assert_eq!(fs.prepared_count(), 1);
+    }
+}
+
+#[test]
+fn a_renamed_note_meeting_an_undecodable_claim_refuses_state_corrupt() {
+    let fs = strict_prior();
+    put(&fs, "/p/dest/a", b"A", 101);
+    let r_id = identity_of(&fs, "/p/dest/a");
+    noted(&fs, 5, "a", "a", r_id, "", false, "");
+    fs.put_raw_claim(
+        state_db(5),
+        &ClaimKey::new(strong(&fs, "/p/dest"), OsStr::new("a")),
+        &[0xff; 3],
+    );
+    let (r, _) = recover(&fs);
+    assert_eq!(refused(&r.stop), (LockCode::StateCorrupt, false), "{:?}", r.stop);
+    assert_eq!(fs.prepared_count(), 1);
+    assert!(!matches!(r.resumed, Some(ResumeNote::Adopted { .. })), "{:?}", r.resumed);
+}

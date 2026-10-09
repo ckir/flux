@@ -260,3 +260,109 @@ mod open {
         assert_eq!(open_err(&path).code, Code::StateCorrupt);
     }
 }
+
+mod undecodable_claims {
+    use super::*;
+    use flux_fs::{PreparedRecord, RecoveryOp};
+    use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+
+    const CLAIMS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("claims");
+
+    fn target() -> FluxPathKey {
+        FluxPathKey(b"t".to_vec())
+    }
+
+    fn key(name: &str) -> ClaimKey {
+        ClaimKey::new(ObjectId { volume: 1, index: 1 }, OsStr::new(name))
+    }
+
+    /// A store at a fresh path holding a note for `key("a")`, closed again.
+    fn with_note() -> std::path::PathBuf {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        std::mem::forget(dir);
+        let file = OpenOptions::new().read(true).write(true).create_new(true).open(&path).unwrap();
+        let mut s = RedbClaimStore::create_file(file, Durability::Strict).unwrap();
+        let note = PreparedRecord {
+            target: target(),
+            temp_name: b"a.flux-partial.x".to_vec(),
+            identity: "strong:1:9".to_string(),
+            dir_path: String::new(),
+            name: b"a".to_vec(),
+            planned_name: Vec::new(),
+            replacement: false,
+        };
+        s.prepare(&key("a"), &note).unwrap();
+        path
+    }
+
+    fn garbage_at(path: &std::path::Path, k: &ClaimKey) {
+        let db = Database::open(path).unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            tx.open_table(CLAIMS)
+                .unwrap()
+                .insert(k.encode().as_slice(), [0xffu8; 3].as_slice())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    fn claims_rows(path: &std::path::Path) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let db = Database::open(path).unwrap();
+        let tx = db.begin_read().unwrap();
+        let t = tx.open_table(CLAIMS).unwrap();
+        t.iter()
+            .unwrap()
+            .map(|r| {
+                let (k, v) = r.unwrap();
+                (k.value().to_vec(), v.value().to_vec())
+            })
+            .collect()
+    }
+
+    fn open(path: &std::path::Path) -> RedbClaimStore {
+        let f = OpenOptions::new().read(true).write(true).open(path).unwrap();
+        RedbClaimStore::open_file(f, Durability::Strict).unwrap()
+    }
+
+    /// Both entry points refuse with StateCorrupt and change nothing.
+    fn refuses(path: &std::path::Path, planned: Option<&ClaimKey>) {
+        let before = claims_rows(path);
+        let mut s = open(path);
+        let e = s.commit_prepared(&key("a"), &target(), planned).unwrap_err();
+        assert_eq!(e.code, Code::StateCorrupt, "{e:?}");
+        let op = RecoveryOp::Commit { key: key("a"), target: target(), planned: planned.cloned() };
+        let e = s.apply_recovery(&[op]).unwrap_err();
+        assert_eq!(e.code, Code::StateCorrupt, "{e:?}");
+        assert_eq!(s.prepared().unwrap().len(), 1, "the note is still listed");
+        drop(s);
+        assert_eq!(claims_rows(path), before, "claims unchanged");
+    }
+
+    #[test]
+    fn an_undecodable_claim_at_the_key_is_state_corrupt() {
+        // Mutant (claims.rs `apply_in`): `None => true` (foreign, IoError) for an undecodable claim.
+        let path = with_note();
+        garbage_at(&path, &key("a"));
+        refuses(&path, None);
+    }
+
+    #[test]
+    fn an_undecodable_claim_at_the_planned_key_is_state_corrupt() {
+        let path = with_note();
+        garbage_at(&path, &key("A"));
+        refuses(&path, Some(&key("A")));
+    }
+
+    #[test]
+    fn a_decodable_foreign_claim_stays_an_io_error() {
+        let path = with_note();
+        let mut s = open(&path);
+        let other =
+            ClaimRecord { target: FluxPathKey(b"other".to_vec()), status: ClaimStatus::Existing };
+        s.insert_if_absent(&key("a"), &other).unwrap();
+        let e = s.commit_prepared(&key("a"), &target(), None).unwrap_err();
+        assert_eq!(e.code, Code::IoError, "{e:?}");
+    }
+}
