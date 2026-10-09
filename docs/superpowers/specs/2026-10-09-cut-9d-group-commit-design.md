@@ -30,8 +30,9 @@ own durable note first.
 ## Decisions
 
 1. **Split the copy at the publish point.** `copy_file_guarded` (crates/flux-core/src/copy.rs) keeps its name, signature and behaviour. Internally it
-   becomes `stage_file` (steps 1-7: leftover sweep, source, identity gate, existing-file policy, exclusive create, stream, data sync, metadata,
-   source recheck) followed by `publish_staged` (the final heartbeat and guard, then the rename). `stage_file` returns a `Staged` value: the temporary's
+   becomes `stage_file` (steps 1-7: leftover sweep, source, identity gate, existing-file policy, the cut 8b `before_create` claim, exclusive create, stream,
+   data sync, metadata, source recheck; `before_create` runs inside `stage_file` at its present place, so a Replace target's `Existing` claim is made
+   BEFORE its temporary exists, exactly as today, and two targets can never stage onto the same stored name) followed by `publish_staged` (the final heartbeat and guard, then the rename). `stage_file` returns a `Staged` value: the temporary's
    name, its `FileIdentity`, `bytes_copied`, `metadata_failures`, `identity_degraded`. The writer handle is dropped (closed) when `stage_file` returns,
    so a staged file holds no descriptor. Every caller other than the Strict tree path calls the pair back to back and is byte-for-byte unchanged,
    including the cut 9c `before_publish` hook, which stays between the two halves for them.
@@ -51,11 +52,17 @@ own durable note first.
    4. `apply_recovery` (cut 9c's existing method: ONE Immediate transaction, each op with `commit_prepared`'s rules, nothing changes when any
       errs) called with a `RecoveryOp::Commit` for every entry that renamed. It is NOT called when no entry renamed (an empty call costs a sync;
       cut 9c deferred minor).
-   5. For each entry that failed its rename: `discard_prepared` for its note (best effort, as cut 9c) and the temporary is discarded as today.
+   5. Entries that failed their rename: their temporaries are discarded as today and their notes go in the SAME `apply_recovery` call as
+      `RecoveryOp::Discard` ops, so step 4 is one transaction for the whole batch (Commit ops for the renamed, Discard ops for the failed; the
+      call is skipped when both lists are empty). A batch of failing renames costs one sync, not one per file.
+   6. Counting happens at the rename, not at the commit: each entry that renames is credited to `files_copied`, `bytes_copied` (and
+      `files_overwritten`) at once, before any later entry is tried, so an abort at entry k returns an outcome that counts the k entries it
+      published. `TreeAbort::changed()` (crates/flux-core/src/tree.rs:79) reads `files_copied`; an uncounted published file would make a lost-lock
+      abort look `changed == false` and let the cut 7a "refused unchanged" rollback delete a destination holding those files.
 5. **Flush triggers.** The batch flushes (a) when it holds `BATCH_FILES` = 64 entries or `BATCH_BYTES` = 64 MiB of staged source bytes
    in that frame (section 148.3's threshold), (b) when the next file to stage is itself at least `BATCH_BYTES` long (the pending small files publish first, then the
-   large file is staged alone), (c) at a `WalkEvent::DirEnd` whose frame has pending entries (the frame's directory handle is about to be dropped; the
-   flush needs it for the renames), (d) when the batch is older than `BATCH_AGE` = 1 s at the next staging, (e) when the walk ends or stops with an
+   large file is staged alone), (c) at a `WalkEvent::DirEnd` whose frame has pending entries, in this order: pop the frame, flush its batch using the popped frame's
+   directory handle, then the existing `claims.flush()` (with its `beat()`/`guard()`), then drop the handle (the flush needs the handle for the renames), (d) when the batch is older than `BATCH_AGE` = 1 s at the next staging, (e) when the walk ends or stops with an
    error (every live frame's flush runs before the error is returned, decision 8), (f) before staging a file whose name case-folds equal to a pending name in the
    same frame (decision 6). The thresholds are constants in `tree.rs`; there is no flag.
 6. **Name hazards while files are pending.** Staged names are not in the destination yet and not in the frame's `NameIndex`. Two source files whose
@@ -110,8 +117,9 @@ format and `meta.format` 2, and every Normal-durability behaviour. A Strict sing
   `DirEnd` with pending entries in a nested tree, age via an injected clock, walk end, case-fold collision).
 - Failure isolation (decision 7): `prepare_many` failing, then one entry's own `prepare` failing; the `apply_recovery` commit failing, then one entry's own
   commit failing; each asserts WHICH files are reported and that no file is both published and reported failed.
-- Lost lock mid-publish (decision 8): the guard fails at entry k; entries before k are claims, entries from k keep their temporaries (reported as
-  leftovers) and nothing under DEST is removed after the loss.
+- Lost lock mid-publish (decision 8): the guard fails at entry k; `outcome.files_copied` counts the k renamed entries, `TreeAbort::changed()` is
+  true and `refused_unchanged()` false (so no rollback runs), entries before k keep their notes, entries from k keep their temporaries (reported
+  as leftovers) and nothing under DEST is removed after the loss; a resume then recovers all of them.
 - Crash matrix (cut 9c's six rows, extended): kill after `prepare_many`, after j renames, after all renames before the `apply_recovery` commit; each resumes to
   the same final state as an unbatched run; fault-injected through `FaultFs` (a failing rename at entry j; a failing `apply_recovery`) and one real
   kill-and-resume e2e.
@@ -161,3 +169,16 @@ order was wrong; the file copy holds the same seven-seat report, so no content w
 - REJECTED: "falling back to per-entry `prepare` after a failed `prepare_many` spams a broken store" (agy's Axiom Breaker): an unbatched Strict
   copy already fails and reports each file separately and the run continues (crates/flux-core/src/tree.rs:1003-1010, `ClaimNotRecorded` per file),
   so the fallback reproduces cut 9c's behaviour; its extra cost is bounded by `BATCH_FILES` = 64 failed commits.
+
+Panel round 2 (2026-10-09; reply `.clavity/scratch/cut9d-panel/r2-reply.md`: report only, no census, echo or verdict token, so the round counts as
+incomplete in form; every claim was verified against the code before folding).
+- FOLDED: counting at the rename, not at the flush end (traced from agy's Blindspot Auditor lead to `TreeAbort::changed()`, tree.rs:79, a worse
+  consequence than the one agy stated: a lost-lock abort would report `changed == false` over published files).
+- FOLDED: failed renames' notes are discarded inside the one `apply_recovery` call (agy's Cascade Analyst: a per-entry `discard_prepared` is one
+  sync each).
+- FOLDED: the DirEnd ordering (agy's Literal Implementer) and the statement that `before_create` runs inside `stage_file` (agy's Axiom Breaker
+  misread the spec as deferring it; the spec was silent, now explicit).
+- REJECTED: "`recover_publications` compares the note's temp name with the resuming run's own operation id, so every resume is `INVALID_NOTE`"
+  (agy's open question 2): the function receives the ADOPTED prior's id (crates/flux-core/src/run/place.rs:403 `let id = state.operation_id`,
+  :618 `recover_publications(dest, &self.dest_shown, id, ...)`), and cut 9c's e2e test `a_renamed_publication_is_recovered_and_reported` resumes
+  through it.
