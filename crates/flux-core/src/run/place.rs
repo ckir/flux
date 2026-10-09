@@ -146,6 +146,40 @@ pub(crate) fn locate_tree<F: DestinationRoot>(
             dest: Some(dest),
         });
     }
+    let located = locate_dest(fs, dst_root)?;
+    let (holder, dest) = (&located.holder, &located.dest);
+    let anchor = match dest {
+        Some(d) => d.identity(),
+        None => holder.identity(),
+    }
+    .map_err(resolve)?;
+    preflight(src_identity, anchor, safety, &mut out.warnings)?;
+    let (anchor_handle, anchor_shown) = match dest {
+        Some(d) => (d, dst_root),
+        None => (holder, located.holder_shown.as_path()),
+    };
+    containment(fs, src_root, anchor_handle, anchor_shown, safety, out)?;
+    Ok(located)
+}
+
+/// B1's resolution of DEST, without the pre-flight: the directory holding the lock, DEST's name in it, and DEST if it
+/// exists. A DEST that exists and is not a directory is `DESTINATION_ERROR`, a link at DEST `SAFETY_REJECTED`, and a
+/// parent that cannot be opened the error of the open. `flux cleanup` reads through this too.
+pub(crate) fn locate_dest<F: DestinationRoot>(
+    fs: &F,
+    dst_root: &Path,
+) -> Result<LocatedTree<F::Dir>, CopyError> {
+    let resolve = |e| CopyError::at(CopyStep::Resolve, e);
+    if dst_root.file_name().is_none() {
+        let holder = fs.destination_root(dst_root).map_err(resolve)?;
+        let dest = fs.destination_root(dst_root).map_err(resolve)?;
+        return Ok(LocatedTree {
+            holder,
+            holder_shown: dst_root.to_path_buf(),
+            name: None,
+            dest: Some(dest),
+        });
+    }
     let (parent_path, name) = split_destination(dst_root)?;
     let holder = fs.destination_root(parent_path).map_err(resolve)?;
     let dest = match holder.metadata(name) {
@@ -167,17 +201,6 @@ pub(crate) fn locate_tree<F: DestinationRoot>(
             )));
         }
     };
-    let anchor = match &dest {
-        Some(d) => d.identity(),
-        None => holder.identity(),
-    }
-    .map_err(resolve)?;
-    preflight(src_identity, anchor, safety, &mut out.warnings)?;
-    let (anchor_handle, anchor_shown) = match &dest {
-        Some(d) => (d, dst_root),
-        None => (&holder, parent_path),
-    };
-    containment(fs, src_root, anchor_handle, anchor_shown, safety, out)?;
     Ok(LocatedTree {
         holder,
         holder_shown: parent_path.to_path_buf(),

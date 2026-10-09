@@ -1,8 +1,10 @@
 //! `flux cleanup` (cut 9b): removes what finished or dead operations left behind.
 
+use crate::state::OpState;
 use std::time::Duration;
 
 pub mod artifacts;
+pub mod discover;
 pub mod status;
 
 /// How long a finished operation's state is kept before cleanup may remove it: seven days.
@@ -68,4 +70,24 @@ impl EntryKind {
             Self::RootLock => "root-lock",
         }
     }
+}
+
+/// One row of the cleanup report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub kind: EntryKind,
+    /// The operation id; `<id>.creating` / `<id>.removing`; or the lock file's name (`<name>.flux-lock`, `.flux-root.lock`, `<lock>.broken.<id>`).
+    pub id: String,
+    pub status: Status,
+    pub eligible: bool,
+    pub state: Option<OpState>,
+    pub age_seconds: Option<u64>,
+    pub note: String,
+}
+
+/// Exit 3: nothing was examined.
+#[derive(Debug)]
+pub struct Refused {
+    pub code: &'static str,
+    pub detail: String,
 }
