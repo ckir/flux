@@ -7,11 +7,12 @@ use crate::ids::is_id;
 use crate::lock::error::refuse;
 use crate::lock::{LockCode, LockError, LockResult};
 use crate::state::{
-    FLUX_DIR, FORMAT_VERSION, Kind, MANIFEST, OPERATIONS_DIR, OperationState, RECORD_INFIX,
-    RESERVED_DIRS, Unusable, control_path_conflict, id_after, read_state, record_name,
+    CREATING_SUFFIX, FLUX_DIR, FORMAT_VERSION, Kind, MANIFEST, OPERATIONS_DIR, OpState,
+    OperationState, RECORD_INFIX, REMOVING_SUFFIX, RESERVED_DIRS, Unusable, control_path_conflict,
+    id_after, read_state, record_name,
 };
 use flux_fs::{Code, DirHandle, FileType};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -23,11 +24,15 @@ pub struct PriorOp {
     pub shown: PathBuf,
 }
 
-/// What the scan found: every resumable prior operation, in name order. COMPLETED and ABANDONED ones are passed over
-/// (§21.1: proceed; what they left is cut 9's).
+/// What the scan found: every resumable prior operation, in name order, and (cut 9b) what a copy finishes. ABANDONED
+/// ones are passed over (§21.1: proceed); `flux cleanup` handles them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Scan {
     pub resumable: Vec<PriorOp>,
+    /// Cut 9b: COMPLETED priors, to finish (their recorded leftovers, then their state).
+    pub completed: Vec<PriorOp>,
+    /// Cut 9b: `<id>.creating` and `<id>.removing` directories (trees only), by name, never this run's own.
+    pub debris: Vec<OsString>,
 }
 
 /// A tree's prior operations. `dest_shown` is DEST as messages name it.
@@ -44,9 +49,21 @@ pub fn scan_tree<D: DirHandle>(dest: &D, dest_shown: &Path, own_id: &str) -> Loc
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     let mut scan = Scan::default();
     for entry in entries {
-        // Decision 3: an operation is a DIRECTORY named by an id. Anything else here - a crash's `<id>.creating`, a
-        // stray file - is not one, and is left for cut 9's cleanup.
-        let Some(id) = entry.name.to_str().filter(|n| is_id(n)) else { continue };
+        // Decision 3: an operation is a DIRECTORY named by an id. Anything else here is not one. Cut 9b: a directory
+        // named `<id>.creating` or `<id>.removing` is a crash's debris, reported for the copy to remove - except this
+        // run's own, which may be under construction (a D1 restart scans again).
+        let Some(id) = entry.name.to_str().filter(|n| is_id(n)) else {
+            let debris = entry.file_type == FileType::Dir
+                && entry.name.to_str().is_some_and(|n| {
+                    n.strip_suffix(CREATING_SUFFIX)
+                        .or_else(|| n.strip_suffix(REMOVING_SUFFIX))
+                        .is_some_and(|id| is_id(id) && id != own_id)
+                });
+            if debris {
+                scan.debris.push(entry.name.clone());
+            }
+            continue;
+        };
         if entry.file_type != FileType::Dir || id == own_id {
             continue;
         }
@@ -79,6 +96,8 @@ pub fn scan_tree<D: DirHandle>(dest: &D, dest_shown: &Path, own_id: &str) -> Loc
         }
         if state.state.is_resumable() {
             scan.resumable.push(PriorOp { state, shown });
+        } else if state.state == OpState::Completed {
+            scan.completed.push(PriorOp { state, shown });
         }
     }
     Ok(scan)
@@ -143,6 +162,8 @@ pub fn scan_file<D: DirHandle>(
         }
         if state.state.is_resumable() {
             scan.resumable.push(PriorOp { state, shown });
+        } else if state.state == OpState::Completed {
+            scan.completed.push(PriorOp { state, shown });
         }
     }
     Ok(scan)
@@ -348,7 +369,57 @@ mod tests {
         fs.create_dir(Path::new(&format!("{OPS}/junk"))).unwrap();
         fs.create_dir(Path::new(&format!("{OPS}/{}.creating", id(7)))).unwrap();
         fs.write_file(format!("{OPS}/{}", id(8)), &state(8, Kind::Tree, OpState::Created).encode());
-        assert_eq!(scan(&d, 0).unwrap(), Scan::default());
+        // Cut 9b: the crash's `<id>.creating` is debris, reported by name; the rest is still not an operation.
+        let found = scan(&d, 0).unwrap();
+        assert_eq!(
+            found,
+            Scan { debris: vec![OsString::from(format!("{}.creating", id(7)))], ..Scan::default() }
+        );
+    }
+
+    #[test]
+    fn user_objects_named_like_debris_are_not_debris() {
+        // Mutants: accept any `*.creating` (loosen the id test); drop the `FileType::Dir` test.
+        let (fs, d) = dest();
+        operations(&fs);
+        let (h31, h33) = ("a".repeat(31), "a".repeat(33));
+        let upper = id(0xab).to_uppercase();
+        for dir in [
+            "notes.creating".to_string(),
+            format!("{h31}.creating"),
+            format!("{h33}.removing"),
+            format!("{upper}.creating"),
+            format!("{}.creating.bak", id(3)),
+        ] {
+            fs.create_dir(Path::new(&format!("{OPS}/{dir}"))).unwrap();
+        }
+        fs.write_file(format!("{OPS}/notes.creating/manifest"), b"the user's");
+        fs.write_file(format!("{OPS}/{}.removing", id(4)), b"a file, not a directory");
+        assert!(scan(&d, 0).unwrap().debris.is_empty());
+        // Control: a real `<id>.removing` directory is debris.
+        fs.create_dir(Path::new(&format!("{OPS}/{}.removing", id(5)))).unwrap();
+        assert_eq!(
+            scan(&d, 0).unwrap().debris,
+            vec![OsString::from(format!("{}.removing", id(5)))]
+        );
+    }
+
+    #[test]
+    fn a_copy_never_removes_its_own_creating_directory() {
+        // Mutant: drop the `own_id` test on the debris branch of `scan_tree`.
+        let (fs, d) = dest();
+        operations(&fs);
+        fs.create_dir(Path::new(&format!("{OPS}/{}.creating", id(5)))).unwrap();
+        fs.create_dir(Path::new(&format!("{OPS}/{}.removing", id(5)))).unwrap();
+        fs.create_dir(Path::new(&format!("{OPS}/{}.removing", id(6)))).unwrap();
+        workspace(&fs, 4, Some(&state(4, Kind::Tree, OpState::Completed).encode()));
+        let found = scan(&d, 5).unwrap();
+        assert_eq!(found.debris, vec![OsString::from(format!("{}.removing", id(6)))]);
+        assert_eq!(
+            found.completed.len(),
+            1,
+            "a COMPLETED prior is reported for the copy to finish"
+        );
     }
 
     #[test]

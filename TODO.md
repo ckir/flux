@@ -408,7 +408,9 @@ are the spec's).
 - [ ] **2. A destination changed during the downtime** is caught only by the size and mtime check; a same-size,
       same-mtime change is not.
 - [ ] **3. Files published in the unsynced window** (limit 4a of cut 8b) are copied again under overwrite.
-- [ ] **4. Orphan partials of targets that vanished between the runs** are not swept (slice 9b).
+- [ ] **4. Orphan partials of targets that vanished between the runs** are swept only when their operation is removed
+      by `flux cleanup` (STALE or `--force`d) or superseded by `--restart` (the J1 walk, by operation id); a run
+      resumed to completion does not record them, so they stay (cut 9b spec, known limit 2).
 - [ ] **5. A manifest-only workspace in state `CREATED`** resumes with zero progress; one in any later state without
       `state.db` is `STATE_CORRUPT`.
 - [ ] **6. Claim keys contain the filesystem's device number**. Linux does not guarantee that `st_dev` is stable
@@ -438,14 +440,55 @@ are the spec's).
 
 ## Cut 9a debt
 
-- [ ] Slice 9b must validate `cleanup_pending_artifacts` entries as relative paths without `..` (`from_native_hex`
-      now accepts absolute paths for the format-3 `source_root`) before deleting by them.
-- [ ] Stale-lease classification (9b) should know that a long resume skip refreshes no heartbeat.
+- [ ] Stale-lease classification (9b) should know that a long resume skip refreshes no heartbeat; a live resume holds
+      the lock and is LIVE, so only an unlocked operation depends on the lease (cut 9b known limit 5).
 - [ ] State writes do not enforce `STATE_LIMIT` (a source root of more than 16K units on Windows makes a format-3
       manifest unreadable).
 - [ ] The resume note prints after the per-file failure lines (spec order: note, then report).
 - [ ] A single-file case-variant target on a case-insensitive filesystem is offered `--resume` by the refusal but
       refused by the byte-exact `destination_prefix` check.
+
+## Cut 9b known limits
+
+Recorded by cut 9b (`docs/superpowers/specs/2026-10-08-cut-9b-cleanup-design.md`, "Known limits"; limits 1-8 are
+the spec's numbers, 9-10 were learned during execution).
+
+- [ ] **1. A copy that starts in the instant a cleanup (or a classification) probes the lock** is refused with
+      `TARGET_LOCK_BUSY` (D1). Cleanup probes once per lock file it probes (the root
+      lock and each `<lock>.broken.*`) and holds nothing across the listing.
+- [ ] **2. Partials of a vanished target** are swept only when their operation is removed by `flux cleanup` (STALE or
+      forced) or superseded by `--restart` (the J1 walk). A run resumed to completion does not record them: they stay
+      (9a limit 4, narrowed, not closed).
+- [ ] **3. Single-file operations' state records** (`<target>.flux-state.<id>`) are completed only by a copy to that
+      target; `flux cleanup DEST` does not list them (the standalone catalog is out of scope).
+- [ ] **4. Retention reads the manifest's modification time**: a restore from backup or a tool that rewrites times
+      changes the age. The ownership checks, not the age, are what keep a live or ambiguous operation safe.
+- [ ] **5. A long `--resume` skip refreshes no heartbeat** (9a debt); a live resume holds the lock and is LIVE, so only
+      an unlocked operation depends on the lease.
+- [ ] **6. `--force` can delete a RESUMABLE operation** and with it the progress `--resume` would have used; this is
+      its purpose.
+- [ ] **7. A boot-session mismatch is not used**: liveness is decided by the OS lock, the lease gate and the clock rule
+      only (macOS and Windows boot identifiers are boot times and are unmeasured under clock steps).
+- [ ] **8. `--break-lock` for cleanup, `--target`, the standalone catalog and `P/.flux/atomic/` do not exist**; an
+      UNCERTAIN row can only be reported.
+- [ ] **9. A dead owner's lock with a young or future heartbeat** (a killed `flux cleanup`, a crashed resume; a future
+      heartbeat fails the gate like a young one) makes a deleting pass skip every eligible row with
+      `skipped <id>: destination lock busy: <detail>` (the detail names "younger than the lease threshold") and exit 0.
+      A younger orphan lock is refused as `ARTIFACT_OWNERSHIP_UNCERTAIN` and the pass exits 1.
+- [ ] **10. A `<lock>.broken.*` file** is classified by its own record whether or not the workspace it names exists
+      (spec row 11 wording corrected).
+
+## Cut 9b debt
+
+- [ ] `S251_1_close` stays `not-in-7a` only because `tests/model_impl_map.rs:141` needs one such label.
+- [ ] The lock model has no notion of time or leases, so it does not capture the lease gate on the Dead and Orphan arms.
+- [ ] The age test does not pin 86_399 -> 23h.
+- [ ] A `<lock>.broken.*` row can show eligible while the root lock is busy (nothing is deleted: acquisition reports busy).
+- [ ] `classify` now calls `identity()` before returning `Orphan`, so a failing identity call gives a copy an I/O error
+      instead of its old exit-3 refusal.
+- [ ] The lock model's `clean` process never creates a lock while the implementation does.
+- [ ] A transient I/O error during the pass's re-read is reported as "changed since listing".
+- [ ] `--json` has no fields for a failed listing or a lost lock (the cause is on stderr only).
 
 ## Scaffolding follow-ups
 
@@ -801,6 +844,9 @@ Each is deferred to the cut that first reads it (cut 7b spec, `docs/superpowers/
 Triaged 2026-09-22. Kept here rather than deleted: the evidence for a closure belongs where the
 item was, not only in a commit message.
 
+- `DONE` **Validate `cleanup_pending_artifacts` entries as relative paths without `..`** (was under "Cut 9a
+  debt"). Done by cut 9b: `cleanup::artifacts::validate` in `crates/flux-core/src/cleanup/artifacts.rs` applies the
+  artifact rules before anything is deleted by an entry.
 - `DONE` **Model-check the lock protocol before implementing it.** Done by lock-model plans 1 to 3.
   The item asked for two recoverers, two `--break-lock` takeovers, a stalled prior owner and a plain
   run, checking that at most one operation ever owns a target: `recovery` runs `Recoverers = {r1, r2}`,

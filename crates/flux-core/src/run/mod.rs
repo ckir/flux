@@ -8,10 +8,11 @@
 //! `stop` is 1; with no `stop`, the copy's own rule decides (`exit_code::for_tree` / `for_file`); `warnings` never
 //! change it.
 
-mod place;
+pub(crate) mod place;
 mod restart;
 mod resume;
-mod session;
+pub(crate) mod session;
+pub(crate) mod sweep;
 #[cfg(test)]
 mod tests;
 
@@ -128,6 +129,8 @@ pub enum RunStep {
     Record,
     /// Superseding a prior operation (`--restart`).
     Restart,
+    /// Cut 9b: finishing an earlier COMPLETED operation's cleanup, or removing workspace debris.
+    PriorCleanup,
     /// Removing what a refused copy left (Q-I).
     Rollback,
     /// The section 241.5 no-replace probe inside the unpublished workspace (cut 8a, Part P).
@@ -142,6 +145,7 @@ impl RunStep {
             Self::State => "writing the operation's state",
             Self::Record => "writing the lock record",
             Self::Restart => "superseding a prior operation",
+            Self::PriorCleanup => "finishing an earlier operation's cleanup",
             Self::Rollback => "removing what the refused copy left",
             Self::Probe => "probing the destination for no-replace publication",
         }
@@ -167,6 +171,10 @@ pub enum RunWarning {
     /// Cut 9a: the source root's identity could not decide the mapping check (a side is not Strong), so the
     /// stored path decided, byte for byte. `path` is the source root this run names.
     ResumeMappingByPath(PathBuf),
+    /// Cut 9b: an earlier COMPLETED operation's recorded cleanup was finished (`removed` leftovers, then its state).
+    PriorCleaned { operation_id: String, removed: u64 },
+    /// Cut 9b: an earlier operation's cleanup could not be finished; `path` is the first thing kept, with its error.
+    PriorCleanupFailed { operation_id: String, path: PathBuf, error: FsError },
 }
 
 /// A directory copy under the destination's lock ("The run").

@@ -6,8 +6,9 @@ use super::acquire::{Acquire, Last, acquire};
 use super::classify::{Classified, classify};
 use super::error::{LockCode, LockError, LockResult, refuse};
 use super::held::Held;
+use super::record::LockRecord;
 use super::recover::{Recovered, recover};
-use super::site::LockSite;
+use super::site::{LockSite, SiteKind};
 use super::takeover::{Claimed, TakeOver, take_over};
 use flux_fs::{DirHandle, LockCapability};
 use std::ffi::OsString;
@@ -51,6 +52,8 @@ pub fn check_capability<D: DirHandle>(dir: &D) -> LockResult<LockCapability> {
     }
 }
 
+const UNTRUSTED_DETAIL: &str = "the dead owner's record names a workspace that is missing or not one Flux trusts; Flux never deletes state it cannot read: inspect it, and remove it by hand if it is not needed";
+
 /// The run's step 3. `operation_id` names a recovery's move-aside file.
 pub fn obtain<'a, D: DirHandle>(
     site: &LockSite<'a, D>,
@@ -89,8 +92,19 @@ pub fn obtain<'a, D: DirHandle>(
                 return Err(refuse(
                     LockCode::ArtifactOwnershipUncertain,
                     Some(record),
-                    "the dead owner's record names a workspace that is missing or not one Flux trusts; Flux never deletes state it cannot read: inspect it, and remove it by hand if it is not needed",
+                    UNTRUSTED_DETAIL,
                 ));
+            }
+            Classified::Orphan { record, .. } => {
+                // Cleanup does not handle single-file operations, so it is no way out for a File site.
+                let detail = if site.kind() == SiteKind::File {
+                    UNTRUSTED_DETAIL.to_string()
+                } else {
+                    format!(
+                        "{UNTRUSTED_DETAIL}; flux cleanup DEST removes a dead owner's lock whose workspace is gone"
+                    )
+                };
+                return Err(refuse(LockCode::ArtifactOwnershipUncertain, Some(record), detail));
             }
             Classified::Uncertain(why) => match mode {
                 Mode::Plain => {
@@ -111,6 +125,122 @@ pub fn obtain<'a, D: DirHandle>(
                 match recover(site, lock, identity, &record, operation_id)? {
                     Recovered::Held { held, leftover } => {
                         return Ok(Obtained::Held { held, leftover_broken: leftover });
+                    }
+                    Recovered::Restart(l) => last = l,
+                }
+            }
+        }
+    }
+    Err(give_up(last))
+}
+
+/// What `obtain_cleanup_lock` acquired: a held lock with no record yet, and what the acquisition reclaimed.
+pub struct CleanupObtained<'a, D: DirHandle> {
+    /// No record yet: the caller writes one with workspace_path "none".
+    pub held: Held<'a, D>,
+    pub leftover_broken: Option<OsString>,
+    /// The orphan record the acquisition reclaimed (reported as the `root-lock` row's action).
+    pub reclaimed: Option<LockRecord>,
+}
+
+/// Cut 9b: `obtain` for cleanup. Differs in two arms and in always refusing an uncertain lock. An `Orphan` whose heartbeat is not in
+/// the future and is at least `lease_threshold_ns` old is recovered (section 240.3); younger, or future, it is refused
+/// `ARTIFACT_OWNERSHIP_UNCERTAIN` ("the dead owner's lock is younger than the lease threshold"), where `obtain` refuses every orphan.
+/// A `Dead` owner's lock is recovered only past the same gate; younger, or future, it is refused `TARGET_LOCK_BUSY`, where `obtain`
+/// recovers it at once. `Uncertain` is always refused (`TARGET_LOCK_UNCERTAIN`; no --break-lock). Every other classification behaves
+/// as in `obtain`.
+pub fn obtain_cleanup_lock<'a, D: DirHandle>(
+    site: &LockSite<'a, D>,
+    capability: LockCapability,
+    operation_id: &str,
+    now_ns: u64,
+    lease_threshold_ns: u64,
+) -> LockResult<CleanupObtained<'a, D>> {
+    // Cleanup never takes over a lock, so the capability is not needed after the caller's check.
+    let _ = capability;
+    let mut last = Last::Other;
+    for _ in 0..MAX_ATTEMPTS {
+        match acquire(site)? {
+            Acquire::Acquired(held) => {
+                return Ok(CleanupObtained { held, leftover_broken: None, reclaimed: None });
+            }
+            Acquire::Restart(l) => {
+                last = l;
+                continue;
+            }
+            Acquire::Exists => {}
+        }
+        // S251_1_classify: classify the existing lock; an old enough orphan is recovered, anything else uncertain is refused.
+        match classify(site)? {
+            Classified::Vanished => last = Last::Other,
+            Classified::Busy(holder) => {
+                return Err(refuse(
+                    LockCode::TargetLockBusy,
+                    holder,
+                    "another run holds the lock; wait for it to finish",
+                ));
+            }
+            Classified::Foreign => {
+                return Err(refuse(
+                    LockCode::ControlPlaneNamespaceConflict,
+                    None,
+                    "a non-Flux object occupies the lock path; move it away",
+                ));
+            }
+            Classified::Untrusted(record) => {
+                return Err(refuse(
+                    LockCode::ArtifactOwnershipUncertain,
+                    Some(record),
+                    UNTRUSTED_DETAIL,
+                ));
+            }
+            Classified::Uncertain(why) => {
+                return Err(refuse(
+                    LockCode::TargetLockUncertain,
+                    None,
+                    format!(
+                        "the lock's record is unreadable ({why:?}); if no Flux run is active on this destination, run again with --restart --break-lock"
+                    ),
+                ));
+            }
+            Classified::Orphan { lock, identity, record } => {
+                let beat = record.last_heartbeat_wall_time;
+                if beat > now_ns || now_ns - beat < lease_threshold_ns {
+                    return Err(refuse(
+                        LockCode::ArtifactOwnershipUncertain,
+                        Some(record),
+                        "the dead owner's lock is younger than the lease threshold; wait, or retry once it is older",
+                    ));
+                }
+                match recover(site, lock, identity, &record, operation_id)? {
+                    Recovered::Held { held, leftover } => {
+                        return Ok(CleanupObtained {
+                            held,
+                            leftover_broken: leftover,
+                            reclaimed: Some(record),
+                        });
+                    }
+                    Recovered::Restart(l) => last = l,
+                }
+            }
+            Classified::Dead { lock, identity, record } => {
+                // The same lease gate as an orphan: a dead owner whose record is young may be an operation that was
+                // resumed and crashed seconds ago, and the caller's manifest-age reading would not see that.
+                let beat = record.last_heartbeat_wall_time;
+                if beat > now_ns || now_ns - beat < lease_threshold_ns {
+                    return Err(refuse(
+                        LockCode::TargetLockBusy,
+                        Some(record),
+                        "the previous owner's lock is younger than the lease threshold; wait, or retry once it is older",
+                    ));
+                }
+                match recover(site, lock, identity, &record, operation_id)? {
+                    Recovered::Held { held, leftover } => {
+                        return Ok(CleanupObtained {
+                            held,
+                            leftover_broken: leftover,
+                            reclaimed: None,
+                        });
                     }
                     Recovered::Restart(l) => last = l,
                 }
@@ -262,6 +392,163 @@ mod tests {
         let r = refusal(obtain(&site, STRONG, Mode::BreakLock, &me()));
         assert_eq!(r.code, LockCode::ArtifactOwnershipUncertain);
         assert_eq!(r.holder, Some(rec));
+        assert!(r.detail.contains("flux cleanup"), "the way out is named: {}", r.detail);
+    }
+
+    #[test]
+    fn the_cleanup_pointer_is_not_offered_for_a_single_file_orphan() {
+        let (_fs, d) = fake();
+        let file = LockSite::file(&d, OsStr::new("dest")).unwrap();
+        let id = me();
+        dead_lock(&d, NAME, &record(&file, &id, &format!("adjacent/{id}")).encode());
+        let r = refusal(obtain(&file, STRONG, Mode::Plain, &me()));
+        assert_eq!(r.code, LockCode::ArtifactOwnershipUncertain);
+        assert!(!r.detail.contains("flux cleanup"), "no pointer for a file: {}", r.detail);
+
+        let (_fs, d) = fake();
+        let dir = site(&d);
+        let id = me();
+        dead_lock(&d, NAME, &record(&dir, &id, &format!("operations/{id}")).encode());
+        let r = refusal(obtain(&dir, STRONG, Mode::Plain, &me()));
+        assert_eq!(r.code, LockCode::ArtifactOwnershipUncertain);
+        assert!(r.detail.contains("flux cleanup"), "the pointer for a directory: {}", r.detail);
+    }
+
+    const NOW: u64 = 31_000_000_000;
+    const LEASE: u64 = 30_000_000_000;
+
+    fn orphan_at(d: &FakeDirHandle, site: &LockSite<'_, FakeDirHandle>, beat: u64) -> LockRecord {
+        let id = me();
+        let mut rec = record(site, &id, &format!("operations/{id}"));
+        rec.last_heartbeat_wall_time = beat;
+        dead_lock(d, NAME, &rec.encode());
+        rec
+    }
+
+    fn bytes(d: &FakeDirHandle) -> Vec<u8> {
+        d.open_lock(OsStr::new(NAME)).unwrap().read_all(crate::lock::record::RECORD_LEN).unwrap()
+    }
+
+    #[test]
+    fn cleanup_reclaims_an_orphan_lock_past_the_lease_gate() {
+        let (fs, d) = fake();
+        let site = site(&d);
+        let rec = orphan_at(&d, &site, 1);
+        let old = d.metadata(OsStr::new(NAME)).unwrap().identity;
+        let op = me();
+        let got = obtain_cleanup_lock(&site, STRONG, &op, NOW, LEASE).unwrap();
+        assert_eq!(got.reclaimed, Some(rec));
+        assert_eq!(got.leftover_broken, None);
+        assert_ne!(got.held.identity(), &old, "a new lock replaced the orphan's");
+        let broken = std::path::Path::new("/p").join(site.broken_name(&op));
+        assert!(!fs.exists(broken), "no .broken file remains");
+    }
+
+    #[test]
+    fn cleanup_refuses_a_young_or_future_orphan_lock() {
+        for beat in [NOW - 29_000_000_000, NOW + 1] {
+            let (_fs, d) = fake();
+            let site = site(&d);
+            let rec = orphan_at(&d, &site, beat);
+            let before = bytes(&d);
+            let r = refusal(obtain_cleanup_lock(&site, STRONG, &me(), NOW, LEASE));
+            assert_eq!(r.code, LockCode::ArtifactOwnershipUncertain, "beat {beat}");
+            assert_eq!(r.holder, Some(rec));
+            assert!(r.detail.contains("younger than the lease threshold"), "{}", r.detail);
+            assert_eq!(bytes(&d), before, "the file is untouched");
+        }
+    }
+
+    #[test]
+    fn cleanup_reclaims_an_orphan_lock_exactly_at_the_lease_threshold() {
+        let (_fs, d) = fake();
+        let site = site(&d);
+        orphan_at(&d, &site, NOW - LEASE);
+        let got = obtain_cleanup_lock(&site, STRONG, &me(), NOW, LEASE).unwrap();
+        assert!(got.reclaimed.is_some(), "age == threshold passes the gate");
+    }
+
+    #[test]
+    fn cleanup_refuses_an_uncertain_lock_and_is_busy_on_a_live_one() {
+        let (_fs, d) = fake();
+        dead_lock(&d, NAME, b"");
+        let r = refusal(obtain_cleanup_lock(&site(&d), STRONG, &me(), NOW, LEASE));
+        assert_eq!(r.code, LockCode::TargetLockUncertain);
+        let (_fs, d) = fake();
+        let live_site = site(&d);
+        let rec = record(&live_site, &me(), "none");
+        let _live = live_lock(&d, NAME, &rec.encode());
+        let r = refusal(obtain_cleanup_lock(&live_site, STRONG, &me(), NOW, LEASE));
+        assert_eq!(r.code, LockCode::TargetLockBusy);
+        assert_eq!(r.holder, Some(rec));
+    }
+
+    #[test]
+    fn cleanup_acquires_a_free_path_like_a_run() {
+        let (_fs, d) = fake();
+        let got = obtain_cleanup_lock(&site(&d), STRONG, &me(), NOW, LEASE).unwrap();
+        assert!(got.held.record().is_none());
+        assert_eq!(got.reclaimed, None);
+        assert_eq!(got.leftover_broken, None);
+    }
+
+    #[test]
+    fn cleanup_recovers_a_dead_owner_with_its_workspace_past_the_lease_gate() {
+        let (fs, d) = fake();
+        let site = site(&d);
+        let id = me();
+        for dir in [
+            "/p/dest",
+            "/p/dest/.flux",
+            "/p/dest/.flux/operations",
+            &format!("/p/dest/.flux/operations/{id}"),
+        ] {
+            fs.create_dir(Path::new(dir)).unwrap();
+        }
+        let mut rec = record(&site, &id, &format!("operations/{id}"));
+        rec.last_heartbeat_wall_time = NOW - LEASE;
+        dead_lock(&d, NAME, &rec.encode());
+        let got = obtain_cleanup_lock(&site, STRONG, &me(), NOW, LEASE).unwrap();
+        assert_eq!(got.reclaimed, None, "only an orphan is reported as reclaimed");
+    }
+
+    #[test]
+    fn cleanup_refuses_a_young_or_future_dead_lock_as_busy() {
+        for beat in [NOW - 5_000_000_000, NOW + 1] {
+            let (fs, d) = fake();
+            let site = site(&d);
+            let id = me();
+            for dir in [
+                "/p/dest",
+                "/p/dest/.flux",
+                "/p/dest/.flux/operations",
+                &format!("/p/dest/.flux/operations/{id}"),
+            ] {
+                fs.create_dir(Path::new(dir)).unwrap();
+            }
+            let mut rec = record(&site, &id, &format!("operations/{id}"));
+            rec.last_heartbeat_wall_time = beat;
+            dead_lock(&d, NAME, &rec.encode());
+            let before = bytes(&d);
+            let r = refusal(obtain_cleanup_lock(&site, STRONG, &me(), NOW, LEASE));
+            assert_eq!(r.code, LockCode::TargetLockBusy, "beat {beat}");
+            assert_eq!(r.holder, Some(rec));
+            assert!(r.detail.contains("younger than the lease threshold"), "{}", r.detail);
+            assert_eq!(bytes(&d), before, "the file is untouched");
+        }
+    }
+
+    #[test]
+    fn cleanup_refuses_an_untrusted_and_a_foreign_lock_as_a_run_does() {
+        let (_fs, d) = fake();
+        let site1 = site(&d);
+        dead_lock(&d, NAME, &record(&site1, &me(), "garbage").encode());
+        let r = refusal(obtain_cleanup_lock(&site1, STRONG, &me(), NOW, LEASE));
+        assert_eq!(r.code, LockCode::ArtifactOwnershipUncertain);
+        let (_fs, d) = fake();
+        dead_lock(&d, NAME, b"hello, not a lock");
+        let r = refusal(obtain_cleanup_lock(&site(&d), STRONG, &me(), NOW, LEASE));
+        assert_eq!(r.code, LockCode::ControlPlaneNamespaceConflict);
     }
 
     #[test]

@@ -837,7 +837,7 @@ pub fn publish_workspace<D: DirHandle>(
 /// 2. write the manifest inside crash-safely, rename it to `<id>` without replacing, and flush `operations/`
 ///    (`publish_workspace`).
 ///
-/// A crash before the rename leaves only `<id>.creating`, which the §21.1 scan ignores (cut 9's cleanup). Returns the
+/// A crash before the rename leaves only `<id>.creating`, which the §21.1 scan reports as debris (cut 9b: `flux cleanup` and the next copy remove it). Returns the
 /// workspace's handle.
 pub fn create_workspace<D: DirHandle>(
     operations: &D,
@@ -858,25 +858,30 @@ pub fn operations_dir<D: DirHandle>(dest: &D, dest_shown: &Path) -> LockResult<D
 
 /// Remove a tree operation's workspace without ever leaving `operations/<id>` without its manifest (refinement 9,
 /// reversed; Part 3b decision 17): rename it to `<id>.removing`, which the §21.1 scan passes over, then remove its
-/// `manifest`, a crash's `manifest.tmp`, and the directory. A failure part-way leaves only `<id>.removing` (cut 9's).
+/// `manifest`, a crash's `manifest.tmp`, and the directory. A failure part-way leaves only `<id>.removing`, which cut 9b's cleanup (and the next copy) removes.
 pub fn retire_workspace<D: DirHandle>(operations: &D, id: &str) -> flux_fs::Result<()> {
     let mut retired = OsString::from(id);
     retired.push(REMOVING_SUFFIX);
     operations.rename_no_replace(OsStr::new(id), operations, &retired)?;
+    finish_retire(operations, &retired)
+}
+
+/// The second half of `retire_workspace`: remove the known names inside `operations/<name>`, then the directory.
+pub fn finish_retire<D: DirHandle>(operations: &D, name: &OsStr) -> flux_fs::Result<()> {
     {
-        let dir = operations.open_dir(&retired)?;
-        for name in [
+        let dir = operations.open_dir(name)?;
+        for known in [
             OsString::from(MANIFEST),
             temp_name(OsStr::new(MANIFEST)),
             OsString::from(PROBE),
             OsString::from(PROBE_TEMP),
             OsString::from(STATE_DB),
         ] {
-            remove_if_present(&dir, &name)?;
+            remove_if_present(&dir, &known)?;
         }
         // Closed before the directory is removed.
     }
-    operations.remove_dir(&retired)
+    operations.remove_dir(name)
 }
 
 /// Remove a single-file operation's state record, then a crash's `<record>.tmp` beside it.
@@ -1302,6 +1307,28 @@ mod tests {
         fs.write_file(format!("{path}/{STATE_DB}"), b"");
         retire_workspace(&ops, &id(1)).unwrap();
         assert!(!fs.exists(&path) && !fs.exists(format!("{path}.removing")));
+    }
+
+    #[test]
+    fn finish_retire_removes_only_the_known_names_and_keeps_a_directory_with_a_stranger() {
+        use flux_fs::FileSystem as _;
+        let (fs, d) = dest();
+        let ops = operations_dir(&d, Path::new("D")).unwrap();
+        let path = format!("/p/dest/.flux/operations/{}.removing", id(1));
+        fs.create_dir(Path::new(&path)).unwrap();
+        for name in [MANIFEST, "manifest.tmp", STATE_DB, "extra"] {
+            fs.write_file(format!("{path}/{name}"), b"x");
+        }
+        let removing = OsString::from(format!("{}.removing", id(1)));
+        let e = finish_retire(&ops, &removing).unwrap_err();
+        assert_eq!(e.source.kind(), ErrorKind::DirectoryNotEmpty);
+        for name in [MANIFEST, "manifest.tmp", STATE_DB] {
+            assert!(!fs.exists(format!("{path}/{name}")), "{name} is a known name");
+        }
+        assert!(fs.exists(format!("{path}/extra")), "a stranger stays");
+        ops.open_dir(&removing).unwrap().remove_file(OsStr::new("extra")).unwrap();
+        finish_retire(&ops, &removing).unwrap();
+        assert!(!fs.exists(&path));
     }
 
     #[test]

@@ -124,11 +124,14 @@ pub(crate) fn open_operation<'a, D: DirHandle, P: Place<D>>(
         let obtained = obtain(site, capability, mode, own_id)
             .map_err(|e| from_lock(e, RunStep::Lock, &lock_shown, made.is_some()))?;
         // Step 4.
-        let (priors, adopt): (Vec<PriorOp>, Option<PriorOp>) = match place.scan(own_id) {
-            Ok(scan) if cfg.restart => (scan.resumable, None),
-            Ok(scan) if scan.resumable.is_empty() => (Vec::new(), None),
+        // Cut 9b: also what a copy finishes once it holds its own state and record (COMPLETED priors, debris).
+        let (priors, adopt, completed, debris): Prior = match place.scan(own_id) {
+            Ok(scan) if cfg.restart => (scan.resumable, None, scan.completed, scan.debris),
+            Ok(scan) if scan.resumable.is_empty() => {
+                (Vec::new(), None, scan.completed, scan.debris)
+            }
             Ok(mut scan) if cfg.resume && scan.resumable.len() == 1 => {
-                (Vec::new(), Some(scan.resumable.remove(0)))
+                (Vec::new(), Some(scan.resumable.remove(0)), scan.completed, scan.debris)
             }
             Ok(scan) => {
                 let refused = resumable_refusal(&scan.resumable);
@@ -265,6 +268,20 @@ pub(crate) fn open_operation<'a, D: DirHandle, P: Place<D>>(
                 }
             });
         }
+        // Cut 9b: finish what earlier COMPLETED operations left, then remove workspace debris. This run's state and
+        // record exist, so `checked` proves ownership before every removal. Only losing the lock stops the run; every
+        // other failure is a warning (F6).
+        if let Err(fault) = finish_priors(place, &locked, &completed, &debris, warnings) {
+            return Err(match fault {
+                Fault::Lost => lost(),
+                Fault::Io(path, error) => {
+                    stop_after_record(place, locked, RunStep::PriorCleanup, path, error)
+                }
+                Fault::Heartbeat(path, error) => {
+                    stop_after_record(place, locked, RunStep::Lock, path, error)
+                }
+            });
+        }
         // The last write of step 5: TRANSFERRING, under §99.
         if let Err(fault) = owned(&locked.held, &locked.lock_shown) {
             return Err(fault.into_error(RunStep::State));
@@ -287,6 +304,27 @@ pub(crate) fn open_operation<'a, D: DirHandle, P: Place<D>>(
         changed: made.is_some(),
         not_removed: None,
     })
+}
+
+/// The step 4 scan as `open_operation` keeps it: the resumable priors to supersede, the one to adopt, and (cut 9b) the
+/// COMPLETED priors and the debris directories to clean.
+type Prior = (Vec<PriorOp>, Option<PriorOp>, Vec<PriorOp>, Vec<std::ffi::OsString>);
+
+/// Cut 9b: each COMPLETED prior's recorded cleanup, then each debris directory.
+fn finish_priors<D: DirHandle, P: Place<D>>(
+    place: &P,
+    locked: &Locked<'_, D>,
+    completed: &[PriorOp],
+    debris: &[std::ffi::OsString],
+    warnings: &mut Vec<RunWarning>,
+) -> Result<(), Fault> {
+    for prior in completed {
+        place.finish_completed(prior, locked, warnings)?;
+    }
+    for name in debris {
+        place.remove_debris(name, locked, warnings)?;
+    }
+    Ok(())
 }
 
 /// A refusal or failure before this run's record exists: remove the lock this run created (Part 2 decision 7:
@@ -380,10 +418,19 @@ pub(crate) fn owned<D: DirHandle>(held: &Held<'_, D>, lock_shown: &Path) -> Resu
 /// The `--restart` sweep's check (cut 7b, "The heartbeat"): the heartbeat, then §99. Two calls: `owned` stays a pure
 /// check.
 pub(crate) fn checked<D: DirHandle>(locked: &Locked<'_, D>) -> Result<(), Fault> {
-    if let Err(e) = locked.pulse.beat(&locked.held) {
-        return Err(Fault::Heartbeat(locked.lock_shown.clone(), e));
+    checked_held(&locked.held, &locked.lock_shown, &locked.pulse)
+}
+
+/// `checked` for a caller that holds the pieces rather than a `Locked` (cut 9b's cleanup).
+pub(crate) fn checked_held<D: DirHandle>(
+    held: &Held<'_, D>,
+    lock_shown: &Path,
+    pulse: &Pulse,
+) -> Result<(), Fault> {
+    if let Err(e) = pulse.beat(held) {
+        return Err(Fault::Heartbeat(lock_shown.to_path_buf(), e));
     }
-    owned(&locked.held, &locked.lock_shown)
+    owned(held, lock_shown)
 }
 
 const LOST: &str =

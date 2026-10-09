@@ -16,6 +16,8 @@ pub(crate) mod test_support;
 
 pub use error::{LockCode, LockError, LockResult, Refusal};
 pub use held::{Held, Released};
-pub use obtain::{MAX_ATTEMPTS, Mode, Obtained, check_capability, obtain};
+pub use obtain::{
+    CleanupObtained, MAX_ATTEMPTS, Mode, Obtained, check_capability, obtain, obtain_cleanup_lock,
+};
 pub use site::{LockSite, SiteKind};
 pub use takeover::{Claimed, Overwritten};

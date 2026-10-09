@@ -32,6 +32,22 @@ enum Commands {
     /// may be given. A skipped file is not a failure. A symlink given as SOURCE is not
     /// followed. Several sources are not supported yet.
     Copy(CopyArgs),
+    /// Classify and remove what earlier operations left at DEST (§24.4, §251).
+    Cleanup(CleanupArgs),
+}
+
+#[derive(Args)]
+struct CleanupArgs {
+    destination: PathBuf,
+    /// Classify and report eligibility; delete nothing and take no lock.
+    #[arg(long)]
+    dry_run: bool,
+    /// Also delete RESUMABLE operations (bypasses retention only; never a live or uncertain owner).
+    #[arg(long)]
+    force: bool,
+    /// Print the report as one JSON object on stdout.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -96,8 +112,10 @@ enum SafetyArg {
 }
 
 fn main() -> ExitCode {
-    let Commands::Copy(args) = Cli::parse().command;
-    ExitCode::from(copy(&args))
+    ExitCode::from(match Cli::parse().command {
+        Commands::Copy(args) => copy(&args),
+        Commands::Cleanup(args) => cleanup(&args),
+    })
 }
 
 /// Explicitly requested preservation is Strict; otherwise best effort (§44.1).
@@ -279,6 +297,73 @@ fn copy(args: &CopyArgs) -> u8 {
     }
 }
 
+/// The cleanup's configuration: retention and the lease are fixed (no flag, no environment variable), the ids are
+/// fresh for this invocation.
+fn cleanup_config(args: &CleanupArgs) -> flux_core::cleanup::CleanupConfig {
+    flux_core::cleanup::CleanupConfig {
+        retention: flux_core::cleanup::DEFAULT_RETENTION,
+        lease_threshold: flux_core::cleanup::LEASE_THRESHOLD,
+        now: flux_core::state::wall_time_ns(),
+        force: args.force,
+        dry_run: args.dry_run,
+        operation_id: flux_core::ids::new_id(),
+        owner_instance_id: flux_core::ids::new_id(),
+        boot_session_id: flux_platform::boot_session_id(),
+        before_mutation: debug_hook(),
+        heartbeat_interval: heartbeat_interval(),
+    }
+}
+
+/// Everything `flux cleanup` writes to stdout: with `--json` only the one-line object, else the table, the action
+/// lines and the summary.
+fn cleanup_stdout(
+    args: &CleanupArgs,
+    dst: &std::path::Path,
+    rep: &flux_core::cleanup::CleanupReport,
+) -> String {
+    use flux_cli::cleanup_report as cr;
+    if args.json {
+        let j = cr::json(dst, args.dry_run, rep);
+        return format!(
+            "{}\n",
+            serde_json::to_string(&j)
+                .expect("plain structs of strings, numbers and bools serialize")
+        );
+    }
+    let mut lines = vec![cr::header_line()];
+    lines.extend(rep.entries.iter().map(cr::entry_line));
+    lines.extend(rep.actions.iter().map(cr::action_line));
+    lines.push(cr::summary_line(rep, args.dry_run));
+    lines.join("\n") + "\n"
+}
+
+fn cleanup(args: &CleanupArgs) -> u8 {
+    use flux_cli::cleanup_report as cr;
+    let dst = match resolve::canonical_with_remainder(&args.destination) {
+        Ok(p) => p,
+        Err(e) => {
+            err(&format!("DESTINATION_ERROR: {}: {e}", args.destination.display()));
+            return exit_code::REFUSED;
+        }
+    };
+    let cfg = cleanup_config(args);
+    let rep = match flux_core::cleanup::cleanup(&flux_platform::StdFileSystem, &dst, &cfg) {
+        Ok(rep) => rep,
+        Err(refused) => {
+            err(&cr::refused_line(&refused));
+            return exit_code::REFUSED;
+        }
+    };
+    let _ = write!(std::io::stdout(), "{}", cleanup_stdout(args, &dst, &rep));
+    if let Some((path, e)) = &rep.listing_failed {
+        err(&format!("error: could not list {}: {e}", path.display()));
+    }
+    if let Some((path, e)) = &rep.lost {
+        err(&format!("error: the destination's lock was lost at {}: {e}", path.display()));
+    }
+    exit_code::for_cleanup(&rep)
+}
+
 /// Each line to stderr.
 fn lines(v: Vec<String>) {
     for line in v {
@@ -308,8 +393,65 @@ mod tests {
     fn parse(extra: &[&str]) -> CopyArgs {
         let mut argv = vec!["flux", "copy", "a", "b"];
         argv.extend_from_slice(extra);
-        let Commands::Copy(args) = Cli::try_parse_from(argv).unwrap().command;
+        let Commands::Copy(args) = Cli::try_parse_from(argv).unwrap().command else {
+            panic!("not a copy");
+        };
         args
+    }
+
+    fn parse_cleanup(argv: &[&str]) -> CleanupArgs {
+        let Commands::Cleanup(args) = Cli::try_parse_from(argv).unwrap().command else {
+            panic!("not a cleanup");
+        };
+        args
+    }
+
+    #[test]
+    fn cleanup_parses_its_three_flags() {
+        let bare = parse_cleanup(&["flux", "cleanup", "d"]);
+        assert_eq!(bare.destination, PathBuf::from("d"));
+        assert!(!bare.dry_run && !bare.force && !bare.json);
+        let all = parse_cleanup(&["flux", "cleanup", "d", "--dry-run", "--force", "--json"]);
+        assert!(all.dry_run && all.force && all.json);
+        let cfg = cleanup_config(&all);
+        assert!(cfg.dry_run && cfg.force);
+        assert_eq!(cfg.retention, flux_core::cleanup::DEFAULT_RETENTION);
+        assert_eq!(cfg.lease_threshold, flux_core::cleanup::LEASE_THRESHOLD);
+        assert_ne!(cfg.operation_id, cfg.owner_instance_id);
+    }
+
+    #[test]
+    fn json_stdout_is_one_object_and_text_stdout_is_the_table() {
+        let rep = flux_core::cleanup::CleanupReport::default();
+        let p = std::path::Path::new("/d");
+        let json = cleanup_stdout(&parse_cleanup(&["flux", "cleanup", "d", "--json"]), p, &rep);
+        assert_eq!(json.lines().count(), 1);
+        assert!(json.starts_with("{\"destination\":\"/d\",\"dry_run\":false,"), "{json}");
+        let text = cleanup_stdout(&parse_cleanup(&["flux", "cleanup", "d"]), p, &rep);
+        assert!(
+            text.starts_with("STATUS ")
+                && text.ends_with("cleanup: 0 entries, 0 removed, 0 kept, 0 skipped\n")
+        );
+        assert!(!text.contains('{'));
+    }
+
+    #[test]
+    fn a_bare_cleanup_is_a_usage_error() {
+        let err = Cli::try_parse_from(["flux", "cleanup"]).err().expect("DEST is required");
+        assert_eq!(err.exit_code(), 2);
+        assert!(Cli::try_parse_from(["flux", "cleanup", "d", "--bogus"]).is_err());
+    }
+
+    #[test]
+    fn an_unresolvable_destination_exits_3_not_1() {
+        // A NUL byte is not NotFound, so canonicalisation returns the error instead of climbing.
+        let args = CleanupArgs {
+            destination: PathBuf::from("a\0b"),
+            dry_run: true,
+            force: false,
+            json: false,
+        };
+        assert_eq!(cleanup(&args), exit_code::REFUSED);
     }
 
     #[test]

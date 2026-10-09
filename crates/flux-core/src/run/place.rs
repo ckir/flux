@@ -3,18 +3,21 @@
 //! `<target>.flux-state.<id>` beside the target, with its lock.
 
 use super::session::{Fault, Locked, checked, failed, from_lock};
+use super::sweep::sweep_partials;
 use super::{RunError, RunStep, RunWarning};
+use crate::cleanup::Action;
+use crate::cleanup::artifacts::remove_validated;
+use crate::cleanup::delete;
 use crate::copy::{CopyError, CopyStep, split_destination};
 use crate::lock::{LockCode, LockResult, Refusal};
 use crate::prior::{PriorOp, Scan, scan_file, scan_tree};
 use crate::state::{
-    FLUX_DIR, Kind, MANIFEST, OPERATIONS_DIR, OpState, OperationState, PARTIAL_INFIX, PROBE,
-    PROBE_TEMP, Root, STATE_DB, absolute_lexical, begin_workspace, creating_name, id_after,
-    identity_text, native_hex, operations_dir, publish_workspace, record_name,
-    remove_empty_control_dirs, remove_record, retire_workspace, write_state,
+    FLUX_DIR, Kind, MANIFEST, OPERATIONS_DIR, OpState, OperationState, PROBE, PROBE_TEMP, Root,
+    STATE_DB, absolute_lexical, begin_workspace, creating_name, from_native_hex, identity_text,
+    native_hex, operations_dir, publish_workspace, record_name, remove_empty_control_dirs,
+    remove_record, retire_workspace, write_state,
 };
-use crate::tree::{TreeOutcome, containment, preflight, primitive_unavailable, reserved_path};
-use crate::walk::{WalkEvent, walk};
+use crate::tree::{TreeOutcome, containment, preflight, primitive_unavailable};
 use flux_fs::{
     ClaimStore, Code, DestinationRoot, DirHandle, Durability, FileIdentity, FileType, FsError,
     OperationId, Safety, temp_path,
@@ -64,6 +67,22 @@ pub(crate) trait Place<D: DirHandle> {
     /// (`None` if there is none, `Unavailable` if it cannot be read). Read under the lock, as the state is made. `None`
     /// for a tree.
     fn file_identities(&self) -> Option<(FileIdentity, Option<FileIdentity>)>;
+    /// Cut 9b: finish `prior`'s recorded cleanup under this run's lock: its leftovers, then its state. `Ok(Some(n))`:
+    /// `n` leftovers removed and the state with them (a `PriorCleaned` warning is pushed); `Ok(None)`: something was
+    /// kept (a `PriorCleanupFailed` warning is pushed). Only losing the lock is an `Err`.
+    fn finish_completed(
+        &self,
+        prior: &PriorOp,
+        locked: &Locked<'_, D>,
+        warnings: &mut Vec<RunWarning>,
+    ) -> Result<Option<u64>, Fault>;
+    /// Cut 9b: remove one `<id>.creating` / `<id>.removing` directory; a tree only (a single file has none).
+    fn remove_debris(
+        &self,
+        name: &OsStr,
+        locked: &Locked<'_, D>,
+        warnings: &mut Vec<RunWarning>,
+    ) -> Result<(), Fault>;
     /// Cut 9a: the one root this run records (format 3 `roots`).
     fn roots(&self) -> Vec<Root>;
     /// Cut 9a: adopt a validated prior. A tree opens `operations/<id>/state.db` (`open_claim_store`), or, while
@@ -146,6 +165,40 @@ pub(crate) fn locate_tree<F: DestinationRoot>(
             dest: Some(dest),
         });
     }
+    let located = locate_dest(fs, dst_root)?;
+    let (holder, dest) = (&located.holder, &located.dest);
+    let anchor = match dest {
+        Some(d) => d.identity(),
+        None => holder.identity(),
+    }
+    .map_err(resolve)?;
+    preflight(src_identity, anchor, safety, &mut out.warnings)?;
+    let (anchor_handle, anchor_shown) = match dest {
+        Some(d) => (d, dst_root),
+        None => (holder, located.holder_shown.as_path()),
+    };
+    containment(fs, src_root, anchor_handle, anchor_shown, safety, out)?;
+    Ok(located)
+}
+
+/// B1's resolution of DEST, without the pre-flight: the directory holding the lock, DEST's name in it, and DEST if it
+/// exists. A DEST that exists and is not a directory is `DESTINATION_ERROR`, a link at DEST `SAFETY_REJECTED`, and a
+/// parent that cannot be opened the error of the open. `flux cleanup` reads through this too.
+pub(crate) fn locate_dest<F: DestinationRoot>(
+    fs: &F,
+    dst_root: &Path,
+) -> Result<LocatedTree<F::Dir>, CopyError> {
+    let resolve = |e| CopyError::at(CopyStep::Resolve, e);
+    if dst_root.file_name().is_none() {
+        let holder = fs.destination_root(dst_root).map_err(resolve)?;
+        let dest = fs.destination_root(dst_root).map_err(resolve)?;
+        return Ok(LocatedTree {
+            holder,
+            holder_shown: dst_root.to_path_buf(),
+            name: None,
+            dest: Some(dest),
+        });
+    }
     let (parent_path, name) = split_destination(dst_root)?;
     let holder = fs.destination_root(parent_path).map_err(resolve)?;
     let dest = match holder.metadata(name) {
@@ -167,17 +220,6 @@ pub(crate) fn locate_tree<F: DestinationRoot>(
             )));
         }
     };
-    let anchor = match &dest {
-        Some(d) => d.identity(),
-        None => holder.identity(),
-    }
-    .map_err(resolve)?;
-    preflight(src_identity, anchor, safety, &mut out.warnings)?;
-    let (anchor_handle, anchor_shown) = match &dest {
-        Some(d) => (d, dst_root),
-        None => (&holder, parent_path),
-    };
-    containment(fs, src_root, anchor_handle, anchor_shown, safety, out)?;
     Ok(LocatedTree {
         holder,
         holder_shown: parent_path.to_path_buf(),
@@ -414,63 +456,75 @@ impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {
             return Ok(Vec::new());
         }
         let dest = self.dest.as_ref().expect("DEST exists once this run's state does");
-        let operations = self.operations_shown();
-        let mut kept: BTreeSet<&str> = BTreeSet::new();
-        // J1: every `<name>.flux-partial.<prior-id>` under DEST, found by a walk of DEST by path that skips the
-        // reserved control directories, and deleted through handles opened from DEST's own, one component at a time.
-        let events = match walk(self.fs, &self.dest_shown) {
-            Ok(events) => events,
-            Err(error) => {
-                warnings.push(RunWarning::PartialKept {
-                    path: self.dest_shown.clone(),
-                    error,
-                    kept: operations,
-                });
-                return Ok(Vec::new());
-            }
-        };
-        for item in events {
-            let path = match item {
-                Ok(WalkEvent::File { path }) => path,
-                Ok(_) => continue,
-                // A directory the sweep cannot read may hold a partial: every prior's state stays as its record.
-                Err(e) => {
-                    let path = self.dest_shown.join(&e.path);
-                    warnings.push(RunWarning::PartialKept {
-                        path,
-                        error: e.cause,
-                        kept: operations.clone(),
-                    });
-                    kept.extend(ids.iter().copied());
-                    continue;
-                }
-            };
-            if reserved_path(&path) {
-                continue;
-            }
-            let Some(prior) = path
-                .file_name()
-                .and_then(|n| id_after(n, PARTIAL_INFIX))
-                .and_then(|i| ids.get(i).copied())
-            else {
-                continue;
-            };
-            checked(locked)?;
-            if let Err(error) = remove_below(dest, &path) {
-                let shown = self.dest_shown.join(&path);
-                warnings.push(RunWarning::PartialKept {
-                    path: shown,
-                    error,
-                    kept: self.shown(prior),
-                });
-                kept.insert(prior);
-            }
-        }
-        Ok(ids.difference(&kept).map(|i| (*i).to_string()).collect())
+        sweep_partials(
+            self.fs,
+            dest,
+            &self.dest_shown,
+            &self.operations_shown(),
+            &ids,
+            &|id| self.shown(id),
+            &mut || checked(locked),
+            &mut |_| {},
+            warnings,
+        )
     }
 
     fn remove(&self, id: &str) -> Result<(), (PathBuf, FsError)> {
         retire_workspace(self.operations(), id).map_err(|e| (self.operations_shown().join(id), e))
+    }
+
+    fn finish_completed(
+        &self,
+        prior: &PriorOp,
+        locked: &Locked<'_, F::Dir>,
+        warnings: &mut Vec<RunWarning>,
+    ) -> Result<Option<u64>, Fault> {
+        let dest = self.dest.as_ref().expect("DEST exists once this run's state does");
+        let mut actions = Vec::new();
+        let done = delete::finish_completed(
+            dest,
+            &self.dest_shown,
+            self.operations(),
+            &self.operations_shown(),
+            &prior.state,
+            &mut || checked(locked),
+            &mut actions,
+        )?;
+        let operation_id = prior.state.operation_id.clone();
+        match done {
+            Some(removed) => warnings.push(RunWarning::PriorCleaned { operation_id, removed }),
+            None => {
+                if let Some(Action::Kept { path, error }) =
+                    actions.into_iter().find(|a| matches!(a, Action::Kept { .. }))
+                {
+                    warnings.push(RunWarning::PriorCleanupFailed { operation_id, path, error });
+                }
+            }
+        }
+        Ok(done)
+    }
+
+    fn remove_debris(
+        &self,
+        name: &OsStr,
+        locked: &Locked<'_, F::Dir>,
+        warnings: &mut Vec<RunWarning>,
+    ) -> Result<(), Fault> {
+        let mut actions = Vec::new();
+        delete::remove_debris(
+            self.operations(),
+            &self.operations_shown(),
+            name,
+            &mut || checked(locked),
+            &mut actions,
+        )?;
+        if let Some(Action::Kept { path, error }) =
+            actions.into_iter().find(|a| matches!(a, Action::Kept { .. }))
+        {
+            let operation_id = name.to_string_lossy().into_owned();
+            warnings.push(RunWarning::PriorCleanupFailed { operation_id, path, error });
+        }
+        Ok(())
     }
 
     fn remove_control_dirs(&mut self, rollback: bool) -> Result<(), (PathBuf, FsError)> {
@@ -545,19 +599,6 @@ impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {
         self.operations = Some(operations);
         Ok(Some(claims))
     }
-}
-
-/// Remove the file at `rel` below `dest` through handles opened one component at a time, so no link is followed
-/// (§149.7; J1).
-fn remove_below<D: DirHandle>(dest: &D, rel: &Path) -> flux_fs::Result<()> {
-    let mut parts: Vec<&OsStr> = rel.iter().collect();
-    let name = parts.pop().expect("a walk path ends in a name");
-    let mut opened: Option<D> = None;
-    for part in parts {
-        let next = opened.as_ref().unwrap_or(dest).open_dir(part)?;
-        opened = Some(next);
-    }
-    opened.as_ref().unwrap_or(dest).remove_file(name)
 }
 
 /// A single file's directory: it holds the lock, the record `<target>.flux-state.<id>` and the copy.
@@ -638,6 +679,71 @@ impl<D: DirHandle> Place<D> for FilePlace<'_, D> {
 
     fn remove(&self, id: &str) -> Result<(), (PathBuf, FsError)> {
         remove_record(self.dir, &record_name(&self.target, id)).map_err(|e| (self.shown(id), e))
+    }
+
+    fn finish_completed(
+        &self,
+        prior: &PriorOp,
+        locked: &Locked<'_, D>,
+        warnings: &mut Vec<RunWarning>,
+    ) -> Result<Option<u64>, Fault> {
+        let id = prior.state.operation_id.as_str();
+        // Spec "Artifact rules": the only artifact of a single file is this target's own partial for the id.
+        let own = temp_path(Path::new(&self.target), &OperationId::new(id));
+        let hexes: &[String] =
+            prior.state.cleanup.as_ref().map_or(&[], |c| &c.cleanup_pending_artifacts);
+        let kept = |path: PathBuf, error: FsError, warnings: &mut Vec<RunWarning>| {
+            warnings.push(RunWarning::PriorCleanupFailed {
+                operation_id: id.to_string(),
+                path,
+                error,
+            });
+        };
+        // Every artifact is checked before anything is deleted: one stranger keeps the whole record.
+        for hex in hexes {
+            if from_native_hex(hex).as_deref() != Some(own.as_path()) {
+                let shown = from_native_hex(hex).unwrap_or_else(|| PathBuf::from(hex));
+                let error = FsError::new(
+                    Code::SafetyRejected,
+                    std::io::Error::other("not a recognized leftover"),
+                );
+                kept(self.dir_shown.join(shown), error, warnings);
+                return Ok(None);
+            }
+        }
+        let mut removed = 0;
+        for _ in hexes {
+            checked(locked)?;
+            // `AlreadyGone` converges a re-run after a kill (artifact rule 4).
+            match remove_validated(self.dir, &own) {
+                Ok(_) => removed += 1,
+                Err(error) => {
+                    kept(self.dir_shown.join(&own), error, warnings);
+                    return Ok(None);
+                }
+            }
+        }
+        checked(locked)?;
+        match remove_record(self.dir, &record_name(&self.target, id)) {
+            Ok(()) => {
+                warnings.push(RunWarning::PriorCleaned { operation_id: id.to_string(), removed });
+                Ok(Some(removed))
+            }
+            Err(error) => {
+                kept(prior.shown.clone(), error, warnings);
+                Ok(None)
+            }
+        }
+    }
+
+    fn remove_debris(
+        &self,
+        _name: &OsStr,
+        _locked: &Locked<'_, D>,
+        _warnings: &mut Vec<RunWarning>,
+    ) -> Result<(), Fault> {
+        // A single file has no workspace to leave debris.
+        Ok(())
     }
 
     fn remove_control_dirs(&mut self, _rollback: bool) -> Result<(), (PathBuf, FsError)> {
