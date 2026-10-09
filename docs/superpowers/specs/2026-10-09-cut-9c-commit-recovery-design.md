@@ -64,13 +64,23 @@ Derived from the above and the spec (the matrix and the failure rule were agreed
    ("" for DEST itself), name: bytes (the stored name), planned_name: bytes (the name the plan used when the filesystem stored it under another
    spelling, empty when equal to `name`), replacement: bool }`. `temp_identity` is `copy_file_guarded`'s `published_identity`, read from the
    open writer handle immediately before the rename (`copy.rs`, "a rename keeps it").
+   **Encoding (version 1):** one version byte `1`, then in this order `target`, `temp_name`, `identity`, `dir_path`, `name`, `planned_name`, each as a
+   4-byte big-endian length followed by that many bytes (`identity` is the ASCII `identity_text` of `state.rs`: `strong:<volume>:<index>`,
+   `weak:<volume>:<index>` or `unavailable`; `dir_path` is the lowercase hex of `native_hex`), then one byte `replacement` (0 or 1). A record that does not
+   decode, has trailing bytes, or carries a version other than 1 is UNCERTAIN. **Validation in phase 1 before any filesystem access:** `name` and
+   `planned_name` (when not empty) are single normal path components; `temp_name` equals `<name>.flux-partial.<this operation's id>` (derived, so a
+   hostile row cannot name another file); `dir_path` decodes to a relative path of normal components; and once the directory is resolved, its
+   `FileIdentity` equals the row key's `parent` (when either is not `Strong` the row is UNCERTAIN). Any failure is UNCERTAIN.
 6. **Order of a Strict publication:** copy, verify, metadata, flush (as today); the final recheck of the source (as today); NEW `prepare` (one
    synced commit) through a hook called once, after that recheck and BEFORE the final heartbeat and section 99 guard, so the ownership check still
    immediately precedes the rename and the synced commit does not widen its window (a lost lock then leaves a note whose temporary was never renamed:
    recovery row 2); the heartbeat and the guard (as today); the rename; NEW `commit_prepared` (one synced commit: the claim becomes `Created`,
    the note is deleted). A failing `prepare` aborts the publication: the temporary is discarded as for any failure before the rename and the file fails
    with `CopyStep::Claim` (no new code). A failing `commit_prepared` after a successful rename is the existing `ClaimNotRecorded` report (the file IS
-   published); the note stays and recovery settles it on the next resume.
+   published); the note stays and recovery settles it on the next resume. **Any other failure after a successful `prepare` and before the rename** (the
+   heartbeat, the guard, the rename itself failing, a lost lock) makes `tree.rs` call `discard_prepared` for that key at once, best effort: the copy path
+   has already removed (or kept as a leftover) its temporary, and a note left behind would describe a publication that did not happen. A `discard_prepared`
+   that itself fails leaves the note, which recovery decides by the matrix (row 4 below).
 7. **Recovery order:** `Place::adopt` opens the store, then runs recovery, then returns; the walk starts afterwards (section 241.5: "before any other target
    is planned or published").
 
@@ -83,14 +93,17 @@ never following a link). With R the recorded `temp_identity`:
 
 | # | Evidence | Verdict | Action in phase 2 |
 |---|---|---|---|
-| 1 | D is `Entry(i)`, R and `i` both `Strong`, and `i == R` | RENAMED | `commit_prepared`; if T is `Present(j)` with `j == R` (the `link()`+`unlink()` no-replace fallback of section 241.5 leaves both names), remove the temp name |
-| 2 | T is `Present` and D is `Absent` | NOT RENAMED | `discard_prepared`; the normal path redoes the file (its step-1 sweep removes the temporary) |
-| 3 | T is `Present(j)` with R and `j` `Strong` and `j == R`, and D is `Entry(i)` with `i` `Strong` and `i != R` | NOT RENAMED | as row 2 (a replacement whose old object is still there) |
-| 4 | T is `Absent` and D is `Absent` | GONE | `discard_prepared`; nothing of ours exists, the normal path redoes the file |
-| 5 | anything else (a `Weak` or `Unavailable` identity where the comparison needs a `Strong` one; D holds a different object and T is absent; T present with another identity while D is present; a hostile or unreadable directory) | UNCERTAIN | none |
+| 1 | D is `Entry(i)`, R and `i` both `Strong`, and `i == R` | RENAMED | `commit_prepared(key, target, planned)` (the row's `planned_name` becomes the second `Created` claim); then, if T is `Present(j)` with `j == R` (the `link()`+`unlink()` no-replace fallback of section 241.5 leaves both names), remove the temp name; a failed removal is a warning (`PartialKept` shape: the object IS published, the stray name is the J1 sweep's) and never fails the adoption |
+| 2 | T is `Present` and D is `Absent` | NOT RENAMED | `discard_prepared`; the normal path redoes the file (its step-1 sweep removes the temporary: the name is reserved to this operation, so T's identity is not needed) |
+| 3 | T is `Present` and the row is a replacement (`replacement == true`; `rename_replace` is atomic and never leaves two names) | NOT RENAMED | as row 2 (D is the old object, whatever its identity) |
+| 3b | T is `Present(j)` with R and `j` `Strong` and `j == R`, and D is `Entry(i)` with `i` `Strong` and `i != R` (a no-replace row whose entry was taken by another object) | NOT RENAMED | as row 2 |
+| 4 | T is `Absent` and either D is `Absent`, or D is `Entry(i)` with R and `i` both `Strong` and `i != R` | GONE | `discard_prepared`; no object of the operation's exists at either name (an aborted publication whose note outlived its temporary, or our object replaced afterwards by someone else), so the normal path decides by the existing-file policy exactly as in 9a |
+| 5 | anything else: a `Weak` or `Unavailable` identity where a comparison needs a `Strong` one (R or D); T present with D present for a no-replace row when the identities cannot show `i != R`; a row that fails validation; an unreadable directory | UNCERTAIN | none |
 
-Row 1 needs strong identity on both sides (section 259.8: existence, size or timestamp alone never prove the rename). Rows 2 and 4 need no identity: a rename
-moves the name, so `T present and D absent` cannot follow a completed rename, and `T absent and D absent` leaves no object of ours to protect.
+Row 1 needs strong identity on both sides (section 259.8: existence, size or timestamp alone never prove the rename). Rows 2, 3 and 4 (the `D absent` form) need no identity: a rename moves the name, so
+`T present and D absent` cannot follow a completed rename, a replacement never leaves two names, and with neither name present there is no object of ours
+to protect. Row 4's second form needs both identities `Strong`: if R is the recorded object and D is a different object while T is gone, the object this
+operation made is not at either name, so redo is the 9a behaviour (the policy may replace D, as it would without any note).
 
 Phase 2 runs only when no row is UNCERTAIN. It applies every verdict in ONE redb transaction (synced) so recovery is all-or-nothing. If any row is
 UNCERTAIN, nothing is applied and adoption is refused: `COMMIT_STATE_UNCERTAIN`, exit 3, `changed: false` (the refusal changes nothing, as the exit-3
@@ -125,9 +138,10 @@ after the resume note: `recovered <k> interrupted publications` when `k > 0` (RE
 - `flux-core/src/copy.rs`: `PublishIntent { temp: OsString, identity: FileIdentity }` and a `BeforePublish` hook called exactly once per copy that reaches the
   rename, after the source recheck (the identity is read from the writer handle there) and before the final heartbeat and guard; its error stops the
   copy there with the temporary discarded (`CopyStep::Claim`).
-  `no_before_publish` is the default. The hook arrives beside `before_create` (the plan decides whether that is a ninth parameter or a bundle).
+  `pub type BeforePublish<'g> = dyn Fn(&PublishIntent) -> std::result::Result<(), CopyError> + 'g;` and `no_before_publish` is the default. The hook arrives beside `before_create` (the plan decides whether that is a ninth parameter or a bundle).
 - `flux-core/src/tree.rs`: under `opts.durability == Strict` and `claims.supports_prepared()`, the new-target and replacement branches pass a hook that
-  calls `prepare`, and replace the post-rename `insert_if_absent`/`upgrade_own_claim` by `commit_prepared`.
+  calls `prepare`, replace the post-rename `insert_if_absent`/`upgrade_own_claim` (and the second claim for a planned name) by one `commit_prepared`, and
+  call `discard_prepared` when the copy fails after `prepare`.
 - `flux-core/src/run/recover.rs` (new): `recover_publications(dest, store, durability) -> Result<Recovered, RecoverError>` with phase 1 and phase 2.
 - `flux-core/src/run/place.rs` / `mod.rs`: `TreePlace::adopt` calls it after `count()`; `ResumeNote::Adopted` gains `recovered: u64`; `LockCode` gains
   `CommitStateUncertain` ("COMMIT_STATE_UNCERTAIN"), mapped to exit 3 (`flux-cli/src/exit_code.rs` is unchanged: a refusal that changed nothing is 3).
@@ -151,8 +165,9 @@ after the resume note: `recovered <k> interrupted publications` when `k > 0` (RE
 
 ## Writer's rulings (owner: confirm or change at spec review)
 
-W1. **T absent and D absent is GONE (redo), not UNCERTAIN.** agy's matrix said any unmatched destination is UNCERTAIN; but with no object of ours at either
-    name there is nothing to preserve or overwrite and redo cannot destroy anything. The nearby cases (a different object at D) stay UNCERTAIN.
+W1. **T absent with D absent, or with D a different Strong object, is GONE (redo), not UNCERTAIN.** agy's matrix said any unmatched destination is
+    UNCERTAIN; but with no object of ours at either name nothing is preserved or overwritten by anything beyond what the 9a policy already does, and
+    leaving it UNCERTAIN would wedge an operation after a benign crash between the temporary's removal and the note's removal (panel round 1).
 W2. **Classify all, then apply all in one transaction, refuse changing nothing.** So the exit-3 rule ("nothing was changed") holds even when some notes
     were decidable.
 W3. **A format-1 store is not upgraded in place**, and a Strict run on it writes no notes.
@@ -160,7 +175,11 @@ W4. **`link()`+`unlink()` leftover temp name is removed in recovery** only when 
 W5. **A failing `commit_prepared` after a successful rename is the existing `ClaimNotRecorded` report**, not a new failure: the file is published and the
     note settles it at the next resume.
 W6. **`COMMIT_STATE_UNCERTAIN` is a `LockCode` refusal** (like `INCOMPATIBLE_STATE`), exit 3, and appears in the exit-3 examples of section 55.
-W7. **Spec gaps found:** G2 to G5 and the 259.8 wording "may finalize the commit" (the amendment says recovery MUST finalize when row 1 holds).
+W7. **Replacement notes never leave two names** (row 3), because `rename_replace` is atomic; the `link()`+`unlink()` ambiguity exists only for no-replace
+    publications.
+W8. **A failed publication after `prepare` discards its note in `tree.rs`** (best effort), so the table stays small and the matrix is the backstop.
+W9. **The record encoding (version 1) and the validation list** are this spec's (panel round 1: the plan would otherwise guess them).
+W10. **Spec gaps found:** G2 to G5 and the 259.8 wording "may finalize the commit" (the amendment says recovery MUST finalize when row 1 holds).
 
 ## Tests (Review Focus; each is pinned by a named test in the plan)
 
@@ -175,6 +194,11 @@ W7. **Spec gaps found:** G2 to G5 and the 259.8 wording "may finalize the commit
 7. Atomicity of `commit_prepared`: a foreign claim at the key changes nothing; a crash inside the transaction leaves note and claim as they were.
 8. A hostile note: `dir_path` naming a path through a link, an absolute path, `..`; the verdict is UNCERTAIN and nothing is touched.
 9. The report line, the exit code and the refusal text.
+10. No wedge: a rename (or guard) failing after `prepare` leaves no note; a note whose temporary is gone while D is the old Strong object is GONE and the
+    file is redone; a replacement note with T present and a Weak D is NOT RENAMED; a no-replace note with T present and a Weak D is UNCERTAIN (the link
+    fallback); a failed removal of the stray temp name in row 1 is a warning and the adoption succeeds.
+11. A hostile note (unknown version, trailing bytes, a `temp_name` that is not `<name>.flux-partial.<id>`, a `dir_path` whose resolved identity differs from
+    the key's parent): UNCERTAIN, nothing touched.
 
 ## Appendix: Amendment text for `FLUX_FULL_UPDATED_SPEC_V16.md`
 
