@@ -1649,6 +1649,45 @@ fn a_heartbeat_restarts_its_interval() {
     );
 }
 
+/// A config whose guard sleeps 30 ms once (at the first guard), with a 5 ms heartbeat interval, so the first heartbeat
+/// after the sleep is due and the gap since the lock's creation record is at least 30 ms.
+fn sleeping_beats() -> RunConfig {
+    let first = Arc::new(AtomicUsize::new(0));
+    let hook: BeforeMutation = Arc::new(move || {
+        if first.fetch_add(1, Ordering::SeqCst) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+    });
+    RunConfig {
+        heartbeat_interval: std::time::Duration::from_millis(5),
+        before_mutation: Some(hook),
+        ..cfg()
+    }
+}
+
+#[test]
+fn the_longest_gap_between_successful_record_writes_is_reported() {
+    // Mutant: delete the `gap_max.set(..)` in `Pulse::beat` (session.rs), or record the shorter of the two gaps.
+    let fs = fake();
+    let (r, _) = run_tree(&fs, &sleeping_beats());
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+    assert!(
+        r.beat_gap_max >= std::time::Duration::from_millis(30),
+        "the gap across the sleep: {:?}",
+        r.beat_gap_max
+    );
+}
+
+#[test]
+fn a_failed_heartbeat_write_does_not_raise_the_longest_gap() {
+    // Mutant: move the `gap_max.set(..)` in `Pulse::beat` (session.rs) ahead of the write's result.
+    let fs = fake();
+    fail_heartbeat(&fs, 2, T_LOCK, false);
+    let (r, _) = run_tree(&fs, &sleeping_beats());
+    assert!(r.stop.is_some() || matches!(r.copy, Some(Err(_))), "the heartbeat failed the copy");
+    assert_eq!(r.beat_gap_max, std::time::Duration::ZERO);
+}
+
 #[test]
 fn a_heartbeat_failure_message_names_the_lock() {
     // Mutant: change the wording `beat_error` builds (session.rs). The operator reads this line; it must say what
