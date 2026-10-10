@@ -203,7 +203,7 @@ pub(crate) fn no_heartbeat() -> flux_fs::Result<()> {
 /// The leftover is recorded RELATIVE to `parent` -- the only frame `copy_file_at`
 /// has. `copy_file` joins it onto the parent path it resolved, so its callers see
 /// the same full path as before.
-fn discard<D: DirHandle>(
+pub(crate) fn discard<D: DirHandle>(
     parent: &D,
     temp: &OsStr,
     step: CopyStep,
@@ -459,37 +459,26 @@ pub fn copy_file_at<F: DestinationRoot>(
     )
 }
 
-/// Copy `src` to `name` inside `parent`, writing ONLY through `parent`.
-///
-/// Nothing below re-resolves a destination path: the staging temporary, the
-/// metadata, the publish and the cleanup all go through the handle, so a parent
-/// swapped for a link after it was opened cannot redirect the write (item 114).
-///
-/// `guard` runs before every destination mutation - the step-1 sweep, the exclusive create, the publishing rename and a
-/// failed copy's removal of its temporary - which is §99's `S99_check` before each `S99_write` (cut 7a Part 3b). A
-/// failed guard stops the copy at that point: before the create it creates nothing, and at the publish or a removal
-/// the temporary stays, reported as `leftover`.
-///
-/// `beat` runs immediately before each of those guard calls except the removal's, and after every chunk written (cut
-/// 7b; at most `COPY_BUF_MAX` bytes). Its failure is `CopyStep::Heartbeat`: before the create it creates nothing;
-/// after it, the temporary is removed as for any other failure.
-///
-/// `before_create` (cut 8b) is called exactly once per copy that reaches the create: after the heartbeat and guard that
-/// precede the exclusive create, and before the temporary exists. Its error stops the copy there, creating nothing.
-/// A copy that is refused by the gate or skipped by the policy never calls it.
-///
-/// Step 2b is the existing-destination policy decision, taken after the identity gate (which already refused a
-/// directory at the name): `Overwrite` proceeds, `SkipExisting` returns a skipped outcome changing nothing on disk,
-/// and `Update` proceeds when the source is newer or the sizes differ (sizes alone when either time is unavailable).
-///
-/// `before_publish` (cut 9c) is called exactly once per copy that reaches the publish: after the source recheck and
-/// before the final heartbeat and guard, with the temporary's name and identity. Its error discards the temporary and
-/// is returned as is; a copy that fails the recheck never calls it.
-///
-/// Nine parameters: the signature is the cut 8b plan's contract (guard, beat, before_create arrive together), plus
-/// cut 9c's `before_publish`.
+/// What `stage_file` produced: a closed temporary on disk, ready to be renamed to its name.
+pub(crate) struct Staged {
+    pub temp: OsString,
+    pub identity: FileIdentity,
+    pub bytes_copied: u64,
+    pub metadata_failures: Vec<MetadataFailure>,
+    pub identity_degraded: Option<FileIdentity>,
+}
+
+/// The result of `stage_file`: the step-2b skip (changes nothing on disk), or a staged temporary.
+pub(crate) enum Stage {
+    Skipped(Outcome),
+    Staged(Staged),
+}
+
+/// Steps 1-7 of the copy, up to and including the source recheck and the read of the temporary's identity: everything
+/// before the final heartbeat, guard and publishing rename. The writer is dropped on return, so no descriptor is held;
+/// on every error path the temporary has already been discarded exactly as `copy_file_guarded` always did.
 #[allow(clippy::too_many_arguments)]
-pub fn copy_file_guarded<F: DestinationRoot>(
+pub(crate) fn stage_file<F: DestinationRoot>(
     fs: &F,
     src: &Path,
     parent: &F::Dir,
@@ -498,8 +487,7 @@ pub fn copy_file_guarded<F: DestinationRoot>(
     guard: &Guard<'_>,
     beat: &Heartbeat<'_>,
     before_create: &BeforeCreate<'_>,
-    before_publish: &BeforePublish<'_>,
-) -> std::result::Result<Outcome, CopyError> {
+) -> std::result::Result<Stage, CopyError> {
     let temp = temp_name(name, &opts.operation_id);
 
     // 1. this invocation's own leftover, if any (§18.1). A no-op in practice: the
@@ -537,13 +525,13 @@ pub fn copy_file_guarded<F: DestinationRoot>(
             }
         };
         if !proceed {
-            return Ok(Outcome {
+            return Ok(Stage::Skipped(Outcome {
                 skipped: true,
                 bytes_copied: 0,
                 metadata_failures: vec![],
                 identity_degraded: gate.degraded,
                 published_identity: FileIdentity::Unavailable,
-            });
+            }));
         }
     }
     let identity_degraded = gate.degraded;
@@ -658,19 +646,87 @@ pub fn copy_file_guarded<F: DestinationRoot>(
 
     // Cut 7b: the object about to be published, read from its own handle - a rename keeps it - so the run records the
     // target's identity without a look-up by name after the rename.
-    let published_identity = writer.identity().unwrap_or(FileIdentity::Unavailable);
+    let identity = writer.identity().unwrap_or(FileIdentity::Unavailable);
+    Ok(Stage::Staged(Staged { temp, identity, bytes_copied, metadata_failures, identity_degraded }))
+}
+
+/// Copy `src` to `name` inside `parent`, writing ONLY through `parent`.
+///
+/// Nothing below re-resolves a destination path: the staging temporary, the
+/// metadata, the publish and the cleanup all go through the handle, so a parent
+/// swapped for a link after it was opened cannot redirect the write (item 114).
+///
+/// `guard` runs before every destination mutation - the step-1 sweep, the exclusive create, the publishing rename and a
+/// failed copy's removal of its temporary - which is §99's `S99_check` before each `S99_write` (cut 7a Part 3b). A
+/// failed guard stops the copy at that point: before the create it creates nothing, and at the publish or a removal
+/// the temporary stays, reported as `leftover`.
+///
+/// `beat` runs immediately before each of those guard calls except the removal's, and after every chunk written (cut
+/// 7b; at most `COPY_BUF_MAX` bytes). Its failure is `CopyStep::Heartbeat`: before the create it creates nothing;
+/// after it, the temporary is removed as for any other failure.
+///
+/// `before_create` (cut 8b) is called exactly once per copy that reaches the create: after the heartbeat and guard that
+/// precede the exclusive create, and before the temporary exists. Its error stops the copy there, creating nothing.
+/// A copy that is refused by the gate or skipped by the policy never calls it.
+///
+/// Step 2b is the existing-destination policy decision, taken after the identity gate (which already refused a
+/// directory at the name): `Overwrite` proceeds, `SkipExisting` returns a skipped outcome changing nothing on disk,
+/// and `Update` proceeds when the source is newer or the sizes differ (sizes alone when either time is unavailable).
+///
+/// `before_publish` (cut 9c) is called exactly once per copy that reaches the publish: after the source recheck and
+/// before the final heartbeat and guard, with the temporary's name and identity. Its error discards the temporary and
+/// is returned as is; a copy that fails the recheck never calls it.
+///
+/// Nine parameters: the signature is the cut 8b plan's contract (guard, beat, before_create arrive together), plus
+/// cut 9c's `before_publish`.
+#[allow(clippy::too_many_arguments)]
+pub fn copy_file_guarded<F: DestinationRoot>(
+    fs: &F,
+    src: &Path,
+    parent: &F::Dir,
+    name: &OsStr,
+    opts: &CopyOptions,
+    guard: &Guard<'_>,
+    beat: &Heartbeat<'_>,
+    before_create: &BeforeCreate<'_>,
+    before_publish: &BeforePublish<'_>,
+) -> std::result::Result<Outcome, CopyError> {
+    let staged = match stage_file(fs, src, parent, name, opts, guard, beat, before_create)? {
+        Stage::Skipped(outcome) => return Ok(outcome),
+        Stage::Staged(staged) => staged,
+    };
     // Cut 9c: the hook sees the temporary and its identity before the final heartbeat and guard. Its error is returned
     // as is, after the temporary is discarded like any other pre-rename failure.
-    let intent = PublishIntent { temp: temp.clone(), identity: published_identity };
+    let intent = PublishIntent { temp: staged.temp.clone(), identity: staged.identity };
     if let Err(e) = before_publish(&intent) {
         let CopyError { cause, leftover, step } = e;
-        let mut out = discard(parent, &temp, step, cause.code, cause.source, guard);
+        let mut out = discard(parent, &staged.temp, step, cause.code, cause.source, guard);
         if out.leftover.is_none() {
             out.leftover = leftover;
         }
         return Err(out);
     }
+    publish_staged(parent, name, staged, opts.publish, guard, beat)
+}
 
+/// The final heartbeat, guard and publishing rename for a `Staged` temporary, with the exact error handling the single
+/// copy always had: a heartbeat failure discards the temporary, a lost guard keeps it as the leftover, and a failed
+/// rename discards it.
+pub(crate) fn publish_staged<D: DirHandle>(
+    parent: &D,
+    name: &OsStr,
+    staged: Staged,
+    publish: Publish,
+    guard: &Guard<'_>,
+    beat: &Heartbeat<'_>,
+) -> std::result::Result<Outcome, CopyError> {
+    let Staged {
+        temp,
+        identity: published_identity,
+        bytes_copied,
+        metadata_failures,
+        identity_degraded,
+    } = staged;
     // §99 (`S99_check`, then the `S99_write` below): publish only while the lock is still this run's. Otherwise the
     // temporary stays - removing it would be a mutation too - and is reported as the leftover.
     if let Err(e) = beat() {
@@ -685,7 +741,7 @@ pub fn copy_file_guarded<F: DestinationRoot>(
             ..CopyError::at(CopyStep::Publish, lost)
         });
     }
-    let published = match opts.publish {
+    let published = match publish {
         Publish::Replace => parent.rename_replace(&temp, parent, name),
         Publish::NoReplace => parent.rename_no_replace(&temp, parent, name),
     };
@@ -723,6 +779,91 @@ mod tests {
             operation_id: OperationId::new("op1"),
             existing: flux_fs::ExistingPolicy::Overwrite,
         }
+    }
+
+    fn stage_hello(fs: &FaultFs, root: &<FaultFs as DestinationRoot>::Dir) -> Staged {
+        match stage_file(
+            fs,
+            Path::new("/src"),
+            root,
+            OsStr::new("dst"),
+            &opts(),
+            &unguarded,
+            &no_heartbeat,
+            &no_before_create,
+        ) {
+            Ok(Stage::Staged(s)) => s,
+            Ok(Stage::Skipped(_)) => panic!("unexpectedly skipped"),
+            Err(e) => panic!("stage_file failed: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn stage_file_leaves_a_closed_temporary_and_no_target() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        let root = fs.destination_root(Path::new("/")).unwrap();
+        let staged = stage_hello(&fs, &root);
+
+        assert_eq!(staged.bytes_copied, 5);
+        assert_eq!(staged.temp, OsString::from("dst.flux-partial.op1"));
+        assert!(
+            fs.calls().iter().any(|c| c.starts_with("create_new(/dst.flux-partial.op1)")),
+            "{:?}",
+            fs.calls()
+        );
+        assert!(!fs.called("rename_"), "{:?}", fs.calls());
+        assert_eq!(fs.read_file("/dst.flux-partial.op1").as_deref(), Some(&b"hello"[..]));
+        assert!(!fs.exists("/dst"));
+    }
+
+    #[test]
+    fn publish_staged_renames_and_reports_the_outcome() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        let root = fs.destination_root(Path::new("/")).unwrap();
+        let staged = stage_hello(&fs, &root);
+        let identity = staged.identity;
+        let out = publish_staged(
+            &root,
+            OsStr::new("dst"),
+            staged,
+            Publish::NoReplace,
+            &unguarded,
+            &no_heartbeat,
+        )
+        .unwrap();
+
+        assert_eq!(fs.read_file("/dst").as_deref(), Some(&b"hello"[..]));
+        assert!(!fs.exists("/dst.flux-partial.op1"));
+        assert_eq!(out.published_identity, identity);
+        assert_eq!(out.bytes_copied, 5);
+        assert!(!out.skipped);
+        assert!(fs.called("rename_no_replace"), "{:?}", fs.calls());
+    }
+
+    #[test]
+    fn publish_staged_with_a_lost_guard_keeps_the_temporary_as_leftover() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        let root = fs.destination_root(Path::new("/")).unwrap();
+        let staged = stage_hello(&fs, &root);
+        let e = publish_staged(
+            &root,
+            OsStr::new("dst"),
+            staged,
+            Publish::Replace,
+            &lost,
+            &no_heartbeat,
+        )
+        .unwrap_err();
+
+        assert_eq!((e.code(), e.step), (Code::TargetLockBusy, CopyStep::Publish));
+        let (left, _) = e.leftover.as_ref().expect("the kept temporary is reported");
+        assert_eq!(left, Path::new("dst.flux-partial.op1"));
+        assert!(fs.exists("/dst.flux-partial.op1"), "nothing removed");
+        assert!(!fs.exists("/dst"));
+        assert!(!fs.called("rename_"), "{:?}", fs.calls());
     }
 
     #[test]
