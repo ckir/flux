@@ -49,24 +49,32 @@ is not the engine and the real gain is smaller (reads, renames and about 25 othe
 4. **Per-entry failure attribution.** The barrier returns one result per entry. An entry whose `sync_all` failed is reported
    `Code::StrictDurabilityUnavailable` at `CopyStep::Durability`, exactly the report step 5 gives today, and its temp is discarded. The other
    entries continue to `prepare_many` in the same flush. No note is written for a failed entry. **Order:** the failed entries are discarded
-   AFTER decision 5's post-barrier heartbeat and guard have passed, so every removal runs under a lock just checked. `discard` itself checks the
+   AFTER decision 5's heartbeat and guard have passed and BEFORE `prepare_many`, so every removal runs under a lock just checked. `discard` itself checks the
    guard first and keeps the temp as a leftover if the lock is gone (`copy.rs:216`); a loss between that check and the discard is the 9d
    hardening debt (a lost lock noticed only inside a cleanup `discard`), not new here.
-5. **An extra heartbeat and guard after the barrier.** The barrier can take seconds, so `flush_batch` runs one more heartbeat and guard after
-   it, before anything is written or removed. The two outcomes are the 9d step-1 ones and must not be conflated: a **failed heartbeat** (the lock
-   is still held) removes every temp of the batch, guarded, and reports any that stays as a leftover; a **lost lock** (the guard) writes and
-   removes nothing: entry 0's temp rides in the error and the rest are reported through `on_report` (9d plan ruling 2).
-   This adds one heartbeat and one guard call per flush and shifts every Strict stall index of the end-to-end tests; the plan re-derives them as 9d did.
+5. **The barrier runs BEFORE the existing step-4.1 heartbeat and guard.** `flush_batch` today begins with a heartbeat and a guard
+   (`tree.rs` ~1367, "4.1") and then `prepare_many`. 9e inserts the barrier ahead of that pair, so the existing pair becomes the post-barrier
+   check: **no heartbeat or guard call is added, and the Strict stall indices of the end-to-end tests do not move** (the stall hook counts
+   guard calls; the heartbeats during the wait are not counted; the plan verifies the claim by running the 9d stall tests unchanged). Syncing
+   the temps writes nothing new to the destination (their data was written at staging), so it needs no lock; every removal and write still runs
+   after the guard. The two outcomes of the pair are the 9d ones and must not be conflated: a **failed heartbeat** (the lock is still held)
+   removes every temp of the batch, failed-sync entries included, guarded, and reports any that stays as a leftover; a **lost lock** (the guard)
+   writes and removes nothing: entry 0's temp rides in the error and the rest, failed-sync entries included, are reported through `on_report`
+   (9d plan ruling 2). **Order after the pair passes:** (a) discard the failed-sync entries' temps, (b) `prepare_many` for the entries that
+   synced, (c) the renames, (d) the one `apply_recovery`. Discards come before the notes so that notes exist only for entries that continue; a
+   crash between (a) and (b) leaves removed or unsynced temps with no note, which the resume sweep removes like any leftover.
 6. **Metadata before the barrier.** Times and permissions (step 6) are applied to the handle before it is synced, so the barrier also makes
    them durable. This is strictly stronger than today (metadata applied after the sync, never synced), costs nothing, and removes an order
    dependency between the old step 5 and 6. If the plan finds a test that pins the old order, the test is re-derived, not the order kept.
    **The writers are closed right after the barrier:** `Staged` has no writer today (9d drops it inside `stage_file`, `copy.rs:462`); 9e adds
    `Staged.writer`, and `flush_batch` takes every one out and drops it (on every exit path, including a failed heartbeat or a lost lock) before
-   `prepare_many` and before any rename, so the descriptor lifetime ends where the 9d staging ended it, one step later. A rename or an unlink of a file with an
+   `prepare_many` and before any rename, so the descriptor lifetime ends where the 9d staging ended it, one step later. When the heartbeat
+   fails during the wait the workers are joined first (the scope borrows the writers, so they cannot be dropped earlier), then the writers are
+   dropped. A rename or an unlink of a file with an
    open handle fails or misbehaves on Windows, which the Windows CI would surface and no Linux test can. Closing a descriptor here is not a
    mutation in the section 99 sense: the barrier has just synced every successful entry, so nothing of theirs is dirty and the close writes
-   nothing (a failed-sync entry is discarded, and its dirty data is of no interest); the close therefore precedes the post-barrier guard
-   without contradicting decision 5.
+   nothing (a failed-sync entry is discarded, and its dirty data is of no interest); the close therefore precedes decision 5's
+   heartbeat and guard without contradicting it.
 7. **Open-writer budget.** A pending entry now holds a descriptor. A directory frame holds at most 64 entries, but the walker's stack holds
    several frames. `OPEN_WRITERS_MAX = 256` run-wide, **lowered at startup to a quarter of the soft `RLIMIT_NOFILE`** where the platform has one (the walker's
    directory handles, `state.db` and the lock hold descriptors of their own, so a cap equal to the limit would be unsafe; 256 is the ceiling,
@@ -88,7 +96,9 @@ is not the engine and the real gain is smaller (reads, renames and about 25 othe
 - `copy.rs`: `stage_file` takes a `defer_sync: bool` (or an options field); `Staged` gains `writer: Option<F::Writer>`; a new
   `sync_staged_many(entries, threads) -> Vec<Result<()>>`.
 - `tree.rs`: `BatchPolicy` gains `sync_threads: usize` and `open_writers: usize`; `Shared` counts open writers; `flush_batch` gains the
-  barrier step and the post-barrier beat and guard.
+  barrier step ahead of the existing beat and guard (decision 5), the discard-before-`prepare_many` order, and two counters in the outcome:
+  `barrier_max` (the longest barrier) and `cap_flushes` (flushes forced by the open-writer cap), which the acceptance run reads and the plan
+  surfaces through the lightest existing channel.
 - Constants `SYNC_THREADS = 16`, `OPEN_WRITERS_MAX = 256`.
 
 ## Behaviour that does not change
@@ -105,10 +115,13 @@ flush trigger of 9d, and the order data -> note -> rename.
   thread only.
 - **Heartbeat failure after the barrier:** every temp removed, none left, no note. **Lost lock after the barrier:** every temp kept as a
   leftover, no note, nothing removed. Each is red under ITS OWN mutant, because the "skip the barrier" mutant leaves both green (the post-barrier
-  check still fails and still leaves the temps): drop the post-barrier guard (the lost-lock test then renames and notes); treat a failed
+  check still fails and still leaves the temps): drop the heartbeat/guard pair (or move the barrier after it) (the lost-lock test then renames and notes); treat a failed
   heartbeat like a lost lock (the heartbeat test then leaves temps behind).
 - **Deadline:** a fake whose workers each finish just inside `heartbeat_interval` still sees the heartbeat called once the interval has passed
   in total (mutant: a fresh full timeout per receive).
+- **Mutants for the rest:** writers closed: keep the writers until after `prepare_many`; lease: drop the heartbeat from the wait loop;
+  equivalence: lose or reorder one entry's result; cap: ignore `open_writers`; thread safety is carried by the `Writer: Sync` bound at compile
+  time (no runtime mutant); the re-derived 9d tests are oracles, not new tests.
 - **Writers closed:** after the barrier and before `prepare_many`, no writer of the batch is alive (observed through the fake), on the success
   path and on both failure paths.
 - **Equivalence:** the same tree under `sync_threads` 1 and 16 produces the same outcome set, claims and counters.
@@ -129,7 +142,8 @@ pre-9d (`49fabc4`), the merged 9d head, and 9e. Absolute times drift between ses
 2026-10-10 runs, ratio unchanged), so a gate is a ratio taken inside one session, never against a figure from an earlier one. Gates:
 
 - Strict small and flat5000: at least 50% faster than the 9d median of the same session (the spike projects about 74% below the pre-9d median).
-- Syncs per file stay at most 1.15 (the barrier changes when they happen, not how many).
+- Syncs per file stay at most 1.15 AND at least 0.99 (the barrier changes when they happen, not how many; a lower bound so that a mutant that
+  skips the barrier cannot pass on zero syncs). The order test and the crash tests carry the durability claim; the speed gate does not.
 - Normal unchanged within the baseline spread; Strict large and mixed not worse than their spread; peak RSS within 2 MiB of the 9d figure.
 - Reported, not gated: nested 500x10, one file per directory (no benefit by design), a run with a background writer.
 If a gate fails the PR states it, as PR #82 did; thresholds are not moved.
@@ -144,6 +158,8 @@ If a gate fails the PR states it, as PR #82 did; thresholds are not moved.
 3. A shallow pending batch still waits while a subtree is walked (9d limit 5), now holding descriptors; the cap in decision 7 bounds that.
 4. The gain is measured on Linux ext4 only.
 5. One file per directory gets no benefit (9d limit 1).
+7. A `sync_all` that hangs (a dead network mount) hangs the run exactly as today's inline sync does: the system call is not cancellable. The
+   main thread keeps the heartbeat going during the wait, so the lease stays alive; no timeout or cancel is built, and none is claimed.
 6. The heartbeat is itself a synced write (`lock/held.rs:48`), so on a filesystem where a burst of concurrent `fsync` calls holds the journal, the
    heartbeat can queue behind the barrier and arrive late. Today's per-file `fsync` has the same exposure at a smaller scale. Not measured here:
    the acceptance run records the longest barrier and the longest heartbeat gap, and reports them.
