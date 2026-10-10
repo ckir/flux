@@ -4,8 +4,9 @@
 //! Design authority: `docs/superpowers/specs/2026-09-26-cut-4b-copy-tree-design.md`.
 
 use crate::copy::{
-    BeforePublish, CopyError, CopyStep, Guard, Heartbeat, PublishIntent, copy_file_guarded,
-    no_before_create, no_before_publish, no_heartbeat, split_destination, unguarded, weaker,
+    BeforeCreate, BeforePublish, CopyError, CopyStep, Guard, Heartbeat, PublishIntent, Stage,
+    Staged, copy_file_guarded, discard, no_before_create, no_before_publish, no_heartbeat,
+    publish_staged, split_destination, stage_file, unguarded, weaker,
 };
 use crate::names::{NameIndex, Resolved};
 use crate::state::{FLUX_DIR, RESERVED_DIRS, identity_text, native_hex};
@@ -14,7 +15,7 @@ use flux_fs::{
     ClaimKey, ClaimOutcome, ClaimRecord, ClaimStatus, ClaimStore, Code, CopyOptions,
     DestinationRoot, DirHandle, Durability, ExistingPolicy, FileIdentity, FileSystem, FileType,
     FluxPathKey, FsError, Metadata, MetadataFailure, MountRoot, ObjectId, PreparedRecord, Preserve,
-    Publish, Safety,
+    Publish, RecoveryOp, Safety,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
@@ -249,6 +250,8 @@ enum Frame<D> {
         /// two source names is then refused by that rename (`AlreadyExists`, a collision), whether or not the first
         /// target's claim was recorded.
         fresh: bool,
+        /// Cut 9d: the files staged in `dir` and not yet published, flushed through `dir` before it is dropped.
+        batch: Batch,
     },
     /// Its directory failed; everything below it is skipped, and was reported once.
     Skipped,
@@ -326,6 +329,73 @@ pub(crate) struct Shared<'c, F: DestinationRoot> {
     pub(crate) claims: Option<&'c std::cell::RefCell<<F::Dir as DirHandle>::Claims>>,
     /// Cut 9a: `--resume`: an own `Created` claim may skip its target.
     pub(crate) resume: bool,
+    /// Cut 9d: when a Strict tree's per-directory batch flushes.
+    pub(crate) batch: BatchPolicy,
+}
+
+/// Cut 9d (spec decision 5): a batch flushes at this many staged files...
+pub(crate) const BATCH_FILES: usize = 64;
+/// ...or this many staged source bytes (section 148.3's threshold); a file at least this long is staged alone...
+pub(crate) const BATCH_BYTES: u64 = 64 << 20;
+/// ...or when, at the next staging, the batch is at least this old.
+pub(crate) const BATCH_AGE: std::time::Duration = std::time::Duration::from_secs(1);
+/// `BatchPolicy::DEFAULT.files`: batching is on. (1 would be the unbatched cut 9c path, plan ruling 1; tests reach it
+/// with an explicit policy.)
+const DEFAULT_FILES: usize = BATCH_FILES;
+
+/// Cut 9d: the flush thresholds of a Strict tree's per-directory batch, and the clock the age is read from. Carried in
+/// `Shared` so tests inject small thresholds and a fake clock (plan ruling 4). `files == 1` never batches.
+#[derive(Clone, Copy)]
+pub(crate) struct BatchPolicy {
+    pub files: usize,
+    pub bytes: u64,
+    pub age: std::time::Duration,
+    pub now: fn() -> std::time::Instant,
+    /// Decision 6's ASCII fold pre-check; a test turns it off so the fake's ASCII fold reaches the temporary probe.
+    pub fold_precheck: bool,
+}
+
+impl BatchPolicy {
+    pub(crate) const DEFAULT: BatchPolicy = BatchPolicy {
+        files: DEFAULT_FILES,
+        bytes: BATCH_BYTES,
+        age: BATCH_AGE,
+        now: std::time::Instant::now,
+        fold_precheck: true,
+    };
+}
+
+/// Cut 9d: one staged file waiting in its directory's batch for the flush that notes and publishes it.
+struct Pending {
+    /// Relative to the source root, as the walk reports it.
+    path: PathBuf,
+    /// The planned name, the rename's destination.
+    name: OsString,
+    /// The note's and the claim's key: the planned name for a new file, the stored name for a replacement.
+    key: ClaimKey,
+    /// A case-variant replacement's second claim key, on the planned name (as `commit_prepared`'s `planned`).
+    planned: Option<ClaimKey>,
+    /// The note without the temporary's name and identity (`write_note`'s template).
+    template: PreparedRecord,
+    staged: Staged,
+    target: FluxPathKey,
+    /// `Plan::Replace`'s `stored` and `meta`; `None` for a new file.
+    replaced: Option<(OsString, Metadata)>,
+}
+
+/// Cut 9d: a directory's staged files (spec decision 3), the staged source bytes, when the first was staged, and the
+/// ASCII-folded names of the pending entries (decision 6).
+#[derive(Default)]
+struct Batch {
+    pending: Vec<Pending>,
+    bytes: u64,
+    since: Option<std::time::Instant>,
+    folded: HashSet<Vec<u8>>,
+}
+
+/// Decision 6's fold: ASCII lowercase of the name's encoded bytes, the fold `reserved_path` compares with.
+fn folded(name: &std::ffi::OsStr) -> Vec<u8> {
+    name.as_encoded_bytes().to_ascii_lowercase()
 }
 
 /// `copy_tree`'s body. Every `?` here is an abort; `copy_tree` pairs it with `out`,
@@ -387,6 +457,7 @@ fn run_tree<F: DestinationRoot>(
         beat: &no_heartbeat,
         claims: None,
         resume: false,
+        batch: BatchPolicy::DEFAULT,
     };
     copy_tree_at(&cx, source.events, root, false, out, on_report).1
 }
@@ -444,8 +515,13 @@ pub(crate) fn copy_tree_at<F: DestinationRoot>(
         names,
         claim_parent,
         fresh: root_created,
+        batch: Batch::default(),
     }];
     let walked = walk_into(cx, events, root_identity, &mut stack, out, on_report);
+    // Cut 9d, spec decision 5(e): every live frame's batch is flushed whatever the walk returned; the walk's own error
+    // wins over a stop of the drain.
+    let drained = drain_batches(cx, &mut stack, out, on_report, walked.is_err());
+    let walked = walked.and(drained);
     // The walk emits no `Dir` for the root, so no `DirEnd` pops it, and a frame is skipped only when pushed.
     match stack.into_iter().next() {
         Some(Frame::Live { dir, .. }) => (dir, walked),
@@ -486,6 +562,15 @@ fn walk_into<F: DestinationRoot>(
                     report(out, on_report, path.clone(), conflict);
                     Frame::Skipped
                 } else {
+                    // Cut 9d (decision 6, ASCII fold): a pending file whose name this directory's folds onto publishes
+                    // first, so the directory meets it as an unbatched copy's would, instead of winning the name.
+                    if let Some(Frame::Live { dir, names, batch, .. }) = stack.last_mut()
+                        && !batch.pending.is_empty()
+                        && let Some(name) = path.file_name()
+                        && batch.folded.contains(&folded(name))
+                    {
+                        flush_batch(cx, dir, names, batch, out, on_report)?;
+                    }
                     // §101, then §99, before the directory's creation.
                     (cx.beat)().map_err(|e| CopyError::at(CopyStep::Heartbeat, e))?;
                     (cx.guard)().map_err(|e| CopyError::at(CopyStep::Create, e))?;
@@ -505,13 +590,24 @@ fn walk_into<F: DestinationRoot>(
             }
             WalkEvent::File { path } => {
                 out.files_total += 1;
-                if let Some(Frame::Live { dir, names, claim_parent, fresh, .. }) = stack.last_mut()
+                if let Some(Frame::Live { dir, names, claim_parent, fresh, batch, .. }) =
+                    stack.last_mut()
                 {
                     if reserved_path(&path) {
                         let conflict = CopyError::at(CopyStep::Gate, reserved_conflict());
                         report(out, on_report, path, TreeFailureCause::Copy(conflict));
                     } else {
-                        copy_one(cx, dir, names, *claim_parent, *fresh, path, out, on_report)?;
+                        copy_one(
+                            cx,
+                            dir,
+                            names,
+                            batch,
+                            *claim_parent,
+                            *fresh,
+                            path,
+                            out,
+                            on_report,
+                        )?;
                     }
                 }
             }
@@ -530,16 +626,22 @@ fn walk_into<F: DestinationRoot>(
             WalkEvent::DirEnd { path } => {
                 // Cut 8b, "Claim syncing": a directory that keyed claims is flushed at its end. A synced commit is a
                 // write under DEST, so §101 and §99 come first, as before a directory's creation. A skipped
-                // directory flushed nothing.
-                if let Some(Frame::Live { claim_parent: Some(_), .. }) = stack.pop()
-                    && let Some(claims) = cx.claims
+                // directory flushed nothing. Cut 9d, spec decision 5(c): the popped frame's batch is published first,
+                // through the frame's own handle, which drops only after both.
+                if let Some(Frame::Live { dir, mut names, mut batch, claim_parent, .. }) =
+                    stack.pop()
                 {
-                    (cx.beat)().map_err(|e| CopyError::at(CopyStep::Heartbeat, e))?;
-                    (cx.guard)().map_err(|e| CopyError::at(CopyStep::Create, e))?;
-                    // Held in a local so the `RefMut` is dropped before the report callback runs.
-                    let r = claims.borrow_mut().flush();
-                    if let Err(e) = r {
-                        report(out, on_report, path, TreeFailureCause::ClaimNotRecorded(e));
+                    flush_batch(cx, &dir, &mut names, &mut batch, out, on_report)?;
+                    if claim_parent.is_some()
+                        && let Some(claims) = cx.claims
+                    {
+                        (cx.beat)().map_err(|e| CopyError::at(CopyStep::Heartbeat, e))?;
+                        (cx.guard)().map_err(|e| CopyError::at(CopyStep::Create, e))?;
+                        // Held in a local so the `RefMut` is dropped before the report callback runs.
+                        let r = claims.borrow_mut().flush();
+                        if let Err(e) = r {
+                            report(out, on_report, path, TreeFailureCause::ClaimNotRecorded(e));
+                        }
                     }
                 }
             }
@@ -734,6 +836,7 @@ fn enter_dir<D: DirHandle>(
         names,
         claim_parent,
         fresh: !pre_existing,
+        batch: Batch::default(),
     })
 }
 
@@ -782,6 +885,7 @@ fn copy_one<F: DestinationRoot>(
     cx: &Shared<'_, F>,
     parent: &F::Dir,
     names: &mut NameIndex,
+    batch: &mut Batch,
     claim_parent: Option<ObjectId>,
     fresh: bool,
     path: PathBuf,
@@ -824,6 +928,22 @@ fn copy_one<F: DestinationRoot>(
             return Ok(());
         }
     };
+
+    // Cut 9d, spec decision 2: a Strict publication into a store with notes is staged into the directory's batch, unless
+    // the policy turns batching off (plan ruling 1: `files == 1` is the per-file cut 9c path below).
+    let batching = cx.batch.files > 1
+        && cx.opts.durability == Durability::Strict
+        && claims.borrow().supports_prepared();
+    // Decisions 5(d) and 5(f): a batch older than the age, or a pending name this one folds onto, publishes first, so
+    // the resolution below sees what an unbatched copy would.
+    if batching && !batch.pending.is_empty() {
+        let aged = batch
+            .since
+            .is_some_and(|t| (cx.batch.now)().saturating_duration_since(t) >= cx.batch.age);
+        if aged || (cx.batch.fold_precheck && batch.folded.contains(&folded(name))) {
+            flush_batch(cx, parent, names, batch, out, on_report)?;
+        }
+    }
 
     // 1-2. Resolve the planned name to the entry it denotes.
     // A directory this run created plans every target as new (plan decision 6).
@@ -973,6 +1093,24 @@ fn copy_one<F: DestinationRoot>(
                 planned_name: Vec::new(),
                 replacement: false,
             };
+            if batching {
+                let pending = |path, staged| Pending {
+                    path,
+                    name: name_owned.clone(),
+                    key,
+                    planned: None,
+                    template,
+                    staged,
+                    target,
+                    replaced: None,
+                };
+                let publish = Publish::NoReplace;
+                let no_claim: &BeforeCreate<'_> = &no_before_create;
+                return stage_into_batch(
+                    cx, parent, names, batch, &src, path, publish, no_claim, out, on_report,
+                    pending,
+                );
+            }
             let hook = |intent: &PublishIntent| write_note(claims, &key, &template, &wrote, intent);
             let before_publish: &BeforePublish<'_> =
                 if strict { &hook } else { &no_before_publish };
@@ -1046,6 +1184,32 @@ fn copy_one<F: DestinationRoot>(
                 },
                 replacement: true,
             };
+            if batching {
+                let planned = (name != stored).then(|| ClaimKey::new(parent_id, name));
+                let pending = |path, staged| Pending {
+                    path,
+                    name: name_owned.clone(),
+                    key: key_stored.clone(),
+                    planned,
+                    template,
+                    staged,
+                    target: target.clone(),
+                    replaced: Some((stored.clone(), meta.clone())),
+                };
+                return stage_into_batch(
+                    cx,
+                    parent,
+                    names,
+                    batch,
+                    &src,
+                    path,
+                    Publish::Replace,
+                    &before_create,
+                    out,
+                    on_report,
+                    pending,
+                );
+            }
             let hook =
                 |intent: &PublishIntent| write_note(claims, &key_stored, &template, &wrote, intent);
             let before_publish: &BeforePublish<'_> =
@@ -1102,6 +1266,345 @@ fn copy_one<F: DestinationRoot>(
             Ok(())
         }
     }
+}
+
+/// Cut 9d: `copy_one` for a batching target, after its plan: stage it into `batch` (spec decision 3), flushing first
+/// when it is itself at least `bytes` long (decision 5(b)) and after it when the batch reaches `files` or `bytes`
+/// (5(a)). An exclusive create refused with `AlreadyExists` while entries are pending flushes them and stages ONCE more
+/// (decision 6's backstop). `pending` completes the entry from its path and its staged temporary.
+// One input per piece of frame state the protocol reads, as `copy_one`.
+#[allow(clippy::too_many_arguments)]
+fn stage_into_batch<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    parent: &F::Dir,
+    names: &mut NameIndex,
+    batch: &mut Batch,
+    src: &Path,
+    path: PathBuf,
+    publish: Publish,
+    before_create: &BeforeCreate<'_>,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+    pending: impl FnOnce(PathBuf, Staged) -> Pending,
+) -> std::result::Result<(), CopyError> {
+    // Decision 6: anything at this entry's temporary name (on a folding destination, a pending sibling's temporary,
+    // which `stage_file`'s step-1 sweep would delete) publishes the pending entries first.
+    if !batch.pending.is_empty() {
+        let name = path.file_name().expect("a walk path ends in a name");
+        let temp = flux_fs::temp_path(Path::new(name), &cx.opts.operation_id);
+        if parent.metadata(temp.as_os_str()).is_ok() {
+            flush_batch(cx, parent, names, batch, out, on_report)?;
+        }
+    }
+    // 5(b). The stat is paid only when something is pending.
+    if !batch.pending.is_empty() {
+        let len = match cx.fs.metadata(src) {
+            Ok(m) => m.len,
+            Err(e) => {
+                let cause = TreeFailureCause::Copy(CopyError::at(CopyStep::Source, e));
+                report(out, on_report, path, cause);
+                return Ok(());
+            }
+        };
+        if len >= cx.batch.bytes {
+            flush_batch(cx, parent, names, batch, out, on_report)?;
+        }
+    }
+    let name = path.file_name().expect("a walk path ends in a name");
+    let opts = CopyOptions { existing: ExistingPolicy::Overwrite, publish, ..cx.opts.clone() };
+    let stage = || stage_file(cx.fs, src, parent, name, &opts, cx.guard, cx.beat, before_create);
+    let staged = match stage() {
+        Err(e)
+            if e.step == CopyStep::Create
+                && e.cause.source.kind() == ErrorKind::AlreadyExists
+                && !batch.pending.is_empty() =>
+        {
+            flush_batch(cx, parent, names, batch, out, on_report)?;
+            stage()
+        }
+        staged => staged,
+    };
+    match staged {
+        Ok(Stage::Staged(s)) => {
+            batch.bytes += s.bytes_copied;
+            batch.since.get_or_insert((cx.batch.now)());
+            batch.folded.insert(folded(name));
+            batch.pending.push(pending(path, s));
+        }
+        Ok(Stage::Skipped(_)) => {
+            unreachable!("the tree stages with ExistingPolicy::Overwrite, which never skips")
+        }
+        // No note exists yet, and `stage_file` already removed its temporary: nothing else to undo.
+        Err(e) => return finish_copy(path, Err(e), out, on_report),
+    }
+    if batch.pending.len() >= cx.batch.files || batch.bytes >= cx.batch.bytes {
+        flush_batch(cx, parent, names, batch, out, on_report)?;
+    }
+    Ok(())
+}
+
+/// Cut 9d, spec decision 4: publish `batch` through `parent`, its directory, and reset it. One `prepare_many` for every
+/// note, each entry's rename in order (counted at once, decision 4.6), then one `apply_recovery` committing the renamed
+/// and discarding the failed. A per-entry failure is reported and the rest go on (decision 7's per-file fallbacks).
+/// `Err` only for a stop (decision 8): the opening heartbeat or guard failing; a lost lock at a publish (STOP-LOST:
+/// nothing more is written or removed); a heartbeat failure or a missing primitive at a publish with the lock still
+/// held (STOP-HELD: the renamed are committed, the rest discarded).
+fn flush_batch<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    parent: &F::Dir,
+    names: &mut NameIndex,
+    batch: &mut Batch,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) -> std::result::Result<(), CopyError> {
+    let entries = std::mem::take(batch).pending;
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let Some(claims) = cx.claims else {
+        unreachable!("only a copy with a claim store stages a batch");
+    };
+    // 4.1: sections 101 and 99, as before any synced write under DEST. No note exists yet.
+    if let Err(e) = (cx.beat)() {
+        // The lock is held: every temporary is removed (guarded); one that stays is reported as a leftover.
+        for p in entries {
+            let source = copy_of(&e).source;
+            let failed =
+                discard(parent, &p.staged.temp, CopyStep::Heartbeat, e.code, source, cx.guard);
+            if failed.leftover.is_some() {
+                report_leftover(p.path, failed, out, on_report);
+            }
+        }
+        return Err(CopyError::at(CopyStep::Heartbeat, e));
+    }
+    if let Err(lost) = (cx.guard)() {
+        // Nothing is written or removed: entry 0's temporary rides in the returned error, the others' are reported
+        // (plan ruling 2).
+        let mut rest = entries.into_iter();
+        let p0 = rest.next().expect("the batch is not empty");
+        for p in rest {
+            report_kept(p.path, &p.staged.temp, &lost, out, on_report);
+        }
+        return Err(kept(&p0.path, &p0.staged.temp, lost));
+    }
+    // 4.2: every note in ONE transaction, each built as `write_note` builds it.
+    let notes: Vec<(ClaimKey, PreparedRecord)> = entries
+        .iter()
+        .map(|p| {
+            let record = PreparedRecord {
+                temp_name: p.staged.temp.as_encoded_bytes().to_vec(),
+                identity: identity_text(p.staged.identity),
+                ..p.template.clone()
+            };
+            (p.key.clone(), record)
+        })
+        .collect();
+    // Held in a local so the `RefMut` is dropped before any report callback runs.
+    let prepared = claims.borrow_mut().prepare_many(&notes);
+    let entries = match prepared {
+        Ok(()) => entries,
+        // Decision 7: all-or-nothing, so no note was written. Each entry is noted on its own, so a store error fails only
+        // the files it hits: such an entry's temporary is removed and it is reported at the claim step, as when
+        // `write_note` fails; the others go on.
+        Err(_) => {
+            let mut noted = Vec::with_capacity(entries.len());
+            let mut rest = entries.into_iter().zip(&notes);
+            while let Some((p, (key, record))) = rest.next() {
+                let r = claims.borrow_mut().prepare(key, record);
+                match r {
+                    Ok(()) => noted.push(p),
+                    Err(e) => {
+                        let failed = discard(
+                            parent,
+                            &p.staged.temp,
+                            CopyStep::Claim,
+                            e.code,
+                            e.source,
+                            cx.guard,
+                        );
+                        // A stop (an error carrying `TargetLockBusy`) drops no entry: as at STOP-LOST, the noted keep
+                        // their notes and temporaries, the rest their temporaries, each reported (plan ruling 2).
+                        if let Err(stop) = finish_copy(p.path, Err(failed), out, on_report) {
+                            for q in noted.into_iter().chain(rest.map(|(q, _)| q)) {
+                                report_kept(q.path, &q.staged.temp, &stop.cause, out, on_report);
+                            }
+                            return Err(stop);
+                        }
+                    }
+                }
+            }
+            noted
+        }
+    };
+    // 4.3-4.6. `paths[i]` is the entry `ops[i]` settles, for the per-op fallback's report.
+    let mut ops = Vec::with_capacity(entries.len());
+    let mut paths = Vec::with_capacity(entries.len());
+    let mut rest = entries.into_iter();
+    while let Some(p) = rest.next() {
+        let Pending { path, name, key, planned, template: _, staged, target, replaced } = p;
+        let publish = if replaced.is_some() { Publish::Replace } else { Publish::NoReplace };
+        match publish_staged(parent, &name, staged, publish, cx.guard, cx.beat) {
+            Ok(o) => {
+                let identity = o.published_identity;
+                // Counted at the rename, before any later entry is tried (decision 4.6). Never `Err` for an `Ok`.
+                finish_copy(path.clone(), Ok(o), out, on_report)?;
+                match &replaced {
+                    None => names.record_publication(&target, None, &name, None, identity),
+                    Some((stored, meta)) => {
+                        out.files_overwritten += 1;
+                        let replaced_id = match meta.identity {
+                            FileIdentity::Strong(id) => Some(id),
+                            _ => None,
+                        };
+                        names.record_publication(
+                            &target,
+                            Some(stored.as_os_str()),
+                            &name,
+                            replaced_id,
+                            identity,
+                        );
+                    }
+                }
+                ops.push(RecoveryOp::Commit { key, target, planned });
+                paths.push(path);
+            }
+            Err(e) => {
+                // `finish_copy` classifies (one place): `Ok` is a failure of this entry alone, already reported.
+                let Err(stop) = finish_copy(path.clone(), Err(e), out, on_report) else {
+                    ops.push(RecoveryOp::Discard { key });
+                    paths.push(path);
+                    continue;
+                };
+                if stop.code() == Code::TargetLockBusy {
+                    // STOP-LOST: write and remove nothing more. The renamed keep their notes (no `apply_recovery`),
+                    // this entry's temporary rides in `stop`, the later ones' are reported (plan ruling 2).
+                    for q in rest {
+                        report_kept(q.path, &q.staged.temp, &stop.cause, out, on_report);
+                    }
+                    return Err(stop);
+                }
+                // STOP-HELD: this entry's temporary is already discarded; every later one is removed BEFORE the
+                // transaction that discards the notes (a crash in between leaves notes with no temporary, which
+                // recovery classifies GONE; the reverse order could orphan temporaries). Best effort: a failed
+                // `apply_recovery` leaves the notes to recovery at `--resume`.
+                ops.push(RecoveryOp::Discard { key });
+                for q in rest {
+                    let source = copy_of(&stop.cause).source;
+                    let failed =
+                        discard(parent, &q.staged.temp, stop.step, stop.code(), source, cx.guard);
+                    if failed.leftover.is_some() {
+                        report_leftover(q.path, failed, out, on_report);
+                    }
+                    ops.push(RecoveryOp::Discard { key: q.key });
+                }
+                let _ = claims.borrow_mut().apply_recovery(&ops);
+                return Err(stop);
+            }
+        }
+    }
+    // 4.4-4.5: one transaction settles the batch, skipped only when it would carry no op.
+    if !ops.is_empty() {
+        let settled = claims.borrow_mut().apply_recovery(&ops);
+        if settled.is_err() {
+            // Decision 7: nothing changed, so each op is retried on its own. A commit that fails is reported at its
+            // entry, its note left for recovery; a discard is best effort.
+            for (op, path) in ops.iter().zip(paths) {
+                match op {
+                    RecoveryOp::Commit { key, target, planned } => {
+                        let r = claims.borrow_mut().commit_prepared(key, target, planned.as_ref());
+                        if let Err(e) = r {
+                            report(out, on_report, path, TreeFailureCause::ClaimNotRecorded(e));
+                        }
+                    }
+                    RecoveryOp::Discard { key } => {
+                        let _ = claims.borrow_mut().discard_prepared(key);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Plan ruling 2: `cause`, with the entry's temporary kept as the leftover (relative to DEST, as `finish_copy` rebuilds
+/// it), at the publish step, the shape of `publish_staged`'s lost guard.
+fn kept(path: &Path, temp: &std::ffi::OsStr, cause: FsError) -> CopyError {
+    CopyError {
+        cause,
+        leftover: Some((
+            path.with_file_name(temp),
+            std::io::Error::other("kept: this run no longer holds the destination's lock"),
+        )),
+        step: CopyStep::Publish,
+    }
+}
+
+/// Plan ruling 2: an entry after the one a lost lock stopped at is reported as a `TargetLockBusy` copy failure whose
+/// leftover is its temporary. (`finish_copy` cannot report it: it returns a `TargetLockBusy` failure as a stop.)
+fn report_kept(
+    path: PathBuf,
+    temp: &std::ffi::OsStr,
+    lost: &FsError,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) {
+    let cause = FsError::new(
+        Code::TargetLockBusy,
+        std::io::Error::new(lost.source.kind(), lost.source.to_string()),
+    );
+    let e = kept(&path, temp, cause);
+    report(out, on_report, path, TreeFailureCause::Copy(e));
+}
+
+/// A temporary a stop's cleanup could not remove: reported with its leftover rebuilt relative to DEST, as
+/// `finish_copy` rebuilds one (which would return a stop's failure instead of reporting it).
+fn report_leftover(
+    path: PathBuf,
+    mut e: CopyError,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) {
+    if let Some((p, _)) = e.leftover.as_mut() {
+        *p = path.with_file_name(&*p);
+    }
+    report(out, on_report, path, TreeFailureCause::Copy(e));
+}
+
+/// Cut 9d, spec decision 5(e): flush every live frame's batch, from the top of the stack down, WITHOUT popping (the
+/// root frame goes back to `copy_tree_at`'s caller). The first stop is returned, unless the walk already failed or an
+/// earlier frame stopped: such a later stop is dropped (spec decision 8), or reported at its leftover's path when it
+/// carries one (plan ruling 2).
+fn drain_batches<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    stack: &mut [Frame<F::Dir>],
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+    walk_failed: bool,
+) -> std::result::Result<(), CopyError> {
+    let mut first: Option<CopyError> = None;
+    for frame in stack.iter_mut().rev() {
+        let Frame::Live { dir, names, batch, .. } = frame else {
+            continue;
+        };
+        if let Err(e) = flush_batch(cx, dir, names, batch, out, on_report) {
+            if walk_failed || first.is_some() {
+                // Spec decision 8: the stop is dropped (the returned error already says it), unless it carries a
+                // temporary, which must still reach the run as a leftover (plan ruling 2).
+                if let Some((path, _)) = &e.leftover {
+                    let path = path.clone();
+                    report(out, on_report, path, TreeFailureCause::Copy(e));
+                }
+            } else {
+                first = Some(e);
+            }
+        }
+    }
+    first.map_or(Ok(()), Err)
+}
+
+/// One store error, reported for several entries: `FsError` is not `Clone`, so its code, kind and message are copied.
+fn copy_of(e: &FsError) -> FsError {
+    FsError::new(e.code, std::io::Error::new(e.source.kind(), e.source.to_string()))
 }
 
 /// Cut 9c: `native_hex` of the entry's directory relative to DEST; empty for DEST itself (spec decision 5).
@@ -1366,6 +1869,7 @@ mod tests {
     use super::*;
     use crate::fault_fs::FaultFs;
     use flux_fs::{Code, Durability, FileSystem, ObjectId, OperationId, Preserve};
+    use std::ffi::OsStr;
 
     #[test]
     fn the_tally_counts_each_cause_in_its_own_field() {
@@ -2278,6 +2782,7 @@ mod tests {
             beat: &no_heartbeat,
             claims: None,
             resume: false,
+            batch: BatchPolicy { age: NO_AGE, ..BatchPolicy::DEFAULT },
         };
         let mut out = TreeOutcome::default();
         let (_root, r) = copy_tree_at(&cx, source.events, root, false, &mut out, &mut |_| {});
@@ -2352,6 +2857,7 @@ mod tests {
             beat: &beat,
             claims: None,
             resume: false,
+            batch: BatchPolicy { age: NO_AGE, ..BatchPolicy::DEFAULT },
         };
         let mut out = TreeOutcome::default();
         let mut reported = 0;
@@ -2389,6 +2895,7 @@ mod tests {
             beat: &beat,
             claims: None,
             resume: false,
+            batch: BatchPolicy { age: NO_AGE, ..BatchPolicy::DEFAULT },
         };
         let mut out = TreeOutcome::default();
         let mut reported = 0;
@@ -2416,6 +2923,7 @@ mod tests {
             beat: &no_heartbeat,
             claims: None,
             resume: false,
+            batch: BatchPolicy { age: NO_AGE, ..BatchPolicy::DEFAULT },
         };
         let mut out = TreeOutcome::default();
         let (back, r) = copy_tree_at(&cx, source.events, root, false, &mut out, &mut |_| {});
@@ -2442,5 +2950,897 @@ mod tests {
         assert!(!abort(Code::TargetLockBusy, |_| {}).refused_unchanged());
         assert!(!abort(Code::SafetyRejected, |o| o.files_copied = 1).refused_unchanged());
         assert!(!abort(Code::SafetyRejected, |o| o.failures.walk = 1).refused_unchanged());
+    }
+
+    // Cut 9d: the per-directory batch. Every test here passes its own policy (small thresholds, or `files == 1` for the
+    // unbatched path) rather than the default (64 files).
+
+    /// An age no test run reaches: a unit test that counts calls must not let the real clock (the default's `now`)
+    /// fire an age flush on a slow machine. Only `the_age_trigger_uses_the_injected_clock` tests the age.
+    const NO_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+    fn policy(files: usize) -> BatchPolicy {
+        BatchPolicy { files, age: NO_AGE, ..BatchPolicy::DEFAULT }
+    }
+
+    /// `/` and `/src` holding `entries` (paths relative to `/src`, parent directories made as needed). `/dst` absent.
+    fn sources(entries: &[(&str, &[u8])]) -> FaultFs {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/")).unwrap();
+        fs.create_dir(Path::new("/src")).unwrap();
+        for (rel, bytes) in entries {
+            let full = Path::new("/src").join(rel);
+            let parent = full.parent().unwrap();
+            if !fs.exists(parent) {
+                fs.create_dir(parent).unwrap();
+            }
+            fs.write_file(&full, bytes);
+        }
+        fs
+    }
+
+    /// `f0`..`f{n-1}` in `/src`, each holding its own name.
+    fn n_files(n: usize) -> FaultFs {
+        let names: Vec<String> = (0..n).map(|i| format!("f{i}")).collect();
+        let entries: Vec<(&str, &[u8])> =
+            names.iter().map(|n| (n.as_str(), n.as_bytes())).collect();
+        sources(&entries)
+    }
+
+    /// `copy_tree_at` from `/src` into a pre-made `/dst` with a claim store at `/dst/state.db`, both the copy and the
+    /// store at `durability`, under `policy` (the pattern of `run/tests.rs`'s `a_target_that_finds_its_own_claim_proceeds`).
+    fn batched(
+        fs: &FaultFs,
+        policy: BatchPolicy,
+        durability: Durability,
+    ) -> (std::result::Result<(), CopyError>, TreeOutcome, Vec<TreeFailure>) {
+        batched_with(fs, policy, durability, &unguarded, &no_heartbeat)
+    }
+
+    /// `batched` with the run's guard and heartbeat injected.
+    fn batched_with(
+        fs: &FaultFs,
+        policy: BatchPolicy,
+        durability: Durability,
+        guard: &Guard<'_>,
+        beat: &Heartbeat<'_>,
+    ) -> (std::result::Result<(), CopyError>, TreeOutcome, Vec<TreeFailure>) {
+        let source = prepare_source(fs, Path::new("/src"), Path::new("/dst")).unwrap();
+        fs.create_dir(Path::new("/dst")).unwrap();
+        let root = fs.destination_root(Path::new("/dst")).unwrap();
+        let store = root.create_claim_store(OsStr::new("state.db"), durability).unwrap();
+        let claims = std::cell::RefCell::new(store);
+        let mut o = opts();
+        o.durability = durability;
+        let cx = Shared {
+            fs,
+            src_root: Path::new("/src"),
+            src_identity: source.identity,
+            opts: &o,
+            guard,
+            beat,
+            claims: Some(&claims),
+            resume: false,
+            batch: policy,
+        };
+        let mut out = TreeOutcome::default();
+        let mut got = Vec::new();
+        let (_root, r) =
+            copy_tree_at(&cx, source.events, root, false, &mut out, &mut |f| got.push(f));
+        (r, out, got)
+    }
+
+    /// The call log with `/` separators.
+    fn log(fs: &FaultFs) -> Vec<String> {
+        fs.calls().into_iter().map(|c| c.replace('\\', "/")).collect()
+    }
+
+    fn count(c: &[String], prefix: &str) -> usize {
+        c.iter().filter(|x| x.starts_with(prefix)).count()
+    }
+
+    /// Every index of a call starting with `prefix`, in order.
+    fn positions(c: &[String], prefix: &str) -> Vec<usize> {
+        c.iter().enumerate().filter(|(_, x)| x.starts_with(prefix)).map(|(i, _)| i).collect()
+    }
+
+    fn first(c: &[String], prefix: &str) -> usize {
+        c.iter()
+            .position(|x| x.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no {prefix} in {c:?}"))
+    }
+
+    /// The first exclusive create of `rel`'s temporary under `/dst`.
+    fn created(c: &[String], rel: &str) -> usize {
+        first(c, &format!("create_new(/dst/{rel}.flux-partial.op1)"))
+    }
+
+    /// The publishing rename of `rel`'s temporary under `/dst`.
+    fn renamed(c: &[String], rel: &str) -> usize {
+        first(c, &format!("rename_no_replace(/dst/{rel}.flux-partial.op1 -> /dst/{rel})"))
+    }
+
+    /// The `prepare_many` calls, in order.
+    fn prepares(c: &[String]) -> Vec<&str> {
+        c.iter().filter(|x| x.starts_with("claim_prepare_many(")).map(String::as_str).collect()
+    }
+
+    fn strong_id(fs: &FaultFs, p: &str) -> ObjectId {
+        match identity_of(fs, p) {
+            FileIdentity::Strong(id) => id,
+            other => panic!("{p} is not strong: {other:?}"),
+        }
+    }
+
+    /// A report as `(path, what)`: `TreeFailure` has no `PartialEq`.
+    fn shape(got: &[TreeFailure]) -> Vec<(PathBuf, String)> {
+        got.iter()
+            .map(|f| {
+                let what = match &f.cause {
+                    TreeFailureCause::Copy(e) => format!("Copy {:?} at {:?}", e.code(), e.step),
+                    TreeFailureCause::ClaimNotRecorded(e) => {
+                        format!("ClaimNotRecorded {:?}", e.code)
+                    }
+                    other => format!("{other:?}"),
+                };
+                (f.path.clone(), what)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn n_files_in_one_directory_make_ceil_n_over_batch_calls() {
+        let fs = n_files(10);
+        let (r, out, got) = batched(&fs, policy(4), Durability::Strict);
+        r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        let c = log(&fs);
+        assert_eq!(count(&c, "claim_prepare_many("), 3, "{c:?}");
+        assert_eq!(count(&c, "claim_apply_recovery"), 3, "{c:?}");
+        assert_eq!(count(&c, "claim_prepare("), 0, "{c:?}");
+        assert_eq!(count(&c, "claim_commit_prepared("), 0, "{c:?}");
+        let dst = strong_id(&fs, "/dst");
+        for i in 0..10 {
+            let n = format!("f{i}");
+            assert_eq!(fs.read_file(format!("/dst/{n}")).as_deref(), Some(n.as_bytes()), "{n}");
+            assert_eq!(fs.claim(dst, &n).map(|r| r.status), Some(ClaimStatus::Created), "{n}");
+        }
+        assert_eq!(fs.prepared_count(), 0);
+        assert_eq!(out.files_copied, 10);
+    }
+
+    #[test]
+    fn the_boundary_of_a_batch() {
+        let fs = n_files(4);
+        batched(&fs, policy(4), Durability::Strict).0.unwrap();
+        let c = log(&fs);
+        assert_eq!(prepares(&c), ["claim_prepare_many(4)"], "{c:?}");
+
+        let fs = n_files(5);
+        batched(&fs, policy(4), Durability::Strict).0.unwrap();
+        let c = log(&fs);
+        assert_eq!(prepares(&c), ["claim_prepare_many(4)", "claim_prepare_many(1)"], "{c:?}");
+        assert!(
+            renamed(&c, "f3") < created(&c, "f4"),
+            "the 4th publishes before the 5th is staged: {c:?}"
+        );
+    }
+
+    #[test]
+    fn normal_durability_never_batches() {
+        let fs = n_files(5);
+        let (r, out, _) = batched(&fs, policy(4), Durability::Normal);
+        r.unwrap();
+        let c = log(&fs);
+        assert_eq!(count(&c, "claim_prepare_many("), 0, "{c:?}");
+        assert_eq!(count(&c, "claim_apply_recovery"), 0, "{c:?}");
+        assert_eq!(out.files_copied, 5);
+    }
+
+    #[test]
+    fn a_format_1_store_never_batches() {
+        let fs = n_files(5);
+        fs.set_claim_store_format("/dst/state.db", 1);
+        let (r, out, got) = batched(&fs, policy(4), Durability::Strict);
+        r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        let c = log(&fs);
+        assert_eq!(count(&c, "claim_prepare_many("), 0, "{c:?}");
+        assert_eq!(out.files_copied, 5);
+    }
+
+    #[test]
+    fn files_one_is_the_unbatched_path() {
+        let fs = n_files(3);
+        let (r, out, got) = batched(&fs, policy(1), Durability::Strict);
+        r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        let c = log(&fs);
+        assert_eq!(count(&c, "claim_prepare("), 3, "{c:?}");
+        assert_eq!(count(&c, "claim_commit_prepared("), 3, "{c:?}");
+        assert_eq!(count(&c, "claim_prepare_many("), 0, "{c:?}");
+        assert_eq!(out.files_copied, 3);
+    }
+
+    #[test]
+    fn bytes_trigger() {
+        let fs = sources(&[("a", b"aaaaaa"), ("b", b"bbbbbb"), ("c", b"cccccc")]);
+        let p = BatchPolicy { files: 64, bytes: 10, age: NO_AGE, ..BatchPolicy::DEFAULT };
+        let (r, out, _) = batched(&fs, p, Durability::Strict);
+        r.unwrap();
+        let c = log(&fs);
+        assert_eq!(prepares(&c), ["claim_prepare_many(2)", "claim_prepare_many(1)"], "{c:?}");
+        assert!(renamed(&c, "b") < created(&c, "c"), "12 >= 10 flushes before c is staged: {c:?}");
+        assert_eq!(out.files_copied, 3);
+    }
+
+    #[test]
+    fn a_large_file_flushes_the_pending_small_ones_first_and_is_staged_alone() {
+        let fs = sources(&[("a", b"aa"), ("b", &[b'b'; 20]), ("c", b"cc")]);
+        let p = BatchPolicy { files: 64, bytes: 10, age: NO_AGE, ..BatchPolicy::DEFAULT };
+        let (r, out, _) = batched(&fs, p, Durability::Strict);
+        r.unwrap();
+        let c = log(&fs);
+        assert!(renamed(&c, "a") < created(&c, "b"), "a publishes before b is staged: {c:?}");
+        assert_eq!(
+            prepares(&c),
+            ["claim_prepare_many(1)", "claim_prepare_many(1)", "claim_prepare_many(1)"],
+            "{c:?}"
+        );
+        let p = positions(&c, "claim_prepare_many(");
+        assert!(created(&c, "b") < p[1] && p[1] < created(&c, "c"), "b is flushed alone: {c:?}");
+        assert!(renamed(&c, "b") < created(&c, "c"), "{c:?}");
+        assert!(created(&c, "c") < p[2], "c is separate: {c:?}");
+        assert_eq!(out.files_copied, 3);
+    }
+
+    #[test]
+    fn a_directory_end_flushes_the_child_batch_before_the_parents() {
+        let fs = sources(&[("a0", b"a0"), ("m/x", b"x"), ("z", b"z")]);
+        let (r, out, got) = batched(&fs, policy(64), Durability::Strict);
+        r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        let c = log(&fs);
+        let commit = first(&c, "claim_apply_recovery");
+        assert!(renamed(&c, "m/x") < commit && commit < renamed(&c, "a0"), "{c:?}");
+        assert_eq!(prepares(&c), ["claim_prepare_many(1)", "claim_prepare_many(2)"], "{c:?}");
+        let parents = first(&c, "claim_prepare_many(2)");
+        assert!(commit < parents, "{c:?}");
+        assert!(parents < renamed(&c, "a0") && renamed(&c, "a0") < renamed(&c, "z"), "{c:?}");
+        assert!(created(&c, "z") < parents, "z joined the parent's pending batch: {c:?}");
+        for (p, bytes) in [("/dst/a0", &b"a0"[..]), ("/dst/m/x", b"x"), ("/dst/z", b"z")] {
+            assert_eq!(fs.read_file(p).as_deref(), Some(bytes), "{p}");
+        }
+        assert_eq!((out.files_copied, out.directories_created), (3, 1));
+    }
+
+    thread_local! {
+        static CLOCK: (std::time::Instant, std::cell::Cell<std::time::Duration>) =
+            (std::time::Instant::now(), std::cell::Cell::new(std::time::Duration::ZERO));
+    }
+
+    /// The injected clock: a fixed base plus a settable offset.
+    fn fake_now() -> std::time::Instant {
+        CLOCK.with(|c| c.0 + c.1.get())
+    }
+
+    #[test]
+    fn the_age_trigger_uses_the_injected_clock() {
+        let fs = sources(&[("a", b"a"), ("b", b"b"), ("c", b"c")]);
+        // t = 2 s from b's exclusive create on: after a set the batch's start, before c's staging is decided.
+        fs.on_nth("create_new", 2, |_| {
+            CLOCK.with(|c| c.1.set(std::time::Duration::from_secs(2)));
+        });
+        let p = BatchPolicy {
+            files: 64,
+            age: std::time::Duration::from_secs(1),
+            now: fake_now,
+            ..BatchPolicy::DEFAULT
+        };
+        let (r, out, _) = batched(&fs, p, Durability::Strict);
+        r.unwrap();
+        let c = log(&fs);
+        assert!(renamed(&c, "a") < created(&c, "c"), "{c:?}");
+        assert!(renamed(&c, "b") < created(&c, "c"), "{c:?}");
+        assert_eq!(prepares(&c), ["claim_prepare_many(2)", "claim_prepare_many(1)"], "{c:?}");
+        assert_eq!(out.files_copied, 3);
+    }
+
+    #[test]
+    fn the_walk_end_flushes_the_root_batch() {
+        let fs = n_files(3);
+        let (r, out, got) = batched(&fs, policy(64), Durability::Strict);
+        r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        for i in 0..3 {
+            let n = format!("f{i}");
+            assert_eq!(fs.read_file(format!("/dst/{n}")).as_deref(), Some(n.as_bytes()), "{n}");
+        }
+        let c = log(&fs);
+        assert_eq!(prepares(&c), ["claim_prepare_many(3)"], "{c:?}");
+        assert_eq!(out.files_copied, 3);
+        assert_eq!(fs.prepared_count(), 0);
+    }
+
+    /// `File` and `file` in one source directory, onto a case-folding destination.
+    fn folding_pair() -> FaultFs {
+        let fs = sources(&[("File", b"upper"), ("file", b"lower")]);
+        fs.set_case_insensitive(true);
+        fs
+    }
+
+    #[test]
+    fn names_that_fold_in_one_directory_flush_before_the_second_is_staged() {
+        let fs = folding_pair();
+        let (r, out, got) = batched(&fs, policy(64), Durability::Strict);
+        r.unwrap();
+        let c = log(&fs);
+        let published = renamed(&c, "File");
+        // No exclusive create but `File`'s own precedes its rename (the second is refused before or at its create).
+        let creates = positions(&c, "create_new(");
+        assert_eq!(creates[0], created(&c, "File"), "{c:?}");
+        assert!(creates[1..].iter().all(|&p| p > published), "{c:?}");
+        assert_eq!(fs.read_file("/dst/File").as_deref(), Some(&b"upper"[..]));
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].path, PathBuf::from("file"));
+        let TreeFailureCause::Copy(e) = &got[0].cause else { panic!("{got:?}") };
+        assert_eq!(e.code(), Code::DestinationNamespaceCollision);
+
+        let fs = folding_pair();
+        let (r1, out1, got1) = batched(&fs, policy(1), Durability::Strict);
+        r1.unwrap();
+        assert_eq!(shape(&got), shape(&got1), "the same code and step as the unbatched run");
+        assert_eq!(
+            (out.files_copied, out.failures.total()),
+            (out1.files_copied, out1.failures.total())
+        );
+    }
+
+    #[test]
+    fn a_fold_equal_pending_temporary_is_never_swept() {
+        let fs = folding_pair();
+        let p = BatchPolicy { fold_precheck: false, ..policy(64) };
+        let (r, out, got) = batched(&fs, p, Durability::Strict);
+        r.unwrap();
+        let c = log(&fs);
+        assert_eq!(fs.read_file("/dst/File").as_deref(), Some(&b"upper"[..]), "{c:?}");
+        // `file` reaches no exclusive create once `File` is published (its gate refuses it), so: no create but `File`'s
+        // own precedes `File`'s rename.
+        let creates = positions(&c, "create_new(");
+        assert_eq!(creates[0], created(&c, "File"), "{c:?}");
+        assert!(creates[1..].iter().all(|&p| p > renamed(&c, "File")), "{c:?}");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].path, PathBuf::from("file"));
+        let TreeFailureCause::Copy(e) = &got[0].cause else { panic!("{got:?}") };
+        assert_eq!(e.code(), Code::DestinationNamespaceCollision, "{e:?}");
+        assert_eq!(out.files_copied, 1);
+    }
+
+    #[test]
+    fn an_exclusive_create_collision_with_pending_entries_flushes_and_retries_once() {
+        let fs = sources(&[("a", b"A"), ("b", b"B")]);
+        fs.fail_nth("create_new", 2, Code::IoError, ErrorKind::AlreadyExists);
+        let (r, out, got) = batched(&fs, policy(64), Durability::Strict);
+        r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        let c = log(&fs);
+        let b_creates = positions(&c, "create_new(/dst/b.flux-partial.op1)");
+        assert_eq!(b_creates.len(), 2, "{c:?}");
+        assert!(renamed(&c, "a") < b_creates[1], "a is flushed before b's retry: {c:?}");
+        assert_eq!(count(&c, "create_new("), 3, "{c:?}");
+        assert_eq!(fs.read_file("/dst/b").as_deref(), Some(&b"B"[..]));
+        assert_eq!(out.files_copied, 2);
+    }
+
+    #[test]
+    fn an_exclusive_create_collision_that_persists_is_retried_once_only() {
+        let fs = sources(&[("a", b"A"), ("b", b"B")]);
+        // Every exclusive create from b's first on answers AlreadyExists.
+        fs.on_nth("create_new", 2, |fs| {
+            fs.fail_kind("create_new", Code::IoError, ErrorKind::AlreadyExists);
+            fs.fail_always("create_new", Code::IoError);
+        });
+        let (r, out, got) = batched(&fs, policy(64), Durability::Strict);
+        r.unwrap();
+        let c = log(&fs);
+        assert_eq!(positions(&c, "create_new(/dst/b.flux-partial.op1)").len(), 2, "{c:?}");
+        assert_eq!(fs.read_file("/dst/a").as_deref(), Some(&b"A"[..]));
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].path, PathBuf::from("b"));
+        let TreeFailureCause::Copy(e) = &got[0].cause else { panic!("{got:?}") };
+        // What an unbatched copy reports for a create refused `AlreadyExists`: `finish_copy` maps only Gate and Publish.
+        assert_eq!((e.code(), e.step), (Code::IoError, CopyStep::Create), "{e:?}");
+        assert_eq!(out.files_copied, 1);
+    }
+
+    /// 130 files in two directories, 65 each.
+    fn two_directories() -> FaultFs {
+        let owned: Vec<(String, Vec<u8>)> = ["d1", "d2"]
+            .iter()
+            .flat_map(|d| {
+                (0..65).map(move |i| (format!("{d}/f{i:03}"), format!("{d}{i}").into_bytes()))
+            })
+            .collect();
+        let entries: Vec<(&str, &[u8])> =
+            owned.iter().map(|(p, b)| (p.as_str(), b.as_slice())).collect();
+        sources(&entries)
+    }
+
+    #[test]
+    fn equivalence_of_batched_and_unbatched() {
+        let on = two_directories();
+        let (r_on, out_on, got_on) = batched(&on, policy(64), Durability::Strict);
+        r_on.unwrap();
+        let off = two_directories();
+        let (r_off, out_off, got_off) = batched(&off, policy(1), Durability::Strict);
+        r_off.unwrap();
+        for d in ["d1", "d2"] {
+            let (id_on, id_off) =
+                (strong_id(&on, &format!("/dst/{d}")), strong_id(&off, &format!("/dst/{d}")));
+            for i in 0..65 {
+                let n = format!("f{i:03}");
+                let p = format!("/dst/{d}/{n}");
+                assert!(on.read_file(&p).is_some(), "{p}");
+                assert_eq!(on.read_file(&p), off.read_file(&p), "{p}");
+                assert!(on.claim(id_on, &n).is_some(), "{p}");
+                assert_eq!(on.claim(id_on, &n), off.claim(id_off, &n), "{p}");
+            }
+        }
+        assert_eq!(
+            (out_on.files_copied, out_on.bytes_copied, out_on.directories_created),
+            (out_off.files_copied, out_off.bytes_copied, out_off.directories_created)
+        );
+        assert_eq!(out_on.files_copied, 130);
+        assert_eq!(shape(&got_on), shape(&got_off));
+        let (c_on, c_off) = (log(&on), log(&off));
+        assert!(count(&c_on, "claim_prepare_many(") > 0 && count(&c_on, "claim_prepare(") == 0);
+        assert!(count(&c_off, "claim_prepare_many(") == 0 && count(&c_off, "claim_prepare(") > 0);
+    }
+
+    #[test]
+    fn batch_policy_default_matches_the_spec() {
+        assert_eq!(BATCH_FILES, 64);
+        assert_eq!(BATCH_BYTES, 64 << 20);
+        assert_eq!(BATCH_AGE, std::time::Duration::from_secs(1));
+        assert_eq!(BatchPolicy::DEFAULT.files, BATCH_FILES);
+        assert_eq!(BatchPolicy::DEFAULT.bytes, BATCH_BYTES);
+        assert_eq!(BatchPolicy::DEFAULT.age, BATCH_AGE);
+    }
+
+    // Cut 9d Task 4: failure isolation (spec decision 7), the stops (decision 8), the abort drain (5(e)).
+
+    /// The temporary of `rel`, relative to DEST, as a leftover names it.
+    fn temp_of(rel: &str) -> PathBuf {
+        PathBuf::from(format!("{rel}.flux-partial.op1"))
+    }
+
+    /// Every leftover temporary named by a `Copy` report in `got` and by `err`, sorted.
+    fn leftovers(got: &[TreeFailure], err: Option<&CopyError>) -> Vec<PathBuf> {
+        let mut all: Vec<PathBuf> = got
+            .iter()
+            .filter_map(|f| match &f.cause {
+                TreeFailureCause::Copy(e) => e.leftover.as_ref().map(|(p, _)| p.clone()),
+                _ => None,
+            })
+            .chain(err.and_then(|e| e.leftover.as_ref().map(|(p, _)| p.clone())))
+            .collect();
+        all.sort();
+        all
+    }
+
+    /// `f`'s claim under `/dst` is `Created`.
+    fn claimed(fs: &FaultFs, f: &str) -> bool {
+        fs.claim(strong_id(fs, "/dst"), f).map(|r| r.status) == Some(ClaimStatus::Created)
+    }
+
+    /// `f` is published under `/dst` with its own name as its bytes (the `n_files` fixture).
+    fn published(fs: &FaultFs, f: &str) -> bool {
+        fs.read_file(format!("/dst/{f}")).as_deref() == Some(f.as_bytes())
+    }
+
+    #[test]
+    fn a_failing_prepare_many_falls_back_to_per_entry_prepare() {
+        let fs = n_files(3);
+        fs.fail("claim_prepare_many", Code::IoError);
+        let (r, out, got) = batched(&fs, policy(4), Durability::Strict);
+        r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        let c = log(&fs);
+        let many = first(&c, "claim_prepare_many(3)");
+        let each = positions(&c, "claim_prepare(");
+        assert_eq!(each.len(), 3, "{c:?}");
+        assert!(each.iter().all(|&p| p > many), "{c:?}");
+        for f in ["f0", "f1", "f2"] {
+            assert!(published(&fs, f) && claimed(&fs, f), "{f}: {c:?}");
+        }
+        assert_eq!(fs.prepared_count(), 0);
+        assert_eq!(out.files_copied, 3);
+    }
+
+    #[test]
+    fn one_entry_own_prepare_failing_fails_only_that_file() {
+        let fs = n_files(3);
+        fs.fail_always("claim_prepare_many", Code::IoError);
+        fs.fail_nth("claim_prepare", 2, Code::IoError, ErrorKind::Other);
+        let (r, out, got) = batched(&fs, policy(4), Durability::Strict);
+        r.unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].path, PathBuf::from("f1"));
+        let TreeFailureCause::Copy(e) = &got[0].cause else { panic!("{got:?}") };
+        assert_eq!(e.step, CopyStep::Claim, "{e:?}");
+        assert!(!fs.exists("/dst/f1.flux-partial.op1") && !fs.exists("/dst/f1"));
+        assert!(fs.claim(strong_id(&fs, "/dst"), "f1").is_none());
+        assert_eq!(fs.prepared_count(), 0, "no note for it, and the others committed");
+        for f in ["f0", "f2"] {
+            assert!(published(&fs, f) && claimed(&fs, f), "{f}");
+        }
+        assert_eq!(out.files_copied, 2);
+    }
+
+    /// Final-review hardening: a STOP from the per-entry `prepare` fallback (an error carrying `TargetLockBusy`, which
+    /// `finish_copy` returns as a stop) drops no entry: the already-noted keep their notes and temporaries, the not yet
+    /// noted keep their temporaries, and each is reported with its temporary as the leftover.
+    #[test]
+    fn a_stop_in_the_per_entry_prepare_fallback_reports_every_other_entry() {
+        let fs = n_files(3);
+        fs.fail_always("claim_prepare_many", Code::IoError);
+        fs.fail_nth("claim_prepare", 2, Code::TargetLockBusy, ErrorKind::Other);
+        let (r, out, got) = batched(&fs, policy(4), Durability::Strict);
+        let stop = r.unwrap_err();
+        assert_eq!(stop.code(), Code::TargetLockBusy, "{stop:?}");
+        assert_eq!(stop.step, CopyStep::Claim, "{stop:?}");
+        let paths: Vec<&Path> = got.iter().map(|f| f.path.as_path()).collect();
+        assert_eq!(paths, [Path::new("f0"), Path::new("f2")], "{got:?}");
+        for (f, name) in got.iter().zip(["f0", "f2"]) {
+            let TreeFailureCause::Copy(e) = &f.cause else { panic!("{got:?}") };
+            assert_eq!(e.code(), Code::TargetLockBusy, "{e:?}");
+            let (leftover, _) = e.leftover.as_ref().expect("the temporary is reported");
+            assert_eq!(leftover, &PathBuf::from(format!("{name}.flux-partial.op1")));
+            assert!(fs.exists(format!("/dst/{name}.flux-partial.op1")), "{name}: kept");
+            assert!(!fs.exists(format!("/dst/{name}")), "{name}: not published");
+        }
+        assert!(
+            !fs.exists("/dst/f1.flux-partial.op1"),
+            "the failed entry's temporary is discarded"
+        );
+        assert_eq!(fs.prepared_count(), 1, "f0's note stays for recovery");
+        assert_eq!(out.files_copied, 0);
+    }
+
+    #[test]
+    fn a_failing_apply_recovery_falls_back_to_per_entry_commits() {
+        let fs = n_files(3);
+        fs.fail("claim_apply_recovery", Code::IoError);
+        let (r, out, got) = batched(&fs, policy(4), Durability::Strict);
+        r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        let c = log(&fs);
+        let settle = first(&c, "claim_apply_recovery");
+        let each = positions(&c, "claim_commit_prepared(");
+        assert_eq!(each.len(), 3, "{c:?}");
+        assert!(each.iter().all(|&p| p > settle), "{c:?}");
+        for f in ["f0", "f1", "f2"] {
+            assert!(published(&fs, f) && claimed(&fs, f), "{f}");
+        }
+        assert_eq!(fs.prepared_count(), 0);
+        assert_eq!(out.files_copied, 3);
+    }
+
+    #[test]
+    fn one_entry_own_commit_failing_is_claim_not_recorded() {
+        let fs = n_files(3);
+        fs.fail_always("claim_apply_recovery", Code::IoError);
+        fs.fail_nth("claim_commit_prepared", 2, Code::IoError, ErrorKind::Other);
+        let (r, out, got) = batched(&fs, policy(4), Durability::Strict);
+        r.unwrap();
+        assert!(published(&fs, "f1"), "the file is published");
+        assert_eq!(
+            got.len(),
+            1,
+            "no file is both published and reported failed but this one: {got:?}"
+        );
+        assert_eq!(got[0].path, PathBuf::from("f1"));
+        assert!(matches!(got[0].cause, TreeFailureCause::ClaimNotRecorded(_)), "{got:?}");
+        assert_eq!(fs.prepared_count(), 1, "its note is left for recovery");
+        assert!(fs.claim(strong_id(&fs, "/dst"), "f1").is_none());
+        for f in ["f0", "f2"] {
+            assert!(published(&fs, f) && claimed(&fs, f), "{f}");
+        }
+        assert_eq!((out.files_copied, out.failures.copy), (3, 0));
+    }
+
+    #[test]
+    fn a_failed_rename_discards_its_note_inside_the_one_apply_recovery() {
+        let fs = n_files(3);
+        fs.fail_nth("rename_no_replace", 2, Code::IoError, ErrorKind::Other);
+        let (r, out, got) = batched(&fs, policy(4), Durability::Strict);
+        r.unwrap();
+        let c = log(&fs);
+        // One transaction carries the two commits and the discard: no per-entry call settles anything.
+        assert_eq!(count(&c, "claim_apply_recovery"), 1, "{c:?}");
+        assert_eq!(count(&c, "claim_discard_prepared("), 0, "{c:?}");
+        assert_eq!(count(&c, "claim_commit_prepared("), 0, "{c:?}");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].path, PathBuf::from("f1"));
+        let TreeFailureCause::Copy(e) = &got[0].cause else { panic!("{got:?}") };
+        assert_eq!(e.step, CopyStep::Publish, "{e:?}");
+        assert!(!fs.exists("/dst/f1.flux-partial.op1") && !fs.exists("/dst/f1"));
+        assert_eq!(fs.prepared_count(), 0, "the failed entry's note was discarded");
+        for f in ["f0", "f2"] {
+            assert!(published(&fs, f) && claimed(&fs, f), "{f}");
+        }
+        assert_eq!(out.files_copied, 2);
+    }
+
+    #[test]
+    fn the_rename_collision_is_a_namespace_collision() {
+        let fs = n_files(3);
+        // Between staging and the renames, someone else writes f1.
+        fs.on_nth("claim_prepare_many", 1, |fs| fs.write_file("/dst/f1", b"theirs"));
+        let (r, out, got) = batched(&fs, policy(4), Durability::Strict);
+        r.unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].path, PathBuf::from("f1"));
+        let TreeFailureCause::Copy(e) = &got[0].cause else { panic!("{got:?}") };
+        assert_eq!(e.code(), Code::DestinationNamespaceCollision, "{e:?}");
+        assert_eq!(fs.read_file("/dst/f1").as_deref(), Some(&b"theirs"[..]));
+        for f in ["f0", "f2"] {
+            assert!(published(&fs, f) && claimed(&fs, f), "{f}");
+        }
+        assert_eq!(fs.prepared_count(), 0);
+        assert_eq!(out.files_copied, 2);
+    }
+
+    #[test]
+    fn a_lost_lock_at_entry_k_writes_and_removes_nothing() {
+        let fs = n_files(4);
+        let calls = std::cell::Cell::new(0);
+        // Staging guards twice per file (1-8), the flush's step 1 once (9), entries 0 and 1 once each (10, 11): entry
+        // 2's publish guard (12) is the first to fail.
+        let guard = failing_after(4 * 2 + 1 + 2, &calls);
+        let (r, out, got) = batched_with(&fs, policy(4), Durability::Strict, &guard, &no_heartbeat);
+        let error = r.unwrap_err();
+        assert_eq!(error.code(), Code::TargetLockBusy, "{error:?}");
+        assert!(error.leftover.is_some());
+        assert_eq!(error.leftover.as_ref().map(|(p, _)| p.clone()), Some(temp_of("f2")));
+        assert_eq!(out.files_copied, 2);
+        let c = log(&fs);
+        assert_eq!(count(&c, "rename_"), 2, "entries 0 and 1 renamed: {c:?}");
+        assert!(published(&fs, "f0") && published(&fs, "f1"));
+        assert_eq!(fs.prepared_count(), 4, "every note stays");
+        assert!(
+            fs.claim(strong_id(&fs, "/dst"), "f0").is_none(),
+            "no claim committed after the loss"
+        );
+        let lost = renamed(&c, "f1");
+        for after in &c[lost + 1..] {
+            assert!(
+                !after.starts_with("claim_apply_recovery")
+                    && !after.starts_with("claim_discard_prepared(")
+                    && !after.starts_with("remove_file("),
+                "nothing written or removed after the loss: {c:?}"
+            );
+        }
+        assert!(fs.exists("/dst/f2.flux-partial.op1") && fs.exists("/dst/f3.flux-partial.op1"));
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].path, PathBuf::from("f3"));
+        let TreeFailureCause::Copy(e3) = &got[0].cause else { panic!("{got:?}") };
+        assert_eq!(e3.code(), Code::TargetLockBusy);
+        assert_eq!(leftovers(&got, Some(&error)), [temp_of("f2"), temp_of("f3")]);
+        let abort = TreeAbort { error, outcome: out };
+        assert!(abort.changed());
+        assert!(!abort.refused_unchanged());
+    }
+
+    #[test]
+    fn a_lost_lock_at_the_step_one_guard_leaves_every_temporary() {
+        let fs = n_files(4);
+        let calls = std::cell::Cell::new(0);
+        // Staging guards 1-8; the flush's first guard (9) fails.
+        let guard = failing_after(4 * 2, &calls);
+        let (r, out, got) = batched_with(&fs, policy(4), Durability::Strict, &guard, &no_heartbeat);
+        let error = r.unwrap_err();
+        assert_eq!((error.code(), error.step), (Code::TargetLockBusy, CopyStep::Publish));
+        let c = log(&fs);
+        assert_eq!(count(&c, "claim_prepare_many("), 0, "{c:?}");
+        assert_eq!(count(&c, "rename_"), 0, "{c:?}");
+        for f in ["f0", "f1", "f2", "f3"] {
+            assert!(fs.exists(format!("/dst/{f}.flux-partial.op1")), "{f}");
+        }
+        let all: Vec<PathBuf> = ["f0", "f1", "f2", "f3"].iter().map(|f| temp_of(f)).collect();
+        assert_eq!(leftovers(&got, Some(&error)), all, "{got:?}");
+        assert_eq!(out.files_copied, 0);
+        let abort = TreeAbort { error, outcome: out };
+        assert!(abort.changed(), "because of the leftover");
+    }
+
+    #[test]
+    fn a_heartbeat_failure_with_the_lock_held_commits_the_renamed_and_discards_the_rest() {
+        let fs = n_files(4);
+        let calls = std::cell::Cell::new(0);
+        // Staging beats three times per file (sweep, create, one chunk: 1-12), the flush's step 1 once (13), entries 0
+        // and 1 once each (14, 15): entry 2's publish heartbeat (16) fails.
+        let beat = || {
+            calls.set(calls.get() + 1);
+            if calls.get() > 4 * 3 + 1 + 2 {
+                Err(FsError::new(Code::IoError, std::io::Error::other("beat")))
+            } else {
+                Ok(())
+            }
+        };
+        let (r, out, got) = batched_with(&fs, policy(4), Durability::Strict, &unguarded, &beat);
+        assert_eq!(r.unwrap_err().step, CopyStep::Heartbeat);
+        let c = log(&fs);
+        assert_eq!(count(&c, "rename_"), 2, "entries 0 and 1 renamed: {c:?}");
+        for f in ["f0", "f1"] {
+            assert!(published(&fs, f) && claimed(&fs, f), "{f}: {c:?}");
+        }
+        for f in ["f2", "f3"] {
+            assert!(!fs.exists(format!("/dst/{f}.flux-partial.op1")), "{f}: {c:?}");
+            assert!(!fs.exists(format!("/dst/{f}")), "{f}");
+        }
+        assert_eq!(fs.prepared_count(), 0, "the unrenamed entries' notes are discarded");
+        // Every temporary goes before the transaction that discards the notes.
+        let settle = first(&c, "claim_apply_recovery");
+        for f in ["f2", "f3"] {
+            let removed =
+                *positions(&c, &format!("remove_file(/dst/{f}.flux-partial.op1)")).last().unwrap();
+            assert!(removed > renamed(&c, "f1") && removed < settle, "{f}: {c:?}");
+        }
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(out.files_copied, 2);
+    }
+
+    #[test]
+    fn a_stage_failure_mid_batch_does_not_lose_the_pending_entries() {
+        let names: Vec<String> = (0..40).map(|i| format!("f{i:02}")).collect();
+        let entries: Vec<(&str, &[u8])> =
+            names.iter().map(|n| (n.as_str(), n.as_bytes())).collect();
+        let fs = sources(&entries);
+        // The 30th exclusive create is f29's.
+        fs.fail_nth("create_new", 30, Code::DiskFull, ErrorKind::Other);
+        let (r, out, got) = batched(&fs, policy(64), Durability::Strict);
+        r.unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].path, PathBuf::from("f29"));
+        let TreeFailureCause::Copy(e) = &got[0].cause else { panic!("{got:?}") };
+        assert_eq!((e.code(), e.step), (Code::DiskFull, CopyStep::Create), "{e:?}");
+        let c = log(&fs);
+        assert_eq!(prepares(&c), ["claim_prepare_many(39)"], "{c:?}");
+        assert!(
+            created(&c, "f39") < first(&c, "claim_prepare_many("),
+            "published after the directory ends"
+        );
+        for n in names.iter().filter(|n| *n != "f29") {
+            assert!(published(&fs, n) && claimed(&fs, n), "{n}");
+        }
+        assert!(!fs.exists("/dst/f29"));
+        assert_eq!(fs.prepared_count(), 0);
+        assert_eq!(out.files_copied, 39);
+    }
+
+    #[test]
+    fn a_metadata_failure_with_pending_entries_reports_only_that_file() {
+        let fs = sources(&[("a", b"a"), ("b", b"b"), ("c", b"c")]);
+        // The green run's call log, counting `metadata` calls: /src, /src, /dst/a, /src/a, /dst/a, /src/a, /dst/b,
+        // /dst/b's temporary (decision 6's probe), then /src/b: the 9th is the 5(b) stat of b, paid because a is pending
+        // (a's own stat is skipped: its batch is empty).
+        fs.fail_nth("metadata", 9, Code::PermissionDenied, ErrorKind::PermissionDenied);
+        let (r, out, got) = batched(&fs, policy(64), Durability::Strict);
+        r.unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].path, PathBuf::from("b"));
+        let TreeFailureCause::Copy(e) = &got[0].cause else { panic!("{got:?}") };
+        assert_eq!(e.step, CopyStep::Source, "{e:?}");
+        let c = log(&fs);
+        let stats = positions(&c, "metadata(");
+        assert_eq!(c[stats[8]], "metadata(/src/b)", "the fault hit b's 5(b) stat: {c:?}");
+        assert_eq!(count(&c, "create_new(/dst/b"), 0, "nothing was created for b: {c:?}");
+        for f in ["a", "c"] {
+            assert!(published(&fs, f) && claimed(&fs, f), "{f}");
+        }
+        assert!(!fs.exists("/dst/b"));
+        assert!(!fs.exists("/dst/b.flux-partial.op1"));
+        assert_eq!(prepares(&c), ["claim_prepare_many(2)"], "{c:?}");
+        assert_eq!(out.files_copied, 2);
+        assert_eq!(fs.prepared_count(), 0);
+    }
+
+    #[test]
+    fn an_abort_drains_every_frame() {
+        let fs = sources(&[("a", b"a"), ("b", b"b"), ("m/x", b"x")]);
+        let calls = std::cell::Cell::new(0);
+        // a and b staged in the root (1-4), m's creation (5), x staged in m (6-7): m's `DirEnd` flush guard (8) fails
+        // while the root holds a and b.
+        let guard = failing_after(2 * 2 + 1 + 2, &calls);
+        let (r, out, got) =
+            batched_with(&fs, policy(64), Durability::Strict, &guard, &no_heartbeat);
+        let error = r.unwrap_err();
+        assert_eq!(error.code(), Code::TargetLockBusy, "{error:?}");
+        // The walk's error is the one returned: the child's, at m's flush.
+        assert_eq!(error.leftover.as_ref().map(|(p, _)| p.clone()), Some(temp_of("m/x")));
+        let c = log(&fs);
+        assert_eq!(count(&c, "rename_"), 0, "{c:?}");
+        assert_eq!(count(&c, "claim_prepare_many("), 0, "{c:?}");
+        // No pending entry is silently dropped: each staged temporary is still there and named as a leftover.
+        for t in ["/dst/a.flux-partial.op1", "/dst/b.flux-partial.op1", "/dst/m/x.flux-partial.op1"]
+        {
+            assert!(fs.exists(t), "{t}");
+        }
+        assert_eq!(
+            leftovers(&got, Some(&error)),
+            [temp_of("a"), temp_of("b"), temp_of("m/x")],
+            "{got:?}"
+        );
+        assert_eq!(out.files_copied, 0);
+    }
+
+    #[test]
+    fn a_heartbeat_abort_drains_the_pending_temporaries_and_reports_nothing() {
+        let fs = sources(&[("a", b"a"), ("b", b"b"), ("m/x", b"x")]);
+        let calls = std::cell::Cell::new(0);
+        // a and b staged in the root (beats 1-6); m's creation's heartbeat (7) fails, and every later one.
+        let beat = || {
+            calls.set(calls.get() + 1);
+            if calls.get() > 2 * 3 {
+                Err(FsError::new(Code::IoError, std::io::Error::other("beat")))
+            } else {
+                Ok(())
+            }
+        };
+        let (r, out, got) = batched_with(&fs, policy(64), Durability::Strict, &unguarded, &beat);
+        assert_eq!(r.unwrap_err().step, CopyStep::Heartbeat);
+        let c = log(&fs);
+        assert!(created(&c, "a") < created(&c, "b"), "both staged before the abort: {c:?}");
+        // The drain's flush fails its opening heartbeat with the lock held: no note exists, so each temporary goes.
+        for t in ["/dst/a.flux-partial.op1", "/dst/b.flux-partial.op1"] {
+            assert!(!fs.exists(t), "{t}: {c:?}");
+        }
+        assert_eq!(count(&c, "claim_prepare_many("), 0, "{c:?}");
+        assert_eq!(fs.prepared_count(), 0);
+        assert!(!fs.exists("/dst/m"));
+        // An abort, never a per-file failure: the drain's own stop (no leftover) is dropped (spec decision 8).
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!((out.files_copied, out.failures.total()), (0, 0));
+    }
+
+    #[test]
+    fn the_count_is_taken_at_the_rename() {
+        let fs = n_files(4);
+        let calls = std::cell::Cell::new(0);
+        // Entry 2's publish guard (8 staging + 1 + 2 = 12th) fails.
+        let guard = failing_after(4 * 2 + 1 + 2, &calls);
+        let (r, out, _) = batched_with(&fs, policy(4), Durability::Strict, &guard, &no_heartbeat);
+        assert_eq!(r.unwrap_err().code(), Code::TargetLockBusy);
+        assert_eq!(count(&log(&fs), "rename_"), 2);
+        assert_eq!(out.files_copied, 2);
+    }
+
+    /// A file `M` and a directory `m/` (holding `x`) in one source directory, onto a case-folding destination.
+    fn file_then_folding_dir() -> FaultFs {
+        let fs = sources(&[("M", b"upper"), ("m/x", b"x")]);
+        fs.set_case_insensitive(true);
+        fs
+    }
+
+    #[test]
+    fn a_directory_whose_name_folds_to_a_pending_file_flushes_first() {
+        let fs = file_then_folding_dir();
+        let (r, out, got) = batched(&fs, policy(64), Durability::Strict);
+        r.unwrap();
+        let fs1 = file_then_folding_dir();
+        let (r1, out1, got1) = batched(&fs1, policy(1), Durability::Strict);
+        r1.unwrap();
+        assert!(!got1.is_empty(), "the fixture folds: {got1:?}");
+        assert_eq!(
+            shape(&got),
+            shape(&got1),
+            "the same reports, code and step, as the unbatched run"
+        );
+        assert_eq!(fs.read_file("/dst/M"), fs1.read_file("/dst/M"));
+        assert_eq!(
+            (out.files_copied, out.directories_created, out.failures.total()),
+            (out1.files_copied, out1.directories_created, out1.failures.total())
+        );
     }
 }

@@ -327,6 +327,23 @@ impl ClaimStore for FakeClaimStore {
         Ok(())
     }
 
+    fn prepare_many(&mut self, notes: &[(ClaimKey, PreparedRecord)]) -> Result<()> {
+        self.record(format!("claim_prepare_many({})", notes.len()), "claim_prepare_many")?;
+        self.require_prepared()?;
+        let mut p = self.prepared.lock().unwrap();
+        let mut staged = p.clone();
+        for (key, record) in notes {
+            if staged.insert(key.encode(), record.encode()).is_some() {
+                return Err(FsError::new(
+                    Code::IoError,
+                    std::io::Error::other("a prepared note already exists at this key"),
+                ));
+            }
+        }
+        *p = staged;
+        Ok(())
+    }
+
     fn commit_prepared(
         &mut self,
         key: &ClaimKey,
@@ -2816,6 +2833,28 @@ mod tests {
         // A format-1 file still opens.
         drop(s);
         assert!(d.open_claim_store(OsStr::new("state.db"), Durability::Normal).is_ok());
+    }
+
+    #[test]
+    fn prepare_many_records_its_call_honours_a_fault_and_is_all_or_nothing() {
+        use flux_fs::{ClaimKey, ClaimStore, DestinationRoot, DirHandle, Durability, ObjectId};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let mut s = d.create_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap();
+        let k = |n: &str| ClaimKey::new(ObjectId { volume: 1, index: 1 }, OsStr::new(n));
+        let two = vec![(k("a"), test_note("a")), (k("b"), test_note("b"))];
+        fs.fail("claim_prepare_many", Code::IoError);
+        assert_eq!(s.prepare_many(&two).expect_err("fault").code, Code::IoError);
+        assert_eq!(fs.prepared_count(), 0, "a faulted prepare_many leaves no note");
+        assert!(fs.calls().iter().any(|c| c == "claim_prepare_many(2)"), "{:?}", fs.calls());
+        s.prepare_many(&two).unwrap();
+        assert_eq!(fs.prepared_count(), 2);
+        let dup = vec![(k("c"), test_note("c")), (k("a"), test_note("a"))];
+        assert_eq!(s.prepare_many(&dup).expect_err("duplicate").code, Code::IoError);
+        assert_eq!(fs.prepared_count(), 2, "a duplicate key adds nothing");
+        s.prepare_many(&[]).unwrap();
+        assert!(fs.calls().iter().any(|c| c == "claim_prepare_many(0)"), "{:?}", fs.calls());
     }
 
     #[test]

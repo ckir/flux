@@ -513,6 +513,45 @@ the spec's numbers, 9-10 were learned during execution).
 - [ ] A test for a heartbeat failure after the note is written is missing.
 - [ ] The Normal path builds the note template needlessly.
 
+## Cut 9d known limits
+
+1. A tree with one small file per directory gets no batching: the batch flushes at every `DirEnd`. Keeping directory handles alive across `DirEnd` is
+   the later fix.
+2. A crash loses up to `BATCH_FILES` files' staging work (they are recopied at `--resume`) and up to that many claims reach recovery as notes.
+3. The rename is still not directory-synced (cut 9c limit 1 stands).
+4. The data `fsync` per file is not batched; it is the floor of about 1 sync per file.
+5. The age bound is not a timer: it is checked only at the NEXT STAGING in that directory or at its `DirEnd`. A long file being copied delays the
+   publication of the files staged before it, unless it is at least `BATCH_BYTES` long. Because the walk is depth-first, a parent's pending files
+   wait for the parent's next staging or `DirEnd`, i.e. until the whole subtree below has been walked, so their wait has no time bound.
+6. A Replace target (an existing destination file, `Plan::Replace`) still pays one synced commit for its `Existing` claim in `before_create`, because
+   `insert_if_absent` is Immediate under Strict (`crates/flux-platform/src/claims.rs`, `next_commit`): a replaced file costs 4 syncs today (data,
+   `Existing` claim, note, claim) and about 2 after this cut (data, `Existing` claim). Folding the `Existing` claim into `prepare_many` is the later
+   fix; it needs the exclusivity the claim gives to come from the in-frame pending names instead.
+7. A file and a directory in one directory whose names fold equal only by a NON-ASCII fold, onto a folding destination: the file's rename meets the
+   collision (batched) where an unbatched copy publishes the file and refuses the directory. Nothing is lost or overwritten; which of the two is
+   reported differs.
+
+## Cut 9d debt
+
+- [ ] Keep directory handles alive across `DirEnd` so a tree with one small file per directory batches (limit 1 fix).
+- [ ] Fold the Replace target's `Existing` claim into `prepare_many` (limit 6 fix); the exclusivity the claim gives must come from the in-frame pending
+  names.
+- [ ] The source recheck now happens at staging, not immediately before the rename: a source changed after the recheck is published as the snapshot
+  read, up to 64 files wide (an unbatched copy already allows the gap between recheck and rename). The 1 s age is no bound on that gap: it is checked
+  only at the next staging in that directory or its `DirEnd`, and a parent's pending files wait until the whole subtree below has been walked
+  (limit 5), so their gap has no time bound.
+- [ ] Strict small files are 34-35% faster, not the 40% the spec gated on (measured 2026-10-10: 3.0 -> 1.04 syncs per file, so batches are
+  near full and the age trigger is not the limit). The remaining time is the one data `fsync` per file (about 70% of syscall time under
+  `perf trace`, about 6 ms each): batching removed the cheaper claim `fdatasync` calls. Going further needs a batched or overlapped data sync
+  (`syncfs` per batch, parallel fsync), which changes what "durable before publish" means: its own design and cut.
+- [ ] Hardening: a lost lock noticed only inside a cleanup `discard` (heartbeat-stop cleanup, per-entry `prepare` fallback) does not stop the flush,
+  so store writes can still happen before the next guard (recovery handles every resulting state; spec decision 8's "writes nothing" holds for the
+  guard-detected loss). (The `prepare_many` fallback's stop, a store error carrying `TargetLockBusy`, no longer drops the remaining entries: each is
+  reported with its temporary kept, `a_stop_in_the_per_entry_prepare_fallback_reports_every_other_entry`.)
+- [ ] Tests not written: a lost lock inside `copy_one` with pending entries in two frames (the `DirEnd` form, a lost lock at a child's `DirEnd`
+  flush, is covered by `an_abort_drains_every_frame`; the `copy_one` form is not); the `discard_prepared` fallback after a failed rename when
+  `apply_recovery` also fails; the É/é non-ASCII fold on a real folding filesystem (the fake folds ASCII only; reasoned, not measured).
+
 ## Scaffolding follow-ups
 
 - [ ] Run `lefthook install` in each clone (or add it to a bootstrap recipe)

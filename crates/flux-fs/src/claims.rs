@@ -203,6 +203,10 @@ pub trait ClaimStore {
     fn supports_prepared(&self) -> bool;
     /// Inserts the note; a note already at `key` is `Code::IoError`. Always an Immediate commit.
     fn prepare(&mut self, key: &ClaimKey, record: &PreparedRecord) -> Result<()>;
+    /// ONE Immediate transaction inserting every note. A key that already has a note (in the
+    /// store or earlier in `notes`) is `Code::IoError` and nothing changes. An empty slice is
+    /// `Ok(())` and commits nothing. A format-1 store is `Code::IncompatibleState`.
+    fn prepare_many(&mut self, notes: &[(ClaimKey, PreparedRecord)]) -> Result<()>;
     /// ONE transaction: the claim at `key` becomes `Created` for `target` (inserted if absent,
     /// upgraded if `Existing` of the same target); when `planned` is given a `Created` claim for
     /// it is inserted (an existing claim there owned by the same target is accepted); the note at
@@ -282,6 +286,27 @@ pub mod conformance {
         apply_recovery_applies_every_op_or_none(new_store());
         notes_and_claims_share_keys_but_not_tables(new_store());
         prepared_lists_notes_in_claim_key_byte_order(new_store());
+        prepare_many_inserts_all_or_none(new_store());
+    }
+
+    pub fn prepare_many_inserts_all_or_none<S: ClaimStore>(mut s: S) {
+        let first =
+            vec![(key(1, "a"), note("a")), (key(1, "b"), note("b")), (key(1, "c"), note("c"))];
+        s.prepare_many(&first).unwrap();
+        assert_eq!(s.prepared().unwrap(), first, "prepare_many: lists exactly the three notes");
+        // One fresh key and one already-noted key: all or none.
+        let mixed = vec![(key(1, "d"), note("d")), (key(1, "b"), note("other"))];
+        let err = s.prepare_many(&mixed).unwrap_err();
+        assert_eq!(err.code, Code::IoError, "prepare_many: an already-noted key is IoError");
+        assert_eq!(s.prepared().unwrap(), first, "prepare_many: the fresh key was not added");
+        // The same key twice in one slice.
+        let twice = vec![(key(2, "x"), note("x")), (key(2, "x"), note("y"))];
+        let err = s.prepare_many(&twice).unwrap_err();
+        assert_eq!(err.code, Code::IoError, "prepare_many: a repeated key is IoError");
+        assert_eq!(s.prepared().unwrap(), first, "prepare_many: a repeated key adds nothing");
+        // Empty.
+        s.prepare_many(&[]).unwrap();
+        assert_eq!(s.prepared().unwrap(), first, "prepare_many: an empty slice changes nothing");
     }
 
     pub fn prepared_lists_notes_in_claim_key_byte_order<S: ClaimStore>(mut s: S) {

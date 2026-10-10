@@ -8147,7 +8147,10 @@ remain equivalent.
 `--durability=strict` records PREPARE_COMMIT and COMMIT as one `prepared`
 row in the operation's claim store (`state.db`): the row is written and
 synced before the rename and is replaced by the target's `Created` claim
-in the same transaction after it. Recovery semantics are those of Section
+in the same transaction after it. The rows of up to 64 files (per batch, cut 9d) may be written in
+one synced transaction before their renames, and the claims that replace
+them committed in one transaction after; each row is still durable before
+its own rename. Recovery semantics are those of Section
 183. Under `--durability=normal` no commit record is written and Section
 183 does not apply: the existing-file policy reconciles a published but
 unclaimed file. A single-file operation follows the same rule with a

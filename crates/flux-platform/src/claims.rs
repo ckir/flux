@@ -283,6 +283,27 @@ impl ClaimStore for RedbClaimStore {
         })
     }
 
+    fn prepare_many(&mut self, notes: &[(ClaimKey, PreparedRecord)]) -> Result<()> {
+        self.require_prepared()?;
+        if notes.is_empty() {
+            return Ok(());
+        }
+        self.immediate(|tx| {
+            let mut table = tx.open_table(PREPARED).map_err(io_err)?;
+            for (key, record) in notes {
+                let k = key.encode();
+                if table.get(k.as_slice()).map_err(io_err)?.is_some() {
+                    return Err(FsError::new(
+                        Code::IoError,
+                        io::Error::other("a prepared note already exists at this key"),
+                    ));
+                }
+                table.insert(k.as_slice(), record.encode().as_slice()).map_err(io_err)?;
+            }
+            Ok(())
+        })
+    }
+
     fn commit_prepared(
         &mut self,
         key: &ClaimKey,
@@ -432,5 +453,99 @@ mod tests {
         eprintln!("MEASURED evictions={} used_bytes={}", stats.evictions(), stats.used_bytes());
         assert!(stats.evictions() > 0, "{stats:?}");
         assert!(stats.used_bytes() <= BOUND + BOUND / 8, "{stats:?}");
+    }
+
+    /// A memory-backed redb file that counts `sync_data` calls.
+    #[derive(Debug, Default)]
+    struct CountingBackend {
+        data: std::sync::Mutex<Vec<u8>>,
+        syncs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl redb::StorageBackend for CountingBackend {
+        fn len(&self) -> std::result::Result<u64, io::Error> {
+            Ok(self.data.lock().unwrap().len() as u64)
+        }
+
+        fn read(&self, offset: u64, out: &mut [u8]) -> std::result::Result<(), io::Error> {
+            let d = self.data.lock().unwrap();
+            let start = offset as usize;
+            let end = start
+                .checked_add(out.len())
+                .filter(|e| *e <= d.len())
+                .ok_or_else(|| io::Error::other("read past the end"))?;
+            out.copy_from_slice(&d[start..end]);
+            Ok(())
+        }
+
+        fn set_len(&self, len: u64) -> std::result::Result<(), io::Error> {
+            self.data.lock().unwrap().resize(len as usize, 0);
+            Ok(())
+        }
+
+        fn sync_data(&self) -> std::result::Result<(), io::Error> {
+            self.syncs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn write(&self, offset: u64, data: &[u8]) -> std::result::Result<(), io::Error> {
+            let mut d = self.data.lock().unwrap();
+            let start = offset as usize;
+            let end = start + data.len();
+            if d.len() < end {
+                d.resize(end, 0);
+            }
+            d[start..end].copy_from_slice(data);
+            Ok(())
+        }
+    }
+
+    fn a_note(target: &str) -> PreparedRecord {
+        PreparedRecord {
+            target: FluxPathKey(target.as_bytes().to_vec()),
+            temp_name: b"n.flux-partial.x".to_vec(),
+            identity: "strong:1:9".to_string(),
+            dir_path: String::new(),
+            name: b"n".to_vec(),
+            planned_name: Vec::new(),
+            replacement: false,
+        }
+    }
+
+    #[test]
+    fn prepare_many_costs_one_commit() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let backend = CountingBackend::default();
+        let syncs = std::sync::Arc::clone(&backend.syncs);
+        let db = Builder::new().create_with_backend(backend).unwrap();
+        let mut tx = db.begin_write().unwrap();
+        tx.set_durability(redb::Durability::Immediate).unwrap();
+        {
+            tx.open_table(CLAIMS).unwrap();
+            tx.open_table(PREPARED).unwrap();
+            tx.open_table(META).unwrap().insert("format", FORMAT).unwrap();
+        }
+        tx.commit().unwrap();
+        let mut store =
+            RedbClaimStore { db, durability: Durability::Strict, unsynced: 0, format: FORMAT };
+        let parent = ObjectId { volume: 1, index: 1 };
+
+        let before = syncs.load(SeqCst);
+        store.prepare(&ClaimKey::new(parent, OsStr::new("single")), &a_note("single")).unwrap();
+        let one = syncs.load(SeqCst) - before;
+
+        let notes: Vec<(ClaimKey, PreparedRecord)> = (0..64)
+            .map(|i| {
+                let n = format!("many-{i}");
+                (ClaimKey::new(parent, OsStr::new(&n)), a_note(&n))
+            })
+            .collect();
+        let before = syncs.load(SeqCst);
+        store.prepare_many(&notes).unwrap();
+        let many = syncs.load(SeqCst) - before;
+
+        assert!(one > 0, "a prepare must sync: {one}");
+        assert_eq!(many, one, "64 notes cost the syncs of one prepare");
+        assert_eq!(store.prepared().unwrap().len(), 65);
     }
 }
