@@ -66,7 +66,8 @@ pub struct TreeOutcome {
     /// Cut 9e: the longest data-sync barrier of a Strict tree's batches (wall time from the first worker's start to the
     /// last result). Zero when no batch synced.
     pub barrier_max: std::time::Duration,
-    /// Cut 9e: batches flushed because a sync barrier hit its cap (stays 0 until the cap exists).
+    /// Cut 9e: batches flushed because the open-writer cap was reached (`BatchPolicy::open_writers`): at it, the
+    /// shallowest pending batch flushes before the next file is staged. A cap flush that stops the run still counts.
     pub cap_flushes: u64,
 }
 
@@ -375,7 +376,9 @@ pub(crate) struct BatchPolicy {
     pub fold_precheck: bool,
     /// Cut 9e: the barrier's worker threads (`SYNC_THREADS`); a test uses 1 so the sync order is the entries' order.
     pub sync_threads: usize,
-    /// Cut 9e: how often the waiting main thread beats during the barrier (the run's heartbeat interval; never zero).
+    /// Cut 9e: how often the waiting main thread wakes to beat during the barrier: half the run's heartbeat interval
+    /// (`Pulse::beat` writes only once a full interval has passed since its last write). Never zero by construction:
+    /// `DEFAULT` is a non-zero constant and `batch_policy` clamps the halved interval to at least 1 ms.
     pub beat_every: std::time::Duration,
     /// Cut 9e: the most writers held open across the frame stack (`open_writers_cap`); at it, the shallowest pending
     /// batch flushes before the next file is staged. Never zero.
@@ -390,7 +393,9 @@ impl BatchPolicy {
         now: std::time::Instant::now,
         fold_precheck: true,
         sync_threads: SYNC_THREADS,
-        beat_every: crate::run::HEARTBEAT_INTERVAL,
+        beat_every: std::time::Duration::from_millis(
+            crate::run::HEARTBEAT_INTERVAL.as_secs() * 500,
+        ),
         open_writers: OPEN_WRITERS_MAX,
     };
 }
@@ -636,8 +641,9 @@ fn walk_into<F: DestinationRoot>(
                     ) else {
                         break;
                     };
-                    flush_batch(cx, dir, names, batch, out, on_report)?;
+                    // Counted before the `?`: a cap flush that stops the run was still a cap flush.
                     out.cap_flushes += 1;
+                    flush_batch(cx, dir, names, batch, out, on_report)?;
                 }
                 if let Some(Frame::Live { dir, names, claim_parent, fresh, batch, .. }) =
                     stack.last_mut()
@@ -4215,9 +4221,11 @@ mod tests {
         fs.delay("sync_all", std::time::Duration::from_millis(20));
         let p = BatchPolicy { beat_every: std::time::Duration::from_millis(10), ..one_worker() };
         let calls = std::cell::Cell::new(0u32);
+        let failed_at = std::cell::Cell::new(None);
         let beat = || {
             calls.set(calls.get() + 1);
             if calls.get() == k(3) + 1 {
+                failed_at.set(Some(fs.calls().len()));
                 Err(FsError::new(Code::IoError, std::io::Error::other("beat")))
             } else {
                 Ok(())
@@ -4227,6 +4235,12 @@ mod tests {
         assert_eq!(r.unwrap_err().step, CopyStep::Heartbeat);
         assert_eq!(fs.prepared_count(), 0);
         assert_eq!(calls.get(), k(3) + 1, "no heartbeat call after the one that failed");
+        // Mutant: the flush hands the barrier `&no_heartbeat`; the failing call then lands on the pair's own heartbeat.
+        // The failure must have happened inside the barrier: before the last sync was even begun.
+        let c = log(&fs);
+        let last_sync = *positions(&c, "sync_all(").last().expect("the barrier synced");
+        let at = failed_at.get().expect("the heartbeat failed");
+        assert!(at < last_sync, "failed at call {at}, the last sync is call {last_sync}: {c:?}");
         for i in 0..3 {
             assert!(!fs.exists(format!("/dst/f{i}.flux-partial.op1")));
         }
@@ -4330,10 +4344,10 @@ mod tests {
     }
 
     #[test]
-    fn the_default_policy_syncs_from_sixteen_threads_at_the_heartbeat_interval() {
+    fn the_default_policy_syncs_from_sixteen_threads_at_half_the_heartbeat_interval() {
         assert_eq!(
             (BatchPolicy::DEFAULT.sync_threads, BatchPolicy::DEFAULT.beat_every),
-            (16, crate::run::HEARTBEAT_INTERVAL)
+            (16, crate::run::HEARTBEAT_INTERVAL / 2)
         );
     }
 

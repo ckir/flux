@@ -509,8 +509,15 @@ enum Ended {
     Failed,
 }
 
-/// Cut 9d: the batch policy of a tree run, `BatchPolicy::DEFAULT` with cut 9e's `beat_every` the run's heartbeat
-/// interval. In a debug build, `FLUX_TEST_BATCH_AGE_MS=<n>`
+/// Cut 9e: how often the sync barrier's waiting thread wakes to beat: half the heartbeat interval, because
+/// `Pulse::beat` writes only once a full interval has passed since its last write, so a wake every full interval would
+/// write only every other time. Clamped to 1 ms so a zero interval cannot make the wait a busy loop.
+fn barrier_beat_every(cfg: &RunConfig) -> std::time::Duration {
+    (cfg.heartbeat_interval / 2).max(std::time::Duration::from_millis(1))
+}
+
+/// Cut 9d: the batch policy of a tree run, `BatchPolicy::DEFAULT` with cut 9e's `beat_every` from the run's heartbeat
+/// interval (`barrier_beat_every`). In a debug build, `FLUX_TEST_BATCH_AGE_MS=<n>`
 /// replaces its age (absent or unparsable: the default's), because the end-to-end stall tests count guard calls to
 /// pick a stall index, and an age flush on the real clock (a slow runner staging a batch for over a second) adds guard
 /// calls and shifts every index. Likewise `FLUX_TEST_OPEN_WRITERS=<n>` replaces `open_writers` (cut 9e: the cap derives
@@ -527,13 +534,13 @@ fn batch_policy(cfg: &RunConfig) -> crate::tree::BatchPolicy {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| crate::tree::open_writers_cap(cfg.descriptor_limit));
-    crate::tree::BatchPolicy { age, beat_every: cfg.heartbeat_interval, open_writers, ..default }
+    crate::tree::BatchPolicy { age, beat_every: barrier_beat_every(cfg), open_writers, ..default }
 }
 
 #[cfg(not(debug_assertions))]
 fn batch_policy(cfg: &RunConfig) -> crate::tree::BatchPolicy {
     crate::tree::BatchPolicy {
-        beat_every: cfg.heartbeat_interval,
+        beat_every: barrier_beat_every(cfg),
         open_writers: crate::tree::open_writers_cap(cfg.descriptor_limit),
         ..crate::tree::BatchPolicy::DEFAULT
     }
