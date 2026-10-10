@@ -850,7 +850,9 @@ mod tests {
         let fs = FaultFs::new();
         fs.write_file("/src", b"hello");
         let root = fs.destination_root(Path::new("/")).unwrap();
-        let staged = stage_hello(&fs, &root, SyncAt::Barrier);
+        let mut o = opts();
+        o.durability = Durability::Strict; // under `Normal` nothing syncs whatever `sync` is, so the assertion would be vacuous
+        let staged = stage_with(&fs, &root, &o, SyncAt::Barrier);
         assert!(staged.writer.is_some());
         assert!(!fs.called("sync_all("), "{:?}", fs.calls());
         assert_eq!(fs.read_file("/dst.flux-partial.op1").as_deref(), Some(&b"hello"[..]));
