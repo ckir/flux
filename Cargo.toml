@@ -24,6 +24,10 @@ harness = false
 [dev-dependencies]
 blake3 = { workspace = true }
 criterion = { workspace = true }
+flux-core = { workspace = true }
+flux-fs = { workspace = true }
+flux-platform = { workspace = true }
+tempfile = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

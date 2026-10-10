@@ -516,9 +516,10 @@ the spec's numbers, 9-10 were learned during execution).
 ## Scaffolding follow-ups
 
 - [ ] Run `lefthook install` in each clone (or add it to a bootstrap recipe)
-- [ ] Replace the placeholder `benches/copy.rs` once there is a pipeline to measure
-- [ ] Replace the placeholder test in `tests/integration/mod.rs` with the first
-      real case from spec §68.2
+- [x] Replace the placeholder `benches/copy.rs` once there is a pipeline to measure (#76: in-process criterion,
+      Normal and Strict, real-disk data dir, tmpfs refused)
+- [x] Replace the placeholder test in `tests/integration/mod.rs` with the first
+      real case from spec §68.2 (#75: engine-level cases; CLI-surface cases stay in `crates/flux-cli/tests`)
 
 ## Repository and CI hygiene
 
