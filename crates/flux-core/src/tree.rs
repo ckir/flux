@@ -5,7 +5,7 @@
 
 use crate::copy::{
     BeforeCreate, BeforePublish, CopyError, CopyStep, Guard, Heartbeat, PublishIntent, Stage,
-    Staged, copy_file_guarded, discard, no_before_create, no_before_publish, no_heartbeat,
+    Staged, SyncAt, copy_file_guarded, discard, no_before_create, no_before_publish, no_heartbeat,
     publish_staged, split_destination, stage_file, unguarded, weaker,
 };
 use crate::names::{NameIndex, Resolved};
@@ -229,7 +229,7 @@ impl WeakIdentityWarnings {
 /// `next` emits `DirEnd` for every such frame, so this stack cannot drift from the walk.
 // `Skipped` is a marker on a stack that holds one frame per directory DEPTH; the size of `Live` costs nothing there.
 #[allow(clippy::large_enum_variant)]
-enum Frame<D> {
+enum Frame<D: DirHandle> {
     Live {
         dir: D,
         /// `Strong` identities of the directories this operation created INSIDE `dir`.
@@ -251,7 +251,7 @@ enum Frame<D> {
         /// target's claim was recorded.
         fresh: bool,
         /// Cut 9d: the files staged in `dir` and not yet published, flushed through `dir` before it is dropped.
-        batch: Batch,
+        batch: Batch<D::Writer>,
     },
     /// Its directory failed; everything below it is skipped, and was reported once.
     Skipped,
@@ -366,7 +366,7 @@ impl BatchPolicy {
 }
 
 /// Cut 9d: one staged file waiting in its directory's batch for the flush that notes and publishes it.
-struct Pending {
+struct Pending<W> {
     /// Relative to the source root, as the walk reports it.
     path: PathBuf,
     /// The planned name, the rename's destination.
@@ -377,7 +377,7 @@ struct Pending {
     planned: Option<ClaimKey>,
     /// The note without the temporary's name and identity (`write_note`'s template).
     template: PreparedRecord,
-    staged: Staged,
+    staged: Staged<W>,
     target: FluxPathKey,
     /// `Plan::Replace`'s `stored` and `meta`; `None` for a new file.
     replaced: Option<(OsString, Metadata)>,
@@ -385,12 +385,18 @@ struct Pending {
 
 /// Cut 9d: a directory's staged files (spec decision 3), the staged source bytes, when the first was staged, and the
 /// ASCII-folded names of the pending entries (decision 6).
-#[derive(Default)]
-struct Batch {
-    pending: Vec<Pending>,
+struct Batch<W> {
+    pending: Vec<Pending<W>>,
     bytes: u64,
     since: Option<std::time::Instant>,
     folded: HashSet<Vec<u8>>,
+}
+
+// Manual, so that no `W: Default` bound appears (the writer is never constructed here).
+impl<W> Default for Batch<W> {
+    fn default() -> Self {
+        Batch { pending: Vec::new(), bytes: 0, since: None, folded: HashSet::new() }
+    }
 }
 
 /// Decision 6's fold: ASCII lowercase of the name's encoded bytes, the fold `reserved_path` compares with.
@@ -885,7 +891,7 @@ fn copy_one<F: DestinationRoot>(
     cx: &Shared<'_, F>,
     parent: &F::Dir,
     names: &mut NameIndex,
-    batch: &mut Batch,
+    batch: &mut Batch<F::Writer>,
     claim_parent: Option<ObjectId>,
     fresh: bool,
     path: PathBuf,
@@ -1278,14 +1284,14 @@ fn stage_into_batch<F: DestinationRoot>(
     cx: &Shared<'_, F>,
     parent: &F::Dir,
     names: &mut NameIndex,
-    batch: &mut Batch,
+    batch: &mut Batch<F::Writer>,
     src: &Path,
     path: PathBuf,
     publish: Publish,
     before_create: &BeforeCreate<'_>,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
-    pending: impl FnOnce(PathBuf, Staged) -> Pending,
+    pending: impl FnOnce(PathBuf, Staged<F::Writer>) -> Pending<F::Writer>,
 ) -> std::result::Result<(), CopyError> {
     // Decision 6: anything at this entry's temporary name (on a folding destination, a pending sibling's temporary,
     // which `stage_file`'s step-1 sweep would delete) publishes the pending entries first.
@@ -1312,7 +1318,19 @@ fn stage_into_batch<F: DestinationRoot>(
     }
     let name = path.file_name().expect("a walk path ends in a name");
     let opts = CopyOptions { existing: ExistingPolicy::Overwrite, publish, ..cx.opts.clone() };
-    let stage = || stage_file(cx.fs, src, parent, name, &opts, cx.guard, cx.beat, before_create);
+    let stage = || {
+        stage_file(
+            cx.fs,
+            src,
+            parent,
+            name,
+            &opts,
+            cx.guard,
+            cx.beat,
+            before_create,
+            SyncAt::Staging,
+        )
+    };
     let staged = match stage() {
         Err(e)
             if e.step == CopyStep::Create
@@ -1353,7 +1371,7 @@ fn flush_batch<F: DestinationRoot>(
     cx: &Shared<'_, F>,
     parent: &F::Dir,
     names: &mut NameIndex,
-    batch: &mut Batch,
+    batch: &mut Batch<F::Writer>,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<(), CopyError> {

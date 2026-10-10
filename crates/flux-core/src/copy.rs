@@ -460,18 +460,32 @@ pub fn copy_file_at<F: DestinationRoot>(
 }
 
 /// What `stage_file` produced: a closed temporary on disk, ready to be renamed to its name.
-pub(crate) struct Staged {
+pub(crate) struct Staged<W> {
     pub temp: OsString,
     pub identity: FileIdentity,
     pub bytes_copied: u64,
     pub metadata_failures: Vec<MetadataFailure>,
     pub identity_degraded: Option<FileIdentity>,
+    /// Cut 9e: the temporary's open writer, `Some` only for a file staged at `SyncAt::Barrier` (whose data sync the
+    /// caller owes, once per batch); `None` at `SyncAt::Staging`, which has already synced and closed it.
+    pub writer: Option<W>,
+}
+
+/// Cut 9e: where `stage_file` pays a Strict file's data `fsync`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SyncAt {
+    /// Inline, after the metadata step; the writer is dropped on return (the single copy, and the unbatched path).
+    Staging,
+    /// Not at all: the open writer is handed out in `Staged.writer` for the caller's barrier.
+    // Constructed by the tree's batch flush in a later cut 9e task; until then only the tests reach it.
+    #[allow(dead_code)]
+    Barrier,
 }
 
 /// The result of `stage_file`: the step-2b skip (changes nothing on disk), or a staged temporary.
-pub(crate) enum Stage {
+pub(crate) enum Stage<W> {
     Skipped(Outcome),
-    Staged(Staged),
+    Staged(Staged<W>),
 }
 
 /// Steps 1-7 of the copy, up to and including the source recheck and the read of the temporary's identity: everything
@@ -487,7 +501,8 @@ pub(crate) fn stage_file<F: DestinationRoot>(
     guard: &Guard<'_>,
     beat: &Heartbeat<'_>,
     before_create: &BeforeCreate<'_>,
-) -> std::result::Result<Stage, CopyError> {
+    sync: SyncAt,
+) -> std::result::Result<Stage<F::Writer>, CopyError> {
     let temp = temp_name(name, &opts.operation_id);
 
     // 1. this invocation's own leftover, if any (§18.1). A no-op in practice: the
@@ -569,20 +584,6 @@ pub(crate) fn stage_file<F: DestinationRoot>(
         }
     }
 
-    // 5. durability
-    if opts.durability == Durability::Strict
-        && let Err(e) = writer.sync_all()
-    {
-        return Err(discard(
-            parent,
-            &temp,
-            CopyStep::Durability,
-            Code::StrictDurabilityUnavailable,
-            e.source,
-            guard,
-        ));
-    }
-
     // 6. metadata, on the temporary, BEFORE publication (§44.1)
     let mut metadata_failures = Vec::new();
 
@@ -618,6 +619,22 @@ pub(crate) fn stage_file<F: DestinationRoot>(
         metadata_failures.push(MetadataFailure { item: MetadataItem::Permissions, error: e });
     }
 
+    // 6b. durability (cut 9e: after the metadata, so the one sync covers the times and permissions as well as the data;
+    //     at `SyncAt::Barrier` the caller syncs the returned writer, once per batch).
+    if sync == SyncAt::Staging
+        && opts.durability == Durability::Strict
+        && let Err(e) = writer.sync_all()
+    {
+        return Err(discard(
+            parent,
+            &temp,
+            CopyStep::Durability,
+            Code::StrictDurabilityUnavailable,
+            e.source,
+            guard,
+        ));
+    }
+
     // 7. the source must not have changed under us (Section 33), then publish.
     //    Note the `match` rather than `?`: a `?` here would return with the temporary
     //    still on disk, which is the one leak the `discard` helper exists to prevent.
@@ -647,7 +664,18 @@ pub(crate) fn stage_file<F: DestinationRoot>(
     // Cut 7b: the object about to be published, read from its own handle - a rename keeps it - so the run records the
     // target's identity without a look-up by name after the rename.
     let identity = writer.identity().unwrap_or(FileIdentity::Unavailable);
-    Ok(Stage::Staged(Staged { temp, identity, bytes_copied, metadata_failures, identity_degraded }))
+    let writer = match sync {
+        SyncAt::Staging => None,
+        SyncAt::Barrier => Some(writer),
+    };
+    Ok(Stage::Staged(Staged {
+        temp,
+        identity,
+        bytes_copied,
+        metadata_failures,
+        identity_degraded,
+        writer,
+    }))
 }
 
 /// Copy `src` to `name` inside `parent`, writing ONLY through `parent`.
@@ -691,10 +719,12 @@ pub fn copy_file_guarded<F: DestinationRoot>(
     before_create: &BeforeCreate<'_>,
     before_publish: &BeforePublish<'_>,
 ) -> std::result::Result<Outcome, CopyError> {
-    let staged = match stage_file(fs, src, parent, name, opts, guard, beat, before_create)? {
-        Stage::Skipped(outcome) => return Ok(outcome),
-        Stage::Staged(staged) => staged,
-    };
+    let staged =
+        match stage_file(fs, src, parent, name, opts, guard, beat, before_create, SyncAt::Staging)?
+        {
+            Stage::Skipped(outcome) => return Ok(outcome),
+            Stage::Staged(staged) => staged,
+        };
     // Cut 9c: the hook sees the temporary and its identity before the final heartbeat and guard. Its error is returned
     // as is, after the temporary is discarded like any other pre-rename failure.
     let intent = PublishIntent { temp: staged.temp.clone(), identity: staged.identity };
@@ -715,7 +745,7 @@ pub fn copy_file_guarded<F: DestinationRoot>(
 pub(crate) fn publish_staged<D: DirHandle>(
     parent: &D,
     name: &OsStr,
-    staged: Staged,
+    staged: Staged<D::Writer>,
     publish: Publish,
     guard: &Guard<'_>,
     beat: &Heartbeat<'_>,
@@ -726,7 +756,10 @@ pub(crate) fn publish_staged<D: DirHandle>(
         bytes_copied,
         metadata_failures,
         identity_degraded,
+        writer,
     } = staged;
+    // Cut 9e: a file published at the barrier was synced there; either way no descriptor is held across the rename.
+    drop(writer);
     // §99 (`S99_check`, then the `S99_write` below): publish only while the lock is still this run's. Otherwise the
     // temporary stays - removing it would be a mutation too - and is reported as the leftover.
     if let Err(e) = beat() {
@@ -781,16 +814,30 @@ mod tests {
         }
     }
 
-    fn stage_hello(fs: &FaultFs, root: &<FaultFs as DestinationRoot>::Dir) -> Staged {
+    fn stage_hello(
+        fs: &FaultFs,
+        root: &<FaultFs as DestinationRoot>::Dir,
+        sync: SyncAt,
+    ) -> Staged<<FaultFs as FileSystem>::Writer> {
+        stage_with(fs, root, &opts(), sync)
+    }
+
+    fn stage_with(
+        fs: &FaultFs,
+        root: &<FaultFs as DestinationRoot>::Dir,
+        opts: &CopyOptions,
+        sync: SyncAt,
+    ) -> Staged<<FaultFs as FileSystem>::Writer> {
         match stage_file(
             fs,
             Path::new("/src"),
             root,
             OsStr::new("dst"),
-            &opts(),
+            opts,
             &unguarded,
             &no_heartbeat,
             &no_before_create,
+            sync,
         ) {
             Ok(Stage::Staged(s)) => s,
             Ok(Stage::Skipped(_)) => panic!("unexpectedly skipped"),
@@ -799,11 +846,38 @@ mod tests {
     }
 
     #[test]
+    fn staging_at_the_barrier_keeps_the_writer_open_and_does_not_sync() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        let root = fs.destination_root(Path::new("/")).unwrap();
+        let staged = stage_hello(&fs, &root, SyncAt::Barrier);
+        assert!(staged.writer.is_some());
+        assert!(!fs.called("sync_all("), "{:?}", fs.calls());
+        assert_eq!(fs.read_file("/dst.flux-partial.op1").as_deref(), Some(&b"hello"[..]));
+    }
+
+    #[test]
+    fn staging_inline_syncs_once_after_the_metadata_step_and_returns_no_writer() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        let root = fs.destination_root(Path::new("/")).unwrap();
+        let mut o = opts(); // `opts()` already sets `preserve_times: Preserve::Default`, so `set_times` is called
+        o.durability = Durability::Strict;
+        let staged = stage_with(&fs, &root, &o, SyncAt::Staging);
+        assert!(staged.writer.is_none());
+        let c = fs.calls();
+        let sync = c.iter().position(|x| x.starts_with("sync_all(")).expect("synced");
+        let times = c.iter().position(|x| x.starts_with("set_times(")).expect("times set");
+        assert!(times < sync, "metadata before the sync: {c:?}");
+        assert_eq!(c.iter().filter(|x| x.starts_with("sync_all(")).count(), 1);
+    }
+
+    #[test]
     fn stage_file_leaves_a_closed_temporary_and_no_target() {
         let fs = FaultFs::new();
         fs.write_file("/src", b"hello");
         let root = fs.destination_root(Path::new("/")).unwrap();
-        let staged = stage_hello(&fs, &root);
+        let staged = stage_hello(&fs, &root, SyncAt::Staging);
 
         assert_eq!(staged.bytes_copied, 5);
         assert_eq!(staged.temp, OsString::from("dst.flux-partial.op1"));
@@ -822,7 +896,7 @@ mod tests {
         let fs = FaultFs::new();
         fs.write_file("/src", b"hello");
         let root = fs.destination_root(Path::new("/")).unwrap();
-        let staged = stage_hello(&fs, &root);
+        let staged = stage_hello(&fs, &root, SyncAt::Staging);
         let identity = staged.identity;
         let out = publish_staged(
             &root,
@@ -847,7 +921,7 @@ mod tests {
         let fs = FaultFs::new();
         fs.write_file("/src", b"hello");
         let root = fs.destination_root(Path::new("/")).unwrap();
-        let staged = stage_hello(&fs, &root);
+        let staged = stage_hello(&fs, &root, SyncAt::Staging);
         let e = publish_staged(
             &root,
             OsStr::new("dst"),
