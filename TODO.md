@@ -552,6 +552,32 @@ the spec's numbers, 9-10 were learned during execution).
   flush, is covered by `an_abort_drains_every_frame`; the `copy_one` form is not); the `discard_prepared` fallback after a failed rename when
   `apply_recovery` also fails; the É/é non-ASCII fold on a real folding filesystem (the fake folds ASCII only; reasoned, not measured).
 
+## Cut 9e known limits
+
+1. First threads in the engine. The shipped binary builds with `panic = "abort"` (`Cargo.toml:111`), so a worker panic is a hard crash, not a
+   reported failure; it is safe for the recovery matrix (no note exists yet, the sweep removes the temps) but is not a handled error. In
+   unwinding test builds the panic propagates out of the scope and fails the test. No catch-and-report path is built.
+2. The barrier lengthens the window between the temps' creation and the notes by up to the slowest sync; the post-barrier guard bounds the lock
+   risk, not the source-change window (9d known limit 5 still applies).
+3. A shallow pending batch still waits while a subtree is walked (9d limit 5), now holding descriptors; the cap in decision 7 bounds that.
+4. The gain is measured on Linux ext4 only.
+5. One file per directory gets no benefit (9d limit 1).
+6. The heartbeat is itself a synced write (`lock/held.rs:48`), so on a filesystem where a burst of concurrent `fsync` calls holds the journal, the
+   heartbeat can queue behind the barrier and arrive late. Today's per-file `fsync` has the same exposure at a smaller scale. Not measured here:
+   the acceptance run records the longest barrier and the longest heartbeat gap, and reports them.
+7. A `sync_all` that hangs (a dead network mount) hangs the run exactly as today's inline sync does: the system call is not cancellable. The
+   main thread keeps the heartbeat going during the wait, so the lease stays alive; no timeout or cancel is built, and none is claimed.
+
+## Cut 9e debt
+
+- [ ] 9e-2: a Linux `syncfs(2)` on the destination filesystem at the barrier (measured 93-94% faster in the spike) ships only if (a) a capability
+  probe not depending on the kernel version string shows the kernel reports writeback errors from `syncfs` (5.8 and later), and (b) `syncfs` is
+  measured under a heavy (tens of GiB) background writer; otherwise it is dropped and recorded here. See the 9e spec, decision 9.
+- [ ] The acceptance measurement's figures (the longest barrier, the longest heartbeat gap, cap flushes; Strict small/flat ratios against the 9d head)
+  are filled in by Task 7 of the 9e plan.
+- [ ] `FaultFs::on_nth` keeps one hook per call name (`hooks.insert` replaces, `crates/flux-core/src/fault_fs.rs`); a second `on_nth` on the same name
+  silently wins. Document or key by (name, nth).
+
 ## Scaffolding follow-ups
 
 - [ ] Run `lefthook install` in each clone (or add it to a bootstrap recipe)
