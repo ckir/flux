@@ -573,6 +573,7 @@ the spec's numbers, 9-10 were learned during execution).
 - [ ] 9e-2: a Linux `syncfs(2)` on the destination filesystem at the barrier (measured 93-94% faster in the spike) ships only if (a) a capability
   probe not depending on the kernel version string shows the kernel reports writeback errors from `syncfs` (5.8 and later), and (b) `syncfs` is
   measured under a heavy (tens of GiB) background writer; otherwise it is dropped and recorded here. See the 9e spec, decision 9.
+- [x] The drain after a lost-lock or heartbeat-failure stop ran the data-sync barrier (and, after a heartbeat failure, published): fixed by owner ruling B2' (9e spec decision 10).
 - [ ] The acceptance measurement's figures (the longest barrier, the longest heartbeat gap, cap flushes; Strict small/flat ratios against the 9d head)
   are filled in by Task 7 of the 9e plan.
 - [ ] `FaultFs::on_nth` keeps one hook per call name (`hooks.insert` replaces, `crates/flux-core/src/fault_fs.rs`); a second `on_nth` on the same name

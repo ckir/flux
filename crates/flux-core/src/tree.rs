@@ -561,7 +561,13 @@ pub(crate) fn copy_tree_at<F: DestinationRoot>(
     let walked = walk_into(cx, events, root_identity, &mut stack, out, on_report);
     // Cut 9d, spec decision 5(e): every live frame's batch is flushed whatever the walk returned; the walk's own error
     // wins over a stop of the drain.
-    let drained = drain_batches(cx, &mut stack, out, on_report, walked.is_err());
+    let mode = match &walked {
+        // Tested first: a lost lock noticed at a heartbeat step is still a lost lock.
+        Err(e) if e.code() == Code::TargetLockBusy => DrainMode::KeepAll(copy_of(&e.cause)),
+        Err(e) if e.step == CopyStep::Heartbeat => DrainMode::RemoveAll(copy_of(&e.cause)),
+        _ => DrainMode::Publish,
+    };
+    let drained = drain_batches(cx, &mut stack, out, on_report, walked.is_err(), mode);
     let walked = walked.and(drained);
     // The walk emits no `Dir` for the root, so no `DirEnd` pops it, and a frame is skipped only when pushed.
     match stack.into_iter().next() {
@@ -1779,22 +1785,69 @@ fn report_leftover(
     report(out, on_report, path, TreeFailureCause::Copy(e));
 }
 
+/// Cut 9e, owner ruling B2': what the drain does after the walk, by how the walk ended.
+enum DrainMode {
+    /// The walk finished, or failed in an ordinary way: every batch is flushed and published (cut 9d decision 5(e)).
+    Publish,
+    /// The walk stopped with a lost lock: nothing is written or removed (spec decision 8); every pending temporary is
+    /// kept and reported with this error.
+    KeepAll(FsError),
+    /// The walk stopped at a failed heartbeat with the lock held: a failed heartbeat is the copy's failure (cut 7b),
+    /// so every pending temporary is removed (guarded), with no barrier and no note.
+    RemoveAll(FsError),
+}
+
 /// Cut 9d, spec decision 5(e): flush every live frame's batch, from the top of the stack down, WITHOUT popping (the
 /// root frame goes back to `copy_tree_at`'s caller). The first stop is returned, unless the walk already failed or an
 /// earlier frame stopped: such a later stop is dropped (spec decision 8), or reported at its leftover's path when it
 /// carries one (plan ruling 2).
+///
+/// Cut 9e, owner ruling B2' (2026-10-10): after a lost-lock or heartbeat-failure stop the drain performs that stop's
+/// cleanup only, with no data-sync barrier, no note and no rename. A failed heartbeat is the copy's failure (cut 7b),
+/// so the drain no longer publishes after one; `mode` says which stop the walk ended with.
 fn drain_batches<F: DestinationRoot>(
     cx: &Shared<'_, F>,
     stack: &mut [Frame<F::Dir>],
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
     walk_failed: bool,
+    mode: DrainMode,
 ) -> std::result::Result<(), CopyError> {
     let mut first: Option<CopyError> = None;
     for frame in stack.iter_mut().rev() {
         let Frame::Live { dir, names, batch, .. } = frame else {
             continue;
         };
+        match &mode {
+            DrainMode::Publish => {}
+            DrainMode::KeepAll(lost) => {
+                for mut p in std::mem::take(batch).pending {
+                    p.staged.writer = None;
+                    report_kept(p.path, &p.staged.temp, lost, out, on_report);
+                }
+                continue;
+            }
+            DrainMode::RemoveAll(cause) => {
+                let mut entries = std::mem::take(batch).pending;
+                for p in &mut entries {
+                    p.staged.writer = None;
+                }
+                if !entries.is_empty() {
+                    let failed: Vec<Option<FsError>> = entries.iter().map(|_| None).collect();
+                    // The returned stop is the walk's own error, already returned; its cleanup reported what it left.
+                    let _ = stop_held_before_notes(
+                        cx,
+                        dir,
+                        entries,
+                        failed,
+                        copy_of(cause),
+                        out,
+                        on_report,
+                    );
+                }
+                continue;
+            }
+        }
         if let Err(e) = flush_batch(cx, dir, names, batch, out, on_report) {
             if walk_failed || first.is_some() {
                 // Spec decision 8: the stop is dropped (the returned error already says it), unless it carries a
@@ -4244,6 +4297,107 @@ mod tests {
         for i in 0..3 {
             assert!(!fs.exists(format!("/dst/f{i}.flux-partial.op1")));
         }
+    }
+
+    /// Cut 9e, owner ruling B2': `a0`, `m/x`, `m/y`, `z`; the guard calls and the heartbeats made up to and including the
+    /// last of each before `m/y`'s temporary is created, read from an unfailing run's log. `a0` and `m/x` are then
+    /// pending (in the root's and in `m`'s batch) when a failure at that call stops the walk.
+    fn stop_points_at_the_staging_of_my() -> (u32, u32) {
+        let fs = sources(&[("a0", b"a"), ("m/x", b"x"), ("m/y", b"y"), ("z", b"z")]);
+        let guards = std::cell::RefCell::new(Vec::new());
+        let beats = std::cell::RefCell::new(Vec::new());
+        let guard = || {
+            guards.borrow_mut().push(fs.calls().len());
+            Ok(())
+        };
+        let beat = || {
+            beats.borrow_mut().push(fs.calls().len());
+            Ok(())
+        };
+        let (r, _, _) = batched_with(&fs, one_worker(), Durability::Strict, &guard, &beat);
+        r.unwrap();
+        let c = log(&fs);
+        let at = created(&c, "m/y");
+        let before = |v: &std::cell::RefCell<Vec<usize>>| {
+            v.borrow().iter().filter(|&&len| len <= at).count() as u32
+        };
+        (before(&guards), before(&beats))
+    }
+
+    #[test]
+    fn a_lost_lock_mid_walk_drains_by_keeping_and_reporting_every_pending_temporary_without_a_sync()
+    {
+        // Mutant: a drain mode that is always `Publish` syncs, notes and publishes the pending files after the loss.
+        let (guard_calls, _) = stop_points_at_the_staging_of_my();
+        let fs = sources(&[("a0", b"a"), ("m/x", b"x"), ("m/y", b"y"), ("z", b"z")]);
+        let calls = std::cell::Cell::new(0);
+        // The guard call that guards `m/y`'s temporary is the last one before its creation.
+        let guard = failing_after(guard_calls - 1, &calls);
+        let (r, out, got) =
+            batched_with(&fs, one_worker(), Durability::Strict, &guard, &no_heartbeat);
+        let error = r.unwrap_err();
+        assert_eq!(error.code(), Code::TargetLockBusy, "{error:?}");
+        let c = log(&fs);
+        assert_eq!(
+            count(&c, "create_new(/dst/m/y"),
+            0,
+            "the loss hit before m/y was staged: {c:?}"
+        );
+        assert_eq!(count(&c, "sync_all("), 0, "no barrier after the loss: {c:?}");
+        assert_eq!(count(&c, "claim_prepare_many("), 0, "{c:?}");
+        assert_eq!(count(&c, "rename_"), 0, "{c:?}");
+        for t in ["/dst/a0.flux-partial.op1", "/dst/m/x.flux-partial.op1"] {
+            assert!(fs.exists(t), "{t} is kept");
+        }
+        assert!(!fs.exists("/dst/a0") && !fs.exists("/dst/m/x"));
+        let mut kept: Vec<PathBuf> = leftovers(&got, Some(&error));
+        kept.sort();
+        assert_eq!(kept, [temp_of("a0"), temp_of("m/x")], "{got:?} {error:?}");
+        for f in &got {
+            let TreeFailureCause::Copy(e) = &f.cause else { panic!("{got:?}") };
+            assert_eq!(e.code(), Code::TargetLockBusy, "{e:?}");
+        }
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(fs.prepared_count(), 0);
+        assert_eq!(out.files_copied, 0);
+    }
+
+    #[test]
+    fn a_heartbeat_failure_mid_walk_drains_by_removing_every_pending_temporary_without_a_sync() {
+        let (_, beat_calls) = stop_points_at_the_staging_of_my();
+        let fs = sources(&[("a0", b"a"), ("m/x", b"x"), ("m/y", b"y"), ("z", b"z")]);
+        let calls = std::cell::Cell::new(0);
+        // The heartbeat before `m/y`'s temporary fails, and every later one.
+        let beat = || {
+            calls.set(calls.get() + 1);
+            if calls.get() >= beat_calls {
+                Err(FsError::new(Code::IoError, std::io::Error::other("beat")))
+            } else {
+                Ok(())
+            }
+        };
+        let (r, out, got) = batched_with(&fs, one_worker(), Durability::Strict, &unguarded, &beat);
+        assert_eq!(r.unwrap_err().step, CopyStep::Heartbeat);
+        let c = log(&fs);
+        assert_eq!(
+            count(&c, "create_new(/dst/m/y"),
+            0,
+            "the failure hit before m/y was staged: {c:?}"
+        );
+        assert!(
+            count(&c, "create_new(/dst/m/x") > 0 && count(&c, "create_new(/dst/a0") > 0,
+            "{c:?}"
+        );
+        assert_eq!(count(&c, "sync_all("), 0, "no barrier after the failure: {c:?}");
+        assert_eq!(count(&c, "claim_prepare_many("), 0, "{c:?}");
+        assert_eq!(count(&c, "rename_"), 0, "{c:?}");
+        for t in ["/dst/a0.flux-partial.op1", "/dst/m/x.flux-partial.op1"] {
+            assert!(!fs.exists(t), "{t} is removed: {c:?}");
+        }
+        assert!(!fs.exists("/dst/a0") && !fs.exists("/dst/m/x"));
+        assert_eq!(fs.prepared_count(), 0);
+        assert!(got.is_empty(), "every removal succeeded: {got:?}");
+        assert_eq!(out.files_copied, 0);
     }
 
     #[test]

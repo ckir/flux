@@ -98,6 +98,15 @@ is not the engine and the real gain is smaller (reads, renames and about 25 othe
    only if a task first (a) finds a probe that does not depend on the kernel version string, and (b) measures `syncfs` under a heavy
    (tens of GiB) writer. Otherwise 9e-2 is dropped and recorded as such. 9e-1 must not preclude it: the barrier is one function behind
    `BatchPolicy`.
+10. **Drain after a stop (owner ruling, 2026-10-10, after the capstone).** The drain that follows the walk (9d decision 5(e)) has three modes,
+    chosen from how the walk ended. `Publish`: the walk finished or failed in an ordinary way, so every live frame's batch is flushed in full
+    (barrier, notes, renames), unchanged. `KeepAll`: the walk stopped with a lost lock (`TargetLockBusy`, tested first, so a lost lock noticed
+    at a heartbeat step is still a lost lock): nothing is written or removed (decision 8); every pending temporary is kept and reported as a
+    `TargetLockBusy` copy failure whose leftover is the temporary, with no barrier, no note and no guard call. `RemoveAll`: the walk stopped
+    at a failed heartbeat (`CopyStep::Heartbeat`) with the lock held: a failed heartbeat is the copy's failure (cut 7b), so every pending
+    temporary is removed (guarded), with no barrier and no note; a temporary that cannot be removed is reported as a leftover. This changes
+    9d's drain-after-heartbeat-failure behaviour: the drain used to go on and publish the remaining batches (the heartbeat's failure was
+    swallowed and the ownership re-checked); it now removes them, and the files are recopied at `--resume`.
 
 ## Interfaces added or changed (names are the plan's contract; signatures are final in the plan)
 
