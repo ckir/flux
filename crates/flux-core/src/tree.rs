@@ -1468,8 +1468,7 @@ fn flush_batch<F: DestinationRoot>(
             None => ok.push(p),
         }
     }
-    let mut bad = bad.into_iter();
-    while let Some((p, f)) = bad.next() {
+    for (p, f) in bad {
         let failed_copy = discard(
             parent,
             &p.staged.temp,
@@ -1478,16 +1477,10 @@ fn flush_batch<F: DestinationRoot>(
             f.source,
             cx.guard,
         );
-        if let Err(stop) = finish_copy(p.path, Err(failed_copy), out, on_report) {
-            // A stop: nothing more is written; every entry not yet settled is reported kept.
-            for (q, _) in bad {
-                report_kept(q.path, &q.staged.temp, &stop.cause, out, on_report);
-            }
-            for q in ok {
-                report_kept(q.path, &q.staged.temp, &stop.cause, out, on_report);
-            }
-            return Err(stop);
-        }
+        // A stop cannot fire here today: `discard` keeps the sync's code (`StrictDurabilityUnavailable`) and reports a lost
+        // lock as a kept leftover. If it ever does, the flush stops and the remaining entries' temporaries are left for
+        // the resume sweep, like any crash before the notes.
+        finish_copy(p.path, Err(failed_copy), out, on_report)?;
     }
     if ok.is_empty() {
         return Ok(());
