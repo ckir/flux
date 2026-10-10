@@ -43,6 +43,7 @@ fn config() -> RunConfig {
         before_mutation: None,
         heartbeat_interval: run::HEARTBEAT_INTERVAL,
         resume: false,
+        descriptor_limit: None,
     }
 }
 

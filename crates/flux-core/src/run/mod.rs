@@ -64,6 +64,9 @@ pub struct RunConfig {
     pub heartbeat_interval: std::time::Duration,
     /// `--resume`: continue the one resumable prior operation as itself.
     pub resume: bool,
+    /// Cut 9e: the process's soft descriptor limit (`flux_platform::soft_descriptor_limit()`), which caps the writers a
+    /// batched tree holds open; `None` when unknown (Windows) or in a test that does not care.
+    pub descriptor_limit: Option<u64>,
 }
 
 /// §101's heartbeat interval: 5 s.
@@ -80,6 +83,7 @@ impl std::fmt::Debug for RunConfig {
             .field("before_mutation", &self.before_mutation.is_some())
             .field("heartbeat_interval", &self.heartbeat_interval)
             .field("resume", &self.resume)
+            .field("descriptor_limit", &self.descriptor_limit)
             .finish()
     }
 }
@@ -491,7 +495,8 @@ enum Ended {
 /// interval. In a debug build, `FLUX_TEST_BATCH_AGE_MS=<n>`
 /// replaces its age (absent or unparsable: the default's), because the end-to-end stall tests count guard calls to
 /// pick a stall index, and an age flush on the real clock (a slow runner staging a batch for over a second) adds guard
-/// calls and shifts every index. A release build has no override.
+/// calls and shifts every index. Likewise `FLUX_TEST_OPEN_WRITERS=<n>` replaces `open_writers` (cut 9e: the cap derives
+/// from the host's descriptor limit, and a small one would flush early and shift the same indices).
 #[cfg(debug_assertions)]
 fn batch_policy(cfg: &RunConfig) -> crate::tree::BatchPolicy {
     let default = crate::tree::BatchPolicy::DEFAULT;
@@ -500,13 +505,18 @@ fn batch_policy(cfg: &RunConfig) -> crate::tree::BatchPolicy {
         .and_then(|v| v.parse().ok())
         .map(std::time::Duration::from_millis)
         .unwrap_or(default.age);
-    crate::tree::BatchPolicy { age, beat_every: cfg.heartbeat_interval, ..default }
+    let open_writers = std::env::var("FLUX_TEST_OPEN_WRITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| crate::tree::open_writers_cap(cfg.descriptor_limit));
+    crate::tree::BatchPolicy { age, beat_every: cfg.heartbeat_interval, open_writers, ..default }
 }
 
 #[cfg(not(debug_assertions))]
 fn batch_policy(cfg: &RunConfig) -> crate::tree::BatchPolicy {
     crate::tree::BatchPolicy {
         beat_every: cfg.heartbeat_interval,
+        open_writers: crate::tree::open_writers_cap(cfg.descriptor_limit),
         ..crate::tree::BatchPolicy::DEFAULT
     }
 }

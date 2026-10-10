@@ -15,8 +15,9 @@ redb = { workspace = true }
 # `accessat` for the write-protection guard in `std_fs.rs`. Unix only: Windows has no
 # equivalent that is worth the cost, and its own `rename` already refuses a read-only
 # destination, so the attribute check suffices there.
+# Its `process` feature: `getrlimit` for `soft_descriptor_limit` (cut 9e).
 [target.'cfg(unix)'.dependencies]
-rustix = { workspace = true }
+rustix = { workspace = true, features = ["process"] }
 
 # `FILE_ID_INFO` for object identity in `std_fs.rs`. The 64-bit file index std exposes
 # is not unique on ReFS (§107, §109.1), so identity needs the 128-bit id, which is only

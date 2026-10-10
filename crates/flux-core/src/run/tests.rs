@@ -34,6 +34,7 @@ fn cfg() -> RunConfig {
         // Plan decision 6: the existing tests never heartbeat.
         heartbeat_interval: std::time::Duration::from_secs(3600),
         resume: false,
+        descriptor_limit: None,
     }
 }
 

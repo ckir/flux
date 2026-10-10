@@ -161,6 +161,7 @@ fn run_config(args: &CopyArgs) -> RunConfig {
         before_mutation: debug_hook(),
         heartbeat_interval: heartbeat_interval(),
         resume: args.resume,
+        descriptor_limit: flux_platform::soft_descriptor_limit(),
     }
 }
 

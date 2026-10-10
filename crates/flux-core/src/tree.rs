@@ -349,6 +349,19 @@ pub(crate) const BATCH_AGE: std::time::Duration = std::time::Duration::from_secs
 const DEFAULT_FILES: usize = BATCH_FILES;
 /// Cut 9e: the data-sync barrier's worker threads (spec decision 2): at most this many `fsync`s in flight at once.
 pub(crate) const SYNC_THREADS: usize = 16;
+/// Cut 9e (spec decision 7): the most staged files whose writers are held open at once across the walk's whole frame
+/// stack; each pending entry holds one descriptor until its batch's barrier.
+pub(crate) const OPEN_WRITERS_MAX: usize = 256;
+
+/// Cut 9e: the open-writer cap for a soft descriptor limit: a quarter of it (the rest is left for the walk's directory
+/// handles, the claim store, the source reads and the barrier), at most `OPEN_WRITERS_MAX`, at least 1. `None` (no limit
+/// known, as on Windows) is `OPEN_WRITERS_MAX`.
+pub(crate) fn open_writers_cap(soft_limit: Option<u64>) -> usize {
+    match soft_limit {
+        None => OPEN_WRITERS_MAX,
+        Some(limit) => usize::try_from(limit / 4).unwrap_or(usize::MAX).clamp(1, OPEN_WRITERS_MAX),
+    }
+}
 
 /// Cut 9d: the flush thresholds of a Strict tree's per-directory batch, and the clock the age is read from. Carried in
 /// `Shared` so tests inject small thresholds and a fake clock (plan ruling 4). `files == 1` never batches.
@@ -364,6 +377,9 @@ pub(crate) struct BatchPolicy {
     pub sync_threads: usize,
     /// Cut 9e: how often the waiting main thread beats during the barrier (the run's heartbeat interval; never zero).
     pub beat_every: std::time::Duration,
+    /// Cut 9e: the most writers held open across the frame stack (`open_writers_cap`); at it, the shallowest pending
+    /// batch flushes before the next file is staged. Never zero.
+    pub open_writers: usize,
 }
 
 impl BatchPolicy {
@@ -375,6 +391,7 @@ impl BatchPolicy {
         fold_precheck: true,
         sync_threads: SYNC_THREADS,
         beat_every: crate::run::HEARTBEAT_INTERVAL,
+        open_writers: OPEN_WRITERS_MAX,
     };
 }
 
@@ -609,6 +626,19 @@ fn walk_into<F: DestinationRoot>(
             }
             WalkEvent::File { path } => {
                 out.files_total += 1;
+                // Cut 9e (decision 7): the writers held open across every live frame stay under the cap. At it, the
+                // shallowest frame with a pending entry flushes (the longest-waiting batch, and the one the walk is
+                // least likely to add to), through the same `flush_batch` a `DirEnd` uses; each flush empties one batch.
+                debug_assert!(cx.batch.open_writers >= 1);
+                while pending_total(stack) >= cx.batch.open_writers {
+                    let Some(Frame::Live { dir, names, batch, .. }) = stack.iter_mut().find(
+                        |f| matches!(f, Frame::Live { batch, .. } if !batch.pending.is_empty()),
+                    ) else {
+                        break;
+                    };
+                    flush_batch(cx, dir, names, batch, out, on_report)?;
+                    out.cap_flushes += 1;
+                }
                 if let Some(Frame::Live { dir, names, claim_parent, fresh, batch, .. }) =
                     stack.last_mut()
                 {
@@ -667,6 +697,17 @@ fn walk_into<F: DestinationRoot>(
         }
     }
     Ok(())
+}
+
+/// Cut 9e: the writers held open across the stack, one per pending entry of every live frame.
+fn pending_total<D: DirHandle>(stack: &[Frame<D>]) -> usize {
+    stack
+        .iter()
+        .map(|f| match f {
+            Frame::Live { batch, .. } => batch.pending.len(),
+            _ => 0,
+        })
+        .sum()
 }
 
 /// P3-F: a path below the source root, so below DEST, that IS a reserved control directory - `.flux/operations`,
@@ -4294,5 +4335,54 @@ mod tests {
             (BatchPolicy::DEFAULT.sync_threads, BatchPolicy::DEFAULT.beat_every),
             (16, crate::run::HEARTBEAT_INTERVAL)
         );
+    }
+
+    // Cut 9e (spec decision 7): the open-writer cap across the frame stack.
+
+    #[test]
+    fn open_writers_cap_is_a_quarter_of_the_soft_limit_capped_at_256_and_at_least_1() {
+        assert_eq!(open_writers_cap(None), 256);
+        assert_eq!(open_writers_cap(Some(1024)), 256);
+        assert_eq!(open_writers_cap(Some(4096)), 256);
+        assert_eq!(open_writers_cap(Some(64)), 16);
+        assert_eq!(open_writers_cap(Some(3)), 1);
+    }
+
+    #[test]
+    fn the_cap_flushes_the_shallowest_pending_batch_first_and_never_holds_more_writers() {
+        let fs = sources(&[("a0", b"a"), ("m/x", b"x"), ("m/y", b"y"), ("m/z", b"z"), ("w", b"w")]);
+        let p = BatchPolicy { open_writers: 2, ..one_worker() };
+        let (r, out, _) = batched(&fs, p, Durability::Strict);
+        r.unwrap();
+        let c = log(&fs);
+        // Running count of live writers over the log: +1 at create_new, -1 at drop_writer; never above 2.
+        let (mut live, mut peak) = (0i64, 0i64);
+        for x in &c {
+            if x.starts_with("create_new(") {
+                live += 1;
+                peak = peak.max(live);
+            } else if x.starts_with("drop_writer(") {
+                live -= 1;
+            }
+        }
+        assert_eq!(peak, 2, "{c:?}");
+        assert!(
+            renamed(&c, "a0") < created(&c, "m/y"),
+            "the parent's batch flushes before m/y is staged: {c:?}"
+        );
+        assert_eq!(out.files_copied, 5);
+        assert!(out.cap_flushes >= 1, "{}", out.cap_flushes);
+    }
+
+    #[test]
+    fn many_small_directories_never_trip_the_cap() {
+        let entries: Vec<(String, Vec<u8>)> =
+            (0..40).map(|d| (format!("d{d:02}/f"), b"f".to_vec())).collect();
+        let refs: Vec<(&str, &[u8])> =
+            entries.iter().map(|(p, b)| (p.as_str(), b.as_slice())).collect();
+        let fs = sources(&refs);
+        let (r, out, _) = batched(&fs, one_worker(), Durability::Strict);
+        r.unwrap();
+        assert_eq!((out.files_copied, out.cap_flushes), (40, 0));
     }
 }

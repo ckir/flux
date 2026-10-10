@@ -81,6 +81,8 @@ impl Stalled {
             // Pin the batch age to an hour: the stall indices count guard calls, which a real-clock age flush
             // would shift (cut 9d).
             .env("FLUX_TEST_BATCH_AGE_MS", "3600000")
+            // Pin the open-writer cap to its ceiling: a small host descriptor limit would flush early (cut 9e).
+            .env("FLUX_TEST_OPEN_WRITERS", "256")
             .envs(env.iter().copied())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
