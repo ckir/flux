@@ -38,7 +38,8 @@ is not the engine and the real gain is smaller (reads, renames and about 25 othe
    (default `SYNC_THREADS = 16`, the best measured count) workers, fewer when fewer entries are pending. `sync_threads == 1` is a sequential loop
    on the same code path, and is the seam tests use for a deterministic call order. No new dependency. A worker calls `sync_all` and nothing else:
    never the guard, the heartbeat or the claim store. **The main thread keeps the lease alive:** while workers run it waits on their results with a
-   timeout of `heartbeat_interval` and calls the heartbeat on every timeout (the heartbeat closure never leaves the main thread), because a barrier
+   **absolute deadline** (`next_beat = last_beat + heartbeat_interval`; each wait is `recv_timeout(next_beat - now)`, never a fresh full interval, or a
+   steady stream of results would reset the timer and starve the heartbeat) and calls the heartbeat when the deadline passes (the heartbeat closure never leaves the main thread), because a barrier
    can take seconds (11 s measured under a background writer) and a record older than the lease threshold can be taken over by another run
    (`lock/obtain.rs:208`). A heartbeat that fails during the wait ends the wait only after the workers are joined (the scope needs them), and is
    then handled as decision 5's heartbeat case.
@@ -60,7 +61,10 @@ is not the engine and the real gain is smaller (reads, renames and about 25 othe
    dependency between the old step 5 and 6. If the plan finds a test that pins the old order, the test is re-derived, not the order kept.
    **The writers are closed right after the barrier:** `flush_batch` takes every `Staged.writer` out and drops it (on every exit path, including
    a failed heartbeat or a lost lock) before `prepare_many` and before any rename, as the 9d staging did. A rename or an unlink of a file with an
-   open handle fails or misbehaves on Windows, which the Windows CI would surface and no Linux test can.
+   open handle fails or misbehaves on Windows, which the Windows CI would surface and no Linux test can. Closing a descriptor here is not a
+   mutation in the section 99 sense: the barrier has just synced every successful entry, so nothing of theirs is dirty and the close writes
+   nothing (a failed-sync entry is discarded, and its dirty data is of no interest); the close therefore precedes the post-barrier guard
+   without contradicting decision 5.
 7. **Open-writer budget.** A pending entry now holds a descriptor. A directory frame holds at most 64 entries, but the walker's stack holds
    several frames. `OPEN_WRITERS_MAX = 256` run-wide: before staging a new entry while the stack already holds that many, the walker flushes pending
    batches shallowest frame first until it is below the cap. The cap is a `BatchPolicy` field (`open_writers`) so a test can set it to 2.
@@ -95,7 +99,12 @@ flush trigger of 9d, and the order data -> note -> rename.
   are published and claimed, and `prepare_many` carries only the successful entries.
 - **Lease:** with a barrier that outlasts `heartbeat_interval` (a fake sync that sleeps), the heartbeat is called during the wait, from the main
   thread only.
-- **Heartbeat failure after the barrier:** every temp removed, none left, no note; **lost lock after the barrier:** see below.
+- **Heartbeat failure after the barrier:** every temp removed, none left, no note. **Lost lock after the barrier:** every temp kept as a
+  leftover, no note, nothing removed. Each is red under ITS OWN mutant, because the "skip the barrier" mutant leaves both green (the post-barrier
+  check still fails and still leaves the temps): drop the post-barrier guard (the lost-lock test then renames and notes); treat a failed
+  heartbeat like a lost lock (the heartbeat test then leaves temps behind).
+- **Deadline:** a fake whose workers each finish just inside `heartbeat_interval` still sees the heartbeat called once the interval has passed
+  in total (mutant: a fresh full timeout per receive).
 - **Writers closed:** after the barrier and before `prepare_many`, no writer of the batch is alive (observed through the fake), on the success
   path and on both failure paths.
 - **Equivalence:** the same tree under `sync_threads` 1 and 16 produces the same outcome set, claims and counters.
@@ -105,7 +114,8 @@ flush trigger of 9d, and the order data -> note -> rename.
 - **Thread safety:** the fake's call log and fault table are exercised from several threads without a race (the fake's own tests).
 - **Re-derived:** the 9d end-to-end stall constants in `recovery.rs`/`run.rs`, and the cut 9c/9d `run/tests.rs` cases whose call sequence moved.
   Oracle: the 9d tests; a value that looks wrong is surfaced, not edited to match.
-- **Non-vacuity:** each new test is shown red under a logic mutant (skip the barrier; sync after `prepare_many`; swallow a failed result).
+- **Non-vacuity:** each new test is shown red under a logic mutant, named per test: skip the barrier or sync after `prepare_many` (the order
+  test); swallow a failed result (the partial-failure test); the mutants named above for the lost-lock, heartbeat and deadline tests.
 
 ## Measurement (acceptance)
 
@@ -130,6 +140,9 @@ If a gate fails the PR states it, as PR #82 did; thresholds are not moved.
 3. A shallow pending batch still waits while a subtree is walked (9d limit 5), now holding descriptors; the cap in decision 7 bounds that.
 4. The gain is measured on Linux ext4 only.
 5. One file per directory gets no benefit (9d limit 1).
+6. The heartbeat is itself a synced write (`lock/held.rs:48`), so on a filesystem where a burst of concurrent `fsync` calls holds the journal, the
+   heartbeat can queue behind the barrier and arrive late. Today's per-file `fsync` has the same exposure at a smaller scale. Not measured here:
+   the acceptance run records the longest barrier and the longest heartbeat gap, and reports them.
 
 ## Out of scope
 
