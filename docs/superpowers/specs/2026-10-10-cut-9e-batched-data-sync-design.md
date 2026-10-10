@@ -43,6 +43,7 @@ is not the engine and the real gain is smaller (reads, renames and about 25 othe
    can take seconds (11 s measured under a background writer) and a record older than the lease threshold can be taken over by another run
    (`lock/obtain.rs:208`). A heartbeat that fails during the wait ends the wait only after the workers are joined (the scope needs them), and is
    then handled as decision 5's heartbeat case; once a heartbeat has failed, the wait goes on joining without calling it again.
+   Implementation note (final review, 2026-10-10): the barrier's wake cadence is HALF the heartbeat interval, clamped to at least 1 ms, because `Pulse::beat` writes the record only once a full interval has passed since the last write; a wake every full interval would write only every other time.
 3. **`FileSystem::Writer` must be `Sync`.** Today the associated type is only `FileHandle` (`crates/flux-fs/src/fs.rs:125`, and the twin at
    :227); `sync_all` is already `&self`, so the cut adds `Sync` to the bound and the plan checks every implementor (the real std and Windows
    writers, the fake, the `NullWriter` test double at :453) against it.
@@ -161,7 +162,7 @@ If a gate fails the PR states it, as PR #82 did; thresholds are not moved.
 
 1. First threads in the engine. The shipped binary builds with `panic = "abort"` (`Cargo.toml:111`), so a worker panic is a hard crash, not a
    reported failure; it is safe for the recovery matrix (no note exists yet, the sweep removes the temps) but is not a handled error. In
-   unwinding test builds the panic propagates out of the scope and fails the test. No catch-and-report path is built.
+   unwinding test builds the panic propagates out of the scope and fails the test. No catch-and-report path is built. A thread the OS refuses to spawn is not a panic: a worker that cannot be spawned is skipped; with no worker spawned the syncs run on the main thread.
 2. The barrier lengthens the window between the temps' creation and the notes by up to the slowest sync; the post-barrier guard bounds the lock
    risk, not the source-change window (9d known limit 5 still applies).
 3. A shallow pending batch still waits while a subtree is walked (9d limit 5), now holding descriptors; the cap in decision 7 bounds that.

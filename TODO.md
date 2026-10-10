@@ -544,7 +544,7 @@ the spec's numbers, 9-10 were learned during execution).
   near full and the age trigger is not the limit). The remaining time is the one data `fsync` per file (about 70% of syscall time under
   `perf trace`, about 6 ms each): batching removed the cheaper claim `fdatasync` calls. Going further needs a batched or overlapped data sync
   (`syncfs` per batch, parallel fsync), which changes what "durable before publish" means: its own design and cut.
-- [ ] Hardening: a lost lock noticed only inside a cleanup `discard` (heartbeat-stop cleanup, per-entry `prepare` fallback) does not stop the flush,
+- [ ] Hardening: a lost lock noticed only inside a cleanup `discard` (heartbeat-stop cleanup, per-entry `prepare` fallback, and cut 9e's failed-sync discard in `flush_batch`) does not stop the flush,
   so store writes can still happen before the next guard (recovery handles every resulting state; spec decision 8's "writes nothing" holds for the
   guard-detected loss). (The `prepare_many` fallback's stop, a store error carrying `TargetLockBusy`, no longer drops the remaining entries: each is
   reported with its temporary kept, `a_stop_in_the_per_entry_prepare_fallback_reports_every_other_entry`.)
@@ -577,6 +577,11 @@ the spec's numbers, 9-10 were learned during execution).
   are filled in by Task 7 of the 9e plan.
 - [ ] `FaultFs::on_nth` keeps one hook per call name (`hooks.insert` replaces, `crates/flux-core/src/fault_fs.rs`); a second `on_nth` on the same name
   silently wins. Document or key by (name, nth).
+
+- [ ] A cross-platform real-filesystem Strict test copying a READ-ONLY source with an mtime check: the inline sync now runs after
+  `set_permissions`/`set_times`, and no CI test exercises `FlushFileBuffers`/`F_FULLFSYNC` after a handle-level read-only attribute.
+- [ ] Error precedence in the non-batched Strict path: when both the `Preserve::Strict` metadata step and the sync fail, `MetadataApplyFailed`
+  is now reported instead of `StrictDurabilityUnavailable` (a consequence of the sync moving after the metadata step).
 
 ## Scaffolding follow-ups
 
