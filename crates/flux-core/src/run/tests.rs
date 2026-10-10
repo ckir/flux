@@ -5395,3 +5395,19 @@ fn a_failed_recovery_transaction_is_retried_by_the_next_resume() {
     assert_eq!(fs.claim(strong(&fs, "/p/dest"), "a"), created("a"));
     assert_eq!(fs.claim(strong(&fs, "/p/dest/sub"), "b"), created("sub\0b"));
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_zero_open_writers_override_is_floored_to_one() {
+    // nextest runs each test in its own process, so the env is private to this test.
+    // SAFETY: single-threaded at this point; no other thread reads the environment in this test process.
+    unsafe { std::env::set_var("FLUX_TEST_OPEN_WRITERS", "0") };
+    let p = batch_policy(&cfg());
+    assert_eq!(p.open_writers, 1);
+    unsafe { std::env::set_var("FLUX_TEST_OPEN_WRITERS", "abc") };
+    assert_eq!(
+        batch_policy(&cfg()).open_writers,
+        crate::tree::open_writers_cap(cfg().descriptor_limit)
+    );
+    unsafe { std::env::remove_var("FLUX_TEST_OPEN_WRITERS") };
+}

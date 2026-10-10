@@ -582,6 +582,7 @@ the spec's numbers, 9-10 were learned during execution).
   `set_permissions`/`set_times`, and no CI test exercises `FlushFileBuffers`/`F_FULLFSYNC` after a handle-level read-only attribute.
 - [ ] Error precedence in the non-batched Strict path: when both the `Preserve::Strict` metadata step and the sync fail, `MetadataApplyFailed`
   is now reported instead of `StrictDurabilityUnavailable` (a consequence of the sync moving after the metadata step).
+- [ ] The end-to-end stall oracles pin `FLUX_TEST_BATCH_AGE_MS` and `FLUX_TEST_OPEN_WRITERS` so no age or cap flush moves a guard index; a clock injectable from the CLI (the tree already takes `BatchPolicy.now`) would let an end-to-end test exercise an age flush deterministically instead of blinding the oracles to it (capstone round 3 recommendation).
 
 ## Scaffolding follow-ups
 

@@ -521,7 +521,8 @@ fn barrier_beat_every(cfg: &RunConfig) -> std::time::Duration {
 /// replaces its age (absent or unparsable: the default's), because the end-to-end stall tests count guard calls to
 /// pick a stall index, and an age flush on the real clock (a slow runner staging a batch for over a second) adds guard
 /// calls and shifts every index. Likewise `FLUX_TEST_OPEN_WRITERS=<n>` replaces `open_writers` (cut 9e: the cap derives
-/// from the host's descriptor limit, and a small one would flush early and shift the same indices).
+/// from the host's descriptor limit, and a small one would flush early and shift the same indices). 0 is floored to 1, the
+/// same floor as `open_writers_cap`.
 #[cfg(debug_assertions)]
 fn batch_policy(cfg: &RunConfig) -> crate::tree::BatchPolicy {
     let default = crate::tree::BatchPolicy::DEFAULT;
@@ -532,7 +533,8 @@ fn batch_policy(cfg: &RunConfig) -> crate::tree::BatchPolicy {
         .unwrap_or(default.age);
     let open_writers = std::env::var("FLUX_TEST_OPEN_WRITERS")
         .ok()
-        .and_then(|v| v.parse().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.max(1))
         .unwrap_or_else(|| crate::tree::open_writers_cap(cfg.descriptor_limit));
     crate::tree::BatchPolicy { age, beat_every: barrier_beat_every(cfg), open_writers, ..default }
 }
