@@ -57,7 +57,7 @@ Failure modes the spec implies that no single mechanism task owns; each has a te
 **Files:**
 - Modify: `crates/flux-fs/src/fs.rs:103-108` (`FileHandle`), `:125` (`FileSystem::Writer`), `:227` (`DirHandle::Writer`)
 - Modify: `crates/flux-core/src/copy.rs:462-474` (`Staged`, `Stage`), `:481-490` (`stage_file` signature), `:572-583` (step 5), `:649-650` (the return), `:694` and `:709` (`copy_file_guarded`), `:715-730` (`publish_staged`)
-- Modify: `crates/flux-core/src/tree.rs:1315` (the `stage()` closure), `:369-394` (`Pending`, `Batch`), `:232-258` (`Frame`), plus every signature naming them (`copy_one :884`, `stage_into_batch :1277-1289`, `flush_batch :1352-1359`, `drain_batches :1577-1583`, `enter_dir :680-690`, `walk_into :533-540`, `copy_tree_at :512-519`)
+- Modify: `crates/flux-core/src/tree.rs:1315` (the `stage()` closure), `:369-394` (`Pending`, `Batch`), `:232-258` (`Frame`), plus every signature naming them (`copy_one :884`, `stage_into_batch :1277-1289`, `flush_batch :1352-1359`, `drain_batches :1577-1583`, `enter_dir :680-690`, `walk_into :533-540`, and the frame construction in `copy_tree_at :512-519`)
 - Test: `crates/flux-core/src/copy.rs` (test module, `stage_hello` at `:784`)
 
 **Interfaces:**
@@ -120,7 +120,7 @@ Add `stage_with(fs, root, opts, sync) -> Staged<FakeHandle>` beside `stage_hello
 
 **Interfaces:**
 - Produces: `pub(crate) struct SyncOutcome { pub results: Vec<Result<(), FsError>>, pub heartbeat: Option<FsError> }`; `pub(crate) fn sync_staged_many<W: FileHandle + Sync>(writers: &[&W], threads: usize, beat: &Heartbeat<'_>, beat_every: Duration) -> SyncOutcome`.
-- Fake: `FaultFs::delay(&self, name: &str, d: Duration)` (only `"sync_all"` is honoured; others are stored and ignored); the call-log string `drop_writer(<path>)`; `FaultFs::peak_concurrent_syncs(&self) -> usize` (the most `sync_all` calls in flight at once, counted under the fake's lock at entry and exit of `FakeHandle::sync_all`, the sleep between them).
+- Fake: `FaultFs::delay(&self, name: &str, d: Duration)` (only `"sync_all"` is honoured; others are stored and ignored); the call-log string `drop_writer(<path>)`; `FaultFs::peak_concurrent_syncs(&self) -> usize` (the most `sync_all` calls in flight at once, counted under the fake's lock at entry and exit of `FakeHandle::sync_all`); `FaultFs::rendezvous(&self, name: &str, parties: usize, timeout: Duration)` (only `"sync_all"` honoured): each `sync_all` call, after incrementing the in-flight count, waits on a `Condvar` until the count reaches `parties` or `timeout` passes, so concurrency is proven by a meeting, not by a race against the scheduler.
 
 - [ ] **Step 0: State verification.** `FakeHandle::sync_all` records `sync_all(<path>)` and consults `sync_fault` only (`fault_fs.rs:661-672`); there is no `impl Drop for FakeHandle` (`rg "impl Drop" crates/flux-core/src/fault_fs.rs` lists `FakeClaimStore` and `FakeLock` only). Otherwise STOP with `STATE_MISMATCH`.
 
@@ -179,14 +179,17 @@ fn the_heartbeat_is_called_from_the_main_thread_once_the_interval_has_passed_in_
 
 #[test]
 fn sixteen_threads_sync_concurrently() {
-    // Mutant: ignore `threads` (one worker) -> the peak is 1. Eight 20 ms syncs on eight workers overlap on any machine
-    // that can start two threads within 20 ms; the assertion is `>= 2`, not 8, so a loaded runner cannot flake it.
+    // Deterministic: every sync waits for a second one to be in flight (or 2 s). With real workers the two meet at
+    // once and the peak is >= 2; under the mutant "ignore `threads`, one worker" each sync waits out the 2 s alone and
+    // the peak stays 1 (red, and slow: a mutant run, not CI). No sleep, no scheduler race.
     let fs = FaultFs::new();
-    fs.delay("sync_all", Duration::from_millis(20));
+    fs.rendezvous("sync_all", 2, Duration::from_secs(2));
     let ws = handles(&fs, 8);
     let refs: Vec<&FakeHandle> = ws.iter().collect();
+    let started = std::time::Instant::now();
     sync_staged_many(&refs, 16, &no_heartbeat, Duration::from_secs(5));
     assert!(fs.peak_concurrent_syncs() >= 2, "{}", fs.peak_concurrent_syncs());
+    assert!(started.elapsed() < Duration::from_secs(2), "the syncs met; nobody waited out the timeout");
 }
 
 #[test]
@@ -235,7 +238,7 @@ fn sync_all_from_several_threads_records_every_call() {
   - The main thread: `let start = Instant::now(); let mut deadline = start + beat_every; let mut slots: Vec<Option<Result<..>>> = vec![None; n]` (use a `Vec<Option<_>>` built with `resize_with`; `FsError` is not `Clone`); loop while `received < n`: `match rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))` - `Ok((i, r))` stores it; `Err(Timeout)` => if `heartbeat.is_none() { if let Err(e) = beat() { heartbeat = Some(e) } }` then `deadline += beat_every` (an absolute step, never "now + interval"); `Err(Disconnected)` => break.
   - After the scope: `results = slots.into_iter().map(|s| s.expect("every index is sent exactly once")).collect()`. A worker panic propagates out of the scope (spec known limit 1); no catch.
   - `Heartbeat` is `dyn Fn` without `Send`, so `beat` must be used only in the main thread's loop, never captured by a spawned closure.
-- [ ] **Step 4: Implement the fake additions.** `Inner.delays: HashMap<String, Duration>` and `pub fn delay(&self, name: &str, d: Duration)`; in `FakeHandle::sync_all`, read the delay under the lock, release the lock, then `std::thread::sleep`, then record and fault as today (the record must stay under its own short lock, so concurrent syncs interleave in the log without a race). `Inner.syncs_in_flight` and `Inner.syncs_peak` (both `usize`), incremented and decremented in `sync_all` around the sleep, read by `peak_concurrent_syncs`. `impl Drop for FakeHandle`: if `self.sink` is `Some`, push `format!("drop_writer({})", self.path.display())` to `calls`. Check that no existing test asserts an exact full call log that a trailing `drop_writer(` would now break (`rg "assert_eq!\(.*calls\(\)" crates/flux-core/src` and read each hit); if one does, extend its expected list rather than filtering the log.
+- [ ] **Step 4: Implement the fake additions.** `Inner.delays: HashMap<String, Duration>` and `pub fn delay(&self, name: &str, d: Duration)`; in `FakeHandle::sync_all`, read the delay under the lock, release the lock, then `std::thread::sleep`, then record and fault as today (the record must stay under its own short lock, so concurrent syncs interleave in the log without a race). `Inner.syncs_in_flight` and `Inner.syncs_peak` (both `usize`), incremented and decremented in `sync_all` around the sleep, read by `peak_concurrent_syncs`; `Inner.rendezvous: Option<(usize, Duration)>` with a `Condvar` beside the fake's `Mutex` (an `Arc<(Mutex<Inner>, Condvar)>` is the smallest change if `FaultFs.inner` cannot grow a sibling field; the implementer picks and says which): `sync_all` increments the count, `notify_all`s, then `wait_timeout_while` until `in_flight >= parties` or the timeout, then proceeds; the decrement happens after the (optional) sleep. `impl Drop for FakeHandle`: if `self.sink` is `Some`, push `format!("drop_writer({})", self.path.display())` to `calls`. Check that no existing test asserts an exact full call log that a trailing `drop_writer(` would now break (`rg "assert_eq!\(.*calls\(\)" crates/flux-core/src` and read each hit); if one does, extend its expected list rather than filtering the log.
 
 - [ ] **Step 5: Gate.** `just check` - green.
 
@@ -442,6 +445,7 @@ fn the_default_policy_syncs_from_sixteen_threads_at_the_heartbeat_interval() {
 - Modify: `crates/flux-core/src/run/mod.rs:50-67` (`RunConfig.descriptor_limit: Option<u64>`), `batch_policy`
 - Modify: `crates/flux-platform/src/lib.rs` (`pub fn soft_descriptor_limit() -> Option<u64>`), `crates/flux-platform/Cargo.toml:18-19` (`rustix = { workspace = true, features = ["process"] }` on the unix dependency)
 - Modify: `crates/flux-cli/src/main.rs:154-165` (`run_config` sets `descriptor_limit: flux_platform::soft_descriptor_limit()`; the literal at `:305-315` is a `CleanupConfig` and is untouched)
+- Modify: `crates/flux-cli/tests/recovery.rs:60` and `:259-260`, `crates/flux-cli/tests/run.rs:83` (the `Stalled` helpers pin `FLUX_TEST_OPEN_WRITERS=256`; see Step 3)
 - Modify: every other FULL `RunConfig` literal (one without a `..base` struct update) sets `descriptor_limit: None`: `crates/flux-core/tests/safety_std_fs.rs:125`, `crates/flux-core/tests/replace_std_fs.rs:25` and `:114`, and those of the 20 literals in `crates/flux-core/src/run/tests.rs` (`:27`, `:40` and the rest) that do not end in `..cfg()` or `..restart()` (12 of the 20 do and need nothing). `rg -n "RunConfig \{" crates` prints 29 lines: the struct (`run/mod.rs:50`), its `Debug` impl (`:72`) and 27 literals.
 - Test: `tree.rs` test module; `flux-platform` unit test
 
