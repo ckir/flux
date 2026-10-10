@@ -559,6 +559,16 @@ Runs ONLY after the owner says so, from the top-level session with no other tool
 
 ---
 
+## Panel record (adversarial-panel-review, 2026-10-10)
+
+Four rounds with agy on this plan; GREEN at round 4 (seats: Cascade Analyst, Axiom Breaker, Mechanism Gamer, Literal Implementer, State Corruptor;
+no live challenge). Folded: rounds 1-3 as listed in the rulings and tasks (RunConfig count, `FLUX_TEST_OPEN_WRITERS`, rendezvous test, indices,
+lost-lock loop, Task 4 files, stop inside a failed-sync discard, `Option<FsError>` per entry, the rendezvous's own lock) plus the solo pass's ruling 9.
+REJECTED (measured or read): "the heartbeat inside the barrier contradicts the spec's barrier -> close -> heartbeat order" (spec decision 2 puts
+the main thread's beats inside the wait; decision 5 orders the pair); "the writers-closed test's heartbeat scenario has no post-barrier beat"
+(it fails at the pair's call, K+1; the sketch now says so). Rounds 3-4 carried agy's drafting notes ahead of the report; the reports and the
+echo lines were complete.
+
 ## Self-review (run after writing; results recorded here)
 
 1. **Spec coverage.** Decision 1 -> Tasks 1, 3. Decision 2 (threads, deadline, main-thread heartbeat, join-before-return) -> Task 2 and ruling 4. Decision 3 (`Sync` bound) -> Task 1. Decisions 4-5 (positional results, the order barrier/close/pair/discard/notes, reports never shadowed, no new guard) -> Task 3 Step 3 and its tests 2, 7, 8, and Step 4's oracle check. Decision 6 (metadata before sync, writers closed before the pair) -> Tasks 1 and 3 (test 4). Decision 7 (cap, RLIMIT) -> Task 4. Decision 8 (platforms) -> no code; CI is the oracle. Decision 9 (9e-2) -> Task 6 debt. Interfaces: `SyncOutcome` and `sync_staged_many(entries, threads, beat, interval)` -> Task 2 (`writers: &[&W]` is the "entries"); `barrier_max`, `cap_flushes` -> Tasks 3, 4, 5. Tests section: order, partial failure, lease, heartbeat-after, lost-lock-after, deadline, writers closed, equivalence, `barrier_max`, cap, thread safety, re-derived oracles, non-vacuity -> Tasks 2-4 (the "lease" test is Task 2's deadline test, which asserts the main thread id). Measurement -> Task 7. Known limits -> Task 6. Gap: none found.
