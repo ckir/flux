@@ -3720,6 +3720,33 @@ mod tests {
     }
 
     #[test]
+    fn a_metadata_failure_with_pending_entries_reports_only_that_file() {
+        let fs = sources(&[("a", b"a"), ("b", b"b"), ("c", b"c")]);
+        // The green run's call log, counting `metadata` calls: /src, /src, /dst/a, /src/a, /dst/a, /src/a, /dst/b,
+        // /dst/b's temporary (decision 6's probe), then /src/b: the 9th is the 5(b) stat of b, paid because a is pending
+        // (a's own stat is skipped: its batch is empty).
+        fs.fail_nth("metadata", 9, Code::PermissionDenied, ErrorKind::PermissionDenied);
+        let (r, out, got) = batched(&fs, policy(64), Durability::Strict);
+        r.unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].path, PathBuf::from("b"));
+        let TreeFailureCause::Copy(e) = &got[0].cause else { panic!("{got:?}") };
+        assert_eq!(e.step, CopyStep::Source, "{e:?}");
+        let c = log(&fs);
+        let stats = positions(&c, "metadata(");
+        assert_eq!(c[stats[8]], "metadata(/src/b)", "the fault hit b's 5(b) stat: {c:?}");
+        assert_eq!(count(&c, "create_new(/dst/b"), 0, "nothing was created for b: {c:?}");
+        for f in ["a", "c"] {
+            assert!(published(&fs, f) && claimed(&fs, f), "{f}");
+        }
+        assert!(!fs.exists("/dst/b"));
+        assert!(!fs.exists("/dst/b.flux-partial.op1"));
+        assert_eq!(prepares(&c), ["claim_prepare_many(2)"], "{c:?}");
+        assert_eq!(out.files_copied, 2);
+        assert_eq!(fs.prepared_count(), 0);
+    }
+
+    #[test]
     fn an_abort_drains_every_frame() {
         let fs = sources(&[("a", b"a"), ("b", b"b"), ("m/x", b"x")]);
         let calls = std::cell::Cell::new(0);
