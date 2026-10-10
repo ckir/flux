@@ -180,6 +180,15 @@ decision 9's two conditions are met; a per-file directory sync (cut 9c known lim
 - `syncfs` as the 9e core (the owner's driver's first synthesis): deferred to 9e-2 on the two conditions above; agy rejects it outright. The
   two positions were left unresolved by AGY-NEGOTIATE and the owner chose the split.
 
+- Panel rounds 1-5 (agy, 2026-10-10). REJECTED: "`next_beat - now` panics when `now` is later" (measured on rustc 1.99.0: `Instant - Instant`
+  returns 0ns); "a heartbeat failure inside the rename loop is misclassified GONE" (`tree.rs` ~1487-1503, the 9d stop-held path removes the later
+  temps before the `apply_recovery` that discards the notes, and it is 9d code, not 9e); "closing the writers before the guard breaks the
+  lost-lock rule" (after a successful barrier nothing is dirty, so the close writes nothing; decision 6); "discard-failed-sync is catastrophic
+  because a foreign `syncfs` error aborts the batch" (that is `syncfs`, deferred to 9e-2; a discarded batch loses no data). UNVERIFIED-ACCEPTED:
+  the heartbeat queueing behind the journal (known limit 6), measured at acceptance. Round 5 ended with all findings folded and no round-6 run
+  (the round cap asks the owner); agy's round 3 and round 5 replies were delivered through its reply file after the driver reported a stalled
+  peer, so those two rounds carry no echo or verdict token.
+
 ## Self-audit (exhaustiveness)
 
 - Contracts: names and fields are listed under Interfaces; signatures are fixed in the plan (the plan writes against merged 9d code, per the
