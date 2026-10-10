@@ -47,7 +47,8 @@ is not the engine and the real gain is smaller (reads, renames and about 25 othe
    :227); `sync_all` is already `&self`, so the cut adds `Sync` to the bound and the plan checks every implementor (the real std and Windows
    writers, the fake, the `NullWriter` test double at :453) against it.
 4. **Per-entry failure attribution.** The barrier returns one result per entry, **positional** (`results[i]` is `entries[i]`'s; the flush splits the entries by it, preserving their order). An entry whose `sync_all` failed is reported
-   `Code::StrictDurabilityUnavailable` at `CopyStep::Durability`, exactly the report step 5 gives today, and its temp is discarded. The other
+   `Code::StrictDurabilityUnavailable` at `CopyStep::Durability`, exactly the report step 5 gives today, and its temp is discarded under decision 5's rule (removed on the way to `prepare_many`, or on a
+   heartbeat failure; kept as a leftover on a lost lock). The other
    entries continue to `prepare_many` in the same flush. No note is written for a failed entry. **Order:** the failed entries are discarded
    AFTER decision 5's heartbeat and guard have passed and BEFORE `prepare_many`, so every removal runs under a lock just checked. `discard` itself checks the
    guard first and keeps the temp as a leftover if the lock is gone (`copy.rs:216`); a loss between that check and the discard is the 9d
@@ -71,11 +72,13 @@ is not the engine and the real gain is smaller (reads, renames and about 25 othe
    dependency between the old step 5 and 6. If the plan finds a test that pins the old order, the test is re-derived, not the order kept.
    **The writers are closed right after the barrier returns, unconditionally and BEFORE the heartbeat and guard of decision 5** (not on the exit
    branches; the join has completed by then): `Staged` has no writer today (9d drops it inside `stage_file`, `copy.rs:462`); 9e adds
-   `Staged.writer`, and `flush_batch` takes every one out and drops it (on every exit path, including a failed heartbeat or a lost lock) before
+   `Staged.writer`, and `flush_batch` takes every one out and drops it before
    `prepare_many` and before any rename, so the descriptor lifetime ends where the 9d staging ended it, one step later. When the heartbeat
    fails during the wait the workers are joined first (the scope borrows the writers, so they cannot be dropped earlier), then the writers are
-   dropped. A rename or an unlink of a file with an
-   open handle fails or misbehaves on Windows, which the Windows CI would surface and no Linux test can. Closing a descriptor here is not a
+   dropped. The reason is
+   descriptor accounting (decision 7) and keeping the 9d descriptor lifetime, not a Windows rename failure: the Windows platform code opens
+   temps with `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` (`dir_windows.rs:631`, `std_fs.rs:624`), so an open handle would not block
+   the rename or the unlink there; the Windows CI stays the oracle for any sharing surprise. Closing a descriptor here is not a
    mutation in the section 99 sense: the barrier has just synced every successful entry, so nothing of theirs is dirty and the close writes
    nothing (a failed-sync entry is discarded, and its dirty data is of no interest); the close therefore precedes decision 5's
    heartbeat and guard without contradicting it.
@@ -98,7 +101,8 @@ is not the engine and the real gain is smaller (reads, renames and about 25 othe
 ## Interfaces added or changed (names are the plan's contract; signatures are final in the plan)
 
 - `copy.rs`: `stage_file` takes a `defer_sync: bool` (or an options field); `Staged` gains `writer: Option<F::Writer>`; a new
-  `sync_staged_many(entries, threads) -> Vec<Result<()>>`.
+  `sync_staged_many(entries, threads, beat, interval) -> SyncOutcome`, where `SyncOutcome { results: Vec<Result<()>>, heartbeat: Option<..> }`
+  carries the positional per-entry results AND a heartbeat failure that ended the wait (decision 2), so `flush_batch` can route it to decision 5.
 - `tree.rs`: `BatchPolicy` gains `sync_threads: usize` and `open_writers: usize`; `Shared` counts open writers; `flush_batch` gains the
   barrier step ahead of the existing beat and guard (decision 5), the discard-before-`prepare_many` order, and two counters in the outcome:
   `barrier_max` (the longest barrier) and `cap_flushes` (flushes forced by the open-writer cap), which the acceptance run reads and the plan
@@ -128,7 +132,8 @@ flush trigger of 9d, and the order data -> note -> rename.
   time (no runtime mutant); the re-derived 9d tests are oracles, not new tests.
 - **Writers closed:** at the moment of the first heartbeat call after the barrier, no writer of the batch is alive (the fake records each writer's
   drop in its call log, so the test compares the drop's position with the heartbeat's), on the success path and on both failure paths.
-- **Equivalence:** the same tree under `sync_threads` 1 and 16 produces the same outcome set, claims and counters.
+- **Equivalence:** the same tree under `sync_threads` 1 and 16 produces the same outcome set, claims and counters, **excluding `barrier_max`** (a duration). A separate test pins `barrier_max`: a fake whose
+  `sync_all` sleeps 50 ms yields `barrier_max >= 50 ms` (mutant: a hardcoded zero).
 - **Lost lock after the barrier:** every temp kept as a leftover, no note, no removal.
 - **Open-writer cap:** with `open_writers == 2` a three-directory tree never holds more than 2 writers (observed through the fake) and every file
   still arrives.
@@ -188,6 +193,12 @@ decision 9's two conditions are met; a per-file directory sync (cut 9c known lim
   the heartbeat queueing behind the journal (known limit 6), measured at acceptance. Round 5 ended with all findings folded and no round-6 run
   (the round cap asks the owner); agy's round 3 and round 5 replies were delivered through its reply file after the driver reported a stalled
   peer, so those two rounds carry no echo or verdict token.
+- Panel round 6 (2026-10-10). FOLDED: decision 4 and 5 now say the same about a failed-sync temp; the Windows rename claim is replaced by the
+  descriptor-accounting reason (the platform code opens temps with `FILE_SHARE_DELETE`); the duplicate drop wording is removed;
+  `sync_staged_many` returns a `SyncOutcome` carrying a heartbeat failure; `barrier_max` has its own test and is excluded from the equivalence
+  test. REJECTED: "closing a failed-sync entry's handle on Windows writes the MFT without the lock, violating section 99" (unsupported: nothing in
+  `dir_windows.rs` or `std_fs.rs` makes `CloseHandle` a destination mutation, and the temp is this run's own file; a close creates no write that
+  the earlier staging did not).
 
 ## Self-audit (exhaustiveness)
 
