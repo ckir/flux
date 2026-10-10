@@ -1,6 +1,6 @@
 # Cut 9d: group commit of Strict tree publications
 
-Status: DRAFT for the AGY-AFTER panel and owner review (2026-10-09), branch `spec/cut-9d`. Scope picked by the owner on 2026-10-09 after an
+Status: APPROVED by the owner 2026-10-10 (panel GREEN at d7015fa); implemented on branch `spec/cut-9d` per docs/superpowers/plans/2026-10-10-cut-9d-group-commit.md. Scope picked by the owner on 2026-10-09 after an
 AGY-FIRST consult and one AGY-NEGOTIATE round (briefs `.clavity/seams/cut9d-scope.md`, `cut9d-scope-neg1.md`; replies under
 `.clavity/scratch/cut9d-scope/`): **9d is group commit; chunk checkpoints, partial-file resume and `--resume-verify` become cut 9e.** The slicing
 table of the cut 9a spec (9d = chunk checkpoints) is superseded by this ordering. Parent spec: `FLUX_FULL_UPDATED_SPEC_V16.md` (sections 148,
@@ -169,6 +169,23 @@ quoted, and what was not controlled is stated.
    `prepare_many` is the later fix; it needs the exclusivity the claim gives (decision 1) to come from the in-frame pending names instead.
 
 7. A file and a directory in one directory whose names fold equal only by a NON-ASCII fold, onto a folding destination: the file's rename meets the collision (batched) where an unbatched copy publishes the file and refuses the directory. Nothing is lost or overwritten; which of the two is reported differs.
+
+## Plan rulings (2026-10-10)
+
+Decisions the spec left open, made in `docs/superpowers/plans/2026-10-10-cut-9d-group-commit.md`.
+
+1. **"Batching off" seam.** `BatchPolicy.files == 1` makes `copy_one` take the unbatched cut 9c path (per-file `prepare`/`commit_prepared`), which the
+   equivalence test needs (N per-file `prepare` calls and no `prepare_many`). A real one-file batch (a directory with one file, policy 64) uses
+   `prepare_many` with one note.
+2. **Leftovers after a lost lock.** `CopyError.leftover` holds one path. The failing entry k's leftover travels in the returned error (as in an
+   unbatched copy); the temporaries of entries k+1.. are each reported through `on_report` as `TreeFailureCause::Copy` with a `TargetLockBusy` error
+   carrying that temporary as `leftover` (path relative to DEST).
+3. **Fault key names.** The fake's new call/fault key is `claim_prepare_many` (the spec says `prepare_many`; every existing key carries the `claim_`
+   prefix). The call string is `claim_prepare_many(<n>)`, `n` = number of notes.
+4. **Test seams instead of a 64 MiB source.** The `BATCH_BYTES` and age triggers are tested with an injected `BatchPolicy` (small `bytes`, fake
+   `now`), not a sparse 64 MiB file and a real second; one test pins `BatchPolicy::DEFAULT` to 64 / `64 << 20` / 1 s. The sync-count proxy is realised
+   at the store (a counting redb `StorageBackend`: `prepare_many` of 64 notes costs the same backend syncs as one `prepare`) plus the counting fake;
+   the real-filesystem sync count is the owner-gated `strace -f -c` measurement.
 
 ## Out of scope
 
