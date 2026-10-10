@@ -19,9 +19,10 @@
 
 mod support;
 
+use flux_fs::Durability;
 use std::fs;
 use std::path::Path;
-use support::{copy_tree, tree_bytes};
+use support::{copy_tree, copy_tree_with, tree_bytes};
 
 fn write(root: &Path, rel: &str, bytes: &[u8]) {
     let p = root.join(rel);
@@ -95,4 +96,39 @@ fn single_file_copy_is_byte_for_byte() {
     support::copy_file(&src, &dst);
     assert_eq!(blake3::hash(&fs::read(&dst).unwrap()), blake3::hash(&data));
     assert_eq!(fs::read(&src).unwrap(), data, "the source is untouched");
+}
+
+/// Cut 9d group commit on the real filesystem: a Strict copy batches 64 files per directory, so 70 files split 64 + 6.
+/// Each directory also holds a zero-byte file and a 300 KiB file (both among its 70).
+#[test]
+fn strict_tree_of_many_files_arrives_byte_for_byte() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+    for d in 0..3u8 {
+        for f in 0..68u8 {
+            write(&src, &format!("d{d}/f{f:02}"), &payload(d * 70 + f, 100 + f as usize));
+        }
+        write(&src, &format!("d{d}/zero"), b"");
+        write(&src, &format!("d{d}/big"), &payload(d, 300 * 1024));
+    }
+
+    let out = copy_tree_with(&src, &dst, Durability::Strict);
+    assert_eq!(out.files_copied, 210);
+    assert_eq!(tree_bytes(&dst), tree_bytes(&src));
+    assert!(!dst.join(".flux").exists(), "the finished copy removes its workspace");
+    fn leftovers(dir: &Path, found: &mut Vec<String>) {
+        for e in fs::read_dir(dir).unwrap() {
+            let e = e.unwrap();
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.contains(".flux-partial.") {
+                found.push(name);
+            }
+            if e.file_type().unwrap().is_dir() {
+                leftovers(&e.path(), found);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    leftovers(&dst, &mut found);
+    assert!(found.is_empty(), "no temporary survives: {found:?}");
 }

@@ -428,3 +428,49 @@ fn a_strict_copy_writes_format_2() {
     let id = killed_strict(&src, &dst, AT_D1_CREATE, marks.path());
     assert_eq!(format_of(&dst, &id), Some(2));
 }
+
+/// Cut 9d, the kill between renames (Review Focus 5): stall 445 precedes d1/f010's publish guard, so f000..f009 are
+/// renamed and the other 54 are still staged, each with its note. Resume recovers only the ten RENAMED verdicts.
+#[test]
+fn a_strict_copy_killed_between_renames_resumes_to_the_same_tree() {
+    let d = TempDir::new().unwrap();
+    let marks = TempDir::new().unwrap();
+    let (src, dst) = big_tree_in(d.path());
+    let at = AT_D1_F000_PUBLISH + 10;
+    let id = killed_strict(&src, &dst, at, marks.path());
+    assert!(marks.path().join(format!("stalled-{at}")).exists());
+
+    assert_eq!(prepared_count(&dst, &id), 64, "all 64 notes are still held");
+    let renamed: Vec<usize> =
+        (0..64).filter(|f| dst.join("d1").join(format!("f{f:03}")).exists()).collect();
+    assert_eq!(renamed, (0..10).collect::<Vec<_>>(), "exactly f000..f009 are published");
+
+    let out =
+        copy(&[os("--resume"), os("--durability"), os("strict"), src.as_os_str(), dst.as_os_str()]);
+    let e = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "{e}");
+    assert!(e.contains("recovered 10 interrupted publications"), "{e}");
+    assert!(!dst.join(".flux").exists(), "the finished copy removes its workspace");
+    same_bytes(&src, &dst);
+}
+
+/// Cut 9d, the commit-done row: stall 499 is d1/f064's sweep guard, after f063's rename and the batch's
+/// `apply_recovery` commit, so no note is left and d0's 100 claims plus the batch's 64 are durable.
+#[test]
+fn a_strict_copy_killed_after_a_batch_commit_resumes() {
+    let d = TempDir::new().unwrap();
+    let marks = TempDir::new().unwrap();
+    let (src, dst) = big_tree_in(d.path());
+    let at = AT_D1_F000_PUBLISH + 64;
+    let id = killed_strict(&src, &dst, at, marks.path());
+    assert!(marks.path().join(format!("stalled-{at}")).exists());
+
+    assert_eq!(prepared_count(&dst, &id), 0, "the batch's notes are committed away");
+    assert_eq!(claim_count(&dst, &id), 100 + 64);
+
+    let out =
+        copy(&[os("--resume"), os("--durability"), os("strict"), src.as_os_str(), dst.as_os_str()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(!dst.join(".flux").exists(), "the finished copy removes its workspace");
+    same_bytes(&src, &dst);
+}

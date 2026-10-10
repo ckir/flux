@@ -33,9 +33,13 @@ pub fn config() -> RunConfig {
 
 /// Copy `src` to `dst` as the CLI would, and require a clean run.
 pub fn copy_tree(src: &Path, dst: &Path) -> TreeOutcome {
+    copy_tree_with(src, dst, Durability::Normal)
+}
+
+/// `copy_tree` at the given durability.
+pub fn copy_tree_with(src: &Path, dst: &Path, durability: Durability) -> TreeOutcome {
     let fs = flux_platform::StdFileSystem;
-    let run =
-        run::tree(&fs, src, dst, &options(Durability::Normal), &config(), &mut |f| panic!("{f:?}"));
+    let run = run::tree(&fs, src, dst, &options(durability), &config(), &mut |f| panic!("{f:?}"));
     assert!(run.stop.is_none(), "run stopped: {:?}", run.stop);
     run.copy.expect("the copy ran").unwrap_or_else(|a| panic!("tree aborted: {}", a.error))
 }
