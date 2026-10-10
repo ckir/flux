@@ -480,8 +480,6 @@ pub(crate) enum SyncAt {
     /// Inline, after the metadata step; the writer is dropped on return (the single copy, and the unbatched path).
     Staging,
     /// Not at all: the open writer is handed out in `Staged.writer` for the caller's barrier.
-    // Constructed by the tree's batch flush in a later cut 9e task; until then only the tests reach it.
-    #[allow(dead_code)]
     Barrier,
 }
 
@@ -800,13 +798,6 @@ pub(crate) fn publish_staged<D: DirHandle>(
 }
 
 /// What the cut 9e barrier found: one result per writer, in input order, and the heartbeat failure if one ended the wait.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "cut 9e task 3 wires the barrier into the tree walk; remove this then"
-    )
-)]
 pub(crate) struct SyncOutcome {
     pub results: Vec<Result<(), FsError>>,
     pub heartbeat: Option<FsError>,
@@ -818,13 +809,6 @@ pub(crate) struct SyncOutcome {
 /// `beat` is `dyn Fn` without `Send`, so it is only ever called here, never from a worker. After one heartbeat failure
 /// no further `beat` is made, but the wait continues until every worker has finished and been joined: every writer
 /// still gets its result, and the failure is reported once in `heartbeat`. A worker panic propagates out of the scope.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "cut 9e task 3 wires the barrier into the tree walk; remove this then"
-    )
-)]
 pub(crate) fn sync_staged_many<W: FileHandle + Sync>(
     writers: &[&W],
     threads: usize,

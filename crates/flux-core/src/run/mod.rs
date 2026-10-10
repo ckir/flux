@@ -284,7 +284,7 @@ pub fn tree<F: DestinationRoot>(
             beat: &beat,
             claims: claims.as_ref(),
             resume: cfg.resume,
-            batch: batch_policy(),
+            batch: batch_policy(cfg),
         };
         let root = place.dest.take().expect("step 5 made DEST");
         let mut report = |f: TreeFailure| {
@@ -487,24 +487,28 @@ enum Ended {
     Failed,
 }
 
-/// Cut 9d: the batch policy of a tree run, `BatchPolicy::DEFAULT`. In a debug build, `FLUX_TEST_BATCH_AGE_MS=<n>`
+/// Cut 9d: the batch policy of a tree run, `BatchPolicy::DEFAULT` with cut 9e's `beat_every` the run's heartbeat
+/// interval. In a debug build, `FLUX_TEST_BATCH_AGE_MS=<n>`
 /// replaces its age (absent or unparsable: the default's), because the end-to-end stall tests count guard calls to
 /// pick a stall index, and an age flush on the real clock (a slow runner staging a batch for over a second) adds guard
 /// calls and shifts every index. A release build has no override.
 #[cfg(debug_assertions)]
-fn batch_policy() -> crate::tree::BatchPolicy {
+fn batch_policy(cfg: &RunConfig) -> crate::tree::BatchPolicy {
     let default = crate::tree::BatchPolicy::DEFAULT;
     let age = std::env::var("FLUX_TEST_BATCH_AGE_MS")
         .ok()
         .and_then(|v| v.parse().ok())
         .map(std::time::Duration::from_millis)
         .unwrap_or(default.age);
-    crate::tree::BatchPolicy { age, ..default }
+    crate::tree::BatchPolicy { age, beat_every: cfg.heartbeat_interval, ..default }
 }
 
 #[cfg(not(debug_assertions))]
-fn batch_policy() -> crate::tree::BatchPolicy {
-    crate::tree::BatchPolicy::DEFAULT
+fn batch_policy(cfg: &RunConfig) -> crate::tree::BatchPolicy {
+    crate::tree::BatchPolicy {
+        beat_every: cfg.heartbeat_interval,
+        ..crate::tree::BatchPolicy::DEFAULT
+    }
 }
 
 /// Step 7, "Finish".

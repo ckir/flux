@@ -6,7 +6,7 @@
 use crate::copy::{
     BeforeCreate, BeforePublish, CopyError, CopyStep, Guard, Heartbeat, PublishIntent, Stage,
     Staged, SyncAt, copy_file_guarded, discard, no_before_create, no_before_publish, no_heartbeat,
-    publish_staged, split_destination, stage_file, unguarded, weaker,
+    publish_staged, split_destination, stage_file, sync_staged_many, unguarded, weaker,
 };
 use crate::names::{NameIndex, Resolved};
 use crate::state::{FLUX_DIR, RESERVED_DIRS, identity_text, native_hex};
@@ -63,6 +63,11 @@ pub struct TreeOutcome {
     pub files_resumed: u64,
     /// Cut 9a: the source bytes of the files in `files_resumed`.
     pub bytes_resumed: u64,
+    /// Cut 9e: the longest data-sync barrier of a Strict tree's batches (wall time from the first worker's start to the
+    /// last result). Zero when no batch synced.
+    pub barrier_max: std::time::Duration,
+    /// Cut 9e: batches flushed because a sync barrier hit its cap (stays 0 until the cap exists).
+    pub cap_flushes: u64,
 }
 
 /// The operation stopped as a whole (cut 5, K1). `outcome` holds what was counted
@@ -342,6 +347,8 @@ pub(crate) const BATCH_AGE: std::time::Duration = std::time::Duration::from_secs
 /// `BatchPolicy::DEFAULT.files`: batching is on. (1 would be the unbatched cut 9c path, plan ruling 1; tests reach it
 /// with an explicit policy.)
 const DEFAULT_FILES: usize = BATCH_FILES;
+/// Cut 9e: the data-sync barrier's worker threads (spec decision 2): at most this many `fsync`s in flight at once.
+pub(crate) const SYNC_THREADS: usize = 16;
 
 /// Cut 9d: the flush thresholds of a Strict tree's per-directory batch, and the clock the age is read from. Carried in
 /// `Shared` so tests inject small thresholds and a fake clock (plan ruling 4). `files == 1` never batches.
@@ -353,6 +360,10 @@ pub(crate) struct BatchPolicy {
     pub now: fn() -> std::time::Instant,
     /// Decision 6's ASCII fold pre-check; a test turns it off so the fake's ASCII fold reaches the temporary probe.
     pub fold_precheck: bool,
+    /// Cut 9e: the barrier's worker threads (`SYNC_THREADS`); a test uses 1 so the sync order is the entries' order.
+    pub sync_threads: usize,
+    /// Cut 9e: how often the waiting main thread beats during the barrier (the run's heartbeat interval; never zero).
+    pub beat_every: std::time::Duration,
 }
 
 impl BatchPolicy {
@@ -362,6 +373,8 @@ impl BatchPolicy {
         age: BATCH_AGE,
         now: std::time::Instant::now,
         fold_precheck: true,
+        sync_threads: SYNC_THREADS,
+        beat_every: crate::run::HEARTBEAT_INTERVAL,
     };
 }
 
@@ -1328,7 +1341,13 @@ fn stage_into_batch<F: DestinationRoot>(
             cx.guard,
             cx.beat,
             before_create,
-            SyncAt::Staging,
+            // Cut 9e: a Strict batch defers the data sync to the flush's barrier; a Normal batch never reaches here
+            // (it syncs nothing), the branch is for completeness.
+            if cx.opts.durability == Durability::Strict {
+                SyncAt::Barrier
+            } else {
+                SyncAt::Staging
+            },
         )
     };
     let staged = match stage() {
@@ -1382,29 +1401,98 @@ fn flush_batch<F: DestinationRoot>(
     let Some(claims) = cx.claims else {
         unreachable!("only a copy with a claim store stages a batch");
     };
+    // Cut 9e, spec decision 1: the data barrier. Every staged file's `fsync` runs here, on up to `sync_threads` workers
+    // while this thread keeps the lock's heartbeat alive, BEFORE the opening heartbeat and guard (so those see a lock
+    // that was alive after the longest wait of the batch) and before any note exists. `indices[j]` is the entry whose
+    // writer is `writers[j]`; an entry with no writer was synced at staging.
+    let mut entries = entries;
+    let mut writers: Vec<&F::Writer> = Vec::with_capacity(entries.len());
+    let mut indices: Vec<usize> = Vec::with_capacity(entries.len());
+    for (i, p) in entries.iter().enumerate() {
+        if let Some(w) = p.staged.writer.as_ref() {
+            writers.push(w);
+            indices.push(i);
+        }
+    }
+    let started = std::time::Instant::now();
+    let synced = sync_staged_many(&writers, cx.batch.sync_threads, cx.beat, cx.batch.beat_every);
+    out.barrier_max = out.barrier_max.max(started.elapsed());
+    drop(writers);
+    // Close every handle now, on every path below (a failed sync's too).
+    for p in &mut entries {
+        p.staged.writer = None;
+    }
+    let mut failed: Vec<Option<FsError>> = Vec::with_capacity(entries.len());
+    failed.resize_with(entries.len(), || None);
+    for (j, r) in synced.results.into_iter().enumerate() {
+        if let Err(e) = r {
+            failed[indices[j]] = Some(e);
+        }
+    }
+    // A heartbeat that failed during the wait is handled as the opening one below, and not detected again (plan ruling 4).
+    if let Some(e) = synced.heartbeat {
+        return Err(stop_held_before_notes(cx, parent, entries, failed, e, out, on_report));
+    }
     // 4.1: sections 101 and 99, as before any synced write under DEST. No note exists yet.
     if let Err(e) = (cx.beat)() {
-        // The lock is held: every temporary is removed (guarded); one that stays is reported as a leftover.
-        for p in entries {
-            let source = copy_of(&e).source;
-            let failed =
-                discard(parent, &p.staged.temp, CopyStep::Heartbeat, e.code, source, cx.guard);
-            if failed.leftover.is_some() {
-                report_leftover(p.path, failed, out, on_report);
-            }
-        }
-        return Err(CopyError::at(CopyStep::Heartbeat, e));
+        return Err(stop_held_before_notes(cx, parent, entries, failed, e, out, on_report));
     }
     if let Err(lost) = (cx.guard)() {
         // Nothing is written or removed: entry 0's temporary rides in the returned error, the others' are reported
-        // (plan ruling 2).
-        let mut rest = entries.into_iter();
-        let p0 = rest.next().expect("the batch is not empty");
-        for p in rest {
-            report_kept(p.path, &p.staged.temp, &lost, out, on_report);
+        // (plan ruling 2). A failed-sync entry is reported once, with its sync failure and its temporary as leftover,
+        // in place of the lost-lock report; as entry 0 its report comes first and the returned error carries no
+        // leftover (plan ruling 9).
+        let mut rest = entries.into_iter().zip(failed);
+        let (p0, f0) = rest.next().expect("the batch is not empty");
+        if let Some(f) = &f0 {
+            report_sync_kept(p0.path.clone(), &p0.staged.temp, f, out, on_report);
         }
-        return Err(kept(&p0.path, &p0.staged.temp, lost));
+        for (p, f) in rest {
+            match f {
+                Some(f) => report_sync_kept(p.path, &p.staged.temp, &f, out, on_report),
+                None => report_kept(p.path, &p.staged.temp, &lost, out, on_report),
+            }
+        }
+        let stop = match f0 {
+            Some(_) => CopyError::at(CopyStep::Publish, lost),
+            None => kept(&p0.path, &p0.staged.temp, lost),
+        };
+        return Err(stop);
     }
+    // Cut 9e, plan ruling 9: a failed sync is discarded and reported BEFORE the notes, so no note ever names it.
+    let mut ok = Vec::with_capacity(entries.len());
+    let mut bad = Vec::new();
+    for (p, f) in entries.into_iter().zip(failed) {
+        match f {
+            Some(f) => bad.push((p, f)),
+            None => ok.push(p),
+        }
+    }
+    let mut bad = bad.into_iter();
+    while let Some((p, f)) = bad.next() {
+        let failed_copy = discard(
+            parent,
+            &p.staged.temp,
+            CopyStep::Durability,
+            Code::StrictDurabilityUnavailable,
+            f.source,
+            cx.guard,
+        );
+        if let Err(stop) = finish_copy(p.path, Err(failed_copy), out, on_report) {
+            // A stop: nothing more is written; every entry not yet settled is reported kept.
+            for (q, _) in bad {
+                report_kept(q.path, &q.staged.temp, &stop.cause, out, on_report);
+            }
+            for q in ok {
+                report_kept(q.path, &q.staged.temp, &stop.cause, out, on_report);
+            }
+            return Err(stop);
+        }
+    }
+    if ok.is_empty() {
+        return Ok(());
+    }
+    let entries = ok;
     // 4.2: every note in ONE transaction, each built as `write_note` builds it.
     let notes: Vec<(ClaimKey, PreparedRecord)> = entries
         .iter()
@@ -1572,6 +1660,69 @@ fn report_kept(
     );
     let e = kept(&path, temp, cause);
     report(out, on_report, path, TreeFailureCause::Copy(e));
+}
+
+/// Cut 9e, plan ruling 9: an entry whose data sync failed, when the lock was lost before its discard: reported once as
+/// its own `StrictDurabilityUnavailable` failure at `CopyStep::Durability`, with the sync's error as the cause and its
+/// kept temporary (relative to DEST) as the leftover. `report_kept`'s shape, for a sync failure.
+fn report_sync_kept(
+    path: PathBuf,
+    temp: &std::ffi::OsStr,
+    sync: &FsError,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) {
+    let e = CopyError {
+        cause: FsError::new(
+            Code::StrictDurabilityUnavailable,
+            std::io::Error::new(sync.source.kind(), sync.source.to_string()),
+        ),
+        leftover: Some((
+            path.with_file_name(temp),
+            std::io::Error::other("kept: this run no longer holds the destination's lock"),
+        )),
+        step: CopyStep::Durability,
+    };
+    report(out, on_report, path, TreeFailureCause::Copy(e));
+}
+
+/// Cut 9e: STOP-HELD before any note exists (the heartbeat failed, during the barrier or at the flush's opening pair):
+/// the lock is held, so every temporary of the batch is removed (guarded). A failed-sync entry is reported as
+/// `StrictDurabilityUnavailable` at `CopyStep::Durability` (with a leftover only if its removal failed); any other entry
+/// only when its removal left a leftover. Returns the stop, at `CopyStep::Heartbeat`.
+fn stop_held_before_notes<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    parent: &F::Dir,
+    entries: Vec<Pending<F::Writer>>,
+    failed: Vec<Option<FsError>>,
+    e: FsError,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) -> CopyError {
+    for (p, f) in entries.into_iter().zip(failed) {
+        match f {
+            Some(f) => {
+                let r = discard(
+                    parent,
+                    &p.staged.temp,
+                    CopyStep::Durability,
+                    Code::StrictDurabilityUnavailable,
+                    f.source,
+                    cx.guard,
+                );
+                report_leftover(p.path, r, out, on_report);
+            }
+            None => {
+                let source = copy_of(&e).source;
+                let r =
+                    discard(parent, &p.staged.temp, CopyStep::Heartbeat, e.code, source, cx.guard);
+                if r.leftover.is_some() {
+                    report_leftover(p.path, r, out, on_report);
+                }
+            }
+        }
+    }
+    CopyError::at(CopyStep::Heartbeat, e)
 }
 
 /// A temporary a stop's cleanup could not remove: reported with its leftover rebuilt relative to DEST, as
@@ -3859,6 +4010,296 @@ mod tests {
         assert_eq!(
             (out.files_copied, out.directories_created, out.failures.total()),
             (out1.files_copied, out1.directories_created, out1.failures.total())
+        );
+    }
+
+    // Cut 9e: the data-sync barrier inside `flush_batch`. `K(n)` and `G(n)` below are the heartbeat and guard calls that
+    // precede the first flush of an `n`-file batch (`pinned_pre_flush_call_counts` asserts them, so a shift is visible).
+
+    /// `policy(64)` with one sync worker: the barrier's order is then the entries' order.
+    fn one_worker() -> BatchPolicy {
+        BatchPolicy { sync_threads: 1, ..policy(64) }
+    }
+
+    /// `drop_writer(` calls of the log, in order.
+    fn drops(c: &[String]) -> Vec<usize> {
+        positions(c, "drop_writer(")
+    }
+
+    /// The heartbeat calls before the first flush of an `n`-file batch (the walk's, the stagings' and the root's).
+    const fn k(n: u32) -> u32 {
+        K_BASE + K_PER_FILE * n
+    }
+
+    /// The guard calls before the first flush of an `n`-file batch.
+    const fn g(n: u32) -> u32 {
+        G_BASE + G_PER_FILE * n
+    }
+
+    const K_BASE: u32 = 0;
+    const K_PER_FILE: u32 = 3;
+    const G_BASE: u32 = 0;
+    const G_PER_FILE: u32 = 2;
+
+    #[test]
+    fn pinned_pre_flush_call_counts() {
+        for n in [2usize, 3] {
+            let fs = n_files(n);
+            let beats = std::cell::RefCell::new(Vec::new());
+            let guards = std::cell::RefCell::new(Vec::new());
+            let beat = || {
+                beats.borrow_mut().push(fs.calls().len());
+                Ok(())
+            };
+            let guard = || {
+                guards.borrow_mut().push(fs.calls().len());
+                Ok(())
+            };
+            let (r, _, _) = batched_with(&fs, one_worker(), Durability::Strict, &guard, &beat);
+            r.unwrap();
+            let c = log(&fs);
+            let last_sync = *positions(&c, "sync_all(").last().unwrap();
+            let before = |v: &std::cell::RefCell<Vec<usize>>| {
+                v.borrow().iter().filter(|&&len| len <= last_sync).count() as u32
+            };
+            assert_eq!(before(&beats), k(n as u32), "heartbeat calls before the barrier, n={n}");
+            assert_eq!(before(&guards), g(n as u32), "guard calls before the barrier, n={n}");
+        }
+    }
+
+    #[test]
+    fn every_sync_of_a_batch_precedes_its_prepare_many_which_precedes_its_first_rename() {
+        let fs = n_files(3);
+        let (r, out, _) = batched(&fs, one_worker(), Durability::Strict);
+        r.unwrap();
+        let c = log(&fs);
+        let syncs = positions(&c, "sync_all(");
+        let prepare = positions(&c, "claim_prepare_many(")[0];
+        assert_eq!(syncs.len(), 3, "{c:?}");
+        assert!(syncs.iter().all(|&s| s < prepare), "{c:?}");
+        assert!(prepare < renamed(&c, "f0"), "{c:?}");
+        assert!(
+            syncs.iter().all(|&s| s > created(&c, "f2")),
+            "no sync before the last staging: {c:?}"
+        );
+        assert_eq!(out.files_copied, 3);
+    }
+
+    #[test]
+    fn a_failed_sync_discards_and_reports_that_entry_and_the_rest_are_noted_and_published() {
+        let fs = n_files(3);
+        fs.on_nth("create_new", 2, |fs| fs.fail("sync_all", Code::StrictDurabilityUnavailable));
+        let (r, out, got) = batched(&fs, one_worker(), Durability::Strict);
+        r.unwrap();
+        let c = log(&fs);
+        assert_eq!(prepares(&c), ["claim_prepare_many(2)"], "{c:?}");
+        assert_eq!(out.files_copied, 2);
+        assert_eq!(got.len(), 1);
+        let TreeFailureCause::Copy(e) = &got[0].cause else { panic!("{got:?}") };
+        assert_eq!(
+            (e.code(), e.step, e.leftover.is_none()),
+            (Code::StrictDurabilityUnavailable, CopyStep::Durability, true)
+        );
+        assert!(!fs.exists("/dst/f1") && !fs.exists("/dst/f1.flux-partial.op1"));
+        let remove = first(&c, "remove_file(/dst/f1.flux-partial.op1)");
+        let prepare = positions(&c, "claim_prepare_many(")[0];
+        assert!(remove < prepare, "the discard precedes the notes: {c:?}");
+    }
+
+    #[test]
+    fn a_batch_whose_every_sync_fails_writes_no_note_and_the_walk_goes_on() {
+        let fs = sources(&[("a/x", b"x"), ("a/y", b"y"), ("b/z", b"z")]);
+        // `on_nth` keeps ONE hook per call name, so the second fault is armed from inside the first.
+        fs.on_nth("create_new", 1, |fs| {
+            fs.fail("sync_all", Code::IoError);
+            fs.on_nth("create_new", 2, |fs| fs.fail("sync_all", Code::IoError));
+        });
+        let (r, out, got) = batched(&fs, one_worker(), Durability::Strict);
+        r.unwrap();
+        let c = log(&fs);
+        assert_eq!(prepares(&c), ["claim_prepare_many(1)"], "only b's batch is noted: {c:?}");
+        assert_eq!((out.files_copied, got.len()), (1, 2));
+        assert!(fs.exists("/dst/b/z") && !fs.exists("/dst/a/x") && !fs.exists("/dst/a/y"));
+    }
+
+    #[test]
+    fn the_writers_are_closed_before_the_post_barrier_heartbeat_on_every_path() {
+        for scenario in ["ok", "heartbeat", "lost"] {
+            let fs = n_files(2);
+            let beats = std::cell::RefCell::new(Vec::new());
+            let nbeat = std::cell::Cell::new(0u32);
+            let nguard = std::cell::Cell::new(0u32);
+            let beat = || {
+                beats.borrow_mut().push(fs.calls().len());
+                nbeat.set(nbeat.get() + 1);
+                if scenario == "heartbeat" && nbeat.get() == k(2) + 1 {
+                    return Err(FsError::new(Code::IoError, std::io::Error::other("beat")));
+                }
+                Ok(())
+            };
+            let guard = || {
+                nguard.set(nguard.get() + 1);
+                if scenario == "lost" && nguard.get() > g(2) {
+                    return Err(FsError::new(Code::TargetLockBusy, std::io::Error::other("lost")));
+                }
+                Ok(())
+            };
+            let (_, _, _) = batched_with(&fs, one_worker(), Durability::Strict, &guard, &beat);
+            let c = log(&fs);
+            let last_sync = *positions(&c, "sync_all(").last().unwrap();
+            let first_beat_after = *beats
+                .borrow()
+                .iter()
+                .find(|&&len| len > last_sync)
+                .expect("a heartbeat after the barrier");
+            assert!(drops(&c).iter().all(|&d| d < first_beat_after), "{scenario}: {c:?}");
+            assert_eq!(drops(&c).len(), 2, "{scenario}: {c:?}");
+        }
+    }
+
+    #[test]
+    fn a_heartbeat_failure_after_the_barrier_removes_every_temporary_and_writes_no_note() {
+        let fs = n_files(3);
+        let calls = std::cell::Cell::new(0);
+        let beat = failing_after(k(3), &calls);
+        let (r, _, got) = batched_with(&fs, one_worker(), Durability::Strict, &unguarded, &beat);
+        assert_eq!(r.unwrap_err().step, CopyStep::Heartbeat);
+        assert_eq!(fs.prepared_count(), 0);
+        for i in 0..3 {
+            assert!(
+                !fs.exists(format!("/dst/f{i}.flux-partial.op1"))
+                    && !fs.exists(format!("/dst/f{i}"))
+            );
+        }
+        assert!(got.is_empty(), "every removal succeeded, nothing to report: {got:?}");
+    }
+
+    #[test]
+    fn a_heartbeat_failure_during_the_barrier_is_handled_as_the_post_barrier_one_and_not_re_detected()
+     {
+        let fs = n_files(3);
+        fs.delay("sync_all", std::time::Duration::from_millis(20));
+        let p = BatchPolicy { beat_every: std::time::Duration::from_millis(10), ..one_worker() };
+        let calls = std::cell::Cell::new(0u32);
+        let beat = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == k(3) + 1 {
+                Err(FsError::new(Code::IoError, std::io::Error::other("beat")))
+            } else {
+                Ok(())
+            }
+        };
+        let (r, _, _) = batched_with(&fs, p, Durability::Strict, &unguarded, &beat);
+        assert_eq!(r.unwrap_err().step, CopyStep::Heartbeat);
+        assert_eq!(fs.prepared_count(), 0);
+        assert_eq!(calls.get(), k(3) + 1, "no heartbeat call after the one that failed");
+        for i in 0..3 {
+            assert!(!fs.exists(format!("/dst/f{i}.flux-partial.op1")));
+        }
+    }
+
+    #[test]
+    fn a_lost_lock_after_the_barrier_keeps_every_temporary_and_writes_no_note() {
+        // Mutant: drop the pair (or move the barrier after it): this test then renames and notes.
+        let fs = n_files(3);
+        let calls = std::cell::Cell::new(0);
+        let guard = failing_after(g(3), &calls);
+        let (r, _, got) =
+            batched_with(&fs, one_worker(), Durability::Strict, &guard, &no_heartbeat);
+        let e = r.unwrap_err();
+        assert_eq!(e.code(), Code::TargetLockBusy);
+        assert!(e.leftover.is_some(), "entry 0's temporary rides in the error");
+        assert_eq!(got.len(), 2, "entries 1 and 2 are reported kept: {got:?}");
+        assert_eq!(fs.prepared_count(), 0);
+        // The stagings' step-1 sweeps remove (a missing name); the flush removes nothing, so none follows the barrier.
+        let c = log(&fs);
+        let first_sync = first(&c, "sync_all(");
+        assert!(positions(&c, "remove_file(").iter().all(|&r| r < first_sync), "{c:?}");
+        for i in 0..3 {
+            assert!(fs.exists(format!("/dst/f{i}.flux-partial.op1")));
+        }
+    }
+
+    #[test]
+    fn a_failed_sync_entry_is_still_reported_when_the_lock_is_lost_at_the_pair() {
+        let fs = n_files(2);
+        fs.on_nth("create_new", 1, |fs| fs.fail("sync_all", Code::StrictDurabilityUnavailable));
+        let calls = std::cell::Cell::new(0);
+        let guard = failing_after(g(2), &calls);
+        let (r, _, got) =
+            batched_with(&fs, one_worker(), Durability::Strict, &guard, &no_heartbeat);
+        let e = r.unwrap_err();
+        assert_eq!(e.code(), Code::TargetLockBusy);
+        assert!(
+            e.leftover.is_none(),
+            "entry 0 is the failed-sync entry: its report carries the leftover, not the error (ruling 9)"
+        );
+        let reported: Vec<(Code, bool)> = got
+            .iter()
+            .map(|f| match &f.cause {
+                TreeFailureCause::Copy(e) => (e.code(), e.leftover.is_some()),
+                c => panic!("{c:?}"),
+            })
+            .collect();
+        assert_eq!(
+            reported,
+            [(Code::StrictDurabilityUnavailable, true), (Code::TargetLockBusy, true)],
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_sync_entry_under_a_heartbeat_failure_is_reported_once_with_the_sync_code() {
+        let fs = n_files(2);
+        fs.on_nth("create_new", 1, |fs| fs.fail("sync_all", Code::StrictDurabilityUnavailable));
+        let calls = std::cell::Cell::new(0);
+        let beat = failing_after(k(2), &calls);
+        let (r, _, got) = batched_with(&fs, one_worker(), Durability::Strict, &unguarded, &beat);
+        assert_eq!(r.unwrap_err().step, CopyStep::Heartbeat);
+        assert_eq!(got.len(), 1, "{got:?}");
+        let TreeFailureCause::Copy(e) = &got[0].cause else { panic!("{got:?}") };
+        assert_eq!(
+            (e.code(), e.leftover.is_none()),
+            (Code::StrictDurabilityUnavailable, true),
+            "removed, so no leftover"
+        );
+        assert!(!fs.exists("/dst/f0.flux-partial.op1") && !fs.exists("/dst/f1.flux-partial.op1"));
+    }
+
+    #[test]
+    fn one_and_sixteen_threads_give_the_same_outcome() {
+        let run = |threads: usize| {
+            let fs = n_files(70);
+            let (r, out, got) = batched(
+                &fs,
+                BatchPolicy { sync_threads: threads, ..policy(64) },
+                Durability::Strict,
+            );
+            r.unwrap();
+            (out.files_copied, out.bytes_copied, got.len(), fs.claim_count(), fs.prepared_count())
+        };
+        let a = run(1);
+        let b = run(16);
+        assert_eq!(a, b);
+        assert_eq!(a.0, 70);
+        // This test cannot tell 16 threads from 1 (a one-worker mutant passes it); Task 2's `sixteen_threads_sync_concurrently` does.
+    }
+
+    #[test]
+    fn barrier_max_records_the_longest_barrier() {
+        let fs = n_files(2);
+        fs.delay("sync_all", std::time::Duration::from_millis(50));
+        let (r, out, _) = batched(&fs, one_worker(), Durability::Strict);
+        r.unwrap();
+        // Mutant: a hardcoded zero.
+        assert!(out.barrier_max >= std::time::Duration::from_millis(50), "{:?}", out.barrier_max);
+    }
+
+    #[test]
+    fn the_default_policy_syncs_from_sixteen_threads_at_the_heartbeat_interval() {
+        assert_eq!(
+            (BatchPolicy::DEFAULT.sync_threads, BatchPolicy::DEFAULT.beat_every),
+            (16, crate::run::HEARTBEAT_INTERVAL)
         );
     }
 }
