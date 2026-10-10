@@ -38,6 +38,7 @@
 6. **Counters channel.** `TreeOutcome` gains `barrier_max: Duration` and `cap_flushes: u64`; `Pulse` gains the longest gap between two record writes, surfaced as `Run.beat_gap_max`. The CLI writes all three as one JSON object to `FLUX_TEST_COUNTERS_FILE` in debug builds only (the `FLUX_TEST_STALL_FILE` pattern, `main.rs:170-188`). Nothing is added to stderr or `--json`. The acceptance run reads the counters from a debug binary in a separate, untimed pass.
 7. **Fake additions.** `FaultFs::delay("sync_all", d)` makes every `FakeHandle::sync_all` sleep `d` (outside the fake's lock); `FakeHandle` records `drop_writer(<path>)` in the call log when it is dropped with a sink (readers have none). The fault key stays `sync_all` (consumed per handle at `create_new`, `fault_fs.rs:1198`); a middle entry is faulted with `on_nth("create_new", k, |fs| fs.fail("sync_all", ..))`.
 8. **Descriptor limit plumbing.** `flux-core` does not depend on `flux-platform` (dev-dependency only, `crates/flux-core/Cargo.toml:19`), so the CLI reads `flux_platform::soft_descriptor_limit() -> Option<u64>` and passes it as `RunConfig.descriptor_limit: Option<u64>`; `tree::open_writers_cap(limit) -> usize` applies the formula.
+9. **Every temporary is reported exactly once.** A failed-sync entry's report (`StrictDurabilityUnavailable` at `CopyStep::Durability`) replaces, never joins, the report the pair's failure branch would otherwise make for it: under a lost lock it goes through `on_report` with the temporary as `leftover`, and if that entry is entry 0 the returned `TargetLockBusy` error carries NO leftover (the run collects leftovers from the reports, `run/mod.rs:290-296`, and the abort's error separately, so the same temporary would otherwise be listed twice); under a failed heartbeat its temporary is removed with the others and the report carries a leftover only if the removal failed.
 
 ## Review Focus
 
@@ -354,8 +355,24 @@ fn a_failed_sync_entry_is_still_reported_when_the_lock_is_lost_at_the_pair() {
     fs.on_nth("create_new", 1, |fs| fs.fail("sync_all", Code::StrictDurabilityUnavailable));
     let guard = failing_after(G, &Cell::new(0));
     let (r, _, got) = batched_with(&fs, strict(), Durability::Strict, &guard, &no_heartbeat);
-    assert_eq!(r.unwrap_err().code(), Code::TargetLockBusy);
-    assert!(got.iter().any(|f| matches!(&f.cause, TreeFailureCause::Copy(e) if e.code() == Code::StrictDurabilityUnavailable && e.leftover.is_some())), "{got:?}");
+    let e = r.unwrap_err();
+    assert_eq!(e.code(), Code::TargetLockBusy);
+    assert!(e.leftover.is_none(), "entry 0 is the failed-sync entry: its report carries the leftover, not the error (ruling 9)");
+    let reported: Vec<(Code, bool)> = got.iter().map(|f| match &f.cause { TreeFailureCause::Copy(e) => (e.code(), e.leftover.is_some()), c => panic!("{c:?}") }).collect();
+    assert_eq!(reported, [(Code::StrictDurabilityUnavailable, true), (Code::TargetLockBusy, true)], "{got:?}");
+}
+
+#[test]
+fn a_failed_sync_entry_under_a_heartbeat_failure_is_reported_once_with_the_sync_code() {
+    let fs = n_files(2);
+    fs.on_nth("create_new", 1, |fs| fs.fail("sync_all", Code::StrictDurabilityUnavailable));
+    let beat = failing_after(K, &Cell::new(0));
+    let (r, _, got) = batched_with(&fs, strict(), Durability::Strict, &unguarded, &beat);
+    assert_eq!(r.unwrap_err().step, CopyStep::Heartbeat);
+    assert_eq!(got.len(), 1, "{got:?}");
+    let TreeFailureCause::Copy(e) = &got[0].cause else { panic!("{got:?}") };
+    assert_eq!((e.code(), e.leftover.is_none()), (Code::StrictDurabilityUnavailable, true), "removed, so no leftover");
+    assert!(!fs.exists("/dst/f0.flux-partial.op1") && !fs.exists("/dst/f1.flux-partial.op1"));
 }
 
 #[test]
@@ -392,8 +409,8 @@ fn the_default_policy_syncs_from_sixteen_threads_at_the_heartbeat_interval() {
     1. `let writers: Vec<&W> = entries.iter().filter_map(|p| p.staged.writer.as_ref()).collect()` with their entry indices (an entry staged `Staging` has none; today none does, but the code must not assume it); `let started = Instant::now(); let synced = sync_staged_many(&writers, cx.batch.sync_threads, cx.beat, cx.batch.beat_every); out.barrier_max = out.barrier_max.max(started.elapsed());`
     2. Close: `for p in &mut entries { p.staged.writer = None; }` (dropping records `drop_writer(` in the fake).
     3. Map results onto entries: `failed: Vec<bool>` per entry (an entry without a writer counts as synced).
-    4. If `synced.heartbeat` is `Some(e)`: run the EXISTING heartbeat-failure block (`:1368-1379`) with that `e` and return; do not call `cx.beat` again (ruling 4). Refactor that block into a local closure or helper so the two call sites share it.
-    5. The 4.1 pair as today. In its lost-lock branch, every entry (failed-sync ones included) is kept and reported as today; a failed-sync entry is reported ONCE, as `TreeFailureCause::Copy` of a `CopyError` at `CopyStep::Durability` with `Code::StrictDurabilityUnavailable` and its temporary as `leftover` (relative to DEST, as `report_kept` builds it), in place of the `TargetLockBusy` report for that entry.
+    4. If `synced.heartbeat` is `Some(e)`: run the heartbeat-failure block (`:1368-1379`) with that `e` and return; do not call `cx.beat` again (ruling 4). Refactor that block into a helper `fn stop_held_before_notes(..)` shared by this call site and the pair's, extended per ruling 9: a failed-sync entry's temporary is removed like the others, but it is reported through `on_report` as `StrictDurabilityUnavailable` at `CopyStep::Durability` (a leftover only if its removal failed) instead of the heartbeat leftover report.
+    5. The 4.1 pair as today. In its lost-lock branch, every entry (failed-sync ones included) is kept; a failed-sync entry is reported ONCE through `on_report`, as `TreeFailureCause::Copy` of a `CopyError` at `CopyStep::Durability` with `Code::StrictDurabilityUnavailable` and its temporary as `leftover` (relative to DEST, as `report_kept` builds it), in place of the `TargetLockBusy` report; if entry 0 is such an entry, the returned error is `CopyError::at(CopyStep::Publish, lost)` with no leftover (ruling 9).
     6. After the pair passes: partition `entries` into `(failed, ok)`; for each failed one, `discard(parent, &temp, CopyStep::Durability, Code::StrictDurabilityUnavailable, source, cx.guard)` where `source` is the sync's error, then `finish_copy(path, Err(that), out, on_report)?` (it reports and returns `Ok` for this code; a `TargetLockBusy` noticed inside the discard propagates as a stop, the 9d hardening debt). Then the unchanged 9d sequence from `// 4.2` on `ok`. An empty `ok` returns `Ok(())` after the discards (no `prepare_many(0)`).
   - The heartbeat-failure block removes every temporary including the failed-sync ones (they are all in `entries`).
 
