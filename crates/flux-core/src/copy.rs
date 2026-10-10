@@ -802,6 +802,17 @@ pub(crate) fn publish_staged<D: DirHandle>(
     })
 }
 
+/// Cut 9e: the next wake on the barrier's absolute grid (anchored at the barrier's start, stepped by `beat_every`):
+/// the first grid point strictly after `now`. Advancing on the grid, never from `now`, is what keeps a stream of
+/// results from resetting the timer; stepping until the point is past `now` is what keeps a stalled main thread from
+/// timing out once per missed step on resume.
+fn next_wake(mut deadline: Instant, now: Instant, beat_every: Duration) -> Instant {
+    while deadline <= now {
+        deadline += beat_every;
+    }
+    deadline
+}
+
 /// What the cut 9e barrier found: one result per writer, in input order, and the heartbeat failure if one ended the wait.
 pub(crate) struct SyncOutcome {
     pub results: Vec<Result<(), FsError>>,
@@ -866,13 +877,7 @@ pub(crate) fn sync_staged_many<W: FileHandle + Sync>(
             {
                 heartbeat = Some(e);
             }
-            // Catch up on the SAME absolute grid (never `now + beat_every`: a per-receive reset is the starvation the
-            // grid prevents). After a stall of several intervals this makes one beat, not one per missed interval.
-            // No deterministic test can stall the calling thread, so this loop is covered by reading only.
-            let now = Instant::now();
-            while *deadline <= now {
-                *deadline += beat_every;
-            }
+            *deadline = next_wake(*deadline, Instant::now(), beat_every);
         };
         let mut deadline = Instant::now() + beat_every;
         if spawned == 0 {
@@ -906,6 +911,19 @@ mod tests {
     use super::*;
     use crate::fault_fs::FaultFs;
     use flux_fs::{Durability, FileSystem, OperationId, Preserve, Publish};
+
+    #[test]
+    fn the_next_wake_is_the_first_grid_point_after_now() {
+        let start = Instant::now();
+        let step = Duration::from_millis(10);
+        // Not yet due: unchanged.
+        assert_eq!(next_wake(start + step, start, step), start + step);
+        // Exactly due: one step on.
+        assert_eq!(next_wake(start + step, start + step, step), start + 2 * step);
+        // Five steps behind (a stalled main thread): the first point after now, not now + step and not deadline + step.
+        let now = start + Duration::from_millis(57);
+        assert_eq!(next_wake(start + step, now, step), start + 6 * step);
+    }
 
     fn opts() -> CopyOptions {
         CopyOptions {
