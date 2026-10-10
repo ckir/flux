@@ -15,7 +15,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-10-cut-9e-batched-data-sync-design.md` (approved by the owner 2026-10-10 after a 6-round panel). Executors read it with this plan. Where the two differ the spec wins and the executor reports the conflict, except in the numbered "Plan rulings" below, which settle what the spec leaves to the plan.
 
-**Code base:** written against `spec/cut-9d` at `276da4b` (PR #82 with `main` merged in; its auto-merge was pending CI when this plan was written). The merge adds no code commit, so every citation below holds on `main` once #82 lands; Task 1's Step 0 re-verifies the cited lines before the first edit.
+**Code base:** written against `spec/cut-9d` at `276da4b` and re-verified on `main` after PR #82 merged (2026-10-10, no code change in the merge); every citation below was checked on the merged tree. Task 1's Step 0 re-verifies the cited lines before the first edit.
 
 ## Global Constraints
 
