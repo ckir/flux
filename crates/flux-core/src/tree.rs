@@ -4367,10 +4367,10 @@ mod tests {
         let (_, beat_calls) = stop_points_at_the_staging_of_my();
         let fs = sources(&[("a0", b"a"), ("m/x", b"x"), ("m/y", b"y"), ("z", b"z")]);
         let calls = std::cell::Cell::new(0);
-        // The heartbeat before `m/y`'s temporary fails, and every later one.
+        // Pulse-shaped (`Pulse::beat`): the heartbeat before `m/y`'s temporary fails ONCE, every later call is `Ok`.
         let beat = || {
             calls.set(calls.get() + 1);
-            if calls.get() >= beat_calls {
+            if calls.get() == beat_calls {
                 Err(FsError::new(Code::IoError, std::io::Error::other("beat")))
             } else {
                 Ok(())
@@ -4391,6 +4391,7 @@ mod tests {
         assert_eq!(count(&c, "sync_all("), 0, "no barrier after the failure: {c:?}");
         assert_eq!(count(&c, "claim_prepare_many("), 0, "{c:?}");
         assert_eq!(count(&c, "rename_"), 0, "{c:?}");
+        assert_eq!(count(&c, "rename_no_replace("), 0, "no rename after the failure: {c:?}");
         for t in ["/dst/a0.flux-partial.op1", "/dst/m/x.flux-partial.op1"] {
             assert!(!fs.exists(t), "{t} is removed: {c:?}");
         }
