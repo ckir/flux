@@ -158,11 +158,11 @@ If a gate fails the PR states it, as PR #82 did; thresholds are not moved.
 3. A shallow pending batch still waits while a subtree is walked (9d limit 5), now holding descriptors; the cap in decision 7 bounds that.
 4. The gain is measured on Linux ext4 only.
 5. One file per directory gets no benefit (9d limit 1).
-7. A `sync_all` that hangs (a dead network mount) hangs the run exactly as today's inline sync does: the system call is not cancellable. The
-   main thread keeps the heartbeat going during the wait, so the lease stays alive; no timeout or cancel is built, and none is claimed.
 6. The heartbeat is itself a synced write (`lock/held.rs:48`), so on a filesystem where a burst of concurrent `fsync` calls holds the journal, the
    heartbeat can queue behind the barrier and arrive late. Today's per-file `fsync` has the same exposure at a smaller scale. Not measured here:
    the acceptance run records the longest barrier and the longest heartbeat gap, and reports them.
+7. A `sync_all` that hangs (a dead network mount) hangs the run exactly as today's inline sync does: the system call is not cancellable. The
+   main thread keeps the heartbeat going during the wait, so the lease stays alive; no timeout or cancel is built, and none is claimed.
 
 ## Out of scope
 
