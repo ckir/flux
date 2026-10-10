@@ -4296,6 +4296,32 @@ fn a_strict_replacement_commits_the_planned_claim_too() {
     assert_eq!(fs.prepared_count(), 0);
 }
 
+#[test]
+fn a_strict_replacement_commits_the_planned_claim_through_the_per_entry_fallback() {
+    // Mutant (tree.rs, `flush_batch`'s decision-7 fallback): pass `None` as `commit_prepared`'s planned key.
+    // The batch's `apply_recovery` fails, so the entry is committed on its own by `commit_prepared`, which must carry
+    // the planned spelling too.
+    let fs = FaultFs::new();
+    for d in ["/src", "/p", "/p/dest"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    fs.write_file("/src/a", b"new");
+    fs.write_file("/p/dest/A", b"old");
+    fs.set_case_insensitive(true);
+    fs.fail_always("claim_apply_recovery", Code::IoError);
+    let (r, got) = run_tree_with(&fs, &cfg(), &strict());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(out.files_overwritten, 1, "{out:?}");
+    let c = calls(&fs);
+    assert_eq!(count(&c, "claim_commit_prepared("), 1, "the fallback's one commit: {c:?}");
+    let dest = strong(&fs, "/p/dest");
+    let created = Some(ClaimRecord { target: key("a"), status: ClaimStatus::Created });
+    assert_eq!(fs.claim(dest, "A"), created, "the stored spelling");
+    assert_eq!(fs.claim(dest, "a"), created, "the planned spelling");
+    assert_eq!(fs.prepared_count(), 0);
+}
+
 /// Every note in prior 5's store, read through a second handle.
 fn notes_of_prior_5(fs: &FaultFs) -> Vec<(ClaimKey, flux_fs::PreparedRecord)> {
     fs.destination_root(Path::new(&format!("/p/dest/.flux/operations/{}", id(5))))
@@ -4374,6 +4400,7 @@ fn the_note_precedes_the_publish_heartbeat_and_guard() {
     // Cut 9d: the window opens at the `prepare_many` of `a`'s batch (the root's; `sub`'s flush precedes it).
     let rename = publish_of(&c, "a");
     let prepare = last_before(&c, "claim_prepare_many(", rename);
+    assert_eq!(c[prepare], "claim_prepare_many(1)", "the root's batch, holding a alone: {c:?}");
     let window = &c[prepare..rename];
     let beat = window.iter().position(|x| x.starts_with("write_at_start("));
     let guard = window.iter().rposition(|x| *x == format!("metadata({LOCK})"));

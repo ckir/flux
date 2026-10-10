@@ -2944,7 +2944,8 @@ mod tests {
         assert!(!abort(Code::SafetyRejected, |o| o.failures.walk = 1).refused_unchanged());
     }
 
-    // Cut 9d: the per-directory batch. The default policy is OFF (`files == 1`), so every test here passes its own.
+    // Cut 9d: the per-directory batch. Every test here passes its own policy (small thresholds, or `files == 1` for the
+    // unbatched path) rather than the default (64 files).
 
     fn policy(files: usize) -> BatchPolicy {
         BatchPolicy { files, ..BatchPolicy::DEFAULT }
