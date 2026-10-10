@@ -334,15 +334,14 @@ pub(crate) struct Shared<'c, F: DestinationRoot> {
 }
 
 /// Cut 9d (spec decision 5): a batch flushes at this many staged files...
-// Referenced by `DEFAULT_FILES` once Task 5 turns batching on; until then only the tests read it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const BATCH_FILES: usize = 64;
 /// ...or this many staged source bytes (section 148.3's threshold); a file at least this long is staged alone...
 pub(crate) const BATCH_BYTES: u64 = 64 << 20;
 /// ...or when, at the next staging, the batch is at least this old.
 pub(crate) const BATCH_AGE: std::time::Duration = std::time::Duration::from_secs(1);
-/// `BatchPolicy::DEFAULT.files`. 1 is the unbatched cut 9c path (plan ruling 1). Task 5 sets this to BATCH_FILES.
-const DEFAULT_FILES: usize = 1;
+/// `BatchPolicy::DEFAULT.files`: batching is on. (1 would be the unbatched cut 9c path, plan ruling 1; tests reach it
+/// with an explicit policy.)
+const DEFAULT_FILES: usize = BATCH_FILES;
 
 /// Cut 9d: the flush thresholds of a Strict tree's per-directory batch, and the clock the age is read from. Carried in
 /// `Shared` so tests inject small thresholds and a fake clock (plan ruling 4). `files == 1` never batches.
@@ -3390,6 +3389,7 @@ mod tests {
         assert_eq!(BATCH_FILES, 64);
         assert_eq!(BATCH_BYTES, 64 << 20);
         assert_eq!(BATCH_AGE, std::time::Duration::from_secs(1));
+        assert_eq!(BatchPolicy::DEFAULT.files, BATCH_FILES);
         assert_eq!(BatchPolicy::DEFAULT.bytes, BATCH_BYTES);
         assert_eq!(BatchPolicy::DEFAULT.age, BATCH_AGE);
     }

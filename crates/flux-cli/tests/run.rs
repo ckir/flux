@@ -715,10 +715,14 @@ fn a_killed_single_file_copy_resumes_keeping_its_id_and_bumping_its_generation()
 }
 
 /// Spec "Testing": under the default overwrite policy the claim count equals the file count. Guard calls (measured
-/// by the published-file counts and the stall announcements below): d0's create is #1, its 100 files #2..#301, its
-/// DirEnd flush #302, d1's create #303. Stall 1 at 303: d0 whole and its claims synced, d1 not begun. The resume
-/// (`--durability strict`, allowed from normal and recorded) skips d0's files, so its calls are d0 create + DirEnd
-/// (2) + d1 (1 + 300 + 1) + d2 (302) = 606: stall at 606, d2's DirEnd flush, every file published, every claim durable.
+/// by the published-file counts and the stall announcements below). Run 1 is Normal, which does not batch: d0's
+/// create is #1, its 100 files #2..#301 (sweep, create, publish), its DirEnd flush #302, d1's create #303. Stall 1 at
+/// 303: d0 whole and its claims synced, d1 not begun. The resume (`--durability strict`, allowed from normal and
+/// recorded) batches (cut 9d, spec decision 11) and skips d0's files: d0 is its create and its `claims.flush()` guard
+/// (2; its batch is empty, so its DirEnd flush guards nothing). d1 and d2 are 304 each: the create (1), f000..f063
+/// staged (128), the batch's flush guard (1), 64 renames (64), f064..f099 staged (72), the DirEnd flush guard (1), 36
+/// renames (36), the `claims.flush()` guard (1). 2 + 304 + 304 = 610: stall at 610, d2's `claims.flush()` guard, every
+/// file published, every claim durable (each batch's `apply_recovery` commits them).
 #[test]
 fn the_claim_count_equals_the_file_count_under_the_default_policy() {
     let d = TempDir::new().unwrap();
@@ -729,7 +733,7 @@ fn the_claim_count_equals_the_file_count_under_the_default_policy() {
     assert_eq!(published(&dst), 100, "d0 whole, d1 not begun");
     assert_eq!(claim_count(&dst, &id), 100, "d0's claims were synced at its end");
 
-    Stalled::start_args(&src, &dst, 606, m2.path(), &["--resume", "--durability", "strict"]).kill();
+    Stalled::start_args(&src, &dst, 610, m2.path(), &["--resume", "--durability", "strict"]).kill();
     assert_eq!(the_operation(&dst), id);
     assert_eq!(published(&dst), 300, "every file is published at d2's flush");
     same_bytes(&src, &dst);

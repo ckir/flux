@@ -247,13 +247,18 @@ fn killed_strict(src: &Path, dst: &Path, at: u32, marks: &Path) -> String {
     the_operation(dst)
 }
 
-/// Guard calls in `big_tree_in`: d0's create is #1, its 100 files #2..#301 at three guards each (sweep, create,
-/// publish), its DirEnd flush #302, d1's create #303, d1/f000's sweep #304, create #305, publish #306. The stall
-/// precedes the guarded mutation, so 306 is held with `d1/f000`'s temporary written and its note prepared, before the
-/// rename.
-const AT_D1_F000_PUBLISH: u32 = 306;
-/// d1's create: d0 whole and its claims synced, d1 not begun.
-const AT_D1_CREATE: u32 = 303;
+/// Guard calls in `big_tree_in` under Strict (cut 9d, spec decision 11: 64-file batches, so a directory's creates
+/// precede its renames). d0: its create #1; f000..f063 staged at two guards each (sweep, create) #2..#129; the batch's
+/// flush guard (step 1, before `prepare_many`) #130; the 64 renames #131..#194; f064..f099 staged #195..#266; the
+/// DirEnd flush guard #267; the 36 renames #268..#303; the `claims.flush()` guard #304. So d0 is 304 guards and d1's
+/// create is #305; d1/f000..f063 staged #306..#433, the flush guard #434, f000's publish #435. The stall precedes the
+/// guarded mutation, so 435 is held with 64 temporaries written and 64 notes prepared, none renamed.
+const AT_D1_F000_PUBLISH: u32 = 435;
+/// d1's create under Strict (see above): d0 whole and its claims committed, d1 not begun.
+const AT_D1_CREATE: u32 = 305;
+/// d1/f000's publish under Normal, which does not batch: d0's create #1, its 100 files #2..#301 at three guards each
+/// (sweep, create, publish), its DirEnd flush #302, d1's create #303, d1/f000's sweep #304, create #305, publish #306.
+const AT_D1_F000_PUBLISH_NORMAL: u32 = 306;
 
 #[test]
 fn a_strict_copy_killed_at_a_publish_guard_leaves_a_note_that_resume_discards_and_redoes() {
@@ -263,8 +268,9 @@ fn a_strict_copy_killed_at_a_publish_guard_leaves_a_note_that_resume_discards_an
     let id = killed_strict(&src, &dst, AT_D1_F000_PUBLISH, marks.path());
     assert!(marks.path().join(format!("stalled-{AT_D1_F000_PUBLISH}")).exists());
 
-    // Measured: the stall landed at d1/f000's publish guard (the index was right).
-    assert_eq!(prepared_count(&dst, &id), 1, "the note is written before the publish");
+    // Measured: the stall landed at d1/f000's publish guard (the index was right): the batch's 64 notes are written
+    // before its first publish.
+    assert_eq!(prepared_count(&dst, &id), 64, "the notes are written before the publish");
     let temp = dst.join("d1").join(format!("f000.flux-partial.{id}"));
     assert!(temp.exists(), "the temporary is written: {:?}", names(&dst.join("d1")));
     assert!(!dst.join("d1").join("f000").exists(), "not yet published");
@@ -370,11 +376,13 @@ fn a_renamed_publication_is_recovered_and_reported() {
     let entry = dst.join("d1").join("f000");
     std::fs::rename(dst.join("d1").join(format!("f000.flux-partial.{id}")), &entry).unwrap();
 
-    // The note holds the file's real identity, encoded as the engine does.
-    let engine_note = notes(&dst, &id).remove(0).1;
+    // The note holds the file's real identity, encoded as the engine does. The batch's other 63 notes stay with their
+    // temporaries unrenamed (NOT RENAMED: discarded and redone, so not counted as recovered).
+    let engine_note =
+        notes(&dst, &id).into_iter().find(|(_, n)| n.name == b"f000").expect("f000's note").1;
     assert_eq!(engine_note.identity, identity_text(identity_of(&entry)));
     assert!(engine_note.identity.starts_with("strong:"), "{}", engine_note.identity);
-    assert_eq!(prepared_count(&dst, &id), 1);
+    assert_eq!(prepared_count(&dst, &id), 64);
 
     let out = copy(&[
         os("--resume"),
@@ -400,7 +408,7 @@ fn a_normal_copy_never_writes_a_note() {
     let d = TempDir::new().unwrap();
     let marks = TempDir::new().unwrap();
     let (src, dst) = big_tree_in(d.path());
-    Stalled::start_args(&src, &dst, AT_D1_F000_PUBLISH, marks.path(), &[]).kill();
+    Stalled::start_args(&src, &dst, AT_D1_F000_PUBLISH_NORMAL, marks.path(), &[]).kill();
     let id = the_operation(&dst);
     assert!(
         dst.join("d1").join(format!("f000.flux-partial.{id}")).exists(),

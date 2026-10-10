@@ -103,7 +103,10 @@ fn replacement_works_on_the_default_filesystem() {
 
     // A run cut short (the guard panics at its 3rd mutation, as a crash would): the workspace and `state.db` stay,
     // and the claim for `a`, recorded before its publish, is in the store. `Strict` makes every claim commit
-    // durable, so the answer does not depend on the directory-end sync this test does not reach.
+    // durable, so the answer does not depend on the directory-end sync this test does not reach. Under `Strict` the
+    // tree batches (cut 9d): the 3rd mutation is `sub`'s create, with `a` staged (its sweep and create are the 1st
+    // and 2nd) and its `Existing` claim recorded, but not yet noted or published (the root's batch flushes at walk
+    // end).
     let dst2 = d.path().join("dst2");
     std::fs::create_dir_all(&dst2).unwrap();
     std::fs::write(dst2.join("a"), b"old").unwrap();

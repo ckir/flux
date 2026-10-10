@@ -4058,19 +4058,43 @@ fn publish_of(c: &[String], name: &str) -> usize {
     at(c, &format!("rename_no_replace(/p/dest/{name}.flux-partial.{ID} -> /p/dest/{name})"))
 }
 
+/// Cut 9d: the index of the last call starting with `prefix` before index `i` (the batch call that owns call `i`).
+fn last_before(c: &[String], prefix: &str, i: usize) -> usize {
+    c[..i]
+        .iter()
+        .rposition(|x| x.starts_with(prefix))
+        .unwrap_or_else(|| panic!("no {prefix} before {i}: {c:?}"))
+}
+
+/// Cut 9d: the index of the first call starting with `prefix` after index `i`.
+fn first_after(c: &[String], prefix: &str, i: usize) -> usize {
+    i + 1
+        + c[i + 1..]
+            .iter()
+            .position(|x| x.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no {prefix} after {i}: {c:?}"))
+}
+
 #[test]
 fn a_strict_publication_prepares_before_the_rename_and_commits_after_it() {
-    // Mutants (tree.rs): no hook for a new file under Strict; `record_claim` kept in place of `commit_prepared`.
+    // Mutant (tree.rs, `flush_batch`): skip the batch's `prepare_many` (no note before the renames).
+    // Cut 9d: each directory's files are noted in one `prepare_many` before its renames and committed in one
+    // `apply_recovery` after them; `sub` flushes first (its DirEnd), then the root at walk end.
     let fs = fake();
     let (r, got) = run_tree_with(&fs, &cfg(), &strict());
     ok(&r);
     assert!(got.is_empty(), "{got:?}");
     let c = calls(&fs);
-    let prepare = at(&c, "claim_prepare(a)");
     let rename = publish_of(&c, "a");
-    let commit = at(&c, "claim_commit_prepared(a)");
+    let prepare = last_before(&c, "claim_prepare_many(", rename);
+    let commit = first_after(&c, "claim_apply_recovery", rename);
+    assert_eq!(c[prepare], "claim_prepare_many(1)", "a's batch holds a's note alone: {c:?}");
     assert!(prepare < rename && rename < commit, "{c:?}");
-    assert_eq!(count(&c, "claim_prepare(a)"), 1, "{c:?}");
+    assert!(publish_of(&c, "sub/b") < prepare, "sub/b publishes before the root's batch: {c:?}");
+    assert_eq!(count(&c, "claim_prepare_many("), 2, "one batch per directory: {c:?}");
+    assert_eq!(count(&c, "claim_apply_recovery"), 2, "one commit per directory: {c:?}");
+    assert_eq!(count(&c, "claim_prepare("), 0, "{c:?}");
+    assert_eq!(count(&c, "claim_commit_prepared("), 0, "{c:?}");
     assert!(
         !c.iter().any(|x| x.starts_with("claim_insert(a)")),
         "commit_prepared replaces the insert: {c:?}"
@@ -4118,9 +4142,13 @@ fn a_format_1_store_under_strict_writes_no_note() {
 
 #[test]
 fn a_prepare_failure_fails_the_file_before_the_rename() {
-    // Mutant: map the hook's error to `Ok(())` (tree.rs): the file is published without a note.
+    // Mutant (tree.rs, `flush_batch`): ignore the fallback `prepare`'s error: the file is published without a note.
+    // Cut 9d: `a`'s note is written by its batch's `prepare_many`, or, when that fails, by the per-entry fallback's
+    // `prepare`. Every `prepare_many` fails; `sub` flushes first, so the fallback's 1st `prepare` is `sub/b`'s (it
+    // succeeds) and the 2nd is `a`'s (it fails).
     let fs = fake();
-    fs.fail("claim_prepare", Code::IoError);
+    fs.fail_always("claim_prepare_many", Code::IoError);
+    fs.fail_nth("claim_prepare", 2, Code::IoError, std::io::ErrorKind::Other);
     let (r, got) = run_tree_with(&fs, &cfg(), &strict());
     let out = ok(&r);
     assert_eq!(got.len(), 1, "{got:?}");
@@ -4146,8 +4174,11 @@ fn a_prepare_failure_fails_the_file_before_the_rename() {
 #[test]
 fn a_commit_failure_keeps_the_note_and_reports_claim_not_recorded() {
     // Mutant: discard the note when `commit_prepared` fails (tree.rs).
+    // Cut 9d: every batch commit (`apply_recovery`) fails, so each renamed entry is committed by the fallback's
+    // `commit_prepared`: `sub/b`'s first (it succeeds; `sub` flushes first), then `a`'s (it fails).
     let fs = fake();
-    fs.fail("claim_commit_prepared", Code::IoError);
+    fs.fail_always("claim_apply_recovery", Code::IoError);
+    fs.fail_nth("claim_commit_prepared", 2, Code::IoError, std::io::ErrorKind::Other);
     let (r, got) = run_tree_with(&fs, &cfg(), &strict());
     let out = ok(&r);
     assert_eq!(fs.read_file("/p/dest/a").as_deref(), Some(&b"A"[..]), "the file IS published");
@@ -4164,18 +4195,22 @@ fn a_commit_failure_keeps_the_note_and_reports_claim_not_recorded() {
 fn a_publish_failure_after_the_note_discards_it() {
     // Mutant: skip the discard (tree.rs).
     let fs = fake();
-    // `rename_no_replace`: the no-replace probe (1), the workspace publish `<ID>.creating -> <ID>` (2), then `a`'s
-    // publish (3), measured from a green Strict run's call log.
-    fs.fail_nth("rename_no_replace", 3, Code::IoError, std::io::ErrorKind::Other);
+    // `rename_no_replace`: the no-replace probe (1), the workspace publish `<ID>.creating -> <ID>` (2), `sub/b`'s
+    // publish at `sub`'s DirEnd flush (3), then `a`'s at the root's walk-end flush (4), measured from a green Strict
+    // run's call log.
+    fs.fail_nth("rename_no_replace", 4, Code::IoError, std::io::ErrorKind::Other);
     let (r, got) = run_tree_with(&fs, &cfg(), &strict());
     ok(&r);
     let c = calls(&fs);
-    let prepare = at(&c, "claim_prepare(a)");
     let rename = publish_of(&c, "a");
-    let discard = at(&c, "claim_discard_prepared(a)");
+    let prepare = last_before(&c, "claim_prepare_many(", rename);
+    // Cut 9d: the note's discard is a `Discard` op of the batch's one `apply_recovery`.
+    let discard = first_after(&c, "claim_apply_recovery", rename);
     assert!(prepare < rename && rename < discard, "{c:?}");
-    assert!(!c.iter().any(|x| x.starts_with("claim_commit_prepared(a)")), "{c:?}");
+    assert!(!c.iter().any(|x| x.starts_with("claim_commit_prepared(")), "{c:?}");
+    assert!(!c.iter().any(|x| x.starts_with("claim_discard_prepared(")), "{c:?}");
     assert_eq!(fs.prepared_count(), 0);
+    assert_eq!(fs.claim(strong(&fs, "/p/dest"), "a"), None, "discarded, not committed");
     assert_eq!(got.len(), 1, "{got:?}");
     assert_eq!(got[0].path, PathBuf::from("a"));
     assert_eq!(step_of(&got[0]), CopyStep::Publish);
@@ -4183,32 +4218,53 @@ fn a_publish_failure_after_the_note_discards_it() {
 }
 
 #[test]
-fn a_lost_lock_after_the_note_discards_it_and_keeps_the_temporary() {
-    // Mutant: discard only after `finish_copy(..)?` (tree.rs): the abort returns first and the note stays.
+fn a_lost_lock_after_the_notes_keeps_them_and_the_temporaries() {
+    // Mutant: discard the notes on a lost lock (tree.rs, STOP-LOST: an `apply_recovery` of `Discard` ops).
+    // Cut 9d, spec decision 8 (this replaces cut 9c's "the note is discarded"): after a lost lock the run writes and
+    // removes NOTHING, so the notes stay for `--resume` and every temporary is kept.
     let fs = fake();
     // The idiom of `restart_stops_when_ownership_is_lost_and_deletes_nothing_after`: the lock is taken over, here just
-    // before `a`'s note is written, so the publish guard that follows the note finds it gone.
-    fs.on_nth("claim_prepare", 1, |fs| fs.write_file(LOCK, b"another run's bytes"));
-    let (r, _) = run_tree_with(&fs, &cfg(), &strict());
+    // before the first batch's notes are written (`sub`'s DirEnd flush, holding `sub/b`), so the publish guard that
+    // follows them finds it gone. `a` is still pending in the root's batch; the abort drain's flush finds the lock gone
+    // at its opening guard.
+    fs.on_nth("claim_prepare_many", 1, |fs| fs.write_file(LOCK, b"another run's bytes"));
+    let (r, got) = run_tree_with(&fs, &cfg(), &strict());
     assert!(r.stop.is_none(), "the copy's abort is the report: {:?}", r.stop);
     let a = aborted(&r);
     assert_eq!(a.error.code(), Code::TargetLockBusy);
-    assert!(a.error.leftover.is_some(), "{:?}", a.error);
+    let (left, _) = a.error.leftover.as_ref().expect("sub/b's temporary is the leftover");
+    assert_eq!(*left, Path::new("sub").join(format!("b.flux-partial.{ID}")), "{:?}", a.error);
+    // `a`'s kept temporary is named too: reported by the drain, whose own stop the walk's error outranks.
+    let a_left: Vec<_> = got
+        .iter()
+        .filter_map(|f| match &f.cause {
+            TreeFailureCause::Copy(e) => e.leftover.as_ref().map(|(p, _)| p.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(a_left, [PathBuf::from(format!("a.flux-partial.{ID}"))], "{got:?}");
     let c = calls(&fs);
-    assert!(at(&c, "claim_prepare(a)") < at(&c, "claim_discard_prepared(a)"), "{c:?}");
+    assert_eq!(count(&c, "claim_prepare_many("), 1, "only sub's notes were written: {c:?}");
+    for none in ["claim_apply_recovery", "claim_discard_prepared(", "claim_commit_prepared("] {
+        assert_eq!(count(&c, none), 0, "nothing is written after the loss: {none} in {c:?}");
+    }
     assert!(!c.iter().any(|x| x.starts_with("rename_no_replace(/p/dest/a.flux-partial")), "{c:?}");
-    assert_eq!(fs.prepared_count(), 0);
     assert!(
-        fs.exists(format!("/p/dest/a.flux-partial.{ID}")),
-        "the guard forbids removing the temporary"
+        !c.iter().any(|x| x.starts_with("rename_no_replace(/p/dest/sub/b.flux-partial")),
+        "{c:?}"
     );
+    assert_eq!(fs.prepared_count(), 1, "sub/b's note stays for recovery");
+    for temp in [format!("/p/dest/a.flux-partial.{ID}"), format!("/p/dest/sub/b.flux-partial.{ID}")]
+    {
+        assert!(fs.exists(&temp), "the guard forbids removing the temporary {temp}");
+    }
     assert!(!fs.exists("/p/dest/a") && !fs.exists("/p/dest/sub/b"), "the run stops");
     assert_eq!(fs.read_file(LOCK).as_deref(), Some(&b"another run's bytes"[..]), "never unlinked");
 }
 
 #[test]
 fn a_strict_replacement_commits_the_planned_claim_too() {
-    // Mutant: pass `None` as `commit_prepared`'s planned key (tree.rs).
+    // Mutant (tree.rs, `flush_batch`): `planned: None` in the batch's `RecoveryOp::Commit`.
     let fs = FaultFs::new();
     for d in ["/src", "/p", "/p/dest"] {
         fs.create_dir(Path::new(d)).unwrap();
@@ -4221,11 +4277,16 @@ fn a_strict_replacement_commits_the_planned_claim_too() {
     assert!(got.is_empty(), "{got:?}");
     assert_eq!(out.files_overwritten, 1, "{out:?}");
     let c = calls(&fs);
-    let prepare = at(&c, "claim_prepare(A)");
+    // Cut 9d: the note is written by the batch's `prepare_many` (its key, the stored spelling `A`, is pinned by
+    // `a_strict_note_carries_the_publications_fields`) and committed, with the planned claim, by its `apply_recovery`.
     // The fake logs the rename's target as the name it resolved to: the stored spelling.
     let rename = at(&c, &format!("rename_replace(/p/dest/a.flux-partial.{ID} -> "));
-    let commit = at(&c, "claim_commit_prepared(A)");
+    let prepare = last_before(&c, "claim_prepare_many(", rename);
+    let commit = first_after(&c, "claim_apply_recovery", rename);
+    assert_eq!(c[prepare], "claim_prepare_many(1)", "{c:?}");
     assert!(prepare < rename && rename < commit, "{c:?}");
+    assert_eq!(count(&c, "claim_prepare("), 0, "{c:?}");
+    assert_eq!(count(&c, "claim_commit_prepared("), 0, "{c:?}");
     assert!(!c.iter().any(|x| x.starts_with("claim_upgrade(")), "{c:?}");
     assert!(!c.iter().any(|x| x.starts_with("claim_insert(a)")), "{c:?}");
     let dest = strong(&fs, "/p/dest");
@@ -4255,11 +4316,12 @@ fn a_strict_note_carries_the_publications_fields() {
     fs.set_case_insensitive(true);
     let seen: Arc<Mutex<Vec<(ClaimKey, flux_fs::PreparedRecord)>>> = Arc::default();
     let keep = Arc::clone(&seen);
-    // Read each note just before its commit: `A`'s (1), then `sub/b`'s (2).
-    fs.on_nth("claim_commit_prepared", 1, move |fs| {
+    // Read each note just before its batch's commit (cut 9d: `sub` flushes first): `sub/b`'s (1), then `A`'s (2).
+    // (No note is adopted, so recovery makes no `apply_recovery` call of its own.)
+    fs.on_nth("claim_apply_recovery", 1, move |fs| {
         keep.lock().unwrap().extend(notes_of_prior_5(fs));
         let keep = Arc::clone(&keep);
-        fs.on_nth("claim_commit_prepared", 2, move |fs| {
+        fs.on_nth("claim_apply_recovery", 2, move |fs| {
             keep.lock().unwrap().extend(notes_of_prior_5(fs));
         });
     });
@@ -4270,7 +4332,7 @@ fn a_strict_note_carries_the_publications_fields() {
     assert_eq!(notes.len(), 2, "{notes:?}");
     let identity = |p: &str| identity_text(fs.metadata(Path::new(p)).unwrap().identity);
     let temp = |name: &str| format!("{name}.flux-partial.{}", id(5)).into_bytes();
-    let (k, n) = &notes[0];
+    let (k, n) = &notes[1];
     assert_eq!(*k, ClaimKey::new(strong(&fs, "/p/dest"), OsStr::new("A")));
     assert_eq!(
         *n,
@@ -4284,7 +4346,7 @@ fn a_strict_note_carries_the_publications_fields() {
             replacement: true,
         }
     );
-    let (k, n) = &notes[1];
+    let (k, n) = &notes[0];
     assert_eq!(*k, ClaimKey::new(strong(&fs, "/p/dest/sub"), OsStr::new("b")));
     assert_eq!(
         *n,
@@ -4303,14 +4365,15 @@ fn a_strict_note_carries_the_publications_fields() {
 
 #[test]
 fn the_note_precedes_the_publish_heartbeat_and_guard() {
-    // Mutant (copy.rs, reverted by hand): call `before_publish` after the final `beat()` and `guard()`.
+    // Mutant (copy.rs, `publish_staged`): the final `guard()` before the final `beat()`.
     let fs = fake();
     let (r, got) = run_tree_with(&fs, &beating(), &strict());
     ok(&r);
     assert!(got.is_empty(), "{got:?}");
     let c = calls(&fs);
-    let prepare = at(&c, "claim_prepare(a)");
+    // Cut 9d: the window opens at the `prepare_many` of `a`'s batch (the root's; `sub`'s flush precedes it).
     let rename = publish_of(&c, "a");
+    let prepare = last_before(&c, "claim_prepare_many(", rename);
     let window = &c[prepare..rename];
     let beat = window.iter().position(|x| x.starts_with("write_at_start("));
     let guard = window.iter().rposition(|x| *x == format!("metadata({LOCK})"));
@@ -4318,6 +4381,75 @@ fn the_note_precedes_the_publish_heartbeat_and_guard() {
         matches!((beat, guard), (Some(b), Some(g)) if b < g),
         "the heartbeat, then the guard, between the note and the rename: {window:?}"
     );
+}
+
+// Cut 9d Task 5: with the default policy (64 files) a Strict tree copy publishes in groups through the run.
+
+/// `/src/d/f000..f<n-1>`, each holding its own name, and `/p`.
+fn wide_fake(n: usize) -> FaultFs {
+    let fs = FaultFs::new();
+    for d in ["/src", "/src/d", "/p"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    for i in 0..n {
+        let name = format!("f{i:03}");
+        fs.write_file(format!("/src/d/{name}"), name.as_bytes());
+    }
+    fs
+}
+
+#[test]
+fn a_strict_tree_of_130_files_makes_three_batches() {
+    // Mutant: `DEFAULT_FILES = 1` (tree.rs): 130 per-file prepares and no batch.
+    let fs = wide_fake(130);
+    let (r, got) = run_tree_with(&fs, &cfg(), &strict());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(out.files_copied, 130, "{out:?}");
+    let c = calls(&fs);
+    let batches: Vec<&String> = c.iter().filter(|x| x.starts_with("claim_prepare_many(")).collect();
+    assert_eq!(
+        batches,
+        ["claim_prepare_many(64)", "claim_prepare_many(64)", "claim_prepare_many(2)"],
+        "{c:?}"
+    );
+    assert_eq!(count(&c, "claim_apply_recovery"), 3, "{c:?}");
+    assert_eq!(count(&c, "claim_prepare("), 0, "{c:?}");
+    assert_eq!(count(&c, "claim_commit_prepared("), 0, "{c:?}");
+    let d = strong(&fs, "/p/dest/d");
+    for i in 0..130 {
+        let name = format!("f{i:03}");
+        assert_eq!(
+            fs.read_file(format!("/p/dest/d/{name}")).as_deref(),
+            Some(name.as_bytes()),
+            "{name}"
+        );
+        assert_eq!(
+            fs.claim(d, &name),
+            Some(ClaimRecord { target: key(&format!("d\0{name}")), status: ClaimStatus::Created }),
+            "{name}"
+        );
+    }
+    assert_eq!(fs.prepared_count(), 0);
+    assert!(!fs.exists("/p/dest/.flux") && !fs.exists(LOCK), "the workspace is removed");
+}
+
+#[test]
+fn a_normal_tree_of_130_files_makes_no_batch_calls() {
+    // Mutant: drop the `Durability::Strict` test from the batching gate (tree.rs).
+    let fs = wide_fake(130);
+    let (r, got) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(out.files_copied, 130, "{out:?}");
+    let c = calls(&fs);
+    for call in
+        ["claim_prepare_many(", "claim_apply_recovery", "claim_prepare(", "claim_commit_prepared("]
+    {
+        assert_eq!(count(&c, call), 0, "{call}: {c:?}");
+    }
+    assert_eq!(count(&c, "claim_insert("), 130, "today's claim path: {c:?}");
+    assert!(!fs.exists("/p/dest/.flux") && !fs.exists(LOCK), "the workspace is removed");
 }
 
 // Cut 9c Task 6: commit recovery at `--resume` (spec "Recovery at --resume"). Every note of the adopted store is
@@ -4612,7 +4744,16 @@ fn recovery_row_4_gone_discards() {
     assert_eq!(fs.prepared_count(), 0);
     assert_eq!(out.files_copied, 2, "{out:?}");
     assert_eq!(fs.read_file("/p/dest/sub/b").as_deref(), Some(&b"BB"[..]), "the policy decides");
-    assert_eq!(count(&calls(&fs), "claim_apply_recovery"), 1, "one transaction for both notes");
+    // Cut 9d: the walk's batch flushes (`sub`'s and the root's) commit through `apply_recovery` too; recovery's own
+    // call is the one before the walk's first `prepare_many`.
+    let c = calls(&fs);
+    let walk = at(&c, "claim_prepare_many(");
+    assert_eq!(
+        count(&c[..walk], "claim_apply_recovery"),
+        1,
+        "one transaction for both notes: {c:?}"
+    );
+    assert_eq!(count(&c, "claim_apply_recovery"), 3, "recovery's, then one per batch: {c:?}");
 
     // Distractor: T absent and D Weak: UNCERTAIN.
     let fs = strict_prior();
@@ -5022,18 +5163,12 @@ fn a_crashed_case_variant_replacement_is_recovered_with_both_claims() {
     fs.create_dir(Path::new("/p/dest")).unwrap();
     fs.write_file("/p/dest/A", b"old");
     fs.set_case_insensitive(true);
-    fs.fail("claim_commit_prepared", Code::IoError);
-    // The 4th guarded mutation is `sub`'s creation, after `a`'s publish and its failed commit: the run dies there.
-    let count = Arc::new(AtomicUsize::new(0));
-    let seen = Arc::clone(&count);
-    let hook: BeforeMutation = Arc::new(move || {
-        if seen.fetch_add(1, Ordering::SeqCst) + 1 == 4 {
-            panic!("the test's crash point");
-        }
-    });
-    let first = RunConfig { before_mutation: Some(hook), ..cfg() };
+    // Cut 9d: the root's batch (`a`) flushes at walk end, after `sub`'s (`sub/b`, published and committed), and no
+    // guarded mutation follows `a`'s publish, so the run dies inside the batch's commit instead: the 2nd
+    // `apply_recovery` (the 1st is `sub`'s), after `a`'s rename and before its claim is durable (spec decision 9).
+    fs.on_nth("claim_apply_recovery", 2, |_| panic!("the test's crash point"));
     let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_tree_with(&fs, &first, &strict())
+        run_tree_with(&fs, &cfg(), &strict())
     }));
     assert!(died.is_err(), "the run died");
     assert_eq!(fs.prepared_count(), 1, "the crash left the engine's own note");
@@ -5050,8 +5185,9 @@ fn a_crashed_case_variant_replacement_is_recovered_with_both_claims() {
     let before = calls(&fs).len();
     let (r, _) = run_tree_with(&fs, &again, &strict());
     let out = ok(&r);
-    // Recovered, not redone: the walk skips the case-variant file as resumed and makes no temporary for it.
-    assert_eq!(out.files_resumed, 1, "{out:?}");
+    // Recovered, not redone: the walk skips the case-variant file as resumed and makes no temporary for it. (Cut 9d:
+    // `sub/b`, committed before the crash, is resumed too: 2.)
+    assert_eq!(out.files_resumed, 2, "{out:?}");
     let c = calls(&fs);
     assert!(
         !c[before..].iter().any(|x| x.starts_with("create_new(/p/dest/a.flux-partial.")
@@ -5059,10 +5195,11 @@ fn a_crashed_case_variant_replacement_is_recovered_with_both_claims() {
         "{c:?}"
     );
     let dest = strong(&fs, "/p/dest");
-    // `claims` is taken before recovery: the replacement's `Existing` claim of the old file.
+    // `claims` is taken before recovery: the replacement's `Existing` claim of the old file, and (cut 9d) `sub/b`'s
+    // `Created` claim, committed by `sub`'s batch before the crash.
     assert_eq!(
         r.resumed,
-        Some(ResumeNote::Adopted { operation_id: ID.to_string(), claims: Some(1), recovered: 1 }),
+        Some(ResumeNote::Adopted { operation_id: ID.to_string(), claims: Some(2), recovered: 1 }),
         "{:?}",
         r.resumed
     );
@@ -5174,7 +5311,15 @@ fn a_failed_recovery_transaction_is_retried_by_the_next_resume() {
     assert!(got.is_empty(), "{got:?}");
     // `two_decidable`'s notes are NOT RENAMED / GONE: both discarded (recovered 0), then the walk redoes both files.
     adopted_recovering(&r, 0, 0);
-    assert_eq!(count(&calls(&fs), "claim_apply_recovery"), 2, "the failed call, then the retry");
+    // Cut 9d: recovery's calls are those before the walk's first `prepare_many` (the walk's two batch flushes follow).
+    let c = calls(&fs);
+    let walk = at(&c, "claim_prepare_many(");
+    assert_eq!(
+        count(&c[..walk], "claim_apply_recovery"),
+        2,
+        "the failed call, then the retry: {c:?}"
+    );
+    assert_eq!(count(&c, "claim_apply_recovery"), 4, "then one per batch: {c:?}");
     assert_eq!(fs.prepared_count(), 0);
     assert_eq!(fs.claim(strong(&fs, "/p/dest"), "a"), created("a"));
     assert_eq!(fs.claim(strong(&fs, "/p/dest/sub"), "b"), created("sub\0b"));
