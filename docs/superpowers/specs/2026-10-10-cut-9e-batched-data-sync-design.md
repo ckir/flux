@@ -37,18 +37,30 @@ is not the engine and the real gain is smaller (reads, renames and about 25 othe
 2. **Threads confined to the barrier.** The barrier runs `sync_all` on the pending writers from `std::thread::scope` workers: `BatchPolicy.sync_threads`
    (default `SYNC_THREADS = 16`, the best measured count) workers, fewer when fewer entries are pending. `sync_threads == 1` is a sequential loop
    on the same code path, and is the seam tests use for a deterministic call order. No new dependency. A worker calls `sync_all` and nothing else:
-   never the guard, the heartbeat, the call log's ordering-sensitive methods or the claim store, so lock-loss behaviour is untouched.
+   never the guard, the heartbeat or the claim store. **The main thread keeps the lease alive:** while workers run it waits on their results with a
+   timeout of `heartbeat_interval` and calls the heartbeat on every timeout (the heartbeat closure never leaves the main thread), because a barrier
+   can take seconds (11 s measured under a background writer) and a record older than the lease threshold can be taken over by another run
+   (`lock/obtain.rs:208`). A heartbeat that fails during the wait ends the wait only after the workers are joined (the scope needs them), and is
+   then handled as decision 5's heartbeat case.
 3. **`FileSystem::Writer` must be `Sync`** (`sync_all(&self)` is already `&self`). Real and fake writers satisfy it; the plan verifies each
    implementor and widens the trait bound only if the compiler requires it.
-4. **Per-entry failure attribution.** The barrier returns one result per entry. An entry whose `sync_all` failed has its temp discarded and is
-   reported `Code::StrictDurabilityUnavailable` at `CopyStep::Durability`, exactly the report step 5 gives today. The other entries continue
-   to `prepare_many` in the same flush. No note is written for a failed entry.
-5. **An extra guard after the barrier.** The barrier can take seconds, so `flush_batch` runs one more heartbeat and guard after it, before
-   `prepare_many`. A lost lock there writes and removes nothing (the 9d decision 8 rule): every entry's temp is kept as a leftover, none discarded.
-   This adds one guard call per flush and shifts every Strict stall index of the end-to-end tests; the plan re-derives them as 9d did.
+4. **Per-entry failure attribution.** The barrier returns one result per entry. An entry whose `sync_all` failed is reported
+   `Code::StrictDurabilityUnavailable` at `CopyStep::Durability`, exactly the report step 5 gives today, and its temp is discarded. The other
+   entries continue to `prepare_many` in the same flush. No note is written for a failed entry. **Order:** the failed entries are discarded
+   AFTER decision 5's post-barrier heartbeat and guard have passed, so every removal runs under a lock just checked. `discard` itself checks the
+   guard first and keeps the temp as a leftover if the lock is gone (`copy.rs:216`); a loss between that check and the discard is the 9d
+   hardening debt (a lost lock noticed only inside a cleanup `discard`), not new here.
+5. **An extra heartbeat and guard after the barrier.** The barrier can take seconds, so `flush_batch` runs one more heartbeat and guard after
+   it, before anything is written or removed. The two outcomes are the 9d step-1 ones and must not be conflated: a **failed heartbeat** (the lock
+   is still held) removes every temp of the batch, guarded, and reports any that stays as a leftover; a **lost lock** (the guard) writes and
+   removes nothing: entry 0's temp rides in the error and the rest are reported through `on_report` (9d plan ruling 2).
+   This adds one heartbeat and one guard call per flush and shifts every Strict stall index of the end-to-end tests; the plan re-derives them as 9d did.
 6. **Metadata before the barrier.** Times and permissions (step 6) are applied to the handle before it is synced, so the barrier also makes
    them durable. This is strictly stronger than today (metadata applied after the sync, never synced), costs nothing, and removes an order
    dependency between the old step 5 and 6. If the plan finds a test that pins the old order, the test is re-derived, not the order kept.
+   **The writers are closed right after the barrier:** `flush_batch` takes every `Staged.writer` out and drops it (on every exit path, including
+   a failed heartbeat or a lost lock) before `prepare_many` and before any rename, as the 9d staging did. A rename or an unlink of a file with an
+   open handle fails or misbehaves on Windows, which the Windows CI would surface and no Linux test can.
 7. **Open-writer budget.** A pending entry now holds a descriptor. A directory frame holds at most 64 entries, but the walker's stack holds
    several frames. `OPEN_WRITERS_MAX = 256` run-wide: before staging a new entry while the stack already holds that many, the walker flushes pending
    batches shallowest frame first until it is below the cap. The cap is a `BatchPolicy` field (`open_writers`) so a test can set it to 2.
@@ -81,6 +93,11 @@ flush trigger of 9d, and the order data -> note -> rename.
 - **Order:** with `sync_threads == 1`, the call log shows every `sync_all` of a batch before `claim_prepare_many`, which precedes the renames.
 - **Partial failure:** one entry's `sync_all` is faulted; that entry's temp is discarded and reported `StrictDurabilityUnavailable`, the others
   are published and claimed, and `prepare_many` carries only the successful entries.
+- **Lease:** with a barrier that outlasts `heartbeat_interval` (a fake sync that sleeps), the heartbeat is called during the wait, from the main
+  thread only.
+- **Heartbeat failure after the barrier:** every temp removed, none left, no note; **lost lock after the barrier:** see below.
+- **Writers closed:** after the barrier and before `prepare_many`, no writer of the batch is alive (observed through the fake), on the success
+  path and on both failure paths.
 - **Equivalence:** the same tree under `sync_threads` 1 and 16 produces the same outcome set, claims and counters.
 - **Lost lock after the barrier:** every temp kept as a leftover, no note, no removal.
 - **Open-writer cap:** with `open_writers == 2` a three-directory tree never holds more than 2 writers (observed through the fake) and every file
@@ -93,10 +110,11 @@ flush trigger of 9d, and the order data -> note -> rename.
 ## Measurement (acceptance)
 
 Same protocol as 9d: `measure9d.py`-style driver, page cache dropped, 2 passes x 3 runs alternating binary order, strace sync counts,
-criterion `small_1000x4kib`, idleness census with a busy-core control, background load stated. Baselines: the 9d "after" figures (small 17.8 s,
-flat5000 16.3 s) and the pre-9d ones. Gates:
+criterion `small_1000x4kib`, idleness census with a busy-core control, background load stated. **Three binaries in one session**, alternating:
+pre-9d (`49fabc4`), the merged 9d head, and 9e. Absolute times drift between sessions (the same small shape read 17.8 s and 33.0 s on the
+2026-10-10 runs, ratio unchanged), so a gate is a ratio taken inside one session, never against a figure from an earlier one. Gates:
 
-- Strict small and flat5000: at least 50% faster than the 9d "after" median (the spike projects about 74% below the pre-9d median).
+- Strict small and flat5000: at least 50% faster than the 9d median of the same session (the spike projects about 74% below the pre-9d median).
 - Syncs per file stay at most 1.15 (the barrier changes when they happen, not how many).
 - Normal unchanged within the baseline spread; Strict large and mixed not worse than their spread; peak RSS within 2 MiB of the 9d figure.
 - Reported, not gated: nested 500x10, one file per directory (no benefit by design), a run with a background writer.
@@ -104,7 +122,9 @@ If a gate fails the PR states it, as PR #82 did; thresholds are not moved.
 
 ## Known limits (to be recorded in `TODO.md` "Cut 9e known limits")
 
-1. First threads in the engine: a worker panic is caught at the scope's join and reported as `StrictDurabilityUnavailable` for the entries it held.
+1. First threads in the engine. The shipped binary builds with `panic = "abort"` (`Cargo.toml:111`), so a worker panic is a hard crash, not a
+   reported failure; it is safe for the recovery matrix (no note exists yet, the sweep removes the temps) but is not a handled error. In
+   unwinding test builds the panic propagates out of the scope and fails the test. No catch-and-report path is built.
 2. The barrier lengthens the window between the temps' creation and the notes by up to the slowest sync; the post-barrier guard bounds the lock
    risk, not the source-change window (9d known limit 5 still applies).
 3. A shallow pending batch still waits while a subtree is walked (9d limit 5), now holding descriptors; the cap in decision 7 bounds that.
