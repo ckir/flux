@@ -8,6 +8,9 @@ use flux_fs::{
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 /// The code for a failure inside the streaming loop.
 ///
@@ -796,6 +799,88 @@ pub(crate) fn publish_staged<D: DirHandle>(
     })
 }
 
+/// What the cut 9e barrier found: one result per writer, in input order, and the heartbeat failure if one ended the wait.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "cut 9e task 3 wires the barrier into the tree walk; remove this then"
+    )
+)]
+pub(crate) struct SyncOutcome {
+    pub results: Vec<Result<(), FsError>>,
+    pub heartbeat: Option<FsError>,
+}
+
+/// Cut 9e: the data `fsync` of every pending writer, `threads` at a time (at most one worker per writer). The calling
+/// thread does not sync; it keeps the lock's heartbeat alive, calling `beat` whenever a further `beat_every` has passed
+/// IN TOTAL since the start (an absolute deadline stepped by `beat_every`, never a fresh interval per received result).
+/// `beat` is `dyn Fn` without `Send`, so it is only ever called here, never from a worker. After one heartbeat failure
+/// no further `beat` is made, but the wait continues until every worker has finished and been joined: every writer
+/// still gets its result, and the failure is reported once in `heartbeat`. A worker panic propagates out of the scope.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "cut 9e task 3 wires the barrier into the tree walk; remove this then"
+    )
+)]
+pub(crate) fn sync_staged_many<W: FileHandle + Sync>(
+    writers: &[&W],
+    threads: usize,
+    beat: &Heartbeat<'_>,
+    beat_every: Duration,
+) -> SyncOutcome {
+    let n = writers.len();
+    if n == 0 {
+        return SyncOutcome { results: Vec::new(), heartbeat: None };
+    }
+    let workers = threads.clamp(1, n);
+    let next = AtomicUsize::new(0);
+    let mut slots: Vec<Option<Result<(), FsError>>> = Vec::new();
+    slots.resize_with(n, || None);
+    let mut heartbeat = None;
+    std::thread::scope(|scope| {
+        let (tx, rx) = mpsc::channel::<(usize, Result<(), FsError>)>();
+        for _ in 0..workers {
+            let tx = tx.clone();
+            let next = &next;
+            scope.spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= n {
+                        break;
+                    }
+                    // A closed receiver cannot happen before every index is received; ignore it rather than panic.
+                    let _ = tx.send((i, writers[i].sync_all()));
+                }
+            });
+        }
+        drop(tx);
+        let mut deadline = Instant::now() + beat_every;
+        let mut received = 0;
+        while received < n {
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok((i, r)) => {
+                    slots[i] = Some(r);
+                    received += 1;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if heartbeat.is_none()
+                        && let Err(e) = beat()
+                    {
+                        heartbeat = Some(e);
+                    }
+                    deadline += beat_every;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
+    let results = slots.into_iter().map(|s| s.expect("every index is sent exactly once")).collect();
+    SyncOutcome { results, heartbeat }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -872,6 +957,121 @@ mod tests {
         let times = c.iter().position(|x| x.starts_with("set_times(")).expect("times set");
         assert!(times < sync, "metadata before the sync: {c:?}");
         assert_eq!(c.iter().filter(|x| x.starts_with("sync_all(")).count(), 1);
+    }
+
+    use crate::fault_fs::FakeHandle;
+    use std::cell::Cell;
+    use std::thread::ThreadId;
+    use std::time::Duration;
+
+    fn handles(fs: &FaultFs, n: usize) -> Vec<FakeHandle> {
+        (0..n).map(|i| fs.create_new(Path::new(&format!("/t{i}"))).unwrap()).collect()
+    }
+
+    /// A heartbeat that counts its calls and remembers the thread of the last one.
+    type Calls = std::rc::Rc<Cell<u32>>;
+    type Thread = std::rc::Rc<Cell<Option<ThreadId>>>;
+
+    fn counting_beat() -> (impl Fn() -> flux_fs::Result<()>, Calls, Thread) {
+        let count = std::rc::Rc::new(Cell::new(0u32));
+        let thread = std::rc::Rc::new(Cell::new(None));
+        let (c, t) = (std::rc::Rc::clone(&count), std::rc::Rc::clone(&thread));
+        let beat = move || {
+            c.set(c.get() + 1);
+            t.set(Some(std::thread::current().id()));
+            Ok(())
+        };
+        (beat, count, thread)
+    }
+
+    #[test]
+    fn barrier_results_are_positional_and_every_writer_is_synced_once() {
+        let fs = FaultFs::new();
+        let ws = handles(&fs, 5);
+        let refs: Vec<&FakeHandle> = ws.iter().collect();
+        let out = sync_staged_many(&refs, 16, &no_heartbeat, Duration::from_secs(5));
+        assert_eq!(out.results.len(), 5);
+        assert!(out.results.iter().all(Result::is_ok) && out.heartbeat.is_none());
+        assert_eq!(fs.calls().iter().filter(|c| c.starts_with("sync_all(")).count(), 5);
+    }
+
+    #[test]
+    fn a_faulted_writer_fails_at_its_own_index_only() {
+        let fs = FaultFs::new();
+        fs.on_nth("create_new", 3, |fs| fs.fail("sync_all", Code::StrictDurabilityUnavailable));
+        let ws = handles(&fs, 4);
+        let refs: Vec<&FakeHandle> = ws.iter().collect();
+        let out = sync_staged_many(&refs, 2, &no_heartbeat, Duration::from_secs(5));
+        let failed: Vec<usize> =
+            out.results.iter().enumerate().filter(|(_, r)| r.is_err()).map(|(i, _)| i).collect();
+        assert_eq!(failed, [2]);
+        assert_eq!(out.results[2].as_ref().unwrap_err().code, Code::StrictDurabilityUnavailable);
+    }
+
+    #[test]
+    fn one_thread_syncs_in_order() {
+        let fs = FaultFs::new();
+        let ws = handles(&fs, 3);
+        let refs: Vec<&FakeHandle> = ws.iter().collect();
+        sync_staged_many(&refs, 1, &no_heartbeat, Duration::from_secs(5));
+        let synced: Vec<String> =
+            fs.calls().into_iter().filter(|c| c.starts_with("sync_all(")).collect();
+        assert_eq!(synced, ["sync_all(/t0)", "sync_all(/t1)", "sync_all(/t2)"]);
+    }
+
+    #[test]
+    fn the_heartbeat_is_called_from_the_main_thread_once_the_interval_has_passed_in_total() {
+        // 5 syncs x 20 ms = 100 ms, one worker; a 25 ms deadline must fire at least once. A fresh full timeout per
+        // receive (the mutant) would never reach 25 ms, because a result lands every 20 ms.
+        let fs = FaultFs::new();
+        fs.delay("sync_all", Duration::from_millis(20));
+        let ws = handles(&fs, 5);
+        let refs: Vec<&FakeHandle> = ws.iter().collect();
+        let (beat, count, thread) = counting_beat();
+        let out = sync_staged_many(&refs, 1, &beat, Duration::from_millis(25));
+        assert!(out.heartbeat.is_none());
+        assert!(count.get() >= 1, "no heartbeat during a 100 ms barrier");
+        assert_eq!(thread.get(), Some(std::thread::current().id()));
+    }
+
+    #[test]
+    fn sixteen_threads_sync_concurrently() {
+        // Deterministic: every sync waits for a second one to be in flight (or 2 s). With real workers the two meet at
+        // once and the peak is >= 2; under the mutant "ignore `threads`, one worker" each sync waits out the 2 s alone and
+        // the peak stays 1 (red, and slow: a mutant run, not CI). No sleep, no scheduler race.
+        let fs = FaultFs::new();
+        fs.rendezvous("sync_all", 2, Duration::from_secs(2));
+        let ws = handles(&fs, 8);
+        let refs: Vec<&FakeHandle> = ws.iter().collect();
+        let started = std::time::Instant::now();
+        sync_staged_many(&refs, 16, &no_heartbeat, Duration::from_secs(5));
+        assert!(fs.peak_concurrent_syncs() >= 2, "{}", fs.peak_concurrent_syncs());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the syncs met; nobody waited out the timeout"
+        );
+    }
+
+    #[test]
+    fn a_failed_heartbeat_ends_the_wait_after_the_join_and_is_reported_once() {
+        let fs = FaultFs::new();
+        fs.delay("sync_all", Duration::from_millis(20));
+        let ws = handles(&fs, 4);
+        let refs: Vec<&FakeHandle> = ws.iter().collect();
+        let calls = Cell::new(0u32);
+        let beat = || {
+            calls.set(calls.get() + 1);
+            Err(FsError::new(Code::IoError, std::io::Error::other("torn")))
+        };
+        let out = sync_staged_many(&refs, 1, &beat, Duration::from_millis(10));
+        assert_eq!(out.heartbeat.as_ref().map(|e| e.code), Some(Code::IoError));
+        assert_eq!(calls.get(), 1, "no second heartbeat call after a failure");
+        assert_eq!(
+            out.results.len(),
+            4,
+            "every writer still has a result: the workers were joined"
+        );
+        assert_eq!(fs.calls().iter().filter(|c| c.starts_with("sync_all(")).count(), 4);
     }
 
     #[test]
