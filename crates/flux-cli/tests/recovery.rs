@@ -55,6 +55,9 @@ impl Stalled {
             .arg(dst)
             .env("FLUX_TEST_STALL_AT", at.to_string())
             .env("FLUX_TEST_STALL_FILE", &announced)
+            // Pin the batch age to an hour: the stall indices count guard calls, which a real-clock age flush
+            // would shift (cut 9d).
+            .env("FLUX_TEST_BATCH_AGE_MS", "3600000")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -253,6 +256,8 @@ fn killed_strict(src: &Path, dst: &Path, at: u32, marks: &Path) -> String {
 /// DirEnd flush guard #267; the 36 renames #268..#303; the `claims.flush()` guard #304. So d0 is 304 guards and d1's
 /// create is #305; d1/f000..f063 staged #306..#433, the flush guard #434, f000's publish #435. The stall precedes the
 /// guarded mutation, so 435 is held with 64 temporaries written and 64 notes prepared, none renamed.
+/// These indices hold only when no AGE flush fires (a batch staged for over `BATCH_AGE` on the real clock would flush
+/// early and add guard calls), which is why `Stalled` pins `FLUX_TEST_BATCH_AGE_MS` to an hour.
 const AT_D1_F000_PUBLISH: u32 = 435;
 /// d1's create under Strict (see above): d0 whole and its claims committed, d1 not begun.
 const AT_D1_CREATE: u32 = 305;

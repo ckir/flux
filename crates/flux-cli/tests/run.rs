@@ -78,6 +78,9 @@ impl Stalled {
             .arg(dst)
             .env("FLUX_TEST_STALL_AT", at.to_string())
             .env("FLUX_TEST_STALL_FILE", &announced)
+            // Pin the batch age to an hour: the stall indices count guard calls, which a real-clock age flush
+            // would shift (cut 9d).
+            .env("FLUX_TEST_BATCH_AGE_MS", "3600000")
             .envs(env.iter().copied())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -722,7 +725,9 @@ fn a_killed_single_file_copy_resumes_keeping_its_id_and_bumping_its_generation()
 /// (2; its batch is empty, so its DirEnd flush guards nothing). d1 and d2 are 304 each: the create (1), f000..f063
 /// staged (128), the batch's flush guard (1), 64 renames (64), f064..f099 staged (72), the DirEnd flush guard (1), 36
 /// renames (36), the `claims.flush()` guard (1). 2 + 304 + 304 = 610: stall at 610, d2's `claims.flush()` guard, every
-/// file published, every claim durable (each batch's `apply_recovery` commits them).
+/// file published, every claim durable (each batch's `apply_recovery` commits them). The count holds only when no AGE
+/// flush fires (a batch staged for over `BATCH_AGE` on the real clock would flush early and add guard calls), which is
+/// why `Stalled` pins `FLUX_TEST_BATCH_AGE_MS` to an hour.
 #[test]
 fn the_claim_count_equals_the_file_count_under_the_default_policy() {
     let d = TempDir::new().unwrap();

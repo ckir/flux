@@ -1408,7 +1408,8 @@ fn flush_batch<F: DestinationRoot>(
         // `write_note` fails; the others go on.
         Err(_) => {
             let mut noted = Vec::with_capacity(entries.len());
-            for (p, (key, record)) in entries.into_iter().zip(&notes) {
+            let mut rest = entries.into_iter().zip(&notes);
+            while let Some((p, (key, record))) = rest.next() {
                 let r = claims.borrow_mut().prepare(key, record);
                 match r {
                     Ok(()) => noted.push(p),
@@ -1421,7 +1422,14 @@ fn flush_batch<F: DestinationRoot>(
                             e.source,
                             cx.guard,
                         );
-                        finish_copy(p.path, Err(failed), out, on_report)?;
+                        // A stop (an error carrying `TargetLockBusy`) drops no entry: as at STOP-LOST, the noted keep
+                        // their notes and temporaries, the rest their temporaries, each reported (plan ruling 2).
+                        if let Err(stop) = finish_copy(p.path, Err(failed), out, on_report) {
+                            for q in noted.into_iter().chain(rest.map(|(q, _)| q)) {
+                                report_kept(q.path, &q.staged.temp, &stop.cause, out, on_report);
+                            }
+                            return Err(stop);
+                        }
                     }
                 }
             }
@@ -2774,7 +2782,7 @@ mod tests {
             beat: &no_heartbeat,
             claims: None,
             resume: false,
-            batch: BatchPolicy::DEFAULT,
+            batch: BatchPolicy { age: NO_AGE, ..BatchPolicy::DEFAULT },
         };
         let mut out = TreeOutcome::default();
         let (_root, r) = copy_tree_at(&cx, source.events, root, false, &mut out, &mut |_| {});
@@ -2849,7 +2857,7 @@ mod tests {
             beat: &beat,
             claims: None,
             resume: false,
-            batch: BatchPolicy::DEFAULT,
+            batch: BatchPolicy { age: NO_AGE, ..BatchPolicy::DEFAULT },
         };
         let mut out = TreeOutcome::default();
         let mut reported = 0;
@@ -2887,7 +2895,7 @@ mod tests {
             beat: &beat,
             claims: None,
             resume: false,
-            batch: BatchPolicy::DEFAULT,
+            batch: BatchPolicy { age: NO_AGE, ..BatchPolicy::DEFAULT },
         };
         let mut out = TreeOutcome::default();
         let mut reported = 0;
@@ -2915,7 +2923,7 @@ mod tests {
             beat: &no_heartbeat,
             claims: None,
             resume: false,
-            batch: BatchPolicy::DEFAULT,
+            batch: BatchPolicy { age: NO_AGE, ..BatchPolicy::DEFAULT },
         };
         let mut out = TreeOutcome::default();
         let (back, r) = copy_tree_at(&cx, source.events, root, false, &mut out, &mut |_| {});
@@ -2947,8 +2955,12 @@ mod tests {
     // Cut 9d: the per-directory batch. Every test here passes its own policy (small thresholds, or `files == 1` for the
     // unbatched path) rather than the default (64 files).
 
+    /// An age no test run reaches: a unit test that counts calls must not let the real clock (the default's `now`)
+    /// fire an age flush on a slow machine. Only `the_age_trigger_uses_the_injected_clock` tests the age.
+    const NO_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
     fn policy(files: usize) -> BatchPolicy {
-        BatchPolicy { files, ..BatchPolicy::DEFAULT }
+        BatchPolicy { files, age: NO_AGE, ..BatchPolicy::DEFAULT }
     }
 
     /// `/` and `/src` holding `entries` (paths relative to `/src`, parent directories made as needed). `/dst` absent.
@@ -3153,7 +3165,7 @@ mod tests {
     #[test]
     fn bytes_trigger() {
         let fs = sources(&[("a", b"aaaaaa"), ("b", b"bbbbbb"), ("c", b"cccccc")]);
-        let p = BatchPolicy { files: 64, bytes: 10, ..BatchPolicy::DEFAULT };
+        let p = BatchPolicy { files: 64, bytes: 10, age: NO_AGE, ..BatchPolicy::DEFAULT };
         let (r, out, _) = batched(&fs, p, Durability::Strict);
         r.unwrap();
         let c = log(&fs);
@@ -3165,7 +3177,7 @@ mod tests {
     #[test]
     fn a_large_file_flushes_the_pending_small_ones_first_and_is_staged_alone() {
         let fs = sources(&[("a", b"aa"), ("b", &[b'b'; 20]), ("c", b"cc")]);
-        let p = BatchPolicy { files: 64, bytes: 10, ..BatchPolicy::DEFAULT };
+        let p = BatchPolicy { files: 64, bytes: 10, age: NO_AGE, ..BatchPolicy::DEFAULT };
         let (r, out, _) = batched(&fs, p, Durability::Strict);
         r.unwrap();
         let c = log(&fs);
@@ -3463,6 +3475,36 @@ mod tests {
             assert!(published(&fs, f) && claimed(&fs, f), "{f}");
         }
         assert_eq!(out.files_copied, 2);
+    }
+
+    /// Final-review hardening: a STOP from the per-entry `prepare` fallback (an error carrying `TargetLockBusy`, which
+    /// `finish_copy` returns as a stop) drops no entry: the already-noted keep their notes and temporaries, the not yet
+    /// noted keep their temporaries, and each is reported with its temporary as the leftover.
+    #[test]
+    fn a_stop_in_the_per_entry_prepare_fallback_reports_every_other_entry() {
+        let fs = n_files(3);
+        fs.fail_always("claim_prepare_many", Code::IoError);
+        fs.fail_nth("claim_prepare", 2, Code::TargetLockBusy, ErrorKind::Other);
+        let (r, out, got) = batched(&fs, policy(4), Durability::Strict);
+        let stop = r.unwrap_err();
+        assert_eq!(stop.code(), Code::TargetLockBusy, "{stop:?}");
+        assert_eq!(stop.step, CopyStep::Claim, "{stop:?}");
+        let paths: Vec<&Path> = got.iter().map(|f| f.path.as_path()).collect();
+        assert_eq!(paths, [Path::new("f0"), Path::new("f2")], "{got:?}");
+        for (f, name) in got.iter().zip(["f0", "f2"]) {
+            let TreeFailureCause::Copy(e) = &f.cause else { panic!("{got:?}") };
+            assert_eq!(e.code(), Code::TargetLockBusy, "{e:?}");
+            let (leftover, _) = e.leftover.as_ref().expect("the temporary is reported");
+            assert_eq!(leftover, &PathBuf::from(format!("{name}.flux-partial.op1")));
+            assert!(fs.exists(format!("/dst/{name}.flux-partial.op1")), "{name}: kept");
+            assert!(!fs.exists(format!("/dst/{name}")), "{name}: not published");
+        }
+        assert!(
+            !fs.exists("/dst/f1.flux-partial.op1"),
+            "the failed entry's temporary is discarded"
+        );
+        assert_eq!(fs.prepared_count(), 1, "f0's note stays for recovery");
+        assert_eq!(out.files_copied, 0);
     }
 
     #[test]

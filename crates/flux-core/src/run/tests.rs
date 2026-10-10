@@ -2292,7 +2292,11 @@ fn a_target_that_finds_its_own_claim_proceeds() {
         beat: &no_heartbeat,
         claims: Some(&claims),
         resume: false,
-        batch: crate::tree::BatchPolicy::DEFAULT,
+        // An hour: the real clock must not fire an age flush in a test that counts calls.
+        batch: crate::tree::BatchPolicy {
+            age: std::time::Duration::from_secs(3600),
+            ..crate::tree::BatchPolicy::DEFAULT
+        },
     };
     let mut out = TreeOutcome::default();
     let mut got = Vec::new();

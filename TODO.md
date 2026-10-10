@@ -520,8 +520,9 @@ the spec's numbers, 9-10 were learned during execution).
 2. A crash loses up to `BATCH_FILES` files' staging work (they are recopied at `--resume`) and up to that many claims reach recovery as notes.
 3. The rename is still not directory-synced (cut 9c limit 1 stands).
 4. The data `fsync` per file is not batched; it is the floor of about 1 sync per file.
-5. The age bound is checked at the next staging, not by a timer: a long file being copied delays the publication of the files staged before it,
-   unless it is at least `BATCH_BYTES` long.
+5. The age bound is not a timer: it is checked only at the NEXT STAGING in that directory or at its `DirEnd`. A long file being copied delays the
+   publication of the files staged before it, unless it is at least `BATCH_BYTES` long. Because the walk is depth-first, a parent's pending files
+   wait for the parent's next staging or `DirEnd`, i.e. until the whole subtree below has been walked, so their wait has no time bound.
 6. A Replace target (an existing destination file, `Plan::Replace`) still pays one synced commit for its `Existing` claim in `before_create`, because
    `insert_if_absent` is Immediate under Strict (`crates/flux-platform/src/claims.rs`, `next_commit`): a replaced file costs 4 syncs today (data,
    `Existing` claim, note, claim) and about 2 after this cut (data, `Existing` claim). Folding the `Existing` claim into `prepare_many` is the later
@@ -536,12 +537,17 @@ the spec's numbers, 9-10 were learned during execution).
 - [ ] Fold the Replace target's `Existing` claim into `prepare_many` (limit 6 fix); the exclusivity the claim gives must come from the in-frame pending
   names.
 - [ ] The source recheck now happens at staging, not immediately before the rename: a source changed after the recheck is published as the snapshot
-  read, up to 64 files / 1 s wide (an unbatched copy already allows the gap between recheck and rename).
+  read, up to 64 files wide (an unbatched copy already allows the gap between recheck and rename). The 1 s age is no bound on that gap: it is checked
+  only at the next staging in that directory or its `DirEnd`, and a parent's pending files wait until the whole subtree below has been walked
+  (limit 5), so their gap has no time bound.
+- [ ] On slow storage (a real fsync per file) the 1 s age trigger keeps real batches below 64 files: measure the achieved batch sizes in the Task 8
+  measurement.
 - [ ] Hardening: a lost lock noticed only inside a cleanup `discard` (heartbeat-stop cleanup, per-entry `prepare` fallback) does not stop the flush,
   so store writes can still happen before the next guard (recovery handles every resulting state; spec decision 8's "writes nothing" holds for the
-  guard-detected loss). The `finish_copy(..)?` in the `prepare_many` fallback would drop the remaining entries if a store error ever carried
-  `TargetLockBusy` (unreachable today).
-- [ ] Tests not written: a lost lock inside `copy_one` with pending entries in two frames; the `discard_prepared` fallback after a failed rename when
+  guard-detected loss). (The `prepare_many` fallback's stop, a store error carrying `TargetLockBusy`, no longer drops the remaining entries: each is
+  reported with its temporary kept, `a_stop_in_the_per_entry_prepare_fallback_reports_every_other_entry`.)
+- [ ] Tests not written: a lost lock inside `copy_one` with pending entries in two frames (the `DirEnd` form, a lost lock at a child's `DirEnd`
+  flush, is covered by `an_abort_drains_every_frame`; the `copy_one` form is not); the `discard_prepared` fallback after a failed rename when
   `apply_recovery` also fails; the É/é non-ASCII fold on a real folding filesystem (the fake folds ASCII only; reasoned, not measured).
 
 ## Scaffolding follow-ups
