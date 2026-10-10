@@ -540,8 +540,10 @@ the spec's numbers, 9-10 were learned during execution).
   read, up to 64 files wide (an unbatched copy already allows the gap between recheck and rename). The 1 s age is no bound on that gap: it is checked
   only at the next staging in that directory or its `DirEnd`, and a parent's pending files wait until the whole subtree below has been walked
   (limit 5), so their gap has no time bound.
-- [ ] On slow storage (a real fsync per file) the 1 s age trigger keeps real batches below 64 files: measure the achieved batch sizes in the Task 8
-  measurement.
+- [ ] Strict small files are 34-35% faster, not the 40% the spec gated on (measured 2026-10-10: 3.0 -> 1.04 syncs per file, so batches are
+  near full and the age trigger is not the limit). The remaining time is the one data `fsync` per file (about 70% of syscall time under
+  `perf trace`, about 6 ms each): batching removed the cheaper claim `fdatasync` calls. Going further needs a batched or overlapped data sync
+  (`syncfs` per batch, parallel fsync), which changes what "durable before publish" means: its own design and cut.
 - [ ] Hardening: a lost lock noticed only inside a cleanup `discard` (heartbeat-stop cleanup, per-entry `prepare` fallback) does not stop the flush,
   so store writes can still happen before the next guard (recovery handles every resulting state; spec decision 8's "writes nothing" holds for the
   guard-detected loss). (The `prepare_many` fallback's stop, a store error carrying `TargetLockBusy`, no longer drops the remaining entries: each is
