@@ -120,7 +120,7 @@ Add `stage_with(fs, root, opts, sync) -> Staged<FakeHandle>` beside `stage_hello
 
 **Interfaces:**
 - Produces: `pub(crate) struct SyncOutcome { pub results: Vec<Result<(), FsError>>, pub heartbeat: Option<FsError> }`; `pub(crate) fn sync_staged_many<W: FileHandle + Sync>(writers: &[&W], threads: usize, beat: &Heartbeat<'_>, beat_every: Duration) -> SyncOutcome`.
-- Fake: `FaultFs::delay(&self, name: &str, d: Duration)` (only `"sync_all"` is honoured; others are stored and ignored); the call-log string `drop_writer(<path>)`.
+- Fake: `FaultFs::delay(&self, name: &str, d: Duration)` (only `"sync_all"` is honoured; others are stored and ignored); the call-log string `drop_writer(<path>)`; `FaultFs::peak_concurrent_syncs(&self) -> usize` (the most `sync_all` calls in flight at once, counted under the fake's lock at entry and exit of `FakeHandle::sync_all`, the sleep between them).
 
 - [ ] **Step 0: State verification.** `FakeHandle::sync_all` records `sync_all(<path>)` and consults `sync_fault` only (`fault_fs.rs:661-672`); there is no `impl Drop for FakeHandle` (`rg "impl Drop" crates/flux-core/src/fault_fs.rs` lists `FakeClaimStore` and `FakeLock` only). Otherwise STOP with `STATE_MISMATCH`.
 
@@ -178,6 +178,18 @@ fn the_heartbeat_is_called_from_the_main_thread_once_the_interval_has_passed_in_
 }
 
 #[test]
+fn sixteen_threads_sync_concurrently() {
+    // Mutant: ignore `threads` (one worker) -> the peak is 1. Eight 20 ms syncs on eight workers overlap on any machine
+    // that can start two threads within 20 ms; the assertion is `>= 2`, not 8, so a loaded runner cannot flake it.
+    let fs = FaultFs::new();
+    fs.delay("sync_all", Duration::from_millis(20));
+    let ws = handles(&fs, 8);
+    let refs: Vec<&FakeHandle> = ws.iter().collect();
+    sync_staged_many(&refs, 16, &no_heartbeat, Duration::from_secs(5));
+    assert!(fs.peak_concurrent_syncs() >= 2, "{}", fs.peak_concurrent_syncs());
+}
+
+#[test]
 fn a_failed_heartbeat_ends_the_wait_after_the_join_and_is_reported_once() {
     let fs = FaultFs::new();
     fs.delay("sync_all", Duration::from_millis(20));
@@ -215,7 +227,7 @@ fn sync_all_from_several_threads_records_every_call() {
 }
 ```
 
-- [ ] **Step 2: Run them to see them fail.** `cargo nextest run -p flux-core barrier_ one_thread a_faulted_writer the_heartbeat_is a_failed_heartbeat_ends a_dropped_writer sync_all_from` - expected: compile errors (`sync_staged_many`, `delay` undefined).
+- [ ] **Step 2: Run them to see them fail.** `cargo nextest run -p flux-core barrier_ one_thread a_faulted_writer the_heartbeat_is a_failed_heartbeat_ends sixteen_threads a_dropped_writer sync_all_from` - expected: compile errors (`sync_staged_many`, `delay`, `peak_concurrent_syncs` undefined).
 
 - [ ] **Step 3: Implement `sync_staged_many`.** The algorithm is fixed by the spec, so it is given:
   - `workers = threads.clamp(1, writers.len().max(1))`; if `writers` is empty return at once.
@@ -223,7 +235,7 @@ fn sync_all_from_several_threads_records_every_call() {
   - The main thread: `let start = Instant::now(); let mut deadline = start + beat_every; let mut slots: Vec<Option<Result<..>>> = vec![None; n]` (use a `Vec<Option<_>>` built with `resize_with`; `FsError` is not `Clone`); loop while `received < n`: `match rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))` - `Ok((i, r))` stores it; `Err(Timeout)` => if `heartbeat.is_none() { if let Err(e) = beat() { heartbeat = Some(e) } }` then `deadline += beat_every` (an absolute step, never "now + interval"); `Err(Disconnected)` => break.
   - After the scope: `results = slots.into_iter().map(|s| s.expect("every index is sent exactly once")).collect()`. A worker panic propagates out of the scope (spec known limit 1); no catch.
   - `Heartbeat` is `dyn Fn` without `Send`, so `beat` must be used only in the main thread's loop, never captured by a spawned closure.
-- [ ] **Step 4: Implement the fake additions.** `Inner.delays: HashMap<String, Duration>` and `pub fn delay(&self, name: &str, d: Duration)`; in `FakeHandle::sync_all`, read the delay under the lock, release the lock, then `std::thread::sleep`, then record and fault as today (the record must stay under its own short lock, so concurrent syncs interleave in the log without a race). `impl Drop for FakeHandle`: if `self.sink` is `Some`, push `format!("drop_writer({})", self.path.display())` to `calls`. Check that no existing test asserts an exact full call log that a trailing `drop_writer(` would now break (`rg "assert_eq!\(.*calls\(\)" crates/flux-core/src` and read each hit); if one does, extend its expected list rather than filtering the log.
+- [ ] **Step 4: Implement the fake additions.** `Inner.delays: HashMap<String, Duration>` and `pub fn delay(&self, name: &str, d: Duration)`; in `FakeHandle::sync_all`, read the delay under the lock, release the lock, then `std::thread::sleep`, then record and fault as today (the record must stay under its own short lock, so concurrent syncs interleave in the log without a race). `Inner.syncs_in_flight` and `Inner.syncs_peak` (both `usize`), incremented and decremented in `sync_all` around the sleep, read by `peak_concurrent_syncs`. `impl Drop for FakeHandle`: if `self.sink` is `Some`, push `format!("drop_writer({})", self.path.display())` to `calls`. Check that no existing test asserts an exact full call log that a trailing `drop_writer(` would now break (`rg "assert_eq!\(.*calls\(\)" crates/flux-core/src` and read each hit); if one does, extend its expected list rather than filtering the log.
 
 - [ ] **Step 5: Gate.** `just check` - green.
 
@@ -381,6 +393,7 @@ fn one_and_sixteen_threads_give_the_same_outcome() {
     let b = { let fs = n_files(70); let (r, out, got) = batched(&fs, BatchPolicy { sync_threads: 16, ..policy(64) }, Durability::Strict); r.unwrap(); (out.files_copied, out.bytes_copied, got.len(), fs.claim_count(), fs.prepared_count()) };
     assert_eq!(a, b);
     assert_eq!(a.0, 70);
+    // This test cannot tell 16 threads from 1 (a one-worker mutant passes it); Task 2's `sixteen_threads_sync_concurrently` does.
 }
 
 #[test]
@@ -406,11 +419,11 @@ fn the_default_policy_syncs_from_sixteen_threads_at_the_heartbeat_interval() {
   - `run/mod.rs`: `batch_policy(cfg: &RunConfig)` sets `beat_every: cfg.heartbeat_interval` (debug age override unchanged); the call at `:287` passes `cfg`.
   - The `stage()` closure (`tree.rs:1315`) passes `SyncAt::Barrier` when `cx.opts.durability == Durability::Strict`, else `SyncAt::Staging` (a Normal batch never reaches here; the branch is for completeness and costs nothing).
   - `flush_batch`, after the `claims` `let-else` and BEFORE the 4.1 pair:
-    1. `let writers: Vec<&W> = entries.iter().filter_map(|p| p.staged.writer.as_ref()).collect()` with their entry indices (an entry staged `Staging` has none; today none does, but the code must not assume it); `let started = Instant::now(); let synced = sync_staged_many(&writers, cx.batch.sync_threads, cx.beat, cx.batch.beat_every); out.barrier_max = out.barrier_max.max(started.elapsed());`
+    1. Two parallel vectors built in one pass over `entries.iter().enumerate()`: `writers: Vec<&W>` (each `p.staged.writer.as_ref()` that is `Some`) and `indices: Vec<usize>` (that entry's position), so `synced.results[j]` belongs to `entries[indices[j]]`; an entry without a writer (staged `Staging`; none today, but the code must not assume it) counts as synced; `let started = Instant::now(); let synced = sync_staged_many(&writers, cx.batch.sync_threads, cx.beat, cx.batch.beat_every); out.barrier_max = out.barrier_max.max(started.elapsed());`
     2. Close: `for p in &mut entries { p.staged.writer = None; }` (dropping records `drop_writer(` in the fake).
     3. Map results onto entries: `failed: Vec<bool>` per entry (an entry without a writer counts as synced).
     4. If `synced.heartbeat` is `Some(e)`: run the heartbeat-failure block (`:1368-1379`) with that `e` and return; do not call `cx.beat` again (ruling 4). Refactor that block into a helper `fn stop_held_before_notes(..)` shared by this call site and the pair's, extended per ruling 9: a failed-sync entry's temporary is removed like the others, but it is reported through `on_report` as `StrictDurabilityUnavailable` at `CopyStep::Durability` (a leftover only if its removal failed) instead of the heartbeat leftover report.
-    5. The 4.1 pair as today. In its lost-lock branch, every entry (failed-sync ones included) is kept; a failed-sync entry is reported ONCE through `on_report`, as `TreeFailureCause::Copy` of a `CopyError` at `CopyStep::Durability` with `Code::StrictDurabilityUnavailable` and its temporary as `leftover` (relative to DEST, as `report_kept` builds it), in place of the `TargetLockBusy` report; if entry 0 is such an entry, the returned error is `CopyError::at(CopyStep::Publish, lost)` with no leftover (ruling 9).
+    5. The 4.1 pair as today. In its lost-lock branch, every entry (failed-sync ones included) is kept; a failed-sync entry is reported ONCE through `on_report`, as `TreeFailureCause::Copy` of a `CopyError` at `CopyStep::Durability` with `Code::StrictDurabilityUnavailable` and its temporary as `leftover` (relative to DEST, as `report_kept` builds it), in place of the `TargetLockBusy` report; if entry 0 is such an entry, the returned error is `CopyError::at(CopyStep::Publish, lost)` with no leftover (ruling 9). Concretely the branch becomes: `for (i, p) in entries.iter().enumerate().skip(1) { if failed[i] { report the sync failure with its temporary as leftover } else { report_kept(..) } }`, then the return built from entry 0 by the same test.
     6. After the pair passes: partition `entries` into `(failed, ok)`; for each failed one, `discard(parent, &temp, CopyStep::Durability, Code::StrictDurabilityUnavailable, source, cx.guard)` where `source` is the sync's error, then `finish_copy(path, Err(that), out, on_report)?` (it reports and returns `Ok` for this code; a `TargetLockBusy` noticed inside the discard propagates as a stop, the 9d hardening debt). Then the unchanged 9d sequence from `// 4.2` on `ok`. An empty `ok` returns `Ok(())` after the discards (no `prepare_many(0)`).
   - The heartbeat-failure block removes every temporary including the failed-sync ones (they are all in `entries`).
 
@@ -429,13 +442,13 @@ fn the_default_policy_syncs_from_sixteen_threads_at_the_heartbeat_interval() {
 - Modify: `crates/flux-core/src/run/mod.rs:50-67` (`RunConfig.descriptor_limit: Option<u64>`), `batch_policy`
 - Modify: `crates/flux-platform/src/lib.rs` (`pub fn soft_descriptor_limit() -> Option<u64>`), `crates/flux-platform/Cargo.toml:18-19` (`rustix = { workspace = true, features = ["process"] }` on the unix dependency)
 - Modify: `crates/flux-cli/src/main.rs:154-165` (`run_config` sets `descriptor_limit: flux_platform::soft_descriptor_limit()`; the literal at `:305-315` is a `CleanupConfig` and is untouched)
-- Modify: every other `RunConfig` literal, which sets `descriptor_limit: None`: `crates/flux-core/src/run/tests.rs:27` and `:40`, `crates/flux-core/tests/safety_std_fs.rs:125`, `crates/flux-core/tests/replace_std_fs.rs:25` and `:114`
+- Modify: every other FULL `RunConfig` literal (one without a `..base` struct update) sets `descriptor_limit: None`: `crates/flux-core/tests/safety_std_fs.rs:125`, `crates/flux-core/tests/replace_std_fs.rs:25` and `:114`, and those of the 20 literals in `crates/flux-core/src/run/tests.rs` (`:27`, `:40` and the rest) that do not end in `..cfg()` or `..restart()` (12 of the 20 do and need nothing). `rg -n "RunConfig \{" crates` prints 29 lines: the struct (`run/mod.rs:50`), its `Debug` impl (`:72`) and 27 literals.
 - Test: `tree.rs` test module; `flux-platform` unit test
 
 **Interfaces:**
 - Produces: `pub(crate) const OPEN_WRITERS_MAX: usize = 256;` `pub(crate) fn open_writers_cap(soft_limit: Option<u64>) -> usize` = `min(256, limit / 4).max(1)`, `256` for `None`; `BatchPolicy.open_writers: usize` (`DEFAULT = OPEN_WRITERS_MAX`); `RunConfig.descriptor_limit: Option<u64>`; `flux_platform::soft_descriptor_limit()` = `rustix::process::getrlimit(Resource::Nofile).current` on unix, `None` on Windows.
 
-- [ ] **Step 0: State verification.** `walk_into`'s `File` arm borrows `stack.last_mut()` before `copy_one` (`tree.rs:593-610`); `RunConfig` has eight fields ending in `resume` (`run/mod.rs:50-67`); `flux-platform`'s unix `rustix` dependency has no `features` key (`Cargo.toml:18-19`); `rg -n "RunConfig \{" crates` lists exactly the six literals named under Files. Otherwise STOP with `STATE_MISMATCH`.
+- [ ] **Step 0: State verification.** `walk_into`'s `File` arm borrows `stack.last_mut()` before `copy_one` (`tree.rs:593-610`); `RunConfig` has eight fields ending in `resume` (`run/mod.rs:50-67`); `flux-platform`'s unix `rustix` dependency has no `features` key (`Cargo.toml:18-19`); `rg -n "RunConfig \{" crates` prints 29 lines as described under Files; this box's `ulimit -Sn` is 524288 (so the cap is 256 here). Otherwise STOP with `STATE_MISMATCH`.
 
 - [ ] **Step 1: Write the failing tests.**
 
@@ -483,7 +496,8 @@ In `flux-platform` (unix-only test): `soft_descriptor_limit()` is `Some(n)` with
   - `tree.rs`: the constant, the field, `open_writers_cap`. In `walk_into`'s `File` arm, before the `stack.last_mut()` borrow: `while pending_total(stack) >= cx.batch.open_writers { flush the first (index-lowest) live frame whose batch is non-empty via flush_batch(cx, dir, names, batch, out, on_report)?; out.cap_flushes += 1; }` where `pending_total` sums `batch.pending.len()` over `Frame::Live` frames. The loop ends because each iteration empties one batch; if no frame has a pending entry the condition is false (`0 >= cap` only when cap is 0, which `open_writers_cap` never returns; `debug_assert!(cx.batch.open_writers >= 1)`).
   - `run/mod.rs`: `RunConfig.descriptor_limit`; `batch_policy(cfg)` sets `open_writers: crate::tree::open_writers_cap(cfg.descriptor_limit)`.
   - `flux-platform`: the `process` feature on the unix `rustix` dependency; `soft_descriptor_limit()` with `#[cfg(unix)]` and `#[cfg(windows)]` bodies.
-  - `flux-cli`: `run_config` sets `descriptor_limit: flux_platform::soft_descriptor_limit()`; the five test literals set `descriptor_limit: None`.
+  - `flux-cli`: `run_config` sets `descriptor_limit: flux_platform::soft_descriptor_limit()`; every full test literal sets `descriptor_limit: None` (the compiler lists them).
+  - **Debug-only override, so the stall oracles never depend on the host's descriptor limit:** in a debug build `batch_policy` reads `FLUX_TEST_OPEN_WRITERS=<n>` and uses it as `open_writers` (absent or unparsable: the computed cap), exactly as `FLUX_TEST_BATCH_AGE_MS` is read (`run/mod.rs:495-503`); a release build has no override. The `Stalled` helpers pin `FLUX_TEST_OPEN_WRITERS=256` beside `FLUX_TEST_BATCH_AGE_MS` (`crates/flux-cli/tests/recovery.rs:60`, `run.rs:83`), and the comment at `recovery.rs:259-260` names both pins. Why: macOS's default soft limit is 256 (a cap of 64, which the stall tree's single live directory never reaches, but a smaller limit on a constrained runner would force early flushes and move every index); Task 5's counters test sets the same pin.
 
 - [ ] **Step 4: Gate.** `just check` - green; `cargo deny check` is part of CI (`Cargo deny` job) and must stay green with the feature change (no new crate).
 
