@@ -39,18 +39,31 @@ pub(crate) struct Pulse {
     interval: Duration,
     last: Cell<Instant>,
     failed: Cell<bool>,
+    /// Cut 9e: the longest gap between two successful record writes (the creation write counts as the first), for the
+    /// acceptance measurement of known limit 6.
+    gap_max: Cell<Duration>,
 }
 
 impl Pulse {
     /// Made as the record is written: the interval counts from then.
     pub(crate) fn new(interval: Duration) -> Self {
-        Pulse { interval, last: Cell::new(Instant::now()), failed: Cell::new(false) }
+        Pulse {
+            interval,
+            last: Cell::new(Instant::now()),
+            failed: Cell::new(false),
+            gap_max: Cell::new(Duration::ZERO),
+        }
     }
 
     /// A heartbeat has failed: the run makes no further attempt, and the finish handles a record it can no longer read
     /// as its own (`fail`).
     pub(crate) fn failed(&self) -> bool {
         self.failed.get()
+    }
+
+    /// Cut 9e: the longest gap between two successful writes so far; a failed write records nothing.
+    pub(crate) fn gap_max(&self) -> Duration {
+        self.gap_max.get()
     }
 
     /// Refresh `held`'s record once the interval has passed since the last write; a failed write is retried once, at
@@ -64,6 +77,7 @@ impl Pulse {
         let now = wall_time_ns();
         match held.heartbeat(now).or_else(|_| held.heartbeat(now)) {
             Ok(()) => {
+                self.gap_max.set(self.gap_max.get().max(self.last.get().elapsed()));
                 self.last.set(Instant::now());
                 Ok(())
             }

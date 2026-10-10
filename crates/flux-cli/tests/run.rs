@@ -767,3 +767,42 @@ fn the_claim_count_equals_the_file_count_under_the_default_policy() {
     same_bytes(&src, &dst);
     assert!(!dst.join(".flux").exists());
 }
+
+/// Cut 9e: a tree run's counters file (debug builds): one JSON object with exactly the three acceptance counters.
+/// Strict reaches the data-sync barrier; Normal never does.
+#[test]
+fn counters_file_reports_the_barrier_cap_and_heartbeat_gap() {
+    let d = TempDir::new().unwrap();
+    let src = d.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    for i in 0..10 {
+        std::fs::write(src.join(format!("f{i}")), format!("file {i}")).unwrap();
+    }
+    let run = |durability: &str, dst: &Path, counters: &Path| {
+        let out = flux()
+            .arg("copy")
+            .args(["--durability", durability])
+            .arg(&src)
+            .arg(dst)
+            .env("FLUX_TEST_COUNTERS_FILE", counters)
+            .env("FLUX_TEST_BATCH_AGE_MS", "3600000")
+            .env("FLUX_TEST_OPEN_WRITERS", "256")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        let text = std::fs::read_to_string(counters).expect("the counters file was written");
+        assert_eq!(text.lines().count(), 1, "{text:?}");
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let o = v.as_object().expect("a JSON object");
+        let mut keys: Vec<&str> = o.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["barrier_max_ms", "beat_gap_max_ms", "cap_flushes"]);
+        assert!(o.values().all(|x| x.is_u64()), "{text}");
+        v
+    };
+    let strict = run("strict", &d.path().join("dst-strict"), &d.path().join("strict.json"));
+    assert_eq!(strict["cap_flushes"], 0);
+    assert!(strict["barrier_max_ms"].as_u64().unwrap() <= 60_000, "{strict}");
+    let normal = run("normal", &d.path().join("dst-normal"), &d.path().join("normal.json"));
+    assert_eq!(normal["barrier_max_ms"], 0);
+}

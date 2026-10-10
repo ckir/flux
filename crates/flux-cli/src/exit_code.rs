@@ -206,7 +206,13 @@ mod tests {
 
     #[test]
     fn a_tree_runs_own_stop_decides_before_its_copy() {
-        let run = |copy, stop| Run { copy, stop, warnings: Vec::new(), resumed: None };
+        let run = |copy, stop| Run {
+            copy,
+            stop,
+            warnings: Vec::new(),
+            resumed: None,
+            beat_gap_max: std::time::Duration::ZERO,
+        };
         assert_eq!(for_tree_run(&run(None, Some(refused(false)))), REFUSED);
         assert_eq!(for_tree_run(&run(None, Some(refused(true)))), FAILED);
         assert_eq!(for_tree_run(&run(None, Some(failed()))), FAILED);
@@ -218,7 +224,13 @@ mod tests {
 
     #[test]
     fn a_file_runs_own_stop_decides_before_its_copy() {
-        let run = |copy, stop| Run { copy, stop, warnings: Vec::new(), resumed: None };
+        let run = |copy, stop| Run {
+            copy,
+            stop,
+            warnings: Vec::new(),
+            resumed: None,
+            beat_gap_max: std::time::Duration::ZERO,
+        };
         let copied = || {
             Ok(Outcome {
                 bytes_copied: 1,

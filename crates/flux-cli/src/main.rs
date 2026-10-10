@@ -204,6 +204,28 @@ fn heartbeat_interval() -> std::time::Duration {
     flux_core::run::HEARTBEAT_INTERVAL
 }
 
+/// Cut 9e, known limit 6 (debug builds only): with `FLUX_TEST_COUNTERS_FILE=<path>`, a tree run writes `<path>` as one
+/// line of JSON, `{"barrier_max_ms":<u64>,"cap_flushes":<u64>,"beat_gap_max_ms":<u64>}`: the longest data-sync barrier,
+/// the flushes the open-writer cap forced, and the longest gap between two heartbeat writes. The acceptance measurement
+/// reads it; nothing goes to stderr or `--json`. Every error is ignored: a test aid never fails a copy. A release build
+/// ignores the variable.
+#[cfg(debug_assertions)]
+fn counters_file(outcome: &flux_core::tree::TreeOutcome, run_beat_gap_max: std::time::Duration) {
+    let Some(path) = std::env::var_os("FLUX_TEST_COUNTERS_FILE") else {
+        return;
+    };
+    let ms = |d: std::time::Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    let counters = serde_json::json!({
+        "barrier_max_ms": ms(outcome.barrier_max),
+        "cap_flushes": outcome.cap_flushes,
+        "beat_gap_max_ms": ms(run_beat_gap_max),
+    });
+    let _ = std::fs::write(path, format!("{counters}\n"));
+}
+
+#[cfg(not(debug_assertions))]
+fn counters_file(_outcome: &flux_core::tree::TreeOutcome, _run_beat_gap_max: std::time::Duration) {}
+
 fn copy(args: &CopyArgs) -> u8 {
     let job = match resolve::job(&args.source, &args.destination) {
         Ok(job) => job,
@@ -257,6 +279,15 @@ fn copy(args: &CopyArgs) -> u8 {
                     err(&report::summary_line(&rep, outcome.directories_created));
                 }
                 None => lines(report::run_lines(&run)),
+            }
+            if let Some(result) = &run.copy {
+                counters_file(
+                    match result {
+                        Ok(out) => out,
+                        Err(a) => &a.outcome,
+                    },
+                    run.beat_gap_max,
+                );
             }
             json(args, &rep);
             exit_code::for_tree_run(&run)

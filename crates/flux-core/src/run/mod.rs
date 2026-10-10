@@ -99,6 +99,9 @@ pub struct Run<T> {
     /// Cut 9a: set once the run adopted or started under `--resume`; `None` without the flag or when the run stopped
     /// before step 5.
     pub resumed: Option<ResumeNote>,
+    /// Cut 9e: the longest gap between two heartbeat writes of the lock record (known limit 6); `Duration::ZERO` when
+    /// the run never held the lock.
+    pub beat_gap_max: std::time::Duration,
 }
 
 /// What `--resume` did (cut 9a).
@@ -194,7 +197,13 @@ pub fn tree<F: DestinationRoot>(
     cfg: &RunConfig,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> Run<Result<TreeOutcome, TreeAbort>> {
-    let mut run = Run { copy: None, stop: None, warnings: Vec::new(), resumed: None };
+    let mut run = Run {
+        copy: None,
+        stop: None,
+        warnings: Vec::new(),
+        resumed: None,
+        beat_gap_max: std::time::Duration::ZERO,
+    };
     let opts =
         CopyOptions { operation_id: OperationId::new(cfg.operation_id.as_str()), ..opts.clone() };
     let mut out = TreeOutcome::default();
@@ -265,6 +274,7 @@ pub fn tree<F: DestinationRoot>(
         }
     };
     run.resumed = locked.resumed.clone();
+    run.beat_gap_max = locked.pulse.gap_max();
     // Cut 9a: under `--resume` the effective id is the prior's; the partials are named by it.
     let opts = CopyOptions { operation_id: OperationId::new(&locked.state.operation_id), ..opts };
     // Step 6: the copy, with §99 before every destination mutation.
@@ -349,6 +359,8 @@ pub fn tree<F: DestinationRoot>(
         }
     }
     drop(claims);
+    // Cut 9e: the barrier's beats happen during the walk, so the value taken at the lock is stale by now.
+    run.beat_gap_max = locked.pulse.gap_max();
     run.stop = finish(&mut place, locked, ended, &mut run.warnings);
     // E1: a DEST this run made counts among the directories it created, unless a rollback removed it again.
     if place.created_dest {
@@ -369,7 +381,13 @@ pub fn file<F: DestinationRoot>(
     opts: &CopyOptions,
     cfg: &RunConfig,
 ) -> Run<Result<Outcome, CopyError>> {
-    let mut run = Run { copy: None, stop: None, warnings: Vec::new(), resumed: None };
+    let mut run = Run {
+        copy: None,
+        stop: None,
+        warnings: Vec::new(),
+        resumed: None,
+        beat_gap_max: std::time::Duration::ZERO,
+    };
     let opts =
         CopyOptions { operation_id: OperationId::new(cfg.operation_id.as_str()), ..opts.clone() };
     // B1.
