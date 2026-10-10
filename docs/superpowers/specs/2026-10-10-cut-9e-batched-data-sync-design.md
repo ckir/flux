@@ -1,6 +1,6 @@
 # Cut 9e: a batched, parallel data-sync barrier for Strict tree publications
 
-Status: DRAFT for the owner's written-spec review. Design approved in chat 2026-10-10; adversarial panel ran 6 rounds with agy, all findings folded, NOT GREEN (round 6 still found definition gaps; the owner chose to ship to review at the round cap, see Stand-downs). Stacked on cut 9d (PR #82; branch
+Status: APPROVED by the owner 2026-10-10 (design in chat, then the written spec after the panel). Adversarial panel: 6 rounds with agy, all findings folded, NOT GREEN (round 6 still found definition gaps; the owner chose to ship to review at the round cap, see Stand-downs). Stacked on cut 9d (PR #82; branch
 `spec/cut-9d`): 9e edits the 9d flush and must be planned against the merged 9d code. Scope was set by an AGY-FIRST consult and a two-round
 AGY-NEGOTIATE (briefs `.clavity/seams/cut9e-scope.md`, `cut9e-negotiate-r1.md`, `cut9e-negotiate-r2.md`; replies under `.clavity/scratch/`) and
 decided by the owner: **9e-1 = a portable thread-pool barrier for the per-file data syncs; 9e-2 = a conditional Linux `syncfs` fast path.**
