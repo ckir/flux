@@ -462,7 +462,8 @@ pub fn copy_file_at<F: DestinationRoot>(
     )
 }
 
-/// What `stage_file` produced: a closed temporary on disk, ready to be renamed to its name.
+/// What `stage_file` produced: a temporary on disk, ready to be renamed to its name. At `SyncAt::Staging` it is closed;
+/// at `SyncAt::Barrier` its writer is still open in `writer` and the flush closes it after the barrier.
 pub(crate) struct Staged<W> {
     pub temp: OsString,
     pub identity: FileIdentity,
@@ -470,7 +471,8 @@ pub(crate) struct Staged<W> {
     pub metadata_failures: Vec<MetadataFailure>,
     pub identity_degraded: Option<FileIdentity>,
     /// Cut 9e: the temporary's open writer, `Some` only for a file staged at `SyncAt::Barrier` (whose data sync the
-    /// caller owes, once per batch); `None` at `SyncAt::Staging`, which has already synced and closed it.
+    /// caller owes, once per batch, and closes after the barrier); `None` at `SyncAt::Staging`, which has already synced
+    /// the writer and dropped it on return.
     pub writer: Option<W>,
 }
 
@@ -490,8 +492,10 @@ pub(crate) enum Stage<W> {
 }
 
 /// Steps 1-7 of the copy, up to and including the source recheck and the read of the temporary's identity: everything
-/// before the final heartbeat, guard and publishing rename. The writer is dropped on return, so no descriptor is held;
-/// on every error path the temporary has already been discarded exactly as `copy_file_guarded` always did.
+/// before the final heartbeat, guard and publishing rename. At `SyncAt::Staging` the writer is dropped on return, so no
+/// descriptor is held; at `SyncAt::Barrier` it is NOT: the open writer rides in `Staged.writer` and the flush closes it
+/// after the barrier (the descriptor is held until then, which is what the open-writer cap bounds). On every error path
+/// the temporary has already been discarded exactly as `copy_file_guarded` always did.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn stage_file<F: DestinationRoot>(
     fs: &F,
@@ -742,7 +746,8 @@ pub fn copy_file_guarded<F: DestinationRoot>(
 
 /// The final heartbeat, guard and publishing rename for a `Staged` temporary, with the exact error handling the single
 /// copy always had: a heartbeat failure discards the temporary, a lost guard keeps it as the leftover, and a failed
-/// rename discards it.
+/// rename discards it. `staged.writer` is `None` on every live path (the flush closes it after the barrier, before this
+/// runs); a `Some` is dropped defensively, first.
 pub(crate) fn publish_staged<D: DirHandle>(
     parent: &D,
     name: &OsStr,
@@ -809,6 +814,9 @@ pub(crate) struct SyncOutcome {
 /// `beat` is `dyn Fn` without `Send`, so it is only ever called here, never from a worker. After one heartbeat failure
 /// no further `beat` is made, but the wait continues until every worker has finished and been joined: every writer
 /// still gets its result, and the failure is reported once in `heartbeat`. A worker panic propagates out of the scope.
+/// A worker the OS refuses to spawn (thread limits) is skipped, never a panic: the workers that did start share the
+/// index counter and so all the work; with none started, the syncs run on the calling thread in index order and `beat`
+/// is called between them whenever the deadline has passed (the same deadline rule and single-failure rule).
 pub(crate) fn sync_staged_many<W: FileHandle + Sync>(
     writers: &[&W],
     threads: usize,
@@ -826,10 +834,11 @@ pub(crate) fn sync_staged_many<W: FileHandle + Sync>(
     let mut heartbeat = None;
     std::thread::scope(|scope| {
         let (tx, rx) = mpsc::channel::<(usize, Result<(), FsError>)>();
+        let mut spawned = 0;
         for _ in 0..workers {
             let tx = tx.clone();
             let next = &next;
-            scope.spawn(move || {
+            let worker = move || {
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     if i >= n {
@@ -838,10 +847,33 @@ pub(crate) fn sync_staged_many<W: FileHandle + Sync>(
                     // A closed receiver cannot happen before every index is received; ignore it rather than panic.
                     let _ = tx.send((i, writers[i].sync_all()));
                 }
-            });
+            };
+            // `Scope::spawn` panics when the OS refuses a thread, and the binary aborts on panic: use the fallible form.
+            if std::thread::Builder::new().spawn_scoped(scope, worker).is_err() {
+                break;
+            }
+            spawned += 1;
         }
         drop(tx);
+        let mut beat_if_due = |deadline: &mut Instant| {
+            if heartbeat.is_none()
+                && let Err(e) = beat()
+            {
+                heartbeat = Some(e);
+            }
+            *deadline += beat_every;
+        };
         let mut deadline = Instant::now() + beat_every;
+        if spawned == 0 {
+            // No worker could be spawned: sync on this thread in index order, beating once the deadline has passed.
+            for (i, w) in writers.iter().enumerate() {
+                slots[i] = Some(w.sync_all());
+                if Instant::now() >= deadline {
+                    beat_if_due(&mut deadline);
+                }
+            }
+            return;
+        }
         let mut received = 0;
         while received < n {
             match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
@@ -849,14 +881,7 @@ pub(crate) fn sync_staged_many<W: FileHandle + Sync>(
                     slots[i] = Some(r);
                     received += 1;
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if heartbeat.is_none()
-                        && let Err(e) = beat()
-                    {
-                        heartbeat = Some(e);
-                    }
-                    deadline += beat_every;
-                }
+                Err(mpsc::RecvTimeoutError::Timeout) => beat_if_due(&mut deadline),
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
