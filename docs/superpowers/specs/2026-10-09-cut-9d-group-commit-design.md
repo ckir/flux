@@ -135,6 +135,7 @@ format and `meta.format` 2, and every Normal-durability behaviour. A Strict sing
   per-file `prepare`; off: N per-file `prepare` calls and no `prepare_many`), so an implementation that ignores the seam fails the test.
 - Non-ASCII fold collision (reasoned, not measured: no case-folding filesystem on the dev box): a FaultFs destination that folds `É`/`é` and
   fails the second exclusive create with `AlreadyExists`; the copy flushes, retries, and reports `DestinationNamespaceCollision` for the second file.
+  (Amendment, Task 3: FaultFs folds ASCII only (fault_fs.rs:61), so this is realised as two tests: the injected-`AlreadyExists` retry tests, and `a_fold_equal_pending_temporary_is_never_swept` with the `BatchPolicy.fold_precheck` seam; neither shows a DNC coming out of a retry. A file and a DIRECTORY whose names fold equal are handled by flushing at the `Dir` event when the folded name is pending (ASCII fold only; a non-ASCII file/directory pair resolves the other way round than an unbatched copy, nothing is lost: known limit 7).)
 - Existing tests that depend on the old order (decision 11) are listed in the plan and re-derived, not loosened.
 
 ## Measurement (acceptance)
@@ -166,6 +167,8 @@ quoted, and what was not controlled is stated.
    because `insert_if_absent` is Immediate under Strict (crates/flux-platform/src/claims.rs:183, `next_commit`): a replaced file costs 4 syncs
    today (data, `Existing` claim, note, claim) and about 2 after this cut (data, `Existing` claim). Folding the `Existing` claim into
    `prepare_many` is the later fix; it needs the exclusivity the claim gives (decision 1) to come from the in-frame pending names instead.
+
+7. A file and a directory in one directory whose names fold equal only by a NON-ASCII fold, onto a folding destination: the file's rename meets the collision (batched) where an unbatched copy publishes the file and refuses the directory. Nothing is lost or overwritten; which of the two is reported differs.
 
 ## Out of scope
 
