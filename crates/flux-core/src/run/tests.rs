@@ -2292,6 +2292,7 @@ fn a_target_that_finds_its_own_claim_proceeds() {
         beat: &no_heartbeat,
         claims: Some(&claims),
         resume: false,
+        batch: crate::tree::BatchPolicy::DEFAULT,
     };
     let mut out = TreeOutcome::default();
     let mut got = Vec::new();

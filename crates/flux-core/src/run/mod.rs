@@ -284,6 +284,7 @@ pub fn tree<F: DestinationRoot>(
             beat: &beat,
             claims: claims.as_ref(),
             resume: cfg.resume,
+            batch: crate::tree::BatchPolicy::DEFAULT,
         };
         let root = place.dest.take().expect("step 5 made DEST");
         let mut report = |f: TreeFailure| {
