@@ -43,8 +43,9 @@ is not the engine and the real gain is smaller (reads, renames and about 25 othe
    can take seconds (11 s measured under a background writer) and a record older than the lease threshold can be taken over by another run
    (`lock/obtain.rs:208`). A heartbeat that fails during the wait ends the wait only after the workers are joined (the scope needs them), and is
    then handled as decision 5's heartbeat case.
-3. **`FileSystem::Writer` must be `Sync`** (`sync_all(&self)` is already `&self`). Real and fake writers satisfy it; the plan verifies each
-   implementor and widens the trait bound only if the compiler requires it.
+3. **`FileSystem::Writer` must be `Sync`.** Today the associated type is only `FileHandle` (`crates/flux-fs/src/fs.rs:125`, and the twin at
+   :227); `sync_all` is already `&self`, so the cut adds `Sync` to the bound and the plan checks every implementor (the real std and Windows
+   writers, the fake, the `NullWriter` test double at :453) against it.
 4. **Per-entry failure attribution.** The barrier returns one result per entry. An entry whose `sync_all` failed is reported
    `Code::StrictDurabilityUnavailable` at `CopyStep::Durability`, exactly the report step 5 gives today, and its temp is discarded. The other
    entries continue to `prepare_many` in the same flush. No note is written for a failed entry. **Order:** the failed entries are discarded
@@ -59,14 +60,17 @@ is not the engine and the real gain is smaller (reads, renames and about 25 othe
 6. **Metadata before the barrier.** Times and permissions (step 6) are applied to the handle before it is synced, so the barrier also makes
    them durable. This is strictly stronger than today (metadata applied after the sync, never synced), costs nothing, and removes an order
    dependency between the old step 5 and 6. If the plan finds a test that pins the old order, the test is re-derived, not the order kept.
-   **The writers are closed right after the barrier:** `flush_batch` takes every `Staged.writer` out and drops it (on every exit path, including
-   a failed heartbeat or a lost lock) before `prepare_many` and before any rename, as the 9d staging did. A rename or an unlink of a file with an
+   **The writers are closed right after the barrier:** `Staged` has no writer today (9d drops it inside `stage_file`, `copy.rs:462`); 9e adds
+   `Staged.writer`, and `flush_batch` takes every one out and drops it (on every exit path, including a failed heartbeat or a lost lock) before
+   `prepare_many` and before any rename, so the descriptor lifetime ends where the 9d staging ended it, one step later. A rename or an unlink of a file with an
    open handle fails or misbehaves on Windows, which the Windows CI would surface and no Linux test can. Closing a descriptor here is not a
    mutation in the section 99 sense: the barrier has just synced every successful entry, so nothing of theirs is dirty and the close writes
    nothing (a failed-sync entry is discarded, and its dirty data is of no interest); the close therefore precedes the post-barrier guard
    without contradicting decision 5.
 7. **Open-writer budget.** A pending entry now holds a descriptor. A directory frame holds at most 64 entries, but the walker's stack holds
-   several frames. `OPEN_WRITERS_MAX = 256` run-wide: before staging a new entry while the stack already holds that many, the walker flushes pending
+   several frames. `OPEN_WRITERS_MAX = 256` run-wide, **lowered at startup to a quarter of the soft `RLIMIT_NOFILE`** where the platform has one (the walker's
+   directory handles, `state.db` and the lock hold descriptors of their own, so a cap equal to the limit would be unsafe; 256 is the ceiling,
+   not the assumption): before staging a new entry while the stack already holds that many, the walker flushes pending
    batches shallowest frame first until it is below the cap. The cap is a `BatchPolicy` field (`open_writers`) so a test can set it to 2.
 8. **Platforms.** Threads and per-file `sync_all` are portable (Linux `fsync`, Windows `FlushFileBuffers` on the write handle, macOS whatever
    the platform layer's `sync_all` maps to). The gain is not measured off Linux; the spec claims it only for the box measured. Sections 166-169
