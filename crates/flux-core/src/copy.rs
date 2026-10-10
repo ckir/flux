@@ -810,7 +810,12 @@ pub(crate) struct SyncOutcome {
 
 /// Cut 9e: the data `fsync` of every pending writer, `threads` at a time (at most one worker per writer). The calling
 /// thread does not sync; it keeps the lock's heartbeat alive, calling `beat` whenever a further `beat_every` has passed
-/// IN TOTAL since the start (an absolute deadline stepped by `beat_every`, never a fresh interval per received result).
+/// IN TOTAL since the start (an absolute deadline on the grid `start + k * beat_every`, never a fresh interval per
+/// received result). After a beat the deadline advances along that same grid to the first point after now, so a stalled
+/// calling thread beats once, not once per missed interval.
+///
+/// `threads == 0` means no workers: the syncs run on the calling thread (the main-thread path). 0 is the test seam for
+/// that path; `BatchPolicy` never passes 0 (`DEFAULT` is 16, the tests use 1 or 16).
 /// `beat` is `dyn Fn` without `Send`, so it is only ever called here, never from a worker. After one heartbeat failure
 /// no further `beat` is made, but the wait continues until every worker has finished and been joined: every writer
 /// still gets its result, and the failure is reported once in `heartbeat`. A worker panic propagates out of the scope.
@@ -827,7 +832,7 @@ pub(crate) fn sync_staged_many<W: FileHandle + Sync>(
     if n == 0 {
         return SyncOutcome { results: Vec::new(), heartbeat: None };
     }
-    let workers = threads.clamp(1, n);
+    let workers = threads.min(n);
     let next = AtomicUsize::new(0);
     let mut slots: Vec<Option<Result<(), FsError>>> = Vec::new();
     slots.resize_with(n, || None);
@@ -861,11 +866,17 @@ pub(crate) fn sync_staged_many<W: FileHandle + Sync>(
             {
                 heartbeat = Some(e);
             }
-            *deadline += beat_every;
+            // Catch up on the SAME absolute grid (never `now + beat_every`: a per-receive reset is the starvation the
+            // grid prevents). After a stall of several intervals this makes one beat, not one per missed interval.
+            // No deterministic test can stall the calling thread, so this loop is covered by reading only.
+            let now = Instant::now();
+            while *deadline <= now {
+                *deadline += beat_every;
+            }
         };
         let mut deadline = Instant::now() + beat_every;
         if spawned == 0 {
-            // No worker could be spawned: sync on this thread in index order, beating once the deadline has passed.
+            // No worker (`threads == 0`, or none could be spawned): sync on this thread in index order, beating once the deadline has passed.
             for (i, w) in writers.iter().enumerate() {
                 slots[i] = Some(w.sync_all());
                 if Instant::now() >= deadline {
@@ -1081,6 +1092,51 @@ mod tests {
             "every writer still has a result: the workers were joined"
         );
         assert_eq!(fs.calls().iter().filter(|c| c.starts_with("sync_all(")).count(), 4);
+    }
+
+    #[test]
+    fn zero_threads_syncs_on_the_main_thread_in_order_and_beats_between_syncs() {
+        // 4 x 20 ms syncs on the main thread with a 10 ms deadline: at least one beat lands between syncs, from the main
+        // thread, results are positional and the order is t0..t3. Mutant: remove the beat check from the fallback -> count 0.
+        let fs = FaultFs::new();
+        fs.delay("sync_all", Duration::from_millis(20));
+        let ws = handles(&fs, 4);
+        let refs: Vec<&FakeHandle> = ws.iter().collect();
+        let (beat, count, thread) = counting_beat();
+        let out = sync_staged_many(&refs, 0, &beat, Duration::from_millis(10));
+        assert_eq!(out.results.len(), 4);
+        assert!(out.results.iter().all(Result::is_ok) && out.heartbeat.is_none());
+        assert!(count.get() >= 1, "no heartbeat between main-thread syncs");
+        assert_eq!(thread.get(), Some(std::thread::current().id()));
+        let synced: Vec<String> =
+            fs.calls().into_iter().filter(|c| c.starts_with("sync_all(")).collect();
+        assert_eq!(synced, ["sync_all(/t0)", "sync_all(/t1)", "sync_all(/t2)", "sync_all(/t3)"]);
+    }
+
+    #[test]
+    fn zero_threads_reports_a_failed_sync_at_its_index_and_a_failed_heartbeat_once() {
+        let fs = FaultFs::new();
+        fs.delay("sync_all", Duration::from_millis(20));
+        fs.on_nth("create_new", 2, |fs| fs.fail("sync_all", Code::StrictDurabilityUnavailable));
+        let ws = handles(&fs, 3);
+        let refs: Vec<&FakeHandle> = ws.iter().collect();
+        let calls = Cell::new(0u32);
+        let beat = || {
+            calls.set(calls.get() + 1);
+            Err(FsError::new(Code::IoError, std::io::Error::other("torn")))
+        };
+        let out = sync_staged_many(&refs, 0, &beat, Duration::from_millis(10));
+        assert_eq!(
+            out.results.iter().map(Result::is_err).collect::<Vec<_>>(),
+            [false, true, false]
+        );
+        assert_eq!(out.heartbeat.as_ref().map(|e| e.code), Some(Code::IoError));
+        assert_eq!(calls.get(), 1, "no second heartbeat call after a failure");
+        assert_eq!(
+            fs.calls().iter().filter(|c| c.starts_with("sync_all(")).count(),
+            3,
+            "every writer still synced"
+        );
     }
 
     #[test]
