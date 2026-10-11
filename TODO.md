@@ -584,6 +584,7 @@ the spec's numbers, 9-10 were learned during execution).
 - [ ] Error precedence in the non-batched Strict path: when both the `Preserve::Strict` metadata step and the sync fail, `MetadataApplyFailed`
   is now reported instead of `StrictDurabilityUnavailable` (a consequence of the sync moving after the metadata step).
 - [ ] The end-to-end stall oracles pin `FLUX_TEST_BATCH_AGE_MS` and `FLUX_TEST_OPEN_WRITERS` so no age or cap flush moves a guard index; a clock injectable from the CLI (the tree already takes `BatchPolicy.now`) would let an end-to-end test exercise an age flush deterministically instead of blinding the oracles to it (capstone round 3 recommendation).
+- [ ] Test-audit debt (cut 9e, 2026-10-11): the suite pins the drain's stop classes with hand-built two- and three-frame fixtures; a property test over (frame depth x stop class x failure phase) asserting "no temporary neither removed nor reported", "no note for unsynced data" and "no barrier after a stop", and a real-filesystem crash-injection harness (the fake masks OS fsync semantics), would cover the state space the point tests cannot.
 
 ## Scaffolding follow-ups
 
