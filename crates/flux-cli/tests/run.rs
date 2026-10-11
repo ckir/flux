@@ -806,3 +806,36 @@ fn counters_file_reports_the_barrier_cap_and_heartbeat_gap() {
     let normal = run("normal", &d.path().join("dst-normal"), &d.path().join("normal.json"));
     assert_eq!(normal["barrier_max_ms"], 0);
 }
+
+/// Cut 9e test audit: the counters are not constant zeros. A nested Strict tree under a cap of 2 forces cap flushes (the
+/// root's file is pending while the subdirectory is walked), and a 1 ms heartbeat interval makes the gap measurable.
+/// Mutants: `cap_flushes` hardcoded to 0, or `beat_gap_max_ms` hardcoded to 0, in `counters_file`.
+#[test]
+fn counters_file_reports_a_positive_cap_flush_count_and_a_heartbeat_gap() {
+    let d = TempDir::new().unwrap();
+    let src = d.path().join("src");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("r0"), "root file").unwrap();
+    for i in 0..6 {
+        std::fs::write(src.join("sub").join(format!("s{i}")), format!("sub file {i}")).unwrap();
+    }
+    let dst = d.path().join("dst");
+    let counters = d.path().join("counters.json");
+    let out = flux()
+        .arg("copy")
+        .args(["--durability", "strict"])
+        .arg(&src)
+        .arg(&dst)
+        .env("FLUX_TEST_COUNTERS_FILE", &counters)
+        .env("FLUX_TEST_BATCH_AGE_MS", "3600000")
+        .env("FLUX_TEST_OPEN_WRITERS", "2")
+        .env("FLUX_TEST_HEARTBEAT_INTERVAL_MS", "1")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = std::fs::read_to_string(&counters).expect("the counters file was written");
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(v["cap_flushes"].as_u64().unwrap() >= 1, "{text}");
+    assert!(v["beat_gap_max_ms"].as_u64().unwrap() >= 1, "{text}");
+    same_bytes(&src, &dst);
+}

@@ -3284,7 +3284,9 @@ mod tests {
         beat: &Heartbeat<'_>,
     ) -> (std::result::Result<(), CopyError>, TreeOutcome, Vec<TreeFailure>) {
         let source = prepare_source(fs, Path::new("/src"), Path::new("/dst")).unwrap();
-        fs.create_dir(Path::new("/dst")).unwrap();
+        if !fs.exists(Path::new("/dst")) {
+            fs.create_dir(Path::new("/dst")).unwrap();
+        }
         let root = fs.destination_root(Path::new("/dst")).unwrap();
         let store = root.create_claim_store(OsStr::new("state.db"), durability).unwrap();
         let claims = std::cell::RefCell::new(store);
@@ -3683,6 +3685,9 @@ mod tests {
         assert_eq!(BatchPolicy::DEFAULT.files, BATCH_FILES);
         assert_eq!(BatchPolicy::DEFAULT.bytes, BATCH_BYTES);
         assert_eq!(BatchPolicy::DEFAULT.age, BATCH_AGE);
+        // Cut 9e test audit: the cap's default is pinned too (mutant: `open_writers: 1` in `DEFAULT`).
+        assert_eq!(BatchPolicy::DEFAULT.open_writers, OPEN_WRITERS_MAX);
+        assert_eq!(OPEN_WRITERS_MAX, 256);
     }
 
     // Cut 9d Task 4: failure isolation (spec decision 7), the stops (decision 8), the abort drain (5(e)).
@@ -4754,5 +4759,124 @@ mod tests {
         let (r, out, _) = batched(&fs, one_worker(), Durability::Strict);
         r.unwrap();
         assert_eq!((out.files_copied, out.cap_flushes), (40, 0));
+    }
+
+    // Cut 9e test audit: five closed gaps, each red under the named mutant.
+
+    #[test]
+    fn a_cap_flush_that_stops_the_run_is_counted_and_the_remaining_frames_are_kept() {
+        let entries: [(&str, &[u8]); 5] =
+            [("a0", b"a"), ("m/x", b"x"), ("m/y", b"y"), ("m/z", b"z"), ("w", b"w")];
+        let p = BatchPolicy { open_writers: 2, ..one_worker() };
+        // Dry run: the 1-based number of the first guard call after the first (cap) flush's barrier.
+        let dry = sources(&entries);
+        let at = std::cell::RefCell::new(Vec::new());
+        let note = || {
+            at.borrow_mut().push(dry.calls().len());
+            Ok(())
+        };
+        let (r, _, _) = batched_with(&dry, p, Durability::Strict, &note, &no_heartbeat);
+        r.unwrap();
+        let first_sync = first(&log(&dry), "sync_all(");
+        let n = at
+            .borrow()
+            .iter()
+            .position(|&len| len > first_sync)
+            .expect("a guard call in the flush")
+            + 1;
+
+        let fs = sources(&entries);
+        let calls = std::cell::Cell::new(0);
+        let guard = failing_after(u32::try_from(n - 1).unwrap(), &calls);
+        let (r, out, got) = batched_with(&fs, p, Durability::Strict, &guard, &no_heartbeat);
+        let err = r.unwrap_err();
+        assert_eq!(err.code(), Code::TargetLockBusy);
+        // Mutant: the increment after the `?` in `walk_into`'s cap loop.
+        assert_eq!(out.cap_flushes, 1);
+        let c = log(&fs);
+        assert_eq!(count(&c, "sync_all("), 1, "only the stopped flush's own barrier: {c:?}");
+        assert!(positions(&c, "claim_prepare_many(").is_empty(), "{c:?}");
+        assert!(positions(&c, "rename_").is_empty(), "{c:?}");
+        for rel in ["a0", "m/x"] {
+            assert!(fs.exists(format!("/dst/{rel}.flux-partial.op1")), "{rel}: {c:?}");
+            assert!(!fs.exists(format!("/dst/{rel}")), "{rel}");
+        }
+        assert!(!fs.exists("/dst/m/y.flux-partial.op1"), "m/y was never staged");
+        assert!(
+            got.iter().all(|f| matches!(&f.cause, TreeFailureCause::Copy(e) if e.code() == Code::TargetLockBusy)),
+            "{got:?}"
+        );
+        assert_eq!(got.len(), 1, "m/x is kept and reported; a0 rides in the error: {got:?}");
+        assert_eq!(leftovers(&got, Some(&err)), [temp_of("a0"), temp_of("m/x")]);
+        assert_eq!((out.files_copied, fs.prepared_count()), (0, 0));
+    }
+
+    #[test]
+    fn the_cap_flushes_batches_holding_replace_entries_and_overwrites_them() {
+        // Mutant: delete `out.files_overwritten += 1;` in `flush_batch`'s Replace branch.
+        let rels = ["a0", "a1", "m/x", "m/y", "m/z"];
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/")).unwrap();
+        for d in ["/src", "/src/m", "/dst", "/dst/m"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        for rel in rels {
+            fs.write_file(Path::new("/src").join(rel), format!("new-{rel}").as_bytes());
+            fs.write_file(Path::new("/dst").join(rel), b"old");
+        }
+        let p = BatchPolicy { open_writers: 2, ..one_worker() };
+        let (r, out, got) = batched(&fs, p, Durability::Strict);
+        r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        for rel in rels {
+            assert_eq!(
+                fs.read_file(Path::new("/dst").join(rel)).as_deref(),
+                Some(format!("new-{rel}").as_bytes()),
+                "{rel}"
+            );
+        }
+        assert_eq!(out.files_overwritten, 5);
+        assert_eq!(out.files_copied, 5);
+        assert!(out.cap_flushes >= 1, "{}", out.cap_flushes);
+        let c = log(&fs);
+        let (mut live, mut peak) = (0i64, 0i64);
+        for x in &c {
+            if x.starts_with("create_new(") {
+                live += 1;
+                peak = peak.max(live);
+            } else if x.starts_with("drop_writer(") {
+                live -= 1;
+            }
+        }
+        assert!((1..=2).contains(&peak), "{peak}: {c:?}");
+        assert_eq!(fs.prepared_count(), 0);
+        let dst = strong_id(&fs, "/dst");
+        let dst_m = strong_id(&fs, "/dst/m");
+        for rel in ["a0", "a1"] {
+            assert_eq!(fs.claim(dst, rel).map(|r| r.status), Some(ClaimStatus::Created), "{rel}");
+        }
+        for rel in ["x", "y", "z"] {
+            assert_eq!(
+                fs.claim(dst_m, rel).map(|r| r.status),
+                Some(ClaimStatus::Created),
+                "m/{rel}"
+            );
+        }
+    }
+
+    #[test]
+    fn barrier_max_keeps_the_longest_barrier_across_batches() {
+        let fs = n_files(4);
+        let slow = std::time::Duration::from_millis(60);
+        fs.delay("sync_all", slow);
+        // The first batch's notes are written after its barrier: the delay is off for the second batch.
+        fs.on_nth("claim_prepare_many", 1, |fs| fs.delay("sync_all", std::time::Duration::ZERO));
+        let (r, out, _) = batched(&fs, policy(2), Durability::Strict);
+        r.unwrap();
+        let c = log(&fs);
+        assert_eq!(prepares(&c).len(), 2, "two batches: {c:?}");
+        assert_eq!(count(&c, "sync_all("), 4, "{c:?}");
+        // Mutant: `out.barrier_max = started.elapsed()` (the fast second batch overwrites).
+        assert!(out.barrier_max >= slow, "{:?}", out.barrier_max);
     }
 }
