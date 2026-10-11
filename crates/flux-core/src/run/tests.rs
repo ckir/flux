@@ -34,6 +34,7 @@ fn cfg() -> RunConfig {
         // Plan decision 6: the existing tests never heartbeat.
         heartbeat_interval: std::time::Duration::from_secs(3600),
         resume: false,
+        descriptor_limit: None,
     }
 }
 
@@ -1646,6 +1647,45 @@ fn a_heartbeat_restarts_its_interval() {
         "the record, one heartbeat, and Q-K: {:?}",
         calls(&fs)
     );
+}
+
+/// A config whose guard sleeps 30 ms once (at the first guard), with a 5 ms heartbeat interval, so the first heartbeat
+/// after the sleep is due and the gap since the lock's creation record is at least 30 ms.
+fn sleeping_beats() -> RunConfig {
+    let first = Arc::new(AtomicUsize::new(0));
+    let hook: BeforeMutation = Arc::new(move || {
+        if first.fetch_add(1, Ordering::SeqCst) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+    });
+    RunConfig {
+        heartbeat_interval: std::time::Duration::from_millis(5),
+        before_mutation: Some(hook),
+        ..cfg()
+    }
+}
+
+#[test]
+fn the_longest_gap_between_successful_record_writes_is_reported() {
+    // Mutant: delete the `gap_max.set(..)` in `Pulse::beat` (session.rs), or record the shorter of the two gaps.
+    let fs = fake();
+    let (r, _) = run_tree(&fs, &sleeping_beats());
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+    assert!(
+        r.beat_gap_max >= std::time::Duration::from_millis(30),
+        "the gap across the sleep: {:?}",
+        r.beat_gap_max
+    );
+}
+
+#[test]
+fn a_failed_heartbeat_write_does_not_raise_the_longest_gap() {
+    // Mutant: move the `gap_max.set(..)` in `Pulse::beat` (session.rs) ahead of the write's result.
+    let fs = fake();
+    fail_heartbeat(&fs, 2, T_LOCK, false);
+    let (r, _) = run_tree(&fs, &sleeping_beats());
+    assert!(r.stop.is_some() || matches!(r.copy, Some(Err(_))), "the heartbeat failed the copy");
+    assert_eq!(r.beat_gap_max, std::time::Duration::ZERO);
 }
 
 #[test]
@@ -5354,4 +5394,20 @@ fn a_failed_recovery_transaction_is_retried_by_the_next_resume() {
     assert_eq!(fs.prepared_count(), 0);
     assert_eq!(fs.claim(strong(&fs, "/p/dest"), "a"), created("a"));
     assert_eq!(fs.claim(strong(&fs, "/p/dest/sub"), "b"), created("sub\0b"));
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_zero_open_writers_override_is_floored_to_one() {
+    // nextest runs each test in its own process, so the env is private to this test.
+    // SAFETY: single-threaded at this point; no other thread reads the environment in this test process.
+    unsafe { std::env::set_var("FLUX_TEST_OPEN_WRITERS", "0") };
+    let p = batch_policy(&cfg());
+    assert_eq!(p.open_writers, 1);
+    unsafe { std::env::set_var("FLUX_TEST_OPEN_WRITERS", "abc") };
+    assert_eq!(
+        batch_policy(&cfg()).open_writers,
+        crate::tree::open_writers_cap(cfg().descriptor_limit)
+    );
+    unsafe { std::env::remove_var("FLUX_TEST_OPEN_WRITERS") };
 }

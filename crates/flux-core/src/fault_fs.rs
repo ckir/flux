@@ -13,12 +13,23 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::SystemTime;
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, SystemTime};
+
+/// The rendezvous state, behind its own lock so a waiting `sync_all` never holds the fake's main lock: the cumulative
+/// arrivals, the condition variable, the parties to wait for, and the timeout.
+type Rendezvous = std::sync::Arc<(Mutex<usize>, Condvar, usize, Duration)>;
 
 #[derive(Default)]
 struct Inner {
     files: HashMap<PathBuf, Vec<u8>>,
+    /// call name -> a pause (cut 9e `delay`); only `sync_all` honours it
+    delays: HashMap<String, Duration>,
+    /// `sync_all` calls inside the call right now, and the most there have been at once (cut 9e)
+    syncs_in_flight: usize,
+    syncs_peak: usize,
+    /// cut 9e `rendezvous("sync_all", ..)`
+    rendezvous: Option<Rendezvous>,
     /// The ORDER of calls, which is what every assertion on it checks. Formatted with
     /// the lossy `display()` deliberately: this is an order oracle, not a path oracle,
     /// and no test distinguishes two paths by this string. The MAPS above are keyed by
@@ -628,6 +639,19 @@ pub struct FakeHandle {
     write_fault: std::sync::Arc<Mutex<Option<std::io::Error>>>,
 }
 
+/// Cut 9e: a dropped WRITER is part of the call log (`drop_writer(<path>)`), so a test can tell a descriptor released
+/// before the rename from one held across it. A handle opened to read has no sink and records nothing.
+impl Drop for FakeHandle {
+    fn drop(&mut self) {
+        if let Some(sink) = &self.sink {
+            // A poisoned lock means a test already failed; do not turn that into an abort while unwinding.
+            if let Ok(mut g) = sink.lock() {
+                g.calls.push(format!("drop_writer({})", self.path.display()));
+            }
+        }
+    }
+}
+
 impl Read for FakeHandle {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         let n = (self.buf.len() - self.read_pos).min(out.len());
@@ -659,11 +683,36 @@ impl Write for FakeHandle {
 
 impl FileHandle for FakeHandle {
     fn sync_all(&self) -> Result<()> {
+        // Cut 9e: the barrier calls this from several threads. Enter under the fake's lock (raising the peak), then
+        // wait on the rendezvous and sleep with NO lock held, then leave and record under a short lock again.
+        let mut pause = None;
+        if let Some(sink) = &self.sink {
+            let rendezvous = {
+                let mut g = sink.lock().unwrap();
+                g.syncs_in_flight += 1;
+                g.syncs_peak = g.syncs_peak.max(g.syncs_in_flight);
+                pause = g.delays.get("sync_all").copied();
+                g.rendezvous.clone()
+            };
+            if let Some(r) = rendezvous {
+                let (arrivals, cv, parties, timeout) = &*r;
+                let mut n = arrivals.lock().unwrap();
+                *n += 1;
+                cv.notify_all();
+                // Arrivals are cumulative, so a late last thread never finds the others gone and waits out the timeout.
+                let _ = cv.wait_timeout_while(n, *timeout, |n| *n < *parties).unwrap();
+            }
+        }
+        if let Some(d) = pause {
+            std::thread::sleep(d);
+        }
         // Record it. Without this the call log never mentioned `sync_all`, so no test
         // could tell a run that synced from one that did not -- only one that FAILED
         // to, via the injected fault below.
         if let Some(sink) = &self.sink {
-            sink.lock().unwrap().calls.push(format!("sync_all({})", self.path.display()));
+            let mut g = sink.lock().unwrap();
+            g.syncs_in_flight -= 1;
+            g.calls.push(format!("sync_all({})", self.path.display()));
         }
         if let Some(code) = self.sync_fault.lock().unwrap().take() {
             return Err(FsError::new(code, std::io::Error::other("injected")));
@@ -908,6 +957,25 @@ impl FaultFs {
         g.claim_stores
             .iter()
             .find_map(|m| m.lock().unwrap().get(&k).and_then(|v| ClaimRecord::decode(v)))
+    }
+
+    /// Pause every `sync_all` for `d` (cut 9e). Only `"sync_all"` is honoured; any other name is stored and ignored.
+    pub fn delay(&self, name: &str, d: Duration) {
+        self.inner.lock().unwrap().delays.insert(name.to_string(), d);
+    }
+
+    /// Make every `sync_all` wait until `parties` calls have arrived in total, or `timeout` has passed (cut 9e). Only
+    /// `"sync_all"` is honoured. Concurrency is then proven by a meeting, not by a race against the scheduler.
+    pub fn rendezvous(&self, name: &str, parties: usize, timeout: Duration) {
+        if name == "sync_all" {
+            self.inner.lock().unwrap().rendezvous =
+                Some(std::sync::Arc::new((Mutex::new(0), Condvar::new(), parties, timeout)));
+        }
+    }
+
+    /// The most `sync_all` calls that were inside the call at once (cut 9e).
+    pub fn peak_concurrent_syncs(&self) -> usize {
+        self.inner.lock().unwrap().syncs_peak
     }
 
     pub fn calls(&self) -> Vec<String> {
@@ -1934,6 +2002,30 @@ impl DirHandle for FakeDirHandle {
 mod tests {
     use super::*;
     use flux_fs::FileIdentity;
+
+    #[test]
+    fn a_dropped_writer_is_recorded_and_a_dropped_reader_is_not() {
+        let fs = FaultFs::new();
+        fs.write_file("/r", b"r");
+        drop(fs.create_new(Path::new("/w")).unwrap());
+        drop(fs.open_read(Path::new("/r")).unwrap());
+        let drops: Vec<String> =
+            fs.calls().into_iter().filter(|c| c.starts_with("drop_writer(")).collect();
+        assert_eq!(drops, ["drop_writer(/w)"]);
+    }
+
+    #[test]
+    fn sync_all_from_several_threads_records_every_call() {
+        let fs = FaultFs::new();
+        let ws: Vec<FakeHandle> =
+            (0..8).map(|i| fs.create_new(Path::new(&format!("/t{i}"))).unwrap()).collect();
+        std::thread::scope(|s| {
+            for w in &ws {
+                s.spawn(move || w.sync_all().unwrap());
+            }
+        });
+        assert_eq!(fs.calls().iter().filter(|c| c.starts_with("sync_all(")).count(), 8);
+    }
 
     #[test]
     fn it_records_the_order_of_calls() {

@@ -8,6 +8,9 @@ use flux_fs::{
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 /// The code for a failure inside the streaming loop.
 ///
@@ -459,24 +462,40 @@ pub fn copy_file_at<F: DestinationRoot>(
     )
 }
 
-/// What `stage_file` produced: a closed temporary on disk, ready to be renamed to its name.
-pub(crate) struct Staged {
+/// What `stage_file` produced: a temporary on disk, ready to be renamed to its name. At `SyncAt::Staging` it is closed;
+/// at `SyncAt::Barrier` its writer is still open in `writer` and the flush closes it after the barrier.
+pub(crate) struct Staged<W> {
     pub temp: OsString,
     pub identity: FileIdentity,
     pub bytes_copied: u64,
     pub metadata_failures: Vec<MetadataFailure>,
     pub identity_degraded: Option<FileIdentity>,
+    /// Cut 9e: the temporary's open writer, `Some` only for a file staged at `SyncAt::Barrier` (whose data sync the
+    /// caller owes, once per batch, and closes after the barrier); `None` at `SyncAt::Staging`, which has already synced
+    /// the writer and dropped it on return.
+    pub writer: Option<W>,
+}
+
+/// Cut 9e: where `stage_file` pays a Strict file's data `fsync`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SyncAt {
+    /// Inline, after the metadata step; the writer is dropped on return (the single copy, and the unbatched path).
+    Staging,
+    /// Not at all: the open writer is handed out in `Staged.writer` for the caller's barrier.
+    Barrier,
 }
 
 /// The result of `stage_file`: the step-2b skip (changes nothing on disk), or a staged temporary.
-pub(crate) enum Stage {
+pub(crate) enum Stage<W> {
     Skipped(Outcome),
-    Staged(Staged),
+    Staged(Staged<W>),
 }
 
 /// Steps 1-7 of the copy, up to and including the source recheck and the read of the temporary's identity: everything
-/// before the final heartbeat, guard and publishing rename. The writer is dropped on return, so no descriptor is held;
-/// on every error path the temporary has already been discarded exactly as `copy_file_guarded` always did.
+/// before the final heartbeat, guard and publishing rename. At `SyncAt::Staging` the writer is dropped on return, so no
+/// descriptor is held; at `SyncAt::Barrier` it is NOT: the open writer rides in `Staged.writer` and the flush closes it
+/// after the barrier (the descriptor is held until then, which is what the open-writer cap bounds). On every error path
+/// the temporary has already been discarded exactly as `copy_file_guarded` always did.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn stage_file<F: DestinationRoot>(
     fs: &F,
@@ -487,7 +506,8 @@ pub(crate) fn stage_file<F: DestinationRoot>(
     guard: &Guard<'_>,
     beat: &Heartbeat<'_>,
     before_create: &BeforeCreate<'_>,
-) -> std::result::Result<Stage, CopyError> {
+    sync: SyncAt,
+) -> std::result::Result<Stage<F::Writer>, CopyError> {
     let temp = temp_name(name, &opts.operation_id);
 
     // 1. this invocation's own leftover, if any (§18.1). A no-op in practice: the
@@ -569,20 +589,6 @@ pub(crate) fn stage_file<F: DestinationRoot>(
         }
     }
 
-    // 5. durability
-    if opts.durability == Durability::Strict
-        && let Err(e) = writer.sync_all()
-    {
-        return Err(discard(
-            parent,
-            &temp,
-            CopyStep::Durability,
-            Code::StrictDurabilityUnavailable,
-            e.source,
-            guard,
-        ));
-    }
-
     // 6. metadata, on the temporary, BEFORE publication (§44.1)
     let mut metadata_failures = Vec::new();
 
@@ -618,6 +624,22 @@ pub(crate) fn stage_file<F: DestinationRoot>(
         metadata_failures.push(MetadataFailure { item: MetadataItem::Permissions, error: e });
     }
 
+    // 6b. durability (cut 9e: after the metadata, so the one sync covers the times and permissions as well as the data;
+    //     at `SyncAt::Barrier` the caller syncs the returned writer, once per batch).
+    if sync == SyncAt::Staging
+        && opts.durability == Durability::Strict
+        && let Err(e) = writer.sync_all()
+    {
+        return Err(discard(
+            parent,
+            &temp,
+            CopyStep::Durability,
+            Code::StrictDurabilityUnavailable,
+            e.source,
+            guard,
+        ));
+    }
+
     // 7. the source must not have changed under us (Section 33), then publish.
     //    Note the `match` rather than `?`: a `?` here would return with the temporary
     //    still on disk, which is the one leak the `discard` helper exists to prevent.
@@ -647,7 +669,18 @@ pub(crate) fn stage_file<F: DestinationRoot>(
     // Cut 7b: the object about to be published, read from its own handle - a rename keeps it - so the run records the
     // target's identity without a look-up by name after the rename.
     let identity = writer.identity().unwrap_or(FileIdentity::Unavailable);
-    Ok(Stage::Staged(Staged { temp, identity, bytes_copied, metadata_failures, identity_degraded }))
+    let writer = match sync {
+        SyncAt::Staging => None,
+        SyncAt::Barrier => Some(writer),
+    };
+    Ok(Stage::Staged(Staged {
+        temp,
+        identity,
+        bytes_copied,
+        metadata_failures,
+        identity_degraded,
+        writer,
+    }))
 }
 
 /// Copy `src` to `name` inside `parent`, writing ONLY through `parent`.
@@ -691,10 +724,12 @@ pub fn copy_file_guarded<F: DestinationRoot>(
     before_create: &BeforeCreate<'_>,
     before_publish: &BeforePublish<'_>,
 ) -> std::result::Result<Outcome, CopyError> {
-    let staged = match stage_file(fs, src, parent, name, opts, guard, beat, before_create)? {
-        Stage::Skipped(outcome) => return Ok(outcome),
-        Stage::Staged(staged) => staged,
-    };
+    let staged =
+        match stage_file(fs, src, parent, name, opts, guard, beat, before_create, SyncAt::Staging)?
+        {
+            Stage::Skipped(outcome) => return Ok(outcome),
+            Stage::Staged(staged) => staged,
+        };
     // Cut 9c: the hook sees the temporary and its identity before the final heartbeat and guard. Its error is returned
     // as is, after the temporary is discarded like any other pre-rename failure.
     let intent = PublishIntent { temp: staged.temp.clone(), identity: staged.identity };
@@ -711,11 +746,12 @@ pub fn copy_file_guarded<F: DestinationRoot>(
 
 /// The final heartbeat, guard and publishing rename for a `Staged` temporary, with the exact error handling the single
 /// copy always had: a heartbeat failure discards the temporary, a lost guard keeps it as the leftover, and a failed
-/// rename discards it.
+/// rename discards it. `staged.writer` is `None` on every live path (the flush closes it after the barrier, before this
+/// runs); a `Some` is dropped defensively, first.
 pub(crate) fn publish_staged<D: DirHandle>(
     parent: &D,
     name: &OsStr,
-    staged: Staged,
+    staged: Staged<D::Writer>,
     publish: Publish,
     guard: &Guard<'_>,
     beat: &Heartbeat<'_>,
@@ -726,7 +762,10 @@ pub(crate) fn publish_staged<D: DirHandle>(
         bytes_copied,
         metadata_failures,
         identity_degraded,
+        writer,
     } = staged;
+    // Cut 9e: a file published at the barrier was synced there; either way no descriptor is held across the rename.
+    drop(writer);
     // §99 (`S99_check`, then the `S99_write` below): publish only while the lock is still this run's. Otherwise the
     // temporary stays - removing it would be a mutation too - and is reported as the leftover.
     if let Err(e) = beat() {
@@ -763,11 +802,138 @@ pub(crate) fn publish_staged<D: DirHandle>(
     })
 }
 
+/// Cut 9e: the next wake on the barrier's absolute grid (anchored at the barrier's start, stepped by `beat_every`):
+/// the first grid point strictly after `now`. Advancing on the grid, never from `now`, is what keeps a stream of
+/// results from resetting the timer; stepping until the point is past `now` is what keeps a stalled main thread from
+/// timing out once per missed step on resume.
+fn next_wake(mut deadline: Instant, now: Instant, beat_every: Duration) -> Instant {
+    while deadline <= now {
+        deadline += beat_every;
+    }
+    deadline
+}
+
+/// What the cut 9e barrier found: one result per writer, in input order, and the heartbeat failure if one ended the wait.
+pub(crate) struct SyncOutcome {
+    pub results: Vec<Result<(), FsError>>,
+    pub heartbeat: Option<FsError>,
+    /// Worker threads that actually ran: 0 on the main-thread path (chosen by `n == 1`, by `threads == 0`, or by the
+    /// spawn fallback). Read by the tests only; `flush_batch` ignores it.
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub workers: usize,
+}
+
+/// Cut 9e: the data `fsync` of every pending writer, `threads` at a time (at most one worker per writer). The calling
+/// thread does not sync; it keeps the lock's heartbeat alive, calling `beat` whenever a further `beat_every` has passed
+/// IN TOTAL since the start (an absolute deadline on the grid `start + k * beat_every`, never a fresh interval per
+/// received result). After a beat the deadline advances along that same grid to the first point after now, so a stalled
+/// calling thread beats once, not once per missed interval.
+///
+/// A single writer (`n == 1`) always syncs on the calling thread, whatever `threads` is: a worker would cost a thread
+/// spawn and a channel for nothing, and the measurement found that cost 1.6 ms per single-entry batch (one-file-per-
+/// directory trees ran 15% slower than cut 9d). `beat` between syncs is moot for one.
+///
+/// `threads == 0` means no workers: the syncs run on the calling thread (the main-thread path). 0 is the test seam for
+/// that path; `BatchPolicy` never passes 0 (`DEFAULT` is 16, the tests use 1 or 16).
+/// `beat` is `dyn Fn` without `Send`, so it is only ever called here, never from a worker. After one heartbeat failure
+/// no further `beat` is made, but the wait continues until every worker has finished and been joined: every writer
+/// still gets its result, and the failure is reported once in `heartbeat`. A worker panic propagates out of the scope.
+/// A worker the OS refuses to spawn (thread limits) is skipped, never a panic: the workers that did start share the
+/// index counter and so all the work; with none started, the syncs run on the calling thread in index order and `beat`
+/// is called between them whenever the deadline has passed (the same deadline rule and single-failure rule).
+pub(crate) fn sync_staged_many<W: FileHandle + Sync>(
+    writers: &[&W],
+    threads: usize,
+    beat: &Heartbeat<'_>,
+    beat_every: Duration,
+) -> SyncOutcome {
+    let n = writers.len();
+    if n == 0 {
+        return SyncOutcome { results: Vec::new(), heartbeat: None, workers: 0 };
+    }
+    let workers = if n == 1 { 0 } else { threads.min(n) };
+    let next = AtomicUsize::new(0);
+    let mut slots: Vec<Option<Result<(), FsError>>> = Vec::new();
+    slots.resize_with(n, || None);
+    let mut heartbeat = None;
+    let mut ran = 0;
+    std::thread::scope(|scope| {
+        let (tx, rx) = mpsc::channel::<(usize, Result<(), FsError>)>();
+        let mut spawned = 0;
+        for _ in 0..workers {
+            let tx = tx.clone();
+            let next = &next;
+            let worker = move || {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= n {
+                        break;
+                    }
+                    // A closed receiver cannot happen before every index is received; ignore it rather than panic.
+                    let _ = tx.send((i, writers[i].sync_all()));
+                }
+            };
+            // `Scope::spawn` panics when the OS refuses a thread, and the binary aborts on panic: use the fallible form.
+            if std::thread::Builder::new().spawn_scoped(scope, worker).is_err() {
+                break;
+            }
+            spawned += 1;
+        }
+        drop(tx);
+        let mut beat_if_due = |deadline: &mut Instant| {
+            if heartbeat.is_none()
+                && let Err(e) = beat()
+            {
+                heartbeat = Some(e);
+            }
+            *deadline = next_wake(*deadline, Instant::now(), beat_every);
+        };
+        let mut deadline = Instant::now() + beat_every;
+        if spawned == 0 {
+            // No worker (`threads == 0`, or none could be spawned): sync on this thread in index order, beating once the deadline has passed.
+            for (i, w) in writers.iter().enumerate() {
+                slots[i] = Some(w.sync_all());
+                if Instant::now() >= deadline {
+                    beat_if_due(&mut deadline);
+                }
+            }
+            return;
+        }
+        ran = spawned;
+        let mut received = 0;
+        while received < n {
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok((i, r)) => {
+                    slots[i] = Some(r);
+                    received += 1;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => beat_if_due(&mut deadline),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
+    let results = slots.into_iter().map(|s| s.expect("every index is sent exactly once")).collect();
+    SyncOutcome { results, heartbeat, workers: ran }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fault_fs::FaultFs;
     use flux_fs::{Durability, FileSystem, OperationId, Preserve, Publish};
+
+    #[test]
+    fn the_next_wake_is_the_first_grid_point_after_now() {
+        let start = Instant::now();
+        let step = Duration::from_millis(10);
+        // Not yet due: unchanged.
+        assert_eq!(next_wake(start + step, start, step), start + step);
+        // Exactly due: one step on.
+        assert_eq!(next_wake(start + step, start + step, step), start + 2 * step);
+        // Five steps behind (a stalled main thread): the first point after now, not now + step and not deadline + step.
+        let now = start + Duration::from_millis(57);
+        assert_eq!(next_wake(start + step, now, step), start + 6 * step);
+    }
 
     fn opts() -> CopyOptions {
         CopyOptions {
@@ -781,16 +947,30 @@ mod tests {
         }
     }
 
-    fn stage_hello(fs: &FaultFs, root: &<FaultFs as DestinationRoot>::Dir) -> Staged {
+    fn stage_hello(
+        fs: &FaultFs,
+        root: &<FaultFs as DestinationRoot>::Dir,
+        sync: SyncAt,
+    ) -> Staged<<FaultFs as FileSystem>::Writer> {
+        stage_with(fs, root, &opts(), sync)
+    }
+
+    fn stage_with(
+        fs: &FaultFs,
+        root: &<FaultFs as DestinationRoot>::Dir,
+        opts: &CopyOptions,
+        sync: SyncAt,
+    ) -> Staged<<FaultFs as FileSystem>::Writer> {
         match stage_file(
             fs,
             Path::new("/src"),
             root,
             OsStr::new("dst"),
-            &opts(),
+            opts,
             &unguarded,
             &no_heartbeat,
             &no_before_create,
+            sync,
         ) {
             Ok(Stage::Staged(s)) => s,
             Ok(Stage::Skipped(_)) => panic!("unexpectedly skipped"),
@@ -799,11 +979,227 @@ mod tests {
     }
 
     #[test]
+    fn staging_at_the_barrier_keeps_the_writer_open_and_does_not_sync() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        let root = fs.destination_root(Path::new("/")).unwrap();
+        let mut o = opts();
+        o.durability = Durability::Strict; // under `Normal` nothing syncs whatever `sync` is, so the assertion would be vacuous
+        let staged = stage_with(&fs, &root, &o, SyncAt::Barrier);
+        assert!(staged.writer.is_some());
+        assert!(!fs.called("sync_all("), "{:?}", fs.calls());
+        assert_eq!(fs.read_file("/dst.flux-partial.op1").as_deref(), Some(&b"hello"[..]));
+    }
+
+    #[test]
+    fn staging_inline_syncs_once_after_the_metadata_step_and_returns_no_writer() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        let root = fs.destination_root(Path::new("/")).unwrap();
+        let mut o = opts(); // `opts()` already sets `preserve_times: Preserve::Default`, so `set_times` is called
+        o.durability = Durability::Strict;
+        let staged = stage_with(&fs, &root, &o, SyncAt::Staging);
+        assert!(staged.writer.is_none());
+        let c = fs.calls();
+        let sync = c.iter().position(|x| x.starts_with("sync_all(")).expect("synced");
+        let times = c.iter().position(|x| x.starts_with("set_times(")).expect("times set");
+        assert!(times < sync, "metadata before the sync: {c:?}");
+        assert_eq!(c.iter().filter(|x| x.starts_with("sync_all(")).count(), 1);
+    }
+
+    use crate::fault_fs::FakeHandle;
+    use std::cell::Cell;
+    use std::thread::ThreadId;
+    use std::time::Duration;
+
+    fn handles(fs: &FaultFs, n: usize) -> Vec<FakeHandle> {
+        (0..n).map(|i| fs.create_new(Path::new(&format!("/t{i}"))).unwrap()).collect()
+    }
+
+    /// A heartbeat that counts its calls and remembers the thread of the last one.
+    type Calls = std::rc::Rc<Cell<u32>>;
+    type Thread = std::rc::Rc<Cell<Option<ThreadId>>>;
+
+    fn counting_beat() -> (impl Fn() -> flux_fs::Result<()>, Calls, Thread) {
+        let count = std::rc::Rc::new(Cell::new(0u32));
+        let thread = std::rc::Rc::new(Cell::new(None));
+        let (c, t) = (std::rc::Rc::clone(&count), std::rc::Rc::clone(&thread));
+        let beat = move || {
+            c.set(c.get() + 1);
+            t.set(Some(std::thread::current().id()));
+            Ok(())
+        };
+        (beat, count, thread)
+    }
+
+    #[test]
+    fn barrier_results_are_positional_and_every_writer_is_synced_once() {
+        let fs = FaultFs::new();
+        let ws = handles(&fs, 5);
+        let refs: Vec<&FakeHandle> = ws.iter().collect();
+        let out = sync_staged_many(&refs, 16, &no_heartbeat, Duration::from_secs(5));
+        assert_eq!(out.results.len(), 5);
+        assert!(out.results.iter().all(Result::is_ok) && out.heartbeat.is_none());
+        assert_eq!(fs.calls().iter().filter(|c| c.starts_with("sync_all(")).count(), 5);
+    }
+
+    #[test]
+    fn a_single_writer_syncs_on_the_main_thread_without_a_worker() {
+        // Mutant: remove the `n == 1` branch -> one worker is spawned -> `workers == 1`.
+        let fs = FaultFs::new();
+        let ws = handles(&fs, 1);
+        let refs: Vec<&FakeHandle> = ws.iter().collect();
+        let out = sync_staged_many(&refs, 16, &no_heartbeat, Duration::from_secs(5));
+        assert_eq!(out.workers, 0);
+        assert_eq!(out.results.len(), 1);
+        assert!(out.results[0].is_ok() && out.heartbeat.is_none());
+        assert_eq!(fs.calls().iter().filter(|c| c.starts_with("sync_all(")).count(), 1);
+    }
+
+    #[test]
+    fn two_writers_still_use_workers() {
+        // Guards the mutant that routes everything to the main thread.
+        let fs = FaultFs::new();
+        let ws = handles(&fs, 2);
+        let refs: Vec<&FakeHandle> = ws.iter().collect();
+        let out = sync_staged_many(&refs, 16, &no_heartbeat, Duration::from_secs(5));
+        assert!(out.workers >= 1);
+        assert!(out.results.iter().all(Result::is_ok));
+        assert_eq!(out.results.len(), 2);
+    }
+
+    #[test]
+    fn a_faulted_writer_fails_at_its_own_index_only() {
+        let fs = FaultFs::new();
+        fs.on_nth("create_new", 3, |fs| fs.fail("sync_all", Code::StrictDurabilityUnavailable));
+        let ws = handles(&fs, 4);
+        let refs: Vec<&FakeHandle> = ws.iter().collect();
+        let out = sync_staged_many(&refs, 2, &no_heartbeat, Duration::from_secs(5));
+        let failed: Vec<usize> =
+            out.results.iter().enumerate().filter(|(_, r)| r.is_err()).map(|(i, _)| i).collect();
+        assert_eq!(failed, [2]);
+        assert_eq!(out.results[2].as_ref().unwrap_err().code, Code::StrictDurabilityUnavailable);
+    }
+
+    #[test]
+    fn one_thread_syncs_in_order() {
+        let fs = FaultFs::new();
+        let ws = handles(&fs, 3);
+        let refs: Vec<&FakeHandle> = ws.iter().collect();
+        sync_staged_many(&refs, 1, &no_heartbeat, Duration::from_secs(5));
+        let synced: Vec<String> =
+            fs.calls().into_iter().filter(|c| c.starts_with("sync_all(")).collect();
+        assert_eq!(synced, ["sync_all(/t0)", "sync_all(/t1)", "sync_all(/t2)"]);
+    }
+
+    #[test]
+    fn the_heartbeat_is_called_from_the_main_thread_once_the_interval_has_passed_in_total() {
+        // 5 syncs x 20 ms = 100 ms, one worker; a 25 ms deadline must fire at least once. A fresh full timeout per
+        // receive (the mutant) would never reach 25 ms, because a result lands every 20 ms.
+        let fs = FaultFs::new();
+        fs.delay("sync_all", Duration::from_millis(20));
+        let ws = handles(&fs, 5);
+        let refs: Vec<&FakeHandle> = ws.iter().collect();
+        let (beat, count, thread) = counting_beat();
+        let out = sync_staged_many(&refs, 1, &beat, Duration::from_millis(25));
+        assert!(out.heartbeat.is_none());
+        assert!(count.get() >= 1, "no heartbeat during a 100 ms barrier");
+        assert_eq!(thread.get(), Some(std::thread::current().id()));
+    }
+
+    #[test]
+    fn sixteen_threads_sync_concurrently() {
+        // Deterministic: every sync waits for a second one to be in flight (or 2 s). With real workers the two meet at
+        // once and the peak is >= 2; under the mutant "ignore `threads`, one worker" each sync waits out the 2 s alone and
+        // the peak stays 1 (red, and slow: a mutant run, not CI). No sleep, no scheduler race.
+        let fs = FaultFs::new();
+        fs.rendezvous("sync_all", 2, Duration::from_secs(2));
+        let ws = handles(&fs, 8);
+        let refs: Vec<&FakeHandle> = ws.iter().collect();
+        let started = std::time::Instant::now();
+        sync_staged_many(&refs, 16, &no_heartbeat, Duration::from_secs(5));
+        assert!(fs.peak_concurrent_syncs() >= 2, "{}", fs.peak_concurrent_syncs());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the syncs met; nobody waited out the timeout"
+        );
+    }
+
+    #[test]
+    fn a_failed_heartbeat_ends_the_wait_after_the_join_and_is_reported_once() {
+        let fs = FaultFs::new();
+        fs.delay("sync_all", Duration::from_millis(20));
+        let ws = handles(&fs, 4);
+        let refs: Vec<&FakeHandle> = ws.iter().collect();
+        let calls = Cell::new(0u32);
+        let beat = || {
+            calls.set(calls.get() + 1);
+            Err(FsError::new(Code::IoError, std::io::Error::other("torn")))
+        };
+        let out = sync_staged_many(&refs, 1, &beat, Duration::from_millis(10));
+        assert_eq!(out.heartbeat.as_ref().map(|e| e.code), Some(Code::IoError));
+        assert_eq!(calls.get(), 1, "no second heartbeat call after a failure");
+        assert_eq!(
+            out.results.len(),
+            4,
+            "every writer still has a result: the workers were joined"
+        );
+        assert_eq!(fs.calls().iter().filter(|c| c.starts_with("sync_all(")).count(), 4);
+    }
+
+    #[test]
+    fn zero_threads_syncs_on_the_main_thread_in_order_and_beats_between_syncs() {
+        // 4 x 20 ms syncs on the main thread with a 10 ms deadline: at least one beat lands between syncs, from the main
+        // thread, results are positional and the order is t0..t3. Mutant: remove the beat check from the fallback -> count 0.
+        let fs = FaultFs::new();
+        fs.delay("sync_all", Duration::from_millis(20));
+        let ws = handles(&fs, 4);
+        let refs: Vec<&FakeHandle> = ws.iter().collect();
+        let (beat, count, thread) = counting_beat();
+        let out = sync_staged_many(&refs, 0, &beat, Duration::from_millis(10));
+        assert_eq!(out.workers, 0);
+        assert_eq!(out.results.len(), 4);
+        assert!(out.results.iter().all(Result::is_ok) && out.heartbeat.is_none());
+        assert!(count.get() >= 1, "no heartbeat between main-thread syncs");
+        assert_eq!(thread.get(), Some(std::thread::current().id()));
+        let synced: Vec<String> =
+            fs.calls().into_iter().filter(|c| c.starts_with("sync_all(")).collect();
+        assert_eq!(synced, ["sync_all(/t0)", "sync_all(/t1)", "sync_all(/t2)", "sync_all(/t3)"]);
+    }
+
+    #[test]
+    fn zero_threads_reports_a_failed_sync_at_its_index_and_a_failed_heartbeat_once() {
+        let fs = FaultFs::new();
+        fs.delay("sync_all", Duration::from_millis(20));
+        fs.on_nth("create_new", 2, |fs| fs.fail("sync_all", Code::StrictDurabilityUnavailable));
+        let ws = handles(&fs, 3);
+        let refs: Vec<&FakeHandle> = ws.iter().collect();
+        let calls = Cell::new(0u32);
+        let beat = || {
+            calls.set(calls.get() + 1);
+            Err(FsError::new(Code::IoError, std::io::Error::other("torn")))
+        };
+        let out = sync_staged_many(&refs, 0, &beat, Duration::from_millis(10));
+        assert_eq!(out.workers, 0);
+        assert_eq!(
+            out.results.iter().map(Result::is_err).collect::<Vec<_>>(),
+            [false, true, false]
+        );
+        assert_eq!(out.heartbeat.as_ref().map(|e| e.code), Some(Code::IoError));
+        assert_eq!(calls.get(), 1, "no second heartbeat call after a failure");
+        assert_eq!(
+            fs.calls().iter().filter(|c| c.starts_with("sync_all(")).count(),
+            3,
+            "every writer still synced"
+        );
+    }
+
+    #[test]
     fn stage_file_leaves_a_closed_temporary_and_no_target() {
         let fs = FaultFs::new();
         fs.write_file("/src", b"hello");
         let root = fs.destination_root(Path::new("/")).unwrap();
-        let staged = stage_hello(&fs, &root);
+        let staged = stage_hello(&fs, &root, SyncAt::Staging);
 
         assert_eq!(staged.bytes_copied, 5);
         assert_eq!(staged.temp, OsString::from("dst.flux-partial.op1"));
@@ -822,7 +1218,7 @@ mod tests {
         let fs = FaultFs::new();
         fs.write_file("/src", b"hello");
         let root = fs.destination_root(Path::new("/")).unwrap();
-        let staged = stage_hello(&fs, &root);
+        let staged = stage_hello(&fs, &root, SyncAt::Staging);
         let identity = staged.identity;
         let out = publish_staged(
             &root,
@@ -847,7 +1243,7 @@ mod tests {
         let fs = FaultFs::new();
         fs.write_file("/src", b"hello");
         let root = fs.destination_root(Path::new("/")).unwrap();
-        let staged = stage_hello(&fs, &root);
+        let staged = stage_hello(&fs, &root, SyncAt::Staging);
         let e = publish_staged(
             &root,
             OsStr::new("dst"),

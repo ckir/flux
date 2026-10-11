@@ -122,7 +122,7 @@ pub trait FileSystem: Send + Sync {
     type Reader: Read;
 
     /// A handle open for writing, used for the temporary.
-    type Writer: FileHandle;
+    type Writer: FileHandle + Sync;
 
     fn open_read(&self, path: &Path) -> Result<Self::Reader>;
 
@@ -224,7 +224,7 @@ pub trait FileSystem: Send + Sync {
 /// Where the error KIND is stated below, both existing implementations were
 /// measured to agree on it, and a third should too: the engine branches on it.
 pub trait DirHandle: Sized {
-    type Writer: FileHandle;
+    type Writer: FileHandle + Sync;
 
     /// A lock file held open for reading and writing (§96.1). See `crate::LockFile`.
     type Lock: crate::LockFile;

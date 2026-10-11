@@ -31,6 +31,7 @@ fn run_cfg() -> RunConfig {
         before_mutation: None,
         heartbeat_interval: std::time::Duration::from_secs(3600),
         resume: false,
+        descriptor_limit: None,
     }
 }
 

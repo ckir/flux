@@ -64,6 +64,9 @@ pub struct RunConfig {
     pub heartbeat_interval: std::time::Duration,
     /// `--resume`: continue the one resumable prior operation as itself.
     pub resume: bool,
+    /// Cut 9e: the process's soft descriptor limit (`flux_platform::soft_descriptor_limit()`), which caps the writers a
+    /// batched tree holds open; `None` when unknown (Windows) or in a test that does not care.
+    pub descriptor_limit: Option<u64>,
 }
 
 /// §101's heartbeat interval: 5 s.
@@ -80,6 +83,7 @@ impl std::fmt::Debug for RunConfig {
             .field("before_mutation", &self.before_mutation.is_some())
             .field("heartbeat_interval", &self.heartbeat_interval)
             .field("resume", &self.resume)
+            .field("descriptor_limit", &self.descriptor_limit)
             .finish()
     }
 }
@@ -95,6 +99,9 @@ pub struct Run<T> {
     /// Cut 9a: set once the run adopted or started under `--resume`; `None` without the flag or when the run stopped
     /// before step 5.
     pub resumed: Option<ResumeNote>,
+    /// Cut 9e: the longest gap between two heartbeat writes of the lock record (known limit 6); `Duration::ZERO` when
+    /// the run never held the lock.
+    pub beat_gap_max: std::time::Duration,
 }
 
 /// What `--resume` did (cut 9a).
@@ -190,7 +197,13 @@ pub fn tree<F: DestinationRoot>(
     cfg: &RunConfig,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> Run<Result<TreeOutcome, TreeAbort>> {
-    let mut run = Run { copy: None, stop: None, warnings: Vec::new(), resumed: None };
+    let mut run = Run {
+        copy: None,
+        stop: None,
+        warnings: Vec::new(),
+        resumed: None,
+        beat_gap_max: std::time::Duration::ZERO,
+    };
     let opts =
         CopyOptions { operation_id: OperationId::new(cfg.operation_id.as_str()), ..opts.clone() };
     let mut out = TreeOutcome::default();
@@ -261,6 +274,7 @@ pub fn tree<F: DestinationRoot>(
         }
     };
     run.resumed = locked.resumed.clone();
+    run.beat_gap_max = locked.pulse.gap_max();
     // Cut 9a: under `--resume` the effective id is the prior's; the partials are named by it.
     let opts = CopyOptions { operation_id: OperationId::new(&locked.state.operation_id), ..opts };
     // Step 6: the copy, with §99 before every destination mutation.
@@ -284,7 +298,7 @@ pub fn tree<F: DestinationRoot>(
             beat: &beat,
             claims: claims.as_ref(),
             resume: cfg.resume,
-            batch: batch_policy(),
+            batch: batch_policy(cfg),
         };
         let root = place.dest.take().expect("step 5 made DEST");
         let mut report = |f: TreeFailure| {
@@ -345,6 +359,8 @@ pub fn tree<F: DestinationRoot>(
         }
     }
     drop(claims);
+    // Cut 9e: the barrier's beats happen during the walk, so the value taken at the lock is stale by now.
+    run.beat_gap_max = locked.pulse.gap_max();
     run.stop = finish(&mut place, locked, ended, &mut run.warnings);
     // E1: a DEST this run made counts among the directories it created, unless a rollback removed it again.
     if place.created_dest {
@@ -365,7 +381,13 @@ pub fn file<F: DestinationRoot>(
     opts: &CopyOptions,
     cfg: &RunConfig,
 ) -> Run<Result<Outcome, CopyError>> {
-    let mut run = Run { copy: None, stop: None, warnings: Vec::new(), resumed: None };
+    let mut run = Run {
+        copy: None,
+        stop: None,
+        warnings: Vec::new(),
+        resumed: None,
+        beat_gap_max: std::time::Duration::ZERO,
+    };
     let opts =
         CopyOptions { operation_id: OperationId::new(cfg.operation_id.as_str()), ..opts.clone() };
     // B1.
@@ -487,24 +509,43 @@ enum Ended {
     Failed,
 }
 
-/// Cut 9d: the batch policy of a tree run, `BatchPolicy::DEFAULT`. In a debug build, `FLUX_TEST_BATCH_AGE_MS=<n>`
+/// Cut 9e: how often the sync barrier's waiting thread wakes to beat: half the heartbeat interval, because
+/// `Pulse::beat` writes only once a full interval has passed since its last write, so a wake every full interval would
+/// write only every other time. Clamped to 1 ms so a zero interval cannot make the wait a busy loop.
+fn barrier_beat_every(cfg: &RunConfig) -> std::time::Duration {
+    (cfg.heartbeat_interval / 2).max(std::time::Duration::from_millis(1))
+}
+
+/// Cut 9d: the batch policy of a tree run, `BatchPolicy::DEFAULT` with cut 9e's `beat_every` from the run's heartbeat
+/// interval (`barrier_beat_every`). In a debug build, `FLUX_TEST_BATCH_AGE_MS=<n>`
 /// replaces its age (absent or unparsable: the default's), because the end-to-end stall tests count guard calls to
 /// pick a stall index, and an age flush on the real clock (a slow runner staging a batch for over a second) adds guard
-/// calls and shifts every index. A release build has no override.
+/// calls and shifts every index. Likewise `FLUX_TEST_OPEN_WRITERS=<n>` replaces `open_writers` (cut 9e: the cap derives
+/// from the host's descriptor limit, and a small one would flush early and shift the same indices). 0 is floored to 1, the
+/// same floor as `open_writers_cap`.
 #[cfg(debug_assertions)]
-fn batch_policy() -> crate::tree::BatchPolicy {
+fn batch_policy(cfg: &RunConfig) -> crate::tree::BatchPolicy {
     let default = crate::tree::BatchPolicy::DEFAULT;
     let age = std::env::var("FLUX_TEST_BATCH_AGE_MS")
         .ok()
         .and_then(|v| v.parse().ok())
         .map(std::time::Duration::from_millis)
         .unwrap_or(default.age);
-    crate::tree::BatchPolicy { age, ..default }
+    let open_writers = std::env::var("FLUX_TEST_OPEN_WRITERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.max(1))
+        .unwrap_or_else(|| crate::tree::open_writers_cap(cfg.descriptor_limit));
+    crate::tree::BatchPolicy { age, beat_every: barrier_beat_every(cfg), open_writers, ..default }
 }
 
 #[cfg(not(debug_assertions))]
-fn batch_policy() -> crate::tree::BatchPolicy {
-    crate::tree::BatchPolicy::DEFAULT
+fn batch_policy(cfg: &RunConfig) -> crate::tree::BatchPolicy {
+    crate::tree::BatchPolicy {
+        beat_every: barrier_beat_every(cfg),
+        open_writers: crate::tree::open_writers_cap(cfg.descriptor_limit),
+        ..crate::tree::BatchPolicy::DEFAULT
+    }
 }
 
 /// Step 7, "Finish".

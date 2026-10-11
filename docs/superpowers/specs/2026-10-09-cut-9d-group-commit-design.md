@@ -2,7 +2,7 @@
 
 Status: APPROVED by the owner 2026-10-10 (panel GREEN at d7015fa); implemented on branch `spec/cut-9d` per docs/superpowers/plans/2026-10-10-cut-9d-group-commit.md. Scope picked by the owner on 2026-10-09 after an
 AGY-FIRST consult and one AGY-NEGOTIATE round (briefs `.clavity/seams/cut9d-scope.md`, `cut9d-scope-neg1.md`; replies under
-`.clavity/scratch/cut9d-scope/`): **9d is group commit; chunk checkpoints, partial-file resume and `--resume-verify` become cut 9e.** The slicing
+`.clavity/scratch/cut9d-scope/`): **9d is group commit; chunk checkpoints, partial-file resume and `--resume-verify` become cut 9f.** The slicing
 table of the cut 9a spec (9d = chunk checkpoints) is superseded by this ordering. Parent spec: `FLUX_FULL_UPDATED_SPEC_V16.md` (sections 148,
 163, 164, 171, 180-183). Builds on cut 9c (`docs/superpowers/specs/2026-10-09-cut-9c-commit-recovery-design.md`).
 
@@ -189,7 +189,7 @@ Decisions the spec left open, made in `docs/superpowers/plans/2026-10-10-cut-9d-
 
 ## Out of scope
 
-Chunk checkpoints, partial-file resume, `--resume-verify`, snapshots, compaction, rotation and any WAL file (cut 9e, whose own design decides WAL
+Chunk checkpoints, partial-file resume, `--resume-verify`, snapshots, compaction, rotation and any WAL file (cut 9f, whose own design decides WAL
 file versus redb rows); single-file notes; batching the data syncs; a CLI flag for the batch size.
 
 ## Stand-downs

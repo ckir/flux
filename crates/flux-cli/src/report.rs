@@ -850,7 +850,13 @@ mod tests {
     #[test]
     fn resume_lines_name_the_operation_and_the_counts() {
         use flux_core::run::ResumeNote;
-        let with = |resumed| Run::<()> { copy: None, stop: None, warnings: Vec::new(), resumed };
+        let with = |resumed| Run::<()> {
+            copy: None,
+            stop: None,
+            warnings: Vec::new(),
+            resumed,
+            beat_gap_max: std::time::Duration::ZERO,
+        };
         assert_eq!(
             resume_lines(&with(Some(ResumeNote::StartedNew)), 0),
             vec!["no prior operation; starting new".to_string()]
@@ -919,6 +925,7 @@ mod tests {
             stop: Some(refused()),
             warnings: vec![kept(), kept()],
             resumed: None,
+            beat_gap_max: std::time::Duration::ZERO,
         };
         let lines = run_lines(&run);
         assert_eq!(lines.len(), 3, "{lines:?}");
@@ -927,13 +934,25 @@ mod tests {
             lines[1..].iter().all(|l| l.starts_with("warning: ") && l.contains("kept-state")),
             "{lines:?}"
         );
-        let quiet: Run<()> = Run { copy: None, stop: None, warnings: vec![kept()], resumed: None };
+        let quiet: Run<()> = Run {
+            copy: None,
+            stop: None,
+            warnings: vec![kept()],
+            resumed: None,
+            beat_gap_max: std::time::Duration::ZERO,
+        };
         assert_eq!(run_lines(&quiet).len(), 1, "warnings print without a stop too");
     }
 
     #[test]
     fn a_tree_runs_report_counts_a_stop_as_one_more_error() {
-        let run = |copy, stop| Run { copy, stop, warnings: Vec::new(), resumed: None };
+        let run = |copy, stop| Run {
+            copy,
+            stop,
+            warnings: Vec::new(),
+            resumed: None,
+            beat_gap_max: std::time::Duration::ZERO,
+        };
         let clean = Report::tree_run(&run(Some(Ok(TreeOutcome::default())), None), 1);
         assert_eq!(clean.errors, 0);
         let stopped = Report::tree_run(&run(Some(Ok(TreeOutcome::default())), Some(refused())), 1);
@@ -959,7 +978,13 @@ mod tests {
 
     #[test]
     fn a_file_runs_report_counts_a_stop_as_one_more_error() {
-        let run = |copy, stop| Run { copy, stop, warnings: Vec::new(), resumed: None };
+        let run = |copy, stop| Run {
+            copy,
+            stop,
+            warnings: Vec::new(),
+            resumed: None,
+            beat_gap_max: std::time::Duration::ZERO,
+        };
         let copied = || {
             Ok(Outcome {
                 bytes_copied: 1,

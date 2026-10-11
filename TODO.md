@@ -544,13 +544,47 @@ the spec's numbers, 9-10 were learned during execution).
   near full and the age trigger is not the limit). The remaining time is the one data `fsync` per file (about 70% of syscall time under
   `perf trace`, about 6 ms each): batching removed the cheaper claim `fdatasync` calls. Going further needs a batched or overlapped data sync
   (`syncfs` per batch, parallel fsync), which changes what "durable before publish" means: its own design and cut.
-- [ ] Hardening: a lost lock noticed only inside a cleanup `discard` (heartbeat-stop cleanup, per-entry `prepare` fallback) does not stop the flush,
+- [ ] Hardening: a lost lock noticed only inside a cleanup `discard` (heartbeat-stop cleanup, per-entry `prepare` fallback, and cut 9e's failed-sync discard in `flush_batch`) does not stop the flush,
   so store writes can still happen before the next guard (recovery handles every resulting state; spec decision 8's "writes nothing" holds for the
   guard-detected loss). (The `prepare_many` fallback's stop, a store error carrying `TargetLockBusy`, no longer drops the remaining entries: each is
   reported with its temporary kept, `a_stop_in_the_per_entry_prepare_fallback_reports_every_other_entry`.)
 - [ ] Tests not written: a lost lock inside `copy_one` with pending entries in two frames (the `DirEnd` form, a lost lock at a child's `DirEnd`
   flush, is covered by `an_abort_drains_every_frame`; the `copy_one` form is not); the `discard_prepared` fallback after a failed rename when
   `apply_recovery` also fails; the É/é non-ASCII fold on a real folding filesystem (the fake folds ASCII only; reasoned, not measured).
+
+## Cut 9e known limits
+
+1. First threads in the engine. The shipped binary builds with `panic = "abort"` (`Cargo.toml:111`), so a worker panic is a hard crash, not a
+   reported failure; it is safe for the recovery matrix (no note exists yet, the sweep removes the temps) but is not a handled error. In
+   unwinding test builds the panic propagates out of the scope and fails the test. No catch-and-report path is built.
+2. The barrier lengthens the window between the temps' creation and the notes by up to the slowest sync; the post-barrier guard bounds the lock
+   risk, not the source-change window (9d known limit 5 still applies).
+3. A shallow pending batch still waits while a subtree is walked (9d limit 5), now holding descriptors; the cap in decision 7 bounds that.
+4. The gain is measured on Linux ext4 only.
+5. One file per directory gets no benefit (9d limit 1).
+6. The heartbeat is itself a synced write (`lock/held.rs:48`), so on a filesystem where a burst of concurrent `fsync` calls holds the journal, the
+   heartbeat can queue behind the barrier and arrive late. Today's per-file `fsync` has the same exposure at a smaller scale. Not measured here:
+   the acceptance run records the longest barrier and the longest heartbeat gap, and reports them.
+7. A `sync_all` that hangs (a dead network mount) hangs the run exactly as today's inline sync does: the system call is not cancellable. The
+   main thread keeps the heartbeat going during the wait, so the lease stays alive; no timeout or cancel is built, and none is claimed.
+
+## Cut 9e debt
+
+- [ ] 9e-2: a Linux `syncfs(2)` on the destination filesystem at the barrier (measured 93-94% faster in the spike) ships only if (a) a capability
+  probe not depending on the kernel version string shows the kernel reports writeback errors from `syncfs` (5.8 and later), and (b) `syncfs` is
+  measured under a heavy (tens of GiB) background writer; otherwise it is dropped and recorded here. See the 9e spec, decision 9.
+- [x] The drain after a lost-lock or heartbeat-failure stop ran the data-sync barrier (and, after a heartbeat failure, published): fixed by owner ruling B2' (9e spec decision 10).
+- [ ] The acceptance measurement's figures (the longest barrier, the longest heartbeat gap, cap flushes; Strict small/flat ratios against the 9d head)
+  are filled in by Task 7 of the 9e plan.
+- [ ] `FaultFs::on_nth` keeps one hook per call name (`hooks.insert` replaces, `crates/flux-core/src/fault_fs.rs`); a second `on_nth` on the same name
+  silently wins. Document or key by (name, nth).
+
+- [ ] A cross-platform real-filesystem Strict test copying a READ-ONLY source with an mtime check: the inline sync now runs after
+  `set_permissions`/`set_times`, and no CI test exercises `FlushFileBuffers`/`F_FULLFSYNC` after a handle-level read-only attribute.
+- [ ] Error precedence in the non-batched Strict path: when both the `Preserve::Strict` metadata step and the sync fail, `MetadataApplyFailed`
+  is now reported instead of `StrictDurabilityUnavailable` (a consequence of the sync moving after the metadata step).
+- [ ] The end-to-end stall oracles pin `FLUX_TEST_BATCH_AGE_MS` and `FLUX_TEST_OPEN_WRITERS` so no age or cap flush moves a guard index; a clock injectable from the CLI (the tree already takes `BatchPolicy.now`) would let an end-to-end test exercise an age flush deterministically instead of blinding the oracles to it (capstone round 3 recommendation).
+- [ ] Test-audit debt (cut 9e, 2026-10-11): the suite pins the drain's stop classes with hand-built two- and three-frame fixtures; a property test over (frame depth x stop class x failure phase) asserting "no temporary neither removed nor reported", "no note for unsynced data" and "no barrier after a stop", and a real-filesystem crash-injection harness (the fake masks OS fsync semantics), would cover the state space the point tests cannot.
 
 ## Scaffolding follow-ups
 
