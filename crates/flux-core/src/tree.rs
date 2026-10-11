@@ -565,6 +565,10 @@ pub(crate) fn copy_tree_at<F: DestinationRoot>(
         // Tested first: a lost lock noticed at a heartbeat step is still a lost lock.
         Err(e) if e.code() == Code::TargetLockBusy => DrainMode::KeepAll(copy_of(&e.cause)),
         Err(e) if e.step == CopyStep::Heartbeat => DrainMode::RemoveAll(copy_of(&e.cause)),
+        // Cut 9d decision 3: a destination without a no-replace primitive stops the operation with the lock held.
+        Err(e) if e.code() == Code::NoReplacePublishUnavailable => {
+            DrainMode::RemoveAll(copy_of(&e.cause))
+        }
         _ => DrainMode::Publish,
     };
     let drained = drain_batches(cx, &mut stack, out, on_report, walked.is_err(), mode);
@@ -1792,8 +1796,9 @@ enum DrainMode {
     /// The walk stopped with a lost lock: nothing is written or removed (spec decision 8); every pending temporary is
     /// kept and reported with this error.
     KeepAll(FsError),
-    /// The walk stopped at a failed heartbeat with the lock held: a failed heartbeat is the copy's failure (cut 7b),
-    /// so every pending temporary is removed (guarded), with no barrier and no note.
+    /// The walk stopped with the lock held and nothing more to publish, by either of two triggers: a failed heartbeat
+    /// (the copy's failure, cut 7b), or a destination without a no-replace primitive (cut 9d decision 3: the operation
+    /// stops instead of failing every file). Every pending temporary is removed (guarded), with no barrier and no note.
     RemoveAll(FsError),
 }
 
@@ -1802,11 +1807,12 @@ enum DrainMode {
 /// earlier frame stopped: such a later stop is dropped (spec decision 8), or reported at its leftover's path when it
 /// carries one (plan ruling 2).
 ///
-/// Cut 9e, owner ruling B2' (2026-10-10): after a lost-lock or heartbeat-failure stop the drain performs that stop's
-/// cleanup only, with no data-sync barrier, no note and no rename. A failed heartbeat is the copy's failure (cut 7b),
-/// so the drain no longer publishes after one. `mode` comes from how the walk ended OR from the first stop the drain
-/// itself hits: a lost lock or failed heartbeat at one frame's flush switches the mode for the frames not yet drained
-/// (capstone round 5).
+/// Cut 9e, owner ruling B2' (2026-10-10): after a lost-lock, heartbeat-failure or missing-publish-primitive stop the
+/// drain performs that stop's cleanup only, with no data-sync barrier, no note and no rename. A failed heartbeat is the
+/// copy's failure (cut 7b), and a missing primitive stops the operation (cut 9d decision 3), so the drain no longer
+/// publishes after either. `mode` comes from how the walk ended OR from the first stop the drain itself hits: a stop
+/// of any of the three classes at one frame's flush switches the mode for ALL the frames not yet drained (capstone
+/// rounds 5 and 6).
 fn drain_batches<F: DestinationRoot>(
     cx: &Shared<'_, F>,
     stack: &mut [Frame<F::Dir>],
@@ -1855,7 +1861,8 @@ fn drain_batches<F: DestinationRoot>(
             // A stop that first appears here switches the mode for the frames not yet drained (owner ruling B2').
             if e.code() == Code::TargetLockBusy {
                 mode = DrainMode::KeepAll(copy_of(&e.cause));
-            } else if e.step == CopyStep::Heartbeat {
+            } else if e.step == CopyStep::Heartbeat || e.code() == Code::NoReplacePublishUnavailable
+            {
                 mode = DrainMode::RemoveAll(copy_of(&e.cause));
             }
             if walk_failed || first.is_some() {
@@ -4158,6 +4165,106 @@ mod tests {
         assert_eq!(fs.prepared_count(), 0);
         assert!(got.is_empty(), "{got:?}");
         assert_eq!((out.files_copied, out.failures.total()), (0, 0));
+    }
+
+    #[test]
+    fn a_missing_publish_primitive_during_the_drain_removes_the_remaining_frames_without_a_barrier()
+    {
+        let fs = two_pending_frames_then_an_ordinary_abort();
+        // `primitive_unavailable` recognises `ErrorKind::Unsupported`. The drain's first flush (m) renames x first.
+        fs.fail_nth("rename_no_replace", 1, Code::IoError, ErrorKind::Unsupported);
+        let calls = std::cell::Cell::new(0);
+        // The walk's ordinary abort: the guard before z's creation (8th call) fails with a code that is no stop.
+        let guard = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 8 {
+                Err(FsError::new(Code::IoError, std::io::Error::other("walk")))
+            } else {
+                Ok(())
+            }
+        };
+        let (r, out, got) =
+            batched_with(&fs, policy(64), Durability::Strict, &guard, &no_heartbeat);
+        let error = r.unwrap_err();
+        // The walk's own ordinary error wins over the drain's stop (spec decision 8); the stop is seen in the log.
+        assert_eq!(error.code(), Code::IoError, "{error:?}");
+        let c = log(&fs);
+        let at = positions(&c, "rename_no_replace(");
+        assert_eq!(at.len(), 1, "only the failed rename ran: {c:?}");
+        let after = &c[at[0] + 1..];
+        assert_eq!(count(after, "sync_all("), 0, "{c:?}");
+        assert_eq!(count(after, "claim_prepare_many("), 0, "{c:?}");
+        assert_eq!(count(after, "rename_"), 0, "{c:?}");
+        for f in ["a", "b", "m/x"] {
+            assert!(!fs.exists(format!("/dst/{f}.flux-partial.op1")), "{f}: {c:?}");
+            assert!(!fs.exists(format!("/dst/{f}")), "{f} was not published: {c:?}");
+        }
+        assert_eq!(fs.prepared_count(), 0);
+        assert_eq!(out.files_copied, 0);
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn a_missing_publish_primitive_in_the_walk_removes_the_pending_frames_without_a_barrier() {
+        let fs = sources(&[("a", b"a"), ("b", b"b"), ("m/x", b"x")]);
+        // m's `DirEnd` flush renames x first, while the root still holds a and b.
+        fs.fail_nth("rename_no_replace", 1, Code::IoError, ErrorKind::Unsupported);
+        let (r, out, got) =
+            batched_with(&fs, policy(64), Durability::Strict, &unguarded, &no_heartbeat);
+        let error = r.unwrap_err();
+        assert_eq!(error.code(), Code::NoReplacePublishUnavailable, "{error:?}");
+        let c = log(&fs);
+        let at = positions(&c, "rename_no_replace(");
+        assert_eq!(at.len(), 1, "only the failed rename ran: {c:?}");
+        let after = &c[at[0] + 1..];
+        assert_eq!(count(after, "sync_all("), 0, "{c:?}");
+        assert_eq!(count(after, "claim_prepare_many("), 0, "{c:?}");
+        assert_eq!(count(after, "rename_"), 0, "{c:?}");
+        for f in ["a", "b", "m/x"] {
+            assert!(!fs.exists(format!("/dst/{f}.flux-partial.op1")), "{f}: {c:?}");
+            assert!(!fs.exists(format!("/dst/{f}")), "{f} was not published: {c:?}");
+        }
+        assert_eq!(fs.prepared_count(), 0);
+        assert_eq!(out.files_copied, 0);
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn a_drain_time_stop_switches_the_mode_for_every_remaining_frame() {
+        let fs = sources(&[("a", b"a"), ("m/c", b"c"), ("m/n/y", b"y"), ("m/n/z/q", b"q")]);
+        let calls = std::cell::Cell::new(0);
+        // a staged (guards 1-2), m's creation (3), c staged (4-5), n's creation (6), y staged (7-8), z's creation (9)
+        // fails ordinarily: three frames are pending. The drain's first flush (m/n) meets a lost lock at its guard
+        // (10), and every one after.
+        let guard = || {
+            calls.set(calls.get() + 1);
+            match calls.get() {
+                1..=8 => Ok(()),
+                9 => Err(FsError::new(Code::IoError, std::io::Error::other("walk"))),
+                _ => Err(FsError::new(Code::TargetLockBusy, std::io::Error::other("lost"))),
+            }
+        };
+        let (r, out, got) =
+            batched_with(&fs, policy(64), Durability::Strict, &guard, &no_heartbeat);
+        let error = r.unwrap_err();
+        assert_eq!(error.code(), Code::IoError, "the walk's own error wins: {error:?}");
+        assert_eq!(calls.get(), 10, "the drain's first flush met the lost lock at its guard");
+        let c = log(&fs);
+        // Only m/n's barrier ran, before the stop at its guard: none for m (c) or the root (a) after it.
+        assert_eq!(count(&c, "sync_all("), 1, "{c:?}");
+        assert_eq!(count(&c, "claim_prepare_many("), 0, "{c:?}");
+        assert_eq!(count(&c, "rename_"), 0, "{c:?}");
+        for f in ["a", "m/c"] {
+            assert!(fs.exists(format!("/dst/{f}.flux-partial.op1")), "{f}: {c:?}");
+            let kept = got.iter().any(|g| {
+                matches!(&g.cause, TreeFailureCause::Copy(e)
+                    if e.code() == Code::TargetLockBusy
+                        && e.leftover.as_ref().map(|(p, _)| p) == Some(&temp_of(f)))
+            });
+            assert!(kept, "{f} is reported as lost-lock with its temporary: {got:?}");
+        }
+        assert_eq!(fs.prepared_count(), 0);
+        assert_eq!(out.files_copied, 0);
     }
 
     #[test]

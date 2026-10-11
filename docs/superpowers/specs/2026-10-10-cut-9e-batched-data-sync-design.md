@@ -103,11 +103,13 @@ is not the engine and the real gain is smaller (reads, renames and about 25 othe
     (barrier, notes, renames), unchanged. `KeepAll`: the walk, or a flush during the drain, stopped with a lost lock (`TargetLockBusy`, tested first, so a lost lock noticed
     at a heartbeat step is still a lost lock): nothing is written or removed (decision 8); every pending temporary is kept and reported as a
     `TargetLockBusy` copy failure whose leftover is the temporary, with no barrier, no note and no guard call. `RemoveAll`: the walk, or a flush during the drain,
-    stopped at a failed heartbeat (`CopyStep::Heartbeat`) with the lock held: a failed heartbeat is the copy's failure (cut 7b), so every pending
+    stopped at a failed heartbeat (`CopyStep::Heartbeat`) with the lock held (a failed heartbeat is the copy's failure, cut 7b), or at a missing
+    publish primitive (`NoReplacePublishUnavailable`, tested last; 9d decision 3: the operation stops instead of failing every file; the remaining
+    temporaries are removed): every pending
     temporary is removed (guarded), with no barrier and no note; a temporary that cannot be removed is reported as a leftover. This changes
     9d's drain-after-heartbeat-failure behaviour: the drain used to go on and publish the remaining batches (the heartbeat's failure was
     swallowed and the ownership re-checked); it now removes them, and the files are recopied at `--resume`. A stop that first appears during the drain switches the mode for the
-    frames not yet drained (capstone round 5).
+    frames not yet drained, all of them, not only the next (capstone rounds 5 and 6).
 
 ## Interfaces added or changed (names are the plan's contract; signatures are final in the plan)
 
