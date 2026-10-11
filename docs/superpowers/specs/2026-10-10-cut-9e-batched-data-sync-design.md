@@ -35,7 +35,7 @@ is not the engine and the real gain is smaller (reads, renames and about 25 othe
    renames, one `apply_recovery`). The recovery invariant of cut 9c is unchanged: data durable before the `prepared` note, note durable before
    the rename. Normal mode, `files == 1` (batching off) and single-file copy keep the inline step 5.
 2. **Threads confined to the barrier.** The barrier runs `sync_all` on the pending writers from `std::thread::scope` workers: `BatchPolicy.sync_threads`
-   (default `SYNC_THREADS = 16`, the best measured count) workers, fewer when fewer entries are pending. `sync_threads == 1` is a sequential loop
+   (default `SYNC_THREADS = 16`, the best measured count) workers, fewer when fewer entries are pending. A batch with one pending writer syncs on the main thread (no worker: the measurement found a thread spawn per single-entry batch cost one-file-per-directory trees 15%; owner ruling 2026-10-11). `sync_threads == 1` is a sequential loop
    on the same code path, and is the seam tests use for a deterministic call order. No new dependency. A worker calls `sync_all` and nothing else:
    never the guard, the heartbeat or the claim store. **The main thread keeps the lease alive:** while workers run it waits on their results with a
    **absolute deadline** (`next_beat = last_beat + heartbeat_interval`; each wait is `recv_timeout(next_beat - now)`, never a fresh full interval, or a
@@ -179,7 +179,7 @@ If a gate fails the PR states it, as PR #82 did; thresholds are not moved.
    risk, not the source-change window (9d known limit 5 still applies).
 3. A shallow pending batch still waits while a subtree is walked (9d limit 5), now holding descriptors; the cap in decision 7 bounds that.
 4. The gain is measured on Linux ext4 only.
-5. One file per directory gets no benefit (9d limit 1).
+5. One file per directory gets no benefit (9d limit 1) and, since the n == 1 rule, no thread cost.
 6. The heartbeat is itself a synced write (`lock/held.rs:48`), so on a filesystem where a burst of concurrent `fsync` calls holds the journal, the
    heartbeat can queue behind the barrier and arrive late. Today's per-file `fsync` has the same exposure at a smaller scale. Not measured here:
    the acceptance run records the longest barrier and the longest heartbeat gap, and reports them.
