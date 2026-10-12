@@ -527,6 +527,7 @@ mod tests {
     use crate::fault_fs::{FakeDirHandle, FakeHandle, FaultFs};
     use crate::wal::CHUNK_SIZE;
     use crate::wal::record::{Decoded, decode_next};
+    use crate::wal::replay::{DiscardedTail, TailReason};
     use flux_fs::{DestinationRoot, FileSystem};
     use std::cell::Cell;
     use std::path::Path;
@@ -1103,6 +1104,40 @@ mod tests {
         let whole = scan(&bytes[..], OP).expect("the whole file scans");
         assert_eq!(whole.last, Some((1, 3)));
         assert_eq!(whole.valid_len, bytes.len() as u64);
+    }
+
+    #[test]
+    fn reopen_truncates_a_zero_filled_tail() {
+        let (fs, dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let c = cfg(BIG, HOUR, Durability::Normal);
+        let (s, t) = start(dir, 1, c);
+        s.send(begin_msg(b"p", None), beat).unwrap();
+        s.send(Msg::Range(range(b"p", 0, 1)), beat).unwrap();
+        s.send(Msg::Stop, beat).unwrap();
+        t.join();
+        let len = wal_bytes(&fs).unwrap().len() as u64;
+        let mut padded = wal_bytes(&fs).unwrap();
+        padded.extend(std::iter::repeat_n(0u8, 300));
+        fs.write_file(WAL_PATH, &padded);
+
+        let again = fs.destination_root(Path::new("/ws")).unwrap();
+        let (s, t, found) = open(again, OP.to_vec(), 1, c).expect("a zero-filled tail is torn");
+        let found = found.expect("a scan");
+        assert_eq!((found.valid_len, found.last), (len, Some((1, 2))));
+        assert_eq!(
+            found.discarded_tail,
+            Some(DiscardedTail { offset: len, len: 300, reason: TailReason::ZeroFilled })
+        );
+        assert_eq!(wal_bytes(&fs).unwrap().len() as u64, len);
+        assert!(calls_unix(&fs).contains(&format!("truncate_to({WAL_PATH}, {len})")));
+        s.send(Msg::Range(range(b"p", 1, 2)), beat).unwrap();
+        s.send(Msg::Stop, beat).unwrap();
+        t.join();
+        let bytes = wal_bytes(&fs).unwrap();
+        let whole = scan(&bytes[..], OP).expect("the whole file scans clean");
+        assert_eq!((whole.last, whole.valid_len), (Some((1, 3)), bytes.len() as u64));
+        assert_eq!(whole.discarded_tail, None);
     }
 
     #[test]

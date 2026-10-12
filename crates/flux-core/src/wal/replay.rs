@@ -1,7 +1,7 @@
 //! Two-pass WAL replay (cut 9f-1): `scan` indexes the log, `load_file` rebuilds one file's state.
 
-use super::record::{Body, Decoded, FileBegin, decode_next};
-use super::{CHUNK_SIZE, Digest};
+use super::record::{Body, Decoded, FileBegin, declared_span, decode_next};
+use super::{CHUNK_SIZE, Digest, MAGIC};
 use flux_fs::FsError;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read};
@@ -17,6 +17,28 @@ pub(crate) struct Scan {
     pub last: Option<(u64, u64)>,
     /// Bytes up to and including the last valid record.
     pub valid_len: u64,
+    /// The trailing bytes `valid_len..end` that recovery cuts, and why; `None` when nothing was cut.
+    pub discarded_tail: Option<DiscardedTail>,
+}
+
+/// A tail the scan stopped before (plan ruling 23): reported so nothing is discarded silently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiscardedTail {
+    /// Where the tail starts (equals `Scan::valid_len`).
+    pub offset: u64,
+    /// Bytes from `offset` to the end of the stream.
+    pub len: u64,
+    pub reason: TailReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TailReason {
+    /// Every byte of the tail is 0x00.
+    ZeroFilled,
+    /// A damaged record whose declared span ends exactly at the end of the stream.
+    SpanReachesEnd,
+    /// A record cut short by the end of the stream.
+    TornRecord,
 }
 
 #[derive(Debug)]
@@ -45,9 +67,49 @@ fn fill<R: Read>(reader: &mut R, window: &mut Vec<u8>, chunk: &mut [u8]) -> Resu
     }
 }
 
+/// Plan ruling 23: is the undecodable record at `window[start..]` TRAILING damage? Returns the
+/// tail's byte count and reason when it is (the stream is read to its end, in bounded memory),
+/// `None` when something that is not zero and not inside the record's own span follows.
+/// `trust_span` is false for an unsupported version, whose lengths cannot be trusted.
+fn trailing_damage<R: Read>(
+    reader: &mut R,
+    window: &mut Vec<u8>,
+    start: usize,
+    chunk: &mut [u8],
+    trust_span: bool,
+) -> Result<Option<(u64, TailReason)>, WalError> {
+    // (b) The declared span ends exactly at the end of the stream.
+    if trust_span
+        && let Some(span) = declared_span(&window[start..])
+        && window.len() - start == span
+        && !fill(reader, window, chunk)?
+    {
+        return Ok(Some((span as u64, TailReason::SpanReachesEnd)));
+    }
+    // (a) Every byte to the end of the stream is zero; a leading MAGIC (a record header begun and
+    // never filled in) is allowed in front of the zeros.
+    let mut from = start;
+    if window[start..].starts_with(&MAGIC) {
+        from += MAGIC.len();
+    }
+    let mut total = (from - start) as u64;
+    loop {
+        let part = &window[from..];
+        if part.iter().any(|b| *b != 0) {
+            return Ok(None);
+        }
+        total += part.len() as u64;
+        window.clear();
+        from = 0;
+        if !fill(reader, window, chunk)? {
+            return Ok(Some((total, TailReason::ZeroFilled)));
+        }
+    }
+}
+
 /// Pass one: stream the segment, index every file's records, and find where the valid log ends.
 pub(crate) fn scan<R: Read>(mut reader: R, operation_id: &[u8]) -> Result<Scan, WalError> {
-    let mut out = Scan { per_file: HashMap::new(), last: None, valid_len: 0 };
+    let mut out = Scan { per_file: HashMap::new(), last: None, valid_len: 0, discarded_tail: None };
     let mut seen: HashMap<(u64, u64), [u8; 16]> = HashMap::new();
     let mut window: Vec<u8> = Vec::new();
     let mut chunk = vec![0u8; READ_WINDOW];
@@ -64,11 +126,35 @@ pub(crate) fn scan<R: Read>(mut reader: R, operation_id: &[u8]) -> Result<Scan, 
                 if fill(&mut reader, &mut window, &mut chunk)? {
                     continue;
                 }
+                if !window.is_empty() {
+                    let reason = if window.iter().all(|b| *b == 0) {
+                        TailReason::ZeroFilled
+                    } else {
+                        TailReason::TornRecord
+                    };
+                    out.discarded_tail =
+                        Some(DiscardedTail { offset, len: window.len() as u64, reason });
+                }
                 break;
             }
-            Decoded::Corrupt(why) => return Err(WalError::Corrupt { at: offset, why }),
+            // Damage at the physical end is a torn tail, damage before it is not (ruling 23).
+            Decoded::Corrupt(why) => {
+                match trailing_damage(&mut reader, &mut window, start, &mut chunk, true)? {
+                    Some((len, reason)) => {
+                        out.discarded_tail = Some(DiscardedTail { offset, len, reason });
+                        break;
+                    }
+                    None => return Err(WalError::Corrupt { at: offset, why }),
+                }
+            }
             Decoded::Unsupported { format, checksum } => {
-                return Err(WalError::Unsupported { format, checksum });
+                match trailing_damage(&mut reader, &mut window, start, &mut chunk, false)? {
+                    Some((len, reason)) => {
+                        out.discarded_tail = Some(DiscardedTail { offset, len, reason });
+                        break;
+                    }
+                    None => return Err(WalError::Unsupported { format, checksum }),
+                }
             }
         };
         if header.operation_id != operation_id {
@@ -252,6 +338,20 @@ mod tests {
         let s = run(&bytes).unwrap();
         assert_eq!(s.valid_len, whole);
         assert_eq!(s.last, Some((1, 3)));
+        assert_eq!(
+            s.discarded_tail,
+            Some(DiscardedTail {
+                offset: whole,
+                len: fourth.len() as u64 - 5,
+                reason: TailReason::TornRecord
+            })
+        );
+    }
+
+    #[test]
+    fn a_clean_log_discards_nothing() {
+        let s = run(&stream(&[(1, 1, begin(b'A', 0))])).unwrap();
+        assert_eq!(s.discarded_tail, None);
     }
 
     #[test]
@@ -485,6 +585,145 @@ mod tests {
         assert_eq!(st.digests[&5], [42; 32]);
         let st = load_file(Trickle::new(&bytes), &s, b"A").unwrap().unwrap();
         assert_eq!(keys(&st), vec![5]);
+    }
+
+    // ---- Plan ruling 23: trailing damage is torn, not corrupt ----
+
+    /// Two valid records; returns the bytes.
+    fn two_valid() -> Vec<u8> {
+        stream(&[(1, 1, begin(b'A', 0)), (1, 2, range(b'A', 0, 1, 1))])
+    }
+
+    fn zero_tail_cases() -> [usize; 5] {
+        [1, 9, 10, 5000, READ_WINDOW + 1]
+    }
+
+    fn assert_cut(s: &Scan, valid: u64, len: u64, reason: TailReason) {
+        assert_eq!(s.valid_len, valid);
+        assert_eq!(s.last, Some((1, 2)));
+        assert_eq!(s.discarded_tail, Some(DiscardedTail { offset: valid, len, reason }));
+    }
+
+    #[test]
+    fn a_zero_filled_tail_is_torn() {
+        let good = two_valid();
+        let valid = good.len() as u64;
+        for n in zero_tail_cases() {
+            let mut bytes = good.clone();
+            bytes.extend(std::iter::repeat_n(0u8, n));
+            assert_cut(&run(&bytes).unwrap(), valid, n as u64, TailReason::ZeroFilled);
+            assert_cut(
+                &scan(Trickle::new(&bytes), OP).unwrap(),
+                valid,
+                n as u64,
+                TailReason::ZeroFilled,
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_tail_with_one_nonzero_byte_at_the_very_end_is_corrupt() {
+        let good = two_valid();
+        let mut bytes = good.clone();
+        bytes.extend(std::iter::repeat_n(0u8, READ_WINDOW + 1));
+        *bytes.last_mut().unwrap() = 1;
+        for result in [run(&bytes), scan(Trickle::new(&bytes), OP)] {
+            match result {
+                Err(WalError::Corrupt { at, .. }) => assert_eq!(at, good.len() as u64),
+                other => panic!("expected Corrupt, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn magic_followed_by_zeros_is_torn_not_unsupported() {
+        let good = two_valid();
+        let mut bytes = good.clone();
+        bytes.extend_from_slice(b"FWAL");
+        bytes.extend_from_slice(&[0u8; 20]);
+        assert_cut(&run(&bytes).unwrap(), good.len() as u64, 24, TailReason::ZeroFilled);
+        assert_cut(
+            &scan(Trickle::new(&bytes), OP).unwrap(),
+            good.len() as u64,
+            24,
+            TailReason::ZeroFilled,
+        );
+    }
+
+    /// A third record whose last-digest byte is flipped: full length, checksum mismatch.
+    fn flipped_third() -> Vec<u8> {
+        let mut rec = one(1, 3, &range(b'A', 1, 1, 2));
+        let at = rec.len() - 20;
+        rec[at] ^= 1;
+        rec
+    }
+
+    #[test]
+    fn a_full_length_last_record_with_a_flipped_payload_byte_is_torn() {
+        let good = two_valid();
+        let flipped = flipped_third();
+        let mut bytes = good.clone();
+        bytes.extend_from_slice(&flipped);
+        assert_cut(
+            &run(&bytes).unwrap(),
+            good.len() as u64,
+            flipped.len() as u64,
+            TailReason::SpanReachesEnd,
+        );
+        assert_cut(
+            &scan(Trickle::new(&bytes), OP).unwrap(),
+            good.len() as u64,
+            flipped.len() as u64,
+            TailReason::SpanReachesEnd,
+        );
+        // The same damage followed by one valid record is mid-log corruption.
+        let mut mid = bytes.clone();
+        mid.extend_from_slice(&one(1, 4, &range(b'A', 2, 1, 3)));
+        for result in [run(&mid), scan(Trickle::new(&mid), OP)] {
+            match result {
+                Err(WalError::Corrupt { at, .. }) => assert_eq!(at, good.len() as u64),
+                other => panic!("expected Corrupt, got {other:?}"),
+            }
+        }
+        // Followed only by zeros it is still not trailing: the damaged record is not zero.
+        let mut zeros = bytes.clone();
+        zeros.extend_from_slice(&[0u8; 7]);
+        assert!(
+            matches!(run(&zeros), Err(WalError::Corrupt { at, .. }) if at == good.len() as u64)
+        );
+    }
+
+    #[test]
+    fn a_nonzero_unknown_version_at_the_tail_is_still_unsupported() {
+        let mut bytes = two_valid();
+        let mut rec = one(1, 3, &range(b'A', 1, 1, 2));
+        rec[4] = 2;
+        bytes.extend_from_slice(&rec);
+        assert!(matches!(run(&bytes), Err(WalError::Unsupported { format: 2, checksum: 1 })));
+        assert!(matches!(
+            scan(Trickle::new(&bytes), OP),
+            Err(WalError::Unsupported { format: 2, checksum: 1 })
+        ));
+    }
+
+    #[test]
+    fn non_zero_garbage_with_a_bad_magic_in_the_middle_is_still_corrupt() {
+        let good = two_valid();
+        let mut bytes = good.clone();
+        bytes.extend_from_slice(&[0xFF; 20]);
+        bytes.extend_from_slice(&one(1, 3, &range(b'A', 1, 1, 2)));
+        for result in [run(&bytes), scan(Trickle::new(&bytes), OP)] {
+            match result {
+                Err(WalError::Corrupt { at, .. }) => assert_eq!(at, good.len() as u64),
+                other => panic!("expected Corrupt, got {other:?}"),
+            }
+        }
+        // The same garbage alone at the end is not zero and spans nothing: still corrupt.
+        let mut alone = good.clone();
+        alone.extend_from_slice(&[0xFF; 20]);
+        assert!(
+            matches!(run(&alone), Err(WalError::Corrupt { at, .. }) if at == good.len() as u64)
+        );
     }
 
     #[test]

@@ -196,6 +196,27 @@ fn parse_range(r: &mut Reader<'_>) -> Option<Range> {
     Some(Range { file_id, attempt_id, range_start, range_end, digests })
 }
 
+/// The span the record at the start of `bytes` DECLARES, when its lengths can be trusted: valid
+/// `MAGIC`, a supported format and checksum version, a readable `operation_id_len` and a
+/// `payload_len` within the bound. `None` otherwise. It does not check the checksum, the type or
+/// that `bytes` is long enough to hold the span.
+pub(crate) fn declared_span(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() < PREFIX_LEN || bytes[..4] != MAGIC {
+        return None;
+    }
+    if u16::from_le_bytes([bytes[4], bytes[5]]) != FORMAT_VERSION || bytes[6] != CHECKSUM_VERSION {
+        return None;
+    }
+    let fixed_at = PREFIX_LEN + usize::from(u16::from_le_bytes([bytes[8], bytes[9]]));
+    let payload_len_at = fixed_at + 16;
+    let payload_len =
+        u32::from_le_bytes(bytes.get(payload_len_at..payload_len_at + 4)?.try_into().ok()?);
+    if payload_len > MAX_PAYLOAD {
+        return None;
+    }
+    Some(fixed_at + FIXED_LEN + payload_len as usize + SUFFIX_LEN)
+}
+
 pub(crate) fn decode_next(bytes: &[u8]) -> Decoded {
     if bytes.is_empty() {
         return Decoded::End;
