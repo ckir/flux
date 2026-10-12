@@ -534,6 +534,10 @@ the spec's numbers, 9-10 were learned during execution).
 ## Cut 9f-1 open
 
 - [ ] Single-file WAL layout: a single-file operation has no workspace directory, so a half-copied single large file still recopies on `--resume`; the next cut's FIRST decision is where its WAL lives (V16 s18.1/s119 give a single file no `wal/`; needs a V16 amendment).
+- [ ] Verify the Strict duplicate-sync behaviour per platform (spec decision 6): macOS `F_FULLFSYNC` per descriptor, and Windows `FlushFileBuffers` needing write access on a duplicate; not performed in plan 2 (use the `verifying-platform-assumptions` skill).
+- [ ] Salvage the valid prefix of a log with mid-log damage: today the whole segment is set aside and every large file recopies (owner ruling 23).
+- [ ] An `--on-wal-corrupt=stop|quarantine` flag, for operators who want a damaged log to stop the run instead of being set aside.
+- [ ] Identity gate and `st_dev`: resume identity compares `identity_text`, which embeds `st_dev` on Unix, and that may differ after a reboot on some filesystems, discarding every checkpoint; verify with the `verifying-platform-assumptions` skill.
 
 ## Cut 9d debt
 
