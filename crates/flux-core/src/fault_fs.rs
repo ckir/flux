@@ -28,6 +28,8 @@ struct Inner {
     /// `sync_all` calls inside the call right now, and the most there have been at once (cut 9e)
     syncs_in_flight: usize,
     syncs_peak: usize,
+    /// Bytes returned by `Read::read` on every reader opened for a path, never reset (cut 9f-1 plan 2, task 3)
+    bytes_read: HashMap<PathBuf, u64>,
     /// cut 9e `rendezvous("sync_all", ..)`
     rendezvous: Option<Rendezvous>,
     /// The ORDER of calls, which is what every assertion on it checks. Formatted with
@@ -639,6 +641,8 @@ pub struct FakeHandle {
     /// Where writes land. `None` for a handle opened to read, so a reader cannot
     /// mutate the fake's state even though both roles share this struct.
     sink: Option<std::sync::Arc<Mutex<Inner>>>,
+    /// Where a READER adds the bytes it returns (`Inner::bytes_read`); `None` for a writer.
+    read_tally: Option<std::sync::Arc<Mutex<Inner>>>,
     sync_fault: std::sync::Arc<Mutex<Option<Code>>>,
     write_fault: std::sync::Arc<Mutex<Option<std::io::Error>>>,
 }
@@ -661,6 +665,9 @@ impl Read for FakeHandle {
         let n = (self.buf.len() - self.read_pos).min(out.len());
         out[..n].copy_from_slice(&self.buf[self.read_pos..self.read_pos + n]);
         self.read_pos += n;
+        if let Some(tally) = &self.read_tally {
+            *tally.lock().unwrap().bytes_read.entry(self.path.clone()).or_insert(0) += n as u64;
+        }
         Ok(n)
     }
 }
@@ -699,6 +706,10 @@ impl Write for FakeHandle {
 
 impl FileHandle for FakeHandle {
     fn sync_all(&self) -> Result<()> {
+        // `on_nth("sync_all", n, ..)` hooks run first, with no lock held; hook only, as the log and the fault below are this call's own.
+        if let Some(sink) = &self.sink {
+            FaultFs { inner: std::sync::Arc::clone(sink) }.run_hook("sync_all");
+        }
         // Cut 9e: the barrier calls this from several threads. Enter under the fake's lock (raising the peak), then
         // wait on the rendezvous and sleep with NO lock held, then leave and record under a short lock again.
         let mut pause = None;
@@ -766,6 +777,7 @@ impl FileHandle for FakeHandle {
             read_pos: 0,
             write_pos: None,
             sink: Some(sink.clone()),
+            read_tally: None,
             sync_fault: self.sync_fault.clone(),
             write_fault: self.write_fault.clone(),
         })
@@ -1039,6 +1051,12 @@ impl FaultFs {
         self.inner.lock().unwrap().syncs_peak
     }
 
+    /// The total bytes returned by `Read::read` on every reader opened for `path` (through `FileSystem::open_read` or
+    /// `DirHandle::open_read`), never reset. A resume test asserts it: byte equality alone passes if resume recopies from 0.
+    pub fn bytes_read(&self, path: impl AsRef<Path>) -> u64 {
+        self.inner.lock().unwrap().bytes_read.get(path.as_ref()).copied().unwrap_or(0)
+    }
+
     pub fn calls(&self) -> Vec<String> {
         self.inner.lock().unwrap().calls.clone()
     }
@@ -1263,6 +1281,23 @@ impl FaultFs {
         Ok(())
     }
 
+    /// Count a call to `key` and run its `on_nth` hook, and nothing else: no call-log entry and no fault. For a call
+    /// that logs and takes its fault itself (`FakeHandle::sync_all`), where `record` would log and fault twice.
+    fn run_hook(&self, key: &str) {
+        let mut g = self.inner.lock().unwrap();
+        let n = {
+            let c = g.call_counts.entry(key.to_string()).or_insert(0);
+            *c += 1;
+            *c
+        };
+        let hook = g.hooks.remove(&(key.to_string(), n));
+        // Released first: the action calls back into the fake, and `std::sync::Mutex` is not reentrant.
+        drop(g);
+        if let Some(action) = hook {
+            action(&FaultFs { inner: std::sync::Arc::clone(&self.inner) });
+        }
+    }
+
     /// `ErrorKind::Other` unless a test asked for a specific kind.
     fn injected(code: Code, kind: Option<std::io::ErrorKind>) -> FsError {
         match kind {
@@ -1283,10 +1318,12 @@ impl FileSystem for FaultFs {
     fn open_read(&self, path: &Path) -> Result<Self::Reader> {
         let p = path.to_path_buf();
         self.record(format!("open_read({})", p.display()), "open_read")?;
-        let g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap();
         let buf = g.files.get(&p).cloned().ok_or_else(|| {
             FsError::new(Code::IoError, std::io::Error::from(std::io::ErrorKind::NotFound))
         })?;
+        g.bytes_read.entry(p.clone()).or_insert(0);
+        drop(g);
         // The reader never syncs, and never writes: only the writer may consume the
         // injected sync fault, and only the writer gets a sink.
         Ok(FakeHandle {
@@ -1295,6 +1332,7 @@ impl FileSystem for FaultFs {
             read_pos: 0,
             write_pos: None,
             sink: None,
+            read_tally: Some(std::sync::Arc::clone(&self.inner)),
             sync_fault: std::sync::Arc::new(Mutex::new(None)),
             write_fault: std::sync::Arc::new(Mutex::new(None)),
         })
@@ -1331,6 +1369,7 @@ impl FileSystem for FaultFs {
             read_pos: 0,
             write_pos: None,
             sink: Some(std::sync::Arc::clone(&self.inner)),
+            read_tally: None,
             sync_fault,
             write_fault,
         })
@@ -1810,6 +1849,7 @@ impl DirHandle for FakeDirHandle {
             read_pos: 0,
             write_pos: Some(0),
             sink: Some(std::sync::Arc::clone(&self.inner)),
+            read_tally: None,
             sync_fault,
             write_fault,
         };
@@ -2277,6 +2317,33 @@ mod tests {
             }
         });
         assert_eq!(fs.calls().iter().filter(|c| c.starts_with("sync_all(")).count(), 8);
+    }
+
+    #[test]
+    fn on_nth_sync_all_runs_its_hook_before_the_second_sync() {
+        let fs = FaultFs::new();
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&ran);
+        fs.on_nth("sync_all", 2, move |_| flag.store(true, std::sync::atomic::Ordering::SeqCst));
+        let w = fs.create_new(Path::new("/w")).unwrap();
+        w.sync_all().unwrap();
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+        w.sync_all().unwrap();
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(fs.calls(), ["create_new(/w)", "sync_all(/w)", "sync_all(/w)"]);
+    }
+
+    #[test]
+    fn bytes_read_counts_every_reader_of_a_path() {
+        let fs = FaultFs::new();
+        fs.write_file("/a", &[1u8; 32]);
+        fs.write_file("/b", &[2u8; 32]);
+        let mut r1 = fs.open_read(Path::new("/a")).unwrap();
+        let mut r2 = fs.open_read(Path::new("/a")).unwrap();
+        assert_eq!(r1.read(&mut [0u8; 10]).unwrap(), 10);
+        assert_eq!(r2.read(&mut [0u8; 7]).unwrap(), 7);
+        assert_eq!(fs.bytes_read("/a"), 17);
+        assert_eq!(fs.bytes_read("/b"), 0);
     }
 
     #[test]
