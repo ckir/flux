@@ -632,6 +632,10 @@ pub struct FakeHandle {
     path: PathBuf,
     buf: Vec<u8>,
     read_pos: usize,
+    /// Where the next write lands in the stored file. `None` appends at the end (a `create_new` handle and a
+    /// duplicate). `open_existing` gives `Some(0)`, as the real handles are positioned at 0 (`DirHandle::open_existing`);
+    /// `truncate_to(len)` sets `Some(len)`. A write at `Some(p)` overwrites from `p` and advances it.
+    write_pos: Option<usize>,
     /// Where writes land. `None` for a handle opened to read, so a reader cannot
     /// mutate the fake's state even though both roles share this struct.
     sink: Option<std::sync::Arc<Mutex<Inner>>>,
@@ -672,7 +676,19 @@ impl Write for FakeHandle {
         // because none of them looked at the content.
         if let Some(sink) = &self.sink {
             let mut g = sink.lock().unwrap();
-            g.files.entry(self.path.clone()).or_default().extend_from_slice(b);
+            let stored = g.files.entry(self.path.clone()).or_default();
+            match self.write_pos {
+                None => stored.extend_from_slice(b),
+                Some(p) => {
+                    // Overwrite from `p`, extending when the write runs past the end.
+                    let end = p + b.len();
+                    if stored.len() < end {
+                        stored.resize(end, 0);
+                    }
+                    stored[p..end].copy_from_slice(b);
+                    self.write_pos = Some(end);
+                }
+            }
         }
         Ok(b.len())
     }
@@ -745,6 +761,7 @@ impl FileHandle for FakeHandle {
             path: self.path.clone(),
             buf: Vec::new(),
             read_pos: 0,
+            write_pos: None,
             sink: Some(sink.clone()),
             sync_fault: self.sync_fault.clone(),
             write_fault: self.write_fault.clone(),
@@ -770,6 +787,7 @@ impl FileHandle for FakeHandle {
             f.truncate(len as usize);
         }
         g.calls.push(format!("truncate_to({}, {len})", self.path.display()));
+        self.write_pos = Some(len as usize);
         Ok(())
     }
 }
@@ -1272,6 +1290,7 @@ impl FileSystem for FaultFs {
             path: p,
             buf,
             read_pos: 0,
+            write_pos: None,
             sink: None,
             sync_fault: std::sync::Arc::new(Mutex::new(None)),
             write_fault: std::sync::Arc::new(Mutex::new(None)),
@@ -1307,6 +1326,7 @@ impl FileSystem for FaultFs {
             path: p,
             buf: Vec::new(),
             read_pos: 0,
+            write_pos: None,
             sink: Some(std::sync::Arc::clone(&self.inner)),
             sync_fault,
             write_fault,
@@ -1785,6 +1805,7 @@ impl DirHandle for FakeDirHandle {
             path: child_path,
             buf: Vec::new(),
             read_pos: 0,
+            write_pos: Some(0),
             sink: Some(std::sync::Arc::clone(&self.inner)),
             sync_fault,
             write_fault,
@@ -3014,6 +3035,48 @@ mod tests {
             "{:?}",
             fs.calls()
         );
+    }
+
+    /// `DirHandle::open_existing` is documented "positioned at 0" and the real handles are, so a resume that
+    /// skips `truncate_to` overwrites the head of the partial. The fake must do the same, not append.
+    #[test]
+    fn the_fake_open_existing_handle_is_unpositioned_like_the_real_one() {
+        use flux_fs::FileHandle;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let mut w = d.create_new(OsStr::new("f")).unwrap();
+        w.write_all(b"abcde").unwrap();
+        let id = w.identity().unwrap();
+        drop(w);
+        // No `truncate_to`: the write lands at offset 0.
+        let mut w2 = d.open_existing(OsStr::new("f"), &id).unwrap();
+        w2.write_all(b"ZZ").unwrap();
+        w2.write_all(b"Y").unwrap();
+        drop(w2);
+        assert_eq!(d.read_file(OsStr::new("f"), 100).unwrap(), b"ZZYde");
+        // With `truncate_to(2)` first, the next write lands at 2 and the rest is gone.
+        let mut w3 = d.open_existing(OsStr::new("f"), &id).unwrap();
+        w3.truncate_to(2).unwrap();
+        w3.write_all(b"Z").unwrap();
+        drop(w3);
+        assert_eq!(d.read_file(OsStr::new("f"), 100).unwrap(), b"ZZZ");
+        // A write that runs past the end extends the file.
+        let mut w4 = d.open_existing(OsStr::new("f"), &id).unwrap();
+        w4.write_all(b"123456").unwrap();
+        drop(w4);
+        assert_eq!(d.read_file(OsStr::new("f"), 100).unwrap(), b"123456");
+    }
+
+    #[test]
+    fn a_created_handle_and_its_duplicate_still_append() {
+        let fs = FaultFs::new();
+        let mut w = fs.create_new(Path::new("/p")).unwrap();
+        w.write_all(b"abc").unwrap();
+        let mut d = w.duplicate().unwrap();
+        d.write_all(b"def").unwrap();
+        w.write_all(b"g").unwrap();
+        assert_eq!(fs.read_file("/p").unwrap(), b"abcdefg");
     }
 
     #[test]
