@@ -31,21 +31,16 @@ fn io_err(e: io::Error) -> WalError {
     WalError::Io(FsError::from_io(e))
 }
 
-/// Reads up to one window more into `window`; `false` when the reader is exhausted.
-fn fill<R: Read>(reader: &mut R, window: &mut Vec<u8>) -> Result<bool, WalError> {
-    let old = window.len();
-    window.resize(old + READ_WINDOW, 0);
+/// Reads up to one window more into `window` through `chunk`; `false` when the reader is exhausted.
+fn fill<R: Read>(reader: &mut R, window: &mut Vec<u8>, chunk: &mut [u8]) -> Result<bool, WalError> {
     loop {
-        match reader.read(&mut window[old..]) {
+        match reader.read(chunk) {
             Ok(n) => {
-                window.truncate(old + n);
+                window.extend_from_slice(&chunk[..n]);
                 return Ok(n > 0);
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => {
-                window.truncate(old);
-                return Err(io_err(e));
-            }
+            Err(e) => return Err(io_err(e)),
         }
     }
 }
@@ -55,6 +50,7 @@ pub(crate) fn scan<R: Read>(mut reader: R, operation_id: &[u8]) -> Result<Scan, 
     let mut out = Scan { per_file: HashMap::new(), last: None, valid_len: 0 };
     let mut seen: HashMap<(u64, u64), [u8; 16]> = HashMap::new();
     let mut window: Vec<u8> = Vec::new();
+    let mut chunk = vec![0u8; READ_WINDOW];
     let mut start = 0usize;
     let mut offset = 0u64;
     loop {
@@ -65,7 +61,7 @@ pub(crate) fn scan<R: Read>(mut reader: R, operation_id: &[u8]) -> Result<Scan, 
             Decoded::End | Decoded::TornTail => {
                 window.drain(..start);
                 start = 0;
-                if fill(&mut reader, &mut window)? {
+                if fill(&mut reader, &mut window, &mut chunk)? {
                     continue;
                 }
                 break;
@@ -129,6 +125,7 @@ pub(crate) fn load_file<R: Read>(
         return Ok(None);
     };
     let mut window: Vec<u8> = Vec::new();
+    let mut chunk = vec![0u8; READ_WINDOW];
     // Absolute offset of `window[0]`; the reader sits at `base + window.len()`.
     let mut base = 0u64;
     let mut begin: Option<FileBegin> = None;
@@ -155,7 +152,7 @@ pub(crate) fn load_file<R: Read>(
             match decode_next(&window) {
                 Decoded::Record { body, len, .. } => break (body, len),
                 Decoded::TornTail | Decoded::End => {
-                    if !fill(&mut reader, &mut window)? {
+                    if !fill(&mut reader, &mut window, &mut chunk)? {
                         return Err(corrupt("segment ends inside an indexed record"));
                     }
                 }
@@ -264,7 +261,8 @@ mod tests {
         let bytes = stream(&[(1, 1, begin(b'A', 0)), (1, 2, big.clone())]);
         assert!(one(1, 2, &big).len() > 65_536);
         let s = run(&bytes).unwrap();
-        assert_eq!(s.per_file[&vec![b'A']].len(), 2);
+        let len0 = one(1, 1, &begin(b'A', 0)).len() as u64;
+        assert_eq!(s.per_file[&vec![b'A']], vec![0, len0]);
         assert_eq!(s.last, Some((1, 2)));
         assert_eq!(s.valid_len, bytes.len() as u64);
     }
@@ -411,6 +409,99 @@ mod tests {
         let st = state(&more, b'A').unwrap();
         assert_eq!(keys(&st), vec![0, 1, 2]);
         assert_eq!(st.digests[&2], [77; 32]);
+    }
+
+    /// Yields 1 to 7 bytes per call, so no read ever fills the window.
+    struct Trickle {
+        inner: Cursor<Vec<u8>>,
+        calls: usize,
+    }
+
+    impl Trickle {
+        fn new(bytes: &[u8]) -> Self {
+            Self { inner: Cursor::new(bytes.to_vec()), calls: 0 }
+        }
+    }
+
+    impl Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.calls += 1;
+            let cap = buf.len().min(1 + self.calls % 7);
+            self.inner.read(&mut buf[..cap])
+        }
+    }
+
+    #[test]
+    fn short_reads_do_not_end_the_scan_early() {
+        let big = range(b'A', 0, 2_200, 1);
+        let mut bytes = stream(&[(1, 1, begin(b'A', 0)), (1, 2, big)]);
+        let whole = bytes.len() as u64;
+        let s = scan(Trickle::new(&bytes), OP).unwrap();
+        assert_eq!((s.last, s.valid_len), (Some((1, 2)), whole));
+        let third = one(1, 3, &range(b'A', 0, 1, 2));
+        bytes.extend_from_slice(&third[..third.len() - 5]);
+        let s = scan(Trickle::new(&bytes), OP).unwrap();
+        assert_eq!((s.last, s.valid_len), (Some((1, 2)), whole));
+    }
+
+    #[test]
+    fn offsets_stay_absolute_across_window_drains() {
+        let mut records = vec![(1, 1, begin(b'A', 0))];
+        for i in 0..700u64 {
+            records.push((1, i + 2, range(b'A', i, 1, 1)));
+        }
+        let mut want = Vec::new();
+        let mut at = 0u64;
+        for (g, sq, b) in &records {
+            want.push(at);
+            at += one(*g, *sq, b).len() as u64;
+        }
+        let bytes = stream(&records);
+        assert!(at > 65_536);
+        let s = run(&bytes).unwrap();
+        assert_eq!(s.per_file[&vec![b'A']], want);
+        assert_eq!(s.valid_len, at);
+        let st = load_file(Cursor::new(bytes), &s, b"A").unwrap().unwrap();
+        assert_eq!(st.digests.len(), 700);
+    }
+
+    /// begin A, a 2,200-digest range for B (over one window), then a range for A past the window.
+    fn skipping_stream() -> (Vec<u8>, Scan) {
+        let bytes = stream(&[
+            (1, 1, begin(b'A', 0)),
+            (1, 2, range(b'B', 0, 2_200, 1)),
+            (1, 3, range(b'A', 5, 1, 42)),
+        ]);
+        let s = run(&bytes).unwrap();
+        (bytes, s)
+    }
+
+    #[test]
+    fn load_file_skips_forward_past_the_window() {
+        let (bytes, s) = skipping_stream();
+        assert!(s.per_file[&vec![b'A']][1] > 65_536);
+        let st = load_file(Cursor::new(bytes.clone()), &s, b"A").unwrap().unwrap();
+        assert_eq!(keys(&st), vec![5]);
+        assert_eq!(st.digests[&5], [42; 32]);
+        let st = load_file(Trickle::new(&bytes), &s, b"A").unwrap().unwrap();
+        assert_eq!(keys(&st), vec![5]);
+    }
+
+    #[test]
+    fn a_reader_truncated_before_an_indexed_record_is_corrupt() {
+        let (bytes, s) = skipping_stream();
+        let last = s.per_file[&vec![b'A']][1] as usize;
+        // Cut inside the skipped gap: the skip itself comes up short.
+        let cut = Cursor::new(bytes[..last - 100].to_vec());
+        match load_file(cut, &s, b"A") {
+            Err(WalError::Corrupt { why, .. }) => {
+                assert!(why.contains("before an indexed"), "{why}")
+            }
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+        // Cut inside the record itself.
+        let cut = Cursor::new(bytes[..bytes.len() - 3].to_vec());
+        assert!(matches!(load_file(cut, &s, b"A"), Err(WalError::Corrupt { .. })));
     }
 
     #[test]
