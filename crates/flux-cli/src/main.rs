@@ -268,6 +268,7 @@ fn copy(args: &CopyArgs) -> u8 {
                         Ok(out) => out,
                         Err(a) => {
                             err(&a.error.to_string());
+                            lines(report::abort_hint_lines(&a.error));
                             &a.outcome
                         }
                     };
@@ -276,6 +277,7 @@ fn copy(args: &CopyArgs) -> u8 {
                     }
                     lines(report::run_lines(&run));
                     lines(report::resume_lines(&run, outcome.files_resumed));
+                    lines(report::checkpoint_lines(outcome, opts.durability == Durability::Normal));
                     err(&report::summary_line(&rep, outcome.directories_created));
                 }
                 None => lines(report::run_lines(&run)),

@@ -6129,6 +6129,9 @@ mod checkpointing {
         assert!(r.stop.is_none(), "{:?}", r.stop);
         let a = aborted(&r);
         assert_eq!((a.error.code(), a.error.step), (Code::WalWriteFailed, CopyStep::Checkpoint));
+        // The CLI prints the `--resume` hint once, after the error: the message must not carry it too.
+        let m = a.error.to_string();
+        assert!(m.contains("NOT trustworthy") && !m.contains("run again with --resume"), "{m}");
         assert!(a.error.leftover.is_none());
         assert!(fs.exists(partial()), "the temporary is kept");
         assert_eq!(manifest(&fs, ID).state, OpState::Failed);
@@ -6164,6 +6167,9 @@ mod checkpointing {
         let (r, _) = run_with(&fs, &cfg(), &opts(), lazy(Durability::Normal));
         let a = aborted(&r);
         assert_eq!((a.error.code(), a.error.step), (Code::WalWriteFailed, CopyStep::Checkpoint));
+        // The CLI prints the `--resume` hint once, after the error: the message must not carry it too.
+        let m = a.error.to_string();
+        assert!(m.contains("NOT trustworthy") && !m.contains("run again with --resume"), "{m}");
         assert!(fs.exists(partial()), "the temporary is kept");
         assert_eq!(manifest(&fs, ID).state, OpState::Failed);
     }
