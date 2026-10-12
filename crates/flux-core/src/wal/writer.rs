@@ -161,6 +161,12 @@ impl<W> WalSender<W> {
         }
     }
 
+    /// The run is abandoned from now on: the thread begins no new flush (it checks the flag before each one and in its
+    /// loop). The same flag a dropped sender without `Stop` sets.
+    pub(crate) fn mark_abandoned(&self) {
+        self.abandoned.store(true, Ordering::SeqCst);
+    }
+
     pub(crate) fn failure(&self) -> Failure {
         lock(&self.failure).clone()
     }
@@ -884,6 +890,29 @@ mod tests {
             Body::FileBegin(f) => &f.file_id,
             Body::Range(r) => &r.file_id,
         }
+    }
+
+    #[test]
+    fn mark_abandoned_stops_a_flush_that_would_otherwise_start() {
+        let beat: &Heartbeat = &|| Ok(());
+        // The control: an eager policy flushes as soon as a range is queued.
+        let (fs, dir) = ws();
+        let (s, t) = start(dir, 1, cfg(1, HOUR, Durability::Normal));
+        s.send(begin_msg(b"p", None), beat).unwrap();
+        s.send(Msg::Range(range(b"p", 0, 1)), beat).unwrap();
+        settle(&s, beat);
+        assert!(wal_bytes(&fs).is_some(), "without the mark the range flushes at once");
+        s.send(Msg::Stop, beat).unwrap();
+        t.join();
+        // The same messages after the mark: the thread begins no flush.
+        let (fs, dir) = ws();
+        let (s, t) = start(dir, 1, cfg(1, HOUR, Durability::Normal));
+        s.mark_abandoned();
+        s.send(begin_msg(b"p", None), beat).unwrap();
+        let _ = s.send(Msg::Range(range(b"p", 0, 1)), beat);
+        drop(s);
+        t.join();
+        assert!(wal_bytes(&fs).is_none(), "no segment was ever created");
     }
 
     #[test]

@@ -514,6 +514,43 @@ mod tests {
     }
 
     #[test]
+    fn checkpoints_mark_abandoned_reaches_the_writer() {
+        let beat: &Heartbeat = &|| Ok(());
+        let eager = || CheckpointPolicy {
+            wal: WalConfig { flush_bytes: 1, ..policy(1, Durability::Normal).wal },
+            ..policy(1, Durability::Normal)
+        };
+        // The control: eager, unmarked, the range reaches the segment.
+        let (fs, _dir) = ws();
+        let run = open_run(&fs, eager());
+        let mut sink = FileSink::begin(&fc(&run), &meta(MIB as u64), 0, None, beat).unwrap();
+        sink.wrote(&data(MIB), beat).unwrap();
+        for _ in 0..5000 {
+            if fs.read_file(WAL_PATH).is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(fs.read_file(WAL_PATH).is_some(), "the unmarked eager run flushed");
+        sink.abort(beat);
+        drop(sink);
+        run.abandon();
+        // Marked first: nothing is ever written.
+        let (fs, _dir) = ws();
+        let run = open_run(&fs, eager());
+        run.mark_abandoned();
+        if let Ok(mut sink) = FileSink::begin(&fc(&run), &meta(MIB as u64), 0, None, beat) {
+            let _ = sink.wrote(&data(MIB), beat);
+            // Time for an unflagged writer to flush what was queued.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            sink.abort(beat);
+            drop(sink);
+        }
+        run.abandon();
+        assert!(fs.read_file(WAL_PATH).is_none());
+    }
+
+    #[test]
     fn abort_discards_pending_records_and_drops_the_duplicate() {
         let (fs, _dir) = ws();
         let beat: &Heartbeat = &|| Ok(());

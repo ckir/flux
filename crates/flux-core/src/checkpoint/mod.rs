@@ -121,6 +121,12 @@ impl<D: DirHandle + Send + 'static> Checkpoints<D> {
         thread.join()
     }
 
+    /// Tell the writer thread the run is abandoned, now: it begins no new flush from here on. A flush already in flight
+    /// may complete or tear. The final `abandon` or `finish` still follows.
+    pub(crate) fn mark_abandoned(&self) {
+        self.sender.mark_abandoned();
+    }
+
     /// Drop the sender WITHOUT `Stop` and join: the thread exits without flushing what is pending.
     pub(crate) fn abandon(self) {
         let Checkpoints { sender, thread, .. } = self;

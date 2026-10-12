@@ -5496,6 +5496,7 @@ mod checkpointing {
     use crate::wal::record::{Body, Header};
     use crate::wal::record::{Decoded as WalDecoded, decode_next};
     use crate::wal::writer::WalConfig;
+    use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
     const MIB: usize = 1 << 20;
@@ -5901,6 +5902,74 @@ mod checkpointing {
         assert!(
             c[mark..].iter().all(|x| !x.starts_with("truncate_to(")),
             "every large file recopies"
+        );
+    }
+
+    /// The count of `create_dir` calls of a clean run of the big file: the WAL's `wal/` is the last.
+    fn wal_create_dir_nth() -> u32 {
+        let dry = big_fs(3 * MIB);
+        ok(&run_with(&dry, &cfg(), &opts(), lazy(Durability::Normal)).0);
+        u32::try_from(calls(&dry).iter().filter(|c| c.starts_with("create_dir(")).count()).unwrap()
+    }
+
+    // Mutants: the beat closure does not call `mark_abandoned`; `Checkpoints::mark_abandoned` is a no-op. (The
+    // guard closure's own mark cannot be told apart here: no guard runs mid-file, and after a file's `Close` nothing
+    // is pending.)
+    #[test]
+    fn a_lost_lock_appends_nothing_even_with_an_eager_flush_policy() {
+        let fs = Arc::new(big_fs(5 * MIB));
+        let (entered, release) =
+            (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        // The WAL thread's first flush (the file's `FileBegin` and first `Range`) is held at the creation of `wal/`:
+        // it is IN FLIGHT while the main thread queues the next ranges.
+        {
+            let (entered, release) = (Arc::clone(&entered), Arc::clone(&release));
+            fs.on_nth("create_dir", wal_create_dir_nth(), move |_| {
+                entered.store(true, Ordering::SeqCst);
+                for _ in 0..10_000 {
+                    if release.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                panic!("the flush was never released");
+            });
+        }
+        // The heartbeat fails 3 MiB in, once the flush is in flight (ranges 2 and 3 are queued behind it).
+        fn fail_beat(fs: &FaultFs, n: u32, entered: Arc<AtomicBool>) {
+            fs.on_nth("write_at_start", n, move |fs| {
+                if entered.load(Ordering::SeqCst)
+                    && fs.read_file(partial()).is_some_and(|b| b.len() >= 3 * MIB)
+                {
+                    fs.fail("write_at_start", Code::IoError);
+                    fs.on_nth("write_at_start", n + 1, |fs| {
+                        fs.fail("write_at_start", Code::IoError)
+                    });
+                } else {
+                    fail_beat(fs, n + 1, entered);
+                }
+            });
+        }
+        fail_beat(&fs, 1, Arc::clone(&entered));
+        // The guard of the discard that follows the failure (after the beat closure flagged the log) releases the
+        // held flush, then gives an unflagged writer time to flush the queued ranges too.
+        let hook: BeforeMutation = {
+            let (fs, release) = (Arc::clone(&fs), Arc::clone(&release));
+            Arc::new(move || {
+                if fs.read_file(partial()).is_some_and(|b| b.len() >= 3 * MIB)
+                    && !release.swap(true, Ordering::SeqCst)
+                {
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            })
+        };
+        let c = RunConfig { before_mutation: Some(hook), ..beating() };
+        let (r, _) = run_with(&fs, &c, &opts(), policy(Durability::Normal, 1));
+        assert!(matches!(&r.copy, Some(Err(_))), "{:?}", r.copy);
+        assert_eq!(
+            covered(&fs),
+            MIB as u64,
+            "only the flush already in flight landed; the ranges queued behind it were never flushed"
         );
     }
 

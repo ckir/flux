@@ -299,19 +299,37 @@ pub(crate) fn tree_with<F: DestinationRoot>(
     let opts = CopyOptions { operation_id: OperationId::new(&locked.state.operation_id), ..opts };
     // Cut 9f-1: the checkpoint log, opened from two handles on this operation's workspace. Every way it fails to open is
     // a warning and the tree runs without checkpoints (every large file recopies): a damaged log never aborts a copy.
-    let ckpt = open_checkpoints(&place, &locked.state, policy, &mut run.warnings);
+    // In a `RefCell` because the guard and beat closures (below) read it for the whole walk while the end of the run must
+    // take it by value to `finish` or `abandon` it.
+    let ckpt =
+        std::cell::RefCell::new(open_checkpoints(&place, &locked.state, policy, &mut run.warnings));
     // Step 6: the copy, with §99 before every destination mutation.
     let mut leftovers: Vec<PathBuf> = Vec::new();
+    // The log is opened before these closures, so they can flag it the moment either detects a loss: from then on no
+    // NEW flush begins (a flush already in flight may complete or tear; a loss not yet detected is outside this).
+    let flagged = |e| {
+        if let Some(c) = &*ckpt.borrow() {
+            c.mark_abandoned();
+        }
+        e
+    };
     let guard = || {
         if let Some(hook) = &cfg.before_mutation {
             hook();
         }
-        guarded(&locked.held, &locked.pulse)
+        guarded(&locked.held, &locked.pulse).map_err(flagged)
     };
-    let beat = || locked.pulse.beat(&locked.held).map_err(|e| beat_error(&locked.lock_shown, e));
+    let beat = || {
+        locked
+            .pulse
+            .beat(&locked.held)
+            .map_err(|e| beat_error(&locked.lock_shown, e))
+            .map_err(flagged)
+    };
     // The store stays open past the walk, for the final sync; it is dropped before `finish` removes the file.
     let claims = place.claims.take().map(std::cell::RefCell::new);
     let walked = {
+        let held = ckpt.borrow();
         let cx = Shared {
             fs,
             src_root,
@@ -322,7 +340,7 @@ pub(crate) fn tree_with<F: DestinationRoot>(
             claims: claims.as_ref(),
             resume: cfg.resume,
             batch: batch_policy(cfg),
-            ckpt: ckpt.as_ref(),
+            ckpt: held.as_ref(),
         };
         let root = place.dest.take().expect("step 5 made DEST");
         let mut report = |f: TreeFailure| {
@@ -342,10 +360,11 @@ pub(crate) fn tree_with<F: DestinationRoot>(
         Ok(()) => Ok(out),
         Err(error) => Err(TreeAbort { error, outcome: out }),
     };
-    // Cut 9f-1: the WAL thread ends BEFORE anything else: its directory handles must be closed before `finish` may
+    // Cut 9f-1 (the guard and beat closures already flagged the log at the moment they detected a loss): the WAL thread
+    // ends BEFORE anything else: its directory handles must be closed before `finish` may
     // remove the workspace (a held handle blocks the rename on Windows). A lost lock or a failed heartbeat abandons the
-    // log (nothing more is appended after the loss); every other ending sends `Stop`, which flushes, and joins.
-    if let Some(run_ckpt) = ckpt {
+    // log (no NEW flush begins once the loss was detected: the closures flagged the log; a flush already in flight may complete or tear, and a loss not yet detected is outside this); every other ending sends `Stop`, which flushes, and joins.
+    if let Some(run_ckpt) = ckpt.take() {
         let lost = matches!(&result, Err(a) if a.error.code() == Code::TargetLockBusy)
             || locked.pulse.failed();
         if lost {
