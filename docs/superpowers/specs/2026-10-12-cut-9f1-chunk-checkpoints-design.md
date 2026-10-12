@@ -33,7 +33,7 @@ starved by a full checkpoint channel; a measurable slowdown of an uninterrupted 
 ## Facts this design rests on (read at main f27574e; the plan re-reads them)
 
 - Chunk model: `chunk_size` = 1 MiB fixed (V16:6349). The copy buffer is `COPY_BUF_MAX` = 256 KiB (`copy.rs:167-172`), one heartbeat per buffer (`copy.rs:586`).
-- No checkpoint, WAL or per-chunk digest code exists in `crates/`. Per-operation state is redb `state.db` (`flux-platform/src/claims.rs:21-23`). `blake3` is a workspace dependency (`Cargo.toml:64`; crate `flux-hash`).
+- No checkpoint, WAL or per-chunk digest code exists in `crates/`. Per-operation state is redb `state.db` (`flux-platform/src/claims.rs:21-23`). `blake3` is a workspace dependency (`Cargo.toml:64`; the chunk digest lives in `flux-core` as `wal::digest`, not in `flux-hash`, because the chunk framing (1 MiB boundaries across arbitrary writes) is WAL logic, not a general hash utility).
 - The 9e barrier syncs the writers of COMPLETED files, once per batch (`copy.rs` step 6b comment). It never runs inside a file, so it cannot make an in-flight file's checkpoint durable.
 - Under `--durability=normal` no data fsync happens at all (9e).
 - Spec V16:6415-6416: "No state record may claim bytes are valid if their durable destination content is not known to be valid."
