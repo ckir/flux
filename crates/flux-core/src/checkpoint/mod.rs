@@ -6,6 +6,7 @@
 //! `Checkpoints` owns the WAL writer thread for one run; `FileSink` turns the bytes of one file being copied
 //! into chunk digests and sends them as `Range` records.
 
+mod decide;
 mod sink;
 
 use crate::copy::Heartbeat;
@@ -17,6 +18,7 @@ use flux_fs::{DirHandle, Durability, FsError};
 use std::ffi::OsStr;
 use std::io;
 
+pub(crate) use decide::{Discard, Gate, Start, Verdict, decide};
 pub(crate) use sink::{FileSink, SinkError};
 
 /// Files shorter than this are not checkpointed.
