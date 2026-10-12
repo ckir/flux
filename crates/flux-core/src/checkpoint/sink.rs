@@ -180,14 +180,14 @@ impl<'a, D: DirHandle + Send + 'static> FileSink<'a, D> {
         }
     }
 
-    /// Closes the file without waiting. Errors are ignored: a heartbeat failure or a dead writer means the run
+    /// Discards the file's pending records and duplicate without waiting (nothing is flushed). Errors are ignored: a heartbeat failure or a dead writer means the run
     /// abandons the log, which closes every duplicate. A no-op once the sink has ended.
     pub(crate) fn abort(&mut self, beat: &Heartbeat<'_>) {
         if self.ended {
             return;
         }
         self.ended = true;
-        let _ = self.send(Msg::Close { file_id: self.file_id.clone(), ack: None }, beat);
+        let _ = self.send(Msg::Discard { file_id: self.file_id.clone() }, beat);
     }
 }
 
@@ -514,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn abort_sends_close_and_the_writer_drops_the_duplicate() {
+    fn abort_discards_pending_records_and_drops_the_duplicate() {
         let (fs, _dir) = ws();
         let beat: &Heartbeat = &|| Ok(());
         let p = fs.create_new(Path::new("/ws/p")).unwrap();
@@ -522,19 +522,21 @@ mod tests {
         let mut sink =
             FileSink::begin(&fc(&run), &meta(MIB as u64), 0, Some(p.duplicate().unwrap()), beat)
                 .unwrap();
+        sink.wrote(&data(MIB), beat).unwrap();
         let drops = |fs: &FaultFs| {
             fs.calls().iter().filter(|c| c.replace('\\', "/") == "drop_writer(/ws/p)").count()
         };
         assert_eq!(drops(&fs), 0);
         sink.abort(beat);
-        // A drain is answered after the Close before it was handled, so the duplicate is gone by now, with
-        // no Stop (which would also clear it).
+        // A drain is answered after the Discard before it was handled, so the duplicate is gone by now, with
+        // no Stop (which would also clear it). The drain's own flush has nothing left to write.
         drain(&run, beat);
         assert_eq!(drops(&fs), 1);
         sink.abort(beat);
         drop(sink);
         assert!(run.finish(beat).is_clean());
         assert_eq!(drops(&fs), 1);
+        assert!(fs.read_file(WAL_PATH).is_none(), "the aborted file's records were never written");
         drop(p);
     }
 

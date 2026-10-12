@@ -3282,8 +3282,10 @@ mod tests {
     use crate::checkpoint::Discard;
     use std::time::SystemTime;
 
+    /// Every range flushes as soon as the writer handles it: a crashed run's abort discards what is still pending, so the
+    /// checkpoints a test expects to be durable must already be written when the crash comes.
     fn resume_policy(durability: Durability) -> CheckpointPolicy {
-        CheckpointPolicy { range_chunks: 1, ..ckpt_policy(durability, 64, 1 << 50) }
+        CheckpointPolicy { range_chunks: 1, ..ckpt_policy(durability, 64, 1) }
     }
 
     fn run_gen(

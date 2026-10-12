@@ -97,6 +97,11 @@ pub(crate) enum Msg<W> {
         file_id: Vec<u8>,
         ack: Option<mpsc::SyncSender<Option<WalFault>>>,
     },
+    /// The file's copy was abandoned (it failed, or the run lost its lock): drop its pending records and its
+    /// duplicate. Flushes nothing and answers nothing, so no byte reaches the segment because of it.
+    Discard {
+        file_id: Vec<u8>,
+    },
     /// The channel must have capacity >= 1 (see `Close`): a capacity-0 channel loses the answer, because
     /// `try_send` on it never succeeds.
     Drain(mpsc::SyncSender<Failure>),
@@ -360,6 +365,24 @@ impl<D: DirHandle> State<D> {
                         };
                         let _ = ack.try_send(answer);
                     }
+                }
+                Msg::Discard { file_id } => {
+                    // Honoured on a dead log too (there it only drops what is already dropped).
+                    let gone: u64 = self
+                        .pending
+                        .iter()
+                        .filter(|(id, _)| *id == file_id)
+                        .map(|(_, body)| match body {
+                            Body::Range(r) => r.range_end.saturating_sub(r.range_start),
+                            Body::FileBegin(_) => 0,
+                        })
+                        .sum();
+                    self.pending.retain(|(id, _)| *id != file_id);
+                    self.pending_bytes = self.pending_bytes.saturating_sub(gone);
+                    if self.pending.is_empty() {
+                        self.first_pending_at = None;
+                    }
+                    self.dups.remove(&file_id);
                 }
                 Msg::Drain(ack) => {
                     self.flush();
@@ -844,6 +867,91 @@ mod tests {
         drain(&s, beat);
         assert_eq!(s.wal_fault().map(|w| w.code), Some(Code::DiskFull));
         s.send(Msg::Range(range(b"p", 1, 2)), beat).unwrap();
+        s.send(Msg::Stop, beat).unwrap();
+        t.join();
+    }
+
+    /// Wait until every message sent so far was handled, flushing nothing (a `Close` of a file with no pending
+    /// records answers without a flush; `drain` would flush).
+    fn settle(s: &Sender, beat: &Heartbeat<'_>) {
+        let (tx, rx) = mpsc::sync_channel(1);
+        s.send(Msg::Close { file_id: b"nobody".to_vec(), ack: Some(tx) }, beat).unwrap();
+        rx.recv().unwrap();
+    }
+
+    fn body_file(b: &Body) -> &[u8] {
+        match b {
+            Body::FileBegin(f) => &f.file_id,
+            Body::Range(r) => &r.file_id,
+        }
+    }
+
+    #[test]
+    fn discard_drops_the_files_pending_records_and_its_duplicate_and_flushes_nothing() {
+        let (fs, dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let p = fs.create_new(Path::new("/ws/p")).unwrap();
+        let (s, t) = start(dir, 1, cfg(BIG, HOUR, Durability::Strict));
+        s.send(begin_msg(b"p", Some(p.duplicate().unwrap())), beat).unwrap();
+        s.send(Msg::Range(range(b"p", 0, 1)), beat).unwrap();
+        s.send(Msg::Discard { file_id: b"p".to_vec() }, beat).unwrap();
+        settle(&s, beat);
+        let drops =
+            |fs: &FaultFs| calls_unix(fs).iter().filter(|c| *c == "drop_writer(/ws/p)").count();
+        assert_eq!(drops(&fs), 1, "the duplicate was dropped");
+        assert!(wal_bytes(&fs).is_none(), "nothing was appended");
+        s.send(Msg::Stop, beat).unwrap();
+        assert!(t.join().is_clean());
+        assert!(wal_bytes(&fs).is_none(), "not even the Stop flushed the discarded records");
+        assert!(syncs(&fs).is_empty());
+        drop(p);
+    }
+
+    #[test]
+    fn discard_leaves_other_files_pending_records_to_flush_later() {
+        let (fs, dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let (s, t) = start(dir, 1, cfg(BIG, HOUR, Durability::Normal));
+        s.send(begin_msg(b"p", None), beat).unwrap();
+        s.send(Msg::Range(range(b"p", 0, 1)), beat).unwrap();
+        s.send(begin_msg(b"q", None), beat).unwrap();
+        s.send(Msg::Range(range(b"q", 0, 1)), beat).unwrap();
+        s.send(Msg::Discard { file_id: b"p".to_vec() }, beat).unwrap();
+        settle(&s, beat);
+        assert!(wal_bytes(&fs).is_none());
+        s.send(Msg::Stop, beat).unwrap();
+        t.join();
+        let recs = records(&wal_bytes(&fs).unwrap());
+        assert_eq!(recs.len(), 2);
+        assert!(recs.iter().all(|(_, b)| body_file(b) == b"q"), "{recs:?}");
+    }
+
+    #[test]
+    fn discard_keeps_the_flush_threshold_accounting_exact() {
+        let (fs, dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        // The trigger is 5 chunks of pending range bytes.
+        let (s, t) = start(dir, 1, cfg(5 * CHUNK_SIZE, HOUR, Durability::Normal));
+        s.send(begin_msg(b"p", None), beat).unwrap();
+        s.send(Msg::Range(range(b"p", 0, 3)), beat).unwrap();
+        s.send(begin_msg(b"q", None), beat).unwrap();
+        s.send(Msg::Range(range(b"q", 0, 1)), beat).unwrap();
+        settle(&s, beat);
+        assert!(wal_bytes(&fs).is_none(), "4 pending chunks: below the trigger");
+        s.send(Msg::Discard { file_id: b"p".to_vec() }, beat).unwrap();
+        // Stale accounting would count p's 3 chunks still: 3 + 1 + 3 crosses 5 here.
+        s.send(Msg::Range(range(b"q", 1, 4)), beat).unwrap();
+        settle(&s, beat);
+        assert!(wal_bytes(&fs).is_none(), "q's 4 chunks alone: still below the trigger");
+        s.send(Msg::Range(range(b"q", 4, 5)), beat).unwrap();
+        for _ in 0..5000 {
+            if wal_bytes(&fs).is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let recs = records(&wal_bytes(&fs).expect("q's 5 chunks cross the trigger"));
+        assert!(recs.iter().all(|(_, b)| body_file(b) == b"q"), "{recs:?}");
         s.send(Msg::Stop, beat).unwrap();
         t.join();
     }

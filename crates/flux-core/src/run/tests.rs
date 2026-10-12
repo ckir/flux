@@ -5904,11 +5904,37 @@ mod checkpointing {
         );
     }
 
+    // Mutant: `FileSink::abort` sends `Close` again (it flushes the aborted file's pending records after the loss).
+    #[test]
+    fn a_lost_lock_appends_nothing_after_the_loss() {
+        let fs = Arc::new(big_fs(5 * MIB));
+        // Nothing flushes on its own: no threshold, an hour's interval. Ranges are queued as the file streams; the
+        // heartbeat fails 2 MiB in, and the guard of the discard that follows finds the lock gone.
+        stop_beat_at(&fs, 1, 2 * MIB, false, false);
+        let hook: BeforeMutation = {
+            let fs = Arc::clone(&fs);
+            Arc::new(move || {
+                if fs.read_file(partial()).is_some_and(|b| b.len() >= 2 * MIB) {
+                    fs.write_file(LOCK, b"another run's bytes");
+                }
+            })
+        };
+        let c = RunConfig { before_mutation: Some(hook), ..beating() };
+        let (r, _) = run_with(&fs, &c, &opts(), lazy(Durability::Normal));
+        assert!(matches!(&r.copy, Some(Err(_))), "{:?}", r.copy);
+        assert!(!fs.exists(wal()), "no append ever followed the loss: {:?}", calls(&fs));
+        assert_eq!(
+            manifest(&fs, ID).state,
+            OpState::Transferring,
+            "the lost run left its state as it was"
+        );
+    }
+
     // Mutant: a lost lock still calls `finish` (a `Stop`), or the log is left running. (A `Stop` has nothing pending
     // to flush here, because a file's own `Close` flushes it: the run-level property is that the log is joined and the
     // segment is exactly what was flushed before the loss.)
     #[test]
-    fn a_lost_lock_appends_nothing_after_the_loss() {
+    fn a_lost_lock_at_the_publication_guard_appends_nothing_after_the_loss() {
         let fs = Arc::new(big_fs(3 * MIB));
         let at_loss: Arc<Mutex<Option<Vec<u8>>>> = Arc::default();
         // The first guard after the stream is the publication's: the lock is taken over just before it.
@@ -5946,14 +5972,7 @@ mod checkpointing {
         assert!(matches!(&r.copy, Some(Err(_))), "{:?}", r.copy);
         assert_eq!(manifest(&fs, ID).state, OpState::Failed);
         assert!(fs.exists(format!("/p/dest/.flux/operations/{ID}/manifest")));
-        // Whatever the log holds was written by a thread that has since been joined: its handle is dropped.
-        if fs.exists(wal()) {
-            assert!(
-                calls(&fs).iter().any(|c| c == &format!("drop_writer({})", wal())),
-                "{:?}",
-                calls(&fs)
-            );
-        }
+        assert!(!fs.exists(wal()), "the aborted file's queued records were discarded, not flushed");
     }
 
     // Mutants: `Failure.wal` is ignored at the end of the run; the kept partial is removed.
