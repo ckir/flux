@@ -15,6 +15,11 @@ impl ChunkHasher {
         Self { hasher: blake3::Hasher::new(), in_chunk: 0, index: 0 }
     }
 
+    /// A hasher whose next chunk is number `index`, for a resumed file whose earlier chunks are already logged.
+    pub(crate) fn from_chunk(index: u64) -> Self {
+        Self { hasher: blake3::Hasher::new(), in_chunk: 0, index }
+    }
+
     /// The `(chunk_index, digest)` pairs completed by this call, in order.
     pub(crate) fn update(&mut self, mut bytes: &[u8]) -> Vec<(u64, Digest)> {
         let mut done = Vec::new();
@@ -114,5 +119,15 @@ mod tests {
         let mut h = ChunkHasher::new();
         assert_eq!(h.update(&d), vec![(0, b3(&d[..MIB])), (1, b3(&d[MIB..2 * MIB]))]);
         assert_eq!(h.finish(), Some((2, b3(&d[2 * MIB..]))));
+    }
+
+    #[test]
+    fn a_hasher_started_at_chunk_n_numbers_its_digests_from_n() {
+        let d = data(MIB + 7);
+        let mut h = ChunkHasher::from_chunk(5);
+        assert_eq!(h.bytes_seen(), 5 * MIB as u64);
+        assert_eq!(h.update(&d), vec![(5, b3(&d[..MIB]))]);
+        assert_eq!(h.bytes_seen(), 6 * MIB as u64 + 7);
+        assert_eq!(h.finish(), Some((6, b3(&d[MIB..]))));
     }
 }

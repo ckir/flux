@@ -159,6 +159,12 @@ impl<W> WalSender<W> {
     pub(crate) fn failure(&self) -> Failure {
         lock(&self.failure).clone()
     }
+
+    /// The first WAL fault, once `Failure.wal` is set. A dead log keeps its thread alive and discarding, so
+    /// `send` still returns `Ok`; this is how a sender notices the log died.
+    pub(crate) fn wal_fault(&self) -> Option<WalFault> {
+        lock(&self.failure).wal.clone()
+    }
 }
 
 pub(crate) struct WalThread {
@@ -823,6 +829,23 @@ mod tests {
         s.send(Msg::Stop, beat).unwrap();
         let f = t.join();
         assert!(f.wal.is_some());
+    }
+
+    #[test]
+    fn wal_fault_is_some_after_a_failed_append_while_send_still_succeeds() {
+        let (fs, dir) = ws();
+        let p = fs.create_new(Path::new("/ws/p")).unwrap();
+        fs.fail("create_new", Code::DiskFull);
+        let beat: &Heartbeat = &|| Ok(());
+        let (s, t) = start(dir, 1, cfg(BIG, HOUR, Durability::Normal));
+        assert_eq!(s.wal_fault(), None);
+        s.send(begin_msg(b"p", Some(p.duplicate().unwrap())), beat).unwrap();
+        s.send(Msg::Range(range(b"p", 0, 1)), beat).unwrap();
+        drain(&s, beat);
+        assert_eq!(s.wal_fault().map(|w| w.code), Some(Code::DiskFull));
+        s.send(Msg::Range(range(b"p", 1, 2)), beat).unwrap();
+        s.send(Msg::Stop, beat).unwrap();
+        t.join();
     }
 
     #[test]

@@ -438,7 +438,7 @@ pub enum MountRoot {
 /// exempts, because a user who points `DEST` at a symlink has chosen that
 /// destination. The clause protects what is BELOW it.
 pub trait DestinationRoot: FileSystem {
-    type Dir: DirHandle<Writer = Self::Writer>;
+    type Dir: DirHandle<Writer = Self::Writer> + Send + 'static;
 
     /// Resolve `DEST` and return a handle to it.
     ///

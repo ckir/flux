@@ -1,5 +1,6 @@
 //! Flux engine (spec §3.1).
 
+pub(crate) mod checkpoint;
 pub mod cleanup;
 pub mod copy;
 pub mod ids;
