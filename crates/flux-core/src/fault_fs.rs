@@ -115,11 +115,11 @@ struct Inner {
     next_lock_handle: u64,
     /// What `lock_capability` answers; `None` means `LocalStrong`.
     lock_capability: Option<LockCapability>,
-    /// call name -> (which call, an action). The action runs just BEFORE that call, outside the fake's own lock,
+    /// (call name, which call) -> an action. The action runs just BEFORE that call, outside the fake's own lock,
     /// so it can drive the fake itself: "another process acts between two of this one's calls" (cut 7a Part 2's
-    /// protocol tests). Consumed on use.
+    /// protocol tests). Consumed on use. Keyed by both, so two hooks on one name at different counts coexist.
     #[allow(clippy::type_complexity)]
-    hooks: HashMap<String, (u32, Box<dyn FnOnce(&FaultFs) + Send>)>,
+    hooks: HashMap<(String, u32), Box<dyn FnOnce(&FaultFs) + Send>>,
     /// Windows' legacy delete (cut 7a Part 1 capstone; `set_legacy_delete`).
     legacy_delete: bool,
     /// Object index -> live `FakeLock` handles on it.
@@ -993,7 +993,7 @@ impl FaultFs {
 
     /// Run `action` just before the `nth` call to `name` (1-based, counted like `fail_nth`).
     pub fn on_nth(&self, name: &str, nth: u32, action: impl FnOnce(&FaultFs) + Send + 'static) {
-        self.inner.lock().unwrap().hooks.insert(name.to_string(), (nth, Box::new(action)));
+        self.inner.lock().unwrap().hooks.insert((name.to_string(), nth), Box::new(action));
     }
 
     /// Windows' legacy delete semantics (a volume without POSIX delete; cut 7a Part 1 capstone). A file removed while
@@ -1181,11 +1181,8 @@ impl FaultFs {
             *c += 1;
             *c
         };
-        let hook = match g.hooks.get(key) {
-            Some((at, _)) if *at == n => g.hooks.remove(key),
-            _ => None,
-        };
-        if let Some((_, action)) = hook {
+        let hook = g.hooks.remove(&(key.to_string(), n));
+        if let Some(action) = hook {
             // Released first: the action calls back into the fake, and `std::sync::Mutex` is not reentrant.
             drop(g);
             action(&FaultFs { inner: std::sync::Arc::clone(&self.inner) });
@@ -2674,6 +2671,16 @@ mod tests {
         assert!(fs.metadata(Path::new("/b")).is_err(), "first call: the hook has not run");
         assert!(fs.metadata(Path::new("/b")).is_ok(), "second call: the hook ran just before it");
         assert!(fs.metadata(Path::new("/b")).is_ok(), "a hook runs once");
+    }
+
+    #[test]
+    fn two_hooks_on_one_name_at_different_counts_both_run() {
+        use flux_fs::FileSystem;
+        let fs = FaultFs::new();
+        fs.on_nth("metadata", 1, |fs| fs.write_file("/a", b"x"));
+        fs.on_nth("metadata", 2, |fs| fs.write_file("/b", b"y"));
+        assert!(fs.metadata(Path::new("/a")).is_ok(), "first call: the first hook ran");
+        assert!(fs.metadata(Path::new("/b")).is_ok(), "second call: the second hook ran");
     }
 
     #[test]
