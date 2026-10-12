@@ -732,6 +732,46 @@ impl FileHandle for FakeHandle {
         }
         Ok(g.identities.get(&self.path).copied().unwrap_or(flux_fs::FileIdentity::Unavailable))
     }
+
+    fn duplicate(&self) -> Result<Self> {
+        let Some(sink) = &self.sink else {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::other("a reader cannot be duplicated"),
+            ));
+        };
+        sink.lock().unwrap().calls.push(format!("duplicate({})", self.path.display()));
+        Ok(FakeHandle {
+            path: self.path.clone(),
+            buf: Vec::new(),
+            read_pos: 0,
+            sink: Some(sink.clone()),
+            sync_fault: self.sync_fault.clone(),
+            write_fault: self.write_fault.clone(),
+        })
+    }
+
+    fn truncate_to(&mut self, len: u64) -> Result<()> {
+        let Some(sink) = &self.sink else {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::other("a reader cannot be truncated"),
+            ));
+        };
+        let mut g = sink.lock().unwrap();
+        let current = g.files.get(&self.path).map_or(0, |f| f.len() as u64);
+        if len > current {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "truncate_to cannot extend"),
+            ));
+        }
+        if let Some(f) = g.files.get_mut(&self.path) {
+            f.truncate(len as usize);
+        }
+        g.calls.push(format!("truncate_to({}, {len})", self.path.display()));
+        Ok(())
+    }
 }
 
 /// A lock file in the fake. It addresses its OBJECT (by identity), so a rename carries it.
@@ -1999,6 +2039,52 @@ impl DirHandle for FakeDirHandle {
 mod tests {
     use super::*;
     use flux_fs::FileIdentity;
+
+    #[test]
+    fn a_duplicate_syncs_the_same_file_from_another_thread() {
+        let fs = FaultFs::new();
+        let mut w = fs.create_new(Path::new("/p")).unwrap();
+        w.write_all(b"hello").unwrap();
+        let d = w.duplicate().unwrap();
+        std::thread::scope(|s| {
+            s.spawn(move || d.sync_all().unwrap());
+        });
+        w.write_all(b"!").unwrap();
+        assert_eq!(fs.read_file("/p").unwrap(), b"hello!");
+    }
+
+    #[test]
+    fn truncate_to_cuts_the_tail_and_positions_the_next_write() {
+        let fs = FaultFs::new();
+        let mut w = fs.create_new(Path::new("/p")).unwrap();
+        w.write_all(b"hello world").unwrap();
+        w.truncate_to(5).unwrap();
+        w.write_all(b"!").unwrap();
+        assert_eq!(fs.read_file("/p").unwrap(), b"hello!");
+    }
+
+    #[test]
+    fn truncate_to_refuses_to_extend() {
+        let fs = FaultFs::new();
+        let mut w = fs.create_new(Path::new("/p")).unwrap();
+        w.write_all(b"hello").unwrap();
+        let e = w.truncate_to(100).unwrap_err();
+        assert_eq!(e.code, Code::DestinationError);
+        assert_eq!(e.source.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(fs.read_file("/p").unwrap(), b"hello");
+    }
+
+    #[test]
+    fn the_fake_records_duplicate_and_truncate_to() {
+        let fs = FaultFs::new();
+        let mut w = fs.create_new(Path::new("/p")).unwrap();
+        w.write_all(b"hello world").unwrap();
+        let _d = w.duplicate().unwrap();
+        w.truncate_to(5).unwrap();
+        let calls = fs.calls();
+        let at = |name: &str| calls.iter().position(|c| c == name).unwrap();
+        assert!(at("duplicate(/p)") < at("truncate_to(/p, 5)"));
+    }
 
     #[test]
     fn a_dropped_writer_is_recorded_and_a_dropped_reader_is_not() {

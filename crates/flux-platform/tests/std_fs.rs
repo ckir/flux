@@ -1,4 +1,4 @@
-use flux_fs::{FileIdentity, FileSystem};
+use flux_fs::{Code, FileHandle, FileIdentity, FileSystem};
 use flux_platform::StdFileSystem;
 use std::io::Write;
 use tempfile::TempDir;
@@ -931,4 +931,41 @@ fn zz_identity_probe() {
     assert!(free.is_ok(), "a free name must still be claimable on this volume");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_duplicate_syncs_the_same_file_from_another_thread() {
+    let d = TempDir::new().unwrap();
+    let p = d.path().join("a");
+    let mut w = StdFileSystem.create_new(&p).unwrap();
+    w.write_all(b"hello").unwrap();
+    let dup = w.duplicate().unwrap();
+    std::thread::scope(|s| {
+        s.spawn(move || dup.sync_all().unwrap());
+    });
+    w.write_all(b"!").unwrap();
+    assert_eq!(std::fs::read(&p).unwrap(), b"hello!");
+}
+
+#[test]
+fn truncate_to_cuts_the_tail_and_positions_the_next_write() {
+    let d = TempDir::new().unwrap();
+    let p = d.path().join("a");
+    let mut w = StdFileSystem.create_new(&p).unwrap();
+    w.write_all(b"hello world").unwrap();
+    w.truncate_to(5).unwrap();
+    w.write_all(b"!").unwrap();
+    assert_eq!(std::fs::read(&p).unwrap(), b"hello!");
+}
+
+#[test]
+fn truncate_to_refuses_to_extend() {
+    let d = TempDir::new().unwrap();
+    let p = d.path().join("a");
+    let mut w = StdFileSystem.create_new(&p).unwrap();
+    w.write_all(b"hello").unwrap();
+    let e = w.truncate_to(100).unwrap_err();
+    assert_eq!(e.code, Code::DestinationError);
+    assert_eq!(e.source.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(std::fs::read(&p).unwrap(), b"hello");
 }

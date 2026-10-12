@@ -104,6 +104,18 @@ pub trait FileHandle: Write {
     /// The identity of the file this handle HOLDS - never of a path (cut 7b): a rename keeps it, so the copy reads the
     /// published target's identity from its temporary's handle.
     fn identity(&self) -> Result<FileIdentity>;
+
+    /// An OS-level duplicate of this handle (`File::try_clone`: `dup` on POSIX, `DuplicateHandle` on Windows). It
+    /// shares the open file description, so `sync_all` on the duplicate syncs the same file, and it may be moved to
+    /// another thread while this handle keeps writing. Never follows anything: this is a handle, not a path.
+    fn duplicate(&self) -> Result<Self>
+    where
+        Self: Sized;
+
+    /// Makes the file exactly `len` bytes long and positions the next `write` at `len`. Never follows anything: this
+    /// is a handle, not a path. A `len` greater than the current length is refused (`Code::DestinationError`, kind
+    /// `InvalidInput`): this cuts a tail, it never extends the file.
+    fn truncate_to(&mut self, len: u64) -> Result<()>;
 }
 
 pub trait FileSystem: Send + Sync {
@@ -122,7 +134,7 @@ pub trait FileSystem: Send + Sync {
     type Reader: Read;
 
     /// A handle open for writing, used for the temporary.
-    type Writer: FileHandle + Sync;
+    type Writer: FileHandle + Sync + Send;
 
     fn open_read(&self, path: &Path) -> Result<Self::Reader>;
 
@@ -224,7 +236,7 @@ pub trait FileSystem: Send + Sync {
 /// Where the error KIND is stated below, both existing implementations were
 /// measured to agree on it, and a third should too: the engine branches on it.
 pub trait DirHandle: Sized {
-    type Writer: FileHandle + Sync;
+    type Writer: FileHandle + Sync + Send;
 
     /// A lock file held open for reading and writing (§96.1). See `crate::LockFile`.
     type Lock: crate::LockFile;
@@ -443,6 +455,18 @@ mod tests {
         }
         fn identity(&self) -> crate::Result<crate::FileIdentity> {
             Ok(crate::FileIdentity::Unavailable)
+        }
+        fn duplicate(&self) -> crate::Result<Self> {
+            Err(crate::FsError::new(
+                crate::Code::DestinationError,
+                std::io::Error::other("NullWriter cannot duplicate"),
+            ))
+        }
+        fn truncate_to(&mut self, _: u64) -> crate::Result<()> {
+            Err(crate::FsError::new(
+                crate::Code::DestinationError,
+                std::io::Error::other("NullWriter cannot truncate"),
+            ))
         }
     }
 

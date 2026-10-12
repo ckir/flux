@@ -762,6 +762,18 @@ mod tests {
         fn identity(&self) -> Result<flux_fs::FileIdentity> {
             Ok(flux_fs::FileIdentity::Unavailable)
         }
+        fn duplicate(&self) -> Result<Self> {
+            Err(flux_fs::FsError::new(
+                flux_fs::Code::DestinationError,
+                std::io::Error::other("NeverHandle is never used"),
+            ))
+        }
+        fn truncate_to(&mut self, _: u64) -> Result<()> {
+            Err(flux_fs::FsError::new(
+                flux_fs::Code::DestinationError,
+                std::io::Error::other("NeverHandle is never used"),
+            ))
+        }
     }
 
     struct EscapingFs;

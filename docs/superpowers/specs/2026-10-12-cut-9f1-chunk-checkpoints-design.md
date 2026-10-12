@@ -118,8 +118,8 @@ starved by a full checkpoint channel; a measurable slowdown of an uninterrupted 
 9f-1 therefore adds, in `flux-fs`, with an implementation for the real filesystems and a model in `FaultFs` (the plan counts the touch points; none is measured here): (1) open an EXISTING child of a directory handle for writing without
 truncation, handle-relative like `create_new`, with the Windows share flags the existing publication and cleanup paths need, and with the containment contract of `create_new` (`fs.rs:258-264`): it judges the NAME, never its target, so it
 must not follow a symlink or junction planted at the partial's name between the crash and the resume (non-following open flags, then a check that the handle is a regular file whose `FileIdentity` equals the one the gate saw); a planted link is refused
-as a safety rejection, and a test plants one; (2) `set_len`; (3) positioning at the resume offset; (4) an OS-level duplicate of a write handle usable for `sync_all` on another thread (decision 6);
-(5) a handle-relative read of the destination partial for chunk validation, if `DirHandle` has none (the plan checks; `FileSystem::open_read` is path-based, `fs.rs:127`). Each new method is covered by the conformance suite the existing methods use.
+as a safety rejection, and a test plants one; (2) `truncate_to(len)`, which cuts the file to `len` and positions the next write there, and refuses to extend (ruling 2 of plan 1, Task 1: `set_len` and positioning are one method, so a caller cannot truncate without positioning); (3) an OS-level duplicate of a write handle usable for `sync_all` on another thread (decision 6);
+(4) `FileSystem::Writer` and `DirHandle::Writer` are `Send` as well as `Sync` (ruling 5 of plan 1, Task 1: the duplicate and the writer move to other threads); (5) a handle-relative read of the destination partial for chunk validation, if `DirHandle` has none (the plan checks; `FileSystem::open_read` is path-based, `fs.rs:127`). Each new method is covered by the conformance suite the existing methods use.
 
 ## Rulings (both ACCEPTED by the owner 2026-10-12, as written)
 

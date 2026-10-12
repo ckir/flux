@@ -6,11 +6,11 @@
 //! that, and Section 241.5 is amended in Task 9 to name it.
 
 use flux_fs::{
-    DirEntry, FileHandle, FileIdentity, FileSystem, FileType, FsError, Metadata, ObjectId, Perms,
-    Result,
+    Code, DirEntry, FileHandle, FileIdentity, FileSystem, FileType, FsError, Metadata, ObjectId,
+    Perms, Result,
 };
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 #[cfg(unix)]
 use std::time::Duration;
@@ -53,6 +53,23 @@ impl FileHandle for StdFile {
     #[cfg(windows)]
     fn identity(&self) -> Result<FileIdentity> {
         Ok(identity_of_handle(&self.0))
+    }
+
+    fn duplicate(&self) -> Result<Self> {
+        self.0.try_clone().map(StdFile).map_err(FsError::from_io)
+    }
+
+    fn truncate_to(&mut self, len: u64) -> Result<()> {
+        let current = self.0.metadata().map_err(FsError::from_io)?.len();
+        if len > current {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "truncate_to cannot extend"),
+            ));
+        }
+        self.0.set_len(len).map_err(FsError::from_io)?;
+        Seek::seek(&mut self.0, SeekFrom::Start(len)).map_err(FsError::from_io)?;
+        Ok(())
     }
 }
 
