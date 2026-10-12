@@ -1160,8 +1160,12 @@ fn copy_one<F: DestinationRoot>(
     let own = |status| ClaimRecord { target: target.clone(), status };
     // Cut 9f-1: the file's checkpoint identity is the claim key of the TARGET name (never the stored name of a
     // replacement), built only for a run that checkpoints.
+    // Only a file at or above the run's threshold gets a context (its length is read here, since the New path has not
+    // looked at the source): a smaller file takes the unchanged path, with no extra guard. `stage_file` filters again.
     let file_ckpt = |key: &ClaimKey| {
-        cx.ckpt.map(|run| FileCkpt {
+        let run = cx.ckpt?;
+        let len = cx.fs.metadata(&src).ok()?.len;
+        (len >= run.min_len()).then(|| FileCkpt {
             run,
             file_id: key.encode(),
             destination: path.as_os_str().as_encoded_bytes().to_vec(),

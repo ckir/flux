@@ -1113,10 +1113,8 @@ fn a_refusal_of_the_lock_names_the_lock_path() {
 #[test]
 fn the_hook_runs_once_before_each_guarded_mutation() {
     // A tree's guarded mutations: `a`'s sweep, temporary and publish; `sub`'s creation; `sub/b`'s three; `sub`'s
-    // directory-end flush (cut 8b); and, since the tree run checkpoints (cut 9f-1), each file's sweep after its claim,
-    // behind its own guard (`stage_file`'s `ckpt.is_some()` path, whatever the file's length): 8 + 2. A single file's:
-    // its sweep, temporary and publish.
-    for (tree_run, expected) in [(true, 10), (false, 3)] {
+    // directory-end flush (cut 8b). A single file's: its sweep, temporary and publish.
+    for (tree_run, expected) in [(true, 8), (false, 3)] {
         let fs = fake();
         let count = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&count);
@@ -1139,17 +1137,16 @@ fn a_hook_that_never_returns_stops_the_copy_before_that_mutation() {
     let fs = fake();
     let count = Arc::new(AtomicUsize::new(0));
     let seen = Arc::clone(&count);
-    // The fourth guarded mutation is `a`'s publish (its sweep, temporary, the sweep after the claim that a
-    // checkpointing run adds, then the publish); the CLI's hook blocks there forever, this one panics instead.
+    // The third guarded mutation is `a`'s publish; the CLI's hook blocks there forever, this one panics instead.
     let hook: BeforeMutation = Arc::new(move || {
-        if seen.fetch_add(1, Ordering::SeqCst) + 1 == 4 {
+        if seen.fetch_add(1, Ordering::SeqCst) + 1 == 3 {
             panic!("the test's stall point");
         }
     });
     let c = RunConfig { before_mutation: Some(hook), ..cfg() };
     let stalled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_tree(&fs, &c)));
     assert!(stalled.is_err(), "the hook stopped the run");
-    assert_eq!(count.load(Ordering::SeqCst), 4);
+    assert_eq!(count.load(Ordering::SeqCst), 3);
     assert!(fs.exists(format!("/p/dest/a.flux-partial.{ID}")), "the temporary was made");
     assert!(!fs.exists("/p/dest/a"), "the publish did not happen");
 }
@@ -6012,6 +6009,31 @@ mod checkpointing {
         assert_eq!((a.error.code(), a.error.step), (Code::WalWriteFailed, CopyStep::Checkpoint));
         assert!(fs.exists(partial()), "the temporary is kept");
         assert_eq!(manifest(&fs, ID).state, OpState::Failed);
+    }
+
+    // Mutant: `file_ckpt` in `copy_one` returns `Some` for every file (no length gate).
+    #[test]
+    fn a_file_below_the_checkpoint_threshold_takes_the_unchanged_path_in_a_checkpointing_run() {
+        let guards = |p: CheckpointPolicy| {
+            let fs = FaultFs::new();
+            for d in ["/src", "/p"] {
+                fs.create_dir(Path::new(d)).unwrap();
+            }
+            fs.write_file("/src/small", &pattern(MIB / 2));
+            let count = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&count);
+            let hook: BeforeMutation = Arc::new(move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+            });
+            let c = RunConfig { before_mutation: Some(hook), ..cfg() };
+            ok(&run_with(&fs, &c, &opts(), p).0);
+            (count.load(Ordering::SeqCst), calls(&fs).len())
+        };
+        let checkpointing = guards(lazy(Durability::Normal));
+        // A threshold above every file: the context is never made, whatever the run opened.
+        let never = guards(CheckpointPolicy { min_len: u64::MAX, ..lazy(Durability::Normal) });
+        assert_eq!(checkpointing.0, never.0, "the same guard count");
+        assert_eq!(checkpointing.0, 3, "sweep, temporary, publish: the unchanged path");
     }
 
     // Mutant: `run::file` opens a log.
