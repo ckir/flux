@@ -55,7 +55,7 @@ impl std::fmt::Display for WalError {
             WalError::Corrupt { at, why } => write!(f, "corrupt log at byte {at}: {why}"),
             WalError::SequenceConflict { generation, sequence } => write!(
                 f,
-                "the log already holds generation {generation} at or beyond sequence {sequence}"
+                "generation {generation}, sequence {sequence} conflicts with the records already in the log"
             ),
             WalError::Unsupported { format, checksum } => {
                 write!(f, "unsupported log format {format} (checksum {checksum})")
@@ -282,7 +282,7 @@ pub(crate) fn load_file<R: Read>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::super::CHUNK_SIZE;
     use super::super::record::{Body, FileBegin, Header, Range, encode};
     use super::*;
@@ -295,7 +295,7 @@ mod tests {
         Header { operation_id: OP.to_vec(), generation, sequence }
     }
 
-    fn begin(file: u8, valid_through: u64) -> Body {
+    pub(crate) fn begin(file: u8, valid_through: u64) -> Body {
         Body::FileBegin(FileBegin {
             file_id: vec![file],
             attempt_id: 1,
@@ -309,7 +309,7 @@ mod tests {
     }
 
     /// A range of whole chunks starting at chunk `first`, digest `i` being `[tag + i; 32]`.
-    fn range(file: u8, first: u64, count: u64, tag: u8) -> Body {
+    pub(crate) fn range(file: u8, first: u64, count: u64, tag: u8) -> Body {
         Body::Range(Range {
             file_id: vec![file],
             attempt_id: 1,
@@ -323,7 +323,7 @@ mod tests {
         encode(&header(g, s), body)
     }
 
-    fn stream(records: &[(u64, u64, Body)]) -> Vec<u8> {
+    pub(crate) fn stream(records: &[(u64, u64, Body)]) -> Vec<u8> {
         records.iter().flat_map(|(g, s, b)| one(*g, *s, b)).collect()
     }
 

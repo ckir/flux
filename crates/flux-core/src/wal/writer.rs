@@ -91,7 +91,8 @@ pub(crate) enum Msg<W> {
         dup: Option<W>,
     },
     Range(Range),
-    #[cfg(test)]
+    /// Flush now. Spec decision 9 (V16 s132/s187): the writer drains on request, kept for a future cancellation cut.
+    #[cfg_attr(not(test), allow(dead_code))]
     Flush,
     /// The `ack` channel must have capacity >= 1: the answer is delivered with `try_send`, so a zero-capacity
     /// or dropped receiver is ignored and never blocks the thread (and a capacity-0 channel loses the answer).
@@ -106,7 +107,9 @@ pub(crate) enum Msg<W> {
     },
     /// The channel must have capacity >= 1 (see `Close`): a capacity-0 channel loses the answer, because
     /// `try_send` on it never succeeds.
-    #[cfg(test)]
+    /// Flush, then answer with the failure state. Spec decision 9 (V16 s132/s187): drain on request, kept for
+    /// cancellation.
+    #[cfg_attr(not(test), allow(dead_code))]
     Drain(mpsc::SyncSender<Failure>),
     Stop,
 }
@@ -356,7 +359,6 @@ impl<D: DirHandle> State<D> {
                     let bytes = r.range_end.saturating_sub(r.range_start);
                     self.push(r.file_id.clone(), Body::Range(r), bytes);
                 }
-                #[cfg(test)]
                 Msg::Flush => self.flush(),
                 Msg::Close { file_id, ack } => {
                     // File completion is a permitted early flush; the duplicate outlives every pending record.
@@ -390,7 +392,6 @@ impl<D: DirHandle> State<D> {
                     }
                     self.dups.remove(&file_id);
                 }
-                #[cfg(test)]
                 Msg::Drain(ack) => {
                     self.flush();
                     let snapshot = lock(&self.failure).clone();
@@ -1111,6 +1112,35 @@ mod tests {
         assert_eq!(f.code, Code::DiskFull);
         s.send(Msg::Stop, beat).unwrap();
         t.join();
+    }
+
+    #[test]
+    fn sequence_conflict_text_is_true_for_both_producers() {
+        use crate::wal::replay::tests::{begin as rbegin, range as rrange, stream};
+        // The writer: the log holds generation 2, the run is generation 1.
+        let (fs, dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let (s, t) = start(dir, 2, cfg(BIG, HOUR, Durability::Normal));
+        s.send(begin_msg(b"p", None), beat).unwrap();
+        s.send(Msg::Stop, beat).unwrap();
+        t.join();
+        let again = fs.destination_root(Path::new("/ws")).unwrap();
+        let err = open(again, OP.to_vec(), 1, cfg(BIG, HOUR, Durability::Normal)).err().unwrap();
+        assert_eq!(
+            err.to_string(),
+            "generation 1, sequence 1 conflicts with the records already in the log"
+        );
+        // The replay: a duplicate (generation 1, sequence 2) pair with different payloads.
+        let bytes = stream(&[
+            (1, 1, rbegin(b'A', 0)),
+            (1, 2, rrange(b'A', 0, 1, 1)),
+            (1, 2, rrange(b'A', 0, 1, 9)),
+        ]);
+        let err = crate::wal::replay::scan(std::io::Cursor::new(bytes), b"op-replay").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "generation 1, sequence 2 conflicts with the records already in the log"
+        );
     }
 
     #[test]
