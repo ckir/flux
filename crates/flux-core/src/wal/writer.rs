@@ -613,8 +613,18 @@ mod tests {
         rx.recv().unwrap()
     }
 
+    /// The call log with every path separator normalised to `/`. The fake builds child paths with `Path::join`,
+    /// which yields `\` on Windows, and its log is an ORDER oracle, not a path oracle.
+    fn unix(calls: Vec<String>) -> Vec<String> {
+        calls.into_iter().map(|c| c.replace('\\', "/")).collect()
+    }
+
+    fn calls_unix(fs: &FaultFs) -> Vec<String> {
+        unix(fs.calls())
+    }
+
     fn syncs(fs: &FaultFs) -> Vec<String> {
-        fs.calls().into_iter().filter(|c| c.starts_with("sync_all(")).collect()
+        calls_unix(fs).into_iter().filter(|c| c.starts_with("sync_all(")).collect()
     }
 
     fn pos(calls: &[String], entry: &str) -> usize {
@@ -634,7 +644,7 @@ mod tests {
         // The thread has certainly seen the begin once a Drain is answered... which flushes. Use the log instead:
         // nothing but the setup's own call may mention the WAL until a flush.
         assert!(wal_bytes(&fs).is_none());
-        assert!(!fs.calls().iter().any(|c| c == "create_dir(/ws/wal)"));
+        assert!(!calls_unix(&fs).iter().any(|c| c == "create_dir(/ws/wal)"));
         s.send(Msg::Stop, beat).unwrap();
         t.join();
         let r = records(&wal_bytes(&fs).unwrap());
@@ -679,7 +689,7 @@ mod tests {
         s.send(Msg::Stop, beat).unwrap();
         t.join();
         assert!(wal_bytes(&fs).is_none());
-        assert!(!fs.calls().iter().any(|c| c.starts_with("create_dir(/ws/wal")));
+        assert!(!calls_unix(&fs).iter().any(|c| c.starts_with("create_dir(/ws/wal")));
         assert!(syncs(&fs).is_empty());
     }
 
@@ -696,7 +706,7 @@ mod tests {
         // `FakeHandle::sync_all` does not pass through `FaultFs::record`, so `on_nth("sync_all", ..)` never fires.
         // The call log carries the same fact: the WAL's directory and segment are created only after the
         // partial's sync, so the WAL was absent when it ran.
-        let calls = fs.calls();
+        let calls = calls_unix(&fs);
         let partial = pos(&calls, "sync_all(/ws/p)");
         assert!(pos(&calls, "create_dir(/ws/wal)") > partial);
         assert!(pos(&calls, "create_new(/ws/wal/000001)") > partial);
@@ -761,7 +771,7 @@ mod tests {
         let f = drain(&s, beat);
         assert_eq!(f.wal.as_ref().map(|w| w.code), Some(Code::DiskFull));
         // The failure released the duplicate (and only it: the original `p` is still alive) before any later send.
-        let drops = fs.calls().iter().filter(|c| *c == "drop_writer(/ws/p)").count();
+        let drops = calls_unix(&fs).iter().filter(|c| *c == "drop_writer(/ws/p)").count();
         assert_eq!(drops, 1);
         // 100 more sends against a dead log: each returns. A transiently full channel is fine (the thread is
         // still receiving); a beat budget of 500 (about 5 s of waiting) means the thread stopped receiving.
@@ -793,7 +803,7 @@ mod tests {
         s.send(begin_msg(b"p", Some(p.duplicate().unwrap())), beat).unwrap();
         s.send(Msg::Close { file_id: b"p".to_vec(), ack: None }, beat).unwrap();
         drain(&s, beat);
-        let drops = fs.calls().iter().filter(|c| *c == "drop_writer(/ws/p)").count();
+        let drops = calls_unix(&fs).iter().filter(|c| *c == "drop_writer(/ws/p)").count();
         assert_eq!(drops, 1);
         s.send(Msg::Stop, beat).unwrap();
         t.join();
@@ -812,7 +822,7 @@ mod tests {
         s.send(Msg::Stop, beat).unwrap();
         let f = t.join();
         assert!(f.is_clean());
-        let calls = fs.calls();
+        let calls = calls_unix(&fs);
         assert!(pos(&calls, "sync_all(/ws/p)") < pos(&calls, "drop_writer(/ws/p)"));
         assert_eq!(records(&wal_bytes(&fs).unwrap()).len(), 2);
         drop(p);
@@ -923,7 +933,7 @@ mod tests {
         let err = open(again, OP.to_vec(), 1, cfg(BIG, HOUR, Durability::Normal)).err();
         assert!(matches!(err, Some(WalError::SequenceConflict { generation: 1, sequence: 1 })));
         assert_eq!(wal_bytes(&fs).unwrap(), before);
-        let calls = fs.calls();
+        let calls = calls_unix(&fs);
         assert!(!calls.iter().any(|c| c.starts_with("open_existing(")));
         assert!(!calls.iter().any(|c| c.starts_with("truncate_to(")));
     }
@@ -942,7 +952,7 @@ mod tests {
             Some(WalError::Io(e)) => assert_eq!(e.source.kind(), io::ErrorKind::Unsupported),
             other => panic!("expected Io(Unsupported), got {other:?}"),
         }
-        assert!(!fs.calls().iter().any(|c| c.starts_with("open_existing(")));
+        assert!(!calls_unix(&fs).iter().any(|c| c.starts_with("open_existing(")));
     }
 
     #[test]
@@ -956,7 +966,7 @@ mod tests {
         drop(s);
         t.join();
         assert!(wal_bytes(&fs).is_none());
-        assert!(fs.calls().iter().any(|c| c == "drop_writer(/ws/p)"));
+        assert!(calls_unix(&fs).iter().any(|c| c == "drop_writer(/ws/p)"));
         drop(p);
     }
 
@@ -1085,7 +1095,7 @@ mod tests {
         let (s, t, found) = open(again, OP.to_vec(), 1, c).expect("reopen");
         assert_eq!(found.expect("a scan").valid_len, len);
         assert_eq!(wal_bytes(&fs).unwrap().len() as u64, len);
-        assert!(fs.calls().contains(&format!("truncate_to({WAL_PATH}, {len})")));
+        assert!(calls_unix(&fs).contains(&format!("truncate_to({WAL_PATH}, {len})")));
         s.send(Msg::Range(range(b"p", 1, 2)), beat).unwrap();
         s.send(Msg::Stop, beat).unwrap();
         t.join();
@@ -1248,7 +1258,7 @@ mod tests {
     }
 
     fn dir_syncs(fs: &FaultFs) -> Vec<String> {
-        fs.calls().into_iter().filter(|c| c.starts_with("sync_dir(")).collect()
+        calls_unix(fs).into_iter().filter(|c| c.starts_with("sync_dir(")).collect()
     }
 
     #[test]
@@ -1259,7 +1269,7 @@ mod tests {
         let (s, t) = start(dir, 1, cfg(BIG, HOUR, Durability::Strict));
         s.send(begin_msg(b"p", Some(p.duplicate().unwrap())), beat).unwrap();
         drain(&s, beat);
-        let calls = fs.calls();
+        let calls = calls_unix(&fs);
         let seg = pos(&calls, "sync_all(/ws/wal/000001)");
         assert!(pos(&calls, "sync_dir(/ws/wal)") > seg);
         assert!(pos(&calls, "sync_dir(/ws)") > seg);
@@ -1315,6 +1325,44 @@ mod tests {
         s.send(begin_msg(b"p", Some(p.duplicate().unwrap())), beat).unwrap();
         let f = drain(&s, beat);
         assert_eq!(f.wal.as_ref().map(|w| w.code), Some(Code::IoError));
+        s.send(Msg::Stop, beat).unwrap();
+        t.join();
+    }
+
+    #[test]
+    fn the_call_log_helper_normalises_windows_separators() {
+        let raw = vec![
+            "sync_all(/ws\\wal\\000001)".to_owned(),
+            "truncate_to(/ws\\wal\\000001, 7)".to_owned(),
+            "sync_all(/ws/p)".to_owned(),
+        ];
+        assert_eq!(
+            unix(raw),
+            ["sync_all(/ws/wal/000001)", "truncate_to(/ws/wal/000001, 7)", "sync_all(/ws/p)"]
+        );
+    }
+
+    #[test]
+    fn the_payload_bound_is_exact() {
+        let (fs, dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let (s, t) = start(dir, 1, cfg(BIG, HOUR, Durability::Normal));
+        // A Range payload is 4 + L + 8 + 8 + 8 + 4 + 32n; one digest (an empty range does not decode) gives
+        // 64 + L, so L = MAX_PAYLOAD - 64 is exactly at the bound.
+        let at_bound = vec![1u8; MAX_PAYLOAD as usize - 64];
+        let over = vec![2u8; MAX_PAYLOAD as usize - 64 + 1];
+        s.send(Msg::Range(range(&at_bound, 0, 1)), beat).unwrap();
+        s.send(Msg::Range(range(&over, 0, 1)), beat).unwrap();
+        let f = drain(&s, beat);
+        assert!(!f.files.contains_key(&at_bound));
+        let fault = &f.files[&over];
+        assert_eq!(fault.kind, io::ErrorKind::InvalidInput);
+        assert_eq!(fault.message, "range too large for one record");
+        let bytes = wal_bytes(&fs).unwrap();
+        // `records` panics unless the record decodes as `Record`.
+        let r = records(&bytes);
+        assert_eq!(r.len(), 1);
+        assert!(matches!(&r[0].1, Body::Range(x) if x.file_id == at_bound));
         s.send(Msg::Stop, beat).unwrap();
         t.join();
     }
