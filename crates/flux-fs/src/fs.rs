@@ -239,6 +239,9 @@ pub trait FileSystem: Send + Sync {
 pub trait DirHandle: Sized {
     type Writer: FileHandle + Sync + Send;
 
+    /// A child file opened for streaming reads (`open_read`). Read only: it has no write half.
+    type Reader: std::io::Read;
+
     /// A lock file held open for reading and writing (§96.1). See `crate::LockFile`.
     type Lock: crate::LockFile;
 
@@ -370,6 +373,13 @@ pub trait DirHandle: Sized {
     /// kind `IsADirectory`); any other non-regular file where the platform can tell (`Code::DestinationError`). A
     /// missing name is `Code::IoError` with kind `NotFound`.
     fn read_file(&self, name: &std::ffi::OsStr, limit: usize) -> Result<Vec<u8>>;
+
+    /// Open a child REGULAR FILE for streaming reads, never following a link.
+    ///
+    /// Refuses exactly as `read_file` does: a name-surrogate (`Code::SafetyRejected`); a directory
+    /// (`Code::DestinationError`, kind `IsADirectory`); any other non-regular file where the platform can tell
+    /// (`Code::DestinationError`). A missing name is `Code::IoError` with kind `NotFound`.
+    fn open_read(&self, name: &std::ffi::OsStr) -> Result<Self::Reader>;
 
     /// Remove an EMPTY child directory (`rmdir`).
     ///

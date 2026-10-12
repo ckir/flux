@@ -87,6 +87,11 @@ pub(crate) fn std_file_from(f: File) -> StdFile {
     StdFile(f)
 }
 
+/// A `StdReader` over an already-opened file, for the handle arms that open by name relative to a directory.
+pub(crate) fn std_reader_from(f: File) -> StdReader {
+    StdReader(f)
+}
+
 pub struct StdFileSystem;
 
 /// Can this process actually replace the destination NAME?

@@ -563,6 +563,50 @@ mod posix {
         }
         assert_ne!(root.identity().unwrap(), sub.identity().unwrap());
     }
+
+    #[test]
+    fn open_read_streams_a_child_file() {
+        use std::io::{Read, Write};
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let mut w = root.create_new(OsStr::new("f")).unwrap();
+        w.write_all(&bytes).unwrap();
+        drop(w);
+        let mut r = root.open_read(OsStr::new("f")).unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, bytes);
+    }
+
+    #[test]
+    fn open_read_refuses_a_symlink_as_safety_rejected() {
+        let d = TempDir::new().unwrap();
+        std::fs::write(d.path().join("f"), b"target").unwrap();
+        std::os::unix::fs::symlink("f", d.path().join("l")).unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let Err(e) = root.open_read(OsStr::new("l")) else { panic!("a link must not be followed") };
+        assert_eq!(e.code, flux_fs::Code::SafetyRejected, "{e:?}");
+    }
+
+    #[test]
+    fn open_read_refuses_a_directory() {
+        let d = TempDir::new().unwrap();
+        std::fs::create_dir(d.path().join("d")).unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let Err(e) = root.open_read(OsStr::new("d")) else { panic!("a directory is not readable") };
+        assert_eq!(e.code, flux_fs::Code::DestinationError, "{e:?}");
+        assert_eq!(e.source.kind(), std::io::ErrorKind::IsADirectory, "{e:?}");
+    }
+
+    #[test]
+    fn open_read_of_a_missing_name_is_not_found() {
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let Err(e) = root.open_read(OsStr::new("nope")) else { panic!("a missing name") };
+        assert_eq!(e.code, flux_fs::Code::IoError, "{e:?}");
+        assert_eq!(e.source.kind(), std::io::ErrorKind::NotFound, "{e:?}");
+    }
 }
 
 #[cfg(windows)]
@@ -1386,6 +1430,62 @@ mod windows_arm {
             assert_eq!(by_handle, StdFileSystem.metadata(&path).unwrap().identity, "{path:?}");
         }
         assert_ne!(root.identity().unwrap(), sub.identity().unwrap());
+    }
+
+    #[test]
+    fn open_read_streams_a_child_file() {
+        use std::io::{Read, Write};
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let mut w = root.create_new(OsStr::new("f")).unwrap();
+        w.write_all(&bytes).unwrap();
+        drop(w);
+        let mut r = root.open_read(OsStr::new("f")).unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, bytes);
+    }
+
+    #[test]
+    fn open_read_answers_a_junction_as_a_directory_and_leaves_its_target_alone() {
+        // A junction is the only name-surrogate CI can plant (a file symlink needs a privilege the runner lacks).
+        // FILE_NON_DIRECTORY_FILE answers STATUS_FILE_IS_A_DIRECTORY BEFORE the reparse-tag check, so the junction is
+        // a DestinationError/IsADirectory here (a symlink, if the runner could make one, would be SafetyRejected).
+        let d = TempDir::new().unwrap();
+        std::fs::create_dir(d.path().join("real")).unwrap();
+        if !junction(&d.path().join("real"), &d.path().join("junc")) {
+            panic!("could not create a junction; mklink /J requires no privilege");
+        }
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let Err(e) = root.open_read(OsStr::new("junc")) else {
+            panic!("a junction must not be opened for reading")
+        };
+        assert_eq!(e.code, flux_fs::Code::DestinationError, "{e:?}");
+        assert_eq!(e.source.kind(), std::io::ErrorKind::IsADirectory, "{e:?}");
+        assert!(
+            std::fs::read_dir(d.path().join("real")).unwrap().next().is_none(),
+            "the junction's TARGET is untouched"
+        );
+    }
+
+    #[test]
+    fn open_read_refuses_a_directory() {
+        let d = TempDir::new().unwrap();
+        std::fs::create_dir(d.path().join("d")).unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let Err(e) = root.open_read(OsStr::new("d")) else { panic!("a directory is not readable") };
+        assert_eq!(e.code, flux_fs::Code::DestinationError, "{e:?}");
+        assert_eq!(e.source.kind(), std::io::ErrorKind::IsADirectory, "{e:?}");
+    }
+
+    #[test]
+    fn open_read_of_a_missing_name_is_not_found() {
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let Err(e) = root.open_read(OsStr::new("nope")) else { panic!("a missing name") };
+        assert_eq!(e.code, flux_fs::Code::IoError, "{e:?}");
+        assert_eq!(e.source.kind(), std::io::ErrorKind::NotFound, "{e:?}");
     }
 }
 

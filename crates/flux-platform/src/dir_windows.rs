@@ -113,6 +113,7 @@ impl StdDir {
 
 impl DirHandle for StdDir {
     type Writer = crate::StdFile;
+    type Reader = crate::StdReader;
     type Lock = crate::StdLock;
     type Claims = crate::RedbClaimStore;
 
@@ -332,6 +333,12 @@ impl DirHandle for StdDir {
         read_file_at(&self.0, name, limit)
     }
 
+    fn open_read(&self, name: &OsStr) -> Result<Self::Reader> {
+        check_component(name)?;
+        let opened = open_read_at(&self.0, name)?;
+        Ok(crate::std_fs::std_reader_from(File::from(opened)))
+    }
+
     fn remove_dir(&self, name: &OsStr) -> Result<()> {
         check_component(name)?;
         remove_dir_at(&self.0, name)
@@ -464,6 +471,12 @@ fn entry_type(attributes: u32, ea_size: u32) -> flux_fs::FileType {
 /// opened and then refused), for reading only.
 fn read_file_at(p: &OwnedHandle, n: &OsStr, limit: usize) -> Result<Vec<u8>> {
     use std::os::windows::fs::FileExt;
+    let file = File::from(open_read_at(p, n)?);
+    crate::lock_file::read_loop(limit, |buf, at| file.seek_read(buf, at))
+}
+
+/// The open half of `read_file_at`: a child regular file, read-only, a name-surrogate refused. Shared with `open_read`.
+fn open_read_at(p: &OwnedHandle, n: &OsStr) -> Result<OwnedHandle> {
     use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
     let mut wide: Vec<u16> = n.encode_wide().collect();
     let bytes = (wide.len() * 2) as u16;
@@ -526,8 +539,7 @@ fn read_file_at(p: &OwnedHandle, n: &OsStr, limit: usize) -> Result<Vec<u8>> {
             ));
         }
     }
-    let file = File::from(opened);
-    crate::lock_file::read_loop(limit, |buf, at| file.seek_read(buf, at))
+    Ok(opened)
 }
 
 fn create_dir_at(p: &OwnedHandle, n: &OsStr) -> Result<OwnedHandle> {
