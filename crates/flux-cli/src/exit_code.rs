@@ -110,6 +110,11 @@ mod tests {
     }
 
     #[test]
+    fn a_wal_write_failed_tree_exits_1() {
+        assert_eq!(for_tree(&abort(Code::WalWriteFailed, |_| {})), FAILED);
+    }
+
+    #[test]
     fn an_unchanged_refusal_exits_3() {
         assert_eq!(for_tree(&abort(Code::SafetyRejected, |_| {})), REFUSED);
         assert_eq!(for_tree(&abort(Code::NoReplacePublishUnavailable, |_| {})), REFUSED);

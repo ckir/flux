@@ -59,6 +59,8 @@ pub enum CopyStep {
     Heartbeat,
     /// Cut 8b: the claim made before the temporary is created.
     Claim,
+    /// Cut 9f-1: a checkpoint or its writer failed.
+    Checkpoint,
 }
 
 /// Cut 8b: runs after the identity gate and the policy decision and before the temporary is created. Its `Err` stops

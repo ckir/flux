@@ -1978,8 +1978,11 @@ fn finish_copy(
                 *p = path.with_file_name(&*p);
             }
             // §99 (cut 7a Part 3b): this run no longer owns the destination's lock; or §101 (cut 7b): its heartbeat
-            // failed. The whole operation stops.
-            if e.code() == Code::TargetLockBusy || e.step == CopyStep::Heartbeat {
+            // failed; or (cut 9f-1) a checkpoint or its writer failed. The whole operation stops.
+            if e.code() == Code::TargetLockBusy
+                || e.code() == Code::WalWriteFailed
+                || e.step == CopyStep::Heartbeat
+            {
                 return Err(e);
             }
             // Decision 3: this destination lacks a no-replace primitive. Found at the
@@ -3107,6 +3110,20 @@ mod tests {
         assert_eq!(fs.read_file("/dst/a").as_deref(), Some(&b"A"[..]));
         assert!(!fs.exists("/dst/sub"));
         assert_eq!(out.directories_created, 0);
+    }
+
+    #[test]
+    fn a_wal_write_failed_copy_stops_the_walk() {
+        let mut out = TreeOutcome::default();
+        let mut reported = 0;
+        let failed = CopyError::at(
+            CopyStep::Checkpoint,
+            FsError::new(Code::WalWriteFailed, std::io::Error::other("wal")),
+        );
+        let r = finish_copy(PathBuf::from("a"), Err(failed), &mut out, &mut |_| reported += 1);
+        let e = r.unwrap_err();
+        assert_eq!((e.code(), e.step), (Code::WalWriteFailed, CopyStep::Checkpoint));
+        assert_eq!((reported, out.failures.total()), (0, 0), "a stop, never a per-file failure");
     }
 
     #[test]

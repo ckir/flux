@@ -6,7 +6,7 @@ pub(crate) const ENOSPC_RAW: i32 = 28;
 #[cfg(windows)]
 pub(crate) const ENOSPC_RAW: i32 = 112;
 
-/// A spec error code. Only codes single-file copy can actually produce.
+/// A spec error code: the codes a single-file copy or a tree copy can produce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Code {
     CopyFailed,
@@ -50,6 +50,8 @@ pub enum Code {
     StateCorrupt,
     /// Cut 9a. A state file written in another format than this build reads.
     IncompatibleState,
+    /// Cut 9f-1. A checkpoint of the write-ahead log, or the writer that records it, failed. Stops the whole operation.
+    WalWriteFailed,
 }
 
 impl Code {
@@ -73,6 +75,7 @@ impl Code {
             Code::ControlPlaneNamespaceConflict => "CONTROL_PLANE_NAMESPACE_CONFLICT",
             Code::StateCorrupt => "STATE_CORRUPT",
             Code::IncompatibleState => "INCOMPATIBLE_STATE",
+            Code::WalWriteFailed => "WAL_WRITE_FAILED",
         }
     }
 }
@@ -166,6 +169,11 @@ mod tests {
         assert_eq!(FsError::classify(&io), Code::PermissionDenied);
         // still usable: this is what lets a caller pick its own fallback code
         assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn wal_write_failed_has_its_taxonomy_string() {
+        assert_eq!(Code::WalWriteFailed.as_str(), "WAL_WRITE_FAILED");
     }
 
     #[test]
