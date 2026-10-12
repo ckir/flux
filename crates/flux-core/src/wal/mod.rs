@@ -23,3 +23,4 @@ pub(crate) const MAX_PAYLOAD: u32 = 1 << 20;
 pub(crate) mod digest;
 pub(crate) mod record;
 pub(crate) mod replay;
+pub(crate) mod writer;
