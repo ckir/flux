@@ -27,7 +27,10 @@ Windows with a warm one, and a pair appears only once a calibration shows its ra
 - Bounded resident RAM regardless of tree size
 - Deterministic discovery and traversal ordering
 - Hardlink topology preservation, including exclusion-aware dependencies
-- Robust resume after interruption, with checkpoint validation
+- Robust resume after interruption, with checkpoint validation: in a tree copy, a file of 64 MiB or more continues from the
+  last chunk whose digest matches on both the source and the destination, and everything else is recopied; a single-file
+  copy still recopies a half-copied file; under `--durability=normal` a checkpoint is advisory and is validated against the
+  data before it is trusted
 - Source-mutation detection
 - Atomic publication where the filesystem allows it
 - Clear human and machine-readable (`--json`) reporting

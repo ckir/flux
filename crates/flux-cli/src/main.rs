@@ -81,6 +81,9 @@ struct CopyArgs {
     restart: bool,
     /// Continue the one resumable prior operation on DEST as itself: files it completed are verified and skipped,
     /// the rest are copied under the existing-file policy. With no prior operation a new one starts.
+    /// In a tree copy a file of 64 MiB or more continues from the last chunk whose digest matches on both the source and
+    /// the destination; every other half-copied file is recopied, and a single-file copy always recopies. Under
+    /// --durability=normal a checkpoint is advisory and is validated against the data before it is trusted.
     #[arg(long, conflicts_with = "restart")]
     resume: bool,
     /// With --restart: take over a lock that a crashed run left empty or unreadable (§240.5).

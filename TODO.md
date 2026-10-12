@@ -517,7 +517,7 @@ the spec's numbers, 9-10 were learned during execution).
 
 1. A tree with one small file per directory gets no batching: the batch flushes at every `DirEnd`. Keeping directory handles alive across `DirEnd` is
    the later fix.
-2. A crash loses up to `BATCH_FILES` files' staging work (they are recopied at `--resume`) and up to that many claims reach recovery as notes.
+2. A crash loses up to `BATCH_FILES` files' staging work (they are recopied at `--resume`) and up to that many claims reach recovery as notes. Large files (64 MiB and up) in a tree now resume from validated checkpoints (cut 9f-1); small files in a batch are still recopied.
 3. The rename is still not directory-synced (cut 9c limit 1 stands).
 4. The data `fsync` per file is not batched; it is the floor of about 1 sync per file.
 5. The age bound is not a timer: it is checked only at the NEXT STAGING in that directory or at its `DirEnd`. A long file being copied delays the
@@ -530,6 +530,10 @@ the spec's numbers, 9-10 were learned during execution).
 7. A file and a directory in one directory whose names fold equal only by a NON-ASCII fold, onto a folding destination: the file's rename meets the
    collision (batched) where an unbatched copy publishes the file and refuses the directory. Nothing is lost or overwritten; which of the two is
    reported differs.
+
+## Cut 9f-1 open
+
+- [ ] Single-file WAL layout: a single-file operation has no workspace directory, so a half-copied single large file still recopies on `--resume`; the next cut's FIRST decision is where its WAL lives (V16 s18.1/s119 give a single file no `wal/`; needs a V16 amendment).
 
 ## Cut 9d debt
 
