@@ -394,8 +394,8 @@ pub(crate) struct Shared<'c, F: DestinationRoot> {
     pub(crate) resume: bool,
     /// Cut 9d: when a Strict tree's per-directory batch flushes.
     pub(crate) batch: BatchPolicy,
-    /// Cut 9f-1: the run's checkpoint log; `None` for a copy that does not checkpoint (every production run until the
-    /// run wires one).
+    /// Cut 9f-1: the run's checkpoint log; `None` for a copy that does not checkpoint: a single-file copy, a run whose
+    /// WAL could not be opened (a warning, and every large file recopies), and tests.
     pub(crate) ckpt: Option<&'c Checkpoints<F::Dir>>,
 }
 

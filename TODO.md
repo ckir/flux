@@ -936,6 +936,10 @@ Each is deferred to the cut that first reads it (cut 7b spec, `docs/superpowers/
 - [ ] **`configuration_fingerprint` (§19, §121)** - cut 9: read only by resume; most §121 options do not exist yet.
 - [ ] **Checkpoints and `last_checkpoint` (§19, §139, §148, §164)** - cuts 8/9: the spec defines them only through
       the WAL and `state.db` (§119's layout).
+      Partly delivered by cut 9f-1: batched chunk checkpoints in a WAL, and partial-file resume for tree files of
+      64 MiB and up. Still open: snapshots, compaction and rotation of the WAL (cut 9f-3), `--resume-verify`
+      (cut 9f-2), and checkpoints for the single-file layout. Decision 15's real-filesystem crash tests are the
+      `real-filesystem crash-injection harness` item under "Closed" below (the cut 9e test-audit debt).
 - [ ] **`roots` (§19, §18.3)** - cut 10: one root until several sources exist.
 - [ ] **`last_heartbeat_monotonic` (§229.2)** - cut 9: "diagnostic/current-session data only".
 - [ ] **Finishing a prior run's `cleanup_pending` (§21.1 "may", §218)** - cut 9: a COMPLETED prior with

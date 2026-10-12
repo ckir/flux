@@ -613,7 +613,10 @@ fn plan_resume<D: DirHandle + Send + 'static, R: std::io::Read>(
 /// before the final heartbeat, guard and publishing rename. At `SyncAt::Staging` the writer is dropped on return, so no
 /// descriptor is held; at `SyncAt::Barrier` it is NOT: the open writer rides in `Staged.writer` and the flush closes it
 /// after the barrier (the descriptor is held until then, which is what the open-writer cap bounds). On every error path
-/// the temporary has already been discarded exactly as `copy_file_guarded` always did.
+/// after the temporary exists it has been discarded exactly as `copy_file_guarded` always did, with two deliberate
+/// exceptions: a WAL failure while streaming a checkpointed file (`StreamFail::Keep`) and a failure to reopen a
+/// partial for resume (`open_existing` / `truncate_to`) leave the partial in place, because it is the state a later
+/// `--resume` judges.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn stage_file<F: DestinationRoot>(
     fs: &F,
@@ -629,10 +632,10 @@ pub(crate) fn stage_file<F: DestinationRoot>(
 ) -> std::result::Result<Stage<F::Writer>, CopyError> {
     let temp = temp_name(name, &opts.operation_id);
 
-    // 1. this invocation's own leftover, if any (§18.1). A no-op in practice: the
-    //    operation id is generated per invocation and never persisted, so nothing from
-    //    an earlier run carries this name. It stays because §18.1 asks the id to be
-    //    "deterministic enough for discovery", and a derivable id makes this live.
+    // 1. a leftover partial under this operation's name (§18.1). Live under `--resume`, which carries the prior
+    //    run's operation id, so the name IS the prior run's partial. A run that does not checkpoint removes it here; a
+    //    checkpointing run defers the sweep until after the claim (below), because the partial may be resumed rather
+    //    than recopied, and sweeps it only when no validated checkpoint set lets it continue.
     beat().map_err(|e| CopyError::at(CopyStep::Heartbeat, e))?;
     guard().map_err(|e| CopyError::at(CopyStep::Create, e))?;
     // Cut 9f-1: a checkpointing run sweeps after the claim instead (below), where it gets its own guard.
