@@ -366,6 +366,12 @@ pub fn run_warning_line(w: &RunWarning) -> String {
             path.display(),
             error.source
         ),
+        RunWarning::CheckpointsUnavailable { why } => {
+            format!("checkpoints unavailable on this filesystem: {why}; every large file recopies")
+        }
+        RunWarning::CheckpointsUnreadable { why } => {
+            format!("checkpoints unreadable: {why}; every large file recopies")
+        }
     }
 }
 

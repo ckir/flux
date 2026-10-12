@@ -346,6 +346,12 @@ impl<F: DestinationRoot> TreePlace<'_, F> {
             .as_ref()
             .expect("step 5 made operations/ before any state is rewritten or removed")
     }
+
+    /// A fresh handle on operation `id`'s workspace (cut 9f-1: the run opens two, one for the WAL writer and one for
+    /// reading the segment back).
+    pub(crate) fn open_workspace(&self, id: &str) -> flux_fs::Result<F::Dir> {
+        self.operations().open_dir(OsStr::new(id))
+    }
 }
 
 impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {

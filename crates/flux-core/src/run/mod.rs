@@ -17,6 +17,7 @@ pub(crate) mod sweep;
 #[cfg(test)]
 mod tests;
 
+use crate::checkpoint::{CheckpointOpenError, CheckpointPolicy, Checkpoints};
 use crate::copy::{
     CopyError, copy_file_guarded, no_before_create, no_before_publish, prepare_file,
 };
@@ -186,6 +187,12 @@ pub enum RunWarning {
     PriorCleaned { operation_id: String, removed: u64 },
     /// Cut 9b: an earlier operation's cleanup could not be finished; `path` is the first thing kept, with its error.
     PriorCleanupFailed { operation_id: String, path: PathBuf, error: FsError },
+    /// Cut 9f-1: the checkpoint log's segment cannot be reopened safely on this filesystem (its identity is
+    /// unavailable); the tree ran without checkpoints, so every large file recopied.
+    CheckpointsUnavailable { why: String },
+    /// Cut 9f-1: the checkpoint log could not be read (corrupt, unsupported, or a failed open); the tree ran without
+    /// checkpoints, so every large file recopied.
+    CheckpointsUnreadable { why: String },
 }
 
 /// A directory copy under the destination's lock ("The run").
@@ -196,6 +203,19 @@ pub fn tree<F: DestinationRoot>(
     opts: &CopyOptions,
     cfg: &RunConfig,
     on_report: &mut dyn FnMut(TreeFailure),
+) -> Run<Result<TreeOutcome, TreeAbort>> {
+    tree_with(fs, src_root, dst_root, opts, cfg, on_report, checkpoint_policy(cfg, opts.durability))
+}
+
+/// `tree` with the checkpoint policy given (cut 9f-1): the test seam, so a test can checkpoint small files.
+pub(crate) fn tree_with<F: DestinationRoot>(
+    fs: &F,
+    src_root: &Path,
+    dst_root: &Path,
+    opts: &CopyOptions,
+    cfg: &RunConfig,
+    on_report: &mut dyn FnMut(TreeFailure),
+    policy: CheckpointPolicy,
 ) -> Run<Result<TreeOutcome, TreeAbort>> {
     let mut run = Run {
         copy: None,
@@ -277,6 +297,9 @@ pub fn tree<F: DestinationRoot>(
     run.beat_gap_max = locked.pulse.gap_max();
     // Cut 9a: under `--resume` the effective id is the prior's; the partials are named by it.
     let opts = CopyOptions { operation_id: OperationId::new(&locked.state.operation_id), ..opts };
+    // Cut 9f-1: the checkpoint log, opened from two handles on this operation's workspace. Every way it fails to open is
+    // a warning and the tree runs without checkpoints (every large file recopies): a damaged log never aborts a copy.
+    let ckpt = open_checkpoints(&place, &locked.state, policy, &mut run.warnings);
     // Step 6: the copy, with §99 before every destination mutation.
     let mut leftovers: Vec<PathBuf> = Vec::new();
     let guard = || {
@@ -299,7 +322,7 @@ pub fn tree<F: DestinationRoot>(
             claims: claims.as_ref(),
             resume: cfg.resume,
             batch: batch_policy(cfg),
-            ckpt: None,
+            ckpt: ckpt.as_ref(),
         };
         let root = place.dest.take().expect("step 5 made DEST");
         let mut report = |f: TreeFailure| {
@@ -319,7 +342,37 @@ pub fn tree<F: DestinationRoot>(
         Ok(()) => Ok(out),
         Err(error) => Err(TreeAbort { error, outcome: out }),
     };
+    // Cut 9f-1: the WAL thread ends BEFORE anything else: its directory handles must be closed before `finish` may
+    // remove the workspace (a held handle blocks the rename on Windows). A lost lock or a failed heartbeat abandons the
+    // log (nothing more is appended after the loss); every other ending sends `Stop`, which flushes, and joins.
+    if let Some(run_ckpt) = ckpt {
+        let lost = matches!(&result, Err(a) if a.error.code() == Code::TargetLockBusy)
+            || locked.pulse.failed();
+        if lost {
+            run_ckpt.abandon();
+        } else {
+            let failure = run_ckpt.finish(&beat);
+            // `finish` swallows a heartbeat error from its final `Stop` (the pulse records it), so a failed pulse
+            // after it still makes this run Failed, never Completed.
+            if let Some(fault) = failure.wal
+                && let Ok(outcome) = &mut result
+            {
+                let why = &fault.message;
+                let cause = FsError::new(
+                    Code::WalWriteFailed,
+                    std::io::Error::other(format!(
+                        "checkpoints could not be written ({why}); resume state is NOT trustworthy; run again with --resume to continue from the last durable checkpoint"
+                    )),
+                );
+                let error =
+                    CopyError { cause, leftover: None, step: crate::copy::CopyStep::Checkpoint };
+                result = Err(TreeAbort { error, outcome: std::mem::take(outcome) });
+            }
+        }
+    }
     let ended = match &result {
+        // Cut 9f-1: a heartbeat that failed during the final `Stop` ends the run Failed even though the copy was Ok.
+        Ok(_) if locked.pulse.failed() => Ended::Failed,
         Ok(_) => Ended::Completed { leftovers, published: None },
         // Cut 7b: a failed heartbeat is the copy's failure, whatever its code.
         Err(_) if locked.pulse.failed() => Ended::Failed,
@@ -546,6 +599,63 @@ fn batch_policy(cfg: &RunConfig) -> crate::tree::BatchPolicy {
         beat_every: barrier_beat_every(cfg),
         open_writers: crate::tree::open_writers_cap(cfg.descriptor_limit),
         ..crate::tree::BatchPolicy::DEFAULT
+    }
+}
+
+/// Cut 9f-1: the checkpoint policy of a tree run: `CheckpointPolicy::DEFAULT` with the run's durability. In a debug
+/// build, `FLUX_TEST_CHECKPOINT_MIN=<n>` (bytes) replaces `min_len` (absent or unparsable: the default's).
+#[cfg(debug_assertions)]
+fn checkpoint_policy(_cfg: &RunConfig, durability: flux_fs::Durability) -> CheckpointPolicy {
+    let default = CheckpointPolicy::DEFAULT;
+    let min_len = std::env::var("FLUX_TEST_CHECKPOINT_MIN")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default.min_len);
+    CheckpointPolicy {
+        min_len,
+        wal: crate::wal::writer::WalConfig { durability, ..default.wal },
+        ..default
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn checkpoint_policy(_cfg: &RunConfig, durability: flux_fs::Durability) -> CheckpointPolicy {
+    let default = CheckpointPolicy::DEFAULT;
+    CheckpointPolicy { wal: crate::wal::writer::WalConfig { durability, ..default.wal }, ..default }
+}
+
+/// Cut 9f-1: open the run's checkpoint log, or say why there is none. `None` also when the state carries no WAL
+/// generation. The caller builds the policy's WAL durability from the run's (`checkpoint_policy`).
+fn open_checkpoints<F: DestinationRoot>(
+    place: &TreePlace<'_, F>,
+    state: &crate::state::OperationState,
+    policy: CheckpointPolicy,
+    warnings: &mut Vec<RunWarning>,
+) -> Option<Checkpoints<F::Dir>> {
+    let generation = state.wal.as_ref().map(|w| w.wal_generation)?;
+    let id = state.operation_id.as_str();
+    let handles = place.open_workspace(id).and_then(|w| place.open_workspace(id).map(|r| (w, r)));
+    let (workspace, read_dir) = match handles {
+        Ok(h) => h,
+        Err(e) => {
+            warnings.push(RunWarning::CheckpointsUnreadable { why: e.to_string() });
+            return None;
+        }
+    };
+    match Checkpoints::open(workspace, read_dir, id, generation, policy) {
+        Ok(c) => Some(c),
+        Err(CheckpointOpenError::Unavailable(why)) => {
+            warnings.push(RunWarning::CheckpointsUnavailable { why });
+            None
+        }
+        Err(CheckpointOpenError::Corrupt(why)) => {
+            warnings.push(RunWarning::CheckpointsUnreadable { why });
+            None
+        }
+        Err(CheckpointOpenError::Fatal(e)) => {
+            warnings.push(RunWarning::CheckpointsUnreadable { why: e.to_string() });
+            None
+        }
     }
 }
 

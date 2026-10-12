@@ -110,6 +110,10 @@ impl<D: DirHandle + Send + 'static> Checkpoints<D> {
 
     /// `Stop` (which flushes), join, and the final failure. When `Stop` cannot be delivered (the heartbeat
     /// failed, or the thread is gone) the sender is dropped undelivered, which abandons the run's log.
+    ///
+    /// A heartbeat error from sending the final `Stop` is SWALLOWED here: the signature has no place for it. The run
+    /// records it in its pulse, so the caller must check `pulse.failed()` after this returns and end the run Failed,
+    /// never Completed, even when the copy itself succeeded (`run::tree_with`).
     pub(crate) fn finish(self, beat: &Heartbeat<'_>) -> Failure {
         let Checkpoints { sender, thread, .. } = self;
         let _ = sender.send(Msg::Stop, beat);
