@@ -444,4 +444,74 @@ mod tests {
         assert_eq!(v.carry, src[2 * MIB..3 * MIB]);
         assert_eq!(v.discard, Some(Discard::MismatchAt(2 * MIB as u64)));
     }
+
+    /// `chunks` MiB of one repeating 1 MiB pattern: every chunk has the same bytes, so an off-by-one-chunk
+    /// source position cannot be told apart by content.
+    fn identical_chunks(chunks: usize) -> Vec<u8> {
+        let one = source_bytes(MIB);
+        one.iter().copied().cycle().take(chunks * MIB).collect()
+    }
+
+    #[test]
+    fn a_hole_in_the_digest_map_ends_validation_at_the_hole() {
+        let src = identical_chunks(4);
+        let full = digests_of(&src);
+        // Case A: chunks {0, 2} recorded; chunk 1 is a hole.
+        let mut d = full.clone();
+        d.retain(|k, _| *k == 0 || *k == 2);
+        let (v, s) = run(&state(src.len(), d), src.len(), &src, &src);
+        assert_eq!(v.start, Start::Resume { offset: MIB as u64 });
+        assert!(v.carry.is_empty());
+        assert_eq!(s.read, MIB);
+        assert_positioned(&v, s, &src);
+        // Case B: only chunk 1 recorded; chunk 0 is a hole.
+        let mut d = full;
+        d.retain(|k, _| *k == 1);
+        let (v, s) = run(&state(src.len(), d), src.len(), &src, &src);
+        assert_eq!(v.start, Start::Fresh);
+        assert!(v.carry.is_empty());
+        assert_eq!(s.read, 0);
+        assert_positioned(&v, s, &src);
+    }
+
+    #[test]
+    fn a_source_that_ends_inside_a_chunk_is_a_mismatch_with_the_short_carry() {
+        let src = identical_chunks(3);
+        let st = state(src.len(), digests_of(&src));
+        let short = &src[..2 * MIB + MIB / 2];
+        let mut s = counting(short);
+        let mut p = Cursor::new(src.clone());
+        let v =
+            decide(&st, &gate(src.len()), Some(src.len() as u64), &mut s, Some(&mut p), &ok_beat)
+                .unwrap();
+        assert_eq!(v.start, Start::Resume { offset: 2 * MIB as u64 });
+        assert_eq!(v.discard, Some(Discard::MismatchAt(2 * MIB as u64)));
+        assert_eq!(v.carry.len(), MIB / 2);
+        assert_eq!(v.carry, src[2 * MIB..2 * MIB + MIB / 2]);
+        let mut rest = Vec::new();
+        s.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn a_digest_key_beyond_the_source_is_ignored_and_does_not_underflow() {
+        let src = source_bytes(3 * MIB);
+        let mut d = digests_of(&src);
+        d.insert(7, [7u8; 32]);
+        let st = state(src.len(), d);
+        let (v, s) = run(&st, src.len(), &src, &src);
+        assert_eq!(v.start, Start::Resume { offset: 3 * MIB as u64 });
+        assert!(v.carry.is_empty());
+        assert_positioned(&v, s, &src);
+        // A forged key just past the source, with a partial long enough to reach it.
+        let mut d = digests_of(&src);
+        d.insert(3, [3u8; 32]);
+        let mut long = src.clone();
+        long.extend(vec![1u8; MIB]);
+        let (v, s) = run(&state(src.len(), d), src.len(), &src, &long);
+        assert_eq!(v.start, Start::Resume { offset: 3 * MIB as u64 });
+        assert!(v.carry.is_empty());
+        assert_eq!(v.discard, None);
+        assert_positioned(&v, s, &src);
+    }
 }
