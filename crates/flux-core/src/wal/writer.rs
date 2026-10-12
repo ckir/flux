@@ -1587,18 +1587,24 @@ mod tests {
         let (fs, dir) = ws();
         let beat: &Heartbeat = &|| Ok(());
         let p = fs.create_new(Path::new("/ws/p")).unwrap();
-        fs.delay("sync_all", Duration::from_millis(300));
-        let mut c = cfg(BIG, HOUR, Durability::Strict);
-        c.channel_cap = 2;
-        let (s, t) = start(dir, 1, c);
+        // The first `sync_all` of the run is the first flush's sync of the partial. The hook announces that the thread
+        // is inside it and holds it there until the test releases it, so the flush is provably in flight (no sleeps).
+        let (entered_tx, entered) = mpsc::channel::<()>();
+        let (release, released) = mpsc::channel::<()>();
+        fs.on_nth("sync_all", 1, move |_| {
+            entered_tx.send(()).unwrap();
+            released.recv().unwrap();
+        });
+        let (s, t) = start(dir, 1, cfg(BIG, HOUR, Durability::Strict));
         s.send(begin_msg(b"p", Some(p.duplicate().unwrap())), beat).unwrap();
         s.send(Msg::Range(range(b"p", 0, 1)), beat).unwrap();
         s.send(Msg::Flush, beat).unwrap();
-        // With a capacity of 2, the fifth send cannot return before the third message was taken, so the thread
-        // is inside the first flush (a 300 ms sync) when the sender goes.
+        entered.recv().expect("the first flush started");
+        // A second flush is queued behind the one in flight, then the sender goes while that flush is blocked.
         s.send(Msg::Range(range(b"p", 1, 2)), beat).unwrap();
         s.send(Msg::Flush, beat).unwrap();
         drop(s);
+        release.send(()).unwrap();
         t.join();
         assert_eq!(records(&wal_bytes(&fs).unwrap()).len(), 2);
         assert_eq!(syncs(&fs).iter().filter(|c| *c == "sync_all(/ws/p)").count(), 1);
