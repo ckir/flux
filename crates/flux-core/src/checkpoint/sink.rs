@@ -62,8 +62,9 @@ fn mtime_pair(t: std::time::SystemTime) -> (i64, u32) {
 }
 
 impl<'a, D: DirHandle + Send + 'static> FileSink<'a, D> {
-    /// Registers the file with the log. `valid_through` is a byte offset on a chunk boundary: the bytes fed to
-    /// `wrote` start there, and chunk numbering resumes from it.
+    /// Registers the file with the log. `valid_through` is a byte offset on a chunk boundary, or the source length
+    /// (a fully validated partial whose last chunk is short): the bytes fed to `wrote` start there, and chunk
+    /// numbering resumes from it. At the source length no bytes follow, so no chunk is ever numbered from it.
     pub(crate) fn begin(
         fc: &FileCkpt<'a, D>,
         src: &Metadata,
@@ -72,10 +73,10 @@ impl<'a, D: DirHandle + Send + 'static> FileSink<'a, D> {
         beat: &Heartbeat<'_>,
     ) -> Result<Self, SinkError> {
         debug_assert!(
-            valid_through.is_multiple_of(CHUNK_SIZE),
-            "valid_through must be a chunk boundary"
+            valid_through.is_multiple_of(CHUNK_SIZE) || valid_through == src.len,
+            "valid_through must be a chunk boundary or the source length"
         );
-        let first_chunk = valid_through / CHUNK_SIZE;
+        let first_chunk = valid_through.div_ceil(CHUNK_SIZE);
         let begin = FileBegin {
             file_id: fc.file_id.clone(),
             attempt_id: ATTEMPT_ID,
@@ -90,7 +91,7 @@ impl<'a, D: DirHandle + Send + 'static> FileSink<'a, D> {
             run: fc.run,
             file_id: fc.file_id.clone(),
             hasher: ChunkHasher::from_chunk(first_chunk),
-            range_start: first_chunk * CHUNK_SIZE,
+            range_start: valid_through,
             digests: Vec::new(),
             // Nothing is registered until the message is queued, so a failed `begin` leaves nothing to close.
             ended: true,
@@ -371,6 +372,24 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert_eq!((r[0].range_start, r[0].range_end), (MIB as u64, 2 * MIB as u64));
         assert_eq!(r[0].digests, vec![*blake3::hash(&src[MIB..]).as_bytes()]);
+    }
+
+    #[test]
+    fn begin_accepts_a_valid_through_equal_to_the_source_length() {
+        let (fs, _dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let run = open_run(&fs, policy(4, Durability::Normal));
+        let len = 2 * MIB as u64 + 5;
+        // A fully validated partial whose last chunk is short: nothing is left to hash, so nothing is numbered.
+        let mut sink = FileSink::begin(&fc(&run), &meta(len), len, None, beat).unwrap();
+        sink.complete(beat).unwrap();
+        drop(sink);
+        assert!(run.finish(beat).is_clean());
+        let recs = records(&fs);
+        let Body::FileBegin(b) = &recs[0].1 else { panic!("first record is not a FileBegin") };
+        assert_eq!(b.valid_through, len);
+        assert_eq!(b.source_len, len);
+        assert!(ranges(&fs).is_empty(), "no Range: no bytes arrived");
     }
 
     #[test]
