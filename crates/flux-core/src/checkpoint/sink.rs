@@ -350,7 +350,7 @@ mod tests {
         let beat: &Heartbeat = &|| Ok(());
         let run = open_run(&fs, policy(4, Durability::Normal));
         let mut m = meta(3 * MIB as u64);
-        m.modified = Some(UNIX_EPOCH + Duration::new(1_700_000_000, 7));
+        m.modified = Some(UNIX_EPOCH + Duration::new(1_700_000_000, 700));
         m.identity = FileIdentity::Strong(flux_fs::ObjectId { volume: 3, index: 9 });
         let src = data(2 * MIB);
         let mut sink = FileSink::begin(&fc(&run), &m, MIB as u64, None, beat).unwrap();
@@ -364,7 +364,7 @@ mod tests {
         assert_eq!(b.attempt_id, 1);
         assert_eq!(b.destination, b"/ws/f");
         assert_eq!(b.source_len, 3 * MIB as u64);
-        assert_eq!(b.source_mtime, Some((1_700_000_000, 7)));
+        assert_eq!(b.source_mtime, Some((1_700_000_000, 700)));
         assert_eq!(b.source_identity, b"strong:3:9");
         assert_eq!(b.chunk_size, CHUNK_SIZE);
         assert_eq!(b.valid_through, MIB as u64);

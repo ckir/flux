@@ -3405,7 +3405,7 @@ mod tests {
     #[test]
     fn resume_continues_from_the_last_whole_chunk_and_the_output_equals_the_source() {
         let (fs, root) = ckpt_fs(5 * MIB);
-        fs.set_modified("/src", SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 7));
+        fs.set_modified("/src", SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 700));
         let src = fs.read_file("/src").unwrap();
         crash_after(&fs, &root, 3);
         fs.write_file(PARTIAL, &src[..3 * MIB]);
@@ -3832,7 +3832,7 @@ mod tests {
     fn the_resume_gate_encodes_the_source_time_as_the_sink_recorded_it() {
         // After the epoch with nanoseconds, and before it (floored seconds): both must round-trip through the WAL.
         for t in [
-            SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 7),
+            SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 700),
             SystemTime::UNIX_EPOCH - Duration::new(5, 250_000_000),
         ] {
             let (fs, root) = ckpt_fs(5 * MIB);
