@@ -374,6 +374,12 @@ pub fn run_warning_line(w: &RunWarning) -> String {
         RunWarning::CheckpointsUnreadable { why } => {
             format!("checkpoints unreadable: {why}; every large file recopies")
         }
+        RunWarning::WalQuarantined { code, why, set_aside_as } => format!(
+            "{code}: the checkpoint log is damaged ({why}); possible storage damage, investigate; it was set aside as wal/{set_aside_as} and a fresh log was started; every large file recopies"
+        ),
+        RunWarning::WalNotQuarantined { code, why, error } => format!(
+            "{code}: the checkpoint log is damaged ({why}) and could not be set aside ({error}); this run copies with no checkpoints"
+        ),
         RunWarning::WalTailDiscarded { offset, len, reason } => format!(
             "WAL tail cut: {len} bytes at offset {offset} ({reason}); the checkpoints before it are intact"
         ),
@@ -969,6 +975,49 @@ mod tests {
             step: CopyStep::Source,
         };
         assert!(abort_hint_lines(&other).is_empty());
+    }
+
+    // Owner ruling 23: the exact texts of the two quarantine warnings.
+    #[test]
+    fn the_wal_quarantine_warnings_have_their_exact_texts() {
+        assert_eq!(
+            run_warning_line(&RunWarning::WalQuarantined {
+                code: "WAL_CORRUPT",
+                why: "corrupt log at byte 40: bad".to_string(),
+                set_aside_as: "000001.corrupt-2".to_string(),
+            }),
+            "WAL_CORRUPT: the checkpoint log is damaged (corrupt log at byte 40: bad); possible storage damage, investigate; it was set aside as wal/000001.corrupt-2 and a fresh log was started; every large file recopies"
+        );
+        assert_eq!(
+            run_warning_line(&RunWarning::WalNotQuarantined {
+                code: "WAL_SEQUENCE_CONFLICT",
+                why: "conflict".to_string(),
+                error: "denied".to_string(),
+            }),
+            "WAL_SEQUENCE_CONFLICT: the checkpoint log is damaged (conflict) and could not be set aside (denied); this run copies with no checkpoints"
+        );
+    }
+
+    // Owner ruling 23: an unsupported log format aborts the tree with its own code, exits 1 and has no resume hint.
+    #[test]
+    fn a_wal_format_unsupported_abort_prints_its_code_exits_1_and_adds_no_hint() {
+        let error = CopyError {
+            cause: FsError::new(
+                Code::WalFormatUnsupported,
+                std::io::Error::other(
+                    "the checkpoint log was written by a newer Flux (unsupported log format 2 (checksum 1)); nothing was copied; run again with --restart to supersede it",
+                ),
+            ),
+            leftover: None,
+            step: CopyStep::Checkpoint,
+        };
+        let line = error.to_string();
+        assert!(line.contains("WAL_FORMAT_UNSUPPORTED: "), "{line}");
+        assert!(line.contains("run again with --restart to supersede it"), "{line}");
+        assert!(abort_hint_lines(&error).is_empty());
+        let aborted =
+            Err(flux_core::TreeAbort { error, outcome: flux_core::TreeOutcome::default() });
+        assert_eq!(crate::exit_code::for_tree(&aborted), crate::exit_code::FAILED);
     }
 
     #[test]

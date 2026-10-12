@@ -44,8 +44,14 @@ impl CheckpointPolicy {
 pub(crate) enum CheckpointOpenError {
     /// The segment's identity is unavailable, so it cannot be reopened safely.
     Unavailable(String),
-    /// The segment is corrupt, unsupported, or continues another run's sequence.
-    Corrupt(String),
+    /// Mid-log damage (`WAL_CORRUPT`) or a sequence conflict (`WAL_SEQUENCE_CONFLICT`): the segment is not usable, and
+    /// the run sets it aside (owner ruling 23). `why` is the `WalError` text.
+    Corrupt {
+        code: &'static str,
+        why: String,
+    },
+    /// An unknown format or checksum version: a newer Flux wrote it, so the run stops (owner ruling 23).
+    FormatUnsupported(String),
     Fatal(FsError),
 }
 
@@ -75,7 +81,16 @@ impl<D: DirHandle + Send + 'static> Checkpoints<D> {
                 Err(CheckpointOpenError::Unavailable(e.source.to_string()))
             }
             Err(WalError::Io(e)) => Err(CheckpointOpenError::Fatal(e)),
-            Err(other) => Err(CheckpointOpenError::Corrupt(other.to_string())),
+            Err(e @ WalError::Corrupt { .. }) => {
+                Err(CheckpointOpenError::Corrupt { code: "WAL_CORRUPT", why: e.to_string() })
+            }
+            Err(e @ WalError::SequenceConflict { .. }) => Err(CheckpointOpenError::Corrupt {
+                code: "WAL_SEQUENCE_CONFLICT",
+                why: e.to_string(),
+            }),
+            Err(e @ WalError::Unsupported { .. }) => {
+                Err(CheckpointOpenError::FormatUnsupported(e.to_string()))
+            }
         }
     }
 

@@ -5931,7 +5931,8 @@ mod checkpointing {
         );
     }
 
-    // Mutant: every `CheckpointOpenError` aborts the run, or `Corrupt` is dropped silently.
+    // Mutant: every `CheckpointOpenError` aborts the run, or `Corrupt` is dropped silently. (Owner ruling 23: it was
+    // `CheckpointsUnreadable` and `ckpt: None` under Ruling 11; a damaged log is now quarantined and reported.)
     #[test]
     fn a_corrupt_wal_recopies_and_reports_instead_of_aborting() {
         let fs = big_fs(5 * MIB);
@@ -5942,7 +5943,7 @@ mod checkpointing {
         ok(&r);
         assert!(got.is_empty(), "{got:?}");
         assert!(
-            r.warnings.iter().any(|w| matches!(w, RunWarning::CheckpointsUnreadable { .. })),
+            r.warnings.iter().any(|w| matches!(w, RunWarning::WalQuarantined { .. })),
             "{:?}",
             r.warnings
         );
@@ -6600,11 +6601,12 @@ mod checkpointing {
         records(&seen.lock().unwrap().clone());
     }
 
-    // Additional: the segment already holds generation 5 and the resumed run is generation 2: the log is refused
-    // (`SequenceConflict`), which is the `CheckpointsUnreadable` warning, and every file recopies. Mutant: the
-    // writer's open accepts a lower generation (it would append below the existing records).
+    // Additional: the segment already holds generation 5 and the resumed run is generation 2: the open is a
+    // `SequenceConflict` (the run's generation, sequence 1), which is quarantined (owner ruling 23; Ruling 11 made it
+    // `CheckpointsUnreadable`), and every file recopies. Mutant: the writer's open accepts a lower generation (it
+    // would append below the existing records).
     #[test]
-    fn a_lower_generation_than_the_segment_is_refused_and_files_recopy() {
+    fn a_lower_generation_open_quarantines_as_a_sequence_conflict() {
         let fs = big_fs(5 * MIB);
         crashed_run(&fs);
         let raised: Vec<u8> = segment_records(&fs)
@@ -6616,17 +6618,26 @@ mod checkpointing {
             .collect();
         fs.write_file(wal(), &raised);
         let (r, mark) = resume_run(&fs, Durability::Normal);
-        assert!(
-            r.warnings.iter().any(|w| matches!(w, RunWarning::CheckpointsUnreadable { .. })),
-            "{:?}",
-            r.warnings
-        );
+        let q = quarantined(&r);
+        assert_eq!(q.len(), 1, "{:?}", r.warnings);
+        let (code, why, name) = &q[0];
+        assert_eq!(*code, "WAL_SEQUENCE_CONFLICT");
+        assert_eq!(why, "generation 2, sequence 1 conflicts with the records already in the log");
+        assert_eq!(name, "000001.corrupt-2");
         assert_safe_redo(&fs, &r, mark);
+        assert!(
+            calls(&fs)[mark..]
+                .iter()
+                .any(|c| c == &format!("rename_no_replace({} -> {}.corrupt-2)", wal(), wal())),
+            "{:?}",
+            &calls(&fs)[mark..]
+        );
         assert_eq!(
             fs.read_file(wal()),
             None,
-            "the refused log was left untouched, then removed with the workspace"
+            "the fresh log and the set-aside one went with the workspace"
         );
+        assert_eq!(fs.read_file(format!("{}.corrupt-2", wal())), None);
     }
 
     // Additional: a second run (generation 2) found no usable partial, recopied from byte 0 and crashed after 1 MiB;
@@ -6688,5 +6699,251 @@ mod checkpointing {
         let (r, mark) = resume_run(&fs, Durability::Normal);
         assert_progress(&fs, &r, mark, MIB);
         assert!(ok(&r).checkpoint_discards.is_empty(), "{:?}", ok(&r).checkpoint_discards);
+    }
+    // ---- Owner ruling 23: what `--resume` does with a damaged or unopenable checkpoint log.
+
+    /// Every `WalQuarantined` warning of the run as (code, why, set_aside_as).
+    fn quarantined(r: &Resumed) -> Vec<(&'static str, String, String)> {
+        r.warnings
+            .iter()
+            .filter_map(|w| match w {
+                RunWarning::WalQuarantined { code, why, set_aside_as } => {
+                    Some((*code, why.clone(), set_aside_as.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// At every `rename_no_replace` of the next 16 calls, record (the quarantine `name` exists beside the segment, the
+    /// segment's bytes): the hooks run just BEFORE their call, so the later renames see the state the earlier left.
+    type Snapshots = Arc<Mutex<Vec<(bool, Option<Vec<u8>>)>>>;
+    fn snapshot_at_renames(fs: &FaultFs, name: &'static str) -> Snapshots {
+        fn watch(fs: &FaultFs, n: u32, last: u32, seen: Snapshots, name: &'static str) {
+            if n > last {
+                return;
+            }
+            fs.on_nth("rename_no_replace", n, move |fs| {
+                seen.lock()
+                    .unwrap()
+                    .push((fs.exists(format!("{}.{name}", wal())), fs.read_file(wal())));
+                watch(fs, n + 1, last, seen, name);
+            });
+        }
+        let seen: Snapshots = Arc::default();
+        let first = next_nth(fs, "rename_no_replace(");
+        watch(fs, first, first + 16, Arc::clone(&seen), name);
+        seen
+    }
+
+    /// The crashed run's segment with one byte flipped inside its second record: damage that is not a trailing tear.
+    fn corrupt_mid_log(fs: &FaultFs) {
+        let enc = crashed_segment(fs);
+        let mut bytes = enc.concat();
+        bytes[enc[0].len() + 12] ^= 1;
+        fs.write_file(wal(), &bytes);
+    }
+
+    #[test]
+    fn a_mid_log_corruption_quarantines_the_segment_and_the_run_completes() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        corrupt_mid_log(&fs);
+        let seen = snapshot_at_renames(&fs, "corrupt-2");
+        let (r, mark) = resume_run(&fs, Durability::Normal);
+        let q = quarantined(&r);
+        assert_eq!(q.len(), 1, "{:?}", r.warnings);
+        assert_eq!((q[0].0, q[0].2.as_str()), ("WAL_CORRUPT", "000001.corrupt-2"));
+        assert!(q[0].1.starts_with("corrupt log at byte"), "{}", q[0].1);
+        assert_safe_redo(&fs, &r, mark);
+        assert_eq!(ok(&r).bytes_reused, 0);
+        let c = calls(&fs);
+        assert!(
+            c[mark..]
+                .iter()
+                .any(|x| x == &format!("rename_no_replace({} -> {}.corrupt-2)", wal(), wal())),
+            "{:?}",
+            &c[mark..]
+        );
+        // While the run copied: the damaged segment sat under its new name, and a NEW `wal/000001` held only the
+        // fresh run's records (generation 2, none of the old log's).
+        let snaps = seen.lock().unwrap().clone();
+        let fresh = snaps
+            .iter()
+            .filter(|(quarantine, _)| *quarantine)
+            .filter_map(|(_, bytes)| bytes.as_ref())
+            .max_by_key(|b| b.len())
+            .expect("a rename saw the quarantine name beside a fresh segment");
+        let recs = records(fresh);
+        assert!(matches!(recs[0].1, Body::FileBegin(_)), "{recs:?}");
+        assert!(recs.iter().all(|(h, _)| h.generation == 2), "{recs:?}");
+        // finish_retire removed the quarantine name with the log: the workspace is gone.
+        assert!(!fs.exists("/p/dest/.flux"));
+        assert_eq!(fs.read_file(format!("{}.corrupt-2", wal())), None);
+    }
+
+    #[test]
+    fn an_unknown_wal_format_stops_the_run_before_any_copy() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        let mut bytes = crashed_segment(&fs).concat();
+        bytes[4] = 2;
+        fs.write_file(wal(), &bytes);
+        let kept = fs.read_file(partial()).expect("the crash left its partial");
+        let mark = fs.calls().len();
+        let o = opts();
+        let mut got = Vec::new();
+        let r = tree_with(
+            &fs,
+            Path::new("/src"),
+            Path::new("/p/dest"),
+            &o,
+            &resuming(),
+            &mut |f| got.push(f),
+            lazy(Durability::Normal),
+        );
+        assert!(r.stop.is_none() && got.is_empty(), "{:?} {got:?}", r.stop);
+        let Some(Err(abort)) = &r.copy else { panic!("expected an abort: {:?}", r.copy) };
+        assert_eq!(abort.error.code(), Code::WalFormatUnsupported);
+        let text = abort.error.to_string();
+        for part in [
+            "WAL_FORMAT_UNSUPPORTED",
+            "written by a newer Flux",
+            "unsupported log format 2 (checksum 1)",
+            "nothing was copied",
+            "run again with --restart to supersede it",
+        ] {
+            assert!(text.contains(part), "{part} missing from {text}");
+        }
+        assert!(quarantined(&r).is_empty() && r.warnings.is_empty(), "{:?}", r.warnings);
+        // Nothing was copied, nothing was set aside, and the workspace is FAILED with its segment untouched.
+        let c = calls(&fs);
+        assert!(
+            c[mark..].iter().all(|x| x != &format!("create_new({})", partial())
+                && !x.starts_with("truncate_to(")
+                && !x.contains(".corrupt-")
+                && !x.starts_with(&format!("rename_no_replace({}", wal()))),
+            "{:?}",
+            &c[mark..]
+        );
+        assert!(!fs.exists("/p/dest/big"));
+        assert_eq!(fs.read_file(partial()), Some(kept));
+        assert_eq!(fs.read_file(wal()), Some(bytes));
+        assert_eq!(manifest(&fs, ID).state, OpState::Failed);
+    }
+
+    #[test]
+    fn an_unavailable_segment_is_not_quarantined() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        fs.set_identity(wal(), FileIdentity::Unavailable);
+        let (r, mark) = resume_run(&fs, Durability::Normal);
+        assert!(
+            r.warnings.iter().any(|w| matches!(w, RunWarning::CheckpointsUnavailable { .. })),
+            "{:?}",
+            r.warnings
+        );
+        assert!(quarantined(&r).is_empty());
+        assert!(
+            !r.warnings.iter().any(|w| matches!(w, RunWarning::WalNotQuarantined { .. })),
+            "{:?}",
+            r.warnings
+        );
+        assert_safe_redo(&fs, &r, mark);
+        assert!(
+            calls(&fs)[mark..].iter().all(|c| !c.contains(".corrupt-")),
+            "{:?}",
+            &calls(&fs)[mark..]
+        );
+    }
+
+    /// At each of the next 16 `rename_no_replace` calls, make the call fail when it is the quarantine's.
+    fn fail_the_quarantine_rename(fs: &FaultFs) {
+        fn watch(fs: &FaultFs, n: u32, last: u32) {
+            if n > last {
+                return;
+            }
+            fs.on_nth("rename_no_replace", n, move |fs| {
+                if fs.calls().last().is_some_and(|c| c.replace('\\', "/").contains(".corrupt-")) {
+                    fs.fail("rename_no_replace", Code::IoError);
+                }
+                watch(fs, n + 1, last);
+            });
+        }
+        let first = next_nth(fs, "rename_no_replace(");
+        watch(fs, first, first + 16);
+    }
+
+    #[test]
+    fn a_failed_quarantine_rename_falls_back_to_no_checkpoints() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        corrupt_mid_log(&fs);
+        fail_the_quarantine_rename(&fs);
+        let (r, mark) = resume_run(&fs, Durability::Normal);
+        let failed: Vec<_> = r
+            .warnings
+            .iter()
+            .filter_map(|w| match w {
+                RunWarning::WalNotQuarantined { code, why, error } => {
+                    Some((*code, why.clone(), error.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failed.len(), 1, "{:?}", r.warnings);
+        assert_eq!(failed[0].0, "WAL_CORRUPT");
+        assert!(failed[0].1.starts_with("corrupt log at byte"), "{}", failed[0].1);
+        assert!(failed[0].2.contains("IO_ERROR"), "{}", failed[0].2);
+        assert!(quarantined(&r).is_empty());
+        assert_safe_redo(&fs, &r, mark);
+        let c = calls(&fs);
+        assert!(
+            c[mark..].iter().all(|x| x != &format!("create_new({})", wal())),
+            "ckpt: None, so no fresh log was started: {:?}",
+            &c[mark..]
+        );
+    }
+
+    #[test]
+    fn a_second_corruption_in_the_same_generation_gets_a_numbered_quarantine_name() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        corrupt_mid_log(&fs);
+        fs.write_file(format!("{}.corrupt-2", wal()), b"an earlier set-aside segment");
+        fs.write_file(format!("{}.corrupt-2-2", wal()), b"and another");
+        let (r, mark) = resume_run(&fs, Durability::Normal);
+        let q = quarantined(&r);
+        assert_eq!(q.len(), 1, "{:?}", r.warnings);
+        assert_eq!(q[0].2, "000001.corrupt-2-3");
+        assert_safe_redo(&fs, &r, mark);
+        assert!(!fs.exists("/p/dest/.flux"), "every quarantine name went with the workspace");
+    }
+
+    // Owner ruling 23, section-99 discipline: the quarantine is a destination mutation. A lock lost before it ends the
+    // run as any lost lock: nothing is renamed and nothing is copied. Mutant: the quarantine skips the guard.
+    #[test]
+    fn a_lost_lock_before_the_quarantine_aborts_it() {
+        let fs = Arc::new(big_fs(5 * MIB));
+        crashed_run(&fs);
+        corrupt_mid_log(&fs);
+        let hook: BeforeMutation = {
+            let fs = Arc::clone(&fs);
+            Arc::new(move || fs.write_file(LOCK, b"another run's bytes"))
+        };
+        let mark = fs.calls().len();
+        let c = RunConfig { before_mutation: Some(hook), ..resuming() };
+        let (r, _) = run_with(&fs, &c, &opts(), lazy(Durability::Normal));
+        let Some(Err(abort)) = &r.copy else { panic!("expected an abort: {:?}", r.copy) };
+        assert_eq!(abort.error.code(), Code::TargetLockBusy);
+        let calls = calls(&fs);
+        assert!(
+            calls[mark..]
+                .iter()
+                .all(|x| !x.contains(".corrupt-") && x != &format!("create_new({})", partial())),
+            "{:?}",
+            &calls[mark..]
+        );
+        assert!(quarantined(&r).is_empty(), "{:?}", r.warnings);
     }
 }

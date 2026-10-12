@@ -488,7 +488,7 @@ mod tests {
         let a = fs.destination_root(Path::new("/ws")).unwrap();
         let b = fs.destination_root(Path::new("/ws")).unwrap();
         match Checkpoints::open(a, b, "op", 1, policy(4, Durability::Normal)) {
-            Err(CheckpointOpenError::Corrupt(_)) => {}
+            Err(CheckpointOpenError::Corrupt { .. }) => {}
             other => panic!("expected Corrupt, got {:?}", other.err()),
         }
 

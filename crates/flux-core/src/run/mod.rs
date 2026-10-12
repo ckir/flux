@@ -36,6 +36,7 @@ use flux_fs::{
 };
 use place::{FilePlace, Place, TreePlace, locate_tree};
 use session::{Locked, beat_error, from_lock, guarded, lock_io, open_operation, owned};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// The `workspace_path` a record carries once the state it named is about to go (Q-K): the spec's literal for "names
@@ -196,6 +197,13 @@ pub enum RunWarning {
     /// Cut 9f-1: the checkpoint log ended in `len` bytes at `offset` that the replay cut (spec decision 7.1);
     /// the records before `offset` are intact and were used.
     WalTailDiscarded { offset: u64, len: u64, reason: &'static str },
+    /// Cut 9f-1, owner ruling 23: the checkpoint log was damaged mid-log (`code` is `WAL_CORRUPT` or
+    /// `WAL_SEQUENCE_CONFLICT`; `why` is the replay's text). It was renamed to `wal/{set_aside_as}` and a fresh log
+    /// was started; none of the old log's checkpoints were used, so every large file recopied.
+    WalQuarantined { code: &'static str, why: String, set_aside_as: String },
+    /// Cut 9f-1, owner ruling 23: as `WalQuarantined`, but the damaged log could not be set aside (`error`), so the
+    /// tree ran without checkpoints.
+    WalNotQuarantined { code: &'static str, why: String, error: String },
 }
 
 /// A directory copy under the destination's lock ("The run").
@@ -300,16 +308,16 @@ pub(crate) fn tree_with<F: DestinationRoot>(
     run.beat_gap_max = locked.pulse.gap_max();
     // Cut 9a: under `--resume` the effective id is the prior's; the partials are named by it.
     let opts = CopyOptions { operation_id: OperationId::new(&locked.state.operation_id), ..opts };
-    // Cut 9f-1: the checkpoint log, opened from two handles on this operation's workspace. Every way it fails to open is
-    // a warning and the tree runs without checkpoints (every large file recopies): a damaged log never aborts a copy.
-    // In a `RefCell` because the guard and beat closures (below) read it for the whole walk while the end of the run must
-    // take it by value to `finish` or `abandon` it.
-    let ckpt =
-        std::cell::RefCell::new(open_checkpoints(&place, &locked.state, policy, &mut run.warnings));
+    // Cut 9f-1: the checkpoint log, opened from two handles on this operation's workspace, below, once the guard and beat
+    // closures exist (owner ruling 23: setting a damaged log aside is a destination mutation, so it runs under them).
+    // A damaged log never aborts a copy, except an unsupported format (a newer Flux wrote it) and a lost lock. In a
+    // `RefCell` because the guard and beat closures read it for the whole walk while the end of the run must take it by
+    // value to `finish` or `abandon` it.
+    let ckpt: std::cell::RefCell<Option<Checkpoints<F::Dir>>> = std::cell::RefCell::new(None);
     // Step 6: the copy, with §99 before every destination mutation.
     let mut leftovers: Vec<PathBuf> = Vec::new();
-    // The log is opened before these closures, so they can flag it the moment either detects a loss: from then on no
-    // NEW flush begins (a flush already in flight may complete or tear; a loss not yet detected is outside this).
+    // The closures flag the log the moment either detects a loss: from then on no NEW flush begins (a flush already in
+    // flight may complete or tear; a loss not yet detected is outside this).
     let flagged = |e| {
         if let Some(c) = &*ckpt.borrow() {
             c.mark_abandoned();
@@ -329,9 +337,18 @@ pub(crate) fn tree_with<F: DestinationRoot>(
             .map_err(|e| beat_error(&locked.lock_shown, e))
             .map_err(flagged)
     };
+    let opened = open_checkpoints(&place, &locked.state, policy, &mut run.warnings, &guard, &beat);
+    let mut stopped_early = None;
+    match opened {
+        Ok(c) => *ckpt.borrow_mut() = c,
+        Err(error) => stopped_early = Some(error),
+    }
     // The store stays open past the walk, for the final sync; it is dropped before `finish` removes the file.
     let claims = place.claims.take().map(std::cell::RefCell::new);
-    let walked = {
+    let walked = if let Some(error) = stopped_early {
+        // The log could not be opened (or set aside) under the run's lock: nothing is copied.
+        Err(error)
+    } else {
         let held = ckpt.borrow();
         let cx = Shared {
             fs,
@@ -646,22 +663,35 @@ fn checkpoint_policy(_cfg: &RunConfig, durability: flux_fs::Durability) -> Check
     CheckpointPolicy { wal: crate::wal::writer::WalConfig { durability, ..default.wal }, ..default }
 }
 
-/// Cut 9f-1: open the run's checkpoint log, or say why there is none. `None` also when the state carries no WAL
+/// The most quarantine names `set_aside` tries for one generation (`.corrupt-<g>`, `-2`, `-3`, ...).
+const QUARANTINE_NAMES_MAX: u32 = 64;
+
+/// Cut 9f-1: open the run's checkpoint log, or say why there is none. `Ok(None)` also when the state carries no WAL
 /// generation. The caller builds the policy's WAL durability from the run's (`checkpoint_policy`).
+///
+/// Owner ruling 23, per open-time failure: an unsupported format stops the run (`Err`, before any file is copied);
+/// mid-log damage or a sequence conflict sets the segment aside and starts a fresh log (`quarantine`); an unavailable
+/// identity or any other failure warns and the run has no checkpoints. `guard` and `beat` are the run's own closures: the
+/// quarantine is a destination mutation, so it runs under them, and their error is the run's lost lock (`Err`).
 fn open_checkpoints<F: DestinationRoot>(
     place: &TreePlace<'_, F>,
     state: &crate::state::OperationState,
     policy: CheckpointPolicy,
     warnings: &mut Vec<RunWarning>,
-) -> Option<Checkpoints<F::Dir>> {
-    let generation = state.wal.as_ref().map(|w| w.wal_generation)?;
+    guard: &dyn Fn() -> flux_fs::Result<()>,
+    beat: &dyn Fn() -> flux_fs::Result<()>,
+) -> Result<Option<Checkpoints<F::Dir>>, CopyError> {
+    let Some(generation) = state.wal.as_ref().map(|w| w.wal_generation) else {
+        return Ok(None);
+    };
     let id = state.operation_id.as_str();
-    let handles = place.open_workspace(id).and_then(|w| place.open_workspace(id).map(|r| (w, r)));
-    let (workspace, read_dir) = match handles {
+    let handles =
+        || place.open_workspace(id).and_then(|w| place.open_workspace(id).map(|r| (w, r)));
+    let (workspace, read_dir) = match handles() {
         Ok(h) => h,
         Err(e) => {
             warnings.push(RunWarning::CheckpointsUnreadable { why: e.to_string() });
-            return None;
+            return Ok(None);
         }
     };
     match Checkpoints::open(workspace, read_dir, id, generation, policy) {
@@ -679,21 +709,94 @@ fn open_checkpoints<F: DestinationRoot>(
                     reason,
                 });
             }
-            Some(c)
+            Ok(Some(c))
         }
         Err(CheckpointOpenError::Unavailable(why)) => {
             warnings.push(RunWarning::CheckpointsUnavailable { why });
-            None
+            Ok(None)
         }
-        Err(CheckpointOpenError::Corrupt(why)) => {
-            warnings.push(RunWarning::CheckpointsUnreadable { why });
-            None
+        Err(CheckpointOpenError::FormatUnsupported(why)) => {
+            let message = format!(
+                "the checkpoint log was written by a newer Flux ({why}); nothing was copied; use the Flux version that wrote it, or run again with --restart to supersede it"
+            );
+            Err(CopyError {
+                cause: FsError::new(Code::WalFormatUnsupported, std::io::Error::other(message)),
+                leftover: None,
+                step: crate::copy::CopyStep::Checkpoint,
+            })
+        }
+        Err(CheckpointOpenError::Corrupt { code, why }) => {
+            // Under §99: a lost lock aborts the quarantine, and the run ends as any lost lock does.
+            let lost = |cause| CopyError {
+                cause,
+                leftover: None,
+                step: crate::copy::CopyStep::Checkpoint,
+            };
+            guard().and_then(|()| beat()).map_err(lost)?;
+            let set_aside_as = match set_aside(place, id, generation) {
+                Ok(name) => name,
+                Err(error) => {
+                    warnings.push(RunWarning::WalNotQuarantined {
+                        code,
+                        why,
+                        error: error.to_string(),
+                    });
+                    return Ok(None);
+                }
+            };
+            // No segment exists now, so the open starts a clean log: the old log's checkpoints are not used.
+            let reopened = handles().map_err(|e| e.to_string()).and_then(|(w, r)| {
+                Checkpoints::open(w, r, id, generation, policy).map_err(|e| match e {
+                    CheckpointOpenError::Unavailable(m)
+                    | CheckpointOpenError::FormatUnsupported(m)
+                    | CheckpointOpenError::Corrupt { why: m, .. } => m,
+                    CheckpointOpenError::Fatal(e) => e.to_string(),
+                })
+            });
+            match reopened {
+                Ok(c) => {
+                    warnings.push(RunWarning::WalQuarantined { code, why, set_aside_as });
+                    Ok(Some(c))
+                }
+                Err(error) => {
+                    warnings.push(RunWarning::WalNotQuarantined { code, why, error });
+                    Ok(None)
+                }
+            }
         }
         Err(CheckpointOpenError::Fatal(e)) => {
             warnings.push(RunWarning::CheckpointsUnreadable { why: e.to_string() });
-            None
+            Ok(None)
         }
     }
+}
+
+/// Owner ruling 23: rename the workspace's `wal/000001` to `000001.corrupt-<generation>` (then `-2`, `-3`, ... when that
+/// name is taken, up to `QUARANTINE_NAMES_MAX`), through handles opened and closed here. Returns the new name.
+fn set_aside<F: DestinationRoot>(
+    place: &TreePlace<'_, F>,
+    id: &str,
+    generation: u64,
+) -> flux_fs::Result<String> {
+    use crate::wal::writer::{DIR_NAME, SEGMENT_NAME};
+    let workspace = place.open_workspace(id)?;
+    let wal = workspace.open_dir(OsStr::new(DIR_NAME))?;
+    for n in 1..=QUARANTINE_NAMES_MAX {
+        let name = if n == 1 {
+            format!("{SEGMENT_NAME}.corrupt-{generation}")
+        } else {
+            format!("{SEGMENT_NAME}.corrupt-{generation}-{n}")
+        };
+        match wal.rename_no_replace(OsStr::new(SEGMENT_NAME), &wal, OsStr::new(&name)) {
+            Ok(()) => return Ok(name),
+            Err(e) if e.source.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(FsError::new(
+        Code::IoError,
+        std::io::Error::other(format!("all {QUARANTINE_NAMES_MAX} quarantine names are taken")),
+    ))
 }
 
 /// Step 7, "Finish".

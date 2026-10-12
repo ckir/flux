@@ -935,6 +935,14 @@ pub fn finish_retire<D: DirHandle>(operations: &D, name: &OsStr) -> flux_fs::Res
         match dir.open_dir(OsStr::new(crate::wal::writer::DIR_NAME)) {
             Ok(w) => {
                 remove_if_present(&w, OsStr::new(crate::wal::writer::SEGMENT_NAME))?;
+                // Owner ruling 23: the damaged segments a run set aside (`000001.corrupt-<generation>[-<n>]`) go with
+                // the log; any other name is a stranger and stays.
+                let quarantined = format!("{}.corrupt-", crate::wal::writer::SEGMENT_NAME);
+                for entry in w.read_dir()? {
+                    if entry.name.to_str().is_some_and(|n| n.starts_with(&quarantined)) {
+                        remove_if_present(&w, &entry.name)?;
+                    }
+                }
                 // Closed before its directory is removed.
                 drop(w);
                 dir.remove_dir(OsStr::new(crate::wal::writer::DIR_NAME))?;
@@ -1427,6 +1435,43 @@ mod tests {
         for name in [MANIFEST, "manifest.tmp", STATE_DB] {
             assert!(!fs.exists(format!("{path}/{name}")), "{name} is a known name");
         }
+    }
+
+    // Owner ruling 23. Mutant: `finish_retire` removes `000001` only, not its `.corrupt-` quarantine names.
+    #[test]
+    fn finish_retire_removes_quarantined_segments_and_keeps_a_stranger() {
+        let (fs, d) = dest();
+        let ops = operations_dir(&d, Path::new("D")).unwrap();
+        let path = format!("/p/dest/.flux/operations/{}.removing", id(1));
+        fs.create_dir(Path::new(&path)).unwrap();
+        fs.create_dir(Path::new(&format!("{path}/wal"))).unwrap();
+        fs.write_file(format!("{path}/{MANIFEST}"), b"x");
+        for name in ["000001", "000001.corrupt-2", "000001.corrupt-2-2", "000001.corrupt-7"] {
+            fs.write_file(format!("{path}/wal/{name}"), b"segment");
+        }
+        let removing = OsString::from(format!("{}.removing", id(1)));
+        finish_retire(&ops, &removing).unwrap();
+        assert!(!fs.exists(format!("{path}/wal")) && !fs.exists(&path));
+
+        // A stranger beside the quarantine names (even one that only resembles them) keeps `wal/` and the
+        // workspace; the segment and the quarantine names still go.
+        let (fs, d) = dest();
+        let ops = operations_dir(&d, Path::new("D")).unwrap();
+        fs.create_dir(Path::new(&path)).unwrap();
+        fs.create_dir(Path::new(&format!("{path}/wal"))).unwrap();
+        fs.write_file(format!("{path}/{MANIFEST}"), b"x");
+        for name in ["000001", "000001.corrupt-2", "000001.corruptx", "000002.corrupt-2"] {
+            fs.write_file(format!("{path}/wal/{name}"), b"segment");
+        }
+        let e = finish_retire(&ops, &removing).unwrap_err();
+        assert_eq!(e.source.kind(), ErrorKind::DirectoryNotEmpty);
+        for gone in ["000001", "000001.corrupt-2"] {
+            assert!(!fs.exists(format!("{path}/wal/{gone}")), "{gone}");
+        }
+        for kept in ["000001.corruptx", "000002.corrupt-2"] {
+            assert!(fs.exists(format!("{path}/wal/{kept}")), "{kept} is a stranger");
+        }
+        assert!(!fs.exists(format!("{path}/{MANIFEST}")), "the flat known names still go first");
     }
 
     #[test]
