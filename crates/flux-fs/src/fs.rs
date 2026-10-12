@@ -107,7 +107,8 @@ pub trait FileHandle: Write {
 
     /// An OS-level duplicate of this handle (`File::try_clone`: `dup` on POSIX, `DuplicateHandle` on Windows). It
     /// shares the open file description, so `sync_all` on the duplicate syncs the same file, and it may be moved to
-    /// another thread while this handle keeps writing. Never follows anything: this is a handle, not a path.
+    /// another thread while this handle keeps writing. The file OFFSET is shared too, so a write through either handle moves
+    /// both. Never follows anything: this is a handle, not a path.
     fn duplicate(&self) -> Result<Self>
     where
         Self: Sized;

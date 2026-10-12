@@ -2043,14 +2043,52 @@ mod tests {
     #[test]
     fn a_duplicate_syncs_the_same_file_from_another_thread() {
         let fs = FaultFs::new();
+        fs.set_identity("/p", FileIdentity::Strong(flux_fs::ObjectId { volume: 1, index: 7 }));
         let mut w = fs.create_new(Path::new("/p")).unwrap();
         w.write_all(b"hello").unwrap();
         let d = w.duplicate().unwrap();
+        assert_eq!(d.identity().unwrap(), w.identity().unwrap());
+        assert_ne!(d.identity().unwrap(), FileIdentity::Unavailable);
         std::thread::scope(|s| {
             s.spawn(move || d.sync_all().unwrap());
         });
+        assert!(fs.calls().contains(&"sync_all(/p)".to_string()));
         w.write_all(b"!").unwrap();
         assert_eq!(fs.read_file("/p").unwrap(), b"hello!");
+    }
+
+    #[test]
+    fn an_injected_sync_fault_reaches_the_duplicate() {
+        let fs = FaultFs::new();
+        fs.fail("sync_all", Code::DestinationError);
+        let w = fs.create_new(Path::new("/p")).unwrap();
+        let d = w.duplicate().unwrap();
+        let e = d.sync_all().unwrap_err();
+        assert_eq!(e.code, Code::DestinationError);
+        // One-shot and shared: the original now syncs cleanly.
+        w.sync_all().unwrap();
+    }
+
+    #[test]
+    fn truncate_to_the_current_length_succeeds_and_zero_restarts_the_file() {
+        let fs = FaultFs::new();
+        let mut w = fs.create_new(Path::new("/p")).unwrap();
+        w.write_all(b"hello").unwrap();
+        w.truncate_to(5).unwrap();
+        assert_eq!(fs.read_file("/p").unwrap(), b"hello");
+        w.truncate_to(0).unwrap();
+        w.write_all(b"x").unwrap();
+        assert_eq!(fs.read_file("/p").unwrap(), b"x");
+    }
+
+    #[test]
+    fn a_reader_cannot_be_duplicated_or_truncated() {
+        let fs = FaultFs::new();
+        fs.write_file("/r", b"r");
+        let mut r = fs.open_read(Path::new("/r")).unwrap();
+        assert_eq!(r.duplicate().err().unwrap().code, Code::DestinationError);
+        assert_eq!(r.truncate_to(0).unwrap_err().code, Code::DestinationError);
+        assert_eq!(fs.read_file("/r").unwrap(), b"r");
     }
 
     #[test]
