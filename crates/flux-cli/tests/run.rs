@@ -577,6 +577,99 @@ fn a_killed_tree_copy_resumes_as_the_same_operation() {
     assert!(!d.path().join("dst.flux-lock").exists(), "and the lock");
 }
 
+/// Cut 9f-1, plan 2, task 10b: the real binary, real files, the real 64 MiB threshold (no `FLUX_TEST_CHECKPOINT_MIN`).
+/// A one-file tree `src/big` of 70 MiB under `--durability strict`. A one-file tree run has these guarded mutations:
+/// the destination directory's creation (1), the file's sweep (2), its temporary (3), the batch's flush guard (4) and
+/// its publish (5); measured by stalling at each index (3: no partial yet; 4 and 5: the partial is whole and the WAL
+/// segment holds every range; 6: published). The stall at 5 is before the publish guard. The kill leaves a whole
+/// partial, so the test simulates the mid-file crash on it: truncated to 40 MiB, then 1 MiB of garbage appended, so the
+/// chunk at offset 40 MiB mismatches. The resume must keep the validated 40 MiB, recopy the rest, publish a file equal
+/// to the source, report both lines of `checkpoint_lines` (pinning `main.rs`'s call), and leave no workspace behind
+/// (the WAL thread was joined and its handles dropped; on Windows a held handle would block the removal).
+#[test]
+fn a_killed_large_file_resumes_from_its_validated_prefix() {
+    use std::io::{Read, Write};
+    const MIB: usize = 1024 * 1024;
+    const LEN: usize = 70 * MIB;
+    let d = TempDir::new().unwrap();
+    let marks = TempDir::new().unwrap();
+    let src = d.path().join("src");
+    let dst = d.path().join("dst");
+    std::fs::create_dir_all(&src).unwrap();
+    // Deterministic, non-repeating content: an xorshift64 stream.
+    {
+        let mut w = std::io::BufWriter::new(std::fs::File::create(src.join("big")).unwrap());
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..LEN / 8 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            w.write_all(&x.to_le_bytes()).unwrap();
+        }
+        w.flush().unwrap();
+    }
+    Stalled::start_args(&src, &dst, 5, marks.path(), &["--durability", "strict"]).kill();
+
+    let id = the_operation(&dst);
+    let partials: Vec<String> =
+        names(&dst).into_iter().filter(|n| n.starts_with("big.flux-partial.")).collect();
+    assert_eq!(partials.len(), 1, "one partial: {partials:?}");
+    let id_hex = &partials[0]["big.flux-partial.".len()..];
+    assert_eq!(id_hex.len(), 32, "{partials:?}");
+    assert!(id_hex.bytes().all(|b| b.is_ascii_hexdigit()), "{partials:?}");
+    assert_eq!(id.len(), 32, "{id}");
+    let partial = dst.join(&partials[0]);
+    assert_eq!(
+        std::fs::metadata(&partial).unwrap().len(),
+        LEN as u64,
+        "the kill left a whole partial"
+    );
+    let segment = dst.join(".flux").join("operations").join(&id).join("wal").join("000001");
+    assert!(std::fs::metadata(&segment).unwrap().len() > 0, "the WAL holds the file's ranges");
+
+    // The mid-file crash: 40 MiB kept, then 1 MiB of garbage in place of the real chunk 40.
+    {
+        let f = std::fs::OpenOptions::new().write(true).open(&partial).unwrap();
+        f.set_len(40 * MIB as u64).unwrap();
+        let mut f = std::fs::OpenOptions::new().append(true).open(&partial).unwrap();
+        f.write_all(&vec![0xA5u8; MIB]).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    let out =
+        copy(&[os("--resume"), os("--durability"), os("strict"), src.as_os_str(), dst.as_os_str()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = format!("{}{}", stderr(&out), String::from_utf8_lossy(&out.stdout));
+    let has_line = |prefix: &str| text.lines().any(|l| l.starts_with(prefix));
+    assert!(has_line("resumed big: reused 41943040 bytes, recopied"), "{text}");
+    assert!(has_line("checkpoints discarded for big: mismatch at offset 41943040"), "{text}");
+
+    // Byte for byte, in chunks (never 140 MiB at once).
+    let (mut a, mut b) = (
+        std::fs::File::open(src.join("big")).unwrap(),
+        std::fs::File::open(dst.join("big")).unwrap(),
+    );
+    assert_eq!(a.metadata().unwrap().len(), b.metadata().unwrap().len());
+    let (mut buf_a, mut buf_b) = (vec![0u8; MIB], vec![0u8; MIB]);
+    let mut at = 0usize;
+    loop {
+        let n = a.read(&mut buf_a).unwrap();
+        if n == 0 {
+            break;
+        }
+        b.read_exact(&mut buf_b[..n]).unwrap();
+        assert!(
+            buf_a[..n] == buf_b[..n],
+            "the output differs from the source in the chunk at {at}"
+        );
+        at += n;
+    }
+    assert_eq!(at, LEN);
+    assert!(!dst.join(".flux").join("operations").join(&id).exists(), "the workspace is gone");
+    assert!(!dst.join(".flux").exists(), "and the control directory");
+    assert!(names(&dst).iter().all(|n| !n.contains(".flux-partial.")), "no partial remains");
+}
+
 #[test]
 fn a_resume_killed_again_resumes_a_third_time() {
     let d = TempDir::new().unwrap();
