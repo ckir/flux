@@ -607,6 +607,119 @@ mod posix {
         assert_eq!(e.code, flux_fs::Code::IoError, "{e:?}");
         assert_eq!(e.source.kind(), std::io::ErrorKind::NotFound, "{e:?}");
     }
+
+    #[test]
+    fn open_existing_appends_after_the_prefix() {
+        use flux_fs::FileHandle;
+        use std::io::Write;
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let mut w = root.create_new(OsStr::new("f")).unwrap();
+        w.write_all(b"abc").unwrap();
+        let id = w.identity().unwrap();
+        drop(w);
+        let mut w2 = root.open_existing(OsStr::new("f"), &id).unwrap();
+        assert_eq!(w2.identity().unwrap(), id);
+        w2.truncate_to(2).unwrap();
+        w2.write_all(b"Z").unwrap();
+        drop(w2);
+        assert_eq!(root.read_file(OsStr::new("f"), 100).unwrap(), b"abZ");
+    }
+
+    #[test]
+    fn open_existing_refuses_a_planted_symlink() {
+        use flux_fs::FileHandle;
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let w = root.create_new(OsStr::new("f")).unwrap();
+        let id = w.identity().unwrap();
+        drop(w);
+        std::fs::remove_file(d.path().join("f")).unwrap();
+        // A dangling link: following it would CREATE nothing with this flag set, but a follow of a link to an existing
+        // file would open it. Plant the dangling one and assert its target is never created.
+        std::os::unix::fs::symlink("elsewhere", d.path().join("f")).unwrap();
+        let Err(e) = root.open_existing(OsStr::new("f"), &id) else {
+            panic!("a link must not be followed")
+        };
+        assert_eq!(e.code, flux_fs::Code::SafetyRejected, "{e:?}");
+        assert!(
+            !d.path().join("elsewhere").exists(),
+            "the link's target must not have been created"
+        );
+    }
+
+    #[test]
+    fn open_existing_refuses_a_symlink_to_an_existing_file() {
+        use flux_fs::FileHandle;
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let w = root.create_new(OsStr::new("real")).unwrap();
+        let id = w.identity().unwrap();
+        drop(w);
+        std::os::unix::fs::symlink("real", d.path().join("l")).unwrap();
+        // The link resolves to a file whose identity IS `id`: only NOFOLLOW stops this open.
+        let Err(e) = root.open_existing(OsStr::new("l"), &id) else {
+            panic!("a link must not be followed")
+        };
+        assert_eq!(e.code, flux_fs::Code::SafetyRejected, "{e:?}");
+    }
+
+    #[test]
+    fn open_existing_refuses_an_identity_mismatch() {
+        use flux_fs::FileHandle;
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let w = root.create_new(OsStr::new("f")).unwrap();
+        let id = w.identity().unwrap();
+        drop(w);
+        // Keep the first inode alive so the filesystem cannot hand its number to the second file.
+        std::fs::hard_link(d.path().join("f"), d.path().join("keep")).unwrap();
+        std::fs::remove_file(d.path().join("f")).unwrap();
+        drop(root.create_new(OsStr::new("f")).unwrap());
+        let Err(e) = root.open_existing(OsStr::new("f"), &id) else {
+            panic!("a different object at the name must be refused")
+        };
+        assert_eq!(e.code, flux_fs::Code::DestinationError, "{e:?}");
+        assert_eq!(e.source.kind(), std::io::ErrorKind::InvalidData, "{e:?}");
+    }
+
+    #[test]
+    fn open_existing_refuses_an_unavailable_expectation() {
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        drop(root.create_new(OsStr::new("f")).unwrap());
+        let Err(e) = root.open_existing(OsStr::new("f"), &flux_fs::FileIdentity::Unavailable)
+        else {
+            panic!("an unavailable expectation proves nothing")
+        };
+        assert_eq!(e.code, flux_fs::Code::DestinationError, "{e:?}");
+        assert_eq!(e.source.kind(), std::io::ErrorKind::InvalidData, "{e:?}");
+    }
+
+    #[test]
+    fn open_existing_of_a_missing_name_is_not_found() {
+        use flux_fs::FileHandle;
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let id = root.create_new(OsStr::new("g")).unwrap().identity().unwrap();
+        let Err(e) = root.open_existing(OsStr::new("nope"), &id) else { panic!("a missing name") };
+        assert_eq!(e.code, flux_fs::Code::IoError, "{e:?}");
+        assert_eq!(e.source.kind(), std::io::ErrorKind::NotFound, "{e:?}");
+    }
+
+    #[test]
+    fn open_existing_refuses_a_directory() {
+        use flux_fs::FileHandle;
+        let d = TempDir::new().unwrap();
+        std::fs::create_dir(d.path().join("d")).unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let id = root.create_new(OsStr::new("g")).unwrap().identity().unwrap();
+        let Err(e) = root.open_existing(OsStr::new("d"), &id) else {
+            panic!("a directory is not a state file")
+        };
+        assert_eq!(e.code, flux_fs::Code::DestinationError, "{e:?}");
+        assert_eq!(e.source.kind(), std::io::ErrorKind::IsADirectory, "{e:?}");
+    }
 }
 
 #[cfg(windows)]
@@ -1486,6 +1599,101 @@ mod windows_arm {
         let Err(e) = root.open_read(OsStr::new("nope")) else { panic!("a missing name") };
         assert_eq!(e.code, flux_fs::Code::IoError, "{e:?}");
         assert_eq!(e.source.kind(), std::io::ErrorKind::NotFound, "{e:?}");
+    }
+
+    #[test]
+    fn open_existing_appends_after_the_prefix() {
+        use flux_fs::FileHandle;
+        use std::io::Write;
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let mut w = root.create_new(OsStr::new("f")).unwrap();
+        w.write_all(b"abc").unwrap();
+        let id = w.identity().unwrap();
+        drop(w);
+        let mut w2 = root.open_existing(OsStr::new("f"), &id).unwrap();
+        assert_eq!(w2.identity().unwrap(), id);
+        w2.truncate_to(2).unwrap();
+        w2.write_all(b"Z").unwrap();
+        drop(w2);
+        assert_eq!(root.read_file(OsStr::new("f"), 100).unwrap(), b"abZ");
+    }
+
+    #[test]
+    fn open_existing_answers_a_junction_as_a_directory_and_leaves_its_target_alone() {
+        use flux_fs::FileHandle;
+        // As `open_read`'s: FILE_NON_DIRECTORY_FILE answers STATUS_FILE_IS_A_DIRECTORY before the reparse-tag check.
+        let d = TempDir::new().unwrap();
+        std::fs::create_dir(d.path().join("real")).unwrap();
+        if !junction(&d.path().join("real"), &d.path().join("junc")) {
+            panic!("could not create a junction; mklink /J requires no privilege");
+        }
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let id = root.create_new(OsStr::new("g")).unwrap().identity().unwrap();
+        let Err(e) = root.open_existing(OsStr::new("junc"), &id) else {
+            panic!("a junction must not be opened for writing")
+        };
+        assert_eq!(e.code, flux_fs::Code::DestinationError, "{e:?}");
+        assert_eq!(e.source.kind(), std::io::ErrorKind::IsADirectory, "{e:?}");
+        assert!(
+            std::fs::read_dir(d.path().join("real")).unwrap().next().is_none(),
+            "nothing was created inside the junction's TARGET"
+        );
+    }
+
+    #[test]
+    fn open_existing_refuses_an_identity_mismatch() {
+        use flux_fs::FileHandle;
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let w = root.create_new(OsStr::new("f")).unwrap();
+        let id = w.identity().unwrap();
+        drop(w);
+        std::fs::remove_file(d.path().join("f")).unwrap();
+        drop(root.create_new(OsStr::new("f")).unwrap());
+        let Err(e) = root.open_existing(OsStr::new("f"), &id) else {
+            panic!("a different object at the name must be refused")
+        };
+        assert_eq!(e.code, flux_fs::Code::DestinationError, "{e:?}");
+        assert_eq!(e.source.kind(), std::io::ErrorKind::InvalidData, "{e:?}");
+    }
+
+    #[test]
+    fn open_existing_refuses_an_unavailable_expectation() {
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        drop(root.create_new(OsStr::new("f")).unwrap());
+        let Err(e) = root.open_existing(OsStr::new("f"), &flux_fs::FileIdentity::Unavailable)
+        else {
+            panic!("an unavailable expectation proves nothing")
+        };
+        assert_eq!(e.code, flux_fs::Code::DestinationError, "{e:?}");
+        assert_eq!(e.source.kind(), std::io::ErrorKind::InvalidData, "{e:?}");
+    }
+
+    #[test]
+    fn open_existing_of_a_missing_name_is_not_found() {
+        use flux_fs::FileHandle;
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let id = root.create_new(OsStr::new("g")).unwrap().identity().unwrap();
+        let Err(e) = root.open_existing(OsStr::new("nope"), &id) else { panic!("a missing name") };
+        assert_eq!(e.code, flux_fs::Code::IoError, "{e:?}");
+        assert_eq!(e.source.kind(), std::io::ErrorKind::NotFound, "{e:?}");
+    }
+
+    #[test]
+    fn open_existing_refuses_a_directory() {
+        use flux_fs::FileHandle;
+        let d = TempDir::new().unwrap();
+        std::fs::create_dir(d.path().join("d")).unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let id = root.create_new(OsStr::new("g")).unwrap().identity().unwrap();
+        let Err(e) = root.open_existing(OsStr::new("d"), &id) else {
+            panic!("a directory is not a state file")
+        };
+        assert_eq!(e.code, flux_fs::Code::DestinationError, "{e:?}");
+        assert_eq!(e.source.kind(), std::io::ErrorKind::IsADirectory, "{e:?}");
     }
 }
 

@@ -279,6 +279,23 @@ pub trait DirHandle: Sized {
     /// outside `DEST`. The name is occupied by the link itself.
     fn create_new(&self, name: &std::ffi::OsStr) -> Result<Self::Writer>;
 
+    /// Open an existing child REGULAR FILE for writing, as `create_new` does by name: relative to this handle, so the
+    /// name cannot be resolved anywhere outside the directory it holds, and never following a link. The file is not
+    /// truncated and the handle is positioned at 0; a caller that resumes calls `truncate_to` next.
+    ///
+    /// `expected` is the identity the caller recorded when it wrote the file. The handle's `identity()` MUST equal it,
+    /// or the open is refused: a different object at the name is not the file the caller means to resume.
+    ///
+    /// Refuses: a name-surrogate (`Code::SafetyRejected`); a directory (`Code::DestinationError`, kind `IsADirectory`);
+    /// any other non-regular file (`Code::DestinationError`); an identity that differs from `expected`, and an
+    /// `expected` of `FileIdentity::Unavailable`, which proves nothing (`Code::DestinationError`, kind `InvalidData`).
+    /// A missing name is `Code::IoError` with kind `NotFound`. The handle is closed on every refusal.
+    fn open_existing(
+        &self,
+        name: &std::ffi::OsStr,
+        expected: &crate::FileIdentity,
+    ) -> Result<Self::Writer>;
+
     /// Metadata for a child, judging the NAME and never its target.
     ///
     /// A link reports as a link. Reporting its target's type is how a caller is

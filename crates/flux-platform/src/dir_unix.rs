@@ -1,6 +1,7 @@
 //! The POSIX `DirHandle`: `openat` with `O_NOFOLLOW | O_DIRECTORY` (§149.7).
 
-use flux_fs::{Code, DirHandle, FsError, Metadata, MountRoot, Result, check_component};
+use crate::std_fs::{identity_mismatch, unavailable_expectation};
+use flux_fs::{Code, DirHandle, FileHandle, FsError, Metadata, MountRoot, Result, check_component};
 use rustix::fs::{Access, AtFlags, Mode, OFlags, accessat, openat, statat};
 use std::ffi::OsStr;
 use std::os::fd::OwnedFd;
@@ -160,6 +161,71 @@ impl DirHandle for StdDir {
         )
         .map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
         Ok(crate::std_fs::std_file_from(std::fs::File::from(fd)))
+    }
+
+    fn open_existing(
+        &self,
+        name: &OsStr,
+        expected: &flux_fs::FileIdentity,
+    ) -> Result<Self::Writer> {
+        use rustix::fs::FileType;
+        check_component(name)?;
+        if *expected == flux_fs::FileIdentity::Unavailable {
+            return Err(unavailable_expectation());
+        }
+        // No CREATE, no TRUNC: the file must already exist and keeps its bytes. NOFOLLOW refuses a link at the name.
+        // NONBLOCK keeps a FIFO from hanging the open (a write-only open of a FIFO with no reader would block; with it
+        // the open fails ENXIO and is classified below), NOCTTY keeps a terminal from becoming this process's.
+        let fd = openat(
+            &self.0,
+            name,
+            OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| match e {
+            rustix::io::Errno::LOOP => FsError::new(Code::SafetyRejected, std::io::Error::from(e)),
+            // A directory refuses a write open with EISDIR.
+            rustix::io::Errno::ISDIR => FsError::new(
+                Code::DestinationError,
+                std::io::Error::new(
+                    std::io::ErrorKind::IsADirectory,
+                    "a directory is not a state file",
+                ),
+            ),
+            _ if statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW)
+                .is_ok_and(|st| FileType::from_raw_mode(st.st_mode) != FileType::RegularFile) =>
+            {
+                FsError::new(
+                    Code::DestinationError,
+                    std::io::Error::other(format!("not a regular file ({e})")),
+                )
+            }
+            _ => FsError::from_io(std::io::Error::from(e)),
+        })?;
+        let st = rustix::fs::fstat(&fd).map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
+        match FileType::from_raw_mode(st.st_mode) {
+            FileType::RegularFile => {}
+            FileType::Directory => {
+                return Err(FsError::new(
+                    Code::DestinationError,
+                    std::io::Error::new(
+                        std::io::ErrorKind::IsADirectory,
+                        "a directory is not a state file",
+                    ),
+                ));
+            }
+            _ => {
+                return Err(FsError::new(
+                    Code::DestinationError,
+                    std::io::Error::other("not a regular file"),
+                ));
+            }
+        }
+        let handle = crate::std_fs::std_file_from(std::fs::File::from(fd));
+        if handle.identity()? != *expected {
+            return Err(identity_mismatch());
+        }
+        Ok(handle)
     }
 
     fn metadata(&self, name: &OsStr) -> Result<Metadata> {

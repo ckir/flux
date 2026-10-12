@@ -92,6 +92,26 @@ pub(crate) fn std_reader_from(f: File) -> StdReader {
     StdReader(f)
 }
 
+/// The refusal of `DirHandle::open_existing` for an `expected` identity of `Unavailable`, which proves nothing. Shared by
+/// both handle arms so the two answer identically.
+pub(crate) fn unavailable_expectation() -> FsError {
+    FsError::new(
+        Code::DestinationError,
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "open_existing needs an identity to check against, and was given none",
+        ),
+    )
+}
+
+/// The refusal of `DirHandle::open_existing` for a different object at the name.
+pub(crate) fn identity_mismatch() -> FsError {
+    FsError::new(
+        Code::DestinationError,
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "identity mismatch"),
+    )
+}
+
 pub struct StdFileSystem;
 
 /// Can this process actually replace the destination NAME?
