@@ -1339,6 +1339,28 @@ mod tests {
     }
 
     #[test]
+    fn a_file_whose_sync_failed_gets_no_checkpoint_in_a_later_flush() {
+        let (fs, dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        fs.fail("sync_all", Code::StrictDurabilityUnavailable);
+        let p = fs.create_new(Path::new("/ws/p")).unwrap();
+        let (s, t) = start(dir, 1, cfg(BIG, HOUR, Durability::Strict));
+        s.send(begin_msg(b"p", Some(p.duplicate().unwrap())), beat).unwrap();
+        s.send(Msg::Range(range(b"p", 0, 1)), beat).unwrap();
+        let first = drain(&s, beat);
+        assert_eq!(first.files[&b"p".to_vec()].code, Code::StrictDurabilityUnavailable);
+        // A later flush for the same attempt: the injected fault is spent, so a retried sync would succeed,
+        // and that proves nothing about the pages the failed one lost. Nothing may be appended and no sync retried.
+        s.send(Msg::Range(range(b"p", 1, 2)), beat).unwrap();
+        let second = drain(&s, beat);
+        assert_eq!(second.files[&b"p".to_vec()].code, Code::StrictDurabilityUnavailable);
+        assert!(wal_bytes(&fs).is_none());
+        assert_eq!(syncs(&fs), ["sync_all(/ws/p)"]);
+        s.send(Msg::Stop, beat).unwrap();
+        t.join();
+    }
+
+    #[test]
     fn a_later_strict_flush_syncs_the_duplicate_again() {
         let (fs, dir) = ws();
         let beat: &Heartbeat = &|| Ok(());
