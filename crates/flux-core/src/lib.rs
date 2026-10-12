@@ -9,6 +9,7 @@ pub mod prior;
 pub mod run;
 pub mod state;
 pub mod tree;
+pub(crate) mod wal;
 pub mod walk;
 
 // Test-only. Nothing outside this crate uses the fake, so it is gated on `test`

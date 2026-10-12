@@ -6,11 +6,11 @@
 //! that, and Section 241.5 is amended in Task 9 to name it.
 
 use flux_fs::{
-    DirEntry, FileHandle, FileIdentity, FileSystem, FileType, FsError, Metadata, ObjectId, Perms,
-    Result,
+    Code, DirEntry, FileHandle, FileIdentity, FileSystem, FileType, FsError, Metadata, ObjectId,
+    Perms, Result,
 };
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 #[cfg(unix)]
 use std::time::Duration;
@@ -54,6 +54,23 @@ impl FileHandle for StdFile {
     fn identity(&self) -> Result<FileIdentity> {
         Ok(identity_of_handle(&self.0))
     }
+
+    fn duplicate(&self) -> Result<Self> {
+        self.0.try_clone().map(StdFile).map_err(FsError::from_io)
+    }
+
+    fn truncate_to(&mut self, len: u64) -> Result<()> {
+        let current = self.0.metadata().map_err(FsError::from_io)?.len();
+        if len > current {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "truncate_to cannot extend"),
+            ));
+        }
+        self.0.set_len(len).map_err(FsError::from_io)?;
+        Seek::seek(&mut self.0, SeekFrom::Start(len)).map_err(FsError::from_io)?;
+        Ok(())
+    }
 }
 
 /// Construct a writer from an already-open file. `DirHandle::create_new` opens
@@ -68,6 +85,31 @@ impl FileHandle for StdFile {
 /// else's homework is a gate that stays.
 pub(crate) fn std_file_from(f: File) -> StdFile {
     StdFile(f)
+}
+
+/// A `StdReader` over an already-opened file, for the handle arms that open by name relative to a directory.
+pub(crate) fn std_reader_from(f: File) -> StdReader {
+    StdReader(f)
+}
+
+/// The refusal of `DirHandle::open_existing` for an `expected` identity of `Unavailable`, which proves nothing. Shared by
+/// both handle arms so the two answer identically.
+pub(crate) fn unavailable_expectation() -> FsError {
+    FsError::new(
+        Code::DestinationError,
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "open_existing needs an identity to check against, and was given none",
+        ),
+    )
+}
+
+/// The refusal of `DirHandle::open_existing` for a different object at the name.
+pub(crate) fn identity_mismatch() -> FsError {
+    FsError::new(
+        Code::DestinationError,
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "identity mismatch"),
+    )
 }
 
 pub struct StdFileSystem;

@@ -632,6 +632,10 @@ pub struct FakeHandle {
     path: PathBuf,
     buf: Vec<u8>,
     read_pos: usize,
+    /// Where the next write lands in the stored file. `None` appends at the end (a `create_new` handle and a
+    /// duplicate). `open_existing` gives `Some(0)`, as the real handles are positioned at 0 (`DirHandle::open_existing`);
+    /// `truncate_to(len)` sets `Some(len)`. A write at `Some(p)` overwrites from `p` and advances it.
+    write_pos: Option<usize>,
     /// Where writes land. `None` for a handle opened to read, so a reader cannot
     /// mutate the fake's state even though both roles share this struct.
     sink: Option<std::sync::Arc<Mutex<Inner>>>,
@@ -672,7 +676,19 @@ impl Write for FakeHandle {
         // because none of them looked at the content.
         if let Some(sink) = &self.sink {
             let mut g = sink.lock().unwrap();
-            g.files.entry(self.path.clone()).or_default().extend_from_slice(b);
+            let stored = g.files.entry(self.path.clone()).or_default();
+            match self.write_pos {
+                None => stored.extend_from_slice(b),
+                Some(p) => {
+                    // Overwrite from `p`, extending when the write runs past the end.
+                    let end = p + b.len();
+                    if stored.len() < end {
+                        stored.resize(end, 0);
+                    }
+                    stored[p..end].copy_from_slice(b);
+                    self.write_pos = Some(end);
+                }
+            }
         }
         Ok(b.len())
     }
@@ -731,6 +747,51 @@ impl FileHandle for FakeHandle {
             return Err(FsError::new(code, std::io::Error::other("injected")));
         }
         Ok(g.identities.get(&self.path).copied().unwrap_or(flux_fs::FileIdentity::Unavailable))
+    }
+
+    /// UNLIKE a real duplicate this one does NOT share the write offset (`write_pos` is per handle), so a write through
+    /// it would not move the original's position. The WAL only calls `sync_all` on a duplicate, so nothing observes
+    /// the difference today; a test that writes through a duplicate must not rely on this fake for the shared offset.
+    fn duplicate(&self) -> Result<Self> {
+        let Some(sink) = &self.sink else {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::other("a reader cannot be duplicated"),
+            ));
+        };
+        sink.lock().unwrap().calls.push(format!("duplicate({})", self.path.display()));
+        Ok(FakeHandle {
+            path: self.path.clone(),
+            buf: Vec::new(),
+            read_pos: 0,
+            write_pos: None,
+            sink: Some(sink.clone()),
+            sync_fault: self.sync_fault.clone(),
+            write_fault: self.write_fault.clone(),
+        })
+    }
+
+    fn truncate_to(&mut self, len: u64) -> Result<()> {
+        let Some(sink) = &self.sink else {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::other("a reader cannot be truncated"),
+            ));
+        };
+        let mut g = sink.lock().unwrap();
+        let current = g.files.get(&self.path).map_or(0, |f| f.len() as u64);
+        if len > current {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "truncate_to cannot extend"),
+            ));
+        }
+        if let Some(f) = g.files.get_mut(&self.path) {
+            f.truncate(len as usize);
+        }
+        g.calls.push(format!("truncate_to({}, {len})", self.path.display()));
+        self.write_pos = Some(len as usize);
+        Ok(())
     }
 }
 
@@ -1232,6 +1293,7 @@ impl FileSystem for FaultFs {
             path: p,
             buf,
             read_pos: 0,
+            write_pos: None,
             sink: None,
             sync_fault: std::sync::Arc::new(Mutex::new(None)),
             write_fault: std::sync::Arc::new(Mutex::new(None)),
@@ -1267,6 +1329,7 @@ impl FileSystem for FaultFs {
             path: p,
             buf: Vec::new(),
             read_pos: 0,
+            write_pos: None,
             sink: Some(std::sync::Arc::clone(&self.inner)),
             sync_fault,
             write_fault,
@@ -1587,6 +1650,7 @@ impl FakeDirHandle {
 
 impl DirHandle for FakeDirHandle {
     type Writer = FakeHandle;
+    type Reader = FakeHandle;
     type Lock = FakeLock;
     type Claims = FakeClaimStore;
 
@@ -1684,6 +1748,78 @@ impl DirHandle for FakeDirHandle {
         check_component(name)?;
         let child_path = self.my_path().join(name);
         self.fs().create_new(&child_path)
+    }
+
+    fn open_existing(
+        &self,
+        name: &OsStr,
+        expected: &flux_fs::FileIdentity,
+    ) -> Result<Self::Writer> {
+        use flux_fs::FileHandle;
+        check_component(name)?;
+        if *expected == flux_fs::FileIdentity::Unavailable {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "open_existing needs an identity to check against, and was given none",
+                ),
+            ));
+        }
+        let child_path = self.fs().norm(&self.my_path().join(name));
+        let mut g = self.inner.lock().unwrap();
+        match g.types.get(&child_path) {
+            Some(FileType::Symlink) => {
+                return Err(FsError::new(
+                    Code::SafetyRejected,
+                    std::io::Error::other("refuses to follow a symlink or other name-surrogate"),
+                ));
+            }
+            Some(FileType::Other) => {
+                return Err(FsError::new(
+                    Code::DestinationError,
+                    std::io::Error::other("not a regular file"),
+                ));
+            }
+            _ => {}
+        }
+        if g.directories.contains(&child_path) {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::new(
+                    std::io::ErrorKind::IsADirectory,
+                    "a directory is not a state file",
+                ),
+            ));
+        }
+        if !g.files.contains_key(&child_path) {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            ));
+        }
+        // Recorded only once the open is accepted by the name checks, so a refused name leaves no call behind.
+        g.calls.push(format!("open_existing({})", child_path.display()));
+        let sync_fault = std::sync::Arc::new(Mutex::new(g.faults.remove("sync_all")));
+        let write_fault = std::sync::Arc::new(Mutex::new(g.write_fault.take()));
+        drop(g);
+        // A sink handle for the path, as `FaultFs::create_new` builds one, but the stored bytes are left alone.
+        let handle = FakeHandle {
+            path: child_path,
+            buf: Vec::new(),
+            read_pos: 0,
+            write_pos: Some(0),
+            sink: Some(std::sync::Arc::clone(&self.inner)),
+            sync_fault,
+            write_fault,
+        };
+        if handle.identity()? != *expected {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "identity mismatch"),
+            ));
+        }
+        Ok(handle)
     }
 
     fn metadata(&self, name: &OsStr) -> Result<Metadata> {
@@ -1944,6 +2080,41 @@ impl DirHandle for FakeDirHandle {
         Ok(bytes)
     }
 
+    fn open_read(&self, name: &OsStr) -> Result<Self::Reader> {
+        check_component(name)?;
+        let child_path = self.my_path().join(name);
+        {
+            let g = self.inner.lock().unwrap();
+            match g.types.get(&child_path) {
+                Some(FileType::Symlink) => {
+                    return Err(FsError::new(
+                        Code::SafetyRejected,
+                        std::io::Error::other(
+                            "refuses to follow a symlink or other name-surrogate",
+                        ),
+                    ));
+                }
+                Some(FileType::Other) => {
+                    return Err(FsError::new(
+                        Code::DestinationError,
+                        std::io::Error::other("not a regular file"),
+                    ));
+                }
+                _ => {}
+            }
+            if g.directories.contains(&child_path) {
+                return Err(FsError::new(
+                    Code::DestinationError,
+                    std::io::Error::new(
+                        std::io::ErrorKind::IsADirectory,
+                        "a directory is not a state file",
+                    ),
+                ));
+            }
+        }
+        self.fs().open_read(&child_path)
+    }
+
     fn remove_dir(&self, name: &OsStr) -> Result<()> {
         check_component(name)?;
         let child_path = self.my_path().join(name);
@@ -1999,6 +2170,90 @@ impl DirHandle for FakeDirHandle {
 mod tests {
     use super::*;
     use flux_fs::FileIdentity;
+
+    #[test]
+    fn a_duplicate_syncs_the_same_file_from_another_thread() {
+        let fs = FaultFs::new();
+        fs.set_identity("/p", FileIdentity::Strong(flux_fs::ObjectId { volume: 1, index: 7 }));
+        let mut w = fs.create_new(Path::new("/p")).unwrap();
+        w.write_all(b"hello").unwrap();
+        let d = w.duplicate().unwrap();
+        assert_eq!(d.identity().unwrap(), w.identity().unwrap());
+        assert_ne!(d.identity().unwrap(), FileIdentity::Unavailable);
+        std::thread::scope(|s| {
+            s.spawn(move || d.sync_all().unwrap());
+        });
+        assert!(fs.calls().contains(&"sync_all(/p)".to_string()));
+        w.write_all(b"!").unwrap();
+        assert_eq!(fs.read_file("/p").unwrap(), b"hello!");
+    }
+
+    #[test]
+    fn an_injected_sync_fault_reaches_the_duplicate() {
+        let fs = FaultFs::new();
+        fs.fail("sync_all", Code::DestinationError);
+        let w = fs.create_new(Path::new("/p")).unwrap();
+        let d = w.duplicate().unwrap();
+        let e = d.sync_all().unwrap_err();
+        assert_eq!(e.code, Code::DestinationError);
+        // One-shot and shared: the original now syncs cleanly.
+        w.sync_all().unwrap();
+    }
+
+    #[test]
+    fn truncate_to_the_current_length_succeeds_and_zero_restarts_the_file() {
+        let fs = FaultFs::new();
+        let mut w = fs.create_new(Path::new("/p")).unwrap();
+        w.write_all(b"hello").unwrap();
+        w.truncate_to(5).unwrap();
+        assert_eq!(fs.read_file("/p").unwrap(), b"hello");
+        w.truncate_to(0).unwrap();
+        w.write_all(b"x").unwrap();
+        assert_eq!(fs.read_file("/p").unwrap(), b"x");
+    }
+
+    #[test]
+    fn a_reader_cannot_be_duplicated_or_truncated() {
+        let fs = FaultFs::new();
+        fs.write_file("/r", b"r");
+        let mut r = fs.open_read(Path::new("/r")).unwrap();
+        assert_eq!(r.duplicate().err().unwrap().code, Code::DestinationError);
+        assert_eq!(r.truncate_to(0).unwrap_err().code, Code::DestinationError);
+        assert_eq!(fs.read_file("/r").unwrap(), b"r");
+    }
+
+    #[test]
+    fn truncate_to_cuts_the_tail_and_positions_the_next_write() {
+        let fs = FaultFs::new();
+        let mut w = fs.create_new(Path::new("/p")).unwrap();
+        w.write_all(b"hello world").unwrap();
+        w.truncate_to(5).unwrap();
+        w.write_all(b"!").unwrap();
+        assert_eq!(fs.read_file("/p").unwrap(), b"hello!");
+    }
+
+    #[test]
+    fn truncate_to_refuses_to_extend() {
+        let fs = FaultFs::new();
+        let mut w = fs.create_new(Path::new("/p")).unwrap();
+        w.write_all(b"hello").unwrap();
+        let e = w.truncate_to(100).unwrap_err();
+        assert_eq!(e.code, Code::DestinationError);
+        assert_eq!(e.source.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(fs.read_file("/p").unwrap(), b"hello");
+    }
+
+    #[test]
+    fn the_fake_records_duplicate_and_truncate_to() {
+        let fs = FaultFs::new();
+        let mut w = fs.create_new(Path::new("/p")).unwrap();
+        w.write_all(b"hello world").unwrap();
+        let _d = w.duplicate().unwrap();
+        w.truncate_to(5).unwrap();
+        let calls = fs.calls();
+        let at = |name: &str| calls.iter().position(|c| c == name).unwrap();
+        assert!(at("duplicate(/p)") < at("truncate_to(/p, 5)"));
+    }
 
     #[test]
     fn a_dropped_writer_is_recorded_and_a_dropped_reader_is_not() {
@@ -2721,6 +2976,183 @@ mod tests {
         fs.set_type("/p/l", FileType::Symlink);
         assert_eq!(d.read_file(OsStr::new("l"), 4).unwrap_err().code, Code::SafetyRejected);
         assert!(fs.called("read_file("), "{:?}", fs.calls());
+    }
+
+    #[test]
+    fn the_fake_dir_open_read_streams_and_refuses_a_directory() {
+        use std::io::Read;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/p")).unwrap();
+        let d = fs.destination_root(Path::new("/p")).unwrap();
+        fs.write_file("/p/s", b"0123456789");
+        let mut r = d.open_read(OsStr::new("s")).unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"0123456789");
+        drop(d.create_dir(OsStr::new("sub")).unwrap());
+        let Err(e) = d.open_read(OsStr::new("sub")) else { panic!("a directory is not readable") };
+        assert_eq!(
+            (e.code, e.source.kind()),
+            (Code::DestinationError, std::io::ErrorKind::IsADirectory)
+        );
+        fs.write_file("/p/l", b"");
+        fs.set_type("/p/l", FileType::Symlink);
+        let Err(e) = d.open_read(OsStr::new("l")) else { panic!("a link is not followed") };
+        assert_eq!(e.code, Code::SafetyRejected);
+        let Err(e) = d.open_read(OsStr::new("absent")) else { panic!("a missing name") };
+        assert_eq!((e.code, e.source.kind()), (Code::IoError, std::io::ErrorKind::NotFound));
+    }
+
+    #[test]
+    fn the_fake_dir_open_read_records_the_call() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/p")).unwrap();
+        let d = fs.destination_root(Path::new("/p")).unwrap();
+        fs.write_file("/p/s", b"x");
+        drop(d.open_read(OsStr::new("s")).unwrap());
+        assert!(
+            fs.calls().iter().any(|c| c.replace('\\', "/") == "open_read(/p/s)"),
+            "{:?}",
+            fs.calls()
+        );
+    }
+
+    #[test]
+    fn the_fake_dir_open_existing_appends_after_the_prefix_and_records_the_call() {
+        use flux_fs::FileHandle;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let mut w = d.create_new(OsStr::new("f")).unwrap();
+        w.write_all(b"abc").unwrap();
+        let id = w.identity().unwrap();
+        drop(w);
+        let mut w2 = d.open_existing(OsStr::new("f"), &id).unwrap();
+        assert_eq!(w2.identity().unwrap(), id);
+        w2.truncate_to(2).unwrap();
+        w2.write_all(b"Z").unwrap();
+        drop(w2);
+        assert_eq!(d.read_file(OsStr::new("f"), 100).unwrap(), b"abZ");
+        assert!(
+            fs.calls().iter().any(|c| c.replace('\\', "/") == "open_existing(/d/f)"),
+            "{:?}",
+            fs.calls()
+        );
+    }
+
+    /// `DirHandle::open_existing` is documented "positioned at 0" and the real handles are, so a resume that
+    /// skips `truncate_to` overwrites the head of the partial. The fake must do the same, not append.
+    #[test]
+    fn the_fake_open_existing_handle_is_unpositioned_like_the_real_one() {
+        use flux_fs::FileHandle;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let mut w = d.create_new(OsStr::new("f")).unwrap();
+        w.write_all(b"abcde").unwrap();
+        let id = w.identity().unwrap();
+        drop(w);
+        // No `truncate_to`: the write lands at offset 0.
+        let mut w2 = d.open_existing(OsStr::new("f"), &id).unwrap();
+        w2.write_all(b"ZZ").unwrap();
+        w2.write_all(b"Y").unwrap();
+        drop(w2);
+        assert_eq!(d.read_file(OsStr::new("f"), 100).unwrap(), b"ZZYde");
+        // With `truncate_to(2)` first, the next write lands at 2 and the rest is gone.
+        let mut w3 = d.open_existing(OsStr::new("f"), &id).unwrap();
+        w3.truncate_to(2).unwrap();
+        w3.write_all(b"Z").unwrap();
+        drop(w3);
+        assert_eq!(d.read_file(OsStr::new("f"), 100).unwrap(), b"ZZZ");
+        // A write that runs past the end extends the file.
+        let mut w4 = d.open_existing(OsStr::new("f"), &id).unwrap();
+        w4.write_all(b"123456").unwrap();
+        drop(w4);
+        assert_eq!(d.read_file(OsStr::new("f"), 100).unwrap(), b"123456");
+    }
+
+    #[test]
+    fn a_created_handle_and_its_duplicate_still_append() {
+        let fs = FaultFs::new();
+        let mut w = fs.create_new(Path::new("/p")).unwrap();
+        w.write_all(b"abc").unwrap();
+        let mut d = w.duplicate().unwrap();
+        d.write_all(b"def").unwrap();
+        w.write_all(b"g").unwrap();
+        assert_eq!(fs.read_file("/p").unwrap(), b"abcdefg");
+    }
+
+    #[test]
+    fn the_fake_dir_open_existing_refuses_a_link_and_creates_nothing() {
+        use flux_fs::FileHandle;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let id = d.create_new(OsStr::new("g")).unwrap().identity().unwrap();
+        fs.write_file("/d/l", b"");
+        fs.set_type("/d/l", FileType::Symlink);
+        let Err(e) = d.open_existing(OsStr::new("l"), &id) else {
+            panic!("a link is not followed")
+        };
+        assert_eq!(e.code, Code::SafetyRejected);
+        assert!(!fs.calls().iter().any(|c| c.starts_with("open_existing(")), "{:?}", fs.calls());
+    }
+
+    #[test]
+    fn the_fake_dir_open_existing_refuses_an_identity_mismatch() {
+        use flux_fs::FileHandle;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let id = d.create_new(OsStr::new("f")).unwrap().identity().unwrap();
+        d.remove_file(OsStr::new("f")).unwrap();
+        drop(d.create_new(OsStr::new("f")).unwrap());
+        let Err(e) = d.open_existing(OsStr::new("f"), &id) else { panic!("a different object") };
+        assert_eq!(
+            (e.code, e.source.kind()),
+            (Code::DestinationError, std::io::ErrorKind::InvalidData)
+        );
+    }
+
+    #[test]
+    fn the_fake_dir_open_existing_refuses_an_unavailable_expectation() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        drop(d.create_new(OsStr::new("f")).unwrap());
+        let Err(e) = d.open_existing(OsStr::new("f"), &FileIdentity::Unavailable) else {
+            panic!("an unavailable expectation proves nothing")
+        };
+        assert_eq!(
+            (e.code, e.source.kind()),
+            (Code::DestinationError, std::io::ErrorKind::InvalidData)
+        );
+    }
+
+    #[test]
+    fn the_fake_dir_open_existing_of_a_missing_name_is_not_found() {
+        use flux_fs::FileHandle;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let id = d.create_new(OsStr::new("g")).unwrap().identity().unwrap();
+        let Err(e) = d.open_existing(OsStr::new("nope"), &id) else { panic!("a missing name") };
+        assert_eq!((e.code, e.source.kind()), (Code::IoError, std::io::ErrorKind::NotFound));
+    }
+
+    #[test]
+    fn the_fake_dir_open_existing_refuses_a_directory() {
+        use flux_fs::FileHandle;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let id = d.create_new(OsStr::new("g")).unwrap().identity().unwrap();
+        drop(d.create_dir(OsStr::new("sub")).unwrap());
+        let Err(e) = d.open_existing(OsStr::new("sub"), &id) else { panic!("a directory") };
+        assert_eq!(
+            (e.code, e.source.kind()),
+            (Code::DestinationError, std::io::ErrorKind::IsADirectory)
+        );
     }
 
     #[test]
