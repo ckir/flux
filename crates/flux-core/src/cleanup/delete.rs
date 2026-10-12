@@ -869,6 +869,21 @@ mod tests {
         assert!(r.failed());
     }
 
+    #[test]
+    fn cleanup_removes_a_removing_workspace_that_holds_a_wal() {
+        let (fs, _d) = setup();
+        ops_dir(&fs);
+        let name = format!("{}.removing", id(3));
+        fs.create_dir(Path::new(&format!("{OPS}/{name}"))).unwrap();
+        fs.create_dir(Path::new(&format!("{OPS}/{name}/wal"))).unwrap();
+        fs.write_file(format!("{OPS}/{name}/manifest"), b"x");
+        fs.write_file(format!("{OPS}/{name}/wal/000001"), b"segment");
+        let r = run(&fs, &cfg());
+        assert_eq!(lines(&r), vec![format!("removed {OPS}/{name}")]);
+        assert!(!fs.exists(format!("{OPS}/{name}")));
+        assert!(!r.failed());
+    }
+
     // ---------- STALE and forced RESUMABLE ----------
 
     #[test]

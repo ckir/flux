@@ -930,6 +930,18 @@ pub fn finish_retire<D: DirHandle>(operations: &D, name: &OsStr) -> flux_fs::Res
         ] {
             remove_if_present(&dir, &known)?;
         }
+        // The one known subdirectory, the checkpoint log, after the flat names so a stranger inside it still leaves
+        // them gone; the stranger keeps `wal/` and so the workspace.
+        match dir.open_dir(OsStr::new(crate::wal::writer::DIR_NAME)) {
+            Ok(w) => {
+                remove_if_present(&w, OsStr::new(crate::wal::writer::SEGMENT_NAME))?;
+                // Closed before its directory is removed.
+                drop(w);
+                dir.remove_dir(OsStr::new(crate::wal::writer::DIR_NAME))?;
+            }
+            Err(e) if e.source.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
         // Closed before the directory is removed.
     }
     operations.remove_dir(name)
@@ -1380,6 +1392,57 @@ mod tests {
         ops.open_dir(&removing).unwrap().remove_file(OsStr::new("extra")).unwrap();
         finish_retire(&ops, &removing).unwrap();
         assert!(!fs.exists(&path));
+    }
+
+    #[test]
+    fn finish_retire_removes_the_wal_directory_and_its_segment() {
+        let (fs, d) = dest();
+        let ops = operations_dir(&d, Path::new("D")).unwrap();
+        let path = format!("/p/dest/.flux/operations/{}.removing", id(1));
+        fs.create_dir(Path::new(&path)).unwrap();
+        fs.create_dir(Path::new(&format!("{path}/wal"))).unwrap();
+        fs.write_file(format!("{path}/{MANIFEST}"), b"x");
+        fs.write_file(format!("{path}/wal/000001"), b"segment");
+        let removing = OsString::from(format!("{}.removing", id(1)));
+        finish_retire(&ops, &removing).unwrap();
+        assert!(!fs.exists(format!("{path}/wal/000001")));
+        assert!(!fs.exists(format!("{path}/wal")));
+        assert!(!fs.exists(&path));
+    }
+
+    #[test]
+    fn finish_retire_keeps_a_wal_directory_that_holds_a_stranger() {
+        let (fs, d) = dest();
+        let ops = operations_dir(&d, Path::new("D")).unwrap();
+        let path = format!("/p/dest/.flux/operations/{}.removing", id(1));
+        fs.create_dir(Path::new(&path)).unwrap();
+        fs.create_dir(Path::new(&format!("{path}/wal"))).unwrap();
+        for name in [MANIFEST, "manifest.tmp", STATE_DB, "wal/000001", "wal/extra"] {
+            fs.write_file(format!("{path}/{name}"), b"x");
+        }
+        let removing = OsString::from(format!("{}.removing", id(1)));
+        let e = finish_retire(&ops, &removing).unwrap_err();
+        assert_eq!(e.source.kind(), ErrorKind::DirectoryNotEmpty);
+        assert!(fs.exists(format!("{path}/wal/extra")), "a stranger stays");
+        for name in [MANIFEST, "manifest.tmp", STATE_DB] {
+            assert!(!fs.exists(format!("{path}/{name}")), "{name} is a known name");
+        }
+    }
+
+    #[test]
+    fn retire_workspace_removes_a_workspace_with_a_wal() {
+        let (fs, d) = dest();
+        let ops = operations_dir(&d, Path::new("D")).unwrap();
+        drop(create_workspace(&ops, &created()).unwrap());
+        let path = format!("/p/dest/.flux/operations/{}", id(1));
+        fs.create_dir(Path::new(&format!("{path}/wal"))).unwrap();
+        fs.write_file(format!("{path}/wal/000001"), b"segment");
+        retire_workspace(&ops, &id(1)).unwrap();
+        assert!(!fs.exists(&path) && !fs.exists(format!("{path}.removing")));
+        let calls: Vec<String> = fs.calls().iter().map(|c| c.replace('\\', "/")).collect();
+        let retire = position(&calls, &format!("rename_no_replace({path} -> {path}.removing)"));
+        let segment = position(&calls, &format!("remove_file({path}.removing/wal/000001)"));
+        assert!(retire < segment, "the id name goes first: {calls:?}");
     }
 
     #[test]
