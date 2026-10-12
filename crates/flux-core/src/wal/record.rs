@@ -490,4 +490,170 @@ mod tests {
         assert_eq!(bytes.len(), 30);
         assert!(matches!(decode_next(&bytes), Decoded::Corrupt(_)));
     }
+
+    /// The persisted layout, spelled out by hand: every byte of two small records, little-endian, so a
+    /// reordered field, a changed width or a changed constant cannot pass by round-tripping through itself.
+    #[test]
+    fn the_wire_layout_is_pinned() {
+        fn blake16(preceding: &[u8]) -> Vec<u8> {
+            blake3::hash(preceding).as_bytes()[..16].to_vec()
+        }
+        let file_begin = |mtime: Option<(i64, u32)>| {
+            Body::FileBegin(FileBegin {
+                file_id: b"f".to_vec(),
+                attempt_id: 1,
+                destination: b"d".to_vec(),
+                source_len: 5,
+                source_mtime: mtime,
+                source_identity: b"i".to_vec(),
+                chunk_size: CHUNK_SIZE,
+                valid_through: 0,
+            })
+        };
+        let head = |record_type: u8, sequence: u8, payload_len: u8| -> Vec<u8> {
+            [
+                &b"FWAL"[..],                     // MAGIC
+                &[1, 0],                          // FORMAT_VERSION = 1, u16
+                &[1],                             // CHECKSUM_VERSION = 1
+                &[record_type],                   // record_type
+                &[2, 0],                          // operation_id_len = 2, u16
+                b"op",                            // operation_id
+                &[1, 0, 0, 0, 0, 0, 0, 0],        // generation = 1, u64
+                &[sequence, 0, 0, 0, 0, 0, 0, 0], // sequence, u64
+                &[payload_len, 0, 0, 0],          // payload_len, u32
+            ]
+            .concat()
+        };
+        let seal = |preceding: Vec<u8>| -> Vec<u8> {
+            [preceding.clone(), blake16(&preceding), vec![0xC3]].concat()
+        };
+
+        // FileBegin with an mtime: a 60-byte payload.
+        let payload_with_mtime = [
+            &[1, 0, 0, 0][..],
+            b"f",                      // file_id: u32 length 1, bytes
+            &[1, 0, 0, 0, 0, 0, 0, 0], // attempt_id = 1, u64
+            &[1, 0, 0, 0],
+            b"d",                      // destination: u32 length 1, bytes
+            &[5, 0, 0, 0, 0, 0, 0, 0], // source_len = 5, u64
+            &[1],                      // mtime tag 1 = present
+            &[7, 0, 0, 0, 0, 0, 0, 0], // mtime seconds = 7, i64
+            &[9, 0, 0, 0],             // mtime nanos = 9, u32
+            &[1, 0, 0, 0],
+            b"i",                         // source_identity: u32 length 1, bytes
+            &[0, 0, 0x10, 0, 0, 0, 0, 0], // chunk_size = 1 MiB, u64
+            &[0, 0, 0, 0, 0, 0, 0, 0],    // valid_through = 0, u64
+        ]
+        .concat();
+        assert_eq!(payload_with_mtime.len(), 60);
+        let want = seal([head(1, 1, 60), payload_with_mtime].concat());
+        assert_eq!(encode(&header_pinned(1), &file_begin(Some((7, 9)))), want);
+
+        // The same record without an mtime: tag 0 and no seconds or nanos, 12 bytes shorter.
+        let payload_without_mtime = [
+            &[1, 0, 0, 0][..],
+            b"f",
+            &[1, 0, 0, 0, 0, 0, 0, 0],
+            &[1, 0, 0, 0],
+            b"d",
+            &[5, 0, 0, 0, 0, 0, 0, 0],
+            &[0], // mtime tag 0 = absent
+            &[1, 0, 0, 0],
+            b"i",
+            &[0, 0, 0x10, 0, 0, 0, 0, 0],
+            &[0, 0, 0, 0, 0, 0, 0, 0],
+        ]
+        .concat();
+        assert_eq!(payload_without_mtime.len(), 48);
+        let want = seal([head(1, 1, 48), payload_without_mtime].concat());
+        assert_eq!(encode(&header_pinned(1), &file_begin(None)), want);
+
+        // Range of one chunk with one digest of 0x11 bytes: a 65-byte payload.
+        let payload_range = [
+            &[1, 0, 0, 0][..],
+            b"f",                         // file_id: u32 length 1, bytes
+            &[1, 0, 0, 0, 0, 0, 0, 0],    // attempt_id = 1, u64
+            &[0, 0, 0, 0, 0, 0, 0, 0],    // range_start = 0, u64
+            &[0, 0, 0x10, 0, 0, 0, 0, 0], // range_end = 1 MiB, u64
+            &[1, 0, 0, 0],                // digest count = 1, u32
+            &[0x11; 32],                  // the digest
+        ]
+        .concat();
+        assert_eq!(payload_range.len(), 65);
+        let preceding = [head(2, 2, 65), payload_range].concat();
+        let want = seal(preceding.clone());
+        let got = encode(
+            &header_pinned(2),
+            &Body::Range(Range {
+                file_id: b"f".to_vec(),
+                attempt_id: 1,
+                range_start: 0,
+                range_end: CHUNK_SIZE,
+                digests: vec![[0x11; 32]],
+            }),
+        );
+        assert_eq!(got, want);
+        // The checksum is the first 16 BLAKE3 bytes of everything before it, and the last byte is COMMIT.
+        let at = got.len() - SUFFIX_LEN;
+        assert_eq!(got[at..at + 16], blake3::hash(&preceding).as_bytes()[..16]);
+        assert_eq!(got[got.len() - 1], 0xC3);
+    }
+
+    fn header_pinned(sequence: u64) -> Header {
+        Header { operation_id: b"op".to_vec(), generation: 1, sequence }
+    }
+
+    /// The record `rec` with its payload passed through `f`, the length field rewritten and a valid checksum.
+    fn resealed_payload(rec: &[u8], f: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+        let op_len = usize::from(u16::from_le_bytes([rec[8], rec[9]]));
+        let payload_at = PREFIX_LEN + op_len + FIXED_LEN;
+        let mut payload = rec[payload_at..rec.len() - SUFFIX_LEN].to_vec();
+        f(&mut payload);
+        let mut out = rec[..payload_at - 4].to_vec();
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&payload);
+        out.extend_from_slice(&[0u8; 16]);
+        out.push(COMMIT);
+        reseal(out)
+    }
+
+    #[test]
+    fn a_sealed_payload_with_a_bad_nested_length_is_corrupt() {
+        let begin = encode(&header(1), &file_begin());
+        let ranged = encode(&header(2), &range());
+        // The control: patching nothing still decodes, so each failure below is the patch's.
+        assert!(matches!(decode_next(&resealed_payload(&begin, |_| {})), Decoded::Record { .. }));
+        assert!(matches!(decode_next(&resealed_payload(&ranged, |_| {})), Decoded::Record { .. }));
+        // (i) A file_id length larger than the remaining payload.
+        let rec = resealed_payload(&begin, |p| {
+            let too_long = p.len() as u32 + 1;
+            p[0..4].copy_from_slice(&too_long.to_le_bytes());
+        });
+        assert_eq!(decode_next(&rec), Decoded::Corrupt("malformed payload".to_owned()));
+        // (ii) A digest count of 0xFFFF_FFFF: file_id (4 + 4) + attempt_id, range_start, range_end (24).
+        let rec =
+            resealed_payload(&ranged, |p| p[32..36].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()));
+        assert_eq!(decode_next(&rec), Decoded::Corrupt("malformed payload".to_owned()));
+        // (iii) An mtime tag of 2, on a record with no mtime bytes after the tag (so a lenient reader that
+        // treated an unknown tag as "absent" would decode it): file_id (8) + attempt_id (8) +
+        // destination (4 + 9) + source_len (8) put the tag at payload offset 37.
+        let Body::FileBegin(mut no_mtime) = file_begin() else { unreachable!() };
+        no_mtime.source_mtime = None;
+        let plain = encode(&header(1), &Body::FileBegin(no_mtime));
+        assert!(matches!(decode_next(&resealed_payload(&plain, |_| {})), Decoded::Record { .. }));
+        let rec = resealed_payload(&plain, |p| {
+            assert_eq!(p[37], 0);
+            p[37] = 2;
+        });
+        assert_eq!(decode_next(&rec), Decoded::Corrupt("malformed payload".to_owned()));
+        // (iv) Trailing payload bytes after a well-formed body.
+        for (rec, name) in [(&begin, "file_begin"), (&ranged, "range")] {
+            let rec = resealed_payload(rec, |p| p.push(0));
+            assert_eq!(
+                decode_next(&rec),
+                Decoded::Corrupt("malformed payload".to_owned()),
+                "{name}"
+            );
+        }
+    }
 }
