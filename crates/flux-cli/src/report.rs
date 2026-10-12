@@ -374,6 +374,9 @@ pub fn run_warning_line(w: &RunWarning) -> String {
         RunWarning::CheckpointsUnreadable { why } => {
             format!("checkpoints unreadable: {why}; every large file recopies")
         }
+        RunWarning::WalTailDiscarded { offset, len, reason } => format!(
+            "WAL tail cut: {len} bytes at offset {offset} ({reason}); the checkpoints before it are intact"
+        ),
     }
 }
 
@@ -1132,5 +1135,20 @@ mod tests {
         // An existing target changes nothing about a run that never reached its copy.
         let over = Report::file_run(&run(None, Some(refused())), true, 1);
         assert_eq!((over.errors, over.files_total, over.files_failed), (1, 0, 0), "over a target");
+    }
+
+    // Mutant: the arm's reason or numbers are swapped, or its sentence changed.
+    #[test]
+    fn the_wal_tail_warning_names_the_cut_and_why_for_each_reason() {
+        for reason in
+            ["zero-filled", "its declared span reaches the end of the log", "a record cut short"]
+        {
+            assert_eq!(
+                run_warning_line(&RunWarning::WalTailDiscarded { offset: 1014, len: 4096, reason }),
+                format!(
+                    "WAL tail cut: 4096 bytes at offset 1014 ({reason}); the checkpoints before it are intact"
+                )
+            );
+        }
     }
 }

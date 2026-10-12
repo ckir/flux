@@ -193,6 +193,9 @@ pub enum RunWarning {
     /// Cut 9f-1: the checkpoint log could not be read (corrupt, unsupported, or a failed open); the tree ran without
     /// checkpoints, so every large file recopied.
     CheckpointsUnreadable { why: String },
+    /// Cut 9f-1: the checkpoint log ended in `len` bytes at `offset` that the replay cut (spec decision 7.1);
+    /// the records before `offset` are intact and were used.
+    WalTailDiscarded { offset: u64, len: u64, reason: &'static str },
 }
 
 /// A directory copy under the destination's lock ("The run").
@@ -662,7 +665,22 @@ fn open_checkpoints<F: DestinationRoot>(
         }
     };
     match Checkpoints::open(workspace, read_dir, id, generation, policy) {
-        Ok(c) => Some(c),
+        Ok(c) => {
+            if let Some(t) = c.discarded_tail() {
+                use crate::wal::replay::TailReason;
+                let reason = match t.reason {
+                    TailReason::ZeroFilled => "zero-filled",
+                    TailReason::SpanReachesEnd => "its declared span reaches the end of the log",
+                    TailReason::TornRecord => "a record cut short",
+                };
+                warnings.push(RunWarning::WalTailDiscarded {
+                    offset: t.offset,
+                    len: t.len,
+                    reason,
+                });
+            }
+            Some(c)
+        }
         Err(CheckpointOpenError::Unavailable(why)) => {
             warnings.push(RunWarning::CheckpointsUnavailable { why });
             None

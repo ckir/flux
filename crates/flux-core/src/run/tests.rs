@@ -5576,11 +5576,15 @@ mod checkpointing {
     /// The highest byte a `Range` of the segment covers.
     fn covered(fs: &FaultFs) -> u64 {
         let Some(bytes) = fs.read_file(wal()) else { return 0 };
-        records(&bytes)
-            .iter()
-            .filter_map(|(_, b)| if let Body::Range(r) = b { Some(r.range_end) } else { None })
-            .max()
-            .unwrap_or(0)
+        // The WAL thread appends asynchronously: a read can end inside a record, which is simply not yet covered.
+        let (mut at, mut high) = (0, 0);
+        while let WalDecoded::Record { body, len, .. } = decode_next(&bytes[at..]) {
+            if let Body::Range(r) = body {
+                high = high.max(r.range_end);
+            }
+            at += len;
+        }
+        high
     }
 
     /// Wait (bounded) until the WAL thread has made `bytes` of the file durable in the segment.
@@ -6252,6 +6256,35 @@ mod checkpointing {
         (r, mark)
     }
 
+    /// The run warned that the replay cut `len` bytes at `offset`, for `reason`, and warned of nothing else about the log.
+    fn assert_tail_warning(r: &Resumed, offset: usize, len: usize, reason: &'static str) {
+        let cut: Vec<(u64, u64, &str)> = r
+            .warnings
+            .iter()
+            .filter_map(|w| match w {
+                RunWarning::WalTailDiscarded { offset, len, reason } => {
+                    Some((*offset, *len, *reason))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cut, vec![(offset as u64, len as u64, reason)], "{:?}", r.warnings);
+    }
+
+    // Mutant: `open_checkpoints` pushes the tail warning whatever the scan found.
+    #[test]
+    fn a_clean_wal_yields_no_tail_warning() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        let (r, mark) = resume_run(&fs, Durability::Normal);
+        assert_progress(&fs, &r, mark, 3 * MIB);
+        assert!(
+            !r.warnings.iter().any(|w| matches!(w, RunWarning::WalTailDiscarded { .. })),
+            "{:?}",
+            r.warnings
+        );
+    }
+
     /// The resume recopied the whole file: nothing reused, no partial resume reported, the temporary created anew.
     fn assert_safe_redo(fs: &FaultFs, r: &Run<Result<TreeOutcome, TreeAbort>>, mark: usize) {
         let out = ok(r);
@@ -6363,6 +6396,7 @@ mod checkpointing {
         let (r, mark, seen) = resume_spied(&fs, Durability::Normal);
         assert_progress(&fs, &r, mark, 2 * MIB);
         assert!(ok(&r).checkpoint_discards.is_empty(), "{:?}", ok(&r).checkpoint_discards);
+        assert_tail_warning(&r, whole, enc[3].len() / 2, "a record cut short");
         let c = calls(&fs);
         assert!(
             c[mark..].iter().any(|x| x == &format!("truncate_to({}, {whole})", wal())),
@@ -6406,6 +6440,7 @@ mod checkpointing {
         let (r, mark, seen) = resume_spied(&fs, Durability::Strict);
         assert_progress(&fs, &r, mark, 2 * MIB);
         assert!(ok(&r).checkpoint_discards.is_empty(), "{:?}", ok(&r).checkpoint_discards);
+        assert_tail_warning(&r, whole, enc[3].len() - 1, "a record cut short");
         let c = calls(&fs);
         assert!(
             c[mark..].iter().any(|x| x == &format!("truncate_to({}, {whole})", wal())),
@@ -6554,7 +6589,8 @@ mod checkpointing {
         fs.write_file(wal(), &bytes);
         let (r, mark, seen) = resume_spied(&fs, Durability::Normal);
         assert_progress(&fs, &r, mark, 2 * MIB);
-        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_tail_warning(&r, whole, 4096, "zero-filled");
+        assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
         let c = calls(&fs);
         assert!(
             c[mark..].iter().any(|x| x == &format!("truncate_to({}, {whole})", wal())),
@@ -6606,9 +6642,18 @@ mod checkpointing {
         // Generation 2: the file starts again from 0 and crashes once the segment holds its first range.
         fn stop(fs: &FaultFs, n: u32) {
             fs.on_nth("write_at_start", n, move |fs| {
-                let gen2 = fs
-                    .read_file(wal())
-                    .is_some_and(|b| records(&b).iter().any(|(h, _)| h.generation == 2));
+                // The WAL thread appends asynchronously: a read can end inside a record, so stop at the first
+                // record that does not decode instead of asserting on it.
+                let gen2 = fs.read_file(wal()).is_some_and(|b| {
+                    let mut at = 0;
+                    while let WalDecoded::Record { header, len, .. } = decode_next(&b[at..]) {
+                        if header.generation == 2 {
+                            return true;
+                        }
+                        at += len;
+                    }
+                    false
+                });
                 if fs.read_file(partial()).is_some_and(|b| b.len() >= MIB) && gen2 {
                     fs.fail("write_at_start", Code::IoError);
                     fs.on_nth("write_at_start", n + 1, |fs| {
@@ -6627,6 +6672,17 @@ mod checkpointing {
         let recs = segment_records(&fs);
         let gens: Vec<u64> = recs.iter().map(|(h, _)| h.generation).collect();
         assert!(gens.contains(&1) && gens.contains(&2), "{gens:?}");
+        // The WAL thread may have flushed more than the first chunk of generation 2 before the beat failed: keep
+        // exactly its FileBegin and its first range, so the case does not depend on that race.
+        let kept: Vec<u8> = recs
+            .iter()
+            .filter(|(h, b)| match b {
+                Body::Range(r) if h.generation == 2 => r.range_end <= MIB as u64,
+                _ => true,
+            })
+            .flat_map(|(h, b)| encode(h, b))
+            .collect();
+        fs.write_file(wal(), &kept);
         // The third run's partial holds 3 MiB of correct bytes, which generation 1's stale ranges would vouch for.
         fs.write_file(partial(), &pattern(5 * MIB)[..3 * MIB]);
         let (r, mark) = resume_run(&fs, Durability::Normal);

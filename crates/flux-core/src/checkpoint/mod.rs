@@ -79,6 +79,11 @@ impl<D: DirHandle + Send + 'static> Checkpoints<D> {
         }
     }
 
+    /// The tail the open-time replay cut from the segment, if any (spec decision 7.1: every cut is reported).
+    pub(crate) fn discarded_tail(&self) -> Option<crate::wal::replay::DiscardedTail> {
+        self.scan.as_ref().and_then(|s| s.discarded_tail.clone())
+    }
+
     pub(crate) fn min_len(&self) -> u64 {
         self.policy.min_len
     }
