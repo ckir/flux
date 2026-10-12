@@ -1,6 +1,6 @@
 # Cut 9f-1: batched chunk checkpoints and partial-file resume
 
-Status: DRAFT 2026-10-12, NOT approved. Written without a question round (the owner chose to skip questions). Every call below that the owner did not
+Status: DRAFT 2026-10-12; the owner ACCEPTED Rulings 1 and 2 as written on 2026-10-12; the rest is not yet approved. Written without a question round (the owner chose to skip questions). Every call below that the owner did not
 make is marked **[my call]**; the two that reinterpret the parent spec are collected under "Rulings needed". Adversarial panel: not yet run.
 Scope was set by an AGY-FIRST consult and a one-round AGY-NEGOTIATE (briefs `.clavity/seams/next-cut-fork.md`, `9f-split-negotiate-r1.md`,
 `9f1-design-fork.md`; replies under `.clavity/scratch/`). Parent spec: `FLUX_FULL_UPDATED_SPEC_V16.md` (sections 23, 35, 136-139, 148, 155-165, 171-175, 178, 185, 195).
@@ -121,7 +121,7 @@ must not follow a symlink or junction planted at the partial's name between the 
 as a safety rejection, and a test plants one; (2) `set_len`; (3) positioning at the resume offset; (4) an OS-level duplicate of a write handle usable for `sync_all` on another thread (decision 6);
 (5) a handle-relative read of the destination partial for chunk validation, if `DirHandle` has none (the plan checks; `FileSystem::open_read` is path-based, `fs.rs:127`). Each new method is covered by the conformance suite the existing methods use.
 
-## Rulings needed from the owner
+## Rulings (both ACCEPTED by the owner 2026-10-12, as written)
 
 - **Ruling 1, Normal durability (decision 6).** V16 s164 says a checkpoint must not become durable before its data crosses "the configured durability boundary". Under Normal that boundary is a plain write, so a Normal
   checkpoint can reach disk before its data does. My reading: Normal checkpoints are advisory and become trusted only through digest validation (s138 is satisfied because no record is used as a claim before it is validated).
