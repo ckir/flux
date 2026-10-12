@@ -576,13 +576,15 @@ the spec's numbers, 9-10 were learned during execution).
 - [x] The drain after a lost-lock or heartbeat-failure stop ran the data-sync barrier (and, after a heartbeat failure, published): fixed by owner ruling B2' (9e spec decision 10).
 - [ ] The acceptance measurement's figures (the longest barrier, the longest heartbeat gap, cap flushes; Strict small/flat ratios against the 9d head)
   are filled in by Task 7 of the 9e plan.
-- [ ] `FaultFs::on_nth` keeps one hook per call name (`hooks.insert` replaces, `crates/flux-core/src/fault_fs.rs`); a second `on_nth` on the same name
+- [x] (closed 2026-10-12: hooks are keyed by (name, nth), pinned by `two_hooks_on_one_name_at_different_counts_both_run`) `FaultFs::on_nth` keeps one hook per call name (`hooks.insert` replaces, `crates/flux-core/src/fault_fs.rs`); a second `on_nth` on the same name
   silently wins. Document or key by (name, nth).
 
 - [ ] A cross-platform real-filesystem Strict test copying a READ-ONLY source with an mtime check: the inline sync now runs after
   `set_permissions`/`set_times`, and no CI test exercises `FlushFileBuffers`/`F_FULLFSYNC` after a handle-level read-only attribute.
-- [ ] Error precedence in the non-batched Strict path: when both the `Preserve::Strict` metadata step and the sync fail, `MetadataApplyFailed`
-  is now reported instead of `StrictDurabilityUnavailable` (a consequence of the sync moving after the metadata step).
+- [x] Error precedence in the non-batched Strict path: when both the `Preserve::Strict` metadata step and the sync fail, `MetadataApplyFailed`
+  is reported instead of `StrictDurabilityUnavailable` (a consequence of the sync moving after the metadata step). Owner ruling 2026-10-12: kept; the
+  first failing step reports its own code, in step order, and the sync never runs after a Strict metadata failure. Pinned by
+  `a_strict_metadata_failure_is_reported_before_the_sync_runs`.
 - [ ] The end-to-end stall oracles pin `FLUX_TEST_BATCH_AGE_MS` and `FLUX_TEST_OPEN_WRITERS` so no age or cap flush moves a guard index; a clock injectable from the CLI (the tree already takes `BatchPolicy.now`) would let an end-to-end test exercise an age flush deterministically instead of blinding the oracles to it (capstone round 3 recommendation).
 - [ ] Test-audit debt (cut 9e, 2026-10-11): the suite pins the drain's stop classes with hand-built two- and three-frame fixtures; a property test over (frame depth x stop class x failure phase) asserting "no temporary neither removed nor reported", "no note for unsynced data" and "no barrier after a stop", and a real-filesystem crash-injection harness (the fake masks OS fsync semantics), would cover the state space the point tests cannot.
 

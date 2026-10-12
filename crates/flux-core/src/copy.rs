@@ -625,7 +625,9 @@ pub(crate) fn stage_file<F: DestinationRoot>(
     }
 
     // 6b. durability (cut 9e: after the metadata, so the one sync covers the times and permissions as well as the data;
-    //     at `SyncAt::Barrier` the caller syncs the returned writer, once per batch).
+    //     at `SyncAt::Barrier` the caller syncs the returned writer, once per batch). Error precedence (owner ruling,
+    //     2026-10-12): the first failing step reports its own code, in step order, so a Strict metadata failure
+    //     returns before this sync runs and `MetadataApplyFailed` wins over `StrictDurabilityUnavailable`.
     if sync == SyncAt::Staging
         && opts.durability == Durability::Strict
         && let Err(e) = writer.sync_all()
@@ -1633,6 +1635,28 @@ mod tests {
 
         assert_eq!(out.metadata_failures.len(), 2);
         assert!(fs.called("rename_replace"));
+    }
+
+    #[test]
+    fn a_strict_metadata_failure_is_reported_before_the_sync_runs() {
+        // Owner ruling 2026-10-12: the first failing step reports its own code, in step order. The sync follows the
+        // metadata (cut 9e), so with both failing the metadata code is reported and the sync is never attempted.
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        fs.fail("set_times", flux_fs::Code::PermissionDenied);
+        fs.fail("sync_all", flux_fs::Code::IoError);
+
+        let mut o = opts();
+        o.preserve_times = Preserve::Strict;
+        o.durability = Durability::Strict;
+        let err = copy_file(&fs, Path::new("/src"), Path::new("/dst"), &o).unwrap_err();
+
+        assert_eq!(err.code(), flux_fs::Code::MetadataApplyFailed);
+        assert!(
+            !fs.called("sync_all"),
+            "the sync must not run after a Strict metadata failure: {:?}",
+            fs.calls()
+        );
     }
 
     #[test]
