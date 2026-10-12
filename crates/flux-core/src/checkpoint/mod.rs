@@ -17,7 +17,7 @@ use std::io;
 
 pub use decide::Discard;
 pub(crate) use decide::{Gate, Start, Verdict, decide};
-pub(crate) use sink::{FileSink, SinkError};
+pub(crate) use sink::{FileSink, SinkError, mtime_pair};
 
 /// Files shorter than this are not checkpointed.
 pub(crate) const CHECKPOINT_MIN_LEN: u64 = 64 << 20;

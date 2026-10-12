@@ -1,6 +1,6 @@
 //! Single-file copy. The algorithm lives here once; platforms supply primitives.
 
-use crate::checkpoint::{Discard, FileCkpt, FileSink, Gate, Start, Verdict, decide};
+use crate::checkpoint::{Discard, FileCkpt, FileSink, Gate, Start, Verdict, decide, mtime_pair};
 use flux_fs::{
     Code, CopyOptions, DestinationRoot, DirHandle, Durability, FileHandle, FileIdentity, FileType,
     FsError, Metadata, MetadataFailure, MetadataItem, OperationId, Outcome, Preserve, Publish,
@@ -546,23 +546,6 @@ pub(crate) enum Stage<W> {
     Staged(Staged<W>),
 }
 
-/// `(seconds, nanoseconds)` since the Unix epoch as the WAL records a source's modified time (the same encoding
-/// `FileSink::begin` writes: a time before the epoch has negative, floored seconds).
-fn mtime_pair(t: std::time::SystemTime) -> (i64, u32) {
-    use std::time::UNIX_EPOCH;
-    match t.duration_since(UNIX_EPOCH) {
-        Ok(d) => (i64::try_from(d.as_secs()).unwrap_or(i64::MAX), d.subsec_nanos()),
-        Err(e) => {
-            let d = e.duration();
-            let secs = i64::try_from(d.as_secs()).unwrap_or(i64::MAX);
-            match d.subsec_nanos() {
-                0 => (-secs, 0),
-                n => (-secs - 1, 1_000_000_000 - n),
-            }
-        }
-    }
-}
-
 /// Decides what a checkpointed file does with a partial at `temp` (spec decision 7). Reads the log's state for the
 /// file, the partial's metadata and its bytes, and the source prefix; changes NOTHING on disk. Returns the verdict
 /// and, for a resume, the partial's identity, which the caller needs to reopen it for writing.
@@ -583,7 +566,7 @@ fn plan_resume<D: DirHandle + Send + 'static, R: std::io::Read>(
     let state = match fc.run.load(&fc.file_id) {
         Ok(Some(state)) => state,
         Ok(None) => return Ok((fresh(None), None)),
-        Err(e) => return unreadable(format!("{e:?}")),
+        Err(e) => return unreadable(format!("{e}")),
     };
     let partial_meta = match parent.metadata(temp) {
         // No identity means `open_existing` must refuse it by contract: recopy rather than wedge on every later run.

@@ -47,7 +47,7 @@ impl<D: DirHandle + Send + 'static> Drop for FileSink<'_, D> {
 
 /// `(seconds, nanoseconds)` since the Unix epoch, nanoseconds in `0..1_000_000_000`: a time before the epoch has
 /// negative seconds (floored), so the pair always denotes `secs + nanos / 1e9`.
-fn mtime_pair(t: std::time::SystemTime) -> (i64, u32) {
+pub(crate) fn mtime_pair(t: std::time::SystemTime) -> (i64, u32) {
     match t.duration_since(UNIX_EPOCH) {
         Ok(d) => (i64::try_from(d.as_secs()).unwrap_or(i64::MAX), d.subsec_nanos()),
         Err(e) => {
@@ -72,7 +72,10 @@ impl<'a, D: DirHandle + Send + 'static> FileSink<'a, D> {
         dup: Option<D::Writer>,
         beat: &Heartbeat<'_>,
     ) -> Result<Self, SinkError> {
-        debug_assert!(
+        // A hard assert: a misaligned value in a release build would write digests labelled with the wrong chunks. A
+        // panic in a library path is acceptable here because the value can only come from `decide`, which never
+        // produces one.
+        assert!(
             valid_through.is_multiple_of(CHUNK_SIZE) || valid_through == src.len,
             "valid_through must be a chunk boundary or the source length"
         );
@@ -391,6 +394,16 @@ mod tests {
         assert_eq!(b.valid_through, len);
         assert_eq!(b.source_len, len);
         assert!(ranges(&fs).is_empty(), "no Range: no bytes arrived");
+    }
+
+    #[test]
+    #[should_panic(expected = "valid_through must be a chunk boundary or the source length")]
+    fn begin_refuses_a_misaligned_valid_through_other_than_the_source_length() {
+        let (fs, _dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let run = open_run(&fs, policy(4, Durability::Normal));
+        // Neither a chunk boundary nor the source length (3 MiB).
+        let _ = FileSink::begin(&fc(&run), &meta(3 * MIB as u64), MIB as u64 + 1, None, beat);
     }
 
     #[test]
