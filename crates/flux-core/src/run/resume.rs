@@ -5,7 +5,7 @@ use super::{RunError, RunWarning};
 use crate::lock::{LockCode, LockError};
 use crate::prior::{PriorOp, corrupt};
 use crate::state::{
-    Config, FORMAT_VERSION, Options, Root, V1, V2, V3, from_native_hex, parse_identity,
+    Config, FORMAT_VERSION, Options, Root, V1, V2, from_native_hex, parse_identity,
 };
 use flux_fs::{CopyOptions, FileIdentity};
 
@@ -36,22 +36,23 @@ pub(crate) fn validate(
     warnings: &mut Vec<RunWarning>,
 ) -> Result<Config, RunError> {
     let state = &prior.state;
-    if state.format_version < FORMAT_VERSION {
-        return Err(incompatible(format!(
-            "operation {} was created by an older version (format {}) and has no WAL generation to continue; run again with --restart",
-            state.operation_id, state.format_version
-        )));
-    }
     let stored = match (&state.config, state.format_version) {
         (Some(config), _) => config,
         (None, version) => {
-            debug_assert!(version == V1 || version == V2 || version == V3);
+            debug_assert!(version == V1 || version == V2);
             return Err(incompatible(format!(
                 "operation {} was created by an older version (format {version}) and has no options to compare; run again with --restart",
                 state.operation_id
             )));
         }
     };
+    // A format-3 prior HAS a config, so the arm above did not catch it; it carries no WAL generation to continue.
+    if state.format_version < FORMAT_VERSION {
+        return Err(incompatible(format!(
+            "operation {} was created by an older version (format {}) and has no WAL generation to continue; run again with --restart",
+            state.operation_id, state.format_version
+        )));
+    }
     if stored.options.fingerprint() != stored.configuration_fingerprint {
         return Err(
             match corrupt(

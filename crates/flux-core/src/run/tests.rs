@@ -2851,6 +2851,11 @@ fn the_adopted_manifest_goes_transferring_before_the_copy() {
     let m = seen.lock().unwrap().clone().expect("read during the copy");
     assert_eq!((m.state, m.format_version), (OpState::Transferring, crate::state::FORMAT_VERSION));
     assert_eq!(m.config, before.config);
+    assert_eq!(
+        m.wal.expect("v4").wal_generation,
+        before.wal.expect("v4").wal_generation + 1,
+        "the bumped generation is already on disk in the TRANSFERRING write"
+    );
 }
 
 #[test]

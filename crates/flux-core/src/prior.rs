@@ -591,7 +591,7 @@ mod tests {
         for part in [id(1).as_str(), "FAILED", "--resume to continue it", "--restart", "manifest"] {
             assert!(r.detail.contains(part), "{part}: {}", r.detail);
         }
-        for v in [1, 2] {
+        for v in [1, 2, 3] {
             let d = detail(&[op(1, v, OpState::Created)]);
             for part in ["created by an older version", "--restart", "recorded progress"] {
                 assert!(d.contains(part), "{part}: {d}");
