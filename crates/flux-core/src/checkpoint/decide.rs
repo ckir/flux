@@ -27,7 +27,11 @@ pub(crate) enum Discard {
     SourceChanged(&'static str),
     PartialMissing,
     MismatchAt(u64),
-    PartialShorter { kept: u64 },
+    PartialShorter {
+        kept: u64,
+    },
+    /// The checkpoints (or the partial) could not be read: "checkpoints unreadable: {why}".
+    Unreadable(String),
 }
 
 /// `carry` is the source bytes `decide` consumed that the caller must write first. For both starts the source

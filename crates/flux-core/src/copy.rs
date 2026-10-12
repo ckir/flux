@@ -1,6 +1,6 @@
 //! Single-file copy. The algorithm lives here once; platforms supply primitives.
 
-use crate::checkpoint::{FileCkpt, FileSink};
+use crate::checkpoint::{Discard, FileCkpt, FileSink, Gate, Start, Verdict, decide};
 use flux_fs::{
     Code, CopyOptions, DestinationRoot, DirHandle, Durability, FileHandle, FileIdentity, FileType,
     FsError, Metadata, MetadataFailure, MetadataItem, OperationId, Outcome, Preserve, Publish,
@@ -478,11 +478,11 @@ pub(crate) struct Staged<W> {
     /// the writer and dropped it on return.
     pub writer: Option<W>,
     /// Cut 9f-1: bytes proven by a validated prefix and not re-copied (0 for a fresh copy).
-    #[allow(dead_code)] // read by the resume path (cut 9f-1 plan 2, a later task)
+    #[allow(dead_code)] // read by the checkpointed tree copy (cut 9f-1 plan 2, a later task)
     pub reused: u64,
-    /// Cut 9f-1: how a resumed partial's prefix was decided; `None` for a fresh copy.
-    #[allow(dead_code)] // read by the resume path (cut 9f-1 plan 2, a later task)
-    pub discard: Option<crate::checkpoint::Discard>,
+    /// Cut 9f-1: how a resumed partial's prefix was decided; `None` when nothing was discarded.
+    #[allow(dead_code)] // read by the checkpointed tree copy (cut 9f-1 plan 2, a later task)
+    pub discard: Option<Discard>,
 }
 
 /// What ends the streaming step early: remove the partial (`Discard`) or keep it (`Keep`, a WAL failure).
@@ -530,6 +530,77 @@ pub(crate) enum SyncAt {
 pub(crate) enum Stage<W> {
     Skipped(Outcome),
     Staged(Staged<W>),
+}
+
+/// `(seconds, nanoseconds)` since the Unix epoch as the WAL records a source's modified time (the same encoding
+/// `FileSink::begin` writes: a time before the epoch has negative, floored seconds).
+fn mtime_pair(t: std::time::SystemTime) -> (i64, u32) {
+    use std::time::UNIX_EPOCH;
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => (i64::try_from(d.as_secs()).unwrap_or(i64::MAX), d.subsec_nanos()),
+        Err(e) => {
+            let d = e.duration();
+            let secs = i64::try_from(d.as_secs()).unwrap_or(i64::MAX);
+            match d.subsec_nanos() {
+                0 => (-secs, 0),
+                n => (-secs - 1, 1_000_000_000 - n),
+            }
+        }
+    }
+}
+
+/// Decides what a checkpointed file does with a partial at `temp` (spec decision 7). Reads the log's state for the
+/// file, the partial's metadata and its bytes, and the source prefix; changes NOTHING on disk. Returns the verdict
+/// and, for a resume, the partial's identity, which the caller needs to reopen it for writing.
+///
+/// No checkpoints for the file is a plain fresh copy (`discard: None`) that touches nothing. A log that cannot be
+/// read, a partial that is not a regular file, or one that cannot be opened for reading is a fresh copy with
+/// `Discard::Unreadable`; a partial that is not there is `decide`'s `PartialMissing`.
+fn plan_resume<D: DirHandle + Send + 'static, R: std::io::Read>(
+    fc: &FileCkpt<'_, D>,
+    parent: &D,
+    temp: &OsStr,
+    src_meta: &Metadata,
+    reader: &mut R,
+    beat: &Heartbeat<'_>,
+) -> std::result::Result<(Verdict, Option<FileIdentity>), CopyError> {
+    let fresh = |discard| Verdict { start: Start::Fresh, carry: Vec::new(), discard };
+    let unreadable = |why: String| Ok((fresh(Some(Discard::Unreadable(why))), None));
+    let state = match fc.run.load(&fc.file_id) {
+        Ok(Some(state)) => state,
+        Ok(None) => return Ok((fresh(None), None)),
+        Err(e) => return unreadable(format!("{e:?}")),
+    };
+    let partial_meta = match parent.metadata(temp) {
+        Ok(m) if m.file_type == FileType::File => Some(m),
+        Ok(m) => {
+            return unreadable(format!("the partial is not a regular file ({:?})", m.file_type));
+        }
+        Err(e) if e.source.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return unreadable(format!("the partial's metadata: {}", e.source)),
+    };
+    let mut partial_reader = if partial_meta.is_some() {
+        match parent.open_read(temp) {
+            Ok(r) => Some(r),
+            Err(e) if e.source.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return unreadable(format!("the partial cannot be read: {}", e.source)),
+        }
+    } else {
+        None
+    };
+    // A heartbeat failure inside `decide` is the lost lock; any other failure is reading the source.
+    let beat_failed = std::cell::Cell::new(false);
+    let watched = || beat().inspect_err(|_| beat_failed.set(true));
+    let identity = crate::state::identity_text(src_meta.identity).into_bytes();
+    let gate =
+        Gate { len: src_meta.len, mtime: src_meta.modified.map(mtime_pair), identity: &identity };
+    let partial_len = partial_reader.as_ref().and(partial_meta.as_ref()).map(|m| m.len);
+    let verdict = decide(&state, &gate, partial_len, reader, partial_reader.as_mut(), &watched)
+        .map_err(|e| {
+            let step = if beat_failed.get() { CopyStep::Heartbeat } else { CopyStep::Source };
+            CopyError::at(step, e)
+        })?;
+    Ok((verdict, partial_meta.map(|m| m.identity)))
 }
 
 /// Steps 1-7 of the copy, up to and including the source recheck and the read of the temporary's identity: everything
@@ -611,13 +682,39 @@ pub(crate) fn stage_file<F: DestinationRoot>(
     guard().map_err(|e| CopyError::at(CopyStep::Create, e))?;
     // Cut 8b: the claim, after the gate and the section 99 check, before the temporary exists.
     before_create()?;
-    // Cut 9f-1: the sweep of a checkpointing run, after the claim; a removal is a destination mutation, so it has its
-    // own section 99 check.
-    if ckpt.is_some() {
-        guard().map_err(|e| CopyError::at(CopyStep::Create, e))?;
-        let _ = parent.remove_file(&temp);
-    }
-    let mut writer = parent.create_new(&temp).map_err(|e| CopyError::at(CopyStep::Create, e))?;
+    // Cut 9f-1: a checkpointing run decides what to do with an existing partial, after the claim (a refused claim
+    // reads nothing). Only a file large enough to be checkpointed can resume; every other verdict is a fresh copy.
+    let ckpt_file = ckpt.filter(|c| src_meta.len >= c.run.min_len());
+    let (verdict, partial_identity) = match ckpt_file {
+        Some(fc) => plan_resume(fc, parent, &temp, &src_meta, &mut reader, beat)?,
+        None => (Verdict { start: Start::Fresh, carry: Vec::new(), discard: None }, None),
+    };
+    let Verdict { start, carry, discard: why } = verdict;
+    let (mut writer, reused) = match (start, partial_identity) {
+        (Start::Resume { offset }, Some(identity)) => {
+            // A destination mutation, so its own section 99 check. The partial is reopened for writing by the identity
+            // `decide` validated, then cut: bytes past `offset` are never trusted.
+            guard().map_err(|e| CopyError::at(CopyStep::Create, e))?;
+            let mut w = parent
+                .open_existing(&temp, &identity)
+                .map_err(|e| CopyError::at(CopyStep::Create, e))?;
+            w.truncate_to(offset).map_err(|e| CopyError::at(CopyStep::Create, e))?;
+            (w, offset)
+        }
+        (Start::Resume { .. }, None) => {
+            unreachable!("a resume is decided only over an existing partial")
+        }
+        (Start::Fresh, _) => {
+            // The sweep of a checkpointing run: a removal is a destination mutation, so it has its own section 99
+            // check.
+            if ckpt.is_some() {
+                guard().map_err(|e| CopyError::at(CopyStep::Create, e))?;
+                let _ = parent.remove_file(&temp);
+            }
+            let w = parent.create_new(&temp).map_err(|e| CopyError::at(CopyStep::Create, e))?;
+            (w, 0)
+        }
+    };
 
     // 4. stream. The sink (checkpointed files only) is declared before the funnel so the one `abort` below covers
     //    every exit between its `begin` and the end of the loop.
@@ -640,9 +737,21 @@ pub(crate) fn stage_file<F: DestinationRoot>(
             } else {
                 None
             };
-            match FileSink::begin(fc, &src_meta, 0, dup, beat) {
+            match FileSink::begin(fc, &src_meta, reused, dup, beat) {
                 Ok(s) => sink = Some(s),
                 Err(e) => break 'stream Err(sink_fail(e, name)),
+            }
+        }
+        // The source bytes `decide` consumed are written first: `reader` already sits past them.
+        if !carry.is_empty() {
+            if let Err(e) = writer.write_all(&carry) {
+                break 'stream Err(StreamFail::Discard(CopyStep::Stream, copy_code(&e), e));
+            }
+            bytes_copied += carry.len() as u64;
+            if let Some(s) = sink.as_mut()
+                && let Err(e) = s.wrote(&carry, beat)
+            {
+                break 'stream Err(sink_fail(e, name));
             }
         }
         loop {
@@ -780,8 +889,8 @@ pub(crate) fn stage_file<F: DestinationRoot>(
         metadata_failures,
         identity_degraded,
         writer,
-        reused: 0,
-        discard: None,
+        reused,
+        discard: why,
     }))
 }
 
@@ -3161,6 +3270,539 @@ mod tests {
             let out = guarded_with(&fs, &o, &no_before_create).unwrap();
             assert!(!out.skipped, "case {i}");
             assert_eq!(fs.read_file("/dst").as_deref(), Some(&b"new!"[..]), "case {i}");
+        }
+    }
+
+    // ---- cut 9f-1 plan 2, task 7: `stage_file` resumes a partial from its proven prefix ----
+
+    use crate::checkpoint::Discard;
+    use std::time::SystemTime;
+
+    fn resume_policy(durability: Durability) -> CheckpointPolicy {
+        CheckpointPolicy { range_chunks: 1, ..ckpt_policy(durability, 64, 1 << 50) }
+    }
+
+    fn run_gen(
+        fs: &FaultFs,
+        generation: u64,
+        durability: Durability,
+    ) -> Checkpoints<FakeDirHandle> {
+        let a = fs.destination_root(Path::new("/ws")).unwrap();
+        let b = fs.destination_root(Path::new("/ws")).unwrap();
+        Checkpoints::open(a, b, "op", generation, resume_policy(durability))
+            .unwrap_or_else(|e| panic!("open: {e:?}"))
+    }
+
+    fn pattern(len: usize, mul: usize) -> Vec<u8> {
+        (0..len).map(|i| ((i * mul) % 251) as u8).collect()
+    }
+
+    fn chunk_digests(bytes: &[u8]) -> Vec<[u8; 32]> {
+        bytes.chunks(MIB).map(|c| *blake3::hash(c).as_bytes()).collect()
+    }
+
+    type Dir = <FaultFs as DestinationRoot>::Dir;
+    type StageResult = std::result::Result<Stage<<FaultFs as FileSystem>::Writer>, CopyError>;
+
+    fn stage_full(
+        fs: &FaultFs,
+        root: &Dir,
+        run: &Checkpoints<FakeDirHandle>,
+        durability: Durability,
+        beat: &Heartbeat<'_>,
+        before_create: &BeforeCreate<'_>,
+    ) -> StageResult {
+        let mut o = opts();
+        o.durability = durability;
+        let fc = FileCkpt { run, file_id: b"f".to_vec(), destination: b"dst".to_vec() };
+        stage_file(
+            fs,
+            Path::new("/src"),
+            root,
+            OsStr::new("dst"),
+            &o,
+            &unguarded,
+            beat,
+            before_create,
+            SyncAt::Staging,
+            Some(&fc),
+        )
+    }
+
+    fn staged_of(r: StageResult) -> Staged<<FaultFs as FileSystem>::Writer> {
+        match r {
+            Ok(Stage::Staged(s)) => s,
+            Ok(Stage::Skipped(_)) => panic!("unexpectedly skipped"),
+            Err(e) => panic!("stage_file failed: {e:?}"),
+        }
+    }
+
+    /// A crashed prior run (generation 1): the copy is stopped by a failing heartbeat once `chunks` MiB of the
+    /// partial are written, so the WAL holds the digests of exactly those chunks (one `Range` per chunk) and the
+    /// failed copy removes its partial. Tests then put whatever partial they want at the temporary's name.
+    fn crash_after(fs: &FaultFs, root: &Dir, chunks: usize) {
+        let run = run_gen(fs, 1, Durability::Normal);
+        let beat = || {
+            if fs.read_file(PARTIAL).is_some_and(|b| b.len() >= chunks * MIB) {
+                Err(FsError::new(Code::IoError, std::io::Error::other("the power went")))
+            } else {
+                Ok(())
+            }
+        };
+        let e = stage_full(fs, root, &run, Durability::Normal, &beat, &no_before_create)
+            .err()
+            .expect("the crash stops the copy");
+        assert_eq!(e.step, CopyStep::Heartbeat);
+        assert!(!fs.exists(PARTIAL));
+        assert!(run.finish(&no_heartbeat).is_clean());
+    }
+
+    /// The `FILE_BEGIN` valid_through values and the `Range`s the WAL holds, in order.
+    fn wal_begin_valid_through(fs: &FaultFs) -> Vec<u64> {
+        wal_bodies(fs)
+            .iter()
+            .filter_map(|b| if let Body::FileBegin(f) = b { Some(f.valid_through) } else { None })
+            .collect()
+    }
+
+    /// What a later run would replay for file `f`, read through a fresh `Checkpoints::open`.
+    fn replayed(fs: &FaultFs, generation: u64) -> crate::wal::replay::FileState {
+        let run = run_gen(fs, generation, Durability::Normal);
+        let state = run.load(b"f").expect("loads").expect("the file is indexed");
+        run.abandon();
+        state
+    }
+
+    fn resume_fixture(len: usize, crash_chunks: usize) -> (FaultFs, Dir, Vec<u8>) {
+        let (fs, root) = ckpt_fs(len);
+        let src = fs.read_file("/src").unwrap();
+        crash_after(&fs, &root, crash_chunks);
+        (fs, root, src)
+    }
+
+    #[test]
+    fn resume_continues_from_the_last_whole_chunk_and_the_output_equals_the_source() {
+        let (fs, root) = ckpt_fs(5 * MIB);
+        fs.set_modified("/src", SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 7));
+        let src = fs.read_file("/src").unwrap();
+        crash_after(&fs, &root, 3);
+        fs.write_file(PARTIAL, &src[..3 * MIB]);
+        let (s0, p0) = (fs.bytes_read("/src"), fs.bytes_read(PARTIAL));
+        let mark = fs.calls().len();
+        let claims = AtomicUsize::new(0);
+        let claim = || {
+            claims.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+        let run = run_gen(&fs, 2, Durability::Normal);
+        let staged =
+            staged_of(stage_full(&fs, &root, &run, Durability::Normal, &no_heartbeat, &claim));
+        assert_eq!(staged.reused, 3 * MIB as u64);
+        assert_eq!(staged.bytes_copied, 2 * MIB as u64);
+        assert_eq!(staged.discard, None);
+        assert_eq!(claims.load(Ordering::SeqCst), 1, "the claim is made exactly once");
+        // The validated prefix is read once by `decide`, the rest once by the loop: nothing twice, nothing skipped.
+        assert_eq!(fs.bytes_read("/src") - s0, 5 * MIB as u64);
+        assert_eq!(fs.bytes_read(PARTIAL) - p0, 3 * MIB as u64);
+        assert_eq!(fs.read_file(PARTIAL).unwrap(), src);
+        assert!(fs.called(&format!("truncate_to({PARTIAL}, {})", 3 * MIB)), "{:?}", fs.calls());
+        let calls = fs.calls();
+        assert!(
+            calls[mark..].iter().all(|c| c != &format!("remove_file({PARTIAL})")
+                && c != &format!("create_new({PARTIAL})")),
+            "a resume neither sweeps nor creates: {:?}",
+            &calls[mark..]
+        );
+        assert!(run.finish(&no_heartbeat).is_clean());
+        assert_eq!(wal_begin_valid_through(&fs), vec![0, 3 * MIB as u64]);
+        let state = replayed(&fs, 3);
+        assert_eq!(state.digests.values().copied().collect::<Vec<_>>(), chunk_digests(&src));
+    }
+
+    #[test]
+    fn resume_truncates_garbage_past_the_last_checkpoint() {
+        let (fs, root, src) = resume_fixture(5 * MIB, 3);
+        let mut partial = src[..3 * MIB].to_vec();
+        partial.extend(vec![0xEE; MIB + MIB / 2]);
+        fs.write_file(PARTIAL, &partial);
+        let run = run_gen(&fs, 2, Durability::Normal);
+        let staged = staged_of(stage_full(
+            &fs,
+            &root,
+            &run,
+            Durability::Normal,
+            &no_heartbeat,
+            &no_before_create,
+        ));
+        assert_eq!((staged.reused, staged.bytes_copied), (3 * MIB as u64, 2 * MIB as u64));
+        assert_eq!(staged.discard, None);
+        assert_eq!(fs.read_file(PARTIAL).unwrap(), src, "the garbage is cut, never trusted");
+        assert!(fs.called(&format!("truncate_to({PARTIAL}, {})", 3 * MIB)), "{:?}", fs.calls());
+        assert!(run.finish(&no_heartbeat).is_clean());
+    }
+
+    #[test]
+    fn resume_recopies_from_the_first_bad_chunk() {
+        let (fs, root, src) = resume_fixture(5 * MIB, 3);
+        let mut partial = src[..3 * MIB].to_vec();
+        partial[MIB + 10] ^= 0xFF;
+        fs.write_file(PARTIAL, &partial);
+        let (s0, p0) = (fs.bytes_read("/src"), fs.bytes_read(PARTIAL));
+        let run = run_gen(&fs, 2, Durability::Normal);
+        let staged = staged_of(stage_full(
+            &fs,
+            &root,
+            &run,
+            Durability::Normal,
+            &no_heartbeat,
+            &no_before_create,
+        ));
+        assert_eq!(staged.discard, Some(Discard::MismatchAt(MIB as u64)));
+        assert_eq!(staged.reused, MIB as u64);
+        // The carry (source chunk 1) is written by this run, so it counts.
+        assert_eq!(staged.bytes_copied, 4 * MIB as u64);
+        assert_eq!(fs.read_file(PARTIAL).unwrap(), src);
+        assert_eq!(fs.bytes_read("/src") - s0, 5 * MIB as u64, "no source byte twice");
+        assert_eq!(fs.bytes_read(PARTIAL) - p0, 2 * MIB as u64);
+        assert!(run.finish(&no_heartbeat).is_clean());
+        let state = replayed(&fs, 3);
+        assert_eq!(state.digests.values().copied().collect::<Vec<_>>(), chunk_digests(&src));
+    }
+
+    #[test]
+    fn a_changed_source_discards_the_checkpoints_and_recopies() {
+        let (fs, root, src) = resume_fixture(5 * MIB, 3);
+        fs.write_file(PARTIAL, &src[..3 * MIB]);
+        let new_src = pattern(5 * MIB + 17, 3);
+        fs.write_file("/src", &new_src);
+        let mark = fs.calls().len();
+        let run = run_gen(&fs, 2, Durability::Normal);
+        let staged = staged_of(stage_full(
+            &fs,
+            &root,
+            &run,
+            Durability::Normal,
+            &no_heartbeat,
+            &no_before_create,
+        ));
+        assert!(matches!(staged.discard, Some(Discard::SourceChanged(_))), "{:?}", staged.discard);
+        assert_eq!((staged.reused, staged.bytes_copied), (0, new_src.len() as u64));
+        let calls = fs.calls();
+        let after = &calls[mark..];
+        let at =
+            |c: &str| after.iter().position(|x| x == c).unwrap_or_else(|| panic!("{c}: {after:?}"));
+        assert!(
+            at(&format!("remove_file({PARTIAL})")) < at(&format!("create_new({PARTIAL})")),
+            "the sweep ran: {after:?}"
+        );
+        assert!(!fs.called(&format!("open_existing({PARTIAL})")));
+        assert_eq!(fs.read_file(PARTIAL).unwrap(), new_src);
+        assert!(run.finish(&no_heartbeat).is_clean());
+    }
+
+    #[test]
+    fn a_missing_partial_recopies() {
+        let (fs, root, src) = resume_fixture(5 * MIB, 3);
+        assert!(!fs.exists(PARTIAL));
+        let run = run_gen(&fs, 2, Durability::Normal);
+        let staged = staged_of(stage_full(
+            &fs,
+            &root,
+            &run,
+            Durability::Normal,
+            &no_heartbeat,
+            &no_before_create,
+        ));
+        assert_eq!(staged.discard, Some(Discard::PartialMissing));
+        assert_eq!((staged.reused, staged.bytes_copied), (0, 5 * MIB as u64));
+        assert_eq!(fs.read_file(PARTIAL).unwrap(), src);
+        assert!(run.finish(&no_heartbeat).is_clean());
+    }
+
+    #[test]
+    fn a_fully_validated_partial_copies_nothing_and_still_publishes() {
+        // A short last chunk: the resume offset is the source length, which is not a multiple of the chunk size.
+        let len = 3 * MIB + 12345;
+        let (fs, root) = ckpt_fs(len);
+        let src = fs.read_file("/src").unwrap();
+        let run = run_gen(&fs, 1, Durability::Strict);
+        staged_of(stage_full(
+            &fs,
+            &root,
+            &run,
+            Durability::Strict,
+            &no_heartbeat,
+            &no_before_create,
+        ));
+        assert!(run.finish(&no_heartbeat).is_clean());
+        assert_eq!(fs.read_file(PARTIAL).unwrap(), src);
+        let (s0, p0) = (fs.bytes_read("/src"), fs.bytes_read(PARTIAL));
+        let mark = fs.calls().len();
+
+        let run = run_gen(&fs, 2, Durability::Strict);
+        let fc = FileCkpt { run: &run, file_id: b"f".to_vec(), destination: b"dst".to_vec() };
+        let mut o = opts();
+        o.durability = Durability::Strict;
+        let out = copy_file_checkpointed(
+            &fs,
+            Path::new("/src"),
+            &root,
+            OsStr::new("dst"),
+            &o,
+            &unguarded,
+            &no_heartbeat,
+            &no_before_create,
+            &no_before_publish,
+            Some(&fc),
+        )
+        .unwrap_or_else(|e| panic!("copy failed: {e:?}"));
+        assert_eq!(out.bytes_copied, 0);
+        assert_eq!(fs.read_file("/dst").unwrap(), src, "published");
+        assert_eq!(fs.bytes_read("/src") - s0, len as u64, "only `decide` reads the source");
+        assert_eq!(fs.bytes_read(PARTIAL) - p0, len as u64);
+        let calls = fs.calls();
+        let after = &calls[mark..];
+        assert!(after.contains(&format!("truncate_to({PARTIAL}, {len})")), "{after:?}");
+        assert!(
+            after.iter().any(|c| c.starts_with("set_times(")),
+            "metadata still runs: {after:?}"
+        );
+        assert!(
+            after.contains(&format!("sync_all({PARTIAL})")),
+            "the Strict sync still runs: {after:?}"
+        );
+        assert!(run.finish(&no_heartbeat).is_clean());
+        assert_eq!(wal_begin_valid_through(&fs), vec![0, len as u64]);
+        let bodies = wal_bodies(&fs);
+        assert!(
+            matches!(bodies.last(), Some(Body::FileBegin(_))),
+            "no Range follows the resumed FILE_BEGIN: no byte arrived"
+        );
+    }
+
+    #[test]
+    fn a_source_that_changes_during_a_resumed_copy_is_discarded() {
+        let (fs, root, src) = resume_fixture(5 * MIB, 3);
+        fs.write_file(PARTIAL, &src[..3 * MIB]);
+        let new_src = pattern(2 * MIB + MIB / 2, 5);
+        let swap = || {
+            fs.write_file("/src", &new_src);
+            Ok(())
+        };
+        let run = run_gen(&fs, 2, Durability::Normal);
+        let e = stage_full(&fs, &root, &run, Durability::Normal, &no_heartbeat, &swap)
+            .err()
+            .expect("the recheck fails");
+        assert_eq!((e.step, e.cause.code), (CopyStep::Recheck, Code::SourceChanged));
+        assert!(!fs.exists(PARTIAL), "the temporary is removed");
+        assert!(run.finish(&no_heartbeat).is_clean());
+        // The log now holds the resumed run's digests of the OLD source (chunks 0..4).
+        assert_eq!(replayed(&fs, 3).digests.len(), 5);
+
+        let run = run_gen(&fs, 4, Durability::Normal);
+        let staged = staged_of(stage_full(
+            &fs,
+            &root,
+            &run,
+            Durability::Normal,
+            &no_heartbeat,
+            &no_before_create,
+        ));
+        assert!(matches!(staged.discard, Some(Discard::SourceChanged(_))), "{:?}", staged.discard);
+        assert!(run.finish(&no_heartbeat).is_clean());
+        let state = replayed(&fs, 5);
+        assert_eq!(state.begin.source_len, new_src.len() as u64);
+        assert_eq!(
+            state.digests.values().copied().collect::<Vec<_>>(),
+            chunk_digests(&new_src),
+            "the new FILE_BEGIN reset the set: no stale digest of chunks 3 and 4 survives"
+        );
+    }
+
+    #[test]
+    fn a_source_that_shrinks_before_it_is_read_fails_the_recheck_and_discards() {
+        let (fs, root, src) = resume_fixture(5 * MIB, 3);
+        fs.write_file(PARTIAL, &src[..3 * MIB]);
+        // After the metadata that fixed the length and before the reader is opened: the shrunk file is what is read.
+        let shrunk = src[..MIB + MIB / 2].to_vec();
+        let run = run_gen(&fs, 2, Durability::Normal);
+        // Opening the run scanned the log through `open_read` too, so count from here: the next one is the source's.
+        let next = count(&fs, "open_read(") as u32 + 1;
+        fs.on_nth("open_read", next, move |fs| fs.write_file("/src", &shrunk));
+        let e = stage_full(&fs, &root, &run, Durability::Normal, &no_heartbeat, &no_before_create)
+            .err()
+            .expect("a shrunk source cannot publish");
+        assert_eq!((e.step, e.cause.code), (CopyStep::Recheck, Code::SourceChanged));
+        assert!(
+            fs.called(&format!("truncate_to({PARTIAL}, {MIB})")),
+            "resumed at the last good chunk, no special case: {:?}",
+            fs.calls()
+        );
+        assert!(!fs.exists(PARTIAL));
+        run.abandon();
+    }
+
+    #[test]
+    fn a_planted_symlink_at_the_partial_name_is_refused() {
+        let (fs, root, src) = resume_fixture(5 * MIB, 3);
+        fs.write_file("/target", b"orig");
+        fs.add_symlink(PARTIAL);
+        let (s0, p0) = (fs.bytes_read("/src"), fs.bytes_read(PARTIAL));
+        let run = run_gen(&fs, 2, Durability::Normal);
+        let staged = staged_of(stage_full(
+            &fs,
+            &root,
+            &run,
+            Durability::Normal,
+            &no_heartbeat,
+            &no_before_create,
+        ));
+        // The reason names the type check, not the fake's refusal to open a link: the partial is never opened.
+        let Some(Discard::Unreadable(why)) = &staged.discard else {
+            panic!("{:?}", staged.discard)
+        };
+        assert!(why.contains("not a regular file"), "{why}");
+        assert_eq!((staged.reused, staged.bytes_copied), (0, 5 * MIB as u64));
+        assert!(!fs.called(&format!("open_existing({PARTIAL})")), "{:?}", fs.calls());
+        assert!(fs.called(&format!("remove_file({PARTIAL})")), "the sweep removes the link");
+        assert_eq!(fs.read_file("/target").as_deref(), Some(&b"orig"[..]));
+        assert_eq!(fs.read_file(PARTIAL).unwrap(), src);
+        assert_eq!(fs.bytes_read(PARTIAL) - p0, 0, "a link is never read");
+        assert_eq!(fs.bytes_read("/src") - s0, 5 * MIB as u64);
+        assert!(run.finish(&no_heartbeat).is_clean());
+    }
+
+    #[test]
+    fn a_chunk_zero_mismatch_still_publishes_every_byte() {
+        let (fs, root, src) = resume_fixture(5 * MIB, 3);
+        let mut partial = src[..3 * MIB].to_vec();
+        partial[7] ^= 0xFF;
+        fs.write_file(PARTIAL, &partial);
+        let s0 = fs.bytes_read("/src");
+        let run = run_gen(&fs, 2, Durability::Normal);
+        let staged = staged_of(stage_full(
+            &fs,
+            &root,
+            &run,
+            Durability::Normal,
+            &no_heartbeat,
+            &no_before_create,
+        ));
+        assert_eq!(staged.discard, Some(Discard::MismatchAt(0)));
+        assert_eq!((staged.reused, staged.bytes_copied), (0, 5 * MIB as u64));
+        assert_eq!(fs.read_file(PARTIAL).unwrap(), src);
+        assert_eq!(fs.bytes_read("/src") - s0, 5 * MIB as u64, "no byte read twice or skipped");
+        assert!(run.finish(&no_heartbeat).is_clean());
+        let state = replayed(&fs, 3);
+        assert_eq!(
+            state.digests[&0],
+            *blake3::hash(&src[..MIB]).as_bytes(),
+            "the carry was fed to the sink"
+        );
+        assert_eq!(state.digests.values().copied().collect::<Vec<_>>(), chunk_digests(&src));
+    }
+
+    #[test]
+    fn deliberately_wrong_digests_recopy() {
+        let (fs, root) = ckpt_fs(5 * MIB);
+        let other = pattern(5 * MIB, 7);
+        fs.write_file("/src", &other);
+        crash_after(&fs, &root, 3);
+        let src = pattern(5 * MIB, 1);
+        fs.write_file("/src", &src);
+        fs.write_file(PARTIAL, &src[..3 * MIB]);
+        let run = run_gen(&fs, 2, Durability::Normal);
+        let staged = staged_of(stage_full(
+            &fs,
+            &root,
+            &run,
+            Durability::Normal,
+            &no_heartbeat,
+            &no_before_create,
+        ));
+        assert_eq!(staged.discard, Some(Discard::MismatchAt(0)));
+        assert_eq!((staged.reused, staged.bytes_copied), (0, 5 * MIB as u64));
+        assert_eq!(fs.read_file(PARTIAL).unwrap(), src);
+        assert!(run.finish(&no_heartbeat).is_clean());
+    }
+
+    #[test]
+    fn an_unreadable_wal_is_a_fresh_copy_with_the_reason() {
+        let (fs, root, src) = resume_fixture(5 * MIB, 3);
+        fs.write_file(PARTIAL, &src[..3 * MIB]);
+        let run = run_gen(&fs, 2, Durability::Normal);
+        // The segment is cut after the run scanned it: pass two cannot read the indexed records.
+        let wal = fs.read_file(WAL_PATH).unwrap();
+        fs.write_file(WAL_PATH, &wal[..wal.len() / 2]);
+        let staged = staged_of(stage_full(
+            &fs,
+            &root,
+            &run,
+            Durability::Normal,
+            &no_heartbeat,
+            &no_before_create,
+        ));
+        assert!(matches!(staged.discard, Some(Discard::Unreadable(_))), "{:?}", staged.discard);
+        assert_eq!((staged.reused, staged.bytes_copied), (0, 5 * MIB as u64));
+        assert_eq!(fs.read_file(PARTIAL).unwrap(), src);
+        run.abandon();
+    }
+
+    #[test]
+    fn a_refused_claim_reads_nothing_and_leaves_the_partial_alone() {
+        let (fs, root, src) = resume_fixture(5 * MIB, 3);
+        fs.write_file(PARTIAL, &src[..3 * MIB]);
+        let (s0, p0) = (fs.bytes_read("/src"), fs.bytes_read(PARTIAL));
+        let mark = fs.calls().len();
+        let claims = AtomicUsize::new(0);
+        let refuse = || {
+            claims.fetch_add(1, Ordering::SeqCst);
+            Err(CopyError::at(
+                CopyStep::Claim,
+                FsError::new(Code::IoError, std::io::Error::other("claimed elsewhere")),
+            ))
+        };
+        let run = run_gen(&fs, 2, Durability::Normal);
+        let e = stage_full(&fs, &root, &run, Durability::Normal, &no_heartbeat, &refuse)
+            .err()
+            .expect("the claim is refused");
+        assert_eq!(e.step, CopyStep::Claim);
+        assert_eq!(claims.load(Ordering::SeqCst), 1);
+        assert_eq!(fs.bytes_read("/src") - s0, 0);
+        assert_eq!(fs.bytes_read(PARTIAL) - p0, 0);
+        assert_eq!(fs.read_file(PARTIAL).unwrap(), src[..3 * MIB]);
+        let calls = fs.calls();
+        assert!(
+            calls[mark..].iter().all(|c| !c.contains(PARTIAL)),
+            "nothing touched the partial: {:?}",
+            &calls[mark..]
+        );
+        run.abandon();
+    }
+
+    #[test]
+    fn the_resume_gate_encodes_the_source_time_as_the_sink_recorded_it() {
+        // After the epoch with nanoseconds, and before it (floored seconds): both must round-trip through the WAL.
+        for t in [
+            SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 7),
+            SystemTime::UNIX_EPOCH - Duration::new(5, 250_000_000),
+        ] {
+            let (fs, root) = ckpt_fs(5 * MIB);
+            fs.set_modified("/src", t);
+            let src = fs.read_file("/src").unwrap();
+            crash_after(&fs, &root, 3);
+            fs.write_file(PARTIAL, &src[..3 * MIB]);
+            let run = run_gen(&fs, 2, Durability::Normal);
+            let staged = staged_of(stage_full(
+                &fs,
+                &root,
+                &run,
+                Durability::Normal,
+                &no_heartbeat,
+                &no_before_create,
+            ));
+            assert_eq!((staged.reused, staged.discard), (3 * MIB as u64, None), "{t:?}");
+            run.abandon();
         }
     }
 }
