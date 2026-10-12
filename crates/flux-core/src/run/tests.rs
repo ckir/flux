@@ -2710,6 +2710,30 @@ fn prior3_with(fs: &FaultFs, n: u8, s: OpState, o: &CopyOptions) -> OperationSta
     state
 }
 
+/// A FORMAT-3 prior tree operation `n` in state `s` (the format before the WAL generation), written under `/p/dest`.
+fn prior3_older(fs: &FaultFs, n: u8, s: OpState) -> OperationState {
+    let o = opts();
+    for d in ["/p/dest", "/p/dest/.flux", "/p/dest/.flux/operations"] {
+        if !fs.exists(d) {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+    }
+    fs.create_dir(Path::new(&format!("/p/dest/.flux/operations/{}", id(n)))).unwrap();
+    let state = OperationState {
+        state: s,
+        ..OperationState::created_v3(
+            &id(n),
+            Kind::Tree,
+            Path::new("/p/dest"),
+            1,
+            None,
+            tree_config(fs, &o),
+        )
+    };
+    write_manifest(fs, &state);
+    state
+}
+
 fn prior3(fs: &FaultFs, n: u8, s: OpState) -> OperationState {
     prior3_with(fs, n, s, &opts())
 }
@@ -2764,8 +2788,8 @@ fn resume_with_no_prior_starts_a_new_operation_and_says_so() {
 fn a_new_tree_manifest_is_version_3_with_roots_options_and_fingerprint() {
     let fs = fake();
     let s = kept_tree_manifest(&fs);
-    assert_eq!(s.format_version, 3);
-    let c = s.config.expect("version 3 carries its configuration");
+    assert_eq!(s.format_version, crate::state::FORMAT_VERSION);
+    let c = s.config.expect("version 3 and later carry their configuration");
     assert_eq!(c.roots.len(), 1);
     assert_eq!(c.roots[0].destination_prefix, "");
     assert_eq!(c.roots[0].source_root, native_hex(&absolute_lexical(Path::new("/src"))));
@@ -2825,7 +2849,7 @@ fn the_adopted_manifest_goes_transferring_before_the_copy() {
     let (r, _) = run_tree(&fs, &resume());
     ok(&r);
     let m = seen.lock().unwrap().clone().expect("read during the copy");
-    assert_eq!((m.state, m.format_version), (OpState::Transferring, 3));
+    assert_eq!((m.state, m.format_version), (OpState::Transferring, crate::state::FORMAT_VERSION));
     assert_eq!(m.config, before.config);
 }
 
@@ -2844,6 +2868,49 @@ fn two_resumable_priors_are_refused_naming_both_with_and_without_resume() {
         assert!(!fs.exists(LOCK));
         assert_eq!(manifest(&fs, &id(5)).state, OpState::Failed);
         assert_eq!(manifest(&fs, &id(6)).state, OpState::Created);
+    }
+}
+
+#[test]
+fn resume_refuses_a_format_3_prior_as_older_and_names_restart() {
+    let fs = fake();
+    let prior = prior3_older(&fs, 5, OpState::Failed);
+    assert_eq!(prior.format_version, 3);
+    let (r, _) = run_tree(&fs, &resume());
+    assert_eq!(refused(&r.stop), (LockCode::IncompatibleState, false));
+    let d = detail(&r.stop);
+    assert!(d.contains("created by an older version (format 3)") && d.contains("--restart"), "{d}");
+    assert_eq!(manifest(&fs, &id(5)), prior, "the refusal changed nothing");
+}
+
+#[test]
+fn a_new_tree_operation_starts_at_wal_generation_1() {
+    let fs = fake();
+    let s = kept_tree_manifest(&fs);
+    assert_eq!(s.format_version, crate::state::FORMAT_VERSION);
+    assert_eq!(s.wal.expect("version 4 carries its WAL generation").wal_generation, 1);
+}
+
+#[test]
+fn an_adopted_prior_bumps_its_wal_generation() {
+    let fs = FaultFs::new();
+    for d in ["/src", "/src/sub", "/p", "/p/dest"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    fs.write_file("/src/sub/b", b"BB");
+    let p = prior3(&fs, 5, OpState::Failed);
+    assert_eq!(p.wal.expect("v4").wal_generation, 1);
+    drop(prior_store(&fs, 5));
+    // `sub` IS DEST by identity: each copy refuses it before creating anything, so the adopted workspace is kept
+    // FAILED and resumable again.
+    fs.set_identity("/src/sub", fs.metadata(Path::new("/p/dest")).unwrap().identity);
+    for expected in [2_u64, 3] {
+        let (r, _) = run_tree(&fs, &resume());
+        assert!(r.stop.is_none(), "{:?}", r.stop);
+        assert!(matches!(&r.copy, Some(Err(a)) if a.refused_unchanged()), "{:?}", r.copy);
+        let stored = manifest(&fs, &id(5));
+        assert_eq!(stored.state, OpState::Failed);
+        assert_eq!(stored.wal.expect("v4").wal_generation, expected);
     }
 }
 
@@ -3041,7 +3108,7 @@ fn a_transferring_or_failed_manifest_without_a_usable_state_db_is_state_corrupt(
 /// its `state.db` is still there, and no `.removing` / `.creating` sibling of its workspace appeared.
 fn assert_prior_survives(fs: &FaultFs, staged: &OperationState) {
     assert_eq!(&manifest(fs, &id(5)), staged, "the prior's manifest is unchanged");
-    assert_eq!(staged.format_version, 3);
+    assert_eq!(staged.format_version, crate::state::FORMAT_VERSION);
     assert!(fs.exists(format!("/p/dest/.flux/operations/{}/state.db", id(5))), "state.db survives");
     for suffix in ["removing", "creating"] {
         let sibling = format!("/p/dest/.flux/operations/{}.{suffix}", id(5));
@@ -3299,7 +3366,10 @@ fn a_refused_unchanged_copy_after_adoption_keeps_the_adopted_workspace() {
     adopted(&r, 5, Some(1));
     assert!(fs.exists(state_db(5)), "the recorded progress survives");
     let m = manifest(&fs, &id(5));
-    assert_eq!((m.state, m.format_version, m.operation_id), (OpState::Failed, 3, id(5)));
+    assert_eq!(
+        (m.state, m.format_version, m.operation_id),
+        (OpState::Failed, crate::state::FORMAT_VERSION, id(5))
+    );
     assert_eq!(m.config, p.config);
     assert!(!fs.exists(LOCK), "released");
 }
@@ -3319,7 +3389,7 @@ fn a_refused_unchanged_single_file_after_adoption_keeps_the_record() {
     let s = file_record(&fs, &id(5));
     assert_eq!(
         (s.state, s.format_version, s.operation_id.as_str()),
-        (OpState::Failed, 3, id(5).as_str())
+        (OpState::Failed, crate::state::FORMAT_VERSION, id(5).as_str())
     );
     assert!(!fs.exists(T_LOCK), "released");
 }

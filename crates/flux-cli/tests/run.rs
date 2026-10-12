@@ -333,7 +333,7 @@ fn an_empty_lock_is_uncertain_until_restart_break_lock_takes_it_over() {
 #[test]
 fn unreadable_or_newer_state_is_refused_and_preserved() {
     let corrupt: &[u8] = b"garbage";
-    let newer: &[u8] = br#"{"format_version":4}"#;
+    let newer: &[u8] = br#"{"format_version":5}"#;
     for (bytes, code) in [(corrupt, "STATE_CORRUPT"), (newer, "INCOMPATIBLE_STATE")] {
         let d = TempDir::new().unwrap();
         let src = tree_in(d.path());
@@ -591,7 +591,7 @@ fn a_resume_killed_again_resumes_a_third_time() {
     assert_eq!(the_operation(&dst), id, "the same operation, not a new one");
     assert!(claim_count(&dst, &id) >= 100, "the claims survived both kills");
     let m = manifest_of(&dst, &id);
-    assert_eq!(m.format_version, 3);
+    assert_eq!(m.format_version, flux_core::state::FORMAT_VERSION);
     assert_eq!(m.state, flux_core::state::OpState::Transferring);
     assert!(
         published(&dst) > after_first,
@@ -746,7 +746,7 @@ fn the_claim_count_equals_the_file_count_under_the_default_policy() {
     same_bytes(&src, &dst);
     assert_eq!(claim_count(&dst, &id), 300, "the claim count equals the file count");
     let m = manifest_of(&dst, &id);
-    assert_eq!(m.format_version, 3);
+    assert_eq!(m.format_version, flux_core::state::FORMAT_VERSION);
     assert_eq!(m.state, flux_core::state::OpState::Transferring);
     assert_eq!(m.config.expect("format 3 carries a config").options.durability, "strict");
 
