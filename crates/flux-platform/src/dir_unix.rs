@@ -221,6 +221,14 @@ impl DirHandle for StdDir {
                 ));
             }
         }
+        // A second name for the object: a write through this handle would change the bytes behind the other name too.
+        // Dropping `fd` here closes the handle, so a refusal leaves nothing open.
+        if st.st_nlink != 1 {
+            return Err(FsError::new(
+                Code::SafetyRejected,
+                std::io::Error::other(format!("the file has {} hard links, not 1", st.st_nlink)),
+            ));
+        }
         let handle = crate::std_fs::std_file_from(std::fs::File::from(fd));
         if handle.identity()? != *expected {
             return Err(identity_mismatch());

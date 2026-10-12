@@ -689,6 +689,15 @@ fn open_existing_at(p: &OwnedHandle, n: &OsStr) -> Result<crate::StdFile> {
             std::io::Error::other(format!("name-surrogate reparse point, tag 0x{tag:08X}")),
         ));
     }
+    // A hard link to another file: writing through this handle would change the bytes behind the other name too.
+    if let Some(n) = crate::std_fs::link_count_of_handle(&opened)
+        && n != 1
+    {
+        return Err(FsError::new(
+            Code::SafetyRejected,
+            std::io::Error::other(format!("the file has {n} hard links, not 1")),
+        ));
+    }
     Ok(crate::std_fs::std_file_from(File::from(opened)))
 }
 
@@ -916,6 +925,7 @@ fn metadata_at(p: &OwnedHandle, n: &OsStr) -> Result<Metadata> {
         permissions: Some(crate::std_fs::perms_of(&m)),
         modified: m.modified().ok(),
         identity: crate::std_fs::identity_of_handle(&f),
+        nlink: crate::std_fs::link_count_of_handle(&f),
     })
 }
 

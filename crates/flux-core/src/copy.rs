@@ -590,6 +590,11 @@ fn plan_resume<D: DirHandle + Send + 'static, R: std::io::Read>(
         Ok(m) if m.file_type == FileType::File && m.identity == FileIdentity::Unavailable => {
             return unreadable("the partial's identity is unavailable".to_string());
         }
+        // A second name for the object: reopening it for writing would write through into the other name's file. The
+        // sweep unlinks only THIS name and the fresh create makes a new object; an unknown count proves nothing.
+        Ok(m) if m.file_type == FileType::File && m.nlink != Some(1) => {
+            return unreadable("the partial has more than one link".to_string());
+        }
         Ok(m) if m.file_type == FileType::File => Some(m),
         Ok(m) => {
             return unreadable(format!("the partial is not a regular file ({:?})", m.file_type));
@@ -3793,6 +3798,48 @@ mod tests {
         assert_eq!((staged.reused, staged.bytes_copied), (0, 5 * MIB as u64));
         assert_eq!(fs.read_file(PARTIAL).unwrap(), src);
         assert_eq!(fs.bytes_read(PARTIAL) - p0, 0, "the partial was never read");
+        assert!(run.finish(&no_heartbeat).is_clean());
+    }
+
+    #[test]
+    fn a_hard_linked_partial_is_recopied_never_written_through() {
+        let (fs, root, src) = resume_fixture(5 * MIB, 3);
+        fs.write_file(PARTIAL, &src[..3 * MIB]);
+        fs.set_link_count(PARTIAL, 2);
+        let p0 = fs.bytes_read(PARTIAL);
+        let mark = fs.calls().len();
+        let run = run_gen(&fs, 2, Durability::Normal);
+        let staged = staged_of(stage_full(
+            &fs,
+            &root,
+            &run,
+            Durability::Normal,
+            &no_heartbeat,
+            &no_before_create,
+        ));
+        let Some(Discard::Unreadable(why)) = &staged.discard else {
+            panic!("{:?}", staged.discard)
+        };
+        assert!(why.contains("link"), "{why}");
+        assert_eq!((staged.reused, staged.bytes_copied), (0, 5 * MIB as u64));
+        assert_eq!(fs.bytes_read(PARTIAL) - p0, 0, "the partial was never read");
+        let calls = fs.calls();
+        let on_partial: Vec<&String> =
+            calls[mark..].iter().filter(|c| c.contains(PARTIAL)).collect();
+        assert!(
+            on_partial
+                .iter()
+                .all(|c| !c.starts_with("open_existing(") && !c.starts_with("truncate_to(")),
+            "the partial was reopened or truncated: {on_partial:?}"
+        );
+        let removed = format!("remove_file({PARTIAL})");
+        let created = format!("create_new({PARTIAL})");
+        let at = |what: &String| calls[mark..].iter().position(|c| c == what);
+        assert!(
+            matches!((at(&removed), at(&created)), (Some(r), Some(c)) if r < c),
+            "the name was swept, then a new object created: {on_partial:?}"
+        );
+        assert_eq!(fs.read_file(PARTIAL).unwrap(), src);
         assert!(run.finish(&no_heartbeat).is_clean());
     }
 

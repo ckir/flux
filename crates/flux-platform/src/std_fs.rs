@@ -271,6 +271,7 @@ impl FileSystem for StdFileSystem {
             // Free on Unix: `st_dev` and `st_ino` are already in the stat buffer, so
             // there is no second open to eliminate here and nothing to change.
             identity: identity_of(&m),
+            nlink: Some(std::os::unix::fs::MetadataExt::nlink(&m)),
         })
     }
 
@@ -302,6 +303,7 @@ impl FileSystem for StdFileSystem {
             permissions: Some(perms_of(&m)),
             modified: m.modified().ok(),
             identity: identity_of_handle(&f),
+            nlink: link_count_of_handle(&f),
         })
     }
 
@@ -772,6 +774,9 @@ pub(crate) fn metadata_from_stat(st: &rustix::fs::Stat) -> Metadata {
         permissions: Some(Perms::UnixMode(mode)),
         modified: mtime_from_stat(st),
         identity: identity_of_raw(dev, st.st_ino),
+        // `st_nlink` is `u16` on macOS and `u64` on Linux: the cast is a no-op on one and required on the other.
+        #[allow(clippy::unnecessary_cast)]
+        nlink: Some(st.st_nlink as u64),
     }
 }
 
@@ -827,4 +832,25 @@ pub(crate) fn identity_of_handle(file: &impl std::os::windows::io::AsRawHandle) 
         return FileIdentity::Unavailable;
     }
     FileIdentity::Strong(ObjectId { volume: info.VolumeSerialNumber, index })
+}
+
+/// The number of hard links to the object an open handle holds (`FILE_STANDARD_INFO::NumberOfLinks`), `None` when the
+/// filesystem does not answer. Read from the handle, never a path, so it describes the object the caller holds.
+#[cfg(windows)]
+pub(crate) fn link_count_of_handle(file: &impl std::os::windows::io::AsRawHandle) -> Option<u64> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandleEx,
+    };
+    // SAFETY: an all-zero `FILE_STANDARD_INFO` is a valid value (integers and booleans only).
+    let mut info: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a live, correctly sized `FILE_STANDARD_INFO`, and the handle stays open for the call.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as _,
+            FileStandardInfo,
+            (&raw mut info).cast(),
+            size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    };
+    (ok != 0).then_some(u64::from(info.NumberOfLinks))
 }

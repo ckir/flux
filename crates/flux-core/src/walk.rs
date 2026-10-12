@@ -800,6 +800,7 @@ mod tests {
                 permissions: None,
                 modified: None,
                 identity: FileIdentity::Unavailable,
+                nlink: None,
             })
         }
 

@@ -96,6 +96,10 @@ pub struct Metadata {
     /// §107 requires the strength to travel with it. One field, three states, and no
     /// second way to say "absent".
     pub identity: FileIdentity,
+    /// The number of hard links to the object (`st_nlink` on POSIX, `NumberOfLinks` on Windows), `None` when the
+    /// platform or filesystem cannot say. Resume writes THROUGH a partial it reopens, so it must know the name is the
+    /// object's only one: a partial with another link would write into a file the other name leads to.
+    pub nlink: Option<u64>,
 }
 
 /// A handle open for writing. Deliberately NOT `Read`: see `FileSystem::Reader`.
@@ -289,6 +293,9 @@ pub trait DirHandle: Sized {
     /// Refuses: a name-surrogate (`Code::SafetyRejected`); a directory (`Code::DestinationError`, kind `IsADirectory`);
     /// any other non-regular file (`Code::DestinationError`); an identity that differs from `expected`, and an
     /// `expected` of `FileIdentity::Unavailable`, which proves nothing (`Code::DestinationError`, kind `InvalidData`).
+    /// A file with more than one hard link (`Code::SafetyRejected`): a write through this handle would change the
+    /// bytes behind every other name of the object, so the name is not a file the caller may resume. A link count the
+    /// platform cannot report does not refuse here; callers that need the guarantee read `Metadata::nlink` first.
     /// A missing name is `Code::IoError` with kind `NotFound`. The handle is closed on every refusal.
     fn open_existing(
         &self,
@@ -521,6 +528,7 @@ mod tests {
                 // The stub exists to prove the trait compiles. Inventing an identity
                 // here would let a test pass against a fake that never had one.
                 identity: FileIdentity::Unavailable,
+                nlink: None,
             })
         }
 

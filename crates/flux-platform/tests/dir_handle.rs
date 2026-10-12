@@ -733,6 +733,32 @@ mod posix {
     }
 
     #[test]
+    fn open_existing_refuses_a_hard_linked_file_and_leaves_the_other_name_alone() {
+        use flux_fs::{DirHandle, FileHandle};
+        use std::io::Write;
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let mut w = root.create_new(OsStr::new("victim")).unwrap();
+        w.write_all(b"precious").unwrap();
+        let id = w.identity().unwrap();
+        drop(w);
+        // The planted name: the same object under a second name, so its identity IS `id` and only the link count
+        // stops this open from writing through it.
+        std::fs::hard_link(d.path().join("victim"), d.path().join("partial")).unwrap();
+        assert_eq!(root.metadata(OsStr::new("partial")).unwrap().nlink, Some(2));
+        let Err(e) = root.open_existing(OsStr::new("partial"), &id) else {
+            panic!("a hard-linked file must not be opened for writing")
+        };
+        assert_eq!(e.code, flux_fs::Code::SafetyRejected, "{e:?}");
+        assert!(e.source.to_string().contains("2 hard links"), "{e:?}");
+        assert_eq!(std::fs::read(d.path().join("victim")).unwrap(), b"precious");
+        // Unlinking the planted name leaves the object with one link, and it opens again.
+        std::fs::remove_file(d.path().join("partial")).unwrap();
+        assert_eq!(root.metadata(OsStr::new("victim")).unwrap().nlink, Some(1));
+        drop(root.open_existing(OsStr::new("victim"), &id).unwrap());
+    }
+
+    #[test]
     fn open_existing_refuses_an_unavailable_expectation() {
         let d = TempDir::new().unwrap();
         let root = StdFileSystem.destination_root(d.path()).unwrap();
@@ -1754,6 +1780,32 @@ mod windows_arm {
         };
         assert_eq!(e.code, flux_fs::Code::DestinationError, "{e:?}");
         assert_eq!(e.source.kind(), std::io::ErrorKind::InvalidData, "{e:?}");
+    }
+
+    #[test]
+    fn open_existing_refuses_a_hard_linked_file_and_leaves_the_other_name_alone() {
+        use flux_fs::{DirHandle, FileHandle};
+        use std::io::Write;
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let mut w = root.create_new(OsStr::new("victim")).unwrap();
+        w.write_all(b"precious").unwrap();
+        let id = w.identity().unwrap();
+        drop(w);
+        // The planted name: the same object under a second name, so its identity IS `id` and only the link count
+        // stops this open from writing through it.
+        std::fs::hard_link(d.path().join("victim"), d.path().join("partial")).unwrap();
+        assert_eq!(root.metadata(OsStr::new("partial")).unwrap().nlink, Some(2));
+        let Err(e) = root.open_existing(OsStr::new("partial"), &id) else {
+            panic!("a hard-linked file must not be opened for writing")
+        };
+        assert_eq!(e.code, flux_fs::Code::SafetyRejected, "{e:?}");
+        assert!(e.source.to_string().contains("2 hard links"), "{e:?}");
+        assert_eq!(std::fs::read(d.path().join("victim")).unwrap(), b"precious");
+        // Unlinking the planted name leaves the object with one link, and it opens again.
+        std::fs::remove_file(d.path().join("partial")).unwrap();
+        assert_eq!(root.metadata(OsStr::new("victim")).unwrap().nlink, Some(1));
+        drop(root.open_existing(OsStr::new("victim"), &id).unwrap());
     }
 
     #[test]

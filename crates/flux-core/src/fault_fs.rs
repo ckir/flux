@@ -48,6 +48,8 @@ struct Inner {
     /// directory snapshot path -> the fault `canonical_path` raises on that one directory, every time
     canonical_faults: HashMap<PathBuf, (Code, std::io::ErrorKind)>,
     times: HashMap<PathBuf, Option<SystemTime>>,
+    /// path -> hard-link count a test set (absent: 1); follows the object like `times`
+    links: HashMap<PathBuf, u64>,
     /// path -> bytes appended on the second `metadata` call
     grow: HashMap<PathBuf, Vec<u8>>,
     metadata_reads: HashMap<PathBuf, u32>,
@@ -520,6 +522,7 @@ fn purge(g: &mut Inner, path: &Path) {
     g.files.remove(path);
     g.identities.remove(path);
     g.times.remove(path);
+    g.links.remove(path);
     g.perms.remove(path);
     g.types.remove(path);
 }
@@ -544,6 +547,14 @@ fn move_object(g: &mut Inner, from: &Path, to: &Path) {
         }
         None => {
             g.times.remove(to);
+        }
+    }
+    match g.links.remove(from) {
+        Some(v) => {
+            g.links.insert(to.to_path_buf(), v);
+        }
+        None => {
+            g.links.remove(to);
         }
     }
     match g.perms.remove(from) {
@@ -594,6 +605,7 @@ fn move_directory(g: &mut Inner, from: &Path, to: &Path) {
     }
     rekey(&mut g.files, &moved);
     rekey(&mut g.times, &moved);
+    rekey(&mut g.links, &moved);
     rekey(&mut g.perms, &moved);
     rekey(&mut g.identities, &moved);
     rekey(&mut g.types, &moved);
@@ -1210,6 +1222,13 @@ impl FaultFs {
         self.inner.lock().unwrap().times.insert(path.to_path_buf(), Some(modified));
     }
 
+    /// Make a file report `n` hard links (`Metadata::nlink`), and refuse `open_existing`, as a real filesystem with a
+    /// second name for the object would. The default for every file is 1.
+    pub fn set_link_count(&self, path: impl AsRef<Path>, n: u64) {
+        let path = path.as_ref();
+        self.inner.lock().unwrap().links.insert(path.to_path_buf(), n);
+    }
+
     /// Give a file permissions, so a copy has something to carry across.
     pub fn set_file_perms(&self, path: impl AsRef<Path>, perms: Perms) {
         let path = path.as_ref();
@@ -1418,6 +1437,7 @@ impl FileSystem for FaultFs {
             file_type: g.types.get(&p).copied().unwrap_or(FileType::File),
             permissions: g.perms.get(&p).copied().flatten(),
             modified: g.times.get(&p).copied().flatten(),
+            nlink: Some(g.links.get(&p).copied().unwrap_or(1)),
             // Panic, not `Unavailable`: `Unavailable` is a state the walker handles
             // gracefully, so an unhooked creation path would degrade silently and keep
             // its test green. Every path that inserts into `files` calls
@@ -1835,6 +1855,14 @@ impl DirHandle for FakeDirHandle {
             return Err(FsError::new(
                 Code::IoError,
                 std::io::Error::from(std::io::ErrorKind::NotFound),
+            ));
+        }
+        if let Some(&n) = g.links.get(&child_path)
+            && n != 1
+        {
+            return Err(FsError::new(
+                Code::SafetyRejected,
+                std::io::Error::other(format!("the file has {n} hard links, not 1")),
             ));
         }
         // Recorded only once the open is accepted by the name checks, so a refused name leaves no call behind.
