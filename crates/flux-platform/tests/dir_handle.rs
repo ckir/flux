@@ -608,6 +608,55 @@ mod posix {
         assert_eq!(e.source.kind(), std::io::ErrorKind::NotFound, "{e:?}");
     }
 
+    /// The Task 7 production path: the WAL thread syncs a duplicate of a writer made through a `DirHandle`,
+    /// while the copy loop keeps writing through the original.
+    #[test]
+    fn a_duplicate_of_a_created_child_syncs_on_another_thread_while_the_original_writes() {
+        use flux_fs::FileHandle;
+        use std::io::Write;
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let mut w = root.create_new(OsStr::new("f")).unwrap();
+        w.write_all(b"abc").unwrap();
+        let dup = w.duplicate().unwrap();
+        std::thread::scope(|s| {
+            s.spawn(|| dup.sync_all().unwrap()).join().unwrap();
+        });
+        w.write_all(b"def").unwrap();
+        // The duplicate still works after the original wrote.
+        std::thread::scope(|s| {
+            s.spawn(|| dup.sync_all().unwrap()).join().unwrap();
+        });
+        drop(dup);
+        drop(w);
+        assert_eq!(std::fs::read(d.path().join("f")).unwrap(), b"abcdef");
+    }
+
+    #[test]
+    fn a_duplicate_of_a_reopened_child_syncs_on_another_thread() {
+        use flux_fs::FileHandle;
+        use std::io::Write;
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let mut w = root.create_new(OsStr::new("f")).unwrap();
+        w.write_all(b"abcde").unwrap();
+        let id = w.identity().unwrap();
+        drop(w);
+        let mut w2 = root.open_existing(OsStr::new("f"), &id).unwrap();
+        w2.truncate_to(3).unwrap();
+        let dup = w2.duplicate().unwrap();
+        std::thread::scope(|s| {
+            s.spawn(|| dup.sync_all().unwrap()).join().unwrap();
+        });
+        w2.write_all(b"XY").unwrap();
+        std::thread::scope(|s| {
+            s.spawn(|| dup.sync_all().unwrap()).join().unwrap();
+        });
+        drop(dup);
+        drop(w2);
+        assert_eq!(std::fs::read(d.path().join("f")).unwrap(), b"abcXY");
+    }
+
     #[test]
     fn open_existing_appends_after_the_prefix() {
         use flux_fs::FileHandle;
@@ -1599,6 +1648,55 @@ mod windows_arm {
         let Err(e) = root.open_read(OsStr::new("nope")) else { panic!("a missing name") };
         assert_eq!(e.code, flux_fs::Code::IoError, "{e:?}");
         assert_eq!(e.source.kind(), std::io::ErrorKind::NotFound, "{e:?}");
+    }
+
+    /// The Task 7 production path: the WAL thread syncs a duplicate of a writer made through a `DirHandle`,
+    /// while the copy loop keeps writing through the original.
+    #[test]
+    fn a_duplicate_of_a_created_child_syncs_on_another_thread_while_the_original_writes() {
+        use flux_fs::FileHandle;
+        use std::io::Write;
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let mut w = root.create_new(OsStr::new("f")).unwrap();
+        w.write_all(b"abc").unwrap();
+        let dup = w.duplicate().unwrap();
+        std::thread::scope(|s| {
+            s.spawn(|| dup.sync_all().unwrap()).join().unwrap();
+        });
+        w.write_all(b"def").unwrap();
+        // The duplicate still works after the original wrote.
+        std::thread::scope(|s| {
+            s.spawn(|| dup.sync_all().unwrap()).join().unwrap();
+        });
+        drop(dup);
+        drop(w);
+        assert_eq!(std::fs::read(d.path().join("f")).unwrap(), b"abcdef");
+    }
+
+    #[test]
+    fn a_duplicate_of_a_reopened_child_syncs_on_another_thread() {
+        use flux_fs::FileHandle;
+        use std::io::Write;
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let mut w = root.create_new(OsStr::new("f")).unwrap();
+        w.write_all(b"abcde").unwrap();
+        let id = w.identity().unwrap();
+        drop(w);
+        let mut w2 = root.open_existing(OsStr::new("f"), &id).unwrap();
+        w2.truncate_to(3).unwrap();
+        let dup = w2.duplicate().unwrap();
+        std::thread::scope(|s| {
+            s.spawn(|| dup.sync_all().unwrap()).join().unwrap();
+        });
+        w2.write_all(b"XY").unwrap();
+        std::thread::scope(|s| {
+            s.spawn(|| dup.sync_all().unwrap()).join().unwrap();
+        });
+        drop(dup);
+        drop(w2);
+        assert_eq!(std::fs::read(d.path().join("f")).unwrap(), b"abcXY");
     }
 
     #[test]

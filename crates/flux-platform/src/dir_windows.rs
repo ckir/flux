@@ -63,10 +63,11 @@ fn nt_io_error(what: &str, status: i32) -> std::io::Error {
         //
         // Mapping FILE_IS_A_DIRECTORY globally is safe HERE rather than merely
         // convenient: it can only be returned to a call that asked for a
-        // non-directory, and `create_new_at` is the one call in this file that passes
-        // FILE_NON_DIRECTORY_FILE. `open_lock_at` passes it too, and answers
-        // FILE_IS_A_DIRECTORY for an OPEN before calling this. If another call ever
-        // does, this mapping needs revisiting with it.
+        // non-directory. `create_new_at` passes FILE_NON_DIRECTORY_FILE, and so do
+        // `open_lock_at`, `open_existing_at` and `open_read_at`; each of those three
+        // answers STATUS_FILE_IS_A_DIRECTORY itself (the lock, for an OPEN), before
+        // calling this. If another call ever passes it, this mapping needs
+        // revisiting with it.
         STATUS_OBJECT_NAME_COLLISION | STATUS_FILE_IS_A_DIRECTORY => {
             std::io::ErrorKind::AlreadyExists
         }
