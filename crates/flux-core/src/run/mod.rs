@@ -191,8 +191,8 @@ pub enum RunWarning {
     /// Cut 9f-1: the checkpoint log's segment cannot be reopened safely on this filesystem (its identity is
     /// unavailable); the tree ran without checkpoints, so every large file recopied.
     CheckpointsUnavailable { why: String },
-    /// Cut 9f-1: the checkpoint log could not be read (corrupt, unsupported, or a failed open); the tree ran without
-    /// checkpoints, so every large file recopied.
+    /// Cut 9f-1: the checkpoint log's handles could not be opened, or reading it failed with an I/O error; the tree ran
+    /// without checkpoints, so every large file recopied. (Damage is `WalQuarantined`; an unknown format stops the run.)
     CheckpointsUnreadable { why: String },
     /// Cut 9f-1: the checkpoint log ended in `len` bytes at `offset` that the replay cut (spec decision 7.1);
     /// the records before `offset` are intact and were used.
@@ -717,7 +717,7 @@ fn open_checkpoints<F: DestinationRoot>(
         }
         Err(CheckpointOpenError::FormatUnsupported(why)) => {
             let message = format!(
-                "the checkpoint log was written by a newer Flux ({why}); nothing was copied; use the Flux version that wrote it, or run again with --restart to supersede it"
+                "the checkpoint log was written by a newer Flux, or its version bytes are damaged ({why}); this run copies nothing; use the Flux version that wrote it, or run again with --restart to supersede it"
             );
             Err(CopyError {
                 cause: FsError::new(Code::WalFormatUnsupported, std::io::Error::other(message)),
@@ -752,6 +752,9 @@ fn open_checkpoints<F: DestinationRoot>(
                     | CheckpointOpenError::Corrupt { why: m, .. } => m,
                     CheckpointOpenError::Fatal(e) => e.to_string(),
                 })
+            })
+            .map_err(|m| {
+                format!("it was set aside as wal/{set_aside_as}, but a fresh log could not be opened: {m}")
             });
             match reopened {
                 Ok(c) => {

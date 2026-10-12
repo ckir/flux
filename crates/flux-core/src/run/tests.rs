@@ -6808,9 +6808,9 @@ mod checkpointing {
         let text = abort.error.to_string();
         for part in [
             "WAL_FORMAT_UNSUPPORTED",
-            "written by a newer Flux",
+            "written by a newer Flux, or its version bytes are damaged",
             "unsupported log format 2 (checksum 1)",
-            "nothing was copied",
+            "this run copies nothing",
             "run again with --restart to supersede it",
         ] {
             assert!(text.contains(part), "{part} missing from {text}");
@@ -6903,6 +6903,50 @@ mod checkpointing {
             "ckpt: None, so no fresh log was started: {:?}",
             &c[mark..]
         );
+    }
+
+    #[test]
+    fn a_failed_reopen_after_the_rename_says_the_log_was_set_aside_and_runs_without_checkpoints() {
+        fn watch(fs: &FaultFs, n: u32, last: u32) {
+            if n > last {
+                return;
+            }
+            fs.on_nth("metadata", n, move |fs| {
+                // The re-open's probe of the new segment: a `metadata` of it after the quarantine rename.
+                let c: Vec<String> = fs.calls().iter().map(|x| x.replace('\\', "/")).collect();
+                if c.iter().any(|x| x.contains(".corrupt-"))
+                    && c.last().is_some_and(|x| x == &format!("metadata({})", wal()))
+                {
+                    fs.fail("metadata", Code::IoError);
+                }
+                watch(fs, n + 1, last);
+            });
+        }
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        corrupt_mid_log(&fs);
+        let first = next_nth(&fs, "metadata(");
+        watch(&fs, first, first + 400);
+        let (r, mark) = resume_run(&fs, Durability::Normal);
+        let failed: Vec<_> = r
+            .warnings
+            .iter()
+            .filter_map(|w| match w {
+                RunWarning::WalNotQuarantined { code, error, .. } => Some((*code, error.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failed.len(), 1, "{:?}", r.warnings);
+        assert_eq!(failed[0].0, "WAL_CORRUPT");
+        assert!(
+            failed[0].1.starts_with(
+                "it was set aside as wal/000001.corrupt-2, but a fresh log could not be opened: "
+            ),
+            "{}",
+            failed[0].1
+        );
+        assert!(quarantined(&r).is_empty());
+        assert_safe_redo(&fs, &r, mark);
     }
 
     #[test]
