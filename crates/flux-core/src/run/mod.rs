@@ -380,7 +380,7 @@ pub(crate) fn tree_with<F: DestinationRoot>(
                 let cause = FsError::new(
                     Code::WalWriteFailed,
                     std::io::Error::other(format!(
-                        "checkpoints could not be written ({why}); resume state is NOT trustworthy; run again with --resume to continue from the last durable checkpoint"
+                        "checkpoints could not be written ({why}); resume state is NOT trustworthy"
                     )),
                 );
                 let error =

@@ -3,10 +3,11 @@
 //!
 //! Design authority: `docs/superpowers/specs/2026-09-26-cut-4b-copy-tree-design.md`.
 
+pub use crate::checkpoint::Discard;
 use crate::checkpoint::{Checkpoints, FileCkpt};
 use crate::copy::{
-    BeforeCreate, BeforePublish, CopyError, CopyStep, Guard, Heartbeat, PublishIntent, Stage,
-    Staged, SyncAt, copy_file_checkpointed, copy_file_guarded, discard, no_before_create,
+    BeforeCreate, BeforePublish, CopyError, CopyStep, Guard, Heartbeat, PublishIntent, Reuse,
+    Stage, Staged, SyncAt, copy_file_checkpointed, copy_file_guarded, discard, no_before_create,
     no_before_publish, no_heartbeat, publish_staged, split_destination, stage_file,
     sync_staged_many, unguarded, weaker,
 };
@@ -71,6 +72,60 @@ pub struct TreeOutcome {
     /// Cut 9e: batches flushed because the open-writer cap was reached (`BatchPolicy::open_writers`): at it, the
     /// shallowest pending batch flushes before the next file is staged. A cap flush that stops the run still counts.
     pub cap_flushes: u64,
+    /// Cut 9f-1: the bytes proven by validated checkpoints and not re-copied, summed over the published files.
+    pub bytes_reused: u64,
+    /// Cut 9f-1: published files that reused a validated prefix (`reused > 0`); `partial_resumes.len()`.
+    pub files_partially_resumed: u64,
+    /// Cut 9f-1: each partially resumed file with the bytes it reused and the bytes this run copied for it.
+    pub partial_resumes: Vec<PartialResume>,
+    /// Cut 9f-1: every published file whose checkpoints were discarded, and why (nothing is discarded silently).
+    pub checkpoint_discards: Vec<CheckpointDiscard>,
+}
+
+/// Cut 9f-1: a file resumed from a validated prefix. `path` is relative to the source root, as the walk reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialResume {
+    pub path: PathBuf,
+    pub reused: u64,
+    pub recopied: u64,
+}
+
+/// Cut 9f-1: a file whose checkpoints were discarded (wholly or from an offset on). `path` is relative to the source
+/// root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointDiscard {
+    pub path: PathBuf,
+    pub reason: Discard,
+}
+
+/// Cut 9f-1: `copy_file_checkpointed`'s result split into the `Outcome` the tree counts and, for a published file, its
+/// reuse with the bytes this run copied for it.
+fn split_reuse(
+    result: std::result::Result<(flux_fs::Outcome, Reuse), CopyError>,
+) -> (std::result::Result<flux_fs::Outcome, CopyError>, Option<(Reuse, u64)>) {
+    match result {
+        Ok((o, reuse)) => {
+            let recopied = o.bytes_copied;
+            (Ok(o), Some((reuse, recopied)))
+        }
+        Err(e) => (Err(e), None),
+    }
+}
+
+/// Cut 9f-1: records a published file's reuse and discard in the outcome.
+fn note_reuse(out: &mut TreeOutcome, path: &Path, reuse: Reuse, recopied: u64) {
+    if reuse.reused > 0 {
+        out.bytes_reused += reuse.reused;
+        out.files_partially_resumed += 1;
+        out.partial_resumes.push(PartialResume {
+            path: path.to_path_buf(),
+            reused: reuse.reused,
+            recopied,
+        });
+    }
+    if let Some(reason) = reuse.discard {
+        out.checkpoint_discards.push(CheckpointDiscard { path: path.to_path_buf(), reason });
+    }
 }
 
 /// The operation stopped as a whole (cut 5, K1). `outcome` holds what was counted
@@ -1237,12 +1292,16 @@ fn copy_one<F: DestinationRoot>(
                 before_publish,
                 fc.as_ref(),
             );
+            let (result, reuse) = split_reuse(result);
             discard_note_on_failure(claims, &key, &wrote, &result);
             let published = match &result {
                 Ok(o) => Some(o.published_identity),
                 Err(_) => None,
             };
             finish_copy(path.clone(), result, out, on_report)?;
+            if let Some((reuse, recopied)) = reuse {
+                note_reuse(out, &path, reuse, recopied);
+            }
             if let Some(identity) = published {
                 let recorded = if strict {
                     claims.borrow_mut().commit_prepared(&key, &target, None)
@@ -1340,12 +1399,16 @@ fn copy_one<F: DestinationRoot>(
                 before_publish,
                 fc.as_ref(),
             );
+            let (result, reuse) = split_reuse(result);
             discard_note_on_failure(claims, &key_stored, &wrote, &result);
             let published = match &result {
                 Ok(o) => Some(o.published_identity),
                 Err(_) => None,
             };
             finish_copy(path.clone(), result, out, on_report)?;
+            if let Some((reuse, recopied)) = reuse {
+                note_reuse(out, &path, reuse, recopied);
+            }
             if let Some(identity) = published {
                 out.files_overwritten += 1;
                 // The entry now holds the new object under its stored name (and, on some systems, the planned one).
@@ -1633,13 +1696,17 @@ fn flush_batch<F: DestinationRoot>(
     let mut paths = Vec::with_capacity(entries.len());
     let mut rest = entries.into_iter();
     while let Some(p) = rest.next() {
-        let Pending { path, name, key, planned, template: _, staged, target, replaced } = p;
+        let Pending { path, name, key, planned, template: _, mut staged, target, replaced } = p;
         let publish = if replaced.is_some() { Publish::Replace } else { Publish::NoReplace };
+        // Cut 9f-1: taken before `publish_staged` consumes the staged file.
+        let reuse = Reuse::take(&mut staged);
         match publish_staged(parent, &name, staged, publish, cx.guard, cx.beat) {
             Ok(o) => {
                 let identity = o.published_identity;
+                let recopied = o.bytes_copied;
                 // Counted at the rename, before any later entry is tried (decision 4.6). Never `Err` for an `Ok`.
                 finish_copy(path.clone(), Ok(o), out, on_report)?;
+                note_reuse(out, &path, reuse, recopied);
                 match &replaced {
                     None => names.record_publication(&target, None, &name, None, identity),
                     Some((stored, meta)) => {

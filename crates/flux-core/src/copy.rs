@@ -478,11 +478,25 @@ pub(crate) struct Staged<W> {
     /// the writer and dropped it on return.
     pub writer: Option<W>,
     /// Cut 9f-1: bytes proven by a validated prefix and not re-copied (0 for a fresh copy).
-    #[allow(dead_code)] // read by the checkpointed tree copy (cut 9f-1 plan 2, a later task)
     pub reused: u64,
     /// Cut 9f-1: how a resumed partial's prefix was decided; `None` when nothing was discarded.
-    #[allow(dead_code)] // read by the checkpointed tree copy (cut 9f-1 plan 2, a later task)
     pub discard: Option<Discard>,
+}
+
+/// Cut 9f-1 (task 9): what a published checkpointed file reports beyond the public `Outcome`: the bytes its validated
+/// prefix proved (not re-copied) and why its checkpoints were discarded, if they were. Taken from `Staged` before
+/// `publish_staged` consumes it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Reuse {
+    pub reused: u64,
+    pub discard: Option<Discard>,
+}
+
+impl Reuse {
+    /// Moves the discard out of `staged` (which is about to be published).
+    pub(crate) fn take<W>(staged: &mut Staged<W>) -> Reuse {
+        Reuse { reused: staged.reused, discard: staged.discard.take() }
+    }
 }
 
 /// What ends the streaming step early: remove the partial (`Discard`) or keep it (`Keep`, a WAL failure).
@@ -951,6 +965,7 @@ pub fn copy_file_guarded<F: DestinationRoot>(
         before_publish,
         None,
     )
+    .map(|(outcome, _)| outcome)
 }
 
 /// `copy_file_guarded` plus cut 9f-1's checkpoint hook (`ckpt`, `None` for an uncheckpointed copy, which is then
@@ -967,8 +982,8 @@ pub(crate) fn copy_file_checkpointed<F: DestinationRoot>(
     before_create: &BeforeCreate<'_>,
     before_publish: &BeforePublish<'_>,
     ckpt: Option<&FileCkpt<'_, F::Dir>>,
-) -> std::result::Result<Outcome, CopyError> {
-    let staged = match stage_file(
+) -> std::result::Result<(Outcome, Reuse), CopyError> {
+    let mut staged = match stage_file(
         fs,
         src,
         parent,
@@ -980,9 +995,10 @@ pub(crate) fn copy_file_checkpointed<F: DestinationRoot>(
         SyncAt::Staging,
         ckpt,
     )? {
-        Stage::Skipped(outcome) => return Ok(outcome),
+        Stage::Skipped(outcome) => return Ok((outcome, Reuse::default())),
         Stage::Staged(staged) => staged,
     };
+    let reuse = Reuse::take(&mut staged);
     // Cut 9c: the hook sees the temporary and its identity before the final heartbeat and guard. Its error is returned
     // as is, after the temporary is discarded like any other pre-rename failure.
     let intent = PublishIntent { temp: staged.temp.clone(), identity: staged.identity };
@@ -994,7 +1010,7 @@ pub(crate) fn copy_file_checkpointed<F: DestinationRoot>(
         }
         return Err(out);
     }
-    publish_staged(parent, name, staged, opts.publish, guard, beat)
+    publish_staged(parent, name, staged, opts.publish, guard, beat).map(|outcome| (outcome, reuse))
 }
 
 /// The final heartbeat, guard and publishing rename for a `Staged` temporary, with the exact error handling the single
@@ -3549,7 +3565,7 @@ mod tests {
         let fc = FileCkpt { run: &run, file_id: b"f".to_vec(), destination: b"dst".to_vec() };
         let mut o = opts();
         o.durability = Durability::Strict;
-        let out = copy_file_checkpointed(
+        let (out, reuse) = copy_file_checkpointed(
             &fs,
             Path::new("/src"),
             &root,
@@ -3563,6 +3579,7 @@ mod tests {
         )
         .unwrap_or_else(|e| panic!("copy failed: {e:?}"));
         assert_eq!(out.bytes_copied, 0);
+        assert_eq!((reuse.reused, reuse.discard), (len as u64, None));
         assert_eq!(fs.read_file("/dst").unwrap(), src, "published");
         assert_eq!(fs.bytes_read("/src") - s0, len as u64, "only `decide` reads the source");
         assert_eq!(fs.bytes_read(PARTIAL) - p0, len as u64);

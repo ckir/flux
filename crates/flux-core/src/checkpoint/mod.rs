@@ -18,7 +18,8 @@ use flux_fs::{DirHandle, Durability, FsError};
 use std::ffi::OsStr;
 use std::io;
 
-pub(crate) use decide::{Discard, Gate, Start, Verdict, decide};
+pub use decide::Discard;
+pub(crate) use decide::{Gate, Start, Verdict, decide};
 pub(crate) use sink::{FileSink, SinkError};
 
 /// Files shorter than this are not checkpointed.

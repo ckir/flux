@@ -5620,8 +5620,14 @@ mod checkpointing {
     /// A first run of a 5 MiB file stopped by a failing heartbeat once 3 MiB of the partial are written and the
     /// segment covers them (generation 1). Its state is FAILED and its workspace and `wal/` stay.
     fn crashed_run(fs: &FaultFs) {
+        crashed_run_as(fs, Durability::Normal);
+    }
+
+    /// `crashed_run` under `durability` (Strict stages the file through a batch).
+    fn crashed_run_as(fs: &FaultFs, durability: Durability) {
         stop_beat_at(fs, 1, 3 * MIB, true, false);
-        let (r, _) = run_with(fs, &beating(), &opts(), policy(Durability::Normal, 1));
+        let o = CopyOptions { durability, ..opts() };
+        let (r, _) = run_with(fs, &beating(), &o, policy(durability, 1));
         assert!(r.stop.is_none(), "{:?}", r.stop);
         assert!(matches!(&r.copy, Some(Err(_))), "{:?}", r.copy);
         let m = manifest(fs, ID);
@@ -5837,6 +5843,69 @@ mod checkpointing {
         let b = begin.expect("the adopted run (generation 2) began the file again");
         assert!(b.valid_through >= 3 * MIB as u64, "{b:?}");
         assert!(!fs.exists("/p/dest/.flux"));
+    }
+
+    // Task 9. Mutant: `copy_file_checkpointed` returns `Reuse::default()` (the unbatched path drops its reuse).
+    #[test]
+    fn a_resumed_run_reports_the_bytes_it_reused_and_recopied() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        let (r, _) = run_with(&fs, &resuming(), &opts(), lazy(Durability::Normal));
+        let out = ok(&r);
+        assert!(out.bytes_reused >= 3 * MIB as u64, "{out:?}");
+        assert_eq!(out.files_partially_resumed, 1, "{out:?}");
+        assert_eq!(out.partial_resumes.len(), 1);
+        let p = &out.partial_resumes[0];
+        assert_eq!(p.path, Path::new("big"));
+        assert_eq!((p.reused, p.reused + p.recopied), (out.bytes_reused, 5 * MIB as u64), "{p:?}");
+        assert_eq!(p.recopied, out.bytes_copied, "the only file");
+        assert!(out.checkpoint_discards.is_empty(), "{:?}", out.checkpoint_discards);
+    }
+
+    // Task 9. Mutant: `flush_batch` takes no `Reuse` from the staged file (the batched path drops its reuse).
+    #[test]
+    fn a_resumed_strict_batched_file_reports_its_reuse() {
+        let fs = big_fs(5 * MIB);
+        crashed_run_as(&fs, Durability::Strict);
+        let (r, _) = run_with(&fs, &resuming(), &strict(), lazy(Durability::Strict));
+        let out = ok(&r);
+        assert!(out.bytes_reused >= 3 * MIB as u64, "{out:?}");
+        assert_eq!(out.files_partially_resumed, 1, "{out:?}");
+        let p = &out.partial_resumes[0];
+        assert_eq!((p.path.as_path(), p.reused + p.recopied), (Path::new("big"), 5 * MIB as u64));
+        assert!(out.checkpoint_discards.is_empty(), "{:?}", out.checkpoint_discards);
+    }
+
+    // Task 9. Mutant: `note_reuse` records no discard when `reused == 0` (or drops `discard` on the unbatched path).
+    #[test]
+    fn a_resume_that_cannot_trust_its_partial_names_the_file_and_why() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        fs.write_file(partial(), &pattern(5 * MIB)[..2 * MIB + MIB / 2]);
+        let (r, _) = run_with(&fs, &resuming(), &opts(), lazy(Durability::Normal));
+        let out = ok(&r);
+        assert_eq!(out.checkpoint_discards.len(), 1, "{:?}", out.checkpoint_discards);
+        let d = &out.checkpoint_discards[0];
+        assert_eq!(d.path, Path::new("big"));
+        assert!(matches!(d.reason, crate::Discard::PartialShorter { .. }), "{:?}", d.reason);
+    }
+
+    // Task 9. A missing partial is `PartialMissing` and reuses nothing.
+    #[test]
+    fn a_resume_with_no_partial_names_the_file_and_reuses_nothing() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        fs.remove_file(Path::new(&partial())).unwrap();
+        let (r, _) = run_with(&fs, &resuming(), &opts(), lazy(Durability::Normal));
+        let out = ok(&r);
+        assert_eq!((out.bytes_reused, out.files_partially_resumed), (0, 0));
+        assert_eq!(
+            out.checkpoint_discards
+                .iter()
+                .map(|d| (d.path.clone(), d.reason.clone()))
+                .collect::<Vec<_>>(),
+            vec![(PathBuf::from("big"), crate::Discard::PartialMissing)]
+        );
     }
 
     // Mutant: `checkpoint_policy` builds Strict (or the run's durability is not passed): Normal would not validate.

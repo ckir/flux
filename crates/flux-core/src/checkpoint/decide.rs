@@ -23,7 +23,7 @@ pub(crate) enum Start {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Discard {
+pub enum Discard {
     SourceChanged(&'static str),
     PartialMissing,
     MismatchAt(u64),
