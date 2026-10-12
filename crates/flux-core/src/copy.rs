@@ -572,6 +572,10 @@ fn plan_resume<D: DirHandle + Send + 'static, R: std::io::Read>(
         Err(e) => return unreadable(format!("{e:?}")),
     };
     let partial_meta = match parent.metadata(temp) {
+        // No identity means `open_existing` must refuse it by contract: recopy rather than wedge on every later run.
+        Ok(m) if m.file_type == FileType::File && m.identity == FileIdentity::Unavailable => {
+            return unreadable("the partial's identity is unavailable".to_string());
+        }
         Ok(m) if m.file_type == FileType::File => Some(m),
         Ok(m) => {
             return unreadable(format!("the partial is not a regular file ({:?})", m.file_type));
@@ -3746,6 +3750,31 @@ mod tests {
         assert_eq!((staged.reused, staged.bytes_copied), (0, 5 * MIB as u64));
         assert_eq!(fs.read_file(PARTIAL).unwrap(), src);
         run.abandon();
+    }
+
+    #[test]
+    fn a_partial_with_an_unavailable_identity_is_recopied_not_wedged() {
+        let (fs, root, src) = resume_fixture(5 * MIB, 3);
+        fs.write_file(PARTIAL, &src[..3 * MIB]);
+        fs.set_identity(PARTIAL, FileIdentity::Unavailable);
+        let p0 = fs.bytes_read(PARTIAL);
+        let run = run_gen(&fs, 2, Durability::Normal);
+        let staged = staged_of(stage_full(
+            &fs,
+            &root,
+            &run,
+            Durability::Normal,
+            &no_heartbeat,
+            &no_before_create,
+        ));
+        let Some(Discard::Unreadable(why)) = &staged.discard else {
+            panic!("{:?}", staged.discard)
+        };
+        assert!(why.contains("identity"), "{why}");
+        assert_eq!((staged.reused, staged.bytes_copied), (0, 5 * MIB as u64));
+        assert_eq!(fs.read_file(PARTIAL).unwrap(), src);
+        assert_eq!(fs.bytes_read(PARTIAL) - p0, 0, "the partial was never read");
+        assert!(run.finish(&no_heartbeat).is_clean());
     }
 
     #[test]
