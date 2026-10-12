@@ -732,6 +732,22 @@ mod posix {
         assert_eq!(e.source.kind(), std::io::ErrorKind::InvalidData, "{e:?}");
     }
 
+    // A name that is neither 8.3-compatible nor short, so an auto-generated short name would exist on a volume that
+    // makes them: the link count must still be 1 (a count of 2 would make resume refuse every partial).
+    #[test]
+    fn a_long_named_file_reports_one_link() {
+        use flux_fs::{DirHandle, FileHandle};
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let name = OsStr::new("a.long-name.flux-partial.0123456789abcdef0123456789abcdef");
+        let w = root.create_new(name).unwrap();
+        let id = w.identity().unwrap();
+        drop(w);
+        assert_eq!(root.metadata(name).unwrap().nlink, Some(1));
+        // The opened-handle path: `open_existing` refuses a count above 1, so it opening is the handle's own report.
+        drop(root.open_existing(name, &id).unwrap());
+    }
+
     #[test]
     fn open_existing_refuses_a_hard_linked_file_and_leaves_the_other_name_alone() {
         use flux_fs::{DirHandle, FileHandle};
@@ -1780,6 +1796,22 @@ mod windows_arm {
         };
         assert_eq!(e.code, flux_fs::Code::DestinationError, "{e:?}");
         assert_eq!(e.source.kind(), std::io::ErrorKind::InvalidData, "{e:?}");
+    }
+
+    // A name that is neither 8.3-compatible nor short, so an auto-generated short name would exist on a volume that
+    // makes them: the link count must still be 1 (a count of 2 would make resume refuse every partial).
+    #[test]
+    fn a_long_named_file_reports_one_link() {
+        use flux_fs::{DirHandle, FileHandle};
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let name = OsStr::new("a.long-name.flux-partial.0123456789abcdef0123456789abcdef");
+        let w = root.create_new(name).unwrap();
+        let id = w.identity().unwrap();
+        drop(w);
+        assert_eq!(root.metadata(name).unwrap().nlink, Some(1));
+        // The opened-handle path: `open_existing` refuses a count above 1, so it opening is the handle's own report.
+        drop(root.open_existing(name, &id).unwrap());
     }
 
     #[test]

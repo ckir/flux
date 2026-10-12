@@ -774,7 +774,7 @@ pub(crate) fn metadata_from_stat(st: &rustix::fs::Stat) -> Metadata {
         permissions: Some(Perms::UnixMode(mode)),
         modified: mtime_from_stat(st),
         identity: identity_of_raw(dev, st.st_ino),
-        // `st_nlink` is `u16` on macOS and `u64` on Linux: the cast is a no-op on one and required on the other.
+        // `st_nlink` is `u16` on macOS, `u32` on aarch64 Linux and `u64` on x86_64 Linux: the cast is a no-op on one and required on the others.
         #[allow(clippy::unnecessary_cast)]
         nlink: Some(st.st_nlink as u64),
     }

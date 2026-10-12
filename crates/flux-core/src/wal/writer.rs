@@ -771,7 +771,8 @@ mod tests {
         s.send(Msg::Range(range(b"p", 0, 1)), beat).unwrap();
         drain(&s, beat);
         assert_eq!(syncs(&fs), ["sync_all(/ws/p)", "sync_all(/ws/wal/000001)"]);
-        // `FakeHandle::sync_all` does not pass through `FaultFs::record`, so `on_nth("sync_all", ..)` never fires.
+        // `FakeHandle::sync_all` logs its call directly rather than through `FaultFs::record`, but it runs the hook
+        // (`run_hook`), so `on_nth("sync_all", ..)` fires.
         // The call log carries the same fact: the WAL's directory and segment are created only after the
         // partial's sync, so the WAL was absent when it ran.
         let calls = calls_unix(&fs);
@@ -1593,13 +1594,17 @@ mod tests {
         let (release, released) = mpsc::channel::<()>();
         fs.on_nth("sync_all", 1, move |_| {
             entered_tx.send(()).unwrap();
-            released.recv().unwrap();
+            released
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the test never released the held first sync_all");
         });
         let (s, t) = start(dir, 1, cfg(BIG, HOUR, Durability::Strict));
         s.send(begin_msg(b"p", Some(p.duplicate().unwrap())), beat).unwrap();
         s.send(Msg::Range(range(b"p", 0, 1)), beat).unwrap();
         s.send(Msg::Flush, beat).unwrap();
-        entered.recv().expect("the first flush started");
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the flush never reached its first sync_all");
         // A second flush is queued behind the one in flight, then the sender goes while that flush is blocked.
         s.send(Msg::Range(range(b"p", 1, 2)), beat).unwrap();
         s.send(Msg::Flush, beat).unwrap();
