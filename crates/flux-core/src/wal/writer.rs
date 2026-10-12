@@ -6,6 +6,7 @@
 //! then appends that file's records, then syncs the log, so a checkpoint is never durable before the
 //! data it describes.
 
+use super::MAX_PAYLOAD;
 use super::record::{Body, FileBegin, Header, Range, encode};
 use super::replay::{Scan, WalError, scan};
 use crate::copy::Heartbeat;
@@ -13,6 +14,7 @@ use flux_fs::{Code, DirHandle, Durability, FileHandle, FileIdentity, FsError};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -26,8 +28,6 @@ pub(crate) const SEGMENT_NAME: &str = "000001";
 pub(crate) const SEND_RETRY: Duration = Duration::from_millis(10);
 /// Channel capacity of the production configuration.
 pub(crate) const CHANNEL_CAP: usize = 64;
-/// Most digests one record may carry: 32,000 * 32 bytes plus framing stays under `MAX_PAYLOAD`.
-const RANGE_DIGESTS_MAX: usize = 32_000;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct WalConfig {
@@ -85,10 +85,19 @@ impl Failure {
 }
 
 pub(crate) enum Msg<W> {
-    FileBegin { begin: FileBegin, dup: Option<W> },
+    FileBegin {
+        begin: FileBegin,
+        dup: Option<W>,
+    },
     Range(Range),
     Flush,
-    Close { file_id: Vec<u8>, ack: Option<mpsc::SyncSender<Option<WalFault>>> },
+    /// The `ack` channel must have capacity >= 1: the answer is delivered with `try_send`, so a zero-capacity
+    /// or dropped receiver is ignored and never blocks the thread.
+    Close {
+        file_id: Vec<u8>,
+        ack: Option<mpsc::SyncSender<Option<WalFault>>>,
+    },
+    /// The channel must have capacity >= 1 (see `Close`).
     Drain(mpsc::SyncSender<Failure>),
     Stop,
 }
@@ -108,16 +117,34 @@ fn lock(m: &Mutex<Failure>) -> MutexGuard<'_, Failure> {
 pub(crate) struct WalSender<W> {
     tx: SyncSender<Msg<W>>,
     failure: Arc<Mutex<Failure>>,
+    /// Shared with the thread. Set when the sender is dropped without a delivered `Stop`: the run is abandoned
+    /// and the thread begins nothing more, whatever is still queued (ruling 11, spec decision 9).
+    abandoned: Arc<AtomicBool>,
+    stopped: AtomicBool,
+}
+
+impl<W> Drop for WalSender<W> {
+    fn drop(&mut self) {
+        if !self.stopped.load(Ordering::SeqCst) {
+            self.abandoned.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 impl<W> WalSender<W> {
     /// Queue `msg`. A full channel is waited out in `SEND_RETRY` steps, calling `beat` before each wait so a
     /// lock-holding run keeps refreshing its lock (ruling 12).
     pub(crate) fn send(&self, msg: Msg<W>, beat: &Heartbeat<'_>) -> Result<(), SendError> {
+        let is_stop = matches!(msg, Msg::Stop);
         let mut msg = msg;
         loop {
             match self.tx.try_send(msg) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    if is_stop {
+                        self.stopped.store(true, Ordering::SeqCst);
+                    }
+                    return Ok(());
+                }
                 Err(TrySendError::Disconnected(_)) => return Err(SendError::WalFailed),
                 Err(TrySendError::Full(back)) => {
                     msg = back;
@@ -209,7 +236,9 @@ pub(crate) fn open<D: DirHandle + Send + 'static>(
     }
     let (tx, rx) = mpsc::sync_channel(cfg.channel_cap);
     let failure = Arc::new(Mutex::new(Failure::default()));
+    let abandoned = Arc::new(AtomicBool::new(false));
     let state = State {
+        abandoned: Arc::clone(&abandoned),
         workspace,
         wal,
         operation_id,
@@ -227,10 +256,15 @@ pub(crate) fn open<D: DirHandle + Send + 'static>(
         .name("flux-wal".to_owned())
         .spawn(move || state.run(rx))
         .map_err(|e| WalError::Io(FsError::from_io(e)))?;
-    Ok((WalSender { tx, failure: Arc::clone(&failure) }, WalThread { handle, failure }, found))
+    Ok((
+        WalSender { tx, failure: Arc::clone(&failure), abandoned, stopped: AtomicBool::new(false) },
+        WalThread { handle, failure },
+        found,
+    ))
 }
 
 struct State<D: DirHandle> {
+    abandoned: Arc<AtomicBool>,
     workspace: D,
     wal: Option<D::Writer>,
     operation_id: Vec<u8>,
@@ -248,23 +282,24 @@ struct State<D: DirHandle> {
 impl<D: DirHandle> State<D> {
     fn run(mut self, rx: Receiver<Msg<D::Writer>>) {
         loop {
-            let msg = match self.first_pending_at {
-                None => match rx.recv() {
-                    Ok(m) => m,
-                    Err(_) => return self.abandon(),
-                },
-                Some(first) => {
-                    let wait =
-                        (first + self.cfg.flush_interval).saturating_duration_since(Instant::now());
-                    match rx.recv_timeout(wait) {
-                        Ok(m) => m,
-                        Err(RecvTimeoutError::Timeout) => {
-                            self.flush();
-                            continue;
-                        }
-                        Err(RecvTimeoutError::Disconnected) => return self.abandon(),
-                    }
+            let deadline =
+                self.first_pending_at.and_then(|f| f.checked_add(self.cfg.flush_interval));
+            let received = match deadline {
+                None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+                Some(d) => rx.recv_timeout(d.saturating_duration_since(Instant::now())),
+            };
+            // std delivers queued messages before it reports a disconnect, so the flag, not the channel, says
+            // whether the run was abandoned.
+            if self.abandoned.load(Ordering::SeqCst) {
+                return self.abandon();
+            }
+            let msg = match received {
+                Ok(m) => m,
+                Err(RecvTimeoutError::Timeout) => {
+                    self.flush();
+                    continue;
                 }
+                Err(RecvTimeoutError::Disconnected) => return self.abandon(),
             };
             match msg {
                 Msg::FileBegin { begin, dup } => {
@@ -295,13 +330,13 @@ impl<D: DirHandle> State<D> {
                             let g = lock(&self.failure);
                             g.files.get(&file_id).cloned().or_else(|| g.wal.clone())
                         };
-                        let _ = ack.send(answer);
+                        let _ = ack.try_send(answer);
                     }
                 }
                 Msg::Drain(ack) => {
                     self.flush();
                     let snapshot = lock(&self.failure).clone();
-                    let _ = ack.send(snapshot);
+                    let _ = ack.try_send(snapshot);
                 }
                 Msg::Stop => {
                     self.flush();
@@ -311,7 +346,8 @@ impl<D: DirHandle> State<D> {
             }
             let timer_due = self
                 .first_pending_at
-                .is_some_and(|first| first.elapsed() >= self.cfg.flush_interval);
+                .and_then(|first| first.checked_add(self.cfg.flush_interval))
+                .is_some_and(|due| Instant::now() >= due);
             if self.pending_bytes >= self.cfg.flush_bytes || timer_due {
                 self.flush();
             }
@@ -348,9 +384,11 @@ impl<D: DirHandle> State<D> {
         self.first_pending_at = None;
     }
 
-    fn ensure_wal(&mut self) -> Result<(), FsError> {
+    /// Opens the segment if it is not open yet. Returns the `wal/` directory handle when THIS call created the
+    /// segment, so the caller can make its directory entries durable.
+    fn ensure_wal(&mut self) -> Result<Option<D>, FsError> {
         if self.wal.is_some() {
-            return Ok(());
+            return Ok(None);
         }
         let dir = match self.workspace.create_dir(OsStr::new(DIR_NAME)) {
             Ok(d) => d,
@@ -360,10 +398,14 @@ impl<D: DirHandle> State<D> {
             Err(e) => return Err(e),
         };
         self.wal = Some(dir.create_new(OsStr::new(SEGMENT_NAME))?);
-        Ok(())
+        Ok(Some(dir))
     }
 
     fn flush(&mut self) {
+        if self.abandoned.load(Ordering::SeqCst) {
+            // Abandoned while this flush was queued: begin nothing. An append already in flight is not stopped.
+            return self.abandon();
+        }
         if self.dead {
             self.pending.clear();
             self.pending_bytes = 0;
@@ -379,15 +421,17 @@ impl<D: DirHandle> State<D> {
 
         let mut order: Vec<&[u8]> = Vec::new();
         let mut seen: HashSet<&[u8]> = HashSet::new();
-        let mut oversized: HashSet<&[u8]> = HashSet::new();
+        let mut oversized: HashMap<&[u8], &'static str> = HashMap::new();
         for (id, body) in &pending {
             if seen.insert(id.as_slice()) {
                 order.push(id.as_slice());
             }
-            if let Body::Range(r) = body
-                && r.digests.len() > RANGE_DIGESTS_MAX
-            {
-                oversized.insert(id.as_slice());
+            if self.payload_len(body) > u64::from(MAX_PAYLOAD) {
+                let why = match body {
+                    Body::Range(_) => "range too large for one record",
+                    Body::FileBegin(_) => "record too large for one record",
+                };
+                oversized.entry(id.as_slice()).or_insert(why);
             }
         }
         // Files whose records this flush must not append, and why.
@@ -397,14 +441,10 @@ impl<D: DirHandle> State<D> {
                 // A file whose data sync already failed never gets a checkpoint later: a retried sync that
                 // succeeds proves nothing about the pages the failed one lost.
                 bad.insert(id.to_vec());
-            } else if oversized.contains(id) {
+            } else if let Some(why) = oversized.get(id) {
                 self.fail_file(
                     id,
-                    WalFault::new(
-                        Code::DestinationError,
-                        io::ErrorKind::InvalidInput,
-                        "range too large for one record",
-                    ),
+                    WalFault::new(Code::DestinationError, io::ErrorKind::InvalidInput, why),
                 );
                 bad.insert(id.to_vec());
             } else if self.cfg.durability == Durability::Strict {
@@ -428,10 +468,13 @@ impl<D: DirHandle> State<D> {
         if keep.is_empty() {
             return;
         }
-        if let Err(e) = self.ensure_wal() {
-            self.fail_wal(WalFault::from_error(&e));
-            return;
-        }
+        let created = match self.ensure_wal() {
+            Ok(created) => created,
+            Err(e) => {
+                self.fail_wal(WalFault::from_error(&e));
+                return;
+            }
+        };
         let mut buf = Vec::new();
         for (_, body) in keep {
             let header = Header {
@@ -447,11 +490,34 @@ impl<D: DirHandle> State<D> {
             self.fail_wal(WalFault::from_error(&FsError::from_io(e)));
             return;
         }
-        if self.cfg.durability == Durability::Strict
-            && let Err(e) = wal.sync_all()
-        {
-            self.fail_wal(WalFault::from_error(&e));
+        if self.cfg.durability == Durability::Strict {
+            let mut synced = wal.sync_all();
+            // The segment's own directory entries, after its data, so a Strict acknowledgement is true of the
+            // name as well as the bytes (plan 1 ruling 22). Only the flush that created the segment needs it.
+            if synced.is_ok()
+                && let Some(dir) = created
+            {
+                synced = dir.sync().and_then(|()| self.workspace.sync());
+            }
+            if let Err(e) = synced {
+                self.fail_wal(WalFault::from_error(&e));
+            }
         }
+    }
+
+    /// The payload length `encode` would give `body`, read from the encoded record (the length field sits after
+    /// `MAGIC(4) FORMAT_VERSION(2) CHECKSUM_VERSION(1) record_type(1) operation_id_len(2) operation_id
+    /// generation(8) sequence(8)`). A record over `MAX_PAYLOAD` would read back as `Corrupt`.
+    fn payload_len(&self, body: &Body) -> u64 {
+        let header = Header {
+            operation_id: self.operation_id.clone(),
+            generation: self.generation,
+            sequence: self.next_seq,
+        };
+        let bytes = encode(&header, body);
+        let at = 10 + self.operation_id.len() + 16;
+        let field: [u8; 4] = bytes[at..at + 4].try_into().expect("four length bytes");
+        u64::from(u32::from_le_bytes(field))
     }
 }
 
@@ -694,9 +760,9 @@ mod tests {
         s.send(Msg::Range(range(b"p", 0, 1)), beat).unwrap();
         let f = drain(&s, beat);
         assert_eq!(f.wal.as_ref().map(|w| w.code), Some(Code::DiskFull));
-        let dropped_at = pos(&fs.calls(), "drop_writer(/ws/p)");
-        let calls_before = fs.calls().len();
-        assert!(dropped_at < calls_before);
+        // The failure released the duplicate (and only it: the original `p` is still alive) before any later send.
+        let drops = fs.calls().iter().filter(|c| *c == "drop_writer(/ws/p)").count();
+        assert_eq!(drops, 1);
         // 100 more sends against a dead log: each returns. A transiently full channel is fine (the thread is
         // still receiving); a beat budget of 500 (about 5 s of waiting) means the thread stopped receiving.
         let waits = Cell::new(0u32);
@@ -857,6 +923,9 @@ mod tests {
         let err = open(again, OP.to_vec(), 1, cfg(BIG, HOUR, Durability::Normal)).err();
         assert!(matches!(err, Some(WalError::SequenceConflict { generation: 1, sequence: 1 })));
         assert_eq!(wal_bytes(&fs).unwrap(), before);
+        let calls = fs.calls();
+        assert!(!calls.iter().any(|c| c.starts_with("open_existing(")));
+        assert!(!calls.iter().any(|c| c.starts_with("truncate_to(")));
     }
 
     #[test]
@@ -1032,7 +1101,7 @@ mod tests {
         let beat: &Heartbeat = &|| Ok(());
         let (s, t) = start(dir, 1, cfg(BIG, HOUR, Durability::Normal));
         s.send(begin_msg(b"big", None), beat).unwrap();
-        s.send(Msg::Range(range(b"big", 0, 32_001)), beat).unwrap();
+        s.send(Msg::Range(range(b"big", 0, 32_769)), beat).unwrap();
         s.send(begin_msg(b"ok", None), beat).unwrap();
         s.send(Msg::Range(range(b"ok", 0, 1)), beat).unwrap();
         let f = drain(&s, beat);
@@ -1052,5 +1121,214 @@ mod tests {
         }
         s.send(Msg::Stop, beat).unwrap();
         t.join();
+    }
+
+    #[test]
+    fn a_range_just_under_the_payload_bound_is_accepted() {
+        let (fs, dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let (s, t) = start(dir, 1, cfg(BIG, HOUR, Durability::Normal));
+        s.send(begin_msg(b"p", None), beat).unwrap();
+        s.send(Msg::Range(range(b"p", 0, 32_000)), beat).unwrap();
+        assert!(drain(&s, beat).is_clean());
+        assert_eq!(records(&wal_bytes(&fs).unwrap()).len(), 2);
+        s.send(Msg::Stop, beat).unwrap();
+        t.join();
+    }
+
+    #[test]
+    fn a_long_file_id_makes_a_small_range_oversized() {
+        let (fs, dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let (s, t) = start(dir, 1, cfg(BIG, HOUR, Durability::Normal));
+        let long = vec![7u8; 1 << 20];
+        s.send(begin_msg(b"ok", None), beat).unwrap();
+        s.send(Msg::Range(range(&long, 0, 1)), beat).unwrap();
+        let f = drain(&s, beat);
+        let fault = &f.files[&long];
+        assert_eq!(fault.kind, io::ErrorKind::InvalidInput);
+        assert_eq!(fault.message, "range too large for one record");
+        assert_eq!(records(&wal_bytes(&fs).unwrap()).len(), 1);
+        s.send(Msg::Stop, beat).unwrap();
+        t.join();
+    }
+
+    #[test]
+    fn an_oversized_file_begin_is_refused() {
+        let (fs, dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let (s, t) = start(dir, 1, cfg(BIG, HOUR, Durability::Normal));
+        let mut big = begin(b"big");
+        big.destination = vec![b'd'; 1 << 20];
+        s.send(Msg::FileBegin { begin: big, dup: None }, beat).unwrap();
+        s.send(begin_msg(b"ok", None), beat).unwrap();
+        let f = drain(&s, beat);
+        assert_eq!(f.files[&b"big".to_vec()].message, "record too large for one record");
+        assert_eq!(records(&wal_bytes(&fs).unwrap()).len(), 1);
+        s.send(Msg::Stop, beat).unwrap();
+        t.join();
+    }
+
+    #[test]
+    fn a_dead_or_zero_capacity_ack_never_blocks_the_thread() {
+        let (_fs, dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let (s, t) = start(dir, 1, cfg(BIG, HOUR, Durability::Normal));
+        let (tx, rx) = mpsc::sync_channel(1);
+        drop(rx);
+        s.send(Msg::Close { file_id: b"p".to_vec(), ack: Some(tx) }, beat).unwrap();
+        let (tx, _rx) = mpsc::sync_channel(0);
+        s.send(Msg::Close { file_id: b"p".to_vec(), ack: Some(tx) }, beat).unwrap();
+        let (tx, _rx) = mpsc::sync_channel(0);
+        s.send(Msg::Drain(tx), beat).unwrap();
+        // The thread is still alive and answering.
+        assert!(drain(&s, beat).is_clean());
+        s.send(Msg::Stop, beat).unwrap();
+        t.join();
+    }
+
+    #[test]
+    fn a_later_strict_flush_syncs_the_duplicate_again() {
+        let (fs, dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let p = fs.create_new(Path::new("/ws/p")).unwrap();
+        let (s, t) = start(dir, 1, cfg(BIG, HOUR, Durability::Strict));
+        s.send(begin_msg(b"p", Some(p.duplicate().unwrap())), beat).unwrap();
+        s.send(Msg::Range(range(b"p", 0, 1)), beat).unwrap();
+        drain(&s, beat);
+        s.send(Msg::Range(range(b"p", 1, 2)), beat).unwrap();
+        drain(&s, beat);
+        assert_eq!(
+            syncs(&fs),
+            [
+                "sync_all(/ws/p)",
+                "sync_all(/ws/wal/000001)",
+                "sync_all(/ws/p)",
+                "sync_all(/ws/wal/000001)"
+            ]
+        );
+        assert_eq!(records(&wal_bytes(&fs).unwrap()).len(), 3);
+        s.send(Msg::Stop, beat).unwrap();
+        t.join();
+    }
+
+    #[test]
+    fn a_sender_dropped_mid_flush_begins_no_further_flush() {
+        let (fs, dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let p = fs.create_new(Path::new("/ws/p")).unwrap();
+        fs.delay("sync_all", Duration::from_millis(300));
+        let mut c = cfg(BIG, HOUR, Durability::Strict);
+        c.channel_cap = 2;
+        let (s, t) = start(dir, 1, c);
+        s.send(begin_msg(b"p", Some(p.duplicate().unwrap())), beat).unwrap();
+        s.send(Msg::Range(range(b"p", 0, 1)), beat).unwrap();
+        s.send(Msg::Flush, beat).unwrap();
+        // With a capacity of 2, the fifth send cannot return before the third message was taken, so the thread
+        // is inside the first flush (a 300 ms sync) when the sender goes.
+        s.send(Msg::Range(range(b"p", 1, 2)), beat).unwrap();
+        s.send(Msg::Flush, beat).unwrap();
+        drop(s);
+        t.join();
+        assert_eq!(records(&wal_bytes(&fs).unwrap()).len(), 2);
+        assert_eq!(syncs(&fs).iter().filter(|c| *c == "sync_all(/ws/p)").count(), 1);
+        drop(p);
+    }
+
+    #[test]
+    fn a_stopped_sender_that_is_then_dropped_is_not_abandoned() {
+        let (fs, dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let (s, t) = start(dir, 1, cfg(BIG, HOUR, Durability::Normal));
+        s.send(begin_msg(b"p", None), beat).unwrap();
+        s.send(Msg::Stop, beat).unwrap();
+        drop(s);
+        t.join();
+        assert_eq!(records(&wal_bytes(&fs).unwrap()).len(), 1);
+    }
+
+    fn dir_syncs(fs: &FaultFs) -> Vec<String> {
+        fs.calls().into_iter().filter(|c| c.starts_with("sync_dir(")).collect()
+    }
+
+    #[test]
+    fn strict_makes_the_new_segment_entries_durable_after_the_segment_itself() {
+        let (fs, dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let p = fs.create_new(Path::new("/ws/p")).unwrap();
+        let (s, t) = start(dir, 1, cfg(BIG, HOUR, Durability::Strict));
+        s.send(begin_msg(b"p", Some(p.duplicate().unwrap())), beat).unwrap();
+        drain(&s, beat);
+        let calls = fs.calls();
+        let seg = pos(&calls, "sync_all(/ws/wal/000001)");
+        assert!(pos(&calls, "sync_dir(/ws/wal)") > seg);
+        assert!(pos(&calls, "sync_dir(/ws)") > seg);
+        // A second flush into the same segment needs no directory sync.
+        s.send(Msg::Range(range(b"p", 0, 1)), beat).unwrap();
+        drain(&s, beat);
+        assert_eq!(dir_syncs(&fs).len(), 2);
+        s.send(Msg::Stop, beat).unwrap();
+        t.join();
+    }
+
+    #[test]
+    fn normal_makes_no_directory_sync() {
+        let (fs, dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let (s, t) = start(dir, 1, cfg(BIG, HOUR, Durability::Normal));
+        s.send(begin_msg(b"p", None), beat).unwrap();
+        drain(&s, beat);
+        assert!(dir_syncs(&fs).is_empty());
+        assert!(syncs(&fs).is_empty());
+        s.send(Msg::Stop, beat).unwrap();
+        t.join();
+    }
+
+    #[test]
+    fn a_reopened_segment_issues_no_directory_sync() {
+        let (fs, dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let p = fs.create_new(Path::new("/ws/p")).unwrap();
+        let c = cfg(BIG, HOUR, Durability::Strict);
+        let (s, t) = start(dir, 1, c);
+        s.send(begin_msg(b"p", Some(p.duplicate().unwrap())), beat).unwrap();
+        s.send(Msg::Stop, beat).unwrap();
+        t.join();
+        let before = dir_syncs(&fs).len();
+        assert_eq!(before, 2);
+        let again = fs.destination_root(Path::new("/ws")).unwrap();
+        let (s, t, _) = open(again, OP.to_vec(), 1, c).expect("reopen");
+        s.send(begin_msg(b"p", Some(p.duplicate().unwrap())), beat).unwrap();
+        s.send(Msg::Stop, beat).unwrap();
+        t.join();
+        assert_eq!(records(&wal_bytes(&fs).unwrap()).len(), 2);
+        assert_eq!(dir_syncs(&fs).len(), before);
+    }
+
+    #[test]
+    fn a_failed_directory_sync_is_a_wal_failure() {
+        let (fs, dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let p = fs.create_new(Path::new("/ws/p")).unwrap();
+        fs.fail("sync_dir", Code::IoError);
+        let (s, t) = start(dir, 1, cfg(BIG, HOUR, Durability::Strict));
+        s.send(begin_msg(b"p", Some(p.duplicate().unwrap())), beat).unwrap();
+        let f = drain(&s, beat);
+        assert_eq!(f.wal.as_ref().map(|w| w.code), Some(Code::IoError));
+        s.send(Msg::Stop, beat).unwrap();
+        t.join();
+    }
+
+    #[test]
+    fn the_wal_defaults_are_pinned() {
+        let d = WalConfig::DEFAULT;
+        assert_eq!(d.flush_interval, Duration::from_secs(1));
+        assert_eq!(d.flush_bytes, 64 << 20);
+        assert_eq!(d.channel_cap, 64);
+        assert_eq!(d.durability, Durability::Normal);
+        assert_eq!(CHANNEL_CAP, 64);
+        assert_eq!(SEND_RETRY, Duration::from_millis(10));
+        assert_eq!(DIR_NAME, "wal");
+        assert_eq!(SEGMENT_NAME, "000001");
     }
 }
