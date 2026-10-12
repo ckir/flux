@@ -1394,6 +1394,79 @@ mod tests {
     }
 
     #[test]
+    fn a_checkpointing_run_sweeps_after_the_claim_behind_its_own_guard() {
+        for (len, label) in [(512 * 1024, "small"), (3 * MIB, "large")] {
+            let (fs, root) = ckpt_fs(len);
+            fs.write_file(PARTIAL, b"leftover");
+            let run = ckpt_run(&fs, ckpt_policy(Durability::Normal, 64, 1 << 50));
+            // Each label records how many fake calls had happened when it fired, so the merge below is exact.
+            let marks = std::cell::RefCell::new(Vec::<(usize, &'static str)>::new());
+            let mark = |l: &'static str| marks.borrow_mut().push((fs.calls().len(), l));
+            let guard = || {
+                mark("guard");
+                Ok(())
+            };
+            let beat = || {
+                mark("beat");
+                Ok(())
+            };
+            let claim = || {
+                mark("claim");
+                Ok(())
+            };
+            let fc = FileCkpt { run: &run, file_id: b"f".to_vec(), destination: b"dst".to_vec() };
+            let staged = stage_file(
+                &fs,
+                Path::new("/src"),
+                &root,
+                OsStr::new("dst"),
+                &opts(),
+                &guard,
+                &beat,
+                &claim,
+                SyncAt::Staging,
+                Some(&fc),
+            );
+            assert!(matches!(staged, Ok(Stage::Staged(_))), "{label}");
+            run.abandon();
+            let calls = fs.calls();
+            let mut order: Vec<String> = Vec::new();
+            for (i, c) in calls.iter().enumerate() {
+                for (at, l) in marks.borrow().iter() {
+                    if *at == i {
+                        order.push((*l).to_string());
+                    }
+                }
+                order.push(c.clone());
+            }
+            for (at, l) in marks.borrow().iter() {
+                if *at >= calls.len() {
+                    order.push((*l).to_string());
+                }
+            }
+            let removes: Vec<usize> = order
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.starts_with(&format!("remove_file({PARTIAL})")))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(removes.len(), 1, "{label}: exactly one sweep: {order:?}");
+            let remove = removes[0];
+            let claim_at = order.iter().position(|c| c == "claim").expect("claimed");
+            let create = order
+                .iter()
+                .position(|c| c.starts_with(&format!("create_new({PARTIAL})")))
+                .expect("created");
+            assert!(remove > claim_at, "{label}: the sweep follows the claim: {order:?}");
+            assert_eq!(order[remove - 1], "guard", "{label}: its own guard: {order:?}");
+            assert!(create > remove, "{label}: the create follows the sweep: {order:?}");
+            // Step 1 keeps its guard but sweeps nothing: no removal follows the first guard directly.
+            let first_guard = order.iter().position(|c| c == "guard").expect("guarded");
+            assert!(!order[first_guard + 1].starts_with("remove_file("), "{label}: {order:?}");
+        }
+    }
+
+    #[test]
     fn staging_at_the_barrier_keeps_the_writer_open_and_does_not_sync() {
         let fs = FaultFs::new();
         fs.write_file("/src", b"hello");
