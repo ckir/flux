@@ -3,10 +3,12 @@
 //!
 //! Design authority: `docs/superpowers/specs/2026-09-26-cut-4b-copy-tree-design.md`.
 
+use crate::checkpoint::{Checkpoints, FileCkpt};
 use crate::copy::{
     BeforeCreate, BeforePublish, CopyError, CopyStep, Guard, Heartbeat, PublishIntent, Stage,
-    Staged, SyncAt, copy_file_guarded, discard, no_before_create, no_before_publish, no_heartbeat,
-    publish_staged, split_destination, stage_file, sync_staged_many, unguarded, weaker,
+    Staged, SyncAt, copy_file_checkpointed, copy_file_guarded, discard, no_before_create,
+    no_before_publish, no_heartbeat, publish_staged, split_destination, stage_file,
+    sync_staged_many, unguarded, weaker,
 };
 use crate::names::{NameIndex, Resolved};
 use crate::state::{FLUX_DIR, RESERVED_DIRS, identity_text, native_hex};
@@ -337,6 +339,9 @@ pub(crate) struct Shared<'c, F: DestinationRoot> {
     pub(crate) resume: bool,
     /// Cut 9d: when a Strict tree's per-directory batch flushes.
     pub(crate) batch: BatchPolicy,
+    /// Cut 9f-1: the run's checkpoint log; `None` for a copy that does not checkpoint (every production run until the
+    /// run wires one).
+    pub(crate) ckpt: Option<&'c Checkpoints<F::Dir>>,
 }
 
 /// Cut 9d (spec decision 5): a batch flushes at this many staged files...
@@ -499,6 +504,7 @@ fn run_tree<F: DestinationRoot>(
         claims: None,
         resume: false,
         batch: BatchPolicy::DEFAULT,
+        ckpt: None,
     };
     copy_tree_at(&cx, source.events, root, false, out, on_report).1
 }
@@ -1152,6 +1158,15 @@ fn copy_one<F: DestinationRoot>(
     };
 
     let own = |status| ClaimRecord { target: target.clone(), status };
+    // Cut 9f-1: the file's checkpoint identity is the claim key of the TARGET name (never the stored name of a
+    // replacement), built only for a run that checkpoints.
+    let file_ckpt = |key: &ClaimKey| {
+        cx.ckpt.map(|run| FileCkpt {
+            run,
+            file_id: key.encode(),
+            destination: path.as_os_str().as_encoded_bytes().to_vec(),
+        })
+    };
     // Cut 9c: a Strict publication into a store with the `prepared` table writes a note before its rename (the hook),
     // commits it with the claim after it, and discards it when the copy fails after the note. Otherwise: cut 9a.
     let strict = cx.opts.durability == Durability::Strict && claims.borrow().supports_prepared();
@@ -1160,6 +1175,7 @@ fn copy_one<F: DestinationRoot>(
         // 3. Plan as new.
         Plan::New => {
             let key = ClaimKey::new(parent_id, name);
+            let fc = file_ckpt(&key);
             let template = PreparedRecord {
                 target: target.clone(),
                 temp_name: Vec::new(),
@@ -1183,7 +1199,17 @@ fn copy_one<F: DestinationRoot>(
                 let publish = Publish::NoReplace;
                 let no_claim: &BeforeCreate<'_> = &no_before_create;
                 return stage_into_batch(
-                    cx, parent, names, batch, &src, path, publish, no_claim, out, on_report,
+                    cx,
+                    parent,
+                    names,
+                    batch,
+                    &src,
+                    path,
+                    publish,
+                    no_claim,
+                    fc.as_ref(),
+                    out,
+                    on_report,
                     pending,
                 );
             }
@@ -1195,7 +1221,7 @@ fn copy_one<F: DestinationRoot>(
                 publish: Publish::NoReplace,
                 ..cx.opts.clone()
             };
-            let result = copy_file_guarded(
+            let result = copy_file_checkpointed(
                 cx.fs,
                 &src,
                 parent,
@@ -1205,6 +1231,7 @@ fn copy_one<F: DestinationRoot>(
                 cx.beat,
                 &no_before_create,
                 before_publish,
+                fc.as_ref(),
             );
             discard_note_on_failure(claims, &key, &wrote, &result);
             let published = match &result {
@@ -1228,6 +1255,7 @@ fn copy_one<F: DestinationRoot>(
         // 5. Replace, under a claim on the stored name made after the gate and the section 99 checks.
         Plan::Replace { stored, meta } => {
             let key_stored = ClaimKey::new(parent_id, &stored);
+            let fc = file_ckpt(&ClaimKey::new(parent_id, name));
             let before_create = || -> std::result::Result<(), CopyError> {
                 let claimed =
                     claims.borrow_mut().insert_if_absent(&key_stored, &own(ClaimStatus::Existing));
@@ -1281,6 +1309,7 @@ fn copy_one<F: DestinationRoot>(
                     path,
                     Publish::Replace,
                     &before_create,
+                    fc.as_ref(),
                     out,
                     on_report,
                     pending,
@@ -1295,7 +1324,7 @@ fn copy_one<F: DestinationRoot>(
                 publish: Publish::Replace,
                 ..cx.opts.clone()
             };
-            let result = copy_file_guarded(
+            let result = copy_file_checkpointed(
                 cx.fs,
                 &src,
                 parent,
@@ -1305,6 +1334,7 @@ fn copy_one<F: DestinationRoot>(
                 cx.beat,
                 &before_create,
                 before_publish,
+                fc.as_ref(),
             );
             discard_note_on_failure(claims, &key_stored, &wrote, &result);
             let published = match &result {
@@ -1359,6 +1389,7 @@ fn stage_into_batch<F: DestinationRoot>(
     path: PathBuf,
     publish: Publish,
     before_create: &BeforeCreate<'_>,
+    fc: Option<&FileCkpt<'_, F::Dir>>,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
     pending: impl FnOnce(PathBuf, Staged<F::Writer>) -> Pending<F::Writer>,
@@ -1405,6 +1436,7 @@ fn stage_into_batch<F: DestinationRoot>(
             } else {
                 SyncAt::Staging
             },
+            fc,
         )
     };
     let staged = match stage() {
@@ -3064,6 +3096,7 @@ mod tests {
             claims: None,
             resume: false,
             batch: BatchPolicy { age: NO_AGE, ..BatchPolicy::DEFAULT },
+            ckpt: None,
         };
         let mut out = TreeOutcome::default();
         let (_root, r) = copy_tree_at(&cx, source.events, root, false, &mut out, &mut |_| {});
@@ -3153,6 +3186,7 @@ mod tests {
             claims: None,
             resume: false,
             batch: BatchPolicy { age: NO_AGE, ..BatchPolicy::DEFAULT },
+            ckpt: None,
         };
         let mut out = TreeOutcome::default();
         let mut reported = 0;
@@ -3191,6 +3225,7 @@ mod tests {
             claims: None,
             resume: false,
             batch: BatchPolicy { age: NO_AGE, ..BatchPolicy::DEFAULT },
+            ckpt: None,
         };
         let mut out = TreeOutcome::default();
         let mut reported = 0;
@@ -3219,6 +3254,7 @@ mod tests {
             claims: None,
             resume: false,
             batch: BatchPolicy { age: NO_AGE, ..BatchPolicy::DEFAULT },
+            ckpt: None,
         };
         let mut out = TreeOutcome::default();
         let (back, r) = copy_tree_at(&cx, source.events, root, false, &mut out, &mut |_| {});
@@ -3319,6 +3355,7 @@ mod tests {
             claims: Some(&claims),
             resume: false,
             batch: policy,
+            ckpt: None,
         };
         let mut out = TreeOutcome::default();
         let mut got = Vec::new();

@@ -299,6 +299,7 @@ pub fn tree<F: DestinationRoot>(
             claims: claims.as_ref(),
             resume: cfg.resume,
             batch: batch_policy(cfg),
+            ckpt: None,
         };
         let root = place.dest.take().expect("step 5 made DEST");
         let mut report = |f: TreeFailure| {

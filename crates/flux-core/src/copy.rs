@@ -1,5 +1,6 @@
 //! Single-file copy. The algorithm lives here once; platforms supply primitives.
 
+use crate::checkpoint::{FileCkpt, FileSink};
 use flux_fs::{
     Code, CopyOptions, DestinationRoot, DirHandle, Durability, FileHandle, FileIdentity, FileType,
     FsError, Metadata, MetadataFailure, MetadataItem, OperationId, Outcome, Preserve, Publish,
@@ -476,6 +477,44 @@ pub(crate) struct Staged<W> {
     /// caller owes, once per batch, and closes after the barrier); `None` at `SyncAt::Staging`, which has already synced
     /// the writer and dropped it on return.
     pub writer: Option<W>,
+    /// Cut 9f-1: bytes proven by a validated prefix and not re-copied (0 for a fresh copy).
+    #[allow(dead_code)] // read by the resume path (cut 9f-1 plan 2, a later task)
+    pub reused: u64,
+    /// Cut 9f-1: how a resumed partial's prefix was decided; `None` for a fresh copy.
+    #[allow(dead_code)] // read by the resume path (cut 9f-1 plan 2, a later task)
+    pub discard: Option<crate::checkpoint::Discard>,
+}
+
+/// What ends the streaming step early: remove the partial (`Discard`) or keep it (`Keep`, a WAL failure).
+enum StreamFail {
+    Discard(CopyStep, Code, std::io::Error),
+    Keep(CopyError),
+}
+
+fn sink_fail(e: crate::checkpoint::SinkError, name: &OsStr) -> StreamFail {
+    use crate::checkpoint::SinkError;
+    match e {
+        SinkError::Heartbeat(e) => StreamFail::Discard(CopyStep::Heartbeat, e.code, e.source),
+        SinkError::Data(f) => StreamFail::Discard(
+            CopyStep::Durability,
+            Code::StrictDurabilityUnavailable,
+            std::io::Error::new(f.kind, f.message),
+        ),
+        SinkError::Wal(f) => {
+            let name = name.to_string_lossy();
+            StreamFail::Keep(CopyError {
+                cause: FsError::new(
+                    Code::WalWriteFailed,
+                    std::io::Error::other(format!(
+                        "checkpoints for {name} could not be written ({}); resume state is NOT trustworthy for this file",
+                        f.message
+                    )),
+                ),
+                leftover: None,
+                step: CopyStep::Checkpoint,
+            })
+        }
+    }
 }
 
 /// Cut 9e: where `stage_file` pays a Strict file's data `fsync`.
@@ -509,6 +548,7 @@ pub(crate) fn stage_file<F: DestinationRoot>(
     beat: &Heartbeat<'_>,
     before_create: &BeforeCreate<'_>,
     sync: SyncAt,
+    ckpt: Option<&FileCkpt<'_, F::Dir>>,
 ) -> std::result::Result<Stage<F::Writer>, CopyError> {
     let temp = temp_name(name, &opts.operation_id);
 
@@ -518,7 +558,10 @@ pub(crate) fn stage_file<F: DestinationRoot>(
     //    "deterministic enough for discovery", and a derivable id makes this live.
     beat().map_err(|e| CopyError::at(CopyStep::Heartbeat, e))?;
     guard().map_err(|e| CopyError::at(CopyStep::Create, e))?;
-    let _ = parent.remove_file(&temp);
+    // Cut 9f-1: a checkpointing run sweeps after the claim instead (below), where it gets its own guard.
+    if ckpt.is_none() {
+        let _ = parent.remove_file(&temp);
+    }
 
     // 2. source, captured for the step-7 re-check
     // Safe to `?`: nothing has been created yet, so there is nothing to leak.
@@ -568,26 +611,79 @@ pub(crate) fn stage_file<F: DestinationRoot>(
     guard().map_err(|e| CopyError::at(CopyStep::Create, e))?;
     // Cut 8b: the claim, after the gate and the section 99 check, before the temporary exists.
     before_create()?;
+    // Cut 9f-1: the sweep of a checkpointing run, after the claim; a removal is a destination mutation, so it has its
+    // own section 99 check.
+    if ckpt.is_some() {
+        guard().map_err(|e| CopyError::at(CopyStep::Create, e))?;
+        let _ = parent.remove_file(&temp);
+    }
     let mut writer = parent.create_new(&temp).map_err(|e| CopyError::at(CopyStep::Create, e))?;
 
-    // 4. stream
+    // 4. stream. The sink (checkpointed files only) is declared before the funnel so the one `abort` below covers
+    //    every exit between its `begin` and the end of the loop.
     let mut bytes_copied = 0u64;
     let mut buf = vec![0u8; copy_buffer_len(src_meta.len)];
-    loop {
-        let n = match std::io::Read::read(&mut reader, &mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) => {
-                return Err(discard(parent, &temp, CopyStep::Stream, copy_code(&e), e, guard));
+    let mut sink: Option<FileSink<'_, F::Dir>> = None;
+    let streamed: std::result::Result<(), StreamFail> = 'stream: {
+        if let Some(fc) = ckpt.filter(|c| src_meta.len >= c.run.min_len()) {
+            let dup = if fc.run.durability() == Durability::Strict {
+                match writer.duplicate() {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        break 'stream Err(StreamFail::Discard(
+                            CopyStep::Durability,
+                            Code::StrictDurabilityUnavailable,
+                            e.source,
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+            match FileSink::begin(fc, &src_meta, 0, dup, beat) {
+                Ok(s) => sink = Some(s),
+                Err(e) => break 'stream Err(sink_fail(e, name)),
             }
-        };
-        if let Err(e) = writer.write_all(&buf[..n]) {
-            return Err(discard(parent, &temp, CopyStep::Stream, copy_code(&e), e, guard));
         }
-        bytes_copied += n as u64;
-        // §101 (cut 7b): the heartbeat, once per chunk (at most COPY_BUF_MAX bytes).
-        if let Err(e) = beat() {
-            return Err(discard(parent, &temp, CopyStep::Heartbeat, e.code, e.source, guard));
+        loop {
+            let n = match std::io::Read::read(&mut reader, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    break 'stream Err(StreamFail::Discard(CopyStep::Stream, copy_code(&e), e));
+                }
+            };
+            if let Err(e) = writer.write_all(&buf[..n]) {
+                break 'stream Err(StreamFail::Discard(CopyStep::Stream, copy_code(&e), e));
+            }
+            bytes_copied += n as u64;
+            if let Some(s) = sink.as_mut()
+                && let Err(e) = s.wrote(&buf[..n], beat)
+            {
+                break 'stream Err(sink_fail(e, name));
+            }
+            // §101 (cut 7b): the heartbeat, once per chunk (at most COPY_BUF_MAX bytes).
+            if let Err(e) = beat() {
+                break 'stream Err(StreamFail::Discard(CopyStep::Heartbeat, e.code, e.source));
+            }
+        }
+        if let Some(s) = sink.as_mut()
+            && let Err(e) = s.complete(beat)
+        {
+            break 'stream Err(sink_fail(e, name));
+        }
+        Ok(())
+    };
+    if streamed.is_err()
+        && let Some(s) = sink.as_mut()
+    {
+        s.abort(beat);
+    }
+    match streamed {
+        Ok(()) => {}
+        Err(StreamFail::Keep(e)) => return Err(e),
+        Err(StreamFail::Discard(step, code, source)) => {
+            return Err(discard(parent, &temp, step, code, source, guard));
         }
     }
 
@@ -684,6 +780,8 @@ pub(crate) fn stage_file<F: DestinationRoot>(
         metadata_failures,
         identity_degraded,
         writer,
+        reused: 0,
+        discard: None,
     }))
 }
 
@@ -728,12 +826,50 @@ pub fn copy_file_guarded<F: DestinationRoot>(
     before_create: &BeforeCreate<'_>,
     before_publish: &BeforePublish<'_>,
 ) -> std::result::Result<Outcome, CopyError> {
-    let staged =
-        match stage_file(fs, src, parent, name, opts, guard, beat, before_create, SyncAt::Staging)?
-        {
-            Stage::Skipped(outcome) => return Ok(outcome),
-            Stage::Staged(staged) => staged,
-        };
+    copy_file_checkpointed(
+        fs,
+        src,
+        parent,
+        name,
+        opts,
+        guard,
+        beat,
+        before_create,
+        before_publish,
+        None,
+    )
+}
+
+/// `copy_file_guarded` plus cut 9f-1's checkpoint hook (`ckpt`, `None` for an uncheckpointed copy, which is then
+/// exactly `copy_file_guarded`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn copy_file_checkpointed<F: DestinationRoot>(
+    fs: &F,
+    src: &Path,
+    parent: &F::Dir,
+    name: &OsStr,
+    opts: &CopyOptions,
+    guard: &Guard<'_>,
+    beat: &Heartbeat<'_>,
+    before_create: &BeforeCreate<'_>,
+    before_publish: &BeforePublish<'_>,
+    ckpt: Option<&FileCkpt<'_, F::Dir>>,
+) -> std::result::Result<Outcome, CopyError> {
+    let staged = match stage_file(
+        fs,
+        src,
+        parent,
+        name,
+        opts,
+        guard,
+        beat,
+        before_create,
+        SyncAt::Staging,
+        ckpt,
+    )? {
+        Stage::Skipped(outcome) => return Ok(outcome),
+        Stage::Staged(staged) => staged,
+    };
     // Cut 9c: the hook sees the temporary and its identity before the final heartbeat and guard. Its error is returned
     // as is, after the temporary is discarded like any other pre-rename failure.
     let intent = PublishIntent { temp: staged.temp.clone(), identity: staged.identity };
@@ -767,6 +903,8 @@ pub(crate) fn publish_staged<D: DirHandle>(
         metadata_failures,
         identity_degraded,
         writer,
+        reused: _,
+        discard: _,
     } = staged;
     // Cut 9e: a file published at the barrier was synced there; either way no descriptor is held across the rename.
     drop(writer);
@@ -975,10 +1113,283 @@ mod tests {
             &no_heartbeat,
             &no_before_create,
             sync,
+            None,
         ) {
             Ok(Stage::Staged(s)) => s,
             Ok(Stage::Skipped(_)) => panic!("unexpectedly skipped"),
             Err(e) => panic!("stage_file failed: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn an_uncheckpointed_copy_is_byte_for_byte_unchanged() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        let root = fs.destination_root(Path::new("/")).unwrap();
+        let mut o = opts();
+        o.durability = Durability::Strict;
+        let staged = stage_with(&fs, &root, &o, SyncAt::Staging);
+        assert_eq!(staged.bytes_copied, 5);
+        assert_eq!(fs.read_file("/dst.flux-partial.op1").as_deref(), Some(&b"hello"[..]));
+        // Captured from the code BEFORE cut 9f-1 plan 2 task 6 touched `stage_file`.
+        let golden = [
+            "remove_file(/dst.flux-partial.op1)",
+            "metadata(/src)",
+            "metadata(/dst)",
+            "open_read(/src)",
+            "create_new(/dst.flux-partial.op1)",
+            "set_times(/dst.flux-partial.op1)",
+            "set_permissions(/dst.flux-partial.op1)",
+            "sync_all(/dst.flux-partial.op1)",
+            "metadata(/src)",
+            "drop_writer(/dst.flux-partial.op1)",
+        ];
+        assert_eq!(fs.calls(), golden);
+    }
+
+    // ---- cut 9f-1 plan 2, task 6: a fresh copy checkpoints through `ckpt` ----
+
+    use crate::checkpoint::{CheckpointPolicy, Checkpoints};
+    use crate::fault_fs::FakeDirHandle;
+    use crate::wal::record::{Body, Decoded, decode_next};
+    use crate::wal::writer::WalConfig;
+    use std::sync::atomic::AtomicBool;
+
+    const MIB: usize = 1 << 20;
+    const WAL_PATH: &str = "/ws/wal/000001";
+    const PARTIAL: &str = "/dst.flux-partial.op1";
+
+    fn ckpt_policy(
+        durability: Durability,
+        channel_cap: usize,
+        flush_bytes: u64,
+    ) -> CheckpointPolicy {
+        CheckpointPolicy {
+            min_len: 1 << 20,
+            range_chunks: 4,
+            wal: WalConfig {
+                flush_interval: Duration::from_secs(3600),
+                flush_bytes,
+                channel_cap,
+                durability,
+            },
+        }
+    }
+
+    fn ckpt_fs(len: usize) -> (FaultFs, <FaultFs as DestinationRoot>::Dir) {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/ws")).unwrap();
+        let src: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        fs.write_file("/src", &src);
+        let root = fs.destination_root(Path::new("/")).unwrap();
+        (fs, root)
+    }
+
+    fn ckpt_run(fs: &FaultFs, policy: CheckpointPolicy) -> Checkpoints<FakeDirHandle> {
+        let a = fs.destination_root(Path::new("/ws")).unwrap();
+        let b = fs.destination_root(Path::new("/ws")).unwrap();
+        Checkpoints::open(a, b, "op", 1, policy).unwrap_or_else(|e| panic!("open: {e:?}"))
+    }
+
+    fn stage_ckpt(
+        fs: &FaultFs,
+        root: &<FaultFs as DestinationRoot>::Dir,
+        run: &Checkpoints<FakeDirHandle>,
+        durability: Durability,
+        beat: &Heartbeat<'_>,
+    ) -> std::result::Result<Stage<<FaultFs as FileSystem>::Writer>, CopyError> {
+        let mut o = opts();
+        o.durability = durability;
+        let fc = FileCkpt { run, file_id: b"f".to_vec(), destination: b"dst".to_vec() };
+        stage_file(
+            fs,
+            Path::new("/src"),
+            root,
+            OsStr::new("dst"),
+            &o,
+            &unguarded,
+            beat,
+            &no_before_create,
+            SyncAt::Staging,
+            Some(&fc),
+        )
+    }
+
+    fn wal_bodies(fs: &FaultFs) -> Vec<Body> {
+        let bytes = fs.read_file(WAL_PATH).expect("the segment exists");
+        let mut out = Vec::new();
+        let mut at = 0;
+        loop {
+            match decode_next(&bytes[at..]) {
+                Decoded::Record { body, len, .. } => {
+                    out.push(body);
+                    at += len;
+                }
+                Decoded::End => return out,
+                other => panic!("unexpected {other:?} at {at}"),
+            }
+        }
+    }
+
+    fn count(fs: &FaultFs, prefix: &str) -> usize {
+        fs.calls().iter().filter(|c| c.starts_with(prefix)).count()
+    }
+
+    #[test]
+    fn a_large_file_writes_a_filebegin_and_ranges_that_cover_it() {
+        let (fs, root) = ckpt_fs(5 * MIB);
+        let run = ckpt_run(&fs, ckpt_policy(Durability::Normal, 64, 1 << 50));
+        let Ok(Stage::Staged(staged)) =
+            stage_ckpt(&fs, &root, &run, Durability::Normal, &no_heartbeat)
+        else {
+            panic!("expected a staged file");
+        };
+        assert_eq!(staged.bytes_copied, 5 * MIB as u64);
+        assert_eq!((staged.reused, staged.discard.is_none()), (0, true));
+        assert!(run.finish(&no_heartbeat).is_clean());
+        let bodies = wal_bodies(&fs);
+        let begins: Vec<_> = bodies
+            .iter()
+            .filter_map(|b| if let Body::FileBegin(b) = b { Some(b) } else { None })
+            .collect();
+        assert_eq!(begins.len(), 1);
+        assert_eq!(begins[0].valid_through, 0);
+        assert_eq!(begins[0].source_len, 5 * MIB as u64);
+        let ranges: Vec<_> = bodies
+            .iter()
+            .filter_map(|b| if let Body::Range(r) = b { Some(r) } else { None })
+            .collect();
+        let src = fs.read_file("/src").unwrap();
+        let want: Vec<[u8; 32]> = src.chunks(MIB).map(|c| *blake3::hash(c).as_bytes()).collect();
+        let got: Vec<[u8; 32]> = ranges.iter().flat_map(|r| r.digests.clone()).collect();
+        assert_eq!(got, want);
+        assert_eq!(ranges.first().map(|r| r.range_start), Some(0));
+        assert_eq!(ranges.last().map(|r| r.range_end), Some(5 * MIB as u64));
+        assert!(ranges.windows(2).all(|w| w[0].range_end == w[1].range_start));
+    }
+
+    #[test]
+    fn a_file_below_min_len_writes_no_wal_at_all() {
+        let (fs, root) = ckpt_fs(512 * 1024);
+        let run = ckpt_run(&fs, ckpt_policy(Durability::Strict, 64, 1 << 50));
+        let Ok(Stage::Staged(_)) = stage_ckpt(&fs, &root, &run, Durability::Strict, &no_heartbeat)
+        else {
+            panic!("expected a staged file");
+        };
+        assert!(run.finish(&no_heartbeat).is_clean());
+        assert!(!fs.called("create_dir(/ws/wal"), "{:?}", fs.calls());
+        assert!(fs.read_file(WAL_PATH).is_none());
+        assert!(!fs.called("duplicate("), "{:?}", fs.calls());
+    }
+
+    #[test]
+    fn normal_registers_no_duplicate_and_strict_registers_one() {
+        let (fs, root) = ckpt_fs(3 * MIB);
+        let run = ckpt_run(&fs, ckpt_policy(Durability::Normal, 64, 1 << 50));
+        assert!(stage_ckpt(&fs, &root, &run, Durability::Normal, &no_heartbeat).is_ok());
+        assert!(run.finish(&no_heartbeat).is_clean());
+        assert!(!fs.called("duplicate("), "{:?}", fs.calls());
+
+        let (fs, root) = ckpt_fs(3 * MIB);
+        let run = ckpt_run(&fs, ckpt_policy(Durability::Strict, 64, 1 << 50));
+        assert!(stage_ckpt(&fs, &root, &run, Durability::Strict, &no_heartbeat).is_ok());
+        assert!(run.finish(&no_heartbeat).is_clean());
+        assert_eq!(count(&fs, "duplicate("), 1, "{:?}", fs.calls());
+    }
+
+    #[test]
+    fn an_aborted_file_closes_its_duplicate() {
+        let (fs, root) = ckpt_fs(3 * MIB);
+        let run = ckpt_run(&fs, ckpt_policy(Durability::Strict, 64, 1 << 50));
+        fs.fail_write(std::io::Error::other("the device hiccupped"));
+        let e = match stage_ckpt(&fs, &root, &run, Durability::Strict, &no_heartbeat) {
+            Err(e) => e,
+            Ok(_) => panic!("the write fault must stop the copy"),
+        };
+        assert_eq!(e.step, CopyStep::Stream);
+        run.abandon();
+        // The partial's own writer and its one duplicate: every writer opened on the path is closed again.
+        assert_eq!(count(&fs, &format!("duplicate({PARTIAL})")), 1, "{:?}", fs.calls());
+        assert_eq!(count(&fs, &format!("drop_writer({PARTIAL})")), 2, "{:?}", fs.calls());
+    }
+
+    #[test]
+    fn a_wal_failure_keeps_the_partial_and_stops() {
+        let (fs, root) = ckpt_fs(3 * MIB);
+        let run = ckpt_run(&fs, ckpt_policy(Durability::Strict, 64, 1 << 50));
+        // The partial is create #1 and the WAL segment create #2.
+        fs.fail_nth("create_new", 2, Code::DiskFull, std::io::ErrorKind::Other);
+        let e = match stage_ckpt(&fs, &root, &run, Durability::Strict, &no_heartbeat) {
+            Err(e) => e,
+            Ok(_) => panic!("the WAL fault must stop the copy"),
+        };
+        assert_eq!(e.step, CopyStep::Checkpoint);
+        assert_eq!(e.cause.code, Code::WalWriteFailed);
+        assert!(e.leftover.is_none());
+        assert!(e.cause.source.to_string().contains("dst"), "{}", e.cause.source);
+        assert!(fs.exists(PARTIAL), "the partial is KEPT: {:?}", fs.calls());
+        run.abandon();
+    }
+
+    #[test]
+    fn a_data_sync_failure_discards_the_partial_like_todays_strict_failure() {
+        let (fs, root) = ckpt_fs(3 * MIB);
+        let run = ckpt_run(&fs, ckpt_policy(Durability::Strict, 64, 1 << 50));
+        // The first sync is the duplicate's, at the file's Close.
+        fs.fail("sync_all", Code::StrictDurabilityUnavailable);
+        let e = match stage_ckpt(&fs, &root, &run, Durability::Strict, &no_heartbeat) {
+            Err(e) => e,
+            Ok(_) => panic!("the data sync fault must stop the copy"),
+        };
+        assert_eq!(e.step, CopyStep::Durability);
+        assert_eq!(e.cause.code, Code::StrictDurabilityUnavailable);
+        assert!(!fs.exists(PARTIAL), "the partial is removed: {:?}", fs.calls());
+        run.abandon();
+    }
+
+    #[test]
+    fn a_full_channel_keeps_the_heartbeat_beating_and_a_heartbeat_failure_stops_the_copy() {
+        // One range per chunk and a flush per range, so the WAL thread meets its first duplicate sync after chunk 1.
+        let policy = CheckpointPolicy { range_chunks: 1, ..ckpt_policy(Durability::Strict, 2, 1) };
+        // 5 MiB is 20 buffers: at most 22 beats happen without a full channel, so 40 beats while the thread is
+        // still blocked can only come from `send`'s wait on the full channel.
+        const BEATS: usize = 40;
+        for fail_the_heartbeat in [false, true] {
+            let (fs, root) = ckpt_fs(5 * MIB);
+            let run = ckpt_run(&fs, policy);
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let release_tx = std::sync::Mutex::new(release_tx);
+            fs.on_nth("sync_all", 1, move |_| {
+                release_rx.recv_timeout(Duration::from_secs(60)).expect("released");
+            });
+            let beats = AtomicUsize::new(0);
+            let released = AtomicBool::new(false);
+            let beat = || {
+                let n = beats.fetch_add(1, Ordering::SeqCst) + 1;
+                if n >= BEATS && fail_the_heartbeat {
+                    // A lost lock stays lost: the abort's own send must see the failure too.
+                    return Err(FsError::new(Code::IoError, std::io::Error::other("lock lost")));
+                }
+                if n >= BEATS && !released.swap(true, Ordering::SeqCst) {
+                    release_tx.lock().unwrap().send(()).unwrap();
+                }
+                Ok(())
+            };
+            let result = stage_ckpt(&fs, &root, &run, Durability::Strict, &beat);
+            assert!(beats.load(Ordering::SeqCst) >= BEATS);
+            if fail_the_heartbeat {
+                let e = match result {
+                    Err(e) => e,
+                    Ok(_) => panic!("a failed heartbeat stops the copy"),
+                };
+                assert_eq!(e.step, CopyStep::Heartbeat);
+                assert!(!fs.exists(PARTIAL), "the partial is removed");
+                release_tx.lock().unwrap().send(()).unwrap();
+                run.abandon();
+            } else {
+                assert!(result.is_ok(), "the copy outlives a blocked flush");
+                assert!(run.finish(&no_heartbeat).is_clean());
+            }
         }
     }
 

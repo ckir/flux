@@ -2337,6 +2337,7 @@ fn a_target_that_finds_its_own_claim_proceeds() {
             age: std::time::Duration::from_secs(3600),
             ..crate::tree::BatchPolicy::DEFAULT
         },
+        ckpt: None,
     };
     let mut out = TreeOutcome::default();
     let mut got = Vec::new();
