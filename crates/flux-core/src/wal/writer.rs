@@ -92,12 +92,13 @@ pub(crate) enum Msg<W> {
     Range(Range),
     Flush,
     /// The `ack` channel must have capacity >= 1: the answer is delivered with `try_send`, so a zero-capacity
-    /// or dropped receiver is ignored and never blocks the thread.
+    /// or dropped receiver is ignored and never blocks the thread (and a capacity-0 channel loses the answer).
     Close {
         file_id: Vec<u8>,
         ack: Option<mpsc::SyncSender<Option<WalFault>>>,
     },
-    /// The channel must have capacity >= 1 (see `Close`).
+    /// The channel must have capacity >= 1 (see `Close`): a capacity-0 channel loses the answer, because
+    /// `try_send` on it never succeeds.
     Drain(mpsc::SyncSender<Failure>),
     Stop,
 }
@@ -167,6 +168,9 @@ pub(crate) struct WalThread {
 
 impl WalThread {
     /// Wait for the thread and return the final failure state (after `Stop`'s flush).
+    ///
+    /// Drop the sender before joining, unless `Stop` was delivered: the thread exits only on `Stop` or when
+    /// the sender is gone, so joining while the sender is alive and no `Stop` was delivered blocks forever.
     pub(crate) fn join(self) -> Failure {
         if let Err(panic) = self.handle.join() {
             std::panic::resume_unwind(panic);
@@ -194,6 +198,14 @@ pub(crate) fn open<D: DirHandle + Send + 'static>(
     generation: u64,
     cfg: WalConfig,
 ) -> Result<Opened<D::Writer>, WalError> {
+    // The record layout stores the id's length in a u16; a longer id would panic the thread inside `encode`.
+    if operation_id.len() > usize::from(u16::MAX) {
+        return Err(io_err(
+            Code::DestinationError,
+            io::ErrorKind::InvalidInput,
+            "the operation id is longer than 65,535 bytes",
+        ));
+    }
     let mut found: Option<Scan> = None;
     let mut wal: Option<D::Writer> = None;
     let mut next_seq = 1u64;
@@ -306,9 +318,19 @@ impl<D: DirHandle> State<D> {
                     if self.dead {
                         continue;
                     }
-                    if let Some(d) = dup {
-                        self.dups.insert(begin.file_id.clone(), d);
+                    // A `FileBegin` starts a new attempt at this id: it REPLACES the registered duplicate
+                    // (`None` removes the old one, so a stale duplicate never satisfies the Strict guard or
+                    // syncs the wrong file) and forgets the previous attempt's fault, which that attempt's
+                    // `Close` already answered. `Failure.wal` is untouched.
+                    match dup {
+                        Some(d) => {
+                            self.dups.insert(begin.file_id.clone(), d);
+                        }
+                        None => {
+                            self.dups.remove(&begin.file_id);
+                        }
                     }
+                    lock(&self.failure).files.remove(&begin.file_id);
                     self.push(begin.file_id.clone(), Body::FileBegin(begin), 0);
                 }
                 Msg::Range(r) => {
@@ -642,10 +664,13 @@ mod tests {
         let beat: &Heartbeat = &|| Ok(());
         let (s, t) = start(dir, 1, cfg(BIG, HOUR, Durability::Normal));
         s.send(begin_msg(b"p", None), beat).unwrap();
-        // The thread has certainly seen the begin once a Drain is answered... which flushes. Use the log instead:
-        // nothing but the setup's own call may mention the WAL until a flush.
+        // A `Close` for another file answers without flushing, and the thread handles messages in order, so
+        // once it is answered the `FileBegin` before it has certainly been processed.
+        let (tx, rx) = mpsc::sync_channel(1);
+        s.send(Msg::Close { file_id: b"other".to_vec(), ack: Some(tx) }, beat).unwrap();
+        assert_eq!(rx.recv().unwrap(), None);
         assert!(wal_bytes(&fs).is_none());
-        assert!(!calls_unix(&fs).iter().any(|c| c == "create_dir(/ws/wal)"));
+        assert!(!calls_unix(&fs).iter().any(|c| c.starts_with("create_dir(/ws/wal")));
         s.send(Msg::Stop, beat).unwrap();
         t.join();
         let r = records(&wal_bytes(&fs).unwrap());
@@ -1230,6 +1255,87 @@ mod tests {
         assert!(drain(&s, beat).is_clean());
         s.send(Msg::Stop, beat).unwrap();
         t.join();
+    }
+
+    #[test]
+    fn an_operation_id_above_the_u16_bound_is_refused_at_open() {
+        let (_fs, dir) = ws();
+        let too_long = vec![b'o'; usize::from(u16::MAX) + 1];
+        match open(dir, too_long, 1, cfg(BIG, HOUR, Durability::Normal)).err() {
+            Some(WalError::Io(e)) => assert_eq!(e.source.kind(), io::ErrorKind::InvalidInput),
+            other => panic!("expected Io(InvalidInput), got {other:?}"),
+        }
+        // Exactly 65,535 bytes is the largest id, and it encodes.
+        let (fs, dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let longest = vec![b'o'; usize::from(u16::MAX)];
+        let (s, t, _) =
+            open(dir, longest.clone(), 1, cfg(BIG, HOUR, Durability::Normal)).expect("open");
+        s.send(begin_msg(b"p", None), beat).unwrap();
+        s.send(Msg::Stop, beat).unwrap();
+        t.join();
+        let r = records(&wal_bytes(&fs).unwrap());
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].0.operation_id, longest);
+    }
+
+    #[test]
+    fn a_refiled_file_does_not_inherit_the_previous_duplicate() {
+        let (fs, dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let p = fs.create_new(Path::new("/ws/p")).unwrap();
+        let (s, t) = start(dir, 1, cfg(BIG, HOUR, Durability::Strict));
+        s.send(begin_msg(b"p", Some(p.duplicate().unwrap())), beat).unwrap();
+        s.send(begin_msg(b"p", None), beat).unwrap();
+        s.send(Msg::Range(range(b"p", 0, 1)), beat).unwrap();
+        let f = drain(&s, beat);
+        // The second attempt has no duplicate registered: refused, and nothing synced or appended.
+        let fault = &f.files[&b"p".to_vec()];
+        assert_eq!(fault.kind, io::ErrorKind::InvalidInput);
+        assert_eq!(fault.message, "no duplicate registered");
+        assert!(wal_bytes(&fs).is_none());
+        assert!(syncs(&fs).is_empty());
+        // The first attempt's duplicate was dropped when the second `FileBegin` replaced it.
+        let drops = calls_unix(&fs).iter().filter(|c| *c == "drop_writer(/ws/p)").count();
+        assert_eq!(drops, 1);
+        s.send(Msg::Stop, beat).unwrap();
+        t.join();
+        drop(p);
+    }
+
+    #[test]
+    fn a_restaged_file_checkpoints_again_after_a_sync_failure() {
+        let (fs, dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        fs.fail("sync_all", Code::StrictDurabilityUnavailable);
+        let first = fs.create_new(Path::new("/ws/first")).unwrap();
+        let second = fs.create_new(Path::new("/ws/second")).unwrap();
+        let (s, t) = start(dir, 1, cfg(BIG, HOUR, Durability::Strict));
+        // Attempt 1: its duplicate's sync fails, and its `Close` answers the fault.
+        s.send(begin_msg(b"p", Some(first.duplicate().unwrap())), beat).unwrap();
+        s.send(Msg::Range(range(b"p", 0, 1)), beat).unwrap();
+        let (tx, rx) = mpsc::sync_channel(1);
+        s.send(Msg::Close { file_id: b"p".to_vec(), ack: Some(tx) }, beat).unwrap();
+        let fault = rx.recv().unwrap().expect("attempt 1 failed its sync");
+        assert_eq!(fault.code, Code::StrictDurabilityUnavailable);
+        assert!(wal_bytes(&fs).is_none());
+        // Attempt 2 of the same file id, with a healthy duplicate: it checkpoints again.
+        s.send(begin_msg(b"p", Some(second.duplicate().unwrap())), beat).unwrap();
+        s.send(Msg::Range(range(b"p", 0, 1)), beat).unwrap();
+        let f = drain(&s, beat);
+        assert!(f.is_clean(), "{f:?}");
+        assert_eq!(records(&wal_bytes(&fs).unwrap()).len(), 2);
+        assert_eq!(
+            syncs(&fs),
+            ["sync_all(/ws/first)", "sync_all(/ws/second)", "sync_all(/ws/wal/000001)"]
+        );
+        // And its `Close` no longer answers the previous attempt's fault.
+        let (tx, rx) = mpsc::sync_channel(1);
+        s.send(Msg::Close { file_id: b"p".to_vec(), ack: Some(tx) }, beat).unwrap();
+        assert_eq!(rx.recv().unwrap(), None);
+        s.send(Msg::Stop, beat).unwrap();
+        t.join();
+        drop((first, second));
     }
 
     #[test]
