@@ -749,6 +749,9 @@ impl FileHandle for FakeHandle {
         Ok(g.identities.get(&self.path).copied().unwrap_or(flux_fs::FileIdentity::Unavailable))
     }
 
+    /// UNLIKE a real duplicate this one does NOT share the write offset (`write_pos` is per handle), so a write through
+    /// it would not move the original's position. The WAL only calls `sync_all` on a duplicate, so nothing observes
+    /// the difference today; a test that writes through a duplicate must not rely on this fake for the shared offset.
     fn duplicate(&self) -> Result<Self> {
         let Some(sink) = &self.sink else {
             return Err(FsError::new(
