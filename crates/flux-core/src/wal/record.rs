@@ -357,6 +357,21 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_operation_id_round_trips_and_its_span_is_exact() {
+        let h = Header { operation_id: Vec::new(), generation: 3, sequence: 1 };
+        for body in [file_begin(), range()] {
+            let bytes = encode(&h, &body);
+            assert_eq!(declared_span(&bytes), Some(bytes.len()));
+            let Decoded::Record { header, body: decoded, len, .. } = decode_next(&bytes) else {
+                panic!("an empty operation id is still a record");
+            };
+            assert_eq!(header, h);
+            assert_eq!(decoded, body);
+            assert_eq!(len, bytes.len());
+        }
+    }
+
+    #[test]
     fn a_file_begin_without_an_mtime_round_trips() {
         let Body::FileBegin(mut f) = file_begin() else { unreachable!() };
         f.source_mtime = None;

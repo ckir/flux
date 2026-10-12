@@ -701,7 +701,12 @@ mod tests {
         let (s, t) = start(dir, 1, cfg(BIG, Duration::from_millis(50), Durability::Normal));
         s.send(begin_msg(b"p", None), beat).unwrap();
         s.send(Msg::Range(range(b"p", 0, 1)), beat).unwrap();
-        wait_for("the timer flush", || wal_bytes(&fs));
+        // Both records are on disk BEFORE `Stop`, which would flush them on exit anyway: only the timer put them there.
+        let bytes =
+            wait_for("the timer flush", || wal_bytes(&fs).filter(|b| records(b).len() == 2));
+        let r = records(&bytes);
+        assert!(matches!(r[0].1, Body::FileBegin(_)));
+        assert!(matches!(r[1].1, Body::Range(_)));
         s.send(Msg::Stop, beat).unwrap();
         t.join();
     }
@@ -900,7 +905,8 @@ mod tests {
         s.send(begin_msg(b"p", Some(p.duplicate().unwrap())), beat).unwrap();
         s.send(Msg::Range(range(b"p", 0, 1)), beat).unwrap();
         let drained = drain(&s, beat);
-        assert!(!drained.files.is_empty());
+        assert_eq!(drained.files.keys().collect::<Vec<_>>(), [&b"p".to_vec()]);
+        assert_eq!(drained.files[&b"p".to_vec()].code, Code::StrictDurabilityUnavailable);
         s.send(Msg::Stop, beat).unwrap();
         assert_eq!(t.join().files, drained.files);
     }
