@@ -79,6 +79,7 @@ pub(crate) struct Failure {
 }
 
 impl Failure {
+    #[cfg(test)]
     pub(crate) fn is_clean(&self) -> bool {
         self.wal.is_none() && self.files.is_empty()
     }
@@ -90,6 +91,7 @@ pub(crate) enum Msg<W> {
         dup: Option<W>,
     },
     Range(Range),
+    #[cfg(test)]
     Flush,
     /// The `ack` channel must have capacity >= 1: the answer is delivered with `try_send`, so a zero-capacity
     /// or dropped receiver is ignored and never blocks the thread (and a capacity-0 channel loses the answer).
@@ -104,6 +106,7 @@ pub(crate) enum Msg<W> {
     },
     /// The channel must have capacity >= 1 (see `Close`): a capacity-0 channel loses the answer, because
     /// `try_send` on it never succeeds.
+    #[cfg(test)]
     Drain(mpsc::SyncSender<Failure>),
     Stop,
 }
@@ -165,10 +168,6 @@ impl<W> WalSender<W> {
     /// loop). The same flag a dropped sender without `Stop` sets.
     pub(crate) fn mark_abandoned(&self) {
         self.abandoned.store(true, Ordering::SeqCst);
-    }
-
-    pub(crate) fn failure(&self) -> Failure {
-        lock(&self.failure).clone()
     }
 
     /// The first WAL fault, once `Failure.wal` is set. A dead log keeps its thread alive and discarding, so
@@ -357,6 +356,7 @@ impl<D: DirHandle> State<D> {
                     let bytes = r.range_end.saturating_sub(r.range_start);
                     self.push(r.file_id.clone(), Body::Range(r), bytes);
                 }
+                #[cfg(test)]
                 Msg::Flush => self.flush(),
                 Msg::Close { file_id, ack } => {
                     // File completion is a permitted early flush; the duplicate outlives every pending record.
@@ -390,6 +390,7 @@ impl<D: DirHandle> State<D> {
                     }
                     self.dups.remove(&file_id);
                 }
+                #[cfg(test)]
                 Msg::Drain(ack) => {
                     self.flush();
                     let snapshot = lock(&self.failure).clone();

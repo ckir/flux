@@ -1,6 +1,3 @@
-// No caller until cut 9f-1 plan 2 task 6 wires it into the copy loop; task 10 removes this line.
-#![allow(dead_code, unused_imports)]
-
 //! The run's WAL handle and the per-file sink (cut 9f-1 plan 2).
 //!
 //! `Checkpoints` owns the WAL writer thread for one run; `FileSink` turns the bytes of one file being copied
@@ -78,7 +75,7 @@ impl<D: DirHandle + Send + 'static> Checkpoints<D> {
                 Err(CheckpointOpenError::Unavailable(e.source.to_string()))
             }
             Err(WalError::Io(e)) => Err(CheckpointOpenError::Fatal(e)),
-            Err(other) => Err(CheckpointOpenError::Corrupt(format!("{other:?}"))),
+            Err(other) => Err(CheckpointOpenError::Corrupt(other.to_string())),
         }
     }
 
@@ -88,11 +85,6 @@ impl<D: DirHandle + Send + 'static> Checkpoints<D> {
 
     pub(crate) fn durability(&self) -> Durability {
         self.policy.wal.durability
-    }
-
-    /// The index of the segment that existed when the run opened.
-    pub(crate) fn scan(&self) -> Option<&Scan> {
-        self.scan.as_ref()
     }
 
     /// Pass two for one file, over a fresh read of the segment through `read_dir`. With no segment at open

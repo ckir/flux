@@ -49,6 +49,22 @@ pub(crate) enum WalError {
     Io(FsError),
 }
 
+impl std::fmt::Display for WalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WalError::Corrupt { at, why } => write!(f, "corrupt log at byte {at}: {why}"),
+            WalError::SequenceConflict { generation, sequence } => write!(
+                f,
+                "the log already holds generation {generation} at or beyond sequence {sequence}"
+            ),
+            WalError::Unsupported { format, checksum } => {
+                write!(f, "unsupported log format {format} (checksum {checksum})")
+            }
+            WalError::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 fn io_err(e: io::Error) -> WalError {
     WalError::Io(FsError::from_io(e))
 }
