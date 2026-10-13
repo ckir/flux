@@ -18,9 +18,10 @@ pub(crate) mod sweep;
 mod tests;
 
 pub use crate::checkpoint::ResumeVerify;
-use crate::checkpoint::{CheckpointOpenError, CheckpointPolicy, Checkpoints};
+use crate::checkpoint::{CheckpointOpenError, CheckpointPolicy, Checkpoints, Hook};
 use crate::copy::{
-    CopyError, copy_file_guarded, no_before_create, no_before_publish, prepare_file,
+    CopyError, copy_file_checkpointed, copy_file_guarded, no_before_create, no_before_publish,
+    prepare_file,
 };
 use crate::lock::record::LockRecord;
 use crate::lock::site::NAME_LIMIT;
@@ -108,6 +109,17 @@ pub struct Run<T> {
     /// Cut 9e: the longest gap between two heartbeat writes of the lock record (known limit 6); `Duration::ZERO` when
     /// the run never held the lock.
     pub beat_gap_max: std::time::Duration,
+    /// Cut 9g: what a single-file resume reused and discarded; `None` unless an ADOPTED single-file run reused a
+    /// prefix of its partial or discarded one, and always `None` on a tree or on a failed copy.
+    pub file_resume: Option<FileResume>,
+}
+
+/// Cut 9g: what a single-file resume reused and discarded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileResume {
+    pub reused: u64,
+    pub recopied: u64,
+    pub discard: Option<crate::Discard>,
 }
 
 /// What `--resume` did (cut 9a).
@@ -238,6 +250,7 @@ pub(crate) fn tree_with<F: DestinationRoot>(
         warnings: Vec::new(),
         resumed: None,
         beat_gap_max: std::time::Duration::ZERO,
+        file_resume: None,
     };
     let opts =
         CopyOptions { operation_id: OperationId::new(cfg.operation_id.as_str()), ..opts.clone() };
@@ -478,12 +491,25 @@ pub fn file<F: DestinationRoot>(
     opts: &CopyOptions,
     cfg: &RunConfig,
 ) -> Run<Result<Outcome, CopyError>> {
+    file_with(fs, src, dst, opts, cfg, checkpoint_policy(cfg, opts.durability))
+}
+
+/// `file` with the checkpoint policy given (cut 9g): the test seam, as `tree_with` is for `tree`.
+pub(crate) fn file_with<F: DestinationRoot>(
+    fs: &F,
+    src: &Path,
+    dst: &Path,
+    opts: &CopyOptions,
+    cfg: &RunConfig,
+    policy: CheckpointPolicy,
+) -> Run<Result<Outcome, CopyError>> {
     let mut run = Run {
         copy: None,
         stop: None,
         warnings: Vec::new(),
         resumed: None,
         beat_gap_max: std::time::Duration::ZERO,
+        file_resume: None,
     };
     let opts =
         CopyOptions { operation_id: OperationId::new(cfg.operation_id.as_str()), ..opts.clone() };
@@ -555,17 +581,46 @@ pub fn file<F: DestinationRoot>(
         };
         let beat =
             || locked.pulse.beat(&locked.held).map_err(|e| beat_error(&locked.lock_shown, e));
-        copy_file_guarded(
-            fs,
-            src,
-            &parent,
-            name,
-            &opts,
-            &guard,
-            &beat,
-            &no_before_create,
-            &no_before_publish,
-        )
+        // Cut 9g: only an adopted prior can have a partial worth continuing, and only a source the policy would
+        // checkpoint (ruling P2: the same `min_len` gate as the tree's files).
+        let log_free = matches!(locked.resumed, Some(ResumeNote::Adopted { .. }))
+            && fs.metadata(src).is_ok_and(|m| m.len >= policy.min_len);
+        if log_free {
+            copy_file_checkpointed(
+                fs,
+                src,
+                &parent,
+                name,
+                &opts,
+                &guard,
+                &beat,
+                &no_before_create,
+                &no_before_publish,
+                Some(Hook::LogFree { min_len: policy.min_len }),
+            )
+            .map(|(outcome, reuse)| {
+                if reuse.reused > 0 || reuse.discard.is_some() {
+                    run.file_resume = Some(FileResume {
+                        reused: reuse.reused,
+                        recopied: outcome.bytes_copied,
+                        discard: reuse.discard,
+                    });
+                }
+                outcome
+            })
+        } else {
+            copy_file_guarded(
+                fs,
+                src,
+                &parent,
+                name,
+                &opts,
+                &guard,
+                &beat,
+                &no_before_create,
+                &no_before_publish,
+            )
+        }
     }
     .map_err(|mut e| {
         // As `copy_file` reports it: the leftover in the frame of the path the operator gave.

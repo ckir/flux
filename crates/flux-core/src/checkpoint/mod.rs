@@ -174,8 +174,6 @@ pub(crate) enum Hook<'r, 'a, D: DirHandle + Send + 'static> {
     /// A WAL-backed context (tree files, cuts 9f-1/9f-2).
     Logged(&'r FileCkpt<'a, D>),
     /// No log (a single file). `plan_resume` runs as `full`; no `FileSink` exists.
-    // Constructed only by tests until cut 9g's run wiring (a later task) builds it.
-    #[allow(dead_code)]
     LogFree { min_len: u64 },
 }
 

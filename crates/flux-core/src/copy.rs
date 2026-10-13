@@ -560,6 +560,7 @@ pub(crate) enum Stage<W> {
 /// chunk by chunk against the source by `decide_full`. The log is read only to choose the report when there is no
 /// partial: `PartialMissing` iff it began the file, nothing otherwise (an unreadable log with no partial reports
 /// nothing). A partial that is not a regular file is `Unreadable` under both levels.
+/// Under `Hook::LogFree` it runs as `full` and, with no partial, reports nothing.
 fn plan_resume<D: DirHandle + Send + 'static, R: std::io::Read>(
     hook: Hook<'_, '_, D>,
     parent: &D,

@@ -1095,6 +1095,7 @@ mod tests {
             warnings: Vec::new(),
             resumed,
             beat_gap_max: std::time::Duration::ZERO,
+            file_resume: None,
         };
         assert_eq!(
             resume_lines(&with(Some(ResumeNote::StartedNew)), 0),
@@ -1165,6 +1166,7 @@ mod tests {
             warnings: vec![kept(), kept()],
             resumed: None,
             beat_gap_max: std::time::Duration::ZERO,
+            file_resume: None,
         };
         let lines = run_lines(&run);
         assert_eq!(lines.len(), 3, "{lines:?}");
@@ -1179,6 +1181,7 @@ mod tests {
             warnings: vec![kept()],
             resumed: None,
             beat_gap_max: std::time::Duration::ZERO,
+            file_resume: None,
         };
         assert_eq!(run_lines(&quiet).len(), 1, "warnings print without a stop too");
     }
@@ -1191,6 +1194,7 @@ mod tests {
             warnings: Vec::new(),
             resumed: None,
             beat_gap_max: std::time::Duration::ZERO,
+            file_resume: None,
         };
         let clean = Report::tree_run(&run(Some(Ok(TreeOutcome::default())), None), 1);
         assert_eq!(clean.errors, 0);
@@ -1223,6 +1227,7 @@ mod tests {
             warnings: Vec::new(),
             resumed: None,
             beat_gap_max: std::time::Duration::ZERO,
+            file_resume: None,
         };
         let copied = || {
             Ok(Outcome {
