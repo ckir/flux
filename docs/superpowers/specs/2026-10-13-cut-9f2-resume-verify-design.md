@@ -1,6 +1,6 @@
 # Cut 9f-2: `--resume-verify` (design)
 
-Status: DRAFT for owner approval, 2026-10-13, against main `8f1f291`. Spec authority: `FLUX_FULL_UPDATED_SPEC_V16.md` sections 36, 121, 137, 211, 212 (test items 52, 86). Built on cut 9f-1 (`docs/superpowers/specs/2026-10-12-cut-9f1-chunk-checkpoints-design.md`, incl. its final section "Deviations and amendments recorded at merge (plan 2)").
+Status: APPROVED by the owner 2026-10-13; implemented by docs/superpowers/plans/2026-10-13-cut-9f2-resume-verify.md. Spec authority: `FLUX_FULL_UPDATED_SPEC_V16.md` sections 36, 121, 137, 211, 212 (test items 52, 86). Built on cut 9f-1 (`docs/superpowers/specs/2026-10-12-cut-9f1-chunk-checkpoints-design.md`, incl. its final section "Deviations and amendments recorded at merge (plan 2)").
 
 How this was decided: the owner asked for an order proposed from the spec (no interview). The fork "which levels, in what order" was put to agy first (`.clavity/seams/9f2-sequencing-fork{,-r2}.md`; ALIGNED after one negotiation turn) and the owner chose: **`chunks` + `full` now; `metadata` and the section 121 upgrade rule go to cut 9f-3.** Everything marked **[my call]** is not owner-approved.
 
