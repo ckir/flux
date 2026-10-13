@@ -3234,6 +3234,16 @@ fn a_resume_that_fails_before_transferring_can_be_resumed_again() {
 }
 
 fn file_prior3(fs: &FaultFs, n: u8, source_identity: Option<&str>) -> OperationState {
+    file_prior3_with(fs, n, source_identity, &opts())
+}
+
+/// `file_prior3` for a prior whose recorded options are `o`.
+fn file_prior3_with(
+    fs: &FaultFs,
+    n: u8,
+    source_identity: Option<&str>,
+    o: &CopyOptions,
+) -> OperationState {
     let src = identity_text(fs.metadata(Path::new("/src/a")).unwrap().identity);
     let shown = source_identity.map_or(src, str::to_string);
     let fields = crate::state::FileFields {
@@ -3254,7 +3264,7 @@ fn file_prior3(fs: &FaultFs, n: u8, source_identity: Option<&str>) -> OperationS
             source_identity: shown,
             destination_prefix: native_hex(Path::new("t")),
         }],
-        Options::of(&opts()),
+        Options::of(o),
     );
     let state = OperationState {
         state: OpState::Failed,
@@ -7313,5 +7323,76 @@ mod checkpointing {
         let r = resume_file(&fs, &resume(), &o, lazy(Durability::Strict));
         assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
         assert_eq!(fs.read_file("/p/t").unwrap(), pattern(5 * MIB));
+    }
+
+    // ---- cut 9g final fix wave ----
+
+    // Mutant: `file_with` does not sweep a skipped resume's partial (the sweep lives in `stage_file`'s skip branch).
+    #[test]
+    fn a_skipped_single_file_resume_leaves_no_partial() {
+        let skip = CopyOptions { existing: flux_fs::ExistingPolicy::SkipExisting, ..opts() };
+        let fs = fake();
+        fs.write_file("/src/a", &pattern(5 * MIB));
+        file_prior3_with(&fs, 5, None, &skip);
+        fs.write_file("/p/t", b"existing");
+        fs.write_file(file_partial(5), &pattern(5 * MIB)[..3 * MIB]);
+        let r = resume_file(&fs, &resume(), &skip, lazy(Durability::Normal));
+        assert!(r.stop.is_none(), "{:?}", r.stop);
+        assert!(matches!(&r.copy, Some(Ok(o)) if o.skipped), "{:?}", r.copy);
+        assert!(matches!(r.resumed, Some(ResumeNote::Adopted { .. })), "{:?}", r.resumed);
+        assert!(!fs.exists(file_partial(5)), "the partial is gone");
+        assert_eq!(fs.read_file("/p/t").unwrap(), b"existing");
+        assert_eq!(r.file_resume, None);
+    }
+
+    // Mutant: `reuse.reused > 0 || reuse.discard.is_some()` -> `&&`.
+    #[test]
+    fn a_single_file_resume_with_an_empty_partial_reports_it_shorter() {
+        let fs = file_fixture(5 * MIB);
+        fs.write_file(file_partial(5), &[]);
+        let r = resume_file(&fs, &resume(), &opts(), lazy(Durability::Normal));
+        assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+        assert_eq!(
+            r.file_resume,
+            Some(FileResume {
+                reused: 0,
+                recopied: 5 * MIB as u64,
+                discard: Some(Discard::PartialShorter { kept: 0 }),
+            })
+        );
+        assert_eq!(fs.read_file("/p/t").unwrap(), pattern(5 * MIB));
+    }
+
+    // Mutant: `||` -> `&&` (a whole-source partial reports reuse with no discard). Also spec 6.4 under Strict.
+    #[test]
+    fn a_single_file_resume_with_a_partial_longer_than_the_source_proves_the_whole_source_under_strict()
+     {
+        let len = 3 * MIB + 12345;
+        let fs = file_fixture(len);
+        let mut part = pattern(len);
+        part.extend(vec![0xEE; 2 * MIB]);
+        fs.write_file(file_partial(5), &part);
+        let o = CopyOptions { durability: Durability::Strict, ..opts() };
+        let r = resume_file(&fs, &resume(), &o, lazy(Durability::Strict));
+        assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+        assert_eq!(
+            r.file_resume,
+            Some(FileResume { reused: len as u64, recopied: 0, discard: None })
+        );
+        assert_eq!(fs.read_file("/p/t").unwrap(), pattern(len));
+    }
+
+    // Mutant: `run::file`'s gate `m.len >= policy.min_len` -> `>`.
+    #[test]
+    fn a_single_file_resume_of_exactly_min_len_continues_its_partial() {
+        let fs = file_fixture(MIB);
+        fs.write_file(file_partial(5), &pattern(MIB));
+        let r = resume_file(&fs, &resume(), &opts(), lazy(Durability::Normal));
+        assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+        assert_eq!(
+            r.file_resume,
+            Some(FileResume { reused: MIB as u64, recopied: 0, discard: None })
+        );
+        assert_eq!(fs.read_file("/p/t").unwrap(), pattern(MIB));
     }
 }

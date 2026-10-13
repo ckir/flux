@@ -717,17 +717,7 @@ fn a_killed_large_file_resumes_under_full_from_its_validated_prefix_without_its_
     let src = d.path().join("src");
     let dst = d.path().join("dst");
     std::fs::create_dir_all(&src).unwrap();
-    {
-        let mut w = std::io::BufWriter::new(std::fs::File::create(src.join("big")).unwrap());
-        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
-        for _ in 0..LEN / 8 {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            w.write_all(&x.to_le_bytes()).unwrap();
-        }
-        w.flush().unwrap();
-    }
+    write_xorshift(&src.join("big"), LEN);
     Stalled::start_args(&src, &dst, 5, marks.path(), &["--durability", "strict"]).kill();
 
     let id = the_operation(&dst);
@@ -1289,6 +1279,8 @@ fn an_explicit_chunks_single_file_resume_prints_what_full_prints() {
     );
     assert_eq!(chunks_lines, full_lines);
     assert_eq!(chunks_json, full_json);
+    assert_eq!(chunks_json["resume_verify"], "full");
+    assert_eq!(full_json["resume_verify"], "full");
 }
 
 /// Cut 9g: a resume that is itself killed before its publish leaves a record a third run continues.
@@ -1308,6 +1300,12 @@ fn a_single_file_resume_killed_again_resumes_a_third_time() {
     let out = copy(&[os("--resume"), os("--json"), src.as_os_str(), t.as_os_str()]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert!(stderr(&out).contains(&before[0]["t.flux-state.".len()..]), "{}", stderr(&out));
+    // A silent recopy would print no reuse line.
+    let e = stderr(&out);
+    assert!(
+        e.lines().any(|l| l.starts_with("resumed ") && l.contains("reused ")),
+        "the third run reports what it reused: {e}"
+    );
     assert_same_bytes(&src, &t);
     assert_eq!(names(d.path()), ["src", "t"]);
 }

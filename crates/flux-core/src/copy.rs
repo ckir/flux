@@ -707,6 +707,12 @@ pub(crate) fn stage_file<F: DestinationRoot>(
             }
         };
         if !proceed {
+            // A hook deferred the early sweep, and a skip returns before the Fresh branch's: sweep here, under its
+            // own section 99 check (a removal is a destination mutation).
+            if ckpt.is_some() {
+                guard().map_err(|e| CopyError::at(CopyStep::Create, e))?;
+                let _ = parent.remove_file(&temp);
+            }
             return Ok(Stage::Skipped(Outcome {
                 skipped: true,
                 bytes_copied: 0,
@@ -3978,18 +3984,59 @@ mod tests {
     ) -> StageResult {
         let mut o = opts();
         o.durability = durability;
+        stage_log_free_with(fs, root, &o, beat)
+    }
+
+    fn stage_log_free_with(
+        fs: &FaultFs,
+        root: &Dir,
+        o: &CopyOptions,
+        beat: &Heartbeat<'_>,
+    ) -> StageResult {
         stage_file(
             fs,
             Path::new("/src"),
             root,
             OsStr::new("dst"),
-            &o,
+            o,
             &unguarded,
             beat,
             &no_before_create,
             SyncAt::Staging,
             Some(Hook::LogFree { min_len: MIB as u64 }),
         )
+    }
+
+    // Mutant: `stage_file`'s skip branch does not sweep the partial (a hook defers the early sweep).
+    #[test]
+    fn log_free_skip_existing_removes_the_stale_partial() {
+        let (fs, root) = ckpt_fs(5 * MIB);
+        let src = fs.read_file("/src").unwrap();
+        fs.write_file("/dst", b"existing");
+        fs.write_file(PARTIAL, &src[..3 * MIB]);
+        let mut o = opts();
+        o.existing = flux_fs::ExistingPolicy::SkipExisting;
+        let r = stage_log_free_with(&fs, &root, &o, &no_heartbeat);
+        assert!(matches!(r, Ok(Stage::Skipped(_))), "{:?}", r.err());
+        assert_eq!(fs.read_file(PARTIAL), None);
+        assert_eq!(fs.read_file("/dst").unwrap(), b"existing");
+    }
+
+    // Mutant: as above, for `Update` when the source is neither newer nor of a different size.
+    #[test]
+    fn log_free_update_that_skips_removes_the_stale_partial() {
+        let (fs, root) = ckpt_fs(5 * MIB);
+        let src = fs.read_file("/src").unwrap();
+        fs.write_file("/dst", &vec![1u8; 5 * MIB]);
+        let at = |n| std::time::UNIX_EPOCH + Duration::from_secs(n);
+        fs.set_modified("/src", at(100));
+        fs.set_modified("/dst", at(200));
+        fs.write_file(PARTIAL, &src[..3 * MIB]);
+        let mut o = opts();
+        o.existing = flux_fs::ExistingPolicy::Update;
+        let r = stage_log_free_with(&fs, &root, &o, &no_heartbeat);
+        assert!(matches!(r, Ok(Stage::Skipped(_))), "{:?}", r.err());
+        assert_eq!(fs.read_file(PARTIAL), None);
     }
 
     // Mutant: `plan_resume` calls `load` for `LogFree` (returns early with no log, so `reused == 0`).
