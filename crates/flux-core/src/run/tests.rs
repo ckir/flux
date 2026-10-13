@@ -35,6 +35,7 @@ fn cfg() -> RunConfig {
         heartbeat_interval: std::time::Duration::from_secs(3600),
         resume: false,
         descriptor_limit: None,
+        resume_verify: ResumeVerify::Chunks,
     }
 }
 
@@ -5534,6 +5535,7 @@ mod checkpointing {
                 channel_cap: 64,
                 durability,
             },
+            verify: ResumeVerify::Chunks,
         }
     }
 
@@ -5647,6 +5649,11 @@ mod checkpointing {
     /// The adopting run: its own id differs from the prior's (`ID`), as a later process's does.
     fn resuming() -> RunConfig {
         RunConfig { operation_id: id(9), ..resume() }
+    }
+
+    /// `resuming()` with `--resume-verify=full`.
+    fn resuming_full() -> RunConfig {
+        RunConfig { resume_verify: ResumeVerify::Full, ..resuming() }
     }
 
     fn published(fs: &FaultFs, len: usize) {
@@ -5808,6 +5815,16 @@ mod checkpointing {
             checkpoint_policy(&cfg(), Durability::Normal).range_chunks,
             CheckpointPolicy::DEFAULT.range_chunks
         );
+    }
+
+    // Mutant: `checkpoint_policy` builds the policy with `ResumeVerify::Chunks` whatever `cfg.resume_verify` says.
+    #[test]
+    fn the_checkpoint_policy_carries_the_runs_resume_verify() {
+        for level in [ResumeVerify::Chunks, ResumeVerify::Full] {
+            let c = RunConfig { resume_verify: level, ..cfg() };
+            assert_eq!(checkpoint_policy(&c, Durability::Normal).verify, level);
+        }
+        assert_eq!(CheckpointPolicy::DEFAULT.verify, ResumeVerify::Chunks);
     }
 
     // Mutant: `Shared.ckpt = None` (the resume would recopy: no `truncate_to`, a fresh `create_new`).
@@ -6281,9 +6298,15 @@ mod checkpointing {
     type Resumed = Run<Result<TreeOutcome, TreeAbort>>;
 
     fn resume_run(fs: &FaultFs, d: Durability) -> (Resumed, usize) {
+        resume_run_as(fs, d, &resuming())
+    }
+
+    /// `resume_run` under the given adopting config.
+    fn resume_run_as(fs: &FaultFs, d: Durability, cfg: &RunConfig) -> (Resumed, usize) {
         let mark = fs.calls().len();
         let o = CopyOptions { durability: d, ..opts() };
-        let (r, got) = run_with(fs, &resuming(), &o, lazy(d));
+        let policy = CheckpointPolicy { verify: cfg.resume_verify, ..lazy(d) };
+        let (r, got) = run_with(fs, cfg, &o, policy);
         assert!(got.is_empty(), "{got:?}");
         (r, mark)
     }
@@ -6733,6 +6756,24 @@ mod checkpointing {
     }
     // ---- Owner ruling 23: what `--resume` does with a damaged or unopenable checkpoint log.
 
+    fn assert_discards(r: &Resumed) {
+        let out = ok(r);
+        assert!(out.checkpoint_discards.is_empty(), "{:?}", out.checkpoint_discards);
+    }
+
+    /// Under `full` a partial shorter than the source is salvaged and reported (design 3.2 item 4): this is the
+    /// run's only discard, for `big`, which kept its 3 MiB.
+    fn assert_only_shorter_discard(r: &Resumed) {
+        let out = ok(r);
+        assert_eq!(
+            out.checkpoint_discards
+                .iter()
+                .map(|d| (d.path.clone(), d.reason.clone()))
+                .collect::<Vec<_>>(),
+            vec![(PathBuf::from("big"), crate::Discard::PartialShorter { kept: 3 * MIB as u64 })]
+        );
+    }
+
     /// Every `WalQuarantined` warning of the run as (code, why, set_aside_as).
     fn quarantined(r: &Resumed) -> Vec<(&'static str, String, String)> {
         r.warnings
@@ -6813,8 +6854,7 @@ mod checkpointing {
         assert_eq!(fs.read_file(format!("{}.corrupt-2", wal())), None);
     }
 
-    #[test]
-    fn an_unknown_wal_format_stops_the_run_before_any_copy() {
+    fn assert_unknown_format_stops(cfg: &RunConfig) {
         let fs = big_fs(5 * MIB);
         crashed_run(&fs);
         let mut bytes = crashed_segment(&fs).concat();
@@ -6829,9 +6869,9 @@ mod checkpointing {
             Path::new("/src"),
             Path::new("/p/dest"),
             &o,
-            &resuming(),
+            cfg,
             &mut |f| got.push(f),
-            lazy(Durability::Normal),
+            CheckpointPolicy { verify: cfg.resume_verify, ..lazy(Durability::Normal) },
         );
         assert!(r.stop.is_none() && got.is_empty(), "{:?} {got:?}", r.stop);
         let Some(Err(abort)) = &r.copy else { panic!("expected an abort: {:?}", r.copy) };
@@ -6861,6 +6901,140 @@ mod checkpointing {
         assert_eq!(fs.read_file(partial()), Some(kept));
         assert_eq!(fs.read_file(wal()), Some(bytes));
         assert_eq!(manifest(&fs, ID).state, OpState::Failed);
+    }
+
+    #[test]
+    fn an_unknown_wal_format_stops_the_run_before_any_copy() {
+        assert_unknown_format_stops(&resuming());
+    }
+
+    // Property 7.5. Mutant: `open_checkpoints` maps `FormatUnsupported` to a warning when the level is `full`.
+    #[test]
+    fn an_unknown_wal_format_stops_a_full_resume_before_any_copy() {
+        assert_unknown_format_stops(&resuming_full());
+    }
+
+    // ---- `--resume-verify=full`: the run under the level (design 3.4).
+
+    // Mutant: `plan_resume` ignores the level.
+    #[test]
+    fn a_full_resume_salvages_the_partial_after_the_log_was_quarantined() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        corrupt_mid_log(&fs);
+        let (r, mark) = resume_run_as(&fs, Durability::Normal, &resuming_full());
+        let q = quarantined(&r);
+        assert_eq!(q.len(), 1, "{:?}", r.warnings);
+        assert_eq!(q[0].0, "WAL_CORRUPT");
+        assert_progress(&fs, &r, mark, 3 * MIB);
+    }
+
+    // Mutant: `plan_resume` ignores the level (the `scan == None` origin of `Ok(None)`; the next test pins the
+    // empty `per_file` one).
+    #[test]
+    fn a_full_resume_salvages_the_partial_with_a_zero_length_log() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        fs.write_file(wal(), b"");
+        let (r, mark) = resume_run_as(&fs, Durability::Normal, &resuming_full());
+        assert_progress(&fs, &r, mark, 3 * MIB);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_only_shorter_discard(&r);
+    }
+
+    // Mutant: `plan_resume` ignores the level.
+    #[test]
+    fn a_full_resume_salvages_the_partial_with_no_log() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        fs.remove_file(Path::new(&wal())).unwrap();
+        let (r, mark) = resume_run_as(&fs, Durability::Normal, &resuming_full());
+        assert_progress(&fs, &r, mark, 3 * MIB);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_only_shorter_discard(&r);
+    }
+
+    // Ruling 1. Mutant: `Full` with no partial always reports `PartialMissing`.
+    #[test]
+    fn a_full_resume_of_a_large_file_never_started_reports_no_discard() {
+        let fs = big_fs(5 * MIB);
+        // Sorts after `big`, so the crash at 3 MiB of `big` never starts it.
+        fs.write_file("/src/zzz", &pattern(2 * MIB));
+        crashed_run(&fs);
+        let (r, _) = resume_run_as(&fs, Durability::Normal, &resuming_full());
+        let out = ok(&r);
+        assert_only_shorter_discard(&r);
+        published(&fs, 5 * MIB);
+        assert_eq!(fs.read_file("/p/dest/zzz").as_deref(), Some(&pattern(2 * MIB)[..]));
+        assert_eq!(out.files_partially_resumed, 1, "{out:?}");
+    }
+
+    // Mutant: the `load` result is ignored (never `PartialMissing`).
+    #[test]
+    fn a_full_resume_with_a_missing_partial_names_the_file() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        fs.remove_file(Path::new(&partial())).unwrap();
+        let (r, _) = resume_run_as(&fs, Durability::Normal, &resuming_full());
+        let out = ok(&r);
+        assert_eq!(
+            out.checkpoint_discards
+                .iter()
+                .map(|d| (d.path.clone(), d.reason.clone()))
+                .collect::<Vec<_>>(),
+            vec![(PathBuf::from("big"), crate::Discard::PartialMissing)]
+        );
+        assert_eq!(out.bytes_reused, 0, "{out:?}");
+    }
+
+    // Review Focus 4. Mutant: `full` runs without a checkpoint context.
+    #[test]
+    fn a_full_resume_whose_checkpoints_are_unavailable_recopies_and_warns_once() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        fs.set_identity(wal(), FileIdentity::Unavailable);
+        let (r, mark) = resume_run_as(&fs, Durability::Normal, &resuming_full());
+        let n = r
+            .warnings
+            .iter()
+            .filter(|w| matches!(w, RunWarning::CheckpointsUnavailable { .. }))
+            .count();
+        assert_eq!(n, 1, "{:?}", r.warnings);
+        let out = ok(&r);
+        assert!(
+            calls(&fs)[mark..].iter().all(|c| !c.starts_with("truncate_to(")),
+            "{:?}",
+            &calls(&fs)[mark..]
+        );
+        published(&fs, 5 * MIB);
+        assert!(out.partial_resumes.is_empty(), "{:?}", out.partial_resumes);
+        assert_discards(&r);
+    }
+
+    // Mutant: `stage_into_batch` passes `None` for `fc` (pinned for `chunks`; this pins it for `full` too).
+    #[test]
+    fn a_full_resume_under_strict_salvages_a_batched_partial() {
+        let fs = big_fs(5 * MIB);
+        crashed_run_as(&fs, Durability::Strict);
+        let (r, _) = resume_run_as(&fs, Durability::Strict, &resuming_full());
+        let out = ok(&r);
+        assert!(out.bytes_reused >= 3 * MIB as u64, "{out:?}");
+        assert_eq!(out.files_partially_resumed, 1, "{out:?}");
+        published(&fs, 5 * MIB);
+    }
+
+    // Test audit (cut 9f-2). The partial comes from a NORMAL crash, so `stage_into_batch`'s mutant (`fc` passed as
+    // `None`) cannot touch the fixture and turns THIS resume red: nothing is salvaged, so `bytes_reused` is 0.
+    #[test]
+    fn a_strict_full_resume_reuses_exactly_what_a_normal_crash_left() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        let (r, _) = resume_run_as(&fs, Durability::Strict, &resuming_full());
+        let out = ok(&r);
+        assert_eq!(out.bytes_reused, 3 * MIB as u64, "{out:?}");
+        assert_eq!(out.files_partially_resumed, 1, "{out:?}");
+        assert_only_shorter_discard(&r);
+        published(&fs, 5 * MIB);
     }
 
     #[test]

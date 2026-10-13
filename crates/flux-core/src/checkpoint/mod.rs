@@ -16,7 +16,7 @@ use std::ffi::OsStr;
 use std::io;
 
 pub use decide::Discard;
-pub(crate) use decide::{Gate, Start, Verdict, decide};
+pub(crate) use decide::{Gate, Start, Verdict, decide, decide_full};
 pub(crate) use sink::{FileSink, SinkError, mtime_pair};
 
 /// Files shorter than this are not checkpointed.
@@ -24,12 +24,21 @@ pub(crate) const CHECKPOINT_MIN_LEN: u64 = 64 << 20;
 /// Chunks coalesced into one `Range` message.
 pub(crate) const RANGE_CHUNKS: usize = 16;
 
+/// How much of a checkpointed file a resume re-reads before it trusts the log (cut 9f-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResumeVerify {
+    #[default]
+    Chunks,
+    Full,
+}
+
 /// Everything a run decides about checkpointing; the fields are injectable so tests can use small fixtures.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CheckpointPolicy {
     pub min_len: u64,
     pub range_chunks: usize,
     pub wal: WalConfig,
+    pub verify: ResumeVerify,
 }
 
 impl CheckpointPolicy {
@@ -37,6 +46,7 @@ impl CheckpointPolicy {
         min_len: CHECKPOINT_MIN_LEN,
         range_chunks: RANGE_CHUNKS,
         wal: WalConfig::DEFAULT,
+        verify: ResumeVerify::Chunks,
     };
 }
 
@@ -105,6 +115,10 @@ impl<D: DirHandle + Send + 'static> Checkpoints<D> {
 
     pub(crate) fn durability(&self) -> Durability {
         self.policy.wal.durability
+    }
+
+    pub(crate) fn resume_verify(&self) -> ResumeVerify {
+        self.policy.verify
     }
 
     /// Pass two for one file, over a fresh read of the segment through `read_dir`. With no segment at open

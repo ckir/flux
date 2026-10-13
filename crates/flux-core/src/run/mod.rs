@@ -17,6 +17,7 @@ pub(crate) mod sweep;
 #[cfg(test)]
 mod tests;
 
+pub use crate::checkpoint::ResumeVerify;
 use crate::checkpoint::{CheckpointOpenError, CheckpointPolicy, Checkpoints};
 use crate::copy::{
     CopyError, copy_file_guarded, no_before_create, no_before_publish, prepare_file,
@@ -69,6 +70,8 @@ pub struct RunConfig {
     /// Cut 9e: the process's soft descriptor limit (`flux_platform::soft_descriptor_limit()`), which caps the writers a
     /// batched tree holds open; `None` when unknown (Windows) or in a test that does not care.
     pub descriptor_limit: Option<u64>,
+    /// Cut 9f-2: how much of a checkpointed file a resume re-reads (`--resume-verify`).
+    pub resume_verify: ResumeVerify,
 }
 
 /// §101's heartbeat interval: 5 s.
@@ -86,6 +89,7 @@ impl std::fmt::Debug for RunConfig {
             .field("heartbeat_interval", &self.heartbeat_interval)
             .field("resume", &self.resume)
             .field("descriptor_limit", &self.descriptor_limit)
+            .field("resume_verify", &self.resume_verify)
             .finish()
     }
 }
@@ -641,10 +645,11 @@ fn batch_policy(cfg: &RunConfig) -> crate::tree::BatchPolicy {
     }
 }
 
-/// Cut 9f-1: the checkpoint policy of a tree run: `CheckpointPolicy::DEFAULT` with the run's durability. In a debug
+/// Cut 9f-1: the checkpoint policy of a tree run: `CheckpointPolicy::DEFAULT` with the run's durability and (cut 9f-2)
+/// its `--resume-verify` level. In a debug
 /// build, `FLUX_TEST_CHECKPOINT_MIN=<n>` (bytes) replaces `min_len` (absent or unparsable: the default's).
 #[cfg(debug_assertions)]
-fn checkpoint_policy(_cfg: &RunConfig, durability: flux_fs::Durability) -> CheckpointPolicy {
+fn checkpoint_policy(cfg: &RunConfig, durability: flux_fs::Durability) -> CheckpointPolicy {
     let default = CheckpointPolicy::DEFAULT;
     let min_len = std::env::var("FLUX_TEST_CHECKPOINT_MIN")
         .ok()
@@ -653,14 +658,19 @@ fn checkpoint_policy(_cfg: &RunConfig, durability: flux_fs::Durability) -> Check
     CheckpointPolicy {
         min_len,
         wal: crate::wal::writer::WalConfig { durability, ..default.wal },
+        verify: cfg.resume_verify,
         ..default
     }
 }
 
 #[cfg(not(debug_assertions))]
-fn checkpoint_policy(_cfg: &RunConfig, durability: flux_fs::Durability) -> CheckpointPolicy {
+fn checkpoint_policy(cfg: &RunConfig, durability: flux_fs::Durability) -> CheckpointPolicy {
     let default = CheckpointPolicy::DEFAULT;
-    CheckpointPolicy { wal: crate::wal::writer::WalConfig { durability, ..default.wal }, ..default }
+    CheckpointPolicy {
+        wal: crate::wal::writer::WalConfig { durability, ..default.wal },
+        verify: cfg.resume_verify,
+        ..default
+    }
 }
 
 /// The most quarantine names `set_aside` tries for one generation (`.corrupt-<g>`, `-2`, `-3`, ...).

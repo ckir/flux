@@ -957,8 +957,9 @@ Each is deferred to the cut that first reads it (cut 7b spec, `docs/superpowers/
 - [ ] **Checkpoints and `last_checkpoint` (§19, §139, §148, §164)** - cuts 8/9: the spec defines them only through
       the WAL and `state.db` (§119's layout).
       Partly delivered by cut 9f-1: batched chunk checkpoints in a WAL, and partial-file resume for tree files of
-      64 MiB and up. Still open: snapshots, compaction and rotation of the WAL (cut 9f-3), `--resume-verify`
-      (cut 9f-2), and checkpoints for the single-file layout. Decision 15's real-filesystem crash tests are the
+      64 MiB and up. Still open: snapshots, compaction and rotation of the WAL (cut 9f-3, with
+      `--resume-verify=metadata` and the section 121 upgrade rule), and checkpoints for the single-file layout.
+      `--resume-verify=chunks|full` shipped in cut 9f-2. Decision 15's real-filesystem crash tests are the
       `real-filesystem crash-injection harness` item, still open, under "Cut 9e debt" above (the test-audit debt entry
       near line 593).
 - [ ] **`roots` (§19, §18.3)** - cut 10: one root until several sources exist.
