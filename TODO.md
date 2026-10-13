@@ -538,6 +538,21 @@ the spec's numbers, 9-10 were learned during execution).
 - [ ] Salvage the valid prefix of a log with mid-log damage: today the whole segment is set aside and every large file recopies (owner ruling 23).
 - [ ] An `--on-wal-corrupt=stop|quarantine` flag, for operators who want a damaged log to stop the run instead of being set aside.
 - [ ] Identity gate and `st_dev`: resume identity compares `identity_text`, which embeds `st_dev` on Unix, and that may differ after a reboot on some filesystems, discarding every checkpoint; verify with the `verifying-platform-assumptions` skill.
+- [ ] The WAL writer thread has no section-99 lock check of its own: it mutates the destination (`ensure_wal`, appends, Strict syncs) on its 1 s timer, and the run notices a lost lock only at its next guard or heartbeat (up to 5 s, or right after a process freeze), so a successor that already holds the lock can see a late flush from the old holder (design deviation (f)). Harm is bounded: replay reports `WAL_CORRUPT` and the file recopies, digests still protect destination bytes. Needs a `Send + Sync` guard handed to `WalConfig` (`guarded()` uses the main thread's lock handle).
+- [ ] The Strict duplicate descriptor is not counted against `OPEN_WRITERS_MAX` (decision 6 followed without a recorded deviation until the plan 2 review).
+- [ ] Reporting: a file whose checkpoints were discarded but which then FAILS gets no discard line (the `Err` carries no `Reuse`, `split_reuse`, `tree.rs`), and `--json` carries none of the reuse/discard fields; this weakens decision 12 ("nothing is discarded silently").
+- [ ] `flux copy` with an unreadable `DEST/.flux` (permission denied) is refused whole by `check_control_plane` (`prior.rs:212`) instead of the spec's "cleanup cannot list: exit 1, classification incomplete" for `flux cleanup`; found by reading in cut 9b, not measured.
+- [ ] CI: no job in `.github/workflows/ci.yml` sets `timeout-minutes` (the model and bench workflows do), so a test that blocks forever runs for GitHub's 6 h default; the nextest override covers `wal::` tests only. The Windows store tests legitimately run 112-158 s, so pick the limit from CI history.
+
+## Cut 9f-1 test debt (audits of plans 1 and 2; owner deferred)
+
+- [ ] No test opens a FIFO through `DirHandle::open_existing`: the `O_NONBLOCK`/`ENXIO` classification (`dir_unix.rs:180`) is unpinned.
+- [ ] No Windows test holds a hard-link keep-alive across `open_existing` to pin the identity check against a replaced object (`dir_windows.rs:637`).
+- [ ] Torn-tail classification (ruling 23, `wal/replay.rs:84`) is pinned by a handful of cases; add multi-record spans, window-boundary damage and zero-tail variants.
+- [ ] A property or fuzz test over `wal::replay::scan` / `load_file`: arbitrary prefix truncation and bit flips never panic, and `scan(stream[..valid_len])` is idempotent with no discarded tail (suggested by capstone r2 and r3 and the plan 1 audit).
+- [ ] `crash_case_2_during_destination_flush` (`run/tests.rs`) zeroes a partial tail that `decide` never reads (its WAL holds only `FileBegin`, so `decide` returns Fresh before reading); it passes with or without the zeroing. Unverified by mutation; `assert_safe_redo` still pins the redo.
+- [ ] No test injects a heartbeat failure during `plan_resume` (`copy.rs:597-608` maps it to `CopyStep::Heartbeat`; `decide.rs` covers it in isolation).
+- [ ] FaultFs gaps that limit those tests: `FakeHandle::write` records nothing in the call log, so no test can order a WAL write against a sync or rename (`fault_fs.rs:688`); there is no read-fault injector, so a source read error mid-file cannot be simulated (the abort-on-source-read-error path is unexercised); `FakeDirHandle::open_existing` and `open_dir` push their call-log entry directly or not at all, so `on_nth` hooks and `fail(..)` never fire for them (`fault_fs.rs:1751`, `:1812`); `FakeHandle::identity` looks up the handle's stale path, so after `move_object` an open handle reads `Unavailable` where a real file reads its descriptor (`fault_fs.rs:749`).
 
 ## Cut 9d debt
 
@@ -926,8 +941,9 @@ are kept on the development box under `~/flux-probe` (not in the repository).
 - [ ] **Heartbeat cadence per chunk.** The copy loop calls the heartbeat once per chunk; a chunk is now up to 256 KiB
       (was 64 KiB), so beats per byte fell fourfold for large files. The beat is rate-limited to once per 5 s and
       section 101 sets no maximum gap per chunk. The 30 s stale-lease threshold comes from the spec (items at lines
-      4186 and 5005 of `FLUX_FULL_UPDATED_SPEC_V16.md`), not from a constant in the code, which has only the 5 s
-      `HEARTBEAT_INTERVAL` (`crates/flux-core/src/run/mod.rs`). Because the beat can lag the last call by up to 5 s,
+      4186 and 5005 of `FLUX_FULL_UPDATED_SPEC_V16.md`); `flux cleanup` carries it as `LEASE_THRESHOLD`
+      (`crates/flux-core/src/cleanup/mod.rs`), and the run's own heartbeat constant is the 5 s `HEARTBEAT_INTERVAL`
+      (`crates/flux-core/src/run/mod.rs`). Because the beat can lag the last call by up to 5 s,
       a chunk must complete within 25 s to keep the heartbeat under 30 s old: the worst case holds above about
       10 KiB/s of sustained throughput (256 KiB / 25 s = 10.24 KiB/s; it was about 2.6 KiB/s at 64 KiB). Very slow
       media could appear stale during one slow chunk, though staleness also requires that no live process holds the
