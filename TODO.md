@@ -974,10 +974,11 @@ Each is deferred to the cut that first reads it (cut 7b spec, `docs/superpowers/
 - [ ] **Checkpoints and `last_checkpoint` (§19, §139, §148, §164)** - cuts 8/9: the spec defines them only through
       the WAL and `state.db` (§119's layout).
       Partly delivered by cut 9f-1: batched chunk checkpoints in a WAL, and partial-file resume for tree files of
-      64 MiB and up. `--resume-verify=chunks|full` shipped in cut 9f-2. Still open: checkpoints for the single-file
-      layout (the next cut; its deciding question is where a single-file copy keeps its state, because the layout has no
-      operation workspace and the `<target>.flux-state.<id>` sidecar is capped at 64 KiB, and `full` already needs no
-      log). Cut 9f-3 as first parked was NOT built, by ruling of 2026-10-13 (agy consulted, ALIGNED after one
+      64 MiB and up. `--resume-verify=chunks|full` shipped in cut 9f-2. Single-file resume shipped in cut 9g: a single-file
+      `--resume` that adopts a prior operation and whose source is at least 64 MiB re-reads and hashes the partial
+      against the source (`chunks` runs as `full` and is reported as such) and continues from the proven prefix; it keeps
+      no log and creates no file beside the target, and a partial survives only a hard crash (every graceful failure
+      removes it). Cut 9f-3 as first parked was NOT built, by ruling of 2026-10-13 (agy consulted, ALIGNED after one
       negotiation round; the owner approved): **closed, reopen if measured** - WAL compaction, rotation and snapshots,
       because the WAL grows by 32 KiB of digests plus about 5 KiB of framing per GiB at the default 16 chunks per
       `Range` (60 KiB at 4), under 0.006% of the payload, and the workspace is deleted on completion; reopen if a

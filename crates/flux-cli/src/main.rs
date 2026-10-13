@@ -82,7 +82,7 @@ struct CopyArgs {
     /// Continue the one resumable prior operation on DEST as itself: files it completed are verified and skipped,
     /// the rest are copied under the existing-file policy. With no prior operation a new one starts.
     /// In a tree copy a file of 64 MiB or more continues after the longest leading run of chunks whose digests match on
-    /// both the source and the destination; every other half-copied file is recopied, a half-copied single file is validated by re-reading and hashing it against the source (`--resume-verify=chunks` runs as `full` for a single file). Under
+    /// both the source and the destination; every other half-copied file is recopied, and a half-copied single file is validated by re-reading and hashing it against the source (`--resume-verify=chunks` runs as `full` for a single file). Under
     /// --durability=normal a checkpoint is advisory and is validated against the data before it is trusted.
     #[arg(long, conflicts_with = "restart")]
     resume: bool,

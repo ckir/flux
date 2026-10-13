@@ -1,6 +1,6 @@
 # Cut 9g: single-file resume (design)
 
-Status: DRAFT, not yet approved by the owner. Spec authority: `FLUX_FULL_UPDATED_SPEC_V16.md` sections 36, 119 (single-file layout), 120, 121. Built on cuts 9f-1 and 9f-2 (`docs/superpowers/specs/2026-10-12-cut-9f1-chunk-checkpoints-design.md`, `docs/superpowers/specs/2026-10-13-cut-9f2-resume-verify-design.md`).
+Status: IMPLEMENTED; approved by the owner 2026-10-14 (plan `docs/superpowers/plans/2026-10-14-cut-9g-single-file-resume.md`). Spec authority: `FLUX_FULL_UPDATED_SPEC_V16.md` sections 36, 119 (single-file layout), 120, 121. Built on cuts 9f-1 and 9f-2 (`docs/superpowers/specs/2026-10-12-cut-9f1-chunk-checkpoints-design.md`, `docs/superpowers/specs/2026-10-13-cut-9f2-resume-verify-design.md`).
 
 How this was decided: the owner chose to skip the interview and asked for a scope proposal. The cut 9f-3 scope was put to agy first (`.clavity/seams/9f3-scope-fork{,-r2}.md`; ALIGNED after one negotiation round) and the owner approved: 9f-3 as parked is NOT built (closed by ruling in `TODO.md`), and the next cut is single-file checkpoints. The storage fork for this cut was put to agy first (`.clavity/seams/sf-ckpt-fork.md`; ALIGNED) and the owner approved all three points: (1) a `full`-only single-file resume with no new on-disk state; (2) `--resume-verify=chunks` on a single file runs as `full` and is reported as such; (3) write this spec. Everything marked **[my call]** is not owner-approved.
 
@@ -31,11 +31,11 @@ Central safety property (unchanged from 9f-1/9f-2): **`--resume` never publishes
 `plan_resume` and `stage_file` take `Option<&FileCkpt<D>>`, and a `FileCkpt` holds a `&Checkpoints<D>` that owns a WAL writer. A single file has no workspace to hold a WAL, so this cut adds a second kind of checkpoint context that needs none. **[my call; the builder confirms the smallest type]** Introduce in `checkpoint/mod.rs`:
 
 ```
-pub(crate) enum Hook<'a, D> {
+pub(crate) enum Hook<'r, 'a, D> {
     /// Cut 9f: a WAL-backed context (tree files).
-    Logged(&'a FileCkpt<'a, D>),
-    /// Cut 9g: no log. `min_len` and `durability` are the policy's.
-    LogFree { min_len: u64, durability: Durability },
+    Logged(&'r FileCkpt<'a, D>),
+    /// Cut 9g: no log. `min_len` is the policy's (ruling P1: there is no `durability` field).
+    LogFree { min_len: u64 },
 }
 ```
 
@@ -54,7 +54,7 @@ Pass `Hook::LogFree{..}` to `copy_file_checkpointed` only when `locked.resumed` 
 A SIGKILL, power loss or panic leaves the partial (the temp is never swept). Every graceful failure inside `stage_file` removes it through `discard` (`copy.rs:843-845`): a read or write error, disk full, a heartbeat failure, a failed duplicate handle, a Strict metadata or sync failure. The one variant that keeps it, `StreamFail::Keep` (`copy.rs:520`), is produced only by a WAL failure, which a log-free run cannot have. `discard` itself leaves the temp as a reported leftover when `guard()` fails (a lost lock). The tree path behaves the same for data errors. So the benefit is the crash case, which is the case that matters. A failed run that kept its state record and removed its partial resumes as a fresh copy and reports nothing, which is today's behaviour.
 
 ## 5. Why a log-free resume is safe
-No byte is trusted that was not hashed on both sides in this run. The partial is reopened by the identity `decide_full`'s `partial_meta` captured (`open_existing`), truncated to the proven prefix, and appended to. A partial that is not a regular file, has more than one link, or has an unavailable identity is `Unreadable` and recopied (unchanged `plan_resume` rules). A source that changed since the crash differs from the partial at the first changed chunk (or, if only its tail changed, in the carried tail), so the partial's equal prefix is kept only where the source still matches. Accepted costs: the whole partial and the source prefix are re-read on EVERY resume, so a second crash during a long validation re-reads it again (the hash is not incremental); and nothing prints progress while it runs (only the heartbeat beats). Measured in cut 9f-2: measured in cut 9f-2 at equal to about 10% above `chunks` at 1 to 3.6 GB partials, on a warm cache.
+No byte is trusted that was not hashed on both sides in this run. The partial is reopened by the identity `decide_full`'s `partial_meta` captured (`open_existing`), truncated to the proven prefix, and appended to. A partial that is not a regular file, has more than one link, or has an unavailable identity is `Unreadable` and recopied (unchanged `plan_resume` rules). A source that changed since the crash differs from the partial at the first changed chunk (or, if only its tail changed, in the carried tail), so the partial's equal prefix is kept only where the source still matches. Accepted costs: the whole partial and the source prefix are re-read on EVERY resume, so a second crash during a long validation re-reads it again (the hash is not incremental); and nothing prints progress while it runs (only the heartbeat beats). Measured in cut 9f-2 at equal to about 10% above `chunks` at 1 to 3.6 GB partials, on a warm cache.
 
 ## 6. Cases and tests
 Oracles are the design lines cited; a conflict surfaces rather than editing a test.
@@ -79,4 +79,9 @@ Open, with where each resolves: (a) the exact shape of the `Hook` type and wheth
 - AGY-AFTER panel round 1 (agy, 8 seats; the driver ran a solo panel first and folded five findings): GREEN, no live challenge. DISCARDED-BELOW-FLOOR: the hook enum's name (stylistic; section 7 (a) leaves it to the plan), and whether the single-file reuse lives on `Run` or `Outcome` (internal data flow; section 4.3 and 7 (b) leave it to the plan). The owner decisions (log-free `full`, `chunks` upgraded and reported, no sidecar) were not challenged.
 
 ## 9. Deviations and amendments recorded at merge
-(empty until merge)
+- **P1.** `Hook::LogFree` carries only `min_len`, not `durability` (section 4.1 listed both): with no sink the durability is never read, and an unread field warns.
+- **P2.** `run::file` passes `LogFree` only when the source length is at least `min_len` (one extra `fs.metadata(src)`), in addition to the prior having been adopted. Below `min_len` the old path swept the partial BEFORE the claim; `LogFree` would move that sweep after it and shift the e2e stall indices. PROVEN: dropping the `>= min_len` condition turns the existing e2e test `a_killed_single_file_copy_resumes_keeping_its_id_and_bumping_its_generation` red.
+- **P3.** `FileResume` carries `recopied` (the bytes the run copied) as well as `reused` and `discard`, so the CLI prints the tree's `resumed X: reused N bytes, recopied M bytes` line.
+- **Plan text corrections found in execution (intent honoured):** the heartbeat in `log_free_heartbeat_failure_leaves_the_partial_untouched` fails on the 4th call, because `stage_file` beats twice before `plan_resume`; the pre-publish stall index of the resume in `a_single_file_resume_killed_again_resumes_a_third_time` is 4, not 3 (measured: 1 to 3 leave the damaged partial, 4 leaves a whole partial); the log-free hook replaced by `None` turns 3 of the 4 new e2e tests red (the fourth expects no reuse).
+- **Two non-resume fixtures were corrected in review:** `a_fresh_single_file_run_never_reads_a_partial` first put its stray partial under a name the run never opens (vacuous); the partial now sits under the run's own id.
+- **Counts:** the suite grew from 1423 to 1446 tests (8 copy, 7 run, 4 report, 4 e2e), 5 skipped, unchanged.
