@@ -553,9 +553,14 @@ pub(crate) enum Stage<W> {
 /// file, the partial's metadata and its bytes, and the source prefix; changes NOTHING on disk. Returns the verdict
 /// and, for a resume, the partial's identity, which the caller needs to reopen it for writing.
 ///
-/// No checkpoints for the file is a plain fresh copy (`discard: None`) that touches nothing. A log that cannot be
-/// read, a partial that is not a regular file, or one that cannot be opened for reading is a fresh copy with
-/// `Discard::Unreadable`; a partial that is not there is `decide`'s `PartialMissing`.
+/// Under `--resume-verify=chunks`: no checkpoints for the file is a plain fresh copy (`discard: None`) that touches
+/// nothing. A log that cannot be read, a partial that is not a regular file, or one that cannot be opened for reading
+/// is a fresh copy with `Discard::Unreadable`; a partial that is not there is `decide`'s `PartialMissing`.
+///
+/// Under `full` the log never decides validity: an absent, unreadable or empty log still salvages the partial, proven
+/// chunk by chunk against the source by `decide_full`. The log is read only to choose the report when there is no
+/// partial: `PartialMissing` iff it began the file, nothing otherwise (an unreadable log with no partial reports
+/// nothing). A partial that is not a regular file is `Unreadable` under both levels.
 fn plan_resume<D: DirHandle + Send + 'static, R: std::io::Read>(
     fc: &FileCkpt<'_, D>,
     parent: &D,
@@ -603,7 +608,7 @@ fn plan_resume<D: DirHandle + Send + 'static, R: std::io::Read>(
     } else {
         None
     };
-    // A heartbeat failure inside `decide` is the lost lock; any other failure is reading the source.
+    // A heartbeat failure inside `decide` or `decide_full` is the lost lock; any other failure is reading the source.
     let beat_failed = std::cell::Cell::new(false);
     let watched = || beat().inspect_err(|_| beat_failed.set(true));
     let identity = crate::state::identity_text(src_meta.identity).into_bytes();
@@ -3937,11 +3942,15 @@ mod tests {
             .err()
             .expect("the lost lock stops the copy");
         assert_eq!(e.step, CopyStep::Heartbeat);
-        if fs.exists(WAL_PATH) {
-            assert!(wal_bodies(&fs).is_empty(), "no FileBegin and no Range: {:?}", wal_bodies(&fs));
-        }
         assert!(!fs.called("truncate_to("), "the partial is untouched: {:?}", fs.calls());
-        run.abandon();
+        // `finish` flushes whatever was pending (the segment is created lazily on the first flush), so an absent
+        // segment or an empty one is the pass case and a pending `FileBegin` or `Range` would show up here.
+        assert!(run.finish(&no_heartbeat).is_clean());
+        let bodies = if fs.exists(WAL_PATH) { wal_bodies(&fs) } else { Vec::new() };
+        assert!(
+            !bodies.iter().any(|b| matches!(b, Body::FileBegin(_) | Body::Range(_))),
+            "no FileBegin and no Range: {bodies:?}"
+        );
     }
 
     #[test]
