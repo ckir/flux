@@ -186,6 +186,9 @@ pub(crate) fn open_operation<'a, D: DirHandle, P: Place<D>>(
                 };
                 let mut state = prior.state.clone();
                 state.config = Some(config);
+                // Cut 9f-1: the new WAL generation is durable with the TRANSFERRING write that follows, before any
+                // WAL is opened. `resume::validate` refused every prior older than format 4.
+                state.wal.as_mut().expect("v4").wal_generation += 1;
                 if file.is_some()
                     && let Some(f) = &mut state.file
                 {

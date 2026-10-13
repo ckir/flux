@@ -437,7 +437,7 @@ mod tests {
     fn an_unreadable_newer_or_mismatched_manifest_is_refused() {
         for (bytes, code) in [
             (b"garbage".to_vec(), LockCode::StateCorrupt),
-            (br#"{"format_version":4}"#.to_vec(), LockCode::IncompatibleState),
+            (br#"{"format_version":5}"#.to_vec(), LockCode::IncompatibleState),
             (state(3, Kind::Tree, OpState::Created).encode(), LockCode::StateCorrupt),
             (state(4, Kind::File, OpState::Created).encode(), LockCode::StateCorrupt),
         ] {
@@ -447,7 +447,7 @@ mod tests {
             let r = refusal(scan(&d, 0));
             assert_eq!(r.code, code, "{}", r.detail);
             if code == LockCode::IncompatibleState {
-                assert!(r.detail.contains("format_version 4"), "{}", r.detail);
+                assert!(r.detail.contains("format_version 5"), "{}", r.detail);
             }
         }
     }
@@ -511,7 +511,7 @@ mod tests {
         let t = OsStr::new("t");
         for (bytes, code) in [
             (state(3, Kind::File, OpState::Created).encode(), LockCode::StateCorrupt),
-            (br#"{"format_version":4}"#.to_vec(), LockCode::IncompatibleState),
+            (br#"{"format_version":5}"#.to_vec(), LockCode::IncompatibleState),
         ] {
             let (fs, d) = dest();
             fs.write_file(rec(t, 4), &bytes);
@@ -586,19 +586,22 @@ mod tests {
             PriorOp { state, shown: PathBuf::from(format!("D/.flux/operations/{n}/manifest")) }
         };
         let detail = |ops: &[PriorOp]| refusal::<()>(Err(resumable_refusal(ops))).detail;
-        let r = refusal::<()>(Err(resumable_refusal(&[op(1, 3, OpState::Failed)])));
+        let r = refusal::<()>(Err(resumable_refusal(&[op(1, FORMAT_VERSION, OpState::Failed)])));
         assert_eq!(r.code, LockCode::ResumableOperationExists);
         for part in [id(1).as_str(), "FAILED", "--resume to continue it", "--restart", "manifest"] {
             assert!(r.detail.contains(part), "{part}: {}", r.detail);
         }
-        for v in [1, 2] {
+        for v in [1, 2, 3] {
             let d = detail(&[op(1, v, OpState::Created)]);
             for part in ["created by an older version", "--restart", "recorded progress"] {
                 assert!(d.contains(part), "{part}: {d}");
             }
             assert!(!d.contains("--resume to continue"), "{d}");
         }
-        let d = detail(&[op(1, 3, OpState::Failed), op(2, 3, OpState::Transferring)]);
+        let d = detail(&[
+            op(1, FORMAT_VERSION, OpState::Failed),
+            op(2, FORMAT_VERSION, OpState::Transferring),
+        ]);
         for part in [
             id(1).as_str(),
             id(2).as_str(),

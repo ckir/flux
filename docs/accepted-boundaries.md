@@ -62,3 +62,14 @@ One section per audited change, newest at the bottom.
   unchanged, and the dry run on all three hosted runners (Bench run 37112559659) produced complete headers: commit,
   run, a three-id `source`, image, cache, Defender (off on the Windows runner) and tool versions. Owner-accepted
   2026-10-03.
+
+## Cut 9f-1 plan 1 - the WAL and the handle primitives (test audit 2026-10-12)
+
+- **A file-level name-surrogate reparse point is not planted on Windows for `open_read`.** `dir_windows.rs:545` returns
+  `SafetyRejected` for a name-surrogate tag found on a handle that opened as a file. The runner cannot plant a file
+  symlink (it needs a privilege the CI runner lacks), and the one surrogate it can plant, a junction, is answered
+  earlier as `IsADirectory` by `FILE_NON_DIRECTORY_FILE`, so `open_read_answers_a_junction_as_a_directory_and_leaves_its_target_alone`
+  (`dir_handle.rs:1613`) never reaches the tag check. Compensation: the predicate itself is unit-tested
+  (`dir_windows.rs:1755`: a junction tag is a surrogate, 0 and the OneDrive tag are not), the same check guards the
+  other handle opens, and the POSIX arm pins its symlink analogue (`open_read_refuses_a_symlink_as_safety_rejected`,
+  `dir_handle.rs:583`). Re-check that all three still exist before honouring this entry.

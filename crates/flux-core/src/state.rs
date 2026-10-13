@@ -12,9 +12,11 @@ use std::ffi::{OsStr, OsString};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
-/// The version this binary writes (cut 9a). It reads `V1` and `V2` too and never upgrades a record it rewrites
-/// (decision 5).
-pub const FORMAT_VERSION: u64 = 3;
+/// The version this binary writes (cut 9f-1). It reads `V1`, `V2` and `V3` too and never upgrades a record it
+/// rewrites (decision 5).
+pub const FORMAT_VERSION: u64 = 4;
+/// Cut 9a's version: read, and rewritten as itself.
+pub const V3: u64 = 3;
 /// Cut 7b's version: read, and rewritten as itself.
 pub const V2: u64 = 2;
 /// Cut 7a's version: read, classified as 7a classifies it, and rewritten as itself.
@@ -51,6 +53,8 @@ const FILE_KEYS: [&str; 10] = [
 ];
 /// Version 3's keys for both kinds (cut 9a, "Manifest format 3").
 const CONFIG_KEYS: [&str; 3] = ["roots", "options", "configuration_fingerprint"];
+/// Version 4's key for both kinds (cut 9f-1): the WAL generation.
+const WAL_KEYS: [&str; 1] = ["wal_generation"];
 /// The first line of the canonical configuration bytes the fingerprint hashes.
 pub const FINGERPRINT_HEADER: &str = "flux-config-v1\n";
 
@@ -222,6 +226,14 @@ impl Takeover {
     }
 }
 
+/// Version 4's record (cut 9f-1, both kinds): the generation of the operation's write-ahead log. It is 1 for a new
+/// operation and one more for each `--resume` adoption.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Wal {
+    pub wal_generation: u64,
+}
+
 /// §218's record (cut 7b, version 2, both kinds): `cleanup_pending` is true from the `COMPLETED` write on, and the
 /// artifacts are the temporaries the copy could not remove, each in `native_hex`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,9 +286,12 @@ pub struct OperationState {
     /// Version 2, a single file (cut 7b, §249.1): `Some` exactly for a version-2 `Kind::File` record.
     #[serde(skip)]
     pub file: Option<FileFields>,
-    /// Version 3 (cut 9a): `Some` exactly when `format_version` is 3.
+    /// Version 3 and later (cut 9a): `Some` exactly when `format_version` is at least 3.
     #[serde(skip)]
     pub config: Option<Config>,
+    /// Version 4 (cut 9f-1): `Some` exactly when `format_version` is 4.
+    #[serde(skip)]
+    pub wal: Option<Wal>,
 }
 
 /// Why a state record cannot be used.
@@ -309,6 +324,7 @@ impl OperationState {
             cleanup: None,
             file: None,
             config: None,
+            wal: None,
         }
     }
 
@@ -337,7 +353,23 @@ impl OperationState {
         }
     }
 
-    /// A new operation's state as THIS binary writes it: version 3, `CREATED`.
+    /// A new operation's state as a cut-9a binary wrote it: version 3, `CREATED` (tests stage it).
+    pub fn created_v3(
+        operation_id: &str,
+        kind: Kind,
+        destination_root: &Path,
+        created_at: u64,
+        file: Option<FileFields>,
+        config: Config,
+    ) -> Self {
+        Self {
+            format_version: V3,
+            config: Some(config),
+            ..Self::created_v2(operation_id, kind, destination_root, created_at, file)
+        }
+    }
+
+    /// A new operation's state as THIS binary writes it: version 4, `CREATED`, WAL generation 1.
     pub fn created(
         operation_id: &str,
         kind: Kind,
@@ -348,8 +380,8 @@ impl OperationState {
     ) -> Self {
         Self {
             format_version: FORMAT_VERSION,
-            config: Some(config),
-            ..Self::created_v2(operation_id, kind, destination_root, created_at, file)
+            wal: Some(Wal { wal_generation: 1 }),
+            ..Self::created_v3(operation_id, kind, destination_root, created_at, file, config)
         }
     }
 
@@ -369,6 +401,9 @@ impl OperationState {
         }
         if let Some(c) = &self.config {
             map.extend(object(c));
+        }
+        if let Some(w) = &self.wal {
+            map.extend(object(w));
         }
         serde_json::to_vec(&map).expect("an operation state always serializes")
     }
@@ -392,11 +427,12 @@ pub fn decode(bytes: &[u8]) -> Result<OperationState, Unusable> {
         })?,
         None => return Err(Unusable::Corrupt("no format_version".to_string())),
     };
-    if version != V1 && version != V2 && version != FORMAT_VERSION {
+    if version != V1 && version != V2 && version != V3 && version != FORMAT_VERSION {
         return Err(Unusable::Incompatible(version));
     }
     let v2 = version >= V2;
-    let v3 = version == FORMAT_VERSION;
+    let v3 = version >= V3;
+    let v4 = version == FORMAT_VERSION;
     let file = v2 && map.get("kind").and_then(Value::as_str) == Some("file");
     let mut expected: Vec<&str> = KEYS.to_vec();
     if v2 {
@@ -407,6 +443,9 @@ pub fn decode(bytes: &[u8]) -> Result<OperationState, Unusable> {
     }
     if v3 {
         expected.extend(CONFIG_KEYS);
+    }
+    if v4 {
+        expected.extend(WAL_KEYS);
     }
     if let Some(key) = map.keys().find(|k| !expected.contains(&k.as_str())) {
         return Err(Unusable::Corrupt(format!("unknown key {key}")));
@@ -435,11 +474,17 @@ pub fn decode(bytes: &[u8]) -> Result<OperationState, Unusable> {
     } else {
         None
     };
+    let wal = if v4 {
+        Some(serde_json::from_value::<Wal>(take(&WAL_KEYS)).map_err(malformed)?)
+    } else {
+        None
+    };
     let mut state: OperationState =
         serde_json::from_value(Value::Object(map)).map_err(malformed)?;
     state.cleanup = cleanup;
     state.file = fields;
     state.config = config;
+    state.wal = wal;
     validate(&state).map_err(Unusable::Corrupt)?;
     Ok(state)
 }
@@ -480,7 +525,8 @@ fn validate(s: &OperationState) -> Result<(), String> {
         }
     }
     let v2 = s.format_version >= V2;
-    if (s.format_version == FORMAT_VERSION) != s.config.is_some()
+    if (s.format_version >= V3) != s.config.is_some()
+        || (s.format_version == FORMAT_VERSION) != s.wal.is_some()
         || v2 != s.cleanup.is_some()
         || (v2 && s.kind == Kind::File) != s.file.is_some()
     {
@@ -522,6 +568,11 @@ fn validate(s: &OperationState) -> Result<(), String> {
         if f.len() != 64 || !f.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
             return Err(format!("configuration_fingerprint is not 64 lowercase hex: {f}"));
         }
+    }
+    if let Some(w) = &s.wal
+        && w.wal_generation == 0
+    {
+        return Err("wal_generation is 0".to_string());
     }
     if let Some(c) = &s.cleanup {
         if c.cleanup_pending != (s.state == OpState::Completed) {
@@ -879,6 +930,26 @@ pub fn finish_retire<D: DirHandle>(operations: &D, name: &OsStr) -> flux_fs::Res
         ] {
             remove_if_present(&dir, &known)?;
         }
+        // The one known subdirectory, the checkpoint log, after the flat names so a stranger inside it still leaves
+        // them gone; the stranger keeps `wal/` and so the workspace.
+        match dir.open_dir(OsStr::new(crate::wal::writer::DIR_NAME)) {
+            Ok(w) => {
+                remove_if_present(&w, OsStr::new(crate::wal::writer::SEGMENT_NAME))?;
+                // Owner ruling 23: the damaged segments a run set aside (`000001.corrupt-<generation>[-<n>]`) go with
+                // the log; any other name is a stranger and stays.
+                let quarantined = format!("{}.corrupt-", crate::wal::writer::SEGMENT_NAME);
+                for entry in w.read_dir()? {
+                    if entry.name.to_str().is_some_and(|n| n.starts_with(&quarantined)) {
+                        remove_if_present(&w, &entry.name)?;
+                    }
+                }
+                // Closed before its directory is removed.
+                drop(w);
+                dir.remove_dir(OsStr::new(crate::wal::writer::DIR_NAME))?;
+            }
+            Err(e) if e.source.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
         // Closed before the directory is removed.
     }
     operations.remove_dir(name)
@@ -1006,8 +1077,8 @@ mod tests {
     #[test]
     fn format_version_is_judged_before_any_other_key() {
         assert_eq!(
-            decode(br#"{"format_version":4,"anything":[1,2]}"#),
-            Err(Unusable::Incompatible(4))
+            decode(br#"{"format_version":5,"anything":[1,2]}"#),
+            Err(Unusable::Incompatible(5))
         );
         assert!(matches!(decode(br#"{"kind":"tree"}"#), Err(Unusable::Corrupt(_))), "none");
         assert!(matches!(decode(br#"{"format_version":"1"}"#), Err(Unusable::Corrupt(_))), "text");
@@ -1329,6 +1400,94 @@ mod tests {
         ops.open_dir(&removing).unwrap().remove_file(OsStr::new("extra")).unwrap();
         finish_retire(&ops, &removing).unwrap();
         assert!(!fs.exists(&path));
+    }
+
+    #[test]
+    fn finish_retire_removes_the_wal_directory_and_its_segment() {
+        let (fs, d) = dest();
+        let ops = operations_dir(&d, Path::new("D")).unwrap();
+        let path = format!("/p/dest/.flux/operations/{}.removing", id(1));
+        fs.create_dir(Path::new(&path)).unwrap();
+        fs.create_dir(Path::new(&format!("{path}/wal"))).unwrap();
+        fs.write_file(format!("{path}/{MANIFEST}"), b"x");
+        fs.write_file(format!("{path}/wal/000001"), b"segment");
+        let removing = OsString::from(format!("{}.removing", id(1)));
+        finish_retire(&ops, &removing).unwrap();
+        assert!(!fs.exists(format!("{path}/wal/000001")));
+        assert!(!fs.exists(format!("{path}/wal")));
+        assert!(!fs.exists(&path));
+    }
+
+    #[test]
+    fn finish_retire_keeps_a_wal_directory_that_holds_a_stranger() {
+        let (fs, d) = dest();
+        let ops = operations_dir(&d, Path::new("D")).unwrap();
+        let path = format!("/p/dest/.flux/operations/{}.removing", id(1));
+        fs.create_dir(Path::new(&path)).unwrap();
+        fs.create_dir(Path::new(&format!("{path}/wal"))).unwrap();
+        for name in [MANIFEST, "manifest.tmp", STATE_DB, "wal/000001", "wal/extra"] {
+            fs.write_file(format!("{path}/{name}"), b"x");
+        }
+        let removing = OsString::from(format!("{}.removing", id(1)));
+        let e = finish_retire(&ops, &removing).unwrap_err();
+        assert_eq!(e.source.kind(), ErrorKind::DirectoryNotEmpty);
+        assert!(fs.exists(format!("{path}/wal/extra")), "a stranger stays");
+        for name in [MANIFEST, "manifest.tmp", STATE_DB] {
+            assert!(!fs.exists(format!("{path}/{name}")), "{name} is a known name");
+        }
+    }
+
+    // Owner ruling 23. Mutant: `finish_retire` removes `000001` only, not its `.corrupt-` quarantine names.
+    #[test]
+    fn finish_retire_removes_quarantined_segments_and_keeps_a_stranger() {
+        let (fs, d) = dest();
+        let ops = operations_dir(&d, Path::new("D")).unwrap();
+        let path = format!("/p/dest/.flux/operations/{}.removing", id(1));
+        fs.create_dir(Path::new(&path)).unwrap();
+        fs.create_dir(Path::new(&format!("{path}/wal"))).unwrap();
+        fs.write_file(format!("{path}/{MANIFEST}"), b"x");
+        for name in ["000001", "000001.corrupt-2", "000001.corrupt-2-2", "000001.corrupt-7"] {
+            fs.write_file(format!("{path}/wal/{name}"), b"segment");
+        }
+        let removing = OsString::from(format!("{}.removing", id(1)));
+        finish_retire(&ops, &removing).unwrap();
+        assert!(!fs.exists(format!("{path}/wal")) && !fs.exists(&path));
+
+        // A stranger beside the quarantine names (even one that only resembles them) keeps `wal/` and the
+        // workspace; the segment and the quarantine names still go.
+        let (fs, d) = dest();
+        let ops = operations_dir(&d, Path::new("D")).unwrap();
+        fs.create_dir(Path::new(&path)).unwrap();
+        fs.create_dir(Path::new(&format!("{path}/wal"))).unwrap();
+        fs.write_file(format!("{path}/{MANIFEST}"), b"x");
+        for name in ["000001", "000001.corrupt-2", "000001.corruptx", "000002.corrupt-2"] {
+            fs.write_file(format!("{path}/wal/{name}"), b"segment");
+        }
+        let e = finish_retire(&ops, &removing).unwrap_err();
+        assert_eq!(e.source.kind(), ErrorKind::DirectoryNotEmpty);
+        for gone in ["000001", "000001.corrupt-2"] {
+            assert!(!fs.exists(format!("{path}/wal/{gone}")), "{gone}");
+        }
+        for kept in ["000001.corruptx", "000002.corrupt-2"] {
+            assert!(fs.exists(format!("{path}/wal/{kept}")), "{kept} is a stranger");
+        }
+        assert!(!fs.exists(format!("{path}/{MANIFEST}")), "the flat known names still go first");
+    }
+
+    #[test]
+    fn retire_workspace_removes_a_workspace_with_a_wal() {
+        let (fs, d) = dest();
+        let ops = operations_dir(&d, Path::new("D")).unwrap();
+        drop(create_workspace(&ops, &created()).unwrap());
+        let path = format!("/p/dest/.flux/operations/{}", id(1));
+        fs.create_dir(Path::new(&format!("{path}/wal"))).unwrap();
+        fs.write_file(format!("{path}/wal/000001"), b"segment");
+        retire_workspace(&ops, &id(1)).unwrap();
+        assert!(!fs.exists(&path) && !fs.exists(format!("{path}.removing")));
+        let calls: Vec<String> = fs.calls().iter().map(|c| c.replace('\\', "/")).collect();
+        let retire = position(&calls, &format!("rename_no_replace({path} -> {path}.removing)"));
+        let segment = position(&calls, &format!("remove_file({path}.removing/wal/000001)"));
+        assert!(retire < segment, "the id name goes first: {calls:?}");
     }
 
     #[test]
@@ -1675,11 +1834,11 @@ mod tests {
     }
 
     fn tree_v3() -> OperationState {
-        OperationState::created(&id(1), Kind::Tree, Path::new("/d"), 5, None, config())
+        OperationState::created_v3(&id(1), Kind::Tree, Path::new("/d"), 5, None, config())
     }
 
     fn file_v3() -> OperationState {
-        OperationState::created(
+        OperationState::created_v3(
             &id(1),
             Kind::File,
             Path::new("/d/t"),
@@ -1709,6 +1868,83 @@ mod tests {
         let s = file_v3();
         assert_eq!(keys(&s), sorted(&[&KEYS, &CLEANUP_KEYS, &FILE_KEYS, &CONFIG_KEYS]));
         assert_eq!(decode(&s.encode()), Ok(s));
+    }
+
+    fn tree_v4() -> OperationState {
+        OperationState::created(&id(1), Kind::Tree, Path::new("/d"), 5, None, config())
+    }
+
+    fn file_v4() -> OperationState {
+        OperationState::created(
+            &id(1),
+            Kind::File,
+            Path::new("/d/t"),
+            5,
+            Some(file_fields()),
+            config(),
+        )
+    }
+
+    fn edited_v4(
+        edit: &dyn Fn(&mut serde_json::Map<String, serde_json::Value>),
+    ) -> Result<OperationState, Unusable> {
+        let mut v: serde_json::Value = serde_json::from_slice(&tree_v4().encode()).unwrap();
+        edit(v.as_object_mut().unwrap());
+        decode(v.to_string().as_bytes())
+    }
+
+    #[test]
+    fn a_version_4_tree_state_carries_the_config_and_wal_keys_and_round_trips() {
+        let s = tree_v4();
+        assert_eq!(keys(&s), sorted(&[&KEYS, &CLEANUP_KEYS, &CONFIG_KEYS, &WAL_KEYS]));
+        assert_eq!(s.format_version, 4);
+        assert_eq!(s.wal, Some(Wal { wal_generation: 1 }));
+        assert_eq!(decode(&s.encode()), Ok(s));
+    }
+
+    #[test]
+    fn a_version_4_file_record_carries_the_file_config_and_wal_keys_and_round_trips() {
+        let s = file_v4();
+        assert_eq!(keys(&s), sorted(&[&KEYS, &CLEANUP_KEYS, &FILE_KEYS, &CONFIG_KEYS, &WAL_KEYS]));
+        assert_eq!(decode(&s.encode()), Ok(s));
+    }
+
+    #[test]
+    fn a_version_3_record_still_decodes_with_no_wal_and_rewrites_as_version_3() {
+        for s in [tree_v3(), file_v3()] {
+            let d = decode(&s.encode()).unwrap();
+            assert_eq!((d.format_version, d.wal.is_none(), d.config.is_some()), (V3, true, true));
+            let rewritten =
+                OperationState { state: OpState::Abandoned, superseded_by: Some(id(2)), ..d };
+            let again = decode(&rewritten.encode()).unwrap();
+            assert_eq!(again.format_version, V3);
+            assert!(!keys(&again).contains(&"wal_generation".to_string()));
+            assert_eq!(again, rewritten);
+        }
+    }
+
+    #[test]
+    fn a_version_4_record_without_wal_generation_is_corrupt() {
+        let r = edited_v4(&|m| {
+            m.remove("wal_generation");
+        });
+        assert_eq!(r, Err(Unusable::Corrupt("missing key wal_generation".to_string())));
+    }
+
+    #[test]
+    fn a_version_4_record_with_wal_generation_0_is_corrupt() {
+        let r = edited_v4(&|m| {
+            m.insert("wal_generation".to_string(), serde_json::json!(0));
+        });
+        assert_eq!(r, Err(Unusable::Corrupt("wal_generation is 0".to_string())));
+    }
+
+    #[test]
+    fn a_version_5_record_is_incompatible() {
+        let r = edited_v4(&|m| {
+            m.insert("format_version".to_string(), serde_json::json!(5));
+        });
+        assert_eq!(r, Err(Unusable::Incompatible(5)));
     }
 
     #[test]
@@ -1836,11 +2072,6 @@ mod tests {
         ] {
             assert!(matches!(r, Err(Unusable::Corrupt(_))), "{what}: {r:?}");
         }
-    }
-
-    #[test]
-    fn a_version_4_record_is_incompatible() {
-        assert_eq!(decode(br#"{"format_version":4}"#), Err(Unusable::Incompatible(4)));
     }
 
     #[test]

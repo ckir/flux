@@ -35,6 +35,7 @@ fn cfg() -> RunConfig {
         heartbeat_interval: std::time::Duration::from_secs(3600),
         resume: false,
         descriptor_limit: None,
+        resume_verify: ResumeVerify::Chunks,
     }
 }
 
@@ -2337,6 +2338,7 @@ fn a_target_that_finds_its_own_claim_proceeds() {
             age: std::time::Duration::from_secs(3600),
             ..crate::tree::BatchPolicy::DEFAULT
         },
+        ckpt: None,
     };
     let mut out = TreeOutcome::default();
     let mut got = Vec::new();
@@ -2710,6 +2712,30 @@ fn prior3_with(fs: &FaultFs, n: u8, s: OpState, o: &CopyOptions) -> OperationSta
     state
 }
 
+/// A FORMAT-3 prior tree operation `n` in state `s` (the format before the WAL generation), written under `/p/dest`.
+fn prior3_older(fs: &FaultFs, n: u8, s: OpState) -> OperationState {
+    let o = opts();
+    for d in ["/p/dest", "/p/dest/.flux", "/p/dest/.flux/operations"] {
+        if !fs.exists(d) {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+    }
+    fs.create_dir(Path::new(&format!("/p/dest/.flux/operations/{}", id(n)))).unwrap();
+    let state = OperationState {
+        state: s,
+        ..OperationState::created_v3(
+            &id(n),
+            Kind::Tree,
+            Path::new("/p/dest"),
+            1,
+            None,
+            tree_config(fs, &o),
+        )
+    };
+    write_manifest(fs, &state);
+    state
+}
+
 fn prior3(fs: &FaultFs, n: u8, s: OpState) -> OperationState {
     prior3_with(fs, n, s, &opts())
 }
@@ -2764,8 +2790,8 @@ fn resume_with_no_prior_starts_a_new_operation_and_says_so() {
 fn a_new_tree_manifest_is_version_3_with_roots_options_and_fingerprint() {
     let fs = fake();
     let s = kept_tree_manifest(&fs);
-    assert_eq!(s.format_version, 3);
-    let c = s.config.expect("version 3 carries its configuration");
+    assert_eq!(s.format_version, crate::state::FORMAT_VERSION);
+    let c = s.config.expect("version 3 and later carry their configuration");
     assert_eq!(c.roots.len(), 1);
     assert_eq!(c.roots[0].destination_prefix, "");
     assert_eq!(c.roots[0].source_root, native_hex(&absolute_lexical(Path::new("/src"))));
@@ -2825,8 +2851,13 @@ fn the_adopted_manifest_goes_transferring_before_the_copy() {
     let (r, _) = run_tree(&fs, &resume());
     ok(&r);
     let m = seen.lock().unwrap().clone().expect("read during the copy");
-    assert_eq!((m.state, m.format_version), (OpState::Transferring, 3));
+    assert_eq!((m.state, m.format_version), (OpState::Transferring, crate::state::FORMAT_VERSION));
     assert_eq!(m.config, before.config);
+    assert_eq!(
+        m.wal.expect("v4").wal_generation,
+        before.wal.expect("v4").wal_generation + 1,
+        "the bumped generation is already on disk in the TRANSFERRING write"
+    );
 }
 
 #[test]
@@ -2844,6 +2875,49 @@ fn two_resumable_priors_are_refused_naming_both_with_and_without_resume() {
         assert!(!fs.exists(LOCK));
         assert_eq!(manifest(&fs, &id(5)).state, OpState::Failed);
         assert_eq!(manifest(&fs, &id(6)).state, OpState::Created);
+    }
+}
+
+#[test]
+fn resume_refuses_a_format_3_prior_as_older_and_names_restart() {
+    let fs = fake();
+    let prior = prior3_older(&fs, 5, OpState::Failed);
+    assert_eq!(prior.format_version, 3);
+    let (r, _) = run_tree(&fs, &resume());
+    assert_eq!(refused(&r.stop), (LockCode::IncompatibleState, false));
+    let d = detail(&r.stop);
+    assert!(d.contains("created by an older version (format 3)") && d.contains("--restart"), "{d}");
+    assert_eq!(manifest(&fs, &id(5)), prior, "the refusal changed nothing");
+}
+
+#[test]
+fn a_new_tree_operation_starts_at_wal_generation_1() {
+    let fs = fake();
+    let s = kept_tree_manifest(&fs);
+    assert_eq!(s.format_version, crate::state::FORMAT_VERSION);
+    assert_eq!(s.wal.expect("version 4 carries its WAL generation").wal_generation, 1);
+}
+
+#[test]
+fn an_adopted_prior_bumps_its_wal_generation() {
+    let fs = FaultFs::new();
+    for d in ["/src", "/src/sub", "/p", "/p/dest"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    fs.write_file("/src/sub/b", b"BB");
+    let p = prior3(&fs, 5, OpState::Failed);
+    assert_eq!(p.wal.expect("v4").wal_generation, 1);
+    drop(prior_store(&fs, 5));
+    // `sub` IS DEST by identity: each copy refuses it before creating anything, so the adopted workspace is kept
+    // FAILED and resumable again.
+    fs.set_identity("/src/sub", fs.metadata(Path::new("/p/dest")).unwrap().identity);
+    for expected in [2_u64, 3] {
+        let (r, _) = run_tree(&fs, &resume());
+        assert!(r.stop.is_none(), "{:?}", r.stop);
+        assert!(matches!(&r.copy, Some(Err(a)) if a.refused_unchanged()), "{:?}", r.copy);
+        let stored = manifest(&fs, &id(5));
+        assert_eq!(stored.state, OpState::Failed);
+        assert_eq!(stored.wal.expect("v4").wal_generation, expected);
     }
 }
 
@@ -3041,7 +3115,7 @@ fn a_transferring_or_failed_manifest_without_a_usable_state_db_is_state_corrupt(
 /// its `state.db` is still there, and no `.removing` / `.creating` sibling of its workspace appeared.
 fn assert_prior_survives(fs: &FaultFs, staged: &OperationState) {
     assert_eq!(&manifest(fs, &id(5)), staged, "the prior's manifest is unchanged");
-    assert_eq!(staged.format_version, 3);
+    assert_eq!(staged.format_version, crate::state::FORMAT_VERSION);
     assert!(fs.exists(format!("/p/dest/.flux/operations/{}/state.db", id(5))), "state.db survives");
     for suffix in ["removing", "creating"] {
         let sibling = format!("/p/dest/.flux/operations/{}.{suffix}", id(5));
@@ -3299,7 +3373,10 @@ fn a_refused_unchanged_copy_after_adoption_keeps_the_adopted_workspace() {
     adopted(&r, 5, Some(1));
     assert!(fs.exists(state_db(5)), "the recorded progress survives");
     let m = manifest(&fs, &id(5));
-    assert_eq!((m.state, m.format_version, m.operation_id), (OpState::Failed, 3, id(5)));
+    assert_eq!(
+        (m.state, m.format_version, m.operation_id),
+        (OpState::Failed, crate::state::FORMAT_VERSION, id(5))
+    );
     assert_eq!(m.config, p.config);
     assert!(!fs.exists(LOCK), "released");
 }
@@ -3319,7 +3396,7 @@ fn a_refused_unchanged_single_file_after_adoption_keeps_the_record() {
     let s = file_record(&fs, &id(5));
     assert_eq!(
         (s.state, s.format_version, s.operation_id.as_str()),
-        (OpState::Failed, 3, id(5).as_str())
+        (OpState::Failed, crate::state::FORMAT_VERSION, id(5).as_str())
     );
     assert!(!fs.exists(T_LOCK), "released");
 }
@@ -5410,4 +5487,1712 @@ fn a_zero_open_writers_override_is_floored_to_one() {
         crate::tree::open_writers_cap(cfg().descriptor_limit)
     );
     unsafe { std::env::remove_var("FLUX_TEST_OPEN_WRITERS") };
+}
+
+// ---- cut 9f-1 plan 2, task 8: the tree run owns the checkpoint WAL ----
+
+mod checkpointing {
+    use super::*;
+    use crate::checkpoint::CheckpointPolicy;
+    use crate::wal::record::{Body, Header};
+    use crate::wal::record::{Decoded as WalDecoded, decode_next};
+    use crate::wal::writer::WalConfig;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    const MIB: usize = 1 << 20;
+
+    fn wal() -> String {
+        format!("/p/dest/.flux/operations/{ID}/wal/000001")
+    }
+
+    fn partial() -> String {
+        format!("/p/dest/big.flux-partial.{ID}")
+    }
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| ((i * 7 + i / 251) % 251) as u8).collect()
+    }
+
+    /// `/src/big` of `len` bytes alone in the tree (so nothing else creates files while the WAL does).
+    fn big_fs(len: usize) -> FaultFs {
+        let fs = FaultFs::new();
+        for d in ["/src", "/p"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        fs.write_file("/src/big", &pattern(len));
+        fs
+    }
+
+    /// A policy that checkpoints from 1 MiB, one `Range` per chunk, with the WAL flushing every `flush_bytes`.
+    fn policy(durability: Durability, flush_bytes: u64) -> CheckpointPolicy {
+        CheckpointPolicy {
+            min_len: MIB as u64,
+            range_chunks: 1,
+            wal: WalConfig {
+                flush_interval: Duration::from_secs(3600),
+                flush_bytes,
+                channel_cap: 64,
+                durability,
+            },
+            verify: ResumeVerify::Chunks,
+        }
+    }
+
+    /// Nothing flushes before a `Close` or the `Stop`.
+    fn lazy(durability: Durability) -> CheckpointPolicy {
+        policy(durability, 1 << 50)
+    }
+
+    fn run_with(
+        fs: &FaultFs,
+        c: &RunConfig,
+        o: &CopyOptions,
+        p: CheckpointPolicy,
+    ) -> (Run<Result<TreeOutcome, TreeAbort>>, Vec<TreeFailure>) {
+        let mut got = Vec::new();
+        let r =
+            tree_with(fs, Path::new("/src"), Path::new("/p/dest"), o, c, &mut |f| got.push(f), p);
+        (r, got)
+    }
+
+    fn strict() -> CopyOptions {
+        CopyOptions { durability: Durability::Strict, ..opts() }
+    }
+
+    fn records(bytes: &[u8]) -> Vec<(Header, Body)> {
+        let mut out = Vec::new();
+        let mut at = 0;
+        loop {
+            match decode_next(&bytes[at..]) {
+                WalDecoded::Record { header, body, len, .. } => {
+                    out.push((header, body));
+                    at += len;
+                }
+                WalDecoded::End => return out,
+                other => panic!("unexpected {other:?} at {at}"),
+            }
+        }
+    }
+
+    /// The highest byte a `Range` of the segment covers.
+    fn covered(fs: &FaultFs) -> u64 {
+        let Some(bytes) = fs.read_file(wal()) else { return 0 };
+        // The WAL thread appends asynchronously: a read can end inside a record, which is simply not yet covered.
+        let (mut at, mut high) = (0, 0);
+        while let WalDecoded::Record { body, len, .. } = decode_next(&bytes[at..]) {
+            if let Body::Range(r) = body {
+                high = high.max(r.range_end);
+            }
+            at += len;
+        }
+        high
+    }
+
+    /// Wait (bounded) until the WAL thread has made `bytes` of the file durable in the segment.
+    fn await_covered(fs: &FaultFs, bytes: usize) {
+        for _ in 0..10_000 {
+            if covered(fs) >= bytes as u64 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("the WAL never covered {bytes} bytes: {}", covered(fs));
+    }
+
+    /// Fail the heartbeat (both its attempts) at the first beat after `bytes` of the partial are written; with
+    /// `wait`, only once the segment covers them (the WAL thread is asynchronous). Chained from beat `n` on, because
+    /// the beats before the partial exists cannot be counted in advance.
+    fn stop_beat_at(fs: &FaultFs, n: u32, bytes: usize, wait: bool, lose_lock: bool) {
+        fs.on_nth("write_at_start", n, move |fs| {
+            if fs.read_file(partial()).is_some_and(|b| b.len() >= bytes) {
+                if wait {
+                    await_covered(fs, bytes);
+                }
+                if lose_lock {
+                    fs.write_file(LOCK, b"another run's bytes");
+                } else {
+                    fs.fail("write_at_start", Code::IoError);
+                    fs.on_nth("write_at_start", n + 1, |fs| {
+                        fs.fail("write_at_start", Code::IoError)
+                    });
+                }
+            } else {
+                stop_beat_at(fs, n + 1, bytes, wait, lose_lock);
+            }
+        });
+    }
+
+    /// A first run of a 5 MiB file stopped by a failing heartbeat once 3 MiB of the partial are written and the
+    /// segment covers them (generation 1). Its state is FAILED and its workspace and `wal/` stay.
+    fn crashed_run(fs: &FaultFs) {
+        crashed_run_as(fs, Durability::Normal);
+    }
+
+    /// `crashed_run` under `durability` (Strict stages the file through a batch).
+    fn crashed_run_as(fs: &FaultFs, durability: Durability) {
+        stop_beat_at(fs, 1, 3 * MIB, true, false);
+        let o = CopyOptions { durability, ..opts() };
+        let (r, _) = run_with(fs, &beating(), &o, policy(durability, 1));
+        assert!(r.stop.is_none(), "{:?}", r.stop);
+        assert!(matches!(&r.copy, Some(Err(_))), "{:?}", r.copy);
+        let m = manifest(fs, ID);
+        assert_eq!((m.state, m.wal.map(|w| w.wal_generation)), (OpState::Failed, Some(1)));
+        assert!(covered(fs) >= 3 * MIB as u64);
+        // A crash leaves the partial; this run's discard removed it (its guard still held), so put back what the
+        // crash would have left: the first 3 MiB.
+        if !fs.exists(partial()) {
+            fs.write_file(partial(), &pattern(5 * MIB)[..3 * MIB]);
+        }
+    }
+
+    /// The adopting run: its own id differs from the prior's (`ID`), as a later process's does.
+    fn resuming() -> RunConfig {
+        RunConfig { operation_id: id(9), ..resume() }
+    }
+
+    /// `resuming()` with `--resume-verify=full`.
+    fn resuming_full() -> RunConfig {
+        RunConfig { resume_verify: ResumeVerify::Full, ..resuming() }
+    }
+
+    fn published(fs: &FaultFs, len: usize) {
+        assert_eq!(fs.read_file("/p/dest/big").as_deref(), Some(&pattern(len)[..]));
+    }
+
+    /// The 1-based index the NEXT call of kind `prefix` will have: `on_nth` counts over the fake's whole life, so a hook
+    /// for a later run must start after the earlier runs' calls.
+    fn next_nth(fs: &FaultFs, prefix: &str) -> u32 {
+        let done = calls(fs).iter().filter(|c| c.starts_with(prefix)).count();
+        u32::try_from(done).unwrap() + 1
+    }
+
+    /// The longest the WAL segment is at any of the run's `rename_no_replace` calls (the publication, then the
+    /// workspace's retirement, which comes after the log is closed): the segment as the run left it.
+    fn spy_wal(fs: &FaultFs) -> Arc<Mutex<Vec<u8>>> {
+        fn watch(fs: &FaultFs, n: u32, seen: Arc<Mutex<Vec<u8>>>) {
+            if n > 12 {
+                return;
+            }
+            fs.on_nth("rename_no_replace", n, move |fs| {
+                if let Some(bytes) = fs.read_file(wal()) {
+                    let mut kept = seen.lock().unwrap();
+                    if bytes.len() > kept.len() {
+                        *kept = bytes;
+                    }
+                }
+                watch(fs, n + 1, seen);
+            });
+        }
+        let seen: Arc<Mutex<Vec<u8>>> = Arc::default();
+        watch(fs, next_nth(fs, "rename_no_replace("), Arc::clone(&seen));
+        seen
+    }
+
+    fn parent_id(fs: &FaultFs) -> flux_fs::ObjectId {
+        match fs.metadata(Path::new("/p/dest")).unwrap().identity {
+            FileIdentity::Strong(o) | FileIdentity::Weak(o) => o,
+            FileIdentity::Unavailable => panic!("the fake gives DEST an identity"),
+        }
+    }
+
+    fn key(fs: &FaultFs, name: &str) -> Vec<u8> {
+        ClaimKey::new(parent_id(fs), OsStr::new(name)).encode()
+    }
+
+    // Mutants: `Shared.ckpt` is always `None`; the normal ending calls `abandon` instead of `finish`.
+    #[test]
+    fn a_tree_copy_with_a_large_file_creates_wal_000001_in_its_workspace_and_removes_it_at_completion()
+     {
+        let fs = big_fs(3 * MIB);
+        fs.write_file("/src/a", b"A");
+        let seen = spy_wal(&fs);
+        let (r, got) = run_with(&fs, &cfg(), &opts(), lazy(Durability::Normal));
+        ok(&r);
+        assert!(got.is_empty() && r.warnings.is_empty(), "{got:?} {:?}", r.warnings);
+        let bytes = seen.lock().unwrap().clone();
+        assert!(
+            !bytes.is_empty(),
+            "the segment existed in the workspace while the run was in flight"
+        );
+        let recs = records(&bytes);
+        assert!(matches!(&recs[0].1, Body::FileBegin(_)), "{recs:?}");
+        assert_eq!(recs[0].0.generation, 1);
+        assert_eq!(recs[0].0.operation_id, ID.as_bytes());
+        published(&fs, 3 * MIB);
+        assert!(!fs.exists("/p/dest/.flux") && !fs.exists(LOCK), "the workspace is gone");
+    }
+
+    // Mutant: `finish_retire` (8A) does not remove `wal/`; or the run never opens a log.
+    #[test]
+    fn a_completed_tree_run_with_a_wal_leaves_no_workspace() {
+        let fs = big_fs(2 * MIB);
+        let seen = spy_wal(&fs);
+        let (r, _) = run_with(&fs, &cfg(), &opts(), lazy(Durability::Normal));
+        ok(&r);
+        assert!(!seen.lock().unwrap().is_empty(), "the segment existed during the run");
+        assert!(!fs.exists(wal()) && !fs.exists("/p/dest/.flux"), "{:?}", calls(&fs));
+    }
+
+    // Mutant: `finish(..)` is called without joining first (the thread outlives the workspace removal).
+    #[test]
+    fn the_wal_thread_is_joined_before_the_workspace_is_removed() {
+        let fs = big_fs(3 * MIB);
+        let (r, _) = run_with(&fs, &cfg(), &opts(), lazy(Durability::Normal));
+        ok(&r);
+        let c = calls(&fs);
+        let dropped = at(&c, &format!("drop_writer({})", wal()));
+        let retire = c
+            .iter()
+            .position(|x| {
+                x.contains(".removing")
+                    || x.starts_with(&format!("remove_dir(/p/dest/.flux/operations/{ID})"))
+            })
+            .unwrap_or_else(|| panic!("no workspace removal in {c:?}"));
+        assert!(dropped < retire, "the segment handle was dropped before the removal: {c:?}");
+    }
+
+    // Mutant: `Shared.ckpt` is always `None` (the source of `fc` in `stage_file`).
+    #[test]
+    fn a_checkpointed_file_is_named_by_its_target_claim_key_and_relative_path() {
+        let fs = big_fs(3 * MIB);
+        let seen = spy_wal(&fs);
+        let (r, _) = run_with(&fs, &cfg(), &opts(), lazy(Durability::Normal));
+        ok(&r);
+        let recs = records(&seen.lock().unwrap());
+        let Body::FileBegin(b) = &recs[0].1 else { panic!("{recs:?}") };
+        assert_eq!(b.file_id, key(&fs, "big"));
+        assert_eq!(b.destination, b"big");
+        assert_eq!(b.source_len, 3 * MIB as u64);
+    }
+
+    // Mutant: `tree.rs` keys the checkpoint by the STORED name of a replacement (`key_stored`).
+    #[test]
+    fn a_replaced_file_whose_stored_name_differs_is_still_named_by_its_target() {
+        let fs = FaultFs::new();
+        for d in ["/src", "/p", "/p/dest"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        fs.set_case_insensitive(true);
+        fs.write_file("/src/big.bin", &pattern(3 * MIB));
+        fs.write_file("/p/dest/Big.bin", b"old");
+        let seen = spy_wal(&fs);
+        let (r, got) = run_with(&fs, &cfg(), &opts(), lazy(Durability::Normal));
+        let out = ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(out.files_overwritten, 1, "the file was REPLACED");
+        let recs = records(&seen.lock().unwrap());
+        let Body::FileBegin(b) = &recs[0].1 else { panic!("{recs:?}") };
+        assert_eq!(b.file_id, key(&fs, "big.bin"), "the TARGET name's claim key");
+        assert_ne!(b.file_id, key(&fs, "Big.bin"));
+        assert_eq!(b.destination, b"big.bin");
+    }
+
+    // Mutant: `stage_into_batch` hands `stage_file` `None` instead of `fc`.
+    #[test]
+    fn a_file_staged_through_a_strict_batch_also_checkpoints() {
+        let fs = big_fs(3 * MIB);
+        let seen = spy_wal(&fs);
+        let (r, _) = run_with(&fs, &cfg(), &strict(), lazy(Durability::Strict));
+        ok(&r);
+        let recs = records(&seen.lock().unwrap());
+        let Body::FileBegin(b) = &recs[0].1 else { panic!("{recs:?}") };
+        assert_eq!(b.file_id, key(&fs, "big"));
+        assert!(
+            calls(&fs).iter().any(|c| c.starts_with(&format!("sync_all({}", partial()))),
+            "a Strict WAL syncs the partial before it checkpoints it: {:?}",
+            calls(&fs)
+        );
+    }
+
+    // The policy a tree run builds carries the run's durability. Mutant: `checkpoint_policy` ignores it.
+    #[test]
+    fn the_checkpoint_policy_carries_the_runs_durability() {
+        for d in [Durability::Normal, Durability::Strict] {
+            assert_eq!(checkpoint_policy(&cfg(), d).wal.durability, d);
+        }
+        assert_eq!(
+            checkpoint_policy(&cfg(), Durability::Normal).range_chunks,
+            CheckpointPolicy::DEFAULT.range_chunks
+        );
+    }
+
+    // Mutant: `checkpoint_policy` builds the policy with `ResumeVerify::Chunks` whatever `cfg.resume_verify` says.
+    #[test]
+    fn the_checkpoint_policy_carries_the_runs_resume_verify() {
+        for level in [ResumeVerify::Chunks, ResumeVerify::Full] {
+            let c = RunConfig { resume_verify: level, ..cfg() };
+            assert_eq!(checkpoint_policy(&c, Durability::Normal).verify, level);
+        }
+        assert_eq!(CheckpointPolicy::DEFAULT.verify, ResumeVerify::Chunks);
+    }
+
+    // Mutant: `Shared.ckpt = None` (the resume would recopy: no `truncate_to`, a fresh `create_new`).
+    #[test]
+    fn a_resume_continues_a_large_partial_end_to_end() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        let (s0, p0) = (fs.bytes_read("/src/big"), fs.bytes_read(partial()));
+        let mark = fs.calls().len();
+        let seen = spy_wal(&fs);
+        let (r, got) = run_with(&fs, &resuming(), &opts(), lazy(Durability::Normal));
+        let out = ok(&r);
+        assert!(got.is_empty() && r.warnings.is_empty(), "{got:?} {:?}", r.warnings);
+        assert!(
+            matches!(&r.resumed, Some(ResumeNote::Adopted { operation_id, .. }) if operation_id == ID),
+            "{:?}",
+            r.resumed
+        );
+        assert_eq!(out.files_copied, 1);
+        published(&fs, 5 * MIB);
+        let c = calls(&fs);
+        assert!(
+            c[mark..].iter().any(|x| x.starts_with(&format!("truncate_to({}", partial()))),
+            "{c:?}"
+        );
+        assert!(
+            !c[mark..].iter().any(|x| x == &format!("create_new({})", partial())),
+            "a resume continues the partial, it does not create it again"
+        );
+        assert!(fs.bytes_read(partial()) - p0 >= 3 * MIB as u64, "the proven prefix was validated");
+        assert_eq!(fs.bytes_read("/src/big") - s0, 5 * MIB as u64, "the source is read once");
+        let recs = records(&seen.lock().unwrap());
+        let begin = recs.iter().rev().find_map(|(h, b)| match b {
+            Body::FileBegin(f) if h.generation == 2 => Some(f),
+            _ => None,
+        });
+        let b = begin.expect("the adopted run (generation 2) began the file again");
+        assert!(b.valid_through >= 3 * MIB as u64, "{b:?}");
+        assert!(!fs.exists("/p/dest/.flux"));
+    }
+
+    // Task 9. Mutant: `copy_file_checkpointed` returns `Reuse::default()` (the unbatched path drops its reuse).
+    #[test]
+    fn a_resumed_run_reports_the_bytes_it_reused_and_recopied() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        let (r, _) = run_with(&fs, &resuming(), &opts(), lazy(Durability::Normal));
+        let out = ok(&r);
+        assert!(out.bytes_reused >= 3 * MIB as u64, "{out:?}");
+        assert_eq!(out.files_partially_resumed, 1, "{out:?}");
+        assert_eq!(out.partial_resumes.len(), 1);
+        let p = &out.partial_resumes[0];
+        assert_eq!(p.path, Path::new("big"));
+        assert_eq!((p.reused, p.reused + p.recopied), (out.bytes_reused, 5 * MIB as u64), "{p:?}");
+        assert_eq!(p.recopied, out.bytes_copied, "the only file");
+        assert!(out.checkpoint_discards.is_empty(), "{:?}", out.checkpoint_discards);
+    }
+
+    // Task 9. Mutant: `flush_batch` takes no `Reuse` from the staged file (the batched path drops its reuse).
+    #[test]
+    fn a_resumed_strict_batched_file_reports_its_reuse() {
+        let fs = big_fs(5 * MIB);
+        crashed_run_as(&fs, Durability::Strict);
+        let (r, _) = run_with(&fs, &resuming(), &strict(), lazy(Durability::Strict));
+        let out = ok(&r);
+        assert!(out.bytes_reused >= 3 * MIB as u64, "{out:?}");
+        assert_eq!(out.files_partially_resumed, 1, "{out:?}");
+        let p = &out.partial_resumes[0];
+        assert_eq!((p.path.as_path(), p.reused + p.recopied), (Path::new("big"), 5 * MIB as u64));
+        assert!(out.checkpoint_discards.is_empty(), "{:?}", out.checkpoint_discards);
+    }
+
+    // Task 9. Mutant: `note_reuse` records no discard when `reused == 0` (or drops `discard` on the unbatched path).
+    #[test]
+    fn a_resume_that_cannot_trust_its_partial_names_the_file_and_why() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        fs.write_file(partial(), &pattern(5 * MIB)[..2 * MIB + MIB / 2]);
+        let (r, _) = run_with(&fs, &resuming(), &opts(), lazy(Durability::Normal));
+        let out = ok(&r);
+        assert_eq!(out.checkpoint_discards.len(), 1, "{:?}", out.checkpoint_discards);
+        let d = &out.checkpoint_discards[0];
+        assert_eq!(d.path, Path::new("big"));
+        assert!(matches!(d.reason, crate::Discard::PartialShorter { .. }), "{:?}", d.reason);
+    }
+
+    // Task 9. A missing partial is `PartialMissing` and reuses nothing.
+    #[test]
+    fn a_resume_with_no_partial_names_the_file_and_reuses_nothing() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        fs.remove_file(Path::new(&partial())).unwrap();
+        let (r, _) = run_with(&fs, &resuming(), &opts(), lazy(Durability::Normal));
+        let out = ok(&r);
+        assert_eq!((out.bytes_reused, out.files_partially_resumed), (0, 0));
+        assert_eq!(
+            out.checkpoint_discards
+                .iter()
+                .map(|d| (d.path.clone(), d.reason.clone()))
+                .collect::<Vec<_>>(),
+            vec![(PathBuf::from("big"), crate::Discard::PartialMissing)]
+        );
+    }
+
+    // Mutant: `checkpoint_policy` builds Strict (or the run's durability is not passed): Normal would not validate.
+    #[test]
+    fn normal_durability_resume_validates_before_it_trusts() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        // The checkpoints name 3 MiB; only 2.5 MiB of the partial exist.
+        fs.write_file(partial(), &pattern(5 * MIB)[..2 * MIB + MIB / 2]);
+        let mark = fs.calls().len();
+        let (r, _) = run_with(&fs, &resuming(), &opts(), lazy(Durability::Normal));
+        ok(&r);
+        published(&fs, 5 * MIB);
+        let c = calls(&fs);
+        assert!(
+            c[mark..].iter().any(|x| x == &format!("truncate_to({}, {})", partial(), 2 * MIB)),
+            "recopied from the first chunk the partial cannot prove: {:?}",
+            &c[mark..]
+        );
+    }
+
+    // Mutant: every `CheckpointOpenError` aborts the run, or `Corrupt` is dropped silently. (Owner ruling 23: it was
+    // `CheckpointsUnreadable` and `ckpt: None` under Ruling 11; a damaged log is now quarantined and reported.)
+    #[test]
+    fn a_corrupt_wal_recopies_and_reports_instead_of_aborting() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        fs.write_file(wal(), &[0xFFu8; 64]);
+        let mark = fs.calls().len();
+        let (r, got) = run_with(&fs, &resuming(), &opts(), lazy(Durability::Normal));
+        ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        assert!(
+            r.warnings.iter().any(|w| matches!(w, RunWarning::WalQuarantined { .. })),
+            "{:?}",
+            r.warnings
+        );
+        published(&fs, 5 * MIB);
+        let c = calls(&fs);
+        assert!(
+            c[mark..].iter().all(|x| !x.starts_with("truncate_to(")),
+            "every large file recopies"
+        );
+        assert!(c[mark..].iter().any(|x| x == &format!("create_new({})", partial())));
+    }
+
+    // Mutant: `Unavailable` is reported as `Unreadable`, or aborts.
+    #[test]
+    fn an_unavailable_segment_identity_recopies_and_reports() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        fs.set_identity(wal(), FileIdentity::Unavailable);
+        let mark = fs.calls().len();
+        let (r, got) = run_with(&fs, &resuming(), &opts(), lazy(Durability::Normal));
+        ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        assert!(
+            r.warnings.iter().any(|w| matches!(w, RunWarning::CheckpointsUnavailable { .. })),
+            "{:?}",
+            r.warnings
+        );
+        published(&fs, 5 * MIB);
+        let c = calls(&fs);
+        assert!(
+            c[mark..].iter().all(|x| !x.starts_with("truncate_to(")),
+            "every large file recopies"
+        );
+    }
+
+    /// The count of `create_dir` calls of a clean run of the big file: the WAL's `wal/` is the last.
+    fn wal_create_dir_nth() -> u32 {
+        let dry = big_fs(3 * MIB);
+        ok(&run_with(&dry, &cfg(), &opts(), lazy(Durability::Normal)).0);
+        u32::try_from(calls(&dry).iter().filter(|c| c.starts_with("create_dir(")).count()).unwrap()
+    }
+
+    // Mutants: the beat closure does not call `mark_abandoned`; `Checkpoints::mark_abandoned` is a no-op. (The
+    // guard closure's own mark cannot be told apart here: no guard runs mid-file, and after a file's `Close` nothing
+    // is pending.)
+    #[test]
+    fn a_lost_lock_appends_nothing_even_with_an_eager_flush_policy() {
+        let fs = Arc::new(big_fs(5 * MIB));
+        let (entered, release) =
+            (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        // The WAL thread's first flush (the file's `FileBegin` and first `Range`) is held at the creation of `wal/`:
+        // it is IN FLIGHT while the main thread queues the next ranges.
+        {
+            let (entered, release) = (Arc::clone(&entered), Arc::clone(&release));
+            fs.on_nth("create_dir", wal_create_dir_nth(), move |_| {
+                entered.store(true, Ordering::SeqCst);
+                for _ in 0..10_000 {
+                    if release.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                panic!("the flush was never released");
+            });
+        }
+        // The heartbeat fails 3 MiB in, once the flush is in flight (ranges 2 and 3 are queued behind it).
+        fn fail_beat(fs: &FaultFs, n: u32, entered: Arc<AtomicBool>) {
+            fs.on_nth("write_at_start", n, move |fs| {
+                if entered.load(Ordering::SeqCst)
+                    && fs.read_file(partial()).is_some_and(|b| b.len() >= 3 * MIB)
+                {
+                    fs.fail("write_at_start", Code::IoError);
+                    fs.on_nth("write_at_start", n + 1, |fs| {
+                        fs.fail("write_at_start", Code::IoError)
+                    });
+                } else {
+                    fail_beat(fs, n + 1, entered);
+                }
+            });
+        }
+        fail_beat(&fs, 1, Arc::clone(&entered));
+        // The guard of the discard that follows the failure (after the beat closure flagged the log) releases the
+        // held flush, then gives an unflagged writer time to flush the queued ranges too.
+        let hook: BeforeMutation = {
+            let (fs, release) = (Arc::clone(&fs), Arc::clone(&release));
+            Arc::new(move || {
+                if fs.read_file(partial()).is_some_and(|b| b.len() >= 3 * MIB)
+                    && !release.swap(true, Ordering::SeqCst)
+                {
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            })
+        };
+        let c = RunConfig { before_mutation: Some(hook), ..beating() };
+        let (r, _) = run_with(&fs, &c, &opts(), policy(Durability::Normal, 1));
+        assert!(matches!(&r.copy, Some(Err(_))), "{:?}", r.copy);
+        assert_eq!(
+            covered(&fs),
+            MIB as u64,
+            "only the flush already in flight landed; the ranges queued behind it were never flushed"
+        );
+    }
+
+    // Mutant: `FileSink::abort` sends `Close` again (it flushes the aborted file's pending records after the loss).
+    #[test]
+    fn a_lost_lock_appends_nothing_after_the_loss() {
+        let fs = Arc::new(big_fs(5 * MIB));
+        // Nothing flushes on its own: no threshold, an hour's interval. Ranges are queued as the file streams; the
+        // heartbeat fails 2 MiB in, and the guard of the discard that follows finds the lock gone.
+        stop_beat_at(&fs, 1, 2 * MIB, false, false);
+        let hook: BeforeMutation = {
+            let fs = Arc::clone(&fs);
+            Arc::new(move || {
+                if fs.read_file(partial()).is_some_and(|b| b.len() >= 2 * MIB) {
+                    fs.write_file(LOCK, b"another run's bytes");
+                }
+            })
+        };
+        let c = RunConfig { before_mutation: Some(hook), ..beating() };
+        let (r, _) = run_with(&fs, &c, &opts(), lazy(Durability::Normal));
+        assert!(matches!(&r.copy, Some(Err(_))), "{:?}", r.copy);
+        assert!(!fs.exists(wal()), "no append ever followed the loss: {:?}", calls(&fs));
+        assert_eq!(
+            manifest(&fs, ID).state,
+            OpState::Transferring,
+            "the lost run left its state as it was"
+        );
+    }
+
+    // Mutant: a lost lock still calls `finish` (a `Stop`), or the log is left running. (A `Stop` has nothing pending
+    // to flush here, because a file's own `Close` flushes it: the run-level property is that the log is joined and the
+    // segment is exactly what was flushed before the loss.)
+    #[test]
+    fn a_lost_lock_at_the_publication_guard_appends_nothing_after_the_loss() {
+        let fs = Arc::new(big_fs(3 * MIB));
+        let at_loss: Arc<Mutex<Option<Vec<u8>>>> = Arc::default();
+        // The first guard after the stream is the publication's: the lock is taken over just before it.
+        let hook: BeforeMutation = {
+            let (fs, at_loss) = (Arc::clone(&fs), Arc::clone(&at_loss));
+            Arc::new(move || {
+                let full = fs.read_file(partial()).is_some_and(|b| b.len() == 3 * MIB);
+                if full && at_loss.lock().unwrap().is_none() {
+                    *at_loss.lock().unwrap() = Some(fs.read_file(wal()).unwrap_or_default());
+                    fs.write_file(LOCK, b"another run's bytes");
+                }
+            })
+        };
+        let c = RunConfig { before_mutation: Some(hook), ..cfg() };
+        let (r, _) = run_with(&fs, &c, &opts(), lazy(Durability::Normal));
+        assert!(r.stop.is_none(), "{:?}", r.stop);
+        assert_eq!(aborted(&r).error.code(), Code::TargetLockBusy);
+        let at_loss = at_loss.lock().unwrap().clone().expect("the lock was taken over");
+        assert!(!at_loss.is_empty(), "the file's own Close flushed its records before the loss");
+        assert_eq!(fs.read_file(wal()).unwrap(), at_loss, "no record was appended after the loss");
+        assert!(
+            calls(&fs).iter().any(|c| c == &format!("drop_writer({})", wal())),
+            "the log was joined"
+        );
+        // The state is whatever the loss left: the workspace stays for `--resume`.
+        assert_eq!(manifest(&fs, ID).state, OpState::Transferring);
+    }
+
+    // Mutant: a failed heartbeat is treated as an ordinary ending (the run is Completed or the log is not joined).
+    #[test]
+    fn a_failed_heartbeat_ends_the_run_failed_and_joins_the_log() {
+        let fs = big_fs(5 * MIB);
+        stop_beat_at(&fs, 1, 2 * MIB, false, false);
+        let (r, _) = run_with(&fs, &beating(), &opts(), lazy(Durability::Normal));
+        assert!(matches!(&r.copy, Some(Err(_))), "{:?}", r.copy);
+        assert_eq!(manifest(&fs, ID).state, OpState::Failed);
+        assert!(fs.exists(format!("/p/dest/.flux/operations/{ID}/manifest")));
+        assert!(!fs.exists(wal()), "the aborted file's queued records were discarded, not flushed");
+    }
+
+    // Mutants: `Failure.wal` is ignored at the end of the run; the kept partial is removed.
+    #[test]
+    fn a_wal_failure_stops_the_tree_keeps_the_partial_and_exits_1() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        // The adopted run (generation 2) cannot append: the segment's first write fails, before any byte lands.
+        let before = fs.read_file(wal()).unwrap();
+        // The adopting run's first manifest write (TRANSFERRING) is followed by the log's `open_existing`: the next
+        // handle made is the segment's, and it takes the fault.
+        fs.on_nth("rename_replace", next_nth(&fs, "rename_replace("), |fs| {
+            fs.fail_write(std::io::Error::other("injected append"))
+        });
+        let (r, _) = run_with(&fs, &resuming(), &opts(), policy(Durability::Normal, 1));
+        assert!(r.stop.is_none(), "{:?}", r.stop);
+        let a = aborted(&r);
+        assert_eq!((a.error.code(), a.error.step), (Code::WalWriteFailed, CopyStep::Checkpoint));
+        // The CLI prints the `--resume` hint once, after the error: the message must not carry it too.
+        let m = a.error.to_string();
+        assert!(m.contains("NOT trustworthy") && !m.contains("run again with --resume"), "{m}");
+        assert!(a.error.leftover.is_none());
+        assert!(fs.exists(partial()), "the temporary is kept");
+        assert_eq!(manifest(&fs, ID).state, OpState::Failed);
+        assert_eq!(fs.read_file(wal()).unwrap(), before, "nothing was appended");
+        // `--resume` again reuses the checkpoints that were durable.
+        let p0 = fs.bytes_read(partial());
+        let mark = fs.calls().len();
+        let (r, got) = run_with(&fs, &resuming(), &opts(), lazy(Durability::Normal));
+        ok(&r);
+        assert!(got.is_empty() && r.warnings.is_empty(), "{got:?} {:?}", r.warnings);
+        published(&fs, 5 * MIB);
+        let c = calls(&fs);
+        assert!(
+            c[mark..].iter().any(|x| x == &format!("truncate_to({}, {})", partial(), 3 * MIB)),
+            "{:?}",
+            &c[mark..]
+        );
+        assert!(fs.bytes_read(partial()) - p0 >= 3 * MIB as u64);
+    }
+
+    // Mutant: a failed first flush (the segment cannot be created) is swallowed instead of failing the file.
+    #[test]
+    fn a_segment_that_cannot_be_created_fails_the_run_with_wal_write_failed() {
+        // A dry run counts the `create_dir` calls; the WAL's `wal/` is the last (nothing else creates below DEST).
+        let dry = big_fs(3 * MIB);
+        ok(&run_with(&dry, &cfg(), &opts(), lazy(Durability::Normal)).0);
+        let n = calls(&dry).iter().filter(|c| c.starts_with("create_dir(")).count();
+        let fs = big_fs(3 * MIB);
+        // Just before `wal/` is created, the next `create_new` (the segment's) is made to fail.
+        fs.on_nth("create_dir", u32::try_from(n).unwrap(), |fs| {
+            fs.fail("create_new", Code::DiskFull)
+        });
+        let (r, _) = run_with(&fs, &cfg(), &opts(), lazy(Durability::Normal));
+        let a = aborted(&r);
+        assert_eq!((a.error.code(), a.error.step), (Code::WalWriteFailed, CopyStep::Checkpoint));
+        // The CLI prints the `--resume` hint once, after the error: the message must not carry it too.
+        let m = a.error.to_string();
+        assert!(m.contains("NOT trustworthy") && !m.contains("run again with --resume"), "{m}");
+        assert!(fs.exists(partial()), "the temporary is kept");
+        assert_eq!(manifest(&fs, ID).state, OpState::Failed);
+    }
+
+    // Mutant: `file_ckpt` in `copy_one` returns `Some` for every file (no length gate).
+    #[test]
+    fn a_file_below_the_checkpoint_threshold_takes_the_unchanged_path_in_a_checkpointing_run() {
+        let guards = |p: CheckpointPolicy| {
+            let fs = FaultFs::new();
+            for d in ["/src", "/p"] {
+                fs.create_dir(Path::new(d)).unwrap();
+            }
+            fs.write_file("/src/small", &pattern(MIB / 2));
+            let count = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&count);
+            let hook: BeforeMutation = Arc::new(move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+            });
+            let c = RunConfig { before_mutation: Some(hook), ..cfg() };
+            ok(&run_with(&fs, &c, &opts(), p).0);
+            (count.load(Ordering::SeqCst), calls(&fs).len())
+        };
+        let checkpointing = guards(lazy(Durability::Normal));
+        // A threshold above every file: the context is never made, whatever the run opened.
+        let never = guards(CheckpointPolicy { min_len: u64::MAX, ..lazy(Durability::Normal) });
+        assert_eq!(checkpointing.0, never.0, "the same guard count");
+        assert_eq!(checkpointing.0, 3, "sweep, temporary, publish: the unchanged path");
+    }
+
+    // Test audit (cut 9f-1 plan 2, round 1). Mutants: `>=` -> `>` at tree.rs `file_ckpt`, and at the two
+    // `src_meta.len >= c.run.min_len()` filters in copy.rs `stage_file`; each leaves a file of exactly `min_len` on
+    // the unchanged path (the 3-guard count of the small file) while the tree-level test suite stays green.
+    #[test]
+    fn a_file_of_exactly_the_threshold_length_is_checkpointed() {
+        let guard_count = |len: usize| {
+            let fs = FaultFs::new();
+            for d in ["/src", "/p"] {
+                fs.create_dir(Path::new(d)).unwrap();
+            }
+            fs.write_file("/src/f", &pattern(len));
+            let count = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&count);
+            let hook: BeforeMutation = Arc::new(move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+            });
+            let c = RunConfig { before_mutation: Some(hook), ..cfg() };
+            ok(&run_with(&fs, &c, &opts(), lazy(Durability::Normal)).0);
+            count.load(Ordering::SeqCst)
+        };
+        let below = guard_count(MIB - 1);
+        let exact = guard_count(MIB);
+        let above = guard_count(MIB + 1);
+        assert_eq!(below, 3, "one byte under the threshold: the unchanged path");
+        assert!(
+            above > below,
+            "a file over the threshold takes the checkpointed path: {above} guards"
+        );
+        assert_eq!(exact, above, "a file of exactly min_len is checkpointed like the one above it");
+    }
+
+    // Mutant: `run::file` opens a log.
+    #[test]
+    fn a_single_file_copy_is_untouched_by_checkpointing() {
+        let fs = FaultFs::new();
+        for d in ["/src", "/p"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        fs.write_file("/src/a", &pattern(3 * MIB));
+        let r = run_file(&fs, &cfg());
+        assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?}", r.stop);
+        assert!(!calls(&fs).iter().any(|c| c.contains("/wal")), "{:?}", calls(&fs));
+        assert!(!fs.exists("/p/.flux"));
+    }
+
+    // ---- Task 10a: the crash matrix of V16 section 180 (cases 1-7, 15, 16; cases 8-14 are snapshot, compaction and
+    // rotation, a later cut). Every case ends in "known durable progress" or "safe redo", never a false completion:
+    // the published bytes always equal the source. Cases 1-7 manufacture the on-disk state a crash leaves by editing
+    // the segment of a real crashed run (FaultFs has no unsynced-data model); 15 and 16 crash a real run with a panic
+    // at the named call.
+
+    use crate::wal::record::encode;
+
+    fn segment_records(fs: &FaultFs) -> Vec<(Header, Body)> {
+        records(&fs.read_file(wal()).expect("the crashed run left a segment"))
+    }
+
+    /// The segment of a crashed run, normalised to its FileBegin and the `Range`s up to 3 MiB (so a case does not
+    /// depend on how many chunks the WAL thread had flushed beyond the 3 MiB the partial holds), one encoding per
+    /// record, and written back.
+    fn crashed_segment(fs: &FaultFs) -> Vec<Vec<u8>> {
+        let recs: Vec<(Header, Body)> = segment_records(fs)
+            .into_iter()
+            .filter(|(_, b)| match b {
+                Body::FileBegin(_) => true,
+                Body::Range(r) => r.range_end <= 3 * MIB as u64,
+            })
+            .collect();
+        assert_eq!(recs.len(), 4, "a FileBegin and three one-chunk ranges: {recs:?}");
+        let enc: Vec<Vec<u8>> = recs.iter().map(|(h, b)| encode(h, b)).collect();
+        fs.write_file(wal(), &enc.concat());
+        enc
+    }
+
+    type Resumed = Run<Result<TreeOutcome, TreeAbort>>;
+
+    fn resume_run(fs: &FaultFs, d: Durability) -> (Resumed, usize) {
+        resume_run_as(fs, d, &resuming())
+    }
+
+    /// `resume_run` under the given adopting config.
+    fn resume_run_as(fs: &FaultFs, d: Durability, cfg: &RunConfig) -> (Resumed, usize) {
+        let mark = fs.calls().len();
+        let o = CopyOptions { durability: d, ..opts() };
+        let policy = CheckpointPolicy { verify: cfg.resume_verify, ..lazy(d) };
+        let (r, got) = run_with(fs, cfg, &o, policy);
+        assert!(got.is_empty(), "{got:?}");
+        (r, mark)
+    }
+
+    /// The run warned that the replay cut `len` bytes at `offset`, for `reason`, and warned of nothing else about the log.
+    fn assert_tail_warning(r: &Resumed, offset: usize, len: usize, reason: &'static str) {
+        let cut: Vec<(u64, u64, &str)> = r
+            .warnings
+            .iter()
+            .filter_map(|w| match w {
+                RunWarning::WalTailDiscarded { offset, len, reason } => {
+                    Some((*offset, *len, *reason))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cut, vec![(offset as u64, len as u64, reason)], "{:?}", r.warnings);
+    }
+
+    // Mutant: `open_checkpoints` pushes the tail warning whatever the scan found.
+    #[test]
+    fn a_clean_wal_yields_no_tail_warning() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        let (r, mark) = resume_run(&fs, Durability::Normal);
+        assert_progress(&fs, &r, mark, 3 * MIB);
+        assert!(
+            !r.warnings.iter().any(|w| matches!(w, RunWarning::WalTailDiscarded { .. })),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    /// The resume recopied the whole file: nothing reused, no partial resume reported, the temporary created anew.
+    fn assert_safe_redo(fs: &FaultFs, r: &Run<Result<TreeOutcome, TreeAbort>>, mark: usize) {
+        let out = ok(r);
+        assert_eq!((out.bytes_reused, out.files_partially_resumed), (0, 0), "{out:?}");
+        assert!(out.partial_resumes.is_empty(), "{:?}", out.partial_resumes);
+        assert_eq!((out.files_copied, out.bytes_copied), (1, 5 * MIB as u64), "{out:?}");
+        published(fs, 5 * MIB);
+        let c = calls(fs);
+        assert!(c[mark..].iter().any(|x| x == &format!("create_new({})", partial())), "{c:?}");
+        assert!(
+            c[mark..].iter().all(|x| !x.starts_with(&format!("truncate_to({}", partial()))),
+            "{c:?}"
+        );
+        assert!(!fs.exists("/p/dest/.flux"));
+    }
+
+    /// The resume reused exactly `reused` bytes (known durable progress) and recopied the rest.
+    fn assert_progress(
+        fs: &FaultFs,
+        r: &Run<Result<TreeOutcome, TreeAbort>>,
+        mark: usize,
+        reused: usize,
+    ) {
+        let out = ok(r);
+        let total = 5 * MIB as u64;
+        assert_eq!(out.bytes_reused, reused as u64, "{out:?}");
+        assert_eq!(out.files_partially_resumed, 1, "{out:?}");
+        assert_eq!(out.partial_resumes.len(), 1, "{:?}", out.partial_resumes);
+        let p = &out.partial_resumes[0];
+        assert_eq!(p.path, Path::new("big"));
+        assert_eq!((p.reused, p.reused + p.recopied), (reused as u64, total), "{p:?}");
+        assert_eq!(out.bytes_copied, p.recopied, "{out:?}");
+        published(fs, 5 * MIB);
+        let c = calls(fs);
+        assert!(
+            c[mark..].iter().any(|x| x == &format!("truncate_to({}, {reused})", partial())),
+            "the partial was cut to the proven offset: {:?}",
+            &c[mark..]
+        );
+        assert!(
+            c[mark..].iter().all(|x| x != &format!("create_new({})", partial())),
+            "continued, not recreated"
+        );
+        assert!(!fs.exists("/p/dest/.flux"));
+    }
+
+    // Case 1: the destination bytes were written, no WAL record names the file (the log was never created).
+    // Mutant: `decide` treats a file with no state as resumable from the partial's length.
+    #[test]
+    fn crash_case_1_after_destination_write() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        fs.remove_file(Path::new(&wal())).unwrap();
+        assert!(fs.exists(partial()), "the destination write survived");
+        let (r, mark) = resume_run(&fs, Durability::Normal);
+        assert_safe_redo(&fs, &r, mark);
+        assert!(ok(&r).checkpoint_discards.is_empty(), "{:?}", ok(&r).checkpoint_discards);
+    }
+
+    // Case 2: Strict; the partial's data was being flushed (its tail never reached the disk) and the duplicate sync
+    // never completed, so only the FILE_BEGIN is in the log. Mutant: `decide` trusts a file whose log holds no digest.
+    #[test]
+    fn crash_case_2_during_destination_flush() {
+        let fs = big_fs(5 * MIB);
+        crashed_run_as(&fs, Durability::Strict);
+        let enc = crashed_segment(&fs);
+        fs.write_file(wal(), &enc[0]);
+        let mut torn = pattern(5 * MIB)[..3 * MIB].to_vec();
+        torn[2 * MIB + MIB / 2..].fill(0);
+        fs.write_file(partial(), &torn);
+        let (r, mark) = resume_run(&fs, Durability::Strict);
+        assert_safe_redo(&fs, &r, mark);
+        assert!(ok(&r).checkpoint_discards.is_empty(), "{:?}", ok(&r).checkpoint_discards);
+    }
+
+    // Case 3: Strict; the destination flush completed (the partial is intact) but the crash came before the `Range`
+    // was appended: only the FILE_BEGIN is in the log, so the durable bytes are not vouched for and are redone.
+    // Mutant: as case 2.
+    #[test]
+    fn crash_case_3_after_destination_flush() {
+        let fs = big_fs(5 * MIB);
+        crashed_run_as(&fs, Durability::Strict);
+        let enc = crashed_segment(&fs);
+        fs.write_file(wal(), &enc[0]);
+        assert_eq!(fs.read_file(partial()).unwrap(), pattern(5 * MIB)[..3 * MIB]);
+        let (r, mark) = resume_run(&fs, Durability::Strict);
+        assert_safe_redo(&fs, &r, mark);
+        assert!(ok(&r).checkpoint_discards.is_empty(), "{:?}", ok(&r).checkpoint_discards);
+    }
+
+    /// Run the resumed run while spying the segment at its renames, so the log as the resumed run left it can be read.
+    fn resume_spied(fs: &FaultFs, d: Durability) -> (Resumed, usize, Arc<Mutex<Vec<u8>>>) {
+        let seen = spy_wal(fs);
+        let (r, mark) = resume_run(fs, d);
+        (r, mark, seen)
+    }
+
+    // Case 4: the third record was cut in the middle of its payload. Replay cuts the torn tail (`truncate_to` the
+    // whole-record boundary), the file resumes from the last whole record, and the log the resumed run leaves decodes
+    // cleanly. Mutant: the replay's torn-tail truncation disabled (the segment is not cut before appending).
+    #[test]
+    fn crash_case_4_during_wal_append() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        let enc = crashed_segment(&fs);
+        let whole: usize = enc[..3].iter().map(Vec::len).sum();
+        let torn_at = whole + enc[3].len() / 2;
+        fs.write_file(wal(), &enc.concat()[..torn_at]);
+        let (r, mark, seen) = resume_spied(&fs, Durability::Normal);
+        assert_progress(&fs, &r, mark, 2 * MIB);
+        assert!(ok(&r).checkpoint_discards.is_empty(), "{:?}", ok(&r).checkpoint_discards);
+        assert_tail_warning(&r, whole, enc[3].len() / 2, "a record cut short");
+        let c = calls(&fs);
+        assert!(
+            c[mark..].iter().any(|x| x == &format!("truncate_to({}, {whole})", wal())),
+            "the torn tail was cut at the last whole record: {:?}",
+            &c[mark..]
+        );
+        let kept = seen.lock().unwrap().clone();
+        let recs = records(&kept); // panics on any torn byte left in the middle of the log
+        assert!(recs.iter().any(|(h, _)| h.generation == 2), "the resumed run appended: {recs:?}");
+    }
+
+    // Case 5: Normal; every record was appended (no sync), but the data of the last chunk never reached the disk. The
+    // log vouches for 3 MiB, the partial proves only 2: the resume trusts the chunks both sides confirm and recopies
+    // from the first it cannot. Mutant: the digest comparison skipped on the destination side.
+    #[test]
+    fn crash_case_5_after_wal_append() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        crashed_segment(&fs);
+        let mut lost = pattern(5 * MIB)[..3 * MIB].to_vec();
+        lost[2 * MIB..].fill(0);
+        fs.write_file(partial(), &lost);
+        let (r, mark) = resume_run(&fs, Durability::Normal);
+        assert_progress(&fs, &r, mark, 2 * MIB);
+        let out = ok(&r);
+        assert_eq!(out.checkpoint_discards.len(), 1, "{:?}", out.checkpoint_discards);
+        assert_eq!(out.checkpoint_discards[0].path, Path::new("big"));
+        assert_eq!(out.checkpoint_discards[0].reason, crate::Discard::MismatchAt(2 * MIB as u64));
+    }
+
+    // Case 6: Strict; a flush batch of two records was written and only the LAST is torn (its COMMIT byte is
+    // missing): the first of the batch stands, the torn one is cut. Mutant: the torn-tail truncation disabled, or the
+    // torn record's digests used.
+    #[test]
+    fn crash_case_6_during_wal_flush() {
+        let fs = big_fs(5 * MIB);
+        crashed_run_as(&fs, Durability::Strict);
+        let enc = crashed_segment(&fs);
+        let whole: usize = enc[..3].iter().map(Vec::len).sum();
+        fs.write_file(wal(), &enc.concat()[..whole + enc[3].len() - 1]);
+        let (r, mark, seen) = resume_spied(&fs, Durability::Strict);
+        assert_progress(&fs, &r, mark, 2 * MIB);
+        assert!(ok(&r).checkpoint_discards.is_empty(), "{:?}", ok(&r).checkpoint_discards);
+        assert_tail_warning(&r, whole, enc[3].len() - 1, "a record cut short");
+        let c = calls(&fs);
+        assert!(
+            c[mark..].iter().any(|x| x == &format!("truncate_to({}, {whole})", wal())),
+            "{:?}",
+            &c[mark..]
+        );
+        records(&seen.lock().unwrap().clone());
+    }
+
+    // Case 7: Strict; every record was flushed and the data synced before it: everything the log vouches for (3 MiB)
+    // is reused and the remaining 2 MiB recopied. Mutant: the fully validated path recopies instead of reusing.
+    #[test]
+    fn crash_case_7_after_wal_flush() {
+        let fs = big_fs(5 * MIB);
+        crashed_run_as(&fs, Durability::Strict);
+        crashed_segment(&fs);
+        let (r, mark) = resume_run(&fs, Durability::Strict);
+        assert_progress(&fs, &r, mark, 3 * MIB);
+        assert!(ok(&r).checkpoint_discards.is_empty(), "{:?}", ok(&r).checkpoint_discards);
+    }
+
+    /// A first run of the big file that dies (a panic, as a kill would) when `crash(fs)` is true at a call of kind
+    /// `kind`; the segment covers every byte of the file first (the WAL thread is asynchronous).
+    fn die_at(fs: &FaultFs, kind: &'static str, d: Durability, crash: fn(&FaultFs) -> bool) {
+        fn arm(fs: &FaultFs, kind: &'static str, n: u32, crash: fn(&FaultFs) -> bool) {
+            fs.on_nth(kind, n, move |fs| {
+                if crash(fs) {
+                    await_covered(fs, 5 * MIB);
+                    panic!("the test's crash point");
+                }
+                arm(fs, kind, n + 1, crash);
+            });
+        }
+        arm(fs, kind, next_nth(fs, kind), crash);
+        let o = CopyOptions { durability: d, ..opts() };
+        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_with(fs, &cfg(), &o, policy(d, 1))
+        }));
+        assert!(died.is_err(), "the run died at {kind}");
+    }
+
+    // Case 15: the whole file is written and logged, the crash comes immediately before the atomic rename. The
+    // resume validates the complete partial against the log and the source, reuses every byte, recopies none, and
+    // publishes through the normal tail. Mutant: the fully validated path recopies; or `truncate_to` removed.
+    #[test]
+    fn crash_case_15_immediately_before_atomic_rename() {
+        let fs = big_fs(5 * MIB);
+        die_at(&fs, "rename_no_replace", Durability::Normal, |fs| {
+            fs.read_file(partial()).is_some_and(|b| b.len() == 5 * MIB) && !fs.exists("/p/dest/big")
+        });
+        assert_eq!(fs.read_file(partial()).unwrap(), pattern(5 * MIB), "the complete temporary");
+        assert!(!fs.exists("/p/dest/big"), "not yet published");
+        assert!(covered(&fs) >= 5 * MIB as u64);
+        let (r, mark) = resume_run(&fs, Durability::Normal);
+        assert_progress(&fs, &r, mark, 5 * MIB);
+        let out = ok(&r);
+        assert_eq!((out.bytes_copied, out.files_copied), (0, 1), "nothing recopied: {out:?}");
+        assert!(out.checkpoint_discards.is_empty(), "{:?}", out.checkpoint_discards);
+    }
+
+    // Case 16 (Strict): the file is published, the crash comes immediately after the atomic rename and before the
+    // batch's claim commit; the log still holds all of the file's records. The resume recovers the publication from
+    // its prepared note: the file is NOT staged again and nothing is counted twice. Mutant: recovery discards the
+    // note (the file is restaged); or the WAL's records make the tree resume a file that is already published.
+    #[test]
+    fn crash_case_16_immediately_after_atomic_rename() {
+        let fs = big_fs(5 * MIB);
+        // Recovery commits the claim and the resume then finds the entry complete by its length and modified time.
+        fs.set_modified("/src/big", std::time::UNIX_EPOCH + Duration::from_secs(100));
+        die_at(&fs, "claim_apply_recovery", Durability::Strict, |_| true);
+        published(&fs, 5 * MIB);
+        assert!(!fs.exists(partial()), "renamed away");
+        assert_eq!(fs.prepared_count(), 1, "the crash left the publication's note");
+        assert!(covered(&fs) >= 5 * MIB as u64, "the log still vouches for the whole file");
+        let (r, mark) = resume_run(&fs, Durability::Strict);
+        let out = ok(&r);
+        assert_eq!((out.files_resumed, out.bytes_resumed), (1, 5 * MIB as u64), "{out:?}");
+        assert_eq!((out.files_copied, out.bytes_copied, out.bytes_reused), (0, 0, 0), "{out:?}");
+        assert_eq!(out.files_partially_resumed, 0);
+        assert!(out.partial_resumes.is_empty() && out.checkpoint_discards.is_empty(), "{out:?}");
+        assert!(
+            matches!(&r.resumed, Some(ResumeNote::Adopted { recovered: 1, .. })),
+            "{:?}",
+            r.resumed
+        );
+        published(&fs, 5 * MIB);
+        let c = calls(&fs);
+        assert!(
+            c[mark..].iter().all(|x| !x.starts_with("create_new(/p/dest/big.flux-partial")),
+            "the published file was not staged again: {:?}",
+            &c[mark..]
+        );
+        assert!(!fs.exists("/p/dest/.flux"));
+    }
+
+    // Case 16 (Normal): the unbatched path writes its claim after the rename, so a crash between them leaves the file
+    // published with NO claim and no note. The file is then an existing destination entry the resume does not own:
+    // it is replaced (a safe redo), never reported complete from the stale log, and counted once. The log's records
+    // are not used for a file whose temporary is gone (`PartialMissing`).
+    #[test]
+    fn crash_case_16_immediately_after_atomic_rename_before_its_claim() {
+        let fs = big_fs(5 * MIB);
+        die_at(&fs, "claim_insert", Durability::Normal, |_| true);
+        published(&fs, 5 * MIB);
+        assert!(!fs.exists(partial()), "renamed away");
+        let (r, mark) = resume_run(&fs, Durability::Normal);
+        let out = ok(&r);
+        assert_eq!((out.files_resumed, out.files_copied, out.bytes_copied), (0, 1, 5 * MIB as u64));
+        assert_eq!(
+            (out.files_overwritten, out.bytes_reused, out.files_partially_resumed),
+            (1, 0, 0)
+        );
+        assert_eq!(
+            out.checkpoint_discards.iter().map(|d| d.reason.clone()).collect::<Vec<_>>(),
+            vec![crate::Discard::PartialMissing]
+        );
+        published(&fs, 5 * MIB);
+        assert!(calls(&fs)[mark..].iter().any(|x| x == &format!("create_new({})", partial())));
+        assert!(!fs.exists("/p/dest/.flux"));
+    }
+
+    // Additional: a segment of zero bytes (a crash after the log was created, before its first record) has no state
+    // for any file: `Fresh`, no discard line, no warning. Mutant: an empty segment is reported unreadable.
+    #[test]
+    fn a_zero_length_wal_segment_is_ignored_and_files_recopy() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        fs.write_file(wal(), b"");
+        let (r, mark) = resume_run(&fs, Durability::Normal);
+        assert_safe_redo(&fs, &r, mark);
+        assert!(ok(&r).checkpoint_discards.is_empty(), "{:?}", ok(&r).checkpoint_discards);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    // Additional: the log ends in zeros (a preallocated or zero-extended tail). The tail is cut at the last whole
+    // record, the file resumes from the 2 MiB its whole records prove, and the log the resumed run leaves decodes
+    // cleanly. Mutant: the zero-filled tail is not cut (or is treated as corruption, which refuses the log).
+    #[test]
+    fn a_zero_filled_wal_tail_is_cut_and_reported() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        let enc = crashed_segment(&fs);
+        let whole: usize = enc[..3].iter().map(Vec::len).sum();
+        let mut bytes = enc.concat()[..whole].to_vec();
+        bytes.extend(std::iter::repeat_n(0u8, 4096));
+        fs.write_file(wal(), &bytes);
+        let (r, mark, seen) = resume_spied(&fs, Durability::Normal);
+        assert_progress(&fs, &r, mark, 2 * MIB);
+        assert_tail_warning(&r, whole, 4096, "zero-filled");
+        assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+        let c = calls(&fs);
+        assert!(
+            c[mark..].iter().any(|x| x == &format!("truncate_to({}, {whole})", wal())),
+            "{:?}",
+            &c[mark..]
+        );
+        records(&seen.lock().unwrap().clone());
+    }
+
+    // Additional: the segment already holds generation 5 and the resumed run is generation 2: the open is a
+    // `SequenceConflict` (the run's generation, sequence 1), which is quarantined (owner ruling 23; Ruling 11 made it
+    // `CheckpointsUnreadable`), and every file recopies. Mutant: the writer's open accepts a lower generation (it
+    // would append below the existing records).
+    #[test]
+    fn a_lower_generation_open_quarantines_as_a_sequence_conflict() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        let raised: Vec<u8> = segment_records(&fs)
+            .into_iter()
+            .flat_map(|(mut h, b)| {
+                h.generation = 5;
+                encode(&h, &b)
+            })
+            .collect();
+        fs.write_file(wal(), &raised);
+        let (r, mark) = resume_run(&fs, Durability::Normal);
+        let q = quarantined(&r);
+        assert_eq!(q.len(), 1, "{:?}", r.warnings);
+        let (code, why, name) = &q[0];
+        assert_eq!(*code, "WAL_SEQUENCE_CONFLICT");
+        assert_eq!(why, "generation 2, sequence 1 conflicts with the records already in the log");
+        assert_eq!(name, "000001.corrupt-2");
+        assert_safe_redo(&fs, &r, mark);
+        assert!(
+            calls(&fs)[mark..]
+                .iter()
+                .any(|c| c == &format!("rename_no_replace({} -> {}.corrupt-2)", wal(), wal())),
+            "{:?}",
+            &calls(&fs)[mark..]
+        );
+        assert_eq!(
+            fs.read_file(wal()),
+            None,
+            "the fresh log and the set-aside one went with the workspace"
+        );
+        assert_eq!(fs.read_file(format!("{}.corrupt-2", wal())), None);
+    }
+
+    // Additional: a second run (generation 2) found no usable partial, recopied from byte 0 and crashed after 1 MiB;
+    // the segment holds generation 1's three ranges and then generation 2's FILE_BEGIN (valid_through 0) and one
+    // range. The third run must trust only generation 2's chunk: the FILE_BEGIN resets the range set, so generation
+    // 1's chunks 1 and 2 (which the 3 MiB partial would match) are stale. Mutant: `load_file` does not reset the
+    // digests on a FILE_BEGIN.
+    #[test]
+    fn a_stale_record_from_an_earlier_generation_does_not_mix_with_the_current_one() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        fs.remove_file(Path::new(&partial())).unwrap();
+        // Generation 2: the file starts again from 0 and crashes once the segment holds its first range.
+        fn stop(fs: &FaultFs, n: u32) {
+            fs.on_nth("write_at_start", n, move |fs| {
+                // The WAL thread appends asynchronously: a read can end inside a record, so stop at the first
+                // record that does not decode instead of asserting on it.
+                let gen2 = fs.read_file(wal()).is_some_and(|b| {
+                    let mut at = 0;
+                    while let WalDecoded::Record { header, len, .. } = decode_next(&b[at..]) {
+                        if header.generation == 2 {
+                            return true;
+                        }
+                        at += len;
+                    }
+                    false
+                });
+                if fs.read_file(partial()).is_some_and(|b| b.len() >= MIB) && gen2 {
+                    fs.fail("write_at_start", Code::IoError);
+                    fs.on_nth("write_at_start", n + 1, |fs| {
+                        fs.fail("write_at_start", Code::IoError)
+                    });
+                } else {
+                    stop(fs, n + 1);
+                }
+            });
+        }
+        stop(&fs, next_nth(&fs, "write_at_start("));
+        let second =
+            RunConfig { operation_id: id(8), heartbeat_interval: Duration::ZERO, ..resume() };
+        let (r, _) = run_with(&fs, &second, &opts(), policy(Durability::Normal, 1));
+        assert!(matches!(&r.copy, Some(Err(_))), "{:?}", r.copy);
+        let recs = segment_records(&fs);
+        let gens: Vec<u64> = recs.iter().map(|(h, _)| h.generation).collect();
+        assert!(gens.contains(&1) && gens.contains(&2), "{gens:?}");
+        // The WAL thread may have flushed more than the first chunk of generation 2 before the beat failed: keep
+        // exactly its FileBegin and its first range, so the case does not depend on that race.
+        let kept: Vec<u8> = recs
+            .iter()
+            .filter(|(h, b)| match b {
+                Body::Range(r) if h.generation == 2 => r.range_end <= MIB as u64,
+                _ => true,
+            })
+            .flat_map(|(h, b)| encode(h, b))
+            .collect();
+        fs.write_file(wal(), &kept);
+        // The third run's partial holds 3 MiB of correct bytes, which generation 1's stale ranges would vouch for.
+        fs.write_file(partial(), &pattern(5 * MIB)[..3 * MIB]);
+        let (r, mark) = resume_run(&fs, Durability::Normal);
+        assert_progress(&fs, &r, mark, MIB);
+        assert!(ok(&r).checkpoint_discards.is_empty(), "{:?}", ok(&r).checkpoint_discards);
+    }
+    // ---- Owner ruling 23: what `--resume` does with a damaged or unopenable checkpoint log.
+
+    fn assert_discards(r: &Resumed) {
+        let out = ok(r);
+        assert!(out.checkpoint_discards.is_empty(), "{:?}", out.checkpoint_discards);
+    }
+
+    /// Under `full` a partial shorter than the source is salvaged and reported (design 3.2 item 4): this is the
+    /// run's only discard, for `big`, which kept its 3 MiB.
+    fn assert_only_shorter_discard(r: &Resumed) {
+        let out = ok(r);
+        assert_eq!(
+            out.checkpoint_discards
+                .iter()
+                .map(|d| (d.path.clone(), d.reason.clone()))
+                .collect::<Vec<_>>(),
+            vec![(PathBuf::from("big"), crate::Discard::PartialShorter { kept: 3 * MIB as u64 })]
+        );
+    }
+
+    /// Every `WalQuarantined` warning of the run as (code, why, set_aside_as).
+    fn quarantined(r: &Resumed) -> Vec<(&'static str, String, String)> {
+        r.warnings
+            .iter()
+            .filter_map(|w| match w {
+                RunWarning::WalQuarantined { code, why, set_aside_as } => {
+                    Some((*code, why.clone(), set_aside_as.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// At every `rename_no_replace` of the next 16 calls, record (the quarantine `name` exists beside the segment, the
+    /// segment's bytes): the hooks run just BEFORE their call, so the later renames see the state the earlier left.
+    type Snapshots = Arc<Mutex<Vec<(bool, Option<Vec<u8>>)>>>;
+    fn snapshot_at_renames(fs: &FaultFs, name: &'static str) -> Snapshots {
+        fn watch(fs: &FaultFs, n: u32, last: u32, seen: Snapshots, name: &'static str) {
+            if n > last {
+                return;
+            }
+            fs.on_nth("rename_no_replace", n, move |fs| {
+                seen.lock()
+                    .unwrap()
+                    .push((fs.exists(format!("{}.{name}", wal())), fs.read_file(wal())));
+                watch(fs, n + 1, last, seen, name);
+            });
+        }
+        let seen: Snapshots = Arc::default();
+        let first = next_nth(fs, "rename_no_replace(");
+        watch(fs, first, first + 16, Arc::clone(&seen), name);
+        seen
+    }
+
+    /// The crashed run's segment with one byte flipped inside its second record: damage that is not a trailing tear.
+    fn corrupt_mid_log(fs: &FaultFs) {
+        let enc = crashed_segment(fs);
+        let mut bytes = enc.concat();
+        bytes[enc[0].len() + 12] ^= 1;
+        fs.write_file(wal(), &bytes);
+    }
+
+    #[test]
+    fn a_mid_log_corruption_quarantines_the_segment_and_the_run_completes() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        corrupt_mid_log(&fs);
+        let seen = snapshot_at_renames(&fs, "corrupt-2");
+        let (r, mark) = resume_run(&fs, Durability::Normal);
+        let q = quarantined(&r);
+        assert_eq!(q.len(), 1, "{:?}", r.warnings);
+        assert_eq!((q[0].0, q[0].2.as_str()), ("WAL_CORRUPT", "000001.corrupt-2"));
+        assert!(q[0].1.starts_with("corrupt log at byte"), "{}", q[0].1);
+        assert_safe_redo(&fs, &r, mark);
+        assert_eq!(ok(&r).bytes_reused, 0);
+        let c = calls(&fs);
+        assert!(
+            c[mark..]
+                .iter()
+                .any(|x| x == &format!("rename_no_replace({} -> {}.corrupt-2)", wal(), wal())),
+            "{:?}",
+            &c[mark..]
+        );
+        // While the run copied: the damaged segment sat under its new name, and a NEW `wal/000001` held only the
+        // fresh run's records (generation 2, none of the old log's).
+        let snaps = seen.lock().unwrap().clone();
+        let fresh = snaps
+            .iter()
+            .filter(|(quarantine, _)| *quarantine)
+            .filter_map(|(_, bytes)| bytes.as_ref())
+            .max_by_key(|b| b.len())
+            .expect("a rename saw the quarantine name beside a fresh segment");
+        let recs = records(fresh);
+        assert!(matches!(recs[0].1, Body::FileBegin(_)), "{recs:?}");
+        assert!(recs.iter().all(|(h, _)| h.generation == 2), "{recs:?}");
+        // finish_retire removed the quarantine name with the log: the workspace is gone.
+        assert!(!fs.exists("/p/dest/.flux"));
+        assert_eq!(fs.read_file(format!("{}.corrupt-2", wal())), None);
+    }
+
+    fn assert_unknown_format_stops(cfg: &RunConfig) {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        let mut bytes = crashed_segment(&fs).concat();
+        bytes[4] = 2;
+        fs.write_file(wal(), &bytes);
+        let kept = fs.read_file(partial()).expect("the crash left its partial");
+        let mark = fs.calls().len();
+        let o = opts();
+        let mut got = Vec::new();
+        let r = tree_with(
+            &fs,
+            Path::new("/src"),
+            Path::new("/p/dest"),
+            &o,
+            cfg,
+            &mut |f| got.push(f),
+            CheckpointPolicy { verify: cfg.resume_verify, ..lazy(Durability::Normal) },
+        );
+        assert!(r.stop.is_none() && got.is_empty(), "{:?} {got:?}", r.stop);
+        let Some(Err(abort)) = &r.copy else { panic!("expected an abort: {:?}", r.copy) };
+        assert_eq!(abort.error.code(), Code::WalFormatUnsupported);
+        let text = abort.error.to_string();
+        for part in [
+            "WAL_FORMAT_UNSUPPORTED",
+            "written by a newer Flux, or its version bytes are damaged",
+            "unsupported log format 2 (checksum 1)",
+            "this run copies nothing",
+            "run again with --restart to supersede it",
+        ] {
+            assert!(text.contains(part), "{part} missing from {text}");
+        }
+        assert!(quarantined(&r).is_empty() && r.warnings.is_empty(), "{:?}", r.warnings);
+        // Nothing was copied, nothing was set aside, and the workspace is FAILED with its segment untouched.
+        let c = calls(&fs);
+        assert!(
+            c[mark..].iter().all(|x| x != &format!("create_new({})", partial())
+                && !x.starts_with("truncate_to(")
+                && !x.contains(".corrupt-")
+                && !x.starts_with(&format!("rename_no_replace({}", wal()))),
+            "{:?}",
+            &c[mark..]
+        );
+        assert!(!fs.exists("/p/dest/big"));
+        assert_eq!(fs.read_file(partial()), Some(kept));
+        assert_eq!(fs.read_file(wal()), Some(bytes));
+        assert_eq!(manifest(&fs, ID).state, OpState::Failed);
+    }
+
+    #[test]
+    fn an_unknown_wal_format_stops_the_run_before_any_copy() {
+        assert_unknown_format_stops(&resuming());
+    }
+
+    // Property 7.5. Mutant: `open_checkpoints` maps `FormatUnsupported` to a warning when the level is `full`.
+    #[test]
+    fn an_unknown_wal_format_stops_a_full_resume_before_any_copy() {
+        assert_unknown_format_stops(&resuming_full());
+    }
+
+    // ---- `--resume-verify=full`: the run under the level (design 3.4).
+
+    // Mutant: `plan_resume` ignores the level.
+    #[test]
+    fn a_full_resume_salvages_the_partial_after_the_log_was_quarantined() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        corrupt_mid_log(&fs);
+        let (r, mark) = resume_run_as(&fs, Durability::Normal, &resuming_full());
+        let q = quarantined(&r);
+        assert_eq!(q.len(), 1, "{:?}", r.warnings);
+        assert_eq!(q[0].0, "WAL_CORRUPT");
+        assert_progress(&fs, &r, mark, 3 * MIB);
+    }
+
+    // Mutant: `plan_resume` ignores the level (the `scan == None` origin of `Ok(None)`; the next test pins the
+    // empty `per_file` one).
+    #[test]
+    fn a_full_resume_salvages_the_partial_with_a_zero_length_log() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        fs.write_file(wal(), b"");
+        let (r, mark) = resume_run_as(&fs, Durability::Normal, &resuming_full());
+        assert_progress(&fs, &r, mark, 3 * MIB);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_only_shorter_discard(&r);
+    }
+
+    // Mutant: `plan_resume` ignores the level.
+    #[test]
+    fn a_full_resume_salvages_the_partial_with_no_log() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        fs.remove_file(Path::new(&wal())).unwrap();
+        let (r, mark) = resume_run_as(&fs, Durability::Normal, &resuming_full());
+        assert_progress(&fs, &r, mark, 3 * MIB);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_only_shorter_discard(&r);
+    }
+
+    // Ruling 1. Mutant: `Full` with no partial always reports `PartialMissing`.
+    #[test]
+    fn a_full_resume_of_a_large_file_never_started_reports_no_discard() {
+        let fs = big_fs(5 * MIB);
+        // Sorts after `big`, so the crash at 3 MiB of `big` never starts it.
+        fs.write_file("/src/zzz", &pattern(2 * MIB));
+        crashed_run(&fs);
+        let (r, _) = resume_run_as(&fs, Durability::Normal, &resuming_full());
+        let out = ok(&r);
+        assert_only_shorter_discard(&r);
+        published(&fs, 5 * MIB);
+        assert_eq!(fs.read_file("/p/dest/zzz").as_deref(), Some(&pattern(2 * MIB)[..]));
+        assert_eq!(out.files_partially_resumed, 1, "{out:?}");
+    }
+
+    // Mutant: the `load` result is ignored (never `PartialMissing`).
+    #[test]
+    fn a_full_resume_with_a_missing_partial_names_the_file() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        fs.remove_file(Path::new(&partial())).unwrap();
+        let (r, _) = resume_run_as(&fs, Durability::Normal, &resuming_full());
+        let out = ok(&r);
+        assert_eq!(
+            out.checkpoint_discards
+                .iter()
+                .map(|d| (d.path.clone(), d.reason.clone()))
+                .collect::<Vec<_>>(),
+            vec![(PathBuf::from("big"), crate::Discard::PartialMissing)]
+        );
+        assert_eq!(out.bytes_reused, 0, "{out:?}");
+    }
+
+    // Review Focus 4. Mutant: `full` runs without a checkpoint context.
+    #[test]
+    fn a_full_resume_whose_checkpoints_are_unavailable_recopies_and_warns_once() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        fs.set_identity(wal(), FileIdentity::Unavailable);
+        let (r, mark) = resume_run_as(&fs, Durability::Normal, &resuming_full());
+        let n = r
+            .warnings
+            .iter()
+            .filter(|w| matches!(w, RunWarning::CheckpointsUnavailable { .. }))
+            .count();
+        assert_eq!(n, 1, "{:?}", r.warnings);
+        let out = ok(&r);
+        assert!(
+            calls(&fs)[mark..].iter().all(|c| !c.starts_with("truncate_to(")),
+            "{:?}",
+            &calls(&fs)[mark..]
+        );
+        published(&fs, 5 * MIB);
+        assert!(out.partial_resumes.is_empty(), "{:?}", out.partial_resumes);
+        assert_discards(&r);
+    }
+
+    // Mutant: `stage_into_batch` passes `None` for `fc` (pinned for `chunks`; this pins it for `full` too).
+    #[test]
+    fn a_full_resume_under_strict_salvages_a_batched_partial() {
+        let fs = big_fs(5 * MIB);
+        crashed_run_as(&fs, Durability::Strict);
+        let (r, _) = resume_run_as(&fs, Durability::Strict, &resuming_full());
+        let out = ok(&r);
+        assert!(out.bytes_reused >= 3 * MIB as u64, "{out:?}");
+        assert_eq!(out.files_partially_resumed, 1, "{out:?}");
+        published(&fs, 5 * MIB);
+    }
+
+    // Test audit (cut 9f-2). The partial comes from a NORMAL crash, so `stage_into_batch`'s mutant (`fc` passed as
+    // `None`) cannot touch the fixture and turns THIS resume red: nothing is salvaged, so `bytes_reused` is 0.
+    #[test]
+    fn a_strict_full_resume_reuses_exactly_what_a_normal_crash_left() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        let (r, _) = resume_run_as(&fs, Durability::Strict, &resuming_full());
+        let out = ok(&r);
+        assert_eq!(out.bytes_reused, 3 * MIB as u64, "{out:?}");
+        assert_eq!(out.files_partially_resumed, 1, "{out:?}");
+        assert_only_shorter_discard(&r);
+        published(&fs, 5 * MIB);
+    }
+
+    #[test]
+    fn an_unavailable_segment_is_not_quarantined() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        fs.set_identity(wal(), FileIdentity::Unavailable);
+        let (r, mark) = resume_run(&fs, Durability::Normal);
+        assert!(
+            r.warnings.iter().any(|w| matches!(w, RunWarning::CheckpointsUnavailable { .. })),
+            "{:?}",
+            r.warnings
+        );
+        assert!(quarantined(&r).is_empty());
+        assert!(
+            !r.warnings.iter().any(|w| matches!(w, RunWarning::WalNotQuarantined { .. })),
+            "{:?}",
+            r.warnings
+        );
+        assert_safe_redo(&fs, &r, mark);
+        assert!(
+            calls(&fs)[mark..].iter().all(|c| !c.contains(".corrupt-")),
+            "{:?}",
+            &calls(&fs)[mark..]
+        );
+    }
+
+    /// At each of the next 16 `rename_no_replace` calls, make the call fail when it is the quarantine's.
+    fn fail_the_quarantine_rename(fs: &FaultFs) {
+        fn watch(fs: &FaultFs, n: u32, last: u32) {
+            if n > last {
+                return;
+            }
+            fs.on_nth("rename_no_replace", n, move |fs| {
+                if fs.calls().last().is_some_and(|c| c.replace('\\', "/").contains(".corrupt-")) {
+                    fs.fail("rename_no_replace", Code::IoError);
+                }
+                watch(fs, n + 1, last);
+            });
+        }
+        let first = next_nth(fs, "rename_no_replace(");
+        watch(fs, first, first + 16);
+    }
+
+    #[test]
+    fn a_failed_quarantine_rename_falls_back_to_no_checkpoints() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        corrupt_mid_log(&fs);
+        fail_the_quarantine_rename(&fs);
+        let (r, mark) = resume_run(&fs, Durability::Normal);
+        let failed: Vec<_> = r
+            .warnings
+            .iter()
+            .filter_map(|w| match w {
+                RunWarning::WalNotQuarantined { code, why, error } => {
+                    Some((*code, why.clone(), error.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failed.len(), 1, "{:?}", r.warnings);
+        assert_eq!(failed[0].0, "WAL_CORRUPT");
+        assert!(failed[0].1.starts_with("corrupt log at byte"), "{}", failed[0].1);
+        assert!(failed[0].2.contains("IO_ERROR"), "{}", failed[0].2);
+        assert!(quarantined(&r).is_empty());
+        assert_safe_redo(&fs, &r, mark);
+        let c = calls(&fs);
+        assert!(
+            c[mark..].iter().all(|x| x != &format!("create_new({})", wal())),
+            "ckpt: None, so no fresh log was started: {:?}",
+            &c[mark..]
+        );
+    }
+
+    #[test]
+    fn a_failed_reopen_after_the_rename_says_the_log_was_set_aside_and_runs_without_checkpoints() {
+        fn watch(fs: &FaultFs, n: u32, last: u32) {
+            if n > last {
+                return;
+            }
+            fs.on_nth("metadata", n, move |fs| {
+                // The re-open's probe of the new segment: a `metadata` of it after the quarantine rename.
+                let c: Vec<String> = fs.calls().iter().map(|x| x.replace('\\', "/")).collect();
+                if c.iter().any(|x| x.contains(".corrupt-"))
+                    && c.last().is_some_and(|x| x == &format!("metadata({})", wal()))
+                {
+                    fs.fail("metadata", Code::IoError);
+                }
+                watch(fs, n + 1, last);
+            });
+        }
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        corrupt_mid_log(&fs);
+        let first = next_nth(&fs, "metadata(");
+        watch(&fs, first, first + 400);
+        let (r, mark) = resume_run(&fs, Durability::Normal);
+        let failed: Vec<_> = r
+            .warnings
+            .iter()
+            .filter_map(|w| match w {
+                RunWarning::WalNotQuarantined { code, error, .. } => Some((*code, error.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failed.len(), 1, "{:?}", r.warnings);
+        assert_eq!(failed[0].0, "WAL_CORRUPT");
+        assert!(
+            failed[0].1.starts_with(
+                "it was set aside as wal/000001.corrupt-2, but a fresh log could not be opened: "
+            ),
+            "{}",
+            failed[0].1
+        );
+        assert!(quarantined(&r).is_empty());
+        assert_safe_redo(&fs, &r, mark);
+    }
+
+    #[test]
+    fn a_second_corruption_in_the_same_generation_gets_a_numbered_quarantine_name() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        corrupt_mid_log(&fs);
+        fs.write_file(format!("{}.corrupt-2", wal()), b"an earlier set-aside segment");
+        fs.write_file(format!("{}.corrupt-2-2", wal()), b"and another");
+        let (r, mark) = resume_run(&fs, Durability::Normal);
+        let q = quarantined(&r);
+        assert_eq!(q.len(), 1, "{:?}", r.warnings);
+        assert_eq!(q[0].2, "000001.corrupt-2-3");
+        assert_safe_redo(&fs, &r, mark);
+        assert!(!fs.exists("/p/dest/.flux"), "every quarantine name went with the workspace");
+    }
+
+    // Owner ruling 23, section-99 discipline: the quarantine is a destination mutation. A lock lost before it ends the
+    // run as any lost lock: nothing is renamed and nothing is copied. Mutant: the quarantine skips the guard.
+    #[test]
+    fn a_lost_lock_before_the_quarantine_aborts_it() {
+        let fs = Arc::new(big_fs(5 * MIB));
+        crashed_run(&fs);
+        corrupt_mid_log(&fs);
+        let hook: BeforeMutation = {
+            let fs = Arc::clone(&fs);
+            Arc::new(move || fs.write_file(LOCK, b"another run's bytes"))
+        };
+        let mark = fs.calls().len();
+        let c = RunConfig { before_mutation: Some(hook), ..resuming() };
+        let (r, _) = run_with(&fs, &c, &opts(), lazy(Durability::Normal));
+        let Some(Err(abort)) = &r.copy else { panic!("expected an abort: {:?}", r.copy) };
+        assert_eq!(abort.error.code(), Code::TargetLockBusy);
+        let calls = calls(&fs);
+        assert!(
+            calls[mark..]
+                .iter()
+                .all(|x| !x.contains(".corrupt-") && x != &format!("create_new({})", partial())),
+            "{:?}",
+            &calls[mark..]
+        );
+        assert!(quarantined(&r).is_empty(), "{:?}", r.warnings);
+    }
 }

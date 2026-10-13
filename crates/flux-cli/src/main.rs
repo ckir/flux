@@ -81,8 +81,16 @@ struct CopyArgs {
     restart: bool,
     /// Continue the one resumable prior operation on DEST as itself: files it completed are verified and skipped,
     /// the rest are copied under the existing-file policy. With no prior operation a new one starts.
+    /// In a tree copy a file of 64 MiB or more continues after the longest leading run of chunks whose digests match on
+    /// both the source and the destination; every other half-copied file is recopied, and a half-copied single file is always recopied. Under
+    /// --durability=normal a checkpoint is advisory and is validated against the data before it is trusted.
     #[arg(long, conflicts_with = "restart")]
     resume: bool,
+    /// How a half-copied large file is validated before --resume continues it: `chunks` (the default) proves each
+    /// recorded chunk's digest on both sides; `full` re-reads and hashes the whole partial against the source, needs no
+    /// checkpoint log, and keeps the equal prefix; `metadata` is not implemented in this version.
+    #[arg(long, value_enum, requires = "resume")]
+    resume_verify: Option<ResumeVerifyArg>,
     /// With --restart: take over a lock that a crashed run left empty or unreadable (§240.5).
     #[arg(long, requires = "restart")]
     break_lock: bool,
@@ -103,6 +111,13 @@ struct CopyArgs {
 enum DurabilityArg {
     Normal,
     Strict,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ResumeVerifyArg {
+    Metadata,
+    Chunks,
+    Full,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -162,6 +177,14 @@ fn run_config(args: &CopyArgs) -> RunConfig {
         heartbeat_interval: heartbeat_interval(),
         resume: args.resume,
         descriptor_limit: flux_platform::soft_descriptor_limit(),
+        resume_verify: match args.resume_verify {
+            None | Some(ResumeVerifyArg::Chunks) => flux_core::run::ResumeVerify::Chunks,
+            Some(ResumeVerifyArg::Full) => flux_core::run::ResumeVerify::Full,
+            // Refused first thing in `copy`.
+            Some(ResumeVerifyArg::Metadata) => {
+                unreachable!("--resume-verify=metadata is refused before the run")
+            }
+        },
     }
 }
 
@@ -227,6 +250,12 @@ fn counters_file(outcome: &flux_core::tree::TreeOutcome, run_beat_gap_max: std::
 fn counters_file(_outcome: &flux_core::tree::TreeOutcome, _run_beat_gap_max: std::time::Duration) {}
 
 fn copy(args: &CopyArgs) -> u8 {
+    if args.resume_verify == Some(ResumeVerifyArg::Metadata) {
+        err(
+            "error: --resume-verify=metadata is not implemented in this version; use chunks (the default) or full",
+        );
+        return exit_code::USAGE;
+    }
     let job = match resolve::job(&args.source, &args.destination) {
         Ok(job) => job,
         Err(Stop::Usage(msg)) => {
@@ -261,13 +290,15 @@ fn copy(args: &CopyArgs) -> u8 {
                 }
             });
             let ms = millis(started);
-            let rep = Report::tree_run(&run, ms);
+            let mut rep = Report::tree_run(&run, ms);
+            let full = args.resume_verify == Some(ResumeVerifyArg::Full);
             match &run.copy {
                 Some(result) => {
                     let outcome = match result {
                         Ok(out) => out,
                         Err(a) => {
                             err(&a.error.to_string());
+                            lines(report::abort_hint_lines(&a.error));
                             &a.outcome
                         }
                     };
@@ -276,6 +307,9 @@ fn copy(args: &CopyArgs) -> u8 {
                     }
                     lines(report::run_lines(&run));
                     lines(report::resume_lines(&run, outcome.files_resumed));
+                    lines(report::checkpoint_lines(outcome, opts.durability == Durability::Normal));
+                    lines(report::resume_verify_lines(outcome, full));
+                    rep.resume_verify = report::resume_verify_used(outcome, full).then_some("full");
                     err(&report::summary_line(&rep, outcome.directories_created));
                 }
                 None => lines(report::run_lines(&run)),

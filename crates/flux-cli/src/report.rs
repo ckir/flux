@@ -4,7 +4,9 @@
 
 use flux_core::copy::CopyError;
 use flux_core::run::{ResumeNote, Run, RunError, RunWarning};
-use flux_core::{TreeAbort, TreeFailure, TreeFailureCause, TreeOutcome, WeakIdentityWarnings};
+use flux_core::{
+    Discard, TreeAbort, TreeFailure, TreeFailureCause, TreeOutcome, WeakIdentityWarnings,
+};
 use flux_fs::{Code, FileIdentity, MetadataFailure, MetadataItem, Outcome};
 use serde::Serialize;
 use std::path::Path;
@@ -36,6 +38,9 @@ pub struct Report {
     pub average_bytes_per_second: u64,
     pub verify_level: &'static str,
     pub hash_algorithm: &'static str,
+    /// Cut 9f-2: `"full"` when `--resume-verify=full` re-read a partial; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_verify: Option<&'static str>,
 }
 
 impl Report {
@@ -59,6 +64,7 @@ impl Report {
             average_bytes_per_second: 0,
             verify_level: "none",
             hash_algorithm: "blake3",
+            resume_verify: None,
         }
     }
 
@@ -366,6 +372,21 @@ pub fn run_warning_line(w: &RunWarning) -> String {
             path.display(),
             error.source
         ),
+        RunWarning::CheckpointsUnavailable { why } => {
+            format!("checkpoints unavailable on this filesystem: {why}; every large file recopies")
+        }
+        RunWarning::CheckpointsUnreadable { why } => {
+            format!("checkpoints unreadable: {why}; every large file recopies")
+        }
+        RunWarning::WalQuarantined { code, why, set_aside_as } => format!(
+            "{code}: the checkpoint log is damaged ({why}); possible storage damage, investigate; it was set aside as wal/{set_aside_as} and a fresh log was started; every large file recopies"
+        ),
+        RunWarning::WalNotQuarantined { code, why, error } => format!(
+            "{code}: the checkpoint log is damaged ({why}) and could not be set aside ({error}); this run copies with no checkpoints"
+        ),
+        RunWarning::WalTailDiscarded { offset, len, reason } => format!(
+            "WAL tail cut: {len} bytes at offset {offset} ({reason}); the checkpoints before it are intact"
+        ),
     }
 }
 
@@ -398,6 +419,64 @@ pub fn resume_lines<T>(run: &Run<T>, files_resumed: u64) -> Vec<String> {
         v.push(format!("resumed {files_resumed} already-complete files"));
     }
     v
+}
+
+/// Cut 9f-1 (spec decision 12): what a checkpointed run reused and discarded. One `resumed` line per partially resumed
+/// file, one `checkpoints discarded` line per file whose checkpoints were discarded, and, under Normal durability and
+/// only when something was reused or discarded, a closing note. An uncheckpointed run prints nothing.
+pub fn checkpoint_lines(outcome: &TreeOutcome, normal_durability: bool) -> Vec<String> {
+    let mut v = Vec::new();
+    for r in &outcome.partial_resumes {
+        v.push(format!(
+            "resumed {}: reused {} bytes, recopied {} bytes",
+            rel(&r.path),
+            r.reused,
+            r.recopied
+        ));
+    }
+    for d in &outcome.checkpoint_discards {
+        let why = match &d.reason {
+            Discard::SourceChanged(what) => format!("source changed ({what})"),
+            Discard::PartialMissing => "partial missing".to_string(),
+            Discard::MismatchAt(at) => format!("mismatch at offset {at}"),
+            Discard::PartialShorter { kept } => {
+                format!("partial shorter than its checkpoints (kept {kept} bytes)")
+            }
+            Discard::Unreadable(why) => format!("checkpoints unreadable: {why}"),
+        };
+        v.push(format!("checkpoints discarded for {}: {why}", rel(&d.path)));
+    }
+    if normal_durability && !v.is_empty() {
+        v.push(
+            "note: --durability=normal checkpoints are advisory; every reused chunk was validated against the source and the destination"
+                .to_string(),
+        );
+    }
+    v
+}
+
+/// Cut 9f-2: whether `--resume-verify=full` did something a user can see: it re-read a partial that was then resumed or
+/// whose checkpoints were discarded. Never under `chunks`.
+pub fn resume_verify_used(outcome: &TreeOutcome, full: bool) -> bool {
+    full && (!outcome.partial_resumes.is_empty() || !outcome.checkpoint_discards.is_empty())
+}
+
+/// Cut 9f-2: the level line, printed after `checkpoint_lines` when `resume_verify_used`.
+pub fn resume_verify_lines(outcome: &TreeOutcome, full: bool) -> Vec<String> {
+    if resume_verify_used(outcome, full) {
+        vec!["resume verification: full (source and partial re-read and hashed)".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Cut 9f-1: the line that follows an aborting error when it is a checkpoint-write failure.
+pub fn abort_hint_lines(error: &CopyError) -> Vec<String> {
+    if error.code() == Code::WalWriteFailed {
+        vec!["run again with --resume to continue from the last durable checkpoint".to_string()]
+    } else {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
@@ -848,6 +927,166 @@ mod tests {
     }
 
     #[test]
+    fn resume_verify_lines_print_only_for_full_with_a_partial_resume_or_discard() {
+        use flux_core::{CheckpointDiscard, PartialResume};
+        let line =
+            vec!["resume verification: full (source and partial re-read and hashed)".to_string()];
+        let resumed = TreeOutcome {
+            partial_resumes: vec![PartialResume {
+                path: PathBuf::from("big"),
+                reused: 1,
+                recopied: 1,
+            }],
+            ..TreeOutcome::default()
+        };
+        assert_eq!(resume_verify_lines(&resumed, true), line);
+        assert!(resume_verify_lines(&resumed, false).is_empty());
+        let discarded = TreeOutcome {
+            checkpoint_discards: vec![CheckpointDiscard {
+                path: PathBuf::from("big"),
+                reason: Discard::PartialMissing,
+            }],
+            ..TreeOutcome::default()
+        };
+        assert_eq!(resume_verify_lines(&discarded, true), line);
+        assert!(resume_verify_lines(&discarded, false).is_empty());
+        assert!(resume_verify_lines(&TreeOutcome::default(), true).is_empty());
+        assert!(!resume_verify_used(&TreeOutcome::default(), true));
+        assert!(resume_verify_used(&resumed, true));
+        assert!(!resume_verify_used(&resumed, false));
+    }
+
+    #[test]
+    fn the_json_carries_resume_verify_only_when_set() {
+        let mut r = Report::pre_engine(false);
+        assert!(!r.to_json().contains("resume_verify"));
+        r.resume_verify = Some("full");
+        let s = r.to_json();
+        assert!(s.contains("\"resume_verify\":\"full\""), "{s}");
+        let last = KEYS.last().unwrap();
+        assert!(
+            s.find(&format!("\"{last}\":")).unwrap() < s.find("\"resume_verify\"").unwrap(),
+            "{s}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v.as_object().unwrap().len(), KEYS.len() + 1, "{s}");
+        assert!(s.trim_end().ends_with("\"resume_verify\":\"full\"}"), "{s}");
+    }
+
+    #[test]
+    fn checkpoint_lines_name_each_reuse_and_each_discard() {
+        use flux_core::{CheckpointDiscard, PartialResume};
+        let d = |p: &str, reason| CheckpointDiscard { path: PathBuf::from(p), reason };
+        let out = TreeOutcome {
+            partial_resumes: vec![PartialResume {
+                path: PathBuf::from("sub/big"),
+                reused: 3145728,
+                recopied: 2097152,
+            }],
+            checkpoint_discards: vec![
+                d("a", Discard::SourceChanged("length")),
+                d("b", Discard::SourceChanged("modified time")),
+                d("c", Discard::SourceChanged("identity")),
+                d("d", Discard::PartialMissing),
+                d("sub/e", Discard::MismatchAt(1048576)),
+                d("f", Discard::PartialShorter { kept: 2621440 }),
+                d("g", Discard::Unreadable("bad crc".into())),
+            ],
+            ..TreeOutcome::default()
+        };
+        let strict = checkpoint_lines(&out, false);
+        assert_eq!(
+            strict,
+            vec![
+                "resumed sub/big: reused 3145728 bytes, recopied 2097152 bytes",
+                "checkpoints discarded for a: source changed (length)",
+                "checkpoints discarded for b: source changed (modified time)",
+                "checkpoints discarded for c: source changed (identity)",
+                "checkpoints discarded for d: partial missing",
+                "checkpoints discarded for sub/e: mismatch at offset 1048576",
+                "checkpoints discarded for f: partial shorter than its checkpoints (kept 2621440 bytes)",
+                "checkpoints discarded for g: checkpoints unreadable: bad crc",
+            ]
+        );
+        let normal = checkpoint_lines(&out, true);
+        assert_eq!(&normal[..strict.len()], &strict[..]);
+        assert_eq!(
+            &normal[strict.len()..],
+            [
+                "note: --durability=normal checkpoints are advisory; every reused chunk was validated against the source and the destination"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_uncheckpointed_resume_report_is_unchanged() {
+        assert!(checkpoint_lines(&TreeOutcome::default(), true).is_empty());
+        assert!(checkpoint_lines(&TreeOutcome::default(), false).is_empty());
+    }
+
+    #[test]
+    fn a_wal_write_failure_adds_one_resume_hint_and_no_other_error_does() {
+        let wal = CopyError {
+            cause: FsError::new(Code::WalWriteFailed, std::io::Error::other("x")),
+            leftover: None,
+            step: CopyStep::Checkpoint,
+        };
+        assert_eq!(
+            abort_hint_lines(&wal),
+            vec!["run again with --resume to continue from the last durable checkpoint"]
+        );
+        let other = CopyError {
+            cause: FsError::new(Code::IoError, io("x")),
+            leftover: None,
+            step: CopyStep::Source,
+        };
+        assert!(abort_hint_lines(&other).is_empty());
+    }
+
+    // Owner ruling 23: the exact texts of the two quarantine warnings.
+    #[test]
+    fn the_wal_quarantine_warnings_have_their_exact_texts() {
+        assert_eq!(
+            run_warning_line(&RunWarning::WalQuarantined {
+                code: "WAL_CORRUPT",
+                why: "corrupt log at byte 40: bad".to_string(),
+                set_aside_as: "000001.corrupt-2".to_string(),
+            }),
+            "WAL_CORRUPT: the checkpoint log is damaged (corrupt log at byte 40: bad); possible storage damage, investigate; it was set aside as wal/000001.corrupt-2 and a fresh log was started; every large file recopies"
+        );
+        assert_eq!(
+            run_warning_line(&RunWarning::WalNotQuarantined {
+                code: "WAL_SEQUENCE_CONFLICT",
+                why: "conflict".to_string(),
+                error: "denied".to_string(),
+            }),
+            "WAL_SEQUENCE_CONFLICT: the checkpoint log is damaged (conflict) and could not be set aside (denied); this run copies with no checkpoints"
+        );
+    }
+
+    // Owner ruling 23: an unsupported log format aborts the tree with its own code, exits 1 and has no resume hint.
+    #[test]
+    fn a_wal_format_unsupported_abort_prints_its_code_exits_1_and_adds_no_hint() {
+        let error = CopyError {
+            cause: FsError::new(
+                Code::WalFormatUnsupported,
+                std::io::Error::other(
+                    "the checkpoint log was written by a newer Flux (unsupported log format 2 (checksum 1)); nothing was copied; run again with --restart to supersede it",
+                ),
+            ),
+            leftover: None,
+            step: CopyStep::Checkpoint,
+        };
+        let line = error.to_string();
+        assert!(line.contains("WAL_FORMAT_UNSUPPORTED: "), "{line}");
+        assert!(line.contains("run again with --restart to supersede it"), "{line}");
+        assert!(abort_hint_lines(&error).is_empty());
+        let aborted =
+            Err(flux_core::TreeAbort { error, outcome: flux_core::TreeOutcome::default() });
+        assert_eq!(crate::exit_code::for_tree(&aborted), crate::exit_code::FAILED);
+    }
+
+    #[test]
     fn resume_lines_name_the_operation_and_the_counts() {
         use flux_core::run::ResumeNote;
         let with = |resumed| Run::<()> {
@@ -1011,5 +1250,20 @@ mod tests {
         // An existing target changes nothing about a run that never reached its copy.
         let over = Report::file_run(&run(None, Some(refused())), true, 1);
         assert_eq!((over.errors, over.files_total, over.files_failed), (1, 0, 0), "over a target");
+    }
+
+    // Mutant: the arm's reason or numbers are swapped, or its sentence changed.
+    #[test]
+    fn the_wal_tail_warning_names_the_cut_and_why_for_each_reason() {
+        for reason in
+            ["zero-filled", "its declared span reaches the end of the log", "a record cut short"]
+        {
+            assert_eq!(
+                run_warning_line(&RunWarning::WalTailDiscarded { offset: 1014, len: 4096, reason }),
+                format!(
+                    "WAL tail cut: 4096 bytes at offset 1014 ({reason}); the checkpoints before it are intact"
+                )
+            );
+        }
     }
 }

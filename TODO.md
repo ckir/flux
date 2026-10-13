@@ -520,7 +520,7 @@ the spec's numbers, 9-10 were learned during execution).
 
 1. A tree with one small file per directory gets no batching: the batch flushes at every `DirEnd`. Keeping directory handles alive across `DirEnd` is
    the later fix.
-2. A crash loses up to `BATCH_FILES` files' staging work (they are recopied at `--resume`) and up to that many claims reach recovery as notes.
+2. A crash loses up to `BATCH_FILES` files' staging work (they are recopied at `--resume`) and up to that many claims reach recovery as notes. Large files (64 MiB and up) in a tree now resume from validated checkpoints (cut 9f-1); small files in a batch are still recopied.
 3. The rename is still not directory-synced (cut 9c limit 1 stands).
 4. The data `fsync` per file is not batched; it is the floor of about 1 sync per file.
 5. The age bound is not a timer: it is checked only at the NEXT STAGING in that directory or at its `DirEnd`. A long file being copied delays the
@@ -533,6 +533,29 @@ the spec's numbers, 9-10 were learned during execution).
 7. A file and a directory in one directory whose names fold equal only by a NON-ASCII fold, onto a folding destination: the file's rename meets the
    collision (batched) where an unbatched copy publishes the file and refuses the directory. Nothing is lost or overwritten; which of the two is
    reported differs.
+
+## Cut 9f-1 open
+
+- [ ] Single-file WAL layout: a single-file operation has no workspace directory, so a half-copied single large file still recopies on `--resume`; the next cut's FIRST decision is where its WAL lives (V16 s18.1/s119 give a single file no `wal/`; needs a V16 amendment).
+- [ ] Verify the Strict duplicate-sync behaviour per platform (spec decision 6): macOS `F_FULLFSYNC` per descriptor, and Windows `FlushFileBuffers` needing write access on a duplicate; not performed in plan 2 (use the `verifying-platform-assumptions` skill).
+- [ ] Salvage the valid prefix of a log with mid-log damage: today the whole segment is set aside and every large file recopies (owner ruling 23).
+- [ ] An `--on-wal-corrupt=stop|quarantine` flag, for operators who want a damaged log to stop the run instead of being set aside.
+- [ ] Identity gate and `st_dev`: resume identity compares `identity_text`, which embeds `st_dev` on Unix, and that may differ after a reboot on some filesystems, discarding every checkpoint; verify with the `verifying-platform-assumptions` skill.
+- [ ] The WAL writer thread has no section-99 lock check of its own: it mutates the destination (`ensure_wal`, appends, Strict syncs) on its 1 s timer, and the run notices a lost lock only at its next guard or heartbeat (up to 5 s, or right after a process freeze), so a successor that already holds the lock can see a late flush from the old holder (design deviation (f)). Harm is bounded: replay reports `WAL_CORRUPT` and the file recopies, digests still protect destination bytes. Needs a `Send + Sync` guard handed to `WalConfig` (`guarded()` uses the main thread's lock handle).
+- [ ] The Strict duplicate descriptor is not counted against `OPEN_WRITERS_MAX` (decision 6 followed without a recorded deviation until the plan 2 review).
+- [ ] Reporting: a file whose checkpoints were discarded but which then FAILS gets no discard line (the `Err` carries no `Reuse`, `split_reuse`, `tree.rs`), and `--json` carries none of the reuse/discard fields; this weakens decision 12 ("nothing is discarded silently").
+- [ ] `flux copy` with an unreadable `DEST/.flux` (permission denied) is refused whole by `check_control_plane` (`prior.rs:212`) instead of the spec's "cleanup cannot list: exit 1, classification incomplete" for `flux cleanup`; found by reading in cut 9b, not measured.
+- [ ] CI: no job in `.github/workflows/ci.yml` sets `timeout-minutes` (the model and bench workflows do), so a test that blocks forever runs for GitHub's 6 h default; the nextest override covers `wal::` tests only. The Windows store tests legitimately run 112-158 s, so pick the limit from CI history.
+
+## Cut 9f-1 test debt (audits of plans 1 and 2; owner deferred)
+
+- [ ] No test opens a FIFO through `DirHandle::open_existing`: the `O_NONBLOCK`/`ENXIO` classification (`dir_unix.rs:180`) is unpinned.
+- [ ] No Windows test holds a hard-link keep-alive across `open_existing` to pin the identity check against a replaced object (`dir_windows.rs:637`).
+- [ ] Torn-tail classification (ruling 23, `wal/replay.rs:84`) is pinned by a handful of cases; add multi-record spans, window-boundary damage and zero-tail variants.
+- [ ] A property or fuzz test over `wal::replay::scan` / `load_file`: arbitrary prefix truncation and bit flips never panic, and `scan(stream[..valid_len])` is idempotent with no discarded tail (suggested by capstone r2 and r3 and the plan 1 audit).
+- [ ] `crash_case_2_during_destination_flush` (`run/tests.rs`) zeroes a partial tail that `decide` never reads (its WAL holds only `FileBegin`, so `decide` returns Fresh before reading); it passes with or without the zeroing. Unverified by mutation; `assert_safe_redo` still pins the redo.
+- [ ] No test injects a heartbeat failure during `plan_resume` (`copy.rs:597-608` maps it to `CopyStep::Heartbeat`; `decide.rs` covers it in isolation).
+- [ ] FaultFs gaps that limit those tests: `FakeHandle::write` records nothing in the call log, so no test can order a WAL write against a sync or rename (`fault_fs.rs:688`); there is no read-fault injector, so a source read error mid-file cannot be simulated (the abort-on-source-read-error path is unexercised); `FakeDirHandle::open_existing` and `open_dir` push their call-log entry directly or not at all, so `on_nth` hooks and `fail(..)` never fire for them (`fault_fs.rs:1751`, `:1812`); `FakeHandle::identity` looks up the handle's stale path, so after `move_object` an open handle reads `Unavailable` where a real file reads its descriptor (`fault_fs.rs:749`).
 
 ## Cut 9d debt
 
@@ -579,13 +602,15 @@ the spec's numbers, 9-10 were learned during execution).
 - [x] The drain after a lost-lock or heartbeat-failure stop ran the data-sync barrier (and, after a heartbeat failure, published): fixed by owner ruling B2' (9e spec decision 10).
 - [ ] The acceptance measurement's figures (the longest barrier, the longest heartbeat gap, cap flushes; Strict small/flat ratios against the 9d head)
   are filled in by Task 7 of the 9e plan.
-- [ ] `FaultFs::on_nth` keeps one hook per call name (`hooks.insert` replaces, `crates/flux-core/src/fault_fs.rs`); a second `on_nth` on the same name
+- [x] (closed 2026-10-12: hooks are keyed by (name, nth), pinned by `two_hooks_on_one_name_at_different_counts_both_run`) `FaultFs::on_nth` keeps one hook per call name (`hooks.insert` replaces, `crates/flux-core/src/fault_fs.rs`); a second `on_nth` on the same name
   silently wins. Document or key by (name, nth).
 
 - [ ] A cross-platform real-filesystem Strict test copying a READ-ONLY source with an mtime check: the inline sync now runs after
   `set_permissions`/`set_times`, and no CI test exercises `FlushFileBuffers`/`F_FULLFSYNC` after a handle-level read-only attribute.
-- [ ] Error precedence in the non-batched Strict path: when both the `Preserve::Strict` metadata step and the sync fail, `MetadataApplyFailed`
-  is now reported instead of `StrictDurabilityUnavailable` (a consequence of the sync moving after the metadata step).
+- [x] Error precedence in the non-batched Strict path: when both the `Preserve::Strict` metadata step and the sync fail, `MetadataApplyFailed`
+  is reported instead of `StrictDurabilityUnavailable` (a consequence of the sync moving after the metadata step). Owner ruling 2026-10-12: kept; the
+  first failing step reports its own code, in step order, and the sync never runs after a Strict metadata failure. Pinned by
+  `a_strict_metadata_failure_is_reported_before_the_sync_runs`.
 - [ ] The end-to-end stall oracles pin `FLUX_TEST_BATCH_AGE_MS` and `FLUX_TEST_OPEN_WRITERS` so no age or cap flush moves a guard index; a clock injectable from the CLI (the tree already takes `BatchPolicy.now`) would let an end-to-end test exercise an age flush deterministically instead of blinding the oracles to it (capstone round 3 recommendation).
 - [ ] Test-audit debt (cut 9e, 2026-10-11): the suite pins the drain's stop classes with hand-built two- and three-frame fixtures; a property test over (frame depth x stop class x failure phase) asserting "no temporary neither removed nor reported", "no note for unsynced data" and "no barrier after a stop", and a real-filesystem crash-injection harness (the fake masks OS fsync semantics), would cover the state space the point tests cannot.
 - [ ] `Run.beat_gap_max` is refreshed after the copy only in the tree run (`crates/flux-core/src/run/mod.rs`); the single-file run
@@ -933,8 +958,9 @@ are kept on the development box under `~/flux-probe` (not in the repository).
 - [ ] **Heartbeat cadence per chunk.** The copy loop calls the heartbeat once per chunk; a chunk is now up to 256 KiB
       (was 64 KiB), so beats per byte fell fourfold for large files. The beat is rate-limited to once per 5 s and
       section 101 sets no maximum gap per chunk. The 30 s stale-lease threshold comes from the spec (items at lines
-      4186 and 5005 of `FLUX_FULL_UPDATED_SPEC_V16.md`), not from a constant in the code, which has only the 5 s
-      `HEARTBEAT_INTERVAL` (`crates/flux-core/src/run/mod.rs`). Because the beat can lag the last call by up to 5 s,
+      4186 and 5005 of `FLUX_FULL_UPDATED_SPEC_V16.md`); `flux cleanup` carries it as `LEASE_THRESHOLD`
+      (`crates/flux-core/src/cleanup/mod.rs`), and the run's own heartbeat constant is the 5 s `HEARTBEAT_INTERVAL`
+      (`crates/flux-core/src/run/mod.rs`). Because the beat can lag the last call by up to 5 s,
       a chunk must complete within 25 s to keep the heartbeat under 30 s old: the worst case holds above about
       10 KiB/s of sustained throughput (256 KiB / 25 s = 10.24 KiB/s; it was about 2.6 KiB/s at 64 KiB). Very slow
       media could appear stale during one slow chunk, though staleness also requires that no live process holds the
@@ -947,6 +973,12 @@ Each is deferred to the cut that first reads it (cut 7b spec, `docs/superpowers/
 - [ ] **`configuration_fingerprint` (§19, §121)** - cut 9: read only by resume; most §121 options do not exist yet.
 - [ ] **Checkpoints and `last_checkpoint` (§19, §139, §148, §164)** - cuts 8/9: the spec defines them only through
       the WAL and `state.db` (§119's layout).
+      Partly delivered by cut 9f-1: batched chunk checkpoints in a WAL, and partial-file resume for tree files of
+      64 MiB and up. Still open: snapshots, compaction and rotation of the WAL (cut 9f-3, with
+      `--resume-verify=metadata` and the section 121 upgrade rule), and checkpoints for the single-file layout.
+      `--resume-verify=chunks|full` shipped in cut 9f-2. Decision 15's real-filesystem crash tests are the
+      `real-filesystem crash-injection harness` item, still open, under "Cut 9e debt" above (the test-audit debt entry
+      near line 593).
 - [ ] **`roots` (§19, §18.3)** - cut 10: one root until several sources exist.
 - [ ] **`last_heartbeat_monotonic` (§229.2)** - cut 9: "diagnostic/current-session data only".
 - [ ] **Finishing a prior run's `cleanup_pending` (§21.1 "may", §218)** - cut 9: a COMPLETED prior with

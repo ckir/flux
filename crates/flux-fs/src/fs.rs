@@ -96,6 +96,10 @@ pub struct Metadata {
     /// §107 requires the strength to travel with it. One field, three states, and no
     /// second way to say "absent".
     pub identity: FileIdentity,
+    /// The number of hard links to the object (`st_nlink` on POSIX, `NumberOfLinks` on Windows), `None` when the
+    /// platform or filesystem cannot say. Resume writes THROUGH a partial it reopens, so it must know the name is the
+    /// object's only one: a partial with another link would write into a file the other name leads to.
+    pub nlink: Option<u64>,
 }
 
 /// A handle open for writing. Deliberately NOT `Read`: see `FileSystem::Reader`.
@@ -104,6 +108,19 @@ pub trait FileHandle: Write {
     /// The identity of the file this handle HOLDS - never of a path (cut 7b): a rename keeps it, so the copy reads the
     /// published target's identity from its temporary's handle.
     fn identity(&self) -> Result<FileIdentity>;
+
+    /// An OS-level duplicate of this handle (`File::try_clone`: `dup` on POSIX, `DuplicateHandle` on Windows). It
+    /// shares the open file description, so `sync_all` on the duplicate syncs the same file, and it may be moved to
+    /// another thread while this handle keeps writing. The file OFFSET is shared too, so a write through either handle moves
+    /// both. Never follows anything: this is a handle, not a path.
+    fn duplicate(&self) -> Result<Self>
+    where
+        Self: Sized;
+
+    /// Makes the file exactly `len` bytes long and positions the next `write` at `len`. Never follows anything: this
+    /// is a handle, not a path. A `len` greater than the current length is refused (`Code::DestinationError`, kind
+    /// `InvalidInput`): this cuts a tail, it never extends the file.
+    fn truncate_to(&mut self, len: u64) -> Result<()>;
 }
 
 pub trait FileSystem: Send + Sync {
@@ -122,7 +139,7 @@ pub trait FileSystem: Send + Sync {
     type Reader: Read;
 
     /// A handle open for writing, used for the temporary.
-    type Writer: FileHandle + Sync;
+    type Writer: FileHandle + Sync + Send;
 
     fn open_read(&self, path: &Path) -> Result<Self::Reader>;
 
@@ -224,7 +241,10 @@ pub trait FileSystem: Send + Sync {
 /// Where the error KIND is stated below, both existing implementations were
 /// measured to agree on it, and a third should too: the engine branches on it.
 pub trait DirHandle: Sized {
-    type Writer: FileHandle + Sync;
+    type Writer: FileHandle + Sync + Send;
+
+    /// A child file opened for streaming reads (`open_read`). Read only: it has no write half.
+    type Reader: std::io::Read;
 
     /// A lock file held open for reading and writing (§96.1). See `crate::LockFile`.
     type Lock: crate::LockFile;
@@ -262,6 +282,26 @@ pub trait DirHandle: Sized {
     /// would find nothing to collide with and create the file at the link's target,
     /// outside `DEST`. The name is occupied by the link itself.
     fn create_new(&self, name: &std::ffi::OsStr) -> Result<Self::Writer>;
+
+    /// Open an existing child REGULAR FILE for writing, as `create_new` does by name: relative to this handle, so the
+    /// name cannot be resolved anywhere outside the directory it holds, and never following a link. The file is not
+    /// truncated and the handle is positioned at 0; a caller that resumes calls `truncate_to` next.
+    ///
+    /// `expected` is the identity the caller recorded when it wrote the file. The handle's `identity()` MUST equal it,
+    /// or the open is refused: a different object at the name is not the file the caller means to resume.
+    ///
+    /// Refuses: a name-surrogate (`Code::SafetyRejected`); a directory (`Code::DestinationError`, kind `IsADirectory`);
+    /// any other non-regular file (`Code::DestinationError`); an identity that differs from `expected`, and an
+    /// `expected` of `FileIdentity::Unavailable`, which proves nothing (`Code::DestinationError`, kind `InvalidData`).
+    /// A file with more than one hard link (`Code::SafetyRejected`): a write through this handle would change the
+    /// bytes behind every other name of the object, so the name is not a file the caller may resume. A link count the
+    /// platform cannot report does not refuse here; callers that need the guarantee read `Metadata::nlink` first.
+    /// A missing name is `Code::IoError` with kind `NotFound`. The handle is closed on every refusal.
+    fn open_existing(
+        &self,
+        name: &std::ffi::OsStr,
+        expected: &crate::FileIdentity,
+    ) -> Result<Self::Writer>;
 
     /// Metadata for a child, judging the NAME and never its target.
     ///
@@ -358,6 +398,13 @@ pub trait DirHandle: Sized {
     /// missing name is `Code::IoError` with kind `NotFound`.
     fn read_file(&self, name: &std::ffi::OsStr, limit: usize) -> Result<Vec<u8>>;
 
+    /// Open a child REGULAR FILE for streaming reads, never following a link.
+    ///
+    /// Refuses exactly as `read_file` does: a name-surrogate (`Code::SafetyRejected`); a directory
+    /// (`Code::DestinationError`, kind `IsADirectory`); any other non-regular file where the platform can tell
+    /// (`Code::DestinationError`). A missing name is `Code::IoError` with kind `NotFound`.
+    fn open_read(&self, name: &std::ffi::OsStr) -> Result<Self::Reader>;
+
     /// Remove an EMPTY child directory (`rmdir`).
     ///
     /// Refuses, with these kinds (the engine branches on them): a name that is not a directory - a file, or a link of
@@ -398,7 +445,7 @@ pub enum MountRoot {
 /// exempts, because a user who points `DEST` at a symlink has chosen that
 /// destination. The clause protects what is BELOW it.
 pub trait DestinationRoot: FileSystem {
-    type Dir: DirHandle<Writer = Self::Writer>;
+    type Dir: DirHandle<Writer = Self::Writer> + Send + 'static;
 
     /// Resolve `DEST` and return a handle to it.
     ///
@@ -444,6 +491,18 @@ mod tests {
         fn identity(&self) -> crate::Result<crate::FileIdentity> {
             Ok(crate::FileIdentity::Unavailable)
         }
+        fn duplicate(&self) -> crate::Result<Self> {
+            Err(crate::FsError::new(
+                crate::Code::DestinationError,
+                std::io::Error::other("NullWriter cannot duplicate"),
+            ))
+        }
+        fn truncate_to(&mut self, _: u64) -> crate::Result<()> {
+            Err(crate::FsError::new(
+                crate::Code::DestinationError,
+                std::io::Error::other("NullWriter cannot truncate"),
+            ))
+        }
     }
 
     struct NullFs;
@@ -469,6 +528,7 @@ mod tests {
                 // The stub exists to prove the trait compiles. Inventing an identity
                 // here would let a test pass against a fake that never had one.
                 identity: FileIdentity::Unavailable,
+                nlink: None,
             })
         }
 

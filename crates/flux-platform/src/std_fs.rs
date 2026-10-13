@@ -6,11 +6,11 @@
 //! that, and Section 241.5 is amended in Task 9 to name it.
 
 use flux_fs::{
-    DirEntry, FileHandle, FileIdentity, FileSystem, FileType, FsError, Metadata, ObjectId, Perms,
-    Result,
+    Code, DirEntry, FileHandle, FileIdentity, FileSystem, FileType, FsError, Metadata, ObjectId,
+    Perms, Result,
 };
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 #[cfg(unix)]
 use std::time::Duration;
@@ -54,6 +54,23 @@ impl FileHandle for StdFile {
     fn identity(&self) -> Result<FileIdentity> {
         Ok(identity_of_handle(&self.0))
     }
+
+    fn duplicate(&self) -> Result<Self> {
+        self.0.try_clone().map(StdFile).map_err(FsError::from_io)
+    }
+
+    fn truncate_to(&mut self, len: u64) -> Result<()> {
+        let current = self.0.metadata().map_err(FsError::from_io)?.len();
+        if len > current {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "truncate_to cannot extend"),
+            ));
+        }
+        self.0.set_len(len).map_err(FsError::from_io)?;
+        Seek::seek(&mut self.0, SeekFrom::Start(len)).map_err(FsError::from_io)?;
+        Ok(())
+    }
 }
 
 /// Construct a writer from an already-open file. `DirHandle::create_new` opens
@@ -68,6 +85,31 @@ impl FileHandle for StdFile {
 /// else's homework is a gate that stays.
 pub(crate) fn std_file_from(f: File) -> StdFile {
     StdFile(f)
+}
+
+/// A `StdReader` over an already-opened file, for the handle arms that open by name relative to a directory.
+pub(crate) fn std_reader_from(f: File) -> StdReader {
+    StdReader(f)
+}
+
+/// The refusal of `DirHandle::open_existing` for an `expected` identity of `Unavailable`, which proves nothing. Shared by
+/// both handle arms so the two answer identically.
+pub(crate) fn unavailable_expectation() -> FsError {
+    FsError::new(
+        Code::DestinationError,
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "open_existing needs an identity to check against, and was given none",
+        ),
+    )
+}
+
+/// The refusal of `DirHandle::open_existing` for a different object at the name.
+pub(crate) fn identity_mismatch() -> FsError {
+    FsError::new(
+        Code::DestinationError,
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "identity mismatch"),
+    )
 }
 
 pub struct StdFileSystem;
@@ -229,6 +271,7 @@ impl FileSystem for StdFileSystem {
             // Free on Unix: `st_dev` and `st_ino` are already in the stat buffer, so
             // there is no second open to eliminate here and nothing to change.
             identity: identity_of(&m),
+            nlink: Some(std::os::unix::fs::MetadataExt::nlink(&m)),
         })
     }
 
@@ -260,6 +303,7 @@ impl FileSystem for StdFileSystem {
             permissions: Some(perms_of(&m)),
             modified: m.modified().ok(),
             identity: identity_of_handle(&f),
+            nlink: link_count_of_handle(&f),
         })
     }
 
@@ -730,6 +774,9 @@ pub(crate) fn metadata_from_stat(st: &rustix::fs::Stat) -> Metadata {
         permissions: Some(Perms::UnixMode(mode)),
         modified: mtime_from_stat(st),
         identity: identity_of_raw(dev, st.st_ino),
+        // `st_nlink` is `u16` on macOS, `u32` on aarch64 Linux and `u64` on x86_64 Linux: the cast is a no-op on one and required on the others.
+        #[allow(clippy::unnecessary_cast)]
+        nlink: Some(st.st_nlink as u64),
     }
 }
 
@@ -785,4 +832,25 @@ pub(crate) fn identity_of_handle(file: &impl std::os::windows::io::AsRawHandle) 
         return FileIdentity::Unavailable;
     }
     FileIdentity::Strong(ObjectId { volume: info.VolumeSerialNumber, index })
+}
+
+/// The number of hard links to the object an open handle holds (`FILE_STANDARD_INFO::NumberOfLinks`), `None` when the
+/// filesystem does not answer. Read from the handle, never a path, so it describes the object the caller holds.
+#[cfg(windows)]
+pub(crate) fn link_count_of_handle(file: &impl std::os::windows::io::AsRawHandle) -> Option<u64> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandleEx,
+    };
+    // SAFETY: an all-zero `FILE_STANDARD_INFO` is a valid value (integers and booleans only).
+    let mut info: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a live, correctly sized `FILE_STANDARD_INFO`, and the handle stays open for the call.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as _,
+            FileStandardInfo,
+            (&raw mut info).cast(),
+            size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    };
+    (ok != 0).then_some(u64::from(info.NumberOfLinks))
 }

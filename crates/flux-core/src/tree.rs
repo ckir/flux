@@ -3,10 +3,13 @@
 //!
 //! Design authority: `docs/superpowers/specs/2026-09-26-cut-4b-copy-tree-design.md`.
 
+pub use crate::checkpoint::Discard;
+use crate::checkpoint::{Checkpoints, FileCkpt};
 use crate::copy::{
-    BeforeCreate, BeforePublish, CopyError, CopyStep, Guard, Heartbeat, PublishIntent, Stage,
-    Staged, SyncAt, copy_file_guarded, discard, no_before_create, no_before_publish, no_heartbeat,
-    publish_staged, split_destination, stage_file, sync_staged_many, unguarded, weaker,
+    BeforeCreate, BeforePublish, CopyError, CopyStep, Guard, Heartbeat, PublishIntent, Reuse,
+    Stage, Staged, SyncAt, copy_file_checkpointed, copy_file_guarded, discard, no_before_create,
+    no_before_publish, no_heartbeat, publish_staged, split_destination, stage_file,
+    sync_staged_many, unguarded, weaker,
 };
 use crate::names::{NameIndex, Resolved};
 use crate::state::{FLUX_DIR, RESERVED_DIRS, identity_text, native_hex};
@@ -69,6 +72,60 @@ pub struct TreeOutcome {
     /// Cut 9e: batches flushed because the open-writer cap was reached (`BatchPolicy::open_writers`): at it, the
     /// shallowest pending batch flushes before the next file is staged. A cap flush that stops the run still counts.
     pub cap_flushes: u64,
+    /// Cut 9f-1: the bytes proven by validated checkpoints and not re-copied, summed over the published files.
+    pub bytes_reused: u64,
+    /// Cut 9f-1: published files that reused a validated prefix (`reused > 0`); `partial_resumes.len()`.
+    pub files_partially_resumed: u64,
+    /// Cut 9f-1: each partially resumed file with the bytes it reused and the bytes this run copied for it.
+    pub partial_resumes: Vec<PartialResume>,
+    /// Cut 9f-1: every published file whose checkpoints were discarded, and why (nothing is discarded silently).
+    pub checkpoint_discards: Vec<CheckpointDiscard>,
+}
+
+/// Cut 9f-1: a file resumed from a validated prefix. `path` is relative to the source root, as the walk reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialResume {
+    pub path: PathBuf,
+    pub reused: u64,
+    pub recopied: u64,
+}
+
+/// Cut 9f-1: a file whose checkpoints were discarded (wholly or from an offset on). `path` is relative to the source
+/// root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointDiscard {
+    pub path: PathBuf,
+    pub reason: Discard,
+}
+
+/// Cut 9f-1: `copy_file_checkpointed`'s result split into the `Outcome` the tree counts and, for a published file, its
+/// reuse with the bytes this run copied for it.
+fn split_reuse(
+    result: std::result::Result<(flux_fs::Outcome, Reuse), CopyError>,
+) -> (std::result::Result<flux_fs::Outcome, CopyError>, Option<(Reuse, u64)>) {
+    match result {
+        Ok((o, reuse)) => {
+            let recopied = o.bytes_copied;
+            (Ok(o), Some((reuse, recopied)))
+        }
+        Err(e) => (Err(e), None),
+    }
+}
+
+/// Cut 9f-1: records a published file's reuse and discard in the outcome.
+fn note_reuse(out: &mut TreeOutcome, path: &Path, reuse: Reuse, recopied: u64) {
+    if reuse.reused > 0 {
+        out.bytes_reused += reuse.reused;
+        out.files_partially_resumed += 1;
+        out.partial_resumes.push(PartialResume {
+            path: path.to_path_buf(),
+            reused: reuse.reused,
+            recopied,
+        });
+    }
+    if let Some(reason) = reuse.discard {
+        out.checkpoint_discards.push(CheckpointDiscard { path: path.to_path_buf(), reason });
+    }
 }
 
 /// The operation stopped as a whole (cut 5, K1). `outcome` holds what was counted
@@ -337,6 +394,9 @@ pub(crate) struct Shared<'c, F: DestinationRoot> {
     pub(crate) resume: bool,
     /// Cut 9d: when a Strict tree's per-directory batch flushes.
     pub(crate) batch: BatchPolicy,
+    /// Cut 9f-1: the run's checkpoint log; `None` for a copy that does not checkpoint: a single-file copy, a run whose
+    /// WAL could not be opened (a warning, and every large file recopies), and tests.
+    pub(crate) ckpt: Option<&'c Checkpoints<F::Dir>>,
 }
 
 /// Cut 9d (spec decision 5): a batch flushes at this many staged files...
@@ -499,6 +559,7 @@ fn run_tree<F: DestinationRoot>(
         claims: None,
         resume: false,
         batch: BatchPolicy::DEFAULT,
+        ckpt: None,
     };
     copy_tree_at(&cx, source.events, root, false, out, on_report).1
 }
@@ -1152,6 +1213,19 @@ fn copy_one<F: DestinationRoot>(
     };
 
     let own = |status| ClaimRecord { target: target.clone(), status };
+    // Cut 9f-1: the file's checkpoint identity is the claim key of the TARGET name (never the stored name of a
+    // replacement), built only for a run that checkpoints.
+    // Only a file at or above the run's threshold gets a context (its length is read here, since the New path has not
+    // looked at the source): a smaller file takes the unchanged path, with no extra guard. `stage_file` filters again.
+    let file_ckpt = |key: &ClaimKey| {
+        let run = cx.ckpt?;
+        let len = cx.fs.metadata(&src).ok()?.len;
+        (len >= run.min_len()).then(|| FileCkpt {
+            run,
+            file_id: key.encode(),
+            destination: path.as_os_str().as_encoded_bytes().to_vec(),
+        })
+    };
     // Cut 9c: a Strict publication into a store with the `prepared` table writes a note before its rename (the hook),
     // commits it with the claim after it, and discards it when the copy fails after the note. Otherwise: cut 9a.
     let strict = cx.opts.durability == Durability::Strict && claims.borrow().supports_prepared();
@@ -1160,6 +1234,7 @@ fn copy_one<F: DestinationRoot>(
         // 3. Plan as new.
         Plan::New => {
             let key = ClaimKey::new(parent_id, name);
+            let fc = file_ckpt(&key);
             let template = PreparedRecord {
                 target: target.clone(),
                 temp_name: Vec::new(),
@@ -1183,7 +1258,17 @@ fn copy_one<F: DestinationRoot>(
                 let publish = Publish::NoReplace;
                 let no_claim: &BeforeCreate<'_> = &no_before_create;
                 return stage_into_batch(
-                    cx, parent, names, batch, &src, path, publish, no_claim, out, on_report,
+                    cx,
+                    parent,
+                    names,
+                    batch,
+                    &src,
+                    path,
+                    publish,
+                    no_claim,
+                    fc.as_ref(),
+                    out,
+                    on_report,
                     pending,
                 );
             }
@@ -1195,7 +1280,7 @@ fn copy_one<F: DestinationRoot>(
                 publish: Publish::NoReplace,
                 ..cx.opts.clone()
             };
-            let result = copy_file_guarded(
+            let result = copy_file_checkpointed(
                 cx.fs,
                 &src,
                 parent,
@@ -1205,13 +1290,18 @@ fn copy_one<F: DestinationRoot>(
                 cx.beat,
                 &no_before_create,
                 before_publish,
+                fc.as_ref(),
             );
+            let (result, reuse) = split_reuse(result);
             discard_note_on_failure(claims, &key, &wrote, &result);
             let published = match &result {
                 Ok(o) => Some(o.published_identity),
                 Err(_) => None,
             };
             finish_copy(path.clone(), result, out, on_report)?;
+            if let Some((reuse, recopied)) = reuse {
+                note_reuse(out, &path, reuse, recopied);
+            }
             if let Some(identity) = published {
                 let recorded = if strict {
                     claims.borrow_mut().commit_prepared(&key, &target, None)
@@ -1228,6 +1318,7 @@ fn copy_one<F: DestinationRoot>(
         // 5. Replace, under a claim on the stored name made after the gate and the section 99 checks.
         Plan::Replace { stored, meta } => {
             let key_stored = ClaimKey::new(parent_id, &stored);
+            let fc = file_ckpt(&ClaimKey::new(parent_id, name));
             let before_create = || -> std::result::Result<(), CopyError> {
                 let claimed =
                     claims.borrow_mut().insert_if_absent(&key_stored, &own(ClaimStatus::Existing));
@@ -1281,6 +1372,7 @@ fn copy_one<F: DestinationRoot>(
                     path,
                     Publish::Replace,
                     &before_create,
+                    fc.as_ref(),
                     out,
                     on_report,
                     pending,
@@ -1295,7 +1387,7 @@ fn copy_one<F: DestinationRoot>(
                 publish: Publish::Replace,
                 ..cx.opts.clone()
             };
-            let result = copy_file_guarded(
+            let result = copy_file_checkpointed(
                 cx.fs,
                 &src,
                 parent,
@@ -1305,13 +1397,18 @@ fn copy_one<F: DestinationRoot>(
                 cx.beat,
                 &before_create,
                 before_publish,
+                fc.as_ref(),
             );
+            let (result, reuse) = split_reuse(result);
             discard_note_on_failure(claims, &key_stored, &wrote, &result);
             let published = match &result {
                 Ok(o) => Some(o.published_identity),
                 Err(_) => None,
             };
             finish_copy(path.clone(), result, out, on_report)?;
+            if let Some((reuse, recopied)) = reuse {
+                note_reuse(out, &path, reuse, recopied);
+            }
             if let Some(identity) = published {
                 out.files_overwritten += 1;
                 // The entry now holds the new object under its stored name (and, on some systems, the planned one).
@@ -1359,6 +1456,7 @@ fn stage_into_batch<F: DestinationRoot>(
     path: PathBuf,
     publish: Publish,
     before_create: &BeforeCreate<'_>,
+    fc: Option<&FileCkpt<'_, F::Dir>>,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
     pending: impl FnOnce(PathBuf, Staged<F::Writer>) -> Pending<F::Writer>,
@@ -1405,6 +1503,7 @@ fn stage_into_batch<F: DestinationRoot>(
             } else {
                 SyncAt::Staging
             },
+            fc,
         )
     };
     let staged = match stage() {
@@ -1597,13 +1696,17 @@ fn flush_batch<F: DestinationRoot>(
     let mut paths = Vec::with_capacity(entries.len());
     let mut rest = entries.into_iter();
     while let Some(p) = rest.next() {
-        let Pending { path, name, key, planned, template: _, staged, target, replaced } = p;
+        let Pending { path, name, key, planned, template: _, mut staged, target, replaced } = p;
         let publish = if replaced.is_some() { Publish::Replace } else { Publish::NoReplace };
+        // Cut 9f-1: taken before `publish_staged` consumes the staged file.
+        let reuse = Reuse::take(&mut staged);
         match publish_staged(parent, &name, staged, publish, cx.guard, cx.beat) {
             Ok(o) => {
                 let identity = o.published_identity;
+                let recopied = o.bytes_copied;
                 // Counted at the rename, before any later entry is tried (decision 4.6). Never `Err` for an `Ok`.
                 finish_copy(path.clone(), Ok(o), out, on_report)?;
+                note_reuse(out, &path, reuse, recopied);
                 match &replaced {
                     None => names.record_publication(&target, None, &name, None, identity),
                     Some((stored, meta)) => {
@@ -1978,8 +2081,11 @@ fn finish_copy(
                 *p = path.with_file_name(&*p);
             }
             // §99 (cut 7a Part 3b): this run no longer owns the destination's lock; or §101 (cut 7b): its heartbeat
-            // failed. The whole operation stops.
-            if e.code() == Code::TargetLockBusy || e.step == CopyStep::Heartbeat {
+            // failed; or (cut 9f-1) a checkpoint or its writer failed. The whole operation stops.
+            if e.code() == Code::TargetLockBusy
+                || e.code() == Code::WalWriteFailed
+                || e.step == CopyStep::Heartbeat
+            {
                 return Err(e);
             }
             // Decision 3: this destination lacks a no-replace primitive. Found at the
@@ -3061,6 +3167,7 @@ mod tests {
             claims: None,
             resume: false,
             batch: BatchPolicy { age: NO_AGE, ..BatchPolicy::DEFAULT },
+            ckpt: None,
         };
         let mut out = TreeOutcome::default();
         let (_root, r) = copy_tree_at(&cx, source.events, root, false, &mut out, &mut |_| {});
@@ -3110,6 +3217,20 @@ mod tests {
     }
 
     #[test]
+    fn a_wal_write_failed_copy_stops_the_walk() {
+        let mut out = TreeOutcome::default();
+        let mut reported = 0;
+        let failed = CopyError::at(
+            CopyStep::Checkpoint,
+            FsError::new(Code::WalWriteFailed, std::io::Error::other("wal")),
+        );
+        let r = finish_copy(PathBuf::from("a"), Err(failed), &mut out, &mut |_| reported += 1);
+        let e = r.unwrap_err();
+        assert_eq!((e.code(), e.step), (Code::WalWriteFailed, CopyStep::Checkpoint));
+        assert_eq!((reported, out.failures.total()), (0, 0), "a stop, never a per-file failure");
+    }
+
+    #[test]
     fn a_failed_heartbeat_aborts_the_whole_tree() {
         let fs = tree();
         let source = prepare_source(&fs, Path::new("/src"), Path::new("/dst")).unwrap();
@@ -3136,6 +3257,7 @@ mod tests {
             claims: None,
             resume: false,
             batch: BatchPolicy { age: NO_AGE, ..BatchPolicy::DEFAULT },
+            ckpt: None,
         };
         let mut out = TreeOutcome::default();
         let mut reported = 0;
@@ -3174,6 +3296,7 @@ mod tests {
             claims: None,
             resume: false,
             batch: BatchPolicy { age: NO_AGE, ..BatchPolicy::DEFAULT },
+            ckpt: None,
         };
         let mut out = TreeOutcome::default();
         let mut reported = 0;
@@ -3202,6 +3325,7 @@ mod tests {
             claims: None,
             resume: false,
             batch: BatchPolicy { age: NO_AGE, ..BatchPolicy::DEFAULT },
+            ckpt: None,
         };
         let mut out = TreeOutcome::default();
         let (back, r) = copy_tree_at(&cx, source.events, root, false, &mut out, &mut |_| {});
@@ -3302,6 +3426,7 @@ mod tests {
             claims: Some(&claims),
             resume: false,
             batch: policy,
+            ckpt: None,
         };
         let mut out = TreeOutcome::default();
         let mut got = Vec::new();

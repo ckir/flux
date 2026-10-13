@@ -63,10 +63,11 @@ fn nt_io_error(what: &str, status: i32) -> std::io::Error {
         //
         // Mapping FILE_IS_A_DIRECTORY globally is safe HERE rather than merely
         // convenient: it can only be returned to a call that asked for a
-        // non-directory, and `create_new_at` is the one call in this file that passes
-        // FILE_NON_DIRECTORY_FILE. `open_lock_at` passes it too, and answers
-        // FILE_IS_A_DIRECTORY for an OPEN before calling this. If another call ever
-        // does, this mapping needs revisiting with it.
+        // non-directory. `create_new_at` passes FILE_NON_DIRECTORY_FILE, and so do
+        // `open_lock_at`, `open_existing_at` and `open_read_at`; each of those three
+        // answers STATUS_FILE_IS_A_DIRECTORY itself (the lock, for an OPEN), before
+        // calling this. If another call ever passes it, this mapping needs
+        // revisiting with it.
         STATUS_OBJECT_NAME_COLLISION | STATUS_FILE_IS_A_DIRECTORY => {
             std::io::ErrorKind::AlreadyExists
         }
@@ -113,6 +114,7 @@ impl StdDir {
 
 impl DirHandle for StdDir {
     type Writer = crate::StdFile;
+    type Reader = crate::StdReader;
     type Lock = crate::StdLock;
     type Claims = crate::RedbClaimStore;
 
@@ -255,6 +257,23 @@ impl DirHandle for StdDir {
         crate::dir_windows::create_new_at(&self.0, name)
     }
 
+    fn open_existing(
+        &self,
+        name: &OsStr,
+        expected: &flux_fs::FileIdentity,
+    ) -> Result<Self::Writer> {
+        use flux_fs::FileHandle;
+        check_component(name)?;
+        if *expected == flux_fs::FileIdentity::Unavailable {
+            return Err(crate::std_fs::unavailable_expectation());
+        }
+        let handle = open_existing_at(&self.0, name)?;
+        if handle.identity()? != *expected {
+            return Err(crate::std_fs::identity_mismatch());
+        }
+        Ok(handle)
+    }
+
     fn metadata(&self, name: &OsStr) -> Result<Metadata> {
         check_component(name)?;
         crate::dir_windows::metadata_at(&self.0, name)
@@ -330,6 +349,12 @@ impl DirHandle for StdDir {
     fn read_file(&self, name: &OsStr, limit: usize) -> Result<Vec<u8>> {
         check_component(name)?;
         read_file_at(&self.0, name, limit)
+    }
+
+    fn open_read(&self, name: &OsStr) -> Result<Self::Reader> {
+        check_component(name)?;
+        let opened = open_read_at(&self.0, name)?;
+        Ok(crate::std_fs::std_reader_from(File::from(opened)))
     }
 
     fn remove_dir(&self, name: &OsStr) -> Result<()> {
@@ -464,6 +489,12 @@ fn entry_type(attributes: u32, ea_size: u32) -> flux_fs::FileType {
 /// opened and then refused), for reading only.
 fn read_file_at(p: &OwnedHandle, n: &OsStr, limit: usize) -> Result<Vec<u8>> {
     use std::os::windows::fs::FileExt;
+    let file = File::from(open_read_at(p, n)?);
+    crate::lock_file::read_loop(limit, |buf, at| file.seek_read(buf, at))
+}
+
+/// The open half of `read_file_at`: a child regular file, read-only, a name-surrogate refused. Shared with `open_read`.
+fn open_read_at(p: &OwnedHandle, n: &OsStr) -> Result<OwnedHandle> {
     use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
     let mut wide: Vec<u16> = n.encode_wide().collect();
     let bytes = (wide.len() * 2) as u16;
@@ -526,8 +557,7 @@ fn read_file_at(p: &OwnedHandle, n: &OsStr, limit: usize) -> Result<Vec<u8>> {
             ));
         }
     }
-    let file = File::from(opened);
-    crate::lock_file::read_loop(limit, |buf, at| file.seek_read(buf, at))
+    Ok(opened)
 }
 
 fn create_dir_at(p: &OwnedHandle, n: &OsStr) -> Result<OwnedHandle> {
@@ -600,6 +630,75 @@ fn create_dir_at(p: &OwnedHandle, n: &OsStr) -> Result<OwnedHandle> {
     //
     // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `h` is a valid handle we own.
     Ok(unsafe { OwnedHandle::from_raw_handle(h as _) })
+}
+
+/// The open half of `DirHandle::open_existing`: a child regular file for writing, no truncation, a name-surrogate refused.
+/// `create_new_at`'s access, share and flags, with `FILE_OPEN` for the disposition.
+fn open_existing_at(p: &OwnedHandle, n: &OsStr) -> Result<crate::StdFile> {
+    let mut wide: Vec<u16> = n.encode_wide().collect();
+    let bytes = (wide.len() * 2) as u16;
+    let us = UNICODE_STRING { Length: bytes, MaximumLength: bytes, Buffer: wide.as_mut_ptr() };
+    let mut oa: OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    oa.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
+    oa.RootDirectory = p.as_raw_handle() as HANDLE;
+    oa.ObjectName = &raw const us;
+    let mut h: HANDLE = std::ptr::null_mut();
+    let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    // SAFETY: every pointer is to a live local that outlives the call, and `wide` outlives `us`.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut h,
+            FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            &raw const oa,
+            &raw mut iosb,
+            std::ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status != 0 {
+        // Answered first: `nt_io_error` maps FILE_IS_A_DIRECTORY to AlreadyExists, for `create_new_at`'s sake.
+        if status == STATUS_FILE_IS_A_DIRECTORY {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::new(
+                    std::io::ErrorKind::IsADirectory,
+                    "a directory is not a state file",
+                ),
+            ));
+        }
+        let code = match status {
+            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => Code::IoError,
+            STATUS_ACCESS_DENIED => Code::PermissionDenied,
+            _ => Code::IoError,
+        };
+        return Err(FsError::new(code, nt_io_error("NtCreateFile", status)));
+    }
+    // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `h` is a valid handle we own.
+    let opened = unsafe { OwnedHandle::from_raw_handle(h as _) };
+    // Dropping `opened` on the reject path closes the handle, so a refused name leaves no sharing constraint behind.
+    if let Some(tag) = reparse_tag_of(&opened)?
+        && is_name_surrogate(tag)
+    {
+        return Err(FsError::new(
+            Code::SafetyRejected,
+            std::io::Error::other(format!("name-surrogate reparse point, tag 0x{tag:08X}")),
+        ));
+    }
+    // A hard link to another file: writing through this handle would change the bytes behind the other name too.
+    if let Some(n) = crate::std_fs::link_count_of_handle(&opened)
+        && n != 1
+    {
+        return Err(FsError::new(
+            Code::SafetyRejected,
+            std::io::Error::other(format!("the file has {n} hard links, not 1")),
+        ));
+    }
+    Ok(crate::std_fs::std_file_from(File::from(opened)))
 }
 
 fn create_new_at(p: &OwnedHandle, n: &OsStr) -> Result<crate::StdFile> {
@@ -826,6 +925,7 @@ fn metadata_at(p: &OwnedHandle, n: &OsStr) -> Result<Metadata> {
         permissions: Some(crate::std_fs::perms_of(&m)),
         modified: m.modified().ok(),
         identity: crate::std_fs::identity_of_handle(&f),
+        nlink: crate::std_fs::link_count_of_handle(&f),
     })
 }
 
