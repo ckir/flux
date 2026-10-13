@@ -138,6 +138,41 @@ impl<'a, D: DirHandle + Send + 'static> FileSink<'a, D> {
         self.send(Msg::Range(range), beat)
     }
 
+    /// Records digests `full` proved for `[0, valid_through)`: one `Range` per `policy.range_chunks` chunks, from
+    /// offset 0, the last ending at `valid_through`. Call once, right after `begin`, before the first `wrote`.
+    /// `range_start`, the hasher and the pending digests are left as `begin` set them.
+    #[allow(dead_code)] // used by stage_file in cut 9f-2 task 4
+    pub(crate) fn record_proven(
+        &mut self,
+        digests: &[Digest],
+        beat: &Heartbeat<'_>,
+    ) -> Result<(), SinkError> {
+        let valid_through = self.range_start;
+        debug_assert!(
+            digests.len() as u64 == valid_through.div_ceil(CHUNK_SIZE),
+            "one proven digest per chunk of the prefix"
+        );
+        debug_assert!(
+            self.hasher.bytes_seen() == valid_through.div_ceil(CHUNK_SIZE) * CHUNK_SIZE
+                && self.digests.is_empty(),
+            "record_proven comes right after begin, before the first wrote"
+        );
+        let per_range = self.run.policy.range_chunks.max(1);
+        for (group, piece) in digests.chunks(per_range).enumerate() {
+            let start = (group * per_range) as u64 * CHUNK_SIZE;
+            let end = (start + piece.len() as u64 * CHUNK_SIZE).min(valid_through);
+            let range = Range {
+                file_id: self.file_id.clone(),
+                attempt_id: ATTEMPT_ID,
+                range_start: start,
+                range_end: end,
+                digests: piece.to_vec(),
+            };
+            self.send(Msg::Range(range), beat)?;
+        }
+        Ok(())
+    }
+
     /// Feeds source bytes. Returns `SinkError::Wal` at the first completed chunk after the log died.
     pub(crate) fn wrote(&mut self, bytes: &[u8], beat: &Heartbeat<'_>) -> Result<(), SinkError> {
         for (index, digest) in self.hasher.update(bytes) {
@@ -590,6 +625,91 @@ mod tests {
         assert_eq!(drops(&fs), 1);
         assert!(fs.read_file(WAL_PATH).is_none(), "the aborted file's records were never written");
         drop(p);
+    }
+
+    fn chunk_digests(src: &[u8]) -> Vec<Digest> {
+        src.chunks(MIB).map(|c| *blake3::hash(c).as_bytes()).collect()
+    }
+
+    fn range_shape(fs: &FaultFs) -> Vec<(u64, u64, usize)> {
+        ranges(fs).iter().map(|r| (r.range_start, r.range_end, r.digests.len())).collect()
+    }
+
+    #[test]
+    fn record_proven_sends_ranges_from_chunk_zero_up_to_valid_through() {
+        let (fs, _dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let run = open_run(&fs, policy(2, Durability::Normal));
+        let src = data(5 * MIB);
+        let d = chunk_digests(&src[..3 * MIB]);
+        let mut sink =
+            FileSink::begin(&fc(&run), &meta(5 * MIB as u64), 3 * MIB as u64, None, beat).unwrap();
+        sink.record_proven(&d, beat).unwrap();
+        sink.complete(beat).unwrap();
+        drop(sink);
+        assert!(run.finish(beat).is_clean());
+        let recs = records(&fs);
+        assert!(matches!(recs[0].1, Body::FileBegin(_)));
+        assert_eq!(recs.len(), 3, "a FileBegin and two Ranges, nothing else");
+        let r = ranges(&fs);
+        assert_eq!(
+            (r[0].range_start, r[0].range_end, r[0].digests.clone()),
+            (0, 2 * MIB as u64, vec![d[0], d[1]])
+        );
+        assert_eq!(
+            (r[1].range_start, r[1].range_end, r[1].digests.clone()),
+            (2 * MIB as u64, 3 * MIB as u64, vec![d[2]])
+        );
+        assert!(r.iter().all(|r| r.file_id == b"f" && r.attempt_id == ATTEMPT_ID));
+    }
+
+    #[test]
+    fn record_proven_then_wrote_numbers_the_copied_chunks_after_the_prefix() {
+        let (fs, _dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let run = open_run(&fs, policy(2, Durability::Normal));
+        let src = data(5 * MIB);
+        let d = chunk_digests(&src[..3 * MIB]);
+        let mut sink =
+            FileSink::begin(&fc(&run), &meta(5 * MIB as u64), 3 * MIB as u64, None, beat).unwrap();
+        sink.record_proven(&d, beat).unwrap();
+        sink.wrote(&src[3 * MIB..], beat).unwrap();
+        sink.complete(beat).unwrap();
+        drop(sink);
+        assert!(run.finish(beat).is_clean());
+        let m = MIB as u64;
+        assert_eq!(range_shape(&fs), [(0, 2 * m, 2), (2 * m, 3 * m, 1), (3 * m, 5 * m, 2)]);
+        let a = fs.destination_root(Path::new("/ws")).unwrap();
+        let b = fs.destination_root(Path::new("/ws")).unwrap();
+        let run2 = Checkpoints::open(a, b, "op", 2, policy(2, Durability::Normal))
+            .unwrap_or_else(|e| panic!("open: {e:?}"));
+        let state = run2.load(b"f").expect("loads").expect("the file is indexed");
+        run2.abandon();
+        let want: Vec<(u64, Digest)> =
+            chunk_digests(&src).into_iter().enumerate().map(|(i, d)| (i as u64, d)).collect();
+        let got: Vec<(u64, Digest)> = state.digests.into_iter().collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn record_proven_at_the_source_length_ends_the_last_range_there() {
+        let (fs, _dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let run = open_run(&fs, policy(2, Durability::Normal));
+        let len = 2 * MIB + 777;
+        let src = data(len);
+        let d = chunk_digests(&src);
+        assert_eq!(d.len(), 3);
+        let mut sink =
+            FileSink::begin(&fc(&run), &meta(len as u64), len as u64, None, beat).unwrap();
+        sink.record_proven(&d, beat).unwrap();
+        sink.complete(beat).unwrap();
+        drop(sink);
+        assert!(run.finish(beat).is_clean());
+        let m = MIB as u64;
+        assert_eq!(range_shape(&fs), [(0, 2 * m, 2), (2 * m, 2 * m + 777, 1)]);
+        let r = ranges(&fs);
+        assert_eq!(r[1].digests, vec![d[2]]);
     }
 
     #[test]
