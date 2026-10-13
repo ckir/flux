@@ -974,9 +974,20 @@ Each is deferred to the cut that first reads it (cut 7b spec, `docs/superpowers/
 - [ ] **Checkpoints and `last_checkpoint` (§19, §139, §148, §164)** - cuts 8/9: the spec defines them only through
       the WAL and `state.db` (§119's layout).
       Partly delivered by cut 9f-1: batched chunk checkpoints in a WAL, and partial-file resume for tree files of
-      64 MiB and up. Still open: snapshots, compaction and rotation of the WAL (cut 9f-3, with
-      `--resume-verify=metadata` and the section 121 upgrade rule), and checkpoints for the single-file layout.
-      `--resume-verify=chunks|full` shipped in cut 9f-2. Decision 15's real-filesystem crash tests are the
+      64 MiB and up. `--resume-verify=chunks|full` shipped in cut 9f-2. Still open: checkpoints for the single-file
+      layout (the next cut; its deciding question is where a single-file copy keeps its state, because the layout has no
+      operation workspace and the `<target>.flux-state.<id>` sidecar is capped at 64 KiB, and `full` already needs no
+      log). Cut 9f-3 as first parked was NOT built, by ruling of 2026-10-13 (agy consulted, ALIGNED after one
+      negotiation round; the owner approved): **closed, reopen if measured** - WAL compaction, rotation and snapshots,
+      because the WAL grows by 32 KiB of digests plus about 5 KiB of framing per GiB at the default 16 chunks per
+      `Range` (60 KiB at 4), under 0.006% of the payload, and the workspace is deleted on completion; reopen if a
+      measured case exhausts storage. **Closed, reopen if the spec changes** - `--resume-verify=metadata` (the CLI keeps
+      refusing it with exit 2) and the section 121 upgrade rule (test item 86, which fires only after digests were
+      compacted away): reopen if the owner amends the spec to define what `metadata` verifies and its safety under
+      `--durability=normal`. **Waived** - the WAL-bytes-per-GiB acceptance measurement promised by the 9f-1 design
+      (decision 11), by the arithmetic above. Advisory, not acted on: agy recommends the owner retire `metadata` and
+      section 121 from the spec, because trusting unhashed partial bytes after a crash under `normal` would publish
+      unproven data; that argument was not measured, and the spec amendment is the owner's call. Decision 15's real-filesystem crash tests are the
       `real-filesystem crash-injection harness` item, still open, under "Cut 9e debt" above (the test-audit debt entry
       near line 593).
 - [ ] **`roots` (§19, §18.3)** - cut 10: one root until several sources exist.
