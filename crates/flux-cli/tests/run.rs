@@ -114,6 +114,20 @@ impl Drop for Stalled {
     }
 }
 
+/// Deterministic, non-repeating content: `len` bytes of an xorshift64 stream (`len` a multiple of 8).
+fn write_xorshift(path: &Path, len: usize) {
+    use std::io::Write;
+    let mut w = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    for _ in 0..len / 8 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        w.write_all(&x.to_le_bytes()).unwrap();
+    }
+    w.flush().unwrap();
+}
+
 #[test]
 fn a_tree_copy_and_a_file_copy_leave_no_state_or_lock_behind() {
     let d = TempDir::new().unwrap();
@@ -614,18 +628,7 @@ fn a_killed_large_file_resumes_with(extra: &[&str], log_deleted: bool) {
     let src = d.path().join("src");
     let dst = d.path().join("dst");
     std::fs::create_dir_all(&src).unwrap();
-    // Deterministic, non-repeating content: an xorshift64 stream.
-    {
-        let mut w = std::io::BufWriter::new(std::fs::File::create(src.join("big")).unwrap());
-        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
-        for _ in 0..LEN / 8 {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            w.write_all(&x.to_le_bytes()).unwrap();
-        }
-        w.flush().unwrap();
-    }
+    write_xorshift(&src.join("big"), LEN);
     Stalled::start_args(&src, &dst, 5, marks.path(), &["--durability", "strict"]).kill();
 
     let id = the_operation(&dst);
@@ -1039,6 +1042,7 @@ fn a_killed_single_file_copy_resumes_keeping_its_id_and_bumping_its_generation()
     let out = copy(&[os("--resume"), src.join("a").as_os_str(), t.as_os_str()]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let e = stderr(&out);
+    assert!(!e.contains("resume verification"), "a 1-byte file never reaches min_len: {e}");
     let note = e
         .find(&format!("resuming operation {}", first.operation_id))
         .unwrap_or_else(|| panic!("{e}"));
@@ -1168,4 +1172,161 @@ fn counters_file_reports_a_positive_cap_flush_count_and_a_heartbeat_gap() {
     assert!(v["cap_flushes"].as_u64().unwrap() >= 1, "{text}");
     assert!(v["beat_gap_max_ms"].as_u64().unwrap() >= 1, "{text}");
     same_bytes(&src, &dst);
+}
+
+const MIB: usize = 1024 * 1024;
+
+/// Cut 9g: a 70 MiB single file killed with its whole partial written (sweep 1, temporary 2, publish 3), the partial
+/// then cut to 40 MiB and followed by 1 MiB of garbage, so the chunk at offset 40 MiB mismatches. Returns the source,
+/// the target and the partial's path.
+fn killed_single_file_with_a_damaged_partial(d: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    use std::io::Write;
+    let marks = TempDir::new().unwrap();
+    let src = d.join("src");
+    let t = d.join("t");
+    write_xorshift(&src, 70 * MIB);
+    Stalled::start(&src, &t, 3, marks.path()).kill();
+    let partials: Vec<String> =
+        names(d).into_iter().filter(|n| n.starts_with("t.flux-partial.")).collect();
+    assert_eq!(partials.len(), 1, "one partial: {partials:?}");
+    let partial = d.join(&partials[0]);
+    assert_eq!(std::fs::metadata(&partial).unwrap().len(), (70 * MIB) as u64, "a whole partial");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&partial)
+        .unwrap()
+        .set_len((40 * MIB) as u64)
+        .unwrap();
+    let mut f = std::fs::OpenOptions::new().append(true).open(&partial).unwrap();
+    f.write_all(&vec![0xA5u8; MIB]).unwrap();
+    f.sync_all().unwrap();
+    (src, t, partial)
+}
+
+/// Byte for byte, in chunks (never 140 MiB at once).
+fn assert_same_bytes(a: &Path, b: &Path) {
+    use std::io::Read;
+    let (mut a, mut b) = (std::fs::File::open(a).unwrap(), std::fs::File::open(b).unwrap());
+    assert_eq!(a.metadata().unwrap().len(), b.metadata().unwrap().len());
+    let (mut buf_a, mut buf_b) = (vec![0u8; MIB], vec![0u8; MIB]);
+    let mut at = 0usize;
+    loop {
+        let n = a.read(&mut buf_a).unwrap();
+        if n == 0 {
+            break;
+        }
+        b.read_exact(&mut buf_b[..n]).unwrap();
+        assert!(
+            buf_a[..n] == buf_b[..n],
+            "the output differs from the source in the chunk at {at}"
+        );
+        at += n;
+    }
+    assert_eq!(at, 70 * MIB);
+}
+
+/// Cut 9g: a single file's `--resume` keeps the partial's proven prefix (the log-free check) and says so.
+#[test]
+fn a_killed_single_file_copy_resumes_its_validated_prefix() {
+    let d = TempDir::new().unwrap();
+    let (src, t, _) = killed_single_file_with_a_damaged_partial(d.path());
+    let out = copy(&[os("--resume"), os("--json"), src.as_os_str(), t.as_os_str()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let e = stderr(&out);
+    let target = t.display().to_string();
+    let has_line = |prefix: &str| e.lines().any(|l| l.starts_with(prefix));
+    assert!(
+        has_line(&format!("resumed {target}: reused 41943040 bytes, recopied 31457280 bytes")),
+        "{e}"
+    );
+    assert!(
+        has_line(&format!("checkpoints discarded for {target}: mismatch at offset 41943040")),
+        "{e}"
+    );
+    assert!(e.contains("resume verification: full (source and partial re-read and hashed)"), "{e}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["resume_verify"], "full", "{v}");
+    assert_same_bytes(&src, &t);
+    assert!(names(d.path()).iter().all(|n| !n.contains(".flux-partial.")), "no partial remains");
+    assert_eq!(names(d.path()), ["src", "t"]);
+}
+
+/// Cut 9g: naming the default level prints exactly what leaving it out prints, for a single file with a real prefix.
+#[test]
+fn an_explicit_chunks_single_file_resume_prints_what_full_prints() {
+    let run = |level: &str| {
+        let d = TempDir::new().unwrap();
+        let (src, t, _) = killed_single_file_with_a_damaged_partial(d.path());
+        let record = names(d.path()).into_iter().find(|n| n.starts_with("t.flux-state.")).unwrap();
+        let id = record["t.flux-state.".len()..].to_owned();
+        let out = copy(&[
+            os("--resume"),
+            os("--resume-verify"),
+            os(level),
+            os("--json"),
+            src.as_os_str(),
+            t.as_os_str(),
+        ]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert_same_bytes(&src, &t);
+        // The last stderr line is the summary, which carries the duration.
+        let text = stderr(&out).replace(&t.display().to_string(), "<t>").replace(&id, "<id>");
+        let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        lines.pop();
+        let mut v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let m = v.as_object_mut().unwrap();
+        m.remove("duration_ms");
+        m.remove("average_bytes_per_second");
+        m.remove("source");
+        m.remove("destination");
+        (lines, v)
+    };
+    let (chunks_lines, chunks_json) = run("chunks");
+    let (full_lines, full_json) = run("full");
+    assert!(
+        chunks_lines.iter().any(|l| l.starts_with("resumed <t>: reused 41943040 bytes")),
+        "{chunks_lines:?}"
+    );
+    assert_eq!(chunks_lines, full_lines);
+    assert_eq!(chunks_json, full_json);
+}
+
+/// Cut 9g: a resume that is itself killed before its publish leaves a record a third run continues.
+#[test]
+fn a_single_file_resume_killed_again_resumes_a_third_time() {
+    let d = TempDir::new().unwrap();
+    let m2 = TempDir::new().unwrap();
+    let (src, t, _) = killed_single_file_with_a_damaged_partial(d.path());
+    let record_ids = |d: &Path| -> Vec<String> {
+        names(d).into_iter().filter(|n| n.starts_with("t.flux-state.")).collect()
+    };
+    let before = record_ids(d.path());
+    assert_eq!(before.len(), 1, "{before:?}");
+    // The resume's guard calls 1-3 leave the partial as the first kill did; the 4th is its publish (measured).
+    Stalled::start_args(&src, &t, 4, m2.path(), &["--resume"]).kill();
+    assert_eq!(record_ids(d.path()), before, "one record, the same operation");
+    let out = copy(&[os("--resume"), os("--json"), src.as_os_str(), t.as_os_str()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(stderr(&out).contains(&before[0]["t.flux-state.".len()..]), "{}", stderr(&out));
+    assert_same_bytes(&src, &t);
+    assert_eq!(names(d.path()), ["src", "t"]);
+}
+
+/// Cut 9g: with a record but no temporary yet there is no partial, so no level line and no reuse line.
+#[test]
+fn a_single_file_resume_with_no_partial_prints_no_level_line() {
+    let d = TempDir::new().unwrap();
+    let marks = TempDir::new().unwrap();
+    let src = d.path().join("src");
+    let t = d.path().join("t");
+    write_xorshift(&src, 70 * MIB);
+    Stalled::start(&src, &t, 2, marks.path()).kill();
+    assert!(names(d.path()).iter().all(|n| !n.contains(".flux-partial.")));
+    let out = copy(&[os("--resume"), src.as_os_str(), t.as_os_str()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let e = stderr(&out);
+    assert!(!e.contains("resume verification"), "{e}");
+    assert!(!e.lines().any(|l| l.starts_with("resumed ")), "{e}");
+    assert_same_bytes(&src, &t);
+    assert_eq!(names(d.path()), ["src", "t"]);
 }
