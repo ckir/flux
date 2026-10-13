@@ -619,10 +619,10 @@ fn plan_resume<D: DirHandle + Send + 'static, R: std::io::Read>(
         // `full` with no partial: the log is consulted only to choose the report (a log that began the file says
         // the partial went missing; no log at all is a plain fresh copy).
         (None, _, _) => {
+            // A log that cannot be read reports nothing either: under `full` validity never comes from the log.
             let discard = match fc.run.load(&fc.file_id) {
                 Ok(Some(_)) => Some(Discard::PartialMissing),
-                Ok(None) => None,
-                Err(e) => return unreadable(format!("{e}")),
+                Ok(None) | Err(_) => None,
             };
             return Ok((fresh(discard), None));
         }
@@ -3848,6 +3848,22 @@ mod tests {
         assert_eq!(staged.reused, 0);
         assert_eq!(fs.read_file(PARTIAL).unwrap(), src);
         assert!(run.finish(&no_heartbeat).is_clean());
+    }
+
+    #[test]
+    fn full_with_no_partial_and_an_unreadable_log_reports_nothing() {
+        use crate::checkpoint::ResumeVerify::Full;
+        let (fs, root, src) = resume_fixture(5 * MIB, 3);
+        assert!(!fs.exists(PARTIAL));
+        let run = run_gen_as(&fs, 2, Durability::Normal, Full);
+        // The segment is cut after the run scanned it: `load` cannot read the indexed records.
+        let wal = fs.read_file(WAL_PATH).unwrap();
+        fs.write_file(WAL_PATH, &wal[..wal.len() / 2]);
+        let staged = stage_normal(&fs, &root, &run);
+        assert_eq!(staged.discard, None, "a broken log is not a per-file report under `full`");
+        assert_eq!((staged.reused, staged.bytes_copied), (0, 5 * MIB as u64));
+        assert_eq!(fs.read_file(PARTIAL).unwrap(), src);
+        run.abandon();
     }
 
     #[test]
