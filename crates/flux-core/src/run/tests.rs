@@ -7290,15 +7290,19 @@ mod checkpointing {
 
     #[test]
     fn a_fresh_single_file_run_never_reads_a_partial() {
-        // No prior record: a fresh run over a FAILED prior is refused (ResumableOperationExists), so the partial
-        // under id 5 is the stray one a non-resume run must leave unread.
+        // No prior record (a fresh run over a FAILED prior is refused), and the stale partial sits under the run's
+        // OWN id, the one name a wrongly log-free run would find and continue.
         let fs = fake();
         fs.write_file("/src/a", &pattern(5 * MIB));
-        fs.write_file(file_partial(5), &pattern(5 * MIB)[..3 * MIB]);
+        let stale = format!("/p/t.flux-partial.{ID}");
+        fs.write_file(&stale, &pattern(5 * MIB)[..3 * MIB]);
         let r = resume_file(&fs, &cfg(), &opts(), lazy(Durability::Normal));
         assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
         assert_eq!(r.file_resume, None);
-        assert_eq!(fs.bytes_read(file_partial(5)), 0);
+        let Some(Ok(o)) = &r.copy else { unreachable!() };
+        assert_eq!(o.bytes_copied, 5 * MIB as u64, "recopied from byte 0, nothing reused");
+        assert_eq!(fs.bytes_read(&stale), 0);
+        assert_eq!(fs.read_file("/p/t").unwrap(), pattern(5 * MIB));
     }
 
     #[test]
