@@ -133,7 +133,6 @@ pub(crate) fn decide<S: Read, P: Read>(
 /// The WAL-free proof (cut 9f-2): a chunk of the partial is trusted only when it is byte-equal (by BLAKE3) to the
 /// same chunk of the source as it is now. No recorded digests are consulted; the source is the only oracle.
 /// For both starts the source reader is left at `start_offset + carry.len()`, as for `decide`.
-#[allow(dead_code)] // used by plan_resume in cut 9f-2 task 4
 pub(crate) fn decide_full<S: Read, P: Read>(
     source_len: u64,
     partial_len: u64,

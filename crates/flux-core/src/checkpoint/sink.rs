@@ -141,7 +141,6 @@ impl<'a, D: DirHandle + Send + 'static> FileSink<'a, D> {
     /// Records digests `full` proved for `[0, valid_through)`: one `Range` per `policy.range_chunks` chunks, from
     /// offset 0, the last ending at `valid_through`. Call once, right after `begin`, before the first `wrote`.
     /// `range_start`, the hasher and the pending digests are left as `begin` set them.
-    #[allow(dead_code)] // used by stage_file in cut 9f-2 task 4
     pub(crate) fn record_proven(
         &mut self,
         digests: &[Digest],

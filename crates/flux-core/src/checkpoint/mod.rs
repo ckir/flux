@@ -16,9 +16,7 @@ use std::ffi::OsStr;
 use std::io;
 
 pub use decide::Discard;
-#[allow(unused_imports)] // used by plan_resume in cut 9f-2 task 4
-pub(crate) use decide::decide_full;
-pub(crate) use decide::{Gate, Start, Verdict, decide};
+pub(crate) use decide::{Gate, Start, Verdict, decide, decide_full};
 pub(crate) use sink::{FileSink, SinkError, mtime_pair};
 
 /// Files shorter than this are not checkpointed.
@@ -40,7 +38,6 @@ pub(crate) struct CheckpointPolicy {
     pub min_len: u64,
     pub range_chunks: usize,
     pub wal: WalConfig,
-    #[allow(dead_code)] // read by the resume path (cut 9f-2, a later task)
     pub verify: ResumeVerify,
 }
 
@@ -120,7 +117,6 @@ impl<D: DirHandle + Send + 'static> Checkpoints<D> {
         self.policy.wal.durability
     }
 
-    #[allow(dead_code)] // called by the resume path (cut 9f-2, a later task)
     pub(crate) fn resume_verify(&self) -> ResumeVerify {
         self.policy.verify
     }
