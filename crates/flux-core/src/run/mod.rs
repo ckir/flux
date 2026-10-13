@@ -645,7 +645,8 @@ fn batch_policy(cfg: &RunConfig) -> crate::tree::BatchPolicy {
     }
 }
 
-/// Cut 9f-1: the checkpoint policy of a tree run: `CheckpointPolicy::DEFAULT` with the run's durability. In a debug
+/// Cut 9f-1: the checkpoint policy of a tree run: `CheckpointPolicy::DEFAULT` with the run's durability and (cut 9f-2)
+/// its `--resume-verify` level. In a debug
 /// build, `FLUX_TEST_CHECKPOINT_MIN=<n>` (bytes) replaces `min_len` (absent or unparsable: the default's).
 #[cfg(debug_assertions)]
 fn checkpoint_policy(cfg: &RunConfig, durability: flux_fs::Durability) -> CheckpointPolicy {
