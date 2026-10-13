@@ -226,6 +226,7 @@ mod tests {
                 channel_cap: 64,
                 durability,
             },
+            verify: crate::checkpoint::ResumeVerify::Chunks,
         }
     }
 

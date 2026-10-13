@@ -44,6 +44,7 @@ fn config() -> RunConfig {
         heartbeat_interval: run::HEARTBEAT_INTERVAL,
         resume: false,
         descriptor_limit: None,
+        resume_verify: flux_core::run::ResumeVerify::Chunks,
     }
 }
 

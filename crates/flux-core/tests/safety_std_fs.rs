@@ -132,6 +132,7 @@ fn run_cfg() -> RunConfig {
         heartbeat_interval: std::time::Duration::from_secs(3600),
         resume: false,
         descriptor_limit: None,
+        resume_verify: flux_core::run::ResumeVerify::Chunks,
     }
 }
 

@@ -165,6 +165,7 @@ fn run_config(args: &CopyArgs) -> RunConfig {
         heartbeat_interval: heartbeat_interval(),
         resume: args.resume,
         descriptor_limit: flux_platform::soft_descriptor_limit(),
+        resume_verify: flux_core::run::ResumeVerify::Chunks,
     }
 }
 

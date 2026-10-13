@@ -35,6 +35,7 @@ fn cfg() -> RunConfig {
         heartbeat_interval: std::time::Duration::from_secs(3600),
         resume: false,
         descriptor_limit: None,
+        resume_verify: ResumeVerify::Chunks,
     }
 }
 
@@ -5534,6 +5535,7 @@ mod checkpointing {
                 channel_cap: 64,
                 durability,
             },
+            verify: ResumeVerify::Chunks,
         }
     }
 
@@ -5808,6 +5810,16 @@ mod checkpointing {
             checkpoint_policy(&cfg(), Durability::Normal).range_chunks,
             CheckpointPolicy::DEFAULT.range_chunks
         );
+    }
+
+    // Mutant: `checkpoint_policy` builds the policy with `ResumeVerify::Chunks` whatever `cfg.resume_verify` says.
+    #[test]
+    fn the_checkpoint_policy_carries_the_runs_resume_verify() {
+        for level in [ResumeVerify::Chunks, ResumeVerify::Full] {
+            let c = RunConfig { resume_verify: level, ..cfg() };
+            assert_eq!(checkpoint_policy(&c, Durability::Normal).verify, level);
+        }
+        assert_eq!(CheckpointPolicy::DEFAULT.verify, ResumeVerify::Chunks);
     }
 
     // Mutant: `Shared.ckpt = None` (the resume would recopy: no `truncate_to`, a fresh `create_new`).

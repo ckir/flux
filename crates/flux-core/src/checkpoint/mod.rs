@@ -24,12 +24,22 @@ pub(crate) const CHECKPOINT_MIN_LEN: u64 = 64 << 20;
 /// Chunks coalesced into one `Range` message.
 pub(crate) const RANGE_CHUNKS: usize = 16;
 
+/// How much of a checkpointed file a resume re-reads before it trusts the log (cut 9f-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResumeVerify {
+    #[default]
+    Chunks,
+    Full,
+}
+
 /// Everything a run decides about checkpointing; the fields are injectable so tests can use small fixtures.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CheckpointPolicy {
     pub min_len: u64,
     pub range_chunks: usize,
     pub wal: WalConfig,
+    #[allow(dead_code)] // read by the resume path (cut 9f-2, a later task)
+    pub verify: ResumeVerify,
 }
 
 impl CheckpointPolicy {
@@ -37,6 +47,7 @@ impl CheckpointPolicy {
         min_len: CHECKPOINT_MIN_LEN,
         range_chunks: RANGE_CHUNKS,
         wal: WalConfig::DEFAULT,
+        verify: ResumeVerify::Chunks,
     };
 }
 
@@ -105,6 +116,11 @@ impl<D: DirHandle + Send + 'static> Checkpoints<D> {
 
     pub(crate) fn durability(&self) -> Durability {
         self.policy.wal.durability
+    }
+
+    #[allow(dead_code)] // called by the resume path (cut 9f-2, a later task)
+    pub(crate) fn resume_verify(&self) -> ResumeVerify {
+        self.policy.verify
     }
 
     /// Pass two for one file, over a fresh read of the segment through `read_dir`. With no segment at open

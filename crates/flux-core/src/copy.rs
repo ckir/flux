@@ -1293,6 +1293,7 @@ mod tests {
                 channel_cap,
                 durability,
             },
+            verify: crate::checkpoint::ResumeVerify::Chunks,
         }
     }
 
