@@ -588,6 +588,24 @@ fn a_killed_tree_copy_resumes_as_the_same_operation() {
 /// (the WAL thread was joined and its handles dropped; on Windows a held handle would block the removal).
 #[test]
 fn a_killed_large_file_resumes_from_its_validated_prefix() {
+    a_killed_large_file_resumes_with(&[], false);
+}
+
+/// Cut 9f-2: naming the default level changes nothing, on a tree that really has a partial resume to report.
+#[test]
+fn a_killed_large_file_resumes_under_explicit_chunks_like_unflagged() {
+    a_killed_large_file_resumes_with(&["--resume-verify", "chunks"], false);
+}
+
+/// Cut 9f-2: with the log gone, `chunks` (unflagged or named) recopies everything, where `full` would keep the prefix.
+#[test]
+fn a_killed_large_file_without_its_log_is_recopied_whole_under_chunks_flagged_or_not() {
+    a_killed_large_file_resumes_with(&[], true);
+    a_killed_large_file_resumes_with(&["--resume-verify", "chunks"], true);
+}
+
+/// The body of the tests above: `extra` is added to the resume's arguments; `log_deleted` removes the WAL segment first.
+fn a_killed_large_file_resumes_with(extra: &[&str], log_deleted: bool) {
     use std::io::{Read, Write};
     const MIB: usize = 1024 * 1024;
     const LEN: usize = 70 * MIB;
@@ -636,13 +654,26 @@ fn a_killed_large_file_resumes_from_its_validated_prefix() {
         f.sync_all().unwrap();
     }
 
-    let out =
-        copy(&[os("--resume"), os("--durability"), os("strict"), src.as_os_str(), dst.as_os_str()]);
+    if log_deleted {
+        std::fs::remove_file(&segment).unwrap();
+    }
+    let mut args: Vec<&std::ffi::OsStr> =
+        vec![os("--resume"), os("--durability"), os("strict"), os("--json")];
+    args.extend(extra.iter().map(|a| os(a)));
+    args.extend([src.as_os_str(), dst.as_os_str()]);
+    let out = copy(&args);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let text = format!("{}{}", stderr(&out), String::from_utf8_lossy(&out.stdout));
     let has_line = |prefix: &str| text.lines().any(|l| l.starts_with(prefix));
-    assert!(has_line("resumed big: reused 41943040 bytes, recopied"), "{text}");
-    assert!(has_line("checkpoints discarded for big: mismatch at offset 41943040"), "{text}");
+    if log_deleted {
+        assert!(!has_line("resumed big:"), "{text}");
+    } else {
+        assert!(has_line("resumed big: reused 41943040 bytes, recopied"), "{text}");
+        assert!(has_line("checkpoints discarded for big: mismatch at offset 41943040"), "{text}");
+    }
+    assert!(!stderr(&out).contains("resume verification"), "{}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v.get("resume_verify").is_none(), "{v}");
 
     // Byte for byte, in chunks (never 140 MiB at once).
     let (mut a, mut b) = (
@@ -786,6 +817,25 @@ fn resume_verify_metadata_is_a_usage_error_that_creates_nothing() {
     assert!(out.stdout.is_empty(), "{}", String::from_utf8_lossy(&out.stdout));
     assert!(!dst.exists());
     assert!(!d.path().join("dst.flux-lock").exists());
+
+    // The refusal comes before the source is resolved: a missing source must not be reported instead.
+    let missing = d.path().join("no-such-source");
+    let out = copy(&[
+        os("--resume"),
+        os("--resume-verify"),
+        os("metadata"),
+        os("--json"),
+        missing.as_os_str(),
+        dst.as_os_str(),
+    ]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("--resume-verify=metadata is not implemented"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(out.stdout.is_empty());
+    assert!(!dst.exists());
 }
 
 #[test]
