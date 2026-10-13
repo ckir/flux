@@ -4,7 +4,7 @@
 //! Design authority: `docs/superpowers/specs/2026-09-26-cut-4b-copy-tree-design.md`.
 
 pub use crate::checkpoint::Discard;
-use crate::checkpoint::{Checkpoints, FileCkpt};
+use crate::checkpoint::{Checkpoints, FileCkpt, Hook};
 use crate::copy::{
     BeforeCreate, BeforePublish, CopyError, CopyStep, Guard, Heartbeat, PublishIntent, Reuse,
     Stage, Staged, SyncAt, copy_file_checkpointed, copy_file_guarded, discard, no_before_create,
@@ -1290,7 +1290,7 @@ fn copy_one<F: DestinationRoot>(
                 cx.beat,
                 &no_before_create,
                 before_publish,
-                fc.as_ref(),
+                fc.as_ref().map(Hook::Logged),
             );
             let (result, reuse) = split_reuse(result);
             discard_note_on_failure(claims, &key, &wrote, &result);
@@ -1397,7 +1397,7 @@ fn copy_one<F: DestinationRoot>(
                 cx.beat,
                 &before_create,
                 before_publish,
-                fc.as_ref(),
+                fc.as_ref().map(Hook::Logged),
             );
             let (result, reuse) = split_reuse(result);
             discard_note_on_failure(claims, &key_stored, &wrote, &result);
@@ -1503,7 +1503,7 @@ fn stage_into_batch<F: DestinationRoot>(
             } else {
                 SyncAt::Staging
             },
-            fc,
+            fc.map(Hook::Logged),
         )
     };
     let staged = match stage() {

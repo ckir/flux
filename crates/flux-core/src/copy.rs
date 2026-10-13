@@ -1,8 +1,7 @@
 //! Single-file copy. The algorithm lives here once; platforms supply primitives.
 
 use crate::checkpoint::{
-    Discard, FileCkpt, FileSink, Gate, ResumeVerify, Start, Verdict, decide, decide_full,
-    mtime_pair,
+    Discard, FileSink, Gate, Hook, ResumeVerify, Start, Verdict, decide, decide_full, mtime_pair,
 };
 use flux_fs::{
     Code, CopyOptions, DestinationRoot, DirHandle, Durability, FileHandle, FileIdentity, FileType,
@@ -562,7 +561,7 @@ pub(crate) enum Stage<W> {
 /// partial: `PartialMissing` iff it began the file, nothing otherwise (an unreadable log with no partial reports
 /// nothing). A partial that is not a regular file is `Unreadable` under both levels.
 fn plan_resume<D: DirHandle + Send + 'static, R: std::io::Read>(
-    fc: &FileCkpt<'_, D>,
+    hook: Hook<'_, '_, D>,
     parent: &D,
     temp: &OsStr,
     src_meta: &Metadata,
@@ -572,14 +571,21 @@ fn plan_resume<D: DirHandle + Send + 'static, R: std::io::Read>(
     let fresh =
         |discard| Verdict { start: Start::Fresh, carry: Vec::new(), discard, proven: Vec::new() };
     let unreadable = |why: String| Ok((fresh(Some(Discard::Unreadable(why))), None));
-    let level = fc.run.resume_verify();
+    // A log-free hook has no log to consult: it behaves as `full`.
+    let (level, logged) = match hook {
+        Hook::Logged(fc) => (fc.run.resume_verify(), Some(fc)),
+        Hook::LogFree { .. } => (ResumeVerify::Full, None),
+    };
     // `chunks` trusts the recorded digests; `full` consults no log to decide validity (the source is the oracle).
     let state = match level {
-        ResumeVerify::Chunks => match fc.run.load(&fc.file_id) {
-            Ok(Some(state)) => Some(state),
-            Ok(None) => return Ok((fresh(None), None)),
-            Err(e) => return unreadable(format!("{e}")),
-        },
+        ResumeVerify::Chunks => {
+            let fc = logged.expect("`chunks` is reachable only through a logged hook");
+            match fc.run.load(&fc.file_id) {
+                Ok(Some(state)) => Some(state),
+                Ok(None) => return Ok((fresh(None), None)),
+                Err(e) => return unreadable(format!("{e}")),
+            }
+        }
         ResumeVerify::Full => None,
     };
     let partial_meta = match parent.metadata(temp) {
@@ -625,9 +631,9 @@ fn plan_resume<D: DirHandle + Send + 'static, R: std::io::Read>(
         // the partial went missing; no log at all is a plain fresh copy).
         (None, _, _) => {
             // A log that cannot be read reports nothing either: under `full` validity never comes from the log.
-            let discard = match fc.run.load(&fc.file_id) {
-                Ok(Some(_)) => Some(Discard::PartialMissing),
-                Ok(None) | Err(_) => None,
+            let discard = match logged.map(|fc| fc.run.load(&fc.file_id)) {
+                Some(Ok(Some(_))) => Some(Discard::PartialMissing),
+                Some(Ok(None) | Err(_)) | None => None,
             };
             return Ok((fresh(discard), None));
         }
@@ -658,7 +664,7 @@ pub(crate) fn stage_file<F: DestinationRoot>(
     beat: &Heartbeat<'_>,
     before_create: &BeforeCreate<'_>,
     sync: SyncAt,
-    ckpt: Option<&FileCkpt<'_, F::Dir>>,
+    ckpt: Option<Hook<'_, '_, F::Dir>>,
 ) -> std::result::Result<Stage<F::Writer>, CopyError> {
     let temp = temp_name(name, &opts.operation_id);
 
@@ -723,9 +729,9 @@ pub(crate) fn stage_file<F: DestinationRoot>(
     before_create()?;
     // Cut 9f-1: a checkpointing run decides what to do with an existing partial, after the claim (a refused claim
     // reads nothing). Only a file large enough to be checkpointed can resume; every other verdict is a fresh copy.
-    let ckpt_file = ckpt.filter(|c| src_meta.len >= c.run.min_len());
+    let ckpt_file = ckpt.filter(|c| src_meta.len >= c.min_len());
     let (verdict, partial_identity) = match ckpt_file {
-        Some(fc) => plan_resume(fc, parent, &temp, &src_meta, &mut reader, beat)?,
+        Some(hook) => plan_resume(hook, parent, &temp, &src_meta, &mut reader, beat)?,
         None => (
             Verdict { start: Start::Fresh, carry: Vec::new(), discard: None, proven: Vec::new() },
             None,
@@ -764,7 +770,7 @@ pub(crate) fn stage_file<F: DestinationRoot>(
     let mut buf = vec![0u8; copy_buffer_len(src_meta.len)];
     let mut sink: Option<FileSink<'_, F::Dir>> = None;
     let streamed: std::result::Result<(), StreamFail> = 'stream: {
-        if let Some(fc) = ckpt.filter(|c| src_meta.len >= c.run.min_len()) {
+        if let Some(Hook::Logged(fc)) = ckpt.filter(|c| src_meta.len >= c.min_len()) {
             let dup = if fc.run.durability() == Durability::Strict {
                 match writer.duplicate() {
                     Ok(d) => Some(d),
@@ -1012,7 +1018,7 @@ pub(crate) fn copy_file_checkpointed<F: DestinationRoot>(
     beat: &Heartbeat<'_>,
     before_create: &BeforeCreate<'_>,
     before_publish: &BeforePublish<'_>,
-    ckpt: Option<&FileCkpt<'_, F::Dir>>,
+    ckpt: Option<Hook<'_, '_, F::Dir>>,
 ) -> std::result::Result<(Outcome, Reuse), CopyError> {
     let mut staged = match stage_file(
         fs,
@@ -1221,6 +1227,7 @@ pub(crate) fn sync_staged_many<W: FileHandle + Sync>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkpoint::FileCkpt;
     use crate::fault_fs::FaultFs;
     use flux_fs::{Durability, FileSystem, OperationId, Preserve, Publish};
 
@@ -1372,7 +1379,7 @@ mod tests {
             beat,
             &no_before_create,
             SyncAt::Staging,
-            Some(&fc),
+            Some(Hook::Logged(&fc)),
         )
     }
 
@@ -1586,7 +1593,7 @@ mod tests {
                 &beat,
                 &claim,
                 SyncAt::Staging,
-                Some(&fc),
+                Some(Hook::Logged(&fc)),
             );
             assert!(matches!(staged, Ok(Stage::Staged(_))), "{label}");
             run.abandon();
@@ -3379,7 +3386,7 @@ mod tests {
             beat,
             before_create,
             SyncAt::Staging,
-            Some(&fc),
+            Some(Hook::Logged(&fc)),
         )
     }
 
@@ -3632,7 +3639,7 @@ mod tests {
             &no_heartbeat,
             &no_before_create,
             &no_before_publish,
-            Some(&fc),
+            Some(Hook::Logged(&fc)),
         )
         .unwrap_or_else(|e| panic!("copy failed: {e:?}"));
         assert_eq!(out.bytes_copied, 0);
@@ -3894,7 +3901,7 @@ mod tests {
             &no_heartbeat,
             &no_before_create,
             &no_before_publish,
-            Some(&fc),
+            Some(Hook::Logged(&fc)),
         )
         .unwrap_or_else(|e| panic!("copy failed: {e:?}"));
         assert_eq!(out.bytes_copied, 0);
@@ -3958,6 +3965,160 @@ mod tests {
         assert!(run.finish(&no_heartbeat).is_clean());
         let state = replayed(&fs, 2);
         assert_eq!(state.digests.values().copied().collect::<Vec<_>>(), chunk_digests(&src));
+    }
+
+    // ---- cut 9g: the log-free hook (a single file): `plan_resume` runs as `full` with no log and no sink ----
+
+    fn stage_log_free(
+        fs: &FaultFs,
+        root: &Dir,
+        durability: Durability,
+        beat: &Heartbeat<'_>,
+    ) -> StageResult {
+        let mut o = opts();
+        o.durability = durability;
+        stage_file(
+            fs,
+            Path::new("/src"),
+            root,
+            OsStr::new("dst"),
+            &o,
+            &unguarded,
+            beat,
+            &no_before_create,
+            SyncAt::Staging,
+            Some(Hook::LogFree { min_len: MIB as u64 }),
+        )
+    }
+
+    // Mutant: `plan_resume` calls `load` for `LogFree` (returns early with no log, so `reused == 0`).
+    #[test]
+    fn log_free_resumes_the_equal_prefix_of_a_partial_with_no_log() {
+        let (fs, root) = ckpt_fs(5 * MIB);
+        let src = fs.read_file("/src").unwrap();
+        fs.write_file(PARTIAL, &src[..3 * MIB]);
+        let mark = fs.calls().len();
+        let staged = staged_of(stage_log_free(&fs, &root, Durability::Normal, &no_heartbeat));
+        assert_eq!(staged.reused, 3 * MIB as u64);
+        assert_eq!(staged.bytes_copied, 2 * MIB as u64);
+        assert_eq!(staged.discard, Some(Discard::PartialShorter { kept: 3 * MIB as u64 }));
+        assert_eq!(fs.read_file(PARTIAL).unwrap(), src);
+        let calls = fs.calls();
+        assert!(
+            calls[mark..].iter().all(|c| !c.contains("wal") && !c.starts_with("create_new(")),
+            "no log is touched and nothing is created: {:?}",
+            &calls[mark..]
+        );
+    }
+
+    // Mutant: `PartialMissing` reported.
+    #[test]
+    fn log_free_with_no_partial_is_a_fresh_copy_that_reports_nothing() {
+        let (fs, root) = ckpt_fs(5 * MIB);
+        let src = fs.read_file("/src").unwrap();
+        let staged = staged_of(stage_log_free(&fs, &root, Durability::Normal, &no_heartbeat));
+        assert_eq!(staged.reused, 0);
+        assert_eq!(staged.discard, None);
+        assert!(fs.called(&format!("create_new({PARTIAL})")), "{:?}", fs.calls());
+        assert_eq!(fs.read_file(PARTIAL).unwrap(), src);
+    }
+
+    // Mutant: the partial is trusted past a mismatch.
+    #[test]
+    fn log_free_reports_a_differing_unrecorded_tail() {
+        let (fs, root) = ckpt_fs(5 * MIB);
+        let src = fs.read_file("/src").unwrap();
+        let mut partial = src[..3 * MIB].to_vec();
+        partial.extend(vec![0xEE; MIB + MIB / 2]);
+        fs.write_file(PARTIAL, &partial);
+        let staged = staged_of(stage_log_free(&fs, &root, Durability::Normal, &no_heartbeat));
+        assert_eq!(staged.discard, Some(Discard::MismatchAt(3 * MIB as u64)));
+        assert_eq!(staged.reused, 3 * MIB as u64);
+        assert_eq!(fs.read_file(PARTIAL).unwrap(), src);
+    }
+
+    #[test]
+    fn log_free_with_a_partial_longer_than_the_source_proves_the_whole_source() {
+        let len = 3 * MIB + 12345;
+        let (fs, root) = ckpt_fs(len);
+        let src = fs.read_file("/src").unwrap();
+        let mut partial = src.clone();
+        partial.extend(vec![0xEE; 2 * MIB]);
+        fs.write_file(PARTIAL, &partial);
+        let staged = staged_of(stage_log_free(&fs, &root, Durability::Normal, &no_heartbeat));
+        assert_eq!(staged.reused, len as u64);
+        assert_eq!(staged.bytes_copied, 0);
+        assert_eq!(staged.discard, None);
+        assert!(fs.called(&format!("truncate_to({PARTIAL}, {len})")), "{:?}", fs.calls());
+        assert_eq!(fs.read_file(PARTIAL).unwrap(), src);
+    }
+
+    #[test]
+    fn log_free_with_an_empty_partial_recopies_and_reports_it_shorter() {
+        let (fs, root) = ckpt_fs(5 * MIB);
+        fs.write_file(PARTIAL, &[]);
+        let staged = staged_of(stage_log_free(&fs, &root, Durability::Normal, &no_heartbeat));
+        assert_eq!(staged.reused, 0);
+        assert_eq!(staged.discard, Some(Discard::PartialShorter { kept: 0 }));
+    }
+
+    // Mutant: the min_len filter at the `plan_resume` call removed (the partial is read).
+    #[test]
+    fn log_free_below_min_len_recopies_without_reading_the_partial() {
+        let (fs, root) = ckpt_fs(MIB / 2);
+        fs.write_file(PARTIAL, &[1, 2, 3, 4]);
+        let staged = staged_of(stage_log_free(&fs, &root, Durability::Normal, &no_heartbeat));
+        assert_eq!(staged.reused, 0);
+        assert_eq!(staged.discard, None);
+        assert_eq!(fs.bytes_read(PARTIAL), 0);
+    }
+
+    #[test]
+    fn log_free_heartbeat_failure_leaves_the_partial_untouched() {
+        let (fs, root) = ckpt_fs(5 * MIB);
+        let src = fs.read_file("/src").unwrap();
+        fs.write_file(PARTIAL, &src[..3 * MIB]);
+        let mark = fs.calls().len();
+        // Beats 1 and 2 are `stage_file`'s own; 3 is `decide_full`'s for chunk 0; the 4th, before chunk 1, fails: one
+        // chunk was hashed and nothing was mutated.
+        let calls = std::cell::Cell::new(0u32);
+        let beat = || {
+            calls.set(calls.get() + 1);
+            if calls.get() >= 4 {
+                Err(FsError::new(Code::IoError, std::io::Error::other("the lock is lost")))
+            } else {
+                Ok(())
+            }
+        };
+        let e = stage_log_free(&fs, &root, Durability::Normal, &beat)
+            .err()
+            .expect("the lost lock stops the copy");
+        assert_eq!(e.step, CopyStep::Heartbeat);
+        let partial = fs.read_file(PARTIAL).expect("the partial is still there");
+        assert_eq!(partial.len(), 3 * MIB);
+        assert_eq!(partial, src[..3 * MIB]);
+        let all = fs.calls();
+        assert!(
+            all[mark..].iter().all(|c| !c.starts_with("truncate_to(")),
+            "the partial is untouched: {:?}",
+            &all[mark..]
+        );
+    }
+
+    #[test]
+    fn log_free_under_strict_syncs_the_partial_before_publish() {
+        let (fs, root) = ckpt_fs(5 * MIB);
+        let src = fs.read_file("/src").unwrap();
+        fs.write_file(PARTIAL, &src[..3 * MIB]);
+        let mark = fs.calls().len();
+        let staged = staged_of(stage_log_free(&fs, &root, Durability::Strict, &no_heartbeat));
+        assert_eq!(staged.reused, 3 * MIB as u64);
+        let calls = fs.calls();
+        assert!(
+            calls[mark..].iter().any(|c| c == &format!("sync_all({PARTIAL})")),
+            "{:?}",
+            &calls[mark..]
+        );
     }
 
     #[test]
