@@ -6204,6 +6204,37 @@ mod checkpointing {
         assert_eq!(checkpointing.0, 3, "sweep, temporary, publish: the unchanged path");
     }
 
+    // Test audit (cut 9f-1 plan 2, round 1). Mutants: `>=` -> `>` at tree.rs `file_ckpt`, and at the two
+    // `src_meta.len >= c.run.min_len()` filters in copy.rs `stage_file`; each leaves a file of exactly `min_len` on
+    // the unchanged path (the 3-guard count of the small file) while the tree-level test suite stays green.
+    #[test]
+    fn a_file_of_exactly_the_threshold_length_is_checkpointed() {
+        let guard_count = |len: usize| {
+            let fs = FaultFs::new();
+            for d in ["/src", "/p"] {
+                fs.create_dir(Path::new(d)).unwrap();
+            }
+            fs.write_file("/src/f", &pattern(len));
+            let count = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&count);
+            let hook: BeforeMutation = Arc::new(move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+            });
+            let c = RunConfig { before_mutation: Some(hook), ..cfg() };
+            ok(&run_with(&fs, &c, &opts(), lazy(Durability::Normal)).0);
+            count.load(Ordering::SeqCst)
+        };
+        let below = guard_count(MIB - 1);
+        let exact = guard_count(MIB);
+        let above = guard_count(MIB + 1);
+        assert_eq!(below, 3, "one byte under the threshold: the unchanged path");
+        assert!(
+            above > below,
+            "a file over the threshold takes the checkpointed path: {above} guards"
+        );
+        assert_eq!(exact, above, "a file of exactly min_len is checkpointed like the one above it");
+    }
+
     // Mutant: `run::file` opens a log.
     #[test]
     fn a_single_file_copy_is_untouched_by_checkpointing() {

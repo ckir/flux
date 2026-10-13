@@ -3482,6 +3482,31 @@ mod tests {
         assert_eq!(state.digests.values().copied().collect::<Vec<_>>(), chunk_digests(&src));
     }
 
+    // Test audit (cut 9f-1 plan 2, round 1). Mutants: `>=` -> `>` at the `src_meta.len >= c.run.min_len()` filter
+    // that gates `plan_resume` (the first), and at the one that gates the sink (the second): each leaves a source of
+    // exactly `min_len` on the unchanged path (no validation of the partial, no WAL) while the others stay green.
+    #[test]
+    fn a_source_of_exactly_min_len_is_resumed_and_checkpointed() {
+        let (fs, root, src) = resume_fixture(MIB, 1);
+        assert_eq!(src.len(), 1 << 20, "the fixture's source is exactly the policy's min_len");
+        fs.write_file(PARTIAL, &src);
+        let run = run_gen(&fs, 2, Durability::Normal);
+        let staged = staged_of(stage_full(
+            &fs,
+            &root,
+            &run,
+            Durability::Normal,
+            &no_heartbeat,
+            &no_before_create,
+        ));
+        assert_eq!(staged.reused, MIB as u64, "the whole partial is validated and kept");
+        assert_eq!(staged.discard, None);
+        assert_eq!(fs.read_file(PARTIAL).unwrap(), src);
+        assert!(run.finish(&no_heartbeat).is_clean());
+        let state = replayed(&fs, 2);
+        assert_eq!(state.digests.values().copied().collect::<Vec<_>>(), chunk_digests(&src));
+    }
+
     #[test]
     fn a_changed_source_discards_the_checkpoints_and_recopies() {
         let (fs, root, src) = resume_fixture(5 * MIB, 3);
