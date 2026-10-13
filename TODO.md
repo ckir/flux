@@ -512,6 +512,9 @@ the spec's numbers, 9-10 were learned during execution).
 
 - [ ] A test for a heartbeat failure after the note is written is missing.
 - [ ] The Normal path builds the note template needlessly.
+- [ ] After a lost guard the UNBATCHED Strict path's `discard_note_on_failure` still writes `state.db` (`discard_prepared`,
+      `crates/flux-core/src/tree.rs`), where the batched path writes nothing after a lost lock (9d spec decision 8). Align it:
+      skip the discard when the guard reported the loss. (Triage of 2026-10-11, verified 2026-10-10.)
 
 ## Cut 9d known limits
 
@@ -610,6 +613,12 @@ the spec's numbers, 9-10 were learned during execution).
   `a_strict_metadata_failure_is_reported_before_the_sync_runs`.
 - [ ] The end-to-end stall oracles pin `FLUX_TEST_BATCH_AGE_MS` and `FLUX_TEST_OPEN_WRITERS` so no age or cap flush moves a guard index; a clock injectable from the CLI (the tree already takes `BatchPolicy.now`) would let an end-to-end test exercise an age flush deterministically instead of blinding the oracles to it (capstone round 3 recommendation).
 - [ ] Test-audit debt (cut 9e, 2026-10-11): the suite pins the drain's stop classes with hand-built two- and three-frame fixtures; a property test over (frame depth x stop class x failure phase) asserting "no temporary neither removed nor reported", "no note for unsynced data" and "no barrier after a stop", and a real-filesystem crash-injection harness (the fake masks OS fsync semantics), would cover the state space the point tests cannot.
+- [ ] `Run.beat_gap_max` is refreshed after the copy only in the tree run (`crates/flux-core/src/run/mod.rs`); the single-file run
+      keeps its lock-time value. Refresh it after the single-file copy, or document the field as tree-only. (Triage of 2026-10-11.)
+- [ ] The walk holds one open `DirHandle` per live frame (`Frame::Live { dir, .. }` in `crates/flux-core/src/tree.rs`, since e2112e3),
+      so a tree deeper than the soft descriptor limit minus the run's own handles (about 1000 levels at the 1024 default) fails with
+      "too many open files"; the 9e open-writer cap counts writers only. Count live frames in the budget, or refuse with a clear
+      error near the limit. (Found by the 9e capstone, round 2; triage of 2026-10-11.)
 
 ## Scaffolding follow-ups
 
@@ -669,6 +678,14 @@ Triage of 2026-09-23 adds one more, re-measured that day.
       `#[cfg(windows)]` twin, which is not compiled on Linux, so no Linux test can catch them. No `.cargo/mutants.toml`
       is needed for the Linux result. A Windows-only mutant can be judged only on Windows (the CI Windows leg or a
       Windows box), so read a `flux-platform` mutants report as covering the Unix half only until then.
+
+Triage of 2026-10-11 adds two more.
+
+- [ ] **`model-extended.yml` and `model-mutants.yml` download `tla2tools.jar` on every job.** Both run `models/lockproto/run.py`,
+      but only `model.yml` got the jar cache step. Add the same cache step to both.
+- [ ] **Watch item: `Test (windows-latest)` failed once on PR #80** in `crates/flux-cli/tests/recovery.rs` (two stall tests panicked at
+      `recovery.rs:68` after ~61 s; the re-run of the job passed). Cause not found. If it recurs, treat it as a stall-wait timeout flake
+      on Windows and raise the wait or make the stall-file check robust.
 
 ## Spec gaps from the filesystem probes
 
