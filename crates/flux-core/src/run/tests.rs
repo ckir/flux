@@ -7023,6 +7023,20 @@ mod checkpointing {
         published(&fs, 5 * MIB);
     }
 
+    // Test audit (cut 9f-2). The partial comes from a NORMAL crash, so `stage_into_batch`'s mutant (`fc` passed as
+    // `None`) cannot touch the fixture and turns THIS resume red: nothing is salvaged, so `bytes_reused` is 0.
+    #[test]
+    fn a_strict_full_resume_reuses_exactly_what_a_normal_crash_left() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        let (r, _) = resume_run_as(&fs, Durability::Strict, &resuming_full());
+        let out = ok(&r);
+        assert_eq!(out.bytes_reused, 3 * MIB as u64, "{out:?}");
+        assert_eq!(out.files_partially_resumed, 1, "{out:?}");
+        assert_only_shorter_discard(&r);
+        published(&fs, 5 * MIB);
+    }
+
     #[test]
     fn an_unavailable_segment_is_not_quarantined() {
         let fs = big_fs(5 * MIB);

@@ -3921,6 +3921,45 @@ mod tests {
         assert!(run.finish(&no_heartbeat).is_clean());
     }
 
+    // Test audit (cut 9f-2). Design 7.8 under `full`. Mutants: `>=` -> `>` at either `min_len` filter; `<` -> `<=` at
+    // `decide_full`'s `partial_len < start + len` (an exactly-one-chunk partial is then called short and kept as 0).
+    #[test]
+    fn full_resumes_a_source_of_exactly_min_len() {
+        use crate::checkpoint::ResumeVerify::Full;
+        let (fs, root, src) = resume_fixture(MIB, 1);
+        assert_eq!(src.len(), 1 << 20, "the fixture's source is exactly the policy's min_len");
+        fs.write_file(PARTIAL, &src);
+        let run = run_gen_as(&fs, 2, Durability::Normal, Full);
+        let staged = stage_normal(&fs, &root, &run);
+        assert_eq!(staged.reused, MIB as u64, "the whole partial is proven and kept");
+        assert_eq!(staged.bytes_copied, 0);
+        assert_eq!(staged.discard, None);
+        assert_eq!(fs.read_file(PARTIAL).unwrap(), src);
+        assert!(run.finish(&no_heartbeat).is_clean());
+        let state = replayed(&fs, 2);
+        assert_eq!(state.digests.values().copied().collect::<Vec<_>>(), chunk_digests(&src));
+    }
+
+    // Test audit (cut 9f-2). A partial of exactly one chunk, through `plan_resume`, not only `decide_full`'s unit
+    // test. Mutants: `<` -> `<=` at `decide_full`'s `partial_len < start + len`; `plan_resume` handing `decide_full`
+    // `len - 1`.
+    #[test]
+    fn full_keeps_a_partial_of_exactly_one_chunk() {
+        use crate::checkpoint::ResumeVerify::Full;
+        let (fs, root) = ckpt_fs(5 * MIB);
+        let src = fs.read_file("/src").unwrap();
+        fs.write_file(PARTIAL, &src[..MIB]);
+        let run = run_gen_as(&fs, 1, Durability::Normal, Full);
+        let staged = stage_normal(&fs, &root, &run);
+        assert_eq!(staged.reused, MIB as u64);
+        assert_eq!(staged.bytes_copied, 4 * MIB as u64);
+        assert_eq!(staged.discard, Some(Discard::PartialShorter { kept: MIB as u64 }));
+        assert_eq!(fs.read_file(PARTIAL).unwrap(), src);
+        assert!(run.finish(&no_heartbeat).is_clean());
+        let state = replayed(&fs, 2);
+        assert_eq!(state.digests.values().copied().collect::<Vec<_>>(), chunk_digests(&src));
+    }
+
     #[test]
     fn a_heartbeat_failure_during_full_validation_appends_nothing() {
         use crate::checkpoint::ResumeVerify::Full;
