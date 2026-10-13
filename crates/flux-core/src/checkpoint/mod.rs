@@ -16,6 +16,8 @@ use std::ffi::OsStr;
 use std::io;
 
 pub use decide::Discard;
+#[allow(unused_imports)] // used by plan_resume in cut 9f-2 task 4
+pub(crate) use decide::decide_full;
 pub(crate) use decide::{Gate, Start, Verdict, decide};
 pub(crate) use sink::{FileSink, SinkError, mtime_pair};
 

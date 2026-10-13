@@ -561,7 +561,8 @@ fn plan_resume<D: DirHandle + Send + 'static, R: std::io::Read>(
     reader: &mut R,
     beat: &Heartbeat<'_>,
 ) -> std::result::Result<(Verdict, Option<FileIdentity>), CopyError> {
-    let fresh = |discard| Verdict { start: Start::Fresh, carry: Vec::new(), discard };
+    let fresh =
+        |discard| Verdict { start: Start::Fresh, carry: Vec::new(), discard, proven: Vec::new() };
     let unreadable = |why: String| Ok((fresh(Some(Discard::Unreadable(why))), None));
     let state = match fc.run.load(&fc.file_id) {
         Ok(Some(state)) => state,
@@ -696,9 +697,13 @@ pub(crate) fn stage_file<F: DestinationRoot>(
     let ckpt_file = ckpt.filter(|c| src_meta.len >= c.run.min_len());
     let (verdict, partial_identity) = match ckpt_file {
         Some(fc) => plan_resume(fc, parent, &temp, &src_meta, &mut reader, beat)?,
-        None => (Verdict { start: Start::Fresh, carry: Vec::new(), discard: None }, None),
+        None => (
+            Verdict { start: Start::Fresh, carry: Vec::new(), discard: None, proven: Vec::new() },
+            None,
+        ),
     };
-    let Verdict { start, carry, discard: why } = verdict;
+    let Verdict { start, carry, discard: why, proven } = verdict;
+    let _ = proven; // cut 9f-2 task 4 uses it
     let (mut writer, reused) = match (start, partial_identity) {
         (Start::Resume { offset }, Some(identity)) => {
             // A destination mutation, so its own section 99 check. The partial is reopened for writing by the identity

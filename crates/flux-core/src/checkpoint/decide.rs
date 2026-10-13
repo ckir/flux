@@ -35,12 +35,14 @@ pub enum Discard {
 }
 
 /// `carry` is the source bytes `decide` consumed that the caller must write first. For both starts the source
-/// reader is left at `start_offset + carry.len()`.
+/// reader is left at `start_offset + carry.len()`. `proven` is the BLAKE3 digest of every chunk `decide_full` proved
+/// (chunks `0..offset.div_ceil(CHUNK_SIZE)`); `decide` and every fresh verdict leave it empty.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Verdict {
     pub start: Start,
     pub carry: Vec<u8>,
     pub discard: Option<Discard>,
+    pub proven: Vec<Digest>,
 }
 
 /// Reads up to `buf.len()` bytes, looping over short reads and retrying `Interrupted`; fewer only at end of stream.
@@ -69,7 +71,8 @@ pub(crate) fn decide<S: Read, P: Read>(
     partial: Option<&mut P>,
     beat: &Heartbeat<'_>,
 ) -> Result<Verdict, FsError> {
-    let fresh = |discard| Verdict { start: Start::Fresh, carry: Vec::new(), discard };
+    let fresh =
+        |discard| Verdict { start: Start::Fresh, carry: Vec::new(), discard, proven: Vec::new() };
     let begin = &state.begin;
     if begin.source_len != gate.len {
         return Ok(fresh(Some(Discard::SourceChanged("length"))));
@@ -118,13 +121,57 @@ pub(crate) fn decide<S: Read, P: Read>(
             let carry = source_buf[..got].to_vec();
             let discard = Some(Discard::MismatchAt(start));
             let start = if k == 0 { Start::Fresh } else { Start::Resume { offset: start } };
-            return Ok(Verdict { start, carry, discard });
+            return Ok(Verdict { start, carry, discard, proven: Vec::new() });
         }
         pos = start + len as u64;
     }
     let discard = shorter.then_some(Discard::PartialShorter { kept: pos });
     let start = if pos == 0 { Start::Fresh } else { Start::Resume { offset: pos } };
-    Ok(Verdict { start, carry: Vec::new(), discard })
+    Ok(Verdict { start, carry: Vec::new(), discard, proven: Vec::new() })
+}
+
+/// The WAL-free proof (cut 9f-2): a chunk of the partial is trusted only when it is byte-equal (by BLAKE3) to the
+/// same chunk of the source as it is now. No recorded digests are consulted; the source is the only oracle.
+/// For both starts the source reader is left at `start_offset + carry.len()`, as for `decide`.
+#[allow(dead_code)] // used by plan_resume in cut 9f-2 task 4
+pub(crate) fn decide_full<S: Read, P: Read>(
+    source_len: u64,
+    partial_len: u64,
+    source: &mut S,
+    partial: &mut P,
+    beat: &Heartbeat<'_>,
+) -> Result<Verdict, FsError> {
+    let mut pos = 0u64;
+    let mut shorter = false;
+    let mut proven = Vec::new();
+    let mut source_buf = vec![0u8; CHUNK_SIZE as usize];
+    let mut partial_buf = vec![0u8; CHUNK_SIZE as usize];
+    let mut k = 0u64;
+    while k * CHUNK_SIZE < source_len {
+        let start = k * CHUNK_SIZE;
+        let len = (source_len - start).min(CHUNK_SIZE);
+        if partial_len < start + len {
+            shorter = true;
+            break;
+        }
+        beat()?;
+        let len = len as usize;
+        let got = read_full(source, &mut source_buf[..len]).map_err(FsError::from_io)?;
+        let partial_got = read_full(partial, &mut partial_buf[..len]).unwrap_or(0);
+        let digest = hash(&source_buf[..len]);
+        if !(got == len && partial_got == len && digest == hash(&partial_buf[..len])) {
+            let carry = source_buf[..got].to_vec();
+            let discard = Some(Discard::MismatchAt(start));
+            let start = if k == 0 { Start::Fresh } else { Start::Resume { offset: start } };
+            return Ok(Verdict { start, carry, discard, proven });
+        }
+        proven.push(digest);
+        pos = start + len as u64;
+        k += 1;
+    }
+    let discard = shorter.then_some(Discard::PartialShorter { kept: pos });
+    let start = if pos == 0 { Start::Fresh } else { Start::Resume { offset: pos } };
+    Ok(Verdict { start, carry: Vec::new(), discard, proven })
 }
 
 #[cfg(test)]
@@ -517,5 +564,145 @@ mod tests {
         assert!(v.carry.is_empty());
         assert_eq!(v.discard, None);
         assert_positioned(&v, s, &src);
+    }
+
+    /// Runs `decide_full` over cursors; returns the verdict and the source reader.
+    fn run_full(len: usize, source: &[u8], partial: &[u8]) -> (Verdict, Counting<Cursor<Vec<u8>>>) {
+        let mut s = counting(source);
+        let mut p = Cursor::new(partial.to_vec());
+        let v = decide_full(len as u64, partial.len() as u64, &mut s, &mut p, &ok_beat)
+            .expect("decide_full");
+        (v, s)
+    }
+
+    #[test]
+    fn full_proves_an_equal_partial_to_the_end() {
+        let src = source_bytes(5 * MIB);
+        let want: Vec<Digest> = digests_of(&src).into_values().collect();
+        let (v, s) = run_full(src.len(), &src, &src);
+        assert_eq!(v.start, Start::Resume { offset: 5 * MIB as u64 });
+        assert!(v.carry.is_empty());
+        assert_eq!(v.discard, None);
+        assert_eq!(v.proven, want);
+        assert_positioned(&v, s, &src);
+        let mut longer = src.clone();
+        longer.extend([1u8, 2, 3]);
+        let (v, s) = run_full(src.len(), &src, &longer);
+        assert_eq!(v.start, Start::Resume { offset: 5 * MIB as u64 });
+        assert!(v.carry.is_empty());
+        assert_eq!(v.discard, None);
+        assert_eq!(v.proven, want);
+        assert_eq!(s.read, 5 * MIB);
+    }
+
+    #[test]
+    fn full_resumes_at_the_chunk_start_before_a_differing_byte() {
+        let src = source_bytes(4 * MIB + 12345);
+        let flipped = |at: usize| {
+            let mut p = src.clone();
+            p[at] ^= 1;
+            p
+        };
+        let (v, s) = run_full(src.len(), &src, &flipped(10));
+        assert_eq!(v.start, Start::Fresh);
+        assert_eq!(v.discard, Some(Discard::MismatchAt(0)));
+        assert_eq!(v.carry, src[..MIB]);
+        assert!(v.proven.is_empty());
+        assert_positioned(&v, s, &src);
+        let (v, s) = run_full(src.len(), &src, &flipped(2 * MIB + 10));
+        assert_eq!(v.start, Start::Resume { offset: 2 * MIB as u64 });
+        assert_eq!(v.discard, Some(Discard::MismatchAt(2 * MIB as u64)));
+        assert_eq!(v.carry, src[2 * MIB..3 * MIB]);
+        assert_eq!(v.proven.len(), 2);
+        assert_positioned(&v, s, &src);
+        let (v, s) = run_full(src.len(), &src, &flipped(4 * MIB + 100));
+        assert_eq!(v.start, Start::Resume { offset: 4 * MIB as u64 });
+        assert_eq!(v.discard, Some(Discard::MismatchAt(4 * MIB as u64)));
+        assert_eq!(v.carry, src[4 * MIB..]);
+        assert_eq!(v.proven.len(), 4);
+        assert_positioned(&v, s, &src);
+    }
+
+    #[test]
+    fn full_a_source_that_ends_inside_a_chunk_is_a_mismatch_with_the_short_carry() {
+        let src = identical_chunks(3);
+        let short = &src[..2 * MIB + 100];
+        let mut s = counting(short);
+        let mut p = Cursor::new(src.clone());
+        let v = decide_full(src.len() as u64, src.len() as u64, &mut s, &mut p, &ok_beat).unwrap();
+        assert_eq!(v.start, Start::Resume { offset: 2 * MIB as u64 });
+        assert_eq!(v.discard, Some(Discard::MismatchAt(2 * MIB as u64)));
+        assert_eq!(v.carry.len(), 100);
+        assert_eq!(v.carry, src[2 * MIB..2 * MIB + 100]);
+        assert_eq!(v.proven.len(), 2);
+    }
+
+    #[test]
+    fn full_a_partial_read_error_stops_validation_at_that_chunk() {
+        let src = source_bytes(4 * MIB);
+        let mut s = counting(&src);
+        let mut p = FailAfter { inner: Cursor::new(src.clone()), good: MIB + 10 };
+        let v = decide_full(src.len() as u64, src.len() as u64, &mut s, &mut p, &ok_beat).unwrap();
+        assert_eq!(v.start, Start::Resume { offset: MIB as u64 });
+        assert_eq!(v.discard, Some(Discard::MismatchAt(MIB as u64)));
+        assert_eq!(v.carry, src[MIB..2 * MIB]);
+        assert_eq!(v.proven.len(), 1);
+    }
+
+    #[test]
+    fn full_a_shorter_partial_keeps_the_chunks_that_fit_and_reads_no_source_past_them() {
+        let src = source_bytes(5 * MIB);
+        let (v, s) = run_full(src.len(), &src, &src[..2 * MIB + MIB / 2]);
+        assert_eq!(v.start, Start::Resume { offset: 2 * MIB as u64 });
+        assert_eq!(v.discard, Some(Discard::PartialShorter { kept: 2 * MIB as u64 }));
+        assert!(v.carry.is_empty());
+        assert_eq!(v.proven.len(), 2);
+        assert_eq!(s.read, 2 * MIB);
+        let (v, s) = run_full(src.len(), &src, &[]);
+        assert_eq!(v.start, Start::Fresh);
+        assert_eq!(v.discard, Some(Discard::PartialShorter { kept: 0 }));
+        assert!(v.carry.is_empty());
+        assert_eq!(s.read, 0);
+        let (v, _) = run_full(src.len(), &src, &src[..MIB]);
+        assert_eq!(v.start, Start::Resume { offset: MIB as u64 });
+        assert_eq!(v.discard, Some(Discard::PartialShorter { kept: MIB as u64 }));
+    }
+
+    #[test]
+    fn full_the_heartbeat_runs_once_per_chunk_and_its_failure_aborts() {
+        let src = source_bytes(5 * MIB);
+        let calls = Cell::new(0u32);
+        let counted = || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+        let mut s = counting(&src);
+        let mut p = Cursor::new(src.clone());
+        decide_full(src.len() as u64, src.len() as u64, &mut s, &mut p, &counted).unwrap();
+        assert_eq!(calls.get(), 5);
+
+        calls.set(0);
+        let failing = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 3 {
+                Err(FsError::from_io(io::Error::other("lease lost")))
+            } else {
+                Ok(())
+            }
+        };
+        let mut s = counting(&src);
+        let mut p = Cursor::new(src.clone());
+        let r = decide_full(src.len() as u64, src.len() as u64, &mut s, &mut p, &failing);
+        assert!(r.is_err());
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn full_a_source_read_error_is_an_error() {
+        let src = source_bytes(4 * MIB);
+        let mut s = FailAfter { inner: Cursor::new(src.clone()), good: MIB + 10 };
+        let mut p = Cursor::new(src.clone());
+        let r = decide_full(src.len() as u64, src.len() as u64, &mut s, &mut p, &ok_beat);
+        assert!(r.is_err());
     }
 }
