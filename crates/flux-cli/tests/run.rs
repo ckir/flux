@@ -670,6 +670,193 @@ fn a_killed_large_file_resumes_from_its_validated_prefix() {
     assert!(names(&dst).iter().all(|n| !n.contains(".flux-partial.")), "no partial remains");
 }
 
+/// Cut 9f-2, property 7.10: the model test above under `--resume-verify full`, with the checkpoint log deleted. A
+/// `chunks` resume would find no log and recopy everything; `full` re-reads the partial against the source, keeps the
+/// equal 40 MiB prefix, and says so.
+#[test]
+fn a_killed_large_file_resumes_under_full_from_its_validated_prefix_without_its_log() {
+    use std::io::{Read, Write};
+    const MIB: usize = 1024 * 1024;
+    const LEN: usize = 70 * MIB;
+    let d = TempDir::new().unwrap();
+    let marks = TempDir::new().unwrap();
+    let src = d.path().join("src");
+    let dst = d.path().join("dst");
+    std::fs::create_dir_all(&src).unwrap();
+    {
+        let mut w = std::io::BufWriter::new(std::fs::File::create(src.join("big")).unwrap());
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..LEN / 8 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            w.write_all(&x.to_le_bytes()).unwrap();
+        }
+        w.flush().unwrap();
+    }
+    Stalled::start_args(&src, &dst, 5, marks.path(), &["--durability", "strict"]).kill();
+
+    let id = the_operation(&dst);
+    let partials: Vec<String> =
+        names(&dst).into_iter().filter(|n| n.starts_with("big.flux-partial.")).collect();
+    assert_eq!(partials.len(), 1, "one partial: {partials:?}");
+    let partial = dst.join(&partials[0]);
+    assert_eq!(
+        std::fs::metadata(&partial).unwrap().len(),
+        LEN as u64,
+        "the kill left a whole partial"
+    );
+    let segment = dst.join(".flux").join("operations").join(&id).join("wal").join("000001");
+    assert!(std::fs::metadata(&segment).unwrap().len() > 0, "the WAL holds the file's ranges");
+
+    // The mid-file crash: 40 MiB kept, then 1 MiB of garbage in place of the real chunk 40.
+    {
+        let f = std::fs::OpenOptions::new().write(true).open(&partial).unwrap();
+        f.set_len(40 * MIB as u64).unwrap();
+        let mut f = std::fs::OpenOptions::new().append(true).open(&partial).unwrap();
+        f.write_all(&vec![0xA5u8; MIB]).unwrap();
+        f.sync_all().unwrap();
+    }
+    // The log is gone: a `chunks` resume would recopy everything.
+    std::fs::remove_file(&segment).unwrap();
+
+    let out = copy(&[
+        os("--resume"),
+        os("--resume-verify"),
+        os("full"),
+        os("--durability"),
+        os("strict"),
+        os("--json"),
+        src.as_os_str(),
+        dst.as_os_str(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let err = stderr(&out);
+    let has_line = |prefix: &str| err.lines().any(|l| l.starts_with(prefix));
+    assert!(has_line("resumed big: reused 41943040 bytes, recopied"), "{err}");
+    assert!(has_line("checkpoints discarded for big: mismatch at offset 41943040"), "{err}");
+    assert!(has_line("resume verification: full"), "{err}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["resume_verify"], "full", "{v}");
+
+    let (mut a, mut b) = (
+        std::fs::File::open(src.join("big")).unwrap(),
+        std::fs::File::open(dst.join("big")).unwrap(),
+    );
+    assert_eq!(a.metadata().unwrap().len(), b.metadata().unwrap().len());
+    let (mut buf_a, mut buf_b) = (vec![0u8; MIB], vec![0u8; MIB]);
+    let mut at = 0usize;
+    loop {
+        let n = a.read(&mut buf_a).unwrap();
+        if n == 0 {
+            break;
+        }
+        b.read_exact(&mut buf_b[..n]).unwrap();
+        assert!(
+            buf_a[..n] == buf_b[..n],
+            "the output differs from the source in the chunk at {at}"
+        );
+        at += n;
+    }
+    assert_eq!(at, LEN);
+    assert!(!dst.join(".flux").join("operations").join(&id).exists(), "the workspace is gone");
+    assert!(!dst.join(".flux").exists(), "and the control directory");
+    assert!(names(&dst).iter().all(|n| !n.contains(".flux-partial.")), "no partial remains");
+}
+
+#[test]
+fn resume_verify_metadata_is_a_usage_error_that_creates_nothing() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let dst = d.path().join("dst");
+    let out = copy(&[
+        os("--resume"),
+        os("--resume-verify"),
+        os("metadata"),
+        os("--json"),
+        src.as_os_str(),
+        dst.as_os_str(),
+    ]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("--resume-verify=metadata is not implemented"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(out.stdout.is_empty(), "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(!dst.exists());
+    assert!(!d.path().join("dst.flux-lock").exists());
+}
+
+#[test]
+fn resume_verify_without_resume_is_a_usage_error() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let dst = d.path().join("dst");
+    let out = copy(&[os("--resume-verify"), os("full"), src.as_os_str(), dst.as_os_str()]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(!dst.exists());
+}
+
+/// Property 7.9, the differential: naming the default level changes nothing a user can see.
+#[test]
+fn a_chunks_resume_prints_what_an_unflagged_resume_prints() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let (dst_a, dst_b) = (d.path().join("dst_a"), d.path().join("dst_b"));
+    let a = copy(&[os("--resume"), os("--json"), src.as_os_str(), dst_a.as_os_str()]);
+    let b = copy(&[
+        os("--resume"),
+        os("--resume-verify"),
+        os("chunks"),
+        os("--json"),
+        src.as_os_str(),
+        dst_b.as_os_str(),
+    ]);
+    assert_eq!(a.status.code(), Some(0), "{}", stderr(&a));
+    assert_eq!(b.status.code(), Some(0), "{}", stderr(&b));
+    // The last stderr line is the summary, which carries the duration.
+    let body = |o: &Output, dst: &Path| {
+        let text = stderr(o).replace(&dst.display().to_string(), "<dst>");
+        let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        lines.pop();
+        lines
+    };
+    assert_eq!(body(&a, &dst_a), body(&b, &dst_b));
+    let json = |o: &Output| {
+        let mut v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+        let m = v.as_object_mut().unwrap();
+        m.remove("duration_ms");
+        m.remove("average_bytes_per_second");
+        v
+    };
+    let (ja, jb) = (json(&a), json(&b));
+    assert_eq!(ja, jb);
+    assert!(ja.get("resume_verify").is_none(), "{ja}");
+    assert!(jb.get("resume_verify").is_none(), "{jb}");
+}
+
+#[test]
+fn a_single_file_resume_accepts_full_and_prints_no_level_line() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let dst = d.path().join("dst");
+    std::fs::create_dir_all(&dst).unwrap();
+    let out = copy(&[
+        os("--resume"),
+        os("--resume-verify"),
+        os("full"),
+        os("--json"),
+        src.join("a").as_os_str(),
+        dst.join("a").as_os_str(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(std::fs::read(dst.join("a")).unwrap(), b"A");
+    assert!(!stderr(&out).contains("resume verification"), "{}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v.get("resume_verify").is_none(), "{v}");
+}
+
 #[test]
 fn a_resume_killed_again_resumes_a_third_time() {
     let d = TempDir::new().unwrap();

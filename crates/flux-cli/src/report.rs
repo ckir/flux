@@ -38,6 +38,9 @@ pub struct Report {
     pub average_bytes_per_second: u64,
     pub verify_level: &'static str,
     pub hash_algorithm: &'static str,
+    /// Cut 9f-2: `"full"` when `--resume-verify=full` re-read a partial; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_verify: Option<&'static str>,
 }
 
 impl Report {
@@ -61,6 +64,7 @@ impl Report {
             average_bytes_per_second: 0,
             verify_level: "none",
             hash_algorithm: "blake3",
+            resume_verify: None,
         }
     }
 
@@ -449,6 +453,21 @@ pub fn checkpoint_lines(outcome: &TreeOutcome, normal_durability: bool) -> Vec<S
         );
     }
     v
+}
+
+/// Cut 9f-2: whether `--resume-verify=full` did something a user can see: it re-read a partial that was then resumed or
+/// whose checkpoints were discarded. Never under `chunks`.
+pub fn resume_verify_used(outcome: &TreeOutcome, full: bool) -> bool {
+    full && (!outcome.partial_resumes.is_empty() || !outcome.checkpoint_discards.is_empty())
+}
+
+/// Cut 9f-2: the level line, printed after `checkpoint_lines` when `resume_verify_used`.
+pub fn resume_verify_lines(outcome: &TreeOutcome, full: bool) -> Vec<String> {
+    if resume_verify_used(outcome, full) {
+        vec!["resume verification: full (source and partial re-read and hashed)".to_string()]
+    } else {
+        Vec::new()
+    }
 }
 
 /// Cut 9f-1: the line that follows an aborting error when it is a checkpoint-write failure.
@@ -905,6 +924,53 @@ mod tests {
 
     fn kept() -> RunWarning {
         RunWarning::StateKept(PathBuf::from("X/kept-state"))
+    }
+
+    #[test]
+    fn resume_verify_lines_print_only_for_full_with_a_partial_resume_or_discard() {
+        use flux_core::{CheckpointDiscard, PartialResume};
+        let line =
+            vec!["resume verification: full (source and partial re-read and hashed)".to_string()];
+        let resumed = TreeOutcome {
+            partial_resumes: vec![PartialResume {
+                path: PathBuf::from("big"),
+                reused: 1,
+                recopied: 1,
+            }],
+            ..TreeOutcome::default()
+        };
+        assert_eq!(resume_verify_lines(&resumed, true), line);
+        assert!(resume_verify_lines(&resumed, false).is_empty());
+        let discarded = TreeOutcome {
+            checkpoint_discards: vec![CheckpointDiscard {
+                path: PathBuf::from("big"),
+                reason: Discard::PartialMissing,
+            }],
+            ..TreeOutcome::default()
+        };
+        assert_eq!(resume_verify_lines(&discarded, true), line);
+        assert!(resume_verify_lines(&discarded, false).is_empty());
+        assert!(resume_verify_lines(&TreeOutcome::default(), true).is_empty());
+        assert!(!resume_verify_used(&TreeOutcome::default(), true));
+        assert!(resume_verify_used(&resumed, true));
+        assert!(!resume_verify_used(&resumed, false));
+    }
+
+    #[test]
+    fn the_json_carries_resume_verify_only_when_set() {
+        let mut r = Report::pre_engine(false);
+        assert!(!r.to_json().contains("resume_verify"));
+        r.resume_verify = Some("full");
+        let s = r.to_json();
+        assert!(s.contains("\"resume_verify\":\"full\""), "{s}");
+        let last = KEYS.last().unwrap();
+        assert!(
+            s.find(&format!("\"{last}\":")).unwrap() < s.find("\"resume_verify\"").unwrap(),
+            "{s}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v.as_object().unwrap().len(), KEYS.len() + 1, "{s}");
+        assert!(s.trim_end().ends_with("\"resume_verify\":\"full\"}"), "{s}");
     }
 
     #[test]
