@@ -4018,7 +4018,7 @@ mod tests {
         o.existing = flux_fs::ExistingPolicy::SkipExisting;
         let r = stage_log_free_with(&fs, &root, &o, &no_heartbeat);
         assert!(matches!(r, Ok(Stage::Skipped(_))), "{:?}", r.err());
-        assert_eq!(fs.read_file(PARTIAL), None);
+        assert!(fs.read_file(PARTIAL).is_none(), "the stale partial was removed");
         assert_eq!(fs.read_file("/dst").unwrap(), b"existing");
     }
 
@@ -4036,7 +4036,7 @@ mod tests {
         o.existing = flux_fs::ExistingPolicy::Update;
         let r = stage_log_free_with(&fs, &root, &o, &no_heartbeat);
         assert!(matches!(r, Ok(Stage::Skipped(_))), "{:?}", r.err());
-        assert_eq!(fs.read_file(PARTIAL), None);
+        assert!(fs.read_file(PARTIAL).is_none(), "the stale partial was removed");
     }
 
     // Mutant: the skip branch's sweep drops its own section 99 `guard()` (a removal is a destination mutation, so a

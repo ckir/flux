@@ -557,6 +557,20 @@ the spec's numbers, 9-10 were learned during execution).
 - [ ] No test injects a heartbeat failure during `plan_resume` (`copy.rs:597-608` maps it to `CopyStep::Heartbeat`; `decide.rs` covers it in isolation).
 - [ ] FaultFs gaps that limit those tests: `FakeHandle::write` records nothing in the call log, so no test can order a WAL write against a sync or rename (`fault_fs.rs:688`); there is no read-fault injector, so a source read error mid-file cannot be simulated (the abort-on-source-read-error path is unexercised); `FakeDirHandle::open_existing` and `open_dir` push their call-log entry directly or not at all, so `on_nth` hooks and `fail(..)` never fire for them (`fault_fs.rs:1751`, `:1812`); `FakeHandle::identity` looks up the handle's stale path, so after `move_object` an open handle reads `Unavailable` where a real file reads its descriptor (`fault_fs.rs:749`).
 
+## Cut 9g open (single-file resume; triaged from the anomalies inbox 2026-10-14)
+
+- [ ] Kill after publish, before the record is finalised: a single-file `--resume` finds the target complete and the record still Transferring, prints "resuming operation <id>" and re-copies the whole file (`files_overwritten: 1`, no level line; 4 GiB took about 11.7 s, twice a fresh copy). No partial exists, so it is not a 9g regression; a published-and-equal target could be recognised instead. Found by the 9g timing run.
+- [ ] `plan_resume` hashes through `parent.open_read(temp)` without comparing that handle's identity to `partial_meta.identity` (only `open_existing` checks it), so a concurrent double swap of the partial name could keep an unproven prefix. Pre-existing (same code as 9f-2 `full`), `copy.rs` near line 610; needs a second writer on the destination directory.
+- [ ] Tooling (clavity agy driver, not flux code): the `[13b] TRUNCATED REPLY` flag fired falsely on complete `adversarial-panel-review` replies (twice), and `[13b] ECHO MISSING` fired when agy stripped the backticks from the quoted last line (once per capstone). Workaround: read the reply file tail, one permitted re-ask. Report upstream if it recurs.
+
+## Cut 9g test debt (test audit of 2026-10-14; owner closed only the skip-sweep lock check)
+
+- [ ] `log_free_under_strict_syncs_the_partial_before_publish` (`copy.rs`) asserts only `reused` and `sync_all`.
+- [ ] No stage-level `LogFree` exact-`min_len` test (the run-level `a_single_file_resume_of_exactly_min_len_continues_its_partial` exists).
+- [ ] `file_checkpoint_lines` note-condition mutants survive (`report.rs`, `main.rs`): the note skipped for a discard-only report under Normal, and printed for `Some{reused:0, discard:None}`.
+- [ ] `main.rs` passing the durability flag to `run::file_with` is untested.
+- [ ] No real-process CLI test resumes a fully clean partial (the e2e tests damage the tail); covered at the unit and run levels.
+
 ## Cut 9d debt
 
 - [ ] Keep directory handles alive across `DirEnd` so a tree with one small file per directory batches (limit 1 fix).
