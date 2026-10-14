@@ -563,14 +563,6 @@ the spec's numbers, 9-10 were learned during execution).
 - [ ] `plan_resume` hashes through `parent.open_read(temp)` without comparing that handle's identity to `partial_meta.identity` (only `open_existing` checks it), so a concurrent double swap of the partial name could keep an unproven prefix. Pre-existing (same code as 9f-2 `full`), `copy.rs` near line 610; needs a second writer on the destination directory.
 - [ ] Tooling (clavity agy driver, not flux code): the `[13b] TRUNCATED REPLY` flag fired falsely on complete `adversarial-panel-review` replies (twice), and `[13b] ECHO MISSING` fired when agy stripped the backticks from the quoted last line (once per capstone). Workaround: read the reply file tail, one permitted re-ask. Report upstream if it recurs.
 
-## Cut 9g test debt (test audit of 2026-10-14; owner closed only the skip-sweep lock check)
-
-- [ ] `log_free_under_strict_syncs_the_partial_before_publish` (`copy.rs`) asserts only `reused` and `sync_all`.
-- [ ] No stage-level `LogFree` exact-`min_len` test (the run-level `a_single_file_resume_of_exactly_min_len_continues_its_partial` exists).
-- [ ] `file_checkpoint_lines` note-condition mutants survive (`report.rs`, `main.rs`): the note skipped for a discard-only report under Normal, and printed for `Some{reused:0, discard:None}`.
-- [ ] `main.rs` passing the durability flag to `run::file_with` is untested.
-- [ ] No real-process CLI test resumes a fully clean partial (the e2e tests damage the tail); covered at the unit and run levels.
-
 ## Cut 9d debt
 
 - [ ] Keep directory handles alive across `DirEnd` so a tree with one small file per directory batches (limit 1 fix).

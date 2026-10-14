@@ -1166,11 +1166,9 @@ fn counters_file_reports_a_positive_cap_flush_count_and_a_heartbeat_gap() {
 
 const MIB: usize = 1024 * 1024;
 
-/// Cut 9g: a 70 MiB single file killed with its whole partial written (sweep 1, temporary 2, publish 3), the partial
-/// then cut to 40 MiB and followed by 1 MiB of garbage, so the chunk at offset 40 MiB mismatches. Returns the source,
-/// the target and the partial's path.
-fn killed_single_file_with_a_damaged_partial(d: &Path) -> (PathBuf, PathBuf, PathBuf) {
-    use std::io::Write;
+/// Cut 9g: a 70 MiB single file killed with its whole, undamaged partial written (sweep 1, temporary 2, publish 3).
+/// Returns the source, the target and the partial's path.
+fn killed_single_file_with_a_clean_partial(d: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let marks = TempDir::new().unwrap();
     let src = d.join("src");
     let t = d.join("t");
@@ -1181,6 +1179,15 @@ fn killed_single_file_with_a_damaged_partial(d: &Path) -> (PathBuf, PathBuf, Pat
     assert_eq!(partials.len(), 1, "one partial: {partials:?}");
     let partial = d.join(&partials[0]);
     assert_eq!(std::fs::metadata(&partial).unwrap().len(), (70 * MIB) as u64, "a whole partial");
+    (src, t, partial)
+}
+
+/// Cut 9g: a 70 MiB single file killed with its whole partial written (sweep 1, temporary 2, publish 3), the partial
+/// then cut to 40 MiB and followed by 1 MiB of garbage, so the chunk at offset 40 MiB mismatches. Returns the source,
+/// the target and the partial's path.
+fn killed_single_file_with_a_damaged_partial(d: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    use std::io::Write;
+    let (src, t, partial) = killed_single_file_with_a_clean_partial(d);
     std::fs::OpenOptions::new()
         .write(true)
         .open(&partial)
@@ -1234,10 +1241,45 @@ fn a_killed_single_file_copy_resumes_its_validated_prefix() {
         "{e}"
     );
     assert!(e.contains("resume verification: full (source and partial re-read and hashed)"), "{e}");
+    assert!(
+        e.contains("note: --durability=normal checkpoints are advisory"),
+        "the default is normal: {e}"
+    );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["resume_verify"], "full", "{v}");
     assert_same_bytes(&src, &t);
     assert!(names(d.path()).iter().all(|n| !n.contains(".flux-partial.")), "no partial remains");
+    assert_eq!(names(d.path()), ["src", "t"]);
+}
+
+/// Cut 9g: a clean partial is kept whole under `--durability strict`: one reuse line with nothing recopied, no discard
+/// line, and no advisory note (the note is for normal durability only).
+#[test]
+fn a_killed_single_file_copy_with_a_clean_partial_resumes_all_of_it_under_strict() {
+    let d = TempDir::new().unwrap();
+    let (src, t, _) = killed_single_file_with_a_clean_partial(d.path());
+    let out = copy(&[
+        os("--resume"),
+        os("--durability"),
+        os("strict"),
+        os("--json"),
+        src.as_os_str(),
+        t.as_os_str(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let e = stderr(&out);
+    let target = t.display().to_string();
+    assert!(
+        e.lines()
+            .any(|l| l == format!("resumed {target}: reused 73400320 bytes, recopied 0 bytes")),
+        "{e}"
+    );
+    assert!(!e.contains("checkpoints discarded"), "{e}");
+    assert!(!e.contains("note: --durability=normal"), "{e}");
+    assert!(e.contains("resume verification: full (source and partial re-read and hashed)"), "{e}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["resume_verify"], "full", "{v}");
+    assert_same_bytes(&src, &t);
     assert_eq!(names(d.path()), ["src", "t"]);
 }
 

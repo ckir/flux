@@ -4199,20 +4199,66 @@ mod tests {
         );
     }
 
+    // Mutant: the Strict sync is dropped, or runs before the appended bytes are written, or runs under `Normal` too.
     #[test]
-    fn log_free_under_strict_syncs_the_partial_before_publish() {
+    fn log_free_under_strict_syncs_the_partial_after_the_last_append() {
         let (fs, root) = ckpt_fs(5 * MIB);
         let src = fs.read_file("/src").unwrap();
         fs.write_file(PARTIAL, &src[..3 * MIB]);
         let mark = fs.calls().len();
         let staged = staged_of(stage_log_free(&fs, &root, Durability::Strict, &no_heartbeat));
         assert_eq!(staged.reused, 3 * MIB as u64);
+        assert_eq!(staged.bytes_copied, 2 * MIB as u64);
+        assert_eq!(fs.read_file(PARTIAL).unwrap(), src);
+        let calls = fs.calls();
+        let new = &calls[mark..];
+        let sync = format!("sync_all({PARTIAL})");
+        let at = new.iter().position(|c| c == &sync).unwrap_or_else(|| panic!("no sync: {new:?}"));
+        assert_eq!(new.iter().filter(|c| *c == &sync).count(), 1, "{new:?}");
+        assert!(
+            new[..at].iter().any(|c| c.starts_with("truncate_to(")),
+            "the sync follows the truncation to the proven prefix: {new:?}"
+        );
+        assert!(new.iter().all(|c| !c.contains("wal")), "no log is touched: {new:?}");
+    }
+
+    // The distractor of the test above: `Normal` does not sync the partial in `stage_file`.
+    #[test]
+    fn log_free_under_normal_does_not_sync_the_partial() {
+        let (fs, root) = ckpt_fs(5 * MIB);
+        let src = fs.read_file("/src").unwrap();
+        fs.write_file(PARTIAL, &src[..3 * MIB]);
+        let mark = fs.calls().len();
+        staged_of(stage_log_free(&fs, &root, Durability::Normal, &no_heartbeat));
         let calls = fs.calls();
         assert!(
-            calls[mark..].iter().any(|c| c == &format!("sync_all({PARTIAL})")),
+            !calls[mark..].iter().any(|c| c == &format!("sync_all({PARTIAL})")),
             "{:?}",
             &calls[mark..]
         );
+    }
+
+    // Mutant: the stage-level gate `len >= min_len` becomes `len > min_len` (a source of exactly `min_len` resumes).
+    #[test]
+    fn log_free_at_exactly_min_len_reads_and_keeps_the_partial() {
+        let (fs, root) = ckpt_fs(MIB);
+        let src = fs.read_file("/src").unwrap();
+        fs.write_file(PARTIAL, &src);
+        let staged = staged_of(stage_log_free(&fs, &root, Durability::Normal, &no_heartbeat));
+        assert_eq!(staged.reused, MIB as u64);
+        assert_eq!(staged.bytes_copied, 0);
+        assert!(fs.bytes_read(PARTIAL) > 0, "the partial was read to prove it");
+    }
+
+    // The other side of the boundary: one byte under `min_len` never reads the partial.
+    #[test]
+    fn log_free_one_byte_under_min_len_does_not_read_the_partial() {
+        let (fs, root) = ckpt_fs(MIB - 1);
+        let src = fs.read_file("/src").unwrap();
+        fs.write_file(PARTIAL, &src);
+        let staged = staged_of(stage_log_free(&fs, &root, Durability::Normal, &no_heartbeat));
+        assert_eq!(staged.reused, 0);
+        assert_eq!(fs.bytes_read(PARTIAL), 0);
     }
 
     #[test]
