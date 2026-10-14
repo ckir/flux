@@ -2,7 +2,7 @@
 
 Release scope follows spec §77–§80; the build order follows spec §81. The State
 column below is the build order's progress, each state naming the merged pull
-requests behind it (checked 2026-09-26).
+requests behind it (checked 2026-10-14 against `main` at `5502b44`, PR #92).
 
 ## Release scope
 
@@ -38,15 +38,15 @@ packed small-file transfers
 | Phase | Deliverable | State |
 |---|---|---|
 | 1 | Workspace — crates created and compiling | **done** (no PR — direct commit `7d86f7b`, before the PR workflow started) |
-| 2 | Portable copy — files, directories, metadata, errors, statistics | in progress (PR #32: files, metadata, errors; PR #48: single-file copies write through a directory handle; directories and full statistics not merged) |
-| 3 | Streaming — scanner, selection, bounded queues, planner, workers; demonstrate bounded memory | not started |
-| 4 | Deterministic topology — ordered traversal, `FileIdentity`, hardlink canonicalization, persistent topology store, excluded members, dependency-aware links | in progress (PR #36, #37: ordered traversal and `FileIdentity`; hardlink canonicalization, topology store, excluded members and dependency-aware links not merged) |
-| 5 | Persistent operation state — manifest, operation ID, lock, heartbeat, state database, partial-file mapping, crash recovery, cleanup | not started |
-| 6 | Verification — BLAKE3, source-stream hashing, destination verification, `verify` command | not started |
-| 7 | Safety — filesystem identity, destination nesting, mount boundaries, symlink policy, source mutation | in progress (PR #32: source mutation, symlink not followed; PR #48: filesystem identity gate; destination nesting and mount boundaries not merged) |
-| 8 | UX — progress, JSON, logging, dry-run, statistics | not started |
-| 9 | Advanced filesystem operations — resume, checkpoint validation, atomic replacement, capacity planning, sparse, reflink | not started |
-| 10 | Performance — worker count, queue depth, buffer size, filesystem APIs, metadata calls, topology lookup, small-file scheduling | not started |
+| 2 | Portable copy — files, directories, metadata, errors, statistics | **done** for files and trees (PR #32: files, metadata, errors; PR #48: single-file copies write through a directory handle; PR #52, #53: `copy_tree` and `flux copy` on folders; the `--json` report carries the statistics). Advanced metadata (xattrs, ACLs) is 0.3 scope, not built |
+| 3 | Streaming — scanner, selection, bounded queues, planner, workers; demonstrate bounded memory | in progress (PR #37: the ordered walk; PR #52: the sequential tree copy). Selection and filtering, bounded queues, a planner and parallel copy workers are not built: the walk and the copy are sequential |
+| 4 | Deterministic topology — ordered traversal, `FileIdentity`, hardlink canonicalization, persistent topology store, excluded members, dependency-aware links | in progress (PR #36, #37: ordered traversal and `FileIdentity`; hardlink canonicalization, the persistent topology store, excluded members and dependency-aware links not merged) |
+| 5 | Persistent operation state — manifest, operation ID, lock, heartbeat, state database, partial-file mapping, crash recovery, cleanup | **done** (PR #57: the destination lock and operation state; PR #59: state version 2, `cleanup_pending` and the heartbeat; PR #63: claim records; PR #68, #89, #91: `--resume`; PR #74: `flux cleanup`; PR #78: recoverable publication under strict durability). The persistent topology store is phase 4. Two deliberate gaps: Flux installs no SIGINT/SIGTERM handler (an interrupt is a crash, recovered by the next run), and §23's recorded temporary path and `RESUME_INVALID` became a name derived from the operation id and a reported recopy (cut 9f-1, Ruling 2) |
+| 6 | Verification — BLAKE3, source-stream hashing, destination verification, `verify` command | in progress (BLAKE3 in `flux-hash`; a resume verifies and skips the files a prior run completed, and `--resume-verify=full` hashes a partial against the source: PR #89, #91). The `verify` command, destination verification on a plain copy and the verification levels are not built (`--json` reports `verify_level: none`) |
+| 7 | Safety — filesystem identity, destination nesting, mount boundaries, symlink policy, source mutation | in progress (PR #32: source mutation, symlink not followed; PR #36, #48: filesystem identity gate; PR #62: destination containment and refusing a destination mount root). Mount boundaries during the walk (§42) are not enforced (TODO.md) |
+| 8 | UX — progress, JSON, logging, dry-run, statistics | in progress (`--json` and the run report with statistics). Progress, logging and dry-run for `copy` are not built (`flux-ui` is an empty crate) |
+| 9 | Advanced filesystem operations — resume, checkpoint validation, atomic replacement, capacity planning, sparse, reflink | in progress (PR #63: atomic replacement under claim records, with `--overwrite`, `--update` and `--skip-existing`; PR #68, #89, #91: resume with chunk checkpoint validation for trees and a single file). Capacity planning, sparse files and reflinks are not built |
+| 10 | Performance — worker count, queue depth, buffer size, filesystem APIs, metadata calls, topology lookup, small-file scheduling | in progress (PR #67: buffer sizing; PR #60, #80: CI benchmarks and criterion benches; PR #82, #84: group commit and a parallel data-sync barrier for strict durability). Worker count, queue depth, filesystem APIs, small-file scheduling and topology lookup are not done |
 
 Phase 10 is measured, not guessed: performance regressions must be benchmarked
 before and after (spec §76).
