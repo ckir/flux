@@ -559,7 +559,6 @@ the spec's numbers, 9-10 were learned during execution).
 
 ## Cut 9g open (single-file resume; triaged from the anomalies inbox 2026-10-14)
 
-- [ ] Kill after publish, before the record is finalised: a single-file `--resume` finds the target complete and the record still Transferring, prints "resuming operation <id>" and re-copies the whole file (`files_overwritten: 1`, no level line; 4 GiB took about 11.7 s, twice a fresh copy). No partial exists, so it is not a 9g regression; a published-and-equal target could be recognised instead. Found by the 9g timing run.
 - [ ] `plan_resume` hashes through `parent.open_read(temp)` without comparing that handle's identity to `partial_meta.identity` (only `open_existing` checks it), so a concurrent double swap of the partial name could keep an unproven prefix. Pre-existing (same code as 9f-2 `full`), `copy.rs` near line 610; needs a second writer on the destination directory.
 - [ ] Tooling (clavity agy driver, not flux code): the `[13b] TRUNCATED REPLY` flag fired falsely on complete `adversarial-panel-review` replies (twice), and `[13b] ECHO MISSING` fired when agy stripped the backticks from the quoted last line (once per capstone). Workaround: read the reply file tail, one permitted re-ask. Report upstream if it recurs.
 
@@ -1040,3 +1039,14 @@ item was, not only in a commit message.
 - `DONE` **`_typos.toml` excludes the spec by its literal file name** (was under "Repository and CI
   hygiene"). Fixed by this branch's Task 1, commit `2f25822`: `_typos.toml`'s exclude is now the glob
   `"FLUX_FULL_UPDATED_SPEC_V*.md"`.
+- `CLOSED-BY-RULING` **Kill after publish, before the record is finalised (single file), 2026-10-14.** A SIGKILL
+  between the publishing rename and the COMPLETED record write leaves the target complete, no partial and the
+  record Transferring; `--resume` then re-copies the whole file (measured: 4 GiB, `files_overwritten: 1`, no level
+  line, 11.7 s, twice a fresh copy), replacing an identical file atomically, so the result is correct. Owner ruling
+  (agy consulted first, ALIGNED): accept. The window is milliseconds, and the same on-disk state also arises from a
+  crash before the temporary exists over a pre-existing target, so "Transferring, no partial, target present" cannot
+  be read as "published". Rejected: an intent record before the rename (adds a synchronous record write to every
+  single-file copy, and under `--durability normal` an identity match does not prove the bytes survived a power
+  loss), hashing both sides on resume (reads everything for a state that is often an old, different target), and a
+  size-and-mtime match (trusts unproven bytes). **Reopen if:** a measured case shows the window is hit routinely, or
+  the single file gains a record write before the rename for another reason.
