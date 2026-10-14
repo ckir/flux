@@ -4039,6 +4039,52 @@ mod tests {
         assert_eq!(fs.read_file(PARTIAL), None);
     }
 
+    // Mutant: the skip branch's sweep drops its own section 99 `guard()` (a removal is a destination mutation, so a
+    // process that lost the lock must not make it). Guard call 1 is `stage_file`'s opening check, call 2 the sweep's.
+    #[test]
+    fn log_free_skip_sweep_checks_the_lock_before_removing_the_partial() {
+        let (fs, root) = ckpt_fs(5 * MIB);
+        let src = fs.read_file("/src").unwrap();
+        fs.write_file("/dst", b"existing");
+        fs.write_file(PARTIAL, &src[..3 * MIB]);
+        let mark = fs.calls().len();
+        let mut o = opts();
+        o.existing = flux_fs::ExistingPolicy::SkipExisting;
+        let calls = std::cell::Cell::new(0u32);
+        let guard = || {
+            calls.set(calls.get() + 1);
+            if calls.get() >= 2 {
+                Err(FsError::new(Code::IoError, std::io::Error::other("the lock is lost")))
+            } else {
+                Ok(())
+            }
+        };
+        let e = stage_file(
+            &fs,
+            Path::new("/src"),
+            &root,
+            OsStr::new("dst"),
+            &o,
+            &guard,
+            &no_heartbeat,
+            &no_before_create,
+            SyncAt::Staging,
+            Some(Hook::LogFree { min_len: MIB as u64 }),
+        )
+        .err()
+        .expect("the lost lock stops the sweep");
+        assert_eq!(e.step, CopyStep::Create);
+        assert_eq!(calls.get(), 2);
+        assert_eq!(fs.read_file(PARTIAL).expect("the partial is still there"), src[..3 * MIB]);
+        assert_eq!(fs.read_file("/dst").unwrap(), b"existing");
+        let all = fs.calls();
+        assert!(
+            all[mark..].iter().all(|c| !c.starts_with("remove_file(")),
+            "nothing was removed: {:?}",
+            &all[mark..]
+        );
+    }
+
     // Mutant: `plan_resume` calls `load` for `LogFree` (returns early with no log, so `reused == 0`).
     #[test]
     fn log_free_resumes_the_equal_prefix_of_a_partial_with_no_log() {
