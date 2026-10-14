@@ -3234,6 +3234,16 @@ fn a_resume_that_fails_before_transferring_can_be_resumed_again() {
 }
 
 fn file_prior3(fs: &FaultFs, n: u8, source_identity: Option<&str>) -> OperationState {
+    file_prior3_with(fs, n, source_identity, &opts())
+}
+
+/// `file_prior3` for a prior whose recorded options are `o`.
+fn file_prior3_with(
+    fs: &FaultFs,
+    n: u8,
+    source_identity: Option<&str>,
+    o: &CopyOptions,
+) -> OperationState {
     let src = identity_text(fs.metadata(Path::new("/src/a")).unwrap().identity);
     let shown = source_identity.map_or(src, str::to_string);
     let fields = crate::state::FileFields {
@@ -3254,7 +3264,7 @@ fn file_prior3(fs: &FaultFs, n: u8, source_identity: Option<&str>) -> OperationS
             source_identity: shown,
             destination_prefix: native_hex(Path::new("t")),
         }],
-        Options::of(&opts()),
+        Options::of(o),
     );
     let state = OperationState {
         state: OpState::Failed,
@@ -7194,5 +7204,195 @@ mod checkpointing {
             &calls[mark..]
         );
         assert!(quarantined(&r).is_empty(), "{:?}", r.warnings);
+    }
+
+    // ---- cut 9g task 2: a single-file resume continues its proven prefix ----
+
+    use crate::Discard;
+
+    /// The partial path of the prior `n`'s single-file copy of `/p/t`.
+    fn file_partial(n: u8) -> String {
+        format!("/p/t.flux-partial.{}", id(n))
+    }
+
+    /// `/src/a` of `len` bytes and an adopted-able prior 5 (`file_prior3` reads `/src/a`, so it comes first).
+    fn file_fixture(len: usize) -> FaultFs {
+        let fs = fake();
+        fs.write_file("/src/a", &pattern(len));
+        file_prior3(&fs, 5, None);
+        fs
+    }
+
+    fn resume_file(
+        fs: &FaultFs,
+        c: &RunConfig,
+        o: &CopyOptions,
+        p: CheckpointPolicy,
+    ) -> Run<Result<flux_fs::Outcome, CopyError>> {
+        file_with(fs, Path::new("/src/a"), Path::new("/p/t"), o, c, p)
+    }
+
+    #[test]
+    fn a_single_file_resume_keeps_the_proven_prefix_of_its_partial() {
+        let fs = file_fixture(5 * MIB);
+        fs.write_file(file_partial(5), &pattern(5 * MIB)[..3 * MIB]);
+        let r = resume_file(&fs, &resume(), &opts(), lazy(Durability::Normal));
+        assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+        assert_eq!(
+            r.file_resume,
+            Some(FileResume {
+                reused: 3 * MIB as u64,
+                recopied: 2 * MIB as u64,
+                discard: Some(Discard::PartialShorter { kept: 3 * MIB as u64 }),
+            })
+        );
+        assert_eq!(fs.read_file("/p/t").unwrap(), pattern(5 * MIB));
+    }
+
+    #[test]
+    fn a_single_file_resume_reports_a_mismatch_inside_the_partial() {
+        let fs = file_fixture(5 * MIB);
+        let mut part = pattern(5 * MIB)[..3 * MIB].to_vec();
+        part[2 * MIB + 5] ^= 0xff;
+        fs.write_file(file_partial(5), &part);
+        let r = resume_file(&fs, &resume(), &opts(), lazy(Durability::Normal));
+        assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+        let fr = r.file_resume.expect("a resume was reported");
+        assert_eq!(fr.discard, Some(Discard::MismatchAt(2 * MIB as u64)));
+        assert_eq!(fr.reused, 2 * MIB as u64);
+        assert_eq!(fs.read_file("/p/t").unwrap(), pattern(5 * MIB));
+    }
+
+    #[test]
+    fn a_single_file_resume_with_no_partial_reports_nothing() {
+        let fs = file_fixture(5 * MIB);
+        let r = resume_file(&fs, &resume(), &opts(), lazy(Durability::Normal));
+        assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+        assert_eq!(r.file_resume, None);
+        assert_eq!(fs.read_file("/p/t").unwrap(), pattern(5 * MIB));
+    }
+
+    #[test]
+    fn a_single_file_resume_below_min_len_reports_nothing() {
+        let fs = file_fixture(MIB / 2);
+        fs.write_file(file_partial(5), b"half");
+        let r = resume_file(&fs, &resume(), &opts(), lazy(Durability::Normal));
+        assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+        assert_eq!(r.file_resume, None);
+        assert_eq!(fs.read_file("/p/t").unwrap(), pattern(MIB / 2));
+        assert!(!fs.exists(file_partial(5)), "the partial is gone");
+    }
+
+    #[test]
+    fn a_run_that_adopted_nothing_reports_no_file_resume() {
+        let fs = fake();
+        fs.write_file("/src/a", &pattern(5 * MIB));
+        let other = pattern(5 * MIB)[..3 * MIB].to_vec();
+        fs.write_file(file_partial(9), &other);
+        // Under the run's own id too: were the run to continue partials without adopting, this one would be reused.
+        fs.write_file(format!("/p/t.flux-partial.{ID}"), &other);
+        let r = resume_file(&fs, &resume(), &opts(), lazy(Durability::Normal));
+        assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+        assert_eq!(r.resumed, Some(ResumeNote::StartedNew));
+        assert_eq!(r.file_resume, None);
+        assert_eq!(fs.read_file(file_partial(9)).as_deref(), Some(other.as_slice()), "untouched");
+    }
+
+    #[test]
+    fn a_fresh_single_file_run_never_reads_a_partial() {
+        // No prior record (a fresh run over a FAILED prior is refused), and the stale partial sits under the run's
+        // OWN id, the one name a wrongly log-free run would find and continue.
+        let fs = fake();
+        fs.write_file("/src/a", &pattern(5 * MIB));
+        let stale = format!("/p/t.flux-partial.{ID}");
+        fs.write_file(&stale, &pattern(5 * MIB)[..3 * MIB]);
+        let r = resume_file(&fs, &cfg(), &opts(), lazy(Durability::Normal));
+        assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+        assert_eq!(r.file_resume, None);
+        let Some(Ok(o)) = &r.copy else { unreachable!() };
+        assert_eq!(o.bytes_copied, 5 * MIB as u64, "recopied from byte 0, nothing reused");
+        assert_eq!(fs.bytes_read(&stale), 0);
+        assert_eq!(fs.read_file("/p/t").unwrap(), pattern(5 * MIB));
+    }
+
+    #[test]
+    fn a_single_file_resume_under_strict_publishes_equal_bytes() {
+        let fs = file_fixture(5 * MIB);
+        fs.write_file(file_partial(5), &pattern(5 * MIB)[..3 * MIB]);
+        let o = CopyOptions { durability: Durability::Strict, ..opts() };
+        let r = resume_file(&fs, &resume(), &o, lazy(Durability::Strict));
+        assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+        assert_eq!(fs.read_file("/p/t").unwrap(), pattern(5 * MIB));
+    }
+
+    // ---- cut 9g final fix wave ----
+
+    // Mutant: `file_with` does not sweep a skipped resume's partial (the sweep lives in `stage_file`'s skip branch).
+    #[test]
+    fn a_skipped_single_file_resume_leaves_no_partial() {
+        let skip = CopyOptions { existing: flux_fs::ExistingPolicy::SkipExisting, ..opts() };
+        let fs = fake();
+        fs.write_file("/src/a", &pattern(5 * MIB));
+        file_prior3_with(&fs, 5, None, &skip);
+        fs.write_file("/p/t", b"existing");
+        fs.write_file(file_partial(5), &pattern(5 * MIB)[..3 * MIB]);
+        let r = resume_file(&fs, &resume(), &skip, lazy(Durability::Normal));
+        assert!(r.stop.is_none(), "{:?}", r.stop);
+        assert!(matches!(&r.copy, Some(Ok(o)) if o.skipped), "{:?}", r.copy);
+        assert!(matches!(r.resumed, Some(ResumeNote::Adopted { .. })), "{:?}", r.resumed);
+        assert!(!fs.exists(file_partial(5)), "the partial is gone");
+        assert_eq!(fs.read_file("/p/t").unwrap(), b"existing");
+        assert_eq!(r.file_resume, None);
+    }
+
+    // Mutant: `reuse.reused > 0 || reuse.discard.is_some()` -> `&&`.
+    #[test]
+    fn a_single_file_resume_with_an_empty_partial_reports_it_shorter() {
+        let fs = file_fixture(5 * MIB);
+        fs.write_file(file_partial(5), &[]);
+        let r = resume_file(&fs, &resume(), &opts(), lazy(Durability::Normal));
+        assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+        assert_eq!(
+            r.file_resume,
+            Some(FileResume {
+                reused: 0,
+                recopied: 5 * MIB as u64,
+                discard: Some(Discard::PartialShorter { kept: 0 }),
+            })
+        );
+        assert_eq!(fs.read_file("/p/t").unwrap(), pattern(5 * MIB));
+    }
+
+    // Mutant: `||` -> `&&` (a whole-source partial reports reuse with no discard). Also spec 6.4 under Strict.
+    #[test]
+    fn a_single_file_resume_with_a_partial_longer_than_the_source_proves_the_whole_source_under_strict()
+     {
+        let len = 3 * MIB + 12345;
+        let fs = file_fixture(len);
+        let mut part = pattern(len);
+        part.extend(vec![0xEE; 2 * MIB]);
+        fs.write_file(file_partial(5), &part);
+        let o = CopyOptions { durability: Durability::Strict, ..opts() };
+        let r = resume_file(&fs, &resume(), &o, lazy(Durability::Strict));
+        assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+        assert_eq!(
+            r.file_resume,
+            Some(FileResume { reused: len as u64, recopied: 0, discard: None })
+        );
+        assert_eq!(fs.read_file("/p/t").unwrap(), pattern(len));
+    }
+
+    // Mutant: `run::file`'s gate `m.len >= policy.min_len` -> `>`.
+    #[test]
+    fn a_single_file_resume_of_exactly_min_len_continues_its_partial() {
+        let fs = file_fixture(MIB);
+        fs.write_file(file_partial(5), &pattern(MIB));
+        let r = resume_file(&fs, &resume(), &opts(), lazy(Durability::Normal));
+        assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+        assert_eq!(
+            r.file_resume,
+            Some(FileResume { reused: MIB as u64, recopied: 0, discard: None })
+        );
+        assert_eq!(fs.read_file("/p/t").unwrap(), pattern(MIB));
     }
 }

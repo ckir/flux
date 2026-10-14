@@ -168,3 +168,30 @@ pub(crate) struct FileCkpt<'a, D: DirHandle + Send + 'static> {
     pub file_id: Vec<u8>,
     pub destination: Vec<u8>,
 }
+
+/// Cut 9g: what a file checkpoints through.
+pub(crate) enum Hook<'r, 'a, D: DirHandle + Send + 'static> {
+    /// A WAL-backed context (tree files, cuts 9f-1/9f-2).
+    Logged(&'r FileCkpt<'a, D>),
+    /// No log (a single file). `plan_resume` runs as `full`; no `FileSink` exists.
+    LogFree { min_len: u64 },
+}
+
+// Manual impls: a derive would demand `D: Clone`, and the hook holds only a reference.
+impl<D: DirHandle + Send + 'static> Clone for Hook<'_, '_, D> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<D: DirHandle + Send + 'static> Copy for Hook<'_, '_, D> {}
+
+impl<D: DirHandle + Send + 'static> Hook<'_, '_, D> {
+    /// The smallest source length that checkpoints (and so resumes).
+    pub(crate) fn min_len(&self) -> u64 {
+        match self {
+            Hook::Logged(fc) => fc.run.min_len(),
+            Hook::LogFree { min_len } => *min_len,
+        }
+    }
+}

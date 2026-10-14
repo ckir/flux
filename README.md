@@ -29,7 +29,7 @@ Windows with a warm one, and a pair appears only once a calibration shows its ra
 - Hardlink topology preservation, including exclusion-aware dependencies
 - Robust resume after interruption, with checkpoint validation: in a tree copy, a file of 64 MiB or more continues after the
   longest leading run of chunks whose digests match on both the source and the destination, and everything else is recopied; a single-file
-  copy still recopies a half-copied file; under `--durability=normal` a checkpoint is advisory and is validated against the
+  copy of 64 MiB or more continues a half-copied file from its proven prefix (the partial is re-read and hashed against the source); under `--durability=normal` a checkpoint is advisory and is validated against the
   data before it is trusted
 - Source-mutation detection
 - Atomic publication where the filesystem allows it

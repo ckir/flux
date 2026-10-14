@@ -148,6 +148,7 @@ impl Report {
             None => return Self::pre_engine(false),
         };
         rep.errors += u64::from(run.stop.is_some());
+        rep.resume_verify = run.file_resume.as_ref().map(|_| "full");
         rep
     }
 
@@ -421,6 +422,25 @@ pub fn resume_lines<T>(run: &Run<T>, files_resumed: u64) -> Vec<String> {
     v
 }
 
+/// One wording for why checkpoints were discarded, shared by the tree and single-file builders.
+fn discard_why(reason: &Discard) -> String {
+    match reason {
+        Discard::SourceChanged(what) => format!("source changed ({what})"),
+        Discard::PartialMissing => "partial missing".to_string(),
+        Discard::MismatchAt(at) => format!("mismatch at offset {at}"),
+        Discard::PartialShorter { kept } => {
+            format!("partial shorter than its checkpoints (kept {kept} bytes)")
+        }
+        Discard::Unreadable(why) => format!("checkpoints unreadable: {why}"),
+    }
+}
+
+/// The `--durability=normal` closing note, printed after a `resumed` or `checkpoints discarded` line.
+const ADVISORY_NOTE: &str = "note: --durability=normal checkpoints are advisory; every reused chunk was validated against the source and the destination";
+
+/// The level line text of `--resume-verify=full`.
+const FULL_LEVEL_LINE: &str = "resume verification: full (source and partial re-read and hashed)";
+
 /// Cut 9f-1 (spec decision 12): what a checkpointed run reused and discarded. One `resumed` line per partially resumed
 /// file, one `checkpoints discarded` line per file whose checkpoints were discarded, and, under Normal durability and
 /// only when something was reused or discarded, a closing note. An uncheckpointed run prints nothing.
@@ -435,24 +455,42 @@ pub fn checkpoint_lines(outcome: &TreeOutcome, normal_durability: bool) -> Vec<S
         ));
     }
     for d in &outcome.checkpoint_discards {
-        let why = match &d.reason {
-            Discard::SourceChanged(what) => format!("source changed ({what})"),
-            Discard::PartialMissing => "partial missing".to_string(),
-            Discard::MismatchAt(at) => format!("mismatch at offset {at}"),
-            Discard::PartialShorter { kept } => {
-                format!("partial shorter than its checkpoints (kept {kept} bytes)")
-            }
-            Discard::Unreadable(why) => format!("checkpoints unreadable: {why}"),
-        };
+        let why = discard_why(&d.reason);
         v.push(format!("checkpoints discarded for {}: {why}", rel(&d.path)));
     }
     if normal_durability && !v.is_empty() {
-        v.push(
-            "note: --durability=normal checkpoints are advisory; every reused chunk was validated against the source and the destination"
-                .to_string(),
-        );
+        v.push(ADVISORY_NOTE.to_string());
     }
     v
+}
+
+/// Cut 9g: `checkpoint_lines` for a single file's resume; `target` is the path as the user gave it.
+pub fn file_checkpoint_lines(
+    run: &Run<Result<Outcome, CopyError>>,
+    target: &str,
+    normal_durability: bool,
+) -> Vec<String> {
+    let mut v = Vec::new();
+    if let Some(fr) = &run.file_resume {
+        if fr.reused > 0 {
+            v.push(format!(
+                "resumed {target}: reused {} bytes, recopied {} bytes",
+                fr.reused, fr.recopied
+            ));
+        }
+        if let Some(d) = &fr.discard {
+            v.push(format!("checkpoints discarded for {target}: {}", discard_why(d)));
+        }
+    }
+    if normal_durability && !v.is_empty() {
+        v.push(ADVISORY_NOTE.to_string());
+    }
+    v
+}
+
+/// Cut 9g: the level line of a single-file resume, printed iff a log-free proof ran.
+pub fn file_resume_verify_lines(run: &Run<Result<Outcome, CopyError>>) -> Vec<String> {
+    if run.file_resume.is_some() { vec![FULL_LEVEL_LINE.to_string()] } else { Vec::new() }
 }
 
 /// Cut 9f-2: whether `--resume-verify=full` did something a user can see: it re-read a partial that was then resumed or
@@ -463,11 +501,7 @@ pub fn resume_verify_used(outcome: &TreeOutcome, full: bool) -> bool {
 
 /// Cut 9f-2: the level line, printed after `checkpoint_lines` when `resume_verify_used`.
 pub fn resume_verify_lines(outcome: &TreeOutcome, full: bool) -> Vec<String> {
-    if resume_verify_used(outcome, full) {
-        vec!["resume verification: full (source and partial re-read and hashed)".to_string()]
-    } else {
-        Vec::new()
-    }
+    if resume_verify_used(outcome, full) { vec![FULL_LEVEL_LINE.to_string()] } else { Vec::new() }
 }
 
 /// Cut 9f-1: the line that follows an aborting error when it is a checkpoint-write failure.
@@ -1018,6 +1052,86 @@ mod tests {
         );
     }
 
+    fn file_run_with(
+        file_resume: Option<flux_core::run::FileResume>,
+    ) -> Run<Result<Outcome, CopyError>> {
+        Run {
+            copy: Some(Ok(Outcome {
+                bytes_copied: 1,
+                metadata_failures: Vec::new(),
+                identity_degraded: None,
+                published_identity: flux_fs::FileIdentity::Unavailable,
+                skipped: false,
+            })),
+            stop: None,
+            warnings: Vec::new(),
+            resumed: None,
+            beat_gap_max: std::time::Duration::ZERO,
+            file_resume,
+        }
+    }
+
+    #[test]
+    fn file_checkpoint_lines_name_the_reuse_and_the_discard() {
+        use flux_core::run::FileResume;
+        let run = file_run_with(Some(FileResume {
+            reused: 3145728,
+            recopied: 2097152,
+            discard: Some(Discard::PartialShorter { kept: 3145728 }),
+        }));
+        let strict = file_checkpoint_lines(&run, "t", false);
+        assert_eq!(
+            strict,
+            vec![
+                "resumed t: reused 3145728 bytes, recopied 2097152 bytes",
+                "checkpoints discarded for t: partial shorter than its checkpoints (kept 3145728 bytes)",
+            ]
+        );
+        let normal = file_checkpoint_lines(&run, "t", true);
+        assert_eq!(&normal[..2], &strict[..]);
+        assert_eq!(
+            &normal[2..],
+            [
+                "note: --durability=normal checkpoints are advisory; every reused chunk was validated against the source and the destination"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_file_discard_with_no_reuse_prints_the_mismatch_offset_and_no_resumed_line() {
+        use flux_core::run::FileResume;
+        let run = file_run_with(Some(FileResume {
+            reused: 0,
+            recopied: 9,
+            discard: Some(Discard::MismatchAt(7)),
+        }));
+        assert_eq!(
+            file_checkpoint_lines(&run, "t", false),
+            vec!["checkpoints discarded for t: mismatch at offset 7"]
+        );
+    }
+
+    #[test]
+    fn file_checkpoint_lines_print_nothing_without_a_file_resume() {
+        let run = file_run_with(None);
+        assert!(file_checkpoint_lines(&run, "t", true).is_empty());
+        assert!(file_checkpoint_lines(&run, "t", false).is_empty());
+    }
+
+    #[test]
+    fn the_level_line_and_json_field_appear_exactly_when_a_single_file_resume_ran() {
+        use flux_core::run::FileResume;
+        let some = file_run_with(Some(FileResume { reused: 1, recopied: 0, discard: None }));
+        assert_eq!(
+            file_resume_verify_lines(&some),
+            vec!["resume verification: full (source and partial re-read and hashed)"]
+        );
+        assert_eq!(Report::file_run(&some, false, 1).resume_verify, Some("full"));
+        let none = file_run_with(None);
+        assert!(file_resume_verify_lines(&none).is_empty());
+        assert_eq!(Report::file_run(&none, false, 1).resume_verify, None);
+    }
+
     #[test]
     fn an_uncheckpointed_resume_report_is_unchanged() {
         assert!(checkpoint_lines(&TreeOutcome::default(), true).is_empty());
@@ -1095,6 +1209,7 @@ mod tests {
             warnings: Vec::new(),
             resumed,
             beat_gap_max: std::time::Duration::ZERO,
+            file_resume: None,
         };
         assert_eq!(
             resume_lines(&with(Some(ResumeNote::StartedNew)), 0),
@@ -1165,6 +1280,7 @@ mod tests {
             warnings: vec![kept(), kept()],
             resumed: None,
             beat_gap_max: std::time::Duration::ZERO,
+            file_resume: None,
         };
         let lines = run_lines(&run);
         assert_eq!(lines.len(), 3, "{lines:?}");
@@ -1179,6 +1295,7 @@ mod tests {
             warnings: vec![kept()],
             resumed: None,
             beat_gap_max: std::time::Duration::ZERO,
+            file_resume: None,
         };
         assert_eq!(run_lines(&quiet).len(), 1, "warnings print without a stop too");
     }
@@ -1191,6 +1308,7 @@ mod tests {
             warnings: Vec::new(),
             resumed: None,
             beat_gap_max: std::time::Duration::ZERO,
+            file_resume: None,
         };
         let clean = Report::tree_run(&run(Some(Ok(TreeOutcome::default())), None), 1);
         assert_eq!(clean.errors, 0);
@@ -1223,6 +1341,7 @@ mod tests {
             warnings: Vec::new(),
             resumed: None,
             beat_gap_max: std::time::Duration::ZERO,
+            file_resume: None,
         };
         let copied = || {
             Ok(Outcome {

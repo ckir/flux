@@ -217,6 +217,7 @@ mod tests {
             warnings: Vec::new(),
             resumed: None,
             beat_gap_max: std::time::Duration::ZERO,
+            file_resume: None,
         };
         assert_eq!(for_tree_run(&run(None, Some(refused(false)))), REFUSED);
         assert_eq!(for_tree_run(&run(None, Some(refused(true)))), FAILED);
@@ -235,6 +236,7 @@ mod tests {
             warnings: Vec::new(),
             resumed: None,
             beat_gap_max: std::time::Duration::ZERO,
+            file_resume: None,
         };
         let copied = || {
             Ok(Outcome {
