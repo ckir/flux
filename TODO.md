@@ -563,6 +563,10 @@ the spec's numbers, 9-10 were learned during execution).
 - [ ] `plan_resume` hashes through `parent.open_read(temp)` without comparing that handle's identity to `partial_meta.identity` (only `open_existing` checks it), so a concurrent double swap of the partial name could keep an unproven prefix. Pre-existing (same code as 9f-2 `full`), `copy.rs` near line 610; needs a second writer on the destination directory.
 - [ ] Tooling (clavity agy driver, not flux code): the `[13b] TRUNCATED REPLY` flag fired falsely on complete `adversarial-panel-review` replies (twice), and `[13b] ECHO MISSING` fired when agy stripped the backticks from the quoted last line (once per capstone). Workaround: read the reply file tail, one permitted re-ask. Report upstream if it recurs.
 
+## Spec gaps found by the ROADMAP check (2026-10-14)
+
+- [ ] **No SIGINT / SIGTERM / Windows console-control handler (spec §56).** §56 lists SIGINT and process termination among what Flux must handle; no crate installs a handler (searched `crates/` for sigint, ctrl_c, SetConsoleCtrlHandler, signal-hook, tokio::signal: nothing). A Ctrl-C therefore kills the process like a crash: the record stays TRANSFERRING, the destination lock stays held until the next run takes it over, and a partial is left. The next `--resume` or `--restart` recovers all of it, so nothing is lost, but the operator gets no clean stop. A handler would set a cancel flag that the existing guard and heartbeat checks already poll, stop at the next one, keep the partial, write the record FAILED (resumable) and release the lock, then exit with a signal-specific code. Needs its own design (exit codes, what a second signal does, Windows semantics), so an AGY-FIRST fork before any plan.
+
 ## Cut 9d debt
 
 - [ ] Keep directory handles alive across `DirEnd` so a tree with one small file per directory batches (limit 1 fix).
