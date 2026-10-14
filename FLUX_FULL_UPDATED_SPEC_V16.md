@@ -2990,6 +2990,16 @@ Successful operations must clean up their operation workspace.
 Abandoned operations remain resumable until explicitly or automatically
 garbage-collected.
 
+**56.1 Signals.** The `flux` binary installs no handler for SIGINT,
+SIGTERM, SIGHUP or the Windows console-control events. Such a signal
+ends the process as a crash does, and this section's crash recovery
+(the next `--resume` or `--restart`) is how it is handled: the lock is
+released by the operating system, a staged partial is kept (a graceful
+stop through the engine's error path would delete it), and the operation record stays `TRANSFERRING`. No exit status
+is defined for a signal; a shell reports 128 plus the signal number.
+Sections 99, 132 and 187 (cancellation to `PAUSED`) describe a cancel
+request made through the engine and are not reached by a signal.
+
 ------------------------------------------------------------------------
 
 # 57. Operation Identity
@@ -6216,6 +6226,11 @@ active-operation ownership.
 ------------------------------------------------------------------------
 
 # 132. Cancellation
+
+This section describes a cancel request made through the engine. The CLI
+does not translate a signal into one (Section 56.1), and no engine entry
+point issues a cancel request yet; `PAUSED` is not written by any
+version.
 
 On normal cancellation:
 

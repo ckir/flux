@@ -562,10 +562,6 @@ the spec's numbers, 9-10 were learned during execution).
 - [ ] `plan_resume` hashes through `parent.open_read(temp)` without comparing that handle's identity to `partial_meta.identity` (only `open_existing` checks it), so a concurrent double swap of the partial name could keep an unproven prefix. Pre-existing (same code as 9f-2 `full`), `copy.rs` near line 610; needs a second writer on the destination directory.
 - [ ] Tooling (clavity agy driver, not flux code): the `[13b] TRUNCATED REPLY` flag fired falsely on complete `adversarial-panel-review` replies (twice), and `[13b] ECHO MISSING` fired when agy stripped the backticks from the quoted last line (once per capstone). Workaround: read the reply file tail, one permitted re-ask. Report upstream if it recurs.
 
-## Spec gaps found by the ROADMAP check (2026-10-14)
-
-- [ ] **No SIGINT / SIGTERM / Windows console-control handler (spec §56).** §56 lists SIGINT and process termination among what Flux must handle; no crate installs a handler (searched `crates/` for sigint, ctrl_c, SetConsoleCtrlHandler, signal-hook, tokio::signal: nothing). A Ctrl-C therefore kills the process like a crash: the record stays TRANSFERRING, the destination lock file is left behind for the next run to take over (not measured), and a partial is left. The next `--resume` or `--restart` recovers all of it, so nothing is lost, but the operator gets no clean stop. A handler would set a cancel flag that the guard and heartbeat checks (which today poll only the lock) would also poll, stop at the next one, keep the partial, write the record FAILED (resumable) and release the lock, then exit with a signal-specific code. Needs its own design (exit codes, what a second signal does, Windows semantics), so an AGY-FIRST fork before any plan.
-
 ## Cut 9d debt
 
 - [ ] Keep directory handles alive across `DirEnd` so a tree with one small file per directory batches (limit 1 fix).
@@ -1050,3 +1046,13 @@ item was, not only in a commit message.
   loss), hashing both sides on resume (reads everything for a state that is often an old, different target), and a
   size-and-mtime match (trusts unproven bytes). **Reopen if:** a measured case shows the window is hit routinely, or
   the single file gains a record write before the rename for another reason.
+- `CLOSED-BY-RULING` **No SIGINT / SIGTERM / console-control handler (spec section 56), 2026-10-14.** No crate installs
+  a handler, so a Ctrl-C kills the process like a crash: the lock is released by the OS (the kill-then-`--resume` e2e
+  tests resume with no `--break-lock`), the staged partial is kept and the record stays TRANSFERRING; the next
+  `--resume` or `--restart` recovers it. Owner ruling (agy consulted first, ALIGNED): accept, and amend the spec
+  (new section 56.1; a note under section 132). Rejected: the spec's cancellation to `PAUSED` (a new `OpState`, state
+  format version 5, resume/restart/cleanup changes, for a state `FAILED` already equals in behaviour), and a
+  cooperative stop that keeps the partial (a normal stop through the error path DELETES the partial, `copy.rs`
+  `StreamFail::Discard`; cross-thread cancellation plumbing for the guard, the WAL writer and the sync barrier; a stop
+  can hang on a stalled read or an fsync). **Reopen if:** an engine caller (a library or UI) needs to cancel a run, or
+  a measured case shows operators losing work to an interrupt.
