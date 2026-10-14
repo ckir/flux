@@ -1111,6 +1111,35 @@ mod tests {
         );
     }
 
+    // Mutants: the advisory note keyed on `fr.reused > 0` instead of "any line printed" (a discard-only report loses
+    // it), or printed for a `FileResume` that printed nothing, or its durability test inverted.
+    #[test]
+    fn the_advisory_note_follows_any_printed_line_under_normal_and_never_under_strict() {
+        use flux_core::run::FileResume;
+        const NOTE: &str = "note: --durability=normal checkpoints are advisory; every reused chunk was validated against the source and the destination";
+        let discard_only = file_run_with(Some(FileResume {
+            reused: 0,
+            recopied: 9,
+            discard: Some(Discard::MismatchAt(7)),
+        }));
+        assert_eq!(
+            file_checkpoint_lines(&discard_only, "t", true),
+            vec!["checkpoints discarded for t: mismatch at offset 7", NOTE]
+        );
+        let reuse_only = file_run_with(Some(FileResume { reused: 5, recopied: 4, discard: None }));
+        assert_eq!(
+            file_checkpoint_lines(&reuse_only, "t", true),
+            vec!["resumed t: reused 5 bytes, recopied 4 bytes", NOTE]
+        );
+        assert_eq!(
+            file_checkpoint_lines(&reuse_only, "t", false),
+            vec!["resumed t: reused 5 bytes, recopied 4 bytes"]
+        );
+        let nothing = file_run_with(Some(FileResume { reused: 0, recopied: 9, discard: None }));
+        assert!(file_checkpoint_lines(&nothing, "t", true).is_empty());
+        assert!(file_checkpoint_lines(&nothing, "t", false).is_empty());
+    }
+
     #[test]
     fn file_checkpoint_lines_print_nothing_without_a_file_resume() {
         let run = file_run_with(None);

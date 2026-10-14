@@ -41,7 +41,7 @@ pub(crate) enum Hook<'r, 'a, D> {
 
 `copy_file_checkpointed`'s `ckpt` parameter becomes `Option<Hook>`; every existing caller passes `Logged(..)` or `None` and behaves exactly as today. Under `LogFree`:
 - `plan_resume`: always the `Full` arm; the `(None, _, _)` no-partial case returns `fresh(None)` without calling `load` (there is none).
-- `stage_file`: the early sweep (`ckpt.is_none()`) is skipped; the fresh-start sweep at `copy.rs:752` still runs; no `FileSink` is created (no `begin`, `record_proven`, `wrote`, `complete`), so no log record exists to be torn, stale or forged.
+- `stage_file`: the early sweep (`ckpt.is_none()`) is skipped; the fresh-start sweep at `copy.rs:752` still runs, and the step-2b skip branch (`--skip-existing`/`--update` that skips) sweeps the partial under its own lock check (added after the whole-branch review); no `FileSink` is created (no `begin`, `record_proven`, `wrote`, `complete`), so no log record exists to be torn, stale or forged.
 - Strict durability: unchanged. The sink's `dup` handle exists only to flush per batch before a log record claims it; with no log there is no claim, and the existing end-of-file sync before publish still applies.
 
 ### 4.2 `run::file`
