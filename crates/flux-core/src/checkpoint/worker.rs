@@ -66,6 +66,8 @@ thread_local! {
     pub(super) static INJECT: Cell<Inject> =
         const { Cell::new(Inject { fail_send_after_ranges: None, panic_on_job: None }) };
     static SPAWNED: Cell<usize> = const { Cell::new(0) };
+    /// Jobs this thread handed to a worker through `Worker::submit` (ruling R9).
+    static SUBMITTED: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Worker threads alive in this process (spawned and not yet at the end of their body).
@@ -223,7 +225,10 @@ impl Worker {
     /// Hands `buf` to the worker; its first `n` bytes are the data.
     pub(super) fn submit(&self, buf: Vec<u8>, n: usize) -> Result<(), Gone> {
         debug_assert!(n <= buf.len(), "n is within the buffer");
-        self.submit.as_ref().ok_or(Gone)?.send(Job { buf, n }).map_err(|_| Gone)
+        self.submit.as_ref().ok_or(Gone)?.send(Job { buf, n }).map_err(|_| Gone)?;
+        #[cfg(test)]
+        SUBMITTED.set(SUBMITTED.get() + 1);
+        Ok(())
     }
 
     /// A buffer the worker is done with, at its full length.
@@ -297,6 +302,12 @@ impl Worker {
     #[cfg(test)]
     pub(super) fn live_for_tests() -> usize {
         LIVE.load(Ordering::SeqCst)
+    }
+
+    /// Jobs handed over by this thread (a thread-local, like `spawned_for_tests`).
+    #[cfg(test)]
+    pub(super) fn submitted_for_tests() -> usize {
+        SUBMITTED.get()
     }
 }
 

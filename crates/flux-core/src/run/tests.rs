@@ -5641,6 +5641,9 @@ mod checkpointing {
 
     /// `crashed_run` under `durability` (Strict stages the file through a batch).
     fn crashed_run_as(fs: &FaultFs, durability: Durability) {
+        // Models inline hashing timing; the worker path is covered by copy::tests::a_checkpointed_copy_logs_the_same_ranges_with_and_without_the_worker,
+        // checkpoint::sink::tests::the_worker_log_equals_the_inline_log and flux-cli a_killed_large_file_resumes_from_its_validated_prefix (R11).
+        let _inline = crate::checkpoint::test_seams::OneCpu::new();
         stop_beat_at(fs, 1, 3 * MIB, true, false);
         let o = CopyOptions { durability, ..opts() };
         let (r, _) = run_with(fs, &beating(), &o, policy(durability, 1));
@@ -6018,6 +6021,9 @@ mod checkpointing {
     // is pending.)
     #[test]
     fn a_lost_lock_appends_nothing_even_with_an_eager_flush_policy() {
+        // Models inline hashing timing; the worker path is covered by copy::tests::a_checkpointed_copy_logs_the_same_ranges_with_and_without_the_worker,
+        // checkpoint::sink::tests::the_worker_log_equals_the_inline_log and flux-cli a_killed_large_file_resumes_from_its_validated_prefix (R11).
+        let _inline = crate::checkpoint::test_seams::OneCpu::new();
         let fs = Arc::new(big_fs(5 * MIB));
         let (entered, release) =
             (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
@@ -6077,6 +6083,9 @@ mod checkpointing {
     // Mutant: `FileSink::abort` sends `Close` again (it flushes the aborted file's pending records after the loss).
     #[test]
     fn a_lost_lock_appends_nothing_after_the_loss() {
+        // Models inline hashing timing; the worker path is covered by copy::tests::a_checkpointed_copy_logs_the_same_ranges_with_and_without_the_worker,
+        // checkpoint::sink::tests::the_worker_log_equals_the_inline_log and flux-cli a_killed_large_file_resumes_from_its_validated_prefix (R11).
+        let _inline = crate::checkpoint::test_seams::OneCpu::new();
         let fs = Arc::new(big_fs(5 * MIB));
         // Nothing flushes on its own: no threshold, an hour's interval. Ranges are queued as the file streams; the
         // heartbeat fails 2 MiB in, and the guard of the discard that follows finds the lock gone.
@@ -6136,6 +6145,9 @@ mod checkpointing {
     // Mutant: a failed heartbeat is treated as an ordinary ending (the run is Completed or the log is not joined).
     #[test]
     fn a_failed_heartbeat_ends_the_run_failed_and_joins_the_log() {
+        // Models inline hashing timing; the worker path is covered by copy::tests::a_checkpointed_copy_logs_the_same_ranges_with_and_without_the_worker,
+        // checkpoint::sink::tests::the_worker_log_equals_the_inline_log and flux-cli a_killed_large_file_resumes_from_its_validated_prefix (R11).
+        let _inline = crate::checkpoint::test_seams::OneCpu::new();
         let fs = big_fs(5 * MIB);
         stop_beat_at(&fs, 1, 2 * MIB, false, false);
         let (r, _) = run_with(&fs, &beating(), &opts(), lazy(Durability::Normal));
@@ -6711,6 +6723,9 @@ mod checkpointing {
     // digests on a FILE_BEGIN.
     #[test]
     fn a_stale_record_from_an_earlier_generation_does_not_mix_with_the_current_one() {
+        // Models inline hashing timing; the worker path is covered by copy::tests::a_checkpointed_copy_logs_the_same_ranges_with_and_without_the_worker,
+        // checkpoint::sink::tests::the_worker_log_equals_the_inline_log and flux-cli a_killed_large_file_resumes_from_its_validated_prefix (R11).
+        let _inline = crate::checkpoint::test_seams::OneCpu::new();
         let fs = big_fs(5 * MIB);
         crashed_run(&fs);
         fs.remove_file(Path::new(&partial())).unwrap();

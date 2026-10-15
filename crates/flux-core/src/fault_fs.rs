@@ -86,6 +86,11 @@ struct Inner {
     write_nth: Option<(String, u32, std::io::ErrorKind)>,
     /// Count of matching writes since `write_nth` was armed.
     writes: u32,
+    /// (path substring, nth, kind): the `nth` (1-based) `read` on a READER handle whose path contains the substring
+    /// fails once (`fail_read_nth`). Arming resets `reads`.
+    read_nth: Option<(String, u32, std::io::ErrorKind)>,
+    /// Count of matching reads since `read_nth` was armed.
+    reads: u32,
     /// call name -> the `ErrorKind` an injected fault should carry. Without this the
     /// fake could only ever produce `ErrorKind::Other`, so code branching on the kind
     /// was unreachable from a test -- `cargo mutants` measured exactly that, and two
@@ -679,6 +684,19 @@ impl Drop for FakeHandle {
 
 impl Read for FakeHandle {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        // `fail_read_nth`: count only reads on a reader handle (a tally, no sink) whose path matches.
+        if let (Some(tally), None) = (&self.read_tally, &self.sink) {
+            let mut g = tally.lock().unwrap();
+            if let Some((pat, n, kind)) = g.read_nth.clone()
+                && self.path.to_string_lossy().contains(&pat)
+            {
+                g.reads += 1;
+                if g.reads == n {
+                    g.read_nth = None;
+                    return Err(std::io::Error::new(kind, "injected read failure"));
+                }
+            }
+        }
         let n = (self.buf.len() - self.read_pos).min(out.len());
         out[..n].copy_from_slice(&self.buf[self.read_pos..self.read_pos + n]);
         self.read_pos += n;
@@ -1265,6 +1283,14 @@ impl FaultFs {
         let mut g = self.inner.lock().unwrap();
         g.write_nth = Some((path_contains.to_string(), nth, kind));
         g.writes = 0;
+    }
+
+    /// Fail the `nth` (1-based) `read` on a READER handle whose path contains `path_contains`, once: a source that
+    /// fails mid-stream. Only matching reads are counted. Arming resets the count.
+    pub fn fail_read_nth(&self, path_contains: &str, nth: u32, kind: std::io::ErrorKind) {
+        let mut g = self.inner.lock().unwrap();
+        g.read_nth = Some((path_contains.to_string(), nth, kind));
+        g.reads = 0;
     }
 
     /// Append to a file the *second* time its metadata is read — what a concurrent
@@ -2281,6 +2307,26 @@ mod tests {
         w.write_all(b"dddd").unwrap();
         assert_eq!(fs.read_file("/ws/p"), Some(b"aaaabbbbdddd".to_vec()));
         assert_eq!(fs.read_file("/ws/other"), Some(b"zzzz".to_vec()));
+    }
+
+    #[test]
+    fn fail_read_nth_fails_exactly_the_nth_read_once() {
+        use std::io::Read;
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"abcdefgh");
+        fs.write_file("/other", b"zz");
+        fs.fail_read_nth("src", 2, std::io::ErrorKind::TimedOut);
+        let mut r = fs.open_read(Path::new("/src")).unwrap();
+        let mut other = fs.open_read(Path::new("/other")).unwrap();
+        let mut w = fs.create_new(Path::new("/src2")).unwrap();
+        w.write_all(b"x").unwrap(); // a writer whose path matches is not a reader: not counted
+        let mut b = [0u8; 3];
+        assert_eq!(r.read(&mut b).unwrap(), 3);
+        assert_eq!(other.read(&mut b).unwrap(), 2); // a non-matching reader is neither counted nor failed
+        let e = r.read(&mut b).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(r.read(&mut b).unwrap(), 3, "the failure is once, and it consumed nothing");
+        assert_eq!(&b, b"def");
     }
 
     #[test]

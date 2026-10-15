@@ -196,9 +196,6 @@ impl<'a, D: DirHandle + Send + 'static> FileSink<'a, D> {
     /// checks the log's fault, then the worker's, queues `buf`, and waits for a free buffer, beating every
     /// `SEND_RETRY` and re-checking both faults. A log fault stops the file within one buffer; a fault only the worker
     /// saw, within `POOL` buffers.
-    // TEMPORARY: `stage_file` starts calling this in Task 5 of cut 9h, which removes this allowance. It is the only
-    // one: everything the worker needs is reached from here.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn submit(
         &mut self,
         buf: Vec<u8>,
