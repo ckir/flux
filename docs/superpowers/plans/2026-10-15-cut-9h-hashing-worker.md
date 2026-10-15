@@ -38,6 +38,12 @@
 4. A read, write or heartbeat error, or a panic, with the worker running and queued buffers: no leaked or blocked `flux-hash` thread, no `Range` after `Discard`. Pinned in Tasks 4 and 5 (`abort_joins_the_worker_and_nothing_follows_discard`, `a_failed_read_write_or_beat_does_not_hang`, `a_panic_in_the_copy_thread_does_not_leave_a_worker_blocked`).
 5. A resumed file (proven prefix via `record_proven`, a `carry`): chunk numbering and `Range` boundaries must equal the inline run. Pinned in Task 4 (`the_worker_log_equals_the_inline_log`, with a proven prefix and a carry).
 
+## Test mechanisms (verified against existing tests)
+
+- **Holding the WAL writer so its channel stays full** (Task 3 test 4; Task 4 tests 3, 5, 8): the pattern of `a_full_channel_blocks_the_sender_and_beats` (`wal/writer.rs:1210-1231`): `Durability::Strict` with a duplicate handle (`fs.create_new(Path::new("/ws/p"))` then `.duplicate()` passed to `FileSink::begin`), `fs.delay("sync_all", Duration::from_millis(300))`, `channel_cap = 1` in the `WalConfig` of the policy, then `run.sender.send(Msg::Flush, beat)` (the `Flush` variant is available under `cfg(test)`). The writer is then stuck in the delayed `sync_all`, so further sends return `Full`. The "release" is the delay expiring; tests assert counts (for example `beat` calls >= 3) inside that window, never exact timing.
+- **Worker-only fault and panic** (Task 4 tests 7 and 10): a `#[cfg(test)] thread_local!` `INJECT: Cell<Inject>` in `worker.rs` (`Inject` is `Copy`), read by `FileSink` when it builds `WorkerArgs`; production code builds `WorkerArgs` without the field (`#[cfg(test)]` on both the field and its initializer).
+- **Mode selection** (`Force` seam, Task 3): same `thread_local!` pattern.
+
 ## Execution notes (model gating)
 
 Tasks 1, 2, 6: Sonnet implementer (mechanical, well specified). Tasks 3, 4, 5: concurrency next to the durability log, so error-cost raises the tier: Opus implementer and Opus reviewer. Every dispatch carries: STATE-VERIFICATION Step 0 (`STATE_MISMATCH:`), SHAPE-DIVERGENCE STOP, NAME THE ORACLE, no elided enumerations, exact commands with the expected pass line, the ANOMALIES clause, and a FILES clause (pre-list every file the compiler will name for a signature change). The tests in each task are already written in the plan: "implement until they pass". Timing (Task 6 Step 4) is run by the controller at the top level.
