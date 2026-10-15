@@ -81,6 +81,11 @@ struct Inner {
     perms: HashMap<PathBuf, Option<Perms>>,
     /// consumed by the next `write` on a handle from `create_new`
     write_fault: Option<std::io::Error>,
+    /// (path substring, nth, kind): the `nth` (1-based) write on a WRITER handle whose path contains the substring
+    /// fails once (`fail_write_nth`). Arming resets `writes`.
+    write_nth: Option<(String, u32, std::io::ErrorKind)>,
+    /// Count of matching writes since `write_nth` was armed.
+    writes: u32,
     /// call name -> the `ErrorKind` an injected fault should carry. Without this the
     /// fake could only ever produce `ErrorKind::Other`, so code branching on the kind
     /// was unreachable from a test -- `cargo mutants` measured exactly that, and two
@@ -686,6 +691,20 @@ impl Read for FakeHandle {
 
 impl Write for FakeHandle {
     fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        // `fail_write_nth`: count only writes on a writer handle whose path matches; the lock is dropped before the
+        // rest of `write`, which locks the sink again.
+        if let Some(sink) = &self.sink {
+            let mut g = sink.lock().unwrap();
+            if let Some((pat, n, kind)) = g.write_nth.clone()
+                && self.path.to_string_lossy().contains(&pat)
+            {
+                g.writes += 1;
+                if g.writes == n {
+                    g.write_nth = None;
+                    return Err(std::io::Error::new(kind, "injected write failure"));
+                }
+            }
+        }
         if let Some(e) = self.write_fault.lock().unwrap().take() {
             return Err(e);
         }
@@ -1238,6 +1257,14 @@ impl FaultFs {
     /// Fail the next `write` on a handle from `create_new`, with this error.
     pub fn fail_write(&self, e: std::io::Error) {
         self.inner.lock().unwrap().write_fault = Some(e);
+    }
+
+    /// Fail the `nth` (1-based) `write` on a WRITER handle whose path contains `path_contains`, once. Only matching
+    /// writes are counted (the WAL writer thread also writes through the fake). Arming resets the count.
+    pub fn fail_write_nth(&self, path_contains: &str, nth: u32, kind: std::io::ErrorKind) {
+        let mut g = self.inner.lock().unwrap();
+        g.write_nth = Some((path_contains.to_string(), nth, kind));
+        g.writes = 0;
     }
 
     /// Append to a file the *second* time its metadata is read — what a concurrent
@@ -2238,6 +2265,23 @@ impl DirHandle for FakeDirHandle {
 mod tests {
     use super::*;
     use flux_fs::FileIdentity;
+
+    #[test]
+    fn fail_write_nth_fails_exactly_the_nth_write_once() {
+        let fs = FaultFs::new();
+        fs.fail_write_nth("p", 3, std::io::ErrorKind::StorageFull);
+        let mut w = fs.create_new(Path::new("/ws/p")).unwrap();
+        let mut other = fs.create_new(Path::new("/ws/other")).unwrap();
+        w.write_all(b"aaaa").unwrap();
+        other.write_all(b"zzzz").unwrap(); // a non-matching handle is neither counted nor failed
+        w.write_all(b"bbbb").unwrap();
+        let e = w.write_all(b"cccc").unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(fs.read_file("/ws/p"), Some(b"aaaabbbb".to_vec()));
+        w.write_all(b"dddd").unwrap();
+        assert_eq!(fs.read_file("/ws/p"), Some(b"aaaabbbbdddd".to_vec()));
+        assert_eq!(fs.read_file("/ws/other"), Some(b"zzzz".to_vec()));
+    }
 
     #[test]
     fn a_duplicate_syncs_the_same_file_from_another_thread() {
