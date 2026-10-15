@@ -828,10 +828,13 @@ pub(crate) fn stage_file<F: DestinationRoot>(
                 break 'stream Err(StreamFail::Discard(CopyStep::Stream, copy_code(&e), e));
             }
             bytes_copied += n as u64;
-            if let Some(s) = sink.as_mut()
-                && let Err(e) = s.wrote(&buf[..n], beat)
-            {
-                break 'stream Err(sink_fail(e, name));
+            // Cut 9h (spec 3.4): only a buffer already written is handed over (I1); the sink returns one at full
+            // length to read into next. Without a sink `buf` is never taken.
+            if let Some(s) = sink.as_mut() {
+                match s.submit(std::mem::take(&mut buf), n, beat) {
+                    Ok(next) => buf = next,
+                    Err(e) => break 'stream Err(sink_fail(e, name)),
+                }
             }
             // §101 (cut 7b): the heartbeat, once per chunk (at most COPY_BUF_MAX bytes).
             if let Err(e) = beat() {
@@ -1668,6 +1671,201 @@ mod tests {
         let times = c.iter().position(|x| x.starts_with("set_times(")).expect("times set");
         assert!(times < sync, "metadata before the sync: {c:?}");
         assert_eq!(c.iter().filter(|x| x.starts_with("sync_all(")).count(), 1);
+    }
+
+    // ---- cut 9h, task 5: the copy loop hands written buffers to the hashing worker ----
+    //
+    // The worker tests need more than one CPU (`Worker::wanted`: Normal durability and more than one CPU); each
+    // asserts `test_seams::spawned() > 0`, so on a one-CPU machine they fail loudly instead of passing without a
+    // worker. `FORCE`, the spawn and the job counters are thread-locals: a test that stages on a helper thread sets
+    // and reads them there.
+
+    use crate::checkpoint::test_seams;
+
+    /// The fixture of the cut 9h copy tests: 6 MiB, 256 KiB buffers (24 writes), one `Range` per 4 chunks, every
+    /// record flushed at once.
+    const HASH_SRC: usize = 6 * MIB;
+
+    fn hash_policy() -> CheckpointPolicy {
+        ckpt_policy(Durability::Normal, 64, 1)
+    }
+
+    /// Runs `f` on a helper thread and waits at most 10 s for it: a hang fails the test instead of the suite. A panic in
+    /// `f` is resumed here.
+    fn within_deadline<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(v) => v,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("{what}: hung past the 10 s deadline")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match handle.join() {
+                Err(p) => std::panic::resume_unwind(p),
+                Ok(()) => panic!("{what}: the helper thread ended without a result"),
+            },
+        }
+    }
+
+    fn ranges_of(bodies: &[Body]) -> Vec<&crate::wal::record::Range> {
+        bodies.iter().filter_map(|b| if let Body::Range(r) = b { Some(r) } else { None }).collect()
+    }
+
+    #[test]
+    fn no_job_for_a_buffer_whose_write_failed() {
+        // On a helper thread (the job counter is its thread-local), so a hang fails the test.
+        within_deadline("write fault", no_job_for_a_buffer_whose_write_failed_body);
+    }
+
+    fn no_job_for_a_buffer_whose_write_failed_body() {
+        // Write 16 to the partial is the buffer that would complete chunk 3 (16 x 256 KiB = 4 MiB).
+        const K: u32 = 16;
+        let (fs, root) = ckpt_fs(HASH_SRC);
+        let run = ckpt_run(&fs, hash_policy());
+        fs.fail_write_nth("flux-partial", K, std::io::ErrorKind::StorageFull);
+        let (spawned, submitted) = (test_seams::spawned(), test_seams::submitted());
+        let e = match stage_ckpt(&fs, &root, &run, Durability::Normal, &no_heartbeat) {
+            Err(e) => e,
+            Ok(_) => panic!("the failed write stops the copy"),
+        };
+        assert_eq!((e.step, e.cause.code), (CopyStep::Stream, Code::CopyFailed));
+        assert_eq!(e.cause.source.kind(), std::io::ErrorKind::StorageFull);
+        assert!(!fs.exists(PARTIAL), "the partial is discarded: {:?}", fs.calls());
+        assert!(test_seams::spawned() > spawned, "a flux-hash worker hashed this file");
+        assert_eq!(
+            test_seams::submitted() - submitted,
+            (K - 1) as usize,
+            "only the buffers whose write succeeded were handed to the worker"
+        );
+        assert!(run.finish(&no_heartbeat).is_clean());
+        // The `FileBegin` is flushed only with a `Range` and the discard dropped it, so the honest log may be absent.
+        // A smoke check only: it passes with or without the mutant. The job count above is the real
+        // assertion (R9).
+        let bodies = if fs.exists(WAL_PATH) { wal_bodies(&fs) } else { Vec::new() };
+        assert!(
+            ranges_of(&bodies).iter().all(|r| r.range_end <= 3 * MIB as u64),
+            "no Range covers bytes that never reached the partial: {bodies:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_read_write_or_beat_does_not_hang() {
+        #[derive(Debug, Clone, Copy)]
+        enum Fault {
+            Read,
+            Write,
+            Beat,
+        }
+        for fault in [Fault::Read, Fault::Write, Fault::Beat] {
+            let (step, code, spawned, live_before, live_after) =
+                within_deadline(&format!("{fault:?}"), move || {
+                    let (fs, root) = ckpt_fs(HASH_SRC);
+                    let run = ckpt_run(&fs, hash_policy());
+                    match fault {
+                        Fault::Read => fs.fail_read_nth("/src", 8, std::io::ErrorKind::TimedOut),
+                        Fault::Write => {
+                            fs.fail_write_nth("flux-partial", 8, std::io::ErrorKind::StorageFull)
+                        }
+                        Fault::Beat => {}
+                    }
+                    let beats = AtomicUsize::new(0);
+                    let beat = || {
+                        if matches!(fault, Fault::Beat)
+                            && beats.fetch_add(1, Ordering::SeqCst) + 1 == 5
+                        {
+                            return Err(FsError::new(
+                                Code::IoError,
+                                std::io::Error::other("lock lost"),
+                            ));
+                        }
+                        Ok(())
+                    };
+                    let (spawned, live) = (test_seams::spawned(), test_seams::live());
+                    let e = match stage_ckpt(&fs, &root, &run, Durability::Normal, &beat) {
+                        Err(e) => e,
+                        Ok(_) => panic!("{fault:?}: the fault stops the copy"),
+                    };
+                    assert!(!fs.exists(PARTIAL), "{fault:?}: the partial is discarded");
+                    let live_after = test_seams::live();
+                    run.abandon();
+                    (e.step, e.cause.code, test_seams::spawned() - spawned, live, live_after)
+                });
+            let want = match fault {
+                Fault::Read | Fault::Write => (CopyStep::Stream, Code::CopyFailed),
+                Fault::Beat => (CopyStep::Heartbeat, Code::IoError),
+            };
+            assert_eq!((step, code), want, "{fault:?}");
+            assert!(spawned > 0, "{fault:?}: a flux-hash worker hashed this file");
+            assert_eq!(
+                live_after, live_before,
+                "{fault:?}: no flux-hash thread outlives the failed copy"
+            );
+        }
+    }
+
+    #[test]
+    fn a_panic_in_the_copy_thread_does_not_leave_a_worker_blocked() {
+        let spawned = within_deadline("panic", || {
+            let (fs, root) = ckpt_fs(HASH_SRC);
+            let run = ckpt_run(&fs, hash_policy());
+            let beats = AtomicUsize::new(0);
+            let beat = || {
+                if beats.fetch_add(1, Ordering::SeqCst) + 1 == 5 {
+                    // Let the worker drain its queue first: an idle worker waits on its job channel, the state in
+                    // which only the channel's disconnect (not the cancel flag) can wake it.
+                    std::thread::sleep(Duration::from_millis(200));
+                    panic!("injected panic in the copy thread's heartbeat");
+                }
+                Ok(())
+            };
+            // The live count is per spawning thread: this helper thread is the spawner.
+            let (spawned, live_before) = (test_seams::spawned(), test_seams::live());
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = stage_ckpt(&fs, &root, &run, Durability::Normal, &beat);
+            }));
+            assert!(unwound.is_err(), "the heartbeat panicked");
+            run.abandon();
+            let end = std::time::Instant::now() + Duration::from_secs(5);
+            while test_seams::live() != live_before {
+                assert!(
+                    std::time::Instant::now() < end,
+                    "a flux-hash thread outlived the panicked copy"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            test_seams::spawned() - spawned
+        });
+        assert!(spawned > 0, "a flux-hash worker was running when the copy thread panicked");
+    }
+
+    #[test]
+    fn a_checkpointed_copy_logs_the_same_ranges_with_and_without_the_worker() {
+        let logged = |one_cpu: bool| {
+            within_deadline(if one_cpu { "inline" } else { "worker" }, move || {
+                let _force = one_cpu.then(test_seams::OneCpu::new);
+                let spawned = test_seams::spawned();
+                let (fs, root) = ckpt_fs(HASH_SRC);
+                let run = ckpt_run(&fs, hash_policy());
+                let staged =
+                    staged_of(stage_ckpt(&fs, &root, &run, Durability::Normal, &no_heartbeat));
+                assert_eq!(staged.bytes_copied, HASH_SRC as u64);
+                assert!(run.finish(&no_heartbeat).is_clean());
+                assert_eq!(
+                    fs.read_file(PARTIAL),
+                    fs.read_file("/src"),
+                    "the partial holds the source"
+                );
+                (wal_bodies(&fs), test_seams::spawned() - spawned)
+            })
+        };
+        let (inline, inline_spawned) = logged(true);
+        let (worker, worker_spawned) = logged(false);
+        assert_eq!(inline_spawned, 0, "one CPU hashes inline");
+        assert!(worker_spawned > 0, "a flux-hash worker hashed the second copy");
+        assert_eq!(ranges_of(&inline).len(), 2, "6 MiB in ranges of 4 chunks: {inline:?}");
+        assert_eq!(worker, inline);
     }
 
     use crate::fault_fs::FakeHandle;
@@ -3409,6 +3607,14 @@ mod tests {
     /// partial are written, so the WAL holds the digests of exactly those chunks (one `Range` per chunk) and the
     /// failed copy removes its partial. Tests then put whatever partial they want at the temporary's name.
     fn crash_after(fs: &FaultFs, root: &Dir, chunks: usize) {
+        // R11: a kill may lose up to the in-flight pool's Ranges, which spec 3.6 allows and resume
+        // re-hashes; this fixture pins resume given an exact log, so its crashing run hashes
+        // inline.
+        // The worker path is covered by:
+        //   copy::tests::a_checkpointed_copy_logs_the_same_ranges_with_and_without_the_worker,
+        //   checkpoint::sink::tests::the_worker_log_equals_the_inline_log, and
+        //   flux-cli a_killed_large_file_resumes_from_its_validated_prefix.
+        let _inline = crate::checkpoint::test_seams::OneCpu::new();
         let run = run_gen(fs, 1, Durability::Normal);
         let beat = || {
             if fs.read_file(PARTIAL).is_some_and(|b| b.len() >= chunks * MIB) {
@@ -3821,6 +4027,14 @@ mod tests {
 
     #[test]
     fn a_chunks_resume_after_a_full_resume_that_crashed_reuses_the_full_prefix() {
+        // R11: a kill may lose up to the in-flight pool's Ranges, which spec 3.6 allows and resume
+        // re-hashes; this fixture pins resume given an exact log, so its crashing run hashes
+        // inline.
+        // The worker path is covered by:
+        //   copy::tests::a_checkpointed_copy_logs_the_same_ranges_with_and_without_the_worker,
+        //   checkpoint::sink::tests::the_worker_log_equals_the_inline_log, and
+        //   flux-cli a_killed_large_file_resumes_from_its_validated_prefix.
+        let inline = crate::checkpoint::test_seams::OneCpu::new();
         use crate::checkpoint::ResumeVerify::{Chunks, Full};
         let (fs, root) = ckpt_fs(5 * MIB);
         let src = fs.read_file("/src").unwrap();
@@ -3838,6 +4052,8 @@ mod tests {
             .expect("the crash stops the copy");
         assert_eq!(e.step, CopyStep::Heartbeat);
         assert!(run.finish(&no_heartbeat).is_clean());
+        // Only the crashing run hashes inline; the resuming run below uses the worker.
+        drop(inline);
         fs.write_file(PARTIAL, &src[..4 * MIB]);
         let run = run_gen_as(&fs, 2, Durability::Normal, Chunks);
         let staged = stage_normal(&fs, &root, &run);

@@ -81,6 +81,16 @@ struct Inner {
     perms: HashMap<PathBuf, Option<Perms>>,
     /// consumed by the next `write` on a handle from `create_new`
     write_fault: Option<std::io::Error>,
+    /// (path substring, nth, kind): the `nth` (1-based) write on a WRITER handle whose path contains the substring
+    /// fails once (`fail_write_nth`). Arming resets `writes`.
+    write_nth: Option<(String, u32, std::io::ErrorKind)>,
+    /// Count of matching writes since `write_nth` was armed.
+    writes: u32,
+    /// (path substring, nth, kind): the `nth` (1-based) `read` on a READER handle whose path contains the substring
+    /// fails once (`fail_read_nth`). Arming resets `reads`.
+    read_nth: Option<(String, u32, std::io::ErrorKind)>,
+    /// Count of matching reads since `read_nth` was armed.
+    reads: u32,
     /// call name -> the `ErrorKind` an injected fault should carry. Without this the
     /// fake could only ever produce `ErrorKind::Other`, so code branching on the kind
     /// was unreachable from a test -- `cargo mutants` measured exactly that, and two
@@ -674,6 +684,19 @@ impl Drop for FakeHandle {
 
 impl Read for FakeHandle {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        // `fail_read_nth`: count only reads on a reader handle (a tally, no sink) whose path matches.
+        if let (Some(tally), None) = (&self.read_tally, &self.sink) {
+            let mut g = tally.lock().unwrap();
+            if let Some((pat, n, kind)) = g.read_nth.clone()
+                && self.path.to_string_lossy().contains(&pat)
+            {
+                g.reads += 1;
+                if g.reads == n {
+                    g.read_nth = None;
+                    return Err(std::io::Error::new(kind, "injected read failure"));
+                }
+            }
+        }
         let n = (self.buf.len() - self.read_pos).min(out.len());
         out[..n].copy_from_slice(&self.buf[self.read_pos..self.read_pos + n]);
         self.read_pos += n;
@@ -686,6 +709,20 @@ impl Read for FakeHandle {
 
 impl Write for FakeHandle {
     fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        // `fail_write_nth`: count only writes on a writer handle whose path matches; the lock is dropped before the
+        // rest of `write`, which locks the sink again.
+        if let Some(sink) = &self.sink {
+            let mut g = sink.lock().unwrap();
+            if let Some((pat, n, kind)) = g.write_nth.clone()
+                && self.path.to_string_lossy().contains(&pat)
+            {
+                g.writes += 1;
+                if g.writes == n {
+                    g.write_nth = None;
+                    return Err(std::io::Error::new(kind, "injected write failure"));
+                }
+            }
+        }
         if let Some(e) = self.write_fault.lock().unwrap().take() {
             return Err(e);
         }
@@ -1238,6 +1275,22 @@ impl FaultFs {
     /// Fail the next `write` on a handle from `create_new`, with this error.
     pub fn fail_write(&self, e: std::io::Error) {
         self.inner.lock().unwrap().write_fault = Some(e);
+    }
+
+    /// Fail the `nth` (1-based) `write` on a WRITER handle whose path contains `path_contains`, once. Only matching
+    /// writes are counted (the WAL writer thread also writes through the fake). Arming resets the count.
+    pub fn fail_write_nth(&self, path_contains: &str, nth: u32, kind: std::io::ErrorKind) {
+        let mut g = self.inner.lock().unwrap();
+        g.write_nth = Some((path_contains.to_string(), nth, kind));
+        g.writes = 0;
+    }
+
+    /// Fail the `nth` (1-based) `read` on a READER handle whose path contains `path_contains`, once: a source that
+    /// fails mid-stream. Only matching reads are counted. Arming resets the count.
+    pub fn fail_read_nth(&self, path_contains: &str, nth: u32, kind: std::io::ErrorKind) {
+        let mut g = self.inner.lock().unwrap();
+        g.read_nth = Some((path_contains.to_string(), nth, kind));
+        g.reads = 0;
     }
 
     /// Append to a file the *second* time its metadata is read — what a concurrent
@@ -2238,6 +2291,78 @@ impl DirHandle for FakeDirHandle {
 mod tests {
     use super::*;
     use flux_fs::FileIdentity;
+
+    #[test]
+    fn fail_write_nth_fails_exactly_the_nth_write_once() {
+        let fs = FaultFs::new();
+        fs.fail_write_nth("p", 3, std::io::ErrorKind::StorageFull);
+        let mut w = fs.create_new(Path::new("/ws/p")).unwrap();
+        let mut other = fs.create_new(Path::new("/ws/other")).unwrap();
+        w.write_all(b"aaaa").unwrap();
+        other.write_all(b"zzzz").unwrap(); // a non-matching handle is neither counted nor failed
+        w.write_all(b"bbbb").unwrap();
+        let e = w.write_all(b"cccc").unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(fs.read_file("/ws/p"), Some(b"aaaabbbb".to_vec()));
+        w.write_all(b"dddd").unwrap();
+        assert_eq!(fs.read_file("/ws/p"), Some(b"aaaabbbbdddd".to_vec()));
+        assert_eq!(fs.read_file("/ws/other"), Some(b"zzzz".to_vec()));
+    }
+
+    #[test]
+    fn fail_write_nth_re_arming_restarts_the_count_from_one() {
+        let fs = FaultFs::new();
+        fs.fail_write_nth("p", 2, std::io::ErrorKind::StorageFull);
+        let mut w = fs.create_new(Path::new("/ws/p")).unwrap();
+        w.write_all(b"aaaa").unwrap(); // write 1 of the first arming: not the nth
+        // Re-arm with a different nth: the count restarts, so the next write (the 2nd overall) is write 1.
+        fs.fail_write_nth("p", 3, std::io::ErrorKind::StorageFull);
+        w.write_all(b"bbbb").unwrap(); // write 1 since the re-arm, not the old nth
+        w.write_all(b"cccc").unwrap(); // write 2 since the re-arm
+        let e = w.write_all(b"dddd").unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::StorageFull, "write 3 since the re-arm fails");
+        w.write_all(b"eeee").unwrap(); // the failure is once
+        assert_eq!(fs.read_file("/ws/p"), Some(b"aaaabbbbcccceeee".to_vec()));
+    }
+
+    #[test]
+    fn fail_read_nth_fails_exactly_the_nth_read_once() {
+        use std::io::Read;
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"abcdefgh");
+        fs.write_file("/other", b"zz");
+        fs.fail_read_nth("src", 2, std::io::ErrorKind::TimedOut);
+        let mut r = fs.open_read(Path::new("/src")).unwrap();
+        let mut other = fs.open_read(Path::new("/other")).unwrap();
+        let mut w = fs.create_new(Path::new("/src2")).unwrap();
+        w.write_all(b"x").unwrap(); // a writer whose path matches is not a reader: not counted
+        let mut b = [0u8; 3];
+        assert_eq!(r.read(&mut b).unwrap(), 3);
+        assert_eq!(other.read(&mut b).unwrap(), 2); // a non-matching reader is neither counted nor failed
+        let e = r.read(&mut b).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(r.read(&mut b).unwrap(), 3, "the failure is once, and it consumed nothing");
+        assert_eq!(&b, b"def");
+    }
+
+    #[test]
+    fn fail_read_nth_re_arming_restarts_the_count_from_one() {
+        use std::io::Read;
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"abcdefghijkl");
+        fs.fail_read_nth("src", 2, std::io::ErrorKind::TimedOut);
+        let mut r = fs.open_read(Path::new("/src")).unwrap();
+        let mut b = [0u8; 3];
+        assert_eq!(r.read(&mut b).unwrap(), 3); // read 1 of the first arming: not the nth
+        // Re-arm with a different nth: the count restarts, so this read (the 2nd overall) is read 1.
+        fs.fail_read_nth("src", 3, std::io::ErrorKind::TimedOut);
+        assert_eq!(r.read(&mut b).unwrap(), 3, "read 1 since the re-arm, not the old nth");
+        assert_eq!(r.read(&mut b).unwrap(), 3, "read 2 since the re-arm");
+        let e = r.read(&mut b).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "read 3 since the re-arm fails");
+        assert_eq!(r.read(&mut b).unwrap(), 3, "the failure is once");
+        assert_eq!(&b, b"jkl");
+    }
 
     #[test]
     fn a_duplicate_syncs_the_same_file_from_another_thread() {

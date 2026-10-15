@@ -180,6 +180,45 @@ impl<W> WalSender<W> {
     }
 }
 
+/// A cloneable send/fault view of a `WalSender` for a worker thread. It has no `Drop` and no access to `stopped` or
+/// `abandoned`, so dropping it never abandons the run; only the owning `WalSender` decides that.
+/// Every link must be dropped (its worker joined) before the writer thread is joined: a live link keeps the channel
+/// connected, so `WalThread::join` would hang.
+pub(crate) struct WalLink<W> {
+    tx: SyncSender<Msg<W>>,
+    failure: Arc<Mutex<Failure>>,
+}
+
+// Manual: a derive would demand `W: Clone`, and neither field needs it.
+impl<W> Clone for WalLink<W> {
+    fn clone(&self) -> Self {
+        Self { tx: self.tx.clone(), failure: Arc::clone(&self.failure) }
+    }
+}
+
+impl<W> WalSender<W> {
+    /// A link for a worker thread to send through and read the log's failure state. Every link must be dropped (its
+    /// worker joined) before the writer thread is joined: a live link keeps the channel connected, so `WalThread::join`
+    /// would hang.
+    pub(crate) fn link(&self) -> WalLink<W> {
+        WalLink { tx: self.tx.clone(), failure: Arc::clone(&self.failure) }
+    }
+}
+
+impl<W> WalLink<W> {
+    /// Queue `msg` without waiting; a full channel is the caller's to handle.
+    // The `Err` hands the unsent message back, so it is as large as `Msg`; the brief fixes this signature.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn try_send(&self, msg: Msg<W>) -> Result<(), TrySendError<Msg<W>>> {
+        self.tx.try_send(msg)
+    }
+
+    /// The first WAL fault, the same read as `WalSender::wal_fault`.
+    pub(crate) fn fault(&self) -> Option<WalFault> {
+        lock(&self.failure).wal.clone()
+    }
+}
+
 pub(crate) struct WalThread {
     handle: JoinHandle<()>,
     failure: Arc<Mutex<Failure>>,
@@ -878,6 +917,64 @@ mod tests {
         s.send(Msg::Range(range(b"p", 1, 2)), beat).unwrap();
         s.send(Msg::Stop, beat).unwrap();
         t.join();
+    }
+
+    #[test]
+    fn a_link_delivers_a_range_that_reaches_the_log() {
+        let (fs, dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let (s, t) = start(dir, 1, cfg(BIG, HOUR, Durability::Normal));
+        let l = s.link();
+        s.send(begin_msg(b"p", None), beat).unwrap();
+        l.try_send(Msg::Range(range(b"p", 0, 1))).unwrap();
+        s.send(Msg::Stop, beat).unwrap();
+        t.join();
+        let r = records(&wal_bytes(&fs).unwrap());
+        assert_eq!(r.len(), 2);
+        assert!(matches!(r[0].1, Body::FileBegin(_)));
+        assert!(matches!(r[1].1, Body::Range(_)));
+    }
+
+    #[test]
+    fn a_link_reads_the_same_fault_as_the_sender() {
+        let (fs, dir) = ws();
+        let p = fs.create_new(Path::new("/ws/p")).unwrap();
+        fs.fail("create_new", Code::DiskFull);
+        let beat: &Heartbeat = &|| Ok(());
+        let (s, t) = start(dir, 1, cfg(BIG, HOUR, Durability::Normal));
+        let l = s.link();
+        assert_eq!(l.fault(), None);
+        s.send(begin_msg(b"p", Some(p.duplicate().unwrap())), beat).unwrap();
+        s.send(Msg::Range(range(b"p", 0, 1)), beat).unwrap();
+        drain(&s, beat);
+        assert!(l.fault().is_some());
+        assert!(s.wal_fault().is_some());
+        assert_eq!(l.fault(), s.wal_fault());
+        s.send(Msg::Stop, beat).unwrap();
+        t.join();
+    }
+
+    #[test]
+    fn dropping_a_link_does_not_abandon_the_run() {
+        let (fs, dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let (s, t) = start(dir, 1, cfg(BIG, HOUR, Durability::Normal));
+        let l = s.link();
+        s.send(begin_msg(b"p", None), beat).unwrap();
+        drop(l);
+        s.send(Msg::Stop, beat).unwrap();
+        t.join();
+        let r = records(&wal_bytes(&fs).unwrap());
+        assert_eq!(r.len(), 1);
+        assert!(matches!(r[0].1, Body::FileBegin(_)));
+    }
+
+    #[test]
+    fn a_link_is_send_and_sync_for_a_send_writer() {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        assert_send::<WalLink<FakeHandle>>();
+        assert_sync::<WalLink<FakeHandle>>();
     }
 
     /// Wait until every message sent so far was handled, flushing nothing (a `Close` of a file with no pending

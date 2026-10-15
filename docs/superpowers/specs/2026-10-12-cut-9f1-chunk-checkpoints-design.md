@@ -192,3 +192,7 @@ Known conflicts with the parent spec, stated rather than hidden: s164 under Norm
 - (d) Decisions 10 and 12, consequences of plan 2 ruling 12. A checkpoint context is built only for files at or above the threshold, but every file of a checkpointing run, small files included, on both the new and the replace path, costs one extra `metadata` stat of its source (the length test that decides it). Decided by the plan 2 controller (plan 2 execution ruling 12, Task 8B; not owner-approved).
 - (e) The crash matrix cases 1-7 are simulated by editing the segment of a real crashed run, because `FaultFs` has no unsynced-data model; cases 15 and 16 crash a real run. The real-filesystem crash tests remain the `TODO.md` debt.
 - (f) Known limitation: the WAL writer thread has no section-99 lock check of its own, so a late timer flush can follow an UNDETECTED loss of the lock; detection flags the log abandoned, and no NEW flush begins after it. Tracked in the anomalies inbox, not fixed in 9f-1.
+
+## Cut 9h
+
+Checkpoint hashing moved to a per-file `flux-hash` worker thread; the log is byte-identical. The stop bound after a log failure is now one buffer rather than up to one completed chunk. See `docs/superpowers/specs/2026-10-15-cut-9h-hashing-worker-design.md`.

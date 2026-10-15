@@ -5,6 +5,7 @@
 
 mod decide;
 mod sink;
+mod worker;
 
 use crate::copy::Heartbeat;
 use crate::wal::replay::{FileState, Scan, WalError, load_file};
@@ -18,6 +19,46 @@ use std::io;
 pub use decide::Discard;
 pub(crate) use decide::{Gate, Start, Verdict, decide, decide_full};
 pub(crate) use sink::{FileSink, SinkError, mtime_pair};
+
+/// Test-only views of the hashing worker's seams for tests outside `checkpoint` (cut 9h, ruling R10): `worker` is
+/// private, so its `pub(super)` counters and mode override are reached through these functions.
+#[cfg(test)]
+pub(crate) mod test_seams {
+    use super::worker::{FORCE, Force, Worker};
+
+    /// Workers spawned by the calling thread.
+    pub(crate) fn spawned() -> usize {
+        Worker::spawned_for_tests()
+    }
+
+    /// Worker threads alive that the calling thread spawned.
+    pub(crate) fn live() -> usize {
+        Worker::live_for_tests()
+    }
+
+    /// Jobs the calling thread handed to a worker.
+    pub(crate) fn submitted() -> usize {
+        Worker::submitted_for_tests()
+    }
+
+    /// Forces the inline (one-CPU) mode on the calling thread while alive; restores the previous mode on drop. A small
+    /// sibling of the `ForceGuard` private to the sink's tests, which also resets `INJECT` and always restores `Auto`.
+    pub(crate) struct OneCpu {
+        prev: Force,
+    }
+
+    impl OneCpu {
+        pub(crate) fn new() -> OneCpu {
+            OneCpu { prev: FORCE.replace(Force::OneCpu) }
+        }
+    }
+
+    impl Drop for OneCpu {
+        fn drop(&mut self) {
+            FORCE.set(self.prev);
+        }
+    }
+}
 
 /// Files shorter than this are not checkpointed.
 pub(crate) const CHECKPOINT_MIN_LEN: u64 = 64 << 20;

@@ -4,6 +4,7 @@ use super::{CHUNK_SIZE, Digest};
 
 /// Feeds bytes of any size and yields one BLAKE3 digest per completed
 /// `CHUNK_SIZE` chunk; the digest covers exactly that chunk's bytes.
+#[derive(Clone)]
 pub(crate) struct ChunkHasher {
     hasher: blake3::Hasher,
     in_chunk: u64,
