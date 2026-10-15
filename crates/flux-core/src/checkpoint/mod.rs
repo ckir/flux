@@ -5,7 +5,6 @@
 
 mod decide;
 mod sink;
-#[allow(dead_code)]
 mod worker;
 
 use crate::copy::Heartbeat;

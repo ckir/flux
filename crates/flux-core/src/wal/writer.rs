@@ -182,7 +182,8 @@ impl<W> WalSender<W> {
 
 /// A cloneable send/fault view of a `WalSender` for a worker thread. It has no `Drop` and no access to `stopped` or
 /// `abandoned`, so dropping it never abandons the run; only the owning `WalSender` decides that.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Every link must be dropped (its worker joined) before the writer thread is joined: a live link keeps the channel
+/// connected, so `WalThread::join` would hang.
 pub(crate) struct WalLink<W> {
     tx: SyncSender<Msg<W>>,
     failure: Arc<Mutex<Failure>>,
@@ -196,14 +197,14 @@ impl<W> Clone for WalLink<W> {
 }
 
 impl<W> WalSender<W> {
-    /// A link for a worker thread to send through and read the log's failure state.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// A link for a worker thread to send through and read the log's failure state. Every link must be dropped (its
+    /// worker joined) before the writer thread is joined: a live link keeps the channel connected, so `WalThread::join`
+    /// would hang.
     pub(crate) fn link(&self) -> WalLink<W> {
         WalLink { tx: self.tx.clone(), failure: Arc::clone(&self.failure) }
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl<W> WalLink<W> {
     /// Queue `msg` without waiting; a full channel is the caller's to handle.
     // The `Err` hands the unsent message back, so it is as large as `Msg`; the brief fixes this signature.
