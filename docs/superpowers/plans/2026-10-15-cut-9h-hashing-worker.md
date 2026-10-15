@@ -26,7 +26,7 @@
 - Modify `crates/flux-core/src/wal/writer.rs`: `WalLink<W>` and `WalSender::link`.
 - Create `crates/flux-core/src/checkpoint/worker.rs`: the hashing thread (`Worker`), its channels, its test seams.
 - Modify `crates/flux-core/src/checkpoint/mod.rs`: `mod worker;` (beside `mod sink;`, line 7).
-- Modify `crates/flux-core/src/checkpoint/sink.rs`: modes, `submit`, `complete`/`abort`/`Drop` changes, tests.
+- Modify `crates/flux-core/src/checkpoint/sink.rs`: modes, `submit`, `complete`/`abort`/`Drop` changes, tests. Task 4 also removes the temporary `#[allow(dead_code)]` on `mod worker;` and the `#[cfg_attr(not(test), allow(dead_code))]` on `WalLink`/`link` (ruling R5).
 - Modify `crates/flux-core/src/copy.rs`: the copy loop (lines 777-852) and tests.
 - Modify `docs/superpowers/specs/2026-10-12-cut-9f1-chunk-checkpoints-design.md` (deviations note), `TODO.md` (the hashing-cost entry), `README.md` only if it names the stop bound (check by grep).
 
@@ -76,7 +76,7 @@ Tasks 1, 2, 6: Sonnet implementer (mechanical, well specified). Tasks 3, 4, 5: c
 
 - [ ] **Step 1: Write the failing tests** in `writer.rs` tests: (a) `a_link_delivers_a_range_that_reaches_the_log`: open a writer as the existing tests do, `let l = s.link();` send `FileBegin` through `s.send` then a `Range` through `l.try_send`, `Stop` through `s.send`, join, assert the segment holds both records (decode with `decode_next`, as `sink.rs` tests do); (b) `a_link_reads_the_same_fault_as_the_sender`: kill the log (`fs.fail("create_new", Code::DiskFull)`, drain) and assert `l.fault() == s.wal_fault()` and both `Some`; (c) `dropping_a_link_does_not_abandon_the_run`: create a link, drop it, `s.send(Msg::Stop)`, join, assert the segment flushed what was pending (not abandoned); (d) `a_link_is_send_and_sync_for_a_send_writer` : a compile-time assertion `fn assert_send<T: Send>() {}` over `WalLink<FakeHandle-writer type used by the tests>`.
 - [ ] **Step 2: Run:** `cargo nextest run -p flux-core a_link dropping_a_link` Expected: FAIL (no `link`).
-- [ ] **Step 3: Implement** the type and methods above; `use std::sync::mpsc::TrySendError` is already imported at line 18.
+- [ ] **Step 3: Implement** the type and methods above; `use std::sync::mpsc::TrySendError` is already imported at line 18. `WalSender::link` and the `WalLink` methods are unused in non-test builds until Task 4: annotate them `#[cfg_attr(not(test), allow(dead_code))]` (the same idiom `Msg::Flush` uses, `wal/writer.rs`), and Task 4 removes the annotations (ruling R5; otherwise `clippy -D warnings` fails at this task's gate).
 - [ ] **Step 4: Run** the same command. Expected: PASS; then `cargo nextest run -p flux-core wal::` all pass.
 - [ ] **Step 5: Commit** `feat(wal): WalLink, a cloneable send/fault view for a worker thread (cut 9h, task 2)`.
 
@@ -103,9 +103,9 @@ Tasks 1, 2, 6: Sonnet implementer (mechanical, well specified). Tasks 3, 4, 5: c
   3. `a_log_fault_sets_the_fault_and_the_worker_exits`: kill the log, submit a chunk; `recv_free`/`fault()` eventually report `Some(Wal)` within a polled deadline; `finish` returns `WorkerFail::Fault`.
   4. `cancel_stops_a_worker_blocked_on_a_full_channel`: channel cap 1 (`policy` `channel_cap`), the writer held so sends return `Full` (the hold mechanism in "Test mechanisms" above); call `cancel_and_join` and assert it returns within a deadline and the thread is gone (`Worker` exposes `is_finished()` for tests).
   5. `a_panicking_worker_reports_gone`: `Inject { panic_on_job: Some(1) }`; `finish` returns `WorkerFail::Gone`; no panic propagates to the caller.
-  6. `dropping_the_worker_sender_disconnects_the_thread`: drop the `Worker` without `finish`/`cancel_and_join` via `std::mem::forget`-free route: call the `Drop` impl (which must cancel and join); assert the thread finished.
+  6. `dropping_a_worker_joins_its_thread`: spawn a `Worker`, submit one job, then simply drop it (no `finish`, no `cancel_and_join`); assert `live_for_tests()` returns to its starting value within a polled deadline (ruling R3).
 - [ ] **Step 2: Run:** `cargo nextest run -p flux-core checkpoint::worker` Expected: FAIL (module does not exist / does not compile).
-- [ ] **Step 3: Implement** `worker.rs` per the Interfaces block. `Drop for Worker`: if not already joined, `cancel_and_join(None)`.
+- [ ] **Step 3: Implement** `worker.rs` per the Interfaces block. `Drop for Worker`: if not already joined, `cancel_and_join(None)`. Declare it `#[allow(dead_code)] mod worker;` in `checkpoint/mod.rs` and say so in the commit message; Task 4 removes the `allow` (ruling R5). The test harness helpers it needs (`ws`, `policy`, `open_run`) are DUPLICATED in `worker.rs`'s own `mod tests`, not shared with `sink.rs` (ruling R2).
 - [ ] **Step 4: Run:** the same command. Expected: PASS (6 tests); then `cargo nextest run -p flux-core` all pass; `cargo clippy -p flux-core --all-targets -- -D warnings` clean.
 - [ ] **Step 5: Mutants** (non-vacuity; each must turn the NAMED test red, restore after): (a) in the worker, hash `&buf[..n + 1]` (wrong slice) -> test 1; (b) skip the `link.fault()` check -> test 3; (c) never set the cancel flag in `cancel_and_join` -> test 4; (d) in `finish`, skip reaping so a panic propagates -> test 5. Use `cargo nextest run --no-fail-fast` and read which test failed.
 - [ ] **Step 6: Commit** `feat(checkpoint): the hashing worker thread (cut 9h, task 3)`.
@@ -139,7 +139,7 @@ Tasks 1, 2, 6: Sonnet implementer (mechanical, well specified). Tasks 3, 4, 5: c
   8. `a_fault_during_the_pool_wait_ends_the_file`: pool exhausted, kill the log while `submit` waits; assert it returns `SinkError::Wal` within a deadline (no hang).
   9. `the_inline_fallback_is_used_for_one_cpu_and_a_failed_spawn`: under `Force::OneCpu` and `Force::SpawnFails` assert the logged ranges equal the worker's and no `flux-hash` thread was spawned.
   10. `a_panicking_worker_is_a_wal_stop_not_a_hang`: `Inject { panic_on_job: Some(1) }`: the `submit`/`complete` returns `SinkError::Wal` whose message says the hashing worker stopped, within a deadline.
-  11. `dropping_a_sink_with_a_live_worker_joins_it` (debug only if the `Drop` assert would fire: end the sink via `abort` first, then verify; plus a separate test that a panic unwinding past a sink with a live worker leaves no running `flux-hash` after the sink is dropped).
+  11. (a) `an_ended_sink_leaves_no_worker`: after `abort` (and, in a second case, `complete`) drop the sink and assert `live_for_tests()` is back to its starting value; (b) `#[cfg(debug_assertions)] dropping_an_unended_sink_joins_its_worker_then_trips_the_assert`: `catch_unwind` around dropping a sink that has a live worker and was not ended; assert the unwind carries the existing "a FileSink must end through complete or abort" message AND that the worker has finished by then (the `Drop` stops the worker BEFORE the assert) (ruling R4).
 - [ ] **Step 2: Run:** `cargo nextest run -p flux-core checkpoint::sink` Expected: FAIL (no `submit`).
 - [ ] **Step 3: Implement** per the Interfaces block. Worker-fault messages: `wal_fault_or_gone()` text is kept for a dead WAL thread; for a vanished worker use `WalFault::new(Code::WalWriteFailed, io::ErrorKind::BrokenPipe, "the checkpoint hashing worker stopped")`.
 - [ ] **Step 4: Run:** `cargo nextest run -p flux-core checkpoint::` Expected: PASS (existing 12 sink tests plus the new ones); `cargo nextest run -p flux-core` all pass; clippy clean.
