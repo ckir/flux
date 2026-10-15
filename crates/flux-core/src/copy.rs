@@ -1740,6 +1740,8 @@ mod tests {
         );
         assert!(run.finish(&no_heartbeat).is_clean());
         // The `FileBegin` is flushed only with a `Range` and the discard dropped it, so the honest log may be absent.
+        // A smoke check only: it passes with or without the mutant. The job count above is the real
+        // assertion (R9).
         let bodies = if fs.exists(WAL_PATH) { wal_bodies(&fs) } else { Vec::new() };
         assert!(
             ranges_of(&bodies).iter().all(|r| r.range_end <= 3 * MIB as u64),
@@ -3604,8 +3606,13 @@ mod tests {
     /// partial are written, so the WAL holds the digests of exactly those chunks (one `Range` per chunk) and the
     /// failed copy removes its partial. Tests then put whatever partial they want at the temporary's name.
     fn crash_after(fs: &FaultFs, root: &Dir, chunks: usize) {
-        // Models inline hashing timing; the worker path is covered by copy::tests::a_checkpointed_copy_logs_the_same_ranges_with_and_without_the_worker,
-        // checkpoint::sink::tests::the_worker_log_equals_the_inline_log and flux-cli a_killed_large_file_resumes_from_its_validated_prefix (R11).
+        // R11: a kill may lose up to the in-flight pool's Ranges, which spec 3.6 allows and resume
+        // re-hashes; this fixture pins resume given an exact log, so its crashing run hashes
+        // inline.
+        // The worker path is covered by:
+        //   copy::tests::a_checkpointed_copy_logs_the_same_ranges_with_and_without_the_worker,
+        //   checkpoint::sink::tests::the_worker_log_equals_the_inline_log, and
+        //   flux-cli a_killed_large_file_resumes_from_its_validated_prefix.
         let _inline = crate::checkpoint::test_seams::OneCpu::new();
         let run = run_gen(fs, 1, Durability::Normal);
         let beat = || {
@@ -4019,9 +4026,14 @@ mod tests {
 
     #[test]
     fn a_chunks_resume_after_a_full_resume_that_crashed_reuses_the_full_prefix() {
-        // Models inline hashing timing; the worker path is covered by copy::tests::a_checkpointed_copy_logs_the_same_ranges_with_and_without_the_worker,
-        // checkpoint::sink::tests::the_worker_log_equals_the_inline_log and flux-cli a_killed_large_file_resumes_from_its_validated_prefix (R11).
-        let _inline = crate::checkpoint::test_seams::OneCpu::new();
+        // R11: a kill may lose up to the in-flight pool's Ranges, which spec 3.6 allows and resume
+        // re-hashes; this fixture pins resume given an exact log, so its crashing run hashes
+        // inline.
+        // The worker path is covered by:
+        //   copy::tests::a_checkpointed_copy_logs_the_same_ranges_with_and_without_the_worker,
+        //   checkpoint::sink::tests::the_worker_log_equals_the_inline_log, and
+        //   flux-cli a_killed_large_file_resumes_from_its_validated_prefix.
+        let inline = crate::checkpoint::test_seams::OneCpu::new();
         use crate::checkpoint::ResumeVerify::{Chunks, Full};
         let (fs, root) = ckpt_fs(5 * MIB);
         let src = fs.read_file("/src").unwrap();
@@ -4039,6 +4051,8 @@ mod tests {
             .expect("the crash stops the copy");
         assert_eq!(e.step, CopyStep::Heartbeat);
         assert!(run.finish(&no_heartbeat).is_clean());
+        // Only the crashing run hashes inline; the resuming run below uses the worker.
+        drop(inline);
         fs.write_file(PARTIAL, &src[..4 * MIB]);
         let run = run_gen_as(&fs, 2, Durability::Normal, Chunks);
         let staged = stage_normal(&fs, &root, &run);

@@ -5641,8 +5641,13 @@ mod checkpointing {
 
     /// `crashed_run` under `durability` (Strict stages the file through a batch).
     fn crashed_run_as(fs: &FaultFs, durability: Durability) {
-        // Models inline hashing timing; the worker path is covered by copy::tests::a_checkpointed_copy_logs_the_same_ranges_with_and_without_the_worker,
-        // checkpoint::sink::tests::the_worker_log_equals_the_inline_log and flux-cli a_killed_large_file_resumes_from_its_validated_prefix (R11).
+        // R11: a kill may lose up to the in-flight pool's Ranges, which spec 3.6 allows and resume
+        // re-hashes; this fixture pins resume given an exact log, so its crashing run hashes
+        // inline.
+        // The worker path is covered by:
+        //   copy::tests::a_checkpointed_copy_logs_the_same_ranges_with_and_without_the_worker,
+        //   checkpoint::sink::tests::the_worker_log_equals_the_inline_log, and
+        //   flux-cli a_killed_large_file_resumes_from_its_validated_prefix.
         let _inline = crate::checkpoint::test_seams::OneCpu::new();
         stop_beat_at(fs, 1, 3 * MIB, true, false);
         let o = CopyOptions { durability, ..opts() };
@@ -6021,8 +6026,13 @@ mod checkpointing {
     // is pending.)
     #[test]
     fn a_lost_lock_appends_nothing_even_with_an_eager_flush_policy() {
-        // Models inline hashing timing; the worker path is covered by copy::tests::a_checkpointed_copy_logs_the_same_ranges_with_and_without_the_worker,
-        // checkpoint::sink::tests::the_worker_log_equals_the_inline_log and flux-cli a_killed_large_file_resumes_from_its_validated_prefix (R11).
+        // R11: a kill may lose up to the in-flight pool's Ranges, which spec 3.6 allows and resume
+        // re-hashes; this fixture pins resume given an exact log, so its crashing run hashes
+        // inline.
+        // The worker path is covered by:
+        //   copy::tests::a_checkpointed_copy_logs_the_same_ranges_with_and_without_the_worker,
+        //   checkpoint::sink::tests::the_worker_log_equals_the_inline_log, and
+        //   flux-cli a_killed_large_file_resumes_from_its_validated_prefix.
         let _inline = crate::checkpoint::test_seams::OneCpu::new();
         let fs = Arc::new(big_fs(5 * MIB));
         let (entered, release) =
@@ -6083,8 +6093,13 @@ mod checkpointing {
     // Mutant: `FileSink::abort` sends `Close` again (it flushes the aborted file's pending records after the loss).
     #[test]
     fn a_lost_lock_appends_nothing_after_the_loss() {
-        // Models inline hashing timing; the worker path is covered by copy::tests::a_checkpointed_copy_logs_the_same_ranges_with_and_without_the_worker,
-        // checkpoint::sink::tests::the_worker_log_equals_the_inline_log and flux-cli a_killed_large_file_resumes_from_its_validated_prefix (R11).
+        // R11: a kill may lose up to the in-flight pool's Ranges, which spec 3.6 allows and resume
+        // re-hashes; this fixture pins resume given an exact log, so its crashing run hashes
+        // inline.
+        // The worker path is covered by:
+        //   copy::tests::a_checkpointed_copy_logs_the_same_ranges_with_and_without_the_worker,
+        //   checkpoint::sink::tests::the_worker_log_equals_the_inline_log, and
+        //   flux-cli a_killed_large_file_resumes_from_its_validated_prefix.
         let _inline = crate::checkpoint::test_seams::OneCpu::new();
         let fs = Arc::new(big_fs(5 * MIB));
         // Nothing flushes on its own: no threshold, an hour's interval. Ranges are queued as the file streams; the
@@ -6145,8 +6160,13 @@ mod checkpointing {
     // Mutant: a failed heartbeat is treated as an ordinary ending (the run is Completed or the log is not joined).
     #[test]
     fn a_failed_heartbeat_ends_the_run_failed_and_joins_the_log() {
-        // Models inline hashing timing; the worker path is covered by copy::tests::a_checkpointed_copy_logs_the_same_ranges_with_and_without_the_worker,
-        // checkpoint::sink::tests::the_worker_log_equals_the_inline_log and flux-cli a_killed_large_file_resumes_from_its_validated_prefix (R11).
+        // R11: a kill may lose up to the in-flight pool's Ranges, which spec 3.6 allows and resume
+        // re-hashes; this fixture pins resume given an exact log, so its crashing run hashes
+        // inline.
+        // The worker path is covered by:
+        //   copy::tests::a_checkpointed_copy_logs_the_same_ranges_with_and_without_the_worker,
+        //   checkpoint::sink::tests::the_worker_log_equals_the_inline_log, and
+        //   flux-cli a_killed_large_file_resumes_from_its_validated_prefix.
         let _inline = crate::checkpoint::test_seams::OneCpu::new();
         let fs = big_fs(5 * MIB);
         stop_beat_at(&fs, 1, 2 * MIB, false, false);
@@ -6723,9 +6743,14 @@ mod checkpointing {
     // digests on a FILE_BEGIN.
     #[test]
     fn a_stale_record_from_an_earlier_generation_does_not_mix_with_the_current_one() {
-        // Models inline hashing timing; the worker path is covered by copy::tests::a_checkpointed_copy_logs_the_same_ranges_with_and_without_the_worker,
-        // checkpoint::sink::tests::the_worker_log_equals_the_inline_log and flux-cli a_killed_large_file_resumes_from_its_validated_prefix (R11).
-        let _inline = crate::checkpoint::test_seams::OneCpu::new();
+        // R11: a kill may lose up to the in-flight pool's Ranges, which spec 3.6 allows and resume
+        // re-hashes; this fixture pins resume given an exact log, so its crashing run hashes
+        // inline.
+        // The worker path is covered by:
+        //   copy::tests::a_checkpointed_copy_logs_the_same_ranges_with_and_without_the_worker,
+        //   checkpoint::sink::tests::the_worker_log_equals_the_inline_log, and
+        //   flux-cli a_killed_large_file_resumes_from_its_validated_prefix.
+        let inline = crate::checkpoint::test_seams::OneCpu::new();
         let fs = big_fs(5 * MIB);
         crashed_run(&fs);
         fs.remove_file(Path::new(&partial())).unwrap();
@@ -6759,6 +6784,8 @@ mod checkpointing {
             RunConfig { operation_id: id(8), heartbeat_interval: Duration::ZERO, ..resume() };
         let (r, _) = run_with(&fs, &second, &opts(), policy(Durability::Normal, 1));
         assert!(matches!(&r.copy, Some(Err(_))), "{:?}", r.copy);
+        // Only the crashing runs hash inline; the resuming run below uses the worker.
+        drop(inline);
         let recs = segment_records(&fs);
         let gens: Vec<u64> = recs.iter().map(|(h, _)| h.generation).collect();
         assert!(gens.contains(&1) && gens.contains(&2), "{gens:?}");

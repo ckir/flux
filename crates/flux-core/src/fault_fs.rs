@@ -2330,6 +2330,25 @@ mod tests {
     }
 
     #[test]
+    fn fail_read_nth_re_arming_restarts_the_count_from_one() {
+        use std::io::Read;
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"abcdefghijkl");
+        fs.fail_read_nth("src", 2, std::io::ErrorKind::TimedOut);
+        let mut r = fs.open_read(Path::new("/src")).unwrap();
+        let mut b = [0u8; 3];
+        assert_eq!(r.read(&mut b).unwrap(), 3); // read 1 of the first arming: not the nth
+        // Re-arm with a different nth: the count restarts, so this read (the 2nd overall) is read 1.
+        fs.fail_read_nth("src", 3, std::io::ErrorKind::TimedOut);
+        assert_eq!(r.read(&mut b).unwrap(), 3, "read 1 since the re-arm, not the old nth");
+        assert_eq!(r.read(&mut b).unwrap(), 3, "read 2 since the re-arm");
+        let e = r.read(&mut b).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "read 3 since the re-arm fails");
+        assert_eq!(r.read(&mut b).unwrap(), 3, "the failure is once");
+        assert_eq!(&b, b"jkl");
+    }
+
+    #[test]
     fn a_duplicate_syncs_the_same_file_from_another_thread() {
         let fs = FaultFs::new();
         fs.set_identity("/p", FileIdentity::Strong(flux_fs::ObjectId { volume: 1, index: 7 }));
