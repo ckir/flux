@@ -391,6 +391,10 @@ impl<W> State<W> {
         }
         let mut msg = Msg::Range(range);
         loop {
+            // Before EVERY attempt, the first and each one after a retry sleep: nothing is sent after a cancel.
+            if self.cancel.load(Ordering::SeqCst) {
+                return Err(Stop::Cancelled);
+            }
             match self.link.try_send(msg) {
                 Ok(()) => {
                     #[cfg(test)]
@@ -410,9 +414,6 @@ impl<W> State<W> {
                 }
                 Err(TrySendError::Full(back)) => {
                     msg = back;
-                    if self.cancel.load(Ordering::SeqCst) {
-                        return Err(Stop::Cancelled);
-                    }
                     if let Some(f) = self.link.fault() {
                         return Err(Stop::Fault(f));
                     }
@@ -659,21 +660,23 @@ mod tests {
         run.abandon();
     }
 
-    #[test]
-    fn cancel_stops_a_worker_blocked_on_a_full_channel() {
-        let (fs, _dir) = ws();
-        let beat: &Heartbeat = &|| Ok(());
+    /// A run whose writer is held: Strict, every `sync_all` delayed by `HOLD`, a one-slot channel, and a `Flush` the
+    /// writer is stuck in (the duplicate's `sync_all` comes first, so the segment does not exist until the hold ends).
+    /// The returned handle is the partial, kept open for the duplicate's sake.
+    fn held_run(fs: &FaultFs, beat: &Heartbeat<'_>) -> (Checkpoints<FakeDirHandle>, FakeHandle) {
         let p = fs.create_new(Path::new("/ws/p")).unwrap();
         fs.delay("sync_all", HOLD);
         let mut pol = policy(1, Durability::Strict);
         pol.wal.channel_cap = 1;
-        let run = open_run(&fs, pol);
+        let run = open_run(fs, pol);
         begin(&run, Some(p.duplicate().unwrap()), beat);
-        // The writer takes the flush and is held in the duplicate's `sync_all`, before the segment exists.
         run.sender.send(Msg::Flush, beat).unwrap();
-        let live = Worker::live_for_tests();
-        let mut w = Worker::spawn(args(&run, 1, extras(MIB))).unwrap();
-        // Three one-chunk jobs: the first Range fills the one-slot channel, the second finds it full.
+        (run, p)
+    }
+
+    /// Feeds a `range_chunks = 1` worker on a held run until it is in its full-channel retry loop: the first Range
+    /// fills the one slot, the second finds it full.
+    fn block_on_a_full_channel(w: &Worker) {
         let mut buf = vec![0u8; MIB];
         for _ in 0..3 {
             w.submit(buf, MIB).unwrap();
@@ -681,9 +684,18 @@ mod tests {
         }
         // Two more buffers back (the first two jobs' own): the second job is hashed, its Range is being sent.
         for _ in 0..2 {
-            buf = w.recv_free(DEADLINE).unwrap();
+            w.recv_free(DEADLINE).unwrap();
         }
-        drop(buf);
+    }
+
+    #[test]
+    fn cancel_stops_a_worker_blocked_on_a_full_channel() {
+        let (fs, _dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let (run, _p) = held_run(&fs, beat);
+        let live = Worker::live_for_tests();
+        let mut w = Worker::spawn(args(&run, 1, extras(MIB))).unwrap();
+        block_on_a_full_channel(&w);
         let t = Instant::now();
         w.cancel_and_join(Some(beat));
         let took = t.elapsed();
@@ -720,16 +732,67 @@ mod tests {
     fn dropping_a_worker_joins_its_thread() {
         let (fs, _dir) = ws();
         let beat: &Heartbeat = &|| Ok(());
-        let run = open_run(&fs, policy(4, Durability::Normal));
-        begin(&run, None, beat);
+        let (run, _p) = held_run(&fs, beat);
         let start = Worker::live_for_tests();
         let spawned = Worker::spawned_for_tests();
-        let w = Worker::spawn(args(&run, 4, extras(PIECE))).unwrap();
+        let w = Worker::spawn(args(&run, 1, extras(MIB))).unwrap();
         assert_eq!(Worker::spawned_for_tests(), spawned + 1);
         assert_eq!(Worker::live_for_tests(), start + 1);
-        w.submit(vec![1u8; PIECE], PIECE).unwrap();
+        // Busy: blocked on a full channel with a Range pending, so closing its submit channel alone cannot end it
+        // before the writer is released; only the cancel flag can.
+        block_on_a_full_channel(&w);
         drop(w);
-        wait_for("the worker thread to end", || (Worker::live_for_tests() == start).then_some(()));
+        // No polling: `drop` returns only after the thread is joined, and the live guard drops inside the thread.
+        assert_eq!(Worker::live_for_tests(), start, "drop returned with the worker thread alive");
+        assert!(
+            fs.read_file(WAL_PATH).is_none(),
+            "drop waited for the writer's release instead of cancelling the worker"
+        );
         run.abandon();
+    }
+
+    #[test]
+    fn a_cancelled_worker_sends_no_range() {
+        let (fs, _dir) = ws();
+        let beat: &Heartbeat = &|| Ok(());
+        let run = open_run(&fs, policy(4, Durability::Normal));
+        begin(&run, None, beat);
+        // The thread body is driven on this thread, so the cancel lands at a known point: a spawned worker may already
+        // be past its loop-top check, blocked in `recv`, when a test sets the flag.
+        let cancel = Arc::new(AtomicBool::new(true));
+        let state = || State {
+            link: run.sender.link(),
+            file_id: b"f".to_vec(),
+            hasher: ChunkHasher::new(),
+            digests: Vec::new(),
+            range_start: 0,
+            range_chunks: 4,
+            cancel: Arc::clone(&cancel),
+            inject: Inject::default(),
+            sent: 0,
+        };
+        // Cancelled between jobs, with a queued job that completes a whole Range (4 chunks): the body takes no job,
+        // so the job's buffer never comes back.
+        let (jobs_tx, jobs_rx) = mpsc::sync_channel(POOL);
+        let (free_tx, free_rx) = mpsc::channel();
+        jobs_tx.send(Job { buf: data(4 * MIB), n: 4 * MIB }).unwrap();
+        drop(jobs_tx);
+        assert!(matches!(state().run(&jobs_rx, &free_tx), Exit::Cancelled));
+        assert!(free_rx.try_recv().is_err(), "the cancelled worker took a job");
+        // Cancelled with a Range built (a later chunk of the same job, or an attempt after a retry sleep), the
+        // channel NOT full: nothing is sent.
+        let mut s = state();
+        let range = Range {
+            file_id: b"f".to_vec(),
+            attempt_id: ATTEMPT_ID,
+            range_start: 0,
+            range_end: CHUNK_SIZE,
+            digests: vec![[0u8; 32]],
+        };
+        assert!(matches!(s.send(range), Err(Stop::Cancelled)), "a Range was sent after the cancel");
+        assert_eq!(s.sent, 0);
+        drop(s);
+        assert!(run.finish(beat).is_clean());
+        assert!(ranges(&fs).is_empty(), "no Range reached the log");
     }
 }
