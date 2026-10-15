@@ -1361,6 +1361,7 @@ mod tests {
                 }
             }
         }
+        assert!(matches!(sink.hashing, Hashing::Worker(_)), "this test must run a worker");
         match got {
             Some(SinkError::Wal(f)) => assert_eq!(f.code, Code::DiskFull),
             other => panic!("expected Wal, got {other:?}"),
@@ -1396,6 +1397,47 @@ mod tests {
             let (worker, worker_spawned) = run_file(Force::Auto, &src, prefix, carry, 4);
             assert_eq!(worker_spawned, 1, "{what}: the worker run used a worker (needs > 1 CPU)");
             assert_eq!(fallback, worker, "{what}: the fallback log differs from the worker's");
+            assert_oracle(&fallback, &src, &what);
+        }
+    }
+
+    #[test]
+    fn a_failed_spawn_falls_back_inline_under_strict_too() {
+        let src = data(8 * MIB + 5);
+        let beat: &Heartbeat = &|| Ok(());
+        for (prefix, carry) in [(0, 0), (0, 300 * 1024), (2 * MIB, 0), (2 * MIB, 300 * 1024)] {
+            let what = format!("Strict, prefix {prefix}, carry {carry}");
+            {
+                // `Pending` is selected under SpawnFails whatever the durability; the first submit then falls back.
+                let _force = ForceGuard::set(Force::SpawnFails);
+                let (fs, _dir) = ws();
+                let p = fs.create_new(Path::new("/ws/p")).unwrap();
+                let run = open_run(&fs, policy(4, Durability::Strict));
+                let dup = Some(p.duplicate().unwrap());
+                let mut sink =
+                    FileSink::begin(&fc(&run), &meta(src.len() as u64), prefix as u64, dup, beat)
+                        .unwrap();
+                assert!(matches!(sink.hashing, Hashing::Pending), "{what}: not Pending at begin");
+                if prefix > 0 {
+                    sink.record_proven(&chunk_digests(&src[..prefix]), beat).unwrap();
+                }
+                let carry_end = prefix + carry;
+                sink.wrote(&src[prefix..carry_end], beat).unwrap();
+                let piece = &src[carry_end..carry_end + PIECE];
+                let mut buf = vec![0u8; PIECE];
+                buf.copy_from_slice(piece);
+                let _ = sink.submit(buf, PIECE, beat).unwrap();
+                assert!(matches!(sink.hashing, Hashing::Inline), "{what}: no fallback to Inline");
+                sink.abort(beat);
+                drop(sink);
+                run.abandon();
+            }
+            let (fallback, spawned) =
+                run_file_with(Durability::Strict, Force::SpawnFails, &src, prefix, carry, 4);
+            assert_eq!(spawned, 0, "{what}: a flux-hash thread was spawned");
+            let (inline, _) =
+                run_file_with(Durability::Strict, Force::OneCpu, &src, prefix, carry, 4);
+            assert_eq!(fallback, inline, "{what}: the fallback log differs from the Inline log");
             assert_oracle(&fallback, &src, &what);
         }
     }

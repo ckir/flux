@@ -179,7 +179,9 @@ impl Worker {
         match FORCE.get() {
             Force::Worker => return true,
             Force::OneCpu => return false,
-            Force::Auto | Force::SpawnFails => {}
+            // `Pending` is selected and the spawn then fails: the fallback is exercised for either durability.
+            Force::SpawnFails => return Worker::available(),
+            Force::Auto => {}
         }
         durability == flux_fs::Durability::Normal && Worker::available()
     }

@@ -1675,9 +1675,10 @@ mod tests {
 
     // ---- cut 9h, task 5: the copy loop hands written buffers to the hashing worker ----
     //
-    // The worker tests need more than one CPU (`Worker::available`); each asserts `test_seams::spawned() > 0`, so on
-    // a one-CPU machine they fail loudly instead of passing without a worker. `FORCE`, the spawn and the job counters
-    // are thread-locals: a test that stages on a helper thread sets and reads them there.
+    // The worker tests need more than one CPU (`Worker::wanted`: Normal durability and more than one CPU); each
+    // asserts `test_seams::spawned() > 0`, so on a one-CPU machine they fail loudly instead of passing without a
+    // worker. `FORCE`, the spawn and the job counters are thread-locals: a test that stages on a helper thread sets
+    // and reads them there.
 
     use crate::checkpoint::test_seams;
 
