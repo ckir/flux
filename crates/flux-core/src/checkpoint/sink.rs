@@ -116,7 +116,11 @@ impl<'a, D: DirHandle + Send + 'static> FileSink<'a, D> {
             digests: Vec::new(),
             // Nothing is registered until the message is queued, so a failed `begin` leaves nothing to close.
             ended: true,
-            hashing: if Worker::available() { Hashing::Pending } else { Hashing::Inline },
+            hashing: if Worker::wanted(fc.run.durability()) {
+                Hashing::Pending
+            } else {
+                Hashing::Inline
+            },
         };
         sink.send(Msg::FileBegin { begin, dup }, beat)?;
         let mut sink = sink;
@@ -899,13 +903,28 @@ mod tests {
         carry: usize,
         range_chunks: usize,
     ) -> (Vec<Range>, usize) {
+        run_file_with(Durability::Normal, force, src, prefix, carry, range_chunks)
+    }
+
+    fn run_file_with(
+        durability: Durability,
+        force: Force,
+        src: &[u8],
+        prefix: usize,
+        carry: usize,
+        range_chunks: usize,
+    ) -> (Vec<Range>, usize) {
         let _force = ForceGuard::set(force);
         let spawned = Worker::spawned_for_tests();
         let (fs, _dir) = ws();
         let beat: &Heartbeat = &|| Ok(());
-        let run = open_run(&fs, policy(range_chunks, Durability::Normal));
+        let run = open_run(&fs, policy(range_chunks, durability));
+        // A Strict run syncs the partial, so it needs the duplicate; a Normal run has none (as before).
+        let partial =
+            (durability == Durability::Strict).then(|| fs.create_new(Path::new("/ws/p")).unwrap());
+        let dup = partial.as_ref().map(|p| p.duplicate().unwrap());
         let mut sink =
-            FileSink::begin(&fc(&run), &meta(src.len() as u64), prefix as u64, None, beat).unwrap();
+            FileSink::begin(&fc(&run), &meta(src.len() as u64), prefix as u64, dup, beat).unwrap();
         if prefix > 0 {
             sink.record_proven(&chunk_digests(&src[..prefix]), beat).unwrap();
         }
@@ -952,11 +971,73 @@ mod tests {
         len: usize,
         beat: &Heartbeat<'_>,
     ) -> FileSink<'a, FakeDirHandle> {
-        let sink =
-            FileSink::begin(&fc(run), &meta(len as u64), 0, Some(p.duplicate().unwrap()), beat)
-                .unwrap();
+        // The run is Strict, so the worker is forced for the `begin` that chooses the mode (ruling R15); the
+        // caller's own seam value (and any injection) is put back right after.
+        let prev = FORCE.replace(Force::Worker);
+        let began =
+            FileSink::begin(&fc(run), &meta(len as u64), 0, Some(p.duplicate().unwrap()), beat);
+        FORCE.set(prev);
+        let sink = began.unwrap();
         run.sender.send(Msg::Flush, beat).unwrap();
         sink
+    }
+
+    #[test]
+    fn normal_durability_hashes_on_a_worker_and_strict_inline() {
+        let _force = ForceGuard::set(Force::Auto);
+        let beat: &Heartbeat = &|| Ok(());
+        let spawned = Worker::spawned_for_tests();
+
+        let (fs, _dir) = ws();
+        let run = open_run(&fs, policy(4, Durability::Normal));
+        let mut sink = FileSink::begin(&fc(&run), &meta(PIECE as u64), 0, None, beat).unwrap();
+        assert!(matches!(sink.hashing, Hashing::Pending), "Normal selects the worker");
+        let buf = sink.submit(vec![7u8; PIECE], PIECE, beat).unwrap();
+        assert!(matches!(sink.hashing, Hashing::Worker(_)), "the first submit spawns it");
+        assert_eq!(Worker::spawned_for_tests(), spawned + 1);
+        drop(buf);
+        sink.complete(beat).unwrap();
+        drop(sink);
+        assert!(run.finish(beat).is_clean());
+
+        let (fs, _dir) = ws();
+        let p = fs.create_new(Path::new("/ws/p")).unwrap();
+        let run = open_run(&fs, policy(4, Durability::Strict));
+        let spawned = Worker::spawned_for_tests();
+        let dup = Some(p.duplicate().unwrap());
+        let mut sink = FileSink::begin(&fc(&run), &meta(PIECE as u64), 0, dup, beat).unwrap();
+        assert!(matches!(sink.hashing, Hashing::Inline), "Strict hashes inline");
+        let buf = sink.submit(vec![7u8; PIECE], PIECE, beat).unwrap();
+        assert!(matches!(sink.hashing, Hashing::Inline), "a submit keeps it inline");
+        assert_eq!(Worker::spawned_for_tests(), spawned, "Strict never spawns a worker");
+        drop(buf);
+        sink.complete(beat).unwrap();
+        drop(sink);
+        assert!(run.finish(beat).is_clean());
+    }
+
+    #[test]
+    fn the_worker_override_selects_a_worker_under_strict() {
+        let _force = ForceGuard::set(Force::Worker);
+        let beat: &Heartbeat = &|| Ok(());
+        let (fs, _dir) = ws();
+        let run = open_run(&fs, policy(4, Durability::Strict));
+        let mut sink = FileSink::begin(&fc(&run), &meta(PIECE as u64), 0, None, beat).unwrap();
+        assert!(matches!(sink.hashing, Hashing::Pending));
+        sink.abort(beat);
+    }
+
+    #[test]
+    fn a_strict_sink_logs_the_same_ranges_as_a_normal_one() {
+        let src = data(3 * MIB + MIB / 2);
+        let (normal, normal_spawned) =
+            run_file_with(Durability::Normal, Force::Auto, &src, 0, 0, 4);
+        let (strict, strict_spawned) =
+            run_file_with(Durability::Strict, Force::Auto, &src, 0, 0, 4);
+        assert_eq!(normal_spawned, 1);
+        assert_eq!(strict_spawned, 0);
+        assert_eq!(strict, normal, "the log is mode-independent");
+        assert_oracle(&strict, &src, "strict");
     }
 
     fn worker_of<'s>(sink: &'s FileSink<'_, FakeDirHandle>) -> &'s Worker {

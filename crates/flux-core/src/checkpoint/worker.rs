@@ -56,6 +56,8 @@ pub(super) enum Force {
     Auto,
     OneCpu,
     SpawnFails,
+    /// A worker whatever the durability (the Strict held-writer tests need one).
+    Worker,
 }
 
 #[cfg(test)]
@@ -163,11 +165,23 @@ impl Worker {
         match FORCE.get() {
             Force::OneCpu => return false,
             // The worker tests do not depend on the machine's CPU count.
-            Force::Auto => return true,
+            Force::Auto | Force::Worker => return true,
             Force::SpawnFails => {}
         }
         // An unknown count is treated as one CPU: the inline path is always correct.
         std::thread::available_parallelism().is_ok_and(|n| n.get() > 1)
+    }
+
+    /// Whether a file's hashing runs on a worker: only under Normal durability (ruling R15; under Strict the fsyncs
+    /// mask the hashing and the worker would only cost CPU), and not on a single CPU.
+    pub(super) fn wanted(durability: flux_fs::Durability) -> bool {
+        #[cfg(test)]
+        match FORCE.get() {
+            Force::Worker => return true,
+            Force::OneCpu => return false,
+            Force::Auto | Force::SpawnFails => {}
+        }
+        durability == flux_fs::Durability::Normal && Worker::available()
     }
 
     pub(super) fn spawn<W: Send + 'static>(args: WorkerArgs<W>) -> io::Result<Worker> {
