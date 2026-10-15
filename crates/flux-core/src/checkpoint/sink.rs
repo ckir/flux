@@ -1052,8 +1052,16 @@ mod tests {
     fn the_worker_log_equals_the_inline_log() {
         // 2 MiB + 5 with the 2 MiB proven prefix leaves a remainder shorter than one buffer.
         let sizes = [MIB - 1, MIB, 2 * MIB + 5, 3 * MIB + MIB / 2, 8 * MIB, 8 * MIB + 5];
-        // (proven prefix, carry): none, a 2 MiB proven prefix, a 300 KiB carry.
-        let cases = [(0, 0), (2 * MIB, 0), (0, 300 * 1024)];
+        // (proven prefix, carry): none, a 2 MiB proven prefix, a 300 KiB carry, and carries of whole chunks (what a
+        // resume mismatch hands over: the carry's completed chunks are digests the sink holds before the first submit).
+        let cases = [
+            (0, 0),
+            (2 * MIB, 0),
+            (0, 300 * 1024),
+            (0, MIB),
+            (0, 2 * MIB + 300 * 1024),
+            (2 * MIB, MIB),
+        ];
         for size in sizes {
             let src = data(size);
             for (prefix, carry) in cases {
@@ -1377,13 +1385,17 @@ mod tests {
     fn the_inline_fallback_is_used_for_one_cpu_and_a_failed_spawn() {
         let src = data(8 * MIB + 5);
         // (mode, proven prefix, carry): the failed spawn is tried with hashing state already in the sink (a carry
-        // with a partial chunk, a proven prefix, both), so a fallback that lost that state would log differently.
+        // with a partial chunk, a carry of whole chunks whose digests are pending, a proven prefix, both), so a
+        // fallback that lost that state would log differently.
         let cases = [
             (Force::OneCpu, 0, 0),
             (Force::SpawnFails, 0, 0),
             (Force::SpawnFails, 0, 300 * 1024),
+            (Force::SpawnFails, 0, MIB),
+            (Force::SpawnFails, 0, 2 * MIB + 300 * 1024),
             (Force::SpawnFails, 2 * MIB, 0),
             (Force::SpawnFails, 2 * MIB, 300 * 1024),
+            (Force::SpawnFails, 2 * MIB, MIB),
         ];
         for (force, prefix, carry) in cases {
             let what = format!("{force:?}, prefix {prefix}, carry {carry}");
@@ -1405,7 +1417,9 @@ mod tests {
     fn a_failed_spawn_falls_back_inline_under_strict_too() {
         let src = data(8 * MIB + 5);
         let beat: &Heartbeat = &|| Ok(());
-        for (prefix, carry) in [(0, 0), (0, 300 * 1024), (2 * MIB, 0), (2 * MIB, 300 * 1024)] {
+        for (prefix, carry) in
+            [(0, 0), (0, 300 * 1024), (0, MIB), (2 * MIB, 0), (2 * MIB, 300 * 1024), (2 * MIB, MIB)]
+        {
             let what = format!("Strict, prefix {prefix}, carry {carry}");
             {
                 // `Pending` is selected under SpawnFails whatever the durability; the first submit then falls back.
