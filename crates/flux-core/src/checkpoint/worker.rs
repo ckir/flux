@@ -172,8 +172,8 @@ impl Worker {
         std::thread::available_parallelism().is_ok_and(|n| n.get() > 1)
     }
 
-    /// Whether a file's hashing runs on a worker: only under Normal durability (ruling R15; under Strict the fsyncs
-    /// mask the hashing and the worker would only cost CPU), and not on a single CPU.
+    /// Whether a file's hashing runs on a worker: only under Normal durability (ruling R15; measured under Strict,
+    /// the worker's wall time is within the spread of inline hashing while it costs more CPU), and not on a single CPU.
     pub(super) fn wanted(durability: flux_fs::Durability) -> bool {
         #[cfg(test)]
         match FORCE.get() {
