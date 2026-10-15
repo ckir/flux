@@ -12,7 +12,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::UNIX_EPOCH;
 
 /// The attempt number every checkpointed file uses.
-const ATTEMPT_ID: u64 = 1;
+pub(super) const ATTEMPT_ID: u64 = 1;
 
 #[derive(Debug)]
 pub(crate) enum SinkError {

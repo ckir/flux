@@ -5,6 +5,8 @@
 
 mod decide;
 mod sink;
+#[allow(dead_code)]
+mod worker;
 
 use crate::copy::Heartbeat;
 use crate::wal::replay::{FileState, Scan, WalError, load_file};
