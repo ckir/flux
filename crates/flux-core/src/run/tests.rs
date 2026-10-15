@@ -6026,14 +6026,6 @@ mod checkpointing {
     // is pending.)
     #[test]
     fn a_lost_lock_appends_nothing_even_with_an_eager_flush_policy() {
-        // R11: a kill may lose up to the in-flight pool's Ranges, which spec 3.6 allows and resume
-        // re-hashes; this fixture pins resume given an exact log, so its crashing run hashes
-        // inline.
-        // The worker path is covered by:
-        //   copy::tests::a_checkpointed_copy_logs_the_same_ranges_with_and_without_the_worker,
-        //   checkpoint::sink::tests::the_worker_log_equals_the_inline_log, and
-        //   flux-cli a_killed_large_file_resumes_from_its_validated_prefix.
-        let _inline = crate::checkpoint::test_seams::OneCpu::new();
         let fs = Arc::new(big_fs(5 * MIB));
         let (entered, release) =
             (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
@@ -6093,14 +6085,6 @@ mod checkpointing {
     // Mutant: `FileSink::abort` sends `Close` again (it flushes the aborted file's pending records after the loss).
     #[test]
     fn a_lost_lock_appends_nothing_after_the_loss() {
-        // R11: a kill may lose up to the in-flight pool's Ranges, which spec 3.6 allows and resume
-        // re-hashes; this fixture pins resume given an exact log, so its crashing run hashes
-        // inline.
-        // The worker path is covered by:
-        //   copy::tests::a_checkpointed_copy_logs_the_same_ranges_with_and_without_the_worker,
-        //   checkpoint::sink::tests::the_worker_log_equals_the_inline_log, and
-        //   flux-cli a_killed_large_file_resumes_from_its_validated_prefix.
-        let _inline = crate::checkpoint::test_seams::OneCpu::new();
         let fs = Arc::new(big_fs(5 * MIB));
         // Nothing flushes on its own: no threshold, an hour's interval. Ranges are queued as the file streams; the
         // heartbeat fails 2 MiB in, and the guard of the discard that follows finds the lock gone.
@@ -6160,14 +6144,6 @@ mod checkpointing {
     // Mutant: a failed heartbeat is treated as an ordinary ending (the run is Completed or the log is not joined).
     #[test]
     fn a_failed_heartbeat_ends_the_run_failed_and_joins_the_log() {
-        // R11: a kill may lose up to the in-flight pool's Ranges, which spec 3.6 allows and resume
-        // re-hashes; this fixture pins resume given an exact log, so its crashing run hashes
-        // inline.
-        // The worker path is covered by:
-        //   copy::tests::a_checkpointed_copy_logs_the_same_ranges_with_and_without_the_worker,
-        //   checkpoint::sink::tests::the_worker_log_equals_the_inline_log, and
-        //   flux-cli a_killed_large_file_resumes_from_its_validated_prefix.
-        let _inline = crate::checkpoint::test_seams::OneCpu::new();
         let fs = big_fs(5 * MIB);
         stop_beat_at(&fs, 1, 2 * MIB, false, false);
         let (r, _) = run_with(&fs, &beating(), &opts(), lazy(Durability::Normal));

@@ -1806,7 +1806,6 @@ mod tests {
 
     #[test]
     fn a_panic_in_the_copy_thread_does_not_leave_a_worker_blocked() {
-        let live_before = test_seams::live();
         let spawned = within_deadline("panic", || {
             let (fs, root) = ckpt_fs(HASH_SRC);
             let run = ckpt_run(&fs, hash_policy());
@@ -1820,23 +1819,24 @@ mod tests {
                 }
                 Ok(())
             };
-            let spawned = test_seams::spawned();
+            // The live count is per spawning thread: this helper thread is the spawner.
+            let (spawned, live_before) = (test_seams::spawned(), test_seams::live());
             let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = stage_ckpt(&fs, &root, &run, Durability::Normal, &beat);
             }));
             assert!(unwound.is_err(), "the heartbeat panicked");
             run.abandon();
+            let end = std::time::Instant::now() + Duration::from_secs(5);
+            while test_seams::live() != live_before {
+                assert!(
+                    std::time::Instant::now() < end,
+                    "a flux-hash thread outlived the panicked copy"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
             test_seams::spawned() - spawned
         });
         assert!(spawned > 0, "a flux-hash worker was running when the copy thread panicked");
-        let end = std::time::Instant::now() + Duration::from_secs(10);
-        while test_seams::live() != live_before {
-            assert!(
-                std::time::Instant::now() < end,
-                "a flux-hash thread outlived the panicked copy"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
     }
 
     #[test]

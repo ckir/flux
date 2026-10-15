@@ -81,7 +81,7 @@ pub(crate) fn mtime_pair(t: std::time::SystemTime) -> (i64, u32) {
 
 impl<'a, D: DirHandle + Send + 'static> FileSink<'a, D> {
     /// Registers the file with the log. `valid_through` is a byte offset on a chunk boundary, or the source length
-    /// (a fully validated partial whose last chunk is short): the bytes fed to `wrote` start there, and chunk
+    /// (a fully validated partial whose last chunk is short): the bytes fed to `wrote` or `submit` start there, and chunk
     /// numbering resumes from it. At the source length no bytes follow, so no chunk is ever numbered from it.
     pub(crate) fn begin(
         fc: &FileCkpt<'a, D>,
@@ -244,7 +244,7 @@ impl<'a, D: DirHandle + Send + 'static> FileSink<'a, D> {
     }
 
     /// Records digests `full` proved for `[0, valid_through)`: one `Range` per `policy.range_chunks` chunks, from
-    /// offset 0, the last ending at `valid_through`. Call once, right after `begin`, before the first `wrote`.
+    /// offset 0, the last ending at `valid_through`. Call once, right after `begin`, before the first `wrote` or `submit`.
     /// `range_start`, the hasher and the pending digests are left as `begin` set them.
     pub(crate) fn record_proven(
         &mut self,
@@ -969,7 +969,8 @@ mod tests {
 
     #[test]
     fn the_worker_log_equals_the_inline_log() {
-        let sizes = [MIB - 1, MIB, 3 * MIB + MIB / 2, 8 * MIB, 8 * MIB + 5];
+        // 2 MiB + 5 with the 2 MiB proven prefix leaves a remainder shorter than one buffer.
+        let sizes = [MIB - 1, MIB, 2 * MIB + 5, 3 * MIB + MIB / 2, 8 * MIB, 8 * MIB + 5];
         // (proven prefix, carry): none, a 2 MiB proven prefix, a 300 KiB carry.
         let cases = [(0, 0), (2 * MIB, 0), (0, 300 * 1024)];
         for size in sizes {
@@ -1091,6 +1092,7 @@ mod tests {
         let src = data(len);
         let beats = AtomicUsize::new(0);
         let done = std::sync::atomic::AtomicBool::new(false);
+        let spawned_by_helper = AtomicUsize::new(0);
         std::thread::scope(|s| {
             let helper = s.spawn(|| {
                 let ok: &Heartbeat = &|| Ok(());
@@ -1113,6 +1115,8 @@ mod tests {
                 }
                 done.store(true, Ordering::SeqCst);
                 sink.complete(ok).unwrap();
+                // The counter is this (fresh) helper thread's own.
+                spawned_by_helper.store(Worker::spawned_for_tests(), Ordering::SeqCst);
             });
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             loop {
@@ -1127,6 +1131,8 @@ mod tests {
         });
         assert!(done.load(Ordering::SeqCst));
         assert!(run.finish(ok).is_clean());
+        // Inline mode also beats inside `sender.send`; only a worker makes this test about the pool wait.
+        assert!(spawned_by_helper.load(Ordering::SeqCst) >= 1, "a worker ran on the helper thread");
         assert_oracle(&ranges(&fs), &src, "held writer");
 
         // A failing heartbeat ends the pool wait with that error.
@@ -1390,6 +1396,9 @@ mod tests {
     fn dropping_an_unended_sink_joins_its_worker_then_trips_the_assert() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static LIVE_AT_ASSERT: AtomicUsize = AtomicUsize::new(usize::MAX);
+        // The panic hook is process-wide: hold this for the whole test so it cannot disturb another test's panics.
+        static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _hook = HOOK.lock().unwrap_or_else(|p| p.into_inner());
         let (fs, _dir) = ws();
         let beat: &Heartbeat = &|| Ok(());
         let _force = ForceGuard::set(Force::Auto);

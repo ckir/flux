@@ -21,8 +21,6 @@ use std::time::Duration;
 
 #[cfg(test)]
 use std::cell::Cell;
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
 
 /// Buffers per file: the caller's own plus `POOL - 1` extras.
 pub(super) const POOL: usize = 4;
@@ -70,27 +68,43 @@ thread_local! {
     static SUBMITTED: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Worker threads alive in this process (spawned and not yet at the end of their body).
+/// Worker threads alive, counted per SPAWNING thread: libtest runs tests as threads of one process, so a
+/// process-wide count would see other tests' workers (ruling R12).
 #[cfg(test)]
-static LIVE: AtomicUsize = AtomicUsize::new(0);
+static LIVE: Mutex<Option<std::collections::HashMap<std::thread::ThreadId, usize>>> =
+    Mutex::new(None);
 
-/// Decrements `LIVE` when dropped: created at spawn, moved into the thread, dropped last in its body (or with the
-/// closure, when the spawn fails).
+/// Decrements the spawning thread's entry in `LIVE` when dropped: created at spawn (on the spawning thread), moved
+/// into the worker thread, dropped last in its body (or with the closure, when the spawn fails). It carries the
+/// spawner's id because it drops on the worker thread.
 #[cfg(test)]
-struct LiveGuard;
+struct LiveGuard(std::thread::ThreadId);
 
 #[cfg(test)]
 impl LiveGuard {
     fn new() -> LiveGuard {
-        LIVE.fetch_add(1, Ordering::SeqCst);
-        LiveGuard
+        let me = std::thread::current().id();
+        *LIVE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_or_insert_with(Default::default)
+            .entry(me)
+            .or_insert(0) += 1;
+        LiveGuard(me)
     }
 }
 
 #[cfg(test)]
 impl Drop for LiveGuard {
     fn drop(&mut self) {
-        LIVE.fetch_sub(1, Ordering::SeqCst);
+        if let Some(n) = LIVE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_or_insert_with(Default::default)
+            .get_mut(&self.0)
+        {
+            *n -= 1;
+        }
     }
 }
 
@@ -146,8 +160,11 @@ impl Worker {
     /// Whether a worker should be used at all: not on a single CPU.
     pub(super) fn available() -> bool {
         #[cfg(test)]
-        if FORCE.get() == Force::OneCpu {
-            return false;
+        match FORCE.get() {
+            Force::OneCpu => return false,
+            // The worker tests do not depend on the machine's CPU count.
+            Force::Auto => return true,
+            Force::SpawnFails => {}
         }
         // An unknown count is treated as one CPU: the inline path is always correct.
         std::thread::available_parallelism().is_ok_and(|n| n.get() > 1)
@@ -301,7 +318,12 @@ impl Worker {
 
     #[cfg(test)]
     pub(super) fn live_for_tests() -> usize {
-        LIVE.load(Ordering::SeqCst)
+        let me = std::thread::current().id();
+        LIVE.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .and_then(|m| m.get(&me).copied())
+            .unwrap_or(0)
     }
 
     /// Jobs handed over by this thread (a thread-local, like `spawned_for_tests`).

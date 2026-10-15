@@ -1,6 +1,6 @@
-# Scoped on purpose: a blocking regression in a WAL test must fail in about 30 s instead of hanging the job
-# until its default timeout. There is NO repo-wide timeout (the Windows store tests legitimately run
+# Scoped on purpose: a blocking regression in a WAL test or a checkpoint-worker test (a join that never returns)
+# must fail in about 30 s instead of hanging the job until its default timeout. There is NO repo-wide timeout (the Windows store tests legitimately run
 # 112-158 s) and CI is unchanged.
 [[profile.default.overrides]]
-filter = 'test(/^wal::/)'
+filter = 'test(/^wal::/) | test(/^checkpoint::/)'
 slow-timeout = { period = "10s", terminate-after = 3 }

@@ -31,7 +31,7 @@ pub(crate) mod test_seams {
         Worker::spawned_for_tests()
     }
 
-    /// Worker threads alive in the whole process.
+    /// Worker threads alive that the calling thread spawned.
     pub(crate) fn live() -> usize {
         Worker::live_for_tests()
     }

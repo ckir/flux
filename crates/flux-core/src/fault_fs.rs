@@ -2310,6 +2310,22 @@ mod tests {
     }
 
     #[test]
+    fn fail_write_nth_re_arming_restarts_the_count_from_one() {
+        let fs = FaultFs::new();
+        fs.fail_write_nth("p", 2, std::io::ErrorKind::StorageFull);
+        let mut w = fs.create_new(Path::new("/ws/p")).unwrap();
+        w.write_all(b"aaaa").unwrap(); // write 1 of the first arming: not the nth
+        // Re-arm with a different nth: the count restarts, so the next write (the 2nd overall) is write 1.
+        fs.fail_write_nth("p", 3, std::io::ErrorKind::StorageFull);
+        w.write_all(b"bbbb").unwrap(); // write 1 since the re-arm, not the old nth
+        w.write_all(b"cccc").unwrap(); // write 2 since the re-arm
+        let e = w.write_all(b"dddd").unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::StorageFull, "write 3 since the re-arm fails");
+        w.write_all(b"eeee").unwrap(); // the failure is once
+        assert_eq!(fs.read_file("/ws/p"), Some(b"aaaabbbbcccceeee".to_vec()));
+    }
+
+    #[test]
     fn fail_read_nth_fails_exactly_the_nth_read_once() {
         use std::io::Read;
         let fs = FaultFs::new();
