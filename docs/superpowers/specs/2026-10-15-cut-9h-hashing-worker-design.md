@@ -67,7 +67,7 @@ The hashing happens AFTER the write, on a worker, with buffers handed over by va
 - I3. `beat()` is called at least once per copy-buffer period and at least once per `SEND_RETRY` while the main thread waits on the worker (including in `abort` and `complete`), the pool or the `Close` ack. A full WAL channel never starves the heartbeat.
 - I4. After the log has failed, the file stops with `SinkError::Wal` within `POOL` buffers; a lost lock (`guard()` failing in the main loop, section 99) stops the main thread, and `abort` stops the worker before any further WAL send.
 - I5. After `abort` or `complete` returns, no worker exists and nothing is sent to the log on the file's behalf.
-- I6. A worker panic is a `SinkError::Wal("the WAL writer thread is gone")`-class stop (the file's partial is kept, `StreamFail::Keep`), never a hang and never a silent success: the submit and join channels disconnect, and the main thread maps a disconnected worker to the existing `wal_fault_or_gone()` text.
+- I6. A worker panic is a `SinkError::Wal("the WAL writer thread is gone")`-class stop (the file's partial is kept, `StreamFail::Keep`), never a hang and never a silent success: the submit and join channels disconnect, and the main thread maps a disconnected worker to a `WalFault` of the same class (`Code::WalWriteFailed`, `StreamFail::Keep`) whose message says the checkpoint hashing worker stopped, so a worker panic is not reported as the log writer being gone (panel round 2, low).
 - I7. At most `POOL * copy_buffer_len` bytes per file are held by the pool; memory does not grow with file size or queue depth.
 
 ## 5. Failure cases (state combinations)
@@ -131,3 +131,10 @@ The plan names the `FaultFs` hooks each test needs against the code that exists 
 - Edge/state combinations: failure table in section 5, including resume-with-proven-prefix, exact-multiple lengths, one CPU, spawn failure, lost lock, kill.
 - Requirement mapping: G1 -> section 8; G2 -> tests 1, 9; G3 -> I1-I7 -> tests 2-7; each anti-goal -> an invariant (I1, I3, I5, I7) and a test.
 - Not covered by design, deliberately: resume-time hashing cost (`decide`), parallel hashing within a file, Strict-specific tuning.
+
+## Stand-downs (adversarial panel, 3 rounds, agy plus a solo floor; final round GREEN)
+
+- ALTERNATIVE CONSIDERED, NOT CHOSEN (round 3, low): main-thread proxying, where the worker returns completed `Range` records to the main thread over the recycle channel and the main thread forwards `Msg::Range`. It would avoid a second `SyncSender` clone, but it puts a blocking send (with `beat()`) and the fault checks back on the copy thread and couples digest hand-back to buffer recycling. WalLink is bounded by the sink's join (3.3, 3.6), so the clone cannot outlive a file. Cost if wrong: the `WalLink` accessor on `WalSender`; the plan can switch without touching the log format.
+- DISCARDED-BELOW-FLOOR (round 2, low): `abort` ignoring `beat()` errors in its join loop, because `FileSink::abort` already ignores them for its `Discard` send (`checkpoint/sink.rs`, `let _ = self.send(Msg::Discard ..)`); the run is already failing and the join is bounded by the cancel flag within one `SEND_RETRY`.
+- FOLDED (round 3, low): the `abort` doc comment update, already in 3.6.
+- Panel record: round 1 (solo floor + agy): 4 findings, all verified and folded (scope hang on `break 'stream`, abort wait without `beat()`, 3.2/3.4 spawn contradiction, `SyncSender`-only clone). Round 2: 2 findings, both verified and folded by D6 (a `Scope` is needed to spawn; shape (a) hangs on panic). Round 3: GREEN. agy's verdicts were checked against the code at the cited lines (`copy.rs:778` and `848-852`, `wal/writer.rs:129-144`, `checkpoint/mod.rs:144-162`); one citation (`V16:6415-6416`, from the earlier fork consult) was wrong and not used.
