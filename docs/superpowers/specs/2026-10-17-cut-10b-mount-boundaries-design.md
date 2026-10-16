@@ -98,6 +98,7 @@ Running the check before the ancestor logic is load-bearing: for `mount --bind a
 - A mount point whose mounted root is unreadable or has odd permissions: the directory create or finalise can fail like any directory's; that is a normal `CreateDir` failure.
 - `--links=skip`/`copy` and mounts are independent. A symlink to a mount is a link (cut 10a); a bind-mounted file (a file mount) is not a directory and is not in scope (the walk only asks about directories).
 - `reserved_path`: a mount at `.flux/operations` is refused by the existing `Dir` arm before any mount event matters (`tree.rs:673`).
+- After a Strict abort on `Unknown` the empty directories already created stay (as after any mid-run abort). `--resume` with the same options meets the same refusal; `--resume` with `--safety=default` is `INCOMPATIBLE_STATE` (`safety` is a compared option, `run/resume.rs:99`); the way forward is `--restart --safety=default`, or a kernel that reports mount roots.
 - Case-folding destinations, long names, ordering: unchanged (the mount directory is an ordinary entry in the sorted listing).
 
 ## 5. Failure table
@@ -134,7 +135,7 @@ Engine (`tree.rs` `mod tests`):
 8. A mount whose directory could not be created yields no `MountSkipped` report (M6). A mount below a Skipped frame is silent.
 9. A mount at `.flux/operations` is refused by the reserved arm.
 10. `--update`/second run: the existing empty directory is merged into, nothing changes, no new claim.
-11. `source_mount_unknown` is noted under Default (exit 0, the files copied); under Strict `copy_tree` returns `Err` with `SafetyRejected` and the CLI exit is 1, not 3 (`exit_code.rs`). Mutant: Strict handled like Default.
+11. `source_mount_unknown` is noted under Default (exit 0, the files copied); under Strict `copy_tree` returns `Err` with `SafetyRejected`, and `exit_code::for_tree` (`exit_code.rs:16`) maps it to 1, not 3 (the outcome has `directories_created > 0`). Library level, with `FaultFs` answering `Unknown`: a real kernel on 5.8 or later never answers `Unknown`, so no CLI test can provoke it. Mutant: Strict handled like Default.
 11b. A skipped mount whose `Dir` identity equals the destination root is refused by `enter_dir` (existing behaviour, now pinned for a mount).
 State and resume:
 12. `cross_filesystems` omitted from a default-mode state's JSON; written when true; a literal pre-cut `state.json` fixture still resumes; the pre-cut fingerprint is unchanged; `--resume --cross-filesystems` after a default run is `INCOMPATIBLE_STATE` naming the option, and the reverse.
