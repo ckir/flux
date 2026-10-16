@@ -3344,6 +3344,70 @@ mod tests {
         assert_eq!(out.files_copied, 0);
     }
 
+    /// Cut 10a test audit: a file entry and a link entry are one protocol, so the same scenario is run over both and
+    /// must end the same way. Each arm of `link_one` duplicates `copy_one`'s; a fix made to one and not the other turns
+    /// the arm for the other kind red here.
+    #[test]
+    fn a_file_and_a_link_entry_end_alike_at_each_step() {
+        #[derive(Clone, Copy, Debug)]
+        enum Entry {
+            File,
+            Link,
+        }
+        let seed = |entry: Entry| -> FaultFs {
+            match entry {
+                Entry::File => {
+                    let fs = FaultFs::new();
+                    fs.create_dir(Path::new("/")).unwrap();
+                    fs.create_dir(Path::new("/src")).unwrap();
+                    fs.write_file("/src/n", b"N");
+                    fs
+                }
+                Entry::Link => links(&[("n", "payload")]),
+            }
+        };
+        for entry in [Entry::File, Entry::Link] {
+            // Success: one entry published, no temporary left.
+            let fs = seed(entry);
+            let (r, got) = run(&fs, "/src", "/dst", &opts());
+            let out = r.unwrap();
+            assert!(got.is_empty(), "{entry:?}: {got:?}");
+            assert_eq!(out.files_copied, 1, "{entry:?}");
+            assert!(fs.exists("/dst/n"), "{entry:?}");
+            assert!(temps_in(&fs, "/dst").is_empty(), "{entry:?}");
+
+            // A refused publish: reported at Publish, the temporary removed, nothing at the name.
+            let fs = seed(entry);
+            fs.fail("rename_no_replace", Code::IoError);
+            let (r, got) = run(&fs, "/src", "/dst", &opts());
+            let out = r.unwrap();
+            let e = only_copy_failure(&got, "n");
+            assert_eq!(e.step, CopyStep::Publish, "{entry:?}");
+            assert!(e.leftover.is_none(), "{entry:?}: the temporary was removed");
+            assert!(!fs.exists("/dst/n"), "{entry:?}");
+            assert!(temps_in(&fs, "/dst").is_empty(), "{entry:?}");
+            assert_eq!(out.files_copied, 0, "{entry:?}");
+
+            // A directory at the name: refused, the directory untouched, nothing staged.
+            let fs = seed(entry);
+            fs.create_dir(Path::new("/dst")).unwrap();
+            fs.create_dir(Path::new("/dst/n")).unwrap();
+            fs.write_file("/dst/n/keep", b"K");
+            let (r, got) = run(&fs, "/src", "/dst", &opts());
+            let out = r.unwrap();
+            let e = only_copy_failure(&got, "n");
+            // Under `Publish::Replace` and `Overwrite` the identity gate refuses a directory first, for both kinds.
+            assert_eq!(
+                (e.code(), e.step),
+                (Code::SafetyRejected, CopyStep::Gate),
+                "{entry:?}: {e:?}"
+            );
+            assert_eq!(fs.read_file("/dst/n/keep").as_deref(), Some(&b"K"[..]), "{entry:?}");
+            assert!(temps_in(&fs, "/dst").is_empty(), "{entry:?}");
+            assert_eq!(out.files_copied, 0, "{entry:?}");
+        }
+    }
+
     #[test]
     fn a_link_and_a_file_folding_to_one_name_collide() {
         // Spec test 6, §241.5.

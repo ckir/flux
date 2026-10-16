@@ -4111,6 +4111,60 @@ mod tests {
         assert!(fs.called("read_link(/d/l)"));
     }
 
+    /// Cut 10a test audit: the fake and the real filesystem answer `create_symlink` and `read_link` with the same
+    /// `(Code, ErrorKind)` for each scenario below, so a test that passes on the fake is not resting on an answer the
+    /// real filesystem never gives. Unix only: the Windows error kinds are pinned in `flux-platform`'s tests.
+    #[cfg(unix)]
+    #[test]
+    fn the_fake_answers_symlink_calls_as_the_real_filesystem_does() {
+        use flux_fs::{DestinationRoot, DirHandle, Link, LinkKind};
+
+        type Answer = (Code, std::io::ErrorKind);
+        fn answers<D: DirHandle>(d: &D) -> Vec<(String, Answer)> {
+            let link = Link { payload: "t".into(), kind: LinkKind::Unspecified };
+            let mut got = Vec::new();
+            // Success is marked `(IoError, Other)`; no scenario below expects the two sides to differ on it.
+            let mut note = |what: &str, r: flux_fs::Result<()>| {
+                let a = match r {
+                    Ok(()) => (Code::IoError, std::io::ErrorKind::Other),
+                    Err(e) => (e.code, e.source.kind()),
+                };
+                got.push((what.to_string(), a));
+            };
+            for name in ["file", "dir", "dangling", "ok"] {
+                note(&format!("create over {name}"), d.create_symlink(OsStr::new(name), &link));
+            }
+            for name in ["file", "dir", "none"] {
+                note(&format!("read_link {name}"), d.read_link(OsStr::new(name)).map(|_| ()));
+            }
+            note("read_link ok", d.read_link(OsStr::new("ok")).map(|_| ()));
+            note("create fresh", d.create_symlink(OsStr::new("fresh"), &link));
+            got
+        }
+
+        let fake = FaultFs::new();
+        fake.create_dir(Path::new("/d")).unwrap();
+        fake.create_dir(Path::new("/d/dir")).unwrap();
+        fake.write_file("/d/file", b"x");
+        fake.add_symlink_to("/d/dangling", "nowhere", LinkKind::Unspecified);
+        fake.add_symlink_to("/d/ok", "file", LinkKind::Unspecified);
+        let fake_answers = answers(&fake.destination_root(Path::new("/d")).unwrap());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("dir")).unwrap();
+        std::fs::write(tmp.path().join("file"), b"x").unwrap();
+        std::os::unix::fs::symlink("nowhere", tmp.path().join("dangling")).unwrap();
+        std::os::unix::fs::symlink("file", tmp.path().join("ok")).unwrap();
+        let real_answers =
+            answers(&flux_platform::StdFileSystem.destination_root(tmp.path()).unwrap());
+
+        assert_eq!(fake_answers, real_answers);
+        // The scenarios are not all one answer: the comparison can fail.
+        assert!(fake_answers.iter().any(|(_, a)| a.1 == std::io::ErrorKind::AlreadyExists));
+        assert!(fake_answers.iter().any(|(_, a)| a.1 == std::io::ErrorKind::InvalidInput));
+        assert!(fake_answers.iter().any(|(_, a)| a.1 == std::io::ErrorKind::NotFound));
+    }
+
     #[test]
     fn read_link_refuses_a_file_a_dir_and_a_missing_name() {
         use flux_fs::{DestinationRoot, DirHandle};

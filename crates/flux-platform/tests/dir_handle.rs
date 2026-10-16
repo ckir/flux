@@ -942,6 +942,21 @@ mod posix {
         }
     }
 
+    /// Cut 10a test audit: a payload longer than the OS allows (`PATH_MAX`, 4096 on Linux) is the OS error as an `IoError`,
+    /// never `SymlinkCreationUnavailable` (which would tell the operator the filesystem cannot hold links), and creates
+    /// nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_over_long_payload_is_an_io_error_and_creates_nothing() {
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let payload = "p".repeat(5000);
+        let e = root.create_symlink(OsStr::new("l"), &link(OsStr::new(&payload))).unwrap_err();
+        assert_eq!(e.code, flux_fs::Code::IoError, "{e:?}");
+        assert_eq!(e.source.raw_os_error(), Some(36), "ENAMETOOLONG: {e:?}");
+        assert!(std::fs::symlink_metadata(d.path().join("l")).is_err(), "nothing created: {e:?}");
+    }
+
     #[test]
     fn an_empty_payload_is_the_os_error_not_a_panic() {
         let d = TempDir::new().unwrap();
