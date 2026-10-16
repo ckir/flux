@@ -1,6 +1,6 @@
 # Cut 10b: source mount boundaries (design)
 
-Status: draft for the adversarial panel. Written 2026-10-17 against `main` at `a563613` (cut 10a merged). Every `file:line` below was read at that commit.
+Status: implemented in cut 10b (branch spec/cut-10b-mount-boundaries); panel GREEN after three rounds. Written 2026-10-17 against `main` at `a563613` (cut 10a merged). Every `file:line` below was read at that commit.
 Master spec: `FLUX_FULL_UPDATED_SPEC_V16.md` section 42 (lines 2496-2506: "do not cross filesystem boundaries", "Crossing is off unless `--cross-filesystems` is given (Section 5)", "Filesystem identity must be used to evaluate boundaries"), section 5 option list (line 741), item 72 (line 223), item 70 (line 1482, `--cross-filesystems` is part of the resume selection), axiom 22 (line 528).
 Prior art in the repo: `TODO.md:265-273` (the open item this cut closes: "the walk descends into a directory on another volume ... would read `/proc` inside a copied tree"), `TODO.md:276-290` (the destination half, cut 8a Part M), `TODO.md:56-64` (the measured bind mount `mount --bind a a/b`: `a` and `a/b` share `dev` and `ino`).
 Consult record: AGY-FIRST `.clavity/seams/next-cut-fork-2.md` (which cut), `10b-fork-1.md` (detection and destination behaviour), AGY-NEGOTIATE `10b-neg-1.md` (the destination behaviour, settled by measurement); the owner approved the design on 2026-10-17.
@@ -162,7 +162,21 @@ Performance: the default policy adds one `statx` per directory (never per file) 
 
 ## 9. Deviations and amendments recorded at merge
 
-(to be filled at merge)
+Rulings of the SDD run (ledger `.superpowers/sdd/2026-10-17-cut-10b-mount-boundaries/progress.md`):
+
+- P1. The seven `prepare_source` test call sites all pass `MountPolicy::Cross` (the plan's "`of(o)` where in scope" left five sites ambiguous); old tests keep their behaviour, new behaviour is pinned by new tests.
+- P2. Task 2's FILES widened by one doc-comment hunk in `crates/flux-platform/src/std_fs.rs`: the Windows `mount_root` comment pointed at `open_dir`'s reparse check, but the source side's mechanism is `read_dir`'s reparse classification (section 6.3).
+- P3. Plan test 3-4's expected Stay events corrected to `["D a","D a/b","M a/b","E a/b","F a/marker","E a"]`: entries are sorted by bytes, so `b` precedes `marker`.
+- P4. Task 4 test 5 (`a_second_run_merges_into_the_empty_mount_directory`) uses a source containing only the mount, because a second plain `run` without a claim store reports `DestinationNamespaceCollision` for `a` and `sub/b` (measured); the mount assertions are unchanged.
+- P5. Task 4's tests were written after the production code (no RED observed); the three prescribed mutants were each measured RED instead.
+- P6. Fix round 1 of Task 4 (three assertion/comment minors) was verified by the controller reading the diff and re-running the gate, with no scoped re-review.
+- P7. One compiler-forced line accepted outside Task 5's FILES: `crates/flux-cli/tests/cleanup.rs:209` (a `state::Options` literal gained `cross_filesystems: false`).
+- P8. The timing comparison (`--cross-filesystems` on vs off on `small_1000x4kib`, section 7 "Performance") was NOT run; the owner chose to skip it. The cost of the extra `statx` per directory is UNMEASURED. Command to run later: `cargo bench --bench copy -- small_1000x4kib` once as committed and once with `cross_filesystems: true` set locally in `benches/copy.rs` `options()`, twice each, on an idle machine, at the top level.
+
+Deviations and corrections:
+
+- The JSON field `mounts_skipped` is an additive deviation from the master spec's example (`FLUX_FULL_UPDATED_SPEC_V16.md:2821`, which does not list it): present only when non-zero (decision D8).
+- Task 3's test 3-4 expected-event order was corrected during the run (entries sort by bytes; P3).
 
 ## 10. Exhaustiveness self-audit
 

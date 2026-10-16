@@ -262,10 +262,10 @@ entries below are cut 4b's.
       publishes it by rename would observe a wrong tree. Fix with the fake's move to node-id keys, which
       §149.7's handle-relative writes (PR #44) also need. DECIDED 2026-09-25: not needed in cut 4 --
       the engine renames only files. Stays debt for the first cut that renames a directory.
-- [ ] **§42 mount boundaries are not enforced.** The walk descends into a directory on another volume
-      (a mount), and would read `/proc` inside a copied tree. Needs a walk-level rule (the walk must not
-      even read the mounted subtree), a `--cross-filesystems` option, and a report channel. Its own cut,
-      decided 2026-09-25. **The destination half too:** a bind mount INSIDE the destination can present a
+- [ ] **§42 mount boundaries: the SOURCE half is done (cut 10b); the destination half remains.** SOURCE,
+      DONE by cut 10b: the walk stops at a mount root, creates it at the destination as an empty
+      directory, reports a `MountSkipped` record (JSON `mounts_skipped`), and `--cross-filesystems`
+      restores the old behaviour (descend). **The destination half:** a bind mount INSIDE the destination can present a
       source directory under a destination name, and `copy_tree` merges into it (`open_dir` refuses only
       name-surrogates), so new files can land in the source - never overwriting or deleting (every file
       publishes no-replace), and with no loop. Cut 4b refuses the case where that directory is the source
@@ -568,6 +568,29 @@ the spec's numbers, 9-10 were learned during execution).
 - [ ] `crates/flux-platform/tests/dir_handle.rs`: the `rename_replace` link test asserts only `is_symlink()` after the replace; the empty-payload kind is asserted on Linux only; the Windows tests skip on the hosted runner (it cannot create links), so the success path rides on the owner's Developer-Mode box (see `docs/accepted-boundaries.md`).
 - [ ] Windows arm: `map_symlink_error` is Windows-only (not Linux-unit-testable); the identity re-check window in `create_symlink` could be narrowed by holding the opened path without `FILE_SHARE_DELETE`; a failing `FileRenameInformationEx` retry reports the retry's status, not the first `ACCESS_DENIED` (an unsupported-class status on FAT/old SMB would read as "invalid info class"); WSL `LX_SYMLINK` sources are refused as special files with no hint why; the K7 refusal reuses `SYMLINK_CREATION_UNAVAILABLE`'s code though this version can create links (spec 3.6; a later cut may add a dedicated code); a Windows `flux copy` smoke test by the owner is still owed.
 - [ ] Anomalies verified during the run and left for triage in the local inbox: `discard_note_on_failure` discards the prepared note on any publish error, a lost lock included (pre-existing for files); the fake folds ASCII case only.
+
+## Cut 10b known limits (source mount boundaries; spec `docs/superpowers/specs/2026-10-17-cut-10b-mount-boundaries-design.md`, sections 3.2, 4, 6)
+
+- [ ] **A Linux kernel before 5.8 (or any place `statx` is unavailable) answers `Unknown` for EVERY directory.** Default safety copies as before with one grouped warning; Strict refuses the whole operation at the first subdirectory. Use Default, or a newer kernel.
+- [ ] **autofs trigger directories are UNMEASURED.** The query passes `AT_NO_AUTOMOUNT`; whether an unmounted trigger reads as a mount root, or `read_dir` mounts it on descent, is not known.
+- [ ] **A Windows mounted-volume folder under a copied tree is UNMEASURED** (the source walk already types it as a link or special file).
+- [ ] **`STATX_ATTR_MOUNT_ROOT` on a real same-filesystem bind mount is unmeasured** (needs privilege; the platform tests use the real mount roots `/proc` and `/dev/shm`).
+- [ ] **A skipped mount's empty directory has the process-default attributes**, because no tree copy applies directory metadata yet (cut 4b design decision 8). When directory metadata is built, the source for a mount is the mounted root's (as rsync documents).
+- [ ] **No `-xx`-style mode** that omits mount points entirely.
+- [ ] **The cost of the one extra `statx` per directory is NOT BENCHMARKED** (ruling P8; the owner skipped the timing run). To measure later, at the top level on an idle machine with no agents running: `cargo bench --bench copy -- small_1000x4kib` once as committed (mount check on) and once with `cross_filesystems: true` set locally in `benches/copy.rs` `options()` (mount check off), twice each; quote the range.
+
+## Cut 10b test debt (source mount boundaries; reviewer minors deferred by the SDD run, 2026-10-17)
+
+- [ ] `walk.rs` tests: `paths`/`paths_with` duplicate the event renderer.
+- [ ] `FaultFs::mount_root` ignores its `parent` argument, so no test pins what the walk passes.
+- [ ] A mutant that moves the mount query before the `file_type != Dir` refusal is caught by no test.
+- [ ] The Default branch of `MountUnknown` is not covered under a non-live frame.
+- [ ] `source_mount_unknown` aggregation beyond count 1 is covered only by the `DegradedGroup` unit tests.
+- [ ] The engine test for `Unknown` packs three scenarios into one test.
+- [ ] `is_zero` is a generic free-function name in `report.rs`.
+- [ ] The device-number FALLBACK of `StdFileSystem::mount_root` is exercised by no `std_fs` test on Linux (only the helper's unit test), and two platform tests assume a kernel of 5.8 or later.
+- [ ] The doc line on the unix `mount_root` in `crates/flux-platform/src/std_fs.rs` (~:260) is 120 columns wide.
+- [ ] No real-process CLI test creates a mount (needs privilege), so the end-to-end skip is pinned only through the fake.
 
 ## Cut 9g open (single-file resume; triaged from the anomalies inbox 2026-10-14)
 
