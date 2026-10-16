@@ -824,6 +824,61 @@ mod tests {
     }
 
     #[test]
+    fn a_skipped_mount_does_not_disturb_cycle_detection_for_a_later_sibling() {
+        let fs = FaultFs::new();
+        for d in ["/r", "/r/aaa", "/r/loop"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        fs.write_file("/r/aaa/f", b"");
+        // `loop` IS the root, the measured `mount --bind a a/b` shape.
+        let shared = ObjectId { volume: 1, index: 77 };
+        fs.set_identity("/r", FileIdentity::Strong(shared));
+        fs.set_identity("/r/loop", FileIdentity::Strong(shared));
+        fs.set_mount_root("/r/aaa", flux_fs::MountRoot::Yes);
+
+        let mut events = Vec::new();
+        let mut errors = Vec::new();
+        let opts = WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts: MountPolicy::Stay };
+        for item in walk_with(&fs, Path::new("/r"), opts).unwrap() {
+            match item {
+                Ok(WalkEvent::Dir { path, .. }) => events.push(format!("D {}", rel(&path))),
+                Ok(WalkEvent::File { path }) => events.push(format!("F {}", rel(&path))),
+                Ok(WalkEvent::DirEnd { path }) => events.push(format!("E {}", rel(&path))),
+                Ok(WalkEvent::MountSkipped { path }) => events.push(format!("M {}", rel(&path))),
+                Ok(_) => {}
+                Err(e) => errors.push(rel(&e.path)),
+            }
+        }
+        assert_eq!(events, vec!["D aaa", "M aaa", "E aaa"]);
+        assert_eq!(errors, vec!["loop".to_string()], "the cycle must still be caught");
+    }
+
+    #[test]
+    fn an_unknown_mount_whose_listing_fails_yields_only_the_error() {
+        let fs = FaultFs::new();
+        for d in ["/r", "/r/u"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        fs.set_mount_root("/r/u", flux_fs::MountRoot::Unknown);
+        // read_dir calls: 1 = the root, 2 = `u`.
+        fs.fail_nth("read_dir", 2, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+
+        let mut events = Vec::new();
+        let mut errors = Vec::new();
+        let opts = WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts: MountPolicy::Stay };
+        for item in walk_with(&fs, Path::new("/r"), opts).unwrap() {
+            match item {
+                Ok(WalkEvent::Dir { path, .. }) => events.push(format!("D {}", rel(&path))),
+                Ok(WalkEvent::MountUnknown { path }) => events.push(format!("U {}", rel(&path))),
+                Ok(other) => events.push(format!("{other:?}")),
+                Err(e) => errors.push(rel(&e.path)),
+            }
+        }
+        assert!(events.is_empty(), "no Dir and no MountUnknown; got {events:?}");
+        assert_eq!(errors, vec!["u".to_string()]);
+    }
+
+    #[test]
     fn a_too_deep_mount_meets_the_depth_cap_first() {
         let fs = FaultFs::new();
         for d in ["/r", "/r/a", "/r/a/b"] {
