@@ -175,17 +175,20 @@
 - [ ] **Step 3: OWNER runs** `cargo nextest run -p flux-platform --test dir_handle` on the Developer-Mode box and pastes the summary line into the ledger; CI runs the unavailable path.
 - [ ] **Step 4: Gate, then commit** `feat(platform): Windows symlink creation per the measured mechanism (cut 10a)`.
 
-### Task 8 (GATED on R-W2): The directory-link replacement fallback
+### Task 8: The directory-link replacement retry in the Windows arm (R-W2 ruled: option B)
 
 **Files:**
-- Modify: `crates/flux-core/src/copy.rs` (`Staged` at `:950-959` gains `pub existing: Option<FileType>`, filled at `:944-962` from `gate.existing` (`:695-699`); `publish_staged` at `:1067-1121`: after a `rename_replace` failure that the arm classifies as the directory-attribute refusal (R-W2 fixes the code/kind; expected `DestinationError`/`Unsupported`), a new `fn replace_through_unlink<D: DirHandle>(parent: &D, temp: &OsStr, name: &OsStr, existing: Option<FileType>, guard: &Guard<'_>) -> Result<(), CopyError>` runs: `existing == Some(FileType::Symlink)` → `guard()`, `parent.remove_file(name)`, `parent.rename_no_replace(temp, parent, name)`; anything else → the entry fails with the arm's error, message "the destination holds a file that a directory link cannot replace atomically on this filesystem; remove it first"); `crates/flux-core/src/tree.rs` (`link_one` passes `Some(meta.file_type)` for Replace and calls the same helper on the same refusal).
-- Test: `crates/flux-core/src/copy.rs` and `tree.rs` tests with the fake answering the refusal (`fail_kind("rename_replace", Code::DestinationError, ErrorKind::Unsupported)`).
+- Modify: `crates/flux-platform/src/dir_windows.rs` (`rename_at` at ~:1437 and its callers `rename_replace`/`rename_no_replace`; reuse `surrogate_tag_at` at ~:1552 and the `FileRenameInformationEx` / `FILE_RENAME_POSIX_SEMANTICS` imports the probe module already compiles with).
+- Test: `crates/flux-platform/tests/dir_handle.rs` (`mod windows_arm`); extend `crates/flux-platform/src/symlink_probe.rs` with the follow-up probes.
 
 **Interfaces:**
-- Consumes: Task 0's R-W2. If R-W2 says `ReplaceIfExists` accepts both sides, this task is a one-line ruling in the ledger ("no fallback needed") and spec §9, and the helper is not written.
+- Consumes: Task 7's real `create_symlink`; measured R-W2 (spec 3.7, owner-approved option B).
+- Produces: `DirHandle::rename_replace` on Windows replaces an existing directory link atomically; nothing else changes (trait signature, other platforms, the engine).
 
-- [ ] **Step 1: Write the failing tests** (if the fallback is needed): `a_refused_replace_over_an_existing_link_falls_back_to_unlink_and_rename` (file path and link path: the old link gone, the new object at the name, the log shows `remove_file(name)` then `rename_no_replace`); `a_refused_replace_over_a_regular_file_fails_the_entry_and_keeps_the_file` (spec 5's row; the file's bytes intact); `a_crash_in_the_fallback_window_is_recreated_by_resume` (fault the `rename_no_replace` after the unlink; `--resume` → the entry is New, published, the claim upgraded to `Created`).
-- [ ] **Step 2: Run to verify they fail**; **Step 3: Implement**; **Step 4: Gate**; **Step 5: Commit** `feat(copy): unlink-then-rename fallback for a refused directory-link replacement (cut 10a)`.
+- [ ] **Step 1: Write the failing Windows tests** (`mod windows_arm`, skip with a printed reason when `!can_create_symlinks`): `rename_replace_replaces_a_directory_link_with_a_regular_file` (a directory link `L` to an existing directory `T`; a staged file `f`; `rename_replace(f -> L)`: the name is now a regular file with the staged bytes, `T` and its contents untouched); `rename_replace_still_replaces_a_file_with_a_directory_link` (regression: the case that already worked); `rename_replace_over_a_directory_link_fails_cleanly_when_the_retry_fails` is NOT written (cannot be provoked portably; state this in the report).
+- [ ] **Step 2: Implement** in `rename_at`: after the plain `NtSetInformationFile(FileRenameInformation)` returns `STATUS_ACCESS_DENIED` (0xC0000022) with `r == true`, and `surrogate_tag_at(td, t)` is `Some(_)`, rebuild the rename information for `FileRenameInformationEx` with `FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS` and call once more; any other status, or a second failure, is returned exactly as today. A `// SAFETY:`/rationale comment cites spec 3.7 and the measurement.
+- [ ] **Step 3: Extend the probe** (follow-up for the owner, safe either way): `probe_rename_replace_over_and_with_a_directory_link` gains `dir-link-at-temp-over-dir-link` and `file-at-temp-over-junction`, each with plain and Ex+POSIX.
+- [ ] **Step 4: Gates**: Windows `cargo check`/`clippy` for flux-platform rc=0; `TMPDIR=$HOME/ff_tmp just check`; release clippy; commit `feat(platform): replace an existing Windows directory link atomically (cut 10a)`. The OWNER runs the Windows tests and the extended probe.
 
 ### Task 9: Documentation and the deviation record
 
