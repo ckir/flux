@@ -291,7 +291,7 @@ impl FileSystem for StdFileSystem {
     }
 
     /// Always `No`: a mounted-volume folder is a name-surrogate reparse point, which the walk never descends into
-    /// (see `open_dir`'s reparse-point check), so no directory it reaches can be the root of a mount.
+    /// (the source walk types a junction or volume mount point as a link in `read_dir`, below, and `read_link` refuses it as a special file), so no directory it reaches can be the root of a mount.
     #[cfg(windows)]
     fn mount_root(&self, _path: &Path, _parent: &Path) -> Result<MountRoot> {
         Ok(MountRoot::No)

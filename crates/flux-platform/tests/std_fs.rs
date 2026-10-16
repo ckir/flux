@@ -1,4 +1,4 @@
-use flux_fs::{Code, FileHandle, FileIdentity, FileSystem};
+use flux_fs::{Code, FileHandle, FileIdentity, FileSystem, MountRoot};
 use flux_platform::StdFileSystem;
 use std::io::Write;
 use tempfile::TempDir;
@@ -983,4 +983,59 @@ fn truncate_to_the_current_length_succeeds_and_zero_restarts_the_file() {
     w.truncate_to(0).unwrap();
     w.write_all(b"x").unwrap();
     assert_eq!(std::fs::read(&p).unwrap(), b"x");
+}
+
+#[cfg(unix)]
+#[test]
+fn mount_root_is_no_for_a_plain_subdirectory_and_agrees_with_the_handle_query() {
+    use flux_fs::{DestinationRoot, DirHandle};
+    let d = TempDir::new().unwrap();
+    std::fs::create_dir(d.path().join("sub")).unwrap();
+    let path_answer = StdFileSystem.mount_root(&d.path().join("sub"), d.path());
+    assert!(matches!(path_answer, Ok(MountRoot::No)), "got {path_answer:?}");
+    let root = StdFileSystem.destination_root(d.path()).unwrap();
+    let sub = root.open_dir(std::ffi::OsStr::new("sub")).unwrap();
+    let handle_answer = sub.mount_root(&root);
+    assert_eq!(path_answer.unwrap(), handle_answer.unwrap());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mount_root_is_yes_for_a_real_mount_point_asked_without_privilege() {
+    use std::path::Path;
+    let mut ran = 0;
+    if Path::new("/proc/self").is_dir() {
+        ran += 1;
+        let r = StdFileSystem.mount_root(Path::new("/proc"), Path::new("/"));
+        assert!(matches!(r, Ok(MountRoot::Yes)), "/proc: {r:?}");
+    } else {
+        eprintln!("skipped: /proc/self is absent");
+    }
+    if Path::new("/dev/shm").is_dir() {
+        ran += 1;
+        let r = StdFileSystem.mount_root(Path::new("/dev/shm"), Path::new("/dev"));
+        assert!(matches!(r, Ok(MountRoot::Yes)), "/dev/shm: {r:?}");
+    } else {
+        eprintln!("skipped: /dev/shm is absent");
+    }
+    assert!(ran > 0, "both halves were skipped: no real mount point to test");
+}
+
+#[cfg(unix)]
+#[test]
+fn mount_root_reports_a_missing_path_as_not_found() {
+    let d = TempDir::new().unwrap();
+    match StdFileSystem.mount_root(&d.path().join("none"), d.path()) {
+        Err(e) => assert_eq!(e.source.kind(), std::io::ErrorKind::NotFound),
+        Ok(v) => panic!("expected NotFound, got Ok({v:?})"),
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn mount_root_is_always_no_on_windows() {
+    let d = TempDir::new().unwrap();
+    std::fs::create_dir(d.path().join("sub")).unwrap();
+    let r = StdFileSystem.mount_root(&d.path().join("sub"), d.path());
+    assert!(matches!(r, Ok(MountRoot::No)), "got {r:?}");
 }
