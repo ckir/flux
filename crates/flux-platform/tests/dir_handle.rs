@@ -1797,6 +1797,70 @@ mod windows_arm {
     }
 
     #[test]
+    fn create_symlink_on_a_fat32_volume_is_unavailable_and_creates_nothing() {
+        // Cut 10a ruling R12: a FAT volume has no file ids, so the handle's identity is
+        // Unavailable, create_symlink SKIPS its identity re-check and calls
+        // CreateSymbolicLinkW, which such a volume cannot satisfy. Expected outcome is
+        // Code::SymlinkCreationUnavailable ("the destination filesystem cannot hold a
+        // symlink"), Win32 error 1 or 50. NOT yet measured: this test IS the
+        // measurement, so the PROBE line below is always printed (run with --nocapture).
+        //
+        // Set FLUX_FAT32_ROOT to a directory on a FAT32 volume to run this.
+        let Ok(base) = std::env::var("FLUX_FAT32_ROOT") else {
+            eprintln!("SKIPPED: set FLUX_FAT32_ROOT to a directory on a FAT32 volume");
+            return;
+        };
+
+        // Removes the scratch directory on every path, a panic included.
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let dir = std::path::Path::new(&base).join("fluxsymlink");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _cleanup = Cleanup(dir.clone());
+
+        let root = StdFileSystem.destination_root(&dir).unwrap();
+        let identity = root.identity().unwrap();
+        eprintln!("PROBE fat32 identity: {identity:?}");
+        assert!(
+            matches!(identity, flux_fs::FileIdentity::Unavailable),
+            "FLUX_FAT32_ROOT must name a volume with no file ids (FAT32); identity was {identity:?}"
+        );
+
+        let link = flux_fs::Link { payload: "x".into(), kind: flux_fs::LinkKind::File };
+        let outcome = root.create_symlink(OsStr::new("l"), &link);
+        let e = match outcome {
+            Ok(()) => {
+                let _ = std::fs::remove_file(dir.join("l"));
+                let _ = std::fs::remove_dir(dir.join("l"));
+                eprintln!("PROBE fat32 create_symlink: unexpectedly created");
+                panic!("PROBE fat32 create_symlink: unexpectedly created");
+            }
+            Err(e) => e,
+        };
+        eprintln!(
+            "PROBE fat32 create_symlink: code={:?} kind={:?} raw_os_error={:?} message={}",
+            e.code,
+            e.source.kind(),
+            e.source.raw_os_error(),
+            e
+        );
+        assert_eq!(e.code, flux_fs::Code::SymlinkCreationUnavailable);
+
+        let after = root.metadata(OsStr::new("l"));
+        assert!(
+            matches!(&after, Err(m) if m.source.kind() == std::io::ErrorKind::NotFound),
+            "nothing named `l` may exist afterwards; metadata said {:?}",
+            after.as_ref().map(|_| "exists").map_err(|m| m.source.kind())
+        );
+    }
+
+    #[test]
     fn create_new_refuses_a_name_a_dangling_symlink_holds() {
         // THIS is the test that guards FILE_OPEN_REPARSE_POINT, and the reason the
         // flag is there. Without it the kernel follows the link during the existence
