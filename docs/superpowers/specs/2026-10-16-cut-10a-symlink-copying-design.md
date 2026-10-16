@@ -169,7 +169,7 @@ Windows (`dir_windows.rs`):
 | claim not recorded after publish | `ClaimNotRecorded`; the link stays published; counted as copied. |
 | `--links=skip` | `SymlinkSkipped`; nothing read from the link; exit unaffected. |
 | crash between `create_symlink(temp)` and the rename | a link at `<name>.flux-partial.<op>`; `--restart` and `cleanup` delete it (3.4); `--resume` finds no claim and republishes (the temp is removed and recreated). |
-| a link named `.flux` (or below it) at the root | reserved-path refusal, before any read. |
+| a link at a reserved control path (`.flux/operations`, `.flux/standalone`, `.flux/atomic`, or below) | reserved-path refusal at `Gate`, before any read. A root-level `.flux` link is ordinary data exactly as a root `.flux` file is (`reserved_path(".flux")` is false by a pinned test); it follows the file rule. |
 
 ## 6. Cases and tests
 
@@ -189,7 +189,7 @@ Fake-backed (`tree.rs` and `copy.rs` tests, `fault_fs.rs` tests):
 8b. Cleanup of a recorded link leftover (`cleanup/artifacts.rs` and `run/tests.rs`): `remove_validated` deletes a link leaf and still refuses a link COMPONENT and a directory leaf (the existing `remove_validated_refuses_a_link_component_and_a_directory_leaf` keeps its two refusals); a run whose link publish failed with a kept temporary records it in `cleanup_pending_artifacts`, and `flux cleanup` then deletes it (`Deleted`, exit 0, the link's target untouched). Mutant: the leaf acceptance reverted (`cleanup` reports `Kept`, exit 1).
 8c. `record_claim` upgrades an own `Existing` claim to `Created` on a New publish (fake claim store: insert `Existing` for the target, publish as New, read back `Created`); a foreign claim is still refused. Mutant: the upgrade removed (the claim stays `Existing` and the next `--resume` republishes instead of resuming).
 9. Failure injection: `read_link` fails → `Copy(e)` at `Source`; a leftover at the temp with an empty batch is removed before the create; the rename fails → temp removed, entry failed at `Publish`; the rename fails AND the removal fails → the leftover is in the record and in the run's `leftovers`; the guard fails before the publish → the temp is kept and reported as the leftover, the run stops. Mutant: the guard check before the rename removed.
-10. The reserved name `.flux -> /elsewhere` at the root is refused before `read_link` (call log).
+10. A link at `.flux/operations` is refused at `Gate` before `read_link` (call log); a root `.flux` link follows the rule a root `.flux` file follows (one test compares the two).
 11. Identity gate: a destination entry whose Strong identity equals the source link's is refused `SafetyRejected`.
 12. Differential (I7): the existing tree test corpus passes unchanged; a tree without links produces the same stderr and JSON as before (a snapshot test on the fake).
 13. A junction-classified source entry (fake: `read_link` answering `SpecialFileUnsupported`) is a `SpecialFileSkipped` record.
