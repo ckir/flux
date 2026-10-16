@@ -3206,6 +3206,20 @@ fn resume_with_a_different_links_setting_is_incompatible() {
 }
 
 #[test]
+fn resume_with_a_different_cross_filesystems_setting_is_incompatible() {
+    let fs = fake();
+    let p = prior3(&fs, 5, OpState::Failed);
+    drop(prior_store(&fs, 5));
+    assert!(!p.config.as_ref().unwrap().options.cross_filesystems);
+    let crossing = CopyOptions { cross_filesystems: true, ..opts() };
+    let (r, _) = run_tree_with(&fs, &resume(), &crossing);
+    assert_eq!(refused(&r.stop), (LockCode::IncompatibleState, false));
+    assert!(detail(&r.stop).starts_with("cross_filesystems:"), "{}", detail(&r.stop));
+    assert_eq!(manifest(&fs, &id(5)), p, "nothing changed");
+    assert!(!fs.exists(LOCK));
+}
+
+#[test]
 fn a_pre_cut_state_file_resumes_as_copy() {
     let fs = fake();
     let p = prior3(&fs, 5, OpState::Failed);

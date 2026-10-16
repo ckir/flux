@@ -93,12 +93,14 @@ pub(crate) fn validate(
     }
     let now = Options::of(opts);
     let then = &stored.options;
+    let (then_cf, now_cf) = (then.cross_filesystems.to_string(), now.cross_filesystems.to_string());
     for (name, was, asks) in [
         ("preserve_times", &then.preserve_times, &now.preserve_times),
         ("preserve_permissions", &then.preserve_permissions, &now.preserve_permissions),
         ("safety", &then.safety, &now.safety),
         ("existing", &then.existing, &now.existing),
         ("links", &then.links, &now.links),
+        ("cross_filesystems", &then_cf, &now_cf),
     ] {
         if was != asks {
             return Err(incompatible(format!(
@@ -303,6 +305,21 @@ mod tests {
             let (code, detail) = refused(run(&prior, &roots_now(), &opts()).0);
             assert_eq!(code, LockCode::IncompatibleState, "{name}");
             assert!(detail.starts_with(&format!("{name}:")), "{detail}");
+            assert!(detail.contains("--restart"), "{detail}");
+        }
+    }
+
+    #[test]
+    fn a_different_cross_filesystems_setting_is_incompatible_and_named() {
+        let crossing = CopyOptions { cross_filesystems: true, ..opts() };
+        let cases = [
+            (prior_options(|o| o.cross_filesystems = true), opts()),
+            (prior_options(|_| {}), crossing),
+        ];
+        for (prior, now) in cases {
+            let (code, detail) = refused(run(&prior, &roots_now(), &now).0);
+            assert_eq!(code, LockCode::IncompatibleState);
+            assert!(detail.starts_with("cross_filesystems:"), "{detail}");
             assert!(detail.contains("--restart"), "{detail}");
         }
     }
