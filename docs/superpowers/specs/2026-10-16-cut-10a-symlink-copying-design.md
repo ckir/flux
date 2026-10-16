@@ -236,4 +236,11 @@ Real-process (`crates/flux-cli/tests/copy.rs`, Unix):
 
 ## 9. Deviations and amendments recorded at merge
 
-(Filled at merge: the plan rulings that changed this document, the Windows measurement outcome, the `TODO.md` lines for D1 and D4.)
+Plan rulings and measurements that changed or settled this document (full ledger in the SDD run; the owner's probe output is `.clavity/scratch/10a-w2/probe-output.txt`, summarised here):
+- R-W1 (measured, Windows 11): creation is `CreateSymbolicLinkW` + `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE` (+ `SYMBOLIC_LINK_FLAG_DIRECTORY`): file, directory and dangling links succeed in Developer Mode without elevation; a plain user gets error 1314 (with or without the flag); the NT-create + `FSCTL_SET_REPARSE_POINT` route produced plain files for the relative and directory cases and is not used.
+- R-W2 (measured): a plain `FileRenameInformation` replaces a file BY a directory link but is refused (`STATUS_ACCESS_DENIED`) replacing an existing directory link; `FileRenameInformationEx` + POSIX semantics succeeds in both. Option B (an atomic retry in the Windows arm) was chosen by the owner after an AGY-FIRST consult; D16 and section 3.7 were revised. Unmeasured: a directory link replaced by a directory link, a junction replaced by a file, ReFS/FAT/SMB.
+- R-W3 (measured): `read_link` returns the PrintName verbatim (`sub\x`, `C:\Windows`); a junction has tag `0xA0000003` and is refused as `SpecialFileUnsupported`.
+- R-L1 (NOT measured): `symlinkat` on vfat; `EPERM` -> `SymlinkCreationUnavailable` by the spec's default (D8).
+- R1-R12 of the SDD run: R1 (Task 3 plain paths, Task 4 edges), R4 (probe module re-implements private helpers), R5 (Task 1 file list widened for the trait ripple), R7-R8 (two CLI tests rewritten; a root `.flux` link follows the file rule, section 5 and test 10 amended), R10 (test 4c uses `A`/`a` with `fold_precheck: false`; the fake folds ASCII only), R11 (cleanup.rs literal), R12 (an unavailable directory identity skips the Windows re-check).
+- Verified-and-corrected spec facts: the lost-lock note is discarded as for a file (section 3.2 step 5, section 5); `record_claim` also upgrades an own `Existing` claim for files (shared code).
+- `TODO.md` lines for D1, D4, D8 and the deferred test debt are in `TODO.md` (section "Cut 10a test debt" and the symlink items).
