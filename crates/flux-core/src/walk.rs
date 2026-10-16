@@ -472,6 +472,26 @@ mod tests {
     use crate::fault_fs::FaultFs;
 
     #[test]
+    fn the_policy_follows_the_cross_filesystems_option() {
+        use flux_fs::{
+            CopyOptions, Durability, ExistingPolicy, Links, OperationId, Preserve, Publish, Safety,
+        };
+        let with = |cross: bool| CopyOptions {
+            preserve_times: Preserve::Default,
+            preserve_permissions: Preserve::Default,
+            durability: Durability::Normal,
+            publish: Publish::Replace,
+            safety: Safety::Default,
+            operation_id: OperationId::new("op1"),
+            existing: ExistingPolicy::Overwrite,
+            links: Links::Copy,
+            cross_filesystems: cross,
+        };
+        assert_eq!(MountPolicy::of(&with(false)), MountPolicy::Stay);
+        assert_eq!(MountPolicy::of(&with(true)), MountPolicy::Cross);
+    }
+
+    #[test]
     fn walk_refuses_a_root_that_is_not_a_directory() {
         let fs = FaultFs::new();
         fs.write_file("/f", b"x");

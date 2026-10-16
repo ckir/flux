@@ -2925,6 +2925,22 @@ mod tests {
     }
 
     #[test]
+    fn crossing_descends_into_a_mount_and_reports_nothing_skipped() {
+        let fs = tree();
+        mounted(&fs, "/src/m");
+        let o = CopyOptions { cross_filesystems: true, ..opts() };
+
+        let (r, got) = run(&fs, "/src", "/dst", &o);
+
+        let out = r.unwrap();
+        assert!(fs.exists("/dst/m/inside"));
+        assert_eq!(out.mounts_skipped, 0);
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(out.files_copied, 3);
+        assert!(!fs.called("source_mount_root("), "{:?}", fs.calls());
+    }
+
+    #[test]
     fn a_mount_whose_directory_cannot_be_created_reports_the_failure_only() {
         let fs = tree();
         mounted(&fs, "/src/m");
