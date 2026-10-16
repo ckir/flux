@@ -3015,6 +3015,42 @@ fn durability_normal_to_strict_is_recorded_on_adoption() {
 }
 
 #[test]
+fn resume_with_a_different_links_setting_is_incompatible() {
+    let fs = fake();
+    let p = prior3(&fs, 5, OpState::Failed);
+    drop(prior_store(&fs, 5));
+    assert_eq!(p.config.as_ref().unwrap().options.links, "copy");
+    let skip = CopyOptions { links: Links::Skip, ..opts() };
+    let (r, _) = run_tree_with(&fs, &resume(), &skip);
+    assert_eq!(refused(&r.stop), (LockCode::IncompatibleState, false));
+    assert!(detail(&r.stop).starts_with("links:"), "{}", detail(&r.stop));
+    assert_eq!(manifest(&fs, &id(5)), p, "nothing changed");
+    assert!(!fs.exists(LOCK));
+    assert!(!fs.called("open_claim_store("), "validate comes before the store is opened");
+}
+
+#[test]
+fn a_pre_cut_state_file_resumes_as_copy() {
+    let fs = fake();
+    let p = prior3(&fs, 5, OpState::Failed);
+    drop(prior_store(&fs, 5));
+    // The pre-cut manifest: no `links` key, and the four-line fingerprint as the pre-cut code computed it.
+    let mut v: serde_json::Value = serde_json::from_slice(&p.encode()).unwrap();
+    let options = v["options"].as_object_mut().unwrap();
+    assert!(options.remove("links").is_some());
+    v["configuration_fingerprint"] =
+        "6814cb38cd3fe6c13a382a988c9c5cbac2ebcf30be0bb4af44596d3019b19f1d".into();
+    assert_eq!(v["options"].as_object().unwrap().len(), 5);
+    fs.write_file(
+        format!("/p/dest/.flux/operations/{}/manifest", id(5)),
+        &serde_json::to_vec(&v).unwrap(),
+    );
+    let (r, _) = run_tree(&fs, &resume());
+    ok(&r);
+    adopted(&r, 5, Some(0));
+}
+
+#[test]
 fn a_mapping_mismatch_is_refused_and_strong_identities_decide() {
     let edit = |fs: &FaultFs, f: &dyn Fn(&mut Root)| {
         let mut p = prior3(fs, 5, OpState::Failed);

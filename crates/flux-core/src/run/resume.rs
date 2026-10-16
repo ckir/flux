@@ -98,6 +98,7 @@ pub(crate) fn validate(
         ("preserve_permissions", &then.preserve_permissions, &now.preserve_permissions),
         ("safety", &then.safety, &now.safety),
         ("existing", &then.existing, &now.existing),
+        ("links", &then.links, &now.links),
     ] {
         if was != asks {
             return Err(incompatible(format!(

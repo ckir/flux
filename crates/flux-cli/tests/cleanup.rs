@@ -206,6 +206,7 @@ fn completed_fixture(dst: &Path) -> String {
             durability: "normal".to_owned(),
             safety: "default".to_owned(),
             existing: "overwrite".to_owned(),
+            links: "copy".to_owned(),
         },
     );
     let mut state = OperationState::created(&id, Kind::Tree, dst, 5, None, config);
