@@ -1153,6 +1153,46 @@ mod windows_arm {
     }
 
     #[test]
+    fn rename_replace_replaces_a_directory_link_with_a_regular_file() {
+        let d = TempDir::new().unwrap();
+        if !can_create_symlinks(d.path()) {
+            println!("skipped: this runner cannot create symlinks");
+            return;
+        }
+        let t = d.path().join("T");
+        std::fs::create_dir(&t).unwrap();
+        std::fs::write(t.join("inside"), b"keep").unwrap();
+        std::os::windows::fs::symlink_dir("T", d.path().join("L")).unwrap();
+        std::fs::write(d.path().join("f"), b"staged bytes").unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        root.rename_replace(OsStr::new("f"), &root, OsStr::new("L")).unwrap();
+        let meta = std::fs::symlink_metadata(d.path().join("L")).unwrap();
+        assert!(meta.is_file() && !meta.is_symlink(), "L is now a regular file: {meta:?}");
+        assert_eq!(std::fs::read(d.path().join("L")).unwrap(), b"staged bytes");
+        assert_eq!(std::fs::read(t.join("inside")).unwrap(), b"keep", "T is untouched");
+        assert!(std::fs::symlink_metadata(d.path().join("f")).is_err(), "f is gone");
+    }
+
+    #[test]
+    fn rename_replace_still_replaces_a_file_with_a_directory_link() {
+        let d = TempDir::new().unwrap();
+        if !can_create_symlinks(d.path()) {
+            println!("skipped: this runner cannot create symlinks");
+            return;
+        }
+        let t = d.path().join("T");
+        std::fs::create_dir(&t).unwrap();
+        std::os::windows::fs::symlink_dir("T", d.path().join("staged")).unwrap();
+        std::fs::write(d.path().join("F"), b"old").unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        root.rename_replace(OsStr::new("staged"), &root, OsStr::new("F")).unwrap();
+        let meta = std::fs::symlink_metadata(d.path().join("F")).unwrap();
+        assert!(meta.is_symlink(), "F is now a link: {meta:?}");
+        assert!(std::fs::symlink_metadata(d.path().join("staged")).is_err(), "staged is gone");
+        assert!(t.is_dir(), "T is untouched");
+    }
+
+    #[test]
     fn read_link_on_a_junction_is_special_file_unsupported() {
         let d = TempDir::new().unwrap();
         std::fs::create_dir(d.path().join("real")).unwrap();

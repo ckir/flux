@@ -20,8 +20,9 @@ use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_DELETE, FILE_DISPOSITION_INFORMATION,
     FILE_DISPOSITION_INFORMATION_EX, FILE_DISPOSITION_POSIX_SEMANTICS, FILE_NON_DIRECTORY_FILE,
-    FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FileDispositionInformation,
-    FileDispositionInformationEx, FileRenameInformation, NtCreateFile, NtSetInformationFile,
+    FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS,
+    FILE_RENAME_REPLACE_IF_EXISTS, FileDispositionInformation, FileDispositionInformationEx,
+    FileRenameInformation, FileRenameInformationEx, NtCreateFile, NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
     HANDLE, STATUS_DELETE_PENDING, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_INFO_CLASS,
@@ -1535,6 +1536,32 @@ fn rename_at(fd: &OwnedHandle, f: &OsStr, td: &OwnedHandle, t: &OsStr, r: bool) 
             FileRenameInformation,
         )
     };
+    // Replacing an existing DIRECTORY LINK by anything but a directory link: plain
+    // `FileRenameInformation` answers STATUS_ACCESS_DENIED (spec 3.7, "Replacing an
+    // existing DIRECTORY link"; MEASURED on Windows 11 by the owner:
+    // `FileRenameInformationEx` with REPLACE_IF_EXISTS | POSIX_SEMANTICS succeeds in
+    // both directions). So retry ONCE, and only when replacing, when the failure is
+    // ACCESS_DENIED, and when the existing target is a name-surrogate reparse point.
+    // Any other status, or a failing retry, is reported exactly as before.
+    let mut status = status;
+    if status != 0 && r && status == STATUS_ACCESS_DENIED && surrogate_tag_at(td, t).is_some() {
+        // SAFETY: same buffer, same `total`, same live `h`/`buf` as the call above. The
+        // `Anonymous` union is u32-sized at the same offset for the classic and the Ex
+        // layout; the Ex class reads it as `Flags`, so it is overwritten whole (this also
+        // clears the classic `ReplaceIfExists` byte). The other fields are unchanged.
+        status = unsafe {
+            let info = base.cast::<FILE_RENAME_INFORMATION>();
+            (&raw mut (*info).Anonymous.Flags)
+                .write(FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS);
+            NtSetInformationFile(
+                h.as_raw_handle() as _,
+                &raw mut iosb,
+                base.cast(),
+                total as u32,
+                FileRenameInformationEx,
+            )
+        };
+    }
     if status != 0 {
         return Err(FsError::new(Code::IoError, nt_io_error("NtSetInformationFile", status)));
     }

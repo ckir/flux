@@ -339,6 +339,54 @@ mod win {
                     st as u32
                 );
             }
+            // Follow-ups for the owner: a directory link at the temp name over an existing
+            // directory link, and a regular file at the temp name over a junction.
+            for case in ["dir-link-at-temp-over-dir-link", "file-at-temp-over-junction"] {
+                let td = tempfile::TempDir::new().unwrap();
+                let p = td.path();
+                std::fs::create_dir(p.join("real-dir")).unwrap();
+                let flags =
+                    SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE | SYMBOLIC_LINK_FLAG_DIRECTORY;
+                if case == "dir-link-at-temp-over-dir-link" {
+                    let made = create_symlink_w(&p.join("temp"), "real-dir", flags)
+                        .and_then(|()| create_symlink_w(&p.join("link"), "real-dir", flags));
+                    if let Err(e) = made {
+                        println!(
+                            "PROBE rename {variant} {case}: SETUP link creation failed Win32Error={e}"
+                        );
+                        continue;
+                    }
+                } else {
+                    std::fs::write(p.join("temp"), b"x").unwrap();
+                    let out = std::process::Command::new("cmd")
+                        .arg("/C")
+                        .arg("mklink")
+                        .arg("/J")
+                        .arg(OsString::from(p.join("link")))
+                        .arg(OsString::from(p.join("real-dir")))
+                        .output();
+                    match out {
+                        Ok(o) if o.status.success() => {}
+                        Ok(o) => {
+                            println!(
+                                "PROBE rename {variant} {case}: SETUP junction failed status={}",
+                                o.status
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            println!("PROBE rename {variant} {case}: SETUP spawn failed {e}");
+                            continue;
+                        }
+                    }
+                }
+                let dir = open_dir(p);
+                let (stage, st) = rename(&dir, "temp", &dir, "link", ex);
+                println!(
+                    "PROBE rename {variant} {case}: stage={stage} NTSTATUS=0x{:08X}",
+                    st as u32
+                );
+            }
         }
     }
 
