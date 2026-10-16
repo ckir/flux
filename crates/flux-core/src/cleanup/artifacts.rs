@@ -56,8 +56,9 @@ fn not_found(e: &FsError) -> bool {
     e.source.kind() == std::io::ErrorKind::NotFound
 }
 
-/// Rules 3 and 4: open each directory component with `open_dir`, check the last is a regular file by `metadata`,
-/// `remove_file` it. `NotFound` anywhere is `AlreadyGone`. A link, a directory or anything else is the error.
+/// Rules 3 and 4: open each directory component with `open_dir` (which refuses a link), check the last is a regular
+/// file or a link (cut 10a: a link temporary) by `metadata`, `remove_file` it (which unlinks a link, never its target).
+/// `NotFound` anywhere is `AlreadyGone`. A directory or anything else at the leaf is the error.
 pub fn remove_validated<D: DirHandle>(dest: &D, rel: &Path) -> flux_fs::Result<Removed> {
     let parts: Vec<&OsStr> = rel.iter().collect();
     let Some((leaf, dirs)) = parts.split_last() else {
@@ -77,11 +78,11 @@ pub fn remove_validated<D: DirHandle>(dest: &D, rel: &Path) -> flux_fs::Result<R
     }
     let dir = held.as_ref().unwrap_or(dest);
     match dir.metadata(leaf) {
-        Ok(meta) if meta.file_type == FileType::File => {}
+        Ok(meta) if matches!(meta.file_type, FileType::File | FileType::Symlink) => {}
         Ok(_) => {
             return Err(FsError::new(
                 Code::SafetyRejected,
-                std::io::Error::other("a recorded artifact is not a regular file"),
+                std::io::Error::other("a recorded artifact is not a regular file or a link"),
             ));
         }
         Err(e) if not_found(&e) => return Ok(Removed::AlreadyGone),
@@ -220,15 +221,28 @@ mod tests {
             err.code
         );
         assert!(fs.exists(&leaf));
+    }
 
-        fs.add_symlink(format!("/dest/dir/c.flux-partial.{ID}"));
-        let err =
-            remove_validated(&dest, Path::new(&format!("dir/c.flux-partial.{ID}"))).unwrap_err();
-        assert!(
-            matches!(err.code, Code::SafetyRejected | Code::DestinationError),
-            "{:?}",
-            err.code
+    #[test]
+    fn remove_validated_deletes_a_link_leaf_and_leaves_its_target() {
+        // Cut 10a (spec 3.4, test 8b): a crashed or kept link temporary is this operation's own artifact. `remove_file`
+        // unlinks the link and never follows it. Mutant: the leaf acceptance reverted to `FileType::File` only.
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/dest")).unwrap();
+        fs.create_dir(Path::new("/dest/dir")).unwrap();
+        fs.write_file("/dest/keep", b"K");
+        let link = format!("/dest/dir/c.flux-partial.{ID}");
+        fs.add_symlink_to(&link, "/dest/keep", flux_fs::LinkKind::Unspecified);
+        let dest = fs.destination_root(Path::new("/dest")).unwrap();
+        let rel = format!("dir/c.flux-partial.{ID}");
+        assert_eq!(remove_validated(&dest, Path::new(&rel)).unwrap(), Removed::Deleted);
+        assert!(!fs.exists(&link));
+        assert!(calls(&fs).contains(&format!("remove_file({link})")), "{:?}", calls(&fs));
+        assert_eq!(
+            fs.read_file("/dest/keep").as_deref(),
+            Some(&b"K"[..]),
+            "the target is untouched"
         );
-        assert!(fs.exists(format!("/dest/dir/c.flux-partial.{ID}")));
+        assert_eq!(remove_validated(&dest, Path::new(&rel)).unwrap(), Removed::AlreadyGone);
     }
 }
