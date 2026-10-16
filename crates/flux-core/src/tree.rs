@@ -163,7 +163,7 @@ impl TreeAbort {
     }
 }
 
-/// One streamed record: every failure, plus the one non-failure `SpecialFileSkipped`.
+/// One streamed record: every failure, plus the non-failure skips.
 #[derive(Debug)]
 pub struct TreeFailure {
     /// Relative to the source root, as the walk reports it.
@@ -2992,6 +2992,9 @@ mod tests {
         assert_eq!(out.mounts_skipped, 1);
         assert_eq!(out.directories_created, 0);
         assert_eq!(out.failures.total(), 0, "{got:?}");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].path, PathBuf::from("m"));
+        assert!(matches!(got[0].cause, TreeFailureCause::MountSkipped), "{got:?}");
         assert!(!fs.exists("/dst/m/inside"));
     }
 
@@ -3014,7 +3017,9 @@ mod tests {
         let abort = r.unwrap_err();
         assert_eq!(abort.error.code(), Code::SafetyRejected);
         assert!(abort.error.to_string().contains("cannot be told"), "{}", abort.error);
-        assert!(abort.outcome.directories_created >= 2);
+        assert_eq!(abort.outcome.directories_created, 2);
+        assert!(!abort.refused_unchanged(), "the destination was changed, so the exit is 1");
+        assert!(fs.exists("/dst/a"));
 
         // Under a reserved refusal the directory is not live, so the Unknown answer is ignored.
         let fs = tree();
