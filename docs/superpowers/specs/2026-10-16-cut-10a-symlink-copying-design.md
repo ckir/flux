@@ -157,7 +157,7 @@ Windows (`dir_windows.rs`):
 | creation unavailable (privilege, filesystem) | `Copy(SymlinkCreationUnavailable)` at `Create`; nothing at the temp or final name; the Existing claim (Replace) stays, as a failed file's does; exit 1. |
 | temp name occupied, batch empty | the leftover is removed under the guard before the create (a directory there fails the entry). |
 | temp name occupied, batch pending | the batch is flushed first (never a removal while entries are pending), then the create; `AlreadyExists` at the create with entries pending flushes and retries once. |
-| lock lost before the publish | the temporary is KEPT and reported as the leftover; the note stays for recovery (as `publish_staged`). |
+| lock lost before the publish | the temporary is KEPT and reported as the leftover; the note is discarded as for a file (`discard_note_on_failure`; anomalies inbox) (as `publish_staged`). |
 | rename fails | guarded discard of the temp; note discarded; `Copy(e)` at `Publish`; leftover reported if the removal failed; `AlreadyExists` becomes `DestinationNamespaceCollision`, a missing no-replace primitive stops the run. |
 | Windows: replacing with or over a directory link refused, the existing object a link | the measured fallback (3.7): unlink the existing link, then `rename_no_replace`; the window stated; a crash there is recreated by `--resume`. |
 | Windows: a directory link would replace a regular file and the rename is refused | the entry fails with the arm's error; the file is untouched. |
