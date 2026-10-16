@@ -35,6 +35,11 @@ mod win {
     const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
     const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
 
+    fn last_error() -> u32 {
+        // SAFETY: GetLastError only reads the calling thread's last-error value.
+        unsafe { GetLastError() }
+    }
+
     fn wide0(s: &OsStr) -> Vec<u16> {
         s.encode_wide().chain(std::iter::once(0)).collect()
     }
@@ -61,11 +66,13 @@ mod win {
         let mut w: Vec<u16> = OsStr::new(name).encode_wide().collect();
         let bytes = (w.len() * 2) as u16;
         let us = UNICODE_STRING { Length: bytes, MaximumLength: bytes, Buffer: w.as_mut_ptr() };
+        // SAFETY: OBJECT_ATTRIBUTES is plain data for which all-zero is a valid initial value.
         let mut oa: OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
         oa.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
         oa.RootDirectory = dir.as_raw_handle() as HANDLE;
         oa.ObjectName = &raw const us;
         let mut raw: HANDLE = std::ptr::null_mut();
+        // SAFETY: IO_STATUS_BLOCK is plain data for which all-zero is valid.
         let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
         // SAFETY: every pointer is to a live local; `w` outlives `us`.
         let status = unsafe {
@@ -93,18 +100,26 @@ mod win {
 
     /// A symlink reparse buffer: header, then offsets/lengths, flags and the path buffer.
     fn symlink_buffer(target: &str, relative: bool) -> Vec<u8> {
-        let t: Vec<u16> = OsStr::new(target).encode_wide().collect();
-        let tb = (t.len() * 2) as u16;
+        let print: Vec<u16> = OsStr::new(target).encode_wide().collect();
+        // A relative payload keeps the same text for both names. An absolute one needs the NT form
+        // `\??\` + the Win32 path as its substitute name; only the print name stays Win32.
+        let substitute: Vec<u16> = if relative {
+            print.clone()
+        } else {
+            OsStr::new("\\??\\").encode_wide().chain(print.iter().copied()).collect()
+        };
+        let sb = (substitute.len() * 2) as u16;
+        let pb = (print.len() * 2) as u16;
         let mut b = Vec::new();
         b.extend_from_slice(&IO_REPARSE_TAG_SYMLINK.to_le_bytes());
-        b.extend_from_slice(&(12 + 2 * tb).to_le_bytes()); // ReparseDataLength
+        b.extend_from_slice(&(12 + sb + pb).to_le_bytes()); // ReparseDataLength
         b.extend_from_slice(&0u16.to_le_bytes()); // Reserved
         b.extend_from_slice(&0u16.to_le_bytes()); // SubstituteNameOffset
-        b.extend_from_slice(&tb.to_le_bytes()); // SubstituteNameLength
-        b.extend_from_slice(&tb.to_le_bytes()); // PrintNameOffset
-        b.extend_from_slice(&tb.to_le_bytes()); // PrintNameLength
+        b.extend_from_slice(&sb.to_le_bytes()); // SubstituteNameLength
+        b.extend_from_slice(&sb.to_le_bytes()); // PrintNameOffset
+        b.extend_from_slice(&pb.to_le_bytes()); // PrintNameLength
         b.extend_from_slice(&(if relative { SYMLINK_FLAG_RELATIVE } else { 0 }).to_le_bytes());
-        for u in t.iter().chain(t.iter()) {
+        for u in substitute.iter().chain(print.iter()) {
             b.extend_from_slice(&u.to_le_bytes());
         }
         b
@@ -126,7 +141,7 @@ mod win {
                 std::ptr::null_mut(),
             )
         };
-        if ok != 0 { Ok(()) } else { Err(unsafe { GetLastError() }) }
+        if ok != 0 { Ok(()) } else { Err(last_error()) }
     }
 
     fn create_symlink_w(link: &Path, target: &str, flags: u32) -> Result<(), u32> {
@@ -134,7 +149,7 @@ mod win {
         let t = wide0(OsStr::new(target));
         // SAFETY: both are NUL-terminated and live across the call.
         let ok = unsafe { CreateSymbolicLinkW(l.as_ptr(), t.as_ptr(), flags) };
-        if ok { Ok(()) } else { Err(unsafe { GetLastError() }) }
+        if ok { Ok(()) } else { Err(last_error()) }
     }
 
     fn show<E: std::fmt::Debug>(r: Result<(), E>) -> String {
@@ -146,8 +161,14 @@ mod win {
 
     /// Rename `from` in `fd` to `to` in `td`. `ex = None`: classic `FileRenameInformation` with
     /// `ReplaceIfExists = true`. `ex = Some(flags)`: `FileRenameInformationEx` with those flags.
-    /// Returns the open status, or the set-information status.
-    fn rename(fd: &OwnedHandle, from: &str, td: &OwnedHandle, to: &str, ex: Option<u32>) -> i32 {
+    /// Returns the failing or final stage (`open` of the source, or `set-information`) with its NTSTATUS.
+    fn rename(
+        fd: &OwnedHandle,
+        from: &str,
+        td: &OwnedHandle,
+        to: &str,
+        ex: Option<u32>,
+    ) -> (&'static str, i32) {
         let (st, h) = nt_create(
             fd,
             from,
@@ -155,16 +176,17 @@ mod win {
             FILE_OPEN,
             FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
         );
-        let Some(h) = h else { return st };
+        let Some(h) = h else { return ("open", st) };
         let wide: Vec<u16> = OsStr::new(to).encode_wide().collect();
         let name_bytes = wide.len() * 2;
         let total = size_of::<FILE_RENAME_INFORMATION>() + name_bytes;
         let mut buf: Vec<u64> = vec![0u64; total.div_ceil(8)];
         let base: *mut u8 = buf.as_mut_ptr().cast();
+        // SAFETY: IO_STATUS_BLOCK is plain data for which all-zero is valid.
         let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
         // SAFETY: `base` addresses at least `total` zeroed, 8-aligned bytes; the name is written into
         // the trailing space; `buf` and `h` outlive the call.
-        unsafe {
+        let st = unsafe {
             let info = base.cast::<FILE_RENAME_INFORMATION>();
             match ex {
                 None => (&raw mut (*info).Anonymous.ReplaceIfExists).write(true),
@@ -184,7 +206,8 @@ mod win {
                 total as u32,
                 if ex.is_some() { FileRenameInformationEx } else { FileRenameInformation },
             )
-        }
+        };
+        ("set-information", st)
     }
 
     /// The reparse tag of `path` itself (not followed), or a description of why it is absent.
@@ -205,6 +228,7 @@ mod win {
             tag: u32,
         }
         let mut info = Info { attrs: 0, tag: 0 };
+        // SAFETY: IO_STATUS_BLOCK is plain data for which all-zero is valid.
         let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
         // SAFETY: `info` is a live, correctly sized FILE_ATTRIBUTE_TAG_INFORMATION.
         let st = unsafe {
@@ -233,7 +257,7 @@ mod win {
         let cases: [(&str, &str, &str, u32); 4] = [
             ("file", "link-file", "real-file", un),
             ("dir", "link-dir", "real-dir", un | SYMBOLIC_LINK_FLAG_DIRECTORY),
-            ("dangling", "link-dangling", "no-such-target", un),
+            ("dangling-file-target", "link-dangling", "no-such-target", un),
             ("file-without-unprivileged-flag", "link-file-privileged", "real-file", 0),
         ];
         for (label, name, target, flags) in cases {
@@ -268,7 +292,7 @@ mod win {
             let r = set_reparse(&h, &symlink_buffer(target, relative));
             match r {
                 Ok(()) => println!("PROBE fsctl_set_reparse_point {label}: Ok"),
-                Err(e) => println!("PROBE fsctl_set_reparse_point {label}: GetLastError={e}"),
+                Err(e) => println!("PROBE fsctl_set_reparse_point {label}: Win32Error={e}"),
             }
             drop(h);
             match std::fs::read_link(p.join(name)) {
@@ -300,17 +324,20 @@ mod win {
                 );
                 if let Err(e) = made {
                     println!(
-                        "PROBE rename {variant} {case}: SETUP link creation failed GetLastError={e}"
+                        "PROBE rename {variant} {case}: SETUP link creation failed Win32Error={e}"
                     );
                     continue;
                 }
                 let dir = open_dir(p);
-                let st = if link_is_source {
+                let (stage, st) = if link_is_source {
                     rename(&dir, "link", &dir, "file", ex)
                 } else {
                     rename(&dir, "file", &dir, "link", ex)
                 };
-                println!("PROBE rename {variant} {case}: NTSTATUS=0x{:08X}", st as u32);
+                println!(
+                    "PROBE rename {variant} {case}: stage={stage} NTSTATUS=0x{:08X}",
+                    st as u32
+                );
             }
         }
     }
@@ -386,6 +413,16 @@ mod linux {
                 return;
             }
         };
+        // A leftover from an earlier run would answer EEXIST and pollute the measurement.
+        match unlinkat(&fd, "probe-link", AtFlags::empty()) {
+            Ok(()) => println!("PROBE symlinkat: removed a leftover probe-link"),
+            Err(e) if e == rustix::io::Errno::NOENT => {}
+            Err(e) => println!("PROBE symlinkat: leftover removal failed: {e:?}"),
+        }
+        match rustix::fs::fstatfs(&fd) {
+            Ok(sf) => println!("PROBE symlinkat {dir:?}: statfs f_type=0x{:X}", sf.f_type as u64),
+            Err(e) => println!("PROBE symlinkat {dir:?}: statfs failed {e:?}"),
+        }
         match symlinkat("target", &fd, "probe-link") {
             Ok(()) => {
                 println!("PROBE symlinkat {dir:?}: Ok");
