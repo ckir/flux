@@ -325,6 +325,19 @@ mod tests {
     }
 
     #[test]
+    fn the_same_cross_filesystems_setting_is_compatible_either_way() {
+        let crossing = CopyOptions { cross_filesystems: true, ..opts() };
+        let prior = prior_options(|o| o.cross_filesystems = true);
+        let (r, w) = run(&prior, &roots_now(), &crossing);
+        assert!(r.is_ok(), "{:?}", r.err());
+        assert!(w.is_empty());
+        let prior = prior_options(|_| {});
+        let (r, w) = run(&prior, &roots_now(), &opts());
+        assert!(r.is_ok(), "{:?}", r.err());
+        assert!(w.is_empty());
+    }
+
+    #[test]
     fn durability_normal_to_strict_is_recorded_and_strict_to_normal_is_refused() {
         let normal = prior_options(|_| {});
         let strict_run = CopyOptions { durability: Durability::Strict, ..opts() };

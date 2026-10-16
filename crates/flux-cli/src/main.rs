@@ -562,6 +562,12 @@ mod tests {
     }
 
     #[test]
+    fn cross_filesystems_reaches_the_options() {
+        assert!(!options(&parse(&[])).cross_filesystems);
+        assert!(options(&parse(&["--cross-filesystems"])).cross_filesystems);
+    }
+
+    #[test]
     fn existing_policy_defaults_to_overwrite() {
         assert_eq!(options(&parse(&[])).existing, ExistingPolicy::Overwrite);
         assert_eq!(options(&parse(&["--overwrite"])).existing, ExistingPolicy::Overwrite);
