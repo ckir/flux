@@ -53,6 +53,7 @@ fn opts() -> CopyOptions {
         operation_id: OperationId::new("replaced by the run"),
         existing: flux_fs::ExistingPolicy::Overwrite,
         links: Links::Copy,
+        cross_filesystems: false,
     }
 }
 

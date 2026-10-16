@@ -174,6 +174,8 @@ fn options(args: &CopyArgs) -> CopyOptions {
         } else {
             ExistingPolicy::Overwrite
         },
+        // The CLI flag is a later task.
+        cross_filesystems: false,
     }
 }
 

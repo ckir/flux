@@ -831,6 +831,9 @@ mod tests {
         fn read_link(&self, _: &Path) -> Result<flux_fs::Link> {
             unimplemented!("EscapingFs exists only to break read_dir")
         }
+        fn mount_root(&self, _: &Path, _: &Path) -> Result<flux_fs::MountRoot> {
+            Ok(flux_fs::MountRoot::No)
+        }
     }
 
     #[test]

@@ -1844,6 +1844,7 @@ mod tests {
             operation_id: flux_fs::OperationId::new(id(1)),
             existing: flux_fs::ExistingPolicy::Overwrite,
             links: flux_fs::Links::Copy,
+            cross_filesystems: false,
         })
     }
 
@@ -1994,6 +1995,7 @@ mod tests {
                 operation_id: flux_fs::OperationId::new(id(1)),
                 existing: ExistingPolicy::Overwrite,
                 links: Links::Copy,
+                cross_filesystems: false,
             };
             f(&mut o);
             Options::of(&o)

@@ -1483,6 +1483,13 @@ impl FileSystem for FaultFs {
         })
     }
 
+    fn mount_root(&self, path: &Path, _parent: &Path) -> Result<MountRoot> {
+        let p = self.norm(path);
+        self.record(format!("source_mount_root({})", p.display()), "source_mount_root")?;
+        let g = self.inner.lock().unwrap();
+        Ok(g.mount_roots.get(&p).copied().unwrap_or(MountRoot::No))
+    }
+
     fn metadata(&self, path: &Path) -> Result<Metadata> {
         let p = self.norm(path);
         self.record(format!("metadata({})", p.display()), "metadata")?;

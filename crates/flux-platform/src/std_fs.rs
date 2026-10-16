@@ -7,7 +7,7 @@
 
 use flux_fs::{
     Code, DirEntry, FileHandle, FileIdentity, FileSystem, FileType, FsError, Link, Metadata,
-    ObjectId, Perms, Result,
+    MountRoot, ObjectId, Perms, Result,
 };
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -255,6 +255,46 @@ impl FileSystem for StdFileSystem {
             .open(path)
             .map(StdFile)
             .map_err(FsError::from_io)
+    }
+
+    /// Whether the directory at `path` is the root of a mount, judged against `parent`; never follows a link at `path`.
+    #[cfg(unix)]
+    fn mount_root(&self, path: &Path, parent: &Path) -> Result<MountRoot> {
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::fs::{AtFlags, StatxFlags, statx};
+            use rustix::io::Errno;
+            match statx(
+                rustix::fs::CWD,
+                path,
+                AtFlags::SYMLINK_NOFOLLOW | AtFlags::NO_AUTOMOUNT,
+                StatxFlags::empty(),
+            ) {
+                Ok(st) => {
+                    if let Some(a) = crate::mount::from_statx_attributes(
+                        st.stx_attributes_mask,
+                        st.stx_attributes,
+                    ) {
+                        return Ok(a);
+                    }
+                    // The kernel did not report the attribute: judge by device numbers.
+                }
+                // `OPNOTSUPP` is the same value as `NOTSUP` on Linux; naming both is an unreachable pattern.
+                Err(Errno::NOSYS | Errno::NOTSUP) => {}
+                Err(e) => return Err(FsError::from_io(std::io::Error::from(e))),
+            }
+        }
+        use std::os::unix::fs::MetadataExt;
+        let child = std::fs::symlink_metadata(path).map_err(FsError::from_io)?;
+        let above = std::fs::symlink_metadata(parent).map_err(FsError::from_io)?;
+        Ok(crate::mount::from_devices(child.dev(), above.dev()))
+    }
+
+    /// Always `No`: a mounted-volume folder is a name-surrogate reparse point, which the walk never descends into
+    /// (see `open_dir`'s reparse-point check), so no directory it reaches can be the root of a mount.
+    #[cfg(windows)]
+    fn mount_root(&self, _path: &Path, _parent: &Path) -> Result<MountRoot> {
+        Ok(MountRoot::No)
     }
 
     #[cfg(unix)]

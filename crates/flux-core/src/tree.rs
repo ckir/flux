@@ -2795,6 +2795,7 @@ mod tests {
             operation_id: OperationId::new("op1"),
             existing: flux_fs::ExistingPolicy::Overwrite,
             links: Links::Copy,
+            cross_filesystems: false,
         }
     }
 

@@ -10,6 +10,8 @@ pub use claims::{CACHE_BYTES, RedbClaimStore, SYNC_CAP};
 #[cfg(unix)]
 mod dir_unix;
 #[cfg(unix)]
+mod mount;
+#[cfg(unix)]
 pub use dir_unix::StdDir;
 
 #[cfg(windows)]
