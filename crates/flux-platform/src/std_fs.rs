@@ -290,8 +290,10 @@ impl FileSystem for StdFileSystem {
         Ok(crate::mount::from_devices(child.dev(), above.dev()))
     }
 
-    /// Always `No`: a mounted-volume folder is a name-surrogate reparse point, which the walk never descends into
-    /// (the source walk types a junction or volume mount point as a link in `read_dir`, below, and `read_link` refuses it as a special file), so no directory it reaches can be the root of a mount.
+    /// Always `No`: a mounted-volume folder is a name-surrogate reparse point, which the walk never
+    /// descends into (the source walk types a junction or volume mount point as a link in
+    /// `read_dir`, below, and `read_link` refuses it as a special file), so no directory it reaches
+    /// can be the root of a mount.
     #[cfg(windows)]
     fn mount_root(&self, _path: &Path, _parent: &Path) -> Result<MountRoot> {
         Ok(MountRoot::No)
