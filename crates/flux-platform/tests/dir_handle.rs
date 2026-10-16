@@ -1174,6 +1174,30 @@ mod windows_arm {
     }
 
     #[test]
+    fn rename_replace_over_a_junction_is_still_refused() {
+        let d = TempDir::new().unwrap();
+        let t = d.path().join("T");
+        std::fs::create_dir(&t).unwrap();
+        std::fs::write(t.join("inside"), b"keep").unwrap();
+        if !junction(&t, &d.path().join("J")) {
+            println!("skipped: mklink /J failed on this runner");
+            return;
+        }
+        std::fs::write(d.path().join("f"), b"staged bytes").unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let r = root.rename_replace(OsStr::new("f"), &root, OsStr::new("J"));
+        assert!(r.is_err(), "replacing a junction must be refused");
+        let meta = std::fs::symlink_metadata(d.path().join("J")).unwrap();
+        assert!(!meta.is_file(), "J is still not a regular file: {meta:?}");
+        assert!(
+            std::os::windows::fs::MetadataExt::file_attributes(&meta) & 0x400 != 0,
+            "J is still a reparse point: {meta:?}"
+        );
+        assert_eq!(std::fs::read(t.join("inside")).unwrap(), b"keep", "T is intact");
+        assert!(std::fs::symlink_metadata(d.path().join("f")).is_ok(), "f still exists");
+    }
+
+    #[test]
     fn rename_replace_still_replaces_a_file_with_a_directory_link() {
         let d = TempDir::new().unwrap();
         if !can_create_symlinks(d.path()) {

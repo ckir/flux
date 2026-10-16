@@ -376,6 +376,15 @@ impl DirHandle for StdDir {
         let ok = unsafe { CreateSymbolicLinkW(link_path.as_ptr(), payload.as_ptr(), flags) };
         if !ok {
             let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32;
+            // ERROR_ACCESS_DENIED is what Windows answers when the name is held by a DIRECTORY (measured on
+            // the hosted runner). The trait contract is AlreadyExists when anything holds the name, so look
+            // through the handle (no-follow) and report that; a name that is not there keeps the denial.
+            if code == 5 && metadata_at(&self.0, name).is_ok() {
+                return Err(FsError::from_io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    std::io::Error::from_raw_os_error(code as i32),
+                )));
+            }
             return Err(map_symlink_error(code));
         }
         Ok(())
@@ -1541,10 +1550,17 @@ fn rename_at(fd: &OwnedHandle, f: &OsStr, td: &OwnedHandle, t: &OsStr, r: bool) 
     // existing DIRECTORY link"; MEASURED on Windows 11 by the owner:
     // `FileRenameInformationEx` with REPLACE_IF_EXISTS | POSIX_SEMANTICS succeeds in
     // both directions). So retry ONCE, and only when replacing, when the failure is
-    // ACCESS_DENIED, and when the existing target is a name-surrogate reparse point.
+    // ACCESS_DENIED, and when the existing target is a SYMLINK reparse point (R13). Only a
+    // directory symlink was measured; a junction (tag 0xA0000003) and any other surrogate are
+    // unmeasured and keep the plain denial, pinned by the test
+    // `a_file_over_a_junction_at_the_destination_name`.
     // Any other status, or a failing retry, is reported exactly as before.
     let mut status = status;
-    if status != 0 && r && status == STATUS_ACCESS_DENIED && surrogate_tag_at(td, t).is_some() {
+    if status != 0
+        && r
+        && status == STATUS_ACCESS_DENIED
+        && surrogate_tag_at(td, t) == Some(IO_REPARSE_TAG_SYMLINK)
+    {
         // SAFETY: same buffer, same `total`, same live `h`/`buf` as the call above. The
         // `Anonymous` union is u32-sized at the same offset for the classic and the Ex
         // layout; the Ex class reads it as `Flags`, so it is overwritten whole (this also
@@ -1569,7 +1585,7 @@ fn rename_at(fd: &OwnedHandle, f: &OsStr, td: &OwnedHandle, t: &OsStr, r: bool) 
     Ok(())
 }
 
-/// The name-surrogate tag of a child that is NOT a directory, or `None`.
+/// The name-surrogate reparse tag of a child (a file link or a directory link), or `None`.
 ///
 /// Opens with no `FILE_DIRECTORY_FILE` and no `FILE_NON_DIRECTORY_FILE`, so it
 /// accepts whatever the name is, plus `FILE_OPEN_REPARSE_POINT` so it sees the LINK
