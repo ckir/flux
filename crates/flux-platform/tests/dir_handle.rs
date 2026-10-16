@@ -1098,6 +1098,45 @@ mod windows_arm {
     }
 
     #[test]
+    fn create_symlink_round_trips_file_and_dir_links_when_the_runner_can() {
+        use flux_fs::{Link, LinkKind};
+        let d = TempDir::new().unwrap();
+        if !can_create_symlinks(d.path()) {
+            println!("skipped: this runner cannot create symlinks");
+            return;
+        }
+        std::fs::create_dir(d.path().join("target_dir")).unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let cases: [(&str, &str, LinkKind); 5] = [
+            ("a", r"x\y", LinkKind::File),
+            ("dl", "target_dir", LinkKind::Dir),
+            ("d", "nowhere", LinkKind::File),
+            ("abs", r"C:\Windows", LinkKind::File),
+            ("L", "target_dir", LinkKind::Dir),
+        ];
+        for (name, payload, kind) in cases {
+            let made = Link { payload: payload.into(), kind };
+            root.create_symlink(OsStr::new(name), &made).unwrap();
+            let back = root.read_link(OsStr::new(name)).unwrap();
+            assert_eq!(back.payload, OsStr::new(payload), "{name}");
+            assert_eq!(back.kind, kind, "{name}");
+        }
+        for (name, payload, kind) in cases {
+            let made = Link { payload: payload.into(), kind };
+            let e = root.create_symlink(OsStr::new(name), &made).unwrap_err();
+            assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists, "{name}: {e:?}");
+        }
+        // Nothing is created through an existing link.
+        let e = root.create_symlink(OsStr::new("L\\child"), &link(OsStr::new("z")));
+        assert!(e.is_err(), "a separator is a bad component");
+        assert!(
+            root.open_dir(OsStr::new("L")).is_err(),
+            "a handle cannot be opened through a link"
+        );
+        assert_eq!(std::fs::read_dir(d.path().join("target_dir")).unwrap().count(), 0);
+    }
+
+    #[test]
     fn read_link_on_a_junction_is_special_file_unsupported() {
         let d = TempDir::new().unwrap();
         std::fs::create_dir(d.path().join("real")).unwrap();

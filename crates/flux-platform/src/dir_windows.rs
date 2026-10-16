@@ -103,6 +103,31 @@ const fn is_name_surrogate(tag: u32) -> bool {
 /// It is a socket, not a regular file, and the POSIX arm refuses a socket through `fstat`.
 const IO_REPARSE_TAG_AF_UNIX: u32 = 0x8000_0023;
 
+/// A `CreateSymbolicLinkW` failure (`GetLastError`) as the trait's error (spec 3.1, 3.7).
+fn map_symlink_error(code: u32) -> FsError {
+    use windows_sys::Win32::Foundation::{
+        ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER,
+        ERROR_NOT_SUPPORTED, ERROR_PRIVILEGE_NOT_HELD,
+    };
+    match code {
+        // 87 is an OS that does not know the unprivileged flag.
+        ERROR_PRIVILEGE_NOT_HELD
+        | ERROR_NOT_SUPPORTED
+        | ERROR_INVALID_FUNCTION
+        | ERROR_INVALID_PARAMETER => FsError::new(
+            Code::SymlinkCreationUnavailable,
+            std::io::Error::other(
+                "symlink creation needs Developer Mode or the SeCreateSymbolicLinkPrivilege right",
+            ),
+        ),
+        ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS => FsError::from_io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            std::io::Error::from_raw_os_error(code as i32),
+        )),
+        _ => FsError::from_io(std::io::Error::from_raw_os_error(code as i32)),
+    }
+}
+
 /// `Debug` is required, not decorative: the tests call `.unwrap_err()` on a
 /// `Result<StdDir, _>`, which needs `StdDir: Debug` to compile.
 #[derive(Debug)]
@@ -291,17 +316,55 @@ impl DirHandle for StdDir {
         crate::dir_windows::read_link_at(&self.0, name)
     }
 
-    /// PLACEHOLDER (cut 10a Task 1): Windows symlink creation is decided by measurement and lands in Task 7. Until
-    /// then every create answers the spec's failure for a process without the right. `LinkKind::Unspecified` will
-    /// create a file link there.
-    fn create_symlink(&self, name: &OsStr, _link: &Link) -> Result<()> {
+    /// `CreateSymbolicLinkW` with the unprivileged flag (measured: works under Developer Mode, 1314 without it).
+    /// `LinkKind::Unspecified` creates a FILE link (spec D9). Exclusive: an occupied name, a dangling link included,
+    /// is `AlreadyExists`.
+    fn create_symlink(&self, name: &OsStr, link: &Link) -> Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateSymbolicLinkW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE, SYMBOLIC_LINK_FLAG_DIRECTORY,
+        };
+
         check_component(name)?;
-        Err(FsError::new(
-            Code::SymlinkCreationUnavailable,
-            std::io::Error::other(
-                "symlink creation needs Developer Mode or the SeCreateSymbolicLinkPrivilege right (not yet wired on Windows: cut 10a Task 7)",
-            ),
-        ))
+        let dir_path = self.canonical_path()?;
+
+        // SAFETY/RESIDUAL: this is the ONE path-based destination write the Windows arm makes (spec 3.7,
+        // candidate (b)); `CreateSymbolicLinkW` takes no directory handle. The residual is the window between
+        // this identity re-check and the call. The re-check refuses when the path no longer names the object
+        // this handle holds.
+        let at_path = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&dir_path)
+            .map_err(FsError::from_io)?;
+        let held = crate::std_fs::identity_of_handle(&self.0);
+        if matches!(held, flux_fs::FileIdentity::Unavailable)
+            || crate::std_fs::identity_of_handle(&at_path) != held
+        {
+            return Err(FsError::new(
+                Code::SafetyRejected,
+                std::io::Error::other(
+                    "the directory handle no longer names the path it was opened at",
+                ),
+            ));
+        }
+        drop(at_path);
+
+        let link_path: Vec<u16> =
+            dir_path.join(name).as_os_str().encode_wide().chain(Some(0)).collect();
+        let payload: Vec<u16> = link.payload.encode_wide().chain(Some(0)).collect();
+        let mut flags = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
+        if link.kind == LinkKind::Dir {
+            flags |= SYMBOLIC_LINK_FLAG_DIRECTORY;
+        }
+        // SAFETY: both buffers are live NUL-terminated UTF-16 strings that outlive the call.
+        let ok = unsafe { CreateSymbolicLinkW(link_path.as_ptr(), payload.as_ptr(), flags) };
+        if !ok {
+            let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32;
+            return Err(map_symlink_error(code));
+        }
+        Ok(())
     }
 
     fn rename_no_replace(&self, from: &OsStr, other: &Self, to: &OsStr) -> Result<()> {
