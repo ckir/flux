@@ -753,6 +753,8 @@ fn walk_into<F: DestinationRoot>(
                     report(out, on_report, path, TreeFailureCause::SpecialFileSkipped);
                 }
             }
+            // Cut 10b: Task 4 gives these their behaviour.
+            WalkEvent::MountSkipped { .. } | WalkEvent::MountUnknown { .. } => {}
             WalkEvent::DirEnd { path } => {
                 // Cut 8b, "Claim syncing": a directory that keyed claims is flushed at its end. A synced commit is a
                 // write under DEST, so §101 and §99 come first, as before a directory's creation. A skipped
