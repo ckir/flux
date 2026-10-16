@@ -41,6 +41,13 @@ pub struct Report {
     /// Cut 9f-2: `"full"` when `--resume-verify=full` re-read a partial; absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_verify: Option<&'static str>,
+    /// Cut 10b: source mount roots created as empty directories and not descended into; absent at zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub mounts_skipped: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 impl Report {
@@ -65,6 +72,7 @@ impl Report {
             verify_level: "none",
             hash_algorithm: "blake3",
             resume_verify: None,
+            mounts_skipped: 0,
         }
     }
 
@@ -79,6 +87,7 @@ impl Report {
             + out.symlinks_skipped
             + out.files_skipped
             + out.files_resumed;
+        r.mounts_skipped = out.mounts_skipped;
         r.files_overwritten = out.files_overwritten;
         r.bytes_skipped = out.bytes_skipped + out.bytes_resumed;
         r.files_degraded = out.files_degraded;
@@ -190,6 +199,9 @@ pub fn record_lines(f: &TreeFailure) -> Vec<String> {
         TreeFailureCause::SymlinkSkipped => {
             vec![format!("{p}: object_type=symlink action=skipped (--links=skip)")]
         }
+        TreeFailureCause::MountSkipped => vec![format!(
+            "{p}: object_type=mount action=skipped (pass --cross-filesystems to copy its contents)"
+        )],
         TreeFailureCause::PublishedWithComplaints(v) => {
             v.iter().map(|m| complaint_line(&p, m)).collect()
         }
@@ -241,6 +253,13 @@ pub fn safety_warning_lines(out: &TreeOutcome) -> Vec<String> {
     if let Some(g) = &out.mount_unknown {
         v.push(format!(
             "warning: could not tell whether a pre-existing destination directory is a mount root ({} checks, e.g. {}); merged anyway - --safety=strict refuses instead",
+            g.count,
+            rel(&g.example)
+        ));
+    }
+    if let Some(g) = &out.source_mount_unknown {
+        v.push(format!(
+            "warning: could not tell whether a source directory is a mount root ({} checks, e.g. {}); descended into it - --safety=strict refuses instead",
             g.count,
             rel(&g.example)
         ));
@@ -606,6 +625,23 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn mounts_skipped_is_its_own_count_and_absent_from_json_at_zero() {
+        let mut out = TreeOutcome::default();
+        let before = Report::tree(&out, false, 10).files_skipped;
+        out.mounts_skipped = 2;
+        let r = Report::tree(&out, false, 10);
+        assert_eq!(r.mounts_skipped, 2);
+        assert_eq!(r.files_skipped, before, "a skipped mount is not a skipped file");
+        assert_eq!(serde_json::to_value(&r).unwrap()["mounts_skipped"], 2);
+
+        let zero = serde_json::to_value(Report::tree(&TreeOutcome::default(), false, 0)).unwrap();
+        let obj = zero.as_object().unwrap();
+        assert_eq!(obj.len(), 18);
+        assert!(!obj.contains_key("mounts_skipped"));
+    }
+
+    #[test]
     fn a_claim_not_recorded_failure_is_not_a_failed_file() {
         let mut out = TreeOutcome::default();
         out.failures.claim_not_recorded = 1;
@@ -707,6 +743,10 @@ mod tests {
             ["l: object_type=symlink action=skipped (--links=skip)"]
         );
         assert_eq!(
+            line("m", TreeFailureCause::MountSkipped),
+            ["m: object_type=mount action=skipped (pass --cross-filesystems to copy its contents)"]
+        );
+        assert_eq!(
             line("s", TreeFailureCause::Walk(FsError::new(Code::PermissionDenied, io("denied")))),
             ["PERMISSION_DENIED: s: denied"]
         );
@@ -763,18 +803,25 @@ mod tests {
     fn both_safety_warnings_render_after_the_identity_ones() {
         let mut out = TreeOutcome::default();
         out.mount_unknown = Some(DegradedGroup { count: 2, example: PathBuf::from("sub") });
+        out.source_mount_unknown =
+            Some(DegradedGroup { count: 3, example: PathBuf::from("src-sub") });
         out.containment_degraded = Some(PathBuf::from("/p"));
         out.replace_degraded = Some(DegradedGroup { count: 4, example: PathBuf::from("d") });
         let v = safety_warning_lines(&out);
-        assert_eq!(v.len(), 3);
+        assert_eq!(v.len(), 4);
         for needle in ["mount root", "2 checks", "e.g. sub", "--safety=strict"] {
             assert!(v[0].contains(needle), "{needle}: {}", v[0]);
         }
-        for needle in ["/p", "lexically", "--safety=strict"] {
+        for needle in
+            ["source directory", "3 checks", "e.g. src-sub", "descended", "--safety=strict"]
+        {
             assert!(v[1].contains(needle), "{needle}: {}", v[1]);
         }
+        for needle in ["/p", "lexically", "--safety=strict"] {
+            assert!(v[2].contains(needle), "{needle}: {}", v[2]);
+        }
         assert_eq!(
-            v[2],
+            v[3],
             "warning: could not key claims in 4 directories (e.g. d); existing files there are reported as collisions - --safety=strict skips them instead"
         );
         assert!(safety_warning_lines(&TreeOutcome::default()).is_empty());
@@ -782,12 +829,13 @@ mod tests {
         // The order is pinned where it is decided: identity lines first, then these two.
         out.warnings.unavailable = Some(DegradedGroup { count: 1, example: PathBuf::new() });
         let all = tree_warning_lines(&out);
-        assert_eq!(all.len(), 4);
+        assert_eq!(all.len(), 5);
         assert!(
             all[0].contains("identity")
-                && all[1].contains("mount root")
-                && all[2].contains("lexically")
-                && all[3].contains("could not key claims"),
+                && all[1].contains("destination directory is a mount root")
+                && all[2].contains("source directory is a mount root")
+                && all[3].contains("lexically")
+                && all[4].contains("could not key claims"),
             "{all:?}"
         );
     }

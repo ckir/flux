@@ -13,7 +13,7 @@ use crate::copy::{
 };
 use crate::names::{NameIndex, Resolved};
 use crate::state::{FLUX_DIR, RESERVED_DIRS, identity_text, native_hex};
-use crate::walk::{Walk, WalkEvent, walk};
+use crate::walk::{DEFAULT_MAX_DEPTH, MountPolicy, Walk, WalkEvent, WalkOptions, walk_with};
 use flux_fs::{
     ClaimKey, ClaimOutcome, ClaimRecord, ClaimStatus, ClaimStore, Code, CopyOptions,
     DestinationRoot, DirHandle, Durability, ExistingPolicy, FileIdentity, FileSystem, FileType,
@@ -49,9 +49,15 @@ pub struct TreeOutcome {
     pub special_files_skipped: u64,
     /// Cut 10a: symlinks left out under `--links=skip` (§124). Not failures; the CLI adds them into `files_skipped`.
     pub symlinks_skipped: u64,
+    /// Cut 10b: source mount roots created as empty directories and not descended into (section 42). Not failures; the
+    /// CLI reports them as `mounts_skipped`, apart from `files_skipped`.
+    pub mounts_skipped: u64,
     /// Part M: pre-existing destination directories whose mount-root query could not tell, merged into under
     /// `Safety::Default`. The example is relative to the source root, as `warnings` are.
     pub mount_unknown: Option<DegradedGroup>,
+    /// Cut 10b: source directories whose mount-root query could not tell, descended into under `Safety::Default`
+    /// (`Safety::Strict` refuses). The example is relative to the source root.
+    pub source_mount_unknown: Option<DegradedGroup>,
     /// Part A: the canonical-path query was unsupported, so containment was checked lexically only. The path
     /// whose query failed, as the operator gave it (DEST, its parent, or the source root).
     pub containment_degraded: Option<PathBuf>,
@@ -186,6 +192,10 @@ pub enum TreeFailureCause {
     /// created. Not counted by `FailureTally`; `TreeOutcome` counts it in `symlinks_skipped`. A link that fails to be
     /// copied is a `Copy` failure like a file's.
     SymlinkSkipped,
+    /// NOT a failure (cut 10b, section 42): a source directory that is a mount root, created at the destination as an
+    /// empty directory and not descended into. Not counted by `FailureTally`; `TreeOutcome` counts it in
+    /// `mounts_skipped`.
+    MountSkipped,
     /// The file IS at the destination; some of its metadata could not be applied.
     /// Published with complaints, which exits 1 like the single-file case.
     PublishedWithComplaints(Vec<MetadataFailure>),
@@ -233,6 +243,8 @@ impl FailureTally {
             TreeFailureCause::SpecialFileSkipped => {}
             // Not a failure (§124): `report` counts it in `TreeOutcome::symlinks_skipped`.
             TreeFailureCause::SymlinkSkipped => {}
+            // Not a failure (section 42): `report` counts it in `TreeOutcome::mounts_skipped`.
+            TreeFailureCause::MountSkipped => {}
             TreeFailureCause::PublishedWithComplaints(_) => self.published_with_complaints += 1,
             TreeFailureCause::ClaimNotRecorded(_) => self.claim_not_recorded += 1,
         }
@@ -365,10 +377,12 @@ pub(crate) fn prepare_source<'a, F: FileSystem>(
     fs: &'a F,
     src_root: &'a Path,
     dst_root: &Path,
+    mounts: MountPolicy,
 ) -> std::result::Result<Source<'a, F>, CopyError> {
     // 1. The source root. `walk` refuses a missing or non-directory root: the whole
     //    operation failing, before any destination call.
-    let events = walk(fs, src_root).map_err(|e| CopyError::at(CopyStep::Source, e))?;
+    let events = walk_with(fs, src_root, WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts })
+        .map_err(|e| CopyError::at(CopyStep::Source, e))?;
     let identity = fs.metadata(src_root).map_err(|e| CopyError::at(CopyStep::Source, e))?.identity;
 
     // 2. The lexical floor, before any destination call (§129's own example, `/data`
@@ -510,7 +524,7 @@ fn run_tree<F: DestinationRoot>(
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<(), CopyError> {
-    let source = prepare_source(fs, src_root, dst_root)?;
+    let source = prepare_source(fs, src_root, dst_root, MountPolicy::of(opts))?;
 
     // 3-5. Resolve the destination, compare it with the source, create the root.
     let resolve = |e| CopyError::at(CopyStep::Resolve, e);
@@ -753,8 +767,25 @@ fn walk_into<F: DestinationRoot>(
                     report(out, on_report, path, TreeFailureCause::SpecialFileSkipped);
                 }
             }
-            // Cut 10b: Task 4 gives these their behaviour.
-            WalkEvent::MountSkipped { .. } | WalkEvent::MountUnknown { .. } => {}
+            WalkEvent::MountSkipped { path } => {
+                if live {
+                    report(out, on_report, path, TreeFailureCause::MountSkipped);
+                }
+            }
+            WalkEvent::MountUnknown { path } => {
+                if live {
+                    match cx.opts.safety {
+                        Safety::Default => {
+                            DegradedGroup::note(&mut out.source_mount_unknown, &path)
+                        }
+                        Safety::Strict => {
+                            return Err(refuse(
+                                "whether a source directory is a mount root cannot be told with full confidence",
+                            ));
+                        }
+                    }
+                }
+            }
             WalkEvent::DirEnd { path } => {
                 // Cut 8b, "Claim syncing": a directory that keyed claims is flushed at its end. A synced commit is a
                 // write under DEST, so §101 and §99 come first, as before a directory's creation. A skipped
@@ -2733,6 +2764,9 @@ pub(crate) fn report(
     if matches!(cause, TreeFailureCause::SymlinkSkipped) {
         out.symlinks_skipped += 1;
     }
+    if matches!(cause, TreeFailureCause::MountSkipped) {
+        out.mounts_skipped += 1;
+    }
     out.failures.count(&cause);
     on_report(TreeFailure { path, cause });
 }
@@ -2754,6 +2788,7 @@ mod tests {
         t.count(&TreeFailureCause::PublishedWithComplaints(Vec::new()));
         t.count(&TreeFailureCause::SpecialFileSkipped);
         t.count(&TreeFailureCause::SymlinkSkipped);
+        t.count(&TreeFailureCause::MountSkipped);
         t.count(&TreeFailureCause::ClaimNotRecorded(e()));
         assert_eq!(
             t,
@@ -2847,6 +2882,164 @@ mod tests {
 
     fn calls_since(fs: &FaultFs, n: usize) -> Vec<String> {
         fs.calls()[n..].to_vec()
+    }
+
+    /// A source directory `path` that is a mount root: it and every missing ancestor are created, one file `inside`
+    /// is written in it, and the fake is told it is a mount root.
+    fn mounted(fs: &FaultFs, path: &str) {
+        let mut cur = PathBuf::new();
+        for c in Path::new(path).components() {
+            cur.push(c);
+            if !fs.exists(&cur) {
+                fs.create_dir(&cur).unwrap();
+            }
+        }
+        fs.write_file(format!("{path}/inside"), b"x");
+        fs.set_mount_root(path, flux_fs::MountRoot::Yes);
+    }
+
+    #[test]
+    fn a_mount_is_an_empty_directory_reported_once_and_not_a_failure() {
+        let fs = tree();
+        mounted(&fs, "/src/m1");
+        mounted(&fs, "/src/m2");
+
+        let (r, got) = run(&fs, "/src", "/dst", &opts());
+
+        let out = r.unwrap();
+        for m in ["/dst/m1", "/dst/m2"] {
+            assert!(fs.exists(m), "{m}");
+            assert!(fs.read_dir(Path::new(m)).unwrap().is_empty(), "{m}");
+        }
+        assert!(!fs.exists("/dst/m1/inside"));
+        assert_eq!(out.mounts_skipped, 2);
+        assert_eq!(out.directories_created, 4);
+        assert_eq!(out.files_total, 2);
+        assert_eq!(out.files_copied, 2);
+        assert_eq!(out.failures.total(), 0);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got.iter().all(|f| matches!(f.cause, TreeFailureCause::MountSkipped)), "{got:?}");
+        assert_eq!(got[0].path, PathBuf::from("m1"));
+        assert_eq!(got[1].path, PathBuf::from("m2"));
+        assert!(!fs.called("read_dir(/src/m1)"), "{:?}", fs.calls());
+    }
+
+    #[test]
+    fn a_mount_whose_directory_cannot_be_created_reports_the_failure_only() {
+        let fs = tree();
+        mounted(&fs, "/src/m");
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.write_file("/dst/m", b"x");
+
+        let (r, got) = run(&fs, "/src", "/dst", &opts());
+
+        let out = r.unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].path, PathBuf::from("m"));
+        assert!(matches!(got[0].cause, TreeFailureCause::CreateDir(_)), "{got:?}");
+        assert_eq!(out.mounts_skipped, 0);
+        assert!(!fs.exists("/dst/m/inside"));
+    }
+
+    #[test]
+    fn a_mount_under_a_skipped_subtree_is_silent() {
+        let fs = tree();
+        mounted(&fs, "/src/.flux/operations/m");
+
+        let (r, got) = run(&fs, "/src", "/dst", &opts());
+
+        let out = r.unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].path, PathBuf::from(".flux/operations"));
+        assert!(matches!(got[0].cause, TreeFailureCause::CreateDir(_)), "{got:?}");
+        assert_eq!(out.mounts_skipped, 0);
+        assert!(!fs.exists("/dst/.flux/operations/m"));
+    }
+
+    #[test]
+    fn a_mount_at_a_reserved_name_is_refused_by_the_reserved_arm() {
+        let fs = tree();
+        mounted(&fs, "/src/.flux/operations");
+
+        let (r, got) = run(&fs, "/src", "/dst", &opts());
+
+        let out = r.unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].path, PathBuf::from(".flux/operations"));
+        match &got[0].cause {
+            TreeFailureCause::CreateDir(e) => {
+                assert_eq!(e.code, Code::ControlPlaneNamespaceConflict)
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(out.mounts_skipped, 0);
+        assert!(!fs.exists("/dst/.flux/operations"));
+    }
+
+    #[test]
+    fn a_second_run_merges_into_the_empty_mount_directory() {
+        // Only the mount: a plain `run` keys no claims, so a second run would report every file as a collision.
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/")).unwrap();
+        fs.create_dir(Path::new("/src")).unwrap();
+        mounted(&fs, "/src/m");
+        let (r, _) = run(&fs, "/src", "/dst", &opts());
+        r.unwrap();
+
+        let (r, got) = run(&fs, "/src", "/dst", &with_existing(flux_fs::ExistingPolicy::Update));
+
+        let out = r.unwrap();
+        assert_eq!(out.mounts_skipped, 1);
+        assert_eq!(out.directories_created, 0);
+        assert_eq!(out.failures.total(), 0, "{got:?}");
+        assert!(!fs.exists("/dst/m/inside"));
+    }
+
+    #[test]
+    fn an_unknown_source_mount_warns_under_default_and_refuses_the_operation_under_strict() {
+        let fs = tree();
+        fs.set_mount_root("/src/sub", flux_fs::MountRoot::Unknown);
+        let (r, got) = run(&fs, "/src", "/dst", &opts());
+        let out = r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(
+            out.source_mount_unknown,
+            Some(DegradedGroup { count: 1, example: PathBuf::from("sub") })
+        );
+        assert!(fs.exists("/dst/sub/b"));
+
+        let fs = tree();
+        fs.set_mount_root("/src/sub", flux_fs::MountRoot::Unknown);
+        let (r, _) = run_full(&fs, "/src", "/dst", &strict());
+        let abort = r.unwrap_err();
+        assert_eq!(abort.error.code(), Code::SafetyRejected);
+        assert!(abort.error.to_string().contains("cannot be told"), "{}", abort.error);
+        assert!(abort.outcome.directories_created >= 2);
+
+        // Under a reserved refusal the directory is not live, so the Unknown answer is ignored.
+        let fs = tree();
+        fs.create_dir(Path::new("/src/.flux")).unwrap();
+        fs.create_dir(Path::new("/src/.flux/operations")).unwrap();
+        fs.write_file("/src/.flux/operations/f", b"x");
+        fs.set_mount_root("/src/.flux/operations", flux_fs::MountRoot::Unknown);
+        let (r, _) = run(&fs, "/src", "/dst", &strict());
+        let out = r.unwrap();
+        assert!(out.source_mount_unknown.is_none());
+    }
+
+    #[test]
+    fn a_skipped_mount_that_is_the_destination_itself_is_refused_by_identity() {
+        let fs = tree();
+        mounted(&fs, "/src/m");
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.set_identity("/src/m", identity_of(&fs, "/dst"));
+
+        let (r, _) = run_full(&fs, "/src", "/dst", &opts());
+
+        let abort = r.unwrap_err();
+        assert_eq!(abort.error.code(), Code::SafetyRejected);
+        assert!(abort.error.to_string().contains("the destination itself"), "{}", abort.error);
+        assert_eq!(abort.outcome.mounts_skipped, 0);
     }
 
     #[test]
@@ -3622,7 +3815,8 @@ mod tests {
         guard: &Guard<'_>,
         seed: impl FnOnce(&mut crate::fault_fs::FakeClaimStore, ObjectId),
     ) -> (std::result::Result<(), CopyError>, TreeOutcome, Vec<TreeFailure>) {
-        let source = prepare_source(fs, Path::new("/src"), Path::new("/dst")).unwrap();
+        let source =
+            prepare_source(fs, Path::new("/src"), Path::new("/dst"), MountPolicy::Cross).unwrap();
         if !fs.exists(Path::new("/dst")) {
             fs.create_dir(Path::new("/dst")).unwrap();
         }
@@ -4582,7 +4776,8 @@ mod tests {
         fs: &FaultFs,
         guard: &Guard<'_>,
     ) -> (std::result::Result<(), CopyError>, TreeOutcome) {
-        let source = prepare_source(fs, Path::new("/src"), Path::new("/dst")).unwrap();
+        let source =
+            prepare_source(fs, Path::new("/src"), Path::new("/dst"), MountPolicy::Cross).unwrap();
         fs.create_dir(Path::new("/dst")).unwrap();
         let root = fs.destination_root(Path::new("/dst")).unwrap();
         let o = opts();
@@ -4662,7 +4857,8 @@ mod tests {
     #[test]
     fn a_failed_heartbeat_aborts_the_whole_tree() {
         let fs = tree();
-        let source = prepare_source(&fs, Path::new("/src"), Path::new("/dst")).unwrap();
+        let source =
+            prepare_source(&fs, Path::new("/src"), Path::new("/dst"), MountPolicy::Cross).unwrap();
         fs.create_dir(Path::new("/dst")).unwrap();
         let root = fs.destination_root(Path::new("/dst")).unwrap();
         let o = opts();
@@ -4701,7 +4897,8 @@ mod tests {
     #[test]
     fn a_heartbeat_failure_inside_a_file_aborts_the_whole_tree() {
         let fs = tree();
-        let source = prepare_source(&fs, Path::new("/src"), Path::new("/dst")).unwrap();
+        let source =
+            prepare_source(&fs, Path::new("/src"), Path::new("/dst"), MountPolicy::Cross).unwrap();
         fs.create_dir(Path::new("/dst")).unwrap();
         let root = fs.destination_root(Path::new("/dst")).unwrap();
         let o = opts();
@@ -4741,7 +4938,8 @@ mod tests {
         let fs = tree();
         let (r, _) = guarded(&fs, &unguarded);
         r.unwrap();
-        let source = prepare_source(&fs, Path::new("/src"), Path::new("/dst")).unwrap();
+        let source =
+            prepare_source(&fs, Path::new("/src"), Path::new("/dst"), MountPolicy::Cross).unwrap();
         let root = fs.destination_root(Path::new("/dst")).unwrap();
         let o = opts();
         let cx = Shared {
@@ -4836,7 +5034,8 @@ mod tests {
         guard: &Guard<'_>,
         beat: &Heartbeat<'_>,
     ) -> (std::result::Result<(), CopyError>, TreeOutcome, Vec<TreeFailure>) {
-        let source = prepare_source(fs, Path::new("/src"), Path::new("/dst")).unwrap();
+        let source =
+            prepare_source(fs, Path::new("/src"), Path::new("/dst"), MountPolicy::Cross).unwrap();
         if !fs.exists(Path::new("/dst")) {
             fs.create_dir(Path::new("/dst")).unwrap();
         }
