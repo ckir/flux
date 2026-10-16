@@ -946,11 +946,24 @@ mod posix {
     fn an_empty_payload_is_the_os_error_not_a_panic() {
         let d = TempDir::new().unwrap();
         let root = StdFileSystem.destination_root(d.path()).unwrap();
-        let e = root.create_symlink(OsStr::new("l"), &link(OsStr::new(""))).unwrap_err();
-        // Linux answers ENOENT for an empty symlink target; other kernels may differ, so the kind is the OS's own.
+        let r = root.create_symlink(OsStr::new("l"), &link(OsStr::new("")));
+        let name = d.path().join("l");
+        // Linux answers ENOENT for an empty symlink target and creates nothing. macOS creates an empty-target link, so
+        // elsewhere either outcome is accepted: an error leaves nothing behind, a success reads back an empty payload.
         #[cfg(target_os = "linux")]
-        assert_eq!(e.source.kind(), std::io::ErrorKind::NotFound, "{e:?}");
-        assert!(std::fs::symlink_metadata(d.path().join("l")).is_err(), "nothing created: {e:?}");
+        {
+            let e = r.unwrap_err();
+            assert_eq!(e.source.kind(), std::io::ErrorKind::NotFound, "{e:?}");
+            assert!(std::fs::symlink_metadata(&name).is_err(), "nothing created: {e:?}");
+        }
+        #[cfg(not(target_os = "linux"))]
+        match r {
+            Err(e) => assert!(std::fs::symlink_metadata(&name).is_err(), "nothing created: {e:?}"),
+            Ok(_) => {
+                assert!(std::fs::read_link(&name).unwrap().as_os_str().is_empty(), "empty payload");
+                std::fs::remove_file(&name).unwrap();
+            }
+        }
     }
 }
 

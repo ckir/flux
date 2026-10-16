@@ -1123,8 +1123,10 @@ impl FaultFs {
         self.inner.lock().unwrap().bytes_read.get(path.as_ref()).copied().unwrap_or(0)
     }
 
+    /// Every recorded call, with `\` spelled `/`: the fake records `Path::display()`, which uses backslashes on Windows,
+    /// so a call-log assertion (including an absence assertion) must not depend on the platform's separator.
     pub fn calls(&self) -> Vec<String> {
-        self.inner.lock().unwrap().calls.clone()
+        self.inner.lock().unwrap().calls.iter().map(|c| c.replace('\\', "/")).collect()
     }
 
     pub fn called(&self, prefix: &str) -> bool {
@@ -3950,6 +3952,19 @@ mod tests {
         let e = fs.create_dir(Path::new("/d/FILE.TXT")).unwrap_err();
         assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(names(&fs, "/d"), vec!["file.txt"]);
+    }
+
+    #[test]
+    fn calls_use_forward_slashes_on_every_platform() {
+        let fs = FaultFs::new();
+        fs.write_file("/d/seed", b"x");
+        // A backslash inside a component is recorded verbatim on Linux and is the separator on Windows: either way the
+        // log must spell it `/`.
+        fs.create_new(Path::new("/d/a\\b")).unwrap();
+        let calls = fs.calls();
+        assert!(calls.iter().any(|c| c == "create_new(/d/a/b)"), "{calls:?}");
+        assert!(calls.iter().all(|c| !c.contains('\\')), "{calls:?}");
+        assert!(fs.called("create_new(/d/a/b)"));
     }
 
     #[test]
