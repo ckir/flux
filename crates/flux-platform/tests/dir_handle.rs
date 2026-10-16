@@ -1126,6 +1126,22 @@ mod windows_arm {
             let e = root.create_symlink(OsStr::new(name), &made).unwrap_err();
             assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists, "{name}: {e:?}");
         }
+        // `Unspecified` creates a file link (spec D9).
+        let u = Link { payload: "x".into(), kind: LinkKind::Unspecified };
+        root.create_symlink(OsStr::new("u"), &u).unwrap();
+        assert_eq!(root.read_link(OsStr::new("u")).unwrap().kind, LinkKind::File);
+        // An exclusive create does not follow a dangling link.
+        let dangling = Link { payload: "nowhere".into(), kind: LinkKind::File };
+        let e = root.create_symlink(OsStr::new("d"), &dangling).unwrap_err();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists, "{e:?}");
+        assert!(!d.path().join("nowhere").exists(), "nothing created through the dangling link");
+        // A regular file and a directory holding the name are AlreadyExists too.
+        std::fs::write(d.path().join("rf"), b"x").unwrap();
+        std::fs::create_dir(d.path().join("rd")).unwrap();
+        for name in ["rf", "rd"] {
+            let e = root.create_symlink(OsStr::new(name), &link(OsStr::new("z"))).unwrap_err();
+            assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists, "{name}: {e:?}");
+        }
         // Nothing is created through an existing link.
         let e = root.create_symlink(OsStr::new("L\\child"), &link(OsStr::new("z")));
         assert!(e.is_err(), "a separator is a bad component");

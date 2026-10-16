@@ -332,28 +332,41 @@ impl DirHandle for StdDir {
         // SAFETY/RESIDUAL: this is the ONE path-based destination write the Windows arm makes (spec 3.7,
         // candidate (b)); `CreateSymbolicLinkW` takes no directory handle. The residual is the window between
         // this identity re-check and the call. The re-check refuses when the path no longer names the object
-        // this handle holds.
-        let at_path = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(&dir_path)
-            .map_err(FsError::from_io)?;
+        // this handle holds. A volume with no file ids (FAT32, exFAT: the handle's identity is `Unavailable`)
+        // cannot be re-checked, so the check is skipped as `rename_no_replace` does; such a volume cannot hold a
+        // symlink in practice and the call below then fails through `map_symlink_error`. A Strong handle against
+        // an `Unavailable` path identity is still refused.
         let held = crate::std_fs::identity_of_handle(&self.0);
-        if matches!(held, flux_fs::FileIdentity::Unavailable)
-            || crate::std_fs::identity_of_handle(&at_path) != held
-        {
-            return Err(FsError::new(
-                Code::SafetyRejected,
-                std::io::Error::other(
-                    "the directory handle no longer names the path it was opened at",
-                ),
-            ));
+        if !matches!(held, flux_fs::FileIdentity::Unavailable) {
+            // Query-only access, as the arm's metadata path does, so a write-only directory still opens.
+            let at_path = std::fs::OpenOptions::new()
+                .access_mode(0)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&dir_path)
+                .map_err(FsError::from_io)?;
+            if crate::std_fs::identity_of_handle(&at_path) != held {
+                return Err(FsError::new(
+                    Code::SafetyRejected,
+                    std::io::Error::other(
+                        "the directory handle no longer names the path it was opened at",
+                    ),
+                ));
+            }
         }
-        drop(at_path);
 
         let link_path: Vec<u16> =
             dir_path.join(name).as_os_str().encode_wide().chain(Some(0)).collect();
         let payload: Vec<u16> = link.payload.encode_wide().chain(Some(0)).collect();
+        // An interior NUL would silently truncate the payload at the API boundary.
+        if payload[..payload.len() - 1].contains(&0) {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "a symlink payload cannot contain NUL",
+                ),
+            ));
+        }
         let mut flags = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
         if link.kind == LinkKind::Dir {
             flags |= SYMBOLIC_LINK_FLAG_DIRECTORY;
