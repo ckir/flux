@@ -17,6 +17,9 @@ mod dir_windows;
 #[cfg(windows)]
 pub use dir_windows::StdDir;
 
+#[cfg(test)]
+mod symlink_probe;
+
 pub use lock_file::{StdLock, boot_session_id};
 pub use std_fs::{StdFile, StdFileSystem, StdReader};
 
