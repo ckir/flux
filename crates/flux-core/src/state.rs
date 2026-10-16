@@ -79,13 +79,20 @@ pub struct Options {
     pub durability: String,
     pub safety: String,
     pub existing: String,
-    /// `"copy"` or `"skip"`; a state written before cut 10a has no key and reads as `"copy"`.
-    #[serde(default = "links_copy")]
+    /// `"copy"` or `"skip"`; a state written before cut 10a has no key and reads as `"copy"`. Written only when it is
+    /// `"skip"` (ruling R16), so a copy-mode state is byte-identical to the pre-cut format, which a pre-cut binary
+    /// (`deny_unknown_fields`) still reads.
+    #[serde(default = "links_copy", skip_serializing_if = "is_copy")]
     pub links: String,
 }
 
 fn links_copy() -> String {
     "copy".to_string()
+}
+
+#[allow(clippy::ptr_arg)] // serde's `skip_serializing_if` passes `&String`.
+fn is_copy(v: &String) -> bool {
+    v == "copy"
 }
 
 impl Options {
@@ -2060,6 +2067,25 @@ mod tests {
         let mut bad = s.clone();
         bad.config.as_mut().unwrap().options.links = "follow".into();
         assert!(validate(&bad).unwrap_err().starts_with("links is not one of"));
+    }
+
+    #[test]
+    fn a_copy_mode_state_is_written_without_a_links_key_and_a_skip_mode_state_with_one() {
+        // Ruling R16. Mutant: the `skip_serializing_if` removed (a copy-mode state then carries `"links":"copy"`,
+        // which a pre-cut `deny_unknown_fields` binary refuses).
+        let copy = tree_v3();
+        assert_eq!(copy.config.as_ref().unwrap().options.links, "copy");
+        let v: serde_json::Value = serde_json::from_slice(&copy.encode()).unwrap();
+        let options = v["options"].as_object().unwrap();
+        assert!(!options.contains_key("links"), "{options:?}");
+        assert_eq!(options.len(), 5, "the pre-cut five option keys: {options:?}");
+        assert_eq!(decode(&copy.encode()).unwrap(), copy, "round trip");
+
+        let mut skip = tree_v3();
+        skip.config.as_mut().unwrap().options.links = "skip".into();
+        let v: serde_json::Value = serde_json::from_slice(&skip.encode()).unwrap();
+        assert_eq!(v["options"]["links"], "skip");
+        assert_eq!(decode(&skip.encode()).unwrap(), skip, "round trip");
     }
 
     #[test]

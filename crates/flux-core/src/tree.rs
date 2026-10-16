@@ -1803,6 +1803,14 @@ fn publish_link<F: DestinationRoot>(
     };
     if !batch.pending.is_empty() && parent.metadata(&temp).is_ok() {
         flush_batch(cx, parent, names, batch, out, on_report)?;
+        // The gate's heartbeat and guard predate the flush: take fresh ones before the removal below, as `stage_file`
+        // guards right before its own (review SC-1). Without a flush, the gate's pair is the one just before it.
+        if let Err(e) = (cx.beat)() {
+            return Ok(Err(CopyError::at(CopyStep::Heartbeat, e)));
+        }
+        if let Err(e) = (cx.guard)() {
+            return Ok(Err(CopyError::at(CopyStep::Create, e)));
+        }
     }
     // A leftover under this operation's own id (a crashed earlier attempt under `--resume`), as `stage_file` step 1
     // removes it: `remove_file` unlinks a link and refuses a directory, which the create below then fails on. The batch
@@ -3961,6 +3969,99 @@ mod tests {
         );
         assert_eq!(count(&c, "rename_"), 0, "{c:?}");
         assert_eq!(out.files_copied, 0);
+    }
+
+    /// Cut 10a final review: the guard calls a single link `n` into an empty `/dst` makes, in order: 1 `gate_link`'s,
+    /// 2 `create_link`'s, 3 `publish_staged`'s (no flush, so no pair after a probe).
+    const LINK_GUARD_AT_GATE: u32 = 1;
+    const LINK_GUARD_AT_CREATE: u32 = 2;
+
+    #[test]
+    fn a_lost_lock_before_the_create_is_a_stop_and_creates_nothing() {
+        // Mutant: the guard in `create_link`'s pair removed (the link is created and only the publish guard stops it,
+        // keeping the temporary).
+        let fs = links(&[("n", "p")]);
+        let calls = std::cell::Cell::new(0);
+        let guard = failing_after(LINK_GUARD_AT_CREATE - 1, &calls);
+
+        let (r, out, _) = link_run(&fs, &opts(), false, policy(1), &guard, no_seed);
+
+        let e = r.unwrap_err();
+        assert_eq!(e.code(), Code::TargetLockBusy, "{e:?}");
+        assert_eq!(calls.get(), LINK_GUARD_AT_CREATE, "stopped at the create's guard");
+        let c = log(&fs);
+        assert!(
+            fs.called("remove_file(/dst/n.flux-partial.op1)"),
+            "precondition: past the gate: {c:?}"
+        );
+        assert!(!fs.called("create_symlink("), "{c:?}");
+        assert!(temps_in(&fs, "/dst").is_empty(), "{c:?}");
+        assert!(!fs.exists("/dst/n"));
+        assert_eq!(out.files_copied, 0);
+    }
+
+    #[test]
+    fn a_lost_lock_at_the_gate_removes_and_creates_nothing() {
+        // Mutant: the guard in `gate_link`'s pair removed (the leftover removal runs under a lost lock).
+        let fs = links(&[("n", "p")]);
+        let calls = std::cell::Cell::new(0);
+        let guard = failing_after(LINK_GUARD_AT_GATE - 1, &calls);
+
+        let (r, out, _) = link_run(&fs, &opts(), false, policy(1), &guard, no_seed);
+
+        let e = r.unwrap_err();
+        assert_eq!(e.code(), Code::TargetLockBusy, "{e:?}");
+        assert_eq!(calls.get(), LINK_GUARD_AT_GATE, "stopped at the gate's guard");
+        let c = log(&fs);
+        assert!(fs.called("read_link(/src/n)"), "precondition: the link was read: {c:?}");
+        assert!(!fs.called("remove_file("), "{c:?}");
+        assert!(!fs.called("create_symlink("), "{c:?}");
+        assert!(!fs.exists("/dst/n"));
+        assert_eq!(out.files_copied, 0);
+    }
+
+    #[test]
+    fn a_strict_replace_link_writes_a_replacement_note_and_discards_it_on_a_failed_rename() {
+        // Mutant: `replacement: false` in the Replace template.
+        let notes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fs = links(&[("n", "p")]);
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.write_file("/dst/n", b"old");
+        let seen = std::sync::Arc::clone(&notes);
+        fs.on_nth("rename_replace", 1, move |fs| {
+            let root = fs.destination_root(Path::new("/dst")).unwrap();
+            let store = root.open_claim_store(OsStr::new("state.db"), Durability::Strict).unwrap();
+            *seen.lock().unwrap() = store.prepared().unwrap();
+        });
+        let o = CopyOptions { durability: Durability::Strict, ..opts() };
+
+        let (r, out, got) = link_run(&fs, &o, false, policy(1), &unguarded, no_seed);
+
+        r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        let pending = notes.lock().unwrap().clone();
+        assert_eq!(pending.len(), 1, "the note is pending at the rename: {pending:?}");
+        let (key, note) = &pending[0];
+        assert_eq!(key.name, b"n");
+        assert!(note.replacement, "a Replace note says replacement: {note:?}");
+        assert_eq!(note.target, key_of("n"));
+        assert_eq!(fs.prepared_count(), 0, "committed after");
+        assert_eq!(link_at(&fs, "/dst/n").payload, "p");
+        assert_eq!((out.files_copied, out.files_overwritten), (1, 1));
+
+        let fs = links(&[("n", "p")]);
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.write_file("/dst/n", b"old");
+        fs.fail("rename_replace", Code::IoError);
+        let (r, out, got) = link_run(&fs, &o, false, policy(1), &unguarded, no_seed);
+        r.unwrap();
+        let e = only_copy_failure(&got, "n");
+        assert_eq!(e.step, CopyStep::Publish, "{e:?}");
+        assert!(fs.called("claim_prepare("), "precondition: the note was written");
+        assert_eq!(fs.prepared_count(), 0, "the note is discarded");
+        assert!(temps_in(&fs, "/dst").is_empty(), "the temporary is discarded");
+        assert_eq!(fs.read_file("/dst/n").as_deref(), Some(&b"old"[..]));
+        assert_eq!((out.files_copied, out.files_overwritten), (0, 0));
     }
 
     #[test]

@@ -104,22 +104,25 @@ const fn is_name_surrogate(tag: u32) -> bool {
 /// It is a socket, not a regular file, and the POSIX arm refuses a socket through `fstat`.
 const IO_REPARSE_TAG_AF_UNIX: u32 = 0x8000_0023;
 
-/// A `CreateSymbolicLinkW` failure (`GetLastError`) as the trait's error (spec 3.1, 3.7).
+/// A `CreateSymbolicLinkW` failure (`GetLastError`) as the trait's error (spec 3.1, 3.7, ruling R15). Error 87 (an
+/// OS that does not know the unprivileged flag) never reaches here as such: `create_symlink` retries without the flag
+/// first, and a retry that still answers 87 is a genuine invalid parameter, mapped generically below.
 fn map_symlink_error(code: u32) -> FsError {
     use windows_sys::Win32::Foundation::{
-        ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER,
-        ERROR_NOT_SUPPORTED, ERROR_PRIVILEGE_NOT_HELD,
+        ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED,
+        ERROR_PRIVILEGE_NOT_HELD,
     };
     match code {
-        // 87 is an OS that does not know the unprivileged flag.
-        ERROR_PRIVILEGE_NOT_HELD
-        | ERROR_NOT_SUPPORTED
-        | ERROR_INVALID_FUNCTION
-        | ERROR_INVALID_PARAMETER => FsError::new(
+        ERROR_PRIVILEGE_NOT_HELD => FsError::new(
             Code::SymlinkCreationUnavailable,
             std::io::Error::other(
                 "symlink creation needs Developer Mode or the SeCreateSymbolicLinkPrivilege right",
             ),
+        ),
+        // The filesystem case (FAT32, exFAT, a share that refuses reparse points).
+        ERROR_NOT_SUPPORTED | ERROR_INVALID_FUNCTION => FsError::new(
+            Code::SymlinkCreationUnavailable,
+            std::io::Error::other("the destination filesystem cannot hold a symlink"),
         ),
         ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS => FsError::from_io(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
@@ -317,7 +320,8 @@ impl DirHandle for StdDir {
         crate::dir_windows::read_link_at(&self.0, name)
     }
 
-    /// `CreateSymbolicLinkW` with the unprivileged flag (measured: works under Developer Mode, 1314 without it).
+    /// `CreateSymbolicLinkW` with the unprivileged flag (measured: works under Developer Mode, 1314 without it); an
+    /// ERROR_INVALID_PARAMETER is retried once without the flag (ruling R15).
     /// `LinkKind::Unspecified` creates a FILE link (spec D9). Exclusive: an occupied name, a dangling link included,
     /// is `AlreadyExists`.
     fn create_symlink(&self, name: &OsStr, link: &Link) -> Result<()> {
@@ -372,10 +376,19 @@ impl DirHandle for StdDir {
         if link.kind == LinkKind::Dir {
             flags |= SYMBOLIC_LINK_FLAG_DIRECTORY;
         }
+        let last_error = || std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32;
         // SAFETY: both buffers are live NUL-terminated UTF-16 strings that outlive the call.
-        let ok = unsafe { CreateSymbolicLinkW(link_path.as_ptr(), payload.as_ptr(), flags) };
+        let mut ok = unsafe { CreateSymbolicLinkW(link_path.as_ptr(), payload.as_ptr(), flags) };
+        let mut code = if ok { 0 } else { last_error() };
+        // Ruling R15: ERROR_INVALID_PARAMETER is what an OS that does not know the unprivileged flag answers (as
+        // Rust std handles it): retry ONCE without that flag, and map the retry's error if it fails too.
+        if !ok && code == windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER {
+            let without = flags & !SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
+            // SAFETY: as above.
+            ok = unsafe { CreateSymbolicLinkW(link_path.as_ptr(), payload.as_ptr(), without) };
+            code = if ok { 0 } else { last_error() };
+        }
         if !ok {
-            let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32;
             // ERROR_ACCESS_DENIED is what Windows answers when the name is held by a DIRECTORY (measured on
             // the hosted runner). The trait contract is AlreadyExists when anything holds the name, so look
             // through the handle (no-follow) and report that; a name that is not there keeps the denial.
@@ -1041,8 +1054,8 @@ const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 /// A symlink's payload, read without following it: open the name with `FILE_OPEN_REPARSE_POINT`, judge the tag with
 /// `reparse_tag_of`, then `FSCTL_GET_REPARSE_POINT`.
 ///
-/// The payload is the PrintName (the user-visible text), falling back to the SubstituteName with a `\??\` prefix
-/// stripped when the print name is empty. `kind` is `Dir` when the link object carries `FILE_ATTRIBUTE_DIRECTORY`.
+/// The payload is the PrintName (the user-visible text), falling back to the SubstituteName through
+/// `substitute_to_payload` when the print name is empty. `kind` is `Dir` when the link object carries `FILE_ATTRIBUTE_DIRECTORY`.
 fn read_link_at(p: &OwnedHandle, n: &OsStr) -> Result<Link> {
     use std::os::windows::ffi::OsStringExt;
     use std::os::windows::fs::MetadataExt;
@@ -1148,17 +1161,29 @@ fn read_link_at(p: &OwnedHandle, n: &OsStr) -> Result<Link> {
     };
     let print = name_at(12)?;
     let payload = if print.is_empty() {
-        let sub = name_at(8)?;
-        let units: Vec<u16> = sub.encode_wide().collect();
-        let prefix: Vec<u16> = "\\??\\".encode_utf16().collect();
-        match units.strip_prefix(prefix.as_slice()) {
-            Some(rest) => std::ffi::OsString::from_wide(rest),
-            None => sub,
-        }
+        let units: Vec<u16> = name_at(8)?.encode_wide().collect();
+        std::ffi::OsString::from_wide(&substitute_to_payload(&units))
     } else {
         print
     };
     Ok(Link { payload, kind: if is_dir { LinkKind::Dir } else { LinkKind::File } })
+}
+
+/// A symlink's SubstituteName (NT namespace) as the user-visible payload, for a link whose PrintName is empty:
+/// `\??\UNC\srv\sh` is `\\srv\sh` and `\??\C:\x` is `C:\x`; anything else (a relative payload) is unchanged. Stripping
+/// the bare `\??\` from a UNC name would yield `UNC\srv\sh`, a different, relative payload (invariant I1).
+fn substitute_to_payload(units: &[u16]) -> Vec<u16> {
+    let nt: Vec<u16> = "\\??\\".encode_utf16().collect();
+    let unc: Vec<u16> = "\\??\\UNC\\".encode_utf16().collect();
+    if let Some(rest) = units.strip_prefix(unc.as_slice()) {
+        let mut out: Vec<u16> = "\\\\".encode_utf16().collect();
+        out.extend_from_slice(rest);
+        out
+    } else if let Some(rest) = units.strip_prefix(nt.as_slice()) {
+        rest.to_vec()
+    } else {
+        units.to_vec()
+    }
 }
 
 fn remove_file_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {
@@ -2058,5 +2083,27 @@ mod judge_tests {
             entry_type(FILE_ATTRIBUTE_NORMAL, IO_REPARSE_TAG_AF_UNIX),
             flux_fs::FileType::File
         );
+    }
+}
+
+#[cfg(test)]
+#[cfg(windows)]
+mod substitute_tests {
+    use super::substitute_to_payload;
+
+    fn conv(s: &str) -> String {
+        let units: Vec<u16> = s.encode_utf16().collect();
+        String::from_utf16(&substitute_to_payload(&units)).unwrap()
+    }
+
+    #[test]
+    fn a_substitute_name_maps_to_the_payload_without_rewriting_it() {
+        assert_eq!(conv(r"\??\UNC\srv\sh"), r"\\srv\sh");
+        assert_eq!(conv(r"\??\UNC\srv\sh\dir"), r"\\srv\sh\dir");
+        assert_eq!(conv(r"\??\C:\x"), r"C:\x");
+        assert_eq!(conv(r"sub\x"), r"sub\x");
+        assert_eq!(conv(r"..\up"), r"..\up");
+        assert_eq!(conv(r"\abs\no\drive"), r"\abs\no\drive");
+        assert_eq!(conv(""), "");
     }
 }

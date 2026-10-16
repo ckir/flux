@@ -298,7 +298,10 @@ impl DirHandle for StdDir {
         use rustix::io::Errno;
         check_component(name)?;
         rustix::fs::symlinkat(link.payload.as_os_str(), &self.0, name).map_err(|e| {
-            if e == Errno::PERM {
+            // EPERM: a filesystem that cannot hold a symlink (Linux vfat). EOPNOTSUPP / ENOTSUP (one value on Linux,
+            // two on macOS): UNMEASURED, expected from a macOS msdos/exFAT volume; not provokable on this project's
+            // Linux test filesystems, so it has no test.
+            if e == Errno::PERM || e == Errno::OPNOTSUPP || e == Errno::NOTSUP {
                 return FsError::new(
                     Code::SymlinkCreationUnavailable,
                     std::io::Error::new(

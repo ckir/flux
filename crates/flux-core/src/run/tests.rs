@@ -3207,10 +3207,10 @@ fn a_pre_cut_state_file_resumes_as_copy() {
     let fs = fake();
     let p = prior3(&fs, 5, OpState::Failed);
     drop(prior_store(&fs, 5));
-    // The pre-cut manifest: no `links` key, and the four-line fingerprint as the pre-cut code computed it.
+    // The pre-cut manifest: no `links` key (a copy-mode state is written without one, ruling R16), and the four-line
+    // fingerprint as the pre-cut code computed it.
     let mut v: serde_json::Value = serde_json::from_slice(&p.encode()).unwrap();
-    let options = v["options"].as_object_mut().unwrap();
-    assert!(options.remove("links").is_some());
+    assert!(!v["options"].as_object().unwrap().contains_key("links"));
     v["configuration_fingerprint"] =
         "6814cb38cd3fe6c13a382a988c9c5cbac2ebcf30be0bb4af44596d3019b19f1d".into();
     assert_eq!(v["options"].as_object().unwrap().len(), 5);
