@@ -571,7 +571,12 @@ the spec's numbers, 9-10 were learned during execution).
 
 ## Cut 10b known limits (source mount boundaries; spec `docs/superpowers/specs/2026-10-17-cut-10b-mount-boundaries-design.md`, sections 3.2, 4, 6)
 
-- [ ] **A Linux kernel before 5.8 (or any place `statx` is unavailable) answers `Unknown` for EVERY directory.** Default safety copies as before with one grouped warning; Strict refuses the whole operation at the first subdirectory. Use Default, or a newer kernel.
+- [ ] **On a Linux kernel before 5.8 (or any place `statx` is unavailable) every directory on the SAME device as its parent answers `Unknown`** (a directory on a different device still answers `Yes`). Default safety copies as before with one grouped warning; Strict refuses the whole operation at the first such subdirectory. Use Default, or a newer kernel. On the SOURCE side `statx` answering EPERM (an old seccomp profile) now also falls back to the device comparison.
+- [ ] **The DESTINATION arm `DirHandle::mount_root` (`crates/flux-platform/src/dir_unix.rs`, ~:535) still treats `statx` EPERM as an error.** Pre-existing; not changed by this cut.
+- [ ] **A hung network mount under the source still blocks `flux copy` at the stat of the mount point** (the query and `metadata` both ask the mounted filesystem; nothing below it is read).
+- [ ] **On macOS `/Users` and `/Applications` sit on the Data volume**, a different device from the sealed system volume, so `flux copy / DEST` skips them as mounts by default (as `find -x /` does).
+- [ ] **`--cross-filesystems` on a single-FILE copy is accepted and recorded in its state although it has no effect;** a resume of that file with the other setting is INCOMPATIBLE_STATE (as `--links` behaves).
+- [ ] **A state written by a PRE-cut binary (no key, reads as false) resumed by this version runs under the `Stay` default although the old binary always crossed.** `--resume` of an operation that had half-copied a mount skips that mount with a `MountSkipped` line and leaves the half-copied directory (exit 0). `--resume --cross-filesystems` is refused as INCOMPATIBLE_STATE, so finishing in kind needs `--restart --cross-filesystems`.
 - [ ] **autofs trigger directories are UNMEASURED.** The query passes `AT_NO_AUTOMOUNT`; whether an unmounted trigger reads as a mount root, or `read_dir` mounts it on descent, is not known.
 - [ ] **A Windows mounted-volume folder under a copied tree is UNMEASURED** (the source walk already types it as a link or special file).
 - [ ] **`STATX_ATTR_MOUNT_ROOT` on a real same-filesystem bind mount is unmeasured** (needs privilege; the platform tests use the real mount roots `/proc` and `/dev/shm`).

@@ -1002,23 +1002,30 @@ fn mount_root_is_no_for_a_plain_subdirectory_and_agrees_with_the_handle_query() 
 #[cfg(target_os = "linux")]
 #[test]
 fn mount_root_is_yes_for_a_real_mount_point_asked_without_privilege() {
+    use std::os::unix::fs::MetadataExt;
     use std::path::Path;
+    // A half asserts only where the kernel sees a real mount point: a directory (not a link)
+    // whose device differs from its parent's. A sandbox may make `/dev/shm` a plain directory
+    // or (old Debian) a link to `/run/shm`, which the query never follows.
+    let is_mount_point = |path: &str, parent: &str| -> bool {
+        match (std::fs::symlink_metadata(path), std::fs::symlink_metadata(parent)) {
+            (Ok(c), Ok(p)) => c.is_dir() && c.dev() != p.dev(),
+            _ => false,
+        }
+    };
     let mut ran = 0;
-    if Path::new("/proc/self").is_dir() {
-        ran += 1;
-        let r = StdFileSystem.mount_root(Path::new("/proc"), Path::new("/"));
-        assert!(matches!(r, Ok(MountRoot::Yes)), "/proc: {r:?}");
-    } else {
-        eprintln!("skipped: /proc/self is absent");
+    for (path, parent) in [("/proc", "/"), ("/dev/shm", "/dev")] {
+        if is_mount_point(path, parent) {
+            ran += 1;
+            let r = StdFileSystem.mount_root(Path::new(path), Path::new(parent));
+            assert!(matches!(r, Ok(MountRoot::Yes)), "{path}: {r:?}");
+        } else {
+            eprintln!("skipped: {path} is not a mount point here");
+        }
     }
-    if Path::new("/dev/shm").is_dir() {
-        ran += 1;
-        let r = StdFileSystem.mount_root(Path::new("/dev/shm"), Path::new("/dev"));
-        assert!(matches!(r, Ok(MountRoot::Yes)), "/dev/shm: {r:?}");
-    } else {
-        eprintln!("skipped: /dev/shm is absent");
+    if ran == 0 {
+        eprintln!("skipped: no distinguishable mount point in this sandbox");
     }
-    assert!(ran > 0, "both halves were skipped: no real mount point to test");
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

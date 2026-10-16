@@ -172,11 +172,13 @@ Rulings of the SDD run (ledger `.superpowers/sdd/2026-10-17-cut-10b-mount-bounda
 - P6. Fix round 1 of Task 4 (three assertion/comment minors) was verified by the controller reading the diff and re-running the gate, with no scoped re-review.
 - P7. One compiler-forced line accepted outside Task 5's FILES: `crates/flux-cli/tests/cleanup.rs:209` (a `state::Options` literal gained `cross_filesystems: false`).
 - P8. The timing comparison (`--cross-filesystems` on vs off on `small_1000x4kib`, section 7 "Performance") was NOT run; the owner chose to skip it. The cost of the extra `statx` per directory is UNMEASURED. Command to run later: `cargo bench --bench copy -- small_1000x4kib` once as committed and once with `cross_filesystems: true` set locally in `benches/copy.rs` `options()`, twice each, on an idle machine, at the top level.
+- P9. Final whole-branch review fix round (four minors): (A) the source `StdFileSystem::mount_root` Linux arm falls back to the device comparison on `statx` EPERM as well as NOSYS/NOTSUP (old seccomp profiles; no portable way to provoke EPERM, so unmeasured, no new test); the DESTINATION arm `DirHandle::mount_root` in `dir_unix.rs` was NOT changed; (B) the real-mount-point platform test asserts each half only where the path is a directory on a different device from its parent, and skips (does not fail) when neither half qualifies; (C) `TODO.md` known limits reworded and extended; (D) this section updated.
 
 Deviations and corrections:
 
 - The JSON field `mounts_skipped` is an additive deviation from the master spec's example (`FLUX_FULL_UPDATED_SPEC_V16.md:2821`, which does not list it): present only when non-zero (decision D8).
 - Task 3's test 3-4 expected-event order was corrected during the run (entries sort by bytes; P3).
+- A state written by a pre-cut binary (no `cross_filesystems` key, reads as false) resumed by this version runs under the `Stay` default although the old binary always crossed: `--resume` of an operation that had half-copied a mount skips it with a `MountSkipped` line and leaves the half-copied directory (exit 0); `--resume --cross-filesystems` is INCOMPATIBLE_STATE, so finishing in kind needs `--restart --cross-filesystems`.
 
 ## 10. Exhaustiveness self-audit
 

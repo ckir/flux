@@ -280,7 +280,9 @@ impl FileSystem for StdFileSystem {
                     // The kernel did not report the attribute: judge by device numbers.
                 }
                 // `OPNOTSUPP` is the same value as `NOTSUP` on Linux; naming both is an unreachable pattern.
-                Err(Errno::NOSYS | Errno::NOTSUP) => {}
+                // `PERM`: an old seccomp profile blocks `statx`; a real permission problem then
+                // surfaces from the lstat fallback as EACCES.
+                Err(Errno::NOSYS | Errno::NOTSUP | Errno::PERM) => {}
                 Err(e) => return Err(FsError::from_io(std::io::Error::from(e))),
             }
         }
