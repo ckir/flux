@@ -1,43 +1,43 @@
 {
  "pairs": {
   "linux/large/cp": {
-   "calibrated": "2026-10-16T07:49:38Z",
-   "cv": 0.0041,
+   "calibrated": "2026-10-16T08:08:27Z",
+   "cv": 0.004,
    "image": "20261012.334.1",
    "source": "calibration",
    "stable": true
   },
   "linux/large/rsync": {
-   "calibrated": "2026-10-16T07:49:38Z",
-   "cv": 0.0106,
+   "calibrated": "2026-10-16T08:08:27Z",
+   "cv": 0.0039,
    "image": "20261012.334.1",
    "source": "calibration",
    "stable": true
   },
   "linux/mixed/cp": {
-   "calibrated": "2026-10-16T07:49:38Z",
-   "cv": 0.0056,
+   "calibrated": "2026-10-16T08:08:27Z",
+   "cv": 0.0068,
    "image": "20261012.334.1",
    "source": "calibration",
    "stable": true
   },
   "linux/mixed/rsync": {
-   "calibrated": "2026-10-16T07:49:38Z",
-   "cv": 0.0055,
+   "calibrated": "2026-10-16T08:08:27Z",
+   "cv": 0.0127,
    "image": "20261012.334.1",
    "source": "calibration",
    "stable": true
   },
   "linux/small/cp": {
-   "calibrated": "2026-10-16T07:49:38Z",
-   "cv": 0.035,
+   "calibrated": "2026-10-16T08:08:27Z",
+   "cv": 0.0722,
    "image": "20261012.334.1",
    "source": "calibration",
    "stable": false
   },
   "linux/small/rsync": {
-   "calibrated": "2026-10-16T07:49:38Z",
-   "cv": 0.0472,
+   "calibrated": "2026-10-16T08:08:27Z",
+   "cv": 0.1113,
    "image": "20261012.334.1",
    "source": "calibration",
    "stable": false
@@ -85,25 +85,25 @@
    "stable": false
   },
   "windows/large/robocopy": {
-   "calibrated": "2026-10-16T07:49:38Z",
-   "cv": 0.0359,
+   "calibrated": "2026-10-16T08:08:27Z",
+   "cv": 0.0244,
    "image": "20261007.264.1",
    "source": "calibration",
-   "stable": false
+   "stable": true
   },
   "windows/mixed/robocopy": {
-   "calibrated": "2026-10-16T07:49:38Z",
-   "cv": 0.0422,
+   "calibrated": "2026-10-16T08:08:27Z",
+   "cv": 0.0641,
    "image": "20261007.264.1",
    "source": "calibration",
    "stable": false
   },
   "windows/small/robocopy": {
-   "calibrated": "2026-10-16T07:49:38Z",
-   "cv": 0.0118,
+   "calibrated": "2026-10-16T08:08:27Z",
+   "cv": 0.0444,
    "image": "20261007.264.1",
    "source": "calibration",
-   "stable": true
+   "stable": false
   }
  },
  "schema": 1
