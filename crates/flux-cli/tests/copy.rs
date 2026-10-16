@@ -414,7 +414,7 @@ fn a_fifo_in_a_folder_is_skipped_reported_and_exits_0() {
 
 #[cfg(unix)]
 #[test]
-fn a_symlink_in_a_folder_fails_the_run_with_exit_1() {
+fn a_symlink_in_a_folder_is_recreated_and_the_run_exits_0() {
     let d = TempDir::new().unwrap();
     let src = tree_in(d.path());
     std::os::unix::fs::symlink("a", src.join("link")).unwrap();
@@ -422,14 +422,18 @@ fn a_symlink_in_a_folder_fails_the_run_with_exit_1() {
 
     let out = flux().arg("copy").arg(&src).arg(&dst).output().unwrap();
 
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(
+        std::fs::read_link(dst.join("link")).unwrap(),
+        std::fs::read_link(src.join("link")).unwrap()
+    );
+    assert_eq!(std::fs::read_link(dst.join("link")).unwrap(), Path::new("a"));
+    assert_eq!(std::fs::read(dst.join("a")).unwrap(), b"A");
     assert!(
-        stderr(&out).lines().any(|l| l.starts_with("SYMLINK_CREATION_UNAVAILABLE: link: ")),
+        !stderr(&out).lines().any(|l| l.starts_with("SYMLINK_CREATION_UNAVAILABLE")),
         "{}",
         stderr(&out)
     );
-    assert!(std::fs::symlink_metadata(dst.join("link")).is_err());
-    assert_eq!(std::fs::read(dst.join("a")).unwrap(), b"A");
 }
 
 #[cfg(unix)]
@@ -451,7 +455,7 @@ fn a_symlink_given_as_source_is_never_followed() {
         assert_eq!(
             stderr(&out),
             format!(
-                "SYMLINK_CREATION_UNAVAILABLE: {}: a symlink is copied as a link (§25), which this version cannot create; name its target to copy what it points at
+                "SYMLINK_CREATION_UNAVAILABLE: {}: a symlink SOURCE is not followed; copy its parent folder, or name its target
 ",
                 d.path().join(link).display()
             ),

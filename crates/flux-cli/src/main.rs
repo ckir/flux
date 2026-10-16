@@ -265,7 +265,7 @@ fn copy(args: &CopyArgs) -> u8 {
         }
         Err(Stop::SymlinkSource) => {
             err(&format!(
-                "{}: {}: {}; name its target to copy what it points at",
+                "{}: {}: {}",
                 Code::SymlinkCreationUnavailable.as_str(),
                 args.source.display(),
                 report::SYMLINK_WHY
