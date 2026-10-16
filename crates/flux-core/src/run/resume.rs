@@ -140,7 +140,7 @@ mod tests {
     use super::*;
     use crate::state::{Config, Kind, OperationState, Options, Root, native_hex};
     use flux_fs::{
-        CopyOptions, Durability, ExistingPolicy, OperationId, Preserve, Publish, Safety,
+        CopyOptions, Durability, ExistingPolicy, Links, OperationId, Preserve, Publish, Safety,
     };
     use std::path::PathBuf;
 
@@ -155,6 +155,7 @@ mod tests {
             safety: Safety::Default,
             operation_id: OperationId::new("replaced by the run"),
             existing: ExistingPolicy::Overwrite,
+            links: Links::Copy,
         }
     }
 

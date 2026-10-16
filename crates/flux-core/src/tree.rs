@@ -2252,7 +2252,7 @@ pub(crate) fn report(
 mod tests {
     use super::*;
     use crate::fault_fs::FaultFs;
-    use flux_fs::{Code, Durability, FileSystem, ObjectId, OperationId, Preserve};
+    use flux_fs::{Code, Durability, FileSystem, Links, ObjectId, OperationId, Preserve};
     use std::ffi::OsStr;
 
     #[test]
@@ -2308,6 +2308,7 @@ mod tests {
             safety: Safety::Default,
             operation_id: OperationId::new("op1"),
             existing: flux_fs::ExistingPolicy::Overwrite,
+            links: Links::Copy,
         }
     }
 

@@ -9,7 +9,9 @@
 //! Dropping the flag is not an alternative -- without it `NtCreateFile` FOLLOWS
 //! the junction, which is the traversal §149.7 forbids.
 
-use flux_fs::{Code, DirHandle, FsError, Metadata, MountRoot, Result, check_component};
+use flux_fs::{
+    Code, DirHandle, FsError, Link, LinkKind, Metadata, MountRoot, Result, check_component,
+};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::os::windows::ffi::OsStrExt;
@@ -282,6 +284,24 @@ impl DirHandle for StdDir {
     fn remove_file(&self, name: &OsStr) -> Result<()> {
         check_component(name)?;
         crate::dir_windows::remove_file_at(&self.0, name)
+    }
+
+    fn read_link(&self, name: &OsStr) -> Result<Link> {
+        check_component(name)?;
+        crate::dir_windows::read_link_at(&self.0, name)
+    }
+
+    /// PLACEHOLDER (cut 10a Task 1): Windows symlink creation is decided by measurement and lands in Task 7. Until
+    /// then every create answers the spec's failure for a process without the right. `LinkKind::Unspecified` will
+    /// create a file link there.
+    fn create_symlink(&self, name: &OsStr, _link: &Link) -> Result<()> {
+        check_component(name)?;
+        Err(FsError::new(
+            Code::SymlinkCreationUnavailable,
+            std::io::Error::other(
+                "symlink creation needs Developer Mode or the SeCreateSymbolicLinkPrivilege right (not yet wired on Windows: cut 10a Task 7)",
+            ),
+        ))
     }
 
     fn rename_no_replace(&self, from: &OsStr, other: &Self, to: &OsStr) -> Result<()> {
@@ -927,6 +947,132 @@ fn metadata_at(p: &OwnedHandle, n: &OsStr) -> Result<Metadata> {
         identity: crate::std_fs::identity_of_handle(&f),
         nlink: crate::std_fs::link_count_of_handle(&f),
     })
+}
+
+/// `IO_REPARSE_TAG_SYMLINK`.
+const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+
+/// A symlink's payload, read without following it: open the name with `FILE_OPEN_REPARSE_POINT`, judge the tag with
+/// `reparse_tag_of`, then `FSCTL_GET_REPARSE_POINT`.
+///
+/// The payload is the PrintName (the user-visible text), falling back to the SubstituteName with a `\??\` prefix
+/// stripped when the print name is empty. `kind` is `Dir` when the link object carries `FILE_ATTRIBUTE_DIRECTORY`.
+fn read_link_at(p: &OwnedHandle, n: &OsStr) -> Result<Link> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
+
+    let mut wide: Vec<u16> = n.encode_wide().collect();
+    let bytes = (wide.len() * 2) as u16;
+    let us = UNICODE_STRING { Length: bytes, MaximumLength: bytes, Buffer: wide.as_mut_ptr() };
+    let mut oa: OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    oa.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
+    oa.RootDirectory = p.as_raw_handle() as HANDLE;
+    oa.ObjectName = &raw const us;
+    let mut h: HANDLE = std::ptr::null_mut();
+    let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    // SAFETY: every pointer is to a live local that outlives the call, and `wide` outlives `us`.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut h,
+            FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            &raw const oa,
+            &raw mut iosb,
+            std::ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status != 0 {
+        let code = match status {
+            STATUS_ACCESS_DENIED => Code::PermissionDenied,
+            _ => Code::IoError,
+        };
+        return Err(FsError::new(code, nt_io_error("NtCreateFile", status)));
+    }
+    // SAFETY: NtCreateFile returned this handle and nothing else owns it.
+    let opened = unsafe { OwnedHandle::from_raw_handle(h as _) };
+
+    match reparse_tag_of(&opened)? {
+        None => {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a symbolic link"),
+            ));
+        }
+        Some(IO_REPARSE_TAG_SYMLINK) => {}
+        Some(_) => {
+            return Err(FsError::new(
+                Code::SpecialFileUnsupported,
+                std::io::Error::other("a junction or mounted-volume folder is not a symlink"),
+            ));
+        }
+    }
+
+    let file = File::from(opened);
+    let is_dir = file.metadata().map_err(FsError::from_io)?.file_attributes()
+        & FILE_ATTRIBUTE_DIRECTORY
+        != 0;
+
+    // MAXIMUM_REPARSE_DATA_BUFFER_SIZE.
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut returned = 0u32;
+    // SAFETY: `buf` is a live writable buffer of the stated length, `returned` a live u32, the handle outlives the
+    // call, and there is no OVERLAPPED (the handle is synchronous).
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as HANDLE,
+            FSCTL_GET_REPARSE_POINT,
+            std::ptr::null(),
+            0,
+            buf.as_mut_ptr().cast(),
+            buf.len() as u32,
+            &raw mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(FsError::from_io(std::io::Error::last_os_error()));
+    }
+    let buf = &buf[..returned as usize];
+
+    // REPARSE_DATA_BUFFER, symlink arm: ReparseTag u32, ReparseDataLength u16, Reserved u16, then
+    // SubstituteNameOffset/Length u16, PrintNameOffset/Length u16, Flags u32, PathBuffer. Offsets are in bytes from
+    // the start of PathBuffer (byte 20).
+    const PATH_BUFFER: usize = 20;
+    let malformed =
+        || FsError::new(Code::IoError, std::io::Error::other("malformed symlink reparse buffer"));
+    let field = |at: usize| -> Result<usize> {
+        let b = buf.get(at..at + 2).ok_or_else(malformed)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]) as usize)
+    };
+    let name_at = |offset_at: usize| -> Result<std::ffi::OsString> {
+        let (off, len) = (field(offset_at)?, field(offset_at + 2)?);
+        let start = PATH_BUFFER + off;
+        let raw = buf.get(start..start + len).ok_or_else(malformed)?;
+        let units: Vec<u16> =
+            raw.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
+        Ok(std::ffi::OsString::from_wide(&units))
+    };
+    let print = name_at(12)?;
+    let payload = if print.is_empty() {
+        let sub = name_at(8)?;
+        let units: Vec<u16> = sub.encode_wide().collect();
+        let prefix: Vec<u16> = "\\??\\".encode_utf16().collect();
+        match units.strip_prefix(prefix.as_slice()) {
+            Some(rest) => std::ffi::OsString::from_wide(rest),
+            None => sub,
+        }
+    } else {
+        print
+    };
+    Ok(Link { payload, kind: if is_dir { LinkKind::Dir } else { LinkKind::File } })
 }
 
 fn remove_file_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {

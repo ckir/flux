@@ -4,7 +4,7 @@
 
 use flux_core::copy::CopyError;
 use flux_core::{TreeFailure, TreeFailureCause, TreeOutcome, copy_tree};
-use flux_fs::{Code, CopyOptions, Durability, OperationId, Preserve, Publish, Safety};
+use flux_fs::{Code, CopyOptions, Durability, Links, OperationId, Preserve, Publish, Safety};
 use flux_platform::StdFileSystem;
 use std::path::Path;
 use tempfile::TempDir;
@@ -18,6 +18,7 @@ fn opts() -> CopyOptions {
         safety: Safety::Default,
         operation_id: OperationId::new("t"),
         existing: flux_fs::ExistingPolicy::Overwrite,
+        links: Links::Copy,
     }
 }
 

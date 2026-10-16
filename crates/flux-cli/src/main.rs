@@ -7,7 +7,7 @@ use flux_cli::report::{self, Report};
 use flux_cli::resolve::{self, Job, Stop};
 use flux_core::run::RunConfig;
 use flux_fs::{
-    Code, CopyOptions, Durability, ExistingPolicy, OperationId, Preserve, Publish, Safety,
+    Code, CopyOptions, Durability, ExistingPolicy, Links, OperationId, Preserve, Publish, Safety,
 };
 use std::io::Write;
 use std::path::PathBuf;
@@ -160,6 +160,7 @@ fn options(args: &CopyArgs) -> CopyOptions {
         } else {
             ExistingPolicy::Overwrite
         },
+        links: Links::Copy,
     }
 }
 

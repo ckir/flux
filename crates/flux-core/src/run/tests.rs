@@ -8,8 +8,8 @@ use crate::lock::record::{Decoded, LockRecord, decode};
 use crate::lock::test_support::{dead_lock, live_lock, record};
 use crate::state::{Kind, OperationState, UNREADABLE, decode as decode_state};
 use flux_fs::{
-    DestinationRoot, Durability, FileIdentity, FileSystem, LockCapability, ObjectId, OperationId,
-    Preserve, Publish, Safety,
+    DestinationRoot, Durability, FileIdentity, FileSystem, Links, LockCapability, ObjectId,
+    OperationId, Preserve, Publish, Safety,
 };
 use std::ffi::OsStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -52,6 +52,7 @@ fn opts() -> CopyOptions {
         safety: Safety::Default,
         operation_id: OperationId::new("replaced by the run"),
         existing: flux_fs::ExistingPolicy::Overwrite,
+        links: Links::Copy,
     }
 }
 

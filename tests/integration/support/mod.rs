@@ -2,7 +2,9 @@
 
 use flux_core::TreeOutcome;
 use flux_core::run::{self, RunConfig};
-use flux_fs::{CopyOptions, Durability, ExistingPolicy, OperationId, Preserve, Publish, Safety};
+use flux_fs::{
+    CopyOptions, Durability, ExistingPolicy, Links, OperationId, Preserve, Publish, Safety,
+};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -15,6 +17,7 @@ pub fn options(durability: Durability) -> CopyOptions {
         safety: Safety::Default,
         operation_id: OperationId::new(String::new()),
         existing: ExistingPolicy::Overwrite,
+        links: Links::Copy,
     }
 }
 

@@ -6,8 +6,8 @@
 //! that, and Section 241.5 is amended in Task 9 to name it.
 
 use flux_fs::{
-    Code, DirEntry, FileHandle, FileIdentity, FileSystem, FileType, FsError, Metadata, ObjectId,
-    Perms, Result,
+    Code, DirEntry, FileHandle, FileIdentity, FileSystem, FileType, FsError, Link, Metadata,
+    ObjectId, Perms, Result,
 };
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -635,6 +635,30 @@ impl FileSystem for StdFileSystem {
 
     fn create_dir(&self, path: &Path) -> Result<()> {
         std::fs::create_dir(path).map_err(FsError::from_io)
+    }
+
+    /// POSIX: `readlink(2)` never follows and answers `EINVAL` for a non-link, which `from_io` keeps as
+    /// `IoError`/`InvalidInput`. The kind is `Unspecified`: a POSIX link carries none.
+    #[cfg(unix)]
+    fn read_link(&self, path: &Path) -> Result<Link> {
+        let payload = std::fs::read_link(path).map_err(FsError::from_io)?;
+        Ok(Link { payload: payload.into_os_string(), kind: flux_fs::LinkKind::Unspecified })
+    }
+
+    /// Windows: through the handle arm, so a junction is refused (`SpecialFileUnsupported`) and the kind is read from
+    /// the link object. The PARENT is resolved by path and may be reached through a link (§149.7 exempts it); the leaf
+    /// is judged by its own handle.
+    #[cfg(windows)]
+    fn read_link(&self, path: &Path) -> Result<Link> {
+        use flux_fs::{DestinationRoot, DirHandle};
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a symbolic link"),
+            ));
+        };
+        let parent = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
+        self.destination_root(parent)?.read_link(name)
     }
 }
 

@@ -1819,6 +1819,7 @@ mod tests {
             safety: flux_fs::Safety::Default,
             operation_id: flux_fs::OperationId::new(id(1)),
             existing: flux_fs::ExistingPolicy::Overwrite,
+            links: flux_fs::Links::Copy,
         })
     }
 
@@ -1958,7 +1959,7 @@ mod tests {
 
     #[test]
     fn options_of_spells_every_value_as_the_spec_does() {
-        use flux_fs::{CopyOptions, Durability, ExistingPolicy, Preserve, Safety};
+        use flux_fs::{CopyOptions, Durability, ExistingPolicy, Links, Preserve, Safety};
         let with = |f: &dyn Fn(&mut CopyOptions)| {
             let mut o = flux_fs::CopyOptions {
                 preserve_times: Preserve::Default,
@@ -1968,6 +1969,7 @@ mod tests {
                 safety: Safety::Default,
                 operation_id: flux_fs::OperationId::new(id(1)),
                 existing: ExistingPolicy::Overwrite,
+                links: Links::Copy,
             };
             f(&mut o);
             Options::of(&o)

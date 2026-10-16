@@ -43,6 +43,22 @@ pub struct DirEntry {
     pub file_type: FileType,
 }
 
+/// A symlink's payload, read without following it (§125: verbatim bytes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    pub payload: std::ffi::OsString,
+    pub kind: LinkKind,
+}
+
+/// What the link object itself says it points at. POSIX links carry no kind: `Unspecified`.
+/// Windows links do (`FILE_ATTRIBUTE_DIRECTORY` is set on a directory symlink, dangling or not).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkKind {
+    Unspecified,
+    File,
+    Dir,
+}
+
 /// Portable filesystem object identity (§109).
 ///
 /// BOTH fields, always. §109 says "Never compare only inode" and "only file ID",
@@ -205,6 +221,15 @@ pub trait FileSystem: Send + Sync {
     /// returns `AlreadyExists` -- but the trait is public and the requirement was
     /// unstated.
     fn create_dir(&self, path: &Path) -> Result<()>;
+
+    /// Read a symlink's payload, never following it.
+    ///
+    /// Refuses a regular file or a directory at `path` with `Code::IoError`, kind
+    /// `InvalidInput` (what `readlink(2)` itself answers, `EINVAL`, through
+    /// `FsError::from_io`); a name-surrogate that is not a symlink (on Windows a junction or
+    /// a mounted-volume folder) with `Code::SpecialFileUnsupported`; a missing path with
+    /// `Code::IoError`, kind `NotFound`.
+    fn read_link(&self, path: &Path) -> Result<Link>;
 }
 
 /// An open directory under `DEST` (§149.7).
@@ -322,6 +347,21 @@ pub trait DirHandle: Sized {
     /// guard protects against destroying a tree, so being unable to tell is a
     /// reason to stop, not a reason to proceed.
     fn remove_file(&self, name: &std::ffi::OsStr) -> Result<()>;
+
+    /// Create a symlink named `name` in this directory, with `link.payload` as its payload,
+    /// EXCLUSIVELY: MUST FAIL with `ErrorKind::AlreadyExists` if the name is taken by anything,
+    /// a dangling link included, and never creates through a link (the same clause
+    /// `create_new` carries). Calls `check_component(name)` first.
+    ///
+    /// Maps "this filesystem or this process cannot create a symlink" to
+    /// `Code::SymlinkCreationUnavailable`; every other failure goes through `FsError::from_io`.
+    /// `LinkKind::Unspecified` on a platform that needs a kind creates a file link.
+    fn create_symlink(&self, name: &std::ffi::OsStr, link: &Link) -> Result<()>;
+
+    /// As `FileSystem::read_link`, for a child of this handle: never follows, and refuses a
+    /// non-link (`IoError`/`InvalidInput`), a non-symlink name-surrogate
+    /// (`SpecialFileUnsupported`) and a missing name (`IoError`/`NotFound`).
+    fn read_link(&self, name: &std::ffi::OsStr) -> Result<Link>;
 
     /// Publish `from` in this directory onto `to` in `other`, atomically and
     /// without replacing. The two-handle form is what makes staging in one
@@ -562,6 +602,10 @@ mod tests {
 
         fn create_dir(&self, _: &Path) -> crate::Result<()> {
             Ok(())
+        }
+
+        fn read_link(&self, _: &Path) -> crate::Result<Link> {
+            Ok(Link { payload: std::ffi::OsString::new(), kind: LinkKind::Unspecified })
         }
     }
 

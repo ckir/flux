@@ -1,7 +1,10 @@
 //! The POSIX `DirHandle`: `openat` with `O_NOFOLLOW | O_DIRECTORY` (§149.7).
 
 use crate::std_fs::{identity_mismatch, unavailable_expectation};
-use flux_fs::{Code, DirHandle, FileHandle, FsError, Metadata, MountRoot, Result, check_component};
+use flux_fs::{
+    Code, DirHandle, FileHandle, FsError, Link, LinkKind, Metadata, MountRoot, Result,
+    check_component,
+};
 use rustix::fs::{Access, AtFlags, Mode, OFlags, accessat, openat, statat};
 use std::ffi::OsStr;
 use std::os::fd::OwnedFd;
@@ -268,6 +271,39 @@ impl DirHandle for StdDir {
                     std::io::Error::new(
                         std::io::ErrorKind::IsADirectory,
                         "remove_file refuses a directory",
+                    ),
+                );
+            }
+            FsError::from_io(std::io::Error::from(e))
+        })
+    }
+
+    /// `readlinkat(2)` on the child: never follows, answers `EINVAL` for a non-link (`IoError`/`InvalidInput` through
+    /// `from_io`) and `ENOENT` for a missing name. A POSIX link carries no kind.
+    fn read_link(&self, name: &OsStr) -> Result<Link> {
+        use std::os::unix::ffi::OsStringExt;
+        check_component(name)?;
+        let payload = rustix::fs::readlinkat(&self.0, name, Vec::new())
+            .map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
+        Ok(Link {
+            payload: std::ffi::OsString::from_vec(payload.into_bytes()),
+            kind: LinkKind::Unspecified,
+        })
+    }
+
+    /// `symlinkat(2)`: exclusive (`EEXIST` is `AlreadyExists`, a dangling link included) and never through a link.
+    /// `EPERM` is what a filesystem that cannot hold a symlink answers (Linux, vfat), so it is
+    /// `SymlinkCreationUnavailable`; `EACCES` stays `PermissionDenied` through `from_io`.
+    fn create_symlink(&self, name: &OsStr, link: &Link) -> Result<()> {
+        use rustix::io::Errno;
+        check_component(name)?;
+        rustix::fs::symlinkat(link.payload.as_os_str(), &self.0, name).map_err(|e| {
+            if e == Errno::PERM {
+                return FsError::new(
+                    Code::SymlinkCreationUnavailable,
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "the destination filesystem cannot hold a symlink",
                     ),
                 );
             }
