@@ -9,7 +9,9 @@
 //! Dropping the flag is not an alternative -- without it `NtCreateFile` FOLLOWS
 //! the junction, which is the traversal §149.7 forbids.
 
-use flux_fs::{Code, DirHandle, FsError, Metadata, MountRoot, Result, check_component};
+use flux_fs::{
+    Code, DirHandle, FsError, Link, LinkKind, Metadata, MountRoot, Result, check_component,
+};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::os::windows::ffi::OsStrExt;
@@ -18,8 +20,9 @@ use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_DELETE, FILE_DISPOSITION_INFORMATION,
     FILE_DISPOSITION_INFORMATION_EX, FILE_DISPOSITION_POSIX_SEMANTICS, FILE_NON_DIRECTORY_FILE,
-    FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FileDispositionInformation,
-    FileDispositionInformationEx, FileRenameInformation, NtCreateFile, NtSetInformationFile,
+    FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS,
+    FILE_RENAME_REPLACE_IF_EXISTS, FileDispositionInformation, FileDispositionInformationEx,
+    FileRenameInformation, FileRenameInformationEx, NtCreateFile, NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
     HANDLE, STATUS_DELETE_PENDING, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_INFO_CLASS,
@@ -100,6 +103,34 @@ const fn is_name_surrogate(tag: u32) -> bool {
 /// checks above would treat it as an ordinary file. MEASURED (cut 7a Part 3a capstone, NTFS): read, it gives 0 bytes.
 /// It is a socket, not a regular file, and the POSIX arm refuses a socket through `fstat`.
 const IO_REPARSE_TAG_AF_UNIX: u32 = 0x8000_0023;
+
+/// A `CreateSymbolicLinkW` failure (`GetLastError`) as the trait's error (spec 3.1, 3.7, ruling R15). Error 87 (an
+/// OS that does not know the unprivileged flag) never reaches here as such: `create_symlink` retries without the flag
+/// first, and a retry that still answers 87 is a genuine invalid parameter, mapped generically below.
+fn map_symlink_error(code: u32) -> FsError {
+    use windows_sys::Win32::Foundation::{
+        ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED,
+        ERROR_PRIVILEGE_NOT_HELD,
+    };
+    match code {
+        ERROR_PRIVILEGE_NOT_HELD => FsError::new(
+            Code::SymlinkCreationUnavailable,
+            std::io::Error::other(
+                "symlink creation needs Developer Mode or the SeCreateSymbolicLinkPrivilege right",
+            ),
+        ),
+        // The filesystem case (FAT32, exFAT, a share that refuses reparse points).
+        ERROR_NOT_SUPPORTED | ERROR_INVALID_FUNCTION => FsError::new(
+            Code::SymlinkCreationUnavailable,
+            std::io::Error::other("the destination filesystem cannot hold a symlink"),
+        ),
+        ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS => FsError::from_io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            std::io::Error::from_raw_os_error(code as i32),
+        )),
+        _ => FsError::from_io(std::io::Error::from_raw_os_error(code as i32)),
+    }
+}
 
 /// `Debug` is required, not decorative: the tests call `.unwrap_err()` on a
 /// `Result<StdDir, _>`, which needs `StdDir: Debug` to compile.
@@ -282,6 +313,94 @@ impl DirHandle for StdDir {
     fn remove_file(&self, name: &OsStr) -> Result<()> {
         check_component(name)?;
         crate::dir_windows::remove_file_at(&self.0, name)
+    }
+
+    fn read_link(&self, name: &OsStr) -> Result<Link> {
+        check_component(name)?;
+        crate::dir_windows::read_link_at(&self.0, name)
+    }
+
+    /// `CreateSymbolicLinkW` with the unprivileged flag (measured: works under Developer Mode, 1314 without it); an
+    /// ERROR_INVALID_PARAMETER is retried once without the flag (ruling R15).
+    /// `LinkKind::Unspecified` creates a FILE link (spec D9). Exclusive: an occupied name, a dangling link included,
+    /// is `AlreadyExists`.
+    fn create_symlink(&self, name: &OsStr, link: &Link) -> Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateSymbolicLinkW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE, SYMBOLIC_LINK_FLAG_DIRECTORY,
+        };
+
+        check_component(name)?;
+        let dir_path = self.canonical_path()?;
+
+        // SAFETY/RESIDUAL: this is the ONE path-based destination write the Windows arm makes (spec 3.7,
+        // candidate (b)); `CreateSymbolicLinkW` takes no directory handle. The residual is the window between
+        // this identity re-check and the call. The re-check refuses when the path no longer names the object
+        // this handle holds. A volume with no file ids (FAT32, exFAT: the handle's identity is `Unavailable`)
+        // cannot be re-checked, so the check is skipped as `rename_no_replace` does; such a volume cannot hold a
+        // symlink in practice and the call below then fails through `map_symlink_error`. A Strong handle against
+        // an `Unavailable` path identity is still refused.
+        let held = crate::std_fs::identity_of_handle(&self.0);
+        if !matches!(held, flux_fs::FileIdentity::Unavailable) {
+            // Query-only access, as the arm's metadata path does, so a write-only directory still opens.
+            let at_path = std::fs::OpenOptions::new()
+                .access_mode(0)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&dir_path)
+                .map_err(FsError::from_io)?;
+            if crate::std_fs::identity_of_handle(&at_path) != held {
+                return Err(FsError::new(
+                    Code::SafetyRejected,
+                    std::io::Error::other(
+                        "the directory handle no longer names the path it was opened at",
+                    ),
+                ));
+            }
+        }
+
+        let link_path: Vec<u16> =
+            dir_path.join(name).as_os_str().encode_wide().chain(Some(0)).collect();
+        let payload: Vec<u16> = link.payload.encode_wide().chain(Some(0)).collect();
+        // An interior NUL would silently truncate the payload at the API boundary.
+        if payload[..payload.len() - 1].contains(&0) {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "a symlink payload cannot contain NUL",
+                ),
+            ));
+        }
+        let mut flags = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
+        if link.kind == LinkKind::Dir {
+            flags |= SYMBOLIC_LINK_FLAG_DIRECTORY;
+        }
+        let last_error = || std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32;
+        // SAFETY: both buffers are live NUL-terminated UTF-16 strings that outlive the call.
+        let mut ok = unsafe { CreateSymbolicLinkW(link_path.as_ptr(), payload.as_ptr(), flags) };
+        let mut code = if ok { 0 } else { last_error() };
+        // Ruling R15: ERROR_INVALID_PARAMETER is what an OS that does not know the unprivileged flag answers (as
+        // Rust std handles it): retry ONCE without that flag, and map the retry's error if it fails too.
+        if !ok && code == windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER {
+            let without = flags & !SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
+            // SAFETY: as above.
+            ok = unsafe { CreateSymbolicLinkW(link_path.as_ptr(), payload.as_ptr(), without) };
+            code = if ok { 0 } else { last_error() };
+        }
+        if !ok {
+            // ERROR_ACCESS_DENIED is what Windows answers when the name is held by a DIRECTORY (measured on
+            // the hosted runner). The trait contract is AlreadyExists when anything holds the name, so look
+            // through the handle (no-follow) and report that; a name that is not there keeps the denial.
+            if code == 5 && metadata_at(&self.0, name).is_ok() {
+                return Err(FsError::from_io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    std::io::Error::from_raw_os_error(code as i32),
+                )));
+            }
+            return Err(map_symlink_error(code));
+        }
+        Ok(())
     }
 
     fn rename_no_replace(&self, from: &OsStr, other: &Self, to: &OsStr) -> Result<()> {
@@ -929,6 +1048,144 @@ fn metadata_at(p: &OwnedHandle, n: &OsStr) -> Result<Metadata> {
     })
 }
 
+/// `IO_REPARSE_TAG_SYMLINK`.
+const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+
+/// A symlink's payload, read without following it: open the name with `FILE_OPEN_REPARSE_POINT`, judge the tag with
+/// `reparse_tag_of`, then `FSCTL_GET_REPARSE_POINT`.
+///
+/// The payload is the PrintName (the user-visible text), falling back to the SubstituteName through
+/// `substitute_to_payload` when the print name is empty. `kind` is `Dir` when the link object carries `FILE_ATTRIBUTE_DIRECTORY`.
+fn read_link_at(p: &OwnedHandle, n: &OsStr) -> Result<Link> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
+
+    let mut wide: Vec<u16> = n.encode_wide().collect();
+    let bytes = (wide.len() * 2) as u16;
+    let us = UNICODE_STRING { Length: bytes, MaximumLength: bytes, Buffer: wide.as_mut_ptr() };
+    let mut oa: OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    oa.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
+    oa.RootDirectory = p.as_raw_handle() as HANDLE;
+    oa.ObjectName = &raw const us;
+    let mut h: HANDLE = std::ptr::null_mut();
+    let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    // SAFETY: every pointer is to a live local that outlives the call, and `wide` outlives `us`.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut h,
+            FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            &raw const oa,
+            &raw mut iosb,
+            std::ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status != 0 {
+        let code = match status {
+            STATUS_ACCESS_DENIED => Code::PermissionDenied,
+            _ => Code::IoError,
+        };
+        return Err(FsError::new(code, nt_io_error("NtCreateFile", status)));
+    }
+    // SAFETY: NtCreateFile returned this handle and nothing else owns it.
+    let opened = unsafe { OwnedHandle::from_raw_handle(h as _) };
+
+    match reparse_tag_of(&opened)? {
+        None => {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a symbolic link"),
+            ));
+        }
+        Some(IO_REPARSE_TAG_SYMLINK) => {}
+        Some(_) => {
+            return Err(FsError::new(
+                Code::SpecialFileUnsupported,
+                std::io::Error::other("a junction or mounted-volume folder is not a symlink"),
+            ));
+        }
+    }
+
+    let file = File::from(opened);
+    let is_dir = file.metadata().map_err(FsError::from_io)?.file_attributes()
+        & FILE_ATTRIBUTE_DIRECTORY
+        != 0;
+
+    // MAXIMUM_REPARSE_DATA_BUFFER_SIZE.
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut returned = 0u32;
+    // SAFETY: `buf` is a live writable buffer of the stated length, `returned` a live u32, the handle outlives the
+    // call, and there is no OVERLAPPED (the handle is synchronous).
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as HANDLE,
+            FSCTL_GET_REPARSE_POINT,
+            std::ptr::null(),
+            0,
+            buf.as_mut_ptr().cast(),
+            buf.len() as u32,
+            &raw mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(FsError::from_io(std::io::Error::last_os_error()));
+    }
+    let buf = &buf[..returned as usize];
+
+    // REPARSE_DATA_BUFFER, symlink arm: ReparseTag u32, ReparseDataLength u16, Reserved u16, then
+    // SubstituteNameOffset/Length u16, PrintNameOffset/Length u16, Flags u32, PathBuffer. Offsets are in bytes from
+    // the start of PathBuffer (byte 20).
+    const PATH_BUFFER: usize = 20;
+    let malformed =
+        || FsError::new(Code::IoError, std::io::Error::other("malformed symlink reparse buffer"));
+    let field = |at: usize| -> Result<usize> {
+        let b = buf.get(at..at + 2).ok_or_else(malformed)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]) as usize)
+    };
+    let name_at = |offset_at: usize| -> Result<std::ffi::OsString> {
+        let (off, len) = (field(offset_at)?, field(offset_at + 2)?);
+        let start = PATH_BUFFER + off;
+        let raw = buf.get(start..start + len).ok_or_else(malformed)?;
+        let units: Vec<u16> =
+            raw.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
+        Ok(std::ffi::OsString::from_wide(&units))
+    };
+    let print = name_at(12)?;
+    let payload = if print.is_empty() {
+        let units: Vec<u16> = name_at(8)?.encode_wide().collect();
+        std::ffi::OsString::from_wide(&substitute_to_payload(&units))
+    } else {
+        print
+    };
+    Ok(Link { payload, kind: if is_dir { LinkKind::Dir } else { LinkKind::File } })
+}
+
+/// A symlink's SubstituteName (NT namespace) as the user-visible payload, for a link whose PrintName is empty:
+/// `\??\UNC\srv\sh` is `\\srv\sh` and `\??\C:\x` is `C:\x`; anything else (a relative payload) is unchanged. Stripping
+/// the bare `\??\` from a UNC name would yield `UNC\srv\sh`, a different, relative payload (invariant I1).
+fn substitute_to_payload(units: &[u16]) -> Vec<u16> {
+    let nt: Vec<u16> = "\\??\\".encode_utf16().collect();
+    let unc: Vec<u16> = "\\??\\UNC\\".encode_utf16().collect();
+    if let Some(rest) = units.strip_prefix(unc.as_slice()) {
+        let mut out: Vec<u16> = "\\\\".encode_utf16().collect();
+        out.extend_from_slice(rest);
+        out
+    } else if let Some(rest) = units.strip_prefix(nt.as_slice()) {
+        rest.to_vec()
+    } else {
+        units.to_vec()
+    }
+}
+
 fn remove_file_at(p: &OwnedHandle, n: &OsStr) -> Result<()> {
     // Open the name with DELETE | SYNCHRONIZE and FILE_OPEN_REPARSE_POINT, so a
     // link is removed rather than followed -- the same reasoning `open_dir`
@@ -1313,6 +1570,39 @@ fn rename_at(fd: &OwnedHandle, f: &OsStr, td: &OwnedHandle, t: &OsStr, r: bool) 
             FileRenameInformation,
         )
     };
+    // Replacing an existing DIRECTORY LINK by anything but a directory link: plain
+    // `FileRenameInformation` answers STATUS_ACCESS_DENIED (spec 3.7, "Replacing an
+    // existing DIRECTORY link"; MEASURED on Windows 11 by the owner:
+    // `FileRenameInformationEx` with REPLACE_IF_EXISTS | POSIX_SEMANTICS succeeds in
+    // both directions). So retry ONCE, and only when replacing, when the failure is
+    // ACCESS_DENIED, and when the existing target is a SYMLINK reparse point (R13). Only a
+    // directory symlink was measured; a junction (tag 0xA0000003) and any other surrogate are
+    // unmeasured and keep the plain denial, pinned by the test
+    // `a_file_over_a_junction_at_the_destination_name`.
+    // Any other status, or a failing retry, is reported exactly as before.
+    let mut status = status;
+    if status != 0
+        && r
+        && status == STATUS_ACCESS_DENIED
+        && surrogate_tag_at(td, t) == Some(IO_REPARSE_TAG_SYMLINK)
+    {
+        // SAFETY: same buffer, same `total`, same live `h`/`buf` as the call above. The
+        // `Anonymous` union is u32-sized at the same offset for the classic and the Ex
+        // layout; the Ex class reads it as `Flags`, so it is overwritten whole (this also
+        // clears the classic `ReplaceIfExists` byte). The other fields are unchanged.
+        status = unsafe {
+            let info = base.cast::<FILE_RENAME_INFORMATION>();
+            (&raw mut (*info).Anonymous.Flags)
+                .write(FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS);
+            NtSetInformationFile(
+                h.as_raw_handle() as _,
+                &raw mut iosb,
+                base.cast(),
+                total as u32,
+                FileRenameInformationEx,
+            )
+        };
+    }
     if status != 0 {
         return Err(FsError::new(Code::IoError, nt_io_error("NtSetInformationFile", status)));
     }
@@ -1320,7 +1610,7 @@ fn rename_at(fd: &OwnedHandle, f: &OsStr, td: &OwnedHandle, t: &OsStr, r: bool) 
     Ok(())
 }
 
-/// The name-surrogate tag of a child that is NOT a directory, or `None`.
+/// The name-surrogate reparse tag of a child (a file link or a directory link), or `None`.
 ///
 /// Opens with no `FILE_DIRECTORY_FILE` and no `FILE_NON_DIRECTORY_FILE`, so it
 /// accepts whatever the name is, plus `FILE_OPEN_REPARSE_POINT` so it sees the LINK
@@ -1793,5 +2083,27 @@ mod judge_tests {
             entry_type(FILE_ATTRIBUTE_NORMAL, IO_REPARSE_TAG_AF_UNIX),
             flux_fs::FileType::File
         );
+    }
+}
+
+#[cfg(test)]
+#[cfg(windows)]
+mod substitute_tests {
+    use super::substitute_to_payload;
+
+    fn conv(s: &str) -> String {
+        let units: Vec<u16> = s.encode_utf16().collect();
+        String::from_utf16(&substitute_to_payload(&units)).unwrap()
+    }
+
+    #[test]
+    fn a_substitute_name_maps_to_the_payload_without_rewriting_it() {
+        assert_eq!(conv(r"\??\UNC\srv\sh"), r"\\srv\sh");
+        assert_eq!(conv(r"\??\UNC\srv\sh\dir"), r"\\srv\sh\dir");
+        assert_eq!(conv(r"\??\C:\x"), r"C:\x");
+        assert_eq!(conv(r"sub\x"), r"sub\x");
+        assert_eq!(conv(r"..\up"), r"..\up");
+        assert_eq!(conv(r"\abs\no\drive"), r"\abs\no\drive");
+        assert_eq!(conv(""), "");
     }
 }

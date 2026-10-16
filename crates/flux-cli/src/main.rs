@@ -7,7 +7,7 @@ use flux_cli::report::{self, Report};
 use flux_cli::resolve::{self, Job, Stop};
 use flux_core::run::RunConfig;
 use flux_fs::{
-    Code, CopyOptions, Durability, ExistingPolicy, OperationId, Preserve, Publish, Safety,
+    Code, CopyOptions, Durability, ExistingPolicy, Links, OperationId, Preserve, Publish, Safety,
 };
 use std::io::Write;
 use std::path::PathBuf;
@@ -55,10 +55,10 @@ struct CleanupArgs {
 struct CopyArgs {
     source: PathBuf,
     destination: PathBuf,
-    /// Fail a file if its timestamps cannot be applied (§44.1).
+    /// Fail a file if its timestamps cannot be applied (§44.1); a symlink's own times are not preserved.
     #[arg(long)]
     preserve_times: bool,
-    /// Fail a file if its permissions cannot be applied (§44.1).
+    /// Fail a file if its permissions cannot be applied (§44.1); a symlink's own permissions are not preserved.
     #[arg(long)]
     preserve_permissions: bool,
     /// Both --preserve-times and --preserve-permissions.
@@ -105,12 +105,22 @@ struct CopyArgs {
     /// Leave an existing file at DEST untouched (§5.1).
     #[arg(long)]
     skip_existing: bool,
+    /// How a symlink in the tree is copied: `copy` recreates it as a link with the same payload (§125); `skip`
+    /// creates nothing and reports it as skipped (§124). `follow` is not supported.
+    #[arg(long, value_enum, default_value_t = LinksArg::Copy)]
+    links: LinksArg,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
 enum DurabilityArg {
     Normal,
     Strict,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum LinksArg {
+    Copy,
+    Skip,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -150,6 +160,10 @@ fn options(args: &CopyArgs) -> CopyOptions {
         safety: match args.safety {
             SafetyArg::Default => Safety::Default,
             SafetyArg::Strict => Safety::Strict,
+        },
+        links: match args.links {
+            LinksArg::Copy => Links::Copy,
+            LinksArg::Skip => Links::Skip,
         },
         // A placeholder: the run replaces it with its own operation id (`RunConfig::operation_id`).
         operation_id: OperationId::new(String::new()),
@@ -264,7 +278,7 @@ fn copy(args: &CopyArgs) -> u8 {
         }
         Err(Stop::SymlinkSource) => {
             err(&format!(
-                "{}: {}: {}; name its target to copy what it points at",
+                "{}: {}: {}",
                 Code::SymlinkCreationUnavailable.as_str(),
                 args.source.display(),
                 report::SYMLINK_WHY

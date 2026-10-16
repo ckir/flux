@@ -98,6 +98,7 @@ pub(crate) fn validate(
         ("preserve_permissions", &then.preserve_permissions, &now.preserve_permissions),
         ("safety", &then.safety, &now.safety),
         ("existing", &then.existing, &now.existing),
+        ("links", &then.links, &now.links),
     ] {
         if was != asks {
             return Err(incompatible(format!(
@@ -140,7 +141,7 @@ mod tests {
     use super::*;
     use crate::state::{Config, Kind, OperationState, Options, Root, native_hex};
     use flux_fs::{
-        CopyOptions, Durability, ExistingPolicy, OperationId, Preserve, Publish, Safety,
+        CopyOptions, Durability, ExistingPolicy, Links, OperationId, Preserve, Publish, Safety,
     };
     use std::path::PathBuf;
 
@@ -155,6 +156,7 @@ mod tests {
             safety: Safety::Default,
             operation_id: OperationId::new("replaced by the run"),
             existing: ExistingPolicy::Overwrite,
+            links: Links::Copy,
         }
     }
 

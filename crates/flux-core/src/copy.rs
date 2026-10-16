@@ -1239,7 +1239,7 @@ mod tests {
     use super::*;
     use crate::checkpoint::FileCkpt;
     use crate::fault_fs::FaultFs;
-    use flux_fs::{Durability, FileSystem, OperationId, Preserve, Publish};
+    use flux_fs::{Durability, FileSystem, Links, OperationId, Preserve, Publish};
 
     #[test]
     fn the_next_wake_is_the_first_grid_point_after_now() {
@@ -1263,6 +1263,7 @@ mod tests {
             safety: flux_fs::Safety::Default,
             operation_id: OperationId::new("op1"),
             existing: flux_fs::ExistingPolicy::Overwrite,
+            links: Links::Copy,
         }
     }
 

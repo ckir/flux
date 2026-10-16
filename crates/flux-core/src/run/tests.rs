@@ -8,8 +8,8 @@ use crate::lock::record::{Decoded, LockRecord, decode};
 use crate::lock::test_support::{dead_lock, live_lock, record};
 use crate::state::{Kind, OperationState, UNREADABLE, decode as decode_state};
 use flux_fs::{
-    DestinationRoot, Durability, FileIdentity, FileSystem, LockCapability, ObjectId, OperationId,
-    Preserve, Publish, Safety,
+    DestinationRoot, Durability, FileIdentity, FileSystem, Links, LockCapability, ObjectId,
+    OperationId, Preserve, Publish, Safety,
 };
 use std::ffi::OsStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -52,6 +52,7 @@ fn opts() -> CopyOptions {
         safety: Safety::Default,
         operation_id: OperationId::new("replaced by the run"),
         existing: flux_fs::ExistingPolicy::Overwrite,
+        links: Links::Copy,
     }
 }
 
@@ -406,6 +407,91 @@ fn restart_supersedes_a_prior_deleting_its_partials_then_its_workspace() {
     let delete = at(&c, &format!("remove_file({partial})"));
     let retire = at(&c, &format!("rename_no_replace(/p/dest/.flux/operations/{} ", id(5)));
     assert!(record < abandon && abandon < delete && delete < retire, "Q-H (a): {c:?}");
+}
+
+/// Cut 10a: a link left at `<name>.flux-partial.<id>` by a crash between its creation and its rename, pointing at
+/// `/p/keep` (a file outside DEST that must survive every removal).
+fn planted_link_temp(fs: &FaultFs, at: &str) {
+    fs.write_file("/p/keep", b"K");
+    fs.add_symlink_to(at, "/p/keep", flux_fs::LinkKind::Unspecified);
+}
+
+fn keep_intact(fs: &FaultFs) {
+    assert_eq!(
+        fs.read_file("/p/keep").as_deref(),
+        Some(&b"K"[..]),
+        "the link's target is untouched"
+    );
+}
+
+#[test]
+fn restart_deletes_a_prior_operations_link_temporary() {
+    // Spec test 13a. Mutant (sweep.rs): the `Symlink` arm removed (the link survives).
+    let fs = fake();
+    prior(&fs, 5, OpState::Failed);
+    let link = format!("/p/dest/old.flux-partial.{}", id(5));
+    planted_link_temp(&fs, &link);
+    let (r, _) = run_tree(&fs, &restart());
+    ok(&r);
+    assert!(!fs.exists(&link), "the superseded operation's link temporary is deleted");
+    keep_intact(&fs);
+    assert!(calls(&fs).contains(&format!("remove_file({link})")), "{:?}", calls(&fs));
+    assert!(
+        !r.warnings.iter().any(|w| matches!(w, RunWarning::PartialKept { .. })),
+        "{:?}",
+        r.warnings
+    );
+    assert!(!fs.exists(format!("/p/dest/.flux/operations/{}", id(5))), "and then its workspace");
+}
+
+/// 2033-05-18, as `cleanup::delete`'s tests pin it.
+const CLEANUP_NOW: u64 = 2_000_000_000_000_000_000;
+
+fn cleanup_cfg() -> crate::cleanup::CleanupConfig {
+    crate::cleanup::CleanupConfig {
+        retention: crate::cleanup::DEFAULT_RETENTION,
+        lease_threshold: crate::cleanup::LEASE_THRESHOLD,
+        now: CLEANUP_NOW,
+        force: false,
+        dry_run: false,
+        operation_id: id(200),
+        owner_instance_id: id(201),
+        boot_session_id: "test-boot".to_string(),
+        before_mutation: None,
+        heartbeat_interval: std::time::Duration::from_secs(5),
+    }
+}
+
+fn run_cleanup(fs: &FaultFs) -> crate::cleanup::CleanupReport {
+    crate::cleanup::cleanup(fs, Path::new("/p/dest"), &cleanup_cfg())
+        .unwrap_or_else(|r| panic!("refused: {r:?}"))
+}
+
+fn removed(r: &crate::cleanup::CleanupReport, path: &str) -> bool {
+    r.actions.iter().any(|a| {
+        matches!(a, crate::cleanup::Action::Removed(p) if p.to_string_lossy().replace('\\', "/") == path)
+    })
+}
+
+#[test]
+fn cleanup_deletes_a_stale_operations_link_temporary() {
+    // Spec test 13a, under `flux cleanup` (the same J1 sweep). Mutant (sweep.rs): the `Symlink` arm removed.
+    let fs = fake();
+    prior(&fs, 5, OpState::Failed);
+    // Older than the retention: STALE, so the pass abandons it and sweeps its partials.
+    fs.set_modified(
+        format!("/p/dest/.flux/operations/{}/manifest", id(5)),
+        std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_nanos(CLEANUP_NOW - 8 * 86_400 * 1_000_000_000),
+    );
+    let link = format!("/p/dest/old.flux-partial.{}", id(5));
+    planted_link_temp(&fs, &link);
+    let r = run_cleanup(&fs);
+    assert!(!r.failed(), "{:?}", r.actions);
+    assert!(removed(&r, &link), "{:?}", r.actions);
+    assert!(!fs.exists(&link));
+    keep_intact(&fs);
+    assert!(calls(&fs).contains(&format!("remove_file({link})")), "{:?}", calls(&fs));
 }
 
 #[test]
@@ -1326,6 +1412,94 @@ fn a_leftover_inside_a_folder_is_listed_by_its_path_below_dest() {
     let c = manifest(&fs, ID).cleanup.expect("version 2");
     let leftover = Path::new("sub").join(format!("b.flux-partial.{ID}"));
     assert_eq!(c.cleanup_pending_artifacts, vec![crate::state::native_hex(&leftover)]);
+}
+
+/// `/src/l`, a link to `/p/keep`, is the source's only entry; `/p` exists.
+fn link_only_src() -> FaultFs {
+    let fs = FaultFs::new();
+    for d in ["/src", "/p"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    fs.write_file("/p/keep", b"K");
+    fs.add_symlink_to("/src/l", "/p/keep", flux_fs::LinkKind::Unspecified);
+    fs
+}
+
+#[test]
+fn a_kept_link_temporary_is_cleaned_up_by_cleanup() {
+    // Spec test 8b. Mutant (cleanup/artifacts.rs): the leaf acceptance reverted (`cleanup` reports `Kept`, exit 1).
+    let fs = link_only_src();
+    let temp = format!("/p/dest/l.flux-partial.{ID}");
+    // Armed when the link's temporary is about to be created, so both faults land on that entry alone: its publishing
+    // rename fails, and so does the discard's removal of the temporary, which therefore stays as the leftover.
+    fs.on_nth("create_symlink", 1, |fs| {
+        fs.fail("rename_no_replace", Code::IoError);
+        fs.fail("remove_file", Code::PermissionDenied);
+    });
+    let (r, got) = run_tree(&fs, &cfg());
+    let out = ok(&r);
+    assert_eq!(out.failures.copy, 1, "{got:?}");
+    assert!(FileSystem::read_link(&fs, Path::new(&temp)).is_ok(), "the link temporary is kept");
+    let c = manifest(&fs, ID).cleanup.expect("version 2");
+    assert!(c.cleanup_pending);
+    assert_eq!(
+        c.cleanup_pending_artifacts,
+        vec![crate::state::native_hex(Path::new(&format!("l.flux-partial.{ID}")))]
+    );
+
+    let report = run_cleanup(&fs);
+    assert!(!report.failed(), "exit 0: {:?}", report.actions);
+    assert!(removed(&report, &temp), "{:?}", report.actions);
+    assert!(!fs.exists(&temp));
+    keep_intact(&fs);
+    assert!(!fs.exists(format!("/p/dest/.flux/operations/{ID}")), "and the workspace");
+}
+
+#[test]
+fn a_resume_after_a_crash_between_create_and_rename_republishes_the_link() {
+    // Spec section 5, the crash row (Review Focus 5): the crashed run leaves its link temporary; the resumed operation
+    // (the same id) removes it under the guard, creates it again and publishes, and its claim is `Created`.
+    let fs = link_only_src();
+    let temp = format!("/p/dest/l.flux-partial.{ID}");
+    // The crash point: the link's publishing rename, the first `rename_no_replace` after its `create_symlink`.
+    fs.on_nth("create_symlink", 1, |fs| {
+        let n = fs.calls().iter().filter(|c| c.starts_with("rename_no_replace(")).count() as u32;
+        fs.on_nth("rename_no_replace", n + 1, |_| panic!("the test's crash point"));
+    });
+    let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_tree(&fs, &cfg())));
+    assert!(died.is_err(), "the run died");
+    assert!(
+        FileSystem::read_link(&fs, Path::new(&temp)).is_ok(),
+        "the crash left the link temporary"
+    );
+    assert!(!fs.exists("/p/dest/l"));
+
+    let again = RunConfig { operation_id: id(0x77), ..resume() };
+    let before = calls(&fs).len();
+    let (r, got) = run_tree(&fs, &again);
+    ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert!(
+        matches!(&r.resumed, Some(ResumeNote::Adopted { operation_id, .. }) if operation_id == ID),
+        "{:?}",
+        r.resumed
+    );
+    let c = calls(&fs)[before..].to_vec();
+    let removal = at(&c, &format!("remove_file({temp})"));
+    assert!(
+        c[..removal].iter().any(|x| *x == format!("metadata({LOCK})")),
+        "the removal is guarded: {c:?}"
+    );
+    let create = at(&c, &format!("create_symlink({temp})"));
+    assert!(removal < create, "{c:?}");
+    assert!(!fs.exists(&temp));
+    let link = FileSystem::read_link(&fs, Path::new("/p/dest/l")).expect("published as a link");
+    assert_eq!(link.payload, "/p/keep");
+    keep_intact(&fs);
+    assert_eq!(
+        fs.claim(strong(&fs, "/p/dest"), "l"),
+        Some(ClaimRecord { target: key("l"), status: ClaimStatus::Created })
+    );
 }
 
 #[test]
@@ -3011,6 +3185,42 @@ fn durability_normal_to_strict_is_recorded_on_adoption() {
         detail(&r.stop),
         "durability: the operation runs with strict durability; pass --durability strict"
     );
+}
+
+#[test]
+fn resume_with_a_different_links_setting_is_incompatible() {
+    let fs = fake();
+    let p = prior3(&fs, 5, OpState::Failed);
+    drop(prior_store(&fs, 5));
+    assert_eq!(p.config.as_ref().unwrap().options.links, "copy");
+    let skip = CopyOptions { links: Links::Skip, ..opts() };
+    let (r, _) = run_tree_with(&fs, &resume(), &skip);
+    assert_eq!(refused(&r.stop), (LockCode::IncompatibleState, false));
+    assert!(detail(&r.stop).starts_with("links:"), "{}", detail(&r.stop));
+    assert_eq!(manifest(&fs, &id(5)), p, "nothing changed");
+    assert!(!fs.exists(LOCK));
+    assert!(!fs.called("open_claim_store("), "validate comes before the store is opened");
+}
+
+#[test]
+fn a_pre_cut_state_file_resumes_as_copy() {
+    let fs = fake();
+    let p = prior3(&fs, 5, OpState::Failed);
+    drop(prior_store(&fs, 5));
+    // The pre-cut manifest: no `links` key (a copy-mode state is written without one, ruling R16), and the four-line
+    // fingerprint as the pre-cut code computed it.
+    let mut v: serde_json::Value = serde_json::from_slice(&p.encode()).unwrap();
+    assert!(!v["options"].as_object().unwrap().contains_key("links"));
+    v["configuration_fingerprint"] =
+        "6814cb38cd3fe6c13a382a988c9c5cbac2ebcf30be0bb4af44596d3019b19f1d".into();
+    assert_eq!(v["options"].as_object().unwrap().len(), 5);
+    fs.write_file(
+        format!("/p/dest/.flux/operations/{}/manifest", id(5)),
+        &serde_json::to_vec(&v).unwrap(),
+    );
+    let (r, _) = run_tree(&fs, &resume());
+    ok(&r);
+    adopted(&r, 5, Some(0));
 }
 
 #[test]
@@ -4800,6 +5010,45 @@ fn recovery_row_1_removes_a_stray_temp_name_of_the_same_object() {
     assert_eq!(fs.claim(strong(&fs, "/p/dest"), "a"), created("a"));
 }
 
+/// Cut 10a: `strict_prior` whose source `a` is a link to `/p/keep` (a file outside DEST that must survive).
+fn strict_link_prior() -> FaultFs {
+    let fs = strict_prior();
+    FileSystem::remove_file(&fs, Path::new("/src/a")).unwrap();
+    fs.write_file("/p/keep", b"K");
+    fs.add_symlink_to("/src/a", "/p/keep", flux_fs::LinkKind::Unspecified);
+    fs
+}
+
+#[test]
+fn recovery_row_1_removes_a_stray_link_temporary() {
+    // Spec test 8a, second case. Mutant (cleanup/artifacts.rs): the leaf acceptance reverted (the stray survives as
+    // `PartialKept`).
+    let fs = strict_link_prior();
+    fs.add_symlink_to("/p/dest/a", "/p/keep", flux_fs::LinkKind::Unspecified);
+    let r_id = identity_of(&fs, "/p/dest/a");
+    let temp = format!("/p/dest/{}", temp_of("a", 5));
+    fs.add_symlink_to(&temp, "/p/keep", flux_fs::LinkKind::Unspecified);
+    fs.set_identity(&temp, r_id);
+    noted(&fs, 5, "a", "a", r_id, "", false, "");
+    let (r, got) = recover(&fs);
+    ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    adopted_recovering(&r, 0, 1);
+    let c = calls(&fs);
+    let apply = at(&c, "claim_apply_recovery");
+    let removed = at(&c, &format!("remove_file({temp})"));
+    assert!(apply < removed, "the stray name goes after the transaction: {c:?}");
+    assert!(!fs.exists(&temp));
+    assert!(
+        !r.warnings.iter().any(|w| matches!(w, RunWarning::PartialKept { .. })),
+        "{:?}",
+        r.warnings
+    );
+    assert_eq!(fs.claim(strong(&fs, "/p/dest"), "a"), created("a"));
+    assert_eq!(FileSystem::read_link(&fs, Path::new("/p/dest/a")).unwrap().payload, "/p/keep");
+    keep_intact(&fs);
+}
+
 /// The temporary of `a` under prior 5 is on disk with some identity.
 fn temp_present(fs: &FaultFs) -> FileIdentity {
     let temp = format!("/p/dest/{}", temp_of("a", 5));
@@ -4832,6 +5081,52 @@ fn recovery_row_2_not_renamed_discards_and_the_walk_redoes() {
     noted(&fs, 5, "a", "a", t, "", false, "");
     let (r, _) = recover(&fs);
     assert!(uncertain(&r).contains("(identity unavailable)"));
+}
+
+#[test]
+fn recovery_row_2_discards_a_link_temporary() {
+    // Spec test 8a, first case. Mutant (recover.rs): the `Symlink` acceptance removed (the note becomes UNCERTAIN).
+    let fs = strict_link_prior();
+    let temp = format!("/p/dest/{}", temp_of("a", 5));
+    fs.add_symlink_to(&temp, "/p/keep", flux_fs::LinkKind::Unspecified);
+    let t = identity_of(&fs, &temp);
+    noted(&fs, 5, "a", "a", t, "", false, "");
+    let (r, got) = recover(&fs);
+    ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    adopted_recovering(&r, 0, 0);
+    assert_eq!(fs.prepared_count(), 0, "the note is discarded");
+    assert!(calls(&fs).contains(&format!("remove_file({temp})")), "{:?}", calls(&fs));
+    assert!(!fs.exists(&temp), "the link temporary is unlinked");
+    keep_intact(&fs);
+    // The walk redid the link.
+    assert_eq!(FileSystem::read_link(&fs, Path::new("/p/dest/a")).unwrap().payload, "/p/keep");
+    assert_eq!(fs.claim(strong(&fs, "/p/dest"), "a"), created("a"));
+}
+
+#[test]
+fn a_directory_at_a_link_notes_temp_name_stays_uncertain() {
+    // Spec test 8a, third case: only a file or a link is T; a directory at the temporary's name is another object.
+    // Mutant (recover.rs): the temporary's read accepts any type.
+    let fs = strict_link_prior();
+    let temp = format!("/p/dest/{}", temp_of("a", 5));
+    // The note records the link the crashed run created; a directory has taken its name since.
+    fs.add_symlink_to(&temp, "/p/keep", flux_fs::LinkKind::Unspecified);
+    let t = identity_of(&fs, &temp);
+    FileSystem::remove_file(&fs, Path::new(&temp)).unwrap();
+    fs.create_dir(Path::new(&temp)).unwrap();
+    noted(&fs, 5, "a", "a", t, "", false, "");
+    let (r, _) = recover(&fs);
+    let d = uncertain(&r);
+    assert!(
+        d.contains(
+            "/p/dest/a: cannot tell whether this file was published (destination holds another object)"
+        ),
+        "{d}"
+    );
+    assert_eq!(fs.prepared_count(), 1, "nothing changed");
+    assert!(fs.metadata(Path::new(&temp)).unwrap().file_type == FileType::Dir);
+    keep_intact(&fs);
 }
 
 #[test]
@@ -5173,10 +5468,12 @@ fn a_weak_directory_identity_is_unavailable_and_a_strong_other_is_another_object
 }
 
 #[test]
-fn a_link_at_the_temporary_name_is_another_object_and_an_unreadable_name_is_unreadable() {
+fn a_directory_at_the_temporary_name_is_another_object_and_an_unreadable_name_is_unreadable() {
     // Mutant (recover.rs): the `Ok(_)` arm of the temporary's metadata answers UNREADABLE_DIRECTORY (old labelling).
+    // Cut 10a: a link at the temporary's name is T now (`recovery_row_2_discards_a_link_temporary`); a directory is
+    // still another object.
     let fs = strict_prior();
-    fs.add_symlink(format!("/p/dest/{}", temp_of("a", 5)));
+    fs.create_dir(Path::new(&format!("/p/dest/{}", temp_of("a", 5)))).unwrap();
     noted(&fs, 5, "a", "a", another(), "", false, "");
     let (r, _) = recover(&fs);
     let d = uncertain(&r);

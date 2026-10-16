@@ -155,8 +155,9 @@ pub(crate) fn classify<D: DirHandle>(
         Err(_) => return uncertain(UNREADABLE_DIRECTORY),
     }
     let t: Seen = match dir.metadata(&v.temp) {
-        Ok(m) if m.file_type == FileType::File => Some(m.identity),
-        // A link, a directory or anything else at the temporary's name is another object, not an unreadable one.
+        // Cut 10a: a link temporary is T too, by its own identity (the handle stat never follows it).
+        Ok(m) if matches!(m.file_type, FileType::File | FileType::Symlink) => Some(m.identity),
+        // A directory or anything else at the temporary's name is another object, not an unreadable one.
         Ok(_) => return uncertain(ANOTHER_OBJECT),
         Err(e) if e.source.kind() == ErrorKind::NotFound => None,
         Err(_) => return uncertain(UNREADABLE_DIRECTORY),
@@ -173,8 +174,8 @@ fn strong(i: FileIdentity) -> bool {
     matches!(i, FileIdentity::Strong(_))
 }
 
-/// The matrix, rows in order; the first that matches decides. `t` is T (the temporary, a regular file), `d` is D (the
-/// entry), `r` is R (the recorded identity).
+/// The matrix, rows in order; the first that matches decides. `t` is T (the temporary, a regular file or a link), `d`
+/// is D (the entry), `r` is R (the recorded identity).
 fn decide(t: Seen, d: Seen, r: FileIdentity, replacement: bool) -> Verdict {
     // Row 1: D is R, both Strong.
     if let Some(i) = d

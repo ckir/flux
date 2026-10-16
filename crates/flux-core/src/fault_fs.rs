@@ -6,8 +6,9 @@
 
 use flux_fs::{
     ClaimKey, ClaimOutcome, ClaimRecord, ClaimStore, Code, DestinationRoot, DirEntry, DirHandle,
-    Durability, FileHandle, FileSystem, FileType, FluxPathKey, FsError, LockCapability, LockFile,
-    Metadata, MountRoot, Perms, PreparedRecord, RecoveryOp, Result, check_component,
+    Durability, FileHandle, FileSystem, FileType, FluxPathKey, FsError, Link, LinkKind,
+    LockCapability, LockFile, Metadata, MountRoot, Perms, PreparedRecord, RecoveryOp, Result,
+    check_component,
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -67,6 +68,11 @@ struct Inner {
     /// directory must be distinguishable from a device node (`types` alone
     /// could not tell them apart, since neither is in `files`).
     directories: HashSet<PathBuf>,
+    /// path -> the payload and kind of a symlink (`add_symlink_to`, `create_symlink`). A link is ALSO in `files`
+    /// (empty) and `types` (`Symlink`); this map holds what only a link has. `Inner.links` is the hard-link COUNT.
+    symlinks: HashMap<PathBuf, Link>,
+    /// `set_symlinks_unavailable`: every `create_symlink` answers `SymlinkCreationUnavailable`.
+    symlinks_unavailable: bool,
     /// Does this fake's `rename_no_replace` have an atomic no-replace primitive?
     ///
     /// `true` by default, because every test written before this switch existed
@@ -535,6 +541,7 @@ fn purge(g: &mut Inner, path: &Path) {
     g.links.remove(path);
     g.perms.remove(path);
     g.types.remove(path);
+    g.symlinks.remove(path);
 }
 
 /// Move a name's content AND its metadata. Moving only the bytes meant the times and
@@ -585,6 +592,15 @@ fn move_object(g: &mut Inner, from: &Path, to: &Path) {
             g.types.remove(to);
         }
     }
+    // The payload is the link object's own, so it moves with it and a replaced link's payload does not survive.
+    match g.symlinks.remove(from) {
+        Some(v) => {
+            g.symlinks.insert(to.to_path_buf(), v);
+        }
+        None => {
+            g.symlinks.remove(to);
+        }
+    }
     // Identity follows the OBJECT, not the name: a real filesystem preserves the inode
     // across a rename, and §149.4's whole point is detecting when the object under a
     // path CHANGED.
@@ -619,6 +635,7 @@ fn move_directory(g: &mut Inner, from: &Path, to: &Path) {
     rekey(&mut g.perms, &moved);
     rekey(&mut g.identities, &moved);
     rekey(&mut g.types, &moved);
+    rekey(&mut g.symlinks, &moved);
     rekey(&mut g.dir_node_by_path, &moved);
     let dirs: Vec<PathBuf> = g.directories.iter().filter(|d| moved(d).is_some()).cloned().collect();
     for dir in dirs {
@@ -1106,8 +1123,10 @@ impl FaultFs {
         self.inner.lock().unwrap().bytes_read.get(path.as_ref()).copied().unwrap_or(0)
     }
 
+    /// Every recorded call, with `\` spelled `/`: the fake records `Path::display()`, which uses backslashes on Windows,
+    /// so a call-log assertion (including an absence assertion) must not depend on the platform's separator.
     pub fn calls(&self) -> Vec<String> {
-        self.inner.lock().unwrap().calls.clone()
+        self.inner.lock().unwrap().calls.iter().map(|c| c.replace('\\', "/")).collect()
     }
 
     pub fn called(&self, prefix: &str) -> bool {
@@ -1246,11 +1265,28 @@ impl FaultFs {
     /// Seed a symlink. The fake never follows it -- the walk must REPORT symlinks
     /// and never descend into them, so a target would be unused state.
     pub fn add_symlink(&self, path: impl AsRef<Path>) {
+        self.add_symlink_to(path, "target", LinkKind::Unspecified);
+    }
+
+    /// Seed a symlink with a payload and a kind, which `read_link` returns verbatim. Never followed.
+    pub fn add_symlink_to(
+        &self,
+        path: impl AsRef<Path>,
+        payload: impl Into<OsString>,
+        kind: LinkKind,
+    ) {
         let path = path.as_ref();
         let mut g = self.inner.lock().unwrap();
         g.files.insert(path.to_path_buf(), Vec::new());
         g.types.insert(path.to_path_buf(), FileType::Symlink);
+        g.symlinks.insert(path.to_path_buf(), Link { payload: payload.into(), kind });
         mint_identity(&mut g, path);
+    }
+
+    /// Make every `create_symlink` answer `SymlinkCreationUnavailable`, the way `set_no_replace_support(false)` models a
+    /// missing primitive: a filesystem or a process that cannot hold a link. Default false.
+    pub fn set_symlinks_unavailable(&self, on: bool) {
+        self.inner.lock().unwrap().symlinks_unavailable = on;
     }
 
     /// Give any existing entry (a directory or a link too) a modified time, directly.
@@ -1475,6 +1511,8 @@ impl FileSystem for FaultFs {
         }
         let g = &*g;
         let len = match g.files.get(&p) {
+            // A link's size is its payload's, as `lstat` reports it.
+            Some(_) if g.symlinks.contains_key(&p) => g.symlinks[&p].payload.len() as u64,
             Some(b) => b.len() as u64,
             // A directory has no bytes, and is not in `files`.
             None if g.directories.contains(&p) => 0,
@@ -1595,6 +1633,22 @@ impl FileSystem for FaultFs {
         // object's identity, permissions or type (each MEASURED as a leak before it was removed here).
         purge(&mut g, &p);
         Ok(())
+    }
+
+    fn read_link(&self, path: &Path) -> Result<Link> {
+        let p = self.norm(path);
+        self.record(format!("read_link({})", p.display()), "read_link")?;
+        let g = self.inner.lock().unwrap();
+        if let Some(link) = g.symlinks.get(&p) {
+            return Ok(link.clone());
+        }
+        // What `readlink(2)` answers: EINVAL for anything that exists and is not a link, ENOENT otherwise.
+        let kind = if g.files.contains_key(&p) || g.directories.contains(&p) {
+            std::io::ErrorKind::InvalidInput
+        } else {
+            std::io::ErrorKind::NotFound
+        };
+        Err(FsError::new(Code::IoError, std::io::Error::from(kind)))
     }
 
     fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>> {
@@ -1978,6 +2032,41 @@ impl DirHandle for FakeDirHandle {
             g.claim_files.remove(&child_path);
         }
         self.fs().remove_file(&child_path)
+    }
+
+    fn read_link(&self, name: &OsStr) -> Result<Link> {
+        check_component(name)?;
+        let child_path = self.my_path().join(name);
+        FileSystem::read_link(&self.fs(), &child_path)
+    }
+
+    fn create_symlink(&self, name: &OsStr, link: &Link) -> Result<()> {
+        check_component(name)?;
+        let child_path = self.fs().norm(&self.my_path().join(name));
+        self.fs().record(format!("create_symlink({})", child_path.display()), "create_symlink")?;
+        let mut g = self.inner.lock().unwrap();
+        if g.symlinks_unavailable {
+            return Err(FsError::new(
+                Code::SymlinkCreationUnavailable,
+                std::io::Error::other("the destination filesystem cannot hold a symlink"),
+            ));
+        }
+        // Anything holds the name: a file, a directory, a link (dangling or not), a pending delete.
+        if g.files.contains_key(&child_path)
+            || g.directories.contains(&child_path)
+            || g.types.contains_key(&child_path)
+            || g.pending.contains(&child_path)
+        {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+            ));
+        }
+        g.files.insert(child_path.clone(), Vec::new());
+        g.types.insert(child_path.clone(), FileType::Symlink);
+        g.symlinks.insert(child_path.clone(), link.clone());
+        mint_identity(&mut g, &child_path);
+        Ok(())
     }
 
     fn rename_no_replace(&self, from: &OsStr, other: &Self, to: &OsStr) -> Result<()> {
@@ -3866,6 +3955,19 @@ mod tests {
     }
 
     #[test]
+    fn calls_use_forward_slashes_on_every_platform() {
+        let fs = FaultFs::new();
+        fs.write_file("/d/seed", b"x");
+        // A backslash inside a component is recorded verbatim on Linux and is the separator on Windows: either way the
+        // log must spell it `/`.
+        fs.create_new(Path::new("/d/a\\b")).unwrap();
+        let calls = fs.calls();
+        assert!(calls.iter().any(|c| c == "create_new(/d/a/b)"), "{calls:?}");
+        assert!(calls.iter().all(|c| !c.contains('\\')), "{calls:?}");
+        assert!(fs.called("create_new(/d/a/b)"));
+    }
+
+    #[test]
     fn rename_no_replace_onto_another_case_is_already_exists() {
         let fs = ci_fs();
         fs.write_file("/d/src", b"new");
@@ -3994,5 +4096,178 @@ mod tests {
         let sub = d.open_dir(OsStr::new("SUB")).unwrap();
         let canon = sub.canonical_path().unwrap();
         assert_eq!(canon.to_string_lossy().replace('\\', "/"), "/d/Sub");
+    }
+
+    #[test]
+    fn read_link_returns_the_seeded_payload_and_kind() {
+        use flux_fs::{DestinationRoot, DirHandle, Link, LinkKind};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.add_symlink_to("/d/l", "../x", LinkKind::Unspecified);
+        let want = Link { payload: "../x".into(), kind: LinkKind::Unspecified };
+        assert_eq!(FileSystem::read_link(&fs, Path::new("/d/l")).unwrap(), want);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        assert_eq!(DirHandle::read_link(&d, OsStr::new("l")).unwrap(), want);
+        assert!(fs.called("read_link(/d/l)"));
+    }
+
+    /// Cut 10a test audit: the fake and the real filesystem answer `create_symlink` and `read_link` with the same
+    /// `(Code, ErrorKind)` for each scenario below, so a test that passes on the fake is not resting on an answer the
+    /// real filesystem never gives. Unix only: the Windows error kinds are pinned in `flux-platform`'s tests.
+    #[cfg(unix)]
+    #[test]
+    fn the_fake_answers_symlink_calls_as_the_real_filesystem_does() {
+        use flux_fs::{DestinationRoot, DirHandle, Link, LinkKind};
+
+        type Answer = (Code, std::io::ErrorKind);
+        fn answers<D: DirHandle>(d: &D) -> Vec<(String, Answer)> {
+            let link = Link { payload: "t".into(), kind: LinkKind::Unspecified };
+            let mut got = Vec::new();
+            // Success is marked `(IoError, Other)`; no scenario below expects the two sides to differ on it.
+            let mut note = |what: &str, r: flux_fs::Result<()>| {
+                let a = match r {
+                    Ok(()) => (Code::IoError, std::io::ErrorKind::Other),
+                    Err(e) => (e.code, e.source.kind()),
+                };
+                got.push((what.to_string(), a));
+            };
+            for name in ["file", "dir", "dangling", "ok"] {
+                note(&format!("create over {name}"), d.create_symlink(OsStr::new(name), &link));
+            }
+            for name in ["file", "dir", "none"] {
+                note(&format!("read_link {name}"), d.read_link(OsStr::new(name)).map(|_| ()));
+            }
+            note("read_link ok", d.read_link(OsStr::new("ok")).map(|_| ()));
+            note("create fresh", d.create_symlink(OsStr::new("fresh"), &link));
+            got
+        }
+
+        let fake = FaultFs::new();
+        fake.create_dir(Path::new("/d")).unwrap();
+        fake.create_dir(Path::new("/d/dir")).unwrap();
+        fake.write_file("/d/file", b"x");
+        fake.add_symlink_to("/d/dangling", "nowhere", LinkKind::Unspecified);
+        fake.add_symlink_to("/d/ok", "file", LinkKind::Unspecified);
+        let fake_answers = answers(&fake.destination_root(Path::new("/d")).unwrap());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("dir")).unwrap();
+        std::fs::write(tmp.path().join("file"), b"x").unwrap();
+        std::os::unix::fs::symlink("nowhere", tmp.path().join("dangling")).unwrap();
+        std::os::unix::fs::symlink("file", tmp.path().join("ok")).unwrap();
+        let real_answers =
+            answers(&flux_platform::StdFileSystem.destination_root(tmp.path()).unwrap());
+
+        assert_eq!(fake_answers, real_answers);
+        // The scenarios are not all one answer: the comparison can fail.
+        assert!(fake_answers.iter().any(|(_, a)| a.1 == std::io::ErrorKind::AlreadyExists));
+        assert!(fake_answers.iter().any(|(_, a)| a.1 == std::io::ErrorKind::InvalidInput));
+        assert!(fake_answers.iter().any(|(_, a)| a.1 == std::io::ErrorKind::NotFound));
+    }
+
+    #[test]
+    fn read_link_refuses_a_file_a_dir_and_a_missing_name() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.create_dir(Path::new("/d/sub")).unwrap();
+        fs.write_file("/d/f", b"x");
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        for name in ["f", "sub"] {
+            let e = FileSystem::read_link(&fs, &Path::new("/d").join(name)).unwrap_err();
+            assert_eq!(e.code, Code::IoError, "{name}");
+            assert_eq!(e.source.kind(), std::io::ErrorKind::InvalidInput, "{name}");
+            let e = DirHandle::read_link(&d, OsStr::new(name)).unwrap_err();
+            assert_eq!(e.code, Code::IoError, "{name}");
+            assert_eq!(e.source.kind(), std::io::ErrorKind::InvalidInput, "{name}");
+        }
+        let e = FileSystem::read_link(&fs, Path::new("/d/none")).unwrap_err();
+        assert_eq!((e.code, e.source.kind()), (Code::IoError, std::io::ErrorKind::NotFound));
+        let e = DirHandle::read_link(&d, OsStr::new("none")).unwrap_err();
+        assert_eq!((e.code, e.source.kind()), (Code::IoError, std::io::ErrorKind::NotFound));
+    }
+
+    #[test]
+    fn create_symlink_creates_an_entry_that_metadata_reports_as_a_link() {
+        use flux_fs::{DestinationRoot, DirHandle, FileIdentity, Link, LinkKind};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let link = Link { payload: "../elsewhere".into(), kind: LinkKind::Dir };
+        d.create_symlink(OsStr::new("n"), &link).unwrap();
+        let m = FileSystem::metadata(&fs, Path::new("/d/n")).unwrap();
+        assert_eq!(m.file_type, FileType::Symlink);
+        assert_eq!(m.len, "../elsewhere".len() as u64);
+        assert!(matches!(m.identity, FileIdentity::Strong(_)));
+        assert_eq!(m.nlink, Some(1));
+        assert_eq!(FileSystem::read_link(&fs, Path::new("/d/n")).unwrap(), link);
+        assert!(fs.called("create_symlink(/d/n)"));
+    }
+
+    #[test]
+    fn create_symlink_refuses_an_occupied_name_including_a_dangling_link() {
+        use flux_fs::{DestinationRoot, DirHandle, Link, LinkKind};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.create_dir(Path::new("/d/sub")).unwrap();
+        fs.write_file("/d/f", b"x");
+        fs.add_symlink_to("/d/l", "/nowhere", LinkKind::Unspecified);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let link = Link { payload: "p".into(), kind: LinkKind::Unspecified };
+        for name in ["f", "sub", "l"] {
+            let e = d.create_symlink(OsStr::new(name), &link).unwrap_err();
+            assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists, "{name}");
+        }
+        assert_eq!(fs.read_file("/d/f").as_deref(), Some(&b"x"[..]));
+        assert_eq!(FileSystem::read_link(&fs, Path::new("/d/l")).unwrap().payload, "/nowhere");
+    }
+
+    #[test]
+    fn create_symlink_is_unavailable_when_switched_off() {
+        use flux_fs::{DestinationRoot, DirHandle, Link, LinkKind};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.set_symlinks_unavailable(true);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let link = Link { payload: "p".into(), kind: LinkKind::Unspecified };
+        let e = d.create_symlink(OsStr::new("n"), &link).unwrap_err();
+        assert_eq!(e.code, Code::SymlinkCreationUnavailable);
+        assert!(!fs.exists("/d/n"));
+        assert!(FileSystem::metadata(&fs, Path::new("/d/n")).is_err());
+    }
+
+    #[test]
+    fn rename_and_remove_carry_a_link_without_touching_its_target() {
+        use flux_fs::{DestinationRoot, DirHandle, Link, LinkKind};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.add_symlink_to("/d/l", "/d/t", LinkKind::File);
+        fs.write_file("/d/t", b"keep");
+        fs.rename_no_replace(Path::new("/d/l"), Path::new("/d/m")).unwrap();
+        assert_eq!(
+            FileSystem::read_link(&fs, Path::new("/d/m")).unwrap(),
+            Link { payload: "/d/t".into(), kind: LinkKind::File }
+        );
+        assert!(FileSystem::read_link(&fs, Path::new("/d/l")).is_err());
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        d.remove_file(OsStr::new("m")).unwrap();
+        assert!(FileSystem::read_link(&fs, Path::new("/d/m")).is_err());
+        assert_eq!(fs.read_file("/d/t").as_deref(), Some(&b"keep"[..]));
+    }
+
+    #[test]
+    fn a_fault_on_create_symlink_is_delivered() {
+        use flux_fs::{DestinationRoot, DirHandle, Link, LinkKind};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let link = Link { payload: "p".into(), kind: LinkKind::Unspecified };
+        fs.fail("create_symlink", Code::IoError);
+        let e = d.create_symlink(OsStr::new("n"), &link).unwrap_err();
+        assert_eq!(e.code, Code::IoError);
+        assert!(!fs.exists("/d/n"));
+        fs.fail("read_link", Code::PermissionDenied);
+        let e = FileSystem::read_link(&fs, Path::new("/d/n")).unwrap_err();
+        assert_eq!(e.code, Code::PermissionDenied);
     }
 }

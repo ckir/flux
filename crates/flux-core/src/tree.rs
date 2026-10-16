@@ -7,9 +7,9 @@ pub use crate::checkpoint::Discard;
 use crate::checkpoint::{Checkpoints, FileCkpt, Hook};
 use crate::copy::{
     BeforeCreate, BeforePublish, CopyError, CopyStep, Guard, Heartbeat, PublishIntent, Reuse,
-    Stage, Staged, SyncAt, copy_file_checkpointed, copy_file_guarded, discard, no_before_create,
-    no_before_publish, no_heartbeat, publish_staged, split_destination, stage_file,
-    sync_staged_many, unguarded, weaker,
+    Stage, Staged, SyncAt, copy_file_checkpointed, copy_file_guarded, discard, identity_gate,
+    no_before_create, no_before_publish, no_heartbeat, publish_staged, split_destination,
+    stage_file, sync_staged_many, unguarded, weaker,
 };
 use crate::names::{NameIndex, Resolved};
 use crate::state::{FLUX_DIR, RESERVED_DIRS, identity_text, native_hex};
@@ -17,8 +17,8 @@ use crate::walk::{Walk, WalkEvent, walk};
 use flux_fs::{
     ClaimKey, ClaimOutcome, ClaimRecord, ClaimStatus, ClaimStore, Code, CopyOptions,
     DestinationRoot, DirHandle, Durability, ExistingPolicy, FileIdentity, FileSystem, FileType,
-    FluxPathKey, FsError, Metadata, MetadataFailure, MountRoot, ObjectId, PreparedRecord, Preserve,
-    Publish, RecoveryOp, Safety,
+    FluxPathKey, FsError, Links, Metadata, MetadataFailure, MountRoot, ObjectId, PreparedRecord,
+    Preserve, Publish, RecoveryOp, Safety,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
@@ -47,6 +47,8 @@ pub struct TreeOutcome {
     pub files_degraded: u64,
     /// Special files skipped (§233.1). Not failures.
     pub special_files_skipped: u64,
+    /// Cut 10a: symlinks left out under `--links=skip` (§124). Not failures; the CLI adds them into `files_skipped`.
+    pub symlinks_skipped: u64,
     /// Part M: pre-existing destination directories whose mount-root query could not tell, merged into under
     /// `Safety::Default`. The example is relative to the source root, as `warnings` are.
     pub mount_unknown: Option<DegradedGroup>,
@@ -176,14 +178,14 @@ pub enum TreeFailureCause {
     /// One file's copy failed. `CopyError` intact, so a leftover temporary is still
     /// reported per file.
     Copy(CopyError),
-    /// A symlink: §25's default is to copy it AS a link, which this version cannot do,
-    /// so the action fails (the CLI renders `SYMLINK_CREATION_UNAVAILABLE`).
-    Symlink,
     /// NOT a failure: a device, socket or FIFO, skipped as §233.1 prescribes ("SKIP +
-    /// DURABLE WARNING") and streamed so each one is reported by its own record. The
-    /// one variant `FailureTally` does not count; `TreeOutcome` counts it in
-    /// `special_files_skipped`.
+    /// DURABLE WARNING") and streamed so each one is reported by its own record. Not
+    /// counted by `FailureTally`; `TreeOutcome` counts it in `special_files_skipped`.
     SpecialFileSkipped,
+    /// NOT a failure (cut 10a, §124): a symlink left out under `--links=skip`, nothing read from it and nothing
+    /// created. Not counted by `FailureTally`; `TreeOutcome` counts it in `symlinks_skipped`. A link that fails to be
+    /// copied is a `Copy` failure like a file's.
+    SymlinkSkipped,
     /// The file IS at the destination; some of its metadata could not be applied.
     /// Published with complaints, which exits 1 like the single-file case.
     PublishedWithComplaints(Vec<MetadataFailure>),
@@ -200,7 +202,6 @@ pub struct FailureTally {
     pub walk: u64,
     pub create_dir: u64,
     pub copy: u64,
-    pub symlink: u64,
     pub published_with_complaints: u64,
     pub claim_not_recorded: u64,
 }
@@ -211,7 +212,6 @@ impl FailureTally {
         self.walk
             + self.create_dir
             + self.copy
-            + self.symlink
             + self.published_with_complaints
             + self.claim_not_recorded
     }
@@ -228,10 +228,11 @@ impl FailureTally {
             TreeFailureCause::Walk(_) => self.walk += 1,
             TreeFailureCause::CreateDir(_) => self.create_dir += 1,
             TreeFailureCause::Copy(_) => self.copy += 1,
-            TreeFailureCause::Symlink => self.symlink += 1,
             // Not a failure (§233.1): `report` counts it in
             // `TreeOutcome::special_files_skipped`; named here so the match stays exhaustive.
             TreeFailureCause::SpecialFileSkipped => {}
+            // Not a failure (§124): `report` counts it in `TreeOutcome::symlinks_skipped`.
+            TreeFailureCause::SymlinkSkipped => {}
             TreeFailureCause::PublishedWithComplaints(_) => self.published_with_complaints += 1,
             TreeFailureCause::ClaimNotRecorded(_) => self.claim_not_recorded += 1,
         }
@@ -739,8 +740,11 @@ fn walk_into<F: DestinationRoot>(
             }
             WalkEvent::Symlink { path } => {
                 out.files_total += 1;
-                if live {
-                    report(out, on_report, path, TreeFailureCause::Symlink);
+                // Cut 10a: a link holds no writer, so the open-writers cap above does not apply to it.
+                if let Some(Frame::Live { dir, names, claim_parent, fresh, batch, .. }) =
+                    stack.last_mut()
+                {
+                    link_one(cx, dir, names, batch, *claim_parent, *fresh, path, out, on_report)?;
                 }
             }
             WalkEvent::Other { path } => {
@@ -1441,6 +1445,475 @@ fn copy_one<F: DestinationRoot>(
     }
 }
 
+/// Cut 10a: a `Symlink` event under a live frame (spec 3.2): a file entry with no bytes. It runs `copy_one`'s
+/// protocol (resolve, plan New or Replace, claim, publish through the temporary name, record) with the streaming
+/// replaced by one `create_symlink`, and its result goes through `finish_copy` exactly as a file's does, so the stops,
+/// the publish-failure mappings and the leftover collection are a file's. A link is never batched and never
+/// checkpointed. The link's target is never opened or stat'ed, on either side (§126).
+// One input per piece of frame state the protocol reads, as `copy_one`.
+#[allow(clippy::too_many_arguments)]
+fn link_one<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    parent: &F::Dir,
+    names: &mut NameIndex,
+    batch: &mut Batch<F::Writer>,
+    claim_parent: Option<ObjectId>,
+    fresh: bool,
+    path: PathBuf,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) -> std::result::Result<(), CopyError> {
+    // 1. A reserved control path is refused as a file's is, before anything is read.
+    if reserved_path(&path) {
+        let conflict = CopyError::at(CopyStep::Gate, reserved_conflict());
+        report(out, on_report, path, TreeFailureCause::Copy(conflict));
+        return Ok(());
+    }
+    // 2. `--links=skip` (§124): no source read, no destination touch.
+    if cx.opts.links == Links::Skip {
+        report(out, on_report, path, TreeFailureCause::SymlinkSkipped);
+        return Ok(());
+    }
+    let name_owned = path.file_name().expect("a walk path ends in a name").to_os_string();
+    let name = name_owned.as_os_str();
+    let src = cx.src_root.join(&path);
+
+    // 3. The payload, never followed. A junction or mounted-volume folder is a special file (D7).
+    let link = match cx.fs.read_link(&src) {
+        Ok(link) => link,
+        Err(e) if e.code == Code::SpecialFileUnsupported => {
+            report(out, on_report, path, TreeFailureCause::SpecialFileSkipped);
+            return Ok(());
+        }
+        Err(e) => {
+            return finish_copy(path, Err(CopyError::at(CopyStep::Source, e)), out, on_report);
+        }
+    };
+
+    // 4. Resolve and plan, as `copy_one` does.
+    let (Some(parent_id), Some(claims)) = (claim_parent, cx.claims) else {
+        // No claims for this directory: published as new, an existing name is a collision (as a file's). No batch
+        // exists without claims.
+        let published = publish_link(
+            cx,
+            parent,
+            names,
+            batch,
+            out,
+            on_report,
+            name,
+            &src,
+            &link,
+            Publish::NoReplace,
+            &no_before_create,
+            &no_before_publish,
+        )?;
+        return finish_copy(path, published, out, on_report);
+    };
+    let target = match FluxPathKey::from_relative(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            report(
+                out,
+                on_report,
+                path,
+                TreeFailureCause::Copy(CopyError::at(CopyStep::Resolve, e)),
+            );
+            return Ok(());
+        }
+    };
+    // The same aged/folded pre-check a file runs before resolving while a batch is pending (decisions 5(d), 5(f)).
+    let batching = cx.batch.files > 1
+        && cx.opts.durability == Durability::Strict
+        && claims.borrow().supports_prepared();
+    if batching && !batch.pending.is_empty() {
+        let aged = batch
+            .since
+            .is_some_and(|t| (cx.batch.now)().saturating_duration_since(t) >= cx.batch.age);
+        if aged || (cx.batch.fold_precheck && batch.folded.contains(&folded(name))) {
+            flush_batch(cx, parent, names, batch, out, on_report)?;
+        }
+    }
+
+    let resolved = if fresh { Ok(Ok(Resolved::Absent)) } else { names.resolve(parent, name) };
+    let plan = match resolved {
+        Err(e) => {
+            report(
+                out,
+                on_report,
+                path,
+                TreeFailureCause::Copy(CopyError::at(CopyStep::Resolve, e)),
+            );
+            return Ok(());
+        }
+        Ok(Err(_)) => {
+            let cause = target_failure(
+                CopyStep::Resolve,
+                Code::DestinationError,
+                "cannot determine the stored name of the destination entry",
+            );
+            report(out, on_report, path, cause);
+            return Ok(());
+        }
+        Ok(Ok(Resolved::Absent)) => Plan::New,
+        Ok(Ok(Resolved::Entry { stored, meta })) => {
+            // §241.5, before any policy decision.
+            if names.owner(&stored).is_some_and(|t| t != &target) {
+                let e = CopyError::at(
+                    CopyStep::Claim,
+                    FsError::new(
+                        Code::DestinationNamespaceCollision,
+                        std::io::Error::other(
+                            "another target of this operation already wrote that destination entry",
+                        ),
+                    ),
+                );
+                return finish_copy(path, Err(e), out, on_report);
+            }
+            // `--resume` (spec 3.4). The branch mutates nothing at the destination, so it neither beats nor guards.
+            if cx.resume {
+                let found = claims.borrow().get(&ClaimKey::new(parent_id, &stored));
+                match found {
+                    Err(e) => {
+                        return finish_copy(
+                            path,
+                            Err(CopyError::at(CopyStep::Claim, e)),
+                            out,
+                            on_report,
+                        );
+                    }
+                    Ok(Some(r)) if r.target == target => {
+                        // Resumed only when the claim says `Created` AND the destination is an equal link; anything
+                        // else falls through to the policy and republishes.
+                        if r.status == ClaimStatus::Created && same_link(parent, &stored, &link) {
+                            out.files_resumed += 1;
+                            names.record_publication(
+                                &target,
+                                Some(&stored),
+                                name,
+                                None,
+                                meta.identity,
+                            );
+                            return Ok(());
+                        }
+                    }
+                    Ok(Some(_)) => {
+                        let e = CopyError::at(
+                            CopyStep::Claim,
+                            FsError::new(
+                                Code::DestinationNamespaceCollision,
+                                std::io::Error::other(
+                                    "another target of this operation already claimed that destination entry",
+                                ),
+                            ),
+                        );
+                        return finish_copy(path, Err(e), out, on_report);
+                    }
+                    Ok(None) => {}
+                }
+            }
+            if meta.file_type == FileType::Dir {
+                let cause = target_failure(
+                    CopyStep::Gate,
+                    Code::DestinationError,
+                    "the destination is a directory",
+                );
+                report(out, on_report, path, cause);
+                return Ok(());
+            }
+            // §5.1 for a link (spec 3.3): sizes and times say nothing about a link, so `update_replaces` is not used.
+            let skip = match cx.opts.existing {
+                ExistingPolicy::Overwrite => false,
+                ExistingPolicy::SkipExisting => true,
+                // Skips an equal destination link only; a file, another link or an unreadable one is replaced.
+                ExistingPolicy::Update => same_link(parent, &stored, &link),
+            };
+            if skip {
+                out.files_skipped += 1;
+                return Ok(());
+            }
+            Plan::Replace { stored, meta }
+        }
+    };
+
+    // 5-6. Claim and publish, as `copy_one`'s unbatched plan arms do.
+    let own = |status| ClaimRecord { target: target.clone(), status };
+    let strict = cx.opts.durability == Durability::Strict && claims.borrow().supports_prepared();
+    let wrote = std::cell::Cell::new(false);
+    match plan {
+        Plan::New => {
+            let key = ClaimKey::new(parent_id, name);
+            let template = PreparedRecord {
+                target: target.clone(),
+                temp_name: Vec::new(),
+                identity: String::new(),
+                dir_path: note_dir(&path),
+                name: name.as_encoded_bytes().to_vec(),
+                planned_name: Vec::new(),
+                replacement: false,
+            };
+            let hook = |intent: &PublishIntent| write_note(claims, &key, &template, &wrote, intent);
+            let before_publish: &BeforePublish<'_> =
+                if strict { &hook } else { &no_before_publish };
+            let result = publish_link(
+                cx,
+                parent,
+                names,
+                batch,
+                out,
+                on_report,
+                name,
+                &src,
+                &link,
+                Publish::NoReplace,
+                &no_before_create,
+                before_publish,
+            )?;
+            discard_note_on_failure(claims, &key, &wrote, &result);
+            let published = result.as_ref().ok().map(|o| o.published_identity);
+            finish_copy(path.clone(), result, out, on_report)?;
+            if let Some(identity) = published {
+                let recorded = if strict {
+                    claims.borrow_mut().commit_prepared(&key, &target, None)
+                } else {
+                    record_claim(claims, &key, &own(ClaimStatus::Created))
+                };
+                if let Err(e) = recorded {
+                    report(out, on_report, path, TreeFailureCause::ClaimNotRecorded(e));
+                }
+                names.record_publication(&target, None, name, None, identity);
+            }
+            Ok(())
+        }
+        Plan::Replace { stored, meta } => {
+            let key_stored = ClaimKey::new(parent_id, &stored);
+            let before_create = || -> std::result::Result<(), CopyError> {
+                let claimed =
+                    claims.borrow_mut().insert_if_absent(&key_stored, &own(ClaimStatus::Existing));
+                match claimed {
+                    Ok(ClaimOutcome::Inserted) => Ok(()),
+                    // A target that finds its own claim proceeds.
+                    Ok(ClaimOutcome::Present(r)) if r.target == target => Ok(()),
+                    Ok(ClaimOutcome::Present(_)) => Err(CopyError::at(
+                        CopyStep::Claim,
+                        FsError::new(
+                            Code::DestinationNamespaceCollision,
+                            std::io::Error::other(
+                                "another target of this operation already claimed that destination entry",
+                            ),
+                        ),
+                    )),
+                    Err(e) => Err(CopyError::at(CopyStep::Claim, e)),
+                }
+            };
+            let template = PreparedRecord {
+                target: target.clone(),
+                temp_name: Vec::new(),
+                identity: String::new(),
+                dir_path: note_dir(&path),
+                name: stored.as_encoded_bytes().to_vec(),
+                planned_name: if name != stored {
+                    name.as_encoded_bytes().to_vec()
+                } else {
+                    Vec::new()
+                },
+                replacement: true,
+            };
+            let hook =
+                |intent: &PublishIntent| write_note(claims, &key_stored, &template, &wrote, intent);
+            let before_publish: &BeforePublish<'_> =
+                if strict { &hook } else { &no_before_publish };
+            let result = publish_link(
+                cx,
+                parent,
+                names,
+                batch,
+                out,
+                on_report,
+                name,
+                &src,
+                &link,
+                Publish::Replace,
+                &before_create,
+                before_publish,
+            )?;
+            discard_note_on_failure(claims, &key_stored, &wrote, &result);
+            let published = result.as_ref().ok().map(|o| o.published_identity);
+            finish_copy(path.clone(), result, out, on_report)?;
+            if let Some(identity) = published {
+                out.files_overwritten += 1;
+                let recorded = if strict {
+                    let planned = (name != stored).then(|| ClaimKey::new(parent_id, name));
+                    claims.borrow_mut().commit_prepared(&key_stored, &target, planned.as_ref())
+                } else {
+                    let mut recorded = claims.borrow_mut().upgrade_own_claim(&key_stored, &target);
+                    if name != stored {
+                        let planned = record_claim(
+                            claims,
+                            &ClaimKey::new(parent_id, name),
+                            &own(ClaimStatus::Created),
+                        );
+                        recorded = recorded.and(planned);
+                    }
+                    recorded
+                };
+                if let Err(e) = recorded {
+                    report(out, on_report, path, TreeFailureCause::ClaimNotRecorded(e));
+                }
+                let replaced = match meta.identity {
+                    FileIdentity::Strong(id) => Some(id),
+                    _ => None,
+                };
+                names.record_publication(&target, Some(&stored), name, replaced, identity);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Cut 10a: `link_one`'s gate and publish (spec 3.2, the end of step 4 and step 5). The source link's own metadata
+/// (never its target's) feeds the same `identity_gate` a file runs, every row. Then, in `stage_file`'s and
+/// `publish_staged`'s order: heartbeat and guard before every mutation; with entries pending and something at this
+/// operation's temporary name (on a folding destination, a pending sibling's temporary), the batch flushed first, since
+/// nothing there is removed while entries are pending; the leftover at the temporary name removed; heartbeat and guard,
+/// `before_create` (the Replace claim); the exclusive `create_symlink` at the temporary (refused `AlreadyExists` with
+/// entries pending: the batch flushed and the create made once more); its identity (a failure discards it);
+/// `before_publish` (the Strict note; a failure discards it); and the final heartbeat, guard and rename through
+/// `publish_staged` itself, so a heartbeat failure or a failed rename discards the temporary and a lost lock keeps it as
+/// the leftover. The outer `Err` is a stop from a flush (`flush_batch`'s), which the entry passes on unreported; the inner
+/// result is the entry's, for `finish_copy`.
+#[allow(clippy::too_many_arguments)]
+fn publish_link<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    parent: &F::Dir,
+    names: &mut NameIndex,
+    batch: &mut Batch<F::Writer>,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+    name: &std::ffi::OsStr,
+    src: &Path,
+    link: &flux_fs::Link,
+    publish: Publish,
+    before_create: &BeforeCreate<'_>,
+    before_publish: &BeforePublish<'_>,
+) -> std::result::Result<std::result::Result<flux_fs::Outcome, CopyError>, CopyError> {
+    let (degraded, temp) = match gate_link(cx, parent, name, src, publish) {
+        Ok(g) => g,
+        Err(e) => return Ok(Err(e)),
+    };
+    if !batch.pending.is_empty() && parent.metadata(&temp).is_ok() {
+        flush_batch(cx, parent, names, batch, out, on_report)?;
+        // The gate's heartbeat and guard predate the flush: take fresh ones before the removal below, as `stage_file`
+        // guards right before its own (review SC-1). Without a flush, the gate's pair is the one just before it.
+        if let Err(e) = (cx.beat)() {
+            return Ok(Err(CopyError::at(CopyStep::Heartbeat, e)));
+        }
+        if let Err(e) = (cx.guard)() {
+            return Ok(Err(CopyError::at(CopyStep::Create, e)));
+        }
+    }
+    // A leftover under this operation's own id (a crashed earlier attempt under `--resume`), as `stage_file` step 1
+    // removes it: `remove_file` unlinks a link and refuses a directory, which the create below then fails on. The batch
+    // is empty here whenever something was at `temp`.
+    let _ = parent.remove_file(&temp);
+
+    let create = || create_link(cx, parent, &temp, link, before_create);
+    let created = match create() {
+        // The second backstop (as `stage_into_batch`'s): the name may be a pending sibling's temporary.
+        Err(e)
+            if e.step == CopyStep::Create
+                && e.cause.source.kind() == ErrorKind::AlreadyExists
+                && !batch.pending.is_empty() =>
+        {
+            flush_batch(cx, parent, names, batch, out, on_report)?;
+            create()
+        }
+        created => created,
+    };
+    if let Err(e) = created {
+        // A failed create made nothing of ours.
+        return Ok(Err(e));
+    }
+    Ok(publish_created_link(cx, parent, name, temp, degraded, publish, before_publish))
+}
+
+/// `publish_link`'s gate: the source link's own metadata through `identity_gate`, then the heartbeat and the guard
+/// before the first mutation. Nothing of ours is on disk yet. Answers the gate's degraded identity and the temporary name.
+fn gate_link<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    parent: &F::Dir,
+    name: &std::ffi::OsStr,
+    src: &Path,
+    publish: Publish,
+) -> std::result::Result<(Option<FileIdentity>, OsString), CopyError> {
+    let src_meta = cx.fs.metadata(src).map_err(|e| CopyError::at(CopyStep::Source, e))?;
+    let gate = identity_gate(parent, name, &src_meta, cx.opts.safety, publish)?;
+    let temp = flux_fs::temp_path(Path::new(name), &cx.opts.operation_id).into_os_string();
+    (cx.beat)().map_err(|e| CopyError::at(CopyStep::Heartbeat, e))?;
+    (cx.guard)().map_err(|e| CopyError::at(CopyStep::Create, e))?;
+    Ok((gate.degraded, temp))
+}
+
+/// `publish_link`'s create, `stage_file`'s step-3 order: heartbeat, guard, `before_create`, the exclusive create.
+fn create_link<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    parent: &F::Dir,
+    temp: &std::ffi::OsStr,
+    link: &flux_fs::Link,
+    before_create: &BeforeCreate<'_>,
+) -> std::result::Result<(), CopyError> {
+    (cx.beat)().map_err(|e| CopyError::at(CopyStep::Heartbeat, e))?;
+    (cx.guard)().map_err(|e| CopyError::at(CopyStep::Create, e))?;
+    before_create()?;
+    parent.create_symlink(temp, link).map_err(|e| CopyError::at(CopyStep::Create, e))
+}
+
+/// `publish_link` after the create: the created link's identity, `before_publish`, then `publish_staged`.
+fn publish_created_link<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    parent: &F::Dir,
+    name: &std::ffi::OsStr,
+    temp: OsString,
+    degraded: Option<FileIdentity>,
+    publish: Publish,
+    before_publish: &BeforePublish<'_>,
+) -> std::result::Result<flux_fs::Outcome, CopyError> {
+    // The created link's own identity: the handle stat judges the name and never follows it.
+    let identity = match parent.metadata(&temp) {
+        Ok(m) => m.identity,
+        Err(e) => {
+            return Err(discard(parent, &temp, CopyStep::Create, e.code, e.source, cx.guard));
+        }
+    };
+    let intent = PublishIntent { temp: temp.clone(), identity };
+    if let Err(e) = before_publish(&intent) {
+        let CopyError { cause, leftover, step } = e;
+        let mut out = discard(parent, &temp, step, cause.code, cause.source, cx.guard);
+        if out.leftover.is_none() {
+            out.leftover = leftover;
+        }
+        return Err(out);
+    }
+    let staged = Staged {
+        temp,
+        identity,
+        bytes_copied: 0,
+        metadata_failures: vec![],
+        identity_degraded: degraded,
+        writer: None,
+        reused: 0,
+        discard: None,
+    };
+    publish_staged(parent, name, staged, publish, cx.guard, cx.beat)
+}
+
+/// Cut 10a (spec 3.3, 3.4): the one link equality rule, shared by `--update` and `--resume`: the destination entry at
+/// `stored` is a symlink whose `payload` AND `kind` equal `link`'s. A failing read (not a link, a junction, an I/O
+/// error) is "not equal", never a failed entry.
+fn same_link<D: DirHandle>(parent: &D, stored: &std::ffi::OsStr, link: &flux_fs::Link) -> bool {
+    parent.read_link(stored).is_ok_and(|l| l.payload == link.payload && l.kind == link.kind)
+}
+
 /// Cut 9d: `copy_one` for a batching target, after its plan: stage it into `batch` (spec decision 3), flushing first
 /// when it is itself at least `bytes` long (decision 5(b)) and after it when the batch reaches `files` or `bytes`
 /// (5(a)). An exclusive create refused with `AlreadyExists` while entries are pending flushes them and stages ONCE more
@@ -2037,8 +2510,19 @@ fn record_claim<C: ClaimStore>(
     key: &ClaimKey,
     record: &ClaimRecord,
 ) -> std::result::Result<(), FsError> {
-    match claims.borrow_mut().insert_if_absent(key, record)? {
+    // Bound first: the store's borrow ends here, before an upgrade borrows it again.
+    let found = claims.borrow_mut().insert_if_absent(key, record)?;
+    match found {
         ClaimOutcome::Inserted => Ok(()),
+        // Cut 10a (spec 3.2 step 5): a present own `Existing` claim, when `record` is `Created`, is upgraded, so a New
+        // publish that finds its own `Existing` claim (an earlier attempt's) leaves `Created` for the next `--resume`.
+        ClaimOutcome::Present(r)
+            if r.target == record.target
+                && r.status == ClaimStatus::Existing
+                && record.status == ClaimStatus::Created =>
+        {
+            claims.borrow_mut().upgrade_own_claim(key, &record.target)
+        }
         ClaimOutcome::Present(r) if r.target == record.target => Ok(()),
         ClaimOutcome::Present(_) => Err(FsError::new(
             Code::IoError,
@@ -2244,6 +2728,9 @@ pub(crate) fn report(
     if matches!(cause, TreeFailureCause::SpecialFileSkipped) {
         out.special_files_skipped += 1;
     }
+    if matches!(cause, TreeFailureCause::SymlinkSkipped) {
+        out.symlinks_skipped += 1;
+    }
     out.failures.count(&cause);
     on_report(TreeFailure { path, cause });
 }
@@ -2252,7 +2739,7 @@ pub(crate) fn report(
 mod tests {
     use super::*;
     use crate::fault_fs::FaultFs;
-    use flux_fs::{Code, Durability, FileSystem, ObjectId, OperationId, Preserve};
+    use flux_fs::{Code, Durability, FileSystem, LinkKind, Links, ObjectId, OperationId, Preserve};
     use std::ffi::OsStr;
 
     #[test]
@@ -2262,9 +2749,9 @@ mod tests {
         t.count(&TreeFailureCause::Walk(e()));
         t.count(&TreeFailureCause::CreateDir(e()));
         t.count(&TreeFailureCause::Copy(CopyError::at(crate::copy::CopyStep::Create, e())));
-        t.count(&TreeFailureCause::Symlink);
         t.count(&TreeFailureCause::PublishedWithComplaints(Vec::new()));
         t.count(&TreeFailureCause::SpecialFileSkipped);
+        t.count(&TreeFailureCause::SymlinkSkipped);
         t.count(&TreeFailureCause::ClaimNotRecorded(e()));
         assert_eq!(
             t,
@@ -2272,12 +2759,11 @@ mod tests {
                 walk: 1,
                 create_dir: 1,
                 copy: 1,
-                symlink: 1,
                 published_with_complaints: 1,
                 claim_not_recorded: 1
             }
         );
-        assert_eq!(t.total(), 6, "a skipped special file is not a failure");
+        assert_eq!(t.total(), 5, "a skipped special file or link is not a failure");
         assert!(!t.is_empty());
         assert!(FailureTally::default().is_empty());
     }
@@ -2308,6 +2794,7 @@ mod tests {
             safety: Safety::Default,
             operation_id: OperationId::new("op1"),
             existing: flux_fs::ExistingPolicy::Overwrite,
+            links: Links::Copy,
         }
     }
 
@@ -2748,20 +3235,956 @@ mod tests {
         assert_eq!(out.failures.published_with_complaints, 1);
     }
 
+    /// Cut 10a: `/` and `/src` holding only the links `(name, payload)`, kind `Unspecified`. `/dst` absent.
+    fn links(entries: &[(&str, &str)]) -> FaultFs {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/")).unwrap();
+        fs.create_dir(Path::new("/src")).unwrap();
+        for (name, payload) in entries {
+            fs.add_symlink_to(Path::new("/src").join(name), *payload, LinkKind::Unspecified);
+        }
+        fs
+    }
+
+    /// Cut 10a: the payload and kind of the link at `p`.
+    fn link_at(fs: &FaultFs, p: &str) -> flux_fs::Link {
+        FileSystem::read_link(fs, Path::new(p)).unwrap_or_else(|e| panic!("{p}: {e:?}"))
+    }
+
+    /// Cut 10a: the names under `dir` holding a temporary (`.flux-partial.`).
+    fn temps_in(fs: &FaultFs, dir: &str) -> Vec<OsString> {
+        fs.read_dir(Path::new(dir))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .filter(|n| n.to_string_lossy().contains(".flux-partial."))
+            .collect()
+    }
+
+    /// Cut 10a: the one `Copy` record in `got`, for `path`.
+    fn only_copy_failure<'a>(got: &'a [TreeFailure], path: &str) -> &'a CopyError {
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].path, Path::new(path));
+        match &got[0].cause {
+            TreeFailureCause::Copy(e) => e,
+            other => panic!("expected Copy, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn a_symlink_is_a_failure_and_never_copied() {
-        let fs = tree();
-        fs.add_symlink("/src/link");
+    fn links_are_recreated_with_their_payloads_and_count_as_copied_with_no_bytes() {
+        // Spec test 1 (I1, I2). Mutant: the payload altered on create.
+        let fs = links(&[("rel", "a/b"), ("abs", "/x/y"), ("dangling", "nowhere")]);
+        fs.write_file("/src/f", b"FILE");
 
         let (r, got) = run(&fs, "/src", "/dst", &opts());
 
         let out = r.unwrap();
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].path, Path::new("link"));
-        assert!(matches!(got[0].cause, TreeFailureCause::Symlink));
-        assert!(!fs.exists("/dst/link"));
-        assert_eq!(out.failures.symlink, 1);
-        assert_eq!(out.special_files_skipped, 0);
+        assert!(got.is_empty(), "{got:?}");
+        for n in ["rel", "abs", "dangling"] {
+            assert_eq!(
+                link_at(&fs, &format!("/dst/{n}")),
+                link_at(&fs, &format!("/src/{n}")),
+                "{n}"
+            );
+        }
+        assert_eq!(link_at(&fs, "/dst/rel").payload, "a/b");
+        assert_eq!(fs.read_file("/dst/f").as_deref(), Some(&b"FILE"[..]));
+        assert_eq!(out.files_copied, 4);
+        assert_eq!(out.bytes_copied, 4, "only the file's bytes");
+        assert_eq!(out.files_total, 4);
+        assert!(out.failures.is_empty());
+        assert!(temps_in(&fs, "/dst").is_empty());
+        // I2: no target is ever opened or stat'ed, on either side.
+        let c = log(&fs);
+        for t in ["/src/a/b", "/x/y", "/src/nowhere", "/dst/a/b", "/dst/nowhere"] {
+            assert!(
+                !c.iter()
+                    .any(|x| x == &format!("open_read({t})") || x == &format!("metadata({t})")),
+                "{t} was followed: {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_existing_file_at_a_links_name_is_replaced_under_overwrite() {
+        // Spec test 5, first row.
+        let fs = links(&[("n", "payload")]);
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.write_file("/dst/n", b"old");
+
+        let (r, out, got) = batched(&fs, policy(1), Durability::Normal);
+
+        r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(link_at(&fs, "/dst/n").payload, "payload");
+        assert_eq!((out.files_copied, out.files_overwritten), (1, 1));
+        assert_eq!(
+            fs.claim(strong_id(&fs, "/dst"), "n").map(|r| r.status),
+            Some(ClaimStatus::Created)
+        );
+        assert!(temps_in(&fs, "/dst").is_empty());
+    }
+
+    #[test]
+    fn a_directory_at_a_links_name_is_refused() {
+        let fs = links(&[("n", "payload")]);
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.create_dir(Path::new("/dst/n")).unwrap();
+        fs.write_file("/dst/n/keep", b"K");
+
+        let (r, out, got) = batched(&fs, policy(1), Durability::Normal);
+
+        r.unwrap();
+        let e = only_copy_failure(&got, "n");
+        assert_eq!(e.code(), Code::DestinationError);
+        assert_eq!(fs.read_file("/dst/n/keep").as_deref(), Some(&b"K"[..]), "the dir untouched");
+        assert!(FileSystem::read_link(&fs, Path::new("/dst/n")).is_err());
+        assert!(!fs.called("create_symlink("));
+        assert_eq!(out.files_copied, 0);
+    }
+
+    /// Cut 10a test audit: a file entry and a link entry are one protocol, so the same scenario is run over both and
+    /// must end the same way. Each arm of `link_one` duplicates `copy_one`'s; a fix made to one and not the other turns
+    /// the arm for the other kind red here.
+    #[test]
+    fn a_file_and_a_link_entry_end_alike_at_each_step() {
+        #[derive(Clone, Copy, Debug)]
+        enum Entry {
+            File,
+            Link,
+        }
+        let seed = |entry: Entry| -> FaultFs {
+            match entry {
+                Entry::File => {
+                    let fs = FaultFs::new();
+                    fs.create_dir(Path::new("/")).unwrap();
+                    fs.create_dir(Path::new("/src")).unwrap();
+                    fs.write_file("/src/n", b"N");
+                    fs
+                }
+                Entry::Link => links(&[("n", "payload")]),
+            }
+        };
+        for entry in [Entry::File, Entry::Link] {
+            // Success: one entry published, no temporary left.
+            let fs = seed(entry);
+            let (r, got) = run(&fs, "/src", "/dst", &opts());
+            let out = r.unwrap();
+            assert!(got.is_empty(), "{entry:?}: {got:?}");
+            assert_eq!(out.files_copied, 1, "{entry:?}");
+            assert!(fs.exists("/dst/n"), "{entry:?}");
+            assert!(temps_in(&fs, "/dst").is_empty(), "{entry:?}");
+
+            // A refused publish: reported at Publish, the temporary removed, nothing at the name.
+            let fs = seed(entry);
+            fs.fail("rename_no_replace", Code::IoError);
+            let (r, got) = run(&fs, "/src", "/dst", &opts());
+            let out = r.unwrap();
+            let e = only_copy_failure(&got, "n");
+            assert_eq!(e.step, CopyStep::Publish, "{entry:?}");
+            assert!(e.leftover.is_none(), "{entry:?}: the temporary was removed");
+            assert!(!fs.exists("/dst/n"), "{entry:?}");
+            assert!(temps_in(&fs, "/dst").is_empty(), "{entry:?}");
+            assert_eq!(out.files_copied, 0, "{entry:?}");
+
+            // A directory at the name: refused, the directory untouched, nothing staged.
+            let fs = seed(entry);
+            fs.create_dir(Path::new("/dst")).unwrap();
+            fs.create_dir(Path::new("/dst/n")).unwrap();
+            fs.write_file("/dst/n/keep", b"K");
+            let (r, got) = run(&fs, "/src", "/dst", &opts());
+            let out = r.unwrap();
+            let e = only_copy_failure(&got, "n");
+            // Under `Publish::Replace` and `Overwrite` the identity gate refuses a directory first, for both kinds.
+            assert_eq!(
+                (e.code(), e.step),
+                (Code::SafetyRejected, CopyStep::Gate),
+                "{entry:?}: {e:?}"
+            );
+            assert_eq!(fs.read_file("/dst/n/keep").as_deref(), Some(&b"K"[..]), "{entry:?}");
+            assert!(temps_in(&fs, "/dst").is_empty(), "{entry:?}");
+            assert_eq!(out.files_copied, 0, "{entry:?}");
+        }
+    }
+
+    #[test]
+    fn a_link_and_a_file_folding_to_one_name_collide() {
+        // Spec test 6, §241.5.
+        let fs = links(&[("a", "payload")]);
+        fs.write_file("/src/A", b"upper");
+        fs.set_case_insensitive(true);
+
+        let (r, out, got) = batched(&fs, policy(1), Durability::Normal);
+
+        r.unwrap();
+        let e = only_copy_failure(&got, "a");
+        assert_eq!(e.code(), Code::DestinationNamespaceCollision);
+        assert_eq!(fs.read_file("/dst/A").as_deref(), Some(&b"upper"[..]));
+        let objects: Vec<OsString> = fs
+            .read_dir(Path::new("/dst"))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .filter(|n| n != "state.db")
+            .collect();
+        assert_eq!(objects, [OsString::from("A")], "exactly one object at the destination");
+        assert!(!fs.called("create_symlink("));
+        assert_eq!(out.files_copied, 1);
+    }
+
+    #[test]
+    fn a_failed_read_link_is_a_source_step_failure() {
+        let fs = tree();
+        fs.add_symlink_to("/src/l", "payload", LinkKind::Unspecified);
+        fs.fail("read_link", Code::IoError);
+
+        let (r, got) = run(&fs, "/src", "/dst", &opts());
+
+        let out = r.unwrap();
+        let e = only_copy_failure(&got, "l");
+        assert_eq!(e.step, CopyStep::Source);
+        assert!(!fs.exists("/dst/l"));
+        assert!(!fs.called("create_symlink("));
+        assert_eq!((out.files_copied, out.failures.copy), (2, 1));
+    }
+
+    #[test]
+    fn a_failed_create_symlink_leaves_nothing() {
+        let fs = tree();
+        fs.add_symlink_to("/src/l", "payload", LinkKind::Unspecified);
+        fs.fail("create_symlink", Code::IoError);
+
+        let (r, got) = run(&fs, "/src", "/dst", &opts());
+
+        let out = r.unwrap();
+        let e = only_copy_failure(&got, "l");
+        assert_eq!(e.step, CopyStep::Create);
+        assert!(e.leftover.is_none());
+        assert!(!fs.exists("/dst/l"));
+        assert!(temps_in(&fs, "/dst").is_empty());
+        assert_eq!((out.files_copied, out.failures.copy), (2, 1));
+    }
+
+    #[test]
+    fn an_unavailable_creation_is_reported_with_its_code_and_the_files_still_copy() {
+        // Spec test 4. Mutant: the code mapped to IO_ERROR.
+        let fs = links(&[("l1", "a"), ("l2", "/b"), ("l3", "c/d")]);
+        fs.write_file("/src/f", b"F");
+        fs.set_symlinks_unavailable(true);
+
+        let (r, got) = run(&fs, "/src", "/dst", &opts());
+
+        let out = r.unwrap();
+        assert_eq!(got.len(), 3, "{got:?}");
+        for f in &got {
+            let TreeFailureCause::Copy(e) = &f.cause else { panic!("{got:?}") };
+            assert_eq!(e.code(), Code::SymlinkCreationUnavailable, "{:?}", f.path);
+            assert_eq!(e.step, CopyStep::Create);
+        }
+        assert_eq!(out.failures.copy, 3);
+        assert_eq!(out.files_copied, 1);
+        assert_eq!(fs.read_file("/dst/f").as_deref(), Some(&b"F"[..]));
+        assert!(temps_in(&fs, "/dst").is_empty(), "no temp names left");
+        for n in ["l1", "l2", "l3"] {
+            assert!(!fs.exists(format!("/dst/{n}")), "{n}");
+        }
+    }
+
+    #[test]
+    fn a_failed_rename_discards_the_temporary() {
+        let fs = links(&[("n", "payload")]);
+        fs.fail("rename_no_replace", Code::IoError);
+
+        let (r, got) = run(&fs, "/src", "/dst", &opts());
+
+        let out = r.unwrap();
+        let e = only_copy_failure(&got, "n");
+        assert_eq!(e.step, CopyStep::Publish);
+        assert!(e.leftover.is_none(), "the temporary was removed");
+        assert!(!fs.exists("/dst/n.flux-partial.op1"));
+        assert!(!fs.exists("/dst/n"));
+        assert!(
+            fs.called("create_symlink(/dst/n.flux-partial.op1)"),
+            "precondition: it was created"
+        );
+        assert_eq!(out.files_copied, 0);
+    }
+
+    #[test]
+    fn a_reserved_root_link_is_refused_before_it_is_read() {
+        // Spec test 10.
+        let fs = links(&[]);
+        fs.create_dir(Path::new("/src/.flux")).unwrap();
+        fs.add_symlink_to("/src/.flux/operations", "/elsewhere", LinkKind::Unspecified);
+
+        let (r, got) = run(&fs, "/src", "/dst", &opts());
+
+        r.unwrap();
+        let e = only_copy_failure(&got, ".flux/operations");
+        assert_eq!(e.step, CopyStep::Gate);
+        assert_eq!(e.code(), Code::ControlPlaneNamespaceConflict);
+        assert!(!fs.called("read_link(/src/.flux/operations)"), "{:?}", fs.calls());
+        assert!(!fs.called("create_symlink("));
+    }
+
+    #[test]
+    fn a_root_dot_flux_link_follows_the_rule_a_root_dot_flux_file_follows() {
+        // R8: only `.flux/operations`, `.flux/standalone`, `.flux/atomic` and below are reserved; a root `.flux` entry
+        // is ordinary data, so the same name as a file and as a link is copied the same way.
+        let file = links(&[]);
+        file.write_file("/src/.flux", b"data");
+        let (r, got) = run(&file, "/src", "/dst", &opts());
+        let as_file = r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(file.read_file("/dst/.flux").as_deref(), Some(&b"data"[..]));
+
+        let link = links(&[(".flux", "/elsewhere")]);
+        let (r, got) = run(&link, "/src", "/dst", &opts());
+        let as_link = r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(link_at(&link, "/dst/.flux").payload, "/elsewhere");
+        assert!(link.called("read_link(/src/.flux)"), "not refused before the read");
+
+        assert_eq!(
+            (as_link.files_copied, as_link.failures.total()),
+            (as_file.files_copied, as_file.failures.total()),
+            "a link follows the file rule"
+        );
+        assert_eq!(as_link.files_copied, 1);
+    }
+
+    #[test]
+    fn a_link_named_dot_flux_below_the_root_is_ordinary_data() {
+        // Review Focus 4.
+        let fs = tree();
+        fs.add_symlink_to("/src/sub/.flux", "payload", LinkKind::Unspecified);
+
+        let (r, got) = run(&fs, "/src", "/dst", &opts());
+
+        let out = r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(link_at(&fs, "/dst/sub/.flux").payload, "payload");
+        assert_eq!(out.files_copied, 3);
+    }
+
+    #[test]
+    fn a_junction_classified_link_is_a_skipped_special_file() {
+        // Spec test 13, D7.
+        let fs = tree();
+        fs.add_symlink_to("/src/j", "payload", LinkKind::Dir);
+        fs.fail_kind("read_link", Code::SpecialFileUnsupported, std::io::ErrorKind::Other);
+
+        let (r, got) = run(&fs, "/src", "/dst", &opts());
+
+        let out = r.unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].path, Path::new("j"));
+        assert!(matches!(got[0].cause, TreeFailureCause::SpecialFileSkipped));
+        assert_eq!(out.special_files_skipped, 1);
+        assert_eq!(out.failures.copy, 0, "files_failed is the copy failures");
+        assert!(out.failures.is_empty());
+        assert!(!fs.exists("/dst/j"));
+        assert_eq!(out.files_copied, 2);
+    }
+
+    #[test]
+    fn a_destination_that_is_the_source_link_by_identity_is_refused() {
+        // Spec test 11.
+        let fs = links(&[("l", "payload")]);
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.write_file("/dst/l", b"keep");
+        let same = FileIdentity::Strong(ObjectId { volume: 77, index: 7 });
+        fs.set_identity("/src/l", same);
+        fs.set_identity("/dst/l", same);
+
+        let (r, got) = run(&fs, "/src", "/dst", &opts());
+
+        let out = r.unwrap();
+        let e = only_copy_failure(&got, "l");
+        assert_eq!(e.code(), Code::SafetyRejected);
+        assert_eq!(e.step, CopyStep::Gate);
+        assert_eq!(fs.read_file("/dst/l").as_deref(), Some(&b"keep"[..]));
+        assert!(!fs.called("create_symlink("));
+        assert_eq!(out.files_copied, 0);
+    }
+
+    /// Cut 10a task 4: `batched_with` under the copy options `o` (durability included), `--resume` as `resume`, and
+    /// `seed` run on the fresh claim store, with `/dst`'s id, before the walk.
+    fn link_run(
+        fs: &FaultFs,
+        o: &CopyOptions,
+        resume: bool,
+        policy: BatchPolicy,
+        guard: &Guard<'_>,
+        seed: impl FnOnce(&mut crate::fault_fs::FakeClaimStore, ObjectId),
+    ) -> (std::result::Result<(), CopyError>, TreeOutcome, Vec<TreeFailure>) {
+        let source = prepare_source(fs, Path::new("/src"), Path::new("/dst")).unwrap();
+        if !fs.exists(Path::new("/dst")) {
+            fs.create_dir(Path::new("/dst")).unwrap();
+        }
+        let root = fs.destination_root(Path::new("/dst")).unwrap();
+        let mut store = root.create_claim_store(OsStr::new("state.db"), o.durability).unwrap();
+        seed(&mut store, strong_id(fs, "/dst"));
+        let claims = std::cell::RefCell::new(store);
+        let cx = Shared {
+            fs,
+            src_root: Path::new("/src"),
+            src_identity: source.identity,
+            opts: o,
+            guard,
+            beat: &no_heartbeat,
+            claims: Some(&claims),
+            resume,
+            batch: policy,
+            ckpt: None,
+        };
+        let mut out = TreeOutcome::default();
+        let mut got = Vec::new();
+        let (_root, r) =
+            copy_tree_at(&cx, source.events, root, false, &mut out, &mut |f| got.push(f));
+        (r, out, got)
+    }
+
+    fn no_seed(_: &mut crate::fault_fs::FakeClaimStore, _: ObjectId) {}
+
+    fn with_existing(policy: flux_fs::ExistingPolicy) -> CopyOptions {
+        CopyOptions { existing: policy, ..opts() }
+    }
+
+    fn key_of(rel: &str) -> FluxPathKey {
+        FluxPathKey::from_relative(Path::new(rel)).unwrap()
+    }
+
+    #[test]
+    fn update_skips_an_equal_link_and_replaces_a_different_one_or_a_file() {
+        // Spec 3.3 and test 5. Mutant: `--update` comparing payload lengths (`diff` has an equal-length payload).
+        let fs = links(&[("diff", "abcd"), ("eq", "same/x"), ("file", "p"), ("kind", "k")]);
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.add_symlink_to("/dst/eq", "same/x", LinkKind::Unspecified);
+        fs.add_symlink_to("/dst/diff", "wxyz", LinkKind::Unspecified);
+        fs.write_file("/dst/file", b"old");
+        fs.add_symlink_to("/dst/kind", "k", LinkKind::File);
+        let eq_identity = identity_of(&fs, "/dst/eq");
+
+        let o = with_existing(flux_fs::ExistingPolicy::Update);
+        let (r, out, got) = link_run(&fs, &o, false, policy(1), &unguarded, no_seed);
+
+        r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(out.files_skipped, 1, "only the equal link");
+        assert_eq!(out.bytes_skipped, 0);
+        assert_eq!((out.files_copied, out.files_overwritten), (3, 3));
+        assert_eq!(link_at(&fs, "/dst/eq").payload, "same/x");
+        assert_eq!(identity_of(&fs, "/dst/eq"), eq_identity, "the equal link untouched");
+        assert!(!fs.called("create_symlink(/dst/eq.flux-partial.op1)"), "{:?}", fs.calls());
+        assert_eq!(link_at(&fs, "/dst/diff").payload, "abcd", "equal length, different payload");
+        assert_eq!(link_at(&fs, "/dst/file").payload, "p", "a file at the name is replaced");
+        assert_eq!(
+            link_at(&fs, "/dst/kind"),
+            flux_fs::Link { payload: "k".into(), kind: LinkKind::Unspecified },
+            "the same payload with another kind is different"
+        );
+        assert!(temps_in(&fs, "/dst").is_empty());
+    }
+
+    #[test]
+    fn update_treats_an_unreadable_destination_link_as_different() {
+        // Review Focus 2: a failed `read_link` of the destination is "not equal", never a failed entry.
+        let fs = links(&[("n", "p")]);
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.add_symlink_to("/dst/n", "p", LinkKind::Unspecified);
+        // The source read is the first `read_link`, the destination's the second.
+        fs.fail_nth("read_link", 2, Code::SpecialFileUnsupported, ErrorKind::Other);
+
+        let o = with_existing(flux_fs::ExistingPolicy::Update);
+        let (r, out, got) = link_run(&fs, &o, false, policy(1), &unguarded, no_seed);
+
+        r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        let reads: Vec<String> =
+            log(&fs).into_iter().filter(|c| c.starts_with("read_link(")).collect();
+        assert_eq!(reads[..2], ["read_link(/src/n)", "read_link(/dst/n)"], "{reads:?}");
+        assert_eq!((out.files_skipped, out.files_copied, out.files_overwritten), (0, 1, 1));
+        assert!(fs.called("create_symlink(/dst/n.flux-partial.op1)"));
+        assert_eq!(link_at(&fs, "/dst/n").payload, "p");
+    }
+
+    #[test]
+    fn skip_existing_skips_whatever_holds_the_name() {
+        // Spec 3.3: a file, a link and a dangling link at the name.
+        let fs = links(&[("d", "p"), ("f", "p"), ("l", "p")]);
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.write_file("/dst/f", b"old");
+        fs.add_symlink_to("/dst/l", "other", LinkKind::Unspecified);
+        fs.add_symlink_to("/dst/d", "/nowhere/at/all", LinkKind::Unspecified);
+
+        let o = with_existing(flux_fs::ExistingPolicy::SkipExisting);
+        let (r, out, got) = link_run(&fs, &o, false, policy(1), &unguarded, no_seed);
+
+        r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!((out.files_skipped, out.files_copied, out.bytes_skipped), (3, 0, 0));
+        assert!(!fs.called("create_symlink("));
+        assert_eq!(fs.read_file("/dst/f").as_deref(), Some(&b"old"[..]));
+        assert_eq!(link_at(&fs, "/dst/l").payload, "other");
+        assert_eq!(link_at(&fs, "/dst/d").payload, "/nowhere/at/all");
+    }
+
+    #[test]
+    fn a_created_link_claim_with_the_same_payload_is_resumed_and_a_different_one_republished() {
+        // Spec 3.4 and test 7. Mutant: resume trusting the claim alone.
+        let seeded = |status| {
+            move |s: &mut crate::fault_fs::FakeClaimStore, dst: ObjectId| {
+                let record = ClaimRecord { target: key_of("n"), status };
+                s.insert_if_absent(&ClaimKey::new(dst, OsStr::new("n")), &record).unwrap();
+            }
+        };
+
+        let fs = links(&[("n", "p")]);
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.add_symlink_to("/dst/n", "p", LinkKind::Unspecified);
+        let (r, out, got) =
+            link_run(&fs, &opts(), true, policy(1), &unguarded, seeded(ClaimStatus::Created));
+        r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!((out.files_resumed, out.bytes_resumed, out.files_copied), (1, 0, 0));
+        assert!(!fs.called("create_symlink("), "{:?}", fs.calls());
+
+        let fs = links(&[("n", "p")]);
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.add_symlink_to("/dst/n", "q", LinkKind::Unspecified);
+        let (r, out, got) =
+            link_run(&fs, &opts(), true, policy(1), &unguarded, seeded(ClaimStatus::Created));
+        r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!((out.files_resumed, out.files_copied, out.files_overwritten), (0, 1, 1));
+        assert_eq!(link_at(&fs, "/dst/n").payload, "p", "republished");
+
+        // An `Existing` claim (an earlier attempt that never published) is not resumed, even with an equal link.
+        let fs = links(&[("n", "p")]);
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.add_symlink_to("/dst/n", "p", LinkKind::Unspecified);
+        let (r, out, got) =
+            link_run(&fs, &opts(), true, policy(1), &unguarded, seeded(ClaimStatus::Existing));
+        r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!((out.files_resumed, out.files_copied), (0, 1));
+    }
+
+    #[test]
+    fn a_resumed_link_owns_its_name_for_the_rest_of_the_directory() {
+        // Spec 3.4: `names.record_publication` on resume, so a later entry folding to the name meets §241.5's
+        // `names.owner` refusal before it reads the claim store (`A` sorts before `a`).
+        let fs = links(&[("A", "p")]);
+        fs.write_file("/src/a", b"lower");
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.add_symlink_to("/dst/A", "p", LinkKind::Unspecified);
+        fs.set_case_insensitive(true);
+        let seed = |s: &mut crate::fault_fs::FakeClaimStore, dst: ObjectId| {
+            let record = ClaimRecord { target: key_of("A"), status: ClaimStatus::Created };
+            s.insert_if_absent(&ClaimKey::new(dst, OsStr::new("A")), &record).unwrap();
+        };
+        let (r, out, got) = link_run(&fs, &opts(), true, policy(1), &unguarded, seed);
+        r.unwrap();
+        assert_eq!(out.files_resumed, 1);
+        let e = only_copy_failure(&got, "a");
+        assert_eq!((e.code(), e.step), (Code::DestinationNamespaceCollision, CopyStep::Claim));
+        let c = log(&fs);
+        assert_eq!(count(&c, "claim_get(A)"), 1, "the file is refused by the owner check: {c:?}");
+        assert_eq!(link_at(&fs, "/dst/A").payload, "p");
+        assert_eq!(out.files_copied, 0);
+    }
+
+    #[test]
+    fn a_strict_run_notes_the_link_before_the_rename_and_commits_after() {
+        // Spec test 8. Mutant: commit without the note.
+        let fs = links(&[("n", "p")]);
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let at_rename = std::sync::Arc::clone(&seen);
+        fs.on_nth("rename_no_replace", 1, move |fs| {
+            at_rename.store(fs.prepared_count(), std::sync::atomic::Ordering::SeqCst);
+        });
+        let o = CopyOptions { durability: Durability::Strict, ..opts() };
+
+        let (r, out, got) = link_run(&fs, &o, false, policy(1), &unguarded, no_seed);
+
+        r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the note precedes the rename"
+        );
+        assert_eq!(fs.prepared_count(), 0, "committed after");
+        assert_eq!(
+            fs.claim(strong_id(&fs, "/dst"), "n").map(|r| r.status),
+            Some(ClaimStatus::Created)
+        );
+        let c = log(&fs);
+        assert!(
+            first(&c, "claim_prepare(") < renamed(&c, "n")
+                && renamed(&c, "n") < first(&c, "claim_commit_prepared("),
+            "{c:?}"
+        );
+        assert_eq!(out.files_copied, 1);
+
+        let fs = links(&[("n", "p")]);
+        fs.fail_nth("rename_no_replace", 1, Code::IoError, ErrorKind::Other);
+        let (r, out, got) = link_run(&fs, &o, false, policy(1), &unguarded, no_seed);
+        r.unwrap();
+        let e = only_copy_failure(&got, "n");
+        assert_eq!(e.step, CopyStep::Publish);
+        assert!(fs.called("claim_prepare("), "precondition: the note was written");
+        assert_eq!(fs.prepared_count(), 0, "the note is discarded");
+        assert!(temps_in(&fs, "/dst").is_empty(), "the temporary is discarded");
+        assert!(!fs.exists("/dst/n"));
+        assert_eq!(out.files_copied, 0);
+    }
+
+    #[test]
+    fn a_pending_batch_is_flushed_before_a_link_touches_an_occupied_temp_name() {
+        // Spec test 4c: a batched file `A` pending, then a link `a` on a folding destination, with the ASCII pre-check
+        // off (as `a_fold_equal_pending_temporary_is_never_swept`), so only the temp probe can flush. Mutant: the probe's
+        // flush removed (the link's leftover removal unlinks the file's temporary and its publish fails).
+        let fs = sources(&[("A", b"upper")]);
+        fs.add_symlink_to("/src/a", "p", LinkKind::Unspecified);
+        fs.set_case_insensitive(true);
+        let o = CopyOptions { durability: Durability::Strict, ..opts() };
+        let p = BatchPolicy { fold_precheck: false, ..policy(64) };
+
+        let (r, out, got) = link_run(&fs, &o, false, p, &unguarded, no_seed);
+
+        r.unwrap();
+        let c = log(&fs);
+        assert_eq!(fs.read_file("/dst/A").as_deref(), Some(&b"upper"[..]), "{c:?}");
+        let e = only_copy_failure(&got, "a");
+        assert_eq!(e.code(), Code::DestinationNamespaceCollision, "{e:?}");
+        // Between the file's staging and its publish, nothing removes a temporary under either spelling.
+        let (staged, published) = (created(&c, "A"), renamed(&c, "A"));
+        for removal in
+            ["remove_file(/dst/A.flux-partial.op1)", "remove_file(/dst/a.flux-partial.op1)"]
+        {
+            assert!(
+                positions(&c, removal).iter().all(|&i| i < staged || i > published),
+                "{removal}: {c:?}"
+            );
+        }
+        assert!(published < first(&c, "create_symlink(/dst/a.flux-partial.op1)"), "{c:?}");
+        assert_eq!(out.files_copied, 1);
+        assert!(temps_in(&fs, "/dst").is_empty(), "{c:?}");
+    }
+
+    #[test]
+    fn a_link_create_refused_already_exists_with_pending_entries_flushes_and_retries_once() {
+        // Spec 3.2 step 5, the second backstop.
+        let fs = sources(&[("a", b"A")]);
+        fs.add_symlink_to("/src/b", "p", LinkKind::Unspecified);
+        fs.fail_nth("create_symlink", 1, Code::IoError, ErrorKind::AlreadyExists);
+        let o = CopyOptions { durability: Durability::Strict, ..opts() };
+
+        let (r, out, got) = link_run(&fs, &o, false, policy(64), &unguarded, no_seed);
+
+        r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        let c = log(&fs);
+        let creates = positions(&c, "create_symlink(/dst/b.flux-partial.op1)");
+        assert_eq!(creates.len(), 2, "{c:?}");
+        assert!(creates[0] < renamed(&c, "a") && renamed(&c, "a") < creates[1], "{c:?}");
+        assert_eq!(link_at(&fs, "/dst/b").payload, "p");
+        assert_eq!(out.files_copied, 2);
+
+        // A collision that persists is retried once only, and fails the entry at `Create`.
+        let fs = sources(&[("a", b"A")]);
+        fs.add_symlink_to("/src/b", "p", LinkKind::Unspecified);
+        fs.fail_kind("create_symlink", Code::IoError, ErrorKind::AlreadyExists);
+        fs.fail_always("create_symlink", Code::IoError);
+        let (r, out, got) = link_run(&fs, &o, false, policy(64), &unguarded, no_seed);
+        r.unwrap();
+        let c = log(&fs);
+        assert_eq!(positions(&c, "create_symlink(/dst/b.flux-partial.op1)").len(), 2, "{c:?}");
+        let e = only_copy_failure(&got, "b");
+        assert_eq!((e.code(), e.step), (Code::IoError, CopyStep::Create), "{e:?}");
+        assert_eq!(fs.read_file("/dst/a").as_deref(), Some(&b"A"[..]));
+        assert_eq!(out.files_copied, 1);
+
+        // With nothing pending there is no retry.
+        let fs = links(&[("b", "p")]);
+        fs.fail_nth("create_symlink", 1, Code::IoError, ErrorKind::AlreadyExists);
+        let (r, _, got) = link_run(&fs, &o, false, policy(64), &unguarded, no_seed);
+        r.unwrap();
+        assert_eq!(count(&log(&fs), "create_symlink("), 1);
+        assert_eq!(only_copy_failure(&got, "b").step, CopyStep::Create);
+    }
+
+    #[test]
+    fn a_weak_source_identity_on_a_replace_is_degraded_or_refused_under_strict_safety() {
+        // Spec test 4b (the gate's `NotFound` row never degrades, so the name is taken). Mutant: the gate called with
+        // only its equality row.
+        let weak = FileIdentity::Weak(ObjectId { volume: 5, index: 9 });
+        let fs = links(&[("n", "p")]);
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.write_file("/dst/n", b"old");
+        fs.set_identity("/src/n", weak);
+        let (r, out, got) = link_run(&fs, &opts(), false, policy(1), &unguarded, no_seed);
+        r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!((out.files_copied, out.files_degraded), (1, 1));
+        assert_eq!(out.warnings.weak[&5], DegradedGroup { count: 1, example: PathBuf::from("n") });
+        assert_eq!(link_at(&fs, "/dst/n").payload, "p");
+
+        let fs = links(&[("n", "p")]);
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.write_file("/dst/n", b"old");
+        fs.set_identity("/src/n", weak);
+        let (r, out, got) = link_run(&fs, &strict(), false, policy(1), &unguarded, no_seed);
+        r.unwrap();
+        let e = only_copy_failure(&got, "n");
+        assert_eq!(e.code(), Code::SafetyRejected, "{e:?}");
+        assert_eq!(fs.read_file("/dst/n").as_deref(), Some(&b"old"[..]));
+        assert!(!fs.called("create_symlink("));
+        assert_eq!((out.files_copied, out.files_degraded), (0, 0));
+    }
+
+    #[test]
+    fn record_claim_upgrades_an_own_existing_claim_to_created() {
+        // Spec 3.2 step 5 (the record bullet) and test 8c. Mutant: the upgrade removed.
+        let fs = links(&[("n", "p")]);
+        let seed = |s: &mut crate::fault_fs::FakeClaimStore, dst: ObjectId| {
+            let record = ClaimRecord { target: key_of("n"), status: ClaimStatus::Existing };
+            s.insert_if_absent(&ClaimKey::new(dst, OsStr::new("n")), &record).unwrap();
+        };
+        let (r, out, got) = link_run(&fs, &opts(), false, policy(1), &unguarded, seed);
+        r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(out.files_copied, 1);
+        assert_eq!(
+            fs.claim(strong_id(&fs, "/dst"), "n"),
+            Some(ClaimRecord { target: key_of("n"), status: ClaimStatus::Created })
+        );
+
+        // A foreign claim is still refused: the link is published, the claim is not recorded and stays foreign.
+        let fs = links(&[("n", "p")]);
+        let seed = |s: &mut crate::fault_fs::FakeClaimStore, dst: ObjectId| {
+            let record = ClaimRecord { target: key_of("other"), status: ClaimStatus::Existing };
+            s.insert_if_absent(&ClaimKey::new(dst, OsStr::new("n")), &record).unwrap();
+        };
+        let (r, out, got) = link_run(&fs, &opts(), false, policy(1), &unguarded, seed);
+        r.unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(matches!(got[0].cause, TreeFailureCause::ClaimNotRecorded(_)), "{got:?}");
+        assert_eq!(out.files_copied, 1);
+        assert_eq!(
+            fs.claim(strong_id(&fs, "/dst"), "n"),
+            Some(ClaimRecord { target: key_of("other"), status: ClaimStatus::Existing })
+        );
+
+        // `record_claim` itself: the upgrade only for own `Existing` -> `Created`; same status is a no-op.
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let root = fs.destination_root(Path::new("/d")).unwrap();
+        let store = root.create_claim_store(OsStr::new("s.db"), Durability::Normal).unwrap();
+        let claims = std::cell::RefCell::new(store);
+        let id = ObjectId { volume: 1, index: 1 };
+        let rec = |t: &str, status| ClaimRecord { target: key_of(t), status };
+        let k = |n: &str| ClaimKey::new(id, OsStr::new(n));
+        for (n, present, writing, after) in [
+            ("up", ClaimStatus::Existing, ClaimStatus::Created, ClaimStatus::Created),
+            ("cc", ClaimStatus::Created, ClaimStatus::Created, ClaimStatus::Created),
+            ("ee", ClaimStatus::Existing, ClaimStatus::Existing, ClaimStatus::Existing),
+            ("ce", ClaimStatus::Created, ClaimStatus::Existing, ClaimStatus::Created),
+        ] {
+            claims.borrow_mut().insert_if_absent(&k(n), &rec(n, present)).unwrap();
+            record_claim(&claims, &k(n), &rec(n, writing)).unwrap();
+            assert_eq!(claims.borrow().get(&k(n)).unwrap(), Some(rec(n, after)), "{n}");
+        }
+        assert_eq!(count(&log(&fs), "claim_upgrade("), 1, "only the Existing -> Created case");
+        claims.borrow_mut().insert_if_absent(&k("f"), &rec("g", ClaimStatus::Existing)).unwrap();
+        assert!(record_claim(&claims, &k("f"), &rec("f", ClaimStatus::Created)).is_err());
+        assert_eq!(claims.borrow().get(&k("f")).unwrap(), Some(rec("g", ClaimStatus::Existing)));
+    }
+
+    #[test]
+    fn a_lost_lock_before_the_publish_keeps_the_temporary_and_stops() {
+        // Spec test 9's guard case. Mutant: the guard check before the rename removed (publishes under a lost lock).
+        let fs = links(&[("n", "p")]);
+        let lost = || -> flux_fs::Result<()> {
+            if fs.called("create_symlink(") {
+                Err(FsError::new(Code::TargetLockBusy, std::io::Error::other("lock lost")))
+            } else {
+                Ok(())
+            }
+        };
+
+        let (r, out, _) = link_run(&fs, &opts(), false, policy(1), &lost, no_seed);
+
+        let e = r.unwrap_err();
+        assert_eq!(e.code(), Code::TargetLockBusy, "{e:?}");
+        let (left, why) = e.leftover.as_ref().expect("the temporary is reported");
+        assert_eq!(left, Path::new("n.flux-partial.op1"));
+        assert!(why.to_string().contains("no longer holds"), "{why}");
+        assert!(fs.exists("/dst/n.flux-partial.op1"), "the temporary is kept");
+        assert!(!fs.exists("/dst/n"), "nothing published under a lost lock");
+        let c = log(&fs);
+        let created = first(&c, "create_symlink(/dst/n.flux-partial.op1)");
+        assert!(
+            positions(&c, "remove_file(/dst/n.flux-partial.op1)").iter().all(|&i| i < created),
+            "no removal after the create: {c:?}"
+        );
+        assert_eq!(count(&c, "rename_"), 0, "{c:?}");
+        assert_eq!(out.files_copied, 0);
+    }
+
+    /// Cut 10a final review: the guard calls a single link `n` into an empty `/dst` makes, in order: 1 `gate_link`'s,
+    /// 2 `create_link`'s, 3 `publish_staged`'s (no flush, so no pair after a probe).
+    const LINK_GUARD_AT_GATE: u32 = 1;
+    const LINK_GUARD_AT_CREATE: u32 = 2;
+
+    #[test]
+    fn a_lost_lock_before_the_create_is_a_stop_and_creates_nothing() {
+        // Mutant: the guard in `create_link`'s pair removed (the link is created and only the publish guard stops it,
+        // keeping the temporary).
+        let fs = links(&[("n", "p")]);
+        let calls = std::cell::Cell::new(0);
+        let guard = failing_after(LINK_GUARD_AT_CREATE - 1, &calls);
+
+        let (r, out, _) = link_run(&fs, &opts(), false, policy(1), &guard, no_seed);
+
+        let e = r.unwrap_err();
+        assert_eq!(e.code(), Code::TargetLockBusy, "{e:?}");
+        assert_eq!(calls.get(), LINK_GUARD_AT_CREATE, "stopped at the create's guard");
+        let c = log(&fs);
+        assert!(
+            fs.called("remove_file(/dst/n.flux-partial.op1)"),
+            "precondition: past the gate: {c:?}"
+        );
+        assert!(!fs.called("create_symlink("), "{c:?}");
+        assert!(temps_in(&fs, "/dst").is_empty(), "{c:?}");
+        assert!(!fs.exists("/dst/n"));
+        assert_eq!(out.files_copied, 0);
+    }
+
+    #[test]
+    fn a_lost_lock_at_the_gate_removes_and_creates_nothing() {
+        // Mutant: the guard in `gate_link`'s pair removed (the leftover removal runs under a lost lock).
+        let fs = links(&[("n", "p")]);
+        let calls = std::cell::Cell::new(0);
+        let guard = failing_after(LINK_GUARD_AT_GATE - 1, &calls);
+
+        let (r, out, _) = link_run(&fs, &opts(), false, policy(1), &guard, no_seed);
+
+        let e = r.unwrap_err();
+        assert_eq!(e.code(), Code::TargetLockBusy, "{e:?}");
+        assert_eq!(calls.get(), LINK_GUARD_AT_GATE, "stopped at the gate's guard");
+        let c = log(&fs);
+        assert!(fs.called("read_link(/src/n)"), "precondition: the link was read: {c:?}");
+        assert!(!fs.called("remove_file("), "{c:?}");
+        assert!(!fs.called("create_symlink("), "{c:?}");
+        assert!(!fs.exists("/dst/n"));
+        assert_eq!(out.files_copied, 0);
+    }
+
+    #[test]
+    fn a_strict_replace_link_writes_a_replacement_note_and_discards_it_on_a_failed_rename() {
+        // Mutant: `replacement: false` in the Replace template.
+        let notes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fs = links(&[("n", "p")]);
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.write_file("/dst/n", b"old");
+        let seen = std::sync::Arc::clone(&notes);
+        fs.on_nth("rename_replace", 1, move |fs| {
+            let root = fs.destination_root(Path::new("/dst")).unwrap();
+            let store = root.open_claim_store(OsStr::new("state.db"), Durability::Strict).unwrap();
+            *seen.lock().unwrap() = store.prepared().unwrap();
+        });
+        let o = CopyOptions { durability: Durability::Strict, ..opts() };
+
+        let (r, out, got) = link_run(&fs, &o, false, policy(1), &unguarded, no_seed);
+
+        r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        let pending = notes.lock().unwrap().clone();
+        assert_eq!(pending.len(), 1, "the note is pending at the rename: {pending:?}");
+        let (key, note) = &pending[0];
+        assert_eq!(key.name, b"n");
+        assert!(note.replacement, "a Replace note says replacement: {note:?}");
+        assert_eq!(note.target, key_of("n"));
+        assert_eq!(fs.prepared_count(), 0, "committed after");
+        assert_eq!(link_at(&fs, "/dst/n").payload, "p");
+        assert_eq!((out.files_copied, out.files_overwritten), (1, 1));
+
+        let fs = links(&[("n", "p")]);
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.write_file("/dst/n", b"old");
+        fs.fail("rename_replace", Code::IoError);
+        let (r, out, got) = link_run(&fs, &o, false, policy(1), &unguarded, no_seed);
+        r.unwrap();
+        let e = only_copy_failure(&got, "n");
+        assert_eq!(e.step, CopyStep::Publish, "{e:?}");
+        assert!(fs.called("claim_prepare("), "precondition: the note was written");
+        assert_eq!(fs.prepared_count(), 0, "the note is discarded");
+        assert!(temps_in(&fs, "/dst").is_empty(), "the temporary is discarded");
+        assert_eq!(fs.read_file("/dst/n").as_deref(), Some(&b"old"[..]));
+        assert_eq!((out.files_copied, out.files_overwritten), (0, 0));
+    }
+
+    #[test]
+    fn a_link_to_an_existing_target_never_opens_the_target_or_the_link_path() {
+        // I2, with targets that EXIST (outside the tree, absolute and relative) and one that does not.
+        let fs =
+            links(&[("abs", "/outside/t"), ("gone", "/outside/none"), ("rel", "../outside/t")]);
+        fs.create_dir(Path::new("/outside")).unwrap();
+        fs.write_file("/outside/t", b"target");
+        let setup = fs.calls().len();
+
+        let (r, got) = run(&fs, "/src", "/dst", &opts());
+
+        let out = r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(out.files_copied, 3);
+        let c = calls_since(&fs, setup);
+        assert!(!c.iter().any(|x| x.contains("outside")), "a target was touched: {c:?}");
+        for n in ["abs", "gone", "rel"] {
+            for p in [format!("/src/{n}"), format!("/dst/{n}")] {
+                assert!(!c.contains(&format!("open_read({p})")), "{p} was opened: {c:?}");
+            }
+        }
+        assert_eq!(fs.read_file("/outside/t").as_deref(), Some(&b"target"[..]));
+    }
+
+    #[test]
+    fn the_names_owner_check_refuses_a_folded_name_before_any_claim() {
+        // §241.5's `names.owner` refusal, not the claim backstop: no claim insertion is attempted for the link.
+        let fs = links(&[("a", "payload")]);
+        fs.write_file("/src/A", b"upper");
+        fs.set_case_insensitive(true);
+
+        let (r, _, got) = batched(&fs, policy(1), Durability::Normal);
+
+        r.unwrap();
+        let e = only_copy_failure(&got, "a");
+        assert_eq!((e.code(), e.step), (Code::DestinationNamespaceCollision, CopyStep::Claim));
+        let c = log(&fs);
+        assert_eq!(count(&c, "claim_insert(A)"), 1, "the file's own claim only: {c:?}");
+        assert_eq!(count(&c, "claim_insert(a)"), 0, "{c:?}");
+        assert_eq!(count(&c, "read_link(/dst/"), 0, "{c:?}");
+    }
+
+    #[test]
+    fn a_reserved_link_under_links_skip_is_still_a_gate_failure() {
+        // Spec 3.2: step 1 (reserved) precedes step 2 (`--links=skip`).
+        let fs = links(&[]);
+        fs.create_dir(Path::new("/src/.flux")).unwrap();
+        fs.add_symlink_to("/src/.flux/operations", "/elsewhere", LinkKind::Unspecified);
+        let o = CopyOptions { links: Links::Skip, ..opts() };
+
+        let (r, got) = run(&fs, "/src", "/dst", &o);
+
+        let out = r.unwrap();
+        let e = only_copy_failure(&got, ".flux/operations");
+        assert_eq!((e.step, e.code()), (CopyStep::Gate, Code::ControlPlaneNamespaceConflict));
+        assert_eq!(out.symlinks_skipped, 0);
+        assert!(!fs.called("read_link("));
     }
 
     #[test]
@@ -3085,8 +4508,11 @@ mod tests {
         fs.add_special("/src/sub/dev");
         fs.create_dir(Path::new("/dst")).unwrap();
         fs.write_file("/dst/sub", b"a file where a directory belongs");
+        // Cut 10a: under `--links=skip` the link is one record and copies nothing, as the removed failure was.
+        let mut o = opts();
+        o.links = Links::Skip;
 
-        let (r, got) = run(&fs, "/src", "/dst", &opts());
+        let (r, got) = run(&fs, "/src", "/dst", &o);
 
         let out = r.unwrap();
         // `a` and `link`, and - under the skipped `sub` - `b` and `dev`.

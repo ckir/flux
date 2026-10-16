@@ -414,7 +414,7 @@ fn a_fifo_in_a_folder_is_skipped_reported_and_exits_0() {
 
 #[cfg(unix)]
 #[test]
-fn a_symlink_in_a_folder_fails_the_run_with_exit_1() {
+fn a_symlink_in_a_folder_is_recreated_and_the_run_exits_0() {
     let d = TempDir::new().unwrap();
     let src = tree_in(d.path());
     std::os::unix::fs::symlink("a", src.join("link")).unwrap();
@@ -422,14 +422,18 @@ fn a_symlink_in_a_folder_fails_the_run_with_exit_1() {
 
     let out = flux().arg("copy").arg(&src).arg(&dst).output().unwrap();
 
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(
+        std::fs::read_link(dst.join("link")).unwrap(),
+        std::fs::read_link(src.join("link")).unwrap()
+    );
+    assert_eq!(std::fs::read_link(dst.join("link")).unwrap(), Path::new("a"));
+    assert_eq!(std::fs::read(dst.join("a")).unwrap(), b"A");
     assert!(
-        stderr(&out).lines().any(|l| l.starts_with("SYMLINK_CREATION_UNAVAILABLE: link: ")),
+        !stderr(&out).lines().any(|l| l.starts_with("SYMLINK_CREATION_UNAVAILABLE")),
         "{}",
         stderr(&out)
     );
-    assert!(std::fs::symlink_metadata(dst.join("link")).is_err());
-    assert_eq!(std::fs::read(dst.join("a")).unwrap(), b"A");
 }
 
 #[cfg(unix)]
@@ -451,7 +455,7 @@ fn a_symlink_given_as_source_is_never_followed() {
         assert_eq!(
             stderr(&out),
             format!(
-                "SYMLINK_CREATION_UNAVAILABLE: {}: a symlink is copied as a link (§25), which this version cannot create; name its target to copy what it points at
+                "SYMLINK_CREATION_UNAVAILABLE: {}: a symlink SOURCE is not followed; copy its parent folder, or name its target
 ",
                 d.path().join(link).display()
             ),
@@ -593,4 +597,93 @@ fn a_single_file_skip_existing_exits_0_and_counts_one_skipped() {
     assert_eq!(v["files_copied"].as_u64(), Some(0), "{v}");
     assert_eq!(v["files_overwritten"].as_u64(), Some(0), "{v}");
     assert_eq!(std::fs::read(&dst).unwrap(), b"old", "content unchanged");
+}
+
+/// `src/rel -> a` (relative) and `src/abs -> <absolute path of src/a>` beside `tree_in`'s files.
+#[cfg(unix)]
+fn tree_with_links(d: &Path) -> PathBuf {
+    let src = tree_in(d);
+    std::os::unix::fs::symlink("a", src.join("rel")).unwrap();
+    std::os::unix::fs::symlink(src.join("a"), src.join("abs")).unwrap();
+    src
+}
+
+#[cfg(unix)]
+#[test]
+fn links_are_copied_by_default_and_skipped_on_request() {
+    let d = TempDir::new().unwrap();
+    let src = tree_with_links(d.path());
+
+    let dst = d.path().join("dst");
+    let out = flux().arg("copy").arg(&src).arg(&dst).arg("--json").output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    for name in ["rel", "abs"] {
+        assert_eq!(
+            std::fs::read_link(dst.join(name)).unwrap(),
+            std::fs::read_link(src.join(name)).unwrap(),
+            "{name}"
+        );
+    }
+    let v = json(&out);
+    assert_eq!(v["files_copied"].as_u64(), Some(4), "two files and two links: {v}");
+
+    let dst = d.path().join("dst-skip");
+    let out =
+        flux().arg("copy").arg(&src).arg(&dst).args(["--links=skip", "--json"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).lines().any(|l| l == "rel: object_type=symlink action=skipped (--links=skip)"),
+        "{}",
+        stderr(&out)
+    );
+    for name in ["rel", "abs"] {
+        assert!(std::fs::symlink_metadata(dst.join(name)).is_err(), "{name}: nothing created");
+    }
+    assert_eq!(std::fs::read(dst.join("a")).unwrap(), b"A");
+}
+
+#[cfg(unix)]
+#[test]
+fn links_follow_is_a_usage_error() {
+    let d = TempDir::new().unwrap();
+    let src = tree_with_links(d.path());
+    let dst = d.path().join("dst");
+    let out = flux().arg("copy").arg(&src).arg(&dst).arg("--links=follow").output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(std::fs::symlink_metadata(&dst).is_err(), "nothing was created");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_second_run_with_update_skips_equal_links() {
+    let d = TempDir::new().unwrap();
+    let src = tree_with_links(d.path());
+    let dst = d.path().join("dst");
+    let first = flux().arg("copy").arg(&src).arg(&dst).output().unwrap();
+    assert_eq!(first.status.code(), Some(0), "stderr: {}", stderr(&first));
+
+    let out =
+        flux().arg("copy").arg(&src).arg(&dst).arg("--update").arg("--json").output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let v = json(&out);
+    assert_eq!(v["files_skipped"].as_u64(), Some(4), "{v}");
+    assert_eq!(v["files_copied"].as_u64(), Some(0), "{v}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_source_prints_the_corrected_refusal() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let link = d.path().join("to-dir");
+    std::os::unix::fs::symlink(&src, &link).unwrap();
+    let out = flux().arg("copy").arg(&link).arg(d.path().join("dst")).output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(
+        stderr(&out),
+        format!(
+            "SYMLINK_CREATION_UNAVAILABLE: {}: a symlink SOURCE is not followed; copy its parent folder, or name its target\n",
+            link.display()
+        )
+    );
 }

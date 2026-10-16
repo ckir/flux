@@ -811,6 +811,175 @@ mod posix {
         assert_eq!(e.code, flux_fs::Code::DestinationError, "{e:?}");
         assert_eq!(e.source.kind(), std::io::ErrorKind::IsADirectory, "{e:?}");
     }
+
+    fn link(payload: &OsStr) -> flux_fs::Link {
+        flux_fs::Link { payload: payload.to_os_string(), kind: flux_fs::LinkKind::Unspecified }
+    }
+
+    #[test]
+    fn create_symlink_and_read_link_round_trip_every_payload_shape() {
+        use std::os::unix::ffi::OsStrExt;
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let payloads: [&OsStr; 5] = [
+            OsStr::new("rel/x"),
+            OsStr::new("/abs/x"),
+            OsStr::new("dangling"),
+            OsStr::new("../../etc/passwd"),
+            OsStr::from_bytes(b"na\xefve"),
+        ];
+        for (i, payload) in payloads.iter().enumerate() {
+            let name = format!("l{i}");
+            root.create_symlink(OsStr::new(&name), &link(payload)).unwrap();
+            let got = root.read_link(OsStr::new(&name)).unwrap();
+            assert_eq!(got.payload.as_bytes(), payload.as_bytes(), "{name}: handle read_link");
+            assert_eq!(
+                got.kind,
+                flux_fs::LinkKind::Unspecified,
+                "{name}: a POSIX link has no kind"
+            );
+            let std_got = std::fs::read_link(d.path().join(&name)).unwrap();
+            assert_eq!(std_got.as_os_str().as_bytes(), payload.as_bytes(), "{name}: std agrees");
+        }
+    }
+
+    #[test]
+    fn create_symlink_refuses_an_occupied_name() {
+        let d = TempDir::new().unwrap();
+        std::fs::write(d.path().join("file"), b"keep").unwrap();
+        std::fs::create_dir(d.path().join("dir")).unwrap();
+        std::os::unix::fs::symlink("nowhere", d.path().join("dangling")).unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        for name in ["file", "dir", "dangling"] {
+            let e = root.create_symlink(OsStr::new(name), &link(OsStr::new("other"))).unwrap_err();
+            assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists, "{name}: {e:?}");
+        }
+        assert_eq!(std::fs::read(d.path().join("file")).unwrap(), b"keep");
+        assert!(d.path().join("dir").is_dir());
+        assert_eq!(
+            std::fs::read_link(d.path().join("dangling")).unwrap(),
+            std::path::Path::new("nowhere"),
+            "an occupied dangling link keeps its payload"
+        );
+    }
+
+    #[test]
+    fn create_symlink_refuses_a_bad_component() {
+        let d = TempDir::new().unwrap();
+        std::fs::create_dir(d.path().join("a")).unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let e = root.create_symlink(OsStr::new("a/b"), &link(OsStr::new("x"))).unwrap_err();
+        assert_eq!(e.code, flux_fs::Code::SafetyRejected, "{e:?}");
+        assert!(std::fs::symlink_metadata(d.path().join("a/b")).is_err(), "nothing created");
+        assert_eq!(std::fs::read_dir(d.path().join("a")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_created_links_metadata_is_the_links_own() {
+        use flux_fs::DirHandle as _;
+        let d = TempDir::new().unwrap();
+        std::fs::write(d.path().join("target"), b"payload bytes").unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        root.create_symlink(OsStr::new("l"), &link(OsStr::new("target"))).unwrap();
+        let l = root.metadata(OsStr::new("l")).unwrap();
+        let t = root.metadata(OsStr::new("target")).unwrap();
+        assert_eq!(l.file_type, flux_fs::FileType::Symlink);
+        assert_eq!(t.file_type, flux_fs::FileType::File);
+        assert!(matches!(l.identity, flux_fs::FileIdentity::Strong(_)), "{l:?}");
+        assert_ne!(l.identity, t.identity, "the link is its own object");
+        // Cross-check against the OS: the link's inode is not the target's.
+        use std::os::unix::fs::MetadataExt;
+        let std_target = std::fs::metadata(d.path().join("l")).unwrap();
+        let std_link = std::fs::symlink_metadata(d.path().join("l")).unwrap();
+        assert_ne!(std_link.ino(), std_target.ino());
+    }
+
+    #[test]
+    fn rename_and_remove_act_on_the_link_never_its_target() {
+        let d = TempDir::new().unwrap();
+        let target = d.path().join("target");
+        std::fs::write(&target, b"precious").unwrap();
+        std::fs::write(d.path().join("victim"), b"replaced").unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let kept = |why: &str| {
+            assert_eq!(std::fs::read(&target).unwrap(), b"precious", "{why}");
+            assert!(!std::fs::symlink_metadata(&target).unwrap().is_symlink(), "{why}");
+        };
+
+        // rename_no_replace moves the link itself.
+        root.create_symlink(OsStr::new("l1"), &link(OsStr::new("target"))).unwrap();
+        root.rename_no_replace(OsStr::new("l1"), &root, OsStr::new("l2")).unwrap();
+        assert!(std::fs::symlink_metadata(d.path().join("l1")).is_err());
+        assert_eq!(
+            std::fs::read_link(d.path().join("l2")).unwrap(),
+            std::path::Path::new("target")
+        );
+        kept("after rename_no_replace");
+
+        // rename_replace over a regular file replaces that file with the link.
+        root.rename_replace(OsStr::new("l2"), &root, OsStr::new("victim")).unwrap();
+        assert!(std::fs::symlink_metadata(d.path().join("l2")).is_err());
+        let v = std::fs::symlink_metadata(d.path().join("victim")).unwrap();
+        assert!(v.is_symlink(), "the link now sits at the replaced name");
+        kept("after rename_replace");
+
+        // remove_file unlinks the link and leaves the target.
+        root.remove_file(OsStr::new("victim")).unwrap();
+        assert!(std::fs::symlink_metadata(d.path().join("victim")).is_err());
+        kept("after remove_file");
+    }
+
+    #[test]
+    fn read_link_refuses_a_file_and_a_directory_as_invalid_input() {
+        let d = TempDir::new().unwrap();
+        std::fs::write(d.path().join("f"), b"x").unwrap();
+        std::fs::create_dir(d.path().join("sub")).unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        for name in ["f", "sub"] {
+            let e = root.read_link(OsStr::new(name)).unwrap_err();
+            assert_eq!(e.code, flux_fs::Code::IoError, "{name}: {e:?}");
+            assert_eq!(e.source.kind(), std::io::ErrorKind::InvalidInput, "{name}: {e:?}");
+        }
+    }
+
+    /// Cut 10a test audit: a payload longer than the OS allows (`PATH_MAX`, 4096 on Linux) is the OS error as an `IoError`,
+    /// never `SymlinkCreationUnavailable` (which would tell the operator the filesystem cannot hold links), and creates
+    /// nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_over_long_payload_is_an_io_error_and_creates_nothing() {
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let payload = "p".repeat(5000);
+        let e = root.create_symlink(OsStr::new("l"), &link(OsStr::new(&payload))).unwrap_err();
+        assert_eq!(e.code, flux_fs::Code::IoError, "{e:?}");
+        assert_eq!(e.source.raw_os_error(), Some(36), "ENAMETOOLONG: {e:?}");
+        assert!(std::fs::symlink_metadata(d.path().join("l")).is_err(), "nothing created: {e:?}");
+    }
+
+    #[test]
+    fn an_empty_payload_is_the_os_error_not_a_panic() {
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let r = root.create_symlink(OsStr::new("l"), &link(OsStr::new("")));
+        let name = d.path().join("l");
+        // Linux answers ENOENT for an empty symlink target and creates nothing. macOS creates an empty-target link, so
+        // elsewhere either outcome is accepted: an error leaves nothing behind, a success reads back an empty payload.
+        #[cfg(target_os = "linux")]
+        {
+            let e = r.unwrap_err();
+            assert_eq!(e.source.kind(), std::io::ErrorKind::NotFound, "{e:?}");
+            assert!(std::fs::symlink_metadata(&name).is_err(), "nothing created: {e:?}");
+        }
+        #[cfg(not(target_os = "linux"))]
+        match r {
+            Err(e) => assert!(std::fs::symlink_metadata(&name).is_err(), "nothing created: {e:?}"),
+            Ok(_) => {
+                assert!(std::fs::read_link(&name).unwrap().as_os_str().is_empty(), "empty payload");
+                std::fs::remove_file(&name).unwrap();
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -916,6 +1085,172 @@ mod windows_arm {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    fn link(payload: &OsStr) -> flux_fs::Link {
+        flux_fs::Link { payload: payload.to_os_string(), kind: flux_fs::LinkKind::Unspecified }
+    }
+
+    /// Whether this process may create a symlink at all (Developer Mode or the privilege).
+    fn can_create_symlinks(dir: &std::path::Path) -> bool {
+        let probe = dir.join("can_create_probe");
+        let ok = std::os::windows::fs::symlink_file("nowhere", &probe).is_ok();
+        let _ = std::fs::remove_file(&probe);
+        ok
+    }
+
+    #[test]
+    fn create_symlink_without_the_right_is_unavailable_and_creates_nothing() {
+        let d = TempDir::new().unwrap();
+        if can_create_symlinks(d.path()) {
+            println!("skipped: this runner can create symlinks");
+            return;
+        }
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let e = root.create_symlink(OsStr::new("l"), &link(OsStr::new("target"))).unwrap_err();
+        assert_eq!(e.code, flux_fs::Code::SymlinkCreationUnavailable, "{e:?}");
+        assert!(std::fs::symlink_metadata(d.path().join("l")).is_err(), "nothing created");
+    }
+
+    #[test]
+    fn create_symlink_round_trips_file_and_dir_links_when_the_runner_can() {
+        use flux_fs::{Link, LinkKind};
+        let d = TempDir::new().unwrap();
+        if !can_create_symlinks(d.path()) {
+            println!("skipped: this runner cannot create symlinks");
+            return;
+        }
+        std::fs::create_dir(d.path().join("target_dir")).unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let cases: [(&str, &str, LinkKind); 5] = [
+            ("a", r"x\y", LinkKind::File),
+            ("dl", "target_dir", LinkKind::Dir),
+            ("d", "nowhere", LinkKind::File),
+            ("abs", r"C:\Windows", LinkKind::File),
+            ("L", "target_dir", LinkKind::Dir),
+        ];
+        for (name, payload, kind) in cases {
+            let made = Link { payload: payload.into(), kind };
+            root.create_symlink(OsStr::new(name), &made).unwrap();
+            let back = root.read_link(OsStr::new(name)).unwrap();
+            assert_eq!(back.payload, OsStr::new(payload), "{name}");
+            assert_eq!(back.kind, kind, "{name}");
+        }
+        for (name, payload, kind) in cases {
+            let made = Link { payload: payload.into(), kind };
+            let e = root.create_symlink(OsStr::new(name), &made).unwrap_err();
+            assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists, "{name}: {e:?}");
+        }
+        // `Unspecified` creates a file link (spec D9).
+        let u = Link { payload: "x".into(), kind: LinkKind::Unspecified };
+        root.create_symlink(OsStr::new("u"), &u).unwrap();
+        assert_eq!(root.read_link(OsStr::new("u")).unwrap().kind, LinkKind::File);
+        // An exclusive create does not follow a dangling link.
+        let dangling = Link { payload: "nowhere".into(), kind: LinkKind::File };
+        let e = root.create_symlink(OsStr::new("d"), &dangling).unwrap_err();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists, "{e:?}");
+        assert!(!d.path().join("nowhere").exists(), "nothing created through the dangling link");
+        // A regular file and a directory holding the name are AlreadyExists too.
+        std::fs::write(d.path().join("rf"), b"x").unwrap();
+        std::fs::create_dir(d.path().join("rd")).unwrap();
+        for name in ["rf", "rd"] {
+            let e = root.create_symlink(OsStr::new(name), &link(OsStr::new("z"))).unwrap_err();
+            assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists, "{name}: {e:?}");
+        }
+        // Nothing is created through an existing link.
+        let e = root.create_symlink(OsStr::new("L\\child"), &link(OsStr::new("z")));
+        assert!(e.is_err(), "a separator is a bad component");
+        assert!(
+            root.open_dir(OsStr::new("L")).is_err(),
+            "a handle cannot be opened through a link"
+        );
+        assert_eq!(std::fs::read_dir(d.path().join("target_dir")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn rename_replace_replaces_a_directory_link_with_a_regular_file() {
+        let d = TempDir::new().unwrap();
+        if !can_create_symlinks(d.path()) {
+            println!("skipped: this runner cannot create symlinks");
+            return;
+        }
+        let t = d.path().join("T");
+        std::fs::create_dir(&t).unwrap();
+        std::fs::write(t.join("inside"), b"keep").unwrap();
+        std::os::windows::fs::symlink_dir("T", d.path().join("L")).unwrap();
+        std::fs::write(d.path().join("f"), b"staged bytes").unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        root.rename_replace(OsStr::new("f"), &root, OsStr::new("L")).unwrap();
+        let meta = std::fs::symlink_metadata(d.path().join("L")).unwrap();
+        assert!(meta.is_file() && !meta.is_symlink(), "L is now a regular file: {meta:?}");
+        assert_eq!(std::fs::read(d.path().join("L")).unwrap(), b"staged bytes");
+        assert_eq!(std::fs::read(t.join("inside")).unwrap(), b"keep", "T is untouched");
+        assert!(std::fs::symlink_metadata(d.path().join("f")).is_err(), "f is gone");
+    }
+
+    #[test]
+    fn rename_replace_over_a_junction_is_still_refused() {
+        let d = TempDir::new().unwrap();
+        let t = d.path().join("T");
+        std::fs::create_dir(&t).unwrap();
+        std::fs::write(t.join("inside"), b"keep").unwrap();
+        if !junction(&t, &d.path().join("J")) {
+            println!("skipped: mklink /J failed on this runner");
+            return;
+        }
+        std::fs::write(d.path().join("f"), b"staged bytes").unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let r = root.rename_replace(OsStr::new("f"), &root, OsStr::new("J"));
+        assert!(r.is_err(), "replacing a junction must be refused");
+        let meta = std::fs::symlink_metadata(d.path().join("J")).unwrap();
+        assert!(!meta.is_file(), "J is still not a regular file: {meta:?}");
+        assert!(
+            std::os::windows::fs::MetadataExt::file_attributes(&meta) & 0x400 != 0,
+            "J is still a reparse point: {meta:?}"
+        );
+        assert_eq!(std::fs::read(t.join("inside")).unwrap(), b"keep", "T is intact");
+        assert!(std::fs::symlink_metadata(d.path().join("f")).is_ok(), "f still exists");
+    }
+
+    #[test]
+    fn rename_replace_still_replaces_a_file_with_a_directory_link() {
+        let d = TempDir::new().unwrap();
+        if !can_create_symlinks(d.path()) {
+            println!("skipped: this runner cannot create symlinks");
+            return;
+        }
+        let t = d.path().join("T");
+        std::fs::create_dir(&t).unwrap();
+        std::os::windows::fs::symlink_dir("T", d.path().join("staged")).unwrap();
+        std::fs::write(d.path().join("F"), b"old").unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        root.rename_replace(OsStr::new("staged"), &root, OsStr::new("F")).unwrap();
+        let meta = std::fs::symlink_metadata(d.path().join("F")).unwrap();
+        assert!(meta.is_symlink(), "F is now a link: {meta:?}");
+        assert!(std::fs::symlink_metadata(d.path().join("staged")).is_err(), "staged is gone");
+        assert!(t.is_dir(), "T is untouched");
+    }
+
+    #[test]
+    fn read_link_on_a_junction_is_special_file_unsupported() {
+        let d = TempDir::new().unwrap();
+        std::fs::create_dir(d.path().join("real")).unwrap();
+        if !junction(&d.path().join("real"), &d.path().join("junc")) {
+            panic!("could not create a junction; mklink /J requires no privilege");
+        }
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let e = root.read_link(OsStr::new("junc")).unwrap_err();
+        assert_eq!(e.code, flux_fs::Code::SpecialFileUnsupported, "{e:?}");
+    }
+
+    #[test]
+    fn read_link_on_a_file_is_invalid_input() {
+        let d = TempDir::new().unwrap();
+        std::fs::write(d.path().join("f"), b"x").unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let e = root.read_link(OsStr::new("f")).unwrap_err();
+        assert_eq!(e.code, flux_fs::Code::IoError, "{e:?}");
+        assert_eq!(e.source.kind(), std::io::ErrorKind::InvalidInput, "{e:?}");
     }
 
     #[test]
@@ -1474,6 +1809,70 @@ mod windows_arm {
         assert!(dir.join("child/inside").is_file(), "the write must land through the handle");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_symlink_on_a_fat32_volume_is_unavailable_and_creates_nothing() {
+        // Cut 10a ruling R12: a FAT volume has no file ids, so the handle's identity is
+        // Unavailable, create_symlink SKIPS its identity re-check and calls
+        // CreateSymbolicLinkW, which such a volume cannot satisfy. Expected outcome is
+        // Code::SymlinkCreationUnavailable ("the destination filesystem cannot hold a
+        // symlink"), Win32 error 1 or 50. NOT yet measured: this test IS the
+        // measurement, so the PROBE line below is always printed (run with --nocapture).
+        //
+        // Set FLUX_FAT32_ROOT to a directory on a FAT32 volume to run this.
+        let Ok(base) = std::env::var("FLUX_FAT32_ROOT") else {
+            eprintln!("SKIPPED: set FLUX_FAT32_ROOT to a directory on a FAT32 volume");
+            return;
+        };
+
+        // Removes the scratch directory on every path, a panic included.
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let dir = std::path::Path::new(&base).join("fluxsymlink");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _cleanup = Cleanup(dir.clone());
+
+        let root = StdFileSystem.destination_root(&dir).unwrap();
+        let identity = root.identity().unwrap();
+        eprintln!("PROBE fat32 identity: {identity:?}");
+        assert!(
+            matches!(identity, flux_fs::FileIdentity::Unavailable),
+            "FLUX_FAT32_ROOT must name a volume with no file ids (FAT32); identity was {identity:?}"
+        );
+
+        let link = flux_fs::Link { payload: "x".into(), kind: flux_fs::LinkKind::File };
+        let outcome = root.create_symlink(OsStr::new("l"), &link);
+        let e = match outcome {
+            Ok(()) => {
+                let _ = std::fs::remove_file(dir.join("l"));
+                let _ = std::fs::remove_dir(dir.join("l"));
+                eprintln!("PROBE fat32 create_symlink: unexpectedly created");
+                panic!("PROBE fat32 create_symlink: unexpectedly created");
+            }
+            Err(e) => e,
+        };
+        eprintln!(
+            "PROBE fat32 create_symlink: code={:?} kind={:?} raw_os_error={:?} message={}",
+            e.code,
+            e.source.kind(),
+            e.source.raw_os_error(),
+            e
+        );
+        assert_eq!(e.code, flux_fs::Code::SymlinkCreationUnavailable);
+
+        let after = root.metadata(OsStr::new("l"));
+        assert!(
+            matches!(&after, Err(m) if m.source.kind() == std::io::ErrorKind::NotFound),
+            "nothing named `l` may exist afterwards; metadata said {:?}",
+            after.as_ref().map(|_| "exists").map_err(|m| m.source.kind())
+        );
     }
 
     #[test]

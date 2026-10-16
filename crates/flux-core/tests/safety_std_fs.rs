@@ -3,7 +3,7 @@
 //! reason; when `CI` is set it fails instead.
 
 use flux_core::run::RunConfig;
-use flux_fs::{Code, CopyOptions, Durability, OperationId, Preserve, Publish, Safety};
+use flux_fs::{Code, CopyOptions, Durability, Links, OperationId, Preserve, Publish, Safety};
 use flux_platform::StdFileSystem;
 use std::path::Path;
 use tempfile::TempDir;
@@ -17,6 +17,7 @@ fn opts() -> CopyOptions {
         safety: Safety::Default,
         operation_id: OperationId::new("t"),
         existing: flux_fs::ExistingPolicy::Overwrite,
+        links: Links::Copy,
     }
 }
 

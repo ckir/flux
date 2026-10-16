@@ -46,7 +46,8 @@ pub(crate) fn sweep_partials<F: DestinationRoot>(
     };
     for item in events {
         let path = match item {
-            Ok(WalkEvent::File { path }) => path,
+            // Cut 10a: a link temporary too (a crash between its creation and its rename); `remove_file` unlinks it.
+            Ok(WalkEvent::File { path }) | Ok(WalkEvent::Symlink { path }) => path,
             Ok(_) => continue,
             // A directory the sweep cannot read may hold a partial: every prior's state stays as its record.
             Err(e) => {

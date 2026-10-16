@@ -11,9 +11,9 @@ use flux_fs::{Code, FileIdentity, MetadataFailure, MetadataItem, Outcome};
 use serde::Serialize;
 use std::path::Path;
 
-/// Why a symlink fails, shared by the tree record and the SOURCE refusal (K7).
+/// Why a symlink given as SOURCE is refused (K7). A symlink inside a tree is copied as a link (cut 10a).
 pub const SYMLINK_WHY: &str =
-    "a symlink is copied as a link (§25), which this version cannot create";
+    "a symlink SOURCE is not followed; copy its parent folder, or name its target";
 
 /// §53's complete field list, in its order. Every value is true for what this version
 /// does: nothing hardlinks, reflinks or verifies, so those stay 0 and `verify_level`
@@ -75,14 +75,17 @@ impl Report {
         let mut r = Self::zero();
         r.files_total = out.files_total;
         r.files_copied = out.files_copied;
-        r.files_skipped = out.special_files_skipped + out.files_skipped + out.files_resumed;
+        r.files_skipped = out.special_files_skipped
+            + out.symlinks_skipped
+            + out.files_skipped
+            + out.files_resumed;
         r.files_overwritten = out.files_overwritten;
         r.bytes_skipped = out.bytes_skipped + out.bytes_resumed;
         r.files_degraded = out.files_degraded;
-        // Only `copy` and `symlink` are failed FILES. A `ClaimNotRecorded` failure is counted in
-        // `FailureTally::total()` (so in `errors`) and in `claim_not_recorded`, but not here: the file was published
-        // and counted as copied.
-        r.files_failed = out.failures.copy + out.failures.symlink;
+        // Only `copy` failures are failed FILES (a failed link is one, cut 10a). A `ClaimNotRecorded` failure is
+        // counted in `FailureTally::total()` (so in `errors`) and in `claim_not_recorded`, but not here: the file was
+        // published and counted as copied.
+        r.files_failed = out.failures.copy;
         r.bytes_total = out.bytes_copied;
         r.bytes_copied = out.bytes_copied;
         r.errors = out.failures.total() + u64::from(aborted);
@@ -179,13 +182,14 @@ pub fn record_lines(f: &TreeFailure) -> Vec<String> {
             vec![format!("{}: {p}: {}", e.code.as_str(), e.source)]
         }
         TreeFailureCause::Copy(e) => vec![copy_line(&p, e)],
-        TreeFailureCause::Symlink => {
-            vec![format!("{}: {p}: {SYMLINK_WHY}", Code::SymlinkCreationUnavailable.as_str())]
-        }
         TreeFailureCause::SpecialFileSkipped => vec![format!(
             "{}: {p}: object_type=special action=skipped",
             Code::SpecialFileUnsupported.as_str()
         )],
+        // Cut 10a (D11): neither an error nor a warning, so no code; §124 names the fields.
+        TreeFailureCause::SymlinkSkipped => {
+            vec![format!("{p}: object_type=symlink action=skipped (--links=skip)")]
+        }
         TreeFailureCause::PublishedWithComplaints(v) => {
             v.iter().map(|m| complaint_line(&p, m)).collect()
         }
@@ -569,8 +573,7 @@ mod tests {
         out.bytes_copied = 30;
         out.special_files_skipped = 1;
         out.files_degraded = 1;
-        out.failures.copy = 1;
-        out.failures.symlink = 1;
+        out.failures.copy = 2;
         out.failures.walk = 1;
         out.failures.published_with_complaints = 1;
 
@@ -578,7 +581,7 @@ mod tests {
 
         assert_eq!((r.files_total, r.files_copied, r.files_skipped), (7, 2, 1));
         assert_eq!(r.files_degraded, 1);
-        assert_eq!(r.files_failed, 2, "copy + symlink: walk and complaints are not failed files");
+        assert_eq!(r.files_failed, 2, "copy only: walk and complaints are not failed files");
         assert_eq!((r.bytes_total, r.bytes_copied), (30, 30));
         assert_eq!(r.errors, 4);
         assert_eq!((r.duration_ms, r.average_bytes_per_second), (10, 3000));
@@ -587,6 +590,19 @@ mod tests {
             (0, 0, 0, 0)
         );
         assert_eq!(Report::tree(&out, true, 10).errors, 5, "an abort counts as one");
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn files_skipped_adds_skipped_links() {
+        let mut out = TreeOutcome::default();
+        out.symlinks_skipped = 2;
+        out.special_files_skipped = 3;
+        out.files_skipped = 5;
+        out.files_resumed = 7;
+        let r = Report::tree(&out, false, 10);
+        assert_eq!(r.files_skipped, 2 + 3 + 5 + 7);
+        assert_eq!((r.files_failed, r.errors), (0, 0), "a skipped link is not a failure");
     }
 
     #[test]
@@ -687,10 +703,8 @@ mod tests {
             ["SPECIAL_FILE_UNSUPPORTED: dev: object_type=special action=skipped"]
         );
         assert_eq!(
-            line("l", TreeFailureCause::Symlink),
-            [
-                "SYMLINK_CREATION_UNAVAILABLE: l: a symlink is copied as a link (§25), which this version cannot create"
-            ]
+            line("l", TreeFailureCause::SymlinkSkipped),
+            ["l: object_type=symlink action=skipped (--links=skip)"]
         );
         assert_eq!(
             line("s", TreeFailureCause::Walk(FsError::new(Code::PermissionDenied, io("denied")))),

@@ -1,0 +1,215 @@
+# Cut 10a: Symlink Copying Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** `flux copy` recreates every source symlink at the destination as a symlink with the identical payload (`--links=copy`, the default) or reports it as skipped (`--links=skip`), through the engine's existing per-entry protocol, on Linux and macOS, and on Windows where the process may create links.
+
+**Architecture:** `read_link`/`create_symlink` join the `flux-fs` traits (`FileSystem` for the source by path, `DirHandle` for the destination by handle); a `link_one` beside `copy_one` in `tree.rs` runs the file protocol with no bytes (temp name, claim, rename, `finish_copy`); the J1 sweep, note recovery and cleanup's artifact removal accept link artefacts; `--links` joins the resume configuration. The two Windows mechanisms are measured by owner-run probes before the Windows arm and the directory-link fallback are written.
+
+**Tech Stack:** Rust 2024 workspace (`flux-fs`, `flux-core`, `flux-platform`, `flux-cli`), `rustix` (POSIX), `windows-sys` (Windows), `clap`, `serde`, `blake3`, the `FaultFs` test fake, `cargo nextest`.
+
+**Spec:** `docs/superpowers/specs/2026-10-16-cut-10a-symlink-copying-design.md` (committed `3e63c3d` on `spec/cut-10a-symlink-copying`). Section numbers below are the spec's. Every line number in this plan was read at main `67091fc`.
+
+## Global Constraints
+
+- The payload is copied verbatim: never made relative or absolute, re-rooted, normalised or re-encoded (§125; spec anti-goal 2).
+- No read, open or stat THROUGH a link on either side; no path-based destination write except the one Windows residual the spec admits in 3.7 (anti-goals 1 and 4; I2, I3).
+- Every link entry produces exactly one record: created, skipped, or failed (I4; §233.3).
+- The repo gate, as is: `cargo fmt`; `TMPDIR=$HOME/ff_tmp just check` (expected: `Summary [...] N tests run: N passed, 5 skipped`, where N grows with this cut; 1493 today); `cargo clippy --workspace --all-targets --release -- -D warnings` clean; `cargo test -p flux-core --lib` passes too (`just mutants` uses libtest). On this box `/tmp` is near its quota, hence `TMPDIR`.
+- Commit messages end with the session's standing attribution trailer, `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>` as of execution (the controller commits subagent work with it); nothing under `.clavity/` or `.superpowers/` is committed.
+- Every `CopyOptions { .. }` literal in the workspace must name the new `links` field: the compiler is the oracle; the files are pre-listed in Task 1.
+- Windows CI cannot create a symlink (`docs/accepted-boundaries.md:70-74`); every Windows test that needs one probes the capability first and skips with a printed reason when it is present, so a changed runner surfaces.
+- Tasks 7 and 8 are GATED on Task 0's rulings; Tasks 1-6 are not. The branch is not offered as a PR with Task 1's Windows placeholder still in place unless the owner rules so explicitly (a placeholder ships "symlinks never created on Windows", which §127 permits but G1 does not aim at).
+
+## Review Focus
+
+1. An empty payload (`link -> ""`): the OS refuses the creation (`ENOENT` on Linux); the entry must fail with that error and nothing else must change. Pinned in Task 2.
+2. A destination link that cannot be read under `--update` (a junction, an I/O error): "not equal", so replaced, never a failed entry at the read. Pinned in Task 4.
+3. A link whose name folds (non-ASCII) onto a pending batched file's name on a case-folding destination: the file's temporary is never removed; the second entry is a collision. Pinned in Task 4 (test 4c).
+4. A source link named `.flux` BELOW the root (`sub/.flux`) is ordinary data and is copied; only the root-level reserved paths are refused before the read. Pinned in Task 3.
+5. A crash between `create_symlink(temp)` and the rename, then `--resume` of the same operation: the leftover is removed under the guard and the link republished, with the claim ending `Created`. Pinned in Task 6.
+
+---
+
+### Task 0: The measurement probes (owner-run; no production code)
+
+**Files:**
+- Create: `crates/flux-platform/src/symlink_probe.rs` (`#[cfg(test)]` module, every test `#[ignore]`), declared from `crates/flux-platform/src/lib.rs`.
+- Modify: `crates/flux-platform/src/lib.rs` (one `#[cfg(test)] mod symlink_probe;` line).
+
+**Interfaces:**
+- Produces: four rulings recorded in this plan's ledger and in spec §9: R-W1 (which Windows creation call works in Developer Mode without elevation, and the error without the right), R-W2 (whether `FileRenameInformation` with `ReplaceIfExists` accepts a directory link at `temp`, at `name`, and whether `FILE_RENAME_POSIX_SEMANTICS` changes it), R-W3 (`read_link` round trip of a relative and an absolute payload, and the reparse tag of a junction), R-L1 (`symlinkat` on vfat: `EPERM` or another errno).
+
+- [ ] **Step 1: Write the Windows probe tests** (`#[cfg(windows)]`, each `#[ignore]`, each PRINTS its result with `println!` and asserts nothing except that the probe ran): `probe_create_symbolic_link_w_file_and_dir_and_dangling` (calls `CreateSymbolicLinkW` with `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE`, then with `| SYMBOLIC_LINK_FLAG_DIRECTORY`, then with a dangling target, in a `tempfile::TempDir`; prints `GetLastError` on failure); `probe_nt_create_plus_fsctl_set_reparse_point` (candidate (a): `NtCreateFile` relative to the directory's handle with `FILE_CREATE | FILE_OPEN_REPARSE_POINT`, then `FSCTL_SET_REPARSE_POINT` with a `REPARSE_DATA_BUFFER` symlink; prints the `NTSTATUS` of each step); `probe_rename_replace_over_and_with_a_directory_link` (uses the arm's own `rename_at` (`dir_windows.rs:1215`) with `r = true` for: a `Dir` link at `temp` over a file; a file at `temp` over a `Dir` link; then the same two with `FileRenameInformationEx` and `FILE_RENAME_POSIX_SEMANTICS`; prints each status); `probe_read_link_round_trip_and_junction_tag` (creates `rel -> sub\\x`, `abs -> C:\\Windows`, a junction with `mklink /J` via `std::process::Command`, prints `std::fs::read_link` of each and `reparse_tag_of` (`dir_windows.rs:1480`) of each).
+- [ ] **Step 2: Write the Linux probe test** (`#[cfg(target_os = "linux")]`, `#[ignore]`): `probe_symlinkat_on_the_directory_named_by_FLUX_PROBE_DIR` reads `FLUX_PROBE_DIR` from the environment, calls `rustix::fs::symlinkat("target", &dirfd, "probe-link")`, prints `Ok` or the `Errno`, removes the link if created.
+- [ ] **Step 3: Verify the probes compile and are skipped by the gate**: `cargo test -p flux-platform --lib symlink_probe` prints `0 passed; 0 failed; N ignored` (N = 5 on Windows, 1 on Linux); `TMPDIR=$HOME/ff_tmp just check` unchanged.
+- [ ] **Step 4: Commit** `test(platform): ignored symlink probes for the cut 10a measurements` (trailer).
+- [ ] **Step 5 (OWNER, top level, their machines):** run `cargo test -p flux-platform --lib -- --ignored symlink_probe --nocapture` on the Windows box in Developer Mode and once as a plain user (no Developer Mode, not elevated), and on Linux with `FLUX_PROBE_DIR=<a vfat mount>`; paste the printed lines into the plan ledger as rulings R-W1, R-W2, R-W3, R-L1. The driver records them in spec §9. Tasks 7 and 8 read them.
+
+### Task 1: The trait surface, the option, the fake, and the platform arms
+
+**Files:**
+- Modify: `crates/flux-fs/src/fs.rs` (`Link`, `LinkKind` after `DirEntry` at `:40-44`; `FileSystem::read_link` after `create_dir`; `DirHandle::create_symlink` and `DirHandle::read_link` after `remove_file` at `:310-321`); `crates/flux-fs/src/lib.rs` (re-export `Link`, `LinkKind`, `Links`).
+- Modify: `crates/flux-fs/src/options.rs` (`enum Links { Copy, Skip }` beside `ExistingPolicy`; `CopyOptions.links: Links`).
+- Modify (every `CopyOptions { .. }` literal gains `links: Links::Copy` unless `..` fills it; 26 sites in 11 files, the compiler names them): `crates/flux-cli/src/main.rs`, `crates/flux-core/src/copy.rs`, `crates/flux-core/src/run/mod.rs`, `crates/flux-core/src/run/resume.rs`, `crates/flux-core/src/run/tests.rs`, `crates/flux-core/src/state.rs`, `crates/flux-core/src/tree.rs`, `crates/flux-core/tests/replace_std_fs.rs`, `crates/flux-core/tests/safety_std_fs.rs`, `crates/flux-core/tests/tree_std_fs.rs`, `crates/flux-fs/src/options.rs`.
+- Modify: `crates/flux-core/src/fault_fs.rs` (`Inner.symlinks: HashMap<PathBuf, Link>` beside `types` at `:64` (`Inner.links` at `:52` is the hard-link count); `add_symlink` at `:1248` keeps its signature and inserts `Link { payload: "target".into(), kind: LinkKind::Unspecified }`; new `add_symlink_to(path, payload, kind)`; new `set_symlinks_unavailable(bool)` beside `set_no_replace_support` at `:1199`; `FileSystem::read_link` in the `impl FileSystem for FaultFs` block at `:1382`; `DirHandle::read_link` and `DirHandle::create_symlink` in the `impl DirHandle for FakeDirHandle` block at `:1763`; `metadata` (`:1450`) reports `len = payload.len()` for a link; `rename_*`, `remove_file` and the `rekey` helper (`:609`) carry the `symlinks` entry).
+- Modify: `crates/flux-platform/src/std_fs.rs` (`FileSystem::read_link` in `impl FileSystem for StdFileSystem` at `:242`); `crates/flux-platform/src/dir_unix.rs` (`DirHandle::read_link`, `DirHandle::create_symlink` beside `remove_file` at `:257`); `crates/flux-platform/src/dir_windows.rs` (`DirHandle::read_link` real; `DirHandle::create_symlink` placeholder, see Step 6); `Cargo.toml:77` (the workspace `windows-sys` features: `FSCTL_GET_REPARSE_POINT` lives in `Win32::System::Ioctl`, which is NOT among the enabled features (`Win32_Foundation`, `Win32_Storage_FileSystem`, `Win32_System_IO`, `Win32_Security`, `Wdk_Foundation`, `Wdk_Storage_FileSystem`, `Wdk_System_SystemInformation`); add `Win32_System_Ioctl`. `DeviceIoControl` is in `Win32::System::IO`, already enabled. The Windows compiler, through CI's `Clippy`/`Test (windows-latest)` legs, is the oracle for any further feature.)
+
+**Interfaces:**
+- Produces (exact, `crates/flux-fs/src/fs.rs`):
+  ```rust
+  pub struct Link { pub payload: std::ffi::OsString, pub kind: LinkKind }   // Debug, Clone, PartialEq, Eq
+  pub enum LinkKind { Unspecified, File, Dir }                               // Debug, Clone, Copy, PartialEq, Eq
+  // FileSystem:
+  fn read_link(&self, path: &Path) -> Result<Link>;
+  // DirHandle:
+  fn create_symlink(&self, name: &std::ffi::OsStr, link: &Link) -> Result<()>;
+  fn read_link(&self, name: &std::ffi::OsStr) -> Result<Link>;
+  ```
+  `crates/flux-fs/src/options.rs`: `pub enum Links { Copy, Skip }` (Debug, Clone, Copy, PartialEq, Eq); `CopyOptions.links: Links`.
+  Fake: `FaultFs::add_symlink_to(&self, path, payload: impl Into<OsString>, kind: LinkKind)`, `FaultFs::set_symlinks_unavailable(&self, on: bool)`; call-log entries `read_link(<path>)` and `create_symlink(<path>)`; fault keys `"read_link"` and `"create_symlink"` for `fail`/`fail_kind`/`fail_nth`/`fail_always`.
+- Refusal contract (3.1; both traits' `read_link`): a non-link at the name is `Code::IoError` with kind `InvalidInput`; a name-surrogate that is not a symlink is `Code::SpecialFileUnsupported`; a missing name is `Code::IoError`/`NotFound`. `create_symlink`: `AlreadyExists` when anything (a dangling link included) holds the name; never creates through a link; `Code::SymlinkCreationUnavailable` when the filesystem or the process cannot create one; `check_component(name)` first.
+
+- [ ] **Step 1: Write the failing fake tests** in `fault_fs.rs`'s `mod tests`: `read_link_returns_the_seeded_payload_and_kind` (`add_symlink_to("/d/l", "../x", LinkKind::Unspecified)`; `fs.read_link("/d/l") == Link{payload: "../x", kind: Unspecified}`; the dir handle's `read_link("l")` equal); `read_link_refuses_a_file_a_dir_and_a_missing_name` (file → `IoError`/`InvalidInput`; dir → same; missing → `IoError`/`NotFound`); `create_symlink_creates_an_entry_that_metadata_reports_as_a_link` (`metadata` is `FileType::Symlink`, `len == payload.len()`, identity `Strong`, `nlink == Some(1)`; `read_link` round trip; the call log holds `create_symlink(/d/n)`); `create_symlink_refuses_an_occupied_name_including_a_dangling_link` (`AlreadyExists` over a file, a dir, a link); `create_symlink_is_unavailable_when_switched_off` (`set_symlinks_unavailable(true)` → `Code::SymlinkCreationUnavailable`; nothing created); `rename_and_remove_carry_a_link_without_touching_its_target` (`add_symlink_to("/d/l", "/d/t", ..)`, `write_file("/d/t", b"keep")`; `rename_no_replace(l → m)` then `read_link("m")`; `remove_file("m")` leaves `/d/t` with `b"keep"`); `a_fault_on_create_symlink_is_delivered` (`fail("create_symlink", Code::IoError)` → `Err` with that code).
+- [ ] **Step 2: Run them to verify they fail**: `cargo nextest run -p flux-core read_link create_symlink rename_and_remove_carry a_fault_on_create_symlink` — expected: compile error (`read_link` not found).
+- [ ] **Step 3: Add the shapes, the trait methods and the option** (Interfaces above, doc comments copied from spec 3.1), then fix every `CopyOptions` literal the compiler names (`links: Links::Copy`), including `crates/flux-cli/src/main.rs:141` (`options()`: `links: Links::Copy` for now; Task 5 wires the flag).
+- [ ] **Step 4: Implement the fake** (file list above). `read_link` on both traits: `record` the call, consult `faults`, then `symlinks.get(&norm(path))`; a path in `types` as `File`/`Dir` → `InvalidInput`; absent → `NotFound`. `create_symlink`: `record`, faults, `set_symlinks_unavailable` → `SymlinkCreationUnavailable` with message `the destination filesystem cannot hold a symlink`; any existing `files`/`directories`/`types` entry at the normalised child path → `AlreadyExists`; else insert `files` (empty), `types = Symlink`, `symlinks`, `mint_identity`. `remove_file` on a link removes all three maps' entries; `rekey` moves them on rename.
+- [ ] **Step 5: Implement the POSIX arms.** `std_fs.rs` `FileSystem::read_link`: `std::fs::read_link(path)` mapped through `FsError::from_io` (an `InvalidInput` from `EINVAL` is the non-link refusal, 3.1), `kind: Unspecified`. `dir_unix.rs` `DirHandle::read_link`: `check_component`, `rustix::fs::readlinkat(&self.0, name, Vec::new())`, `from_io`. `dir_unix.rs` `DirHandle::create_symlink`: `check_component`, `rustix::fs::symlinkat(link.payload.as_os_str(), &self.0, name)`; `Errno::EXIST` → `from_io` (kind `AlreadyExists`); `Errno::PERM` → `FsError::new(Code::SymlinkCreationUnavailable, io::Error::new(PermissionDenied, "the destination filesystem cannot hold a symlink"))`; everything else `from_io` (so `EACCES` stays `PermissionDenied`). (R-L1 may amend the `EPERM` line in Task 7.)
+- [ ] **Step 6: Implement the Windows arm.** `read_link`: open the child with `FILE_OPEN_REPARSE_POINT` as `open_lock_at` does (`dir_windows.rs:789`), read the tag with `reparse_tag_of` (`:1480`): `None` → `IoError`/`InvalidInput`; a tag other than `IO_REPARSE_TAG_SYMLINK` (`0xA000000C`) → `Code::SpecialFileUnsupported` with message `a junction or mounted-volume folder is not a symlink`; else `FSCTL_GET_REPARSE_POINT` (`DeviceIoControl`) into a `REPARSE_DATA_BUFFER` (declare its `#[repr(C)]` symlink layout locally if `windows-sys` 0.61 does not export it, as `FileAttributeTagInfo` is declared at `dir_windows.rs:1491-1495`), payload = the `PrintName` (or `SubstituteName` with a `\??\` prefix stripped; R-W3 decides which, Task 7 may amend), `kind` = `Dir` when the handle's attributes carry `FILE_ATTRIBUTE_DIRECTORY`, else `File`. `create_symlink`: `check_component`, then `Err(FsError::new(Code::SymlinkCreationUnavailable, io::Error::other("symlink creation needs Developer Mode or the SeCreateSymbolicLinkPrivilege right (not yet wired on Windows: cut 10a Task 7)")))`, a placeholder that is spec-conformant (§127's failure) until Task 7 lands R-W1.
+- [ ] **Step 7: Run the fake tests**: the Step 1 list passes; then `cargo build --workspace --all-targets` and `cargo clippy --workspace --all-targets --release -- -D warnings` clean.
+- [ ] **Step 8: Run the gate**: `TMPDIR=$HOME/ff_tmp just check` → all passed (the count grows by the new fake tests), 6 skipped.
+- [ ] **Step 9: Commit** `feat(fs): read_link and create_symlink on the traits, the Links option, the fake and the arms (cut 10a)`.
+
+### Task 2: Platform tests for the arms
+
+**Files:**
+- Modify: `crates/flux-platform/tests/dir_handle.rs` (the `#[cfg(unix)] mod posix` at `:1-815`; the `#[cfg(windows)] mod windows_arm` at `:816`).
+
+**Interfaces:**
+- Consumes: Task 1's `DirHandle::create_symlink`/`read_link`, `StdFileSystem::read_link`.
+
+- [ ] **Step 1: Write the POSIX tests** (in `mod posix`, with `TempDir` and `StdFileSystem.destination_root` as `:10-13` do): `create_symlink_and_read_link_round_trip_every_payload_shape` (payloads `"rel/x"`, `"/abs/x"`, `"dangling"`, `"../../etc/passwd"`, and a non-UTF-8 `OsStr::from_bytes(b"na\xefve")`; each `read_link(name).payload` equals the input byte for byte; `std::fs::read_link` agrees); `create_symlink_refuses_an_occupied_name` (a file, a directory, a dangling link: `AlreadyExists`); `create_symlink_refuses_a_bad_component` (`"a/b"` → the `check_component` error, nothing created); `a_created_links_metadata_is_the_links_own` (`metadata(name).file_type == Symlink`, its identity differs from the target's `std::fs::metadata` inode); `rename_and_remove_act_on_the_link_never_its_target` (target file keeps its bytes after `rename_no_replace`, `rename_replace` over a file, `remove_file`); `read_link_refuses_a_file_and_a_directory_as_invalid_input` (`IoError`/`InvalidInput`); `an_empty_payload_is_the_os_error_not_a_panic` (payload `""`: `Err` with kind from the OS (`NotFound` on Linux), nothing created) — Review Focus 1.
+- [ ] **Step 2: Write the Windows tests** (in `mod windows_arm`): a helper `fn can_create_symlinks(dir: &Path) -> bool` that tries `std::os::windows::fs::symlink_file` once; `create_symlink_without_the_right_is_unavailable_and_creates_nothing` (if `can_create_symlinks` → `println!("skipped: this runner can create symlinks")` and return; else `create_symlink` → `Code::SymlinkCreationUnavailable`, the name absent); `read_link_on_a_junction_is_special_file_unsupported` (make a junction with `cmd /C mklink /J`; `read_link` → `Code::SpecialFileUnsupported`); `read_link_on_a_file_is_invalid_input`.
+- [ ] **Step 3: Run**: `cargo nextest run -p flux-platform --test dir_handle` → every new test passes on Linux; on CI, Windows and macOS legs pass (push happens at the end of the plan; a reviewer reads the test for the Windows arm).
+- [ ] **Step 4: Commit** `test(platform): symlink round trips, refusals and the Windows unavailable path (cut 10a)`.
+
+### Task 3: The engine: `link_one`, the variants, the counters, the CLI rendering
+
+**Files:**
+- Modify: `crates/flux-core/src/tree.rs` (`TreeFailureCause` at `:169-194`: remove `Symlink`, add `SymlinkSkipped`; `FailureTally` at `:199-234` (`count` at `:226`): remove `symlink` and its `count` arm, add the `SymlinkSkipped => {}` arm; `TreeOutcome` at `:32-55`: add `pub symlinks_skipped: u64`; the `WalkEvent::Symlink` arm at `:740-745`; new `fn link_one` after `copy_one` (`:1021`); the test `a_symlink_is_a_failure_and_never_copied` at `:2752` replaced; the tally test at `:2265`/`:2275`).
+- Modify: `crates/flux-cli/src/report.rs` (`:15-16` `SYMLINK_WHY` text; `:85` `files_failed = out.failures.copy`; `:78` add `out.symlinks_skipped`; `:182-184` the `SymlinkSkipped` line; tests `:573`, `:581`, `:690`), `crates/flux-cli/src/main.rs:265-272` (the K7 message uses the new `SYMLINK_WHY`).
+
+**Interfaces:**
+- Consumes: Task 1's traits and `CopyOptions.links`.
+- Produces: `fn link_one<F: DestinationRoot>(cx: &Shared<'_, F>, parent: &F::Dir, names: &mut NameIndex, batch: &mut Batch<F::Writer>, claim_parent: Option<ObjectId>, fresh: bool, path: PathBuf, out: &mut TreeOutcome, on_report: &mut dyn FnMut(TreeFailure)) -> Result<(), CopyError>` (the exact parameter list of `copy_one`, `tree.rs:1021-1031`); `TreeFailureCause::SymlinkSkipped`; `TreeOutcome.symlinks_skipped`; `report::SYMLINK_WHY = "a symlink SOURCE is not followed; copy its parent folder, or name its target"`; the record line `"{p}: object_type=symlink action=skipped (--links=skip)"`.
+
+- [ ] **Step 1: Write the failing engine tests** in `tree.rs`'s `mod tests` (helpers `tree()`, `run()`, `opts()` as `:2752-2765` use): `links_are_recreated_with_their_payloads_and_count_as_copied_with_no_bytes` (spec test 1: `add_symlink_to("/src/rel", "a/b")`, `"/src/abs", "/x/y"`, `"/src/dangling", "nowhere"`, one file; `fs.read_link("/dst/rel")` etc. equal; `files_copied == 4`, `bytes_copied == file len`, no failures; the call log has no `open_read` or `metadata` of `/src/a/b`, `/x/y`, `/src/nowhere` — I2); `an_existing_file_at_a_links_name_is_replaced_under_overwrite` (spec 5, first row; `files_overwritten == 1`; the fake's `claim(parent, "n")` is `Created` after); `a_directory_at_a_links_name_is_refused` (`TreeFailureCause::Copy` with `Code::DestinationError`, the dir untouched); `a_link_and_a_file_folding_to_one_name_collide` (spec 6: `set_case_insensitive(true)`, `/src/A` file, `/src/a` link; the second is `DestinationNamespaceCollision`; exactly one object at the destination); `a_failed_read_link_is_a_source_step_failure` (`fail("read_link", Code::IoError)` → `Copy(e)` with `e.step == CopyStep::Source`, nothing created); `a_failed_create_symlink_leaves_nothing` (`fail("create_symlink", Code::IoError)` → `Copy(e)`, `e.step == CopyStep::Create`, no temp); `an_unavailable_creation_is_reported_with_its_code_and_the_files_still_copy` (spec 4: `set_symlinks_unavailable(true)`, 3 links + 1 file → `failures.copy == 3` each with `Code::SymlinkCreationUnavailable`, `files_copied == 1`, no temp names left); `a_failed_rename_discards_the_temporary` (`fail("rename_no_replace", ..)` → `Copy(e)` at `Publish`, `/dst/n.flux-partial.<op>` absent); `a_reserved_root_link_is_refused_before_it_is_read` (spec 10: `add_symlink_to("/src/.flux", "/elsewhere", ..)` → `Copy` at `Gate`; the log holds no `read_link(/src/.flux)`); `a_link_named_dot_flux_below_the_root_is_ordinary_data` (Review Focus 4: `/src/sub/.flux` link → created); `a_junction_classified_link_is_a_skipped_special_file` (spec 13: `fail_kind("read_link", Code::SpecialFileUnsupported, ..)` → `SpecialFileSkipped`, `special_files_skipped == 1`, `files_failed == 0`); `a_destination_that_is_the_source_link_by_identity_is_refused` (spec 11: `set_identity` equal Strong on `/src/l` and `/dst/l` → `SafetyRejected`); the replaced `a_symlink_is_a_failure_and_never_copied` is deleted.
+- [ ] **Step 2: Write the failing CLI report tests** in `report.rs`'s tests: update `:573`/`:581` (no `symlink` field; `files_failed = copy` only); replace the `:690` line case with `line("l", TreeFailureCause::SymlinkSkipped) == "l: object_type=symlink action=skipped (--links=skip)"`; `files_skipped_adds_skipped_links` (`out.symlinks_skipped = 2` → `files_skipped == 2 + special + skipped + resumed`).
+- [ ] **Step 3: Run them to verify they fail**: `cargo nextest run -p flux-core links_are_recreated` → compile error (no `add_symlink_to` use yet compiles, but `link_one` missing: the walk arm still reports `Symlink`) or FAIL.
+- [ ] **Step 4: Implement `link_one`** (spec 3.2, in this order; every `beat`/`guard` as written there): step 1 reserved check (as the `File` arm at `:721-725`); step 2 `cx.opts.links == Links::Skip` → `report(.., TreeFailureCause::SymlinkSkipped)`, `out.symlinks_skipped += 1`, return; step 3 `cx.fs.read_link(&src)`: `SpecialFileUnsupported` → `SpecialFileSkipped` and `out.special_files_skipped += 1`; other errors → `finish_copy(path, Err(CopyError::at(CopyStep::Source, e)), ..)`; step 4 the no-claim-store arm (`:1035-1055`'s shape, `Publish::NoReplace`), `FluxPathKey::from_relative`, the aged/folded pre-check (`:1076-1083`), `names.resolve`, the `names.owner` refusal, the `--resume` branch (Task 4 completes it), the directory refusal, the policy (3.3; Task 4 completes `--update`), `cx.fs.metadata(&src)` then `identity_gate(parent, name, &src_meta, cx.opts.safety, publish)` (`copy.rs:289`); step 5 as spec 3.2 (temp probe flush, leftover removal, hooks, `create_symlink(temp)`, `metadata(temp).identity`, the Strict `write_note` through a `PublishIntent { temp, identity }`, `beat`/`guard`, the rename, `discard` on failure, `discard_note_on_failure`, the claim recording, `names.record_publication`, `files_overwritten`); step 6 `finish_copy(path, Ok(Outcome { bytes_copied: 0, metadata_failures: vec![], identity_degraded: gate.degraded, published_identity, skipped: false }), ..)`. The walk arm at `:740-745` calls `link_one` under a live frame exactly as the `File` arm calls `copy_one` (`:711-737`, minus the open-writers cap loop, which a link does not need).
+- [ ] **Step 5: Remove `TreeFailureCause::Symlink` and `FailureTally::symlink`; add `SymlinkSkipped` and `TreeOutcome::symlinks_skipped`; update `report.rs` and `main.rs`** per the Files list.
+- [ ] **Step 6: Run**: `cargo nextest run -p flux-core -p flux-cli` → the Step 1-2 tests pass; the existing tree, copy and report tests pass unchanged except the three named edits.
+- [ ] **Step 7: Run the gate** (`TMPDIR=$HOME/ff_tmp just check`, clippy release).
+- [ ] **Step 8: Commit** `feat(tree): recreate symlinks through the per-entry protocol; --links=skip records; link failures are copy failures (cut 10a)`.
+
+### Task 4: The engine edges: `--update`, `--resume`, Strict notes, the batch backstops, degraded identities, the claim upgrade
+
+**Files:**
+- Modify: `crates/flux-core/src/tree.rs` (`link_one`; `record_claim` at `:2035-2048`).
+
+**Interfaces:**
+- Consumes: Task 3's `link_one`.
+- Produces: `record_claim` upgrades a present own `Existing` claim to `Created` when the record is `Created` (spec 3.2 step 5); the link equality rule `payload && kind` shared by `--update` and resume.
+
+- [ ] **Step 1: Write the failing tests** (`tree.rs` tests): `update_skips_an_equal_link_and_replaces_a_different_one_or_a_file` (spec 5: equal payload+kind → `files_skipped += 1`, untouched; different payload of EQUAL LENGTH → replaced (the length mutant); a file at the name → replaced); `update_treats_an_unreadable_destination_link_as_different` (Review Focus 2: `fail_nth("read_link", 1, Code::SpecialFileUnsupported, ..)` on the destination read → replaced, not failed); `skip_existing_skips_whatever_holds_the_name` (a file, a link, a dangling link → skipped); `a_created_link_claim_with_the_same_payload_is_resumed_and_a_different_one_republished` (spec 7: seed a `Created` claim for the target and the link at the name; `cx.resume` run → `files_resumed == 1`, no `create_symlink` in the log; then with a different payload at the name → republished, `files_resumed == 0`); `a_strict_run_notes_the_link_before_the_rename_and_commits_after` (spec 8: Strict + a prepared-capable store; `prepared_count()` is 1 between the create and the rename (use `on_nth("rename_no_replace", 1, ..)` to observe), 0 after; `fail_nth("rename_no_replace", 1, ..)` → no note, no temp); `a_pending_batch_is_flushed_before_a_link_touches_an_occupied_temp_name` (spec 4c: `set_case_insensitive(true)`, Strict, batching on, `BatchPolicy { fold_precheck: false, .. }` as the decision-6 test at `:435` documents, non-ASCII names `É` (file, batched) then `é` (link): the file is published, the link is `DestinationNamespaceCollision`, the file's temporary was never removed (the log has no `remove_file(/dst/É.flux-partial.<op>)`)); `a_weak_source_identity_on_a_replace_is_degraded_or_refused_under_strict_safety` (spec 4b: an existing entry at the name, `set_identity("/src/l", Weak(..))` → `files_degraded == 1` and a warning; with `Safety::Strict` → `SafetyRejected`); `record_claim_upgrades_an_own_existing_claim_to_created` (spec 8c: insert `Existing` for the target, publish the link as New (the name absent) → `claim(..)` is `Created`; a foreign claim is still refused); `a_lost_lock_before_the_publish_keeps_the_temporary_and_stops` (spec test 9's guard mutant: a `guard` closure that fails on its first call after `create_symlink` (count the calls) → the run stops with that error, the error's `leftover` names `<name>.flux-partial.<op>`, the temp still exists, no `remove_file` of it in the log. Mutant: the guard check before the rename removed, which publishes under a lost lock).
+- [ ] **Step 2: Run to verify they fail**: `cargo nextest run -p flux-core update_skips a_created_link_claim a_strict_run_notes a_pending_batch a_weak_source record_claim_upgrades` → FAIL.
+- [ ] **Step 3: Implement**: the `--update` arm compares `parent.read_link(&stored)` (an `Err` is "different") with the source `Link` by `payload` and `kind`; the resume branch (3.4) uses the same comparison in place of `resumed_complete`, then `files_resumed += 1` and `names.record_publication(&target, Some(&stored), name, None, meta.identity)` (`:1150-1156`); the Strict note and `discard_note_on_failure` as `copy_one`'s New/Replace arms do (the `hook` closure and `discard_note_on_failure` at `:1275-1296` for New and `:1385-1403` for Replace); the temp-probe flush and the `AlreadyExists` flush-and-retry (3.2 step 5); `record_claim`: on `ClaimOutcome::Present(r)` with `r.target == record.target && r.status == ClaimStatus::Existing && record.status == ClaimStatus::Created` → `claims.borrow_mut().upgrade_own_claim(key, &record.target)`.
+- [ ] **Step 4: Run** the Step 1 tests and the whole `flux-core` suite; then the gate.
+- [ ] **Step 5: Commit** `feat(tree): link policies, resume, strict notes, batch backstops and the claim upgrade (cut 10a)`.
+
+### Task 5: `--links` on the CLI and in the resume configuration
+
+**Files:**
+- Modify: `crates/flux-cli/src/main.rs` (`enum LinksArg { Copy, Skip }` with `ValueEnum` beside `DurabilityArg` at `:110-114`; `#[arg(long, value_enum, default_value_t = LinksArg::Copy)] links: LinksArg` on `CopyArgs`; `options()` at `:137` maps it; the `--preserve-times`/`--preserve-permissions` doc comments at `:60-66` gain "a symlink's own times/permissions are not preserved").
+- Modify: `crates/flux-core/src/state.rs` (`Options` at `:74-82`: `#[serde(default = "links_copy")] pub links: String` with `fn links_copy() -> String { "copy".into() }`; `Options::of` at `:85-111`; `canonical_bytes` at `:115-122`: append `links=skip\n` only when `self.links == "skip"`; `validate` at `:499` / the `one_of` block at `:555-566`: `one_of("links", &o.links, &["copy", "skip"])`).
+- Modify: `crates/flux-core/src/run/resume.rs` (`validate`'s list at `:96-101` gains `("links", &then.links, &now.links)`).
+- Test: `crates/flux-cli/tests/copy.rs` (helpers `flux()`, `stderr()`, `json()`, `tree_in()` at `:5-18`); `crates/flux-core/src/run/tests.rs` (beside `an_incompatible_option_is_refused_naming_it_and_nothing_changes` at `:2973` and `a_tampered_fingerprint_is_state_corrupt_on_resume` at `:3057`); `crates/flux-core/src/state.rs` tests (beside `the_fingerprint_is_blake3_of_the_canonical_lines_and_ignores_durability` at `:1997`).
+
+**Interfaces:**
+- Consumes: Task 1's `Links`; Task 3's skip path.
+- Produces: `--links=<copy|skip>`; `state::Options.links`.
+
+- [ ] **Step 1: Write the failing tests**: `state.rs`: `a_copy_links_fingerprint_is_the_four_line_one_and_skip_adds_a_line` (`Options { links: "copy", .. }.canonical_bytes()` equals the pre-cut four-line bytes exactly; `"skip"` appends `links=skip\n`); `a_state_without_links_deserializes_as_copy` (a literal JSON `options` object with the five pre-cut fields → `links == "copy"`; `validate` passes); `run/tests.rs`: `resume_with_a_different_links_setting_is_incompatible` (a `--links=copy` operation, then `--resume` with `links: Links::Skip` → `INCOMPATIBLE_STATE` naming `links`, nothing changed); `a_pre_cut_state_file_resumes_as_copy` (write the state JSON WITHOUT `links` and with its four-line fingerprint through the fake, then `--resume` → adopted, not `STATE_CORRUPT`); `crates/flux-cli/tests/copy.rs` (Unix, `#[cfg(unix)]`): `links_are_copied_by_default_and_skipped_on_request` (spec 16: a tree with a relative and an absolute link; `flux copy` exit 0, `std::fs::read_link` equal, the JSON `files_copied` counts them; `--links=skip` exit 0, stderr holds `rel: object_type=symlink action=skipped (--links=skip)`, nothing at the names); `links_follow_is_a_usage_error` (exit 2); `a_second_run_with_update_skips_equal_links` (`files_skipped` counts them); `a_symlink_source_prints_the_corrected_refusal` (spec 17: exit 1, the new `SYMLINK_WHY` text).
+- [ ] **Step 2: Run to verify they fail** (`cargo nextest run -p flux-core -p flux-cli links_ resume_with_a_different_links a_pre_cut_state a_copy_links_fingerprint a_state_without_links`) → FAIL/compile error.
+- [ ] **Step 3: Implement** per the Files list.
+- [ ] **Step 4: Run** the tests, then the gate.
+- [ ] **Step 5: Commit** `feat(cli): --links=<copy|skip>, part of the resume configuration (cut 10a)`.
+
+### Task 6: Link artefacts in the sweep, note recovery and cleanup
+
+**Files:**
+- Modify: `crates/flux-core/src/run/sweep.rs:48-50` (`Ok(WalkEvent::File { path }) | Ok(WalkEvent::Symlink { path }) => path`); `crates/flux-core/src/run/recover.rs:157-158` (`Ok(m) if matches!(m.file_type, FileType::File | FileType::Symlink) => Some(m.identity)`, comment updated); `crates/flux-core/src/cleanup/artifacts.rs:80` (`Ok(meta) if matches!(meta.file_type, FileType::File | FileType::Symlink) => {}`, the message at `:84` becomes "a recorded artifact is not a regular file or a link").
+- Test: `crates/flux-core/src/cleanup/artifacts.rs` tests (`remove_validated_refuses_a_link_component_and_a_directory_leaf` at `:200`: its third case at `:226-230` (a link LEAF) inverts to `Removed::Deleted` and moves into a new `remove_validated_deletes_a_link_leaf_and_leaves_its_target`); `crates/flux-core/src/run/tests.rs` (beside `recovery_row_2_not_renamed_discards_and_the_walk_redoes` at `:4811`, `recovery_row_1_removes_a_stray_temp_name_of_the_same_object` at `:4766`, `restart_supersedes_a_prior_deleting_its_partials_then_its_workspace` at `:390`).
+
+**Interfaces:**
+- Consumes: Tasks 1-4.
+
+- [ ] **Step 1: Write the failing tests**: `artifacts.rs`: `remove_validated_deletes_a_link_leaf_and_leaves_its_target` (a link at `dir/c.flux-partial.<ID>` pointing at `/dest/keep`; `Deleted`; `/dest/keep` intact), the component/directory refusals unchanged; `run/tests.rs`: `recovery_row_2_discards_a_link_temporary` (spec 8a: a note whose temp is a link at the temp name, nothing at the entry → `NotRenamed`, the temp unlinked, its target intact, the note gone); `recovery_row_1_removes_a_stray_link_temporary` (the link renamed to the entry and a stray link at the temp name with the same identity → committed, the stray removed); `a_directory_at_a_link_notes_temp_name_stays_uncertain`; `restart_deletes_a_prior_operations_link_temporary` (spec 13a: a link planted at `<name>.flux-partial.<prior-id>` → `--restart` deletes it through `remove_file`; the target intact; the same under `flux cleanup`); `a_kept_link_temporary_is_cleaned_up_by_cleanup` (spec 8b: `fail_always("rename_no_replace", ..)` plus `fail_always("remove_file", ..)` for the temp → the run records the leftover in `cleanup_pending_artifacts`; then `cleanup` with the faults cleared deletes it: `Deleted`, exit 0 of the report); `a_resume_after_a_crash_between_create_and_rename_republishes_the_link` (Review Focus 5: `on_nth("create_symlink", 1, |fs| panic or fault the rename)` so the first run leaves the link temp; the second run with the same operation id removes it under the guard (the log has `remove_file(..flux-partial..)` after a `guard`) and publishes; the claim is `Created`).
+- [ ] **Step 2: Run to verify they fail** → the three new acceptances missing: FAIL (`uncertain`, `Kept`, the link survives).
+- [ ] **Step 3: Implement** the three one-line changes.
+- [ ] **Step 4: Run** the tests, then the gate.
+- [ ] **Step 5: Commit** `fix(run): the partial sweep, note recovery and cleanup accept link artefacts (cut 10a)`.
+
+### Task 7 (GATED on R-W1, R-W3, R-L1): The Windows creation mechanism
+
+**Files:**
+- Modify: `crates/flux-platform/src/dir_windows.rs` (`DirHandle::create_symlink` replaces Task 1's placeholder; `read_link`'s payload source per R-W3); `crates/flux-platform/src/dir_unix.rs` (the `EPERM` line per R-L1, only if the measurement contradicts it).
+- Test: `crates/flux-platform/tests/dir_handle.rs` (`mod windows_arm`); `docs/accepted-boundaries.md` (an entry for the owner-measured success path, if CI cannot run it).
+
+**Interfaces:**
+- Consumes: Task 0's rulings.
+- Produces: the contract of spec 3.1 on Windows.
+
+- [ ] **Step 1: Read the rulings** in this plan's ledger. If R-W1 says (b) works in Developer Mode: implement `create_symlink` as `CreateSymbolicLinkW(canonical_path().join(name), payload, SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE | (SYMBOLIC_LINK_FLAG_DIRECTORY if kind == Dir))` after re-checking that `metadata_at(self, "")`/the handle's identity (`identity()`, `dir_windows.rs:246`) equals the identity of the object at `canonical_path()` (refuse with `SafetyRejected` otherwise); `ERROR_PRIVILEGE_NOT_HELD` (1314), `ERROR_NOT_SUPPORTED` (50), `ERROR_INVALID_FUNCTION` (1) → `SymlinkCreationUnavailable` with the message naming Developer Mode or `SeCreateSymbolicLinkPrivilege`; `ERROR_ALREADY_EXISTS`/`ERROR_FILE_EXISTS` → `AlreadyExists`. If R-W1 says only (a) works: implement (a) with `FILE_DELETE_ON_CLOSE` cleared after the FSCTL succeeds (spec 3.7), and record the residue closure in spec §9. `LinkKind::Unspecified` creates a file link (D9).
+- [ ] **Step 2: Write the Windows tests**: `create_symlink_round_trips_file_and_dir_links_when_the_runner_can` (skips with a printed reason when `can_create_symlinks` is false; else: file link, dir link, dangling, relative and absolute payloads round-trip through `read_link`, `kind` is `File`/`Dir` as created); the Task 2 unavailable test keeps pinning the no-right path.
+- [ ] **Step 3: OWNER runs** `cargo nextest run -p flux-platform --test dir_handle` on the Developer-Mode box and pastes the summary line into the ledger; CI runs the unavailable path.
+- [ ] **Step 4: Gate, then commit** `feat(platform): Windows symlink creation per the measured mechanism (cut 10a)`.
+
+### Task 8: The directory-link replacement retry in the Windows arm (R-W2 ruled: option B)
+
+**Files:**
+- Modify: `crates/flux-platform/src/dir_windows.rs` (`rename_at` at ~:1437 and its callers `rename_replace`/`rename_no_replace`; reuse `surrogate_tag_at` at ~:1552 and the `FileRenameInformationEx` / `FILE_RENAME_POSIX_SEMANTICS` imports the probe module already compiles with).
+- Test: `crates/flux-platform/tests/dir_handle.rs` (`mod windows_arm`); extend `crates/flux-platform/src/symlink_probe.rs` with the follow-up probes.
+
+**Interfaces:**
+- Consumes: Task 7's real `create_symlink`; measured R-W2 (spec 3.7, owner-approved option B).
+- Produces: `DirHandle::rename_replace` on Windows replaces an existing directory link atomically; nothing else changes (trait signature, other platforms, the engine).
+
+- [ ] **Step 1: Write the failing Windows tests** (`mod windows_arm`, skip with a printed reason when `!can_create_symlinks`): `rename_replace_replaces_a_directory_link_with_a_regular_file` (a directory link `L` to an existing directory `T`; a staged file `f`; `rename_replace(f -> L)`: the name is now a regular file with the staged bytes, `T` and its contents untouched); `rename_replace_still_replaces_a_file_with_a_directory_link` (regression: the case that already worked); `rename_replace_over_a_directory_link_fails_cleanly_when_the_retry_fails` is NOT written (cannot be provoked portably; state this in the report).
+- [ ] **Step 2: Implement** in `rename_at`: after the plain `NtSetInformationFile(FileRenameInformation)` returns `STATUS_ACCESS_DENIED` (0xC0000022) with `r == true`, and `surrogate_tag_at(td, t)` is `Some(_)`, rebuild the rename information for `FileRenameInformationEx` with `FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS` and call once more; any other status, or a second failure, is returned exactly as today. A `// SAFETY:`/rationale comment cites spec 3.7 and the measurement.
+- [ ] **Step 3: Extend the probe** (follow-up for the owner, safe either way): `probe_rename_replace_over_and_with_a_directory_link` gains `dir-link-at-temp-over-dir-link` and `file-at-temp-over-junction`, each with plain and Ex+POSIX.
+- [ ] **Step 4: Gates**: Windows `cargo check`/`clippy` for flux-platform rc=0; `TMPDIR=$HOME/ff_tmp just check`; release clippy; commit `feat(platform): replace an existing Windows directory link atomically (cut 10a)`. The OWNER runs the Windows tests and the extended probe.
+
+### Task 9: Documentation and the deviation record
+
+**Files:**
+- Modify: `TODO.md:236-239` (the "Symlinks are never recreated" item: `- [x]`, closed by cut 10a with the PR number; two new `- [ ]` lines under the same section: "a symlink given as SOURCE is still refused (K7); copying a single link is a later cut" (D1) and "a link's own timestamps and permissions are not preserved under --preserve-times/--preserve-permissions (cut 10a D4, §44.1 deviation); needs a NOFOLLOW primitive on every arm"); `docs/superpowers/specs/2026-10-16-cut-10a-symlink-copying-design.md` section 9 (the rulings R-W1, R-W2, R-W3, R-L1, the Windows outcome, any plan ruling that changed the design); `docs/accepted-boundaries.md` (the Windows success-path entry if Task 7 could not run it on CI); `ROADMAP.md:46` (row 7: "symlink copying" done, PR number).
+
+- [ ] **Step 1: Make the edits**; **Step 2: `just check`** (the docs checks: `typos`, the tracker-status check); **Step 3: Commit** `docs: cut 10a rulings, TODO and roadmap (symlink copying)`.
+
+---
+
+## Ledger of rulings (filled during execution)
+
+- R-W1: (Task 0, owner)
+- R-W2: (Task 0, owner)
+- R-W3: (Task 0, owner)
+- R-L1: (Task 0, owner)
+
+## Self-review (writing-plans)
+
+- Spec coverage: 3.1 → Task 1; 3.2 → Tasks 3-4; 3.3 → Task 4; 3.4 → Tasks 4 (resume) and 6 (sweep, recovery, cleanup); 3.5 → Task 3; 3.6 → Task 5; 3.7 → Tasks 1 (POSIX, Windows `read_link`, the placeholder), 7, 8, 0 (measurements); 3.8 → Task 1; section 6's tests 1-17 → Tasks 2-8 as named; D1/D4 debt lines → Task 9.
+- Step scan: every test step names the test and its assertions; every code step names the file, the function and the values; the one open algorithm (Windows creation) is gated on a measurement with both outcomes written.
+- Type consistency: `Link`, `LinkKind`, `Links` (Task 1) are the names used by Tasks 3-8; `link_one`'s signature equals `copy_one`'s; `TreeFailureCause::SymlinkSkipped` and `TreeOutcome::symlinks_skipped` (Task 3) are what Task 5's CLI test reads.
+- Review Focus: each of the five lines names its owning task and test.
+- Proportion: the plan is about 60% of the spec's length; code blocks hold signatures and shapes only.

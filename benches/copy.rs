@@ -15,7 +15,9 @@
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use flux_core::run::{self, RunConfig};
-use flux_fs::{CopyOptions, Durability, ExistingPolicy, OperationId, Preserve, Publish, Safety};
+use flux_fs::{
+    CopyOptions, Durability, ExistingPolicy, Links, OperationId, Preserve, Publish, Safety,
+};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -30,6 +32,7 @@ fn options(durability: Durability) -> CopyOptions {
         safety: Safety::Default,
         operation_id: OperationId::new(String::new()),
         existing: ExistingPolicy::Overwrite,
+        links: Links::Copy,
     }
 }
 

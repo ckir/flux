@@ -828,6 +828,9 @@ mod tests {
         fn create_dir(&self, _: &Path) -> Result<()> {
             unimplemented!("EscapingFs exists only to break read_dir")
         }
+        fn read_link(&self, _: &Path) -> Result<flux_fs::Link> {
+            unimplemented!("EscapingFs exists only to break read_dir")
+        }
     }
 
     #[test]

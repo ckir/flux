@@ -72,6 +72,15 @@ pub enum ExistingPolicy {
     SkipExisting,
 }
 
+/// What a copy does with a symlink in the source tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Links {
+    /// Recreate it as a link, payload verbatim.
+    Copy,
+    /// Leave it out.
+    Skip,
+}
+
 #[derive(Debug, Clone)]
 pub struct CopyOptions {
     pub preserve_times: Preserve,
@@ -81,6 +90,7 @@ pub struct CopyOptions {
     pub safety: Safety,
     pub operation_id: OperationId,
     pub existing: ExistingPolicy,
+    pub links: Links,
 }
 
 #[derive(Debug)]

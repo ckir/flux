@@ -79,6 +79,20 @@ pub struct Options {
     pub durability: String,
     pub safety: String,
     pub existing: String,
+    /// `"copy"` or `"skip"`; a state written before cut 10a has no key and reads as `"copy"`. Written only when it is
+    /// `"skip"` (ruling R16), so a copy-mode state is byte-identical to the pre-cut format, which a pre-cut binary
+    /// (`deny_unknown_fields`) still reads.
+    #[serde(default = "links_copy", skip_serializing_if = "is_copy")]
+    pub links: String,
+}
+
+fn links_copy() -> String {
+    "copy".to_string()
+}
+
+#[allow(clippy::ptr_arg)] // serde's `skip_serializing_if` passes `&String`.
+fn is_copy(v: &String) -> bool {
+    v == "copy"
 }
 
 impl Options {
@@ -109,17 +123,26 @@ impl Options {
                 ExistingPolicy::SkipExisting => "skip-existing",
             }
             .to_string(),
+            links: match opts.links {
+                flux_fs::Links::Copy => "copy",
+                flux_fs::Links::Skip => "skip",
+            }
+            .to_string(),
         }
     }
 
-    /// `FINGERPRINT_HEADER`, then the four covered options, one `name=value` line each. `durability` is not covered
+    /// `FINGERPRINT_HEADER`, then the four covered options, one `name=value` line each, then `links=skip` only when
+    /// links are skipped (so every state written before cut 10a keeps its exact hash). `durability` is not covered
     /// (it is compared by rule at resume).
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        format!(
+        let mut text = format!(
             "{FINGERPRINT_HEADER}preserve_times={}\npreserve_permissions={}\nsafety={}\nexisting={}\n",
             self.preserve_times, self.preserve_permissions, self.safety, self.existing
-        )
-        .into_bytes()
+        );
+        if self.links == "skip" {
+            text.push_str("links=skip\n");
+        }
+        text.into_bytes()
     }
 
     /// Lowercase hex of `blake3(canonical_bytes())`.
@@ -564,6 +587,7 @@ fn validate(s: &OperationState) -> Result<(), String> {
         one_of("durability", &o.durability, &["normal", "strict"])?;
         one_of("safety", &o.safety, &["default", "strict"])?;
         one_of("existing", &o.existing, &["overwrite", "update", "skip-existing"])?;
+        one_of("links", &o.links, &["copy", "skip"])?;
         let f = &c.configuration_fingerprint;
         if f.len() != 64 || !f.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
             return Err(format!("configuration_fingerprint is not 64 lowercase hex: {f}"));
@@ -1819,6 +1843,7 @@ mod tests {
             safety: flux_fs::Safety::Default,
             operation_id: flux_fs::OperationId::new(id(1)),
             existing: flux_fs::ExistingPolicy::Overwrite,
+            links: flux_fs::Links::Copy,
         })
     }
 
@@ -1958,7 +1983,7 @@ mod tests {
 
     #[test]
     fn options_of_spells_every_value_as_the_spec_does() {
-        use flux_fs::{CopyOptions, Durability, ExistingPolicy, Preserve, Safety};
+        use flux_fs::{CopyOptions, Durability, ExistingPolicy, Links, Preserve, Safety};
         let with = |f: &dyn Fn(&mut CopyOptions)| {
             let mut o = flux_fs::CopyOptions {
                 preserve_times: Preserve::Default,
@@ -1968,6 +1993,7 @@ mod tests {
                 safety: Safety::Default,
                 operation_id: flux_fs::OperationId::new(id(1)),
                 existing: ExistingPolicy::Overwrite,
+                links: Links::Copy,
             };
             f(&mut o);
             Options::of(&o)
@@ -2005,6 +2031,61 @@ mod tests {
         assert_eq!(strict.fingerprint(), o.fingerprint());
         let update = Options { existing: "update".into(), ..o.clone() };
         assert_ne!(update.fingerprint(), o.fingerprint());
+    }
+
+    #[test]
+    fn a_copy_links_fingerprint_is_the_four_line_one_and_skip_adds_a_line() {
+        let o = options_default();
+        assert_eq!(o.links, "copy");
+        assert_eq!(
+            o.canonical_bytes(),
+            b"flux-config-v1\npreserve_times=default\npreserve_permissions=default\nsafety=default\nexisting=overwrite\n"
+        );
+        assert_eq!(
+            o.fingerprint(),
+            "6814cb38cd3fe6c13a382a988c9c5cbac2ebcf30be0bb4af44596d3019b19f1d",
+            "the pre-cut fingerprint, computed before links existed"
+        );
+        let skip = Options { links: "skip".into(), ..o.clone() };
+        assert_eq!(
+            skip.canonical_bytes(),
+            b"flux-config-v1\npreserve_times=default\npreserve_permissions=default\nsafety=default\nexisting=overwrite\nlinks=skip\n"
+        );
+        assert_ne!(skip.fingerprint(), o.fingerprint());
+    }
+
+    #[test]
+    fn a_state_without_links_deserializes_as_copy() {
+        let o: Options = serde_json::from_str(
+            r#"{"preserve_times":"default","preserve_permissions":"default","durability":"normal","safety":"default","existing":"overwrite"}"#,
+        )
+        .unwrap();
+        assert_eq!(o.links, "copy");
+        let mut s = tree_v3();
+        s.config.as_mut().unwrap().options = o;
+        assert_eq!(validate(&s), Ok(()));
+        let mut bad = s.clone();
+        bad.config.as_mut().unwrap().options.links = "follow".into();
+        assert!(validate(&bad).unwrap_err().starts_with("links is not one of"));
+    }
+
+    #[test]
+    fn a_copy_mode_state_is_written_without_a_links_key_and_a_skip_mode_state_with_one() {
+        // Ruling R16. Mutant: the `skip_serializing_if` removed (a copy-mode state then carries `"links":"copy"`,
+        // which a pre-cut `deny_unknown_fields` binary refuses).
+        let copy = tree_v3();
+        assert_eq!(copy.config.as_ref().unwrap().options.links, "copy");
+        let v: serde_json::Value = serde_json::from_slice(&copy.encode()).unwrap();
+        let options = v["options"].as_object().unwrap();
+        assert!(!options.contains_key("links"), "{options:?}");
+        assert_eq!(options.len(), 5, "the pre-cut five option keys: {options:?}");
+        assert_eq!(decode(&copy.encode()).unwrap(), copy, "round trip");
+
+        let mut skip = tree_v3();
+        skip.config.as_mut().unwrap().options.links = "skip".into();
+        let v: serde_json::Value = serde_json::from_slice(&skip.encode()).unwrap();
+        assert_eq!(v["options"]["links"], "skip");
+        assert_eq!(decode(&skip.encode()).unwrap(), skip, "round trip");
     }
 
     #[test]
