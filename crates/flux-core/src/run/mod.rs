@@ -8,6 +8,7 @@
 //! `stop` is 1; with no `stop`, the copy's own rule decides (`exit_code::for_tree` / `for_file`); `warnings` never
 //! change it.
 
+mod dry_prior;
 pub(crate) mod place;
 mod recover;
 mod restart;

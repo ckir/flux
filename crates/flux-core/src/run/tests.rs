@@ -7983,6 +7983,147 @@ fn a_dry_run_with_the_lock_held_by_another_still_plans() {
 }
 
 #[test]
+fn dry_lock_rows_of_the_record_table() {
+    use super::dry_prior::{LockPreview, dry_lock};
+    let dest = OsStr::new("dest");
+    let now = crate::state::wall_time_ns();
+    let code = |p: &LockPreview| match p {
+        LockPreview::Refused(crate::lock::LockError::Refused(r)) => r.code,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    let local = LockCapability::LocalStrong;
+
+    // Absent.
+    let fs = fake();
+    let p = fs.destination_root(Path::new("/p")).unwrap();
+    let site = LockSite::directory(&p, dest).unwrap();
+    let mut w = Vec::new();
+    assert!(matches!(dry_lock(&site, false, local, now, &mut w), LockPreview::Absent));
+    assert!(w.is_empty());
+
+    // A foreign file.
+    let fs = fake();
+    let p = fs.destination_root(Path::new("/p")).unwrap();
+    let site = LockSite::directory(&p, dest).unwrap();
+    dead_lock(&p, "dest.flux-lock", b"hello, not a lock");
+    let mut w = Vec::new();
+    let got = dry_lock(&site, false, local, now, &mut w);
+    assert_eq!(code(&got), LockCode::ControlPlaneNamespaceConflict);
+    assert!(w.is_empty());
+
+    // A torn record: refused, taken over under --break-lock, refused again on an unsupported capability.
+    let fs = fake();
+    let p = fs.destination_root(Path::new("/p")).unwrap();
+    let site = LockSite::directory(&p, dest).unwrap();
+    dead_lock(&p, "dest.flux-lock", &[0u8; 100]);
+    let mut w = Vec::new();
+    let got = dry_lock(&site, false, local, now, &mut w);
+    assert_eq!(code(&got), LockCode::TargetLockUncertain);
+    assert!(w.is_empty());
+    let got = dry_lock(&site, true, local, now, &mut w);
+    assert!(matches!(got, LockPreview::Takeover(crate::lock::record::Uncertain::Torn)), "{got:?}");
+    assert!(matches!(&w[..], [RunWarning::DryRunLockTakeover { why }] if why == "Torn"), "{w:?}");
+    let mut w = Vec::new();
+    let got = dry_lock(&site, true, LockCapability::Unsupported, now, &mut w);
+    assert_eq!(code(&got), LockCode::TargetLockUncertain);
+    assert!(w.is_empty());
+
+    // A dead record whose workspace is missing.
+    let fs = fake();
+    let p = fs.destination_root(Path::new("/p")).unwrap();
+    let site = LockSite::directory(&p, dest).unwrap();
+    let rec = record(&site, &id(5), &format!("operations/{}", id(5)));
+    dead_lock(&p, "dest.flux-lock", &rec.encode());
+    let mut w = Vec::new();
+    let got = dry_lock(&site, false, local, now, &mut w);
+    assert_eq!(code(&got), LockCode::ArtifactOwnershipUncertain);
+    assert!(w.is_empty());
+
+    // A dead record with a trusted workspace, an old heartbeat.
+    let fs = fake();
+    let p = fs.destination_root(Path::new("/p")).unwrap();
+    let site = LockSite::directory(&p, dest).unwrap();
+    let mut rec = record(&site, &id(5), "none");
+    rec.last_heartbeat_wall_time = now - 3_000_000_000;
+    dead_lock(&p, "dest.flux-lock", &rec.encode());
+    let mut w = Vec::new();
+    let got = dry_lock(&site, false, local, now, &mut w);
+    assert!(matches!(&got, LockPreview::Recorded(r) if *r == rec), "{got:?}");
+    assert!(
+        matches!(&w[..], [RunWarning::DryRunLockRecord { operation_id, heartbeat_age_secs: Some(_), workspace_path, .. }]
+            if *operation_id == id(5) && workspace_path == "none"),
+        "{w:?}"
+    );
+
+    // A heartbeat in the future has no age.
+    let fs = fake();
+    let p = fs.destination_root(Path::new("/p")).unwrap();
+    let site = LockSite::directory(&p, dest).unwrap();
+    let mut rec = record(&site, &id(5), "none");
+    rec.last_heartbeat_wall_time = now + 10_000_000_000;
+    dead_lock(&p, "dest.flux-lock", &rec.encode());
+    let mut w = Vec::new();
+    let got = dry_lock(&site, false, local, now, &mut w);
+    assert!(matches!(got, LockPreview::Recorded(_)), "{got:?}");
+    assert!(
+        matches!(&w[..], [RunWarning::DryRunLockRecord { heartbeat_age_secs: None, .. }]),
+        "{w:?}"
+    );
+
+    // A `.broken.` sibling is reported, with no lock file at all.
+    let fs = fake();
+    let p = fs.destination_root(Path::new("/p")).unwrap();
+    let site = LockSite::directory(&p, dest).unwrap();
+    let broken = format!("dest.flux-lock.broken.{}", id(7));
+    let rec = record(&site, &id(7), "none");
+    dead_lock(&p, &broken, &rec.encode());
+    let mut w = Vec::new();
+    let got = dry_lock(&site, false, local, now, &mut w);
+    assert!(matches!(got, LockPreview::Absent), "{got:?}");
+    assert!(
+        matches!(&w[..], [RunWarning::DryRunBrokenLeftover { name }] if *name == broken),
+        "{w:?}"
+    );
+}
+
+#[test]
+fn dry_lock_never_opens_or_locks() {
+    use super::dry_prior::dry_lock;
+    let dest = OsStr::new("dest");
+    let now = crate::state::wall_time_ns();
+    let bytes_of = |site: &LockSite<'_, _>, id_n: u8| record(site, &id(id_n), "none").encode();
+    for (label, bytes) in [
+        ("absent", None),
+        ("foreign", Some(b"hello, not a lock".to_vec())),
+        ("torn", Some(vec![0u8; 100])),
+        ("record", Some(Vec::new())),
+    ] {
+        for break_lock in [false, true] {
+            let fs = fake();
+            let p = fs.destination_root(Path::new("/p")).unwrap();
+            let site = LockSite::directory(&p, dest).unwrap();
+            let held = bytes
+                .as_ref()
+                .map(|b| if label == "record" { bytes_of(&site, 5) } else { b.clone() });
+            let _holder = held.as_ref().map(|b| live_lock(&p, "dest.flux-lock", b));
+            let base = fs.calls().len();
+            let mut w = Vec::new();
+            let _ = dry_lock(&site, break_lock, LockCapability::LocalStrong, now, &mut w);
+            let after = calls(&fs)[base..].to_vec();
+            assert!(
+                !after.iter().any(|c| c.starts_with("open_lock(")
+                    || c.starts_with("create_lock(")
+                    || c.starts_with("try_lock")),
+                "{label}: {after:?}"
+            );
+            let reads =
+                after.iter().filter(|c| c.starts_with("read_file(/p/dest.flux-lock)")).count();
+            assert_eq!(reads, 1, "{label}: {after:?}");
+        }
+    }
+}
+
+#[test]
 fn a_dry_single_file_run_plans_copy_overwrite_and_each_skip() {
     let planned = |r: &Run<Result<flux_fs::Outcome, CopyError>>| r.dry.as_ref().unwrap().planned;
     let run = |fs: &FaultFs, existing| {
