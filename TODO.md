@@ -607,6 +607,7 @@ PS-1 (a socket at the lock or claim-store path was `IO_ERROR`, exit 1) and PP-1 
 - [ ] **Windows `open_lock` / `open_claim_store` with an `AF_UNIX` socket file at the name are unmeasured** (`dir_windows.rs`, `open_file_at`; the new socket tests are POSIX-only). The Windows open refuses reparse points, which an `AF_UNIX` socket file is, but the code returned by that path was not checked.
 
 ## Cut 11a known limits (`flux copy --dry-run`; spec `docs/superpowers/specs/2026-10-17-cut-11a-dry-run-design.md`, sections 1, 3.5, 3.6, 4)
+- [ ] **A source entry spelled `.FLUX` (another ASCII case of `.flux`) directly under the root** is matched like `.flux` (the fold `reserved_path` uses), so on a case-sensitive destination the dry run predicts a merge or a failure where a real run creates a distinct `.FLUX`; the prediction errs toward a failure (ruling P13).
 
 - [ ] **Prior operations at DEST are noted, not previewed.** A resumable prior, a completed prior and an unreadable record each print one `note:` line and the fresh plan still prints; the exit code never changes for it, and the JSON carries `prior_operation` in `unprobed`. What a real run does with the prior (it may refuse with `RESUMABLE_OPERATION_EXISTS`) is cut 11b's `--dry-run --resume|--restart|--break-lock`, which this cut refuses as usage (exit 2).
 - [ ] **Same-run namespace collisions are not predicted (spec 5.2).** Two source names that fold onto one destination entry plan as two creates where a real run reports one collision.
