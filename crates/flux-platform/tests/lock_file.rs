@@ -146,6 +146,17 @@ fn open_lock_refuses_a_fifo_without_hanging() {
     assert_eq!(e.code, Code::DestinationError);
 }
 
+#[cfg(unix)]
+#[test]
+fn open_lock_refuses_a_socket() {
+    let (tmp, d) = dir();
+    // A socket fails the open itself (ENXIO on Linux), so the type check after the open never sees it.
+    let _bound = std::os::unix::net::UnixListener::bind(tmp.path().join("sock.flux-lock"))
+        .expect("bind a unix socket");
+    let e = d.open_lock(OsStr::new("sock.flux-lock")).expect_err("a socket is not a lock file");
+    assert_eq!(e.code, Code::DestinationError, "{e:?}");
+}
+
 /// What the child prints once it holds the lock. Distinctive, so no line libtest prints can match it.
 const CHILD_MARKER: &str = "FLUX_CHILD_HOLDS_LOCK";
 

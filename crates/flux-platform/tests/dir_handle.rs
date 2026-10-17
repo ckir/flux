@@ -408,6 +408,20 @@ mod posix {
     }
 
     #[test]
+    fn open_claim_store_refuses_a_socket() {
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        // A socket fails the open itself (ENXIO on Linux), so the type check after the open never sees it.
+        let _bound = std::os::unix::net::UnixListener::bind(d.path().join("state.db"))
+            .expect("bind a unix socket");
+        let e = match root.open_claim_store(OsStr::new("state.db"), flux_fs::Durability::Normal) {
+            Err(e) => e,
+            Ok(_) => panic!("a socket must be refused"),
+        };
+        assert_eq!(e.code, flux_fs::Code::DestinationError, "{e:?}");
+    }
+
+    #[test]
     fn create_claim_store_never_follows_a_link() {
         let d = TempDir::new().unwrap();
         let outside = d.path().join("outside");
