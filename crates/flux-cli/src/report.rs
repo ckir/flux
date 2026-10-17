@@ -3,7 +3,7 @@
 //! returns text, and `main` writes it.
 
 use flux_core::copy::CopyError;
-use flux_core::dry_run::PlannedAction;
+use flux_core::dry_run::{PlannedAction, PlannedEntry};
 use flux_core::run::{ResumeNote, Run, RunError, RunWarning};
 use flux_core::{
     Discard, TreeAbort, TreeFailure, TreeFailureCause, TreeOutcome, WeakIdentityWarnings,
@@ -335,6 +335,31 @@ pub fn summary_line(r: &Report, directories_created: u64) -> String {
         "copied {} files ({} bytes), created {directories_created} directories; {} failed, {} skipped",
         r.files_copied, r.bytes_copied, r.errors, r.files_skipped
     )
+}
+
+/// The last stderr line of a `--dry-run` that reached the engine: what a real run would do.
+pub fn dry_run_summary_line(r: &Report, directories_created: u64) -> String {
+    format!(
+        "dry run: would copy {} files ({} bytes), overwrite {}, skip {}, create {directories_created} directories; {} errors",
+        r.files_copied, r.bytes_copied, r.files_overwritten, r.files_skipped, r.errors
+    )
+}
+
+/// A tree dry run reached the walk without probing the no-replace publication primitive (section 3.6).
+pub const UNPROBED_NOREPLACE_LINE: &str = "note: the no-replace publication primitive was not probed under --dry-run; a real run may be refused with NOREPLACE_PUBLISH_UNAVAILABLE";
+
+/// The single-file counterpart of a `Planned` record's line: `target` in place of the tree-relative path.
+pub fn planned_file_line(target: &str, p: PlannedEntry) -> String {
+    match p.action {
+        PlannedAction::Skip(r) => {
+            format!(
+                "{target}: object_type={} action=would_skip ({})",
+                p.object.as_str(),
+                r.as_str()
+            )
+        }
+        a => format!("{target}: object_type={} action={}", p.object.as_str(), a.as_str()),
+    }
 }
 
 /// A run's stop (cut 7a), as stderr lines. A refusal is `CODE: detail` - the detail names the path and what to do next
