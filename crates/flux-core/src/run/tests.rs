@@ -8048,6 +8048,92 @@ fn a_dry_single_file_run_refuses_what_prepare_file_refuses() {
     assert_eq!(r.dry, None);
 }
 
+#[test]
+fn a_dry_single_file_run_into_a_weak_parent_reports_the_degradation_as_live_does() {
+    // Test audit 2026-10-17: `dry_file` carries `plan_file`'s degradation into the outcome (the gate degrades only
+    // an EXISTING destination whose identity cannot be compared with full confidence); no other single-file dry
+    // test has one, so dropping it left every test green.
+    let weak = || {
+        let fs = fake();
+        fs.write_file("/p/t", b"old");
+        fs.set_identity("/p/t", FileIdentity::Weak(ObjectId { volume: 9, index: 9 }));
+        fs
+    };
+    let run = |fs: &FaultFs, existing, c: &RunConfig| {
+        let o = CopyOptions { existing, ..opts() };
+        file(fs, Path::new("/src/a"), Path::new("/p/t"), &o, c)
+    };
+    let degraded = |r: &Run<Result<flux_fs::Outcome, CopyError>>| {
+        assert!(r.stop.is_none(), "{:?}", r.stop);
+        r.copy.as_ref().unwrap().as_ref().unwrap().identity_degraded
+    };
+    // An overwrite.
+    let fs = weak();
+    let base = fs.calls().len();
+    let d = run(&fs, flux_fs::ExistingPolicy::Overwrite, &dry());
+    assert_eq!(d.dry.as_ref().unwrap().planned.unwrap().action, PlannedAction::Overwrite);
+    assert!(degraded(&d).is_some(), "{d:?}");
+    assert_eq!(fs.read_file("/p/t").as_deref(), Some(&b"old"[..]));
+    forbidden(&fs, base);
+    let l = run(&weak(), flux_fs::ExistingPolicy::Overwrite, &cfg());
+    assert_eq!(degraded(&d), degraded(&l));
+    // A skip: the degradation is reported there too.
+    let fs = weak();
+    let d = run(&fs, flux_fs::ExistingPolicy::SkipExisting, &dry());
+    assert_eq!(
+        d.dry.as_ref().unwrap().planned.unwrap().action,
+        PlannedAction::Skip(SkipReason::Existing)
+    );
+    assert!(degraded(&d).is_some(), "{d:?}");
+    let l = run(&weak(), flux_fs::ExistingPolicy::SkipExisting, &cfg());
+    assert_eq!(degraded(&d), degraded(&l));
+}
+
+#[test]
+fn a_dry_single_file_run_with_the_lock_held_by_another_still_plans() {
+    // Test audit 2026-10-17: I5 for the single-file entry point (the tree has its own test above).
+    let fs = fake();
+    let p = fs.destination_root(Path::new("/p")).unwrap();
+    let site = LockSite::file(&p, OsStr::new("t")).unwrap();
+    let theirs = record(&site, &id(5), "none").encode();
+    let _holder = live_lock(&p, "t.flux-lock", &theirs);
+    let base = fs.calls().len();
+    let r = file(&fs, Path::new("/src/a"), Path::new("/p/t"), &opts(), &dry());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert_eq!(
+        r.dry.as_ref().unwrap().planned,
+        Some(PlannedEntry { object: PlannedObject::File, action: PlannedAction::Copy })
+    );
+    assert_eq!(fs.read_file(T_LOCK), Some(theirs));
+    assert!(!fs.exists("/p/t"));
+    forbidden(&fs, base);
+}
+
+#[test]
+fn a_dry_run_of_an_empty_source_counts_only_dest_as_live_does() {
+    // Test audit 2026-10-17: I7 with nothing to plan: DEST's own creation is still the one directory.
+    let empty = || {
+        let fs = FaultFs::new();
+        for d in ["/src", "/p"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        fs
+    };
+    let fs = empty();
+    let base = fs.calls().len();
+    let (d, got) = run_tree(&fs, &dry());
+    let out = ok(&d);
+    assert_eq!((out.files_total, out.files_copied, out.directories_created), (0, 0, 1));
+    assert!(got.is_empty(), "{got:?}");
+    assert!(!fs.exists("/p/dest"));
+    forbidden(&fs, base);
+    let fs = empty();
+    let (l, _) = run_tree(&fs, &cfg());
+    let live = ok(&l);
+    assert_eq!((live.files_total, live.files_copied, live.directories_created), (0, 0, 1));
+    assert!(fs.exists("/p/dest"));
+}
+
 /// The records a walk streamed that are not plan records, as (path, kind).
 fn real_records(got: &[TreeFailure]) -> Vec<(PathBuf, String)> {
     got.iter()

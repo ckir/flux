@@ -238,6 +238,55 @@ fn a_dry_run_notes_a_completed_prior_and_still_plans() {
     );
 }
 
+/// Restores a directory's permissions when dropped, so `TempDir` can remove it.
+#[cfg(unix)]
+struct Restore(PathBuf);
+
+#[cfg(unix)]
+impl Drop for Restore {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dry_tree_run_counts_a_walk_failure_in_its_summary_and_exits_as_live_does() {
+    // Test audit 2026-10-17: the summary's error count is the report's `errors` (a walk failure counts, though no
+    // file failed); every other CLI dry test has 0 errors.
+    use std::os::unix::fs::PermissionsExt;
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let sub = src.join("sub");
+    let _restore = Restore(sub.clone());
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Root ignores permissions: probe, and say so rather than fail.
+    if std::fs::read_dir(&sub).is_ok() {
+        println!("skipped: running as root, directory permissions are not enforced");
+        return;
+    }
+    let dst = d.path().join("dst");
+    let dry = flux().args(["copy", "--dry-run", "--json"]).arg(&src).arg(&dst).output().unwrap();
+    let e = stderr(&dry);
+    assert_eq!(dry.status.code(), Some(1), "{e}");
+    // `sub` fails to list before it is planned, so only DEST itself would be created.
+    assert!(
+        e.contains("dry run: would copy 1 files (1 bytes), overwrite 0, skip 0, create 1 directories; 1 errors"),
+        "{e}"
+    );
+    let counts = |v: &serde_json::Value| {
+        (v["errors"].as_u64(), v["files_failed"].as_u64(), v["files_copied"].as_u64())
+    };
+    let v = json(&dry);
+    assert_eq!(counts(&v), (Some(1), Some(0), Some(1)), "{v}");
+    assert!(!dst.exists());
+
+    let live = flux().args(["copy", "--json"]).arg(&src).arg(&dst).output().unwrap();
+    assert_eq!(live.status.code(), Some(1), "{}", stderr(&live));
+    assert_eq!(counts(&json(&live)), counts(&v), "{}", stderr(&live));
+}
+
 #[cfg(unix)]
 #[test]
 fn a_dry_run_stopped_on_a_symlink_source_is_still_marked_dry() {
