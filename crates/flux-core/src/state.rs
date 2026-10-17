@@ -84,6 +84,15 @@ pub struct Options {
     /// (`deny_unknown_fields`) still reads.
     #[serde(default = "links_copy", skip_serializing_if = "is_copy")]
     pub links: String,
+    /// Whether the run descends into directories that are other mounts (cut 10b). Written only when true, so a
+    /// default-mode state is byte-identical to the pre-cut format, which a pre-cut binary (`deny_unknown_fields`)
+    /// still reads; a state without the key reads as `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cross_filesystems: bool,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 fn links_copy() -> String {
@@ -128,6 +137,7 @@ impl Options {
                 flux_fs::Links::Skip => "skip",
             }
             .to_string(),
+            cross_filesystems: opts.cross_filesystems,
         }
     }
 
@@ -141,6 +151,9 @@ impl Options {
         );
         if self.links == "skip" {
             text.push_str("links=skip\n");
+        }
+        if self.cross_filesystems {
+            text.push_str("cross_filesystems=true\n");
         }
         text.into_bytes()
     }
@@ -1844,6 +1857,7 @@ mod tests {
             operation_id: flux_fs::OperationId::new(id(1)),
             existing: flux_fs::ExistingPolicy::Overwrite,
             links: flux_fs::Links::Copy,
+            cross_filesystems: false,
         })
     }
 
@@ -1994,6 +2008,7 @@ mod tests {
                 operation_id: flux_fs::OperationId::new(id(1)),
                 existing: ExistingPolicy::Overwrite,
                 links: Links::Copy,
+                cross_filesystems: false,
             };
             f(&mut o);
             Options::of(&o)
@@ -2052,6 +2067,49 @@ mod tests {
             b"flux-config-v1\npreserve_times=default\npreserve_permissions=default\nsafety=default\nexisting=overwrite\nlinks=skip\n"
         );
         assert_ne!(skip.fingerprint(), o.fingerprint());
+
+        let crossing = Options { cross_filesystems: true, ..o.clone() };
+        let mut expected = o.canonical_bytes();
+        expected.extend_from_slice(b"cross_filesystems=true\n");
+        assert_eq!(crossing.canonical_bytes(), expected);
+        assert_ne!(crossing.fingerprint(), o.fingerprint());
+        let both = Options { links: "skip".into(), cross_filesystems: true, ..o.clone() };
+        let mut expected = skip.canonical_bytes();
+        expected.extend_from_slice(b"cross_filesystems=true\n");
+        assert_eq!(both.canonical_bytes(), expected);
+    }
+
+    #[test]
+    fn a_state_without_cross_filesystems_deserializes_as_false() {
+        let o: Options = serde_json::from_str(
+            r#"{"preserve_times":"default","preserve_permissions":"default","durability":"normal","safety":"default","existing":"overwrite"}"#,
+        )
+        .unwrap();
+        assert!(!o.cross_filesystems);
+        let mut s = tree_v3();
+        s.config.as_mut().unwrap().options = o;
+        assert_eq!(validate(&s), Ok(()));
+    }
+
+    #[test]
+    fn a_default_state_is_written_without_a_cross_filesystems_key_and_a_crossing_state_with_one() {
+        // Mutant: the `skip_serializing_if` removed (a default-mode state then carries the key, which a pre-cut
+        // `deny_unknown_fields` binary refuses).
+        let default = tree_v3();
+        assert!(!default.config.as_ref().unwrap().options.cross_filesystems);
+        let v: serde_json::Value = serde_json::from_slice(&default.encode()).unwrap();
+        let options = v["options"].as_object().unwrap();
+        assert!(!options.contains_key("cross_filesystems"), "{options:?}");
+        assert_eq!(options.len(), 5, "the pre-cut five option keys: {options:?}");
+        assert_eq!(decode(&default.encode()).unwrap(), default, "round trip");
+
+        let mut crossing = tree_v3();
+        crossing.config.as_mut().unwrap().options.cross_filesystems = true;
+        let v: serde_json::Value = serde_json::from_slice(&crossing.encode()).unwrap();
+        let options = v["options"].as_object().unwrap();
+        assert_eq!(v["options"]["cross_filesystems"], serde_json::Value::Bool(true));
+        assert_eq!(options.len(), 6, "{options:?}");
+        assert_eq!(decode(&crossing.encode()).unwrap(), crossing, "round trip");
     }
 
     #[test]

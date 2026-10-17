@@ -109,6 +109,9 @@ struct CopyArgs {
     /// creates nothing and reports it as skipped (§124). `follow` is not supported.
     #[arg(long, value_enum, default_value_t = LinksArg::Copy)]
     links: LinksArg,
+    /// Descend into directories that are other mounts (section 42); by default each is created empty and skipped.
+    #[arg(long)]
+    cross_filesystems: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -174,6 +177,7 @@ fn options(args: &CopyArgs) -> CopyOptions {
         } else {
             ExistingPolicy::Overwrite
         },
+        cross_filesystems: args.cross_filesystems,
     }
 }
 
@@ -555,6 +559,12 @@ mod tests {
     #[test]
     fn safety_strict_reaches_the_options() {
         assert_eq!(options(&parse(&["--safety=strict"])).safety, Safety::Strict);
+    }
+
+    #[test]
+    fn cross_filesystems_reaches_the_options() {
+        assert!(!options(&parse(&[])).cross_filesystems);
+        assert!(options(&parse(&["--cross-filesystems"])).cross_filesystems);
     }
 
     #[test]

@@ -519,18 +519,18 @@ impl DirHandle for StdDir {
     fn mount_root(&self, parent: &Self) -> Result<MountRoot> {
         #[cfg(target_os = "linux")]
         {
-            use rustix::fs::{StatxAttributes, StatxFlags, statx};
+            use rustix::fs::{StatxFlags, statx};
             use rustix::io::Errno;
             match statx(&self.0, "", AtFlags::EMPTY_PATH, StatxFlags::empty()) {
-                Ok(st) if st.stx_attributes_mask.contains(StatxAttributes::MOUNT_ROOT) => {
-                    return Ok(if st.stx_attributes.contains(StatxAttributes::MOUNT_ROOT) {
-                        MountRoot::Yes
-                    } else {
-                        MountRoot::No
-                    });
+                Ok(st) => {
+                    if let Some(a) = crate::mount::from_statx_attributes(
+                        st.stx_attributes_mask,
+                        st.stx_attributes,
+                    ) {
+                        return Ok(a);
+                    }
+                    // The kernel did not report the attribute: judge by device numbers.
                 }
-                // The kernel did not report the attribute: judge by device numbers.
-                Ok(_) => {}
                 // `OPNOTSUPP` is the same value as `NOTSUP` on Linux; naming both is an unreachable pattern.
                 Err(Errno::NOSYS | Errno::NOTSUP) => {}
                 Err(e) => return Err(FsError::from_io(std::io::Error::from(e))),
@@ -543,14 +543,7 @@ impl DirHandle for StdDir {
         // `st_dev` is `i32` on macOS and `u64` on Linux: widen both to one type.
         #[allow(clippy::unnecessary_cast)]
         let (child_dev, parent_dev) = (child.st_dev as u64, above.st_dev as u64);
-        Ok(if child_dev != parent_dev {
-            MountRoot::Yes
-        } else if cfg!(target_os = "macos") {
-            // macOS has no same-filesystem bind mount of its own.
-            MountRoot::No
-        } else {
-            MountRoot::Unknown
-        })
+        Ok(crate::mount::from_devices(child_dev, parent_dev))
     }
 
     fn canonical_path(&self) -> Result<std::path::PathBuf> {

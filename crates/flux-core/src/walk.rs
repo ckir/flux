@@ -1,6 +1,8 @@
 //! The ordered directory walk (§7.2, §9, §149.4).
 
-use flux_fs::{Code, DirEntry, FileIdentity, FileSystem, FileType, FsError, ObjectId, Result};
+use flux_fs::{
+    Code, DirEntry, FileIdentity, FileSystem, FileType, FsError, MountRoot, ObjectId, Result,
+};
 use std::path::{Path, PathBuf};
 
 /// Chosen to sit BELOW the `PATH_MAX`-implied bound of roughly 370 levels rather
@@ -44,6 +46,44 @@ pub enum WalkEvent {
     DirEnd {
         path: PathBuf,
     },
+    /// After this directory's `Dir`, before its `DirEnd`: it is the root of a mount and nothing below it was listed.
+    MountSkipped {
+        path: PathBuf,
+    },
+    /// After this directory's `Dir`, before any child: whether it is a mount root could not be told; it was listed.
+    MountUnknown {
+        path: PathBuf,
+    },
+}
+
+/// Whether the walk descends into a directory that is the root of a mount.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountPolicy {
+    /// Descend into every directory; no mount query is made.
+    Cross,
+    /// Ask of every directory below the root whether it is a mount root, and do not descend into one.
+    Stay,
+}
+
+impl MountPolicy {
+    /// `Cross` when the options allow crossing filesystems, else `Stay`.
+    pub fn of(opts: &flux_fs::CopyOptions) -> MountPolicy {
+        if opts.cross_filesystems { MountPolicy::Cross } else { MountPolicy::Stay }
+    }
+}
+
+/// How a walk is configured.
+#[derive(Debug, Clone, Copy)]
+pub struct WalkOptions {
+    pub max_depth: usize,
+    pub mounts: MountPolicy,
+}
+
+/// What `next` yields right after a directory's `Dir` event, before its first entry.
+#[derive(Debug, Clone, Copy)]
+enum MountNote {
+    Skipped,
+    Unknown,
 }
 
 /// One failed entry. NOT terminal: the walk reports it, skips that subtree, and
@@ -65,6 +105,8 @@ struct Frame {
     pushed_ancestor: bool,
     /// False for the root frame, which emits no event of any kind.
     emit_end: bool,
+    /// Yielded once by `next`, before this frame's first entry.
+    mount: Option<MountNote>,
 }
 
 /// Borrows the filesystem for the life of the walk; holds the explicit stack, the
@@ -73,6 +115,7 @@ pub struct Walk<'a, F: FileSystem> {
     fs: &'a F,
     root: PathBuf,
     max_depth: usize,
+    mounts: MountPolicy,
     stack: Vec<Frame>,
     /// The `ObjectId`s of the directories on the CURRENT path -- not a global
     /// visited set, which would grow with the total number of directories and is
@@ -133,7 +176,7 @@ fn is_one_component(name: &std::ffi::OsStr) -> bool {
 /// its first event is the root's first child -- because the root is not part of the
 /// tree being copied INTO the destination, it IS the destination mapping.
 pub fn walk<'a, F: FileSystem>(fs: &'a F, root: &Path) -> Result<Walk<'a, F>> {
-    walk_with_depth(fs, root, DEFAULT_MAX_DEPTH)
+    walk_with(fs, root, WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts: MountPolicy::Cross })
 }
 
 /// As `walk`, with the depth cap chosen explicitly.
@@ -142,6 +185,17 @@ pub fn walk_with_depth<'a, F: FileSystem>(
     root: &Path,
     max_depth: usize,
 ) -> Result<Walk<'a, F>> {
+    walk_with(fs, root, WalkOptions { max_depth, mounts: MountPolicy::Cross })
+}
+
+/// As `walk`, with the depth cap and the mount policy chosen explicitly. The root
+/// is never asked whether it is a mount: the caller chose it.
+pub fn walk_with<'a, F: FileSystem>(
+    fs: &'a F,
+    root: &Path,
+    options: WalkOptions,
+) -> Result<Walk<'a, F>> {
+    let WalkOptions { max_depth, mounts } = options;
     // Fallible BEFORE anything is yielded: a missing root, or a root that is not a
     // directory, is a failure of the whole operation rather than a per-entry error,
     // so it is reported through `Result` and not as a first `Err` item.
@@ -171,11 +225,13 @@ pub fn walk_with_depth<'a, F: FileSystem>(
         fs,
         root: root.to_path_buf(),
         max_depth,
+        mounts,
         stack: vec![Frame {
             rel: PathBuf::new(),
             entries: entries.into_iter(),
             pushed_ancestor,
             emit_end: false,
+            mount: None,
         }],
         ancestors,
     })
@@ -205,6 +261,16 @@ impl<'a, F: FileSystem> Iterator for Walk<'a, F> {
         loop {
             if self.stack.is_empty() {
                 return None;
+            }
+            // A mount note is yielded once, right after the `Dir` event `enter`
+            // returned and before the frame's first entry.
+            if let Some(note) = self.stack.last_mut().expect("stack checked non-empty").mount.take()
+            {
+                let path = self.stack.last().expect("stack checked non-empty").rel.clone();
+                return Some(Ok(match note {
+                    MountNote::Skipped => WalkEvent::MountSkipped { path },
+                    MountNote::Unknown => WalkEvent::MountUnknown { path },
+                }));
             }
             // Take the next entry and release the borrow before `enter` needs
             // `&mut self`. `join` allocates the path we were going to need anyway.
@@ -329,6 +395,30 @@ impl<'a, F: FileSystem> Walk<'a, F> {
             });
         }
 
+        // The mount check runs BEFORE the ancestor check, and that order is
+        // load-bearing: a bind mount of an ancestor shares its identity, so after the
+        // ancestor check it would be reported as a cycle instead of a mount, and a
+        // mount root must never reach `read_dir`. The root is never asked.
+        let mut note = None;
+        if self.mounts == MountPolicy::Stay {
+            let parent = abs.parent().expect("a descendant has a parent");
+            match self.fs.mount_root(&abs, parent) {
+                Err(cause) => return Err(WalkError { path: rel, cause }),
+                Ok(MountRoot::Yes) => {
+                    self.stack.push(Frame {
+                        rel: rel.clone(),
+                        entries: Vec::new().into_iter(),
+                        pushed_ancestor: false,
+                        emit_end: true,
+                        mount: Some(MountNote::Skipped),
+                    });
+                    return Ok(WalkEvent::Dir { path: rel, identity: m.identity });
+                }
+                Ok(MountRoot::Unknown) => note = Some(MountNote::Unknown),
+                Ok(MountRoot::No) => {}
+            }
+        }
+
         // Only `Strong` is ever pushed OR compared, so "both sides Strong" holds by
         // construction. §107: a Weak identity exists and cannot be trusted, and a
         // comparison is no stronger than its weaker operand. Asymmetry is the normal
@@ -370,6 +460,7 @@ impl<'a, F: FileSystem> Walk<'a, F> {
             entries: entries.into_iter(),
             pushed_ancestor,
             emit_end: true,
+            mount: note,
         });
         Ok(WalkEvent::Dir { path: rel, identity: m.identity })
     }
@@ -379,6 +470,26 @@ impl<'a, F: FileSystem> Walk<'a, F> {
 mod tests {
     use super::*;
     use crate::fault_fs::FaultFs;
+
+    #[test]
+    fn the_policy_follows_the_cross_filesystems_option() {
+        use flux_fs::{
+            CopyOptions, Durability, ExistingPolicy, Links, OperationId, Preserve, Publish, Safety,
+        };
+        let with = |cross: bool| CopyOptions {
+            preserve_times: Preserve::Default,
+            preserve_permissions: Preserve::Default,
+            durability: Durability::Normal,
+            publish: Publish::Replace,
+            safety: Safety::Default,
+            operation_id: OperationId::new("op1"),
+            existing: ExistingPolicy::Overwrite,
+            links: Links::Copy,
+            cross_filesystems: cross,
+        };
+        assert_eq!(MountPolicy::of(&with(false)), MountPolicy::Stay);
+        assert_eq!(MountPolicy::of(&with(true)), MountPolicy::Cross);
+    }
 
     #[test]
     fn walk_refuses_a_root_that_is_not_a_directory() {
@@ -446,6 +557,23 @@ mod tests {
                 WalkEvent::Symlink { path } => format!("L {}", rel(&path)),
                 WalkEvent::Other { path } => format!("O {}", rel(&path)),
                 WalkEvent::DirEnd { path } => format!("E {}", rel(&path)),
+                WalkEvent::MountSkipped { path } => format!("M {}", rel(&path)),
+                WalkEvent::MountUnknown { path } => format!("U {}", rel(&path)),
+            })
+            .collect()
+    }
+
+    fn paths_with(fs: &FaultFs, policy: MountPolicy) -> Vec<String> {
+        walk_with(fs, Path::new("/r"), WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts: policy })
+            .unwrap()
+            .map(|r| match r.unwrap() {
+                WalkEvent::Dir { path, .. } => format!("D {}", rel(&path)),
+                WalkEvent::File { path } => format!("F {}", rel(&path)),
+                WalkEvent::Symlink { path } => format!("L {}", rel(&path)),
+                WalkEvent::Other { path } => format!("O {}", rel(&path)),
+                WalkEvent::DirEnd { path } => format!("E {}", rel(&path)),
+                WalkEvent::MountSkipped { path } => format!("M {}", rel(&path)),
+                WalkEvent::MountUnknown { path } => format!("U {}", rel(&path)),
             })
             .collect()
     }
@@ -565,6 +693,247 @@ mod tests {
     #[test]
     fn the_default_cap_is_256() {
         assert_eq!(DEFAULT_MAX_DEPTH, 256);
+    }
+
+    /// `/r/m` (with `/r/m/inside`) and `/r/z`; `/r/m` is the root of a mount.
+    fn mount_tree() -> FaultFs {
+        let fs = FaultFs::new();
+        for d in ["/r", "/r/m"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        fs.write_file("/r/m/inside", b"");
+        fs.write_file("/r/z", b"");
+        fs.set_mount_root("/r/m", flux_fs::MountRoot::Yes);
+        fs
+    }
+
+    #[test]
+    fn a_mount_below_the_root_is_skipped_and_nothing_under_it_is_read() {
+        let fs = mount_tree();
+        assert_eq!(
+            paths_with(&fs, MountPolicy::Stay),
+            vec!["D m", "M m", "E m", "F z"],
+            "the mount is announced between its Dir and its DirEnd, with no child"
+        );
+        let calls = fs.calls();
+        assert!(!calls.iter().any(|c| c == "read_dir(/r/m)"), "got {calls:?}");
+        assert!(!calls.iter().any(|c| c == "metadata(/r/m/inside)"), "got {calls:?}");
+        assert_eq!(
+            calls.iter().filter(|c| *c == "source_mount_root(/r/m)").count(),
+            1,
+            "got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn the_root_is_never_asked_whether_it_is_a_mount() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/r")).unwrap();
+        fs.write_file("/r/f", b"");
+        fs.set_mount_root("/r", flux_fs::MountRoot::Yes);
+        assert_eq!(paths_with(&fs, MountPolicy::Stay), vec!["F f"]);
+        let calls = fs.calls();
+        assert!(!calls.iter().any(|c| c.starts_with("source_mount_root(")), "got {calls:?}");
+    }
+
+    #[test]
+    fn a_plain_subdirectory_is_asked_once_and_yields_no_mount_event() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/r")).unwrap();
+        fs.create_dir(Path::new("/r/d")).unwrap();
+        fs.write_file("/r/d/f", b"");
+        assert_eq!(
+            paths_with(&fs, MountPolicy::Stay),
+            vec!["D d", "F d/f", "E d"],
+            "a directory that is not a mount root yields neither MountSkipped nor MountUnknown"
+        );
+        let calls = fs.calls();
+        assert_eq!(
+            calls.iter().filter(|c| *c == "source_mount_root(/r/d)").count(),
+            1,
+            "got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn crossing_makes_the_same_calls_and_events_as_before() {
+        let want = vec!["D m", "F m/inside", "E m", "F z"];
+        let fs = mount_tree();
+        assert_eq!(paths_with(&fs, MountPolicy::Cross), want);
+        let calls = fs.calls();
+        assert!(!calls.iter().any(|c| c.starts_with("source_mount_root(")), "got {calls:?}");
+        let fs = mount_tree();
+        assert_eq!(paths(&fs), want);
+        let calls = fs.calls();
+        assert!(!calls.iter().any(|c| c.starts_with("source_mount_root(")), "got {calls:?}");
+    }
+
+    #[test]
+    fn a_bind_mount_of_an_ancestor_is_a_skipped_mount_not_a_cycle() {
+        // The same fixture as the cycle test, but `a/b` is also a mount root: under
+        // `Stay` the mount check runs BEFORE the ancestor check, so it is a skipped
+        // mount and no error.
+        let build = || {
+            let fs = FaultFs::new();
+            for d in ["/r", "/r/a", "/r/a/b"] {
+                fs.create_dir(Path::new(d)).unwrap();
+            }
+            fs.write_file("/r/a/marker", b"");
+            let shared = ObjectId { volume: 1, index: 9999 };
+            fs.set_identity("/r/a", FileIdentity::Strong(shared));
+            fs.set_identity("/r/a/b", FileIdentity::Strong(shared));
+            fs.set_mount_root("/r/a/b", flux_fs::MountRoot::Yes);
+            fs
+        };
+
+        let fs = build();
+        let mut events = Vec::new();
+        let mut errors = Vec::new();
+        let opts = WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts: MountPolicy::Stay };
+        for item in walk_with(&fs, Path::new("/r"), opts).unwrap() {
+            match item {
+                Ok(WalkEvent::Dir { path, .. }) => events.push(format!("D {}", rel(&path))),
+                Ok(WalkEvent::File { path }) => events.push(format!("F {}", rel(&path))),
+                Ok(WalkEvent::DirEnd { path }) => events.push(format!("E {}", rel(&path))),
+                Ok(WalkEvent::MountSkipped { path }) => events.push(format!("M {}", rel(&path))),
+                Ok(_) => {}
+                Err(e) => errors.push(rel(&e.path)),
+            }
+        }
+        assert_eq!(events, vec!["D a", "D a/b", "M a/b", "E a/b", "F a/marker", "E a"]);
+        assert!(errors.is_empty(), "no error under Stay; got {errors:?}");
+
+        let fs = build();
+        let mut dirs = Vec::new();
+        let mut errors = Vec::new();
+        let opts = WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts: MountPolicy::Cross };
+        for item in walk_with(&fs, Path::new("/r"), opts).unwrap() {
+            match item {
+                Ok(WalkEvent::Dir { path, .. }) => dirs.push(rel(&path)),
+                Err(e) => errors.push(rel(&e.path)),
+                _ => {}
+            }
+        }
+        assert_eq!(dirs, vec!["a".to_string()]);
+        assert_eq!(errors, vec!["a/b".to_string()]);
+    }
+
+    #[test]
+    fn an_unknown_mount_is_announced_and_then_listed() {
+        let build = || {
+            let fs = FaultFs::new();
+            fs.create_dir(Path::new("/r")).unwrap();
+            fs.create_dir(Path::new("/r/u")).unwrap();
+            fs.write_file("/r/u/f", b"");
+            fs.set_mount_root("/r/u", flux_fs::MountRoot::Unknown);
+            fs
+        };
+        assert_eq!(paths_with(&build(), MountPolicy::Stay), vec!["D u", "U u", "F u/f", "E u"]);
+        assert_eq!(paths_with(&build(), MountPolicy::Cross), vec!["D u", "F u/f", "E u"]);
+    }
+
+    #[test]
+    fn a_failing_mount_query_fails_that_directory_and_the_walk_continues() {
+        let fs = FaultFs::new();
+        for d in ["/r", "/r/a", "/r/b"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        fs.write_file("/r/b/f", b"");
+        fs.fail("source_mount_root", Code::PermissionDenied);
+
+        let mut errors = Vec::new();
+        let mut events = Vec::new();
+        let opts = WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts: MountPolicy::Stay };
+        for item in walk_with(&fs, Path::new("/r"), opts).unwrap() {
+            match item {
+                Ok(WalkEvent::Dir { path, .. }) => events.push(format!("D {}", rel(&path))),
+                Ok(WalkEvent::File { path }) => events.push(format!("F {}", rel(&path))),
+                Ok(WalkEvent::DirEnd { path }) => events.push(format!("E {}", rel(&path))),
+                Ok(_) => {}
+                Err(e) => errors.push(rel(&e.path)),
+            }
+        }
+        assert_eq!(errors, vec!["a".to_string()]);
+        assert!(events.contains(&"D b".to_string()), "got {events:?}");
+        assert!(events.contains(&"F b/f".to_string()), "got {events:?}");
+        assert!(events.contains(&"E b".to_string()), "got {events:?}");
+        assert!(!events.contains(&"D a".to_string()), "got {events:?}");
+        let calls = fs.calls();
+        assert!(!calls.iter().any(|c| c == "read_dir(/r/a)"), "got {calls:?}");
+    }
+
+    #[test]
+    fn a_skipped_mount_does_not_disturb_cycle_detection_for_a_later_sibling() {
+        let fs = FaultFs::new();
+        for d in ["/r", "/r/aaa", "/r/loop"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        fs.write_file("/r/aaa/f", b"");
+        // `loop` IS the root, the measured `mount --bind a a/b` shape.
+        let shared = ObjectId { volume: 1, index: 77 };
+        fs.set_identity("/r", FileIdentity::Strong(shared));
+        fs.set_identity("/r/loop", FileIdentity::Strong(shared));
+        fs.set_mount_root("/r/aaa", flux_fs::MountRoot::Yes);
+
+        let mut events = Vec::new();
+        let mut errors = Vec::new();
+        let opts = WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts: MountPolicy::Stay };
+        for item in walk_with(&fs, Path::new("/r"), opts).unwrap() {
+            match item {
+                Ok(WalkEvent::Dir { path, .. }) => events.push(format!("D {}", rel(&path))),
+                Ok(WalkEvent::File { path }) => events.push(format!("F {}", rel(&path))),
+                Ok(WalkEvent::DirEnd { path }) => events.push(format!("E {}", rel(&path))),
+                Ok(WalkEvent::MountSkipped { path }) => events.push(format!("M {}", rel(&path))),
+                Ok(_) => {}
+                Err(e) => errors.push(rel(&e.path)),
+            }
+        }
+        assert_eq!(events, vec!["D aaa", "M aaa", "E aaa"]);
+        assert_eq!(errors, vec!["loop".to_string()], "the cycle must still be caught");
+    }
+
+    #[test]
+    fn an_unknown_mount_whose_listing_fails_yields_only_the_error() {
+        let fs = FaultFs::new();
+        for d in ["/r", "/r/u"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        fs.set_mount_root("/r/u", flux_fs::MountRoot::Unknown);
+        // read_dir calls: 1 = the root, 2 = `u`.
+        fs.fail_nth("read_dir", 2, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+
+        let mut events = Vec::new();
+        let mut errors = Vec::new();
+        let opts = WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts: MountPolicy::Stay };
+        for item in walk_with(&fs, Path::new("/r"), opts).unwrap() {
+            match item {
+                Ok(WalkEvent::Dir { path, .. }) => events.push(format!("D {}", rel(&path))),
+                Ok(WalkEvent::MountUnknown { path }) => events.push(format!("U {}", rel(&path))),
+                Ok(other) => events.push(format!("{other:?}")),
+                Err(e) => errors.push(rel(&e.path)),
+            }
+        }
+        assert!(events.is_empty(), "no Dir and no MountUnknown; got {events:?}");
+        assert_eq!(errors, vec!["u".to_string()]);
+    }
+
+    #[test]
+    fn a_too_deep_mount_meets_the_depth_cap_first() {
+        let fs = FaultFs::new();
+        for d in ["/r", "/r/a", "/r/a/b"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        fs.set_mount_root("/r/a/b", flux_fs::MountRoot::Yes);
+        let opts = WalkOptions { max_depth: 1, mounts: MountPolicy::Stay };
+        let errors: Vec<WalkError> =
+            walk_with(&fs, Path::new("/r"), opts).unwrap().filter_map(|i| i.err()).collect();
+        assert_eq!(errors.len(), 1, "got {errors:?}");
+        assert_eq!(rel(&errors[0].path), "a/b");
+        let msg =
+            std::error::Error::source(&errors[0].cause).map(|s| s.to_string()).unwrap_or_default();
+        assert!(msg.contains("directory depth cap exceeded"), "got {msg:?}");
+        let calls = fs.calls();
+        assert!(!calls.iter().any(|c| c == "source_mount_root(/r/a/b)"), "got {calls:?}");
     }
 
     #[test]
@@ -830,6 +1199,9 @@ mod tests {
         }
         fn read_link(&self, _: &Path) -> Result<flux_fs::Link> {
             unimplemented!("EscapingFs exists only to break read_dir")
+        }
+        fn mount_root(&self, _: &Path, _: &Path) -> Result<flux_fs::MountRoot> {
+            Ok(flux_fs::MountRoot::No)
         }
     }
 

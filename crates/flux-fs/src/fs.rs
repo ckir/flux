@@ -230,6 +230,12 @@ pub trait FileSystem: Send + Sync {
     /// a mounted-volume folder) with `Code::SpecialFileUnsupported`; a missing path with
     /// `Code::IoError`, kind `NotFound`.
     fn read_link(&self, path: &Path) -> Result<Link>;
+
+    /// Whether the directory at `path` is the root of a mount, judged against `parent` (the directory it was listed
+    /// in). Never follows a link at `path`. `Unknown` only where the platform cannot tell (Linux without
+    /// `STATX_ATTR_MOUNT_ROOT` and equal device numbers); Windows answers `No`: a mounted-volume folder is a
+    /// reparse point the walk never descends into. An `Err` is the query's own failure.
+    fn mount_root(&self, path: &Path, parent: &Path) -> Result<MountRoot>;
 }
 
 /// An open directory under `DEST` (§149.7).
@@ -606,6 +612,10 @@ mod tests {
 
         fn read_link(&self, _: &Path) -> crate::Result<Link> {
             Ok(Link { payload: std::ffi::OsString::new(), kind: LinkKind::Unspecified })
+        }
+
+        fn mount_root(&self, _: &Path, _: &Path) -> crate::Result<MountRoot> {
+            Ok(MountRoot::No)
         }
     }
 

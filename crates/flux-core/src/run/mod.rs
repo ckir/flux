@@ -32,6 +32,7 @@ use crate::tree::{
     Shared, TreeAbort, TreeFailure, TreeFailureCause, TreeOutcome, copy_tree_at, prepare_source,
     report,
 };
+use crate::walk::MountPolicy;
 use flux_fs::{
     ClaimStore, Code, CopyOptions, DestinationRoot, DirHandle, FileIdentity, FsError, OperationId,
     Outcome,
@@ -256,7 +257,7 @@ pub(crate) fn tree_with<F: DestinationRoot>(
         CopyOptions { operation_id: OperationId::new(cfg.operation_id.as_str()), ..opts.clone() };
     let mut out = TreeOutcome::default();
     // B1: the source side, then DEST and the identity pre-flight, before anything is created.
-    let source = match prepare_source(fs, src_root, dst_root) {
+    let source = match prepare_source(fs, src_root, dst_root, MountPolicy::of(&opts)) {
         Ok(s) => s,
         Err(error) => {
             run.copy = Some(Err(TreeAbort { error, outcome: out }));

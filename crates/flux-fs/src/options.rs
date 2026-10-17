@@ -91,6 +91,7 @@ pub struct CopyOptions {
     pub operation_id: OperationId,
     pub existing: ExistingPolicy,
     pub links: Links,
+    pub cross_filesystems: bool,
 }
 
 #[derive(Debug)]

@@ -291,6 +291,34 @@ fn json_reports_every_section_53_field() {
 }
 
 #[test]
+fn cross_filesystems_is_accepted_and_json_omits_the_mount_count_at_zero() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let out = flux()
+        .arg("copy")
+        .arg(&src)
+        .arg(d.path().join("dst"))
+        .arg("--cross-filesystems")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let v = json(&out);
+    assert_eq!(v["files_copied"].as_u64(), Some(2));
+    assert!(v.get("mounts_skipped").is_none(), "{v}");
+    assert_eq!(v.as_object().unwrap().len(), KEYS.len());
+
+    let d2 = TempDir::new().unwrap();
+    let src2 = tree_in(d2.path());
+    let out =
+        flux().arg("copy").arg(&src2).arg(d2.path().join("dst")).arg("--json").output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let v = json(&out);
+    assert!(v.get("mounts_skipped").is_none(), "{v}");
+    assert_eq!(v.as_object().unwrap().len(), KEYS.len());
+}
+
+#[test]
 fn json_is_printed_when_the_copy_fails() {
     let d = TempDir::new().unwrap();
     let src = tree_in(d.path());

@@ -53,6 +53,7 @@ fn opts() -> CopyOptions {
         operation_id: OperationId::new("replaced by the run"),
         existing: flux_fs::ExistingPolicy::Overwrite,
         links: Links::Copy,
+        cross_filesystems: false,
     }
 }
 
@@ -2486,6 +2487,7 @@ fn a_claim_store_error_after_the_rename_is_claim_not_recorded_and_the_file_is_co
 fn a_target_that_finds_its_own_claim_proceeds() {
     use crate::copy::{no_heartbeat, unguarded};
     use crate::tree::{Shared, copy_tree_at, prepare_source};
+    use crate::walk::MountPolicy;
     let fs = dest_fake();
     fs.write_file("/p/dest/a", b"old");
     let root = fs.destination_root(Path::new("/p/dest")).unwrap();
@@ -2496,7 +2498,8 @@ fn a_target_that_finds_its_own_claim_proceeds() {
     let key_a = flux_fs::ClaimKey::new(dest, OsStr::new("a"));
     assert!(matches!(store.insert_if_absent(&key_a, &own).unwrap(), ClaimOutcome::Inserted));
     let claims = std::cell::RefCell::new(store);
-    let source = prepare_source(&fs, Path::new("/src"), Path::new("/p/dest")).unwrap();
+    let source =
+        prepare_source(&fs, Path::new("/src"), Path::new("/p/dest"), MountPolicy::Cross).unwrap();
     let o = opts();
     let cx = Shared {
         fs: &fs,
@@ -3200,6 +3203,20 @@ fn resume_with_a_different_links_setting_is_incompatible() {
     assert_eq!(manifest(&fs, &id(5)), p, "nothing changed");
     assert!(!fs.exists(LOCK));
     assert!(!fs.called("open_claim_store("), "validate comes before the store is opened");
+}
+
+#[test]
+fn resume_with_a_different_cross_filesystems_setting_is_incompatible() {
+    let fs = fake();
+    let p = prior3(&fs, 5, OpState::Failed);
+    drop(prior_store(&fs, 5));
+    assert!(!p.config.as_ref().unwrap().options.cross_filesystems);
+    let crossing = CopyOptions { cross_filesystems: true, ..opts() };
+    let (r, _) = run_tree_with(&fs, &resume(), &crossing);
+    assert_eq!(refused(&r.stop), (LockCode::IncompatibleState, false));
+    assert!(detail(&r.stop).starts_with("cross_filesystems:"), "{}", detail(&r.stop));
+    assert_eq!(manifest(&fs, &id(5)), p, "nothing changed");
+    assert!(!fs.exists(LOCK));
 }
 
 #[test]

@@ -1,4 +1,4 @@
-use flux_fs::{Code, FileHandle, FileIdentity, FileSystem};
+use flux_fs::{Code, FileHandle, FileIdentity, FileSystem, MountRoot};
 use flux_platform::StdFileSystem;
 use std::io::Write;
 use tempfile::TempDir;
@@ -983,4 +983,84 @@ fn truncate_to_the_current_length_succeeds_and_zero_restarts_the_file() {
     w.truncate_to(0).unwrap();
     w.write_all(b"x").unwrap();
     assert_eq!(std::fs::read(&p).unwrap(), b"x");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn mount_root_is_no_for_a_plain_subdirectory_and_agrees_with_the_handle_query() {
+    use flux_fs::{DestinationRoot, DirHandle};
+    let d = TempDir::new().unwrap();
+    std::fs::create_dir(d.path().join("sub")).unwrap();
+    let path_answer = StdFileSystem.mount_root(&d.path().join("sub"), d.path());
+    assert!(matches!(path_answer, Ok(MountRoot::No)), "got {path_answer:?}");
+    let root = StdFileSystem.destination_root(d.path()).unwrap();
+    let sub = root.open_dir(std::ffi::OsStr::new("sub")).unwrap();
+    let handle_answer = sub.mount_root(&root);
+    assert_eq!(path_answer.unwrap(), handle_answer.unwrap());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mount_root_is_yes_for_a_real_mount_point_asked_without_privilege() {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+    // A half asserts only where the kernel sees a real mount point: a directory (not a link)
+    // whose device differs from its parent's. A sandbox may make `/dev/shm` a plain directory
+    // or (old Debian) a link to `/run/shm`, which the query never follows.
+    let is_mount_point = |path: &str, parent: &str| -> bool {
+        match (std::fs::symlink_metadata(path), std::fs::symlink_metadata(parent)) {
+            (Ok(c), Ok(p)) => c.is_dir() && c.dev() != p.dev(),
+            _ => false,
+        }
+    };
+    let mut ran = 0;
+    for (path, parent) in [("/proc", "/"), ("/dev/shm", "/dev")] {
+        if is_mount_point(path, parent) {
+            ran += 1;
+            let r = StdFileSystem.mount_root(Path::new(path), Path::new(parent));
+            assert!(matches!(r, Ok(MountRoot::Yes)), "{path}: {r:?}");
+        } else {
+            eprintln!("skipped: {path} is not a mount point here");
+        }
+    }
+    if ran == 0 {
+        eprintln!("skipped: no distinguishable mount point in this sandbox");
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn mount_root_reports_a_missing_path_as_not_found() {
+    let d = TempDir::new().unwrap();
+    match StdFileSystem.mount_root(&d.path().join("none"), d.path()) {
+        Err(e) => assert_eq!(e.source.kind(), std::io::ErrorKind::NotFound),
+        Ok(v) => panic!("expected NotFound, got Ok({v:?})"),
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn mount_root_is_always_no_on_windows() {
+    let d = TempDir::new().unwrap();
+    std::fs::create_dir(d.path().join("sub")).unwrap();
+    let r = StdFileSystem.mount_root(&d.path().join("sub"), d.path());
+    assert!(matches!(r, Ok(MountRoot::No)), "got {r:?}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mount_root_never_follows_a_link_at_the_path() {
+    let d = TempDir::new().unwrap();
+    std::fs::create_dir(d.path().join("sub")).unwrap();
+    std::os::unix::fs::symlink(d.path().join("sub"), d.path().join("sublink")).unwrap();
+    let r = StdFileSystem.mount_root(&d.path().join("sublink"), d.path());
+    assert!(matches!(r, Ok(MountRoot::No)), "sublink: {r:?}");
+    if std::path::Path::new("/proc/self").is_dir() {
+        std::os::unix::fs::symlink("/proc", d.path().join("link")).unwrap();
+        // A followed link would answer Yes: /proc is a mount root.
+        let r = StdFileSystem.mount_root(&d.path().join("link"), d.path());
+        assert!(matches!(r, Ok(MountRoot::No)), "link to /proc: {r:?}");
+    } else {
+        eprintln!("skipped: /proc is absent");
+    }
 }
