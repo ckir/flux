@@ -7806,6 +7806,39 @@ fn a_dry_tree_run_counts_dest_only_when_the_walk_did_not_refuse_unchanged() {
     let (live, _) = run_tree_with(&fs, &cfg(), &strict);
     assert!(matches!(&live.copy, Some(Err(a)) if a.refused_unchanged()), "{:?}", live.copy);
 
+    // The walk's own abort (the dynamic section 129 check at `sub`) before anything is planned: DEST is not counted.
+    // (`fake()` without `/src/a`, which the walk would copy before it reached `sub`.)
+    let weak_sub = || {
+        let fs = FaultFs::new();
+        for d in ["/src", "/src/sub", "/p"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        fs.write_file("/src/sub/b", b"BB");
+        fs.set_identity("/src/sub", FileIdentity::Weak(ObjectId { volume: 9, index: 9 }));
+        fs
+    };
+    let fs = weak_sub();
+    let base = fs.calls().len();
+    let (r, _) = run_tree_with(&fs, &dry(), &strict);
+    match &r.copy {
+        Some(Err(a)) => {
+            assert!(a.refused_unchanged(), "{a:?}");
+            assert_eq!(a.outcome.directories_created, 0);
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(!calls(&fs)[base..].iter().any(|c| c.starts_with("create_dir(")));
+    let fs = weak_sub();
+    let (live, _) = run_tree_with(&fs, &cfg(), &strict);
+    match &live.copy {
+        Some(Err(a)) => {
+            assert!(a.refused_unchanged(), "{a:?}");
+            assert_eq!(a.outcome.directories_created, 0);
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(!fs.exists("/p/dest"));
+
     // A refusal after an entry was planned changed something: DEST counts, as it does live.
     let unknown = || {
         let fs = fake();
