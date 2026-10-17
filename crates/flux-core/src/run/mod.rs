@@ -240,8 +240,6 @@ pub enum RunWarning {
     DryRunPrior { operation_id: String, state: OpState },
     /// Cut 11a: a dry run found an earlier COMPLETED operation; a real run would finish its recorded cleanup.
     DryRunPriorCompleted { operation_id: String },
-    /// Cut 11a: a dry run could not read the prior operations' records; `detail` is `CODE: text`.
-    DryRunPriorUnreadable { detail: String },
     /// Cut 11b: a dry run read the lock record but did not probe its owner's liveness; `heartbeat_age_secs` is `None`
     /// when the heartbeat lies in the future.
     DryRunLockRecord {
@@ -1135,16 +1133,13 @@ fn dry_start<D: DirHandle, P: Place<D>>(
         LockPreview::Recorded(_) => dry.owner_liveness = true,
         LockPreview::Takeover(_) => dry.lock_takeover = true,
         LockPreview::Refused(e) => {
-            let stop = from_lock(e, RunStep::Lock, place.holder_shown(), false);
+            let lock_shown = place.holder_shown().join(site.lock_name());
+            let stop = from_lock(e, RunStep::Lock, &lock_shown, false);
             return DryStart::Stop(stop, dry);
         }
         LockPreview::Error(e) => {
-            let stop = from_lock(
-                crate::lock::LockError::Io(e),
-                RunStep::Lock,
-                place.holder_shown(),
-                false,
-            );
+            let lock_shown = place.holder_shown().join(site.lock_name());
+            let stop = from_lock(crate::lock::LockError::Io(e), RunStep::Lock, &lock_shown, false);
             return DryStart::Stop(stop, dry);
         }
     }
@@ -1173,7 +1168,8 @@ fn dry_start<D: DirHandle, P: Place<D>>(
                 state: p.state.state,
             });
         }
-        dry.prior_seen = true;
+        // Spec 3.3: the resumable priors leave `unprobed`; `prior_seen` stays as the completed priors and
+        // debris set it.
         let stop = from_lock(
             resumable_refusal(&scan.resumable),
             RunStep::Inspect,
@@ -1412,7 +1408,10 @@ fn dry_file<F: DestinationRoot>(
         if let Some(name) = temp.file_name()
             && let Ok(m) = place.dir.metadata(name)
         {
-            dry.partials_present = 1;
+            // Ruling P7: only a write over the partial counts; a skip leaves it alone.
+            if matches!(entry.action, PlannedAction::Copy | PlannedAction::Overwrite) {
+                dry.partials_present = 1;
+            }
             if entry.action == PlannedAction::Copy {
                 entry.action = PlannedAction::CopyOverPartial { len: m.len };
             }

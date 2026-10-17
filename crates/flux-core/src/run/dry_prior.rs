@@ -10,13 +10,15 @@ use crate::dry_run::{DryPrior, PlannedAction, PlannedEntry, PlannedObject};
 use crate::lock::record::{Decoded, LockRecord, RECORD_LEN, Uncertain, decode};
 use crate::lock::site::{LockSite, Workspace};
 use crate::lock::{
-    LockCode, LockError, foreign_refusal, orphan_refusal, uncertain_refusal, untrusted_refusal,
+    LockCode, LockError, foreign_refusal, orphan_refusal, takeover_unavailable_refusal,
+    uncertain_refusal, untrusted_refusal,
 };
 use crate::prior::PriorOp;
 use crate::state::{FLUX_DIR, OPERATIONS_DIR, OpState, STATE_DB};
 use crate::tree::{TreeFailure, TreeFailureCause};
 use flux_fs::{
-    ClaimStore, Code, CopyOptions, DestinationRoot, DirHandle, FileHandle, FsError, LockCapability,
+    ClaimStore, Code, CopyOptions, DestinationRoot, DirHandle, FileHandle, FileIdentity, FsError,
+    LockCapability,
 };
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
@@ -58,11 +60,22 @@ pub(crate) fn dry_lock<D: DirHandle>(
         Ok(bytes) => match decode(&bytes) {
             Decoded::Foreign => LockPreview::Refused(foreign_refusal()),
             Decoded::Uncertain(why) => {
-                if break_lock && capability.allows_exclusive() {
-                    warnings.push(RunWarning::DryRunLockTakeover { why: format!("{why:?}") });
-                    LockPreview::Takeover(why)
-                } else {
+                if !break_lock {
                     LockPreview::Refused(uncertain_refusal(why))
+                } else {
+                    // The live takeover's first check (S240_5_s1): strong identity and OS-native locks.
+                    match site.dir().identity() {
+                        Err(e) => return LockPreview::Error(e),
+                        Ok(id)
+                            if matches!(id, FileIdentity::Strong(_))
+                                && capability.allows_exclusive() =>
+                        {
+                            warnings
+                                .push(RunWarning::DryRunLockTakeover { why: format!("{why:?}") });
+                            LockPreview::Takeover(why)
+                        }
+                        Ok(_) => LockPreview::Refused(takeover_unavailable_refusal()),
+                    }
                 }
             }
             Decoded::Record(r) => match site.workspace(&r) {
@@ -309,7 +322,7 @@ fn adopt_on_copy<F: DestinationRoot>(
     };
     // 4. Commit recovery on the copy; the stray temporaries stay.
     // Counted before the recovery, as the real adoption counts it (`Adopted.claims`).
-    let claims = store.count().ok();
+    let claims = Some(store.count().map_err(|e| state_error(&db, e))?);
     let (mut recovered, mut strays) = (0, 0);
     if store.supports_prepared() {
         let manifest = place.shown(id);

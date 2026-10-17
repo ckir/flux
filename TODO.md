@@ -625,6 +625,8 @@ PS-1 (a socket at the lock or claim-store path was `IO_ERROR`, exit 1) and PP-1 
 - [ ] **The resume preview needs temp disk (D8):** it copies the prior's `state.db` into `flux-dry-<id>` under the system temp directory, so temp disk equal to the store's size is needed; `RunConfig.dry_temp_root` overrides the root.
 - [ ] **The empty-lock blind spot:** an empty or torn record is `TARGET_LOCK_UNCERTAIN` for the dry run where a holder inside its first write would be busy for the real one (spec 3.2).
 - [ ] **The real-fs paired oracle:** a byte copy of DEST has new inodes, so the resume preview is compared on the ORIGINAL, dry first (ruling P9).
+- [ ] **The copied claim store is not private:** `<temp>` is made with the platform's default modes (`dir_unix.rs:152,163`: 0o777 / 0o666 under umask), so on a shared temp directory the copy of a prior's claim store (destination names) is readable by others; a dry run interrupted by a signal leaves `flux-dry-<id>/state.db` behind (Flux installs no signal handler).
+- [ ] **The sweep's walk-error warnings now precede its deletion warnings** (`partials_under` lists first, `sweep_partials` deletes after): a live `--restart` or `flux cleanup` prints the same warnings in a different order than before cut 11b.
 
 ## Cut 11b test debt (deferred by the SDD run, 2026-10-18)
 - [ ] **The `dry_lock` branches without a test:** SafetyRejected/DestinationError, `Error`, `Untrusted`, File-site Orphan (`run/tests.rs`).

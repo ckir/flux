@@ -137,6 +137,7 @@ fn dry_run_combines_with_resume_and_restart() {
     assert!(!dst.exists());
 }
 
+#[cfg(unix)]
 /// A tree prior operation `id` under `dst` in `state`, with a partial `sub/b.flux-partial.<id>`.
 fn prior_in(src: &Path, dst: &Path, id: &str, state: OpState) -> PathBuf {
     use std::os::unix::fs::MetadataExt;
@@ -184,6 +185,7 @@ fn prior_in(src: &Path, dst: &Path, id: &str, state: OpState) -> PathBuf {
     ws
 }
 
+#[cfg(unix)]
 #[test]
 fn test_79_dry_resume_and_restart_report_and_change_nothing() {
     let d = TempDir::new().unwrap();
@@ -249,6 +251,7 @@ fn test_79_dry_resume_and_restart_report_and_change_nothing() {
     assert!(e.contains("a: object_type=file action=would_copy"), "{e}");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_single_file_restart_lists_its_discards() {
     let d = TempDir::new().unwrap();
@@ -301,7 +304,7 @@ fn a_single_file_restart_lists_its_discards() {
     let e = stderr(&out);
     for want in [
         format!("{}: object_type=state action=would_discard", record.display()),
-        format!("b.flux-partial.{id}: object_type=partial action=would_discard"),
+        format!("{}: object_type=partial action=would_discard", partial.display()),
         format!("note: would supersede operation {id} (state TRANSFERRING)"),
         "dry run: would discard 1 partials and 1 states".to_owned(),
     ] {
@@ -335,10 +338,15 @@ fn test_136_takeover_preview() {
     assert!(keys.as_array().unwrap().iter().any(|k| k == "lock_takeover"), "{keys}");
     assert_eq!(std::fs::read(&lock).unwrap(), vec![0u8; 100], "the lock bytes are untouched");
 
+    // A leftover of an interrupted lock recovery: its note is made before the refusal and prints before it.
+    std::fs::write(d.path().join("dst.flux-lock.broken.x"), b"").unwrap();
     let out = flux().args(["copy", "--dry-run", "--restart"]).arg(&src).arg(&dst).output().unwrap();
     assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
     let e = stderr(&out);
     assert!(e.contains("TARGET_LOCK_UNCERTAIN"), "{e}");
+    let note = e.find("note: an interrupted lock recovery left dst.flux-lock.broken.x").expect(&e);
+    let refusal = e.find("TARGET_LOCK_UNCERTAIN").unwrap();
+    assert!(note < refusal, "the notes print before the refusal (ruling P10): {e}");
     assert!(!e.contains("dry run: would copy"), "no plan follows a predicted refusal: {e}");
     assert_eq!(std::fs::read(&lock).unwrap(), vec![0u8; 100]);
 }
@@ -378,6 +386,7 @@ fn a_recorded_lock_prints_the_dual_outcome_and_exits_zero() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn the_json_unprobed_order_is_fixed() {
     let order = [

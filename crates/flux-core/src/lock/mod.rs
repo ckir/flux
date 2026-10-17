@@ -25,4 +25,5 @@ pub(crate) use obtain::{
     busy_refusal, foreign_refusal, orphan_refusal, uncertain_refusal, untrusted_refusal,
 };
 pub use site::{LockSite, SiteKind};
+pub(crate) use takeover::takeover_unavailable_refusal;
 pub use takeover::{Claimed, Overwritten};

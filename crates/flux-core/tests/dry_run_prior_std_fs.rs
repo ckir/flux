@@ -3,9 +3,14 @@
 //! runs against one byte-identical copy of the destination and the live run against another; the live run is the
 //! oracle (spec I10).
 //!
-//! The unwound run may have closed its claim store cleanly through `Drop`. That is acceptable here: the copy path
-//! serves a clean and an unclean store alike, so the spec's crashed-prior assertion about `RepairAborted` is NOT made;
-//! the paired agreement is the oracle.
+//! The unwound run closed its claim store cleanly through `Drop`, so the fixture then makes the store UNCLEAN after
+//! the fact: it reopens `state.db`, commits one claim at `Durability::Normal` (which writes no allocator state) and
+//! keeps the file image as it stands while the store is open (spec section 10 says `forget` suffices; it
+//! keeps redb's file lock for the process, so the image is restored after a clean drop instead). redb repairs the COPY a dry run opens, and the
+//! live run repairs the real store, so the paired agreement below is the oracle.
+//!
+//! The resume test runs the dry run FIRST on the ORIGINAL destination (a byte copy has new object identities, so a
+//! live resume on a copy is refused; ruling P9), then the live run on the same destination; copies serve `--restart`.
 
 use flux_core::dry_run::{DryPrior, DryRun, PlannedAction, PlannedEntry, PlannedObject};
 use flux_core::lock::LockCode;
@@ -286,6 +291,28 @@ fn interrupted(cut: u64) -> Fixture {
     let partials = partials(&snap);
     assert_eq!(published, ["sub/c.txt", "sub/d.txt"], "files the interrupted run published");
     assert_eq!(partials.len(), 3, "files it left half-done: {partials:?}");
+    // Leave the store unclean: one more claim at `Normal` durability (no allocator state is written), and the
+    // file's bytes as they stand while the store is still open, which is what a crash leaves. `forget` alone would
+    // keep redb's file lock for the rest of the process, so the open-file image is restored after a clean drop.
+    #[cfg(unix)]
+    {
+        use flux_fs::{ClaimKey, ClaimRecord, ClaimStatus, ClaimStore, FluxPathKey, ObjectId};
+        let db = dst.join(".flux").join("operations").join(&id).join("state.db");
+        let mut store = RedbClaimStore::open_file(
+            std::fs::File::options().read(true).write(true).open(&db).unwrap(),
+            Durability::Normal,
+        )
+        .expect("the fixture's store reopens");
+        let key = ClaimKey::new(ObjectId { volume: 9, index: 9 }, std::ffi::OsStr::new("unclean"));
+        let record =
+            ClaimRecord { target: FluxPathKey(b"unclean".to_vec()), status: ClaimStatus::Created };
+        store.insert_if_absent(&key, &record).expect("the extra claim commits");
+        let open_image = std::fs::read(&db).unwrap();
+        // redb's header flag byte (offset 9) has its RECOVERY_REQUIRED bit (2) set while a store is open.
+        assert_ne!(open_image[9] & 2, 0, "the image is unclean");
+        drop(store);
+        std::fs::write(&db, open_image).unwrap();
+    }
     Fixture { d, src, dst, id }
 }
 

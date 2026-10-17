@@ -7766,22 +7766,35 @@ fn forbidden(fs: &FaultFs, base: usize) {
 }
 
 /// Cut 11b: `forbidden` for a dry `--resume`, which reads the prior's `state.db` (`open_read`, the one admitted
-/// `open_read`) and works on the copy's store (`claim_*` calls, whose key names no path). Whether the on-disk store
-/// stayed untouched is asserted on its bytes.
+/// `open_read`) and works on the copy's store. The copy's `claim_*` calls name a key, never a path, so they cannot
+/// be told from the on-disk store's by name; that the on-disk store stays unopened is `forbidden_in`'s ban on
+/// `open_claim_store(` and `create_claim_store(` under `/p`. The `claim_*` calls admitted are exactly the reads and
+/// writes of the adoption and the walk on the copy, measured on the resume tests: `claim_get`, `claim_insert` (the
+/// walk claims the entries it plans), `claim_prepared`, `claim_count`, `claim_flush` and `claim_apply_recovery`
+/// (the recovery on the copy). The publication and upgrade calls never happen in a dry run, so they are banned.
 fn forbidden_for_resume(fs: &FaultFs, base: usize) {
     let all = calls(fs);
     let ops = ".flux/operations/";
-    let kept: Vec<String> = all[base..]
-        .iter()
-        .filter(|c| {
-            let store_read = c.starts_with("open_read(")
-                && c.contains(ops)
-                && c.ends_with("/state.db)")
-                && c.starts_with("open_read(/p/dest/");
-            !(store_read || c.starts_with("claim_"))
-        })
-        .cloned()
-        .collect();
+    const BANNED_CLAIMS: [&str; 5] = [
+        "claim_upgrade",
+        "claim_prepare",
+        "claim_prepare_many",
+        "claim_commit_prepared",
+        "claim_discard_prepared",
+    ];
+    let mut kept: Vec<String> = Vec::new();
+    for c in &all[base..] {
+        let name = c.split('(').next().unwrap_or(c);
+        if name.starts_with("claim_") {
+            assert!(!BANNED_CLAIMS.contains(&name), "{c} in a dry resume: {:?}", &all[base..]);
+            continue;
+        }
+        let store_read =
+            c.starts_with("open_read(/p/dest/") && c.contains(ops) && c.ends_with("/state.db)");
+        if !store_read {
+            kept.push(c.clone());
+        }
+    }
     forbidden_in(&kept);
 }
 
@@ -7951,7 +7964,8 @@ fn a_dry_run_notes_each_prior_and_still_plans() {
     let (r, _) = run_tree(&fs, &dry());
     assert_resumable_refusal(&r.stop);
     assert!(r.copy.is_none());
-    assert!(r.dry.as_ref().unwrap().prior_seen);
+    // Spec 3.3: the predicted refusal leaves `unprobed`; a resumable prior does not set `prior_seen`.
+    assert!(!r.dry.as_ref().unwrap().prior_seen);
     assert!(
         matches!(&r.warnings[..], [RunWarning::DryRunPrior { operation_id, state }]
             if *operation_id == id(5) && *state == OpState::Failed),
@@ -7988,10 +8002,11 @@ fn a_dry_run_says_whether_it_saw_a_prior_through_both_entry_points() {
     };
     let fs = fake();
     assert_eq!(seen_tree(&fs), (false, 0));
-    for state in [OpState::Failed, OpState::Completed] {
+    // A completed prior sets it; a resumable one (the predicted refusal) does not (spec 3.3).
+    for (state, seen) in [(OpState::Failed, false), (OpState::Completed, true)] {
         let fs = fake();
         prior(&fs, 5, state);
-        assert_eq!(seen_tree(&fs), (true, 1), "{state:?}");
+        assert_eq!(seen_tree(&fs), (seen, 1), "{state:?}");
     }
     let fs = fake();
     prior(&fs, 7, OpState::Failed);
@@ -8004,7 +8019,7 @@ fn a_dry_run_says_whether_it_saw_a_prior_through_both_entry_points() {
     let fs = fake();
     file_prior(&fs, 5);
     let r = run_file(&fs, &dry());
-    assert!(r.dry.as_ref().unwrap().prior_seen);
+    assert!(!r.dry.as_ref().unwrap().prior_seen, "a resumable prior is not `prior_seen`");
     assert!(
         matches!(&r.warnings[..], [RunWarning::DryRunPrior { operation_id, state }]
             if *operation_id == id(5) && *state == OpState::Failed),
@@ -8023,7 +8038,7 @@ fn dry_a_plain_run_with_a_resumable_prior_predicts_the_refusal() {
     let (r, _) = run_tree(&fs, &dry());
     assert_resumable_refusal(&r.stop);
     assert!(r.copy.is_none());
-    assert!(r.dry.as_ref().unwrap().prior_seen);
+    assert!(!r.dry.as_ref().unwrap().prior_seen, "spec 3.3: the resumable leaves `unprobed`");
     forbidden(&fs, base);
 
     let fs = fake();
@@ -8032,7 +8047,7 @@ fn dry_a_plain_run_with_a_resumable_prior_predicts_the_refusal() {
     let r = run_file(&fs, &dry());
     assert_resumable_refusal(&r.stop);
     assert!(r.copy.is_none());
-    assert!(r.dry.as_ref().unwrap().prior_seen);
+    assert!(!r.dry.as_ref().unwrap().prior_seen, "spec 3.3: the resumable leaves `unprobed`");
     forbidden(&fs, base);
 }
 
@@ -8132,6 +8147,15 @@ fn dry_lock_rows_of_the_record_table() {
         LockPreview::Refused(crate::lock::LockError::Refused(r)) => r.code,
         other => panic!("expected a refusal, got {other:?}"),
     };
+    let detail = |p: &LockPreview| match p {
+        LockPreview::Refused(crate::lock::LockError::Refused(r)) => r.detail.clone(),
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    let live_takeover_detail = match crate::lock::takeover_unavailable_refusal() {
+        crate::lock::LockError::Refused(r) => r.detail,
+        other => panic!("a refusal: {other:?}"),
+    };
+    assert!(live_takeover_detail.starts_with("--break-lock needs strong file identity"));
     let local = LockCapability::LocalStrong;
 
     // Absent.
@@ -8167,6 +8191,13 @@ fn dry_lock_rows_of_the_record_table() {
     let mut w = Vec::new();
     let got = dry_lock(&site, true, LockCapability::Unsupported, now, &mut w);
     assert_eq!(code(&got), LockCode::TargetLockUncertain);
+    assert_eq!(detail(&got), live_takeover_detail);
+    assert!(w.is_empty());
+    // Weak file identity with a strong capability is refused the same way (the live `take_over`'s first check).
+    fs.set_identity("/p", FileIdentity::Weak(ObjectId { volume: 9, index: 9 }));
+    let got = dry_lock(&site, true, local, now, &mut w);
+    assert_eq!(code(&got), LockCode::TargetLockUncertain);
+    assert_eq!(detail(&got), live_takeover_detail);
     assert!(w.is_empty());
 
     // A dead record whose workspace is missing.
@@ -8730,7 +8761,6 @@ fn only_the_copy_under_the_temp_root(fs: &FaultFs, base: usize) {
 #[test]
 fn a_dry_resume_previews_resumed_entries_from_a_copy_of_the_store() {
     let (fs, base) = with_temp_root(resumable(100, b"o", 101, ClaimStatus::Created));
-    let on_disk = fs.read_file(state_db(5)).unwrap();
     let (r, got) = run_tree_with(&fs, &dry_resume(), &opts());
     let out = ok(&r);
     assert_eq!((out.files_resumed, out.files_copied), (1, 1), "{out:?}");
@@ -8748,7 +8778,8 @@ fn a_dry_resume_previews_resumed_entries_from_a_copy_of_the_store() {
         Some(DryPrior::Resume { operation_id: id(5), claims: Some(1), recovered: 0, strays: 0 })
     );
     assert!(!dry.prior_seen && dry.partials_present == 0, "{dry:?}");
-    assert_eq!(fs.read_file(state_db(5)).unwrap(), on_disk, "the on-disk store is never written");
+    // `forbidden_for_resume` below bans `open_claim_store(` and `create_claim_store(` under `/p`: the on-disk store
+    // is never opened, so it is never written.
     assert_eq!(fs.read_file("/p/dest/a").unwrap(), b"o");
     assert!(!fs.exists("/p/dest/sub"));
     only_the_copy_under_the_temp_root(&fs, base);
@@ -8973,6 +9004,52 @@ fn a_dry_single_file_resume_validates_and_reports_its_partial() {
     assert_eq!(d.partials_present, 1);
     assert!(!calls(&fs).iter().any(|c| c.contains("try_lock") || c.contains("create_lock")));
     forbidden(&fs, base);
+}
+
+#[test]
+fn a_dry_single_file_resume_that_skips_counts_no_partial() {
+    // Ruling P7: the partial counts only when the planned action writes the target; a skip leaves it alone.
+    let fs = fake();
+    let skip = CopyOptions { existing: ExistingPolicy::SkipExisting, ..opts() };
+    file_prior3_with(&fs, 5, None, &skip);
+    fs.write_file(format!("/p/{}", temp_of("t", 5)), b"abc");
+    fs.write_file("/p/t", b"already here");
+    let r = file(
+        &fs,
+        Path::new("/src/a"),
+        Path::new("/p/t"),
+        &skip,
+        &RunConfig { resume: true, ..dry() },
+    );
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    let d = r.dry.as_ref().unwrap();
+    assert!(
+        matches!(d.planned, Some(PlannedEntry { action: PlannedAction::Skip(_), .. })),
+        "{d:?}"
+    );
+    assert_eq!(d.partials_present, 0, "{d:?}");
+}
+
+#[test]
+fn a_predicted_lock_refusal_prints_the_live_runs_line() {
+    // The CLI prints `CODE: detail` of the `Refused` value (`report::stop_lines`), and the detail carries the lock
+    // file's path, so equal code and detail is the same stderr line.
+    let refusal = |r: &Run<Result<TreeOutcome, TreeAbort>>| match &r.stop {
+        Some(RunError::Refused { refusal, .. }) => (refusal.code, refusal.detail.clone()),
+        other => panic!("a refusal: {other:?}"),
+    };
+    let torn = || {
+        let fs = fake();
+        let p = fs.destination_root(Path::new("/p")).unwrap();
+        dead_lock(&p, "dest.flux-lock", &[0u8; 100]);
+        fs
+    };
+    let (dry_run, _) = run_tree(&torn(), &RunConfig { restart: true, ..dry() });
+    let (live_run, _) = run_tree(&torn(), &RunConfig { restart: true, ..cfg() });
+    let (dry_line, live_line) = (refusal(&dry_run), refusal(&live_run));
+    assert_eq!(live_line.0, LockCode::TargetLockUncertain);
+    assert!(live_line.1.contains("dest.flux-lock"), "{live_line:?}");
+    assert_eq!(dry_line, live_line);
 }
 
 #[test]

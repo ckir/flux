@@ -432,10 +432,12 @@ pub fn dry_discard_lines(target: &Path, p: &DryPrior) -> Vec<String> {
             )
         })
         .collect();
+    // The partial is named beside the target, as the state line names the record.
+    let dir = target.parent().unwrap_or(Path::new(""));
     v.extend(
-        partials_found
-            .iter()
-            .map(|n| format!("{}: object_type=partial action=would_discard", n.display())),
+        partials_found.iter().map(|n| {
+            format!("{}: object_type=partial action=would_discard", dir.join(n).display())
+        }),
     );
     v
 }
@@ -591,9 +593,6 @@ pub fn run_warning_line(w: &RunWarning) -> String {
         RunWarning::DryRunPriorCompleted { operation_id } => format!(
             "note: an earlier completed operation {operation_id} exists at DEST; a real run would finish its recorded cleanup"
         ),
-        RunWarning::DryRunPriorUnreadable { detail } => format!(
-            "note: a prior operation's record could not be read ({detail}); --dry-run does not preview how a real run handles it"
-        ),
         RunWarning::DryRunLockRecord {
             operation_id,
             owner_instance_id,
@@ -627,8 +626,16 @@ pub fn run_warning_line(w: &RunWarning) -> String {
 
 /// A run's own stop, then its warnings (cut 7a): the stderr lines that follow the copy's and precede the summary.
 pub fn run_lines<T>(run: &Run<T>) -> Vec<String> {
-    let mut v = run.stop.as_ref().map(stop_lines).unwrap_or_default();
-    v.extend(run.warnings.iter().map(run_warning_line));
+    let stop = run.stop.as_ref().map(stop_lines).unwrap_or_default();
+    let mut v: Vec<String> = Vec::new();
+    // Ruling P10: a dry run's predicted refusal prints the notes made before it, then the refusal, then nothing.
+    if run.dry.is_some() {
+        v.extend(run.warnings.iter().map(run_warning_line));
+        v.extend(stop);
+    } else {
+        v.extend(stop);
+        v.extend(run.warnings.iter().map(run_warning_line));
+    }
     v
 }
 
@@ -1829,7 +1836,7 @@ mod tests {
             [
                 "/d/t.flux-state.a: object_type=state action=would_discard",
                 "/d/t.flux-state.b: object_type=state action=would_discard",
-                "x.flux-partial.a: object_type=partial action=would_discard"
+                "/d/x.flux-partial.a: object_type=partial action=would_discard"
             ]
         );
         assert!(dry_discard_lines(Path::new("/d/t"), &DryPrior::StartedNew).is_empty());
