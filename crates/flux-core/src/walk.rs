@@ -737,6 +737,25 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_subdirectory_is_asked_once_and_yields_no_mount_event() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/r")).unwrap();
+        fs.create_dir(Path::new("/r/d")).unwrap();
+        fs.write_file("/r/d/f", b"");
+        assert_eq!(
+            paths_with(&fs, MountPolicy::Stay),
+            vec!["D d", "F d/f", "E d"],
+            "a directory that is not a mount root yields neither MountSkipped nor MountUnknown"
+        );
+        let calls = fs.calls();
+        assert_eq!(
+            calls.iter().filter(|c| *c == "source_mount_root(/r/d)").count(),
+            1,
+            "got {calls:?}"
+        );
+    }
+
+    #[test]
     fn crossing_makes_the_same_calls_and_events_as_before() {
         let want = vec!["D m", "F m/inside", "E m", "F z"];
         let fs = mount_tree();
