@@ -341,6 +341,21 @@ mod undecodable_claims {
     }
 
     #[test]
+    fn get_on_an_undecodable_claim_is_state_corrupt_and_changes_nothing() {
+        // Mutant (claims.rs `read`): `got.and_then(|g| ClaimRecord::decode(g.value()))` answers `Ok(None)`.
+        let path = with_note();
+        garbage_at(&path, &key("zz"));
+        let before = claims_rows(&path);
+        let s = open(&path);
+        let e = s.get(&key("zz")).unwrap_err();
+        assert_eq!(e.code, Code::StateCorrupt, "{e:?}");
+        // A key with no row at all is still absent, not corrupt.
+        assert_eq!(s.get(&key("absent")).unwrap(), None);
+        drop(s);
+        assert_eq!(claims_rows(&path), before, "claims unchanged");
+    }
+
+    #[test]
     fn an_undecodable_claim_at_the_key_is_state_corrupt() {
         // Mutant (claims.rs `apply_in`): `None => true` (foreign, IoError) for an undecodable claim.
         let path = with_note();

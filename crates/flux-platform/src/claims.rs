@@ -190,7 +190,16 @@ impl RedbClaimStore {
         let tx = self.db.begin_read().map_err(io_err)?;
         let table = tx.open_table(CLAIMS).map_err(io_err)?;
         let got = table.get(key.encode().as_slice()).map_err(io_err)?;
-        Ok(got.and_then(|g| ClaimRecord::decode(g.value())))
+        match got {
+            None => Ok(None),
+            Some(g) => match ClaimRecord::decode(g.value()) {
+                Some(r) => Ok(Some(r)),
+                None => Err(FsError::new(
+                    Code::StateCorrupt,
+                    io::Error::other("undecodable claim record"),
+                )),
+            },
+        }
     }
 }
 
