@@ -297,7 +297,7 @@ fn state_error(db: &Path, e: FsError) -> RunError {
 }
 
 impl<F: DestinationRoot> TreePlace<'_, F> {
-    fn operations_shown(&self) -> PathBuf {
+    pub(crate) fn operations_shown(&self) -> PathBuf {
         self.dest_shown.join(FLUX_DIR).join(OPERATIONS_DIR)
     }
 

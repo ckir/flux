@@ -1,13 +1,19 @@
 //! Cut 11b: the dry run's read-only preview of the prior operations' lock and state.
 
 use super::RunWarning;
+use super::sweep::partials_under;
+use crate::dry_run::{DryPrior, PlannedAction, PlannedEntry, PlannedObject};
 use crate::lock::record::{Decoded, LockRecord, RECORD_LEN, Uncertain, decode};
 use crate::lock::site::{LockSite, Workspace};
 use crate::lock::{
     LockError, foreign_refusal, orphan_refusal, uncertain_refusal, untrusted_refusal,
 };
-use flux_fs::{Code, DirHandle, FsError, LockCapability};
+use crate::prior::PriorOp;
+use crate::tree::{TreeFailure, TreeFailureCause};
+use flux_fs::{Code, DestinationRoot, DirHandle, FsError, LockCapability};
+use std::collections::BTreeSet;
 use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 
 /// What a dry run found at the lock path, read without opening or trying the lock.
 // The `Takeover` and `Recorded` payloads are read by the resume and restart previews (Tasks 4 and 6).
@@ -86,4 +92,45 @@ pub(crate) fn dry_lock<D: DirHandle>(
         }
     }
     preview
+}
+
+/// One streamed `Planned(object, Discard)` record.
+fn discard(path: PathBuf, object: PlannedObject) -> TreeFailure {
+    TreeFailure {
+        path,
+        cause: TreeFailureCause::Planned(PlannedEntry { object, action: PlannedAction::Discard }),
+    }
+}
+
+/// Spec 3.5, a tree: what `--restart` would supersede, listed read-only. Per prior, in order, its state directory,
+/// then every partial the sweep would delete (`partials_under`, the walk the real sweep uses), each streamed as a
+/// planned discard. A directory the walk cannot list is reported through `warnings`, as the real sweep does.
+pub(crate) fn dry_restart<F: DestinationRoot>(
+    fs: &F,
+    dest_shown: &Path,
+    operations_shown: &Path,
+    priors: &[PriorOp],
+    warnings: &mut Vec<RunWarning>,
+    on_report: &mut dyn FnMut(TreeFailure),
+) -> DryPrior {
+    for prior in priors {
+        let path = PathBuf::from(".flux/operations").join(&prior.state.operation_id);
+        on_report(discard(path, PlannedObject::State));
+    }
+    let ids: BTreeSet<&str> = priors.iter().map(|p| p.state.operation_id.as_str()).collect();
+    let (found, _) = if ids.is_empty() {
+        (Vec::new(), false)
+    } else {
+        partials_under(fs, dest_shown, operations_shown, &ids, warnings)
+    };
+    let mut partials_found = Vec::with_capacity(found.len());
+    for (path, _) in found {
+        on_report(discard(path.clone(), PlannedObject::Partial));
+        partials_found.push(path);
+    }
+    DryPrior::Restart {
+        superseded: priors.iter().map(|p| (p.state.operation_id.clone(), p.state.state)).collect(),
+        partials_found,
+        states: priors.len() as u64,
+    }
 }

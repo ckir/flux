@@ -8506,3 +8506,126 @@ fn a_dry_tree_run_agrees_with_the_live_run_on_the_fake() {
         assert_eq!(would, changed, "{name}");
     }
 }
+
+// ---- Cut 11b, Task 4: the dry --restart preview ----
+
+/// The streamed `Planned(object, Discard)` records, as (path, object).
+fn discards(got: &[TreeFailure]) -> Vec<(String, PlannedObject)> {
+    got.iter()
+        .filter_map(|f| match &f.cause {
+            TreeFailureCause::Planned(PlannedEntry { object, action: PlannedAction::Discard }) => {
+                Some((f.path.to_string_lossy().replace('\\', "/"), *object))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn dry_restart_cfg() -> RunConfig {
+    RunConfig { restart: true, ..dry() }
+}
+
+#[test]
+fn dry_restart_lists_every_partial_and_state_it_would_discard() {
+    let fs = fake();
+    prior(&fs, 5, OpState::Transferring);
+    prior(&fs, 6, OpState::Failed);
+    fs.create_dir(Path::new("/p/dest/sub")).unwrap();
+    let a = format!("/p/dest/sub/a.flux-partial.{}", id(5));
+    let b = format!("/p/dest/b.flux-partial.{}", id(6));
+    let c = format!("/p/dest/c.flux-partial.{}", id(9));
+    for p in [&a, &b, &c] {
+        fs.write_file(p, b"x");
+    }
+    let base = fs.calls().len();
+    let (r, got) = run_tree(&fs, &dry_restart_cfg());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    let found = discards(&got);
+    let states: Vec<_> = found.iter().filter(|(_, o)| *o == PlannedObject::State).collect();
+    let partials: Vec<_> = found.iter().filter(|(_, o)| *o == PlannedObject::Partial).collect();
+    assert_eq!(found.len(), 4, "{found:?}");
+    assert_eq!(
+        states,
+        [
+            &(format!(".flux/operations/{}", id(5)), PlannedObject::State),
+            &(format!(".flux/operations/{}", id(6)), PlannedObject::State),
+        ]
+    );
+    // States come first, then the partials in walk order.
+    assert!(found[..2].iter().all(|(_, o)| *o == PlannedObject::State));
+    let mut names: Vec<&str> = partials.iter().map(|(p, _)| p.as_str()).collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [format!("b.flux-partial.{}", id(6)), format!("sub/a.flux-partial.{}", id(5))]
+    );
+    let Some(crate::dry_run::DryPrior::Restart { superseded, mut partials_found, states }) =
+        r.dry.as_ref().unwrap().prior.clone()
+    else {
+        panic!("{:?}", r.dry);
+    };
+    assert_eq!(superseded, vec![(id(5), OpState::Transferring), (id(6), OpState::Failed)]);
+    assert_eq!(states, 2);
+    partials_found.sort();
+    assert_eq!(
+        partials_found,
+        [
+            PathBuf::from(format!("b.flux-partial.{}", id(6))),
+            PathBuf::from(format!("sub/a.flux-partial.{}", id(5))),
+        ]
+    );
+    for p in [&a, &b, &c] {
+        assert!(fs.exists(p), "{p}");
+    }
+    forbidden(&fs, base);
+}
+
+#[test]
+fn dry_restart_then_plans_the_fresh_tree() {
+    let fs = fake();
+    prior(&fs, 5, OpState::Transferring);
+    let (r, got) = run_tree(&fs, &dry_restart_cfg());
+    assert_eq!(ok(&r).files_copied, 2);
+    assert_eq!(discards(&got).len(), 1);
+    assert!(got.iter().any(|f| matches!(
+        &f.cause,
+        TreeFailureCause::Planned(PlannedEntry { action: PlannedAction::Copy, .. })
+    )));
+}
+
+#[test]
+fn dry_restart_of_an_absent_dest_discards_nothing() {
+    let fs = fake();
+    let (r, got) = run_tree(&fs, &dry_restart_cfg());
+    assert!(discards(&got).is_empty());
+    assert_eq!(
+        r.dry.as_ref().unwrap().prior,
+        Some(crate::dry_run::DryPrior::Restart {
+            superseded: vec![],
+            partials_found: vec![],
+            states: 0
+        })
+    );
+    assert_eq!(ok(&r).files_copied, 2);
+}
+
+#[test]
+fn dry_restart_on_a_single_file_names_its_state_and_partial() {
+    let fs = fake();
+    file_prior(&fs, 5);
+    let partial = format!("/p/t.flux-partial.{}", id(5));
+    fs.write_file(&partial, b"x");
+    let base = fs.calls().len();
+    let r = run_file(&fs, &dry_restart_cfg());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert_eq!(
+        r.dry.as_ref().unwrap().prior,
+        Some(crate::dry_run::DryPrior::Restart {
+            superseded: vec![(id(5), OpState::Failed)],
+            partials_found: vec![PathBuf::from(format!("t.flux-partial.{}", id(5)))],
+            states: 1,
+        })
+    );
+    assert!(fs.exists(&partial));
+    forbidden(&fs, base);
+}

@@ -31,46 +31,14 @@ pub(crate) fn sweep_partials<F: DestinationRoot>(
         return Ok(Vec::new());
     }
     let mut kept: BTreeSet<&str> = BTreeSet::new();
-    // J1: every `<name>.flux-partial.<prior-id>` under DEST, found by a walk of DEST by path that skips the
-    // reserved control directories, and deleted through handles opened from DEST's own, one component at a time.
-    let events = match walk(fs, dest_shown) {
-        Ok(events) => events,
-        Err(error) => {
-            warnings.push(RunWarning::PartialKept {
-                path: dest_shown.to_path_buf(),
-                error,
-                kept: operations_shown.to_path_buf(),
-            });
-            return Ok(Vec::new());
-        }
-    };
-    for item in events {
-        let path = match item {
-            // Cut 10a: a link temporary too (a crash between its creation and its rename); `remove_file` unlinks it.
-            Ok(WalkEvent::File { path }) | Ok(WalkEvent::Symlink { path }) => path,
-            Ok(_) => continue,
-            // A directory the sweep cannot read may hold a partial: every prior's state stays as its record.
-            Err(e) => {
-                let path = dest_shown.join(&e.path);
-                warnings.push(RunWarning::PartialKept {
-                    path,
-                    error: e.cause,
-                    kept: operations_shown.to_path_buf(),
-                });
-                kept.extend(ids.iter().copied());
-                continue;
-            }
-        };
-        if reserved_path(&path) {
-            continue;
-        }
-        let Some(prior) = path
-            .file_name()
-            .and_then(|n| id_after(n, PARTIAL_INFIX))
-            .and_then(|i| ids.get(i).copied())
-        else {
-            continue;
-        };
+    let (found, unlistable) = partials_under(fs, dest_shown, operations_shown, ids, warnings);
+    if unlistable {
+        // A directory the sweep cannot read may hold a partial: every prior's state stays as its record.
+        kept.extend(ids.iter().copied());
+    }
+    for (path, prior) in found {
+        let prior =
+            ids.get(prior.as_str()).copied().expect("partials_under yields only ids from `ids`");
         check()?;
         match remove_below(dest, &path) {
             Ok(()) => on_removed(dest_shown.join(&path)),
@@ -85,6 +53,64 @@ pub(crate) fn sweep_partials<F: DestinationRoot>(
         }
     }
     Ok(ids.difference(&kept).map(|i| (*i).to_string()).collect())
+}
+
+/// J1 and cut 11b: every `<name>.flux-partial.<id>` for `ids` under DEST, found by a walk of `dest_shown` that skips the
+/// reserved control directories. Read-only: each entry is the partial's DEST-relative path (as the walk yields it) and
+/// its prior's id, in walk order. A root or directory that cannot be listed is reported through `warnings` as
+/// `PartialKept` (kept: `operations_shown`); the bool answers whether a directory below the root could not be listed
+/// (the root failing yields no entries and `false`, as the sweep always treated it).
+pub(crate) fn partials_under<F: DestinationRoot>(
+    fs: &F,
+    dest_shown: &Path,
+    operations_shown: &Path,
+    ids: &BTreeSet<&str>,
+    warnings: &mut Vec<RunWarning>,
+) -> (Vec<(PathBuf, String)>, bool) {
+    let mut found = Vec::new();
+    let mut unlistable = false;
+    // J1: every `<name>.flux-partial.<prior-id>` under DEST, found by a walk of DEST by path that skips the
+    // reserved control directories.
+    let events = match walk(fs, dest_shown) {
+        Ok(events) => events,
+        Err(error) => {
+            warnings.push(RunWarning::PartialKept {
+                path: dest_shown.to_path_buf(),
+                error,
+                kept: operations_shown.to_path_buf(),
+            });
+            return (found, false);
+        }
+    };
+    for item in events {
+        let path = match item {
+            // Cut 10a: a link temporary too (a crash between its creation and its rename); `remove_file` unlinks it.
+            Ok(WalkEvent::File { path }) | Ok(WalkEvent::Symlink { path }) => path,
+            Ok(_) => continue,
+            Err(e) => {
+                let path = dest_shown.join(&e.path);
+                warnings.push(RunWarning::PartialKept {
+                    path,
+                    error: e.cause,
+                    kept: operations_shown.to_path_buf(),
+                });
+                unlistable = true;
+                continue;
+            }
+        };
+        if reserved_path(&path) {
+            continue;
+        }
+        let Some(prior) = path
+            .file_name()
+            .and_then(|n| id_after(n, PARTIAL_INFIX))
+            .and_then(|i| ids.get(i).copied())
+        else {
+            continue;
+        };
+        found.push((path, prior.to_string()));
+    }
+    (found, unlistable)
 }
 
 /// Remove the file at `rel` below `dest` through handles opened one component at a time, so no link is followed

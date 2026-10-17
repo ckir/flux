@@ -5,6 +5,7 @@ use flux_fs::{
     ClaimKey, ClaimOutcome, ClaimRecord, ClaimStore, FluxPathKey, PreparedRecord, RecoveryOp,
     Result,
 };
+use std::path::PathBuf;
 
 /// What kind of object a dry run plans to touch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,7 +106,14 @@ pub enum DryPrior {
     Resume { operation_id: String, claims: Option<u64>, recovered: u64, strays: u64 },
     /// `--restart` would supersede the listed operations (id and state), discarding `partials` half-copied files and
     /// `states` state directories.
-    Restart { superseded: Vec<(String, OpState)>, partials: u64, states: u64 },
+    Restart {
+        superseded: Vec<(String, OpState)>,
+        /// Every `<name>.flux-partial.<prior id>` a real run would delete: DEST-relative for a tree, the bare name
+        /// for a single file; the CLI prints the single-file discard lines from `superseded` and this list, a tree's
+        /// come through the streamed `Planned` records.
+        partials_found: Vec<PathBuf>,
+        states: u64,
+    },
 }
 
 /// A claim store that stores nothing: every insert is fresh, every lookup is absent. Holds no state.

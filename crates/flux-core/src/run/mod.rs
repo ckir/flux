@@ -37,7 +37,7 @@ use crate::tree::{
     copy_tree_at, copy_tree_frames, prepare_source, report,
 };
 use crate::walk::MountPolicy;
-use dry_prior::{LockPreview, dry_lock};
+use dry_prior::{LockPreview, dry_lock, dry_restart};
 use flux_fs::{
     ClaimStore, Code, CopyOptions, DestinationRoot, DirHandle, FileIdentity, FsError,
     LockCapability, OperationId, Outcome,
@@ -1111,6 +1111,7 @@ fn dry_start<D: DirHandle, P: Place<D>>(
     capability: LockCapability,
     place: &P,
     cfg: &RunConfig,
+    restart_preview: &mut dyn FnMut(&[crate::prior::PriorOp], &mut Vec<RunWarning>) -> DryPrior,
     warnings: &mut Vec<RunWarning>,
 ) -> DryStart {
     let mut dry = DryRun {
@@ -1149,7 +1150,7 @@ fn dry_start<D: DirHandle, P: Place<D>>(
     };
     dry.prior_seen = dry_prior_notes(&scan, warnings);
     if cfg.restart {
-        // Task 4: the restart preview runs here.
+        dry.prior = Some(restart_preview(&scan.resumable, warnings));
     } else if scan.resumable.is_empty() {
         dry.prior = cfg.resume.then_some(DryPrior::StartedNew);
     } else if cfg.resume && scan.resumable.len() == 1 {
@@ -1187,14 +1188,26 @@ fn dry_tree<F: DestinationRoot>(
     on_report: &mut dyn FnMut(TreeFailure),
     mut out: TreeOutcome,
 ) -> Run<Result<TreeOutcome, TreeAbort>> {
-    let mut dry = match dry_start(site, capability, &*place, cfg, &mut run.warnings) {
-        DryStart::Plan(dry) => dry,
-        DryStart::Stop(stop, dry) => {
-            run.stop = Some(stop);
-            run.dry = Some(dry);
-            return run;
+    // Spec 3.5: DEST absent means nothing to supersede and no walk.
+    let (dest_shown, operations_shown, absent_dest) =
+        (place.dest_shown.clone(), place.operations_shown(), place.dest.is_none());
+    let place_fs = place.fs;
+    let mut restart_preview = |priors: &[crate::prior::PriorOp], warnings: &mut Vec<RunWarning>| {
+        if absent_dest {
+            DryPrior::Restart { superseded: Vec::new(), partials_found: Vec::new(), states: 0 }
+        } else {
+            dry_restart(place_fs, &dest_shown, &operations_shown, priors, warnings, &mut *on_report)
         }
     };
+    let mut dry =
+        match dry_start(site, capability, &*place, cfg, &mut restart_preview, &mut run.warnings) {
+            DryStart::Plan(dry) => dry,
+            DryStart::Stop(stop, dry) => {
+                run.stop = Some(stop);
+                run.dry = Some(dry);
+                return run;
+            }
+        };
     let fs = place.fs;
     let src_root = place.src_root.clone();
     let null = std::cell::RefCell::new(NullClaimStore);
@@ -1265,14 +1278,36 @@ fn dry_file<F: DestinationRoot>(
     cfg: &RunConfig,
     opts: &CopyOptions,
 ) -> Run<Result<Outcome, CopyError>> {
-    let mut dry = match dry_start(site, capability, place, cfg, &mut run.warnings) {
-        DryStart::Plan(dry) => dry,
-        DryStart::Stop(stop, dry) => {
-            run.stop = Some(stop);
-            run.dry = Some(dry);
-            return run;
+    // Spec 3.5, a single file: each prior's state record and, where present beside the target, its partial. The
+    // file form streams no per-entry records, so only `partials_found` and the counts are previewed.
+    let mut restart_preview = |priors: &[crate::prior::PriorOp], _: &mut Vec<RunWarning>| {
+        let mut partials_found = Vec::new();
+        for p in priors {
+            let mut name = place.target.clone();
+            name.push(crate::state::PARTIAL_INFIX);
+            name.push(&p.state.operation_id);
+            if place.dir.metadata(&name).is_ok() {
+                partials_found.push(PathBuf::from(name));
+            }
+        }
+        DryPrior::Restart {
+            superseded: priors
+                .iter()
+                .map(|p| (p.state.operation_id.clone(), p.state.state))
+                .collect(),
+            partials_found,
+            states: priors.len() as u64,
         }
     };
+    let mut dry =
+        match dry_start(site, capability, place, cfg, &mut restart_preview, &mut run.warnings) {
+            DryStart::Plan(dry) => dry,
+            DryStart::Stop(stop, dry) => {
+                run.stop = Some(stop);
+                run.dry = Some(dry);
+                return run;
+            }
+        };
     let planned = match plan_file(fs, src, Some(place.dir), &place.target, opts) {
         Ok(FilePlan::Proceed { src_meta, degraded, replaces }) => {
             run.copy = Some(Ok(Outcome {
