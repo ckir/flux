@@ -42,6 +42,8 @@ pub(crate) enum Verdict {
 pub(crate) struct Recovered {
     /// RENAMED notes, whose claims are now `Created`.
     pub recovered: u64,
+    /// Cut 11b: the stray temporaries of RENAMED rows (removed live, only counted under a dry run).
+    pub strays: u64,
 }
 
 #[derive(Debug)]
@@ -253,7 +255,8 @@ fn remove_stray<D: DirHandle>(dest: &D, rel: &Path, recorded: FileIdentity) -> R
 }
 
 /// Both phases: classify every note, then `apply_recovery` once, then remove the stray temp names of RENAMED rows. A
-/// failed removal is a `PartialKept` warning (the object IS published) and never fails the adoption.
+/// failed removal is a `PartialKept` warning (the object IS published) and never fails the adoption. Under `dry`
+/// (cut 11b) the strays are counted and left in place; `apply_recovery` still runs, on the caller's private copy.
 pub(crate) fn recover_publications<D: DirHandle, S: ClaimStore>(
     dest: &D,
     dest_shown: &Path,
@@ -261,10 +264,11 @@ pub(crate) fn recover_publications<D: DirHandle, S: ClaimStore>(
     store: &mut S,
     warnings: &mut Vec<RunWarning>,
     manifest_shown: &Path,
+    dry: bool,
 ) -> Result<Recovered, RecoverError> {
     let notes = store.prepared().map_err(RecoverError::Store)?;
     if notes.is_empty() {
-        return Ok(Recovered { recovered: 0 });
+        return Ok(Recovered { recovered: 0, strays: 0 });
     }
     let mut ops = Vec::with_capacity(notes.len());
     let mut undecided = Vec::new();
@@ -290,7 +294,11 @@ pub(crate) fn recover_publications<D: DirHandle, S: ClaimStore>(
         return Err(RecoverError::Uncertain(undecided));
     }
     store.apply_recovery(&ops).map_err(RecoverError::Store)?;
+    let stray_count = strays.len() as u64;
     for (rel, recorded) in strays {
+        if dry {
+            break;
+        }
         if let Err(error) = remove_stray(dest, &rel, recorded) {
             warnings.push(RunWarning::PartialKept {
                 path: dest_shown.join(&rel),
@@ -299,7 +307,7 @@ pub(crate) fn recover_publications<D: DirHandle, S: ClaimStore>(
             });
         }
     }
-    Ok(Recovered { recovered })
+    Ok(Recovered { recovered, strays: stray_count })
 }
 
 /// The COMMIT_STATE_UNCERTAIN detail: up to ten undecided targets with their evidence, then the total.

@@ -410,7 +410,8 @@ pub(crate) struct Shared<'c, F: DestinationRoot> {
     pub(crate) guard: &'c Guard<'c>,
     /// §101's heartbeat (cut 7b), beside the guard; `&no_heartbeat` for a copy that holds no lock.
     pub(crate) beat: &'c Heartbeat<'c>,
-    /// The run's claim store, open for the walk (cut 8b); `None` for a copy that holds no lock.
+    /// The run's claim store, open for the walk (cut 8b); `None` for a copy that holds no lock; a dry run passes its
+    /// null store or, under `--resume`, the copy of the prior's store (cut 11b).
     pub(crate) claims: Option<&'c std::cell::RefCell<dyn flux_fs::ClaimStore>>,
     /// Cut 9a: `--resume`: an own `Created` claim may skip its target.
     pub(crate) resume: bool,
@@ -421,6 +422,10 @@ pub(crate) struct Shared<'c, F: DestinationRoot> {
     pub(crate) ckpt: Option<&'c Checkpoints<F::Dir>>,
     /// Spec cut 11a: every destination write is skipped, the decisions are not.
     pub(crate) dry_run: bool,
+    /// Cut 11b: the adopted prior's id under a dry `--resume`, for the partial check.
+    pub(crate) dry_prior: Option<&'c str>,
+    /// Cut 11b: counts the partials a dry `--resume` found beside their targets.
+    pub(crate) dry_partials: Option<&'c std::cell::Cell<u64>>,
 }
 
 /// Cut 9d (spec decision 5): a batch flushes at this many staged files...
@@ -585,6 +590,8 @@ fn run_tree<F: DestinationRoot>(
         batch: BatchPolicy::DEFAULT,
         ckpt: None,
         dry_run: false,
+        dry_prior: None,
+        dry_partials: None,
     };
     copy_tree_at(&cx, source.events, root, false, out, on_report).1
 }
@@ -1415,6 +1422,9 @@ fn copy_one<F: DestinationRoot>(
                                 None,
                                 meta.identity,
                             );
+                            if cx.dry_run {
+                                dry_resumed(out, on_report, path, PlannedObject::File);
+                            }
                             return Ok(());
                         }
                     }
@@ -1900,6 +1910,9 @@ fn link_one<F: DestinationRoot>(
                                 None,
                                 meta.identity,
                             );
+                            if cx.dry_run {
+                                dry_resumed(out, on_report, path, PlannedObject::Symlink);
+                            }
                             return Ok(());
                         }
                     }
@@ -2207,7 +2220,8 @@ fn dry_stop_file<F: DestinationRoot>(
         skipped: false,
     };
     finish_copy(path.clone(), Ok(outcome), out, on_report)?;
-    dry_planned(out, on_report, path, PlannedObject::File, replace);
+    let partial = dry_partial_len(cx, parent, name);
+    dry_planned(out, on_report, path, PlannedObject::File, replace, partial);
     Ok(())
 }
 
@@ -2240,7 +2254,7 @@ fn dry_stop_link<F: DestinationRoot>(
         skipped: false,
     };
     finish_copy(path.clone(), Ok(outcome), out, on_report)?;
-    dry_planned(out, on_report, path, PlannedObject::Symlink, replace);
+    dry_planned(out, on_report, path, PlannedObject::Symlink, replace, None);
     Ok(())
 }
 
@@ -2270,6 +2284,34 @@ fn dry_temp_name_fits<F: DestinationRoot>(
     Ok(())
 }
 
+/// Cut 11b: under a dry `--resume`, the length of the prior's half-copied temporary beside `name`, counted in
+/// `dry_partials`. One metadata call; a missing temporary, or any error, is no partial (nothing is previewed from it).
+fn dry_partial_len<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    parent: Option<&F::Dir>,
+    name: &std::ffi::OsStr,
+) -> Option<u64> {
+    let (id, parent) = (cx.dry_prior?, parent?);
+    let temp = flux_fs::temp_path(Path::new(name), &flux_fs::OperationId::new(id));
+    let m = parent.metadata(temp.file_name()?).ok()?;
+    if let Some(count) = cx.dry_partials {
+        count.set(count.get() + 1);
+    }
+    Some(m.len)
+}
+
+/// Cut 11b: a dry `--resume` entry the claim store resumes: one `Planned(object, Resume)` record (the counters
+/// already counted it).
+fn dry_resumed(
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+    path: PathBuf,
+    object: PlannedObject,
+) {
+    let entry = PlannedEntry { object, action: PlannedAction::Resume };
+    report(out, on_report, path, TreeFailureCause::Planned(entry));
+}
+
 /// What a dry stop does after its entry counted as copied: a replacement counts as overwritten, and the record says
 /// which it was.
 fn dry_planned(
@@ -2278,13 +2320,16 @@ fn dry_planned(
     path: PathBuf,
     object: PlannedObject,
     replace: bool,
+    partial: Option<u64>,
 ) {
     let action = match (replace, object) {
         (true, _) => PlannedAction::Overwrite,
         (false, PlannedObject::Symlink) => PlannedAction::CreateSymlink,
         // The walk plans files, directories and links; a restart preview's `State` and `Partial` entries (cut 11b)
         // are streamed directly and never pass here.
-        (false, _) => PlannedAction::Copy,
+        (false, _) => {
+            partial.map_or(PlannedAction::Copy, |len| PlannedAction::CopyOverPartial { len })
+        }
     };
     if replace {
         out.files_overwritten += 1;
@@ -4299,6 +4344,8 @@ mod tests {
             batch: policy,
             ckpt: None,
             dry_run: false,
+            dry_prior: None,
+            dry_partials: None,
         };
         let mut out = TreeOutcome::default();
         let mut got = Vec::new();
@@ -5257,6 +5304,8 @@ mod tests {
             batch: BatchPolicy { age: NO_AGE, ..BatchPolicy::DEFAULT },
             ckpt: None,
             dry_run: false,
+            dry_prior: None,
+            dry_partials: None,
         };
         let mut out = TreeOutcome::default();
         let (_root, r) = copy_tree_at(&cx, source.events, root, false, &mut out, &mut |_| {});
@@ -5349,6 +5398,8 @@ mod tests {
             batch: BatchPolicy { age: NO_AGE, ..BatchPolicy::DEFAULT },
             ckpt: None,
             dry_run: false,
+            dry_prior: None,
+            dry_partials: None,
         };
         let mut out = TreeOutcome::default();
         let mut reported = 0;
@@ -5390,6 +5441,8 @@ mod tests {
             batch: BatchPolicy { age: NO_AGE, ..BatchPolicy::DEFAULT },
             ckpt: None,
             dry_run: false,
+            dry_prior: None,
+            dry_partials: None,
         };
         let mut out = TreeOutcome::default();
         let mut reported = 0;
@@ -5421,6 +5474,8 @@ mod tests {
             batch: BatchPolicy { age: NO_AGE, ..BatchPolicy::DEFAULT },
             ckpt: None,
             dry_run: false,
+            dry_prior: None,
+            dry_partials: None,
         };
         let mut out = TreeOutcome::default();
         let (back, r) = copy_tree_at(&cx, source.events, root, false, &mut out, &mut |_| {});
@@ -5524,6 +5579,8 @@ mod tests {
             batch: policy,
             ckpt: None,
             dry_run: false,
+            dry_prior: None,
+            dry_partials: None,
         };
         let mut out = TreeOutcome::default();
         let mut got = Vec::new();
@@ -7135,6 +7192,8 @@ mod tests {
             batch: BatchPolicy::DEFAULT,
             ckpt: None,
             dry_run: true,
+            dry_prior: None,
+            dry_partials: None,
         };
         let (root, identity) = match dst_root {
             Some(d) => {
@@ -7676,6 +7735,8 @@ mod tests {
             batch: BatchPolicy::DEFAULT,
             ckpt: None,
             dry_run: false,
+            dry_prior: None,
+            dry_partials: None,
         };
         let mut out = TreeOutcome::default();
         let mut got = Vec::new();

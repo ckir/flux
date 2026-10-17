@@ -37,7 +37,7 @@ use crate::tree::{
     copy_tree_at, copy_tree_frames, prepare_source, report,
 };
 use crate::walk::MountPolicy;
-use dry_prior::{LockPreview, dry_lock, dry_restart};
+use dry_prior::{DryAdopt, LockPreview, dry_adopt, dry_lock, dry_restart};
 use flux_fs::{
     ClaimStore, Code, CopyOptions, DestinationRoot, DirHandle, FileIdentity, FsError,
     LockCapability, OperationId, Outcome,
@@ -425,6 +425,8 @@ pub(crate) fn tree_with<F: DestinationRoot>(
             batch: batch_policy(cfg),
             ckpt: held.as_ref(),
             dry_run: false,
+            dry_prior: None,
+            dry_partials: None,
         };
         let root = place.dest.take().expect("step 5 made DEST");
         let mut report = |f: TreeFailure| {
@@ -1096,6 +1098,10 @@ fn dry_prior_notes(scan: &crate::prior::Scan, warnings: &mut Vec<RunWarning>) ->
     warnings.len() > before
 }
 
+/// Cut 11b: the dry `--resume` preview of the one resumable prior: its `DryPrior`, or the refusal a real run meets.
+type ResumePreview<'a> =
+    dyn FnMut(&crate::prior::PriorOp, &mut Vec<RunWarning>) -> Result<DryPrior, RunError> + 'a;
+
 /// Cut 11b: how a dry run's lock preview and prior classification ended: a predicted refusal (with the report's
 /// flags), or the flags the plan carries.
 enum DryStart {
@@ -1112,6 +1118,7 @@ fn dry_start<D: DirHandle, P: Place<D>>(
     place: &P,
     cfg: &RunConfig,
     restart_preview: &mut dyn FnMut(&[crate::prior::PriorOp], &mut Vec<RunWarning>) -> DryPrior,
+    resume_preview: &mut ResumePreview<'_>,
     warnings: &mut Vec<RunWarning>,
 ) -> DryStart {
     let mut dry = DryRun {
@@ -1154,7 +1161,11 @@ fn dry_start<D: DirHandle, P: Place<D>>(
     } else if scan.resumable.is_empty() {
         dry.prior = cfg.resume.then_some(DryPrior::StartedNew);
     } else if cfg.resume && scan.resumable.len() == 1 {
-        // Task 6: the resume preview runs here.
+        // Spec D6: `prior_seen` stays false for the previewed resumable.
+        match resume_preview(&scan.resumable[0], warnings) {
+            Ok(p) => dry.prior = Some(p),
+            Err(e) => return DryStart::Stop(e, dry),
+        }
     } else {
         for p in &scan.resumable {
             warnings.push(RunWarning::DryRunPrior {
@@ -1199,18 +1210,56 @@ fn dry_tree<F: DestinationRoot>(
             dry_restart(place_fs, &dest_shown, &operations_shown, priors, warnings, &mut *on_report)
         }
     };
-    let mut dry =
-        match dry_start(site, capability, &*place, cfg, &mut restart_preview, &mut run.warnings) {
-            DryStart::Plan(dry) => dry,
-            DryStart::Stop(stop, dry) => {
-                run.stop = Some(stop);
-                run.dry = Some(dry);
-                return run;
+    // Spec 3.4: a dry `--resume` of one resumable prior walks against a repaired copy of its store; the copy and the
+    // directory holding it are parked here for the walk.
+    let temp_root = cfg.dry_temp_root.clone().unwrap_or_else(std::env::temp_dir);
+    let mut adopted: dry_prior::Parked<F> = None;
+    let place_ref: &TreePlace<'_, F> = &*place;
+    let mut resume_preview =
+        |prior: &crate::prior::PriorOp, warnings: &mut Vec<RunWarning>| match dry_adopt(
+            place_fs, place_ref, prior, opts, &temp_root, warnings,
+        ) {
+            DryAdopt::Store { temp, claims, prior } => {
+                adopted = Some((temp, claims));
+                Ok(prior)
             }
+            DryAdopt::Refused(e) => Err(e),
         };
+    let mut dry = match dry_start(
+        site,
+        capability,
+        place_ref,
+        cfg,
+        &mut restart_preview,
+        &mut resume_preview,
+        &mut run.warnings,
+    ) {
+        DryStart::Plan(dry) => dry,
+        DryStart::Stop(stop, dry) => {
+            run.stop = Some(stop);
+            run.dry = Some(dry);
+            return run;
+        }
+    };
     let fs = place.fs;
     let src_root = place.src_root.clone();
     let null = std::cell::RefCell::new(NullClaimStore);
+    // Declared temp first, store second: the store drops first, then the directory holding its file.
+    let (_temp, store) = match adopted.take() {
+        Some((temp, claims)) => (Some(temp), Some(std::cell::RefCell::new(claims))),
+        None => (None, None),
+    };
+    let claims: &std::cell::RefCell<dyn ClaimStore> = match &store {
+        Some(store) => store,
+        None => &null,
+    };
+    let prior_id = match &dry.prior {
+        Some(DryPrior::Resume { operation_id, .. }) if store.is_some() => {
+            Some(operation_id.clone())
+        }
+        _ => None,
+    };
+    let partials = std::cell::Cell::new(0u64);
     let cx = Shared {
         fs,
         src_root: &src_root,
@@ -1218,11 +1267,13 @@ fn dry_tree<F: DestinationRoot>(
         opts,
         guard: &unguarded,
         beat: &no_heartbeat,
-        claims: Some(&null),
-        resume: false,
+        claims: Some(claims),
+        resume: store.is_some(),
         batch: batch_policy(cfg),
         ckpt: None,
         dry_run: true,
+        dry_prior: prior_id.as_deref(),
+        dry_partials: prior_id.is_some().then_some(&partials),
     };
     let root = place.dest.take();
     let absent = root.is_none();
@@ -1261,6 +1312,7 @@ fn dry_tree<F: DestinationRoot>(
         }
     }
     dry.unprobed_noreplace = true;
+    dry.partials_present = partials.get();
     run.dry = Some(dry);
     run.copy = Some(result);
     run
@@ -1299,15 +1351,32 @@ fn dry_file<F: DestinationRoot>(
             states: priors.len() as u64,
         }
     };
-    let mut dry =
-        match dry_start(site, capability, place, cfg, &mut restart_preview, &mut run.warnings) {
-            DryStart::Plan(dry) => dry,
-            DryStart::Stop(stop, dry) => {
-                run.stop = Some(stop);
-                run.dry = Some(dry);
-                return run;
-            }
-        };
+    let mut resume_preview = |prior: &crate::prior::PriorOp, warnings: &mut Vec<RunWarning>| {
+        resume::validate(prior, &place.roots(), opts, warnings)?;
+        // Task 7: the partial check runs here.
+        Ok(DryPrior::Resume {
+            operation_id: prior.state.operation_id.clone(),
+            claims: None,
+            recovered: 0,
+            strays: 0,
+        })
+    };
+    let mut dry = match dry_start(
+        site,
+        capability,
+        place,
+        cfg,
+        &mut restart_preview,
+        &mut resume_preview,
+        &mut run.warnings,
+    ) {
+        DryStart::Plan(dry) => dry,
+        DryStart::Stop(stop, dry) => {
+            run.stop = Some(stop);
+            run.dry = Some(dry);
+            return run;
+        }
+    };
     let planned = match plan_file(fs, src, Some(place.dir), &place.target, opts) {
         Ok(FilePlan::Proceed { src_meta, degraded, replaces }) => {
             run.copy = Some(Ok(Outcome {

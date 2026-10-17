@@ -50,6 +50,10 @@ impl SkipReason {
 pub enum PlannedAction {
     CreateDir,
     Copy,
+    /// Cut 11b: a copy whose half-copied temporary (`len` bytes) is present; its continuation is not previewed.
+    CopyOverPartial {
+        len: u64,
+    },
     Overwrite,
     Skip(SkipReason),
     CreateSymlink,
@@ -61,7 +65,7 @@ impl PlannedAction {
     pub fn as_str(self) -> &'static str {
         match self {
             PlannedAction::CreateDir => "would_create",
-            PlannedAction::Copy => "would_copy",
+            PlannedAction::Copy | PlannedAction::CopyOverPartial { .. } => "would_copy",
             PlannedAction::Overwrite => "would_overwrite",
             PlannedAction::Skip(_) => "would_skip",
             PlannedAction::CreateSymlink => "would_create_symlink",
@@ -204,6 +208,7 @@ mod tests {
     fn every_planned_action_and_object_has_its_stream_word() {
         assert_eq!(PlannedAction::CreateDir.as_str(), "would_create");
         assert_eq!(PlannedAction::Copy.as_str(), "would_copy");
+        assert_eq!(PlannedAction::CopyOverPartial { len: 3 }.as_str(), "would_copy");
         assert_eq!(PlannedAction::Overwrite.as_str(), "would_overwrite");
         assert_eq!(PlannedAction::Skip(SkipReason::UpToDate).as_str(), "would_skip");
         assert_eq!(PlannedAction::Skip(SkipReason::Existing).as_str(), "would_skip");

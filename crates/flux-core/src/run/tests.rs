@@ -2519,6 +2519,8 @@ fn a_target_that_finds_its_own_claim_proceeds() {
         },
         ckpt: None,
         dry_run: false,
+        dry_prior: None,
+        dry_partials: None,
     };
     let mut out = TreeOutcome::default();
     let mut got = Vec::new();
@@ -7760,7 +7762,30 @@ fn in_scope(call: &str) -> bool {
 /// `base` is the call-log length before the run: `fake()` itself records three `create_dir` calls.
 fn forbidden(fs: &FaultFs, base: usize) {
     let all = calls(fs);
-    let after = &all[base..];
+    forbidden_in(&all[base..]);
+}
+
+/// Cut 11b: `forbidden` for a dry `--resume`, which reads the prior's `state.db` (`open_read`, the one admitted
+/// `open_read`) and works on the copy's store (`claim_*` calls, whose key names no path). Whether the on-disk store
+/// stayed untouched is asserted on its bytes.
+fn forbidden_for_resume(fs: &FaultFs, base: usize) {
+    let all = calls(fs);
+    let ops = ".flux/operations/";
+    let kept: Vec<String> = all[base..]
+        .iter()
+        .filter(|c| {
+            let store_read = c.starts_with("open_read(")
+                && c.contains(ops)
+                && c.ends_with("/state.db)")
+                && c.starts_with("open_read(/p/dest/");
+            !(store_read || c.starts_with("claim_"))
+        })
+        .cloned()
+        .collect();
+    forbidden_in(&kept);
+}
+
+fn forbidden_in(after: &[String]) {
     let scoped: Vec<&String> = after.iter().filter(|c| in_scope(c)).collect();
     for banned in [
         "create_dir(",
@@ -8645,4 +8670,281 @@ fn dry_restart_on_a_single_file_names_its_state_and_partial() {
     );
     assert!(fs.exists(&partial));
     forbidden(&fs, base);
+}
+
+// ---- Cut 11b, Task 6: the dry --resume preview from a copy of the prior's claim store ----
+
+use crate::dry_run::DryPrior;
+
+/// A dry `--resume` whose private copy lives under the fake's `/flux-dry`.
+fn dry_resume() -> RunConfig {
+    RunConfig { resume: true, dry_temp_root: Some(PathBuf::from("/flux-dry")), ..dry() }
+}
+
+/// `fs` with the temp root made, and the call-log watermark after every fixture call.
+fn with_temp_root(fs: FaultFs) -> (FaultFs, usize) {
+    fs.create_dir(Path::new("/flux-dry")).unwrap();
+    let base = fs.calls().len();
+    (fs, base)
+}
+
+/// The streamed `Planned` records as (path, object, action), in stream order.
+fn planned_records(got: &[TreeFailure]) -> Vec<(String, PlannedObject, PlannedAction)> {
+    got.iter()
+        .filter_map(|f| match &f.cause {
+            TreeFailureCause::Planned(e) => {
+                Some((f.path.to_string_lossy().replace('\\', "/"), e.object, e.action))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The private directory of prior 5 is gone, and every call under `/flux-dry` is one the copy needs.
+fn only_the_copy_under_the_temp_root(fs: &FaultFs, base: usize) {
+    assert!(!fs.exists(format!("/flux-dry/flux-dry-{}", id(5))), "the temp directory survived");
+    let all = calls(fs);
+    for c in all[base..].iter().filter(|c| c.contains("/flux-dry")) {
+        let name = c.split('(').next().unwrap_or(c);
+        assert!(
+            [
+                "create_dir",
+                "create_new",
+                "create_claim_store",
+                "open_claim_store",
+                "open_dir",
+                "remove_file",
+                "remove_dir",
+                "destination_root",
+                "sync_all",
+                "drop_writer",
+                "metadata",
+            ]
+            .contains(&name),
+            "{c} is not a call the copy needs: {all:?}"
+        );
+    }
+}
+
+#[test]
+fn a_dry_resume_previews_resumed_entries_from_a_copy_of_the_store() {
+    let (fs, base) = with_temp_root(resumable(100, b"o", 101, ClaimStatus::Created));
+    let on_disk = fs.read_file(state_db(5)).unwrap();
+    let (r, got) = run_tree_with(&fs, &dry_resume(), &opts());
+    let out = ok(&r);
+    assert_eq!((out.files_resumed, out.files_copied), (1, 1), "{out:?}");
+    assert_eq!(
+        planned_records(&got),
+        vec![
+            ("a".to_string(), PlannedObject::File, PlannedAction::Resume),
+            ("sub".to_string(), PlannedObject::Dir, PlannedAction::CreateDir),
+            ("sub/b".to_string(), PlannedObject::File, PlannedAction::Copy),
+        ]
+    );
+    let dry = r.dry.as_ref().unwrap();
+    assert_eq!(
+        dry.prior,
+        Some(DryPrior::Resume { operation_id: id(5), claims: Some(1), recovered: 0, strays: 0 })
+    );
+    assert!(!dry.prior_seen && dry.partials_present == 0, "{dry:?}");
+    assert_eq!(fs.read_file(state_db(5)).unwrap(), on_disk, "the on-disk store is never written");
+    assert_eq!(fs.read_file("/p/dest/a").unwrap(), b"o");
+    assert!(!fs.exists("/p/dest/sub"));
+    only_the_copy_under_the_temp_root(&fs, base);
+    forbidden_for_resume(&fs, base);
+}
+
+#[test]
+fn a_dry_resume_recovers_a_renamed_note_on_the_copy_and_keeps_the_stray() {
+    let (fs, base) = with_temp_root(renamed_with_a_stray_temp());
+    let temp = format!("/p/dest/{}", temp_of("a", 5));
+    let (r, got) = run_tree_with(&fs, &dry_resume(), &strict());
+    let out = ok(&r);
+    assert_eq!(out.files_resumed, 1, "{out:?}");
+    assert_eq!(
+        r.dry.as_ref().unwrap().prior,
+        Some(DryPrior::Resume { operation_id: id(5), claims: Some(0), recovered: 1, strays: 1 })
+    );
+    assert!(planned_records(&got).contains(&(
+        "a".to_string(),
+        PlannedObject::File,
+        PlannedAction::Resume
+    )));
+    assert!(fs.exists(&temp), "the stray is only counted");
+    assert_eq!(fs.prepared_count(), 1, "the on-disk note is untouched");
+    only_the_copy_under_the_temp_root(&fs, base);
+    forbidden_for_resume(&fs, base);
+    let on_disk = store_of(&fs, 5);
+    let a = ClaimKey::new(strong(&fs, "/p/dest"), OsStr::new("a"));
+    assert_eq!(on_disk.get(&a).unwrap(), None, "the on-disk claim is untouched");
+}
+
+#[test]
+fn a_dry_resume_with_an_uncertain_note_predicts_commit_state_uncertain() {
+    let fs = strict_prior();
+    put(&fs, "/p/dest/a", b"A", 101);
+    let r_id = identity_of(&fs, "/p/dest/a");
+    noted(&fs, 5, "a", "a", r_id, "", false, "");
+    fs.set_identity("/p/dest/a", weakened(r_id));
+    let (fs, base) = with_temp_root(fs);
+    let (r, _) = run_tree_with(&fs, &dry_resume(), &strict());
+    assert_eq!(refused(&r.stop), (LockCode::CommitStateUncertain, false), "{:?}", r.stop);
+    assert!(r.copy.is_none());
+    only_the_copy_under_the_temp_root(&fs, base);
+    forbidden_for_resume(&fs, base);
+}
+
+#[test]
+fn a_dry_resume_of_a_created_prior_without_a_store_plans_fresh() {
+    for torn in [false, true] {
+        let fs = fake();
+        prior3_with(&fs, 5, OpState::Created, &opts());
+        if torn {
+            fs.write_file(state_db(5), b"");
+        }
+        let (fs, base) = with_temp_root(fs);
+        let (r, _) = run_tree_with(&fs, &dry_resume(), &opts());
+        let out = ok(&r);
+        assert_eq!(out.files_copied, 2, "{torn}: {out:?}");
+        assert!(
+            r.warnings.iter().any(|w| matches!(w, RunWarning::DryRunStoreFresh { operation_id }
+                if *operation_id == id(5))),
+            "{torn}: {:?}",
+            r.warnings
+        );
+        assert_eq!(
+            r.dry.as_ref().unwrap().prior,
+            Some(DryPrior::Resume {
+                operation_id: id(5),
+                claims: Some(0),
+                recovered: 0,
+                strays: 0
+            })
+        );
+        only_the_copy_under_the_temp_root(&fs, base);
+        forbidden_for_resume(&fs, base);
+    }
+}
+
+#[test]
+fn a_dry_resume_of_a_transferring_prior_without_a_store_predicts_state_corrupt() {
+    let fs = fake();
+    prior3_with(&fs, 5, OpState::Transferring, &opts());
+    let (fs, base) = with_temp_root(fs);
+    let (r, _) = run_tree_with(&fs, &dry_resume(), &opts());
+    assert_eq!(refused(&r.stop), (LockCode::StateCorrupt, false), "{:?}", r.stop);
+    assert!(detail(&r.stop).contains("the workspace has no state.db"), "{:?}", r.stop);
+    assert!(r.copy.is_none());
+    only_the_copy_under_the_temp_root(&fs, base);
+    forbidden_for_resume(&fs, base);
+}
+
+#[test]
+fn a_dry_resume_reports_a_partial_as_would_copy_with_its_size() {
+    let fs = resumable(100, b"o", 101, ClaimStatus::Created);
+    fs.create_dir(Path::new("/p/dest/sub")).unwrap();
+    fs.write_file(format!("/p/dest/sub/{}", temp_of("b", 5)), b"BB");
+    let (fs, base) = with_temp_root(fs);
+    let (r, got) = run_tree_with(&fs, &dry_resume(), &opts());
+    ok(&r);
+    assert!(planned_records(&got).contains(&(
+        "sub/b".to_string(),
+        PlannedObject::File,
+        PlannedAction::CopyOverPartial { len: 2 }
+    )));
+    assert_eq!(r.dry.as_ref().unwrap().partials_present, 1);
+    assert!(fs.exists(format!("/p/dest/sub/{}", temp_of("b", 5))));
+    only_the_copy_under_the_temp_root(&fs, base);
+    forbidden_for_resume(&fs, base);
+}
+
+#[test]
+fn dry_adopt_removes_its_temporary_directory_on_every_path() {
+    // A torn store: the refusal names the ON-DISK path, never the copy.
+    let (fs, base) = with_temp_root(resumable(100, b"o", 101, ClaimStatus::Created));
+    fs.write_file(state_db(5), b"garbage");
+    let (r, _) = run_tree_with(&fs, &dry_resume(), &opts());
+    assert_eq!(refused(&r.stop), (LockCode::StateCorrupt, false), "{:?}", r.stop);
+    let d = detail(&r.stop).replace('\\', "/");
+    assert!(d.contains(&state_db(5)) && !d.contains("/flux-dry"), "{d}");
+    assert!(
+        r.warnings.iter().any(|w| matches!(w, RunWarning::DryRunStoreTorn)),
+        "{:?}",
+        r.warnings
+    );
+    only_the_copy_under_the_temp_root(&fs, base);
+
+    // An incompatible option: refused before the copy is made.
+    let (fs, base) = with_temp_root(resumable(100, b"o", 101, ClaimStatus::Created));
+    let (r, _) = run_tree_with(&fs, &dry_resume(), &with_policy(ExistingPolicy::SkipExisting));
+    assert!(matches!(r.stop, Some(RunError::Refused { .. })), "{:?}", r.stop);
+    only_the_copy_under_the_temp_root(&fs, base);
+
+    // A temp root that does not exist: a failure at the state step naming the copy.
+    let fs = resumable(100, b"o", 101, ClaimStatus::Created);
+    let (r, _) = run_tree_with(&fs, &dry_resume(), &opts());
+    match &r.stop {
+        Some(RunError::Failed { step, path, .. }) => {
+            assert_eq!(*step, RunStep::State);
+            assert!(path.to_string_lossy().replace('\\', "/").starts_with("/flux-dry/flux-dry-"));
+        }
+        other => panic!("expected a failure, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_dry_resume_matches_the_live_resume_on_the_fake() {
+    let (dry_fs, _) = with_temp_root(renamed_with_a_stray_temp());
+    let live_fs = renamed_with_a_stray_temp();
+    let (d, got) = run_tree_with(&dry_fs, &dry_resume(), &strict());
+    let (l, _) = run_tree_with(&live_fs, &resume(), &strict());
+    let (d_out, l_out) = (ok(&d), ok(&l));
+    assert_eq!(
+        (d_out.files_resumed, d_out.files_copied, d_out.bytes_resumed),
+        (l_out.files_resumed, l_out.files_copied, l_out.bytes_resumed)
+    );
+    let Some(ResumeNote::Adopted { claims, recovered, .. }) = &l.resumed else {
+        panic!("{:?}", l.resumed)
+    };
+    let Some(DryPrior::Resume { claims: dclaims, recovered: drecovered, strays, .. }) =
+        &d.dry.as_ref().unwrap().prior
+    else {
+        panic!("{:?}", d.dry)
+    };
+    assert_eq!((dclaims, drecovered), (claims, recovered));
+    assert_eq!(*strays, 1, "the live run removed one stray");
+    let resumed: Vec<String> = planned_records(&got)
+        .into_iter()
+        .filter(|(_, _, a)| *a == PlannedAction::Resume)
+        .map(|(p, _, _)| p)
+        .collect();
+    assert_eq!(resumed.len() as u64, l_out.files_resumed);
+    assert_eq!(resumed, vec!["a".to_string()]);
+}
+
+#[test]
+fn recovery_under_dry_counts_strays_and_removes_nothing() {
+    for dry_mode in [true, false] {
+        let fs = renamed_with_a_stray_temp();
+        let temp = format!("/p/dest/{}", temp_of("a", 5));
+        let dest = fs.destination_root(Path::new("/p/dest")).unwrap();
+        let mut store = store_of(&fs, 5);
+        let mut warnings = Vec::new();
+        let got = crate::run::recover::recover_publications(
+            &dest,
+            Path::new("/p/dest"),
+            &id(5),
+            &mut store,
+            &mut warnings,
+            Path::new("manifest"),
+            dry_mode,
+        )
+        .unwrap();
+        assert_eq!((got.recovered, got.strays), (1, 1), "dry {dry_mode}");
+        assert_eq!(fs.exists(&temp), dry_mode, "dry {dry_mode}: the stray stays only under dry");
+        assert_eq!(
+            store.get(&ClaimKey::new(strong(&fs, "/p/dest"), OsStr::new("a"))).unwrap(),
+            created("a")
+        );
+    }
 }
