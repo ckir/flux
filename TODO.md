@@ -619,6 +619,7 @@ PS-1 (a socket at the lock or claim-store path was `IO_ERROR`, exit 1) and PP-1 
 - [ ] **The dry mode's cost on the live path was not measured (D9):** one `dry_run` branch per entry, and the live path now also calls its claim store through `dyn ClaimStore` (a vtable call per claim operation).
 
 ## Cut 11a test debt (deferred by the SDD run, 2026-10-17)
+- [ ] **The fake's `FakeDirHandle::open_dir` records nothing in the call log**, so the dry-run `forbidden` allow-lists (`tree.rs`, `run/tests.rs`) cannot see `open_dir` calls; `open_dir` is in the allow-list for the day the fake records it (capstone round 1, open question b).
 
 - [ ] **The fake does not inherit identity strength.** `crates/flux-core/src/fault_fs.rs` gives every directory it creates a Strong identity regardless of its parent's, so a fake-backed LIVE run into a weak destination notes `replace_degraded` only for the root, while the dry run notes the planned child too (the spec's inheritance rule; the dry test asserts count 2). On a real filesystem both note 2. Debt: let the fake inherit identity strength on `create_dir` (ruling P4).
 - [ ] **Untested arms and pins:** `dry_file`'s `Err` arm is untested (the directory-target refusal happens in `prepare_file` before the dry branch); the unreadable-note test pins only `": "`; two of the three note strings are pinned by inspection only (the completed-prior one is pinned end to end by the CLI test).

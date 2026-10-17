@@ -7768,7 +7768,8 @@ fn forbidden(fs: &FaultFs, base: usize) {
     assert!(after.iter().any(|c| c.starts_with("metadata(")), "no source stat: {after:?}");
     // The allow-list (the fake's own record names for I1's read-only methods): any other call after the watermark is
     // a destination-side effect or ask the dry mode must not make.
-    const ALLOWED: [&str; 8] = [
+    const ALLOWED: [&str; 9] = [
+        "open_dir",
         "metadata",
         "read_dir",
         "read_link",
