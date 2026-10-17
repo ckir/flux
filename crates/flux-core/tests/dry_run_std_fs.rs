@@ -43,6 +43,7 @@ fn config(dry_run: bool) -> RunConfig {
         descriptor_limit: None,
         resume_verify: run::ResumeVerify::Chunks,
         dry_run,
+        dry_temp_root: None,
     }
 }
 

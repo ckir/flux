@@ -498,6 +498,34 @@ pub fn run_warning_line(w: &RunWarning) -> String {
         RunWarning::DryRunPriorUnreadable { detail } => format!(
             "note: a prior operation's record could not be read ({detail}); --dry-run does not preview how a real run handles it"
         ),
+        RunWarning::DryRunLockRecord {
+            operation_id,
+            owner_instance_id,
+            boot_session_id,
+            heartbeat_age_secs,
+            workspace_path,
+        } => {
+            let age = match heartbeat_age_secs {
+                Some(n) => format!("{n} s ago"),
+                None => "in the future".to_string(),
+            };
+            format!(
+                "note: a lock record for operation {operation_id} exists (owner instance {owner_instance_id}, boot session {boot_session_id}, last heartbeat {age}, workspace {workspace_path}); a real run tries the OS lock: if it is held, TARGET_LOCK_BUSY; if not, the preview below applies, and this exit code reflects that case"
+            )
+        }
+        RunWarning::DryRunLockTakeover { why } => format!(
+            "note: --break-lock would take over the lock, whose record is unreadable ({why}); a real run refuses with TARGET_LOCK_BUSY if the OS lock is held"
+        ),
+        RunWarning::DryRunBrokenLeftover { name } => {
+            format!("note: an interrupted lock recovery left {name}; a real run classifies it")
+        }
+        RunWarning::DryRunDebris { name } => {
+            format!("note: a real run would remove the workspace debris {name}")
+        }
+        RunWarning::DryRunStoreFresh { operation_id } => {
+            format!("note: would create a fresh claim store for operation {operation_id}")
+        }
+        RunWarning::DryRunStoreTorn => "note: the prior's claim store could not be read consistently; a live run may have been writing it: run the dry run again before deciding on --restart".to_string(),
     }
 }
 

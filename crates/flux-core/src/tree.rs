@@ -2282,7 +2282,9 @@ fn dry_planned(
     let action = match (replace, object) {
         (true, _) => PlannedAction::Overwrite,
         (false, PlannedObject::Symlink) => PlannedAction::CreateSymlink,
-        (false, PlannedObject::File | PlannedObject::Dir) => PlannedAction::Copy,
+        // The walk plans files, directories and links; a restart preview's `State` and `Partial` entries (cut 11b)
+        // are streamed directly and never pass here.
+        (false, _) => PlannedAction::Copy,
     };
     if replace {
         out.files_overwritten += 1;

@@ -1,5 +1,6 @@
 //! Cut 11a: the types a dry run (`flux copy --dry-run`) is built from.
 
+use crate::state::OpState;
 use flux_fs::{
     ClaimKey, ClaimOutcome, ClaimRecord, ClaimStore, FluxPathKey, PreparedRecord, RecoveryOp,
     Result,
@@ -11,6 +12,8 @@ pub enum PlannedObject {
     File,
     Dir,
     Symlink,
+    State,
+    Partial,
 }
 
 impl PlannedObject {
@@ -19,6 +22,8 @@ impl PlannedObject {
             PlannedObject::File => "file",
             PlannedObject::Dir => "dir",
             PlannedObject::Symlink => "symlink",
+            PlannedObject::State => "state",
+            PlannedObject::Partial => "partial",
         }
     }
 }
@@ -47,6 +52,8 @@ pub enum PlannedAction {
     Overwrite,
     Skip(SkipReason),
     CreateSymlink,
+    Resume,
+    Discard,
 }
 
 impl PlannedAction {
@@ -57,6 +64,8 @@ impl PlannedAction {
             PlannedAction::Overwrite => "would_overwrite",
             PlannedAction::Skip(_) => "would_skip",
             PlannedAction::CreateSymlink => "would_create_symlink",
+            PlannedAction::Resume => "would_resume",
+            PlannedAction::Discard => "would_discard",
         }
     }
 }
@@ -76,6 +85,27 @@ pub struct DryRun {
     pub unprobed_noreplace: bool,
     pub prior_seen: bool,
     pub planned: Option<PlannedEntry>,
+    /// Cut 11b: a readable lock record whose owner's liveness was not probed (the dual outcome).
+    pub owner_liveness: bool,
+    /// Cut 11b: `--restart --break-lock` would take an uncertain lock over.
+    pub lock_takeover: bool,
+    /// Cut 11b: what `--resume` or `--restart` would do with the prior operations.
+    pub prior: Option<DryPrior>,
+    /// Cut 11b: half-copied files found beside their targets under `--resume`; their continuation is not previewed.
+    pub partials_present: u64,
+}
+
+/// Cut 11b: what a dry `--resume` or `--restart` would do with the prior operations at DEST.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DryPrior {
+    /// No prior operation: the run would start a new one.
+    StartedNew,
+    /// `--resume` would continue operation `operation_id`: `claims` of its claim records (`None` when not counted),
+    /// `recovered` prepared notes recovered, `strays` stray temporaries.
+    Resume { operation_id: String, claims: Option<u64>, recovered: u64, strays: u64 },
+    /// `--restart` would supersede the listed operations (id and state), discarding `partials` half-copied files and
+    /// `states` state directories.
+    Restart { superseded: Vec<(String, OpState)>, partials: u64, states: u64 },
 }
 
 /// A claim store that stores nothing: every insert is fresh, every lookup is absent. Holds no state.
@@ -175,5 +205,9 @@ mod tests {
         assert_eq!(PlannedObject::File.as_str(), "file");
         assert_eq!(PlannedObject::Dir.as_str(), "dir");
         assert_eq!(PlannedObject::Symlink.as_str(), "symlink");
+        assert_eq!(PlannedAction::Resume.as_str(), "would_resume");
+        assert_eq!(PlannedAction::Discard.as_str(), "would_discard");
+        assert_eq!(PlannedObject::State.as_str(), "state");
+        assert_eq!(PlannedObject::Partial.as_str(), "partial");
     }
 }

@@ -77,6 +77,9 @@ pub struct RunConfig {
     pub resume_verify: ResumeVerify,
     /// `--dry-run` (spec cut 11a; D6): plan the copy, change nothing.
     pub dry_run: bool,
+    /// Cut 11b: where a dry resume copies the prior's claim store; `None` means `std::env::temp_dir()`; tests pass a
+    /// fake directory.
+    pub dry_temp_root: Option<PathBuf>,
 }
 
 /// §101's heartbeat interval: 5 s.
@@ -227,13 +230,32 @@ pub enum RunWarning {
     /// Cut 9f-1, owner ruling 23: as `WalQuarantined`, but the damaged log could not be set aside (`error`), so the
     /// tree ran without checkpoints.
     WalNotQuarantined { code: &'static str, why: String, error: String },
-    /// Cut 11a: a dry run found a resumable prior operation at DEST. It does not inspect the owner, so what a real run
-    /// does with it is not previewed.
+    /// Cut 11a: a dry run found a resumable prior operation at DEST (cut 11b previews what the invocation does with it;
+    /// this note is printed by a plain dry run before its predicted refusal).
     DryRunPrior { operation_id: String, state: OpState },
     /// Cut 11a: a dry run found an earlier COMPLETED operation; a real run would finish its recorded cleanup.
     DryRunPriorCompleted { operation_id: String },
     /// Cut 11a: a dry run could not read the prior operations' records; `detail` is `CODE: text`.
     DryRunPriorUnreadable { detail: String },
+    /// Cut 11b: a dry run read the lock record but did not probe its owner's liveness; `heartbeat_age_secs` is `None`
+    /// when the heartbeat lies in the future.
+    DryRunLockRecord {
+        operation_id: String,
+        owner_instance_id: String,
+        boot_session_id: String,
+        heartbeat_age_secs: Option<u64>,
+        workspace_path: String,
+    },
+    /// Cut 11b: a dry `--restart --break-lock` would take an uncertain lock over; `why` says what made it uncertain.
+    DryRunLockTakeover { why: String },
+    /// Cut 11b: a dry run found a broken leftover (`name`) beside the state that a real run would remove.
+    DryRunBrokenLeftover { name: String },
+    /// Cut 11b: a dry run found debris (`name`) in the state directory that a real run would remove.
+    DryRunDebris { name: String },
+    /// Cut 11b: a dry resume found the prior's claim store freshly created (empty), so it has no claims to count.
+    DryRunStoreFresh { operation_id: String },
+    /// Cut 11b: a dry resume found the prior's claim store torn, so its claims were not counted.
+    DryRunStoreTorn,
 }
 
 /// A directory copy under the destination's lock ("The run").
@@ -1150,7 +1172,15 @@ fn dry_tree<F: DestinationRoot>(
             Err(a) => a.outcome.directories_created += 1,
         }
     }
-    run.dry = Some(DryRun { unprobed_noreplace: true, prior_seen, planned: None });
+    run.dry = Some(DryRun {
+        unprobed_noreplace: true,
+        prior_seen,
+        planned: None,
+        owner_liveness: false,
+        lock_takeover: false,
+        prior: None,
+        partials_present: 0,
+    });
     run.copy = Some(result);
     run
 }
@@ -1192,6 +1222,14 @@ fn dry_file<F: DestinationRoot>(
             None
         }
     };
-    run.dry = Some(DryRun { unprobed_noreplace: false, prior_seen, planned });
+    run.dry = Some(DryRun {
+        unprobed_noreplace: false,
+        prior_seen,
+        planned,
+        owner_liveness: false,
+        lock_takeover: false,
+        prior: None,
+        partials_present: 0,
+    });
     run
 }

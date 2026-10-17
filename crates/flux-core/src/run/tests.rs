@@ -37,6 +37,7 @@ fn cfg() -> RunConfig {
         descriptor_limit: None,
         resume_verify: ResumeVerify::Chunks,
         dry_run: false,
+        dry_temp_root: None,
     }
 }
 
@@ -7793,7 +7794,18 @@ fn a_dry_tree_run_takes_no_lock_creates_nothing_and_plans_the_tree() {
     let out = ok(&r);
     assert_eq!((out.files_copied, out.bytes_copied, out.directories_created), (2, 3, 2));
     assert!(!fs.exists("/p/dest") && !fs.exists(LOCK));
-    assert_eq!(r.dry, Some(DryRun { unprobed_noreplace: true, prior_seen: false, planned: None }));
+    assert_eq!(
+        r.dry,
+        Some(DryRun {
+            unprobed_noreplace: true,
+            prior_seen: false,
+            planned: None,
+            owner_liveness: false,
+            lock_takeover: false,
+            prior: None,
+            partials_present: 0
+        })
+    );
     assert!(r.stop.is_none() && r.resumed.is_none());
     assert_eq!(got.iter().filter(|f| matches!(f.cause, TreeFailureCause::Planned(_))).count(), 3);
     forbidden(&fs, base);
@@ -7999,7 +8011,11 @@ fn a_dry_single_file_run_plans_copy_overwrite_and_each_skip() {
             planned: Some(PlannedEntry {
                 object: PlannedObject::File,
                 action: PlannedAction::Copy
-            })
+            }),
+            owner_liveness: false,
+            lock_takeover: false,
+            prior: None,
+            partials_present: 0
         })
     );
     assert!(!fs.exists("/p/t"));
