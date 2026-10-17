@@ -629,6 +629,7 @@ PS-1 (a socket at the lock or claim-store path was `IO_ERROR`, exit 1) and PP-1 
 - [ ] **The sweep's walk-error warnings now precede its deletion warnings** (`partials_under` lists first, `sweep_partials` deletes after): a live `--restart` or `flux cleanup` prints the same warnings in a different order than before cut 11b.
 
 ## Cut 11b test debt (deferred by the SDD run, 2026-10-18)
+- [ ] **`forbidden_for_resume` bans five claim writes by name** (`run/tests.rs`): a twelfth `ClaimStore` method would pass unnoticed; an allow-list of the six reads/inserts the copy legitimately sees would fail closed.
 - [ ] **The `dry_lock` branches without a test:** SafetyRejected/DestinationError, `Error`, `Untrusted`, File-site Orphan (`run/tests.rs`).
 - [ ] **The eight-fold lock-test setup and the `("record", Some(Vec::new()))` placeholder.**
 - [ ] **The "Unreadable" scan case asserts only `stop.is_some()`.**
