@@ -7186,10 +7186,24 @@ mod tests {
         (path.to_string(), object, action)
     }
 
-    /// A dry run wrote nothing and asked nothing of the destination's write side, and did stat the source.
+    /// True for a call that names no path, or one under a destination or source root of these tests (`/p`, `/src`, and
+    /// the `/d`, `/dst`, `/out` roots this module's fixtures also use) or below.
+    fn under_dest_or_source(call: &str) -> bool {
+        let Some((_, rest)) = call.split_once('(') else {
+            return true;
+        };
+        let arg = rest.rsplit_once(')').map_or(rest, |(a, _)| a).replace('\\', "/");
+        ["/p", "/src", "/d", "/dst", "/out", "/outside"]
+            .iter()
+            .any(|root| arg == *root || arg.starts_with(&format!("{root}/")))
+    }
+
+    /// A dry run wrote nothing and asked nothing of the destination's write side, and did stat the source, under `/p` or
+    /// `/src`; a dry resume's `<temp>` lives elsewhere and is asserted by its own tests.
     fn forbidden(fs: &FaultFs) {
         let all = fs.calls();
         let calls = &all[DRY_BASE.get()..];
+        let scoped: Vec<&String> = calls.iter().filter(|c| under_dest_or_source(c)).collect();
         for banned in [
             "create_dir(",
             "create_new(",
@@ -7209,7 +7223,7 @@ mod tests {
             "lock_sync_all",
             "claim_",
         ] {
-            assert!(!calls.iter().any(|c| c.starts_with(banned)), "{banned} in {calls:?}");
+            assert!(!scoped.iter().any(|c| c.starts_with(banned)), "{banned} in {calls:?}");
         }
         assert!(calls.iter().any(|c| c.starts_with("metadata(")), "no source stat: {calls:?}");
         // The allow-list (the fake's own record names for I1's read-only methods): any other call after the watermark is
@@ -7225,7 +7239,7 @@ mod tests {
             "lock_capability",
             "read_file",
         ];
-        for c in calls {
+        for c in scoped {
             let name = c.split('(').next().unwrap_or(c);
             assert!(ALLOWED.contains(&name), "{c} is not an allowed dry-run call: {:?}", calls);
         }

@@ -7740,11 +7740,22 @@ fn dry() -> RunConfig {
     RunConfig { dry_run: true, ..cfg() }
 }
 
-/// A dry run wrote nothing and asked nothing of the destination's write side or its lock, and did stat the source.
+/// True for a call that names no path, or one whose path is `/p` or `/src` or below.
+fn under_dest_or_source(call: &str) -> bool {
+    let Some((_, rest)) = call.split_once('(') else {
+        return true;
+    };
+    let arg = rest.rsplit_once(')').map_or(rest, |(a, _)| a).replace('\\', "/");
+    ["/p", "/src"].iter().any(|root| arg == *root || arg.starts_with(&format!("{root}/")))
+}
+
+/// A dry run wrote nothing and asked nothing of the destination's write side or its lock, and did stat the source,
+/// under `/p` or `/src`; a dry resume's `<temp>` lives elsewhere and is asserted by its own tests.
 /// `base` is the call-log length before the run: `fake()` itself records three `create_dir` calls.
 fn forbidden(fs: &FaultFs, base: usize) {
     let all = calls(fs);
     let after = &all[base..];
+    let scoped: Vec<&String> = after.iter().filter(|c| under_dest_or_source(c)).collect();
     for banned in [
         "create_dir(",
         "create_new(",
@@ -7764,7 +7775,7 @@ fn forbidden(fs: &FaultFs, base: usize) {
         "lock_sync_all",
         "claim_",
     ] {
-        assert!(!after.iter().any(|c| c.starts_with(banned)), "{banned} in {after:?}");
+        assert!(!scoped.iter().any(|c| c.starts_with(banned)), "{banned} in {after:?}");
     }
     assert!(after.iter().any(|c| c.starts_with("metadata(")), "no source stat: {after:?}");
     // The allow-list (the fake's own record names for I1's read-only methods): any other call after the watermark is
@@ -7780,7 +7791,7 @@ fn forbidden(fs: &FaultFs, base: usize) {
         "lock_capability",
         "read_file",
     ];
-    for c in after {
+    for c in scoped {
         let name = c.split('(').next().unwrap_or(c);
         assert!(ALLOWED.contains(&name), "{c} is not an allowed dry-run call: {:?}", after);
     }
