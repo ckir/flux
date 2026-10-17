@@ -77,6 +77,8 @@ This is a stated deviation from section 5.2's "or the refusal it would get", clo
 - Summary (last line, stderr): `dry run: would copy N files (B bytes), overwrite O, skip S, create D directories; E errors`, where `E` is the report's `errors` (`report.rs:314`, which includes walk and create-dir failures), not `files_failed`. The real summary line is not printed.
 - `--json` (stdout, section 53): the same object as a real run, plus `"dry_run": true` and, when non-empty, `"unprobed": [...]`. Both keys are omitted when false/empty, so the live 18-key object and its test (`report.rs:576`) are unchanged. The pre-engine stops in `main.rs:283-297` also carry `dry_run`. The counters keep their names with "would" meaning.
 - Unprobed primitive (spec lines 10938-10942, test 124): a real TREE run always probes `rename_no_replace` in its workspace before copying (`run/place.rs:413`, the only caller) and is refused with `NOREPLACE_PUBLISH_UNAVAILABLE` if it is missing. A dry run that passes pre-flight prints once: `note: the no-replace publication primitive was not probed under --dry-run; a real run may be refused with NOREPLACE_PUBLISH_UNAVAILABLE`, and sets `"unprobed": ["noreplace_publish"]`. A single-file run has no probe, so its dry run prints no such note. Owner decision D3.
+- The `unprobed` vocabulary (ruling P10, master spec 5.2: checks that need locks or writes are reported as checks a real run would make, not performed), emitted only under `--dry-run` and only when the dry branch ran, in this order: `noreplace_publish` (tree only, as above), `target_lock` (tree and single file, always, with the stderr line `note: the destination's lock was not taken and no operation state was written under --dry-run; a real run may be refused or fail there`), and `prior_operation` (tree and single file, when the prior scan pushed at least one note; no line of its own). The unprobed lines print in that order after the resume-verify lines and before the summary (tree), after the planned line (single file). `average_bytes_per_second` is 0 under `--dry-run`: no byte moved.
+- A source entry named `.flux` directly under the root (ruling P11): a directory merges as live does (the run's workspace made `DEST/.flux`), uncounted and unrecorded, its reserved children refused; a file or link fails as live does (`DESTINATION_ERROR` into an existing DEST, `SAFETY_REJECTED` into an absent one, step `gate`). A name whose temporary exceeds `NAME_LIMIT` fails as `IO_ERROR` at step `create` before the gate (ruling P12).
 - Warnings and degraded groups (`DegradedGroup`) render as in a real run.
 
 ### 3.7 Exit codes
@@ -122,7 +124,7 @@ The oracle for agreement is the real engine, run on the same inputs.
 5. `None` frames: DEST absent; a nested absent subtree; a pre-existing directory containing an absent subdirectory; a link or file at a directory name (`SafetyRejected` / `DestinationError`).
 6. Exit parity at the edges (I7): a walk abort on the first entry with DEST absent exits 3 in both modes and counts no DEST; a run that completes counts DEST; a 250-byte DEST name exits 3 in both.
 7. `Planned` is not a failure: `FailureTally::total()` is 0 after a clean dry run; the three exhaustive matches name the new cause.
-8. CLI: per-entry lines and the dry-run summary, never the real summary; `--json` carries `dry_run: true`, omits `unprobed` when the plan is for a single file, and a live run's JSON is byte-for-byte what it was (the existing 18-key test); exit codes 0/1/3; `--dry-run --resume|--restart|--break-lock` exits 2; a pre-engine stop under `--dry-run --json` carries `dry_run`.
+8. CLI: per-entry lines and the dry-run summary, never the real summary; `--json` carries `dry_run: true`, carries `unprobed` as `["noreplace_publish","target_lock"]` for a tree and `["target_lock"]` for a single file (plus `prior_operation` when a prior was seen; ruling P10), and a live run's JSON is byte-for-byte what it was (the existing 18-key test); exit codes 0/1/3; `--dry-run --resume|--restart|--break-lock` exits 2; a pre-engine stop under `--dry-run --json` carries `dry_run`.
 9. Prior notes: a destination with a resumable prior, a completed prior, and a corrupt prior record each print their note and the fresh plan, exit unchanged.
 10. Unprobed note: printed for a tree dry run that passes pre-flight, absent for a single file, and absent for a tree dry run refused in pre-flight (mutant: emitted unconditionally).
 11. Single file: new, existing under each policy, `DEST/` trailing slash, a directory at the target, an absent parent (refusal), the planned action reaching the stream line.
@@ -140,7 +142,7 @@ The oracle for agreement is the real engine, run on the same inputs.
 - D6. `RunConfig.dry_run`, not a `CopyOptions` field.
 - D7. `--dry-run` with `--resume`, `--restart`, `--break-lock` is a usage error in 11a.
 - D8. No quiet flag; one stderr line per entry.
-- D9. The mode adds one branch per entry to the Live hot path and nothing else; no timing comparison is part of this cut. If the owner wants one, the same `small_1000x4kib` bench comparison as cut 10b applies (top level, idle machine, owner-approved).
+- D9. The mode adds one branch per entry to the Live hot path, and the Live path now also calls its claim store through `dyn ClaimStore` (a vtable call per claim operation); no timing comparison is part of this cut. If the owner wants one, the same `small_1000x4kib` bench comparison as cut 10b applies (top level, idle machine, owner-approved).
 
 ## 8. Exhaustiveness self-audit
 
@@ -162,6 +164,9 @@ The oracle for agreement is the real engine, run on the same inputs.
   - P2/P3: temporary `expect(dead_code)` attributes were carried between tasks and removed when the use landed.
   - P4: a planned child under a weak parent is noted in `replace_degraded` (count 2 with the root); the fake does not inherit strength, see the test debt in `TODO.md`.
   - P5: the plan's I7 fixture was wrong: the walk yields `Dir` before `MountUnknown`, so the first entry is created before a Strict mount refusal in both modes. I7's walk-abort case is pinned by a weak source subdirectory under Strict.
-  - P6: the `.flux`-in-source known limit (a source `.flux` directory into an absent DEST plans as created; see `TODO.md`).
+  - P6 (RETIRED by P11): the `.flux`-in-source known limit is closed; see P11.
   - P7: `Report.dry_run` and the dry summary follow the flag, because a dry run refused in the engine's pre-flight returns before the dry branch; `unprobed` follows the run.
   - P8: E2 amended as above.
+  - P10: the lock and the operation state are reported as unperformed checks in `unprobed` (`target_lock` always, `prior_operation` when a prior was seen), in the JSON as well as on stderr (final review I-2; master spec 5.2).
+  - P11: a top-level `.flux` source entry mirrors the live run (a directory merges uncounted; a file or link fails with the live code), retiring P6 (final review I-1).
+  - P12: a temporary name over `NAME_LIMIT` is predicted as `IO_ERROR` at step `create` (final review I-3a); an unreadable source file stays predicted as `would_copy` (I-3b, documented).

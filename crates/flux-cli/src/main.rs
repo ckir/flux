@@ -325,9 +325,12 @@ fn copy(args: &CopyArgs) -> u8 {
             let mut rep = Report::tree_run(&run, ms);
             // The flag, not `run.dry`: an engine pre-flight refusal returns before the dry branch (ruling P7).
             rep.dry_run = args.dry_run;
-            let unprobed = run.dry.as_ref().is_some_and(|d| d.unprobed_noreplace);
-            if unprobed {
-                rep.unprobed = vec!["noreplace_publish"];
+            if let Some(d) = &run.dry {
+                rep.unprobed = report::unprobed_keys(d);
+            }
+            if args.dry_run {
+                // Nothing moved: the `timed()` throughput would be for bytes that never did.
+                rep.average_bytes_per_second = 0;
             }
             let full = args.resume_verify == Some(ResumeVerifyArg::Full);
             match &run.copy {
@@ -348,8 +351,8 @@ fn copy(args: &CopyArgs) -> u8 {
                     lines(report::checkpoint_lines(outcome, opts.durability == Durability::Normal));
                     lines(report::resume_verify_lines(outcome, full));
                     rep.resume_verify = report::resume_verify_used(outcome, full).then_some("full");
-                    if unprobed {
-                        err(report::UNPROBED_NOREPLACE_LINE);
+                    for line in report::unprobed_lines(&rep.unprobed) {
+                        err(line);
                     }
                     err(&if args.dry_run {
                         report::dry_run_summary_line(&rep, outcome.directories_created)
@@ -377,6 +380,12 @@ fn copy(args: &CopyArgs) -> u8 {
             let ms = millis(started);
             let mut rep = Report::file_run(&run, target_existed, ms);
             rep.dry_run = args.dry_run;
+            if let Some(d) = &run.dry {
+                rep.unprobed = report::unprobed_keys(d);
+            }
+            if args.dry_run {
+                rep.average_bytes_per_second = 0;
+            }
             match &run.copy {
                 Some(result) => {
                     match result {
@@ -399,6 +408,9 @@ fn copy(args: &CopyArgs) -> u8 {
                         // `CopyError`'s Display is "CODE: source" plus a staging temporary that
                         // could not be removed - the one thing the user needs to clean up.
                         Err(e) => err(&e.to_string()),
+                    }
+                    for line in report::unprobed_lines(&rep.unprobed) {
+                        err(line);
                     }
                     lines(report::run_lines(&run));
                     lines(report::resume_lines(&run, 0));

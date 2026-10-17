@@ -348,6 +348,36 @@ pub fn dry_run_summary_line(r: &Report, directories_created: u64) -> String {
 /// A tree dry run reached the walk without probing the no-replace publication primitive (section 3.6).
 pub const UNPROBED_NOREPLACE_LINE: &str = "note: the no-replace publication primitive was not probed under --dry-run; a real run may be refused with NOREPLACE_PUBLISH_UNAVAILABLE";
 
+/// A dry run took no lock and wrote no state, so the refusals and failures those would meet are unchecked (master spec
+/// 5.2, ruling P10). Printed for a tree and a single file alike.
+pub const UNPROBED_TARGET_LOCK_LINE: &str = "note: the destination's lock was not taken and no operation state was written under --dry-run; a real run may be refused or fail there";
+
+/// The `unprobed` vocabulary of a dry run that reached the engine's dry branch, in its fixed order: the no-replace
+/// publication primitive (tree only), the target lock (always), and a prior operation seen at DEST (the notes already
+/// print, so it has no line of its own).
+pub fn unprobed_keys(d: &flux_core::dry_run::DryRun) -> Vec<&'static str> {
+    let mut v = Vec::new();
+    if d.unprobed_noreplace {
+        v.push("noreplace_publish");
+    }
+    v.push("target_lock");
+    if d.prior_seen {
+        v.push("prior_operation");
+    }
+    v
+}
+
+/// The stderr lines of the `unprobed` keys, in the same order; `prior_operation` has none.
+pub fn unprobed_lines(keys: &[&'static str]) -> Vec<&'static str> {
+    keys.iter()
+        .filter_map(|k| match *k {
+            "noreplace_publish" => Some(UNPROBED_NOREPLACE_LINE),
+            "target_lock" => Some(UNPROBED_TARGET_LOCK_LINE),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The single-file counterpart of a `Planned` record's line: `target` in place of the tree-relative path.
 pub fn planned_file_line(target: &str, p: PlannedEntry) -> String {
     match p.action {

@@ -1055,11 +1055,13 @@ fn rollback<D: DirHandle, P: Place<D>>(
     }
 }
 
-/// Cut 11a: the notes a dry run makes of the prior operations at DEST. It never inspects an owner or a lock.
+/// Cut 11a: the notes a dry run makes of the prior operations at DEST. It never inspects an owner or a lock. Answers
+/// whether it pushed at least one note (`DryRun::prior_seen`, the JSON's `prior_operation`).
 fn dry_prior_notes(
     scan: crate::lock::LockResult<crate::prior::Scan>,
     warnings: &mut Vec<RunWarning>,
-) {
+) -> bool {
+    let before = warnings.len();
     match scan {
         Ok(scan) => {
             for p in scan.resumable {
@@ -1081,6 +1083,7 @@ fn dry_prior_notes(
             warnings.push(RunWarning::DryRunPriorUnreadable { detail });
         }
     }
+    warnings.len() > before
 }
 
 /// Cut 11a: the dry branch of `tree_with`. Reads DEST's prior operations for the notes, then plans the walk over a
@@ -1094,7 +1097,7 @@ fn dry_tree<F: DestinationRoot>(
     on_report: &mut dyn FnMut(TreeFailure),
     mut out: TreeOutcome,
 ) -> Run<Result<TreeOutcome, TreeAbort>> {
-    dry_prior_notes(Place::scan(&*place, &cfg.operation_id), &mut run.warnings);
+    let prior_seen = dry_prior_notes(Place::scan(&*place, &cfg.operation_id), &mut run.warnings);
     let fs = place.fs;
     let src_root = place.src_root.clone();
     let null = std::cell::RefCell::new(NullClaimStore);
@@ -1147,7 +1150,7 @@ fn dry_tree<F: DestinationRoot>(
             Err(a) => a.outcome.directories_created += 1,
         }
     }
-    run.dry = Some(DryRun { unprobed_noreplace: true, planned: None });
+    run.dry = Some(DryRun { unprobed_noreplace: true, prior_seen, planned: None });
     run.copy = Some(result);
     run
 }
@@ -1161,7 +1164,7 @@ fn dry_file<F: DestinationRoot>(
     cfg: &RunConfig,
     opts: &CopyOptions,
 ) -> Run<Result<Outcome, CopyError>> {
-    dry_prior_notes(Place::scan(place, &cfg.operation_id), &mut run.warnings);
+    let prior_seen = dry_prior_notes(Place::scan(place, &cfg.operation_id), &mut run.warnings);
     let planned = match plan_file(fs, src, Some(place.dir), &place.target, opts) {
         Ok(FilePlan::Proceed { src_meta, degraded, replaces }) => {
             run.copy = Some(Ok(Outcome {
@@ -1189,6 +1192,6 @@ fn dry_file<F: DestinationRoot>(
             None
         }
     };
-    run.dry = Some(DryRun { unprobed_noreplace: false, planned });
+    run.dry = Some(DryRun { unprobed_noreplace: false, prior_seen, planned });
     run
 }

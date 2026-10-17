@@ -16,13 +16,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 
-fn opts(existing: ExistingPolicy, links: Links) -> CopyOptions {
+fn opts(existing: ExistingPolicy, links: Links, safety: Safety) -> CopyOptions {
     CopyOptions {
         preserve_times: Preserve::Default,
         preserve_permissions: Preserve::Default,
         durability: Durability::Normal,
         publish: Publish::Replace,
-        safety: Safety::Default,
+        safety,
         operation_id: OperationId::new("t"),
         existing,
         links,
@@ -96,6 +96,14 @@ fn has_flux_name(key: &str) -> bool {
     key.split('/').any(|c| c.starts_with(".flux"))
 }
 
+/// Flux's own workspace under DEST: `.flux` itself and its reserved control directories. A source `.flux/other/x`
+/// is data (P11) and is NOT control.
+fn is_control(key: &str) -> bool {
+    let mut parts = key.split('/');
+    parts.next() == Some(".flux")
+        && parts.next().is_none_or(|c| matches!(c, "operations" | "standalone" | "atomic"))
+}
+
 fn write_aged(path: &Path, bytes: &[u8], modified: SystemTime) {
     std::fs::write(path, bytes).unwrap();
     std::fs::File::options().write(true).open(path).unwrap().set_modified(modified).unwrap();
@@ -117,6 +125,7 @@ struct Case {
     name: &'static str,
     existing: ExistingPolicy,
     links: Links,
+    safety: Safety,
     /// Builds the trees under `src` (exists) and `dst` (does not exist yet).
     build: fn(&Path, &Path),
 }
@@ -131,18 +140,34 @@ fn plain_source(src: &Path) {
     std::fs::write(src.join("sub").join("b.txt"), b"BB").unwrap();
 }
 
+fn flux_dir_source(src: &Path) {
+    std::fs::create_dir_all(src.join(".flux").join("operations")).unwrap();
+    std::fs::write(src.join(".flux").join("operations").join("op.json"), b"{}").unwrap();
+    std::fs::create_dir_all(src.join(".flux").join("other")).unwrap();
+    std::fs::write(src.join(".flux").join("other").join("x.txt"), b"X").unwrap();
+    std::fs::write(src.join("a.txt"), b"A").unwrap();
+}
+
+fn flux_file_source(src: &Path) {
+    std::fs::create_dir_all(src).unwrap();
+    std::fs::write(src.join(".flux"), b"a file named like the control directory").unwrap();
+    std::fs::write(src.join("a.txt"), b"A").unwrap();
+}
+
 fn corpus() -> Vec<Case> {
     let mut v = vec![
         Case {
             name: "fresh dest",
             existing: ExistingPolicy::Overwrite,
             links: Links::Copy,
+            safety: Safety::Default,
             build: |src, _dst| plain_source(src),
         },
         Case {
             name: "existing dest, overwrite",
             existing: ExistingPolicy::Overwrite,
             links: Links::Copy,
+            safety: Safety::Default,
             build: |src, dst| {
                 mk_dst(src, dst);
                 plain_source(src);
@@ -153,6 +178,7 @@ fn corpus() -> Vec<Case> {
             name: "existing dest, skip-existing",
             existing: ExistingPolicy::SkipExisting,
             links: Links::Copy,
+            safety: Safety::Default,
             build: |src, dst| {
                 mk_dst(src, dst);
                 plain_source(src);
@@ -163,6 +189,7 @@ fn corpus() -> Vec<Case> {
             name: "existing dest, update",
             existing: ExistingPolicy::Update,
             links: Links::Copy,
+            safety: Safety::Default,
             build: |src, dst| {
                 mk_dst(src, dst);
                 plain_source(src);
@@ -173,6 +200,7 @@ fn corpus() -> Vec<Case> {
             name: "file at a directory name",
             existing: ExistingPolicy::Overwrite,
             links: Links::Copy,
+            safety: Safety::Default,
             build: |src, dst| {
                 mk_dst(src, dst);
                 std::fs::create_dir_all(src.join("d")).unwrap();
@@ -185,6 +213,7 @@ fn corpus() -> Vec<Case> {
             name: "nested absent subtree",
             existing: ExistingPolicy::Overwrite,
             links: Links::Copy,
+            safety: Safety::Default,
             build: |src, dst| {
                 mk_dst(src, dst);
                 std::fs::create_dir_all(src.join("a").join("b").join("c")).unwrap();
@@ -193,20 +222,92 @@ fn corpus() -> Vec<Case> {
             },
         },
         Case {
-            // P6: the reserved path is exercised on an EXISTING dest whose `.flux` is pre-created.
+            // P11: a top-level `.flux` source directory merges as live does, so DEST needs no pre-created `.flux`.
             name: "reserved .flux/operations source path",
             existing: ExistingPolicy::Overwrite,
             links: Links::Copy,
+            safety: Safety::Default,
             build: |src, dst| {
                 mk_dst(src, dst);
-                std::fs::create_dir(dst.join(".flux")).unwrap();
                 std::fs::create_dir_all(src.join(".flux").join("operations")).unwrap();
                 std::fs::write(src.join(".flux").join("operations").join("op.json"), b"{}")
                     .unwrap();
                 std::fs::write(src.join("a.txt"), b"A").unwrap();
             },
         },
+        Case {
+            name: "top-level .flux directory, existing dest",
+            existing: ExistingPolicy::Overwrite,
+            links: Links::Copy,
+            safety: Safety::Default,
+            build: |src, dst| {
+                mk_dst(src, dst);
+                flux_dir_source(src);
+            },
+        },
+        Case {
+            name: "top-level .flux directory, fresh dest",
+            existing: ExistingPolicy::Overwrite,
+            links: Links::Copy,
+            safety: Safety::Default,
+            build: |src, _dst| flux_dir_source(src),
+        },
+        Case {
+            name: "top-level .flux file, existing dest",
+            existing: ExistingPolicy::Overwrite,
+            links: Links::Copy,
+            safety: Safety::Default,
+            build: |src, dst| {
+                mk_dst(src, dst);
+                flux_file_source(src);
+            },
+        },
+        Case {
+            name: "top-level .flux file, fresh dest",
+            existing: ExistingPolicy::Overwrite,
+            links: Links::Copy,
+            safety: Safety::Default,
+            build: |src, _dst| flux_file_source(src),
+        },
+        Case {
+            // P12: the temporary's name (the name plus a suffix) is over the limit; live fails `create_new`.
+            name: "a name whose temporary is over the name limit",
+            existing: ExistingPolicy::Overwrite,
+            links: Links::Copy,
+            safety: Safety::Default,
+            build: |src, dst| {
+                mk_dst(src, dst);
+                std::fs::create_dir_all(src).unwrap();
+                std::fs::write(src.join("n".repeat(240)), b"N").unwrap();
+                std::fs::write(src.join("ok.txt"), b"OK").unwrap();
+            },
+        },
+        Case {
+            // The destination name is a hard link to the source file: the identity gate refuses it in both modes.
+            name: "hardlink alias of the source at the destination name",
+            existing: ExistingPolicy::Overwrite,
+            links: Links::Copy,
+            safety: Safety::Default,
+            build: |src, dst| {
+                mk_dst(src, dst);
+                plain_source(src);
+                std::fs::hard_link(src.join("a.txt"), dst.join("a.txt")).unwrap();
+            },
+        },
     ];
+    // ext4's identities are Strong, so `--safety strict` passes in both modes. Other filesystems may refuse the root.
+    #[cfg(target_os = "linux")]
+    v.push(Case {
+        name: "strict safety on a strong-identity filesystem, existing dest",
+        existing: ExistingPolicy::Overwrite,
+        links: Links::Copy,
+        safety: Safety::Strict,
+        build: |src, dst| {
+            mk_dst(src, dst);
+            plain_source(src);
+            trio(src, dst);
+        },
+    });
     #[cfg(unix)]
     {
         fn link_source(src: &Path) {
@@ -218,12 +319,14 @@ fn corpus() -> Vec<Case> {
             name: "symlink, links=copy, fresh dest",
             existing: ExistingPolicy::Overwrite,
             links: Links::Copy,
+            safety: Safety::Default,
             build: |src, _dst| link_source(src),
         });
         v.push(Case {
             name: "symlink over an existing file, links=copy, overwrite",
             existing: ExistingPolicy::Overwrite,
             links: Links::Copy,
+            safety: Safety::Default,
             build: |src, dst| {
                 mk_dst(src, dst);
                 link_source(src);
@@ -234,6 +337,7 @@ fn corpus() -> Vec<Case> {
             name: "symlink, links=skip",
             existing: ExistingPolicy::Overwrite,
             links: Links::Skip,
+            safety: Safety::Default,
             build: |src, _dst| link_source(src),
         });
     }
@@ -337,7 +441,7 @@ fn a_dry_run_leaves_the_destination_byte_for_byte_and_the_real_run_then_agrees()
         let (src, dst) = (d.path().join("src"), d.path().join("dst"));
         std::fs::create_dir(&src).unwrap();
         (case.build)(&src, &dst);
-        let o = opts(case.existing, case.links);
+        let o = opts(case.existing, case.links, case.safety);
         let name = case.name;
 
         let before = snapshot(&dst);
@@ -366,7 +470,7 @@ fn a_dry_run_leaves_the_destination_byte_for_byte_and_the_real_run_then_agrees()
         let after = snapshot(&dst);
         let changed: std::collections::BTreeSet<String> = after
             .iter()
-            .filter(|(k, _)| !has_flux_name(k))
+            .filter(|(k, _)| !is_control(k))
             .filter(|(k, e)| match before.get(*k) {
                 None => true,
                 // A directory's own mtime moves when a child is added; that is not the directory being planned.
@@ -404,7 +508,7 @@ fn a_dry_run_plans_while_another_handle_holds_the_destinations_lock() {
     assert!(lock.try_lock().unwrap());
 
     let (shape, planned, note) =
-        run_tree(&src, &dst, &opts(ExistingPolicy::Overwrite, Links::Copy), true);
+        run_tree(&src, &dst, &opts(ExistingPolicy::Overwrite, Links::Copy, Safety::Default), true);
 
     assert_eq!(shape.result, "Ok", "{shape:?}");
     assert_eq!(shape.counters.1, 2, "files_copied");
@@ -430,7 +534,7 @@ fn a_dry_single_file_run_into_a_folder_target_plans_and_creates_nothing() {
         &StdFileSystem,
         &src,
         &out.join("a.txt"),
-        &opts(ExistingPolicy::Overwrite, Links::Copy),
+        &opts(ExistingPolicy::Overwrite, Links::Copy, Safety::Default),
         &config(true),
     );
 

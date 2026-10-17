@@ -27,6 +27,7 @@ fn tree_in(d: &Path) -> PathBuf {
 }
 
 const UNPROBED: &str = "note: the no-replace publication primitive was not probed under --dry-run";
+const UNPROBED_LOCK: &str = "note: the destination's lock was not taken and no operation state was written under --dry-run; a real run may be refused or fail there";
 
 #[test]
 fn a_dry_tree_run_prints_one_line_per_entry_and_the_dry_summary_and_creates_nothing() {
@@ -41,11 +42,19 @@ fn a_dry_tree_run_prints_one_line_per_entry_and_the_dry_summary_and_creates_noth
         "sub: object_type=dir action=would_create",
         "sub/b: object_type=file action=would_copy",
         UNPROBED,
+        UNPROBED_LOCK,
         "dry run: would copy 2 files (3 bytes), overwrite 0, skip 0, create 2 directories; 0 errors",
     ] {
         assert!(e.contains(want), "missing {want:?} in {e}");
     }
     assert!(!e.contains("copied 2 files"), "{e}");
+    // The notes print in the `unprobed` order, before the summary.
+    let (noreplace, lock, summary) = (
+        e.find(UNPROBED).unwrap(),
+        e.find(UNPROBED_LOCK).unwrap(),
+        e.find("dry run: would").unwrap(),
+    );
+    assert!(noreplace < lock && lock < summary, "{e}");
     assert!(!dst.exists());
 }
 
@@ -58,9 +67,11 @@ fn a_dry_tree_run_json_carries_dry_run_and_unprobed_and_a_live_run_does_not() {
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let v = json(&out);
     assert_eq!(v["dry_run"], true, "{v}");
-    assert_eq!(v["unprobed"], serde_json::json!(["noreplace_publish"]), "{v}");
+    assert_eq!(v["unprobed"], serde_json::json!(["noreplace_publish", "target_lock"]), "{v}");
     assert_eq!(v.as_object().unwrap().len(), 20, "{v}");
     assert_eq!(v["files_copied"], 2, "{v}");
+    // Nothing moved, so there is no throughput (M-3).
+    assert_eq!(v["average_bytes_per_second"], 0, "{v}");
 
     let live = d.path().join("live");
     let out = flux().args(["copy", "--json"]).arg(&src).arg(&live).output().unwrap();
@@ -72,7 +83,7 @@ fn a_dry_tree_run_json_carries_dry_run_and_unprobed_and_a_live_run_does_not() {
 }
 
 #[test]
-fn a_dry_single_file_run_prints_its_line_and_no_unprobed_note() {
+fn a_dry_single_file_run_prints_its_line_and_only_the_lock_note() {
     let d = TempDir::new().unwrap();
     let a = d.path().join("a");
     let b = d.path().join("b");
@@ -83,8 +94,21 @@ fn a_dry_single_file_run_prints_its_line_and_no_unprobed_note() {
     assert!(e.contains(&format!("{}: object_type=file action=would_copy", b.display())), "{e}");
     assert!(e.contains("dry run: would copy 1 files"), "{e}");
     assert!(!e.contains(UNPROBED), "{e}");
+    assert!(e.contains(UNPROBED_LOCK), "{e}");
+    assert!(
+        e.find("action=would_copy").unwrap() < e.find(UNPROBED_LOCK).unwrap()
+            && e.find(UNPROBED_LOCK).unwrap() < e.find("dry run: would").unwrap(),
+        "{e}"
+    );
     assert!(!e.contains("copied 1 files"), "{e}");
     assert!(!b.exists());
+
+    let out = flux().args(["copy", "--dry-run", "--json"]).arg(&a).arg(&b).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v = json(&out);
+    assert_eq!(v["unprobed"], serde_json::json!(["target_lock"]), "{v}");
+    assert_eq!(v["dry_run"], true, "{v}");
+    assert_eq!(v["average_bytes_per_second"], 0, "{v}");
 
     std::fs::write(&b, b"old").unwrap();
     let out =
@@ -204,4 +228,29 @@ fn a_dry_run_notes_a_completed_prior_and_still_plans() {
     assert!(e.contains("a: object_type=file action=would_copy"), "{e}");
     assert!(ws.join("manifest").exists());
     assert!(partial.exists(), "a dry run finishes no cleanup");
+
+    // The JSON says so too (ruling P10): the prior is among the unprobed checks, after the other two.
+    let out = flux().args(["copy", "--dry-run", "--json"]).arg(&src).arg(&dst).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        json(&out)["unprobed"],
+        serde_json::json!(["noreplace_publish", "target_lock", "prior_operation"])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dry_run_stopped_on_a_symlink_source_is_still_marked_dry() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let link = d.path().join("to-dir");
+    std::os::unix::fs::symlink(&src, &link).unwrap();
+    let dst = d.path().join("dst");
+    let out = flux().args(["copy", "--dry-run", "--json"]).arg(&link).arg(&dst).output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).starts_with("SYMLINK_CREATION_UNAVAILABLE: "), "{}", stderr(&out));
+    let v = json(&out);
+    assert_eq!(v["dry_run"], true, "{v}");
+    assert!(v.get("unprobed").is_none(), "no dry branch ran: {v}");
+    assert!(!dst.exists());
 }

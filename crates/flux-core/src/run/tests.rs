@@ -7766,6 +7766,22 @@ fn forbidden(fs: &FaultFs, base: usize) {
         assert!(!after.iter().any(|c| c.starts_with(banned)), "{banned} in {after:?}");
     }
     assert!(after.iter().any(|c| c.starts_with("metadata(")), "no source stat: {after:?}");
+    // The allow-list (the fake's own record names for I1's read-only methods): any other call after the watermark is
+    // a destination-side effect or ask the dry mode must not make.
+    const ALLOWED: [&str; 8] = [
+        "metadata",
+        "read_dir",
+        "read_link",
+        "mount_root",
+        "source_mount_root",
+        "canonical_path",
+        "lock_capability",
+        "read_file",
+    ];
+    for c in after {
+        let name = c.split('(').next().unwrap_or(c);
+        assert!(ALLOWED.contains(&name), "{c} is not an allowed dry-run call: {:?}", after);
+    }
 }
 
 #[test]
@@ -7776,7 +7792,7 @@ fn a_dry_tree_run_takes_no_lock_creates_nothing_and_plans_the_tree() {
     let out = ok(&r);
     assert_eq!((out.files_copied, out.bytes_copied, out.directories_created), (2, 3, 2));
     assert!(!fs.exists("/p/dest") && !fs.exists(LOCK));
-    assert_eq!(r.dry, Some(DryRun { unprobed_noreplace: true, planned: None }));
+    assert_eq!(r.dry, Some(DryRun { unprobed_noreplace: true, prior_seen: false, planned: None }));
     assert!(r.stop.is_none() && r.resumed.is_none());
     assert_eq!(got.iter().filter(|f| matches!(f.cause, TreeFailureCause::Planned(_))).count(), 3);
     forbidden(&fs, base);
@@ -7900,6 +7916,42 @@ fn a_dry_run_notes_each_prior_and_still_plans() {
 }
 
 #[test]
+fn a_dry_run_says_whether_it_saw_a_prior_through_both_entry_points() {
+    // Cut 11a, ruling P10: `prior_seen` is true exactly when a `DryRunPrior*` note was pushed (the CLI's
+    // `prior_operation`). Mutant: drop the `prior_seen` assignment in `dry_tree` or `dry_file`.
+    let seen_tree = |fs: &FaultFs| {
+        let (r, _) = run_tree(fs, &dry());
+        (r.dry.as_ref().unwrap().prior_seen, r.warnings.len())
+    };
+    let fs = fake();
+    assert_eq!(seen_tree(&fs), (false, 0));
+    for state in [OpState::Failed, OpState::Completed] {
+        let fs = fake();
+        prior(&fs, 5, state);
+        assert_eq!(seen_tree(&fs), (true, 1), "{state:?}");
+    }
+    let fs = fake();
+    prior(&fs, 7, OpState::Failed);
+    fs.write_file(format!("/p/dest/.flux/operations/{}/manifest", id(7)), b"garbage");
+    assert_eq!(seen_tree(&fs), (true, 1), "unreadable");
+
+    let fs = fake();
+    let r = run_file(&fs, &dry());
+    assert!(!r.dry.as_ref().unwrap().prior_seen && r.warnings.is_empty(), "{:?}", r.warnings);
+    let fs = fake();
+    file_prior(&fs, 5);
+    let r = run_file(&fs, &dry());
+    assert!(r.dry.as_ref().unwrap().prior_seen);
+    assert!(
+        matches!(&r.warnings[..], [RunWarning::DryRunPrior { operation_id, state }]
+            if *operation_id == id(5) && *state == OpState::Failed),
+        "{:?}",
+        r.warnings
+    );
+    assert!(matches!(r.copy, Some(Ok(_))), "a prior never stops the plan: {:?}", r.copy);
+}
+
+#[test]
 fn a_dry_run_with_the_lock_held_by_another_still_plans() {
     let fs = fake();
     let p = fs.destination_root(Path::new("/p")).unwrap();
@@ -7942,6 +7994,7 @@ fn a_dry_single_file_run_plans_copy_overwrite_and_each_skip() {
         r.dry,
         Some(DryRun {
             unprobed_noreplace: false,
+            prior_seen: false,
             planned: Some(PlannedEntry {
                 object: PlannedObject::File,
                 action: PlannedAction::Copy
@@ -8021,9 +8074,9 @@ fn a_dry_tree_run_agrees_with_the_live_run_on_the_fake() {
     let nothing: Setup = |_| {};
     let link: Setup = |fs| fs.add_symlink("/src/l");
     let reserved: Setup = |fs| {
-        // DEST's own `.flux` exists in a live run (its workspace), so it pre-exists in both.
+        // P11: a top-level `.flux` source directory merges as live does (DEST's own `.flux` is the live workspace), so
+        // the dry fixture needs no pre-created `.flux`.
         fs.create_dir(Path::new("/p/dest")).unwrap();
-        fs.create_dir(Path::new("/p/dest/.flux")).unwrap();
         fs.create_dir(Path::new("/src/.flux")).unwrap();
         fs.create_dir(Path::new("/src/.flux/operations")).unwrap();
         fs.write_file("/src/.flux/operations/x", b"x");

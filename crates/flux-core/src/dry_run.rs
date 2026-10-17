@@ -69,9 +69,12 @@ pub struct PlannedEntry {
 }
 
 /// What a dry run tells the CLI beyond the counters. `planned` is a single file's one entry, `None` for a tree.
+/// `prior_seen` is whether the prior-operation scan pushed at least one `DryRunPrior*` warning (the CLI's
+/// `prior_operation` in `unprobed`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DryRun {
     pub unprobed_noreplace: bool,
+    pub prior_seen: bool,
     pub planned: Option<PlannedEntry>,
 }
 

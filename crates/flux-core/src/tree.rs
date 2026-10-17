@@ -739,6 +739,22 @@ fn walk_into<F: DestinationRoot>(
             WalkEvent::Dir { path, identity } => {
                 let frame = if !live {
                     Frame::Skipped
+                } else if dry_top_level_flux(cx, stack, &path) {
+                    // Cut 11a (ruling P11): the live run's own workspace already made DEST/.flux, so a source directory
+                    // of that name at depth 1 MERGES live: no count, no record. Its children plan under a directory
+                    // that is not looked at (a planned, fresh frame), their reserved names refused as ever.
+                    let claim_parent = match stack.last() {
+                        Some(Frame::Live { claim_parent, .. }) => *claim_parent,
+                        _ => None,
+                    };
+                    Frame::Live {
+                        dir: None,
+                        created: HashSet::new(),
+                        names: NameIndex::for_new_dir(),
+                        claim_parent,
+                        fresh: true,
+                        batch: Batch::default(),
+                    }
                 } else if reserved_path(&path) {
                     let conflict = TreeFailureCause::CreateDir(reserved_conflict());
                     report(out, on_report, path.clone(), conflict);
@@ -773,6 +789,10 @@ fn walk_into<F: DestinationRoot>(
             }
             WalkEvent::File { path } => {
                 out.files_total += 1;
+                if dry_top_level_flux(cx, stack, &path) {
+                    dry_flux_entry_failure(stack, path, out, on_report);
+                    continue;
+                }
                 // Cut 9e (decision 7): the writers held open across every live frame stay under the cap. At it, the
                 // shallowest frame with a pending entry flushes (the longest-waiting batch, and the one the walk is
                 // least likely to add to), through the same `flush_batch` a `DirEnd` uses; each flush empties one batch.
@@ -813,6 +833,10 @@ fn walk_into<F: DestinationRoot>(
             }
             WalkEvent::Symlink { path } => {
                 out.files_total += 1;
+                if dry_top_level_flux(cx, stack, &path) && cx.opts.links != Links::Skip {
+                    dry_flux_entry_failure(stack, path, out, on_report);
+                    continue;
+                }
                 // Cut 10a: a link holds no writer, so the open-writers cap above does not apply to it.
                 if let Some(Frame::Live { dir, names, claim_parent, fresh, batch, .. }) =
                     stack.last_mut()
@@ -884,6 +908,54 @@ fn walk_into<F: DestinationRoot>(
         }
     }
     Ok(())
+}
+
+/// Cut 11a (ruling P11), dry mode only: `path` is the root's direct child named `.flux` (ASCII case-insensitive, as
+/// `reserved_path` compares), met while only the root frame is on the stack, AND `.flux` does not exist at the
+/// destination (DEST absent, or `open_dir` answers `NotFound`). The live run's workspace has already made
+/// `DEST/.flux`, which a dry run never does, so such an entry is judged against what live meets there. When
+/// `DEST/.flux` exists, the ordinary dry path applies: it opens the real directory and its entries resolve against
+/// the real listing, as live's do.
+fn dry_top_level_flux<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    stack: &[Frame<F::Dir>],
+    path: &Path,
+) -> bool {
+    if !cx.dry_run || stack.len() != 1 {
+        return false;
+    }
+    let mut parts = path.components();
+    let named = matches!(
+        (parts.next(), parts.next()),
+        (Some(Component::Normal(only)), None)
+            if only.as_encoded_bytes().eq_ignore_ascii_case(FLUX_DIR.as_bytes())
+    );
+    if !named {
+        return false;
+    }
+    match stack.last() {
+        Some(Frame::Live { dir: None, .. }) => true,
+        Some(Frame::Live { dir: Some(root), .. }) => {
+            let name = path.file_name().expect("a walk path ends in a name");
+            matches!(root.open_dir(name), Err(e) if e.source.kind() == ErrorKind::NotFound)
+        }
+        _ => false,
+    }
+}
+
+/// A top-level source FILE or LINK named `.flux`, dry: live fails it because DEST/.flux is a directory. DEST present
+/// means `copy_one` resolves a directory entry (`DESTINATION_ERROR`); DEST absent means a fresh root plans it New and
+/// the identity gate refuses it (`SAFETY_REJECTED`). Counted in `failures.copy` as live's is; no `Planned` record.
+fn dry_flux_entry_failure<D: DirHandle>(
+    stack: &[Frame<D>],
+    path: PathBuf,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) {
+    let dest_exists = matches!(stack.last(), Some(Frame::Live { dir: Some(_), .. }));
+    let code = if dest_exists { Code::DestinationError } else { Code::SafetyRejected };
+    let cause = target_failure(CopyStep::Gate, code, "the destination is a directory");
+    report(out, on_report, path, cause);
 }
 
 /// Cut 9e: the writers held open across the stack, one per pending entry of every live frame.
@@ -2107,6 +2179,9 @@ fn dry_stop_file<F: DestinationRoot>(
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<(), CopyError> {
+    if let Err(e) = dry_temp_name_fits(cx, name) {
+        return finish_copy(path, Err(e), out, on_report);
+    }
     let opts = CopyOptions { existing: ExistingPolicy::Overwrite, publish, ..cx.opts.clone() };
     let planned = match plan_file(cx.fs, src, parent, name, &opts) {
         Ok(p) => p,
@@ -2149,6 +2224,9 @@ fn dry_stop_link<F: DestinationRoot>(
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<(), CopyError> {
+    if let Err(e) = dry_temp_name_fits(cx, name) {
+        return finish_copy(path, Err(e), out, on_report);
+    }
     let degraded = match gate_link_read(cx, parent, name, src, publish) {
         Ok(d) => d,
         Err(e) => return finish_copy(path, Err(e), out, on_report),
@@ -2163,6 +2241,32 @@ fn dry_stop_link<F: DestinationRoot>(
     };
     finish_copy(path.clone(), Ok(outcome), out, on_report)?;
     dry_planned(out, on_report, path, PlannedObject::Symlink, replace);
+    Ok(())
+}
+
+/// Cut 11a (ruling P12): live creates the entry's temporary (`temp_path`, the name plus a suffix) before a byte moves,
+/// and a name over the limit fails that create with `IO_ERROR` (ENAMETOOLONG). The name alone predicts it, so a dry run
+/// reports it, at the live step, before the gate.
+fn dry_temp_name_fits<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    name: &std::ffi::OsStr,
+) -> std::result::Result<(), CopyError> {
+    let temp = flux_fs::temp_path(Path::new(name), &cx.opts.operation_id);
+    let too_long = temp
+        .file_name()
+        .is_some_and(|n| crate::lock::site::name_len(n) > crate::lock::site::NAME_LIMIT);
+    if too_long {
+        return Err(CopyError::at(
+            CopyStep::Create,
+            FsError::new(
+                Code::IoError,
+                std::io::Error::new(
+                    ErrorKind::InvalidFilename,
+                    "the temporary's name would exceed the name limit",
+                ),
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -7106,6 +7210,22 @@ mod tests {
             assert!(!calls.iter().any(|c| c.starts_with(banned)), "{banned} in {calls:?}");
         }
         assert!(calls.iter().any(|c| c.starts_with("metadata(")), "no source stat: {calls:?}");
+        // The allow-list (the fake's own record names for I1's read-only methods): any other call after the watermark is
+        // a destination-side effect or ask the dry mode must not make.
+        const ALLOWED: [&str; 8] = [
+            "metadata",
+            "read_dir",
+            "read_link",
+            "mount_root",
+            "source_mount_root",
+            "canonical_path",
+            "lock_capability",
+            "read_file",
+        ];
+        for c in calls {
+            let name = c.split('(').next().unwrap_or(c);
+            assert!(ALLOWED.contains(&name), "{c} is not an allowed dry-run call: {:?}", calls);
+        }
     }
 
     /// `/src/a` only (1 byte). `/dst` absent.
@@ -7348,6 +7468,7 @@ mod tests {
         let e = only_copy_failure(&got, "a");
         assert_eq!(e.code(), Code::SafetyRejected);
         assert_eq!((dry_out.files_copied, dry_out.failures.copy), (0, 1));
+        forbidden(&dry);
 
         let live = fixture();
         let (r, _, live_got) = link_run(&live, &o, false, policy(1), &unguarded, no_seed);
@@ -7499,5 +7620,230 @@ mod tests {
         );
         assert_eq!(out.special_files_skipped, 1);
         forbidden(&fs);
+    }
+
+    /// A live run over `fs` into `/dst` as the run makes it: the root is `root_created` (DEST was absent) or not, and
+    /// `/dst/.flux` exists already, because the run's own workspace made it before the walk.
+    fn live_with_workspace(
+        fs: &FaultFs,
+        o: &CopyOptions,
+        root_created: bool,
+    ) -> (TreeOutcome, Vec<TreeFailure>) {
+        let source =
+            prepare_source(fs, Path::new("/src"), Path::new("/dst"), MountPolicy::Cross).unwrap();
+        if !fs.exists(Path::new("/dst")) {
+            fs.create_dir(Path::new("/dst")).unwrap();
+        }
+        if !fs.exists(Path::new("/dst/.flux")) {
+            fs.create_dir(Path::new("/dst/.flux")).unwrap();
+        }
+        let root = fs.destination_root(Path::new("/dst")).unwrap();
+        let store = root.create_claim_store(OsStr::new("state.db"), o.durability).unwrap();
+        let claims = std::cell::RefCell::new(store);
+        let cx = Shared {
+            fs,
+            src_root: Path::new("/src"),
+            src_identity: source.identity,
+            opts: o,
+            guard: &unguarded,
+            beat: &no_heartbeat,
+            claims: Some(&claims),
+            resume: false,
+            batch: BatchPolicy::DEFAULT,
+            ckpt: None,
+            dry_run: false,
+        };
+        let mut out = TreeOutcome::default();
+        let mut got = Vec::new();
+        let (_root, r) =
+            copy_tree_at(&cx, source.events, root, root_created, &mut out, &mut |f| got.push(f));
+        r.unwrap();
+        (out, got)
+    }
+
+    /// Every `Copy` or `CreateDir` failure of `got`: path, code, step (the step only a copy carries).
+    fn failure_codes(got: &[TreeFailure]) -> Vec<(PathBuf, Code, Option<CopyStep>)> {
+        got.iter()
+            .filter_map(|f| match &f.cause {
+                TreeFailureCause::Copy(e) => Some((f.path.clone(), e.code(), Some(e.step))),
+                TreeFailureCause::CreateDir(e) => Some((f.path.clone(), e.code, None)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dry_a_top_level_flux_directory_merges_like_live() {
+        // Cut 11a, ruling P11. Mutant: drop the `.flux` special case in `walk_into` (the directory is then planned
+        // and counted as a created one, and `.flux/other/x` is no longer judged under a fresh frame alike).
+        let fixture = || {
+            let fs = tree();
+            fs.create_dir(Path::new("/src/.flux")).unwrap();
+            fs.create_dir(Path::new("/src/.flux/operations")).unwrap();
+            fs.write_file("/src/.flux/operations/x", b"x");
+            fs.create_dir(Path::new("/src/.flux/other")).unwrap();
+            fs.write_file("/src/.flux/other/x", b"xx");
+            fs
+        };
+        for dest_exists in [false, true] {
+            let dry = fixture();
+            if dest_exists {
+                dry.create_dir(Path::new("/dst")).unwrap();
+            }
+            let (r, got) = dry_run(&dry, "/src", dest_exists.then_some("/dst"), &opts());
+            let dry_out = r.unwrap();
+            let plan = plan_of(&got);
+            assert!(!plan.iter().any(|(p, _, _)| p == ".flux"), "{dest_exists}: {plan:?}");
+            assert!(plan.contains(&pl(
+                ".flux/other",
+                PlannedObject::Dir,
+                PlannedAction::CreateDir
+            )));
+            assert!(plan.contains(&pl(".flux/other/x", PlannedObject::File, PlannedAction::Copy)));
+            assert!(!plan.iter().any(|(p, _, _)| p.starts_with(".flux/operations")), "{plan:?}");
+            forbidden(&dry);
+
+            let live = fixture();
+            let (live_out, live_got) = live_with_workspace(&live, &opts(), !dest_exists);
+            assert_eq!(
+                failure_codes(&got),
+                vec![(
+                    PathBuf::from(".flux/operations"),
+                    Code::ControlPlaneNamespaceConflict,
+                    None
+                )],
+                "{dest_exists}"
+            );
+            assert_eq!(failure_codes(&got), failure_codes(&live_got), "{dest_exists}");
+            assert_eq!(dry_out.directories_created, live_out.directories_created, "{dest_exists}");
+            assert_eq!(tally(&dry_out), tally(&live_out), "{dest_exists}");
+            assert!(live.exists("/dst/.flux/other/x"), "live copied the other child");
+        }
+    }
+
+    #[test]
+    fn dry_a_top_level_flux_file_fails_like_live() {
+        // Cut 11a, ruling P11: live fails a root-level FILE or LINK named `.flux` because DEST/.flux is a directory.
+        // DEST present: `copy_one`'s resolve (DESTINATION_ERROR); DEST absent (a fresh root): the identity gate
+        // (SAFETY_REJECTED). Mutant: drop the `.flux` special case.
+        let file_fixture = || {
+            let fs = flat();
+            fs.write_file("/src/.flux", b"f");
+            fs
+        };
+        let link_fixture = || {
+            let fs = links(&[(".flux", "x")]);
+            fs.write_file("/src/a", b"A");
+            fs
+        };
+        type Fixture<'a> = &'a dyn Fn() -> FaultFs;
+        let fixtures: [(&str, Fixture<'_>); 2] = [("file", &file_fixture), ("link", &link_fixture)];
+        for (what, fixture) in fixtures {
+            for (dest_exists, code) in
+                [(true, Code::DestinationError), (false, Code::SafetyRejected)]
+            {
+                let dry = fixture();
+                if dest_exists {
+                    dry.create_dir(Path::new("/dst")).unwrap();
+                }
+                let (r, got) = dry_run(&dry, "/src", dest_exists.then_some("/dst"), &opts());
+                let dry_out = r.unwrap();
+                let want = vec![(PathBuf::from(".flux"), code, Some(CopyStep::Gate))];
+                assert_eq!(failure_codes(&got), want, "{what} {dest_exists}");
+                assert!(!plan_of(&got).iter().any(|(p, _, _)| p == ".flux"), "{got:?}");
+                assert_eq!(dry_out.failures.copy, 1);
+                forbidden(&dry);
+
+                let live = fixture();
+                let (live_out, live_got) = live_with_workspace(&live, &opts(), !dest_exists);
+                assert_eq!(failure_codes(&live_got), want, "live {what} {dest_exists}");
+                assert_eq!(tally(&dry_out), tally(&live_out), "{what} {dest_exists}");
+                assert_eq!(dry_out.files_total, live_out.files_total, "{what} {dest_exists}");
+            }
+        }
+    }
+
+    #[test]
+    fn dry_a_temporary_name_over_the_limit_is_a_predicted_create_failure() {
+        // Cut 11a, ruling P12: live fails `create_new` of an over-long temporary with IO_ERROR before any byte moves.
+        // The fake enforces no name limit, so only the dry side is asserted here; the real-fs corpus pairs it with
+        // a live run. Mutant: drop the length check in `dry_stop_file` / `dry_stop_link`.
+        let long = "n".repeat(240);
+        let fixture = || {
+            let fs = links(&[(long.as_str(), "x")]);
+            fs.write_file(format!("/src/{}", "f".repeat(240)), b"F");
+            fs.write_file("/src/ok", b"K");
+            fs
+        };
+        for dest_exists in [false, true] {
+            let fs = fixture();
+            if dest_exists {
+                fs.create_dir(Path::new("/dst")).unwrap();
+            }
+            let (r, got) = dry_run(&fs, "/src", dest_exists.then_some("/dst"), &opts());
+            let out = r.unwrap();
+            let mut failures = failure_codes(&got);
+            failures.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut want = vec![
+                (PathBuf::from("f".repeat(240)), Code::IoError, Some(CopyStep::Create)),
+                (PathBuf::from(&long), Code::IoError, Some(CopyStep::Create)),
+            ];
+            want.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(failures, want, "{dest_exists}");
+            assert_eq!(plan_of(&got), vec![pl("ok", PlannedObject::File, PlannedAction::Copy)]);
+            assert_eq!((out.failures.copy, out.files_copied, out.files_total), (2, 1, 3));
+            forbidden(&fs);
+        }
+        // The edge: the longest name whose temporary still fits plans.
+        let fs = flat();
+        let temp_extra =
+            flux_fs::temp_path(Path::new("x"), &opts().operation_id).file_name().unwrap().len() - 1;
+        let fits = "m".repeat(crate::lock::site::NAME_LIMIT - temp_extra);
+        fs.write_file(format!("/src/{fits}"), b"F");
+        let (r, got) = dry_run(&fs, "/src", None, &opts());
+        r.unwrap();
+        assert!(failure_codes(&got).is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn dry_an_existing_flux_directory_at_dest_resolves_its_entries_like_live() {
+        // Cut 11a, ruling P11 refined: the special case holds only while `DEST/.flux` is absent. Mutant: apply it
+        // unconditionally (`.flux/other/x` would plan as new and `.flux/other` as created).
+        use flux_fs::ExistingPolicy::{Overwrite, Update};
+        let fixture = || {
+            let fs = tree();
+            fs.create_dir(Path::new("/src/.flux")).unwrap();
+            fs.create_dir(Path::new("/src/.flux/other")).unwrap();
+            fs.write_file("/src/.flux/other/x", b"N");
+            fs.create_dir(Path::new("/dst")).unwrap();
+            fs.create_dir(Path::new("/dst/.flux")).unwrap();
+            fs.create_dir(Path::new("/dst/.flux/other")).unwrap();
+            fs.write_file("/dst/.flux/other/x", b"O");
+            let t = |s| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s);
+            fs.set_modified("/src/.flux/other/x", t(100));
+            fs.set_modified("/dst/.flux/other/x", t(200));
+            fs
+        };
+        for (policy, action, skipped, overwritten) in [
+            (Update, PlannedAction::Skip(SkipReason::UpToDate), 1, 0),
+            (Overwrite, PlannedAction::Overwrite, 0, 1),
+        ] {
+            let o = with_existing(policy);
+            let dry = fixture();
+            let (r, got) = dry_run(&dry, "/src", Some("/dst"), &o);
+            let dry_out = r.unwrap();
+            let plan = plan_of(&got);
+            assert!(plan.contains(&pl(".flux/other/x", PlannedObject::File, action)), "{plan:?}");
+            assert!(!plan.iter().any(|(p, _, _)| p == ".flux" || p == ".flux/other"), "{plan:?}");
+            forbidden(&dry);
+
+            let live = fixture();
+            let (live_out, _) = live_with_workspace(&live, &o, false);
+            for out in [&dry_out, &live_out] {
+                assert_eq!((out.files_skipped, out.files_overwritten), (skipped, overwritten));
+            }
+            assert_eq!(dry_out.directories_created, live_out.directories_created, "{policy:?}");
+            assert_eq!(tally(&dry_out), tally(&live_out), "{policy:?}");
+        }
     }
 }
