@@ -597,6 +597,14 @@ the spec's numbers, 9-10 were learned during execution).
 - [ ] The doc line on the unix `mount_root` in `crates/flux-platform/src/std_fs.rs` (~:260) is 120 columns wide.
 - [ ] No real-process CLI test creates a mount (needs privilege), so the end-to-end skip is pinned only through the fake.
 
+## Main review of 2026-10-17 (agy, new model; brief `.clavity/seams/main-review-r1.md`; every finding re-measured by the driver)
+
+PS-1 (a socket at the lock or claim-store path was `IO_ERROR`, exit 1) and PP-1 (`ClaimStore::get` answered `Ok(None)` for an undecodable record) were fixed in `31a000d`. Left open:
+
+- [ ] **A lost lock inside the STOP-HELD discard loop of `flush_batch`** (`crates/flux-core/src/tree.rs`, `let _ = claims.borrow_mut().apply_recovery(&ops);`): when the first stop is not `TargetLockBusy` and `cx.guard` then fails while a LATER entry's temporary is discarded, the loop still pushes that entry's `Discard` and writes `state.db`, and returns the original stop, so `drain_batches` removes instead of keeping. A narrow race, the same family as the UNBATCHED item above (9d decision 8 says the batched path writes nothing after a lost lock). Reasoned from the code, not reproduced.
+- [ ] **The non-ASCII fold limit (cut 9d limit 7) also covers two FILES** whose names fold equal only by a non-ASCII fold, under `--existing=update` or `skip-existing` into a folding destination: the second resolves against the not-yet-replaced destination entry (the pre-check `folded()` is ASCII only and the temp probe runs later) and may be skipped instead of reported as a collision. Reasoned; the fake folds ASCII only and this machine's filesystem is case-sensitive.
+- [ ] **Windows `open_lock` / `open_claim_store` with an `AF_UNIX` socket file at the name are unmeasured** (`dir_windows.rs`, `open_file_at`; the new socket tests are POSIX-only). The Windows open refuses reparse points, which an `AF_UNIX` socket file is, but the code returned by that path was not checked.
+
 ## Cut 9g open (single-file resume; triaged from the anomalies inbox 2026-10-14)
 
 - [ ] `plan_resume` hashes through `parent.open_read(temp)` without comparing that handle's identity to `partial_meta.identity` (only `open_existing` checks it), so a concurrent double swap of the partial name could keep an unproven prefix. Pre-existing (same code as 9f-2 `full`), `copy.rs` near line 610; needs a second writer on the destination directory.
