@@ -49,6 +49,7 @@ fn config() -> RunConfig {
         resume: false,
         descriptor_limit: None,
         resume_verify: flux_core::run::ResumeVerify::Chunks,
+        dry_run: false,
     }
 }
 

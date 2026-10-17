@@ -36,6 +36,7 @@ fn cfg() -> RunConfig {
         resume: false,
         descriptor_limit: None,
         resume_verify: ResumeVerify::Chunks,
+        dry_run: false,
     }
 }
 
@@ -2516,6 +2517,7 @@ fn a_target_that_finds_its_own_claim_proceeds() {
             ..crate::tree::BatchPolicy::DEFAULT
         },
         ckpt: None,
+        dry_run: false,
     };
     let mut out = TreeOutcome::default();
     let mut got = Vec::new();
@@ -7726,5 +7728,526 @@ mod checkpointing {
             Some(FileResume { reused: MIB as u64, recopied: 0, discard: None })
         );
         assert_eq!(fs.read_file("/p/t").unwrap(), pattern(MIB));
+    }
+}
+
+// ---- Cut 11a, Task 4: the dry branches of the run ----
+
+use crate::dry_run::{DryRun, PlannedAction, PlannedEntry, PlannedObject, SkipReason};
+
+fn dry() -> RunConfig {
+    RunConfig { dry_run: true, ..cfg() }
+}
+
+/// A dry run wrote nothing and asked nothing of the destination's write side or its lock, and did stat the source.
+/// `base` is the call-log length before the run: `fake()` itself records three `create_dir` calls.
+fn forbidden(fs: &FaultFs, base: usize) {
+    let all = calls(fs);
+    let after = &all[base..];
+    for banned in [
+        "create_dir(",
+        "create_new(",
+        "create_symlink(",
+        "rename_no_replace(",
+        "rename_replace(",
+        "remove_file(",
+        "remove_dir(",
+        "open_read(",
+        "set_times(",
+        "set_permissions(",
+        "create_lock(",
+        "open_lock(",
+        "open_claim_store(",
+        "try_lock",
+        "write_at_start",
+        "lock_sync_all",
+        "claim_",
+    ] {
+        assert!(!after.iter().any(|c| c.starts_with(banned)), "{banned} in {after:?}");
+    }
+    assert!(after.iter().any(|c| c.starts_with("metadata(")), "no source stat: {after:?}");
+    // The allow-list (the fake's own record names for I1's read-only methods): any other call after the watermark is
+    // a destination-side effect or ask the dry mode must not make.
+    const ALLOWED: [&str; 9] = [
+        "open_dir",
+        "metadata",
+        "read_dir",
+        "read_link",
+        "mount_root",
+        "source_mount_root",
+        "canonical_path",
+        "lock_capability",
+        "read_file",
+    ];
+    for c in after {
+        let name = c.split('(').next().unwrap_or(c);
+        assert!(ALLOWED.contains(&name), "{c} is not an allowed dry-run call: {:?}", after);
+    }
+}
+
+#[test]
+fn a_dry_tree_run_takes_no_lock_creates_nothing_and_plans_the_tree() {
+    let fs = fake();
+    let base = fs.calls().len();
+    let (r, got) = run_tree(&fs, &dry());
+    let out = ok(&r);
+    assert_eq!((out.files_copied, out.bytes_copied, out.directories_created), (2, 3, 2));
+    assert!(!fs.exists("/p/dest") && !fs.exists(LOCK));
+    assert_eq!(r.dry, Some(DryRun { unprobed_noreplace: true, prior_seen: false, planned: None }));
+    assert!(r.stop.is_none() && r.resumed.is_none());
+    assert_eq!(got.iter().filter(|f| matches!(f.cause, TreeFailureCause::Planned(_))).count(), 3);
+    forbidden(&fs, base);
+}
+
+#[test]
+fn a_dry_tree_run_counts_dest_only_when_the_walk_did_not_refuse_unchanged() {
+    // A Weak parent under Strict refuses at the root frame, before any entry is planned: nothing changed, so DEST's
+    // creation is not counted and the exit stays 3, as in the live run (which creates DEST and rolls it back).
+    let weak_parent = || {
+        let fs = fake();
+        fs.set_identity("/p", FileIdentity::Weak(ObjectId { volume: 9, index: 9 }));
+        fs
+    };
+    let strict = CopyOptions { safety: Safety::Strict, ..opts() };
+    let fs = weak_parent();
+    let (r, _) = run_tree_with(&fs, &dry(), &strict);
+    assert!(r.stop.is_none());
+    match &r.copy {
+        Some(Err(a)) => {
+            assert!(a.refused_unchanged(), "{a:?}");
+            assert_eq!(a.outcome.directories_created, 0);
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    let fs = weak_parent();
+    let (live, _) = run_tree_with(&fs, &cfg(), &strict);
+    assert!(matches!(&live.copy, Some(Err(a)) if a.refused_unchanged()), "{:?}", live.copy);
+
+    // The walk's own abort (the dynamic section 129 check at `sub`) before anything is planned: DEST is not counted.
+    // (`fake()` without `/src/a`, which the walk would copy before it reached `sub`.)
+    let weak_sub = || {
+        let fs = FaultFs::new();
+        for d in ["/src", "/src/sub", "/p"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        fs.write_file("/src/sub/b", b"BB");
+        fs.set_identity("/src/sub", FileIdentity::Weak(ObjectId { volume: 9, index: 9 }));
+        fs
+    };
+    let fs = weak_sub();
+    let base = fs.calls().len();
+    let (r, _) = run_tree_with(&fs, &dry(), &strict);
+    match &r.copy {
+        Some(Err(a)) => {
+            assert!(a.refused_unchanged(), "{a:?}");
+            assert_eq!(a.outcome.directories_created, 0);
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(!calls(&fs)[base..].iter().any(|c| c.starts_with("create_dir(")));
+    let fs = weak_sub();
+    let (live, _) = run_tree_with(&fs, &cfg(), &strict);
+    match &live.copy {
+        Some(Err(a)) => {
+            assert!(a.refused_unchanged(), "{a:?}");
+            assert_eq!(a.outcome.directories_created, 0);
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(!fs.exists("/p/dest"));
+
+    // A refusal after an entry was planned changed something: DEST counts, as it does live.
+    let unknown = || {
+        let fs = fake();
+        fs.set_mount_root("/src/sub", flux_fs::MountRoot::Unknown);
+        fs
+    };
+    let (d, _) = run_tree_with(&unknown(), &dry(), &strict);
+    let (l, _) = run_tree_with(&unknown(), &cfg(), &strict);
+    let count = |r: &Run<Result<TreeOutcome, TreeAbort>>| match &r.copy {
+        Some(Err(a)) => (a.refused_unchanged(), a.outcome.directories_created),
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    assert_eq!(count(&d), (false, 2));
+    assert_eq!(count(&d), count(&l));
+
+    // The same fixture under Default is a finished plan.
+    let (r, _) = run_tree_with(&unknown(), &dry(), &opts());
+    let out = ok(&r);
+    assert_eq!(out.directories_created, 2);
+    assert!(out.source_mount_unknown.is_some());
+}
+
+#[test]
+fn a_dry_run_notes_each_prior_and_still_plans() {
+    // Resumable.
+    let fs = fake();
+    prior(&fs, 5, OpState::Failed);
+    let (r, _) = run_tree(&fs, &dry());
+    assert_eq!(ok(&r).files_copied, 2);
+    assert!(
+        matches!(&r.warnings[..], [RunWarning::DryRunPrior { operation_id, state }]
+            if *operation_id == id(5) && *state == OpState::Failed),
+        "{:?}",
+        r.warnings
+    );
+    // Completed.
+    let fs = fake();
+    prior(&fs, 6, OpState::Completed);
+    let (r, _) = run_tree(&fs, &dry());
+    assert_eq!(ok(&r).files_copied, 2);
+    assert!(
+        matches!(&r.warnings[..], [RunWarning::DryRunPriorCompleted { operation_id }]
+            if *operation_id == id(6)),
+        "{:?}",
+        r.warnings
+    );
+    // Unreadable.
+    let fs = fake();
+    prior(&fs, 7, OpState::Failed);
+    fs.write_file(format!("/p/dest/.flux/operations/{}/manifest", id(7)), b"garbage");
+    let (r, _) = run_tree(&fs, &dry());
+    assert_eq!(ok(&r).files_copied, 2);
+    assert!(
+        matches!(&r.warnings[..], [RunWarning::DryRunPriorUnreadable { detail }] if detail.contains(": ")),
+        "{:?}",
+        r.warnings
+    );
+    assert!(r.stop.is_none());
+}
+
+#[test]
+fn a_dry_run_says_whether_it_saw_a_prior_through_both_entry_points() {
+    // Cut 11a, ruling P10: `prior_seen` is true exactly when a `DryRunPrior*` note was pushed (the CLI's
+    // `prior_operation`). Mutant: drop the `prior_seen` assignment in `dry_tree` or `dry_file`.
+    let seen_tree = |fs: &FaultFs| {
+        let (r, _) = run_tree(fs, &dry());
+        (r.dry.as_ref().unwrap().prior_seen, r.warnings.len())
+    };
+    let fs = fake();
+    assert_eq!(seen_tree(&fs), (false, 0));
+    for state in [OpState::Failed, OpState::Completed] {
+        let fs = fake();
+        prior(&fs, 5, state);
+        assert_eq!(seen_tree(&fs), (true, 1), "{state:?}");
+    }
+    let fs = fake();
+    prior(&fs, 7, OpState::Failed);
+    fs.write_file(format!("/p/dest/.flux/operations/{}/manifest", id(7)), b"garbage");
+    assert_eq!(seen_tree(&fs), (true, 1), "unreadable");
+
+    let fs = fake();
+    let r = run_file(&fs, &dry());
+    assert!(!r.dry.as_ref().unwrap().prior_seen && r.warnings.is_empty(), "{:?}", r.warnings);
+    let fs = fake();
+    file_prior(&fs, 5);
+    let r = run_file(&fs, &dry());
+    assert!(r.dry.as_ref().unwrap().prior_seen);
+    assert!(
+        matches!(&r.warnings[..], [RunWarning::DryRunPrior { operation_id, state }]
+            if *operation_id == id(5) && *state == OpState::Failed),
+        "{:?}",
+        r.warnings
+    );
+    assert!(matches!(r.copy, Some(Ok(_))), "a prior never stops the plan: {:?}", r.copy);
+}
+
+#[test]
+fn a_dry_run_with_the_lock_held_by_another_still_plans() {
+    let fs = fake();
+    let p = fs.destination_root(Path::new("/p")).unwrap();
+    let site = LockSite::directory(&p, OsStr::new("dest")).unwrap();
+    let theirs = record(&site, &id(5), "none").encode();
+    let _holder = live_lock(&p, "dest.flux-lock", &theirs);
+    let base = fs.calls().len();
+    let (r, _) = run_tree(&fs, &dry());
+    assert_eq!(ok(&r).files_copied, 2);
+    assert_eq!(fs.read_file(LOCK), Some(theirs));
+    let after = calls(&fs)[base..].to_vec();
+    assert!(
+        !after.iter().any(|c| c.starts_with("open_lock(") || c.starts_with("try_lock")),
+        "{after:?}"
+    );
+}
+
+#[test]
+fn a_dry_single_file_run_plans_copy_overwrite_and_each_skip() {
+    let planned = |r: &Run<Result<flux_fs::Outcome, CopyError>>| r.dry.as_ref().unwrap().planned;
+    let run = |fs: &FaultFs, existing| {
+        let o = CopyOptions { existing, ..opts() };
+        file(fs, Path::new("/src/a"), Path::new("/p/t"), &o, &dry())
+    };
+    let nothing_left = |fs: &FaultFs| {
+        assert!(!fs.exists(record_path(ID)) && !fs.exists(T_LOCK));
+        assert!(
+            !calls(fs)
+                .iter()
+                .any(|c| c.starts_with("create_new(") || c.starts_with("create_lock("))
+        );
+    };
+    // Absent target.
+    let fs = fake();
+    let r = run(&fs, flux_fs::ExistingPolicy::Overwrite);
+    assert!(r.stop.is_none() && r.warnings.is_empty(), "{:?} {:?}", r.stop, r.warnings);
+    let out = r.copy.as_ref().unwrap().as_ref().unwrap();
+    assert!(!out.skipped && out.bytes_copied == 1, "{out:?}");
+    assert_eq!(
+        r.dry,
+        Some(DryRun {
+            unprobed_noreplace: false,
+            prior_seen: false,
+            planned: Some(PlannedEntry {
+                object: PlannedObject::File,
+                action: PlannedAction::Copy
+            })
+        })
+    );
+    assert!(!fs.exists("/p/t"));
+    nothing_left(&fs);
+    // Existing target, Overwrite.
+    let fs = fake();
+    fs.write_file("/p/t", b"old");
+    let r = run(&fs, flux_fs::ExistingPolicy::Overwrite);
+    assert_eq!(planned(&r).unwrap().action, PlannedAction::Overwrite);
+    assert_eq!(fs.read_file("/p/t").as_deref(), Some(&b"old"[..]));
+    nothing_left(&fs);
+    // SkipExisting.
+    let fs = fake();
+    fs.write_file("/p/t", b"old");
+    let r = run(&fs, flux_fs::ExistingPolicy::SkipExisting);
+    let out = r.copy.as_ref().unwrap().as_ref().unwrap();
+    assert!(out.skipped && out.bytes_copied == 0, "{out:?}");
+    assert_eq!(planned(&r).unwrap().action, PlannedAction::Skip(SkipReason::Existing));
+    nothing_left(&fs);
+    // Update, same length, destination not older.
+    let fs = fake();
+    fs.write_file("/p/t", b"o");
+    let now = std::time::SystemTime::now();
+    fs.set_modified("/src/a", now - std::time::Duration::from_secs(100));
+    fs.set_modified("/p/t", now);
+    let r = run(&fs, flux_fs::ExistingPolicy::Update);
+    let out = r.copy.as_ref().unwrap().as_ref().unwrap();
+    assert!(out.skipped, "{out:?}");
+    assert_eq!(planned(&r).unwrap().action, PlannedAction::Skip(SkipReason::UpToDate));
+    nothing_left(&fs);
+}
+
+#[test]
+fn a_dry_single_file_run_refuses_what_prepare_file_refuses() {
+    let fs = fake();
+    fs.create_dir(Path::new("/p/t")).unwrap();
+    let r = file(&fs, Path::new("/src/a"), Path::new("/p/t"), &opts(), &dry());
+    assert!(r.stop.is_none());
+    match &r.copy {
+        Some(Err(e)) => {
+            assert_eq!(e.code(), Code::SafetyRejected);
+            assert!(e.leftover.is_none());
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(r.dry, None);
+}
+
+#[test]
+fn a_dry_single_file_run_into_a_weak_parent_reports_the_degradation_as_live_does() {
+    // Test audit 2026-10-17: `dry_file` carries `plan_file`'s degradation into the outcome (the gate degrades only
+    // an EXISTING destination whose identity cannot be compared with full confidence); no other single-file dry
+    // test has one, so dropping it left every test green.
+    let weak = || {
+        let fs = fake();
+        fs.write_file("/p/t", b"old");
+        fs.set_identity("/p/t", FileIdentity::Weak(ObjectId { volume: 9, index: 9 }));
+        fs
+    };
+    let run = |fs: &FaultFs, existing, c: &RunConfig| {
+        let o = CopyOptions { existing, ..opts() };
+        file(fs, Path::new("/src/a"), Path::new("/p/t"), &o, c)
+    };
+    let degraded = |r: &Run<Result<flux_fs::Outcome, CopyError>>| {
+        assert!(r.stop.is_none(), "{:?}", r.stop);
+        r.copy.as_ref().unwrap().as_ref().unwrap().identity_degraded
+    };
+    // An overwrite.
+    let fs = weak();
+    let base = fs.calls().len();
+    let d = run(&fs, flux_fs::ExistingPolicy::Overwrite, &dry());
+    assert_eq!(d.dry.as_ref().unwrap().planned.unwrap().action, PlannedAction::Overwrite);
+    assert!(degraded(&d).is_some(), "{d:?}");
+    assert_eq!(fs.read_file("/p/t").as_deref(), Some(&b"old"[..]));
+    forbidden(&fs, base);
+    let l = run(&weak(), flux_fs::ExistingPolicy::Overwrite, &cfg());
+    assert_eq!(degraded(&d), degraded(&l));
+    // A skip: the degradation is reported there too.
+    let fs = weak();
+    let d = run(&fs, flux_fs::ExistingPolicy::SkipExisting, &dry());
+    assert_eq!(
+        d.dry.as_ref().unwrap().planned.unwrap().action,
+        PlannedAction::Skip(SkipReason::Existing)
+    );
+    assert!(degraded(&d).is_some(), "{d:?}");
+    let l = run(&weak(), flux_fs::ExistingPolicy::SkipExisting, &cfg());
+    assert_eq!(degraded(&d), degraded(&l));
+}
+
+#[test]
+fn a_dry_single_file_run_with_the_lock_held_by_another_still_plans() {
+    // Test audit 2026-10-17: I5 for the single-file entry point (the tree has its own test above).
+    let fs = fake();
+    let p = fs.destination_root(Path::new("/p")).unwrap();
+    let site = LockSite::file(&p, OsStr::new("t")).unwrap();
+    let theirs = record(&site, &id(5), "none").encode();
+    let _holder = live_lock(&p, "t.flux-lock", &theirs);
+    let base = fs.calls().len();
+    let r = file(&fs, Path::new("/src/a"), Path::new("/p/t"), &opts(), &dry());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert_eq!(
+        r.dry.as_ref().unwrap().planned,
+        Some(PlannedEntry { object: PlannedObject::File, action: PlannedAction::Copy })
+    );
+    assert_eq!(fs.read_file(T_LOCK), Some(theirs));
+    assert!(!fs.exists("/p/t"));
+    forbidden(&fs, base);
+}
+
+#[test]
+fn a_dry_run_of_an_empty_source_counts_only_dest_as_live_does() {
+    // Test audit 2026-10-17: I7 with nothing to plan: DEST's own creation is still the one directory.
+    let empty = || {
+        let fs = FaultFs::new();
+        for d in ["/src", "/p"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        fs
+    };
+    let fs = empty();
+    let base = fs.calls().len();
+    let (d, got) = run_tree(&fs, &dry());
+    let out = ok(&d);
+    assert_eq!((out.files_total, out.files_copied, out.directories_created), (0, 0, 1));
+    assert!(got.is_empty(), "{got:?}");
+    assert!(!fs.exists("/p/dest"));
+    forbidden(&fs, base);
+    let fs = empty();
+    let (l, _) = run_tree(&fs, &cfg());
+    let live = ok(&l);
+    assert_eq!((live.files_total, live.files_copied, live.directories_created), (0, 0, 1));
+    assert!(fs.exists("/p/dest"));
+}
+
+/// The records a walk streamed that are not plan records, as (path, kind).
+fn real_records(got: &[TreeFailure]) -> Vec<(PathBuf, String)> {
+    got.iter()
+        .filter_map(|f| match &f.cause {
+            TreeFailureCause::Planned(_) => None,
+            TreeFailureCause::Copy(e) => Some((f.path.clone(), format!("copy {:?}", e.code()))),
+            other => Some((f.path.clone(), format!("{:?}", std::mem::discriminant(other)))),
+        })
+        .collect()
+}
+
+#[test]
+fn a_dry_tree_run_agrees_with_the_live_run_on_the_fake() {
+    type Setup = fn(&FaultFs);
+    let weak = |fs: &FaultFs| {
+        fs.create_dir(Path::new("/p/dest")).unwrap();
+        fs.set_identity("/p/dest", FileIdentity::Weak(ObjectId { volume: 9, index: 9 }));
+    };
+    let existing = |fs: &FaultFs| {
+        fs.create_dir(Path::new("/p/dest")).unwrap();
+        fs.create_dir(Path::new("/p/dest/sub")).unwrap();
+        fs.write_file("/p/dest/a", b"old");
+        fs.write_file("/p/dest/sub/b", b"old2");
+    };
+    let nothing: Setup = |_| {};
+    let link: Setup = |fs| fs.add_symlink("/src/l");
+    let reserved: Setup = |fs| {
+        // P11: a top-level `.flux` source directory merges as live does (DEST's own `.flux` is the live workspace), so
+        // the dry fixture needs no pre-created `.flux`.
+        fs.create_dir(Path::new("/p/dest")).unwrap();
+        fs.create_dir(Path::new("/src/.flux")).unwrap();
+        fs.create_dir(Path::new("/src/.flux/operations")).unwrap();
+        fs.write_file("/src/.flux/operations/x", b"x");
+    };
+    let mount: Setup = |fs| {
+        fs.write_file("/src/sub/inner", b"i");
+        fs.set_mount_root("/src/sub", flux_fs::MountRoot::Yes);
+    };
+    let policy = |p| CopyOptions { existing: p, ..opts() };
+    let cases: Vec<(&str, Setup, CopyOptions)> = vec![
+        ("fresh", nothing, opts()),
+        ("existing overwrite", existing, policy(flux_fs::ExistingPolicy::Overwrite)),
+        ("existing update", existing, policy(flux_fs::ExistingPolicy::Update)),
+        ("existing skip", existing, policy(flux_fs::ExistingPolicy::SkipExisting)),
+        ("links skip", link, CopyOptions { links: Links::Skip, ..opts() }),
+        ("links copy", link, opts()),
+        ("weak default", weak, opts()),
+        ("weak strict", weak, CopyOptions { safety: Safety::Strict, ..opts() }),
+        ("reserved source path", reserved, opts()),
+        ("mount under stay", mount, opts()),
+    ];
+    let paths = ["a", "sub", "sub/b", "l"];
+    let snapshot = |fs: &FaultFs| -> Vec<Option<Vec<u8>>> {
+        paths
+            .iter()
+            .map(|p| {
+                let d = format!("/p/dest/{p}");
+                fs.exists(&d).then(|| fs.read_file(&d).unwrap_or_default())
+            })
+            .collect()
+    };
+    for (name, setup, o) in cases {
+        let (dry_fs, live_fs) = (fake(), fake());
+        setup(&dry_fs);
+        setup(&live_fs);
+        let before = snapshot(&live_fs);
+        let (d, dgot) = run_tree_with(&dry_fs, &dry(), &o);
+        let (l, lgot) = run_tree_with(&live_fs, &cfg(), &o);
+        let after = snapshot(&live_fs);
+        let tally = |r: &Run<Result<TreeOutcome, TreeAbort>>| {
+            let t = match r.copy.as_ref().unwrap() {
+                Ok(t) => t,
+                Err(a) => &a.outcome,
+            };
+            (
+                t.files_total,
+                t.files_copied,
+                t.bytes_copied,
+                t.directories_created,
+                t.files_overwritten,
+                t.files_skipped,
+                t.bytes_skipped,
+                t.symlinks_skipped,
+                t.mounts_skipped,
+                t.special_files_skipped,
+                t.files_degraded,
+                t.failures,
+            )
+        };
+        assert_eq!(tally(&d), tally(&l), "{name}");
+        assert_eq!(d.copy.as_ref().unwrap().is_ok(), l.copy.as_ref().unwrap().is_ok(), "{name}");
+        assert_eq!(real_records(&dgot), real_records(&lgot), "{name}");
+        let mut would: Vec<String> = dgot
+            .iter()
+            .filter_map(|f| match &f.cause {
+                TreeFailureCause::Planned(PlannedEntry {
+                    action:
+                        PlannedAction::Copy
+                        | PlannedAction::Overwrite
+                        | PlannedAction::CreateDir
+                        | PlannedAction::CreateSymlink,
+                    ..
+                }) => Some(f.path.to_string_lossy().replace('\\', "/")),
+                _ => None,
+            })
+            .collect();
+        would.sort();
+        let mut changed: Vec<String> = paths
+            .iter()
+            .zip(before.iter().zip(&after))
+            .filter(|(_, (b, a))| b != a)
+            .map(|(p, _)| p.to_string())
+            .collect();
+        changed.sort();
+        assert_eq!(would, changed, "{name}");
     }
 }

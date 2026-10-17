@@ -358,6 +358,59 @@ pub(crate) fn identity_gate<D: DirHandle>(
     }
 }
 
+/// Steps 2, 2a and 2b of `stage_file`, read-only: the source's metadata and type, the identity gate, and (single
+/// file) the existing-destination policy. Nothing on disk changes. `parent` is `None` only for a dry run under a
+/// destination directory that does not exist yet: the gate is then not run (nothing is at the name).
+pub(crate) enum FilePlan {
+    Proceed { src_meta: Metadata, degraded: Option<FileIdentity>, replaces: bool },
+    Skip { reason: crate::dry_run::SkipReason, degraded: Option<FileIdentity> },
+}
+
+pub(crate) fn plan_file<F: DestinationRoot>(
+    fs: &F,
+    src: &Path,
+    parent: Option<&F::Dir>,
+    name: &OsStr,
+    opts: &CopyOptions,
+) -> std::result::Result<FilePlan, CopyError> {
+    // 2. source, captured for the step-7 re-check
+    // Safe to `?`: nothing has been created yet, so there is nothing to leak.
+    let src_meta = fs.metadata(src).map_err(|e| CopyError::at(CopyStep::Source, e))?;
+    if src_meta.file_type != FileType::File {
+        return Err(CopyError::at(
+            CopyStep::Source,
+            FsError::new(Code::SpecialFileUnsupported, std::io::Error::other("not a regular file")),
+        ));
+    }
+
+    let Some(parent) = parent else {
+        return Ok(FilePlan::Proceed { src_meta, degraded: None, replaces: false });
+    };
+
+    // 2a. the destination must not BE the source. Before the temporary exists, so a
+    //     refusal changes nothing on disk.
+    let gate = identity_gate(parent, name, &src_meta, opts.safety, opts.publish)?;
+
+    // 2b. cut 8b, the existing-destination policy (single file): a skip changes nothing on disk. A directory at the
+    //     name was already refused by the gate.
+    if let Some(dest) = &gate.existing {
+        let skip = match opts.existing {
+            flux_fs::ExistingPolicy::Overwrite => None,
+            flux_fs::ExistingPolicy::SkipExisting => Some(crate::dry_run::SkipReason::Existing),
+            // Newer source or a different size; with either time unavailable, the lengths alone decide.
+            flux_fs::ExistingPolicy::Update => {
+                let proceed = src_meta.len != dest.len
+                    || matches!((src_meta.modified, dest.modified), (Some(s), Some(d)) if s > d);
+                (!proceed).then_some(crate::dry_run::SkipReason::UpToDate)
+            }
+        };
+        if let Some(reason) = skip {
+            return Ok(FilePlan::Skip { reason, degraded: gate.degraded });
+        }
+    }
+    Ok(FilePlan::Proceed { src_meta, degraded: gate.degraded, replaces: gate.existing.is_some() })
+}
+
 /// The less trustworthy of two identities, for the warning's aggregation key.
 /// `Unavailable` is weaker than `Weak`; between two `Weak`, the DESTINATION's volume
 /// keys it, because that is the side the user did not name (walker design,
@@ -680,33 +733,9 @@ pub(crate) fn stage_file<F: DestinationRoot>(
         let _ = parent.remove_file(&temp);
     }
 
-    // 2. source, captured for the step-7 re-check
-    // Safe to `?`: nothing has been created yet, so there is nothing to leak.
-    let src_meta = fs.metadata(src).map_err(|e| CopyError::at(CopyStep::Source, e))?;
-    if src_meta.file_type != FileType::File {
-        return Err(CopyError::at(
-            CopyStep::Source,
-            FsError::new(Code::SpecialFileUnsupported, std::io::Error::other("not a regular file")),
-        ));
-    }
-
-    // 2a. the destination must not BE the source. Before the temporary exists, so a
-    //     refusal changes nothing on disk.
-    let gate = identity_gate(parent, name, &src_meta, opts.safety, opts.publish)?;
-
-    // 2b. cut 8b, the existing-destination policy (single file): a skip changes nothing on disk. A directory at the
-    //     name was already refused by the gate.
-    if let Some(dest) = &gate.existing {
-        let proceed = match opts.existing {
-            flux_fs::ExistingPolicy::Overwrite => true,
-            flux_fs::ExistingPolicy::SkipExisting => false,
-            // Newer source or a different size; with either time unavailable, the lengths alone decide.
-            flux_fs::ExistingPolicy::Update => {
-                src_meta.len != dest.len
-                    || matches!((src_meta.modified, dest.modified), (Some(s), Some(d)) if s > d)
-            }
-        };
-        if !proceed {
+    // 2, 2a, 2b: the read-only prelude, `plan_file`. A skip changes nothing on disk.
+    let (src_meta, identity_degraded) = match plan_file(fs, src, Some(parent), name, opts)? {
+        FilePlan::Skip { degraded, .. } => {
             // A hook deferred the early sweep, and a skip returns before the Fresh branch's: sweep here, under its
             // own section 99 check (a removal is a destination mutation).
             if ckpt.is_some() {
@@ -717,12 +746,12 @@ pub(crate) fn stage_file<F: DestinationRoot>(
                 skipped: true,
                 bytes_copied: 0,
                 metadata_failures: vec![],
-                identity_degraded: gate.degraded,
+                identity_degraded: degraded,
                 published_identity: FileIdentity::Unavailable,
             }));
         }
-    }
-    let identity_degraded = gate.degraded;
+        FilePlan::Proceed { src_meta, degraded, .. } => (src_meta, degraded),
+    };
 
     let mut reader = fs.open_read(src).map_err(|e| CopyError::at(CopyStep::Source, e))?;
 
@@ -2055,6 +2084,120 @@ mod tests {
             3,
             "every writer still synced"
         );
+    }
+
+    fn plan_fixture() -> FaultFs {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        fs.create_dir(Path::new("/d")).unwrap();
+        put(&fs, "/s/f", b"new", at_secs(20));
+        fs
+    }
+
+    fn plan_with(
+        fs: &FaultFs,
+        existing: flux_fs::ExistingPolicy,
+    ) -> std::result::Result<FilePlan, CopyError> {
+        let root = fs.destination_root(Path::new("/d")).unwrap();
+        let mut o = opts();
+        o.existing = existing;
+        plan_file(fs, Path::new("/s/f"), Some(&root), OsStr::new("f"), &o)
+    }
+
+    fn assert_no_writes(fs: &FaultFs) {
+        for c in fs.calls() {
+            for bad in ["remove_file(", "rename_", "open_read("] {
+                assert!(!c.starts_with(bad), "{c}");
+            }
+            // The fixture's own `put` calls are `create_new(` too; only a destination create is a write here.
+            assert!(!c.starts_with("create_new(/d/f.flux-partial"), "{c}");
+        }
+    }
+
+    #[test]
+    fn plan_file_answers_copy_overwrite_and_each_skip_without_writing() {
+        use crate::dry_run::SkipReason;
+        use flux_fs::ExistingPolicy::{Overwrite, SkipExisting, Update};
+
+        // absent destination
+        let fs = plan_fixture();
+        match plan_with(&fs, Overwrite).unwrap() {
+            FilePlan::Proceed { src_meta, degraded, replaces } => {
+                assert_eq!(src_meta.len, 3);
+                assert!(degraded.is_none());
+                assert!(!replaces);
+            }
+            FilePlan::Skip { .. } => panic!("absent destination must proceed"),
+        }
+        assert_no_writes(&fs);
+
+        // existing, older, same length
+        let fs = plan_fixture();
+        put(&fs, "/d/f", b"old", at_secs(10));
+        assert!(matches!(
+            plan_with(&fs, Overwrite).unwrap(),
+            FilePlan::Proceed { replaces: true, .. }
+        ));
+        assert!(matches!(
+            plan_with(&fs, SkipExisting).unwrap(),
+            FilePlan::Skip { reason: SkipReason::Existing, .. }
+        ));
+        // Same length, source newer (20 > 10): Update proceeds.
+        assert!(matches!(
+            plan_with(&fs, Update).unwrap(),
+            FilePlan::Proceed { replaces: true, .. }
+        ));
+        assert_no_writes(&fs);
+
+        // existing destination at least as new and the same length: up to date
+        let fs = plan_fixture();
+        put(&fs, "/d/f", b"old", at_secs(20));
+        assert!(matches!(
+            plan_with(&fs, Update).unwrap(),
+            FilePlan::Skip { reason: SkipReason::UpToDate, .. }
+        ));
+        assert_no_writes(&fs);
+
+        // existing, shorter
+        let fs = plan_fixture();
+        put(&fs, "/d/f", b"x", at_secs(20));
+        assert!(matches!(
+            plan_with(&fs, Update).unwrap(),
+            FilePlan::Proceed { replaces: true, .. }
+        ));
+        assert_no_writes(&fs);
+    }
+
+    #[test]
+    fn plan_file_without_a_destination_handle_stats_the_source_and_runs_no_gate() {
+        // The destination directory does not exist in this fake.
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        put(&fs, "/s/f", b"new", at_secs(20));
+        let mut o = opts();
+        o.existing = flux_fs::ExistingPolicy::Overwrite;
+        let plan = plan_file::<FaultFs>(&fs, Path::new("/s/f"), None, OsStr::new("f"), &o).unwrap();
+        assert!(matches!(plan, FilePlan::Proceed { degraded: None, replaces: false, .. }));
+        let calls = fs.calls();
+        assert!(calls.iter().any(|c| c == "metadata(/s/f)"), "{calls:?}");
+        assert!(calls.iter().all(|c| !c.contains("/d")), "{calls:?}");
+    }
+
+    #[test]
+    fn plan_file_refuses_a_special_source_and_a_directory_at_the_name_as_stage_file_did() {
+        let fs = plan_fixture();
+        fs.set_type("/s/f", FileType::Other);
+        let err = plan_with(&fs, flux_fs::ExistingPolicy::Overwrite).err().expect("special source");
+        assert_eq!(err.code(), Code::SpecialFileUnsupported);
+        assert_eq!(err.step, CopyStep::Source);
+
+        let fs = plan_fixture();
+        fs.create_dir(Path::new("/d/f")).unwrap();
+        let err = plan_with(&fs, flux_fs::ExistingPolicy::Overwrite)
+            .err()
+            .expect("directory at the name");
+        assert_eq!(err.code(), Code::SafetyRejected);
+        assert_eq!(err.step, CopyStep::Gate);
     }
 
     #[test]

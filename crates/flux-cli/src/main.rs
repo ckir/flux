@@ -112,6 +112,9 @@ struct CopyArgs {
     /// Descend into directories that are other mounts (section 42); by default each is created empty and skipped.
     #[arg(long)]
     cross_filesystems: bool,
+    /// Report what the copy would do and change nothing: no lock, no state, no destination write (section 5.2).
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -203,6 +206,7 @@ fn run_config(args: &CopyArgs) -> RunConfig {
                 unreachable!("--resume-verify=metadata is refused before the run")
             }
         },
+        dry_run: args.dry_run,
     }
 }
 
@@ -274,6 +278,12 @@ fn copy(args: &CopyArgs) -> u8 {
         );
         return exit_code::USAGE;
     }
+    if args.dry_run && (args.resume || args.restart || args.break_lock) {
+        err(
+            "error: --dry-run does not combine with --resume, --restart or --break-lock in this version (cut 11b)",
+        );
+        return exit_code::USAGE;
+    }
     let job = match resolve::job(&args.source, &args.destination) {
         Ok(job) => job,
         Err(Stop::Usage(msg)) => {
@@ -287,12 +297,16 @@ fn copy(args: &CopyArgs) -> u8 {
                 args.source.display(),
                 report::SYMLINK_WHY
             ));
-            json(args, &Report::pre_engine(true));
+            let mut r = Report::pre_engine(true);
+            r.dry_run = args.dry_run;
+            json(args, &r);
             return exit_code::FAILED;
         }
         Err(Stop::Failed(line)) => {
             err(&line);
-            json(args, &Report::pre_engine(false));
+            let mut r = Report::pre_engine(false);
+            r.dry_run = args.dry_run;
+            json(args, &r);
             return exit_code::FAILED;
         }
     };
@@ -309,6 +323,15 @@ fn copy(args: &CopyArgs) -> u8 {
             });
             let ms = millis(started);
             let mut rep = Report::tree_run(&run, ms);
+            // The flag, not `run.dry`: an engine pre-flight refusal returns before the dry branch (ruling P7).
+            rep.dry_run = args.dry_run;
+            if let Some(d) = &run.dry {
+                rep.unprobed = report::unprobed_keys(d);
+            }
+            if args.dry_run {
+                // Nothing moved: the `timed()` throughput would be for bytes that never did.
+                rep.average_bytes_per_second = 0;
+            }
             let full = args.resume_verify == Some(ResumeVerifyArg::Full);
             match &run.copy {
                 Some(result) => {
@@ -328,7 +351,14 @@ fn copy(args: &CopyArgs) -> u8 {
                     lines(report::checkpoint_lines(outcome, opts.durability == Durability::Normal));
                     lines(report::resume_verify_lines(outcome, full));
                     rep.resume_verify = report::resume_verify_used(outcome, full).then_some("full");
-                    err(&report::summary_line(&rep, outcome.directories_created));
+                    for line in report::unprobed_lines(&rep.unprobed) {
+                        err(line);
+                    }
+                    err(&if args.dry_run {
+                        report::dry_run_summary_line(&rep, outcome.directories_created)
+                    } else {
+                        report::summary_line(&rep, outcome.directories_created)
+                    });
                 }
                 None => lines(report::run_lines(&run)),
             }
@@ -348,12 +378,22 @@ fn copy(args: &CopyArgs) -> u8 {
             let started = Instant::now();
             let run = flux_core::run::file(&fs, &src, &dst, &opts, &cfg);
             let ms = millis(started);
-            let rep = Report::file_run(&run, target_existed, ms);
+            let mut rep = Report::file_run(&run, target_existed, ms);
+            rep.dry_run = args.dry_run;
+            if let Some(d) = &run.dry {
+                rep.unprobed = report::unprobed_keys(d);
+            }
+            if args.dry_run {
+                rep.average_bytes_per_second = 0;
+            }
             match &run.copy {
                 Some(result) => {
                     match result {
                         Ok(o) => {
                             let target = dst.display().to_string();
+                            if let Some(p) = run.dry.as_ref().and_then(|d| d.planned) {
+                                err(&report::planned_file_line(&target, p));
+                            }
                             for m in &o.metadata_failures {
                                 err(&report::complaint_line(&target, m));
                             }
@@ -369,6 +409,9 @@ fn copy(args: &CopyArgs) -> u8 {
                         // could not be removed - the one thing the user needs to clean up.
                         Err(e) => err(&e.to_string()),
                     }
+                    for line in report::unprobed_lines(&rep.unprobed) {
+                        err(line);
+                    }
                     lines(report::run_lines(&run));
                     lines(report::resume_lines(&run, 0));
                     lines(report::file_checkpoint_lines(
@@ -377,7 +420,11 @@ fn copy(args: &CopyArgs) -> u8 {
                         opts.durability == Durability::Normal,
                     ));
                     lines(report::file_resume_verify_lines(&run));
-                    err(&report::summary_line(&rep, 0));
+                    err(&if args.dry_run {
+                        report::dry_run_summary_line(&rep, 0)
+                    } else {
+                        report::summary_line(&rep, 0)
+                    });
                 }
                 None => lines(report::run_lines(&run)),
             }
@@ -559,6 +606,14 @@ mod tests {
     #[test]
     fn safety_strict_reaches_the_options() {
         assert_eq!(options(&parse(&["--safety=strict"])).safety, Safety::Strict);
+    }
+
+    #[test]
+    fn dry_run_reaches_run_config_and_never_the_options() {
+        assert!(!run_config(&parse(&[])).dry_run);
+        assert!(run_config(&parse(&["--dry-run"])).dry_run);
+        let (with, without) = (options(&parse(&["--dry-run"])), options(&parse(&[])));
+        assert_eq!(format!("{with:?}"), format!("{without:?}"));
     }
 
     #[test]
