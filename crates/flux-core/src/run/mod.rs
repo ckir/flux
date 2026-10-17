@@ -381,10 +381,11 @@ pub(crate) fn tree_with<F: DestinationRoot>(
             opts: &opts,
             guard: &guard,
             beat: &beat,
-            claims: claims.as_ref(),
+            claims: claims.as_ref().map(|c| c as &std::cell::RefCell<dyn flux_fs::ClaimStore>),
             resume: cfg.resume,
             batch: batch_policy(cfg),
             ckpt: held.as_ref(),
+            dry_run: false,
         };
         let root = place.dest.take().expect("step 5 made DEST");
         let mut report = |f: TreeFailure| {

@@ -6,11 +6,12 @@
 pub use crate::checkpoint::Discard;
 use crate::checkpoint::{Checkpoints, FileCkpt, Hook};
 use crate::copy::{
-    BeforeCreate, BeforePublish, CopyError, CopyStep, Guard, Heartbeat, PublishIntent, Reuse,
-    Stage, Staged, SyncAt, copy_file_checkpointed, copy_file_guarded, discard, identity_gate,
-    no_before_create, no_before_publish, no_heartbeat, publish_staged, split_destination,
-    stage_file, sync_staged_many, unguarded, weaker,
+    BeforeCreate, BeforePublish, CopyError, CopyStep, FilePlan, Guard, Heartbeat, PublishIntent,
+    Reuse, Stage, Staged, SyncAt, copy_file_checkpointed, copy_file_guarded, discard,
+    identity_gate, no_before_create, no_before_publish, no_heartbeat, plan_file, publish_staged,
+    split_destination, stage_file, sync_staged_many, unguarded, weaker,
 };
+use crate::dry_run::{PlannedAction, PlannedEntry, PlannedObject, SkipReason};
 use crate::names::{NameIndex, Resolved};
 use crate::state::{FLUX_DIR, RESERVED_DIRS, identity_text, native_hex};
 use crate::walk::{DEFAULT_MAX_DEPTH, MountPolicy, Walk, WalkEvent, WalkOptions, walk_with};
@@ -312,7 +313,8 @@ impl WeakIdentityWarnings {
 #[allow(clippy::large_enum_variant)]
 enum Frame<D: DirHandle> {
     Live {
-        dir: D,
+        /// `None` only in dry mode: a directory that does not exist yet. Such a frame is `fresh` and holds no batch.
+        dir: Option<D>,
         /// `Strong` identities of the directories this operation created INSIDE `dir`.
         /// A fold is two source names in ONE source directory landing on one
         /// destination name, so both creations happen here; the set is dropped with the
@@ -409,7 +411,7 @@ pub(crate) struct Shared<'c, F: DestinationRoot> {
     /// §101's heartbeat (cut 7b), beside the guard; `&no_heartbeat` for a copy that holds no lock.
     pub(crate) beat: &'c Heartbeat<'c>,
     /// The run's claim store, open for the walk (cut 8b); `None` for a copy that holds no lock.
-    pub(crate) claims: Option<&'c std::cell::RefCell<<F::Dir as DirHandle>::Claims>>,
+    pub(crate) claims: Option<&'c std::cell::RefCell<dyn flux_fs::ClaimStore>>,
     /// Cut 9a: `--resume`: an own `Created` claim may skip its target.
     pub(crate) resume: bool,
     /// Cut 9d: when a Strict tree's per-directory batch flushes.
@@ -417,6 +419,8 @@ pub(crate) struct Shared<'c, F: DestinationRoot> {
     /// Cut 9f-1: the run's checkpoint log; `None` for a copy that does not checkpoint: a single-file copy, a run whose
     /// WAL could not be opened (a warning, and every large file recopies), and tests.
     pub(crate) ckpt: Option<&'c Checkpoints<F::Dir>>,
+    /// Spec cut 11a: every destination write is skipped, the decisions are not.
+    pub(crate) dry_run: bool,
 }
 
 /// Cut 9d (spec decision 5): a batch flushes at this many staged files...
@@ -580,6 +584,7 @@ fn run_tree<F: DestinationRoot>(
         resume: false,
         batch: BatchPolicy::DEFAULT,
         ckpt: None,
+        dry_run: false,
     };
     copy_tree_at(&cx, source.events, root, false, out, on_report).1
 }
@@ -604,7 +609,51 @@ pub(crate) fn copy_tree_at<F: DestinationRoot>(
         Ok(i) => i,
         Err(e) => return (root, Err(CopyError::at(CopyStep::Resolve, e))),
     };
-    let claim_parent = match (cx.claims, root_identity) {
+    let (root, walked) = copy_tree_frames(
+        cx,
+        events,
+        Some(root),
+        RootIdentity::Existing(root_identity),
+        root_created,
+        out,
+        on_report,
+    );
+    (root.expect("a live root frame keeps its handle"), walked)
+}
+
+/// What the dynamic section 129 check compares a source subdirectory with (cut 11a).
+#[derive(Clone, Copy)]
+pub(crate) enum RootIdentity {
+    /// The destination root exists: equality and strength both count.
+    Existing(FileIdentity),
+    /// Dry mode, the destination root does not exist: the identity is its parent's, kept for its STRENGTH only, and
+    /// nothing equals a directory that does not exist.
+    // Built by the run's dry path (cut 11a, a later task); until then only the tests construct it.
+    #[cfg_attr(not(test), expect(dead_code))]
+    Planned(FileIdentity),
+}
+
+impl RootIdentity {
+    /// The identity itself, whichever way it was obtained.
+    fn inner(self) -> FileIdentity {
+        match self {
+            RootIdentity::Existing(i) | RootIdentity::Planned(i) => i,
+        }
+    }
+}
+
+/// `copy_tree_at`'s body with an optional root: `None` is a dry run's destination root that does not exist yet (its
+/// frame is `fresh` and holds no handle). The root handle is handed back as it came.
+pub(crate) fn copy_tree_frames<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    events: Walk<'_, F>,
+    root: Option<F::Dir>,
+    root_identity: RootIdentity,
+    root_created: bool,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) -> (Option<F::Dir>, std::result::Result<(), CopyError>) {
+    let claim_parent = match (cx.claims, root_identity.inner()) {
         (None, _) => None,
         (Some(_), FileIdentity::Strong(id)) => Some(id),
         (Some(_), _) => match cx.opts.safety {
@@ -622,21 +671,24 @@ pub(crate) fn copy_tree_at<F: DestinationRoot>(
             }
         },
     };
-    // A pre-existing root is listed once; a root this run made is `fresh` and needs no listing.
-    let names = if claim_parent.is_some() && !root_created {
-        match NameIndex::for_existing(&root) {
-            Ok(names) => names,
-            Err(e) => return (root, Err(CopyError::at(CopyStep::Resolve, e))),
+    // A pre-existing root is listed once; a root this run made (or, dry, one that does not exist) is `fresh` and needs
+    // no listing.
+    let names = match &root {
+        Some(dir) if claim_parent.is_some() && !root_created => {
+            match NameIndex::for_existing(dir) {
+                Ok(names) => names,
+                Err(e) => return (root, Err(CopyError::at(CopyStep::Resolve, e))),
+            }
         }
-    } else {
-        NameIndex::for_new_dir()
+        _ => NameIndex::for_new_dir(),
     };
+    let fresh = root_created || root.is_none();
     let mut stack = vec![Frame::Live {
         dir: root,
         created: HashSet::new(),
         names,
         claim_parent,
-        fresh: root_created,
+        fresh,
         batch: Batch::default(),
     }];
     let walked = walk_into(cx, events, root_identity, &mut stack, out, on_report);
@@ -665,7 +717,7 @@ pub(crate) fn copy_tree_at<F: DestinationRoot>(
 fn walk_into<F: DestinationRoot>(
     cx: &Shared<'_, F>,
     events: Walk<'_, F>,
-    root_identity: FileIdentity,
+    root_identity: RootIdentity,
     stack: &mut Vec<Frame<F::Dir>>,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
@@ -696,7 +748,7 @@ fn walk_into<F: DestinationRoot>(
                 } else {
                     // Cut 9d (decision 6, ASCII fold): a pending file whose name this directory's folds onto publishes
                     // first, so the directory meets it as an unbatched copy's would, instead of winning the name.
-                    if let Some(Frame::Live { dir, names, batch, .. }) = stack.last_mut()
+                    if let Some(Frame::Live { dir: Some(dir), names, batch, .. }) = stack.last_mut()
                         && !batch.pending.is_empty()
                         && let Some(name) = path.file_name()
                         && batch.folded.contains(&folded(name))
@@ -714,6 +766,7 @@ fn walk_into<F: DestinationRoot>(
                         cx.src_identity,
                         cx.opts,
                         cx.claims.is_some(),
+                        cx.dry_run,
                         out,
                         on_report,
                     )?
@@ -727,9 +780,12 @@ fn walk_into<F: DestinationRoot>(
                 // least likely to add to), through the same `flush_batch` a `DirEnd` uses; each flush empties one batch.
                 debug_assert!(cx.batch.open_writers >= 1);
                 while pending_total(stack) >= cx.batch.open_writers {
-                    let Some(Frame::Live { dir, names, batch, .. }) = stack.iter_mut().find(
-                        |f| matches!(f, Frame::Live { batch, .. } if !batch.pending.is_empty()),
-                    ) else {
+                    // A frame with no directory (dry) holds no batch, so the one found here has its handle.
+                    let Some(Frame::Live { dir: Some(dir), names, batch, .. }) =
+                        stack.iter_mut().find(
+                            |f| matches!(f, Frame::Live { batch, .. } if !batch.pending.is_empty()),
+                        )
+                    else {
                         break;
                     };
                     // Counted before the `?`: a cap flush that stops the run was still a cap flush.
@@ -745,7 +801,7 @@ fn walk_into<F: DestinationRoot>(
                     } else {
                         copy_one(
                             cx,
-                            dir,
+                            dir.as_ref(),
                             names,
                             batch,
                             *claim_parent,
@@ -763,7 +819,17 @@ fn walk_into<F: DestinationRoot>(
                 if let Some(Frame::Live { dir, names, claim_parent, fresh, batch, .. }) =
                     stack.last_mut()
                 {
-                    link_one(cx, dir, names, batch, *claim_parent, *fresh, path, out, on_report)?;
+                    link_one(
+                        cx,
+                        dir.as_ref(),
+                        names,
+                        batch,
+                        *claim_parent,
+                        *fresh,
+                        path,
+                        out,
+                        on_report,
+                    )?;
                 }
             }
             WalkEvent::Other { path } => {
@@ -799,7 +865,11 @@ fn walk_into<F: DestinationRoot>(
                 if let Some(Frame::Live { dir, mut names, mut batch, claim_parent, .. }) =
                     stack.pop()
                 {
-                    flush_batch(cx, &dir, &mut names, &mut batch, out, on_report)?;
+                    match &dir {
+                        Some(dir) => flush_batch(cx, dir, &mut names, &mut batch, out, on_report)?,
+                        // A directory that does not exist yet (dry) staged nothing.
+                        None => debug_assert!(batch.pending.is_empty()),
+                    }
                     if claim_parent.is_some()
                         && let Some(claims) = cx.claims
                     {
@@ -853,30 +923,36 @@ fn reserved_conflict() -> FsError {
     )
 }
 
-/// A `Dir` event under a live frame: the dynamic §129 check, then decision 8.
-// The signature is the plan's: nine inputs, each a distinct piece of walk state.
+/// A `Dir` event under a live frame: the dynamic §129 check, then decision 8. In dry mode (cut 11a) nothing is created:
+/// a directory that is absent, or sits under a frame with no directory, becomes a planned child with no handle.
+// The signature is the plan's: ten inputs, each a distinct piece of walk state.
 #[allow(clippy::too_many_arguments)]
 fn enter_dir<D: DirHandle>(
     stack: &mut [Frame<D>],
     path: &Path,
     identity: FileIdentity,
-    root_identity: FileIdentity,
+    root_identity: RootIdentity,
     src_identity: FileIdentity,
     opts: &CopyOptions,
     claims_on: bool,
+    dry_run: bool,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<Frame<D>, CopyError> {
     // The dynamic half of §129 / §149.6: a directory reached mid-walk that IS the
     // destination root means the source reached it by an alias. Checked before
-    // anything is created for it.
+    // anything is created for it. A planned root exists nowhere, so nothing equals it.
     match (identity, root_identity) {
-        (FileIdentity::Strong(a), FileIdentity::Strong(b)) if a == b => {
+        (FileIdentity::Strong(a), RootIdentity::Existing(FileIdentity::Strong(b))) if a == b => {
             return Err(refuse("a source directory is the destination itself, by identity"));
         }
-        (FileIdentity::Strong(_), FileIdentity::Strong(_)) => {}
+        (
+            FileIdentity::Strong(_),
+            RootIdentity::Existing(FileIdentity::Strong(_))
+            | RootIdentity::Planned(FileIdentity::Strong(_)),
+        ) => {}
         (s, d) => match opts.safety {
-            Safety::Default => out.warnings.record(weaker(s, d), path),
+            Safety::Default => out.warnings.record(weaker(s, d.inner()), path),
             Safety::Strict => {
                 return Err(refuse(
                     "a source directory cannot be compared with the destination with full confidence",
@@ -885,70 +961,118 @@ fn enter_dir<D: DirHandle>(
         },
     }
 
-    let Some(Frame::Live { dir: parent, created, .. }) = stack.last_mut() else {
+    let Some(Frame::Live { dir: parent, created, claim_parent: parent_claim, .. }) =
+        stack.last_mut()
+    else {
         unreachable!("enter_dir is called only under a live frame");
     };
     let name = path.file_name().expect("a walk path ends in a name");
-    // Decision 8: create first; open on AlreadyExists. Neither call traverses a link.
-    let (child, child_identity, pre_existing) = match parent.create_dir(name) {
-        Ok(child) => {
-            out.directories_created += 1;
-            let child_identity = child.identity();
-            if let Ok(FileIdentity::Strong(id)) = child_identity {
-                created.insert(id);
-            }
-            (child, child_identity, false)
-        }
-        Err(e) if e.source.kind() == ErrorKind::AlreadyExists => match parent.open_dir(name) {
-            Ok(child) => {
-                let child_identity = child.identity();
-                match child_identity {
-                    // Created by THIS operation moments ago, under another source name.
-                    Ok(FileIdentity::Strong(id)) if created.contains(&id) => {
-                        let failure = FsError::new(
-                            Code::DestinationNamespaceCollision,
-                            std::io::Error::other(
-                                "this operation already created that directory under another source name",
-                            ),
-                        );
-                        report(
-                            out,
-                            on_report,
-                            path.to_path_buf(),
-                            TreeFailureCause::CreateDir(failure),
-                        );
-                        return Ok(Frame::Skipped);
-                    }
-                    // Pre-existing: merge into it.
-                    _ => (child, child_identity, true),
+    let (child, child_identity, pre_existing) = if dry_run {
+        // Dry: look, never create. A name that is not there (or any name under a directory that is not there) is a
+        // planned child; anything else the destination says is the live failure.
+        let opened = match parent.as_ref() {
+            None => None,
+            Some(p) => match p.open_dir(name) {
+                Ok(child) => Some(child),
+                Err(e) if e.source.kind() == ErrorKind::NotFound => None,
+                Err(e) => {
+                    report(out, on_report, path.to_path_buf(), TreeFailureCause::CreateDir(e));
+                    return Ok(Frame::Skipped);
                 }
+            },
+        };
+        match opened {
+            Some(child) => {
+                let child_identity = child.identity();
+                (Some(child), child_identity, true)
             }
-            // SAFETY_REJECTED (a link) or DESTINATION_ERROR (a file, or it vanished).
+            None => {
+                out.directories_created += 1;
+                report(
+                    out,
+                    on_report,
+                    path.to_path_buf(),
+                    TreeFailureCause::Planned(PlannedEntry {
+                        object: PlannedObject::Dir,
+                        action: PlannedAction::CreateDir,
+                    }),
+                );
+                // The identity a created child would have is unknowable; it takes the strength its parent keys claims
+                // with, so a planned subtree is judged exactly as a created one is.
+                let child_identity = Ok(match *parent_claim {
+                    Some(id) => FileIdentity::Strong(id),
+                    None => FileIdentity::Unavailable,
+                });
+                (None, child_identity, false)
+            }
+        }
+    } else {
+        let Some(parent) = parent.as_ref() else {
+            unreachable!("only a dry run has a frame without a directory");
+        };
+        // Decision 8: create first; open on AlreadyExists. Neither call traverses a link.
+        match parent.create_dir(name) {
+            Ok(child) => {
+                out.directories_created += 1;
+                let child_identity = child.identity();
+                if let Ok(FileIdentity::Strong(id)) = child_identity {
+                    created.insert(id);
+                }
+                (Some(child), child_identity, false)
+            }
+            Err(e) if e.source.kind() == ErrorKind::AlreadyExists => match parent.open_dir(name) {
+                Ok(child) => {
+                    let child_identity = child.identity();
+                    match child_identity {
+                        // Created by THIS operation moments ago, under another source name.
+                        Ok(FileIdentity::Strong(id)) if created.contains(&id) => {
+                            let failure = FsError::new(
+                                Code::DestinationNamespaceCollision,
+                                std::io::Error::other(
+                                    "this operation already created that directory under another source name",
+                                ),
+                            );
+                            report(
+                                out,
+                                on_report,
+                                path.to_path_buf(),
+                                TreeFailureCause::CreateDir(failure),
+                            );
+                            return Ok(Frame::Skipped);
+                        }
+                        // Pre-existing: merge into it.
+                        _ => (Some(child), child_identity, true),
+                    }
+                }
+                // SAFETY_REJECTED (a link) or DESTINATION_ERROR (a file, or it vanished).
+                Err(e) => {
+                    report(out, on_report, path.to_path_buf(), TreeFailureCause::CreateDir(e));
+                    return Ok(Frame::Skipped);
+                }
+            },
             Err(e) => {
                 report(out, on_report, path.to_path_buf(), TreeFailureCause::CreateDir(e));
                 return Ok(Frame::Skipped);
             }
-        },
-        Err(e) => {
-            report(out, on_report, path.to_path_buf(), TreeFailureCause::CreateDir(e));
-            return Ok(Frame::Skipped);
         }
     };
 
     // A destination directory about to be entered must not BE the source root (owner, cut 4b capstone round 1):
     // a bind mount inside the destination can present the source under a destination name, and `open_dir`
     // refuses only name-surrogates. Aliases of source SUBdirectories stay the section 42 mount cut's. Before the
-    // mount query, so a mount presenting the source root aborts rather than becoming a skipped subtree.
-    if let (Some(FileIdentity::Strong(a)), FileIdentity::Strong(b)) =
-        (child_identity.as_ref().ok().copied(), src_identity)
+    // mount query, so a mount presenting the source root aborts rather than becoming a skipped subtree. A planned
+    // child (dry) is nothing at the name, so there is nothing to compare.
+    if child.is_some()
+        && let (Some(FileIdentity::Strong(a)), FileIdentity::Strong(b)) =
+            (child_identity.as_ref().ok().copied(), src_identity)
         && a == b
     {
         return Err(refuse("a destination directory is the source root itself, by identity"));
     }
 
     // Part M: a pre-existing destination directory that is the root of a mount is never merged into.
-    if pre_existing {
-        let refusal = match child.mount_root(&*parent) {
+    if pre_existing && let (Some(child), Some(parent)) = (child.as_ref(), parent.as_ref()) {
+        let refusal = match child.mount_root(parent) {
             Ok(MountRoot::No) => None,
             Ok(MountRoot::Yes) => Some(FsError::new(
                 Code::SafetyRejected,
@@ -998,16 +1122,15 @@ fn enter_dir<D: DirHandle>(
         },
     };
     // A directory this run created is empty; a pre-existing one is listed once, here.
-    let names = if pre_existing && claim_parent.is_some() {
-        match NameIndex::for_existing(&child) {
+    let names = match &child {
+        Some(dir) if pre_existing && claim_parent.is_some() => match NameIndex::for_existing(dir) {
             Ok(names) => names,
             Err(e) => {
                 report(out, on_report, path.to_path_buf(), TreeFailureCause::CreateDir(e));
                 return Ok(Frame::Skipped);
             }
-        }
-    } else {
-        NameIndex::for_new_dir()
+        },
+        _ => NameIndex::for_new_dir(),
     };
     Ok(Frame::Live {
         dir: child,
@@ -1062,7 +1185,7 @@ fn target_failure(step: CopyStep, code: Code, why: &'static str) -> TreeFailureC
 #[allow(clippy::too_many_arguments)]
 fn copy_one<F: DestinationRoot>(
     cx: &Shared<'_, F>,
-    parent: &F::Dir,
+    parent: Option<&F::Dir>,
     names: &mut NameIndex,
     batch: &mut Batch<F::Writer>,
     claim_parent: Option<ObjectId>,
@@ -1077,6 +1200,22 @@ fn copy_one<F: DestinationRoot>(
     let (Some(parent_id), Some(claims)) = (claim_parent, cx.claims) else {
         // No claims for this directory (a lockless copy, or an identity that cannot key them): exactly the cut 4b
         // behaviour. An existing name is a collision.
+        if cx.dry_run {
+            return dry_stop_file(
+                cx,
+                parent,
+                name,
+                &src,
+                path,
+                Publish::NoReplace,
+                false,
+                out,
+                on_report,
+            );
+        }
+        let Some(parent) = parent else {
+            unreachable!("only a dry run has a planned directory");
+        };
         let opts = CopyOptions {
             existing: ExistingPolicy::Overwrite,
             publish: Publish::NoReplace,
@@ -1110,12 +1249,16 @@ fn copy_one<F: DestinationRoot>(
 
     // Cut 9d, spec decision 2: a Strict publication into a store with notes is staged into the directory's batch, unless
     // the policy turns batching off (plan ruling 1: `files == 1` is the per-file cut 9c path below).
-    let batching = cx.batch.files > 1
+    let batching = !cx.dry_run
+        && cx.batch.files > 1
         && cx.opts.durability == Durability::Strict
         && claims.borrow().supports_prepared();
     // Decisions 5(d) and 5(f): a batch older than the age, or a pending name this one folds onto, publishes first, so
     // the resolution below sees what an unbatched copy would.
-    if batching && !batch.pending.is_empty() {
+    if batching
+        && !batch.pending.is_empty()
+        && let Some(parent) = parent
+    {
         let aged = batch
             .since
             .is_some_and(|t| (cx.batch.now)().saturating_duration_since(t) >= cx.batch.age);
@@ -1125,8 +1268,13 @@ fn copy_one<F: DestinationRoot>(
     }
 
     // 1-2. Resolve the planned name to the entry it denotes.
-    // A directory this run created plans every target as new (plan decision 6).
-    let resolved = if fresh { Ok(Ok(Resolved::Absent)) } else { names.resolve(parent, name) };
+    // A directory this run created plans every target as new (plan decision 6), and so does a planned one (dry).
+    let resolved = if fresh {
+        Ok(Ok(Resolved::Absent))
+    } else {
+        let Some(parent) = parent else { unreachable!("a planned directory is fresh") };
+        names.resolve(parent, name)
+    };
     let plan = match resolved {
         Err(e) => {
             report(
@@ -1248,12 +1396,35 @@ fn copy_one<F: DestinationRoot>(
             if let Some(len) = skip {
                 out.files_skipped += 1;
                 out.bytes_skipped += len;
+                if cx.dry_run {
+                    // A skipped target never reaches the identity gate, live or dry.
+                    let reason = if cx.opts.existing == ExistingPolicy::SkipExisting {
+                        SkipReason::Existing
+                    } else {
+                        SkipReason::UpToDate
+                    };
+                    let skipped = PlannedEntry {
+                        object: PlannedObject::File,
+                        action: PlannedAction::Skip(reason),
+                    };
+                    report(out, on_report, path, TreeFailureCause::Planned(skipped));
+                }
                 return Ok(());
             }
             Plan::Replace { stored, meta }
         }
     };
 
+    if cx.dry_run {
+        let (publish, replace) = match plan {
+            Plan::New => (Publish::NoReplace, false),
+            Plan::Replace { .. } => (Publish::Replace, true),
+        };
+        return dry_stop_file(cx, parent, name, &src, path, publish, replace, out, on_report);
+    }
+    let Some(parent) = parent else {
+        unreachable!("only a dry run has a planned directory");
+    };
     let own = |status| ClaimRecord { target: target.clone(), status };
     // Cut 9f-1: the file's checkpoint identity is the claim key of the TARGET name (never the stored name of a
     // replacement), built only for a run that checkpoints.
@@ -1492,7 +1663,7 @@ fn copy_one<F: DestinationRoot>(
 #[allow(clippy::too_many_arguments)]
 fn link_one<F: DestinationRoot>(
     cx: &Shared<'_, F>,
-    parent: &F::Dir,
+    parent: Option<&F::Dir>,
     names: &mut NameIndex,
     batch: &mut Batch<F::Writer>,
     claim_parent: Option<ObjectId>,
@@ -1532,6 +1703,22 @@ fn link_one<F: DestinationRoot>(
     let (Some(parent_id), Some(claims)) = (claim_parent, cx.claims) else {
         // No claims for this directory: published as new, an existing name is a collision (as a file's). No batch
         // exists without claims.
+        if cx.dry_run {
+            return dry_stop_link(
+                cx,
+                parent,
+                name,
+                &src,
+                path,
+                Publish::NoReplace,
+                false,
+                out,
+                on_report,
+            );
+        }
+        let Some(parent) = parent else {
+            unreachable!("only a dry run has a planned directory");
+        };
         let published = publish_link(
             cx,
             parent,
@@ -1561,10 +1748,14 @@ fn link_one<F: DestinationRoot>(
         }
     };
     // The same aged/folded pre-check a file runs before resolving while a batch is pending (decisions 5(d), 5(f)).
-    let batching = cx.batch.files > 1
+    let batching = !cx.dry_run
+        && cx.batch.files > 1
         && cx.opts.durability == Durability::Strict
         && claims.borrow().supports_prepared();
-    if batching && !batch.pending.is_empty() {
+    if batching
+        && !batch.pending.is_empty()
+        && let Some(parent) = parent
+    {
         let aged = batch
             .since
             .is_some_and(|t| (cx.batch.now)().saturating_duration_since(t) >= cx.batch.age);
@@ -1573,7 +1764,12 @@ fn link_one<F: DestinationRoot>(
         }
     }
 
-    let resolved = if fresh { Ok(Ok(Resolved::Absent)) } else { names.resolve(parent, name) };
+    let resolved = if fresh {
+        Ok(Ok(Resolved::Absent))
+    } else {
+        let Some(parent) = parent else { unreachable!("a planned directory is fresh") };
+        names.resolve(parent, name)
+    };
     let plan = match resolved {
         Err(e) => {
             report(
@@ -1595,6 +1791,8 @@ fn link_one<F: DestinationRoot>(
         }
         Ok(Ok(Resolved::Absent)) => Plan::New,
         Ok(Ok(Resolved::Entry { stored, meta })) => {
+            // An entry is resolved only under a directory that exists.
+            let Some(parent) = parent else { unreachable!("a planned directory is fresh") };
             // §241.5, before any policy decision.
             if names.owner(&stored).is_some_and(|t| t != &target) {
                 let e = CopyError::at(
@@ -1661,17 +1859,37 @@ fn link_one<F: DestinationRoot>(
             }
             // §5.1 for a link (spec 3.3): sizes and times say nothing about a link, so `update_replaces` is not used.
             let skip = match cx.opts.existing {
-                ExistingPolicy::Overwrite => false,
-                ExistingPolicy::SkipExisting => true,
+                ExistingPolicy::Overwrite => None,
+                ExistingPolicy::SkipExisting => Some(SkipReason::Existing),
                 // Skips an equal destination link only; a file, another link or an unreadable one is replaced.
-                ExistingPolicy::Update => same_link(parent, &stored, &link),
+                ExistingPolicy::Update => {
+                    same_link(parent, &stored, &link).then_some(SkipReason::UpToDate)
+                }
             };
-            if skip {
+            if let Some(reason) = skip {
                 out.files_skipped += 1;
+                if cx.dry_run {
+                    let skipped = PlannedEntry {
+                        object: PlannedObject::Symlink,
+                        action: PlannedAction::Skip(reason),
+                    };
+                    report(out, on_report, path, TreeFailureCause::Planned(skipped));
+                }
                 return Ok(());
             }
             Plan::Replace { stored, meta }
         }
+    };
+
+    if cx.dry_run {
+        let (publish, replace) = match plan {
+            Plan::New => (Publish::NoReplace, false),
+            Plan::Replace { .. } => (Publish::Replace, true),
+        };
+        return dry_stop_link(cx, parent, name, &src, path, publish, replace, out, on_report);
+    }
+    let Some(parent) = parent else {
+        unreachable!("only a dry run has a planned directory");
     };
 
     // 5-6. Claim and publish, as `copy_one`'s unbatched plan arms do.
@@ -1873,6 +2091,101 @@ fn publish_link<F: DestinationRoot>(
         return Ok(Err(e));
     }
     Ok(publish_created_link(cx, parent, name, temp, degraded, publish, before_publish))
+}
+
+/// Cut 11a: where a dry run stops a file target, in place of the publish: the read-only half of `stage_file`
+/// (`plan_file`, told `Overwrite` so it never skips: the tree decided the policy), counted exactly as a published file
+/// is, and one `Planned` record. `parent` is `None` under a directory that does not exist yet. `replace` is the tree's
+/// plan (`Plan::Replace`).
+#[allow(clippy::too_many_arguments)]
+fn dry_stop_file<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    parent: Option<&F::Dir>,
+    name: &std::ffi::OsStr,
+    src: &Path,
+    path: PathBuf,
+    publish: Publish,
+    replace: bool,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) -> std::result::Result<(), CopyError> {
+    let opts = CopyOptions { existing: ExistingPolicy::Overwrite, publish, ..cx.opts.clone() };
+    let planned = match plan_file(cx.fs, src, parent, name, &opts) {
+        Ok(p) => p,
+        Err(e) => return finish_copy(path, Err(e), out, on_report),
+    };
+    let (src_meta, degraded) = match planned {
+        FilePlan::Proceed { src_meta, degraded, replaces } => {
+            // The gate sees an entry at the name only when the tree planned a replacement: under `NoReplace` an
+            // existing name is the gate's own refusal, which came back as `Err` above.
+            debug_assert!(replace || !replaces, "the gate found an entry the tree planned as new");
+            (src_meta, degraded)
+        }
+        // `existing` is `Overwrite`, which never skips.
+        FilePlan::Skip { reason, .. } => {
+            unreachable!("a dry stop plans with Overwrite, which never skips ({reason:?})")
+        }
+    };
+    let outcome = flux_fs::Outcome {
+        bytes_copied: src_meta.len,
+        metadata_failures: vec![],
+        identity_degraded: degraded,
+        published_identity: FileIdentity::Unavailable,
+        skipped: false,
+    };
+    finish_copy(path.clone(), Ok(outcome), out, on_report)?;
+    dry_planned(out, on_report, path, PlannedObject::File, replace);
+    Ok(())
+}
+
+/// `dry_stop_file` for a symlink target: `gate_link_read` (the source stat is inside it) and no bytes.
+#[allow(clippy::too_many_arguments)]
+fn dry_stop_link<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    parent: Option<&F::Dir>,
+    name: &std::ffi::OsStr,
+    src: &Path,
+    path: PathBuf,
+    publish: Publish,
+    replace: bool,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) -> std::result::Result<(), CopyError> {
+    let degraded = match gate_link_read(cx, parent, name, src, publish) {
+        Ok(d) => d,
+        Err(e) => return finish_copy(path, Err(e), out, on_report),
+    };
+    // A live link publishes 0 bytes.
+    let outcome = flux_fs::Outcome {
+        bytes_copied: 0,
+        metadata_failures: vec![],
+        identity_degraded: degraded,
+        published_identity: FileIdentity::Unavailable,
+        skipped: false,
+    };
+    finish_copy(path.clone(), Ok(outcome), out, on_report)?;
+    dry_planned(out, on_report, path, PlannedObject::Symlink, replace);
+    Ok(())
+}
+
+/// What a dry stop does after its entry counted as copied: a replacement counts as overwritten, and the record says
+/// which it was.
+fn dry_planned(
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+    path: PathBuf,
+    object: PlannedObject,
+    replace: bool,
+) {
+    let action = match (replace, object) {
+        (true, _) => PlannedAction::Overwrite,
+        (false, PlannedObject::Symlink) => PlannedAction::CreateSymlink,
+        (false, PlannedObject::File | PlannedObject::Dir) => PlannedAction::Copy,
+    };
+    if replace {
+        out.files_overwritten += 1;
+    }
+    report(out, on_report, path, TreeFailureCause::Planned(PlannedEntry { object, action }));
 }
 
 /// `publish_link`'s gate: the source link's own metadata through `identity_gate`, then the heartbeat and the guard
@@ -2453,7 +2766,8 @@ fn drain_batches<F: DestinationRoot>(
     let mut mode = mode;
     let mut first: Option<CopyError> = None;
     for frame in stack.iter_mut().rev() {
-        let Frame::Live { dir, names, batch, .. } = frame else {
+        // A frame with no directory (dry) holds no batch.
+        let Frame::Live { dir: Some(dir), names, batch, .. } = frame else {
             continue;
         };
         match &mode {
@@ -2525,7 +2839,7 @@ fn note_dir(path: &Path) -> String {
 /// Cut 9c: `before_publish` for a Strict publication: `template` completed with the temporary's name and identity,
 /// written as the note at `key`. A store error fails the copy at `CopyStep::Claim` (the temporary is discarded);
 /// `wrote` remembers a written note, so a failure after it discards it.
-fn write_note<C: ClaimStore>(
+fn write_note<C: ClaimStore + ?Sized>(
     claims: &std::cell::RefCell<C>,
     key: &ClaimKey,
     template: &PreparedRecord,
@@ -2545,7 +2859,7 @@ fn write_note<C: ClaimStore>(
 /// Cut 9c: a copy that failed after its note was written (the heartbeat, the guard or the rename) did not publish, so
 /// the note is discarded at once, before `finish_copy` can stop the run. Best effort: a note left behind is decided by
 /// the recovery matrix at the next resume.
-fn discard_note_on_failure<C: ClaimStore>(
+fn discard_note_on_failure<C: ClaimStore + ?Sized>(
     claims: &std::cell::RefCell<C>,
     key: &ClaimKey,
     wrote: &std::cell::Cell<bool>,
@@ -2558,7 +2872,7 @@ fn discard_note_on_failure<C: ClaimStore>(
 
 /// Insert `record` at `key`; an existing record of the SAME target is fine (a resumed target), another target's is an
 /// engine defect, reported as a claim that could not be recorded.
-fn record_claim<C: ClaimStore>(
+fn record_claim<C: ClaimStore + ?Sized>(
     claims: &std::cell::RefCell<C>,
     key: &ClaimKey,
     record: &ClaimRecord,
@@ -3880,6 +4194,7 @@ mod tests {
             resume,
             batch: policy,
             ckpt: None,
+            dry_run: false,
         };
         let mut out = TreeOutcome::default();
         let mut got = Vec::new();
@@ -4837,6 +5152,7 @@ mod tests {
             resume: false,
             batch: BatchPolicy { age: NO_AGE, ..BatchPolicy::DEFAULT },
             ckpt: None,
+            dry_run: false,
         };
         let mut out = TreeOutcome::default();
         let (_root, r) = copy_tree_at(&cx, source.events, root, false, &mut out, &mut |_| {});
@@ -4928,6 +5244,7 @@ mod tests {
             resume: false,
             batch: BatchPolicy { age: NO_AGE, ..BatchPolicy::DEFAULT },
             ckpt: None,
+            dry_run: false,
         };
         let mut out = TreeOutcome::default();
         let mut reported = 0;
@@ -4968,6 +5285,7 @@ mod tests {
             resume: false,
             batch: BatchPolicy { age: NO_AGE, ..BatchPolicy::DEFAULT },
             ckpt: None,
+            dry_run: false,
         };
         let mut out = TreeOutcome::default();
         let mut reported = 0;
@@ -4998,6 +5316,7 @@ mod tests {
             resume: false,
             batch: BatchPolicy { age: NO_AGE, ..BatchPolicy::DEFAULT },
             ckpt: None,
+            dry_run: false,
         };
         let mut out = TreeOutcome::default();
         let (back, r) = copy_tree_at(&cx, source.events, root, false, &mut out, &mut |_| {});
@@ -5100,6 +5419,7 @@ mod tests {
             resume: false,
             batch: policy,
             ckpt: None,
+            dry_run: false,
         };
         let mut out = TreeOutcome::default();
         let mut got = Vec::new();
@@ -6676,5 +6996,510 @@ mod tests {
         assert_eq!(count(&c, "sync_all("), 4, "{c:?}");
         // Mutant: `out.barrier_max = started.elapsed()` (the fast second batch overwrites).
         assert!(out.barrier_max >= slow, "{:?}", out.barrier_max);
+    }
+
+    // ---- Cut 11a, Task 3: the engine's dry mode ----
+
+    use crate::dry_run::{NullClaimStore, PlannedAction, PlannedEntry, PlannedObject, SkipReason};
+
+    thread_local! {
+        /// The length of the call log when `dry_run` started: the fixtures' own `create_dir`s precede it.
+        static DRY_BASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A dry `copy_tree_frames` over `src` into `dst_root` (opened, `RootIdentity::Existing`) or, with `None`, into a
+    /// destination that does not exist (`/dst`, whose parent `/` is the planned root's identity).
+    fn dry_run(
+        fs: &FaultFs,
+        src: &str,
+        dst_root: Option<&str>,
+        o: &CopyOptions,
+    ) -> (std::result::Result<TreeOutcome, TreeAbort>, Vec<TreeFailure>) {
+        DRY_BASE.set(fs.calls().len());
+        let source =
+            prepare_source(fs, Path::new(src), Path::new("/dst"), MountPolicy::of(o)).unwrap();
+        let null = std::cell::RefCell::new(NullClaimStore);
+        let cx = Shared {
+            fs,
+            src_root: Path::new(src),
+            src_identity: source.identity,
+            opts: o,
+            guard: &unguarded,
+            beat: &no_heartbeat,
+            claims: Some(&null),
+            resume: false,
+            batch: BatchPolicy::DEFAULT,
+            ckpt: None,
+            dry_run: true,
+        };
+        let (root, identity) = match dst_root {
+            Some(d) => {
+                let root = fs.destination_root(Path::new(d)).unwrap();
+                let id = root.identity().unwrap();
+                (Some(root), RootIdentity::Existing(id))
+            }
+            None => {
+                let parent = fs.destination_root(Path::new("/")).unwrap();
+                (None, RootIdentity::Planned(parent.identity().unwrap()))
+            }
+        };
+        let mut out = TreeOutcome::default();
+        let mut got = Vec::new();
+        let (_root, r) =
+            copy_tree_frames(&cx, source.events, root, identity, false, &mut out, &mut |f| {
+                got.push(f)
+            });
+        let r = match r {
+            Ok(()) => Ok(out),
+            Err(error) => Err(TreeAbort { error, outcome: out }),
+        };
+        (r, got)
+    }
+
+    /// Every `Planned` record in `got`, in order.
+    fn planned(got: &[TreeFailure]) -> Vec<(PathBuf, PlannedEntry)> {
+        got.iter()
+            .filter_map(|f| match &f.cause {
+                TreeFailureCause::Planned(e) => Some((f.path.clone(), *e)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `planned`, with the path spelled `/` and the entry split.
+    fn plan_of(got: &[TreeFailure]) -> Vec<(String, PlannedObject, PlannedAction)> {
+        planned(got)
+            .into_iter()
+            .map(|(p, e)| (p.to_string_lossy().replace('\\', "/"), e.object, e.action))
+            .collect()
+    }
+
+    fn pl(
+        path: &str,
+        object: PlannedObject,
+        action: PlannedAction,
+    ) -> (String, PlannedObject, PlannedAction) {
+        (path.to_string(), object, action)
+    }
+
+    /// A dry run wrote nothing and asked nothing of the destination's write side, and did stat the source.
+    fn forbidden(fs: &FaultFs) {
+        let all = fs.calls();
+        let calls = &all[DRY_BASE.get()..];
+        for banned in [
+            "create_dir(",
+            "create_new(",
+            "create_symlink(",
+            "rename_no_replace(",
+            "rename_replace(",
+            "remove_file(",
+            "remove_dir(",
+            "open_read(",
+            "set_times(",
+            "set_permissions(",
+            "create_lock(",
+            "open_lock(",
+            "open_claim_store(",
+            "try_lock",
+            "write_at_start",
+            "lock_sync_all",
+            "claim_",
+        ] {
+            assert!(!calls.iter().any(|c| c.starts_with(banned)), "{banned} in {calls:?}");
+        }
+        assert!(calls.iter().any(|c| c.starts_with("metadata(")), "no source stat: {calls:?}");
+    }
+
+    /// `/src/a` only (1 byte). `/dst` absent.
+    fn flat() -> FaultFs {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/")).unwrap();
+        fs.create_dir(Path::new("/src")).unwrap();
+        fs.write_file("/src/a", b"A");
+        fs
+    }
+
+    fn weak_id() -> FileIdentity {
+        FileIdentity::Weak(ObjectId { volume: 7, index: 1 })
+    }
+
+    /// The five counters the dry run must share with the live one.
+    fn tally(out: &TreeOutcome) -> (u64, u64, u64, u64, u64) {
+        (
+            out.files_copied,
+            out.files_overwritten,
+            out.files_skipped,
+            out.bytes_skipped,
+            out.failures.total(),
+        )
+    }
+
+    #[test]
+    fn dry_a_fresh_destination_plans_every_entry_and_writes_nothing() {
+        let fs = tree();
+        let (r, got) = dry_run(&fs, "/src", None, &opts());
+        let out = r.unwrap();
+        assert_eq!(
+            plan_of(&got),
+            vec![
+                pl("a", PlannedObject::File, PlannedAction::Copy),
+                pl("sub", PlannedObject::Dir, PlannedAction::CreateDir),
+                pl("sub/b", PlannedObject::File, PlannedAction::Copy),
+            ]
+        );
+        assert_eq!(
+            (out.files_copied, out.bytes_copied, out.directories_created, out.files_total),
+            (2, 3, 1, 2)
+        );
+        assert_eq!(out.failures.total(), 0);
+        assert!(!fs.exists("/dst"));
+        forbidden(&fs);
+
+        // The same under Strict: a planned root borrows its parent's strength, so it is not refused.
+        let fs = tree();
+        let (r, got) = dry_run(&fs, "/src", None, &strict());
+        let out = r.unwrap();
+        assert_eq!(planned(&got).len(), 3, "{got:?}");
+        assert_eq!(out.files_copied, 2);
+        forbidden(&fs);
+    }
+
+    #[test]
+    fn dry_an_existing_destination_decides_each_policy_as_the_live_run() {
+        use flux_fs::ExistingPolicy::{Overwrite, SkipExisting, Update};
+        let fixture = || {
+            let fs = tree();
+            fs.create_dir(Path::new("/dst")).unwrap();
+            fs.create_dir(Path::new("/dst/sub")).unwrap();
+            fs.write_file("/dst/a", b"X");
+            fs.write_file("/dst/sub/b", b"BBBB");
+            let t = |s| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s);
+            fs.set_modified("/src/a", t(100));
+            fs.set_modified("/dst/a", t(200));
+            fs
+        };
+        let file = PlannedObject::File;
+        let cases = [
+            (
+                Overwrite,
+                vec![
+                    pl("a", file, PlannedAction::Overwrite),
+                    pl("sub/b", file, PlannedAction::Overwrite),
+                ],
+            ),
+            (
+                SkipExisting,
+                vec![
+                    pl("a", file, PlannedAction::Skip(SkipReason::Existing)),
+                    pl("sub/b", file, PlannedAction::Skip(SkipReason::Existing)),
+                ],
+            ),
+            (
+                Update,
+                vec![
+                    pl("a", file, PlannedAction::Skip(SkipReason::UpToDate)),
+                    pl("sub/b", file, PlannedAction::Overwrite),
+                ],
+            ),
+        ];
+        for (policy, want) in cases {
+            let o = with_existing(policy);
+            let dry = fixture();
+            let (r, got) = dry_run(&dry, "/src", Some("/dst"), &o);
+            let dry_out = r.unwrap();
+            assert_eq!(plan_of(&got), want, "{policy:?}");
+            forbidden(&dry);
+            assert_eq!(dry.read_file("/dst/a").as_deref(), Some(&b"X"[..]), "{policy:?}");
+
+            let live = fixture();
+            let (r, live_out, _) = link_run(&live, &o, false, policy_of(1), &unguarded, no_seed);
+            r.unwrap();
+            assert_eq!(tally(&dry_out), tally(&live_out), "{policy:?}");
+        }
+    }
+
+    /// `policy(files)` under a name the policy loop above does not shadow.
+    fn policy_of(files: usize) -> BatchPolicy {
+        policy(files)
+    }
+
+    #[test]
+    fn dry_a_planned_subdirectory_inherits_its_parents_claim_path() {
+        let fs = tree();
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.write_file("/dst/a", b"X");
+        let o = with_existing(flux_fs::ExistingPolicy::SkipExisting);
+        let (r, got) = dry_run(&fs, "/src", Some("/dst"), &o);
+        let out = r.unwrap();
+        assert_eq!(
+            plan_of(&got),
+            vec![
+                pl("a", PlannedObject::File, PlannedAction::Skip(SkipReason::Existing)),
+                pl("sub", PlannedObject::Dir, PlannedAction::CreateDir),
+                pl("sub/b", PlannedObject::File, PlannedAction::Copy),
+            ]
+        );
+        assert_eq!(out.replace_degraded, None);
+        assert_eq!((out.files_skipped, out.files_copied, out.directories_created), (1, 1, 1));
+        forbidden(&fs);
+    }
+
+    #[test]
+    fn dry_a_planned_subdirectory_under_a_weak_parent_notes_replace_degraded() {
+        let fs = tree();
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.set_identity("/dst", weak_id());
+        let (r, got) = dry_run(&fs, "/src", Some("/dst"), &opts());
+        let out = r.unwrap();
+        assert_eq!(
+            plan_of(&got),
+            vec![
+                pl("a", PlannedObject::File, PlannedAction::Copy),
+                pl("sub", PlannedObject::Dir, PlannedAction::CreateDir),
+                pl("sub/b", PlannedObject::File, PlannedAction::Copy),
+            ]
+        );
+        // The weak root notes itself (at ""), and the planned child, whose identity is `Unavailable` under a parent
+        // that cannot key claims, notes again: two directories, the first as the example.
+        assert_eq!(
+            out.replace_degraded,
+            Some(DegradedGroup { count: 2, example: PathBuf::from("") })
+        );
+        forbidden(&fs);
+
+        let fs = tree();
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.set_identity("/dst", weak_id());
+        let (r, _) = dry_run(&fs, "/src", Some("/dst"), &strict());
+        let abort = r.unwrap_err();
+        assert_eq!(abort.error.code(), Code::SafetyRejected);
+    }
+
+    #[test]
+    fn dry_a_file_or_link_at_a_directory_name_is_the_live_create_dir_failure() {
+        let create_dir_failures = |got: &[TreeFailure]| -> Vec<(PathBuf, Code)> {
+            got.iter()
+                .filter_map(|f| match &f.cause {
+                    TreeFailureCause::CreateDir(e) => Some((f.path.clone(), e.code)),
+                    _ => None,
+                })
+                .collect()
+        };
+        for (is_link, code) in [(false, Code::DestinationError), (true, Code::SafetyRejected)] {
+            let fs = tree();
+            fs.create_dir(Path::new("/dst")).unwrap();
+            if is_link {
+                fs.add_symlink("/dst/sub");
+            } else {
+                fs.write_file("/dst/sub", b"f");
+            }
+            let (r, got) = dry_run(&fs, "/src", Some("/dst"), &opts());
+            let out = r.unwrap();
+            assert_eq!(create_dir_failures(&got), vec![(PathBuf::from("sub"), code)], "{got:?}");
+            assert_eq!(out.failures.create_dir, 1);
+            assert_eq!(
+                plan_of(&got),
+                vec![pl("a", PlannedObject::File, PlannedAction::Copy)],
+                "sub/b yields nothing: {got:?}"
+            );
+            forbidden(&fs);
+        }
+    }
+
+    #[test]
+    fn dry_a_skipped_target_never_reaches_the_gate() {
+        let fixture = || {
+            let fs = flat();
+            fs.set_identity("/src/a", weak_id());
+            fs.create_dir(Path::new("/dst")).unwrap();
+            fs.write_file("/dst/a", b"old");
+            fs
+        };
+        let o = with_existing(flux_fs::ExistingPolicy::SkipExisting);
+        let dry = fixture();
+        let (r, got) = dry_run(&dry, "/src", Some("/dst"), &o);
+        let dry_out = r.unwrap();
+        assert_eq!(
+            plan_of(&got),
+            vec![pl("a", PlannedObject::File, PlannedAction::Skip(SkipReason::Existing))]
+        );
+        assert_eq!(dry_out.files_degraded, 0);
+        assert!(dry_out.warnings.is_empty(), "{:?}", dry_out.warnings);
+
+        let live = fixture();
+        let (r, live_out, _) = link_run(&live, &o, false, policy(1), &unguarded, no_seed);
+        r.unwrap();
+        assert_eq!(live_out.files_degraded, 0);
+        assert!(live_out.warnings.is_empty());
+        assert_eq!(tally(&dry_out), tally(&live_out));
+    }
+
+    #[test]
+    fn dry_a_hardlink_alias_of_the_source_is_refused_as_live_does() {
+        let fixture = || {
+            let fs = flat();
+            fs.create_dir(Path::new("/dst")).unwrap();
+            fs.write_file("/dst/a", b"old");
+            fs.set_identity("/dst/a", identity_of(&fs, "/src/a"));
+            fs
+        };
+        let o = with_existing(flux_fs::ExistingPolicy::Overwrite);
+        let dry = fixture();
+        let (r, got) = dry_run(&dry, "/src", Some("/dst"), &o);
+        let dry_out = r.unwrap();
+        let e = only_copy_failure(&got, "a");
+        assert_eq!(e.code(), Code::SafetyRejected);
+        assert_eq!((dry_out.files_copied, dry_out.failures.copy), (0, 1));
+
+        let live = fixture();
+        let (r, _, live_got) = link_run(&live, &o, false, policy(1), &unguarded, no_seed);
+        r.unwrap();
+        assert_eq!(only_copy_failure(&live_got, "a").code(), Code::SafetyRejected);
+    }
+
+    #[test]
+    fn dry_a_weak_source_overwriting_an_existing_file_is_degraded_in_both_modes() {
+        let fixture = || {
+            let fs = flat();
+            fs.set_identity("/src/a", weak_id());
+            fs.create_dir(Path::new("/dst")).unwrap();
+            fs.write_file("/dst/a", b"old");
+            fs
+        };
+        let o = with_existing(flux_fs::ExistingPolicy::Overwrite);
+        let dry = fixture();
+        let (r, got) = dry_run(&dry, "/src", Some("/dst"), &o);
+        let dry_out = r.unwrap();
+        assert_eq!(dry_out.files_degraded, 1);
+        assert_eq!(plan_of(&got), vec![pl("a", PlannedObject::File, PlannedAction::Overwrite)]);
+        let live = fixture();
+        let (r, live_out, _) = link_run(&live, &o, false, policy(1), &unguarded, no_seed);
+        r.unwrap();
+        assert_eq!(live_out.files_degraded, 1);
+
+        let so = CopyOptions { safety: Safety::Strict, ..o.clone() };
+        let dry = fixture();
+        let (r, got) = dry_run(&dry, "/src", Some("/dst"), &so);
+        r.unwrap();
+        assert_eq!(only_copy_failure(&got, "a").code(), Code::SafetyRejected);
+        let live = fixture();
+        let (r, _, live_got) = link_run(&live, &so, false, policy(1), &unguarded, no_seed);
+        r.unwrap();
+        assert_eq!(only_copy_failure(&live_got, "a").code(), Code::SafetyRejected);
+    }
+
+    #[test]
+    fn dry_links_plan_create_symlink_overwrite_and_skip_and_links_skip_is_unchanged() {
+        use flux_fs::ExistingPolicy::{Overwrite, SkipExisting, Update};
+        let sym = PlannedObject::Symlink;
+
+        // A new link, into a destination that does not exist.
+        let fs = links(&[("l", "x")]);
+        let (r, got) = dry_run(&fs, "/src", None, &opts());
+        let out = r.unwrap();
+        assert_eq!(plan_of(&got), vec![pl("l", sym, PlannedAction::CreateSymlink)]);
+        assert_eq!((out.files_copied, out.bytes_copied, out.files_overwritten), (1, 0, 0));
+        assert_eq!(out.files_total, 1);
+        forbidden(&fs);
+
+        let with_dst = |payload: &str| {
+            let fs = links(&[("l", "x")]);
+            fs.create_dir(Path::new("/dst")).unwrap();
+            fs.add_symlink_to("/dst/l", payload, LinkKind::Unspecified);
+            fs
+        };
+        // A differing link, replaced.
+        let fs = with_dst("y");
+        let (r, got) = dry_run(&fs, "/src", Some("/dst"), &with_existing(Overwrite));
+        let out = r.unwrap();
+        assert_eq!(plan_of(&got), vec![pl("l", sym, PlannedAction::Overwrite)]);
+        assert_eq!((out.files_copied, out.files_overwritten, out.bytes_copied), (1, 1, 0));
+        assert_eq!(link_at(&fs, "/dst/l").payload, "y");
+        forbidden(&fs);
+        // An equal link under Update, and any link under SkipExisting.
+        let fs = with_dst("x");
+        let (r, got) = dry_run(&fs, "/src", Some("/dst"), &with_existing(Update));
+        let out = r.unwrap();
+        assert_eq!(plan_of(&got), vec![pl("l", sym, PlannedAction::Skip(SkipReason::UpToDate))]);
+        assert_eq!((out.files_skipped, out.files_copied, out.bytes_skipped), (1, 0, 0));
+        let fs = with_dst("y");
+        let (r, got) = dry_run(&fs, "/src", Some("/dst"), &with_existing(SkipExisting));
+        let out = r.unwrap();
+        assert_eq!(plan_of(&got), vec![pl("l", sym, PlannedAction::Skip(SkipReason::Existing))]);
+        assert_eq!(out.files_skipped, 1);
+
+        // `--links skip`: the unchanged cause, and no planned record.
+        let fs = links(&[("l", "x")]);
+        let o = CopyOptions { links: Links::Skip, ..opts() };
+        let (r, got) = dry_run(&fs, "/src", None, &o);
+        let out = r.unwrap();
+        assert!(planned(&got).is_empty(), "{got:?}");
+        assert_eq!(got.len(), 1);
+        assert!(matches!(got[0].cause, TreeFailureCause::SymlinkSkipped), "{got:?}");
+        assert_eq!(out.symlinks_skipped, 1);
+    }
+
+    #[test]
+    fn dry_a_source_that_fails_to_list_is_the_live_walk_failure() {
+        let fs = tree();
+        fs.fail_nth("read_dir", 2, Code::PermissionDenied, ErrorKind::PermissionDenied);
+        let (r, got) = dry_run(&fs, "/src", None, &opts());
+        let out = r.unwrap();
+        let walks: Vec<&TreeFailure> =
+            got.iter().filter(|f| matches!(f.cause, TreeFailureCause::Walk(_))).collect();
+        assert_eq!(walks.len(), 1, "{got:?}");
+        assert_eq!(walks[0].path, PathBuf::from("sub"));
+        assert_eq!(out.failures.walk, 1);
+        forbidden(&fs);
+    }
+
+    #[test]
+    fn dry_reserved_and_mount_and_special_entries_report_as_live() {
+        let fs = tree();
+        fs.create_dir(Path::new("/src/.flux")).unwrap();
+        fs.create_dir(Path::new("/src/.flux/operations")).unwrap();
+        fs.write_file("/src/.flux/operations/x", b"x");
+        mounted(&fs, "/src/m");
+        fs.add_special("/src/z");
+        let (r, got) = dry_run(&fs, "/src", None, &opts());
+        let out = r.unwrap();
+
+        let reserved: Vec<_> = got
+            .iter()
+            .filter_map(|f| match &f.cause {
+                TreeFailureCause::CreateDir(e) => Some((f.path.clone(), e.code)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reserved,
+            vec![(PathBuf::from(".flux/operations"), Code::ControlPlaneNamespaceConflict)],
+            "{got:?}"
+        );
+        assert!(
+            !plan_of(&got).iter().any(|(p, _, _)| p.starts_with(".flux/operations/")),
+            "{got:?}"
+        );
+        // The mount: planned like any directory, then reported skipped.
+        let at = got.iter().position(|f| f.path == Path::new("m")).expect("m is reported");
+        assert!(
+            matches!(
+                got[at].cause,
+                TreeFailureCause::Planned(PlannedEntry {
+                    object: PlannedObject::Dir,
+                    action: PlannedAction::CreateDir
+                })
+            ),
+            "{got:?}"
+        );
+        assert!(matches!(got[at + 1].cause, TreeFailureCause::MountSkipped), "{got:?}");
+        assert_eq!(out.mounts_skipped, 1);
+        assert!(
+            got.iter().any(|f| f.path == Path::new("z")
+                && matches!(f.cause, TreeFailureCause::SpecialFileSkipped)),
+            "{got:?}"
+        );
+        assert_eq!(out.special_files_skipped, 1);
+        forbidden(&fs);
     }
 }

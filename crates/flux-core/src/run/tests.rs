@@ -2517,6 +2517,7 @@ fn a_target_that_finds_its_own_claim_proceeds() {
             ..crate::tree::BatchPolicy::DEFAULT
         },
         ckpt: None,
+        dry_run: false,
     };
     let mut out = TreeOutcome::default();
     let mut got = Vec::new();

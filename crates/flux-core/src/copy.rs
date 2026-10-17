@@ -361,8 +361,6 @@ pub(crate) fn identity_gate<D: DirHandle>(
 /// Steps 2, 2a and 2b of `stage_file`, read-only: the source's metadata and type, the identity gate, and (single
 /// file) the existing-destination policy. Nothing on disk changes. `parent` is `None` only for a dry run under a
 /// destination directory that does not exist yet: the gate is then not run (nothing is at the name).
-// `replaces` and `reason` are read by the dry mode (cut 11a, next task); the live copy needs neither.
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) enum FilePlan {
     Proceed { src_meta: Metadata, degraded: Option<FileIdentity>, replaces: bool },
     Skip { reason: crate::dry_run::SkipReason, degraded: Option<FileIdentity> },
