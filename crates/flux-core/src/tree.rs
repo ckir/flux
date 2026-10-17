@@ -7188,7 +7188,14 @@ mod tests {
 
     /// True for a call that names no path, or one under a destination or source root of these tests (`/p`, `/src`, and
     /// the `/d`, `/dst`, `/out` roots this module's fixtures also use) or below.
-    fn under_dest_or_source(call: &str) -> bool {
+    /// A call that names a claim key, not a path, is always in scope.
+    fn in_scope(call: &str) -> bool {
+        let name = call.split('(').next().unwrap_or(call);
+        if name.starts_with("claim_")
+            || ["try_lock", "write_at_start", "lock_sync_all"].contains(&name)
+        {
+            return true;
+        }
         let Some((_, rest)) = call.split_once('(') else {
             return true;
         };
@@ -7203,7 +7210,7 @@ mod tests {
     fn forbidden(fs: &FaultFs) {
         let all = fs.calls();
         let calls = &all[DRY_BASE.get()..];
-        let scoped: Vec<&String> = calls.iter().filter(|c| under_dest_or_source(c)).collect();
+        let scoped: Vec<&String> = calls.iter().filter(|c| in_scope(c)).collect();
         for banned in [
             "create_dir(",
             "create_new(",

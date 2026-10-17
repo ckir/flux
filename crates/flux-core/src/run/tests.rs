@@ -7741,7 +7741,13 @@ fn dry() -> RunConfig {
 }
 
 /// True for a call that names no path, or one whose path is `/p` or `/src` or below.
-fn under_dest_or_source(call: &str) -> bool {
+/// A call that names a claim key, not a path, is always in scope.
+fn in_scope(call: &str) -> bool {
+    let name = call.split('(').next().unwrap_or(call);
+    if name.starts_with("claim_") || ["try_lock", "write_at_start", "lock_sync_all"].contains(&name)
+    {
+        return true;
+    }
     let Some((_, rest)) = call.split_once('(') else {
         return true;
     };
@@ -7755,7 +7761,7 @@ fn under_dest_or_source(call: &str) -> bool {
 fn forbidden(fs: &FaultFs, base: usize) {
     let all = calls(fs);
     let after = &all[base..];
-    let scoped: Vec<&String> = after.iter().filter(|c| under_dest_or_source(c)).collect();
+    let scoped: Vec<&String> = after.iter().filter(|c| in_scope(c)).collect();
     for banned in [
         "create_dir(",
         "create_new(",

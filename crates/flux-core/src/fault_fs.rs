@@ -2179,6 +2179,7 @@ impl DirHandle for FakeDirHandle {
             ));
         };
         let empty = bytes.is_empty();
+        // A non-UTF-8 origin reads as "not a claim store": fake paths are UTF-8 in every fixture.
         let origin = bytes
             .strip_prefix(FAKE_STORE_MARKER)
             .and_then(|tail| std::str::from_utf8(tail).ok())
