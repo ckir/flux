@@ -203,6 +203,9 @@ pub enum TreeFailureCause {
     /// path is the directory). Counted in `FailureTally::total()` and `claim_not_recorded` but NOT in the report's
     /// `files_failed`, because the file was published and counted as copied.
     ClaimNotRecorded(FsError),
+    /// NOT a failure (cut 11a): what a dry run would do with this entry. Dry mode only; not counted by
+    /// `FailureTally`.
+    Planned(crate::dry_run::PlannedEntry),
 }
 
 /// One counter per `TreeFailureCause` variant. Fixed size: it costs the same on a
@@ -247,6 +250,8 @@ impl FailureTally {
             TreeFailureCause::MountSkipped => {}
             TreeFailureCause::PublishedWithComplaints(_) => self.published_with_complaints += 1,
             TreeFailureCause::ClaimNotRecorded(_) => self.claim_not_recorded += 1,
+            // Not a failure (cut 11a): a dry run's plan line; named here so the match stays exhaustive.
+            TreeFailureCause::Planned(_) => {}
         }
     }
 }
@@ -2790,6 +2795,10 @@ mod tests {
         t.count(&TreeFailureCause::SymlinkSkipped);
         t.count(&TreeFailureCause::MountSkipped);
         t.count(&TreeFailureCause::ClaimNotRecorded(e()));
+        t.count(&TreeFailureCause::Planned(crate::dry_run::PlannedEntry {
+            object: crate::dry_run::PlannedObject::File,
+            action: crate::dry_run::PlannedAction::Copy,
+        }));
         assert_eq!(
             t,
             FailureTally {

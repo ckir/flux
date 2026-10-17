@@ -218,6 +218,7 @@ mod tests {
             resumed: None,
             beat_gap_max: std::time::Duration::ZERO,
             file_resume: None,
+            dry: None,
         };
         assert_eq!(for_tree_run(&run(None, Some(refused(false)))), REFUSED);
         assert_eq!(for_tree_run(&run(None, Some(refused(true)))), FAILED);
@@ -237,6 +238,7 @@ mod tests {
             resumed: None,
             beat_gap_max: std::time::Duration::ZERO,
             file_resume: None,
+            dry: None,
         };
         let copied = || {
             Ok(Outcome {

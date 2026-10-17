@@ -3,6 +3,7 @@
 //! returns text, and `main` writes it.
 
 use flux_core::copy::CopyError;
+use flux_core::dry_run::PlannedAction;
 use flux_core::run::{ResumeNote, Run, RunError, RunWarning};
 use flux_core::{
     Discard, TreeAbort, TreeFailure, TreeFailureCause, TreeOutcome, WeakIdentityWarnings,
@@ -44,10 +45,20 @@ pub struct Report {
     /// Cut 10b: source mount roots created as empty directories and not descended into; absent at zero.
     #[serde(skip_serializing_if = "is_zero")]
     pub mounts_skipped: u64,
+    /// Cut 11a: `true` for a `--dry-run`; absent otherwise.
+    #[serde(skip_serializing_if = "is_false")]
+    pub dry_run: bool,
+    /// Cut 11a: checks a dry run could not perform; absent when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unprobed: Vec<&'static str>,
 }
 
 fn is_zero(n: &u64) -> bool {
     *n == 0
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Report {
@@ -73,6 +84,8 @@ impl Report {
             hash_algorithm: "blake3",
             resume_verify: None,
             mounts_skipped: 0,
+            dry_run: false,
+            unprobed: Vec::new(),
         }
     }
 
@@ -210,6 +223,15 @@ pub fn record_lines(f: &TreeFailure) -> Vec<String> {
             e.code.as_str(),
             e.source
         )],
+        // Cut 11a: neither an error nor a warning, so no code.
+        TreeFailureCause::Planned(pe) => match pe.action {
+            PlannedAction::Skip(r) => vec![format!(
+                "{p}: object_type={} action=would_skip ({})",
+                pe.object.as_str(),
+                r.as_str()
+            )],
+            a => vec![format!("{p}: object_type={} action={}", pe.object.as_str(), a.as_str())],
+        },
     }
 }
 
@@ -731,6 +753,47 @@ mod tests {
     }
 
     #[test]
+    fn a_planned_record_renders_its_object_and_action() {
+        use flux_core::dry_run::{PlannedAction::*, PlannedEntry, PlannedObject::*, SkipReason::*};
+        let line = |path: &str, (object, action)| {
+            record_lines(&TreeFailure {
+                path: PathBuf::from(path),
+                cause: TreeFailureCause::Planned(PlannedEntry { object, action }),
+            })
+        };
+        assert_eq!(line("sub/a", (File, Copy)), vec!["sub/a: object_type=file action=would_copy"]);
+        assert_eq!(line("d", (Dir, CreateDir)), vec!["d: object_type=dir action=would_create"]);
+        assert_eq!(
+            line("l", (Symlink, CreateSymlink)),
+            vec!["l: object_type=symlink action=would_create_symlink"]
+        );
+        assert_eq!(
+            line("a", (File, Overwrite)),
+            vec!["a: object_type=file action=would_overwrite"]
+        );
+        assert_eq!(
+            line("a", (File, Skip(Existing))),
+            vec!["a: object_type=file action=would_skip (existing)"]
+        );
+        assert_eq!(
+            line("a", (File, Skip(UpToDate))),
+            vec!["a: object_type=file action=would_skip (up to date)"]
+        );
+    }
+
+    #[test]
+    fn a_report_carries_dry_run_and_unprobed_only_when_set() {
+        let mut r = Report::pre_engine(false);
+        assert!(!r.to_json().contains("dry_run"));
+        r.dry_run = true;
+        r.unprobed = vec!["noreplace_publish"];
+        let v: serde_json::Value = serde_json::from_str(&r.to_json()).unwrap();
+        assert_eq!(v["dry_run"], true);
+        assert_eq!(v["unprobed"], serde_json::json!(["noreplace_publish"]));
+        assert_eq!(v.as_object().unwrap().len(), 20);
+    }
+
+    #[test]
     fn each_record_renders_its_code_first() {
         let line =
             |path: &str, cause| record_lines(&TreeFailure { path: PathBuf::from(path), cause });
@@ -1130,6 +1193,7 @@ mod tests {
             resumed: None,
             beat_gap_max: std::time::Duration::ZERO,
             file_resume,
+            dry: None,
         }
     }
 
@@ -1301,6 +1365,7 @@ mod tests {
             resumed,
             beat_gap_max: std::time::Duration::ZERO,
             file_resume: None,
+            dry: None,
         };
         assert_eq!(
             resume_lines(&with(Some(ResumeNote::StartedNew)), 0),
@@ -1372,6 +1437,7 @@ mod tests {
             resumed: None,
             beat_gap_max: std::time::Duration::ZERO,
             file_resume: None,
+            dry: None,
         };
         let lines = run_lines(&run);
         assert_eq!(lines.len(), 3, "{lines:?}");
@@ -1387,6 +1453,7 @@ mod tests {
             resumed: None,
             beat_gap_max: std::time::Duration::ZERO,
             file_resume: None,
+            dry: None,
         };
         assert_eq!(run_lines(&quiet).len(), 1, "warnings print without a stop too");
     }
@@ -1400,6 +1467,7 @@ mod tests {
             resumed: None,
             beat_gap_max: std::time::Duration::ZERO,
             file_resume: None,
+            dry: None,
         };
         let clean = Report::tree_run(&run(Some(Ok(TreeOutcome::default())), None), 1);
         assert_eq!(clean.errors, 0);
@@ -1433,6 +1501,7 @@ mod tests {
             resumed: None,
             beat_gap_max: std::time::Duration::ZERO,
             file_resume: None,
+            dry: None,
         };
         let copied = || {
             Ok(Outcome {

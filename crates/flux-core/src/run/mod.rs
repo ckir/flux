@@ -74,6 +74,8 @@ pub struct RunConfig {
     pub descriptor_limit: Option<u64>,
     /// Cut 9f-2: how much of a checkpointed file a resume re-reads (`--resume-verify`).
     pub resume_verify: ResumeVerify,
+    /// `--dry-run` (spec cut 11a; D6): plan the copy, change nothing.
+    pub dry_run: bool,
 }
 
 /// §101's heartbeat interval: 5 s.
@@ -92,6 +94,7 @@ impl std::fmt::Debug for RunConfig {
             .field("resume", &self.resume)
             .field("descriptor_limit", &self.descriptor_limit)
             .field("resume_verify", &self.resume_verify)
+            .field("dry_run", &self.dry_run)
             .finish()
     }
 }
@@ -113,6 +116,8 @@ pub struct Run<T> {
     /// Cut 9g: what a single-file resume reused and discarded; `None` unless an ADOPTED single-file run reused a
     /// prefix of its partial or discarded one, and always `None` on a tree or on a failed copy.
     pub file_resume: Option<FileResume>,
+    /// Cut 11a: `Some` only for a dry run.
+    pub dry: Option<crate::dry_run::DryRun>,
 }
 
 /// Cut 9g: what a single-file resume reused and discarded.
@@ -252,6 +257,7 @@ pub(crate) fn tree_with<F: DestinationRoot>(
         resumed: None,
         beat_gap_max: std::time::Duration::ZERO,
         file_resume: None,
+        dry: None,
     };
     let opts =
         CopyOptions { operation_id: OperationId::new(cfg.operation_id.as_str()), ..opts.clone() };
@@ -511,6 +517,7 @@ pub(crate) fn file_with<F: DestinationRoot>(
         resumed: None,
         beat_gap_max: std::time::Duration::ZERO,
         file_resume: None,
+        dry: None,
     };
     let opts =
         CopyOptions { operation_id: OperationId::new(cfg.operation_id.as_str()), ..opts.clone() };

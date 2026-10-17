@@ -203,6 +203,7 @@ fn run_config(args: &CopyArgs) -> RunConfig {
                 unreachable!("--resume-verify=metadata is refused before the run")
             }
         },
+        dry_run: false,
     }
 }
 

@@ -36,6 +36,7 @@ fn cfg() -> RunConfig {
         resume: false,
         descriptor_limit: None,
         resume_verify: ResumeVerify::Chunks,
+        dry_run: false,
     }
 }
 
