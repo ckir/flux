@@ -7801,6 +7801,7 @@ fn forbidden_in(after: &[String]) {
         "create_lock(",
         "open_lock(",
         "open_claim_store(",
+        "create_claim_store(",
         "try_lock",
         "write_at_start",
         "lock_sync_all",
@@ -8947,4 +8948,40 @@ fn recovery_under_dry_counts_strays_and_removes_nothing() {
             created("a")
         );
     }
+}
+
+#[test]
+fn a_dry_single_file_resume_validates_and_reports_its_partial() {
+    let fs = fake();
+    file_prior3(&fs, 5, None);
+    fs.write_file(format!("/p/{}", temp_of("t", 5)), b"abc");
+    let base = fs.calls().len();
+    let r = run_file(&fs, &RunConfig { resume: true, ..dry() });
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    let d = r.dry.as_ref().unwrap();
+    assert_eq!(
+        d.prior,
+        Some(DryPrior::Resume { operation_id: id(5), claims: None, recovered: 0, strays: 0 })
+    );
+    assert_eq!(
+        d.planned,
+        Some(PlannedEntry {
+            object: PlannedObject::File,
+            action: PlannedAction::CopyOverPartial { len: 3 }
+        })
+    );
+    assert_eq!(d.partials_present, 1);
+    assert!(!calls(&fs).iter().any(|c| c.contains("try_lock") || c.contains("create_lock")));
+    forbidden(&fs, base);
+}
+
+#[test]
+fn a_dry_single_file_resume_predicts_incompatible_state() {
+    let fs = fake();
+    let other = CopyOptions { existing: ExistingPolicy::SkipExisting, ..opts() };
+    file_prior3_with(&fs, 5, None, &other);
+    let r = run_file(&fs, &RunConfig { resume: true, ..dry() });
+    assert_eq!(refused(&r.stop), (LockCode::IncompatibleState, false));
+    assert!(!detail(&r.stop).contains("older version"), "{}", detail(&r.stop));
+    assert_eq!(r.dry.as_ref().unwrap().partials_present, 0);
 }

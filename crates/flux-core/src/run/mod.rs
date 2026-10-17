@@ -1351,9 +1351,10 @@ fn dry_file<F: DestinationRoot>(
             states: priors.len() as u64,
         }
     };
+    let mut prior_id: Option<String> = None;
     let mut resume_preview = |prior: &crate::prior::PriorOp, warnings: &mut Vec<RunWarning>| {
         resume::validate(prior, &place.roots(), opts, warnings)?;
-        // Task 7: the partial check runs here.
+        prior_id = Some(prior.state.operation_id.clone());
         Ok(DryPrior::Resume {
             operation_id: prior.state.operation_id.clone(),
             claims: None,
@@ -1404,6 +1405,19 @@ fn dry_file<F: DestinationRoot>(
             None
         }
     };
+    let mut planned = planned;
+    // Spec 3.4 step 6: the prior's half-copied file beside the target, if the walk would write the target.
+    if let (Some(id), Some(entry)) = (&prior_id, planned.as_mut()) {
+        let temp = flux_fs::temp_path(Path::new(&place.target), &OperationId::new(id));
+        if let Some(name) = temp.file_name()
+            && let Ok(m) = place.dir.metadata(name)
+        {
+            dry.partials_present = 1;
+            if entry.action == PlannedAction::Copy {
+                entry.action = PlannedAction::CopyOverPartial { len: m.len };
+            }
+        }
+    }
     dry.planned = planned;
     run.dry = Some(dry);
     run

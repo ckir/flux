@@ -96,7 +96,8 @@ pub struct DryRun {
     pub lock_takeover: bool,
     /// Cut 11b: what `--resume` or `--restart` would do with the prior operations.
     pub prior: Option<DryPrior>,
-    /// Cut 11b: half-copied files found beside their targets under `--resume`; their continuation is not previewed.
+    /// Cut 11b: half-copied files found beside targets the walk would write (copied or overwritten) under `--resume`;
+    /// their continuation is not previewed.
     pub partials_present: u64,
 }
 

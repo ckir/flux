@@ -7284,6 +7284,7 @@ mod tests {
             "create_lock(",
             "open_lock(",
             "open_claim_store(",
+            "create_claim_store(",
             "try_lock",
             "write_at_start",
             "lock_sync_all",
