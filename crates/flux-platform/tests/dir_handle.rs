@@ -422,6 +422,25 @@ mod posix {
     }
 
     #[test]
+    fn open_claim_store_keeps_the_open_error_for_a_regular_file_it_cannot_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let path = d.path().join("state.db");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&path).is_ok() {
+            return; // running as root: permission bits do not stop the open, so there is no failed open to classify
+        }
+        // A regular file is not "something else at the name": only a non-regular file is refused as DestinationError.
+        let e = match root.open_claim_store(OsStr::new("state.db"), flux_fs::Durability::Normal) {
+            Err(e) => e,
+            Ok(_) => panic!("the open is denied"),
+        };
+        assert_eq!(e.code, flux_fs::Code::PermissionDenied, "{e:?}");
+    }
+
+    #[test]
     fn create_claim_store_never_follows_a_link() {
         let d = TempDir::new().unwrap();
         let outside = d.path().join("outside");
