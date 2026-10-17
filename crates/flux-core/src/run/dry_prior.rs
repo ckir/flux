@@ -16,7 +16,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 /// What a dry run found at the lock path, read without opening or trying the lock.
-// The `Takeover` and `Recorded` payloads are read by the resume and restart previews (Tasks 4 and 6).
+// The `Takeover` and `Recorded` payloads are read by the resume and restart previews (Task 6).
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum LockPreview {
@@ -118,6 +118,7 @@ pub(crate) fn dry_restart<F: DestinationRoot>(
         on_report(discard(path, PlannedObject::State));
     }
     let ids: BTreeSet<&str> = priors.iter().map(|p| p.state.operation_id.as_str()).collect();
+    // The unlistable flag is ignored: `warnings` already carries the `PartialKept` message, and nothing is retired here.
     let (found, _) = if ids.is_empty() {
         (Vec::new(), false)
     } else {
