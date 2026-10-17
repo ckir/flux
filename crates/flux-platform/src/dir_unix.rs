@@ -409,6 +409,17 @@ impl DirHandle for StdDir {
                             "a directory is not a claim store",
                         ),
                     ),
+                    // A socket fails the open itself (ENXIO on Linux), so the `fstat` check below never sees it: ask
+                    // the name what it is.
+                    _ if statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW).is_ok_and(|st| {
+                        FileType::from_raw_mode(st.st_mode) != FileType::RegularFile
+                    }) =>
+                    {
+                        FsError::new(
+                            Code::DestinationError,
+                            std::io::Error::other(format!("not a regular file ({e})")),
+                        )
+                    }
                     _ => FsError::from_io(std::io::Error::from(e)),
                 })?;
         let st = rustix::fs::fstat(&fd).map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
@@ -450,6 +461,16 @@ impl DirHandle for StdDir {
                     "a directory is not a lock file",
                 ),
             ),
+            // A socket fails the open itself (ENXIO on Linux), so the `fstat` check below never sees it: ask the
+            // name what it is.
+            _ if statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW)
+                .is_ok_and(|st| FileType::from_raw_mode(st.st_mode) != FileType::RegularFile) =>
+            {
+                FsError::new(
+                    Code::DestinationError,
+                    std::io::Error::other(format!("not a regular file ({e})")),
+                )
+            }
             _ => FsError::from_io(std::io::Error::from(e)),
         })?;
         let st = rustix::fs::fstat(&fd).map_err(|e| FsError::from_io(std::io::Error::from(e)))?;

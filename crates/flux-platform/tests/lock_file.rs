@@ -146,6 +146,33 @@ fn open_lock_refuses_a_fifo_without_hanging() {
     assert_eq!(e.code, Code::DestinationError);
 }
 
+#[cfg(unix)]
+#[test]
+fn open_lock_refuses_a_socket() {
+    let (tmp, d) = dir();
+    // A socket fails the open itself (ENXIO on Linux), so the type check after the open never sees it.
+    let _bound = std::os::unix::net::UnixListener::bind(tmp.path().join("sock.flux-lock"))
+        .expect("bind a unix socket");
+    let e = d.open_lock(OsStr::new("sock.flux-lock")).expect_err("a socket is not a lock file");
+    assert_eq!(e.code, Code::DestinationError, "{e:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn open_lock_keeps_the_open_error_for_a_regular_file_it_cannot_open() {
+    use std::os::unix::fs::PermissionsExt;
+    let (tmp, d) = dir();
+    let path = tmp.path().join("locked.flux-lock");
+    std::fs::write(&path, b"").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&path).is_ok() {
+        return; // running as root: permission bits do not stop the open, so there is no failed open to classify
+    }
+    // A regular file is not "something else at the name": only a non-regular file is refused as DestinationError.
+    let e = d.open_lock(OsStr::new("locked.flux-lock")).expect_err("the open is denied");
+    assert_eq!(e.code, Code::PermissionDenied, "{e:?}");
+}
+
 /// What the child prints once it holds the lock. Distinctive, so no line libtest prints can match it.
 const CHILD_MARKER: &str = "FLUX_CHILD_HOLDS_LOCK";
 
