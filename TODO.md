@@ -609,7 +609,7 @@ PS-1 (a socket at the lock or claim-store path was `IO_ERROR`, exit 1) and PP-1 
 ## Cut 11a known limits (`flux copy --dry-run`; spec `docs/superpowers/specs/2026-10-17-cut-11a-dry-run-design.md`, sections 1, 3.5, 3.6, 4)
 - [ ] **A source entry spelled `.FLUX` (another ASCII case of `.flux`) directly under the root** is matched like `.flux` (the fold `reserved_path` uses), so on a case-sensitive destination the dry run predicts a merge or a failure where a real run creates a distinct `.FLUX`; the prediction errs toward a failure (ruling P13).
 
-- [ ] **Prior operations at DEST are noted, not previewed.** A resumable prior, a completed prior and an unreadable record each print one `note:` line and the fresh plan still prints; the exit code never changes for it, and the JSON carries `prior_operation` in `unprobed`. What a real run does with the prior (it may refuse with `RESUMABLE_OPERATION_EXISTS`) is cut 11b's `--dry-run --resume|--restart|--break-lock`, which this cut refuses as usage (exit 2).
+- [x] **Prior operations at DEST are noted, not previewed** — closed by cut 11b (`--dry-run --resume|--restart|--break-lock` preview or predict the refusal; spec `docs/superpowers/specs/2026-10-17-cut-11b-dry-run-prior-design.md`).
 - [ ] **Same-run namespace collisions are not predicted (spec 5.2).** Two source names that fold onto one destination entry plan as two creates where a real run reports one collision.
 - [ ] **Failures that occur only while bytes move are not predicted:** a read error mid-file, a full disk, a source changed during the copy, metadata-apply complaints, claim-store write failures. An unreadable source FILE (open refused, e.g. mode 000) is predicted as `would_copy`: I3 forbids opening the source, and permission bits are not a portable predictor (final review I-3b).
 - [x] **A top-level source entry named `.flux` now mirrors the live run (ruling P11, retiring P6):** a directory merges (no `would_create` line, no count; its reserved children `operations`, `standalone`, `atomic` refuse as in a real run and its other children plan), and a file or link fails as live does (`DESTINATION_ERROR` into an existing DEST, `SAFETY_REJECTED` into an absent one, step `gate`). A `.flux` deeper than the root's direct children is judged against the destination as any other name.
@@ -617,6 +617,29 @@ PS-1 (a socket at the lock or claim-store path was `IO_ERROR`, exit 1) and PP-1 
 - [ ] **A temporary name over the limit is predicted (ruling P12):** a source name whose temporary (`temp_path`) exceeds `NAME_LIMIT` fails as `IO_ERROR` at step `create`, as live does at `create_new`; other name-length failures are not predicted.
 - [ ] **A tree source onto a DEST that is a regular file** is the CLI resolver's usage error (exit 2, no JSON) in both modes; a DEST below a regular file is the engine's pre-flight refusal (exit 1, and under `--json` the dry run's object carries `dry_run: true`) (ruling P8).
 - [ ] **The dry mode's cost on the live path was not measured (D9):** one `dry_run` branch per entry, and the live path now also calls its claim store through `dyn ClaimStore` (a vtable call per claim operation).
+
+## Cut 11b known limits (`flux copy --dry-run` with `--resume`, `--restart`, `--break-lock`; spec `docs/superpowers/specs/2026-10-17-cut-11b-dry-run-prior-design.md`)
+- [ ] **A half-copied file's continuation is not previewed (N1):** `partials_present` counts partials beside targets the walk would write, copied or overwritten (ruling P7).
+- [ ] **`<lock-name>.broken.*` leftovers are noted, not classified (N4).**
+- [ ] **A live owner is not detected (N5/D7):** the dual outcome is printed; a held claim store is not probed, a torn copy prints its note.
+- [ ] **The resume preview needs temp disk (D8):** it copies the prior's `state.db` into `flux-dry-<id>` under the system temp directory, so temp disk equal to the store's size is needed; `RunConfig.dry_temp_root` overrides the root.
+- [ ] **The empty-lock blind spot:** an empty or torn record is `TARGET_LOCK_UNCERTAIN` for the dry run where a holder inside its first write would be busy for the real one (spec 3.2).
+- [ ] **The real-fs paired oracle:** a byte copy of DEST has new inodes, so the resume preview is compared on the ORIGINAL, dry first (ruling P9).
+- [ ] **`Debug for RunConfig` prints `dry_temp_root`** (nothing to do).
+
+## Cut 11b test debt (deferred by the SDD run, 2026-10-18)
+- [ ] **The `dry_lock` branches without a test:** SafetyRejected/DestinationError, `Error`, `Untrusted`, File-site Orphan (`run/tests.rs`).
+- [ ] **The eight-fold lock-test setup and the `("record", Some(Vec::new()))` placeholder.**
+- [ ] **The "Unreadable" scan case asserts only `stop.is_some()`.**
+- [ ] **Tree-only tests for resume-none/two and the recorded lock.**
+- [ ] **No dry test for the unlistable-directory warning path of `dry_restart`.**
+- [ ] **P7's count rule is untested for Overwrite/Skip, and there is no negative partial test.**
+- [ ] **No test for a copy-write failure, a non-NotFound read error, or the link-arm `Resume` record.**
+- [ ] **No CLI test pins the stderr ORDER.**
+- [ ] **`partials_found` is printed as bare names for a single file** (fixed in the final wave if the whole-branch review agrees).
+- [ ] **The real-fs "untouched" oracle is mtime-based.**
+- [ ] **The two `forbidden` helpers and `in_scope` are duplicated across `run/tests.rs` and `tree.rs`.**
+- [ ] **`obtain_cleanup_lock` repeats the refusal texts the new constructors hold** (`lock/obtain.rs`).
 
 ## Cut 11a test debt (deferred by the SDD run, 2026-10-17)
 - [ ] **The fake's `FakeDirHandle::open_dir` records nothing in the call log**, so the dry-run `forbidden` allow-lists (`tree.rs`, `run/tests.rs`) cannot see `open_dir` calls; `open_dir` is in the allow-list for the day the fake records it (capstone round 1, open question b).
