@@ -433,6 +433,16 @@ pub fn run_warning_line(w: &RunWarning) -> String {
         RunWarning::WalTailDiscarded { offset, len, reason } => format!(
             "WAL tail cut: {len} bytes at offset {offset} ({reason}); the checkpoints before it are intact"
         ),
+        RunWarning::DryRunPrior { operation_id, state } => format!(
+            "note: a prior operation {operation_id} in state {} exists at DEST; --dry-run does not inspect its owner, so what a real run does with it (it may be refused with RESUMABLE_OPERATION_EXISTS) is not previewed",
+            state.as_str()
+        ),
+        RunWarning::DryRunPriorCompleted { operation_id } => format!(
+            "note: an earlier completed operation {operation_id} exists at DEST; a real run would finish its recorded cleanup"
+        ),
+        RunWarning::DryRunPriorUnreadable { detail } => format!(
+            "note: a prior operation's record could not be read ({detail}); --dry-run does not preview how a real run handles it"
+        ),
     }
 }
 

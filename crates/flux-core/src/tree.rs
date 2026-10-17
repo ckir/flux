@@ -628,8 +628,6 @@ pub(crate) enum RootIdentity {
     Existing(FileIdentity),
     /// Dry mode, the destination root does not exist: the identity is its parent's, kept for its STRENGTH only, and
     /// nothing equals a directory that does not exist.
-    // Built by the run's dry path (cut 11a, a later task); until then only the tests construct it.
-    #[cfg_attr(not(test), expect(dead_code))]
     Planned(FileIdentity),
 }
 
