@@ -80,7 +80,7 @@ This is a stated deviation from section 5.2's "or the refusal it would get", clo
 - Warnings and degraded groups (`DegradedGroup`) render as in a real run.
 
 ### 3.7 Exit codes
-As the real run on the same predicted outcome (I7): 0 with no predicted failure; 1 when the plan contains a per-target failure; 2 for usage; 3 for a pre-flight refusal or a walk refusal that created nothing. Owner decision D4.
+As the real run on the same predicted outcome (I7): 0 with no predicted failure; 1 when the plan contains a per-target failure, and for a pre-flight ERROR that is not a refusal (`locate_tree`'s `DestinationError` for a DEST below a regular file, E2); 2 for usage; 3 for a pre-flight REFUSAL (`SafetyRejected`: the destination inside the source, a Strict identity refusal) or a walk refusal that created nothing. Owner decision D4.
 
 ## 4. Edge cases and decisions made explicitly
 
