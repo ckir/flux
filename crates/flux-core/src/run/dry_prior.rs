@@ -10,7 +10,7 @@ use flux_fs::{Code, DirHandle, FsError, LockCapability};
 use std::io::ErrorKind;
 
 /// What a dry run found at the lock path, read without opening or trying the lock.
-// Task 3 wires the dry run's lock preview.
+// The `Takeover` and `Recorded` payloads are read by the resume and restart previews (Tasks 4 and 6).
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum LockPreview {
@@ -28,8 +28,6 @@ pub(crate) enum LockPreview {
 
 /// Spec 3.2: classify the lock file from its bytes alone. It never opens the lock, so a lock held by another
 /// run reads the same as a dead one's.
-// Task 3 wires the dry run's lock preview.
-#[allow(dead_code)]
 pub(crate) fn dry_lock<D: DirHandle>(
     site: &LockSite<'_, D>,
     break_lock: bool,

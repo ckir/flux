@@ -24,20 +24,23 @@ use crate::copy::{
     CopyError, CopyStep, FilePlan, copy_file_checkpointed, copy_file_guarded, no_before_create,
     no_before_publish, no_heartbeat, plan_file, prepare_file, unguarded,
 };
-use crate::dry_run::{DryRun, NullClaimStore, PlannedAction, PlannedEntry, PlannedObject};
+use crate::dry_run::{
+    DryPrior, DryRun, NullClaimStore, PlannedAction, PlannedEntry, PlannedObject,
+};
 use crate::lock::record::LockRecord;
 use crate::lock::site::NAME_LIMIT;
 use crate::lock::{LockCode, LockSite, Refusal, Released, check_capability};
-use crate::prior::check_control_plane;
+use crate::prior::{check_control_plane, resumable_refusal};
 use crate::state::{OpState, file_names_fit, identity_text, native_hex};
 use crate::tree::{
     RootIdentity, Shared, Source, TreeAbort, TreeFailure, TreeFailureCause, TreeOutcome,
     copy_tree_at, copy_tree_frames, prepare_source, report,
 };
 use crate::walk::MountPolicy;
+use dry_prior::{LockPreview, dry_lock};
 use flux_fs::{
-    ClaimStore, Code, CopyOptions, DestinationRoot, DirHandle, FileIdentity, FsError, OperationId,
-    Outcome,
+    ClaimStore, Code, CopyOptions, DestinationRoot, DirHandle, FileIdentity, FsError,
+    LockCapability, OperationId, Outcome,
 };
 use place::{FilePlace, Place, TreePlace, locate_tree};
 use session::{Locked, beat_error, from_lock, guarded, lock_io, open_operation, owned};
@@ -100,6 +103,7 @@ impl std::fmt::Debug for RunConfig {
             .field("descriptor_limit", &self.descriptor_limit)
             .field("resume_verify", &self.resume_verify)
             .field("dry_run", &self.dry_run)
+            .field("dry_temp_root", &self.dry_temp_root)
             .finish()
     }
 }
@@ -352,7 +356,7 @@ pub(crate) fn tree_with<F: DestinationRoot>(
     };
     // Cut 11a: a dry run plans the walk and touches nothing: no lock, no state, no claim store, no WAL, no finish.
     if cfg.dry_run {
-        return dry_tree(run, &mut place, source, cfg, &opts, on_report, out);
+        return dry_tree(run, &mut place, &site, capability, source, cfg, &opts, on_report, out);
     }
     // Steps 3-5 (and `--restart`): the lock, then this operation's state and the record naming it.
     let locked = match open_operation(&site, capability, &mut place, cfg, &opts, &mut run.warnings)
@@ -606,7 +610,7 @@ pub(crate) fn file_with<F: DestinationRoot>(
     };
     // Cut 11a: a dry run plans the one file and touches nothing.
     if cfg.dry_run {
-        return dry_file(run, fs, &place, src, cfg, &opts);
+        return dry_file(run, fs, &place, &site, capability, src, cfg, &opts);
     }
     // Steps 3-5.
     let locked = match open_operation(&site, capability, &mut place, cfg, &opts, &mut run.warnings)
@@ -1078,49 +1082,119 @@ fn rollback<D: DirHandle, P: Place<D>>(
     }
 }
 
-/// Cut 11a: the notes a dry run makes of the prior operations at DEST. It never inspects an owner or a lock. Answers
-/// whether it pushed at least one note (`DryRun::prior_seen`, the JSON's `prior_operation`).
-fn dry_prior_notes(
-    scan: crate::lock::LockResult<crate::prior::Scan>,
-    warnings: &mut Vec<RunWarning>,
-) -> bool {
+/// Cut 11a: the notes a dry run makes of the completed priors and the debris at DEST. It never inspects an owner.
+/// Answers whether it pushed at least one note.
+fn dry_prior_notes(scan: &crate::prior::Scan, warnings: &mut Vec<RunWarning>) -> bool {
     let before = warnings.len();
-    match scan {
-        Ok(scan) => {
-            for p in scan.resumable {
-                warnings.push(RunWarning::DryRunPrior {
-                    operation_id: p.state.operation_id,
-                    state: p.state.state,
-                });
-            }
-            for p in scan.completed {
-                warnings
-                    .push(RunWarning::DryRunPriorCompleted { operation_id: p.state.operation_id });
-            }
-        }
-        Err(e) => {
-            let detail = match e {
-                crate::lock::LockError::Refused(r) => format!("{}: {}", r.code.as_str(), r.detail),
-                crate::lock::LockError::Io(e) => format!("{}: {}", e.code.as_str(), e.source),
-            };
-            warnings.push(RunWarning::DryRunPriorUnreadable { detail });
-        }
+    for p in &scan.completed {
+        warnings
+            .push(RunWarning::DryRunPriorCompleted { operation_id: p.state.operation_id.clone() });
+    }
+    for name in &scan.debris {
+        warnings.push(RunWarning::DryRunDebris { name: name.to_string_lossy().into_owned() });
     }
     warnings.len() > before
 }
 
+/// Cut 11b: how a dry run's lock preview and prior classification ended: a predicted refusal (with the report's
+/// flags), or the flags the plan carries.
+enum DryStart {
+    Stop(RunError, DryRun),
+    Plan(DryRun),
+}
+
+/// Cut 11b, spec 3.2 and 3.3: the lock preview first (a predicted refusal ends the preview before any scan or
+/// note), then the scan classified as the real run's step 4 classifies it. The caller fills `unprobed_noreplace`
+/// and `planned`.
+fn dry_start<D: DirHandle, P: Place<D>>(
+    site: &LockSite<'_, D>,
+    capability: LockCapability,
+    place: &P,
+    cfg: &RunConfig,
+    warnings: &mut Vec<RunWarning>,
+) -> DryStart {
+    let mut dry = DryRun {
+        unprobed_noreplace: false,
+        prior_seen: false,
+        planned: None,
+        owner_liveness: false,
+        lock_takeover: false,
+        prior: None,
+        partials_present: 0,
+    };
+    match dry_lock(site, cfg.break_lock, capability, crate::state::wall_time_ns(), warnings) {
+        LockPreview::Absent => {}
+        LockPreview::Recorded(_) => dry.owner_liveness = true,
+        LockPreview::Takeover(_) => dry.lock_takeover = true,
+        LockPreview::Refused(e) => {
+            let stop = from_lock(e, RunStep::Lock, place.holder_shown(), false);
+            return DryStart::Stop(stop, dry);
+        }
+        LockPreview::Error(e) => {
+            let stop = from_lock(
+                crate::lock::LockError::Io(e),
+                RunStep::Lock,
+                place.holder_shown(),
+                false,
+            );
+            return DryStart::Stop(stop, dry);
+        }
+    }
+    let scan = match place.scan(&cfg.operation_id) {
+        Ok(scan) => scan,
+        Err(e) => {
+            let stop = from_lock(e, RunStep::Inspect, place.destination(), false);
+            return DryStart::Stop(stop, dry);
+        }
+    };
+    dry.prior_seen = dry_prior_notes(&scan, warnings);
+    if cfg.restart {
+        // Task 4: the restart preview runs here.
+    } else if scan.resumable.is_empty() {
+        dry.prior = cfg.resume.then_some(DryPrior::StartedNew);
+    } else if cfg.resume && scan.resumable.len() == 1 {
+        // Task 6: the resume preview runs here.
+    } else {
+        for p in &scan.resumable {
+            warnings.push(RunWarning::DryRunPrior {
+                operation_id: p.state.operation_id.clone(),
+                state: p.state.state,
+            });
+        }
+        dry.prior_seen = true;
+        let stop = from_lock(
+            resumable_refusal(&scan.resumable),
+            RunStep::Inspect,
+            place.destination(),
+            false,
+        );
+        return DryStart::Stop(stop, dry);
+    }
+    DryStart::Plan(dry)
+}
+
 /// Cut 11a: the dry branch of `tree_with`. Reads DEST's prior operations for the notes, then plans the walk over a
 /// claim store that stores nothing; the lock, the workspace, the WAL and `finish` are never reached.
+#[allow(clippy::too_many_arguments)]
 fn dry_tree<F: DestinationRoot>(
     mut run: Run<Result<TreeOutcome, TreeAbort>>,
     place: &mut TreePlace<'_, F>,
+    site: &LockSite<'_, F::Dir>,
+    capability: LockCapability,
     source: Source<'_, F>,
     cfg: &RunConfig,
     opts: &CopyOptions,
     on_report: &mut dyn FnMut(TreeFailure),
     mut out: TreeOutcome,
 ) -> Run<Result<TreeOutcome, TreeAbort>> {
-    let prior_seen = dry_prior_notes(Place::scan(&*place, &cfg.operation_id), &mut run.warnings);
+    let mut dry = match dry_start(site, capability, &*place, cfg, &mut run.warnings) {
+        DryStart::Plan(dry) => dry,
+        DryStart::Stop(stop, dry) => {
+            run.stop = Some(stop);
+            run.dry = Some(dry);
+            return run;
+        }
+    };
     let fs = place.fs;
     let src_root = place.src_root.clone();
     let null = std::cell::RefCell::new(NullClaimStore);
@@ -1173,29 +1247,32 @@ fn dry_tree<F: DestinationRoot>(
             Err(a) => a.outcome.directories_created += 1,
         }
     }
-    run.dry = Some(DryRun {
-        unprobed_noreplace: true,
-        prior_seen,
-        planned: None,
-        owner_liveness: false,
-        lock_takeover: false,
-        prior: None,
-        partials_present: 0,
-    });
+    dry.unprobed_noreplace = true;
+    run.dry = Some(dry);
     run.copy = Some(result);
     run
 }
 
 /// Cut 11a: the dry branch of `file_with`: the prior notes, then what `plan_file` says the copy would do.
+#[allow(clippy::too_many_arguments)]
 fn dry_file<F: DestinationRoot>(
     mut run: Run<Result<Outcome, CopyError>>,
     fs: &F,
     place: &FilePlace<'_, F::Dir>,
+    site: &LockSite<'_, F::Dir>,
+    capability: LockCapability,
     src: &Path,
     cfg: &RunConfig,
     opts: &CopyOptions,
 ) -> Run<Result<Outcome, CopyError>> {
-    let prior_seen = dry_prior_notes(Place::scan(place, &cfg.operation_id), &mut run.warnings);
+    let mut dry = match dry_start(site, capability, place, cfg, &mut run.warnings) {
+        DryStart::Plan(dry) => dry,
+        DryStart::Stop(stop, dry) => {
+            run.stop = Some(stop);
+            run.dry = Some(dry);
+            return run;
+        }
+    };
     let planned = match plan_file(fs, src, Some(place.dir), &place.target, opts) {
         Ok(FilePlan::Proceed { src_meta, degraded, replaces }) => {
             run.copy = Some(Ok(Outcome {
@@ -1223,14 +1300,7 @@ fn dry_file<F: DestinationRoot>(
             None
         }
     };
-    run.dry = Some(DryRun {
-        unprobed_noreplace: false,
-        prior_seen,
-        planned,
-        owner_liveness: false,
-        lock_takeover: false,
-        prior: None,
-        partials_present: 0,
-    });
+    dry.planned = planned;
+    run.dry = Some(dry);
     run
 }

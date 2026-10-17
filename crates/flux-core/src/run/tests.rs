@@ -7890,13 +7890,25 @@ fn a_dry_tree_run_counts_dest_only_when_the_walk_did_not_refuse_unchanged() {
     assert!(out.source_mount_unknown.is_some());
 }
 
+/// Cut 11b: the dry run predicts the real run's `RESUMABLE_OPERATION_EXISTS` exit (3, nothing changed).
+fn assert_resumable_refusal(stop: &Option<RunError>) {
+    match stop {
+        Some(RunError::Refused { refusal, changed: false, .. }) => {
+            assert_eq!(refusal.code, LockCode::ResumableOperationExists, "{refusal:?}");
+        }
+        other => panic!("expected the resumable refusal, got {other:?}"),
+    }
+}
+
 #[test]
 fn a_dry_run_notes_each_prior_and_still_plans() {
-    // Resumable.
+    // Resumable: the note stays, and the run predicts the refusal instead of planning.
     let fs = fake();
     prior(&fs, 5, OpState::Failed);
     let (r, _) = run_tree(&fs, &dry());
-    assert_eq!(ok(&r).files_copied, 2);
+    assert_resumable_refusal(&r.stop);
+    assert!(r.copy.is_none());
+    assert!(r.dry.as_ref().unwrap().prior_seen);
     assert!(
         matches!(&r.warnings[..], [RunWarning::DryRunPrior { operation_id, state }]
             if *operation_id == id(5) && *state == OpState::Failed),
@@ -7914,18 +7926,13 @@ fn a_dry_run_notes_each_prior_and_still_plans() {
         "{:?}",
         r.warnings
     );
-    // Unreadable.
+    // Unreadable: the scan's error is the real run's, and it ends the preview with no plan.
     let fs = fake();
     prior(&fs, 7, OpState::Failed);
     fs.write_file(format!("/p/dest/.flux/operations/{}/manifest", id(7)), b"garbage");
     let (r, _) = run_tree(&fs, &dry());
-    assert_eq!(ok(&r).files_copied, 2);
-    assert!(
-        matches!(&r.warnings[..], [RunWarning::DryRunPriorUnreadable { detail }] if detail.contains(": ")),
-        "{:?}",
-        r.warnings
-    );
-    assert!(r.stop.is_none());
+    assert!(r.stop.is_some() && r.copy.is_none(), "{:?} {:?}", r.stop, r.copy);
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
 }
 
 #[test]
@@ -7946,7 +7953,7 @@ fn a_dry_run_says_whether_it_saw_a_prior_through_both_entry_points() {
     let fs = fake();
     prior(&fs, 7, OpState::Failed);
     fs.write_file(format!("/p/dest/.flux/operations/{}/manifest", id(7)), b"garbage");
-    assert_eq!(seen_tree(&fs), (true, 1), "unreadable");
+    assert_eq!(seen_tree(&fs), (false, 0), "unreadable");
 
     let fs = fake();
     let r = run_file(&fs, &dry());
@@ -7961,7 +7968,98 @@ fn a_dry_run_says_whether_it_saw_a_prior_through_both_entry_points() {
         "{:?}",
         r.warnings
     );
-    assert!(matches!(r.copy, Some(Ok(_))), "a prior never stops the plan: {:?}", r.copy);
+    assert_resumable_refusal(&r.stop);
+    assert!(r.copy.is_none(), "a resumable prior predicts the refusal: {:?}", r.copy);
+}
+
+#[test]
+fn dry_a_plain_run_with_a_resumable_prior_predicts_the_refusal() {
+    let fs = fake();
+    prior(&fs, 5, OpState::Transferring);
+    let base = fs.calls().len();
+    let (r, _) = run_tree(&fs, &dry());
+    assert_resumable_refusal(&r.stop);
+    assert!(r.copy.is_none());
+    assert!(r.dry.as_ref().unwrap().prior_seen);
+    forbidden(&fs, base);
+
+    let fs = fake();
+    file_prior(&fs, 5);
+    let base = fs.calls().len();
+    let r = run_file(&fs, &dry());
+    assert_resumable_refusal(&r.stop);
+    assert!(r.copy.is_none());
+    assert!(r.dry.as_ref().unwrap().prior_seen);
+    forbidden(&fs, base);
+}
+
+#[test]
+fn dry_resume_with_no_prior_starts_new() {
+    let fs = fake();
+    let (r, _) = run_tree(&fs, &RunConfig { resume: true, ..dry() });
+    assert_eq!(ok(&r).files_copied, 2);
+    assert_eq!(r.dry.as_ref().unwrap().prior, Some(crate::dry_run::DryPrior::StartedNew));
+    // A plain dry run reports no prior.
+    let (r, _) = run_tree(&fake(), &dry());
+    assert_eq!(r.dry.as_ref().unwrap().prior, None);
+}
+
+#[test]
+fn dry_resume_with_two_priors_predicts_the_refusal() {
+    let fs = fake();
+    prior(&fs, 5, OpState::Transferring);
+    prior(&fs, 6, OpState::Transferring);
+    let (r, _) = run_tree(&fs, &RunConfig { resume: true, ..dry() });
+    assert_resumable_refusal(&r.stop);
+    assert!(r.copy.is_none());
+    let notes = r.warnings.iter().filter(|w| matches!(w, RunWarning::DryRunPrior { .. })).count();
+    assert_eq!(notes, 2, "{:?}", r.warnings);
+}
+
+#[test]
+fn dry_a_predicted_lock_refusal_prints_no_prior_note() {
+    let fs = fake();
+    prior(&fs, 5, OpState::Transferring);
+    fs.write_file(LOCK, b"not a flux lock record");
+    let base = fs.calls().len();
+    let (r, _) = run_tree(&fs, &dry());
+    match &r.stop {
+        Some(RunError::Refused { refusal, changed: false, .. }) => {
+            assert_eq!(refusal.code, LockCode::ControlPlaneNamespaceConflict, "{refusal:?}");
+        }
+        other => panic!("expected the foreign-lock refusal, got {other:?}"),
+    }
+    assert!(r.copy.is_none());
+    assert!(
+        !r.warnings.iter().any(|w| matches!(w, RunWarning::DryRunPrior { .. })),
+        "{:?}",
+        r.warnings
+    );
+    assert!(!r.dry.as_ref().unwrap().prior_seen);
+    let after = calls(&fs)[base..].to_vec();
+    assert!(!after.iter().any(|c| c.starts_with("read_dir(/p/dest/.flux")), "{after:?}");
+}
+
+#[test]
+fn dry_a_recorded_lock_prints_the_dual_outcome_and_previews_the_dead_case() {
+    let fs = fake();
+    let p = fs.destination_root(Path::new("/p")).unwrap();
+    let site = LockSite::directory(&p, OsStr::new("dest")).unwrap();
+    let theirs = record(&site, &id(5), "none").encode();
+    let _holder = live_lock(&p, "dest.flux-lock", &theirs);
+    let base = fs.calls().len();
+    let (r, _) = run_tree(&fs, &dry());
+    assert_eq!(ok(&r).files_copied, 2);
+    assert!(r.stop.is_none());
+    assert!(r.dry.as_ref().unwrap().owner_liveness);
+    let records =
+        r.warnings.iter().filter(|w| matches!(w, RunWarning::DryRunLockRecord { .. })).count();
+    assert_eq!(records, 1, "{:?}", r.warnings);
+    let after = calls(&fs)[base..].to_vec();
+    assert!(
+        !after.iter().any(|c| c.starts_with("open_lock(") || c.starts_with("try_lock")),
+        "{after:?}"
+    );
 }
 
 #[test]
