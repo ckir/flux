@@ -1884,12 +1884,27 @@ fn gate_link<F: DestinationRoot>(
     src: &Path,
     publish: Publish,
 ) -> std::result::Result<(Option<FileIdentity>, OsString), CopyError> {
-    let src_meta = cx.fs.metadata(src).map_err(|e| CopyError::at(CopyStep::Source, e))?;
-    let gate = identity_gate(parent, name, &src_meta, cx.opts.safety, publish)?;
+    let degraded = gate_link_read(cx, Some(parent), name, src, publish)?;
     let temp = flux_fs::temp_path(Path::new(name), &cx.opts.operation_id).into_os_string();
     (cx.beat)().map_err(|e| CopyError::at(CopyStep::Heartbeat, e))?;
     (cx.guard)().map_err(|e| CopyError::at(CopyStep::Create, e))?;
-    Ok((gate.degraded, temp))
+    Ok((degraded, temp))
+}
+
+/// `gate_link`'s read-only half: the source link's own metadata and `identity_gate`. The stat always runs; with
+/// `parent: None` (a dry run under a destination directory that does not exist yet) no gate runs and the answer is
+/// `Ok(None)`.
+fn gate_link_read<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    parent: Option<&F::Dir>,
+    name: &std::ffi::OsStr,
+    src: &Path,
+    publish: Publish,
+) -> std::result::Result<Option<FileIdentity>, CopyError> {
+    let src_meta = cx.fs.metadata(src).map_err(|e| CopyError::at(CopyStep::Source, e))?;
+    let Some(parent) = parent else { return Ok(None) };
+    let gate = identity_gate(parent, name, &src_meta, cx.opts.safety, publish)?;
+    Ok(gate.degraded)
 }
 
 /// `publish_link`'s create, `stage_file`'s step-3 order: heartbeat, guard, `before_create`, the exclusive create.
