@@ -1,106 +1,106 @@
 {
  "pairs": {
   "linux/large/cp": {
-   "calibrated": "2026-10-17T08:36:50Z",
-   "cv": 0.0059,
+   "calibrated": "2026-10-19T09:14:57Z",
+   "cv": 0.1209,
    "image": "20261012.334.1",
    "source": "calibration",
-   "stable": true
+   "stable": false
   },
   "linux/large/rsync": {
-   "calibrated": "2026-10-17T08:36:50Z",
-   "cv": 0.0158,
+   "calibrated": "2026-10-19T09:14:57Z",
+   "cv": 0.1048,
    "image": "20261012.334.1",
    "source": "calibration",
-   "stable": true
+   "stable": false
   },
   "linux/mixed/cp": {
-   "calibrated": "2026-10-17T08:36:50Z",
-   "cv": 0.0533,
+   "calibrated": "2026-10-19T09:14:57Z",
+   "cv": 0.0427,
    "image": "20261012.334.1",
    "source": "calibration",
    "stable": false
   },
   "linux/mixed/rsync": {
-   "calibrated": "2026-10-17T08:36:50Z",
-   "cv": 0.0729,
+   "calibrated": "2026-10-19T09:14:57Z",
+   "cv": 0.0837,
    "image": "20261012.334.1",
    "source": "calibration",
    "stable": false
   },
   "linux/small/cp": {
-   "calibrated": "2026-10-17T08:36:50Z",
-   "cv": 0.0577,
+   "calibrated": "2026-10-19T09:14:57Z",
+   "cv": 0.104,
    "image": "20261012.334.1",
    "source": "calibration",
    "stable": false
   },
   "linux/small/rsync": {
-   "calibrated": "2026-10-17T08:36:50Z",
-   "cv": 0.0993,
+   "calibrated": "2026-10-19T09:14:57Z",
+   "cv": 0.1721,
    "image": "20261012.334.1",
    "source": "calibration",
    "stable": false
   },
   "macos/large/cp": {
-   "calibrated": "2026-10-17T08:36:50Z",
-   "cv": 0.3274,
+   "calibrated": "2026-10-19T09:14:57Z",
+   "cv": 0.1995,
    "image": "20261013.0424.1",
    "source": "calibration",
    "stable": false
   },
   "macos/large/rsync": {
-   "calibrated": "2026-10-12T11:13:11Z",
-   "cv": 0.1034,
-   "image": "20260907.0351.1",
+   "calibrated": "2026-10-19T09:14:57Z",
+   "cv": 0.1208,
+   "image": "20261013.0424.1",
    "source": "calibration",
    "stable": false
   },
   "macos/mixed/cp": {
-   "calibrated": "2026-10-17T08:36:50Z",
-   "cv": 0.1616,
+   "calibrated": "2026-10-19T09:14:57Z",
+   "cv": 0.1193,
    "image": "20261013.0424.1",
    "source": "calibration",
    "stable": false
   },
   "macos/mixed/rsync": {
-   "calibrated": "2026-10-17T08:36:50Z",
-   "cv": 0.1889,
+   "calibrated": "2026-10-19T09:14:57Z",
+   "cv": 0.1428,
    "image": "20261013.0424.1",
    "source": "calibration",
    "stable": false
   },
   "macos/small/cp": {
-   "calibrated": "2026-10-17T08:36:50Z",
-   "cv": 0.1219,
+   "calibrated": "2026-10-19T09:14:57Z",
+   "cv": 0.114,
    "image": "20261013.0424.1",
    "source": "calibration",
    "stable": false
   },
   "macos/small/rsync": {
-   "calibrated": "2026-10-17T08:36:50Z",
-   "cv": 0.1295,
+   "calibrated": "2026-10-19T09:14:57Z",
+   "cv": 0.126,
    "image": "20261013.0424.1",
    "source": "calibration",
    "stable": false
   },
   "windows/large/robocopy": {
-   "calibrated": "2026-10-17T08:36:50Z",
-   "cv": 0.0218,
+   "calibrated": "2026-10-19T09:14:57Z",
+   "cv": 0.0489,
    "image": "20261007.264.1",
    "source": "calibration",
-   "stable": true
+   "stable": false
   },
   "windows/mixed/robocopy": {
-   "calibrated": "2026-10-17T08:36:50Z",
-   "cv": 0.0724,
+   "calibrated": "2026-10-19T09:14:57Z",
+   "cv": 0.0595,
    "image": "20261007.264.1",
    "source": "calibration",
    "stable": false
   },
   "windows/small/robocopy": {
-   "calibrated": "2026-10-17T08:36:50Z",
-   "cv": 0.0403,
+   "calibrated": "2026-10-19T09:14:57Z",
+   "cv": 0.053,
    "image": "20261007.264.1",
    "source": "calibration",
    "stable": false
