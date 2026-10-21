@@ -490,10 +490,26 @@ fn a_store_held_open_by_another_handle_is_copied_without_refusal() {
     if let Some(RunError::Refused { refusal, .. }) = &stop {
         assert_ne!(refusal.code, LockCode::TargetLockBusy, "{refusal:?}");
     }
-    let previewed = stop.is_none()
-        && matches!(dry.as_ref().and_then(|d| d.prior.as_ref()), Some(DryPrior::Resume { .. }));
-    let torn = warnings.iter().any(|w| matches!(w, run::RunWarning::DryRunStoreTorn));
-    assert!(previewed || torn, "the preview or the torn-store note: {stop:?} {warnings:?} {dry:?}");
+    // Windows: redb's writer holds a mandatory `LockFileEx` over the whole file (redb 4.3.0
+    // `page_manager.rs` `lock_whole_storage`), so the copy's read fails with ERROR_LOCK_VIOLATION
+    // (33): spec 3.4 step 2's read error, the live `failed(RunStep::State)`, exit 1. Elsewhere the
+    // lock is advisory and the copy streams.
+    #[cfg(windows)]
+    assert!(
+        matches!(&stop, Some(RunError::Failed { step: run::RunStep::State, error, .. })
+            if error.source.raw_os_error() == Some(33)),
+        "the copy's read meets redb's lock: {stop:?} {warnings:?} {dry:?}"
+    );
+    #[cfg(not(windows))]
+    {
+        let previewed = stop.is_none()
+            && matches!(dry.as_ref().and_then(|d| d.prior.as_ref()), Some(DryPrior::Resume { .. }));
+        let torn = warnings.iter().any(|w| matches!(w, run::RunWarning::DryRunStoreTorn));
+        assert!(
+            previewed || torn,
+            "the preview or the torn-store note: {stop:?} {warnings:?} {dry:?}"
+        );
+    }
     assert!(snapshot(&tmp).is_empty(), "no temporary left");
 }
 
