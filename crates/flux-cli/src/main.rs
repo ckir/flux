@@ -207,6 +207,7 @@ fn run_config(args: &CopyArgs) -> RunConfig {
             }
         },
         dry_run: args.dry_run,
+        dry_temp_root: Some(std::env::temp_dir()),
     }
 }
 
@@ -278,12 +279,6 @@ fn copy(args: &CopyArgs) -> u8 {
         );
         return exit_code::USAGE;
     }
-    if args.dry_run && (args.resume || args.restart || args.break_lock) {
-        err(
-            "error: --dry-run does not combine with --resume, --restart or --break-lock in this version (cut 11b)",
-        );
-        return exit_code::USAGE;
-    }
     let job = match resolve::job(&args.source, &args.destination) {
         Ok(job) => job,
         Err(Stop::Usage(msg)) => {
@@ -326,13 +321,14 @@ fn copy(args: &CopyArgs) -> u8 {
             // The flag, not `run.dry`: an engine pre-flight refusal returns before the dry branch (ruling P7).
             rep.dry_run = args.dry_run;
             if let Some(d) = &run.dry {
-                rep.unprobed = report::unprobed_keys(d);
+                rep.unprobed = report::unprobed_keys(d, args.resume);
             }
             if args.dry_run {
                 // Nothing moved: the `timed()` throughput would be for bytes that never did.
                 rep.average_bytes_per_second = 0;
             }
             let full = args.resume_verify == Some(ResumeVerifyArg::Full);
+            let mode = if full { "full" } else { "chunks" };
             match &run.copy {
                 Some(result) => {
                     let outcome = match result {
@@ -347,18 +343,26 @@ fn copy(args: &CopyArgs) -> u8 {
                         err(&line);
                     }
                     lines(report::run_lines(&run));
-                    lines(report::resume_lines(&run, outcome.files_resumed));
+                    match &run.dry {
+                        Some(d) => {
+                            lines(d.prior.iter().flat_map(report::dry_prior_lines).collect())
+                        }
+                        None => lines(report::resume_lines(&run, outcome.files_resumed)),
+                    }
                     lines(report::checkpoint_lines(outcome, opts.durability == Durability::Normal));
                     lines(report::resume_verify_lines(outcome, full));
                     rep.resume_verify = report::resume_verify_used(outcome, full).then_some("full");
-                    for line in report::unprobed_lines(&rep.unprobed) {
-                        err(line);
+                    for line in report::unprobed_lines(&rep.unprobed, mode) {
+                        err(&line);
                     }
                     err(&if args.dry_run {
                         report::dry_run_summary_line(&rep, outcome.directories_created)
                     } else {
                         report::summary_line(&rep, outcome.directories_created)
                     });
+                    if let Some(d) = &run.dry {
+                        lines(report::dry_extra_lines(d, outcome.files_resumed));
+                    }
                 }
                 None => lines(report::run_lines(&run)),
             }
@@ -381,7 +385,7 @@ fn copy(args: &CopyArgs) -> u8 {
             let mut rep = Report::file_run(&run, target_existed, ms);
             rep.dry_run = args.dry_run;
             if let Some(d) = &run.dry {
-                rep.unprobed = report::unprobed_keys(d);
+                rep.unprobed = report::unprobed_keys(d, args.resume);
             }
             if args.dry_run {
                 rep.average_bytes_per_second = 0;
@@ -393,6 +397,9 @@ fn copy(args: &CopyArgs) -> u8 {
                             let target = dst.display().to_string();
                             if let Some(p) = run.dry.as_ref().and_then(|d| d.planned) {
                                 err(&report::planned_file_line(&target, p));
+                            }
+                            if let Some(prior) = run.dry.as_ref().and_then(|d| d.prior.as_ref()) {
+                                lines(report::dry_discard_lines(&dst, prior));
                             }
                             for m in &o.metadata_failures {
                                 err(&report::complaint_line(&target, m));
@@ -409,22 +416,35 @@ fn copy(args: &CopyArgs) -> u8 {
                         // could not be removed - the one thing the user needs to clean up.
                         Err(e) => err(&e.to_string()),
                     }
-                    for line in report::unprobed_lines(&rep.unprobed) {
-                        err(line);
-                    }
                     lines(report::run_lines(&run));
-                    lines(report::resume_lines(&run, 0));
+                    match &run.dry {
+                        Some(d) => {
+                            lines(d.prior.iter().flat_map(report::dry_prior_lines).collect())
+                        }
+                        None => lines(report::resume_lines(&run, 0)),
+                    }
                     lines(report::file_checkpoint_lines(
                         &run,
                         &dst.display().to_string(),
                         opts.durability == Durability::Normal,
                     ));
                     lines(report::file_resume_verify_lines(&run));
+                    let mode = if args.resume_verify == Some(ResumeVerifyArg::Full) {
+                        "full"
+                    } else {
+                        "chunks"
+                    };
+                    for line in report::unprobed_lines(&rep.unprobed, mode) {
+                        err(&line);
+                    }
                     err(&if args.dry_run {
                         report::dry_run_summary_line(&rep, 0)
                     } else {
                         report::summary_line(&rep, 0)
                     });
+                    if let Some(d) = &run.dry {
+                        lines(report::dry_extra_lines(d, 0));
+                    }
                 }
                 None => lines(report::run_lines(&run)),
             }

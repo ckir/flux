@@ -6,7 +6,7 @@ use super::acquire::{Acquire, Last, acquire};
 use super::classify::{Classified, classify};
 use super::error::{LockCode, LockError, LockResult, refuse};
 use super::held::Held;
-use super::record::LockRecord;
+use super::record::{LockRecord, Uncertain};
 use super::recover::{Recovered, recover};
 use super::site::{LockSite, SiteKind};
 use super::takeover::{Claimed, TakeOver, take_over};
@@ -54,6 +54,49 @@ pub fn check_capability<D: DirHandle>(dir: &D) -> LockResult<LockCapability> {
 
 const UNTRUSTED_DETAIL: &str = "the dead owner's record names a workspace that is missing or not one Flux trusts; Flux never deletes state it cannot read: inspect it, and remove it by hand if it is not needed";
 
+/// `S21_1_refused` for a held lock: another run holds it, with its record where readable.
+pub(crate) fn busy_refusal(holder: Option<LockRecord>) -> LockError {
+    refuse(LockCode::TargetLockBusy, holder, "another run holds the lock; wait for it to finish")
+}
+
+/// `S21_1_refused` for a non-Flux object at the lock path.
+pub(crate) fn foreign_refusal() -> LockError {
+    refuse(
+        LockCode::ControlPlaneNamespaceConflict,
+        None,
+        "a non-Flux object occupies the lock path; move it away",
+    )
+}
+
+/// `S21_1_refused` for a dead owner whose recorded workspace is not one Flux trusts.
+pub(crate) fn untrusted_refusal(record: LockRecord) -> LockError {
+    refuse(LockCode::ArtifactOwnershipUncertain, Some(record), UNTRUSTED_DETAIL)
+}
+
+/// `S21_1_refused` for a dead owner whose trusted-shaped workspace is gone.
+pub(crate) fn orphan_refusal(record: LockRecord, kind: SiteKind) -> LockError {
+    // Cleanup does not handle single-file operations, so it is no way out for a File site.
+    let detail = if kind == SiteKind::File {
+        UNTRUSTED_DETAIL.to_string()
+    } else {
+        format!(
+            "{UNTRUSTED_DETAIL}; flux cleanup DEST removes a dead owner's lock whose workspace is gone"
+        )
+    };
+    refuse(LockCode::ArtifactOwnershipUncertain, Some(record), detail)
+}
+
+/// `S21_1_refused` for an unreadable record when the run may not take the lock over.
+pub(crate) fn uncertain_refusal(why: Uncertain) -> LockError {
+    refuse(
+        LockCode::TargetLockUncertain,
+        None,
+        format!(
+            "the lock's record is unreadable ({why:?}); if no Flux run is active on this destination, run again with --restart --break-lock"
+        ),
+    )
+}
+
 /// The run's step 3. `operation_id` names a recovery's move-aside file.
 pub fn obtain<'a, D: DirHandle>(
     site: &LockSite<'a, D>,
@@ -74,48 +117,12 @@ pub fn obtain<'a, D: DirHandle>(
         // S21_1_decide (a plain run) and S21_1_restart_decide (--restart --break-lock); S21_1_refused is each refusal.
         match classify(site)? {
             Classified::Vanished => last = Last::Other,
-            Classified::Busy(holder) => {
-                return Err(refuse(
-                    LockCode::TargetLockBusy,
-                    holder,
-                    "another run holds the lock; wait for it to finish",
-                ));
-            }
-            Classified::Foreign => {
-                return Err(refuse(
-                    LockCode::ControlPlaneNamespaceConflict,
-                    None,
-                    "a non-Flux object occupies the lock path; move it away",
-                ));
-            }
-            Classified::Untrusted(record) => {
-                return Err(refuse(
-                    LockCode::ArtifactOwnershipUncertain,
-                    Some(record),
-                    UNTRUSTED_DETAIL,
-                ));
-            }
-            Classified::Orphan { record, .. } => {
-                // Cleanup does not handle single-file operations, so it is no way out for a File site.
-                let detail = if site.kind() == SiteKind::File {
-                    UNTRUSTED_DETAIL.to_string()
-                } else {
-                    format!(
-                        "{UNTRUSTED_DETAIL}; flux cleanup DEST removes a dead owner's lock whose workspace is gone"
-                    )
-                };
-                return Err(refuse(LockCode::ArtifactOwnershipUncertain, Some(record), detail));
-            }
+            Classified::Busy(holder) => return Err(busy_refusal(holder)),
+            Classified::Foreign => return Err(foreign_refusal()),
+            Classified::Untrusted(record) => return Err(untrusted_refusal(record)),
+            Classified::Orphan { record, .. } => return Err(orphan_refusal(record, site.kind())),
             Classified::Uncertain(why) => match mode {
-                Mode::Plain => {
-                    return Err(refuse(
-                        LockCode::TargetLockUncertain,
-                        None,
-                        format!(
-                            "the lock's record is unreadable ({why:?}); if no Flux run is active on this destination, run again with --restart --break-lock"
-                        ),
-                    ));
-                }
+                Mode::Plain => return Err(uncertain_refusal(why)),
                 Mode::BreakLock => match take_over(site, capability, why)? {
                     TakeOver::Claimed(c) => return Ok(Obtained::Claimed(c)),
                     TakeOver::Restart => last = Last::EmptyOrTornUnheld,

@@ -216,7 +216,7 @@ Each was measured, and each is deliberately NOT fixed in that PR.
       (measured, cut 4a test audit): the only leftover test uses `/dst`, where the two agree. `FaultFs`
       refuses relative paths by design, so the test needs a working directory in the fake or a
       real-filesystem fixture that can make removal fail. Owner deferred 2026-09-26.
-- [x] **A tree copy never replaces an existing destination file — DONE in cut 8b (branch `spec/cut-8b`, no PR yet).**
+- [x] **A tree copy never replaces an existing destination file — DONE in cut 8b (PR #63, merged `77419c1`).**
       Was: `copy_tree` published every file no-replace and reported an existing one
       `DESTINATION_NAMESPACE_COLLISION`, untouched (cut 4b, F3), because §241.5's replacement claim needs the
       durable `state.db` of the operation workspace. Now a folder copy replaces an existing destination file by
@@ -330,7 +330,9 @@ are the spec's).
 - [ ] **1. A crash between a publish rename and its claim write** leaves an unclaimed published entry until the WAL cut.
 - [ ] **2. Not in this cut:** resume, `PREPARE_COMMIT` / `COMMIT` and commit recovery (sections 182-184), hardlink
       groups (section 253.7), `--atomic`, `--dry-run` and the TLA+ `claims` scenario.
-      (file-granular resume landed in cut 9a; the rest stays)
+      (landed since: file-granular resume in cut 9a, `PREPARE_COMMIT` / `COMMIT` and commit recovery in cut 9c
+      (`run/recover.rs` `recover_publications`), `--dry-run` in cuts 11a and 11b; hardlink groups, `--atomic` and
+      the TLA+ `claims` scenario not re-checked here)
 - [ ] **3. WSL 9p and network filesystems:** whether the backend's (`redb`) file locking works there is unmeasured.
 - [ ] **4. A directory with millions of entries** holds its listing in memory while the walk is inside it (the source
       side already does).
@@ -371,14 +373,18 @@ are the spec's).
 
 ## Cut 8b debt
 
-- [ ] **Propose the section 241.5 clarifications to the spec owner.** Cut 8b made these choices where the spec is
-      silent: the claim key is the parent directory's identity plus the stored entry name; a claim is never released; a
-      claim is written before the temporary is created and after the section 129 gate; a published new entry gets a
-      `Created` claim (the upgrade of the target's own record, plus a second claim for a differing spelling after
-      publication); a directory whose identity is not `Strong` degrades to no-replace.
-- [ ] **`state.db` is created right after the workspace is published** (Windows refuses to rename a directory that
-      contains an open file). A crash between the publish and the creation leaves a manifest-only workspace that
-      `--restart` supersedes.
+- [ ] **Propose the two remaining section 241.5 clarifications to the spec owner.** Cut 8b made these choices where
+      the spec is silent: a claim is written after the section 129 gate and before the temporary is created; a
+      destination directory whose identity is not `Strong` degrades to no-replace. (Re-checked 2026-10-21: the other
+      three are spec text now - the key is the parent directory's identity plus the entry name, a claim is never
+      released, a publication claims the entry it creates; `FLUX_FULL_UPDATED_SPEC_V16.md` 241.5, around line 10891.)
+- [x] **`state.db` is created right after the workspace is published - RESOLVED by cut 9a (re-checked 2026-10-21).**
+      The order stays (Windows refuses to rename a directory that contains an open file; `run/place.rs` before
+      `create_claim_store`). Was: a crash between the publish and the creation left a manifest-only workspace only
+      `--restart` could supersede. Now `--resume` of a `CREATED` prior whose `state.db` is absent, zero-length or
+      corrupt recreates the store (`run/place.rs` `adopt`); pinned by
+      `a_created_manifest_without_a_usable_state_db_resumes_with_a_fresh_store` and, for the dry run,
+      `a_dry_resume_of_a_created_prior_without_a_store_plans_fresh` (`run/tests.rs`).
 - [x] **The Windows kill test is slow - RESOLVED in the hygiene sweep PR (commit `test: skip the large strict-mode kill
       thresholds (an owner-approved gate change)`).** Was: `claims_kill` (`crates/flux-platform/tests/claims_kill.rs`)
       took about 5 minutes on windows-latest (strict mode, an fsync per claim, 24 thresholds). Now, in strict mode only,
@@ -609,7 +615,7 @@ PS-1 (a socket at the lock or claim-store path was `IO_ERROR`, exit 1) and PP-1 
 ## Cut 11a known limits (`flux copy --dry-run`; spec `docs/superpowers/specs/2026-10-17-cut-11a-dry-run-design.md`, sections 1, 3.5, 3.6, 4)
 - [ ] **A source entry spelled `.FLUX` (another ASCII case of `.flux`) directly under the root** is matched like `.flux` (the fold `reserved_path` uses), so on a case-sensitive destination the dry run predicts a merge or a failure where a real run creates a distinct `.FLUX`; the prediction errs toward a failure (ruling P13).
 
-- [ ] **Prior operations at DEST are noted, not previewed.** A resumable prior, a completed prior and an unreadable record each print one `note:` line and the fresh plan still prints; the exit code never changes for it, and the JSON carries `prior_operation` in `unprobed`. What a real run does with the prior (it may refuse with `RESUMABLE_OPERATION_EXISTS`) is cut 11b's `--dry-run --resume|--restart|--break-lock`, which this cut refuses as usage (exit 2).
+- [x] **Prior operations at DEST are noted, not previewed** — closed by cut 11b (`--dry-run --resume|--restart|--break-lock` preview or predict the refusal; spec `docs/superpowers/specs/2026-10-17-cut-11b-dry-run-prior-design.md`).
 - [ ] **Same-run namespace collisions are not predicted (spec 5.2).** Two source names that fold onto one destination entry plan as two creates where a real run reports one collision.
 - [ ] **Failures that occur only while bytes move are not predicted:** a read error mid-file, a full disk, a source changed during the copy, metadata-apply complaints, claim-store write failures. An unreadable source FILE (open refused, e.g. mode 000) is predicted as `would_copy`: I3 forbids opening the source, and permission bits are not a portable predictor (final review I-3b).
 - [x] **A top-level source entry named `.flux` now mirrors the live run (ruling P11, retiring P6):** a directory merges (no `would_create` line, no count; its reserved children `operations`, `standalone`, `atomic` refuse as in a real run and its other children plan), and a file or link fails as live does (`DESTINATION_ERROR` into an existing DEST, `SAFETY_REJECTED` into an absent one, step `gate`). A `.flux` deeper than the root's direct children is judged against the destination as any other name.
@@ -617,6 +623,36 @@ PS-1 (a socket at the lock or claim-store path was `IO_ERROR`, exit 1) and PP-1 
 - [ ] **A temporary name over the limit is predicted (ruling P12):** a source name whose temporary (`temp_path`) exceeds `NAME_LIMIT` fails as `IO_ERROR` at step `create`, as live does at `create_new`; other name-length failures are not predicted.
 - [ ] **A tree source onto a DEST that is a regular file** is the CLI resolver's usage error (exit 2, no JSON) in both modes; a DEST below a regular file is the engine's pre-flight refusal (exit 1, and under `--json` the dry run's object carries `dry_run: true`) (ruling P8).
 - [ ] **The dry mode's cost on the live path was not measured (D9):** one `dry_run` branch per entry, and the live path now also calls its claim store through `dyn ClaimStore` (a vtable call per claim operation).
+
+## Cut 11b known limits (`flux copy --dry-run` with `--resume`, `--restart`, `--break-lock`; spec `docs/superpowers/specs/2026-10-17-cut-11b-dry-run-prior-design.md`)
+- [ ] **A half-copied file's continuation is not previewed (N1):** `partials_present` counts partials beside targets the walk would write, copied or overwritten (ruling P7).
+- [ ] **`<lock-name>.broken.*` leftovers are noted, not classified (N4).**
+- [ ] **A live owner is not detected (N5/D7):** the dual outcome is printed; a held claim store is not probed, a torn copy prints its note.
+- [ ] **The resume preview needs temp disk (D8):** it copies the prior's `state.db` into `flux-dry-<id>` under the system temp directory, so temp disk equal to the store's size is needed; `RunConfig.dry_temp_root` overrides the root.
+- [ ] **The empty-lock blind spot:** an empty or torn record is `TARGET_LOCK_UNCERTAIN` for the dry run where a holder inside its first write would be busy for the real one (spec 3.2).
+- [ ] **The real-fs paired oracle:** a byte copy of DEST has new inodes, so the resume preview is compared on the ORIGINAL, dry first (ruling P9).
+- [ ] **The copied claim store is not private:** `<temp>` is made with the platform's default modes (`dir_unix.rs:152,163`: 0o777 / 0o666 under umask), so on a shared temp directory the copy of a prior's claim store (destination names) is readable by others; a dry run interrupted by a signal leaves `flux-dry-<id>/state.db` behind (Flux installs no signal handler).
+- [ ] **The sweep's walk-error warnings now precede its deletion warnings** (`partials_under` lists first, `sweep_partials` deletes after): a live `--restart` or `flux cleanup` prints the same warnings in a different order than before cut 11b.
+
+## Cut 11b test debt (deferred by the SDD run, 2026-10-18)
+- [ ] **`forbidden_for_resume` bans five claim writes by name** (`run/tests.rs`): a twelfth `ClaimStore` method would pass unnoticed; an allow-list of the six reads/inserts the copy legitimately sees would fail closed.
+- [ ] **The `dry_lock` branches without a test:** SafetyRejected/DestinationError, `Error`, `Untrusted`, File-site Orphan (`run/tests.rs`).
+- [ ] **The eight-fold lock-test setup and the `("record", Some(Vec::new()))` placeholder.**
+- [ ] **The "Unreadable" scan case asserts only `stop.is_some()`.**
+- [ ] **Tree-only tests for resume-none/two and the recorded lock.**
+- [ ] **No dry test for the unlistable-directory warning path of `dry_restart`.**
+- [ ] **P7's count rule is untested for Overwrite/Skip, and there is no negative partial test.**
+- [ ] **No test for a copy-write failure, a non-NotFound read error, or the link-arm `Resume` record.**
+- [ ] **No CLI test pins the stderr ORDER.**
+- [ ] **`partials_found` is printed as bare names for a single file** (fixed in the final wave if the whole-branch review agrees).
+- [ ] **The real-fs "untouched" oracle is mtime-based.**
+- [ ] **The two `forbidden` helpers and `in_scope` are duplicated across `run/tests.rs` and `tree.rs`.**
+- [ ] **`obtain_cleanup_lock` repeats the refusal texts the new constructors hold** (`lock/obtain.rs`).
+- [ ] **`FaultFs::claim` and `claim_count` read every claim store the fake ever created** (`fault_fs.rs`), a dry
+      resume's private copy under the temp root included, so neither can assert what ONE on-disk store holds; a test
+      that uses them after a dry `--resume` sees the copy's claims too. The cut 11b tests use `store_of(..).get`
+      instead. A per-path variant (or `claim` taking the store's path) would remove the trap. (Triaged from the
+      anomalies inbox 2026-10-21; reported by the Task 6 implementer, verified by the controller.)
 
 ## Cut 11a test debt (deferred by the SDD run, 2026-10-17)
 - [ ] **The fake's `FakeDirHandle::open_dir` records nothing in the call log**, so the dry-run `forbidden` allow-lists (`tree.rs`, `run/tests.rs`) cannot see `open_dir` calls; `open_dir` is in the allow-list for the day the fake records it (capstone round 1, open question b).

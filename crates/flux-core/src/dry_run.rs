@@ -1,9 +1,11 @@
 //! Cut 11a: the types a dry run (`flux copy --dry-run`) is built from.
 
+use crate::state::OpState;
 use flux_fs::{
     ClaimKey, ClaimOutcome, ClaimRecord, ClaimStore, FluxPathKey, PreparedRecord, RecoveryOp,
     Result,
 };
+use std::path::PathBuf;
 
 /// What kind of object a dry run plans to touch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,6 +13,8 @@ pub enum PlannedObject {
     File,
     Dir,
     Symlink,
+    State,
+    Partial,
 }
 
 impl PlannedObject {
@@ -19,6 +23,8 @@ impl PlannedObject {
             PlannedObject::File => "file",
             PlannedObject::Dir => "dir",
             PlannedObject::Symlink => "symlink",
+            PlannedObject::State => "state",
+            PlannedObject::Partial => "partial",
         }
     }
 }
@@ -44,19 +50,27 @@ impl SkipReason {
 pub enum PlannedAction {
     CreateDir,
     Copy,
+    /// Cut 11b: a copy whose half-copied temporary (`len` bytes) is present; its continuation is not previewed.
+    CopyOverPartial {
+        len: u64,
+    },
     Overwrite,
     Skip(SkipReason),
     CreateSymlink,
+    Resume,
+    Discard,
 }
 
 impl PlannedAction {
     pub fn as_str(self) -> &'static str {
         match self {
             PlannedAction::CreateDir => "would_create",
-            PlannedAction::Copy => "would_copy",
+            PlannedAction::Copy | PlannedAction::CopyOverPartial { .. } => "would_copy",
             PlannedAction::Overwrite => "would_overwrite",
             PlannedAction::Skip(_) => "would_skip",
             PlannedAction::CreateSymlink => "would_create_symlink",
+            PlannedAction::Resume => "would_resume",
+            PlannedAction::Discard => "would_discard",
         }
     }
 }
@@ -76,6 +90,35 @@ pub struct DryRun {
     pub unprobed_noreplace: bool,
     pub prior_seen: bool,
     pub planned: Option<PlannedEntry>,
+    /// Cut 11b: a readable lock record whose owner's liveness was not probed (the dual outcome).
+    pub owner_liveness: bool,
+    /// Cut 11b: `--restart --break-lock` would take an uncertain lock over.
+    pub lock_takeover: bool,
+    /// Cut 11b: what `--resume` or `--restart` would do with the prior operations.
+    pub prior: Option<DryPrior>,
+    /// Cut 11b: half-copied files found beside targets the walk would write (copied or overwritten) under `--resume`;
+    /// their continuation is not previewed.
+    pub partials_present: u64,
+}
+
+/// Cut 11b: what a dry `--resume` or `--restart` would do with the prior operations at DEST.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DryPrior {
+    /// No prior operation: the run would start a new one.
+    StartedNew,
+    /// `--resume` would continue operation `operation_id`: `claims` of its claim records (`None` when not counted),
+    /// `recovered` prepared notes recovered, `strays` stray temporaries.
+    Resume { operation_id: String, claims: Option<u64>, recovered: u64, strays: u64 },
+    /// `--restart` would supersede the listed operations (id and state), discarding `partials` half-copied files and
+    /// `states` state directories.
+    Restart {
+        superseded: Vec<(String, OpState)>,
+        /// Every `<name>.flux-partial.<prior id>` a real run would delete: DEST-relative for a tree, the bare name
+        /// for a single file; the CLI prints the single-file discard lines from `superseded` and this list, a tree's
+        /// come through the streamed `Planned` records.
+        partials_found: Vec<PathBuf>,
+        states: u64,
+    },
 }
 
 /// A claim store that stores nothing: every insert is fresh, every lookup is absent. Holds no state.
@@ -166,6 +209,7 @@ mod tests {
     fn every_planned_action_and_object_has_its_stream_word() {
         assert_eq!(PlannedAction::CreateDir.as_str(), "would_create");
         assert_eq!(PlannedAction::Copy.as_str(), "would_copy");
+        assert_eq!(PlannedAction::CopyOverPartial { len: 3 }.as_str(), "would_copy");
         assert_eq!(PlannedAction::Overwrite.as_str(), "would_overwrite");
         assert_eq!(PlannedAction::Skip(SkipReason::UpToDate).as_str(), "would_skip");
         assert_eq!(PlannedAction::Skip(SkipReason::Existing).as_str(), "would_skip");
@@ -175,5 +219,9 @@ mod tests {
         assert_eq!(PlannedObject::File.as_str(), "file");
         assert_eq!(PlannedObject::Dir.as_str(), "dir");
         assert_eq!(PlannedObject::Symlink.as_str(), "symlink");
+        assert_eq!(PlannedAction::Resume.as_str(), "would_resume");
+        assert_eq!(PlannedAction::Discard.as_str(), "would_discard");
+        assert_eq!(PlannedObject::State.as_str(), "state");
+        assert_eq!(PlannedObject::Partial.as_str(), "partial");
     }
 }

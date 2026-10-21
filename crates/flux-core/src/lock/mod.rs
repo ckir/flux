@@ -19,5 +19,11 @@ pub use held::{Held, Released};
 pub use obtain::{
     CleanupObtained, MAX_ATTEMPTS, Mode, Obtained, check_capability, obtain, obtain_cleanup_lock,
 };
+// The refusal constructors are crate-internal, so they cannot ride the `pub use` above.
+#[allow(unused_imports)] // only `busy_refusal` still has no user outside `obtain`.
+pub(crate) use obtain::{
+    busy_refusal, foreign_refusal, orphan_refusal, uncertain_refusal, untrusted_refusal,
+};
 pub use site::{LockSite, SiteKind};
+pub(crate) use takeover::takeover_unavailable_refusal;
 pub use takeover::{Claimed, Overwritten};

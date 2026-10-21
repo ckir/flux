@@ -35,6 +35,7 @@ pub fn config() -> RunConfig {
         descriptor_limit: None,
         resume_verify: flux_core::run::ResumeVerify::Chunks,
         dry_run: false,
+        dry_temp_root: None,
     }
 }
 

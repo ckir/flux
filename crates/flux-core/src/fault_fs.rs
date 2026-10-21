@@ -165,6 +165,10 @@ struct Inner {
 
 type ClaimMap = std::sync::Arc<Mutex<std::collections::BTreeMap<Vec<u8>, Vec<u8>>>>;
 
+/// The first bytes of a fake claim store's file; the origin path follows. The contents live in maps keyed by path, so a
+/// byte copy of the file names the store it was copied from, and `open_claim_store` clones that store's maps.
+const FAKE_STORE_MARKER: &[u8] = b"flux-fake-claim-store\0";
+
 /// The fake's claim store: the real store's key and value encodings over an in-memory map, with the call log and the
 /// fault keys `claim_insert`, `claim_get`, `claim_upgrade`, `claim_flush`.
 pub struct FakeClaimStore {
@@ -2127,7 +2131,10 @@ impl DirHandle for FakeDirHandle {
                 std::io::Error::from(std::io::ErrorKind::AlreadyExists),
             ));
         }
-        g.files.insert(child_path.clone(), Vec::new());
+        g.files.insert(
+            child_path.clone(),
+            [FAKE_STORE_MARKER, child_path.as_os_str().as_encoded_bytes()].concat(),
+        );
         mint_identity(&mut g, &child_path);
         let map = ClaimMap::default();
         g.claim_stores.push(std::sync::Arc::clone(&map));
@@ -2172,16 +2179,52 @@ impl DirHandle for FakeDirHandle {
             ));
         };
         let empty = bytes.is_empty();
+        // A non-UTF-8 origin reads as "not a claim store": fake paths are UTF-8 in every fixture.
+        let origin = bytes
+            .strip_prefix(FAKE_STORE_MARKER)
+            .and_then(|tail| std::str::from_utf8(tail).ok())
+            .map(PathBuf::from);
         if g.claim_formats.get(&child_path).is_some_and(|f| *f != 1 && *f != 2) {
             return Err(FsError::new(
                 Code::IncompatibleState,
                 std::io::Error::other("claim store format is not supported"),
             ));
         }
-        let Some(map) = g.claim_files.get(&child_path).cloned() else {
-            let msg = if empty { "zero-length claim store" } else { "not a claim store" };
-            return Err(FsError::new(Code::StateCorrupt, std::io::Error::other(msg)));
-        };
+        // A byte copy keeps its original's format, as a copied redb file keeps its header.
+        if !g.claim_files.contains_key(&child_path)
+            && origin
+                .as_ref()
+                .and_then(|o| g.claim_formats.get(o))
+                .is_some_and(|f| *f != 1 && *f != 2)
+        {
+            return Err(FsError::new(
+                Code::IncompatibleState,
+                std::io::Error::other("claim store format is not supported"),
+            ));
+        }
+        if !g.claim_files.contains_key(&child_path) {
+            // A byte copy of a store: clone the origin's maps into an independent store under this path.
+            let cloned = origin.and_then(|o| {
+                let map = g.claim_files.get(&o)?.lock().unwrap().clone();
+                let prepared =
+                    g.prepared_files.get(&o).map(|p| p.lock().unwrap().clone()).unwrap_or_default();
+                Some((map, prepared, g.claim_formats.get(&o).copied()))
+            });
+            let Some((map, prepared, format)) = cloned else {
+                let msg = if empty { "zero-length claim store" } else { "not a claim store" };
+                return Err(FsError::new(Code::StateCorrupt, std::io::Error::other(msg)));
+            };
+            let map = std::sync::Arc::new(Mutex::new(map));
+            let prepared = std::sync::Arc::new(Mutex::new(prepared));
+            g.claim_stores.push(std::sync::Arc::clone(&map));
+            g.claim_files.insert(child_path.clone(), map);
+            g.prepared_stores.push(std::sync::Arc::clone(&prepared));
+            g.prepared_files.insert(child_path.clone(), prepared);
+            if let Some(f) = format {
+                g.claim_formats.insert(child_path.clone(), f);
+            }
+        }
+        let map = g.claim_files.get(&child_path).cloned().unwrap();
         let prepared = g.prepared_files.get(&child_path).cloned().unwrap_or_default();
         g.claim_stores_open += 1;
         Ok(FakeClaimStore {
@@ -3844,6 +3887,82 @@ mod tests {
         drop(d.create_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap());
         fs.set_claim_store_format("/d/state.db", 3);
         assert_eq!(open("state.db").err().expect("format").code, Code::IncompatibleState);
+    }
+
+    #[test]
+    fn a_byte_copy_of_a_claim_store_opens_as_an_independent_store() {
+        use flux_fs::{
+            ClaimKey, ClaimRecord, ClaimStatus, ClaimStore, DestinationRoot, DirHandle, Durability,
+            FluxPathKey, ObjectId, PreparedRecord,
+        };
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/a")).unwrap();
+        fs.create_dir(Path::new("/b")).unwrap();
+        let a = fs.destination_root(Path::new("/a")).unwrap();
+        let b = fs.destination_root(Path::new("/b")).unwrap();
+        let ka = ClaimKey::new(ObjectId { volume: 1, index: 1 }, OsStr::new("a"));
+        let kc = ClaimKey::new(ObjectId { volume: 1, index: 1 }, OsStr::new("c"));
+        let ra = ClaimRecord { target: FluxPathKey(b"a".to_vec()), status: ClaimStatus::Existing };
+        let rc = ClaimRecord { target: FluxPathKey(b"c".to_vec()), status: ClaimStatus::Created };
+        {
+            let mut s = a.create_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap();
+            s.insert_if_absent(&ka, &ra).unwrap();
+            s.prepare(
+                &ka,
+                &PreparedRecord {
+                    target: FluxPathKey(b"a".to_vec()),
+                    temp_name: b"t".to_vec(),
+                    identity: String::new(),
+                    dir_path: String::new(),
+                    name: b"a".to_vec(),
+                    planned_name: Vec::new(),
+                    replacement: false,
+                },
+            )
+            .unwrap();
+        }
+        let bytes = fs.read_file("/a/state.db").expect("the original's bytes");
+        assert!(bytes.starts_with(b"flux-fake-claim-store\0"), "marker: {bytes:?}");
+        fs.write_file("/b/state.db", &bytes);
+        let mut copy = b.open_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap();
+        assert_eq!(copy.get(&ka).unwrap(), Some(ra.clone()));
+        assert_eq!(copy.count().unwrap(), 1);
+        assert_eq!(copy.prepared().unwrap().len(), 1, "the note came with the copy");
+        copy.discard_prepared(&ka).unwrap();
+        copy.insert_if_absent(&kc, &rc).unwrap();
+        assert_eq!(copy.count().unwrap(), 2);
+        drop(copy);
+        let orig = a.open_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap();
+        assert_eq!(orig.count().unwrap(), 1, "the original is unchanged by the copy's insert");
+        assert_eq!(orig.get(&kc).unwrap(), None);
+        assert_eq!(orig.prepared().unwrap().len(), 1, "the original keeps its note");
+    }
+
+    #[test]
+    fn a_zero_length_or_garbage_state_db_is_still_corrupt() {
+        use flux_fs::{DestinationRoot, DirHandle, Durability};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let open = || d.open_claim_store(OsStr::new("state.db"), Durability::Normal);
+        fs.write_file("/d/state.db", b"");
+        let e = open().err().expect("zero-length");
+        assert_eq!(
+            (e.code, e.source.to_string()),
+            (Code::StateCorrupt, "zero-length claim store".into())
+        );
+        fs.write_file("/d/state.db", b"garbage");
+        let e = open().err().expect("garbage");
+        assert_eq!(
+            (e.code, e.source.to_string()),
+            (Code::StateCorrupt, "not a claim store".into())
+        );
+        fs.write_file("/d/state.db", b"flux-fake-claim-store\0/nowhere");
+        let e = open().err().expect("unknown origin");
+        assert_eq!(
+            (e.code, e.source.to_string()),
+            (Code::StateCorrupt, "not a claim store".into())
+        );
     }
 
     #[test]

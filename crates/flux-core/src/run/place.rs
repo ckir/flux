@@ -266,7 +266,7 @@ pub(crate) struct TreePlace<'p, F: DestinationRoot> {
 }
 
 /// A refusal of the adopted state that changed nothing.
-fn refused_state(code: LockCode, detail: String) -> RunError {
+pub(crate) fn refused_state(code: LockCode, detail: String) -> RunError {
     RunError::Refused {
         refusal: Box::new(Refusal { code, holder: None, detail }),
         changed: false,
@@ -274,11 +274,11 @@ fn refused_state(code: LockCode, detail: String) -> RunError {
     }
 }
 
-const BY_HAND: &str = "Flux never deletes state it cannot read (§249.4): inspect it, and remove it by hand if it is not needed";
+pub(crate) const BY_HAND: &str = "Flux never deletes state it cannot read (§249.4): inspect it, and remove it by hand if it is not needed";
 
 /// The one mapping of a claim-store error met while adopting a prior (`open` and `count` alike): a store that cannot
 /// be read is a refusal, anything else fails the run at the state step.
-fn state_error(db: &Path, e: FsError) -> RunError {
+pub(crate) fn state_error(db: &Path, e: FsError) -> RunError {
     match e.code {
         Code::StateCorrupt => refused_state(
             LockCode::StateCorrupt,
@@ -297,7 +297,7 @@ fn state_error(db: &Path, e: FsError) -> RunError {
 }
 
 impl<F: DestinationRoot> TreePlace<'_, F> {
-    fn operations_shown(&self) -> PathBuf {
+    pub(crate) fn operations_shown(&self) -> PathBuf {
         self.dest_shown.join(FLUX_DIR).join(OPERATIONS_DIR)
     }
 
@@ -621,8 +621,15 @@ impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {
         let mut recovered = 0;
         if store.supports_prepared() {
             let manifest = self.shown(id);
-            match recover_publications(dest, &self.dest_shown, id, &mut store, warnings, &manifest)
-            {
+            match recover_publications(
+                dest,
+                &self.dest_shown,
+                id,
+                &mut store,
+                warnings,
+                &manifest,
+                false,
+            ) {
                 Ok(r) => recovered = r.recovered,
                 Err(RecoverError::Uncertain(list)) => {
                     return Err(refused_state(

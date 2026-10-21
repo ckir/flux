@@ -3,7 +3,7 @@
 //! returns text, and `main` writes it.
 
 use flux_core::copy::CopyError;
-use flux_core::dry_run::{PlannedAction, PlannedEntry};
+use flux_core::dry_run::{DryPrior, PlannedAction, PlannedEntry};
 use flux_core::run::{ResumeNote, Run, RunError, RunWarning};
 use flux_core::{
     Discard, TreeAbort, TreeFailure, TreeFailureCause, TreeOutcome, WeakIdentityWarnings,
@@ -230,7 +230,7 @@ pub fn record_lines(f: &TreeFailure) -> Vec<String> {
                 pe.object.as_str(),
                 r.as_str()
             )],
-            a => vec![format!("{p}: object_type={} action={}", pe.object.as_str(), a.as_str())],
+            a => vec![planned_line(&p, pe.object.as_str(), a)],
         },
     }
 }
@@ -353,26 +353,40 @@ pub const UNPROBED_NOREPLACE_LINE: &str = "note: the no-replace publication prim
 pub const UNPROBED_TARGET_LOCK_LINE: &str = "note: the destination's lock was not taken and no operation state was written under --dry-run; a real run may be refused or fail there";
 
 /// The `unprobed` vocabulary of a dry run that reached the engine's dry branch, in its fixed order: the no-replace
-/// publication primitive (tree only), the target lock (always), and a prior operation seen at DEST (the notes already
-/// print, so it has no line of its own).
-pub fn unprobed_keys(d: &flux_core::dry_run::DryRun) -> Vec<&'static str> {
+/// publication primitive (tree only), the target lock (always), the owner's liveness, a lock takeover, a prior
+/// operation seen at DEST, and (under `--resume`) the verification a real run would do. Only the first, second and last
+/// have a line of their own; the rest are announced by the notes the engine pushed.
+pub fn unprobed_keys(d: &flux_core::dry_run::DryRun, resume: bool) -> Vec<&'static str> {
     let mut v = Vec::new();
     if d.unprobed_noreplace {
         v.push("noreplace_publish");
     }
     v.push("target_lock");
+    if d.owner_liveness {
+        v.push("owner_liveness");
+    }
+    if d.lock_takeover {
+        v.push("lock_takeover");
+    }
     if d.prior_seen {
         v.push("prior_operation");
+    }
+    if resume {
+        v.push("resume_verify");
     }
     v
 }
 
-/// The stderr lines of the `unprobed` keys, in the same order; `prior_operation` has none.
-pub fn unprobed_lines(keys: &[&'static str]) -> Vec<&'static str> {
+/// The stderr lines of the `unprobed` keys, in the same order; `mode` is the `--resume-verify` mode a real run would
+/// apply (`chunks` or `full`).
+pub fn unprobed_lines(keys: &[&'static str], mode: &str) -> Vec<String> {
     keys.iter()
         .filter_map(|k| match *k {
-            "noreplace_publish" => Some(UNPROBED_NOREPLACE_LINE),
-            "target_lock" => Some(UNPROBED_TARGET_LOCK_LINE),
+            "noreplace_publish" => Some(UNPROBED_NOREPLACE_LINE.to_string()),
+            "target_lock" => Some(UNPROBED_TARGET_LOCK_LINE.to_string()),
+            "resume_verify" => Some(format!(
+                "note: --resume-verify={mode} would be applied by a real run; nothing was verified"
+            )),
             _ => None,
         })
         .collect()
@@ -388,8 +402,92 @@ pub fn planned_file_line(target: &str, p: PlannedEntry) -> String {
                 r.as_str()
             )
         }
-        a => format!("{target}: object_type={} action={}", p.object.as_str(), a.as_str()),
+        a => planned_line(target, p.object.as_str(), a),
     }
+}
+
+/// The line of a planned entry that is not a skip: a copy over a half-copied temporary says so (cut 11b).
+fn planned_line(path: &str, object: &str, a: PlannedAction) -> String {
+    match a {
+        PlannedAction::CopyOverPartial { len } => format!(
+            "{path}: object_type={object} action={} (partial of {len} bytes present; its continuation is not previewed)",
+            a.as_str()
+        ),
+        a => format!("{path}: object_type={object} action={}", a.as_str()),
+    }
+}
+
+/// A single file's `--restart` discards (a tree's come through the streamed records): one line per superseded state
+/// record, then one per half-copied temporary.
+pub fn dry_discard_lines(target: &Path, p: &DryPrior) -> Vec<String> {
+    let DryPrior::Restart { superseded, partials_found, .. } = p else {
+        return Vec::new();
+    };
+    let mut v: Vec<String> = superseded
+        .iter()
+        .map(|(id, _)| {
+            format!(
+                "{}: object_type=state action=would_discard",
+                Path::new(&flux_core::state::record_name(target.as_os_str(), id)).display()
+            )
+        })
+        .collect();
+    // The partial is named beside the target, as the state line names the record.
+    let dir = target.parent().unwrap_or(Path::new(""));
+    v.extend(
+        partials_found.iter().map(|n| {
+            format!("{}: object_type=partial action=would_discard", dir.join(n).display())
+        }),
+    );
+    v
+}
+
+/// Cut 11b: what a dry `--resume` or `--restart` would do with the prior operations, as stderr lines.
+pub fn dry_prior_lines(p: &DryPrior) -> Vec<String> {
+    let mut v = Vec::new();
+    match p {
+        DryPrior::StartedNew => v.push("no prior operation; starting new".to_string()),
+        DryPrior::Resume { operation_id, claims, recovered, strays } => {
+            v.push(match claims {
+                Some(n) => format!("would resume operation {operation_id} ({n} entries claimed)"),
+                None => format!("would resume operation {operation_id}"),
+            });
+            if *recovered > 0 {
+                v.push(format!("would recover {recovered} interrupted publications"));
+            }
+            if *strays > 0 {
+                v.push(format!("would remove {strays} stray temporaries"));
+            }
+        }
+        DryPrior::Restart { superseded, .. } => {
+            for (id, state) in superseded {
+                v.push(format!("note: would supersede operation {id} (state {})", state.as_str()));
+            }
+        }
+    }
+    v
+}
+
+/// The summary lines that follow `dry_run_summary_line` (cut 11b): the already-complete files a resume would skip,
+/// what a restart would discard, and the half-copied files whose continuation is not previewed.
+pub fn dry_extra_lines(d: &flux_core::dry_run::DryRun, files_resumed: u64) -> Vec<String> {
+    let mut v = Vec::new();
+    if files_resumed > 0 {
+        v.push(format!("dry run: would resume {files_resumed} already-complete files"));
+    }
+    if let Some(DryPrior::Restart { partials_found, states, .. }) = &d.prior {
+        let partials = partials_found.len();
+        if partials > 0 || *states > 0 {
+            v.push(format!("dry run: would discard {partials} partials and {states} states"));
+        }
+    }
+    if d.partials_present > 0 {
+        v.push(format!(
+            "dry run: {} partial files present, continuation not previewed",
+            d.partials_present
+        ));
+    }
+    v
 }
 
 /// A run's stop (cut 7a), as stderr lines. A refusal is `CODE: detail` - the detail names the path and what to do next
@@ -489,22 +587,55 @@ pub fn run_warning_line(w: &RunWarning) -> String {
             "WAL tail cut: {len} bytes at offset {offset} ({reason}); the checkpoints before it are intact"
         ),
         RunWarning::DryRunPrior { operation_id, state } => format!(
-            "note: a prior operation {operation_id} in state {} exists at DEST; --dry-run does not inspect its owner, so what a real run does with it (it may be refused with RESUMABLE_OPERATION_EXISTS) is not previewed",
+            "note: a resumable prior operation {operation_id} in state {} exists at DEST; a real run without --resume or --restart is refused with RESUMABLE_OPERATION_EXISTS",
             state.as_str()
         ),
         RunWarning::DryRunPriorCompleted { operation_id } => format!(
             "note: an earlier completed operation {operation_id} exists at DEST; a real run would finish its recorded cleanup"
         ),
-        RunWarning::DryRunPriorUnreadable { detail } => format!(
-            "note: a prior operation's record could not be read ({detail}); --dry-run does not preview how a real run handles it"
+        RunWarning::DryRunLockRecord {
+            operation_id,
+            owner_instance_id,
+            boot_session_id,
+            heartbeat_age_secs,
+            workspace_path,
+        } => {
+            let age = match heartbeat_age_secs {
+                Some(n) => format!("{n} s ago"),
+                None => "in the future".to_string(),
+            };
+            format!(
+                "note: a lock record for operation {operation_id} exists (owner instance {owner_instance_id}, boot session {boot_session_id}, last heartbeat {age}, workspace {workspace_path}); a real run tries the OS lock: if it is held, TARGET_LOCK_BUSY; if not, the preview below applies, and this exit code reflects that case"
+            )
+        }
+        RunWarning::DryRunLockTakeover { why } => format!(
+            "note: --break-lock would take over the lock, whose record is unreadable ({why}); a real run refuses with TARGET_LOCK_BUSY if the OS lock is held"
         ),
+        RunWarning::DryRunBrokenLeftover { name } => {
+            format!("note: an interrupted lock recovery left {name}; a real run classifies it")
+        }
+        RunWarning::DryRunDebris { name } => {
+            format!("note: a real run would remove the workspace debris {name}")
+        }
+        RunWarning::DryRunStoreFresh { operation_id } => {
+            format!("note: would create a fresh claim store for operation {operation_id}")
+        }
+        RunWarning::DryRunStoreTorn => "note: the prior's claim store could not be read consistently; a live run may have been writing it: run the dry run again before deciding on --restart".to_string(),
     }
 }
 
 /// A run's own stop, then its warnings (cut 7a): the stderr lines that follow the copy's and precede the summary.
 pub fn run_lines<T>(run: &Run<T>) -> Vec<String> {
-    let mut v = run.stop.as_ref().map(stop_lines).unwrap_or_default();
-    v.extend(run.warnings.iter().map(run_warning_line));
+    let stop = run.stop.as_ref().map(stop_lines).unwrap_or_default();
+    let mut v: Vec<String> = Vec::new();
+    // Ruling P10: a dry run's predicted refusal prints the notes made before it, then the refusal, then nothing.
+    if run.dry.is_some() {
+        v.extend(run.warnings.iter().map(run_warning_line));
+        v.extend(stop);
+    } else {
+        v.extend(stop);
+        v.extend(run.warnings.iter().map(run_warning_line));
+    }
     v
 }
 
@@ -1609,5 +1740,198 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn the_cut_11b_notes_have_their_spec_text() {
+        use flux_core::state::OpState;
+        let id = || "abc".to_string();
+        let cases: Vec<(RunWarning, &str)> = vec![
+            (
+                RunWarning::DryRunPrior { operation_id: id(), state: OpState::Transferring },
+                "note: a resumable prior operation abc in state TRANSFERRING exists at DEST; a real run without --resume or --restart is refused with RESUMABLE_OPERATION_EXISTS",
+            ),
+            (
+                RunWarning::DryRunLockRecord {
+                    operation_id: id(),
+                    owner_instance_id: "o".into(),
+                    boot_session_id: "b".into(),
+                    heartbeat_age_secs: Some(7),
+                    workspace_path: "none".into(),
+                },
+                "note: a lock record for operation abc exists (owner instance o, boot session b, last heartbeat 7 s ago, workspace none); a real run tries the OS lock: if it is held, TARGET_LOCK_BUSY; if not, the preview below applies, and this exit code reflects that case",
+            ),
+            (
+                RunWarning::DryRunLockRecord {
+                    operation_id: id(),
+                    owner_instance_id: "o".into(),
+                    boot_session_id: "b".into(),
+                    heartbeat_age_secs: None,
+                    workspace_path: "none".into(),
+                },
+                "note: a lock record for operation abc exists (owner instance o, boot session b, last heartbeat in the future, workspace none); a real run tries the OS lock: if it is held, TARGET_LOCK_BUSY; if not, the preview below applies, and this exit code reflects that case",
+            ),
+            (
+                RunWarning::DryRunLockTakeover { why: "torn".into() },
+                "note: --break-lock would take over the lock, whose record is unreadable (torn); a real run refuses with TARGET_LOCK_BUSY if the OS lock is held",
+            ),
+            (
+                RunWarning::DryRunBrokenLeftover { name: "n".into() },
+                "note: an interrupted lock recovery left n; a real run classifies it",
+            ),
+            (
+                RunWarning::DryRunDebris { name: "n".into() },
+                "note: a real run would remove the workspace debris n",
+            ),
+            (
+                RunWarning::DryRunStoreFresh { operation_id: id() },
+                "note: would create a fresh claim store for operation abc",
+            ),
+            (
+                RunWarning::DryRunStoreTorn,
+                "note: the prior's claim store could not be read consistently; a live run may have been writing it: run the dry run again before deciding on --restart",
+            ),
+        ];
+        for (w, want) in &cases {
+            assert_eq!(run_warning_line(w), *want);
+        }
+    }
+
+    #[test]
+    fn dry_prior_lines_say_what_a_resume_or_restart_would_do() {
+        use flux_core::state::OpState;
+        assert_eq!(dry_prior_lines(&DryPrior::StartedNew), ["no prior operation; starting new"]);
+        let resume = |claims, recovered, strays| DryPrior::Resume {
+            operation_id: "abc".into(),
+            claims,
+            recovered,
+            strays,
+        };
+        assert_eq!(
+            dry_prior_lines(&resume(Some(4), 0, 0)),
+            ["would resume operation abc (4 entries claimed)"]
+        );
+        assert_eq!(
+            dry_prior_lines(&resume(None, 2, 3)),
+            [
+                "would resume operation abc",
+                "would recover 2 interrupted publications",
+                "would remove 3 stray temporaries"
+            ]
+        );
+        let restart = DryPrior::Restart {
+            superseded: vec![("a".into(), OpState::Transferring), ("b".into(), OpState::Failed)],
+            partials_found: vec![PathBuf::from("x.flux-partial.a")],
+            states: 2,
+        };
+        assert_eq!(
+            dry_prior_lines(&restart),
+            [
+                "note: would supersede operation a (state TRANSFERRING)",
+                "note: would supersede operation b (state FAILED)"
+            ]
+        );
+        // The partial is joined to the target's directory, so Windows separates it with `\`.
+        let partial = Path::new("/d").join("x.flux-partial.a");
+        assert_eq!(
+            dry_discard_lines(Path::new("/d/t"), &restart),
+            [
+                "/d/t.flux-state.a: object_type=state action=would_discard".to_string(),
+                "/d/t.flux-state.b: object_type=state action=would_discard".to_string(),
+                format!("{}: object_type=partial action=would_discard", partial.display())
+            ]
+        );
+        assert!(dry_discard_lines(Path::new("/d/t"), &DryPrior::StartedNew).is_empty());
+    }
+
+    #[test]
+    fn a_dry_run_extra_lines_follow_the_summary() {
+        use flux_core::dry_run::DryRun;
+        let mut d = DryRun {
+            unprobed_noreplace: false,
+            prior_seen: false,
+            planned: None,
+            owner_liveness: false,
+            lock_takeover: false,
+            prior: None,
+            partials_present: 0,
+        };
+        assert!(dry_extra_lines(&d, 0).is_empty());
+        d.partials_present = 2;
+        d.prior = Some(DryPrior::Restart {
+            superseded: Vec::new(),
+            partials_found: vec![PathBuf::from("p")],
+            states: 3,
+        });
+        assert_eq!(
+            dry_extra_lines(&d, 5),
+            [
+                "dry run: would resume 5 already-complete files",
+                "dry run: would discard 1 partials and 3 states",
+                "dry run: 2 partial files present, continuation not previewed"
+            ]
+        );
+    }
+
+    #[test]
+    fn planned_lines_carry_the_new_words() {
+        use flux_core::dry_run::PlannedObject::{File, Partial, State};
+        let line = |o, a| planned_file_line("t", PlannedEntry { object: o, action: a });
+        assert_eq!(
+            line(File, PlannedAction::CopyOverPartial { len: 9 }),
+            "t: object_type=file action=would_copy (partial of 9 bytes present; its continuation is not previewed)"
+        );
+        assert_eq!(
+            line(State, PlannedAction::Discard),
+            "t: object_type=state action=would_discard"
+        );
+        assert_eq!(
+            line(Partial, PlannedAction::Discard),
+            "t: object_type=partial action=would_discard"
+        );
+        assert_eq!(line(File, PlannedAction::Resume), "t: object_type=file action=would_resume");
+    }
+
+    #[test]
+    fn unprobed_keys_come_in_their_fixed_order_and_only_when_they_apply() {
+        use flux_core::dry_run::DryRun;
+        let all = DryRun {
+            unprobed_noreplace: true,
+            prior_seen: true,
+            planned: None,
+            owner_liveness: true,
+            lock_takeover: true,
+            prior: None,
+            partials_present: 0,
+        };
+        assert_eq!(
+            unprobed_keys(&all, true),
+            [
+                "noreplace_publish",
+                "target_lock",
+                "owner_liveness",
+                "lock_takeover",
+                "prior_operation",
+                "resume_verify"
+            ]
+        );
+        let none = DryRun {
+            unprobed_noreplace: false,
+            prior_seen: false,
+            owner_liveness: false,
+            lock_takeover: false,
+            ..all.clone()
+        };
+        assert_eq!(unprobed_keys(&none, false), ["target_lock"]);
+        let keys = unprobed_keys(&all, true);
+        assert_eq!(
+            unprobed_lines(&keys, "full"),
+            [
+                UNPROBED_NOREPLACE_LINE.to_string(),
+                UNPROBED_TARGET_LOCK_LINE.to_string(),
+                "note: --resume-verify=full would be applied by a real run; nothing was verified"
+                    .to_string()
+            ]
+        );
     }
 }
