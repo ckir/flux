@@ -216,7 +216,7 @@ Each was measured, and each is deliberately NOT fixed in that PR.
       (measured, cut 4a test audit): the only leftover test uses `/dst`, where the two agree. `FaultFs`
       refuses relative paths by design, so the test needs a working directory in the fake or a
       real-filesystem fixture that can make removal fail. Owner deferred 2026-09-26.
-- [x] **A tree copy never replaces an existing destination file — DONE in cut 8b (branch `spec/cut-8b`, no PR yet).**
+- [x] **A tree copy never replaces an existing destination file — DONE in cut 8b (PR #63, merged `77419c1`).**
       Was: `copy_tree` published every file no-replace and reported an existing one
       `DESTINATION_NAMESPACE_COLLISION`, untouched (cut 4b, F3), because §241.5's replacement claim needs the
       durable `state.db` of the operation workspace. Now a folder copy replaces an existing destination file by
@@ -330,7 +330,9 @@ are the spec's).
 - [ ] **1. A crash between a publish rename and its claim write** leaves an unclaimed published entry until the WAL cut.
 - [ ] **2. Not in this cut:** resume, `PREPARE_COMMIT` / `COMMIT` and commit recovery (sections 182-184), hardlink
       groups (section 253.7), `--atomic`, `--dry-run` and the TLA+ `claims` scenario.
-      (file-granular resume landed in cut 9a; the rest stays)
+      (landed since: file-granular resume in cut 9a, `PREPARE_COMMIT` / `COMMIT` and commit recovery in cut 9c
+      (`run/recover.rs` `recover_publications`), `--dry-run` in cuts 11a and 11b; hardlink groups, `--atomic` and
+      the TLA+ `claims` scenario not re-checked here)
 - [ ] **3. WSL 9p and network filesystems:** whether the backend's (`redb`) file locking works there is unmeasured.
 - [ ] **4. A directory with millions of entries** holds its listing in memory while the walk is inside it (the source
       side already does).
@@ -371,14 +373,18 @@ are the spec's).
 
 ## Cut 8b debt
 
-- [ ] **Propose the section 241.5 clarifications to the spec owner.** Cut 8b made these choices where the spec is
-      silent: the claim key is the parent directory's identity plus the stored entry name; a claim is never released; a
-      claim is written before the temporary is created and after the section 129 gate; a published new entry gets a
-      `Created` claim (the upgrade of the target's own record, plus a second claim for a differing spelling after
-      publication); a directory whose identity is not `Strong` degrades to no-replace.
-- [ ] **`state.db` is created right after the workspace is published** (Windows refuses to rename a directory that
-      contains an open file). A crash between the publish and the creation leaves a manifest-only workspace that
-      `--restart` supersedes.
+- [ ] **Propose the two remaining section 241.5 clarifications to the spec owner.** Cut 8b made these choices where
+      the spec is silent: a claim is written after the section 129 gate and before the temporary is created; a
+      destination directory whose identity is not `Strong` degrades to no-replace. (Re-checked 2026-10-21: the other
+      three are spec text now - the key is the parent directory's identity plus the entry name, a claim is never
+      released, a publication claims the entry it creates; `FLUX_FULL_UPDATED_SPEC_V16.md` 241.5, around line 10891.)
+- [x] **`state.db` is created right after the workspace is published - RESOLVED by cut 9a (re-checked 2026-10-21).**
+      The order stays (Windows refuses to rename a directory that contains an open file; `run/place.rs` before
+      `create_claim_store`). Was: a crash between the publish and the creation left a manifest-only workspace only
+      `--restart` could supersede. Now `--resume` of a `CREATED` prior whose `state.db` is absent, zero-length or
+      corrupt recreates the store (`run/place.rs` `adopt`); pinned by
+      `a_created_manifest_without_a_usable_state_db_resumes_with_a_fresh_store` and, for the dry run,
+      `a_dry_resume_of_a_created_prior_without_a_store_plans_fresh` (`run/tests.rs`).
 - [x] **The Windows kill test is slow - RESOLVED in the hygiene sweep PR (commit `test: skip the large strict-mode kill
       thresholds (an owner-approved gate change)`).** Was: `claims_kill` (`crates/flux-platform/tests/claims_kill.rs`)
       took about 5 minutes on windows-latest (strict mode, an fsync per claim, 24 thresholds). Now, in strict mode only,
