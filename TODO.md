@@ -648,6 +648,11 @@ PS-1 (a socket at the lock or claim-store path was `IO_ERROR`, exit 1) and PP-1 
 - [ ] **The real-fs "untouched" oracle is mtime-based.**
 - [ ] **The two `forbidden` helpers and `in_scope` are duplicated across `run/tests.rs` and `tree.rs`.**
 - [ ] **`obtain_cleanup_lock` repeats the refusal texts the new constructors hold** (`lock/obtain.rs`).
+- [ ] **`FaultFs::claim` and `claim_count` read every claim store the fake ever created** (`fault_fs.rs`), a dry
+      resume's private copy under the temp root included, so neither can assert what ONE on-disk store holds; a test
+      that uses them after a dry `--resume` sees the copy's claims too. The cut 11b tests use `store_of(..).get`
+      instead. A per-path variant (or `claim` taking the store's path) would remove the trap. (Triaged from the
+      anomalies inbox 2026-10-21; reported by the Task 6 implementer, verified by the controller.)
 
 ## Cut 11a test debt (deferred by the SDD run, 2026-10-17)
 - [ ] **The fake's `FakeDirHandle::open_dir` records nothing in the call log**, so the dry-run `forbidden` allow-lists (`tree.rs`, `run/tests.rs`) cannot see `open_dir` calls; `open_dir` is in the allow-list for the day the fake records it (capstone round 1, open question b).

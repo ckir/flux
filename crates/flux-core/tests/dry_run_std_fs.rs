@@ -156,6 +156,8 @@ fn flux_file_source(src: &Path) {
 }
 
 fn corpus() -> Vec<Case> {
+    // Every push below is Unix-only; Windows builds the corpus as declared.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut v = vec![
         Case {
             name: "fresh dest",
