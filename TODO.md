@@ -521,7 +521,9 @@ the spec's numbers, 9-10 were learned during execution).
 - [ ] The Normal path builds the note template needlessly.
 - [ ] After a lost guard the UNBATCHED Strict path's `discard_note_on_failure` still writes `state.db` (`discard_prepared`,
       `crates/flux-core/src/tree.rs`), where the batched path writes nothing after a lost lock (9d spec decision 8). Align it:
-      skip the discard when the guard reported the loss. (Triage of 2026-10-11, verified 2026-10-10.)
+      skip the discard when the guard reported the loss. (Triage of 2026-10-11, verified 2026-10-10.) Re-verified 2026-10-17:
+      four call sites in `copy_one` and `link_one` (files since cut 9c, links since cut 10a); spec 3.2 step 5 says the note is
+      left for recovery. The fix needs a test that loses the lock between the note and the publish.
 
 ## Cut 9d known limits
 
@@ -573,7 +575,7 @@ the spec's numbers, 9-10 were learned during execution).
 - [ ] `run/tests.rs`: the crash-resume link test's guard-before-removal check accepts any earlier `metadata(LOCK)` (use `rposition` after the gate's source metadata); nothing pins that the partial sweep still skips `WalkEvent::Other` (a FIFO at a partial name); `CLEANUP_NOW`/`cleanup_cfg` duplicate `cleanup::delete`'s test helpers.
 - [ ] `crates/flux-platform/tests/dir_handle.rs`: the `rename_replace` link test asserts only `is_symlink()` after the replace; the empty-payload kind is asserted on Linux only; the Windows tests skip on the hosted runner (it cannot create links), so the success path rides on the owner's Developer-Mode box (see `docs/accepted-boundaries.md`).
 - [ ] Windows arm: `map_symlink_error` is Windows-only (not Linux-unit-testable); the identity re-check window in `create_symlink` could be narrowed by holding the opened path without `FILE_SHARE_DELETE`; a failing `FileRenameInformationEx` retry reports the retry's status, not the first `ACCESS_DENIED` (an unsupported-class status on FAT/old SMB would read as "invalid info class"); WSL `LX_SYMLINK` sources are refused as special files with no hint why; the K7 refusal reuses `SYMLINK_CREATION_UNAVAILABLE`'s code though this version can create links (spec 3.6; a later cut may add a dedicated code); a Windows `flux copy` smoke test by the owner is still owed.
-- [x] Anomalies verified during the run were triaged on 2026-10-17: see "Triaged from the anomalies inbox 2026-10-17" (the prepared-note discard after a lost lock) and "Cut 8b debt" (the fake folds ASCII case only, tracked there already).
+- [x] Anomalies verified during the run were triaged on 2026-10-17: see "Cut 9c debt" (the prepared-note discard after a lost lock, tracked there since 2026-10-11) and "Cut 8b debt" (the fake folds ASCII case only, tracked there already).
 
 ## Cut 10b known limits (source mount boundaries; spec `docs/superpowers/specs/2026-10-17-cut-10b-mount-boundaries-design.md`, sections 3.2, 4, 6)
 
@@ -667,7 +669,6 @@ PS-1 (a socket at the lock or claim-store path was `IO_ERROR`, exit 1) and PP-1 
 
 ## Triaged from the anomalies inbox 2026-10-17 (each verified by measurement before promotion)
 
-- [ ] **A prepared note is discarded after a lost destination lock.** `discard_note_on_failure` (`crates/flux-core/src/tree.rs`, four call sites in `copy_one` and `link_one`) calls `discard_prepared` on ANY `Err` from the publish, a lost section-99 lock included: `publish_staged` keeps the temporary as a leftover, then the note that would have let recovery decide it is deleted, a state.db mutation after the lock is gone (files since cut 9c, links since cut 10a). Spec 3.2 step 5 says the note is left for recovery. Same family as the `flush_batch` STOP-HELD discard loop item above. The fix needs a decision: the discard must not run once the guard has reported the lock lost (keep the note, as the batched path keeps its writes), and a test that loses the lock between the note and the publish.
 - [ ] **Two live tree-copy codes the dry run mirrors (rulings P11 and P12), to fix on both paths together:** (a) a source entry whose temporary name (`<name>.flux-partial.<32 hex>`, `copy::temp_path`) exceeds NAME_MAX fails that file with `IO_ERROR` (File name too long) at `create_new`; a single-file target gets `PATH_COMPONENT_INVALID` from `file_names_fit` before anything is made, a tree entry has no such pre-check (`stage_file`); (b) a source regular FILE named `.flux` directly under the root fails `SAFETY_REJECTED` into an absent DEST (the fresh root plans `New` and the gate refuses "the destination is a directory") but `DESTINATION_ERROR` into an existing DEST (`resolve` finds the workspace directory): one cause, two codes, where master spec section 259.3 calls a source `.flux` ordinary content. Either fix changes `dry_temp_name_fits` / `dry_top_level_flux` and their paired tests in step, and amends the cut 11a spec's section 9.
 
 ## Cut 9g open (single-file resume; triaged from the anomalies inbox 2026-10-14)
