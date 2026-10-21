@@ -490,7 +490,7 @@ fn a_store_held_open_by_another_handle_is_copied_without_refusal() {
     if let Some(RunError::Refused { refusal, .. }) = &stop {
         assert_ne!(refusal.code, LockCode::TargetLockBusy, "{refusal:?}");
     }
-    // Windows: redb's writer holds a mandatory `LockFileEx` over the whole file (redb 4.3.0
+    // Windows: redb's writer holds a mandatory `LockFileEx` over the whole file (redb 4.4.0
     // `page_manager.rs` `lock_whole_storage`), so the copy's read fails with ERROR_LOCK_VIOLATION
     // (33): spec 3.4 step 2's read error, the live `failed(RunStep::State)`, exit 1. Elsewhere the
     // lock is advisory and the copy streams.
