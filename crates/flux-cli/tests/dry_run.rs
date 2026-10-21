@@ -215,6 +215,7 @@ fn test_79_dry_resume_and_restart_report_and_change_nothing() {
     let e = stderr(&out);
     assert!(e.contains(&format!("would resume operation {id}")), "{e}");
     assert!(e.contains("dry run: would copy"), "{e}");
+    assert!(e.contains("dry run: 1 partial files present, continuation not previewed"), "{e}");
     assert!(ws.join("manifest").exists() && partial.exists(), "{e}");
     let out = flux()
         .args(["copy", "--dry-run", "--resume", "--json"])

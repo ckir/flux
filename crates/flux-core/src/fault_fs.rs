@@ -2190,6 +2190,18 @@ impl DirHandle for FakeDirHandle {
                 std::io::Error::other("claim store format is not supported"),
             ));
         }
+        // A byte copy keeps its original's format, as a copied redb file keeps its header.
+        if !g.claim_files.contains_key(&child_path)
+            && origin
+                .as_ref()
+                .and_then(|o| g.claim_formats.get(o))
+                .is_some_and(|f| *f != 1 && *f != 2)
+        {
+            return Err(FsError::new(
+                Code::IncompatibleState,
+                std::io::Error::other("claim store format is not supported"),
+            ));
+        }
         if !g.claim_files.contains_key(&child_path) {
             // A byte copy of a store: clone the origin's maps into an independent store under this path.
             let cloned = origin.and_then(|o| {

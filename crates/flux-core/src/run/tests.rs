@@ -8031,6 +8031,32 @@ fn a_dry_run_says_whether_it_saw_a_prior_through_both_entry_points() {
 }
 
 #[test]
+fn a_dry_resume_beside_a_completed_prior_notes_it_and_still_previews_the_resume() {
+    // Spec D6 and ruling P4: the previewed resumable leaves `prior_seen` alone, a completed prior beside it still
+    // sets it and gets its note. Mutant: skip the notes (and `prior_seen`) when `--resume` previews a resumable.
+    let fs = resumable(100, b"o", 101, ClaimStatus::Created);
+    prior(&fs, 6, OpState::Completed);
+    let (fs, base) = with_temp_root(fs);
+    let (r, _) = run_tree_with(&fs, &dry_resume(), &opts());
+    ok(&r);
+    let d = r.dry.as_ref().unwrap();
+    assert!(d.prior_seen, "the completed prior is seen");
+    assert!(
+        matches!(&d.prior, Some(DryPrior::Resume { operation_id, .. }) if *operation_id == id(5)),
+        "{:?}",
+        d.prior
+    );
+    assert!(
+        r.warnings.iter().any(|w| matches!(w, RunWarning::DryRunPriorCompleted { operation_id }
+            if *operation_id == id(6))),
+        "{:?}",
+        r.warnings
+    );
+    only_the_copy_under_the_temp_root(&fs, base);
+    forbidden_for_resume(&fs, base);
+}
+
+#[test]
 fn dry_a_plain_run_with_a_resumable_prior_predicts_the_refusal() {
     let fs = fake();
     prior(&fs, 5, OpState::Transferring);
@@ -8872,6 +8898,27 @@ fn a_dry_resume_of_a_transferring_prior_without_a_store_predicts_state_corrupt()
 }
 
 #[test]
+fn a_dry_resume_of_an_incompatible_store_predicts_incompatible_state() {
+    // The live twin is `an_incompatible_state_db_is_refused`; the copy keeps the original's format. Mutant: drop
+    // `IncompatibleState` from `adopt_on_copy`'s torn arm.
+    let fs = fake();
+    prior3(&fs, 5, OpState::Failed);
+    drop(prior_store(&fs, 5));
+    fs.set_claim_store_format(state_db(5), 3);
+    let (fs, base) = with_temp_root(fs);
+    let (r, _) = run_tree(&fs, &dry_resume());
+    assert_eq!(refused(&r.stop), (LockCode::IncompatibleState, false), "{:?}", r.stop);
+    assert!(
+        r.warnings.iter().any(|w| matches!(w, RunWarning::DryRunStoreTorn)),
+        "{:?}",
+        r.warnings
+    );
+    assert!(r.copy.is_none());
+    only_the_copy_under_the_temp_root(&fs, base);
+    forbidden_for_resume(&fs, base);
+}
+
+#[test]
 fn a_dry_resume_reports_a_partial_as_would_copy_with_its_size() {
     let fs = resumable(100, b"o", 101, ClaimStatus::Created);
     fs.create_dir(Path::new("/p/dest/sub")).unwrap();
@@ -8886,6 +8933,26 @@ fn a_dry_resume_reports_a_partial_as_would_copy_with_its_size() {
     )));
     assert_eq!(r.dry.as_ref().unwrap().partials_present, 1);
     assert!(fs.exists(format!("/p/dest/sub/{}", temp_of("b", 5))));
+    only_the_copy_under_the_temp_root(&fs, base);
+    forbidden_for_resume(&fs, base);
+}
+
+#[test]
+fn a_dry_resume_reports_a_zero_length_partial_as_present() {
+    // Spec 3.4 step 5: a temporary that answers `metadata` is present, whatever its length. Mutant: treat a
+    // zero-length temporary as absent in `dry_partial_len`.
+    let fs = resumable(100, b"o", 101, ClaimStatus::Created);
+    fs.create_dir(Path::new("/p/dest/sub")).unwrap();
+    fs.write_file(format!("/p/dest/sub/{}", temp_of("b", 5)), b"");
+    let (fs, base) = with_temp_root(fs);
+    let (r, got) = run_tree_with(&fs, &dry_resume(), &opts());
+    ok(&r);
+    assert!(planned_records(&got).contains(&(
+        "sub/b".to_string(),
+        PlannedObject::File,
+        PlannedAction::CopyOverPartial { len: 0 }
+    )));
+    assert_eq!(r.dry.as_ref().unwrap().partials_present, 1);
     only_the_copy_under_the_temp_root(&fs, base);
     forbidden_for_resume(&fs, base);
 }
@@ -8932,8 +8999,8 @@ fn a_dry_resume_matches_the_live_resume_on_the_fake() {
     let (l, _) = run_tree_with(&live_fs, &resume(), &strict());
     let (d_out, l_out) = (ok(&d), ok(&l));
     assert_eq!(
-        (d_out.files_resumed, d_out.files_copied, d_out.bytes_resumed),
-        (l_out.files_resumed, l_out.files_copied, l_out.bytes_resumed)
+        (d_out.files_resumed, d_out.files_copied, d_out.bytes_resumed, d_out.bytes_copied),
+        (l_out.files_resumed, l_out.files_copied, l_out.bytes_resumed, l_out.bytes_copied)
     );
     let Some(ResumeNote::Adopted { claims, recovered, .. }) = &l.resumed else {
         panic!("{:?}", l.resumed)
