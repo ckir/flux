@@ -43,8 +43,8 @@
    "stable": false
   },
   "macos/large/cp": {
-   "calibrated": "2026-10-19T09:14:57Z",
-   "cv": 0.1995,
+   "calibrated": "2026-10-21T14:46:59Z",
+   "cv": 0.2244,
    "image": "20261013.0424.1",
    "source": "calibration",
    "stable": false
@@ -57,29 +57,29 @@
    "stable": false
   },
   "macos/mixed/cp": {
-   "calibrated": "2026-10-19T09:14:57Z",
-   "cv": 0.1193,
+   "calibrated": "2026-10-21T14:46:59Z",
+   "cv": 0.0856,
    "image": "20261013.0424.1",
    "source": "calibration",
    "stable": false
   },
   "macos/mixed/rsync": {
-   "calibrated": "2026-10-19T09:14:57Z",
-   "cv": 0.1428,
+   "calibrated": "2026-10-21T14:46:59Z",
+   "cv": 0.2041,
    "image": "20261013.0424.1",
    "source": "calibration",
    "stable": false
   },
   "macos/small/cp": {
-   "calibrated": "2026-10-19T09:14:57Z",
-   "cv": 0.114,
+   "calibrated": "2026-10-21T14:46:59Z",
+   "cv": 0.0985,
    "image": "20261013.0424.1",
    "source": "calibration",
    "stable": false
   },
   "macos/small/rsync": {
-   "calibrated": "2026-10-19T09:14:57Z",
-   "cv": 0.126,
+   "calibrated": "2026-10-21T14:46:59Z",
+   "cv": 0.1121,
    "image": "20261013.0424.1",
    "source": "calibration",
    "stable": false
