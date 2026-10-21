@@ -1,7 +1,7 @@
 //! §240.5: take an uncertain lock over IN PLACE, so the lock path is never empty. Steps 1-5 here; step 6's overwrite
 //! waits until Part 3 has created this operation's state (F5, the design's refinement 8).
 
-use super::error::{LockCode, LockResult, refuse};
+use super::error::{LockCode, LockError, LockResult, refuse};
 use super::held::Held;
 use super::record::{Decoded, LockRecord, RECORD_LEN, Uncertain, decode};
 use super::site::LockSite;
@@ -31,6 +31,16 @@ pub(crate) enum TakeOver<'a, D: DirHandle> {
     Restart,
 }
 
+/// `S240_5_s1`'s refusal: `--break-lock` without strong file identity or OS-native locks. The dry run's preview
+/// refuses with this same value.
+pub(crate) fn takeover_unavailable_refusal() -> LockError {
+    refuse(
+        LockCode::TargetLockUncertain,
+        None,
+        "--break-lock needs strong file identity and a local filesystem with OS-native locks",
+    )
+}
+
 /// `S240_5_s1` to `S240_5_s5`; `S240_5_close` is `lock` dropping on every non-claimed return.
 pub(crate) fn take_over<'a, D: DirHandle>(
     site: &LockSite<'a, D>,
@@ -40,11 +50,7 @@ pub(crate) fn take_over<'a, D: DirHandle>(
     // S240_5_s1: strong identity and OS-native locks, decided from the capability, never by a trial lock.
     if !matches!(site.dir().identity()?, FileIdentity::Strong(_)) || !capability.allows_exclusive()
     {
-        return Err(refuse(
-            LockCode::TargetLockUncertain,
-            None,
-            "--break-lock needs strong file identity and a local filesystem with OS-native locks",
-        ));
+        return Err(takeover_unavailable_refusal());
     }
     // S240_5_s2: open the existing file without creating it; gone or not a regular file, start again.
     let lock = match site.dir().open_lock(site.lock_name()) {

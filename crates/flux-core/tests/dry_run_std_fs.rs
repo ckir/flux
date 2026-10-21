@@ -43,6 +43,7 @@ fn config(dry_run: bool) -> RunConfig {
         descriptor_limit: None,
         resume_verify: run::ResumeVerify::Chunks,
         dry_run,
+        dry_temp_root: None,
     }
 }
 
@@ -155,6 +156,8 @@ fn flux_file_source(src: &Path) {
 }
 
 fn corpus() -> Vec<Case> {
+    // Every push below is Unix-only; Windows builds the corpus as declared.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut v = vec![
         Case {
             name: "fresh dest",
@@ -506,6 +509,20 @@ fn a_dry_run_plans_while_another_handle_holds_the_destinations_lock() {
     let parent = StdFileSystem.destination_root(d.path()).unwrap();
     let lock = parent.create_lock(OsStr::new("dst.flux-lock")).unwrap();
     assert!(lock.try_lock().unwrap());
+    // A live owner's lock carries a valid record (an empty file is a holder inside its first write).
+    let now = flux_core::state::wall_time_ns();
+    let record = flux_core::lock::record::LockRecord {
+        complete_lock_key: "test-lock-key".into(),
+        operation_id: flux_core::ids::new_id(),
+        owner_instance_id: flux_core::ids::new_id(),
+        boot_session_id: "test-boot".into(),
+        target_path_key: "test-target-key".into(),
+        workspace_path: "none".into(),
+        creation_wall_time: now,
+        last_heartbeat_wall_time: now,
+    };
+    lock.write_at_start(&record.encode()).unwrap();
+    lock.sync_all().unwrap();
 
     let (shape, planned, note) =
         run_tree(&src, &dst, &opts(ExistingPolicy::Overwrite, Links::Copy, Safety::Default), true);
@@ -513,8 +530,11 @@ fn a_dry_run_plans_while_another_handle_holds_the_destinations_lock() {
     assert_eq!(shape.result, "Ok", "{shape:?}");
     assert_eq!(shape.counters.1, 2, "files_copied");
     assert!(note.is_some() && !planned.is_empty());
+    let note = note.unwrap();
+    assert!(note.owner_liveness && !note.lock_takeover, "{note:?}");
     assert!(!dst.exists(), "the dry run created DEST");
     assert!(d.path().join("dst.flux-lock").exists(), "the lock file is still there");
+    assert_eq!(std::fs::read(d.path().join("dst.flux-lock")).unwrap(), record.encode());
     let second = parent.open_lock(OsStr::new("dst.flux-lock")).unwrap();
     assert!(!second.try_lock().unwrap(), "the holder still holds the lock");
     drop(lock);
