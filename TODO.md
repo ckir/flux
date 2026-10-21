@@ -336,9 +336,13 @@ are the spec's).
 - [ ] **3. WSL 9p and network filesystems:** whether the backend's (`redb`) file locking works there is unmeasured.
 - [ ] **4. A directory with millions of entries** holds its listing in memory while the walk is inside it (the source
       side already does).
-- [ ] **4a. Under `Durability::Normal` a process kill can lose the current directory's claims** (up to 1000 commits):
+- [x] **4a. Under `Durability::Normal` a process kill can lose the current directory's claims** (up to 1000 commits):
       claims written since the last directory end or the store's 1000-claim cap are lost on a process crash. Documented;
       cut 9's WAL/recovery must reconcile the resulting "unclaimed published entries".
+      (resolved by design and measured 2026-10-21: cut 9a decision 3 and cut 9c amendment A leave the reconciliation to
+      the existing-file policy, with no commit record under Normal; `crates/flux-cli/tests/run.rs`
+      `a_killed_tree_copy_resumes_as_the_same_operation` now pins it on the real binary: the kill leaves 165 files
+      published and 100 claims, and the resume overwrites exactly the 65 unclaimed ones and resumes the 100)
 - [ ] **5. A replacement reads the destination's metadata twice** (the policy decision, then the section 129 gate): one
       extra stat per replaced file, accepted. If an outside process removes the entry between the two reads, the gate
       sees `NotFound`, the claim is still written and the file is published as new but counted as an overwrite (the
