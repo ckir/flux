@@ -1831,12 +1831,14 @@ mod tests {
                 "note: would supersede operation b (state FAILED)"
             ]
         );
+        // The partial is joined to the target's directory, so Windows separates it with `\`.
+        let partial = Path::new("/d").join("x.flux-partial.a");
         assert_eq!(
             dry_discard_lines(Path::new("/d/t"), &restart),
             [
-                "/d/t.flux-state.a: object_type=state action=would_discard",
-                "/d/t.flux-state.b: object_type=state action=would_discard",
-                "/d/x.flux-partial.a: object_type=partial action=would_discard"
+                "/d/t.flux-state.a: object_type=state action=would_discard".to_string(),
+                "/d/t.flux-state.b: object_type=state action=would_discard".to_string(),
+                format!("{}: object_type=partial action=would_discard", partial.display())
             ]
         );
         assert!(dry_discard_lines(Path::new("/d/t"), &DryPrior::StartedNew).is_empty());
