@@ -68,7 +68,12 @@ Anti-goals (a failure even if the tests pass)
   for one source; this cut changes nothing there.
 - A source whose name is `.flux`, `.flux-dir.lock` or `.flux-root.lock` (ASCII case-insensitive, as `reserved_path`
   compares; the last two are the spec §96.1 directory and root lock names, `lock/site.rs:12` and `lock/acquire.rs:53`),
-  or ends in `.flux-lock` (ASCII case-insensitive), is refused before transfer with `CONTROL_PLANE_NAMESPACE_CONFLICT`. `reserved_path`
+  or ends in `.flux-lock` (ASCII case-insensitive), is refused before transfer with `CONTROL_PLANE_NAMESPACE_CONFLICT`.
+  Every name must also pass `check_component` (`flux-fs/src/name.rs`: not empty, not `.` or `..`, no separator, no NUL,
+  no stream separator). That function does not reject the names Windows cannot create (the DOS device names `CON`,
+  `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`, and a trailing dot or space; a panel finding, read at
+  `name.rs:75-99`), so on Windows a name of that kind is refused in group 1 with `PATH_COMPONENT_INVALID`, on the other
+  platforms it is an ordinary name. The plan verifies whether the destination code already refuses them and where. `reserved_path`
   (`tree.rs:982`) alone does not do this: it reserves only `.flux/operations`, `.flux/standalone` and `.flux/atomic`,
   two components deep, so a root named `.flux` would land ON the control directory, and a root `x.flux-lock` would
   collide with root `x`'s prefix lock `DEST/x.flux-lock`.
@@ -100,15 +105,23 @@ Order, all before any transfer:
    fails against another root's lock of this same operation means the names alias on the destination filesystem:
    `DESTINATION_NAMESPACE_COLLISION`, exit 3, and every lock taken is released. A lock held by another operation is the
    existing `TARGET_LOCK_BUSY` / uncertain classification.
-   How "this same operation" is recognised (a finding of the panel, MEASURED): today a lock is created EMPTY and its
-   record is written only after the state exists (`lock/obtain.rs`: "a lock this run holds with no record yet: create
-   the state, then `Held::write_record`"), and `classify` reads an empty lock whose OS lock another handle holds as
-   `Busy(None)` (`lock/classify.rs`, `Decoded::Uncertain(_) if !got`), which `obtain` reports as `TARGET_LOCK_BUSY`, exit 1.
-   So a record cannot be what tells the run that a failed creation hit its own lock. The run keeps the file identity
-   of every prefix lock it holds (`Held::identity`, `lock/held.rs:34`); when a creation fails, it opens the existing
-   lock and compares that identity with its own BEFORE any classification: equal means an alias of this operation
-   (`DESTINATION_NAMESPACE_COLLISION`); unequal goes through `obtain`'s normal classification. A prefix lock's record is
-   written as soon as the lock is held, not after the workspace. A test makes the empty-record window observable (V10).
+   How "this same operation" is recognised (panel findings, round 1 MEASURED, round 2 fix): today a lock is created
+   EMPTY and its record is written only after the state exists (`lock/obtain.rs`: "a lock this run holds with no record
+   yet: create the state, then `Held::write_record`"), and `classify` reads an empty lock whose OS lock another handle
+   holds as `Busy(None)` (`lock/classify.rs`, `Decoded::Uncertain(_) if !got`), which `obtain` reports as
+   `TARGET_LOCK_BUSY`, exit 1. So with today's order a failed creation cannot tell the run it hit its own lock. The fix
+   is the order, not a new comparison: a prefix lock's record is written as soon as the lock is held (its
+   `workspace_path` is `none` under R7, so it needs no workspace to exist first), and the next root's creation starts
+   only after that. A creation that then fails finds a record, `classify` returns `Busy(Some(record))` (the arm
+   `Decoded::Record(record) if !got`), and the run compares `record.operation_id` with its own: equal is exactly spec
+   §96.1's "record names this operation, for a different target spelling", which is
+   `DESTINATION_NAMESPACE_COLLISION`; different is the normal busy or dead classification. This works because the
+   OS-native lock is `flock` on Unix and `LockFileEx` on Windows, never `fcntl` record locks
+   (`flux-platform/src/lock_file.rs:3`): a second handle of the same process does NOT acquire it, so the run cannot
+   read its own live lock as dead and take it over. A comparison of file identities was considered and dropped: a
+   `FileIdentity` is `PartialEq` over `Strong`, `Weak` and `Unavailable` (`flux-fs/src/fs.rs:88-92`), so two
+   `Unavailable` identities (FAT32, exFAT, some SMB and NFS) compare equal and a foreign lock would be reported as an
+   alias. A test makes the window observable (V10).
 Length rule (a finding of the panel): spec §96.1 says that when `<name>.flux-lock` would exceed the directory's
 name-length limit the acquirer takes the directory lock `P/.flux-dir.lock` instead, and that per-name locks and the
 directory lock exclude each other (`lock/acquire.rs:53` already refuses a per-name acquirer when `.flux-dir.lock` is
@@ -227,6 +240,7 @@ actually do is part of V1, not assumed. The plan
   "files_failed": <n> }`, absent from every one-source report (the precedent is `mounts_skipped`, `dry_run` and
   `unprobed`, which are written only when set). So the 18 keys and a one-source report are unchanged. Ruling R8 (mine,
   owner may veto): without it an aborted run is opaque to automation.
+- A report for a command refused before transfer carries no `roots` (nothing ran), as `Report::pre_engine` builds it today.
 - stderr: the existing per-entry lines, one line per finished root (`root <name>: <files> copied, <failed> failed`, my
   call: an aborted run leaves some roots on disk and the operator must see which), then one summary line in today's
   format over the totals.
@@ -274,9 +288,14 @@ ruling in §3.7, the second is moot under B).
 - V8. Crash residue: after a crash the prefix lock files stay. What a later several-source run, a one-source tree run onto
   DEST (spec §97.1(b)) and `flux cleanup DEST` each do with them; whether `cleanup` removes them. Test obligation in §7.
 - V9. The descriptor cost of one held prefix lock on each platform, to set the cap of §3.4.
-- V10. The alias decision of §3.4 on a case-insensitive destination, including the window in which the first prefix lock
-  has no record yet; and that a prefix lock closed early would be read as dead (`classify`: an unheld lock with a
-  record is `Dead`), which is why the locks are held for the whole run.
+- V10. The alias decision of §3.4 on a case-insensitive destination, including the window between a prefix lock being
+  created and its record being written (a root's creation must not start inside it); and that a prefix lock closed
+  early would be read as dead (`classify`: an unheld lock with a record is `Dead`, agy confirmed this from the same
+  lines), which is why the locks are held for the whole run.
+- V11. Whether the source walk skips Flux control files. `walk.rs` has no such skip (a grep found none), so a stale
+  `*.flux-lock` left in a DEST that is later used as a SOURCE may be copied as payload. This is already true of a stale
+  single-file target lock today; this cut adds more possible stale files (L6). The plan states what is copied and
+  decides, with the owner, whether a walk skip is in scope; it is not assumed.
 - V5. The fake (`fault_fs.rs`) can create, alias and release the prefix locks, and has a case-insensitive mode for the
   alias test; otherwise a real-fs test gated by a case-sensitivity probe, run on the macOS and Windows CI jobs.
 - V6. `Shared` can be rebuilt per root without copying state that must be global (the batch, the checkpoint log).
@@ -322,7 +341,8 @@ ruling in §3.7, the second is moot under B).
   `DESTINATION_NAMESPACE_COLLISION` exit 3 (not `TARGET_LOCK_BUSY`), and a mutant that decides by record is red.
 - State format, root kind: a version-5 record round-trips `kind` for a mixed file and folder run; a version-5 root
   without `kind`, and a version-3 or -4 root with it, are rejected.
-- JSON: a several-source report has `roots` with the right statuses after a mid-run abort; a one-source report has none.
+- JSON: a several-source report has `roots` with the right statuses after a mid-run abort; a one-source report has none;
+  a refusal before transfer (the report built by `Report::pre_engine`) has no `roots` key and does not fail.
 - Later-cut compatibility: a one-source `--resume` against a several-source prior refuses (source mismatch);
   `flux cleanup DEST` classifies and removes an aborted several-source workspace; one-source `--restart` supersedes it.
 - Report: JSON keys unchanged, counters are sums; exit codes.
@@ -370,4 +390,15 @@ root's: REJECTED: an unheld lock with a record classifies as `Dead` (`lock/class
 `got`), so a competitor could take it over, and the alias check needs every lock held at once before any transfer
 (spec §18.3, "Before any transfer ... takes a lock named after each root's prefix"). A8 descriptor exhaustion: already
 folded in round 1 (cap, L5). Counter-turn on A7 owed to agy and sent in round 2.
+
+Panel round 2, agy escalation (cited lines read and verified before folding). B1 alias identity compared with `==` is
+true for two `Unavailable` identities: FOLDED, with a different fix from the one agy proposed (a hybrid of identity and
+record): the identity comparison is dropped and the record, written at once, decides (§3.4); the claim is confirmed at
+`flux-fs/src/fs.rs:88-92`. B2 Windows device names and trailing dots are not rejected by `check_component`: FOLDED
+(§3.2). B3 command-line routing: no new findings; the seat read `main.rs` only, so that is a thin clean result. B4 stale
+prefix locks copied as payload when a DEST becomes a source: FOLDED as V11 (confirmed only in part: `walk.rs` has no skip;
+whether another layer excludes them is the plan's to read). B5 the report built before transfer carries no `roots`:
+FOLDED (§3.8, test). The counter-turn on closing the prefix handles early is closed: agy read `lock/classify.rs` and
+`lock/site.rs` itself and agreed that an unheld lock with a record is classified `Dead`, and that a `none` record is
+`Trusted` and recovered by `recover`. Discarded below the floor: none. Unverified-accepted: none.
 
