@@ -4821,11 +4821,15 @@ mod tests {
         let calls = std::cell::Cell::new(0);
         let guard = failing_after(LINK_GUARD_AT_CREATE, &calls);
         let o = CopyOptions { durability: Durability::Strict, ..opts() };
-        let (r, _, _) = link_run(&fs, &o, false, policy(1), &guard, no_seed);
-        assert_eq!(r.unwrap_err().code(), Code::TargetLockBusy);
+        let (r, out, got) = link_run(&fs, &o, false, policy(1), &guard, no_seed);
+        let error = r.unwrap_err();
+        assert_eq!(error.code(), Code::TargetLockBusy);
         assert_eq!(calls.get(), 3);
         assert_eq!(count(&log(&fs), "claim_discard_prepared("), 0);
         assert_eq!(fs.prepared_count(), 1, "the link's note stays");
+        assert!(got.is_empty(), "a stop, not a per-entry failure: {got:?}");
+        assert_eq!(out.files_copied, 0);
+        assert_eq!(leftovers(&got, Some(&error)), [temp_of("n")], "reported once: {got:?}");
     }
 
     #[test]
