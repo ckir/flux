@@ -205,6 +205,14 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Whether the recovery name of `<name>`'s lock fits: `<name>.flux-lock` plus `.broken.<32-char operation id>` (the
+/// rename `recover` makes) must stay within `NAME_LIMIT`.
+pub fn prefix_lock_fits(name: &OsStr) -> bool {
+    let mut lock_name = name.to_os_string();
+    lock_name.push(LOCK_SUFFIX);
+    name_len(&lock_name) + ".broken.".len() + 32 <= NAME_LIMIT
+}
+
 #[cfg(windows)]
 pub(crate) fn name_len(name: &OsStr) -> usize {
     use std::os::windows::ffi::OsStrExt;
@@ -258,6 +266,24 @@ mod tests {
             refusal(LockSite::directory(&d, OsStr::new(&over))).code,
             LockCode::PathComponentInvalid
         );
+    }
+
+    #[test]
+    fn prefix_lock_fits_is_false_when_the_recovery_name_exceeds_255() {
+        // name + ".flux-lock" (10) + ".broken." + 32-char id (40) <= 255, so 205 units fit and 206 do not.
+        let fits = "x".repeat(NAME_LIMIT - LOCK_SUFFIX.len() - 40);
+        assert_eq!(fits.len(), 205);
+        assert!(prefix_lock_fits(OsStr::new(&fits)));
+        let over = "x".repeat(206);
+        assert!(!prefix_lock_fits(OsStr::new(&over)));
+    }
+
+    #[test]
+    fn broken_name_length_is_lock_name_plus_forty() {
+        let (_fs, d) = fake();
+        let site = LockSite::directory(&d, OsStr::new("dest")).unwrap();
+        let broken = site.broken_name(&crate::ids::new_id());
+        assert_eq!(broken.len(), site.lock_name().len() + 40);
     }
 
     #[test]
