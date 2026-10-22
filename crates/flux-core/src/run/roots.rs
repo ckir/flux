@@ -78,7 +78,6 @@ fn windows_reserved(name: &OsStr) -> bool {
 }
 
 /// Check every name, refuse two sources that take the same name, and return the specs in prefix-key order.
-#[allow(dead_code)] // used by run::session (plan task 7)
 pub(crate) fn plan_roots(specs: Vec<SourceSpec>) -> Result<Vec<SourceSpec>, RunError> {
     let mut keyed: Vec<(Vec<u8>, SourceSpec)> = Vec::with_capacity(specs.len());
     for spec in specs {

@@ -2,17 +2,25 @@
 //! source. Its `create` makes DEST, takes the prefix locks inside it, checks the names the sources take, and only then
 //! makes the workspace, so a refusal at any of those finds no workspace and releases every lock it took.
 
-use super::place::{AdoptedStore, Place, TreePlace, refused_state};
+use super::place::{AdoptedStore, LocatedTree, Place, TreePlace, locate_dest, refused_state};
 use super::prefix::{PrefixId, PrefixIdOwned, PrefixLocks, PrefixRefusal};
+use super::roots::{SourceKind, SourceSpec, plan_roots};
 use super::session::{Fault, Locked, failed, from_lock, lock_io};
-use super::{RunError, RunStep, RunWarning};
-use crate::lock::{LockCode, LockError, LockResult, Refusal};
-use crate::prior::{PriorOp, Scan};
+use super::{Run, RunConfig, RunError, RunStep, RunWarning, TreeAt, checkpoint_policy, drive};
+use crate::copy::{CopyError, CopyStep};
+use crate::lock::{LockCode, LockError, LockResult, LockSite, Refusal, check_capability};
+use crate::prior::{PriorOp, Scan, check_control_plane};
 use crate::state::{
-    Kind, OperationState, Root, RootKind, absolute_lexical, identity_text, native_hex,
+    Kind, OperationState, Root, RootKind, absolute_lexical, identity_text, native_hex, wall_time_ns,
 };
+use crate::tree::{
+    RootDone, RootInput, RootStatus, TreeAbort, TreeFailure, TreeOutcome, containment,
+    copy_roots_at, preflight, prepare_source,
+};
+use crate::walk::MountPolicy;
 use flux_fs::{
-    DestinationRoot, DirHandle, Durability, FileIdentity, FileType, FsError, LockCapability,
+    Code, CopyOptions, DestinationRoot, DirHandle, Durability, FileIdentity, FileType, FsError,
+    LockCapability, OperationId,
 };
 use std::cell::{OnceCell, RefCell};
 use std::ffi::{OsStr, OsString};
@@ -21,7 +29,6 @@ use std::path::{Path, PathBuf};
 
 /// One root of the run: the name it takes under DEST, what it is, where it comes from, and the identity it had when
 /// the run opened it.
-#[allow(dead_code)] // used by run::session (plan task 7)
 pub(crate) struct RootPlan {
     pub name: OsString,
     pub kind: RootKind,
@@ -30,7 +37,6 @@ pub(crate) struct RootPlan {
 }
 
 /// A tree's `TreePlace`, with the prefix locks of its roots.
-#[allow(dead_code)] // used by run::session (plan task 7)
 pub(crate) struct MultiPlace<'p, F: DestinationRoot> {
     pub(crate) tree: TreePlace<'p, F>,
     /// In prefix order.
@@ -72,7 +78,6 @@ fn with_not_removed(mut err: RunError, left: (PathBuf, FsError)) -> RunError {
     err
 }
 
-#[allow(dead_code)] // used by run::session (plan task 7)
 impl<'p, F: DestinationRoot> MultiPlace<'p, F> {
     /// Release the prefix locks, each with `Held::release`; the failures only. A second call is a no-op.
     pub(crate) fn release_prefix_locks(&mut self) -> Vec<(OsString, LockError)> {
@@ -185,7 +190,6 @@ impl<'p, F: DestinationRoot> MultiPlace<'p, F> {
     }
 }
 
-#[allow(dead_code)] // used by run::session (plan task 7)
 impl<F: DestinationRoot> Place<F::Dir> for MultiPlace<'_, F> {
     fn kind(&self) -> Kind {
         self.tree.kind()
@@ -328,6 +332,277 @@ impl<F: DestinationRoot> Place<F::Dir> for MultiPlace<'_, F> {
             "resuming several sources is not supported in this version".to_string(),
         ))
     }
+}
+
+impl<'p, F: DestinationRoot> TreeAt<'p, F> for MultiPlace<'p, F> {
+    fn tree_place(&self) -> &TreePlace<'p, F> {
+        &self.tree
+    }
+
+    fn tree_place_mut(&mut self) -> &mut TreePlace<'p, F> {
+        &mut self.tree
+    }
+}
+
+/// How one root of a several-source run ended, for the report (spec 3.8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootReport {
+    pub name: OsString,
+    pub status: RootStatus,
+    pub files_copied: u64,
+    pub files_failed: u64,
+}
+
+/// A several-source run: the run, as a tree's, and one report per root in prefix order. `roots` is empty when the run
+/// stopped before transfer (a refusal), so nothing was begun.
+#[derive(Debug)]
+pub struct MultiRun {
+    pub run: Run<Result<TreeOutcome, TreeAbort>>,
+    pub roots: Vec<RootReport>,
+}
+
+/// A run that ended before it had a lock: nothing was begun, so no root is reported.
+fn ended_early(run: Run<Result<TreeOutcome, TreeAbort>>) -> MultiRun {
+    MultiRun { run, roots: Vec::new() }
+}
+
+fn aborted(
+    mut run: Run<Result<TreeOutcome, TreeAbort>>,
+    outcome: TreeOutcome,
+    error: CopyError,
+) -> MultiRun {
+    run.copy = Some(Err(TreeAbort { error, outcome }));
+    ended_early(run)
+}
+
+/// What a file root is before the lock: a regular file other than `DEST/<name>`, with its identity (the file half of
+/// B1: `prepare_file` without a destination to open).
+fn prepare_file_root<F: DestinationRoot>(
+    fs: &F,
+    src: &Path,
+    target: &Path,
+) -> Result<FileIdentity, CopyError> {
+    if src == target {
+        return Err(CopyError::at(
+            CopyStep::Resolve,
+            FsError::new(
+                Code::SafetyRejected,
+                std::io::Error::other("source and destination are the same path"),
+            ),
+        ));
+    }
+    let meta = fs.metadata(src).map_err(|e| CopyError::at(CopyStep::Source, e))?;
+    if meta.file_type != FileType::File {
+        return Err(CopyError::at(
+            CopyStep::Source,
+            FsError::new(Code::SpecialFileUnsupported, std::io::Error::other("not a regular file")),
+        ));
+    }
+    Ok(meta.identity)
+}
+
+/// Several sources under the destination's lock (spec 3.3 to 3.8): `specs` is two or more sources, and the run is not
+/// a dry one. `tree_with`'s run, with the roots' prefix locks taken inside DEST before the workspace exists and
+/// released on every path before `finish`.
+pub fn trees<F: DestinationRoot>(
+    fs: &F,
+    specs: Vec<SourceSpec>,
+    dst_root: &Path,
+    opts: &CopyOptions,
+    cfg: &RunConfig,
+    on_report: &mut dyn FnMut(TreeFailure),
+) -> MultiRun {
+    // A one-root manifest would be format 4 with a `kind`, which the validator rejects: the caller routes one source
+    // to `tree` or `file`.
+    debug_assert!(!cfg.dry_run, "a dry run of several sources is not supported");
+    debug_assert!(specs.len() >= 2, "one source is `tree` or `file`");
+    let mut run = Run {
+        copy: None,
+        stop: None,
+        warnings: Vec::new(),
+        resumed: None,
+        beat_gap_max: std::time::Duration::ZERO,
+        file_resume: None,
+        dry: None,
+    };
+    let opts =
+        CopyOptions { operation_id: OperationId::new(cfg.operation_id.as_str()), ..opts.clone() };
+    let mut out = TreeOutcome::default();
+    // Group 1: the names, then the sources (B1), before DEST is touched.
+    let specs = match plan_roots(specs) {
+        Ok(s) => s,
+        Err(e) => {
+            run.stop = Some(e);
+            return ended_early(run);
+        }
+    };
+    let mut plans = Vec::with_capacity(specs.len());
+    let mut inputs: Vec<RootInput<'_, F>> = Vec::with_capacity(specs.len());
+    for spec in &specs {
+        let target = dst_root.join(&spec.name);
+        let (kind, identity) = match spec.kind {
+            SourceKind::Folder => {
+                match prepare_source(fs, &spec.src, &target, MountPolicy::of(&opts)) {
+                    Ok(source) => {
+                        let identity = source.identity;
+                        inputs.push(RootInput::Folder {
+                            name: spec.name.clone(),
+                            src_root: spec.src.clone(),
+                            source,
+                        });
+                        (RootKind::Tree, identity)
+                    }
+                    Err(error) => return aborted(run, out, error),
+                }
+            }
+            SourceKind::File => match prepare_file_root(fs, &spec.src, &target) {
+                Ok(identity) => {
+                    // A bare file name has the empty path as its parent: the working directory.
+                    let src_parent = match spec.src.parent() {
+                        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+                        _ => PathBuf::from("."),
+                    };
+                    inputs.push(RootInput::File { name: spec.name.clone(), src_parent, identity });
+                    (RootKind::File, identity)
+                }
+                Err(error) => return aborted(run, out, error),
+            },
+        };
+        plans.push(RootPlan { name: spec.name.clone(), kind, src: spec.src.clone(), identity });
+    }
+    // DEST once, then the identity pre-flight and the containment check of each folder root, as `locate_tree` runs
+    // them for one tree.
+    let LocatedTree { holder, holder_shown, name, dest } = match locate_dest(fs, dst_root) {
+        Ok(l) => l,
+        Err(error) => return aborted(run, out, error),
+    };
+    let anchor = match &dest {
+        Some(d) => d.identity(),
+        None => holder.identity(),
+    };
+    let anchor = match anchor {
+        Ok(a) => a,
+        Err(e) => return aborted(run, out, CopyError::at(CopyStep::Resolve, e)),
+    };
+    let (anchor_handle, anchor_shown) = match &dest {
+        Some(d) => (d, dst_root),
+        None => (&holder, holder_shown.as_path()),
+    };
+    for plan in plans.iter().filter(|p| p.kind == RootKind::Tree) {
+        let checked =
+            preflight(plan.identity, anchor, opts.safety, &mut out.warnings).and_then(|()| {
+                containment(fs, &plan.src, anchor_handle, anchor_shown, opts.safety, &mut out)
+            });
+        if let Err(error) = checked {
+            return aborted(run, out, error);
+        }
+    }
+    // Step 1: the lock's filesystem (decision 14).
+    let capability = match check_capability(&holder) {
+        Ok(c) => c,
+        Err(e) => {
+            run.stop = Some(from_lock(e, RunStep::Lock, &holder_shown, false));
+            return ended_early(run);
+        }
+    };
+    // Step 2: DEST's control plane, where DEST exists.
+    if let Some(dest) = &dest
+        && let Err(e) = check_control_plane(dest, dst_root)
+    {
+        run.stop = Some(from_lock(e, RunStep::Inspect, dst_root, false));
+        return ended_early(run);
+    }
+    let site = match &name {
+        Some(name) => LockSite::directory(&holder, name),
+        None => Ok(LockSite::root(&holder)),
+    };
+    let site = match site {
+        Ok(s) => s,
+        Err(e) => {
+            run.stop = Some(from_lock(e, RunStep::Lock, &holder_shown, false));
+            return ended_early(run);
+        }
+    };
+    // Owned by this function, so it outlives the place that opens the prefix locks' directory into it.
+    let lock_dir = OnceCell::new();
+    let first = (specs[0].src.clone(), plans[0].identity);
+    let mut place = MultiPlace {
+        tree: TreePlace {
+            fs,
+            holder: &holder,
+            holder_shown,
+            name,
+            dest,
+            dest_shown: dst_root.to_path_buf(),
+            created_dest: false,
+            operations: None,
+            claims: None,
+            durability: opts.durability,
+            // Read only by `TreePlace::roots`, which `MultiPlace` overrides.
+            src_root: first.0.clone(),
+            src_identity: first.1,
+        },
+        roots: plans,
+        lock_dir: &lock_dir,
+        capability,
+        prefix_id: PrefixIdOwned {
+            operation_id: cfg.operation_id.clone(),
+            owner_instance_id: cfg.owner_instance_id.clone(),
+            boot_session_id: cfg.boot_session_id.clone(),
+            now: wall_time_ns(),
+        },
+        prefix: RefCell::new(None),
+    };
+    let mut done: Vec<RootDone> = Vec::new();
+    let run = drive(
+        fs,
+        run,
+        &mut place,
+        &site,
+        capability,
+        cfg,
+        &opts,
+        checkpoint_policy(cfg, opts.durability),
+        &first.0,
+        first.1,
+        out,
+        on_report,
+        |cx, place, out, report| {
+            let dest = place.tree.dest.as_ref().expect("step 5 made DEST");
+            let (roots, walked) =
+                copy_roots_at(cx, dest, place.tree.created_dest, inputs, out, report);
+            done = roots;
+            walked
+        },
+        // Every exit releases the prefix locks: a `Held` has no `Drop`.
+        |place, warnings| {
+            let failed = place.release_prefix_locks();
+            place.warn_release(failed, warnings);
+        },
+    );
+    let roots = if done.is_empty() && run.copy.is_some() {
+        // The copy ended before any root was begun (the checkpoint log could not be opened): every root is unstarted.
+        place
+            .roots
+            .iter()
+            .map(|r| RootReport {
+                name: r.name.clone(),
+                status: RootStatus::NotStarted,
+                files_copied: 0,
+                files_failed: 0,
+            })
+            .collect()
+    } else {
+        done.into_iter()
+            .map(|d| RootReport {
+                name: d.name,
+                status: d.status,
+                files_copied: d.files_copied,
+                files_failed: d.files_failed,
+            })
+            .collect()
+    };
+    MultiRun { run, roots }
 }
 
 #[cfg(test)]
@@ -647,5 +922,718 @@ mod tests {
             }
             other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
         }
+    }
+}
+
+/// `run::trees` on the fake filesystem. `/src/{a,b,c}` are folders, `/src/f` is a file; `/p` exists and `/p/dest` does
+/// not unless a test makes it.
+#[cfg(test)]
+mod trees_tests {
+    use super::*;
+    use crate::fault_fs::FaultFs;
+    use crate::run::ResumeVerify;
+    use crate::state::{OpState, decode as decode_state, from_native_hex};
+    use flux_fs::{ExistingPolicy, FileSystem, Links, ObjectId, Preserve, Publish, Safety};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, SystemTime};
+
+    const ID: &str = "11111111111111111111111111111111";
+    const LOCK: &str = "/p/dest.flux-lock";
+    const THEIRS: &[u8] = b"another run's bytes";
+
+    fn cfg() -> RunConfig {
+        RunConfig {
+            restart: false,
+            break_lock: false,
+            operation_id: ID.to_string(),
+            owner_instance_id: format!("{:032x}", 0xee),
+            boot_session_id: "test-boot".to_string(),
+            before_mutation: None,
+            heartbeat_interval: Duration::from_secs(3600),
+            resume: false,
+            descriptor_limit: None,
+            resume_verify: ResumeVerify::Chunks,
+            dry_run: false,
+            dry_temp_root: None,
+        }
+    }
+
+    fn opts() -> CopyOptions {
+        CopyOptions {
+            preserve_times: Preserve::Default,
+            preserve_permissions: Preserve::Default,
+            durability: Durability::Normal,
+            publish: Publish::Replace,
+            safety: Safety::Default,
+            operation_id: OperationId::new("replaced by the run"),
+            existing: ExistingPolicy::Overwrite,
+            links: Links::Copy,
+            cross_filesystems: false,
+        }
+    }
+
+    fn fake() -> FaultFs {
+        let fs = FaultFs::new();
+        for d in ["/src", "/src/a", "/src/a/sub", "/src/b", "/src/c", "/p"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        for (path, bytes) in [
+            ("/src/a/x", &b"ax"[..]),
+            ("/src/a/sub/y", b"ay"),
+            ("/src/b/k", b"bk"),
+            ("/src/c/z", b"cz"),
+            ("/src/f", b"F"),
+        ] {
+            fs.write_file(path, bytes);
+        }
+        fs
+    }
+
+    fn spec(name: &str) -> SourceSpec {
+        let kind = if name == "f" { SourceKind::File } else { SourceKind::Folder };
+        SourceSpec { src: Path::new("/src").join(name), name: OsString::from(name), kind }
+    }
+
+    fn go_with(
+        fs: &FaultFs,
+        specs: Vec<SourceSpec>,
+        o: &CopyOptions,
+        c: &RunConfig,
+    ) -> (MultiRun, Vec<TreeFailure>) {
+        let mut got = Vec::new();
+        let r = trees(fs, specs, Path::new("/p/dest"), o, c, &mut |f| got.push(f));
+        (r, got)
+    }
+
+    fn go(fs: &FaultFs, names: &[&str]) -> (MultiRun, Vec<TreeFailure>) {
+        go_with(fs, names.iter().map(|n| spec(n)).collect(), &opts(), &cfg())
+    }
+
+    fn calls(fs: &FaultFs) -> Vec<String> {
+        fs.calls().iter().map(|c| c.replace('\\', "/")).collect()
+    }
+
+    /// The 1-based count, among the calls named `op`, of the first one that mentions `needle`: the `n` for `fail_nth`
+    /// and `on_nth`, read from a reference run on an identical fixture (the fake is deterministic).
+    fn nth_of(fs: &FaultFs, op: &str, needle: &str) -> u32 {
+        let head = format!("{op}(");
+        let mut n = 0;
+        for c in calls(fs) {
+            if c.starts_with(&head) {
+                n += 1;
+                if c.contains(needle) {
+                    return n;
+                }
+            }
+        }
+        panic!("no {op} mentioning {needle} in {:?}", calls(fs));
+    }
+
+    /// The reference run's `nth_of`, for a fixture `build` makes.
+    fn reference(build: impl Fn() -> FaultFs, names: &[&str], op: &str, needle: &str) -> u32 {
+        let fs = build();
+        let (r, _) = go(&fs, names);
+        assert!(r.run.stop.is_none(), "{:?}", r.run.stop);
+        nth_of(&fs, op, needle)
+    }
+
+    fn lose_lock(fs: &FaultFs, op: &str, nth: u32) {
+        fs.on_nth(op, nth, |fs| fs.write_file(LOCK, THEIRS));
+    }
+
+    type Seen = Arc<Mutex<Option<OperationState>>>;
+
+    /// The manifest as it is on disk when the `nth` call named `op` is made.
+    fn watch_manifest(fs: &FaultFs, op: &str, nth: u32) -> Seen {
+        let seen: Seen = Arc::default();
+        let keep = Arc::clone(&seen);
+        fs.on_nth(op, nth, move |fs| {
+            let bytes = fs
+                .read_file(format!("/p/dest/.flux/operations/{ID}/manifest"))
+                .expect("the manifest exists");
+            *keep.lock().unwrap() = Some(decode_state(&bytes).unwrap());
+        });
+        seen
+    }
+
+    fn manifest(fs: &FaultFs) -> OperationState {
+        let bytes = fs
+            .read_file(format!("/p/dest/.flux/operations/{ID}/manifest"))
+            .expect("the workspace is kept");
+        decode_state(&bytes).unwrap()
+    }
+
+    fn copy_of(r: &MultiRun) -> &Result<TreeOutcome, TreeAbort> {
+        r.run.copy.as_ref().expect("the copy ran")
+    }
+
+    fn ok(r: &MultiRun) -> &TreeOutcome {
+        assert!(r.run.stop.is_none(), "{:?}", r.run.stop);
+        match copy_of(r) {
+            Ok(o) => o,
+            Err(a) => panic!("the copy aborted: {a:?}"),
+        }
+    }
+
+    fn statuses(r: &MultiRun) -> Vec<RootStatus> {
+        r.roots.iter().map(|x| x.status).collect()
+    }
+
+    fn names(r: &MultiRun) -> Vec<OsString> {
+        r.roots.iter().map(|x| x.name.clone()).collect()
+    }
+
+    fn os(names: &[&str]) -> Vec<OsString> {
+        names.iter().map(OsString::from).collect()
+    }
+
+    fn lock_files(fs: &FaultFs) -> Vec<String> {
+        let mut found: Vec<String> = ["a", "b", "c", "f", "sub"]
+            .iter()
+            .map(|n| format!("/p/dest/{n}.flux-lock"))
+            .chain(std::iter::once(LOCK.to_string()))
+            .filter(|p| fs.exists(p))
+            .collect();
+        found.sort();
+        found
+    }
+
+    fn prefix_lock_files(fs: &FaultFs) -> Vec<String> {
+        lock_files(fs).into_iter().filter(|p| p != LOCK).collect()
+    }
+
+    fn only_code(got: &[TreeFailure]) -> Code {
+        assert_eq!(got.len(), 1, "{got:?}");
+        match &got[0].cause {
+            crate::tree::TreeFailureCause::Copy(e) => e.code(),
+            crate::tree::TreeFailureCause::CreateDir(e) => e.code,
+            other => panic!("expected a copy or directory failure, got {other:?}"),
+        }
+    }
+
+    fn secs(s: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(s)
+    }
+
+    fn strong(fs: &FaultFs, path: &str) -> bool {
+        matches!(fs.metadata(Path::new(path)).unwrap().identity, FileIdentity::Strong(_))
+    }
+
+    #[test]
+    fn two_folders_and_a_file_land_at_dest_name() {
+        let fs = fake();
+
+        let (r, got) = go(&fs, &["a", "b", "f"]);
+
+        let out = ok(&r);
+        assert!(got.is_empty() && r.run.warnings.is_empty(), "{got:?} {:?}", r.run.warnings);
+        for (path, bytes) in [("a/x", "ax"), ("a/sub/y", "ay"), ("b/k", "bk"), ("f", "F")] {
+            assert_eq!(
+                fs.read_file(Path::new("/p/dest").join(path)).as_deref(),
+                Some(bytes.as_bytes()),
+                "{path}"
+            );
+        }
+        // DEST, `DEST/a`, `DEST/b`, and `DEST/a/sub` (the walk's).
+        assert_eq!(out.directories_created, 4);
+        assert_eq!((out.files_total, out.files_copied), (4, 4));
+        assert_eq!(statuses(&r), [RootStatus::Completed; 3]);
+        assert_eq!(names(&r), os(&["a", "b", "f"]));
+        assert!(!fs.exists("/p/dest/.flux"), "the workspace is gone");
+        assert!(lock_files(&fs).is_empty(), "{:?}", lock_files(&fs));
+    }
+
+    /// The indices of the calls that touch `DEST/<name>` or below, not the prefix lock `DEST/<name>.flux-lock`.
+    fn touches(c: &[String], name: &str) -> Vec<usize> {
+        let dir = format!("create_dir(/p/dest/{name})");
+        let below = format!("/p/dest/{name}/");
+        c.iter()
+            .enumerate()
+            .filter(|(_, x)| **x == dir || x.contains(&below))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    #[test]
+    fn roots_are_copied_in_prefix_order_whatever_the_argument_order() {
+        for given in [["a", "b", "c"], ["c", "b", "a"], ["b", "c", "a"]] {
+            let fs = fake();
+
+            let (r, _) = go(&fs, &given);
+
+            ok(&r);
+            let c = calls(&fs);
+            let (a, b, z) = (touches(&c, "a"), touches(&c, "b"), touches(&c, "c"));
+            assert!(
+                a.last() < b.first() && b.last() < z.first(),
+                "a, then b, then c, given {given:?}: {c:?}"
+            );
+            assert_eq!(names(&r), os(&["a", "b", "c"]), "given {given:?}");
+        }
+    }
+
+    /// `/src/f` holding `NEW` modified at second 20, `/p/dest` made, and `DEST/f` holding `OLD` modified at `dest`
+    /// when it is `Some`; and the same for the single-file command, which targets `/p/out/f`. Returns the multi run
+    /// and the single one.
+    fn file_case(
+        policy: ExistingPolicy,
+        dest: Option<u64>,
+    ) -> (MultiRun, FaultFs, Run<Result<flux_fs::Outcome, CopyError>>, FaultFs) {
+        let build = |dir: &str| {
+            let fs = fake();
+            fs.write_file("/src/f", b"NEW");
+            fs.set_modified("/src/f", secs(20));
+            fs.create_dir(Path::new(dir)).unwrap();
+            if let Some(t) = dest {
+                let target = format!("{dir}/f");
+                fs.write_file(&target, b"OLD");
+                fs.set_modified(&target, secs(t));
+                assert!(strong(&fs, &target) && strong(&fs, "/src/f"));
+            }
+            fs
+        };
+        let o = CopyOptions { existing: policy, ..opts() };
+        let multi = build("/p/dest");
+        let (r, got) = go_with(&multi, vec![spec("b"), spec("f")], &o, &cfg());
+        assert!(got.is_empty(), "{got:?}");
+        let single = build("/p/out");
+        let one = crate::run::file(&single, Path::new("/src/f"), Path::new("/p/out/f"), &o, &cfg());
+        (r, multi, one, single)
+    }
+
+    #[test]
+    fn an_existing_name_follows_the_existing_policy_for_a_file_root() {
+        for policy in
+            [ExistingPolicy::Overwrite, ExistingPolicy::Update, ExistingPolicy::SkipExisting]
+        {
+            for dest in [None, Some(10), Some(30)] {
+                let (r, multi, one, single) = file_case(policy, dest);
+                let label = format!("{policy:?} with a destination modified at {dest:?}");
+                let out = ok(&r);
+                assert!(one.stop.is_none(), "{label}: {:?}", one.stop);
+                let Some(Ok(single_out)) = &one.copy else { panic!("{label}: {:?}", one.copy) };
+
+                // The decision the policy makes: a skip keeps what is there.
+                let skipped = match (policy, dest) {
+                    (_, None) | (ExistingPolicy::Overwrite, _) => false,
+                    (ExistingPolicy::SkipExisting, Some(_)) => true,
+                    (ExistingPolicy::Update, Some(t)) => t >= 20,
+                };
+                let bytes: &[u8] = if skipped { b"OLD" } else { b"NEW" };
+                assert_eq!(multi.read_file("/p/dest/f").as_deref(), Some(bytes), "{label}");
+                assert_eq!(single.read_file("/p/out/f").as_deref(), Some(bytes), "{label}");
+                assert_eq!(single_out.skipped, skipped, "{label}");
+                assert_eq!(out.files_skipped, u64::from(skipped), "{label}");
+                // The folder root `b` adds one file of two bytes.
+                assert_eq!(out.files_copied, u64::from(!skipped) + 1, "{label}");
+                assert_eq!(out.bytes_copied, single_out.bytes_copied + 2, "{label}");
+                assert_eq!(out.files_overwritten, u64::from(!skipped && dest.is_some()), "{label}");
+                assert_eq!(statuses(&r), [RootStatus::Completed; 2], "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_weak_destination_identity_makes_a_file_root_a_collision_like_a_tree_file() {
+        // Spec 3.6, the first accepted difference. The spec says a destination whose identity is not Strong makes every
+        // existing file a collision in a tree. At this commit it does not (measured below: a tree file over a Weak or
+        // Unavailable destination is replaced and counted degraded under the default safety, and refused SAFETY_REJECTED
+        // under strict), so what is pinned is the rule the spec chose, "a file root follows the TREE rule": a file root
+        // and the same file inside a one-source tree end with the same bytes, the same degraded accounting and the same
+        // failure, whatever the rule is.
+        for weak in [
+            FileIdentity::Weak(ObjectId { volume: 5, index: 9_000_100 }),
+            FileIdentity::Unavailable,
+        ] {
+            for safety in [Safety::Default, Safety::Strict] {
+                let o = CopyOptions { safety, ..opts() };
+                let label = format!("{weak:?} under {safety:?}");
+                let build = |dir: &str| {
+                    let fs = fake();
+                    fs.write_file("/src/f", b"NEW");
+                    fs.create_dir(Path::new("/src/t")).unwrap();
+                    fs.write_file("/src/t/f", b"NEW");
+                    fs.create_dir(Path::new(dir)).unwrap();
+                    fs.write_file(format!("{dir}/f"), b"OLD");
+                    fs.set_identity(format!("{dir}/f"), weak);
+                    fs
+                };
+                let multi = build("/p/dest");
+                let (r, got) = go_with(&multi, vec![spec("b"), spec("f")], &o, &cfg());
+                let tree = build("/p/out");
+                let mut tree_got = Vec::new();
+                let t = crate::run::tree(
+                    &tree,
+                    Path::new("/src/t"),
+                    Path::new("/p/out"),
+                    &o,
+                    &cfg(),
+                    &mut |f| tree_got.push(f),
+                );
+
+                assert!(r.run.stop.is_none() && t.stop.is_none(), "{label}");
+                let Some(Ok(multi_out)) = &r.run.copy else { panic!("{label}: {:?}", r.run.copy) };
+                let Some(Ok(tree_out)) = &t.copy else { panic!("{label}: {:?}", t.copy) };
+                assert_eq!(
+                    multi.read_file("/p/dest/f"),
+                    tree.read_file("/p/out/f"),
+                    "{label}: the same bytes"
+                );
+                assert_eq!(multi_out.files_degraded, tree_out.files_degraded, "{label}");
+                assert_eq!(multi_out.files_overwritten, tree_out.files_overwritten, "{label}");
+                assert_eq!(multi_out.warnings, tree_out.warnings, "{label}");
+                assert_eq!(got.len(), tree_got.len(), "{label}: {got:?} {tree_got:?}");
+                if safety == Safety::Strict {
+                    assert_eq!(only_code(&got), Code::SafetyRejected, "{label}");
+                    assert_eq!(only_code(&got), only_code(&tree_got), "{label}");
+                    assert_eq!(statuses(&r), [RootStatus::Completed, RootStatus::Failed]);
+                    assert_eq!(multi.read_file("/p/dest/f").as_deref(), Some(&b"OLD"[..]));
+                } else {
+                    assert_eq!(multi_out.files_degraded, 1, "{label}");
+                    assert_eq!(multi.read_file("/p/dest/f").as_deref(), Some(&b"NEW"[..]));
+                    assert_eq!(statuses(&r), [RootStatus::Completed; 2], "{label}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_skip_never_reaches_the_identity_gate_for_a_file_root() {
+        // Spec 3.6, the second accepted difference: `--skip-existing` skips before the identity gate in a tree, and
+        // after it in `plan_file`. A source whose identity is Weak is refused by the gate under `--safety strict`
+        // (the destination exists and the pair cannot be compared with confidence); the tree skips.
+        let weak = FileIdentity::Weak(ObjectId { volume: 5, index: 9_000_101 });
+        let o = CopyOptions {
+            existing: ExistingPolicy::SkipExisting,
+            safety: Safety::Strict,
+            ..opts()
+        };
+        let build = |dir: &str| {
+            let fs = fake();
+            fs.create_dir(Path::new(dir)).unwrap();
+            fs.write_file(format!("{dir}/f"), b"OLD");
+            fs.set_identity("/src/f", weak);
+            assert!(strong(&fs, &format!("{dir}/f")));
+            fs
+        };
+        let multi = build("/p/dest");
+        let (r, got) = go_with(&multi, vec![spec("b"), spec("f")], &o, &cfg());
+        let single = build("/p/out");
+        let one = crate::run::file(&single, Path::new("/src/f"), Path::new("/p/out/f"), &o, &cfg());
+
+        let out = ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!((out.files_skipped, out.files_copied), (1, 1), "f skipped, b/k copied");
+        assert_eq!(multi.read_file("/p/dest/f").as_deref(), Some(&b"OLD"[..]));
+        assert_eq!(statuses(&r), [RootStatus::Completed; 2]);
+        // `file` reaches the gate first and refuses.
+        match &one.copy {
+            Some(Err(e)) => assert_eq!(e.code(), Code::SafetyRejected, "{e:?}"),
+            other => panic!("expected the gate's refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failing_file_in_root_one_does_not_stop_root_two() {
+        let n = reference(fake, &["a", "b"], "create_new", "/p/dest/a/x.flux-partial");
+        let fs = fake();
+        fs.fail_nth("create_new", n, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+
+        let (r, got) = go(&fs, &["a", "b"]);
+
+        let out = ok(&r);
+        assert_eq!(statuses(&r), [RootStatus::Failed, RootStatus::Completed]);
+        let per_root: Vec<_> = r.roots.iter().map(|x| (x.files_copied, x.files_failed)).collect();
+        assert_eq!(per_root, [(1, 1), (1, 0)]);
+        assert_eq!(out.failures.copy, 1);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].path, Path::new("a/x"), "reported under its root's name");
+        assert_eq!(fs.read_file("/p/dest/b/k").as_deref(), Some(&b"bk"[..]));
+    }
+
+    #[test]
+    fn a_lost_lock_between_roots_aborts_and_names_the_rest() {
+        // The lock is lost at the last claim of root `a` (the second): the next thing the run does is root `b`'s
+        // guard, before `DEST/b` is made.
+        let n = reference(fake, &["a", "b", "c"], "claim_insert", "(x)");
+        let fs = fake();
+        lose_lock(&fs, "claim_insert", n);
+
+        let (r, _) = go(&fs, &["a", "b", "c"]);
+
+        assert!(r.run.stop.is_none(), "the copy's abort is the report: {:?}", r.run.stop);
+        let Some(Err(a)) = &r.run.copy else { panic!("the copy aborted: {:?}", r.run.copy) };
+        assert_eq!(a.error.code(), Code::TargetLockBusy);
+        // The root the abort struck is `Failed` (the driver's rule, tree.rs `RootStatus::Failed`), though nothing of it
+        // was made; the roots after it were never begun.
+        assert_eq!(
+            statuses(&r),
+            [RootStatus::Completed, RootStatus::Failed, RootStatus::NotStarted]
+        );
+        assert_eq!(names(&r), os(&["a", "b", "c"]));
+        assert_eq!((r.roots[1].files_copied, r.roots[1].files_failed), (0, 0));
+        assert_eq!((r.roots[2].files_copied, r.roots[2].files_failed), (0, 0));
+        assert!(!fs.exists("/p/dest/b") && !fs.exists("/p/dest/c"), "{:?}", calls(&fs));
+        assert!(fs.exists("/p/dest/a/x") && fs.exists("/p/dest/a/sub/y"));
+        assert_eq!(manifest(&fs).state, OpState::Transferring, "the workspace is kept as it is");
+        assert_eq!(fs.read_file(LOCK).as_deref(), Some(THEIRS), "the lock is never unlinked");
+        assert!(prefix_lock_files(&fs).is_empty(), "{:?}", prefix_lock_files(&fs));
+    }
+
+    #[test]
+    fn prefix_lock_files_are_gone_after_success_failure_and_refusal() {
+        // Success.
+        let fs = fake();
+        let (r, _) = go(&fs, &["a", "b", "c"]);
+        ok(&r);
+        assert!(lock_files(&fs).is_empty(), "success: {:?}", lock_files(&fs));
+
+        // Failure: root `b` cannot be created, so the run ends FAILED and keeps its workspace (no `remove`).
+        let n = reference(fake, &["a", "b", "c"], "create_dir", "create_dir(/p/dest/b)");
+        let fs = fake();
+        fs.fail_nth("create_dir", n, Code::IoError, std::io::ErrorKind::Other);
+        let (r, _) = go(&fs, &["a", "b", "c"]);
+        assert!(r.run.stop.is_none(), "{:?}", r.run.stop);
+        assert!(matches!(&r.run.copy, Some(Err(a)) if a.error.code() == Code::IoError));
+        assert_eq!(
+            statuses(&r),
+            [RootStatus::Completed, RootStatus::Failed, RootStatus::NotStarted]
+        );
+        assert_eq!(manifest(&fs).state, OpState::Failed);
+        assert_eq!(prefix_lock_files(&fs), Vec::<String>::new(), "failure");
+        assert!(!fs.exists(LOCK), "the operation lock is released as well");
+
+        // Refusal: a file where the folder root `b` lands, found with every prefix lock held.
+        let fs = fake();
+        fs.create_dir(Path::new("/p/dest")).unwrap();
+        fs.write_file("/p/dest/b", b"in the way");
+        let (r, _) = go(&fs, &["a", "b", "c"]);
+        match &r.run.stop {
+            Some(RunError::Refused { refusal, changed: false, .. }) => {
+                assert_eq!(refusal.code, LockCode::DestinationNamespaceCollision);
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(r.run.copy.is_none() && r.roots.is_empty());
+        assert!(lock_files(&fs).is_empty(), "refusal: {:?}", lock_files(&fs));
+        assert!(!fs.exists("/p/dest/.flux"), "no workspace was made");
+    }
+
+    #[test]
+    fn a_held_prefix_lock_on_the_last_root_refuses_and_nothing_is_copied() {
+        let fs = fake();
+        fs.create_dir(Path::new("/p/dest")).unwrap();
+        // Another operation holds the LAST root's lock in key order.
+        let dest = fs.destination_root(Path::new("/p/dest")).unwrap();
+        let other = PrefixIdOwned {
+            operation_id: "55555555555555555555555555555555".to_string(),
+            owner_instance_id: "other".to_string(),
+            boot_session_id: "test-boot".to_string(),
+            now: 5,
+        };
+        let (_held, _) =
+            PrefixLocks::acquire(&dest, LockCapability::LocalStrong, &os(&["c"]), &other.as_ref())
+                .unwrap();
+        let mark = fs.calls().len();
+
+        let (r, _) = go(&fs, &["c", "a", "b"]);
+
+        match &r.run.stop {
+            Some(RunError::Refused { refusal, changed: false, .. }) => {
+                assert_eq!(refusal.code, LockCode::TargetLockBusy);
+            }
+            other => panic!("expected TARGET_LOCK_BUSY with nothing changed, got {other:?}"),
+        }
+        assert!(r.run.copy.is_none() && r.roots.is_empty());
+        let c = calls(&fs)[mark..].to_vec();
+        for name in ["a", "b", "c"] {
+            assert!(touches(&c, name).is_empty(), "nothing is written into DEST/{name}: {c:?}");
+        }
+        assert!(
+            !c.iter().any(|x| x.starts_with("create_dir(/p/dest/.flux")
+                || x.starts_with("create_claim_store(")),
+            "no workspace: {c:?}"
+        );
+        assert!(fs.exists("/p/dest/c.flux-lock"), "their lock is untouched");
+        assert!(!fs.exists("/p/dest/a.flux-lock") && !fs.exists("/p/dest/b.flux-lock"));
+        assert!(!fs.exists(LOCK), "the operation lock is released");
+        assert!(fs.exists("/p/dest"), "a DEST that was there stays");
+    }
+
+    #[test]
+    fn a_failure_opening_the_operation_after_the_prefix_locks_releases_them() {
+        // The prefix locks are taken by `create`; the operation lock's own record is written after it. When that write
+        // fails the opening fails with the prefix locks still held, and nothing else would release them.
+        let fs = fake();
+        // The records written at the start of a lock: three prefix locks, then the operation lock's.
+        fs.fail_nth("write_at_start", 4, Code::IoError, std::io::ErrorKind::Other);
+
+        let (r, _) = go(&fs, &["a", "b", "c"]);
+
+        assert!(
+            matches!(r.run.stop, Some(RunError::Failed { step: RunStep::Record, .. })),
+            "{:?}",
+            r.run.stop
+        );
+        assert!(r.run.copy.is_none() && r.roots.is_empty());
+        assert!(prefix_lock_files(&fs).is_empty(), "{:?}", prefix_lock_files(&fs));
+        assert!(!fs.exists("/p/dest/a"), "nothing was copied");
+    }
+
+    #[test]
+    fn counters_are_sums_over_roots_and_a_file_root_counts_as_one_file() {
+        let n = reference(fake, &["a", "f"], "create_new", "/p/dest/a/x.flux-partial");
+        let fs = fake();
+        fs.fail_nth("create_new", n, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+
+        let (r, got) = go(&fs, &["a", "f"]);
+
+        let out = ok(&r);
+        assert_eq!(statuses(&r), [RootStatus::Failed, RootStatus::Completed]);
+        // `a`: x fails, sub/y copies (2 bytes); `f`: one file of one byte.
+        assert_eq!(out.files_total, 3);
+        assert_eq!(out.files_copied, 2);
+        assert_eq!(out.bytes_copied, 3);
+        // DEST, `DEST/a` and `DEST/a/sub`.
+        assert_eq!(out.directories_created, 3);
+        assert_eq!((out.failures.copy, out.failures.total()), (1, 1));
+        assert_eq!(got.len(), 1, "{got:?}");
+        let copied: u64 = r.roots.iter().map(|x| x.files_copied).sum();
+        let failed: u64 = r.roots.iter().map(|x| x.files_failed).sum();
+        assert_eq!((copied, failed), (out.files_copied, out.failures.copy));
+        assert_eq!(copied + failed, out.files_total, "every file is one or the other");
+        assert_eq!(r.roots[1].files_copied, 1, "a file root counts as one file");
+    }
+
+    #[test]
+    fn nested_roots_copy_twice() {
+        let fs = fake();
+        let nested = SourceSpec {
+            src: PathBuf::from("/src/a/sub"),
+            name: OsString::from("sub"),
+            kind: SourceKind::Folder,
+        };
+        // After the first file is published the workspace and its manifest are there.
+        let seen = watch_manifest(&fs, "claim_insert", 1);
+
+        let (r, got) = go_with(&fs, vec![spec("a"), nested], &opts(), &cfg());
+
+        let out = ok(&r);
+        assert!(got.is_empty(), "nothing is refused: {got:?}");
+        assert_eq!(fs.read_file("/p/dest/a/sub/y").as_deref(), Some(&b"ay"[..]));
+        assert_eq!(fs.read_file("/p/dest/sub/y").as_deref(), Some(&b"ay"[..]));
+        assert_eq!(fs.read_file("/p/dest/a/x").as_deref(), Some(&b"ax"[..]));
+        assert_eq!(out.files_copied, 3, "y is copied twice");
+        assert_eq!(names(&r), os(&["a", "sub"]));
+        assert_eq!(statuses(&r), [RootStatus::Completed; 2]);
+        let state = seen.lock().unwrap().take().expect("the manifest was read in flight");
+        let config = state.config.expect("a version-5 record");
+        let prefixes: Vec<_> =
+            config.roots.iter().map(|r| from_native_hex(&r.destination_prefix).unwrap()).collect();
+        assert_eq!(
+            prefixes,
+            [PathBuf::from("a"), PathBuf::from("sub")],
+            "two roots in prefix order"
+        );
+    }
+
+    #[test]
+    fn source_containing_dot_flux_operations_is_refused_as_for_one_source() {
+        // Spec 3.6: `reserved_path` runs on the walk-relative path, so a source holding `.flux/operations/...` has that
+        // entry refused exactly as a one-source run refuses it.
+        let build = || {
+            let fs = fake();
+            for d in ["/src/a/.flux", "/src/a/.flux/operations"] {
+                fs.create_dir(Path::new(d)).unwrap();
+            }
+            fs.write_file("/src/a/.flux/operations/foo", b"mine");
+            fs
+        };
+        let single = build();
+        let mut one = Vec::new();
+        let s = crate::run::tree(
+            &single,
+            Path::new("/src/a"),
+            Path::new("/p/dest"),
+            &opts(),
+            &cfg(),
+            &mut |f| one.push(f),
+        );
+        assert!(s.stop.is_none(), "{:?}", s.stop);
+        let single_code = only_code(&one);
+        assert_eq!(single_code, Code::ControlPlaneNamespaceConflict);
+
+        let fs = build();
+        let (r, got) = go(&fs, &["a", "b"]);
+
+        ok(&r);
+        assert_eq!(only_code(&got), single_code);
+        assert_eq!(
+            got[0].path,
+            Path::new("a").join(&one[0].path),
+            "the same entry, under its root"
+        );
+        assert!(!fs.exists("/p/dest/a/.flux/operations/foo"), "the entry was not copied");
+        assert_eq!(statuses(&r), [RootStatus::Failed, RootStatus::Completed]);
+        assert_eq!(fs.read_file("/p/dest/a/x").as_deref(), Some(&b"ax"[..]), "the rest continued");
+    }
+
+    /// Whether a path component is one Flux keeps for itself: `.flux`, a prefix or operation lock, a state file.
+    fn is_control(component: &str) -> bool {
+        component == ".flux"
+            || component.ends_with(".flux-lock")
+            || component.contains(".flux-state.")
+    }
+
+    #[test]
+    fn the_workspace_is_under_dest_and_nothing_control_is_inside_a_root() {
+        let fs = fake();
+        let seen = watch_manifest(&fs, "claim_insert", 1);
+        let in_flight = Arc::new(Mutex::new(Vec::new()));
+        let keep = Arc::clone(&in_flight);
+        // Taken at the same moment as the manifest: the workspace and the prefix locks exist.
+        fs.on_nth("claim_flush", 1, move |fs| {
+            let mut found = keep.lock().unwrap();
+            found.push(fs.exists(format!("/p/dest/.flux/operations/{ID}")));
+            found.push(["a", "b", "f"].iter().all(|n| fs.exists(format!("/p/dest/{n}.flux-lock"))));
+        });
+
+        let (r, _) = go(&fs, &["f", "b", "a"]);
+
+        ok(&r);
+        // Every path the run named below a root has no control component.
+        for c in calls(&fs) {
+            for token in c.split(['(', ')', ' ', '>']).filter(|t| t.starts_with("/p/dest/")) {
+                for name in ["a", "b", "f"] {
+                    if let Some(below) = token.strip_prefix(&format!("/p/dest/{name}/")) {
+                        assert!(
+                            !below.split('/').any(is_control),
+                            "control state inside DEST/{name}: {c}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(*in_flight.lock().unwrap(), [true, true], "workspace and locks, in flight");
+        let state = seen.lock().unwrap().take().expect("the manifest was read in flight");
+        assert_eq!(state.format_version, 5);
+        assert_eq!(state.kind, Kind::Tree);
+        let config = state.config.expect("a version-5 record");
+        let roots: Vec<_> = config
+            .roots
+            .iter()
+            .map(|r| (from_native_hex(&r.destination_prefix).unwrap(), r.kind))
+            .collect();
+        assert_eq!(
+            roots,
+            [
+                (PathBuf::from("a"), Some(RootKind::Tree)),
+                (PathBuf::from("b"), Some(RootKind::Tree)),
+                (PathBuf::from("f"), Some(RootKind::File)),
+            ],
+            "the roots in key order whatever the order given"
+        );
+        // Nothing of the run's own is left anywhere afterwards.
+        assert!(!fs.exists("/p/dest/.flux") && lock_files(&fs).is_empty());
     }
 }

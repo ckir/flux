@@ -679,7 +679,7 @@ pub(crate) fn copy_tree_at<F: DestinationRoot>(
 /// How one root of a several-source run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootStatus {
-    /// Walked to the end with no per-file failure.
+    /// Walked to the end, with no failure counted over it (the `out.failures.total()` delta is zero) and no abort.
     Completed,
     /// Walked (or tried to) and any failure was counted over it (`FailureTally::total()`: a file, a walk or
     /// directory error, a metadata complaint, an unrecorded claim), as a one-source run exits 1 on any of them, or the
@@ -690,7 +690,6 @@ pub enum RootStatus {
 }
 
 /// One root of a several-source run, ready to copy.
-#[allow(dead_code)] // used by run::trees (plan task 7, part B)
 pub(crate) enum RootInput<'a, F: FileSystem> {
     /// A directory: `DEST/<name>` is made (or merged into) and the source tree walks into it.
     Folder { name: OsString, src_root: PathBuf, source: Source<'a, F> },
@@ -707,7 +706,6 @@ impl<F: FileSystem> RootInput<'_, F> {
 }
 
 /// What one root did: the deltas of the run's counters over that root.
-#[allow(dead_code)] // used by run::trees (plan task 7, part B)
 pub(crate) struct RootDone {
     pub name: OsString,
     pub status: RootStatus,
@@ -718,9 +716,9 @@ pub(crate) struct RootDone {
 /// Several sources, spec 3.6: the roots in the order given (the caller sorts them by prefix key), each into DEST under
 /// its name. Before each root `beat` and `guard` run, as before a directory. An abort-class error (a failed guard or
 /// heartbeat, a lost lock, a root that cannot be created) stops the loop: that root is `Failed` and every later one
-/// `NotStarted`. A per-file failure marks its root `Failed` and the loop goes on. `TreeFailure.path` is relative to
+/// `NotStarted`. ANY counted failure (the `out.failures.total()` delta over the root) marks its root `Failed` and the loop goes
+/// on; an abort marks it `Failed` too. `TreeFailure.path` is relative to
 /// DEST for a folder root's entries (`<name>/<path>`) and is the name itself for a file root.
-#[allow(dead_code)] // used by run::trees (plan task 7, part B)
 pub(crate) fn copy_roots_at<F: DestinationRoot>(
     base: &Shared<'_, F>,
     dest: &F::Dir,
