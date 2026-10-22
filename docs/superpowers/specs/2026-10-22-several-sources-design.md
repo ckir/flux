@@ -131,8 +131,13 @@ name-length limit the acquirer takes the directory lock `P/.flux-dir.lock` inste
 directory lock exclude each other (`lock/acquire.rs:53` already refuses a per-name acquirer when `.flux-dir.lock` is
 present). One operation holding a directory lock for one root and per-name locks for the others would refuse itself, and
 two long-named roots would both want the same file and read each other as an alias. This cut therefore does not use the
-fallback: a several-source command with a root whose `<name>.flux-lock` would exceed the limit is refused in group 1 with
-`PATH_COMPONENT_INVALID` and a message naming the root. Limitation L4. (`file_names_fit`, `run/mod.rs`, is the existing
+fallback: a several-source command with a root whose recovery name would exceed the limit is refused in group 1 with
+`PATH_COMPONENT_INVALID` and a message naming the root. The test is on the RECOVERY name, not the lock name: `recover`
+renames a dead lock to `<name>.flux-lock.broken.<32-character id>` (`lock/site.rs:108`, `lock/recover.rs:42`), 40 units
+longer, and `LockSite::named` only checks the lock name (`site.rs:82`). MEASURED on ext4: a 230-byte lock name renamed
+to its 270-byte recovery name fails with errno 36. So a name is refused when `name_len(<name>.flux-lock) + 40 > 255`
+(`NAME_LIMIT`, `site.rs:17`). The same defect exists for every other lock and is recorded in
+`.clavity/local-anomalies.md`; this cut does not change it. Limitation L4. (`file_names_fit`, `run/mod.rs`, is the existing
 single-file analogue; the plan reads its limit.)
 Source count (a finding of the panel): every prefix lock is a file in DEST and an open handle with an OS-native lock for
 the whole run, and all must be held before any transfer, so n cannot be lazy. The command is refused in group 1 (exit 2)
@@ -149,7 +154,8 @@ against a single-source tree run onto DEST (spec §97.1(b)). The alternative, pr
 Order of operations (answers builder question 1): (1) the operation lock, beside DEST; (2) DEST created where absent,
 as a tree's step 5 does today (E1; `created_dest`); the prefix locks live INSIDE DEST, so DEST must exist first;
 (3) the prefix locks; (4) the workspace `DEST/.flux/operations/<id>/` and the claim store. An alias or busy prefix lock
-at step 3 therefore finds NO workspace: every prefix lock taken is released (the last close removes the file), the
+at step 3 therefore finds NO workspace: every prefix lock taken is released by an explicit `Held::release` (a `Held` has no `Drop`: dropping it closes the
+handle and leaves a dead lock file, `lock/held.rs`; `discard` is for a lock with no record and asserts otherwise), the
 operation lock is released, and a DEST this run created is removed again. That is `Refused { changed: false }`, exit 3,
 by the existing convention ("`changed` is false when nothing changed, or what the run created was removed again",
 `run/mod.rs:153-157`); a DEST that cannot be removed is `not_removed`, exit 1, as today. The section 7 test for
@@ -193,7 +199,7 @@ manifest names, is not taken in this cut; it can be added without a format chang
   older binaries reading it as a damaged record. Version 5 is written only when `roots` has two or more entries
   (for it, the validator requires >= 2 roots and a non-empty prefix on each); every single-source run keeps writing
   format 4, byte-identical to today, so no existing state changes. An older binary meets a version-5 record as an
-  unknown `format_version` (`INCOMPATIBLE_STATE`, `state.rs:338`); whether that refusal is what an older `flux cleanup` and an older `flux copy`
+  unknown `format_version` (`INCOMPATIBLE_STATE`: the variant is `state.rs:339`, returned at `state.rs:467`); whether that refusal is what an older `flux cleanup` and an older `flux copy`
 actually do is part of V1, not assumed. The plan
   must work out the other version-4 coupling in the validator (`state.rs:~563-568`: the `wal` field is tied to
   `format_version == FORMAT_VERSION`) and the decode path, and cite the lines.
@@ -214,20 +220,32 @@ actually do is part of V1, not assumed. The plan
 - Folder root: `DEST/<name>` is created (guarded) or opened if it exists (a copy merges onto an existing folder, as a
   tree onto an existing DEST), then the existing tree walk copies into it with its own source root and identity, the
   run's guard, heartbeat, claim store, batch policy and checkpoint log.
-- Keys (a finding of the panel, MEASURED): the checkpoint log identifies a file by `file_id: key.encode()`
-  (`tree.rs:1518`), where the key is the `FluxPathKey` built from the path RELATIVE TO THE WALK ROOT
-  (`FluxPathKey::from_relative(&path)`, `tree.rs` in `copy_one`). With one tree that key is the §103 key. With several
-  roots, `a/big.bin` and `b/big.bin` would both be `big.bin` and share one checkpoint entry, so one file's chunk digests
-  could be read as the other's. Every key a several-source run stores or compares (the checkpoint `file_id` and every
-  other persisted key) is therefore the §103 key: the root's prefix components followed by the root-relative components.
-  The plan lists every site that calls `FluxPathKey::from_relative` and states for each whether it is persisted, and
-  tests the collision directly (V6).
+- Keys (amended while planning; the first version of this paragraph was WRONG): the checkpoint log's `file_id` is
+  `ClaimKey::encode()` of the parent directory's identity plus the file name (`tree.rs:1518` with `key = ClaimKey::new(
+  parent_id, name)` at `tree.rs:1528`; `flux-fs/src/claims.rs:59`), not a path relative to the walk root. Two roots that
+  hold `big.bin` write to different directories, so their ids already differ and there is no checkpoint collision. The
+  values that ARE walk-root-relative and persisted are: `PreparedRecord.dir_path` (`note_dir(&path)`, `tree.rs:3017`),
+  which `--resume` recovery resolves from the DEST handle (`run/recover.rs:112-124`), so for a file under `DEST/a/x/` it
+  would record `x`, not `a/x`; the leftover paths a run records for `cleanup_pending_artifacts`
+  (`run/mod.rs:434`, `tree.rs:3154`), which `flux cleanup` later removes relative to DEST; and `ClaimRecord.target` and
+  `PreparedRecord.target`, built by `FluxPathKey::from_relative(&path)` at `tree.rs:1314` and `tree.rs:1829`. Spec §103
+  defines the key as the root's prefix components followed by the root-relative ones. So in a several-source run every
+  such persisted value carries the root prefix (`DEST/<name>/...` relative to DEST), and the later resume cut reads
+  the same values it would read from a one-source run. `FileBegin.destination` (`tree.rs:1519`) is written and has no
+  non-test reader (a grep), so it is left as is. `reserved_path` (`tree.rs:982`) still runs on the walk-relative path:
+  a source that contains `.flux/operations/...` is refused as for a one-source run; this is conservative and is pinned
+  by a test, not changed.
 - File root: copied through the same per-file path a tree uses for a file, with DEST as the parent directory and the
   file's parent folder as the walk-relative source root (the manifest still records the file itself, §3.5). An existing
   `DEST/<name>` file follows the operation's `--overwrite|--update|--skip-existing` through the claim path, as a file
   inside a tree does since cut 8b (ROADMAP phase 9: "atomic replacement under claim records, with `--overwrite`,
-  `--update` and `--skip-existing`"); the plan verifies (V3) that this is observably the same as a two-positional
-  single-file copy for all three policies, so G4's "a file is a file" holds whichever command copied it. My proposal;
+  `--update` and `--skip-existing`"). The plan's reader found that a file in a tree and a two-positional single-file copy
+  are NOT identical in two corners (a skip never reaches the identity gate in a tree, `tree.rs:1480`, but does in
+  `plan_file`, `copy.rs:386-394`; and a destination whose identity is not Strong makes every existing file a collision
+  in a tree, `tree.rs:1277`, where a single-file copy honours the policy). A file root follows the TREE rule, so the two
+  corners are accepted differences and are stated in `docs/accepted-boundaries.md`; for a Strong destination identity and
+  an existing target that is not the source, the two commands agree on bytes, replace-or-keep and counters, and the
+  test below pins that. My proposal;
   the plan must cite the lines that show the per-file path fits or choose the alternative named in V3.
 - All roots obey the one guard: a lost lock or a failed heartbeat aborts the operation.
 
@@ -304,8 +322,11 @@ ruling in §3.7, the second is moot under B).
   `*.flux-lock` left in a DEST that is later used as a SOURCE may be copied as payload. This is already true of a stale
   single-file target lock today; this cut adds more possible stale files (L6). The plan states what is copied and
   decides, with the owner, whether a walk skip is in scope; it is not assumed.
-- V5. The fake (`fault_fs.rs`) can create, alias and release the prefix locks, and has a case-insensitive mode for the
-  alias test; otherwise a real-fs test gated by a case-sensitivity probe, run on the macOS and Windows CI jobs.
+- V5 (resolved while planning). The fake has a case-insensitive mode (`fault_fs.rs:1239`) that does NOT fold
+  `create_lock`, `open_lock` or `create_claim_store` (its doc, `fault_fs.rs:1233-1236`; `create_lock` tests the raw
+  joined path, `fault_fs.rs:~2112`). The plan extends the fake so that, in that mode, `create_lock` and `open_lock` fold
+  ASCII case like the other operations, and adds a real-filesystem alias test gated by a case-sensitivity probe that
+  runs on the macOS and Windows jobs.
 - V6. `Shared` can be rebuilt per root without copying state that must be global (the batch, the checkpoint log).
 
 ## 6. Known limitations this cut leaves (to state in `--help`, TODO.md and accepted-boundaries)
@@ -330,8 +351,9 @@ ruling in §3.7, the second is moot under B).
 - Nested roots (R5): `flux copy a a/sub DEST` copies `a` to `DEST/a` and `a/sub` to `DEST/sub`, `DEST/a/sub` holds the
   same content as `DEST/sub`, nothing is refused, and the manifest has two roots in prefix order.
 - File root against the single-file command (V3, G4): for each of `--overwrite`, `--update` and `--skip-existing`, with
-  the target absent, present and older, present and newer, a file given as one of several sources ends with the same
-  bytes, the same replace-or-keep decision and the same report counters as `flux copy FILE DEST/NAME` (two positionals).
+  the target absent, present and older, present and newer, on a destination with a Strong identity, a file given as one
+  of several sources ends with the same bytes, the same replace-or-keep decision and the same report counters as
+  `flux copy FILE DEST/NAME` (two positionals); and the two accepted differences above are pinned as tests of their own.
 - Refusals before any change, with the destination listed afterwards as untouched (and DEST not created): missing
   source; symlink source; byte-equal names (`a/x`, `b/x`) and the same source twice; reserved name; `.flux` source;
   the target is the source (`d/a.txt d/b.txt d`); DEST inside a folder source; wrong-kind existing `DEST/<name>`; two bad
@@ -357,11 +379,10 @@ ruling in §3.7, the second is moot under B).
 - State format: a several-source run writes version 5 with n roots; a single-source run still writes version 4
   byte-for-byte (golden comparison against today's output); the validator accepts exactly the forms it should and
   rejects version 5 with one root, version 4 with several, and an empty prefix on a version-5 root.
-- Keys: two roots holding a large file at the same root-relative path (use the checkpoint policy seam so a small file
-  checkpoints): the checkpoint log, decoded, holds two file ids that are exactly the section 103 keys (`a`, 0x00,
-  `big.bin` and `b`, 0x00, `big.bin`), not one id twice; the copies are byte-correct. (The writer REPLACES a file id it
-  has already seen on a new begin, `wal/writer.rs:~379`, so a collision need not corrupt a fresh copy; byte-correctness
-  alone does not turn a mutant that drops the prefix red, which is why the ids are asserted.)
+- Keys (amended): a Strict run of two roots that both hold `x/f` (the claims store has the `prepared` table) records
+  notes whose `dir_path` is `a/x` and `b/x` (not `x` twice); a run whose temporary cannot be removed in root `b` records
+  its leftover as `b/x/f.flux-partial.<id>` relative to DEST; the stored claim targets are the prefixed section 103 keys.
+  Each assertion is red under a mutant that drops the prefix.
 - Length and count: a name whose lock exceeds the limit is refused with `PATH_COMPONENT_INVALID` and nothing is made; one
   source over the cap is refused with exit 2.
 - Crash residue: a run killed after the prefix locks leaves them with `workspace_path` `none`; a later several-source run
@@ -481,4 +502,13 @@ prior; agy's "fewer than about thirty lines" is its own unmeasured figure and is
 computed from the run-time open-file limit (folded into section 3.4). Agreement between two readings of one document is not
 independent evidence of what the owner prefers: R7 (extends a master-spec rule), D8 (usability) and R8 (a report-schema
 addition) stay the owner's calls.
+
+Amendments found while planning (2026-10-22, after the owner's approval; reported to the owner). The code readers of the
+plan found four errors in this document, now corrected above: (1) the checkpoint-key collision of panel round 1 (F3) does
+not exist as described, because the `file_id` is a parent-identity-plus-name key; the real risk is the DEST-relative
+`dir_path`, the leftover paths and the claim targets, and the Keys paragraph and its test are rewritten (the label MEASURED
+on the first version was wrong: I had read `key.encode()` without checking which type `key` was). (2) A `Held` has no
+`Drop`, so every refusal path must release explicitly. (3) The long-name rule must use the recovery name, +40 units;
+MEASURED. (4) The fake's case-insensitive mode does not fold lock creation. Also: a file root and a single-file copy
+differ in two corners (§3.6 as amended). None of these changes a ruling R1 to R8.
 
