@@ -4829,6 +4829,45 @@ mod tests {
     }
 
     #[test]
+    fn t2f_replace_link_rename_failure_then_a_lost_lock_keeps_the_note() {
+        // Cut 11c site 1, the Replace link caller. Mutant: that caller's `discard_note_on_failure` always discards.
+        let fs = links(&[("n", "p")]);
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.write_file("/dst/n", b"old");
+        fs.fail("rename_replace", Code::IoError);
+        let calls = std::cell::Cell::new(0);
+        // gate (1), create (2), publish (3) pass; the rename fails; the discard guard (4) fails.
+        let guard = failing_after(3, &calls);
+        let o = CopyOptions { durability: Durability::Strict, ..opts() };
+        let (r, _, got) = link_run(&fs, &o, false, policy(1), &guard, no_seed);
+        let error = r.unwrap_err();
+        assert_eq!(error.code(), Code::TargetLockBusy, "{error:?}");
+        assert_eq!(calls.get(), 5, "the re-check ran once");
+        let c = log(&fs);
+        assert_eq!(count(&c, "claim_prepare("), 1, "precondition: the note was written: {c:?}");
+        assert_eq!(count(&c, "claim_discard_prepared("), 0, "{c:?}");
+        assert_eq!(fs.prepared_count(), 1, "the link's note stays");
+        let e = only_copy_failure(&got, "n");
+        assert_eq!((e.code(), e.step), (Code::IoError, CopyStep::Publish), "{e:?}");
+    }
+
+    #[test]
+    fn t2f_held_replace_link_rename_failure_discards_the_note() {
+        let fs = links(&[("n", "p")]);
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.write_file("/dst/n", b"old");
+        fs.fail("rename_replace", Code::IoError);
+        let o = CopyOptions { durability: Durability::Strict, ..opts() };
+        let (r, _, got) = link_run(&fs, &o, false, policy(1), &unguarded, no_seed);
+        r.unwrap();
+        let c = log(&fs);
+        assert_eq!(count(&c, "claim_prepare("), 1, "precondition: the note was written: {c:?}");
+        assert_eq!(count(&c, "claim_discard_prepared("), 1, "{c:?}");
+        assert_eq!(fs.prepared_count(), 0);
+        only_copy_failure(&got, "n");
+    }
+
+    #[test]
     fn a_lost_lock_before_the_create_is_a_stop_and_creates_nothing() {
         // Mutant: the guard in `create_link`'s pair removed (the link is created and only the publish guard stops it,
         // keeping the temporary).
@@ -5852,6 +5891,46 @@ mod tests {
         assert!(fs.exists("/dst/f0.flux-partial.op1"));
         assert!(!fs.called("create_new(/dst/f1"), "no later file is attempted: {c:?}");
         assert_eq!(out.files_copied, 0);
+    }
+
+    #[test]
+    fn t2e_replace_copy_rename_failure_then_a_lost_lock_keeps_the_note() {
+        // Cut 11c site 1, the Replace copy caller. Mutant: that caller's `discard_note_on_failure` always discards.
+        let fs = n_files(1);
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.write_file("/dst/f0", b"old");
+        let calls = std::cell::Cell::new(0);
+        fs.fail_nth("rename_replace", 1, Code::IoError, ErrorKind::Other);
+        // f0: sweep (1), create (2), publish (3) pass; the rename fails; the discard guard (4) fails.
+        let guard = failing_after(3, &calls);
+        let (r, _, got) = batched_with(&fs, policy(1), Durability::Strict, &guard, &no_heartbeat);
+        let error = r.unwrap_err();
+        assert_eq!(error.code(), Code::TargetLockBusy, "{error:?}");
+        assert_eq!(calls.get(), 5, "the re-check ran once");
+        let c = log(&fs);
+        assert_eq!(count(&c, "claim_prepare("), 1, "precondition: the note was written: {c:?}");
+        assert_eq!(count(&c, "claim_discard_prepared("), 0, "{c:?}");
+        assert_eq!(fs.prepared_count(), 1, "the note stays for recovery");
+        assert_eq!(got.len(), 1, "{got:?}");
+        let TreeFailureCause::Copy(e) = &got[0].cause else { panic!("{got:?}") };
+        assert_eq!((e.code(), e.step), (Code::IoError, CopyStep::Publish), "{e:?}");
+        assert_eq!(leftovers(&got, Some(&error)).len(), 1, "reported once: {got:?}");
+        assert_eq!(fs.read_file("/dst/f0").as_deref(), Some(&b"old"[..]));
+    }
+
+    #[test]
+    fn t2e_held_replace_copy_rename_failure_discards_the_note() {
+        let fs = n_files(1);
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.write_file("/dst/f0", b"old");
+        fs.fail_nth("rename_replace", 1, Code::IoError, ErrorKind::Other);
+        let (r, _, got) = batched(&fs, policy(1), Durability::Strict);
+        r.unwrap();
+        let c = log(&fs);
+        assert_eq!(count(&c, "claim_prepare("), 1, "precondition: the note was written: {c:?}");
+        assert_eq!(count(&c, "claim_discard_prepared("), 1, "{c:?}");
+        assert_eq!(fs.prepared_count(), 0);
+        assert_eq!(got.len(), 1, "{got:?}");
     }
 
     #[test]
