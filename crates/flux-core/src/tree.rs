@@ -1586,7 +1586,9 @@ fn copy_one<F: DestinationRoot>(
                 fc.as_ref().map(Hook::Logged),
             );
             let (result, reuse) = split_reuse(result);
-            discard_note_on_failure(claims, &key, &wrote, &result);
+            let result = discard_note_on_failure(
+                claims, &key, &wrote, cx.guard, &path, result, out, on_report,
+            );
             let published = match &result {
                 Ok(o) => Some(o.published_identity),
                 Err(_) => None,
@@ -1693,7 +1695,16 @@ fn copy_one<F: DestinationRoot>(
                 fc.as_ref().map(Hook::Logged),
             );
             let (result, reuse) = split_reuse(result);
-            discard_note_on_failure(claims, &key_stored, &wrote, &result);
+            let result = discard_note_on_failure(
+                claims,
+                &key_stored,
+                &wrote,
+                cx.guard,
+                &path,
+                result,
+                out,
+                on_report,
+            );
             let published = match &result {
                 Ok(o) => Some(o.published_identity),
                 Err(_) => None,
@@ -2008,7 +2019,9 @@ fn link_one<F: DestinationRoot>(
                 &no_before_create,
                 before_publish,
             )?;
-            discard_note_on_failure(claims, &key, &wrote, &result);
+            let result = discard_note_on_failure(
+                claims, &key, &wrote, cx.guard, &path, result, out, on_report,
+            );
             let published = result.as_ref().ok().map(|o| o.published_identity);
             finish_copy(path.clone(), result, out, on_report)?;
             if let Some(identity) = published {
@@ -2076,7 +2089,16 @@ fn link_one<F: DestinationRoot>(
                 &before_create,
                 before_publish,
             )?;
-            discard_note_on_failure(claims, &key_stored, &wrote, &result);
+            let result = discard_note_on_failure(
+                claims,
+                &key_stored,
+                &wrote,
+                cx.guard,
+                &path,
+                result,
+                out,
+                on_report,
+            );
             let published = result.as_ref().ok().map(|o| o.published_identity);
             finish_copy(path.clone(), result, out, on_report)?;
             if let Some(identity) = published {
@@ -3005,17 +3027,54 @@ fn write_note<C: ClaimStore + ?Sized>(
     Ok(())
 }
 
-/// Cut 9c: a copy that failed after its note was written (the heartbeat, the guard or the rename) did not publish, so
-/// the note is discarded at once, before `finish_copy` can stop the run. Best effort: a note left behind is decided by
-/// the recovery matrix at the next resume.
+/// Cut 9c, amended by cut 11c (spec 4.2): a copy that failed after its note was written (the heartbeat, the guard or
+/// the rename) did not publish, so the note is discarded at once, before `finish_copy` can stop the run, but only while
+/// this run still holds the destination lock. Best effort: a note left behind is decided by the recovery matrix at the
+/// next resume. Returns the copy's result, replaced by a `TargetLockBusy` stop when the guard fails.
+///
+/// - `Ok`, or no note written: the result is returned unchanged, with no guard call.
+/// - A `TargetLockBusy` failure: the lock is already known lost; returned as is, no discard, no re-check.
+/// - Any other failure with the guard `Ok`: the note is discarded and the failure returned (cut 9c).
+/// - Any other failure with the guard failing: the note is kept for recovery; the original failure is reported as the
+///   entry's own (with its collision remap), and the stop is the lost lock, carrying the original's step and leftover.
+#[allow(clippy::too_many_arguments)]
 fn discard_note_on_failure<C: ClaimStore + ?Sized>(
     claims: &std::cell::RefCell<C>,
     key: &ClaimKey,
     wrote: &std::cell::Cell<bool>,
-    result: &std::result::Result<flux_fs::Outcome, CopyError>,
-) {
-    if wrote.get() && result.is_err() {
-        let _ = claims.borrow_mut().discard_prepared(key);
+    guard: &Guard<'_>,
+    path: &Path,
+    result: std::result::Result<flux_fs::Outcome, CopyError>,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) -> std::result::Result<flux_fs::Outcome, CopyError> {
+    let Err(mut e) = result else { return result };
+    if !wrote.get() || e.code() == Code::TargetLockBusy {
+        return Err(e);
+    }
+    match guard() {
+        Ok(()) => {
+            let _ = claims.borrow_mut().discard_prepared(key);
+            Err(e)
+        }
+        Err(lost) => {
+            let step = e.step;
+            let leftover = e.leftover.take();
+            remap_collision(&mut e);
+            report(out, on_report, path.to_path_buf(), TreeFailureCause::Copy(e));
+            Err(CopyError { cause: lost, leftover, step })
+        }
+    }
+}
+
+/// F3 and §241.5: an `AlreadyExists` at the gate or the publish is a namespace collision - the name was taken by a
+/// file that already existed (refused at Step 2a) or one that appeared before publish (the no-replace rename refused
+/// it). `source` is kept, so `raw_os_error` survives.
+fn remap_collision(e: &mut CopyError) {
+    if matches!(e.step, CopyStep::Gate | CopyStep::Publish)
+        && e.cause.source.kind() == ErrorKind::AlreadyExists
+    {
+        e.cause.code = Code::DestinationNamespaceCollision;
     }
 }
 
@@ -3094,14 +3153,7 @@ fn finish_copy(
                 e.cause.code = Code::NoReplacePublishUnavailable;
                 return Err(e);
             }
-            // F3 and §241.5: the name was taken - by a file that already existed
-            // (refused at Step 2a) or one that appeared before publish (the no-replace
-            // rename refused it). `source` is kept, so `raw_os_error` survives.
-            if matches!(e.step, CopyStep::Gate | CopyStep::Publish)
-                && e.cause.source.kind() == ErrorKind::AlreadyExists
-            {
-                e.cause.code = Code::DestinationNamespaceCollision;
-            }
+            remap_collision(&mut e);
             // Cut 8b: a claim failure (a store error, or a collision with another target's claim) fails this target
             // only, with the code it carries.
             report(out, on_report, path, TreeFailureCause::Copy(e));
@@ -4749,6 +4801,20 @@ mod tests {
     const LINK_GUARD_AT_CREATE: u32 = 2;
 
     #[test]
+    fn t1_link_publish_guard_failure_after_the_note_keeps_it() {
+        // Sites 2011/2079 (links) share the helper; one pin for a Strict link: gate (1), create (2) pass, publish (3) fails.
+        let fs = links(&[("n", "p")]);
+        let calls = std::cell::Cell::new(0);
+        let guard = failing_after(LINK_GUARD_AT_CREATE, &calls);
+        let o = CopyOptions { durability: Durability::Strict, ..opts() };
+        let (r, _, _) = link_run(&fs, &o, false, policy(1), &guard, no_seed);
+        assert_eq!(r.unwrap_err().code(), Code::TargetLockBusy);
+        assert_eq!(calls.get(), 3);
+        assert_eq!(count(&log(&fs), "claim_discard_prepared("), 0);
+        assert_eq!(fs.prepared_count(), 1, "the link's note stays");
+    }
+
+    #[test]
     fn a_lost_lock_before_the_create_is_a_stop_and_creates_nothing() {
         // Mutant: the guard in `create_link`'s pair removed (the link is created and only the publish guard stops it,
         // keeping the temporary).
@@ -5706,6 +5772,159 @@ mod tests {
         let c = log(&fs);
         assert_eq!(count(&c, "claim_prepare_many("), 0, "{c:?}");
         assert_eq!(out.files_copied, 5);
+    }
+
+    #[test]
+    fn t1_unbatched_publish_guard_failure_after_the_note_keeps_it_and_stops() {
+        // Spec 4.2 bullet 1: a `TargetLockBusy` copy failure is returned as is: no discard and NO re-check.
+        let fs = n_files(2);
+        let calls = std::cell::Cell::new(0);
+        // f0: sweep (1), create (2) pass; its publish guard (3) fails, after `write_note`.
+        let guard = failing_after(2, &calls);
+        let (r, out, got) = batched_with(&fs, policy(1), Durability::Strict, &guard, &no_heartbeat);
+        let error = r.unwrap_err();
+        assert_eq!(
+            (error.code(), error.step),
+            (Code::TargetLockBusy, CopyStep::Publish),
+            "{error:?}"
+        );
+        assert_eq!(calls.get(), 3, "no re-check after a TargetLockBusy failure");
+        assert!(got.is_empty(), "a stop, not a per-file failure: {got:?}");
+        let c = log(&fs);
+        assert_eq!(count(&c, "claim_prepare("), 1, "{c:?}");
+        assert_eq!(count(&c, "claim_discard_prepared("), 0, "{c:?}");
+        assert_eq!(fs.prepared_count(), 1, "the note stays for recovery");
+        assert!(fs.exists("/dst/f0.flux-partial.op1") && !fs.exists("/dst/f0"));
+        assert!(!fs.called("create_new(/dst/f1"), "no later file is attempted: {c:?}");
+        assert_eq!(leftovers(&got, Some(&error)), [temp_of("f0")], "reported once: {got:?}");
+        assert_eq!(out.files_copied, 0);
+    }
+
+    #[test]
+    fn t2_unbatched_rename_failure_then_a_lost_lock_keeps_the_note_reports_the_failure_and_stops() {
+        // Spec 4.2 bullets 2-4: the re-check. Mutant: drop the re-check (today's unconditional discard).
+        let fs = n_files(2);
+        let calls = std::cell::Cell::new(0);
+        fs.fail_nth("rename_no_replace", 1, Code::IoError, ErrorKind::Other);
+        // f0: sweep (1), create (2), publish (3) pass; the rename fails; the copy path's discard guard (4) fails (the
+        // temporary is kept); the re-check (5) fails.
+        let guard = failing_after(3, &calls);
+        let (r, out, got) = batched_with(&fs, policy(1), Durability::Strict, &guard, &no_heartbeat);
+        let error = r.unwrap_err();
+        assert_eq!(
+            (error.code(), error.step),
+            (Code::TargetLockBusy, CopyStep::Publish),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.leftover.as_ref().map(|(p, _)| p.clone()),
+            Some(temp_of("f0")),
+            "relative to DEST"
+        );
+        assert_eq!(calls.get(), 5, "the re-check ran once");
+        let c = log(&fs);
+        assert_eq!(count(&c, "claim_discard_prepared("), 0, "{c:?}");
+        assert_eq!(fs.prepared_count(), 1, "the note stays for recovery");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].path, PathBuf::from("f0"));
+        let TreeFailureCause::Copy(e) = &got[0].cause else { panic!("{got:?}") };
+        assert_eq!(
+            (e.code(), e.step),
+            (Code::IoError, CopyStep::Publish),
+            "the original failure: {e:?}"
+        );
+        assert!(e.leftover.is_none(), "the leftover travels in the stop only: {e:?}");
+        assert_eq!(leftovers(&got, Some(&error)), [temp_of("f0")], "once: {got:?}");
+        assert!(fs.exists("/dst/f0.flux-partial.op1"));
+        assert!(!fs.called("create_new(/dst/f1"), "no later file is attempted: {c:?}");
+        assert_eq!(out.files_copied, 0);
+    }
+
+    #[test]
+    fn t2b_the_collision_remap_survives_the_lost_lock_report() {
+        // Review focus 2. Between f0's create and its rename someone writes /dst/f0; the no-replace rename refuses it.
+        let fs = n_files(2);
+        let calls = std::cell::Cell::new(0);
+        fs.on_nth("rename_no_replace", 1, |fs| fs.write_file("/dst/f0", b"theirs"));
+        let guard = failing_after(3, &calls);
+        let (r, _, got) = batched_with(&fs, policy(1), Durability::Strict, &guard, &no_heartbeat);
+        assert_eq!(r.unwrap_err().code(), Code::TargetLockBusy);
+        let TreeFailureCause::Copy(e) = &got[0].cause else { panic!("{got:?}") };
+        assert_eq!(e.code(), Code::DestinationNamespaceCollision, "{e:?}");
+        assert_eq!(fs.read_file("/dst/f0").as_deref(), Some(&b"theirs"[..]));
+        assert_eq!(count(&log(&fs), "claim_discard_prepared("), 0);
+        assert_eq!(fs.prepared_count(), 1, "the note stays");
+    }
+
+    #[test]
+    fn t2c_a_heartbeat_failure_after_the_note_under_a_lost_lock_is_reported_and_the_stop_is_the_lost_lock()
+     {
+        // Review focus 1 (spec 4.2, "whatever the original's code"). f0 beats sweep (1), create (2), chunk (3); its
+        // publish beat (4) fails before the publish guard; the discard guard (3) fails; the re-check (4) fails.
+        let fs = n_files(2);
+        let calls = std::cell::Cell::new(0);
+        let beats = std::cell::Cell::new(0);
+        let beat = || {
+            beats.set(beats.get() + 1);
+            if beats.get() > 3 {
+                Err(FsError::new(Code::IoError, std::io::Error::other("beat")))
+            } else {
+                Ok(())
+            }
+        };
+        let guard = failing_after(2, &calls);
+        let (r, _, got) = batched_with(&fs, policy(1), Durability::Strict, &guard, &beat);
+        let error = r.unwrap_err();
+        assert_eq!(
+            (error.code(), error.step),
+            (Code::TargetLockBusy, CopyStep::Heartbeat),
+            "the original's step: {error:?}"
+        );
+        assert_eq!((beats.get(), calls.get()), (4, 4));
+        assert_eq!(count(&log(&fs), "claim_discard_prepared("), 0);
+        assert_eq!(fs.prepared_count(), 1);
+        let TreeFailureCause::Copy(e) = &got[0].cause else { panic!("{got:?}") };
+        assert_eq!((e.code(), e.step), (Code::IoError, CopyStep::Heartbeat), "{e:?}");
+        assert_eq!(leftovers(&got, Some(&error)), [temp_of("f0")]);
+    }
+
+    #[test]
+    fn t2d_a_heartbeat_failure_after_the_note_with_the_lock_held_discards_it() {
+        // Closes "Cut 9c debt" item 1. Held: the discard is legal and `finish_copy` stops on the heartbeat as today.
+        let fs = n_files(2);
+        let beats = std::cell::Cell::new(0);
+        let beat = || {
+            beats.set(beats.get() + 1);
+            if beats.get() > 3 {
+                Err(FsError::new(Code::IoError, std::io::Error::other("beat")))
+            } else {
+                Ok(())
+            }
+        };
+        let (r, _, got) = batched_with(&fs, policy(1), Durability::Strict, &unguarded, &beat);
+        assert_eq!(r.unwrap_err().step, CopyStep::Heartbeat);
+        assert!(got.is_empty(), "a stop, not a per-file failure: {got:?}");
+        assert_eq!(count(&log(&fs), "claim_discard_prepared("), 1);
+        assert_eq!(fs.prepared_count(), 0);
+        assert!(!fs.exists("/dst/f0.flux-partial.op1"));
+    }
+
+    #[test]
+    fn t5_unbatched_rename_failure_with_the_lock_held_still_discards_the_note() {
+        // Spec T5: the re-check does not suppress a legal write. Mutant: skip the discard whenever the guard is consulted.
+        let fs = n_files(2);
+        fs.fail_nth("rename_no_replace", 1, Code::IoError, ErrorKind::Other);
+        let (r, out, got) = batched(&fs, policy(1), Durability::Strict);
+        r.unwrap();
+        let c = log(&fs);
+        assert_eq!(count(&c, "claim_discard_prepared("), 1, "{c:?}");
+        assert_eq!(fs.prepared_count(), 0);
+        assert_eq!(got.len(), 1, "{got:?}");
+        let TreeFailureCause::Copy(e) = &got[0].cause else { panic!("{got:?}") };
+        assert_eq!((e.code(), e.step), (Code::IoError, CopyStep::Publish));
+        assert!(e.leftover.is_none() && !fs.exists("/dst/f0.flux-partial.op1"));
+        assert!(published(&fs, "f1") && claimed(&fs, "f1"));
+        assert_eq!(out.files_copied, 1);
     }
 
     #[test]
