@@ -10,6 +10,7 @@
 
 mod dry_prior;
 pub(crate) mod place;
+mod prefix;
 mod recover;
 mod restart;
 mod resume;
