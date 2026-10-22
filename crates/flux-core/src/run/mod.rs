@@ -14,6 +14,7 @@ mod prefix;
 mod recover;
 mod restart;
 mod resume;
+mod roots;
 pub(crate) mod session;
 pub(crate) mod sweep;
 #[cfg(test)]
@@ -44,6 +45,7 @@ use flux_fs::{
     LockCapability, OperationId, Outcome,
 };
 use place::{FilePlace, Place, TreePlace, locate_tree};
+pub use roots::{SourceKind, SourceSpec, source_cap};
 use session::{Locked, beat_error, from_lock, guarded, lock_io, open_operation, owned};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
