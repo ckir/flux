@@ -322,15 +322,24 @@ ruling in §3.7, the second is moot under B).
   an existing file: exit 2; two positionals unchanged.
 - Mapping: two folders; two files; mixed; a source given as `.`, `../x`, `dir/`; output independent of command-line
   order (same tree, same manifest root order).
+- Nested roots (R5): `flux copy a a/sub DEST` copies `a` to `DEST/a` and `a/sub` to `DEST/sub`, `DEST/a/sub` holds the
+  same content as `DEST/sub`, nothing is refused, and the manifest has two roots in prefix order.
+- File root against the single-file command (V3, G4): for each of `--overwrite`, `--update` and `--skip-existing`, with
+  the target absent, present and older, present and newer, a file given as one of several sources ends with the same
+  bytes, the same replace-or-keep decision and the same report counters as `flux copy FILE DEST/NAME` (two positionals).
 - Refusals before any change, with the destination listed afterwards as untouched (and DEST not created): missing
   source; symlink source; byte-equal names (`a/x`, `b/x`) and the same source twice; reserved name; `.flux` source;
-  the target is the source (`d/a.txt d/b.txt d`); DEST inside a folder source; wrong-kind existing `DEST/<name>`.
+  the target is the source (`d/a.txt d/b.txt d`); DEST inside a folder source; wrong-kind existing `DEST/<name>`; two bad
+  sources at once report the FIRST one in command-line order (L2).
 - Aliases: `Data` and `data` refused with `DESTINATION_NAMESPACE_COLLISION` and all locks released (fake with a
   case-insensitive mode; real-fs on macOS and Windows jobs); on Linux both copy.
 - Layout (the A1 regression): after a run, no `.flux`, `*.flux-lock` or `*.flux-state.*` inside any `DEST/<name>`; the
   workspace is `DEST/.flux/operations/<id>` with n roots, the prefixes in key order; completed run leaves none.
 - Locks: DEST lock taken before the prefix locks; a held prefix lock refuses with `TARGET_LOCK_BUSY` and nothing is
   copied; a lock lost between root 1 and root 2 aborts and root 2 is "not started".
+- Prefix-lock liveness (V4): a prefix lock whose OS-native lock is held by a live run is `Busy` to a competing run even
+  when its record's heartbeat time is old (the competitor is not allowed to read it as dead), and the same lock with the
+  OS lock released is `Dead` and recovered; a mutant that classifies by heartbeat age is red.
 - Failure: a per-entry failure in root 1 does not stop root 2; an abort keeps the workspace and names the unstarted
   roots.
 - State format: a several-source run writes version 5 with n roots; a single-source run still writes version 4
@@ -421,4 +430,12 @@ read-after-write on Windows is UNVERIFIED and is a plan obligation, not an accep
 the master spec only at R1, R6 and R7, all stated as rulings: no new findings. The other four fold-audit items: no new
 findings. Echo: agy quoted the artifact's last line without its backticks, so the driver flagged ECHO MISSING; both probes
 and the cited lines are correct, and the flag is recorded here rather than waved off.
+
+Panel round 4, agy escalation (census round; the echo and probe were exact, and the census line numbers and opening words
+were checked against the file for a sample of thirty-four rows, all matching). D1 the census mapped three rules to section
+7 bullets that do not test them: R5 (no nested-roots case), V3 (the equivalence test lived only inside V3) and V4 (the
+Locks bullet has no liveness case); agy answered "no contradictions" without noticing. FOLDED: three new section 7
+bullets and a first-failure clause (R2, L2). The Fold Auditor items (a) to (d): no new findings. So round 4 was clean by
+agy's account but not by measurement; the round that follows audits only these additions. Discarded below the floor: none.
+Unverified-accepted: none.
 
