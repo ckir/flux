@@ -341,6 +341,96 @@ impl<F: DestinationRoot> TreePlace<'_, F> {
         }
     }
 
+    /// Step 5, first half: DEST, made where it is absent (E1; `created_dest`).
+    pub(crate) fn create_dest(&mut self) -> Result<(), RunError> {
+        if self.dest.is_none() {
+            let name = self.name.as_deref().expect("only a named DEST can be absent");
+            let dest = match self.holder.create_dir(name) {
+                Ok(d) => {
+                    self.created_dest = true;
+                    d
+                }
+                Err(e) if e.source.kind() == ErrorKind::AlreadyExists => self
+                    .holder
+                    .open_dir(name)
+                    .map_err(|e| failed(RunStep::State, &self.dest_shown, e))?,
+                Err(e) => return Err(failed(RunStep::State, &self.dest_shown, e)),
+            };
+            self.dest = Some(dest);
+        }
+        Ok(())
+    }
+
+    /// Step 5, second half: the workspace, the probe, the claim store. `before_rollback` runs at the start of each of the
+    /// three arms that roll back (the probe's `Unavailable`, the probe's `Err`, the claim store's `Err`), before the
+    /// control directories (and a DEST this run made) are removed; the early `?` returns roll nothing back and do not
+    /// call it.
+    pub(crate) fn create_workspace(
+        &mut self,
+        state: &OperationState,
+        warnings: &mut Vec<RunWarning>,
+        before_rollback: &mut dyn FnMut(),
+    ) -> Result<(), RunError> {
+        let dest = self.dest.as_ref().expect("create_dest made it");
+        let operations = operations_dir(dest, &self.dest_shown).map_err(|e| {
+            from_lock(e, RunStep::State, &self.operations_shown(), self.created_dest)
+        })?;
+        let id = state.operation_id.as_str();
+        let shown_creating = self.operations_shown().join(creating_name(id));
+        let building = begin_workspace(&operations, id)
+            .map_err(|e| failed(RunStep::State, &shown_creating, e))?;
+        match probe_no_replace(&building) {
+            Ok(Probe::Available { leftover: None }) => {}
+            Ok(Probe::Available { leftover: Some((name, error)) }) => {
+                // The file's path once the workspace is published.
+                warnings.push(RunWarning::ProbeNotRemoved {
+                    path: self.operations_shown().join(id).join(name),
+                    error,
+                });
+            }
+            Ok(Probe::Unavailable { leftover }) => {
+                before_rollback();
+                drop(building);
+                return Err(self.refuse_no_replace(operations, id, leftover));
+            }
+            Err((at, error)) => {
+                before_rollback();
+                drop(building);
+                // Best effort, but a leftover is reported: the CLI prints the warnings of a stopped run too.
+                if let Some((path, error)) = self.unwind_creating(operations, id) {
+                    warnings.push(RunWarning::NotRemoved { path, error });
+                }
+                let file = if at == ProbeAt::Create { PROBE_TEMP } else { PROBE };
+                return Err(failed(RunStep::Probe, &shown_creating.join(file), error));
+            }
+        }
+        let workspace = publish_workspace(&operations, building, state)
+            .map_err(|e| failed(RunStep::State, &self.shown(id), e))?;
+        // After the publishing rename: Windows refuses to rename a directory with an open file inside it.
+        match workspace.create_claim_store(OsStr::new(STATE_DB), self.durability) {
+            Ok(store) => self.claims = Some(store),
+            Err(error) => {
+                before_rollback();
+                drop(workspace);
+                // Retire the published workspace (it holds only its manifest), then the control directories.
+                let shown_id = self.operations_shown().join(id);
+                let mut not_removed =
+                    retire_workspace(&operations, id).err().map(|e| (shown_id.clone(), e));
+                self.operations = Some(operations);
+                if let Err(first) = self.remove_control_dirs(true) {
+                    not_removed.get_or_insert(first);
+                }
+                if let Some((path, error)) = not_removed {
+                    warnings.push(RunWarning::NotRemoved { path, error });
+                }
+                return Err(failed(RunStep::State, &shown_id.join(STATE_DB), error));
+            }
+        }
+        drop(workspace);
+        self.operations = Some(operations);
+        Ok(())
+    }
+
     fn operations(&self) -> &F::Dir {
         self.operations
             .as_ref()
@@ -387,76 +477,8 @@ impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {
         state: &OperationState,
         warnings: &mut Vec<RunWarning>,
     ) -> Result<(), RunError> {
-        if self.dest.is_none() {
-            let name = self.name.as_deref().expect("only a named DEST can be absent");
-            let dest = match self.holder.create_dir(name) {
-                Ok(d) => {
-                    self.created_dest = true;
-                    d
-                }
-                Err(e) if e.source.kind() == ErrorKind::AlreadyExists => self
-                    .holder
-                    .open_dir(name)
-                    .map_err(|e| failed(RunStep::State, &self.dest_shown, e))?,
-                Err(e) => return Err(failed(RunStep::State, &self.dest_shown, e)),
-            };
-            self.dest = Some(dest);
-        }
-        let dest = self.dest.as_ref().expect("made above");
-        let operations = operations_dir(dest, &self.dest_shown).map_err(|e| {
-            from_lock(e, RunStep::State, &self.operations_shown(), self.created_dest)
-        })?;
-        let id = state.operation_id.as_str();
-        let shown_creating = self.operations_shown().join(creating_name(id));
-        let building = begin_workspace(&operations, id)
-            .map_err(|e| failed(RunStep::State, &shown_creating, e))?;
-        match probe_no_replace(&building) {
-            Ok(Probe::Available { leftover: None }) => {}
-            Ok(Probe::Available { leftover: Some((name, error)) }) => {
-                // The file's path once the workspace is published.
-                warnings.push(RunWarning::ProbeNotRemoved {
-                    path: self.operations_shown().join(id).join(name),
-                    error,
-                });
-            }
-            Ok(Probe::Unavailable { leftover }) => {
-                drop(building);
-                return Err(self.refuse_no_replace(operations, id, leftover));
-            }
-            Err((at, error)) => {
-                drop(building);
-                // Best effort, but a leftover is reported: the CLI prints the warnings of a stopped run too.
-                if let Some((path, error)) = self.unwind_creating(operations, id) {
-                    warnings.push(RunWarning::NotRemoved { path, error });
-                }
-                let file = if at == ProbeAt::Create { PROBE_TEMP } else { PROBE };
-                return Err(failed(RunStep::Probe, &shown_creating.join(file), error));
-            }
-        }
-        let workspace = publish_workspace(&operations, building, state)
-            .map_err(|e| failed(RunStep::State, &self.shown(id), e))?;
-        // After the publishing rename: Windows refuses to rename a directory with an open file inside it.
-        match workspace.create_claim_store(OsStr::new(STATE_DB), self.durability) {
-            Ok(store) => self.claims = Some(store),
-            Err(error) => {
-                drop(workspace);
-                // Retire the published workspace (it holds only its manifest), then the control directories.
-                let shown_id = self.operations_shown().join(id);
-                let mut not_removed =
-                    retire_workspace(&operations, id).err().map(|e| (shown_id.clone(), e));
-                self.operations = Some(operations);
-                if let Err(first) = self.remove_control_dirs(true) {
-                    not_removed.get_or_insert(first);
-                }
-                if let Some((path, error)) = not_removed {
-                    warnings.push(RunWarning::NotRemoved { path, error });
-                }
-                return Err(failed(RunStep::State, &shown_id.join(STATE_DB), error));
-            }
-        }
-        drop(workspace);
-        self.operations = Some(operations);
-        Ok(())
+        self.create_dest()?;
+        self.create_workspace(state, warnings, &mut || {})
     }
 
     fn write(&self, state: &OperationState) -> flux_fs::Result<()> {
