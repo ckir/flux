@@ -558,7 +558,11 @@ fn a_killed_tree_copy_resumes_as_the_same_operation() {
     // The stall landed in the second directory: the first is whole, the third not begun.
     let done = published(&dst);
     assert!((100..200).contains(&done), "the stall landed in d1: {done} files published");
-    assert!(claim_count(&dst, &id) >= 100, "the first directory's claims were synced at its end");
+    let claims = claim_count(&dst, &id);
+    assert!(claims >= 100, "the first directory's claims were synced at its end");
+    // Cut 8b known limit 4a: under the default `Durability::Normal` the kill loses d1's unsynced claims, so some
+    // published files have none (measured on Linux: 165 published, 100 claims).
+    assert!(claims < done, "the kill lost the current directory's claims: {claims} of {done}");
 
     let out = copy(&[os("--resume"), os("--json"), src.as_os_str(), dst.as_os_str()]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
@@ -586,6 +590,10 @@ fn a_killed_tree_copy_resumes_as_the_same_operation() {
     assert_eq!(copied + skipped, 300, "{v}");
     assert!(skipped >= 100, "the first directory was not copied again: {v}");
     assert!(copied <= 200, "{v}");
+    // Cut 9a decision 3: the existing-file policy (the default, overwrite) reconciles each published file whose claim
+    // was lost; a claimed file resumes.
+    assert_eq!(v["files_overwritten"].as_u64(), Some(u64::try_from(done - claims).unwrap()), "{v}");
+    assert_eq!(skipped, u64::try_from(claims).unwrap(), "{v}");
     same_bytes(&src, &dst);
     assert!(!dst.join(".flux").exists(), "the workspace is gone");
     assert!(!d.path().join("dst.flux-lock").exists(), "and the lock");
