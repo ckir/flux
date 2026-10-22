@@ -455,6 +455,18 @@ pub fn trees<F: DestinationRoot>(
                     Err(error) => return aborted(run, out, error),
                 }
             }
+            SourceKind::File if spec.src.file_name() != Some(spec.name.as_os_str()) => {
+                // The copy reads `<parent of the source>/<name>`, so the name must be the source's own.
+                run.stop = Some(refuse(
+                    LockCode::PathComponentInvalid,
+                    format!(
+                        "the name {:?} for the source file {} is not its file name",
+                        spec.name,
+                        spec.src.display()
+                    ),
+                ));
+                return ended_early(run);
+            }
             SourceKind::File => match prepare_file_root(fs, &spec.src, &target) {
                 Ok(identity) => {
                     // A bare file name has the empty path as its parent: the working directory.
@@ -1235,12 +1247,10 @@ mod trees_tests {
 
     #[test]
     fn a_weak_destination_identity_makes_a_file_root_a_collision_like_a_tree_file() {
-        // Spec 3.6, the first accepted difference. The spec says a destination whose identity is not Strong makes every
-        // existing file a collision in a tree. At this commit it does not (measured below: a tree file over a Weak or
-        // Unavailable destination is replaced and counted degraded under the default safety, and refused SAFETY_REJECTED
-        // under strict), so what is pinned is the rule the spec chose, "a file root follows the TREE rule": a file root
-        // and the same file inside a one-source tree end with the same bytes, the same degraded accounting and the same
-        // failure, whatever the rule is.
+        // Spec 3.6, the first accepted difference: the identity of the destination DIRECTORY (the DEST that holds the
+        // file root's target) is not Strong. A tree file under it cannot claim its target, so an existing target is a
+        // collision under the default safety (the old bytes are kept) and the directory is refused under strict; a file
+        // root follows the same rule. Compared with the same file as a one-file folder in a one-source `run::tree`.
         for weak in [
             FileIdentity::Weak(ObjectId { volume: 5, index: 9_000_100 }),
             FileIdentity::Unavailable,
@@ -1251,15 +1261,24 @@ mod trees_tests {
                 let build = |dir: &str| {
                     let fs = fake();
                     fs.write_file("/src/f", b"NEW");
+                    fs.write_file("/src/g", b"G");
                     fs.create_dir(Path::new("/src/t")).unwrap();
                     fs.write_file("/src/t/f", b"NEW");
                     fs.create_dir(Path::new(dir)).unwrap();
                     fs.write_file(format!("{dir}/f"), b"OLD");
-                    fs.set_identity(format!("{dir}/f"), weak);
+                    fs.set_identity(dir, weak);
                     fs
                 };
                 let multi = build("/p/dest");
-                let (r, got) = go_with(&multi, vec![spec("b"), spec("f")], &o, &cfg());
+                let specs = vec![
+                    spec("f"),
+                    SourceSpec {
+                        src: PathBuf::from("/src/g"),
+                        name: OsString::from("g"),
+                        kind: SourceKind::File,
+                    },
+                ];
+                let (r, got) = go_with(&multi, specs, &o, &cfg());
                 let tree = build("/p/out");
                 let mut tree_got = Vec::new();
                 let t = crate::run::tree(
@@ -1271,27 +1290,39 @@ mod trees_tests {
                     &mut |f| tree_got.push(f),
                 );
 
-                assert!(r.run.stop.is_none() && t.stop.is_none(), "{label}");
-                let Some(Ok(multi_out)) = &r.run.copy else { panic!("{label}: {:?}", r.run.copy) };
-                let Some(Ok(tree_out)) = &t.copy else { panic!("{label}: {:?}", t.copy) };
                 assert_eq!(
-                    multi.read_file("/p/dest/f"),
-                    tree.read_file("/p/out/f"),
-                    "{label}: the same bytes"
+                    multi.read_file("/p/dest/f").as_deref(),
+                    Some(&b"OLD"[..]),
+                    "{label}: the old bytes are kept"
                 );
-                assert_eq!(multi_out.files_degraded, tree_out.files_degraded, "{label}");
-                assert_eq!(multi_out.files_overwritten, tree_out.files_overwritten, "{label}");
-                assert_eq!(multi_out.warnings, tree_out.warnings, "{label}");
-                assert_eq!(got.len(), tree_got.len(), "{label}: {got:?} {tree_got:?}");
-                if safety == Safety::Strict {
-                    assert_eq!(only_code(&got), Code::SafetyRejected, "{label}");
-                    assert_eq!(only_code(&got), only_code(&tree_got), "{label}");
-                    assert_eq!(statuses(&r), [RootStatus::Completed, RootStatus::Failed]);
-                    assert_eq!(multi.read_file("/p/dest/f").as_deref(), Some(&b"OLD"[..]));
+                assert_eq!(tree.read_file("/p/out/f").as_deref(), Some(&b"OLD"[..]), "{label}");
+                if safety == Safety::Default {
+                    assert!(r.run.stop.is_none() && t.stop.is_none(), "{label}");
+                    assert_eq!(only_code(&got), Code::DestinationNamespaceCollision, "{label}");
+                    assert_eq!(
+                        only_code(&tree_got),
+                        Code::DestinationNamespaceCollision,
+                        "{label}"
+                    );
+                    assert_eq!(got[0].path, Path::new("f"), "{label}");
+                    let Some(Ok(out)) = &r.run.copy else { panic!("{label}: {:?}", r.run.copy) };
+                    let Some(Ok(tree_out)) = &t.copy else { panic!("{label}: {:?}", t.copy) };
+                    assert_eq!(out.replace_degraded, tree_out.replace_degraded, "{label}");
+                    assert!(out.replace_degraded.is_some(), "{label}");
+                    assert_eq!(
+                        statuses(&r),
+                        [RootStatus::Failed, RootStatus::Completed],
+                        "{label}"
+                    );
                 } else {
-                    assert_eq!(multi_out.files_degraded, 1, "{label}");
-                    assert_eq!(multi.read_file("/p/dest/f").as_deref(), Some(&b"NEW"[..]));
-                    assert_eq!(statuses(&r), [RootStatus::Completed; 2], "{label}");
+                    // The directory is refused whole, before anything is copied.
+                    let code = |c: &Option<Result<TreeOutcome, TreeAbort>>| match c {
+                        Some(Err(a)) => a.error.code(),
+                        other => panic!("{label}: expected a refusal, got {other:?}"),
+                    };
+                    assert_eq!(code(&r.run.copy), Code::SafetyRejected, "{label}");
+                    assert_eq!(code(&t.copy), Code::SafetyRejected, "{label}");
+                    assert!(!multi.exists("/p/dest/g"), "{label}: nothing was copied");
                 }
             }
         }
@@ -1368,7 +1399,7 @@ mod trees_tests {
         // was made; the roots after it were never begun.
         assert_eq!(
             statuses(&r),
-            [RootStatus::Completed, RootStatus::Failed, RootStatus::NotStarted]
+            [RootStatus::Completed, RootStatus::NotStarted, RootStatus::NotStarted]
         );
         assert_eq!(names(&r), os(&["a", "b", "c"]));
         assert_eq!((r.roots[1].files_copied, r.roots[1].files_failed), (0, 0));
@@ -1478,6 +1509,28 @@ mod trees_tests {
         assert!(r.run.copy.is_none() && r.roots.is_empty());
         assert!(prefix_lock_files(&fs).is_empty(), "{:?}", prefix_lock_files(&fs));
         assert!(!fs.exists("/p/dest/a"), "nothing was copied");
+    }
+
+    #[test]
+    fn a_file_root_whose_name_is_not_its_source_name_is_refused() {
+        let fs = fake();
+        let renamed = SourceSpec {
+            src: PathBuf::from("/src/f"),
+            name: OsString::from("other"),
+            kind: SourceKind::File,
+        };
+
+        let (r, _) = go_with(&fs, vec![spec("a"), renamed], &opts(), &cfg());
+
+        match &r.run.stop {
+            Some(RunError::Refused { refusal, changed: false, .. }) => {
+                assert_eq!(refusal.code, LockCode::PathComponentInvalid);
+                assert!(refusal.detail.contains("/src/f"), "{}", refusal.detail);
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(r.run.copy.is_none() && r.roots.is_empty());
+        assert!(!fs.exists("/p/dest") && !fs.called("create_lock"), "{:?}", calls(&fs));
     }
 
     #[test]

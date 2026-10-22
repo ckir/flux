@@ -683,9 +683,10 @@ pub enum RootStatus {
     Completed,
     /// Walked (or tried to) and any failure was counted over it (`FailureTally::total()`: a file, a walk or
     /// directory error, a metadata complaint, an unrecorded claim), as a one-source run exits 1 on any of them, or the
-    /// root itself could not be created or entered; the root that triggers an abort is `Failed`.
+    /// root itself could not be created or entered; a root that aborts after beginning is `Failed`.
     Failed,
-    /// An earlier root aborted the operation before this one began.
+    /// Nothing of this root was begun: an earlier root aborted the operation, or the heartbeat or guard check before
+    /// this root failed.
     NotStarted,
 }
 
@@ -714,9 +715,9 @@ pub(crate) struct RootDone {
 }
 
 /// Several sources, spec 3.6: the roots in the order given (the caller sorts them by prefix key), each into DEST under
-/// its name. Before each root `beat` and `guard` run, as before a directory. An abort-class error (a failed guard or
-/// heartbeat, a lost lock, a root that cannot be created) stops the loop: that root is `Failed` and every later one
-/// `NotStarted`. ANY counted failure (the `out.failures.total()` delta over the root) marks its root `Failed` and the loop goes
+/// its name. Before each root `beat` and `guard` run, as before a directory. A failed heartbeat or guard before a root leaves that root and every
+/// later one `NotStarted`. Any other abort-class error (a lost lock mid-walk, a root that cannot be created) stops the
+/// loop: that root, which had begun, is `Failed` and every later one `NotStarted`. ANY counted failure (the `out.failures.total()` delta over the root) marks its root `Failed` and the loop goes
 /// on; an abort marks it `Failed` too. `TreeFailure.path` is relative to
 /// DEST for a folder root's entries (`<name>/<path>`) and is the name itself for a file root.
 pub(crate) fn copy_roots_at<F: DestinationRoot>(
@@ -740,6 +741,17 @@ pub(crate) fn copy_roots_at<F: DestinationRoot>(
                 files_copied: 0,
                 files_failed: 0,
             });
+            continue;
+        }
+        // The pre-root heartbeat and guard: a failure here means the root has begun nothing.
+        if let Err(e) = beat_and_guard(base) {
+            done.push(RootDone {
+                name,
+                status: RootStatus::NotStarted,
+                files_copied: 0,
+                files_failed: 0,
+            });
+            abort = Some(e);
             continue;
         }
         let (copied, failed, any) = (out.files_copied, out.failures.copy, out.failures.total());
@@ -773,7 +785,7 @@ pub(crate) fn copy_roots_at<F: DestinationRoot>(
     (done, abort.map_or(Ok(()), Err))
 }
 
-/// `beat`, then `guard`, as `walk_into` runs them before a directory.
+/// `beat`, then `guard`, as `walk_into` runs them before a directory; `copy_roots_at` runs them before each root.
 fn beat_and_guard<F: DestinationRoot>(base: &Shared<'_, F>) -> std::result::Result<(), CopyError> {
     (base.beat)().map_err(|e| CopyError::at(CopyStep::Heartbeat, e))?;
     (base.guard)().map_err(|e| CopyError::at(CopyStep::Create, e))
@@ -789,7 +801,6 @@ fn folder_root<F: DestinationRoot>(
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<(), CopyError> {
-    beat_and_guard(base)?;
     let (dir, created) = match dest.create_dir(name) {
         Ok(dir) => {
             out.directories_created += 1;
@@ -825,7 +836,6 @@ fn file_root<F: DestinationRoot>(
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<(), CopyError> {
-    beat_and_guard(base)?;
     let state = match state {
         Some(state) => state,
         None => {
