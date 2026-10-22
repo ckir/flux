@@ -681,8 +681,9 @@ pub(crate) fn copy_tree_at<F: DestinationRoot>(
 pub enum RootStatus {
     /// Walked to the end with no per-file failure.
     Completed,
-    /// Walked (or tried to) and at least one file failed, or the root itself could not be created or entered; the
-    /// root that triggers an abort is `Failed`.
+    /// Walked (or tried to) and any failure was counted over it (`FailureTally::total()`: a file, a walk or
+    /// directory error, a metadata complaint, an unrecorded claim), as a one-source run exits 1 on any of them, or the
+    /// root itself could not be created or entered; the root that triggers an abort is `Failed`.
     Failed,
     /// An earlier root aborted the operation before this one began.
     NotStarted,
@@ -743,7 +744,7 @@ pub(crate) fn copy_roots_at<F: DestinationRoot>(
             });
             continue;
         }
-        let (copied, failed) = (out.files_copied, out.failures.copy);
+        let (copied, failed, any) = (out.files_copied, out.failures.copy, out.failures.total());
         let result = match root {
             RootInput::Folder { name, src_root, source } => {
                 folder_root(base, dest, &name, &src_root, source, out, on_report)
@@ -761,7 +762,7 @@ pub(crate) fn copy_roots_at<F: DestinationRoot>(
             ),
         };
         let files_failed = out.failures.copy - failed;
-        let status = if result.is_err() || files_failed > 0 {
+        let status = if result.is_err() || out.failures.total() > any {
             RootStatus::Failed
         } else {
             RootStatus::Completed
@@ -8795,13 +8796,25 @@ mod tests {
     /// `copy_roots_at` into a pre-made `/dst` (claim store at `/dst/state.db`, Normal durability), the roots in the
     /// order given: `(name, source path, is a file)`.
     fn roots_run(fs: &FaultFs, specs: &[(&str, &str, bool)], guard: &Guard<'_>) -> RootsRun {
+        roots_run_with(fs, specs, guard, Durability::Normal, policy(1))
+    }
+
+    /// `roots_run` at `durability` under `policy` (Strict with a batch writes prepared notes).
+    fn roots_run_with(
+        fs: &FaultFs,
+        specs: &[(&str, &str, bool)],
+        guard: &Guard<'_>,
+        durability: Durability,
+        policy: BatchPolicy,
+    ) -> RootsRun {
         if !fs.exists(Path::new("/dst")) {
             fs.create_dir(Path::new("/dst")).unwrap();
         }
         let dest = fs.destination_root(Path::new("/dst")).unwrap();
-        let store = dest.create_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap();
+        let store = dest.create_claim_store(OsStr::new("state.db"), durability).unwrap();
         let claims = std::cell::RefCell::new(store);
-        let o = opts();
+        let mut o = opts();
+        o.durability = durability;
         let base = Shared {
             fs,
             src_root: Path::new("/src"),
@@ -8811,7 +8824,7 @@ mod tests {
             beat: &no_heartbeat,
             claims: Some(&claims),
             resume: false,
-            batch: policy(1),
+            batch: policy,
             ckpt: None,
             dry_run: false,
             dry_prior: None,
@@ -8895,15 +8908,21 @@ mod tests {
         let slot = std::sync::Arc::clone(&seen);
         fs.on_nth("rename_no_replace", 1, move |fs| {
             let root = fs.destination_root(Path::new("/dst")).unwrap();
-            let store = root.open_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap();
+            let store = root.open_claim_store(OsStr::new("state.db"), Durability::Strict).unwrap();
             *slot.lock().unwrap() = Some(store.prepared().unwrap());
         });
 
-        let run = roots_run(&fs, &[("f", "/src/f", true)], &unguarded);
+        let run = roots_run_with(
+            &fs,
+            &[("f", "/src/f", true)],
+            &unguarded,
+            Durability::Strict,
+            policy(64),
+        );
 
         run.result.as_ref().unwrap();
         let root = fs.destination_root(Path::new("/dst")).unwrap();
-        let store = root.open_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap();
+        let store = root.open_claim_store(OsStr::new("state.db"), Durability::Strict).unwrap();
         let identity = root.identity().unwrap();
         let FileIdentity::Strong(parent) = identity else { panic!("{identity:?}") };
         let claim = store
@@ -8911,6 +8930,9 @@ mod tests {
             .unwrap()
             .expect("the claim is stored under DEST and the file's name");
         assert_eq!(claim.target.0, key_of("f").0);
+        let pending = seen.lock().unwrap().take().expect("the hook ran at the publish");
+        assert_eq!(pending.len(), 1, "one note is pending at the rename: {pending:?}");
+        assert_eq!(pending[0].1.target.0, key_of("f").0, "the prepared target is the name alone");
     }
 
     #[test]
@@ -9013,10 +9035,37 @@ mod tests {
     }
 
     #[test]
-    fn a_file_root_over_a_reserved_path_fails_like_a_tree_file() {
-        // `reserved_path` needs two components (`.flux/operations/...`), and a file root's walk-relative path is
-        // one, so it cannot fire here; the helper still calls it, as a tree's file event does. A file root named
-        // `.flux` meets the workspace directory the run made, which fails it like a tree's top-level `.flux` file.
+    fn a_root_with_only_a_walk_or_create_dir_failure_is_failed() {
+        // `a/sub` cannot be created (the second `create_dir`; the first is `DEST/a`): a `create_dir` failure, no
+        // `copy` failure. A one-source run exits 1 on it, so the root is Failed, with no failed file.
+        let fs = sources(&[("a/w", b"0"), ("a/sub/x", b"1"), ("b/k", b"2")]);
+        fs.create_dir(Path::new("/dst")).unwrap();
+        // The count includes the fixture's own `create_dir` calls.
+        let made =
+            u32::try_from(fs.calls().iter().filter(|c| c.starts_with("create_dir(")).count());
+        let second = made.unwrap() + 2;
+        fs.fail_nth(
+            "create_dir",
+            second,
+            Code::PermissionDenied,
+            std::io::ErrorKind::PermissionDenied,
+        );
+
+        let run = roots_run(&fs, &[("a", "/src/a", false), ("b", "/src/b", false)], &unguarded);
+
+        run.result.as_ref().unwrap();
+        assert_eq!((run.out.failures.create_dir, run.out.failures.copy), (1, 0), "{:?}", run.got);
+        assert_eq!(statuses(&run), [RootStatus::Failed, RootStatus::Completed]);
+        assert_eq!(run.done[0].files_failed, 0, "files_failed stays the copy failures");
+        assert_eq!(fs.read_file("/dst/b/k").as_deref(), Some(&b"2"[..]), "the next root ran");
+    }
+
+    #[test]
+    fn a_per_file_failure_of_a_file_root_does_not_stop_the_loop() {
+        // A per-file failure of a file root marks that root Failed and the loop goes on. The failure is made with a
+        // file root named `.flux` over a `.flux` directory this test makes in DEST (standing for the workspace), which
+        // fails it like a tree's top-level `.flux` file. (`reserved_path` needs two components, `.flux/operations/...`,
+        // and a file root's path is one, so it cannot fire here; the helper still calls it, as a tree's file event does.)
         let fs = sources(&[(".flux", b"1"), ("g", b"2")]);
         fs.create_dir(Path::new("/dst")).unwrap();
         fs.create_dir(Path::new("/dst/.flux")).unwrap();
