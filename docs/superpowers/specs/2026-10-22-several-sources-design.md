@@ -391,8 +391,9 @@ ruling in §3.7, the second is moot under B).
 - Alias window: with a case-insensitive destination, the second creation of `Data`/`data` is decided by the record that
   names this operation, and gives `DESTINATION_NAMESPACE_COLLISION` exit 3 (not `TARGET_LOCK_BUSY`, exit 1). Two mutants
   must be red: the first prefix lock's record is written AFTER the next root's creation, and the `operation_id`
-  comparison is removed (both end in exit 1). On a destination that reports `Unavailable` file identities (the fake can
-  be set to) the same test gives the same answer, so a comparison of identities cannot satisfy it by accident.
+  comparison is removed (both end in exit 1). The fake cannot model a lock file with an `Unavailable` identity (`FakeLock::path` resolves by a
+  Strong identity, `fault_fs.rs:904-912`; a finding of the plan's lock reader), so the two mutants carry the guarantee that an
+  identity comparison was not reintroduced.
 - State format, root kind: a version-5 record round-trips `kind` for a mixed file and folder run; a version-5 root
   without `kind`, and a version-3 or -4 root with it, are rejected.
 - JSON: a several-source report has `roots` with the right statuses after a mid-run abort; a one-source report has none;
