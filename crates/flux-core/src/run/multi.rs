@@ -935,7 +935,7 @@ mod tests {
         assert!(first.is_absolute() && first.ends_with("rel/d"), "{first:?}");
         assert_eq!(
             from_native_hex(&roots[1].source_root).expect("decodes"),
-            PathBuf::from("/src/f")
+            std::path::absolute("/src/f").expect("absolute")
         );
     }
 
@@ -1570,7 +1570,12 @@ mod trees_tests {
         match &r.run.stop {
             Some(RunError::Refused { refusal, changed: false, .. }) => {
                 assert_eq!(refusal.code, LockCode::DestinationNamespaceCollision);
-                assert!(refusal.detail.contains("/p/dest/b"), "{}", refusal.detail);
+                let shown = Path::new("/p/dest").join("b");
+                assert!(
+                    refusal.detail.contains(&shown.display().to_string()),
+                    "{}",
+                    refusal.detail
+                );
             }
             other => panic!("expected a refusal before transfer, got {other:?}"),
         }

@@ -2028,9 +2028,13 @@ mod tests {
     fn a_version_4_record_encodes_to_the_pinned_bytes() {
         let bytes = OperationState::created(&id(1), Kind::Tree, Path::new("/d"), 5, None, config())
             .encode();
+        // The source root is native hex: bytes of "/s" on Unix, UTF-16 units of "\\s" on Windows.
+        let source_root = if cfg!(windows) { "5c007300" } else { "2f73" };
         assert_eq!(
             String::from_utf8(bytes).unwrap(),
-            r#"{"cleanup_pending":false,"cleanup_pending_artifacts":[],"configuration_fingerprint":"6814cb38cd3fe6c13a382a988c9c5cbac2ebcf30be0bb4af44596d3019b19f1d","created_at":"5","destination_root":"/d","format_version":4,"kind":"tree","operation_id":"00000000000000000000000000000001","options":{"durability":"normal","existing":"overwrite","preserve_permissions":"default","preserve_times":"default","safety":"default"},"roots":[{"destination_prefix":"","source_identity":"strong:3:9","source_root":"2f73"}],"state":"CREATED","superseded_by":null,"takeover":null,"wal_generation":1}"#
+            format!(
+                r#"{{"cleanup_pending":false,"cleanup_pending_artifacts":[],"configuration_fingerprint":"6814cb38cd3fe6c13a382a988c9c5cbac2ebcf30be0bb4af44596d3019b19f1d","created_at":"5","destination_root":"/d","format_version":4,"kind":"tree","operation_id":"00000000000000000000000000000001","options":{{"durability":"normal","existing":"overwrite","preserve_permissions":"default","preserve_times":"default","safety":"default"}},"roots":[{{"destination_prefix":"","source_identity":"strong:3:9","source_root":"{source_root}"}}],"state":"CREATED","superseded_by":null,"takeover":null,"wal_generation":1}}"#
+            )
         );
     }
 

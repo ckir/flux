@@ -297,7 +297,7 @@ mod tests {
         std::fs::create_dir(tmp.join("x")).unwrap();
         std::fs::write(tmp.join("f"), b"x").unwrap();
         let mut slash = tmp.join("dir").into_os_string();
-        slash.push("/");
+        slash.push(std::path::MAIN_SEPARATOR_STR);
         let sources = vec![
             tmp.join("dir").join("inner").join("."),
             tmp.join("dir").join("..").join("x"),
