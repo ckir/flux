@@ -102,10 +102,13 @@ impl<'a, D: DirHandle> PrefixLocks<'a, D> {
         held: &[(OsString, Held<'a, D>)],
     ) -> Result<(Held<'a, D>, Option<OsString>), PrefixRefusal> {
         let site = LockSite::directory(dir, name).map_err(PrefixRefusal::Lock)?;
+        // Built before `obtain`: once a `Held` exists, the only fallible step left is `write_record`, so no error
+        // path can leave a recordless lock file behind (`Held` has no `Drop`).
+        let complete_lock_key = site.complete_lock_key().map_err(PrefixRefusal::Lock)?;
         match obtain(&site, cap, Mode::Plain, id.operation_id) {
             Ok(Obtained::Held { held: mut h, leftover_broken }) => {
                 let record = LockRecord {
-                    complete_lock_key: site.complete_lock_key().map_err(PrefixRefusal::Lock)?,
+                    complete_lock_key,
                     operation_id: id.operation_id.to_string(),
                     owner_instance_id: id.owner_instance_id.to_string(),
                     boot_session_id: id.boot_session_id.to_string(),
