@@ -49,7 +49,10 @@ failure itself (a `TargetLockBusy` from the publish guard) or behind another fai
 `discard` then finds the lock gone and keeps the temporary, while the returned code stays the I/O error). The re-check covers both.
 
 The three sites are the complete list: the panel traced every `state.db` write in `tree.rs` and its callees (round 1, question 2) and found
-no other one made after a failure; the success-path commits after a rename are N2. `cx.guard` is in scope at all four unbatched call sites
+no other discard or settle made after a failure; the success-path commits after a rename are N2. (The final review found one further class, outside G1:
+in `flush_batch`, `prepare_many` and the per-entry `prepare` fallback can write a NOTE for the next entry after a `discard` inside the same flush saw
+the lock lost and kept a temporary. The next publish guard then stops the run, and a note for a never-renamed temporary is recovery row 2, so no data
+is at risk; it is tracked in TODO.md, not fixed here.) `cx.guard` is in scope at all four unbatched call sites
 (they already pass it to the copy, `tree.rs:1580-1586`) and in `flush_batch`.
 
 A transient I/O error in `still_owned` at a re-check is `TargetLockBusy` (`session.rs:474`) and therefore stops the run where, without the

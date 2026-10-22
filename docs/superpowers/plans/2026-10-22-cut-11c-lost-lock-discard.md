@@ -563,7 +563,7 @@ For each mutant, apply it in the working tree, run the named test, confirm RED, 
 | Mutant | Must turn red |
 |---|---|
 | Site 1: remove the `TargetLockBusy` early return (case 2 falls into case 3/4) | `t1_unbatched_publish_guard_failure_after_the_note_keeps_it_and_stops` (`calls.get()` becomes 4 and, with the guard still failing, the note is kept anyway — so the `calls.get() == 3` assertion is the kill; keep it) |
-| Site 1: remove the re-check (always discard) | `t2_unbatched_rename_failure_then_a_lost_lock_...`, `t2c`, `t1_link` |
+| Site 1: remove the re-check (always discard) | `t2_unbatched_rename_failure_then_a_lost_lock_...`, `t2b`, `t2c` (`t1_link` is killed by the early-return mutant only) |
 | Site 2: remove the re-check | `t3_a_lost_lock_inside_the_stop_held_loop_...` |
 | Site 3: remove the re-check | `t4_a_lost_lock_before_the_settling_transaction_...`, `a_lost_lock_before_the_batch_settles_...` |
 | Site 3: re-check on every batch | `t4_no_failed_entry_means_no_settling_re_check` |
