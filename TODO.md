@@ -521,13 +521,13 @@ the spec's numbers, 9-10 were learned during execution).
 
 ## Cut 9c debt
 
-- [ ] A test for a heartbeat failure after the note is written is missing.
+- [x] A test for a heartbeat failure after the note is written is missing. — closed by cut 11c (spec `docs/superpowers/specs/2026-10-22-cut-11c-lost-lock-discard-design.md`, section 6, test t2d_a_heartbeat_failure_after_the_note_with_the_lock_held_discards_it in crates/flux-core/src/tree.rs).
 - [ ] The Normal path builds the note template needlessly.
-- [ ] After a lost guard the UNBATCHED Strict path's `discard_note_on_failure` still writes `state.db` (`discard_prepared`,
+- [x] After a lost guard the UNBATCHED Strict path's `discard_note_on_failure` still writes `state.db` (`discard_prepared`,
       `crates/flux-core/src/tree.rs`), where the batched path writes nothing after a lost lock (9d spec decision 8). Align it:
       skip the discard when the guard reported the loss. (Triage of 2026-10-11, verified 2026-10-10.) Re-verified 2026-10-17:
       four call sites in `copy_one` and `link_one` (files since cut 9c, links since cut 10a); spec 3.2 step 5 says the note is
-      left for recovery. The fix needs a test that loses the lock between the note and the publish.
+      left for recovery. The fix needs a test that loses the lock between the note and the publish. — closed by cut 11c (spec `docs/superpowers/specs/2026-10-22-cut-11c-lost-lock-discard-design.md`, section 4.2).
 
 ## Cut 9d known limits
 
@@ -613,9 +613,9 @@ the spec's numbers, 9-10 were learned during execution).
 
 PS-1 (a socket at the lock or claim-store path was `IO_ERROR`, exit 1) and PP-1 (`ClaimStore::get` answered `Ok(None)` for an undecodable record) were fixed in `31a000d`. Left open:
 
-- [ ] **A lost lock inside the STOP-HELD discard loop of `flush_batch`** (`crates/flux-core/src/tree.rs`, `let _ = claims.borrow_mut().apply_recovery(&ops);`): when the first stop is not `TargetLockBusy` and `cx.guard` then fails while a LATER entry's temporary is discarded, the loop still pushes that entry's `Discard` and writes `state.db`, and returns the original stop, so `drain_batches` removes instead of keeping. A narrow race, the same family as the UNBATCHED item above (9d decision 8 says the batched path writes nothing after a lost lock). Reasoned from the code, not reproduced.
+- [x] **A lost lock inside the STOP-HELD discard loop of `flush_batch`** (`crates/flux-core/src/tree.rs`, `let _ = claims.borrow_mut().apply_recovery(&ops);`): when the first stop is not `TargetLockBusy` and `cx.guard` then fails while a LATER entry's temporary is discarded, the loop still pushes that entry's `Discard` and writes `state.db`, and returns the original stop, so `drain_batches` removes instead of keeping. A narrow race, the same family as the UNBATCHED item above (9d decision 8 says the batched path writes nothing after a lost lock). Reasoned from the code, not reproduced. — closed by cut 11c (spec `docs/superpowers/specs/2026-10-22-cut-11c-lost-lock-discard-design.md`, section 4.3).
 - [ ] **The non-ASCII fold limit (cut 9d limit 7) also covers two FILES** whose names fold equal only by a non-ASCII fold, under `--existing=update` or `skip-existing` into a folding destination: the second resolves against the not-yet-replaced destination entry (the pre-check `folded()` is ASCII only and the temp probe runs later) and may be skipped instead of reported as a collision. Reasoned; the fake folds ASCII only and this machine's filesystem is case-sensitive.
-- [ ] **The fake (`fault_fs.rs`) does not match the two fixes of `31a000d`:** `corrupt_claim()` (used by `FakeClaimStore::get`) answers `Code::IoError` where `RedbClaimStore::read` now answers `StateCorrupt`, and `FakeDirHandle::open_claim_store` has no special-file check (unlike `FakeDirHandle::open_lock`), so `add_special` at `state.db` answers `StateCorrupt` ("zero-length claim store") instead of `DestinationError`. No fake-backed test reaches either today. Found by the capstone, below its floor. `RedbClaimStore::insert_if_absent` and `upgrade_own_claim` still map an undecodable record to `IoError` (pre-existing).
+- [x] **The fake (`fault_fs.rs`) does not match the two fixes of `31a000d`:** `corrupt_claim()` (used by `FakeClaimStore::get`) answers `Code::IoError` where `RedbClaimStore::read` now answers `StateCorrupt`, and `FakeDirHandle::open_claim_store` has no special-file check (unlike `FakeDirHandle::open_lock`), so `add_special` at `state.db` answers `StateCorrupt` ("zero-length claim store") instead of `DestinationError`. No fake-backed test reaches either today. Found by the capstone, below its floor. `RedbClaimStore::insert_if_absent` and `upgrade_own_claim` still map an undecodable record to `IoError` (pre-existing). — closed by cut 11c (spec `docs/superpowers/specs/2026-10-22-cut-11c-lost-lock-discard-design.md`, section 4.4; RedbClaimStore insert_if_absent and upgrade_own_claim still map an undecodable record to IoError (N1)).
 - [ ] **Windows `open_lock` / `open_claim_store` with an `AF_UNIX` socket file at the name are unmeasured** (`dir_windows.rs`, `open_file_at`; the new socket tests are POSIX-only). The Windows open refuses reparse points, which an `AF_UNIX` socket file is, but the code returned by that path was not checked.
 
 ## Cut 11a known limits (`flux copy --dry-run`; spec `docs/superpowers/specs/2026-10-17-cut-11a-dry-run-design.md`, sections 1, 3.5, 3.6, 4)
