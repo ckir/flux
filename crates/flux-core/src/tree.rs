@@ -2766,6 +2766,14 @@ fn flush_batch<F: DestinationRoot>(
                     }
                     ops.push(RecoveryOp::Discard { key: q.key });
                 }
+                // Cut 11c (spec 4.3 site 2): the lock may have gone during the discards above. Then nothing more is
+                // written: the renamed keep their notes (recovery row 1), the stop that began this arm is reported for
+                // its entry (with the leftover it carries, already relative to DEST), and the lost lock is the stop,
+                // with no leftover of its own.
+                if let Err(lost) = (cx.guard)() {
+                    report(out, on_report, path, TreeFailureCause::Copy(stop));
+                    return Err(CopyError::at(CopyStep::Publish, lost));
+                }
                 let _ = claims.borrow_mut().apply_recovery(&ops);
                 return Err(stop);
             }
@@ -6470,6 +6478,59 @@ mod tests {
         }
         assert!(got.is_empty(), "{got:?}");
         assert_eq!(out.files_copied, 2);
+    }
+
+    #[test]
+    fn t3_a_lost_lock_inside_the_stop_held_loop_writes_nothing_and_keeps_every_later_frame() {
+        // Spec 4.3 site 2. Mutant: drop the re-check (apply_recovery runs; drain_batches removes the root's batch).
+        // Two frames: `a` pending in the root; m's DirEnd flush holds x, y, z.
+        // Each file holds its own relative name, so `published` (which compares bytes to the name) applies.
+        let fs = sources(&[("a", b"a"), ("m/x", b"m/x"), ("m/y", b"m/y"), ("m/z", b"m/z")]);
+        let calls = std::cell::Cell::new(0);
+        let beats = std::cell::Cell::new(0);
+        // Beats: a staged (1-3), m created (4), x y z staged (5-13), m's flush opening beat (14), x's publish (15):
+        // y's publish beat (16) fails with the lock held.
+        let beat = || {
+            beats.set(beats.get() + 1);
+            if beats.get() > 15 {
+                Err(FsError::new(Code::IoError, std::io::Error::other("beat")))
+            } else {
+                Ok(())
+            }
+        };
+        // Guards: a staged (1-2), m created (3), x y z staged (4-9), m's flush opening guard (10), x's publish (11),
+        // y's discard (12, held: removed); z's discard (13) fails (kept); the re-check (14) fails.
+        let guard = failing_after(12, &calls);
+        let (r, out, got) = batched_with(&fs, policy(64), Durability::Strict, &guard, &beat);
+        let error = r.unwrap_err();
+        assert_eq!(
+            (error.code(), error.step),
+            (Code::TargetLockBusy, CopyStep::Publish),
+            "{error:?}"
+        );
+        assert!(error.leftover.is_none(), "{error:?}");
+        assert_eq!((beats.get(), calls.get()), (16, 14), "the events the indices name");
+        let c = log(&fs);
+        assert_eq!(count(&c, "claim_apply_recovery"), 0, "{c:?}");
+        assert_eq!(count(&c, "claim_discard_prepared("), 0, "{c:?}");
+        assert_eq!(fs.prepared_count(), 3, "x, y, z keep their notes");
+        assert!(published(&fs, "m/x"), "renamed");
+        assert!(
+            fs.claim(strong_id(&fs, "/dst/m"), "x").is_none(),
+            "not committed; finalized at --resume"
+        );
+        assert!(!fs.exists("/dst/m/y.flux-partial.op1"), "removed while the lock was held");
+        assert!(
+            fs.exists("/dst/m/z.flux-partial.op1") && fs.exists("/dst/a.flux-partial.op1"),
+            "kept"
+        );
+        // y: the original stop, reported (no leftover); z: kept in the loop; a: the root's batch, KeepAll in the drain.
+        let y = got.iter().find(|f| f.path.as_path() == Path::new("m/y")).expect("y reported");
+        let TreeFailureCause::Copy(e) = &y.cause else { panic!("{got:?}") };
+        assert_eq!((e.code(), e.step), (Code::IoError, CopyStep::Heartbeat), "{e:?}");
+        assert!(e.leftover.is_none());
+        assert_eq!(leftovers(&got, Some(&error)), [temp_of("a"), temp_of("m/z")], "{got:?}");
+        assert_eq!(out.files_copied, 1);
     }
 
     #[test]
