@@ -9,6 +9,7 @@
 //! change it.
 
 mod dry_prior;
+mod multi;
 pub(crate) mod place;
 mod prefix;
 mod recover;

@@ -8,7 +8,6 @@ use flux_fs::{DirHandle, LockCapability};
 use std::ffi::OsString;
 
 /// The identity every prefix lock record carries.
-#[allow(dead_code)] // used by run::multi (plan task 6)
 pub(crate) struct PrefixId<'a> {
     pub operation_id: &'a str,
     pub owner_instance_id: &'a str,
@@ -17,7 +16,6 @@ pub(crate) struct PrefixId<'a> {
 }
 
 /// `PrefixId` with owned strings, for a caller that must keep it across calls.
-#[allow(dead_code)] // used by run::multi (plan task 6)
 pub(crate) struct PrefixIdOwned {
     pub operation_id: String,
     pub owner_instance_id: String,
@@ -26,7 +24,6 @@ pub(crate) struct PrefixIdOwned {
 }
 
 impl PrefixIdOwned {
-    #[allow(dead_code)] // used by run::multi (plan task 6)
     pub(crate) fn as_ref(&self) -> PrefixId<'_> {
         PrefixId {
             operation_id: &self.operation_id,
@@ -38,7 +35,6 @@ impl PrefixIdOwned {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // used by run::multi (plan task 6)
 pub(crate) enum PrefixRefusal {
     /// Two names of this run are one lock file (a case or normalization alias): `name` met the lock `other` holds.
     Collision {
@@ -49,7 +45,6 @@ pub(crate) enum PrefixRefusal {
 }
 
 /// The prefix locks a run holds, in the order they were taken.
-#[allow(dead_code)] // used by run::multi (plan task 6)
 pub(crate) struct PrefixLocks<'a, D: DirHandle> {
     held: Vec<(OsString, Held<'a, D>)>,
 }
@@ -69,7 +64,6 @@ fn release_held<D: DirHandle>(held: Vec<(OsString, Held<'_, D>)>) -> Vec<(OsStri
 impl<'a, D: DirHandle> PrefixLocks<'a, D> {
     /// Lock each of `names` in `dir`, in order, writing each record before the next lock is created. On any refusal
     /// the locks already taken are released. The second value is the `.broken` leftovers a recovery reported.
-    #[allow(dead_code)] // used by run::multi (plan task 6)
     pub(crate) fn acquire(
         dir: &'a D,
         cap: LockCapability,
@@ -151,7 +145,6 @@ impl<'a, D: DirHandle> PrefixLocks<'a, D> {
     }
 
     /// Release every lock; the failures only.
-    #[allow(dead_code)] // used by run::multi (plan task 6)
     pub(crate) fn release_all(self) -> Vec<(OsString, LockError)> {
         release_held(self.held)
     }
