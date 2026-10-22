@@ -121,7 +121,11 @@ Order, all before any transfer:
    read its own live lock as dead and take it over. A comparison of file identities was considered and dropped: a
    `FileIdentity` is `PartialEq` over `Strong`, `Weak` and `Unavailable` (`flux-fs/src/fs.rs:88-92`), so two
    `Unavailable` identities (FAT32, exFAT, some SMB and NFS) compare equal and a foreign lock would be reported as an
-   alias. A test makes the window observable (V10).
+   alias. The write must be COMPLETE before the next root's creation starts: the record is written with the lock's own
+   handle and flushed or synced as `Held::write_record` does for an operation lock, with no buffered writer left open,
+   so that the next creation's `classify`, which opens the same file with a second handle and reads it, sees the whole
+   record. The strict order for each root is: create the lock, hold its OS-native lock, write and complete the record,
+   and only then attempt the next root's creation (a panel finding, round 3). A test makes the window observable (V10).
 Length rule (a finding of the panel): spec §96.1 says that when `<name>.flux-lock` would exceed the directory's
 name-length limit the acquirer takes the directory lock `P/.flux-dir.lock` instead, and that per-name locks and the
 directory lock exclude each other (`lock/acquire.rs:53` already refuses a per-name acquirer when `.flux-dir.lock` is
@@ -288,7 +292,9 @@ ruling in §3.7, the second is moot under B).
 - V8. Crash residue: after a crash the prefix lock files stay. What a later several-source run, a one-source tree run onto
   DEST (spec §97.1(b)) and `flux cleanup DEST` each do with them; whether `cleanup` removes them. Test obligation in §7.
 - V9. The descriptor cost of one held prefix lock on each platform, to set the cap of §3.4.
-- V10. The alias decision of §3.4 on a case-insensitive destination, including the window between a prefix lock being
+- V10. Read-after-write across two handles of one process (the writer's and `classify`'s) on each platform; it is
+  expected on Unix (one page cache), and is UNVERIFIED on Windows, where the Windows CI job must show it. The alias
+  decision of §3.4 on a case-insensitive destination, including the window between a prefix lock being
   created and its record being written (a root's creation must not start inside it); and that a prefix lock closed
   early would be read as dead (`classify`: an unheld lock with a record is `Dead`, agy confirmed this from the same
   lines), which is why the locks are held for the whole run.
@@ -337,8 +343,11 @@ ruling in §3.7, the second is moot under B).
 - Crash residue: a run killed after the prefix locks leaves them with `workspace_path` `none`; a later several-source run
   using the same names recovers them (no `ARTIFACT_OWNERSHIP_UNCERTAIN`, no loop with the cleanup hint); a later
   one-source tree run onto DEST and `flux cleanup DEST` each behave as V8 settled, with a test per behaviour.
-- Alias window: with a case-insensitive destination, the second creation of `Data`/`data` is decided by identity, gives
-  `DESTINATION_NAMESPACE_COLLISION` exit 3 (not `TARGET_LOCK_BUSY`), and a mutant that decides by record is red.
+- Alias window: with a case-insensitive destination, the second creation of `Data`/`data` is decided by the record that
+  names this operation, and gives `DESTINATION_NAMESPACE_COLLISION` exit 3 (not `TARGET_LOCK_BUSY`, exit 1). Two mutants
+  must be red: the first prefix lock's record is written AFTER the next root's creation, and the `operation_id`
+  comparison is removed (both end in exit 1). On a destination that reports `Unavailable` file identities (the fake can
+  be set to) the same test gives the same answer, so a comparison of identities cannot satisfy it by accident.
 - State format, root kind: a version-5 record round-trips `kind` for a mixed file and folder run; a version-5 root
   without `kind`, and a version-3 or -4 root with it, are rejected.
 - JSON: a several-source report has `roots` with the right statuses after a mid-run abort; a one-source report has none;
@@ -381,7 +390,8 @@ Discarded below the floor: none this round. Unverified-accepted: none.
 Panel round 1, agy escalation (reply verified line by line; agy's verdict NEGOTIATE). A1 prefix-lock crash residue is an
 orphan and cleanup does not clear it: FOLDED (§3.4 crash residue, R7, L6; the mechanism is confirmed at `lock/site.rs:152-186`
 and `lock/obtain.rs`, the cleanup half is read from `cleanup/discover.rs` and re-read by the plan). A2 the empty lock record
-makes the alias check read as `TARGET_LOCK_BUSY`: FOLDED (§3.4 identity rule, V10; confirmed at `lock/classify.rs`
+makes the alias check read as `TARGET_LOCK_BUSY`: FOLDED (§3.4, V10; the identity rule first written here was replaced in
+round 2 by the record rule; confirmed at `lock/classify.rs`
 `Decoded::Uncertain(_) if !got` and `lock/obtain.rs` "no record yet"). A3 a version-5 `Root` has no kind: FOLDED (§3.5,
 tests). A4 `--json` is blind to which roots finished: FOLDED as R8. A5 root names `.flux-dir.lock` and `.flux-root.lock`:
 FOLDED (§3.2). A6 the file-root seam is deferred wholesale: FOLDED (V3 reworded; the choice stays with the plan, which
