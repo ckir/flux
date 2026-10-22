@@ -1,6 +1,6 @@
 # Several sources: `flux copy a b c DEST` (fresh copies only)
 
-Status: DRAFT for owner review (2026-10-22); adversarial panel run for five rounds (see Stand-downs). Branch `spec/several-sources` off main `1b69bd4`.
+Status: IMPLEMENTED on branch feat/several-sources (2026-10-22); all ten plan tasks reviewed; capstone and test audit pending.
 Master spec: `FLUX_FULL_UPDATED_SPEC_V16.md` (cited as "spec §N"). Roadmap: ROADMAP.md, 0.1 scope item "multiple sources".
 
 ## 1. Intent
@@ -240,9 +240,9 @@ actually do is part of V1, not assumed. The plan
   `DEST/<name>` file follows the operation's `--overwrite|--update|--skip-existing` through the claim path, as a file
   inside a tree does since cut 8b (ROADMAP phase 9: "atomic replacement under claim records, with `--overwrite`,
   `--update` and `--skip-existing`"). The plan's reader found that a file in a tree and a two-positional single-file copy
-  are NOT identical in two corners (a skip never reaches the identity gate in a tree, `tree.rs:1480`, but does in
+  are NOT identical in two corners (a skip never reaches the identity gate in a tree, `copy_one` in `tree.rs` (the skip decision at `tree.rs:1754`), but does in
   `plan_file`, `copy.rs:386-394`; and a destination whose identity is not Strong makes every existing file a collision
-  in a tree, `tree.rs:1277`, where a single-file copy honours the policy). A file root follows the TREE rule, so the two
+  in a tree, the `claim_parent = None` path of `copy_one` (`tree.rs:1554`, set up by `root_state`, `tree.rs:951`), where a single-file copy honours the policy). A file root follows the TREE rule, so the two
   corners are accepted differences and are stated in `docs/accepted-boundaries.md`; for a Strong destination identity and
   an existing target that is not the source, the two commands agree on bytes, replace-or-keep and counters, and the
   test below pins that. My proposal;

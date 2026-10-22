@@ -98,3 +98,19 @@ One section per audited change, newest at the bottom.
 - **The lock and the operation state are reported as unperformed (ruling P10):** every dry run lists `target_lock` in the JSON's `unprobed` and prints one note; `prior_operation` joins it when a prior was seen. A real run may be refused or fail at the lock.
 - **The unprobed `NOREPLACE_PUBLISH_UNAVAILABLE` note prints on every tree dry run** that reaches the walk, because the dry run never opens the operation and so never probes (D3). It is never printed for a single file, which has no probe.
 - **The fake filesystem does not inherit identity strength on `create_dir`** (ruling P4), so a fake-backed live run notes `replace_degraded` once where the dry run notes the planned child too. Compensation: the real-filesystem paired test (`crates/flux-core/tests/dry_run_std_fs.rs`), where both modes note the same count, and the dry test's explicit count of 2.
+
+## Several sources - `flux copy a b c DEST` (2026-10-22)
+
+These are limits and rulings of the cut, not test gaps. Each is stated as the spec's section 6, 3.4 and 3.6 state it (`docs/superpowers/specs/2026-10-22-several-sources-design.md`).
+
+- **L1. An aborted several-source run is not resumed.** After an aborted or crashed several-source run, re-running the same command is refused by the prior-operation scan (spec 21.1). With several sources `--restart` is refused in this cut, so the way forward is `flux cleanup --force DEST`, or `flux copy --restart` with one source. The resume cut removes this.
+- **L2. The pre-transfer phase stops at the first bad source,** not all of them.
+- **L3. A several-source run is not atomic across roots.** Roots finished before an abort stay on disk.
+- **L4. A root with a very long name is refused.** A root whose name is so long that `<name>.flux-lock` exceeds the directory's limit is refused. Spec 96.1's directory-lock fallback is not used by several-source runs.
+- **L5. The number of sources has a cap.** The plan sets it from a measurement, at run time, from the open-file limit.
+- **L6. A dead prefix lock can stay behind.** A dead prefix lock for a name no later run uses stays in DEST as a stale file until that name is used again (ruling R7).
+- **A skipped existing file does not reach the identity check in a tree, but does in a single-file copy.** A file root follows the tree rule (spec 3.6). Pinned by `a_skip_never_reaches_the_identity_gate_for_a_file_root` in `crates/flux-core/src/run/multi.rs`.
+- **A destination directory whose identity is not Strong makes an existing file a collision in a tree,** where a single-file copy honours the policy. A file root follows the tree rule. MEASURED LIVE during implementation. Pinned by `a_weak_parent_identity_degrades_to_no_replace` in `crates/flux-core/src/run/tests.rs` and `a_weak_destination_identity_makes_a_file_root_a_collision_like_a_tree_file` in `crates/flux-core/src/run/multi.rs`.
+- **R1. One destination-root lock plus one prefix lock per root.** All are held for the whole run. The workspace lives under `DEST/.flux/`, and the root lock serialises every operation on DEST. The prefix locks add alias detection and protect each `DEST/<name>` against a single-source tree run onto DEST.
+- **R7. Prefix lock records carry `workspace_path` `none`.** This extends master spec 259.6, which defines `none` only for cleanup locks. The operation lock already names the real workspace. A dead prefix lock is then trusted and recovered by the next acquirer of that name. Owner decision.
+- **Nested sources copy shared content twice (R5).** `flux copy a a/sub DEST` copies the content under `a/sub` to `DEST/a/sub` and to `DEST/sub`. The prefixes are distinct, which is all spec 18.3 requires.

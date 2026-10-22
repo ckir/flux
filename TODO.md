@@ -228,8 +228,9 @@ Each was measured, and each is deliberately NOT fixed in that PR.
       says so.
 - [ ] **A skipped special file is reported as `object_type=special`.** The walk types it `Other` from
       `read_dir` and does not say FIFO, socket or device (§233.1 wants the object type).
-- [ ] **Several sources are a usage error.** §4.1's last row and §18.3 need the operation workspace;
-      `flux copy` takes exactly two positionals until then (cut 5).
+- [x] **Several sources are a usage error.** Closed by the several-sources cut (branch `feat/several-sources`;
+      spec `docs/superpowers/specs/2026-10-22-several-sources-design.md`): `flux copy a b c DEST` copies fresh
+      copies under one operation. The resume family stays open, below.
 - [ ] **A dangling destination link is exit 3 on Linux only by measurement.** macOS's `open_dir` answer
       for a link (ENOTDIR vs ELOOP) was not measured; if ELOOP, the same run is `IO_ERROR`, exit 1 -
       safe, but not §55's refusal code (cut 5 plan, refinement 3).
@@ -1116,11 +1117,22 @@ Each is deferred to the cut that first reads it (cut 7b spec, `docs/superpowers/
       unproven data; that argument was not measured, and the spec amendment is the owner's call. Decision 15's real-filesystem crash tests are the
       `real-filesystem crash-injection harness` item, still open, under "Cut 9e debt" above (the test-audit debt entry
       near line 593).
-- [ ] **`roots` (§19, §18.3)** - cut 10: one root until several sources exist.
+- [ ] **`roots` (§19, §18.3)** - the manifest now carries several roots (format 5, several-sources cut). What remains is resume, restart and dry-run over several sources (see "Several sources known limits").
 - [ ] **`last_heartbeat_monotonic` (§229.2)** - cut 9: "diagnostic/current-session data only".
 - [ ] **Finishing a prior run's `cleanup_pending` (§21.1 "may", §218)** - cut 9: a COMPLETED prior with
       `cleanup_pending = true` and its artifact list is proceeded past and left.
 - [ ] **Stale classification from heartbeat age (§102)** - cut 9.
+
+## Several sources known limits (`flux copy a b c DEST`; spec `docs/superpowers/specs/2026-10-22-several-sources-design.md`)
+- [ ] **`--resume`, `--restart`, `--break-lock` and `--dry-run` with several sources (L1).** They are usage errors. After an aborted several-source run the way out is `flux cleanup --force DEST` or a one-source `flux copy --restart`.
+- [ ] **The source cap has no measured value on Windows.** The cap is computed at run time from the descriptor limit. Windows has no measured number.
+- [ ] **A walk skip for stray `*.flux-lock` files (spec V11).** A stale prefix lock copied as payload when a DEST is later used as a source.
+- [ ] **`LockSite::named` accepts a lock name its recovery rename cannot hold.** A dead lock whose name is 216 to 255 units can be acquired but never recovered. Measured on ext4: errno 36. See `crates/flux-core/src/lock/site.rs:82`, `broken_name` at `site.rs:108` and the rename at `crates/flux-core/src/lock/recover.rs:42`. The several-sources cut guards prefix locks only, with `prefix_lock_fits`.
+- [ ] **Read-after-write of a lock record across two handles on Windows (spec V10)** is shown only by the Windows CI job.
+- [ ] **Test infrastructure: `FakeLock::path` resolves a lock handle by FileIdentity index alone** (`crates/flux-core/src/fault_fs.rs:904`). `set_identity` with a low index collides with minted lock-file identities. Tests use indices from 9_000_000 up.
+- [ ] **Deferred test gaps.** No test for `before_rollback` in the `Probe::Unavailable` and probe-Err arms of `MultiPlace::create`. None for a heartbeat abort between roots. None for the claim flush after a failed file-root copy. None for `FileCkpt.destination` keyed under a prefix. None for a lock refusal other than an alias in `PrefixLocks`.
+- [ ] **Windows device names and helpers.** The superscript-digit names (COM1-3 and LPT1-3 with superscripts) are not in the reserved-name rule of `crates/flux-core/src/run/roots.rs`. The Windows-only helpers `folded_units` and `windows_reserved` have no Windows test run.
+- [ ] **A missing source plus a DEST that is a file exits 1, not 2.** The DEST-is-a-file check runs after per-source resolution.
 
 ## Closed
 
