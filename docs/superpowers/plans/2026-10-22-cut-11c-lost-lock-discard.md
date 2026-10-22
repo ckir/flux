@@ -212,6 +212,9 @@ fn t2b_the_collision_remap_survives_the_lost_lock_report() {
     let TreeFailureCause::Copy(e) = &got[0].cause else { panic!("{got:?}") };
     assert_eq!(e.code(), Code::DestinationNamespaceCollision, "{e:?}");
     assert_eq!(fs.read_file("/dst/f0").as_deref(), Some(&b"theirs"[..]));
+    // Without these the test passes against today's code too (f1's sweep guard stops the run anyway).
+    assert_eq!(count(&log(&fs), "claim_discard_prepared("), 0);
+    assert_eq!(fs.prepared_count(), 1, "the note stays");
 }
 
 #[test]
@@ -272,7 +275,8 @@ fn t1_link_publish_guard_failure_after_the_note_keeps_it() {
     let fs = links(&[("n", "p")]);
     let calls = std::cell::Cell::new(0);
     let guard = failing_after(LINK_GUARD_AT_CREATE, &calls);
-    let (r, _, _) = link_run(&fs, &strict(), false, policy(1), &guard, no_seed);
+    let o = CopyOptions { durability: Durability::Strict, ..opts() }; // a link writes a note only under Durability::Strict (tree.rs:1991); `strict()` is Safety::Strict only
+    let (r, _, _) = link_run(&fs, &o, false, policy(1), &guard, no_seed);
     assert_eq!(r.unwrap_err().code(), Code::TargetLockBusy);
     assert_eq!(calls.get(), 3);
     assert_eq!(count(&log(&fs), "claim_discard_prepared("), 0);
