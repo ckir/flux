@@ -59,7 +59,10 @@ Anti-goals (a failure even if the tests pass)
   `dir/` usable, which §18.3's "the root's final path component" leaves open). A source with no final component
   (the filesystem root) fails with exit 1 and the existing "the source has no file name" line. The prefix of the root
   is that one component; the source lands at `DEST/<name>`.
-- A symlink source is refused as today (K7, exit 1). A missing source fails as today (exit 1 with the platform line).
+- Each source is resolved exactly as `resolve::job` resolves the one source today, in this order: `symlink_metadata`
+  on the path AS GIVEN (a symlink source is refused, K7, exit 1; a missing source fails, exit 1 with the platform line),
+  then the kind, then canonicalisation for the name. A trailing separator on a link therefore behaves as it does today
+  for one source; this cut changes nothing there.
 - A source whose name is `.flux` (ASCII case-insensitive, as `reserved_path` compares), or ends in `.flux-lock`
   (ASCII case-insensitive), is refused before transfer with `CONTROL_PLANE_NAMESPACE_CONFLICT`. `reserved_path`
   (`tree.rs:982`) alone does not do this: it reserves only `.flux/operations`, `.flux/standalone` and `.flux/atomic`,
@@ -93,13 +96,25 @@ destination-root lock. I take it (step 1) because the workspace lives under `DES
 every operation on DEST, as for a single tree; the prefix locks add alias detection and protect each `DEST/<name>`
 against a single-source tree run onto DEST (spec §97.1(b)). The alternative, prefix locks only, would leave
 `DEST/.flux/` unprotected. Recorded as a ruling in this spec and in the plan's ledger.
+Order of operations (answers builder question 1): (1) the operation lock, beside DEST; (2) DEST created where absent,
+as a tree's step 5 does today (E1; `created_dest`); the prefix locks live INSIDE DEST, so DEST must exist first;
+(3) the prefix locks; (4) the workspace `DEST/.flux/operations/<id>/` and the claim store. An alias or busy prefix lock
+at step 3 therefore finds NO workspace: every prefix lock taken is released (the last close removes the file), the
+operation lock is released, and a DEST this run created is removed again. That is `Refused { changed: false }`, exit 3,
+by the existing convention ("`changed` is false when nothing changed, or what the run created was removed again",
+`run/mod.rs:153-157`); a DEST that cannot be removed is `not_removed`, exit 1, as today. The section 7 test for
+refusals reads "DEST not present afterwards", which covers both a DEST never made and one made and removed.
 Prefix locks are released when the operation ends, on every path, before the workspace is retired.
 
 ### 3.5 Operation state
-- One workspace `DEST/.flux/operations/<id>/` (never under `DEST/<name>/`), kind tree, `roots` with n entries, each
-  `{source_root, source_identity, destination_prefix}` where `destination_prefix` is the `native_hex` of the name for
-  folder AND file roots, in root order (§3.6). (Today a tree records `""` and a single file records its name; a
-  several-source operation has no empty prefix.)
+- One workspace `DEST/.flux/operations/<id>/` (never under `DEST/<name>/`), kind tree, `roots` with n entries in root
+  order (§3.6). Each root records what today's single-root records store for its kind, except the prefix: a folder
+  root `{source_root: native_hex of the absolute folder, source_identity: the folder's, destination_prefix: native_hex
+  of its name}` (today's tree record, `run/place.rs:567-572`, with the prefix filled in instead of `""`); a file root
+  `{source_root: native_hex of the absolute FILE path, source_identity: the file's, destination_prefix: native_hex of
+  its name}` (exactly today's single-file record, `run/place.rs:808-814`). A several-source operation has no empty
+  prefix. The identity pre-flight, the one-source `--resume` mismatch refusal and `cleanup` all read these fields;
+  keeping today's conventions means none of them learns a new one.
 - One claim store `state.db`, as a tree's. Claims are keyed by destination directory identity, so the roots share it.
 - A NEW state format version, written ONLY by a several-source run (my call, R3). The current record validator rejects
   any record whose `roots` is not exactly one (`crates/flux-core/src/state.rs:572-574`, "roots has {} entries, not 1"),
@@ -117,13 +132,23 @@ Prefix locks are released when the operation ends, on every path, before the wor
 ### 3.6 Execution
 - Roots are processed sequentially in the bytewise order of their prefix `FluxPathKey` (spec §103), not command-line
   order. With single-component prefixes this is global key order without buffering (§18.3); it is the order a later
-  hardlink cut needs for canonical selection.
+  hardlink cut needs for canonical selection. The key is the name's exact platform byte form (§103: bytes on Unix,
+  WTF-8 of the WTF-16 units on Windows), so for non-ASCII names the order, and therefore the manifest's root order, may
+  differ between platforms; §103 permits that and this cut does not fold it. Tests of the order use ASCII names and
+  are platform-independent (my call).
+- Nested roots (`flux copy a a/sub DEST`) are allowed (my call, R5): the prefixes `a` and `sub` are distinct, which is
+  all §18.3 requires, and `cp` and `rsync` both allow it; the content under `a/sub` is copied twice, to `DEST/a/sub` and
+  to `DEST/sub`. Refusing it would need a source-overlap rule the spec does not state.
 - Folder root: `DEST/<name>` is created (guarded) or opened if it exists (a copy merges onto an existing folder, as a
   tree onto an existing DEST), then the existing tree walk copies into it with its own source root and identity, the
   run's guard, heartbeat, claim store, batch policy and checkpoint log.
-- File root: copied through the same per-file path a tree uses for a file (existing-file policy and claims as for a file
-  inside a tree), with DEST as the parent directory and the file's parent folder as the source root. My proposal; the
-  plan must cite the lines that show this fits (§5, item V3) or choose the alternative named there.
+- File root: copied through the same per-file path a tree uses for a file, with DEST as the parent directory and the
+  file's parent folder as the walk-relative source root (the manifest still records the file itself, §3.5). An existing
+  `DEST/<name>` file follows the operation's `--overwrite|--update|--skip-existing` through the claim path, as a file
+  inside a tree does since cut 8b (ROADMAP phase 9: "atomic replacement under claim records, with `--overwrite`,
+  `--update` and `--skip-existing`"); the plan verifies (V3) that this is observably the same as a two-positional
+  single-file copy for all three policies, so G4's "a file is a file" holds whichever command copied it. My proposal;
+  the plan must cite the lines that show the per-file path fits or choose the alternative named in V3.
 - All roots obey the one guard: a lost lock or a failed heartbeat aborts the operation.
 
 ### 3.7 Failure semantics (during transfer)
@@ -212,4 +237,9 @@ ruling in §3.7, the second is moot under B).
 - R3: state format version 5, written only by several-source runs; format 4 and every single-source run unchanged.
   Owner to confirm: it is a state-format decision.
 - R4: riders `TODO.md:619` and `:620` are not in this cut.
+- R5: nested roots are allowed, not refused (§3.6). Owner may veto.
+- Builder check (2026-10-22, a fresh reader of this document) raised seven questions: the lock/DEST/workspace order and
+  what an alias refusal leaves behind (§3.4), R1 and R3 (owner), the file root's manifest fields (§3.5), the
+  existing-file policy for a file root (§3.6), the key order across platforms (§3.6), the symlink check before
+  canonicalisation (§3.2), nested roots (R5). All folded above.
 - Owner: fresh copies only; files included; B.
