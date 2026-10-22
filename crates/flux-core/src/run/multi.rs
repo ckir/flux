@@ -1689,4 +1689,91 @@ mod trees_tests {
         // Nothing of the run's own is left anywhere afterwards.
         assert!(!fs.exists("/p/dest/.flux") && lock_files(&fs).is_empty());
     }
+
+    #[test]
+    fn a_one_source_restart_supersedes_an_aborted_several_source_run() {
+        // Root `b` cannot be created, so the several-source run ends FAILED and keeps its version-5 workspace.
+        let n = reference(fake, &["a", "b", "c"], "create_dir", "create_dir(/p/dest/b)");
+        let fs = fake();
+        fs.fail_nth("create_dir", n, Code::IoError, std::io::ErrorKind::Other);
+        let (r, _) = go(&fs, &["a", "b", "c"]);
+        assert!(matches!(&r.run.copy, Some(Err(a)) if a.error.code() == Code::IoError));
+        let prior = manifest(&fs);
+        assert_eq!(prior.state, OpState::Failed);
+        assert_eq!(prior.format_version, crate::state::MULTI_ROOT_FORMAT);
+
+        // Without --restart the one-source run is refused, and the prior stays as it is.
+        let second = RunConfig { operation_id: format!("{:032x}", 0x22), ..cfg() };
+        let refused = crate::run::tree(
+            &fs,
+            Path::new("/src/a"),
+            Path::new("/p/dest"),
+            &opts(),
+            &second,
+            &mut |_| {},
+        );
+        match &refused.stop {
+            Some(RunError::Refused { refusal, .. }) => {
+                assert_eq!(refusal.code, LockCode::ResumableOperationExists);
+            }
+            other => panic!("expected the prior to refuse the run, got {other:?}"),
+        }
+        assert_eq!(manifest(&fs).state, OpState::Failed);
+
+        // With --restart the prior is ABANDONED and the copy succeeds.
+        let restart = RunConfig { restart: true, ..second };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let r = crate::run::tree(
+            &fs,
+            Path::new("/src/a"),
+            Path::new("/p/dest"),
+            &opts(),
+            &restart,
+            &mut |f| sink.lock().unwrap().push(f),
+        );
+        assert!(r.stop.is_none(), "{:?}", r.stop);
+        match &r.copy {
+            Some(Ok(_)) => {}
+            other => panic!("the copy should succeed, got {other:?}"),
+        }
+        assert!(seen.lock().unwrap().is_empty(), "{:?}", seen.lock().unwrap());
+        assert_eq!(fs.read_file("/p/dest/x").as_deref(), Some(&b"ax"[..]));
+        assert_eq!(fs.read_file("/p/dest/sub/y").as_deref(), Some(&b"ay"[..]));
+        assert!(!fs.exists(format!("/p/dest/.flux/operations/{ID}")), "the old workspace is gone");
+        assert!(lock_files(&fs).is_empty(), "{:?}", lock_files(&fs));
+    }
+
+    #[test]
+    fn stale_prefix_locks_of_a_crashed_run_are_recovered_by_the_next_trees_run() {
+        let fs = fake();
+        fs.create_dir(Path::new("/p/dest")).unwrap();
+        // A crashed run: its prefix locks are on disk with a dead owner (`Held` has no `Drop`, so dropping the set
+        // without releasing it is the crash), and so is the operation lock's file.
+        let dest = fs.destination_root(Path::new("/p/dest")).unwrap();
+        let crashed = PrefixIdOwned {
+            operation_id: "55555555555555555555555555555555".to_string(),
+            owner_instance_id: "dead".to_string(),
+            boot_session_id: "old-boot".to_string(),
+            now: 5,
+        };
+        let (held, _) = PrefixLocks::acquire(
+            &dest,
+            LockCapability::LocalStrong,
+            &os(&["a", "b"]),
+            &crashed.as_ref(),
+        )
+        .unwrap();
+        drop(held);
+        assert_eq!(prefix_lock_files(&fs).len(), 2, "the stale locks are on disk");
+
+        let (r, got) = go(&fs, &["a", "b"]);
+
+        ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(statuses(&r), [RootStatus::Completed; 2]);
+        assert_eq!(fs.read_file("/p/dest/a/x").as_deref(), Some(&b"ax"[..]));
+        assert_eq!(fs.read_file("/p/dest/b/k").as_deref(), Some(&b"bk"[..]));
+        assert!(lock_files(&fs).is_empty(), "{:?}", lock_files(&fs));
+    }
 }

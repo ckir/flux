@@ -293,6 +293,37 @@ mod tests {
     }
 
     #[test]
+    fn a_one_root_run_refuses_a_two_root_prior_as_a_source_mismatch() {
+        // A several-source prior (format 5, two roots) met by a one-source run: the existing source-root refusal.
+        let two = vec![
+            Root {
+                kind: Some(crate::state::RootKind::Tree),
+                destination_prefix: native_hex(std::path::Path::new("s")),
+                ..root("/s", "strong:3:9")
+            },
+            Root {
+                kind: Some(crate::state::RootKind::File),
+                destination_prefix: native_hex(std::path::Path::new("t")),
+                ..root("/t", "strong:3:8")
+            },
+        ];
+        let state = OperationState::created(
+            ID,
+            Kind::Tree,
+            std::path::Path::new("/d"),
+            1,
+            None,
+            Config::new(two, Options::of(&opts())),
+        );
+        assert_eq!(state.format_version, crate::state::MULTI_ROOT_FORMAT);
+        let prior = PriorOp { state, shown: shown() };
+        let (code, detail) = refused(run(&prior, &roots_now(), &opts()).0);
+        assert_eq!(code, LockCode::IncompatibleState);
+        assert!(detail.contains("source root"), "{detail}");
+        assert!(detail.contains("--restart"), "{detail}");
+    }
+
+    #[test]
     fn each_exact_match_option_is_compared_and_named() {
         type Edit = fn(&mut Options);
         let cases: [(&str, Edit); 4] = [

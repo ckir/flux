@@ -7,9 +7,9 @@ use crate::ids::is_id;
 use crate::lock::error::refuse;
 use crate::lock::{LockCode, LockError, LockResult};
 use crate::state::{
-    CREATING_SUFFIX, FLUX_DIR, FORMAT_VERSION, Kind, MANIFEST, OPERATIONS_DIR, OpState,
-    OperationState, RECORD_INFIX, REMOVING_SUFFIX, RESERVED_DIRS, Unusable, control_path_conflict,
-    id_after, read_state, record_name,
+    CREATING_SUFFIX, FLUX_DIR, FORMAT_VERSION, Kind, MANIFEST, MULTI_ROOT_FORMAT, OPERATIONS_DIR,
+    OpState, OperationState, RECORD_INFIX, REMOVING_SUFFIX, RESERVED_DIRS, Unusable,
+    control_path_conflict, id_after, read_state, record_name,
 };
 use flux_fs::{Code, DirHandle, FileType};
 use std::ffi::{OsStr, OsString};
@@ -174,6 +174,12 @@ pub fn scan_file<D: DirHandle>(
 pub fn resumable_refusal(ops: &[PriorOp]) -> LockError {
     let wipe = "(its partials and its recorded progress are deleted)";
     let detail = match ops {
+        [op] if op.state.format_version >= MULTI_ROOT_FORMAT => format!(
+            "operation {} is {} ({}), created by a several-source run, so --resume cannot continue it and --restart with several sources is not supported yet; run flux cleanup --force DEST to remove it, then run again",
+            op.state.operation_id,
+            op.state.state.as_str(),
+            op.shown.display()
+        ),
         [op] if op.state.format_version >= FORMAT_VERSION => format!(
             "operation {} is {} ({}); run again with --resume to continue it or --restart to supersede it {wipe}",
             op.state.operation_id,
@@ -198,10 +204,14 @@ pub fn resumable_refusal(ops: &[PriorOp]) -> LockError {
                     )
                 })
                 .collect();
-            format!(
+            let mut detail = format!(
                 "operations {}; --resume needs exactly one; run again with --restart to supersede all of them (their partials and their recorded progress are deleted)",
                 named.join(", ")
-            )
+            );
+            if ops.iter().any(|op| op.state.format_version >= MULTI_ROOT_FORMAT) {
+                detail.push_str("; a several-source prior needs flux cleanup --force DEST");
+            }
+            detail
         }
     };
     refuse(LockCode::ResumableOperationExists, None, detail)
@@ -612,6 +622,33 @@ mod tests {
         ] {
             assert!(d.contains(part), "{part}: {d}");
         }
+    }
+
+    #[test]
+    fn a_version_5_prior_says_to_run_cleanup_force_not_resume_or_restart() {
+        let op = |n: u8, v: u64, s: OpState| {
+            let mut state = state(n, Kind::Tree, s);
+            state.format_version = v;
+            PriorOp { state, shown: PathBuf::from(format!("D/.flux/operations/{n}/manifest")) }
+        };
+        let detail = |ops: &[PriorOp]| refusal::<()>(Err(resumable_refusal(ops))).detail;
+        let d = detail(&[op(1, MULTI_ROOT_FORMAT, OpState::Failed)]);
+        for part in [id(1).as_str(), "FAILED", "manifest", "flux cleanup --force", "several-source"]
+        {
+            assert!(d.contains(part), "{part}: {d}");
+        }
+        assert!(!d.contains("--resume to continue"), "{d}");
+        // Several priors, one of them several-source: the same way out is named; with none, the text is as before.
+        let many = detail(&[
+            op(1, FORMAT_VERSION, OpState::Failed),
+            op(2, MULTI_ROOT_FORMAT, OpState::Transferring),
+        ]);
+        assert!(many.contains("flux cleanup --force"), "{many}");
+        let plain = detail(&[
+            op(1, FORMAT_VERSION, OpState::Failed),
+            op(2, FORMAT_VERSION, OpState::Failed),
+        ]);
+        assert!(!plain.contains("cleanup"), "{plain}");
     }
 
     #[test]
