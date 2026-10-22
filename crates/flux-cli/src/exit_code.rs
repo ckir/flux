@@ -40,6 +40,13 @@ pub fn for_tree_run(r: &Run<Result<TreeOutcome, TreeAbort>>) -> u8 {
         .unwrap_or_else(|| for_tree(r.copy.as_ref().expect("a run with no stop has a copy")))
 }
 
+/// A several-source run: `for_tree_run`, and any root that did not complete is 1 even where the copy reported none.
+pub fn for_multi_run(m: &flux_core::run::MultiRun) -> u8 {
+    let code = for_tree_run(&m.run);
+    let unfinished = m.roots.iter().any(|r| r.status != flux_core::tree::RootStatus::Completed);
+    if code == SUCCESS && unfinished { FAILED } else { code }
+}
+
 /// `for_tree_run`, for a single file.
 pub fn for_file_run(r: &Run<Result<Outcome, CopyError>>) -> u8 {
     for_stop(&r.stop)
@@ -253,5 +260,26 @@ mod tests {
         assert_eq!(for_file_run(&run(Some(copied()), Some(refused(true)))), FAILED);
         assert_eq!(for_file_run(&run(Some(copied()), None)), SUCCESS);
         assert_eq!(for_file_run(&run(Some(Err(err(Code::SafetyRejected))), None)), REFUSED);
+    }
+
+    #[test]
+    fn a_several_run_with_an_unfinished_root_exits_1_and_a_clean_one_exits_0() {
+        use flux_core::run::{MultiRun, RootReport};
+        use flux_core::tree::RootStatus;
+        let run = |status| MultiRun {
+            run: Run {
+                copy: Some(Ok(TreeOutcome::default())),
+                stop: None,
+                warnings: Vec::new(),
+                resumed: None,
+                beat_gap_max: std::time::Duration::ZERO,
+                file_resume: None,
+                dry: None,
+            },
+            roots: vec![RootReport { name: "a".into(), status, files_copied: 0, files_failed: 0 }],
+        };
+        assert_eq!(for_multi_run(&run(RootStatus::Completed)), SUCCESS);
+        assert_eq!(for_multi_run(&run(RootStatus::Failed)), FAILED);
+        assert_eq!(for_multi_run(&run(RootStatus::NotStarted)), FAILED);
     }
 }

@@ -21,6 +21,12 @@ pub enum LockCode {
     /// Raised by `--resume` adoption (cut 9c): a prepared note whose publication the evidence cannot decide. A
     /// refusal that changed nothing (exit 3).
     CommitStateUncertain,
+    /// Raised by the several-sources run: two sources would publish into one destination name (a refusal before any
+    /// change).
+    DestinationNamespaceCollision,
+    /// Raised by the several-sources run for a source or destination the safety rules reject (a refusal before any
+    /// change).
+    SafetyRejected,
 }
 
 impl LockCode {
@@ -37,6 +43,8 @@ impl LockCode {
             Self::ResumableOperationExists => "RESUMABLE_OPERATION_EXISTS",
             Self::NoReplacePublishUnavailable => "NOREPLACE_PUBLISH_UNAVAILABLE",
             Self::CommitStateUncertain => "COMMIT_STATE_UNCERTAIN",
+            Self::DestinationNamespaceCollision => "DESTINATION_NAMESPACE_COLLISION",
+            Self::SafetyRejected => "SAFETY_REJECTED",
         }
     }
 }
@@ -79,6 +87,15 @@ pub(crate) fn refuse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_several_sources_codes_have_the_spec_strings() {
+        assert_eq!(
+            LockCode::DestinationNamespaceCollision.as_str(),
+            "DESTINATION_NAMESPACE_COLLISION"
+        );
+        assert_eq!(LockCode::SafetyRejected.as_str(), "SAFETY_REJECTED");
+    }
 
     #[test]
     fn every_code_has_the_spec_string() {

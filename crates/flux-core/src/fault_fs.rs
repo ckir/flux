@@ -1232,8 +1232,10 @@ impl FaultFs {
     /// STORED spelling of an existing sibling that matches it case-insensitively. Default false. The `DirHandle`
     /// operations delegate to those methods, so they follow the mode too. The call log shows the NORMALIZED path.
     ///
-    /// NOT normalized (they take the spelling asked for): `read_file`, `remove_dir`, `create_lock`, `open_lock`,
-    /// `create_claim_store`, the path-level `open_read`, and the test helpers `write_file`, `read_file` and `exists`.
+    /// `create_lock` and `open_lock` fold too (a second spelling of a lock name is `AlreadyExists`; opening finds the
+    /// stored spelling).
+    ///
+    /// NOT normalized (they take the spelling asked for): `read_file`, `remove_dir`, `create_claim_store`, the path-level `open_read`, and the test helpers `write_file`, `read_file` and `exists`.
     /// The folding is ASCII-only. `stored()` is UNSPECIFIED, not deterministic across runs, when two existing entries
     /// differ only by case and neither equals the requested spelling (the maps it scans have no order).
     pub fn set_case_insensitive(&self, on: bool) {
@@ -2102,7 +2104,7 @@ impl DirHandle for FakeDirHandle {
 
     fn create_lock(&self, name: &OsStr) -> Result<Self::Lock> {
         check_component(name)?;
-        let child_path = self.my_path().join(name);
+        let child_path = self.fs().norm(&self.my_path().join(name));
         self.fs().record(format!("create_lock({})", child_path.display()), "create_lock")?;
         {
             // Not through `create_new`: that would count as a `create_new` call for nth-fault injection and consume
@@ -2249,7 +2251,7 @@ impl DirHandle for FakeDirHandle {
 
     fn open_lock(&self, name: &OsStr) -> Result<Self::Lock> {
         check_component(name)?;
-        let child_path = self.my_path().join(name);
+        let child_path = self.fs().norm(&self.my_path().join(name));
         self.fs().record(format!("open_lock({})", child_path.display()), "open_lock")?;
         {
             let g = self.inner.lock().unwrap();
@@ -4117,6 +4119,39 @@ mod tests {
         assert_eq!(a.identity, c.identity);
         assert!(called_norm(&fs, "metadata(/d/file.txt)"));
         assert!(!called_norm(&fs, "metadata(/D/File.Txt)"));
+    }
+
+    #[test]
+    fn create_lock_in_a_case_insensitive_fake_refuses_a_second_spelling() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        let fs = ci_fs();
+        fs.set_case_insensitive(true);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let _first = d.create_lock(OsStr::new("Data.flux-lock")).unwrap();
+        let e = d.create_lock(OsStr::new("data.flux-lock")).err().unwrap();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn open_lock_in_a_case_insensitive_fake_finds_the_stored_spelling() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        let fs = ci_fs();
+        fs.set_case_insensitive(true);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        drop(d.create_lock(OsStr::new("Data.flux-lock")).unwrap());
+        assert!(d.open_lock(OsStr::new("data.flux-lock")).is_ok());
+        assert!(called_norm(&fs, "open_lock(/d/Data.flux-lock)"));
+    }
+
+    #[test]
+    fn without_the_mode_both_spellings_create() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        let fs = ci_fs();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let _a = d.create_lock(OsStr::new("Data.flux-lock")).unwrap();
+        let _b = d.create_lock(OsStr::new("data.flux-lock")).unwrap();
+        let e = d.open_lock(OsStr::new("DATA.flux-lock")).err().unwrap();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]

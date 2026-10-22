@@ -68,7 +68,11 @@ pub(crate) fn validate(
     }
     let mut by_path = None;
     if roots.len() != stored.roots.len() {
-        return Err(source_mismatch(stored.roots.first(), roots.first()));
+        return Err(incompatible(format!(
+            "the source roots differ: the operation has {} roots, this run names {}; run again with --restart to supersede it",
+            stored.roots.len(),
+            roots.len()
+        )));
     }
     if let (Some(then), Some(now)) = (stored.roots.first(), roots.first()) {
         let strong = |text: &str| match parse_identity(text) {
@@ -168,6 +172,7 @@ mod tests {
             source_root: native_hex(std::path::Path::new(path)),
             source_identity: identity.to_string(),
             destination_prefix: String::new(),
+            kind: None,
         }
     }
 
@@ -288,7 +293,49 @@ mod tests {
         let two = vec![root("/s", "strong:3:9"), root("/t", "strong:3:8")];
         let (code, detail) = refused(run(&prior, &two, &opts()).0);
         assert_eq!(code, LockCode::IncompatibleState);
-        assert!(detail.contains("source root"), "{detail}");
+        assert!(
+            detail.starts_with(
+                "the source roots differ: the operation has 1 roots, this run names 2;"
+            ),
+            "{detail}"
+        );
+        assert!(detail.contains("--restart"), "{detail}");
+    }
+
+    #[test]
+    fn a_one_root_run_refuses_a_two_root_prior_as_a_source_mismatch() {
+        // A several-source prior (format 5, two roots) met by a one-source run: the existing source-root refusal.
+        let two = vec![
+            Root {
+                kind: Some(crate::state::RootKind::Tree),
+                destination_prefix: native_hex(std::path::Path::new("s")),
+                ..root("/s", "strong:3:9")
+            },
+            Root {
+                kind: Some(crate::state::RootKind::File),
+                destination_prefix: native_hex(std::path::Path::new("t")),
+                ..root("/t", "strong:3:8")
+            },
+        ];
+        let state = OperationState::created(
+            ID,
+            Kind::Tree,
+            std::path::Path::new("/d"),
+            1,
+            None,
+            Config::new(two, Options::of(&opts())),
+        );
+        assert_eq!(state.format_version, crate::state::MULTI_ROOT_FORMAT);
+        let prior = PriorOp { state, shown: shown() };
+        let (code, detail) = refused(run(&prior, &roots_now(), &opts()).0);
+        assert_eq!(code, LockCode::IncompatibleState);
+        assert!(
+            detail.starts_with(
+                "the source roots differ: the operation has 2 roots, this run names 1;"
+            ),
+            "{detail}"
+        );
+        assert!(detail.contains("--restart"), "{detail}");
     }
 
     #[test]

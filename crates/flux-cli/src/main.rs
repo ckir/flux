@@ -23,14 +23,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Copy a file, or a folder's contents, to DEST (§4.1).
+    /// Copy SOURCE to DEST, or several sources into the folder DEST (§4.1).
+    ///
+    /// With one SOURCE, a file is copied to DEST and a folder's contents onto DEST. With
+    /// several (`flux copy SOURCE... DEST`; the last path is DEST) each source, a file or
+    /// a folder, is copied to DEST/<its name> in one operation; DEST is created if missing.
+    /// --resume, --restart and --dry-run need exactly one source. In a several-source run
+    /// a file source that already exists at DEST/<name> is skipped without the identity
+    /// check a single file gets, and when DEST's filesystem gives no strong file identity
+    /// an existing file is reported as a collision.
     ///
     /// What happens to a file that already exists at DEST is chosen by one of
     /// --overwrite (the default: replace it), --update (replace it when the source is
     /// newer or the size differs; when either modification time is unavailable, only
     /// the sizes are compared, and equal sizes keep the file) or --skip-existing (leave it untouched); at most one
     /// may be given. A skipped file is not a failure. A symlink given as SOURCE is not
-    /// followed. Several sources are not supported yet.
+    /// followed.
     Copy(CopyArgs),
     /// Classify and remove what earlier operations left at DEST (§24.4, §251).
     Cleanup(CleanupArgs),
@@ -53,8 +61,9 @@ struct CleanupArgs {
 #[derive(Args)]
 #[command(group(clap::ArgGroup::new("existing").args(["overwrite", "update", "skip_existing"]).multiple(false)))]
 struct CopyArgs {
-    source: PathBuf,
-    destination: PathBuf,
+    /// One or more sources, then DEST (the last path).
+    #[arg(value_name = "SOURCE... DEST", required = true, num_args = 2..)]
+    paths: Vec<PathBuf>,
     /// Fail a file if its timestamps cannot be applied (§44.1); a symlink's own times are not preserved.
     #[arg(long)]
     preserve_times: bool,
@@ -279,7 +288,11 @@ fn copy(args: &CopyArgs) -> u8 {
         );
         return exit_code::USAGE;
     }
-    let job = match resolve::job(&args.source, &args.destination) {
+    if args.paths.len() > 2 {
+        return copy_several(args);
+    }
+    let (source, destination) = (&args.paths[0], &args.paths[1]);
+    let job = match resolve::job(source, destination) {
         Ok(job) => job,
         Err(Stop::Usage(msg)) => {
             err(&format!("error: {msg}"));
@@ -289,7 +302,7 @@ fn copy(args: &CopyArgs) -> u8 {
             err(&format!(
                 "{}: {}: {}",
                 Code::SymlinkCreationUnavailable.as_str(),
-                args.source.display(),
+                source.display(),
                 report::SYMLINK_WHY
             ));
             let mut r = Report::pre_engine(true);
@@ -317,65 +330,8 @@ fn copy(args: &CopyArgs) -> u8 {
                 }
             });
             let ms = millis(started);
-            let mut rep = Report::tree_run(&run, ms);
-            // The flag, not `run.dry`: an engine pre-flight refusal returns before the dry branch (ruling P7).
-            rep.dry_run = args.dry_run;
-            if let Some(d) = &run.dry {
-                rep.unprobed = report::unprobed_keys(d, args.resume);
-            }
-            if args.dry_run {
-                // Nothing moved: the `timed()` throughput would be for bytes that never did.
-                rep.average_bytes_per_second = 0;
-            }
-            let full = args.resume_verify == Some(ResumeVerifyArg::Full);
-            let mode = if full { "full" } else { "chunks" };
-            match &run.copy {
-                Some(result) => {
-                    let outcome = match result {
-                        Ok(out) => out,
-                        Err(a) => {
-                            err(&a.error.to_string());
-                            lines(report::abort_hint_lines(&a.error));
-                            &a.outcome
-                        }
-                    };
-                    for line in report::tree_warning_lines(outcome) {
-                        err(&line);
-                    }
-                    lines(report::run_lines(&run));
-                    match &run.dry {
-                        Some(d) => {
-                            lines(d.prior.iter().flat_map(report::dry_prior_lines).collect())
-                        }
-                        None => lines(report::resume_lines(&run, outcome.files_resumed)),
-                    }
-                    lines(report::checkpoint_lines(outcome, opts.durability == Durability::Normal));
-                    lines(report::resume_verify_lines(outcome, full));
-                    rep.resume_verify = report::resume_verify_used(outcome, full).then_some("full");
-                    for line in report::unprobed_lines(&rep.unprobed, mode) {
-                        err(&line);
-                    }
-                    err(&if args.dry_run {
-                        report::dry_run_summary_line(&rep, outcome.directories_created)
-                    } else {
-                        report::summary_line(&rep, outcome.directories_created)
-                    });
-                    if let Some(d) = &run.dry {
-                        lines(report::dry_extra_lines(d, outcome.files_resumed));
-                    }
-                }
-                None => lines(report::run_lines(&run)),
-            }
-            if let Some(result) = &run.copy {
-                counters_file(
-                    match result {
-                        Ok(out) => out,
-                        Err(a) => &a.outcome,
-                    },
-                    run.beat_gap_max,
-                );
-            }
-            json(args, &rep);
+            let rep = Report::tree_run(&run, ms);
+            tree_output(args, &opts, &run, rep, &[], None);
             exit_code::for_tree_run(&run)
         }
         Job::File { src, dst, target_existed } => {
@@ -452,6 +408,141 @@ fn copy(args: &CopyArgs) -> u8 {
             exit_code::for_file_run(&run)
         }
     }
+}
+
+/// Everything a finished tree run prints, after its report is built: the stderr lines, the debug counters and the
+/// `--json` object. `roots` is empty, and `several` (the destination) is `None`, for one source; a several-source run's roots print before the summary line.
+fn tree_output(
+    args: &CopyArgs,
+    opts: &CopyOptions,
+    run: &flux_core::run::Run<Result<flux_core::TreeOutcome, flux_core::TreeAbort>>,
+    mut rep: Report,
+    roots: &[flux_core::run::RootReport],
+    several: Option<&std::path::Path>,
+) {
+    // The flag, not `run.dry`: an engine pre-flight refusal returns before the dry branch (ruling P7).
+    rep.dry_run = args.dry_run;
+    if let Some(d) = &run.dry {
+        rep.unprobed = report::unprobed_keys(d, args.resume);
+    }
+    if args.dry_run {
+        // Nothing moved: the `timed()` throughput would be for bytes that never did.
+        rep.average_bytes_per_second = 0;
+    }
+    let full = args.resume_verify == Some(ResumeVerifyArg::Full);
+    let mode = if full { "full" } else { "chunks" };
+    match &run.copy {
+        Some(result) => {
+            let outcome = match result {
+                Ok(out) => out,
+                Err(a) => {
+                    err(&a.error.to_string());
+                    lines(report::abort_hint_lines(&a.error, several));
+                    &a.outcome
+                }
+            };
+            for line in report::tree_warning_lines(outcome) {
+                err(&line);
+            }
+            lines(report::run_lines(run));
+            match &run.dry {
+                Some(d) => lines(d.prior.iter().flat_map(report::dry_prior_lines).collect()),
+                None => lines(report::resume_lines(run, outcome.files_resumed)),
+            }
+            lines(report::checkpoint_lines(outcome, opts.durability == Durability::Normal));
+            lines(report::resume_verify_lines(outcome, full));
+            rep.resume_verify = report::resume_verify_used(outcome, full).then_some("full");
+            for line in report::unprobed_lines(&rep.unprobed, mode) {
+                err(&line);
+            }
+            lines(report::root_lines(roots));
+            err(&if args.dry_run {
+                report::dry_run_summary_line(&rep, outcome.directories_created)
+            } else {
+                report::summary_line(&rep, outcome.directories_created)
+            });
+            if let Some(d) = &run.dry {
+                lines(report::dry_extra_lines(d, outcome.files_resumed));
+            }
+        }
+        None => lines(report::run_lines(run)),
+    }
+    if let Some(result) = &run.copy {
+        counters_file(
+            match result {
+                Ok(out) => out,
+                Err(a) => &a.outcome,
+            },
+            run.beat_gap_max,
+        );
+    }
+    json(args, &rep);
+}
+
+/// Why `--X` cannot go with several sources: exit 2 and no JSON, as every usage error.
+fn several_flag_gate(args: &CopyArgs) -> Option<String> {
+    let flag = if args.resume {
+        "--resume"
+    } else if args.restart {
+        "--restart"
+    } else if args.dry_run {
+        "--dry-run"
+    } else {
+        return None;
+    };
+    let mut msg = format!("error: {flag} with several sources is not supported yet");
+    if args.restart {
+        msg.push_str("; run flux cleanup --force DEST to remove an aborted several-source run");
+    }
+    Some(msg)
+}
+
+/// `flux copy SOURCE... DEST` with two or more sources (spec 3.1 to 3.8).
+fn copy_several(args: &CopyArgs) -> u8 {
+    if let Some(msg) = several_flag_gate(args) {
+        err(&msg);
+        return exit_code::USAGE;
+    }
+    let (sources, destination) = args.paths.split_at(args.paths.len() - 1);
+    let cfg = run_config(args);
+    let (specs, dst) = match resolve::several(
+        sources,
+        &destination[0],
+        flux_core::run::source_cap(cfg.descriptor_limit),
+    ) {
+        Ok(planned) => planned,
+        Err(Stop::Usage(msg)) => {
+            err(&format!("error: {msg}"));
+            return exit_code::USAGE;
+        }
+        Err(Stop::SymlinkSource) => {
+            let named = resolve::first_symlink(sources).map(|p| p.display().to_string());
+            err(&format!(
+                "{}: {}: {}",
+                Code::SymlinkCreationUnavailable.as_str(),
+                named.unwrap_or_default(),
+                report::SYMLINK_WHY
+            ));
+            json(args, &Report::pre_engine(true));
+            return exit_code::FAILED;
+        }
+        Err(Stop::Failed(line)) => {
+            err(&line);
+            json(args, &Report::pre_engine(false));
+            return exit_code::FAILED;
+        }
+    };
+    let opts = options(args);
+    let fs = flux_platform::StdFileSystem;
+    let started = Instant::now();
+    let multi = flux_core::run::trees(&fs, specs, &dst, &opts, &cfg, &mut |f| {
+        for line in report::record_lines(&f) {
+            err(&line);
+        }
+    });
+    let rep = Report::several_run(&multi, millis(started));
+    tree_output(args, &opts, &multi.run, rep, &multi.roots, Some(&destination[0]));
+    exit_code::for_multi_run(&multi)
 }
 
 /// The cleanup's configuration: retention and the lease are fixed (no flag, no environment variable), the ids are

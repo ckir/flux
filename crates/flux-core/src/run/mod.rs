@@ -9,10 +9,13 @@
 //! change it.
 
 mod dry_prior;
+mod multi;
 pub(crate) mod place;
+mod prefix;
 mod recover;
 mod restart;
 mod resume;
+mod roots;
 pub(crate) mod session;
 pub(crate) mod sweep;
 #[cfg(test)]
@@ -42,7 +45,11 @@ use flux_fs::{
     ClaimStore, Code, CopyOptions, DestinationRoot, DirHandle, FileIdentity, FsError,
     LockCapability, OperationId, Outcome,
 };
+pub use multi::{MultiRun, RootReport, trees};
 use place::{FilePlace, Place, TreePlace, locate_tree};
+pub use roots::{SourceKind, SourceSpec, source_cap};
+
+pub use crate::tree::RootStatus;
 use session::{Locked, beat_error, from_lock, guarded, lock_io, open_operation, owned};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -356,11 +363,83 @@ pub(crate) fn tree_with<F: DestinationRoot>(
     if cfg.dry_run {
         return dry_tree(run, &mut place, &site, capability, source, cfg, &opts, on_report, out);
     }
+    drive(
+        fs,
+        run,
+        &mut place,
+        &site,
+        capability,
+        cfg,
+        &opts,
+        policy,
+        src_root,
+        source.identity,
+        out,
+        on_report,
+        |cx, place, out, report| {
+            let root = place.dest.take().expect("step 5 made DEST");
+            let (root, walked) =
+                copy_tree_at(cx, source.events, root, place.created_dest, out, report);
+            place.dest = Some(root);
+            walked
+        },
+        |_, _| {},
+    )
+}
+
+/// A place that is a tree's DEST, possibly with more around it (the prefix locks of several roots): what `drive` reads
+/// of it beyond `Place`.
+trait TreeAt<'p, F: DestinationRoot>: Place<F::Dir> {
+    fn tree_place(&self) -> &TreePlace<'p, F>;
+    fn tree_place_mut(&mut self) -> &mut TreePlace<'p, F>;
+}
+
+impl<'p, F: DestinationRoot> TreeAt<'p, F> for TreePlace<'p, F> {
+    fn tree_place(&self) -> &TreePlace<'p, F> {
+        self
+    }
+
+    fn tree_place_mut(&mut self) -> &mut TreePlace<'p, F> {
+        self
+    }
+}
+
+/// Steps 3-7 of "The run" for a walk under the run's lock, shared by `tree_with` and `trees`: the lock and the
+/// operation's state, the checkpoint log, the walk (`walk` is the only part that differs), the end of the log, the
+/// claims' final sync and `finish`. `settle` runs once, before `finish` (and on a failed opening): a place that holds
+/// more than the operation lock lets it go there, on every path, because a `Held` has no `Drop`.
+#[allow(clippy::too_many_arguments)]
+fn drive<'p, F, P>(
+    fs: &F,
+    mut run: Run<Result<TreeOutcome, TreeAbort>>,
+    place: &mut P,
+    site: &LockSite<'_, F::Dir>,
+    capability: flux_fs::LockCapability,
+    cfg: &RunConfig,
+    opts: &CopyOptions,
+    policy: CheckpointPolicy,
+    src_root: &Path,
+    src_identity: FileIdentity,
+    mut out: TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+    walk: impl FnOnce(
+        &Shared<'_, F>,
+        &mut P,
+        &mut TreeOutcome,
+        &mut dyn FnMut(TreeFailure),
+    ) -> Result<(), CopyError>,
+    settle: impl FnOnce(&mut P, &mut Vec<RunWarning>),
+) -> Run<Result<TreeOutcome, TreeAbort>>
+where
+    F: DestinationRoot + 'p,
+    P: TreeAt<'p, F>,
+{
     // Steps 3-5 (and `--restart`): the lock, then this operation's state and the record naming it.
-    let locked = match open_operation(&site, capability, &mut place, cfg, &opts, &mut run.warnings)
-    {
+    let locked = match open_operation(site, capability, &mut *place, cfg, opts, &mut run.warnings) {
         Ok(l) => l,
         Err(e) => {
+            // `create` may have taken locks of its own before a later step of the opening failed.
+            settle(&mut *place, &mut run.warnings);
             run.stop = Some(e);
             return run;
         }
@@ -368,7 +447,8 @@ pub(crate) fn tree_with<F: DestinationRoot>(
     run.resumed = locked.resumed.clone();
     run.beat_gap_max = locked.pulse.gap_max();
     // Cut 9a: under `--resume` the effective id is the prior's; the partials are named by it.
-    let opts = CopyOptions { operation_id: OperationId::new(&locked.state.operation_id), ..opts };
+    let opts =
+        CopyOptions { operation_id: OperationId::new(&locked.state.operation_id), ..opts.clone() };
     // Cut 9f-1: the checkpoint log, opened from two handles on this operation's workspace, below, once the guard and beat
     // closures exist (owner ruling 23: setting a damaged log aside is a destination mutation, so it runs under them).
     // A damaged log never aborts a copy, except an unsupported format (a newer Flux wrote it) and a lost lock. In a
@@ -398,14 +478,21 @@ pub(crate) fn tree_with<F: DestinationRoot>(
             .map_err(|e| beat_error(&locked.lock_shown, e))
             .map_err(flagged)
     };
-    let opened = open_checkpoints(&place, &locked.state, policy, &mut run.warnings, &guard, &beat);
+    let opened = open_checkpoints(
+        place.tree_place(),
+        &locked.state,
+        policy,
+        &mut run.warnings,
+        &guard,
+        &beat,
+    );
     let mut stopped_early = None;
     match opened {
         Ok(c) => *ckpt.borrow_mut() = c,
         Err(error) => stopped_early = Some(error),
     }
     // The store stays open past the walk, for the final sync; it is dropped before `finish` removes the file.
-    let claims = place.claims.take().map(std::cell::RefCell::new);
+    let claims = place.tree_place_mut().claims.take().map(std::cell::RefCell::new);
     let walked = if let Some(error) = stopped_early {
         // The log could not be opened (or set aside) under the run's lock: nothing is copied.
         Err(error)
@@ -414,7 +501,7 @@ pub(crate) fn tree_with<F: DestinationRoot>(
         let cx = Shared {
             fs,
             src_root,
-            src_identity: source.identity,
+            src_identity,
             opts: &opts,
             guard: &guard,
             beat: &beat,
@@ -425,8 +512,8 @@ pub(crate) fn tree_with<F: DestinationRoot>(
             dry_run: false,
             dry_prior: None,
             dry_partials: None,
+            key_prefix: None,
         };
-        let root = place.dest.take().expect("step 5 made DEST");
         let mut report = |f: TreeFailure| {
             if let TreeFailureCause::Copy(e) = &f.cause
                 && let Some((path, _)) = &e.leftover
@@ -435,10 +522,7 @@ pub(crate) fn tree_with<F: DestinationRoot>(
             }
             on_report(f);
         };
-        let (root, walked) =
-            copy_tree_at(&cx, source.events, root, place.created_dest, &mut out, &mut report);
-        place.dest = Some(root);
-        walked
+        walk(&cx, &mut *place, &mut out, &mut report)
     };
     let mut result = match walked {
         Ok(()) => Ok(out),
@@ -518,9 +602,10 @@ pub(crate) fn tree_with<F: DestinationRoot>(
     drop(claims);
     // Cut 9e: the barrier's beats happen during the walk, so the value taken at the lock is stale by now.
     run.beat_gap_max = locked.pulse.gap_max();
-    run.stop = finish(&mut place, locked, ended, &mut run.warnings);
+    settle(&mut *place, &mut run.warnings);
+    run.stop = finish(&mut *place, locked, ended, &mut run.warnings);
     // E1: a DEST this run made counts among the directories it created, unless a rollback removed it again.
-    if place.created_dest {
+    if place.tree_place().created_dest {
         match &mut result {
             Ok(o) => o.directories_created += 1,
             Err(a) => a.outcome.directories_created += 1,
@@ -1270,6 +1355,7 @@ fn dry_tree<F: DestinationRoot>(
         dry_run: true,
         dry_prior: prior_id.as_deref(),
         dry_partials: prior_id.is_some().then_some(&partials),
+        key_prefix: None,
     };
     let root = place.dest.take();
     let absent = root.is_none();

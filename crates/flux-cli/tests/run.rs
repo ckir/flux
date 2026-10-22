@@ -347,7 +347,7 @@ fn an_empty_lock_is_uncertain_until_restart_break_lock_takes_it_over() {
 #[test]
 fn unreadable_or_newer_state_is_refused_and_preserved() {
     let corrupt: &[u8] = b"garbage";
-    let newer: &[u8] = br#"{"format_version":5}"#;
+    let newer: &[u8] = br#"{"format_version":6}"#;
     for (bytes, code) in [(corrupt, "STATE_CORRUPT"), (newer, "INCOMPATIBLE_STATE")] {
         let d = TempDir::new().unwrap();
         let src = tree_in(d.path());

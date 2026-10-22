@@ -22,7 +22,7 @@ use flux_fs::{
     Preserve, Publish, RecoveryOp, Safety,
 };
 use std::collections::{BTreeMap, HashSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
@@ -426,6 +426,53 @@ pub(crate) struct Shared<'c, F: DestinationRoot> {
     pub(crate) dry_prior: Option<&'c str>,
     /// Cut 11b: counts the partials a dry `--resume` found beside their targets.
     pub(crate) dry_partials: Option<&'c std::cell::Cell<u64>>,
+    /// Several sources: the root's destination name, prefixed to every path this walk KEYS (the claim target, the
+    /// prepared note's directory, a leftover's path): those are relative to DEST, while the walk is relative to the
+    /// root. `None` for a single-root run, whose keys stay byte-identical to the root-relative path. `TreeFailure.path`
+    /// stays root-relative (display only).
+    pub(crate) key_prefix: Option<&'c OsStr>,
+}
+
+impl<'c, F: DestinationRoot> Shared<'c, F> {
+    /// The same shared state for one more root of a several-source run: its source root and identity, and the
+    /// destination name its keys are prefixed with. Everything else (the guard, the claim store, the batch policy) is
+    /// the run's and is shared.
+    pub(crate) fn for_root(
+        &self,
+        src_root: &'c Path,
+        src_identity: FileIdentity,
+        key_prefix: Option<&'c OsStr>,
+    ) -> Shared<'c, F> {
+        Shared {
+            fs: self.fs,
+            src_root,
+            src_identity,
+            opts: self.opts,
+            guard: self.guard,
+            beat: self.beat,
+            claims: self.claims,
+            resume: self.resume,
+            batch: self.batch,
+            ckpt: self.ckpt,
+            dry_run: self.dry_run,
+            dry_prior: self.dry_prior,
+            dry_partials: self.dry_partials,
+            key_prefix,
+        }
+    }
+
+    /// `rel` (relative to the root) as a path relative to DEST: under the root's prefix when it has one.
+    pub(crate) fn keyed(&self, rel: &Path) -> PathBuf {
+        keyed_under(self.key_prefix, rel)
+    }
+}
+
+/// `prefix` joined to `rel`, or `rel` itself without a prefix (a single-root run keys exactly the root-relative path).
+fn keyed_under(prefix: Option<&OsStr>, rel: &Path) -> PathBuf {
+    match prefix {
+        Some(p) => Path::new(p).join(rel),
+        None => rel.to_path_buf(),
+    }
 }
 
 /// Cut 9d (spec decision 5): a batch flushes at this many staged files...
@@ -592,6 +639,7 @@ fn run_tree<F: DestinationRoot>(
         dry_run: false,
         dry_prior: None,
         dry_partials: None,
+        key_prefix: None,
     };
     copy_tree_at(&cx, source.events, root, false, out, on_report).1
 }
@@ -628,6 +676,212 @@ pub(crate) fn copy_tree_at<F: DestinationRoot>(
     (root.expect("a live root frame keeps its handle"), walked)
 }
 
+/// How one root of a several-source run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootStatus {
+    /// Walked to the end, with no failure counted over it (the `out.failures.total()` delta is zero) and no abort.
+    Completed,
+    /// Walked (or tried to) and any failure was counted over it (`FailureTally::total()`: a file, a walk or
+    /// directory error, a metadata complaint, an unrecorded claim), as a one-source run exits 1 on any of them, or the
+    /// root itself could not be created or entered; a root that aborts after beginning is `Failed`.
+    Failed,
+    /// Nothing of this root was begun: an earlier root aborted the operation, or the heartbeat or guard check before
+    /// this root failed.
+    NotStarted,
+}
+
+/// One root of a several-source run, ready to copy.
+pub(crate) enum RootInput<'a, F: FileSystem> {
+    /// A directory: `DEST/<name>` is made (or merged into) and the source tree walks into it.
+    Folder { name: OsString, src_root: PathBuf, source: Source<'a, F> },
+    /// A file: copied to `DEST/<name>` through the per-file path of a tree, with DEST as the parent directory.
+    File { name: OsString, src_parent: PathBuf, identity: FileIdentity },
+}
+
+impl<F: FileSystem> RootInput<'_, F> {
+    fn name(&self) -> &OsStr {
+        match self {
+            RootInput::Folder { name, .. } | RootInput::File { name, .. } => name,
+        }
+    }
+}
+
+/// What one root did: the deltas of the run's counters over that root.
+pub(crate) struct RootDone {
+    pub name: OsString,
+    pub status: RootStatus,
+    pub files_copied: u64,
+    pub files_failed: u64,
+}
+
+/// Several sources, spec 3.6: the roots in the order given (the caller sorts them by prefix key), each into DEST under
+/// its name. Before each root `beat` and `guard` run, as before a directory. A failed heartbeat or guard before a root leaves that root and every
+/// later one `NotStarted`. Any other abort-class error (a lost lock mid-walk, a root that cannot be created) stops the
+/// loop: that root, which had begun, is `Failed` and every later one `NotStarted`. ANY counted failure (the `out.failures.total()` delta over the root) marks its root `Failed` and the loop goes
+/// on; an abort marks it `Failed` too. `TreeFailure.path` is relative to
+/// DEST for a folder root's entries (`<name>/<path>`) and is the name itself for a file root.
+pub(crate) fn copy_roots_at<F: DestinationRoot>(
+    base: &Shared<'_, F>,
+    dest: &F::Dir,
+    dest_created: bool,
+    roots: Vec<RootInput<'_, F>>,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) -> (Vec<RootDone>, std::result::Result<(), CopyError>) {
+    let mut done = Vec::with_capacity(roots.len());
+    let mut abort: Option<CopyError> = None;
+    // The DEST-level state the file roots share (one frame's worth), made at the first file root.
+    let mut files: Option<RootState> = None;
+    for root in roots {
+        let name = root.name().to_os_string();
+        if abort.is_some() {
+            done.push(RootDone {
+                name,
+                status: RootStatus::NotStarted,
+                files_copied: 0,
+                files_failed: 0,
+            });
+            continue;
+        }
+        // The pre-root heartbeat and guard: a failure here means the root has begun nothing.
+        if let Err(e) = beat_and_guard(base) {
+            done.push(RootDone {
+                name,
+                status: RootStatus::NotStarted,
+                files_copied: 0,
+                files_failed: 0,
+            });
+            abort = Some(e);
+            continue;
+        }
+        let (copied, failed, any) = (out.files_copied, out.failures.copy, out.failures.total());
+        let result = match root {
+            RootInput::Folder { name, src_root, source } => {
+                folder_root(base, dest, &name, &src_root, source, out, on_report)
+            }
+            RootInput::File { name, src_parent, identity } => file_root(
+                base,
+                dest,
+                dest_created,
+                &mut files,
+                &name,
+                &src_parent,
+                identity,
+                out,
+                on_report,
+            ),
+        };
+        let files_failed = out.failures.copy - failed;
+        let status = if result.is_err() || out.failures.total() > any {
+            RootStatus::Failed
+        } else {
+            RootStatus::Completed
+        };
+        done.push(RootDone { name, status, files_copied: out.files_copied - copied, files_failed });
+        if let Err(e) = result {
+            abort = Some(e);
+        }
+    }
+    (done, abort.map_or(Ok(()), Err))
+}
+
+/// `beat`, then `guard`, as `walk_into` runs them before a directory; `copy_roots_at` runs them before each root.
+fn beat_and_guard<F: DestinationRoot>(base: &Shared<'_, F>) -> std::result::Result<(), CopyError> {
+    (base.beat)().map_err(|e| CopyError::at(CopyStep::Heartbeat, e))?;
+    (base.guard)().map_err(|e| CopyError::at(CopyStep::Create, e))
+}
+
+/// A folder root: `DEST/<name>` made or merged into, then the tree walk, its failures reported under `<name>`.
+fn folder_root<F: DestinationRoot>(
+    base: &Shared<'_, F>,
+    dest: &F::Dir,
+    name: &OsStr,
+    src_root: &Path,
+    source: Source<'_, F>,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) -> std::result::Result<(), CopyError> {
+    let (dir, created) = match dest.create_dir(name) {
+        Ok(dir) => {
+            out.directories_created += 1;
+            (dir, true)
+        }
+        // A copy merges onto an existing folder, as a tree onto an existing DEST.
+        Err(e) if e.source.kind() == ErrorKind::AlreadyExists => {
+            (dest.open_dir(name).map_err(|e| CopyError::at(CopyStep::Create, e))?, false)
+        }
+        Err(e) => return Err(CopyError::at(CopyStep::Create, e)),
+    };
+    let cx = base.for_root(src_root, source.identity, Some(name));
+    let mut under_name = |mut f: TreeFailure| {
+        f.path = Path::new(name).join(&f.path);
+        on_report(f);
+    };
+    copy_tree_at(&cx, source.events, dir, created, out, &mut under_name).1
+}
+
+/// A file root: the file `src_parent/<name>` copied to `DEST/<name>` by the per-file path of a tree, DEST being the
+/// parent directory. The walk-relative path is the single component `<name>`, and the keys carry no prefix: the file's
+/// name IS the key (`FluxPathKey::from_relative("<name>")`).
+// One input per piece of the root's state, as `copy_one`'s.
+#[allow(clippy::too_many_arguments)]
+fn file_root<F: DestinationRoot>(
+    base: &Shared<'_, F>,
+    dest: &F::Dir,
+    dest_created: bool,
+    state: &mut Option<RootState>,
+    name: &OsStr,
+    src_parent: &Path,
+    identity: FileIdentity,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) -> std::result::Result<(), CopyError> {
+    let state = match state {
+        Some(state) => state,
+        None => {
+            let dest_identity = dest.identity().map_err(|e| CopyError::at(CopyStep::Resolve, e))?;
+            state.insert(root_state(
+                base,
+                Some(dest),
+                RootIdentity::Existing(dest_identity),
+                dest_created,
+                out,
+            )?)
+        }
+    };
+    let cx = base.for_root(src_parent, identity, None);
+    let RootState { names, claim_parent, fresh } = state;
+    let mut batch = Batch::default();
+    out.files_total += 1;
+    let path = PathBuf::from(name);
+    let walked = if reserved_path(&path) {
+        let conflict = CopyError::at(CopyStep::Gate, reserved_conflict());
+        report(out, on_report, path, TreeFailureCause::Copy(conflict));
+        Ok(())
+    } else {
+        copy_one(&cx, Some(dest), names, &mut batch, *claim_parent, *fresh, path, out, on_report)
+    };
+    // The root has no `DirEnd`, so its batch is drained here, as `copy_tree_frames` drains its frames.
+    let mut mode = drain_mode(&walked);
+    let mut first = None;
+    drain_one(&cx, dest, names, &mut batch, out, on_report, walked.is_err(), &mut mode, &mut first);
+    walked?;
+    if let Some(e) = first {
+        return Err(e);
+    }
+    // ...and its claims are flushed as a `DirEnd` flushes a directory's: after §101 and §99.
+    if claim_parent.is_some()
+        && let Some(claims) = cx.claims
+    {
+        beat_and_guard(&cx)?;
+        let flushed = claims.borrow_mut().flush();
+        if let Err(e) = flushed {
+            report(out, on_report, PathBuf::from(name), TreeFailureCause::ClaimNotRecorded(e));
+        }
+    }
+    Ok(())
+}
+
 /// What the dynamic section 129 check compares a source subdirectory with (cut 11a).
 #[derive(Clone, Copy)]
 pub(crate) enum RootIdentity {
@@ -658,6 +912,49 @@ pub(crate) fn copy_tree_frames<F: DestinationRoot>(
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> (Option<F::Dir>, std::result::Result<(), CopyError>) {
+    let state = match root_state(cx, root.as_ref(), root_identity, root_created, out) {
+        Ok(state) => state,
+        Err(e) => return (root, Err(e)),
+    };
+    let mut stack = vec![Frame::Live {
+        dir: root,
+        created: HashSet::new(),
+        names: state.names,
+        claim_parent: state.claim_parent,
+        fresh: state.fresh,
+        batch: Batch::default(),
+    }];
+    let walked = walk_into(cx, events, root_identity, &mut stack, out, on_report);
+    // Cut 9d, spec decision 5(e): every live frame's batch is flushed whatever the walk returned; the walk's own error
+    // wins over a stop of the drain.
+    let mode = drain_mode(&walked);
+    let drained = drain_batches(cx, &mut stack, out, on_report, walked.is_err(), mode);
+    let walked = walked.and(drained);
+    // The walk emits no `Dir` for the root, so no `DirEnd` pops it, and a frame is skipped only when pushed.
+    match stack.into_iter().next() {
+        Some(Frame::Live { dir, .. }) => (dir, walked),
+        _ => unreachable!("the root frame is never popped, and never skipped"),
+    }
+}
+
+/// What a root frame is made of: the names of the directory (listed once when it pre-exists), the identity claims
+/// under it are keyed with, and whether this run created it. Shared by `copy_tree_frames` and the file roots of
+/// `copy_roots_at`, which keep their DEST-level state without a frame because DEST is borrowed, not owned.
+struct RootState {
+    names: NameIndex,
+    claim_parent: Option<ObjectId>,
+    fresh: bool,
+}
+
+/// `copy_tree_frames`' set-up of its root frame, unchanged: `root` is `None` for a dry run's directory that does not
+/// exist yet. An `Err` is an abort.
+fn root_state<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    root: Option<&F::Dir>,
+    root_identity: RootIdentity,
+    root_created: bool,
+    out: &mut TreeOutcome,
+) -> std::result::Result<RootState, CopyError> {
     let claim_parent = match (cx.claims, root_identity.inner()) {
         (None, _) => None,
         (Some(_), FileIdentity::Strong(id)) => Some(id),
@@ -667,39 +964,26 @@ pub(crate) fn copy_tree_frames<F: DestinationRoot>(
                 None
             }
             Safety::Strict => {
-                return (
-                    root,
-                    Err(refuse(
-                        "the destination's identity is not strong enough to key claims, which --safety strict refuses",
-                    )),
-                );
+                return Err(refuse(
+                    "the destination's identity is not strong enough to key claims, which --safety strict refuses",
+                ));
             }
         },
     };
     // A pre-existing root is listed once; a root this run made (or, dry, one that does not exist) is `fresh` and needs
     // no listing.
-    let names = match &root {
+    let names = match root {
         Some(dir) if claim_parent.is_some() && !root_created => {
-            match NameIndex::for_existing(dir) {
-                Ok(names) => names,
-                Err(e) => return (root, Err(CopyError::at(CopyStep::Resolve, e))),
-            }
+            NameIndex::for_existing(dir).map_err(|e| CopyError::at(CopyStep::Resolve, e))?
         }
         _ => NameIndex::for_new_dir(),
     };
-    let fresh = root_created || root.is_none();
-    let mut stack = vec![Frame::Live {
-        dir: root,
-        created: HashSet::new(),
-        names,
-        claim_parent,
-        fresh,
-        batch: Batch::default(),
-    }];
-    let walked = walk_into(cx, events, root_identity, &mut stack, out, on_report);
-    // Cut 9d, spec decision 5(e): every live frame's batch is flushed whatever the walk returned; the walk's own error
-    // wins over a stop of the drain.
-    let mode = match &walked {
+    Ok(RootState { names, claim_parent, fresh: root_created || root.is_none() })
+}
+
+/// How the drain behaves after a walk that ended as `walked`.
+fn drain_mode(walked: &std::result::Result<(), CopyError>) -> DrainMode {
+    match walked {
         // Tested first: a lost lock noticed at a heartbeat step is still a lost lock.
         Err(e) if e.code() == Code::TargetLockBusy => DrainMode::KeepAll(copy_of(&e.cause)),
         Err(e) if e.step == CopyStep::Heartbeat => DrainMode::RemoveAll(copy_of(&e.cause)),
@@ -708,13 +992,6 @@ pub(crate) fn copy_tree_frames<F: DestinationRoot>(
             DrainMode::RemoveAll(copy_of(&e.cause))
         }
         _ => DrainMode::Publish,
-    };
-    let drained = drain_batches(cx, &mut stack, out, on_report, walked.is_err(), mode);
-    let walked = walked.and(drained);
-    // The walk emits no `Dir` for the root, so no `DirEnd` pops it, and a frame is skipped only when pushed.
-    match stack.into_iter().next() {
-        Some(Frame::Live { dir, .. }) => (dir, walked),
-        _ => unreachable!("the root frame is never popped, and never skipped"),
     }
 }
 
@@ -1309,9 +1586,9 @@ fn copy_one<F: DestinationRoot>(
             &no_before_create,
             &no_before_publish,
         );
-        return finish_copy(path, published, out, on_report);
+        return finish_copy(cx.key_prefix, path, published, out, on_report);
     };
-    let target = match FluxPathKey::from_relative(&path) {
+    let target = match FluxPathKey::from_relative(&cx.keyed(&path)) {
         Ok(t) => t,
         Err(e) => {
             report(
@@ -1386,7 +1663,7 @@ fn copy_one<F: DestinationRoot>(
                         ),
                     ),
                 );
-                return finish_copy(path, Err(e), out, on_report);
+                return finish_copy(cx.key_prefix, path, Err(e), out, on_report);
             }
             // Cut 9a: `--resume`. The branch mutates nothing at the destination, so it neither beats nor guards.
             let mut src_known: Option<Metadata> = None;
@@ -1403,6 +1680,7 @@ fn copy_one<F: DestinationRoot>(
                 match found {
                     Err(e) => {
                         return finish_copy(
+                            cx.key_prefix,
                             path,
                             Err(CopyError::at(CopyStep::Claim, e)),
                             out,
@@ -1438,7 +1716,7 @@ fn copy_one<F: DestinationRoot>(
                                 ),
                             ),
                         );
-                        return finish_copy(path, Err(e), out, on_report);
+                        return finish_copy(cx.key_prefix, path, Err(e), out, on_report);
                     }
                     Ok(None) => {}
                 }
@@ -1516,7 +1794,7 @@ fn copy_one<F: DestinationRoot>(
         (len >= run.min_len()).then(|| FileCkpt {
             run,
             file_id: key.encode(),
-            destination: path.as_os_str().as_encoded_bytes().to_vec(),
+            destination: cx.keyed(&path).as_os_str().as_encoded_bytes().to_vec(),
         })
     };
     // Cut 9c: a Strict publication into a store with the `prepared` table writes a note before its rename (the hook),
@@ -1532,7 +1810,7 @@ fn copy_one<F: DestinationRoot>(
                 target: target.clone(),
                 temp_name: Vec::new(),
                 identity: String::new(),
-                dir_path: note_dir(&path),
+                dir_path: note_dir(&cx.keyed(&path)),
                 name: name.as_encoded_bytes().to_vec(),
                 planned_name: Vec::new(),
                 replacement: false,
@@ -1593,7 +1871,7 @@ fn copy_one<F: DestinationRoot>(
                 Ok(o) => Some(o.published_identity),
                 Err(_) => None,
             };
-            finish_copy(path.clone(), result, out, on_report)?;
+            finish_copy(cx.key_prefix, path.clone(), result, out, on_report)?;
             if let Some((reuse, recopied)) = reuse {
                 note_reuse(out, &path, reuse, recopied);
             }
@@ -1637,7 +1915,7 @@ fn copy_one<F: DestinationRoot>(
                 target: target.clone(),
                 temp_name: Vec::new(),
                 identity: String::new(),
-                dir_path: note_dir(&path),
+                dir_path: note_dir(&cx.keyed(&path)),
                 name: stored.as_encoded_bytes().to_vec(),
                 planned_name: if name != stored {
                     name.as_encoded_bytes().to_vec()
@@ -1709,7 +1987,7 @@ fn copy_one<F: DestinationRoot>(
                 Ok(o) => Some(o.published_identity),
                 Err(_) => None,
             };
-            finish_copy(path.clone(), result, out, on_report)?;
+            finish_copy(cx.key_prefix, path.clone(), result, out, on_report)?;
             if let Some((reuse, recopied)) = reuse {
                 note_reuse(out, &path, reuse, recopied);
             }
@@ -1786,7 +2064,13 @@ fn link_one<F: DestinationRoot>(
             return Ok(());
         }
         Err(e) => {
-            return finish_copy(path, Err(CopyError::at(CopyStep::Source, e)), out, on_report);
+            return finish_copy(
+                cx.key_prefix,
+                path,
+                Err(CopyError::at(CopyStep::Source, e)),
+                out,
+                on_report,
+            );
         }
     };
 
@@ -1824,9 +2108,9 @@ fn link_one<F: DestinationRoot>(
             &no_before_create,
             &no_before_publish,
         )?;
-        return finish_copy(path, published, out, on_report);
+        return finish_copy(cx.key_prefix, path, published, out, on_report);
     };
-    let target = match FluxPathKey::from_relative(&path) {
+    let target = match FluxPathKey::from_relative(&cx.keyed(&path)) {
         Ok(t) => t,
         Err(e) => {
             report(
@@ -1895,7 +2179,7 @@ fn link_one<F: DestinationRoot>(
                         ),
                     ),
                 );
-                return finish_copy(path, Err(e), out, on_report);
+                return finish_copy(cx.key_prefix, path, Err(e), out, on_report);
             }
             // `--resume` (spec 3.4). The branch mutates nothing at the destination, so it neither beats nor guards.
             if cx.resume {
@@ -1903,6 +2187,7 @@ fn link_one<F: DestinationRoot>(
                 match found {
                     Err(e) => {
                         return finish_copy(
+                            cx.key_prefix,
                             path,
                             Err(CopyError::at(CopyStep::Claim, e)),
                             out,
@@ -1937,7 +2222,7 @@ fn link_one<F: DestinationRoot>(
                                 ),
                             ),
                         );
-                        return finish_copy(path, Err(e), out, on_report);
+                        return finish_copy(cx.key_prefix, path, Err(e), out, on_report);
                     }
                     Ok(None) => {}
                 }
@@ -1997,7 +2282,7 @@ fn link_one<F: DestinationRoot>(
                 target: target.clone(),
                 temp_name: Vec::new(),
                 identity: String::new(),
-                dir_path: note_dir(&path),
+                dir_path: note_dir(&cx.keyed(&path)),
                 name: name.as_encoded_bytes().to_vec(),
                 planned_name: Vec::new(),
                 replacement: false,
@@ -2023,7 +2308,7 @@ fn link_one<F: DestinationRoot>(
                 claims, &key, &wrote, cx.guard, &path, result, out, on_report,
             );
             let published = result.as_ref().ok().map(|o| o.published_identity);
-            finish_copy(path.clone(), result, out, on_report)?;
+            finish_copy(cx.key_prefix, path.clone(), result, out, on_report)?;
             if let Some(identity) = published {
                 let recorded = if strict {
                     claims.borrow_mut().commit_prepared(&key, &target, None)
@@ -2062,7 +2347,7 @@ fn link_one<F: DestinationRoot>(
                 target: target.clone(),
                 temp_name: Vec::new(),
                 identity: String::new(),
-                dir_path: note_dir(&path),
+                dir_path: note_dir(&cx.keyed(&path)),
                 name: stored.as_encoded_bytes().to_vec(),
                 planned_name: if name != stored {
                     name.as_encoded_bytes().to_vec()
@@ -2100,7 +2385,7 @@ fn link_one<F: DestinationRoot>(
                 on_report,
             );
             let published = result.as_ref().ok().map(|o| o.published_identity);
-            finish_copy(path.clone(), result, out, on_report)?;
+            finish_copy(cx.key_prefix, path.clone(), result, out, on_report)?;
             if let Some(identity) = published {
                 out.files_overwritten += 1;
                 let recorded = if strict {
@@ -2215,12 +2500,12 @@ fn dry_stop_file<F: DestinationRoot>(
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<(), CopyError> {
     if let Err(e) = dry_temp_name_fits(cx, name) {
-        return finish_copy(path, Err(e), out, on_report);
+        return finish_copy(cx.key_prefix, path, Err(e), out, on_report);
     }
     let opts = CopyOptions { existing: ExistingPolicy::Overwrite, publish, ..cx.opts.clone() };
     let planned = match plan_file(cx.fs, src, parent, name, &opts) {
         Ok(p) => p,
-        Err(e) => return finish_copy(path, Err(e), out, on_report),
+        Err(e) => return finish_copy(cx.key_prefix, path, Err(e), out, on_report),
     };
     let (src_meta, degraded) = match planned {
         FilePlan::Proceed { src_meta, degraded, replaces } => {
@@ -2241,7 +2526,7 @@ fn dry_stop_file<F: DestinationRoot>(
         published_identity: FileIdentity::Unavailable,
         skipped: false,
     };
-    finish_copy(path.clone(), Ok(outcome), out, on_report)?;
+    finish_copy(cx.key_prefix, path.clone(), Ok(outcome), out, on_report)?;
     let partial = dry_partial_len(cx, parent, name);
     dry_planned(out, on_report, path, PlannedObject::File, replace, partial);
     Ok(())
@@ -2261,11 +2546,11 @@ fn dry_stop_link<F: DestinationRoot>(
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<(), CopyError> {
     if let Err(e) = dry_temp_name_fits(cx, name) {
-        return finish_copy(path, Err(e), out, on_report);
+        return finish_copy(cx.key_prefix, path, Err(e), out, on_report);
     }
     let degraded = match gate_link_read(cx, parent, name, src, publish) {
         Ok(d) => d,
-        Err(e) => return finish_copy(path, Err(e), out, on_report),
+        Err(e) => return finish_copy(cx.key_prefix, path, Err(e), out, on_report),
     };
     // A live link publishes 0 bytes.
     let outcome = flux_fs::Outcome {
@@ -2275,7 +2560,7 @@ fn dry_stop_link<F: DestinationRoot>(
         published_identity: FileIdentity::Unavailable,
         skipped: false,
     };
-    finish_copy(path.clone(), Ok(outcome), out, on_report)?;
+    finish_copy(cx.key_prefix, path.clone(), Ok(outcome), out, on_report)?;
     dry_planned(out, on_report, path, PlannedObject::Symlink, replace, None);
     Ok(())
 }
@@ -2538,7 +2823,7 @@ fn stage_into_batch<F: DestinationRoot>(
             unreachable!("the tree stages with ExistingPolicy::Overwrite, which never skips")
         }
         // No note exists yet, and `stage_file` already removed its temporary: nothing else to undo.
-        Err(e) => return finish_copy(path, Err(e), out, on_report),
+        Err(e) => return finish_copy(cx.key_prefix, path, Err(e), out, on_report),
     }
     if batch.pending.len() >= cx.batch.files || batch.bytes >= cx.batch.bytes {
         flush_batch(cx, parent, names, batch, out, on_report)?;
@@ -2611,17 +2896,19 @@ fn flush_batch<F: DestinationRoot>(
         let mut rest = entries.into_iter().zip(failed);
         let (p0, f0) = rest.next().expect("the batch is not empty");
         if let Some(f) = &f0 {
-            report_sync_kept(p0.path.clone(), &p0.staged.temp, f, out, on_report);
+            report_sync_kept(cx.key_prefix, p0.path.clone(), &p0.staged.temp, f, out, on_report);
         }
         for (p, f) in rest {
             match f {
-                Some(f) => report_sync_kept(p.path, &p.staged.temp, &f, out, on_report),
-                None => report_kept(p.path, &p.staged.temp, &lost, out, on_report),
+                Some(f) => {
+                    report_sync_kept(cx.key_prefix, p.path, &p.staged.temp, &f, out, on_report)
+                }
+                None => report_kept(cx.key_prefix, p.path, &p.staged.temp, &lost, out, on_report),
             }
         }
         let stop = match f0 {
             Some(_) => CopyError::at(CopyStep::Publish, lost),
-            None => kept(&p0.path, &p0.staged.temp, lost),
+            None => kept(cx.key_prefix, &p0.path, &p0.staged.temp, lost),
         };
         return Err(stop);
     }
@@ -2646,7 +2933,7 @@ fn flush_batch<F: DestinationRoot>(
         // A stop cannot fire here today: `discard` keeps the sync's code (`StrictDurabilityUnavailable`) and reports a lost
         // lock as a kept leftover. If it ever does, the flush stops and the remaining entries' temporaries are left for
         // the resume sweep, like any crash before the notes.
-        finish_copy(p.path, Err(failed_copy), out, on_report)?;
+        finish_copy(cx.key_prefix, p.path, Err(failed_copy), out, on_report)?;
     }
     if ok.is_empty() {
         return Ok(());
@@ -2689,9 +2976,18 @@ fn flush_batch<F: DestinationRoot>(
                         );
                         // A stop (an error carrying `TargetLockBusy`) drops no entry: as at STOP-LOST, the noted keep
                         // their notes and temporaries, the rest their temporaries, each reported (plan ruling 2).
-                        if let Err(stop) = finish_copy(p.path, Err(failed), out, on_report) {
+                        if let Err(stop) =
+                            finish_copy(cx.key_prefix, p.path, Err(failed), out, on_report)
+                        {
                             for q in noted.into_iter().chain(rest.map(|(q, _)| q)) {
-                                report_kept(q.path, &q.staged.temp, &stop.cause, out, on_report);
+                                report_kept(
+                                    cx.key_prefix,
+                                    q.path,
+                                    &q.staged.temp,
+                                    &stop.cause,
+                                    out,
+                                    on_report,
+                                );
                             }
                             return Err(stop);
                         }
@@ -2715,7 +3011,7 @@ fn flush_batch<F: DestinationRoot>(
                 let identity = o.published_identity;
                 let recopied = o.bytes_copied;
                 // Counted at the rename, before any later entry is tried (decision 4.6). Never `Err` for an `Ok`.
-                finish_copy(path.clone(), Ok(o), out, on_report)?;
+                finish_copy(cx.key_prefix, path.clone(), Ok(o), out, on_report)?;
                 note_reuse(out, &path, reuse, recopied);
                 match &replaced {
                     None => names.record_publication(&target, None, &name, None, identity),
@@ -2739,7 +3035,8 @@ fn flush_batch<F: DestinationRoot>(
             }
             Err(e) => {
                 // `finish_copy` classifies (one place): `Ok` is a failure of this entry alone, already reported.
-                let Err(stop) = finish_copy(path.clone(), Err(e), out, on_report) else {
+                let Err(stop) = finish_copy(cx.key_prefix, path.clone(), Err(e), out, on_report)
+                else {
                     ops.push(RecoveryOp::Discard { key });
                     paths.push(path);
                     continue;
@@ -2748,7 +3045,14 @@ fn flush_batch<F: DestinationRoot>(
                     // STOP-LOST: write and remove nothing more. The renamed keep their notes (no `apply_recovery`),
                     // this entry's temporary rides in `stop`, the later ones' are reported (plan ruling 2).
                     for q in rest {
-                        report_kept(q.path, &q.staged.temp, &stop.cause, out, on_report);
+                        report_kept(
+                            cx.key_prefix,
+                            q.path,
+                            &q.staged.temp,
+                            &stop.cause,
+                            out,
+                            on_report,
+                        );
                     }
                     return Err(stop);
                 }
@@ -2762,7 +3066,7 @@ fn flush_batch<F: DestinationRoot>(
                     let failed =
                         discard(parent, &q.staged.temp, stop.step, stop.code(), source, cx.guard);
                     if failed.leftover.is_some() {
-                        report_leftover(q.path, failed, out, on_report);
+                        report_leftover(cx.key_prefix, q.path, failed, out, on_report);
                     }
                     ops.push(RecoveryOp::Discard { key: q.key });
                 }
@@ -2811,11 +3115,11 @@ fn flush_batch<F: DestinationRoot>(
 
 /// Plan ruling 2: `cause`, with the entry's temporary kept as the leftover (relative to DEST, as `finish_copy` rebuilds
 /// it), at the publish step, the shape of `publish_staged`'s lost guard.
-fn kept(path: &Path, temp: &std::ffi::OsStr, cause: FsError) -> CopyError {
+fn kept(prefix: Option<&OsStr>, path: &Path, temp: &std::ffi::OsStr, cause: FsError) -> CopyError {
     CopyError {
         cause,
         leftover: Some((
-            path.with_file_name(temp),
+            keyed_under(prefix, &path.with_file_name(temp)),
             std::io::Error::other("kept: this run no longer holds the destination's lock"),
         )),
         step: CopyStep::Publish,
@@ -2825,6 +3129,7 @@ fn kept(path: &Path, temp: &std::ffi::OsStr, cause: FsError) -> CopyError {
 /// Plan ruling 2: an entry after the one a lost lock stopped at is reported as a `TargetLockBusy` copy failure whose
 /// leftover is its temporary. (`finish_copy` cannot report it: it returns a `TargetLockBusy` failure as a stop.)
 fn report_kept(
+    prefix: Option<&OsStr>,
     path: PathBuf,
     temp: &std::ffi::OsStr,
     lost: &FsError,
@@ -2835,7 +3140,7 @@ fn report_kept(
         Code::TargetLockBusy,
         std::io::Error::new(lost.source.kind(), lost.source.to_string()),
     );
-    let e = kept(&path, temp, cause);
+    let e = kept(prefix, &path, temp, cause);
     report(out, on_report, path, TreeFailureCause::Copy(e));
 }
 
@@ -2843,6 +3148,7 @@ fn report_kept(
 /// its own `StrictDurabilityUnavailable` failure at `CopyStep::Durability`, with the sync's error as the cause and its
 /// kept temporary (relative to DEST) as the leftover. `report_kept`'s shape, for a sync failure.
 fn report_sync_kept(
+    prefix: Option<&OsStr>,
     path: PathBuf,
     temp: &std::ffi::OsStr,
     sync: &FsError,
@@ -2855,7 +3161,7 @@ fn report_sync_kept(
             std::io::Error::new(sync.source.kind(), sync.source.to_string()),
         ),
         leftover: Some((
-            path.with_file_name(temp),
+            keyed_under(prefix, &path.with_file_name(temp)),
             std::io::Error::other("kept: this run no longer holds the destination's lock"),
         )),
         step: CopyStep::Durability,
@@ -2887,14 +3193,14 @@ fn stop_held_before_notes<F: DestinationRoot>(
                     f.source,
                     cx.guard,
                 );
-                report_leftover(p.path, r, out, on_report);
+                report_leftover(cx.key_prefix, p.path, r, out, on_report);
             }
             None => {
                 let source = copy_of(&e).source;
                 let r =
                     discard(parent, &p.staged.temp, CopyStep::Heartbeat, e.code, source, cx.guard);
                 if r.leftover.is_some() {
-                    report_leftover(p.path, r, out, on_report);
+                    report_leftover(cx.key_prefix, p.path, r, out, on_report);
                 }
             }
         }
@@ -2905,13 +3211,14 @@ fn stop_held_before_notes<F: DestinationRoot>(
 /// A temporary a stop's cleanup could not remove: reported with its leftover rebuilt relative to DEST, as
 /// `finish_copy` rebuilds one (which would return a stop's failure instead of reporting it).
 fn report_leftover(
+    prefix: Option<&OsStr>,
     path: PathBuf,
     mut e: CopyError,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) {
     if let Some((p, _)) = e.leftover.as_mut() {
-        *p = path.with_file_name(&*p);
+        *p = keyed_under(prefix, &path.with_file_name(&*p));
     }
     report(out, on_report, path, TreeFailureCause::Copy(e));
 }
@@ -2955,57 +3262,77 @@ fn drain_batches<F: DestinationRoot>(
         let Frame::Live { dir: Some(dir), names, batch, .. } = frame else {
             continue;
         };
-        match &mode {
-            DrainMode::Publish => {}
-            DrainMode::KeepAll(lost) => {
-                for mut p in std::mem::take(batch).pending {
-                    p.staged.writer = None;
-                    report_kept(p.path, &p.staged.temp, lost, out, on_report);
-                }
-                continue;
-            }
-            DrainMode::RemoveAll(cause) => {
-                let mut entries = std::mem::take(batch).pending;
-                for p in &mut entries {
-                    p.staged.writer = None;
-                }
-                if !entries.is_empty() {
-                    let failed: Vec<Option<FsError>> = entries.iter().map(|_| None).collect();
-                    // The returned stop is the walk's own error, already returned; its cleanup reported what it left.
-                    let _ = stop_held_before_notes(
-                        cx,
-                        dir,
-                        entries,
-                        failed,
-                        copy_of(cause),
-                        out,
-                        on_report,
-                    );
-                }
-                continue;
-            }
-        }
-        if let Err(e) = flush_batch(cx, dir, names, batch, out, on_report) {
-            // A stop that first appears here switches the mode for the frames not yet drained (owner ruling B2').
-            if e.code() == Code::TargetLockBusy {
-                mode = DrainMode::KeepAll(copy_of(&e.cause));
-            } else if e.step == CopyStep::Heartbeat || e.code() == Code::NoReplacePublishUnavailable
-            {
-                mode = DrainMode::RemoveAll(copy_of(&e.cause));
-            }
-            if walk_failed || first.is_some() {
-                // Spec decision 8: the stop is dropped (the returned error already says it), unless it carries a
-                // temporary, which must still reach the run as a leftover (plan ruling 2).
-                if let Some((path, _)) = &e.leftover {
-                    let path = path.clone();
-                    report(out, on_report, path, TreeFailureCause::Copy(e));
-                }
-            } else {
-                first = Some(e);
-            }
-        }
+        drain_one(cx, dir, names, batch, out, on_report, walk_failed, &mut mode, &mut first);
     }
     first.map_or(Ok(()), Err)
+}
+
+/// `drain_batches`' step for one directory's batch: `mode` and `first` carry what the earlier directories left.
+// The signature is the loop body's state: the directory, its two pieces of frame state, and the drain's own.
+#[allow(clippy::too_many_arguments)]
+fn drain_one<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    dir: &F::Dir,
+    names: &mut NameIndex,
+    batch: &mut Batch<F::Writer>,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+    walk_failed: bool,
+    mode: &mut DrainMode,
+    first: &mut Option<CopyError>,
+) {
+    match &*mode {
+        DrainMode::Publish => {}
+        DrainMode::KeepAll(lost) => {
+            for mut p in std::mem::take(batch).pending {
+                p.staged.writer = None;
+                report_kept(cx.key_prefix, p.path, &p.staged.temp, lost, out, on_report);
+            }
+            return;
+        }
+        DrainMode::RemoveAll(cause) => {
+            let mut entries = std::mem::take(batch).pending;
+            for p in &mut entries {
+                p.staged.writer = None;
+            }
+            if !entries.is_empty() {
+                let failed: Vec<Option<FsError>> = entries.iter().map(|_| None).collect();
+                // The returned stop is the walk's own error, already returned; its cleanup reported what it left.
+                let _ = stop_held_before_notes(
+                    cx,
+                    dir,
+                    entries,
+                    failed,
+                    copy_of(cause),
+                    out,
+                    on_report,
+                );
+            }
+            return;
+        }
+    }
+    if let Err(e) = flush_batch(cx, dir, names, batch, out, on_report) {
+        // A stop that first appears here switches the mode for the frames not yet drained (owner ruling B2').
+        if e.code() == Code::TargetLockBusy {
+            *mode = DrainMode::KeepAll(copy_of(&e.cause));
+        } else if e.step == CopyStep::Heartbeat || e.code() == Code::NoReplacePublishUnavailable {
+            *mode = DrainMode::RemoveAll(copy_of(&e.cause));
+        }
+        if walk_failed || first.is_some() {
+            // Spec decision 8: the stop is dropped (the returned error already says it), unless it carries a
+            // temporary, which must still reach the run as a leftover (plan ruling 2).
+            if let Some((path, _)) = &e.leftover {
+                // The leftover is relative to DEST (under the root's prefix); `TreeFailure.path` is relative to the root.
+                let path = match cx.key_prefix {
+                    Some(prefix) => path.strip_prefix(prefix).unwrap_or(path).to_path_buf(),
+                    None => path.clone(),
+                };
+                report(out, on_report, path, TreeFailureCause::Copy(e));
+            }
+        } else {
+            *first = Some(e);
+        }
+    }
 }
 
 /// One store error, reported for several entries: `FsError` is not `Clone`, so its code, kind and message are copied.
@@ -3123,6 +3450,7 @@ fn record_claim<C: ClaimStore + ?Sized>(
 /// Count what `copy_file_guarded` did for one target, or report and map its failure. `Err` only when the whole
 /// operation must stop.
 fn finish_copy(
+    prefix: Option<&OsStr>,
     path: PathBuf,
     result: std::result::Result<flux_fs::Outcome, CopyError>,
     out: &mut TreeOutcome,
@@ -3149,9 +3477,9 @@ fn finish_copy(
         }
         Err(mut e) => {
             // `copy_file_at` records a leftover relative to its handle; rebuild it in
-            // the tree's frame, relative to the destination root.
+            // the tree's frame, relative to the destination root (under the root's prefix, for several sources).
             if let Some((p, _)) = e.leftover.as_mut() {
-                *p = path.with_file_name(&*p);
+                *p = keyed_under(prefix, &path.with_file_name(&*p));
             }
             // §99 (cut 7a Part 3b): this run no longer owns the destination's lock; or §101 (cut 7b): its heartbeat
             // failed; or (cut 9f-1) a checkpoint or its writer failed. The whole operation stops.
@@ -4412,6 +4740,7 @@ mod tests {
             dry_run: false,
             dry_prior: None,
             dry_partials: None,
+            key_prefix: None,
         };
         let mut out = TreeOutcome::default();
         let mut got = Vec::new();
@@ -5429,6 +5758,7 @@ mod tests {
             dry_run: false,
             dry_prior: None,
             dry_partials: None,
+            key_prefix: None,
         };
         let mut out = TreeOutcome::default();
         let (_root, r) = copy_tree_at(&cx, source.events, root, false, &mut out, &mut |_| {});
@@ -5485,7 +5815,8 @@ mod tests {
             CopyStep::Checkpoint,
             FsError::new(Code::WalWriteFailed, std::io::Error::other("wal")),
         );
-        let r = finish_copy(PathBuf::from("a"), Err(failed), &mut out, &mut |_| reported += 1);
+        let r =
+            finish_copy(None, PathBuf::from("a"), Err(failed), &mut out, &mut |_| reported += 1);
         let e = r.unwrap_err();
         assert_eq!((e.code(), e.step), (Code::WalWriteFailed, CopyStep::Checkpoint));
         assert_eq!((reported, out.failures.total()), (0, 0), "a stop, never a per-file failure");
@@ -5523,6 +5854,7 @@ mod tests {
             dry_run: false,
             dry_prior: None,
             dry_partials: None,
+            key_prefix: None,
         };
         let mut out = TreeOutcome::default();
         let mut reported = 0;
@@ -5566,6 +5898,7 @@ mod tests {
             dry_run: false,
             dry_prior: None,
             dry_partials: None,
+            key_prefix: None,
         };
         let mut out = TreeOutcome::default();
         let mut reported = 0;
@@ -5599,6 +5932,7 @@ mod tests {
             dry_run: false,
             dry_prior: None,
             dry_partials: None,
+            key_prefix: None,
         };
         let mut out = TreeOutcome::default();
         let (back, r) = copy_tree_at(&cx, source.events, root, false, &mut out, &mut |_| {});
@@ -5680,6 +6014,18 @@ mod tests {
         guard: &Guard<'_>,
         beat: &Heartbeat<'_>,
     ) -> (std::result::Result<(), CopyError>, TreeOutcome, Vec<TreeFailure>) {
+        batched_keyed(fs, policy, durability, guard, beat, None)
+    }
+
+    /// `batched_with` walking under `key_prefix` (several sources).
+    fn batched_keyed(
+        fs: &FaultFs,
+        policy: BatchPolicy,
+        durability: Durability,
+        guard: &Guard<'_>,
+        beat: &Heartbeat<'_>,
+        key_prefix: Option<&OsStr>,
+    ) -> (std::result::Result<(), CopyError>, TreeOutcome, Vec<TreeFailure>) {
         let source =
             prepare_source(fs, Path::new("/src"), Path::new("/dst"), MountPolicy::Cross).unwrap();
         if !fs.exists(Path::new("/dst")) {
@@ -5704,12 +6050,106 @@ mod tests {
             dry_run: false,
             dry_prior: None,
             dry_partials: None,
+            key_prefix,
         };
         let mut out = TreeOutcome::default();
         let mut got = Vec::new();
         let (_root, r) =
             copy_tree_at(&cx, source.events, root, false, &mut out, &mut |f| got.push(f));
         (r, out, got)
+    }
+
+    // Several sources, task 4: a walk keyed under a root prefix. The tree is `x/f`; the record paths are relative to
+    // DEST, so `a/x/f` under the prefix `a` and `x/f` without one.
+
+    /// Copy `x/f` under `prefix` at Strict durability: the claim it stored, and the note it wrote before the rename.
+    fn keyed_records(prefix: Option<&str>) -> (FluxPathKey, PreparedRecord) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let fs = sources(&[("x/f", b"data")]);
+        let slot = std::sync::Arc::clone(&seen);
+        fs.on_nth("rename_no_replace", 1, move |fs| {
+            let root = fs.destination_root(Path::new("/dst")).unwrap();
+            let store = root.open_claim_store(OsStr::new("state.db"), Durability::Strict).unwrap();
+            let pending = store.prepared().unwrap();
+            assert_eq!(pending.len(), 1, "one note is pending at the rename: {pending:?}");
+            *slot.lock().unwrap() = Some(pending[0].clone());
+        });
+
+        let prefix = prefix.map(OsString::from);
+        let (r, _, got) = batched_keyed(
+            &fs,
+            policy(1),
+            Durability::Strict,
+            &unguarded,
+            &no_heartbeat,
+            prefix.as_deref(),
+        );
+
+        r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        let (key, note) = seen.lock().unwrap().take().expect("the hook ran at the publish");
+        // The claim is committed with the note's discard, after the rename: read it once the run is over.
+        let root = fs.destination_root(Path::new("/dst")).unwrap();
+        let store = root.open_claim_store(OsStr::new("state.db"), Durability::Strict).unwrap();
+        let claim = store.get(&key).unwrap().expect("the claim is stored");
+        (claim.target, note)
+    }
+
+    /// The leftover of `x/f` whose temporary could not be removed, under `prefix`.
+    fn keyed_leftover(prefix: Option<&str>) -> PathBuf {
+        let fs = sources(&[("x/f", b"data")]);
+        fs.fail("rename_no_replace", Code::PermissionDenied);
+        fs.fail_always("remove_file", Code::PermissionDenied);
+        let prefix = prefix.map(OsString::from);
+
+        let (r, _, got) = batched_keyed(
+            &fs,
+            policy(1),
+            Durability::Normal,
+            &unguarded,
+            &no_heartbeat,
+            prefix.as_deref(),
+        );
+
+        r.unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].path, Path::new("x/f"), "TreeFailure.path stays root-relative");
+        match &got[0].cause {
+            TreeFailureCause::Copy(e) => {
+                e.leftover.as_ref().expect("the leftover is reported").0.clone()
+            }
+            other => panic!("expected Copy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claim_and_prepared_targets_carry_the_root_prefix() {
+        let (claim_target, note) = keyed_records(Some("a"));
+
+        assert_eq!(claim_target.0, key_of("a/x/f").0);
+        assert_eq!(note.target.0, key_of("a/x/f").0);
+    }
+
+    #[test]
+    fn a_note_records_dir_path_relative_to_dest() {
+        let (_, note) = keyed_records(Some("a"));
+
+        assert_eq!(note.dir_path, native_hex(Path::new("a/x")));
+    }
+
+    #[test]
+    fn a_leftover_is_relative_to_dest() {
+        assert_eq!(keyed_leftover(Some("a")), Path::new("a/x/f.flux-partial.op1"));
+    }
+
+    #[test]
+    fn without_a_prefix_nothing_changes() {
+        let (claim_target, note) = keyed_records(None);
+
+        assert_eq!(claim_target.0, key_of("x/f").0);
+        assert_eq!(note.target.0, key_of("x/f").0);
+        assert_eq!(note.dir_path, native_hex(Path::new("x")));
+        assert_eq!(keyed_leftover(None), Path::new("x/f.flux-partial.op1"));
     }
 
     /// The call log with `/` separators.
@@ -7609,6 +8049,7 @@ mod tests {
             dry_run: true,
             dry_prior: None,
             dry_partials: None,
+            key_prefix: None,
         };
         let (root, identity) = match dst_root {
             Some(d) => {
@@ -8153,6 +8594,7 @@ mod tests {
             dry_run: false,
             dry_prior: None,
             dry_partials: None,
+            key_prefix: None,
         };
         let mut out = TreeOutcome::default();
         let mut got = Vec::new();
@@ -8346,5 +8788,350 @@ mod tests {
             assert_eq!(dry_out.directories_created, live_out.directories_created, "{policy:?}");
             assert_eq!(tally(&dry_out), tally(&live_out), "{policy:?}");
         }
+    }
+
+    // Several sources, task 7 part A: the per-root driver. `/src/<dir>` are folder roots; a file root is
+    // `/src/<name>` itself, whose parent folder is `/src`.
+
+    /// What `copy_roots_at` reports, with the run's outcome and the streamed failures.
+    struct RootsRun {
+        done: Vec<RootDone>,
+        result: std::result::Result<(), CopyError>,
+        out: TreeOutcome,
+        got: Vec<TreeFailure>,
+    }
+
+    /// `copy_roots_at` into a pre-made `/dst` (claim store at `/dst/state.db`, Normal durability), the roots in the
+    /// order given: `(name, source path, is a file)`.
+    fn roots_run(fs: &FaultFs, specs: &[(&str, &str, bool)], guard: &Guard<'_>) -> RootsRun {
+        roots_run_with(fs, specs, guard, Durability::Normal, policy(1))
+    }
+
+    /// `roots_run` at `durability` under `policy` (Strict with a batch writes prepared notes).
+    fn roots_run_with(
+        fs: &FaultFs,
+        specs: &[(&str, &str, bool)],
+        guard: &Guard<'_>,
+        durability: Durability,
+        policy: BatchPolicy,
+    ) -> RootsRun {
+        if !fs.exists(Path::new("/dst")) {
+            fs.create_dir(Path::new("/dst")).unwrap();
+        }
+        let dest = fs.destination_root(Path::new("/dst")).unwrap();
+        let store = dest.create_claim_store(OsStr::new("state.db"), durability).unwrap();
+        let claims = std::cell::RefCell::new(store);
+        let mut o = opts();
+        o.durability = durability;
+        let base = Shared {
+            fs,
+            src_root: Path::new("/src"),
+            src_identity: FileIdentity::Unavailable,
+            opts: &o,
+            guard,
+            beat: &no_heartbeat,
+            claims: Some(&claims),
+            resume: false,
+            batch: policy,
+            ckpt: None,
+            dry_run: false,
+            dry_prior: None,
+            dry_partials: None,
+            key_prefix: None,
+        };
+        // A source borrows its path for the whole walk, so the paths outlive the roots.
+        let paths: Vec<PathBuf> = specs
+            .iter()
+            .map(|(_, src, is_file)| {
+                let src = PathBuf::from(src);
+                if *is_file { src.parent().unwrap().to_path_buf() } else { src }
+            })
+            .collect();
+        let roots = specs
+            .iter()
+            .zip(&paths)
+            .map(|((name, _, is_file), path)| {
+                let source =
+                    prepare_source(fs, path, Path::new("/dst"), MountPolicy::Cross).unwrap();
+                let name = OsString::from(name);
+                if *is_file {
+                    RootInput::File { name, src_parent: path.clone(), identity: source.identity }
+                } else {
+                    RootInput::Folder { name, src_root: path.clone(), source }
+                }
+            })
+            .collect();
+        let mut out = TreeOutcome::default();
+        let mut got = Vec::new();
+        let (done, result) =
+            copy_roots_at(&base, &dest, false, roots, &mut out, &mut |f| got.push(f));
+        RootsRun { done, result, out, got }
+    }
+
+    fn statuses(run: &RootsRun) -> Vec<RootStatus> {
+        run.done.iter().map(|d| d.status).collect()
+    }
+
+    /// The index of the first and of the last recorded call that mentions `needle`.
+    fn first_and_last(calls: &[String], needle: &str) -> (usize, usize) {
+        let at: Vec<usize> =
+            calls.iter().enumerate().filter(|(_, c)| c.contains(needle)).map(|(i, _)| i).collect();
+        (*at.first().expect(needle), *at.last().expect(needle))
+    }
+
+    fn lock_lost() -> FsError {
+        FsError::new(Code::TargetLockBusy, std::io::Error::other("lost"))
+    }
+
+    const A_B_F: [(&str, &str, bool); 3] =
+        [("a", "/src/a", false), ("b", "/src/b", false), ("f", "/src/f", true)];
+
+    #[test]
+    fn roots_land_at_dest_name_for_two_folders_and_a_file() {
+        let fs = sources(&[("a/x", b"1"), ("b/k", b"2"), ("b/y/z", b"4"), ("f", b"3")]);
+
+        let run = roots_run(&fs, &A_B_F, &unguarded);
+
+        run.result.as_ref().unwrap();
+        assert!(run.got.is_empty(), "{:?}", run.got);
+        for (path, bytes) in [("a/x", "1"), ("b/k", "2"), ("b/y/z", "4"), ("f", "3")] {
+            assert_eq!(
+                fs.read_file(Path::new("/dst").join(path)).as_deref(),
+                Some(bytes.as_bytes()),
+                "{path}"
+            );
+        }
+        // `DEST/a`, `DEST/b` and `DEST/b/y`, each once; DEST itself is the caller's.
+        assert_eq!(run.out.directories_created, 3);
+        assert_eq!((run.out.files_total, run.out.files_copied), (4, 4));
+        assert_eq!(statuses(&run), [RootStatus::Completed; 3]);
+        let per_root: Vec<_> = run.done.iter().map(|d| (d.files_copied, d.files_failed)).collect();
+        assert_eq!(per_root, [(1, 0), (2, 0), (1, 0)]);
+    }
+
+    #[test]
+    fn a_file_root_is_keyed_by_its_name_alone() {
+        let fs = sources(&[("f", b"3")]);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let slot = std::sync::Arc::clone(&seen);
+        fs.on_nth("rename_no_replace", 1, move |fs| {
+            let root = fs.destination_root(Path::new("/dst")).unwrap();
+            let store = root.open_claim_store(OsStr::new("state.db"), Durability::Strict).unwrap();
+            *slot.lock().unwrap() = Some(store.prepared().unwrap());
+        });
+
+        let run = roots_run_with(
+            &fs,
+            &[("f", "/src/f", true)],
+            &unguarded,
+            Durability::Strict,
+            policy(64),
+        );
+
+        run.result.as_ref().unwrap();
+        let root = fs.destination_root(Path::new("/dst")).unwrap();
+        let store = root.open_claim_store(OsStr::new("state.db"), Durability::Strict).unwrap();
+        let identity = root.identity().unwrap();
+        let FileIdentity::Strong(parent) = identity else { panic!("{identity:?}") };
+        let claim = store
+            .get(&ClaimKey::new(parent, OsStr::new("f")))
+            .unwrap()
+            .expect("the claim is stored under DEST and the file's name");
+        assert_eq!(claim.target.0, key_of("f").0);
+        let pending = seen.lock().unwrap().take().expect("the hook ran at the publish");
+        assert_eq!(pending.len(), 1, "one note is pending at the rename: {pending:?}");
+        assert_eq!(pending[0].1.target.0, key_of("f").0, "the prepared target is the name alone");
+    }
+
+    #[test]
+    fn roots_are_copied_in_the_order_given() {
+        let fs = sources(&[("a/x", b"1"), ("b/k", b"2"), ("b/y/z", b"4"), ("f", b"3")]);
+
+        // Not the sorted order: the driver does not sort.
+        let run = roots_run(
+            &fs,
+            &[("f", "/src/f", true), ("b", "/src/b", false), ("a", "/src/a", false)],
+            &unguarded,
+        );
+
+        run.result.as_ref().unwrap();
+        let calls = fs.calls();
+        let (_, f_last) = first_and_last(&calls, "/dst/f");
+        let (b_first, b_last) = first_and_last(&calls, "/dst/b");
+        let (a_first, _) = first_and_last(&calls, "/dst/a");
+        assert!(f_last < b_first, "f, then b: {calls:?}");
+        assert!(b_last < a_first, "b, then a: {calls:?}");
+        let names: Vec<_> = run.done.iter().map(|d| d.name.clone()).collect();
+        assert_eq!(names, ["f", "b", "a"].map(OsString::from));
+    }
+
+    #[test]
+    fn a_failing_file_in_root_one_does_not_stop_root_two() {
+        let fs = sources(&[("a/x", b"1"), ("b/k", b"2")]);
+        fs.fail("create_new", Code::PermissionDenied);
+
+        let run = roots_run(&fs, &[("a", "/src/a", false), ("b", "/src/b", false)], &unguarded);
+
+        run.result.as_ref().unwrap();
+        assert_eq!(statuses(&run), [RootStatus::Failed, RootStatus::Completed]);
+        let failed: Vec<_> = run.done.iter().map(|d| (d.files_copied, d.files_failed)).collect();
+        assert_eq!(failed, [(0, 1), (1, 0)]);
+        assert_eq!(fs.read_file("/dst/b/k").as_deref(), Some(&b"2"[..]));
+        assert_eq!(run.got.len(), 1, "{:?}", run.got);
+        assert_eq!(run.got[0].path, Path::new("a/x"), "reported under its root's name");
+    }
+
+    #[test]
+    fn an_abort_in_root_two_marks_root_three_not_started() {
+        let fs = sources(&[("a/x", b"1"), ("b/k", b"2"), ("c/y", b"3")]);
+        // Root two's directory is made, then the lock is lost: its first file meets it.
+        let guard = || if fs.called("create_dir(/dst/b)") { Err(lock_lost()) } else { Ok(()) };
+
+        let run = roots_run(
+            &fs,
+            &[("a", "/src/a", false), ("b", "/src/b", false), ("c", "/src/c", false)],
+            &guard,
+        );
+
+        assert_eq!(run.result.as_ref().unwrap_err().code(), Code::TargetLockBusy);
+        assert_eq!(
+            statuses(&run),
+            [RootStatus::Completed, RootStatus::Failed, RootStatus::NotStarted],
+            "the root that triggers the abort is Failed"
+        );
+        assert!(!fs.exists("/dst/c"), "root three was not started: {:?}", fs.calls());
+        assert!(fs.exists("/dst/a/x"), "roots finished before the abort stay on disk");
+        assert_eq!(run.done[2].files_copied + run.done[2].files_failed, 0);
+    }
+
+    #[test]
+    fn a_guard_that_fails_before_a_root_aborts_without_creating_it() {
+        let fs = sources(&[("a/x", b"1"), ("b/k", b"2")]);
+        let guard = || if fs.called("create_dir(/dst/a)") { Err(lock_lost()) } else { Ok(()) };
+
+        let run = roots_run(&fs, &[("a", "/src/a", false), ("b", "/src/b", false)], &guard);
+
+        assert_eq!(run.result.as_ref().unwrap_err().code(), Code::TargetLockBusy);
+        // `a` is made and its file meets the lost lock; `b` is never begun, so its directory is never made.
+        assert_eq!(statuses(&run), [RootStatus::Failed, RootStatus::NotStarted]);
+        assert!(!fs.exists("/dst/b"));
+    }
+
+    #[test]
+    fn counters_are_sums_over_roots() {
+        let fs = sources(&[("a/x", b"1"), ("b/k", b"2"), ("b/y/z", b"4"), ("f", b"3")]);
+        fs.fail("create_new", Code::PermissionDenied);
+
+        let run = roots_run(&fs, &A_B_F, &unguarded);
+
+        run.result.as_ref().unwrap();
+        assert_eq!(
+            statuses(&run),
+            [RootStatus::Failed, RootStatus::Completed, RootStatus::Completed]
+        );
+        let out = &run.out;
+        assert_eq!(out.files_total, 4);
+        assert_eq!(out.files_copied, 3);
+        assert_eq!(out.bytes_copied, 3);
+        // `a` and `b` made by the loop, `b/y` by the walk.
+        assert_eq!(out.directories_created, 3);
+        assert_eq!((out.failures.copy, out.failures.total()), (1, 1));
+        let copied: u64 = run.done.iter().map(|d| d.files_copied).sum();
+        let failed: u64 = run.done.iter().map(|d| d.files_failed).sum();
+        assert_eq!((copied, failed), (out.files_copied, out.failures.copy));
+        assert_eq!(copied + failed, out.files_total, "every file is one or the other");
+    }
+
+    #[test]
+    fn a_root_with_only_a_walk_or_create_dir_failure_is_failed() {
+        // `a/sub` cannot be created (the second `create_dir`; the first is `DEST/a`): a `create_dir` failure, no
+        // `copy` failure. A one-source run exits 1 on it, so the root is Failed, with no failed file.
+        let fs = sources(&[("a/w", b"0"), ("a/sub/x", b"1"), ("b/k", b"2")]);
+        fs.create_dir(Path::new("/dst")).unwrap();
+        // The count includes the fixture's own `create_dir` calls.
+        let made =
+            u32::try_from(fs.calls().iter().filter(|c| c.starts_with("create_dir(")).count());
+        let second = made.unwrap() + 2;
+        fs.fail_nth(
+            "create_dir",
+            second,
+            Code::PermissionDenied,
+            std::io::ErrorKind::PermissionDenied,
+        );
+
+        let run = roots_run(&fs, &[("a", "/src/a", false), ("b", "/src/b", false)], &unguarded);
+
+        run.result.as_ref().unwrap();
+        assert_eq!((run.out.failures.create_dir, run.out.failures.copy), (1, 0), "{:?}", run.got);
+        assert_eq!(statuses(&run), [RootStatus::Failed, RootStatus::Completed]);
+        assert_eq!(run.done[0].files_failed, 0, "files_failed stays the copy failures");
+        assert_eq!(fs.read_file("/dst/b/k").as_deref(), Some(&b"2"[..]), "the next root ran");
+    }
+
+    #[test]
+    fn a_per_file_failure_of_a_file_root_does_not_stop_the_loop() {
+        // A per-file failure of a file root marks that root Failed and the loop goes on. The failure is made with a
+        // file root named `.flux` over a `.flux` directory this test makes in DEST (standing for the workspace), which
+        // fails it like a tree's top-level `.flux` file. (`reserved_path` needs two components, `.flux/operations/...`,
+        // and a file root's path is one, so it cannot fire here; the helper still calls it, as a tree's file event does.)
+        let fs = sources(&[(".flux", b"1"), ("g", b"2")]);
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.create_dir(Path::new("/dst/.flux")).unwrap();
+
+        let run =
+            roots_run(&fs, &[(".flux", "/src/.flux", true), ("g", "/src/g", true)], &unguarded);
+
+        run.result.as_ref().unwrap();
+        assert_eq!(statuses(&run), [RootStatus::Failed, RootStatus::Completed]);
+        assert_eq!((run.out.failures.copy, run.out.files_copied), (1, 1), "{:?}", run.got);
+        assert_eq!(run.got[0].path, Path::new(".flux"));
+        assert!(fs.exists("/dst/.flux") && fs.exists("/dst/g"));
+    }
+
+    #[test]
+    fn a_dropped_stop_with_a_leftover_reports_a_root_relative_path_under_a_prefix() {
+        // `a_lost_lock_during_the_drain_keeps_the_remaining_frames_without_a_barrier`, walked under the prefix `p`:
+        // the drain's flush stops after the walk failed, the stop is dropped, and its leftover (relative to DEST,
+        // `p/...`) is reported. `TreeFailure.path` stays relative to the root, so a caller that prefixes the root's
+        // name does not prefix twice.
+        let fs = two_pending_frames_then_an_ordinary_abort();
+        let calls = std::cell::Cell::new(0);
+        let guard = || {
+            calls.set(calls.get() + 1);
+            match calls.get() {
+                1..=7 => Ok(()),
+                8 => Err(FsError::new(Code::IoError, std::io::Error::other("walk"))),
+                _ => Err(lock_lost()),
+            }
+        };
+
+        let prefix = OsString::from("p");
+        let (_, _, got) = batched_keyed(
+            &fs,
+            policy(64),
+            Durability::Strict,
+            &guard,
+            &no_heartbeat,
+            Some(prefix.as_os_str()),
+        );
+
+        let mut checked = 0;
+        for g in &got {
+            if let TreeFailureCause::Copy(e) = &g.cause
+                && let Some((leftover, _)) = &e.leftover
+            {
+                assert!(
+                    leftover.starts_with("p"),
+                    "the leftover is relative to DEST: {leftover:?}"
+                );
+                assert!(!g.path.starts_with("p"), "TreeFailure.path is root-relative: {g:?}");
+                // The dropped stop is reported AT its leftover's path (a temporary's name); the others at their entry's.
+                if g.path.to_string_lossy().contains("flux-partial") {
+                    assert_eq!(g.path, leftover.strip_prefix("p").unwrap());
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 1, "{got:?}");
     }
 }

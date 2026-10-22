@@ -956,6 +956,74 @@ mod tests {
     }
 
     #[test]
+    fn an_aborted_version_5_workspace_is_listed_and_force_deletes_it_and_its_partials() {
+        use crate::state::{Config, Options, Root, RootKind};
+        let (fs, _d) = setup();
+        let roots = vec![
+            Root {
+                source_root: native_hex(Path::new("/s/a")),
+                source_identity: "strong:3:9".to_string(),
+                destination_prefix: native_hex(Path::new("a")),
+                kind: Some(RootKind::Tree),
+            },
+            Root {
+                source_root: native_hex(Path::new("/s/f")),
+                source_identity: "strong:3:8".to_string(),
+                destination_prefix: native_hex(Path::new("f")),
+                kind: Some(RootKind::File),
+            },
+        ];
+        use flux_fs::{
+            CopyOptions, Durability, ExistingPolicy, Links, OperationId, Preserve, Publish, Safety,
+        };
+        let options = Options::of(&CopyOptions {
+            preserve_times: Preserve::Default,
+            preserve_permissions: Preserve::Default,
+            durability: Durability::Normal,
+            publish: Publish::Replace,
+            safety: Safety::Default,
+            operation_id: OperationId::new("replaced by the run"),
+            existing: ExistingPolicy::Overwrite,
+            links: Links::Copy,
+            cross_filesystems: false,
+        });
+        let state = OperationState {
+            state: OpState::Failed,
+            ..OperationState::created(
+                &id(1),
+                Kind::Tree,
+                Path::new("/p/dest"),
+                1,
+                None,
+                Config::new(roots, options),
+            )
+        };
+        assert_eq!(state.format_version, crate::state::MULTI_ROOT_FORMAT);
+        let (x, y) = (partial("a/x", 1), partial("f", 1));
+        fs.create_dir(Path::new("/p/dest/a")).unwrap();
+        for f in [&x, &y] {
+            fs.write_file(format!("/p/dest/{f}"), b"half");
+        }
+        workspace(&fs, &state, Some(NOW - 3600 * SEC));
+
+        let listed = run(&fs, &cfg());
+        assert_eq!(listed.entries[0].status, Status::Resumable);
+        assert!(!listed.entries[0].eligible);
+        assert!(listed.actions.is_empty());
+
+        let forced = run(&fs, &CleanupConfig { force: true, ..cfg() });
+        assert!(forced.entries[0].eligible);
+        let l = lines(&forced);
+        for p in [&x, &y] {
+            assert!(l.contains(&format!("removed /p/dest/{p}")), "{l:?}");
+        }
+        assert_eq!(l.last(), Some(&format!("removed {OPS}/{}", id(1))), "{l:?}");
+        assert!(!fs.exists(format!("{OPS}/{}", id(1))));
+        assert!(!fs.exists(format!("/p/dest/{x}")) && !fs.exists(format!("/p/dest/{y}")));
+        assert!(!forced.failed());
+    }
+
+    #[test]
     fn revalidation_skips_a_row_that_changed() {
         let (fs, _d) = setup();
         let x = partial("x", 1);

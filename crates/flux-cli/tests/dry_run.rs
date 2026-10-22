@@ -147,6 +147,7 @@ fn prior_in(src: &Path, dst: &Path, id: &str, state: OpState) -> PathBuf {
             source_root: native_hex(&std::fs::canonicalize(src).unwrap()),
             source_identity: format!("strong:{}:{}", m.dev(), m.ino()),
             destination_prefix: String::new(),
+            kind: None,
         }],
         Options {
             preserve_times: "default".to_owned(),
@@ -270,6 +271,7 @@ fn a_single_file_restart_lists_its_discards() {
                 std::os::unix::fs::MetadataExt::ino(&m)
             ),
             destination_prefix: String::new(),
+            kind: None,
         }],
         Options {
             preserve_times: "default".to_owned(),
@@ -492,6 +494,7 @@ fn a_dry_run_notes_a_completed_prior_and_still_plans() {
             source_root: native_hex(Path::new("/s")),
             source_identity: "strong:3:9".to_owned(),
             destination_prefix: String::new(),
+            kind: None,
         }],
         Options {
             preserve_times: "default".to_owned(),

@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 /// The version this binary writes (cut 9f-1). It reads `V1`, `V2` and `V3` too and never upgrades a record it
 /// rewrites (decision 5).
 pub const FORMAT_VERSION: u64 = 4;
+/// The version a record with two or more roots carries: it adds a `kind` to every root. A one-root record is still
+/// written as `FORMAT_VERSION`.
+pub const MULTI_ROOT_FORMAT: u64 = 5;
 /// Cut 9a's version: read, and rewritten as itself.
 pub const V3: u64 = 3;
 /// Cut 7b's version: read, and rewritten as itself.
@@ -58,7 +61,15 @@ const WAL_KEYS: [&str; 1] = ["wal_generation"];
 /// The first line of the canonical configuration bytes the fingerprint hashes.
 pub const FINGERPRINT_HEADER: &str = "flux-config-v1\n";
 
-/// One source root of a version-3 record (exactly one today).
+/// What one root of a version-5 record is: a tree or a single file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RootKind {
+    Tree,
+    File,
+}
+
+/// One source root of a record's configuration: exactly one before version 5, two or more from it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Root {
@@ -68,6 +79,9 @@ pub struct Root {
     pub source_identity: String,
     /// `""` for a tree; `native_hex` of the target's name for a single file.
     pub destination_prefix: String,
+    /// Version 5 only: whether the root is a tree or a single file. `None` before version 5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<RootKind>,
 }
 
 /// The run's options as the manifest spells them.
@@ -301,7 +315,7 @@ pub struct FileFields {
 /// Part 1 capstone round 3, owner ruling).
 pub const ARTIFACT_STATE: &str = "state";
 
-/// One operation's state, version 1 or 2.
+/// One operation's state, versions 1 to 5.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperationState {
@@ -405,7 +419,8 @@ impl OperationState {
         }
     }
 
-    /// A new operation's state as THIS binary writes it: version 4, `CREATED`, WAL generation 1.
+    /// A new operation's state as THIS binary writes it: version 5 for two or more roots, else version 4;
+    /// `CREATED`, WAL generation 1.
     pub fn created(
         operation_id: &str,
         kind: Kind,
@@ -415,7 +430,11 @@ impl OperationState {
         config: Config,
     ) -> Self {
         Self {
-            format_version: FORMAT_VERSION,
+            format_version: if config.roots.len() >= 2 {
+                MULTI_ROOT_FORMAT
+            } else {
+                FORMAT_VERSION
+            },
             wal: Some(Wal { wal_generation: 1 }),
             ..Self::created_v3(operation_id, kind, destination_root, created_at, file, config)
         }
@@ -463,12 +482,17 @@ pub fn decode(bytes: &[u8]) -> Result<OperationState, Unusable> {
         })?,
         None => return Err(Unusable::Corrupt("no format_version".to_string())),
     };
-    if version != V1 && version != V2 && version != V3 && version != FORMAT_VERSION {
+    if version != V1
+        && version != V2
+        && version != V3
+        && version != FORMAT_VERSION
+        && version != MULTI_ROOT_FORMAT
+    {
         return Err(Unusable::Incompatible(version));
     }
     let v2 = version >= V2;
     let v3 = version >= V3;
-    let v4 = version == FORMAT_VERSION;
+    let v4 = version >= FORMAT_VERSION;
     let file = v2 && map.get("kind").and_then(Value::as_str) == Some("file");
     let mut expected: Vec<&str> = KEYS.to_vec();
     if v2 {
@@ -562,17 +586,30 @@ fn validate(s: &OperationState) -> Result<(), String> {
     }
     let v2 = s.format_version >= V2;
     if (s.format_version >= V3) != s.config.is_some()
-        || (s.format_version == FORMAT_VERSION) != s.wal.is_some()
+        || (s.format_version >= FORMAT_VERSION) != s.wal.is_some()
         || v2 != s.cleanup.is_some()
         || (v2 && s.kind == Kind::File) != s.file.is_some()
     {
         return Err("the record's fields do not match its version and kind".to_string());
     }
     if let Some(c) = &s.config {
-        if c.roots.len() != 1 {
+        if s.format_version >= MULTI_ROOT_FORMAT {
+            if c.roots.len() < 2 {
+                return Err(format!("roots has {} entries, not 2 or more", c.roots.len()));
+            }
+        } else if c.roots.len() != 1 {
             return Err(format!("roots has {} entries, not 1", c.roots.len()));
         }
         for r in &c.roots {
+            if (s.format_version >= MULTI_ROOT_FORMAT) != r.kind.is_some() {
+                return Err(format!(
+                    "root kind does not match format_version {}: {}",
+                    s.format_version, r.source_root
+                ));
+            }
+            if s.format_version >= MULTI_ROOT_FORMAT && r.destination_prefix.is_empty() {
+                return Err(format!("destination_prefix is empty: {}", r.source_root));
+            }
             if from_native_hex(&r.source_root).is_none() {
                 return Err(format!("source_root is not native-unit hex: {}", r.source_root));
             }
@@ -1114,8 +1151,8 @@ mod tests {
     #[test]
     fn format_version_is_judged_before_any_other_key() {
         assert_eq!(
-            decode(br#"{"format_version":5,"anything":[1,2]}"#),
-            Err(Unusable::Incompatible(5))
+            decode(br#"{"format_version":6,"anything":[1,2]}"#),
+            Err(Unusable::Incompatible(6))
         );
         assert!(matches!(decode(br#"{"kind":"tree"}"#), Err(Unusable::Corrupt(_))), "none");
         assert!(matches!(decode(br#"{"format_version":"1"}"#), Err(Unusable::Corrupt(_))), "text");
@@ -1867,6 +1904,7 @@ mod tests {
                 source_root: native_hex(Path::new("/s")),
                 source_identity: "strong:3:9".into(),
                 destination_prefix: String::new(),
+                kind: None,
             }],
             options_default(),
         )
@@ -1979,11 +2017,166 @@ mod tests {
     }
 
     #[test]
-    fn a_version_5_record_is_incompatible() {
+    fn version_6_is_incompatible() {
         let r = edited_v4(&|m| {
-            m.insert("format_version".to_string(), serde_json::json!(5));
+            m.insert("format_version".to_string(), serde_json::json!(6));
         });
-        assert_eq!(r, Err(Unusable::Incompatible(5)));
+        assert_eq!(r, Err(Unusable::Incompatible(6)));
+    }
+
+    #[test]
+    fn a_version_4_record_encodes_to_the_pinned_bytes() {
+        let bytes = OperationState::created(&id(1), Kind::Tree, Path::new("/d"), 5, None, config())
+            .encode();
+        // The source root is native hex: bytes of "/s" on Unix, UTF-16 units of "\\s" on Windows.
+        let source_root = if cfg!(windows) { "5c007300" } else { "2f73" };
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            format!(
+                r#"{{"cleanup_pending":false,"cleanup_pending_artifacts":[],"configuration_fingerprint":"6814cb38cd3fe6c13a382a988c9c5cbac2ebcf30be0bb4af44596d3019b19f1d","created_at":"5","destination_root":"/d","format_version":4,"kind":"tree","operation_id":"00000000000000000000000000000001","options":{{"durability":"normal","existing":"overwrite","preserve_permissions":"default","preserve_times":"default","safety":"default"}},"roots":[{{"destination_prefix":"","source_identity":"strong:3:9","source_root":"{source_root}"}}],"state":"CREATED","superseded_by":null,"takeover":null,"wal_generation":1}}"#
+            )
+        );
+    }
+
+    fn root_of(path: &str, prefix: &str, kind: Option<RootKind>) -> Root {
+        Root {
+            source_root: native_hex(Path::new(path)),
+            source_identity: "strong:3:9".into(),
+            destination_prefix: prefix.into(),
+            kind,
+        }
+    }
+
+    fn two_roots() -> Vec<Root> {
+        vec![
+            root_of("/a", &native_hex(Path::new("a")), Some(RootKind::Tree)),
+            root_of("/b", &native_hex(Path::new("b")), Some(RootKind::File)),
+        ]
+    }
+
+    fn tree_v5() -> OperationState {
+        OperationState::created(
+            &id(1),
+            Kind::Tree,
+            Path::new("/d"),
+            5,
+            None,
+            Config::new(two_roots(), options_default()),
+        )
+    }
+
+    fn edited_v5(
+        edit: &dyn Fn(&mut serde_json::Map<String, serde_json::Value>),
+    ) -> Result<OperationState, Unusable> {
+        let mut v: serde_json::Value = serde_json::from_slice(&tree_v5().encode()).unwrap();
+        edit(v.as_object_mut().unwrap());
+        decode(v.to_string().as_bytes())
+    }
+
+    fn corrupt_with(r: Result<OperationState, Unusable>, needle: &str) {
+        match r {
+            Err(Unusable::Corrupt(w)) => assert!(w.contains(needle), "{w}"),
+            other => panic!("expected Corrupt containing {needle:?}, got {other:?}"),
+        }
+    }
+
+    fn roots_mut(
+        m: &mut serde_json::Map<String, serde_json::Value>,
+    ) -> &mut Vec<serde_json::Value> {
+        m.get_mut("roots").unwrap().as_array_mut().unwrap()
+    }
+
+    #[test]
+    fn a_version_5_record_with_two_roots_round_trips_with_a_kind_per_root() {
+        let s = tree_v5();
+        assert_eq!(s.format_version, 5);
+        assert_eq!(s.wal, Some(Wal { wal_generation: 1 }));
+        let json = String::from_utf8(s.encode()).unwrap();
+        assert!(json.contains(r#""kind":"tree""#) && json.contains(r#""kind":"file""#), "{json}");
+        let back = decode(&s.encode()).unwrap();
+        assert_eq!(back, s);
+        let kinds: Vec<_> = back.config.unwrap().roots.iter().map(|r| r.kind).collect();
+        assert_eq!(kinds, [Some(RootKind::Tree), Some(RootKind::File)]);
+    }
+
+    #[test]
+    fn a_version_5_record_with_one_root_is_rejected() {
+        let s = OperationState {
+            format_version: MULTI_ROOT_FORMAT,
+            ..OperationState::created(
+                &id(1),
+                Kind::Tree,
+                Path::new("/d"),
+                5,
+                None,
+                Config::new(two_roots()[..1].to_vec(), options_default()),
+            )
+        };
+        corrupt_with(decode(&s.encode()), "roots has 1 entries");
+    }
+
+    #[test]
+    fn a_version_4_record_with_two_roots_is_rejected() {
+        let s = OperationState { format_version: FORMAT_VERSION, ..tree_v5() };
+        corrupt_with(decode(&s.encode()), "roots has 2 entries");
+    }
+
+    #[test]
+    fn a_version_5_root_without_kind_is_rejected() {
+        let r = edited_v5(&|m| {
+            roots_mut(m)[1].as_object_mut().unwrap().remove("kind");
+        });
+        corrupt_with(r, "root kind");
+    }
+
+    #[test]
+    fn a_version_4_root_with_kind_is_rejected() {
+        let r = edited_v4(&|m| {
+            roots_mut(m)[0]
+                .as_object_mut()
+                .unwrap()
+                .insert("kind".to_string(), serde_json::json!("tree"));
+        });
+        corrupt_with(r, "root kind");
+    }
+
+    #[test]
+    fn a_version_5_root_with_an_empty_prefix_is_rejected() {
+        let r = edited_v5(&|m| {
+            roots_mut(m)[0]
+                .as_object_mut()
+                .unwrap()
+                .insert("destination_prefix".to_string(), serde_json::json!(""));
+        });
+        corrupt_with(r, "destination_prefix");
+    }
+
+    #[test]
+    fn a_version_5_record_without_wal_is_rejected() {
+        let r = edited_v5(&|m| {
+            m.remove("wal_generation");
+        });
+        assert_eq!(r, Err(Unusable::Corrupt("missing key wal_generation".to_string())));
+        let s = OperationState { wal: None, ..tree_v5() };
+        corrupt_with(decode(&s.encode()), "missing key wal_generation");
+    }
+
+    #[test]
+    fn created_writes_version_5_only_for_two_or_more_roots() {
+        assert_eq!(tree_v4().format_version, 4);
+        assert_eq!(tree_v5().format_version, 5);
+        let three =
+            [two_roots(), vec![root_of("/c", &native_hex(Path::new("c")), Some(RootKind::Tree))]]
+                .concat();
+        let s = OperationState::created(
+            &id(1),
+            Kind::Tree,
+            Path::new("/d"),
+            5,
+            None,
+            Config::new(three, options_default()),
+        );
+        assert_eq!(s.format_version, 5);
     }
 
     #[test]
