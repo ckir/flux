@@ -32,7 +32,7 @@ Non-goals (each is a later cut or stays in TODO.md)
 - N2. `--exclude` (own cut; the cut 11a spec N5 lists it separately).
 - N3. Hardlink grouping across roots (phase 4 is not built). Only the ORDER that grouping needs is honoured (§3.6).
 - N4. Parallel workers, queues, a planner (phase 3).
-- N5. A per-root breakdown in `--json` (the 18 keys stay).
+- N5. A per-root breakdown in `--json` beyond the optional `roots` array of §3.8 (the 18 keys stay).
 - N6. The two cut 11c leftovers `TODO.md:619` and `:620`. I proposed them as riders earlier; on reading the code this
   cut does not touch `flush_batch`, so they stay in TODO.md and are not part of this cut.
 
@@ -66,8 +66,9 @@ Anti-goals (a failure even if the tests pass)
   on the path AS GIVEN (a symlink source is refused, K7, exit 1; a missing source fails, exit 1 with the platform line),
   then the kind, then canonicalisation for the name. A trailing separator on a link therefore behaves as it does today
   for one source; this cut changes nothing there.
-- A source whose name is `.flux` (ASCII case-insensitive, as `reserved_path` compares), or ends in `.flux-lock`
-  (ASCII case-insensitive), is refused before transfer with `CONTROL_PLANE_NAMESPACE_CONFLICT`. `reserved_path`
+- A source whose name is `.flux`, `.flux-dir.lock` or `.flux-root.lock` (ASCII case-insensitive, as `reserved_path`
+  compares; the last two are the spec §96.1 directory and root lock names, `lock/site.rs:12` and `lock/acquire.rs:53`),
+  or ends in `.flux-lock` (ASCII case-insensitive), is refused before transfer with `CONTROL_PLANE_NAMESPACE_CONFLICT`. `reserved_path`
   (`tree.rs:982`) alone does not do this: it reserves only `.flux/operations`, `.flux/standalone` and `.flux/atomic`,
   two components deep, so a root named `.flux` would land ON the control directory, and a root `x.flux-lock` would
   collide with root `x`'s prefix lock `DEST/x.flux-lock`.
@@ -99,6 +100,15 @@ Order, all before any transfer:
    fails against another root's lock of this same operation means the names alias on the destination filesystem:
    `DESTINATION_NAMESPACE_COLLISION`, exit 3, and every lock taken is released. A lock held by another operation is the
    existing `TARGET_LOCK_BUSY` / uncertain classification.
+   How "this same operation" is recognised (a finding of the panel, MEASURED): today a lock is created EMPTY and its
+   record is written only after the state exists (`lock/obtain.rs`: "a lock this run holds with no record yet: create
+   the state, then `Held::write_record`"), and `classify` reads an empty lock whose OS lock another handle holds as
+   `Busy(None)` (`lock/classify.rs`, `Decoded::Uncertain(_) if !got`), which `obtain` reports as `TARGET_LOCK_BUSY`, exit 1.
+   So a record cannot be what tells the run that a failed creation hit its own lock. The run keeps the file identity
+   of every prefix lock it holds (`Held::identity`, `lock/held.rs:34`); when a creation fails, it opens the existing
+   lock and compares that identity with its own BEFORE any classification: equal means an alias of this operation
+   (`DESTINATION_NAMESPACE_COLLISION`); unequal goes through `obtain`'s normal classification. A prefix lock's record is
+   written as soon as the lock is held, not after the workspace. A test makes the empty-record window observable (V10).
 Length rule (a finding of the panel): spec §96.1 says that when `<name>.flux-lock` would exceed the directory's
 name-length limit the acquirer takes the directory lock `P/.flux-dir.lock` instead, and that per-name locks and the
 directory lock exclude each other (`lock/acquire.rs:53` already refuses a per-name acquirer when `.flux-dir.lock` is
@@ -125,9 +135,22 @@ operation lock is released, and a DEST this run created is removed again. That i
 by the existing convention ("`changed` is false when nothing changed, or what the run created was removed again",
 `run/mod.rs:153-157`); a DEST that cannot be removed is `not_removed`, exit 1, as today. The section 7 test for
 refusals reads "DEST not present afterwards", which covers both a DEST never made and one made and removed.
-Prefix locks are released when the operation ends, on every path, before the workspace is retired. A crash leaves the
-prefix lock files behind with a dead owner; the next acquirer classifies them as any dead lock (§240; `lock/classify.rs`
-separates live, dead-with-workspace, orphan and untrusted), see V8.
+Prefix locks are released when the operation ends, on every path, before the workspace is retired.
+Crash residue (a finding of the panel, MEASURED, and a master-spec gap): a crash leaves the prefix lock files behind with
+a dead owner. `classify` resolves a recorded `workspace_path` of `operations/<id>` RELATIVE TO THE LOCK'S OWN TARGET
+(`lock/site.rs:152-186`, `operation_dir_exists`): for the prefix lock of `<name>` that is `DEST/<name>/.flux/operations/<id>`,
+which never exists, so the dead lock is an `Orphan`, `obtain` refuses it, and the refusal's hint ("flux cleanup DEST
+removes a dead owner's lock whose workspace is gone", `lock/obtain.rs`) is false for it, because `flux cleanup` examines
+the root lock beside DEST and the operations listing, not `DEST/*.flux-lock` (`cleanup/discover.rs:~205-235`; the plan
+re-reads it). An operator would loop between the refusal and the hint. The master spec has no rule for this: §120 and
+§259.6 trust a recorded `workspace_path` only if it is one of two paths derived from the lock's own target, or `none`
+(which they define for a cleanup lock). Ruling R7 (mine, OWNER DECISION): a prefix lock's record carries
+`workspace_path` = `none`, extending §259.6's `none` from cleanup locks to prefix locks. The operation lock beside DEST
+already names the real workspace, and a prefix lock protects no recovery state of its own. A dead prefix lock is then
+`Trusted` (`site.rs`: `path == "none"`), classified `Dead`, and recovered like any dead lock by the next acquirer of that
+name. Consequence, limitation L6: a dead prefix lock for a name no later run uses stays in DEST as a stale file until
+that name is used again. The alternative, teaching `flux cleanup` to remove the dead prefix locks that a version-5
+manifest names, is not taken in this cut; it can be added without a format change.
 
 ### 3.5 Operation state
 - One workspace `DEST/.flux/operations/<id>/` (never under `DEST/<name>/`), kind tree, `roots` with n entries in root
@@ -137,7 +160,13 @@ separates live, dead-with-workspace, orphan and untrusted), see V8.
   `{source_root: native_hex of the absolute FILE path, source_identity: the file's, destination_prefix: native_hex of
   its name}` (exactly today's single-file record, `run/place.rs:808-814`). A several-source operation has no empty
   prefix. The identity pre-flight, the one-source `--resume` mismatch refusal and `cleanup` all read these fields;
-  keeping today's conventions means none of them learns a new one.
+  keeping today's conventions means none of them learns a new one, with ONE addition (a finding of the panel): a version-5
+  `Root` also records `kind` (`"tree"` or `"file"`). `Root` has no kind today (`state.rs:61-71`) because the record's
+  own kind said it, and a version-5 record is `Kind::Tree` with roots of both kinds. Without it the later resume cut
+  could not tell a file root from a folder root once the source path is gone or replaced (a prefix and an identity look
+  the same for both), which would force a version 6. `Root` is `deny_unknown_fields`, so the field is added for
+  version 5 only and version 4 records are byte-identical; the validator requires `kind` on every version-5 root and
+  rejects it on a version-3 or version-4 root.
 - One claim store `state.db`, as a tree's. Claims are keyed by destination directory identity, so the roots share it.
 - A NEW state format version, written ONLY by a several-source run (my call, R3). The current record validator rejects
   any record whose `roots` is not exactly one (`crates/flux-core/src/state.rs:572-574`, "roots has {} entries, not 1"),
@@ -192,6 +221,12 @@ actually do is part of V1, not assumed. The plan
 ### 3.8 Report and exit codes
 - One aggregated `Report` (all 18 JSON keys, same names): counters are sums over roots; `directories_created` counts
   `DEST` if the run made it and every `DEST/<name>` it made; a file root counts as one file.
+- `--json` (a finding of the panel): stderr is not seen by a program reading the report, and after an abort it cannot
+  tell which roots finished. A several-source report therefore carries one additional OPTIONAL key `roots`, an array in
+  prefix order of `{ "name": <string>, "status": "completed" | "failed" | "not_started", "files_copied": <n>,
+  "files_failed": <n> }`, absent from every one-source report (the precedent is `mounts_skipped`, `dry_run` and
+  `unprobed`, which are written only when set). So the 18 keys and a one-source report are unchanged. Ruling R8 (mine,
+  owner may veto): without it an aborted run is opaque to automation.
 - stderr: the existing per-entry lines, one line per finished root (`root <name>: <files> copied, <failed> failed`, my
   call: an aborted run leaves some roots on disk and the operator must see which), then one summary line in today's
   format over the totals.
@@ -225,8 +260,12 @@ ruling in §3.7, the second is moot under B).
   `reserved_path`-adjacent; the `file_names_fit` limit (`NAME_LIMIT`) for every name Flux keeps beside a target.
 - V2. The exact seam for a multi-root run in `run/mod.rs` (`tree` at ~265 builds one `TreePlace` and one `Shared`;
   `open_operation` takes one `LockSite`). Where the prefix locks live (a `Locked` holds one `Held`).
-- V3. File roots: can `copy_one` (`tree.rs:~1263`) run with `src_root` = the file's parent and a DEST-level frame? If
-  not, the alternative is a small claim-aware single-file function beside it; observable behaviour must be the same.
+- V3. File roots: `copy_one` (`tree.rs:~1263`) is a step of a directory traversal; it takes the directory's `NameIndex`,
+  a `Batch`, the parent's `claim_parent` and a walk-relative `path`, so using it for a top-level file means building a
+  DEST-level frame of those (a finding of the panel: the mechanism is not free). The alternative is a small claim-aware
+  single-file function beside it. The plan chooses by reading both and must justify the choice; observable behaviour
+  (existing-file policies, claims, atomic publication, report counters) must be the same either way and is tested
+  against a two-positional single-file copy for all three policies.
 - V4. Prefix-lock liveness: whether a prefix lock needs the heartbeat, or the OS-native lock proves liveness (spec
   §96.1, §240, §252). Intent: heartbeat on the operation lock only. Supporting but NOT verified evidence: the
   classifier's tests build a live owner as a lock file with an OS-native lock held (`live_lock`) and a dead one without
@@ -235,6 +274,9 @@ ruling in §3.7, the second is moot under B).
 - V8. Crash residue: after a crash the prefix lock files stay. What a later several-source run, a one-source tree run onto
   DEST (spec §97.1(b)) and `flux cleanup DEST` each do with them; whether `cleanup` removes them. Test obligation in §7.
 - V9. The descriptor cost of one held prefix lock on each platform, to set the cap of §3.4.
+- V10. The alias decision of §3.4 on a case-insensitive destination, including the window in which the first prefix lock
+  has no record yet; and that a prefix lock closed early would be read as dead (`classify`: an unheld lock with a
+  record is `Dead`), which is why the locks are held for the whole run.
 - V5. The fake (`fault_fs.rs`) can create, alias and release the prefix locks, and has a case-insensitive mode for the
   alias test; otherwise a real-fs test gated by a case-sensitivity probe, run on the macOS and Windows CI jobs.
 - V6. `Shared` can be rebuilt per root without copying state that must be global (the batch, the checkpoint log).
@@ -248,6 +290,7 @@ ruling in §3.7, the second is moot under B).
 - L4. A root whose name is so long that `<name>.flux-lock` exceeds the directory's limit is refused; §96.1's
   directory-lock fallback is not used by several-source runs.
 - L5. A cap on the number of sources (set by the plan from a measurement).
+- L6. A dead prefix lock for a name no later run uses stays in DEST as a stale file (R7).
 
 ## 7. Tests (obligations; each new assertion proven red under a mutant)
 - CLI: 3+ positionals parse; `--resume`, `--restart`, `--dry-run` with several sources are exit 2 naming the flag; DEST is
@@ -272,8 +315,14 @@ ruling in §3.7, the second is moot under B).
   checkpoints): each file's checkpoint entry is its own, and the copies are byte-correct.
 - Length and count: a name whose lock exceeds the limit is refused with `PATH_COMPONENT_INVALID` and nothing is made; one
   source over the cap is refused with exit 2.
-- Crash residue: a run killed after the prefix locks leaves them; a later one-source tree run, a later several-source
-  run and `flux cleanup` each behave as V8 settled, with a test per behaviour.
+- Crash residue: a run killed after the prefix locks leaves them with `workspace_path` `none`; a later several-source run
+  using the same names recovers them (no `ARTIFACT_OWNERSHIP_UNCERTAIN`, no loop with the cleanup hint); a later
+  one-source tree run onto DEST and `flux cleanup DEST` each behave as V8 settled, with a test per behaviour.
+- Alias window: with a case-insensitive destination, the second creation of `Data`/`data` is decided by identity, gives
+  `DESTINATION_NAMESPACE_COLLISION` exit 3 (not `TARGET_LOCK_BUSY`), and a mutant that decides by record is red.
+- State format, root kind: a version-5 record round-trips `kind` for a mixed file and folder run; a version-5 root
+  without `kind`, and a version-3 or -4 root with it, are rejected.
+- JSON: a several-source report has `roots` with the right statuses after a mid-run abort; a one-source report has none.
 - Later-cut compatibility: a one-source `--resume` against a several-source prior refuses (source mismatch);
   `flux cleanup DEST` classifies and removes an aborted several-source workspace; one-source `--restart` supersedes it.
 - Report: JSON keys unchanged, counters are sums; exit codes.
@@ -291,6 +340,8 @@ ruling in §3.7, the second is moot under B).
 - R4: riders `TODO.md:619` and `:620` are not in this cut.
 - R5: nested roots are allowed, not refused (§3.6). Owner may veto.
 - R6: the §96.1 directory-lock fallback is not used; over-long names and over-cap source counts are refused (L4, L5).
+- R7: prefix lock records carry `workspace_path` `none` (§3.4). OWNER DECISION: it extends a master-spec rule.
+- R8: an optional `roots` array in the several-source `--json` report (§3.8). Owner may veto.
 - Builder check (2026-10-22, a fresh reader of this document) raised seven questions: the lock/DEST/workspace order and
   what an alias refusal leaves behind (§3.4), R1 and R3 (owner), the file root's manifest fields (§3.5), the
   existing-file policy for a file root (§3.6), the key order across platforms (§3.6), the symlink check before
@@ -306,3 +357,17 @@ descriptors: FOLDED (§3.4 source count, L5, V9). F6 operator guidance after an 
 F7 crash residue of prefix locks: FOLDED as V8 and a test; the behaviour is for the plan to settle. F8 the unsupported
 claim about cut 9f-1's bump: FOLDED (§3.5 reworded). F9 Windows-reserved and malformed prefix names: FOLDED into V7.
 Discarded below the floor: none this round. Unverified-accepted: none.
+
+Panel round 1, agy escalation (reply verified line by line; agy's verdict NEGOTIATE). A1 prefix-lock crash residue is an
+orphan and cleanup does not clear it: FOLDED (§3.4 crash residue, R7, L6; the mechanism is confirmed at `lock/site.rs:152-186`
+and `lock/obtain.rs`, the cleanup half is read from `cleanup/discover.rs` and re-read by the plan). A2 the empty lock record
+makes the alias check read as `TARGET_LOCK_BUSY`: FOLDED (§3.4 identity rule, V10; confirmed at `lock/classify.rs`
+`Decoded::Uncertain(_) if !got` and `lock/obtain.rs` "no record yet"). A3 a version-5 `Root` has no kind: FOLDED (§3.5,
+tests). A4 `--json` is blind to which roots finished: FOLDED as R8. A5 root names `.flux-dir.lock` and `.flux-root.lock`:
+FOLDED (§3.2). A6 the file-root seam is deferred wholesale: FOLDED (V3 reworded; the choice stays with the plan, which
+must cite both mechanisms). A7 agy's proposal to close the prefix lock handles after validation, or hold only the active
+root's: REJECTED: an unheld lock with a record classifies as `Dead` (`lock/classify.rs`, `Decoded::Record(record)` with
+`got`), so a competitor could take it over, and the alias check needs every lock held at once before any transfer
+(spec §18.3, "Before any transfer ... takes a lock named after each root's prefix"). A8 descriptor exhaustion: already
+folded in round 1 (cap, L5). Counter-turn on A7 owed to agy and sent in round 2.
+
