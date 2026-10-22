@@ -361,11 +361,11 @@ fn t3_a_lost_lock_inside_the_stop_held_loop_writes_nothing_and_keeps_every_later
     assert!(!fs.exists("/dst/m/y.flux-partial.op1"), "removed while the lock was held");
     assert!(fs.exists("/dst/m/z.flux-partial.op1") && fs.exists("/dst/a.flux-partial.op1"), "kept");
     // y: the original stop, reported (no leftover); z: kept in the loop; a: the root's batch, KeepAll in the drain.
-    let y = got.iter().find(|f| f.path == PathBuf::from("m/y")).expect("y reported");
+    let y = got.iter().find(|f| f.path == Path::new("m/y")).expect("y reported");
     let TreeFailureCause::Copy(e) = &y.cause else { panic!("{got:?}") };
     assert_eq!((e.code(), e.step), (Code::IoError, CopyStep::Heartbeat), "{e:?}");
     assert!(e.leftover.is_none());
-    assert_eq!(leftovers(&got, Some(&error)), [temp_of("m/z"), temp_of("a")], "{got:?}");
+    assert_eq!(leftovers(&got, Some(&error)), [temp_of("a"), temp_of("m/z")], "the helper sorts: {got:?}");
     assert_eq!(out.files_copied, 1);
 }
 ```
@@ -473,7 +473,7 @@ fn a_lost_lock_before_the_batch_settles_leaves_the_renamed_for_resume_to_finaliz
     let fs = fake();
     fs.write_file("/src/c", b"C");
     fs.fail_nth("rename_no_replace", 4, Code::IoError, std::io::ErrorKind::Other);
-    fs.on_nth("rename_no_replace", 5, |fs| fs.write_file(LOCK, b"another run's bytes"));
+    fs.on_nth("rename_no_replace", 5, |fs| fs.write_file(LOCK, b"")); // EMPTY: --break-lock takes it over; non-empty junk is a non-Flux object (refused)
     let (r, got) = run_tree_with(&fs, &cfg(), &strict());
     assert!(r.stop.is_none(), "the copy's abort is the report: {:?}", r.stop);
     let a = aborted(&r);
@@ -494,7 +494,7 @@ fn a_lost_lock_before_the_batch_settles_leaves_the_renamed_for_resume_to_finaliz
     // The resume (engine-level `break_lock`, as the CLI would with --restart --break-lock, here over the foreign
     // lock the takeover left): recovery row 1 commits c (RENAMED); a's note (temporary removed, name absent) is
     // GONE and discarded; a is copied again.
-    let (r2, got2) = run_tree_with(&fs, &RunConfig { break_lock: true, ..resume() }, &strict());
+    let (r2, got2) = run_tree_with(&fs, &RunConfig { operation_id: id(0x77), break_lock: true, ..resume() }, &strict());  // a fresh id: the default collides with the prior run's manifest
     let out2 = ok(&r2);
     assert!(matches!(r2.resumed, Some(ResumeNote::Adopted { .. })), "{:?}", r2.resumed);
     assert!(got2.is_empty(), "{got2:?}");
