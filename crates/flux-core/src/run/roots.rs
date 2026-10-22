@@ -5,7 +5,7 @@ use super::RunError;
 use crate::lock::{LockCode, Refusal, prefix_lock_fits};
 use crate::tree::open_writers_cap;
 use flux_fs::{FluxPathKey, check_component};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
 /// What a source is: a directory tree or a single file.
@@ -36,17 +36,40 @@ fn refuse(code: LockCode, detail: String) -> RunError {
     }
 }
 
-fn is_control_plane(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    matches!(lower.as_str(), ".flux" | ".flux-dir.lock" | ".flux-root.lock")
-        || lower.ends_with(".flux-lock")
+/// The name's units (bytes on Unix, UTF-16 units on Windows), ASCII-lowercased, so the control-plane rules also
+/// bind a name that is not valid Unicode.
+#[cfg(unix)]
+fn folded_units(name: &OsStr) -> Vec<u16> {
+    use std::os::unix::ffi::OsStrExt;
+    name.as_bytes().iter().map(|b| u16::from(b.to_ascii_lowercase())).collect()
 }
 
 #[cfg(windows)]
-fn windows_reserved(name: &str) -> bool {
-    if name.ends_with('.') || name.ends_with(' ') {
+fn folded_units(name: &OsStr) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    name.encode_wide()
+        .map(|u| match u8::try_from(u) {
+            Ok(b) if b.is_ascii() => u16::from(b.to_ascii_lowercase()),
+            _ => u,
+        })
+        .collect()
+}
+
+fn is_control_plane(name: &OsStr) -> bool {
+    let units = folded_units(name);
+    let ascii = |s: &str| s.bytes().map(u16::from).collect::<Vec<u16>>();
+    [".flux", ".flux-dir.lock", ".flux-root.lock"].iter().any(|n| units == ascii(n))
+        || units.ends_with(&ascii(".flux-lock"))
+}
+
+#[cfg(windows)]
+fn windows_reserved(name: &OsStr) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    // A trailing dot or space can follow a lone surrogate; a device name is ASCII, so it cannot.
+    if matches!(name.encode_wide().last(), Some(0x2e | 0x20)) {
         return true;
     }
+    let Some(name) = name.to_str() else { return false };
     let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ').to_ascii_uppercase();
     matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
         || (stem.len() == 4
@@ -70,10 +93,10 @@ pub(crate) fn plan_roots(specs: Vec<SourceSpec>) -> Result<Vec<SourceSpec>, RunE
             return Err(invalid(&e.to_string()));
         }
         #[cfg(windows)]
-        if spec.name.to_str().is_some_and(windows_reserved) {
+        if windows_reserved(&spec.name) {
             return Err(invalid("a reserved or trailing-dot/space Windows name"));
         }
-        if spec.name.to_str().is_some_and(is_control_plane) {
+        if is_control_plane(&spec.name) {
             return Err(refuse(
                 LockCode::ControlPlaneNamespaceConflict,
                 format!(
@@ -185,6 +208,23 @@ mod tests {
             [(None, 256), (Some(1024), 256), (Some(256), 64), (Some(3), 1), (Some(0), 1)]
         {
             assert_eq!(source_cap(limit), want, "{limit:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_name_ending_in_flux_lock_is_a_control_plane_conflict() {
+        use std::os::unix::ffi::OsStringExt;
+        for raw in [&b"\xff.flux-lock"[..], &b"\xff.FLUX-LOCK"[..]] {
+            let mut sp = spec("/s/src", "x");
+            sp.name = OsString::from_vec(raw.to_vec());
+            match plan_roots(vec![sp]) {
+                Err(RunError::Refused { refusal, changed, .. }) => {
+                    assert_eq!(refusal.code, LockCode::ControlPlaneNamespaceConflict, "{raw:?}");
+                    assert!(!changed);
+                }
+                other => panic!("expected a refusal for {raw:?}, got {other:?}"),
+            }
         }
     }
 }
