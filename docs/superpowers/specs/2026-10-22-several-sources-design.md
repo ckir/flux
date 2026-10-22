@@ -136,9 +136,11 @@ fallback: a several-source command with a root whose `<name>.flux-lock` would ex
 single-file analogue; the plan reads its limit.)
 Source count (a finding of the panel): every prefix lock is a file in DEST and an open handle with an OS-native lock for
 the whole run, and all must be held before any transfer, so n cannot be lazy. The command is refused in group 1 (exit 2)
-when the number of sources exceeds a cap, with a message giving the cap. The cap is a number the plan sets from a
-measurement (the process's open-file limit less the descriptors the run already needs); this spec fixes the behaviour,
-not the number. Limitation L5.
+when the number of sources exceeds a cap, with a message giving the cap. The cap is not a hard-coded constant where the
+platform reports the process's open-file limit: it is computed at run time as that limit less the descriptors the run
+already needs and a safety margin (a refinement from the owner-requested negotiation with agy, 2026-10-22; where the
+limit cannot be read, a fixed conservative number the plan measures is used). This spec fixes the behaviour and the
+rule, not the numbers. Limitation L5.
 Ruling R1 (mine, to confirm): spec §18.3 and §98 are silent on whether a several-source operation also takes the
 destination-root lock. I take it (step 1) because the workspace lives under `DEST/.flux/` and one root lock serialises
 every operation on DEST, as for a single tree; the prefix locks add alias detection and protect each `DEST/<name>`
@@ -466,4 +468,17 @@ the held lock is the last root's. E5 the weakest bullet, the report and exit cod
 Fold Auditor items (a) to (c): no new findings. Discarded below the floor: none. Unverified-accepted: none.
 Round count: five. Round six is the cap at which the operator is asked whether to continue or ship; the findings of rounds
 four and five were test obligations, not design defects, and this spec is handed to the owner at that point.
+
+Negotiation of the owner decisions with agy (2026-10-22, requested by the owner). Nine decisions were put to agy as even
+options with no default (briefs `.clavity/seams/several-sources-decisions-1.md` and `-2.md`). The first answer picked the
+first-listed option on every decision, which in my brief was always this document's own proposal, so I re-asked with the
+options re-lettered, the proposal unmarked, and a request to argue against its own pick. The second answer picked the same
+substantive option on all nine and gave, for each, its strongest argument against and why it was not moved. The cited lines
+I spot-checked were accurate. Agreed: R1 (D1), R3 (D2), R5 (D3), R6 (D4), R7 (D5), R8 (D6), R4 (D7), L1 (D8), and handing
+this document to the owner now (D9). Two things agy added: D8 is the decision the owner is most likely to regret (a
+usability papercut), and a measurement would settle it (the code needed to let `--restart` supersede a several-source
+prior; agy's "fewer than about thirty lines" is its own unmeasured figure and is not relied on); and the source cap should be
+computed from the run-time open-file limit (folded into section 3.4). Agreement between two readings of one document is not
+independent evidence of what the owner prefers: R7 (extends a master-spec rule), D8 (usability) and R8 (a report-schema
+addition) stay the owner's calls.
 
