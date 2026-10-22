@@ -360,3 +360,24 @@ fn a_file_source_over_an_existing_directory_exits_3() {
     assert_eq!(std::fs::read(out_dir.join("thing").join("keep")).unwrap(), b"keep");
     assert!(!out_dir.join("beta").exists(), "refused before any root is copied");
 }
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_at_a_folder_roots_destination_name_exits_3_and_copies_nothing() {
+    let d = TempDir::new().unwrap();
+    let (a, b) = (folder(&d.path().join("src"), "a"), folder(&d.path().join("src"), "b"));
+    let out_dir = d.path().join("dest");
+    std::fs::create_dir(&out_dir).unwrap();
+    let elsewhere = d.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, out_dir.join("b")).unwrap();
+
+    let out = flux().arg("copy").arg(&a).arg(&b).arg(&out_dir).output().unwrap();
+
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("DESTINATION_NAMESPACE_COLLISION"), "{}", stderr(&out));
+    assert!(!out_dir.join("a").exists(), "root a must not be copied");
+    assert!(!out_dir.join(".flux").exists(), "no workspace is left");
+    assert!(control_plane_names(&out_dir).is_empty(), "{:?}", control_plane_names(&out_dir));
+    assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0, "nothing went through the link");
+}

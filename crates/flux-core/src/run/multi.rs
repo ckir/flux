@@ -158,11 +158,30 @@ impl<'p, F: DestinationRoot> MultiPlace<'p, F> {
                         ),
                     ));
                 }
-                (RootKind::Tree, FileType::File) => {
+                (RootKind::Tree, FileType::Dir) => {
+                    // The same directory as the source (a bind mount, a second mount of one export): a Weak or
+                    // Unavailable identity never decides.
+                    if matches!(
+                        (root.identity, found.identity),
+                        (FileIdentity::Strong(a), FileIdentity::Strong(b)) if a == b
+                    ) {
+                        return Err(refuse(
+                            LockCode::SafetyRejected,
+                            format!(
+                                "{}: it is the source directory {} itself",
+                                shown.display(),
+                                root.src.display()
+                            ),
+                        ));
+                    }
+                }
+                // Anything else at a folder root's name (a file, a link, a special file): the walk would open it as a
+                // directory without following links and abort mid-run, after earlier roots were copied.
+                (RootKind::Tree, other) => {
                     return Err(refuse(
                         LockCode::DestinationNamespaceCollision,
                         format!(
-                            "{}: the source {} is a directory, and a file is already there",
+                            "{}: the source {} is a directory, and a {other:?} is already there",
                             shown.display(),
                             root.src.display()
                         ),
@@ -415,6 +434,12 @@ pub fn trees<F: DestinationRoot>(
     // A one-root manifest would be format 4 with a `kind`, which the validator rejects: the caller routes one source
     // to `tree` or `file`.
     debug_assert!(!cfg.dry_run, "a dry run of several sources is not supported");
+    // `MultiPlace::remove` releases this run's prefix locks whatever operation id it is given, and a supersede or an
+    // adoption removes a prior's: neither is supported with several sources.
+    debug_assert!(
+        !cfg.restart && !cfg.resume,
+        "several sources support neither --restart nor --resume"
+    );
     debug_assert!(specs.len() >= 2, "one source is `tree` or `file`");
     let mut run = Run {
         copy: None,
@@ -1531,6 +1556,62 @@ mod trees_tests {
         }
         assert!(r.run.copy.is_none() && r.roots.is_empty());
         assert!(!fs.exists("/p/dest") && !fs.called("create_lock"), "{:?}", calls(&fs));
+    }
+
+    #[test]
+    fn a_folder_root_over_a_symlink_or_other_object_is_refused_before_transfer() {
+        let fs = fake();
+        fs.create_dir(Path::new("/p/dest")).unwrap();
+        fs.add_symlink_to("/p/dest/b", "/elsewhere", flux_fs::LinkKind::Unspecified);
+        let mark = fs.calls().len();
+
+        let (r, _) = go(&fs, &["a", "b"]);
+
+        match &r.run.stop {
+            Some(RunError::Refused { refusal, changed: false, .. }) => {
+                assert_eq!(refusal.code, LockCode::DestinationNamespaceCollision);
+                assert!(refusal.detail.contains("/p/dest/b"), "{}", refusal.detail);
+            }
+            other => panic!("expected a refusal before transfer, got {other:?}"),
+        }
+        assert!(r.run.copy.is_none() && r.roots.is_empty());
+        let c = calls(&fs)[mark..].to_vec();
+        let last_lock = c.iter().rposition(|x| x.starts_with("create_lock(")).expect("locks");
+        assert!(
+            !c[last_lock..].iter().any(|x| touches_dir(x, "a")
+                || x.starts_with("create_dir(/p/dest/.flux")
+                || x.starts_with("create_claim_store(")),
+            "no write into DEST/a and no workspace after the last prefix lock: {c:?}"
+        );
+        assert!(!fs.exists("/p/dest/a") && !fs.exists("/p/dest/.flux"));
+        assert!(lock_files(&fs).is_empty(), "{:?}", lock_files(&fs));
+        assert!(fs.exists("/p/dest"), "a DEST that was there stays");
+    }
+
+    fn touches_dir(c: &str, name: &str) -> bool {
+        c == format!("create_dir(/p/dest/{name})") || c.contains(&format!("/p/dest/{name}/"))
+    }
+
+    #[test]
+    fn a_folder_root_whose_target_is_the_source_is_refused_safety_rejected() {
+        let fs = fake();
+        let same = FileIdentity::Strong(ObjectId { volume: 1, index: 9_000_300 });
+        fs.set_identity("/src/b", same);
+        fs.create_dir(Path::new("/p/dest")).unwrap();
+        fs.create_dir(Path::new("/p/dest/b")).unwrap();
+        fs.set_identity("/p/dest/b", same);
+
+        let (r, _) = go(&fs, &["a", "b"]);
+
+        match &r.run.stop {
+            Some(RunError::Refused { refusal, changed: false, .. }) => {
+                assert_eq!(refusal.code, LockCode::SafetyRejected);
+            }
+            other => panic!("expected a refusal before transfer, got {other:?}"),
+        }
+        assert!(r.run.copy.is_none() && r.roots.is_empty());
+        assert!(!fs.exists("/p/dest/a") && !fs.exists("/p/dest/.flux"), "{:?}", calls(&fs));
+        assert!(lock_files(&fs).is_empty(), "{:?}", lock_files(&fs));
     }
 
     #[test]

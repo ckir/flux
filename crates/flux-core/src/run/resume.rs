@@ -68,7 +68,11 @@ pub(crate) fn validate(
     }
     let mut by_path = None;
     if roots.len() != stored.roots.len() {
-        return Err(source_mismatch(stored.roots.first(), roots.first()));
+        return Err(incompatible(format!(
+            "the source roots differ: the operation has {} roots, this run names {}; run again with --restart to supersede it",
+            stored.roots.len(),
+            roots.len()
+        )));
     }
     if let (Some(then), Some(now)) = (stored.roots.first(), roots.first()) {
         let strong = |text: &str| match parse_identity(text) {
@@ -289,7 +293,13 @@ mod tests {
         let two = vec![root("/s", "strong:3:9"), root("/t", "strong:3:8")];
         let (code, detail) = refused(run(&prior, &two, &opts()).0);
         assert_eq!(code, LockCode::IncompatibleState);
-        assert!(detail.contains("source root"), "{detail}");
+        assert!(
+            detail.starts_with(
+                "the source roots differ: the operation has 1 roots, this run names 2;"
+            ),
+            "{detail}"
+        );
+        assert!(detail.contains("--restart"), "{detail}");
     }
 
     #[test]
@@ -319,7 +329,12 @@ mod tests {
         let prior = PriorOp { state, shown: shown() };
         let (code, detail) = refused(run(&prior, &roots_now(), &opts()).0);
         assert_eq!(code, LockCode::IncompatibleState);
-        assert!(detail.contains("source root"), "{detail}");
+        assert!(
+            detail.starts_with(
+                "the source roots differ: the operation has 2 roots, this run names 1;"
+            ),
+            "{detail}"
+        );
         assert!(detail.contains("--restart"), "{detail}");
     }
 
