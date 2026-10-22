@@ -4816,7 +4816,7 @@ mod tests {
 
     #[test]
     fn t1_link_publish_guard_failure_after_the_note_keeps_it() {
-        // Sites 2011/2079 (links) share the helper; one pin for a Strict link: gate (1), create (2) pass, publish (3) fails.
+        // The two link callers (New and Replace) share the helper; one pin for a Strict link: gate (1), create (2) pass, publish (3) fails.
         let fs = links(&[("n", "p")]);
         let calls = std::cell::Cell::new(0);
         let guard = failing_after(LINK_GUARD_AT_CREATE, &calls);
