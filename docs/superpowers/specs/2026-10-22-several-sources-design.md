@@ -412,3 +412,13 @@ FOLDED (§3.8, test). The counter-turn on closing the prefix handles early is cl
 `lock/site.rs` itself and agreed that an unheld lock with a record is classified `Dead`, and that a `none` record is
 `Trusted` and recovered by `recover`. Discarded below the floor: none. Unverified-accepted: none.
 
+Panel round 3, agy escalation (narrow: five round-2 edits plus the lock design against the master spec; the cited lines and
+both probe quotes were checked against the artifact). C1 the section 7 alias-window test still said "decided by identity"
+and "a mutant that decides by record is red", contradicting section 3.4: FOLDED (section 7 now names the record and two
+mutants). agy filed it below the floor; it is not, because an implementer would build the wrong test. C2 a record must be
+complete and readable by a second handle before the next root's creation starts: FOLDED (section 3.4 strict order, V10;
+read-after-write on Windows is UNVERIFIED and is a plan obligation, not an accepted risk). C3 the lock design departs from
+the master spec only at R1, R6 and R7, all stated as rulings: no new findings. The other four fold-audit items: no new
+findings. Echo: agy quoted the artifact's last line without its backticks, so the driver flagged ECHO MISSING; both probes
+and the cited lines are correct, and the flag is recorded here rather than waved off.
+
