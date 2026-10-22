@@ -2859,6 +2859,7 @@ fn tree_config(fs: &FaultFs, o: &CopyOptions) -> Config {
             source_root: native_hex(&absolute_lexical(Path::new("/src"))),
             source_identity: identity_text(fs.metadata(Path::new("/src")).unwrap().identity),
             destination_prefix: String::new(),
+            kind: None,
         }],
         Options::of(o),
     )
@@ -3495,6 +3496,7 @@ fn file_prior3_with(
             source_root: native_hex(&absolute_lexical(Path::new("/src/a"))),
             source_identity: shown,
             destination_prefix: native_hex(Path::new("t")),
+            kind: None,
         }],
         Options::of(o),
     );

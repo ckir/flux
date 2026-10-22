@@ -199,6 +199,7 @@ fn completed_fixture(dst: &Path) -> String {
             source_root: native_hex(Path::new("/s")),
             source_identity: "strong:3:9".to_owned(),
             destination_prefix: String::new(),
+            kind: None,
         }],
         Options {
             preserve_times: "default".to_owned(),

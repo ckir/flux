@@ -168,6 +168,7 @@ mod tests {
             source_root: native_hex(std::path::Path::new(path)),
             source_identity: identity.to_string(),
             destination_prefix: String::new(),
+            kind: None,
         }
     }
 

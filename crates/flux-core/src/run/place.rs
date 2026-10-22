@@ -569,6 +569,7 @@ impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {
             source_root: native_hex(&absolute_lexical(&self.src_root)),
             source_identity: identity_text(self.src_identity),
             destination_prefix: String::new(),
+            kind: None,
         }]
     }
 
@@ -810,6 +811,7 @@ impl<D: DirHandle> Place<D> for FilePlace<'_, D> {
             source_root: native_hex(&absolute_lexical(&self.src)),
             source_identity: identity_text(self.source_identity),
             destination_prefix: native_hex(Path::new(&self.target)),
+            kind: None,
         }]
     }
 
