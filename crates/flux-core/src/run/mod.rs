@@ -426,6 +426,7 @@ pub(crate) fn tree_with<F: DestinationRoot>(
             dry_run: false,
             dry_prior: None,
             dry_partials: None,
+            key_prefix: None,
         };
         let root = place.dest.take().expect("step 5 made DEST");
         let mut report = |f: TreeFailure| {
@@ -1271,6 +1272,7 @@ fn dry_tree<F: DestinationRoot>(
         dry_run: true,
         dry_prior: prior_id.as_deref(),
         dry_partials: prior_id.is_some().then_some(&partials),
+        key_prefix: None,
     };
     let root = place.dest.take();
     let absent = root.is_none();

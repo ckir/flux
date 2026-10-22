@@ -22,7 +22,7 @@ use flux_fs::{
     Preserve, Publish, RecoveryOp, Safety,
 };
 use std::collections::{BTreeMap, HashSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
@@ -426,6 +426,54 @@ pub(crate) struct Shared<'c, F: DestinationRoot> {
     pub(crate) dry_prior: Option<&'c str>,
     /// Cut 11b: counts the partials a dry `--resume` found beside their targets.
     pub(crate) dry_partials: Option<&'c std::cell::Cell<u64>>,
+    /// Several sources: the root's destination name, prefixed to every path this walk KEYS (the claim target, the
+    /// prepared note's directory, a leftover's path): those are relative to DEST, while the walk is relative to the
+    /// root. `None` for a single-root run, whose keys stay byte-identical to the root-relative path. `TreeFailure.path`
+    /// stays root-relative (display only).
+    pub(crate) key_prefix: Option<&'c OsStr>,
+}
+
+impl<'c, F: DestinationRoot> Shared<'c, F> {
+    /// The same shared state for one more root of a several-source run: its source root and identity, and the
+    /// destination name its keys are prefixed with. Everything else (the guard, the claim store, the batch policy) is
+    /// the run's and is shared.
+    #[allow(dead_code)] // used by the per-root driver (plan task 7)
+    pub(crate) fn for_root(
+        &self,
+        src_root: &'c Path,
+        src_identity: FileIdentity,
+        key_prefix: Option<&'c OsStr>,
+    ) -> Shared<'c, F> {
+        Shared {
+            fs: self.fs,
+            src_root,
+            src_identity,
+            opts: self.opts,
+            guard: self.guard,
+            beat: self.beat,
+            claims: self.claims,
+            resume: self.resume,
+            batch: self.batch,
+            ckpt: self.ckpt,
+            dry_run: self.dry_run,
+            dry_prior: self.dry_prior,
+            dry_partials: self.dry_partials,
+            key_prefix,
+        }
+    }
+
+    /// `rel` (relative to the root) as a path relative to DEST: under the root's prefix when it has one.
+    pub(crate) fn keyed(&self, rel: &Path) -> PathBuf {
+        keyed_under(self.key_prefix, rel)
+    }
+}
+
+/// `prefix` joined to `rel`, or `rel` itself without a prefix (a single-root run keys exactly the root-relative path).
+fn keyed_under(prefix: Option<&OsStr>, rel: &Path) -> PathBuf {
+    match prefix {
+        Some(p) => Path::new(p).join(rel),
+        None => rel.to_path_buf(),
+    }
 }
 
 /// Cut 9d (spec decision 5): a batch flushes at this many staged files...
@@ -592,6 +640,7 @@ fn run_tree<F: DestinationRoot>(
         dry_run: false,
         dry_prior: None,
         dry_partials: None,
+        key_prefix: None,
     };
     copy_tree_at(&cx, source.events, root, false, out, on_report).1
 }
@@ -1309,9 +1358,9 @@ fn copy_one<F: DestinationRoot>(
             &no_before_create,
             &no_before_publish,
         );
-        return finish_copy(path, published, out, on_report);
+        return finish_copy(cx.key_prefix, path, published, out, on_report);
     };
-    let target = match FluxPathKey::from_relative(&path) {
+    let target = match FluxPathKey::from_relative(&cx.keyed(&path)) {
         Ok(t) => t,
         Err(e) => {
             report(
@@ -1386,7 +1435,7 @@ fn copy_one<F: DestinationRoot>(
                         ),
                     ),
                 );
-                return finish_copy(path, Err(e), out, on_report);
+                return finish_copy(cx.key_prefix, path, Err(e), out, on_report);
             }
             // Cut 9a: `--resume`. The branch mutates nothing at the destination, so it neither beats nor guards.
             let mut src_known: Option<Metadata> = None;
@@ -1403,6 +1452,7 @@ fn copy_one<F: DestinationRoot>(
                 match found {
                     Err(e) => {
                         return finish_copy(
+                            cx.key_prefix,
                             path,
                             Err(CopyError::at(CopyStep::Claim, e)),
                             out,
@@ -1438,7 +1488,7 @@ fn copy_one<F: DestinationRoot>(
                                 ),
                             ),
                         );
-                        return finish_copy(path, Err(e), out, on_report);
+                        return finish_copy(cx.key_prefix, path, Err(e), out, on_report);
                     }
                     Ok(None) => {}
                 }
@@ -1516,7 +1566,7 @@ fn copy_one<F: DestinationRoot>(
         (len >= run.min_len()).then(|| FileCkpt {
             run,
             file_id: key.encode(),
-            destination: path.as_os_str().as_encoded_bytes().to_vec(),
+            destination: cx.keyed(&path).as_os_str().as_encoded_bytes().to_vec(),
         })
     };
     // Cut 9c: a Strict publication into a store with the `prepared` table writes a note before its rename (the hook),
@@ -1532,7 +1582,7 @@ fn copy_one<F: DestinationRoot>(
                 target: target.clone(),
                 temp_name: Vec::new(),
                 identity: String::new(),
-                dir_path: note_dir(&path),
+                dir_path: note_dir(&cx.keyed(&path)),
                 name: name.as_encoded_bytes().to_vec(),
                 planned_name: Vec::new(),
                 replacement: false,
@@ -1593,7 +1643,7 @@ fn copy_one<F: DestinationRoot>(
                 Ok(o) => Some(o.published_identity),
                 Err(_) => None,
             };
-            finish_copy(path.clone(), result, out, on_report)?;
+            finish_copy(cx.key_prefix, path.clone(), result, out, on_report)?;
             if let Some((reuse, recopied)) = reuse {
                 note_reuse(out, &path, reuse, recopied);
             }
@@ -1637,7 +1687,7 @@ fn copy_one<F: DestinationRoot>(
                 target: target.clone(),
                 temp_name: Vec::new(),
                 identity: String::new(),
-                dir_path: note_dir(&path),
+                dir_path: note_dir(&cx.keyed(&path)),
                 name: stored.as_encoded_bytes().to_vec(),
                 planned_name: if name != stored {
                     name.as_encoded_bytes().to_vec()
@@ -1709,7 +1759,7 @@ fn copy_one<F: DestinationRoot>(
                 Ok(o) => Some(o.published_identity),
                 Err(_) => None,
             };
-            finish_copy(path.clone(), result, out, on_report)?;
+            finish_copy(cx.key_prefix, path.clone(), result, out, on_report)?;
             if let Some((reuse, recopied)) = reuse {
                 note_reuse(out, &path, reuse, recopied);
             }
@@ -1786,7 +1836,13 @@ fn link_one<F: DestinationRoot>(
             return Ok(());
         }
         Err(e) => {
-            return finish_copy(path, Err(CopyError::at(CopyStep::Source, e)), out, on_report);
+            return finish_copy(
+                cx.key_prefix,
+                path,
+                Err(CopyError::at(CopyStep::Source, e)),
+                out,
+                on_report,
+            );
         }
     };
 
@@ -1824,9 +1880,9 @@ fn link_one<F: DestinationRoot>(
             &no_before_create,
             &no_before_publish,
         )?;
-        return finish_copy(path, published, out, on_report);
+        return finish_copy(cx.key_prefix, path, published, out, on_report);
     };
-    let target = match FluxPathKey::from_relative(&path) {
+    let target = match FluxPathKey::from_relative(&cx.keyed(&path)) {
         Ok(t) => t,
         Err(e) => {
             report(
@@ -1895,7 +1951,7 @@ fn link_one<F: DestinationRoot>(
                         ),
                     ),
                 );
-                return finish_copy(path, Err(e), out, on_report);
+                return finish_copy(cx.key_prefix, path, Err(e), out, on_report);
             }
             // `--resume` (spec 3.4). The branch mutates nothing at the destination, so it neither beats nor guards.
             if cx.resume {
@@ -1903,6 +1959,7 @@ fn link_one<F: DestinationRoot>(
                 match found {
                     Err(e) => {
                         return finish_copy(
+                            cx.key_prefix,
                             path,
                             Err(CopyError::at(CopyStep::Claim, e)),
                             out,
@@ -1937,7 +1994,7 @@ fn link_one<F: DestinationRoot>(
                                 ),
                             ),
                         );
-                        return finish_copy(path, Err(e), out, on_report);
+                        return finish_copy(cx.key_prefix, path, Err(e), out, on_report);
                     }
                     Ok(None) => {}
                 }
@@ -1997,7 +2054,7 @@ fn link_one<F: DestinationRoot>(
                 target: target.clone(),
                 temp_name: Vec::new(),
                 identity: String::new(),
-                dir_path: note_dir(&path),
+                dir_path: note_dir(&cx.keyed(&path)),
                 name: name.as_encoded_bytes().to_vec(),
                 planned_name: Vec::new(),
                 replacement: false,
@@ -2023,7 +2080,7 @@ fn link_one<F: DestinationRoot>(
                 claims, &key, &wrote, cx.guard, &path, result, out, on_report,
             );
             let published = result.as_ref().ok().map(|o| o.published_identity);
-            finish_copy(path.clone(), result, out, on_report)?;
+            finish_copy(cx.key_prefix, path.clone(), result, out, on_report)?;
             if let Some(identity) = published {
                 let recorded = if strict {
                     claims.borrow_mut().commit_prepared(&key, &target, None)
@@ -2062,7 +2119,7 @@ fn link_one<F: DestinationRoot>(
                 target: target.clone(),
                 temp_name: Vec::new(),
                 identity: String::new(),
-                dir_path: note_dir(&path),
+                dir_path: note_dir(&cx.keyed(&path)),
                 name: stored.as_encoded_bytes().to_vec(),
                 planned_name: if name != stored {
                     name.as_encoded_bytes().to_vec()
@@ -2100,7 +2157,7 @@ fn link_one<F: DestinationRoot>(
                 on_report,
             );
             let published = result.as_ref().ok().map(|o| o.published_identity);
-            finish_copy(path.clone(), result, out, on_report)?;
+            finish_copy(cx.key_prefix, path.clone(), result, out, on_report)?;
             if let Some(identity) = published {
                 out.files_overwritten += 1;
                 let recorded = if strict {
@@ -2215,12 +2272,12 @@ fn dry_stop_file<F: DestinationRoot>(
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<(), CopyError> {
     if let Err(e) = dry_temp_name_fits(cx, name) {
-        return finish_copy(path, Err(e), out, on_report);
+        return finish_copy(cx.key_prefix, path, Err(e), out, on_report);
     }
     let opts = CopyOptions { existing: ExistingPolicy::Overwrite, publish, ..cx.opts.clone() };
     let planned = match plan_file(cx.fs, src, parent, name, &opts) {
         Ok(p) => p,
-        Err(e) => return finish_copy(path, Err(e), out, on_report),
+        Err(e) => return finish_copy(cx.key_prefix, path, Err(e), out, on_report),
     };
     let (src_meta, degraded) = match planned {
         FilePlan::Proceed { src_meta, degraded, replaces } => {
@@ -2241,7 +2298,7 @@ fn dry_stop_file<F: DestinationRoot>(
         published_identity: FileIdentity::Unavailable,
         skipped: false,
     };
-    finish_copy(path.clone(), Ok(outcome), out, on_report)?;
+    finish_copy(cx.key_prefix, path.clone(), Ok(outcome), out, on_report)?;
     let partial = dry_partial_len(cx, parent, name);
     dry_planned(out, on_report, path, PlannedObject::File, replace, partial);
     Ok(())
@@ -2261,11 +2318,11 @@ fn dry_stop_link<F: DestinationRoot>(
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<(), CopyError> {
     if let Err(e) = dry_temp_name_fits(cx, name) {
-        return finish_copy(path, Err(e), out, on_report);
+        return finish_copy(cx.key_prefix, path, Err(e), out, on_report);
     }
     let degraded = match gate_link_read(cx, parent, name, src, publish) {
         Ok(d) => d,
-        Err(e) => return finish_copy(path, Err(e), out, on_report),
+        Err(e) => return finish_copy(cx.key_prefix, path, Err(e), out, on_report),
     };
     // A live link publishes 0 bytes.
     let outcome = flux_fs::Outcome {
@@ -2275,7 +2332,7 @@ fn dry_stop_link<F: DestinationRoot>(
         published_identity: FileIdentity::Unavailable,
         skipped: false,
     };
-    finish_copy(path.clone(), Ok(outcome), out, on_report)?;
+    finish_copy(cx.key_prefix, path.clone(), Ok(outcome), out, on_report)?;
     dry_planned(out, on_report, path, PlannedObject::Symlink, replace, None);
     Ok(())
 }
@@ -2538,7 +2595,7 @@ fn stage_into_batch<F: DestinationRoot>(
             unreachable!("the tree stages with ExistingPolicy::Overwrite, which never skips")
         }
         // No note exists yet, and `stage_file` already removed its temporary: nothing else to undo.
-        Err(e) => return finish_copy(path, Err(e), out, on_report),
+        Err(e) => return finish_copy(cx.key_prefix, path, Err(e), out, on_report),
     }
     if batch.pending.len() >= cx.batch.files || batch.bytes >= cx.batch.bytes {
         flush_batch(cx, parent, names, batch, out, on_report)?;
@@ -2611,17 +2668,19 @@ fn flush_batch<F: DestinationRoot>(
         let mut rest = entries.into_iter().zip(failed);
         let (p0, f0) = rest.next().expect("the batch is not empty");
         if let Some(f) = &f0 {
-            report_sync_kept(p0.path.clone(), &p0.staged.temp, f, out, on_report);
+            report_sync_kept(cx.key_prefix, p0.path.clone(), &p0.staged.temp, f, out, on_report);
         }
         for (p, f) in rest {
             match f {
-                Some(f) => report_sync_kept(p.path, &p.staged.temp, &f, out, on_report),
-                None => report_kept(p.path, &p.staged.temp, &lost, out, on_report),
+                Some(f) => {
+                    report_sync_kept(cx.key_prefix, p.path, &p.staged.temp, &f, out, on_report)
+                }
+                None => report_kept(cx.key_prefix, p.path, &p.staged.temp, &lost, out, on_report),
             }
         }
         let stop = match f0 {
             Some(_) => CopyError::at(CopyStep::Publish, lost),
-            None => kept(&p0.path, &p0.staged.temp, lost),
+            None => kept(cx.key_prefix, &p0.path, &p0.staged.temp, lost),
         };
         return Err(stop);
     }
@@ -2646,7 +2705,7 @@ fn flush_batch<F: DestinationRoot>(
         // A stop cannot fire here today: `discard` keeps the sync's code (`StrictDurabilityUnavailable`) and reports a lost
         // lock as a kept leftover. If it ever does, the flush stops and the remaining entries' temporaries are left for
         // the resume sweep, like any crash before the notes.
-        finish_copy(p.path, Err(failed_copy), out, on_report)?;
+        finish_copy(cx.key_prefix, p.path, Err(failed_copy), out, on_report)?;
     }
     if ok.is_empty() {
         return Ok(());
@@ -2689,9 +2748,18 @@ fn flush_batch<F: DestinationRoot>(
                         );
                         // A stop (an error carrying `TargetLockBusy`) drops no entry: as at STOP-LOST, the noted keep
                         // their notes and temporaries, the rest their temporaries, each reported (plan ruling 2).
-                        if let Err(stop) = finish_copy(p.path, Err(failed), out, on_report) {
+                        if let Err(stop) =
+                            finish_copy(cx.key_prefix, p.path, Err(failed), out, on_report)
+                        {
                             for q in noted.into_iter().chain(rest.map(|(q, _)| q)) {
-                                report_kept(q.path, &q.staged.temp, &stop.cause, out, on_report);
+                                report_kept(
+                                    cx.key_prefix,
+                                    q.path,
+                                    &q.staged.temp,
+                                    &stop.cause,
+                                    out,
+                                    on_report,
+                                );
                             }
                             return Err(stop);
                         }
@@ -2715,7 +2783,7 @@ fn flush_batch<F: DestinationRoot>(
                 let identity = o.published_identity;
                 let recopied = o.bytes_copied;
                 // Counted at the rename, before any later entry is tried (decision 4.6). Never `Err` for an `Ok`.
-                finish_copy(path.clone(), Ok(o), out, on_report)?;
+                finish_copy(cx.key_prefix, path.clone(), Ok(o), out, on_report)?;
                 note_reuse(out, &path, reuse, recopied);
                 match &replaced {
                     None => names.record_publication(&target, None, &name, None, identity),
@@ -2739,7 +2807,8 @@ fn flush_batch<F: DestinationRoot>(
             }
             Err(e) => {
                 // `finish_copy` classifies (one place): `Ok` is a failure of this entry alone, already reported.
-                let Err(stop) = finish_copy(path.clone(), Err(e), out, on_report) else {
+                let Err(stop) = finish_copy(cx.key_prefix, path.clone(), Err(e), out, on_report)
+                else {
                     ops.push(RecoveryOp::Discard { key });
                     paths.push(path);
                     continue;
@@ -2748,7 +2817,14 @@ fn flush_batch<F: DestinationRoot>(
                     // STOP-LOST: write and remove nothing more. The renamed keep their notes (no `apply_recovery`),
                     // this entry's temporary rides in `stop`, the later ones' are reported (plan ruling 2).
                     for q in rest {
-                        report_kept(q.path, &q.staged.temp, &stop.cause, out, on_report);
+                        report_kept(
+                            cx.key_prefix,
+                            q.path,
+                            &q.staged.temp,
+                            &stop.cause,
+                            out,
+                            on_report,
+                        );
                     }
                     return Err(stop);
                 }
@@ -2762,7 +2838,7 @@ fn flush_batch<F: DestinationRoot>(
                     let failed =
                         discard(parent, &q.staged.temp, stop.step, stop.code(), source, cx.guard);
                     if failed.leftover.is_some() {
-                        report_leftover(q.path, failed, out, on_report);
+                        report_leftover(cx.key_prefix, q.path, failed, out, on_report);
                     }
                     ops.push(RecoveryOp::Discard { key: q.key });
                 }
@@ -2811,11 +2887,11 @@ fn flush_batch<F: DestinationRoot>(
 
 /// Plan ruling 2: `cause`, with the entry's temporary kept as the leftover (relative to DEST, as `finish_copy` rebuilds
 /// it), at the publish step, the shape of `publish_staged`'s lost guard.
-fn kept(path: &Path, temp: &std::ffi::OsStr, cause: FsError) -> CopyError {
+fn kept(prefix: Option<&OsStr>, path: &Path, temp: &std::ffi::OsStr, cause: FsError) -> CopyError {
     CopyError {
         cause,
         leftover: Some((
-            path.with_file_name(temp),
+            keyed_under(prefix, &path.with_file_name(temp)),
             std::io::Error::other("kept: this run no longer holds the destination's lock"),
         )),
         step: CopyStep::Publish,
@@ -2825,6 +2901,7 @@ fn kept(path: &Path, temp: &std::ffi::OsStr, cause: FsError) -> CopyError {
 /// Plan ruling 2: an entry after the one a lost lock stopped at is reported as a `TargetLockBusy` copy failure whose
 /// leftover is its temporary. (`finish_copy` cannot report it: it returns a `TargetLockBusy` failure as a stop.)
 fn report_kept(
+    prefix: Option<&OsStr>,
     path: PathBuf,
     temp: &std::ffi::OsStr,
     lost: &FsError,
@@ -2835,7 +2912,7 @@ fn report_kept(
         Code::TargetLockBusy,
         std::io::Error::new(lost.source.kind(), lost.source.to_string()),
     );
-    let e = kept(&path, temp, cause);
+    let e = kept(prefix, &path, temp, cause);
     report(out, on_report, path, TreeFailureCause::Copy(e));
 }
 
@@ -2843,6 +2920,7 @@ fn report_kept(
 /// its own `StrictDurabilityUnavailable` failure at `CopyStep::Durability`, with the sync's error as the cause and its
 /// kept temporary (relative to DEST) as the leftover. `report_kept`'s shape, for a sync failure.
 fn report_sync_kept(
+    prefix: Option<&OsStr>,
     path: PathBuf,
     temp: &std::ffi::OsStr,
     sync: &FsError,
@@ -2855,7 +2933,7 @@ fn report_sync_kept(
             std::io::Error::new(sync.source.kind(), sync.source.to_string()),
         ),
         leftover: Some((
-            path.with_file_name(temp),
+            keyed_under(prefix, &path.with_file_name(temp)),
             std::io::Error::other("kept: this run no longer holds the destination's lock"),
         )),
         step: CopyStep::Durability,
@@ -2887,14 +2965,14 @@ fn stop_held_before_notes<F: DestinationRoot>(
                     f.source,
                     cx.guard,
                 );
-                report_leftover(p.path, r, out, on_report);
+                report_leftover(cx.key_prefix, p.path, r, out, on_report);
             }
             None => {
                 let source = copy_of(&e).source;
                 let r =
                     discard(parent, &p.staged.temp, CopyStep::Heartbeat, e.code, source, cx.guard);
                 if r.leftover.is_some() {
-                    report_leftover(p.path, r, out, on_report);
+                    report_leftover(cx.key_prefix, p.path, r, out, on_report);
                 }
             }
         }
@@ -2905,13 +2983,14 @@ fn stop_held_before_notes<F: DestinationRoot>(
 /// A temporary a stop's cleanup could not remove: reported with its leftover rebuilt relative to DEST, as
 /// `finish_copy` rebuilds one (which would return a stop's failure instead of reporting it).
 fn report_leftover(
+    prefix: Option<&OsStr>,
     path: PathBuf,
     mut e: CopyError,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) {
     if let Some((p, _)) = e.leftover.as_mut() {
-        *p = path.with_file_name(&*p);
+        *p = keyed_under(prefix, &path.with_file_name(&*p));
     }
     report(out, on_report, path, TreeFailureCause::Copy(e));
 }
@@ -2960,7 +3039,7 @@ fn drain_batches<F: DestinationRoot>(
             DrainMode::KeepAll(lost) => {
                 for mut p in std::mem::take(batch).pending {
                     p.staged.writer = None;
-                    report_kept(p.path, &p.staged.temp, lost, out, on_report);
+                    report_kept(cx.key_prefix, p.path, &p.staged.temp, lost, out, on_report);
                 }
                 continue;
             }
@@ -3123,6 +3202,7 @@ fn record_claim<C: ClaimStore + ?Sized>(
 /// Count what `copy_file_guarded` did for one target, or report and map its failure. `Err` only when the whole
 /// operation must stop.
 fn finish_copy(
+    prefix: Option<&OsStr>,
     path: PathBuf,
     result: std::result::Result<flux_fs::Outcome, CopyError>,
     out: &mut TreeOutcome,
@@ -3149,9 +3229,9 @@ fn finish_copy(
         }
         Err(mut e) => {
             // `copy_file_at` records a leftover relative to its handle; rebuild it in
-            // the tree's frame, relative to the destination root.
+            // the tree's frame, relative to the destination root (under the root's prefix, for several sources).
             if let Some((p, _)) = e.leftover.as_mut() {
-                *p = path.with_file_name(&*p);
+                *p = keyed_under(prefix, &path.with_file_name(&*p));
             }
             // §99 (cut 7a Part 3b): this run no longer owns the destination's lock; or §101 (cut 7b): its heartbeat
             // failed; or (cut 9f-1) a checkpoint or its writer failed. The whole operation stops.
@@ -4412,6 +4492,7 @@ mod tests {
             dry_run: false,
             dry_prior: None,
             dry_partials: None,
+            key_prefix: None,
         };
         let mut out = TreeOutcome::default();
         let mut got = Vec::new();
@@ -5429,6 +5510,7 @@ mod tests {
             dry_run: false,
             dry_prior: None,
             dry_partials: None,
+            key_prefix: None,
         };
         let mut out = TreeOutcome::default();
         let (_root, r) = copy_tree_at(&cx, source.events, root, false, &mut out, &mut |_| {});
@@ -5485,7 +5567,8 @@ mod tests {
             CopyStep::Checkpoint,
             FsError::new(Code::WalWriteFailed, std::io::Error::other("wal")),
         );
-        let r = finish_copy(PathBuf::from("a"), Err(failed), &mut out, &mut |_| reported += 1);
+        let r =
+            finish_copy(None, PathBuf::from("a"), Err(failed), &mut out, &mut |_| reported += 1);
         let e = r.unwrap_err();
         assert_eq!((e.code(), e.step), (Code::WalWriteFailed, CopyStep::Checkpoint));
         assert_eq!((reported, out.failures.total()), (0, 0), "a stop, never a per-file failure");
@@ -5523,6 +5606,7 @@ mod tests {
             dry_run: false,
             dry_prior: None,
             dry_partials: None,
+            key_prefix: None,
         };
         let mut out = TreeOutcome::default();
         let mut reported = 0;
@@ -5566,6 +5650,7 @@ mod tests {
             dry_run: false,
             dry_prior: None,
             dry_partials: None,
+            key_prefix: None,
         };
         let mut out = TreeOutcome::default();
         let mut reported = 0;
@@ -5599,6 +5684,7 @@ mod tests {
             dry_run: false,
             dry_prior: None,
             dry_partials: None,
+            key_prefix: None,
         };
         let mut out = TreeOutcome::default();
         let (back, r) = copy_tree_at(&cx, source.events, root, false, &mut out, &mut |_| {});
@@ -5680,6 +5766,18 @@ mod tests {
         guard: &Guard<'_>,
         beat: &Heartbeat<'_>,
     ) -> (std::result::Result<(), CopyError>, TreeOutcome, Vec<TreeFailure>) {
+        batched_keyed(fs, policy, durability, guard, beat, None)
+    }
+
+    /// `batched_with` walking under `key_prefix` (several sources).
+    fn batched_keyed(
+        fs: &FaultFs,
+        policy: BatchPolicy,
+        durability: Durability,
+        guard: &Guard<'_>,
+        beat: &Heartbeat<'_>,
+        key_prefix: Option<&OsStr>,
+    ) -> (std::result::Result<(), CopyError>, TreeOutcome, Vec<TreeFailure>) {
         let source =
             prepare_source(fs, Path::new("/src"), Path::new("/dst"), MountPolicy::Cross).unwrap();
         if !fs.exists(Path::new("/dst")) {
@@ -5704,12 +5802,106 @@ mod tests {
             dry_run: false,
             dry_prior: None,
             dry_partials: None,
+            key_prefix,
         };
         let mut out = TreeOutcome::default();
         let mut got = Vec::new();
         let (_root, r) =
             copy_tree_at(&cx, source.events, root, false, &mut out, &mut |f| got.push(f));
         (r, out, got)
+    }
+
+    // Several sources, task 4: a walk keyed under a root prefix. The tree is `x/f`; the record paths are relative to
+    // DEST, so `a/x/f` under the prefix `a` and `x/f` without one.
+
+    /// Copy `x/f` under `prefix` at Strict durability: the claim it stored, and the note it wrote before the rename.
+    fn keyed_records(prefix: Option<&str>) -> (FluxPathKey, PreparedRecord) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let fs = sources(&[("x/f", b"data")]);
+        let slot = std::sync::Arc::clone(&seen);
+        fs.on_nth("rename_no_replace", 1, move |fs| {
+            let root = fs.destination_root(Path::new("/dst")).unwrap();
+            let store = root.open_claim_store(OsStr::new("state.db"), Durability::Strict).unwrap();
+            let pending = store.prepared().unwrap();
+            assert_eq!(pending.len(), 1, "one note is pending at the rename: {pending:?}");
+            *slot.lock().unwrap() = Some(pending[0].clone());
+        });
+
+        let prefix = prefix.map(OsString::from);
+        let (r, _, got) = batched_keyed(
+            &fs,
+            policy(1),
+            Durability::Strict,
+            &unguarded,
+            &no_heartbeat,
+            prefix.as_deref(),
+        );
+
+        r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        let (key, note) = seen.lock().unwrap().take().expect("the hook ran at the publish");
+        // The claim is committed with the note's discard, after the rename: read it once the run is over.
+        let root = fs.destination_root(Path::new("/dst")).unwrap();
+        let store = root.open_claim_store(OsStr::new("state.db"), Durability::Strict).unwrap();
+        let claim = store.get(&key).unwrap().expect("the claim is stored");
+        (claim.target, note)
+    }
+
+    /// The leftover of `x/f` whose temporary could not be removed, under `prefix`.
+    fn keyed_leftover(prefix: Option<&str>) -> PathBuf {
+        let fs = sources(&[("x/f", b"data")]);
+        fs.fail("rename_no_replace", Code::PermissionDenied);
+        fs.fail_always("remove_file", Code::PermissionDenied);
+        let prefix = prefix.map(OsString::from);
+
+        let (r, _, got) = batched_keyed(
+            &fs,
+            policy(1),
+            Durability::Normal,
+            &unguarded,
+            &no_heartbeat,
+            prefix.as_deref(),
+        );
+
+        r.unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].path, Path::new("x/f"), "TreeFailure.path stays root-relative");
+        match &got[0].cause {
+            TreeFailureCause::Copy(e) => {
+                e.leftover.as_ref().expect("the leftover is reported").0.clone()
+            }
+            other => panic!("expected Copy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claim_and_prepared_targets_carry_the_root_prefix() {
+        let (claim_target, note) = keyed_records(Some("a"));
+
+        assert_eq!(claim_target.0, key_of("a/x/f").0);
+        assert_eq!(note.target.0, key_of("a/x/f").0);
+    }
+
+    #[test]
+    fn a_note_records_dir_path_relative_to_dest() {
+        let (_, note) = keyed_records(Some("a"));
+
+        assert_eq!(note.dir_path, native_hex(Path::new("a/x")));
+    }
+
+    #[test]
+    fn a_leftover_is_relative_to_dest() {
+        assert_eq!(keyed_leftover(Some("a")), Path::new("a/x/f.flux-partial.op1"));
+    }
+
+    #[test]
+    fn without_a_prefix_nothing_changes() {
+        let (claim_target, note) = keyed_records(None);
+
+        assert_eq!(claim_target.0, key_of("x/f").0);
+        assert_eq!(note.target.0, key_of("x/f").0);
+        assert_eq!(note.dir_path, native_hex(Path::new("x")));
+        assert_eq!(keyed_leftover(None), Path::new("x/f.flux-partial.op1"));
     }
 
     /// The call log with `/` separators.
@@ -7609,6 +7801,7 @@ mod tests {
             dry_run: true,
             dry_prior: None,
             dry_partials: None,
+            key_prefix: None,
         };
         let (root, identity) = match dst_root {
             Some(d) => {
@@ -8153,6 +8346,7 @@ mod tests {
             dry_run: false,
             dry_prior: None,
             dry_partials: None,
+            key_prefix: None,
         };
         let mut out = TreeOutcome::default();
         let mut got = Vec::new();

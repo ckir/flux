@@ -2521,6 +2521,7 @@ fn a_target_that_finds_its_own_claim_proceeds() {
         dry_run: false,
         dry_prior: None,
         dry_partials: None,
+        key_prefix: None,
     };
     let mut out = TreeOutcome::default();
     let mut got = Vec::new();
