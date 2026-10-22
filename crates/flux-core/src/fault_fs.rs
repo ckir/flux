@@ -278,6 +278,10 @@ fn corrupt_claim() -> FsError {
     FsError::new(Code::IoError, std::io::Error::other("undecodable claim record"))
 }
 
+fn undecodable_claim() -> FsError {
+    FsError::new(Code::StateCorrupt, std::io::Error::other("undecodable claim record"))
+}
+
 impl ClaimStore for FakeClaimStore {
     fn count(&self) -> Result<u64> {
         self.record("claim_count".to_string(), "claim_count")?;
@@ -304,7 +308,7 @@ impl ClaimStore for FakeClaimStore {
         self.record(format!("claim_get({})", String::from_utf8_lossy(&key.name)), "claim_get")?;
         let m = self.map.lock().unwrap();
         match m.get(&key.encode()) {
-            Some(v) => Ok(Some(ClaimRecord::decode(v).ok_or_else(corrupt_claim)?)),
+            Some(v) => Ok(Some(ClaimRecord::decode(v).ok_or_else(undecodable_claim)?)),
             None => Ok(None),
         }
     }
@@ -2163,6 +2167,14 @@ impl DirHandle for FakeDirHandle {
                 std::io::Error::other("a symlink is not a claim store"),
             ));
         }
+        if g.types.get(&child_path) == Some(&FileType::Other) {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::other(
+                    "a claim store path holds something other than a regular file",
+                ),
+            ));
+        }
         if g.directories.contains(&child_path) {
             return Err(FsError::new(
                 Code::DestinationError,
@@ -3884,9 +3896,47 @@ mod tests {
         assert_eq!(open("dir.db").err().expect("dir").code, Code::DestinationError);
         fs.add_symlink("/d/link.db");
         assert_eq!(open("link.db").err().expect("link").code, Code::SafetyRejected);
+        fs.add_special("/d/sock.db");
+        let err = open("sock.db").err().expect("special");
+        assert_eq!(err.code, Code::DestinationError, "as open_lock and dir_unix.rs: {err:?}");
+        assert!(
+            err.source
+                .to_string()
+                .contains("a claim store path holds something other than a regular file"),
+            "{err:?}"
+        );
         drop(d.create_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap());
         fs.set_claim_store_format("/d/state.db", 3);
         assert_eq!(open("state.db").err().expect("format").code, Code::IncompatibleState);
+    }
+
+    #[test]
+    fn a_claim_that_does_not_decode_is_state_corrupt_on_get_and_io_error_on_write() {
+        use flux_fs::{
+            ClaimKey, ClaimRecord, ClaimStatus, ClaimStore, DestinationRoot, DirHandle, Durability,
+            FluxPathKey, ObjectId,
+        };
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let mut s = d.create_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap();
+        let k = ClaimKey::new(ObjectId { volume: 1, index: 1 }, OsStr::new("a"));
+        // Version byte 9: no build of this format reads it (the idiom of `a_note_that_does_not_decode_...`, run/tests.rs).
+        fs.put_raw_claim("/d/state.db", &k, &[9, 0, 0, 0, 0]);
+        let got = s.get(&k).expect_err("undecodable");
+        assert_eq!(got.code, Code::StateCorrupt, "as RedbClaimStore::read: {got:?}");
+        assert!(got.source.to_string().contains("undecodable claim record"), "{got:?}");
+        let r = ClaimRecord { target: FluxPathKey(b"a".to_vec()), status: ClaimStatus::Created };
+        assert_eq!(
+            s.insert_if_absent(&k, &r).expect_err("undecodable").code,
+            Code::IoError,
+            "N1: as the real store"
+        );
+        assert_eq!(
+            s.upgrade_own_claim(&k, &r.target).expect_err("undecodable").code,
+            Code::IoError,
+            "N1: as the real store"
+        );
     }
 
     #[test]
