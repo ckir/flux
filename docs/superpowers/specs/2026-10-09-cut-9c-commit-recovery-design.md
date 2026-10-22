@@ -79,9 +79,9 @@ Derived from the above and the spec (the matrix and the failure rule were agreed
    the note is deleted). A failing `prepare` aborts the publication: the temporary is discarded as for any failure before the rename and the file fails
    with `CopyStep::Claim` (no new code). A failing `commit_prepared` after a successful rename is the existing `ClaimNotRecorded` report (the file IS
    published); the note stays and recovery settles it on the next resume. **Any other failure after a successful `prepare` and before the rename** (the
-   heartbeat, the guard, the rename itself failing, a lost lock) makes `tree.rs` call `discard_prepared` for that key at once, best effort: the copy path
+   heartbeat, the rename itself failing, or another failure, while this run still holds the lock) makes `tree.rs` call `discard_prepared` for that key at once, best effort: the copy path
    has already removed (or kept as a leftover) its temporary, and a note left behind would describe a publication that did not happen. A `discard_prepared`
-   that itself fails leaves the note, which recovery decides by the matrix (row 4 below).
+   that itself fails leaves the note, which recovery decides by the matrix (row 4 below). After a lost lock nothing is discarded: the note stays and recovery decides it by the matrix (cut 9d decision 8; cut 11c).
 7. **Recovery order:** `Place::adopt` opens the store, then runs recovery, then returns; the walk starts afterwards (section 241.5: "before any other target
    is planned or published").
 
