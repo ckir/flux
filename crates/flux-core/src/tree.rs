@@ -2781,6 +2781,12 @@ fn flush_batch<F: DestinationRoot>(
     }
     // 4.4-4.5: one transaction settles the batch, skipped only when it would carry no op.
     if !ops.is_empty() {
+        // Cut 11c (spec 4.3 site 3): a batch with a failed entry re-checks the lock before it is settled; a batch with
+        // no failure does not (N5: the same inherent window as an unbatched commit after its rename).
+        let any_failed = ops.iter().any(|op| matches!(op, RecoveryOp::Discard { .. }));
+        if any_failed && let Err(lost) = (cx.guard)() {
+            return Err(CopyError::at(CopyStep::Publish, lost));
+        }
         let settled = claims.borrow_mut().apply_recovery(&ops);
         if settled.is_err() {
             // Decision 7: nothing changed, so each op is retried on its own. A commit that fails is reported at its
@@ -6336,6 +6342,52 @@ mod tests {
             assert!(published(&fs, f) && claimed(&fs, f), "{f}");
         }
         assert_eq!((out.files_copied, out.failures.copy), (3, 0));
+    }
+
+    #[test]
+    fn t4_a_lost_lock_before_the_settling_transaction_writes_nothing_when_an_entry_failed() {
+        // Spec 4.3 site 3. Mutant: drop the re-check (apply_recovery commits f0 and f2 and discards f1 after the loss).
+        let fs = n_files(3);
+        let calls = std::cell::Cell::new(0);
+        fs.fail_nth("rename_no_replace", 2, Code::IoError, ErrorKind::Other);
+        // Guards: staging (1-6), the flush's opening guard (7), f0's publish (8), f1's publish (9), f1's rename fails,
+        // f1's discard (10, held: removed), f2's publish (11); the settling re-check (12) fails.
+        let guard = failing_after(11, &calls);
+        let (r, out, got) = batched_with(&fs, policy(4), Durability::Strict, &guard, &no_heartbeat);
+        let error = r.unwrap_err();
+        assert_eq!(
+            (error.code(), error.step),
+            (Code::TargetLockBusy, CopyStep::Publish),
+            "{error:?}"
+        );
+        assert!(error.leftover.is_none(), "{error:?}");
+        assert_eq!(calls.get(), 12);
+        let c = log(&fs);
+        for none in ["claim_apply_recovery", "claim_discard_prepared(", "claim_commit_prepared("] {
+            assert_eq!(count(&c, none), 0, "{none}: {c:?}");
+        }
+        assert_eq!(fs.prepared_count(), 3, "every note stays");
+        for f in ["f0", "f2"] {
+            assert!(published(&fs, f) && !claimed(&fs, f), "{f}: renamed, finalized at --resume");
+        }
+        assert!(!fs.exists("/dst/f1.flux-partial.op1") && !fs.exists("/dst/f1"));
+        assert_eq!(got.len(), 1, "{got:?}");
+        let TreeFailureCause::Copy(e) = &got[0].cause else { panic!("{got:?}") };
+        assert_eq!(got[0].path, Path::new("f1"));
+        assert_eq!((e.code(), e.step), (Code::IoError, CopyStep::Publish));
+        assert!(leftovers(&got, Some(&error)).is_empty(), "{got:?}");
+        assert_eq!(out.files_copied, 2);
+    }
+
+    #[test]
+    fn t4_no_failed_entry_means_no_settling_re_check() {
+        // N5. Mutant: re-check on every batch. A green 3-file batch: staging (1-6), opening (7), three publishes (8-10).
+        let fs = n_files(3);
+        let calls = std::cell::Cell::new(0);
+        let guard = failing_after(u32::MAX, &calls);
+        let (r, out, _) = batched_with(&fs, policy(4), Durability::Strict, &guard, &no_heartbeat);
+        r.unwrap();
+        assert_eq!((calls.get(), out.files_copied), (10, 3));
     }
 
     #[test]

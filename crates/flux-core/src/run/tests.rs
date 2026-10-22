@@ -4626,6 +4626,46 @@ fn a_lost_lock_after_the_notes_keeps_them_and_the_temporaries() {
 }
 
 #[test]
+fn a_lost_lock_before_the_batch_settles_leaves_the_renamed_for_resume_to_finalize() {
+    // Cut 11c site 3, end to end. `/src/c` joins `a` in the root's batch (sub/b flushes first at sub's DirEnd).
+    // `rename_no_replace`: the probe (1), the workspace publish (2), sub/b (3), a (4: fails, I/O), c (5: just before
+    // it the lock is taken over, after c's publish guard passed). The settling re-check then finds the lock gone.
+    let fs = fake();
+    fs.write_file("/src/c", b"C");
+    fs.fail_nth("rename_no_replace", 4, Code::IoError, std::io::ErrorKind::Other);
+    fs.on_nth("rename_no_replace", 5, |fs| fs.write_file(LOCK, b""));
+    let (r, got) = run_tree_with(&fs, &cfg(), &strict());
+    assert!(r.stop.is_none(), "the copy's abort is the report: {:?}", r.stop);
+    let a = aborted(&r);
+    assert_eq!(a.error.code(), Code::TargetLockBusy, "{:?}", a.error);
+    assert!(a.error.leftover.is_none(), "{:?}", a.error);
+    assert_eq!(fs.read_file("/p/dest/c").as_deref(), Some(&b"C"[..]), "c was renamed");
+    assert_eq!(fs.claim(strong(&fs, "/p/dest"), "c"), None, "not committed after the loss");
+    assert_eq!(fs.prepared_count(), 2, "a's and c's notes stay");
+    let c = calls(&fs);
+    let root_rename = publish_of(&c, "c");
+    assert_eq!(count(&c, "claim_apply_recovery"), 1, "sub's only: {c:?}");
+    assert!(at(&c, "claim_apply_recovery") < root_rename, "{c:?}");
+    for none in ["claim_discard_prepared(", "claim_commit_prepared("] {
+        assert_eq!(count(&c, none), 0, "{none}: {c:?}");
+    }
+    assert_eq!(got.iter().filter(|f| f.path == Path::new("a")).count(), 1, "{got:?}");
+    assert_eq!(step_of(got.iter().find(|f| f.path == Path::new("a")).unwrap()), CopyStep::Publish);
+    // The resume (engine-level `break_lock`, as the CLI would with --restart --break-lock, here over the empty lock
+    // the takeover left; a new operation id, as the adopting run must not reuse the prior's): recovery row 1
+    // commits c (RENAMED); a's note (temporary removed, name absent) is GONE and discarded; a is copied again.
+    let again = RunConfig { operation_id: id(0x77), break_lock: true, ..resume() };
+    let (r2, got2) = run_tree_with(&fs, &again, &strict());
+    let out2 = ok(&r2);
+    assert!(matches!(r2.resumed, Some(ResumeNote::Adopted { .. })), "{:?}", r2.resumed);
+    assert!(got2.is_empty(), "{got2:?}");
+    assert_eq!(fs.prepared_count(), 0);
+    assert!(fs.claim(strong(&fs, "/p/dest"), "c").is_some(), "finalized by recovery");
+    assert_eq!(fs.read_file("/p/dest/a").as_deref(), Some(&b"A"[..]));
+    assert!(out2.files_copied >= 1, "{out2:?}");
+}
+
+#[test]
 fn a_strict_replacement_commits_the_planned_claim_too() {
     // Mutant (tree.rs, `flush_batch`): `planned: None` in the batch's `RecoveryOp::Commit`.
     let fs = FaultFs::new();
