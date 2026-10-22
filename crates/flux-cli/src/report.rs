@@ -4,7 +4,8 @@
 
 use flux_core::copy::CopyError;
 use flux_core::dry_run::{DryPrior, PlannedAction, PlannedEntry};
-use flux_core::run::{ResumeNote, Run, RunError, RunWarning};
+use flux_core::run::{MultiRun, ResumeNote, RootReport, Run, RunError, RunWarning};
+use flux_core::tree::RootStatus;
 use flux_core::{
     Discard, TreeAbort, TreeFailure, TreeFailureCause, TreeOutcome, WeakIdentityWarnings,
 };
@@ -51,6 +52,28 @@ pub struct Report {
     /// Cut 11a: checks a dry run could not perform; absent when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unprobed: Vec<&'static str>,
+    /// Several sources (spec 3.8, R8): one entry per root in prefix order; absent for one source and for a command
+    /// refused before transfer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roots: Option<Vec<RootJson>>,
+}
+
+/// One root of a several-source report.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct RootJson {
+    pub name: String,
+    /// `"completed"`, `"failed"` or `"not_started"`.
+    pub status: &'static str,
+    pub files_copied: u64,
+    pub files_failed: u64,
+}
+
+fn status_str(s: RootStatus) -> &'static str {
+    match s {
+        RootStatus::Completed => "completed",
+        RootStatus::Failed => "failed",
+        RootStatus::NotStarted => "not_started",
+    }
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -86,6 +109,7 @@ impl Report {
             mounts_skipped: 0,
             dry_run: false,
             unprobed: Vec::new(),
+            roots: None,
         }
     }
 
@@ -162,6 +186,26 @@ impl Report {
         rep
     }
 
+    /// Several sources: `tree_run` over the run, plus the roots in the order the engine reports them (prefix order).
+    /// A run that stopped before any root was begun has none, so no `roots` key.
+    pub fn several_run(m: &MultiRun, duration_ms: u64) -> Self {
+        let mut rep = Self::tree_run(&m.run, duration_ms);
+        if !m.roots.is_empty() {
+            rep.roots = Some(
+                m.roots
+                    .iter()
+                    .map(|r| RootJson {
+                        name: r.name.to_string_lossy().into_owned(),
+                        status: status_str(r.status),
+                        files_copied: r.files_copied,
+                        files_failed: r.files_failed,
+                    })
+                    .collect(),
+            );
+        }
+        rep
+    }
+
     /// `tree_run`, for a single file.
     pub fn file_run(
         run: &Run<Result<Outcome, CopyError>>,
@@ -187,6 +231,32 @@ impl Report {
         serde_json::to_string(self)
             .expect("a flat struct of integers and static strings always serializes")
     }
+}
+
+/// The stderr lines for a several-source run's roots (spec 3.7, 3.8): one per finished root, then one naming the roots
+/// that were not started.
+pub fn root_lines(roots: &[RootReport]) -> Vec<String> {
+    let mut v: Vec<String> = roots
+        .iter()
+        .filter(|r| r.status != RootStatus::NotStarted)
+        .map(|r| {
+            format!(
+                "root {}: {} copied, {} failed",
+                r.name.to_string_lossy(),
+                r.files_copied,
+                r.files_failed
+            )
+        })
+        .collect();
+    let unstarted: Vec<_> = roots
+        .iter()
+        .filter(|r| r.status == RootStatus::NotStarted)
+        .map(|r| r.name.to_string_lossy().into_owned())
+        .collect();
+    if !unstarted.is_empty() {
+        v.push(format!("not started: {}", unstarted.join(", ")));
+    }
+    v
 }
 
 /// A tree-relative path with `/` separators (§233.1); the root itself is `.`.
@@ -1933,5 +2003,101 @@ mod tests {
                     .to_string()
             ]
         );
+    }
+
+    fn root(name: &str, status: RootStatus, copied: u64, failed: u64) -> RootReport {
+        RootReport {
+            name: std::ffi::OsString::from(name),
+            status,
+            files_copied: copied,
+            files_failed: failed,
+        }
+    }
+
+    fn multi(roots: Vec<RootReport>) -> MultiRun {
+        MultiRun {
+            run: Run {
+                copy: Some(Ok(TreeOutcome::default())),
+                stop: None,
+                warnings: Vec::new(),
+                resumed: None,
+                beat_gap_max: std::time::Duration::ZERO,
+                file_resume: None,
+                dry: None,
+            },
+            roots,
+        }
+    }
+
+    #[test]
+    fn several_run_report_has_a_roots_array_in_prefix_order_with_statuses() {
+        let m = multi(vec![
+            root("alpha", RootStatus::Completed, 3, 0),
+            root("beta", RootStatus::Failed, 1, 2),
+            root("zed", RootStatus::NotStarted, 0, 0),
+        ]);
+        let v: serde_json::Value =
+            serde_json::from_str(&Report::several_run(&m, 5).to_json()).unwrap();
+        assert_eq!(
+            v["roots"],
+            serde_json::json!([
+                {"name": "alpha", "status": "completed", "files_copied": 3, "files_failed": 0},
+                {"name": "beta", "status": "failed", "files_copied": 1, "files_failed": 2},
+                {"name": "zed", "status": "not_started", "files_copied": 0, "files_failed": 0},
+            ])
+        );
+        let s = Report::several_run(&m, 5).to_json();
+        assert!(s.find("\"hash_algorithm\"").unwrap() < s.find("\"roots\"").unwrap());
+        assert!(s.ends_with("]}"), "roots is the last key: {s}");
+        assert_eq!(v.as_object().unwrap().len(), 19);
+        assert_eq!(v["duration_ms"], 5);
+        // The counters are `tree_run`'s.
+        assert_eq!(Report::several_run(&m, 5).files_total, Report::tree_run(&m.run, 5).files_total);
+    }
+
+    #[test]
+    fn a_one_source_report_has_no_roots_key_and_the_same_18_keys() {
+        for r in [Report::pre_engine(false), Report::tree(&TreeOutcome::default(), false, 1)] {
+            let s = r.to_json();
+            assert!(!s.contains("roots"), "{s}");
+            let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+            let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+            let mut sorted_by_position: Vec<&str> = KEYS.to_vec();
+            sorted_by_position.sort_by_key(|k| s.find(&format!("\"{k}\":")).unwrap());
+            assert_eq!(sorted_by_position, KEYS, "{s}");
+            assert_eq!(keys.len(), 18, "{s}");
+            for k in KEYS {
+                assert!(keys.contains(&k), "{k}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_refusal_before_transfer_has_no_roots() {
+        assert!(!Report::pre_engine(false).to_json().contains("roots"));
+        assert!(!Report::pre_engine(true).to_json().contains("roots"));
+        // A refused several-source run reports no roots (the engine returns none), so none is written.
+        let mut m = multi(Vec::new());
+        m.run.copy = None;
+        assert_eq!(Report::several_run(&m, 3), Report::pre_engine(false));
+    }
+
+    #[test]
+    fn root_lines_name_the_not_started_roots() {
+        let lines = root_lines(&[
+            root("a", RootStatus::Completed, 2, 0),
+            root("b", RootStatus::Failed, 1, 3),
+            root("c", RootStatus::NotStarted, 0, 0),
+            root("d", RootStatus::NotStarted, 0, 0),
+        ]);
+        assert_eq!(
+            lines,
+            ["root a: 2 copied, 0 failed", "root b: 1 copied, 3 failed", "not started: c, d"]
+        );
+        assert_eq!(
+            root_lines(&[root("a", RootStatus::Completed, 1, 0)]),
+            ["root a: 1 copied, 0 failed"]
+        );
+        assert!(root_lines(&[]).is_empty());
     }
 }

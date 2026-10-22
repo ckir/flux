@@ -405,8 +405,9 @@ fn closed_output_pipes_do_not_turn_a_finished_copy_into_a_crash() {
 }
 
 #[test]
-fn a_third_positional_is_a_usage_error() {
-    let out = flux().args(["copy", "a", "b", "c"]).output().unwrap();
+fn a_lone_positional_is_a_usage_error() {
+    // Three positionals are the several-source command now (tests/several_sources.rs); one is still too few.
+    let out = flux().args(["copy", "a"]).output().unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
 
