@@ -1,6 +1,6 @@
 # Several sources: `flux copy a b c DEST` (fresh copies only)
 
-Status: DRAFT for owner review (2026-10-22). Branch `spec/several-sources` off main `1b69bd4`.
+Status: DRAFT for owner review (2026-10-22); adversarial panel run for five rounds (see Stand-downs). Branch `spec/several-sources` off main `1b69bd4`.
 Master spec: `FLUX_FULL_UPDATED_SPEC_V16.md` (cited as "spec §N"). Roadmap: ROADMAP.md, 0.1 scope item "multiple sources".
 
 ## 1. Intent
@@ -322,6 +322,9 @@ ruling in §3.7, the second is moot under B).
   an existing file: exit 2; two positionals unchanged.
 - Mapping: two folders; two files; mixed; a source given as `.`, `../x`, `dir/`; output independent of command-line
   order (same tree, same manifest root order).
+- Execution order (B3): the same sources given as `a b c` and as `c b a` are COPIED in the same order, `a` then `b` then
+  `c`, read from the fake's call log (the first write into each `DEST/<name>` follows the last write into the previous
+  one); a mutant that copies in command-line order and only sorts the manifest is red.
 - Nested roots (R5): `flux copy a a/sub DEST` copies `a` to `DEST/a` and `a/sub` to `DEST/sub`, `DEST/a/sub` holds the
   same content as `DEST/sub`, nothing is refused, and the manifest has two roots in prefix order.
 - File root against the single-file command (V3, G4): for each of `--overwrite`, `--update` and `--skip-existing`, with
@@ -331,12 +334,19 @@ ruling in §3.7, the second is moot under B).
   source; symlink source; byte-equal names (`a/x`, `b/x`) and the same source twice; reserved name; `.flux` source;
   the target is the source (`d/a.txt d/b.txt d`); DEST inside a folder source; wrong-kind existing `DEST/<name>`; two bad
   sources at once report the FIRST one in command-line order (L2).
+- Order of the pre-transfer checks (B2, a panel finding): for each group 2 refusal (target is the source; wrong-kind
+  existing `DEST/<name>`), the fake's call log contains NO creation of the workspace or of the claim store, and no write
+  into any `DEST/<name>`; an implementation that makes the workspace first and removes it on refusal passes the bullet
+  above (the destination is untouched afterwards) and is red here. The assertion names the log index of the last prefix
+  lock creation and asserts absence only after it (a fixture that sweeps also logs calls).
 - Aliases: `Data` and `data` refused with `DESTINATION_NAMESPACE_COLLISION` and all locks released (fake with a
   case-insensitive mode; real-fs on macOS and Windows jobs); on Linux both copy.
 - Layout (the A1 regression): after a run, no `.flux`, `*.flux-lock` or `*.flux-state.*` inside any `DEST/<name>`; the
   workspace is `DEST/.flux/operations/<id>` with n roots, the prefixes in key order; completed run leaves none.
 - Locks: DEST lock taken before the prefix locks; a held prefix lock refuses with `TARGET_LOCK_BUSY` and nothing is
-  copied; a lock lost between root 1 and root 2 aborts and root 2 is "not started".
+  copied (the held lock is the LAST root's in key order, so an implementation that takes each root's lock just before
+  that root passes only if it has copied the earlier roots, which the assertion rejects); a lock lost between root 1 and
+  root 2 aborts and root 2 is "not started".
 - Prefix-lock liveness (V4): a prefix lock whose OS-native lock is held by a live run is `Busy` to a competing run even
   when its record's heartbeat time is old (the competitor is not allowed to read it as dead), and the same lock with the
   OS lock released is `Dead` and recovered; a mutant that classifies by heartbeat age is red.
@@ -346,7 +356,10 @@ ruling in §3.7, the second is moot under B).
   byte-for-byte (golden comparison against today's output); the validator accepts exactly the forms it should and
   rejects version 5 with one root, version 4 with several, and an empty prefix on a version-5 root.
 - Keys: two roots holding a large file at the same root-relative path (use the checkpoint policy seam so a small file
-  checkpoints): each file's checkpoint entry is its own, and the copies are byte-correct.
+  checkpoints): the checkpoint log, decoded, holds two file ids that are exactly the section 103 keys (`a`, 0x00,
+  `big.bin` and `b`, 0x00, `big.bin`), not one id twice; the copies are byte-correct. (The writer REPLACES a file id it
+  has already seen on a new begin, `wal/writer.rs:~379`, so a collision need not corrupt a fresh copy; byte-correctness
+  alone does not turn a mutant that drops the prefix red, which is why the ids are asserted.)
 - Length and count: a name whose lock exceeds the limit is refused with `PATH_COMPONENT_INVALID` and nothing is made; one
   source over the cap is refused with exit 2.
 - Crash residue: a run killed after the prefix locks leaves them with `workspace_path` `none`; a later several-source run
@@ -363,7 +376,11 @@ ruling in §3.7, the second is moot under B).
   a refusal before transfer (the report built by `Report::pre_engine`) has no `roots` key and does not fail.
 - Later-cut compatibility: a one-source `--resume` against a several-source prior refuses (source mismatch);
   `flux cleanup DEST` classifies and removes an aborted several-source workspace; one-source `--restart` supersedes it.
-- Report: JSON keys unchanged, counters are sums; exit codes.
+- Report: the 18 JSON keys are unchanged and in the same order; for a run of one folder root and one file root with one
+  failing file inside the folder, each counter (`files_total`, `files_copied`, `files_failed`, `bytes_copied`,
+  `directories_created`, `errors`) equals the sum of the two roots, with the file root counted as one file; exit codes:
+  0 for a clean run, 1 for a run with a failed file and for an aborted run, 2 for each gated flag and for DEST an
+  existing file, 3 for a collision refused before any change; one test per code.
 - Windows, macOS and Linux CI green; the existing single-source suite unchanged.
 
 ## 8. Documentation to change with the cut
@@ -438,4 +455,15 @@ Locks bullet has no liveness case); agy answered "no contradictions" without not
 bullets and a first-failure clause (R2, L2). The Fold Auditor items (a) to (d): no new findings. So round 4 was clean by
 agy's account but not by measurement; the round that follows audits only these additions. Discarded below the floor: none.
 Unverified-accepted: none.
+
+Panel round 5, agy escalation (the cited section 7 lines were checked; they were accurate). E1 the destination-side checks
+are not shown to run before the workspace exists (B2: NONE): FOLDED, a new section 7 bullet using the fake's call log.
+E2, found by checking agy's own mappings: the Keys test could pass with the prefix dropped, because the writer replaces a
+duplicate file id on a new begin (`wal/writer.rs:379`, read): FOLDED, the log's ids are asserted. E3 the order of
+execution was only tested through the manifest, so a mutant that copies in command-line order passes: FOLDED, a new
+execution-order bullet. E4 "nothing is copied" for a busy prefix lock passes if the busy lock is the first root's: FOLDED,
+the held lock is the last root's. E5 the weakest bullet, the report and exit codes: FOLDED, counters and one test per code.
+Fold Auditor items (a) to (c): no new findings. Discarded below the floor: none. Unverified-accepted: none.
+Round count: five. Round six is the cap at which the operator is asked whether to continue or ship; the findings of rounds
+four and five were test obligations, not design defects, and this spec is handed to the owner at that point.
 
