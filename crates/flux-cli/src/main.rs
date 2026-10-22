@@ -331,7 +331,7 @@ fn copy(args: &CopyArgs) -> u8 {
             });
             let ms = millis(started);
             let rep = Report::tree_run(&run, ms);
-            tree_output(args, &opts, &run, rep, &[]);
+            tree_output(args, &opts, &run, rep, &[], None);
             exit_code::for_tree_run(&run)
         }
         Job::File { src, dst, target_existed } => {
@@ -411,13 +411,14 @@ fn copy(args: &CopyArgs) -> u8 {
 }
 
 /// Everything a finished tree run prints, after its report is built: the stderr lines, the debug counters and the
-/// `--json` object. `roots` is empty for one source; a several-source run's roots print before the summary line.
+/// `--json` object. `roots` is empty, and `several` (the destination) is `None`, for one source; a several-source run's roots print before the summary line.
 fn tree_output(
     args: &CopyArgs,
     opts: &CopyOptions,
     run: &flux_core::run::Run<Result<flux_core::TreeOutcome, flux_core::TreeAbort>>,
     mut rep: Report,
     roots: &[flux_core::run::RootReport],
+    several: Option<&std::path::Path>,
 ) {
     // The flag, not `run.dry`: an engine pre-flight refusal returns before the dry branch (ruling P7).
     rep.dry_run = args.dry_run;
@@ -436,7 +437,7 @@ fn tree_output(
                 Ok(out) => out,
                 Err(a) => {
                     err(&a.error.to_string());
-                    lines(report::abort_hint_lines(&a.error));
+                    lines(report::abort_hint_lines(&a.error, several));
                     &a.outcome
                 }
             };
@@ -540,7 +541,7 @@ fn copy_several(args: &CopyArgs) -> u8 {
         }
     });
     let rep = Report::several_run(&multi, millis(started));
-    tree_output(args, &opts, &multi.run, rep, &multi.roots);
+    tree_output(args, &opts, &multi.run, rep, &multi.roots, Some(&destination[0]));
     exit_code::for_multi_run(&multi)
 }
 

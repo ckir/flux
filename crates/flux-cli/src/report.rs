@@ -815,12 +815,21 @@ pub fn resume_verify_lines(outcome: &TreeOutcome, full: bool) -> Vec<String> {
     if resume_verify_used(outcome, full) { vec![FULL_LEVEL_LINE.to_string()] } else { Vec::new() }
 }
 
-/// Cut 9f-1: the line that follows an aborting error when it is a checkpoint-write failure.
-pub fn abort_hint_lines(error: &CopyError) -> Vec<String> {
-    if error.code() == Code::WalWriteFailed {
-        vec!["run again with --resume to continue from the last durable checkpoint".to_string()]
-    } else {
-        Vec::new()
+/// Cut 9f-1: the line that follows an aborting error when it is a checkpoint-write failure. `several` is the
+/// destination of a several-source run, whose operation `--resume` refuses (spec L1): it is pointed at
+/// `flux cleanup --force` instead.
+pub fn abort_hint_lines(error: &CopyError, several: Option<&Path>) -> Vec<String> {
+    if error.code() != Code::WalWriteFailed {
+        return Vec::new();
+    }
+    match several {
+        Some(dest) => vec![format!(
+            "run flux cleanup --force {} to remove the aborted run, then run again",
+            dest.display()
+        )],
+        None => {
+            vec!["run again with --resume to continue from the last durable checkpoint".to_string()]
+        }
     }
 }
 
@@ -1567,7 +1576,7 @@ mod tests {
             step: CopyStep::Checkpoint,
         };
         assert_eq!(
-            abort_hint_lines(&wal),
+            abort_hint_lines(&wal, None),
             vec!["run again with --resume to continue from the last durable checkpoint"]
         );
         let other = CopyError {
@@ -1575,7 +1584,37 @@ mod tests {
             leftover: None,
             step: CopyStep::Source,
         };
-        assert!(abort_hint_lines(&other).is_empty());
+        assert!(abort_hint_lines(&other, None).is_empty());
+    }
+
+    fn wal_failure() -> CopyError {
+        CopyError {
+            cause: FsError::new(Code::WalWriteFailed, std::io::Error::other("x")),
+            leftover: None,
+            step: CopyStep::Checkpoint,
+        }
+    }
+
+    #[test]
+    fn a_wal_write_failure_hint_names_resume_for_one_source() {
+        assert_eq!(
+            abort_hint_lines(&wal_failure(), None),
+            ["run again with --resume to continue from the last durable checkpoint"]
+        );
+    }
+
+    #[test]
+    fn a_wal_write_failure_hint_names_cleanup_force_for_several_sources() {
+        assert_eq!(
+            abort_hint_lines(&wal_failure(), Some(Path::new("out/dir"))),
+            ["run flux cleanup --force out/dir to remove the aborted run, then run again"]
+        );
+        let other = CopyError {
+            cause: FsError::new(Code::IoError, io("x")),
+            leftover: None,
+            step: CopyStep::Source,
+        };
+        assert!(abort_hint_lines(&other, Some(Path::new("d"))).is_empty());
     }
 
     // Owner ruling 23: the exact texts of the two quarantine warnings.
@@ -1615,7 +1654,7 @@ mod tests {
         let line = error.to_string();
         assert!(line.contains("WAL_FORMAT_UNSUPPORTED: "), "{line}");
         assert!(line.contains("run again with --restart to supersede it"), "{line}");
-        assert!(abort_hint_lines(&error).is_empty());
+        assert!(abort_hint_lines(&error, None).is_empty());
         let aborted =
             Err(flux_core::TreeAbort { error, outcome: flux_core::TreeOutcome::default() });
         assert_eq!(crate::exit_code::for_tree(&aborted), crate::exit_code::FAILED);
