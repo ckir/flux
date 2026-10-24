@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! The copy pipeline, in process: `flux_core::run::tree` / `run::file` on the real filesystem, each under
 //! `Durability::Normal` and `Durability::Strict`. Cut 9d adds fsync work to the Strict path, so the Normal/Strict
 //! pair is the number to compare before and after.

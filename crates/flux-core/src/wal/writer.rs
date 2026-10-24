@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! The WAL writer thread (cut 9f-1): a bounded channel, a flush policy, and the Strict
 //! data-before-checkpoint ordering.
 //!

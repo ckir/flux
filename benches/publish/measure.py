@@ -1,3 +1,9 @@
+# Copyright (c) 2026 Costas Kirgoussios
+#
+# This software is licensed under the PolyForm Noncommercial License 1.0.0.
+# You may obtain a copy of the License at:
+# https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 """Time Flux against the comparators on this runner and write result-<os>.json (spec "Measuring").
 
 Run in CI by bench-measure.yml:

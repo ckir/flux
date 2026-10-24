@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! Cut 11b: the real-filesystem paired corpus. A prior is built by a real `--durability strict` tree run that is cut
 //! short by a panic in the `before_mutation` hook, the way a crash would leave it. The dry `--resume` / `--restart`
 //! runs against one byte-identical copy of the destination and the live run against another; the live run is the

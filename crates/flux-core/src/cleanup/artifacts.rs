@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! The artifact rules (cut 9b, spec "Artifact rules" 1-4): a state record names the temporaries an operation left
 //! behind as hex paths. Cleanup deletes only a name it can prove is this operation's own temporary.
 

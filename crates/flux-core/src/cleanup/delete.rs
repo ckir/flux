@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! The cleanup deletion pass (cut 9b, spec "Deletion procedure" and "Locking"): under DEST's root lock, re-read and
 //! re-classify every row the listing marked eligible, then delete what the spec authorises and nothing else. When in
 //! doubt a row is kept or skipped and reported; the listing's verdict alone never deletes anything.

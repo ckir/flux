@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! The operation state (cut 7a spec, "Operation state, `format_version` 1"): one JSON object - a tree operation's
 //! `manifest`, or a single-file operation's adjacent record - its codec, its crash-safe write, and the names Flux gives
 //! it. `format_version` is judged before any other key, and nothing is parsed heuristically (§193).

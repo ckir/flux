@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! The cleanup status table (cut 9b spec, "Statuses, eligibility and the table"): a pure function from the facts
 //! about one entry to its status, eligibility and note. No I/O; the discovery code builds the `Facts`.
 

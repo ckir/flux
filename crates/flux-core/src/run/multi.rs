@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! The place of a several-source run (spec 3.4, 3.5): a `TreePlace` for DEST plus one prefix lock and one root per
 //! source. Its `create` makes DEST, takes the prefix locks inside it, checks the names the sources take, and only then
 //! makes the workspace, so a refusal at any of those finds no workspace and releases every lock it took.

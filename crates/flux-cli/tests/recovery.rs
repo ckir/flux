@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! Commit recovery at `--resume` (cut 9c Task 7), end to end on the real filesystem with the real `flux` binary: a
 //! Strict tree copy is killed at a publish guard with the debug build's stall hook (which exists only in a debug
 //! build, what `cargo test` builds), and the next `--resume` decides each prepared note against what is on disk.

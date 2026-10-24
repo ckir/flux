@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! Real-system tests for cut 8a: a Linux bind mount inside DEST (Part M and the `mount_root` query against the
 //! same mount) and a link in a parent component of DEST (Part A). Locally a missing facility skips with a stated
 //! reason; when `CI` is set it fails instead.

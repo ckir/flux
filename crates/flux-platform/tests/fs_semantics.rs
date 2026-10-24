@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! Filesystem probes FS-1 to FS-11 for the lock-protocol model.
 //!
 //! Design: docs/superpowers/specs/2026-09-11-lock-protocol-model-check-design.md, Section 10.

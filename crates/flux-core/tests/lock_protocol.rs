@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! The lock protocol on a real filesystem, with a real OS-native lock held by ANOTHER PROCESS: while it lives, the
 //! target is BUSY and its holder is reported; once it dies, the next run recovers its lock (§240.2, §240.3).
 

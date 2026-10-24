@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! Model conformance (cut 7a design, "Model conformance"): every protocol label of the lock model maps to the Rust
 //! function that implements it - a function that exists and mentions the label - or says why none does; and no code
 //! mentions a label marked for a later cut.

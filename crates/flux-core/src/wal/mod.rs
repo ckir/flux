@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! Write-ahead log for chunk checkpoints (cut 9f-1).
 
 /// Size of one checkpointed chunk of the source: 1 MiB.

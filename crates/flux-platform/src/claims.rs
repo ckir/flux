@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! The `redb`-backed claim store (cut 8b, format 2 in cut 9c). One file, three tables: `claims`
 //! (key = `ClaimKey::encode`, value = `ClaimRecord::encode`), `prepared` (key = `ClaimKey::encode`,
 //! value = `PreparedRecord::encode`; absent in a format-1 store) and `meta`.

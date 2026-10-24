@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! Cut 9a's compatibility check for `--resume` (spec 121, "Compatibility"): whether a prior operation's stored
 //! configuration admits this run. Pure: it reads the prior's state and the run's roots and options, and decides.
 

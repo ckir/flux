@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! §21.1: classify a destination's prior operations before this run creates its own (the run's step 4). A tree's are
 //! the workspaces in `DEST/.flux/operations/`; a single file's are the `<target>.flux-state.<id>` records beside it.
 //! The entry named with this run's own id is skipped: after a `--break-lock` takeover this run's CREATED state already

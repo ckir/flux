@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! `flux copy SRC... DEST` end to end (several-sources cut, task 8): the binary against a real filesystem.
 
 use std::collections::BTreeMap;
