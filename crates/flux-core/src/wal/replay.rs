@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! Two-pass WAL replay (cut 9f-1): `scan` indexes the log, `load_file` rebuilds one file's state.
 
 use super::record::{Body, Decoded, FileBegin, declared_span, decode_next};

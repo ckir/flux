@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! The directory primitives the operation state rests on (cut 7a Part 3a): listing, reading a small file, removing an
 //! empty directory, flushing a directory, and renaming a directory - each through a directory handle, never following
 //! a link (§149.7).

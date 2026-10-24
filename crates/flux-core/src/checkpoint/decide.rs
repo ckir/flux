@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! The resume decision: which bytes of a crashed run's partial file a resumed run may trust (spec decision 7).
 //!
 //! `decide` is pure over `Read`ers. It re-hashes the source and the partial chunk by chunk and compares both with

@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! The run (cut 7a design, "The run"; Part 3b-1): a copy that holds its destination's target lock from before its
 //! state exists until after that state is gone (F5, Q-K), records a versioned state that a later run classifies
 //! (§21.1), and with `--restart` supersedes the prior operations it finds. `tree` is the directory copy and `file` the

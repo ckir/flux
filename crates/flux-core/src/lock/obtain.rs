@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! The run's steps 1 and 3 ("The run"): the capability gate, then acquisition, classifying and recovering or taking
 //! over as the model's `plain`, `rec` and `brk` processes do (`S21_1_decide`, `S21_1_refused`,
 //! `S21_1_restart_decide`).

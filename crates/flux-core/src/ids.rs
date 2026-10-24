@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! Operation and owner-instance IDs (cut 7a spec, "Operation ID and owner instance ID"; §18.1: collision-resistant).
 
 /// A fresh random version-4 UUID as 32 lowercase hex digits, no dashes.

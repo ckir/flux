@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! Planning the roots of a several-source run (spec 3.2, 3.4, R6, L5): which names the sources take under the
 //! destination, in which order, and how many a run may carry.
 

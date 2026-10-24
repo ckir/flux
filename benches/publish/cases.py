@@ -1,3 +1,9 @@
+# Copyright (c) 2026 Costas Kirgoussios
+#
+# This software is licensed under the PolyForm Noncommercial License 1.0.0.
+# You may obtain a copy of the License at:
+# https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 """The three benchmark cases (spec "Cases") and their generation from a fixed seed.
 
 Contents are pseudo-random, so every run copies the same bytes and no file is compressible or has runs of zeros a

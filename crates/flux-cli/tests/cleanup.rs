@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! `flux cleanup` end to end on the real filesystem (cut 9b, Task 8). The crash hook exists only in a debug build,
 //! which is what `cargo test` builds; `flux cleanup` counts its guarded destructive steps with the same hook as
 //! `flux copy`.

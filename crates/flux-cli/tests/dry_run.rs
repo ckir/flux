@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! `flux copy --dry-run` end to end (cut 11a, Task 6).
 
 use flux_core::state::{Cleanup, Config, Kind, OpState, OperationState, Options, Root, native_hex};

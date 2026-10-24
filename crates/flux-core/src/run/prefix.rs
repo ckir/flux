@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! The prefix locks of a several-sources run (spec 3.4): one `<name>.flux-lock` per prefix name in the destination
 //! directory, each with its record written before the next is created, so an alias (two names one lock file) is told
 //! from a lock another operation holds (R1, R7).

@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! `copy_tree` against real filesystems, on every CI leg. The engine's rules are pinned
 //! against `FaultFs` in `src/tree.rs`; this proves a real filesystem reports what they
 //! rely on - identity, `AlreadyExists`, and a followed destination link.

@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! Owner-run measurement probes for cut 10a (symlink copying). Every test is `#[ignore]`, PRINTS labelled
 //! results and asserts nothing except that it ran. They create nothing outside a `tempfile::TempDir`
 //! (or the directory named by `FLUX_PROBE_DIR` for the Linux one) and clean up after themselves.

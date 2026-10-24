@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! §240.5: take an uncertain lock over IN PLACE, so the lock path is never empty. Steps 1-5 here; step 6's overwrite
 //! waits until Part 3 has created this operation's state (F5, the design's refinement 8).
 

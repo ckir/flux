@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! Cut 11a: a dry run on the real filesystem. The live run on identical, untouched trees is the oracle for the paired
 //! test; a before/after snapshot is the oracle for zero mutation; a lock held on a separate handle is the oracle for
 //! the dry run never touching the lock.

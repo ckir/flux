@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! `flux copy` under the destination's lock (cut 7a Part 3b-2): the design's Testing item 4, end to end on the real
 //! filesystem. The crash hook exists only in a debug build, which is what `cargo test` builds.
 

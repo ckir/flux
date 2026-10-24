@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! Cut 11a: a dry run holds no per-entry state. Its own test binary, so the counting allocator is local to it.
 
 use flux_core::run::{self, RunConfig};

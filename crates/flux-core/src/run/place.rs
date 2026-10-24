@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! Where an operation's state lives - what differs between a tree and a single file. A tree's state is the workspace
 //! `DEST/.flux/operations/<id>/manifest` and its lock is beside DEST; a single file's state is the record
 //! `<target>.flux-state.<id>` beside the target, with its lock.

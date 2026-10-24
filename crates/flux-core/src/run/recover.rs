@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! Commit recovery at `--resume` (cut 9c, spec "Recovery at `--resume`"). A Strict tree publication leaves a prepared
 //! note in the claim store before its rename and turns it into the claim after it; a crash in between leaves the note.
 //! Adoption classifies every note from the evidence at its two names (phase 1, read-only), then applies every verdict

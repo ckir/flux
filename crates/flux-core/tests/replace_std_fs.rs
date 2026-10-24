@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! Real-system tests for cut 8b: replacement on the default filesystem of every OS, name folding on a case-insensitive
 //! destination (macOS and Windows natively, a Linux loopback vfat image), and a Windows junction at the destination
 //! name. Locally a missing facility skips with a stated reason; when `CI` is set it fails instead.

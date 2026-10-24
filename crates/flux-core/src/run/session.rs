@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! Steps 3-5 of "The run", and what the rest of the run shares with them: the §99 checks, and the lock protocol's
 //! errors as the run's.
 

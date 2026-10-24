@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! §240.3: replace a dead owner's lock by moving it aside. The caller classified it `Dead` and still holds its handle
 //! and OS-native lock. The new lock is returned EMPTY: the record comes after the state (decision 3, F5).
 

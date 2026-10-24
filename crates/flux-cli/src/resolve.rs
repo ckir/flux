@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! From the two command-line paths to what the engine is asked to do (cut 5): §4.1's
 //! one-source mapping, K7 (a symlink SOURCE is never followed) and K6
 //! (canonicalization for a folder copy).

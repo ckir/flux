@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! Destination name resolution (cut 8b): the STORED spelling of an existing entry, by listing and identity.
 //!
 //! Design authority: `docs/superpowers/specs/2026-10-07-cut-8b-replacement-design.md`, "Name resolution".

@@ -63,6 +63,17 @@ jobs:
       - uses: actions/checkout@v7
       - uses: crate-ci/typos@master
 
+  license:
+    name: Licence headers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - run: go install github.com/google/addlicense@v1.1.1
+      - run: git ls-files '*.rs' '*.py' '*.sh' | xargs addlicense -f header.txt -check
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

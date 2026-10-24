@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Costas Kirgoussios
+//
+// This software is licensed under the PolyForm Noncommercial License 1.0.0.
+// You may obtain a copy of the License at:
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+
 //! WAL record encoding and its corruption classes (cut 9f-1).
 //!
 //! Layout, little-endian: `MAGIC(4) FORMAT_VERSION(u16) CHECKSUM_VERSION(u8) record_type(u8)
