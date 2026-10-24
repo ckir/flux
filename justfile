@@ -33,6 +33,10 @@ fmt:
 typos:
     typos
 
+# Rustdoc build with warnings denied, as docs.yml runs it (CI runs the same in the Docs build job)
+doc-check:
+    RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --document-private-items
+
 # Licence header present on every tracked source file (needs `go install github.com/google/addlicense@v1.1.1`)
 license:
     git ls-files '*.rs' '*.py' '*.sh' | xargs addlicense -f header.txt -check
@@ -46,8 +50,8 @@ lint-workflows:
 deny:
     cargo deny check
 
-# The local gate: fmt + clippy + typos + license + test
-check: fmt-check clippy typos license test
+# The local gate: fmt + clippy + typos + doc-check + license + test
+check: fmt-check clippy typos doc-check license test
 
 # --- Cross-platform legs of the local gate ---------------------------------
 # `just check` compiles and tests for THIS machine only, so a `#[cfg]` mistake for
