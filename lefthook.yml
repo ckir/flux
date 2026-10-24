@@ -17,3 +17,5 @@ pre-push:
       run: just clippy
     typos:
       run: just typos
+    license:
+      run: just license

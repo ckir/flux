@@ -33,6 +33,10 @@ fmt:
 typos:
     typos
 
+# Licence header present on every tracked source file (needs `go install github.com/google/addlicense@v1.1.1`)
+license:
+    git ls-files '*.rs' '*.py' '*.sh' | xargs addlicense -f header.txt -check
+
 # Lint the GitHub Actions workflows (actionlint, with shellcheck over `run:` steps when it is on PATH;
 # without shellcheck that check is silently skipped). CI runs the same in the Workflow lint job.
 lint-workflows:
@@ -42,8 +46,8 @@ lint-workflows:
 deny:
     cargo deny check
 
-# The local gate: fmt + clippy + typos + test
-check: fmt-check clippy typos test
+# The local gate: fmt + clippy + typos + license + test
+check: fmt-check clippy typos license test
 
 # --- Cross-platform legs of the local gate ---------------------------------
 # `just check` compiles and tests for THIS machine only, so a `#[cfg]` mistake for
