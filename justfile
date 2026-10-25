@@ -37,6 +37,19 @@ typos:
 doc-check:
     RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --document-private-items
 
+# Unit tests for the Pages assembly script (pages/assemble.py)
+pages-test:
+    {{python}} -W error -m unittest discover -s pages -p "test_*.py"
+
+# Build the Pages site as docs.yml does and serve it at http://localhost:8000
+pages-preview:
+    rm -rf target/doc target/pages-work
+    cargo doc --workspace --no-deps --document-private-items
+    {{python}} pages/assemble.py assemble
+    {{python}} pages/assemble.py verify
+    @echo "bench/ exists only in CI, so the chart card shows its fallback text locally"
+    {{python}} -m http.server 8000 --directory target/doc
+
 # Licence header present on every tracked source file (needs `go install github.com/google/addlicense@v1.1.1`)
 license:
     git ls-files '*.rs' '*.py' '*.sh' | xargs addlicense -f header.txt -check
