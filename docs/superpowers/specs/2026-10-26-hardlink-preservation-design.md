@@ -92,8 +92,10 @@ a new persisted format, and reports every case where it could not.
 
 ### The index
 
-A per-run, disk-backed map `source FileIdentity (Strong) -> (destination path of the anchor, the anchor's destination
-ObjectId)`. The ObjectId is read when the anchor is registered (the fresh path already carries it: `o.published_identity`,
+A per-run, disk-backed map from a source `FileIdentity` (Strong) to one of two values: `Anchor(destination path, the
+anchor's destination ObjectId)` or `Failed(Code)` (the group's first member failed to copy; see the table). The
+destination path is the destination-relative claim key, `target` (`FluxPathKey::from_relative(&cx.keyed(&path))`,
+`tree.rs:1597`), which carries the root prefix in a several-source run. It is never the walk-relative `path`. The ObjectId is read when the anchor is registered (the fresh path already carries it: `o.published_identity`,
 `tree.rs:1877`), so that just before linking the run can check that the
 anchor is still the object it registered (spec Section 16.1: "each step revalidates ownership as Section 99
 requires"); a deleted or replaced anchor must never become a link to a stranger.
@@ -102,7 +104,9 @@ requires"); a deleted or replaced anchor must never become a link to a stranger.
   under `DEST/.flux/operations/<id>/` (name: builder's choice), a `redb` file with a fixed page cache like
   `claims.rs:22`, `Durability::None`, no fsync. Resident memory is the cache, not the group count.
 - Removed when the run ends, success or failure. A crash leaves it behind; the existing sweep/cleanup removes it
-  (`flux cleanup` already treats an operation directory's leftovers). No run ever reads a previous run's index.
+  (`flux cleanup` already treats an operation directory's leftovers). No run ever reads a previous run's index, and
+  that is enforced, not assumed: a `--resume` continues the prior operation in the same operation directory
+  (`main.rs:97`), so the run removes any existing index file of that name before it creates a fresh one.
 - Only identities of files with `nlink > 1` enter it. The key is the full source `ObjectId` (volume and index), so it
   is scoped by filesystem identity (Section 109); the aggregated warnings are per source filesystem.
 - One index per operation. With several sources (one operation), a group whose members sit under different roots can
@@ -111,12 +115,20 @@ requires"); a deleted or replaced anchor must never become a link to a stranger.
 ### Fresh copy
 
 For a file with `nlink > 1` and `Strong` identity, under `auto` or `preserve`:
-1. Not in the index: copy it as today. After it is published and its claim recorded (`tree.rs:1888`), insert
-   `identity -> target`.
+1. Not in the index: copy it as today. After it is published and its claim recorded, insert
+   `Anchor(target, its destination ObjectId)`. This happens after ANY successful publication of a regular file,
+   whichever plan produced it: `Plan::New` (claim at `tree.rs:1886-1888`) and `Plan::Replace` (claim at
+   `tree.rs:2005-2012`, the upgrade of its own claim). A canonical that overwrites an existing file is an anchor
+   like any other. If the copy FAILS, insert `Failed(code)` instead.
+   Later members that find `Failed` are not copied; each is reported `BLOCKED_BY_CANONICAL_FAILURE` (Section 92).
 2. In the index: do not transfer data. Apply the existing-destination policy to the member's target exactly as for a
    copy (overwrite replaces it by the link; `--skip-existing` and `--update` may skip it, Section 16.1 `Skipped`). If
    the policy proceeds, check that the anchor is still the registered object, then run the Section 16.1 link steps
-   against the anchor's destination path. On success count `files_hardlinked`.
+   against the anchor's destination path. Between that check and the link the anchor's name could be swapped for
+   another object (author's addition, a hardlink-specific race): so after step 1 (the link at
+   `<target>.flux-partial.<operation-id>`) read the temporary's ObjectId and continue to the rename only if it equals
+   the registered ObjectId; otherwise remove the temporary and treat the anchor as changed (the "anchor is gone" row).
+   The final name therefore only ever receives the registered object. On success count `files_hardlinked`.
 
 Topology is preserved over the selected namespace only (Section 14): a file whose other names lie outside the walk
 is an ordinary copy, not a degradation, and the destination's link count equals the number of selected members
@@ -128,10 +140,10 @@ remain usage errors (`crates/flux-cli/src/main.rs:37`), so a group that spans ro
 | Situation | `copy` | `auto` | `preserve` |
 |---|---|---|---|
 | `nlink <= 1` on a file with `Strong` identity | as today | as today | as today |
-| `nlink` unknown (`None`) on a file with `Strong` identity | as today | not a candidate; one aggregated warning per operation, counted as unverified | same as `auto` (author's call: the platform state is exotic, and failing every file would make `preserve` unusable) |
-| The anchor is gone, or is no longer the object registered, or cannot be checked (the destination identity is not `Strong`), when a member is about to link | not attempted | copy that member independently; counted degraded | fail the member: `HARDLINK_UNAVAILABLE` |
-| A file with `nlink > 1` whose source identity is `Weak` or `Unavailable` (Section 108, lines 5242-5285; a file with `nlink <= 1` is never affected by identity strength, so `preserve` on FAT or NFS still copies ordinary files) | as today | copy independently, never infer equivalence; one aggregated warning per filesystem/operation; counted degraded | fail the member: `HARDLINK_IDENTITY_UNAVAILABLE` |
-| Creating the link fails (no hardlink support on the destination, different filesystem, link limit, permission) | not attempted | copy that member independently; counted degraded | fail the member: `HARDLINK_UNAVAILABLE` (Section 15) |
+| `nlink` unknown (`None`) on a file with `Strong` identity | as today | not a candidate; reported by one aggregated warning per operation, with no counter (nothing is known about the file, so nothing can be counted as degraded) | same as `auto` (author's call: the platform state is exotic, and failing every file would make `preserve` unusable) |
+| The anchor is gone, or is no longer the object registered, or cannot be checked (the destination identity is not `Strong`), when a member is about to link | not attempted | copy that member independently; counted in `hardlinks_degraded` | fail the member: `HARDLINK_UNAVAILABLE` |
+| A file with `nlink > 1` whose source identity is `Weak` or `Unavailable` (Section 108, lines 5242-5285; a file with `nlink <= 1` is never affected by identity strength, so `preserve` on FAT or NFS still copies ordinary files) | as today | copy independently, never infer equivalence; one aggregated warning per filesystem/operation; counted in `hardlinks_degraded` | fail the member: `HARDLINK_IDENTITY_UNAVAILABLE` |
+| Creating the link fails (no hardlink support on the destination, different filesystem, link limit, permission) | not attempted | copy that member independently; counted in `hardlinks_degraded` | fail the member: `HARDLINK_UNAVAILABLE` (Section 15) |
 | The first member's target is skipped by the existing-destination policy (`--skip-existing`, or `--update` finding it up to date): no `Created` claim | not attempted | not registered; the first member whose target is NOT skipped becomes the anchor (spec Section 91, lines 4339-4340: "the first member whose target the existing-destination policy does not skip"); the skipped member keeps what it was; counted skipped, plus one `hardlinks_degraded` per member that stays separate from the anchor | same as `auto` (the policy, not Flux, chose the split; reported) |
 | The canonical's copy failed | not attempted | the group is FAILED for this run: later members are not copied and are reported `BLOCKED_BY_CANONICAL_FAILURE` (Section 92) | same |
 
