@@ -23,7 +23,8 @@ outside the repository), "full neon" direction, dark only. The mockup supplies p
 - Every rustdoc HTML page that resolves today at the Pages root still reaches the same page after the move to
   `/api/` (redirect stubs, "Old URLs" below), and the build fails if a stub's target is missing.
 - Hero: a headline that points at the chart (no figure, no unconditional "faster" — see the calls below),
-  the live benchmark chart, and the download table.
+  the live benchmark chart, and a call to action that leads to the download table, which sits directly below
+  the hero (amended 2026-10-25 after the final review: the table is its own section, not inside the hero box).
 - The first line states the correctness promise in one sentence ("correctness before performance",
   `README.md:26`), so the speed claim is never bare.
 - A download table with one direct link per release target, and a two-line quickstart: `flux copy ./photos /mnt/backup`, then, labelled "interrupted? run it again with
@@ -84,7 +85,10 @@ outside the repository), "full neon" direction, dark only. The mockup supplies p
   list is an illustration, not the rule: `assemble` computes the set from the actual tree and fails on any
   `site/` entry with a colliding name, so a rustdoc release that adds a top-level name cannot slip past a
   hand-kept list.
-- Step order in the `build` job, each step finishing before the next: `cargo doc`; then `assemble`:
+- Step order in the `build` job, each step finishing before the next: `rm -rf target/doc target/pages-work`
+  (added 2026-10-25: `Swatinem/rust-cache` saves `target/` after removing only the FILES under `target/doc`, so the
+  emptied directory tree of `api/` is restored on the next run on the same cache key and `assemble` would refuse
+  with "api exists"; source `src/cleanup.ts:10-34`, `src/save.ts:50`); `cargo doc`; then `assemble`:
   record the manifest, move everything in `target/doc` into `target/doc/api/` (via a staging directory, since the
   destination is inside the source), write `api/index.html` (the crate list), write the stubs, overlay `site/` onto
   `target/doc`; "Add the benchmark pages" (still last, so `bench/` lands at `target/doc/bench/`, never under
@@ -144,7 +148,8 @@ Owner choice: "full neon" (direction A of the 2026-10-25 mockups), dark only.
 
 - Palette from the owner's mockup: void background `#05060b`, primary accent cyan `#00f0ff`, secondary violet
   `#7000ff`, tertiary blue `#3b82f6`; glass cards (translucent dark fill, thin cyan border, soft glow); a faint
-  cyan grid; one violet glow in a corner; a glowing cyan-to-violet gradient primary button.
+  cyan grid; one violet glow in a corner; a glowing primary button filled from cyan to blue (amended 2026-10-25:
+  dark label text on violet measures 3.0:1, below WCAG AA, so violet stays in the button's glow, not its fill).
 - An animated "flux field" `<canvas>` behind the hero, a few dozen lines of vanilla JS in `site/`. It must not run
   when the visitor has `prefers-reduced-motion: reduce` (draw one still frame or nothing) and it pauses while the
   tab is hidden. The page is fully usable and readable with JavaScript off.
