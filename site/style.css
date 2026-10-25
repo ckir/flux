@@ -119,9 +119,12 @@ h3 { font-size: 1.1rem; margin: 1.6em 0 0.4em; }
   background: #ffffff;
   border-radius: 8px;
   max-width: 100%;
+  padding: 12px;
+  color: #1a1d2b;
 }
 
-.chart-scroll object { display: block; width: 720px; height: 300px; color: #1a1d2b; padding: 12px; }
+.chart-scroll object { display: block; width: 720px; height: 560px; }
+.chart-scroll code { color: inherit; }
 
 figcaption { margin-top: 12px; color: var(--muted); font-size: 0.95rem; }
 
@@ -132,11 +135,11 @@ figcaption { margin-top: 12px; color: var(--muted); font-size: 0.95rem; }
   display: inline-block;
   padding: 13px 28px;
   border-radius: 10px;
-  background: linear-gradient(90deg, var(--cyan), var(--violet));
+  background: linear-gradient(90deg, var(--cyan), var(--blue));
   color: #05060b;
   font-weight: 700;
   text-decoration: none;
-  box-shadow: 0 0 22px rgba(0, 240, 255, 0.45), 0 0 40px rgba(112, 0, 255, 0.3);
+  box-shadow: 0 0 22px rgba(0, 240, 255, 0.45), 0 0 44px rgba(112, 0, 255, 0.5);
 }
 .button:hover { color: #05060b; filter: brightness(1.12); }
 
@@ -188,7 +191,7 @@ td a { font-family: var(--mono); font-size: 0.88rem; word-break: break-all; }
   font-family: var(--mono);
 }
 
-footer { padding: 24px 20px 48px; color: var(--muted); font-size: 0.9rem; }
+footer.wrap { padding-block: 24px 48px; color: var(--muted); font-size: 0.9rem; }
 
 @media (max-width: 480px) {
   .wrap { padding: 0 16px; }
