@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Flux - a safe, topology-aware file copier</title>
+  <meta name="description" content="Flux is a filesystem transfer engine written in Rust, built around correctness, bounded memory and resumable copies.">
+  <meta name="color-scheme" content="dark">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="hero">
+    <canvas id="flux-field" aria-hidden="true"></canvas>
+    <div class="wrap hero-inner">
+      <p class="brand">Flux</p>
+      <p class="promise">High throughput, but <strong>correctness before performance</strong>.</p>
+      <h1>See how Flux compares with <code>cp</code> and <code>rsync</code></h1>
+      <p class="lead">A safe, topology-aware filesystem transfer engine written in Rust: bounded memory, resumable copies, atomic publication where the filesystem allows it.</p>
+
+      <figure class="card chart-card">
+        <div class="chart-scroll">
+          <object data="bench/latest.svg" type="image/svg+xml" width="720" height="300">The chart is published by CI from the latest run of <code>main</code>. Until the first benchmark has run there is nothing here yet.</object>
+        </div>
+        <figcaption>
+          Each figure is Flux's median time divided by another copier's, measured in the same GitHub Actions job: below 1.0, Flux is faster.
+          A pair appears only once its ratio is steady. Linux and macOS are compared with <code>cp</code> and <code>rsync</code>; Windows is compared with <code>robocopy</code>.
+        </figcaption>
+      </figure>
+
+      <div class="cta">
+        <a class="button" href="#download">Download Flux</a>
+        <p class="cta-note">Licensed under <a href="https://github.com/ckir/flux/blob/main/LICENSE">PolyForm Noncommercial 1.0.0</a>. Free for noncommercial use only.</p>
+      </div>
+    </div>
+  </header>
+
+  <main id="main" class="wrap">
+    <section id="download" aria-labelledby="download-h">
+      <h2 id="download-h">Download</h2>
+      <p>Pick the build for your system. Each link fetches the asset from the latest GitHub release.</p>
+      <div class="card table-scroll">
+        <table>
+          <thead>
+            <tr><th scope="col">System</th><th scope="col">Architecture</th><th scope="col">Download</th></tr>
+          </thead>
+          <tbody>
+            <tr><th scope="row">Linux</th><td>x86_64</td><td><a href="https://github.com/ckir/flux/releases/latest/download/flux-x86_64-unknown-linux-gnu.tar.gz">flux-x86_64-unknown-linux-gnu.tar.gz</a></td></tr>
+            <tr><th scope="row">Linux</th><td>aarch64</td><td><a href="https://github.com/ckir/flux/releases/latest/download/flux-aarch64-unknown-linux-gnu.tar.gz">flux-aarch64-unknown-linux-gnu.tar.gz</a></td></tr>
+            <tr><th scope="row">macOS</th><td>Intel (x86_64)</td><td><a href="https://github.com/ckir/flux/releases/latest/download/flux-x86_64-apple-darwin.tar.gz">flux-x86_64-apple-darwin.tar.gz</a></td></tr>
+            <tr><th scope="row">macOS</th><td>Apple silicon (aarch64)</td><td><a href="https://github.com/ckir/flux/releases/latest/download/flux-aarch64-apple-darwin.tar.gz">flux-aarch64-apple-darwin.tar.gz</a></td></tr>
+            <tr><th scope="row">Windows</th><td>x86_64</td><td><a href="https://github.com/ckir/flux/releases/latest/download/flux-x86_64-pc-windows-msvc.zip">flux-x86_64-pc-windows-msvc.zip</a></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Something missing? See <a href="https://github.com/ckir/flux/releases/latest">the latest release</a> on GitHub.</p>
+
+      <h3>Extract and run</h3>
+      <pre class="code"><code>tar -xzf flux-x86_64-unknown-linux-gnu.tar.gz   # Linux and macOS: use the archive you downloaded
+Expand-Archive flux-x86_64-pc-windows-msvc.zip . # Windows (PowerShell); or: unzip flux-x86_64-pc-windows-msvc.zip</code></pre>
+      <p class="note">The binaries are not code-signed, so macOS Gatekeeper or Windows SmartScreen may warn the first time you run one.</p>
+    </section>
+
+    <section id="quickstart" aria-labelledby="quick-h">
+      <h2 id="quick-h">Quickstart</h2>
+      <p>Run the extracted binary from its folder (or put it on your <code>PATH</code>).</p>
+      <h3>Linux and macOS</h3>
+      <pre class="code"><code>./flux copy ./photos /mnt/backup</code></pre>
+      <p>Interrupted? Run it again with <code>--resume</code>:</p>
+      <pre class="code"><code>./flux copy --resume ./photos /mnt/backup</code></pre>
+      <h3>Windows</h3>
+      <pre class="code"><code>.\flux.exe copy .\photos D:\backup</code></pre>
+      <p>Interrupted? Run it again with <code>--resume</code>:</p>
+      <pre class="code"><code>.\flux.exe copy --resume .\photos D:\backup</code></pre>
+    </section>
+
+    <section id="goals" aria-labelledby="goals-h">
+      <h2 id="goals-h">Goals</h2>
+      <ul class="goals">
+        <li>High throughput, but correctness before performance</li>
+        <li>Bounded resident RAM regardless of tree size</li>
+        <li>Deterministic discovery and traversal ordering</li>
+        <li>Hardlink topology preservation, including exclusion-aware dependencies</li>
+        <li>Robust resume after interruption, with checkpoint validation</li>
+        <li>Source-mutation detection</li>
+        <li>Atomic publication where the filesystem allows it</li>
+        <li>Clear human and machine-readable (<code>--json</code>) reporting</li>
+        <li>Cross-platform behaviour on Linux, macOS and Windows with explicit capability detection</li>
+      </ul>
+    </section>
+
+    <section id="pipeline" aria-labelledby="pipe-h">
+      <h2 id="pipe-h">Pipeline</h2>
+      <ol class="pipeline">
+        <li>Source</li>
+        <li>Deterministic scanner</li>
+        <li>Selection / filtering</li>
+        <li>Bounded discovery stream</li>
+        <li>Topology + planning state</li>
+        <li>Bounded transfer queue</li>
+        <li>Parallel workers</li>
+        <li>Streaming hash / verification</li>
+        <li>Commit / atomic rename</li>
+        <li>Report</li>
+      </ol>
+    </section>
+
+    <section id="trend" aria-labelledby="trend-h">
+      <h2 id="trend-h">Benchmark trend</h2>
+      <p>CI publishes the benchmark trend and how it is measured under <a href="bench/">bench/</a>. The page appears after the first benchmark has run.</p>
+    </section>
+
+    <section id="api" aria-labelledby="api-h">
+      <h2 id="api-h">API docs</h2>
+      <p>Rustdoc for each crate in the workspace. Private items are documented, so the audience is contributors.</p>
+      <ul class="crates">
+        <li><a href="api/flux_core/index.html"><code>flux-core</code></a> &mdash; scanner, selection, identity, topology, planner, scheduler, workers, copy, verification, resume</li>
+        <li><a href="api/flux_fs/index.html"><code>flux-fs</code></a> &mdash; portable filesystem abstractions</li>
+        <li><a href="api/flux_platform/index.html"><code>flux-platform</code></a> &mdash; Linux, macOS and Windows implementations</li>
+        <li><a href="api/flux_hash/index.html"><code>flux-hash</code></a> &mdash; streaming hashing (BLAKE3)</li>
+        <li><a href="api/flux_ui/index.html"><code>flux-ui</code></a> &mdash; progress and terminal presentation</li>
+        <li><a href="api/flux/index.html"><code>flux-cli</code></a> &mdash; CLI parsing and dispatch; the <code>flux</code> binary</li>
+      </ul>
+    </section>
+
+    <section id="status" aria-labelledby="status-h">
+      <h2 id="status-h">Status</h2>
+      <div class="card">
+        <p>Flux is in early implementation. <code>flux copy</code> and <code>flux cleanup</code> work, with destination locking and resumable operations. <code>flux verify</code> and <code>flux benchmark</code> do not exist yet.</p>
+        <p>Flux is licensed under the PolyForm Noncommercial License 1.0.0, which does not permit commercial use.</p>
+        <p>Read the <a href="https://github.com/ckir/flux/blob/main/ROADMAP.md">roadmap</a>, the <a href="https://github.com/ckir/flux/blob/main/FLUX_FULL_UPDATED_SPEC_V16.md">specification</a> and the <a href="https://github.com/ckir/flux/blob/main/LICENSE">licence</a>, or browse the <a href="https://github.com/ckir/flux">source on GitHub</a>.</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="wrap">
+    <p>Flux &middot; PolyForm Noncommercial 1.0.0</p>
+  </footer>
+  <script src="flux-field.js" defer></script>
+</body>
+</html>
