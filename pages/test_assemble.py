@@ -254,6 +254,12 @@ class VerifyTests(unittest.TestCase):
         self.assertTrue(any("manifest" in p for p in found), found)
         self.assertFalse(any("landing page" in p or "bad stub" in p for p in found), found)
 
+    def test_all_problems_are_collected_not_just_the_first(self):
+        (self.doc / "api" / "search.index" / "s.js").unlink()
+        (self.doc / "flux_core" / "struct.X.html").write_text("not a stub", encoding="utf-8")
+        (self.doc / "index.html").write_text("<html>other</html>", encoding="utf-8")
+        self.assert_exactly("missing: api/search.index/s.js", "bad stub: flux_core/struct.X.html", "landing page")
+
     def test_cli_exit_codes(self):
         argv = ["verify", "--doc", str(self.doc), "--site", str(self.site), "--work", str(self.work)]
         out = io.StringIO()
