@@ -67,6 +67,15 @@ class StubTests(unittest.TestCase):
         s = stub_html('a"b</script>.html')
         self.assertNotIn('</script>.html', s)
         self.assertNotIn('"b<', s)
+        s = stub_html("q\"'&</script>.html")
+        escaped = "../api/q&quot;&#x27;&amp;&lt;/script&gt;.html"
+        self.assertIn(f'content="0; url={escaped}">', s)  # the refresh attribute
+        self.assertIn(f'<a href="{escaped}">{escaped}</a>', s)  # the link attribute and its text
+        script = s[s.index("<script>") + len("<script>") : s.index("</script>")]
+        for raw in "<>&":
+            self.assertNotIn(raw, script)
+        for escaped in ("\\u003c", "\\u003e", "\\u0026"):
+            self.assertIn(escaped, script)
 
 
 class AssembleTests(unittest.TestCase):
@@ -155,11 +164,14 @@ class AssembleTests(unittest.TestCase):
         self.assert_failed_before_move(before)
 
     def test_unsafe_html_path_fails_before_any_move(self):
-        put(self.doc / "we<ird>.html", "x")
-        before = list_files(self.doc)
-        with self.assertRaises(AssembleError):
-            self.run_assemble()
-        self.assert_failed_before_move(before)
+        for name in ("we<ird>.html", "a b.html", "it's.html"):
+            with self.subTest(name=name):
+                put(self.doc / name, "x")
+                before = list_files(self.doc)
+                with self.assertRaises(AssembleError):
+                    self.run_assemble()
+                self.assert_failed_before_move(before)
+                (self.doc / name).unlink()
 
     def test_work_inside_doc_is_refused(self):
         before = list_files(self.doc)
@@ -236,9 +248,23 @@ class VerifyTests(unittest.TestCase):
 
     def test_missing_static_files_is_named(self):
         shutil.rmtree(self.doc / "api" / "static.files")
-        found = self.problems()
-        self.assertTrue(any("api/static.files" in p for p in found), found)
-        self.assertFalse(any("landing page" in p or "bad stub" in p for p in found), found)
+        # the directory is gone, so its one moved file is also reported missing
+        self.assertEqual(
+            sorted(self.problems()),
+            ["missing: api/static.files directory", "missing: api/static.files/a.css"],
+        )
+
+    def test_verify_passes_with_bench_present(self):
+        put(self.doc / "bench" / "index.html", "<html>bench</html>")
+        self.assertEqual(self.problems(), [])
+
+    def test_missing_site_stylesheet_is_named(self):
+        (self.doc / "style.css").unlink()
+        self.assert_exactly("site file: style.css")
+
+    def test_changed_site_script_is_named(self):
+        (self.doc / "flux-field.js").write_text("var other;", encoding="utf-8")
+        self.assert_exactly("site file: flux-field.js")
 
     def test_bench_under_api_is_named(self):
         (self.doc / "api" / "bench").mkdir()

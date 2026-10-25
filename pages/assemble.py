@@ -155,11 +155,15 @@ def verify(doc: Path, site: Path, work: Path) -> list[str]:
     if (api / "bench").exists():
         problems.append("unexpected: api/bench must not exist (benchmarks belong at /bench/)")
 
-    try:
-        if (doc / "index.html").read_bytes() != (site / "index.html").read_bytes():
-            problems.append("landing page: index.html differs from site/index.html")
-    except OSError as e:
-        problems.append(f"landing page: cannot compare index.html: {e}")
+    for entry in sorted(site.iterdir()) if site.is_dir() else []:
+        label = "landing page" if entry.name == "index.html" else f"site file: {entry.name}"
+        try:
+            if (doc / entry.name).read_bytes() != entry.read_bytes():
+                problems.append(f"{label}: {entry.name} differs from site/{entry.name}")
+        except OSError as e:
+            problems.append(f"{label}: cannot compare {entry.name}: {e}")
+    if not (site / "index.html").is_file():
+        problems.append("landing page: site/index.html is missing")
     return problems
 
 

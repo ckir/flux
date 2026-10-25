@@ -14,13 +14,13 @@
     <canvas id="flux-field" aria-hidden="true"></canvas>
     <div class="wrap hero-inner">
       <p class="brand">Flux</p>
-      <p class="promise">High throughput, but <strong>correctness before performance</strong>.</p>
+      <p class="promise"><strong>Correctness before performance.</strong></p>
       <h1>See how Flux compares with <code>cp</code> and <code>rsync</code></h1>
-      <p class="lead">A safe, topology-aware filesystem transfer engine written in Rust: bounded memory, resumable copies, atomic publication where the filesystem allows it.</p>
+      <p class="lead">A safe, topology-aware filesystem transfer engine written in Rust, designed around correctness, bounded resident memory, resumability and atomic publication where the filesystem allows it.</p>
 
       <figure class="card chart-card">
-        <div class="chart-scroll">
-          <object data="bench/latest.svg" type="image/svg+xml" width="720" height="560">The chart is published by CI from the latest run of <code>main</code>. Until the first benchmark has run there is nothing here yet.</object>
+        <div class="chart-scroll" tabindex="0" role="region" aria-label="Latest benchmark chart">
+          <object data="bench/latest.svg" type="image/svg+xml" width="720" height="560" aria-label="Latest benchmark chart">The chart is published by CI from the latest run of <code>main</code>. Until the first benchmark has run there is nothing here yet.</object>
         </div>
         <figcaption>
           Each figure is Flux's median time divided by another copier's, measured in the same GitHub Actions job: below 1.0, Flux is faster.
@@ -39,7 +39,7 @@
     <section id="download" aria-labelledby="download-h">
       <h2 id="download-h">Download</h2>
       <p>Pick the build for your system. Each link fetches the asset from the latest GitHub release.</p>
-      <div class="card table-scroll">
+      <div class="card table-scroll" tabindex="0" role="region" aria-label="Download links">
         <table>
           <thead>
             <tr><th scope="col">System</th><th scope="col">Architecture</th><th scope="col">Download</th></tr>
@@ -56,7 +56,7 @@
       <p>Something missing? See <a href="https://github.com/ckir/flux/releases/latest">the latest release</a> on GitHub.</p>
 
       <h3>Extract and run</h3>
-      <pre class="code"><code>tar -xzf flux-x86_64-unknown-linux-gnu.tar.gz   # Linux and macOS: use the archive you downloaded
+      <pre class="code" tabindex="0" aria-label="Extract commands"><code>tar -xzf flux-x86_64-unknown-linux-gnu.tar.gz   # Linux and macOS: use the archive you downloaded
 Expand-Archive flux-x86_64-pc-windows-msvc.zip . # Windows (PowerShell); or: unzip flux-x86_64-pc-windows-msvc.zip</code></pre>
       <p class="note">The binaries are not code-signed, so macOS Gatekeeper or Windows SmartScreen may warn the first time you run one.</p>
     </section>
@@ -65,13 +65,13 @@ Expand-Archive flux-x86_64-pc-windows-msvc.zip . # Windows (PowerShell); or: unz
       <h2 id="quick-h">Quickstart</h2>
       <p>Run the extracted binary from its folder (or put it on your <code>PATH</code>).</p>
       <h3>Linux and macOS</h3>
-      <pre class="code"><code>./flux copy ./photos /mnt/backup</code></pre>
+      <pre class="code" tabindex="0" aria-label="Copy command for Linux and macOS"><code>./flux copy ./photos /mnt/backup</code></pre>
       <p>Interrupted? Run it again with <code>--resume</code>:</p>
-      <pre class="code"><code>./flux copy --resume ./photos /mnt/backup</code></pre>
+      <pre class="code" tabindex="0" aria-label="Resume command for Linux and macOS"><code>./flux copy --resume ./photos /mnt/backup</code></pre>
       <h3>Windows</h3>
-      <pre class="code"><code>.\flux.exe copy .\photos D:\backup</code></pre>
+      <pre class="code" tabindex="0" aria-label="Copy command for Windows"><code>.\flux.exe copy .\photos D:\backup</code></pre>
       <p>Interrupted? Run it again with <code>--resume</code>:</p>
-      <pre class="code"><code>.\flux.exe copy --resume .\photos D:\backup</code></pre>
+      <pre class="code" tabindex="0" aria-label="Resume command for Windows"><code>.\flux.exe copy --resume .\photos D:\backup</code></pre>
     </section>
 
     <section id="goals" aria-labelledby="goals-h">

@@ -97,6 +97,37 @@ class Page(HTMLParser):
         return "".join(value for kind, value in self.events if kind == "text")
 
 
+BLOCK_TAGS = {
+    "p", "li", "ul", "ol", "h1", "h2", "h3", "figure", "figcaption", "div", "section", "header",
+    "main", "footer", "table", "tr", "th", "td", "pre", "object", "canvas", "body",
+}
+SPEED_WORDS = re.compile(r"\b(?:faster|quicker|speed|throughput|outperforms?|beats?)\b", re.I)
+# every visible sentence that talks about speed must be one of these, word for word
+ALLOWED_SPEED_SENTENCES = {
+    "Each figure is Flux's median time divided by another copier's, measured in the same GitHub "
+    "Actions job: below 1.0, Flux is faster",
+    "High throughput, but correctness before performance",
+}
+
+
+def sentences(parsed: "Page") -> list[str]:
+    """Visible text split into blocks at block-level tags, then into sentences, whitespace collapsed."""
+    blocks: list[str] = [""]
+    for kind, value in parsed.events:
+        if kind == "tag" and value in BLOCK_TAGS:
+            blocks.append("")
+        elif kind == "text":
+            blocks[-1] += value
+    found: list[str] = []
+    for block in blocks:
+        collapsed = " ".join(block.split())
+        for sentence in re.split(r"(?<=[.!?])\s+", collapsed):
+            sentence = sentence.strip().rstrip(".!?").strip()
+            if sentence:
+                found.append(sentence)
+    return found
+
+
 def page() -> Page:
     return Page(read("index.html"))
 
@@ -178,8 +209,16 @@ class SiteTests(unittest.TestCase):
             "./flux copy ./photos /mnt/backup",
             "./flux copy --resume ./photos /mnt/backup",
             ".\\flux.exe copy .\\photos D:\\backup",
+            ".\\flux.exe copy --resume .\\photos D:\\backup",
         ):
             self.assertIn(command, text)
+        tags = page().tags
+        for cls in ("code", "table-scroll"):
+            scrollers = [a for t, a in tags if cls in a.get("class", "").split()]
+            self.assertTrue(scrollers, cls)
+            for attrs in scrollers:
+                self.assertEqual(attrs.get("tabindex"), "0", f"{cls} is not keyboard-scrollable")
+                self.assertTrue(attrs.get("aria-label"), f"{cls} has no aria-label")
     def test_chart_has_object_fallback(self) -> None:
         parsed = page()
         attrs = parsed.object_attrs
@@ -189,12 +228,19 @@ class SiteTests(unittest.TestCase):
         self.assertEqual(attrs.get("width"), "720")
         self.assertGreaterEqual(int(attrs.get("height", "0")), 560)
         self.assertGreaterEqual(len(parsed.fallback.strip()), 20)
+        self.assertTrue(attrs.get("aria-label"), "the <object> has no accessible name")
+        scrollers = [a for _, a in parsed.tags if "chart-scroll" in a.get("class", "").split()]
+        self.assertEqual(len(scrollers), 1)
+        self.assertEqual(scrollers[0].get("tabindex"), "0", "chart scroller is not keyboard-focusable")
+        self.assertTrue(scrollers[0].get("aria-label"))
         rules = chart_rules(read("style.css"))
         self.assertTrue(rules, "no .chart-scroll object rule in style.css")
         for rule in rules:
             for height in re.findall(r"(?<![-\w])height\s*:\s*(\d+)px", rule):
                 self.assertGreaterEqual(int(height), 560)
             self.assertNotRegex(rule, r"(?<![-\w])padding")
+            for width in re.findall(r"(?<![-\w])width\s*:\s*([^;}\s]+)", rule):
+                self.assertEqual(width, "720px")
     def test_correctness_line_precedes_chart(self) -> None:
         events = page().events
         seen = ""
@@ -216,11 +262,28 @@ class SiteTests(unittest.TestCase):
             self.assertNotIn(banned, lowered)
         self.assertIsNone(re.search(r"\d+(\.\d+)?\s*[x×]", text))
         self.assertIsNone(re.search(r"\d+%\s*faster", text, re.I))
+        for sentence in sentences(page()):
+            if SPEED_WORDS.search(sentence):
+                self.assertIn(sentence, ALLOWED_SPEED_SENTENCES, "unexpected speed sentence")
     def test_licence_and_status_stated(self) -> None:
         text = " ".join(page().text.split())
         self.assertIn("PolyForm Noncommercial", text)
         self.assertIn("early implementation", text.lower())
-        self.assertRegex(text, r"(?i)commercial use is (?:not permitted|not allowed)")
+        self.assertRegex(
+            text,
+            r"(?i)commercial use is (?:not permitted|not allowed)"
+            r"|does not (?:permit|allow) commercial use",
+        )
+        found = sentences(page())
+        unimplemented = [s for s in found if "do not exist yet" in s]
+        self.assertEqual(len(unimplemented), 1, unimplemented)
+        self.assertIn("flux verify", unimplemented[0])
+        self.assertIn("flux benchmark", unimplemented[0])
+        for sentence in found:
+            if re.search(r"commercial use", sentence, re.I):
+                self.assertRegex(sentence, r"(?i)\bnot\b|\bno\b|\bnon", "commercial use must be negated")
+        self.assertIn("robocopy", text)
+        self.assertIn("only once its ratio is steady", text)
     def test_install_lines_and_unsigned_note_present(self) -> None:
         text = page().text
         self.assertIn("tar -xzf", text)

@@ -45,7 +45,8 @@ a { color: var(--cyan); text-underline-offset: 3px; }
 a:hover { color: #7df7ff; }
 
 a:focus-visible,
-.button:focus-visible {
+.button:focus-visible,
+[tabindex="0"]:focus-visible {
   outline: 3px solid #ffffff;
   outline-offset: 3px;
   border-radius: 4px;
