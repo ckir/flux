@@ -93,7 +93,8 @@ a new persisted format, and reports every case where it could not.
 ### The index
 
 A per-run, disk-backed map `source FileIdentity (Strong) -> (destination path of the anchor, the anchor's destination
-ObjectId)`. The ObjectId is read when the anchor is registered, so that just before linking the run can check that the
+ObjectId)`. The ObjectId is read when the anchor is registered (the fresh path already carries it: `o.published_identity`,
+`tree.rs:1877`), so that just before linking the run can check that the
 anchor is still the object it registered (spec Section 16.1: "each step revalidates ownership as Section 99
 requires"); a deleted or replaced anchor must never become a link to a stranger.
 
@@ -128,17 +129,17 @@ remain usage errors (`crates/flux-cli/src/main.rs:37`), so a group that spans ro
 |---|---|---|---|
 | `nlink <= 1` on a file with `Strong` identity | as today | as today | as today |
 | `nlink` unknown (`None`) on a file with `Strong` identity | as today | not a candidate; one aggregated warning per operation, counted as unverified | same as `auto` (author's call: the platform state is exotic, and failing every file would make `preserve` unusable) |
-| The anchor is gone, or is no longer the object registered, when a member is about to link | not attempted | copy that member independently; counted degraded | fail the member: `HARDLINK_UNAVAILABLE` |
+| The anchor is gone, or is no longer the object registered, or cannot be checked (the destination identity is not `Strong`), when a member is about to link | not attempted | copy that member independently; counted degraded | fail the member: `HARDLINK_UNAVAILABLE` |
 | A file with `nlink > 1` whose source identity is `Weak` or `Unavailable` (Section 108, lines 5242-5285; a file with `nlink <= 1` is never affected by identity strength, so `preserve` on FAT or NFS still copies ordinary files) | as today | copy independently, never infer equivalence; one aggregated warning per filesystem/operation; counted degraded | fail the member: `HARDLINK_IDENTITY_UNAVAILABLE` |
 | Creating the link fails (no hardlink support on the destination, different filesystem, link limit, permission) | not attempted | copy that member independently; counted degraded | fail the member: `HARDLINK_UNAVAILABLE` (Section 15) |
-| The anchor was not created by this run (skipped by `--skip-existing` or `--update`, no `Created` claim) | not attempted | not registered; members copied independently; counted degraded | fail the members: `HARDLINK_UNAVAILABLE` |
+| The first member's target is skipped by the existing-destination policy (`--skip-existing`, or `--update` finding it up to date): no `Created` claim | not attempted | not registered; the first member whose target is NOT skipped becomes the anchor (spec Section 91, lines 4339-4340: "the first member whose target the existing-destination policy does not skip"); the skipped member keeps what it was; counted skipped, plus one `hardlinks_degraded` per member that stays separate from the anchor | same as `auto` (the policy, not Flux, chose the split; reported) |
 | The canonical's copy failed | not attempted | the group is FAILED for this run: later members are not copied and are reported `BLOCKED_BY_CANONICAL_FAILURE` (Section 92) | same |
 
 `copy` performs no identity lookup (Section 108, last paragraph) and reports nothing about links.
 
 The no-claims path (`tree.rs:1559-1561`: a lockless copy, or an identity that cannot key claims) does not link: with
-no claim there is no `Created` record to make an anchor, so it behaves as the "anchor not created by this operation"
-row (`auto` copies independently and reports; `preserve` fails the member).
+no claim there is no `Created` record to make an anchor. Under `auto` every member of a group is copied independently
+and counted `hardlinks_degraded`; under `preserve` the members of a group fail with `HARDLINK_UNAVAILABLE`.
 
 ### Resume (R2: rebuild from the walk)
 
