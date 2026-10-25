@@ -363,6 +363,38 @@ class SiteTests(unittest.TestCase):
             self.assertIn("var(--cyan)", value)
             self.assertIn("var(--blue)", value)
 
+    def test_ids_are_unique(self) -> None:
+        ids = [attrs["id"] for _, attrs in page().tags if "id" in attrs]
+        self.assertGreaterEqual(len(ids), 10, "too few ids found; did the parse come back empty?")
+        duplicated = sorted({value for value in ids if ids.count(value) > 1})
+        self.assertEqual(duplicated, [], f"duplicate ids: {duplicated}")
+
+    def test_in_page_references_resolve(self) -> None:
+        parsed = page()
+        ids = {attrs["id"] for _, attrs in parsed.tags if "id" in attrs}
+        references: list[tuple[str, str]] = []  # (kind, target)
+        for tag, attrs in parsed.tags:
+            if tag == "a" and attrs.get("href", "").startswith("#") and len(attrs["href"]) > 1:
+                references.append(("href", attrs["href"][1:]))
+            for name in ("aria-labelledby", "aria-describedby", "aria-controls"):
+                references.extend((name, token) for token in attrs.get(name, "").split())
+            if tag == "label" and attrs.get("for"):
+                references.append(("for", attrs["for"]))
+        self.assertTrue(any(kind == "href" for kind, _ in references), "no in-page anchor found")
+        labelled = [target for kind, target in references if kind == "aria-labelledby"]
+        self.assertGreaterEqual(len(labelled), 5, "too few aria-labelledby references found")
+        self.assertIn("main", ids, "the skip link target #main does not exist")
+        dangling = sorted({f"{kind}={target}" for kind, target in references if target not in ids})
+        self.assertEqual(dangling, [], f"references to ids that do not exist: {dangling}")
+
+    def test_heading_levels_do_not_skip(self) -> None:
+        levels = [int(tag[1]) for tag, _ in page().tags if re.fullmatch(r"h[1-6]", tag)]
+        self.assertGreaterEqual(len(levels), 8, "too few headings found")
+        self.assertEqual(levels[0], 1, f"the first heading is h{levels[0]}, not h1")
+        self.assertEqual(levels.count(1), 1, f"expected exactly one h1, found {levels.count(1)}")
+        for previous, current in zip(levels, levels[1:]):
+            self.assertLessEqual(current, previous + 1, f"h{current} follows h{previous} in {levels}")
+
 
 if __name__ == "__main__":
     unittest.main()
