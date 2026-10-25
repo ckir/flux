@@ -103,8 +103,11 @@ requires"); a deleted or replaced anchor must never become a link to a stranger.
 - Created lazily the first time a file with `nlink > 1` and `Strong` identity is met, in the operation's own directory
   under `DEST/.flux/operations/<id>/` (name: builder's choice), a `redb` file with a fixed page cache like
   `claims.rs:22`, `Durability::None`, no fsync. Resident memory is the cache, not the group count.
-- Removed when the run ends, success or failure. A crash leaves it behind; the existing sweep/cleanup removes it
-  (`flux cleanup` already treats an operation directory's leftovers). No run ever reads a previous run's index, and
+- Removed by the run when it ends, success or failure, except when the run lost the destination's lock (it then owns
+  nothing there; plan ruling 15). A crash leaves it behind: the workspace retire path removes only the names it knows
+  (`crates/flux-core/src/state.rs:1003-1040`, `finish_retire`; a stranger keeps the workspace), so the index's name
+  is added to that list (plan ruling 1; an earlier draft of this paragraph said the existing cleanup "already" removed
+  it, which was wrong). No run ever reads a previous run's index, and
   that is enforced, not assumed: a `--resume` continues the prior operation in the same operation directory
   (`main.rs:97`), so the run removes any existing index file of that name before it creates a fresh one.
 - Only identities of files with `nlink > 1` enter it. The key is the full source `ObjectId` (volume and index), so it
@@ -273,6 +276,29 @@ Cut order with a per-run disk-backed index and no persisted format; `--hardlinks
   `HardlinkIdentityUnavailable`.
 - Groups may link across several source roots in one operation.
 - Name: cut 12, on branch `spec/hardlinks`.
+
+### Plan rulings (2026-10-26, refinements made while planning; the plan's "Plan rulings" section is the full list)
+
+- The index file is named `hardlinks.db` and is a known name of the workspace retire path (correction above).
+- A link candidate (`nlink > 1`, `Strong`) is never staged into a Strict-durability directory batch: a batched
+  canonical would publish after its dependents are met. Such files publish one by one, as symlinks do.
+- The tree reads the source metadata once per file and shares it with the checkpoint, resume and policy readers, so
+  an ordinary file in a checkpointing run pays no extra system call.
+- `--hardlinks` is not recorded in the manifest; a `--resume` may change the mode.
+- The index's failed entry names the canonical (its claim key) so the dependent's record can say which member failed;
+  `BLOCKED_BY_CANONICAL_FAILURE` is a `Code` (it is in the spec's error catalogue) and counts as a failed file.
+- An anchor entry's destination object is optional: absent for a dry run and for an anchor whose destination
+  identity is not `Strong`; a live member meeting an absent object treats the anchor as unverifiable.
+- The anchor's directory is opened from a second handle on DEST, obtained by resolving DEST once more (the
+  §149.7 exemption) and checked against the walk's root identity.
+- A linked member is counted in `files_hardlinked` only, never in `files_copied`; the summary line also gains
+  `; N hardlinked`.
+- A member skipped by the existing-file policy before its group has an anchor is recorded in the index as skipped,
+  never linked to, and counted as degraded only when a later member becomes the anchor (the table's "stays separate
+  from the anchor"); a destination that is already correctly linked, copied under `--skip-existing`, reports nothing.
+- Index I/O failures, an unopenable workspace and a missing anchor root are all "cannot check": `auto` degrades and
+  counts, `preserve` fails the member; nothing aborts the run. The non-weak degradations carry one aggregated warning
+  with an example (`hardlinks_unlinked`), beside the §108 weak-identity warning.
 
 ## Left to the builder
 
