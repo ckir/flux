@@ -8,7 +8,10 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -17,7 +20,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from assemble import AssembleError, assemble, list_files, rel_target, stub_html  # noqa: E402
+from assemble import AssembleError, assemble, list_files, main, rel_target, stub_html, verify  # noqa: E402
 
 TEMPLATE_TEXT = (HERE / "api-index.html").read_bytes()
 
@@ -80,15 +83,18 @@ class AssembleTests(unittest.TestCase):
     def run_assemble(self):
         assemble(self.doc, self.site, self.template, self.work)
 
-    def assert_failed_before_move(self, before):
+    def assert_failed_before_move(self, before, work=None):
         self.assertEqual(list_files(self.doc), before)
         self.assertFalse((self.doc / "api").exists())
+        self.assertFalse(work.exists() if work is not None else self.work.exists())
 
     def test_moves_every_file_and_stubs_every_html_path(self):
         before = list_files(self.doc)
+        contents = {p: (self.doc / p).read_bytes() for p in before}
         self.run_assemble()
         for p in before:
             self.assertTrue((self.doc / "api" / p).is_file(), p)
+            self.assertEqual((self.doc / "api" / p).read_bytes(), contents[p], p)
             if p.endswith(".html"):
                 self.assertEqual((self.doc / p).read_text(encoding="utf-8"), stub_html(p), p)
 
@@ -159,7 +165,108 @@ class AssembleTests(unittest.TestCase):
         before = list_files(self.doc)
         with self.assertRaises(AssembleError):
             assemble(self.doc, self.site, self.template, self.doc / "work")
+        self.assert_failed_before_move(before, self.doc / "work")
+
+    def test_root_index_html_in_doc_collides_with_site_index(self):
+        put(self.doc / "index.html", "<html>rustdoc root</html>")
+        before = list_files(self.doc)
+        with self.assertRaises(AssembleError):
+            self.run_assemble()
         self.assert_failed_before_move(before)
+
+    def test_main_reports_assemble_error_on_stderr_and_returns_1(self):
+        argv = ["assemble", "--doc", str(self.doc), "--site", str(self.site),
+                "--template", str(self.template), "--work", str(self.work)]
+        (self.doc / "api").mkdir()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(main(argv), 1)
+        self.assertTrue(err.getvalue().startswith("error: "), err.getvalue())
+        (self.doc / "api").rmdir()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(main(argv), 0)
+        self.assertTrue((self.doc / "api" / "index.html").is_file())
+
+
+class VerifyTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.doc = make_doc(root)
+        self.site = make_site(root)
+        template = root / "api-index.html"
+        template.write_bytes(TEMPLATE_TEXT)
+        self.work = root / "work"
+        assemble(self.doc, self.site, template, self.work)
+
+    def problems(self):
+        return verify(self.doc, self.site, self.work)
+
+    def assert_exactly(self, *needles):
+        found = self.problems()
+        self.assertEqual(len(found), len(needles), found)
+        for needle in needles:
+            self.assertEqual(sum(needle in p for p in found), 1, (needle, found))
+
+    def test_clean_tree_passes(self):
+        self.assertEqual(self.problems(), [])
+
+    def test_verify_passes_without_bench(self):
+        self.assertFalse((self.doc / "bench").exists())
+        self.assertFalse((self.doc / "api" / "bench").exists())
+        self.assertEqual(self.problems(), [])
+
+    def test_missing_moved_file_is_named(self):
+        (self.doc / "api" / "search.index" / "s.js").unlink()
+        self.assert_exactly("missing: api/search.index/s.js")
+
+    def test_missing_stub_is_named(self):
+        (self.doc / "help.html").unlink()
+        self.assert_exactly("bad stub: help.html")
+
+    def test_overwritten_stub_is_named(self):
+        (self.doc / "flux_core" / "index.html").write_text("not a stub", encoding="utf-8")
+        self.assert_exactly("bad stub: flux_core/index.html")
+
+    def test_missing_api_index_is_named(self):
+        (self.doc / "api" / "index.html").unlink()
+        self.assert_exactly("api/index.html")
+
+    def test_missing_static_files_is_named(self):
+        shutil.rmtree(self.doc / "api" / "static.files")
+        found = self.problems()
+        self.assertTrue(any("api/static.files" in p for p in found), found)
+        self.assertFalse(any("landing page" in p or "bad stub" in p for p in found), found)
+
+    def test_bench_under_api_is_named(self):
+        (self.doc / "api" / "bench").mkdir()
+        self.assert_exactly("api/bench")
+
+    def test_changed_landing_page_is_named(self):
+        (self.doc / "index.html").write_text("<html>other</html>", encoding="utf-8")
+        self.assert_exactly("landing page")
+
+    def test_missing_manifest_is_reported(self):
+        (self.work / "manifest.json").unlink()
+        found = self.problems()
+        self.assertTrue(any("manifest" in p for p in found), found)
+        self.assertFalse(any("landing page" in p or "bad stub" in p for p in found), found)
+
+    def test_cli_exit_codes(self):
+        argv = ["verify", "--doc", str(self.doc), "--site", str(self.site), "--work", str(self.work)]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(main(argv), 0)
+        manifest = json.loads((self.work / "manifest.json").read_text(encoding="utf-8"))
+        stubs = sum(1 for p in manifest if p.endswith(".html"))
+        self.assertEqual(out.getvalue(), f"verify: ok ({len(manifest)} files, {stubs} stubs)\n")
+        (self.doc / "help.html").unlink()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(main(argv), 1)
+        self.assertIn("bad stub: help.html", err.getvalue())
 
 
 if __name__ == "__main__":

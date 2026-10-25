@@ -123,6 +123,46 @@ def assemble(doc: Path, site: Path, template: Path, work: Path) -> None:
         shutil.copyfile(entry, doc / entry.name)
 
 
+def verify(doc: Path, site: Path, work: Path) -> list[str]:
+    doc, site, work = Path(doc), Path(site), Path(work)
+    problems: list[str] = []
+    manifest: list[str] = []
+    try:
+        loaded = json.loads((work / "manifest.json").read_text(encoding="utf-8"))
+        if not isinstance(loaded, list) or not all(isinstance(p, str) for p in loaded):
+            raise ValueError("not a list of paths")
+        manifest = loaded
+    except (OSError, ValueError) as e:
+        problems.append(f"manifest unreadable: {work / 'manifest.json'}: {e}")
+
+    api = doc / "api"
+    for path in manifest:
+        if not (api / path).is_file():
+            problems.append(f"missing: api/{path}")
+        if path.endswith(".html"):
+            stub = doc / path
+            try:
+                ok = stub.is_file() and stub.read_text(encoding="utf-8") == stub_html(path)
+            except (OSError, ValueError):
+                ok = False
+            if not ok:
+                problems.append(f"bad stub: {path}")
+
+    if not (api / "index.html").is_file():
+        problems.append("missing: api/index.html")
+    if not (api / "static.files").is_dir():
+        problems.append("missing: api/static.files directory")
+    if (api / "bench").exists():
+        problems.append("unexpected: api/bench must not exist (benchmarks belong at /bench/)")
+
+    try:
+        if (doc / "index.html").read_bytes() != (site / "index.html").read_bytes():
+            problems.append("landing page: index.html differs from site/index.html")
+    except OSError as e:
+        problems.append(f"landing page: cannot compare index.html: {e}")
+    return problems
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -131,6 +171,10 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--site", type=Path, default=Path("site"))
     a.add_argument("--template", type=Path, default=Path("pages/api-index.html"))
     a.add_argument("--work", type=Path, default=Path("target/pages-work"))
+    v = sub.add_parser("verify", help="check the assembled tree against the pre-move manifest")
+    v.add_argument("--doc", type=Path, default=Path("target/doc"))
+    v.add_argument("--site", type=Path, default=Path("site"))
+    v.add_argument("--work", type=Path, default=Path("target/pages-work"))
     args = parser.parse_args(argv)
     try:
         if args.command == "assemble":
@@ -138,6 +182,15 @@ def main(argv: list[str] | None = None) -> int:
             manifest = json.loads((args.work / "manifest.json").read_text(encoding="utf-8"))
             stubs = sum(1 for p in manifest if p.endswith(".html"))
             print(f"assemble: ok ({len(manifest)} files, {stubs} stubs)")
+        else:
+            problems = verify(args.doc, args.site, args.work)
+            if problems:
+                for problem in problems:
+                    print(problem, file=sys.stderr)
+                return 1
+            manifest = json.loads((args.work / "manifest.json").read_text(encoding="utf-8"))
+            stubs = sum(1 for p in manifest if p.endswith(".html"))
+            print(f"verify: ok ({len(manifest)} files, {stubs} stubs)")
     except AssembleError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
