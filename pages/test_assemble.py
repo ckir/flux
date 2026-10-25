@@ -11,15 +11,19 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import shutil
 import sys
 import tempfile
 import unittest
+from html.parser import HTMLParser
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
+import assemble as assemble_module  # noqa: E402
 from assemble import AssembleError, assemble, list_files, main, rel_target, stub_html, verify  # noqa: E402
 
 TEMPLATE_TEXT = (HERE / "api-index.html").read_bytes()
@@ -76,6 +80,40 @@ class StubTests(unittest.TestCase):
             self.assertNotIn(raw, script)
         for escaped in ("\\u003c", "\\u003e", "\\u0026"):
             self.assertIn(escaped, script)
+
+    def test_stub_has_a_visible_link_for_visitors_without_javascript(self):
+        class Anchors(HTMLParser):
+            def __init__(self, source):
+                super().__init__(convert_charrefs=True)
+                self.found = []  # (href, text) of every <a> inside <body>
+                self._in_body = False
+                self._current = None
+                self.feed(source)
+                self.close()
+
+            def handle_starttag(self, tag, attrs):
+                if tag == "body":
+                    self._in_body = True
+                elif tag == "a" and self._in_body:
+                    self._current = [dict(attrs).get("href"), ""]
+
+            def handle_data(self, data):
+                if self._current is not None:
+                    self._current[1] += data
+
+            def handle_endtag(self, tag):
+                if tag == "a" and self._current is not None:
+                    self.found.append(tuple(self._current))
+                    self._current = None
+                elif tag == "body":
+                    self._in_body = False
+
+        for rel, target in (
+            ("flux_core/struct.X.html", "../api/flux_core/struct.X.html"),
+            ("help.html", "api/help.html"),
+        ):
+            with self.subTest(rel=rel):
+                self.assertEqual(Anchors(stub_html(rel)).found, [(target, target)])
 
 
 class AssembleTests(unittest.TestCase):
@@ -164,14 +202,21 @@ class AssembleTests(unittest.TestCase):
         self.assert_failed_before_move(before)
 
     def test_unsafe_html_path_fails_before_any_move(self):
-        for name in ("we<ird>.html", "a b.html", "it's.html"):
+        names = (
+            "we<ird>.html", "a b.html", "it's.html",
+            "bad<dir>/index.html", "a b/c.html", "it's/x.html",  # safe file name, unsafe directory
+        )
+        for name in names:
             with self.subTest(name=name):
                 put(self.doc / name, "x")
                 before = list_files(self.doc)
                 with self.assertRaises(AssembleError):
                     self.run_assemble()
                 self.assert_failed_before_move(before)
-                (self.doc / name).unlink()
+                if "/" in name:
+                    shutil.rmtree(self.doc / name.split("/", 1)[0])
+                else:
+                    (self.doc / name).unlink()
 
     def test_work_inside_doc_is_refused(self):
         before = list_files(self.doc)
@@ -199,6 +244,65 @@ class AssembleTests(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             self.assertEqual(main(argv), 0)
         self.assertTrue((self.doc / "api" / "index.html").is_file())
+
+    def test_missing_inputs_raise_assemble_error_before_any_move(self):
+        def remove_doc(root):
+            shutil.rmtree(root / "doc")
+
+        def remove_template(root):
+            (root / "api-index.html").unlink()
+
+        def remove_site(root):
+            shutil.rmtree(root / "site")
+
+        for label, remove in (("doc", remove_doc), ("template", remove_template), ("site", remove_site)):
+            with self.subTest(missing=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                doc = make_doc(root)
+                site = make_site(root)
+                template = root / "api-index.html"
+                template.write_bytes(TEMPLATE_TEXT)
+                work = root / "work"
+                remove(root)
+                before = list_files(doc) if doc.exists() else None
+                with self.assertRaises(AssembleError):
+                    assemble(doc, site, template, work)
+                if before is not None:
+                    self.assertEqual(list_files(doc), before)
+                    self.assertFalse((doc / "api").exists())
+                self.assertFalse(work.exists())
+                argv = ["assemble", "--doc", str(doc), "--site", str(site),
+                        "--template", str(template), "--work", str(work)]
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(main(argv), 1)
+                self.assertTrue(err.getvalue().startswith("error: "), err.getvalue())
+                self.assertNotIn("Traceback", err.getvalue())
+                self.assertFalse(work.exists())
+
+    def test_assemble_recovers_from_a_stale_staging_directory(self):
+        put(self.work / "staging" / "stale.txt", "left over from a crashed run")
+        self.run_assemble()
+        self.assertFalse((self.doc / "api" / "stale.txt").exists())
+        self.assertEqual(verify(self.doc, self.site, self.work), [])
+
+    def test_cli_defaults_match_what_the_workflows_rely_on(self):
+        start = Path.cwd()
+        with tempfile.TemporaryDirectory() as tmp:
+            put(Path(tmp) / "target" / "pages-work" / "manifest.json", "[]")
+            os.chdir(tmp)
+            try:
+                with mock.patch.object(assemble_module, "assemble") as fake_assemble, \
+                        mock.patch.object(assemble_module, "verify", return_value=[]) as fake_verify, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(main(["assemble"]), 0)
+                    self.assertEqual(main(["verify"]), 0)
+            finally:
+                os.chdir(start)
+        fake_assemble.assert_called_once_with(
+            Path("target/doc"), Path("site"), Path("pages/api-index.html"), Path("target/pages-work")
+        )
+        fake_verify.assert_called_once_with(Path("target/doc"), Path("site"), Path("target/pages-work"))
 
 
 class VerifyTests(unittest.TestCase):
@@ -279,6 +383,14 @@ class VerifyTests(unittest.TestCase):
         found = self.problems()
         self.assertTrue(any("manifest" in p for p in found), found)
         self.assertFalse(any("landing page" in p or "bad stub" in p for p in found), found)
+
+    def test_corrupt_manifest_is_reported_not_raised(self):
+        for content in ("{not json", '{"a": 1}', "[1, 2]"):
+            with self.subTest(content=content):
+                (self.work / "manifest.json").write_text(content, encoding="utf-8")
+                found = self.problems()
+                self.assertEqual(len(found), 1, found)
+                self.assertIn("manifest", found[0])
 
     def test_all_problems_are_collected_not_just_the_first(self):
         (self.doc / "api" / "search.index" / "s.js").unlink()
