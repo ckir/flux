@@ -74,6 +74,14 @@ jobs:
       - run: cargo doc --workspace --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: -D warnings
+      # The same site assembly docs.yml runs after a merge, so a broken one fails the PR
+      # instead of the deploy.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - run: python -W error -m unittest discover -s pages -p "test_*.py"
+      - run: python pages/assemble.py assemble
+      - run: python pages/assemble.py verify
 
   license:
     name: Licence headers
