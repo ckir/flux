@@ -106,6 +106,18 @@ def strip_js_comments(js: str) -> str:
     return re.sub(r"(?m)//.*$", "", js)
 
 
+URL_ATTRS = ("src", "href", "xlink:href", "data", "srcset", "poster", "action")
+
+
+def chart_rules(css: str) -> list[str]:
+    """Bodies of every CSS rule whose selector targets the object inside .chart-scroll."""
+    return [
+        body
+        for selector, body in re.findall(r"([^{}]+)\{([^{}]*)\}", css)
+        if re.search(r"\.chart-scroll\s+object\b", selector)
+    ]
+
+
 def is_external(value: str) -> bool:
     value = value.strip().lower()
     return value.startswith(("http:", "https:", "//"))
@@ -126,16 +138,24 @@ class SiteTests(unittest.TestCase):
     def test_no_external_resources(self) -> None:
         parsed = page()
         for tag, attrs in parsed.tags:
-            self.assertNotIn(tag, {"iframe", "embed", "source"}, f"<{tag}> is forbidden")
-            for name in ("src", "data", "srcset", "poster", "action"):
+            self.assertNotIn(tag, {"iframe", "embed", "source", "base"}, f"<{tag}> is forbidden")
+            for name in URL_ATTRS:
+                if tag == "a" and name == "href":
+                    continue  # anchors are checked against the allow-list in the links test
                 self.assertFalse(is_external(attrs.get(name, "")), f"<{tag} {name}> is external")
-            if tag == "link":
-                self.assertFalse(is_external(attrs.get("href", "")), "<link href> is external")
+            self.assertIsNone(
+                re.search(r"url\(\s*[\"']?\s*(?:[a-z][a-z0-9+.-]*:|//)", attrs.get("style", ""), re.I),
+                f"<{tag} style> loads an external url",
+            )
         css = read("style.css")
         self.assertNotIn("@import", css)
         self.assertIsNone(re.search(r"url\(\s*[\"']?\s*(?:[a-z][a-z0-9+.-]*:|//)", css, re.I))
     def test_internal_links_are_relative(self) -> None:
         parsed = page()
+        for tag, attrs in parsed.tags:
+            for name in ("src", "href", "xlink:href"):
+                value = attrs.get(name, "").strip()
+                self.assertFalse(value.startswith("/"), f"<{tag} {name}={value}> is root-relative")
         for href in parsed.hrefs:
             self.assertFalse(href.startswith("/"), f"root-relative or protocol-relative link {href}")
             if re.match(r"[a-z][a-z0-9+.-]*:", href, re.I):
@@ -169,6 +189,12 @@ class SiteTests(unittest.TestCase):
         self.assertEqual(attrs.get("width"), "720")
         self.assertGreaterEqual(int(attrs.get("height", "0")), 560)
         self.assertGreaterEqual(len(parsed.fallback.strip()), 20)
+        rules = chart_rules(read("style.css"))
+        self.assertTrue(rules, "no .chart-scroll object rule in style.css")
+        for rule in rules:
+            for height in re.findall(r"(?<![-\w])height\s*:\s*(\d+)px", rule):
+                self.assertGreaterEqual(int(height), 560)
+            self.assertNotRegex(rule, r"(?<![-\w])padding")
     def test_correctness_line_precedes_chart(self) -> None:
         events = page().events
         seen = ""
@@ -204,8 +230,9 @@ class SiteTests(unittest.TestCase):
     def test_canvas_script_honours_reduced_motion_and_hidden_tab(self) -> None:
         js = strip_js_comments(read("flux-field.js"))
         self.assertRegex(js, r"matchMedia\([^)]*prefers-reduced-motion")
-        for needed in ("visibilitychange", "document.hidden", "cancelAnimationFrame"):
-            self.assertIn(needed, js)
+        self.assertRegex(js, r"addEventListener\(\s*[\"']visibilitychange[\"']")
+        self.assertRegex(js, r"document\.hidden\b(?!\s*=[^=])")
+        self.assertRegex(js, r"cancelAnimationFrame\(")
 
 if __name__ == "__main__":
     unittest.main()
