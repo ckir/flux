@@ -17,7 +17,8 @@ a new persisted format, and reports every case where it could not.
 
 ## What exists today (read before designing)
 
-- The walk is sequential and deterministic; the canonical member of a group (spec Section 13, lines 1124-1160) is
+- The walk is sequential and deterministic (each directory's entries sorted by name bytes, depth first,
+  `crates/flux-core/src/walk.rs:153-162`); the canonical member of a group (spec Section 13, lines 1124-1160) is
   therefore always met before its dependents. Sections 91 and 94 (compare-and-swap claims, a hold queue; lines
   4314-4560) exist for parallel workers, which Flux does not have (`ROADMAP.md`, Phase 3).
 - Every walked entry carries `Metadata.identity: FileIdentity` (`Strong`, `Weak` or `Unavailable`,
@@ -101,7 +102,8 @@ requires"); a deleted or replaced anchor must never become a link to a stranger.
   `claims.rs:22`, `Durability::None`, no fsync. Resident memory is the cache, not the group count.
 - Removed when the run ends, success or failure. A crash leaves it behind; the existing sweep/cleanup removes it
   (`flux cleanup` already treats an operation directory's leftovers). No run ever reads a previous run's index.
-- Only identities of files with `nlink > 1` enter it. The index is scoped by filesystem identity (Section 109).
+- Only identities of files with `nlink > 1` enter it. The key is the full source `ObjectId` (volume and index), so it
+  is scoped by filesystem identity (Section 109); the aggregated warnings are per source filesystem.
 - One index per operation. With several sources (one operation), a group whose members sit under different roots can
   link across roots; the canonical is the first member in processing order.
 
@@ -115,7 +117,9 @@ For a file with `nlink > 1` and `Strong` identity, under `auto` or `preserve`:
    the policy proceeds, check that the anchor is still the registered object, then run the Section 16.1 link steps
    against the anchor's destination path. On success count `files_hardlinked`.
 
-A single-file copy has one name, so it has no group. With several sources (one operation), `--resume` and `--dry-run`
+Topology is preserved over the selected namespace only (Section 14): a file whose other names lie outside the walk
+is an ordinary copy, not a degradation, and the destination's link count equals the number of selected members
+linked, not the source's `nlink`. A single-file copy has one name, so it has no group. With several sources (one operation), `--resume` and `--dry-run`
 remain usage errors (`crates/flux-cli/src/main.rs:37`), so a group that spans roots only arises for fresh copies.
 
 ### Modes and failures (the table)
@@ -125,12 +129,16 @@ remain usage errors (`crates/flux-cli/src/main.rs:37`), so a group that spans ro
 | `nlink <= 1` on a file with `Strong` identity | as today | as today | as today |
 | `nlink` unknown (`None`) on a file with `Strong` identity | as today | not a candidate; one aggregated warning per operation, counted as unverified | same as `auto` (author's call: the platform state is exotic, and failing every file would make `preserve` unusable) |
 | The anchor is gone, or is no longer the object registered, when a member is about to link | not attempted | copy that member independently; counted degraded | fail the member: `HARDLINK_UNAVAILABLE` |
-| Source identity `Weak` or `Unavailable` (Section 108, lines 5242-5285) | as today | copy independently, never infer equivalence; one aggregated warning per filesystem/operation; counted degraded | fail the member: `HARDLINK_IDENTITY_UNAVAILABLE` |
+| A file with `nlink > 1` whose source identity is `Weak` or `Unavailable` (Section 108, lines 5242-5285; a file with `nlink <= 1` is never affected by identity strength, so `preserve` on FAT or NFS still copies ordinary files) | as today | copy independently, never infer equivalence; one aggregated warning per filesystem/operation; counted degraded | fail the member: `HARDLINK_IDENTITY_UNAVAILABLE` |
 | Creating the link fails (no hardlink support on the destination, different filesystem, link limit, permission) | not attempted | copy that member independently; counted degraded | fail the member: `HARDLINK_UNAVAILABLE` (Section 15) |
 | The anchor was not created by this run (skipped by `--skip-existing` or `--update`, no `Created` claim) | not attempted | not registered; members copied independently; counted degraded | fail the members: `HARDLINK_UNAVAILABLE` |
 | The canonical's copy failed | not attempted | the group is FAILED for this run: later members are not copied and are reported `BLOCKED_BY_CANONICAL_FAILURE` (Section 92) | same |
 
 `copy` performs no identity lookup (Section 108, last paragraph) and reports nothing about links.
+
+The no-claims path (`tree.rs:1559-1561`: a lockless copy, or an identity that cannot key claims) does not link: with
+no claim there is no `Created` record to make an anchor, so it behaves as the "anchor not created by this operation"
+row (`auto` copies independently and reports; `preserve` fails the member).
 
 ### Resume (R2: rebuild from the walk)
 
@@ -145,14 +153,33 @@ then link exactly as in a fresh run. The four crash points:
   policy it is replaced by an identical link (Section 16.1: "an existing correct link never causes a failure"); under
   `--skip-existing` or `--update` it is left, and it is already a correct link.
 
-A completed member whose destination object is not the anchor's object (for example an independent copy from an
-earlier `--hardlinks=copy` run) is relinked under `auto` and `preserve` (an atomic rename of the same bytes), counted
-`files_hardlinked`. `--restart` starts a fresh operation; it never reads the prior index.
+"Created by this operation" means: this operation holds a `Created` claim whose target is the entry's path. A resume
+continues the prior operation as itself (`main.rs:97`), so its earlier `Created` claims count; an `Existing` claim, or
+none (a file skipped by `--skip-existing` or `--update`, or an unrelated pre-existing file), never makes an anchor.
+
+At the skip site, for a source file with `nlink > 1` and `Strong` identity, the order is:
+1. no index entry yet: this member is the anchor; register `(its target, its destination ObjectId)` and skip it as
+   today;
+2. an entry exists and the member's destination `ObjectId` equals the anchor's: it is already linked; skip it;
+3. an entry exists and the ObjectIds differ (an independent copy from an earlier `--hardlinks=copy` run, or a member
+   linked to the OLD object of a canonical that was recopied because it failed `resumed_complete`): do not skip; fall
+   through to the link path, which replaces the member by a link to the anchor (an atomic rename of the same
+   bytes under the claim protocol). A healed member counts `files_hardlinked`, not `files_resumed`.
+
+A canonical that fails `resumed_complete` (length or time mismatch; with `--preserve-times` off it never passes) is
+recopied as a new object and registered with its new ObjectId, so every earlier member is healed by rule 3. The walk is
+sorted, so a resumed run picks the same canonical as the first run unless the source tree changed in between; if it
+changed, rule 3 still converges. `--restart` starts a fresh operation; it never reads the prior index.
 
 ### `--dry-run`
 
-Uses the same registration (`dry_resumed`, `tree.rs:1710`) and reports how many links it would create and how many
-members it would copy independently, with the same reasons as a real run.
+A dry run must not touch the destination, so its index lives in the system temporary directory (author's call), is
+removed at the end, and never under `DEST/.flux`. A fresh dry run goes through `dry_stop_file` (`tree.rs:1563`): it
+registers the source identity and the planned target path (there is no destination object, so no ObjectId). It
+reports how many links it would create and the members that would be copied independently for reasons known without
+I/O (weak identity, an anchor that no claim could make). A dry run cannot predict a link-creation failure or a
+vanished anchor, and does not report them. A dry `--resume` follows the real resume registration (`dry_resumed`,
+`tree.rs:1710`), keyed by the destination objects that exist.
 
 ### Report
 
@@ -241,6 +268,9 @@ Cut order with a per-run disk-backed index and no persisted format; `--hardlinks
 - The stress tests of Section 69 (lines 3356-3376) scaled to CI: one pair, ten members, a large single group, many
   distinct groups with a deliberately tiny cache to prove resident memory does not grow with group count.
 - Updates to `ROADMAP.md` (Phase 4 text), `README.md` (a `--hardlinks` paragraph) and `TODO.md` (items 241 and 363).
+- The JSON field list is pinned by tests (`crates/flux-cli/src/report.rs:858` and `crates/flux-cli/tests/copy.rs:38`):
+  adding `hardlinks_degraded` means updating them. The doc comment at `report.rs:25-27` ("nothing hardlinks,
+  reflinks or verifies, so those stay 0") becomes false and must change.
 
 ## Stand-downs
 
