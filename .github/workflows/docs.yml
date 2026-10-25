@@ -27,6 +27,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      - name: Clean the doc output
+        # rust-cache keeps the emptied directory tree of target/doc, so a restored
+        # target/doc/api would make assemble refuse; start from a clean output.
+        run: rm -rf target/doc target/pages-work
+
       - name: Build docs
         # -D warnings catches broken intra-doc links, which are otherwise
         # invisible until someone clicks a dead link on the published site.
