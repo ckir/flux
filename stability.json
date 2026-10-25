@@ -1,44 +1,44 @@
 {
  "pairs": {
   "linux/large/cp": {
-   "calibrated": "2026-10-22T21:12:49Z",
-   "cv": 0.0059,
-   "image": "20261012.334.1",
+   "calibrated": "2026-10-25T22:02:28Z",
+   "cv": 0.1851,
+   "image": "20261023.334.3",
    "source": "calibration",
-   "stable": true
+   "stable": false
   },
   "linux/large/rsync": {
-   "calibrated": "2026-10-22T21:12:49Z",
-   "cv": 0.0041,
-   "image": "20261012.334.1",
+   "calibrated": "2026-10-25T22:02:28Z",
+   "cv": 0.0184,
+   "image": "20261023.334.3",
    "source": "calibration",
    "stable": true
   },
   "linux/mixed/cp": {
-   "calibrated": "2026-10-22T21:12:49Z",
-   "cv": 0.0338,
-   "image": "20261012.334.1",
+   "calibrated": "2026-10-25T22:02:28Z",
+   "cv": 0.0415,
+   "image": "20261023.334.3",
    "source": "calibration",
    "stable": false
   },
   "linux/mixed/rsync": {
-   "calibrated": "2026-10-22T21:12:49Z",
-   "cv": 0.0678,
-   "image": "20261012.334.1",
+   "calibrated": "2026-10-25T22:02:28Z",
+   "cv": 0.098,
+   "image": "20261023.334.3",
    "source": "calibration",
    "stable": false
   },
   "linux/small/cp": {
-   "calibrated": "2026-10-22T21:12:49Z",
-   "cv": 0.0714,
-   "image": "20261012.334.1",
+   "calibrated": "2026-10-25T22:02:28Z",
+   "cv": 0.1059,
+   "image": "20261023.334.3",
    "source": "calibration",
    "stable": false
   },
   "linux/small/rsync": {
-   "calibrated": "2026-10-22T21:12:49Z",
-   "cv": 0.1422,
-   "image": "20261012.334.1",
+   "calibrated": "2026-10-25T22:02:28Z",
+   "cv": 0.077,
+   "image": "20261023.334.3",
    "source": "calibration",
    "stable": false
   },
@@ -85,25 +85,25 @@
    "stable": false
   },
   "windows/large/robocopy": {
-   "calibrated": "2026-10-24T17:17:55Z",
-   "cv": 0.0536,
+   "calibrated": "2026-10-25T22:02:28Z",
+   "cv": 0.0569,
    "image": "20261021.278.1",
    "source": "calibration",
    "stable": false
   },
   "windows/mixed/robocopy": {
-   "calibrated": "2026-10-24T17:17:55Z",
-   "cv": 0.0527,
+   "calibrated": "2026-10-25T22:02:28Z",
+   "cv": 0.0532,
    "image": "20261021.278.1",
    "source": "calibration",
    "stable": false
   },
   "windows/small/robocopy": {
-   "calibrated": "2026-10-24T17:17:55Z",
-   "cv": 0.032,
+   "calibrated": "2026-10-25T22:02:28Z",
+   "cv": 0.0285,
    "image": "20261021.278.1",
    "source": "calibration",
-   "stable": false
+   "stable": true
   }
  },
  "schema": 1
