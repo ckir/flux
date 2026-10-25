@@ -140,7 +140,7 @@ remain usage errors (`crates/flux-cli/src/main.rs:37`), so a group that spans ro
 | Situation | `copy` | `auto` | `preserve` |
 |---|---|---|---|
 | `nlink <= 1` on a file with `Strong` identity | as today | as today | as today |
-| `nlink` unknown (`None`) on a file with `Strong` identity | as today | not a candidate; reported by one aggregated warning per operation, with no counter (nothing is known about the file, so nothing can be counted as degraded) | same as `auto` (author's call: the platform state is exotic, and failing every file would make `preserve` unusable) |
+| `nlink` unknown (`None`) on a file with `Strong` identity | as today | not a candidate; not linked; one aggregated warning per operation, and counted in `hardlinks_unchecked` so a script reading the JSON can see it (a share that reports no link counts would otherwise leave only one stderr line) | same as `auto` (author's call: the platform state is exotic, and failing every file would make `preserve` unusable) |
 | The anchor is gone, or is no longer the object registered, or cannot be checked (the destination identity is not `Strong`), when a member is about to link | not attempted | copy that member independently; counted in `hardlinks_degraded` | fail the member: `HARDLINK_UNAVAILABLE` |
 | A file with `nlink > 1` whose source identity is `Weak` or `Unavailable` (Section 108, lines 5242-5285; a file with `nlink <= 1` is never affected by identity strength, so `preserve` on FAT or NFS still copies ordinary files) | as today | copy independently, never infer equivalence; one aggregated warning per filesystem/operation; counted in `hardlinks_degraded` | fail the member: `HARDLINK_IDENTITY_UNAVAILABLE` |
 | Creating the link fails (no hardlink support on the destination, different filesystem, link limit, permission) | not attempted | copy that member independently; counted in `hardlinks_degraded` | fail the member: `HARDLINK_UNAVAILABLE` (Section 15) |
@@ -176,8 +176,11 @@ At the skip site, for a source file with `nlink > 1` and `Strong` identity, the 
 2. an entry exists and the member's destination `ObjectId` equals the anchor's: it is already linked; skip it;
 3. an entry exists and the ObjectIds differ (an independent copy from an earlier `--hardlinks=copy` run, or a member
    linked to the OLD object of a canonical that was recopied because it failed `resumed_complete`): do not skip; fall
-   through to the link path, which replaces the member by a link to the anchor (an atomic rename of the same
-   bytes under the claim protocol). A healed member counts `files_hardlinked`, not `files_resumed`.
+   through to the link path. The existing-destination policy applies there first, exactly as for a copy: under the
+   default overwrite the member is replaced by a link to the anchor (an atomic rename of the same bytes under the
+   claim protocol); under `--skip-existing`, or `--update` finding the member up to date, the member is left as it is
+   (the user's policy wins over healing) and is counted in `hardlinks_degraded`. A healed member counts
+   `files_hardlinked`, not `files_resumed`.
 
 A canonical that fails `resumed_complete` (length or time mismatch; with `--preserve-times` off it never passes) is
 recopied as a new object and registered with its new ObjectId, so every earlier member is healed by rule 3. The walk is
@@ -200,6 +203,8 @@ vanished anchor, and does not report them. A dry `--resume` follows the real res
 - New: `hardlinks_degraded` (members copied independently instead of linked) in the JSON report, and
   `summary_line` (`report.rs:409`) appends `; N hardlinks degraded` when non-zero. `files_degraded` keeps its current
   meaning (the weak-identity safety gate).
+- New: `hardlinks_unchecked` (files whose link count the platform could not report, so no link was looked for), in the
+  JSON report, with `; N hardlinks unchecked` appended to the summary line when non-zero.
 - Aggregated stderr warnings use the Section 108 wording. Under `preserve`, a failed member is an ordinary member
   failure with its code.
 - New codes in `Code` (`error.rs:17`): `HardlinkUnavailable` and `HardlinkIdentityUnavailable` (spec Sections 15, 108),
