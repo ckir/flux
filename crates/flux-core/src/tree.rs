@@ -2366,7 +2366,15 @@ fn resume_keeps<F: DestinationRoot>(
     };
     let Some(Group { id, entry }) = group else { return true };
     let skipped = match entry {
-        Lookup::Unreadable => return true,
+        // Plan ruling 13: an unreadable index is "cannot check". Under `preserve` the member is not skipped: the policy
+        // and link path run and `meet_group` reports `HardlinkUnavailable`. Under `auto` it is skipped and counted.
+        Lookup::Unreadable if cx.opts.hardlinks == Hardlinks::Preserve && !cx.dry_run => {
+            return false;
+        }
+        Lookup::Unreadable => {
+            degrade(out, path, UnlinkedWhy::IndexFailure);
+            return true;
+        }
         Lookup::Found(None) => None,
         Lookup::Found(Some(HardlinkEntry::Skipped { members, example, .. })) => {
             Some((*members, example.clone()))
@@ -2498,6 +2506,8 @@ fn register_outcome<F: DestinationRoot>(
     on_report: &mut dyn FnMut(TreeFailure),
 ) {
     let (Meet::Canonical { id, skipped }, Some(slot)) = (meet, cx.hardlinks) else { return };
+    // Ruled acceptable at the fresh and the resume site alike: under `preserve` a failed index write both reports a
+    // failure and counts the file (copied or resumed); the file on disk is correct, the failure concerns the group.
     // Ruled acceptable: the anchor is registered even when the canonical's claim was not recorded (that loss is already
     // reported as `ClaimNotRecorded`, and `--resume` heals the members by rule 3), and an error inserting `Failed` is
     // ignored (the canonical's own failure is the report; later members find no entry and form a group of their own).

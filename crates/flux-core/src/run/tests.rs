@@ -9650,7 +9650,7 @@ fn a_link_the_destination_cannot_hold_degrades_under_auto() {
         out.hardlinks_unlinked[&UnlinkedWhy::LinkRefused],
         DegradedGroup { count: 1, example: "a2".into() }
     );
-    assert_ne!(strong(&fs, "/p/dest/a"), strong(&fs, "/p/dest/a2"));
+    assert_ne!(identity_of(&fs, "/p/dest/a"), identity_of(&fs, "/p/dest/a2"));
     assert_eq!(fs.read_file("/p/dest/a2").as_deref(), Some(&b"A"[..]));
 }
 
@@ -9697,7 +9697,7 @@ fn an_anchor_gone_or_replaced_before_the_check_degrades_without_a_link_call() {
         assert_eq!(count(&calls(&fs), "create_hardlink(/p/dest/"), 0, "gone {gone}");
         assert_eq!(fs.read_file("/p/dest/a2").as_deref(), Some(&b"A"[..]));
         if !gone {
-            assert_ne!(strong(&fs, "/p/dest/a"), strong(&fs, "/p/dest/a2"));
+            assert_ne!(identity_of(&fs, "/p/dest/a"), identity_of(&fs, "/p/dest/a2"));
         }
     }
 }
@@ -9817,7 +9817,7 @@ fn a_skipped_first_member_leaves_the_next_as_anchor() {
     );
     assert_eq!(fs.read_file("/p/dest/a").as_deref(), Some(&b"its own object"[..]));
     assert_eq!(strong(&fs, "/p/dest/a2"), strong(&fs, "/p/dest/a3"));
-    assert_ne!(strong(&fs, "/p/dest/a"), strong(&fs, "/p/dest/a2"));
+    assert_ne!(identity_of(&fs, "/p/dest/a"), identity_of(&fs, "/p/dest/a2"));
 }
 
 /// DEST with `a` and `a2` already one object (through the fake's `create_hardlink`) and the source group `a a2 ..`.
@@ -10211,6 +10211,13 @@ fn crash_between_the_link_rename_and_its_claim_then_resume_relinks_identically()
     let rename = at(&c, "rename_replace(/p/dest/a2.flux-partial");
     assert!(link < rename, "{c:?}");
     assert_eq!(claim_of(&fs, "a2"), created("a2"));
+    // Step 3: the stray temporary name is removed after the in-place rename.
+    let rename = at(&c, "rename_replace(/p/dest/a2.flux-partial");
+    assert!(
+        c[rename..].iter().any(|x| x.starts_with("remove_file(/p/dest/a2.flux-partial")),
+        "{c:?}"
+    );
+    assert!(!fs.exists(format!("/p/dest/a2.flux-partial.{ID}")));
 }
 
 /// A `Copy`-mode first run of the pair interrupted when `sub/b` is about to be published: `a` and `a2` are two
@@ -10246,16 +10253,20 @@ fn the_users_policy_wins_over_healing() {
     assert!(got.is_empty(), "{got:?}");
     assert_ne!(strong(&fs, "/p/dest/a"), strong(&fs, "/p/dest/a2"), "left alone");
     assert_eq!((out.files_skipped, out.hardlinks_degraded, out.files_hardlinked), (1, 1, 0));
+    assert_eq!(out.files_resumed, 1, "a registers at the skip site");
 }
 
 #[test]
-fn a_recopied_canonical_heals_its_earlier_members() {
+fn a_recopied_canonical_relinks_its_earlier_members() {
     let n = reference_nth(pair_fake, &auto(), "rename_no_replace", "-> /p/dest/sub/b)");
     let fs = pair_fake();
     die_at_nth(&fs, "rename_no_replace", n, &auto());
     let old = strong(&fs, "/p/dest/a");
     assert_eq!(old, strong(&fs, "/p/dest/a2"));
-    // The source's group grows: `resumed_complete` fails for both names.
+    assert_eq!((claim_of(&fs, "a"), claim_of(&fs, "a2")), (created("a"), created("a2")));
+    assert!(!fs.exists("/p/dest/sub/b"), "sub/b is unpublished");
+    // The source object's content grows (both names share it): `resumed_complete` fails for both names, so both go
+    // through the ordinary Replace path (a copies and registers, a2 links); rule 3 is pinned by the independent-copy test.
     let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(100);
     for p in ["/src/a", "/src/a2"] {
         fs.write_file(p, b"AAAA");
@@ -10269,7 +10280,7 @@ fn a_recopied_canonical_heals_its_earlier_members() {
     assert_eq!(strong(&fs, "/p/dest/a2"), new, "a2 follows the new object");
     assert_eq!(fs.read_file("/p/dest/a2").as_deref(), Some(&b"AAAA"[..]));
     // `a` and `sub/b` are copies (the brief's 1 does not count `sub/b`, which this prior had not published).
-    assert_eq!((out.files_hardlinked, out.files_copied), (1, 2));
+    assert_eq!((out.files_hardlinked, out.files_copied, out.files_resumed), (1, 2, 0));
 }
 
 fn m_fake() -> FaultFs {
@@ -10297,7 +10308,7 @@ fn a_changed_walk_order_still_converges() {
     assert!(got.is_empty(), "{got:?}");
     let one = strong(&fs, "/p/dest/a");
     assert_eq!((strong(&fs, "/p/dest/m"), strong(&fs, "/p/dest/m2")), (one, one));
-    assert_eq!(out.files_hardlinked, 2);
+    assert_eq!((out.files_hardlinked, out.files_resumed), (2, 0));
 }
 
 #[test]
@@ -10307,6 +10318,7 @@ fn a_skipped_member_that_already_links_to_the_anchor_is_not_degraded() {
     let fs = pair_fake();
     die_at_nth(&fs, "rename_no_replace", n, &o);
     assert_eq!(strong(&fs, "/p/dest/a"), strong(&fs, "/p/dest/a2"), "already linked");
+    assert_eq!((claim_of(&fs, "a"), claim_of(&fs, "a2")), (created("a"), created("a2")));
     let (r, got) = resumed_under(&fs, &o);
     let out = ok(&r);
     assert!(got.is_empty(), "{got:?}");
@@ -10323,16 +10335,27 @@ fn restart_never_reads_the_prior_index() {
     let before = calls(&fs).len();
     let c = RunConfig { operation_id: id(0x77), restart: true, ..cfg() };
     let (r, _) = run_tree_with(&fs, &c, &auto());
-    ok(&r);
+    let out = ok(&r);
     let log = calls(&fs)[before..].to_vec();
-    assert!(!log.iter().any(|x| x.starts_with("open_hardlink_index")), "{log:?}");
-    let own = format!("create_hardlink_index(/p/dest/.flux/operations/{}", id(0x77));
-    assert!(log.iter().any(|x| x.starts_with(&own)), "{log:?}");
-    for x in log.iter().filter(|x| x.contains("hardlinks.db") && x.starts_with("remove_file(")) {
-        assert!(
-            x.contains(&format!("{ID}.removing")) || x.contains(&id(0x77)) || x.contains(ID),
-            "{x}"
-        );
+    // The new operation makes its own index under its own id.
+    let own = format!("create_hardlink_index(/p/dest/.flux/operations/{}/hardlinks.db)", id(0x77));
+    assert!(log.contains(&own), "{log:?}");
+    // Had the prior's index been read, `a` (its anchor) would have been linked, not recopied: it is copied afresh.
+    assert_eq!(
+        count(&log, &format!("create_new(/p/dest/a.flux-partial.{}", id(0x77))),
+        1,
+        "{log:?}"
+    );
+    assert_eq!((out.files_hardlinked, out.files_copied), (1, 2));
+    // Every removal of an index file is the prior's (its own path or its retirement) or the new operation's own.
+    let prior_dir = format!("/p/dest/.flux/operations/{ID}");
+    let retired = format!("/p/dest/.flux/operations/{ID}.removing");
+    let new_dir = format!("/p/dest/.flux/operations/{}", id(0x77));
+    let new_retired = format!("{new_dir}.removing");
+    for x in log.iter().filter(|x| x.starts_with("remove_file(") && x.contains("hardlinks.db")) {
+        let path = x.trim_start_matches("remove_file(").trim_end_matches(')');
+        let dir = path.trim_end_matches("/hardlinks.db");
+        assert!(dir == prior_dir || dir == retired || dir == new_dir || dir == new_retired, "{x}");
     }
     assert!(!fs.exists(&prior));
 }
@@ -10355,4 +10378,94 @@ fn a_strict_note_for_a_link_whose_temporary_still_names_the_object_is_committed_
     assert_eq!(fs.prepared_count(), 0);
     assert!(!fs.exists(format!("/p/dest/{temp}")), "the temporary is removed");
     assert!(fs.exists("/p/dest/a"));
+}
+
+// An unreadable index at the skip site (plan ruling 13), per mode.
+#[test]
+fn an_unreadable_index_at_the_resume_skip_site_degrades_under_auto() {
+    let n = reference_nth(pair_fake, &auto(), "rename_no_replace", "-> /p/dest/sub/b)");
+    let fs = pair_fake();
+    die_at_nth(&fs, "rename_no_replace", n, &auto());
+    fs.fail_always("hardlink_index_get", Code::IoError);
+    let (r, got) = resumed_under(&fs, &auto());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!((out.files_resumed, out.files_hardlinked), (2, 0));
+    assert_eq!(out.hardlinks_degraded, 2);
+    assert_eq!(out.hardlinks_unlinked[&UnlinkedWhy::IndexFailure].count, 2);
+}
+
+#[test]
+fn an_unreadable_index_at_the_resume_skip_site_fails_the_member_under_preserve() {
+    let n = reference_nth(pair_fake, &auto(), "rename_no_replace", "-> /p/dest/sub/b)");
+    let fs = pair_fake();
+    die_at_nth(&fs, "rename_no_replace", n, &auto());
+    fs.fail_always("hardlink_index_get", Code::IoError);
+    let o = CopyOptions { hardlinks: flux_fs::Hardlinks::Preserve, ..opts() };
+    let (r, got) = resumed_under(&fs, &o);
+    let out = ok(&r);
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert!(got.iter().all(|f| code_of(f) == Code::HardlinkUnavailable), "{got:?}");
+    assert_eq!((out.files_resumed, out.files_hardlinked, out.hardlinks_degraded), (0, 0, 0));
+}
+
+#[test]
+fn an_unreadable_index_under_preserve_and_skip_existing_skips_by_policy() {
+    let o = CopyOptions {
+        existing: ExistingPolicy::SkipExisting,
+        hardlinks: flux_fs::Hardlinks::Preserve,
+        ..opts()
+    };
+    let n = reference_nth(pair_fake, &o, "rename_no_replace", "-> /p/dest/sub/b)");
+    let fs = pair_fake();
+    die_at_nth(&fs, "rename_no_replace", n, &o);
+    fs.fail_always("hardlink_index_get", Code::IoError);
+    let (r, got) = resumed_under(&fs, &o);
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!((out.files_skipped, out.files_resumed, out.hardlinks_degraded), (2, 0, 0));
+}
+
+// A `Failed` entry at the skip site: the canonical is recopied (its source grew) and its publish fails, so the
+// completed member is blocked, not silently resumed.
+fn grown_canonical() -> FaultFs {
+    let fs = independent_prior(ExistingPolicy::Overwrite);
+    fs.write_file("/src/a", b"AAAA");
+    fs.set_modified("/src/a", std::time::UNIX_EPOCH + std::time::Duration::from_secs(100));
+    fs
+}
+
+#[test]
+fn a_completed_member_whose_canonical_failed_this_run_is_blocked() {
+    let reference = grown_canonical();
+    ok(&resumed_under(&reference, &auto()).0);
+    let n = nth_of(&reference, "rename_replace", "-> /p/dest/a)");
+    let fs = grown_canonical();
+    fs.fail_nth("rename_replace", n, Code::IoError, std::io::ErrorKind::Other);
+    let (r, got) = resumed_under(&fs, &auto());
+    let out = ok(&r);
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert_eq!((got[0].path.clone(), code_of(&got[0])), (PathBuf::from("a"), Code::IoError));
+    assert_eq!(
+        (got[1].path.clone(), code_of(&got[1])),
+        (PathBuf::from("a2"), Code::BlockedByCanonicalFailure)
+    );
+    assert_eq!((out.files_resumed, out.files_hardlinked), (0, 0));
+    assert_ne!(strong(&fs, "/p/dest/a"), strong(&fs, "/p/dest/a2"), "a2 untouched");
+}
+
+// `Anchor { object: None }`: the completed canonical's destination identity is not Strong, so it registers no object;
+// the later member cannot be checked against it.
+#[test]
+fn a_canonical_with_a_weak_destination_identity_registers_no_object() {
+    let fs = independent_prior(ExistingPolicy::Overwrite);
+    let a = strong(&fs, "/p/dest/a");
+    fs.set_identity("/p/dest/a", FileIdentity::Weak(a));
+    let (r, got) = resumed_under(&fs, &auto());
+    let out = ok(&r);
+    // Real behaviour: `a` resumes; `a2` finds an anchor it cannot check, so it is recopied independently and counted.
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!((out.files_resumed, out.files_hardlinked, out.hardlinks_degraded), (1, 0, 1));
+    assert_eq!(out.hardlinks_unlinked[&UnlinkedWhy::AnchorUnavailable].count, 1);
+    assert_ne!(identity_of(&fs, "/p/dest/a"), identity_of(&fs, "/p/dest/a2"));
 }
