@@ -59,6 +59,9 @@ class Page(HTMLParser):
         self._hidden = 0
         self._object_depth = 0
         self._code_depth = 0
+        self.rows: list[list[dict]] = []  # every <tr>: its cells as {"tag", "attrs", "text", "hrefs"}
+        self._row: list[dict] | None = None
+        self._cell: dict | None = None
         self.feed(source)
         self.close()
 
@@ -68,6 +71,12 @@ class Page(HTMLParser):
         self.events.append(("tag", tag))
         if tag == "a" and "href" in attributes:
             self.hrefs.append(attributes["href"])
+            if self._cell is not None:
+                self._cell["hrefs"].append(attributes["href"])
+        if tag == "tr":
+            self._row = []
+        elif tag in ("th", "td") and self._row is not None:
+            self._cell = {"tag": tag, "attrs": attributes, "text": "", "hrefs": []}
         if tag in HIDDEN_TEXT_TAGS:
             self._hidden += 1
         if tag == "object" and self.object_attrs is None:
@@ -77,6 +86,12 @@ class Page(HTMLParser):
             self._code_depth += 1
 
     def handle_endtag(self, tag: str) -> None:
+        if tag in ("th", "td") and self._cell is not None and self._row is not None:
+            self._row.append(self._cell)
+            self._cell = None
+        elif tag == "tr" and self._row is not None:
+            self.rows.append(self._row)
+            self._row = None
         if tag in HIDDEN_TEXT_TAGS and self._hidden:
             self._hidden -= 1
         if self._object_depth:
@@ -86,6 +101,8 @@ class Page(HTMLParser):
                 self._code_depth -= 1
 
     def handle_data(self, data: str) -> None:
+        if self._cell is not None:
+            self._cell["text"] += data
         if self._hidden:
             return
         self.events.append(("text", data))
@@ -296,6 +313,88 @@ class SiteTests(unittest.TestCase):
         self.assertRegex(js, r"addEventListener\(\s*[\"']visibilitychange[\"']")
         self.assertRegex(js, r"document\.hidden\b(?!\s*=[^=])")
         self.assertRegex(js, r"cancelAnimationFrame\(")
+
+    def test_canvas_script_makes_no_network_requests(self) -> None:
+        js = strip_js_comments(read("flux-field.js"))
+        for banned in ("fetch(", "XMLHttpRequest", "WebSocket", "sendBeacon", "EventSource", "importScripts", "import("):
+            self.assertNotIn(banned, js, f"the canvas script uses {banned}")
+        self.assertNotRegex(js, r"(?i)https?:|//", "the canvas script names a URL")
+
+    def test_download_rows_pair_each_label_with_its_target(self) -> None:
+        expected = {
+            ("Linux", "x86_64"): "flux-x86_64-unknown-linux-gnu.tar.gz",
+            ("Linux", "aarch64"): "flux-aarch64-unknown-linux-gnu.tar.gz",
+            ("macOS", "Intel (x86_64)"): "flux-x86_64-apple-darwin.tar.gz",
+            ("macOS", "Apple silicon (aarch64)"): "flux-aarch64-apple-darwin.tar.gz",
+            ("Windows", "x86_64"): "flux-x86_64-pc-windows-msvc.zip",
+        }
+        body_rows = [r for r in page().rows if r and r[0]["tag"] == "th" and r[0]["attrs"].get("scope") == "row"]
+        self.assertEqual(len(body_rows), 5)
+        found = {}
+        for row in body_rows:
+            self.assertEqual(len(row), 3)
+            self.assertEqual(len(row[-1]["hrefs"]), 1)
+            found[(row[0]["text"].strip(), row[1]["text"].strip())] = row[-1]["hrefs"][0]
+        self.assertEqual(len(found), 5)
+        self.assertEqual(found, {key: f"{RELEASE_BASE}/download/{asset}" for key, asset in expected.items()})
+
+    def test_primary_button_fill_never_uses_violet(self) -> None:
+        # dark label text on violet is 3.0:1, below WCAG AA; violet may appear only in the glow
+        classes = {
+            cls
+            for tag, attrs in page().tags
+            if tag == "a" and "button" in attrs.get("class", "").split()
+            for cls in attrs["class"].split()
+        }
+        self.assertIn("button", classes)
+        fills = []
+        for selector, body in re.findall(r"([^{}]+)\{([^{}]*)\}", read("style.css")):
+            if not any(re.search(rf"\.{re.escape(cls)}(?![\w-])", selector) for cls in classes):
+                continue
+            for value in re.findall(r"(?<![-\w])background[\w-]*\s*:\s*([^;}]+)", body):
+                fills.append(value)
+                self.assertNotIn("var(--violet)", value)
+                self.assertNotIn("#7000ff", value.lower())
+        self.assertTrue(fills, "no background rule for the primary button")
+        self.assertTrue(
+            any("var(--cyan)" in v and "var(--blue)" in v for v in fills), f"no cyan-to-blue fill in {fills}"
+        )
+        for value in fills:
+            self.assertIn("var(--cyan)", value)
+            self.assertIn("var(--blue)", value)
+
+    def test_ids_are_unique(self) -> None:
+        ids = [attrs["id"] for _, attrs in page().tags if "id" in attrs]
+        self.assertGreaterEqual(len(ids), 10, "too few ids found; did the parse come back empty?")
+        duplicated = sorted({value for value in ids if ids.count(value) > 1})
+        self.assertEqual(duplicated, [], f"duplicate ids: {duplicated}")
+
+    def test_in_page_references_resolve(self) -> None:
+        parsed = page()
+        ids = {attrs["id"] for _, attrs in parsed.tags if "id" in attrs}
+        references: list[tuple[str, str]] = []  # (kind, target)
+        for tag, attrs in parsed.tags:
+            if tag == "a" and attrs.get("href", "").startswith("#") and len(attrs["href"]) > 1:
+                references.append(("href", attrs["href"][1:]))
+            for name in ("aria-labelledby", "aria-describedby", "aria-controls"):
+                references.extend((name, token) for token in attrs.get(name, "").split())
+            if tag == "label" and attrs.get("for"):
+                references.append(("for", attrs["for"]))
+        self.assertTrue(any(kind == "href" for kind, _ in references), "no in-page anchor found")
+        labelled = [target for kind, target in references if kind == "aria-labelledby"]
+        self.assertGreaterEqual(len(labelled), 5, "too few aria-labelledby references found")
+        self.assertIn("main", ids, "the skip link target #main does not exist")
+        dangling = sorted({f"{kind}={target}" for kind, target in references if target not in ids})
+        self.assertEqual(dangling, [], f"references to ids that do not exist: {dangling}")
+
+    def test_heading_levels_do_not_skip(self) -> None:
+        levels = [int(tag[1]) for tag, _ in page().tags if re.fullmatch(r"h[1-6]", tag)]
+        self.assertGreaterEqual(len(levels), 8, "too few headings found")
+        self.assertEqual(levels[0], 1, f"the first heading is h{levels[0]}, not h1")
+        self.assertEqual(levels.count(1), 1, f"expected exactly one h1, found {levels.count(1)}")
+        for previous, current in zip(levels, levels[1:]):
+            self.assertLessEqual(current, previous + 1, f"h{current} follows h{previous} in {levels}")
+
 
 if __name__ == "__main__":
     unittest.main()
