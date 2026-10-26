@@ -141,11 +141,13 @@ Anti-goals (a test with any of these has failed even if green)
 - `crates/flux-core/src/verify_proptest.rs`, registered in `lib.rs` as `#[cfg(test)] mod verify_proptest;` directly after
   the `fault_fs` registration, carrying the repository's licence header (`just check` runs `license`, an `addlicense`
   check over tracked `*.rs`, besides `fmt-check clippy typos doc-check test`).
-- `crates/flux-core/Cargo.toml` gains, under `[dev-dependencies]`, `proptest = { workspace = true, default-features =
-  false, features = ["std"] }`: the default feature set adds `fork` and `timeout` (and their `rusty-fork`, `tempfile`
-  trees), which this test does not use and `deny.toml` asks to avoid ("must stay dependency-light"); add `bit-set` only if
-  a strategy the builder uses needs it (the compiler says). `Cargo.lock` changes with it; `cargo deny check` must stay
-  green (it runs in CI).
+- The workspace entry (root `Cargo.toml`) becomes `proptest = { version = "1.11", default-features = false }` and
+  `crates/flux-core/Cargo.toml` gains, under `[dev-dependencies]`, `proptest = { workspace = true, features = ["std"] }`:
+  the default feature set adds `fork` and `timeout` (and their `rusty-fork`, `tempfile` trees), which this test does not
+  use and `deny.toml` asks to avoid ("must stay dependency-light"); add `bit-set` only if a strategy the builder uses needs
+  it (the compiler says). (Measured on cargo 1.99.1: a member-level `default-features = false` on an inherited dependency
+  also takes effect; the workspace-level opt-out is the form every Cargo version documents.) `Cargo.lock` changes with it;
+  `cargo deny check` must stay green (it runs in CI).
 - The property uses the `proptest!` macro: it is what sets `source_file`, and without it proptest persists NO regression
   file (`proptest-1.11.0/src/sugar.rs:966`, `failure_persistence/file.rs:86-90`).
 - `crates/flux-core/proptest-regressions/verify_proptest.txt` is committed the first time proptest writes it (a failure);
@@ -299,7 +301,7 @@ the default; shrinking is proptest's (a shrunk case still fails, so a fault need
    `mismatched` `"source file, destination dir"`; `not_entered == 0` (cut 14 design 6.2: the fold applies to Dir/Dir only);
    `read_dir(/d/m)` was never called (the walker never lists a mount root), so `m/x` is neither `extra` nor anything else.
 6. Non-vacuity (driver-measured, recorded in the plan's mutant table): the three `Side` mutants of section 2 each redden
-   test 1 and leave the 42 fixtures green.
+   test 1 and leave the fixtures (39 today, 40 with test 5) green.
 
 ## 10. Left to the builder
 Strategy composition (how `base` is grown so parents precede children), the weights' exact numbers within 6.3's guidance,
