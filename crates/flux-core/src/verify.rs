@@ -133,16 +133,35 @@ struct Side<'a, F: FileSystem> {
     held: Option<Item>,
     done: bool,
     pruned: Option<PathBuf>,
+    /// The SOURCE side under `Links::Skip`: symlink items are dropped (design 6.3).
+    skip_links: bool,
+    /// The DEST side: Flux's own control state is dropped (design 6.4).
+    control_state: bool,
 }
 
 impl<'a, F: FileSystem> Side<'a, F> {
-    fn new(fs: &'a F, root: &Path, mounts: MountPolicy) -> Self {
+    fn new(
+        fs: &'a F,
+        root: &Path,
+        mounts: MountPolicy,
+        skip_links: bool,
+        control_state: bool,
+    ) -> Self {
         let opened = walk_with(fs, root, WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts });
         let (walk, open_failure) = match opened {
             Ok(w) => (Some(w), None),
             Err(e) => (None, Some(e)),
         };
-        Side { walk, open_failure, peeked: None, held: None, done: false, pruned: None }
+        Side {
+            walk,
+            open_failure,
+            peeked: None,
+            held: None,
+            done: false,
+            pruned: None,
+            skip_links,
+            control_state,
+        }
     }
 
     fn raw(&mut self) -> Option<RawEvent> {
@@ -165,6 +184,32 @@ impl<'a, F: FileSystem> Side<'a, F> {
             Ok(k) => Item { path, key: k.0, kind, not_entered, failed },
             Err(e) => Item { path, key: Vec::new(), kind, not_entered, failed: Some(e) },
         }
+    }
+
+    /// Whether `item` is Flux's own control state (design 6.4): a top-level `.flux` directory with all it holds, the
+    /// root-level `.flux-root.lock`, and a copy's `<name>.flux-partial.<id>` temporary at any depth.
+    fn is_control_state(item: &Item) -> bool {
+        let mut parts = item.path.components();
+        let first = parts.next().map(|c| c.as_os_str());
+        let single = parts.next().is_none();
+        if first.is_some_and(|f| f.as_encoded_bytes() == crate::state::FLUX_DIR.as_bytes())
+            && (!single || item.kind == Kind::Dir)
+        {
+            return true;
+        }
+        if single
+            && item.kind == Kind::File
+            && first.is_some_and(|f| {
+                f.as_encoded_bytes() == crate::lock::site::ROOT_LOCK_NAME.as_bytes()
+            })
+        {
+            return true;
+        }
+        matches!(item.kind, Kind::File | Kind::Symlink)
+            && item
+                .path
+                .file_name()
+                .is_some_and(|n| crate::state::id_after(n, crate::state::PARTIAL_INFIX).is_some())
     }
 
     fn under_pruned(&self, path: &Path) -> bool {
@@ -194,15 +239,21 @@ impl<'a, F: FileSystem> Side<'a, F> {
                     }
                     Self::item(path, Kind::Dir, skipped, None)
                 }
-                // Task 2 pairs symlinks and `Other` entries; until then they merge as files.
-                Ok(WalkEvent::File { path })
-                | Ok(WalkEvent::Symlink { path })
-                | Ok(WalkEvent::Other { path }) => Self::item(path, Kind::File, false, None),
+                Ok(WalkEvent::File { path }) => Self::item(path, Kind::File, false, None),
+                Ok(WalkEvent::Symlink { path }) => {
+                    if self.skip_links {
+                        continue;
+                    }
+                    Self::item(path, Kind::Symlink, false, None)
+                }
+                Ok(WalkEvent::Other { path }) => Self::item(path, Kind::Other, false, None),
                 Ok(WalkEvent::DirEnd { .. })
                 | Ok(WalkEvent::MountSkipped { .. })
                 | Ok(WalkEvent::MountUnknown { .. }) => continue,
             };
-            if self.under_pruned(&item.path) {
+            if self.under_pruned(&item.path)
+                || (self.control_state && Self::is_control_state(&item))
+            {
                 continue;
             }
             return Some(item);
@@ -299,8 +350,8 @@ pub fn verify_tree<F: DestinationRoot>(
     opts: &VerifyOptions,
     sink: &mut dyn FnMut(Record),
 ) -> Result<Summary, VerifyError> {
-    let mut a = Side::new(fs, src, opts.mounts);
-    let mut b = Side::new(fs, dst, opts.mounts);
+    let mut a = Side::new(fs, src, opts.mounts, opts.links == Links::Skip, false);
+    let mut b = Side::new(fs, dst, opts.mounts, false, true);
     let mut buf = vec![0u8; crate::copy::COPY_BUF_MAX];
     let mut out = Emitter { summary: Summary::default(), sink };
     loop {
@@ -398,6 +449,29 @@ fn pair<F: FileSystem>(
                 Err((code, detail)) => out.unreadable(x.path.clone(), x.kind, code, detail),
             }
         }
+        (Kind::Symlink, Kind::Symlink) => {
+            let (src, dst) = (roots.0.join(&x.path), roots.1.join(&x.path));
+            let payloads = fs.read_link(&src).and_then(|s| Ok((s, fs.read_link(&dst)?)));
+            match payloads {
+                Ok((s, d)) if s.payload.as_encoded_bytes() == d.payload.as_encoded_bytes() => {
+                    out.alone(x, Outcome::Match);
+                }
+                Ok(_) => out.emit(Record {
+                    path: x.path.clone(),
+                    outcome: Outcome::Mismatched,
+                    kind: Kind::Symlink,
+                    code: Some(Code::VerifyMismatch),
+                    detail: "symlink payloads differ".to_string(),
+                }),
+                Err(e) => out.unreadable(x.path.clone(), x.kind, e.code, e.source.to_string()),
+            }
+        }
+        (Kind::Other, Kind::Other) => out.unreadable(
+            x.path.clone(),
+            Kind::Other,
+            Code::SpecialFileUnsupported,
+            SPECIAL_NOT_COMPARED.to_string(),
+        ),
         (k1, k2) => out.emit(Record {
             path: x.path.clone(),
             outcome: Outcome::Mismatched,
@@ -413,6 +487,7 @@ mod tests {
     use super::*;
     use crate::copy::COPY_BUF_MAX;
     use crate::fault_fs::FaultFs;
+    use flux_fs::LinkKind;
 
     fn opts() -> VerifyOptions {
         VerifyOptions {
@@ -626,5 +701,184 @@ mod tests {
         assert!(rows.is_empty());
         assert_eq!(s, Summary::default());
         assert!(!fs.called("open_read("));
+    }
+
+    const ZEROS: &str = "00000000000000000000000000000000";
+
+    fn mm(p: &str, k: Kind, d: &str) -> Row {
+        (p.to_string(), Outcome::Mismatched, k, Some(Code::VerifyMismatch), d.to_string())
+    }
+
+    #[test]
+    fn symlink_payloads_equal_differ_and_against_a_file() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[]);
+        tree(&fs, "/d", &[], &[("l3", b"x")]);
+        fs.add_symlink_to("/s/l1", "t", LinkKind::Unspecified);
+        fs.add_symlink_to("/d/l1", "t", LinkKind::Unspecified);
+        fs.add_symlink_to("/s/l2", "a", LinkKind::Unspecified);
+        fs.add_symlink_to("/d/l2", "b", LinkKind::Unspecified);
+        fs.add_symlink_to("/s/l3", "t", LinkKind::Unspecified);
+        let (rows, s) = run(&fs, "/s", "/d", &opts());
+        assert_eq!(
+            rows,
+            vec![
+                rec("l1", Outcome::Match, Kind::Symlink),
+                mm("l2", Kind::Symlink, "symlink payloads differ"),
+                mm("l3", Kind::Symlink, "source symlink, destination file"),
+            ]
+        );
+        assert_eq!((s.matched, s.mismatched, s.bytes_hashed), (1, 2, 0));
+        assert!(!fs.called("open_read("));
+    }
+
+    #[test]
+    fn links_skip_drops_source_symlinks_and_keeps_a_dest_only_one_as_extra() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("f", b"x")]);
+        tree(&fs, "/d", &[], &[]);
+        fs.add_symlink_to("/s/s", "t", LinkKind::Unspecified);
+        fs.add_symlink_to("/d/s", "t", LinkKind::Unspecified);
+        fs.add_symlink_to("/d/d", "t", LinkKind::Unspecified);
+        fs.add_symlink_to("/d/f", "t", LinkKind::Unspecified);
+        let o = VerifyOptions { links: Links::Skip, ..opts() };
+        let (rows, s) = run(&fs, "/s", "/d", &o);
+        assert_eq!(
+            rows,
+            vec![
+                rec("d", Outcome::Extra, Kind::Symlink),
+                mm("f", Kind::File, "source file, destination symlink"),
+                rec("s", Outcome::Extra, Kind::Symlink),
+            ]
+        );
+        assert_eq!((s.extra, s.mismatched, s.matched), (2, 1, 0));
+        assert!(!fs.called("read_link("));
+    }
+
+    #[test]
+    fn special_files_are_never_opened() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[]);
+        tree(&fs, "/d", &[], &[("o2", b"x")]);
+        for p in ["/s/o1", "/d/o1", "/s/o2", "/s/o3", "/d/o4"] {
+            fs.add_special(p);
+        }
+        let (rows, s) = run(&fs, "/s", "/d", &opts());
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "o1".to_string(),
+                    Outcome::Unreadable,
+                    Kind::Other,
+                    Some(Code::SpecialFileUnsupported),
+                    SPECIAL_NOT_COMPARED.to_string()
+                ),
+                mm("o2", Kind::Other, "source other, destination file"),
+                rec("o3", Outcome::Missing, Kind::Other),
+                rec("o4", Outcome::Extra, Kind::Other),
+            ]
+        );
+        assert_eq!((s.unreadable, s.mismatched, s.missing, s.extra), (1, 1, 1, 1));
+        assert!(!fs.calls().iter().any(|c| c.starts_with("open_read(") && c.contains("/o")));
+    }
+
+    #[test]
+    fn an_unreadable_file_on_either_side_is_unreadable_and_the_other_side_is_not_guessed() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("a", b"aaaa"), ("b", b"bbb"), ("c", b"cc")]);
+        tree(&fs, "/d", &[], &[("a", b"aaaa"), ("b", b"bbb"), ("c", b"cc")]);
+        fs.fail_read_nth("/s/a", 1, std::io::ErrorKind::Other);
+        // open_read calls: /s/a (1, its read then fails), /s/b (2), /d/b (3).
+        fs.fail_nth("open_read", 3, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+        let (rows, s) = run(&fs, "/s", "/d", &opts());
+        let classified = FsError::classify(&std::io::Error::from(std::io::ErrorKind::Other));
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            (rows[0].0.as_str(), rows[0].1, rows[0].2, rows[0].3),
+            ("a", Outcome::Unreadable, Kind::File, Some(classified))
+        );
+        assert!(!rows[0].4.is_empty());
+        assert!(!fs.called("open_read(/d/a)"));
+        assert_eq!(
+            (rows[1].0.as_str(), rows[1].1, rows[1].2, rows[1].3),
+            ("b", Outcome::Unreadable, Kind::File, Some(Code::PermissionDenied))
+        );
+        assert_eq!(rows[2], rec("c", Outcome::Match, Kind::File));
+        assert!(!fs.called("open_read(/d/a)"));
+        assert_eq!(s.bytes_hashed, 3 + 2 * 2);
+        assert_eq!((s.unreadable, s.matched), (2, 1));
+    }
+
+    #[test]
+    fn an_unreadable_directory_prunes_both_sides_and_siblings_continue() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &["bad", "good"], &[("bad/x", b"x"), ("good/y", b"y")]);
+        tree(&fs, "/d", &["bad", "good"], &[("bad/z", b"z"), ("good/y", b"y")]);
+        // read_dir(/s), read_dir(/d), then read_dir(/s/bad): the source head is pulled first.
+        fs.fail_nth("read_dir", 3, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+        let (rows, s) = run(&fs, "/s", "/d", &opts());
+        assert!(fs.called("read_dir(/s/bad)"));
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(
+            (rows[0].0.as_str(), rows[0].1, rows[0].2, rows[0].3),
+            ("bad", Outcome::Unreadable, Kind::Dir, Some(Code::PermissionDenied))
+        );
+        assert_eq!(rows[1], rec("good", Outcome::Match, Kind::Dir));
+        assert_eq!(rows[2], rec("good/y", Outcome::Match, Kind::File));
+        assert_eq!((s.unreadable, s.matched), (1, 2));
+    }
+
+    #[test]
+    fn control_state_at_the_destination_root_is_never_reported() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &["sub"], &[]);
+        let ops = format!(".flux/operations/{ZEROS}");
+        tree(
+            &fs,
+            "/d",
+            &["sub", ".flux", ".flux/operations", ops.as_str()],
+            &[
+                (format!("{ops}/state").as_str(), b"s"),
+                (".flux-root.lock", b""),
+                (format!("a.flux-partial.{ZEROS}").as_str(), b"p"),
+                (".flux-partial.txt", b"u"),
+                ("x.flux-partial.1", b"u"),
+                ("sub/.flux", b"u"),
+                (format!("sub/b.flux-partial.{ZEROS}").as_str(), b"p"),
+            ],
+        );
+        fs.add_symlink_to(format!("/d/l.flux-partial.{ZEROS}"), "t", LinkKind::Unspecified);
+        let (rows, s) = run(&fs, "/s", "/d", &opts());
+        assert_eq!(
+            rows,
+            vec![
+                rec(".flux-partial.txt", Outcome::Extra, Kind::File),
+                rec("sub", Outcome::Match, Kind::Dir),
+                rec("sub/.flux", Outcome::Extra, Kind::File),
+                rec("x.flux-partial.1", Outcome::Extra, Kind::File),
+            ]
+        );
+        assert_eq!((s.extra, s.matched), (3, 1));
+        // The brief also asked for `!fs.called("read_dir(/d/.flux")`. `Walk::enter` lists a directory before it yields
+        // the `Dir` event (`walk.rs:452`), so the subtree is dropped from the records but is still listed; asserting
+        // otherwise needs a walker change (reported, not bent here).
+    }
+
+    #[test]
+    fn a_source_dot_flux_directory_is_missing_when_dest_has_only_control_state() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[".flux"], &[(".flux/data", b"x")]);
+        let ops = format!(".flux/operations/{ZEROS}");
+        tree(&fs, "/d", &[".flux", ".flux/operations", ops.as_str()], &[]);
+        let (rows, s) = run(&fs, "/s", "/d", &opts());
+        assert_eq!(
+            rows,
+            vec![
+                rec(".flux", Outcome::Missing, Kind::Dir),
+                rec(".flux/data", Outcome::Missing, Kind::File),
+            ]
+        );
+        assert_eq!((s.missing, s.extra), (2, 0));
     }
 }
