@@ -1525,6 +1525,81 @@ mod tests {
     }
 
     #[test]
+    fn a_pruned_directory_does_not_hide_a_sibling_whose_name_starts_with_the_same_bytes() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &["a", "z"], &[("z/a0", &[2u8; 17])]);
+        fs.set_mount_root("/s/a", MountRoot::Yes);
+        fs.fail_read_dir_of("/s/a", Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+        fs.add_symlink_to("/s/a-b", "t", LinkKind::Unspecified);
+        tree(&fs, "/d", &["z"], &[("z/a0", &[2u8; 17])]);
+        fs.add_symlink_to("/d/a-b", "t", LinkKind::Unspecified);
+        let (rows, s) = run(&fs, "/s", "/d", &opts());
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "a".to_string(),
+                    Outcome::Unreadable,
+                    Kind::Dir,
+                    Some(Code::PermissionDenied),
+                    "permission denied".to_string()
+                ),
+                rec("a-b", Outcome::Match, Kind::Symlink),
+                rec("z", Outcome::Match, Kind::Dir),
+                rec("z/a0", Outcome::Match, Kind::File),
+            ]
+        );
+        assert_eq!((s.matched, s.unreadable, s.bytes_hashed), (3, 1, 34));
+    }
+
+    #[test]
+    fn two_mount_points_not_entered_in_one_run_each_keep_their_own_prune() {
+        let o = VerifyOptions { mounts: MountPolicy::Stay, ..opts() };
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &["a-b", "a0"], &[("a0/a-b", b"")]);
+        fs.set_mount_root("/s/a-b", MountRoot::Yes);
+        fs.set_mount_root("/s/a0", MountRoot::Yes);
+        tree(&fs, "/d", &["a-b", "a0"], &[("a0/a-b", b"")]);
+        fs.set_mount_root("/d/a-b", MountRoot::Unknown);
+        let (rows, s) = run(&fs, "/s", "/d", &o);
+        let not_entered = |p: &str| {
+            (p.to_string(), Outcome::Match, Kind::Dir, None, MOUNT_NOT_ENTERED.to_string())
+        };
+        assert_eq!(rows, vec![not_entered("a-b"), not_entered("a0")]);
+        assert_eq!((s.matched, s.not_entered), (2, 2));
+    }
+
+    #[test]
+    fn a_directory_faulted_on_both_sides_reports_the_source_code() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &["b", "b/a-b", "b/a.txt"], &[]);
+        fs.set_mount_root("/s/b/a-b", MountRoot::Yes);
+        fs.fail_read_dir_of("/s/b/a-b", Code::IoError, std::io::ErrorKind::Other);
+        tree(&fs, "/d", &["b", "b/a-b", "b/a.txt"], &[]);
+        fs.fail_read_dir_of(
+            "/d/b/a-b",
+            Code::PermissionDenied,
+            std::io::ErrorKind::PermissionDenied,
+        );
+        let (rows, s) = run(&fs, "/s", "/d", &opts());
+        assert_eq!(
+            rows,
+            vec![
+                rec("b", Outcome::Match, Kind::Dir),
+                (
+                    "b/a-b".to_string(),
+                    Outcome::Unreadable,
+                    Kind::Dir,
+                    Some(Code::IoError),
+                    "other error".to_string()
+                ),
+                rec("b/a.txt", Outcome::Match, Kind::Dir),
+            ]
+        );
+        assert_eq!((s.matched, s.unreadable), (2, 1));
+    }
+
+    #[test]
     fn cross_filesystems_enters_mount_points() {
         let fs = FaultFs::new();
         tree(&fs, "/s", &["m"], &[("m/x", b"x")]);
