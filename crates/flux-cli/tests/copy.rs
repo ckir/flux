@@ -722,3 +722,88 @@ fn a_symlink_source_prints_the_corrected_refusal() {
         )
     );
 }
+
+/// `src/a` and `src/b` are one object (two names), `src/c` is its own file.
+fn pair_tree_in(d: &Path) -> PathBuf {
+    let src = d.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a"), b"AA").unwrap();
+    std::fs::hard_link(src.join("a"), src.join("b")).unwrap();
+    std::fs::write(src.join("c"), b"C").unwrap();
+    src
+}
+
+/// Whether the two paths name one object, and the object's link count where the platform reports it.
+fn shared_object(a: &Path, b: &Path) -> (bool, Option<u64>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let (ma, mb) = (std::fs::metadata(a).unwrap(), std::fs::metadata(b).unwrap());
+        (ma.ino() == mb.ino() && ma.dev() == mb.dev(), Some(ma.nlink()))
+    }
+    #[cfg(not(unix))]
+    {
+        use flux_fs::FileSystem;
+        let n = flux_platform::StdFileSystem.metadata(a).unwrap().nlink;
+        (std::fs::read(a).unwrap() == std::fs::read(b).unwrap() && n == Some(2), n)
+    }
+}
+
+#[test]
+fn a_hardlink_pair_is_copied_once_and_linked() {
+    let d = TempDir::new().unwrap();
+    let src = pair_tree_in(d.path());
+    let dst = d.path().join("dst");
+
+    let out = flux().arg("copy").arg(&src).arg(&dst).arg("--json").output().unwrap();
+
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let v = json(&out);
+    assert_eq!(v["files_hardlinked"], 1, "{v}");
+    assert_eq!(v["files_copied"], 2, "the canonical and the independent file: {v}");
+    assert_eq!(v["files_total"], 3, "{v}");
+    assert!(v.get("hardlinks_degraded").is_none() && v.get("hardlinks_unchecked").is_none(), "{v}");
+    let (same, nlink) = shared_object(&dst.join("a"), &dst.join("b"));
+    assert!(same, "the two destination names must be one object");
+    assert_eq!(nlink, Some(2));
+    assert_eq!(std::fs::read(dst.join("b")).unwrap(), b"AA");
+    assert!(stderr(&out).contains("; 1 hardlinked"), "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn hardlinks_copy_mode_copies_every_name() {
+    let d = TempDir::new().unwrap();
+    let src = pair_tree_in(d.path());
+    let dst = d.path().join("dst");
+
+    let out = flux()
+        .arg("copy")
+        .arg(&src)
+        .arg(&dst)
+        .args(["--hardlinks=copy", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let v = json(&out);
+    assert_eq!(v["files_hardlinked"], 0, "{v}");
+    assert_eq!(v["files_copied"], 3, "{v}");
+    let (same, _) = shared_object(&dst.join("a"), &dst.join("b"));
+    assert!(!same, "--hardlinks=copy must make two objects");
+    assert!(!stderr(&out).contains("hardlinked"), "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn a_dry_run_says_would_hardlink() {
+    let d = TempDir::new().unwrap();
+    let src = pair_tree_in(d.path());
+    let dst = d.path().join("dst");
+
+    let out = flux().arg("copy").arg(&src).arg(&dst).arg("--dry-run").output().unwrap();
+
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stderr(&out);
+    assert!(text.contains("would_hardlink"), "stderr: {text}");
+    assert!(text.contains("hardlink 1"), "stderr: {text}");
+    assert!(!dst.exists(), "a dry run writes nothing");
+}

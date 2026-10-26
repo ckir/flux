@@ -61,14 +61,16 @@ pub enum Code {
     /// Cut 9f-1. The checkpoint log was written by a newer Flux (an unknown format or checksum version). Stops the
     /// whole operation before any file is copied; `--restart` supersedes it.
     WalFormatUnsupported,
-    /// Cut 12, master §15 line 1226. A hardlink could not be created at the destination under `--hardlinks=preserve`
-    /// (or the platform has no link primitive there). Path-scoped: that member fails.
+    /// Cut 12, master §15/§16.1. The required link could not be created at the destination (the filesystem, volume
+    /// or platform cannot link there, or the hardlink index or anchor cannot be used). Under `--hardlinks=preserve`
+    /// that member fails with this code; under `auto` it is copied independently and counted. Path-scoped.
     HardlinkUnavailable,
-    /// Cut 12, master §108 line 5274. The source or destination identity needed to decide a hardlink group is not
-    /// `Strong`, so the member cannot be checked. Path-scoped.
+    /// Cut 12, master §108. `--hardlinks=preserve` was requested but reliable object identity is unavailable, so the
+    /// member cannot be checked. Path-scoped.
     HardlinkIdentityUnavailable,
-    /// Cut 12, master line 2920. A member whose canonical member failed to copy, so there is nothing to link to.
-    /// Path-scoped; counted as a failed file.
+    /// Cut 12, master §92. A dependent was not linked because its group reached terminal `Failed`: its canonical
+    /// member failed to copy, so there is nothing to link to. Path-scoped; the tree run reports it as a failed
+    /// `Copy` cause, so it counts as a failed file.
     BlockedByCanonicalFailure,
 }
 
