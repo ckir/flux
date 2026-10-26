@@ -12,7 +12,7 @@ use crate::checkpoint::{
 use flux_fs::{
     Code, CopyOptions, DestinationRoot, DirHandle, Durability, FileHandle, FileIdentity, FileType,
     FsError, Metadata, MetadataFailure, MetadataItem, OperationId, Outcome, Preserve, Publish,
-    Safety, temp_path,
+    Safety, VerifyLevel, temp_path,
 };
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
@@ -70,6 +70,8 @@ pub enum CopyStep {
     Claim,
     /// Cut 9f-1: a checkpoint or its writer failed.
     Checkpoint,
+    /// Cut 13: the copy-side verification (the re-read of the temporary or of the source).
+    Verify,
 }
 
 /// Cut 8b: runs after the identity gate and the policy decision and before the temporary is created. Its `Err` stops
@@ -542,6 +544,8 @@ pub(crate) struct Staged<W> {
     pub reused: u64,
     /// Cut 9f-1: how a resumed partial's prefix was decided; `None` when nothing was discarded.
     pub discard: Option<Discard>,
+    /// Cut 13: a `destination` or `full` comparison passed for this file (false for `none` and `source-stream`).
+    pub verified: bool,
 }
 
 /// Cut 9f-1 (task 9): what a published checkpointed file reports beyond the public `Outcome`: the bytes its validated
@@ -705,6 +709,77 @@ fn plan_resume<D: DirHandle + Send + 'static, R: std::io::Read>(
     Ok((verdict, partial_meta.map(|m| m.identity)))
 }
 
+/// The source must not have changed under us (Section 33): its length and mtime still equal `src_meta`'s. On any
+/// difference the temporary is discarded. Run before the verification re-read (cut 13, C13) and again at step 7.
+///
+/// A `match` rather than `?` on the metadata call: a `?` would return with the temporary still on disk, which is the
+/// one leak `discard` exists to prevent.
+fn recheck_source<F: DestinationRoot>(
+    fs: &F,
+    src: &Path,
+    src_meta: &Metadata,
+    parent: &F::Dir,
+    temp: &OsStr,
+    guard: &Guard<'_>,
+) -> std::result::Result<(), CopyError> {
+    let now = match fs.metadata(src) {
+        Ok(m) => m,
+        // Gone is the most complete form of "changed under us", and the taxonomy has
+        // a code for that. Reporting IO_ERROR here would hide it among unrelated
+        // failures.
+        Err(e) if e.source.kind() == std::io::ErrorKind::NotFound => {
+            let gone = std::io::Error::other("source disappeared during the copy");
+            return Err(discard(parent, temp, CopyStep::Recheck, Code::SourceChanged, gone, guard));
+        }
+        Err(e) => return Err(discard(parent, temp, CopyStep::Recheck, e.code, e.source, guard)),
+    };
+    if now.len != src_meta.len || now.modified != src_meta.modified {
+        let changed = std::io::Error::other("source changed");
+        return Err(discard(parent, temp, CopyStep::Recheck, Code::SourceChanged, changed, guard));
+    }
+    Ok(())
+}
+
+/// Why a verification re-read stopped before its digest: the heartbeat failed, or the read itself did.
+enum ReadFail {
+    Beat(FsError),
+    Read(std::io::Error),
+}
+
+/// Cut 13: hash `reader` to EOF in `buf`-sized reads, beating once per chunk like the stream loop.
+fn hash_stream<R: std::io::Read>(
+    reader: &mut R,
+    buf: &mut [u8],
+    beat: &Heartbeat<'_>,
+) -> std::result::Result<(flux_hash::Digest, u64), ReadFail> {
+    let mut beat_failure = None;
+    let result = flux_hash::hash_reader(reader, buf, &mut || {
+        beat().map_err(|e| {
+            beat_failure = Some(e);
+            std::io::Error::other("heartbeat failed during verification")
+        })
+    });
+    match (result, beat_failure) {
+        (Ok(v), _) => Ok(v),
+        (Err(_), Some(e)) => Err(ReadFail::Beat(e)),
+        (Err(e), None) => Err(ReadFail::Read(e)),
+    }
+}
+
+/// Discard the temporary after a verification re-read failed. A failed beat is a `Heartbeat` failure with its own code;
+/// a read error keeps the read's own code under `Verify`, and is NOT a `VerifyMismatch` (design C3).
+fn discard_read_fail<D: DirHandle>(
+    parent: &D,
+    temp: &OsStr,
+    fail: ReadFail,
+    guard: &Guard<'_>,
+) -> CopyError {
+    match fail {
+        ReadFail::Beat(e) => discard(parent, temp, CopyStep::Heartbeat, e.code, e.source, guard),
+        ReadFail::Read(e) => discard(parent, temp, CopyStep::Verify, copy_code(&e), e, guard),
+    }
+}
+
 /// Steps 1-7 of the copy, up to and including the source recheck and the read of the temporary's identity: everything
 /// before the final heartbeat, guard and publishing rename. At `SyncAt::Staging` the writer is dropped on return, so no
 /// descriptor is held; at `SyncAt::Barrier` it is NOT: the open writer rides in `Staged.writer` and the flush closes it
@@ -781,6 +856,19 @@ pub(crate) fn stage_file<F: DestinationRoot>(
         ),
     };
     let Verdict { start, carry, discard: why, proven } = verdict;
+    // Cut 13 (C9): a resumed file's prefix was never hashed by this run, so a digest of it would prove nothing. Refused
+    // before `open_existing`, so the partial is left exactly as the crashed run left it.
+    if opts.verify != VerifyLevel::None && matches!(start, Start::Resume { .. }) {
+        return Err(CopyError::at(
+            CopyStep::Verify,
+            FsError::new(
+                Code::CopyFailed,
+                std::io::Error::other("verification of a resumed file is not supported"),
+            ),
+        ));
+    }
+    // Cut 13: the digest of the source bytes as they are read (C8). `None` does no hashing at all.
+    let mut hasher = (opts.verify != VerifyLevel::None).then(flux_hash::Hasher::new);
     let (mut writer, reused) = match (start, partial_identity) {
         (Start::Resume { offset }, Some(identity)) => {
             // A destination mutation, so its own section 99 check. The partial is reopened for writing by the identity
@@ -842,6 +930,9 @@ pub(crate) fn stage_file<F: DestinationRoot>(
         }
         // The source bytes `decide` consumed are written first: `reader` already sits past them.
         if !carry.is_empty() {
+            if let Some(h) = hasher.as_mut() {
+                h.update(&carry);
+            }
             if let Err(e) = writer.write_all(&carry) {
                 break 'stream Err(StreamFail::Discard(CopyStep::Stream, copy_code(&e), e));
             }
@@ -860,6 +951,9 @@ pub(crate) fn stage_file<F: DestinationRoot>(
                     break 'stream Err(StreamFail::Discard(CopyStep::Stream, copy_code(&e), e));
                 }
             };
+            if let Some(h) = hasher.as_mut() {
+                h.update(&buf[..n]);
+            }
             if let Err(e) = writer.write_all(&buf[..n]) {
                 break 'stream Err(StreamFail::Discard(CopyStep::Stream, copy_code(&e), e));
             }
@@ -895,6 +989,71 @@ pub(crate) fn stage_file<F: DestinationRoot>(
         Err(StreamFail::Discard(step, code, source)) => {
             return Err(discard(parent, &temp, step, code, source, guard));
         }
+    }
+
+    // 5b. cut 13: verification. The source digest `S` covers what the loop read; `destination` and `full` compare it
+    //     with a re-read of the temporary (and, for `full`, of the source) BEFORE anything is published.
+    let mut verified = false;
+    if matches!(opts.verify, VerifyLevel::Destination | VerifyLevel::Full)
+        && let Some(source_digest) = hasher.as_ref().map(flux_hash::Hasher::finalize)
+    {
+        // C13: the cheap source recheck first, so a source that already changed costs no read-back.
+        recheck_source(fs, src, &src_meta, parent, &temp, guard)?;
+        let streamed_len = reused + bytes_copied;
+        let mut vbuf = vec![0u8; copy_buffer_len(src_meta.len)];
+
+        let mut temp_reader = match parent.open_read(&temp) {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(discard(parent, &temp, CopyStep::Verify, e.code, e.source, guard));
+            }
+        };
+        let (digest, len) = match hash_stream(&mut temp_reader, &mut vbuf, beat) {
+            Ok(v) => v,
+            Err(fail) => return Err(discard_read_fail(parent, &temp, fail, guard)),
+        };
+        drop(temp_reader);
+        if digest != source_digest {
+            let text = format!(
+                "destination bytes differ from the source stream (source stream {streamed_len} bytes, destination re-read {len} bytes)"
+            );
+            return Err(discard(
+                parent,
+                &temp,
+                CopyStep::Verify,
+                Code::VerifyMismatch,
+                std::io::Error::other(text),
+                guard,
+            ));
+        }
+
+        if opts.verify == VerifyLevel::Full {
+            // C11: an independent read of the source, by path, as the first read was.
+            let mut second = match fs.open_read(src) {
+                Ok(r) => r,
+                Err(e) => {
+                    return Err(discard(parent, &temp, CopyStep::Verify, e.code, e.source, guard));
+                }
+            };
+            let (again, len) = match hash_stream(&mut second, &mut vbuf, beat) {
+                Ok(v) => v,
+                Err(fail) => return Err(discard_read_fail(parent, &temp, fail, guard)),
+            };
+            if again != source_digest {
+                let text = format!(
+                    "source bytes differ between the copy and the second read (first read {streamed_len} bytes, second read {len} bytes)"
+                );
+                return Err(discard(
+                    parent,
+                    &temp,
+                    CopyStep::Verify,
+                    Code::VerifyMismatch,
+                    std::io::Error::other(text),
+                    guard,
+                ));
+            }
+        }
+        verified = true;
     }
 
     // 6. metadata, on the temporary, BEFORE publication (§44.1)
@@ -953,28 +1112,7 @@ pub(crate) fn stage_file<F: DestinationRoot>(
     // 7. the source must not have changed under us (Section 33), then publish.
     //    Note the `match` rather than `?`: a `?` here would return with the temporary
     //    still on disk, which is the one leak the `discard` helper exists to prevent.
-    let now = match fs.metadata(src) {
-        Ok(m) => m,
-        // Gone is the most complete form of "changed under us", and the taxonomy has
-        // a code for that. Reporting IO_ERROR here would hide it among unrelated
-        // failures.
-        Err(e) if e.source.kind() == std::io::ErrorKind::NotFound => {
-            let gone = std::io::Error::other("source disappeared during the copy");
-            return Err(discard(
-                parent,
-                &temp,
-                CopyStep::Recheck,
-                Code::SourceChanged,
-                gone,
-                guard,
-            ));
-        }
-        Err(e) => return Err(discard(parent, &temp, CopyStep::Recheck, e.code, e.source, guard)),
-    };
-    if now.len != src_meta.len || now.modified != src_meta.modified {
-        let changed = std::io::Error::other("source changed");
-        return Err(discard(parent, &temp, CopyStep::Recheck, Code::SourceChanged, changed, guard));
-    }
+    recheck_source(fs, src, &src_meta, parent, &temp, guard)?;
 
     // Cut 7b: the object about to be published, read from its own handle - a rename keeps it - so the run records the
     // target's identity without a look-up by name after the rename.
@@ -992,6 +1130,7 @@ pub(crate) fn stage_file<F: DestinationRoot>(
         writer,
         reused,
         discard: why,
+        verified,
     }))
 }
 
@@ -1117,6 +1256,7 @@ pub(crate) fn publish_staged<D: DirHandle>(
         writer,
         reused: _,
         discard: _,
+        verified,
     } = staged;
     // Cut 9e: a file published at the barrier was synced there; either way no descriptor is held across the rename.
     drop(writer);
@@ -1153,7 +1293,7 @@ pub(crate) fn publish_staged<D: DirHandle>(
         identity_degraded,
         published_identity,
         skipped: false,
-        verified: false,
+        verified,
     })
 }
 
@@ -4955,6 +5095,367 @@ mod tests {
             ));
             assert_eq!((staged.reused, staged.discard), (3 * MIB as u64, None), "{t:?}");
             run.abandon();
+        }
+    }
+
+    // ---- cut 13 task 3: copy-side verification ----
+
+    const TEMP: &str = "/dst.flux-partial.op1";
+
+    fn level(v: flux_fs::VerifyLevel) -> CopyOptions {
+        CopyOptions { verify: v, ..opts() }
+    }
+
+    fn run_copy(fs: &FaultFs, o: &CopyOptions) -> std::result::Result<Outcome, CopyError> {
+        copy_file(fs, Path::new("/src"), Path::new("/dst"), o)
+    }
+
+    fn seeded(bytes: &[u8]) -> FaultFs {
+        let fs = FaultFs::new();
+        fs.write_file("/src", bytes);
+        fs
+    }
+
+    /// The 1-based ordinal of the first `call` among the calls that start with `kind`, searching from `after`.
+    fn ordinal(calls: &[String], kind: &str, call: &str, after: usize) -> u32 {
+        let mut n = 0;
+        for (i, c) in calls.iter().enumerate() {
+            if c.starts_with(kind) {
+                n += 1;
+                if i >= after && c == call {
+                    return n;
+                }
+            }
+        }
+        panic!("{call} not found after {after} in {calls:?}");
+    }
+
+    /// The call log of a reference run (same seed, same options), whose ordinals the tests assert.
+    fn reference(bytes: &[u8], o: &CopyOptions) -> Vec<String> {
+        let fs = seeded(bytes);
+        run_copy(&fs, o).unwrap();
+        fs.calls()
+    }
+
+    fn expect_err(r: std::result::Result<Outcome, CopyError>) -> CopyError {
+        match r {
+            Ok(o) => panic!("expected an error, got {o:?}"),
+            Err(e) => e,
+        }
+    }
+
+    use flux_fs::VerifyLevel::{Destination, Full, SourceStream};
+
+    #[test]
+    fn none_adds_no_filesystem_calls() {
+        let fs = seeded(b"hello");
+        let out = run_copy(&fs, &opts()).unwrap();
+        assert!(!out.verified);
+        // Recorded from the code BEFORE `stage_file` gained its verification steps.
+        let golden: Vec<String> = [
+            "remove_file(/dst.flux-partial.op1)",
+            "metadata(/src)",
+            "metadata(/dst)",
+            "open_read(/src)",
+            "create_new(/dst.flux-partial.op1)",
+            "set_times(/dst.flux-partial.op1)",
+            "set_permissions(/dst.flux-partial.op1)",
+            "metadata(/src)",
+            "drop_writer(/dst.flux-partial.op1)",
+            "rename_replace(/dst.flux-partial.op1 -> /dst)",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(fs.calls(), golden);
+    }
+
+    #[test]
+    fn destination_clean_copy_is_verified_and_published() {
+        let fs = seeded(b"hello");
+        let out = run_copy(&fs, &level(Destination)).unwrap();
+        assert!(out.verified);
+        assert_eq!(fs.read_file("/dst").as_deref(), Some(&b"hello"[..]));
+        let calls = fs.calls();
+        let create = calls.iter().position(|c| c == &format!("create_new({TEMP})")).unwrap();
+        let reread = calls.iter().position(|c| c == &format!("open_read({TEMP})")).unwrap();
+        let times = calls.iter().position(|c| c == &format!("set_times({TEMP})")).unwrap();
+        assert!(
+            create < reread && reread < times,
+            "re-read after the stream, before metadata: {calls:?}"
+        );
+    }
+
+    /// Runs a `Destination` copy of `bytes` over a fresh fake where `hook` fires just before the temporary's re-read.
+    fn destination_with_hook_before_reread(
+        bytes: &[u8],
+        seed_dst: Option<&[u8]>,
+        hook: impl FnOnce(&FaultFs) + Send + 'static,
+    ) -> (FaultFs, std::result::Result<Outcome, CopyError>) {
+        let o = level(Destination);
+        let refer = FaultFs::new();
+        refer.write_file("/src", bytes);
+        if let Some(d) = seed_dst {
+            refer.write_file("/dst", d);
+        }
+        run_copy(&refer, &o).unwrap();
+        let calls = refer.calls();
+        let n = ordinal(&calls, "open_read(", &format!("open_read({TEMP})"), 0);
+        assert_eq!(n, 2, "the temporary's re-read is the second open_read: {calls:?}");
+        let fs = seeded(bytes);
+        if let Some(d) = seed_dst {
+            fs.write_file("/dst", d);
+        }
+        fs.on_nth("open_read", n, hook);
+        let r = run_copy(&fs, &o);
+        (fs, r)
+    }
+
+    #[test]
+    fn destination_mismatch_is_discarded_and_never_published() {
+        let (fs, r) = destination_with_hook_before_reread(b"hello", None, |fs| {
+            fs.write_file(TEMP, b"HELLX");
+        });
+        let e = expect_err(r);
+        assert_eq!(e.code(), Code::VerifyMismatch);
+        assert_eq!(e.step, CopyStep::Verify);
+        assert!(e.leftover.is_none());
+        assert!(!fs.exists("/dst"));
+        assert!(!fs.exists(TEMP));
+    }
+
+    #[test]
+    fn a_mismatch_over_an_existing_file_leaves_it_untouched() {
+        let (fs, r) = destination_with_hook_before_reread(b"hello", Some(b"old"), |fs| {
+            fs.write_file(TEMP, b"HELLX");
+        });
+        assert_eq!(expect_err(r).code(), Code::VerifyMismatch);
+        assert_eq!(fs.read_file("/dst").as_deref(), Some(&b"old"[..]));
+        assert!(!fs.exists(TEMP));
+    }
+
+    #[test]
+    fn an_empty_file_verifies() {
+        let fs = seeded(b"");
+        let out = run_copy(&fs, &level(Destination)).unwrap();
+        assert!(out.verified);
+        assert_eq!(fs.read_file("/dst").as_deref(), Some(&b""[..]));
+    }
+
+    #[test]
+    fn a_multi_buffer_file_verifies_and_a_late_corruption_is_caught() {
+        let bytes = pattern(COPY_BUF_MAX * 3 + 17, 3);
+        let (fs, r) = destination_with_hook_before_reread(&bytes, None, |_| {});
+        assert!(r.unwrap().verified);
+        assert_eq!(fs.read_file("/dst").unwrap(), bytes);
+
+        let mut bad = bytes.clone();
+        *bad.last_mut().unwrap() ^= 0xFF;
+        let (fs, r) = destination_with_hook_before_reread(&bytes, None, move |fs| {
+            fs.write_file(TEMP, &bad);
+        });
+        let e = expect_err(r);
+        assert_eq!((e.code(), e.step), (Code::VerifyMismatch, CopyStep::Verify));
+        assert!(!fs.exists("/dst") && !fs.exists(TEMP));
+    }
+
+    #[test]
+    fn a_short_or_long_reread_is_a_mismatch() {
+        for (name, reread) in [("short", b"hell".to_vec()), ("long", b"helloX".to_vec())] {
+            let (fs, r) = destination_with_hook_before_reread(b"hello", None, move |fs| {
+                fs.write_file(TEMP, &reread);
+            });
+            let e = expect_err(r);
+            assert_eq!((e.code(), e.step), (Code::VerifyMismatch, CopyStep::Verify), "{name}");
+            assert!(!fs.exists("/dst") && !fs.exists(TEMP), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_reread_io_error_is_not_a_mismatch() {
+        let fs = seeded(b"hello");
+        fs.fail_read_nth(".flux-partial", 1, std::io::ErrorKind::Other);
+        let e = expect_err(run_copy(&fs, &level(Destination)));
+        assert_ne!(e.code(), Code::VerifyMismatch);
+        assert_eq!(e.step, CopyStep::Verify);
+        assert!(e.leftover.is_none());
+        assert!(!fs.exists(TEMP) && !fs.exists("/dst"));
+    }
+
+    #[test]
+    fn full_catches_a_source_that_changes_between_the_reads() {
+        let o = level(Full);
+        let calls = reference(b"hello", &o);
+        let n = ordinal(&calls, "open_read(", "open_read(/src)", calls.len() / 2);
+        assert_eq!(n, 3, "full's second source read is the third open_read: {calls:?}");
+        let fs = seeded(b"hello");
+        fs.on_nth("open_read", n, |fs| fs.write_file("/src", b"HELLX"));
+        let e = expect_err(run_copy(&fs, &o));
+        assert_eq!((e.code(), e.step), (Code::VerifyMismatch, CopyStep::Verify));
+        assert!(
+            e.cause
+                .source
+                .to_string()
+                .contains("source bytes differ between the copy and the second read"),
+            "{e}"
+        );
+        assert!(!fs.exists("/dst") && !fs.exists(TEMP));
+    }
+
+    #[test]
+    fn full_clean_copy_reads_the_source_twice() {
+        let fs = seeded(b"hello");
+        let out = run_copy(&fs, &level(Full)).unwrap();
+        assert!(out.verified);
+        let calls = fs.calls();
+        assert_eq!(calls.iter().filter(|c| *c == "open_read(/src)").count(), 2, "{calls:?}");
+        assert_eq!(calls.iter().filter(|c| *c == &format!("open_read({TEMP})")).count(), 1);
+        assert_eq!(fs.read_file("/dst").as_deref(), Some(&b"hello"[..]));
+    }
+
+    #[test]
+    fn source_stream_hashes_but_compares_nothing() {
+        let o = level(SourceStream);
+        let calls = reference(b"hello", &o);
+        let n = calls.iter().filter(|c| c.starts_with("set_times(")).count();
+        assert_eq!(n, 1);
+        let fs = seeded(b"hello");
+        // After the stream, before the metadata: a destination that no longer holds the source bytes.
+        fs.on_nth("set_times", 1, |fs| fs.write_file(TEMP, b"HELLX"));
+        let out = run_copy(&fs, &o).unwrap();
+        assert!(!out.verified);
+        assert_eq!(fs.read_file("/dst").as_deref(), Some(&b"HELLX"[..]));
+        assert!(!fs.called(&format!("open_read({TEMP})")), "{:?}", fs.calls());
+        assert_eq!(fs.calls().iter().filter(|c| c.starts_with("open_read(")).count(), 1);
+    }
+
+    #[test]
+    fn the_early_recheck_runs_before_the_reread() {
+        let o = level(Destination);
+        let calls = reference(b"hello", &o);
+        let create = calls.iter().position(|c| c.starts_with("create_new(")).unwrap();
+        let n = ordinal(&calls, "metadata(", "metadata(/src)", create);
+        assert_eq!(n, 3, "the early recheck is the third metadata call: {calls:?}");
+        let fs = seeded(b"hello");
+        fs.on_nth("metadata", n, |fs| fs.write_file("/src", b"hello, but longer"));
+        let e = expect_err(run_copy(&fs, &o));
+        assert_eq!((e.code(), e.step), (Code::SourceChanged, CopyStep::Recheck));
+        assert!(!fs.called(&format!("open_read({TEMP})")), "{:?}", fs.calls());
+        assert!(!fs.exists(TEMP) && !fs.exists("/dst"));
+    }
+
+    #[test]
+    fn a_failed_heartbeat_during_the_reread_discards_the_temporary() {
+        fn beats(v: flux_fs::VerifyLevel) -> usize {
+            let fs = seeded(b"hello");
+            let n = std::cell::Cell::new(0usize);
+            let beat = || {
+                n.set(n.get() + 1);
+                Ok(())
+            };
+            copy_file_guarded(
+                &fs,
+                Path::new("/src"),
+                &fs.destination_root(Path::new("/")).unwrap(),
+                OsStr::new("dst"),
+                &level(v),
+                &unguarded,
+                &beat,
+                &no_before_create,
+                &no_before_publish,
+            )
+            .unwrap();
+            n.get()
+        }
+        let (none, dest) = (beats(flux_fs::VerifyLevel::None), beats(Destination));
+        assert!(dest > none, "the re-read beats at least once ({none} vs {dest})");
+        // The re-read's first beat is the last one the `None` run makes before its final (publish) beat.
+        let fail_at = none;
+        let fs = seeded(b"hello");
+        let n = std::cell::Cell::new(0usize);
+        let beat = || {
+            n.set(n.get() + 1);
+            if n.get() == fail_at {
+                Err(FsError::new(Code::IoError, std::io::Error::other("lock lost")))
+            } else {
+                Ok(())
+            }
+        };
+        let e = expect_err(copy_file_guarded(
+            &fs,
+            Path::new("/src"),
+            &fs.destination_root(Path::new("/")).unwrap(),
+            OsStr::new("dst"),
+            &level(Destination),
+            &unguarded,
+            &beat,
+            &no_before_create,
+            &no_before_publish,
+        ));
+        assert_eq!(e.step, CopyStep::Heartbeat);
+        assert!(
+            fs.called(&format!("open_read({TEMP})")),
+            "the beat failed inside the re-read: {:?}",
+            fs.calls()
+        );
+        assert!(!fs.called("set_times"), "the re-read comes before the metadata: {:?}", fs.calls());
+        assert!(!fs.exists(TEMP) && !fs.exists("/dst"));
+    }
+
+    #[test]
+    fn verifying_a_resumed_partial_is_refused_before_it_is_touched() {
+        let (fs, root, src) = resume_fixture(5 * MIB, 3);
+        fs.write_file(PARTIAL, &src[..3 * MIB]);
+        let run = run_gen(&fs, 2, Durability::Normal);
+        let fc = FileCkpt { run: &run, file_id: b"f".to_vec(), destination: b"dst".to_vec() };
+        let mark = fs.calls().len();
+        let e = stage_file(
+            &fs,
+            Path::new("/src"),
+            &root,
+            OsStr::new("dst"),
+            &level(Destination),
+            &unguarded,
+            &no_heartbeat,
+            &no_before_create,
+            SyncAt::Staging,
+            Some(Hook::Logged(&fc)),
+        )
+        .err()
+        .expect("a verified resume is refused");
+        assert_eq!((e.step, e.code()), (CopyStep::Verify, Code::CopyFailed));
+        assert_eq!(fs.read_file(PARTIAL).unwrap(), src[..3 * MIB]);
+        let after = fs.calls()[mark..].to_vec();
+        assert!(
+            after.iter().all(|c| !c.starts_with("truncate_to(")
+                && !c.starts_with("remove_file(")
+                && !c.starts_with("create_new(")),
+            "the partial is not touched: {after:?}"
+        );
+        run.abandon();
+    }
+
+    #[test]
+    fn publish_staged_reports_verified() {
+        for (v, want) in [
+            (flux_fs::VerifyLevel::None, false),
+            (Destination, true),
+            (Full, true),
+            (SourceStream, false),
+        ] {
+            let fs = seeded(b"hello");
+            let root = fs.destination_root(Path::new("/")).unwrap();
+            let staged = stage_with(&fs, &root, &level(v), SyncAt::Staging);
+            assert_eq!(staged.verified, want, "{v:?}");
+            let out = publish_staged(
+                &root,
+                OsStr::new("dst"),
+                staged,
+                Publish::Replace,
+                &unguarded,
+                &no_heartbeat,
+            )
+            .unwrap();
+            assert_eq!(out.verified, want, "{v:?}");
         }
     }
 }

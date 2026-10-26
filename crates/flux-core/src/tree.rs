@@ -3489,6 +3489,7 @@ fn publish_identified<F: DestinationRoot>(
         writer: None,
         reused: 0,
         discard: None,
+        verified: false,
     };
     publish_staged(parent, name, staged, publish, cx.guard, cx.beat)
 }
