@@ -122,4 +122,4 @@ These are limits and rulings of the cut, not test gaps. Each is stated as the sp
   **Compensation:** the engine tests `a_link_the_destination_cannot_hold_degrades_under_auto` and
   `a_link_the_destination_cannot_hold_fails_under_preserve` (`crates/flux-core/src/run/tests.rs`) pin the outcome of the
   refusal (degrade under `auto`, `HARDLINK_UNAVAILABLE` under `preserve`), and the Unix errno mapping of the primitive is
-  unit-pinned (`map_link_errno`, `crates/flux-platform/src/dir_unix.rs`). Not yet owner-accepted.
+  unit-pinned (`map_link_errno`, `crates/flux-platform/src/dir_unix.rs`). Owner-accepted 2026-10-26.
