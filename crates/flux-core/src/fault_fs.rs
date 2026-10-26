@@ -815,7 +815,7 @@ impl Write for FakeHandle {
         if let Some(sink) = &self.sink {
             let mut g = sink.lock().unwrap();
             if let Some((pat, n, kind)) = g.write_nth.clone()
-                && self.path.to_string_lossy().contains(&pat)
+                && self.path.to_string_lossy().replace('\\', "/").contains(&pat)
             {
                 g.writes += 1;
                 if g.writes == n {
