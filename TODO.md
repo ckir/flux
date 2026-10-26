@@ -1202,3 +1202,11 @@ item was, not only in a commit message.
 - [ ] **The page-cache boundary of the `destination` re-read.** The re-read may be served by the operating system's
       cache, so a pass proves the destination returned the bytes that were written, not that they reached stable
       storage. `--help` and the README say so; no mechanism (direct I/O, a cache drop) bypasses it yet.
+
+## Cut 14 open (flux verify; spec `docs/superpowers/specs/2026-10-26-verify-command-design.md`)
+
+- [ ] **Several sources for `verify`** (cut 14b). Today `flux verify` takes one source and one DEST.
+- [ ] **`--exclude` and `--recursive` through the shared walker** when phase 3 selection lands. Today both are usage
+      errors (exit 2).
+- [ ] **Windows reparse points and junctions** as `Other` or `Symlink` in verify are CI evidence only; no local
+      Windows run has shown how the walker classifies them.
