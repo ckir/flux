@@ -295,7 +295,7 @@ On the in-memory/fault filesystem (`flux-core` unit tests):
 3. missing file, missing directory (all descendants `missing`, not hashed), extra file, extra directory (descendants `extra`).
 4. file vs directory at the same path, both directions (section 6.3): the type record plus children as `extra` /
    `missing`; assert the exact record sequence.
-5. component-wise order: `a`, `a.txt`, `a/b`, `a-b` in both trees, in different creation orders: no spurious
+5. component-wise order: `a`, `a/b`, `a-b`, `a.txt` in both trees, in different creation orders: no spurious
    `missing`/`extra`.
 6. symlink payload equal / different / symlink vs file; `--links=skip` drops source symlinks but keeps a DEST-only
    symlink as `extra`.
