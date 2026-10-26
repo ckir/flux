@@ -5,7 +5,7 @@
 // https://polyformproject.org/licenses/noncommercial/1.0.0/
 
 //! The run's side of the hardlink index (cut 12, Task 4): the lazily created per-run index file, and the helpers that
-//! open an anchor's directory and read an anchor's object. Nothing here links yet.
+//! open an anchor's directory and read an anchor's object.
 
 use crate::run::recover::name_of;
 use crate::state::HARDLINK_INDEX;
@@ -15,8 +15,6 @@ use std::ffi::{OsStr, OsString};
 use std::io::ErrorKind;
 use std::ops::Deref;
 
-// Task 6 consumes this.
-#[allow(dead_code)]
 enum SlotState<I> {
     Unopened,
     Open(I),
@@ -24,8 +22,6 @@ enum SlotState<I> {
 }
 
 /// Where a slot's index file goes.
-// Task 6 consumes this.
-#[allow(dead_code)]
 enum Home<D> {
     /// A directory in hand (the live run's workspace).
     Ready(D),
@@ -74,8 +70,6 @@ impl<D: DirHandle> HardlinkSlot<D> {
         }
     }
 
-    // Task 6 consumes `with` and `create`.
-    #[allow(dead_code)]
     /// Lazily removes a stale `HARDLINK_INDEX` and creates a fresh one on the first call; a creation failure is kept
     /// and returned on every call (ruling 9).
     pub(crate) fn with<R>(
@@ -96,7 +90,6 @@ impl<D: DirHandle> HardlinkSlot<D> {
         }
     }
 
-    #[allow(dead_code)]
     /// Makes a deferred slot's directory, then removes a stale file from an earlier run of this operation (a `NotFound`
     /// is the usual answer) and creates a fresh index exclusively.
     fn create(&self) -> Result<D::Index, Code> {
@@ -180,15 +173,11 @@ impl<D: DirHandle> HardlinkSlot<D> {
     }
 }
 
-// Task 6 consumes this.
-#[allow(dead_code)]
 fn unavailable_error(code: Code) -> FsError {
     FsError::new(code, std::io::Error::other("the hardlink index could not be created"))
 }
 
 /// The directory an anchor lives in: DEST itself for a one-component key, else a handle opened below it.
-// Task 6 consumes this.
-#[allow(dead_code)]
 pub(crate) enum ParentDir<'a, D> {
     Dest(&'a D),
     Opened(D),
@@ -206,8 +195,6 @@ impl<D> Deref for ParentDir<'_, D> {
 
 /// The anchor's directory and name, opened component by component from `dest` with `open_dir` (never a path), from
 /// the claim-key bytes of `target`; `None` when a component does not decode (`recover::name_of`) or an open fails.
-// Task 6 consumes this.
-#[allow(dead_code)]
 pub(crate) fn anchor_parent<'a, D: DirHandle>(
     dest: &'a D,
     target: &FluxPathKey,
@@ -228,6 +215,22 @@ pub(crate) fn anchor_parent<'a, D: DirHandle>(
         dir = Some(next);
     }
     Some((dir.map_or(ParentDir::Dest(dest), ParentDir::Opened), name))
+}
+
+/// A claim key as a path for display: its components decoded as `recover::name_of` decodes them (lossily where one
+/// does not decode), joined by `/`.
+pub(crate) fn shown(key: &FluxPathKey) -> std::path::PathBuf {
+    let mut shown = OsString::new();
+    for (i, component) in key.0.split(|b| *b == 0).enumerate() {
+        if i > 0 {
+            shown.push("/");
+        }
+        shown.push(
+            name_of(component)
+                .unwrap_or_else(|| String::from_utf8_lossy(component).into_owned().into()),
+        );
+    }
+    shown.into()
 }
 
 /// What a regular file's metadata says about hardlink grouping (cut 12, Task 5).
@@ -319,7 +322,7 @@ mod tests {
     }
 
     // Ruling 15: a lost lock closes with `remove: false`. The run-level version (a real group's index surviving a lost
-    // lock) lands with Task 6, when the engine opens the index.
+    // lock) is `a_lost_lock_keeps_the_index_file` in `run/tests.rs`.
     #[test]
     fn close_without_remove_keeps_an_open_slots_file() {
         let (fs, d) = setup();
