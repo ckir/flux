@@ -7794,17 +7794,6 @@ fn dry() -> RunConfig {
     RunConfig { dry_run: true, ..cfg() }
 }
 
-/// `fake()` with the directory a dry run's hardlink index is made in (cut 12): the default temp root, which the fake
-/// does not have, would otherwise be reported as `HardlinkIndexUnavailable`.
-fn fake_with_temp_root() -> FaultFs {
-    let fs = fake();
-    let root = std::env::temp_dir();
-    if !fs.exists(&root) {
-        fs.create_dir(&root).unwrap();
-    }
-    fs
-}
-
 /// True for a call that names no path, or one whose path is `/p` or `/src` or below.
 /// A call that names a claim key, not a path, is always in scope.
 fn in_scope(call: &str) -> bool {
@@ -8022,7 +8011,7 @@ fn assert_resumable_refusal(stop: &Option<RunError>) {
 #[test]
 fn a_dry_run_notes_each_prior_and_still_plans() {
     // Resumable: the note stays, and the run predicts the refusal instead of planning.
-    let fs = fake_with_temp_root();
+    let fs = fake();
     prior(&fs, 5, OpState::Failed);
     let (r, _) = run_tree(&fs, &dry());
     assert_resumable_refusal(&r.stop);
@@ -8036,7 +8025,7 @@ fn a_dry_run_notes_each_prior_and_still_plans() {
         r.warnings
     );
     // Completed.
-    let fs = fake_with_temp_root();
+    let fs = fake();
     prior(&fs, 6, OpState::Completed);
     let (r, _) = run_tree(&fs, &dry());
     assert_eq!(ok(&r).files_copied, 2);
@@ -8047,7 +8036,7 @@ fn a_dry_run_notes_each_prior_and_still_plans() {
         r.warnings
     );
     // Unreadable: the scan's error is the real run's, and it ends the preview with no plan.
-    let fs = fake_with_temp_root();
+    let fs = fake();
     prior(&fs, 7, OpState::Failed);
     fs.write_file(format!("/p/dest/.flux/operations/{}/manifest", id(7)), b"garbage");
     let (r, _) = run_tree(&fs, &dry());
@@ -8063,23 +8052,23 @@ fn a_dry_run_says_whether_it_saw_a_prior_through_both_entry_points() {
         let (r, _) = run_tree(fs, &dry());
         (r.dry.as_ref().unwrap().prior_seen, r.warnings.len())
     };
-    let fs = fake_with_temp_root();
+    let fs = fake();
     assert_eq!(seen_tree(&fs), (false, 0));
     // A completed prior sets it; a resumable one (the predicted refusal) does not (spec 3.3).
     for (state, seen) in [(OpState::Failed, false), (OpState::Completed, true)] {
-        let fs = fake_with_temp_root();
+        let fs = fake();
         prior(&fs, 5, state);
         assert_eq!(seen_tree(&fs), (seen, 1), "{state:?}");
     }
-    let fs = fake_with_temp_root();
+    let fs = fake();
     prior(&fs, 7, OpState::Failed);
     fs.write_file(format!("/p/dest/.flux/operations/{}/manifest", id(7)), b"garbage");
     assert_eq!(seen_tree(&fs), (false, 0), "unreadable");
 
-    let fs = fake_with_temp_root();
+    let fs = fake();
     let r = run_file(&fs, &dry());
     assert!(!r.dry.as_ref().unwrap().prior_seen && r.warnings.is_empty(), "{:?}", r.warnings);
-    let fs = fake_with_temp_root();
+    let fs = fake();
     file_prior(&fs, 5);
     let r = run_file(&fs, &dry());
     assert!(!r.dry.as_ref().unwrap().prior_seen, "a resumable prior is not `prior_seen`");
@@ -9204,37 +9193,43 @@ fn a_run_under_auto_with_no_hardlinks_leaves_no_index_file() {
     let log = calls(&fs);
     assert!(!fs.exists(format!("/p/dest/.flux/operations/{ID}/hardlinks.db")), "{log:?}");
     assert!(!log.iter().any(|c| c.starts_with("create_hardlink_index")), "{log:?}");
+    // Mutant: `close(true)` removes the file of an unopened slot. (`finish_retire` removes it from `<id>.removing`.)
+    let own = format!("remove_file(/p/dest/.flux/operations/{ID}/hardlinks.db)");
+    assert!(!log.contains(&own), "{log:?}");
 }
 
-// The brief counted `open_dir` calls, but the fake's handle-level `open_dir` is not in the call log (and `fault_fs.rs`
-// is outside Task 4's files); `Copy` mode's observable half is that it carries no slot and no warning, and creates
-// nothing either.
+// Cut 12 (fix round 1): the dry run's index directory is made at the first use of the index, and nothing consults the
+// index yet, so a dry run makes none and warns of nothing (mutant: build the directory when the slot is built).
 #[test]
-fn copy_mode_carries_no_slot_and_leaves_no_index_file() {
+fn a_dry_run_without_candidates_creates_no_temp_directory() {
+    // The fake has no `/tmp`: an eager directory would be reported as `HardlinkIndexUnavailable`.
     let fs = fake();
-    let mut o = opts();
-    o.hardlinks = flux_fs::Hardlinks::Copy;
-    let mut got = Vec::new();
-    let r = tree(&fs, Path::new("/src"), Path::new("/p/dest"), &o, &cfg(), &mut |f| got.push(f));
+    let (r, _) = run_tree(&fs, &dry());
+    assert_eq!(ok(&r).files_copied, 2);
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    // With a temporary root present, nothing is made under it either.
+    let fs = fake();
+    fs.create_dir(Path::new("/flux-dry")).unwrap();
+    let cfg = RunConfig { dry_temp_root: Some(PathBuf::from("/flux-dry")), ..dry() };
+    let (r, _) = run_tree(&fs, &cfg);
     ok(&r);
-    assert!(r.warnings.iter().all(|w| !matches!(w, RunWarning::HardlinkIndexUnavailable { .. })));
-    assert!(!calls(&fs).iter().any(|c| c.starts_with("create_hardlink_index")), "{:?}", calls(&fs));
-    assert!(!fs.exists(format!("/p/dest/.flux/operations/{ID}/hardlinks.db")));
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert!(!calls(&fs).iter().any(|c| c.starts_with("create_dir(/flux-dry/")), "{:?}", calls(&fs));
 }
 
-// Mutant: `close` is given `remove: true` on `Ended::Lost`. The index file is stood in for by a stale file the hook
-// writes into the workspace (nothing opens the index until the engine consults it).
+// Cut 12 (fix round 1): equal but non-Strong DEST identities leave linking impossible, silently (candidates degrade
+// later); only an error or two differing Strong identities warn. Mutant: the `_ => None` arm of the anchor-root check
+// pushes `HardlinkRootUnavailable`.
 #[test]
-fn a_lost_lock_keeps_the_index_file() {
+fn a_weak_identity_destination_makes_no_anchor_root_warning() {
     let fs = fake();
-    let index = format!("/p/dest/.flux/operations/{ID}/hardlinks.db");
-    let path = index.clone();
-    fs.on_nth("create_new", 4, move |fs| {
-        fs.write_file(LOCK, b"another run's bytes");
-        fs.write_file(&path, b"index");
-    });
+    fs.create_dir(Path::new("/p/dest")).unwrap();
+    fs.set_identity("/p/dest", FileIdentity::Weak(ObjectId { volume: 1, index: 77 }));
     let (r, _) = run_tree(&fs, &cfg());
-    assert_eq!(aborted(&r).error.code(), Code::TargetLockBusy);
-    assert!(fs.exists(&index), "the lost run no longer owns DEST: {:?}", calls(&fs));
-    assert!(!calls(&fs).iter().any(|c| c == &format!("remove_file({index})")), "{:?}", calls(&fs));
+    ok(&r);
+    assert!(
+        r.warnings.iter().all(|w| !matches!(w, RunWarning::HardlinkRootUnavailable { .. })),
+        "{:?}",
+        r.warnings
+    );
 }

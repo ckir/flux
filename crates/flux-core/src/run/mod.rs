@@ -47,7 +47,7 @@ use crate::tree::{
     copy_tree_at, copy_tree_frames, prepare_source, report,
 };
 use crate::walk::MountPolicy;
-use dry_prior::{DryAdopt, LockPreview, TempDir, dry_adopt, dry_lock, dry_restart};
+use dry_prior::{DryAdopt, LockPreview, dry_adopt, dry_lock, dry_restart};
 use flux_fs::{
     ClaimStore, Code, CopyOptions, DestinationRoot, DirHandle, FileIdentity, FsError,
     LockCapability, OperationId, Outcome,
@@ -487,23 +487,29 @@ where
             }
         };
         let walk_root = place.tree_place().dest.as_ref().map(|d| d.identity());
+        // Warn only for a real cause: an error from the reopen or an identity query, or two Strong identities that
+        // differ. Equal but not Strong identities leave linking impossible without a warning (candidates degrade).
         let anchor = match fs.destination_root(&place.tree_place().dest_shown) {
             Ok(root) => match (root.identity(), walk_root) {
-                (Ok(a), Some(Ok(b))) if strong(a).is_some() && a == b => Some(root),
                 (Err(error), _) | (_, Some(Err(error))) => {
                     run.warnings.push(RunWarning::HardlinkRootUnavailable { error });
                     None
                 }
-                _ => {
-                    let error = FsError::new(
-                        Code::DestinationError,
-                        std::io::Error::other(
-                            "DEST reopened as a directory other than the one the walk writes into",
-                        ),
-                    );
-                    run.warnings.push(RunWarning::HardlinkRootUnavailable { error });
-                    None
-                }
+                (Ok(again), Some(Ok(walk))) => match (strong(again), strong(walk)) {
+                    (Some(a), Some(b)) if a == b => Some(root),
+                    (Some(_), Some(_)) => {
+                        let error = FsError::new(
+                            Code::DestinationError,
+                            std::io::Error::other(
+                                "DEST reopened as a different directory than the one the walk writes into",
+                            ),
+                        );
+                        run.warnings.push(RunWarning::HardlinkRootUnavailable { error });
+                        None
+                    }
+                    _ => None,
+                },
+                (Ok(_), None) => None,
             },
             Err(error) => {
                 run.warnings.push(RunWarning::HardlinkRootUnavailable { error });
@@ -1425,31 +1431,14 @@ fn dry_tree<F: DestinationRoot>(
         _ => None,
     };
     let partials = std::cell::Cell::new(0u64);
-    // Cut 12 (ruling 10): the dry run's index lives in a temporary directory of its own; it never links.
-    let hardlinks_name = format!("{}-hardlinks", cfg.operation_id);
-    let hardlinks_path = temp_root.join(format!("flux-dry-{hardlinks_name}")).join(HARDLINK_INDEX);
-    let mut hardlinks_warned = false;
-    let (hardlinks_temp, hardlink_slot) = if opts.hardlinks == flux_fs::Hardlinks::Copy {
-        (None, None)
-    } else {
-        let made = TempDir::make(fs, &temp_root, &hardlinks_name).and_then(|temp| {
-            let handle = fs
-                .destination_root(&temp_root)
-                .and_then(|r| r.open_dir(OsStr::new(&format!("flux-dry-{hardlinks_name}"))));
-            handle.map(|h| (temp, h))
-        });
-        match made {
-            Ok((temp, handle)) => (Some(temp), Some(HardlinkSlot::new(handle))),
-            Err(e) => {
-                hardlinks_warned = true;
-                run.warnings.push(RunWarning::HardlinkIndexUnavailable {
-                    path: hardlinks_path.clone(),
-                    code: e.code,
-                });
-                (None, Some(HardlinkSlot::unavailable(e.code)))
-            }
-        }
-    };
+    // Cut 12 (ruling 10): the dry run's index lives in a private directory under the temporary root, made at the first
+    // use of the index (a tree without a candidate makes nothing); it never links.
+    let hardlinks_dir = format!("flux-dry-{}-hardlinks", cfg.operation_id);
+    let hardlinks_path = temp_root.join(&hardlinks_dir).join(HARDLINK_INDEX);
+    let hardlink_slot = (opts.hardlinks != flux_fs::Hardlinks::Copy).then(|| {
+        let parent = fs.destination_root(&temp_root).map_err(|e| e.code);
+        HardlinkSlot::deferred(parent, std::ffi::OsString::from(&hardlinks_dir))
+    });
     let cx = Shared {
         fs,
         src_root: &src_root,
@@ -1493,17 +1482,14 @@ fn dry_tree<F: DestinationRoot>(
             Err(CopyError::at(CopyStep::Resolve, e))
         }
     };
-    // Cut 12: the index file goes before its directory does.
+    // Cut 12: the index file and its private directory go with the slot.
     if let Some(slot) = hardlink_slot {
         let failure = slot.failure();
         drop(slot.close(true));
-        if let Some(code) = failure
-            && !hardlinks_warned
-        {
+        if let Some(code) = failure {
             run.warnings.push(RunWarning::HardlinkIndexUnavailable { path: hardlinks_path, code });
         }
     }
-    drop(hardlinks_temp);
     let mut result = match walked {
         Ok(()) => Ok(out),
         Err(error) => Err(TreeAbort { error, outcome: out }),

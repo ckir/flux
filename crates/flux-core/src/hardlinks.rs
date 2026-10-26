@@ -24,22 +24,53 @@ enum SlotState<I> {
     Failed(Code),
 }
 
+/// Where a slot's index file goes.
+enum Home<D> {
+    /// A directory in hand (the live run's workspace).
+    Ready(D),
+    /// A dry run's private directory `parent/name`, made at the first `with` and removed by `close(true)`.
+    Pending { parent: D, name: OsString },
+    /// `Pending`, but the parent could not be opened: the first `with` answers this code.
+    PendingFailed(Code),
+    /// `Pending` after the directory was made.
+    Made { parent: D, name: OsString, dir: D },
+    /// No directory: an `unavailable` slot.
+    Absent,
+}
+
 /// The run's hardlink index, created on first use inside the operation workspace (or a dry run's temporary
 /// directory). A creation failure is remembered and answered on every call (plan ruling 9).
 pub(crate) struct HardlinkSlot<D: DirHandle> {
-    dir: Option<D>,
+    home: RefCell<Home<D>>,
     state: RefCell<SlotState<D::Index>>,
 }
 
 impl<D: DirHandle> HardlinkSlot<D> {
     pub(crate) fn new(dir: D) -> Self {
-        HardlinkSlot { dir: Some(dir), state: RefCell::new(SlotState::Unopened) }
+        HardlinkSlot {
+            home: RefCell::new(Home::Ready(dir)),
+            state: RefCell::new(SlotState::Unopened),
+        }
+    }
+
+    /// A dry run's slot: nothing is made until the first `with` (a tree without a hardlink candidate leaves nothing
+    /// under the temporary root and warns of nothing). The first `with` creates `parent/name`; `parent` is `Err` when the
+    /// temporary root could not be opened, and that code is then answered by `with`.
+    pub(crate) fn deferred(parent: Result<D, Code>, name: OsString) -> Self {
+        let home = match parent {
+            Ok(parent) => Home::Pending { parent, name },
+            Err(code) => Home::PendingFailed(code),
+        };
+        HardlinkSlot { home: RefCell::new(home), state: RefCell::new(SlotState::Unopened) }
     }
 
     /// A slot with no directory, already failed: the workspace or temp directory could not be opened (ruling 9).
     /// `with` answers `code`; `close` returns `None`.
     pub(crate) fn unavailable(code: Code) -> Self {
-        HardlinkSlot { dir: None, state: RefCell::new(SlotState::Failed(code)) }
+        HardlinkSlot {
+            home: RefCell::new(Home::Absent),
+            state: RefCell::new(SlotState::Failed(code)),
+        }
     }
 
     /// Lazily removes a stale `HARDLINK_INDEX` and creates a fresh one on the first call; a creation failure is kept
@@ -62,10 +93,40 @@ impl<D: DirHandle> HardlinkSlot<D> {
         }
     }
 
-    /// A stale file from an earlier run of this operation is removed first (a `NotFound` is the usual answer), then a
-    /// fresh index is created exclusively.
+    /// Makes a deferred slot's directory, then removes a stale file from an earlier run of this operation (a `NotFound`
+    /// is the usual answer) and creates a fresh index exclusively.
     fn create(&self) -> Result<D::Index, Code> {
-        let dir = self.dir.as_ref().expect("an unopened slot has a directory");
+        let mut home = self.home.borrow_mut();
+        if matches!(*home, Home::PendingFailed(_)) {
+            let Home::PendingFailed(code) = *home else { unreachable!() };
+            return Err(code);
+        }
+        if matches!(*home, Home::Pending { .. }) {
+            let Home::Pending { parent, name } = std::mem::replace(&mut *home, Home::Absent) else {
+                unreachable!()
+            };
+            match parent.create_dir(&name) {
+                Ok(dir) => *home = Home::Made { parent, name, dir },
+                Err(e) if e.source.kind() == ErrorKind::AlreadyExists => {
+                    // A leftover of an earlier preview with this id: use it.
+                    match parent.open_dir(&name) {
+                        Ok(dir) => *home = Home::Made { parent, name, dir },
+                        Err(e) => {
+                            *home = Home::Pending { parent, name };
+                            return Err(e.code);
+                        }
+                    }
+                }
+                Err(e) => {
+                    *home = Home::Pending { parent, name };
+                    return Err(e.code);
+                }
+            }
+        }
+        let dir = match &*home {
+            Home::Ready(d) | Home::Made { dir: d, .. } => d,
+            _ => unreachable!("an unopened slot has a directory or failed above"),
+        };
         match dir.remove_file(OsStr::new(HARDLINK_INDEX)) {
             Ok(()) => {}
             Err(e) if e.source.kind() == ErrorKind::NotFound => {}
@@ -74,19 +135,36 @@ impl<D: DirHandle> HardlinkSlot<D> {
         dir.create_hardlink_index(OsStr::new(HARDLINK_INDEX)).map_err(|e| e.code)
     }
 
-    /// Drops the index; with `remove`, removes the file too (a `NotFound` is fine; ruling 15 passes `false` on a lost
-    /// lock). Returns the directory (`None` for an `unavailable` slot).
+    /// Drops the index; with `remove`, removes the file too, but only when the slot attempted a creation (an unopened
+    /// slot touches nothing; a `NotFound` is fine; ruling 15 passes `false` on a lost lock). A deferred slot's private
+    /// directory is removed with it. Returns the directory: `None` for an `unavailable` slot, a deferred one that
+    /// was never made, and a deferred one that `remove` took away.
     pub(crate) fn close(self, remove: bool) -> Option<D> {
-        let HardlinkSlot { dir, state } = self;
+        let HardlinkSlot { home, state } = self;
+        let attempted = !matches!(*state.borrow(), SlotState::Unopened);
         // The index is closed before its file is removed.
         drop(state);
-        let dir = dir?;
-        if remove {
-            // Best effort: whatever stays is removed with the workspace (`finish_retire`). An index never opened has
-            // no file of this run's; a stale one from an earlier run goes too.
-            let _ = dir.remove_file(OsStr::new(HARDLINK_INDEX));
+        match home.into_inner() {
+            Home::Ready(dir) => {
+                if remove && attempted {
+                    // Best effort: whatever stays goes with the workspace (`finish_retire`).
+                    let _ = dir.remove_file(OsStr::new(HARDLINK_INDEX));
+                }
+                Some(dir)
+            }
+            Home::Made { parent, name, dir } => {
+                if remove {
+                    let _ = dir.remove_file(OsStr::new(HARDLINK_INDEX));
+                    // The handle goes first, so a platform that cannot remove an open directory can.
+                    drop(dir);
+                    let _ = parent.remove_dir(&name);
+                    None
+                } else {
+                    Some(dir)
+                }
+            }
+            Home::Pending { .. } | Home::PendingFailed(_) | Home::Absent => None,
         }
-        Some(dir)
     }
 
     /// The creation failure, if one was recorded.
@@ -189,6 +267,48 @@ mod tests {
         // Only the first use's stale removal; `close(false)` removes nothing.
         let removals = fs.calls().iter().filter(|c| *c == "remove_file(/w/hardlinks.db)").count();
         assert_eq!(removals, 1);
+    }
+
+    // Mutant: `close` removes the file for an unopened slot as well.
+    #[test]
+    fn closing_an_unopened_slot_touches_nothing() {
+        let (fs, d) = setup();
+        fs.write_file("/w/hardlinks.db", b"stale");
+        drop(HardlinkSlot::new(d).close(true));
+        assert!(fs.exists("/w/hardlinks.db"));
+        assert!(!fs.calls().iter().any(|c| c.starts_with("remove_file")), "{:?}", fs.calls());
+    }
+
+    // Ruling 15: a lost lock closes with `remove: false`. The run-level version (a real group's index surviving a lost
+    // lock) lands with Task 6, when the engine opens the index.
+    #[test]
+    fn close_without_remove_keeps_an_open_slots_file() {
+        let (fs, d) = setup();
+        let slot = HardlinkSlot::new(d);
+        slot.with(|_| Ok(())).unwrap();
+        assert!(slot.close(false).is_some());
+        assert!(fs.exists("/w/hardlinks.db"));
+    }
+
+    #[test]
+    fn a_deferred_slot_makes_nothing_until_used_and_close_removes_its_directory() {
+        let (fs, d) = setup();
+        let parent = fs.destination_root(Path::new("/w")).unwrap();
+        let slot = HardlinkSlot::deferred(Ok(parent), OsString::from("flux-dry-x-hardlinks"));
+        assert!(!fs.exists("/w/flux-dry-x-hardlinks"));
+        slot.with(|_| Ok(())).unwrap();
+        assert!(fs.exists("/w/flux-dry-x-hardlinks/hardlinks.db"));
+        assert!(slot.close(true).is_none());
+        assert!(!fs.exists("/w/flux-dry-x-hardlinks"));
+        drop(d);
+        // Never used: nothing made, nothing removed, no failure.
+        let slot = HardlinkSlot::deferred(
+            Err::<crate::fault_fs::FakeDirHandle, _>(Code::IoError),
+            OsString::from("n"),
+        );
+        assert_eq!(slot.failure(), None);
+        assert_eq!(slot.with(|_| Ok(())).unwrap_err().code, Code::IoError);
+        assert_eq!(slot.failure(), Some(Code::IoError));
     }
 
     #[test]
