@@ -1972,6 +1972,9 @@ fn copy_one<F: DestinationRoot>(
             let before_publish: &BeforePublish<'_> =
                 if strict { &hook } else { &no_before_publish };
             if let Some((anchor, object)) = take_link(&mut meet) {
+                let Some(src_meta) = src_known.as_ref() else {
+                    unreachable!("a candidate's source was read up front");
+                };
                 let step = link_member(
                     cx,
                     parent,
@@ -1980,6 +1983,7 @@ fn copy_one<F: DestinationRoot>(
                     out,
                     on_report,
                     name,
+                    src_meta,
                     &anchor,
                     object,
                     Publish::NoReplace,
@@ -1993,7 +1997,7 @@ fn copy_one<F: DestinationRoot>(
                             claims, &key, &target, strict, names, name, identity, &path, out,
                             on_report,
                         );
-                        out.files_hardlinked += 1;
+                        count_linked(out, &o, &path);
                         return Ok(());
                     }
                     Settled::Finished => return Ok(()),
@@ -2105,6 +2109,9 @@ fn copy_one<F: DestinationRoot>(
             let before_publish: &BeforePublish<'_> =
                 if strict { &hook } else { &no_before_publish };
             if let Some((anchor, object)) = take_link(&mut meet) {
+                let Some(src_meta) = src_known.as_ref() else {
+                    unreachable!("a candidate's source was read up front");
+                };
                 let step = link_member(
                     cx,
                     parent,
@@ -2113,6 +2120,7 @@ fn copy_one<F: DestinationRoot>(
                     out,
                     on_report,
                     name,
+                    src_meta,
                     &anchor,
                     object,
                     Publish::Replace,
@@ -2136,7 +2144,7 @@ fn copy_one<F: DestinationRoot>(
                             out,
                             on_report,
                         );
-                        out.files_hardlinked += 1;
+                        count_linked(out, &o, &path);
                         return Ok(());
                     }
                     Settled::Finished => return Ok(()),
@@ -2263,6 +2271,16 @@ fn record_replace<C: ClaimStore + ?Sized>(
         report(out, on_report, path.to_path_buf(), TreeFailureCause::ClaimNotRecorded(e));
     }
     names.record_publication(target, Some(stored), name, strong(replaced), identity);
+}
+
+/// A linked member is counted `files_hardlinked`, never copied; the weaker comparison its gate made is recorded as a
+/// copy's is.
+fn count_linked(out: &mut TreeOutcome, linked: &flux_fs::Outcome, path: &Path) {
+    out.files_hardlinked += 1;
+    if let Some(weaker) = linked.identity_degraded {
+        out.files_degraded += 1;
+        out.warnings.record(weaker, path);
+    }
 }
 
 /// Cut 12: how a hardlink candidate meets the copy arms, decided from its group's index entry.
@@ -2420,6 +2438,9 @@ fn register_outcome<F: DestinationRoot>(
     on_report: &mut dyn FnMut(TreeFailure),
 ) {
     let (Meet::Canonical { id, skipped }, Some(slot)) = (meet, cx.hardlinks) else { return };
+    // Ruled acceptable: the anchor is registered even when the canonical's claim was not recorded (that loss is already
+    // reported as `ClaimNotRecorded`, and `--resume` heals the members by rule 3), and an error inserting `Failed` is
+    // ignored (the canonical's own failure is the report; later members find no entry and form a group of their own).
     let entry = match published {
         Some(identity) => {
             HardlinkEntry::Anchor { target: target.clone(), object: strong(identity) }
@@ -2510,6 +2531,7 @@ fn link_member<F: DestinationRoot>(
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
     name: &OsStr,
+    src_meta: &Metadata,
     anchor: &FluxPathKey,
     object: Option<ObjectId>,
     publish: Publish,
@@ -2547,6 +2569,12 @@ fn link_member<F: DestinationRoot>(
             "the anchor is gone or is another object",
         );
     }
+    // The identity gate a copy runs at this name (a replacement must not be the source itself; `Safety::Strict` refuses
+    // a target that cannot be compared). A refusal is the member's failure, not a degradation.
+    let gate = match identity_gate(parent, name, src_meta, cx.opts.safety, publish) {
+        Ok(g) => g,
+        Err(e) => return Ok(Err(e)),
+    };
     // 2. As `publish_link`: heartbeat and guard before the first mutation; with entries pending and something at this
     // operation's temporary name the batch is flushed first, and the leftover at the name removed.
     let temp = flux_fs::temp_path(Path::new(name), &cx.opts.operation_id).into_os_string();
@@ -2624,12 +2652,29 @@ fn link_member<F: DestinationRoot>(
         );
     }
     // 5. The note (Strict), then the publish itself.
-    let published =
-        publish_identified(cx, parent, name, temp.clone(), identity, None, publish, before_publish);
+    let published = publish_identified(
+        cx,
+        parent,
+        name,
+        temp.clone(),
+        identity,
+        gate.degraded,
+        publish,
+        before_publish,
+    );
     // 6. A same-object rename (POSIX `rename(2)` of a name onto another name of one object) leaves the temporary.
     match published {
         Ok(outcome) => {
-            if parent.metadata(&temp).is_ok() && (cx.guard)().is_ok() {
+            if parent.metadata(&temp).is_ok() {
+                if let Err(lost) = (cx.guard)() {
+                    let kept = std::io::Error::other(
+                        "kept: this run no longer holds the destination's lock",
+                    );
+                    return Ok(Err(CopyError {
+                        leftover: Some((PathBuf::from(&temp), kept)),
+                        ..CopyError::at(CopyStep::Publish, lost)
+                    }));
+                }
                 let _ = parent.remove_file(&temp);
             }
             Ok(Ok(LinkStep::Linked(outcome)))
