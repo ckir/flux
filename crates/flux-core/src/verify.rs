@@ -442,23 +442,35 @@ const REFUSED_DST_IN_SRC: &str =
 const REFUSED_SRC_IN_DST: &str = "the source lies inside the destination; nothing was compared";
 const BY_PATH_ALONE: &str = " (decided by path alone: a root's identity could not be confirmed)";
 
-/// `opened` names the root the containment query was opening, which a failure is reported against.
-fn refused_by_containment(
-    e: crate::copy::CopyError,
+/// One containment direction of the root check (design 6.1). A refusal becomes `Refused(reason)`; any other failure is
+/// `Unreadable`, led by the name of the root the failing query was about (`anchor.2` or `other.2`).
+fn sided_check<F: DestinationRoot>(
+    fs: &F,
+    anchor: (&F::Dir, &Path, &'static str),
+    other: (&F::Dir, &Path, &'static str),
     reason: &str,
-    opened: &'static str,
-) -> RootsCheck {
-    if e.code() == Code::SafetyRejected {
-        RootsCheck::Refused(reason.to_string())
-    } else {
-        RootsCheck::Unreadable(opened, e.cause)
+    out: &mut crate::tree::TreeOutcome,
+) -> Result<(), RootsCheck> {
+    use crate::tree::{ContainmentTarget, containment_sided};
+    match containment_sided(fs, anchor.0, anchor.1, other.0, other.1, Safety::Default, out) {
+        Ok(()) => Ok(()),
+        Err(f) if f.error.code() == Code::SafetyRejected => {
+            Err(RootsCheck::Refused(reason.to_string()))
+        }
+        Err(f) => Err(RootsCheck::Unreadable(
+            match f.target {
+                ContainmentTarget::Anchor => anchor.2,
+                ContainmentTarget::Other => other.2,
+            },
+            f.error.cause,
+        )),
     }
 }
 
 /// The root check (design 6.1), run before any directory is listed or file opened. `Ok(true)` when the destination
 /// does not exist and is to be treated as empty.
 fn check_roots<F: DestinationRoot>(fs: &F, src: &Path, dst: &Path) -> Result<bool, RootsCheck> {
-    use crate::tree::{containment, lexically_within, preflight};
+    use crate::tree::{lexically_within, preflight};
     let d = match fs.destination_root(dst) {
         Ok(d) => d,
         Err(e) if e.source.kind() == std::io::ErrorKind::NotFound => {
@@ -475,10 +487,8 @@ fn check_roots<F: DestinationRoot>(fs: &F, src: &Path, dst: &Path) -> Result<boo
     let mut out = crate::tree::TreeOutcome::default();
     preflight(si, di, Safety::Default, &mut out.warnings)
         .map_err(|_| RootsCheck::Refused(REFUSED_DST_IN_SRC.to_string()))?;
-    containment(fs, src, &d, dst, Safety::Default, &mut out)
-        .map_err(|e| refused_by_containment(e, REFUSED_DST_IN_SRC, SOURCE))?;
-    containment(fs, dst, &s, src, Safety::Default, &mut out)
-        .map_err(|e| refused_by_containment(e, REFUSED_SRC_IN_DST, DESTINATION))?;
+    sided_check(fs, (&d, dst, DESTINATION), (&s, src, SOURCE), REFUSED_DST_IN_SRC, &mut out)?;
+    sided_check(fs, (&s, src, SOURCE), (&d, dst, DESTINATION), REFUSED_SRC_IN_DST, &mut out)?;
     if out.containment_degraded.is_some() {
         if lexically_within(dst, src) {
             return Err(RootsCheck::Refused(format!("{REFUSED_DST_IN_SRC}{BY_PATH_ALONE}")));
@@ -1338,7 +1348,7 @@ mod tests {
         let r = root_row(&fs, "/s", "/d");
         assert!(r.4.starts_with("source: "), "{}", r.4);
 
-        // canonical_path calls: containment(dst anchor): /d (1), /s (2); containment(src anchor): /s (3), /d (4).
+        // canonical_path calls: containment(dst anchor): /d (1), /s (2); containment(src anchor): /s (3), /d (4). Calls 1 and 3 are the anchors.
         let denied = std::io::ErrorKind::PermissionDenied;
         let fs = FaultFs::new();
         tree(&fs, "/s", &[], &[]);
@@ -1354,6 +1364,22 @@ mod tests {
         fs.fail_nth("canonical_path", 4, Code::PermissionDenied, denied);
         let r = root_row(&fs, "/s", "/d");
         assert!(r.4.starts_with("destination: "), "{}", r.4);
+
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[]);
+        tree(&fs, "/d", &[], &[]);
+        fs.fail_nth("canonical_path", 1, Code::PermissionDenied, denied);
+        let r = root_row(&fs, "/s", "/d");
+        assert_eq!(r.3, Some(Code::PermissionDenied));
+        assert!(r.4.starts_with("destination: "), "{}", r.4);
+
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[]);
+        tree(&fs, "/d", &[], &[]);
+        fs.fail_nth("canonical_path", 3, Code::PermissionDenied, denied);
+        let r = root_row(&fs, "/s", "/d");
+        assert_eq!(r.3, Some(Code::PermissionDenied));
+        assert!(r.4.starts_with("source: "), "{}", r.4);
     }
 
     #[test]

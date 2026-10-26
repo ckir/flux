@@ -121,7 +121,7 @@ used and the doc says so in the message. Exit 2, not copy's exit 3, because veri
 0, 1, 2 (master lines 681-684) (V12). A FILE verify is not subject to this check.
 
 A root that cannot be listed (SOURCE or DEST folder unreadable) is one `unreadable` record with path `.` (the root), the
-error text, and exit 1.
+error text, and exit 1. When the root check fails on a query about one root (opening it, its identity, or its canonical path inside the containment check) the text is led by `source: ` or `destination: `, naming the root the failing query was about, not the root the check was opening (fixed 2026-10-26 after the capstone).
 
 ### 6.2 The merge, per pair of next events
 
@@ -155,7 +155,7 @@ side failed, it is `unreadable` (a source path may hide beneath it); on a DEST-o
 carries the error's code and text (exit unaffected), because nothing the source holds can be beneath a directory the
 source lacks, and the CLI adds a stderr warning `warning: could not read destination-only directory: <path>: <error>`
 (a `lost+found` of mode 000 must not fail an otherwise exact replica). Every `WalkError` is a directory today (the walker
-raises it only while listing one), so the record's `kind` is `dir`.
+raises it only while listing one), so the record's `kind` is `dir` and the stderr warning says `directory` for the same reason.
 
 ### 6.3 Comparing an equal path
 
@@ -212,7 +212,7 @@ null), and `detail`
 (the error text for `unreadable`, the two kinds for a type mismatch, the two digests' first 8 hex characters
 for a file mismatch, empty otherwise; a DEST-only `extra` directory that could not be listed carries its error's code and
 text). The `path` is shown with `\\`, control characters and non-UTF-8 bytes escaped (`\\`, `\n`, `\r`, `\t`, else `\xNN`),
-so two distinct names never print alike and a name never splits a line; an ordinary name is unchanged. Records are emitted AS the cursor decides them, in path order; nothing is
+so two distinct names never print alike and a name never splits a line; an ordinary name is unchanged. Under `--json` the `path` field carries that same escaped string. Records are emitted AS the cursor decides them, in path order; nothing is
 collected.
 
 Human mode (stdout): one line per record whose outcome is not `match`, then a summary line to stdout. A match is not
@@ -364,6 +364,7 @@ path and the outcome), the `--help` text from 6.8.
 - Several sources: cut 14b.
 - A DEST-only directory that cannot be listed is `extra` with a stderr warning, not `unreadable` (6.2).
 - Windows and macOS: unmeasured until CI. The escaping of non-UTF-8 names in `path` is exercised on unix only.
+- The mode-000 CLI test (`a_destination_only_directory_that_cannot_be_listed_is_extra_with_a_warning_and_exit_0`) FAILS, rather than skips, when the user can still list the directory (root), so a root-run CI surfaces it instead of hiding it (owner decision 2026-10-26).
 
 ## 12. Exhaustiveness audit (author, before handoff)
 

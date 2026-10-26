@@ -438,10 +438,10 @@ fn a_destination_only_directory_that_cannot_be_listed_is_extra_with_a_warning_an
     std::fs::write(lost.join("inside"), b"i").unwrap();
     std::fs::set_permissions(&lost, std::fs::Permissions::from_mode(0o000)).unwrap();
     let _restore = Restore(lost.clone());
-    if std::fs::read_dir(&lost).is_ok() {
-        eprintln!("skipped: this user can list a mode-000 directory (root?)");
-        return;
-    }
+    assert!(
+        std::fs::read_dir(&lost).is_err(),
+        "this user can list a mode-000 directory (running as root?): the unlistable case cannot be exercised here"
+    );
     let out = verify(&[&src, &dst]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert!(

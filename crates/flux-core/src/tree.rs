@@ -4346,8 +4346,70 @@ fn canonical_of<F: DestinationRoot>(
     Ok(Some(Canonical { path, confirmed }))
 }
 
-/// Part A: the resolved destination anchor must not be the source root or lie inside it. `anchor` is the handle
-/// the run then writes through; `anchor_shown` names it in the warning. Runs after the identity pre-flight.
+/// Which operand of a containment check a failure was about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContainmentTarget {
+    /// The open handle passed as `anchor`.
+    Anchor,
+    /// The open handle passed as `other`.
+    Other,
+}
+
+/// A containment failure and the operand its failing query was about. A refusal (`SafetyRejected`) and a strict
+/// degraded exit carry `Anchor`: they are about the check as a whole, and every caller discards the tag for them.
+#[derive(Debug)]
+pub(crate) struct ContainmentFailure {
+    pub target: ContainmentTarget,
+    pub error: CopyError,
+}
+
+/// Part A on two OPEN handles: the resolved `anchor` must not be `other` or lie inside it. `anchor_shown` and
+/// `other_shown` name them in the degraded warning. Runs after the identity pre-flight. Each `canonical_of` failure is
+/// tagged with the handle it was about, which is what `flux verify` needs to name the right root.
+pub(crate) fn containment_sided<F: DestinationRoot>(
+    fs: &F,
+    anchor: &F::Dir,
+    anchor_shown: &Path,
+    other: &F::Dir,
+    other_shown: &Path,
+    safety: Safety,
+    out: &mut TreeOutcome,
+) -> std::result::Result<(), ContainmentFailure> {
+    let fail =
+        |target, e| ContainmentFailure { target, error: CopyError::at(CopyStep::Resolve, e) };
+    let degraded = |target: ContainmentTarget, shown: &Path, out: &mut TreeOutcome| match safety {
+        Safety::Default => {
+            out.containment_degraded.get_or_insert_with(|| shown.to_path_buf());
+            Ok(())
+        }
+        Safety::Strict => Err(ContainmentFailure {
+            target,
+            error: refuse(
+                "the destination's location cannot be resolved from its handle, so containment cannot be checked with full confidence",
+            ),
+        }),
+    };
+    let Some(a) = canonical_of(fs, anchor).map_err(|e| fail(ContainmentTarget::Anchor, e))? else {
+        return degraded(ContainmentTarget::Anchor, anchor_shown, out);
+    };
+    let Some(s) = canonical_of(fs, other).map_err(|e| fail(ContainmentTarget::Other, e))? else {
+        return degraded(ContainmentTarget::Other, other_shown, out);
+    };
+    if lexically_within(&a.path, &s.path) {
+        return Err(ContainmentFailure {
+            target: ContainmentTarget::Anchor,
+            error: refuse("the destination's resolved location is the source or lies inside it"),
+        });
+    }
+    if !(a.confirmed && s.confirmed) {
+        return degraded(ContainmentTarget::Anchor, anchor_shown, out);
+    }
+    Ok(())
+}
+
+/// Part A for the copy callers: the resolved destination anchor must not be the source root or lie inside it. `anchor`
+/// is the handle the run then writes through; `anchor_shown` names it in the warning. Opens `src_root`, runs
+/// `containment_sided` with it as `other`, and drops the tag. Opening `src_root` fails as `CopyStep::Resolve`.
 pub(crate) fn containment<F: DestinationRoot>(
     fs: &F,
     src_root: &Path,
@@ -4356,31 +4418,8 @@ pub(crate) fn containment<F: DestinationRoot>(
     safety: Safety,
     out: &mut TreeOutcome,
 ) -> std::result::Result<(), CopyError> {
-    let resolve = |e| CopyError::at(CopyStep::Resolve, e);
-    let degraded = |shown: &Path, out: &mut TreeOutcome| match safety {
-        Safety::Default => {
-            out.containment_degraded.get_or_insert_with(|| shown.to_path_buf());
-            Ok(())
-        }
-        Safety::Strict => Err(refuse(
-            "the destination's location cannot be resolved from its handle, so containment cannot be checked with full confidence",
-        )),
-    };
-    let Some(a) = canonical_of(fs, anchor).map_err(resolve)? else {
-        return degraded(anchor_shown, out);
-    };
-    let src = fs.destination_root(src_root).map_err(resolve)?;
-    let Some(s) = canonical_of(fs, &src).map_err(resolve)? else {
-        return degraded(src_root, out);
-    };
-    drop(src);
-    if lexically_within(&a.path, &s.path) {
-        return Err(refuse("the destination's resolved location is the source or lies inside it"));
-    }
-    if !(a.confirmed && s.confirmed) {
-        return degraded(anchor_shown, out);
-    }
-    Ok(())
+    let src = fs.destination_root(src_root).map_err(|e| CopyError::at(CopyStep::Resolve, e))?;
+    containment_sided(fs, anchor, anchor_shown, &src, src_root, safety, out).map_err(|f| f.error)
 }
 
 /// `inner` equals `outer` or lies inside it, compared component by component with `.`
