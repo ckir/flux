@@ -4,9 +4,10 @@
 // You may obtain a copy of the License at:
 // https://polyformproject.org/licenses/noncommercial/1.0.0/
 
-//! The verify-merge property test's case model: the generated `Case`, and the pure
-//! derivation of the two trees (source and destination) it describes. Later pieces
-//! (materialisation, the reference, the generator and the property) build on it.
+//! The verify-merge property test: the generated `Case` model, the pure derivation of the
+//! two trees it describes, their materialisation on a fault-injecting filesystem, the
+//! non-streaming reference, the generator, the census of reached categories and the
+//! property that `verify_tree` equals the reference.
 
 use crate::fault_fs::FaultFs;
 use crate::verify::{Kind, MOUNT_NOT_ENTERED, Outcome, Record, SPECIAL_NOT_COMPARED, Summary};
@@ -684,7 +685,7 @@ mod tests {
             edits: vec![
                 Edit::ChangeKind(Which::Dest, f(1, b'a')),
                 Edit::KeepBoth,
-                Edit::KeepBoth,
+                Edit::EditContent(Which::Source),
                 Edit::EditContent(Which::Source),
                 Edit::DropFromDest,
                 Edit::EditContent(Which::Dest),
@@ -709,6 +710,7 @@ mod tests {
         assert_eq!(d[&PathBuf::from("a")], f(1, b'a')); // ChangeKind on dest; a/x, a/x/y, a/z pruned there
         assert_eq!(d[&PathBuf::from("l")], link("u")); // EditContent on a symlink swaps the payload
         assert_eq!(s[&PathBuf::from("o")], Spec::Other); // EditContent is a no-op on Other
+        assert_eq!(s[&Path::new("a").join("x").join("y")], f(1, b'z')); // EditContent on a non-empty file: fill + 1, len kept
         assert_eq!(s[&PathBuf::from("b")].clone(), f(1, b'b')); // the extra at an existing path was dropped
     }
 
@@ -940,7 +942,7 @@ mod tests {
         use crate::verify::{VerifyOptions, verify_tree};
         use flux_fs::HashAlgorithm;
         for (i, (case, _)) in fixture_cases().into_iter().enumerate() {
-            let (fs, _setup) = materialise(&case);
+            let (fs, setup) = materialise(&case);
             let opts = VerifyOptions {
                 links: case.links,
                 mounts: case.mounts,
@@ -949,6 +951,11 @@ mod tests {
             let mut rows = Vec::new();
             verify_tree(&fs, Path::new("/s"), Path::new("/d"), &opts, &mut |r| rows.push(row(&r)))
                 .unwrap();
+            assert!(
+                setup > 0 && setup < fs.calls().len(),
+                "setup index {setup} of {}",
+                fs.calls().len()
+            );
             assert_eq!(rows, rows_of(&case), "case {i}");
         }
     }
@@ -995,6 +1002,31 @@ mod tests {
 
     fn is_mount(spec: &Spec) -> bool {
         matches!(spec, Spec::Dir { mount: MountRoot::Yes, .. })
+    }
+
+    /// The records that prune the walk: a failed directory, or a mount root not entered.
+    fn prune_records(recs: &[Record]) -> Vec<&Record> {
+        recs.iter()
+            .filter(|r| {
+                (matches!(r.outcome, Outcome::Unreadable | Outcome::Extra) && is_fail(r.code))
+                    || (r.outcome == Outcome::Match && r.detail == MOUNT_NOT_ENTERED)
+            })
+            .collect()
+    }
+
+    /// The paths the reference hashes: a file on both filtered sides with no prune record above it.
+    fn hashable_paths(case: &Case) -> std::collections::BTreeSet<PathBuf> {
+        let (fsrc, fdst) = filtered_sides(case);
+        let (recs, _) = reference(case);
+        let prunes = prune_records(&recs);
+        fsrc.iter()
+            .filter(|(p, s)| {
+                matches!(s, Spec::File { .. })
+                    && matches!(fdst.get(*p), Some(Spec::File { .. }))
+                    && !prunes.iter().any(|r| *p != &r.path && p.starts_with(&r.path))
+            })
+            .map(|(p, _)| p.clone())
+            .collect()
     }
 
     /// The categories a case reaches, read from the case, `sides` and the reference only (never the engine).
@@ -1087,13 +1119,7 @@ mod tests {
                     .any(|(p, s)| is_mount(s) && side.keys().any(|q| q != p && q.starts_with(p)))
             }),
         );
-        let prunes: Vec<&Record> = recs
-            .iter()
-            .filter(|r| {
-                (matches!(r.outcome, Outcome::Unreadable | Outcome::Extra) && is_fail(r.code))
-                    || (r.outcome == Outcome::Match && r.detail == MOUNT_NOT_ENTERED)
-            })
-            .collect();
+        let prunes = prune_records(&recs);
         when(
             "pruned dir then a prefix-named later sibling",
             prunes.iter().any(|p| {
@@ -1109,7 +1135,12 @@ mod tests {
             prunes
                 .iter()
                 .filter(|p| {
-                    fsrc.keys().chain(fdst.keys()).any(|q| q != &p.path && q.starts_with(&p.path))
+                    // a descendant counts only on a side where the prune is a listed directory
+                    let listed = |side: &BTreeMap<PathBuf, Spec>| {
+                        matches!(side.get(&p.path), Some(Spec::Dir { list_error: None, .. }))
+                            && side.keys().any(|q| q != &p.path && q.starts_with(&p.path))
+                    };
+                    listed(&fsrc) || listed(&fdst)
                 })
                 .count()
                 >= 2,
@@ -1198,7 +1229,12 @@ mod tests {
                     && p.parent().is_some_and(|q| !q.as_os_str().is_empty())
             }),
         );
-        when("case with a source-side extra", case.extras.iter().any(|e| e.0 == Which::Source));
+        when(
+            "case with a source-side extra",
+            case.extras
+                .iter()
+                .any(|(w, rel, spec)| *w == Which::Source && src.get(&join(rel)) == Some(spec)),
+        );
         hit
     }
 
@@ -1264,6 +1300,7 @@ mod tests {
                 fixture_snippet(&case)
             );
             let (src, dst) = sides(&case);
+            let hashable = hashable_paths(&case);
             let calls = fs.calls();
             for call in calls.iter().map(String::as_str) {
                 let Some(rest) = call.strip_prefix("open_read(") else { continue };
@@ -1272,10 +1309,9 @@ mod tests {
                 prop_assert!(
                     tail.is_some_and(|tail| {
                         let rel = tail.split('/').fold(PathBuf::new(), |p, c| p.join(c));
-                        matches!(src.get(&rel), Some(Spec::File { .. }))
-                            && matches!(dst.get(&rel), Some(Spec::File { .. }))
+                        hashable.contains(&rel)
                     }),
-                    "open_read of a path that is not a file on both sides, or a root: {call}\n{}",
+                    "open_read of a path the reference does not hash, or a root: {call}\n{}",
                     fixture_snippet(&case)
                 );
             }
