@@ -104,9 +104,17 @@ is another mount is reported as present and not entered unless `--cross-filesyst
 Exit status is 0 when nothing is missing, mismatched or unreadable, 1 when something is, and 2 for a usage error or
 roots that are the same or nested. `extra` paths never change the exit status.
 
+A destination-only directory that cannot be listed is reported as `extra` with the error and a stderr warning; it never
+fails the run. A source path that is named like flux control state (`.flux/`, `.flux-root.lock`,
+`*.flux-partial.<id>`) is reported `missing` because verify ignores that name at the destination. In a record, `path`
+is shown with `\\`, control characters and non-UTF-8 bytes escaped, so two different names never print alike. If
+stdout cannot be written to (a closed pipe), the run stops at once with exit 1.
+
 `--json` writes newline-delimited JSON on stdout: one object per record (`path`, `outcome`, `kind`, `code`, `detail`),
 then one final `{"summary": {...}}` object with the fields `source`, `dest`, `hash`, `matched`, `missing`,
-`mismatched`, `extra`, `unreadable`, `not_entered`, `bytes_hashed` and `exit`.
+`mismatched`, `extra`, `unreadable`, `not_entered`, `bytes_hashed` and `exit`. A run that stops before any walk with
+exit 1 prints a summary of all-zero counts with `"exit": 1`, so a script must read `exit`, not recompute it from the
+counts.
 
 What a pass guarantees:
 

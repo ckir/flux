@@ -105,8 +105,9 @@ with a separator. Its refusals are reused unchanged: a folder SOURCE against an 
 (never followed), with the same exit code. `Stop::*` maps to the same codes as in `copy`.
 
 DEST absent (folder SOURCE): treated as an empty destination. Every source path is `missing`, the run exits 1, and
-nothing is created. Before the walk starts one stderr line is printed, `destination does not exist: <DEST> (every
-source path is reported missing)`, so a mistyped DEST is not mistaken for a wiped one (V3). DEST present and a file with a file SOURCE: the single pair is compared. DEST a folder with a
+nothing is created. Once the root check has passed and before the walk starts one stderr line is printed, `destination
+does not exist: <DEST> (every source path is reported missing)`, so a mistyped DEST is not mistaken for a wiped one (V3);
+a run the root check refuses prints only the refusal. DEST present and a file with a file SOURCE: the single pair is compared. DEST a folder with a
 file SOURCE resolves to `DEST/<name>`; if that is absent the one record is `missing`.
 
 Refused roots, for a folder verify, BEFORE any read: exit 2 with a usage message and no records, when the resolved
@@ -147,8 +148,14 @@ Let `s` and `d` be the next ENTRY events and `ks`, `kd` their `FluxPathKey`s (se
 - `ks == kd`: compare as in 6.3, record once, advance both. Whatever follows in each stream (the children of a
   directory on one side only, or of a type-mismatched path) is merged by the same rules.
 
-A `WalkError` (an `Err` item) on either side is `unreadable` for that path and the cursor drops the entries under it
-on BOTH sides by the same key-prefix test (V7); the walker has already skipped its own side's subtree.
+A `WalkError` (an `Err` item) drops the entries under its path on BOTH sides by the same key-prefix test (V7); the
+walker has already skipped its own side's subtree. What it is recorded as depends on where it was met (final review,
+owner decision 2026-10-26): on a SOURCE-only path it is `unreadable` (exit 1); on a path both sides hold, where either
+side failed, it is `unreadable` (a source path may hide beneath it); on a DEST-only path it is an `extra` record that
+carries the error's code and text (exit unaffected), because nothing the source holds can be beneath a directory the
+source lacks, and the CLI adds a stderr warning `warning: could not read destination-only directory: <path>: <error>`
+(a `lost+found` of mode 000 must not fail an otherwise exact replica). Every `WalkError` is a directory today (the walker
+raises it only while listing one), so the record's `kind` is `dir`.
 
 ### 6.3 Comparing an equal path
 
@@ -185,7 +192,9 @@ partial artifact name (the syntax the copy engine writes: `<name>.flux-partial.<
 A user file named `.flux-partial.txt`, `x.flux-partial` or `.flux` deeper in the tree is NOT dropped. The source side is
 never filtered. A SOURCE that itself contains a `.flux` directory compares it like any other directory. Whether a
 source `.flux` should have been copied is the copy's business, not verify's; if the destination lacks it the record is
-`missing`.
+`missing`. For the same reason a source path named like control state (`.flux/`, `.flux-root.lock`,
+`*.flux-partial.<id>`) is reported `missing` even when the destination holds an entry of that name: the destination-side
+filter drops that name before the merge.
 
 ### 6.5 Hashing a pair
 
@@ -201,7 +210,9 @@ A record is `{path, outcome, kind, code, detail}`: `path` relative to the walk r
 of the five, `kind` `file|dir|symlink|other` of the SOURCE side when it exists, else of the DEST side, `code` (the `Code` name, e.g. `VERIFY_MISMATCH` for a `mismatched` record, the error's code for `unreadable`, else
 null), and `detail`
 (the error text for `unreadable`, the two kinds for a type mismatch, the two digests' first 8 hex characters
-for a file mismatch, empty otherwise). Records are emitted AS the cursor decides them, in path order; nothing is
+for a file mismatch, empty otherwise; a DEST-only `extra` directory that could not be listed carries its error's code and
+text). The `path` is shown with `\\`, control characters and non-UTF-8 bytes escaped (`\\`, `\n`, `\r`, `\t`, else `\xNN`),
+so two distinct names never print alike and a name never splits a line; an ordinary name is unchanged. Records are emitted AS the cursor decides them, in path order; nothing is
 collected.
 
 Human mode (stdout): one line per record whose outcome is not `match`, then a summary line to stdout. A match is not
@@ -214,7 +225,10 @@ without `--verbose`, and the summary line carries the `not_entered` count.
 `{"summary": {...}}` with `source`, `dest`, `hash`, `matched`, `missing`, `mismatched`, `extra`, `unreadable`,
 `not_entered`, `bytes_hashed`, `exit`. `not_entered` counts pruned mount points; each of them is also a `match` record
 whose `detail` is "mount point not entered". NDJSON is a deliberate difference from `copy --json` (one object at the end):
-a streamed report on a large tree cannot be a single array without holding it (V4).
+a streamed report on a large tree cannot be a single array without holding it (V4). A run that stops before any walk
+with exit 1 (a root that cannot be examined, a symlink SOURCE, a resolution failure) still prints a summary of all-zero
+counts with `"exit": 1`, so a script must read `exit`, not recompute it from the counts. If a write to stdout fails (a
+closed pipe, a full disk) the run ends at once with exit 1 (nothing is printed to stderr for a broken pipe).
 
 Stderr carries only operational lines (the usage error, a root failure, the exit-2 text, the absent-DEST line, the
 mount notices), not the records.
@@ -348,7 +362,8 @@ path and the outcome), the `--help` text from 6.8.
   exit 2 (V12), which differs from copy's exit 3.
 - The `--json` shape is NDJSON (V4).
 - Several sources: cut 14b.
-- Windows and macOS: unmeasured until CI.
+- A DEST-only directory that cannot be listed is `extra` with a stderr warning, not `unreadable` (6.2).
+- Windows and macOS: unmeasured until CI. The escaping of non-UTF-8 names in `path` is exercised on unix only.
 
 ## 12. Exhaustiveness audit (author, before handoff)
 
