@@ -92,6 +92,10 @@ Option 2 can replace 1 later without changing the CLI, the report or the failure
 ### 6.2 Steps added to `stage_file` (after the stream loop ends and the sink completes; before step 6)
 
 1. Finalize the source digest `S`.
+1b. `destination`/`full` only (call C13): the master §134 "source mutation validation" BEFORE the re-read: `fs.metadata(src)`
+   compared with `src_meta` by length and mtime, same comparison and same `SourceChanged` discard as step 7, so a source
+   that already changed does not cost a full read-back. Step 7's recheck stays where it is: it also covers the metadata and
+   sync window.
 2. `destination`/`full`: `parent.open_read(&temp)`, read to EOF in the same buffer size, hash, compare with `S`. Also
    compare byte counts. A short or long read is a mismatch.
 3. `full`: open the source anew, read to EOF, hash, compare with `S`.
@@ -116,7 +120,7 @@ batch sync). `open_read` opens a second, independent handle by name.
 | file skipped by `--skip-existing`/`--update` | not read, not verified, not counted |
 | overwritten file | the NEW temporary is verified before it replaces the old one |
 | empty file | digest of zero bytes; the re-read must also yield zero bytes; counted verified |
-| symlinks, directories | not content-verified, not counted |
+| symlinks, directories, skipped special files | not content-verified, not counted (special files never reach `stage_file`) |
 | `--durability=strict`, any `SyncAt` | verification runs at staging, before the sync/barrier; see 6.5 |
 | `--dry-run` | nothing is read or written; `verify_level` reports the requested level; `files_verified` stays 0 |
 | `--resume` with `--verify=destination\|full` or bare `--verify` | usage error, exit 2, message below, nothing changed |
@@ -133,7 +137,10 @@ verify a resumed copy afterwards, or use --restart`. Placed beside the existing 
 - `files_mismatched`: files whose digest comparison failed (destination or `full` source read). A subset of
   `files_failed` (owner: a mismatch is a failed file); `errors` counts it once as any failed file.
 - `files_verified`: files that passed a `destination` or `full` check AND were published. Counted at publish, not at the
-  comparison, so `files_verified <= files_copied` and a file that verified but failed to publish is not verified.
+  comparison, so `files_verified <= files_copied` and a file that verified but failed to publish is not verified. The rule
+  is per entry: `files_verified` increments exactly where `files_copied` increments for an entry whose `Outcome.verified`
+  is true. A Barrier sync failure affects only the entries whose own sync result failed (`flush_batch` takes per-entry
+  results, `tree.rs:3640`), so only those are un-counted.
 - `verify_level`: `"none"`, `"source-stream"`, `"destination"`, `"full"`. `hash_algorithm`: `"blake3"` (already).
 - Failure line for a mismatch uses the existing per-failure rendering with code `VERIFY_MISMATCH` and the error text of
   6.2 step 4. The summary line gains a suffix when `files_mismatched > 0` in the style of the cut 12 suffixes; absent at
@@ -174,6 +181,20 @@ verify a resumed copy afterwards, or use --restart`. Placed beside the existing 
   "verification of a resumed file is not supported", before touching the partial. Unreachable from the CLI; it keeps the
   engine honest. (Builder: confirm `plan_resume`'s verdict is available before the partial is reopened, `copy.rs:783-796`.)
 - C10. New `CopyStep::Verify`, new `Code::VerifyMismatch` ("VERIFY_MISMATCH", exit 1). Registry entry already exists.
+- C11. The `full` second read opens the source BY PATH with `fs.open_read(src)`, as the first read did (`copy.rs:762`);
+  master §32 requires an independent read, so the first handle is not reused or rewound. A source swapped for another
+  object between the reads therefore surfaces as a digest mismatch on the source side (and the step 1b/7 rechecks catch a
+  length or mtime change first).
+- C12. The hasher is `Option<Hasher>` (or equivalent) inside the stream loop; one predictable branch per chunk is accepted
+  under `none`. No attempt is made to share the cut 9h checkpoint worker's chunk reads with the new hasher.
+- C13. The cheap source recheck also runs before the re-read (6.2 step 1b), per master §134's order. Found by the agy panel.
+- C14. Verified facts the builder asked about: the `plan_resume` verdict exists before the partial is reopened
+  (`copy.rs:775-796`), so C9's guard is an early return after the verdict, before `open_existing`; a failed file exits 1
+  through the existing paths (`exit_code.rs:15, 24-38`: errors default to `FAILED`); `CopyOptions` is not serialized
+  (`options.rs` has no serde), so adding fields touches only struct literals; the destination `Writer` is `StdFile` with no
+  user-space buffer (`dir_unix.rs:132`), so a second handle sees every written byte, and the real-filesystem test pins it.
+- C15. If reflinks are built later, that cut decides how `--verify` applies to a cloned file (master §39, line 2423); this
+  cut neither refuses nor special-cases it.
 
 ## 8. Interfaces (names and shapes; bodies are the builder's)
 
@@ -185,7 +206,9 @@ verify a resumed copy afterwards, or use --restart`. Placed beside the existing 
   the compiler names them; search repo-wide, tests and benches included).
 - `flux-fs/src/error.rs`: `Code::VerifyMismatch` with `as_str() == "VERIFY_MISMATCH"` and a pinning test beside the others.
 - `flux-core/src/copy.rs`: `CopyStep::Verify`; the steps of 6.2 inside `stage_file`; `Staged` carries `verified: bool`
-  (true only when a `destination`/`full` comparison passed).
+  (true only when a `destination`/`full` comparison passed) and `publish_staged` copies it into the returned
+  `flux_fs::Outcome` (new field `pub verified: bool`, `options.rs:122-138`), because `finish_copy` and `Report::file` see
+  only `Outcome`, never `Staged`. Every `Outcome` literal gains the field (compiler-named; search repo-wide).
 - `flux-core/src/tree.rs`: the publish path adds `verified` files to a new `TreeOutcome.files_verified`, and a failure whose
   code is `VerifyMismatch` to `files_mismatched` (still counted failed).
 - `flux-cli/src/main.rs`: `--verify` (`num_args = 0..=1`, `default_missing_value = "destination"`), `--hash` (only
@@ -238,7 +261,9 @@ guard/heartbeat), strict durability both sync positions, hardlink members, skip/
 resume and restart interplay, counters and their relationship (`files_mismatched <= files_failed`, `files_verified <=
 files_copied`), exit codes, flag grammar, API shapes, test list with oracle and non-vacuity rule.
 
-Remaining, and where each resolves: wording of the suffix/refusal (plan); whether `Staged.verified` suffices or the tree
-needs a per-entry flag in `pending(...)` (plan, after reading `tree.rs:3547-3600`); `--hash` help text for the single value
+Reviews: builder check (8 questions; 4 answered from the code and folded as C14, 1 as C13/C11, the rest are plan items);
+agy panel round 1 `PANEL VERDICT: GREEN` with 3 minors, all folded (`Outcome.verified`, step 1b, special files).
+
+Remaining, and where each resolves: wording of the suffix/refusal (plan); `--hash` help text for the single value
 (plan); the benchmark that justifies flipping the default (a later cut, needs owner approval to measure); the cut 15 design
 of resumed-file verification (its own brainstorm).
