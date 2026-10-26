@@ -397,7 +397,7 @@ mod tests {
 
     #[test]
     fn an_ordinary_name_is_shown_unchanged() {
-        for name in ["a", "sub/b.txt", "sp ace", "caf\u{e9}/\u{4e2d}", "a-b.c"] {
+        for name in ["a", "sub/b.txt", "sp ace", "x\u{e9}/\u{4e2d}", "a-b.c"] {
             assert_eq!(display_path(Path::new(name)), name);
         }
         assert_eq!(display_path(Path::new("")), ".");
