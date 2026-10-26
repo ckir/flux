@@ -2334,3 +2334,145 @@ fn a_written_files_handle_identity_is_its_objects_across_a_rename() {
     assert_eq!(root.metadata(OsStr::new("t")).unwrap().identity, held, "a rename keeps the object");
     assert_eq!(w.identity().unwrap(), held);
 }
+
+/// `DirHandle::create_hardlink` on every platform (cut 12, Task 3). Setup goes through `std::fs` so a test of
+/// the link primitive does not depend on any other `DirHandle` write path.
+#[cfg(any(unix, windows))]
+mod hardlink {
+    use flux_fs::{Code, DestinationRoot, DirHandle, FileIdentity};
+    use flux_platform::StdFileSystem;
+    use std::ffi::OsStr;
+    use tempfile::TempDir;
+
+    fn name(s: &str) -> &OsStr {
+        OsStr::new(s)
+    }
+
+    #[test]
+    fn create_hardlink_makes_a_second_name_of_the_same_object() {
+        let d = TempDir::new().unwrap();
+        std::fs::write(d.path().join("a"), b"shared bytes").unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        root.create_hardlink(name("b"), &root, name("a")).unwrap();
+        let (a, b) = (root.metadata(name("a")).unwrap(), root.metadata(name("b")).unwrap());
+        assert_eq!(a.identity, b.identity, "one object, two names");
+        assert!(matches!(a.identity, FileIdentity::Strong(_)), "{a:?}");
+        assert!(matches!(b.identity, FileIdentity::Strong(_)), "{b:?}");
+        assert_eq!(a.nlink, Some(2));
+        assert_eq!(b.nlink, Some(2));
+        assert_eq!(std::fs::read(d.path().join("b")).unwrap(), b"shared bytes");
+    }
+
+    #[test]
+    fn create_hardlink_refuses_an_occupied_name_including_a_dangling_symlink() {
+        let d = TempDir::new().unwrap();
+        std::fs::write(d.path().join("a"), b"src").unwrap();
+        std::fs::write(d.path().join("file"), b"keep").unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let dangling = flux_fs::Link { payload: "nowhere".into(), kind: flux_fs::LinkKind::File };
+        match root.create_symlink(name("dangling"), &dangling) {
+            Ok(()) => {}
+            // Windows without Developer Mode: the dangling case cannot be set up, the file case still runs.
+            Err(e) if e.code == Code::SymlinkCreationUnavailable => {}
+            Err(e) => panic!("{e:?}"),
+        }
+        let mut occupied = vec!["file"];
+        if std::fs::symlink_metadata(d.path().join("dangling")).is_ok() {
+            occupied.push("dangling");
+        }
+        for n in occupied {
+            let e = root.create_hardlink(name(n), &root, name("a")).unwrap_err();
+            assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists, "{n}: {e:?}");
+        }
+        assert_eq!(std::fs::read(d.path().join("file")).unwrap(), b"keep");
+        assert_eq!(std::fs::read(d.path().join("a")).unwrap(), b"src");
+    }
+
+    #[test]
+    fn create_hardlink_links_a_symlink_object_itself_never_its_target() {
+        let d = TempDir::new().unwrap();
+        std::fs::write(d.path().join("target"), b"t").unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let l = flux_fs::Link { payload: "target".into(), kind: flux_fs::LinkKind::File };
+        match root.create_symlink(name("a"), &l) {
+            Ok(()) => {}
+            Err(e) if e.code == Code::SymlinkCreationUnavailable => return,
+            Err(e) => panic!("{e:?}"),
+        }
+        root.create_hardlink(name("b"), &root, name("a")).unwrap();
+        let (ra, rb) = (root.read_link(name("a")).unwrap(), root.read_link(name("b")).unwrap());
+        assert_eq!(ra.payload, rb.payload, "b is the link object, not a name of its target");
+        assert_eq!(rb.payload, OsStr::new("target"));
+        assert_eq!(
+            root.metadata(name("b")).unwrap().file_type,
+            flux_fs::FileType::Symlink,
+            "the new name is a link"
+        );
+        assert_eq!(
+            root.metadata(name("target")).unwrap().nlink,
+            Some(1),
+            "the target gained no name"
+        );
+    }
+
+    #[test]
+    fn create_hardlink_refuses_a_bad_component() {
+        let d = TempDir::new().unwrap();
+        std::fs::create_dir(d.path().join("sub")).unwrap();
+        std::fs::write(d.path().join("sub").join("b"), b"x").unwrap();
+        std::fs::write(d.path().join("a"), b"x").unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let e = root.create_hardlink(name("sub/n"), &root, name("a")).unwrap_err();
+        assert_eq!(e.code, Code::SafetyRejected, "{e:?}");
+        let e = root.create_hardlink(name("n"), &root, name("sub/b")).unwrap_err();
+        assert_eq!(e.code, Code::SafetyRejected, "{e:?}");
+        assert!(std::fs::symlink_metadata(d.path().join("n")).is_err(), "nothing created");
+        assert!(std::fs::symlink_metadata(d.path().join("sub").join("n")).is_err());
+    }
+
+    #[test]
+    fn create_hardlink_of_a_missing_source_is_not_found() {
+        let d = TempDir::new().unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let e = root.create_hardlink(name("b"), &root, name("missing")).unwrap_err();
+        assert_eq!(e.code, Code::IoError, "{e:?}");
+        assert_eq!(e.source.kind(), std::io::ErrorKind::NotFound, "{e:?}");
+        assert!(std::fs::symlink_metadata(d.path().join("b")).is_err());
+    }
+
+    #[test]
+    fn create_hardlink_across_two_directories() {
+        let d = TempDir::new().unwrap();
+        std::fs::create_dir(d.path().join("other")).unwrap();
+        std::fs::write(d.path().join("other").join("a"), b"over there").unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let other = root.open_dir(name("other")).unwrap();
+        root.create_hardlink(name("b"), &other, name("a")).unwrap();
+        assert_eq!(std::fs::read(d.path().join("b")).unwrap(), b"over there");
+        assert_eq!(
+            root.metadata(name("b")).unwrap().identity,
+            other.metadata(name("a")).unwrap().identity
+        );
+        assert!(
+            std::fs::symlink_metadata(d.path().join("other").join("b")).is_err(),
+            "the link lands in the handle it was called on"
+        );
+    }
+
+    #[test]
+    fn a_rename_between_two_names_of_one_object_keeps_the_target() {
+        let d = TempDir::new().unwrap();
+        std::fs::write(d.path().join("a"), b"bytes").unwrap();
+        let root = StdFileSystem.destination_root(d.path()).unwrap();
+        let before = root.metadata(name("a")).unwrap().identity;
+        root.create_hardlink(name("t"), &root, name("a")).unwrap();
+        root.rename_replace(name("t"), &root, name("a")).unwrap();
+        assert_eq!(std::fs::read(d.path().join("a")).unwrap(), b"bytes");
+        assert_eq!(root.metadata(name("a")).unwrap().identity, before);
+        // POSIX `rename(2)`: when both names are links to one object it does nothing, so `t` stays (master 16.1
+        // step 3 is written for that). Windows: UNMEASURED here; whether `t` survives on the hosted runner is to
+        // be recorded by whoever first runs this there. The engine's step 3 handles both outcomes.
+        #[cfg(unix)]
+        assert!(std::fs::symlink_metadata(d.path().join("t")).is_ok(), "POSIX no-op keeps t");
+    }
+}

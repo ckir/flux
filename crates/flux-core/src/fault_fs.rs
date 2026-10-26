@@ -55,8 +55,12 @@ struct Inner {
     /// directory snapshot path -> the fault `canonical_path` raises on that one directory, every time
     canonical_faults: HashMap<PathBuf, (Code, std::io::ErrorKind)>,
     times: HashMap<PathBuf, Option<SystemTime>>,
-    /// path -> hard-link count a test set (absent: 1); follows the object like `times`
-    links: HashMap<PathBuf, u64>,
+    /// path -> a hard-link count a test set; follows the object like `times`. `Some(n)` is `set_link_count`,
+    /// `None` is `set_link_count_unknown` (`Metadata::nlink` unavailable). Absent: the DYNAMIC count, the number
+    /// of paths in `files` that share the path's identity (`create_hardlink` adds names), at least 1.
+    links: HashMap<PathBuf, Option<u64>>,
+    /// `set_hardlinks_unavailable`: every `create_hardlink` answers `HardlinkUnavailable`.
+    hardlinks_unavailable: bool,
     /// path -> bytes appended on the second `metadata` call
     grow: HashMap<PathBuf, Vec<u8>>,
     metadata_reads: HashMap<PathBuf, u32>,
@@ -534,6 +538,32 @@ fn missing_source(g: &Inner, from: &Path) -> Result<()> {
         return Ok(());
     }
     Err(FsError::new(Code::IoError, std::io::Error::from(std::io::ErrorKind::NotFound)))
+}
+
+/// What `Metadata::nlink` reports for `path`: a test's override (`set_link_count`, `set_link_count_unknown`) when
+/// one is present, else the number of live names (paths in `files`, a delete-pending one excluded) that share
+/// `path`'s identity, at least 1.
+fn link_count(g: &Inner, path: &Path) -> Option<u64> {
+    if let Some(over) = g.links.get(path) {
+        return *over;
+    }
+    let Some(id) = g.identities.get(path) else { return Some(1) };
+    let names = g
+        .files
+        .keys()
+        .filter(|k| !g.pending.contains(*k) && g.identities.get(k.as_path()) == Some(id))
+        .count() as u64;
+    Some(names.max(1))
+}
+
+/// POSIX `rename(2)`: when `from` and `to` are two names of ONE object the call succeeds and changes nothing, so both
+/// names remain (master 16.1 step 3 is written for that). The fake models it for two live file names with equal
+/// identities.
+fn same_object(g: &Inner, from: &Path, to: &Path) -> bool {
+    g.files.contains_key(from)
+        && g.files.contains_key(to)
+        && !g.pending.contains(to)
+        && matches!((g.identities.get(from), g.identities.get(to)), (Some(a), Some(b)) if a == b)
 }
 
 /// Give the object now at `path` a fresh identity, unless that path already holds
@@ -1369,9 +1399,25 @@ impl FaultFs {
 
     /// Make a file report `n` hard links (`Metadata::nlink`), and refuse `open_existing`, as a real filesystem with a
     /// second name for the object would. The default for every file is 1.
+    ///
+    /// Without a call, a file's count is the number of names that share its identity (`create_hardlink` makes
+    /// them), at least 1. A call here is an override that wins over that.
     pub fn set_link_count(&self, path: impl AsRef<Path>, n: u64) {
         let path = path.as_ref();
-        self.inner.lock().unwrap().links.insert(path.to_path_buf(), n);
+        self.inner.lock().unwrap().links.insert(path.to_path_buf(), Some(n));
+    }
+
+    /// Make a file report NO link count (`Metadata::nlink` is `None`), the way a filesystem that does not answer
+    /// does. An override like `set_link_count`.
+    pub fn set_link_count_unknown(&self, path: impl AsRef<Path>) {
+        let path = path.as_ref();
+        self.inner.lock().unwrap().links.insert(path.to_path_buf(), None);
+    }
+
+    /// Make every `create_hardlink` answer `HardlinkUnavailable`, as a filesystem without hard links, another volume
+    /// or a refused permission does. Default false.
+    pub fn set_hardlinks_unavailable(&self, on: bool) {
+        self.inner.lock().unwrap().hardlinks_unavailable = on;
     }
 
     /// Give a file permissions, so a copy has something to carry across.
@@ -1607,7 +1653,7 @@ impl FileSystem for FaultFs {
             file_type: g.types.get(&p).copied().unwrap_or(FileType::File),
             permissions: g.perms.get(&p).copied().flatten(),
             modified: g.times.get(&p).copied().flatten(),
-            nlink: Some(g.links.get(&p).copied().unwrap_or(1)),
+            nlink: link_count(g, &p),
             // Panic, not `Unavailable`: `Unavailable` is a state the walker handles
             // gracefully, so an unhooked creation path would degrade silently and keep
             // its test green. Every path that inserts into `files` calls
@@ -1648,6 +1694,9 @@ impl FileSystem for FaultFs {
             !g.directories.contains(&f),
             "the fake moves a directory only through rename_no_replace (cut 7a Part 3a, decision 10)"
         );
+        if same_object(&g, &f, &t) {
+            return Ok(());
+        }
         move_object(&mut g, &f, &t);
         if g.replace_renames && requested != t {
             // Windows: the replaced entry takes the NEW spelling.
@@ -1676,6 +1725,9 @@ impl FileSystem for FaultFs {
                     "no atomic no-replace publication primitive",
                 ),
             ));
+        }
+        if same_object(&g, &f, &t) {
+            return Ok(());
         }
         if g.files.contains_key(&t) || g.directories.contains(&t) {
             return Err(FsError::new(
@@ -2044,7 +2096,7 @@ impl DirHandle for FakeDirHandle {
                 std::io::Error::from(std::io::ErrorKind::NotFound),
             ));
         }
-        if let Some(&n) = g.links.get(&child_path)
+        if let Some(n) = link_count(&g, &child_path)
             && n != 1
         {
             return Err(FsError::new(
@@ -2146,6 +2198,72 @@ impl DirHandle for FakeDirHandle {
         g.types.insert(child_path.clone(), FileType::Symlink);
         g.symlinks.insert(child_path.clone(), link.clone());
         mint_identity(&mut g, &child_path);
+        Ok(())
+    }
+
+    fn create_hardlink(&self, name: &OsStr, other: &Self, existing: &OsStr) -> Result<()> {
+        check_component(name)?;
+        check_component(existing)?;
+        let child_path = self.fs().norm(&self.my_path().join(name));
+        let source = self.fs().norm(&other.my_path().join(existing));
+        self.fs()
+            .record(format!("create_hardlink({})", child_path.display()), "create_hardlink")?;
+        let mut g = self.inner.lock().unwrap();
+        if g.hardlinks_unavailable {
+            return Err(FsError::new(
+                Code::HardlinkUnavailable,
+                std::io::Error::other("the destination cannot hold a hard link"),
+            ));
+        }
+        // Anything holds the name: a file, a directory, a link (dangling or not), a pending delete.
+        if g.files.contains_key(&child_path)
+            || g.directories.contains(&child_path)
+            || g.types.contains_key(&child_path)
+            || g.pending.contains(&child_path)
+        {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+            ));
+        }
+        if g.directories.contains(&source) {
+            return Err(FsError::new(
+                Code::DestinationError,
+                std::io::Error::new(
+                    std::io::ErrorKind::IsADirectory,
+                    "a directory cannot be hard-linked",
+                ),
+            ));
+        }
+        if !g.files.contains_key(&source) || g.pending.contains(&source) {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            ));
+        }
+        // The new name is the SAME object: same identity (no `mint_identity`), and the object's own state. The bytes
+        // are copied, not shared: Flux never writes through a link, so the fake does not alias them.
+        let bytes = g.files[&source].clone();
+        g.files.insert(child_path.clone(), bytes);
+        if let Some(v) = g.types.get(&source).copied() {
+            g.types.insert(child_path.clone(), v);
+        }
+        if let Some(v) = g.symlinks.get(&source).cloned() {
+            g.symlinks.insert(child_path.clone(), v);
+        }
+        if let Some(v) = g.times.get(&source).copied() {
+            g.times.insert(child_path.clone(), v);
+        }
+        if let Some(v) = g.perms.get(&source).copied() {
+            g.perms.insert(child_path.clone(), v);
+        }
+        let id = *g.identities.get(&source).unwrap_or_else(|| {
+            panic!(
+                "no identity minted for {}: a creation path skipped mint_identity",
+                source.display()
+            )
+        });
+        g.identities.insert(child_path, id);
         Ok(())
     }
 
@@ -4619,5 +4737,133 @@ mod tests {
         fs.fail("read_link", Code::PermissionDenied);
         let e = FileSystem::read_link(&fs, Path::new("/d/n")).unwrap_err();
         assert_eq!(e.code, Code::PermissionDenied);
+    }
+
+    #[test]
+    fn fake_hardlink_aliases_identity_bytes_and_counts_links() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.create_dir(Path::new("/o")).unwrap();
+        fs.write_file("/o/a", b"shared");
+        fs.set_modified("/o/a", SystemTime::UNIX_EPOCH);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let o = fs.destination_root(Path::new("/o")).unwrap();
+        d.create_hardlink(OsStr::new("b"), &o, OsStr::new("a")).unwrap();
+        d.create_hardlink(OsStr::new("c"), &o, OsStr::new("a")).unwrap();
+        let a = FileSystem::metadata(&fs, Path::new("/o/a")).unwrap();
+        let b = FileSystem::metadata(&fs, Path::new("/d/b")).unwrap();
+        assert_eq!(a.identity, b.identity);
+        assert_eq!(a.nlink, Some(3));
+        assert_eq!(b.nlink, Some(3));
+        assert_eq!(b.modified, Some(SystemTime::UNIX_EPOCH));
+        assert_eq!(fs.read_file("/d/b").as_deref(), Some(&b"shared"[..]));
+        assert!(fs.called("create_hardlink(/d/b)"));
+        // Occupied names, missing source, directory source.
+        fs.create_dir(Path::new("/d/sub")).unwrap();
+        for n in ["b", "sub"] {
+            let e = d.create_hardlink(OsStr::new(n), &o, OsStr::new("a")).unwrap_err();
+            assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists, "{n}");
+        }
+        let e = d.create_hardlink(OsStr::new("z"), &o, OsStr::new("nope")).unwrap_err();
+        assert_eq!((e.code, e.source.kind()), (Code::IoError, std::io::ErrorKind::NotFound));
+        fs.create_dir(Path::new("/o/dir")).unwrap();
+        let e = d.create_hardlink(OsStr::new("z"), &o, OsStr::new("dir")).unwrap_err();
+        assert_eq!(
+            (e.code, e.source.kind()),
+            (Code::DestinationError, std::io::ErrorKind::IsADirectory)
+        );
+        assert!(!fs.exists("/d/z"));
+        // An override wins over the dynamic count; `None` is "unknown".
+        fs.set_link_count("/d/b", 7);
+        assert_eq!(FileSystem::metadata(&fs, Path::new("/d/b")).unwrap().nlink, Some(7));
+        assert_eq!(FileSystem::metadata(&fs, Path::new("/d/c")).unwrap().nlink, Some(3));
+        fs.set_link_count_unknown("/d/c");
+        assert_eq!(FileSystem::metadata(&fs, Path::new("/d/c")).unwrap().nlink, None);
+    }
+
+    #[test]
+    fn fake_hardlink_of_a_symlink_links_the_link_object() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.add_symlink_to("/d/l", "/d/t", LinkKind::File);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        d.create_hardlink(OsStr::new("m"), &d, OsStr::new("l")).unwrap();
+        let m = FileSystem::metadata(&fs, Path::new("/d/m")).unwrap();
+        assert_eq!(m.file_type, FileType::Symlink);
+        assert_eq!(
+            FileSystem::read_link(&fs, Path::new("/d/m")).unwrap(),
+            Link { payload: "/d/t".into(), kind: LinkKind::File }
+        );
+    }
+
+    #[test]
+    fn fake_hardlink_unavailable_is_the_code() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.write_file("/d/a", b"x");
+        fs.set_hardlinks_unavailable(true);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let e = d.create_hardlink(OsStr::new("b"), &d, OsStr::new("a")).unwrap_err();
+        assert_eq!(e.code, Code::HardlinkUnavailable);
+        assert!(!fs.exists("/d/b"));
+    }
+
+    #[test]
+    fn a_fault_on_create_hardlink_is_delivered() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.write_file("/d/a", b"x");
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        fs.fail("create_hardlink", Code::DiskFull);
+        let e = d.create_hardlink(OsStr::new("b"), &d, OsStr::new("a")).unwrap_err();
+        assert_eq!(e.code, Code::DiskFull);
+        assert!(!fs.exists("/d/b"));
+    }
+
+    #[test]
+    fn a_rename_between_two_names_of_one_object_is_a_no_op() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.write_file("/d/a", b"bytes");
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        d.create_hardlink(OsStr::new("t"), &d, OsStr::new("a")).unwrap();
+        let id = FileSystem::metadata(&fs, Path::new("/d/a")).unwrap().identity;
+        d.rename_replace(OsStr::new("t"), &d, OsStr::new("a")).unwrap();
+        assert!(fs.exists("/d/a") && fs.exists("/d/t"), "both names remain");
+        assert_eq!(fs.read_file("/d/a").as_deref(), Some(&b"bytes"[..]));
+        assert_eq!(FileSystem::metadata(&fs, Path::new("/d/a")).unwrap().identity, id);
+        assert_eq!(FileSystem::metadata(&fs, Path::new("/d/t")).unwrap().identity, id);
+        d.rename_no_replace(OsStr::new("a"), &d, OsStr::new("t")).unwrap();
+        assert!(fs.exists("/d/a") && fs.exists("/d/t"));
+        assert!(fs.called("rename_replace(/d/t -> /d/a)"));
+        assert!(fs.called("rename_no_replace(/d/a -> /d/t)"));
+        // Two DIFFERENT objects still replace.
+        fs.write_file("/d/x", b"other");
+        d.rename_replace(OsStr::new("x"), &d, OsStr::new("a")).unwrap();
+        assert!(!fs.exists("/d/x"));
+        assert_eq!(fs.read_file("/d/a").as_deref(), Some(&b"other"[..]));
+        assert_eq!(fs.read_file("/d/t").as_deref(), Some(&b"bytes"[..]));
+    }
+
+    #[test]
+    fn removing_one_name_lowers_the_others_link_count() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.write_file("/d/a", b"x");
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        d.create_hardlink(OsStr::new("b"), &d, OsStr::new("a")).unwrap();
+        assert_eq!(FileSystem::metadata(&fs, Path::new("/d/a")).unwrap().nlink, Some(2));
+        d.remove_file(OsStr::new("b")).unwrap();
+        assert_eq!(FileSystem::metadata(&fs, Path::new("/d/a")).unwrap().nlink, Some(1));
+        // A rename of one name onto a third keeps the count.
+        d.create_hardlink(OsStr::new("c"), &d, OsStr::new("a")).unwrap();
+        d.rename_no_replace(OsStr::new("c"), &d, OsStr::new("e")).unwrap();
+        assert_eq!(FileSystem::metadata(&fs, Path::new("/d/e")).unwrap().nlink, Some(2));
     }
 }
