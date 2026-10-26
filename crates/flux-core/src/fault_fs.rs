@@ -556,7 +556,7 @@ fn link_count(g: &Inner, path: &Path) -> Option<u64> {
     Some(names.max(1))
 }
 
-/// POSIX `rename(2)`: when `from` and `to` are two names of ONE object the call succeeds and changes nothing, so both
+/// POSIX `rename(2)` (`rename_replace` only; `rename_no_replace` refuses an occupied target): when `from` and `to` are two names of ONE object the call succeeds and changes nothing, so both
 /// names remain (master 16.1 step 3 is written for that). The fake models it for two live file names with equal
 /// identities.
 fn same_object(g: &Inner, from: &Path, to: &Path) -> bool {
@@ -1725,9 +1725,6 @@ impl FileSystem for FaultFs {
                     "no atomic no-replace publication primitive",
                 ),
             ));
-        }
-        if same_object(&g, &f, &t) {
-            return Ok(());
         }
         if g.files.contains_key(&t) || g.directories.contains(&t) {
             return Err(FsError::new(
@@ -4838,8 +4835,11 @@ mod tests {
         assert_eq!(fs.read_file("/d/a").as_deref(), Some(&b"bytes"[..]));
         assert_eq!(FileSystem::metadata(&fs, Path::new("/d/a")).unwrap().identity, id);
         assert_eq!(FileSystem::metadata(&fs, Path::new("/d/t")).unwrap().identity, id);
-        d.rename_no_replace(OsStr::new("a"), &d, OsStr::new("t")).unwrap();
-        assert!(fs.exists("/d/a") && fs.exists("/d/t"));
+        // No-replace is not the POSIX no-op: an occupied target is refused whatever its identity.
+        let e = d.rename_no_replace(OsStr::new("a"), &d, OsStr::new("t")).unwrap_err();
+        assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(fs.exists("/d/a") && fs.exists("/d/t"), "both names intact");
+        assert_eq!(fs.read_file("/d/t").as_deref(), Some(&b"bytes"[..]));
         assert!(fs.called("rename_replace(/d/t -> /d/a)"));
         assert!(fs.called("rename_no_replace(/d/a -> /d/t)"));
         // Two DIFFERENT objects still replace.

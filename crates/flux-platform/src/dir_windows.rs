@@ -1709,7 +1709,7 @@ fn open_for_link(p: &OwnedHandle, n: &OsStr, access: u32) -> Result<OwnedHandle>
 
 /// Create `t` in `td` as a new name of the object `f` names in `fd`, never replacing.
 ///
-/// UNMEASURED AND UNCOMPILED when written (no Windows toolchain on the authoring machine): modelled on
+/// UNMEASURED: compile-checked for x86_64-pc-windows-gnu, never run. Modelled on
 /// `rename_at`. Opens `f` with `FILE_READ_ATTRIBUTES | SYNCHRONIZE` (no `DELETE`: a link needs no right on the
 /// source handle in the documentation, which is the thing to confirm) and, if the link call answers
 /// `STATUS_ACCESS_DENIED`, reopens with `DELETE | SYNCHRONIZE`, the access `rename_at` asks for, and tries once
