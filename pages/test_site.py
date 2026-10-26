@@ -292,10 +292,14 @@ class SiteTests(unittest.TestCase):
             r"|does not (?:permit|allow) commercial use",
         )
         found = sentences(page())
-        unimplemented = [s for s in found if "do not exist yet" in s]
+        unimplemented = [s for s in found if "does not exist yet" in s]
         self.assertEqual(len(unimplemented), 1, unimplemented)
-        self.assertIn("flux verify", unimplemented[0])
         self.assertIn("flux benchmark", unimplemented[0])
+        self.assertNotIn("flux verify", unimplemented[0])
+        self.assertTrue(
+            any("flux verify" in s and " work" in s for s in found),
+            "no sentence lists flux verify among the working commands",
+        )
         for sentence in found:
             if re.search(r"commercial use", sentence, re.I):
                 self.assertRegex(sentence, r"(?i)\bnot\b|\bno\b|\bnon", "commercial use must be negated")

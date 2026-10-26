@@ -18,6 +18,7 @@ pub mod prior;
 pub mod run;
 pub mod state;
 pub mod tree;
+pub mod verify;
 pub(crate) mod wal;
 pub mod walk;
 

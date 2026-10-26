@@ -11,6 +11,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use flux_cli::exit_code;
 use flux_cli::report::{self, Report};
 use flux_cli::resolve::{self, Job, Stop};
+use flux_cli::verify_report;
 use flux_core::run::RunConfig;
 use flux_fs::{
     Code, CopyOptions, Durability, ExistingPolicy, Links, OperationId, Preserve, Publish, Safety,
@@ -48,6 +49,35 @@ enum Commands {
     Copy(CopyArgs),
     /// Classify and remove what earlier operations left at DEST (§24.4, §251).
     Cleanup(CleanupArgs),
+    /// Compare SOURCE with DEST by content and report what differs; nothing is written.
+    ///
+    /// Every file is read in full on both sides and hashed. Exit 0: nothing missing, mismatched
+    /// or unreadable; 1: something is; 2: a usage error, or roots that are the same or nested.
+    #[command(after_long_help = verify_report::GUARANTEES)]
+    Verify(VerifyArgs),
+}
+
+#[derive(Args)]
+struct VerifyArgs {
+    /// The source file or folder.
+    source: PathBuf,
+    /// The destination to compare it with (§4.1's mapping).
+    dest: PathBuf,
+    /// `copy` (the default) compares a symlink's payload; `skip` leaves source symlinks out.
+    #[arg(long, value_enum, default_value_t = LinksArg::Copy)]
+    links: LinksArg,
+    /// Also compare the contents of directories that are other mounts; by default each is reported as present and not entered.
+    #[arg(long)]
+    cross_filesystems: bool,
+    /// The hash used to compare files.
+    #[arg(long, value_enum, default_value_t = HashArg::Blake3)]
+    hash: HashArg,
+    /// One JSON object per record on stdout, then one {"summary": ...} object.
+    #[arg(long)]
+    json: bool,
+    /// Also print each `match` record (the default prints only what is not a match).
+    #[arg(long)]
+    verbose: bool,
 }
 
 #[derive(Args)]
@@ -225,6 +255,7 @@ fn main() -> ExitCode {
     ExitCode::from(match Cli::parse().command {
         Commands::Copy(args) => copy(&args),
         Commands::Cleanup(args) => cleanup(&args),
+        Commands::Verify(args) => verify(&args),
     })
 }
 
@@ -705,6 +736,115 @@ fn cleanup(args: &CleanupArgs) -> u8 {
     exit_code::for_cleanup(&rep)
 }
 
+/// The engine options the flags of `flux verify` select.
+fn verify_options(args: &VerifyArgs) -> flux_core::verify::VerifyOptions {
+    use flux_core::walk::MountPolicy;
+    flux_core::verify::VerifyOptions {
+        links: match args.links {
+            LinksArg::Copy => Links::Copy,
+            LinksArg::Skip => Links::Skip,
+        },
+        mounts: if args.cross_filesystems { MountPolicy::Cross } else { MountPolicy::Stay },
+        hash: match args.hash {
+            HashArg::Blake3 => flux_fs::HashAlgorithm::Blake3,
+        },
+    }
+}
+
+/// `flux verify` (cut 14): design 6.1 and 6.6. Records go to stdout; stderr carries only operational lines.
+fn verify(args: &VerifyArgs) -> u8 {
+    use flux_core::verify::VerifyError;
+    // `--json` still prints a summary when the run stops before any walk with exit 1 (plan R7).
+    let stopped = || {
+        if args.json {
+            let s = flux_core::verify::Summary::default();
+            stdout_or_exit(&verify_report::summary_json(
+                &args.source,
+                &args.dest,
+                "blake3",
+                &s,
+                exit_code::FAILED,
+            ));
+        }
+        exit_code::FAILED
+    };
+    let job = match resolve::job(&args.source, &args.dest) {
+        Ok(job) => job,
+        Err(Stop::Usage(msg)) => {
+            err(&format!("error: {msg}"));
+            return exit_code::USAGE;
+        }
+        Err(Stop::SymlinkSource) => {
+            err(&format!(
+                "{}: {}: {}",
+                Code::SymlinkCreationUnavailable.as_str(),
+                args.source.display(),
+                report::SYMLINK_WHY
+            ));
+            return stopped();
+        }
+        Err(Stop::Failed(line)) => {
+            err(&line);
+            return stopped();
+        }
+    };
+    let opts = verify_options(args);
+    let mut sink = |r: flux_core::verify::Record| {
+        let routed = verify_report::route_record(&r, args.json, args.verbose);
+        if let Some(line) = &routed.stdout {
+            stdout_or_exit(line);
+        }
+        lines(routed.stderr);
+    };
+    let fs = flux_platform::StdFileSystem;
+    let (src, dst, result) = match job {
+        Job::Tree { src, dst } => {
+            // The engine says so after the root check passed, so a refused run prints no such line.
+            let mut on_absent = || err(&verify_report::dest_absent_line(&dst));
+            let result = flux_core::verify::verify_tree_notifying(
+                &fs,
+                &src,
+                &dst,
+                &opts,
+                &mut on_absent,
+                &mut sink,
+            );
+            (src, dst, result)
+        }
+        Job::File { src, dst, .. } => {
+            let result = flux_core::verify::verify_file(&fs, &src, &dst, &opts, &mut sink);
+            (src, dst, result)
+        }
+    };
+    let summary = match result {
+        Ok(summary) => summary,
+        Err(VerifyError::RefusedRoots { reason }) => {
+            err(&format!("error: {reason}"));
+            return exit_code::USAGE;
+        }
+    };
+    let code = exit_code::for_verify(&summary);
+    let line = if args.json {
+        verify_report::summary_json(&src, &dst, "blake3", &summary, code)
+    } else {
+        verify_report::summary_line(&summary)
+    };
+    stdout_or_exit(&line);
+    code
+}
+
+/// One line of `flux verify`'s output to stdout. A failed write (a closed pipe, a full disk) ends the run at once with
+/// exit 1: verify is read-only and holds no lock, and the verdict is unknown once its output is lost, so continuing to
+/// hash the tree would only waste the work. A broken pipe is the reader's choice and says nothing.
+fn stdout_or_exit(line: &str) {
+    if let Err(e) = writeln!(std::io::stdout(), "{line}") {
+        if e.kind() != std::io::ErrorKind::BrokenPipe {
+            err(&format!("error: cannot write to standard output: {e}"));
+        }
+        std::process::exit(i32::from(exit_code::FAILED));
+    }
+}
+
 /// Each line to stderr.
 fn lines(v: Vec<String>) {
     for line in v {
@@ -738,6 +878,55 @@ mod tests {
             panic!("not a copy");
         };
         args
+    }
+
+    fn parse_verify(argv: &[&str]) -> VerifyArgs {
+        let Commands::Verify(args) = Cli::try_parse_from(argv).unwrap().command else {
+            panic!("not a verify");
+        };
+        args
+    }
+
+    #[test]
+    fn cross_filesystems_reaches_the_engine_mount_policy() {
+        use flux_core::walk::MountPolicy;
+        let stay = verify_options(&parse_verify(&["flux", "verify", "s", "d"]));
+        assert_eq!(stay.mounts, MountPolicy::Stay);
+        let cross =
+            verify_options(&parse_verify(&["flux", "verify", "s", "d", "--cross-filesystems"]));
+        assert_eq!(cross.mounts, MountPolicy::Cross);
+        let skip = verify_options(&parse_verify(&["flux", "verify", "s", "d", "--links", "skip"]));
+        assert!(matches!(skip.links, Links::Skip));
+    }
+
+    #[test]
+    fn verify_parses_its_flags_and_needs_exactly_two_paths() {
+        let bare = parse_verify(&["flux", "verify", "s", "d"]);
+        assert_eq!(bare.source, PathBuf::from("s"));
+        assert_eq!(bare.dest, PathBuf::from("d"));
+        assert!(matches!(bare.links, LinksArg::Copy));
+        assert!(!bare.cross_filesystems && !bare.json && !bare.verbose);
+        let all = parse_verify(&[
+            "flux",
+            "verify",
+            "s",
+            "d",
+            "--links",
+            "skip",
+            "--cross-filesystems",
+            "--json",
+            "--verbose",
+        ]);
+        assert!(matches!(all.links, LinksArg::Skip));
+        assert!(all.cross_filesystems && all.json && all.verbose);
+        for argv in [
+            &["flux", "verify", "s"][..],
+            &["flux", "verify", "s", "d", "e"],
+            &["flux", "verify", "s", "d", "--resume"],
+            &["flux", "verify", "s", "d", "--exclude", "x"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
+        }
     }
 
     fn parse_cleanup(argv: &[&str]) -> CleanupArgs {

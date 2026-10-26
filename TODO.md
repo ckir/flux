@@ -681,6 +681,10 @@ PS-1 (a socket at the lock or claim-store path was `IO_ERROR`, exit 1) and PP-1 
 
 - [ ] **Two live tree-copy codes the dry run mirrors (rulings P11 and P12), to fix on both paths together:** (a) a source entry whose temporary name (`<name>.flux-partial.<32 hex>`, `copy::temp_path`) exceeds NAME_MAX fails that file with `IO_ERROR` (File name too long) at `create_new`; a single-file target gets `PATH_COMPONENT_INVALID` from `file_names_fit` before anything is made, a tree entry has no such pre-check (`stage_file`); (b) a source regular FILE named `.flux` directly under the root fails `SAFETY_REJECTED` into an absent DEST (the fresh root plans `New` and the gate refuses "the destination is a directory") but `DESTINATION_ERROR` into an existing DEST (`resolve` finds the workspace directory): one cause, two codes, where master spec section 259.3 calls a source `.flux` ordinary content. Either fix changes `dry_temp_name_fits` / `dry_top_level_flux` and their paired tests in step, and amends the cut 11a spec's section 9.
 
+## Triaged from the anomalies inbox 2026-10-26 (verified by reading `walk.rs` at the cut 14 tip)
+
+- [ ] **`Walk::enter` lists a directory before yielding its `Dir` event** (`crates/flux-core/src/walk.rs`, the `read_dir(&abs)` in `enter` runs before the frame is pushed and the `Dir` event emitted), so a consumer that wants to skip a subtree cannot do so unlisted: `flux verify` lists `DEST/.flux` although it never reports it (read-only, harmless today). A fix would yield `Dir` first and list on the first `next()` into the frame, which changes the `read_dir` call order every verify and copy test pins (`fail_nth("read_dir", N)` indices); schedule it with its own mutant table rather than folding it into a cut.
+
 ## Cut 9g open (single-file resume; triaged from the anomalies inbox 2026-10-14)
 
 - [ ] `plan_resume` hashes through `parent.open_read(temp)` without comparing that handle's identity to `partial_meta.identity` (only `open_existing` checks it), so a concurrent double swap of the partial name could keep an unproven prefix. Pre-existing (same code as 9f-2 `full`), `copy.rs` near line 610; needs a second writer on the destination directory.
@@ -1202,3 +1206,11 @@ item was, not only in a commit message.
 - [ ] **The page-cache boundary of the `destination` re-read.** The re-read may be served by the operating system's
       cache, so a pass proves the destination returned the bytes that were written, not that they reached stable
       storage. `--help` and the README say so; no mechanism (direct I/O, a cache drop) bypasses it yet.
+
+## Cut 14 open (flux verify; spec `docs/superpowers/specs/2026-10-26-verify-command-design.md`)
+
+- [ ] **Several sources for `verify`** (cut 14b). Today `flux verify` takes one source and one DEST.
+- [ ] **`--exclude` and `--recursive` through the shared walker** when phase 3 selection lands. Today both are usage
+      errors (exit 2).
+- [ ] **Windows reparse points and junctions** as `Other` or `Symlink` in verify are CI evidence only; no local
+      Windows run has shown how the walker classifies them.

@@ -65,6 +65,11 @@ pub fn for_cleanup(r: &flux_core::cleanup::CleanupReport) -> u8 {
     if r.failed() { FAILED } else { SUCCESS }
 }
 
+/// `flux verify` (cut 14): 1 when anything is missing, mismatched or unreadable (master lines 681-684); extras never count.
+pub fn for_verify(s: &flux_core::verify::Summary) -> u8 {
+    if s.failed() { FAILED } else { SUCCESS }
+}
+
 fn for_stop(stop: &Option<RunError>) -> Option<u8> {
     match stop {
         None => None,
@@ -291,5 +296,16 @@ mod tests {
         assert_eq!(for_multi_run(&run(RootStatus::Completed)), SUCCESS);
         assert_eq!(for_multi_run(&run(RootStatus::Failed)), FAILED);
         assert_eq!(for_multi_run(&run(RootStatus::NotStarted)), FAILED);
+    }
+
+    #[test]
+    fn verify_exits_1_only_for_missing_mismatched_or_unreadable() {
+        use flux_core::verify::Summary;
+        assert_eq!(for_verify(&Summary::default()), SUCCESS);
+        assert_eq!(for_verify(&Summary { extra: 5, ..Summary::default() }), SUCCESS);
+        assert_eq!(for_verify(&Summary { not_entered: 2, ..Summary::default() }), SUCCESS);
+        assert_eq!(for_verify(&Summary { missing: 1, ..Summary::default() }), FAILED);
+        assert_eq!(for_verify(&Summary { mismatched: 1, ..Summary::default() }), FAILED);
+        assert_eq!(for_verify(&Summary { unreadable: 1, ..Summary::default() }), FAILED);
     }
 }
