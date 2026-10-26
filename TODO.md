@@ -1192,3 +1192,13 @@ item was, not only in a commit message.
   `StreamFail::Discard`; cross-thread cancellation plumbing for the guard, the WAL writer and the sync barrier; a stop
   can hang on a stalled read or an fsync). **Reopen if:** an engine caller (a library or UI) needs to cancel a run, or
   a measured case shows operators losing work to an interrupt.
+
+## Cut 13 open (copy-side verification; spec `docs/superpowers/specs/2026-10-26-copy-verification-design.md`)
+
+- [ ] **Flip the default `--verify` level to `source-stream`** (the spec's default; cut 13 shipped `none`, call C1). Do
+      it after a benchmark shows the cost of hashing the source stream. Measuring needs the owner's OK first.
+- [ ] **`--resume` with `--verify`** (cut 15). Today the combination is refused. The whole-file digest of a resumed file
+      needs the prefix hashed from the source; BLAKE3 digests of 1 MiB chunks do not compose into it.
+- [ ] **The page-cache boundary of the `destination` re-read.** The re-read may be served by the operating system's
+      cache, so a pass proves the destination returned the bytes that were written, not that they reached stable
+      storage. `--help` and the README say so; no mechanism (direct I/O, a cache drop) bypasses it yet.
