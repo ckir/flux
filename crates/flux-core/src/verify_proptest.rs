@@ -16,7 +16,7 @@ use crate::verify::{Kind, MOUNT_NOT_ENTERED, Outcome, Record, SPECIAL_NOT_COMPAR
 use crate::walk::MountPolicy;
 use flux_fs::{Code, FileSystem, FluxPathKey, LinkKind, Links, MountRoot};
 use proptest::collection::vec;
-use proptest::prelude::{Just, Strategy, any, prop_oneof};
+use proptest::prelude::{BoxedStrategy, Just, Strategy, any, prop_oneof};
 use proptest::sample::select;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -489,14 +489,21 @@ fn base() -> impl Strategy<Value = Vec<(RelPath, Spec)>> {
     vec((any::<usize>(), entry()), 3..=10).prop_map(place)
 }
 
-fn edit() -> impl Strategy<Value = Edit> {
+/// One edit; a lock-named entry may only ever change into a `File` (the name is a `File` name only).
+fn edit(lock_named: bool) -> impl Strategy<Value = Edit> {
+    let target = if lock_named { file_spec().boxed() } else { spec().boxed() };
     prop_oneof![
         8 => Just(Edit::KeepBoth),
         1 => which().prop_map(Edit::EditContent),
-        4 => (which(), spec()).prop_map(|(w, s)| Edit::ChangeKind(w, s)),
+        4 => (which(), target).prop_map(|(w, s)| Edit::ChangeKind(w, s)),
         2 => Just(Edit::DropFromDest),
         1 => Just(Edit::DropFromSource),
     ]
+}
+
+/// One edit per base entry, each aware of its entry's name.
+fn edits_for(base: &[(RelPath, Spec)]) -> Vec<BoxedStrategy<Edit>> {
+    base.iter().map(|(rel, _)| edit(rel.last() == Some(&LOCK)).boxed()).collect()
 }
 
 /// Where an extra may go: the root (the empty path) or any base `Dir` with room for a child.
@@ -573,9 +580,9 @@ fn links() -> impl Strategy<Value = Links> {
 fn case() -> impl Strategy<Value = Case> {
     base()
         .prop_flat_map(|base| {
-            let n = base.len();
+            let edits = edits_for(&base);
             let parents = parents_of(&base);
-            (Just(base), vec(edit(), n..=n), extras(parents), mounts(), links())
+            (Just(base), edits, extras(parents), mounts(), links())
         })
         .prop_map(|(base, edits, extras, mounts, links)| Case {
             base,
@@ -1003,9 +1010,11 @@ mod tests {
             if let Edit::ChangeKind(w, new) = &case.edits[i]
                 && kind_of(new) != kind_of(spec)
             {
+                let path = join(rel);
                 match w {
-                    Which::Source => change_src = true,
-                    Which::Dest => change_dst = true,
+                    Which::Source if src.get(&path) == Some(new) => change_src = true,
+                    Which::Dest if dst.get(&path) == Some(new) => change_dst = true,
+                    _ => {}
                 }
             }
         }
