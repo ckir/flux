@@ -288,3 +288,122 @@ fn a_symlink_source_is_refused_like_copy() {
     assert_eq!(lines[0]["summary"]["exit"], 1);
     assert_eq!(lines[0]["summary"]["matched"], 0);
 }
+
+#[test]
+fn a_real_copy_verifies_clean_and_a_flipped_byte_is_caught() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let dst = d.path().join("dst");
+    let copy = flux().arg("copy").arg(&src).arg(&dst).output().unwrap();
+    assert_eq!(copy.status.code(), Some(0), "{}", stderr(&copy));
+
+    let out = flux().arg("verify").arg(&src).arg(&dst).arg("--json").output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let lines = ndjson(&out);
+    let summary = &lines.last().unwrap()["summary"];
+    assert_eq!(summary["matched"], 3, "{lines:?}");
+    assert_eq!(summary["extra"], 0, "{lines:?}");
+
+    let b = dst.join("sub").join("b");
+    let mut bytes = std::fs::read(&b).unwrap();
+    *bytes.last_mut().unwrap() ^= 0xff;
+    std::fs::write(&b, bytes).unwrap();
+    let out = flux().arg("verify").arg(&src).arg(&dst).arg("--json").output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let lines = ndjson(&out);
+    let records: Vec<&serde_json::Value> =
+        lines.iter().filter(|l| l.get("summary").is_none() && l["outcome"] != "match").collect();
+    assert_eq!(records.len(), 1, "{lines:?}");
+    assert_eq!(records[0]["outcome"], "mismatched");
+    assert_eq!(records[0]["path"], "sub/b");
+    assert_eq!(records[0]["code"], "VERIFY_MISMATCH");
+    assert_eq!(lines.last().unwrap()["summary"]["mismatched"], 1);
+}
+
+#[test]
+fn control_state_the_copy_leaves_is_not_reported() {
+    let d = TempDir::new().unwrap();
+    let (src, dst) = pair_in(d.path());
+    let zeros = "0".repeat(32);
+    let op = dst.join(".flux").join("operations").join(&zeros);
+    std::fs::create_dir_all(&op).unwrap();
+    std::fs::write(op.join("state"), b"s").unwrap();
+    std::fs::write(dst.join(".flux-root.lock"), b"l").unwrap();
+    std::fs::write(dst.join(format!("a.flux-partial.{zeros}")), b"p").unwrap();
+    std::fs::write(dst.join("note.flux-partial.txt"), b"user").unwrap();
+
+    let out = flux().arg("verify").arg(&src).arg(&dst).arg("--json").output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let lines = ndjson(&out);
+    let extras: Vec<&serde_json::Value> =
+        lines.iter().filter(|l| l["outcome"] == "extra").collect();
+    assert_eq!(extras.len(), 1, "{lines:?}");
+    assert_eq!(extras[0]["path"], "note.flux-partial.txt");
+    assert_eq!(lines.last().unwrap()["summary"]["extra"], 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn links_skip_leaves_a_source_symlink_out_end_to_end() {
+    let d = TempDir::new().unwrap();
+    let src = d.path().join("src");
+    let dst = d.path().join("dst");
+    for side in [&src, &dst] {
+        std::fs::create_dir(side).unwrap();
+        std::fs::write(side.join("f"), b"F").unwrap();
+        std::os::unix::fs::symlink("target-one", side.join("l")).unwrap();
+    }
+    let paths = |out: &Output| -> Vec<(String, String)> {
+        ndjson(out)
+            .iter()
+            .filter(|l| l.get("summary").is_none())
+            .map(|l| {
+                (l["path"].as_str().unwrap().to_owned(), l["outcome"].as_str().unwrap().to_owned())
+            })
+            .collect()
+    };
+    let run = |extra: &[&str]| {
+        flux()
+            .arg("verify")
+            .arg(&src)
+            .arg(&dst)
+            .args(extra)
+            .args(["--verbose", "--json"])
+            .output()
+            .unwrap()
+    };
+
+    // Without the flag the payloads are compared: both sides have `l`.
+    let out = run(&[]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(paths(&out).contains(&("l".into(), "match".into())), "{:?}", paths(&out));
+
+    // With `--links skip` the source symlink produces no record from the source side.
+    let out = run(&["--links", "skip"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let got = paths(&out);
+    assert_eq!(
+        got.iter().filter(|(p, _)| p == "l").collect::<Vec<_>>(),
+        [&("l".to_owned(), "extra".to_owned())],
+        "{got:?}"
+    );
+
+    // A destination-only symlink is `extra` under `--links skip`.
+    std::os::unix::fs::symlink("elsewhere", dst.join("only-dest")).unwrap();
+    let out = run(&["--links", "skip"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let got = paths(&out);
+    assert!(got.contains(&("only-dest".into(), "extra".into())), "{got:?}");
+    assert!(got.contains(&("f".into(), "match".into())), "{got:?}");
+    // The source symlink `l` is not matched, so the destination's `l` is also left over.
+    assert!(!got.contains(&("l".into(), "match".into())), "{got:?}");
+}
+
+#[test]
+fn help_shows_the_exit_codes_and_the_guarantees() {
+    let out = flux().args(["verify", "--help"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("Exit 0: nothing missing, mismatched or unreadable; 1:"), "{text}");
+    assert!(text.contains("What a pass guarantees:"), "{text}");
+}

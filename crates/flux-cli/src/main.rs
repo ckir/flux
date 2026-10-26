@@ -53,7 +53,7 @@ enum Commands {
     ///
     /// Every file is read in full on both sides and hashed. Exit 0: nothing missing, mismatched
     /// or unreadable; 1: something is; 2: a usage error, or roots that are the same or nested.
-    #[command(long_about = verify_report::GUARANTEES)]
+    #[command(after_long_help = verify_report::GUARANTEES)]
     Verify(VerifyArgs),
 }
 
@@ -737,9 +737,23 @@ fn cleanup(args: &CleanupArgs) -> u8 {
 }
 
 /// `flux verify` (cut 14): design 6.1 and 6.6. Records go to stdout; stderr carries only operational lines.
-fn verify(args: &VerifyArgs) -> u8 {
-    use flux_core::verify::{MOUNT_NOT_ENTERED, Outcome, VerifyError, VerifyOptions};
+/// The engine options the flags of `flux verify` select.
+fn verify_options(args: &VerifyArgs) -> flux_core::verify::VerifyOptions {
     use flux_core::walk::MountPolicy;
+    flux_core::verify::VerifyOptions {
+        links: match args.links {
+            LinksArg::Copy => Links::Copy,
+            LinksArg::Skip => Links::Skip,
+        },
+        mounts: if args.cross_filesystems { MountPolicy::Cross } else { MountPolicy::Stay },
+        hash: match args.hash {
+            HashArg::Blake3 => flux_fs::HashAlgorithm::Blake3,
+        },
+    }
+}
+
+fn verify(args: &VerifyArgs) -> u8 {
+    use flux_core::verify::{MOUNT_NOT_ENTERED, Outcome, VerifyError};
     // `--json` still prints a summary when the run stops before any walk with exit 1 (plan R7).
     let stopped = || {
         if args.json {
@@ -778,16 +792,7 @@ fn verify(args: &VerifyArgs) -> u8 {
             return stopped();
         }
     };
-    let opts = VerifyOptions {
-        links: match args.links {
-            LinksArg::Copy => Links::Copy,
-            LinksArg::Skip => Links::Skip,
-        },
-        mounts: if args.cross_filesystems { MountPolicy::Cross } else { MountPolicy::Stay },
-        hash: match args.hash {
-            HashArg::Blake3 => flux_fs::HashAlgorithm::Blake3,
-        },
-    };
+    let opts = verify_options(args);
     let mut sink = |r: flux_core::verify::Record| {
         if args.json {
             let _ = writeln!(std::io::stdout(), "{}", verify_report::record_json(&r));
@@ -870,6 +875,18 @@ mod tests {
             panic!("not a verify");
         };
         args
+    }
+
+    #[test]
+    fn cross_filesystems_reaches_the_engine_mount_policy() {
+        use flux_core::walk::MountPolicy;
+        let stay = verify_options(&parse_verify(&["flux", "verify", "s", "d"]));
+        assert_eq!(stay.mounts, MountPolicy::Stay);
+        let cross =
+            verify_options(&parse_verify(&["flux", "verify", "s", "d", "--cross-filesystems"]));
+        assert_eq!(cross.mounts, MountPolicy::Cross);
+        let skip = verify_options(&parse_verify(&["flux", "verify", "s", "d", "--links", "skip"]));
+        assert!(matches!(skip.links, Links::Skip));
     }
 
     #[test]
