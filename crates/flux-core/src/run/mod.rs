@@ -18,7 +18,7 @@ mod dry_prior;
 mod multi;
 pub(crate) mod place;
 mod prefix;
-mod recover;
+pub(crate) mod recover;
 mod restart;
 mod resume;
 mod roots;
@@ -36,17 +36,18 @@ use crate::copy::{
 use crate::dry_run::{
     DryPrior, DryRun, NullClaimStore, PlannedAction, PlannedEntry, PlannedObject,
 };
+use crate::hardlinks::{HardlinkSlot, strong};
 use crate::lock::record::LockRecord;
 use crate::lock::site::NAME_LIMIT;
 use crate::lock::{LockCode, LockSite, Refusal, Released, check_capability};
 use crate::prior::{check_control_plane, resumable_refusal};
-use crate::state::{OpState, file_names_fit, identity_text, native_hex};
+use crate::state::{HARDLINK_INDEX, OpState, file_names_fit, identity_text, native_hex};
 use crate::tree::{
     RootIdentity, Shared, Source, TreeAbort, TreeFailure, TreeFailureCause, TreeOutcome,
     copy_tree_at, copy_tree_frames, prepare_source, report,
 };
 use crate::walk::MountPolicy;
-use dry_prior::{DryAdopt, LockPreview, dry_adopt, dry_lock, dry_restart};
+use dry_prior::{DryAdopt, LockPreview, TempDir, dry_adopt, dry_lock, dry_restart};
 use flux_fs::{
     ClaimStore, Code, CopyOptions, DestinationRoot, DirHandle, FileIdentity, FsError,
     LockCapability, OperationId, Outcome,
@@ -238,6 +239,12 @@ pub enum RunWarning {
     /// Cut 9f-1: the checkpoint log's handles could not be opened, or reading it failed with an I/O error; the tree ran
     /// without checkpoints, so every large file recopied. (Damage is `WalQuarantined`; an unknown format stops the run.)
     CheckpointsUnreadable { why: String },
+    /// Cut 12: the hardlink index could not be created (or its directory opened); hardlinks were copied independently
+    /// under `--hardlinks=auto` and failed under `preserve`. `path` is where the index would have been.
+    HardlinkIndexUnavailable { path: PathBuf, code: Code },
+    /// Cut 12 (plan ruling 8): DEST could not be reopened for linking, or reopened as a different directory; hardlinks
+    /// were copied independently under `auto` and failed under `preserve`.
+    HardlinkRootUnavailable { error: FsError },
     /// Cut 9f-1: the checkpoint log ended in `len` bytes at `offset` that the replay cut (spec decision 7.1);
     /// the records before `offset` are intact and were used.
     WalTailDiscarded { offset: u64, len: u64, reason: &'static str },
@@ -455,6 +462,56 @@ where
     // Cut 9a: under `--resume` the effective id is the prior's; the partials are named by it.
     let opts =
         CopyOptions { operation_id: OperationId::new(&locked.state.operation_id), ..opts.clone() };
+    // Cut 12: the hardlink slot (a handle on the workspace; the index file is created on first use) and the second
+    // handle on DEST the anchor's directory is opened from (plan rulings 8, 9).
+    let workspace_id = locked.state.operation_id.clone();
+    let (hardlink_slot, anchor_root, mut slot_warned) = if opts.hardlinks
+        == flux_fs::Hardlinks::Copy
+    {
+        (None, None, false)
+    } else {
+        let mut warned = false;
+        let slot = match place.tree_place().open_workspace(&workspace_id) {
+            Ok(w) => HardlinkSlot::new(w),
+            Err(e) => {
+                warned = true;
+                run.warnings.push(RunWarning::HardlinkIndexUnavailable {
+                    path: place
+                        .tree_place()
+                        .operations_shown()
+                        .join(&workspace_id)
+                        .join(HARDLINK_INDEX),
+                    code: e.code,
+                });
+                HardlinkSlot::unavailable(e.code)
+            }
+        };
+        let walk_root = place.tree_place().dest.as_ref().map(|d| d.identity());
+        let anchor = match fs.destination_root(&place.tree_place().dest_shown) {
+            Ok(root) => match (root.identity(), walk_root) {
+                (Ok(a), Some(Ok(b))) if strong(a).is_some() && a == b => Some(root),
+                (Err(error), _) | (_, Some(Err(error))) => {
+                    run.warnings.push(RunWarning::HardlinkRootUnavailable { error });
+                    None
+                }
+                _ => {
+                    let error = FsError::new(
+                        Code::DestinationError,
+                        std::io::Error::other(
+                            "DEST reopened as a directory other than the one the walk writes into",
+                        ),
+                    );
+                    run.warnings.push(RunWarning::HardlinkRootUnavailable { error });
+                    None
+                }
+            },
+            Err(error) => {
+                run.warnings.push(RunWarning::HardlinkRootUnavailable { error });
+                None
+            }
+        };
+        (Some(slot), anchor, warned)
+    };
     // Cut 9f-1: the checkpoint log, opened from two handles on this operation's workspace, below, once the guard and beat
     // closures exist (owner ruling 23: setting a damaged log aside is a destination mutation, so it runs under them).
     // A damaged log never aborts a copy, except an unsupported format (a newer Flux wrote it) and a lost lock. In a
@@ -519,6 +576,8 @@ where
             dry_prior: None,
             dry_partials: None,
             key_prefix: None,
+            hardlinks: hardlink_slot.as_ref(),
+            anchor_root: anchor_root.as_ref(),
         };
         let mut report = |f: TreeFailure| {
             if let TreeFailureCause::Copy(e) = &f.cause
@@ -606,6 +665,25 @@ where
         }
     }
     drop(claims);
+    // Cut 12: the index is closed once `ended` is known (a lost lock keeps its file: the run no longer owns DEST, plan
+    // ruling 15), and both handles are gone before `finish` retires the workspace.
+    if let Some(slot) = hardlink_slot {
+        let failure = slot.failure();
+        drop(slot.close(!matches!(ended, Ended::Lost)));
+        if let Some(code) = failure
+            && !std::mem::replace(&mut slot_warned, true)
+        {
+            run.warnings.push(RunWarning::HardlinkIndexUnavailable {
+                path: place
+                    .tree_place()
+                    .operations_shown()
+                    .join(&workspace_id)
+                    .join(HARDLINK_INDEX),
+                code,
+            });
+        }
+    }
+    drop(anchor_root);
     // Cut 9e: the barrier's beats happen during the walk, so the value taken at the lock is stale by now.
     run.beat_gap_max = locked.pulse.gap_max();
     settle(&mut *place, &mut run.warnings);
@@ -1347,6 +1425,31 @@ fn dry_tree<F: DestinationRoot>(
         _ => None,
     };
     let partials = std::cell::Cell::new(0u64);
+    // Cut 12 (ruling 10): the dry run's index lives in a temporary directory of its own; it never links.
+    let hardlinks_name = format!("{}-hardlinks", cfg.operation_id);
+    let hardlinks_path = temp_root.join(format!("flux-dry-{hardlinks_name}")).join(HARDLINK_INDEX);
+    let mut hardlinks_warned = false;
+    let (hardlinks_temp, hardlink_slot) = if opts.hardlinks == flux_fs::Hardlinks::Copy {
+        (None, None)
+    } else {
+        let made = TempDir::make(fs, &temp_root, &hardlinks_name).and_then(|temp| {
+            let handle = fs
+                .destination_root(&temp_root)
+                .and_then(|r| r.open_dir(OsStr::new(&format!("flux-dry-{hardlinks_name}"))));
+            handle.map(|h| (temp, h))
+        });
+        match made {
+            Ok((temp, handle)) => (Some(temp), Some(HardlinkSlot::new(handle))),
+            Err(e) => {
+                hardlinks_warned = true;
+                run.warnings.push(RunWarning::HardlinkIndexUnavailable {
+                    path: hardlinks_path.clone(),
+                    code: e.code,
+                });
+                (None, Some(HardlinkSlot::unavailable(e.code)))
+            }
+        }
+    };
     let cx = Shared {
         fs,
         src_root: &src_root,
@@ -1362,6 +1465,8 @@ fn dry_tree<F: DestinationRoot>(
         dry_prior: prior_id.as_deref(),
         dry_partials: prior_id.is_some().then_some(&partials),
         key_prefix: None,
+        hardlinks: hardlink_slot.as_ref(),
+        anchor_root: None,
     };
     let root = place.dest.take();
     let absent = root.is_none();
@@ -1388,6 +1493,17 @@ fn dry_tree<F: DestinationRoot>(
             Err(CopyError::at(CopyStep::Resolve, e))
         }
     };
+    // Cut 12: the index file goes before its directory does.
+    if let Some(slot) = hardlink_slot {
+        let failure = slot.failure();
+        drop(slot.close(true));
+        if let Some(code) = failure
+            && !hardlinks_warned
+        {
+            run.warnings.push(RunWarning::HardlinkIndexUnavailable { path: hardlinks_path, code });
+        }
+    }
+    drop(hardlinks_temp);
     let mut result = match walked {
         Ok(()) => Ok(out),
         Err(error) => Err(TreeAbort { error, outcome: out }),

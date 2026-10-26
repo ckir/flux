@@ -2063,9 +2063,9 @@ fn a_failed_state_creation_that_cannot_remove_its_lock_reports_the_leftover() {
     let fs = fake();
     fs.fail("create_claim_store", Code::PermissionDenied);
     // The lock this run created is given back after the unwinding, so its removal is the run's last `remove_file`:
-    // the probe and manifest temporaries (1, 2), the five files of the renamed operation directory (3-7), then the
-    // lock (8).
-    fs.fail_nth("remove_file", 8, Code::DiskFull, std::io::ErrorKind::StorageFull);
+    // the probe and manifest temporaries (1, 2), the six files of the renamed operation directory (3-8; the hardlink
+    // index's name joined the known list in cut 12), then the lock (9).
+    fs.fail_nth("remove_file", 9, Code::DiskFull, std::io::ErrorKind::StorageFull);
     let (r, _) = run_tree(&fs, &cfg());
     let Some(RunError::Failed { step, path, error, not_removed }) = &r.stop else {
         panic!("expected a failure, got {:?}", r.stop)
@@ -2529,6 +2529,8 @@ fn a_target_that_finds_its_own_claim_proceeds() {
         dry_prior: None,
         dry_partials: None,
         key_prefix: None,
+        hardlinks: None,
+        anchor_root: None,
     };
     let mut out = TreeOutcome::default();
     let mut got = Vec::new();
@@ -7792,6 +7794,17 @@ fn dry() -> RunConfig {
     RunConfig { dry_run: true, ..cfg() }
 }
 
+/// `fake()` with the directory a dry run's hardlink index is made in (cut 12): the default temp root, which the fake
+/// does not have, would otherwise be reported as `HardlinkIndexUnavailable`.
+fn fake_with_temp_root() -> FaultFs {
+    let fs = fake();
+    let root = std::env::temp_dir();
+    if !fs.exists(&root) {
+        fs.create_dir(&root).unwrap();
+    }
+    fs
+}
+
 /// True for a call that names no path, or one whose path is `/p` or `/src` or below.
 /// A call that names a claim key, not a path, is always in scope.
 fn in_scope(call: &str) -> bool {
@@ -8009,7 +8022,7 @@ fn assert_resumable_refusal(stop: &Option<RunError>) {
 #[test]
 fn a_dry_run_notes_each_prior_and_still_plans() {
     // Resumable: the note stays, and the run predicts the refusal instead of planning.
-    let fs = fake();
+    let fs = fake_with_temp_root();
     prior(&fs, 5, OpState::Failed);
     let (r, _) = run_tree(&fs, &dry());
     assert_resumable_refusal(&r.stop);
@@ -8023,7 +8036,7 @@ fn a_dry_run_notes_each_prior_and_still_plans() {
         r.warnings
     );
     // Completed.
-    let fs = fake();
+    let fs = fake_with_temp_root();
     prior(&fs, 6, OpState::Completed);
     let (r, _) = run_tree(&fs, &dry());
     assert_eq!(ok(&r).files_copied, 2);
@@ -8034,7 +8047,7 @@ fn a_dry_run_notes_each_prior_and_still_plans() {
         r.warnings
     );
     // Unreadable: the scan's error is the real run's, and it ends the preview with no plan.
-    let fs = fake();
+    let fs = fake_with_temp_root();
     prior(&fs, 7, OpState::Failed);
     fs.write_file(format!("/p/dest/.flux/operations/{}/manifest", id(7)), b"garbage");
     let (r, _) = run_tree(&fs, &dry());
@@ -8050,23 +8063,23 @@ fn a_dry_run_says_whether_it_saw_a_prior_through_both_entry_points() {
         let (r, _) = run_tree(fs, &dry());
         (r.dry.as_ref().unwrap().prior_seen, r.warnings.len())
     };
-    let fs = fake();
+    let fs = fake_with_temp_root();
     assert_eq!(seen_tree(&fs), (false, 0));
     // A completed prior sets it; a resumable one (the predicted refusal) does not (spec 3.3).
     for (state, seen) in [(OpState::Failed, false), (OpState::Completed, true)] {
-        let fs = fake();
+        let fs = fake_with_temp_root();
         prior(&fs, 5, state);
         assert_eq!(seen_tree(&fs), (seen, 1), "{state:?}");
     }
-    let fs = fake();
+    let fs = fake_with_temp_root();
     prior(&fs, 7, OpState::Failed);
     fs.write_file(format!("/p/dest/.flux/operations/{}/manifest", id(7)), b"garbage");
     assert_eq!(seen_tree(&fs), (false, 0), "unreadable");
 
-    let fs = fake();
+    let fs = fake_with_temp_root();
     let r = run_file(&fs, &dry());
     assert!(!r.dry.as_ref().unwrap().prior_seen && r.warnings.is_empty(), "{:?}", r.warnings);
-    let fs = fake();
+    let fs = fake_with_temp_root();
     file_prior(&fs, 5);
     let r = run_file(&fs, &dry());
     assert!(!r.dry.as_ref().unwrap().prior_seen, "a resumable prior is not `prior_seen`");
@@ -9178,4 +9191,50 @@ fn a_dry_single_file_resume_predicts_incompatible_state() {
     assert_eq!(refused(&r.stop), (LockCode::IncompatibleState, false));
     assert!(!detail(&r.stop).contains("older version"), "{}", detail(&r.stop));
     assert_eq!(r.dry.as_ref().unwrap().partials_present, 0);
+}
+
+// Cut 12 Task 4: the hardlink slot is created lazily, so an ordinary run makes no index file.
+#[test]
+fn a_run_under_auto_with_no_hardlinks_leaves_no_index_file() {
+    let fs = fake();
+    let (r, got) = run_tree(&fs, &cfg());
+    ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert!(r.warnings.iter().all(|w| !matches!(w, RunWarning::HardlinkIndexUnavailable { .. })));
+    let log = calls(&fs);
+    assert!(!fs.exists(format!("/p/dest/.flux/operations/{ID}/hardlinks.db")), "{log:?}");
+    assert!(!log.iter().any(|c| c.starts_with("create_hardlink_index")), "{log:?}");
+}
+
+// The brief counted `open_dir` calls, but the fake's handle-level `open_dir` is not in the call log (and `fault_fs.rs`
+// is outside Task 4's files); `Copy` mode's observable half is that it carries no slot and no warning, and creates
+// nothing either.
+#[test]
+fn copy_mode_carries_no_slot_and_leaves_no_index_file() {
+    let fs = fake();
+    let mut o = opts();
+    o.hardlinks = flux_fs::Hardlinks::Copy;
+    let mut got = Vec::new();
+    let r = tree(&fs, Path::new("/src"), Path::new("/p/dest"), &o, &cfg(), &mut |f| got.push(f));
+    ok(&r);
+    assert!(r.warnings.iter().all(|w| !matches!(w, RunWarning::HardlinkIndexUnavailable { .. })));
+    assert!(!calls(&fs).iter().any(|c| c.starts_with("create_hardlink_index")), "{:?}", calls(&fs));
+    assert!(!fs.exists(format!("/p/dest/.flux/operations/{ID}/hardlinks.db")));
+}
+
+// Mutant: `close` is given `remove: true` on `Ended::Lost`. The index file is stood in for by a stale file the hook
+// writes into the workspace (nothing opens the index until the engine consults it).
+#[test]
+fn a_lost_lock_keeps_the_index_file() {
+    let fs = fake();
+    let index = format!("/p/dest/.flux/operations/{ID}/hardlinks.db");
+    let path = index.clone();
+    fs.on_nth("create_new", 4, move |fs| {
+        fs.write_file(LOCK, b"another run's bytes");
+        fs.write_file(&path, b"index");
+    });
+    let (r, _) = run_tree(&fs, &cfg());
+    assert_eq!(aborted(&r).error.code(), Code::TargetLockBusy);
+    assert!(fs.exists(&index), "the lost run no longer owns DEST: {:?}", calls(&fs));
+    assert!(!calls(&fs).iter().any(|c| c == &format!("remove_file({index})")), "{:?}", calls(&fs));
 }

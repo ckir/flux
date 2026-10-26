@@ -10,6 +10,7 @@ pub(crate) mod checkpoint;
 pub mod cleanup;
 pub mod copy;
 pub mod dry_run;
+pub(crate) mod hardlinks;
 pub mod ids;
 pub mod lock;
 mod names;

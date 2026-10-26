@@ -95,6 +95,29 @@ pub struct TreeOutcome {
     pub partial_resumes: Vec<PartialResume>,
     /// Cut 9f-1: every published file whose checkpoints were discarded, and why (nothing is discarded silently).
     pub checkpoint_discards: Vec<CheckpointDiscard>,
+    /// Cut 12: files recreated as a hardlink to their group's anchor. Not in `files_copied` or `bytes_copied`.
+    pub files_hardlinked: u64,
+    /// Cut 12: members of a hardlink group copied independently, whatever the reason.
+    pub hardlinks_degraded: u64,
+    /// Cut 12: members whose anchor could not be checked (the design's "cannot be checked" row): count and first example.
+    pub hardlinks_unchecked: Option<DegradedGroup>,
+    /// Cut 12: degradations caused by a weak or unavailable identity, aggregated as `warnings` is.
+    pub hardlink_weak: WeakIdentityWarnings,
+    /// Cut 12: the degradations that are NOT weak identity, one count and first example per cause.
+    pub hardlinks_unlinked: BTreeMap<UnlinkedWhy, DegradedGroup>,
+}
+
+/// Cut 12: why a hardlink group member was copied independently when its identity was fine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UnlinkedWhy {
+    /// The destination refused the link (`HARDLINK_UNAVAILABLE`).
+    LinkRefused,
+    /// The anchor's directory could not be opened for linking.
+    AnchorUnavailable,
+    /// The existing-file policy split the group.
+    PolicySplit,
+    /// The hardlink index failed to answer or record.
+    IndexFailure,
 }
 
 /// Cut 9f-1: a file resumed from a validated prefix. `path` is relative to the source root, as the walk reports it.
@@ -437,6 +460,11 @@ pub(crate) struct Shared<'c, F: DestinationRoot> {
     /// root. `None` for a single-root run, whose keys stay byte-identical to the root-relative path. `TreeFailure.path`
     /// stays root-relative (display only).
     pub(crate) key_prefix: Option<&'c OsStr>,
+    /// Cut 12: the run's hardlink index slot; `None` for `--hardlinks=copy` and a lockless `copy_tree`.
+    pub(crate) hardlinks: Option<&'c crate::hardlinks::HardlinkSlot<F::Dir>>,
+    /// Cut 12: a second handle on DEST for opening an anchor's directory; `None` for a dry run, a lockless copy, or a
+    /// root that did not match the walk's (plan ruling 8).
+    pub(crate) anchor_root: Option<&'c F::Dir>,
 }
 
 impl<'c, F: DestinationRoot> Shared<'c, F> {
@@ -464,6 +492,8 @@ impl<'c, F: DestinationRoot> Shared<'c, F> {
             dry_prior: self.dry_prior,
             dry_partials: self.dry_partials,
             key_prefix,
+            hardlinks: self.hardlinks,
+            anchor_root: self.anchor_root,
         }
     }
 
@@ -646,6 +676,8 @@ fn run_tree<F: DestinationRoot>(
         dry_prior: None,
         dry_partials: None,
         key_prefix: None,
+        hardlinks: None,
+        anchor_root: None,
     };
     copy_tree_at(&cx, source.events, root, false, out, on_report).1
 }
@@ -4748,6 +4780,8 @@ mod tests {
             dry_prior: None,
             dry_partials: None,
             key_prefix: None,
+            hardlinks: None,
+            anchor_root: None,
         };
         let mut out = TreeOutcome::default();
         let mut got = Vec::new();
@@ -5766,6 +5800,8 @@ mod tests {
             dry_prior: None,
             dry_partials: None,
             key_prefix: None,
+            hardlinks: None,
+            anchor_root: None,
         };
         let mut out = TreeOutcome::default();
         let (_root, r) = copy_tree_at(&cx, source.events, root, false, &mut out, &mut |_| {});
@@ -5862,6 +5898,8 @@ mod tests {
             dry_prior: None,
             dry_partials: None,
             key_prefix: None,
+            hardlinks: None,
+            anchor_root: None,
         };
         let mut out = TreeOutcome::default();
         let mut reported = 0;
@@ -5906,6 +5944,8 @@ mod tests {
             dry_prior: None,
             dry_partials: None,
             key_prefix: None,
+            hardlinks: None,
+            anchor_root: None,
         };
         let mut out = TreeOutcome::default();
         let mut reported = 0;
@@ -5940,6 +5980,8 @@ mod tests {
             dry_prior: None,
             dry_partials: None,
             key_prefix: None,
+            hardlinks: None,
+            anchor_root: None,
         };
         let mut out = TreeOutcome::default();
         let (back, r) = copy_tree_at(&cx, source.events, root, false, &mut out, &mut |_| {});
@@ -6058,6 +6100,8 @@ mod tests {
             dry_prior: None,
             dry_partials: None,
             key_prefix,
+            hardlinks: None,
+            anchor_root: None,
         };
         let mut out = TreeOutcome::default();
         let mut got = Vec::new();
@@ -8057,6 +8101,8 @@ mod tests {
             dry_prior: None,
             dry_partials: None,
             key_prefix: None,
+            hardlinks: None,
+            anchor_root: None,
         };
         let (root, identity) = match dst_root {
             Some(d) => {
@@ -8602,6 +8648,8 @@ mod tests {
             dry_prior: None,
             dry_partials: None,
             key_prefix: None,
+            hardlinks: None,
+            anchor_root: None,
         };
         let mut out = TreeOutcome::default();
         let mut got = Vec::new();
@@ -8845,6 +8893,8 @@ mod tests {
             dry_prior: None,
             dry_partials: None,
             key_prefix: None,
+            hardlinks: None,
+            anchor_root: None,
         };
         // A source borrows its path for the whole walk, so the paths outlive the roots.
         let paths: Vec<PathBuf> = specs

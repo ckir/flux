@@ -653,6 +653,15 @@ pub fn run_warning_line(w: &RunWarning) -> String {
         RunWarning::CheckpointsUnreadable { why } => {
             format!("checkpoints unreadable: {why}; every large file recopies")
         }
+        RunWarning::HardlinkIndexUnavailable { path, code } => format!(
+            "warning: the hardlink index {} could not be created ({}); hardlinks were copied independently - --hardlinks=preserve fails them instead",
+            path.display(),
+            code.as_str()
+        ),
+        RunWarning::HardlinkRootUnavailable { error } => format!(
+            "warning: DEST could not be reopened for linking ({}); hardlinks were copied independently - --hardlinks=preserve fails them instead",
+            error.source
+        ),
         RunWarning::WalQuarantined { code, why, set_aside_as } => format!(
             "{code}: the checkpoint log is damaged ({why}); possible storage damage, investigate; it was set aside as wal/{set_aside_as} and a fresh log was started; every large file recopies"
         ),
@@ -1641,6 +1650,29 @@ mod tests {
                 error: "denied".to_string(),
             }),
             "WAL_SEQUENCE_CONFLICT: the checkpoint log is damaged (conflict) and could not be set aside (denied); this run copies with no checkpoints"
+        );
+    }
+
+    // Cut 12: the two hardlink warnings' exact texts.
+    #[test]
+    fn the_hardlink_warnings_have_their_exact_texts() {
+        assert_eq!(
+            run_warning_line(&RunWarning::HardlinkIndexUnavailable {
+                path: PathBuf::from("D/.flux/operations/x/hardlinks.db"),
+                code: Code::IoError,
+            }),
+            format!(
+                "warning: the hardlink index {} could not be created ({}); hardlinks were copied independently - --hardlinks=preserve fails them instead",
+                PathBuf::from("D/.flux/operations/x/hardlinks.db").display(),
+                Code::IoError.as_str()
+            )
+        );
+        let line = run_warning_line(&RunWarning::HardlinkRootUnavailable {
+            error: FsError::new(Code::IoError, std::io::Error::other("gone")),
+        });
+        assert_eq!(
+            line,
+            "warning: DEST could not be reopened for linking (gone); hardlinks were copied independently - --hardlinks=preserve fails them instead"
         );
     }
 

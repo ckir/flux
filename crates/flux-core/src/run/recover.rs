@@ -70,7 +70,7 @@ fn uncertain(why: &str) -> Verdict {
 
 /// Stored name bytes as a name. On Windows only UTF-8 is accepted: anything else would need an unchecked conversion of
 /// bytes read from disk, so such a note is invalid.
-fn name_of(bytes: &[u8]) -> Option<OsString> {
+pub(crate) fn name_of(bytes: &[u8]) -> Option<OsString> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
