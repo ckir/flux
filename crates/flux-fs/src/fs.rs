@@ -289,6 +289,9 @@ pub trait DirHandle: Sized {
     /// The claim store `create_claim_store` opens (cut 8b). See `crate::ClaimStore`.
     type Claims: crate::ClaimStore;
 
+    /// The per-run hardlink index `create_hardlink_index` opens (cut 12). See `crate::HardlinkIndex`.
+    type Index: crate::HardlinkIndex;
+
     /// Open a child DIRECTORY, refusing to traverse a symlink, junction or other
     /// name-surrogate reparse point. This is the operation §149.7 is about.
     fn open_dir(&self, name: &std::ffi::OsStr) -> Result<Self>;
@@ -411,6 +414,11 @@ pub trait DirHandle: Sized {
         name: &std::ffi::OsStr,
         durability: crate::Durability,
     ) -> Result<Self::Claims>;
+
+    /// Create `name` exclusively through this handle (read and write, never following a link) and open a hardlink index
+    /// on it. Fails with `ErrorKind::AlreadyExists` if the name is taken. Calls `check_component(name)` first. The index
+    /// is per-run scratch: its commits are never synced.
+    fn create_hardlink_index(&self, name: &std::ffi::OsStr) -> Result<Self::Index>;
 
     /// Open the EXISTING claim store `name` (cut 9a): read and write, never following a link, never creating.
     /// A missing name is `Code::IoError` kind `NotFound`; a link `Code::SafetyRejected`; a directory

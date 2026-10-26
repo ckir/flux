@@ -133,6 +133,7 @@ impl DirHandle for StdDir {
     type Reader = crate::StdReader;
     type Lock = crate::StdLock;
     type Claims = crate::RedbClaimStore;
+    type Index = crate::RedbHardlinkIndex;
 
     fn open_dir(&self, name: &OsStr) -> Result<Self> {
         check_component(name)?;
@@ -393,6 +394,18 @@ impl DirHandle for StdDir {
         )
         .map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
         crate::RedbClaimStore::create_file(std::fs::File::from(fd), durability)
+    }
+
+    fn create_hardlink_index(&self, name: &OsStr) -> Result<Self::Index> {
+        check_component(name)?;
+        let fd = openat(
+            &self.0,
+            name,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o666),
+        )
+        .map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
+        crate::RedbHardlinkIndex::create_file(std::fs::File::from(fd))
     }
 
     fn open_claim_store(

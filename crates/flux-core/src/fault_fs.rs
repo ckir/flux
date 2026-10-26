@@ -12,9 +12,9 @@
 
 use flux_fs::{
     ClaimKey, ClaimOutcome, ClaimRecord, ClaimStore, Code, DestinationRoot, DirEntry, DirHandle,
-    Durability, FileHandle, FileSystem, FileType, FluxPathKey, FsError, Link, LinkKind,
-    LockCapability, LockFile, Metadata, MountRoot, Perms, PreparedRecord, RecoveryOp, Result,
-    check_component,
+    Durability, FileHandle, FileSystem, FileType, FluxPathKey, FsError, HardlinkEntry,
+    HardlinkIndex, Link, LinkKind, LockCapability, LockFile, Metadata, MountRoot, ObjectId, Perms,
+    PreparedRecord, RecoveryOp, Result, check_component, encode_object,
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -165,6 +165,8 @@ struct Inner {
     claim_formats: HashMap<PathBuf, u64>,
     /// Fake claim stores created and not yet dropped (`claim_stores_open`).
     claim_stores_open: usize,
+    /// path -> the map `create_hardlink_index` made there (`encode_object` -> `HardlinkEntry::encode`).
+    hardlink_indexes: HashMap<PathBuf, ClaimMap>,
     /// `claim_stores_open` when a handle last asked to remove a file named `state.db`.
     open_at_state_db_removal: Option<usize>,
 }
@@ -174,6 +176,44 @@ type ClaimMap = std::sync::Arc<Mutex<std::collections::BTreeMap<Vec<u8>, Vec<u8>
 /// The first bytes of a fake claim store's file; the origin path follows. The contents live in maps keyed by path, so a
 /// byte copy of the file names the store it was copied from, and `open_claim_store` clones that store's maps.
 const FAKE_STORE_MARKER: &[u8] = b"flux-fake-claim-store\0";
+
+/// The first bytes of a fake hardlink index's file; the origin path follows.
+const FAKE_INDEX_MARKER: &[u8] = b"flux-fake-hardlink-index\0";
+
+/// The fake's hardlink index: the real index's key and value encodings over an in-memory map, with the fault keys
+/// `hardlink_index_get` and `hardlink_index_insert`.
+pub struct FakeHardlinkIndex {
+    map: ClaimMap,
+    inner: std::sync::Arc<Mutex<Inner>>,
+}
+
+impl HardlinkIndex for FakeHardlinkIndex {
+    fn get(&self, id: &ObjectId) -> Result<Option<HardlinkEntry>> {
+        FaultFs { inner: std::sync::Arc::clone(&self.inner) }
+            .record("hardlink_index_get".to_string(), "hardlink_index_get")?;
+        let map = self.map.lock().unwrap();
+        match map.get(encode_object(id).as_slice()) {
+            None => Ok(None),
+            Some(v) => HardlinkEntry::decode(v).map(Some).ok_or_else(|| {
+                FsError::new(
+                    Code::StateCorrupt,
+                    std::io::Error::other("undecodable hardlink index entry"),
+                )
+            }),
+        }
+    }
+
+    fn insert(&mut self, id: &ObjectId, entry: &HardlinkEntry) -> Result<()> {
+        FaultFs { inner: std::sync::Arc::clone(&self.inner) }
+            .record("hardlink_index_insert".to_string(), "hardlink_index_insert")?;
+        self.map.lock().unwrap().insert(encode_object(id).to_vec(), entry.encode());
+        Ok(())
+    }
+
+    fn count(&self) -> Result<u64> {
+        Ok(self.map.lock().unwrap().len() as u64)
+    }
+}
 
 /// The fake's claim store: the real store's key and value encodings over an in-memory map, with the call log and the
 /// fault keys `claim_insert`, `claim_get`, `claim_upgrade`, `claim_flush`.
@@ -1097,6 +1137,22 @@ impl FaultFs {
         g.prepared_stores.iter().map(|m| m.lock().unwrap().len()).sum()
     }
 
+    /// The entries of the hardlink index created at `path` (the spelling `create_hardlink_index` was given, joined),
+    /// decoded, in key order; `None` when no index was created there.
+    pub fn hardlink_index_entries(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Option<Vec<(Vec<u8>, HardlinkEntry)>> {
+        let g = self.inner.lock().unwrap();
+        let map = g.hardlink_indexes.get(path.as_ref())?;
+        let map = map.lock().unwrap();
+        Some(
+            map.iter()
+                .map(|(k, v)| (k.clone(), HardlinkEntry::decode(v).expect("the fake wrote it")))
+                .collect(),
+        )
+    }
+
     /// Claims across every store created from this fake.
     pub fn claim_count(&self) -> usize {
         let g = self.inner.lock().unwrap();
@@ -1842,6 +1898,7 @@ impl DirHandle for FakeDirHandle {
     type Reader = FakeHandle;
     type Lock = FakeLock;
     type Claims = FakeClaimStore;
+    type Index = FakeHardlinkIndex;
 
     fn mount_root(&self, _parent: &Self) -> Result<MountRoot> {
         let path = self.my_path();
@@ -2161,6 +2218,30 @@ impl DirHandle for FakeDirHandle {
             path: child_path,
             inner: std::sync::Arc::clone(&self.inner),
         })
+    }
+
+    fn create_hardlink_index(&self, name: &OsStr) -> Result<Self::Index> {
+        check_component(name)?;
+        let child_path = self.my_path().join(name);
+        self.fs().record(
+            format!("create_hardlink_index({})", child_path.display()),
+            "create_hardlink_index",
+        )?;
+        let mut g = self.inner.lock().unwrap();
+        if g.files.contains_key(&child_path) || g.directories.contains(&child_path) {
+            return Err(FsError::new(
+                Code::IoError,
+                std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+            ));
+        }
+        g.files.insert(
+            child_path.clone(),
+            [FAKE_INDEX_MARKER, child_path.as_os_str().as_encoded_bytes()].concat(),
+        );
+        mint_identity(&mut g, &child_path);
+        let map = ClaimMap::default();
+        g.hardlink_indexes.insert(child_path, std::sync::Arc::clone(&map));
+        Ok(FakeHardlinkIndex { map, inner: std::sync::Arc::clone(&self.inner) })
     }
 
     fn open_claim_store(&self, name: &OsStr, _durability: Durability) -> Result<Self::Claims> {
@@ -3852,6 +3933,58 @@ mod tests {
             Ok(_) => panic!("a taken name must be refused"),
         };
         assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn fake_index_passes_the_conformance_suite() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let n = std::cell::Cell::new(0u32);
+        flux_fs::hardlinks::conformance::run_all(|| {
+            n.set(n.get() + 1);
+            d.create_hardlink_index(OsStr::new(&format!("h{}.db", n.get()))).unwrap()
+        });
+    }
+
+    #[test]
+    fn create_hardlink_index_refuses_a_taken_name() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let _first = d.create_hardlink_index(OsStr::new("h.db")).unwrap();
+        assert!(fs.exists("/d/h.db"), "a marker file entry is visible at the path");
+        assert!(
+            fs.calls().iter().any(|c| c.replace('\\', "/") == "create_hardlink_index(/d/h.db)"),
+            "the call log names the path: {:?}",
+            fs.calls()
+        );
+        let err = match d.create_hardlink_index(OsStr::new("h.db")) {
+            Err(e) => e,
+            Ok(_) => panic!("a taken name must be refused"),
+        };
+        assert_eq!(err.source.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn hardlink_index_entries_are_decoded_in_key_order_and_faults_apply() {
+        use flux_fs::{DestinationRoot, DirHandle, FluxPathKey, HardlinkIndex};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        assert_eq!(fs.hardlink_index_entries("/d/h.db"), None);
+        let mut idx = d.create_hardlink_index(OsStr::new("h.db")).unwrap();
+        let e = HardlinkEntry::Failed { canonical: FluxPathKey(b"c".to_vec()) };
+        idx.insert(&ObjectId { volume: 1, index: 2 }, &e).unwrap();
+        idx.insert(&ObjectId { volume: 1, index: 1 }, &e).unwrap();
+        let got = fs.hardlink_index_entries("/d/h.db").unwrap();
+        assert_eq!(got.len(), 2);
+        assert!(got[0].0 < got[1].0);
+        assert_eq!(got[0].1, e);
+        fs.fail_always("hardlink_index_insert", Code::IoError);
+        assert!(idx.insert(&ObjectId { volume: 1, index: 3 }, &e).is_err());
     }
 
     #[test]

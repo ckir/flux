@@ -154,6 +154,7 @@ impl DirHandle for StdDir {
     type Reader = crate::StdReader;
     type Lock = crate::StdLock;
     type Claims = crate::RedbClaimStore;
+    type Index = crate::RedbHardlinkIndex;
 
     /// Always `No`: a mounted-volume folder is a name-surrogate reparse point, which `open_dir` already refuses
     /// (see its reparse-point check), so no handle this arm holds can be the root of a mount.
@@ -450,6 +451,13 @@ impl DirHandle for StdDir {
         // The same exclusive, reparse-point-refusing create as `create_lock`; only the wrapper differs.
         let file = open_file_at(&self.0, name, FILE_CREATE)?;
         crate::RedbClaimStore::create_file(file, durability)
+    }
+
+    fn create_hardlink_index(&self, name: &OsStr) -> Result<Self::Index> {
+        check_component(name)?;
+        // The same exclusive, reparse-point-refusing create as `create_claim_store`; only the wrapper differs.
+        let file = open_file_at(&self.0, name, FILE_CREATE)?;
+        crate::RedbHardlinkIndex::create_file(file)
     }
 
     fn open_claim_store(
