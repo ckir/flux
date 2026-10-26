@@ -21,10 +21,6 @@ pub enum HardlinkEntry {
     Skipped { object: Option<ObjectId>, members: u64, example: FluxPathKey },
 }
 
-fn object_bytes(id: &ObjectId) -> [u8; 24] {
-    encode_object(id)
-}
-
 fn object_from(bytes: &[u8; 24]) -> ObjectId {
     let (volume, index) = bytes.split_first_chunk::<8>().expect("24 bytes");
     ObjectId {
@@ -40,14 +36,14 @@ impl HardlinkEntry {
         match self {
             HardlinkEntry::Anchor { target, object: None } => [&[0u8][..], &target.0].concat(),
             HardlinkEntry::Anchor { target, object: Some(o) } => {
-                [&[1u8][..], &object_bytes(o), &target.0].concat()
+                [&[1u8][..], &encode_object(o), &target.0].concat()
             }
             HardlinkEntry::Failed { canonical } => [&[2u8][..], &canonical.0].concat(),
             HardlinkEntry::Skipped { object: None, members, example } => {
                 [&[3u8][..], &members.to_be_bytes(), &example.0].concat()
             }
             HardlinkEntry::Skipped { object: Some(o), members, example } => {
-                [&[4u8][..], &object_bytes(o), &members.to_be_bytes(), &example.0].concat()
+                [&[4u8][..], &encode_object(o), &members.to_be_bytes(), &example.0].concat()
             }
         }
     }

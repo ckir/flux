@@ -793,6 +793,41 @@ fn hardlinks_copy_mode_copies_every_name() {
     assert!(!stderr(&out).contains("hardlinked"), "stderr: {}", stderr(&out));
 }
 
+/// Reaching `main`'s report through the real binary: the existing-file policy skips the group's first member before it
+/// has an anchor, so the later member is copied independently and counted as degraded. (A destination where linking
+/// is impossible, or a volume that reports no link counts, cannot be built on a real filesystem here, so the
+/// `LinkRefused` and `hardlinks_unchecked` paths are covered only by the engine and report unit tests.)
+#[test]
+fn a_degraded_group_reaches_stderr_and_the_json() {
+    let d = TempDir::new().unwrap();
+    let src = pair_tree_in(d.path());
+    let dst = d.path().join("dst");
+    std::fs::create_dir(&dst).unwrap();
+    std::fs::write(dst.join("a"), b"old").unwrap();
+
+    let out = flux()
+        .arg("copy")
+        .arg(&src)
+        .arg(&dst)
+        .args(["--skip-existing", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let v = json(&out);
+    assert_eq!(v["hardlinks_degraded"], 1, "{v}");
+    assert_eq!(v["files_hardlinked"], 0, "{v}");
+    assert!(v.get("hardlinks_unchecked").is_none(), "{v}");
+    let text = stderr(&out);
+    assert!(text.contains("; 1 hardlinks degraded"), "stderr: {text}");
+    assert!(
+        text.contains("warning: 1 hardlink members were copied independently"),
+        "stderr: {text}"
+    );
+    assert_eq!(std::fs::read(dst.join("a")).unwrap(), b"old", "the existing file is kept");
+    assert_eq!(std::fs::read(dst.join("b")).unwrap(), b"AA");
+}
+
 #[test]
 fn a_dry_run_says_would_hardlink() {
     let d = TempDir::new().unwrap();
@@ -804,6 +839,6 @@ fn a_dry_run_says_would_hardlink() {
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let text = stderr(&out);
     assert!(text.contains("would_hardlink"), "stderr: {text}");
-    assert!(text.contains("hardlink 1"), "stderr: {text}");
+    assert!(text.contains(", overwrite 0, hardlink 1, skip 0,"), "stderr: {text}");
     assert!(!dst.exists(), "a dry run writes nothing");
 }

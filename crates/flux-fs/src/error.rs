@@ -61,9 +61,11 @@ pub enum Code {
     /// Cut 9f-1. The checkpoint log was written by a newer Flux (an unknown format or checksum version). Stops the
     /// whole operation before any file is copied; `--restart` supersedes it.
     WalFormatUnsupported,
-    /// Cut 12, master §15/§16.1. The required link could not be created at the destination (the filesystem, volume
-    /// or platform cannot link there, or the hardlink index or anchor cannot be used). Under `--hardlinks=preserve`
-    /// that member fails with this code; under `auto` it is copied independently and counted. Path-scoped.
+    /// Cut 12, master §15/§16.1. A required destination hardlink cannot be created for one member: link creation
+    /// failed, or the member was skipped under `--hardlinks=preserve`.
+    /// Engine detail: the filesystem, volume or platform cannot link there, or the hardlink index or anchor cannot be
+    /// used. Under `preserve` that member fails with this code; under `auto` it is copied independently and counted.
+    /// Path-scoped.
     HardlinkUnavailable,
     /// Cut 12, master §108. `--hardlinks=preserve` was requested but reliable object identity is unavailable, so the
     /// member cannot be checked. Path-scoped.

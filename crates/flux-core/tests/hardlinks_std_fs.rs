@@ -233,8 +233,12 @@ fn the_symlink_sibling_of_a_group_is_untouched() {
     // `Links::Copy` recreates a symlink as a symlink.
     let out = run_clean(&src, &dst, &auto());
 
-    assert_eq!(out.files_hardlinked, 1);
+    assert_eq!(out.files_hardlinked, 1, "the symlink is not a hardlink member");
     assert_eq!(out.hardlinks_degraded, 0);
+    // The engine counts a recreated symlink among `files_copied` (like the dry-run plan does), so the copy count is the
+    // group's one transfer plus the symlink; what the symlink must not do is add bytes or join the group.
+    assert_eq!((out.files_total, out.files_copied), (3, 2));
+    assert_eq!(out.bytes_copied, 7, "only the group's one transfer carries bytes");
     assert!(same_object(&dst.join("f"), &dst.join("g")));
     assert_eq!(nlink(&dst.join("f")), Some(2), "the symlink is not a third name of the object");
     let md = std::fs::symlink_metadata(dst.join("s")).unwrap();
@@ -245,9 +249,21 @@ fn the_symlink_sibling_of_a_group_is_untouched() {
 /// Builds `src/f` and `src/g` as a pair in a scratch directory and runs it, cutting the run short by panic at the
 /// `cut`th guarded mutation (`None` runs to the end). Returns the fixture and the number of mutations the hook saw.
 fn pair_run(cut: Option<u64>) -> (TempDir, PathBuf, PathBuf, u64, bool) {
+    pair_run_with(cut, false)
+}
+
+/// `pair_run`; with `with_b` the pair lives in `src/d/` and an independent `src/sub/b` follows it, so the walk leaves
+/// the pair's directory (where the claims of its members are recorded) before it reaches `sub/b`.
+fn pair_run_with(cut: Option<u64>, with_b: bool) -> (TempDir, PathBuf, PathBuf, u64, bool) {
     let (d, src, dst) = fixture();
-    std::fs::write(src.join("f"), b"payload").unwrap();
-    std::fs::hard_link(src.join("f"), src.join("g")).unwrap();
+    let home = if with_b { src.join("d") } else { src.clone() };
+    if with_b {
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub").join("b"), b"bb").unwrap();
+    }
+    std::fs::write(home.join("f"), b"payload").unwrap();
+    std::fs::hard_link(home.join("f"), home.join("g")).unwrap();
     std::fs::create_dir(&dst).unwrap();
     let seen = Arc::new(AtomicU64::new(0));
     let counter = Arc::clone(&seen);
@@ -299,4 +315,48 @@ fn a_resume_after_an_interrupted_run_links_the_rest() {
     assert!(same_object(&dst.join("f"), &dst.join("g")), "one object behind both names");
     assert_eq!(nlink(&dst.join("f")), Some(2));
     assert_eq!(std::fs::read(dst.join(dependent)).unwrap(), b"payload");
+}
+
+/// Master 16.1 rule 2: a resume that finds a member already correctly linked to its group's anchor does nothing to
+/// it. The prior is a run over the pair plus an independent `sub/b`, cut at the last mutation before which the pair
+/// is complete and linked but `sub/b` is not yet there (found by measurement, then asserted below).
+#[test]
+fn a_resume_over_a_completed_linked_destination_changes_nothing() {
+    let (_ref_dir, _, _, total, panicked) = pair_run_with(None, true);
+    assert!(!panicked);
+    // The LAST such cut: the earlier ones precede the claim batch that records the pair as complete.
+    let cut = (1..=total)
+        .rev()
+        .find(|&c| {
+            let (_d, _, dst, _, panicked) = pair_run_with(Some(c), true);
+            panicked
+                && dst.join("d").join("f").exists()
+                && dst.join("d").join("g").exists()
+                && same_object(&dst.join("d").join("f"), &dst.join("d").join("g"))
+                && !dst.join("sub").join("b").exists()
+        })
+        .expect("some cut leaves the pair linked and sub/b absent");
+    let (_d, src, dst, _, panicked) = pair_run_with(Some(cut), true);
+    assert!(panicked, "the run was cut short");
+    assert!(
+        same_object(&dst.join("d").join("f"), &dst.join("d").join("g")),
+        "the destination pair is linked"
+    );
+    let before = object(&dst.join("d").join("f"));
+
+    let cfg = RunConfig { resume: true, ..config() };
+    let (out, failures) = run_tree(&src, &dst, &auto(), &cfg);
+
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(out.files_resumed, 2, "both names of the pair are already complete");
+    assert_eq!(out.files_hardlinked, 0, "nothing is relinked");
+    assert_eq!(out.hardlinks_degraded, 0);
+    assert_eq!(out.files_copied, 1, "only sub/b is copied");
+    assert!(
+        same_object(&dst.join("d").join("f"), &dst.join("d").join("g")),
+        "still one object behind both names"
+    );
+    assert_eq!(object(&dst.join("d").join("f")), before, "the object was not replaced");
+    assert_eq!(nlink(&dst.join("d").join("f")), Some(2));
+    assert_eq!(std::fs::read(dst.join("sub").join("b")).unwrap(), b"bb");
 }

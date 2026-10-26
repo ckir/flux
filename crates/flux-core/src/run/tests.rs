@@ -10352,7 +10352,14 @@ fn restart_never_reads_the_prior_index() {
     let retired = format!("/p/dest/.flux/operations/{ID}.removing");
     let new_dir = format!("/p/dest/.flux/operations/{}", id(0x77));
     let new_retired = format!("{new_dir}.removing");
-    for x in log.iter().filter(|x| x.starts_with("remove_file(") && x.contains("hardlinks.db")) {
+    // The scenario guarantees removals: the finished run retires its own index and the restart drops the prior's, so
+    // the loop below must see at least one (a filter that matched nothing would pass vacuously).
+    let removals: Vec<&String> = log
+        .iter()
+        .filter(|x| x.starts_with("remove_file(") && x.contains("hardlinks.db"))
+        .collect();
+    assert!(!removals.is_empty(), "no index removal was logged: {log:?}");
+    for x in removals {
         let path = x.trim_start_matches("remove_file(").trim_end_matches(')');
         let dir = path.trim_end_matches("/hardlinks.db");
         assert!(dir == prior_dir || dir == retired || dir == new_dir || dir == new_retired, "{x}");
@@ -10407,6 +10414,8 @@ fn an_unreadable_index_at_the_resume_skip_site_fails_the_member_under_preserve()
     assert_eq!(got.len(), 2, "{got:?}");
     assert!(got.iter().all(|f| code_of(f) == Code::HardlinkUnavailable), "{got:?}");
     assert_eq!((out.files_resumed, out.files_hardlinked, out.hardlinks_degraded), (0, 0, 0));
+    // Only the independent `sub/b` (the interrupted file) is copied; neither failed member of the a/a2 group is.
+    assert_eq!(out.files_copied, 1, "only sub/b is copied");
 }
 
 #[test]
@@ -10442,6 +10451,7 @@ fn a_completed_member_whose_canonical_failed_this_run_is_blocked() {
     let n = nth_of(&reference, "rename_replace", "-> /p/dest/a)");
     let fs = grown_canonical();
     fs.fail_nth("rename_replace", n, Code::IoError, std::io::ErrorKind::Other);
+    let before = calls(&fs).len();
     let (r, got) = resumed_under(&fs, &auto());
     let out = ok(&r);
     assert_eq!(got.len(), 2, "{got:?}");
@@ -10451,7 +10461,12 @@ fn a_completed_member_whose_canonical_failed_this_run_is_blocked() {
         (PathBuf::from("a2"), Code::BlockedByCanonicalFailure)
     );
     assert_eq!((out.files_resumed, out.files_hardlinked), (0, 0));
-    assert_ne!(strong(&fs, "/p/dest/a"), strong(&fs, "/p/dest/a2"), "a2 untouched");
+    // Blocked means untouched: a2 is neither recopied nor counted (only the independent sub/b is copied).
+    assert_eq!(out.files_copied, 1, "only sub/b is copied");
+    assert!(
+        !calls(&fs)[before..].iter().any(|c| c.contains("create_new(/p/dest/a2.flux-partial")),
+        "a2 was recopied"
+    );
 }
 
 // `Anchor { object: None }`: the completed canonical's destination identity is not Strong, so it registers no object;
@@ -10518,6 +10533,39 @@ fn a_dry_run_predicts_one_copy_and_one_link() {
         "{records:?}"
     );
     assert_eq!(PlannedAction::Hardlink.as_str(), "would_hardlink");
+    no_dest_link_io(&fs);
+}
+
+/// A dry run whose temporary root is a directory that does not exist, so the dry index can never be made.
+fn dry_unusable_root() -> RunConfig {
+    RunConfig { dry_temp_root: Some(PathBuf::from("/flux-missing")), ..dry() }
+}
+
+#[test]
+fn a_dry_run_with_an_unusable_temp_root_degrades_its_candidates_under_auto() {
+    let fs = group_fake(&["a2"]);
+    let (r, got) = run_tree(&fs, &dry_unusable_root());
+    let out = ok(&r);
+    assert!(failures(&got).is_empty(), "{got:?}");
+    // Both group members are candidates; neither can consult the index, so both are planned as plain copies.
+    assert_eq!(out.files_hardlinked, 0, "{out:?}");
+    assert_eq!(out.files_copied, 3, "a, a2 and sub/b are planned as copies");
+    assert_eq!(out.hardlinks_degraded, 2);
+    assert_eq!(out.hardlinks_unlinked[&UnlinkedWhy::IndexFailure].count, 2);
+    assert!(!calls(&fs).iter().any(|c| c.starts_with("create_hardlink_index")), "{:?}", calls(&fs));
+    no_dest_link_io(&fs);
+}
+
+#[test]
+fn a_dry_run_with_an_unusable_temp_root_fails_each_candidate_under_preserve() {
+    let fs = group_fake(&["a2"]);
+    let o = CopyOptions { hardlinks: flux_fs::Hardlinks::Preserve, ..opts() };
+    let (r, got) = run_tree_with(&fs, &dry_unusable_root(), &o);
+    let out = ok(&r);
+    let failed = failures(&got);
+    assert_eq!(failed.len(), 2, "{got:?}");
+    assert!(failed.iter().all(|f| code_of(f) == Code::HardlinkUnavailable), "{got:?}");
+    assert_eq!((out.files_hardlinked, out.hardlinks_degraded), (0, 0));
     no_dest_link_io(&fs);
 }
 

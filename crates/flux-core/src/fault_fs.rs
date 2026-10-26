@@ -556,9 +556,9 @@ fn link_count(g: &Inner, path: &Path) -> Option<u64> {
     Some(names.max(1))
 }
 
-/// POSIX `rename(2)` (`rename_replace` only; `rename_no_replace` refuses an occupied target): when `from` and `to` are two names of ONE object the call succeeds and changes nothing, so both
-/// names remain (master 16.1 step 3 is written for that). The fake models it for two live file names with equal
-/// identities.
+/// POSIX `rename(2)` (`rename_replace` only; `rename_no_replace` refuses an occupied target): when `from` and `to`
+/// are two names of ONE object the call succeeds and changes nothing, so both names remain (master 16.1 step 3 is
+/// written for that). The fake models it for two live file names with equal identities.
 fn same_object(g: &Inner, from: &Path, to: &Path) -> bool {
     g.files.contains_key(from)
         && g.files.contains_key(to)
@@ -4100,6 +4100,22 @@ mod tests {
         assert_eq!(got[0].1, e);
         fs.fail_always("hardlink_index_insert", Code::IoError);
         assert!(idx.insert(&ObjectId { volume: 1, index: 3 }, &e).is_err());
+    }
+
+    #[test]
+    fn hardlink_index_get_fault_applies_and_is_one_shot() {
+        use flux_fs::{DestinationRoot, DirHandle, FluxPathKey, HardlinkIndex};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let mut idx = d.create_hardlink_index(OsStr::new("h.db")).unwrap();
+        let id = ObjectId { volume: 1, index: 2 };
+        let e = HardlinkEntry::Failed { canonical: FluxPathKey(b"c".to_vec()) };
+        idx.insert(&id, &e).unwrap();
+        fs.fail("hardlink_index_get", Code::IoError);
+        let err = idx.get(&id).expect_err("the armed get fault must fire");
+        assert_eq!(err.code, Code::IoError);
+        assert_eq!(idx.get(&id).unwrap(), Some(e), "the fault is one-shot and the entry is intact");
     }
 
     #[test]

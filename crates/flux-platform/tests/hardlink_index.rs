@@ -12,25 +12,34 @@ use flux_fs::hardlinks::conformance;
 use flux_fs::{FluxPathKey, HardlinkEntry, HardlinkIndex, ObjectId};
 use flux_platform::RedbHardlinkIndex;
 
-fn fresh_file() -> (std::fs::File, std::path::PathBuf) {
+/// A new index file in a fresh directory. The returned guard owns the directory: keep it alive while the index is in
+/// use and drop the index first.
+fn fresh_file() -> (tempfile::TempDir, std::fs::File, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("hardlinks.db");
     let file = OpenOptions::new().read(true).write(true).create_new(true).open(&path).unwrap();
-    // The tempdir must outlive the index built from it; leaking it is fine in a test.
-    std::mem::forget(dir);
-    (file, path)
+    (dir, file, path)
 }
 
 #[test]
 fn redb_index_passes_the_conformance_suite() {
-    conformance::run_all(|| RedbHardlinkIndex::create_file(fresh_file().0).unwrap());
+    // Each index the suite builds gets its own directory; the guards outlive the whole run.
+    let dirs = std::cell::RefCell::new(Vec::new());
+    conformance::run_all(|| {
+        let (dir, file, _) = fresh_file();
+        dirs.borrow_mut().push(dir);
+        RedbHardlinkIndex::create_file(file).unwrap()
+    });
+    drop(dirs);
 }
 
 #[test]
 fn entries_spill_to_the_file_under_a_small_cache() {
     const CACHE: usize = 64 * 1024;
-    const N: u128 = 20_000;
-    let (file, path) = fresh_file();
+    // 5_000 entries (about 3 s in a debug build, one uncontrolled run; 20_000 took 19 s) still overflow the 64 KiB
+    // cache several times.
+    const N: u128 = 5_000;
+    let (_dir, file, path) = fresh_file();
     let mut index = RedbHardlinkIndex::with_cache_size(file, CACHE).unwrap();
     let target = FluxPathKey(vec![b't'; 40]);
     for i in 0..N {
@@ -38,7 +47,7 @@ fn entries_spill_to_the_file_under_a_small_cache() {
         index.insert(&id, &HardlinkEntry::Anchor { target: target.clone(), object: None }).unwrap();
     }
     assert_eq!(index.count().unwrap(), N as u64);
-    for i in (0..N).step_by(97) {
+    for i in (0..N).step_by(37) {
         let id = ObjectId { volume: 7, index: i };
         assert_eq!(
             index.get(&id).unwrap(),
@@ -47,5 +56,8 @@ fn entries_spill_to_the_file_under_a_small_cache() {
         );
     }
     let len = std::fs::metadata(&path).unwrap().len();
+    // `len > CACHE` shows the entries are on disk; it does not show the cache is bounded.
     assert!(len > CACHE as u64, "the entries are on disk, not in RAM: file is {len} bytes");
+    // The index closes its file before the directory guard removes the directory.
+    drop(index);
 }
