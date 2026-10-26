@@ -136,6 +136,57 @@ struct CopyArgs {
     /// Report what the copy would do and change nothing: no lock, no state, no destination write (section 5.2).
     #[arg(long)]
     dry_run: bool,
+    /// Check each copied file's content. `--verify` alone means `destination`. `none` (the default) checks nothing.
+    /// `source-stream` hashes the source bytes while they are copied; nothing is compared in this version. `destination`
+    /// reads the written file again and compares it with the source bytes that were read, so it detects a destination
+    /// that returns different bytes than were written; the re-read may be served by the operating system's cache and does
+    /// not prove the data reached stable storage (--durability still governs syncing). `full` is `destination` plus a
+    /// second read of the source, which also detects source bytes that changed or were misread during the copy. A
+    /// mismatch is reported as VERIFY_MISMATCH and counts as a failed file. Cannot be combined with --resume.
+    #[arg(long, value_enum, num_args = 0..=1, require_equals = true, default_missing_value = "destination")]
+    verify: Option<VerifyArg>,
+    /// The hash used by --verify.
+    #[arg(long, value_enum, default_value_t = HashArg::Blake3)]
+    hash: HashArg,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum VerifyArg {
+    None,
+    SourceStream,
+    Destination,
+    Full,
+}
+
+impl VerifyArg {
+    fn level(self) -> flux_fs::VerifyLevel {
+        match self {
+            VerifyArg::None => flux_fs::VerifyLevel::None,
+            VerifyArg::SourceStream => flux_fs::VerifyLevel::SourceStream,
+            VerifyArg::Destination => flux_fs::VerifyLevel::Destination,
+            VerifyArg::Full => flux_fs::VerifyLevel::Full,
+        }
+    }
+
+    /// The `verify_level` string of the JSON report.
+    fn name(self) -> &'static str {
+        match self {
+            VerifyArg::None => "none",
+            VerifyArg::SourceStream => "source-stream",
+            VerifyArg::Destination => "destination",
+            VerifyArg::Full => "full",
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum HashArg {
+    Blake3,
+}
+
+/// The requested level's report string; an absent `--verify` is `none`.
+fn verify_name(args: &CopyArgs) -> &'static str {
+    args.verify.map_or("none", VerifyArg::name)
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -214,8 +265,10 @@ fn options(args: &CopyArgs) -> CopyOptions {
             ExistingPolicy::Overwrite
         },
         cross_filesystems: args.cross_filesystems,
-        verify: flux_fs::VerifyLevel::None,
-        hash: flux_fs::HashAlgorithm::Blake3,
+        verify: args.verify.map_or(flux_fs::VerifyLevel::None, VerifyArg::level),
+        hash: match args.hash {
+            HashArg::Blake3 => flux_fs::HashAlgorithm::Blake3,
+        },
     }
 }
 
@@ -314,6 +367,12 @@ fn copy(args: &CopyArgs) -> u8 {
         );
         return exit_code::USAGE;
     }
+    if args.resume && args.verify.is_some_and(|v| v.level() != flux_fs::VerifyLevel::None) {
+        err(
+            "error: --resume cannot be combined with --verify in this version; verify a resumed copy afterwards, or use --restart",
+        );
+        return exit_code::USAGE;
+    }
     if args.paths.len() > 2 {
         return copy_several(args);
     }
@@ -333,6 +392,7 @@ fn copy(args: &CopyArgs) -> u8 {
             ));
             let mut r = Report::pre_engine(true);
             r.dry_run = args.dry_run;
+            r.verify_level = verify_name(args);
             json(args, &r);
             return exit_code::FAILED;
         }
@@ -340,6 +400,7 @@ fn copy(args: &CopyArgs) -> u8 {
             err(&line);
             let mut r = Report::pre_engine(false);
             r.dry_run = args.dry_run;
+            r.verify_level = verify_name(args);
             json(args, &r);
             return exit_code::FAILED;
         }
@@ -366,6 +427,7 @@ fn copy(args: &CopyArgs) -> u8 {
             let ms = millis(started);
             let mut rep = Report::file_run(&run, target_existed, ms);
             rep.dry_run = args.dry_run;
+            rep.verify_level = verify_name(args);
             if let Some(d) = &run.dry {
                 rep.unprobed = report::unprobed_keys(d, args.resume);
             }
@@ -448,6 +510,7 @@ fn tree_output(
 ) {
     // The flag, not `run.dry`: an engine pre-flight refusal returns before the dry branch (ruling P7).
     rep.dry_run = args.dry_run;
+    rep.verify_level = verify_name(args);
     if let Some(d) = &run.dry {
         rep.unprobed = report::unprobed_keys(d, args.resume);
     }
@@ -549,12 +612,16 @@ fn copy_several(args: &CopyArgs) -> u8 {
                 named.unwrap_or_default(),
                 report::SYMLINK_WHY
             ));
-            json(args, &Report::pre_engine(true));
+            let mut r = Report::pre_engine(true);
+            r.verify_level = verify_name(args);
+            json(args, &r);
             return exit_code::FAILED;
         }
         Err(Stop::Failed(line)) => {
             err(&line);
-            json(args, &Report::pre_engine(false));
+            let mut r = Report::pre_engine(false);
+            r.verify_level = verify_name(args);
+            json(args, &r);
             return exit_code::FAILED;
         }
     };
@@ -778,6 +845,42 @@ mod tests {
     fn update_and_skip_existing_reach_the_options() {
         assert_eq!(options(&parse(&["--update"])).existing, ExistingPolicy::Update);
         assert_eq!(options(&parse(&["--skip-existing"])).existing, ExistingPolicy::SkipExisting);
+    }
+
+    #[test]
+    fn verify_flag_forms() {
+        use flux_fs::VerifyLevel;
+        assert_eq!(options(&parse(&[])).verify, VerifyLevel::None);
+        assert_eq!(options(&parse(&["--verify"])).verify, VerifyLevel::Destination);
+        assert_eq!(options(&parse(&["--verify=full"])).verify, VerifyLevel::Full);
+        assert_eq!(options(&parse(&["--verify=none"])).verify, VerifyLevel::None);
+        assert_eq!(options(&parse(&["--verify=source-stream"])).verify, VerifyLevel::SourceStream);
+        assert_eq!(options(&parse(&["--verify=destination"])).verify, VerifyLevel::Destination);
+    }
+
+    #[test]
+    fn a_bare_verify_before_the_positionals_does_not_eat_a_path() {
+        use flux_fs::VerifyLevel;
+        let args = Cli::try_parse_from(["flux", "copy", "--verify", "a", "b"]).unwrap();
+        let Commands::Copy(args) = args.command else { panic!("not a copy") };
+        assert_eq!(args.paths, [PathBuf::from("a"), PathBuf::from("b")]);
+        assert_eq!(options(&args).verify, VerifyLevel::Destination);
+    }
+
+    #[test]
+    fn an_unknown_level_and_an_unknown_hash_are_usage_errors() {
+        for bad in ["--verify=bogus", "--hash=sha256"] {
+            let err = Cli::try_parse_from(["flux", "copy", "a", "b", bad])
+                .err()
+                .expect("must be rejected");
+            assert_eq!(err.exit_code(), 2, "{bad}");
+        }
+    }
+
+    #[test]
+    fn hash_defaults_to_blake3() {
+        assert_eq!(options(&parse(&[])).hash, flux_fs::HashAlgorithm::Blake3);
+        assert_eq!(options(&parse(&["--hash=blake3"])).hash, flux_fs::HashAlgorithm::Blake3);
     }
 
     #[test]

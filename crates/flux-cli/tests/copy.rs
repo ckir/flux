@@ -846,3 +846,201 @@ fn a_dry_run_says_would_hardlink() {
     assert!(text.contains(", overwrite 0, hardlink 1, skip 0,"), "stderr: {text}");
     assert!(!dst.exists(), "a dry run writes nothing");
 }
+
+// ---- Copy verification: --verify / --hash --------------------------------------------------------------------
+
+/// Every path under `d` with its bytes, to prove a refused run left a folder exactly as it was.
+fn snapshot(d: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+    let mut all = Vec::new();
+    let mut stack = vec![d.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        for e in std::fs::read_dir(&p).unwrap() {
+            let path = e.unwrap().path();
+            if path.is_dir() {
+                all.push((path.clone(), None));
+                stack.push(path);
+            } else {
+                let bytes = std::fs::read(&path).unwrap();
+                all.push((path, Some(bytes)));
+            }
+        }
+    }
+    all.sort();
+    all
+}
+
+#[test]
+fn resume_with_verify_is_refused_and_changes_nothing() {
+    for flag in ["--verify", "--verify=destination", "--verify=full", "--verify=source-stream"] {
+        let d = TempDir::new().unwrap();
+        let src = tree_in(d.path());
+        let dst = d.path().join("dst");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(dst.join("keep"), b"K").unwrap();
+        let before = snapshot(&dst);
+
+        let out = flux()
+            .arg("copy")
+            .arg("--resume")
+            .arg(flag)
+            .arg("--json")
+            .arg(&src)
+            .arg(&dst)
+            .output()
+            .unwrap();
+
+        let text = stderr(&out);
+        assert_eq!(out.status.code(), Some(2), "{flag}: {text}");
+        assert!(text.contains("cannot be combined"), "{flag}: {text}");
+        assert!(
+            text.contains(
+                "error: --resume cannot be combined with --verify in this version; verify a resumed copy afterwards, or use --restart"
+            ),
+            "{flag}: {text}"
+        );
+        assert!(out.stdout.is_empty(), "{flag}: a usage error prints no JSON");
+        assert_eq!(snapshot(&dst), before, "{flag}: the destination must be untouched");
+        assert!(!dst.join(".flux").exists(), "{flag}");
+    }
+}
+
+#[test]
+fn resume_with_verify_none_is_allowed() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let dst = d.path().join("dst");
+
+    let out = flux()
+        .arg("copy")
+        .arg("--resume")
+        .arg("--verify=none")
+        .arg("--json")
+        .arg(&src)
+        .arg(&dst)
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(json(&out)["verify_level"], "none");
+    assert_eq!(std::fs::read(dst.join("a")).unwrap(), b"A");
+}
+
+#[test]
+fn restart_with_verify_runs() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let dst = d.path().join("dst");
+
+    let out = flux()
+        .arg("copy")
+        .arg("--restart")
+        .arg("--verify=full")
+        .arg("--json")
+        .arg(&src)
+        .arg(&dst)
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let v = json(&out);
+    assert_eq!(v["verify_level"], "full");
+    assert_eq!(v["files_verified"], 2);
+}
+
+#[test]
+fn dry_run_with_verify_reads_nothing_and_reports_the_level() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let dst = d.path().join("dst");
+
+    let out = flux()
+        .arg("copy")
+        .arg("--dry-run")
+        .arg("--json")
+        .arg("--verify=full")
+        .arg(&src)
+        .arg(&dst)
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let v = json(&out);
+    assert_eq!(v["verify_level"], "full");
+    assert_eq!(v["files_verified"], 0);
+    assert!(!dst.exists(), "a dry run writes nothing");
+}
+
+#[test]
+fn json_reports_the_requested_level() {
+    for level in ["none", "source-stream", "destination", "full"] {
+        let arg = format!("--verify={level}");
+
+        // A single file.
+        let d = TempDir::new().unwrap();
+        let (f, fdst) = (d.path().join("f"), d.path().join("g"));
+        std::fs::write(&f, b"hello").unwrap();
+        let out = flux().arg("copy").arg(&arg).arg("--json").arg(&f).arg(&fdst).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{level} file: {}", stderr(&out));
+        assert_eq!(json(&out)["verify_level"], level, "single file");
+
+        // A tree.
+        let src = tree_in(d.path());
+        let out = flux()
+            .arg("copy")
+            .arg(&arg)
+            .arg("--json")
+            .arg(&src)
+            .arg(d.path().join("t"))
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{level} tree: {}", stderr(&out));
+        assert_eq!(json(&out)["verify_level"], level, "tree");
+
+        // Several sources.
+        let out = flux()
+            .arg("copy")
+            .arg(&arg)
+            .arg("--json")
+            .arg(&f)
+            .arg(&src)
+            .arg(d.path().join("many"))
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{level} several: {}", stderr(&out));
+        assert_eq!(json(&out)["verify_level"], level, "several sources");
+    }
+}
+
+#[test]
+fn a_bare_verify_reports_the_destination_level() {
+    let d = TempDir::new().unwrap();
+    let (f, fdst) = (d.path().join("f"), d.path().join("g"));
+    std::fs::write(&f, b"hello").unwrap();
+    let out = flux().arg("copy").arg("--verify").arg("--json").arg(&f).arg(&fdst).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(json(&out)["verify_level"], "destination");
+}
+
+#[test]
+fn a_verified_tree_reports_files_verified() {
+    let d = TempDir::new().unwrap();
+    let src = d.path().join("src");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("a"), b"A").unwrap();
+    std::fs::write(src.join("b"), b"BB").unwrap();
+    std::fs::write(src.join("sub").join("c"), b"CCC").unwrap();
+
+    let out = flux()
+        .arg("copy")
+        .arg("--verify=full")
+        .arg("--json")
+        .arg(&src)
+        .arg(d.path().join("dst"))
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let v = json(&out);
+    assert_eq!((v["files_verified"].as_u64(), v["files_mismatched"].as_u64()), (Some(3), Some(0)));
+    assert!(stderr(&out).contains("3 verified"), "stderr: {}", stderr(&out));
+}
