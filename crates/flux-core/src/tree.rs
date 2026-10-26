@@ -39,6 +39,10 @@ use std::path::{Component, Path, PathBuf};
 #[derive(Debug, Default)]
 pub struct TreeOutcome {
     pub files_copied: u64,
+    /// Copy verification: files of `files_copied` whose bytes were re-read and compared before publication.
+    pub files_verified: u64,
+    /// Copy verification: files that failed with `VerifyMismatch` (also counted in `failures.copy`).
+    pub files_mismatched: u64,
     pub bytes_copied: u64,
     /// Directories THIS operation created, the root included when it made it. A
     /// pre-existing directory merged into is not counted.
@@ -4225,6 +4229,9 @@ fn finish_copy(
         Ok(o) => {
             debug_assert!(!o.skipped, "the tree never lets the copy path skip");
             out.files_copied += 1;
+            if o.verified {
+                out.files_verified += 1;
+            }
             out.bytes_copied += o.bytes_copied;
             if let Some(weaker) = o.identity_degraded {
                 out.files_degraded += 1;
@@ -4408,6 +4415,9 @@ pub(crate) fn report(
     }
     if matches!(cause, TreeFailureCause::MountSkipped) {
         out.mounts_skipped += 1;
+    }
+    if matches!(&cause, TreeFailureCause::Copy(e) if e.code() == Code::VerifyMismatch) {
+        out.files_mismatched += 1;
     }
     out.failures.count(&cause);
     on_report(TreeFailure { path, cause });
@@ -5115,6 +5125,117 @@ mod tests {
     /// Cut 10a: the payload and kind of the link at `p`.
     fn link_at(fs: &FaultFs, p: &str) -> flux_fs::Link {
         FileSystem::read_link(fs, Path::new(p)).unwrap_or_else(|e| panic!("{p}: {e:?}"))
+    }
+
+    // Copy verification, task 4: the counters.
+
+    fn verifying(level: flux_fs::VerifyLevel) -> CopyOptions {
+        CopyOptions { verify: level, ..opts() }
+    }
+
+    /// The ordinal (1-based, among `open_read` calls) of the re-read of `temp` in a reference run's log.
+    fn reread_ordinal(calls: &[String], temp: &str) -> u32 {
+        let reads: Vec<&String> = calls.iter().filter(|c| c.starts_with("open_read(")).collect();
+        let at = reads
+            .iter()
+            .position(|c| **c == format!("open_read({temp})"))
+            .unwrap_or_else(|| panic!("no re-read of {temp} in {calls:?}"));
+        at as u32 + 1
+    }
+
+    #[test]
+    fn a_verified_file_is_counted_where_it_is_published() {
+        let fs = sources(&[("f0", b"zero"), ("f1", b"one"), ("f2", b"two")]);
+        let (r, got) = run(&fs, "/src", "/dst", &verifying(flux_fs::VerifyLevel::Destination));
+        let out = r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(out.files_copied, 3);
+        assert_eq!(out.files_verified, 3);
+        assert_eq!(out.files_mismatched, 0);
+    }
+
+    #[test]
+    fn a_mismatch_fails_that_file_and_the_tree_goes_on() {
+        let entries: [(&str, &[u8]); 4] =
+            [("f0", b"zero"), ("f1", b"one"), ("f2", b"two"), ("f3", b"three")];
+        let o = verifying(flux_fs::VerifyLevel::Destination);
+        let refer = sources(&entries);
+        run(&refer, "/src", "/dst", &o).0.unwrap();
+        let n = reread_ordinal(&log(&refer), "/dst/f1.flux-partial.op1");
+        assert_eq!(n, 4, "f1's re-read is the fourth open_read of the walk: {:?}", refer.calls());
+
+        let fs = sources(&entries);
+        fs.on_nth("open_read", n, |fs| fs.write_file("/dst/f1.flux-partial.op1", b"XXX"));
+        // A fourth file whose temporary cannot be created: a Copy failure that is NOT a mismatch.
+        let create = log(&refer)
+            .iter()
+            .filter(|c| c.starts_with("create_new("))
+            .position(|c| c.starts_with("create_new(/dst/f3.flux-partial"));
+        let create = create.expect("f3 is created in the reference run") as u32 + 1;
+        fs.fail_nth("create_new", create, Code::IoError, std::io::ErrorKind::Other);
+
+        let (r, got) = run(&fs, "/src", "/dst", &o);
+        let out = r.unwrap();
+        assert_eq!(out.files_copied, 2);
+        assert_eq!(out.files_verified, 2);
+        assert_eq!(out.files_mismatched, 1, "the IoError of f3 is not a mismatch");
+        assert_eq!(out.failures.copy, 2);
+        assert_eq!(got.len(), 2, "{got:?}");
+        let f1 = got.iter().find(|f| f.path == Path::new("f1")).expect("f1 failed");
+        let TreeFailureCause::Copy(e) = &f1.cause else { panic!("{f1:?}") };
+        assert_eq!(e.code(), Code::VerifyMismatch);
+        let f3 = got.iter().find(|f| f.path == Path::new("f3")).expect("f3 failed");
+        let TreeFailureCause::Copy(e) = &f3.cause else { panic!("{f3:?}") };
+        assert_eq!(e.code(), Code::IoError);
+        assert!(fs.exists("/dst/f0") && fs.exists("/dst/f2"));
+        assert!(!fs.exists("/dst/f1") && !fs.exists("/dst/f3"));
+        assert!(temps_in(&fs, "/dst").is_empty(), "{:?}", temps_in(&fs, "/dst"));
+    }
+
+    #[test]
+    fn none_and_source_stream_count_no_verified_files() {
+        for level in [flux_fs::VerifyLevel::None, flux_fs::VerifyLevel::SourceStream] {
+            let fs = sources(&[("f0", b"zero"), ("f1", b"one")]);
+            let (r, got) = run(&fs, "/src", "/dst", &verifying(level));
+            let out = r.unwrap();
+            assert!(got.is_empty(), "{got:?}");
+            assert_eq!((out.files_copied, out.files_verified), (2, 0), "{level:?}");
+        }
+    }
+
+    #[test]
+    fn a_skipped_file_is_not_verified() {
+        let fs = sources(&[("f0", b"zero")]);
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.write_file("/dst/f0", b"zero");
+        let o = CopyOptions {
+            existing: flux_fs::ExistingPolicy::SkipExisting,
+            ..verifying(flux_fs::VerifyLevel::Destination)
+        };
+        let (r, out, got) = link_run(&fs, &o, false, policy(1), &unguarded, no_seed);
+        r.unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!((out.files_skipped, out.files_copied, out.files_verified), (1, 0, 0));
+    }
+
+    #[test]
+    fn a_barrier_sync_failure_uncounts_only_that_entry() {
+        let fs = n_files(3);
+        fs.on_nth("create_new", 2, |fs| fs.fail("sync_all", Code::StrictDurabilityUnavailable));
+        let (r, out, got) = batched_verifying(
+            &fs,
+            one_worker(),
+            Durability::Strict,
+            &unguarded,
+            &no_heartbeat,
+            None,
+            flux_fs::VerifyLevel::Destination,
+        );
+        r.unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(out.files_copied, 2);
+        assert_eq!(out.files_verified, 2);
+        assert_eq!(out.files_mismatched, 0);
     }
 
     /// Cut 10a: the names under `dir` holding a temporary (`.flux-partial.`).
@@ -6804,6 +6925,27 @@ mod tests {
         beat: &Heartbeat<'_>,
         key_prefix: Option<&OsStr>,
     ) -> (std::result::Result<(), CopyError>, TreeOutcome, Vec<TreeFailure>) {
+        batched_verifying(
+            fs,
+            policy,
+            durability,
+            guard,
+            beat,
+            key_prefix,
+            flux_fs::VerifyLevel::None,
+        )
+    }
+
+    /// `batched_keyed` at a verification level.
+    fn batched_verifying(
+        fs: &FaultFs,
+        policy: BatchPolicy,
+        durability: Durability,
+        guard: &Guard<'_>,
+        beat: &Heartbeat<'_>,
+        key_prefix: Option<&OsStr>,
+        verify: flux_fs::VerifyLevel,
+    ) -> (std::result::Result<(), CopyError>, TreeOutcome, Vec<TreeFailure>) {
         let source =
             prepare_source(fs, Path::new("/src"), Path::new("/dst"), MountPolicy::Cross).unwrap();
         if !fs.exists(Path::new("/dst")) {
@@ -6814,6 +6956,7 @@ mod tests {
         let claims = std::cell::RefCell::new(store);
         let mut o = opts();
         o.durability = durability;
+        o.verify = verify;
         let cx = Shared {
             fs,
             src_root: Path::new("/src"),
