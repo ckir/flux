@@ -27,6 +27,8 @@ pub mod walk;
 // undeclared feature in a `cfg` is a warning the repo's clippy gate would surface.
 #[cfg(test)]
 pub mod fault_fs;
+#[cfg(test)]
+mod verify_proptest;
 
 pub use copy::{copy_file, copy_file_at};
 pub use tree::{

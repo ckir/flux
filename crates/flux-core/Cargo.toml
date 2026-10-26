@@ -19,3 +19,4 @@ serde_json = { workspace = true }
 [dev-dependencies]
 flux-platform = { path = "../flux-platform" }
 tempfile = { workspace = true }
+proptest = { workspace = true, features = ["std"] }

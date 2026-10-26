@@ -92,7 +92,7 @@ flux-ui = { path = "crates/flux-ui" }
 
 # --- test / bench tooling (spec §3 benches/, §68 testing strategy) ---
 criterion = "0.8"
-proptest = "1.11"
+proptest = { version = "1.11", default-features = false }
 tempfile = "3"
 
 [profile.ci]
