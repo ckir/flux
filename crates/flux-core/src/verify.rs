@@ -941,6 +941,36 @@ mod tests {
     }
 
     #[test]
+    fn a_symlink_whose_payload_cannot_be_read_is_unreadable_and_the_other_side_is_not_read() {
+        for (nth, dst_read) in [(1, false), (2, true)] {
+            let fs = FaultFs::new();
+            tree(&fs, "/s", &[], &[]);
+            tree(&fs, "/d", &[], &[]);
+            fs.add_symlink_to("/s/l", "t", LinkKind::Unspecified);
+            fs.add_symlink_to("/d/l", "t", LinkKind::Unspecified);
+            // The walker never calls read_link; compare_pair reads the source link first (call 1), then the
+            // destination link (call 2).
+            fs.fail_nth(
+                "read_link",
+                nth,
+                Code::PermissionDenied,
+                std::io::ErrorKind::PermissionDenied,
+            );
+            let (rows, s) = run(&fs, "/s", "/d", &opts());
+            assert_eq!(rows.len(), 1, "nth {nth}: {rows:?}");
+            assert_eq!(
+                (rows[0].0.as_str(), rows[0].1, rows[0].2, rows[0].3),
+                ("l", Outcome::Unreadable, Kind::Symlink, Some(Code::PermissionDenied)),
+                "nth {nth}"
+            );
+            assert!(!rows[0].4.is_empty(), "nth {nth}");
+            assert!(fs.called("read_link(/s/l)"), "nth {nth}");
+            assert_eq!(fs.called("read_link(/d/l)"), dst_read, "nth {nth}");
+            assert_eq!((s.unreadable, s.mismatched, s.matched), (1, 0, 0), "nth {nth}");
+        }
+    }
+
+    #[test]
     fn links_skip_drops_source_symlinks_and_keeps_a_dest_only_one_as_extra() {
         let fs = FaultFs::new();
         tree(&fs, "/s", &[], &[("f", b"x")]);
@@ -1319,6 +1349,26 @@ mod tests {
         assert!(!fs.called("open_read("));
     }
 
+    #[test]
+    fn an_unlistable_source_root_is_one_unreadable_record() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("a", b"x")]);
+        tree(&fs, "/d", &[], &[("a", b"x")]);
+        // The source walk is built first, so read_dir(/s) is the 1st read_dir (the root check lists nothing).
+        fs.fail_nth("read_dir", 1, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+        let (rows, s) = run(&fs, "/s", "/d", &opts());
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            (rows[0].0.as_str(), rows[0].1, rows[0].2, rows[0].3),
+            (".", Outcome::Unreadable, Kind::Dir, Some(Code::PermissionDenied))
+        );
+        assert!(rows[0].4.starts_with("source: "), "{}", rows[0].4);
+        assert!(fs.called("read_dir(/s)"));
+        assert!(!fs.called("read_dir(/d)"));
+        assert_eq!(s.unreadable, 1);
+        assert!(!fs.called("open_read("));
+    }
+
     /// A run that must stop at the root record: the one row, and no directory listed or file opened.
     fn root_row(fs: &FaultFs, src: &str, dst: &str) -> Row {
         let (rows, s) = run(fs, src, dst, &opts());
@@ -1579,5 +1629,24 @@ mod tests {
         assert!(!rows[0].4.is_empty());
         assert!(!fs.called("open_read(/d/a)"));
         assert_eq!((s.unreadable, s.bytes_hashed), (1, 0));
+    }
+
+    #[test]
+    fn verify_file_reports_a_destination_metadata_error_as_unreadable_not_missing() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("a", b"alpha")]);
+        tree(&fs, "/d", &[], &[("a", b"alpha")]);
+        // verify_file calls metadata(src) then metadata(dst), so call 2 is metadata(/d/a).
+        fs.fail_nth("metadata", 2, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+        let (rows, s) = run_file(&fs, "/s/a", "/d/a");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            (rows[0].0.as_str(), rows[0].1, rows[0].2, rows[0].3),
+            ("a", Outcome::Unreadable, Kind::File, Some(Code::PermissionDenied))
+        );
+        assert!(!rows[0].4.is_empty());
+        assert!(fs.called("metadata(/d/a)"));
+        assert!(!fs.called("open_read("));
+        assert_eq!((s.unreadable, s.missing, s.bytes_hashed), (1, 0, 0));
     }
 }
