@@ -1,6 +1,6 @@
 # The `flux verify` command (cut 14, roadmap phase 6) - design
 
-Status: owner-adopted calls (section 4, item 4), 2026-10-26; awaiting the implementation plan. Branch `spec/verify-command` (off `origin/main` f19db29).
+Status: owner-adopted calls (section 4, item 4), 2026-10-26; implementation plan `docs/superpowers/plans/2026-10-26-verify-command.md` (its refinements R1-R7 are folded here where they touch a shape). Branch `spec/verify-command` (off `origin/main` f19db29).
 Master spec: `FLUX_FULL_UPDATED_SPEC_V16.md` (cited as "master §N" or "master line N" at that revision).
 
 ## 1. Intent
@@ -189,7 +189,8 @@ source `.flux` should have been copied is the copy's business, not verify's; if 
 
 ### 6.5 Hashing a pair
 
-Each side is opened and hashed in one pass with `hash_reader` (same 1 MiB-class buffer as the copy). The file is read
+Each side is opened and hashed in one pass with `hash_reader` (one buffer of the copy's maximum, `COPY_BUF_MAX` = 256 KiB,
+allocated once per run and reused; plan R6). The file is read
 twice in total (once per side), sequentially: source first, then destination. The digests are compared. A size
 shortcut (different `len` implies mismatch without reading) is NOT taken: the point of the command is to read the bytes,
 and a size taken from `lstat` can be stale (V8). `bytes_hashed` counts the bytes read on both sides.
@@ -275,12 +276,15 @@ mount notices), not the records.
   - `pub enum Kind { File, Dir, Symlink, Other }`
   - `pub struct Record { pub path: PathBuf, pub outcome: Outcome, pub kind: Kind, pub code: Option<Code>, pub detail: String }`
   - `pub struct Summary { pub matched, missing, mismatched, extra, unreadable, not_entered: u64, pub bytes_hashed: u64 }`
-  - `pub fn verify_tree<F: FileSystem>(fs: &F, src: &Path, dst: &Path, opts: &VerifyOptions, sink: &mut dyn FnMut(Record)) -> Result<Summary, VerifyError>`
+  - `pub fn verify_tree<F: DestinationRoot>(fs: &F, src: &Path, dst: &Path, opts: &VerifyOptions, sink: &mut dyn FnMut(Record)) -> Result<Summary, VerifyError>`
+    (`DestinationRoot`, not `FileSystem`: the reused containment test takes a destination handle; plan R1)
   - `pub fn verify_file<F: FileSystem>(fs: &F, src: &Path, dst: &Path, opts: &VerifyOptions, sink: ...) -> Result<Summary, VerifyError>`
+    (one record whose `path` is the destination's file name; plan R4)
   - `pub struct VerifyOptions { pub links: Links, pub mounts: MountPolicy, pub hash: HashAlgorithm }`
   - `VerifyError` for a failure that stops the whole command (a root that is not what the mapping said).
 - `flux-cli`: `Commands::Verify(VerifyArgs)` with `SOURCE`, `DEST` (exactly two), `--links`, `--cross-filesystems`,
-  `--hash`, `--json`, `--verbose`; `report::verify_*` for the lines and the NDJSON; `exit_code::for_verify(&Summary)`.
+  `--hash`, `--json`, `--verbose`; a `verify_report` module (the `cleanup_report.rs` precedent; plan R3) for the lines
+  and the NDJSON; `exit_code::for_verify(&Summary)`.
 - `Code::VerifyMismatch` is reused for a `mismatched` record's `code` field (6.6); no new code is added.
 
 ## 9. Tests (the oracle for each is the master line or this section; none may be edited to match the code)
@@ -299,8 +303,9 @@ On the in-memory/fault filesystem (`flux-core` unit tests):
    the reason), `Other` vs file `mismatched`, `Other` on one side `missing` / `extra`.
 8. an unreadable file on the source and on the destination (injected read error): `unreadable`, the other side
    not guessed; an unreadable directory: `unreadable`, subtree skipped on both sides, siblings still compared.
-9. control state: `.flux/`, `.flux-root.lock`, `<n>.flux-partial.1` at the DEST root are never reported; a
-   user file `.flux-partial.txt` and a nested `sub/.flux` ARE reported (`extra`).
+9. control state: `.flux/`, `.flux-root.lock`, `<n>.flux-partial.<32-hex id>` at the DEST root are never reported; a
+   user file `.flux-partial.txt`, `x.flux-partial.1` (the id is not 32 hex characters, so it is not a partial name:
+   `state.rs` `id_after`; plan R2) and a nested `sub/.flux` ARE reported (`extra`).
 10. DEST absent: every source path `missing`, exit 1, no directory created (assert no write call on the fake), and the
     leading stderr line is printed before the first record.
 11. nothing is ever written: the fake records no create/write/rename/remove call across every test above.
