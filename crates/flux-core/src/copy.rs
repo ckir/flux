@@ -1506,6 +1506,27 @@ mod tests {
         assert_eq!(fs.calls(), golden);
     }
 
+    #[test]
+    fn verification_runs_before_the_durability_sync() {
+        let fs = FaultFs::new();
+        fs.write_file("/src", b"hello");
+        let root = fs.destination_root(Path::new("/")).unwrap();
+        let mut o = opts();
+        o.durability = Durability::Strict;
+        o.verify = flux_fs::VerifyLevel::Destination;
+        let _ = stage_with(&fs, &root, &o, SyncAt::Staging);
+        let calls = fs.calls();
+        let read = calls.iter().position(|c| c == "open_read(/dst.flux-partial.op1)");
+        let sync = calls.iter().position(|c| c == "sync_all(/dst.flux-partial.op1)");
+        let (Some(read), Some(sync)) = (read, sync) else {
+            panic!("the call log lacks the temporary's read-back or its sync: {calls:?}");
+        };
+        assert!(
+            read < sync,
+            "verification must read the temporary back before the sync: {calls:?}"
+        );
+    }
+
     // ---- cut 9f-1 plan 2, task 6: a fresh copy checkpoints through `ckpt` ----
 
     use crate::checkpoint::{CheckpointPolicy, Checkpoints};

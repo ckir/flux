@@ -24,8 +24,9 @@ pub const SYMLINK_WHY: &str =
     "a symlink SOURCE is not followed; copy its parent folder, or name its target";
 
 /// §53's complete field list, in its order. Every value is true for what this version
-/// does: nothing reflinks or verifies, so those stay 0 and `verify_level` is
-/// `"none"`; `files_hardlinked` counts cut 12's links.
+/// does: nothing reflinks, so that count stays 0; `verify_level` is the level
+/// requested (`none` unless `--verify`); `files_verified` and `files_mismatched`
+/// count cut 13's verification; `files_hardlinked` counts cut 12's links.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct Report {
     pub files_total: u64,
