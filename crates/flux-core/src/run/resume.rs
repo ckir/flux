@@ -171,6 +171,8 @@ mod tests {
             links: Links::Copy,
             hardlinks: flux_fs::Hardlinks::Auto,
             cross_filesystems: false,
+            verify: flux_fs::VerifyLevel::None,
+            hash: flux_fs::HashAlgorithm::Blake3,
         }
     }
 

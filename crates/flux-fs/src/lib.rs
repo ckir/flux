@@ -13,8 +13,8 @@ pub use error::{Code, FsError, Result};
 pub mod options;
 
 pub use options::{
-    CopyOptions, Durability, ExistingPolicy, Hardlinks, Links, MetadataFailure, MetadataItem,
-    OperationId, Outcome, Preserve, Publish, Safety, temp_path,
+    CopyOptions, Durability, ExistingPolicy, Hardlinks, HashAlgorithm, Links, MetadataFailure,
+    MetadataItem, OperationId, Outcome, Preserve, Publish, Safety, VerifyLevel, temp_path,
 };
 
 pub mod claims;

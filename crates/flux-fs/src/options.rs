@@ -98,6 +98,23 @@ pub enum Hardlinks {
     Copy,
 }
 
+/// How much of a copy is verified by hashing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VerifyLevel {
+    #[default]
+    None,
+    SourceStream,
+    Destination,
+    Full,
+}
+
+/// The hash used for verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HashAlgorithm {
+    #[default]
+    Blake3,
+}
+
 #[derive(Debug, Clone)]
 pub struct CopyOptions {
     pub preserve_times: Preserve,
@@ -110,6 +127,8 @@ pub struct CopyOptions {
     pub links: Links,
     pub hardlinks: Hardlinks,
     pub cross_filesystems: bool,
+    pub verify: VerifyLevel,
+    pub hash: HashAlgorithm,
 }
 
 #[derive(Debug)]
@@ -135,6 +154,8 @@ pub struct Outcome {
     pub published_identity: crate::FileIdentity,
     /// `true`: the existing destination was left untouched; `bytes_copied == 0`.
     pub skipped: bool,
+    /// `true`: the copy was verified by hashing at the requested level.
+    pub verified: bool,
 }
 
 /// `<target>.flux-partial.<operation-id>`, in the target's directory (§18.1, normative).
@@ -158,6 +179,12 @@ mod tests {
     }
 
     #[test]
+    fn verify_defaults_to_none_and_hash_to_blake3() {
+        assert_eq!(VerifyLevel::default(), VerifyLevel::None);
+        assert_eq!(HashAlgorithm::default(), HashAlgorithm::Blake3);
+    }
+
+    #[test]
     fn preserve_distinguishes_off_from_default() {
         // §44.1 treats "not requested" and "requested leniently" differently, so a
         // boolean cannot express this.
@@ -173,6 +200,7 @@ mod tests {
             identity_degraded: None,
             published_identity: crate::FileIdentity::Unavailable,
             skipped: false,
+            verified: false,
         };
         assert!(o.metadata_failures.is_empty());
         assert_eq!(o.bytes_copied, 10);

@@ -1577,6 +1577,7 @@ fn dry_file<F: DestinationRoot>(
                 identity_degraded: degraded,
                 published_identity: FileIdentity::Unavailable,
                 skipped: false,
+                verified: false,
             }));
             let action = if replaces { PlannedAction::Overwrite } else { PlannedAction::Copy };
             Some(PlannedEntry { object: PlannedObject::File, action })
@@ -1588,6 +1589,7 @@ fn dry_file<F: DestinationRoot>(
                 identity_degraded: degraded,
                 published_identity: FileIdentity::Unavailable,
                 skipped: true,
+                verified: false,
             }));
             Some(PlannedEntry { object: PlannedObject::File, action: PlannedAction::Skip(reason) })
         }

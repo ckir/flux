@@ -1065,6 +1065,7 @@ mod tests {
             identity_degraded: Some(FileIdentity::Unavailable),
             published_identity: flux_fs::FileIdentity::Unavailable,
             skipped: false,
+            verified: false,
         });
         let r = Report::file(&ok, true, 0);
         assert_eq!((r.files_total, r.files_copied, r.files_overwritten), (1, 1, 1));
@@ -1089,6 +1090,7 @@ mod tests {
             identity_degraded: None,
             published_identity: flux_fs::FileIdentity::Unavailable,
             skipped: false,
+            verified: false,
         });
         let r = Report::file(&ok, false, 0);
         assert_eq!((r.files_copied, r.files_overwritten), (1, 0));
@@ -1097,6 +1099,7 @@ mod tests {
     #[test]
     fn a_skipped_single_file_reports_one_skipped_and_none_copied() {
         let skipped: Result<Outcome, CopyError> = Ok(Outcome {
+            verified: false,
             skipped: true,
             bytes_copied: 0,
             metadata_failures: Vec::new(),
@@ -1558,6 +1561,7 @@ mod tests {
                 identity_degraded: None,
                 published_identity: flux_fs::FileIdentity::Unavailable,
                 skipped: false,
+                verified: false,
             })),
             stop: None,
             warnings: Vec::new(),
@@ -1934,6 +1938,7 @@ mod tests {
                 identity_degraded: None,
                 published_identity: flux_fs::FileIdentity::Unavailable,
                 skipped: false,
+                verified: false,
             })
         };
         assert_eq!(Report::file_run(&run(Some(copied()), None), false, 1).errors, 0);

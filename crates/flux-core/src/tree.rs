@@ -3248,6 +3248,7 @@ fn dry_stop_file<F: DestinationRoot>(
         identity_degraded: degraded,
         published_identity: FileIdentity::Unavailable,
         skipped: false,
+        verified: false,
     };
     finish_copy(cx.key_prefix, path.clone(), Ok(outcome), out, on_report)?;
     let partial = dry_partial_len(cx, parent, name);
@@ -3306,6 +3307,7 @@ fn dry_stop_link<F: DestinationRoot>(
         identity_degraded: degraded,
         published_identity: FileIdentity::Unavailable,
         skipped: false,
+        verified: false,
     };
     finish_copy(cx.key_prefix, path.clone(), Ok(outcome), out, on_report)?;
     dry_planned(out, on_report, path, PlannedObject::Symlink, replace, None);
@@ -4477,6 +4479,8 @@ mod tests {
             links: Links::Copy,
             hardlinks: flux_fs::Hardlinks::Auto,
             cross_filesystems: false,
+            verify: flux_fs::VerifyLevel::None,
+            hash: flux_fs::HashAlgorithm::Blake3,
         }
     }
 

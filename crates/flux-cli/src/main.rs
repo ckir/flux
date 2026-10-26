@@ -214,6 +214,8 @@ fn options(args: &CopyArgs) -> CopyOptions {
             ExistingPolicy::Overwrite
         },
         cross_filesystems: args.cross_filesystems,
+        verify: flux_fs::VerifyLevel::None,
+        hash: flux_fs::HashAlgorithm::Blake3,
     }
 }
 

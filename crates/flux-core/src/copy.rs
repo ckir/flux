@@ -750,6 +750,7 @@ pub(crate) fn stage_file<F: DestinationRoot>(
             }
             return Ok(Stage::Skipped(Outcome {
                 skipped: true,
+                verified: false,
                 bytes_copied: 0,
                 metadata_failures: vec![],
                 identity_degraded: degraded,
@@ -1152,6 +1153,7 @@ pub(crate) fn publish_staged<D: DirHandle>(
         identity_degraded,
         published_identity,
         skipped: false,
+        verified: false,
     })
 }
 
@@ -1301,6 +1303,8 @@ mod tests {
             links: Links::Copy,
             hardlinks: flux_fs::Hardlinks::Auto,
             cross_filesystems: false,
+            verify: flux_fs::VerifyLevel::None,
+            hash: flux_fs::HashAlgorithm::Blake3,
         }
     }
 
