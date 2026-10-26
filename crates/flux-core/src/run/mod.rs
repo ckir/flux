@@ -671,11 +671,12 @@ where
         }
     }
     drop(claims);
-    // Cut 12: the index is closed once `ended` is known (a lost lock keeps its file: the run no longer owns DEST, plan
-    // ruling 15), and both handles are gone before `finish` retires the workspace.
+    // Cut 12: the index is closed once `ended` is known (a lost lock or a failed heartbeat keeps its file: the run no
+    // longer provably owns DEST, plan ruling 15; a failed pulse maps to `Failed` before the Lost check, so it is tested
+    // here as the claim flush above tests it), and both handles are gone before `finish` retires the workspace.
     if let Some(slot) = hardlink_slot {
         let failure = slot.failure();
-        drop(slot.close(!matches!(ended, Ended::Lost)));
+        drop(slot.close(!matches!(ended, Ended::Lost) && !locked.pulse.failed()));
         if let Some(code) = failure
             && !std::mem::replace(&mut slot_warned, true)
         {

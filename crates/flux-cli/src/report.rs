@@ -418,11 +418,18 @@ pub fn hardlink_warning_lines(out: &TreeOutcome) -> Vec<String> {
         v.push(identity(UNAVAILABLE, g));
     }
     for (why, g) in &out.hardlinks_unlinked {
+        // These causes appear only under `auto` (`preserve` fails such a member instead), so the hint is true. A policy
+        // split is the exception: the existing-file policy skipped the member under either mode, so it has no hint.
         let cause = match why {
             UnlinkedWhy::LinkRefused => "the destination refused the link",
             UnlinkedWhy::AnchorUnavailable => "the anchor could not be found or checked",
             UnlinkedWhy::PolicySplit => {
-                "the existing-file policy kept them apart from their anchor"
+                v.push(format!(
+                    "warning: {} hardlink members were kept separate from their anchor by the existing-file policy (--skip-existing / --update) (e.g. {})",
+                    g.count,
+                    rel(&g.example)
+                ));
+                continue;
             }
             UnlinkedWhy::IndexFailure => "the hardlink index could not be read or written",
         };
@@ -728,12 +735,12 @@ pub fn run_warning_line(w: &RunWarning) -> String {
             format!("checkpoints unreadable: {why}; every large file recopies")
         }
         RunWarning::HardlinkIndexUnavailable { path, code } => format!(
-            "warning: the hardlink index {} could not be created ({}); hardlinks were copied independently - --hardlinks=preserve fails them instead",
+            "warning: the hardlink index {} could not be created ({}); hardlink members cannot be linked (copied independently under --hardlinks=auto, failed under --hardlinks=preserve)",
             path.display(),
             code.as_str()
         ),
         RunWarning::HardlinkRootUnavailable { error } => format!(
-            "warning: DEST could not be reopened for linking ({}); hardlinks were copied independently - --hardlinks=preserve fails them instead",
+            "warning: DEST could not be reopened for linking ({}); hardlink members cannot be linked (copied independently under --hardlinks=auto, failed under --hardlinks=preserve)",
             error.source
         ),
         RunWarning::WalQuarantined { code, why, set_aside_as } => format!(
@@ -1736,7 +1743,7 @@ mod tests {
                 code: Code::IoError,
             }),
             format!(
-                "warning: the hardlink index {} could not be created ({}); hardlinks were copied independently - --hardlinks=preserve fails them instead",
+                "warning: the hardlink index {} could not be created ({}); hardlink members cannot be linked (copied independently under --hardlinks=auto, failed under --hardlinks=preserve)",
                 PathBuf::from("D/.flux/operations/x/hardlinks.db").display(),
                 Code::IoError.as_str()
             )
@@ -1746,7 +1753,7 @@ mod tests {
         });
         assert_eq!(
             line,
-            "warning: DEST could not be reopened for linking (gone); hardlinks were copied independently - --hardlinks=preserve fails them instead"
+            "warning: DEST could not be reopened for linking (gone); hardlink members cannot be linked (copied independently under --hardlinks=auto, failed under --hardlinks=preserve)"
         );
     }
 
@@ -2345,7 +2352,7 @@ mod tests {
                 "warning: reliable filesystem object identity unavailable on volume 0x7; hardlink preservation degraded to ordinary copies (2 files, e.g. a) - --hardlinks=preserve fails them instead",
                 "warning: reliable filesystem object identity unavailable where the filesystem reports no identity; hardlink preservation degraded to ordinary copies (1 files, e.g. d) - --hardlinks=preserve fails them instead",
                 "warning: 4 hardlink members were copied independently (e.g. l): the destination refused the link - --hardlinks=preserve fails them instead",
-                "warning: 1 hardlink members were copied independently (e.g. p): the existing-file policy kept them apart from their anchor - --hardlinks=preserve fails them instead",
+                "warning: 1 hardlink members were kept separate from their anchor by the existing-file policy (--skip-existing / --update) (e.g. p)",
                 "warning: the filesystem reports no link counts (3 files, e.g. u); hardlinks among them were not looked for",
             ]
         );

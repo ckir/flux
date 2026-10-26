@@ -1866,6 +1866,18 @@ impl DestinationRoot for FaultFs {
 
     fn destination_root(&self, path: &Path) -> Result<Self::Dir> {
         let mut g = self.inner.lock().unwrap();
+        // Test seam: `on_nth("destination_root", n, ..)` runs just before the nth reopen. The call is counted but NOT
+        // logged, so no call-log assertion shifts.
+        let n = {
+            let c = g.call_counts.entry("destination_root".to_string()).or_insert(0);
+            *c += 1;
+            *c
+        };
+        if let Some(action) = g.hooks.remove(&("destination_root".to_string(), n)) {
+            drop(g);
+            action(&FaultFs { inner: std::sync::Arc::clone(&self.inner) });
+            g = self.inner.lock().unwrap();
+        }
         // A path that has a root but no parent IS a root (`/`, `C:\`), which exists on
         // any real filesystem. Same rule `create_dir` applies to a root-level create.
         let is_root = path.has_root() && path.parent().is_none();

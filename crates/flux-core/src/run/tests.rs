@@ -9199,6 +9199,26 @@ fn a_run_under_auto_with_no_hardlinks_leaves_no_index_file() {
     assert!(!log.contains(&own), "{log:?}");
 }
 
+// Mutant: `close(true)` regardless of the heartbeat (`!matches!(ended, Ended::Lost)` alone). A failed heartbeat is
+// `Ended::Failed` before the Lost check, and ownership is no longer proven, so the index file must stay (ruling 15).
+#[test]
+fn a_failed_heartbeat_keeps_the_hardlink_index_file() {
+    let index = format!("/p/dest/.flux/operations/{ID}/hardlinks.db");
+    let mut proven = 0;
+    for nth in 2..=14 {
+        let fs = group_fake(&["a2"]);
+        fail_heartbeat(&fs, nth, LOCK, false);
+        let (r, _) = run_tree_with(&fs, &beating(), &auto());
+        let made = calls(&fs).iter().any(|c| c.starts_with("create_hardlink_index"));
+        if !made || !matches!(&r.copy, Some(Err(a)) if a.error.step == CopyStep::Heartbeat) {
+            continue;
+        }
+        proven += 1;
+        assert!(fs.exists(&index), "nth {nth}: {:?}", calls(&fs));
+    }
+    assert!(proven > 0, "no heartbeat failure landed after the index was made");
+}
+
 // Cut 12 (fix round 1): the dry run's index directory is made at the first use of the index, and nothing consults the
 // index yet, so a dry run makes none and warns of nothing (mutant: build the directory when the slot is built).
 #[test]
@@ -9233,6 +9253,36 @@ fn a_weak_identity_destination_makes_no_anchor_root_warning() {
         "{:?}",
         r.warnings
     );
+}
+
+// Mutant: make the two-Strong-identities arm of the anchor-root check `Some(root)` (no warning, and no linking). The
+// fake's `destination_root` seam changes DEST's identity just before the run's reopen of it, after the walk's handle
+// has been read, so the two Strong identities differ.
+#[test]
+fn a_strong_anchor_root_that_differs_from_the_walk_root_warns() {
+    let other = FileIdentity::Strong(ObjectId { volume: 1, index: 9999 });
+    let mut warned = 0;
+    for nth in 1..=12 {
+        let fs = fake();
+        fs.on_nth("destination_root", nth, move |fs| fs.set_identity("/p/dest", other));
+        let (r, _) = run_tree(&fs, &cfg());
+        let found: Vec<&RunWarning> = r
+            .warnings
+            .iter()
+            .filter(|w| matches!(w, RunWarning::HardlinkRootUnavailable { .. }))
+            .collect();
+        if found.is_empty() {
+            continue;
+        }
+        warned += 1;
+        let RunWarning::HardlinkRootUnavailable { error } = found[0] else { unreachable!() };
+        assert_eq!(error.code, Code::DestinationError);
+        assert!(
+            error.source.to_string().contains("reopened as a different directory"),
+            "{error:?}"
+        );
+    }
+    assert_eq!(warned, 1, "exactly the run's reopen is the one that warns");
 }
 
 // Cut 12 Task 5: candidacy and the degradations that need no index.
@@ -9405,6 +9455,11 @@ fn a_candidate_without_claims_degrades_under_auto_and_fails_under_preserve() {
         if mode == flux_fs::Hardlinks::Auto {
             assert!(got.is_empty(), "{got:?}");
             assert_eq!((out.hardlinks_degraded, out.files_copied), (1, 2));
+            // Mutant: restore the bare `hardlinks_degraded += 1` (the count then has no cause or example).
+            assert_eq!(
+                out.hardlinks_unlinked[&UnlinkedWhy::AnchorUnavailable],
+                crate::tree::DegradedGroup { count: 1, example: "a".into() }
+            );
             assert!(fs.exists("/p/dest/a"));
         } else {
             assert_eq!(got.len(), 1, "{got:?}");
@@ -9798,6 +9853,49 @@ fn a_lookup_failure_degrades_under_auto_and_fails_under_preserve() {
         assert!(!fs.exists(format!("/p/dest/{name}")));
     }
     assert_eq!((out.files_copied, out.hardlinks_degraded), (1, 0), "only sub/b");
+}
+
+// Mutant: drop `|| self.outcome.files_hardlinked > 0` from `TreeAbort::changed`.
+#[test]
+fn an_abort_that_only_linked_files_is_changed_and_not_refused_unchanged() {
+    use crate::copy::CopyError;
+    let error = || {
+        CopyError::at(
+            CopyStep::Gate,
+            flux_fs::FsError::new(Code::SafetyRejected, std::io::Error::other("refused")),
+        )
+    };
+    let none = TreeAbort { error: error(), outcome: TreeOutcome::default() };
+    assert!(!none.changed() && none.refused_unchanged());
+    let outcome = TreeOutcome { files_hardlinked: 1, ..TreeOutcome::default() };
+    let linked = TreeAbort { error: error(), outcome };
+    assert!(linked.changed());
+    assert!(!linked.refused_unchanged());
+}
+
+// Mutant: drop the `degrade(.., IndexFailure)` after the failed `Skipped` upsert in `skipped_member`.
+#[test]
+fn a_failed_skipped_upsert_counts_the_member_under_auto_only() {
+    for mode in [flux_fs::Hardlinks::Auto, flux_fs::Hardlinks::Preserve] {
+        let fs = dest_fake();
+        fs.write_file("/p/dest/a", b"its own object");
+        link_names(&fs, "/src", "a", &["a2"]);
+        fs.fail_always("hardlink_index_insert", Code::IoError);
+        let o = CopyOptions { hardlinks: mode, ..skip_existing() };
+        let (r, _got) = run_tree_with(&fs, &cfg(), &o);
+        let out = ok(&r);
+        assert_eq!(out.files_skipped, 1, "{mode:?}");
+        assert_eq!(fs.read_file("/p/dest/a").as_deref(), Some(&b"its own object"[..]), "{mode:?}");
+        if mode == flux_fs::Hardlinks::Auto {
+            assert_eq!(
+                out.hardlinks_unlinked[&UnlinkedWhy::IndexFailure].example,
+                PathBuf::from("a")
+            );
+            assert!(out.hardlinks_unlinked[&UnlinkedWhy::IndexFailure].count >= 1);
+        } else {
+            assert!(!out.hardlinks_unlinked.contains_key(&UnlinkedWhy::IndexFailure));
+        }
+    }
 }
 
 #[test]

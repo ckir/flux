@@ -152,9 +152,11 @@ remain usage errors (`crates/flux-cli/src/main.rs:37`), so a group that spans ro
 
 `copy` performs no identity lookup (Section 108, last paragraph) and reports nothing about links.
 
-The no-claims path (`tree.rs:1559-1561`: a lockless copy, or an identity that cannot key claims) does not link: with
+The no-claims path (`tree.rs:1559-1561`: an identity that cannot key claims for a directory) does not link: with
 no claim there is no `Created` record to make an anchor. Under `auto` every member of a group is copied independently
-and counted `hardlinks_degraded`; under `preserve` the members of a group fail with `HARDLINK_UNAVAILABLE`.
+and counted `hardlinks_degraded`; under `preserve` the members of a group fail with `HARDLINK_UNAVAILABLE`. The library
+entry `copy_tree` (no run, no claims, no slot) does not link and does not report link degradation: it copies the members
+silently. The CLI always goes through the run.
 
 ### Resume (R2: rebuild from the walk)
 

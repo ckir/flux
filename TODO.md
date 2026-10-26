@@ -362,6 +362,9 @@ are the spec's).
       junction.
 - [ ] **8. A hardlink alias on a case-insensitive destination:** an alias of an existing entry in the same directory
       makes the alias's target fail rather than replace (no unique identity match). Cut 12's link path records the alias's claim through the same protocol; the case-insensitive alias case is unchanged and untested.
+      With hardlinked source names, an object with several spellings makes `NameIndex` identity resolution
+      Unresolvable, so a colliding unrelated name fails with `DESTINATION_ERROR` instead of
+      `DESTINATION_NAMESPACE_COLLISION` (`names.rs` ~126-131); untested.
 - [ ] **9. Closing the claim store always commits:** `redb` 4.3.0 `Database::drop` is an `Immediate` write commit plus
       a header fsync, so `state.db` is written and synced once on every path, including `Lost` (a write without
       ownership, though only to this run's own workspace file) and a clean `Completed`; the spec's "never on a clean

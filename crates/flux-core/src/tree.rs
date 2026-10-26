@@ -182,6 +182,7 @@ impl TreeAbort {
     pub fn changed(&self) -> bool {
         self.outcome.directories_created > 0
             || self.outcome.files_copied > 0
+            || self.outcome.files_hardlinked > 0
             || self.error.leftover.is_some()
     }
 
@@ -1630,7 +1631,7 @@ fn hardlink_degradation<F: DestinationRoot>(
                 report(out, on_report, path.to_path_buf(), cause);
                 return true;
             }
-            out.hardlinks_degraded += 1;
+            degrade(out, path, UnlinkedWhy::AnchorUnavailable);
             false
         }
         // A candidate with claims meets its group's index entry in `copy_one` (`hardlink_group`, `meet_group`).
@@ -2405,8 +2406,9 @@ fn degrade(out: &mut TreeOutcome, path: &Path, why: UnlinkedWhy) {
 }
 
 /// The existing-file policy skipped this candidate (`dest` is what it left in place): the group's entry says whether
-/// that is a degradation yet (plan ruling 16). Nothing is counted for the skip itself, and an index error counts
-/// nothing under either mode: the member was skipped, not copied or failed.
+/// that is a degradation yet (plan ruling 16). Nothing is counted for the skip itself. A failed index write counts
+/// the member `IndexFailure` under `auto` (its split can no longer be told); under `preserve` it counts nothing: the
+/// member was skipped, not copied or failed.
 fn skipped_member<F: DestinationRoot>(
     cx: &Shared<'_, F>,
     group: &Group,
@@ -2417,16 +2419,22 @@ fn skipped_member<F: DestinationRoot>(
 ) {
     let (Some(slot), Lookup::Found(entry)) = (cx.hardlinks, &group.entry) else { return };
     let here = strong(dest.identity);
-    let upsert = |members, example: FluxPathKey| {
+    let upsert = |out: &mut TreeOutcome, members, example: FluxPathKey| {
         let skipped = HardlinkEntry::Skipped { object: here, members, example };
-        // A failed write loses only the later accounting of this member.
-        let _ = slot.with(|index| index.insert(&group.id, &skipped));
+        // A failed write loses the later accounting of this member; under `auto` the split is counted now instead
+        // (plan ruling 13). Under `preserve` the member stays a policy skip: it was never copied, so it has no
+        // failure to report.
+        if slot.with(|index| index.insert(&group.id, &skipped)).is_err()
+            && cx.opts.hardlinks != Hardlinks::Preserve
+        {
+            degrade(out, path, UnlinkedWhy::IndexFailure);
+        }
     };
     match entry {
-        None => upsert(1, target.clone()),
+        None => upsert(out, 1, target.clone()),
         Some(HardlinkEntry::Skipped { object, members, example }) => {
             if object.is_some() && *object == here {
-                upsert(members + 1, example.clone());
+                upsert(out, members + 1, example.clone());
             } else {
                 degrade(out, path, UnlinkedWhy::PolicySplit);
             }

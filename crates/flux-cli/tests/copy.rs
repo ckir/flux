@@ -820,10 +820,14 @@ fn a_degraded_group_reaches_stderr_and_the_json() {
     assert!(v.get("hardlinks_unchecked").is_none(), "{v}");
     let text = stderr(&out);
     assert!(text.contains("; 1 hardlinks degraded"), "stderr: {text}");
-    assert!(
-        text.contains("warning: 1 hardlink members were copied independently"),
-        "stderr: {text}"
-    );
+    // The existing-file policy skipped `a` under either mode, so the line carries no `--hardlinks=preserve` hint.
+    let line = text
+        .lines()
+        .find(|l| l.contains("kept separate from their anchor"))
+        .unwrap_or_else(|| panic!("stderr: {text}"));
+    assert!(line.starts_with("warning: 1 hardlink members were kept separate"), "{line}");
+    assert!(line.contains("(--skip-existing / --update)") && !line.contains("preserve"), "{line}");
+    assert!(!text.contains("copied independently"), "stderr: {text}");
     assert_eq!(std::fs::read(dst.join("a")).unwrap(), b"old", "the existing file is kept");
     assert_eq!(std::fs::read(dst.join("b")).unwrap(), b"AA");
 }
