@@ -391,7 +391,7 @@ Inputs the design implies but no task's tests would otherwise exercise, most lik
 - Modify: `ROADMAP.md:43` (Phase 4: "hardlink canonicalization and dependency-aware links for fresh copies and `--resume` are done (cut 12, PR #N); the persistent topology store is deferred until parallel workers; excluded members wait for `--exclude`")
 - Modify: `README.md` (Commands section 55-62: a `flux copy --hardlinks=auto|preserve|copy` paragraph under the `flux copy` line: default `auto`, what each does, the report counters; `README.md:29` stays)
 - Modify: `TODO.md:241` (note: "the walker now has hardlink topology for regular files (cut 12); a hardlinked symlink is still N independent links"), `TODO.md:363` item 8 (note: "cut 12's link path records the alias's claim through the same protocol; the case-insensitive alias case is unchanged and untested")
-- Modify: the design: a "Plan rulings" subsection under "Calls made by the author" listing rulings 1-14 above, the correction of the sweep/cleanup claim (ruling 1) in "What exists today", and "Stand-downs" if any arose.
+- Modify: the design: a "Plan rulings" subsection under "Calls made by the author" listing rulings 1-16 above, the correction of the sweep/cleanup claim (ruling 1) in "What exists today", and "Stand-downs" if any arose.
 - Modify: `docs/accepted-boundaries.md`: one entry, "a destination that cannot hold hardlinks (FAT, some shares) is exercised through `FaultFs::set_hardlinks_unavailable` only; no CI runner offers such a destination" with the Task 6 tests as the compensation.
 
 - [ ] **Step 1: Edit** the files as specified.

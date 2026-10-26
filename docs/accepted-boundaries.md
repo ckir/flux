@@ -114,3 +114,12 @@ These are limits and rulings of the cut, not test gaps. Each is stated as the sp
 - **R1. One destination-root lock plus one prefix lock per root.** All are held for the whole run. The workspace lives under `DEST/.flux/`, and the root lock serialises every operation on DEST. The prefix locks add alias detection and protect each `DEST/<name>` against a single-source tree run onto DEST.
 - **R7. Prefix lock records carry `workspace_path` `none`.** This extends master spec 259.6, which defines `none` only for cleanup locks. The operation lock already names the real workspace. A dead prefix lock is then trusted and recovered by the next acquirer of that name. Owner decision.
 - **Nested sources copy shared content twice (R5).** `flux copy a a/sub DEST` copies the content under `a/sub` to `DEST/a/sub` and to `DEST/sub`. The prefixes are distinct, which is all spec 18.3 requires.
+
+## Cut 12 - hardlink preservation (2026-10-26)
+
+- **A destination that cannot hold hardlinks (FAT, some network shares) is exercised through `FaultFs::set_hardlinks_unavailable` only.**
+  No CI runner offers such a destination, so the real `linkat` / `NtSetInformationFile` refusal on one is not reached.
+  **Compensation:** the engine tests `a_link_the_destination_cannot_hold_degrades_under_auto` and
+  `a_link_the_destination_cannot_hold_fails_under_preserve` (`crates/flux-core/src/run/tests.rs`) pin the outcome of the
+  refusal (degrade under `auto`, `HARDLINK_UNAVAILABLE` under `preserve`), and the Unix errno mapping of the primitive is
+  unit-pinned (`map_link_errno`, `crates/flux-platform/src/dir_unix.rs`). Not yet owner-accepted.

@@ -1,6 +1,6 @@
 # Hardlink preservation (cut 12) - design
 
-Status: draft for approval. Date: 2026-10-26. Roadmap: Phase 4 (deterministic topology), first cut.
+Status: approved (owner, 2026-10-26); implemented in cut 12 (plan docs/superpowers/plans/2026-10-26-hardlink-preservation.md). Date: 2026-10-26. Roadmap: Phase 4 (deterministic topology), first cut.
 
 ## Intent and why
 
@@ -204,10 +204,13 @@ vanished anchor, and does not report them. A dry `--resume` follows the real res
 
 - `files_hardlinked` (exists, `report.rs:35`) counts links created, including relinked members.
 - New: `hardlinks_degraded` (members copied independently instead of linked) in the JSON report, and
-  `summary_line` (`report.rs:409`) appends `; N hardlinks degraded` when non-zero. `files_degraded` keeps its current
+  `summary_line` (`report.rs:409`) appends `; N hardlinked` (links created) and `; N hardlinks degraded` when non-zero. `files_degraded` keeps its current
   meaning (the weak-identity safety gate).
 - New: `hardlinks_unchecked` (files whose link count the platform could not report, so no link was looked for), in the
   JSON report, with `; N hardlinks unchecked` appended to the summary line when non-zero.
+- The JSON keys cut 12 adds or fills are `files_hardlinked` (one of the 18 fixed keys), `hardlinks_degraded` and
+  `hardlinks_unchecked` (the last two absent at zero). `hardlinks_unlinked` is NOT a JSON field: it is an internal
+  per-cause aggregate (`UnlinkedWhy`) that only feeds the stderr warnings.
 - Aggregated stderr warnings use the Section 108 wording. Under `preserve`, a failed member is an ordinary member
   failure with its code.
 - New codes in `Code` (`error.rs:17`): `HardlinkUnavailable` and `HardlinkIdentityUnavailable` (spec Sections 15, 108),
@@ -265,7 +268,7 @@ Cut order with a per-run disk-backed index and no persisted format; `--hardlinks
 
 ## Calls made by the author (not the owner - check these)
 
-- Index file in the operation directory, lazily created, fixed cache, removed at the end of the run and by the sweep.
+- Index file in the operation directory, lazily created, fixed cache, removed by the run itself at its end (the workspace retire path removes it too; see the first plan ruling, which corrects "by the sweep").
 - Only `nlink > 1` and `Strong` identity files enter the index; an unknown `nlink` is a candidate for one aggregated
   warning, not an error.
 - Link publication goes through the existing claim protocol, as a copy does.
@@ -279,7 +282,7 @@ Cut order with a per-run disk-backed index and no persisted format; `--hardlinks
 
 ### Plan rulings (2026-10-26, refinements made while planning; the plan's "Plan rulings" section is the full list)
 
-- The index file is named `hardlinks.db` and is a known name of the workspace retire path (correction above).
+- The index file is named `hardlinks.db` and is a known name of the workspace retire path (this corrects the claim that the existing sweep/cleanup removes it: that path removes only known names).
 - A link candidate (`nlink > 1`, `Strong`) is never staged into a Strict-durability directory batch: a batched
   canonical would publish after its dependents are met. Such files publish one by one, as symlinks do.
 - The tree reads the source metadata once per file and shares it with the checkpoint, resume and policy readers, so
@@ -300,6 +303,34 @@ Cut order with a per-run disk-backed index and no persisted format; `--hardlinks
   counts, `preserve` fails the member; nothing aborts the run. The non-weak degradations carry one aggregated warning
   with an example (`hardlinks_unlinked`), beside the §108 weak-identity warning.
 
+Rulings made during execution (the ledger of the implementation; each was found by a task review or a blocked task):
+
+- `anchor_parent` returns a `ParentDir` (`Dest(&D)` or `Opened(D)`, dereferencing to the directory handle): a file
+  directly in DEST has no parent handle to return by value, so the parent is borrowed or owned.
+- Candidacy degradations run after the existing-file policy has decided: a policy-skipped member is neither counted
+  nor failed.
+- The dry run's slot creates its index lazily, at the first lookup: a tree without candidates makes no temporary
+  directory and prints no warning.
+- The anchor-root check warns (`HardlinkRootUnavailable`) only on a Strong-vs-Strong identity mismatch or an error;
+  equal non-Strong identities leave the anchor root unset silently.
+- The link path runs the identity gate for a replacement target (`Plan::Replace`) as a copy does, and passes its
+  degradation to the publication.
+- The registered anchor is kept even when the canonical's claim write failed, and an ignored `Failed` insert error
+  likewise: the group's health is reported through `ClaimNotRecorded` and healed on resume.
+- Non-weak degradations are aggregated per cause (`UnlinkedWhy`: `LinkRefused`, `AnchorUnavailable`, `PolicySplit`,
+  `IndexFailure`) with one warning line per cause.
+- At the resume skip site an unreadable index skips and counts `IndexFailure` under `auto`; under `preserve` it falls
+  through, so the member fails with `HARDLINK_UNAVAILABLE`.
+- Same-object `rename_replace` is the only no-op in the fake (plain `rename(2)`); `rename_no_replace` answers
+  `AlreadyExists` there, as Linux `RENAME_NOREPLACE` and Windows `ReplaceIfExists = false` do.
+
+Known limits of the cut:
+
+- A dry run does not predict a refused replacement (it skips the identity gate) nor a weak-destination anchor on resume
+  (it predicts `would_hardlink` where a live run degrades).
+- A Windows and macOS measurement of the link primitive is outstanding: the Windows arm is compile-checked for
+  `x86_64-pc-windows-gnu` only, and its access mask, same-object rename and status mapping need a Windows runner.
+
 ## Left to the builder
 
 - The exact `DirHandle` method name and signature; the Windows call; the index file name and `redb` settings.
@@ -318,4 +349,4 @@ Cut order with a per-run disk-backed index and no persisted format; `--hardlinks
 
 ## Stand-downs
 
-None yet.
+None.
