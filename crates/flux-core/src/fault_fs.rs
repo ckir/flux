@@ -789,7 +789,7 @@ impl Read for FakeHandle {
         if let (Some(tally), None) = (&self.read_tally, &self.sink) {
             let mut g = tally.lock().unwrap();
             if let Some((pat, n, kind)) = g.read_nth.clone()
-                && self.path.to_string_lossy().contains(&pat)
+                && self.path.to_string_lossy().replace('\\', "/").contains(&pat)
             {
                 g.reads += 1;
                 if g.reads == n {

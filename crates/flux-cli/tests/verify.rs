@@ -198,9 +198,11 @@ fn an_absent_destination_prints_the_leading_line_and_every_path_missing() {
     let dst = d.path().join("nowhere");
     let out = verify(&[&src, &dst]);
     assert_eq!(out.status.code(), Some(1));
+    // The resolver shows the canonical ancestor plus the absent remainder (K6).
+    let shown = std::fs::canonicalize(d.path()).unwrap().join("nowhere");
     let line = format!(
         "destination does not exist: {} (every source path is reported missing)",
-        dst.display()
+        shown.display()
     );
     assert!(stderr(&out).contains(&line), "{}", stderr(&out));
     let text = stdout(&out);
@@ -528,7 +530,19 @@ fn awkward_names_are_unambiguous_and_never_split_a_line() {
     use std::os::unix::ffi::OsStrExt;
     let d = TempDir::new().unwrap();
     let (src, dst) = pair_in(d.path());
-    for name in [&b"bad\xff\nname"[..], b"bad\xfe\nname", b"back\\slash", b"plain"] {
+    // macOS enforces UTF-8 file names, so the invalid-byte cases run on Linux only; the control-byte and
+    // backslash escaping is exercised on both.
+    let names: &[&[u8]] = if cfg!(target_os = "macos") {
+        &[b"bad\nname", b"back\\slash", b"plain"]
+    } else {
+        &[b"bad\xff\nname", b"bad\xfe\nname", b"back\\slash", b"plain"]
+    };
+    let expected: &[&str] = if cfg!(target_os = "macos") {
+        &["back\\\\slash", "bad\\nname", "plain"]
+    } else {
+        &["back\\\\slash", "bad\\xfe\\nname", "bad\\xff\\nname", "plain"]
+    };
+    for name in names {
         std::fs::write(dst.join(std::ffi::OsStr::from_bytes(name)), b"").unwrap();
     }
     let out = flux().arg("verify").arg(&src).arg(&dst).arg("--json").output().unwrap();
@@ -539,8 +553,8 @@ fn awkward_names_are_unambiguous_and_never_split_a_line() {
         .filter(|l| l["outcome"] == "extra")
         .map(|l| l["path"].as_str().unwrap())
         .collect();
-    assert_eq!(paths, ["back\\\\slash", "bad\\xfe\\nname", "bad\\xff\\nname", "plain"]);
+    assert_eq!(paths, expected);
     let out = verify(&[&src, &dst]);
-    // Four extras and the summary: one line each, whatever the names hold.
-    assert_eq!(stdout(&out).lines().count(), 5, "{}", stdout(&out));
+    // One line per extra plus the summary, whatever the names hold.
+    assert_eq!(stdout(&out).lines().count(), names.len() + 1, "{}", stdout(&out));
 }
