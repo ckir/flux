@@ -937,11 +937,31 @@ mod tests {
         }
     }
 
+    /// Cases only `materialise` is checked against: the kinds `fixture_cases` never builds, a symlink and a
+    /// special file, on both sides and on one.
+    fn materialise_only_cases() -> Vec<Case> {
+        let link = |payload| Spec::Symlink { payload };
+        let both = |spec: Spec| vec![(vec!["l"], spec, Edit::KeepBoth)];
+        let differing = case_of(
+            vec![(vec!["l"], link("t"), Edit::EditContent(Which::Dest))],
+            vec![],
+            MountPolicy::Cross,
+        );
+        let mut skipped = case_of(both(link("t")), vec![], MountPolicy::Cross);
+        skipped.links = Links::Skip;
+        let special_both = case_of(both(Spec::Other), vec![], MountPolicy::Cross);
+        let special_source =
+            case_of(vec![(vec!["o"], Spec::Other, Edit::DropFromDest)], vec![], MountPolicy::Cross);
+        vec![differing, skipped, special_both, special_source]
+    }
+
     #[test]
     fn materialise_builds_what_sides_describe() {
         use crate::verify::{VerifyOptions, verify_tree};
         use flux_fs::HashAlgorithm;
-        for (i, (case, _)) in fixture_cases().into_iter().enumerate() {
+        let cases =
+            fixture_cases().into_iter().map(|(case, _)| case).chain(materialise_only_cases());
+        for (i, case) in cases.enumerate() {
             let (fs, setup) = materialise(&case);
             let opts = VerifyOptions {
                 links: case.links,
@@ -1173,16 +1193,24 @@ mod tests {
             }
         }
         when("ChangeKind on both Source and Dest", change_src && change_dst);
+        // A subtree the walker really drains against a type mismatch: on the filtered sides, `q` is a directory
+        // on side `a` and a non-directory on side `b`, the reference reports `q` Mismatched, and the child `p`
+        // of `q` on side `a` is reported Missing or Extra.
         let under_non_dir = |a: &BTreeMap<PathBuf, Spec>, b: &BTreeMap<PathBuf, Spec>| {
             a.keys().any(|p| {
-                p.parent()
-                    .filter(|q| !q.as_os_str().is_empty())
-                    .is_some_and(|q| b.get(q).is_some_and(|s| !matches!(s, Spec::Dir { .. })))
+                p.parent().filter(|q| !q.as_os_str().is_empty()).is_some_and(|q| {
+                    matches!(a.get(q), Some(Spec::Dir { .. }))
+                        && b.get(q).is_some_and(|s| !matches!(s, Spec::Dir { .. }))
+                        && recs.iter().any(|r| r.path == q && r.outcome == Outcome::Mismatched)
+                        && recs.iter().any(|r| {
+                            r.path == *p && matches!(r.outcome, Outcome::Missing | Outcome::Extra)
+                        })
+                })
             })
         };
         when(
             "subtree on one side under a non-directory on the other",
-            under_non_dir(&src, &dst) || under_non_dir(&dst, &src),
+            under_non_dir(&fsrc, &fdst) || under_non_dir(&fdst, &fsrc),
         );
         when(
             "source symlink removed by Skip",

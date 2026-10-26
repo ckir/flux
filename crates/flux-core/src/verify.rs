@@ -1559,7 +1559,7 @@ mod tests {
         tree(&fs, "/s", &["a-b", "a0"], &[("a0/a-b", b"")]);
         fs.set_mount_root("/s/a-b", MountRoot::Yes);
         fs.set_mount_root("/s/a0", MountRoot::Yes);
-        tree(&fs, "/d", &["a-b", "a0"], &[("a0/a-b", b"")]);
+        tree(&fs, "/d", &["a-b", "a0"], &[("a-b/x", b""), ("a0/a-b", b"")]);
         fs.set_mount_root("/d/a-b", MountRoot::Unknown);
         let (rows, s) = run(&fs, "/s", "/d", &o);
         let not_entered = |p: &str| {
