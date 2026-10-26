@@ -1,43 +1,43 @@
 {
  "pairs": {
   "linux/large/cp": {
-   "calibrated": "2026-10-26T03:59:50Z",
-   "cv": 0.0278,
+   "calibrated": "2026-10-26T09:22:11Z",
+   "cv": 0.0172,
    "image": "20261023.334.3",
    "source": "calibration",
    "stable": true
   },
   "linux/large/rsync": {
-   "calibrated": "2026-10-26T03:59:50Z",
-   "cv": 0.1048,
+   "calibrated": "2026-10-26T09:22:11Z",
+   "cv": 0.0211,
    "image": "20261023.334.3",
    "source": "calibration",
-   "stable": false
+   "stable": true
   },
   "linux/mixed/cp": {
-   "calibrated": "2026-10-26T03:59:50Z",
-   "cv": 0.0541,
+   "calibrated": "2026-10-26T09:22:11Z",
+   "cv": 0.0421,
    "image": "20261023.334.3",
    "source": "calibration",
    "stable": false
   },
   "linux/mixed/rsync": {
-   "calibrated": "2026-10-26T03:59:50Z",
-   "cv": 0.0255,
+   "calibrated": "2026-10-26T09:22:11Z",
+   "cv": 0.0906,
    "image": "20261023.334.3",
    "source": "calibration",
-   "stable": true
+   "stable": false
   },
   "linux/small/cp": {
-   "calibrated": "2026-10-26T03:59:50Z",
-   "cv": 0.0599,
+   "calibrated": "2026-10-26T09:22:11Z",
+   "cv": 0.0759,
    "image": "20261023.334.3",
    "source": "calibration",
    "stable": false
   },
   "linux/small/rsync": {
-   "calibrated": "2026-10-26T03:59:50Z",
-   "cv": 0.054,
+   "calibrated": "2026-10-26T09:22:11Z",
+   "cv": 0.1298,
    "image": "20261023.334.3",
    "source": "calibration",
    "stable": false
@@ -85,25 +85,25 @@
    "stable": false
   },
   "windows/large/robocopy": {
-   "calibrated": "2026-10-26T03:59:50Z",
-   "cv": 0.0486,
+   "calibrated": "2026-10-26T09:22:11Z",
+   "cv": 0.0337,
    "image": "20261021.278.1",
    "source": "calibration",
    "stable": false
   },
   "windows/mixed/robocopy": {
-   "calibrated": "2026-10-26T03:59:50Z",
-   "cv": 0.0409,
+   "calibrated": "2026-10-26T09:22:11Z",
+   "cv": 0.073,
    "image": "20261021.278.1",
    "source": "calibration",
    "stable": false
   },
   "windows/small/robocopy": {
-   "calibrated": "2026-10-26T03:59:50Z",
-   "cv": 0.0238,
+   "calibrated": "2026-10-26T09:22:11Z",
+   "cv": 0.0361,
    "image": "20261021.278.1",
    "source": "calibration",
-   "stable": true
+   "stable": false
   }
  },
  "schema": 1
