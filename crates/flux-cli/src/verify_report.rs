@@ -7,8 +7,7 @@
 //! What `flux verify` prints (cut 14): record lines, NDJSON, the summary and the notices. Pure: every function
 //! returns text, and `main` writes it.
 
-use crate::report::rel;
-use flux_core::verify::{Record, Summary};
+use flux_core::verify::{MOUNT_NOT_ENTERED, Outcome, Record, Summary};
 use serde::Serialize;
 use std::path::Path;
 
@@ -27,9 +26,71 @@ pub const GUARANTEES: &str = "What a pass guarantees:
 
 - A mount point the walker did not enter (no `--cross-filesystems`) is reported `match` for its presence only; its contents were NOT compared. The summary's `not_entered` count and the notice line say so, and exit 0 does not mean those contents were verified.";
 
+/// Append `s` with the backslash, the control characters (U+0000-U+001F, U+007F) escaped.
+fn escape_chars(s: &str, out: &mut String) {
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+}
+
+/// One path component, escaped (see `display_path`).
+#[cfg(unix)]
+fn escape_component(name: &std::ffi::OsStr, out: &mut String) {
+    use std::os::unix::ffi::OsStrExt;
+    let mut rest = name.as_bytes();
+    while !rest.is_empty() {
+        match std::str::from_utf8(rest) {
+            Ok(valid) => {
+                escape_chars(valid, out);
+                return;
+            }
+            Err(e) => {
+                let (valid, bad) = rest.split_at(e.valid_up_to());
+                escape_chars(std::str::from_utf8(valid).expect("valid up to"), out);
+                let n = e.error_len().unwrap_or(bad.len());
+                for b in &bad[..n] {
+                    out.push_str(&format!("\\x{b:02x}"));
+                }
+                rest = &bad[n..];
+            }
+        }
+    }
+}
+
+/// Non-unix platforms: the lossy text, then the control and backslash rules. The platform-specific branch can only be
+/// exercised by CI.
+#[cfg(not(unix))]
+fn escape_component(name: &std::ffi::OsStr, out: &mut String) {
+    escape_chars(&name.to_string_lossy(), out);
+}
+
+/// The path of a record as shown (design 6.6): components joined with `/`, `.` for the empty path. The identity for
+/// an ordinary name; otherwise `\\`, control characters (`\n`, `\r`, `\t`, else `\xNN`) and every byte that is not part of
+/// valid UTF-8 (`\xNN`, lowercase hex) are escaped, so two distinct names never print alike and a name never splits a
+/// line.
+pub fn display_path(path: &Path) -> String {
+    let mut out = String::new();
+    for (i, c) in path.components().enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        escape_component(c.as_os_str(), &mut out);
+    }
+    if out.is_empty() { ".".to_owned() } else { out }
+}
+
 /// `{outcome}: {path}`, then `: {CODE}` when there is a code and `: {detail}` when there is a detail.
 pub fn record_line(r: &Record) -> String {
-    let mut line = format!("{}: {}", r.outcome.as_str(), rel(&r.path));
+    let mut line = format!("{}: {}", r.outcome.as_str(), display_path(&r.path));
     if let Some(code) = r.code {
         line.push_str(": ");
         line.push_str(code.as_str());
@@ -53,7 +114,7 @@ struct RecordJson<'a> {
 /// One NDJSON line (no trailing newline).
 pub fn record_json(r: &Record) -> String {
     let j = RecordJson {
-        path: rel(&r.path),
+        path: display_path(&r.path),
         outcome: r.outcome.as_str(),
         kind: r.kind.as_str(),
         code: r.code.map(|c| c.as_str()),
@@ -124,8 +185,44 @@ pub fn summary_json(
 pub fn mount_notice_line(path: &Path) -> String {
     format!(
         "mount point not entered: {} (use --cross-filesystems to verify its contents)",
-        path.display()
+        display_path(path)
     )
+}
+
+/// The stderr warning for a destination-only directory that could not be listed: an `extra` record that has a code.
+pub fn unreadable_extra_warning_line(r: &Record) -> Option<String> {
+    (r.outcome == Outcome::Extra && r.code.is_some()).then(|| {
+        format!(
+            "warning: could not read destination-only directory: {}: {}",
+            display_path(&r.path),
+            r.detail
+        )
+    })
+}
+
+/// Where a record goes: at most one stdout line, and any stderr lines.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Routed {
+    pub stdout: Option<String>,
+    pub stderr: Vec<String>,
+}
+
+/// The routing of one record (design 6.6): `--json` prints every record to stdout, the human form hides `match`
+/// unless `verbose`; a mount point not entered and an unlistable destination-only directory also say so on stderr.
+pub fn route_record(r: &Record, json: bool, verbose: bool) -> Routed {
+    let stdout = if json {
+        Some(record_json(r))
+    } else if r.outcome != Outcome::Match || verbose {
+        Some(record_line(r))
+    } else {
+        None
+    };
+    let mut stderr = Vec::new();
+    if r.detail == MOUNT_NOT_ENTERED {
+        stderr.push(mount_notice_line(&r.path));
+    }
+    stderr.extend(unreadable_extra_warning_line(r));
+    Routed { stdout, stderr }
 }
 
 /// The stderr line before the walk when DEST does not exist.
@@ -139,7 +236,7 @@ pub fn dest_absent_line(dest: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flux_core::verify::{Kind, Outcome, Record, Summary};
+    use flux_core::verify::{Kind, MOUNT_NOT_ENTERED, Outcome, Record, Summary};
     use flux_fs::Code;
     use std::path::{Path, PathBuf};
 
@@ -235,5 +332,145 @@ mod tests {
             summary_line(&s),
             "verified: 3 matched, 1 missing, 0 mismatched, 0 extra, 0 unreadable; 9 bytes hashed; 2 mount points not entered"
         );
+    }
+
+    fn mount(path: &str) -> Record {
+        rec(path, Outcome::Match, None, MOUNT_NOT_ENTERED)
+    }
+
+    fn lost(path: &str) -> Record {
+        rec(path, Outcome::Extra, Some(Code::PermissionDenied), "Permission denied (os error 13)")
+    }
+
+    #[test]
+    fn a_mount_point_not_entered_always_gets_its_stderr_notice() {
+        let m = mount("m");
+        let notice = mount_notice_line(Path::new("m"));
+        let human = route_record(&m, false, false);
+        assert_eq!(human, Routed { stdout: None, stderr: vec![notice.clone()] });
+        let verbose = route_record(&m, false, true);
+        assert_eq!(
+            verbose.stdout.as_deref(),
+            Some(format!("match: m: {MOUNT_NOT_ENTERED}").as_str())
+        );
+        assert_eq!(verbose.stderr, std::slice::from_ref(&notice));
+        let json = route_record(&m, true, false);
+        assert_eq!(json.stdout, Some(record_json(&m)));
+        assert_eq!(json.stderr, [notice]);
+    }
+
+    #[test]
+    fn a_match_is_hidden_in_human_mode_unless_verbose_and_always_shown_as_json() {
+        let m = rec("a", Outcome::Match, None, "");
+        assert_eq!(route_record(&m, false, false), Routed { stdout: None, stderr: vec![] });
+        assert_eq!(route_record(&m, false, true).stdout.as_deref(), Some("match: a"));
+        assert_eq!(route_record(&m, true, false).stdout, Some(record_json(&m)));
+        let x = rec("b", Outcome::Missing, None, "");
+        assert_eq!(route_record(&x, false, false).stdout.as_deref(), Some("missing: b"));
+        assert!(route_record(&x, false, false).stderr.is_empty());
+    }
+
+    #[test]
+    fn an_unlistable_destination_only_directory_is_an_extra_line_plus_a_stderr_warning() {
+        let r = lost("lost+found");
+        let want = "warning: could not read destination-only directory: lost+found: Permission denied (os error 13)";
+        assert_eq!(unreadable_extra_warning_line(&r).as_deref(), Some(want));
+        let human = route_record(&r, false, false);
+        assert_eq!(
+            human.stdout.as_deref(),
+            Some("extra: lost+found: PERMISSION_DENIED: Permission denied (os error 13)")
+        );
+        assert_eq!(human.stderr, [want]);
+        assert_eq!(route_record(&r, true, false).stderr, [want]);
+        // A plain extra, and an unreadable that has a code, get no such warning.
+        assert_eq!(unreadable_extra_warning_line(&rec("e", Outcome::Extra, None, "")), None);
+        let u = rec("u", Outcome::Unreadable, Some(Code::PermissionDenied), "x");
+        assert_eq!(unreadable_extra_warning_line(&u), None);
+        assert!(route_record(&u, false, false).stderr.is_empty());
+    }
+
+    #[cfg(unix)]
+    fn raw(bytes: &[u8]) -> PathBuf {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+
+    #[test]
+    fn an_ordinary_name_is_shown_unchanged() {
+        for name in ["a", "sub/b.txt", "sp ace", "caf\u{e9}/\u{4e2d}", "a-b.c"] {
+            assert_eq!(display_path(Path::new(name)), name);
+        }
+        assert_eq!(display_path(Path::new("")), ".");
+        assert_eq!(display_path(Path::new(".")), ".");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn names_differing_only_in_an_invalid_byte_are_shown_differently() {
+        let a = raw(b"bad\xff\nname");
+        let b = raw(b"bad\xfe\nname");
+        assert_eq!(display_path(&a), "bad\\xff\\nname");
+        assert_eq!(display_path(&b), "bad\\xfe\\nname");
+        let ra = rec_path(a);
+        let rb = rec_path(b);
+        assert_ne!(record_line(&ra), record_line(&rb));
+        let ja: serde_json::Value = serde_json::from_str(&record_json(&ra)).unwrap();
+        let jb: serde_json::Value = serde_json::from_str(&record_json(&rb)).unwrap();
+        assert_ne!(ja["path"], jb["path"]);
+        assert_eq!(ja["path"], "bad\\xff\\nname");
+    }
+
+    #[cfg(unix)]
+    fn rec_path(path: PathBuf) -> Record {
+        Record { path, ..rec("", Outcome::Extra, None, "") }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_newline_or_other_control_character_never_splits_a_line() {
+        let r = rec_path(raw(b"a\nb\rc\td\x01e\x7ff/g\nh"));
+        let line = record_line(&r);
+        assert_eq!(line, "extra: a\\nb\\rc\\td\\x01e\\x7ff/g\\nh");
+        assert_eq!(line.lines().count(), 1);
+        let json = record_json(&r);
+        assert_eq!(json.lines().count(), 1);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["path"], "a\\nb\\rc\\td\\x01e\\x7ff/g\\nh");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_is_doubled_so_the_escaped_form_is_unambiguous() {
+        // A literal backslash-n and a real newline must not print alike.
+        let lit = rec_path(raw(b"a\\nb"));
+        let nl = rec_path(raw(b"a\nb"));
+        assert_eq!(record_line(&lit), "extra: a\\\\nb");
+        assert_eq!(record_line(&nl), "extra: a\\nb");
+        // serde escapes the backslash once more, which is correct: the value parses back to the display form.
+        let json = record_json(&lit);
+        assert!(json.contains("a\\\\\\\\nb"), "{json}");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["path"], "a\\\\nb");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_multibyte_name_cut_short_escapes_only_the_broken_bytes() {
+        // U+00E9 is C3 A9: the lone C3 is invalid, a valid pair after it is kept.
+        assert_eq!(display_path(&raw(b"x\xc3y\xc3\xa9")), "x\\xc3y\u{e9}");
+        assert_eq!(display_path(&raw(b"end\xe2\x82")), "end\\xe2\\x82");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_notices_use_the_escaped_path_too() {
+        let p = raw(b"m\nn");
+        assert_eq!(
+            mount_notice_line(&p),
+            "mount point not entered: m\\nn (use --cross-filesystems to verify its contents)"
+        );
+        let mut r = lost("x");
+        r.path = p;
+        assert!(unreadable_extra_warning_line(&r).unwrap().contains("m\\nn"));
     }
 }

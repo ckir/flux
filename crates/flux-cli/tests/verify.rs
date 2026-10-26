@@ -407,3 +407,133 @@ fn help_shows_the_exit_codes_and_the_guarantees() {
     assert!(text.contains("Exit 0: nothing missing, mismatched or unreadable; 1:"), "{text}");
     assert!(text.contains("What a pass guarantees:"), "{text}");
 }
+
+/// Restores a directory's mode on drop, so the tempdir can be removed even when an assertion fails.
+#[cfg(unix)]
+struct Restore(PathBuf);
+
+#[cfg(unix)]
+impl Drop for Restore {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_destination_only_directory_that_cannot_be_listed_is_extra_with_a_warning_and_exit_0() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = TempDir::new().unwrap();
+    let (src, dst) = pair_in(d.path());
+    let lost = dst.join("lost+found");
+    std::fs::create_dir(&lost).unwrap();
+    std::fs::write(lost.join("inside"), b"i").unwrap();
+    std::fs::set_permissions(&lost, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let _restore = Restore(lost.clone());
+    if std::fs::read_dir(&lost).is_ok() {
+        eprintln!("skipped: this user can list a mode-000 directory (root?)");
+        return;
+    }
+    let out = verify(&[&src, &dst]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        stdout(&out).lines().any(|l| l.starts_with("extra: lost+found: PERMISSION_DENIED: ")),
+        "{}",
+        stdout(&out)
+    );
+    assert!(
+        stderr(&out).contains("warning: could not read destination-only directory: lost+found: "),
+        "{}",
+        stderr(&out)
+    );
+    let out = flux().arg("verify").arg(&src).arg(&dst).arg("--json").output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let lines = ndjson(&out);
+    let extra = lines.iter().find(|l| l["path"] == "lost+found").expect("the record");
+    assert_eq!((extra["outcome"].as_str(), extra["kind"].as_str()), (Some("extra"), Some("dir")));
+    assert_eq!(extra["code"], "PERMISSION_DENIED");
+    let s = &lines.last().unwrap()["summary"];
+    assert_eq!(
+        (s["extra"].as_u64(), s["unreadable"].as_u64(), s["exit"].as_u64()),
+        (Some(1), Some(0), Some(0))
+    );
+    assert!(stderr(&out).contains("warning: could not read destination-only directory"));
+}
+
+#[test]
+fn a_refused_run_does_not_also_announce_a_missing_destination() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let inside = src.join("nope");
+    let out = verify(&[&src, &inside]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("nothing was compared"), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("does not exist"), "{}", stderr(&out));
+    assert!(out.stdout.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_closed_stdout_stops_the_run_with_exit_1_and_no_panic() {
+    use std::io::BufRead;
+    let d = TempDir::new().unwrap();
+    let (src, dst) = pair_in(d.path());
+    // About 600 KB of output: far more than a pipe holds, so the child is still writing when the reader leaves.
+    for i in 0..6000 {
+        std::fs::write(dst.join(format!("{}-{i:05}", "x".repeat(80))), b"").unwrap();
+    }
+    let mut child = flux()
+        .arg("verify")
+        .arg(&src)
+        .arg(&dst)
+        .arg("--verbose")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut reader = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut first = String::new();
+    reader.read_line(&mut first).unwrap();
+    assert!(first.starts_with("extra: ") || first.starts_with("match: "), "{first}");
+    drop(reader);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("verify kept running after its stdout was closed");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(status.code(), Some(1), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("panicked"), "{}", stderr(&out));
+    assert!(stderr(&out).is_empty(), "a broken pipe is silent: {}", stderr(&out));
+}
+
+#[cfg(unix)]
+#[test]
+fn awkward_names_are_unambiguous_and_never_split_a_line() {
+    use std::os::unix::ffi::OsStrExt;
+    let d = TempDir::new().unwrap();
+    let (src, dst) = pair_in(d.path());
+    for name in [&b"bad\xff\nname"[..], b"bad\xfe\nname", b"back\\slash", b"plain"] {
+        std::fs::write(dst.join(std::ffi::OsStr::from_bytes(name)), b"").unwrap();
+    }
+    let out = flux().arg("verify").arg(&src).arg(&dst).arg("--json").output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let lines = ndjson(&out);
+    let paths: Vec<&str> = lines
+        .iter()
+        .filter(|l| l["outcome"] == "extra")
+        .map(|l| l["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["back\\\\slash", "bad\\xfe\\nname", "bad\\xff\\nname", "plain"]);
+    let out = verify(&[&src, &dst]);
+    // Four extras and the summary: one line each, whatever the names hold.
+    assert_eq!(stdout(&out).lines().count(), 5, "{}", stdout(&out));
+}

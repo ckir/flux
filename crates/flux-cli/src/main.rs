@@ -736,7 +736,6 @@ fn cleanup(args: &CleanupArgs) -> u8 {
     exit_code::for_cleanup(&rep)
 }
 
-/// `flux verify` (cut 14): design 6.1 and 6.6. Records go to stdout; stderr carries only operational lines.
 /// The engine options the flags of `flux verify` select.
 fn verify_options(args: &VerifyArgs) -> flux_core::verify::VerifyOptions {
     use flux_core::walk::MountPolicy;
@@ -752,23 +751,20 @@ fn verify_options(args: &VerifyArgs) -> flux_core::verify::VerifyOptions {
     }
 }
 
+/// `flux verify` (cut 14): design 6.1 and 6.6. Records go to stdout; stderr carries only operational lines.
 fn verify(args: &VerifyArgs) -> u8 {
-    use flux_core::verify::{MOUNT_NOT_ENTERED, Outcome, VerifyError};
+    use flux_core::verify::VerifyError;
     // `--json` still prints a summary when the run stops before any walk with exit 1 (plan R7).
     let stopped = || {
         if args.json {
             let s = flux_core::verify::Summary::default();
-            let _ = writeln!(
-                std::io::stdout(),
-                "{}",
-                verify_report::summary_json(
-                    &args.source,
-                    &args.dest,
-                    "blake3",
-                    &s,
-                    exit_code::FAILED
-                )
-            );
+            stdout_or_exit(&verify_report::summary_json(
+                &args.source,
+                &args.dest,
+                "blake3",
+                &s,
+                exit_code::FAILED,
+            ));
         }
         exit_code::FAILED
     };
@@ -794,23 +790,25 @@ fn verify(args: &VerifyArgs) -> u8 {
     };
     let opts = verify_options(args);
     let mut sink = |r: flux_core::verify::Record| {
-        if args.json {
-            let _ = writeln!(std::io::stdout(), "{}", verify_report::record_json(&r));
-        } else if r.outcome != Outcome::Match || args.verbose {
-            let _ = writeln!(std::io::stdout(), "{}", verify_report::record_line(&r));
+        let routed = verify_report::route_record(&r, args.json, args.verbose);
+        if let Some(line) = &routed.stdout {
+            stdout_or_exit(line);
         }
-        if r.detail == MOUNT_NOT_ENTERED {
-            err(&verify_report::mount_notice_line(&r.path));
-        }
+        lines(routed.stderr);
     };
     let fs = flux_platform::StdFileSystem;
     let (src, dst, result) = match job {
         Job::Tree { src, dst } => {
-            if matches!(std::fs::metadata(&dst), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
-            {
-                err(&verify_report::dest_absent_line(&dst));
-            }
-            let result = flux_core::verify::verify_tree(&fs, &src, &dst, &opts, &mut sink);
+            // The engine says so after the root check passed, so a refused run prints no such line.
+            let mut on_absent = || err(&verify_report::dest_absent_line(&dst));
+            let result = flux_core::verify::verify_tree_notifying(
+                &fs,
+                &src,
+                &dst,
+                &opts,
+                &mut on_absent,
+                &mut sink,
+            );
             (src, dst, result)
         }
         Job::File { src, dst, .. } => {
@@ -831,8 +829,20 @@ fn verify(args: &VerifyArgs) -> u8 {
     } else {
         verify_report::summary_line(&summary)
     };
-    let _ = writeln!(std::io::stdout(), "{line}");
+    stdout_or_exit(&line);
     code
+}
+
+/// One line of `flux verify`'s output to stdout. A failed write (a closed pipe, a full disk) ends the run at once with
+/// exit 1: verify is read-only and holds no lock, and the verdict is unknown once its output is lost, so continuing to
+/// hash the tree would only waste the work. A broken pipe is the reader's choice and says nothing.
+fn stdout_or_exit(line: &str) {
+    if let Err(e) = writeln!(std::io::stdout(), "{line}") {
+        if e.kind() != std::io::ErrorKind::BrokenPipe {
+            err(&format!("error: cannot write to standard output: {e}"));
+        }
+        std::process::exit(i32::from(exit_code::FAILED));
+    }
 }
 
 /// Each line to stderr.
