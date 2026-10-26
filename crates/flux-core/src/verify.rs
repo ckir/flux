@@ -10,7 +10,10 @@
 //! as it is decided; the engine holds no list of records.
 
 use crate::walk::{DEFAULT_MAX_DEPTH, MountPolicy, Walk, WalkEvent, WalkOptions, walk_with};
-use flux_fs::{Code, DestinationRoot, FileSystem, FluxPathKey, FsError, HashAlgorithm, Links};
+use flux_fs::{
+    Code, DestinationRoot, DirHandle, FileSystem, FluxPathKey, FsError, HashAlgorithm, Links,
+    Safety,
+};
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 
@@ -126,8 +129,6 @@ type RawEvent = std::result::Result<WalkEvent, crate::walk::WalkError>;
 /// One root's walk, reduced to `Item`s, with one held item for the merge to look at.
 struct Side<'a, F: FileSystem> {
     walk: Option<Walk<'a, F>>,
-    /// The failure to open the walk at all: yielded once as an item for the root, then the side is done.
-    open_failure: Option<FsError>,
     /// One event of lookahead (a `Dir` is followed by its `MountSkipped`).
     peeked: Option<Option<RawEvent>>,
     held: Option<Item>,
@@ -146,21 +147,29 @@ impl<'a, F: FileSystem> Side<'a, F> {
         mounts: MountPolicy,
         skip_links: bool,
         control_state: bool,
-    ) -> Self {
-        let opened = walk_with(fs, root, WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts });
-        let (walk, open_failure) = match opened {
-            Ok(w) => (Some(w), None),
-            Err(e) => (None, Some(e)),
-        };
-        Side {
-            walk,
-            open_failure,
+    ) -> Result<Self, FsError> {
+        let walk = walk_with(fs, root, WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts })?;
+        Ok(Side {
+            walk: Some(walk),
             peeked: None,
             held: None,
             done: false,
             pruned: None,
             skip_links,
             control_state,
+        })
+    }
+
+    /// A side with nothing on it: the walk of a destination that does not exist (design 6.1).
+    fn empty() -> Self {
+        Side {
+            walk: None,
+            peeked: None,
+            held: None,
+            done: true,
+            pruned: None,
+            skip_links: false,
+            control_state: false,
         }
     }
 
@@ -218,10 +227,6 @@ impl<'a, F: FileSystem> Side<'a, F> {
 
     /// The next item the merge has not yet seen, skipping what a prune covers.
     fn advance(&mut self) -> Option<Item> {
-        if let Some(e) = self.open_failure.take() {
-            self.done = true;
-            return Some(Self::item(PathBuf::new(), Kind::Dir, false, Some(e)));
-        }
         loop {
             let Some(ev) = self.raw() else {
                 self.done = true;
@@ -350,10 +355,30 @@ pub fn verify_tree<F: DestinationRoot>(
     opts: &VerifyOptions,
     sink: &mut dyn FnMut(Record),
 ) -> Result<Summary, VerifyError> {
-    let mut a = Side::new(fs, src, opts.mounts, opts.links == Links::Skip, false);
-    let mut b = Side::new(fs, dst, opts.mounts, false, true);
-    let mut buf = vec![0u8; crate::copy::COPY_BUF_MAX];
     let mut out = Emitter { summary: Summary::default(), sink };
+    let dst_absent = match check_roots(fs, src, dst) {
+        Ok(absent) => absent,
+        Err(RootsCheck::Refused(reason)) => return Err(VerifyError::RefusedRoots { reason }),
+        Err(RootsCheck::Unreadable(e)) => {
+            return Ok(root_unreadable(out, &e.source.to_string(), e.code));
+        }
+    };
+    // The source walk is built first, then the destination's (a test pins the `read_dir` order).
+    let mut a = match Side::new(fs, src, opts.mounts, opts.links == Links::Skip, false) {
+        Ok(a) => a,
+        Err(e) => return Ok(root_unreadable(out, &format!("source: {}", e.source), e.code)),
+    };
+    let mut b = if dst_absent {
+        Side::empty()
+    } else {
+        match Side::new(fs, dst, opts.mounts, false, true) {
+            Ok(b) => b,
+            Err(e) => {
+                return Ok(root_unreadable(out, &format!("destination: {}", e.source), e.code));
+            }
+        }
+    };
+    let mut buf = vec![0u8; crate::copy::COPY_BUF_MAX];
     loop {
         let order = match (a.peek(), b.peek()) {
             (None, None) => break,
@@ -378,6 +403,70 @@ pub fn verify_tree<F: DestinationRoot>(
         }
     }
     Ok(out.summary)
+}
+
+/// Why the root check stopped the run.
+enum RootsCheck {
+    /// The roots are the same object or nested: the reason, for `VerifyError::RefusedRoots`.
+    Refused(String),
+    /// A root could not be examined: reported as the root record `.`.
+    Unreadable(FsError),
+}
+
+const REFUSED_DST_IN_SRC: &str =
+    "the destination is the source or lies inside it; nothing was compared";
+const REFUSED_SRC_IN_DST: &str = "the source lies inside the destination; nothing was compared";
+const BY_PATH_ALONE: &str = " (decided by path alone: a root's identity could not be confirmed)";
+
+fn refused_by_containment(e: crate::copy::CopyError, reason: &str) -> RootsCheck {
+    if e.code() == Code::SafetyRejected {
+        RootsCheck::Refused(reason.to_string())
+    } else {
+        RootsCheck::Unreadable(e.cause)
+    }
+}
+
+/// The root check (design 6.1), run before any directory is listed or file opened. `Ok(true)` when the destination
+/// does not exist and is to be treated as empty.
+fn check_roots<F: DestinationRoot>(fs: &F, src: &Path, dst: &Path) -> Result<bool, RootsCheck> {
+    use crate::tree::{containment, lexically_within, preflight};
+    let d = match fs.destination_root(dst) {
+        Ok(d) => d,
+        Err(e) if e.source.kind() == std::io::ErrorKind::NotFound => {
+            if lexically_within(dst, src) {
+                return Err(RootsCheck::Refused(REFUSED_DST_IN_SRC.to_string()));
+            }
+            return Ok(true);
+        }
+        Err(e) => return Err(RootsCheck::Unreadable(e)),
+    };
+    let s = fs.destination_root(src).map_err(RootsCheck::Unreadable)?;
+    let (si, di) = match (s.identity(), d.identity()) {
+        (Ok(si), Ok(di)) => (si, di),
+        (Err(e), _) | (_, Err(e)) => return Err(RootsCheck::Unreadable(e)),
+    };
+    let mut out = crate::tree::TreeOutcome::default();
+    preflight(si, di, Safety::Default, &mut out.warnings)
+        .map_err(|_| RootsCheck::Refused(REFUSED_DST_IN_SRC.to_string()))?;
+    containment(fs, src, &d, dst, Safety::Default, &mut out)
+        .map_err(|e| refused_by_containment(e, REFUSED_DST_IN_SRC))?;
+    containment(fs, dst, &s, src, Safety::Default, &mut out)
+        .map_err(|e| refused_by_containment(e, REFUSED_SRC_IN_DST))?;
+    if out.containment_degraded.is_some() {
+        if lexically_within(dst, src) {
+            return Err(RootsCheck::Refused(format!("{REFUSED_DST_IN_SRC}{BY_PATH_ALONE}")));
+        }
+        if lexically_within(src, dst) {
+            return Err(RootsCheck::Refused(format!("{REFUSED_SRC_IN_DST}{BY_PATH_ALONE}")));
+        }
+    }
+    Ok(false)
+}
+
+/// The run ends at the root record `.` (design 6.6): one `unreadable`, nothing walked.
+fn root_unreadable(mut out: Emitter<'_>, detail: &str, code: Code) -> Summary {
+    out.unreadable(PathBuf::from("."), Kind::Dir, code, detail.to_string());
+    out.summary
 }
 
 /// An item present on one side only: `missing` or `extra`, or `unreadable` (pruning both sides) when its walk failed.
@@ -487,7 +576,7 @@ mod tests {
     use super::*;
     use crate::copy::COPY_BUF_MAX;
     use crate::fault_fs::FaultFs;
-    use flux_fs::LinkKind;
+    use flux_fs::{LinkKind, MountRoot};
 
     fn opts() -> VerifyOptions {
         VerifyOptions {
@@ -704,6 +793,8 @@ mod tests {
     }
 
     const ZEROS: &str = "00000000000000000000000000000000";
+    /// 32 hex characters, but not lowercase: not an operation id, so user data.
+    const UPPER: &str = "ABCDEFABCDEFABCDEFABCDEFABCDEFAB";
 
     fn mm(p: &str, k: Kind, d: &str) -> Row {
         (p.to_string(), Outcome::Mismatched, k, Some(Code::VerifyMismatch), d.to_string())
@@ -799,7 +890,6 @@ mod tests {
             ("a", Outcome::Unreadable, Kind::File, Some(classified))
         );
         assert!(!rows[0].4.is_empty());
-        assert!(!fs.called("open_read(/d/a)"));
         assert_eq!(
             (rows[1].0.as_str(), rows[1].1, rows[1].2, rows[1].3),
             ("b", Outcome::Unreadable, Kind::File, Some(Code::PermissionDenied))
@@ -845,6 +935,8 @@ mod tests {
                 (".flux-partial.txt", b"u"),
                 ("x.flux-partial.1", b"u"),
                 ("sub/.flux", b"u"),
+                ("sub/.flux-root.lock", b"u"),
+                (format!("a.flux-partial.{UPPER}").as_str(), b"u"),
                 (format!("sub/b.flux-partial.{ZEROS}").as_str(), b"p"),
             ],
         );
@@ -854,15 +946,27 @@ mod tests {
             rows,
             vec![
                 rec(".flux-partial.txt", Outcome::Extra, Kind::File),
+                rec(format!("a.flux-partial.{UPPER}").as_str(), Outcome::Extra, Kind::File),
                 rec("sub", Outcome::Match, Kind::Dir),
                 rec("sub/.flux", Outcome::Extra, Kind::File),
+                rec("sub/.flux-root.lock", Outcome::Extra, Kind::File),
                 rec("x.flux-partial.1", Outcome::Extra, Kind::File),
             ]
         );
-        assert_eq!((s.extra, s.matched), (3, 1));
+        assert_eq!((s.extra, s.matched), (5, 1));
         // The brief also asked for `!fs.called("read_dir(/d/.flux")`. `Walk::enter` lists a directory before it yields
         // the `Dir` event (`walk.rs:452`), so the subtree is dropped from the records but is still listed; asserting
         // otherwise needs a walker change (reported, not bent here).
+    }
+
+    #[test]
+    fn a_top_level_dot_flux_file_at_the_destination_is_user_data() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[]);
+        tree(&fs, "/d", &[], &[(".flux", b"u")]);
+        let (rows, s) = run(&fs, "/s", "/d", &opts());
+        assert_eq!(rows, vec![rec(".flux", Outcome::Extra, Kind::File)]);
+        assert_eq!(s.extra, 1);
     }
 
     #[test]
@@ -880,5 +984,181 @@ mod tests {
             ]
         );
         assert_eq!((s.missing, s.extra), (2, 0));
+    }
+
+    const REFUSE_A: &str = "the destination is the source or lies inside it; nothing was compared";
+    const REFUSE_B: &str = "the source lies inside the destination; nothing was compared";
+    const DEGRADED: &str = " (decided by path alone: a root's identity could not be confirmed)";
+
+    /// Run a verify that must be refused; no directory was listed and no file opened.
+    fn refused(fs: &FaultFs, src: &str, dst: &str) -> String {
+        let mut records = 0;
+        let r = verify_tree(fs, Path::new(src), Path::new(dst), &opts(), &mut |_| records += 1);
+        let Err(VerifyError::RefusedRoots { reason }) = r else {
+            panic!("expected a refusal, got {r:?} for {src} {dst}")
+        };
+        assert_eq!(records, 0);
+        assert!(!fs.called("read_dir("));
+        assert!(!fs.called("open_read("));
+        reason
+    }
+
+    #[test]
+    fn dest_equal_to_source_is_refused_before_any_read() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("a", b"x")]);
+        assert_eq!(refused(&fs, "/s", "/s"), REFUSE_A);
+    }
+
+    #[test]
+    fn dest_inside_source_and_source_inside_dest_are_refused() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &["inner"], &[("a", b"x")]);
+        assert_eq!(refused(&fs, "/s", "/s/inner"), REFUSE_A);
+        assert_eq!(refused(&fs, "/s/inner", "/s"), REFUSE_B);
+    }
+
+    #[test]
+    fn an_alias_of_the_source_is_refused_by_path_or_by_identity() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("a", b"x")]);
+        tree(&fs, "/alias", &[], &[]);
+        fs.set_canonical_path("/alias", "/s");
+        // Without this the fake's minted identity for /alias differs from /s's, and `canonical_of` rightly fails with
+        // "the path reported for an open directory now holds a different object" (`tree.rs:4333`) before the lexical
+        // test runs. An alias whose identity is not Strong is the case this branch exists for.
+        fs.set_identity("/alias", flux_fs::FileIdentity::Unavailable);
+        assert_eq!(refused(&fs, "/s", "/alias"), REFUSE_A);
+
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("a", b"x")]);
+        tree(&fs, "/alias2", &[], &[]);
+        let id = fs.metadata(Path::new("/s")).unwrap().identity;
+        fs.set_identity("/alias2", id);
+        assert_eq!(refused(&fs, "/s", "/alias2"), REFUSE_A);
+    }
+
+    #[test]
+    fn a_degraded_root_falls_back_to_the_lexical_test_and_says_so() {
+        let unsupported = std::io::ErrorKind::Unsupported;
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &["inner"], &[]);
+        fs.fail_canonical_path_of("/s/inner", Code::IoError, unsupported);
+        assert_eq!(refused(&fs, "/s", "/s/inner"), format!("{REFUSE_A}{DEGRADED}"));
+
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("a", b"x")]);
+        tree(&fs, "/d", &[], &[("a", b"x")]);
+        fs.fail_canonical_path_of("/d", Code::IoError, unsupported);
+        let (rows, s) = run(&fs, "/s", "/d", &opts());
+        assert_eq!(rows, vec![rec("a", Outcome::Match, Kind::File)]);
+        assert_eq!(s.matched, 1);
+        assert!(!s.failed());
+    }
+
+    #[test]
+    fn siblings_with_a_common_prefix_are_not_refused() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        tree(&fs, "/d/a", &[], &[("f", b"x")]);
+        tree(&fs, "/d/ab", &[], &[("f", b"x")]);
+        let (rows, s) = run(&fs, "/d/a", "/d/ab", &opts());
+        assert_eq!(rows, vec![rec("f", Outcome::Match, Kind::File)]);
+        assert_eq!(s.matched, 1);
+    }
+
+    #[test]
+    fn an_absent_destination_is_an_empty_one_and_nothing_is_created() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &["sub"], &[("a", b"x"), ("sub/b", b"y")]);
+        let before = fs.calls().len();
+        let (rows, s) = run(&fs, "/s", "/nope", &opts());
+        assert_eq!(
+            rows,
+            vec![
+                rec("a", Outcome::Missing, Kind::File),
+                rec("sub", Outcome::Missing, Kind::Dir),
+                rec("sub/b", Outcome::Missing, Kind::File),
+            ]
+        );
+        assert_eq!(s.missing, 3);
+        assert!(s.failed());
+        assert_no_writes(&fs, before);
+        assert!(!fs.exists("/nope"));
+    }
+
+    #[test]
+    fn an_absent_destination_inside_the_source_is_still_refused() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("a", b"x")]);
+        assert_eq!(refused(&fs, "/s", "/s/nope"), REFUSE_A);
+    }
+
+    #[test]
+    fn an_unlistable_destination_root_is_one_unreadable_record() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("a", b"x")]);
+        tree(&fs, "/d", &[], &[("a", b"x")]);
+        // The source walk is built first (read_dir 1); the root check lists nothing, so read_dir(/d) is the 2nd.
+        fs.fail_nth("read_dir", 2, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+        let (rows, s) = run(&fs, "/s", "/d", &opts());
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            (rows[0].0.as_str(), rows[0].1, rows[0].2, rows[0].3),
+            (".", Outcome::Unreadable, Kind::Dir, Some(Code::PermissionDenied))
+        );
+        assert!(rows[0].4.starts_with("destination: "), "{}", rows[0].4);
+        assert!(fs.called("read_dir(/d)"));
+        assert_eq!(s.unreadable, 1);
+        assert!(!fs.called("open_read("));
+    }
+
+    #[test]
+    fn a_mount_point_on_either_side_is_matched_once_and_pruned() {
+        let o = VerifyOptions { mounts: MountPolicy::Stay, ..opts() };
+        let want =
+            vec![("m".to_string(), Outcome::Match, Kind::Dir, None, MOUNT_NOT_ENTERED.to_string())];
+
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &["m"], &[("m/x", b"x")]);
+        tree(&fs, "/d", &["m"], &[]);
+        fs.set_mount_root("/d/m", MountRoot::Yes);
+        let (rows, s) = run(&fs, "/s", "/d", &o);
+        assert_eq!(rows, want);
+        assert_eq!((s.matched, s.not_entered, s.missing), (1, 1, 0));
+
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &["m"], &[]);
+        tree(&fs, "/d", &["m"], &[("m/x", b"x")]);
+        fs.set_mount_root("/s/m", MountRoot::Yes);
+        let (rows, s) = run(&fs, "/s", "/d", &o);
+        assert_eq!(rows, want);
+        assert_eq!((s.matched, s.not_entered, s.extra), (1, 1, 0));
+    }
+
+    #[test]
+    fn a_mount_point_present_on_one_side_only_is_not_a_match() {
+        let o = VerifyOptions { mounts: MountPolicy::Stay, ..opts() };
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &["m"], &[]);
+        tree(&fs, "/d", &[], &[]);
+        fs.set_mount_root("/s/m", MountRoot::Yes);
+        let (rows, s) = run(&fs, "/s", "/d", &o);
+        assert_eq!(rows, vec![rec("m", Outcome::Missing, Kind::Dir)]);
+        assert_eq!(s.not_entered, 0);
+    }
+
+    #[test]
+    fn cross_filesystems_enters_mount_points() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &["m"], &[("m/x", b"x")]);
+        tree(&fs, "/d", &["m"], &[("m/x", b"x")]);
+        fs.set_mount_root("/d/m", MountRoot::Yes);
+        let (rows, s) = run(&fs, "/s", "/d", &opts());
+        assert_eq!(
+            rows,
+            vec![rec("m", Outcome::Match, Kind::Dir), rec("m/x", Outcome::Match, Kind::File)]
+        );
+        assert_eq!((s.matched, s.not_entered), (2, 0));
     }
 }
