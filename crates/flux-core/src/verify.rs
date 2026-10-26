@@ -11,8 +11,8 @@
 
 use crate::walk::{DEFAULT_MAX_DEPTH, MountPolicy, Walk, WalkEvent, WalkOptions, walk_with};
 use flux_fs::{
-    Code, DestinationRoot, DirHandle, FileSystem, FluxPathKey, FsError, HashAlgorithm, Links,
-    Safety,
+    Code, DestinationRoot, DirHandle, FileSystem, FileType, FluxPathKey, FsError, HashAlgorithm,
+    Links, Safety,
 };
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
@@ -521,54 +521,121 @@ fn pair<F: FileSystem>(
                 b.prune(&x.path);
             }
         }
-        (Kind::File, Kind::File) => {
+        (k1, k2) => {
             let (src, dst) = (roots.0.join(&x.path), roots.1.join(&x.path));
+            compare_pair(fs, out, buf, &x.path, (k1, k2), (&src, &dst));
+        }
+    }
+}
+
+/// Two paired entries that are not both directories, by the design 6.3 table: shared by `verify_tree` and
+/// `verify_file`. `path` is the record's path; `src` and `dst` are the entries to read.
+fn compare_pair<F: FileSystem>(
+    fs: &F,
+    out: &mut Emitter<'_>,
+    buf: &mut [u8],
+    path: &Path,
+    kinds: (Kind, Kind),
+    paths: (&Path, &Path),
+) {
+    let (src, dst) = paths;
+    match kinds {
+        (Kind::File, Kind::File) => {
             let mut hashed = 0;
-            let verdict = compare_files(fs, &src, &dst, buf, &mut hashed);
+            let verdict = compare_files(fs, src, dst, buf, &mut hashed);
             out.summary.bytes_hashed += hashed;
             match verdict {
-                Ok(None) => out.alone(x, Outcome::Match),
+                Ok(None) => out.emit(record(path, Outcome::Match, Kind::File, None, "")),
                 Ok(Some(detail)) => out.emit(Record {
-                    path: x.path.clone(),
+                    path: path.to_path_buf(),
                     outcome: Outcome::Mismatched,
-                    kind: x.kind,
+                    kind: Kind::File,
                     code: Some(Code::VerifyMismatch),
                     detail,
                 }),
-                Err((code, detail)) => out.unreadable(x.path.clone(), x.kind, code, detail),
+                Err((code, detail)) => out.unreadable(path.to_path_buf(), Kind::File, code, detail),
             }
         }
         (Kind::Symlink, Kind::Symlink) => {
-            let (src, dst) = (roots.0.join(&x.path), roots.1.join(&x.path));
-            let payloads = fs.read_link(&src).and_then(|s| Ok((s, fs.read_link(&dst)?)));
+            let payloads = fs.read_link(src).and_then(|s| Ok((s, fs.read_link(dst)?)));
             match payloads {
                 Ok((s, d)) if s.payload.as_encoded_bytes() == d.payload.as_encoded_bytes() => {
-                    out.alone(x, Outcome::Match);
+                    out.emit(record(path, Outcome::Match, Kind::Symlink, None, ""));
                 }
                 Ok(_) => out.emit(Record {
-                    path: x.path.clone(),
+                    path: path.to_path_buf(),
                     outcome: Outcome::Mismatched,
                     kind: Kind::Symlink,
                     code: Some(Code::VerifyMismatch),
                     detail: "symlink payloads differ".to_string(),
                 }),
-                Err(e) => out.unreadable(x.path.clone(), x.kind, e.code, e.source.to_string()),
+                Err(e) => {
+                    out.unreadable(path.to_path_buf(), Kind::Symlink, e.code, e.source.to_string());
+                }
             }
         }
         (Kind::Other, Kind::Other) => out.unreadable(
-            x.path.clone(),
+            path.to_path_buf(),
             Kind::Other,
             Code::SpecialFileUnsupported,
             SPECIAL_NOT_COMPARED.to_string(),
         ),
         (k1, k2) => out.emit(Record {
-            path: x.path.clone(),
+            path: path.to_path_buf(),
             outcome: Outcome::Mismatched,
             kind: k1,
             code: Some(Code::VerifyMismatch),
             detail: format!("source {}, destination {}", k1.as_str(), k2.as_str()),
         }),
     }
+}
+
+fn record(path: &Path, outcome: Outcome, kind: Kind, code: Option<Code>, detail: &str) -> Record {
+    Record { path: path.to_path_buf(), outcome, kind, code, detail: detail.to_string() }
+}
+
+fn file_kind(t: FileType) -> Kind {
+    match t {
+        FileType::File => Kind::File,
+        FileType::Dir => Kind::Dir,
+        FileType::Symlink => Kind::Symlink,
+        FileType::Other => Kind::Other,
+    }
+}
+
+/// One source file against one destination path (the CLI has already applied section 4.1: `dst` is `DEST` or
+/// `DEST/<name>`). Exactly one record, whose `path` is `dst.file_name()` (R4). No root check (design 6.1: "a FILE
+/// verify is not subject"). `opts.links` is ignored: a symlink SOURCE never reaches the engine.
+pub fn verify_file<F: FileSystem>(
+    fs: &F,
+    src: &Path,
+    dst: &Path,
+    _opts: &VerifyOptions,
+    sink: &mut dyn FnMut(Record),
+) -> Result<Summary, VerifyError> {
+    let mut out = Emitter { summary: Summary::default(), sink };
+    let name = PathBuf::from(dst.file_name().unwrap_or(dst.as_os_str()));
+    let src_type = match fs.metadata(src) {
+        Ok(m) => file_kind(m.file_type),
+        Err(e) => {
+            out.unreadable(name, Kind::File, e.code, e.source.to_string());
+            return Ok(out.summary);
+        }
+    };
+    let dst_type = match fs.metadata(dst) {
+        Ok(m) => file_kind(m.file_type),
+        Err(e) if e.source.kind() == std::io::ErrorKind::NotFound => {
+            out.emit(record(&name, Outcome::Missing, src_type, None, ""));
+            return Ok(out.summary);
+        }
+        Err(e) => {
+            out.unreadable(name, src_type, e.code, e.source.to_string());
+            return Ok(out.summary);
+        }
+    };
+    let mut buf = vec![0u8; crate::copy::COPY_BUF_MAX];
+    compare_pair(fs, &mut out, &mut buf, &name, (src_type, dst_type), (src, dst));
+    Ok(out.summary)
 }
 
 #[cfg(test)]
@@ -1160,5 +1227,112 @@ mod tests {
             vec![rec("m", Outcome::Match, Kind::Dir), rec("m/x", Outcome::Match, Kind::File)]
         );
         assert_eq!((s.matched, s.not_entered), (2, 0));
+    }
+
+    fn run_file(fs: &FaultFs, src: &str, dst: &str) -> (Vec<Row>, Summary) {
+        let mut rows = Vec::new();
+        let s = verify_file(fs, Path::new(src), Path::new(dst), &opts(), &mut |r| {
+            rows.push(row(&r));
+        })
+        .unwrap();
+        (rows, s)
+    }
+
+    #[test]
+    fn verify_file_matches_mismatches_and_misses() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("a", b"alpha")]);
+        tree(&fs, "/d", &[], &[("a", b"alpha")]);
+        let before = fs.calls().len();
+        let (rows, s) = run_file(&fs, "/s/a", "/d/a");
+        assert_eq!(rows, vec![rec("a", Outcome::Match, Kind::File)]);
+        assert_eq!(s, Summary { matched: 1, bytes_hashed: 10, ..Summary::default() });
+        assert_no_writes(&fs, before);
+
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("a", b"alpha")]);
+        tree(&fs, "/d", &[], &[("a", b"bravo")]);
+        let before = fs.calls().len();
+        let (rows, s) = run_file(&fs, "/s/a", "/d/a");
+        assert_eq!(rows.len(), 1);
+        let (path, outcome, kind, code, detail) = &rows[0];
+        assert_eq!(
+            (path.as_str(), *outcome, *kind, *code),
+            ("a", Outcome::Mismatched, Kind::File, Some(Code::VerifyMismatch))
+        );
+        let parts: Vec<&str> = detail.split(" != ").collect();
+        assert_eq!(parts.len(), 2, "{detail}");
+        assert!(parts.iter().all(|p| p.len() == 8 && p.chars().all(|c| c.is_ascii_hexdigit())));
+        assert_ne!(parts[0], parts[1]);
+        assert_eq!((s.mismatched, s.bytes_hashed), (1, 10));
+        assert!(s.failed());
+        assert_no_writes(&fs, before);
+
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("a", b"alpha")]);
+        tree(&fs, "/d", &[], &[]);
+        let before = fs.calls().len();
+        let (rows, s) = run_file(&fs, "/s/a", "/d/a");
+        assert_eq!(rows, vec![rec("a", Outcome::Missing, Kind::File)]);
+        assert_eq!((s.missing, s.bytes_hashed), (1, 0));
+        assert!(!fs.called("open_read("));
+        assert_no_writes(&fs, before);
+    }
+
+    #[test]
+    fn verify_file_against_a_directory_or_a_special_is_a_mismatch_or_unreadable() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("a", b"alpha")]);
+        tree(&fs, "/d", &["a"], &[]);
+        let (rows, s) = run_file(&fs, "/s/a", "/d/a");
+        assert_eq!(
+            rows,
+            vec![(
+                "a".to_string(),
+                Outcome::Mismatched,
+                Kind::File,
+                Some(Code::VerifyMismatch),
+                "source file, destination dir".to_string()
+            )]
+        );
+        assert_eq!(s.mismatched, 1);
+        assert!(!fs.called("open_read("));
+
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[]);
+        tree(&fs, "/d", &[], &[]);
+        fs.add_special("/s/a");
+        fs.add_special("/d/a");
+        let (rows, s) = run_file(&fs, "/s/a", "/d/a");
+        assert_eq!(
+            rows,
+            vec![(
+                "a".to_string(),
+                Outcome::Unreadable,
+                Kind::Other,
+                Some(Code::SpecialFileUnsupported),
+                SPECIAL_NOT_COMPARED.to_string()
+            )]
+        );
+        assert_eq!(s.unreadable, 1);
+        assert!(!fs.called("open_read("));
+    }
+
+    #[test]
+    fn verify_file_reports_a_source_read_error_without_opening_the_destination() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("a", b"alpha")]);
+        tree(&fs, "/d", &[], &[("a", b"alpha")]);
+        fs.fail_read_nth("/s/a", 1, std::io::ErrorKind::Other);
+        let (rows, s) = run_file(&fs, "/s/a", "/d/a");
+        let classified = FsError::classify(&std::io::Error::from(std::io::ErrorKind::Other));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (rows[0].0.as_str(), rows[0].1, rows[0].2, rows[0].3),
+            ("a", Outcome::Unreadable, Kind::File, Some(classified))
+        );
+        assert!(!rows[0].4.is_empty());
+        assert!(!fs.called("open_read(/d/a)"));
+        assert_eq!((s.unreadable, s.bytes_hashed), (1, 0));
     }
 }
