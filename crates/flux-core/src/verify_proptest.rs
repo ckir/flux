@@ -15,6 +15,9 @@ use crate::fault_fs::FaultFs;
 use crate::verify::{Kind, MOUNT_NOT_ENTERED, Outcome, Record, SPECIAL_NOT_COMPARED, Summary};
 use crate::walk::MountPolicy;
 use flux_fs::{Code, FileSystem, FluxPathKey, LinkKind, Links, MountRoot};
+use proptest::collection::vec;
+use proptest::prelude::{Just, Strategy, any, prop_oneof};
+use proptest::sample::select;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -242,12 +245,11 @@ fn digest_hex(len: usize, fill: u8) -> String {
     h.finalize().to_hex()
 }
 
-/// The non-streaming reference for `verify_tree` (design 6.5): the records and the summary a case must produce.
-fn reference(case: &Case) -> (Vec<Record>, Summary) {
+/// Steps 0 to 2 of the reference (design 6.5): the two trees as the walker and verify's filters leave them.
+fn filtered_sides(case: &Case) -> (BTreeMap<PathBuf, Spec>, BTreeMap<PathBuf, Spec>) {
     let (mut src, mut dst) = sides(case);
-    let stay = case.mounts == MountPolicy::Stay;
     // Step 0: the walker view.
-    if stay {
+    if case.mounts == MountPolicy::Stay {
         for side in [&mut src, &mut dst] {
             let mounts: Vec<PathBuf> = side
                 .iter()
@@ -263,6 +265,13 @@ fn reference(case: &Case) -> (Vec<Record>, Summary) {
     }
     // Step 2: destination control state.
     dst.retain(|p, s| !is_control(p, s));
+    (src, dst)
+}
+
+/// The non-streaming reference for `verify_tree` (design 6.5): the records and the summary a case must produce.
+fn reference(case: &Case) -> (Vec<Record>, Summary) {
+    let (src, dst) = filtered_sides(case);
+    let stay = case.mounts == MountPolicy::Stay;
     // Step 3: key both sides.
     let key = |side: BTreeMap<PathBuf, Spec>| -> Keyed {
         side.into_iter().map(|(p, s)| (key_of(&p), (p, s))).collect()
@@ -380,6 +389,201 @@ fn reference(case: &Case) -> (Vec<Record>, Summary) {
         out.push(record);
     }
     (out, sum)
+}
+
+// ---- The case generator (design 6.3) ----
+
+const LOCK: &str = ".flux-root.lock";
+/// The ordinary name vocabulary; `.flux-root.lock` joins it only as a `File` name (see `entry`).
+const PLAIN_NAMES: [&str; 7] = ["a", "a-b", "a.txt", "a0", "b", "sub", "z"];
+/// Controlled hex ids, so a partial-file name stays a `&'static str`.
+macro_rules! partial {
+    ($head:literal, $id:literal) => {
+        concat!($head, ".flux-partial.", $id)
+    };
+}
+const PARTIAL_32: [&str; 3] = [
+    partial!("a", "0123456789abcdef0123456789abcdef"),
+    partial!("b", "0123456789abcdef0123456789abcdef"),
+    partial!("sub", "0123456789abcdef0123456789abcdef"),
+];
+const PARTIAL_31: [&str; 3] = [
+    partial!("a", "0123456789abcdef0123456789abcde"),
+    partial!("b", "0123456789abcdef0123456789abcde"),
+    partial!("sub", "0123456789abcdef0123456789abcde"),
+];
+const PARTIAL_UPPER: [&str; 3] = [
+    partial!("a", "0123456789ABCDEF0123456789ABCDEF"),
+    partial!("b", "0123456789ABCDEF0123456789ABCDEF"),
+    partial!("sub", "0123456789ABCDEF0123456789ABCDEF"),
+];
+const PARTIAL_NO_HEAD: &str = ".flux-partial.0123456789abcdef0123456789abcdef";
+/// How many control-state shapes `control` knows.
+const CONTROL_SHAPES: usize = 12;
+
+fn which() -> impl Strategy<Value = Which> {
+    prop_oneof![Just(Which::Source), Just(Which::Dest)]
+}
+
+fn file_spec() -> impl Strategy<Value = Spec> {
+    // The large file is one in eight.
+    let len = prop_oneof![
+        1 => Just(crate::copy::COPY_BUF_MAX + 1),
+        7 => select(&[0usize, 1, 17][..]),
+    ];
+    (len, 0u8..4).prop_map(|(len, fill)| Spec::File { len, fill })
+}
+
+fn dir_spec() -> impl Strategy<Value = Spec> {
+    let mount = prop_oneof![
+        1 => Just(MountRoot::Yes),
+        2 => Just(MountRoot::No),
+        1 => Just(MountRoot::Unknown),
+    ];
+    let list_error = prop_oneof![
+        3 => Just(None),
+        1 => select(&[Code::PermissionDenied, Code::IoError][..]).prop_map(Some),
+    ];
+    (mount, list_error).prop_map(|(mount, list_error)| Spec::Dir { mount, list_error })
+}
+
+fn symlink_spec() -> impl Strategy<Value = Spec> {
+    select(&["t", "u"][..]).prop_map(|payload| Spec::Symlink { payload })
+}
+
+fn spec() -> impl Strategy<Value = Spec> {
+    prop_oneof![
+        8 => file_spec(),
+        30 => dir_spec(),
+        3 => symlink_spec(),
+        1 => Just(Spec::Other),
+    ]
+}
+
+/// A name with the spec it may carry: the lock name is only ever a `File`.
+fn entry() -> impl Strategy<Value = (&'static str, Spec)> {
+    prop_oneof![
+        15 => (select(&PLAIN_NAMES[..]), spec()),
+        1 => (Just(LOCK), file_spec()),
+    ]
+}
+
+/// Place raw entries into a base: directories first, each entry under the root or an earlier directory.
+fn place(mut raw: Vec<(usize, (&'static str, Spec))>) -> Vec<(RelPath, Spec)> {
+    raw.sort_by_key(|(_, (_, spec))| !matches!(spec, Spec::Dir { .. }));
+    let mut dirs: Vec<RelPath> = Vec::new();
+    let mut base = Vec::new();
+    for (pick, (name, spec)) in raw {
+        let slot = pick % (dirs.len() + 1);
+        let mut rel = if slot == 0 { Vec::new() } else { dirs[slot - 1].clone() };
+        rel.push(name);
+        if matches!(spec, Spec::Dir { .. }) && rel.len() < 4 {
+            dirs.push(rel.clone());
+        }
+        base.push((rel, spec));
+    }
+    base
+}
+
+fn base() -> impl Strategy<Value = Vec<(RelPath, Spec)>> {
+    vec((any::<usize>(), entry()), 3..=10).prop_map(place)
+}
+
+fn edit() -> impl Strategy<Value = Edit> {
+    prop_oneof![
+        8 => Just(Edit::KeepBoth),
+        1 => which().prop_map(Edit::EditContent),
+        4 => (which(), spec()).prop_map(|(w, s)| Edit::ChangeKind(w, s)),
+        2 => Just(Edit::DropFromDest),
+        1 => Just(Edit::DropFromSource),
+    ]
+}
+
+/// Where an extra may go: the root (the empty path) or any base `Dir` with room for a child.
+fn parents_of(base: &[(RelPath, Spec)]) -> Vec<RelPath> {
+    let mut parents: Vec<RelPath> = vec![Vec::new()];
+    for (rel, spec) in base {
+        if matches!(spec, Spec::Dir { .. }) && rel.len() < 4 && !parents.contains(rel) {
+            parents.push(rel.clone());
+        }
+    }
+    parents
+}
+
+fn child(parent: &RelPath, name: &'static str) -> RelPath {
+    let mut rel = parent.clone();
+    rel.push(name);
+    rel
+}
+
+type Extra = (Which, RelPath, Spec);
+
+/// An ordinary extra: either side, an ordinary name, any spec.
+fn ordinary_extra(parents: Vec<RelPath>) -> impl Strategy<Value = Vec<Extra>> {
+    (which(), select(parents), entry())
+        .prop_map(|(w, parent, (name, spec))| vec![(w, child(&parent, name), spec)])
+}
+
+/// A control-state extra on the destination: the shapes verify must hide, and their near misses.
+fn control(parent: &RelPath, head: usize, shape: usize) -> Vec<Extra> {
+    let f = Spec::File { len: 1, fill: 9 };
+    let d = Spec::Dir { mount: MountRoot::No, list_error: None };
+    let l = Spec::Symlink { payload: "t" };
+    let at = |name| child(parent, name);
+    let dest = |rel, spec| (Which::Dest, rel, spec);
+    match shape % CONTROL_SHAPES {
+        0 => vec![dest(vec![".flux"], d), dest(vec![".flux", "c"], f)],
+        1 => vec![dest(vec![".flux"], f)],
+        2 => vec![dest(vec![LOCK], f)],
+        3 => vec![dest(vec![LOCK], d)],
+        4 => vec![dest(at(PARTIAL_32[head % 3]), f)],
+        5 => vec![dest(at(PARTIAL_32[head % 3]), l)],
+        6 => vec![dest(at(PARTIAL_31[head % 3]), f)],
+        7 => vec![dest(at(PARTIAL_UPPER[head % 3]), f)],
+        8 => vec![dest(at(PARTIAL_NO_HEAD), f)],
+        9 => vec![dest(at(PARTIAL_32[head % 3]), d)],
+        _ => vec![dest(at(".flux"), d)],
+    }
+}
+
+fn control_extra(parents: Vec<RelPath>) -> impl Strategy<Value = Vec<Extra>> {
+    (select(parents), 0usize..3, 0..CONTROL_SHAPES)
+        .prop_map(|(parent, head, shape)| control(&parent, head, shape))
+}
+
+/// 0 to 4 extras, the ordinary and the control-state kind equally likely.
+fn extras(parents: Vec<RelPath>) -> impl Strategy<Value = Vec<Extra>> {
+    let one = prop_oneof![ordinary_extra(parents.clone()), control_extra(parents)];
+    vec(one, 0..=4).prop_map(|groups| {
+        let mut all: Vec<Extra> = groups.into_iter().flatten().collect();
+        all.truncate(4);
+        all
+    })
+}
+
+fn mounts() -> impl Strategy<Value = MountPolicy> {
+    prop_oneof![Just(MountPolicy::Stay), Just(MountPolicy::Cross)]
+}
+
+fn links() -> impl Strategy<Value = Links> {
+    prop_oneof![Just(Links::Copy), Just(Links::Skip)]
+}
+
+/// The generated scenario (design 6.3): a base tree, one edit per base entry, and per-side extras.
+fn case() -> impl Strategy<Value = Case> {
+    base()
+        .prop_flat_map(|base| {
+            let n = base.len();
+            let parents = parents_of(&base);
+            (Just(base), vec(edit(), n..=n), extras(parents), mounts(), links())
+        })
+        .prop_map(|(base, edits, extras, mounts, links)| Case {
+            base,
+            edits,
+            extras,
+            mounts,
+            links,
+        })
 }
 
 #[cfg(test)]
@@ -616,6 +820,279 @@ mod tests {
             verify_tree(&fs, Path::new("/s"), Path::new("/d"), &opts, &mut |r| rows.push(row(&r)))
                 .unwrap();
             assert_eq!(rows, rows_of(&case), "case {i}");
+        }
+    }
+
+    /// Every category the census counts, in report order.
+    const CATEGORIES: [&str; 25] = [
+        "outcome match",
+        "outcome missing",
+        "outcome mismatched",
+        "outcome extra",
+        "outcome unreadable",
+        "source-only failed dir",
+        "destination-only failed dir",
+        "both-sides failed dir, different codes",
+        "fault on exactly one side of a shared path",
+        "mount on exactly one side of a shared path",
+        "failed destination dir over a source file",
+        "mount fold (not_entered > 0)",
+        "mount dir under Stay with children on its side",
+        "pruned dir then a prefix-named later sibling",
+        "two prunes each with a surviving descendant",
+        "control-state drop",
+        "ChangeKind on both Source and Dest",
+        "subtree on one side under a non-directory on the other",
+        "source symlink removed by Skip",
+        "source .flux-root.lock file reported Missing",
+        "symlink on both sides reported Extra under Skip",
+        "mount dir with a fault under Cross reported failed",
+        "case with a large file",
+        "case with a Dir under a Dir",
+        "case with a source-side extra",
+    ];
+
+    fn is_fail(code: Option<Code>) -> bool {
+        matches!(code, Some(Code::PermissionDenied | Code::IoError))
+    }
+
+    fn dir_err(spec: Option<&Spec>) -> Option<Code> {
+        match spec {
+            Some(Spec::Dir { list_error, .. }) => *list_error,
+            _ => None,
+        }
+    }
+
+    fn is_mount(spec: &Spec) -> bool {
+        matches!(spec, Spec::Dir { mount: MountRoot::Yes, .. })
+    }
+
+    /// The categories a case reaches, read from the case, `sides` and the reference only (never the engine).
+    fn categories(case: &Case) -> Vec<&'static str> {
+        let (src, dst) = sides(case);
+        let (fsrc, fdst) = filtered_sides(case);
+        let (recs, sum) = reference(case);
+        let stay = case.mounts == MountPolicy::Stay;
+        let has_record = |p: &Path| recs.iter().any(|r| r.path == p);
+        let mut hit = Vec::new();
+        for (name, outcome) in [
+            ("outcome match", Outcome::Match),
+            ("outcome missing", Outcome::Missing),
+            ("outcome mismatched", Outcome::Mismatched),
+            ("outcome extra", Outcome::Extra),
+            ("outcome unreadable", Outcome::Unreadable),
+        ] {
+            if recs.iter().any(|r| r.outcome == outcome) {
+                hit.push(name);
+            }
+        }
+        let mut when = |name: &'static str, yes: bool| {
+            if yes {
+                hit.push(name);
+            }
+        };
+        when(
+            "source-only failed dir",
+            recs.iter().any(|r| {
+                r.outcome == Outcome::Unreadable
+                    && is_fail(r.code)
+                    && dir_err(fsrc.get(&r.path)).is_some()
+                    && !fdst.contains_key(&r.path)
+            }),
+        );
+        when(
+            "destination-only failed dir",
+            recs.iter().any(|r| {
+                r.outcome == Outcome::Extra
+                    && is_fail(r.code)
+                    && dir_err(fdst.get(&r.path)).is_some()
+                    && !fsrc.contains_key(&r.path)
+            }),
+        );
+        when(
+            "both-sides failed dir, different codes",
+            recs.iter().any(|r| {
+                let (s, d) = (dir_err(fsrc.get(&r.path)), dir_err(fdst.get(&r.path)));
+                r.outcome == Outcome::Unreadable
+                    && s.is_some()
+                    && d.is_some()
+                    && r.code == s
+                    && s != d
+            }),
+        );
+        let shared = || src.iter().filter_map(|(p, s)| dst.get(p).map(|d| (p, s, d)));
+        when(
+            "fault on exactly one side of a shared path",
+            shared().any(|(p, s, d)| {
+                matches!(s, Spec::Dir { .. })
+                    && matches!(d, Spec::Dir { .. })
+                    && dir_err(Some(s)).is_some() != dir_err(Some(d)).is_some()
+                    && has_record(p)
+            }),
+        );
+        when(
+            "mount on exactly one side of a shared path",
+            shared().any(|(p, s, d)| {
+                matches!(s, Spec::Dir { .. })
+                    && matches!(d, Spec::Dir { .. })
+                    && is_mount(s) != is_mount(d)
+                    && has_record(p)
+            }),
+        );
+        when(
+            "failed destination dir over a source file",
+            recs.iter().any(|r| {
+                r.outcome == Outcome::Unreadable
+                    && r.kind == Kind::File
+                    && is_fail(r.code)
+                    && matches!(fsrc.get(&r.path), Some(Spec::File { .. }))
+                    && dir_err(fdst.get(&r.path)).is_some()
+            }),
+        );
+        when("mount fold (not_entered > 0)", sum.not_entered > 0);
+        when(
+            "mount dir under Stay with children on its side",
+            stay && [&src, &dst].iter().any(|side| {
+                side.iter()
+                    .any(|(p, s)| is_mount(s) && side.keys().any(|q| q != p && q.starts_with(p)))
+            }),
+        );
+        let prunes: Vec<&Record> = recs
+            .iter()
+            .filter(|r| {
+                (matches!(r.outcome, Outcome::Unreadable | Outcome::Extra) && is_fail(r.code))
+                    || (r.outcome == Outcome::Match && r.detail == MOUNT_NOT_ENTERED)
+            })
+            .collect();
+        when(
+            "pruned dir then a prefix-named later sibling",
+            prunes.iter().any(|p| {
+                recs.iter().any(|q| {
+                    q.path != p.path
+                        && q.path.parent() == p.path.parent()
+                        && key_of(&q.path).starts_with(&key_of(&p.path))
+                })
+            }),
+        );
+        when(
+            "two prunes each with a surviving descendant",
+            prunes
+                .iter()
+                .filter(|p| {
+                    fsrc.keys().chain(fdst.keys()).any(|q| q != &p.path && q.starts_with(&p.path))
+                })
+                .count()
+                >= 2,
+        );
+        when(
+            "control-state drop",
+            case.extras.iter().any(|(w, rel, spec)| {
+                let path = join(rel);
+                *w == Which::Dest
+                    && is_control(&path, spec)
+                    && dst.get(&path) == Some(spec)
+                    && !fdst.contains_key(&path)
+            }),
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        let (mut change_src, mut change_dst) = (false, false);
+        for (i, (rel, spec)) in case.base.iter().enumerate() {
+            if !seen.insert(join(rel)) {
+                continue;
+            }
+            if let Edit::ChangeKind(w, new) = &case.edits[i]
+                && kind_of(new) != kind_of(spec)
+            {
+                match w {
+                    Which::Source => change_src = true,
+                    Which::Dest => change_dst = true,
+                }
+            }
+        }
+        when("ChangeKind on both Source and Dest", change_src && change_dst);
+        let under_non_dir = |a: &BTreeMap<PathBuf, Spec>, b: &BTreeMap<PathBuf, Spec>| {
+            a.keys().any(|p| {
+                p.parent()
+                    .filter(|q| !q.as_os_str().is_empty())
+                    .is_some_and(|q| b.get(q).is_some_and(|s| !matches!(s, Spec::Dir { .. })))
+            })
+        };
+        when(
+            "subtree on one side under a non-directory on the other",
+            under_non_dir(&src, &dst) || under_non_dir(&dst, &src),
+        );
+        when(
+            "source symlink removed by Skip",
+            case.links == Links::Skip && src.values().any(|s| matches!(s, Spec::Symlink { .. })),
+        );
+        when(
+            "source .flux-root.lock file reported Missing",
+            src.iter().any(|(p, s)| {
+                p == Path::new(".flux-root.lock")
+                    && matches!(s, Spec::File { .. })
+                    && recs.iter().any(|r| r.path == *p && r.outcome == Outcome::Missing)
+            }),
+        );
+        when(
+            "symlink on both sides reported Extra under Skip",
+            case.links == Links::Skip
+                && shared().any(|(p, s, d)| {
+                    matches!(s, Spec::Symlink { .. })
+                        && matches!(d, Spec::Symlink { .. })
+                        && recs.iter().any(|r| r.path == *p && r.outcome == Outcome::Extra)
+                }),
+        );
+        when(
+            "mount dir with a fault under Cross reported failed",
+            case.mounts == MountPolicy::Cross
+                && [&src, &dst].iter().any(|side| {
+                    side.iter().any(|(p, s)| {
+                        matches!(s, Spec::Dir { mount: MountRoot::Yes, list_error: Some(c) }
+                            if recs.iter().any(|r| r.path == *p && r.code == Some(*c)))
+                    })
+                }),
+        );
+        let large = crate::copy::COPY_BUF_MAX + 1;
+        when(
+            "case with a large file",
+            src.values()
+                .chain(dst.values())
+                .any(|s| matches!(s, Spec::File { len, .. } if *len == large)),
+        );
+        when(
+            "case with a Dir under a Dir",
+            src.iter().any(|(p, s)| {
+                matches!(s, Spec::Dir { .. })
+                    && p.parent().is_some_and(|q| !q.as_os_str().is_empty())
+            }),
+        );
+        when("case with a source-side extra", case.extras.iter().any(|e| e.0 == Which::Source));
+        hit
+    }
+
+    #[test]
+    fn generated_cases_reach_every_outcome_and_every_prune_arm() {
+        use proptest::strategy::ValueTree;
+        use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
+        let rng = TestRng::from_seed(RngAlgorithm::ChaCha, &[7u8; 32]);
+        let mut runner = TestRunner::new_with_rng(Config::default(), rng);
+        let strategy = case();
+        let mut counts: BTreeMap<&str, usize> = CATEGORIES.iter().map(|c| (*c, 0)).collect();
+        for _ in 0..512 {
+            let c = strategy.new_tree(&mut runner).unwrap().current();
+            for name in categories(&c) {
+                *counts.get_mut(name).unwrap_or_else(|| panic!("unknown category {name}")) += 1;
+            }
+        }
+        let table: String =
+            CATEGORIES.iter().map(|c| format!("  {:>4}  {c}\n", counts[c])).collect();
+        println!("census over 512 cases:\n{table}");
+        for c in CATEGORIES {
+            assert!(
+                counts[c] >= 5,
+                "category {c:?} reached {} of 512 cases; census:\n{table}",
+                counts[c]
+            );
         }
     }
 }
