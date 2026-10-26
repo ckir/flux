@@ -238,7 +238,7 @@ Each was measured, and each is deliberately NOT fixed in that PR.
 - [ ] **A symlink given as SOURCE is still refused before the engine (K7).** `flux copy link DEST` exits 1 with `SYMLINK_CREATION_UNAVAILABLE`'s code and "a symlink SOURCE is not followed; copy its parent folder, or name its target"; copying a single link is a later cut (cut 10a, decision D1).
 - [ ] **A symlink's own timestamps and permissions are not preserved**, even under `--preserve-times`/`--preserve-permissions` (cut 10a, decision D4; a deviation from §44.1's strictness, stated in `--help`): needs a no-follow times primitive (`utimensat(AT_SYMLINK_NOFOLLOW)` / a reparse-point handle) on every arm.
 - [ ] **`symlinkat` on a Linux vfat/exFAT mount is unmeasured.** The arm maps `EPERM` to `SYMLINK_CREATION_UNAVAILABLE` and leaves `EACCES` as `PermissionDenied` (cut 10a, decision D8); the owner's vfat probe was not run (R-L1). Re-check before relying on it. Also unmeasured on Windows: a directory link replaced BY a directory link, a junction replaced by a file, and ReFS/FAT/SMB behaviour of the POSIX-semantics rename (probe cases are in `crates/flux-platform/src/symlink_probe.rs`).
-- [ ] Hardlinked symlinks: every entry of a multiply-linked symlink inode becomes an independent symlink (the walker has no hardlink topology yet; §12.1 prescribes this for `--hardlinks=copy`).
+- [ ] Hardlinked symlinks: every entry of a multiply-linked symlink inode becomes an independent symlink (the walker now has hardlink topology for regular files (cut 12); a hardlinked symlink is still N independent links; §12.1 prescribes this for `--hardlinks=copy`).
 - [ ] **No progress output during a long copy.** `flux copy` prints each record as it happens and one
       summary at the end; a large tree runs silently in between. §52's progress UI (files, bytes, speed,
       ETA, skipped, degraded, errors) is not built; it needs the walk to know the totals up front (cut 5).
@@ -361,7 +361,10 @@ are the spec's).
       Windows outcome of a file over a directory junction`). So a per-target result, never a traversal of the
       junction.
 - [ ] **8. A hardlink alias on a case-insensitive destination:** an alias of an existing entry in the same directory
-      makes the alias's target fail rather than replace (no unique identity match).
+      makes the alias's target fail rather than replace (no unique identity match). Cut 12's link path records the alias's claim through the same protocol; the case-insensitive alias case is unchanged and untested.
+      With hardlinked source names, an object with several spellings makes `NameIndex` identity resolution
+      Unresolvable, so a colliding unrelated name fails with `DESTINATION_ERROR` instead of
+      `DESTINATION_NAMESPACE_COLLISION` (`names.rs` ~126-131); untested.
 - [ ] **9. Closing the claim store always commits:** `redb` 4.3.0 `Database::drop` is an `Immediate` write commit plus
       a header fsync, so `state.db` is written and synced once on every path, including `Lost` (a write without
       ownership, though only to this run's own workspace file) and a clean `Completed`; the spec's "never on a clean

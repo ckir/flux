@@ -133,6 +133,7 @@ impl DirHandle for StdDir {
     type Reader = crate::StdReader;
     type Lock = crate::StdLock;
     type Claims = crate::RedbClaimStore;
+    type Index = crate::RedbHardlinkIndex;
 
     fn open_dir(&self, name: &OsStr) -> Result<Self> {
         check_component(name)?;
@@ -320,6 +321,16 @@ impl DirHandle for StdDir {
         })
     }
 
+    /// `linkat(2)` with no flags: `existing` is NOT followed (a symlink there is linked as the link object), and a
+    /// taken `name` answers `EEXIST` (`AlreadyExists`, a dangling link included). The errno split is
+    /// `map_link_errno`.
+    fn create_hardlink(&self, name: &OsStr, other: &Self, existing: &OsStr) -> Result<()> {
+        check_component(name)?;
+        check_component(existing)?;
+        rustix::fs::linkat(&other.0, existing, &self.0, name, AtFlags::empty())
+            .map_err(map_link_errno)
+    }
+
     /// NO FALLBACK, and that is the decision rather than an omission.
     ///
     /// `RENAME_NOREPLACE` is not universal. MEASURED on a 9p-mounted volume: this
@@ -393,6 +404,18 @@ impl DirHandle for StdDir {
         )
         .map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
         crate::RedbClaimStore::create_file(std::fs::File::from(fd), durability)
+    }
+
+    fn create_hardlink_index(&self, name: &OsStr) -> Result<Self::Index> {
+        check_component(name)?;
+        let fd = openat(
+            &self.0,
+            name,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o666),
+        )
+        .map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
+        crate::RedbHardlinkIndex::create_file(std::fs::File::from(fd))
     }
 
     fn open_claim_store(
@@ -635,5 +658,54 @@ fn is_write_protected_at(dir: &OwnedFd, name: &OsStr) -> bool {
             accessat(dir, name, Access::WRITE_OK, AtFlags::EACCESS),
             Err(Errno::ACCESS | Errno::PERM | Errno::ROFS)
         ),
+    }
+}
+
+/// A failed `linkat` as the trait's error. `EPERM` (a filesystem or policy that refuses hard links, e.g.
+/// `fs.protected_hardlinks`, vfat), `EXDEV` (another filesystem), `EMLINK` (the link limit) and `EOPNOTSUPP` /
+/// `ENOTSUP` (one value on Linux, two on macOS) mean "this destination cannot hold the link" and are
+/// `HardlinkUnavailable`; everything else goes through `FsError::from_io`. A function of its own because the
+/// cross-filesystem and link-limit cases cannot be provoked on the project's test filesystems.
+fn map_link_errno(e: rustix::io::Errno) -> FsError {
+    use rustix::io::Errno;
+    if e == Errno::PERM
+        || e == Errno::XDEV
+        || e == Errno::MLINK
+        || e == Errno::OPNOTSUPP
+        || e == Errno::NOTSUP
+    {
+        return FsError::new(
+            Code::HardlinkUnavailable,
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("the destination cannot hold the hard link ({e})"),
+            ),
+        );
+    }
+    FsError::from_io(std::io::Error::from(e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_link_errno;
+    use flux_fs::Code;
+    use rustix::io::Errno;
+
+    #[test]
+    fn create_hardlink_unavailable_maps_the_errno() {
+        for e in [Errno::XDEV, Errno::PERM, Errno::MLINK, Errno::OPNOTSUPP, Errno::NOTSUP] {
+            assert_eq!(map_link_errno(e).code, Code::HardlinkUnavailable, "{e:?}");
+        }
+    }
+
+    #[test]
+    fn create_hardlink_other_errnos_go_through_from_io() {
+        let e = map_link_errno(Errno::EXIST);
+        assert_eq!(e.source.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_ne!(e.code, Code::HardlinkUnavailable);
+        assert_eq!(map_link_errno(Errno::ACCESS).code, Code::PermissionDenied);
+        assert_eq!(map_link_errno(Errno::NOSPC).code, Code::DiskFull);
+        let e = map_link_errno(Errno::NOENT);
+        assert_eq!((e.code, e.source.kind()), (Code::IoError, std::io::ErrorKind::NotFound));
     }
 }

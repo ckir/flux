@@ -1011,6 +1011,7 @@ mod trees_tests {
             operation_id: OperationId::new("replaced by the run"),
             existing: ExistingPolicy::Overwrite,
             links: Links::Copy,
+            hardlinks: flux_fs::Hardlinks::Auto,
             cross_filesystems: false,
         }
     }
@@ -1160,6 +1161,37 @@ mod trees_tests {
 
     fn strong(fs: &FaultFs, path: &str) -> bool {
         matches!(fs.metadata(Path::new(path)).unwrap().identity, FileIdentity::Strong(_))
+    }
+
+    #[test]
+    fn a_group_across_two_roots_links_in_one_operation() {
+        let fs = FaultFs::new();
+        for d in ["/s1", "/s2", "/p"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        fs.write_file("/s1/a", b"shared");
+        let (d1, d2) = (
+            fs.destination_root(Path::new("/s1")).unwrap(),
+            fs.destination_root(Path::new("/s2")).unwrap(),
+        );
+        d2.create_hardlink(OsStr::new("a"), &d1, OsStr::new("a")).unwrap();
+        let specs = ["s1", "s2"]
+            .map(|n| SourceSpec {
+                src: Path::new("/").join(n),
+                name: OsString::from(n),
+                kind: SourceKind::Folder,
+            })
+            .to_vec();
+        let (r, got) = go_with(&fs, specs, &opts(), &cfg());
+        let out = ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!((out.files_copied, out.files_hardlinked), (1, 1));
+        let id = |p: &str| match fs.metadata(Path::new(p)).unwrap().identity {
+            FileIdentity::Strong(id) => id,
+            other => panic!("{p}: {other:?}"),
+        };
+        assert_eq!(id("/p/dest/s1/a"), id("/p/dest/s2/a"));
+        assert_eq!(fs.read_file("/p/dest/s2/a").as_deref(), Some(&b"shared"[..]));
     }
 
     #[test]

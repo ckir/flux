@@ -30,11 +30,11 @@ const PREPARED: TableDefinition<&[u8], &[u8]> = TableDefinition::new("prepared")
 /// Written by `create_file`. `open_file` also reads 1 (no `prepared` table), never upgrading it.
 pub const FORMAT: u64 = 2;
 
-fn io_err(e: impl std::error::Error + Send + Sync + 'static) -> FsError {
+pub(crate) fn io_err(e: impl std::error::Error + Send + Sync + 'static) -> FsError {
     FsError::new(Code::IoError, io::Error::other(e))
 }
 
-fn storage_err(e: redb::StorageError) -> FsError {
+pub(crate) fn storage_err(e: redb::StorageError) -> FsError {
     match e {
         redb::StorageError::Corrupted(_) => FsError::new(Code::StateCorrupt, io::Error::other(e)),
         // redb reports a non-empty file with the wrong magic number as `Io(InvalidData)`, not `Corrupted`
@@ -59,7 +59,7 @@ fn database_err(e: redb::DatabaseError) -> FsError {
     }
 }
 
-fn table_err(e: redb::TableError) -> FsError {
+pub(crate) fn table_err(e: redb::TableError) -> FsError {
     match e {
         redb::TableError::Storage(s) => storage_err(s),
         // `TableDoesNotExist` and every other table error.
@@ -67,7 +67,7 @@ fn table_err(e: redb::TableError) -> FsError {
     }
 }
 
-fn transaction_err(e: redb::TransactionError) -> FsError {
+pub(crate) fn transaction_err(e: redb::TransactionError) -> FsError {
     match e {
         redb::TransactionError::Storage(s) => storage_err(s),
         _ => FsError::new(Code::IoError, io::Error::other(e)),

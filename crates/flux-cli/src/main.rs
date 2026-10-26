@@ -124,6 +124,12 @@ struct CopyArgs {
     /// creates nothing and reports it as skipped (§124). `follow` is not supported.
     #[arg(long, value_enum, default_value_t = LinksArg::Copy)]
     links: LinksArg,
+    /// How a file with several names in the tree is copied: `auto` (the default) copies it once and links the other
+    /// selected names to it, copying independently and reporting where a link is impossible; `preserve` fails a member
+    /// that cannot be linked (`HARDLINK_UNAVAILABLE`, `HARDLINK_IDENTITY_UNAVAILABLE`); `copy` copies every name
+    /// separately (§15).
+    #[arg(long, value_enum, default_value_t = HardlinksArg::Auto)]
+    hardlinks: HardlinksArg,
     /// Descend into directories that are other mounts (section 42); by default each is created empty and skipped.
     #[arg(long)]
     cross_filesystems: bool,
@@ -142,6 +148,13 @@ enum DurabilityArg {
 enum LinksArg {
     Copy,
     Skip,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum HardlinksArg {
+    Auto,
+    Preserve,
+    Copy,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -185,6 +198,11 @@ fn options(args: &CopyArgs) -> CopyOptions {
         links: match args.links {
             LinksArg::Copy => Links::Copy,
             LinksArg::Skip => Links::Skip,
+        },
+        hardlinks: match args.hardlinks {
+            HardlinksArg::Auto => flux_fs::Hardlinks::Auto,
+            HardlinksArg::Preserve => flux_fs::Hardlinks::Preserve,
+            HardlinksArg::Copy => flux_fs::Hardlinks::Copy,
         },
         // A placeholder: the run replaces it with its own operation id (`RunConfig::operation_id`).
         operation_id: OperationId::new(String::new()),
@@ -718,6 +736,15 @@ mod tests {
         assert_eq!(o.durability, Durability::Normal);
         assert_eq!(o.safety, Safety::Default);
         assert_eq!(o.publish, Publish::Replace);
+    }
+
+    #[test]
+    fn hardlinks_defaults_to_auto_and_each_mode_reaches_the_options() {
+        use flux_fs::Hardlinks;
+        assert_eq!(options(&parse(&[])).hardlinks, Hardlinks::Auto);
+        assert_eq!(options(&parse(&["--hardlinks=preserve"])).hardlinks, Hardlinks::Preserve);
+        assert_eq!(options(&parse(&["--hardlinks=copy"])).hardlinks, Hardlinks::Copy);
+        assert_eq!(options(&parse(&["--hardlinks=auto"])).hardlinks, Hardlinks::Auto);
     }
 
     #[test]

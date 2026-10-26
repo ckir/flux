@@ -13,12 +13,13 @@ pub use error::{Code, FsError, Result};
 pub mod options;
 
 pub use options::{
-    CopyOptions, Durability, ExistingPolicy, Links, MetadataFailure, MetadataItem, OperationId,
-    Outcome, Preserve, Publish, Safety, temp_path,
+    CopyOptions, Durability, ExistingPolicy, Hardlinks, Links, MetadataFailure, MetadataItem,
+    OperationId, Outcome, Preserve, Publish, Safety, temp_path,
 };
 
 pub mod claims;
 pub mod fs;
+pub mod hardlinks;
 pub mod lock;
 pub mod name;
 
@@ -30,5 +31,6 @@ pub use fs::{
     DestinationRoot, DirEntry, DirHandle, FileHandle, FileIdentity, FileSystem, FileType, Link,
     LinkKind, Metadata, MountRoot, ObjectId, Perms,
 };
+pub use hardlinks::{HardlinkEntry, HardlinkIndex, encode_object};
 pub use lock::{LockCapability, LockFile};
 pub use name::check_component;

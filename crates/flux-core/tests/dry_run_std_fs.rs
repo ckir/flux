@@ -32,6 +32,7 @@ fn opts(existing: ExistingPolicy, links: Links, safety: Safety) -> CopyOptions {
         operation_id: OperationId::new("t"),
         existing,
         links,
+        hardlinks: flux_fs::Hardlinks::Auto,
         cross_filesystems: false,
     }
 }

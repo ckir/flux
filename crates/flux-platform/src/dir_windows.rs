@@ -25,14 +25,16 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_DELETE, FILE_DISPOSITION_INFORMATION,
-    FILE_DISPOSITION_INFORMATION_EX, FILE_DISPOSITION_POSIX_SEMANTICS, FILE_NON_DIRECTORY_FILE,
-    FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS,
-    FILE_RENAME_REPLACE_IF_EXISTS, FileDispositionInformation, FileDispositionInformationEx,
-    FileRenameInformation, FileRenameInformationEx, NtCreateFile, NtSetInformationFile,
+    FILE_DISPOSITION_INFORMATION_EX, FILE_DISPOSITION_POSIX_SEMANTICS, FILE_LINK_INFORMATION,
+    FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION,
+    FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS, FileDispositionInformation,
+    FileDispositionInformationEx, FileLinkInformation, FileRenameInformation,
+    FileRenameInformationEx, NtCreateFile, NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
     HANDLE, STATUS_DELETE_PENDING, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_INFO_CLASS,
-    STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED, UNICODE_STRING,
+    STATUS_INVALID_PARAMETER, STATUS_NOT_SAME_DEVICE, STATUS_NOT_SUPPORTED, STATUS_TOO_MANY_LINKS,
+    UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_GENERIC_WRITE, FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ,
@@ -52,6 +54,7 @@ const STATUS_ACCESS_DENIED: i32 = 0xC000_0022u32 as i32;
 const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035u32 as i32;
 const STATUS_FILE_IS_A_DIRECTORY: i32 = 0xC000_00BAu32 as i32;
 const STATUS_DIRECTORY_NOT_EMPTY: i32 = 0xC000_0101u32 as i32;
+const STATUS_DISK_FULL: i32 = 0xC000_007Fu32 as i32;
 
 /// An `NTSTATUS` as a `std::io::Error` that KEEPS its kind.
 ///
@@ -154,6 +157,7 @@ impl DirHandle for StdDir {
     type Reader = crate::StdReader;
     type Lock = crate::StdLock;
     type Claims = crate::RedbClaimStore;
+    type Index = crate::RedbHardlinkIndex;
 
     /// Always `No`: a mounted-volume folder is a name-surrogate reparse point, which `open_dir` already refuses
     /// (see its reparse-point check), so no handle this arm holds can be the root of a mount.
@@ -409,6 +413,14 @@ impl DirHandle for StdDir {
         Ok(())
     }
 
+    /// `NtSetInformationFile(FileLinkInformation)` on a handle to `existing` (opened relative to `other`, with
+    /// `FILE_OPEN_REPARSE_POINT` so a link is linked, not followed). UNMEASURED: see `link_at`.
+    fn create_hardlink(&self, name: &OsStr, other: &Self, existing: &OsStr) -> Result<()> {
+        check_component(name)?;
+        check_component(existing)?;
+        crate::dir_windows::link_at(&other.0, existing, &self.0, name)
+    }
+
     fn rename_no_replace(&self, from: &OsStr, other: &Self, to: &OsStr) -> Result<()> {
         check_component(from)?;
         check_component(to)?;
@@ -450,6 +462,13 @@ impl DirHandle for StdDir {
         // The same exclusive, reparse-point-refusing create as `create_lock`; only the wrapper differs.
         let file = open_file_at(&self.0, name, FILE_CREATE)?;
         crate::RedbClaimStore::create_file(file, durability)
+    }
+
+    fn create_hardlink_index(&self, name: &OsStr) -> Result<Self::Index> {
+        check_component(name)?;
+        // The same exclusive, reparse-point-refusing create as `create_claim_store`; only the wrapper differs.
+        let file = open_file_at(&self.0, name, FILE_CREATE)?;
+        crate::RedbHardlinkIndex::create_file(file)
     }
 
     fn open_claim_store(
@@ -1613,6 +1632,135 @@ fn rename_at(fd: &OwnedHandle, f: &OsStr, td: &OwnedHandle, t: &OsStr, r: bool) 
         return Err(FsError::new(Code::IoError, nt_io_error("NtSetInformationFile", status)));
     }
     drop(h);
+    Ok(())
+}
+
+/// A failed `FileLinkInformation` call as the trait's error. "This destination cannot hold the link" is
+/// `HardlinkUnavailable`; a taken name is `AlreadyExists` (through `nt_io_error`); a full volume is `DiskFull`;
+/// the rest goes through `FsError::from_io`.
+///
+/// UNMEASURED: written from the status list in the plan (NTFS and ReFS on a hosted runner have not answered
+/// yet). A status that turns up there and is not listed is to be added with its measured value, never guessed.
+fn map_link_status(status: i32) -> FsError {
+    match status {
+        // A different volume, a filesystem or object that cannot hold a link, and the per-file link limit.
+        s if s == STATUS_NOT_SAME_DEVICE
+            || s == STATUS_INVALID_DEVICE_REQUEST
+            || s == STATUS_NOT_SUPPORTED
+            || s == STATUS_TOO_MANY_LINKS =>
+        {
+            FsError::new(
+                Code::HardlinkUnavailable,
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    nt_io_error("NtSetInformationFile(FileLinkInformation)", s),
+                ),
+            )
+        }
+        STATUS_DISK_FULL => FsError::new(
+            Code::DiskFull,
+            nt_io_error("NtSetInformationFile(FileLinkInformation)", status),
+        ),
+        // STATUS_OBJECT_NAME_COLLISION is AlreadyExists by `nt_io_error`.
+        _ => FsError::from_io(nt_io_error("NtSetInformationFile(FileLinkInformation)", status)),
+    }
+}
+
+/// Open `n` relative to `p` for `link_at`: `FILE_OPEN_REPARSE_POINT` (a link is opened, never followed), the
+/// same share mode and statuses as `rename_at`'s open of its source.
+fn open_for_link(p: &OwnedHandle, n: &OsStr, access: u32) -> Result<OwnedHandle> {
+    let mut wide: Vec<u16> = n.encode_wide().collect();
+    let bytes = (wide.len() * 2) as u16;
+    let us = UNICODE_STRING { Length: bytes, MaximumLength: bytes, Buffer: wide.as_mut_ptr() };
+    let mut oa: OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    oa.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
+    oa.RootDirectory = p.as_raw_handle() as HANDLE;
+    oa.ObjectName = &raw const us;
+
+    let mut raw: HANDLE = std::ptr::null_mut();
+    let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    // SAFETY: every pointer is to a live local that outlives the call, and `wide` outlives `us` which borrows it.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut raw,
+            access,
+            &raw const oa,
+            &raw mut iosb,
+            std::ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status != 0 {
+        // As `rename_at`: a missing source is an ordinary not-found (`IoError`), not a broken destination.
+        let code = match status {
+            STATUS_ACCESS_DENIED => Code::PermissionDenied,
+            _ => Code::IoError,
+        };
+        return Err(FsError::new(code, nt_io_error("NtCreateFile", status)));
+    }
+    // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `raw` is a valid handle we own.
+    Ok(unsafe { OwnedHandle::from_raw_handle(raw as _) })
+}
+
+/// Create `t` in `td` as a new name of the object `f` names in `fd`, never replacing.
+///
+/// UNMEASURED: compile-checked for x86_64-pc-windows-gnu, never run. Modelled on
+/// `rename_at`. Opens `f` with `FILE_READ_ATTRIBUTES | SYNCHRONIZE` (no `DELETE`: a link needs no right on the
+/// source handle in the documentation, which is the thing to confirm) and, if the link call answers
+/// `STATUS_ACCESS_DENIED`, reopens with `DELETE | SYNCHRONIZE`, the access `rename_at` asks for, and tries once
+/// more. The access that worked on the hosted runner (NTFS) and on ReFS belongs in this comment.
+fn link_at(fd: &OwnedHandle, f: &OsStr, td: &OwnedHandle, t: &OsStr) -> Result<()> {
+    let wide: Vec<u16> = t.encode_wide().collect();
+    let name_bytes = wide.len() * 2;
+    let total = size_of::<FILE_LINK_INFORMATION>() + name_bytes;
+
+    // A `u64` buffer for the alignment reasons `rename_at` records.
+    const {
+        assert!(align_of::<FILE_LINK_INFORMATION>() <= align_of::<u64>());
+    }
+    let mut buf: Vec<u64> = vec![0u64; total.div_ceil(size_of::<u64>())];
+    let base: *mut u8 = buf.as_mut_ptr().cast();
+    // SAFETY: `base` addresses at least `total` zeroed bytes aligned to 8; the name is written into the trailing
+    // space the `[u16; 1]` placeholder stands for. ReplaceIfExists stays false (zeroed): never replace.
+    unsafe {
+        let info = base.cast::<FILE_LINK_INFORMATION>();
+        (&raw mut (*info).Anonymous.ReplaceIfExists).write(false);
+        (&raw mut (*info).RootDirectory).write(td.as_raw_handle() as HANDLE);
+        (&raw mut (*info).FileNameLength).write(name_bytes as u32);
+        std::ptr::copy_nonoverlapping(
+            wide.as_ptr(),
+            (&raw mut (*info).FileName).cast::<u16>(),
+            wide.len(),
+        );
+    }
+
+    let mut status = 0;
+    for access in [FILE_READ_ATTRIBUTES | SYNCHRONIZE, DELETE | SYNCHRONIZE] {
+        let h = open_for_link(fd, f, access)?;
+        let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        // SAFETY: `base` holds a fully-initialized FILE_LINK_INFORMATION plus its trailing name and `total` is
+        // exactly its size (not `buf.len()`, which counts u64 words); `buf` and `h` outlive the call.
+        status = unsafe {
+            NtSetInformationFile(
+                h.as_raw_handle() as _,
+                &raw mut iosb,
+                base.cast(),
+                total as u32,
+                FileLinkInformation,
+            )
+        };
+        if status != STATUS_ACCESS_DENIED {
+            break;
+        }
+    }
+    if status != 0 {
+        return Err(map_link_status(status));
+    }
     Ok(())
 }
 

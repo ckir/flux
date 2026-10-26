@@ -11,7 +11,9 @@ pub mod std_fs;
 pub(crate) mod lock_file;
 
 mod claims;
+mod hardlinks;
 pub use claims::{CACHE_BYTES, RedbClaimStore, SYNC_CAP};
+pub use hardlinks::RedbHardlinkIndex;
 
 #[cfg(unix)]
 mod dir_unix;

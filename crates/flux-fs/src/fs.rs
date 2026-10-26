@@ -289,6 +289,9 @@ pub trait DirHandle: Sized {
     /// The claim store `create_claim_store` opens (cut 8b). See `crate::ClaimStore`.
     type Claims: crate::ClaimStore;
 
+    /// The per-run hardlink index `create_hardlink_index` opens (cut 12). See `crate::HardlinkIndex`.
+    type Index: crate::HardlinkIndex;
+
     /// Open a child DIRECTORY, refusing to traverse a symlink, junction or other
     /// name-surrogate reparse point. This is the operation §149.7 is about.
     fn open_dir(&self, name: &std::ffi::OsStr) -> Result<Self>;
@@ -370,6 +373,24 @@ pub trait DirHandle: Sized {
     /// `LinkKind::Unspecified` on a platform that needs a kind creates a file link.
     fn create_symlink(&self, name: &std::ffi::OsStr, link: &Link) -> Result<()>;
 
+    /// Create `name` in this directory as a new name of the object that `existing` names in `other`.
+    ///
+    /// NEVER replaces: MUST FAIL with `ErrorKind::AlreadyExists` if `name` is taken by anything, a dangling link
+    /// included. NEVER follows a symlink at `existing`: the link object itself gets the new name, not its target.
+    /// Calls `check_component` on BOTH names first.
+    ///
+    /// Maps "this destination cannot hold the link" to `Code::HardlinkUnavailable`: a filesystem without hard links,
+    /// a different volume, the link limit, or a refused permission (Unix `EPERM`, `EXDEV`, `EMLINK`, `EOPNOTSUPP`;
+    /// Windows `STATUS_NOT_SAME_DEVICE`, `STATUS_INVALID_DEVICE_REQUEST`, `STATUS_NOT_SUPPORTED`,
+    /// `STATUS_TOO_MANY_LINKS`). Every other failure goes through `FsError::from_io` (disk full stays `DiskFull`,
+    /// a missing `existing` is `IoError`/`NotFound`).
+    fn create_hardlink(
+        &self,
+        name: &std::ffi::OsStr,
+        other: &Self,
+        existing: &std::ffi::OsStr,
+    ) -> Result<()>;
+
     /// As `FileSystem::read_link`, for a child of this handle: never follows, and refuses a
     /// non-link (`IoError`/`InvalidInput`), a non-symlink name-surrogate
     /// (`SpecialFileUnsupported`) and a missing name (`IoError`/`NotFound`).
@@ -411,6 +432,11 @@ pub trait DirHandle: Sized {
         name: &std::ffi::OsStr,
         durability: crate::Durability,
     ) -> Result<Self::Claims>;
+
+    /// Create `name` exclusively through this handle (read and write, never following a link) and open a hardlink index
+    /// on it. Fails with `ErrorKind::AlreadyExists` if the name is taken. Calls `check_component(name)` first. The index
+    /// is per-run scratch: its commits are never synced.
+    fn create_hardlink_index(&self, name: &std::ffi::OsStr) -> Result<Self::Index>;
 
     /// Open the EXISTING claim store `name` (cut 9a): read and write, never following a link, never creating.
     /// A missing name is `Code::IoError` kind `NotFound`; a link `Code::SafetyRejected`; a directory

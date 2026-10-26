@@ -18,14 +18,15 @@ use crate::copy::{
     split_destination, stage_file, sync_staged_many, unguarded, weaker,
 };
 use crate::dry_run::{PlannedAction, PlannedEntry, PlannedObject, SkipReason};
+use crate::hardlinks::{Candidacy, anchor_parent, candidacy, shown, strong};
 use crate::names::{NameIndex, Resolved};
 use crate::state::{FLUX_DIR, RESERVED_DIRS, identity_text, native_hex};
 use crate::walk::{DEFAULT_MAX_DEPTH, MountPolicy, Walk, WalkEvent, WalkOptions, walk_with};
 use flux_fs::{
     ClaimKey, ClaimOutcome, ClaimRecord, ClaimStatus, ClaimStore, Code, CopyOptions,
     DestinationRoot, DirHandle, Durability, ExistingPolicy, FileIdentity, FileSystem, FileType,
-    FluxPathKey, FsError, Links, Metadata, MetadataFailure, MountRoot, ObjectId, PreparedRecord,
-    Preserve, Publish, RecoveryOp, Safety,
+    FluxPathKey, FsError, HardlinkEntry, HardlinkIndex, Hardlinks, Links, Metadata,
+    MetadataFailure, MountRoot, ObjectId, PreparedRecord, Preserve, Publish, RecoveryOp, Safety,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -95,6 +96,29 @@ pub struct TreeOutcome {
     pub partial_resumes: Vec<PartialResume>,
     /// Cut 9f-1: every published file whose checkpoints were discarded, and why (nothing is discarded silently).
     pub checkpoint_discards: Vec<CheckpointDiscard>,
+    /// Cut 12: files recreated as a hardlink to their group's anchor. Not in `files_copied` or `bytes_copied`.
+    pub files_hardlinked: u64,
+    /// Cut 12: members of a hardlink group copied independently, whatever the reason.
+    pub hardlinks_degraded: u64,
+    /// Cut 12: members whose anchor could not be checked (the design's "cannot be checked" row): count and first example.
+    pub hardlinks_unchecked: Option<DegradedGroup>,
+    /// Cut 12: degradations caused by a weak or unavailable identity, aggregated as `warnings` is.
+    pub hardlink_weak: WeakIdentityWarnings,
+    /// Cut 12: the degradations that are NOT weak identity, one count and first example per cause.
+    pub hardlinks_unlinked: BTreeMap<UnlinkedWhy, DegradedGroup>,
+}
+
+/// Cut 12: why a hardlink group member was copied independently when its identity was fine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UnlinkedWhy {
+    /// The destination refused the link (`HARDLINK_UNAVAILABLE`).
+    LinkRefused,
+    /// The anchor's directory could not be opened for linking.
+    AnchorUnavailable,
+    /// The existing-file policy split the group.
+    PolicySplit,
+    /// The hardlink index failed to answer or record.
+    IndexFailure,
 }
 
 /// Cut 9f-1: a file resumed from a validated prefix. `path` is relative to the source root, as the walk reports it.
@@ -158,6 +182,7 @@ impl TreeAbort {
     pub fn changed(&self) -> bool {
         self.outcome.directories_created > 0
             || self.outcome.files_copied > 0
+            || self.outcome.files_hardlinked > 0
             || self.error.leftover.is_some()
     }
 
@@ -437,6 +462,11 @@ pub(crate) struct Shared<'c, F: DestinationRoot> {
     /// root. `None` for a single-root run, whose keys stay byte-identical to the root-relative path. `TreeFailure.path`
     /// stays root-relative (display only).
     pub(crate) key_prefix: Option<&'c OsStr>,
+    /// Cut 12: the run's hardlink index slot; `None` for `--hardlinks=copy` and a lockless `copy_tree`.
+    pub(crate) hardlinks: Option<&'c crate::hardlinks::HardlinkSlot<F::Dir>>,
+    /// Cut 12: a second handle on DEST for opening an anchor's directory; `None` for a dry run, a lockless copy, or a
+    /// root that did not match the walk's (plan ruling 8).
+    pub(crate) anchor_root: Option<&'c F::Dir>,
 }
 
 impl<'c, F: DestinationRoot> Shared<'c, F> {
@@ -464,6 +494,8 @@ impl<'c, F: DestinationRoot> Shared<'c, F> {
             dry_prior: self.dry_prior,
             dry_partials: self.dry_partials,
             key_prefix,
+            hardlinks: self.hardlinks,
+            anchor_root: self.anchor_root,
         }
     }
 
@@ -646,6 +678,8 @@ fn run_tree<F: DestinationRoot>(
         dry_prior: None,
         dry_partials: None,
         key_prefix: None,
+        hardlinks: None,
+        anchor_root: None,
     };
     copy_tree_at(&cx, source.events, root, false, out, on_report).1
 }
@@ -1537,6 +1571,74 @@ fn target_failure(step: CopyStep, code: Code, why: &'static str) -> TreeFailureC
     TreeFailureCause::Copy(CopyError::at(step, FsError::new(code, std::io::Error::other(why))))
 }
 
+/// The source stat `copy_one` shares between the hardlink candidacy, the checkpoint context, `--resume` and the
+/// existing-file policy (plan ruling 2): one stat, made once, only when one of them needs it. The no-claims path
+/// (`claims == false`) forces `Overwrite` and has no checkpoint or resume reader, so only the hardlink run needs it.
+fn source_stat<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    src: &Path,
+    claims: bool,
+) -> std::result::Result<Option<Metadata>, CopyError> {
+    let needed = cx.hardlinks.is_some()
+        || (claims
+            && (cx.ckpt.is_some() || cx.resume || cx.opts.existing != ExistingPolicy::Overwrite));
+    if !needed {
+        return Ok(None);
+    }
+    cx.fs.metadata(src).map(Some).map_err(|e| CopyError::at(CopyStep::Source, e))
+}
+
+/// Cut 12: the degradations that need no index, decided from the source's candidacy for a regular file when the run
+/// has a hardlink slot. `true`: the entry is finished (a failure was reported, nothing is created); `false`: the file
+/// copies as an ordinary one. `has_claims` is false in the no-claims path, where no anchor can be recorded.
+fn hardlink_degradation<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    src_meta: Option<&Metadata>,
+    has_claims: bool,
+    path: &Path,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) -> bool {
+    let (Some(_), Some(meta)) = (cx.hardlinks, src_meta) else { return false };
+    let preserve = cx.opts.hardlinks == Hardlinks::Preserve;
+    match candidacy(meta) {
+        Candidacy::NotCandidate => false,
+        Candidacy::Unchecked => {
+            DegradedGroup::note(&mut out.hardlinks_unchecked, path);
+            false
+        }
+        Candidacy::Weak(identity) => {
+            if preserve {
+                let cause = target_failure(
+                    CopyStep::Gate,
+                    Code::HardlinkIdentityUnavailable,
+                    "the source filesystem reports no reliable identity for a multiply-linked file",
+                );
+                report(out, on_report, path.to_path_buf(), cause);
+                return true;
+            }
+            out.hardlinks_degraded += 1;
+            out.hardlink_weak.record(identity, path);
+            false
+        }
+        Candidacy::Candidate(_) if !has_claims => {
+            if preserve {
+                let cause = target_failure(
+                    CopyStep::Claim,
+                    Code::HardlinkUnavailable,
+                    "no claim store keys this directory, so no anchor can be recorded",
+                );
+                report(out, on_report, path.to_path_buf(), cause);
+                return true;
+            }
+            degrade(out, path, UnlinkedWhy::AnchorUnavailable);
+            false
+        }
+        // A candidate with claims meets its group's index entry in `copy_one` (`hardlink_group`, `meet_group`).
+        Candidacy::Candidate(_) => false,
+    }
+}
+
 /// A `File` event under a live frame. See the design, "The per-file protocol".
 ///
 /// The tree decides what an existing destination means and tells the copy path `ExistingPolicy::Overwrite`, so the
@@ -1560,6 +1662,16 @@ fn copy_one<F: DestinationRoot>(
     let (Some(parent_id), Some(claims)) = (claim_parent, cx.claims) else {
         // No claims for this directory (a lockless copy, or an identity that cannot key them): exactly the cut 4b
         // behaviour. An existing name is a collision.
+        let src_known = match source_stat(cx, &src, false) {
+            Ok(m) => m,
+            Err(e) => {
+                report(out, on_report, path, TreeFailureCause::Copy(e));
+                return Ok(());
+            }
+        };
+        if hardlink_degradation(cx, src_known.as_ref(), false, &path, out, on_report) {
+            return Ok(());
+        }
         if cx.dry_run {
             return dry_stop_file(
                 cx,
@@ -1571,7 +1683,8 @@ fn copy_one<F: DestinationRoot>(
                 false,
                 out,
                 on_report,
-            );
+            )
+            .map(|_| ());
         }
         let Some(parent) = parent else {
             unreachable!("only a dry run has a planned directory");
@@ -1607,9 +1720,22 @@ fn copy_one<F: DestinationRoot>(
         }
     };
 
+    // Plan ruling 2: the source is stat'ed once, here, for every reader below.
+    let src_known = match source_stat(cx, &src, true) {
+        Ok(m) => m,
+        Err(e) => {
+            report(out, on_report, path, TreeFailureCause::Copy(e));
+            return Ok(());
+        }
+    };
+    // Cut 12: a link candidate meets its group's index entry here, once; it is never batched (plan ruling 3: a canonical
+    // staged into a batch would publish after its dependents are met).
+    let group = hardlink_group(cx, src_known.as_ref());
+
     // Cut 9d, spec decision 2: a Strict publication into a store with notes is staged into the directory's batch, unless
     // the policy turns batching off (plan ruling 1: `files == 1` is the per-file cut 9c path below).
     let batching = !cx.dry_run
+        && group.is_none()
         && cx.batch.files > 1
         && cx.opts.durability == Durability::Strict
         && claims.borrow().supports_prepared();
@@ -1672,15 +1798,9 @@ fn copy_one<F: DestinationRoot>(
                 return finish_copy(cx.key_prefix, path, Err(e), out, on_report);
             }
             // Cut 9a: `--resume`. The branch mutates nothing at the destination, so it neither beats nor guards.
-            let mut src_known: Option<Metadata> = None;
             if cx.resume {
-                let src_meta = match cx.fs.metadata(&src) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        let cause = TreeFailureCause::Copy(CopyError::at(CopyStep::Source, e));
-                        report(out, on_report, path, cause);
-                        return Ok(());
-                    }
+                let Some(src_meta) = src_known.as_ref() else {
+                    unreachable!("a resuming run reads the source up front");
                 };
                 let found = claims.borrow().get(&ClaimKey::new(parent_id, &stored));
                 match found {
@@ -1695,7 +1815,8 @@ fn copy_one<F: DestinationRoot>(
                     }
                     Ok(Some(r)) if r.target == target => {
                         if r.status == ClaimStatus::Created
-                            && resumed_complete(&src_meta, &meta, cx.opts.preserve_times)
+                            && resumed_complete(src_meta, &meta, cx.opts.preserve_times)
+                            && resume_keeps(cx, &group, &target, &meta, &path, out, on_report)
                         {
                             out.files_resumed += 1;
                             out.bytes_resumed += src_meta.len;
@@ -1726,7 +1847,6 @@ fn copy_one<F: DestinationRoot>(
                     }
                     Ok(None) => {}
                 }
-                src_known = Some(src_meta);
             }
             if meta.file_type == FileType::Dir {
                 let cause = target_failure(
@@ -1740,26 +1860,20 @@ fn copy_one<F: DestinationRoot>(
             let skip = match cx.opts.existing {
                 ExistingPolicy::Overwrite => None,
                 policy => {
-                    let src_meta = match src_known {
-                        Some(m) => m,
-                        None => match cx.fs.metadata(&src) {
-                            Ok(m) => m,
-                            Err(e) => {
-                                let cause =
-                                    TreeFailureCause::Copy(CopyError::at(CopyStep::Source, e));
-                                report(out, on_report, path, cause);
-                                return Ok(());
-                            }
-                        },
+                    let Some(src_meta) = src_known.as_ref() else {
+                        unreachable!("a non-overwrite policy reads the source up front");
                     };
                     let replace =
-                        policy == ExistingPolicy::Update && update_replaces(&src_meta, &meta);
+                        policy == ExistingPolicy::Update && update_replaces(src_meta, &meta);
                     (!replace).then_some(src_meta.len)
                 }
             };
             if let Some(len) = skip {
                 out.files_skipped += 1;
                 out.bytes_skipped += len;
+                if let Some(group) = &group {
+                    skipped_member(cx, group, &target, &meta, &path, out);
+                }
                 if cx.dry_run {
                     // A skipped target never reaches the identity gate, live or dry.
                     let reason = if cx.opts.existing == ExistingPolicy::SkipExisting {
@@ -1779,12 +1893,32 @@ fn copy_one<F: DestinationRoot>(
         }
     };
 
+    // Cut 12: a file that will be copied meets the degradations that need no index (a skipped one is untouched).
+    if hardlink_degradation(cx, src_known.as_ref(), true, &path, out, on_report) {
+        return Ok(());
+    }
+    // The group's entry decides a candidate's fate in a dry run too (cut 12 Task 8): a dependent is predicted a link
+    // with no destination I/O, a canonical is planned as a copy and registered without a destination object.
+    let mut meet = meet_group(cx, group, &path, out, on_report);
+    if matches!(meet, Meet::Finished) {
+        return Ok(());
+    }
     if cx.dry_run {
         let (publish, replace) = match plan {
             Plan::New => (Publish::NoReplace, false),
             Plan::Replace { .. } => (Publish::Replace, true),
         };
-        return dry_stop_file(cx, parent, name, &src, path, publish, replace, out, on_report);
+        if matches!(meet, Meet::Link { .. }) {
+            // A dry run cannot see a vanished anchor or a refused link, and does not predict them (the design).
+            return dry_link(cx, name, path, replace, out, on_report);
+        }
+        let planned =
+            dry_stop_file(cx, parent, name, &src, path.clone(), publish, replace, out, on_report)?;
+        // No destination object exists in a dry run, so the anchor carries none; a canonical that failed to plan
+        // blocks its dependents as a failed live copy does.
+        let published = planned.then_some(FileIdentity::Unavailable);
+        register_outcome(cx, meet, &target, published, &path, out, on_report);
+        return Ok(());
     }
     let Some(parent) = parent else {
         unreachable!("only a dry run has a planned directory");
@@ -1796,7 +1930,7 @@ fn copy_one<F: DestinationRoot>(
     // looked at the source): a smaller file takes the unchanged path, with no extra guard. `stage_file` filters again.
     let file_ckpt = |key: &ClaimKey| {
         let run = cx.ckpt?;
-        let len = cx.fs.metadata(&src).ok()?.len;
+        let len = src_known.as_ref()?.len;
         (len >= run.min_len()).then(|| FileCkpt {
             run,
             file_id: key.encode(),
@@ -1852,6 +1986,39 @@ fn copy_one<F: DestinationRoot>(
             let hook = |intent: &PublishIntent| write_note(claims, &key, &template, &wrote, intent);
             let before_publish: &BeforePublish<'_> =
                 if strict { &hook } else { &no_before_publish };
+            if let Some((anchor, object)) = take_link(&mut meet) {
+                let Some(src_meta) = src_known.as_ref() else {
+                    unreachable!("a candidate's source was read up front");
+                };
+                let step = link_member(
+                    cx,
+                    parent,
+                    names,
+                    batch,
+                    out,
+                    on_report,
+                    name,
+                    src_meta,
+                    &anchor,
+                    object,
+                    Publish::NoReplace,
+                    &no_before_create,
+                    before_publish,
+                )?;
+                match settle_link(cx, claims, &key, &wrote, &path, step, out, on_report)? {
+                    Settled::Linked(o) => {
+                        let identity = o.published_identity;
+                        record_new(
+                            claims, &key, &target, strict, names, name, identity, &path, out,
+                            on_report,
+                        );
+                        count_linked(out, &o, &path);
+                        return Ok(());
+                    }
+                    Settled::Finished => return Ok(()),
+                    Settled::Copy => {}
+                }
+            }
             let opts = CopyOptions {
                 existing: ExistingPolicy::Overwrite,
                 publish: Publish::NoReplace,
@@ -1882,16 +2049,11 @@ fn copy_one<F: DestinationRoot>(
                 note_reuse(out, &path, reuse, recopied);
             }
             if let Some(identity) = published {
-                let recorded = if strict {
-                    claims.borrow_mut().commit_prepared(&key, &target, None)
-                } else {
-                    record_claim(claims, &key, &own(ClaimStatus::Created))
-                };
-                if let Err(e) = recorded {
-                    report(out, on_report, path, TreeFailureCause::ClaimNotRecorded(e));
-                }
-                names.record_publication(&target, None, name, None, identity);
+                record_new(
+                    claims, &key, &target, strict, names, name, identity, &path, out, on_report,
+                );
             }
+            register_outcome(cx, meet, &target, published, &path, out, on_report);
             Ok(())
         }
         // 5. Replace, under a claim on the stored name made after the gate and the section 99 checks.
@@ -1961,6 +2123,49 @@ fn copy_one<F: DestinationRoot>(
                 |intent: &PublishIntent| write_note(claims, &key_stored, &template, &wrote, intent);
             let before_publish: &BeforePublish<'_> =
                 if strict { &hook } else { &no_before_publish };
+            if let Some((anchor, object)) = take_link(&mut meet) {
+                let Some(src_meta) = src_known.as_ref() else {
+                    unreachable!("a candidate's source was read up front");
+                };
+                let step = link_member(
+                    cx,
+                    parent,
+                    names,
+                    batch,
+                    out,
+                    on_report,
+                    name,
+                    src_meta,
+                    &anchor,
+                    object,
+                    Publish::Replace,
+                    &before_create,
+                    before_publish,
+                )?;
+                match settle_link(cx, claims, &key_stored, &wrote, &path, step, out, on_report)? {
+                    Settled::Linked(o) => {
+                        let identity = o.published_identity;
+                        record_replace(
+                            claims,
+                            parent_id,
+                            &stored,
+                            name,
+                            &target,
+                            strict,
+                            meta.identity,
+                            names,
+                            identity,
+                            &path,
+                            out,
+                            on_report,
+                        );
+                        count_linked(out, &o, &path);
+                        return Ok(());
+                    }
+                    Settled::Finished => return Ok(()),
+                    Settled::Copy => {}
+                }
+            }
             let opts = CopyOptions {
                 existing: ExistingPolicy::Overwrite,
                 publish: Publish::Replace,
@@ -1998,34 +2203,546 @@ fn copy_one<F: DestinationRoot>(
                 note_reuse(out, &path, reuse, recopied);
             }
             if let Some(identity) = published {
-                out.files_overwritten += 1;
-                // The entry now holds the new object under its stored name (and, on some systems, the planned one).
-                let recorded = if strict {
-                    let planned = (name != stored).then(|| ClaimKey::new(parent_id, name));
-                    claims.borrow_mut().commit_prepared(&key_stored, &target, planned.as_ref())
-                } else {
-                    let mut recorded = claims.borrow_mut().upgrade_own_claim(&key_stored, &target);
-                    if name != stored {
-                        let planned = record_claim(
-                            claims,
-                            &ClaimKey::new(parent_id, name),
-                            &own(ClaimStatus::Created),
-                        );
-                        recorded = recorded.and(planned);
-                    }
-                    recorded
-                };
-                if let Err(e) = recorded {
-                    report(out, on_report, path, TreeFailureCause::ClaimNotRecorded(e));
-                }
-                let replaced = match meta.identity {
-                    FileIdentity::Strong(id) => Some(id),
-                    _ => None,
-                };
-                names.record_publication(&target, Some(&stored), name, replaced, identity);
+                record_replace(
+                    claims,
+                    parent_id,
+                    &stored,
+                    name,
+                    &target,
+                    strict,
+                    meta.identity,
+                    names,
+                    identity,
+                    &path,
+                    out,
+                    on_report,
+                );
             }
+            register_outcome(cx, meet, &target, published, &path, out, on_report);
             Ok(())
         }
+    }
+}
+
+/// Cut 12: records a published file's claim after the `Plan::New` arm's copy or link: `Created` (Strict: the prepared
+/// note committed), then the name published for this target.
+#[allow(clippy::too_many_arguments)]
+fn record_new<C: ClaimStore + ?Sized>(
+    claims: &std::cell::RefCell<C>,
+    key: &ClaimKey,
+    target: &FluxPathKey,
+    strict: bool,
+    names: &mut NameIndex,
+    name: &OsStr,
+    identity: FileIdentity,
+    path: &Path,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) {
+    let recorded = if strict {
+        claims.borrow_mut().commit_prepared(key, target, None)
+    } else {
+        let created = ClaimRecord { target: target.clone(), status: ClaimStatus::Created };
+        record_claim(claims, key, &created)
+    };
+    if let Err(e) = recorded {
+        report(out, on_report, path.to_path_buf(), TreeFailureCause::ClaimNotRecorded(e));
+    }
+    names.record_publication(target, None, name, None, identity);
+}
+
+/// Cut 12: `record_new` for the `Plan::Replace` arm: counts the overwrite, upgrades the claim on the stored name (and
+/// claims the planned one when it differs), and publishes the name, with the object it replaced.
+#[allow(clippy::too_many_arguments)]
+fn record_replace<C: ClaimStore + ?Sized>(
+    claims: &std::cell::RefCell<C>,
+    parent_id: ObjectId,
+    stored: &OsStr,
+    name: &OsStr,
+    target: &FluxPathKey,
+    strict: bool,
+    replaced: FileIdentity,
+    names: &mut NameIndex,
+    identity: FileIdentity,
+    path: &Path,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) {
+    out.files_overwritten += 1;
+    // The entry now holds the new object under its stored name (and, on some systems, the planned one).
+    let key_stored = ClaimKey::new(parent_id, stored);
+    let planned = (name != stored).then(|| ClaimKey::new(parent_id, name));
+    let recorded = if strict {
+        claims.borrow_mut().commit_prepared(&key_stored, target, planned.as_ref())
+    } else {
+        let mut recorded = claims.borrow_mut().upgrade_own_claim(&key_stored, target);
+        if let Some(planned) = &planned {
+            let created = ClaimRecord { target: target.clone(), status: ClaimStatus::Created };
+            recorded = recorded.and(record_claim(claims, planned, &created));
+        }
+        recorded
+    };
+    if let Err(e) = recorded {
+        report(out, on_report, path.to_path_buf(), TreeFailureCause::ClaimNotRecorded(e));
+    }
+    names.record_publication(target, Some(stored), name, strong(replaced), identity);
+}
+
+/// A linked member is counted `files_hardlinked`, never copied; the weaker comparison its gate made is recorded as a
+/// copy's is.
+fn count_linked(out: &mut TreeOutcome, linked: &flux_fs::Outcome, path: &Path) {
+    out.files_hardlinked += 1;
+    if let Some(weaker) = linked.identity_degraded {
+        out.files_degraded += 1;
+        out.warnings.record(weaker, path);
+    }
+}
+
+/// Cut 12: how a hardlink candidate meets the copy arms, decided from its group's index entry.
+enum Meet {
+    /// Not a group member, or one that copies on its own without registering (an index failure under `auto`).
+    Ordinary,
+    /// A failure was reported; nothing more to do.
+    Finished,
+    /// Link to the anchor (`object` is its destination object when it was strong).
+    Link { anchor: FluxPathKey, object: Option<ObjectId> },
+    /// Copy; the result becomes the group's entry. `skipped`: how many members the existing-file policy skipped before
+    /// this one, and the first of them.
+    Canonical { id: ObjectId, skipped: Option<(u64, FluxPathKey)> },
+}
+
+/// The link a candidate is to make, taken out of `meet` (which stays as it is for any other case).
+fn take_link(meet: &mut Meet) -> Option<(FluxPathKey, Option<ObjectId>)> {
+    match std::mem::replace(meet, Meet::Ordinary) {
+        Meet::Link { anchor, object } => Some((anchor, object)),
+        other => {
+            *meet = other;
+            None
+        }
+    }
+}
+
+/// A candidate's source object and what the index said about it.
+struct Group {
+    id: ObjectId,
+    entry: Lookup,
+}
+
+enum Lookup {
+    /// The lookup failed (or the index never opened): the member cannot be checked (plan ruling 13).
+    Unreadable,
+    Found(Option<HardlinkEntry>),
+}
+
+/// The index lookup for a link candidate: `Some` for a regular file with `nlink > 1` and a `Strong` identity in a run
+/// that links. A dry run looks up its own temporary index (cut 12 Task 8), so it predicts what a live run would do.
+fn hardlink_group<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    meta: Option<&Metadata>,
+) -> Option<Group> {
+    let (Some(slot), Some(meta)) = (cx.hardlinks, meta) else { return None };
+    let Candidacy::Candidate(id) = candidacy(meta) else { return None };
+    let entry = match slot.with(|index| index.get(&id)) {
+        Ok(found) => Lookup::Found(found),
+        Err(_) => Lookup::Unreadable,
+    };
+    Some(Group { id, entry })
+}
+
+/// The `--resume` skip site for a completed destination (design "Resume (R2)"). `true`: skip it as resumed. `false`:
+/// a candidate whose destination is not the anchor's object falls through to the policy decision and the link path.
+#[allow(clippy::too_many_arguments)]
+fn resume_keeps<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    group: &Option<Group>,
+    target: &FluxPathKey,
+    dest: &Metadata,
+    path: &Path,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) -> bool {
+    let Some(Group { id, entry }) = group else { return true };
+    let skipped = match entry {
+        // Plan ruling 13: an unreadable index is "cannot check". Under `preserve` the member is not skipped: the policy
+        // and link path run and `meet_group` reports `HardlinkUnavailable`. Under `auto` it is skipped and counted. A dry
+        // run's index is its temporary one, so an unreadable index is real there too and predicts the same.
+        Lookup::Unreadable if cx.opts.hardlinks == Hardlinks::Preserve => {
+            return false;
+        }
+        Lookup::Unreadable => {
+            degrade(out, path, UnlinkedWhy::IndexFailure);
+            return true;
+        }
+        Lookup::Found(None) => None,
+        Lookup::Found(Some(HardlinkEntry::Skipped { members, example, .. })) => {
+            Some((*members, example.clone()))
+        }
+        // A dry run decides these exactly as live does (its anchors carry the destination object when a resumed
+        // canonical registered them, none when the walk planned them): a completed member that is another object than
+        // the anchor falls through and is predicted `would_hardlink`.
+        Lookup::Found(Some(HardlinkEntry::Anchor { object: Some(a), .. })) => {
+            return strong(dest.identity) == Some(*a);
+        }
+        Lookup::Found(Some(HardlinkEntry::Anchor { object: None, .. })) => return false,
+        Lookup::Found(Some(HardlinkEntry::Failed { .. })) => return false,
+    };
+    let meet = Meet::Canonical { id: *id, skipped };
+    register_outcome(cx, meet, target, Some(dest.identity), path, out, on_report);
+    true
+}
+
+/// `hardlinks_degraded` and the cause's count and first example, for `members` members at once.
+fn degrade_many(out: &mut TreeOutcome, why: UnlinkedWhy, members: u64, example: &Path) {
+    out.hardlinks_degraded += members;
+    out.hardlinks_unlinked
+        .entry(why)
+        .or_insert_with(|| DegradedGroup { count: 0, example: example.to_path_buf() })
+        .count += members;
+}
+
+/// One member copied independently for `why` (a cause that is not a weak identity).
+fn degrade(out: &mut TreeOutcome, path: &Path, why: UnlinkedWhy) {
+    degrade_many(out, why, 1, path);
+}
+
+/// The existing-file policy skipped this candidate (`dest` is what it left in place): the group's entry says whether
+/// that is a degradation yet (plan ruling 16). Nothing is counted for the skip itself. A failed index write counts
+/// the member `IndexFailure` under `auto` (its split can no longer be told); under `preserve` it counts nothing: the
+/// member was skipped, not copied or failed.
+fn skipped_member<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    group: &Group,
+    target: &FluxPathKey,
+    dest: &Metadata,
+    path: &Path,
+    out: &mut TreeOutcome,
+) {
+    let (Some(slot), Lookup::Found(entry)) = (cx.hardlinks, &group.entry) else { return };
+    let here = strong(dest.identity);
+    let upsert = |out: &mut TreeOutcome, members, example: FluxPathKey| {
+        let skipped = HardlinkEntry::Skipped { object: here, members, example };
+        // A failed write loses the later accounting of this member; under `auto` the split is counted now instead
+        // (plan ruling 13). Under `preserve` the member stays a policy skip: it was never copied, so it has no
+        // failure to report.
+        if slot.with(|index| index.insert(&group.id, &skipped)).is_err()
+            && cx.opts.hardlinks != Hardlinks::Preserve
+        {
+            degrade(out, path, UnlinkedWhy::IndexFailure);
+        }
+    };
+    match entry {
+        None => upsert(out, 1, target.clone()),
+        Some(HardlinkEntry::Skipped { object, members, example }) => {
+            if object.is_some() && *object == here {
+                upsert(out, members + 1, example.clone());
+            } else {
+                degrade(out, path, UnlinkedWhy::PolicySplit);
+            }
+        }
+        Some(HardlinkEntry::Anchor { object: Some(anchor), .. }) if here == Some(*anchor) => {}
+        Some(HardlinkEntry::Anchor { .. }) => degrade(out, path, UnlinkedWhy::PolicySplit),
+        Some(HardlinkEntry::Failed { .. }) => {}
+    }
+}
+
+/// What a candidate that will be copied or linked does, by its group's entry (after the plan, the directory check and
+/// the dry-run branch). A reported failure answers `Meet::Finished`.
+fn meet_group<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    group: Option<Group>,
+    path: &Path,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) -> Meet {
+    let Some(Group { id, entry }) = group else { return Meet::Ordinary };
+    match entry {
+        Lookup::Found(None) => Meet::Canonical { id, skipped: None },
+        Lookup::Found(Some(HardlinkEntry::Skipped { members, example, .. })) => {
+            Meet::Canonical { id, skipped: Some((members, example)) }
+        }
+        Lookup::Found(Some(HardlinkEntry::Anchor { target: anchor, object })) => {
+            Meet::Link { anchor, object }
+        }
+        Lookup::Found(Some(HardlinkEntry::Failed { canonical })) => {
+            let why =
+                format!("its canonical member {} failed to copy", shown(&canonical).display());
+            let e = FsError::new(Code::BlockedByCanonicalFailure, std::io::Error::other(why));
+            let cause = TreeFailureCause::Copy(CopyError::at(CopyStep::Gate, e));
+            report(out, on_report, path.to_path_buf(), cause);
+            Meet::Finished
+        }
+        Lookup::Unreadable if cx.opts.hardlinks == Hardlinks::Preserve => {
+            let cause = target_failure(
+                CopyStep::Claim,
+                Code::HardlinkUnavailable,
+                "the hardlink index could not be read",
+            );
+            report(out, on_report, path.to_path_buf(), cause);
+            Meet::Finished
+        }
+        Lookup::Unreadable => {
+            degrade(out, path, UnlinkedWhy::IndexFailure);
+            Meet::Ordinary
+        }
+    }
+}
+
+/// After a canonical's copy (`published` is the new object's identity, `None` when the copy failed and was reported):
+/// record the group's entry, and with an anchor the members the policy had skipped are now degradations (ruling 16).
+fn register_outcome<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    meet: Meet,
+    target: &FluxPathKey,
+    published: Option<FileIdentity>,
+    path: &Path,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) {
+    let (Meet::Canonical { id, skipped }, Some(slot)) = (meet, cx.hardlinks) else { return };
+    // Ruled acceptable at the fresh and the resume site alike: under `preserve` a failed index write both reports a
+    // failure and counts the file (copied or resumed); the file on disk is correct, the failure concerns the group.
+    // Ruled acceptable: the anchor is registered even when the canonical's claim was not recorded (that loss is already
+    // reported as `ClaimNotRecorded`, and `--resume` heals the members by rule 3), and an error inserting `Failed` is
+    // ignored (the canonical's own failure is the report; later members find no entry and form a group of their own).
+    let entry = match published {
+        Some(identity) => {
+            HardlinkEntry::Anchor { target: target.clone(), object: strong(identity) }
+        }
+        None => HardlinkEntry::Failed { canonical: target.clone() },
+    };
+    match slot.with(|index| index.insert(&id, &entry)) {
+        Ok(()) => {
+            if let (Some(_), Some((members, example))) = (published, skipped) {
+                degrade_many(out, UnlinkedWhy::PolicySplit, members, &shown(&example));
+            }
+        }
+        // A failed canonical needs no second report: the later members simply find no entry.
+        Err(_) if published.is_none() => {}
+        Err(e) => {
+            if cx.opts.hardlinks == Hardlinks::Preserve {
+                let cause = TreeFailureCause::Copy(CopyError::at(CopyStep::Claim, e));
+                report(out, on_report, path.to_path_buf(), cause);
+            } else {
+                degrade(out, path, UnlinkedWhy::IndexFailure);
+            }
+        }
+    }
+}
+
+/// What `settle_link` made of a link attempt.
+enum Settled {
+    /// The member is a link; the arm records its claim.
+    Linked(flux_fs::Outcome),
+    /// The attempt failed, or was refused under `preserve`, and was reported.
+    Finished,
+    /// Degraded under `auto` (counted): the arm copies it.
+    Copy,
+}
+
+/// A `link_member` answer as the arm needs it: a degradation is counted (`auto`) or reported (`preserve`), and a
+/// failure goes through `discard_note_on_failure` and `finish_copy`, so a stop propagates and anything else is reported.
+#[allow(clippy::too_many_arguments)]
+fn settle_link<F: DestinationRoot, C: ClaimStore + ?Sized>(
+    cx: &Shared<'_, F>,
+    claims: &std::cell::RefCell<C>,
+    key: &ClaimKey,
+    wrote: &std::cell::Cell<bool>,
+    path: &Path,
+    step: std::result::Result<LinkStep, CopyError>,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) -> std::result::Result<Settled, CopyError> {
+    match step {
+        Ok(LinkStep::Linked(outcome)) => Ok(Settled::Linked(outcome)),
+        Ok(LinkStep::Degrade(step, why, text)) => {
+            if cx.opts.hardlinks == Hardlinks::Preserve {
+                let cause = target_failure(step, Code::HardlinkUnavailable, text);
+                report(out, on_report, path.to_path_buf(), cause);
+                Ok(Settled::Finished)
+            } else {
+                degrade(out, path, why);
+                Ok(Settled::Copy)
+            }
+        }
+        Err(e) => {
+            let failed =
+                discard_note_on_failure(claims, key, wrote, cx.guard, path, Err(e), out, on_report);
+            finish_copy(cx.key_prefix, path.to_path_buf(), failed, out, on_report)?;
+            Ok(Settled::Finished)
+        }
+    }
+}
+
+/// Cut 12: `link_member`'s answer when the link was made and published, or why this member cannot be linked.
+enum LinkStep {
+    Linked(flux_fs::Outcome),
+    /// Not linked, nothing of ours left on disk: the step it failed at, why, and the text for `preserve`'s failure.
+    Degrade(CopyStep, UnlinkedWhy, &'static str),
+}
+
+/// Cut 12 (design, "Fresh copy" step 2): a group member that is NOT the canonical: no data is transferred. The anchor
+/// is checked to still be the registered object, then (master §16.1 as `publish_link`) the member's temporary is made
+/// with `create_hardlink`, its identity must be the registered object's, and it is published with the plan's `publish`.
+/// The outer `Err` is a stop from a flush, which the entry passes on unreported; the inner result is the entry's, for
+/// `settle_link`.
+#[allow(clippy::too_many_arguments)]
+fn link_member<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    parent: &F::Dir,
+    names: &mut NameIndex,
+    batch: &mut Batch<F::Writer>,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+    name: &OsStr,
+    src_meta: &Metadata,
+    anchor: &FluxPathKey,
+    object: Option<ObjectId>,
+    publish: Publish,
+    before_create: &BeforeCreate<'_>,
+    before_publish: &BeforePublish<'_>,
+) -> std::result::Result<std::result::Result<LinkStep, CopyError>, CopyError> {
+    let degraded = |step, why, text| Ok(Ok(LinkStep::Degrade(step, why, text)));
+    // 1. The anchor is still the object that was registered.
+    let Some(object) = object else {
+        return degraded(
+            CopyStep::Gate,
+            UnlinkedWhy::AnchorUnavailable,
+            "the anchor's destination identity is not strong",
+        );
+    };
+    let Some(root) = cx.anchor_root else {
+        return degraded(
+            CopyStep::Gate,
+            UnlinkedWhy::AnchorUnavailable,
+            "DEST could not be reopened for linking",
+        );
+    };
+    let Some((anchor_dir, anchor_name)) = anchor_parent(root, anchor) else {
+        return degraded(
+            CopyStep::Gate,
+            UnlinkedWhy::AnchorUnavailable,
+            "the anchor's directory could not be opened",
+        );
+    };
+    let anchor_dir: &F::Dir = &anchor_dir;
+    if !anchor_dir.metadata(&anchor_name).is_ok_and(|m| strong(m.identity) == Some(object)) {
+        return degraded(
+            CopyStep::Gate,
+            UnlinkedWhy::AnchorUnavailable,
+            "the anchor is gone or is another object",
+        );
+    }
+    // The identity gate a copy runs at this name (a replacement must not be the source itself; `Safety::Strict` refuses
+    // a target that cannot be compared). A refusal is the member's failure, not a degradation.
+    let gate = match identity_gate(parent, name, src_meta, cx.opts.safety, publish) {
+        Ok(g) => g,
+        Err(e) => return Ok(Err(e)),
+    };
+    // 2. As `publish_link`: heartbeat and guard before the first mutation; with entries pending and something at this
+    // operation's temporary name the batch is flushed first, and the leftover at the name removed.
+    let temp = flux_fs::temp_path(Path::new(name), &cx.opts.operation_id).into_os_string();
+    if let Err(e) = (cx.beat)() {
+        return Ok(Err(CopyError::at(CopyStep::Heartbeat, e)));
+    }
+    if let Err(e) = (cx.guard)() {
+        return Ok(Err(CopyError::at(CopyStep::Create, e)));
+    }
+    if !batch.pending.is_empty() && parent.metadata(&temp).is_ok() {
+        flush_batch(cx, parent, names, batch, out, on_report)?;
+        if let Err(e) = (cx.beat)() {
+            return Ok(Err(CopyError::at(CopyStep::Heartbeat, e)));
+        }
+        if let Err(e) = (cx.guard)() {
+            return Ok(Err(CopyError::at(CopyStep::Create, e)));
+        }
+    }
+    let _ = parent.remove_file(&temp);
+    // 3. The link, at the temporary: heartbeat, guard, `before_create` (the Replace claim), then the exclusive create.
+    let create = || -> std::result::Result<(), CopyError> {
+        (cx.beat)().map_err(|e| CopyError::at(CopyStep::Heartbeat, e))?;
+        (cx.guard)().map_err(|e| CopyError::at(CopyStep::Create, e))?;
+        before_create()?;
+        parent
+            .create_hardlink(&temp, anchor_dir, &anchor_name)
+            .map_err(|e| CopyError::at(CopyStep::Create, e))
+    };
+    let created = match create() {
+        // The second backstop, as `publish_link`: the name may be a pending sibling's temporary.
+        Err(e)
+            if e.step == CopyStep::Create
+                && e.cause.source.kind() == ErrorKind::AlreadyExists
+                && !batch.pending.is_empty() =>
+        {
+            flush_batch(cx, parent, names, batch, out, on_report)?;
+            create()
+        }
+        created => created,
+    };
+    match created {
+        Ok(()) => {}
+        Err(e) if e.step == CopyStep::Create && e.cause.code == Code::HardlinkUnavailable => {
+            return degraded(
+                CopyStep::Create,
+                UnlinkedWhy::LinkRefused,
+                "the destination cannot hold the link",
+            );
+        }
+        // A failed create made nothing of ours.
+        Err(e) => return Ok(Err(e)),
+    }
+    // 4. The anchor's name could have been swapped between the check and the link: only the registered object may be
+    // published. Anything else is removed (while this run holds the lock) and the member degrades.
+    let identity = match parent.metadata(&temp) {
+        Ok(m) => m.identity,
+        Err(e) => {
+            return Ok(Err(discard(parent, &temp, CopyStep::Create, e.code, e.source, cx.guard)));
+        }
+    };
+    if strong(identity) != Some(object) {
+        if let Err(lost) = (cx.guard)() {
+            let kept =
+                std::io::Error::other("kept: this run no longer holds the destination's lock");
+            return Ok(Err(CopyError {
+                leftover: Some((PathBuf::from(&temp), kept)),
+                ..CopyError::at(CopyStep::Create, lost)
+            }));
+        }
+        let _ = parent.remove_file(&temp);
+        return degraded(
+            CopyStep::Create,
+            UnlinkedWhy::AnchorUnavailable,
+            "the anchor changed while linking",
+        );
+    }
+    // 5. The note (Strict), then the publish itself.
+    let published = publish_identified(
+        cx,
+        parent,
+        name,
+        temp.clone(),
+        identity,
+        gate.degraded,
+        publish,
+        before_publish,
+    );
+    // 6. A same-object rename (POSIX `rename(2)` of a name onto another name of one object) leaves the temporary.
+    match published {
+        Ok(outcome) => {
+            if parent.metadata(&temp).is_ok() {
+                if let Err(lost) = (cx.guard)() {
+                    let kept = std::io::Error::other(
+                        "kept: this run no longer holds the destination's lock",
+                    );
+                    return Ok(Err(CopyError {
+                        leftover: Some((PathBuf::from(&temp), kept)),
+                        ..CopyError::at(CopyStep::Publish, lost)
+                    }));
+                }
+                let _ = parent.remove_file(&temp);
+            }
+            Ok(Ok(LinkStep::Linked(outcome)))
+        }
+        Err(e) => Ok(Err(e)),
     }
 }
 
@@ -2504,14 +3221,14 @@ fn dry_stop_file<F: DestinationRoot>(
     replace: bool,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
-) -> std::result::Result<(), CopyError> {
+) -> std::result::Result<bool, CopyError> {
     if let Err(e) = dry_temp_name_fits(cx, name) {
-        return finish_copy(cx.key_prefix, path, Err(e), out, on_report);
+        return finish_copy(cx.key_prefix, path, Err(e), out, on_report).map(|()| false);
     }
     let opts = CopyOptions { existing: ExistingPolicy::Overwrite, publish, ..cx.opts.clone() };
     let planned = match plan_file(cx.fs, src, parent, name, &opts) {
         Ok(p) => p,
-        Err(e) => return finish_copy(cx.key_prefix, path, Err(e), out, on_report),
+        Err(e) => return finish_copy(cx.key_prefix, path, Err(e), out, on_report).map(|()| false),
     };
     let (src_meta, degraded) = match planned {
         FilePlan::Proceed { src_meta, degraded, replaces } => {
@@ -2535,6 +3252,30 @@ fn dry_stop_file<F: DestinationRoot>(
     finish_copy(cx.key_prefix, path.clone(), Ok(outcome), out, on_report)?;
     let partial = dry_partial_len(cx, parent, name);
     dry_planned(out, on_report, path, PlannedObject::File, replace, partial);
+    Ok(true)
+}
+
+/// Cut 12 Task 8: a dry run's dependent of a hardlink group. No destination I/O: the entry counts as linked (never
+/// copied: ruling 11), a replacement as overwritten, and one `Planned` record says `would_hardlink`. Only the name's
+/// own length is checked (the live link makes a temporary of that name); the gate, the anchor and the link itself are
+/// the live run's to meet.
+fn dry_link<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    name: &std::ffi::OsStr,
+    path: PathBuf,
+    replace: bool,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) -> std::result::Result<(), CopyError> {
+    if let Err(e) = dry_temp_name_fits(cx, name) {
+        return finish_copy(cx.key_prefix, path, Err(e), out, on_report);
+    }
+    out.files_hardlinked += 1;
+    if replace {
+        out.files_overwritten += 1;
+    }
+    let entry = PlannedEntry { object: PlannedObject::File, action: PlannedAction::Hardlink };
+    report(out, on_report, path, TreeFailureCause::Planned(entry));
     Ok(())
 }
 
@@ -2713,6 +3454,21 @@ fn publish_created_link<F: DestinationRoot>(
             return Err(discard(parent, &temp, CopyStep::Create, e.code, e.source, cx.guard));
         }
     };
+    publish_identified(cx, parent, name, temp, identity, degraded, publish, before_publish)
+}
+
+/// `publish_created_link` with the created object's identity in hand: `before_publish`, then `publish_staged`.
+#[allow(clippy::too_many_arguments)]
+fn publish_identified<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    parent: &F::Dir,
+    name: &std::ffi::OsStr,
+    temp: OsString,
+    identity: FileIdentity,
+    degraded: Option<FileIdentity>,
+    publish: Publish,
+    before_publish: &BeforePublish<'_>,
+) -> std::result::Result<flux_fs::Outcome, CopyError> {
     let intent = PublishIntent { temp: temp.clone(), identity };
     if let Err(e) = before_publish(&intent) {
         let CopyError { cause, leftover, step } = e;
@@ -3719,6 +4475,7 @@ mod tests {
             operation_id: OperationId::new("op1"),
             existing: flux_fs::ExistingPolicy::Overwrite,
             links: Links::Copy,
+            hardlinks: flux_fs::Hardlinks::Auto,
             cross_filesystems: false,
         }
     }
@@ -4747,6 +5504,8 @@ mod tests {
             dry_prior: None,
             dry_partials: None,
             key_prefix: None,
+            hardlinks: None,
+            anchor_root: None,
         };
         let mut out = TreeOutcome::default();
         let mut got = Vec::new();
@@ -5765,6 +6524,8 @@ mod tests {
             dry_prior: None,
             dry_partials: None,
             key_prefix: None,
+            hardlinks: None,
+            anchor_root: None,
         };
         let mut out = TreeOutcome::default();
         let (_root, r) = copy_tree_at(&cx, source.events, root, false, &mut out, &mut |_| {});
@@ -5861,6 +6622,8 @@ mod tests {
             dry_prior: None,
             dry_partials: None,
             key_prefix: None,
+            hardlinks: None,
+            anchor_root: None,
         };
         let mut out = TreeOutcome::default();
         let mut reported = 0;
@@ -5905,6 +6668,8 @@ mod tests {
             dry_prior: None,
             dry_partials: None,
             key_prefix: None,
+            hardlinks: None,
+            anchor_root: None,
         };
         let mut out = TreeOutcome::default();
         let mut reported = 0;
@@ -5939,6 +6704,8 @@ mod tests {
             dry_prior: None,
             dry_partials: None,
             key_prefix: None,
+            hardlinks: None,
+            anchor_root: None,
         };
         let mut out = TreeOutcome::default();
         let (back, r) = copy_tree_at(&cx, source.events, root, false, &mut out, &mut |_| {});
@@ -6057,6 +6824,8 @@ mod tests {
             dry_prior: None,
             dry_partials: None,
             key_prefix,
+            hardlinks: None,
+            anchor_root: None,
         };
         let mut out = TreeOutcome::default();
         let mut got = Vec::new();
@@ -8056,6 +8825,8 @@ mod tests {
             dry_prior: None,
             dry_partials: None,
             key_prefix: None,
+            hardlinks: None,
+            anchor_root: None,
         };
         let (root, identity) = match dst_root {
             Some(d) => {
@@ -8601,6 +9372,8 @@ mod tests {
             dry_prior: None,
             dry_partials: None,
             key_prefix: None,
+            hardlinks: None,
+            anchor_root: None,
         };
         let mut out = TreeOutcome::default();
         let mut got = Vec::new();
@@ -8844,6 +9617,8 @@ mod tests {
             dry_prior: None,
             dry_partials: None,
             key_prefix: None,
+            hardlinks: None,
+            anchor_root: None,
         };
         // A source borrows its path for the whole walk, so the paths outlive the roots.
         let paths: Vec<PathBuf> = specs

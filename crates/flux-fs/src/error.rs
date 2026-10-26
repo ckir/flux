@@ -61,6 +61,19 @@ pub enum Code {
     /// Cut 9f-1. The checkpoint log was written by a newer Flux (an unknown format or checksum version). Stops the
     /// whole operation before any file is copied; `--restart` supersedes it.
     WalFormatUnsupported,
+    /// Cut 12, master §15/§16.1. A required destination hardlink cannot be created for one member: link creation
+    /// failed, or the member was skipped under `--hardlinks=preserve`.
+    /// Engine detail: the filesystem, volume or platform cannot link there, or the hardlink index or anchor cannot be
+    /// used. Under `preserve` that member fails with this code; under `auto` it is copied independently and counted.
+    /// Path-scoped.
+    HardlinkUnavailable,
+    /// Cut 12, master §108. `--hardlinks=preserve` was requested but reliable object identity is unavailable, so the
+    /// member cannot be checked. Path-scoped.
+    HardlinkIdentityUnavailable,
+    /// Cut 12, master §92. A dependent was not linked because its group reached terminal `Failed`: its canonical
+    /// member failed to copy, so there is nothing to link to. Path-scoped; the tree run reports it as a failed
+    /// `Copy` cause, so it counts as a failed file.
+    BlockedByCanonicalFailure,
 }
 
 impl Code {
@@ -86,6 +99,9 @@ impl Code {
             Code::IncompatibleState => "INCOMPATIBLE_STATE",
             Code::WalWriteFailed => "WAL_WRITE_FAILED",
             Code::WalFormatUnsupported => "WAL_FORMAT_UNSUPPORTED",
+            Code::HardlinkUnavailable => "HARDLINK_UNAVAILABLE",
+            Code::HardlinkIdentityUnavailable => "HARDLINK_IDENTITY_UNAVAILABLE",
+            Code::BlockedByCanonicalFailure => "BLOCKED_BY_CANONICAL_FAILURE",
         }
     }
 }
@@ -159,6 +175,9 @@ mod tests {
             Code::ControlPlaneNamespaceConflict.as_str(),
             "CONTROL_PLANE_NAMESPACE_CONFLICT"
         );
+        assert_eq!(Code::HardlinkUnavailable.as_str(), "HARDLINK_UNAVAILABLE");
+        assert_eq!(Code::HardlinkIdentityUnavailable.as_str(), "HARDLINK_IDENTITY_UNAVAILABLE");
+        assert_eq!(Code::BlockedByCanonicalFailure.as_str(), "BLOCKED_BY_CANONICAL_FAILURE");
     }
 
     #[test]

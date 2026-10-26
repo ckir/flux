@@ -61,6 +61,19 @@ flux benchmark
 flux cleanup
 ```
 
+### Hardlinks
+
+`flux copy --hardlinks=auto|preserve|copy` (default `auto`) decides what happens to a source file that has several names
+inside the copied tree. `auto` copies the first name met and links the other selected names to that copy, so the group
+stays one object with several names; where a link is impossible the member is copied independently and reported.
+`preserve` does the same but fails a member it cannot link (`HARDLINK_UNAVAILABLE`, `HARDLINK_IDENTITY_UNAVAILABLE`).
+`copy` copies every name as a separate file. Only the names inside the copied tree are grouped, for fresh copies and for
+`--resume`. The report counts links in `files_hardlinked` (not in `files_copied`) and adds `hardlinks_degraded` (members
+copied independently) and `hardlinks_unchecked` (files whose link count the filesystem did not report), each absent at
+zero; the summary line appends `; N hardlinked`, `; N hardlinks degraded` and `; N hardlinks unchecked` when non-zero.
+`--dry-run` reports a planned link as `would_hardlink` and counts it in `files_hardlinked`. A hardlinked symlink is still
+copied as independent links.
+
 ### Cleanup
 
 `flux cleanup DEST [--dry-run] [--force] [--json]` lists the operations under `DEST/.flux/operations/` and the

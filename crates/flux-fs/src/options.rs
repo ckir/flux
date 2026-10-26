@@ -87,6 +87,17 @@ pub enum Links {
     Skip,
 }
 
+/// What a tree copy does with a hardlink group in the source tree (master §15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hardlinks {
+    /// Recreate the group where the destination can, and copy the member separately where it cannot (the default).
+    Auto,
+    /// Recreate the group, and fail a member that cannot be linked.
+    Preserve,
+    /// Copy every member as its own file: today's behaviour.
+    Copy,
+}
+
 #[derive(Debug, Clone)]
 pub struct CopyOptions {
     pub preserve_times: Preserve,
@@ -97,6 +108,7 @@ pub struct CopyOptions {
     pub operation_id: OperationId,
     pub existing: ExistingPolicy,
     pub links: Links,
+    pub hardlinks: Hardlinks,
     pub cross_filesystems: bool,
 }
 
@@ -136,6 +148,14 @@ pub fn temp_path(target: &Path, id: &OperationId) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hardlinks_default_is_not_a_bool() {
+        // Three modes, so a boolean cannot express it (master §15).
+        assert_ne!(Hardlinks::Auto, Hardlinks::Preserve);
+        assert_ne!(Hardlinks::Preserve, Hardlinks::Copy);
+        assert_ne!(Hardlinks::Auto, Hardlinks::Copy);
+    }
 
     #[test]
     fn preserve_distinguishes_off_from_default() {

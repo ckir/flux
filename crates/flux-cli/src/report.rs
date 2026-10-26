@@ -11,7 +11,7 @@
 use flux_core::copy::CopyError;
 use flux_core::dry_run::{DryPrior, PlannedAction, PlannedEntry};
 use flux_core::run::{MultiRun, ResumeNote, RootReport, Run, RunError, RunWarning};
-use flux_core::tree::RootStatus;
+use flux_core::tree::{RootStatus, UnlinkedWhy};
 use flux_core::{
     Discard, TreeAbort, TreeFailure, TreeFailureCause, TreeOutcome, WeakIdentityWarnings,
 };
@@ -24,8 +24,8 @@ pub const SYMLINK_WHY: &str =
     "a symlink SOURCE is not followed; copy its parent folder, or name its target";
 
 /// §53's complete field list, in its order. Every value is true for what this version
-/// does: nothing hardlinks, reflinks or verifies, so those stay 0 and `verify_level`
-/// is `"none"`.
+/// does: nothing reflinks or verifies, so those stay 0 and `verify_level` is
+/// `"none"`; `files_hardlinked` counts cut 12's links.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct Report {
     pub files_total: u64,
@@ -52,6 +52,13 @@ pub struct Report {
     /// Cut 10b: source mount roots created as empty directories and not descended into; absent at zero.
     #[serde(skip_serializing_if = "is_zero")]
     pub mounts_skipped: u64,
+    /// Cut 12: members of a hardlink group copied independently, whatever the reason; absent at zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub hardlinks_degraded: u64,
+    /// Cut 12: files whose link count the filesystem did not report, so hardlinks among them were not looked for;
+    /// absent at zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub hardlinks_unchecked: u64,
     /// Cut 11a: `true` for a `--dry-run`; absent otherwise.
     #[serde(skip_serializing_if = "is_false")]
     pub dry_run: bool,
@@ -113,6 +120,8 @@ impl Report {
             hash_algorithm: "blake3",
             resume_verify: None,
             mounts_skipped: 0,
+            hardlinks_degraded: 0,
+            hardlinks_unchecked: 0,
             dry_run: false,
             unprobed: Vec::new(),
             roots: None,
@@ -131,6 +140,9 @@ impl Report {
             + out.files_skipped
             + out.files_resumed;
         r.mounts_skipped = out.mounts_skipped;
+        r.files_hardlinked = out.files_hardlinked;
+        r.hardlinks_degraded = out.hardlinks_degraded;
+        r.hardlinks_unchecked = out.hardlinks_unchecked.as_ref().map_or(0, |g| g.count);
         r.files_overwritten = out.files_overwritten;
         r.bytes_skipped = out.bytes_skipped + out.bytes_resumed;
         r.files_degraded = out.files_degraded;
@@ -382,6 +394,58 @@ pub fn safety_warning_lines(out: &TreeOutcome) -> Vec<String> {
 pub fn tree_warning_lines(out: &TreeOutcome) -> Vec<String> {
     let mut v = warning_lines(&out.warnings);
     v.extend(safety_warning_lines(out));
+    v.extend(hardlink_warning_lines(out));
+    v
+}
+
+/// Cut 12's hardlink warnings (design "Report"): weak volumes (master §108), the unavailable group, one line per
+/// cause of an independent copy in `UnlinkedWhy` order, then the files whose link count was not reported.
+pub fn hardlink_warning_lines(out: &TreeOutcome) -> Vec<String> {
+    let identity = |scope: &str, g: &flux_core::DegradedGroup| {
+        format!(
+            "warning: reliable filesystem object identity unavailable {scope}; hardlink preservation degraded to ordinary copies ({} files, e.g. {}) - --hardlinks=preserve fails them instead",
+            g.count,
+            rel(&g.example)
+        )
+    };
+    let mut v: Vec<String> = out
+        .hardlink_weak
+        .weak
+        .iter()
+        .map(|(volume, g)| identity(&format!("on volume {volume:#x}"), g))
+        .collect();
+    if let Some(g) = &out.hardlink_weak.unavailable {
+        v.push(identity(UNAVAILABLE, g));
+    }
+    for (why, g) in &out.hardlinks_unlinked {
+        // These causes appear only under `auto` (`preserve` fails such a member instead), so the hint is true. A policy
+        // split is the exception: the existing-file policy skipped the member under either mode, so it has no hint.
+        let cause = match why {
+            UnlinkedWhy::LinkRefused => "the destination refused the link",
+            UnlinkedWhy::AnchorUnavailable => "the anchor could not be found or checked",
+            UnlinkedWhy::PolicySplit => {
+                v.push(format!(
+                    "warning: {} hardlink members were kept separate from their anchor by the existing-file policy (--skip-existing / --update) (e.g. {})",
+                    g.count,
+                    rel(&g.example)
+                ));
+                continue;
+            }
+            UnlinkedWhy::IndexFailure => "the hardlink index could not be read or written",
+        };
+        v.push(format!(
+            "warning: {} hardlink members were copied independently (e.g. {}): {cause} - --hardlinks=preserve fails them instead",
+            g.count,
+            rel(&g.example)
+        ));
+    }
+    if let Some(g) = &out.hardlinks_unchecked {
+        v.push(format!(
+            "warning: the filesystem reports no link counts ({} files, e.g. {}); hardlinks among them were not looked for",
+            g.count,
+            rel(&g.example)
+        ));
+    }
     v
 }
 
@@ -407,16 +471,33 @@ fn weak_line(scope: &str, count: u64, example: &str) -> String {
 /// The last stderr line of a run that reached the engine. Its failure figure is the
 /// JSON `errors` value, so an abort counts and a non-zero exit never reads as clean.
 pub fn summary_line(r: &Report, directories_created: u64) -> String {
-    format!(
+    let mut s = format!(
         "copied {} files ({} bytes), created {directories_created} directories; {} failed, {} skipped",
         r.files_copied, r.bytes_copied, r.errors, r.files_skipped
-    )
+    );
+    // Cut 12: each suffix only when non-zero, so a copy without hardlinks prints the line it always did.
+    for (n, what) in [
+        (r.files_hardlinked, "hardlinked"),
+        (r.hardlinks_degraded, "hardlinks degraded"),
+        (r.hardlinks_unchecked, "hardlinks unchecked"),
+    ] {
+        if n > 0 {
+            s.push_str(&format!("; {n} {what}"));
+        }
+    }
+    s
 }
 
 /// The last stderr line of a `--dry-run` that reached the engine: what a real run would do.
 pub fn dry_run_summary_line(r: &Report, directories_created: u64) -> String {
+    // Cut 12: the links a real run would make, only when there are any (the line is unchanged otherwise).
+    let links = if r.files_hardlinked > 0 {
+        format!(", hardlink {}", r.files_hardlinked)
+    } else {
+        String::new()
+    };
     format!(
-        "dry run: would copy {} files ({} bytes), overwrite {}, skip {}, create {directories_created} directories; {} errors",
+        "dry run: would copy {} files ({} bytes), overwrite {}{links}, skip {}, create {directories_created} directories; {} errors",
         r.files_copied, r.bytes_copied, r.files_overwritten, r.files_skipped, r.errors
     )
 }
@@ -653,6 +734,15 @@ pub fn run_warning_line(w: &RunWarning) -> String {
         RunWarning::CheckpointsUnreadable { why } => {
             format!("checkpoints unreadable: {why}; every large file recopies")
         }
+        RunWarning::HardlinkIndexUnavailable { path, code } => format!(
+            "warning: the hardlink index {} could not be created ({}); hardlink members cannot be linked (copied independently under --hardlinks=auto, failed under --hardlinks=preserve)",
+            path.display(),
+            code.as_str()
+        ),
+        RunWarning::HardlinkRootUnavailable { error } => format!(
+            "warning: DEST could not be reopened for linking ({}); hardlink members cannot be linked (copied independently under --hardlinks=auto, failed under --hardlinks=preserve)",
+            error.source
+        ),
         RunWarning::WalQuarantined { code, why, set_aside_as } => format!(
             "{code}: the checkpoint log is damaged ({why}); possible storage damage, investigate; it was set aside as wal/{set_aside_as} and a fresh log was started; every large file recopies"
         ),
@@ -1644,6 +1734,29 @@ mod tests {
         );
     }
 
+    // Cut 12: the two hardlink warnings' exact texts.
+    #[test]
+    fn the_hardlink_warnings_have_their_exact_texts() {
+        assert_eq!(
+            run_warning_line(&RunWarning::HardlinkIndexUnavailable {
+                path: PathBuf::from("D/.flux/operations/x/hardlinks.db"),
+                code: Code::IoError,
+            }),
+            format!(
+                "warning: the hardlink index {} could not be created ({}); hardlink members cannot be linked (copied independently under --hardlinks=auto, failed under --hardlinks=preserve)",
+                PathBuf::from("D/.flux/operations/x/hardlinks.db").display(),
+                Code::IoError.as_str()
+            )
+        );
+        let line = run_warning_line(&RunWarning::HardlinkRootUnavailable {
+            error: FsError::new(Code::IoError, std::io::Error::other("gone")),
+        });
+        assert_eq!(
+            line,
+            "warning: DEST could not be reopened for linking (gone); hardlink members cannot be linked (copied independently under --hardlinks=auto, failed under --hardlinks=preserve)"
+        );
+    }
+
     // Owner ruling 23: an unsupported log format aborts the tree with its own code, exits 1 and has no resume hint.
     #[test]
     fn a_wal_format_unsupported_abort_prints_its_code_exits_1_and_adds_no_hint() {
@@ -2005,6 +2118,27 @@ mod tests {
             "t: object_type=partial action=would_discard"
         );
         assert_eq!(line(File, PlannedAction::Resume), "t: object_type=file action=would_resume");
+        assert_eq!(
+            line(File, PlannedAction::Hardlink),
+            "t: object_type=file action=would_hardlink"
+        );
+    }
+
+    #[test]
+    fn dry_summary_names_links() {
+        let mut r = Report::zero();
+        r.files_copied = 4;
+        r.bytes_copied = 9;
+        r.files_overwritten = 1;
+        assert_eq!(
+            dry_run_summary_line(&r, 2),
+            "dry run: would copy 4 files (9 bytes), overwrite 1, skip 0, create 2 directories; 0 errors"
+        );
+        r.files_hardlinked = 3;
+        assert_eq!(
+            dry_run_summary_line(&r, 2),
+            "dry run: would copy 4 files (9 bytes), overwrite 1, hardlink 3, skip 0, create 2 directories; 0 errors"
+        );
     }
 
     #[test]
@@ -2144,5 +2278,96 @@ mod tests {
             ["root a: 1 copied, 0 failed"]
         );
         assert!(root_lines(&[]).is_empty());
+    }
+
+    fn group(count: u64, example: &str) -> DegradedGroup {
+        DegradedGroup { count, example: PathBuf::from(example) }
+    }
+
+    #[test]
+    fn hardlink_counters_are_absent_at_zero_and_present_when_set() {
+        let zero: serde_json::Value =
+            serde_json::from_str(&Report::pre_engine(false).to_json()).unwrap();
+        assert!(zero.get("hardlinks_degraded").is_none());
+        assert!(zero.get("hardlinks_unchecked").is_none());
+        let mut r = Report::pre_engine(false);
+        r.mounts_skipped = 1;
+        r.hardlinks_degraded = 2;
+        r.hardlinks_unchecked = 3;
+        let s = r.to_json();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["hardlinks_degraded"], 2);
+        assert_eq!(v["hardlinks_unchecked"], 3);
+        let at = |k: &str| s.find(&format!("\"{k}\":")).unwrap();
+        assert!(at("mounts_skipped") < at("hardlinks_degraded"));
+        assert!(at("hardlinks_degraded") < at("hardlinks_unchecked"));
+    }
+
+    #[test]
+    fn summary_line_names_links_and_degradations() {
+        let mut r = Report::pre_engine(false);
+        r.errors = 0;
+        r.files_copied = 2;
+        r.bytes_copied = 3;
+        assert_eq!(
+            summary_line(&r, 1),
+            "copied 2 files (3 bytes), created 1 directories; 0 failed, 0 skipped"
+        );
+        r.files_hardlinked = 1;
+        r.hardlinks_degraded = 2;
+        r.hardlinks_unchecked = 1;
+        assert_eq!(
+            summary_line(&r, 1),
+            "copied 2 files (3 bytes), created 1 directories; 0 failed, 0 skipped; 1 hardlinked; 2 hardlinks degraded; 1 hardlinks unchecked"
+        );
+    }
+
+    #[test]
+    fn tree_maps_the_hardlink_counters() {
+        let out = TreeOutcome {
+            files_hardlinked: 1,
+            hardlinks_degraded: 2,
+            files_degraded: 5,
+            hardlinks_unchecked: Some(group(4, "u")),
+            ..TreeOutcome::default()
+        };
+        let r = Report::tree(&out, false, 1);
+        assert_eq!((r.files_hardlinked, r.hardlinks_degraded, r.hardlinks_unchecked), (1, 2, 4));
+        assert_eq!(r.files_degraded, 5);
+    }
+
+    #[test]
+    fn hardlink_warning_lines_follow_section_108() {
+        use flux_core::tree::UnlinkedWhy;
+        let mut out = TreeOutcome::default();
+        assert!(hardlink_warning_lines(&out).is_empty());
+        out.hardlink_weak.weak.insert(0x7, group(2, "a"));
+        out.hardlink_weak.unavailable = Some(group(1, "d"));
+        out.hardlinks_unlinked.insert(UnlinkedWhy::PolicySplit, group(1, "p"));
+        out.hardlinks_unlinked.insert(UnlinkedWhy::LinkRefused, group(4, "l"));
+        out.hardlinks_unchecked = Some(group(3, "u"));
+        assert_eq!(
+            hardlink_warning_lines(&out),
+            [
+                "warning: reliable filesystem object identity unavailable on volume 0x7; hardlink preservation degraded to ordinary copies (2 files, e.g. a) - --hardlinks=preserve fails them instead",
+                "warning: reliable filesystem object identity unavailable where the filesystem reports no identity; hardlink preservation degraded to ordinary copies (1 files, e.g. d) - --hardlinks=preserve fails them instead",
+                "warning: 4 hardlink members were copied independently (e.g. l): the destination refused the link - --hardlinks=preserve fails them instead",
+                "warning: 1 hardlink members were kept separate from their anchor by the existing-file policy (--skip-existing / --update) (e.g. p)",
+                "warning: the filesystem reports no link counts (3 files, e.g. u); hardlinks among them were not looked for",
+            ]
+        );
+        let all = tree_warning_lines(&out);
+        assert_eq!(&all[all.len() - 5..], hardlink_warning_lines(&out).as_slice());
+    }
+
+    #[test]
+    fn the_other_two_causes_have_their_texts() {
+        use flux_core::tree::UnlinkedWhy;
+        let mut out = TreeOutcome::default();
+        out.hardlinks_unlinked.insert(UnlinkedWhy::IndexFailure, group(1, "i"));
+        out.hardlinks_unlinked.insert(UnlinkedWhy::AnchorUnavailable, group(1, "n"));
+        let l = hardlink_warning_lines(&out);
+        assert!(l[0].contains(": the anchor could not be found or checked - "), "{l:?}");
+        assert!(l[1].contains(": the hardlink index could not be read or written - "), "{l:?}");
     }
 }

@@ -849,6 +849,8 @@ pub const MANIFEST: &str = "manifest";
 pub const PROBE: &str = "noreplace-probe";
 /// The claim store (cut 8b), inside a workspace: created beside the manifest and removed with it.
 pub const STATE_DB: &str = "state.db";
+/// The per-run hardlink index (cut 12), inside a workspace: created on first use and removed by the run, or here.
+pub const HARDLINK_INDEX: &str = "hardlinks.db";
 /// The probe's staging temporary.
 pub const PROBE_TEMP: &str = "noreplace-probe.tmp";
 /// A state file's temporary: `<name>.tmp` (decision 4; the name it stages already carries the operation id).
@@ -1007,6 +1009,7 @@ pub fn finish_retire<D: DirHandle>(operations: &D, name: &OsStr) -> flux_fs::Res
             OsString::from(PROBE),
             OsString::from(PROBE_TEMP),
             OsString::from(STATE_DB),
+            OsString::from(HARDLINK_INDEX),
         ] {
             remove_if_present(&dir, &known)?;
         }
@@ -1467,13 +1470,13 @@ mod tests {
         let ops = operations_dir(&d, Path::new("D")).unwrap();
         let path = format!("/p/dest/.flux/operations/{}.removing", id(1));
         fs.create_dir(Path::new(&path)).unwrap();
-        for name in [MANIFEST, "manifest.tmp", STATE_DB, "extra"] {
+        for name in [MANIFEST, "manifest.tmp", STATE_DB, HARDLINK_INDEX, "extra"] {
             fs.write_file(format!("{path}/{name}"), b"x");
         }
         let removing = OsString::from(format!("{}.removing", id(1)));
         let e = finish_retire(&ops, &removing).unwrap_err();
         assert_eq!(e.source.kind(), ErrorKind::DirectoryNotEmpty);
-        for name in [MANIFEST, "manifest.tmp", STATE_DB] {
+        for name in [MANIFEST, "manifest.tmp", STATE_DB, HARDLINK_INDEX] {
             assert!(!fs.exists(format!("{path}/{name}")), "{name} is a known name");
         }
         assert!(fs.exists(format!("{path}/extra")), "a stranger stays");
@@ -1900,6 +1903,7 @@ mod tests {
             operation_id: flux_fs::OperationId::new(id(1)),
             existing: flux_fs::ExistingPolicy::Overwrite,
             links: flux_fs::Links::Copy,
+            hardlinks: flux_fs::Hardlinks::Auto,
             cross_filesystems: false,
         })
     }
@@ -2207,6 +2211,7 @@ mod tests {
                 operation_id: flux_fs::OperationId::new(id(1)),
                 existing: ExistingPolicy::Overwrite,
                 links: Links::Copy,
+                hardlinks: flux_fs::Hardlinks::Auto,
                 cross_filesystems: false,
             };
             f(&mut o);
