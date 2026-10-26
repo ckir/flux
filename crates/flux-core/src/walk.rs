@@ -491,6 +491,7 @@ mod tests {
             operation_id: OperationId::new("op1"),
             existing: ExistingPolicy::Overwrite,
             links: Links::Copy,
+            hardlinks: flux_fs::Hardlinks::Auto,
             cross_filesystems: cross,
         };
         assert_eq!(MountPolicy::of(&with(false)), MountPolicy::Stay);

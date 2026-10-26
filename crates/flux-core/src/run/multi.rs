@@ -1011,6 +1011,7 @@ mod trees_tests {
             operation_id: OperationId::new("replaced by the run"),
             existing: ExistingPolicy::Overwrite,
             links: Links::Copy,
+            hardlinks: flux_fs::Hardlinks::Auto,
             cross_filesystems: false,
         }
     }

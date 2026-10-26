@@ -186,6 +186,8 @@ fn options(args: &CopyArgs) -> CopyOptions {
             LinksArg::Copy => Links::Copy,
             LinksArg::Skip => Links::Skip,
         },
+        // A placeholder until the `--hardlinks` flag is wired (cut 12, Task 9).
+        hardlinks: flux_fs::Hardlinks::Auto,
         // A placeholder: the run replaces it with its own operation id (`RunConfig::operation_id`).
         operation_id: OperationId::new(String::new()),
         existing: if args.update {

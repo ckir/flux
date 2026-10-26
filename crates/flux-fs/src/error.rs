@@ -61,6 +61,15 @@ pub enum Code {
     /// Cut 9f-1. The checkpoint log was written by a newer Flux (an unknown format or checksum version). Stops the
     /// whole operation before any file is copied; `--restart` supersedes it.
     WalFormatUnsupported,
+    /// Cut 12, master §15 line 1226. A hardlink could not be created at the destination under `--hardlinks=preserve`
+    /// (or the platform has no link primitive there). Path-scoped: that member fails.
+    HardlinkUnavailable,
+    /// Cut 12, master §108 line 5274. The source or destination identity needed to decide a hardlink group is not
+    /// `Strong`, so the member cannot be checked. Path-scoped.
+    HardlinkIdentityUnavailable,
+    /// Cut 12, master line 2920. A member whose canonical member failed to copy, so there is nothing to link to.
+    /// Path-scoped; counted as a failed file.
+    BlockedByCanonicalFailure,
 }
 
 impl Code {
@@ -86,6 +95,9 @@ impl Code {
             Code::IncompatibleState => "INCOMPATIBLE_STATE",
             Code::WalWriteFailed => "WAL_WRITE_FAILED",
             Code::WalFormatUnsupported => "WAL_FORMAT_UNSUPPORTED",
+            Code::HardlinkUnavailable => "HARDLINK_UNAVAILABLE",
+            Code::HardlinkIdentityUnavailable => "HARDLINK_IDENTITY_UNAVAILABLE",
+            Code::BlockedByCanonicalFailure => "BLOCKED_BY_CANONICAL_FAILURE",
         }
     }
 }
@@ -159,6 +171,9 @@ mod tests {
             Code::ControlPlaneNamespaceConflict.as_str(),
             "CONTROL_PLANE_NAMESPACE_CONFLICT"
         );
+        assert_eq!(Code::HardlinkUnavailable.as_str(), "HARDLINK_UNAVAILABLE");
+        assert_eq!(Code::HardlinkIdentityUnavailable.as_str(), "HARDLINK_IDENTITY_UNAVAILABLE");
+        assert_eq!(Code::BlockedByCanonicalFailure.as_str(), "BLOCKED_BY_CANONICAL_FAILURE");
     }
 
     #[test]
