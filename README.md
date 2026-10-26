@@ -6,10 +6,10 @@ Flux is inspired by FastCopy, but built on a different architecture — one desi
 around correctness, bounded resident memory, persistent operation state,
 deterministic traversal, resumability and filesystem-native acceleration.
 
-**Status: early implementation.** `flux copy` (a file, or a folder's contents) and
-`flux cleanup` work, with destination locking, resumable operations (`--resume`,
-`--restart`) and cleanup of what an interrupted run left behind. `flux verify` and
-`flux benchmark` are not implemented yet. The authoritative design is
+**Status: early implementation.** `flux copy` (a file, or a folder's contents),
+`flux verify` and `flux cleanup` work, with destination locking, resumable operations (`--resume`,
+`--restart`) and cleanup of what an interrupted run left behind. `flux benchmark`
+is not implemented yet. The authoritative design is
 [`FLUX_FULL_UPDATED_SPEC_V16.md`](FLUX_FULL_UPDATED_SPEC_V16.md).
 
 ## Performance

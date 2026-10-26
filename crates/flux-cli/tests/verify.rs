@@ -395,8 +395,8 @@ fn links_skip_leaves_a_source_symlink_out_end_to_end() {
     let got = paths(&out);
     assert!(got.contains(&("only-dest".into(), "extra".into())), "{got:?}");
     assert!(got.contains(&("f".into(), "match".into())), "{got:?}");
-    // The source symlink `l` is not matched, so the destination's `l` is also left over.
-    assert!(!got.contains(&("l".into(), "match".into())), "{got:?}");
+    // The source symlink `l` is left out, so the destination's `l` is a leftover.
+    assert!(got.contains(&("l".into(), "extra".into())), "{got:?}");
 }
 
 #[test]
