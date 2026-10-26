@@ -96,8 +96,9 @@ Option 2 can replace 1 later without changing the CLI, the report or the failure
    compared with `src_meta` by length and mtime, same comparison and same `SourceChanged` discard as step 7, so a source
    that already changed does not cost a full read-back. Step 7's recheck stays where it is: it also covers the metadata and
    sync window.
-2. `destination`/`full`: `parent.open_read(&temp)`, read to EOF in the same buffer size, hash, compare with `S`. Also
-   compare byte counts. A short or long read is a mismatch.
+2. `destination`/`full`: `parent.open_read(&temp)`, read to EOF in the same buffer size, hash, compare with `S`. A short
+   or long read changes the digest and is therefore a mismatch; the byte counts only enrich the error text (a separate
+   count comparison would be unreachable, found by the agy plan panel).
 3. `full`: open the source anew, read to EOF, hash, compare with `S`.
 4. Any mismatch: `discard(parent, &temp, CopyStep::Verify, Code::VerifyMismatch, <error naming which side>, guard)`.
    The error text names the side that differed ("destination bytes differ from the source stream" / "source bytes differ
