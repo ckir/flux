@@ -67,9 +67,10 @@ pub struct Record {
     pub outcome: Outcome,
     /// The SOURCE side's kind when it exists, else the DEST side's (V9).
     pub kind: Kind,
-    /// `Some(Code::VerifyMismatch)` for every `mismatched`; the error's code for `unreadable`; `None` otherwise.
+    /// `Some(Code::VerifyMismatch)` for every `mismatched`; the error's code for `unreadable` and for a DEST-only
+    /// `extra` directory that could not be listed; `None` otherwise.
     pub code: Option<Code>,
-    /// Error text for `unreadable`; `"source {a}, destination {b}"` for a type mismatch; `"{s} != {d}"` (first 8 hex
+    /// Error text for `unreadable` and for that `extra`; `"source {a}, destination {b}"` for a type mismatch; `"{s} != {d}"` (first 8 hex
     /// characters of each digest) for a file mismatch; `"symlink payloads differ"`; `MOUNT_NOT_ENTERED`; else empty.
     pub detail: String,
 }
@@ -233,6 +234,8 @@ impl<'a, F: FileSystem> Side<'a, F> {
                 return None;
             };
             let item = match ev {
+                // Every `WalkError` is a directory today: the walker raises one only from `enter` (listing a
+                // directory), `walk.rs`.
                 Err(we) => Self::item(we.path, Kind::Dir, false, Some(we.cause)),
                 Ok(WalkEvent::Dir { path, .. }) => {
                     let skipped = matches!(
@@ -355,18 +358,34 @@ pub fn verify_tree<F: DestinationRoot>(
     opts: &VerifyOptions,
     sink: &mut dyn FnMut(Record),
 ) -> Result<Summary, VerifyError> {
+    verify_tree_notifying(fs, src, dst, opts, &mut || {}, sink)
+}
+
+/// `verify_tree`, calling `on_absent` once, after the root check passed and before the first read of either tree, when
+/// the destination does not exist (and is verified as empty). A refused run never calls it.
+pub fn verify_tree_notifying<F: DestinationRoot>(
+    fs: &F,
+    src: &Path,
+    dst: &Path,
+    opts: &VerifyOptions,
+    on_absent: &mut dyn FnMut(),
+    sink: &mut dyn FnMut(Record),
+) -> Result<Summary, VerifyError> {
     let mut out = Emitter { summary: Summary::default(), sink };
     let dst_absent = match check_roots(fs, src, dst) {
         Ok(absent) => absent,
         Err(RootsCheck::Refused(reason)) => return Err(VerifyError::RefusedRoots { reason }),
-        Err(RootsCheck::Unreadable(e)) => {
-            return Ok(root_unreadable(out, &e.source.to_string(), e.code));
+        Err(RootsCheck::Unreadable(side, e)) => {
+            return Ok(root_unreadable(out, &format!("{side}{}", e.source), e.code));
         }
     };
+    if dst_absent {
+        on_absent();
+    }
     // The source walk is built first, then the destination's (a test pins the `read_dir` order).
     let mut a = match Side::new(fs, src, opts.mounts, opts.links == Links::Skip, false) {
         Ok(a) => a,
-        Err(e) => return Ok(root_unreadable(out, &format!("source: {}", e.source), e.code)),
+        Err(e) => return Ok(root_unreadable(out, &format!("{SOURCE}{}", e.source), e.code)),
     };
     let mut b = if dst_absent {
         Side::empty()
@@ -374,7 +393,7 @@ pub fn verify_tree<F: DestinationRoot>(
         match Side::new(fs, dst, opts.mounts, false, true) {
             Ok(b) => b,
             Err(e) => {
-                return Ok(root_unreadable(out, &format!("destination: {}", e.source), e.code));
+                return Ok(root_unreadable(out, &format!("{DESTINATION}{}", e.source), e.code));
             }
         }
     };
@@ -409,20 +428,30 @@ pub fn verify_tree<F: DestinationRoot>(
 enum RootsCheck {
     /// The roots are the same object or nested: the reason, for `VerifyError::RefusedRoots`.
     Refused(String),
-    /// A root could not be examined: reported as the root record `.`.
-    Unreadable(FsError),
+    /// A root could not be examined: reported as the root record `.`, the text led by the root's name (`SOURCE` or
+    /// `DESTINATION`).
+    Unreadable(&'static str, FsError),
 }
+
+/// The detail prefix naming the source root, and the destination root.
+const SOURCE: &str = "source: ";
+const DESTINATION: &str = "destination: ";
 
 const REFUSED_DST_IN_SRC: &str =
     "the destination is the source or lies inside it; nothing was compared";
 const REFUSED_SRC_IN_DST: &str = "the source lies inside the destination; nothing was compared";
 const BY_PATH_ALONE: &str = " (decided by path alone: a root's identity could not be confirmed)";
 
-fn refused_by_containment(e: crate::copy::CopyError, reason: &str) -> RootsCheck {
+/// `opened` names the root the containment query was opening, which a failure is reported against.
+fn refused_by_containment(
+    e: crate::copy::CopyError,
+    reason: &str,
+    opened: &'static str,
+) -> RootsCheck {
     if e.code() == Code::SafetyRejected {
         RootsCheck::Refused(reason.to_string())
     } else {
-        RootsCheck::Unreadable(e.cause)
+        RootsCheck::Unreadable(opened, e.cause)
     }
 }
 
@@ -438,20 +467,18 @@ fn check_roots<F: DestinationRoot>(fs: &F, src: &Path, dst: &Path) -> Result<boo
             }
             return Ok(true);
         }
-        Err(e) => return Err(RootsCheck::Unreadable(e)),
+        Err(e) => return Err(RootsCheck::Unreadable(DESTINATION, e)),
     };
-    let s = fs.destination_root(src).map_err(RootsCheck::Unreadable)?;
-    let (si, di) = match (s.identity(), d.identity()) {
-        (Ok(si), Ok(di)) => (si, di),
-        (Err(e), _) | (_, Err(e)) => return Err(RootsCheck::Unreadable(e)),
-    };
+    let s = fs.destination_root(src).map_err(|e| RootsCheck::Unreadable(SOURCE, e))?;
+    let si = s.identity().map_err(|e| RootsCheck::Unreadable(SOURCE, e))?;
+    let di = d.identity().map_err(|e| RootsCheck::Unreadable(DESTINATION, e))?;
     let mut out = crate::tree::TreeOutcome::default();
     preflight(si, di, Safety::Default, &mut out.warnings)
         .map_err(|_| RootsCheck::Refused(REFUSED_DST_IN_SRC.to_string()))?;
     containment(fs, src, &d, dst, Safety::Default, &mut out)
-        .map_err(|e| refused_by_containment(e, REFUSED_DST_IN_SRC))?;
+        .map_err(|e| refused_by_containment(e, REFUSED_DST_IN_SRC, SOURCE))?;
     containment(fs, dst, &s, src, Safety::Default, &mut out)
-        .map_err(|e| refused_by_containment(e, REFUSED_SRC_IN_DST))?;
+        .map_err(|e| refused_by_containment(e, REFUSED_SRC_IN_DST, DESTINATION))?;
     if out.containment_degraded.is_some() {
         if lexically_within(dst, src) {
             return Err(RootsCheck::Refused(format!("{REFUSED_DST_IN_SRC}{BY_PATH_ALONE}")));
@@ -469,7 +496,9 @@ fn root_unreadable(mut out: Emitter<'_>, detail: &str, code: Code) -> Summary {
     out.summary
 }
 
-/// An item present on one side only: `missing` or `extra`, or `unreadable` (pruning both sides) when its walk failed.
+/// An item present on one side only: `missing` or `extra`. When its walk failed (both sides are then pruned): a
+/// SOURCE-only one is `unreadable`; a DEST-only one is `extra` carrying the error's code and text, because nothing
+/// the source holds can hide beneath it, so it never fails the run (design 6.2).
 fn alone<F: FileSystem>(
     out: &mut Emitter<'_>,
     item: &Item,
@@ -477,13 +506,24 @@ fn alone<F: FileSystem>(
     a: &mut Side<'_, F>,
     b: &mut Side<'_, F>,
 ) {
-    match &item.failed {
-        Some(e) => {
+    match (&item.failed, outcome) {
+        (Some(e), Outcome::Extra) => {
+            out.emit(Record {
+                path: item.path.clone(),
+                outcome: Outcome::Extra,
+                kind: item.kind,
+                code: Some(e.code),
+                detail: e.source.to_string(),
+            });
+            a.prune(&item.path);
+            b.prune(&item.path);
+        }
+        (Some(e), _) => {
             out.unreadable(item.path.clone(), item.kind, e.code, e.source.to_string());
             a.prune(&item.path);
             b.prune(&item.path);
         }
-        None => out.alone(item, outcome),
+        (None, _) => out.alone(item, outcome),
     }
 }
 
@@ -986,6 +1026,89 @@ mod tests {
         assert_eq!((s.unreadable, s.matched), (1, 2));
     }
 
+    /// The `read_dir` calls so far, in order: proves WHICH call a `fail_nth("read_dir", n, ..)` hit.
+    fn read_dirs(fs: &FaultFs) -> Vec<String> {
+        fs.calls().into_iter().filter(|c| c.starts_with("read_dir(")).collect()
+    }
+
+    #[test]
+    fn a_destination_only_directory_that_cannot_be_listed_is_extra_with_its_error_and_never_fails()
+    {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("a", b"a")]);
+        tree(&fs, "/d", &["lost"], &[("a", b"a"), ("lost/x", b"x"), ("z", b"z")]);
+        // read_dir(/s) (1), read_dir(/d) (2), then the DEST-only `lost` once `a` is paired (3).
+        fs.fail_nth("read_dir", 3, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+        let (rows, s) = run(&fs, "/s", "/d", &opts());
+        assert_eq!(read_dirs(&fs)[2], "read_dir(/d/lost)");
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(rows[0], rec("a", Outcome::Match, Kind::File));
+        assert_eq!(
+            (rows[1].0.as_str(), rows[1].1, rows[1].2, rows[1].3),
+            ("lost", Outcome::Extra, Kind::Dir, Some(Code::PermissionDenied))
+        );
+        assert!(rows[1].4.contains("injected"), "{}", rows[1].4);
+        assert_eq!(rows[2], rec("z", Outcome::Extra, Kind::File));
+        assert_eq!((s.extra, s.unreadable, s.matched), (2, 0, 1));
+        assert!(!s.failed());
+    }
+
+    #[test]
+    fn the_same_failure_on_a_directory_both_sides_hold_stays_unreadable() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &["lost"], &[("a", b"a"), ("lost/x", b"x")]);
+        tree(&fs, "/d", &["lost"], &[("a", b"a"), ("lost/y", b"y")]);
+        // read_dir(/s) (1), read_dir(/d) (2), read_dir(/s/lost) (3), read_dir(/d/lost) (4).
+        fs.fail_nth("read_dir", 4, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+        let (rows, s) = run(&fs, "/s", "/d", &opts());
+        assert_eq!(read_dirs(&fs)[3], "read_dir(/d/lost)");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(
+            (rows[1].0.as_str(), rows[1].1, rows[1].2, rows[1].3),
+            ("lost", Outcome::Unreadable, Kind::Dir, Some(Code::PermissionDenied))
+        );
+        assert_eq!((s.unreadable, s.extra, s.missing), (1, 0, 0));
+        assert!(s.failed());
+    }
+
+    #[test]
+    fn a_source_only_directory_that_cannot_be_listed_stays_unreadable() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &["lost"], &[("a", b"a"), ("lost/x", b"x"), ("z", b"z")]);
+        tree(&fs, "/d", &[], &[("a", b"a"), ("z", b"z")]);
+        // read_dir(/s) (1), read_dir(/d) (2), then the SOURCE-only `lost` (3).
+        fs.fail_nth("read_dir", 3, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+        let (rows, s) = run(&fs, "/s", "/d", &opts());
+        assert_eq!(read_dirs(&fs)[2], "read_dir(/s/lost)");
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(
+            (rows[1].0.as_str(), rows[1].1, rows[1].2, rows[1].3),
+            ("lost", Outcome::Unreadable, Kind::Dir, Some(Code::PermissionDenied))
+        );
+        assert_eq!(rows[2], rec("z", Outcome::Match, Kind::File));
+        assert_eq!((s.unreadable, s.extra, s.missing), (1, 0, 0));
+        assert!(s.failed());
+    }
+
+    #[test]
+    fn names_differing_only_in_case_are_a_missing_and_an_extra_by_their_bytes() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("README", b"r")]);
+        tree(&fs, "/d", &[], &[("Readme", b"r")]);
+        let (rows, s) = run(&fs, "/s", "/d", &opts());
+        // 'E' (0x45) sorts before 'e' (0x65), so the source name comes first.
+        assert_eq!(
+            rows,
+            vec![
+                rec("README", Outcome::Missing, Kind::File),
+                rec("Readme", Outcome::Extra, Kind::File)
+            ]
+        );
+        assert_eq!((s.missing, s.extra, s.matched), (1, 1, 0));
+        assert!(s.failed());
+        assert!(!fs.called("open_read("));
+    }
+
     #[test]
     fn control_state_at_the_destination_root_is_never_reported() {
         let fs = FaultFs::new();
@@ -1178,6 +1301,96 @@ mod tests {
         assert!(fs.called("read_dir(/d)"));
         assert_eq!(s.unreadable, 1);
         assert!(!fs.called("open_read("));
+    }
+
+    /// A run that must stop at the root record: the one row, and no directory listed or file opened.
+    fn root_row(fs: &FaultFs, src: &str, dst: &str) -> Row {
+        let (rows, s) = run(fs, src, dst, &opts());
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(s.unreadable, 1);
+        assert!(!fs.called("read_dir(") && !fs.called("open_read("));
+        assert_eq!(
+            (rows[0].0.as_str(), rows[0].1, rows[0].2),
+            (".", Outcome::Unreadable, Kind::Dir)
+        );
+        rows[0].clone()
+    }
+
+    #[test]
+    fn a_root_check_failure_names_the_root_it_was_about() {
+        // The destination is a file: `destination_root(dst)` fails with a kind other than NotFound.
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[]);
+        fs.write_file("/d", b"x");
+        let r = root_row(&fs, "/s", "/d");
+        assert!(r.4.starts_with("destination: "), "{}", r.4);
+
+        // The source is a file.
+        let fs = FaultFs::new();
+        tree(&fs, "/d", &[], &[]);
+        fs.write_file("/s", b"x");
+        let r = root_row(&fs, "/s", "/d");
+        assert!(r.4.starts_with("source: "), "{}", r.4);
+
+        // canonical_path calls: containment(dst anchor): /d (1), /s (2); containment(src anchor): /s (3), /d (4).
+        let denied = std::io::ErrorKind::PermissionDenied;
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[]);
+        tree(&fs, "/d", &[], &[]);
+        fs.fail_nth("canonical_path", 2, Code::PermissionDenied, denied);
+        let r = root_row(&fs, "/s", "/d");
+        assert_eq!(r.3, Some(Code::PermissionDenied));
+        assert!(r.4.starts_with("source: "), "{}", r.4);
+
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[]);
+        tree(&fs, "/d", &[], &[]);
+        fs.fail_nth("canonical_path", 4, Code::PermissionDenied, denied);
+        let r = root_row(&fs, "/s", "/d");
+        assert!(r.4.starts_with("destination: "), "{}", r.4);
+    }
+
+    #[test]
+    fn the_absent_destination_notice_fires_once_after_the_root_check_and_not_on_a_refusal() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("a", b"x")]);
+        let mut events = Vec::new();
+        let events_ref = std::cell::RefCell::new(&mut events);
+        let r = verify_tree_notifying(
+            &fs,
+            Path::new("/s"),
+            Path::new("/nope"),
+            &opts(),
+            &mut || events_ref.borrow_mut().push("absent".to_string()),
+            &mut |r| events_ref.borrow_mut().push(format!("record {}", r.path.display())),
+        );
+        assert!(r.is_ok());
+        assert_eq!(events, ["absent", "record a"]);
+
+        let mut called = false;
+        let r = verify_tree_notifying(
+            &fs,
+            Path::new("/s"),
+            Path::new("/s/nope"),
+            &opts(),
+            &mut || called = true,
+            &mut |_| {},
+        );
+        assert!(matches!(r, Err(VerifyError::RefusedRoots { .. })));
+        assert!(!called);
+
+        tree(&fs, "/d", &[], &[("a", b"x")]);
+        let mut called = false;
+        verify_tree_notifying(
+            &fs,
+            Path::new("/s"),
+            Path::new("/d"),
+            &opts(),
+            &mut || called = true,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(!called, "an existing destination is not announced");
     }
 
     #[test]
