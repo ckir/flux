@@ -415,8 +415,14 @@ pub fn summary_line(r: &Report, directories_created: u64) -> String {
 
 /// The last stderr line of a `--dry-run` that reached the engine: what a real run would do.
 pub fn dry_run_summary_line(r: &Report, directories_created: u64) -> String {
+    // Cut 12: the links a real run would make, only when there are any (the line is unchanged otherwise).
+    let links = if r.files_hardlinked > 0 {
+        format!(", hardlink {}", r.files_hardlinked)
+    } else {
+        String::new()
+    };
     format!(
-        "dry run: would copy {} files ({} bytes), overwrite {}, skip {}, create {directories_created} directories; {} errors",
+        "dry run: would copy {} files ({} bytes), overwrite {}{links}, skip {}, create {directories_created} directories; {} errors",
         r.files_copied, r.bytes_copied, r.files_overwritten, r.files_skipped, r.errors
     )
 }
@@ -2037,6 +2043,27 @@ mod tests {
             "t: object_type=partial action=would_discard"
         );
         assert_eq!(line(File, PlannedAction::Resume), "t: object_type=file action=would_resume");
+        assert_eq!(
+            line(File, PlannedAction::Hardlink),
+            "t: object_type=file action=would_hardlink"
+        );
+    }
+
+    #[test]
+    fn dry_summary_names_links() {
+        let mut r = Report::zero();
+        r.files_copied = 4;
+        r.bytes_copied = 9;
+        r.files_overwritten = 1;
+        assert_eq!(
+            dry_run_summary_line(&r, 2),
+            "dry run: would copy 4 files (9 bytes), overwrite 1, skip 0, create 2 directories; 0 errors"
+        );
+        r.files_hardlinked = 3;
+        assert_eq!(
+            dry_run_summary_line(&r, 2),
+            "dry run: would copy 4 files (9 bytes), overwrite 1, hardlink 3, skip 0, create 2 directories; 0 errors"
+        );
     }
 
     #[test]

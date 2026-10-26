@@ -14,8 +14,8 @@ use crate::lock::record::{Decoded, LockRecord, decode};
 use crate::lock::test_support::{dead_lock, live_lock, record};
 use crate::state::{Kind, OperationState, UNREADABLE, decode as decode_state};
 use flux_fs::{
-    DestinationRoot, Durability, FileIdentity, FileSystem, Links, LockCapability, ObjectId,
-    OperationId, Preserve, Publish, Safety,
+    DestinationRoot, Durability, FileIdentity, FileSystem, HardlinkEntry, Links, LockCapability,
+    ObjectId, OperationId, Preserve, Publish, Safety,
 };
 use std::ffi::OsStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10468,4 +10468,228 @@ fn a_canonical_with_a_weak_destination_identity_registers_no_object() {
     assert_eq!((out.files_resumed, out.files_hardlinked, out.hardlinks_degraded), (1, 0, 1));
     assert_eq!(out.hardlinks_unlinked[&UnlinkedWhy::AnchorUnavailable].count, 1);
     assert_ne!(identity_of(&fs, "/p/dest/a"), identity_of(&fs, "/p/dest/a2"));
+}
+
+// Cut 12 Task 8: the dry run predicts links without destination I/O.
+
+/// A dry run with its temporary root made, and the fake's call-log watermark after the fixture.
+fn dry_links() -> RunConfig {
+    RunConfig { dry_temp_root: Some(PathBuf::from("/flux-dry")), ..dry() }
+}
+
+fn with_dry_root(fs: FaultFs) -> FaultFs {
+    fs.create_dir(Path::new("/flux-dry")).unwrap();
+    fs
+}
+
+fn dry_index_path(run_id: &str) -> String {
+    format!("/flux-dry/flux-dry-{run_id}-hardlinks/hardlinks.db")
+}
+
+/// No link, no write under DEST: the dry run's only link-side call is the index under the temporary root.
+fn no_dest_link_io(fs: &FaultFs) {
+    for c in calls(fs) {
+        assert!(
+            !c.starts_with("create_hardlink(/p/") && !c.starts_with("create_new(/p/dest"),
+            "{c} in a dry run: {:?}",
+            calls(fs)
+        );
+        if c.starts_with("create_hardlink_index") {
+            assert!(c.contains("/flux-dry/"), "{c}");
+        }
+    }
+}
+
+#[test]
+fn a_dry_run_predicts_one_copy_and_one_link() {
+    let fs = with_dry_root(group_fake(&["a2"]));
+    let (r, got) = run_tree(&fs, &dry_links());
+    let out = ok(&r);
+    assert_eq!((out.files_copied, out.files_hardlinked, out.files_overwritten), (2, 1, 0));
+    assert_eq!(out.bytes_copied, 3);
+    assert!(!fs.exists("/p/dest"), "a dry run made DEST");
+    let records = planned_records(&got);
+    assert!(
+        records.contains(&("a".to_string(), PlannedObject::File, PlannedAction::Copy)),
+        "{records:?}"
+    );
+    assert!(
+        records.contains(&("a2".to_string(), PlannedObject::File, PlannedAction::Hardlink)),
+        "{records:?}"
+    );
+    assert_eq!(PlannedAction::Hardlink.as_str(), "would_hardlink");
+    no_dest_link_io(&fs);
+}
+
+#[test]
+fn a_dry_run_parks_its_index_under_the_temp_root() {
+    let fs = with_dry_root(group_fake(&["a2"]));
+    let (r, _) = run_tree(&fs, &dry_links());
+    ok(&r);
+    let log = calls(&fs);
+    let own = format!("create_hardlink_index({})", dry_index_path(ID));
+    assert!(log.contains(&own), "{log:?}");
+    assert!(!log.iter().any(|c| c.contains("/p/dest/.flux")), "{log:?}");
+    assert!(
+        !fs.exists(format!("/flux-dry/flux-dry-{ID}-hardlinks")),
+        "the temporary directory survived"
+    );
+}
+
+#[test]
+fn a_dry_index_entry_carries_no_object() {
+    let fs = with_dry_root(group_fake(&["a2"]));
+    let (r, _) = run_tree(&fs, &dry_links());
+    ok(&r);
+    // The fake keeps the index map after its directory is removed: the entry as the run left it.
+    let entries = fs.hardlink_index_entries(dry_index_path(ID)).expect("the dry index was made");
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(
+        entries[0].1,
+        HardlinkEntry::Anchor { target: key("a"), object: None },
+        "no destination object exists in a dry run"
+    );
+}
+
+#[test]
+fn a_dry_run_reports_a_weak_group_degraded_without_io() {
+    let fs = with_dry_root(weak_group_fake());
+    let (r, got) = run_tree(&fs, &dry_links());
+    let out = ok(&r);
+    assert_eq!((out.hardlinks_degraded, out.files_hardlinked, out.files_copied), (1, 0, 2));
+    assert_eq!(out.hardlink_weak.weak[&5].count, 1);
+    assert!(planned_records(&got).contains(&(
+        "a".to_string(),
+        PlannedObject::File,
+        PlannedAction::Copy
+    )));
+    assert!(!calls(&fs).iter().any(|c| c.starts_with("create_hardlink_index")), "{:?}", calls(&fs));
+    no_dest_link_io(&fs);
+}
+
+#[test]
+fn a_dry_run_blocks_nothing_it_cannot_know() {
+    let fs = with_dry_root(group_fake(&["a2"]));
+    fs.set_hardlinks_unavailable(true);
+    let (r, got) = run_tree(&fs, &dry_links());
+    let out = ok(&r);
+    assert_eq!((out.files_copied, out.files_hardlinked, out.hardlinks_degraded), (2, 1, 0));
+    assert!(got.iter().all(|f| matches!(f.cause, TreeFailureCause::Planned(_))), "{got:?}");
+    assert!(planned_records(&got).contains(&(
+        "a2".to_string(),
+        PlannedObject::File,
+        PlannedAction::Hardlink
+    )));
+    no_dest_link_io(&fs);
+}
+
+#[test]
+fn a_dry_replacing_link_counts_as_an_overwrite() {
+    let fs = with_dry_root(replace_fake());
+    let (r, got) = run_tree(&fs, &dry_links());
+    let out = ok(&r);
+    assert_eq!((out.files_copied, out.files_hardlinked, out.files_overwritten), (2, 1, 1));
+    assert!(planned_records(&got).contains(&(
+        "a2".to_string(),
+        PlannedObject::File,
+        PlannedAction::Hardlink
+    )));
+    assert_eq!(fs.read_file("/p/dest/a2").as_deref(), Some(&b"old"[..]), "DEST is untouched");
+    no_dest_link_io(&fs);
+}
+
+/// The records of a dry run that are failures, not plans.
+fn failures(got: &[TreeFailure]) -> Vec<&TreeFailure> {
+    got.iter().filter(|f| !matches!(f.cause, TreeFailureCause::Planned(_))).collect()
+}
+
+#[test]
+fn a_dry_dependent_of_a_failed_canonical_is_blocked() {
+    // `a` cannot be planned (its temporary name is over the limit), so `a2` is blocked as live would block it.
+    let long = "n".repeat(250);
+    let fs = with_dry_root(fake());
+    fs.write_file(format!("/src/{long}"), b"A");
+    link_names(&fs, "/src", &long, &[&format!("{long}2")]);
+    let (r, got) = run_tree(&fs, &dry_links());
+    let out = ok(&r);
+    let failed = failures(&got);
+    assert_eq!(failed.len(), 2, "{got:?}");
+    assert_eq!(code_of(failed[0]), Code::IoError);
+    assert_eq!(code_of(failed[1]), Code::BlockedByCanonicalFailure);
+    assert_eq!(out.files_hardlinked, 0);
+}
+
+#[test]
+fn a_dry_resume_predicts_links_against_completed_canonicals() {
+    let n = reference_nth(pair_fake, &auto(), "create_hardlink", "/p/dest/");
+    let fs = pair_fake();
+    die_at_nth(&fs, "create_hardlink", n, &auto());
+    assert!(fs.exists("/p/dest/a") && !fs.exists("/p/dest/a2"));
+    let fs = with_dry_root(fs);
+    let again = RunConfig { operation_id: id(0x77), ..dry_resume() };
+    let (r, got) = run_tree_with(&fs, &again, &auto());
+    let out = ok(&r);
+    assert_eq!((out.files_resumed, out.files_hardlinked), (1, 1), "{out:?}");
+    let records = planned_records(&got);
+    assert!(
+        records.contains(&("a".to_string(), PlannedObject::File, PlannedAction::Resume)),
+        "{records:?}"
+    );
+    assert!(
+        records.contains(&("a2".to_string(), PlannedObject::File, PlannedAction::Hardlink)),
+        "{records:?}"
+    );
+    // The skip site registered the resumed canonical, with its destination object (carry-over: the resume site
+    // registers in a dry run exactly as live).
+    let entries =
+        fs.hardlink_index_entries(dry_index_path(&id(0x77))).expect("the dry index was made");
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(
+        entries[0].1,
+        HardlinkEntry::Anchor { target: key("a"), object: Some(strong(&fs, "/p/dest/a")) }
+    );
+    assert!(!fs.exists("/p/dest/a2"));
+    // The live crash run made the one link that `a2` lacked; the dry run made none after it.
+    let log = calls(&fs);
+    let dry_start = at(&log, "create_dir(/flux-dry)");
+    assert!(!log[dry_start..].iter().any(|c| c.starts_with("create_hardlink(")), "{log:?}");
+}
+
+#[test]
+fn a_dry_resume_predicts_a_relink_of_a_completed_independent_member() {
+    let fs = with_dry_root(independent_prior(ExistingPolicy::Overwrite));
+    let again = RunConfig { operation_id: id(0x77), ..dry_resume() };
+    let (r, got) = run_tree_with(&fs, &again, &auto());
+    let out = ok(&r);
+    assert_eq!((out.files_resumed, out.files_hardlinked, out.hardlinks_degraded), (1, 1, 0));
+    assert_eq!(out.files_overwritten, 1, "the relink replaces a2");
+    assert!(planned_records(&got).contains(&(
+        "a2".to_string(),
+        PlannedObject::File,
+        PlannedAction::Hardlink
+    )));
+    assert_ne!(strong(&fs, "/p/dest/a"), strong(&fs, "/p/dest/a2"), "a dry run relinks nothing");
+}
+
+#[test]
+fn a_dry_resume_with_an_unreadable_index_predicts_what_live_does() {
+    let build = || {
+        let n = reference_nth(pair_fake, &auto(), "rename_no_replace", "-> /p/dest/sub/b)");
+        let fs = pair_fake();
+        die_at_nth(&fs, "rename_no_replace", n, &auto());
+        fs.fail_always("hardlink_index_get", Code::IoError);
+        with_dry_root(fs)
+    };
+    let again = RunConfig { operation_id: id(0x77), ..dry_resume() };
+    let (r, got) = run_tree_with(&build(), &again, &auto());
+    let out = ok(&r);
+    assert!(failures(&got).is_empty(), "{got:?}");
+    assert_eq!((out.files_resumed, out.files_hardlinked, out.hardlinks_degraded), (2, 0, 2));
+    let o = CopyOptions { hardlinks: flux_fs::Hardlinks::Preserve, ..opts() };
+    let (r, got) = run_tree_with(&build(), &again, &o);
+    let out = ok(&r);
+    let failed = failures(&got);
+    assert_eq!(failed.len(), 2, "{got:?}");
+    assert!(failed.iter().all(|f| code_of(f) == Code::HardlinkUnavailable), "{got:?}");
+    assert_eq!((out.files_resumed, out.hardlinks_degraded), (0, 0));
 }

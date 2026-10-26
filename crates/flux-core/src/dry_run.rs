@@ -65,6 +65,8 @@ pub enum PlannedAction {
     CreateSymlink,
     Resume,
     Discard,
+    /// Cut 12: a hardlink group member that would be linked to its group's first copy (no data moves).
+    Hardlink,
 }
 
 impl PlannedAction {
@@ -77,6 +79,7 @@ impl PlannedAction {
             PlannedAction::CreateSymlink => "would_create_symlink",
             PlannedAction::Resume => "would_resume",
             PlannedAction::Discard => "would_discard",
+            PlannedAction::Hardlink => "would_hardlink",
         }
     }
 }

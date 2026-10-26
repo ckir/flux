@@ -1682,7 +1682,8 @@ fn copy_one<F: DestinationRoot>(
                 false,
                 out,
                 on_report,
-            );
+            )
+            .map(|_| ());
         }
         let Some(parent) = parent else {
             unreachable!("only a dry run has a planned directory");
@@ -1814,16 +1815,7 @@ fn copy_one<F: DestinationRoot>(
                     Ok(Some(r)) if r.target == target => {
                         if r.status == ClaimStatus::Created
                             && resumed_complete(src_meta, &meta, cx.opts.preserve_times)
-                            && resume_keeps(
-                                cx,
-                                src_known.as_ref(),
-                                &group,
-                                &target,
-                                &meta,
-                                &path,
-                                out,
-                                on_report,
-                            )
+                            && resume_keeps(cx, &group, &target, &meta, &path, out, on_report)
                         {
                             out.files_resumed += 1;
                             out.bytes_resumed += src_meta.len;
@@ -1904,20 +1896,32 @@ fn copy_one<F: DestinationRoot>(
     if hardlink_degradation(cx, src_known.as_ref(), true, &path, out, on_report) {
         return Ok(());
     }
+    // The group's entry decides a candidate's fate in a dry run too (cut 12 Task 8): a dependent is predicted a link
+    // with no destination I/O, a canonical is planned as a copy and registered without a destination object.
+    let mut meet = meet_group(cx, group, &path, out, on_report);
+    if matches!(meet, Meet::Finished) {
+        return Ok(());
+    }
     if cx.dry_run {
         let (publish, replace) = match plan {
             Plan::New => (Publish::NoReplace, false),
             Plan::Replace { .. } => (Publish::Replace, true),
         };
-        return dry_stop_file(cx, parent, name, &src, path, publish, replace, out, on_report);
+        if matches!(meet, Meet::Link { .. }) {
+            // A dry run cannot see a vanished anchor or a refused link, and does not predict them (the design).
+            return dry_link(cx, name, path, replace, out, on_report);
+        }
+        let planned =
+            dry_stop_file(cx, parent, name, &src, path.clone(), publish, replace, out, on_report)?;
+        // No destination object exists in a dry run, so the anchor carries none; a canonical that failed to plan
+        // blocks its dependents as a failed live copy does.
+        let published = planned.then_some(FileIdentity::Unavailable);
+        register_outcome(cx, meet, &target, published, &path, out, on_report);
+        return Ok(());
     }
     let Some(parent) = parent else {
         unreachable!("only a dry run has a planned directory");
     };
-    let mut meet = meet_group(cx, group, &path, out, on_report);
-    if matches!(meet, Meet::Finished) {
-        return Ok(());
-    }
     let own = |status| ClaimRecord { target: target.clone(), status };
     // Cut 9f-1: the file's checkpoint identity is the claim key of the TARGET name (never the stored name of a
     // replacement), built only for a run that checkpoints.
@@ -2330,69 +2334,8 @@ enum Lookup {
 }
 
 /// The index lookup for a link candidate: `Some` for a regular file with `nlink > 1` and a `Strong` identity in a run
-/// that links (a dry run never does link I/O; its predictions are cut 12 Task 8's).
+/// that links. A dry run looks up its own temporary index (cut 12 Task 8), so it predicts what a live run would do.
 fn hardlink_group<F: DestinationRoot>(
-    cx: &Shared<'_, F>,
-    meta: Option<&Metadata>,
-) -> Option<Group> {
-    if cx.dry_run {
-        return None;
-    }
-    hardlink_lookup(cx, meta)
-}
-
-/// The `--resume` skip site for a completed destination (design "Resume (R2)"). `true`: skip it as resumed. `false`:
-/// a candidate whose destination is not the anchor's object falls through to the policy decision and the link path.
-#[allow(clippy::too_many_arguments)]
-fn resume_keeps<F: DestinationRoot>(
-    cx: &Shared<'_, F>,
-    src_meta: Option<&Metadata>,
-    group: &Option<Group>,
-    target: &FluxPathKey,
-    dest: &Metadata,
-    path: &Path,
-    out: &mut TreeOutcome,
-    on_report: &mut dyn FnMut(TreeFailure),
-) -> bool {
-    // A dry run has no group of its own (no link prediction yet): it still registers.
-    let dry_group;
-    let group = match group {
-        Some(g) => Some(g),
-        None if cx.dry_run => {
-            dry_group = hardlink_lookup(cx, src_meta);
-            dry_group.as_ref()
-        }
-        None => None,
-    };
-    let Some(Group { id, entry }) = group else { return true };
-    let skipped = match entry {
-        // Plan ruling 13: an unreadable index is "cannot check". Under `preserve` the member is not skipped: the policy
-        // and link path run and `meet_group` reports `HardlinkUnavailable`. Under `auto` it is skipped and counted.
-        Lookup::Unreadable if cx.opts.hardlinks == Hardlinks::Preserve && !cx.dry_run => {
-            return false;
-        }
-        Lookup::Unreadable => {
-            degrade(out, path, UnlinkedWhy::IndexFailure);
-            return true;
-        }
-        Lookup::Found(None) => None,
-        Lookup::Found(Some(HardlinkEntry::Skipped { members, example, .. })) => {
-            Some((*members, example.clone()))
-        }
-        Lookup::Found(Some(HardlinkEntry::Anchor { object: Some(a), .. })) => {
-            return strong(dest.identity) == Some(*a) || cx.dry_run;
-        }
-        Lookup::Found(Some(HardlinkEntry::Anchor { object: None, .. })) => return cx.dry_run,
-        Lookup::Found(Some(HardlinkEntry::Failed { .. })) => return cx.dry_run,
-    };
-    let meet = Meet::Canonical { id: *id, skipped };
-    register_outcome(cx, meet, target, Some(dest.identity), path, out, on_report);
-    true
-}
-
-/// `hardlink_group` without the dry-run refusal: the `--resume` skip site registers completed canonicals in a dry run
-/// too (the dry index is a temporary one; its link predictions are cut 12 Task 8's).
-fn hardlink_lookup<F: DestinationRoot>(
     cx: &Shared<'_, F>,
     meta: Option<&Metadata>,
 ) -> Option<Group> {
@@ -2403,6 +2346,48 @@ fn hardlink_lookup<F: DestinationRoot>(
         Err(_) => Lookup::Unreadable,
     };
     Some(Group { id, entry })
+}
+
+/// The `--resume` skip site for a completed destination (design "Resume (R2)"). `true`: skip it as resumed. `false`:
+/// a candidate whose destination is not the anchor's object falls through to the policy decision and the link path.
+#[allow(clippy::too_many_arguments)]
+fn resume_keeps<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    group: &Option<Group>,
+    target: &FluxPathKey,
+    dest: &Metadata,
+    path: &Path,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) -> bool {
+    let Some(Group { id, entry }) = group else { return true };
+    let skipped = match entry {
+        // Plan ruling 13: an unreadable index is "cannot check". Under `preserve` the member is not skipped: the policy
+        // and link path run and `meet_group` reports `HardlinkUnavailable`. Under `auto` it is skipped and counted. A dry
+        // run's index is its temporary one, so an unreadable index is real there too and predicts the same.
+        Lookup::Unreadable if cx.opts.hardlinks == Hardlinks::Preserve => {
+            return false;
+        }
+        Lookup::Unreadable => {
+            degrade(out, path, UnlinkedWhy::IndexFailure);
+            return true;
+        }
+        Lookup::Found(None) => None,
+        Lookup::Found(Some(HardlinkEntry::Skipped { members, example, .. })) => {
+            Some((*members, example.clone()))
+        }
+        // A dry run decides these exactly as live does (its anchors carry the destination object when a resumed
+        // canonical registered them, none when the walk planned them): a completed member that is another object than
+        // the anchor falls through and is predicted `would_hardlink`.
+        Lookup::Found(Some(HardlinkEntry::Anchor { object: Some(a), .. })) => {
+            return strong(dest.identity) == Some(*a);
+        }
+        Lookup::Found(Some(HardlinkEntry::Anchor { object: None, .. })) => return false,
+        Lookup::Found(Some(HardlinkEntry::Failed { .. })) => return false,
+    };
+    let meet = Meet::Canonical { id: *id, skipped };
+    register_outcome(cx, meet, target, Some(dest.identity), path, out, on_report);
+    true
 }
 
 /// `hardlinks_degraded` and the cause's count and first example, for `members` members at once.
@@ -3228,14 +3213,14 @@ fn dry_stop_file<F: DestinationRoot>(
     replace: bool,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
-) -> std::result::Result<(), CopyError> {
+) -> std::result::Result<bool, CopyError> {
     if let Err(e) = dry_temp_name_fits(cx, name) {
-        return finish_copy(cx.key_prefix, path, Err(e), out, on_report);
+        return finish_copy(cx.key_prefix, path, Err(e), out, on_report).map(|()| false);
     }
     let opts = CopyOptions { existing: ExistingPolicy::Overwrite, publish, ..cx.opts.clone() };
     let planned = match plan_file(cx.fs, src, parent, name, &opts) {
         Ok(p) => p,
-        Err(e) => return finish_copy(cx.key_prefix, path, Err(e), out, on_report),
+        Err(e) => return finish_copy(cx.key_prefix, path, Err(e), out, on_report).map(|()| false),
     };
     let (src_meta, degraded) = match planned {
         FilePlan::Proceed { src_meta, degraded, replaces } => {
@@ -3259,6 +3244,30 @@ fn dry_stop_file<F: DestinationRoot>(
     finish_copy(cx.key_prefix, path.clone(), Ok(outcome), out, on_report)?;
     let partial = dry_partial_len(cx, parent, name);
     dry_planned(out, on_report, path, PlannedObject::File, replace, partial);
+    Ok(true)
+}
+
+/// Cut 12 Task 8: a dry run's dependent of a hardlink group. No destination I/O: the entry counts as linked (never
+/// copied: ruling 11), a replacement as overwritten, and one `Planned` record says `would_hardlink`. Only the name's
+/// own length is checked (the live link makes a temporary of that name); the gate, the anchor and the link itself are
+/// the live run's to meet.
+fn dry_link<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    name: &std::ffi::OsStr,
+    path: PathBuf,
+    replace: bool,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) -> std::result::Result<(), CopyError> {
+    if let Err(e) = dry_temp_name_fits(cx, name) {
+        return finish_copy(cx.key_prefix, path, Err(e), out, on_report);
+    }
+    out.files_hardlinked += 1;
+    if replace {
+        out.files_overwritten += 1;
+    }
+    let entry = PlannedEntry { object: PlannedObject::File, action: PlannedAction::Hardlink };
+    report(out, on_report, path, TreeFailureCause::Planned(entry));
     Ok(())
 }
 
