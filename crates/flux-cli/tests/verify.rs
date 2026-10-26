@@ -91,6 +91,13 @@ fn exit_0_for_identical_trees_and_with_extras_only() {
     let out = verify(&[&src, &dst]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert!(stdout(&out).lines().any(|l| l == "extra: extra"), "{}", stdout(&out));
+    assert!(
+        stdout(&out).ends_with(
+            "verified: 3 matched, 0 missing, 0 mismatched, 1 extra, 0 unreadable; 6 bytes hashed\n"
+        ),
+        "{}",
+        stdout(&out)
+    );
 }
 
 #[test]

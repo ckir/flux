@@ -1236,6 +1236,12 @@ mod tests {
         fs.fail_canonical_path_of("/s/inner", Code::IoError, unsupported);
         assert_eq!(refused(&fs, "/s", "/s/inner"), format!("{REFUSE_A}{DEGRADED}"));
 
+        // The other direction: the source lies inside the destination, decided by path alone.
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &["inner"], &[]);
+        fs.fail_canonical_path_of("/s", Code::IoError, unsupported);
+        assert_eq!(refused(&fs, "/s/inner", "/s"), format!("{REFUSE_B}{DEGRADED}"));
+
         let fs = FaultFs::new();
         tree(&fs, "/s", &[], &[("a", b"x")]);
         tree(&fs, "/d", &[], &[("a", b"x")]);
