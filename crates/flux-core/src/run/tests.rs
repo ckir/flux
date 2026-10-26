@@ -3950,11 +3950,12 @@ fn a_source_that_became_unreadable_between_runs_fails_that_target() {
     let c = calls(&probe);
     let k = c.iter().filter(|x| x.starts_with("metadata(")).position(|x| x == "metadata(/src/a)");
     let k = k.expect("a stat of /src/a") + 1;
-    // The first stat of `/src/a` is the resume branch's (it follows `metadata(/p/dest/a)`, precedes `claim_get(a)`).
+    // The first stat of `/src/a` is the shared early one (cut 12, plan ruling 2): made before the destination name is
+    // resolved, so it follows the directory listing and precedes `metadata(/p/dest/a)`.
     let at_a = at(&c, "metadata(/src/a)");
     assert_eq!(
         (c[at_a - 1].as_str(), c[at_a + 1].as_str()),
-        ("metadata(/p/dest/a)", "claim_get(a)")
+        ("read_dir(/p/dest)", "metadata(/p/dest/a)")
     );
     fs.fail_nth(
         "metadata",
@@ -9232,4 +9233,188 @@ fn a_weak_identity_destination_makes_no_anchor_root_warning() {
         "{:?}",
         r.warnings
     );
+}
+
+// Cut 12 Task 5: candidacy and the degradations that need no index.
+fn run_hardlinks(
+    fs: &FaultFs,
+    mode: flux_fs::Hardlinks,
+) -> (Run<Result<TreeOutcome, TreeAbort>>, Vec<TreeFailure>) {
+    let mut got = Vec::new();
+    let o = CopyOptions { hardlinks: mode, ..opts() };
+    let r = tree(fs, Path::new("/src"), Path::new("/p/dest"), &o, &cfg(), &mut |f| got.push(f));
+    (r, got)
+}
+
+fn weak_group_fake() -> FaultFs {
+    let fs = fake();
+    fs.set_link_count("/src/a", 2);
+    fs.set_identity("/src/a", FileIdentity::Weak(ObjectId { volume: 5, index: 1 }));
+    fs
+}
+
+fn unknown_count_fake() -> FaultFs {
+    let fs = fake();
+    fs.set_link_count_unknown("/src/a");
+    fs
+}
+
+#[test]
+fn a_weak_identity_group_member_is_copied_independently_and_counted_under_auto() {
+    let fs = weak_group_fake();
+    let (r, got) = run_hardlinks(&fs, flux_fs::Hardlinks::Auto);
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(out.hardlinks_degraded, 1);
+    assert_eq!(out.hardlink_weak.weak[&5].count, 1);
+    assert_eq!(out.hardlink_weak.weak[&5].example, PathBuf::from("a"));
+    assert_eq!(out.files_copied, 2);
+    assert_eq!(out.files_hardlinked, 0);
+    assert!(fs.exists("/p/dest/a"));
+}
+
+#[test]
+fn a_weak_identity_group_member_fails_under_preserve() {
+    let fs = weak_group_fake();
+    let (r, got) = run_hardlinks(&fs, flux_fs::Hardlinks::Preserve);
+    let out = ok(&r);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].path, PathBuf::from("a"));
+    assert_eq!(code_of(&got[0]), Code::HardlinkIdentityUnavailable);
+    assert!(
+        matches!(&got[0].cause, TreeFailureCause::Copy(e) if e.step == CopyStep::Gate),
+        "{got:?}"
+    );
+    assert!(!fs.exists("/p/dest/a"));
+    assert!(!calls(&fs).iter().any(|c| c.starts_with("create_new(/p/dest/a")), "{:?}", calls(&fs));
+    assert_eq!(out.files_copied, 1, "the ordinary file still copies");
+    assert_eq!(out.hardlinks_degraded, 0);
+}
+
+#[test]
+fn an_unknown_link_count_is_counted_unchecked_and_copied() {
+    for mode in [flux_fs::Hardlinks::Auto, flux_fs::Hardlinks::Preserve] {
+        let fs = unknown_count_fake();
+        let (r, got) = run_hardlinks(&fs, mode);
+        let out = ok(&r);
+        assert!(got.is_empty(), "{mode:?}: {got:?}");
+        assert_eq!(
+            out.hardlinks_unchecked,
+            Some(crate::tree::DegradedGroup { count: 1, example: "a".into() }),
+            "{mode:?}"
+        );
+        assert_eq!(out.files_copied, 2, "{mode:?}");
+        assert_eq!(out.hardlinks_degraded, 0, "{mode:?}");
+        assert!(fs.exists("/p/dest/a"));
+    }
+}
+
+#[test]
+fn a_lone_selected_name_of_a_multiply_linked_object_is_an_ordinary_copy() {
+    let fs = fake();
+    fs.set_link_count("/src/a", 2);
+    let (r, got) = run_hardlinks(&fs, flux_fs::Hardlinks::Auto);
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(out.hardlinks_degraded, 0);
+    assert_eq!(out.files_hardlinked, 0);
+    assert_eq!(out.files_copied, 2);
+}
+
+#[test]
+fn copy_mode_counts_and_warns_nothing() {
+    for fs in [weak_group_fake(), unknown_count_fake()] {
+        let (r, got) = run_hardlinks(&fs, flux_fs::Hardlinks::Copy);
+        let out = ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(out.files_copied, 2);
+        assert_eq!(out.hardlinks_degraded, 0);
+        assert_eq!(out.files_hardlinked, 0);
+        assert!(out.hardlinks_unchecked.is_none());
+        assert!(out.hardlink_weak.is_empty());
+        assert!(out.hardlinks_unlinked.is_empty());
+        assert!(!calls(&fs).iter().any(|c| c.starts_with("hardlink_index_get")));
+    }
+}
+
+// Plan ruling 2: an ordinary file pays no extra stat for the hardlink machinery.
+#[test]
+fn an_ordinary_file_pays_no_extra_stat() {
+    let stats = |mode| {
+        let fs = fake();
+        let (r, _) = run_hardlinks(&fs, mode);
+        ok(&r);
+        calls(&fs).iter().filter(|c| *c == "metadata(/src/a)").count()
+    };
+    let copy = stats(flux_fs::Hardlinks::Copy);
+    assert!(copy > 0);
+    assert_eq!(stats(flux_fs::Hardlinks::Auto), copy);
+}
+
+#[test]
+fn an_ordinary_file_never_touches_the_index() {
+    let fs = fake();
+    let (r, _) = run_hardlinks(&fs, flux_fs::Hardlinks::Auto);
+    ok(&r);
+    let log = calls(&fs);
+    assert!(
+        !log.iter()
+            .any(|c| c.starts_with("hardlink_index_get") || c.starts_with("create_hardlink_index")),
+        "{log:?}"
+    );
+}
+
+#[test]
+fn a_candidate_without_claims_degrades_under_auto_and_fails_under_preserve() {
+    use crate::copy::{no_heartbeat, unguarded};
+    use crate::tree::{Shared, copy_tree_at, prepare_source};
+    use crate::walk::MountPolicy;
+    for mode in [flux_fs::Hardlinks::Auto, flux_fs::Hardlinks::Preserve] {
+        let fs = fake();
+        fs.set_link_count("/src/a", 2);
+        fs.create_dir(Path::new("/p/dest")).unwrap();
+        let root = fs.destination_root(Path::new("/p/dest")).unwrap();
+        let source =
+            prepare_source(&fs, Path::new("/src"), Path::new("/p/dest"), MountPolicy::Cross)
+                .unwrap();
+        let o = CopyOptions { hardlinks: mode, ..opts() };
+        let slot = crate::hardlinks::HardlinkSlot::unavailable(Code::IoError);
+        let cx = Shared {
+            fs: &fs,
+            src_root: Path::new("/src"),
+            src_identity: source.identity,
+            opts: &o,
+            guard: &unguarded,
+            beat: &no_heartbeat,
+            claims: None,
+            resume: false,
+            batch: crate::tree::BatchPolicy::DEFAULT,
+            ckpt: None,
+            dry_run: false,
+            dry_prior: None,
+            dry_partials: None,
+            key_prefix: None,
+            hardlinks: Some(&slot),
+            anchor_root: None,
+        };
+        let mut out = TreeOutcome::default();
+        let mut got = Vec::new();
+        let (_root, walked) =
+            copy_tree_at(&cx, source.events, root, false, &mut out, &mut |f| got.push(f));
+        walked.unwrap();
+        if mode == flux_fs::Hardlinks::Auto {
+            assert!(got.is_empty(), "{got:?}");
+            assert_eq!((out.hardlinks_degraded, out.files_copied), (1, 2));
+            assert!(fs.exists("/p/dest/a"));
+        } else {
+            assert_eq!(got.len(), 1, "{got:?}");
+            assert_eq!(code_of(&got[0]), Code::HardlinkUnavailable);
+            assert!(
+                matches!(&got[0].cause, TreeFailureCause::Copy(e) if e.step == CopyStep::Claim),
+                "{got:?}"
+            );
+            assert!(!fs.exists("/p/dest/a"));
+            assert_eq!(out.files_copied, 1);
+        }
+    }
 }

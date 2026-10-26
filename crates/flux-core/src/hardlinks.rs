@@ -7,17 +7,16 @@
 //! The run's side of the hardlink index (cut 12, Task 4): the lazily created per-run index file, and the helpers that
 //! open an anchor's directory and read an anchor's object. Nothing here links yet.
 
-// The consumers (the engine's `copy_one`, Tasks 5-6) land after this plumbing.
-#![allow(dead_code)]
-
 use crate::run::recover::name_of;
 use crate::state::HARDLINK_INDEX;
-use flux_fs::{Code, DirHandle, FileIdentity, FluxPathKey, FsError, ObjectId};
+use flux_fs::{Code, DirHandle, FileIdentity, FileType, FluxPathKey, FsError, Metadata, ObjectId};
 use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
 use std::io::ErrorKind;
 use std::ops::Deref;
 
+// Task 6 consumes this.
+#[allow(dead_code)]
 enum SlotState<I> {
     Unopened,
     Open(I),
@@ -25,6 +24,8 @@ enum SlotState<I> {
 }
 
 /// Where a slot's index file goes.
+// Task 6 consumes this.
+#[allow(dead_code)]
 enum Home<D> {
     /// A directory in hand (the live run's workspace).
     Ready(D),
@@ -73,6 +74,8 @@ impl<D: DirHandle> HardlinkSlot<D> {
         }
     }
 
+    // Task 6 consumes `with` and `create`.
+    #[allow(dead_code)]
     /// Lazily removes a stale `HARDLINK_INDEX` and creates a fresh one on the first call; a creation failure is kept
     /// and returned on every call (ruling 9).
     pub(crate) fn with<R>(
@@ -93,6 +96,7 @@ impl<D: DirHandle> HardlinkSlot<D> {
         }
     }
 
+    #[allow(dead_code)]
     /// Makes a deferred slot's directory, then removes a stale file from an earlier run of this operation (a `NotFound`
     /// is the usual answer) and creates a fresh index exclusively.
     fn create(&self) -> Result<D::Index, Code> {
@@ -176,11 +180,15 @@ impl<D: DirHandle> HardlinkSlot<D> {
     }
 }
 
+// Task 6 consumes this.
+#[allow(dead_code)]
 fn unavailable_error(code: Code) -> FsError {
     FsError::new(code, std::io::Error::other("the hardlink index could not be created"))
 }
 
 /// The directory an anchor lives in: DEST itself for a one-component key, else a handle opened below it.
+// Task 6 consumes this.
+#[allow(dead_code)]
 pub(crate) enum ParentDir<'a, D> {
     Dest(&'a D),
     Opened(D),
@@ -198,6 +206,8 @@ impl<D> Deref for ParentDir<'_, D> {
 
 /// The anchor's directory and name, opened component by component from `dest` with `open_dir` (never a path), from
 /// the claim-key bytes of `target`; `None` when a component does not decode (`recover::name_of`) or an open fails.
+// Task 6 consumes this.
+#[allow(dead_code)]
 pub(crate) fn anchor_parent<'a, D: DirHandle>(
     dest: &'a D,
     target: &FluxPathKey,
@@ -218,6 +228,35 @@ pub(crate) fn anchor_parent<'a, D: DirHandle>(
         dir = Some(next);
     }
     Some((dir.map_or(ParentDir::Dest(dest), ParentDir::Opened), name))
+}
+
+/// What a regular file's metadata says about hardlink grouping (cut 12, Task 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Candidacy {
+    /// A single name, or not a regular file: an ordinary copy.
+    NotCandidate,
+    /// The link count is unknown (`nlink == None`) on a `Strong` identity: it cannot be checked.
+    Unchecked,
+    /// `nlink > 1` but the identity is `Weak` or `Unavailable`: equivalence must never be inferred.
+    Weak(FileIdentity),
+    /// `nlink > 1` and a `Strong` identity: the object a group is keyed by.
+    Candidate(ObjectId),
+}
+
+/// `nlink > 1` and `Strong` is a candidate; `nlink == None` is `Unchecked`; `nlink > 1` with a `Weak`/`Unavailable`
+/// identity is `Weak(identity)`; a regular file with `nlink <= 1` is not a candidate. Non-regular files never are.
+pub(crate) fn candidacy(meta: &Metadata) -> Candidacy {
+    if meta.file_type != FileType::File {
+        return Candidacy::NotCandidate;
+    }
+    match (meta.nlink, meta.identity) {
+        (Some(n), _) if n <= 1 => Candidacy::NotCandidate,
+        (Some(_), FileIdentity::Strong(id)) => Candidacy::Candidate(id),
+        (Some(_), weaker) => Candidacy::Weak(weaker),
+        // The table defines the unknown count for a `Strong` identity only; a weak one could never link anyway.
+        (None, FileIdentity::Strong(_)) => Candidacy::Unchecked,
+        (None, _) => Candidacy::NotCandidate,
+    }
 }
 
 /// `Some(id)` for `FileIdentity::Strong(id)`, else `None`: the object an anchor entry records.
@@ -376,5 +415,52 @@ mod tests {
         assert_eq!(strong(FileIdentity::Strong(id)), Some(id));
         assert_eq!(strong(FileIdentity::Weak(id)), None);
         assert_eq!(strong(FileIdentity::Unavailable), None);
+    }
+
+    fn meta_of(fs: &FaultFs, path: &str) -> Metadata {
+        fs.metadata(Path::new(path)).unwrap()
+    }
+
+    // Mutant: `nlink == Some(1)` returns `Candidate`.
+    #[test]
+    fn candidacy_of_a_single_name_is_not_a_candidate() {
+        let (fs, _d) = setup();
+        fs.write_file("/w/f", b"x");
+        assert_eq!(candidacy(&meta_of(&fs, "/w/f")), Candidacy::NotCandidate);
+        fs.set_link_count("/w/f", 0);
+        assert_eq!(candidacy(&meta_of(&fs, "/w/f")), Candidacy::NotCandidate);
+        // A single name is never touched by identity strength.
+        fs.set_link_count("/w/f", 1);
+        fs.set_identity("/w/f", FileIdentity::Unavailable);
+        assert_eq!(candidacy(&meta_of(&fs, "/w/f")), Candidacy::NotCandidate);
+    }
+
+    #[test]
+    fn candidacy_classifies_the_multiply_linked_and_the_unknown() {
+        let (fs, _d) = setup();
+        fs.write_file("/w/f", b"x");
+        let id = ObjectId { volume: 3, index: 9 };
+        fs.set_link_count("/w/f", 2);
+        fs.set_identity("/w/f", FileIdentity::Strong(id));
+        assert_eq!(candidacy(&meta_of(&fs, "/w/f")), Candidacy::Candidate(id));
+        fs.set_identity("/w/f", FileIdentity::Weak(id));
+        assert_eq!(candidacy(&meta_of(&fs, "/w/f")), Candidacy::Weak(FileIdentity::Weak(id)));
+        fs.set_identity("/w/f", FileIdentity::Unavailable);
+        assert_eq!(candidacy(&meta_of(&fs, "/w/f")), Candidacy::Weak(FileIdentity::Unavailable));
+        fs.set_identity("/w/f", FileIdentity::Strong(id));
+        fs.set_link_count_unknown("/w/f");
+        assert_eq!(candidacy(&meta_of(&fs, "/w/f")), Candidacy::Unchecked);
+        // Unknown count on a non-Strong identity: the table defines `Unchecked` for Strong identities only, and a
+        // weak identity could never link anyway, so it is not a candidate and not counted.
+        fs.set_identity("/w/f", FileIdentity::Weak(id));
+        assert_eq!(candidacy(&meta_of(&fs, "/w/f")), Candidacy::NotCandidate);
+    }
+
+    #[test]
+    fn candidacy_ignores_a_directory() {
+        let (fs, _d) = setup();
+        fs.create_dir(Path::new("/w/d")).unwrap();
+        fs.set_link_count("/w/d", 5);
+        assert_eq!(candidacy(&meta_of(&fs, "/w/d")), Candidacy::NotCandidate);
     }
 }

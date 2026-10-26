@@ -18,14 +18,15 @@ use crate::copy::{
     split_destination, stage_file, sync_staged_many, unguarded, weaker,
 };
 use crate::dry_run::{PlannedAction, PlannedEntry, PlannedObject, SkipReason};
+use crate::hardlinks::{Candidacy, candidacy};
 use crate::names::{NameIndex, Resolved};
 use crate::state::{FLUX_DIR, RESERVED_DIRS, identity_text, native_hex};
 use crate::walk::{DEFAULT_MAX_DEPTH, MountPolicy, Walk, WalkEvent, WalkOptions, walk_with};
 use flux_fs::{
     ClaimKey, ClaimOutcome, ClaimRecord, ClaimStatus, ClaimStore, Code, CopyOptions,
     DestinationRoot, DirHandle, Durability, ExistingPolicy, FileIdentity, FileSystem, FileType,
-    FluxPathKey, FsError, Links, Metadata, MetadataFailure, MountRoot, ObjectId, PreparedRecord,
-    Preserve, Publish, RecoveryOp, Safety,
+    FluxPathKey, FsError, Hardlinks, Links, Metadata, MetadataFailure, MountRoot, ObjectId,
+    PreparedRecord, Preserve, Publish, RecoveryOp, Safety,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -1569,6 +1570,73 @@ fn target_failure(step: CopyStep, code: Code, why: &'static str) -> TreeFailureC
     TreeFailureCause::Copy(CopyError::at(step, FsError::new(code, std::io::Error::other(why))))
 }
 
+/// The source stat `copy_one` shares between the hardlink candidacy, the checkpoint context, `--resume` and the
+/// existing-file policy (plan ruling 2): one stat, made once, only when one of them needs it.
+fn source_stat<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    src: &Path,
+) -> std::result::Result<Option<Metadata>, CopyError> {
+    let needed = cx.hardlinks.is_some()
+        || cx.ckpt.is_some()
+        || cx.resume
+        || cx.opts.existing != ExistingPolicy::Overwrite;
+    if !needed {
+        return Ok(None);
+    }
+    cx.fs.metadata(src).map(Some).map_err(|e| CopyError::at(CopyStep::Source, e))
+}
+
+/// Cut 12: the degradations that need no index, decided from the source's candidacy for a regular file when the run
+/// has a hardlink slot. `true`: the entry is finished (a failure was reported, nothing is created); `false`: the file
+/// copies as an ordinary one. `has_claims` is false in the no-claims path, where no anchor can be recorded.
+fn hardlink_degradation<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    src_meta: Option<&Metadata>,
+    has_claims: bool,
+    path: &Path,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) -> bool {
+    let (Some(_), Some(meta)) = (cx.hardlinks, src_meta) else { return false };
+    let preserve = cx.opts.hardlinks == Hardlinks::Preserve;
+    match candidacy(meta) {
+        Candidacy::NotCandidate => false,
+        Candidacy::Unchecked => {
+            DegradedGroup::note(&mut out.hardlinks_unchecked, path);
+            false
+        }
+        Candidacy::Weak(identity) => {
+            if preserve {
+                let cause = target_failure(
+                    CopyStep::Gate,
+                    Code::HardlinkIdentityUnavailable,
+                    "the source filesystem reports no reliable identity for a multiply-linked file",
+                );
+                report(out, on_report, path.to_path_buf(), cause);
+                return true;
+            }
+            out.hardlinks_degraded += 1;
+            out.hardlink_weak.record(identity, path);
+            false
+        }
+        Candidacy::Candidate(_) if !has_claims => {
+            if preserve {
+                let cause = target_failure(
+                    CopyStep::Claim,
+                    Code::HardlinkUnavailable,
+                    "no claim store keys this directory, so no anchor can be recorded",
+                );
+                report(out, on_report, path.to_path_buf(), cause);
+                return true;
+            }
+            out.hardlinks_degraded += 1;
+            false
+        }
+        // Task 6: a candidate with claims consults the index here.
+        Candidacy::Candidate(_) => false,
+    }
+}
+
 /// A `File` event under a live frame. See the design, "The per-file protocol".
 ///
 /// The tree decides what an existing destination means and tells the copy path `ExistingPolicy::Overwrite`, so the
@@ -1592,6 +1660,16 @@ fn copy_one<F: DestinationRoot>(
     let (Some(parent_id), Some(claims)) = (claim_parent, cx.claims) else {
         // No claims for this directory (a lockless copy, or an identity that cannot key them): exactly the cut 4b
         // behaviour. An existing name is a collision.
+        let src_known = match source_stat(cx, &src) {
+            Ok(m) => m,
+            Err(e) => {
+                report(out, on_report, path, TreeFailureCause::Copy(e));
+                return Ok(());
+            }
+        };
+        if hardlink_degradation(cx, src_known.as_ref(), false, &path, out, on_report) {
+            return Ok(());
+        }
         if cx.dry_run {
             return dry_stop_file(
                 cx,
@@ -1635,6 +1713,15 @@ fn copy_one<F: DestinationRoot>(
                 path,
                 TreeFailureCause::Copy(CopyError::at(CopyStep::Resolve, e)),
             );
+            return Ok(());
+        }
+    };
+
+    // Plan ruling 2: the source is stat'ed once, here, for every reader below.
+    let src_known = match source_stat(cx, &src) {
+        Ok(m) => m,
+        Err(e) => {
+            report(out, on_report, path, TreeFailureCause::Copy(e));
             return Ok(());
         }
     };
@@ -1704,15 +1791,9 @@ fn copy_one<F: DestinationRoot>(
                 return finish_copy(cx.key_prefix, path, Err(e), out, on_report);
             }
             // Cut 9a: `--resume`. The branch mutates nothing at the destination, so it neither beats nor guards.
-            let mut src_known: Option<Metadata> = None;
             if cx.resume {
-                let src_meta = match cx.fs.metadata(&src) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        let cause = TreeFailureCause::Copy(CopyError::at(CopyStep::Source, e));
-                        report(out, on_report, path, cause);
-                        return Ok(());
-                    }
+                let Some(src_meta) = src_known.as_ref() else {
+                    unreachable!("a resuming run reads the source up front");
                 };
                 let found = claims.borrow().get(&ClaimKey::new(parent_id, &stored));
                 match found {
@@ -1727,7 +1808,7 @@ fn copy_one<F: DestinationRoot>(
                     }
                     Ok(Some(r)) if r.target == target => {
                         if r.status == ClaimStatus::Created
-                            && resumed_complete(&src_meta, &meta, cx.opts.preserve_times)
+                            && resumed_complete(src_meta, &meta, cx.opts.preserve_times)
                         {
                             out.files_resumed += 1;
                             out.bytes_resumed += src_meta.len;
@@ -1758,7 +1839,6 @@ fn copy_one<F: DestinationRoot>(
                     }
                     Ok(None) => {}
                 }
-                src_known = Some(src_meta);
             }
             if meta.file_type == FileType::Dir {
                 let cause = target_failure(
@@ -1772,20 +1852,11 @@ fn copy_one<F: DestinationRoot>(
             let skip = match cx.opts.existing {
                 ExistingPolicy::Overwrite => None,
                 policy => {
-                    let src_meta = match src_known {
-                        Some(m) => m,
-                        None => match cx.fs.metadata(&src) {
-                            Ok(m) => m,
-                            Err(e) => {
-                                let cause =
-                                    TreeFailureCause::Copy(CopyError::at(CopyStep::Source, e));
-                                report(out, on_report, path, cause);
-                                return Ok(());
-                            }
-                        },
+                    let Some(src_meta) = src_known.as_ref() else {
+                        unreachable!("a non-overwrite policy reads the source up front");
                     };
                     let replace =
-                        policy == ExistingPolicy::Update && update_replaces(&src_meta, &meta);
+                        policy == ExistingPolicy::Update && update_replaces(src_meta, &meta);
                     (!replace).then_some(src_meta.len)
                 }
             };
@@ -1811,6 +1882,10 @@ fn copy_one<F: DestinationRoot>(
         }
     };
 
+    // Cut 12: a file that will be copied meets the degradations that need no index (a skipped one is untouched).
+    if hardlink_degradation(cx, src_known.as_ref(), true, &path, out, on_report) {
+        return Ok(());
+    }
     if cx.dry_run {
         let (publish, replace) = match plan {
             Plan::New => (Publish::NoReplace, false),
@@ -1828,7 +1903,7 @@ fn copy_one<F: DestinationRoot>(
     // looked at the source): a smaller file takes the unchanged path, with no extra guard. `stage_file` filters again.
     let file_ckpt = |key: &ClaimKey| {
         let run = cx.ckpt?;
-        let len = cx.fs.metadata(&src).ok()?.len;
+        let len = src_known.as_ref()?.len;
         (len >= run.min_len()).then(|| FileCkpt {
             run,
             file_id: key.encode(),
