@@ -133,7 +133,8 @@ fn sides(case: &Case) -> (BTreeMap<PathBuf, Spec>, BTreeMap<PathBuf, Spec>) {
     (source, dest)
 }
 
-/// The `io::ErrorKind` that pairs with a fault code (the two fixed pairs).
+/// The `io::ErrorKind` that pairs with a fault code (the two fixed pairs); panics on any other code, because
+/// the generator emits only those.
 fn fault_kind(code: Code) -> std::io::ErrorKind {
     match code {
         Code::PermissionDenied => std::io::ErrorKind::PermissionDenied,
@@ -164,6 +165,7 @@ fn materialise(case: &Case) -> (FaultFs, usize) {
                     fs.add_symlink_to(&at, *payload, LinkKind::Unspecified)
                 }
                 Spec::Other => fs.add_special(&at),
+                // Directories were created in the preceding pass.
                 Spec::Dir { .. } => {}
             }
         }
@@ -415,7 +417,8 @@ const PARTIAL_UPPER: [&str; 3] = [
     partial!("sub", "0123456789ABCDEF0123456789ABCDEF"),
 ];
 const PARTIAL_NO_HEAD: &str = ".flux-partial.0123456789abcdef0123456789abcdef";
-/// How many control-state shapes `control` knows.
+/// How many control-state shapes `control` knows: ten explicit arms (0 to 9); the `_` arm, the nested `.flux`
+/// directory, takes the other two values (10 and 11).
 const CONTROL_SHAPES: usize = 12;
 
 fn which() -> impl Strategy<Value = Which> {
@@ -1241,8 +1244,15 @@ mod tests {
                 hash: HashAlgorithm::Blake3,
             };
             let mut rows = Vec::new();
-            let summary = verify_tree(&fs, Path::new("/s"), Path::new("/d"), &opts, &mut |r| rows.push(r))
-                .unwrap();
+            let result =
+                verify_tree(&fs, Path::new("/s"), Path::new("/d"), &opts, &mut |r| rows.push(r));
+            prop_assert!(
+                result.is_ok(),
+                "verify_tree failed: {:?}\n{}",
+                result.as_ref().err(),
+                fixture_snippet(&case)
+            );
+            let summary = result.unwrap();
             let (expected_rows, expected_summary) = reference(&case);
             prop_assert_eq!(&rows, &expected_rows, "{}", fixture_snippet(&case));
             prop_assert_eq!(summary, expected_summary, "{}", fixture_snippet(&case));
@@ -1258,17 +1268,14 @@ mod tests {
             for call in calls.iter().map(String::as_str) {
                 let Some(rest) = call.strip_prefix("open_read(") else { continue };
                 let rest = rest.strip_suffix(')').unwrap_or(rest).to_owned();
-                let found = if let Some(t) = rest.strip_prefix("/s/") {
-                    Some((&src, t.to_owned()))
-                } else {
-                    rest.strip_prefix("/d/").map(|t| (&dst, t.to_owned()))
-                };
+                let tail = rest.strip_prefix("/s/").or_else(|| rest.strip_prefix("/d/"));
                 prop_assert!(
-                    found.as_ref().is_some_and(|(side, tail)| {
+                    tail.is_some_and(|tail| {
                         let rel = tail.split('/').fold(PathBuf::new(), |p, c| p.join(c));
-                        matches!(side.get(&rel), Some(Spec::File { .. }))
+                        matches!(src.get(&rel), Some(Spec::File { .. }))
+                            && matches!(dst.get(&rel), Some(Spec::File { .. }))
                     }),
-                    "open_read of a non-file or a root: {call}\n{}",
+                    "open_read of a path that is not a file on both sides, or a root: {call}\n{}",
                     fixture_snippet(&case)
                 );
             }
@@ -1287,6 +1294,24 @@ mod tests {
                     "a non-read call: {call}\n{}",
                     fixture_snippet(&case)
                 );
+            }
+            if case.mounts == MountPolicy::Stay {
+                for (root, side) in [("/s", &src), ("/d", &dst)] {
+                    for (p, spec) in side {
+                        if !matches!(spec, Spec::Dir { mount: MountRoot::Yes, .. }) {
+                            continue;
+                        }
+                        let listing = format!(
+                            "read_dir({})",
+                            Path::new(root).join(p).to_string_lossy().replace('\\', "/")
+                        );
+                        prop_assert!(
+                            !calls.contains(&listing),
+                            "a mount root was listed under Stay: {listing}\n{}",
+                            fixture_snippet(&case)
+                        );
+                    }
+                }
             }
         }
     }
