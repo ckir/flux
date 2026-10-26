@@ -11,10 +11,12 @@
 // Transitional: the generator, reference and property that read every variant and field land in later tasks.
 #![allow(dead_code)]
 
+use crate::fault_fs::FaultFs;
+use crate::verify::{Kind, MOUNT_NOT_ENTERED, Outcome, Record, SPECIAL_NOT_COMPARED, Summary};
 use crate::walk::MountPolicy;
-use flux_fs::{Code, Links, MountRoot};
+use flux_fs::{Code, FileSystem, FluxPathKey, LinkKind, Links, MountRoot};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A relative path as 1 to 4 components, joined with `Path::join`.
 type RelPath = Vec<&'static str>;
@@ -131,6 +133,255 @@ fn sides(case: &Case) -> (BTreeMap<PathBuf, Spec>, BTreeMap<PathBuf, Spec>) {
     (source, dest)
 }
 
+/// The `io::ErrorKind` that pairs with a fault code (the two fixed pairs).
+fn fault_kind(code: Code) -> std::io::ErrorKind {
+    match code {
+        Code::PermissionDenied => std::io::ErrorKind::PermissionDenied,
+        Code::IoError => std::io::ErrorKind::Other,
+        other => panic!("no fault pairing for {other:?}"),
+    }
+}
+
+/// Build the fake filesystem a case describes, under `/s` and `/d`. Returns the fake and the number of calls
+/// logged by the setup, so the property can ignore them by index.
+fn materialise(case: &Case) -> (FaultFs, usize) {
+    let fs = FaultFs::new();
+    let (src, dst) = sides(case);
+    for (root, side) in [("/s", &src), ("/d", &dst)] {
+        let root = Path::new(root);
+        fs.create_dir(root).unwrap();
+        let mut dirs: Vec<(&PathBuf, &Spec)> =
+            side.iter().filter(|(_, s)| matches!(s, Spec::Dir { .. })).collect();
+        dirs.sort_by_key(|(p, _)| p.components().count());
+        for (p, _) in &dirs {
+            fs.create_dir(&root.join(p)).unwrap();
+        }
+        for (p, spec) in side {
+            let at = root.join(p);
+            match spec {
+                Spec::File { len, fill } => fs.write_file(&at, &vec![*fill; *len]),
+                Spec::Symlink { payload } => {
+                    fs.add_symlink_to(&at, *payload, LinkKind::Unspecified)
+                }
+                Spec::Other => fs.add_special(&at),
+                Spec::Dir { .. } => {}
+            }
+        }
+        for (p, spec) in &dirs {
+            if let Spec::Dir { mount, list_error } = spec {
+                let at = root.join(p);
+                if *mount != MountRoot::No {
+                    fs.set_mount_root(&at, *mount);
+                }
+                if let Some(code) = list_error {
+                    fs.fail_read_dir_of(&at, *code, fault_kind(*code));
+                }
+            }
+        }
+    }
+    let n = fs.calls().len();
+    (fs, n)
+}
+
+/// A record in the form the tests compare: the path's components joined with `/`.
+type Row = (String, Outcome, Kind, Option<Code>, String);
+
+fn row(r: &Record) -> Row {
+    let path =
+        r.path.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");
+    (path, r.outcome, r.kind, r.code, r.detail.clone())
+}
+
+fn kind_of(spec: &Spec) -> Kind {
+    match spec {
+        Spec::File { .. } => Kind::File,
+        Spec::Dir { .. } => Kind::Dir,
+        Spec::Symlink { .. } => Kind::Symlink,
+        Spec::Other => Kind::Other,
+    }
+}
+
+type Keyed = BTreeMap<Vec<u8>, (PathBuf, Spec)>;
+
+/// Whether a destination name is `<head>.flux-partial.<32 lowercase hex>` with a non-empty head.
+fn is_partial_name(name: &str) -> bool {
+    let Some(split) = name.len().checked_sub(32) else { return false };
+    let (rest, id) = match (name.get(..split), name.get(split..)) {
+        (Some(r), Some(i)) => (r, i),
+        _ => return false,
+    };
+    id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && rest.strip_suffix(".flux-partial.").is_some_and(|head| !head.is_empty())
+}
+
+/// The destination's control state, which verify hides (design 6.5 step 2).
+fn is_control(path: &Path, spec: &Spec) -> bool {
+    let comps: Vec<_> = path.components().collect();
+    let first = comps[0].as_os_str().to_string_lossy();
+    if first == ".flux" && (comps.len() > 1 || matches!(spec, Spec::Dir { .. })) {
+        return true;
+    }
+    if comps.len() == 1 && first == ".flux-root.lock" && matches!(spec, Spec::File { .. }) {
+        return true;
+    }
+    let name = comps[comps.len() - 1].as_os_str().to_string_lossy();
+    matches!(spec, Spec::File { .. } | Spec::Symlink { .. }) && is_partial_name(&name)
+}
+
+fn key_of(path: &Path) -> Vec<u8> {
+    FluxPathKey::from_relative(path).unwrap().0
+}
+
+fn under(key: &[u8], pruned: &[u8]) -> bool {
+    key == pruned || (key.starts_with(pruned) && key[pruned.len()] == 0x00)
+}
+
+fn digest_hex(len: usize, fill: u8) -> String {
+    let mut h = flux_hash::Hasher::new();
+    h.update(&vec![fill; len]);
+    h.finalize().to_hex()
+}
+
+/// The non-streaming reference for `verify_tree` (design 6.5): the records and the summary a case must produce.
+fn reference(case: &Case) -> (Vec<Record>, Summary) {
+    let (mut src, mut dst) = sides(case);
+    let stay = case.mounts == MountPolicy::Stay;
+    // Step 0: the walker view.
+    if stay {
+        for side in [&mut src, &mut dst] {
+            let mounts: Vec<PathBuf> = side
+                .iter()
+                .filter(|(_, s)| matches!(s, Spec::Dir { mount: MountRoot::Yes, .. }))
+                .map(|(p, _)| p.clone())
+                .collect();
+            side.retain(|p, _| !mounts.iter().any(|m| p.starts_with(m) && p != m));
+        }
+    }
+    // Step 1: links skipped on the source.
+    if case.links == Links::Skip {
+        src.retain(|_, s| !matches!(s, Spec::Symlink { .. }));
+    }
+    // Step 2: destination control state.
+    dst.retain(|p, s| !is_control(p, s));
+    // Step 3: key both sides.
+    let key = |side: BTreeMap<PathBuf, Spec>| -> Keyed {
+        side.into_iter().map(|(p, s)| (key_of(&p), (p, s))).collect()
+    };
+    let (src, dst) = (key(src), key(dst));
+    // Step 4: the merge.
+    let failed = |s: &Spec| match s {
+        Spec::Dir { mount, list_error: Some(code) } if !(stay && *mount == MountRoot::Yes) => {
+            Some((*code, std::io::Error::from(fault_kind(*code)).to_string()))
+        }
+        _ => None,
+    };
+    let mut keys: Vec<&Vec<u8>> = src.keys().chain(dst.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    let mut pruned: Option<Vec<u8>> = None;
+    let mut out = Vec::new();
+    let mut sum = Summary::default();
+    for k in keys {
+        if pruned.as_ref().is_some_and(|p| under(k, p)) {
+            continue;
+        }
+        let rec = |path: &Path, outcome, kind, code, detail: &str| Record {
+            path: path.to_path_buf(),
+            outcome,
+            kind,
+            code,
+            detail: detail.to_string(),
+        };
+        let record = match (src.get(k), dst.get(k)) {
+            (Some((p, s)), None) => match failed(s) {
+                Some((code, text)) => {
+                    pruned = Some(k.clone());
+                    rec(p, Outcome::Unreadable, Kind::Dir, Some(code), &text)
+                }
+                None => rec(p, Outcome::Missing, kind_of(s), None, ""),
+            },
+            (None, Some((p, d))) => match failed(d) {
+                Some((code, text)) => {
+                    pruned = Some(k.clone());
+                    rec(p, Outcome::Extra, Kind::Dir, Some(code), &text)
+                }
+                None => rec(p, Outcome::Extra, kind_of(d), None, ""),
+            },
+            (Some((p, s)), Some((_, d))) => {
+                let (fs_, fd) = (failed(s), failed(d));
+                if let Some((code, text)) = fs_.or(fd) {
+                    pruned = Some(k.clone());
+                    rec(p, Outcome::Unreadable, kind_of(s), Some(code), &text)
+                } else {
+                    match (s, d) {
+                        (Spec::Dir { mount: ms, .. }, Spec::Dir { mount: md, .. }) => {
+                            if stay && (*ms == MountRoot::Yes || *md == MountRoot::Yes) {
+                                pruned = Some(k.clone());
+                                sum.not_entered += 1;
+                                rec(p, Outcome::Match, Kind::Dir, None, MOUNT_NOT_ENTERED)
+                            } else {
+                                rec(p, Outcome::Match, Kind::Dir, None, "")
+                            }
+                        }
+                        (Spec::File { len: ls, fill: fls }, Spec::File { len: ld, fill: fld }) => {
+                            sum.bytes_hashed += (*ls + *ld) as u64;
+                            let (hs, hd) = (digest_hex(*ls, *fls), digest_hex(*ld, *fld));
+                            if hs == hd {
+                                rec(p, Outcome::Match, Kind::File, None, "")
+                            } else {
+                                let text = format!("{} != {}", &hs[..8], &hd[..8]);
+                                rec(
+                                    p,
+                                    Outcome::Mismatched,
+                                    Kind::File,
+                                    Some(Code::VerifyMismatch),
+                                    &text,
+                                )
+                            }
+                        }
+                        (Spec::Symlink { payload: a }, Spec::Symlink { payload: b }) => {
+                            if a == b {
+                                rec(p, Outcome::Match, Kind::Symlink, None, "")
+                            } else {
+                                rec(
+                                    p,
+                                    Outcome::Mismatched,
+                                    Kind::Symlink,
+                                    Some(Code::VerifyMismatch),
+                                    "symlink payloads differ",
+                                )
+                            }
+                        }
+                        (Spec::Other, Spec::Other) => rec(
+                            p,
+                            Outcome::Unreadable,
+                            Kind::Other,
+                            Some(Code::SpecialFileUnsupported),
+                            SPECIAL_NOT_COMPARED,
+                        ),
+                        _ => {
+                            let (ks, kd) = (kind_of(s), kind_of(d));
+                            let text =
+                                format!("source {}, destination {}", ks.as_str(), kd.as_str());
+                            rec(p, Outcome::Mismatched, ks, Some(Code::VerifyMismatch), &text)
+                        }
+                    }
+                }
+            }
+            (None, None) => unreachable!("a key comes from one of the sides"),
+        };
+        match record.outcome {
+            Outcome::Match => sum.matched += 1,
+            Outcome::Missing => sum.missing += 1,
+            Outcome::Mismatched => sum.mismatched += 1,
+            Outcome::Extra => sum.extra += 1,
+            Outcome::Unreadable => sum.unreadable += 1,
+        }
+        out.push(record);
+    }
+    (out, sum)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,5 +430,192 @@ mod tests {
         assert_eq!(d[&PathBuf::from("l")], link("u")); // EditContent on a symlink swaps the payload
         assert_eq!(s[&PathBuf::from("o")], Spec::Other); // EditContent is a no-op on Other
         assert_eq!(s[&PathBuf::from("b")].clone(), f(1, b'b')); // the extra at an existing path was dropped
+    }
+
+    fn file(len: usize, fill: u8) -> Spec {
+        Spec::File { len, fill }
+    }
+
+    fn dir() -> Spec {
+        Spec::Dir { mount: MountRoot::No, list_error: None }
+    }
+
+    fn case_of(
+        entries: Vec<(RelPath, Spec, Edit)>,
+        extras: Vec<(Which, RelPath, Spec)>,
+        mounts: MountPolicy,
+    ) -> Case {
+        let (base, edits) = entries.into_iter().map(|(r, s, e)| ((r, s), e)).unzip();
+        Case { base, edits, extras, mounts, links: Links::Copy }
+    }
+
+    fn rows_of(case: &Case) -> Vec<Row> {
+        reference(case).0.iter().map(row).collect()
+    }
+
+    /// The three fixture cases of test (a), with the rows their `verify::tests` fixtures assert.
+    fn fixture_cases() -> Vec<(Case, Vec<Row>)> {
+        let mm = |p: &str, k: Kind, d: &str| {
+            (p.to_string(), Outcome::Mismatched, k, Some(Code::VerifyMismatch), d.to_string())
+        };
+        let rec = |p: &str, o: Outcome, k: Kind| (p.to_string(), o, k, None, String::new());
+        let drop_d = Edit::DropFromDest;
+        let drop_s = Edit::DropFromSource;
+        // a_type_mismatch_drains_the_children_as_extra_or_missing
+        let type_mismatch = case_of(
+            vec![
+                (vec!["a"], dir(), Edit::ChangeKind(Which::Dest, file(1, b'a'))),
+                (vec!["a", "x"], file(1, b'x'), drop_d.clone()),
+                (vec!["b"], file(1, b'b'), Edit::ChangeKind(Which::Dest, dir())),
+                (vec!["b", "y"], file(1, b'y'), drop_s.clone()),
+            ],
+            vec![],
+            MountPolicy::Cross,
+        );
+        let type_rows = vec![
+            mm("a", Kind::Dir, "source dir, destination file"),
+            rec("a/x", Outcome::Missing, Kind::File),
+            mm("b", Kind::File, "source file, destination dir"),
+            rec("b/y", Outcome::Extra, Kind::File),
+        ];
+        // a_mount_point_on_either_side_is_matched_once_and_pruned, first half: destination mount, source child.
+        let mount = |m: MountRoot| Spec::Dir { mount: m, list_error: None };
+        let want =
+            vec![("m".to_string(), Outcome::Match, Kind::Dir, None, MOUNT_NOT_ENTERED.to_string())];
+        let dest_mount = case_of(
+            vec![
+                (vec!["m"], dir(), Edit::ChangeKind(Which::Dest, mount(MountRoot::Yes))),
+                (vec!["m", "x"], file(1, b'x'), drop_d.clone()),
+            ],
+            vec![],
+            MountPolicy::Stay,
+        );
+        // second half: source mount, destination child.
+        let source_mount = case_of(
+            vec![
+                (vec!["m"], dir(), Edit::ChangeKind(Which::Source, mount(MountRoot::Yes))),
+                (vec!["m", "x"], file(1, b'x'), drop_s.clone()),
+            ],
+            vec![],
+            MountPolicy::Stay,
+        );
+        // a_destination_only_directory_that_cannot_be_listed_is_extra_with_its_error_and_never_fails
+        let lost = Spec::Dir { mount: MountRoot::No, list_error: Some(Code::PermissionDenied) };
+        let unlistable = case_of(
+            vec![
+                (vec!["a"], file(1, b'a'), Edit::KeepBoth),
+                (vec!["lost"], lost, drop_s.clone()),
+                (vec!["lost", "x"], file(1, b'x'), drop_s.clone()),
+                (vec!["z"], file(1, b'z'), drop_s),
+            ],
+            vec![],
+            MountPolicy::Cross,
+        );
+        let unlistable_rows = vec![
+            rec("a", Outcome::Match, Kind::File),
+            (
+                "lost".to_string(),
+                Outcome::Extra,
+                Kind::Dir,
+                Some(Code::PermissionDenied),
+                String::new(),
+            ),
+            rec("z", Outcome::Extra, Kind::File),
+        ];
+        vec![
+            (type_mismatch, type_rows),
+            (dest_mount, want.clone()),
+            (source_mount, want),
+            (unlistable, unlistable_rows),
+        ]
+    }
+
+    /// Rows with the error text dropped, for the fixture whose text is platform-dependent.
+    fn no_text(rows: &[Row]) -> Vec<(String, Outcome, Kind, Option<Code>)> {
+        rows.iter().map(|r| (r.0.clone(), r.1, r.2, r.3)).collect()
+    }
+
+    #[test]
+    fn the_reference_agrees_with_three_fixtures() {
+        for (i, (case, want)) in fixture_cases().into_iter().enumerate() {
+            let got = rows_of(&case);
+            if i == 3 {
+                assert_eq!(no_text(&got), no_text(&want), "{got:?}");
+                assert_eq!(
+                    got[1].4,
+                    std::io::Error::from(std::io::ErrorKind::PermissionDenied).to_string()
+                );
+                let (_, sum) = reference(&case);
+                assert_eq!((sum.extra, sum.unreadable, sum.matched), (2, 0, 1));
+            } else {
+                assert_eq!(got, want, "case {i}");
+            }
+        }
+        let (_, sum) = reference(&fixture_cases()[1].0);
+        assert_eq!((sum.matched, sum.not_entered, sum.missing), (1, 1, 0));
+    }
+
+    #[test]
+    fn the_reference_hides_a_mount_roots_children_on_its_side_under_stay() {
+        let mount = Spec::Dir { mount: MountRoot::Yes, list_error: None };
+        let case = case_of(
+            vec![
+                (vec!["m"], file(1, b'm'), Edit::ChangeKind(Which::Dest, mount)),
+                (vec!["m", "x"], file(1, b'x'), Edit::DropFromSource),
+            ],
+            vec![],
+            MountPolicy::Stay,
+        );
+        let (records, sum) = reference(&case);
+        let rows: Vec<Row> = records.iter().map(row).collect();
+        assert_eq!(
+            rows,
+            [(
+                "m".to_string(),
+                Outcome::Mismatched,
+                Kind::File,
+                Some(Code::VerifyMismatch),
+                "source file, destination dir".to_string()
+            )]
+        );
+        assert_eq!(sum.not_entered, 0);
+    }
+
+    #[test]
+    fn the_reference_gives_a_failed_pair_the_source_kind() {
+        let bad = Spec::Dir { mount: MountRoot::No, list_error: Some(Code::IoError) };
+        let case = case_of(
+            vec![(vec!["p"], file(1, b'p'), Edit::ChangeKind(Which::Dest, bad))],
+            vec![],
+            MountPolicy::Cross,
+        );
+        assert_eq!(
+            rows_of(&case),
+            [(
+                "p".to_string(),
+                Outcome::Unreadable,
+                Kind::File,
+                Some(Code::IoError),
+                "other error".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn materialise_builds_what_sides_describe() {
+        use crate::verify::{VerifyOptions, verify_tree};
+        use flux_fs::HashAlgorithm;
+        for (i, (case, _)) in fixture_cases().into_iter().enumerate() {
+            let (fs, _setup) = materialise(&case);
+            let opts = VerifyOptions {
+                links: case.links,
+                mounts: case.mounts,
+                hash: HashAlgorithm::Blake3,
+            };
+            let mut rows = Vec::new();
+            verify_tree(&fs, Path::new("/s"), Path::new("/d"), &opts, &mut |r| rows.push(row(&r)))
+                .unwrap();
+            assert_eq!(rows, rows_of(&case), "case {i}");
+        }
     }
 }
