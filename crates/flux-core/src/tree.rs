@@ -1814,6 +1814,16 @@ fn copy_one<F: DestinationRoot>(
                     Ok(Some(r)) if r.target == target => {
                         if r.status == ClaimStatus::Created
                             && resumed_complete(src_meta, &meta, cx.opts.preserve_times)
+                            && resume_keeps(
+                                cx,
+                                src_known.as_ref(),
+                                &group,
+                                &target,
+                                &meta,
+                                &path,
+                                out,
+                                on_report,
+                            )
                         {
                             out.files_resumed += 1;
                             out.bytes_resumed += src_meta.len;
@@ -2328,6 +2338,56 @@ fn hardlink_group<F: DestinationRoot>(
     if cx.dry_run {
         return None;
     }
+    hardlink_lookup(cx, meta)
+}
+
+/// The `--resume` skip site for a completed destination (design "Resume (R2)"). `true`: skip it as resumed. `false`:
+/// a candidate whose destination is not the anchor's object falls through to the policy decision and the link path.
+#[allow(clippy::too_many_arguments)]
+fn resume_keeps<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    src_meta: Option<&Metadata>,
+    group: &Option<Group>,
+    target: &FluxPathKey,
+    dest: &Metadata,
+    path: &Path,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) -> bool {
+    // A dry run has no group of its own (no link prediction yet): it still registers.
+    let dry_group;
+    let group = match group {
+        Some(g) => Some(g),
+        None if cx.dry_run => {
+            dry_group = hardlink_lookup(cx, src_meta);
+            dry_group.as_ref()
+        }
+        None => None,
+    };
+    let Some(Group { id, entry }) = group else { return true };
+    let skipped = match entry {
+        Lookup::Unreadable => return true,
+        Lookup::Found(None) => None,
+        Lookup::Found(Some(HardlinkEntry::Skipped { members, example, .. })) => {
+            Some((*members, example.clone()))
+        }
+        Lookup::Found(Some(HardlinkEntry::Anchor { object: Some(a), .. })) => {
+            return strong(dest.identity) == Some(*a) || cx.dry_run;
+        }
+        Lookup::Found(Some(HardlinkEntry::Anchor { object: None, .. })) => return cx.dry_run,
+        Lookup::Found(Some(HardlinkEntry::Failed { .. })) => return cx.dry_run,
+    };
+    let meet = Meet::Canonical { id: *id, skipped };
+    register_outcome(cx, meet, target, Some(dest.identity), path, out, on_report);
+    true
+}
+
+/// `hardlink_group` without the dry-run refusal: the `--resume` skip site registers completed canonicals in a dry run
+/// too (the dry index is a temporary one; its link predictions are cut 12 Task 8's).
+fn hardlink_lookup<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    meta: Option<&Metadata>,
+) -> Option<Group> {
     let (Some(slot), Some(meta)) = (cx.hardlinks, meta) else { return None };
     let Candidacy::Candidate(id) = candidacy(meta) else { return None };
     let entry = match slot.with(|index| index.get(&id)) {

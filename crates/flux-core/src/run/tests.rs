@@ -10072,3 +10072,287 @@ fn a_lost_lock_after_a_same_object_rename_keeps_the_temporary_as_the_leftover() 
         a.error.leftover
     );
 }
+
+// Cut 12 Task 7: `--resume` rebuilds the hardlink index from the walk, heals independent members and converges.
+
+/// A first run that dies (a panic, as a kill would) at the `nth` call of `op`, before that call takes effect.
+fn die_at_nth(fs: &FaultFs, op: &'static str, nth: u32, o: &CopyOptions) {
+    fs.on_nth(op, nth, |_| panic!("the test's crash point"));
+    let died =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_tree_with(fs, &cfg(), o)));
+    assert!(died.is_err(), "the run died at {op} {nth}");
+}
+
+/// The resumed run (a new operation id, adopting the prior one).
+fn resumed_under(
+    fs: &FaultFs,
+    o: &CopyOptions,
+) -> (Run<Result<TreeOutcome, TreeAbort>>, Vec<TreeFailure>) {
+    let again = RunConfig { operation_id: id(0x77), ..resume() };
+    run_tree_with(fs, &again, o)
+}
+
+/// The `nth` of `op` mentioning `needle` in a complete reference run of `build()` under `o`.
+fn reference_nth(build: fn() -> FaultFs, o: &CopyOptions, op: &str, needle: &str) -> u32 {
+    let reference = build();
+    ok(&run_tree_with(&reference, &cfg(), o).0);
+    nth_of(&reference, op, needle)
+}
+
+/// `fake()` with modification times on the sources (so a finished destination reads as complete to `--resume`) and
+/// `/src/a` also named `extra`.
+fn timed_group(extra: &[&str]) -> FaultFs {
+    let fs = FaultFs::new();
+    for d in ["/src", "/src/sub", "/p"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    put(&fs, "/src/a", b"A", 100);
+    put(&fs, "/src/sub/b", b"BB", 100);
+    link_names(&fs, "/src", "a", extra);
+    fs
+}
+
+fn pair_fake() -> FaultFs {
+    timed_group(&["a2"])
+}
+
+fn triple_fake() -> FaultFs {
+    timed_group(&["a2", "a3"])
+}
+
+fn claim_of(fs: &FaultFs, name: &str) -> Option<ClaimRecord> {
+    fs.claim(strong(fs, "/p/dest"), name)
+}
+
+fn auto() -> CopyOptions {
+    opts()
+}
+
+fn copy_mode() -> CopyOptions {
+    CopyOptions { hardlinks: flux_fs::Hardlinks::Copy, ..opts() }
+}
+
+#[test]
+fn crash_before_the_canonical_is_published_then_resume_links_everything() {
+    let n = reference_nth(pair_fake, &auto(), "rename_no_replace", "-> /p/dest/a)");
+    let fs = pair_fake();
+    die_at_nth(&fs, "rename_no_replace", n, &auto());
+    assert!(!fs.exists("/p/dest/a") && !fs.exists("/p/dest/a2"), "nothing was published");
+    assert_eq!((claim_of(&fs, "a"), claim_of(&fs, "a2")), (None, None));
+    let (r, got) = resumed_under(&fs, &auto());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(strong(&fs, "/p/dest/a"), strong(&fs, "/p/dest/a2"));
+    assert_eq!((out.files_hardlinked, out.files_resumed), (1, 0));
+}
+
+#[test]
+fn crash_after_the_canonical_before_the_link_then_resume_links() {
+    let n = reference_nth(pair_fake, &auto(), "create_hardlink", "/p/dest/");
+    let fs = pair_fake();
+    die_at_nth(&fs, "create_hardlink", n, &auto());
+    assert!(fs.exists("/p/dest/a") && !fs.exists("/p/dest/a2"));
+    assert_eq!((claim_of(&fs, "a"), claim_of(&fs, "a2")), (created("a"), None));
+    let (r, got) = resumed_under(&fs, &auto());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(strong(&fs, "/p/dest/a"), strong(&fs, "/p/dest/a2"));
+    assert_eq!((out.files_resumed, out.files_hardlinked), (1, 1));
+}
+
+#[test]
+fn crash_after_some_links_then_resume_links_the_rest() {
+    let reference = triple_fake();
+    ok(&run_tree_with(&reference, &cfg(), &auto()).0);
+    let n = nth_of(&reference, "create_hardlink", "a3.flux-partial");
+    assert!(n > nth_of(&reference, "create_hardlink", "a2.flux-partial"), "after a2's link");
+    let fs = triple_fake();
+    die_at_nth(&fs, "create_hardlink", n, &auto());
+    assert_eq!(strong(&fs, "/p/dest/a"), strong(&fs, "/p/dest/a2"));
+    assert!(!fs.exists("/p/dest/a3"));
+    assert_eq!((claim_of(&fs, "a"), claim_of(&fs, "a2")), (created("a"), created("a2")));
+    assert_eq!(claim_of(&fs, "a3"), None);
+    let (r, got) = resumed_under(&fs, &auto());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    let one = strong(&fs, "/p/dest/a");
+    assert_eq!((strong(&fs, "/p/dest/a2"), strong(&fs, "/p/dest/a3")), (one, one));
+    assert_eq!((out.files_resumed, out.files_hardlinked), (2, 1));
+}
+
+#[test]
+fn crash_between_the_link_rename_and_its_claim_then_resume_relinks_identically() {
+    // The first run loses a2's claim write (the link itself is renamed in) and dies at `sub/b`'s publish, so it is
+    // resumable. The reference run arms the same claim fault: the ordinals are those of the faulted run.
+    fn faulted() -> FaultFs {
+        let fs = pair_fake();
+        let reference = pair_fake();
+        ok(&run_tree_with(&reference, &cfg(), &auto()).0);
+        let n = nth_of(&reference, "claim_insert", "a2");
+        fs.fail_nth("claim_insert", n, Code::IoError, std::io::ErrorKind::Other);
+        fs
+    }
+    let reference = faulted();
+    ok(&run_tree_with(&reference, &cfg(), &auto()).0);
+    let n = nth_of(&reference, "rename_no_replace", "-> /p/dest/sub/b)");
+    let fs = faulted();
+    die_at_nth(&fs, "rename_no_replace", n, &auto());
+    // The state the resume relies on: a2 is linked in place, its claim is missing, a's is there.
+    assert_eq!(strong(&fs, "/p/dest/a"), strong(&fs, "/p/dest/a2"));
+    assert_eq!((claim_of(&fs, "a"), claim_of(&fs, "a2")), (created("a"), None));
+    let before = calls(&fs).len();
+    let (r, got) = resumed_under(&fs, &auto());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(strong(&fs, "/p/dest/a"), strong(&fs, "/p/dest/a2"));
+    assert_eq!((out.files_hardlinked, out.files_resumed), (1, 1));
+    let c = calls(&fs)[before..].to_vec();
+    let link = at(&c, "create_hardlink(/p/dest/a2.flux-partial");
+    let rename = at(&c, "rename_replace(/p/dest/a2.flux-partial");
+    assert!(link < rename, "{c:?}");
+    assert_eq!(claim_of(&fs, "a2"), created("a2"));
+}
+
+/// A `Copy`-mode first run of the pair interrupted when `sub/b` is about to be published: `a` and `a2` are two
+/// completed, independent objects.
+fn independent_prior(existing: ExistingPolicy) -> FaultFs {
+    let o = CopyOptions { existing, ..copy_mode() };
+    let n = reference_nth(pair_fake, &o, "rename_no_replace", "-> /p/dest/sub/b)");
+    let fs = pair_fake();
+    die_at_nth(&fs, "rename_no_replace", n, &o);
+    assert_ne!(strong(&fs, "/p/dest/a"), strong(&fs, "/p/dest/a2"), "two objects");
+    assert_eq!((claim_of(&fs, "a"), claim_of(&fs, "a2")), (created("a"), created("a2")));
+    assert!(!fs.exists("/p/dest/sub/b"));
+    fs
+}
+
+#[test]
+fn a_completed_independent_copy_is_relinked_on_resume() {
+    let fs = independent_prior(ExistingPolicy::Overwrite);
+    let (r, got) = resumed_under(&fs, &auto());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(strong(&fs, "/p/dest/a"), strong(&fs, "/p/dest/a2"));
+    assert_eq!((out.files_hardlinked, out.files_resumed, out.hardlinks_degraded), (1, 1, 0));
+    assert_eq!(out.files_copied, 1, "only sub/b");
+}
+
+#[test]
+fn the_users_policy_wins_over_healing() {
+    let fs = independent_prior(ExistingPolicy::SkipExisting);
+    let o = CopyOptions { existing: ExistingPolicy::SkipExisting, ..opts() };
+    let (r, got) = resumed_under(&fs, &o);
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_ne!(strong(&fs, "/p/dest/a"), strong(&fs, "/p/dest/a2"), "left alone");
+    assert_eq!((out.files_skipped, out.hardlinks_degraded, out.files_hardlinked), (1, 1, 0));
+}
+
+#[test]
+fn a_recopied_canonical_heals_its_earlier_members() {
+    let n = reference_nth(pair_fake, &auto(), "rename_no_replace", "-> /p/dest/sub/b)");
+    let fs = pair_fake();
+    die_at_nth(&fs, "rename_no_replace", n, &auto());
+    let old = strong(&fs, "/p/dest/a");
+    assert_eq!(old, strong(&fs, "/p/dest/a2"));
+    // The source's group grows: `resumed_complete` fails for both names.
+    let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(100);
+    for p in ["/src/a", "/src/a2"] {
+        fs.write_file(p, b"AAAA");
+        fs.set_modified(p, when);
+    }
+    let (r, got) = resumed_under(&fs, &auto());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    let new = strong(&fs, "/p/dest/a");
+    assert_ne!(new, old, "a was recopied");
+    assert_eq!(strong(&fs, "/p/dest/a2"), new, "a2 follows the new object");
+    assert_eq!(fs.read_file("/p/dest/a2").as_deref(), Some(&b"AAAA"[..]));
+    // `a` and `sub/b` are copies (the brief's 1 does not count `sub/b`, which this prior had not published).
+    assert_eq!((out.files_hardlinked, out.files_copied), (1, 2));
+}
+
+fn m_fake() -> FaultFs {
+    let fs = FaultFs::new();
+    for d in ["/src", "/src/sub", "/p"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    put(&fs, "/src/m", b"M", 100);
+    put(&fs, "/src/sub/b", b"BB", 100);
+    link_names(&fs, "/src", "m", &["m2"]);
+    fs
+}
+
+#[test]
+fn a_changed_walk_order_still_converges() {
+    let n = reference_nth(m_fake, &auto(), "rename_no_replace", "-> /p/dest/sub/b)");
+    let fs = m_fake();
+    die_at_nth(&fs, "rename_no_replace", n, &auto());
+    assert_eq!(strong(&fs, "/p/dest/m"), strong(&fs, "/p/dest/m2"));
+    assert_eq!((claim_of(&fs, "m"), claim_of(&fs, "m2")), (created("m"), created("m2")));
+    // The source gains `a`, a new first member of the same group.
+    link_names(&fs, "/src", "m", &["a"]);
+    let (r, got) = resumed_under(&fs, &auto());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    let one = strong(&fs, "/p/dest/a");
+    assert_eq!((strong(&fs, "/p/dest/m"), strong(&fs, "/p/dest/m2")), (one, one));
+    assert_eq!(out.files_hardlinked, 2);
+}
+
+#[test]
+fn a_skipped_member_that_already_links_to_the_anchor_is_not_degraded() {
+    let o = CopyOptions { existing: ExistingPolicy::SkipExisting, ..opts() };
+    let n = reference_nth(pair_fake, &o, "rename_no_replace", "-> /p/dest/sub/b)");
+    let fs = pair_fake();
+    die_at_nth(&fs, "rename_no_replace", n, &o);
+    assert_eq!(strong(&fs, "/p/dest/a"), strong(&fs, "/p/dest/a2"), "already linked");
+    let (r, got) = resumed_under(&fs, &o);
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!((out.files_resumed, out.hardlinks_degraded, out.files_skipped), (2, 0, 0));
+}
+
+#[test]
+fn restart_never_reads_the_prior_index() {
+    let n = reference_nth(pair_fake, &auto(), "rename_no_replace", "-> /p/dest/sub/b)");
+    let fs = pair_fake();
+    die_at_nth(&fs, "rename_no_replace", n, &auto());
+    let prior = format!("/p/dest/.flux/operations/{ID}/hardlinks.db");
+    assert!(fs.exists(&prior), "the interrupted run left its index");
+    let before = calls(&fs).len();
+    let c = RunConfig { operation_id: id(0x77), restart: true, ..cfg() };
+    let (r, _) = run_tree_with(&fs, &c, &auto());
+    ok(&r);
+    let log = calls(&fs)[before..].to_vec();
+    assert!(!log.iter().any(|x| x.starts_with("open_hardlink_index")), "{log:?}");
+    let own = format!("create_hardlink_index(/p/dest/.flux/operations/{}", id(0x77));
+    assert!(log.iter().any(|x| x.starts_with(&own)), "{log:?}");
+    for x in log.iter().filter(|x| x.contains("hardlinks.db") && x.starts_with("remove_file(")) {
+        assert!(
+            x.contains(&format!("{ID}.removing")) || x.contains(&id(0x77)) || x.contains(ID),
+            "{x}"
+        );
+    }
+    assert!(!fs.exists(&prior));
+}
+
+#[test]
+fn a_strict_note_for_a_link_whose_temporary_still_names_the_object_is_committed_by_adoption() {
+    let fs = strict_prior();
+    put(&fs, "/p/dest/a", b"A", 101);
+    let r_id = identity_of(&fs, "/p/dest/a");
+    let temp = temp_of("a", 5);
+    let d = fs.destination_root(Path::new("/p/dest")).unwrap();
+    d.create_hardlink(OsStr::new(&temp), &d, OsStr::new("a")).unwrap();
+    assert_eq!(identity_of(&fs, &format!("/p/dest/{temp}")), r_id, "a real alias");
+    noted(&fs, 5, "a", "a", r_id, "", false, "");
+    let (r, got) = recover(&fs);
+    ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    adopted_recovering(&r, 0, 1);
+    assert_eq!(claim_of(&fs, "a"), created("a"));
+    assert_eq!(fs.prepared_count(), 0);
+    assert!(!fs.exists(format!("/p/dest/{temp}")), "the temporary is removed");
+    assert!(fs.exists("/p/dest/a"));
+}
