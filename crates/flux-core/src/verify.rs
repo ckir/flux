@@ -1511,6 +1511,20 @@ mod tests {
     }
 
     #[test]
+    fn a_source_file_against_a_destination_mount_point_is_a_mismatch_and_nothing_below_it_is_seen()
+    {
+        let o = VerifyOptions { mounts: MountPolicy::Stay, ..opts() };
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("m", b"m")]);
+        tree(&fs, "/d", &["m"], &[("m/x", b"x")]);
+        fs.set_mount_root("/d/m", MountRoot::Yes);
+        let (rows, s) = run(&fs, "/s", "/d", &o);
+        assert_eq!(rows, vec![mm("m", Kind::File, "source file, destination dir")]);
+        assert_eq!((s.mismatched, s.not_entered, s.extra), (1, 0, 0));
+        assert!(!fs.called("read_dir(/d/m)"));
+    }
+
+    #[test]
     fn cross_filesystems_enters_mount_points() {
         let fs = FaultFs::new();
         tree(&fs, "/s", &["m"], &[("m/x", b"x")]);
