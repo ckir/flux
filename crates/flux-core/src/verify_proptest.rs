@@ -8,9 +8,6 @@
 //! derivation of the two trees (source and destination) it describes. Later pieces
 //! (materialisation, the reference, the generator and the property) build on it.
 
-// Transitional: the generator, reference and property that read every variant and field land in later tasks.
-#![allow(dead_code)]
-
 use crate::fault_fs::FaultFs;
 use crate::verify::{Kind, MOUNT_NOT_ENTERED, Outcome, Record, SPECIAL_NOT_COMPARED, Summary};
 use crate::walk::MountPolicy;
@@ -593,6 +590,75 @@ fn case() -> impl Strategy<Value = Case> {
         })
 }
 
+/// A relative path rendered with `/` separators on every platform.
+fn slashed(path: &Path) -> String {
+    path.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/")
+}
+
+/// The case as a pasteable `verify::tests` fixture: one block per side, then the options.
+fn fixture_snippet(case: &Case) -> String {
+    use std::fmt::Write;
+    let (src, dst) = sides(case);
+    let mut out = String::new();
+    for (root, side) in [("/s", &src), ("/d", &dst)] {
+        let dirs: Vec<String> = side
+            .iter()
+            .filter(|(_, s)| matches!(s, Spec::Dir { .. }))
+            .map(|(p, _)| format!("{:?}", slashed(p)))
+            .collect();
+        let files: Vec<String> = side
+            .iter()
+            .filter_map(|(p, s)| match s {
+                Spec::File { len, fill } => Some(format!(
+                    "({:?}, &vec![b'{}'; {len}])",
+                    slashed(p),
+                    std::ascii::escape_default(*fill)
+                )),
+                _ => None,
+            })
+            .collect();
+        let _ = writeln!(
+            out,
+            "tree(&fs, \"{root}\", &[{}], &[{}]);",
+            dirs.join(", "),
+            files.join(", ")
+        );
+        for (p, spec) in side {
+            let at = format!("{root}/{}", slashed(p));
+            match spec {
+                Spec::Symlink { payload } => {
+                    let _ = writeln!(
+                        out,
+                        "fs.add_symlink_to(\"{at}\", \"{payload}\", LinkKind::Unspecified);"
+                    );
+                }
+                Spec::Other => {
+                    let _ = writeln!(out, "fs.add_special(\"{at}\");");
+                }
+                Spec::Dir { mount, list_error } => {
+                    if *mount != MountRoot::No {
+                        let _ = writeln!(out, "fs.set_mount_root(\"{at}\", MountRoot::{mount:?});");
+                    }
+                    if let Some(code) = list_error {
+                        let _ = writeln!(
+                            out,
+                            "fs.fail_read_dir_of(\"{at}\", Code::{code:?}, std::io::ErrorKind::{:?});",
+                            fault_kind(*code)
+                        );
+                    }
+                }
+                Spec::File { .. } => {}
+            }
+        }
+    }
+    let _ = writeln!(
+        out,
+        "let o = VerifyOptions {{ links: Links::{:?}, mounts: MountPolicy::{:?}, hash: HashAlgorithm::Blake3 }};",
+        case.links, case.mounts
+    );
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,6 +876,60 @@ mod tests {
                 "other error".to_string()
             )]
         );
+    }
+
+    #[test]
+    fn an_empty_pair_of_trees_gives_no_records_and_a_default_summary() {
+        use crate::verify::{VerifyOptions, verify_tree};
+        use flux_fs::HashAlgorithm;
+        let case = Case {
+            base: vec![],
+            edits: vec![],
+            extras: vec![],
+            mounts: MountPolicy::Cross,
+            links: Links::Copy,
+        };
+        assert_eq!(reference(&case), (vec![], Summary::default()));
+        let (fs, _) = materialise(&case);
+        let opts =
+            VerifyOptions { links: case.links, mounts: case.mounts, hash: HashAlgorithm::Blake3 };
+        let mut records = Vec::new();
+        let summary =
+            verify_tree(&fs, Path::new("/s"), Path::new("/d"), &opts, &mut |r| records.push(r))
+                .unwrap();
+        assert_eq!((records, summary), (vec![], Summary::default()));
+    }
+
+    #[test]
+    fn fixture_snippet_renders_every_kind_of_line() {
+        let case = case_of(
+            vec![
+                (
+                    vec!["d"],
+                    Spec::Dir { mount: MountRoot::Yes, list_error: Some(Code::IoError) },
+                    Edit::KeepBoth,
+                ),
+                (vec!["d", "f"], file(crate::copy::COPY_BUF_MAX + 1, b'q'), Edit::KeepBoth),
+                (vec!["l"], Spec::Symlink { payload: "t" }, Edit::KeepBoth),
+                (vec!["o"], Spec::Other, Edit::KeepBoth),
+            ],
+            vec![],
+            MountPolicy::Stay,
+        );
+        let mut case = case;
+        case.links = Links::Skip;
+        let text = fixture_snippet(&case);
+        for want in [
+            "tree(&fs, \"/s\", &[\"d\"], &[(\"d/f\", &vec![b'q'; 262145])]);",
+            "tree(&fs, \"/d\", &[\"d\"], &[(\"d/f\", &vec![b'q'; 262145])]);",
+            "fs.add_symlink_to(\"/s/l\", \"t\", LinkKind::Unspecified);",
+            "fs.add_special(\"/s/o\");",
+            "fs.set_mount_root(\"/s/d\", MountRoot::Yes);",
+            "fs.fail_read_dir_of(\"/s/d\", Code::IoError, std::io::ErrorKind::Other);",
+            "let o = VerifyOptions { links: Links::Skip, mounts: MountPolicy::Stay, hash: HashAlgorithm::Blake3 };",
+        ] {
+            assert!(text.contains(want), "missing {want:?} in:\n{text}");
+        }
     }
 
     #[test]
@@ -1102,6 +1222,72 @@ mod tests {
                 "category {c:?} reached {} of 512 cases; census:\n{table}",
                 counts[c]
             );
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::default())]
+
+        #[test]
+        fn the_streaming_merge_equals_the_reference(case in case()) {
+            use crate::verify::{VerifyOptions, verify_tree};
+            use flux_fs::HashAlgorithm;
+            use proptest::prop_assert;
+            use proptest::prop_assert_eq;
+            let (fs, setup) = materialise(&case);
+            let opts = VerifyOptions {
+                links: case.links,
+                mounts: case.mounts,
+                hash: HashAlgorithm::Blake3,
+            };
+            let mut rows = Vec::new();
+            let summary = verify_tree(&fs, Path::new("/s"), Path::new("/d"), &opts, &mut |r| rows.push(r))
+                .unwrap();
+            let (expected_rows, expected_summary) = reference(&case);
+            prop_assert_eq!(&rows, &expected_rows, "{}", fixture_snippet(&case));
+            prop_assert_eq!(summary, expected_summary, "{}", fixture_snippet(&case));
+            let keys: Vec<Vec<u8>> =
+                rows.iter().map(|r| FluxPathKey::from_relative(&r.path).unwrap().0).collect();
+            prop_assert!(
+                keys.windows(2).all(|w| w[0] < w[1]),
+                "keys not strictly increasing: {keys:?}\n{}",
+                fixture_snippet(&case)
+            );
+            let (src, dst) = sides(&case);
+            let calls = fs.calls();
+            for call in calls.iter().map(String::as_str) {
+                let Some(rest) = call.strip_prefix("open_read(") else { continue };
+                let rest = rest.strip_suffix(')').unwrap_or(rest).to_owned();
+                let found = if let Some(t) = rest.strip_prefix("/s/") {
+                    Some((&src, t.to_owned()))
+                } else {
+                    rest.strip_prefix("/d/").map(|t| (&dst, t.to_owned()))
+                };
+                prop_assert!(
+                    found.as_ref().is_some_and(|(side, tail)| {
+                        let rel = tail.split('/').fold(PathBuf::new(), |p, c| p.join(c));
+                        matches!(side.get(&rel), Some(Spec::File { .. }))
+                    }),
+                    "open_read of a non-file or a root: {call}\n{}",
+                    fixture_snippet(&case)
+                );
+            }
+            const READS: [&str; 7] = [
+                "metadata(",
+                "read_dir(",
+                "open_read(",
+                "read_link(",
+                "source_mount_root(",
+                "canonical_path(",
+                "identity(",
+            ];
+            for call in calls.iter().skip(setup) {
+                prop_assert!(
+                    READS.iter().any(|r| call.starts_with(r)),
+                    "a non-read call: {call}\n{}",
+                    fixture_snippet(&case)
+                );
+            }
         }
     }
 }
