@@ -12,3 +12,4 @@ pub mod cleanup_report;
 pub mod exit_code;
 pub mod report;
 pub mod resolve;
+pub mod verify_report;
