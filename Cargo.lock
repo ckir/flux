@@ -358,6 +358,7 @@ version = "0.19.4"
 dependencies = [
  "blake3",
  "flux-fs",
+ "flux-hash",
  "flux-platform",
  "serde",
  "serde_json",
@@ -375,6 +376,9 @@ dependencies = [
 [[package]]
 name = "flux-hash"
 version = "0.19.4"
+dependencies = [
+ "blake3",
+]
 
 [[package]]
 name = "flux-platform"

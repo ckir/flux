@@ -63,6 +63,8 @@ fn opts() -> CopyOptions {
         links: Links::Copy,
         hardlinks: flux_fs::Hardlinks::Auto,
         cross_filesystems: false,
+        verify: flux_fs::VerifyLevel::None,
+        hash: flux_fs::HashAlgorithm::Blake3,
     }
 }
 
@@ -10934,4 +10936,75 @@ fn a_dry_resume_with_an_unreadable_index_predicts_what_live_does() {
     assert_eq!(failed.len(), 2, "{got:?}");
     assert!(failed.iter().all(|f| code_of(f) == Code::HardlinkUnavailable), "{got:?}");
     assert_eq!((out.files_resumed, out.hardlinks_degraded), (0, 0));
+}
+
+// Copy verification, task 4: the counters through a Strict batch and a hardlink group.
+
+fn verifying(base: CopyOptions) -> CopyOptions {
+    CopyOptions { verify: flux_fs::VerifyLevel::Destination, ..base }
+}
+
+#[test]
+fn strict_batch_with_one_bad_file_publishes_the_others() {
+    let o = verifying(strict());
+    let refer = wide_fake(4);
+    let (r, _) = run_tree_with(&refer, &cfg(), &o);
+    assert_eq!(ok(&r).files_verified, 4);
+    let reads: Vec<String> =
+        calls(&refer).into_iter().filter(|c| c.starts_with("open_read(")).collect();
+    let temp = format!("/p/dest/d/f002.flux-partial.{ID}");
+    let n = reads.iter().position(|c| *c == format!("open_read({temp})")).expect("re-read") + 1;
+    assert_eq!(n, 6, "f002's re-read follows f000's and f001's source and re-reads: {reads:?}");
+
+    let fs = wide_fake(4);
+    let bad = temp.clone();
+    fs.on_nth("open_read", n as u32, move |fs| fs.write_file(&bad, b"XXXX"));
+    let (r, got) = run_tree_with(&fs, &cfg(), &o);
+    let out = ok(&r);
+    assert_eq!((out.files_copied, out.files_verified, out.files_mismatched), (3, 3, 1), "{out:?}");
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].path, PathBuf::from("d/f002"));
+    let TreeFailureCause::Copy(e) = &got[0].cause else { panic!("{got:?}") };
+    assert_eq!(e.code(), Code::VerifyMismatch);
+    for i in [0, 1, 3] {
+        let name = format!("f{i:03}");
+        assert_eq!(
+            fs.read_file(format!("/p/dest/d/{name}")).as_deref(),
+            Some(name.as_bytes()),
+            "{name}"
+        );
+    }
+    assert!(!fs.exists("/p/dest/d/f002"));
+    let left: Vec<_> = fs
+        .read_dir(Path::new("/p/dest/d"))
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.name.to_string_lossy().contains(".flux-partial."))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+fn hardlink_pair_verifies_the_anchor_once() {
+    for (mode, hardlinked, verified) in
+        [(flux_fs::Hardlinks::Auto, 1, 1), (flux_fs::Hardlinks::Copy, 0, 2)]
+    {
+        let fs = FaultFs::new();
+        for d in ["/src", "/p"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        fs.write_file("/src/a", b"A");
+        link_names(&fs, "/src", "a", &["a2"]);
+        let o = CopyOptions { hardlinks: mode, ..verifying(opts()) };
+        let mut got = Vec::new();
+        let r =
+            tree(&fs, Path::new("/src"), Path::new("/p/dest"), &o, &cfg(), &mut |f| got.push(f));
+        let out = ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(
+            (out.files_hardlinked, out.files_copied, out.files_verified),
+            (hardlinked, 2 - hardlinked, verified),
+            "{mode:?}"
+        );
+    }
 }

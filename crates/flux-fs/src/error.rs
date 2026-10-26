@@ -20,6 +20,8 @@ pub enum Code {
     DiskFull,
     PermissionDenied,
     SourceChanged,
+    /// Copy-side verification: the bytes read back differ from the bytes read from the source.
+    VerifyMismatch,
     StrictDurabilityUnavailable,
     SpecialFileUnsupported,
     SafetyRejected,
@@ -84,6 +86,7 @@ impl Code {
             Code::DiskFull => "DISK_FULL",
             Code::PermissionDenied => "PERMISSION_DENIED",
             Code::SourceChanged => "SOURCE_CHANGED",
+            Code::VerifyMismatch => "VERIFY_MISMATCH",
             Code::StrictDurabilityUnavailable => "STRICT_DURABILITY_UNAVAILABLE",
             Code::SpecialFileUnsupported => "SPECIAL_FILE_UNSUPPORTED",
             Code::SafetyRejected => "SAFETY_REJECTED",
@@ -159,6 +162,7 @@ mod tests {
         assert_eq!(Code::DiskFull.as_str(), "DISK_FULL");
         assert_eq!(Code::PermissionDenied.as_str(), "PERMISSION_DENIED");
         assert_eq!(Code::SourceChanged.as_str(), "SOURCE_CHANGED");
+        assert_eq!(Code::VerifyMismatch.as_str(), "VERIFY_MISMATCH");
         assert_eq!(Code::StrictDurabilityUnavailable.as_str(), "STRICT_DURABILITY_UNAVAILABLE");
         assert_eq!(Code::SpecialFileUnsupported.as_str(), "SPECIAL_FILE_UNSUPPORTED");
         assert_eq!(Code::SafetyRejected.as_str(), "SAFETY_REJECTED");

@@ -151,6 +151,7 @@ mod tests {
     #[test]
     fn an_unchanged_abort_that_is_not_a_refusal_exits_1() {
         assert_eq!(for_tree(&abort(Code::IoError, |_| {})), FAILED);
+        assert_eq!(for_tree(&abort(Code::VerifyMismatch, |_| {})), FAILED);
     }
 
     #[test]
@@ -167,12 +168,14 @@ mod tests {
                 identity_degraded: None,
                 published_identity: flux_fs::FileIdentity::Unavailable,
                 skipped: false,
+                verified: false,
             })
         };
         assert_eq!(for_file(&ok(0)), SUCCESS);
         assert_eq!(for_file(&ok(1)), FAILED);
         assert_eq!(for_file(&Err(err(Code::SafetyRejected))), REFUSED);
         assert_eq!(for_file(&Err(err(Code::IoError))), FAILED);
+        assert_eq!(for_file(&Err(err(Code::VerifyMismatch))), FAILED);
     }
 
     #[test]
@@ -260,6 +263,7 @@ mod tests {
                 identity_degraded: None,
                 published_identity: flux_fs::FileIdentity::Unavailable,
                 skipped: false,
+                verified: false,
             })
         };
         assert_eq!(for_file_run(&run(None, Some(refused(false)))), REFUSED);

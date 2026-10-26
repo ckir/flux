@@ -493,6 +493,8 @@ mod tests {
             links: Links::Copy,
             hardlinks: flux_fs::Hardlinks::Auto,
             cross_filesystems: cross,
+            verify: flux_fs::VerifyLevel::None,
+            hash: flux_fs::HashAlgorithm::Blake3,
         };
         assert_eq!(MountPolicy::of(&with(false)), MountPolicy::Stay);
         assert_eq!(MountPolicy::of(&with(true)), MountPolicy::Cross);

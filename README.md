@@ -74,6 +74,17 @@ zero; the summary line appends `; N hardlinked`, `; N hardlinks degraded` and `;
 `--dry-run` reports a planned link as `would_hardlink` and counts it in `files_hardlinked`. A hardlinked symlink is still
 copied as independent links.
 
+### Verification
+
+`flux copy --verify[=none|source-stream|destination|full]` checks each copied file's content; `--verify` alone means
+`destination`, and the default is `none`, which checks nothing. `source-stream` hashes the source bytes while they are
+copied and compares nothing in this version. `destination` reads the written file again and compares it with the source
+bytes that were read, so it detects a destination that returns different bytes than were written. `full` is `destination`
+plus a second read of the source, which also detects source bytes that changed or were misread during the copy. The
+re-read may be served by the operating system's page cache, so it does not prove the data reached stable storage
+(`--durability` still governs syncing). A mismatch is reported as `VERIFY_MISMATCH` and counts as a failed file;
+`--verify` cannot be combined with `--resume`. `--hash` selects the hash used by `--verify` (`blake3`, the default).
+
 ### Cleanup
 
 `flux cleanup DEST [--dry-run] [--force] [--json]` lists the operations under `DEST/.flux/operations/` and the

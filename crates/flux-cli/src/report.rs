@@ -24,8 +24,9 @@ pub const SYMLINK_WHY: &str =
     "a symlink SOURCE is not followed; copy its parent folder, or name its target";
 
 /// §53's complete field list, in its order. Every value is true for what this version
-/// does: nothing reflinks or verifies, so those stay 0 and `verify_level` is
-/// `"none"`; `files_hardlinked` counts cut 12's links.
+/// does: nothing reflinks, so that count stays 0; `verify_level` is the level
+/// requested (`none` unless `--verify`); `files_verified` and `files_mismatched`
+/// count cut 13's verification; `files_hardlinked` counts cut 12's links.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct Report {
     pub files_total: u64,
@@ -146,6 +147,8 @@ impl Report {
         r.files_overwritten = out.files_overwritten;
         r.bytes_skipped = out.bytes_skipped + out.bytes_resumed;
         r.files_degraded = out.files_degraded;
+        r.files_verified = out.files_verified;
+        r.files_mismatched = out.files_mismatched;
         // Only `copy` failures are failed FILES (a failed link is one, cut 10a). A `ClaimNotRecorded` failure is
         // counted in `FailureTally::total()` (so in `errors`) and in `claim_not_recorded`, but not here: the file was
         // published and counted as copied.
@@ -171,10 +174,12 @@ impl Report {
                 rep.bytes_total = o.bytes_copied;
                 rep.bytes_copied = o.bytes_copied;
                 rep.errors = u64::from(!o.metadata_failures.is_empty());
+                rep.files_verified = u64::from(o.verified);
             }
-            Err(_) => {
+            Err(e) => {
                 rep.files_failed = 1;
                 rep.errors = 1;
+                rep.files_mismatched = u64::from(e.code() == Code::VerifyMismatch);
             }
         }
         rep.timed(duration_ms)
@@ -480,6 +485,8 @@ pub fn summary_line(r: &Report, directories_created: u64) -> String {
         (r.files_hardlinked, "hardlinked"),
         (r.hardlinks_degraded, "hardlinks degraded"),
         (r.hardlinks_unchecked, "hardlinks unchecked"),
+        (r.files_verified, "verified"),
+        (r.files_mismatched, "mismatched"),
     ] {
         if n > 0 {
             s.push_str(&format!("; {n} {what}"));
@@ -1065,6 +1072,7 @@ mod tests {
             identity_degraded: Some(FileIdentity::Unavailable),
             published_identity: flux_fs::FileIdentity::Unavailable,
             skipped: false,
+            verified: false,
         });
         let r = Report::file(&ok, true, 0);
         assert_eq!((r.files_total, r.files_copied, r.files_overwritten), (1, 1, 1));
@@ -1082,6 +1090,72 @@ mod tests {
     }
 
     #[test]
+    fn a_verified_single_file_counts_one_verified() {
+        let ok: Result<Outcome, CopyError> = Ok(Outcome {
+            bytes_copied: 5,
+            metadata_failures: Vec::new(),
+            identity_degraded: None,
+            published_identity: flux_fs::FileIdentity::Unavailable,
+            skipped: false,
+            verified: true,
+        });
+        let r = Report::file(&ok, false, 0);
+        assert_eq!((r.files_verified, r.files_mismatched), (1, 0));
+    }
+
+    #[test]
+    fn a_verify_mismatch_counts_one_mismatch_and_one_failure() {
+        let bad: Result<Outcome, CopyError> = Err(CopyError {
+            cause: FsError::new(Code::VerifyMismatch, io("x")),
+            leftover: None,
+            step: CopyStep::Stream,
+        });
+        let r = Report::file(&bad, false, 0);
+        assert_eq!((r.files_mismatched, r.files_failed, r.errors, r.files_verified), (1, 1, 1, 0));
+        let other: Result<Outcome, CopyError> = Err(CopyError {
+            cause: FsError::new(Code::IoError, io("x")),
+            leftover: None,
+            step: CopyStep::Stream,
+        });
+        assert_eq!(Report::file(&other, false, 0).files_mismatched, 0);
+    }
+
+    #[test]
+    fn tree_copies_the_verification_counters() {
+        let out = TreeOutcome { files_verified: 3, files_mismatched: 2, ..TreeOutcome::default() };
+        let r = Report::tree(&out, false, 1);
+        assert_eq!((r.files_verified, r.files_mismatched), (3, 2));
+    }
+
+    #[test]
+    fn summary_line_names_verification_only_when_non_zero() {
+        let mut r = Report::pre_engine(false);
+        r.errors = 0;
+        r.files_copied = 2;
+        r.bytes_copied = 3;
+        // The pre-verification literal, pinned: a zero report prints the line it always did.
+        assert_eq!(
+            summary_line(&r, 1),
+            "copied 2 files (3 bytes), created 1 directories; 0 failed, 0 skipped"
+        );
+        r.files_verified = 3;
+        assert_eq!(
+            summary_line(&r, 1),
+            "copied 2 files (3 bytes), created 1 directories; 0 failed, 0 skipped; 3 verified"
+        );
+        r.files_mismatched = 1;
+        assert_eq!(
+            summary_line(&r, 1),
+            "copied 2 files (3 bytes), created 1 directories; 0 failed, 0 skipped; 3 verified; 1 mismatched"
+        );
+        r.files_verified = 0;
+        assert_eq!(
+            summary_line(&r, 1),
+            "copied 2 files (3 bytes), created 1 directories; 0 failed, 0 skipped; 1 mismatched"
+        );
+    }
+
+    #[test]
     fn a_single_file_onto_a_fresh_target_overwrites_nothing() {
         let ok: Result<Outcome, CopyError> = Ok(Outcome {
             bytes_copied: 5,
@@ -1089,6 +1163,7 @@ mod tests {
             identity_degraded: None,
             published_identity: flux_fs::FileIdentity::Unavailable,
             skipped: false,
+            verified: false,
         });
         let r = Report::file(&ok, false, 0);
         assert_eq!((r.files_copied, r.files_overwritten), (1, 0));
@@ -1097,6 +1172,7 @@ mod tests {
     #[test]
     fn a_skipped_single_file_reports_one_skipped_and_none_copied() {
         let skipped: Result<Outcome, CopyError> = Ok(Outcome {
+            verified: false,
             skipped: true,
             bytes_copied: 0,
             metadata_failures: Vec::new(),
@@ -1558,6 +1634,7 @@ mod tests {
                 identity_degraded: None,
                 published_identity: flux_fs::FileIdentity::Unavailable,
                 skipped: false,
+                verified: false,
             })),
             stop: None,
             warnings: Vec::new(),
@@ -1934,6 +2011,7 @@ mod tests {
                 identity_degraded: None,
                 published_identity: flux_fs::FileIdentity::Unavailable,
                 skipped: false,
+                verified: false,
             })
         };
         assert_eq!(Report::file_run(&run(Some(copied()), None), false, 1).errors, 0);
